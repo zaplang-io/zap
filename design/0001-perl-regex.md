@@ -35,11 +35,11 @@ division, and concurrency-hostile magic match variables.
 ### Operators
 
 - `subject =~ regex` — apply the regex to the subject.
-  - With `m//`: returns a **match object** (truthy) on success, `none` on no
+  - With `m//`: returns a **match object** (truthy) on success, `None` on no
     match. With the `g` flag, returns an iterable of match objects.
   - With `s//`: returns a **new string** (the subject is never mutated).
     With `g`, replaces all; otherwise the first occurrence.
-- `subject !~ m//` — returns `true` when there is no match (boolean).
+- `subject !~ m//` — returns `True` when there is no match (boolean).
 - `subject ~= s/a/b/g` — in-place substitution **shorthand**; desugars exactly
   to `subject = subject =~ s/a/b/g`. Requires `subject` to be an assignable
   lvalue.

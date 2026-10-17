@@ -46,11 +46,11 @@ codegen or runtime reflection.
 ```python
 annotation Column:
     str name = ""
-    bool primary = false
+    bool primary = False
 
 @Table(name="users")
 struct User:
-    @Column(name="id", primary=true)
+    @Column(name="id", primary=True)
     int64 id
     @Column(name="email")
     str email
@@ -97,7 +97,7 @@ validation, and derive-driven serialization:
 struct Signup:
     @default(now())                    # computed per instance
     DateTime created
-    bool active = true                 # plain literal field default
+    bool active = True                 # plain literal field default
 
     @validate(max_len=50)
     str name
