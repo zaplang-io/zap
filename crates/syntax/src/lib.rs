@@ -6,6 +6,7 @@
 //! (see `ROADMAP.md`). No lexing or parsing *logic* lives here yet.
 
 pub mod ast;
+pub mod lexer;
 pub mod span;
 pub mod token;
 
