@@ -456,6 +456,13 @@ pub enum Expr {
         value: Option<Box<Expr>>,
         span: Span,
     },
+    /// `then if cond else els` — conditional expression.
+    IfElse {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Box<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -488,6 +495,7 @@ pub enum BinOp {
     Le,       // <=
     Gt,       // >
     Ge,       // >=
+    In,       // in  (membership)
     Send,     // ch <- v  (channel send, D-0031)
 }
 
