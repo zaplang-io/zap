@@ -93,6 +93,20 @@ pub enum TokenKind {
     RegexNotBind, // !~
     SubstAssign,  // ~=  (in-place substitution, D-0010)
 
+    // --- Augmented assignment (D-0026) ---
+    PlusEq,       // +=
+    MinusEq,      // -=
+    StarEq,       // *=
+    SlashEq,      // /=
+    SlashSlashEq, // //=
+    PercentEq,    // %=
+    StarStarEq,   // **=
+    AmpEq,        // &=
+    PipeEq,       // |=
+    CaretEq,      // ^=
+    ShlEq,        // <<=
+    ShrEq,        // >>=
+
     // --- Delimiters ---
     LParen,   // (
     RParen,   // )
