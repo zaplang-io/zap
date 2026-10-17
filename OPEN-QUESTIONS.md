@@ -50,8 +50,10 @@ _Last updated: 2026-10-17_
 
 ## Features deferred with a direction
 
-- 🟡 **Decorators / annotations** (D-0036) — needs its own design: pre/post
-  wrappers *and* Java-style metadata annotations that also apply to variables.
+- 🟡 **User-defined compile-time decorators (macros)** — the decorator model +
+  built-ins are locked (D-0036, `design/0004-decorators.md`); still open: the
+  macro API (what a decorator sees/emits), hygiene rules, and the
+  runtime-reflection API surface.
 - ⚪ **C FFI** (D-0012) — deferred; generalizes interop to all languages.
 - ⚪ **Precise GC** (Immix-style) replacing Boehm (D-0009).
 - ⚪ **Array dtype promotion** rules for mixed-dtype ops (`i64 + f64`), and
@@ -59,10 +61,10 @@ _Last updated: 2026-10-17_
 
 ## Design docs still to write
 
-- `design/0004-concurrency.md` — channels, `select`, sync primitives, structured
+- `design/0005-concurrency.md` — channels, `select`, sync primitives, structured
   concurrency, memory model.
-- `design/0005-types-and-generics.md` — structs, interfaces, generics, enums,
+- `design/0006-types-and-generics.md` — structs, interfaces, generics, enums,
   tuples.
-- `design/0006-strings.md` — the UTF-8 string model (D-0025).
+- `design/0007-strings.md` — the UTF-8 string model (D-0025).
 - `design/IR.md` — the typed-IR schema (phase-boundary contract).
 - `design/RUNTIME-ABI.md` — object layout, calling convention, GC hooks.

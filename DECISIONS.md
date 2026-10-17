@@ -252,11 +252,29 @@ syntax**. Explicitly **not** pip/PyPI's model (dependency-hell, bolted-on
 isolation). Manifest format (e.g. `zap.toml`) and resolver TBD.
 
 ## D-0036 — Decorators / annotations
-**Status:** Open (deferred — needs its own design)
-Direction: richer than Python decorators. Two capabilities wanted: (1) **pre/post
-wrappers** around functions, and (2) **metadata annotations** (Java-style) that
-attach to **methods *and* variables**, not just functions/classes. Deferred to a
-dedicated discussion/design doc.
+**Status:** Locked (design) — v1 scope; user macros staged
+Unified `@`-syntax metaprogramming in two kinds, applicable to **functions,
+methods, structs, fields, variables, and parameters**:
+- **`annotation`** — declarative metadata (declared like a struct), read by
+  compile-time codegen or runtime reflection (e.g. `@Column(name="id")`).
+- **`decorator`** — behavioral/generative, with a `before`/`after` convenience
+  form and a general `wrap`; may take arguments (e.g. `@retry(times=3)`).
+
+**Compile-time-first** — decorators run at compile time and generate real,
+type-checked code with **zero runtime cost** (`@derive`, `@validate`,
+`@default`, `@cache`); annotations are **also** queryable via optional
+**runtime reflection** for dynamic frameworks. Field/variable targets are the
+key capability Python lacks (enables pydantic-style declarative structs with no
+runtime cost). Multiple decorators stack bottom-up. Generated code is always
+inspectable via **`zap expand`** (the antidote to "annotation magic").
+
+**Rationale:** with no inheritance (D-0015), decorators/derive are Zap's primary
+cross-cutting-reuse mechanism; compile-time codegen is the only version
+consistent with the performance goal and the "catch at compile time" ethos
+(D-0016). **v1 ships** the syntax, annotations + reflection, the built-in
+decorator set, behavioral decorators, and `zap expand`; **user-defined
+compile-time macros** are the hardest piece, targeted for v1 or an immediate
+fast-follow. See `design/0004-decorators.md`.
 
 ## D-0037 — Canonical formatter
 **Status:** Locked (direction)

@@ -376,12 +376,58 @@ auto col = m[:, 1]        # a view
 
 ---
 
+## 16. Decorators & annotations (D-0036)
+
+Unified `@`-syntax metaprogramming in two kinds, applicable to functions,
+methods, structs, fields, variables, and parameters. **Compile-time-first**
+(generates real, type-checked code at zero runtime cost) with optional runtime
+reflection. Full details in `design/0004-decorators.md`.
+
+**Annotations** — declarative metadata:
+
+```python
+annotation Column:
+    str name = ""
+    bool primary = false
+
+@Table(name="users")
+struct User:
+    @Column(name="id", primary=true)
+    int64 id
+```
+
+**Decorators** — behavioral / generative (`before`/`after` or general `wrap`;
+may take arguments):
+
+```python
+@retry(times=3)
+def fetch(str url) -> str:
+    ...
+```
+
+**Field decorators** — construction-time defaults (per-instance), validation,
+and derive-driven codegen (pydantic-style, zero runtime cost):
+
+```python
+@derive(Json)
+struct Signup:
+    @default(now())
+    DateTime created
+    @validate(max_len=50)
+    str name
+```
+
+Multiple decorators stack bottom-up. `zap expand` shows the generated code.
+Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
+`@deprecated`, `@inject`.
+
 ## Appendix A — Reserved words (provisional)
 
 `def`, `return`, `if`, `elif`, `else`, `while`, `for`, `in`, `range`, `auto`,
 `const`, `true`, `false`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
 `finally`, `with`, `as`, `yield`, `lambda`, `spawn`, `channel`, `select`,
-`case`, `close`, `struct`, `interface`, `enum`, `import`, `python`, `m`, `s`
+`case`, `close`, `struct`, `interface`, `enum`, `annotation`, `decorator`,
+`import`, `python`, `m`, `s`
 (contextual, before a delimiter), and the type keywords (`int32`, `int64`,
 `float32`, `float64`, `i32`, `i64`, `f32`, `f64`, `bool`, `char`, `str`,
 `bytes`, `bigint`, `complex`, `list`, `dict`, `array`).
@@ -399,4 +445,5 @@ auto col = m[:, 1]        # a view
 | Modules & visibility | Locked |
 | Regex, arrays | Locked (design docs 0001/0002) |
 | Function args: defaults, keyword, variadics | Locked (D-0038) |
-| `match`, `set`, `**kwargs`, decorators | Open (see OPEN-QUESTIONS) |
+| Decorators & annotations | Locked (D-0036, design/0004) |
+| `match`, `set`, `**kwargs` | Open (see OPEN-QUESTIONS) |
