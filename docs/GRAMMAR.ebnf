@@ -1,0 +1,220 @@
+(* ======================================================================
+   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0041.
+
+   Notation:
+     ::=        definition
+     |          alternation
+     [ x ]      optional (zero or one)
+     { x }      repetition (zero or more)
+     ( x )      grouping
+     "x"        literal terminal
+     UPPERCASE  token class produced by the lexer
+
+   Layout tokens are produced by the indentation-sensitive lexer:
+     NEWLINE, INDENT, DEDENT, EOF.
+   A `block` is `":" NEWLINE INDENT { statement } DEDENT`.
+   Inside "(" ")", "[" "]", "{" "}" newlines are insignificant (implicit
+   line continuation, D-0041); "\" continues a line; ";" separates simple
+   statements on one physical line.
+   ====================================================================== *)
+
+module        ::= { NEWLINE } { item } EOF ;
+
+item          ::= function
+                | struct_def
+                | interface_def
+                | enum_def
+                | annotation_def
+                | decorator_def
+                | import
+                | statement ;
+
+(* ---------- Decorators & annotations (D-0036) ---------- *)
+
+decorators    ::= { "@" dotted_name [ "(" [ arg_list ] ")" ] NEWLINE } ;
+
+(* ---------- Functions (D-0003, D-0038) ---------- *)
+
+function      ::= decorators "def" IDENT [ generics ]
+                  "(" [ param_list ] ")" [ "->" type ] block ;
+
+generics      ::= "[" IDENT { "," IDENT } "]" ;
+
+param_list    ::= param { "," param } ;
+param         ::= [ "@" dotted_name [ "(" [ arg_list ] ")" ] ]
+                  ( "self"
+                  | type [ "..." ] IDENT [ "=" expr ] ) ;
+                  (* "type ... IDENT" is a variadic (D-0038);
+                     "= expr" is a per-call default. *)
+
+(* ---------- Structs, interfaces, enums (D-0015, D-0016, D-0018) ---------- *)
+
+struct_def    ::= decorators "struct" IDENT [ generics ] ":" NEWLINE
+                  INDENT { field | function } DEDENT ;
+field         ::= decorators type IDENT [ "=" expr ] NEWLINE ;
+
+interface_def ::= "interface" IDENT [ generics ] ":" NEWLINE
+                  INDENT { method_sig } DEDENT ;
+method_sig    ::= "def" IDENT "(" [ param_list ] ")" [ "->" type ] NEWLINE ;
+
+enum_def      ::= decorators "enum" IDENT ":" NEWLINE
+                  INDENT { IDENT [ "=" expr ] NEWLINE } DEDENT ;
+
+annotation_def ::= "annotation" IDENT ":" NEWLINE
+                  INDENT { field } DEDENT ;
+
+decorator_def ::= "decorator" IDENT [ "(" [ param_list ] ")" ] block ;
+
+(* ---------- Imports (D-0028, D-0012) ---------- *)
+
+import        ::= "import" ( "python" STRING | dotted_name )
+                  [ "as" IDENT ] NEWLINE ;
+
+(* ---------- Types ---------- *)
+
+type          ::= named_type
+                | tuple_type
+                | func_type ;
+named_type    ::= type_name [ "[" type { "," type } "]" ] ;
+type_name     ::= IDENT | TYPE_KEYWORD ;      (* int64, list, dict, array, ... *)
+tuple_type    ::= "(" [ type { "," type } ] ")" ;
+func_type     ::= "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
+
+(* ---------- Statements ---------- *)
+
+block         ::= ":" NEWLINE INDENT { statement } DEDENT ;
+
+statement     ::= simple_stmt NEWLINE
+                | compound_stmt ;
+
+simple_stmt   ::= decl
+                | assign
+                | aug_assign
+                | subst_assign
+                | "return" [ expr ]
+                | "raise" [ expr ]
+                | "spawn" call_expr
+                | "break"
+                | "continue"
+                | expr ;                       (* ";" may join simple stmts *)
+
+decl          ::= [ "const" ] ( type | "auto" ) IDENT "=" expr ;  (* D-0003 *)
+assign        ::= target "=" expr ;
+aug_assign    ::= target aug_op expr ;
+subst_assign  ::= target "~=" subst_regex ;    (* in-place substitution, D-0010 *)
+aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**="
+                | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
+target        ::= atom { trailer } ;           (* name, index, slice, attr *)
+
+compound_stmt ::= if_stmt
+                | while_stmt
+                | do_while_stmt
+                | for_stmt
+                | match_stmt
+                | try_stmt
+                | with_stmt ;
+
+if_stmt       ::= "if" expr block
+                  { "elif" expr block }
+                  [ "else" block ] ;
+
+while_stmt    ::= "while" expr block ;
+
+do_while_stmt ::= "do" block "while" expr NEWLINE ;   (* D-0039 *)
+
+for_stmt      ::= "for" target "in" expr block ;
+
+try_stmt      ::= "try" block
+                  { "except" [ type [ "as" IDENT ] ] block }
+                  [ "finally" block ] ;         (* D-0007, D-0029 *)
+
+with_stmt     ::= "with" with_item { "," with_item } block ;  (* D-0027 *)
+with_item     ::= expr [ "as" IDENT ] ;
+
+(* ---------- Pattern matching (D-0040) ---------- *)
+
+match_stmt    ::= "match" expr ":" NEWLINE INDENT { case_clause } DEDENT ;
+case_clause   ::= "case" pattern [ "if" expr ] block ;
+
+pattern       ::= or_pattern ;
+or_pattern    ::= closed_pattern { "|" closed_pattern } ;
+closed_pattern ::= "_"
+                | literal
+                | IDENT                          (* capture *)
+                | dotted_name "(" [ field_pat { "," field_pat } ] ")"
+                | "[" [ seq_pat { "," seq_pat } ] "]"
+                | "(" [ pattern { "," pattern } ] ")" ;
+seq_pat       ::= "*" [ IDENT ] | pattern ;
+field_pat     ::= IDENT "=" pattern ;
+
+(* ---------- Expressions (lowest to highest precedence) ---------- *)
+
+expr          ::= lambda | ternary ;
+lambda        ::= "lambda" [ IDENT { "," IDENT } ] ":" expr ;   (* D-0026 *)
+ternary       ::= or_test [ "if" or_test "else" expr ] ;
+
+or_test       ::= and_test { "or" and_test } ;
+and_test      ::= not_test { "and" not_test } ;
+not_test      ::= "not" not_test | comparison ;
+comparison    ::= bit_or { comp_op bit_or }
+                | bit_or ( "=~" | "!~" ) match_regex
+                | bit_or "=~" subst_regex ;
+comp_op       ::= "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" ;
+
+bit_or        ::= bit_xor { "|" bit_xor } ;
+bit_xor       ::= bit_and { "^" bit_and } ;
+bit_and       ::= shift { "&" shift } ;
+shift         ::= add { ( "<<" | ">>" ) add } ;
+add           ::= term { ( "+" | "-" ) term } ;
+term          ::= factor { ( "*" | "/" | "//" | "%" ) factor } ;
+factor        ::= ( "+" | "-" | "~" ) factor | power ;
+power         ::= postfix [ "**" factor ] ;
+postfix       ::= atom { trailer } ;
+
+trailer       ::= "(" [ arg_list ] ")"           (* call *)
+                | "[" subscript "]"               (* index or slice *)
+                | "." IDENT ;                     (* attribute *)
+call_expr     ::= postfix "(" [ arg_list ] ")" ;
+
+subscript     ::= expr
+                | [ expr ] ":" [ expr ] [ ":" [ expr ] ] ;  (* slice, D-0030 *)
+
+arg_list      ::= arg { "," arg } ;
+arg           ::= [ IDENT "=" ] expr ;            (* keyword arg, D-0038 *)
+
+atom          ::= literal
+                | IDENT
+                | "<-" postfix                    (* channel receive, D-0031 *)
+                | "(" [ expr { "," expr } ] ")"   (* grouping / tuple *)
+                | list_display
+                | dict_display ;
+
+list_display  ::= "[" [ expr { "," expr } | comp_for ] "]" ;
+dict_display  ::= "{" [ dict_items | dict_comp ] "}" ;
+dict_items    ::= expr ":" expr { "," expr ":" expr } ;
+comp_for      ::= expr "for" target "in" expr [ "if" expr ] ;   (* D-0026 *)
+dict_comp     ::= expr ":" expr "for" target "in" expr [ "if" expr ] ;
+
+(* ---------- Literals & regex ---------- *)
+
+literal       ::= INT | FLOAT | IMAGINARY | STRING
+                | "True" | "False" | "None" ;      (* D-0041 *)
+
+match_regex   ::= "m" DELIM REGEX_BODY DELIM [ FLAGS ] ;        (* D-0010 *)
+subst_regex   ::= "s" DELIM REGEX_BODY DELIM REGEX_BODY DELIM [ FLAGS ] ;
+
+dotted_name   ::= IDENT { "." IDENT } ;
+
+(* ----------------------------------------------------------------------
+   Lexical tokens (informal — see crates/syntax/src/token.rs and D-0041):
+
+   IDENT      letter/_ followed by letters/digits/_  (leading "_" = private)
+   INT        42 | 0x2A | 0o52 | 0b101010   with "_" grouping
+   FLOAT      3.14 | .5 | 1. | 1e10 | 1.5e-3
+   IMAGINARY  <int|float> "j"
+   STRING     '...' | "..." | '''...''' | """...""" with r/b/f (+rb/rf) prefixes
+   TYPE_KEYWORD  int32 int64 float32 float64 i32 i64 f32 f64 bool char str
+                 bytes bigint complex list dict array
+   DELIM      a regex delimiter char after m/s (e.g. "/", "{", "!")
+   Comments   "#" to end of line.
+   ---------------------------------------------------------------------- *)
