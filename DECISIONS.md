@@ -329,3 +329,30 @@ AST nodes). Non-enum scrutinees follow Python (no match = no-op; `_`
 recommended). Statement form now; an expression form (`auto x = match ...`) may
 come later. Extends naturally to data-carrying enum variants when those land
 (tier 3; see OPEN-QUESTIONS).
+
+## D-0041 — Lexical conventions (Python-style)
+**Status:** Locked
+Adopt Python's lexical conventions throughout:
+- **Integer literals:** decimal `42`; hex `0x2A`; octal `0o52`; binary
+  `0b101010`; `_` digit grouping (`1_000_000`).
+- **Float literals:** `3.14`, `.5`, `1.`, exponent `1e10` / `1.5e-3`; `_`
+  grouping allowed.
+- **Complex literals:** imaginary suffix `j` (`3 + 4j`, `2j`) — D-0019.
+- **String literals:** both `'...'` and `"..."` are strings; triple-quoted
+  `'''...'''` / `"""..."""` are multiline; prefixes `r"..."` (raw), `b"..."`
+  (bytes), `f"..."` (f-string, D-0026), and the combinations `rb`/`rf`; Python
+  escape sequences (`\n`, `\t`, `\\`, `\uXXXX`, …).
+- **Char:** **no dedicated char literal** (Python has none). `char` values come
+  from string indexing/iteration (`s[0]`) or a `char(...)` conversion. A literal
+  can be added later if a real need appears.
+- **Line structure:** a newline terminates a statement; `\` is explicit line
+  continuation; lines continue implicitly inside `()` / `[]` / `{}`; `;` may
+  separate statements on one line.
+- **Comments:** `#` to end of line (no block comments). A docstring is a
+  triple-quoted string as the first statement of a module/def.
+- **Indentation:** spaces; consistent within a block; mixing tabs and spaces for
+  indentation is an error (Python 3 rule). Canonical formatter uses 4 spaces
+  (D-0037).
+
+**Boolean/null casing:** full **Python casing** — `True`, `False`, `None`
+(resolves the earlier lowercase `true`/`false` from D-0002). These are keywords.

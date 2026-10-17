@@ -19,12 +19,27 @@ readability, aimed at Python developers who need native performance.
   (D-0028).
 - **Blocks:** indentation-based, like Python. A `:` introduces an indented
   block.
-- **Comments:** `#` to end of line.
+- **Comments:** `#` to end of line (no block comments). A docstring is a
+  triple-quoted string as the first statement of a module/def.
 - **Identifiers:** letters, digits, `_`; cannot start with a digit. A **leading
   `_`** marks a name private to its module (enforced, D-0028). Type keywords are
   reserved and cannot be identifiers.
 - **Compilation unit:** whole-program AOT. Definitions may follow uses — **no
   forward declarations required** (D-0021).
+
+### 1.1 Literals & line rules (Python-style, D-0041)
+
+- **Integers:** `42`, `0x2A`, `0o52`, `0b101010`, with `_` grouping
+  (`1_000_000`).
+- **Floats:** `3.14`, `.5`, `1.`, `1e10`, `1.5e-3`.
+- **Complex:** imaginary suffix `j` (`3 + 4j`).
+- **Strings:** `'...'` and `"..."` are both strings; `'''...'''` / `"""..."""`
+  are multiline; prefixes `r"..."` (raw), `b"..."` (bytes), `f"..."`
+  (interpolation), and `rb`/`rf`; Python escape sequences.
+- **Char:** no dedicated literal — obtain a `char` from `s[0]` or `char(...)`.
+- **Lines:** newline ends a statement; `\` continues a line; lines continue
+  implicitly inside `()` / `[]` / `{}`; `;` may separate statements on one line.
+- **Indentation:** spaces, consistent per block; no tab/space mixing.
 
 ## 2. Program entry (D-0021)
 
@@ -70,7 +85,7 @@ const f64 PI = 3.14159
 |---|---|
 | `int64` (default int), `int32` | **signed**; overflow **wraps** (D-0005, D-0019) |
 | `float64`/`f64`, `float32`/`f32` | IEEE floating point |
-| `bool` | `true` / `false` |
+| `bool` | `True` / `False` |
 | `char` | a Unicode scalar (codepoint) |
 | `bigint` | arbitrary-precision integer (D-0019) |
 | `complex` | complex number (D-0019) |
@@ -253,16 +268,16 @@ defaulted ones, and defaults are evaluated **per call** (a fresh value each
 time, so mutable defaults like `[]` are safe — no Python once-at-def bug):
 
 ```python
-def connect(str host, int64 port = 8080, bool tls = false) -> Conn:
+def connect(str host, int64 port = 8080, bool tls = False) -> Conn:
     ...
-connect("localhost")                 # port=8080, tls=false
+connect("localhost")                 # port=8080, tls=False
 ```
 
 **Keyword arguments** — any parameter may be passed by name; positional args
 precede keyword args at a call site:
 
 ```python
-connect("localhost", tls=true)
+connect("localhost", tls=True)
 connect(host="localhost", port=80)
 ```
 
@@ -415,11 +430,11 @@ reflection. Full details in `design/0004-decorators.md`.
 ```python
 annotation Column:
     str name = ""
-    bool primary = false
+    bool primary = False
 
 @Table(name="users")
 struct User:
-    @Column(name="id", primary=true)
+    @Column(name="id", primary=True)
     int64 id
 ```
 
@@ -452,7 +467,7 @@ Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
 
 `def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
 `match`, `auto`,
-`const`, `true`, `false`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
+`const`, `True`, `False`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
 `finally`, `with`, `as`, `yield`, `lambda`, `spawn`, `channel`, `select`,
 `case`, `close`, `struct`, `interface`, `enum`, `annotation`, `decorator`,
 `import`, `python`, `m`, `s`
