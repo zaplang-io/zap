@@ -1,0 +1,11 @@
+[package]
+name = "zapc_syntax"
+description = "Zap syntax: source spans, tokens, and the abstract syntax tree."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_syntax"
+path = "src/lib.rs"

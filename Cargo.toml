@@ -1,0 +1,16 @@
+# Zap compiler workspace.
+#
+# Phase 0 scaffold: data-structure crates + a driver stub. The lexer, parser,
+# type checker and codegen land in later phases (see ROADMAP.md).
+[workspace]
+resolver = "2"
+members = [
+    "crates/syntax",
+    "crates/driver",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
