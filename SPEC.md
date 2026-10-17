@@ -204,6 +204,33 @@ for item in xs:
     print(item)
 ```
 
+**do-while** (bottom-tested; body runs once before the test, D-0039):
+
+```python
+do:
+    line = read()
+    process(line)
+while line != ""          # trailing while (no colon) closes the do block
+```
+
+**match-case** — Python-style structural pattern matching (D-0040): literals,
+capture, wildcard `_`, or-patterns, guards, and sequence/tuple/struct patterns.
+Matches on `enum` scrutinees are checked for exhaustiveness at compile time.
+
+```python
+match command:
+    case "quit":
+        stop()
+    case ["move", direction]:
+        move(direction)
+    case Point(x=0, y=y):
+        on_axis(y)
+    case n if n > 100:
+        big(n)
+    case _:
+        unknown()
+```
+
 ## 7. Functions, lambdas, generators (D-0026)
 
 ```python
@@ -423,7 +450,8 @@ Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
 
 ## Appendix A — Reserved words (provisional)
 
-`def`, `return`, `if`, `elif`, `else`, `while`, `for`, `in`, `range`, `auto`,
+`def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
+`match`, `auto`,
 `const`, `true`, `false`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
 `finally`, `with`, `as`, `yield`, `lambda`, `spawn`, `channel`, `select`,
 `case`, `close`, `struct`, `interface`, `enum`, `annotation`, `decorator`,
@@ -446,4 +474,5 @@ Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
 | Regex, arrays | Locked (design docs 0001/0002) |
 | Function args: defaults, keyword, variadics | Locked (D-0038) |
 | Decorators & annotations | Locked (D-0036, design/0004) |
-| `match`, `set`, `**kwargs` | Open (see OPEN-QUESTIONS) |
+| do-while, match-case | Locked (D-0039, D-0040) |
+| `set`, `**kwargs`, data-carrying enums | Open (see OPEN-QUESTIONS) |

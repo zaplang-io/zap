@@ -298,3 +298,34 @@ style, gofmt-spirit). Tooling detail, built later.
 - **`**kwargs`** (arbitrary named arguments) is **deferred** — it fights static
   typing, and keyword args + defaults cover the common cases. See
   OPEN-QUESTIONS.
+
+## D-0039 — `do`/`while` loop
+**Status:** Locked
+A bottom-tested loop whose body runs once before the condition is tested
+(Python has none):
+
+```python
+do:
+    line = read()
+    process(line)
+while line != ""
+```
+
+The trailing `while condition` (no colon, no block) closes the `do:` block.
+
+## D-0040 — `match`/`case` structural pattern matching
+**Status:** Locked
+Python-3.10-style **structural pattern matching** as a statement (not a plain
+switch). Supported patterns: literals; capture (a bare name binds); wildcard
+`_`; or-patterns (`a | b`); guards (`case p if cond:`); sequence/tuple
+(`[a, *rest]`, `(x, y)`); struct (`Point(x=0, y=y)`); mapping (`{"k": v}` — may
+be staged). Bare names capture-and-bind (Python semantics) — to match a known
+constant use `_`/a qualified name, not a bare name.
+
+**One upgrade over Python:** for `enum`/sum-type scrutinees the compiler performs
+**exhaustiveness checking** — a `match` that omits a variant and has no `_` is a
+compile error (fits the compile-time-safety ethos, D-0016; ideal for matching
+AST nodes). Non-enum scrutinees follow Python (no match = no-op; `_`
+recommended). Statement form now; an expression form (`auto x = match ...`) may
+come later. Extends naturally to data-carrying enum variants when those land
+(tier 3; see OPEN-QUESTIONS).
