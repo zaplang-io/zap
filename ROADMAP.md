@@ -41,6 +41,9 @@ Compiler pipeline (mirrors Go): **lex/parse → type-check → typed IR →
   tier-1 enums (D-0018).
 - Front-end ergonomics: f-strings, comprehensions, `yield` generators, lambdas,
   slicing (D-0026).
+- Decorators & annotations (D-0036): `@` syntax, annotations + runtime
+  reflection, the built-in decorator set (`@derive`/`@validate`/`@cache`/…),
+  `before`/`after`/`wrap`, and `zap expand`; user macros staged. `design/0004`.
 - Modules, imports, enforced `_` visibility (D-0028).
 
 ## Phase 3 — Signature features (parallel tracks)
