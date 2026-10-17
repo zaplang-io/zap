@@ -33,10 +33,15 @@ Compiler pipeline (mirrors Go): **lex/parse → type-check → typed IR →
 ## Phase 2 — Core language + runtime
 
 - Boehm GC integration (object layout + GC hooks) — **runtime ABI frozen here.**
-- `str`, `bytes`, `bool`, `f64`.
-- Exceptions: `raise`, unwinding, `try`/`catch` (D-0007).
-- `list[T]`, `dict[K,V]` (runtime library behind the frozen ABI).
-- Modules & imports (one file = one module, pending D-0001 follow-up).
+- `str` (immutable UTF-8, D-0025), `bytes`, `bool`, `f64`, `char`.
+- Exceptions: `raise`, unwinding, `try`/`except`/`finally` + `with` (D-0007,
+  D-0027, D-0029).
+- `list[T]`, `dict[K,V]`, tuples (runtime library behind the frozen ABI).
+- Structs + methods (D-0015); compile-time structural interfaces (D-0016);
+  tier-1 enums (D-0018).
+- Front-end ergonomics: f-strings, comprehensions, `yield` generators, lambdas,
+  slicing (D-0026).
+- Modules, imports, enforced `_` visibility (D-0028).
 
 ## Phase 3 — Signature features (parallel tracks)
 
@@ -45,13 +50,19 @@ Once the IR schema and runtime ABI are frozen, these run concurrently:
 - **Regex track** — `m//`, `s//`, `=~`/`!~`, `~=`, match objects (PCRE2). `D-0010`.
 - **Arrays track** — `array[T]` 1-D first: element-wise ops + scalar broadcast +
   SIMD lowering; then N-D shape, broadcasting, slicing. `D-0011`.
-- **Concurrency track** — goroutines + channels + scheduler. `D-0008`.
-- **Interfaces** — structural (Go-like) typing, generics beyond `list`/`dict`.
+- **Concurrency track** — coroutines + channels (unbuffered/buffered, `close`,
+  `select`), sync primitives, structured concurrency, DRF-SC memory model.
+  `D-0008`, `D-0031`–`D-0034`.
+- **Generics track** — user-defined generics via monomorphization, building on
+  the already-generic built-in containers. `D-0017`.
+- **Later language features** — data-carrying enums + `match`, default/keyword
+  args, `set` type, decorators/annotations (see `OPEN-QUESTIONS.md`).
 
 ## Phase 4 — Interop
 
 - **Python runtime interop** — embed CPython, marshal Zap ↔ Python, GIL
   handling, Python-exception ↔ Zap-exception translation. `D-0012`.
+- **Package manager** — Cargo/Go-modules-style manifest + lockfile (D-0035).
 
 ## Phase 5 — Hardening & tooling
 
