@@ -10,9 +10,9 @@ _Last updated: 2026-10-17_
 
 ## Type system & semantics
 
-- 🔴 **Function parameters: default & keyword arguments, variadics.** Python devs
-  rely on these heavily; not yet decided. Affects call syntax and the type
-  checker.
+- ⚪ **`**kwargs`-style arbitrary named arguments.** Deferred (D-0038) — fights
+  static typing; keyword args + defaults cover the common cases. Revisit if a
+  real need appears (e.g. forwarding).
 - 🟡 **Sum types + `match`** (enum tier 3). Data-carrying variants (Rust-style)
   and a pattern-matching statement. High value (state machines, AST nodes), but
   deferred past tier-1 enums (D-0018). Interacts with generics (D-0017).

@@ -262,3 +262,21 @@ dedicated discussion/design doc.
 **Status:** Locked (direction)
 A single canonical formatter enforcing **Python-style** formatting (one true
 style, gofmt-spirit). Tooling detail, built later.
+
+## D-0038 — Function arguments: defaults, keyword calls, variadics
+**Status:** Locked
+- **Default arguments:** syntax `TYPE name = expr` in the parameter list (reads
+  like a declaration). Required params precede defaulted ones.
+- **Keyword arguments:** any parameter may be passed by name; at a call site
+  positional args precede keyword args. Parameter names are therefore part of
+  the public API (renaming is a breaking change).
+- **Default evaluation is per call** — a fresh value each time, so mutable
+  defaults (`[]`, `{}`) are safe. This deliberately avoids Python's
+  evaluate-once-at-definition-time bug. (Impl: an omitted argument is filled
+  with the default expression at the call site; callers pick up a changed
+  default on recompile.)
+- **Variadics:** homogeneous, Java-style `TYPE... name`, received as a
+  `list[TYPE]`.
+- **`**kwargs`** (arbitrary named arguments) is **deferred** — it fights static
+  typing, and keyword args + defaults cover the common cases. See
+  OPEN-QUESTIONS.

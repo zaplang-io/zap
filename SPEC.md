@@ -219,8 +219,38 @@ def count(int64 n):               # generator
         i = i + 1
 ```
 
-Parameters are type-first (`TYPE name`); return type follows `->`. Default and
-keyword arguments are **not yet decided** (OPEN-QUESTIONS).
+Parameters are type-first (`TYPE name`); return type follows `->`.
+
+**Default arguments (D-0038)** read like a declaration; required params precede
+defaulted ones, and defaults are evaluated **per call** (a fresh value each
+time, so mutable defaults like `[]` are safe — no Python once-at-def bug):
+
+```python
+def connect(str host, int64 port = 8080, bool tls = false) -> Conn:
+    ...
+connect("localhost")                 # port=8080, tls=false
+```
+
+**Keyword arguments** — any parameter may be passed by name; positional args
+precede keyword args at a call site:
+
+```python
+connect("localhost", tls=true)
+connect(host="localhost", port=80)
+```
+
+**Variadics** — homogeneous, Java-style `TYPE... name`, received as a list:
+
+```python
+def sum_all(int64... nums) -> int64:
+    auto total = 0
+    for n in nums:
+        total = total + n
+    return total
+sum_all(1, 2, 3)                     # 6
+```
+
+`**kwargs`-style arbitrary named arguments are deferred (D-0038).
 
 ## 8. Comprehensions & slicing (D-0026)
 
@@ -368,4 +398,5 @@ auto col = m[:, 1]        # a view
 | Concurrency | Model locked; `select`/structured-concurrency syntax draft |
 | Modules & visibility | Locked |
 | Regex, arrays | Locked (design docs 0001/0002) |
-| Default/keyword args, `match`, `set`, decorators | Open (see OPEN-QUESTIONS) |
+| Function args: defaults, keyword, variadics | Locked (D-0038) |
+| `match`, `set`, `**kwargs`, decorators | Open (see OPEN-QUESTIONS) |
