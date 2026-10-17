@@ -466,7 +466,7 @@ Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
 ## Appendix A — Reserved words (provisional)
 
 `def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
-`match`, `auto`,
+`match`, `break`, `continue`, `auto`,
 `const`, `True`, `False`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
 `finally`, `with`, `as`, `yield`, `lambda`, `spawn`, `channel`, `select`,
 `case`, `close`, `struct`, `interface`, `enum`, `annotation`, `decorator`,
