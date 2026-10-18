@@ -155,6 +155,12 @@ pub enum Inst {
     Print {
         args: Vec<Value>,
     },
+    /// A string literal: `dest : Ptr` is a freshly built string object holding
+    /// `bytes` (interned via the runtime).
+    StrConst {
+        dest: Value,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -280,6 +286,9 @@ fn fmt_inst(i: &Inst) -> String {
         Inst::Print { args } => {
             let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
             format!("print({})", a.join(", "))
+        }
+        Inst::StrConst { dest, bytes } => {
+            format!("%{dest} = strconst {:?}", String::from_utf8_lossy(bytes))
         }
     }
 }

@@ -61,6 +61,18 @@ mod tests {
     }
 
     #[test]
+    fn lower_strings() {
+        let m = lower_ok(include_str!("../../../tests/golden/hello.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("strconst"), "text:\n{text}");
+        assert!(text.contains("call @zap_str_concat"), "text:\n{text}");
+        // `str` params/returns are pointers.
+        let greet = m.funcs.iter().find(|f| f.name == "greet").expect("greet");
+        assert_eq!(greet.params, vec![Ty::Ptr]);
+        assert_eq!(greet.ret, Ty::Ptr);
+    }
+
+    #[test]
     fn unsupported_construct_errors() {
         let (ast, _p, _l) = parse_str("def main():\n    raise Oops\n");
         let (_m, errs) = lower_module(&ast);
