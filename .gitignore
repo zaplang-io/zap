@@ -1,4 +1,5 @@
 # Rust build output
 /target
+/target-docker
 **/*.rs.bk
 Cargo.lock

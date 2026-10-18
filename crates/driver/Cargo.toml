@@ -12,3 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 zapc_syntax = { path = "../syntax" }
+zapc_sema = { path = "../sema" }
+# Codegen needs LLVM; gated behind the `llvm` feature so the driver builds
+# without LLVM on hosts that lack it.
+zapc_codegen = { path = "../codegen", optional = true }
+
+[features]
+llvm = ["dep:zapc_codegen"]

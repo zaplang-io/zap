@@ -47,17 +47,31 @@ cargo build
 cargo test
 ```
 
-`cargo test` runs the `zapc_syntax` unit tests and the golden-harness
-fixture checks. The end-to-end golden run is `#[ignore]`d until Phase 1 produces
-a runnable binary; enable it with:
+This builds the front-end crates (`zapc_syntax`, `zapc_sema`) and the driver.
+**Codegen needs LLVM** and is excluded from the default build (it's gated behind
+the driver's `llvm` feature), so `cargo build`/`cargo test` work on any host.
+
+## Compiling and running Zap programs (codegen)
+
+Codegen lowers the type-checked AST to native code via **LLVM** (D-0042). Because
+LLVM isn't available as a Homebrew binary on Intel macOS, the LLVM build runs in
+a dev container (`.devcontainer/Dockerfile`: Ubuntu + LLVM 18 + Rust). The
+`Makefile` wraps it:
 
 ```bash
-cargo test -- --ignored
+make docker-build                         # build the LLVM 18 dev image (once)
+make docker-test                          # full suite incl. LLVM codegen
+make docker-run FILE=tests/golden/fib.zap # compile + run a program  -> 55
 ```
 
-## Phase 0 scope
+`zapc run <file.zap>` runs the full pipeline (lex → parse → type-check → LLVM →
+link → run); `zapc build <file.zap> [-o out]` stops after producing the
+executable.
 
-This scaffold freezes the front-end data structures so later work can proceed in
-parallel: source spans, the token set, and the AST (`crates/syntax`), plus the
-CLI shape (`crates/driver`) and a golden-test harness. No lexing, parsing, type
-checking or codegen is implemented yet — those are Phase 1 and beyond.
+## Status
+
+The vertical slice runs end to end: `fib.zap` → `55` and `loop_sum.zap` → `45`.
+Implemented so far — lexer, parser, type checker (scalars + functions with
+inference), and LLVM codegen for the slice (int64/f64/bool, functions incl.
+recursion, control flow, `for`-over-`range`, calls, `print`). See `ROADMAP.md`
+for what's next.

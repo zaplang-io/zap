@@ -356,3 +356,20 @@ Adopt Python's lexical conventions throughout:
 
 **Boolean/null casing:** full **Python casing** — `True`, `False`, `None`
 (resolves the earlier lowercase `true`/`false` from D-0002). These are keywords.
+
+## D-0042 — Codegen backend: LLVM via inkwell
+**Status:** Locked
+Codegen lowers the type-checked AST to native code via **LLVM**, using the
+`inkwell` safe wrapper (reaffirms D-0009; chosen over Cranelift and C-emit
+because Zap's committed features — unwinding exceptions D-0007, goroutines
+D-0008, SIMD arrays D-0011 — all reward LLVM, which the lighter backends do not).
+Codegen lives in `crates/codegen` behind a small `Backend` trait so it stays
+swappable; for the vertical slice the AST lowers directly to LLVM IR (a separate
+typed SSA IR, `design/IR.md`, is deferred until features demand it), and objects
+are linked with `cc`.
+**Toolchain:** the dev host is Intel macOS, where Homebrew no longer ships LLVM
+binaries, so LLVM builds run in a dev container (`.devcontainer/Dockerfile`:
+Ubuntu + LLVM 18 + Rust; driven by `make docker-*`). Codegen is gated behind the
+driver's `llvm` feature and excluded from the workspace `default-members`, so
+host builds of the other crates work without LLVM. A single `Backend` trait keeps
+a future Cranelift or native build a drop-in option.
