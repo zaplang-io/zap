@@ -7,7 +7,9 @@
 pub mod ir;
 pub mod lower;
 
-pub use ir::{BinOp, Block, BlockId, CastKind, CmpPred, Func, Inst, Module, Term, Ty, UnOp, Value};
+pub use ir::{
+    BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Func, Inst, Module, Term, Ty, UnOp, Value,
+};
 pub use lower::{lower_module, LowerError};
 
 #[cfg(test)]
@@ -120,6 +122,36 @@ mod tests {
         ));
         let text = format!("{m}");
         assert!(text.contains("call @zap_uncaught"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_arrays() {
+        // Construction, element access, len, and sum lower to the array runtime
+        // entry points; element-wise ops lower to the dedicated ArrayBinOp node.
+        let m = lower_ok(include_str!("../../../tests/golden/array_int.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_array_new"), "text:\n{text}");
+        assert!(text.contains("call @zap_array_set_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_array_sum_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_array_len"), "text:\n{text}");
+        assert!(text.contains("call @zap_array_get_i64"), "text:\n{text}");
+        assert!(text.contains("array.Add.i64"), "text:\n{text}");
+        assert!(text.contains("array.Mul.i64"), "text:\n{text}");
+        assert!(text.contains("array.Sub.i64"), "text:\n{text}");
+        // f64 arrays select the f64-suffixed entry points.
+        let m = lower_ok(include_str!("../../../tests/golden/array_f64.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_array_sum_f64"), "text:\n{text}");
+        assert!(text.contains("array.Mul.f64"), "text:\n{text}");
+    }
+
+    #[test]
+    fn array_scalar_on_left_only_commutative() {
+        // `scalar + array` is accepted (reordered); `scalar - array` is not.
+        let (ast, _, _) =
+            parse_str("def main():\n    auto a = array[i64]([1, 2])\n    print(sum(3 - a))\n");
+        let (_m, errs) = lower_module(&ast);
+        assert!(!errs.is_empty(), "scalar - array should be rejected");
     }
 
     #[test]

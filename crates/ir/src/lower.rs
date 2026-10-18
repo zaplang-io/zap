@@ -134,12 +134,19 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
             "bool" => Ok(Ty::I1),
             "char" => Ok(Ty::I32),
             "str" | "bytes" => Ok(Ty::Ptr),
-            "list" | "array" => {
+            "list" => {
                 let e = match args.first() {
                     Some(a) => elem_of(a, ids)?,
                     None => Elem::I64,
                 };
                 Ok(Ty::List(e))
+            }
+            "array" => {
+                let d = match args.first() {
+                    Some(a) => dtype_of(a, ids)?,
+                    None => Dtype::F64,
+                };
+                Ok(Ty::Array(d))
             }
             "dict" => {
                 let k = match args.first() {
@@ -176,6 +183,31 @@ fn elem_of(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Elem, LowerError
     elem_kind(resolve_ty(t, ids)?)
 }
 
+/// The array dtype for a `array[T]` element type (ticket #24). Only `f64` and
+/// `i64` are supported in this increment; other numeric dtypes (`f32`, `i32`)
+/// and dtype promotion are deferred.
+fn dtype_of(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Dtype, LowerError> {
+    match resolve_ty(t, ids)? {
+        Ty::F64 => Ok(Dtype::F64),
+        Ty::I64 => Ok(Dtype::I64),
+        other => Err(err(format!(
+            "array[{other}] is not supported yet (only array[f64] and array[i64])"
+        ))),
+    }
+}
+
+/// The array dtype named by a construction subscript like `array[f64]`, where
+/// the dtype appears as a bare name in expression position.
+fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
+    match name {
+        "float64" | "f64" => Ok(Dtype::F64),
+        "int64" | "i64" => Ok(Dtype::I64),
+        other => Err(err(format!(
+            "array[{other}] is not supported yet (only array[f64] and array[i64])"
+        ))),
+    }
+}
+
 /// Classify a ZIR type into the element word kind collections store. Elements
 /// are uniform 8-byte words (RUNTIME-ABI §"Collection layout"): integers/bools
 /// go in as `i64`, reference types as pointers. Floats need a separate word
@@ -183,7 +215,9 @@ fn elem_of(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Elem, LowerError
 fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
     match t {
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
-        Ty::Ptr | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) => Ok(Elem::Ptr),
+        Ty::Ptr | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Array(_) => {
+            Ok(Elem::Ptr)
+        }
         Ty::F32 | Ty::F64 => Err(err(
             "collections of floating-point elements are not supported yet",
         )),
@@ -1084,7 +1118,31 @@ impl<'a> FnLower<'a> {
     }
 
     fn call(&mut self, callee: &Expr, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+        // Array construction `array[dtype]([...])` (ticket #24). The callee
+        // parses as a subscript `array[dtype]`, so it is intercepted here before
+        // the plain-name dispatch below.
+        if let Expr::Index { base, index, .. } = callee {
+            if is_name(base, "array") {
+                return self.lower_array_new(index, args);
+            }
+        }
         if let Expr::Name(fname, _) = callee {
+            if fname == "sum" {
+                if args.len() != 1 {
+                    return Err(err("sum() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let Ty::Array(d) = vt else {
+                    return Err(err("sum() expects an array[T] value"));
+                };
+                let dest = self.new_value(d.ty());
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: format!("zap_array_sum_{}", d.suffix()),
+                    args: vec![v],
+                });
+                return Ok((dest, d.ty()));
+            }
             if fname == "print" {
                 let mut vals = Vec::new();
                 for a in args {
@@ -1106,8 +1164,9 @@ impl<'a> FnLower<'a> {
                     Ty::List(_) => "zap_list_len",
                     Ty::Dict(..) => "zap_dict_len",
                     Ty::Set(_) => "zap_set_len",
+                    Ty::Array(_) => "zap_array_len",
                     Ty::Ptr => "zap_str_len",
-                    _ => return Err(err("len() expects a list, dict, set, or str")),
+                    _ => return Err(err("len() expects a list, dict, set, array, or str")),
                 };
                 let d = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
@@ -1210,6 +1269,57 @@ impl<'a> FnLower<'a> {
     // Lists and dicts lower to runtime calls (like strings), so the ZIR -> LLVM
     // step stays mechanical. The element/key/value `Elem` kind chosen here
     // selects the typed entry point (`..._i64` / `..._ptr` / `..._str`).
+
+    // --- numeric arrays (ticket #24) ---
+    //
+    // Construction, element access, `len`, and `sum` lower to runtime calls
+    // (like collections). Only the element-wise ops (`binop`) use a dedicated
+    // ZIR node so codegen can emit SIMD; everything else stays a plain call.
+
+    /// `array[dtype]([e0, e1, ...])` — allocate an array of the literal's length
+    /// and fill it element-by-element. N-D literals, non-literal arguments
+    /// (`array[f64](xs)`), and `zeros`/`arange` constructors are deferred.
+    fn lower_array_new(
+        &mut self,
+        dtype_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let Expr::Name(dname, _) = dtype_expr else {
+            return Err(err("array[...] expects a dtype name, e.g. array[f64]"));
+        };
+        let dtype = dtype_from_name(dname)?;
+        if args.len() != 1 {
+            return Err(err(
+                "array[T](...) takes exactly one argument (a list literal)",
+            ));
+        }
+        let Expr::List(elems, _) = &args[0].value else {
+            return Err(err(
+                "array[T](...) takes a list literal, e.g. array[f64]([1.0, 2.0, 3.0]) \
+                 (N-D and non-literal construction are not supported yet)",
+            ));
+        };
+        let code = self.iconst(Ty::I64, dtype.code());
+        let n = self.iconst(Ty::I64, elems.len() as i64);
+        let arr = self.new_value(Ty::Array(dtype));
+        self.emit(Inst::Call {
+            dest: Some(arr),
+            func: "zap_array_new".to_string(),
+            args: vec![code, n],
+        });
+        let setter = format!("zap_array_set_{}", dtype.suffix());
+        for (i, e) in elems.iter().enumerate() {
+            let (v, vt) = self.expr(e)?;
+            let v = self.coerce(v, vt, dtype.ty());
+            let idx = self.iconst(Ty::I64, i as i64);
+            self.emit(Inst::Call {
+                dest: None,
+                func: setter.clone(),
+                args: vec![arr, idx, v],
+            });
+        }
+        Ok((arr, Ty::Array(dtype)))
+    }
 
     fn lower_list_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
         // Evaluate elements left-to-right first; the first fixes the element
@@ -1363,7 +1473,22 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, vk.ty()))
             }
-            _ => Err(err("indexing is only supported on list and dict values")),
+            Ty::Array(d) => {
+                // 1-D element access `a[i]`. Multi-axis indexing `m[i, j]` and
+                // slices are deferred (N-D track).
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let dest = self.new_value(d.ty());
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: format!("zap_array_get_{}", d.suffix()),
+                    args: vec![bv, iv],
+                });
+                Ok((dest, d.ty()))
+            }
+            _ => Err(err(
+                "indexing is only supported on list, dict, and array values",
+            )),
         }
     }
 
@@ -1399,8 +1524,20 @@ impl<'a> FnLower<'a> {
                 });
                 Ok(())
             }
+            Ty::Array(d) => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let (v, vt) = self.expr(value)?;
+                let v = self.coerce(v, vt, d.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_array_set_{}", d.suffix()),
+                    args: vec![bv, iv, v],
+                });
+                Ok(())
+            }
             _ => Err(err(
-                "indexed assignment is only supported on list and dict values",
+                "indexed assignment is only supported on list, dict, and array values",
             )),
         }
     }
@@ -1444,6 +1581,12 @@ impl<'a> FnLower<'a> {
         rt: Ty,
     ) -> Result<(Value, Ty), LowerError> {
         use AstBin::*;
+
+        // Element-wise numeric-array ops (ticket #24): same-shape `a + b` and
+        // scalar broadcast `a + 2.0`, lowered to a SIMD kernel in codegen.
+        if matches!(lt, Ty::Array(_)) || matches!(rt, Ty::Array(_)) {
+            return self.array_binop(op, l, lt, r, rt);
+        }
 
         // Membership: `x in <set>` -> `zap_set_contains_*`, normalized to a bool.
         if matches!(op, In) {
@@ -1603,6 +1746,86 @@ impl<'a> FnLower<'a> {
             In => Err(err("'in' is not supported by codegen yet")),
             Send => Err(err("channel send is not supported by codegen yet")),
             Eq | Ne | Lt | Le | Gt | Ge => unreachable!(),
+        }
+    }
+
+    /// Element-wise `+`/`-`/`*` on arrays, including scalar broadcast. Emits the
+    /// [`Inst::ArrayBinOp`] node codegen vectorizes. Both-array operands must
+    /// share a dtype (no promotion yet); `scalar op array` is only accepted for
+    /// the commutative `+`/`*` (reordered to `array op scalar`), so the SIMD
+    /// kernel always computes `array[i] op scalar`.
+    fn array_binop(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lt: Ty,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        use AstBin::*;
+        let irop = match op {
+            Add => BinOp::Add,
+            Sub => BinOp::Sub,
+            Mul => BinOp::Mul,
+            _ => {
+                return Err(err(
+                    "only +, -, and * are supported on arrays yet (/, reductions beyond sum, etc. are deferred)",
+                ))
+            }
+        };
+        let is_scalar = |t: Ty| t.is_float() || t.int_width().is_some();
+        match (lt, rt) {
+            (Ty::Array(ld), Ty::Array(rd)) => {
+                if ld != rd {
+                    return Err(err(
+                        "element-wise array ops require the same dtype on both sides (dtype promotion is deferred)",
+                    ));
+                }
+                let dest = self.new_value(Ty::Array(ld));
+                self.emit(Inst::ArrayBinOp {
+                    dest,
+                    op: irop,
+                    dtype: ld,
+                    lhs: l,
+                    rhs: r,
+                    scalar: false,
+                });
+                Ok((dest, Ty::Array(ld)))
+            }
+            (Ty::Array(ld), _) if is_scalar(rt) => {
+                let s = self.coerce(r, rt, ld.ty());
+                let dest = self.new_value(Ty::Array(ld));
+                self.emit(Inst::ArrayBinOp {
+                    dest,
+                    op: irop,
+                    dtype: ld,
+                    lhs: l,
+                    rhs: s,
+                    scalar: true,
+                });
+                Ok((dest, Ty::Array(ld)))
+            }
+            (_, Ty::Array(rd)) if is_scalar(lt) => {
+                if !matches!(op, Add | Mul) {
+                    return Err(err(
+                        "scalar-on-the-left broadcast is only supported for + and * (write `a - scalar`, not `scalar - a`)",
+                    ));
+                }
+                let s = self.coerce(l, lt, rd.ty());
+                let dest = self.new_value(Ty::Array(rd));
+                self.emit(Inst::ArrayBinOp {
+                    dest,
+                    op: irop,
+                    dtype: rd,
+                    lhs: r,
+                    rhs: s,
+                    scalar: true,
+                });
+                Ok((dest, Ty::Array(rd)))
+            }
+            _ => Err(err(
+                "unsupported array operand (element-wise ops take two arrays of the same dtype or an array and a numeric scalar)",
+            )),
         }
     }
 

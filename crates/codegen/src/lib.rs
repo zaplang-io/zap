@@ -18,8 +18,10 @@ use inkwell::module::Module as LlvmModule;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType};
-use inkwell::values::{BasicValueEnum, FunctionValue};
+use inkwell::types::{
+    BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, VectorType,
+};
+use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue, VectorValue};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
 use zapc_ir::{self as zir, lower_module, CastKind, CmpPred, Func, Inst, Term, Ty};
@@ -264,6 +266,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         );
         self.declare_rt("zap_set_items", &[p.into()], Some(p.into()));
 
+        // Numeric-array entry points (ticket #24, see design/0002-arrays.md and
+        // design/RUNTIME-ABI.md §"Collection layout"). Construction, element
+        // access, length, and reductions are runtime calls; the element-wise
+        // ops (`Inst::ArrayBinOp`) are vectorized inline in codegen instead.
+        let f = self.ctx.f64_type();
+        self.declare_rt("zap_array_new", &[i.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_array_len", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_array_data", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_array_get_f64", &[p.into(), i.into()], Some(f.into()));
+        self.declare_rt("zap_array_set_f64", &[p.into(), i.into(), f.into()], None);
+        self.declare_rt("zap_array_get_i64", &[p.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_array_set_i64", &[p.into(), i.into(), i.into()], None);
+        self.declare_rt("zap_array_sum_f64", &[p.into()], Some(f.into()));
+        self.declare_rt("zap_array_sum_i64", &[p.into()], Some(i.into()));
+
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
         for sl in &m.structs {
@@ -364,9 +381,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Ty::I64 => self.ctx.i64_type().into(),
             Ty::F32 => self.ctx.f32_type().into(),
             Ty::F64 => self.ctx.f64_type().into(),
-            Ty::Ptr | Ty::Void | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) => {
-                self.ctx.ptr_type(AddressSpace::default()).into()
-            }
+            Ty::Ptr
+            | Ty::Void
+            | Ty::Struct(_)
+            | Ty::List(_)
+            | Ty::Dict(..)
+            | Ty::Set(_)
+            | Ty::Array(_) => self.ctx.ptr_type(AddressSpace::default()).into(),
         }
     }
 
@@ -711,8 +732,290 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .map_err(|e| e.to_string())?;
                 vals[*dest as usize] = cs.try_as_basic_value().left();
             }
+            Inst::ArrayBinOp {
+                dest,
+                op,
+                dtype,
+                lhs,
+                rhs,
+                scalar,
+            } => {
+                let lv = get(vals, *lhs);
+                let rv = get(vals, *rhs);
+                let res = self.array_binop(*op, *dtype, lv, rv, *scalar, fv)?;
+                vals[*dest as usize] = Some(res);
+            }
         }
         Ok(())
+    }
+
+    /// Lower an element-wise array op to a SIMD loop (ticket #24): a vector body
+    /// that processes `VW` lanes per iteration with explicit LLVM vector
+    /// load/arith/store, followed by a scalar remainder loop for the final
+    /// `len % VW` elements. `lhs` is the source array pointer; `rhs` is either a
+    /// second array pointer (`!scalar`) or a scalar broadcast across all lanes
+    /// (`scalar`). Returns the freshly allocated result array pointer. This is
+    /// the deliberate exception to the "mechanical" rule — the whole point of
+    /// the ticket is that the arithmetic vectorizes.
+    fn array_binop(
+        &self,
+        op: zir::BinOp,
+        dtype: zir::Dtype,
+        lhs: BasicValueEnum<'ctx>,
+        rhs: BasicValueEnum<'ctx>,
+        scalar: bool,
+        fv: FunctionValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let b = self.builder;
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let la = lhs.into_pointer_value();
+
+        // n = len(lhs); res = new(dtype, n). Both element buffers come back as
+        // raw pointers via `zap_array_data`, so this loop never needs to know
+        // the array object's field layout.
+        let n = self
+            .call1("zap_array_len", &[la.into()], "n")?
+            .into_int_value();
+        let code = i64t.const_int(dtype.code() as u64, false);
+        let res = self
+            .call1("zap_array_new", &[code.into(), n.into()], "arr")?
+            .into_pointer_value();
+        let lp = self
+            .call1("zap_array_data", &[la.into()], "lp")?
+            .into_pointer_value();
+        let op_ptr = self
+            .call1("zap_array_data", &[res.into()], "op")?
+            .into_pointer_value();
+        let rp = if scalar {
+            None
+        } else {
+            Some(
+                self.call1("zap_array_data", &[rhs.into_pointer_value().into()], "rp")?
+                    .into_pointer_value(),
+            )
+        };
+
+        let is_float = dtype.is_float();
+        let elem_ty = self.basic(dtype.ty());
+        const VW: u64 = 4;
+        let vec_ty: VectorType<'ctx> = if is_float {
+            self.ctx.f64_type().vec_type(VW as u32)
+        } else {
+            i64t.vec_type(VW as u32)
+        };
+
+        // Broadcast the scalar operand into a lane vector for the vector body.
+        let svec = if scalar {
+            let mut v = vec_ty.get_undef();
+            for lane in 0..VW {
+                let idx = i32t.const_int(lane, false);
+                v = b
+                    .build_insert_element(v, rhs, idx, "splat")
+                    .map_err(|e| e.to_string())?;
+            }
+            Some(v)
+        } else {
+            None
+        };
+
+        // vend = n & ~(VW-1): the largest multiple of VW not exceeding n.
+        let mask = i64t.const_int(!(VW - 1), false);
+        let vend = b.build_and(n, mask, "vend").map_err(|e| e.to_string())?;
+
+        let entry = b.get_insert_block().unwrap();
+        let vhead = self.ctx.append_basic_block(fv, "arr.vhead");
+        let vbody = self.ctx.append_basic_block(fv, "arr.vbody");
+        let rhead = self.ctx.append_basic_block(fv, "arr.rhead");
+        let rbody = self.ctx.append_basic_block(fv, "arr.rbody");
+        let done = self.ctx.append_basic_block(fv, "arr.done");
+        b.build_unconditional_branch(vhead)
+            .map_err(|e| e.to_string())?;
+
+        // --- vector loop ---
+        b.position_at_end(vhead);
+        let i_phi = b.build_phi(i64t, "i").map_err(|e| e.to_string())?;
+        let i = i_phi.as_basic_value().into_int_value();
+        let vcond = b
+            .build_int_compare(IntPredicate::SLT, i, vend, "vcond")
+            .map_err(|e| e.to_string())?;
+        b.build_conditional_branch(vcond, vbody, rhead)
+            .map_err(|e| e.to_string())?;
+
+        b.position_at_end(vbody);
+        let lvec = self.vec_load(vec_ty, elem_ty, lp, i, "lv")?;
+        let rvec = match rp {
+            Some(rp) => self.vec_load(vec_ty, elem_ty, rp, i, "rv")?,
+            None => svec.unwrap(),
+        };
+        let resvec = self.vec_arith(op, is_float, lvec, rvec)?;
+        let optr = unsafe {
+            b.build_gep(elem_ty, op_ptr, &[i], "optr")
+                .map_err(|e| e.to_string())?
+        };
+        let st = b.build_store(optr, resvec).map_err(|e| e.to_string())?;
+        st.set_alignment(8).map_err(|e| e.to_string())?;
+        let inext = b
+            .build_int_add(i, i64t.const_int(VW, false), "inext")
+            .map_err(|e| e.to_string())?;
+        b.build_unconditional_branch(vhead)
+            .map_err(|e| e.to_string())?;
+        let zero = i64t.const_int(0, false);
+        i_phi.add_incoming(&[(&zero, entry), (&inext, vbody)]);
+
+        // --- scalar remainder loop ---
+        b.position_at_end(rhead);
+        let j_phi = b.build_phi(i64t, "j").map_err(|e| e.to_string())?;
+        let j = j_phi.as_basic_value().into_int_value();
+        let rcond = b
+            .build_int_compare(IntPredicate::SLT, j, n, "rcond")
+            .map_err(|e| e.to_string())?;
+        b.build_conditional_branch(rcond, rbody, done)
+            .map_err(|e| e.to_string())?;
+
+        b.position_at_end(rbody);
+        let lsc = self.elem_load(elem_ty, lp, j, "ls")?;
+        let rsc = match rp {
+            Some(rp) => self.elem_load(elem_ty, rp, j, "rs")?,
+            None => rhs,
+        };
+        let ressc = self.scalar_arith(op, is_float, lsc, rsc)?;
+        let optr = unsafe {
+            b.build_gep(elem_ty, op_ptr, &[j], "optrs")
+                .map_err(|e| e.to_string())?
+        };
+        b.build_store(optr, ressc).map_err(|e| e.to_string())?;
+        let jnext = b
+            .build_int_add(j, i64t.const_int(1, false), "jnext")
+            .map_err(|e| e.to_string())?;
+        b.build_unconditional_branch(rhead)
+            .map_err(|e| e.to_string())?;
+        j_phi.add_incoming(&[(&vend, vhead), (&jnext, rbody)]);
+
+        b.position_at_end(done);
+        Ok(res.into())
+    }
+
+    /// Call a runtime function expected to return a single value.
+    fn call1(
+        &self,
+        name: &str,
+        args: &[inkwell::values::BasicMetadataValueEnum<'ctx>],
+        label: &str,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let fv = self.fns[name];
+        let cs = self
+            .builder
+            .build_call(fv, args, label)
+            .map_err(|e| e.to_string())?;
+        cs.try_as_basic_value()
+            .left()
+            .ok_or_else(|| format!("runtime call '{name}' returned void"))
+    }
+
+    /// A `VW`-lane vector load from `base[idx]`, aligned to the element (8) so
+    /// the buffer need not be vector-aligned.
+    fn vec_load(
+        &self,
+        vec_ty: VectorType<'ctx>,
+        elem_ty: BasicTypeEnum<'ctx>,
+        base: PointerValue<'ctx>,
+        idx: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) -> Result<VectorValue<'ctx>, String> {
+        let ptr = unsafe {
+            self.builder
+                .build_gep(elem_ty, base, &[idx], label)
+                .map_err(|e| e.to_string())?
+        };
+        let v = self
+            .builder
+            .build_load(vec_ty, ptr, label)
+            .map_err(|e| e.to_string())?;
+        v.into_vector_value()
+            .as_instruction()
+            .unwrap()
+            .set_alignment(8)
+            .map_err(|e| e.to_string())?;
+        Ok(v.into_vector_value())
+    }
+
+    /// A scalar element load from `base[idx]`.
+    fn elem_load(
+        &self,
+        elem_ty: BasicTypeEnum<'ctx>,
+        base: PointerValue<'ctx>,
+        idx: inkwell::values::IntValue<'ctx>,
+        label: &str,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let ptr = unsafe {
+            self.builder
+                .build_gep(elem_ty, base, &[idx], label)
+                .map_err(|e| e.to_string())?
+        };
+        self.builder
+            .build_load(elem_ty, ptr, label)
+            .map_err(|e| e.to_string())
+    }
+
+    fn vec_arith(
+        &self,
+        op: zir::BinOp,
+        is_float: bool,
+        l: VectorValue<'ctx>,
+        r: VectorValue<'ctx>,
+    ) -> Result<VectorValue<'ctx>, String> {
+        use zir::BinOp::*;
+        let b = self.builder;
+        let v = if is_float {
+            match op {
+                Add => b.build_float_add(l, r, "vfadd"),
+                Sub => b.build_float_sub(l, r, "vfsub"),
+                Mul => b.build_float_mul(l, r, "vfmul"),
+                _ => return Err("unsupported element-wise array op".into()),
+            }
+        } else {
+            match op {
+                Add => b.build_int_add(l, r, "viadd"),
+                Sub => b.build_int_sub(l, r, "visub"),
+                Mul => b.build_int_mul(l, r, "vimul"),
+                _ => return Err("unsupported element-wise array op".into()),
+            }
+        };
+        v.map_err(|e| e.to_string())
+    }
+
+    fn scalar_arith(
+        &self,
+        op: zir::BinOp,
+        is_float: bool,
+        l: BasicValueEnum<'ctx>,
+        r: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        use zir::BinOp::*;
+        let b = self.builder;
+        let v: BasicValueEnum = if is_float {
+            let (lf, rf) = (l.into_float_value(), r.into_float_value());
+            match op {
+                Add => b.build_float_add(lf, rf, "fadd"),
+                Sub => b.build_float_sub(lf, rf, "fsub"),
+                Mul => b.build_float_mul(lf, rf, "fmul"),
+                _ => return Err("unsupported element-wise array op".into()),
+            }
+            .map_err(|e| e.to_string())?
+            .into()
+        } else {
+            let (li, ri) = (l.into_int_value(), r.into_int_value());
+            match op {
+                Add => b.build_int_add(li, ri, "add"),
+                Sub => b.build_int_sub(li, ri, "sub"),
+                Mul => b.build_int_mul(li, ri, "mul"),
+                _ => return Err("unsupported element-wise array op".into()),
+            }
+            .map_err(|e| e.to_string())?
+            .into()
+        };
+        Ok(v)
     }
 
     fn term(
@@ -819,5 +1122,68 @@ fn float_pred(p: CmpPred) -> FloatPredicate {
         CmpPred::Le => FloatPredicate::OLE,
         CmpPred::Gt => FloatPredicate::OGT,
         CmpPred::Ge => FloatPredicate::OGE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zapc_ir::lower_module;
+    use zapc_syntax::parser::parse_str;
+
+    /// Translate a source program straight to LLVM IR text (no object/link).
+    fn llvm_ir(src: &str) -> String {
+        let (ast, perrs, lerrs) = parse_str(src);
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        let (zir, errs) = lower_module(&ast);
+        assert!(errs.is_empty(), "lower errors: {errs:?}");
+        let ctx = Context::create();
+        let llmod = ctx.create_module("test");
+        let builder = ctx.create_builder();
+        let mut cg = Cg::new(&ctx, &llmod, &builder);
+        cg.translate(&zir).expect("translate");
+        llmod
+            .verify()
+            .map_err(|e| e.to_string())
+            .expect("valid LLVM module");
+        llmod.print_to_string().to_string()
+    }
+
+    // The payoff of ticket #24: element-wise array arithmetic must lower to
+    // explicit LLVM vector instructions (SIMD), not a scalar loop.
+    #[test]
+    fn array_elementwise_vectorizes_f64() {
+        let ir = llvm_ir(
+            "def main():\n    auto a = array[f64]([1.0, 2.0, 3.0, 4.0, 5.0])\n    auto b = array[f64]([5.0, 4.0, 3.0, 2.0, 1.0])\n    print(sum(a + b))\n",
+        );
+        assert!(
+            ir.contains("fadd <4 x double>"),
+            "expected a vectorized fadd in IR:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn array_elementwise_vectorizes_i64() {
+        let ir = llvm_ir(
+            "def main():\n    auto a = array[i64]([1, 2, 3, 4, 5, 6, 7, 8])\n    auto b = array[i64]([8, 7, 6, 5, 4, 3, 2, 1])\n    print(sum(a * b))\n",
+        );
+        assert!(
+            ir.contains("mul <4 x i64>"),
+            "expected a vectorized mul in IR:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn array_scalar_broadcast_vectorizes() {
+        let ir = llvm_ir(
+            "def main():\n    auto a = array[f64]([1.0, 2.0, 3.0, 4.0, 5.0])\n    print(sum(a * 2.0))\n",
+        );
+        // The scalar is broadcast across lanes (a constant splat folds to a
+        // constant vector) and the multiply is still vectorized.
+        assert!(
+            ir.contains("fmul <4 x double>"),
+            "expected a vectorized fmul for scalar broadcast:\n{ir}"
+        );
     }
 }

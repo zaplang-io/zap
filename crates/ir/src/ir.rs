@@ -46,6 +46,43 @@ impl Elem {
     }
 }
 
+/// The element dtype of a numeric `array[T]` (ticket #24). Both current dtypes
+/// are 8-byte element words; this is what selects the typed runtime entry point
+/// (`zap_array_*_f64` / `_i64`) and the LLVM vector element type in the SIMD
+/// element-wise lowering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dtype {
+    F64,
+    I64,
+}
+
+impl Dtype {
+    /// The ZIR scalar type of one element.
+    pub fn ty(self) -> Ty {
+        match self {
+            Dtype::F64 => Ty::F64,
+            Dtype::I64 => Ty::I64,
+        }
+    }
+    /// The runtime-entry-point suffix for this dtype.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Dtype::F64 => "f64",
+            Dtype::I64 => "i64",
+        }
+    }
+    /// The runtime dtype tag passed to `zap_array_new` (matches `zaprt.c`).
+    pub fn code(self) -> i64 {
+        match self {
+            Dtype::F64 => 0,
+            Dtype::I64 => 1,
+        }
+    }
+    pub fn is_float(self) -> bool {
+        matches!(self, Dtype::F64)
+    }
+}
+
 /// A ZIR type (lower-level than a Zap type; reference types become `Ptr`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -66,6 +103,9 @@ pub enum Ty {
     /// A pointer to a `set` object with the given element representation. Elements
     /// are hashed/compared like dict keys, so they use [`Elem::key_suffix`].
     Set(Elem),
+    /// A pointer to a numeric `array` object with the given element dtype
+    /// (ticket #24).
+    Array(Dtype),
     Void,
 }
 
@@ -247,6 +287,22 @@ pub enum Inst {
     LandingPad {
         dest: Value,
     },
+    /// Element-wise binary op on numeric arrays (ticket #24): `dest` is a fresh
+    /// array holding `lhs[i] <op> rhs[i]` (or `lhs[i] <op> scalar` when
+    /// `scalar`). `op` is one of `Add`/`Sub`/`Mul`; `dtype` fixes the element
+    /// type. Codegen lowers this to an explicit LLVM vector loop (SIMD) with a
+    /// scalar remainder — the one non-mechanical ZIR node for arrays, mirroring
+    /// how `Invoke`/`LandingPad` carry the exception-edge shape. `lhs` is always
+    /// an array; `rhs` is an array (same dtype, same length) when `!scalar`, or
+    /// a scalar of `dtype`'s type when `scalar`.
+    ArrayBinOp {
+        dest: Value,
+        op: BinOp,
+        dtype: Dtype,
+        lhs: Value,
+        rhs: Value,
+        scalar: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -316,6 +372,7 @@ impl fmt::Display for Ty {
             Ty::List(e) => return write!(f, "list[{}]", e.val_suffix()),
             Ty::Dict(k, v) => return write!(f, "dict[{}, {}]", k.key_suffix(), v.val_suffix()),
             Ty::Set(e) => return write!(f, "set[{}]", e.key_suffix()),
+            Ty::Array(d) => return write!(f, "array[{}]", d.suffix()),
         };
         f.write_str(s)
     }
@@ -421,6 +478,20 @@ fn fmt_inst(i: &Inst) -> String {
             }
         }
         Inst::LandingPad { dest } => format!("%{dest} = landingpad"),
+        Inst::ArrayBinOp {
+            dest,
+            op,
+            dtype,
+            lhs,
+            rhs,
+            scalar,
+        } => {
+            let kind = if *scalar { "scalar" } else { "array" };
+            format!(
+                "%{dest} = array.{op:?}.{} %{lhs}, %{rhs} ({kind})",
+                dtype.suffix()
+            )
+        }
     }
 }
 
