@@ -7,6 +7,45 @@
 
 use std::fmt;
 
+/// The machine representation of a collection element, key, or value. Elements
+/// are stored as uniform 8-byte words by the runtime (see `design/RUNTIME-ABI.md`
+/// §"Collection layout"): integers/bools fit directly, reference types are a
+/// pointer. This two-way split is all codegen needs; it is what selects the
+/// typed runtime entry point (e.g. `zap_list_push_i64` vs `zap_list_push_ptr`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elem {
+    /// An integer/bool element, passed as `i64`.
+    I64,
+    /// A reference-typed element (`str`, struct, nested collection), passed as a
+    /// pointer.
+    Ptr,
+}
+
+impl Elem {
+    /// The ZIR type a value of this element kind flows as.
+    pub fn ty(self) -> Ty {
+        match self {
+            Elem::I64 => Ty::I64,
+            Elem::Ptr => Ty::Ptr,
+        }
+    }
+    /// The runtime-entry-point suffix for an element/value of this kind.
+    pub fn val_suffix(self) -> &'static str {
+        match self {
+            Elem::I64 => "i64",
+            Elem::Ptr => "ptr",
+        }
+    }
+    /// The runtime-entry-point suffix for a *key* of this kind. Pointer keys are
+    /// strings for the current increment (hashed/compared by contents).
+    pub fn key_suffix(self) -> &'static str {
+        match self {
+            Elem::I64 => "i64",
+            Elem::Ptr => "str",
+        }
+    }
+}
+
 /// A ZIR type (lower-level than a Zap type; reference types become `Ptr`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
@@ -20,6 +59,13 @@ pub enum Ty {
     Ptr,
     /// A pointer to a struct instance; the `u32` indexes [`Module::structs`].
     Struct(u32),
+    /// A pointer to a `list` object with the given element representation.
+    List(Elem),
+    /// A pointer to a `dict` object with the given key and value representations.
+    Dict(Elem, Elem),
+    /// A pointer to a `set` object with the given element representation. Elements
+    /// are hashed/compared like dict keys, so they use [`Elem::key_suffix`].
+    Set(Elem),
     Void,
 }
 
@@ -248,6 +294,9 @@ impl fmt::Display for Ty {
             Ty::Ptr => "ptr",
             Ty::Void => "void",
             Ty::Struct(id) => return write!(f, "struct#{id}"),
+            Ty::List(e) => return write!(f, "list[{}]", e.val_suffix()),
+            Ty::Dict(k, v) => return write!(f, "dict[{}, {}]", k.key_suffix(), v.val_suffix()),
+            Ty::Set(e) => return write!(f, "set[{}]", e.key_suffix()),
         };
         f.write_str(s)
     }

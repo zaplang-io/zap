@@ -160,6 +160,85 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .module
             .add_function("zap_alloc", ptr.fn_type(&[i64t.into()], false), None);
         self.fns.insert("zap_alloc".to_string(), alloc);
+        let str_len =
+            self.module
+                .add_function("zap_str_len", i64t.fn_type(&[ptr.into()], false), None);
+        self.fns.insert("zap_str_len".to_string(), str_len);
+
+        // Collection entry points (ticket #21, see design/RUNTIME-ABI.md). Lists
+        // and dicts store uniform 8-byte element words; the lowering picks the
+        // `_i64` / `_ptr` / `_str` variant per element kind, so this step stays
+        // a mechanical declaration of fixed C signatures.
+        let p = ptr;
+        let i = i64t;
+        // list
+        self.declare_rt("zap_list_new", &[], Some(p.into()));
+        self.declare_rt("zap_list_push_i64", &[p.into(), i.into()], None);
+        self.declare_rt("zap_list_push_ptr", &[p.into(), p.into()], None);
+        self.declare_rt("zap_list_get_i64", &[p.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_list_get_ptr", &[p.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_list_set_i64", &[p.into(), i.into(), i.into()], None);
+        self.declare_rt("zap_list_set_ptr", &[p.into(), i.into(), p.into()], None);
+        self.declare_rt("zap_list_len", &[p.into()], Some(i.into()));
+        // dict
+        self.declare_rt("zap_dict_new", &[], Some(p.into()));
+        self.declare_rt("zap_dict_len", &[p.into()], Some(i.into()));
+        self.declare_rt(
+            "zap_dict_set_i64_i64",
+            &[p.into(), i.into(), i.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_set_i64_ptr",
+            &[p.into(), i.into(), p.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_set_str_i64",
+            &[p.into(), p.into(), i.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_set_str_ptr",
+            &[p.into(), p.into(), p.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_get_i64_i64",
+            &[p.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_i64_ptr",
+            &[p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_str_i64",
+            &[p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_str_ptr",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+        // set
+        self.declare_rt("zap_set_new", &[], Some(p.into()));
+        self.declare_rt("zap_set_len", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_set_add_i64", &[p.into(), i.into()], None);
+        self.declare_rt("zap_set_add_str", &[p.into(), p.into()], None);
+        self.declare_rt(
+            "zap_set_contains_i64",
+            &[p.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_set_contains_str",
+            &[p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt("zap_set_items", &[p.into()], Some(p.into()));
 
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
@@ -188,6 +267,22 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.translate_fn(f)?;
         }
         Ok(())
+    }
+
+    /// Declare a runtime entry point (`ret = None` means `void`) and remember it
+    /// under `name` for `Inst::Call` resolution.
+    fn declare_rt(
+        &mut self,
+        name: &str,
+        params: &[BasicMetadataTypeEnum<'ctx>],
+        ret: Option<BasicTypeEnum<'ctx>>,
+    ) {
+        let fnty = match ret {
+            Some(t) => t.fn_type(params, false),
+            None => self.ctx.void_type().fn_type(params, false),
+        };
+        let fv = self.module.add_function(name, fnty, None);
+        self.fns.insert(name.to_string(), fv);
     }
 
     fn translate_fn(&mut self, f: &Func) -> Result<(), String> {
@@ -224,7 +319,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Ty::I64 => self.ctx.i64_type().into(),
             Ty::F32 => self.ctx.f32_type().into(),
             Ty::F64 => self.ctx.f64_type().into(),
-            Ty::Ptr | Ty::Void | Ty::Struct(_) => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Ptr | Ty::Void | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) => {
+                self.ctx.ptr_type(AddressSpace::default()).into()
+            }
         }
     }
 

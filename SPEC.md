@@ -178,7 +178,8 @@ print(c.name)         # "GREEN"
 
 ### 4.7 Generics (D-0017)
 
-Built-in containers are generic today (`list[T]`, `dict[K,V]`, `array[T]`).
+Built-in containers are generic today (`list[T]`, `dict[K,V]`, `set[T]`,
+`array[T]`).
 User-defined generics (monomorphized) are staged in later; the syntax is
 reserved now:
 
@@ -473,7 +474,7 @@ Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
 `import`, `python`, `m`, `s`
 (contextual, before a delimiter), and the type keywords (`int32`, `int64`,
 `float32`, `float64`, `i32`, `i64`, `f32`, `f64`, `bool`, `char`, `str`,
-`bytes`, `bigint`, `complex`, `list`, `dict`, `array`).
+`bytes`, `bigint`, `complex`, `list`, `dict`, `set`, `array`).
 
 ## Appendix B — Status of sections
 

@@ -86,6 +86,19 @@ mod tests {
     }
 
     #[test]
+    fn lower_sets() {
+        let m = lower_ok(include_str!("../../../tests/golden/set_int.zap"));
+        let text = format!("{m}");
+        // Literal construction, add, membership, len, and snapshot-iteration all
+        // lower to the set runtime entry points.
+        assert!(text.contains("call @zap_set_new"), "text:\n{text}");
+        assert!(text.contains("call @zap_set_add_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_set_contains_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_set_len"), "text:\n{text}");
+        assert!(text.contains("call @zap_set_items"), "text:\n{text}");
+    }
+
+    #[test]
     fn unsupported_construct_errors() {
         let (ast, _p, _l) = parse_str("def main():\n    raise Oops\n");
         let (_m, errs) = lower_module(&ast);

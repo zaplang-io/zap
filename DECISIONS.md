@@ -373,3 +373,21 @@ Ubuntu + LLVM 18 + Rust; driven by `make docker-*`). Codegen is gated behind the
 driver's `llvm` feature and excluded from the workspace `default-members`, so
 host builds of the other crates work without LLVM. A single `Backend` trait keeps
 a future Cranelift or native build a drop-in option.
+
+## D-0043 — `set` built-in collection type
+**Status:** Locked
+`set[T]` joins `list[T]` and `dict[K,V]` as a built-in collection (the original
+core types were list/dict/array; `set` is added here). `set` becomes a reserved
+type keyword alongside the other container keywords.
+**Literal syntax (brace disambiguation):** `{...}` is read as a **set** when it
+holds comma-separated elements with no `key: value` pairs (`{1, 2, 3}`), and as a
+**dict** when it holds `key: value` pairs (`{k: v}`). Empty `{}` stays a **dict**
+(the conventional default; an empty set has no literal form yet — use a typed
+declaration). The same rule extends to comprehensions: `{x for x in it}` is a set
+comprehension, `{k: v for ...}` a dict comprehension.
+**First increment (ticket #21):** literal, membership (`x in s`), `.add(x)`,
+`len(s)`, and `for x in s` iteration (unordered). Implemented as a dict without
+values — an open-addressing hash table sharing the dict's key hashing/equality
+(per `design/RUNTIME-ABI.md`), GC-managed. Deferred, consistent with list/dict:
+float elements, set algebra (union/intersection/difference), `.remove`/`.discard`,
+and struct-element hashing.

@@ -367,6 +367,9 @@ pub enum Expr {
     Tuple(Vec<Expr>, Span),
     List(Vec<Expr>, Span),
     Dict(Vec<(Expr, Expr)>, Span),
+    /// `{a, b, c}` — a set literal: braces with comma-separated elements and no
+    /// `key: value` pairs (empty `{}` parses as an empty [`Expr::Dict`]).
+    Set(Vec<Expr>, Span),
 
     /// `[elem for var in iter if cond]`
     ListComp {
@@ -380,6 +383,14 @@ pub enum Expr {
     DictComp {
         key: Box<Expr>,
         value: Box<Expr>,
+        var: String,
+        iter: Box<Expr>,
+        cond: Option<Box<Expr>>,
+        span: Span,
+    },
+    /// `{elem for var in iter if cond}`
+    SetComp {
+        elem: Box<Expr>,
         var: String,
         iter: Box<Expr>,
         cond: Option<Box<Expr>>,
