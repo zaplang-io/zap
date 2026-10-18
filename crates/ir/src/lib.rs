@@ -8,7 +8,8 @@ pub mod ir;
 pub mod lower;
 
 pub use ir::{
-    BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Func, Inst, Module, Term, Ty, UnOp, Value,
+    BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem, Func, Inst, Module, Term, Ty, UnOp,
+    Value,
 };
 pub use lower::{lower_module, LowerError};
 
@@ -254,6 +255,71 @@ mod tests {
         assert!(text.contains("call @zap_reflect_register"), "text:\n{text}");
         assert!(text.contains("call @zap_reflect_has"), "text:\n{text}");
         assert!(text.contains("call @zap_reflect_names"), "text:\n{text}");
+    }
+
+    // --- goroutines & channels (ticket #25, D-0013/D-0031) ---
+
+    #[test]
+    fn lower_goroutines_fixture() {
+        // The golden program exercises the whole core surface: channel
+        // construction (unbuffered + buffered), `spawn` of a named function,
+        // channel send/receive, and `close`.
+        let m = lower_ok(include_str!("../../../tests/golden/goroutines.zap"));
+        let text = format!("{m}");
+        // `channel[int64]()` / `channel[int64](cap)` lower to the constructor.
+        assert!(text.contains("call @zap_chan_new"), "text:\n{text}");
+        // `spawn worker(...)` lowers to the dedicated Spawn node naming the fn.
+        assert!(text.contains("spawn @worker("), "text:\n{text}");
+        // send/recv pick the i64-suffixed typed entry points.
+        assert!(text.contains("@zap_chan_send_i64("), "text:\n{text}");
+        assert!(text.contains("@zap_chan_recv_i64("), "text:\n{text}");
+        // `close(ch)` lowers to the close entry point.
+        assert!(text.contains("@zap_chan_close("), "text:\n{text}");
+        // A `channel[int64]` parameter and a channel value are typed `chan[i64]`.
+        let worker = m.funcs.iter().find(|f| f.name == "worker").expect("worker");
+        assert_eq!(worker.params, vec![Ty::Chan(Elem::I64), Ty::I64]);
+    }
+
+    #[test]
+    fn spawn_is_a_dedicated_node_with_eager_args() {
+        // `spawn f(a, b)` evaluates its args in the parent, then emits a Spawn
+        // node carrying the callee and the evaluated argument values.
+        let m = lower_ok(
+            "def f(int64 a, int64 b):\n    print(a + b)\n\ndef main():\n    spawn f(1, 2)\n",
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").expect("main");
+        let spawn = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|i| match i {
+                Inst::Spawn { func, args } => Some((func.clone(), args.len())),
+                _ => None,
+            })
+            .expect("a Spawn instruction");
+        assert_eq!(spawn, ("f".to_string(), 2));
+    }
+
+    #[test]
+    fn channel_of_strings_uses_ptr_entry_points() {
+        // A `channel[str]` stores pointer-word elements, selecting the `_ptr`
+        // typed send/receive entry points.
+        let m = lower_ok(
+            "def main():\n    auto ch = channel[str](1)\n    ch <- \"hi\"\n    auto s = <-ch\n    print(s)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_chan_send_ptr("), "text:\n{text}");
+        assert!(text.contains("@zap_chan_recv_ptr("), "text:\n{text}");
+    }
+
+    #[test]
+    fn spawn_of_unknown_function_errors() {
+        let (ast, _p, _l) = parse_str("def main():\n    spawn nope(1)\n");
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            !errs.is_empty(),
+            "spawn of an undefined function should error"
+        );
     }
 
     // --- regex (ticket #23, D-0010) ---

@@ -216,6 +216,16 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
                 };
                 Ok(Ty::Set(e))
             }
+            "channel" => {
+                // A channel's element uses the same uniform-word representation
+                // as a collection element (ticket #25, D-0031): the element kind
+                // picks the typed send/recv runtime entry point.
+                let e = match args.first() {
+                    Some(a) => elem_of(a, ids)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::Chan(e))
+            }
             other => match ids.get(other) {
                 Some(id) => Ok(Ty::Struct(*id)),
                 None => Err(err(format!(
@@ -258,6 +268,21 @@ fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
     }
 }
 
+/// The channel element kind named by a construction subscript like
+/// `channel[int64]`, where the element type appears as a bare name in
+/// expression position (ticket #25, D-0031). Integers/bools become an `i64`
+/// word; reference types (`str`, structs, collections) become a pointer word.
+fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
+    match name {
+        "int64" | "i64" | "int32" | "i32" | "bool" | "char" => Ok(Elem::I64),
+        "float64" | "f64" | "float32" | "f32" => Err(err(
+            "channels of floating-point elements are not supported yet",
+        )),
+        // `str`, `bytes`, struct, and nested-collection elements are references.
+        _ => Ok(Elem::Ptr),
+    }
+}
+
 /// Classify a ZIR type into the element word kind collections store. Elements
 /// are uniform 8-byte words (RUNTIME-ABI §"Collection layout"): integers/bools
 /// go in as `i64`, reference types as pointers. Floats need a separate word
@@ -271,6 +296,7 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
         | Ty::Dict(..)
         | Ty::Set(_)
         | Ty::Array(_)
+        | Ty::Chan(_)
         | Ty::Match
         | Ty::Py => Ok(Elem::Ptr),
         Ty::F32 | Ty::F64 => Err(err(
@@ -1112,10 +1138,48 @@ impl<'a> FnLower<'a> {
                 finally,
                 ..
             } => self.lower_try(body, excepts, finally.as_ref()),
-            Stmt::With { .. } | Stmt::Match { .. } | Stmt::Spawn { .. } => Err(err(
+            Stmt::Spawn { call, .. } => self.lower_spawn(call),
+            Stmt::With { .. } | Stmt::Match { .. } => Err(err(
                 "this statement is not supported by codegen yet (Phase 1 slice)",
             )),
         }
+    }
+
+    /// Lower `spawn f(args)` (ticket #25, D-0013). The operand must be a call;
+    /// its arguments are evaluated eagerly here, in the spawning coroutine (so
+    /// argument evaluation happens-before the child — D-0034), coerced to the
+    /// callee's parameter types, and handed to [`Inst::Spawn`], which codegen
+    /// turns into a GC-registered thread running `f`. Fire-and-forget: the spawn
+    /// yields no handle; the root scope joins all spawned threads at program exit
+    /// (`zap_rt_join_all`, emitted at `main`'s return). Only a direct call to a
+    /// named top-level function is supported in this increment; method-call and
+    /// lambda operands (`spawn s.handle(c)`, `spawn (lambda: ...)()`) are a
+    /// documented follow-up, as is the structured-concurrency `scope:` block.
+    fn lower_spawn(&mut self, call: &Expr) -> Result<(), LowerError> {
+        let Expr::Call { callee, args, .. } = call else {
+            return Err(err("spawn operand must be a call expression (D-0013)"));
+        };
+        let Expr::Name(fname, _) = callee.as_ref() else {
+            return Err(err(
+                "spawn of a method or lambda call is not supported yet (only `spawn f(...)` to a named function)",
+            ));
+        };
+        let (ptys, _ret) = self
+            .sigs
+            .get(fname)
+            .cloned()
+            .ok_or_else(|| err(format!("spawn of unknown function '{fname}'")))?;
+        let mut argvals = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            let (v, vt) = self.expr(&a.value)?;
+            let target = *ptys.get(i).unwrap_or(&vt);
+            argvals.push(self.coerce(v, vt, target));
+        }
+        self.emit(Inst::Spawn {
+            func: fname.clone(),
+            args: argvals,
+        });
+        Ok(())
     }
 
     /// Balance the `__cxa_begin_catch` performed on landing-pad entry. Called on
@@ -1664,6 +1728,25 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, at))
             }
+            // Channel receive `<-ch` (ticket #25, D-0031): blocks until a value
+            // is available, then yields it. The element kind carried by the
+            // channel type picks the typed runtime entry point and the result
+            // type. (The comma-ok `v, ok = <-ch` form and `select` are a
+            // documented follow-up.)
+            Expr::ChanRecv { chan, .. } => {
+                let (cv, cty) = self.expr(chan)?;
+                let Ty::Chan(elem) = cty else {
+                    return Err(err("the operand of '<-' (receive) must be a channel"));
+                };
+                let ety = elem.ty();
+                let d = self.new_value(ety);
+                self.throwing_call(
+                    Some(d),
+                    &format!("zap_chan_recv_{}", elem.val_suffix()),
+                    vec![cv],
+                );
+                Ok((d, ety))
+            }
             _ => Err(err(
                 "this expression is not supported by codegen yet (Phase 1 slice)",
             )),
@@ -1677,6 +1760,9 @@ impl<'a> FnLower<'a> {
         if let Expr::Index { base, index, .. } = callee {
             if is_name(base, "array") {
                 return self.lower_array_new(index, args);
+            }
+            if is_name(base, "channel") {
+                return self.lower_chan_new(index, args);
             }
         }
         if let Expr::Name(fname, _) = callee {
@@ -1720,6 +1806,19 @@ impl<'a> FnLower<'a> {
             }
             if fname == "range" {
                 return Err(err("range() can only be used in a for-loop (Phase 1)"));
+            }
+            // `close(ch)` (ticket #25, D-0031): mark a channel closed. After this,
+            // a send raises and a receive drains then reports not-ok.
+            if fname == "close" {
+                if args.len() != 1 {
+                    return Err(err("close() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if !matches!(vt, Ty::Chan(_)) {
+                    return Err(err("close() expects a channel"));
+                }
+                self.throwing_call(None, "zap_chan_close", vec![v]);
+                return Ok((self.iconst(Ty::I32, 0), Ty::I32));
             }
             if fname == "len" {
                 if args.len() != 1 {
@@ -1937,6 +2036,44 @@ impl<'a> FnLower<'a> {
             });
         }
         Ok((arr, Ty::Array(dtype)))
+    }
+
+    /// Lower channel construction `channel[T]()` (unbuffered) or
+    /// `channel[T](cap)` (buffered) (ticket #25, D-0031). The runtime stores
+    /// elements as uniform 8-byte words, so construction only needs the
+    /// capacity; the element kind `T` is carried in the ZIR [`Ty::Chan`] so
+    /// later send/recv pick the typed entry point. An absent capacity means an
+    /// unbuffered (rendezvous) channel.
+    fn lower_chan_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let Expr::Name(ename, _) = elem_expr else {
+            return Err(err(
+                "channel[...] expects an element type name, e.g. channel[int64]",
+            ));
+        };
+        let elem = chan_elem_from_name(ename)?;
+        let cap = match args.len() {
+            0 => self.iconst(Ty::I64, 0),
+            1 => {
+                let (v, vt) = self.expr(&args[0].value)?;
+                self.coerce(v, vt, Ty::I64)
+            }
+            _ => {
+                return Err(err(
+                    "channel[T](...) takes at most one argument (the buffer capacity)",
+                ))
+            }
+        };
+        let ch = self.new_value(Ty::Chan(elem));
+        self.emit(Inst::Call {
+            dest: Some(ch),
+            func: "zap_chan_new".to_string(),
+            args: vec![cap],
+        });
+        Ok((ch, Ty::Chan(elem)))
     }
 
     fn lower_list_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
@@ -2403,6 +2540,24 @@ impl<'a> FnLower<'a> {
     ) -> Result<(Value, Ty), LowerError> {
         use AstBin::*;
 
+        // Channel send `ch <- v` (ticket #25, D-0031): handled before the
+        // generic reference-type guard below, since the channel operand is a
+        // reference type. Blocks until the value can be delivered; the element
+        // kind picks the typed runtime entry point. Used as a statement, so the
+        // result is a unit-like `i32 0`.
+        if matches!(op, Send) {
+            let Ty::Chan(elem) = lt else {
+                return Err(err("the left operand of '<-' (send) must be a channel"));
+            };
+            let v = self.coerce(r, rt, elem.ty());
+            self.throwing_call(
+                None,
+                &format!("zap_chan_send_{}", elem.val_suffix()),
+                vec![l, v],
+            );
+            return Ok((self.iconst(Ty::I32, 0), Ty::I32));
+        }
+
         // Element-wise numeric-array ops (ticket #24): same-shape `a + b` and
         // scalar broadcast `a + 2.0`, lowered to a SIMD kernel in codegen.
         if matches!(lt, Ty::Array(_)) || matches!(rt, Ty::Array(_)) {
@@ -2631,7 +2786,9 @@ impl<'a> FnLower<'a> {
                 Ok((d, Ty::I1))
             }
             In => Err(err("'in' is not supported by codegen yet")),
-            Send => Err(err("channel send is not supported by codegen yet")),
+            // `Send` is intercepted at the top of `binop` (before the generic
+            // reference-type guard), so it never reaches here.
+            Send => unreachable!("channel send handled above"),
             Eq | Ne | Lt | Le | Gt | Ge => unreachable!(),
         }
     }

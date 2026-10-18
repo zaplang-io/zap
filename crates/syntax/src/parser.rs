@@ -1451,9 +1451,15 @@ impl Parser {
                 Expr::Name(name, span)
             }
             // Type/builtin keywords usable in value position (constructors,
-            // conversions): list/dict/array/int64(...)/range/channel/...
+            // conversions, built-in functions): list/dict/array/int64(...)/
+            // range/channel/close/... `close` is reserved (SPEC §16) but is an
+            // ordinary built-in function (design/0005-concurrency.md), so it
+            // reads as a callable name here.
             TokenKind::Keyword(k)
-                if k.is_type() || k == Keyword::Range || k == Keyword::Channel =>
+                if k.is_type()
+                    || k == Keyword::Range
+                    || k == Keyword::Channel
+                    || k == Keyword::Close =>
             {
                 self.bump();
                 Expr::Name(k.as_str().to_string(), span)

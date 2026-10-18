@@ -354,6 +354,7 @@ impl Keyword {
                 | Dict
                 | Set
                 | Array
+                | Channel
         )
     }
 }

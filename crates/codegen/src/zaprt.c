@@ -15,8 +15,18 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+/* `GC_THREADS` must be defined before <gc.h> so the collector is built/used in
+ * its thread-aware mode (ticket #25, D-0009/D-0013): it then knows about every
+ * goroutine OS thread and scans each one's stack and registers, so live objects
+ * reachable only from a running or suspended coroutine are never collected. The
+ * goroutine runtime starts threads with `GC_pthread_create` (declared by <gc.h>
+ * in this mode) so the collector registers them automatically; channels block
+ * on pthread mutex/condvars. The dev container's `libgc-dev` has thread
+ * support, and the program links `-lpthread` (see build_executable). */
+#define GC_THREADS
 #include <gc.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1160,4 +1170,256 @@ void *zap_py_str(void *obj_) {
     Py_DECREF(s);
     PyGILState_Release(g);
     return out;
+}
+
+/* ===========================================================================
+ * Goroutines + channels (ticket #25, D-0013/D-0031/D-0033/D-0034,
+ * design/0005-concurrency.md).
+ *
+ * This is a correct, shippable milestone of the locked CSP surface, backed by
+ * OS threads rather than a user-space M:N scheduler:
+ *
+ *   - `spawn f(args)` starts one GC-registered pthread (`GC_pthread_create`)
+ *     running `f` on the eagerly-evaluated argument closure. Fire-and-forget:
+ *     no handle. The implicit root scope joins every spawned thread at program
+ *     exit (`zap_rt_join_all`, emitted at `main`'s return), so a bare `spawn`
+ *     is never truly detached (D-0013/D-0033).
+ *   - Channels are `channel[T]()` (unbuffered rendezvous) and `channel[T](cap)`
+ *     (buffered), with `<-` send/receive and `close`, blocking on a
+ *     mutex/condvar (D-0031). Elements are uniform 8-byte words; the typed
+ *     entry points reinterpret them as `int64` or pointer.
+ *   - Channel/close operations are the happens-before synchronization edges the
+ *     DRF-SC model needs (D-0034); the mutex/condvar provide them directly.
+ *
+ * Because every goroutine runs on a GC-registered OS thread, the collector
+ * scans each one's stack and registers, so live objects reachable only from a
+ * running goroutine stay alive with no extra GC machinery (the property
+ * design/0005 relies on for the green-thread stacks). GC_THREADS (defined above
+ * <gc.h>) and GC_pthread_create provide that registration.
+ *
+ * DEFERRED (language-visible semantics unchanged; see the PR / OPEN-QUESTIONS):
+ * the user-space work-stealing M:N scheduler with green-thread stacks, the
+ * `scope:` block and cooperative cancellation, `select`, the comma-ok receive
+ * `v, ok = <-ch` and `for v in ch:`, and the `sync` module
+ * (Mutex/WaitGroup/Once/Atomic). The runtime ABI here is additive, so these
+ * drop in without changing the surface already compiled.
+ * =========================================================================== */
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t not_full;  /* buffered: space available; unbuffered: slot emptied */
+    pthread_cond_t not_empty; /* buffered: item available; unbuffered: slot filled   */
+    pthread_cond_t drained;   /* unbuffered: the handed-off value was taken          */
+    pthread_mutex_t send_mu;  /* unbuffered: serializes senders through the slot     */
+    uint64_t *buf;            /* `cap` element words (buffered); NULL when unbuffered */
+    int64_t cap;              /* buffer capacity; 0 => unbuffered rendezvous          */
+    int64_t count;            /* items currently buffered                            */
+    int64_t head;             /* next slot to read                                   */
+    int64_t tail;             /* next slot to write                                  */
+    int closed;
+    uint64_t u_slot; /* unbuffered rendezvous hand-off slot                 */
+    int u_has;       /* a sender has deposited a value awaiting a receiver  */
+} ZapChan;
+
+/* `channel[T]()` / `channel[T](cap)`. The buffer is GC_MALLOC (pointer-scanned,
+ * not atomic) so a pointer-element channel keeps its queued references alive. */
+void *zap_chan_new(int64_t cap) {
+    ZapChan *c = (ZapChan *)GC_MALLOC(sizeof(ZapChan));
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->not_full, NULL);
+    pthread_cond_init(&c->not_empty, NULL);
+    pthread_cond_init(&c->drained, NULL);
+    pthread_mutex_init(&c->send_mu, NULL);
+    c->cap = cap > 0 ? cap : 0;
+    c->buf = c->cap > 0
+                 ? (uint64_t *)GC_MALLOC((size_t)c->cap * sizeof(uint64_t))
+                 : NULL;
+    c->count = 0;
+    c->head = 0;
+    c->tail = 0;
+    c->closed = 0;
+    c->u_slot = 0;
+    c->u_has = 0;
+    return c;
+}
+
+/* `send on a closed channel` is a programming error that raises (D-0031).
+ * Releases the channel lock (and, when given, the unbuffered send lock) before
+ * raising so the channel is left in a consistent, unlocked state. */
+static void chan_send_closed(ZapChan *c, pthread_mutex_t *also) {
+    pthread_mutex_unlock(&c->mu);
+    if (also) {
+        pthread_mutex_unlock(also);
+    }
+    zap_panic(zap_str_new("send on closed channel", 22));
+}
+
+static void chan_send_word(ZapChan *c, uint64_t v) {
+    if (c->cap > 0) {
+        pthread_mutex_lock(&c->mu);
+        while (c->count == c->cap && !c->closed) {
+            pthread_cond_wait(&c->not_full, &c->mu);
+        }
+        if (c->closed) {
+            chan_send_closed(c, NULL);
+            return;
+        }
+        c->buf[c->tail] = v;
+        c->tail = (c->tail + 1) % c->cap;
+        c->count++;
+        pthread_cond_signal(&c->not_empty);
+        pthread_mutex_unlock(&c->mu);
+    } else {
+        /* Rendezvous: only one sender occupies the hand-off slot at a time
+         * (`send_mu`), so the slot's `u_has` flag unambiguously tracks *this*
+         * sender's value — deposit it, wake a receiver, then block until the
+         * receiver takes it, so the send does not complete until a receive does
+         * (true unbuffered semantics, correct for many concurrent senders). */
+        pthread_mutex_lock(&c->send_mu);
+        pthread_mutex_lock(&c->mu);
+        if (c->closed) {
+            chan_send_closed(c, &c->send_mu);
+            return;
+        }
+        c->u_slot = v;
+        c->u_has = 1;
+        pthread_cond_signal(&c->not_empty);
+        while (c->u_has && !c->closed) {
+            pthread_cond_wait(&c->drained, &c->mu);
+        }
+        if (c->u_has && c->closed) {
+            c->u_has = 0;
+            chan_send_closed(c, &c->send_mu);
+            return;
+        }
+        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(&c->send_mu);
+    }
+}
+
+/* Receive one word. `*ok` is set to 1 on a real value, 0 when the channel is
+ * closed and drained (the zero-value case the comma-ok form will surface). */
+static uint64_t chan_recv_word(ZapChan *c, int *ok) {
+    pthread_mutex_lock(&c->mu);
+    if (c->cap > 0) {
+        while (c->count == 0 && !c->closed) {
+            pthread_cond_wait(&c->not_empty, &c->mu);
+        }
+        if (c->count == 0 && c->closed) {
+            pthread_mutex_unlock(&c->mu);
+            if (ok) {
+                *ok = 0;
+            }
+            return 0;
+        }
+        uint64_t v = c->buf[c->head];
+        c->head = (c->head + 1) % c->cap;
+        c->count--;
+        pthread_cond_signal(&c->not_full);
+        pthread_mutex_unlock(&c->mu);
+        if (ok) {
+            *ok = 1;
+        }
+        return v;
+    } else {
+        while (!c->u_has && !c->closed) {
+            pthread_cond_wait(&c->not_empty, &c->mu);
+        }
+        if (!c->u_has && c->closed) {
+            pthread_mutex_unlock(&c->mu);
+            if (ok) {
+                *ok = 0;
+            }
+            return 0;
+        }
+        uint64_t v = c->u_slot;
+        c->u_has = 0;
+        pthread_cond_signal(&c->drained);  /* wake the matched sender */
+        pthread_cond_signal(&c->not_full); /* let another sender deposit */
+        pthread_mutex_unlock(&c->mu);
+        if (ok) {
+            *ok = 1;
+        }
+        return v;
+    }
+}
+
+void zap_chan_send_i64(void *ch, int64_t v) {
+    chan_send_word((ZapChan *)ch, (uint64_t)v);
+}
+void zap_chan_send_ptr(void *ch, void *v) {
+    chan_send_word((ZapChan *)ch, (uint64_t)(uintptr_t)v);
+}
+int64_t zap_chan_recv_i64(void *ch) {
+    int ok;
+    return (int64_t)chan_recv_word((ZapChan *)ch, &ok);
+}
+void *zap_chan_recv_ptr(void *ch) {
+    int ok;
+    return (void *)(uintptr_t)chan_recv_word((ZapChan *)ch, &ok);
+}
+
+void zap_chan_close(void *ch) {
+    ZapChan *c = (ZapChan *)ch;
+    pthread_mutex_lock(&c->mu);
+    c->closed = 1;
+    pthread_cond_broadcast(&c->not_empty);
+    pthread_cond_broadcast(&c->not_full);
+    pthread_cond_broadcast(&c->drained);
+    pthread_mutex_unlock(&c->mu);
+}
+
+/* --- goroutine spawn + root-scope join -------------------------------------
+ *
+ * The registry tracks every spawned thread so the root scope can join them all
+ * at program exit. It grows under its own lock; goroutines that spawn further
+ * goroutines append to the same registry, and `zap_rt_join_all` keeps joining
+ * until the list is drained (so the whole coroutine tree completes). */
+static pthread_mutex_t zap_threads_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t *zap_threads = NULL;
+static int64_t zap_threads_len = 0;
+static int64_t zap_threads_cap = 0;
+static int64_t zap_threads_joined = 0;
+
+/* `zap_spawn(trampoline, closure)`: start a GC-registered thread running
+ * `trampoline(closure)`. `GC_pthread_create` registers the new thread with the
+ * collector so its stack and registers are scanned (keeping objects reachable
+ * only from the running goroutine alive). */
+void zap_spawn(void *fn_, void *arg) {
+    void *(*fn)(void *) = (void *(*)(void *))fn_;
+    pthread_t t;
+    int rc = GC_pthread_create(&t, NULL, fn, arg);
+    if (rc != 0) {
+        fprintf(stderr, "zap: failed to spawn coroutine (pthread_create: %d)\n", rc);
+        abort();
+    }
+    pthread_mutex_lock(&zap_threads_mu);
+    if (zap_threads_len == zap_threads_cap) {
+        int64_t ncap = zap_threads_cap ? zap_threads_cap * 2 : 8;
+        pthread_t *n =
+            (pthread_t *)GC_MALLOC_ATOMIC((size_t)ncap * sizeof(pthread_t));
+        if (zap_threads) {
+            memcpy(n, zap_threads, (size_t)zap_threads_len * sizeof(pthread_t));
+        }
+        zap_threads = n;
+        zap_threads_cap = ncap;
+    }
+    zap_threads[zap_threads_len++] = t;
+    pthread_mutex_unlock(&zap_threads_mu);
+}
+
+/* Join every spawned coroutine (the implicit root scope's join at program
+ * exit). Re-reads the length each iteration so coroutines spawned by other
+ * coroutines are joined too. */
+void zap_rt_join_all(void) {
+    for (;;) {
+        pthread_mutex_lock(&zap_threads_mu);
+        if (zap_threads_joined >= zap_threads_len) {
+            pthread_mutex_unlock(&zap_threads_mu);
+            return;
+        }
+        pthread_t t = zap_threads[zap_threads_joined++];
+        pthread_mutex_unlock(&zap_threads_mu);
+        GC_pthread_join(t, NULL);
+    }
 }
