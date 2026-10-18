@@ -107,6 +107,7 @@ struct Cg<'a, 'ctx> {
     module: &'a LlvmModule<'ctx>,
     builder: &'a Builder<'ctx>,
     fns: std::collections::HashMap<String, FunctionValue<'ctx>>,
+    structs: Vec<inkwell::types::StructType<'ctx>>,
 }
 
 impl<'a, 'ctx> Cg<'a, 'ctx> {
@@ -120,6 +121,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             module,
             builder,
             fns: std::collections::HashMap::new(),
+            structs: Vec::new(),
         }
     }
 
@@ -150,6 +152,18 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             None,
         );
         self.fns.insert("zap_print_str".to_string(), print_str);
+        // zap_alloc(size) -> ptr (zeroed); routes to the GC later (ticket #10).
+        let alloc = self
+            .module
+            .add_function("zap_alloc", ptr.fn_type(&[i64t.into()], false), None);
+        self.fns.insert("zap_alloc".to_string(), alloc);
+
+        // Build LLVM struct types (fields are scalars or pointers, so no
+        // recursive-by-value ordering concerns).
+        for sl in &m.structs {
+            let field_tys: Vec<BasicTypeEnum> = sl.fields.iter().map(|t| self.basic(*t)).collect();
+            self.structs.push(self.ctx.struct_type(&field_tys, false));
+        }
 
         // Declare all functions first (so calls resolve).
         for f in &m.funcs {
@@ -207,7 +221,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Ty::I64 => self.ctx.i64_type().into(),
             Ty::F32 => self.ctx.f32_type().into(),
             Ty::F64 => self.ctx.f64_type().into(),
-            Ty::Ptr | Ty::Void => self.ctx.ptr_type(AddressSpace::default()).into(),
+            Ty::Ptr | Ty::Void | Ty::Struct(_) => self.ctx.ptr_type(AddressSpace::default()).into(),
         }
     }
 
@@ -459,6 +473,46 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .build_call(str_new, &[data_ptr.into(), len.into()], "strnew")
                     .map_err(|e| e.to_string())?;
                 vals[*dest as usize] = cs.try_as_basic_value().left();
+            }
+            Inst::StructNew { dest, sid } => {
+                let st = self.structs[*sid as usize];
+                let size = st
+                    .size_of()
+                    .ok_or_else(|| "struct has no size".to_string())?;
+                let alloc = self.fns["zap_alloc"];
+                let cs = b
+                    .build_call(alloc, &[size.into()], "structnew")
+                    .map_err(|e| e.to_string())?;
+                vals[*dest as usize] = cs.try_as_basic_value().left();
+            }
+            Inst::FieldGet {
+                dest,
+                base,
+                sid,
+                idx,
+            } => {
+                let st = self.structs[*sid as usize];
+                let p = get(vals, *base).into_pointer_value();
+                let fp = b
+                    .build_struct_gep(st, p, *idx, "fieldptr")
+                    .map_err(|_| "invalid field index".to_string())?;
+                let ty = self.basic(f.value_ty(*dest));
+                let v = b.build_load(ty, fp, "field").map_err(|e| e.to_string())?;
+                vals[*dest as usize] = Some(v);
+            }
+            Inst::FieldSet {
+                base,
+                sid,
+                idx,
+                val,
+            } => {
+                let st = self.structs[*sid as usize];
+                let p = get(vals, *base).into_pointer_value();
+                let fp = b
+                    .build_struct_gep(st, p, *idx, "fieldptr")
+                    .map_err(|_| "invalid field index".to_string())?;
+                b.build_store(fp, get(vals, *val))
+                    .map_err(|e| e.to_string())?;
             }
         }
         Ok(())

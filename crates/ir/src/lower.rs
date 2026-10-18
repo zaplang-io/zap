@@ -19,43 +19,112 @@ pub struct LowerError {
 }
 
 /// Lower a type-checked module to ZIR.
+/// Struct layouts/ids collected before lowering function bodies.
+struct StructCtx {
+    ids: HashMap<String, u32>,
+    names: Vec<String>,
+    fields: Vec<Vec<(String, Ty)>>,
+}
+
+impl StructCtx {
+    /// Index and type of `name` in struct `sid`.
+    fn field(&self, sid: u32, name: &str) -> Option<(u32, Ty)> {
+        self.fields[sid as usize]
+            .iter()
+            .enumerate()
+            .find(|(_, (n, _))| n == name)
+            .map(|(i, (_, t))| (i as u32, *t))
+    }
+}
+
 pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
-    let mut sigs: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
     let mut errors = Vec::new();
 
+    // Collect struct ids, then resolve field types (two passes so fields may
+    // reference structs declared later).
+    let mut ids: HashMap<String, u32> = HashMap::new();
+    let mut names: Vec<String> = Vec::new();
     for item in &module.items {
-        if let ast::Item::Function(f) = item {
-            let params: Vec<Ty> = f
-                .params
-                .iter()
-                .map(|p| {
-                    p.ty.as_ref()
-                        .map(ast_ty)
-                        .unwrap_or(Ok(Ty::Ptr))
-                        .unwrap_or(Ty::Ptr)
-                })
-                .collect();
-            let ret = match &f.ret {
-                Some(t) => ast_ty(t).unwrap_or(Ty::Void),
-                None => Ty::Void,
-            };
-            sigs.insert(f.name.clone(), (params, ret));
+        if let ast::Item::Struct(s) = item {
+            ids.insert(s.name.clone(), names.len() as u32);
+            names.push(s.name.clone());
+        }
+    }
+    let mut fields: Vec<Vec<(String, Ty)>> = vec![Vec::new(); names.len()];
+    for item in &module.items {
+        if let ast::Item::Struct(s) = item {
+            let sid = ids[&s.name];
+            for fld in &s.fields {
+                let ft = resolve_ty(&fld.ty, &ids).unwrap_or(Ty::Ptr);
+                fields[sid as usize].push((fld.name.clone(), ft));
+            }
+        }
+    }
+    let ctx = StructCtx { ids, names, fields };
+
+    // Signatures: top-level functions and struct methods (mangled `S__m`).
+    let mut sigs: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
+    for item in &module.items {
+        match item {
+            ast::Item::Function(f) => {
+                let params = f.params.iter().map(|p| param_ty(p, None, &ctx)).collect();
+                let ret = f
+                    .ret
+                    .as_ref()
+                    .map(|t| resolve_ty(t, &ctx.ids).unwrap_or(Ty::Void))
+                    .unwrap_or(Ty::Void);
+                sigs.insert(f.name.clone(), (params, ret));
+            }
+            ast::Item::Struct(s) => {
+                let sid = ctx.ids[&s.name];
+                for m in &s.methods {
+                    let params = m
+                        .params
+                        .iter()
+                        .map(|p| param_ty(p, Some(sid), &ctx))
+                        .collect();
+                    let ret = m
+                        .ret
+                        .as_ref()
+                        .map(|t| resolve_ty(t, &ctx.ids).unwrap_or(Ty::Void))
+                        .unwrap_or(Ty::Void);
+                    sigs.insert(format!("{}__{}", s.name, m.name), (params, ret));
+                }
+            }
+            _ => {}
         }
     }
 
     let mut out = Module::default();
+    for sid in 0..ctx.names.len() {
+        out.structs.push(StructLayout {
+            name: ctx.names[sid].clone(),
+            fields: ctx.fields[sid].iter().map(|(_, t)| *t).collect(),
+        });
+    }
     for item in &module.items {
-        if let ast::Item::Function(f) = item {
-            match lower_fn(f, &sigs) {
+        match item {
+            ast::Item::Function(f) => match lower_fn(f, f.name.clone(), None, &sigs, &ctx) {
                 Ok(func) => out.funcs.push(func),
                 Err(e) => errors.push(e),
+            },
+            ast::Item::Struct(s) => {
+                let sid = ctx.ids[&s.name];
+                for m in &s.methods {
+                    let name = format!("{}__{}", s.name, m.name);
+                    match lower_fn(m, name, Some(sid), &sigs, &ctx) {
+                        Ok(func) => out.funcs.push(func),
+                        Err(e) => errors.push(e),
+                    }
+                }
             }
+            _ => {}
         }
     }
     (out, errors)
 }
 
-fn ast_ty(t: &ast::Type) -> Result<Ty, LowerError> {
+fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerError> {
     match t {
         ast::Type::Named { name, .. } => match name.as_str() {
             "int64" | "i64" => Ok(Ty::I64),
@@ -65,22 +134,43 @@ fn ast_ty(t: &ast::Type) -> Result<Ty, LowerError> {
             "bool" => Ok(Ty::I1),
             "char" => Ok(Ty::I32),
             "str" | "bytes" => Ok(Ty::Ptr),
-            other => Err(err(format!(
-                "type '{other}' is not supported by codegen yet"
-            ))),
+            other => match ids.get(other) {
+                Some(id) => Ok(Ty::Struct(*id)),
+                None => Err(err(format!(
+                    "type '{other}' is not supported by codegen yet"
+                ))),
+            },
         },
         _ => Err(err("only named scalar types are supported by codegen yet")),
     }
+}
+
+fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
+    if p.name == "self" {
+        if let Some(sid) = self_sid {
+            return Ty::Struct(sid);
+        }
+    }
+    p.ty.as_ref()
+        .map(|t| resolve_ty(t, &ctx.ids).unwrap_or(Ty::Ptr))
+        .unwrap_or(Ty::Ptr)
 }
 
 fn err(m: impl Into<String>) -> LowerError {
     LowerError { message: m.into() }
 }
 
-fn lower_fn(f: &ast::Function, sigs: &HashMap<String, (Vec<Ty>, Ty)>) -> Result<Func, LowerError> {
-    let (params, ret) = sigs.get(&f.name).cloned().unwrap();
-    let is_main = f.name == "main";
-    let mut b = FnLower::new(f.name.clone(), params.clone(), ret, is_main, sigs);
+fn lower_fn(
+    f: &ast::Function,
+    zir_name: String,
+    self_sid: Option<u32>,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let (params, ret) = sigs.get(&zir_name).cloned().unwrap();
+    let is_main = zir_name == "main";
+    let _ = self_sid;
+    let mut b = FnLower::new(zir_name, params.clone(), ret, is_main, sigs, ctx);
 
     // Parameters: values 0..n are the incoming args; copy each into a slot.
     for (i, p) in f.params.iter().enumerate() {
@@ -111,6 +201,7 @@ struct FnLower<'a> {
     loops: Vec<(BlockId, BlockId)>, // (continue, break)
     term_set: HashSet<BlockId>,     // blocks with a real terminator
     sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &'a StructCtx,
 }
 
 impl<'a> FnLower<'a> {
@@ -120,6 +211,7 @@ impl<'a> FnLower<'a> {
         ret: Ty,
         is_main: bool,
         sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
+        ctx: &'a StructCtx,
     ) -> FnLower<'a> {
         let value_types = params.clone();
         let func = Func {
@@ -141,6 +233,7 @@ impl<'a> FnLower<'a> {
             loops: Vec::new(),
             term_set: HashSet::new(),
             sigs,
+            ctx,
         }
     }
 
@@ -236,7 +329,7 @@ impl<'a> FnLower<'a> {
             } => {
                 let (v, vt) = self.expr(value)?;
                 let declared = match ty {
-                    Some(t) => ast_ty(t)?,
+                    Some(t) => resolve_ty(t, &self.ctx.ids)?,
                     None => vt,
                 };
                 let v = self.coerce(v, vt, declared);
@@ -246,17 +339,35 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             Stmt::Assign { target, value, .. } => {
-                let (v, vt) = self.expr(value)?;
                 if let Expr::Name(n, _) = target {
+                    let (v, vt) = self.expr(value)?;
                     let (ptr, ty) = self
                         .lookup(n)
                         .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
                     let v = self.coerce(v, vt, ty);
                     self.store(ptr, v);
                     Ok(())
+                } else if let Expr::Attr { base, name, .. } = target {
+                    let (bv, bty) = self.expr(base)?;
+                    let Ty::Struct(sid) = bty else {
+                        return Err(err("field assignment on a non-struct value"));
+                    };
+                    let (idx, fty) = self
+                        .ctx
+                        .field(sid, name)
+                        .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
+                    let (v, vt) = self.expr(value)?;
+                    let v = self.coerce(v, vt, fty);
+                    self.emit(Inst::FieldSet {
+                        base: bv,
+                        sid,
+                        idx,
+                        val: v,
+                    });
+                    Ok(())
                 } else {
                     Err(err(
-                        "only simple variable assignment is supported by codegen yet",
+                        "only variable and field assignment are supported by codegen yet",
                     ))
                 }
             }
@@ -589,6 +700,24 @@ impl<'a> FnLower<'a> {
                 self.binop(*op, l, lt, r, rt)
             }
             Expr::Call { callee, args, .. } => self.call(callee, args),
+            Expr::Attr { base, name, .. } => {
+                let (bv, bty) = self.expr(base)?;
+                let Ty::Struct(sid) = bty else {
+                    return Err(err("field access on a non-struct value"));
+                };
+                let (idx, fty) = self
+                    .ctx
+                    .field(sid, name)
+                    .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
+                let d = self.new_value(fty);
+                self.emit(Inst::FieldGet {
+                    dest: d,
+                    base: bv,
+                    sid,
+                    idx,
+                });
+                Ok((d, fty))
+            }
             Expr::IfElse {
                 cond, then, els, ..
             } => {
@@ -625,6 +754,10 @@ impl<'a> FnLower<'a> {
             if fname == "range" {
                 return Err(err("range() can only be used in a for-loop (Phase 1)"));
             }
+            // Struct construction: `StructName(fields...)`.
+            if let Some(&sid) = self.ctx.ids.get(fname) {
+                return self.construct(sid, args);
+            }
             if let Some((ptys, ret)) = self.sigs.get(fname).cloned() {
                 let mut argvals = Vec::new();
                 for (i, a) in args.iter().enumerate() {
@@ -646,11 +779,69 @@ impl<'a> FnLower<'a> {
                 return Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }));
             }
             Err(err(format!("call to unknown function '{fname}'")))
+        } else if let Expr::Attr { base, name, .. } = callee {
+            // Method call: `recv.method(args)`.
+            let (recv, bty) = self.expr(base)?;
+            let Ty::Struct(sid) = bty else {
+                return Err(err("method call on a non-struct value"));
+            };
+            let mangled = format!("{}__{}", self.ctx.names[sid as usize], name);
+            let (ptys, ret) = self
+                .sigs
+                .get(&mangled)
+                .cloned()
+                .ok_or_else(|| err(format!("no method '{name}' on that struct")))?;
+            let mut argvals = vec![recv]; // self
+            for (i, a) in args.iter().enumerate() {
+                let (v, vt) = self.expr(&a.value)?;
+                let target = *ptys.get(i + 1).unwrap_or(&vt);
+                argvals.push(self.coerce(v, vt, target));
+            }
+            let dest = if ret == Ty::Void {
+                None
+            } else {
+                Some(self.new_value(ret))
+            };
+            self.emit(Inst::Call {
+                dest,
+                func: mangled,
+                args: argvals,
+            });
+            let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
+            Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }))
         } else {
             Err(err(
                 "only direct function calls are supported by codegen yet",
             ))
         }
+    }
+
+    fn construct(&mut self, sid: u32, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        for (i, a) in args.iter().enumerate() {
+            let (idx, fty) = match &a.name {
+                Some(fname) => self
+                    .ctx
+                    .field(sid, fname)
+                    .ok_or_else(|| err(format!("no field '{fname}' on struct")))?,
+                None => {
+                    let f = self.ctx.fields[sid as usize]
+                        .get(i)
+                        .ok_or_else(|| err("too many fields in constructor"))?;
+                    (i as u32, f.1)
+                }
+            };
+            let (v, vt) = self.expr(&a.value)?;
+            let v = self.coerce(v, vt, fty);
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx,
+                val: v,
+            });
+        }
+        Ok((dest, Ty::Struct(sid)))
     }
 
     fn binop(

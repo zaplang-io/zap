@@ -934,6 +934,13 @@ impl Checker {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
                         return self.check_user_call(&sig, fname, args, span);
                     }
+                    // Struct construction: `StructName(fields...)`.
+                    if self.user_types.contains(fname) {
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Named(fname.clone());
+                    }
                     self.error(format!("call to unknown function '{fname}'"), span);
                     for a in args {
                         self.infer(&a.value);

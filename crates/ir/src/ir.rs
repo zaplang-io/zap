@@ -18,6 +18,8 @@ pub enum Ty {
     F32,
     F64,
     Ptr,
+    /// A pointer to a struct instance; the `u32` indexes [`Module::structs`].
+    Struct(u32),
     Void,
 }
 
@@ -161,6 +163,25 @@ pub enum Inst {
         dest: Value,
         bytes: Vec<u8>,
     },
+    /// Allocate a zeroed struct instance; `dest : Struct(sid)`.
+    StructNew {
+        dest: Value,
+        sid: u32,
+    },
+    /// Load field `idx` of struct `sid` from `base`; `dest` gets the field type.
+    FieldGet {
+        dest: Value,
+        base: Value,
+        sid: u32,
+        idx: u32,
+    },
+    /// Store `val` into field `idx` of struct `sid` at `base`.
+    FieldSet {
+        base: Value,
+        sid: u32,
+        idx: u32,
+        val: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -199,8 +220,16 @@ impl Func {
     }
 }
 
+/// A struct layout: a name and its field types, in declaration order.
+#[derive(Clone, Debug)]
+pub struct StructLayout {
+    pub name: String,
+    pub fields: Vec<Ty>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Module {
+    pub structs: Vec<StructLayout>,
     pub funcs: Vec<Func>,
 }
 
@@ -218,6 +247,7 @@ impl fmt::Display for Ty {
             Ty::F64 => "f64",
             Ty::Ptr => "ptr",
             Ty::Void => "void",
+            Ty::Struct(id) => return write!(f, "struct#{id}"),
         };
         f.write_str(s)
     }
@@ -289,6 +319,23 @@ fn fmt_inst(i: &Inst) -> String {
         }
         Inst::StrConst { dest, bytes } => {
             format!("%{dest} = strconst {:?}", String::from_utf8_lossy(bytes))
+        }
+        Inst::StructNew { dest, sid } => format!("%{dest} = structnew struct#{sid}"),
+        Inst::FieldGet {
+            dest,
+            base,
+            sid,
+            idx,
+        } => {
+            format!("%{dest} = fieldget struct#{sid} %{base}.{idx}")
+        }
+        Inst::FieldSet {
+            base,
+            sid,
+            idx,
+            val,
+        } => {
+            format!("fieldset struct#{sid} %{base}.{idx} = %{val}")
         }
     }
 }
