@@ -67,5 +67,6 @@ _Last updated: 2026-10-17_
 - `design/0006-types-and-generics.md` — structs, interfaces, generics, enums,
   tuples.
 - `design/0007-strings.md` — the UTF-8 string model (D-0025).
-- `design/IR.md` — the typed-IR schema (phase-boundary contract).
-- `design/RUNTIME-ABI.md` — object layout, calling convention, GC hooks.
+
+(Written: `design/IR.md` (#12) and `design/RUNTIME-ABI.md` (#13) — the two
+phase-boundary contracts.)
