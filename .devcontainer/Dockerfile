@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpolly-18-dev \
         clang-18 \
         libclang-18-dev \
+        libgc-dev \
         zlib1g-dev \
         libzstd-dev \
         libffi-dev \
