@@ -183,6 +183,7 @@ pub fn check(module: &Module) -> Vec<TypeError> {
     let mut c = Checker::new();
     c.collect_types(module);
     c.collect_sigs(module);
+    c.validate_decorators(module);
     c.check_module(module);
     c.errors
 }
@@ -203,18 +204,74 @@ pub fn check_str(
 struct Checker {
     sigs: HashMap<String, FnSig>,
     user_types: HashSet<String>,
+    /// Declared `annotation` names -> their field names (D-0036). Used to
+    /// validate `@Annotation(...)` applications (keyword args must name fields).
+    annotations: HashMap<String, Vec<String>>,
+    /// Declared `decorator` names (behavioral, D-0036).
+    user_decorators: HashSet<String>,
     scopes: Vec<HashMap<String, Ty>>,
     ret_ty: Ty,
     errors: Vec<TypeError>,
 }
 
-const BUILTINS: &[&str] = &["print", "range", "len", "sum"];
+const BUILTINS: &[&str] = &[
+    "print",
+    "range",
+    "len",
+    "sum",
+    "reflect_has",
+    "reflect_names",
+];
+
+/// The curated built-in decorator set shipped in v1 (D-0036,
+/// `design/0004-decorators.md` §"Built-in set"). An `@name` whose name is not in
+/// this set, not a declared `annotation`, and not a declared `decorator` is a
+/// compile-time error (consistent with compile-time typo-catching, D-0016).
+const BUILTIN_DECORATORS: &[&str] = &[
+    "derive",
+    "cache",
+    "default",
+    "validate",
+    "range",
+    "deprecated",
+    "inject",
+];
+
+/// The traits `@derive(...)` can generate (D-0036). Only `Eq` and `Repr` are
+/// lowered to code in this increment; the rest are accepted here and reported as
+/// deferred by the lowering pass.
+const DERIVABLE_TRAITS: &[&str] = &["Eq", "Ord", "Json", "Repr", "Hash"];
+
+/// Where a decorator/annotation is attached — used for target-suitability
+/// checks (e.g. `@derive` only on a struct).
+#[derive(Clone, Copy, PartialEq)]
+enum DecoTarget {
+    Struct,
+    Field,
+    Function,
+    Enum,
+    Param,
+}
+
+impl DecoTarget {
+    fn describe(self) -> &'static str {
+        match self {
+            DecoTarget::Struct => "a struct",
+            DecoTarget::Field => "a field",
+            DecoTarget::Function => "a function",
+            DecoTarget::Enum => "an enum",
+            DecoTarget::Param => "a parameter",
+        }
+    }
+}
 
 impl Checker {
     fn new() -> Checker {
         Checker {
             sigs: HashMap::new(),
             user_types: HashSet::new(),
+            annotations: HashMap::new(),
+            user_decorators: HashSet::new(),
             scopes: Vec::new(),
             ret_ty: Ty::Unit,
             errors: Vec::new(),
@@ -269,6 +326,13 @@ impl Checker {
                 }
                 Item::Annotation(a) => {
                     self.user_types.insert(a.name.clone());
+                    self.annotations.insert(
+                        a.name.clone(),
+                        a.fields.iter().map(|f| f.name.clone()).collect(),
+                    );
+                }
+                Item::Decorator(d) => {
+                    self.user_decorators.insert(d.name.clone());
                 }
                 _ => {}
             }
@@ -365,6 +429,231 @@ impl Checker {
                 }
             },
             Type::Tuple { .. } | Type::Func { .. } => Ty::Unknown,
+        }
+    }
+
+    // --- decorator / annotation validation (D-0036) ---
+    //
+    // Every `@name` application is validated here: the name must be a built-in
+    // decorator, a declared `annotation`, or a declared `decorator`; an unknown
+    // name is a compile error (compile-time typo-catching, D-0016). The
+    // built-ins additionally get argument-shape and target-suitability checks.
+    // The *behavior* of the built-ins (code generation, reflection metadata) is
+    // produced later, by the AST->ZIR lowering pass.
+
+    fn validate_decorators(&mut self, module: &Module) {
+        for item in &module.items {
+            match item {
+                Item::Struct(s) => {
+                    for d in &s.decorators {
+                        self.check_decorator(d, DecoTarget::Struct);
+                    }
+                    for f in &s.fields {
+                        for d in &f.decorators {
+                            self.check_decorator(d, DecoTarget::Field);
+                        }
+                    }
+                    for m in &s.methods {
+                        self.check_fn_decorators(m);
+                    }
+                }
+                Item::Function(f) => self.check_fn_decorators(f),
+                Item::Enum(e) => {
+                    for d in &e.decorators {
+                        self.check_decorator(d, DecoTarget::Enum);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_fn_decorators(&mut self, f: &Function) {
+        for d in &f.decorators {
+            self.check_decorator(d, DecoTarget::Function);
+        }
+        for p in &f.params {
+            for d in &p.decorators {
+                self.check_decorator(d, DecoTarget::Param);
+            }
+        }
+    }
+
+    fn check_decorator(&mut self, d: &Decorator, target: DecoTarget) {
+        if BUILTIN_DECORATORS.contains(&d.name.as_str()) {
+            self.check_builtin_decorator(d, target);
+            return;
+        }
+        if let Some(fields) = self.annotations.get(&d.name).cloned() {
+            // An annotation application: every keyword arg must name a field
+            // (typo-catching). Positional args are matched by declaration order.
+            for a in &d.args {
+                if let Some(argname) = &a.name {
+                    if !fields.contains(argname) {
+                        self.error(
+                            format!("annotation '@{}' has no field '{argname}'", d.name),
+                            d.span,
+                        );
+                    }
+                }
+            }
+            if d.args.len() > fields.len() {
+                self.error(
+                    format!(
+                        "annotation '@{}' takes at most {} argument(s), found {}",
+                        d.name,
+                        fields.len(),
+                        d.args.len()
+                    ),
+                    d.span,
+                );
+            }
+            return;
+        }
+        if self.user_decorators.contains(&d.name) {
+            // User-defined behavioral decorator — accepted; its arguments are
+            // checked loosely for now (the user-macro API is deferred,
+            // OPEN-QUESTIONS.md).
+            return;
+        }
+        self.error(
+            format!(
+                "unknown decorator or annotation '@{}' (not a built-in, \
+                 `annotation`, or `decorator`)",
+                d.name
+            ),
+            d.span,
+        );
+    }
+
+    fn check_builtin_decorator(&mut self, d: &Decorator, target: DecoTarget) {
+        let keywords = d.args.iter().filter(|a| a.name.is_some()).count();
+        let positionals = d.args.len() - keywords;
+        match d.name.as_str() {
+            "derive" => {
+                self.require_target(d, target, DecoTarget::Struct);
+                if d.args.is_empty() {
+                    self.error(
+                        "@derive(...) needs at least one trait, e.g. @derive(Eq, Repr)",
+                        d.span,
+                    );
+                }
+                for a in &d.args {
+                    if a.name.is_some() {
+                        self.error("@derive takes positional trait names, not keywords", d.span);
+                    } else if let Expr::Name(t, _) = &a.value {
+                        if !DERIVABLE_TRAITS.contains(&t.as_str()) {
+                            self.error(
+                                format!(
+                                    "unknown derivable trait '{t}' (expected one of \
+                                     Eq, Ord, Json, Repr, Hash)"
+                                ),
+                                d.span,
+                            );
+                        }
+                    } else {
+                        self.error("@derive expects trait names, e.g. @derive(Eq)", d.span);
+                    }
+                }
+            }
+            "default" => {
+                self.require_target(d, target, DecoTarget::Field);
+                if positionals != 1 || keywords != 0 {
+                    self.error(
+                        "@default(expr) takes exactly one expression, e.g. @default(now())",
+                        d.span,
+                    );
+                }
+            }
+            "range" => {
+                self.require_target(d, target, DecoTarget::Field);
+                if positionals != 0 {
+                    self.error(
+                        "@range(...) takes keyword bounds: @range(min=0, max=150)",
+                        d.span,
+                    );
+                }
+                for a in &d.args {
+                    if let Some(n) = &a.name {
+                        if n != "min" && n != "max" {
+                            self.error(
+                                format!("@range has no bound '{n}' (expected 'min' or 'max')"),
+                                d.span,
+                            );
+                        }
+                    }
+                }
+                if d.args.is_empty() {
+                    self.error("@range(...) needs at least one of min/max", d.span);
+                }
+            }
+            "validate" => {
+                self.require_target(d, target, DecoTarget::Field);
+                if positionals != 0 {
+                    self.error(
+                        "@validate(...) takes keyword constraints, e.g. @validate(max_len=50)",
+                        d.span,
+                    );
+                }
+            }
+            "cache" => {
+                self.require_target(d, target, DecoTarget::Function);
+                if !d.args.is_empty() {
+                    self.error("@cache takes no arguments", d.span);
+                }
+            }
+            "inject" => {
+                self.require_target(d, target, DecoTarget::Field);
+                if !d.args.is_empty() {
+                    self.error("@inject takes no arguments", d.span);
+                }
+            }
+            "deprecated" => {
+                // Allowed on any target; optional single positional message.
+                let well_formed = d.args.len() <= 1 && keywords == 0;
+                if !well_formed {
+                    self.error(
+                        "@deprecated takes an optional message string, e.g. @deprecated(\"use X\")",
+                        d.span,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn require_target(&mut self, d: &Decorator, got: DecoTarget, want: DecoTarget) {
+        if got != want {
+            self.error(
+                format!(
+                    "@{} applies to {}, not {}",
+                    d.name,
+                    want.describe(),
+                    got.describe()
+                ),
+                d.span,
+            );
+        }
+    }
+
+    fn check_reflect_args(&mut self, fname: &str, arity: usize, args: &[Arg], span: Span) {
+        if args.len() != arity {
+            self.error(
+                format!(
+                    "{fname}() takes exactly {arity} argument(s), found {}",
+                    args.len()
+                ),
+                span,
+            );
+        }
+        for a in args {
+            let t = self.infer(&a.value);
+            if !matches!(t, Ty::Str | Ty::Unknown) {
+                self.error(
+                    format!("{fname}() expects str arguments, found {}", t.display()),
+                    span,
+                );
+            }
         }
     }
 
@@ -988,6 +1277,19 @@ impl Checker {
                     }
                     return Ty::Int64;
                 }
+                // Runtime reflection (D-0036). `reflect_has(type, name)` reports
+                // whether the type was annotated/decorated with `name`;
+                // `reflect_names(type)` returns the comma-joined names. The type
+                // and name are identified by string (the reflection surface is
+                // intentionally string-keyed; see `design/0004-decorators.md`).
+                "reflect_has" => {
+                    self.check_reflect_args(fname, 2, args, span);
+                    return Ty::Bool;
+                }
+                "reflect_names" => {
+                    self.check_reflect_args(fname, 1, args, span);
+                    return Ty::Str;
+                }
                 _ => {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
                         return self.check_user_call(&sig, fname, args, span);
@@ -1241,5 +1543,75 @@ mod tests {
         // scalar broadcast, indexing, len, and sum must not raise false errors.
         ok(include_str!("../../../tests/golden/array_int.zap"));
         ok(include_str!("../../../tests/golden/array_f64.zap"));
+    }
+
+    // --- decorators & annotations (ticket #16, D-0036) ---
+
+    #[test]
+    fn decorators_golden_type_checks() {
+        ok(include_str!("../../../tests/golden/decorators.zap"));
+    }
+
+    #[test]
+    fn unknown_decorator_is_error() {
+        // Compile-time typo-catching (D-0016): an undeclared `@name` is rejected.
+        let e = errors("@frobnicate\nstruct S:\n    int64 x\n");
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("unknown decorator"), "{e:?}");
+    }
+
+    #[test]
+    fn known_annotation_and_decorator_accepted() {
+        ok("annotation Tag:\n    str name = \"\"\n\n@Tag(name=\"x\")\nstruct S:\n    int64 x\n");
+    }
+
+    #[test]
+    fn annotation_unknown_field_is_error() {
+        let e = errors(
+            "annotation Tag:\n    str name = \"\"\n\n@Tag(nope=\"x\")\nstruct S:\n    int64 x\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("no field 'nope'"), "{e:?}");
+    }
+
+    #[test]
+    fn derive_unknown_trait_is_error() {
+        let e = errors("@derive(Nonsense)\nstruct S:\n    int64 x\n");
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("unknown derivable trait"), "{e:?}");
+    }
+
+    #[test]
+    fn derive_needs_a_trait() {
+        let e = errors("@derive\nstruct S:\n    int64 x\n");
+        assert_eq!(e.len(), 1, "got {e:?}");
+    }
+
+    #[test]
+    fn derive_only_on_structs() {
+        let e = errors("@derive(Eq)\ndef f():\n    print(1)\n");
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("applies to a struct"), "{e:?}");
+    }
+
+    #[test]
+    fn builtin_arg_shapes_checked() {
+        // @cache takes no args; @default takes exactly one expr; @inject none.
+        // (`@range` is in the locked set but its name collides with the `range`
+        // keyword, so it cannot currently be written — see the PR notes.)
+        assert_eq!(errors("@cache(1)\ndef f():\n    print(1)\n").len(), 1);
+        assert_eq!(
+            errors("struct S:\n    @default(1, 2)\n    int64 x\n").len(),
+            1
+        );
+        assert_eq!(errors("struct S:\n    @inject(1)\n    int64 x\n").len(), 1);
+    }
+
+    #[test]
+    fn reflection_builtins_type_check() {
+        ok("def main():\n    if reflect_has(\"S\", \"Tag\"):\n        print(reflect_names(\"S\"))\n");
+        // Non-string argument is rejected.
+        let e = errors("def main():\n    print(reflect_has(1, 2))\n");
+        assert!(!e.is_empty(), "reflect_has should want str args");
     }
 }

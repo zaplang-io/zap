@@ -281,6 +281,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_sum_f64", &[p.into()], Some(f.into()));
         self.declare_rt("zap_array_sum_i64", &[p.into()], Some(i.into()));
 
+        // Decorators & reflection (ticket #16, D-0036). `zap_i64_to_str` and
+        // `zap_str_eq` back the `@derive(Repr)` / `@derive(Eq)` generated methods;
+        // the `zap_reflect_*` entry points back the runtime-reflection surface
+        // (metadata registered at startup, queried by `reflect_has`/`reflect_names`).
+        self.declare_rt("zap_i64_to_str", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_str_eq", &[p.into(), p.into()], Some(i.into()));
+        self.declare_rt("zap_reflect_register", &[p.into(), p.into()], None);
+        self.declare_rt("zap_reflect_has", &[p.into(), p.into()], Some(i.into()));
+        self.declare_rt("zap_reflect_names", &[p.into()], Some(p.into()));
+
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
         for sl in &m.structs {

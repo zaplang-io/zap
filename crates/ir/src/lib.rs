@@ -160,4 +160,83 @@ mod tests {
         let (_m, errs) = lower_module(&ast);
         assert!(!errs.is_empty());
     }
+
+    // --- decorators & annotations (ticket #16, D-0036) ---
+
+    #[test]
+    fn lower_decorators_fixture() {
+        // The golden program exercises the whole feature: `@derive(Eq, Repr)`
+        // generates methods, `@Table` is reflected, and `reflect_*` queries lower
+        // to the runtime registry.
+        let m = lower_ok(include_str!("../../../tests/golden/decorators.zap"));
+        // `@derive(Eq, Repr)` produced two extra top-level functions.
+        let eq = m.funcs.iter().find(|f| f.name == "User__eq").expect("eq");
+        assert_eq!(eq.params, vec![Ty::Struct(0), Ty::Struct(0)]);
+        assert_eq!(eq.ret, Ty::I1);
+        let repr = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "User__repr")
+            .expect("repr");
+        assert_eq!(repr.params, vec![Ty::Struct(0)]);
+        assert_eq!(repr.ret, Ty::Ptr);
+
+        let text = format!("{m}");
+        // Eq compares an int field (icmp) and a str field (runtime content eq).
+        assert!(text.contains("call @zap_str_eq"), "text:\n{text}");
+        // Repr stringifies the int field and concatenates.
+        assert!(text.contains("call @zap_i64_to_str"), "text:\n{text}");
+        // The reflection registry is populated at the top of `main`, and the
+        // user annotation `@Table` (not the compile-time `@derive`) is recorded.
+        assert!(
+            text.contains("strconst \"Table\""),
+            "the user annotation should be registered, text:\n{text}"
+        );
+        assert!(
+            !text.contains("strconst \"derive\""),
+            "the compile-time @derive must not reach the runtime registry"
+        );
+        assert!(text.contains("call @zap_reflect_register"), "text:\n{text}");
+        assert!(text.contains("call @zap_reflect_has"), "text:\n{text}");
+        assert!(text.contains("call @zap_reflect_names"), "text:\n{text}");
+    }
+
+    #[test]
+    fn derive_eq_only_methods_are_callable() {
+        // A struct can derive just one trait; the generated method resolves.
+        let m = lower_ok(
+            "@derive(Eq)\nstruct P:\n    int64 x\n\ndef main():\n    \
+             auto a = P(x=1)\n    auto b = P(x=1)\n    if a.eq(b):\n        print(1)\n",
+        );
+        assert!(m.funcs.iter().any(|f| f.name == "P__eq"));
+        assert!(!m.funcs.iter().any(|f| f.name == "P__repr"));
+    }
+
+    #[test]
+    fn deferred_builtins_error() {
+        // Built-ins in the locked set but not yet generated report cleanly.
+        for src in [
+            "@derive(Json)\nstruct S:\n    int64 x\n",
+            "struct S:\n    @validate(max_len=9)\n    str x\n",
+        ] {
+            let (ast, _p, _l) = parse_str(src);
+            let (_m, errs) = lower_module(&ast);
+            assert!(
+                !errs.is_empty(),
+                "expected a deferred-feature error for:\n{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_and_user_method_clash_errors() {
+        let (ast, _p, _l) = parse_str(
+            "@derive(Eq)\nstruct S:\n    int64 x\n\n    def eq(self, S other) -> bool:\n        return True\n",
+        );
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            !errs.is_empty(),
+            "a user `eq` plus @derive(Eq) should clash"
+        );
+    }
 }

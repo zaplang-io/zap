@@ -52,9 +52,15 @@ _Last updated: 2026-10-17_
 ## Features deferred with a direction
 
 - 🟡 **User-defined compile-time decorators (macros)** — the decorator model +
-  built-ins are locked (D-0036, `design/0004-decorators.md`); still open: the
-  macro API (what a decorator sees/emits), hygiene rules, and the
-  runtime-reflection API surface.
+  built-ins are locked (D-0036, `design/0004-decorators.md`); v1 lands
+  `@derive(Eq, Repr)` and a string-keyed runtime-reflection surface
+  (`reflect_has` / `reflect_names`, see `design/RUNTIME-ABI.md` §"Decorators &
+  reflection", #16). Still open: the macro API (what a decorator sees/emits) and
+  hygiene rules; the remaining built-ins (`@cache`, `@default`, `@validate`,
+  `@range`, `@deprecated`, `@inject`, `@derive(Ord/Json/Hash)`); field/parameter/
+  function decorators; richer reflection (field-level metadata, annotation
+  argument values). The `@range` name also collides with the `range` keyword and
+  needs a parser accommodation before it can be written.
 - ⚪ **C FFI** (D-0012) — deferred; generalizes interop to all languages.
 - ⚪ **Precise GC** (Immix-style) replacing Boehm (D-0009).
 - ⚪ **Array dtype promotion** rules for mixed-dtype ops (`i64 + f64`), and
