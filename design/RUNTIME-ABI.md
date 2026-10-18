@@ -145,6 +145,36 @@ index-out-of-range, `None` access), and stack traces are follow-ups.
 The Phase 1 slice calls libc `printf` directly; those calls migrate behind
 `zap_print_*` as the runtime grows.
 
+### Decorators & reflection (#16, D-0036)
+
+The built-in `@derive` decorators are expanded to real methods at AST→ZIR
+lowering (zero runtime cost); two small runtime helpers back the generated
+code:
+
+```c
+void*   zap_i64_to_str(int64_t v);      // used by generated @derive(Repr)
+int64_t zap_str_eq(void* a, void* b);   // content equality, used by @derive(Eq)
+```
+
+Runtime reflection over annotations/decorators is a flat metadata registry,
+pay-only-when-used. The compiler emits `zap_reflect_register` calls at the top
+of `main` for every struct-level annotation/decorator; queries read the table:
+
+```c
+void    zap_reflect_register(void* type_name, void* deco_name);  // startup bootstrap
+int64_t zap_reflect_has(void* type_name, void* deco_name);       // 1/0
+void*   zap_reflect_names(void* type_name);                      // comma-joined ZapStr*
+```
+
+The surface is intentionally **string-keyed** (`reflect_has("User", "Table")`)
+in v1. Only `@derive(Eq)` and `@derive(Repr)` are generated so far; the rest of
+the locked built-in set (`@cache`, `@default`, `@validate`, `@range`,
+`@deprecated`, `@inject`, and `@derive(Ord/Json/Hash)`), field/parameter/
+function decorators, and the user-defined compile-time macro API remain
+follow-ups. (Note: the `@range` built-in name currently collides with the
+`range` keyword and cannot be written until decorator-name parsing allows
+keyword-like identifiers.)
+
 ### Garbage collection
 
 **v1 — conservative Boehm GC.** `zap_alloc*` wrap `GC_malloc` /

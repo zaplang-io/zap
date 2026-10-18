@@ -95,6 +95,21 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         }
     }
 
+    // Decorators & annotations (ticket #16, D-0036). Register the signatures of
+    // the methods `@derive(...)` will generate, so user calls (`u.eq(v)`) resolve
+    // during body lowering, and collect the runtime-reflection metadata.
+    let deco = DecoratorPlan::collect(module, &ctx, &mut errors);
+    for (sid, traits) in &deco.derived {
+        for t in traits {
+            if let Some((mname, psig, ret)) = t.signature(*sid) {
+                sigs.insert(
+                    format!("{}__{}", ctx.names[*sid as usize], mname),
+                    (psig, ret),
+                );
+            }
+        }
+    }
+
     let mut out = Module::default();
     for sid in 0..ctx.names.len() {
         out.structs.push(StructLayout {
@@ -104,21 +119,35 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     }
     for item in &module.items {
         match item {
-            ast::Item::Function(f) => match lower_fn(f, f.name.clone(), None, &sigs, &ctx) {
-                Ok(func) => out.funcs.push(func),
-                Err(e) => errors.push(e),
-            },
+            ast::Item::Function(f) => {
+                match lower_fn(f, f.name.clone(), None, &sigs, &ctx, &deco.reflect_meta) {
+                    Ok(func) => out.funcs.push(func),
+                    Err(e) => errors.push(e),
+                }
+            }
             ast::Item::Struct(s) => {
                 let sid = ctx.ids[&s.name];
                 for m in &s.methods {
                     let name = format!("{}__{}", s.name, m.name);
-                    match lower_fn(m, name, Some(sid), &sigs, &ctx) {
+                    match lower_fn(m, name, Some(sid), &sigs, &ctx, &[]) {
                         Ok(func) => out.funcs.push(func),
                         Err(e) => errors.push(e),
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    // Generate the bodies of the derived methods (compile-time expansion of the
+    // built-in `@derive(...)` decorator, kept isolated from expression lowering).
+    for (sid, traits) in &deco.derived {
+        for t in traits {
+            match t.generate(*sid, &sigs, &ctx) {
+                Ok(Some(func)) => out.funcs.push(func),
+                Ok(None) => {}
+                Err(e) => errors.push(e),
+            }
         }
     }
     (out, errors)
@@ -240,12 +269,401 @@ fn err(m: impl Into<String>) -> LowerError {
     LowerError { message: m.into() }
 }
 
+// ----------------------------------------------------------------------------
+// Decorators & annotations (ticket #16, D-0036)
+//
+// This is the item-level compile-time expansion of the built-in decorator set.
+// The design doc locks `@cache`, `@derive(Eq, Ord, Json, Repr, Hash)`,
+// `@default`, `@validate`, `@range`, `@deprecated`, and `@inject`, plus runtime
+// reflection over annotations. This increment implements:
+//   * `@derive(Eq)` / `@derive(Repr)` — generate a structural-equality method
+//     and a debug-string method directly as ZIR (zero runtime cost).
+//   * runtime reflection — struct-level annotations/decorators are recorded in a
+//     registry at startup and queried with `reflect_has` / `reflect_names`.
+// Everything else in the locked set is validated by sema and reported here as a
+// clean "not implemented yet" lowering error (never silently ignored). The
+// user-defined compile-time macro API stays deferred (OPEN-QUESTIONS.md).
+// ----------------------------------------------------------------------------
+
+/// The built-in behavioral decorators whose code generation is deferred. Sema
+/// accepts them (they are part of the locked set); lowering reports them.
+const DEFERRED_BUILTINS: &[&str] = &[
+    "cache",
+    "default",
+    "validate",
+    "range",
+    "deprecated",
+    "inject",
+];
+
+/// A trait requested via `@derive(...)`.
+#[derive(Clone, Copy, PartialEq)]
+enum DerivedTrait {
+    Eq,
+    Repr,
+    Ord,
+    Json,
+    Hash,
+}
+
+impl DerivedTrait {
+    fn parse(name: &str) -> Option<DerivedTrait> {
+        match name {
+            "Eq" => Some(DerivedTrait::Eq),
+            "Repr" => Some(DerivedTrait::Repr),
+            "Ord" => Some(DerivedTrait::Ord),
+            "Json" => Some(DerivedTrait::Json),
+            "Hash" => Some(DerivedTrait::Hash),
+            _ => None,
+        }
+    }
+
+    /// The method name the generated code is reachable through (`u.eq(v)`).
+    fn method_name(self) -> &'static str {
+        match self {
+            DerivedTrait::Eq => "eq",
+            DerivedTrait::Repr => "repr",
+            DerivedTrait::Ord => "cmp",
+            DerivedTrait::Json => "to_json",
+            DerivedTrait::Hash => "hash",
+        }
+    }
+
+    /// The ZIR signature of the generated method, if this trait is implemented.
+    fn signature(self, sid: u32) -> Option<(&'static str, Vec<Ty>, Ty)> {
+        match self {
+            DerivedTrait::Eq => Some(("eq", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I1)),
+            DerivedTrait::Repr => Some(("repr", vec![Ty::Struct(sid)], Ty::Ptr)),
+            _ => None,
+        }
+    }
+
+    /// Generate the method body as a ZIR function, or `Ok(None)` if the trait
+    /// produces no standalone function. Deferred traits return an error.
+    fn generate<'a>(
+        self,
+        sid: u32,
+        sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
+        ctx: &'a StructCtx,
+    ) -> Result<Option<Func>, LowerError> {
+        match self {
+            DerivedTrait::Eq => Ok(Some(gen_eq_method(sid, sigs, ctx)?)),
+            DerivedTrait::Repr => Ok(Some(gen_repr_method(sid, sigs, ctx)?)),
+            DerivedTrait::Ord | DerivedTrait::Json | DerivedTrait::Hash => Err(err(format!(
+                "@derive({:?}) is recognized but not implemented yet \
+                 (only Eq and Repr are generated in this increment)",
+                self.name()
+            ))),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            DerivedTrait::Eq => "Eq",
+            DerivedTrait::Repr => "Repr",
+            DerivedTrait::Ord => "Ord",
+            DerivedTrait::Json => "Json",
+            DerivedTrait::Hash => "Hash",
+        }
+    }
+}
+
+/// The result of scanning a module's decorators/annotations.
+struct DecoratorPlan {
+    /// Per struct (by id), the traits to derive.
+    derived: Vec<(u32, Vec<DerivedTrait>)>,
+    /// `(type_name, decorator_or_annotation_name)` pairs for runtime reflection.
+    reflect_meta: Vec<(String, String)>,
+}
+
+impl DecoratorPlan {
+    fn collect(
+        module: &ast::Module,
+        ctx: &StructCtx,
+        errors: &mut Vec<LowerError>,
+    ) -> DecoratorPlan {
+        // Names declared as metadata (annotations) or behavioral decorators.
+        // These are what the reflection registry records; the built-in
+        // compile-time decorators (`@derive` etc.) leave no runtime trace.
+        let mut meta_names: HashSet<String> = HashSet::new();
+        for item in &module.items {
+            match item {
+                ast::Item::Annotation(a) => {
+                    meta_names.insert(a.name.clone());
+                }
+                ast::Item::Decorator(d) => {
+                    meta_names.insert(d.name.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let mut derived: Vec<(u32, Vec<DerivedTrait>)> = Vec::new();
+        let mut reflect_meta: Vec<(String, String)> = Vec::new();
+
+        for item in &module.items {
+            match item {
+                ast::Item::Struct(s) => {
+                    let sid = ctx.ids[&s.name];
+                    let mut traits: Vec<DerivedTrait> = Vec::new();
+                    for d in &s.decorators {
+                        if d.name == "derive" {
+                            for a in &d.args {
+                                if let ast::Expr::Name(t, _) = &a.value {
+                                    match DerivedTrait::parse(t) {
+                                        Some(tr) => {
+                                            // A user method of the same name wins;
+                                            // deriving it too would duplicate it.
+                                            if s.methods.iter().any(|m| m.name == tr.method_name())
+                                            {
+                                                errors.push(err(format!(
+                                                    "struct '{}' both defines method '{}' and \
+                                                     derives {} (remove one)",
+                                                    s.name,
+                                                    tr.method_name(),
+                                                    tr.name()
+                                                )));
+                                            } else if !traits.contains(&tr) {
+                                                traits.push(tr);
+                                            }
+                                        }
+                                        None => errors.push(err(format!(
+                                            "unknown derivable trait '{t}' on struct '{}'",
+                                            s.name
+                                        ))),
+                                    }
+                                }
+                            }
+                        } else if DEFERRED_BUILTINS.contains(&d.name.as_str()) {
+                            errors.push(err(format!(
+                                "built-in decorator '@{}' is not implemented yet (deferred)",
+                                d.name
+                            )));
+                        } else if meta_names.contains(&d.name) {
+                            reflect_meta.push((s.name.clone(), d.name.clone()));
+                        }
+                        // Unknown names are already rejected by sema.
+                    }
+                    if !traits.is_empty() {
+                        derived.push((sid, traits));
+                    }
+                    // Field / method decorators are deferred this increment.
+                    for fld in &s.fields {
+                        if !fld.decorators.is_empty() {
+                            errors.push(err(format!(
+                                "field decorators are not implemented yet (deferred): \
+                                 '@{}' on field '{}'",
+                                fld.decorators[0].name, fld.name
+                            )));
+                        }
+                    }
+                    for m in &s.methods {
+                        defer_fn_decorators(m, errors);
+                    }
+                }
+                ast::Item::Function(f) => defer_fn_decorators(f, errors),
+                ast::Item::Enum(e) if !e.decorators.is_empty() => {
+                    errors.push(err(format!(
+                        "enum decorators are not implemented yet (deferred): '@{}'",
+                        e.decorators[0].name
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        DecoratorPlan {
+            derived,
+            reflect_meta,
+        }
+    }
+}
+
+/// Report function/parameter decorators as deferred (not implemented yet).
+fn defer_fn_decorators(f: &ast::Function, errors: &mut Vec<LowerError>) {
+    if !f.decorators.is_empty() {
+        errors.push(err(format!(
+            "function decorators are not implemented yet (deferred): '@{}' on '{}'",
+            f.decorators[0].name, f.name
+        )));
+    }
+    for p in &f.params {
+        if !p.decorators.is_empty() {
+            errors.push(err(format!(
+                "parameter decorators are not implemented yet (deferred): '@{}' on '{}'",
+                p.decorators[0].name, p.name
+            )));
+        }
+    }
+}
+
+/// `@derive(Eq)` — a structural-equality method `Struct__eq(self, other) -> bool`
+/// that compares every field (ints/bools by value, floats by ordered compare,
+/// strings by content) and ANDs the results.
+fn gen_eq_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let name = format!("{}__eq", ctx.names[sid as usize]);
+    let mut b = FnLower::new(
+        name,
+        vec![Ty::Struct(sid), Ty::Struct(sid)],
+        Ty::I1,
+        false,
+        sigs,
+        ctx,
+    );
+    // Params: value 0 = self, value 1 = other (used directly as struct bases).
+    let mut acc = b.iconst(Ty::I1, 1);
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (_fname, fty)) in fields.iter().enumerate() {
+        let idx = idx as u32;
+        let a = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: a,
+            base: 0,
+            sid,
+            idx,
+        });
+        let c = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: c,
+            base: 1,
+            sid,
+            idx,
+        });
+        let bit = gen_field_eq(&mut b, a, c, *fty)?;
+        let next = b.new_value(Ty::I1);
+        b.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::And,
+            lhs: acc,
+            rhs: bit,
+        });
+        acc = next;
+    }
+    b.set_term(Term::Ret(Some(acc)));
+    Ok(b.func)
+}
+
+/// Compare one field of a derived `eq`, returning an `i1`.
+fn gen_field_eq(b: &mut FnLower, a: Value, c: Value, fty: Ty) -> Result<Value, LowerError> {
+    let bit = b.new_value(Ty::I1);
+    match fty {
+        Ty::Ptr => {
+            // Strings: content equality via the runtime (returns 1/0 as i64).
+            let word = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(word),
+                func: "zap_str_eq".to_string(),
+                args: vec![a, c],
+            });
+            let zero = b.iconst(Ty::I64, 0);
+            b.emit(Inst::ICmp {
+                dest: bit,
+                pred: CmpPred::Ne,
+                lhs: word,
+                rhs: zero,
+            });
+        }
+        Ty::F32 | Ty::F64 => {
+            b.emit(Inst::FCmp {
+                dest: bit,
+                pred: CmpPred::Eq,
+                lhs: a,
+                rhs: c,
+            });
+        }
+        t if t.int_width().is_some() => {
+            b.emit(Inst::ICmp {
+                dest: bit,
+                pred: CmpPred::Eq,
+                lhs: a,
+                rhs: c,
+            });
+        }
+        other => {
+            return Err(err(format!(
+                "@derive(Eq) does not support field type {other} yet \
+                 (only scalars and str)"
+            )));
+        }
+    }
+    Ok(bit)
+}
+
+/// `@derive(Repr)` — a debug-string method `Struct__repr(self) -> str` producing
+/// `Name(f0=v0, f1=v1, ...)`.
+fn gen_repr_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__repr");
+    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, sigs, ctx);
+    let mut acc = b.strconst(&format!("{sname}("));
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (fname, fty)) in fields.iter().enumerate() {
+        if idx > 0 {
+            let sep = b.strconst(", ");
+            acc = gen_concat(&mut b, acc, sep);
+        }
+        let label = b.strconst(&format!("{fname}="));
+        acc = gen_concat(&mut b, acc, label);
+        let fv = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: fv,
+            base: 0,
+            sid,
+            idx: idx as u32,
+        });
+        let vstr = match *fty {
+            Ty::Ptr => fv,
+            t if t.int_width().is_some() => {
+                let i64v = b.coerce(fv, t, Ty::I64);
+                let s = b.new_value(Ty::Ptr);
+                b.emit(Inst::Call {
+                    dest: Some(s),
+                    func: "zap_i64_to_str".to_string(),
+                    args: vec![i64v],
+                });
+                s
+            }
+            other => {
+                return Err(err(format!(
+                    "@derive(Repr) does not support field type {other} yet \
+                     (only integers, bools, and str)"
+                )));
+            }
+        };
+        acc = gen_concat(&mut b, acc, vstr);
+    }
+    let close = b.strconst(")");
+    acc = gen_concat(&mut b, acc, close);
+    b.set_term(Term::Ret(Some(acc)));
+    Ok(b.func)
+}
+
+/// `zap_str_concat(a, b)` as a ZIR call returning the new string.
+fn gen_concat(b: &mut FnLower, a: Value, c: Value) -> Value {
+    let d = b.new_value(Ty::Ptr);
+    b.emit(Inst::Call {
+        dest: Some(d),
+        func: "zap_str_concat".to_string(),
+        args: vec![a, c],
+    });
+    d
+}
+
 fn lower_fn(
     f: &ast::Function,
     zir_name: String,
     self_sid: Option<u32>,
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &StructCtx,
+    reflect_meta: &[(String, String)],
 ) -> Result<Func, LowerError> {
     let (params, ret) = sigs.get(&zir_name).cloned().unwrap();
     let is_main = zir_name == "main";
@@ -261,6 +679,11 @@ fn lower_fn(
     }
 
     if is_main {
+        // Reflection bootstrap (D-0036): populate the runtime metadata registry
+        // once, at the top of `main`, so `reflect_has`/`reflect_names` queries
+        // anywhere in the program see every annotated/decorated type. These are
+        // plain (non-throwing) runtime calls emitted before the user body.
+        b.emit_reflect_registrations(reflect_meta);
         // `main` installs an implicit top-level landing pad so an exception that
         // propagates out of the program is caught and reported (message + exit 1)
         // rather than ending in a raw abort (RUNTIME-ABI §"Exception / unwinding
@@ -458,6 +881,84 @@ impl<'a> FnLower<'a> {
         let d = self.new_value(ty);
         self.emit(Inst::FConst { dest: d, val });
         d
+    }
+
+    // --- decorators & reflection (ticket #16, D-0036) ---
+    //
+    // This section is self-contained: it builds a string constant object, emits
+    // the reflection-registry bootstrap, and lowers the reflection queries. All
+    // of it is item-level/runtime-support work, isolated from expression and
+    // numeric lowering.
+
+    /// A fresh string object holding `s` (via the runtime string constructor).
+    fn strconst(&mut self, s: &str) -> Value {
+        let d = self.new_value(Ty::Ptr);
+        self.emit(Inst::StrConst {
+            dest: d,
+            bytes: s.as_bytes().to_vec(),
+        });
+        d
+    }
+
+    /// Emit `zap_reflect_register(type, name)` for every (type, decorator/
+    /// annotation) pair. Called once at the top of `main`.
+    fn emit_reflect_registrations(&mut self, meta: &[(String, String)]) {
+        for (ty, name) in meta {
+            let tv = self.strconst(ty);
+            let nv = self.strconst(name);
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_reflect_register".to_string(),
+                args: vec![tv, nv],
+            });
+        }
+    }
+
+    /// Lower `reflect_has(type, name) -> bool` / `reflect_names(type) -> str`.
+    fn lower_reflect_query(
+        &mut self,
+        fname: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let mut argvals = Vec::new();
+        for a in args {
+            let (v, vt) = self.expr(&a.value)?;
+            if vt != Ty::Ptr {
+                return Err(err(format!("{fname}() expects str arguments")));
+            }
+            argvals.push(v);
+        }
+        if fname == "reflect_names" {
+            if argvals.len() != 1 {
+                return Err(err("reflect_names(type) takes exactly one argument"));
+            }
+            let d = self.new_value(Ty::Ptr);
+            self.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_reflect_names".to_string(),
+                args: argvals,
+            });
+            return Ok((d, Ty::Ptr));
+        }
+        // reflect_has: the runtime returns 1/0 as i64; normalize to a bool.
+        if argvals.len() != 2 {
+            return Err(err("reflect_has(type, name) takes exactly two arguments"));
+        }
+        let word = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(word),
+            func: "zap_reflect_has".to_string(),
+            args: argvals,
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        let d = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: d,
+            pred: CmpPred::Ne,
+            lhs: word,
+            rhs: zero,
+        });
+        Ok((d, Ty::I1))
     }
 
     // --- statements ---
@@ -1188,6 +1689,12 @@ impl<'a> FnLower<'a> {
                     return Err(err(format!("{fname}() expects a numeric value")));
                 }
                 return Ok((self.convert(v, vt, to), to));
+            }
+            // Runtime reflection (ticket #16, D-0036): `reflect_has(type, name)`
+            // and `reflect_names(type)` query the metadata registry populated at
+            // the top of `main`. Both take string arguments.
+            if fname == "reflect_has" || fname == "reflect_names" {
+                return self.lower_reflect_query(fname, args);
             }
             // Struct construction: `StructName(fields...)`.
             if let Some(&sid) = self.ctx.ids.get(fname) {

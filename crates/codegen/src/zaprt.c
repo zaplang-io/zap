@@ -619,3 +619,101 @@ void zap_uncaught(void *exc) {
     fputc('\n', stderr);
     exit(1);
 }
+
+/* ---------------------------------------------------------------------------
+ * Decorators & reflection (ticket #16, D-0036, design/0004-decorators.md).
+ *
+ * Two kinds of support live here, both kept out of the mechanical codegen path:
+ *   1. helpers for the compile-time `@derive` decorators — `zap_i64_to_str`
+ *      (used by generated `repr` methods) and `zap_str_eq` (used by generated
+ *      `eq` methods);
+ *   2. the runtime-reflection registry — a flat table of (type, name) pairs
+ *      that generated bootstrap code fills at the top of `main`
+ *      (`zap_reflect_register`) and that `reflect_has` / `reflect_names` query.
+ *
+ * The registry is a GC-scanned growable array, so the registered ZapStr*
+ * objects stay reachable. Reflection is pay-only-when-used: a program that
+ * never calls a `reflect_*` entry point never touches this table.
+ * ------------------------------------------------------------------------- */
+
+/* Decimal string for an integer (used by generated `@derive(Repr)` code). */
+void *zap_i64_to_str(int64_t v) {
+    char tmp[24];
+    int n = snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
+    return zap_str_new(tmp, (int64_t)n);
+}
+
+/* Content equality of two Zap strings (1 = equal), for `@derive(Eq)`. */
+int64_t zap_str_eq(void *a, void *b) {
+    ZapStr *x = (ZapStr *)a;
+    ZapStr *y = (ZapStr *)b;
+    if (x == y) {
+        return 1;
+    }
+    if (x == NULL || y == NULL || x->len != y->len) {
+        return 0;
+    }
+    return memcmp(x->data, y->data, (size_t)x->len) == 0 ? 1 : 0;
+}
+
+typedef struct {
+    ZapStr *type_name;
+    ZapStr *deco_name;
+} ZapReflectEntry;
+
+typedef struct {
+    ZapReflectEntry *items;
+    int64_t len;
+    int64_t cap;
+} ZapReflectTable;
+
+static ZapReflectTable zap_reflect_table;
+
+/* Record that `type_name` carries the annotation/decorator `deco_name`. */
+void zap_reflect_register(void *type_name, void *deco_name) {
+    ZapReflectTable *t = &zap_reflect_table;
+    if (t->len == t->cap) {
+        int64_t ncap = t->cap == 0 ? 8 : t->cap * 2;
+        ZapReflectEntry *ni =
+            (ZapReflectEntry *)GC_MALLOC((size_t)ncap * sizeof(ZapReflectEntry));
+        for (int64_t i = 0; i < t->len; i++) {
+            ni[i] = t->items[i];
+        }
+        t->items = ni;
+        t->cap = ncap;
+    }
+    t->items[t->len].type_name = (ZapStr *)type_name;
+    t->items[t->len].deco_name = (ZapStr *)deco_name;
+    t->len++;
+}
+
+/* 1 if `type_name` was registered with `deco_name`, else 0. */
+int64_t zap_reflect_has(void *type_name, void *deco_name) {
+    ZapReflectTable *t = &zap_reflect_table;
+    for (int64_t i = 0; i < t->len; i++) {
+        if (zap_str_eq(t->items[i].type_name, type_name) &&
+            zap_str_eq(t->items[i].deco_name, deco_name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The comma-joined names registered for `type_name` (""+ if none), in
+ * registration order. */
+void *zap_reflect_names(void *type_name) {
+    ZapReflectTable *t = &zap_reflect_table;
+    ZapStr *out = (ZapStr *)zap_str_new("", 0);
+    int first = 1;
+    for (int64_t i = 0; i < t->len; i++) {
+        if (!zap_str_eq(t->items[i].type_name, type_name)) {
+            continue;
+        }
+        if (!first) {
+            out = (ZapStr *)zap_str_concat(out, zap_str_new(", ", 2));
+        }
+        out = (ZapStr *)zap_str_concat(out, t->items[i].deco_name);
+        first = 0;
+    }
+    return out;
+}
