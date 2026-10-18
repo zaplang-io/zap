@@ -223,6 +223,22 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into()],
             Some(p.into()),
         );
+        // set
+        self.declare_rt("zap_set_new", &[], Some(p.into()));
+        self.declare_rt("zap_set_len", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_set_add_i64", &[p.into(), i.into()], None);
+        self.declare_rt("zap_set_add_str", &[p.into(), p.into()], None);
+        self.declare_rt(
+            "zap_set_contains_i64",
+            &[p.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_set_contains_str",
+            &[p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt("zap_set_items", &[p.into()], Some(p.into()));
 
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
@@ -303,7 +319,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Ty::I64 => self.ctx.i64_type().into(),
             Ty::F32 => self.ctx.f32_type().into(),
             Ty::F64 => self.ctx.f64_type().into(),
-            Ty::Ptr | Ty::Void | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) => {
+            Ty::Ptr | Ty::Void | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) => {
                 self.ctx.ptr_type(AddressSpace::default()).into()
             }
         }

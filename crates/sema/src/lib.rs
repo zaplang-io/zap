@@ -43,6 +43,7 @@ pub enum Ty {
     Range,
     List(Box<Ty>),
     Dict(Box<Ty>, Box<Ty>),
+    Set(Box<Ty>),
     /// A user-defined type (struct/enum), treated opaquely for now.
     Named(String),
     /// Not inferable yet — assignable to and from anything to avoid cascading
@@ -87,6 +88,7 @@ impl Ty {
             Ty::Range => "range".into(),
             Ty::List(t) => format!("list[{}]", t.display()),
             Ty::Dict(k, v) => format!("dict[{}, {}]", k.display(), v.display()),
+            Ty::Set(t) => format!("set[{}]", t.display()),
             Ty::Named(n) => n.clone(),
             Ty::Unknown => "<unknown>".into(),
         }
@@ -121,6 +123,7 @@ fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::Float32, Ty::Float64) => true,
         (Ty::Int32 | Ty::Int64, Ty::Bigint) => true,
         (Ty::List(a), Ty::List(b)) => assignable(a, b),
+        (Ty::Set(a), Ty::Set(b)) => assignable(a, b),
         _ => false,
     }
 }
@@ -341,6 +344,13 @@ impl Checker {
                         .map(|a| self.resolve_type(a))
                         .unwrap_or(Ty::Unknown);
                     Ty::Dict(Box::new(k), Box::new(v))
+                }
+                "set" => {
+                    let el = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::Set(Box::new(el))
                 }
                 other => {
                     if self.user_types.contains(other) {
@@ -736,6 +746,32 @@ impl Checker {
                 self.pop_scope();
                 Ty::Dict(Box::new(kt), Box::new(vt))
             }
+            Expr::Set(elems, _) => {
+                let mut elem = Ty::Unknown;
+                for (i, el) in elems.iter().enumerate() {
+                    let t = self.infer(el);
+                    elem = if i == 0 { t } else { join(&elem, &t) };
+                }
+                Ty::Set(Box::new(elem))
+            }
+            Expr::SetComp {
+                elem,
+                var,
+                iter,
+                cond,
+                ..
+            } => {
+                let it = self.infer(iter);
+                let e_ty = iter_elem(&it);
+                self.push_scope();
+                self.declare(var, e_ty);
+                if let Some(c) = cond {
+                    self.infer(c);
+                }
+                let et = self.infer(elem);
+                self.pop_scope();
+                Ty::Set(Box::new(et))
+            }
             Expr::Unary { op, expr, span } => {
                 let t = self.infer(expr);
                 match op {
@@ -1039,6 +1075,7 @@ fn iter_elem(it: &Ty) -> Ty {
     match it {
         Ty::Range => Ty::Int64,
         Ty::List(t) => (**t).clone(),
+        Ty::Set(t) => (**t).clone(),
         Ty::Str => Ty::Char,
         _ => Ty::Unknown,
     }
@@ -1072,10 +1109,12 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::Name(_, s)
         | Expr::Tuple(_, s)
         | Expr::List(_, s)
-        | Expr::Dict(_, s) => *s,
+        | Expr::Dict(_, s)
+        | Expr::Set(_, s) => *s,
         Expr::Str { span, .. }
         | Expr::ListComp { span, .. }
         | Expr::DictComp { span, .. }
+        | Expr::SetComp { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Call { span, .. }

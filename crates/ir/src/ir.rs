@@ -63,6 +63,9 @@ pub enum Ty {
     List(Elem),
     /// A pointer to a `dict` object with the given key and value representations.
     Dict(Elem, Elem),
+    /// A pointer to a `set` object with the given element representation. Elements
+    /// are hashed/compared like dict keys, so they use [`Elem::key_suffix`].
+    Set(Elem),
     Void,
 }
 
@@ -293,6 +296,7 @@ impl fmt::Display for Ty {
             Ty::Struct(id) => return write!(f, "struct#{id}"),
             Ty::List(e) => return write!(f, "list[{}]", e.val_suffix()),
             Ty::Dict(k, v) => return write!(f, "dict[{}, {}]", k.key_suffix(), v.val_suffix()),
+            Ty::Set(e) => return write!(f, "set[{}]", e.key_suffix()),
         };
         f.write_str(s)
     }

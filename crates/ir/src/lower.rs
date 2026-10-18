@@ -152,6 +152,13 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
                 };
                 Ok(Ty::Dict(k, v))
             }
+            "set" => {
+                let e = match args.first() {
+                    Some(a) => elem_of(a, ids)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::Set(e))
+            }
             other => match ids.get(other) {
                 Some(id) => Ok(Ty::Struct(*id)),
                 None => Err(err(format!(
@@ -176,7 +183,7 @@ fn elem_of(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Elem, LowerError
 fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
     match t {
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
-        Ty::Ptr | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) => Ok(Elem::Ptr),
+        Ty::Ptr | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) => Ok(Elem::Ptr),
         Ty::F32 | Ty::F64 => Err(err(
             "collections of floating-point elements are not supported yet",
         )),
@@ -595,8 +602,11 @@ impl<'a> FnLower<'a> {
                 if let Ty::List(elem) = lty {
                     return self.lower_for_list(target, lst, elem, body);
                 }
+                if let Ty::Set(elem) = lty {
+                    return self.lower_for_set(target, lst, elem, body);
+                }
                 return Err(err(
-                    "only `for ... in range(...)` and `for ... in <list>` are supported by codegen yet",
+                    "only `for ... in range(...)`, `for ... in <list>`, and `for ... in <set>` are supported by codegen yet",
                 ));
             }
         };
@@ -746,6 +756,25 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
+    /// `for x in s` where `s : set[T]`. Snapshots the set's live elements into a
+    /// fresh list (sets are unordered; iteration order is unspecified) and then
+    /// iterates that list.
+    fn lower_for_set(
+        &mut self,
+        target: &Expr,
+        set_val: Value,
+        elem: Elem,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let items = self.new_value(Ty::List(elem));
+        self.emit(Inst::Call {
+            dest: Some(items),
+            func: "zap_set_items".to_string(),
+            args: vec![set_val],
+        });
+        self.lower_for_list(target, items, elem, body)
+    }
+
     // --- expressions ---
 
     fn expr(&mut self, e: &Expr) -> Result<(Value, Ty), LowerError> {
@@ -834,6 +863,7 @@ impl<'a> FnLower<'a> {
             Expr::Call { callee, args, .. } => self.call(callee, args),
             Expr::List(elems, _) => self.lower_list_lit(elems),
             Expr::Dict(items, _) => self.lower_dict_lit(items),
+            Expr::Set(elems, _) => self.lower_set_lit(elems),
             Expr::Index { base, index, .. } => self.lower_index_get(base, index),
             Expr::Attr { base, name, .. } => {
                 let (bv, bty) = self.expr(base)?;
@@ -897,8 +927,9 @@ impl<'a> FnLower<'a> {
                 let func = match vt {
                     Ty::List(_) => "zap_list_len",
                     Ty::Dict(..) => "zap_dict_len",
+                    Ty::Set(_) => "zap_set_len",
                     Ty::Ptr => "zap_str_len",
-                    _ => return Err(err("len() expects a list, dict, or str")),
+                    _ => return Err(err("len() expects a list, dict, set, or str")),
                 };
                 let d = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
@@ -938,6 +969,9 @@ impl<'a> FnLower<'a> {
             let (recv, bty) = self.expr(base)?;
             if let Ty::List(elem) = bty {
                 return self.lower_list_method(recv, elem, name, args);
+            }
+            if let Ty::Set(elem) = bty {
+                return self.lower_set_method(recv, elem, name, args);
             }
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
@@ -1074,6 +1108,66 @@ impl<'a> FnLower<'a> {
         Ok((dict, Ty::Dict(kk, vk)))
     }
 
+    fn lower_set_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
+        // Elements are evaluated left-to-right; the first fixes the element kind
+        // (an empty literal is a dict, so a set literal always has >= 1 element).
+        let mut lowered = Vec::with_capacity(elems.len());
+        for e in elems {
+            lowered.push(self.expr(e)?);
+        }
+        let elem = match lowered.first() {
+            Some(&(_, t)) => elem_kind(t)?,
+            None => Elem::I64,
+        };
+        let set = self.new_value(Ty::Set(elem));
+        self.emit(Inst::Call {
+            dest: Some(set),
+            func: "zap_set_new".to_string(),
+            args: vec![],
+        });
+        let add = format!("zap_set_add_{}", elem.key_suffix());
+        for (v, vt) in lowered {
+            if elem_kind(vt)? != elem {
+                return Err(err("set elements must all have the same representation"));
+            }
+            let v = self.coerce(v, vt, elem.ty());
+            self.emit(Inst::Call {
+                dest: None,
+                func: add.clone(),
+                args: vec![set, v],
+            });
+        }
+        Ok((set, Ty::Set(elem)))
+    }
+
+    fn lower_set_method(
+        &mut self,
+        recv: Value,
+        elem: Elem,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        match name {
+            "add" => {
+                if args.len() != 1 {
+                    return Err(err("add() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if elem_kind(vt)? != elem {
+                    return Err(err("add() value has the wrong element type"));
+                }
+                let v = self.coerce(v, vt, elem.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_set_add_{}", elem.key_suffix()),
+                    args: vec![recv, v],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            other => Err(err(format!("set has no method '{other}' (supported: add)"))),
+        }
+    }
+
     fn lower_index_get(&mut self, base: &Expr, index: &Expr) -> Result<(Value, Ty), LowerError> {
         let (bv, bty) = self.expr(base)?;
         match bty {
@@ -1180,6 +1274,32 @@ impl<'a> FnLower<'a> {
         rt: Ty,
     ) -> Result<(Value, Ty), LowerError> {
         use AstBin::*;
+
+        // Membership: `x in <set>` -> `zap_set_contains_*`, normalized to a bool.
+        if matches!(op, In) {
+            let Ty::Set(elem) = rt else {
+                return Err(err("'in' is only supported with a set on the right"));
+            };
+            if elem_kind(lt)? != elem {
+                return Err(err("'in' element has the wrong type for this set"));
+            }
+            let l = self.coerce(l, lt, elem.ty());
+            let word = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(word),
+                func: format!("zap_set_contains_{}", elem.key_suffix()),
+                args: vec![r, l],
+            });
+            let zero = self.iconst(Ty::I64, 0);
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: d,
+                pred: CmpPred::Ne,
+                lhs: word,
+                rhs: zero,
+            });
+            return Ok((d, Ty::I1));
+        }
 
         // Reference-typed operands: the only supported one is `str + str`.
         if matches!(lt, Ty::Ptr) || matches!(rt, Ty::Ptr) {

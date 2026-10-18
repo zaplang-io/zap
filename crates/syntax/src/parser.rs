@@ -1460,7 +1460,7 @@ impl Parser {
             }
             TokenKind::LParen => self.parse_paren_or_tuple(start),
             TokenKind::LBracket => self.parse_list(start),
-            TokenKind::LBrace => self.parse_dict(start),
+            TokenKind::LBrace => self.parse_brace(start),
             _ => {
                 self.error_here("expected an expression");
                 self.bump();
@@ -1519,12 +1519,25 @@ impl Parser {
         Expr::List(elems, self.span_from(start))
     }
 
-    fn parse_dict(&mut self, start: u32) -> Expr {
+    /// A brace literal: a **dict** when it has `key: value` pairs, a **set** when
+    /// it has comma-separated elements and no colon. Empty `{}` stays a dict
+    /// (the conventional default; an empty set has no literal form yet).
+    fn parse_brace(&mut self, start: u32) -> Expr {
         self.expect(&TokenKind::LBrace, "'{'");
         if self.eat(&TokenKind::RBrace) {
             return Expr::Dict(Vec::new(), self.span_from(start));
         }
-        let first_key = self.parse_expr();
+        let first = self.parse_expr();
+        // A `:` after the first element means this is a dict; anything else
+        // (`,`, `}`, or a `for`) means a set.
+        if self.is(&TokenKind::Colon) {
+            return self.parse_dict_rest(start, first);
+        }
+        self.parse_set_rest(start, first)
+    }
+
+    /// Finish a dict literal (or dict comprehension) whose first key is `first`.
+    fn parse_dict_rest(&mut self, start: u32, first_key: Expr) -> Expr {
         self.expect(&TokenKind::Colon, "':'");
         let first_val = self.parse_expr();
         if self.is_kw(Keyword::For) {
@@ -1551,6 +1564,30 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace, "'}'");
         Expr::Dict(items, self.span_from(start))
+    }
+
+    /// Finish a set literal (or set comprehension) whose first element is `first`.
+    fn parse_set_rest(&mut self, start: u32, first: Expr) -> Expr {
+        if self.is_kw(Keyword::For) {
+            let (var, iter, cond) = self.parse_comp_clause();
+            self.expect(&TokenKind::RBrace, "'}'");
+            return Expr::SetComp {
+                elem: Box::new(first),
+                var,
+                iter: Box::new(iter),
+                cond: cond.map(Box::new),
+                span: self.span_from(start),
+            };
+        }
+        let mut elems = vec![first];
+        while self.eat(&TokenKind::Comma) {
+            if self.is(&TokenKind::RBrace) {
+                break;
+            }
+            elems.push(self.parse_expr());
+        }
+        self.expect(&TokenKind::RBrace, "'}'");
+        Expr::Set(elems, self.span_from(start))
     }
 
     /// `for TARGET in ITER [if COND]` — the comprehension clause. The iterable
@@ -1794,6 +1831,34 @@ mod tests {
             panic!();
         };
         assert!(matches!(value, Expr::ListComp { cond: Some(_), .. }));
+    }
+
+    #[test]
+    fn brace_literal_set_vs_dict() {
+        // Comma-separated, no colon -> set.
+        let m = parse_ok("s = {1, 2, 3}\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(matches!(value, Expr::Set(elems, _) if elems.len() == 3));
+        // Key: value pairs -> dict.
+        let m = parse_ok("d = {1: 2, 3: 4}\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(matches!(value, Expr::Dict(items, _) if items.len() == 2));
+        // Empty braces stay a dict.
+        let m = parse_ok("e = {}\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(matches!(value, Expr::Dict(items, _) if items.is_empty()));
+        // A `for` with no colon -> set comprehension.
+        let m = parse_ok("g = {x for x in range(3)}\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(matches!(value, Expr::SetComp { .. }));
     }
 
     #[test]

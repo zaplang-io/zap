@@ -193,6 +193,7 @@ pub enum Keyword {
     Complex,
     List,
     Dict,
+    Set,
     Array,
 }
 
@@ -258,6 +259,7 @@ impl Keyword {
             "complex" => Complex,
             "list" => List,
             "dict" => Dict,
+            "set" => Set,
             "array" => Array,
             _ => return Option::None,
         })
@@ -324,6 +326,7 @@ impl Keyword {
             Complex => "complex",
             List => "list",
             Dict => "dict",
+            Set => "set",
             Array => "array",
         }
     }
@@ -349,6 +352,7 @@ impl Keyword {
                 | Complex
                 | List
                 | Dict
+                | Set
                 | Array
         )
     }

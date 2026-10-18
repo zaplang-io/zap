@@ -284,3 +284,109 @@ int64_t zap_dict_get_str_i64(void *d, void *k) {
 void *zap_dict_get_str_ptr(void *d, void *k) {
     return (void *)(intptr_t)zap_dict_get(d, (int64_t)(intptr_t)k, KEY_STR);
 }
+
+/* set[T]: a dict without values — open-addressing hash table of element words.
+ * Shares the key hashing/equality above (RUNTIME-ABI: "dict and set can share
+ * hashing"). Elements are uniform 8-byte words, like dict keys; the element
+ * kind (int64 vs str) is passed per call and is stable for a given set. */
+typedef struct {
+    uint8_t state;
+    int64_t key; /* element word (int64, or ZapStr* bits) */
+} ZapSetEntry;
+
+typedef struct {
+    int64_t len;
+    int64_t cap; /* number of slots; always a power of two or 0 */
+    ZapSetEntry *entries;
+} ZapSet;
+
+void *zap_set_new(void) {
+    ZapSet *s = (ZapSet *)GC_MALLOC(sizeof(ZapSet));
+    s->len = 0;
+    s->cap = 0;
+    s->entries = NULL;
+    return s;
+}
+
+static void zap_set_resize(ZapSet *s, int keykind) {
+    int64_t ncap = s->cap < 8 ? 8 : s->cap * 2;
+    ZapSetEntry *ne = (ZapSetEntry *)GC_MALLOC((size_t)ncap * sizeof(ZapSetEntry));
+    for (int64_t i = 0; i < ncap; i++) {
+        ne[i].state = SLOT_EMPTY;
+    }
+    for (int64_t i = 0; i < s->cap; i++) {
+        if (s->entries[i].state != SLOT_FULL) {
+            continue;
+        }
+        uint64_t h = zap_key_hash(s->entries[i].key, keykind);
+        int64_t j = (int64_t)(h & (uint64_t)(ncap - 1));
+        while (ne[j].state == SLOT_FULL) {
+            j = (j + 1) & (ncap - 1);
+        }
+        ne[j] = s->entries[i];
+    }
+    s->entries = ne;
+    s->cap = ncap;
+}
+
+static void zap_set_add(void *sp, int64_t key, int keykind) {
+    ZapSet *s = (ZapSet *)sp;
+    if (s->cap == 0 || (s->len + 1) * 4 >= s->cap * 3) { /* load factor 0.75 */
+        zap_set_resize(s, keykind);
+    }
+    uint64_t h = zap_key_hash(key, keykind);
+    int64_t j = (int64_t)(h & (uint64_t)(s->cap - 1));
+    while (s->entries[j].state != SLOT_EMPTY) {
+        if (s->entries[j].state == SLOT_FULL &&
+            zap_key_eq(s->entries[j].key, key, keykind)) {
+            return; /* already present */
+        }
+        j = (j + 1) & (s->cap - 1);
+    }
+    s->entries[j].state = SLOT_FULL;
+    s->entries[j].key = key;
+    s->len++;
+}
+
+static int64_t zap_set_contains(void *sp, int64_t key, int keykind) {
+    ZapSet *s = (ZapSet *)sp;
+    if (s->cap == 0) {
+        return 0;
+    }
+    uint64_t h = zap_key_hash(key, keykind);
+    int64_t j = (int64_t)(h & (uint64_t)(s->cap - 1));
+    while (s->entries[j].state != SLOT_EMPTY) {
+        if (s->entries[j].state == SLOT_FULL &&
+            zap_key_eq(s->entries[j].key, key, keykind)) {
+            return 1;
+        }
+        j = (j + 1) & (s->cap - 1);
+    }
+    return 0;
+}
+
+int64_t zap_set_len(void *s) { return ((ZapSet *)s)->len; }
+
+void zap_set_add_i64(void *s, int64_t v) { zap_set_add(s, v, KEY_I64); }
+void zap_set_add_str(void *s, void *v) {
+    zap_set_add(s, (int64_t)(intptr_t)v, KEY_STR);
+}
+int64_t zap_set_contains_i64(void *s, int64_t v) {
+    return zap_set_contains(s, v, KEY_I64);
+}
+int64_t zap_set_contains_str(void *s, void *v) {
+    return zap_set_contains(s, (int64_t)(intptr_t)v, KEY_STR);
+}
+
+/* Snapshot the live elements into a fresh list (element words copied verbatim),
+ * so `for x in s` can reuse the list iterator. Iteration order is unspecified. */
+void *zap_set_items(void *sp) {
+    ZapSet *s = (ZapSet *)sp;
+    ZapList *out = (ZapList *)zap_list_new();
+    for (int64_t i = 0; i < s->cap; i++) {
+        if (s->entries[i].state == SLOT_FULL) {
+            zap_list_push(out, s->entries[i].key);
+        }
+    }
+    return out;
+}
