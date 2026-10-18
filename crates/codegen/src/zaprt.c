@@ -13,6 +13,11 @@ typedef struct {
     const char *data;
 } ZapStr;
 
+/* Allocate `size` zeroed bytes. Routed to the GC later (ticket #10). */
+void *zap_alloc(int64_t size) {
+    return calloc(1, (size_t)size);
+}
+
 void *zap_str_new(const char *data, int64_t len) {
     ZapStr *s = (ZapStr *)malloc(sizeof(ZapStr));
     char *buf = (char *)malloc((size_t)len);

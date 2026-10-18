@@ -73,6 +73,19 @@ mod tests {
     }
 
     #[test]
+    fn lower_structs() {
+        let m = lower_ok(include_str!("../../../tests/golden/point.zap"));
+        assert_eq!(m.structs.len(), 1);
+        assert_eq!(m.structs[0].name, "Point");
+        assert_eq!(m.structs[0].fields, vec![Ty::F64, Ty::F64]);
+        assert!(m.funcs.iter().any(|f| f.name == "Point__sumsq"));
+        let text = format!("{m}");
+        assert!(text.contains("structnew"), "{text}");
+        assert!(text.contains("fieldget"), "{text}");
+        assert!(text.contains("fieldset"), "{text}");
+    }
+
+    #[test]
     fn unsupported_construct_errors() {
         let (ast, _p, _l) = parse_str("def main():\n    raise Oops\n");
         let (_m, errs) = lower_module(&ast);
