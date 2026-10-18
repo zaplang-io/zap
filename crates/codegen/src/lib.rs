@@ -76,16 +76,26 @@ impl Backend for LlvmBackend {
 }
 
 /// Compile an AST module to a native executable (object + `cc` link).
+/// The Zap C runtime, compiled and linked with each program.
+const RUNTIME_C: &str = include_str!("zaprt.c");
+
 pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), String> {
     let obj_path = out_path.with_extension("o");
     LlvmBackend.compile_object(module, &obj_path)?;
+
+    // Write the runtime to a temp .c and let cc compile + link it in.
+    let rt_path = std::env::temp_dir().join(format!("zaprt-{}.c", std::process::id()));
+    std::fs::write(&rt_path, RUNTIME_C).map_err(|e| format!("failed to write runtime: {e}"))?;
+
     let status = Command::new("cc")
         .arg(&obj_path)
+        .arg(&rt_path)
         .arg("-o")
         .arg(out_path)
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&rt_path);
     if !status.success() {
         return Err(format!("linker (cc) failed: {status}"));
     }
@@ -116,9 +126,30 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     fn translate(&mut self, m: &zir::Module) -> Result<(), String> {
         // printf: i32 printf(ptr, ...)
         let i32t = self.ctx.i32_type();
+        let i64t = self.ctx.i64_type();
         let ptr = self.ctx.ptr_type(AddressSpace::default());
         self.module
             .add_function("printf", i32t.fn_type(&[ptr.into()], true), None);
+
+        // Runtime string entry points (see design/RUNTIME-ABI.md).
+        let str_new = self.module.add_function(
+            "zap_str_new",
+            ptr.fn_type(&[ptr.into(), i64t.into()], false),
+            None,
+        );
+        self.fns.insert("zap_str_new".to_string(), str_new);
+        let str_concat = self.module.add_function(
+            "zap_str_concat",
+            ptr.fn_type(&[ptr.into(), ptr.into()], false),
+            None,
+        );
+        self.fns.insert("zap_str_concat".to_string(), str_concat);
+        let print_str = self.module.add_function(
+            "zap_print_str",
+            self.ctx.void_type().fn_type(&[ptr.into()], false),
+            None,
+        );
+        self.fns.insert("zap_print_str".to_string(), print_str);
 
         // Declare all functions first (so calls resolve).
         for f in &m.funcs {
@@ -392,7 +423,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     }
                     let ty = f.value_ty(*a);
                     let v = get(vals, *a);
-                    if ty.is_float() {
+                    if matches!(ty, Ty::Ptr) {
+                        let print_str = self.fns["zap_print_str"];
+                        b.build_call(print_str, &[v.into()], "")
+                            .map_err(|e| e.to_string())?;
+                    } else if ty.is_float() {
                         self.printf_val("%f", v)?;
                     } else {
                         let iv = if ty.int_width() == Some(64) {
@@ -406,6 +441,24 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     }
                 }
                 self.printf_lit("\n")?;
+            }
+            Inst::StrConst { dest, bytes } => {
+                let i8t = self.ctx.i8_type();
+                let arr_vals: Vec<_> = bytes
+                    .iter()
+                    .map(|byte| i8t.const_int(*byte as u64, false))
+                    .collect();
+                let arr = i8t.const_array(&arr_vals);
+                let global = self.module.add_global(arr.get_type(), None, "str");
+                global.set_initializer(&arr);
+                global.set_constant(true);
+                let data_ptr = global.as_pointer_value();
+                let len = self.ctx.i64_type().const_int(bytes.len() as u64, false);
+                let str_new = self.fns["zap_str_new"];
+                let cs = b
+                    .build_call(str_new, &[data_ptr.into(), len.into()], "strnew")
+                    .map_err(|e| e.to_string())?;
+                vals[*dest as usize] = cs.try_as_basic_value().left();
             }
         }
         Ok(())

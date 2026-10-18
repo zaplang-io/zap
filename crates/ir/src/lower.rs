@@ -64,6 +64,7 @@ fn ast_ty(t: &ast::Type) -> Result<Ty, LowerError> {
             "float32" | "f32" => Ok(Ty::F32),
             "bool" => Ok(Ty::I1),
             "char" => Ok(Ty::I32),
+            "str" | "bytes" => Ok(Ty::Ptr),
             other => Err(err(format!(
                 "type '{other}' is not supported by codegen yet"
             ))),
@@ -519,6 +520,29 @@ impl<'a> FnLower<'a> {
                 self.emit(Inst::BConst { dest: d, val: *b });
                 Ok((d, Ty::I1))
             }
+            Expr::Str {
+                value,
+                raw,
+                bytes,
+                fstring,
+                ..
+            } => {
+                if *fstring {
+                    return Err(err("f-strings are not supported by codegen yet"));
+                }
+                let data = if *raw {
+                    value.clone().into_bytes()
+                } else {
+                    unescape(value)
+                };
+                let _ = bytes; // byte strings share the string object for now
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrConst {
+                    dest: d,
+                    bytes: data,
+                });
+                Ok((d, Ty::Ptr))
+            }
             Expr::Name(n, _) => {
                 let (ptr, ty) = self
                     .lookup(n)
@@ -638,6 +662,23 @@ impl<'a> FnLower<'a> {
         rt: Ty,
     ) -> Result<(Value, Ty), LowerError> {
         use AstBin::*;
+
+        // Reference-typed operands: the only supported one is `str + str`.
+        if matches!(lt, Ty::Ptr) || matches!(rt, Ty::Ptr) {
+            if matches!(op, Add) && lt == Ty::Ptr && rt == Ty::Ptr {
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_concat".to_string(),
+                    args: vec![l, r],
+                });
+                return Ok((d, Ty::Ptr));
+            }
+            return Err(err(
+                "unsupported operation on a reference type (only str + str)",
+            ));
+        }
+
         let is_float = lt.is_float() || rt.is_float();
 
         if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
@@ -847,6 +888,35 @@ impl<'a> FnLower<'a> {
 
 fn is_name(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Name(n, _) if n == name)
+}
+
+/// Process the common escape sequences in a (non-raw) string literal.
+fn unescape(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push(b'\n'),
+            Some('t') => out.push(b'\t'),
+            Some('r') => out.push(b'\r'),
+            Some('0') => out.push(0),
+            Some('\\') => out.push(b'\\'),
+            Some('\'') => out.push(b'\''),
+            Some('"') => out.push(b'"'),
+            Some(other) => {
+                out.push(b'\\');
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    out
 }
 
 fn parse_int_lit(s: &str) -> i64 {
