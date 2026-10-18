@@ -49,6 +49,14 @@ pub enum Ty {
     /// A regex match object (result of `subject =~ m/.../`, D-0010). Truthy on
     /// success; carries captured groups accessed via `.group(...)`.
     Match,
+    /// A Python object/handle (D-0012, `design/0003-python-interop.md`): a
+    /// Python module imported with `import python`, or any value produced by a
+    /// Python attribute access or call. Python is dynamic, so this type permits
+    /// attribute access and calls without further constraint, and — like
+    /// [`Ty::Unknown`] — is assignable to and from anything (values marshal at
+    /// the boundary). Explicit conversions (`int64(x)`, `float64(x)`) and
+    /// `print` marshal it back to a Zap value.
+    Py,
     /// Not inferable yet — assignable to and from anything to avoid cascading
     /// errors.
     Unknown,
@@ -94,6 +102,7 @@ impl Ty {
             Ty::Set(t) => format!("set[{}]", t.display()),
             Ty::Named(n) => n.clone(),
             Ty::Match => "Match".into(),
+            Ty::Py => "py".into(),
             Ty::Unknown => "<unknown>".into(),
         }
     }
@@ -105,7 +114,9 @@ fn assignable(from: &Ty, to: &Ty) -> bool {
     if from == to {
         return true;
     }
-    if matches!(from, Ty::Unknown) || matches!(to, Ty::Unknown) {
+    if matches!(from, Ty::Unknown | Ty::Py) || matches!(to, Ty::Unknown | Ty::Py) {
+        // Python handles (D-0012) are dynamic: values marshal across the
+        // boundary, so a `py` value fits anywhere and anything fits into `py`.
         return true;
     }
     match (from, to) {
@@ -389,6 +400,7 @@ impl Checker {
                 "bigint" => Ty::Bigint,
                 "complex" => Ty::Complex,
                 "Match" => Ty::Match,
+                "pyobject" => Ty::Py,
                 "list" => {
                     let el = args
                         .first()
@@ -666,6 +678,19 @@ impl Checker {
 
     fn check_module(&mut self, module: &Module) {
         self.push_scope();
+        // Python imports (D-0012): bind each imported module's name to a Python
+        // handle type in module scope so references like `np.array(...)` resolve
+        // (and don't trip the "unknown name" check). Declared up front so a
+        // function defined before the `import` still sees the alias.
+        for item in &module.items {
+            if let Item::Import(Import::Python {
+                module: m, alias, ..
+            }) = item
+            {
+                let name = alias.clone().unwrap_or_else(|| m.clone());
+                self.declare(&name, Ty::Py);
+            }
+        }
         for item in &module.items {
             match item {
                 Item::Function(f) => self.check_function(f, None),
@@ -1129,8 +1154,14 @@ impl Checker {
                 }
             }
             Expr::Attr { base, .. } => {
-                self.infer(base);
-                Ty::Unknown
+                // Attribute access on a Python handle yields another Python
+                // handle (D-0012); everything else is modeled loosely for now.
+                let b = self.infer(base);
+                if matches!(b, Ty::Py) {
+                    Ty::Py
+                } else {
+                    Ty::Unknown
+                }
             }
             Expr::Lambda { .. } => Ty::Unknown,
             Expr::RegexMatch {
@@ -1326,7 +1357,9 @@ impl Checker {
                     }
                     for a in args {
                         let at = self.infer(&a.value);
-                        if !at.is_numeric() && !matches!(at, Ty::Unknown) {
+                        // A Python handle is accepted: the conversion marshals it
+                        // back to a Zap number (D-0012).
+                        if !at.is_numeric() && !matches!(at, Ty::Unknown | Ty::Py) {
                             self.error(
                                 format!("{}() expects a number, found {}", fname, at.display()),
                                 expr_span(&a.value),
@@ -1367,12 +1400,18 @@ impl Checker {
                 }
             }
         }
-        // Method or other callable: not modeled yet.
-        self.infer(callee);
+        // Method or other callable. A call through a Python handle (e.g.
+        // `np.array(...)`, or a Python callable held in a variable) yields a
+        // Python handle (D-0012); anything else is modeled loosely for now.
+        let ct = self.infer(callee);
         for a in args {
             self.infer(&a.value);
         }
-        Ty::Unknown
+        if matches!(ct, Ty::Py) {
+            Ty::Py
+        } else {
+            Ty::Unknown
+        }
     }
 
     fn check_user_call(&mut self, sig: &FnSig, fname: &str, args: &[Arg], span: Span) -> Ty {
@@ -1712,5 +1751,36 @@ mod tests {
         // Non-string argument is rejected.
         let e = errors("def main():\n    print(reflect_has(1, 2))\n");
         assert!(!e.is_empty(), "reflect_has should want str args");
+    }
+
+    // --- Python interop (ticket #27, D-0012) ---
+
+    #[test]
+    fn python_interop_golden_type_checks() {
+        // The golden program type-checks: imported module aliases resolve, and
+        // attribute access / calls on Python handles plus scalar conversions are
+        // accepted (Python values are dynamic).
+        ok(include_str!("../../../tests/golden/python_interop.zap"));
+    }
+
+    #[test]
+    fn python_module_alias_is_in_scope() {
+        // Referencing an imported alias is not an "unknown name" error, and a
+        // Python call result flows as a dynamic value usable anywhere.
+        ok("import python \"math\" as m\n\ndef main():\n    auto r = m.sqrt(2.0)\n    print(int64(r))\n");
+        ok("import python \"json\" as j\n\ndef main():\n    auto s = j.dumps(\"x\")\n    print(s)\n");
+    }
+
+    #[test]
+    fn python_conversion_accepts_a_handle() {
+        // `int64(...)` / `float64(...)` accept a Python handle (they marshal it
+        // back), where a non-numeric Zap value would be rejected.
+        ok("import python \"math\" as m\n\ndef main():\n    int64 g = int64(m.gcd(6, 4))\n    print(g)\n");
+    }
+
+    #[test]
+    fn pyobject_type_annotation_is_accepted() {
+        // The opaque `pyobject` handle type can be written explicitly.
+        ok("import python \"math\" as m\n\ndef main():\n    pyobject r = m.sqrt(2.0)\n    print(r)\n");
     }
 }
