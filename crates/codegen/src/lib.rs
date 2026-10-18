@@ -107,7 +107,13 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         .arg("-lm")
         // `-lpcre2-8` provides the 8-bit PCRE2 API the regex runtime wraps
         // (ticket #23); the dev container / CI provide `libpcre2-dev`.
-        .arg("-lpcre2-8");
+        .arg("-lpcre2-8")
+        // `-lpthread` backs the goroutine runtime (ticket #25): each `spawn`
+        // starts a GC-registered pthread, and channels block on pthread
+        // mutex/condvars. `libgc` must be thread-aware (the runtime defines
+        // `GC_THREADS` and uses `GC_pthread_create`); the dev container's
+        // `libgc-dev` is built with thread support.
+        .arg("-lpthread");
     // CPython embedding flags (ticket #27, D-0012): the `-I...` cflags let
     // `zaprt.c` find `<Python.h>`, and the libs link libpython. Discovered with
     // `pkg-config` (the dev container / CI provide `python3-dev` + `pkg-config`)
@@ -383,6 +389,23 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_py_to_f64", &[p.into()], Some(f.into()));
         self.declare_rt("zap_py_str", &[p.into()], Some(p.into()));
 
+        // Concurrency entry points (ticket #25, D-0013/D-0031,
+        // design/0005-concurrency.md). Goroutines are backed by GC-registered OS
+        // threads (`zap_spawn` takes a trampoline `ptr(ptr)` and its closure
+        // `ptr`), joined by the implicit root scope at program exit
+        // (`zap_rt_join_all`, emitted at `main`'s return). Channels store uniform
+        // 8-byte element words; send/recv pick the `_i64` / `_ptr` variant per
+        // element kind, exactly like the collection entry points. `zap_chan_new`
+        // takes the buffer capacity (0 = unbuffered rendezvous). See `zaprt.c`.
+        self.declare_rt("zap_spawn", &[p.into(), p.into()], None);
+        self.declare_rt("zap_rt_join_all", &[], None);
+        self.declare_rt("zap_chan_new", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_chan_send_i64", &[p.into(), i.into()], None);
+        self.declare_rt("zap_chan_send_ptr", &[p.into(), p.into()], None);
+        self.declare_rt("zap_chan_recv_i64", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_chan_recv_ptr", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_chan_close", &[p.into()], None);
+
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
         for sl in &m.structs {
@@ -490,6 +513,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Dict(..)
             | Ty::Set(_)
             | Ty::Array(_)
+            | Ty::Chan(_)
             | Ty::Match
             | Ty::Py => self.ctx.ptr_type(AddressSpace::default()).into(),
         }
@@ -858,8 +882,94 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 let res = self.array_binop(*op, *dtype, lv, rv, *scalar, fv)?;
                 vals[*dest as usize] = Some(res);
             }
+            Inst::Spawn { func, args } => {
+                // Launch a coroutine running `func(args...)` (ticket #25,
+                // D-0013). The evaluated arguments are copied into a
+                // GC-allocated closure whose layout is the callee's parameter
+                // tuple; a per-target trampoline `ptr(ptr)` unpacks that closure
+                // and calls the function. `zap_spawn` starts a GC-registered OS
+                // thread running the trampoline on the closure. This is the one
+                // non-mechanical arm (it synthesizes the trampoline), mirroring
+                // the ArrayBinOp SIMD lowering above.
+                let target = *self
+                    .fns
+                    .get(func)
+                    .ok_or_else(|| format!("spawn of unknown function '{func}'"))?;
+                let param_tys = target.get_type().get_param_types();
+                let env_struct = self.ctx.struct_type(&param_tys, false);
+                let size = env_struct
+                    .size_of()
+                    .ok_or_else(|| "spawn closure has no size".to_string())?;
+                let alloc = self.fns["zap_alloc"];
+                let env = b
+                    .build_call(alloc, &[size.into()], "spawnenv")
+                    .map_err(|e| e.to_string())?
+                    .try_as_basic_value()
+                    .left()
+                    .ok_or_else(|| "zap_alloc returned no value".to_string())?
+                    .into_pointer_value();
+                for (i, a) in args.iter().enumerate() {
+                    let fp = b
+                        .build_struct_gep(env_struct, env, i as u32, "argptr")
+                        .map_err(|_| "invalid spawn argument index".to_string())?;
+                    b.build_store(fp, get(vals, *a))
+                        .map_err(|e| e.to_string())?;
+                }
+                let thunk = self.spawn_thunk(func, target, env_struct)?;
+                let thunk_ptr = thunk.as_global_value().as_pointer_value();
+                let spawn = self.fns["zap_spawn"];
+                b.build_call(spawn, &[thunk_ptr.into(), env.into()], "")
+                    .map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
+    }
+
+    /// Build (once per target function) the spawn trampoline `ptr @__zap_thunk_F(ptr env)`
+    /// that unpacks the closure `env` (laid out as `F`'s parameter tuple) and
+    /// calls `F`, returning null. Reused across spawn sites of the same target.
+    /// Saves and restores the builder's insert position so it can be called
+    /// mid-translation of another function.
+    fn spawn_thunk(
+        &self,
+        func: &str,
+        target: FunctionValue<'ctx>,
+        env_struct: inkwell::types::StructType<'ctx>,
+    ) -> Result<FunctionValue<'ctx>, String> {
+        let name = format!("__zap_thunk_{func}");
+        if let Some(existing) = self.module.get_function(&name) {
+            return Ok(existing);
+        }
+        let b = self.builder;
+        let saved = b.get_insert_block();
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        let thunk = self
+            .module
+            .add_function(&name, ptr.fn_type(&[ptr.into()], false), None);
+        let entry = self.ctx.append_basic_block(thunk, "entry");
+        b.position_at_end(entry);
+        let env = thunk
+            .get_nth_param(0)
+            .ok_or_else(|| "thunk has no env parameter".to_string())?
+            .into_pointer_value();
+        let param_tys = target.get_type().get_param_types();
+        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
+            Vec::with_capacity(param_tys.len());
+        for (i, pty) in param_tys.iter().enumerate() {
+            let fp = b
+                .build_struct_gep(env_struct, env, i as u32, "argptr")
+                .map_err(|_| "invalid thunk argument index".to_string())?;
+            let v = b.build_load(*pty, fp, "arg").map_err(|e| e.to_string())?;
+            call_args.push(v.into());
+        }
+        b.build_call(target, &call_args, "")
+            .map_err(|e| e.to_string())?;
+        b.build_return(Some(&ptr.const_null()))
+            .map_err(|e| e.to_string())?;
+        if let Some(bb) = saved {
+            b.position_at_end(bb);
+        }
+        Ok(thunk)
     }
 
     /// Lower an element-wise array op to a SIMD loop (ticket #24): a vector body
@@ -1140,6 +1250,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         _fv: FunctionValue<'ctx>,
     ) -> Result<(), String> {
         let b = self.builder;
+        // The implicit root scope joins every spawned coroutine at program exit
+        // (ticket #25, D-0033): a bare `spawn` is never truly detached. Emitted
+        // just before each `main` *return* (not before a loop back-edge or the
+        // uncaught-exception `unreachable`) so fire-and-forget spawns the
+        // program does not otherwise await still complete before exit. A no-op
+        // when nothing was spawned.
+        if f.is_main && matches!(term, Term::Ret(_)) {
+            if let Some(join) = self.fns.get("zap_rt_join_all") {
+                b.build_call(*join, &[], "").map_err(|e| e.to_string())?;
+            }
+        }
         match term {
             Term::Ret(Some(v)) => {
                 let rv = vals[*v as usize].expect("ret value");

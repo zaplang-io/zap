@@ -106,6 +106,12 @@ pub enum Ty {
     /// A pointer to a numeric `array` object with the given element dtype
     /// (ticket #24).
     Array(Dtype),
+    /// A pointer to a runtime channel object (ticket #25, D-0031) whose elements
+    /// are stored as uniform 8-byte words of the given kind. The element kind
+    /// selects the typed send/receive runtime entry point (`zap_chan_send_i64`
+    /// vs `zap_chan_send_ptr`), exactly like [`Ty::List`]. Maps to `ptr` in
+    /// codegen.
+    Chan(Elem),
     /// A pointer to a regex match object (ticket #23, D-0010). Null means no
     /// match (falsy); owns its captured groups. Distinct from `Ptr`/`Str` so
     /// lowering can route `.group(...)` method dispatch.
@@ -312,6 +318,20 @@ pub enum Inst {
         rhs: Value,
         scalar: bool,
     },
+    /// Launch a coroutine running `func(args...)` (ticket #25, D-0013): a
+    /// fire-and-forget `spawn`. Arguments are evaluated eagerly in the spawning
+    /// coroutine (the `args` values), so argument evaluation happens-before the
+    /// child starts. Codegen packages the evaluated arguments into a GC-allocated
+    /// closure and hands it, with a per-target trampoline, to `zap_spawn`, which
+    /// starts a GC-registered OS thread (see `crates/codegen/src/zaprt.c`). This
+    /// is a non-mechanical ZIR node (codegen synthesizes the trampoline), like
+    /// [`Inst::ArrayBinOp`]; the language-visible semantics are the M:N
+    /// scheduler's, with the OS-thread backing a documented v1 implementation
+    /// choice (the user-space work-stealing scheduler is a deferred optimization).
+    Spawn {
+        func: String,
+        args: Vec<Value>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -384,6 +404,7 @@ impl fmt::Display for Ty {
             Ty::Dict(k, v) => return write!(f, "dict[{}, {}]", k.key_suffix(), v.val_suffix()),
             Ty::Set(e) => return write!(f, "set[{}]", e.key_suffix()),
             Ty::Array(d) => return write!(f, "array[{}]", d.suffix()),
+            Ty::Chan(e) => return write!(f, "chan[{}]", e.val_suffix()),
         };
         f.write_str(s)
     }
@@ -502,6 +523,10 @@ fn fmt_inst(i: &Inst) -> String {
                 "%{dest} = array.{op:?}.{} %{lhs}, %{rhs} ({kind})",
                 dtype.suffix()
             )
+        }
+        Inst::Spawn { func, args } => {
+            let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
+            format!("spawn @{func}({})", a.join(", "))
         }
     }
 }

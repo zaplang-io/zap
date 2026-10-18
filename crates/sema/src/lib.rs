@@ -44,6 +44,9 @@ pub enum Ty {
     List(Box<Ty>),
     Dict(Box<Ty>, Box<Ty>),
     Set(Box<Ty>),
+    /// A typed channel `channel[T]` (ticket #25, D-0031): a first-class reference
+    /// value over which `T` values are sent (`ch <- v`) and received (`<-ch`).
+    Chan(Box<Ty>),
     /// A user-defined type (struct/enum), treated opaquely for now.
     Named(String),
     /// A regex match object (result of `subject =~ m/.../`, D-0010). Truthy on
@@ -100,6 +103,7 @@ impl Ty {
             Ty::List(t) => format!("list[{}]", t.display()),
             Ty::Dict(k, v) => format!("dict[{}, {}]", k.display(), v.display()),
             Ty::Set(t) => format!("set[{}]", t.display()),
+            Ty::Chan(t) => format!("channel[{}]", t.display()),
             Ty::Named(n) => n.clone(),
             Ty::Match => "Match".into(),
             Ty::Py => "py".into(),
@@ -437,6 +441,13 @@ impl Checker {
                         .unwrap_or(Ty::Unknown);
                     Ty::Set(Box::new(el))
                 }
+                "channel" => {
+                    let el = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::Chan(Box::new(el))
+                }
                 other => {
                     if self.user_types.contains(other) {
                         Ty::Named(other.to_string())
@@ -446,6 +457,28 @@ impl Checker {
                 }
             },
             Type::Tuple { .. } | Type::Func { .. } => Ty::Unknown,
+        }
+    }
+
+    /// The channel element type named by a `channel[T]` subscript, where `T`
+    /// appears as a bare name in expression position (ticket #25, D-0031).
+    fn chan_elem_from_expr(&self, e: &Expr) -> Ty {
+        match e {
+            Expr::Name(n, _) => match n.as_str() {
+                "int64" | "i64" => Ty::Int64,
+                "int32" | "i32" => Ty::Int32,
+                "float64" | "f64" => Ty::Float64,
+                "float32" | "f32" => Ty::Float32,
+                "bool" => Ty::Bool,
+                "str" => Ty::Str,
+                "bytes" => Ty::Bytes,
+                "char" => Ty::Char,
+                "bigint" => Ty::Bigint,
+                "complex" => Ty::Complex,
+                other if self.user_types.contains(other) => Ty::Named(other.to_string()),
+                _ => Ty::Unknown,
+            },
+            _ => Ty::Unknown,
         }
     }
 
@@ -1202,9 +1235,22 @@ impl Checker {
                 // `s///` returns a new string; the subject is never mutated.
                 Ty::Str
             }
-            Expr::ChanRecv { chan, .. } => {
-                self.infer(chan);
-                Ty::Unknown
+            Expr::ChanRecv { chan, span } => {
+                let ct = self.infer(chan);
+                match ct {
+                    Ty::Chan(elem) => *elem,
+                    Ty::Unknown => Ty::Unknown,
+                    other => {
+                        self.error(
+                            format!(
+                                "the operand of '<-' (receive) must be a channel, found {}",
+                                other.display()
+                            ),
+                            *span,
+                        );
+                        Ty::Unknown
+                    }
+                }
             }
             Expr::Yield { value, .. } => {
                 if let Some(v) = value {
@@ -1294,7 +1340,33 @@ impl Checker {
             }
             Eq | Ne | Lt | Le | Gt | Ge | In => Ty::Bool,
             And | Or => Ty::Bool,
-            Send => Ty::Unit,
+            // Channel send `ch <- v` (ticket #25, D-0031): the left operand must
+            // be a channel and the value must be assignable to its element type.
+            Send => {
+                match l {
+                    Ty::Chan(elem) => {
+                        if !assignable(r, elem) {
+                            self.error(
+                                format!(
+                                    "cannot send a value of type {} on a channel[{}]",
+                                    r.display(),
+                                    elem.display()
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                    Ty::Unknown => {}
+                    other => self.error(
+                        format!(
+                            "the left operand of '<-' (send) must be a channel, found {}",
+                            other.display()
+                        ),
+                        span,
+                    ),
+                }
+                Ty::Unit
+            }
         }
     }
 
@@ -1302,12 +1374,38 @@ impl Checker {
         // Array construction `array[dtype]([...])` (ticket #24): the callee is a
         // subscript whose base (`array`) and index (the dtype name) are not
         // ordinary value names, so they are not inferred as such. Typed loosely.
-        if let Expr::Index { base, .. } = callee {
+        if let Expr::Index { base, index, .. } = callee {
             if matches!(base.as_ref(), Expr::Name(n, _) if n == "array") {
                 for a in args {
                     self.infer(&a.value);
                 }
                 return Ty::Unknown;
+            }
+            // Channel construction `channel[T]()` / `channel[T](cap)` (ticket #25,
+            // D-0031). The element type `T` appears as the subscript; an optional
+            // single argument is the buffer capacity (an integer).
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "channel") {
+                let elem = self.chan_elem_from_expr(index);
+                if args.len() > 1 {
+                    self.error(
+                        "channel[T](...) takes at most one argument (the buffer capacity)"
+                            .to_string(),
+                        span,
+                    );
+                }
+                for a in args {
+                    let at = self.infer(&a.value);
+                    if !at.is_int() && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            format!(
+                                "channel capacity must be an integer, found {}",
+                                at.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                return Ty::Chan(Box::new(elem));
             }
         }
         if let Expr::Name(fname, _) = callee {
@@ -1342,6 +1440,22 @@ impl Checker {
                         self.infer(&a.value);
                     }
                     return Ty::Int64;
+                }
+                // `close(ch)` (ticket #25, D-0031): the argument must be a channel.
+                "close" => {
+                    if args.len() != 1 {
+                        self.error("close() takes exactly one argument".to_string(), span);
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !matches!(at, Ty::Chan(_) | Ty::Unknown) {
+                            self.error(
+                                format!("close() expects a channel, found {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Unit;
                 }
                 "int32" | "int64" | "float32" | "float64" | "i32" | "i64" | "f32" | "f64" => {
                     // Explicit numeric conversion (D-0020): the way to narrow or
@@ -1575,6 +1689,55 @@ mod tests {
     #[test]
     fn loop_sum_type_checks() {
         ok(include_str!("../../../tests/golden/loop_sum.zap"));
+    }
+
+    #[test]
+    fn goroutines_type_check() {
+        // The full goroutines fixture type-checks: channel construction,
+        // `spawn`, send/receive, and `close` (ticket #25, D-0013/D-0031).
+        ok(include_str!("../../../tests/golden/goroutines.zap"));
+    }
+
+    #[test]
+    fn channel_send_and_recv_are_typed() {
+        // `<-ch` yields the element type, and a send of a compatible value is
+        // accepted; the whole program type-checks.
+        ok("def main():\n    auto ch = channel[int64]()\n    ch <- 7\n    int64 v = <-ch\n    print(v)\n");
+    }
+
+    #[test]
+    fn channel_send_type_mismatch_errors() {
+        // Sending a str on a channel[int64] is a type error.
+        let e = errors("def main():\n    auto ch = channel[int64]()\n    ch <- \"x\"\n");
+        assert_eq!(e.len(), 1, "expected a send-type error, got {e:?}");
+    }
+
+    #[test]
+    fn send_requires_a_channel_on_the_left() {
+        // `x <- v` where `x` is not a channel is rejected.
+        let e = errors("def main():\n    auto x = 1\n    x <- 2\n");
+        assert_eq!(e.len(), 1, "expected a non-channel send error, got {e:?}");
+    }
+
+    #[test]
+    fn receive_requires_a_channel() {
+        // `<-x` where `x` is not a channel is rejected.
+        let e = errors("def main():\n    auto x = 1\n    auto y = <-x\n    print(y)\n");
+        assert_eq!(
+            e.len(),
+            1,
+            "expected a non-channel receive error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn close_requires_a_channel() {
+        let e = errors("def main():\n    auto x = 1\n    close(x)\n");
+        assert_eq!(
+            e.len(),
+            1,
+            "expected a close-on-non-channel error, got {e:?}"
+        );
     }
 
     #[test]
