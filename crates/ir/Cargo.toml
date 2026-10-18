@@ -1,0 +1,14 @@
+[package]
+name = "zapc_ir"
+description = "ZIR: Zap's typed SSA intermediate representation, and AST->ZIR lowering."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_ir"
+path = "src/lib.rs"
+
+[dependencies]
+zapc_syntax = { path = "../syntax" }

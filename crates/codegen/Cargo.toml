@@ -12,5 +12,5 @@ path = "src/lib.rs"
 
 [dependencies]
 zapc_syntax = { path = "../syntax" }
-zapc_sema = { path = "../sema" }
+zapc_ir = { path = "../ir" }
 inkwell = { version = "0.5.0", features = ["llvm18-0"] }

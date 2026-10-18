@@ -18,6 +18,7 @@ fn main() -> ExitCode {
         }
         Some("build") => pipeline(&args[2..], false),
         Some("run") => pipeline(&args[2..], true),
+        Some("ir") => emit_ir(&args[2..]),
         // Bare `zapc file.zap` defaults to `run`.
         Some(p) if p.ends_with(".zap") => pipeline(&args[1..], true),
         _ => {
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
             eprintln!("usage:");
             eprintln!("  zapc run <file.zap>");
             eprintln!("  zapc build <file.zap> [-o <out>]");
+            eprintln!("  zapc ir <file.zap>              # print ZIR");
             ExitCode::from(2)
         }
     }
@@ -89,6 +91,48 @@ fn pipeline(args: &[String], run_after: bool) -> ExitCode {
     }
 
     backend(&module, &file, out, run_after)
+}
+
+/// `zapc ir <file>` — front-end + AST->ZIR lowering, printing the ZIR. Host-safe
+/// (no LLVM needed).
+fn emit_ir(args: &[String]) -> ExitCode {
+    let Some(file) = args.iter().find(|a| !a.starts_with('-')).cloned() else {
+        eprintln!("zapc: no input file");
+        return ExitCode::from(2);
+    };
+    let src = match std::fs::read_to_string(&file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zapc: cannot read {file}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(&src);
+    if !lerrs.is_empty() || !perrs.is_empty() {
+        for e in &lerrs {
+            eprintln!("{file}: lex error: {}", e.message);
+        }
+        for e in &perrs {
+            eprintln!("{file}: parse error: {}", e.message);
+        }
+        return ExitCode::from(1);
+    }
+    let terrs = zapc_sema::check(&module);
+    if !terrs.is_empty() {
+        for e in &terrs {
+            eprintln!("{file}: type error: {}", e.message);
+        }
+        return ExitCode::from(1);
+    }
+    let (zir, errs) = zapc_ir::lower_module(&module);
+    if !errs.is_empty() {
+        for e in &errs {
+            eprintln!("{file}: lowering error: {}", e.message);
+        }
+        return ExitCode::from(1);
+    }
+    print!("{zir}");
+    ExitCode::SUCCESS
 }
 
 #[cfg(feature = "llvm")]
