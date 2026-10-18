@@ -24,6 +24,10 @@ struct StructCtx {
     ids: HashMap<String, u32>,
     names: Vec<String>,
     fields: Vec<Vec<(String, Ty)>>,
+    /// Python import aliases (ticket #27, D-0012): the in-scope name
+    /// (`import python "numpy" as np` → `np`) mapped to the CPython module name
+    /// (`numpy`). A reference to one of these names lowers to a `zap_py_import`.
+    py: HashMap<String, String>,
 }
 
 impl StructCtx {
@@ -60,7 +64,23 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             }
         }
     }
-    let ctx = StructCtx { ids, names, fields };
+    // Python imports (ticket #27, D-0012): map each imported module's in-scope
+    // name to its CPython module name. The alias defaults to the module string
+    // when `as` is omitted.
+    let mut py: HashMap<String, String> = HashMap::new();
+    for item in &module.items {
+        if let ast::Item::Import(ast::Import::Python { module, alias, .. }) = item {
+            let name = alias.clone().unwrap_or_else(|| module.clone());
+            py.insert(name, module.clone());
+        }
+    }
+
+    let ctx = StructCtx {
+        ids,
+        names,
+        fields,
+        py,
+    };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
     let mut sigs: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
@@ -163,6 +183,7 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
             "bool" => Ok(Ty::I1),
             "char" => Ok(Ty::I32),
             "str" | "bytes" => Ok(Ty::Ptr),
+            "pyobject" => Ok(Ty::Py),
             "list" => {
                 let e = match args.first() {
                     Some(a) => elem_of(a, ids)?,
@@ -250,7 +271,8 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
         | Ty::Dict(..)
         | Ty::Set(_)
         | Ty::Array(_)
-        | Ty::Match => Ok(Elem::Ptr),
+        | Ty::Match
+        | Ty::Py => Ok(Elem::Ptr),
         Ty::F32 | Ty::F64 => Err(err(
             "collections of floating-point elements are not supported yet",
         )),
@@ -1533,10 +1555,16 @@ impl<'a> FnLower<'a> {
                 Ok((d, Ty::Ptr))
             }
             Expr::Name(n, _) => {
-                let (ptr, ty) = self
-                    .lookup(n)
-                    .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
-                Ok((self.load(ptr, ty), ty))
+                if let Some((ptr, ty)) = self.lookup(n) {
+                    return Ok((self.load(ptr, ty), ty));
+                }
+                // A bare Python import alias (`import python "math" as m`) refers
+                // to the module handle; importing is idempotent (CPython caches),
+                // so a reference lowers to a `zap_py_import` (ticket #27, D-0012).
+                if let Some(module) = self.ctx.py.get(n).cloned() {
+                    return Ok((self.lower_py_import(&module), Ty::Py));
+                }
+                Err(err(format!("unknown variable '{n}'")))
             }
             Expr::Unary { op, expr, .. } => {
                 let (v, t) = self.expr(expr)?;
@@ -1598,6 +1626,12 @@ impl<'a> FnLower<'a> {
             Expr::Index { base, index, .. } => self.lower_index_get(base, index),
             Expr::Attr { base, name, .. } => {
                 let (bv, bty) = self.expr(base)?;
+                // Attribute read on a Python handle, e.g. `np.pi` (ticket #27,
+                // D-0012). A call `np.foo(...)` is intercepted in `call` before
+                // reaching here, so this is a plain attribute access.
+                if bty == Ty::Py {
+                    return Ok((self.lower_py_getattr(bv, name), Ty::Py));
+                }
                 let Ty::Struct(sid) = bty else {
                     return Err(err("field access on a non-struct value"));
                 };
@@ -1665,8 +1699,21 @@ impl<'a> FnLower<'a> {
             if fname == "print" {
                 let mut vals = Vec::new();
                 for a in args {
-                    let (v, _) = self.expr(&a.value)?;
-                    vals.push(v);
+                    let (v, vt) = self.expr(&a.value)?;
+                    // A Python handle prints via its `str()` (ticket #27,
+                    // D-0012): marshal it to a Zap string first so codegen's
+                    // `Print` renders it like any other string.
+                    if vt == Ty::Py {
+                        let s = self.new_value(Ty::Ptr);
+                        self.emit(Inst::Call {
+                            dest: Some(s),
+                            func: "zap_py_str".to_string(),
+                            args: vec![v],
+                        });
+                        vals.push(s);
+                    } else {
+                        vals.push(v);
+                    }
                 }
                 self.emit(Inst::Print { args: vals });
                 return Ok((self.iconst(Ty::I32, 0), Ty::I32));
@@ -1703,6 +1750,20 @@ impl<'a> FnLower<'a> {
                     return Err(err(format!("{fname}() takes exactly one argument")));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
+                // Marshal a Python handle back to a Zap scalar (ticket #27,
+                // D-0012): `int64(x)` / `float64(x)` are the conversion surface
+                // the design uses (`print(int64(b))`). Route through the runtime
+                // marshaler (i64 or f64), then coerce to the requested width.
+                if vt == Ty::Py {
+                    let (helper, mid) = if to.is_float() {
+                        ("zap_py_to_f64", Ty::F64)
+                    } else {
+                        ("zap_py_to_i64", Ty::I64)
+                    };
+                    let raw = self.new_value(mid);
+                    self.throwing_call(Some(raw), helper, vec![v]);
+                    return Ok((self.convert(raw, mid, to), to));
+                }
                 if !(vt.is_float() || vt.int_width().is_some()) {
                     return Err(err(format!("{fname}() expects a numeric value")));
                 }
@@ -1734,6 +1795,16 @@ impl<'a> FnLower<'a> {
                 let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
                 return Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }));
             }
+            // A Python callable held in a variable (`auto f = m.sqrt; f(2.0)`)
+            // or an imported module name used as a callable (ticket #27, D-0012).
+            if matches!(self.lookup(fname), Some((_, Ty::Py))) {
+                let (callable, _) = self.expr(callee)?;
+                return self.lower_py_call(callable, args);
+            }
+            if let Some(module) = self.ctx.py.get(fname).cloned() {
+                let callable = self.lower_py_import(&module);
+                return self.lower_py_call(callable, args);
+            }
             Err(err(format!("call to unknown function '{fname}'")))
         } else if let Expr::Attr { base, name, .. } = callee {
             // Method call: `recv.method(args)`.
@@ -1746,6 +1817,12 @@ impl<'a> FnLower<'a> {
             }
             if bty == Ty::Match {
                 return self.lower_match_method(recv, name, args);
+            }
+            if bty == Ty::Py {
+                // `obj.method(args)` on a Python handle (ticket #27, D-0012):
+                // read the bound attribute, then call it with marshaled args.
+                let callable = self.lower_py_getattr(recv, name);
+                return self.lower_py_call(callable, args);
             }
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
@@ -2224,6 +2301,98 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    // --- Python interop (ticket #27, D-0012, design/0003-python-interop.md) ---
+    //
+    // `import python "mod" as m` makes `m` a Python module handle; attribute
+    // access and calls dispatch through the embedded CPython C-API, and values
+    // marshal across the boundary. Nothing here needs a new ZIR instruction (the
+    // strings/collections/regex pattern): every operation lowers to a
+    // `zap_py_*` runtime call. A Python value flows as `Ty::Py` — a GC-managed
+    // handle that owns one CPython reference (decref'd by a finalizer). Calls
+    // that can surface a Python exception use `throwing_call`, so a raised
+    // Python error becomes a Zap exception catchable with `try`/`except`
+    // (D-0007): inside a `try` it is an `invoke` to the handler, else it unwinds
+    // to the caller / top level like any other `zap_panic`.
+
+    /// `import python "module"` → a module handle. Importing is idempotent
+    /// (CPython caches modules), so each reference re-imports cheaply.
+    fn lower_py_import(&mut self, module: &str) -> Value {
+        let name = self.strconst(module);
+        let d = self.new_value(Ty::Py);
+        self.throwing_call(Some(d), "zap_py_import", vec![name]);
+        d
+    }
+
+    /// `obj.attr` on a Python handle → the attribute value (another handle).
+    fn lower_py_getattr(&mut self, base: Value, name: &str) -> Value {
+        let nv = self.strconst(name);
+        let d = self.new_value(Ty::Py);
+        self.throwing_call(Some(d), "zap_py_getattr", vec![base, nv]);
+        d
+    }
+
+    /// Call a Python callable with the given Zap argument expressions. Arguments
+    /// are marshaled to Python values and collected into a `list[ptr]` the
+    /// runtime turns into a call tuple (any arity; keyword arguments are a
+    /// documented follow-up).
+    fn lower_py_call(
+        &mut self,
+        callable: Value,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let argl = self.new_value(Ty::List(Elem::Ptr));
+        self.emit(Inst::Call {
+            dest: Some(argl),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        for a in args {
+            if a.name.is_some() {
+                return Err(err(
+                    "keyword arguments to Python calls are not supported yet",
+                ));
+            }
+            let p = self.marshal_to_py(&a.value)?;
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_list_push_ptr".to_string(),
+                args: vec![argl, p],
+            });
+        }
+        let d = self.new_value(Ty::Py);
+        self.throwing_call(Some(d), "zap_py_call", vec![callable, argl]);
+        Ok((d, Ty::Py))
+    }
+
+    /// Marshal one Zap value into a Python handle (ticket #27 marshaling table).
+    /// Scalars and `str` convert by value; a value already on the Python side is
+    /// passed through. Collections and other types are a documented follow-up.
+    fn marshal_to_py(&mut self, e: &Expr) -> Result<Value, LowerError> {
+        let (v, vt) = self.expr(e)?;
+        let (helper, arg) = if vt == Ty::Py {
+            return Ok(v);
+        } else if vt == Ty::I1 {
+            ("zap_py_from_bool", self.coerce(v, vt, Ty::I64))
+        } else if vt.int_width().is_some() {
+            ("zap_py_from_i64", self.coerce(v, vt, Ty::I64))
+        } else if vt.is_float() {
+            ("zap_py_from_f64", self.as_f64(v, vt))
+        } else if vt == Ty::Ptr {
+            ("zap_py_from_str", v)
+        } else {
+            return Err(err(
+                "cannot marshal this value to Python yet (supported: int, float, bool, str, and Python handles)",
+            ));
+        };
+        let d = self.new_value(Ty::Py);
+        self.emit(Inst::Call {
+            dest: Some(d),
+            func: helper.to_string(),
+            args: vec![arg],
+        });
+        Ok(d)
+    }
+
     fn binop(
         &mut self,
         op: AstBin,
@@ -2638,11 +2807,13 @@ impl<'a> FnLower<'a> {
         if t == Ty::I1 {
             return v;
         }
-        if matches!(t, Ty::Match | Ty::Ptr) {
+        if matches!(t, Ty::Match | Ty::Ptr | Ty::Py) {
             // Reference types are truthy when non-null. Codegen's `ICmp` only
             // compares integers, so go through the runtime (`zap_ptr_nonnull`
             // returns 0/1) and compare that i64 against zero. For a match
-            // object, null means "no match" (D-0010).
+            // object, null means "no match" (D-0010). A Python handle is a
+            // non-null wrapper, so it is effectively always truthy here; real
+            // Python truthiness (`PyObject_IsTrue`) is a documented follow-up.
             let nn = self.new_value(Ty::I64);
             self.emit(Inst::Call {
                 dest: Some(nn),

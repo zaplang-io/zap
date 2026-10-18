@@ -297,6 +297,60 @@ mod tests {
         assert!(text.contains("= call @zap_regex_group("), "text:\n{text}");
     }
 
+    // --- Python interop (ticket #27, D-0012) ---
+
+    #[test]
+    fn lower_python_interop_fixture() {
+        // The golden program exercises the whole surface: module import,
+        // attribute+call dispatch, and scalar/str marshaling both directions.
+        let m = lower_ok(include_str!("../../../tests/golden/python_interop.zap"));
+        let text = format!("{m}");
+        // Import, attribute read, and call all route to the Python runtime.
+        assert!(text.contains("@zap_py_import("), "text:\n{text}");
+        assert!(text.contains("@zap_py_getattr("), "text:\n{text}");
+        assert!(text.contains("@zap_py_call("), "text:\n{text}");
+        // Argument marshaling: int, float, and str cross into Python.
+        assert!(text.contains("call @zap_py_from_i64("), "text:\n{text}");
+        assert!(text.contains("call @zap_py_from_f64("), "text:\n{text}");
+        assert!(text.contains("call @zap_py_from_str("), "text:\n{text}");
+        // Result marshaling: `int64(...)` converts a Python int back, and
+        // `print` of a Python handle renders it via its str().
+        assert!(text.contains("@zap_py_to_i64("), "text:\n{text}");
+        assert!(text.contains("call @zap_py_str("), "text:\n{text}");
+        // The argument vector for a call is a `list[ptr]` of marshaled handles.
+        assert!(text.contains("call @zap_list_new("), "text:\n{text}");
+        assert!(text.contains("call @zap_list_push_ptr("), "text:\n{text}");
+    }
+
+    #[test]
+    fn python_import_and_call_lower_to_runtime() {
+        // A minimal import + call lowers to import -> getattr -> call, with the
+        // int argument marshaled in and the int result marshaled back out.
+        let m = lower_ok(
+            "import python \"math\" as m\n\ndef main():\n    print(int64(m.gcd(12, 8)))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_py_import("), "text:\n{text}");
+        assert!(text.contains("@zap_py_getattr("), "text:\n{text}");
+        assert!(text.contains("@zap_py_call("), "text:\n{text}");
+        assert!(text.contains("call @zap_py_from_i64("), "text:\n{text}");
+        assert!(text.contains("@zap_py_to_i64("), "text:\n{text}");
+    }
+
+    #[test]
+    fn python_calls_in_a_try_use_the_exception_edge() {
+        // A Python call inside a `try` becomes an `invoke` to the handler, so a
+        // raised Python error is catchable with `except` (D-0012 exception
+        // translation routes through the #22 unwinding path).
+        let m = lower_ok(
+            "import python \"math\" as m\n\ndef main():\n    try:\n        print(int64(m.sqrt(2.0)))\n    except:\n        print(\"boom\")\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("invoke @zap_py_import"), "text:\n{text}");
+        assert!(text.contains("invoke @zap_py_call"), "text:\n{text}");
+        assert!(text.contains("landingpad"), "text:\n{text}");
+    }
+
     #[test]
     fn regex_subject_group_method_is_checked() {
         // An unknown match-object method reports cleanly (not a silent miscompile).

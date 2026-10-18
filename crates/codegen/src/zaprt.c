@@ -8,6 +8,13 @@
  * stack, registers and globals, so no stack maps or safepoints are needed. The
  * type-descriptor header from the ABI is added when reflection / precise GC
  * land. */
+/* Python.h must precede the standard headers (it sets feature-test macros).
+ * Embedding CPython backs the Python interop (ticket #27, D-0012); the compile
+ * flags come from `pkg-config --cflags python3-embed` (see build_executable),
+ * and the dev container / CI provide `python3-dev`. */
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+
 #include <gc.h>
 #include <math.h>
 #include <stdint.h>
@@ -911,4 +918,246 @@ void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_
         zap_regex_fail("substitution failed", rc);
     }
     return zap_str_new((const char *)buf, (int64_t)outlen);
+}
+
+/* ---------------------------------------------------------------------------
+ * Python interop (ticket #27, D-0012, design/0003-python-interop.md): embed
+ * CPython and marshal values across the Zap <-> Python boundary. The compiler
+ * lowers `import python`, attribute/call dispatch, and conversions to the
+ * `zap_py_*` entry points below (see crates/ir/src/lower.rs).
+ *
+ * Representation & GC bridging: a Python value held by Zap is an opaque,
+ * GC-managed handle `ZapPy` that OWNS one CPython reference. Capture takes a new
+ * reference (the C-API calls here return new references, handed straight to
+ * `zap_py_wrap`); a Boehm finalizer DECREFs when the wrapper is collected. The
+ * wrapper is GC-scanned, and the ZapList argument vectors that carry handles are
+ * GC_MALLOC'd, so a live Zap handle keeps its PyObject alive across collection.
+ *
+ * GIL: every entry point acquires the GIL (PyGILState_Ensure) around its C-API
+ * work and releases it before returning. With the single-threaded runtime of
+ * this increment the main thread simply re-acquires it; GIL contention vs.
+ * goroutine parallelism (#25) is a documented limitation (design open issue).
+ *
+ * Exceptions: a Python error is translated to a Zap exception — the error is
+ * formatted as "<type>: <message>" into a ZapStr and raised with `zap_panic`,
+ * so it propagates and is catchable with `try`/`except` (D-0007, ticket #22).
+ *
+ * Follow-ups (documented in the PR): list/dict/ndarray marshaling (the design's
+ * container rows), keyword arguments, real `PyObject_IsTrue` truthiness, and a
+ * thread-safe interpreter init for the goroutine runtime. */
+
+typedef struct {
+    PyObject *obj; /* owned reference; NULL once finalized */
+} ZapPy;
+
+/* Initialize the interpreter exactly once (single-threaded this increment). */
+static void zap_py_ensure_init(void) {
+    if (!Py_IsInitialized()) {
+        Py_InitializeEx(0); /* 0 = do not install signal handlers */
+    }
+}
+
+/* Boehm finalizer: drop the owned CPython reference when the wrapper dies. */
+static void zap_py_finalize(void *obj, void *client_data) {
+    (void)client_data;
+    ZapPy *h = (ZapPy *)obj;
+    if (h->obj != NULL) {
+        PyGILState_STATE g = PyGILState_Ensure();
+        Py_DECREF(h->obj);
+        PyGILState_Release(g);
+        h->obj = NULL;
+    }
+}
+
+/* Wrap a *new* reference `o` (ownership transferred to the handle). */
+static ZapPy *zap_py_wrap(PyObject *o) {
+    ZapPy *h = (ZapPy *)GC_MALLOC(sizeof(ZapPy));
+    h->obj = o;
+    GC_register_finalizer(h, zap_py_finalize, NULL, NULL, NULL);
+    return h;
+}
+
+/* NUL-terminated copy of a ZapStr (for the C-string CPython APIs). */
+static char *zap_py_cstr(const ZapStr *s) {
+    char *buf = (char *)GC_MALLOC_ATOMIC((size_t)s->len + 1);
+    if (s->len > 0) {
+        memcpy(buf, s->data, (size_t)s->len);
+    }
+    buf[s->len] = '\0';
+    return buf;
+}
+
+/* Translate the current Python error to a Zap exception and raise it. Releases
+ * the GIL first (the caller passes its gstate), then calls `zap_panic`, which
+ * unwinds and never returns. */
+static void zap_py_raise(PyGILState_STATE g) {
+    PyObject *type = NULL, *value = NULL, *tb = NULL;
+    PyErr_Fetch(&type, &value, &tb);
+    PyErr_NormalizeException(&type, &value, &tb);
+    const char *tname =
+        (type != NULL) ? ((PyTypeObject *)type)->tp_name : "PythonError";
+    ZapStr *msg = (ZapStr *)zap_str_new(tname, (int64_t)strlen(tname));
+    if (value != NULL) {
+        PyObject *s = PyObject_Str(value);
+        if (s != NULL) {
+            Py_ssize_t n = 0;
+            const char *u = PyUnicode_AsUTF8AndSize(s, &n);
+            ZapStr *sep = (ZapStr *)zap_str_new(": ", 2);
+            ZapStr *body = (ZapStr *)zap_str_new(u ? u : "", (int64_t)(u ? n : 0));
+            msg = (ZapStr *)zap_str_concat(zap_str_concat(msg, sep), body);
+            Py_DECREF(s);
+        }
+    }
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(tb);
+    PyGILState_Release(g);
+    zap_panic(msg);
+}
+
+/* `import python "module"` → a module handle. */
+void *zap_py_import(void *name_) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    char *name = zap_py_cstr((ZapStr *)name_);
+    PyObject *m = PyImport_ImportModule(name);
+    if (m == NULL) {
+        zap_py_raise(g);
+    }
+    ZapPy *out = zap_py_wrap(m);
+    PyGILState_Release(g);
+    return out;
+}
+
+/* `obj.attr` on a Python handle → the attribute value (another handle). */
+void *zap_py_getattr(void *obj_, void *name_) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    ZapPy *obj = (ZapPy *)obj_;
+    char *name = zap_py_cstr((ZapStr *)name_);
+    PyObject *a = PyObject_GetAttrString(obj->obj, name);
+    if (a == NULL) {
+        zap_py_raise(g);
+    }
+    ZapPy *out = zap_py_wrap(a);
+    PyGILState_Release(g);
+    return out;
+}
+
+/* Call a Python callable with positional args collected in a ZapList of ZapPy*
+ * handle words (built by the lowering). Returns the result as a handle. */
+void *zap_py_call(void *callable_, void *arglist_) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    ZapPy *callable = (ZapPy *)callable_;
+    ZapList *argl = (ZapList *)arglist_;
+    int64_t n = (argl != NULL) ? argl->len : 0;
+    PyObject *tuple = PyTuple_New((Py_ssize_t)n);
+    if (tuple == NULL) {
+        zap_py_raise(g);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        ZapPy *h = (ZapPy *)(intptr_t)argl->data[i];
+        PyObject *o = h->obj;
+        Py_INCREF(o); /* PyTuple_SET_ITEM steals the reference */
+        PyTuple_SET_ITEM(tuple, (Py_ssize_t)i, o);
+    }
+    PyObject *r = PyObject_CallObject(callable->obj, tuple);
+    Py_DECREF(tuple);
+    if (r == NULL) {
+        zap_py_raise(g);
+    }
+    ZapPy *out = zap_py_wrap(r);
+    PyGILState_Release(g);
+    return out;
+}
+
+/* --- marshaling: Zap scalar/str -> Python (the handle owns the new ref). --- */
+void *zap_py_from_i64(int64_t v) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    PyObject *o = PyLong_FromLongLong((long long)v);
+    if (o == NULL) {
+        zap_py_raise(g);
+    }
+    ZapPy *out = zap_py_wrap(o);
+    PyGILState_Release(g);
+    return out;
+}
+void *zap_py_from_f64(double v) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    PyObject *o = PyFloat_FromDouble(v);
+    if (o == NULL) {
+        zap_py_raise(g);
+    }
+    ZapPy *out = zap_py_wrap(o);
+    PyGILState_Release(g);
+    return out;
+}
+void *zap_py_from_bool(int64_t v) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    PyObject *o = PyBool_FromLong((long)v); /* new ref to Py_True/Py_False */
+    ZapPy *out = zap_py_wrap(o);
+    PyGILState_Release(g);
+    return out;
+}
+void *zap_py_from_str(void *s_) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    ZapStr *s = (ZapStr *)s_;
+    PyObject *o = PyUnicode_FromStringAndSize(s->data, (Py_ssize_t)s->len);
+    if (o == NULL) {
+        zap_py_raise(g);
+    }
+    ZapPy *out = zap_py_wrap(o);
+    PyGILState_Release(g);
+    return out;
+}
+
+/* --- marshaling: Python -> Zap scalar/str. --- */
+int64_t zap_py_to_i64(void *obj_) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    ZapPy *obj = (ZapPy *)obj_;
+    PyObject *n = PyNumber_Long(obj->obj); /* accepts int and float */
+    if (n == NULL) {
+        zap_py_raise(g);
+    }
+    long long v = PyLong_AsLongLong(n);
+    Py_DECREF(n);
+    if (v == -1 && PyErr_Occurred()) {
+        zap_py_raise(g);
+    }
+    PyGILState_Release(g);
+    return (int64_t)v;
+}
+double zap_py_to_f64(void *obj_) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    ZapPy *obj = (ZapPy *)obj_;
+    double v = PyFloat_AsDouble(obj->obj); /* accepts int and float */
+    if (v == -1.0 && PyErr_Occurred()) {
+        zap_py_raise(g);
+    }
+    PyGILState_Release(g);
+    return v;
+}
+
+/* `str(obj)` as a Zap string (used by `print` of a Python handle). */
+void *zap_py_str(void *obj_) {
+    zap_py_ensure_init();
+    PyGILState_STATE g = PyGILState_Ensure();
+    ZapPy *obj = (ZapPy *)obj_;
+    PyObject *s = PyObject_Str(obj->obj);
+    if (s == NULL) {
+        zap_py_raise(g);
+    }
+    Py_ssize_t n = 0;
+    const char *u = PyUnicode_AsUTF8AndSize(s, &n);
+    ZapStr *out = (ZapStr *)zap_str_new(u ? u : "", (int64_t)(u ? n : 0));
+    Py_DECREF(s);
+    PyGILState_Release(g);
+    return out;
 }

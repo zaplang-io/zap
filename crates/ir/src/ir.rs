@@ -110,6 +110,11 @@ pub enum Ty {
     /// match (falsy); owns its captured groups. Distinct from `Ptr`/`Str` so
     /// lowering can route `.group(...)` method dispatch.
     Match,
+    /// A pointer to a GC-managed Python object handle (ticket #27, D-0012): the
+    /// wrapper owns one CPython reference (decref'd by a finalizer). Distinct
+    /// from `Ptr` so lowering can route attribute/call dispatch and marshaling
+    /// through the Python runtime (`zap_py_*`). Maps to `ptr` in codegen.
+    Py,
     Void,
 }
 
@@ -372,6 +377,7 @@ impl fmt::Display for Ty {
             Ty::F64 => "f64",
             Ty::Ptr => "ptr",
             Ty::Match => "match",
+            Ty::Py => "py",
             Ty::Void => "void",
             Ty::Struct(id) => return write!(f, "struct#{id}"),
             Ty::List(e) => return write!(f, "list[{}]", e.val_suffix()),

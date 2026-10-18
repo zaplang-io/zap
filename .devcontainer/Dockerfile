@@ -21,6 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libclang-18-dev \
         libgc-dev \
         libpcre2-dev \
+        python3-dev \
+        pkg-config \
         zlib1g-dev \
         libzstd-dev \
         libffi-dev \

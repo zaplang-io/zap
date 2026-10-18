@@ -95,8 +95,8 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     // `-lstdc++` pulls in the Itanium unwinding personality and the
     // `__cxa_*` exception entry points the runtime calls (ticket #22); the
     // actual stack unwinder (`_Unwind_*`) comes from libgcc, linked by default.
-    let status = Command::new("cc")
-        .arg(&obj_path)
+    let mut cmd = Command::new("cc");
+    cmd.arg(&obj_path)
         .arg(&rt_path)
         .arg("-o")
         .arg(out_path)
@@ -107,7 +107,13 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         .arg("-lm")
         // `-lpcre2-8` provides the 8-bit PCRE2 API the regex runtime wraps
         // (ticket #23); the dev container / CI provide `libpcre2-dev`.
-        .arg("-lpcre2-8")
+        .arg("-lpcre2-8");
+    // CPython embedding flags (ticket #27, D-0012): the `-I...` cflags let
+    // `zaprt.c` find `<Python.h>`, and the libs link libpython. Discovered with
+    // `pkg-config` (the dev container / CI provide `python3-dev` + `pkg-config`)
+    // so the exact libpython version and path are not hardcoded.
+    cmd.args(python_embed_flags()?);
+    let status = cmd
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
@@ -116,6 +122,36 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         return Err(format!("linker (cc) failed: {status}"));
     }
     Ok(())
+}
+
+/// The compile + link flags for embedding CPython (ticket #27, D-0012), as
+/// individual `cc` arguments. Resolved via `pkg-config`: `python3-embed` is the
+/// canonical module for embedding an interpreter (Python 3.8+); `python3` is the
+/// fallback for older layouts. Includes both `--cflags` (so `zaprt.c` finds
+/// `<Python.h>`) and `--libs` (so libpython links). The `python3-dev` and
+/// `pkg-config` packages provide these (added to the dev container and CI).
+fn python_embed_flags() -> Result<Vec<String>, String> {
+    for module in ["python3-embed", "python3"] {
+        let out = Command::new("pkg-config")
+            .args(["--cflags", "--libs", module])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                return Ok(text.split_whitespace().map(|s| s.to_string()).collect());
+            }
+            Ok(_) => continue, // module not found; try the next one
+            Err(e) => {
+                return Err(format!(
+                    "failed to run pkg-config for Python embedding flags: {e} \
+                     (install `pkg-config` and `python3-dev`)"
+                ))
+            }
+        }
+    }
+    Err("pkg-config found neither 'python3-embed' nor 'python3' \
+         (install `python3-dev` and `pkg-config` to build programs that `import python`)"
+        .to_string())
 }
 
 struct Cg<'a, 'ctx> {
@@ -328,6 +364,25 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Some(p.into()),
         );
 
+        // Python interop entry points (ticket #27, D-0012,
+        // design/0003-python-interop.md), backed by the embedded CPython C-API
+        // (linked via `pkg-config --libs python3-embed`; see build_executable).
+        // A Python value is an opaque GC-managed handle (`ptr`): `zap_py_import`
+        // loads a module, `zap_py_getattr` reads an attribute, `zap_py_call`
+        // calls a callable with a ZapList of argument handles, the `zap_py_from_*`
+        // helpers marshal Zap scalars/str into Python, and `zap_py_to_*` /
+        // `zap_py_str` marshal back. Mechanical fixed C signatures.
+        self.declare_rt("zap_py_import", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_py_getattr", &[p.into(), p.into()], Some(p.into()));
+        self.declare_rt("zap_py_call", &[p.into(), p.into()], Some(p.into()));
+        self.declare_rt("zap_py_from_i64", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_py_from_f64", &[f.into()], Some(p.into()));
+        self.declare_rt("zap_py_from_bool", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_py_from_str", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_py_to_i64", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_py_to_f64", &[p.into()], Some(f.into()));
+        self.declare_rt("zap_py_str", &[p.into()], Some(p.into()));
+
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
         for sl in &m.structs {
@@ -435,7 +490,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Dict(..)
             | Ty::Set(_)
             | Ty::Array(_)
-            | Ty::Match => self.ctx.ptr_type(AddressSpace::default()).into(),
+            | Ty::Match
+            | Ty::Py => self.ctx.ptr_type(AddressSpace::default()).into(),
         }
     }
 
