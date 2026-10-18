@@ -1,0 +1,16 @@
+[package]
+name = "zapc_codegen"
+description = "Zap code generation: lowering the typed AST to native code via LLVM."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_codegen"
+path = "src/lib.rs"
+
+[dependencies]
+zapc_syntax = { path = "../syntax" }
+zapc_sema = { path = "../sema" }
+inkwell = { version = "0.5.0", features = ["llvm18-0"] }

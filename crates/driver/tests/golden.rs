@@ -1,12 +1,12 @@
 //! Golden-test harness.
 //!
 //! Golden programs live in `<repo>/tests/golden/*.zap`, each paired with a
-//! `*.expected` file holding the program's expected stdout. Until Phase 1
-//! produces runnable binaries, the end-to-end run is `#[ignore]`d; the
-//! fixtures-present check keeps the harness and fixtures honest today.
+//! `*.expected` file holding the program's expected stdout. The end-to-end run
+//! (`golden_programs_match`) requires the `llvm` feature (and an LLVM
+//! toolchain); run it in the dev container with `--features zapc/llvm`. The
+//! `fixtures_are_paired` check runs everywhere.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 /// `<repo>/tests/golden` — this crate lives at `<repo>/crates/driver`.
 fn golden_dir() -> PathBuf {
@@ -32,7 +32,7 @@ fn zap_fixtures() -> Vec<PathBuf> {
     out
 }
 
-/// Every `.zap` fixture has a matching `.expected` file. Runs today.
+/// Every `.zap` fixture has a matching `.expected` file. Runs everywhere.
 #[test]
 fn fixtures_are_paired() {
     let fixtures = zap_fixtures();
@@ -51,19 +51,26 @@ fn fixtures_are_paired() {
     }
 }
 
-/// Compile + run each fixture and compare stdout. Enabled once Phase 1 codegen
-/// exists: `cargo test -- --ignored`.
+/// Compile + run each fixture and compare stdout. Requires the `llvm` feature.
+#[cfg(feature = "llvm")]
 #[test]
-#[ignore = "enable once Phase 1 produces a runnable binary"]
 fn golden_programs_match() {
+    use std::process::Command;
     let bin = env!("CARGO_BIN_EXE_zapc");
     for zap in zap_fixtures() {
         let expected = std::fs::read_to_string(zap.with_extension("expected"))
             .expect("expected output present");
         let output = Command::new(bin)
+            .arg("run")
             .arg(&zap)
             .output()
-            .expect("run zapc on fixture");
+            .expect("run zapc");
+        assert!(
+            output.status.success(),
+            "`zapc run {}` failed:\n{}",
+            zap.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let got = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
             got.trim_end(),

@@ -7,6 +7,16 @@ resolver = "2"
 members = [
     "crates/syntax",
     "crates/sema",
+    "crates/codegen",
+    "crates/driver",
+]
+# Codegen needs LLVM, which isn't available on every host (e.g. Intel macOS).
+# It is excluded from the default build so `cargo build`/`test` work without
+# LLVM; build it explicitly (in the dev container) with `--features zapc/llvm`
+# or `-p zapc_codegen`.
+default-members = [
+    "crates/syntax",
+    "crates/sema",
     "crates/driver",
 ]
 
