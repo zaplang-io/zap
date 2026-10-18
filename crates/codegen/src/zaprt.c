@@ -9,6 +9,7 @@
  * type-descriptor header from the ABI is added when reflection / precise GC
  * land. */
 #include <gc.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,6 +58,66 @@ void zap_print_str(void *s) {
     ZapStr *z = (ZapStr *)s;
     fwrite(z->data, 1, (size_t)z->len, stdout);
 }
+
+/* --- scalar numeric helpers (ticket #19 / T9) ---
+ *
+ * `**` (power) and `//` (floor division) lower to these calls so codegen stays
+ * mechanical and the semantics live in one place. */
+
+/* Integer power by binary exponentiation. The result stays integer (the static
+ * type of `int ** int`, D-0019), so a negative exponent yields the floor of the
+ * true fractional power: 0 for |base| > 1, and the sign-tracking +/-1 for
+ * base == -1. Overflow wraps (two's complement, D-0019). */
+int64_t zap_ipow(int64_t base, int64_t exp) {
+    if (exp < 0) {
+        if (base == 1) {
+            return 1;
+        }
+        if (base == -1) {
+            return (exp & 1) ? -1 : 1;
+        }
+        return 0;
+    }
+    int64_t result = 1;
+    int64_t b = base;
+    uint64_t e = (uint64_t)exp;
+    while (e != 0) {
+        if (e & 1u) {
+            result *= b;
+        }
+        e >>= 1;
+        if (e != 0) {
+            b *= b;
+        }
+    }
+    return result;
+}
+
+/* Floating-point power via libm. */
+double zap_powf(double base, double exp) { return pow(base, exp); }
+
+/* Floor division for signed integers (Python semantics, D-0024): rounds toward
+ * negative infinity. C `/` truncates toward zero, so correct the quotient when
+ * the remainder is non-zero and the operand signs differ. Division by zero is a
+ * fault (aborts, matching the index-out-of-range behaviour until the typed
+ * exception runtime lands). */
+int64_t zap_ifloordiv(int64_t a, int64_t b) {
+    if (b == 0) {
+        fprintf(stderr, "zap: integer division or modulo by zero\n");
+        abort();
+    }
+    int64_t q = a / b;
+    int64_t r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) {
+        q -= 1;
+    }
+    return q;
+}
+
+/* Floor division for floats (Python semantics, D-0024): floor(a / b). Matches
+ * CPython's result for finite operands; division by zero follows IEEE-754
+ * (+/-inf or NaN) rather than faulting. */
+double zap_ffloordiv(double a, double b) { return floor(a / b); }
 
 int64_t zap_str_len(void *s) { return ((ZapStr *)s)->len; }
 

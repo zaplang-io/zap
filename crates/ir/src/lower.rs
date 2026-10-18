@@ -1677,6 +1677,19 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((d, Ty::I64));
             }
+            // Explicit numeric conversion: `int32(x)`, `float64(x)`, ... (D-0020).
+            // These are the way to narrow or cross the int/float boundary, which
+            // implicit coercion refuses.
+            if let Some(to) = numeric_conv_ty(fname) {
+                if args.len() != 1 {
+                    return Err(err(format!("{fname}() takes exactly one argument")));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if !(vt.is_float() || vt.int_width().is_some()) {
+                    return Err(err(format!("{fname}() expects a numeric value")));
+                }
+                return Ok((self.convert(v, vt, to), to));
+            }
             // Runtime reflection (ticket #16, D-0036): `reflect_has(type, name)`
             // and `reflect_names(type)` query the metadata registry populated at
             // the top of `main`. Both take string arguments.
@@ -2160,27 +2173,33 @@ impl<'a> FnLower<'a> {
                     rhs: rf,
                 });
             } else {
+                // Integer comparisons are done at i64 so mixed-width operands
+                // (e.g. `int32 < int64`, or a literal against an int32) share a
+                // type (D-0019 all-signed tower).
+                let li = self.coerce(l, lt, Ty::I64);
+                let ri = self.coerce(r, rt, Ty::I64);
                 self.emit(Inst::ICmp {
                     dest: d,
                     pred,
-                    lhs: l,
-                    rhs: r,
+                    lhs: li,
+                    rhs: ri,
                 });
             }
             return Ok((d, Ty::I1));
         }
 
         match op {
-            Add | Sub | Mul | Mod | FloorDiv => {
+            Add | Sub | Mul | Mod => {
                 let irop = match op {
                     Add => BinOp::Add,
                     Sub => BinOp::Sub,
                     Mul => BinOp::Mul,
                     Mod => BinOp::Rem,
-                    FloorDiv => BinOp::Div,
                     _ => unreachable!(),
                 };
                 if is_float {
+                    // Float arithmetic computes at f64 (operands widened), per
+                    // the numeric join in sema (any float operand -> float64).
                     let lf = self.as_f64(l, lt);
                     let rf = self.as_f64(r, rt);
                     let d = self.new_value(Ty::F64);
@@ -2192,14 +2211,73 @@ impl<'a> FnLower<'a> {
                     });
                     Ok((d, Ty::F64))
                 } else {
-                    let d = self.new_value(lt);
+                    // Integer arithmetic computes at i64 (operands widened), so
+                    // `int32`/untyped-literal operands share a width (D-0019).
+                    let li = self.coerce(l, lt, Ty::I64);
+                    let ri = self.coerce(r, rt, Ty::I64);
+                    let d = self.new_value(Ty::I64);
                     self.emit(Inst::Bin {
                         dest: d,
                         op: irop,
-                        lhs: l,
-                        rhs: r,
+                        lhs: li,
+                        rhs: ri,
                     });
-                    Ok((d, lt))
+                    Ok((d, Ty::I64))
+                }
+            }
+            FloorDiv => {
+                // Floor division (D-0024) rounds toward negative infinity,
+                // unlike LLVM `sdiv` (toward zero) / `fdiv` (no rounding). The
+                // toward-negative-infinity adjustment lives in a runtime helper
+                // so codegen stays mechanical and the semantics are in one place.
+                if is_float {
+                    let lf = self.as_f64(l, lt);
+                    let rf = self.as_f64(r, rt);
+                    let d = self.new_value(Ty::F64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_ffloordiv".to_string(),
+                        args: vec![lf, rf],
+                    });
+                    Ok((d, Ty::F64))
+                } else {
+                    let li = self.coerce(l, lt, Ty::I64);
+                    let ri = self.coerce(r, rt, Ty::I64);
+                    let d = self.new_value(Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_ifloordiv".to_string(),
+                        args: vec![li, ri],
+                    });
+                    Ok((d, Ty::I64))
+                }
+            }
+            Pow => {
+                // `**` over the numeric tower (D-0019). A floating-point base or
+                // exponent goes through libm `pow` (f64); the all-integer case
+                // uses a binary-exponentiation runtime helper and keeps an
+                // integer result per the static type (a negative exponent yields
+                // the floor of the true power — 0 for |base| > 1).
+                if is_float {
+                    let lf = self.as_f64(l, lt);
+                    let rf = self.as_f64(r, rt);
+                    let d = self.new_value(Ty::F64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_powf".to_string(),
+                        args: vec![lf, rf],
+                    });
+                    Ok((d, Ty::F64))
+                } else {
+                    let li = self.coerce(l, lt, Ty::I64);
+                    let ri = self.coerce(r, rt, Ty::I64);
+                    let d = self.new_value(Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_ipow".to_string(),
+                        args: vec![li, ri],
+                    });
+                    Ok((d, Ty::I64))
                 }
             }
             Div => {
@@ -2223,14 +2301,16 @@ impl<'a> FnLower<'a> {
                     Shr => BinOp::Shr,
                     _ => unreachable!(),
                 };
-                let d = self.new_value(lt);
+                let li = self.coerce(l, lt, Ty::I64);
+                let ri = self.coerce(r, rt, Ty::I64);
+                let d = self.new_value(Ty::I64);
                 self.emit(Inst::Bin {
                     dest: d,
                     op: irop,
-                    lhs: l,
-                    rhs: r,
+                    lhs: li,
+                    rhs: ri,
                 });
-                Ok((d, lt))
+                Ok((d, Ty::I64))
             }
             And | Or => {
                 let lb = self.truthy(l, lt);
@@ -2249,7 +2329,6 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, Ty::I1))
             }
-            Pow => Err(err("'**' is not supported by codegen yet")),
             In => Err(err("'in' is not supported by codegen yet")),
             Send => Err(err("channel send is not supported by codegen yet")),
             Eq | Ne | Lt | Le | Gt | Ge => unreachable!(),
@@ -2382,18 +2461,45 @@ impl<'a> FnLower<'a> {
         v
     }
 
+    /// Widen a numeric value to `f64` (int -> sitofp, f32 -> fpext, f64 -> self).
     fn as_f64(&mut self, v: Value, t: Ty) -> Value {
-        if t.is_float() {
-            v
-        } else {
-            let d = self.new_value(Ty::F64);
-            self.emit(Inst::Cast {
-                dest: d,
-                kind: CastKind::SIToFP,
-                val: v,
-            });
-            d
+        self.coerce(v, t, Ty::F64)
+    }
+
+    /// An explicit numeric conversion to `to` (the `int32(x)` / `float64(x)`
+    /// form, D-0020). Unlike [`coerce`], which only widens, this also narrows
+    /// and converts float -> int (a user wrote the cast, so data loss is their
+    /// intent). Non-numeric operands pass through unchanged.
+    fn convert(&mut self, v: Value, from: Ty, to: Ty) -> Value {
+        if from == to {
+            return v;
         }
+        let kind = match (from, to) {
+            (f, t) if f.int_width().is_some() && t.int_width().is_some() => {
+                if t.int_width().unwrap() > f.int_width().unwrap() {
+                    CastKind::SExt
+                } else {
+                    CastKind::Trunc
+                }
+            }
+            (f, t) if f.int_width().is_some() && t.is_float() => CastKind::SIToFP,
+            (f, t) if f.is_float() && t.int_width().is_some() => CastKind::FPToSI,
+            (f, t) if f.is_float() && t.is_float() => {
+                if t == Ty::F64 {
+                    CastKind::FPExt
+                } else {
+                    CastKind::FPTrunc
+                }
+            }
+            _ => return v,
+        };
+        let d = self.new_value(to);
+        self.emit(Inst::Cast {
+            dest: d,
+            kind,
+            val: v,
+        });
+        d
     }
 
     fn truthy(&mut self, v: Value, t: Ty) -> Value {
@@ -2426,6 +2532,18 @@ impl<'a> FnLower<'a> {
 
 fn is_name(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Name(n, _) if n == name)
+}
+
+/// The ZIR target type of an explicit numeric conversion call, by builtin name
+/// (`int32(x)`, `float64(x)`, ...). `None` for any other callee.
+fn numeric_conv_ty(name: &str) -> Option<Ty> {
+    match name {
+        "int32" | "i32" => Some(Ty::I32),
+        "int64" | "i64" => Some(Ty::I64),
+        "float32" | "f32" => Some(Ty::F32),
+        "float64" | "f64" => Some(Ty::F64),
+        _ => None,
+    }
 }
 
 /// Process the common escape sequences in a (non-raw) string literal.

@@ -155,6 +155,61 @@ mod tests {
     }
 
     #[test]
+    fn lower_scalars_fixture() {
+        // The T9 scalar tower (ticket #19): int32/float32 slots, conversions,
+        // `**`, and `//` all lower to the expected ops/casts/runtime calls.
+        let m = lower_ok(include_str!("../../../tests/golden/scalars.zap"));
+        let text = format!("{m}");
+        // int32 / float32 values get narrow slots (not everything is i64/f64).
+        assert!(text.contains("alloca i32"), "text:\n{text}");
+        assert!(text.contains("alloca f32"), "text:\n{text}");
+        // `scale` is typed int32 -> int32.
+        let scale = m.funcs.iter().find(|f| f.name == "scale").expect("scale");
+        assert_eq!(scale.params, vec![Ty::I32]);
+        assert_eq!(scale.ret, Ty::I32);
+        // Conversions and widening use the cast kinds.
+        assert!(text.contains("Trunc"), "text:\n{text}"); // int64 -> int32
+        assert!(text.contains("FPToSI"), "text:\n{text}"); // float -> int
+        assert!(text.contains("SIToFP"), "text:\n{text}"); // int -> float
+        assert!(text.contains("FPExt"), "text:\n{text}"); // float32 -> float64
+                                                          // Power and floor-division lower to runtime helpers.
+        assert!(text.contains("call @zap_ipow"), "text:\n{text}");
+        assert!(text.contains("call @zap_powf"), "text:\n{text}");
+        assert!(text.contains("call @zap_ifloordiv"), "text:\n{text}");
+        assert!(text.contains("call @zap_ffloordiv"), "text:\n{text}");
+    }
+
+    #[test]
+    fn pow_lowers_by_operand_kind() {
+        // All-integer `**` -> zap_ipow; any float operand -> zap_powf.
+        let m = lower_ok("def main():\n    print(2 ** 10)\n");
+        assert!(format!("{m}").contains("call @zap_ipow"));
+        let m = lower_ok("def main():\n    print(2.0 ** 3.0)\n");
+        assert!(format!("{m}").contains("call @zap_powf"));
+    }
+
+    #[test]
+    fn floordiv_lowers_by_operand_kind() {
+        // `//` never lowers to a bare sdiv/fdiv — it always goes through the
+        // floor-correcting runtime helper (D-0024).
+        let m = lower_ok("def main():\n    print(7 // 2)\n");
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_ifloordiv"), "text:\n{text}");
+        assert!(!text.contains("= Div "), "no raw div for int //:\n{text}");
+        let m = lower_ok("def main():\n    print(7.0 // 2.0)\n");
+        assert!(format!("{m}").contains("call @zap_ffloordiv"));
+    }
+
+    #[test]
+    fn explicit_conversion_lowers_to_cast() {
+        // `int32(x)` narrows (Trunc); `float64(x)` crosses to float (SIToFP).
+        let m = lower_ok("def main():\n    int64 b = 300\n    int32 c = int32(b)\n    print(c)\n");
+        assert!(format!("{m}").contains("Trunc"));
+        let m = lower_ok("def main():\n    int32 a = 7\n    print(float64(a))\n");
+        assert!(format!("{m}").contains("SIToFP"));
+    }
+
+    #[test]
     fn unsupported_construct_errors() {
         let (ast, _p, _l) = parse_str("def main():\n    raise Oops\n");
         let (_m, errs) = lower_module(&ast);
