@@ -102,6 +102,9 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         .arg(out_path)
         .arg("-lgc")
         .arg("-lstdc++")
+        // `-lm` provides libm `pow`/`floor`, used by the scalar `**` and `//`
+        // runtime helpers (ticket #19).
+        .arg("-lm")
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
@@ -280,6 +283,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_set_i64", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_array_sum_f64", &[p.into()], Some(f.into()));
         self.declare_rt("zap_array_sum_i64", &[p.into()], Some(i.into()));
+
+        // Scalar numeric helpers (ticket #19): integer/float power (`**`) and
+        // Python floor division (`//`). The lowering emits plain `Inst::Call`s
+        // to these, so codegen only declares their fixed C signatures.
+        self.declare_rt("zap_ipow", &[i.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_powf", &[f.into(), f.into()], Some(f.into()));
+        self.declare_rt("zap_ifloordiv", &[i.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_ffloordiv", &[f.into(), f.into()], Some(f.into()));
 
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
@@ -610,7 +621,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         b.build_call(print_str, &[v.into()], "")
                             .map_err(|e| e.to_string())?;
                     } else if ty.is_float() {
-                        self.printf_val("%f", v)?;
+                        // `printf` is variadic: a float32 must be promoted to
+                        // double (what `%f` reads) before the call.
+                        let dv = if matches!(ty, Ty::F32) {
+                            b.build_float_ext(v.into_float_value(), self.ctx.f64_type(), "fpext")
+                                .map_err(|e| e.to_string())?
+                                .into()
+                        } else {
+                            v
+                        };
+                        self.printf_val("%f", dv)?;
                     } else {
                         let iv = if ty.int_width() == Some(64) {
                             v

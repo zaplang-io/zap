@@ -988,6 +988,29 @@ impl Checker {
                     }
                     return Ty::Int64;
                 }
+                "int32" | "int64" | "float32" | "float64" | "i32" | "i64" | "f32" | "f64" => {
+                    // Explicit numeric conversion (D-0020): the way to narrow or
+                    // cross the int/float boundary that implicit widening refuses.
+                    let to = match fname.as_str() {
+                        "int32" | "i32" => Ty::Int32,
+                        "int64" | "i64" => Ty::Int64,
+                        "float32" | "f32" => Ty::Float32,
+                        _ => Ty::Float64,
+                    };
+                    if args.len() != 1 {
+                        self.error(format!("{fname}() takes exactly one argument"), span);
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !at.is_numeric() && !matches!(at, Ty::Unknown) {
+                            self.error(
+                                format!("{}() expects a number, found {}", fname, at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return to;
+                }
                 _ => {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
                         return self.check_user_call(&sig, fname, args, span);
@@ -1192,6 +1215,31 @@ mod tests {
     fn narrowing_is_rejected() {
         let e = errors("int64 b = 0\nint32 c = b\n");
         assert_eq!(e.len(), 1, "expected one narrowing error, got {e:?}");
+    }
+
+    #[test]
+    fn explicit_conversion_allows_narrowing() {
+        // The explicit cast is the sanctioned way around the narrowing rule
+        // (D-0020), and also crosses the int/float boundary.
+        ok("int64 b = 0\nint32 c = int32(b)\n");
+        ok("float64 x = 1.5\nint32 n = int32(x)\nfloat32 f = float32(x)\n");
+    }
+
+    #[test]
+    fn conversion_rejects_non_numeric() {
+        let e = errors("auto s = \"hi\"\nint32 n = int32(s)\n");
+        assert_eq!(
+            e.len(),
+            1,
+            "expected a non-numeric conversion error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn power_and_floordiv_type_check() {
+        // `**` and `//` are ordinary numeric ops: int result for ints, float
+        // when a float operand is present; `/` is always float (D-0024).
+        ok("int64 p = 2 ** 10\nint64 q = 7 // 2\nfloat64 r = 2.0 ** 0.5\nfloat64 s = 7.0 // 2.0\nfloat64 t = 7 / 2\n");
     }
 
     #[test]
