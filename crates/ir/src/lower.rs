@@ -126,7 +126,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
 
 fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerError> {
     match t {
-        ast::Type::Named { name, .. } => match name.as_str() {
+        ast::Type::Named { name, args, .. } => match name.as_str() {
             "int64" | "i64" => Ok(Ty::I64),
             "int32" | "i32" => Ok(Ty::I32),
             "float64" | "f64" => Ok(Ty::F64),
@@ -134,6 +134,24 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
             "bool" => Ok(Ty::I1),
             "char" => Ok(Ty::I32),
             "str" | "bytes" => Ok(Ty::Ptr),
+            "list" | "array" => {
+                let e = match args.first() {
+                    Some(a) => elem_of(a, ids)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::List(e))
+            }
+            "dict" => {
+                let k = match args.first() {
+                    Some(a) => elem_of(a, ids)?,
+                    None => Elem::I64,
+                };
+                let v = match args.get(1) {
+                    Some(a) => elem_of(a, ids)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::Dict(k, v))
+            }
             other => match ids.get(other) {
                 Some(id) => Ok(Ty::Struct(*id)),
                 None => Err(err(format!(
@@ -142,6 +160,27 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
             },
         },
         _ => Err(err("only named scalar types are supported by codegen yet")),
+    }
+}
+
+/// The runtime representation of a collection element/key/value given its
+/// source type.
+fn elem_of(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Elem, LowerError> {
+    elem_kind(resolve_ty(t, ids)?)
+}
+
+/// Classify a ZIR type into the element word kind collections store. Elements
+/// are uniform 8-byte words (RUNTIME-ABI §"Collection layout"): integers/bools
+/// go in as `i64`, reference types as pointers. Floats need a separate word
+/// path and are deferred.
+fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
+    match t {
+        Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
+        Ty::Ptr | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) => Ok(Elem::Ptr),
+        Ty::F32 | Ty::F64 => Err(err(
+            "collections of floating-point elements are not supported yet",
+        )),
+        Ty::Void => Err(err("a collection element cannot be void")),
     }
 }
 
@@ -365,9 +404,11 @@ impl<'a> FnLower<'a> {
                         val: v,
                     });
                     Ok(())
+                } else if let Expr::Index { base, index, .. } = target {
+                    self.lower_index_set(base, index, value)
                 } else {
                     Err(err(
-                        "only variable and field assignment are supported by codegen yet",
+                        "only variable, field, and index assignment are supported by codegen yet",
                     ))
                 }
             }
@@ -549,9 +590,14 @@ impl<'a> FnLower<'a> {
                 }
             }
             _ => {
+                // `for x in <list>` — iterate by index over the list's length.
+                let (lst, lty) = self.expr(iter)?;
+                if let Ty::List(elem) = lty {
+                    return self.lower_for_list(target, lst, elem, body);
+                }
                 return Err(err(
-                    "only `for ... in range(...)` is supported by codegen yet",
-                ))
+                    "only `for ... in range(...)` and `for ... in <list>` are supported by codegen yet",
+                ));
             }
         };
         let name = match target {
@@ -607,6 +653,92 @@ impl<'a> FnLower<'a> {
             rhs: step,
         });
         self.store(var, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `for x in xs` where `xs : list[T]`. Re-reads the length each iteration so
+    /// a body that appends behaves like a live iterator.
+    fn lower_for_list(
+        &mut self,
+        target: &Expr,
+        lst: Value,
+        elem: Elem,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let name = match target {
+            Expr::Name(n, _) => n.clone(),
+            _ => {
+                return Err(err(
+                    "only a simple loop variable is supported by codegen yet",
+                ))
+            }
+        };
+
+        self.push_scope();
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let var = self.alloca(elem.ty());
+        self.declare(&name, var, elem.ty());
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![lst],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let e = self.new_value(elem.ty());
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: format!("zap_list_get_{}", elem.val_suffix()),
+            args: vec![lst, i],
+        });
+        self.store(var, e);
+        self.loops.push((incr_bb, end_bb));
+        for st in &body.stmts {
+            self.stmt(st)?;
+        }
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
         self.set_term(Term::Br(cond_bb));
 
         self.position(end_bb);
@@ -700,6 +832,9 @@ impl<'a> FnLower<'a> {
                 self.binop(*op, l, lt, r, rt)
             }
             Expr::Call { callee, args, .. } => self.call(callee, args),
+            Expr::List(elems, _) => self.lower_list_lit(elems),
+            Expr::Dict(items, _) => self.lower_dict_lit(items),
+            Expr::Index { base, index, .. } => self.lower_index_get(base, index),
             Expr::Attr { base, name, .. } => {
                 let (bv, bty) = self.expr(base)?;
                 let Ty::Struct(sid) = bty else {
@@ -754,6 +889,25 @@ impl<'a> FnLower<'a> {
             if fname == "range" {
                 return Err(err("range() can only be used in a for-loop (Phase 1)"));
             }
+            if fname == "len" {
+                if args.len() != 1 {
+                    return Err(err("len() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let func = match vt {
+                    Ty::List(_) => "zap_list_len",
+                    Ty::Dict(..) => "zap_dict_len",
+                    Ty::Ptr => "zap_str_len",
+                    _ => return Err(err("len() expects a list, dict, or str")),
+                };
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![v],
+                });
+                return Ok((d, Ty::I64));
+            }
             // Struct construction: `StructName(fields...)`.
             if let Some(&sid) = self.ctx.ids.get(fname) {
                 return self.construct(sid, args);
@@ -782,6 +936,9 @@ impl<'a> FnLower<'a> {
         } else if let Expr::Attr { base, name, .. } = callee {
             // Method call: `recv.method(args)`.
             let (recv, bty) = self.expr(base)?;
+            if let Ty::List(elem) = bty {
+                return self.lower_list_method(recv, elem, name, args);
+            }
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
             };
@@ -842,6 +999,176 @@ impl<'a> FnLower<'a> {
             });
         }
         Ok((dest, Ty::Struct(sid)))
+    }
+
+    // --- collections (ticket #21) ---
+    //
+    // Lists and dicts lower to runtime calls (like strings), so the ZIR -> LLVM
+    // step stays mechanical. The element/key/value `Elem` kind chosen here
+    // selects the typed entry point (`..._i64` / `..._ptr` / `..._str`).
+
+    fn lower_list_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
+        // Evaluate elements left-to-right first; the first fixes the element
+        // kind (an empty literal defaults to `i64`).
+        let mut lowered = Vec::with_capacity(elems.len());
+        for e in elems {
+            lowered.push(self.expr(e)?);
+        }
+        let elem = match lowered.first() {
+            Some(&(_, t)) => elem_kind(t)?,
+            None => Elem::I64,
+        };
+        let list = self.new_value(Ty::List(elem));
+        self.emit(Inst::Call {
+            dest: Some(list),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let push = format!("zap_list_push_{}", elem.val_suffix());
+        for (v, vt) in lowered {
+            if elem_kind(vt)? != elem {
+                return Err(err("list elements must all have the same representation"));
+            }
+            let v = self.coerce(v, vt, elem.ty());
+            self.emit(Inst::Call {
+                dest: None,
+                func: push.clone(),
+                args: vec![list, v],
+            });
+        }
+        Ok((list, Ty::List(elem)))
+    }
+
+    fn lower_dict_lit(&mut self, items: &[(Expr, Expr)]) -> Result<(Value, Ty), LowerError> {
+        let mut lowered = Vec::with_capacity(items.len());
+        for (k, v) in items {
+            let kv = self.expr(k)?;
+            let vv = self.expr(v)?;
+            lowered.push((kv, vv));
+        }
+        let (kk, vk) = match lowered.first() {
+            Some(&((_, kt), (_, vt))) => (elem_kind(kt)?, elem_kind(vt)?),
+            None => (Elem::I64, Elem::I64),
+        };
+        let dict = self.new_value(Ty::Dict(kk, vk));
+        self.emit(Inst::Call {
+            dest: Some(dict),
+            func: "zap_dict_new".to_string(),
+            args: vec![],
+        });
+        let set = format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix());
+        for ((kv, kt), (vv, vt)) in lowered {
+            if elem_kind(kt)? != kk || elem_kind(vt)? != vk {
+                return Err(err(
+                    "dict keys/values must all have the same representation",
+                ));
+            }
+            let kv = self.coerce(kv, kt, kk.ty());
+            let vv = self.coerce(vv, vt, vk.ty());
+            self.emit(Inst::Call {
+                dest: None,
+                func: set.clone(),
+                args: vec![dict, kv, vv],
+            });
+        }
+        Ok((dict, Ty::Dict(kk, vk)))
+    }
+
+    fn lower_index_get(&mut self, base: &Expr, index: &Expr) -> Result<(Value, Ty), LowerError> {
+        let (bv, bty) = self.expr(base)?;
+        match bty {
+            Ty::List(elem) => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let d = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_list_get_{}", elem.val_suffix()),
+                    args: vec![bv, iv],
+                });
+                Ok((d, elem.ty()))
+            }
+            Ty::Dict(kk, vk) => {
+                let (kv, kt) = self.expr(index)?;
+                let kv = self.coerce(kv, kt, kk.ty());
+                let d = self.new_value(vk.ty());
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    args: vec![bv, kv],
+                });
+                Ok((d, vk.ty()))
+            }
+            _ => Err(err("indexing is only supported on list and dict values")),
+        }
+    }
+
+    fn lower_index_set(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        value: &Expr,
+    ) -> Result<(), LowerError> {
+        let (bv, bty) = self.expr(base)?;
+        match bty {
+            Ty::List(elem) => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let (v, vt) = self.expr(value)?;
+                let v = self.coerce(v, vt, elem.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_list_set_{}", elem.val_suffix()),
+                    args: vec![bv, iv, v],
+                });
+                Ok(())
+            }
+            Ty::Dict(kk, vk) => {
+                let (kv, kt) = self.expr(index)?;
+                let kv = self.coerce(kv, kt, kk.ty());
+                let (v, vt) = self.expr(value)?;
+                let v = self.coerce(v, vt, vk.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    args: vec![bv, kv, v],
+                });
+                Ok(())
+            }
+            _ => Err(err(
+                "indexed assignment is only supported on list and dict values",
+            )),
+        }
+    }
+
+    fn lower_list_method(
+        &mut self,
+        recv: Value,
+        elem: Elem,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        match name {
+            "append" => {
+                if args.len() != 1 {
+                    return Err(err("append() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if elem_kind(vt)? != elem {
+                    return Err(err("append() value has the wrong element type"));
+                }
+                let v = self.coerce(v, vt, elem.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_list_push_{}", elem.val_suffix()),
+                    args: vec![recv, v],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            other => Err(err(format!(
+                "list has no method '{other}' (supported: append)"
+            ))),
+        }
     }
 
     fn binop(
