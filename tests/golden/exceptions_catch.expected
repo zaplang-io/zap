@@ -1,0 +1,6 @@
+before
+in try
+recovered:
+boom
+cleanup
+after

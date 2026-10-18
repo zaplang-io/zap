@@ -129,7 +129,18 @@ void  zap_print_str(void* s);
 
 // Faults / exceptions (#22)
 void  zap_panic(void* exc);         // raise / built-in faults; triggers unwinding
+void* zap_eh_begin_catch(void* ue); // landing-pad entry: recover the exc object
+void  zap_eh_end_catch(void);       // balance a begin_catch when leaving a handler
+void  zap_uncaught(void* exc);      // top-level handler: report + exit non-zero
 ```
+
+The first exceptions increment (#22) lands `raise`, `try`/`except`/`finally`,
+and propagation to an aborting top-level handler on the platform Itanium
+unwinder (libstdc++ personality `__gxx_personality_v0`, linked with `-lstdc++`;
+the `_Unwind_*` unwinder comes from libgcc). The in-flight exception object is
+currently the message string; the typed exception hierarchy (D-0029),
+type-directed `except` matching, built-in faults (div-by-zero,
+index-out-of-range, `None` access), and stack traces are follow-ups.
 
 The Phase 1 slice calls libc `printf` directly; those calls migrate behind
 `zap_print_*` as the runtime grows.

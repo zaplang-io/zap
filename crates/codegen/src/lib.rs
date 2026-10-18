@@ -10,6 +10,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -89,12 +90,16 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
 
     // `-lgc` links the conservative Boehm collector the runtime allocates
     // through (ticket #20, D-0009); the dev container provides `libgc-dev`.
+    // `-lstdc++` pulls in the Itanium unwinding personality and the
+    // `__cxa_*` exception entry points the runtime calls (ticket #22); the
+    // actual stack unwinder (`_Unwind_*`) comes from libgcc, linked by default.
     let status = Command::new("cc")
         .arg(&obj_path)
         .arg(&rt_path)
         .arg("-o")
         .arg(out_path)
         .arg("-lgc")
+        .arg("-lstdc++")
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
@@ -164,6 +169,25 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.module
                 .add_function("zap_str_len", i64t.fn_type(&[ptr.into()], false), None);
         self.fns.insert("zap_str_len".to_string(), str_len);
+
+        // Exception / unwinding entry points (ticket #22, see
+        // design/RUNTIME-ABI.md §"Exception / unwinding ABI"). `zap_panic` begins
+        // unwinding; the landing-pad glue extracts the in-flight exception object
+        // (`zap_eh_begin_catch`) and balances the catch (`zap_eh_end_catch`);
+        // `zap_uncaught` reports an exception that reached the top-level handler.
+        self.declare_rt("zap_panic", &[ptr.into()], None);
+        self.declare_rt("zap_eh_begin_catch", &[ptr.into()], Some(ptr.into()));
+        self.declare_rt("zap_eh_end_catch", &[], None);
+        self.declare_rt("zap_uncaught", &[ptr.into()], None);
+        // The Itanium personality routine (libstdc++/libgcc). Landing pads name it;
+        // it parses the unwind tables and drives phase-1/phase-2 unwinding. Its
+        // exact signature is immaterial — it is only referenced by name — so it is
+        // declared variadic `i32 (...)`.
+        let personality =
+            self.module
+                .add_function("__gxx_personality_v0", i32t.fn_type(&[], true), None);
+        self.fns
+            .insert("__gxx_personality_v0".to_string(), personality);
 
         // Collection entry points (ticket #21, see design/RUNTIME-ABI.md). Lists
         // and dicts store uniform 8-byte element words; the lowering picks the
@@ -287,6 +311,27 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
 
     fn translate_fn(&mut self, f: &Func) -> Result<(), String> {
         let fv = self.fns[&f.name];
+
+        // Force asynchronous unwind tables (.eh_frame / CFI) on every function so
+        // the unwinder can walk through frames that have no landing pad of their
+        // own (ticket #22). A function that installs a landing pad also needs a
+        // personality routine.
+        let uwtable = Attribute::get_named_enum_kind_id("uwtable");
+        if uwtable != 0 {
+            fv.add_attribute(
+                AttributeLoc::Function,
+                self.ctx.create_enum_attribute(uwtable, 2),
+            );
+        }
+        let has_landing_pad = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::LandingPad { .. }));
+        if has_landing_pad {
+            fv.set_personality_function(self.fns["__gxx_personality_v0"]);
+        }
+
         let blocks: Vec<BasicBlock> = f
             .blocks
             .iter()
@@ -301,7 +346,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         for (bi, b) in f.blocks.iter().enumerate() {
             self.builder.position_at_end(blocks[bi]);
             for inst in &b.insts {
-                self.inst(f, inst, &mut vals)?;
+                self.inst(f, inst, &mut vals, fv, &blocks)?;
             }
             self.term(f, &b.term, &blocks, &vals, fv)?;
         }
@@ -347,6 +392,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         f: &Func,
         inst: &Inst,
         vals: &mut [Option<BasicValueEnum<'ctx>>],
+        fv: FunctionValue<'ctx>,
+        blocks: &[BasicBlock<'ctx>],
     ) -> Result<(), String> {
         let get = |vals: &[Option<BasicValueEnum<'ctx>>], v: u32| -> BasicValueEnum<'ctx> {
             vals[v as usize].expect("ZIR value used before definition")
@@ -614,6 +661,56 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 b.build_store(fp, get(vals, *val))
                     .map_err(|e| e.to_string())?;
             }
+            Inst::Invoke {
+                dest,
+                func,
+                args,
+                unwind,
+            } => {
+                // A call that may unwind -> LLVM `invoke`. The normal path is a
+                // fresh block the builder continues into (so the rest of the ZIR
+                // block's instructions and its terminator land there); the unwind
+                // edge goes to the landing-pad block.
+                let callee = *self
+                    .fns
+                    .get(func)
+                    .ok_or_else(|| format!("invoke of unknown function '{func}'"))?;
+                let argvals: Vec<BasicValueEnum> = args.iter().map(|a| get(vals, *a)).collect();
+                let cont = self.ctx.append_basic_block(fv, "invoke.cont");
+                let cs = b
+                    .build_invoke(callee, &argvals, cont, blocks[*unwind as usize], "invoke")
+                    .map_err(|e| e.to_string())?;
+                b.position_at_end(cont);
+                if let Some(d) = dest {
+                    if let Some(v) = cs.try_as_basic_value().left() {
+                        vals[*d as usize] = Some(v);
+                    }
+                }
+            }
+            Inst::LandingPad { dest } => {
+                // The landing-pad result is `{ ptr (exception), i32 (selector) }`.
+                // A single catch-all clause (`catch ptr null`) matches any Zap
+                // exception; selector-based `except` dispatch is deferred, so the
+                // selector is unused. `zap_eh_begin_catch` turns the in-flight
+                // `_Unwind_Exception*` into the Zap exception object.
+                let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
+                let lp_ty = self
+                    .ctx
+                    .struct_type(&[ptr_ty.into(), self.ctx.i32_type().into()], false);
+                let null = ptr_ty.const_null();
+                let pf = self.fns["__gxx_personality_v0"];
+                let lp = b
+                    .build_landing_pad(lp_ty, pf, &[null.into()], false, "lp")
+                    .map_err(|e| e.to_string())?;
+                let exc_ptr = b
+                    .build_extract_value(lp.into_struct_value(), 0, "excptr")
+                    .map_err(|e| e.to_string())?;
+                let begin = self.fns["zap_eh_begin_catch"];
+                let cs = b
+                    .build_call(begin, &[exc_ptr.into()], "begincatch")
+                    .map_err(|e| e.to_string())?;
+                vals[*dest as usize] = cs.try_as_basic_value().left();
+            }
         }
         Ok(())
     }
@@ -630,7 +727,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         match term {
             Term::Ret(Some(v)) => {
                 let rv = vals[*v as usize].expect("ret value");
-                b.build_return(Some(&rv)).map_err(|e| e.to_string())?;
+                // `main` is emitted as `i32 main()` (the C entry point), so a Zap
+                // `main` declared to return `int64` must narrow its value to i32.
+                if f.is_main {
+                    let iv = rv.into_int_value();
+                    let i32t = self.ctx.i32_type();
+                    let r = if iv.get_type().get_bit_width() == 32 {
+                        iv
+                    } else {
+                        b.build_int_truncate(iv, i32t, "mainret")
+                            .map_err(|e| e.to_string())?
+                    };
+                    b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+                } else {
+                    b.build_return(Some(&rv)).map_err(|e| e.to_string())?;
+                }
             }
             Term::Ret(None) => {
                 if f.is_main {
