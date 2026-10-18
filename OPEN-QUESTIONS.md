@@ -60,13 +60,11 @@ _Last updated: 2026-10-17_
 - ⚪ **Array dtype promotion** rules for mixed-dtype ops (`i64 + f64`), and
   `uint8`/`bool` dtypes (`design/0002-arrays.md`).
 
-## Design docs still to write
+## Design docs
 
-- `design/0005-concurrency.md` — channels, `select`, sync primitives, structured
-  concurrency, memory model.
-- `design/0006-types-and-generics.md` — structs, interfaces, generics, enums,
-  tuples.
-- `design/0007-strings.md` — the UTF-8 string model (D-0025).
-
-(Written: `design/IR.md` (#12) and `design/RUNTIME-ABI.md` (#13) — the two
-phase-boundary contracts.)
+All planned design docs are now written: `design/0001-perl-regex.md`,
+`0002-arrays.md`, `0003-python-interop.md`, `0004-decorators.md`,
+`0005-concurrency.md` (#14), `0006-types-and-generics.md` (#15),
+`0007-strings.md` (#16), plus the two phase-boundary contracts `IR.md` (#12) and
+`RUNTIME-ABI.md` (#13). New features get a design doc per the proposal process
+(`design/TEMPLATE.md`).
