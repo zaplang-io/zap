@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang-18 \
         libclang-18-dev \
         libgc-dev \
+        libpcre2-dev \
         zlib1g-dev \
         libzstd-dev \
         libffi-dev \

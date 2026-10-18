@@ -105,6 +105,9 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         // `-lm` provides libm `pow`/`floor`, used by the scalar `**` and `//`
         // runtime helpers (ticket #19).
         .arg("-lm")
+        // `-lpcre2-8` provides the 8-bit PCRE2 API the regex runtime wraps
+        // (ticket #23); the dev container / CI provide `libpcre2-dev`.
+        .arg("-lpcre2-8")
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
@@ -302,6 +305,29 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_reflect_has", &[p.into(), p.into()], Some(i.into()));
         self.declare_rt("zap_reflect_names", &[p.into()], Some(p.into()));
 
+        // Regex entry points (ticket #23, D-0010), backed by PCRE2 (linked with
+        // `-lpcre2-8`). `m/.../` → `zap_regex_match` (match object, null = no
+        // match); `s/.../.../` → `zap_regex_subst` (new string); match-object
+        // captures via `zap_regex_group{,_name}`; `zap_ptr_nonnull` backs
+        // pointer truthiness (`if m:` / `!~`). Mechanical fixed C signatures.
+        self.declare_rt("zap_ptr_nonnull", &[p.into()], Some(i.into()));
+        self.declare_rt(
+            "zap_regex_match",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_regex_subst",
+            &[p.into(), p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_regex_group", &[p.into(), i.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_regex_group_name",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
         for sl in &m.structs {
@@ -408,7 +434,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::List(_)
             | Ty::Dict(..)
             | Ty::Set(_)
-            | Ty::Array(_) => self.ctx.ptr_type(AddressSpace::default()).into(),
+            | Ty::Array(_)
+            | Ty::Match => self.ctx.ptr_type(AddressSpace::default()).into(),
         }
     }
 

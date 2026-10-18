@@ -244,9 +244,13 @@ fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
 fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
     match t {
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
-        Ty::Ptr | Ty::Struct(_) | Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Array(_) => {
-            Ok(Elem::Ptr)
-        }
+        Ty::Ptr
+        | Ty::Struct(_)
+        | Ty::List(_)
+        | Ty::Dict(..)
+        | Ty::Set(_)
+        | Ty::Array(_)
+        | Ty::Match => Ok(Elem::Ptr),
         Ty::F32 | Ty::F64 => Err(err(
             "collections of floating-point elements are not supported yet",
         )),
@@ -1574,6 +1578,20 @@ impl<'a> FnLower<'a> {
                 self.binop(*op, l, lt, r, rt)
             }
             Expr::Call { callee, args, .. } => self.call(callee, args),
+            Expr::RegexMatch {
+                subject,
+                pattern,
+                flags,
+                negated,
+                ..
+            } => self.lower_regex_match(subject, pattern, flags, *negated),
+            Expr::RegexSubst {
+                subject,
+                pattern,
+                replacement,
+                flags,
+                ..
+            } => self.lower_regex_subst(subject, pattern, replacement, flags),
             Expr::List(elems, _) => self.lower_list_lit(elems),
             Expr::Dict(items, _) => self.lower_dict_lit(items),
             Expr::Set(elems, _) => self.lower_set_lit(elems),
@@ -1725,6 +1743,9 @@ impl<'a> FnLower<'a> {
             }
             if let Ty::Set(elem) = bty {
                 return self.lower_set_method(recv, elem, name, args);
+            }
+            if bty == Ty::Match {
+                return self.lower_match_method(recv, name, args);
             }
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
@@ -2088,6 +2109,117 @@ impl<'a> FnLower<'a> {
             }
             other => Err(err(format!(
                 "list has no method '{other}' (supported: append)"
+            ))),
+        }
+    }
+
+    // --- regex (ticket #23, D-0010) ------------------------------------------
+    //
+    // `m/.../`, `s/.../.../`, `=~`/`!~` and the match object all lower to calls
+    // into the PCRE2-backed runtime (`zap_regex_*`); no new ZIR instruction is
+    // needed (the string/collection pattern). Literal patterns are emitted as
+    // string constants and compiled by the runtime on each call — a compiled-
+    // pattern cache is future work (design/0001 step 4). A match object is a
+    // GC'd heap value that owns its captured groups, so capture state is
+    // coroutine-safe by construction (no magic globals, D-0010).
+
+    /// `subject =~ m/pattern/flags` → a match object (`Ty::Match`, null = no
+    /// match), or, for `!~`, an `i1` that is true when there is no match.
+    fn lower_regex_match(
+        &mut self,
+        subject: &Expr,
+        pattern: &str,
+        flags: &str,
+        negated: bool,
+    ) -> Result<(Value, Ty), LowerError> {
+        let (sv, _st) = self.expr(subject)?;
+        let pv = self.strconst(pattern);
+        let fv = self.iconst(Ty::I64, regex_flag_bits(flags));
+        let m = self.new_value(Ty::Match);
+        self.emit(Inst::Call {
+            dest: Some(m),
+            func: "zap_regex_match".to_string(),
+            args: vec![sv, pv, fv],
+        });
+        if !negated {
+            return Ok((m, Ty::Match));
+        }
+        // `!~`: true exactly when the match object is null.
+        let matched = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(matched),
+            func: "zap_ptr_nonnull".to_string(),
+            args: vec![m],
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        let d = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: d,
+            pred: CmpPred::Eq,
+            lhs: matched,
+            rhs: zero,
+        });
+        Ok((d, Ty::I1))
+    }
+
+    /// `subject =~ s/pattern/replacement/flags` → a new string (the subject is
+    /// never mutated). The `g` flag replaces all occurrences, else the first.
+    fn lower_regex_subst(
+        &mut self,
+        subject: &Expr,
+        pattern: &str,
+        replacement: &str,
+        flags: &str,
+    ) -> Result<(Value, Ty), LowerError> {
+        let (sv, _st) = self.expr(subject)?;
+        let pv = self.strconst(pattern);
+        let rv = self.strconst(replacement);
+        let fv = self.iconst(Ty::I64, regex_flag_bits(flags));
+        let d = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(d),
+            func: "zap_regex_subst".to_string(),
+            args: vec![sv, pv, rv, fv],
+        });
+        Ok((d, Ty::Ptr))
+    }
+
+    /// Methods on a match object: `m.group(n)` (positional, 0 = whole match) and
+    /// `m.group("name")` (named capture). Both return a `str` (empty if the
+    /// group did not participate).
+    fn lower_match_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        match name {
+            "group" => {
+                if args.len() != 1 {
+                    return Err(err("group() takes exactly one argument"));
+                }
+                let (arg, aty) = self.expr(&args[0].value)?;
+                let d = self.new_value(Ty::Ptr);
+                if aty == Ty::Ptr {
+                    // Named group: `m.group("year")`.
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_regex_group_name".to_string(),
+                        args: vec![recv, arg],
+                    });
+                } else {
+                    // Positional group: `m.group(0)`.
+                    let idx = self.coerce(arg, aty, Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_regex_group".to_string(),
+                        args: vec![recv, idx],
+                    });
+                }
+                Ok((d, Ty::Ptr))
+            }
+            other => Err(err(format!(
+                "a match object has no method '{other}' (supported: group)"
             ))),
         }
     }
@@ -2506,6 +2638,27 @@ impl<'a> FnLower<'a> {
         if t == Ty::I1 {
             return v;
         }
+        if matches!(t, Ty::Match | Ty::Ptr) {
+            // Reference types are truthy when non-null. Codegen's `ICmp` only
+            // compares integers, so go through the runtime (`zap_ptr_nonnull`
+            // returns 0/1) and compare that i64 against zero. For a match
+            // object, null means "no match" (D-0010).
+            let nn = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(nn),
+                func: "zap_ptr_nonnull".to_string(),
+                args: vec![v],
+            });
+            let z = self.iconst(Ty::I64, 0);
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: d,
+                pred: CmpPred::Ne,
+                lhs: nn,
+                rhs: z,
+            });
+            return d;
+        }
         if t.is_float() {
             let z = self.fconst(t, 0.0);
             let d = self.new_value(Ty::I1);
@@ -2544,6 +2697,23 @@ fn numeric_conv_ty(name: &str) -> Option<Ty> {
         "float64" | "f64" => Some(Ty::F64),
         _ => None,
     }
+}
+
+/// The regex flag bitmask passed to the runtime. Must stay in sync with the
+/// `ZAP_RE_*` constants in `zaprt.c`. Unknown flag letters are ignored.
+fn regex_flag_bits(flags: &str) -> i64 {
+    let mut bits = 0i64;
+    for c in flags.chars() {
+        bits |= match c {
+            'i' => 1,  // caseless
+            'm' => 2,  // multiline ^$
+            's' => 4,  // dotall
+            'x' => 8,  // extended
+            'g' => 16, // global (substitute-all / match-all)
+            _ => 0,
+        };
+    }
+    bits
 }
 
 /// Process the common escape sequences in a (non-raw) string literal.

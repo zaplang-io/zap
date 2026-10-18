@@ -15,6 +15,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* PCRE2, 8-bit code units (ticket #23, D-0010). Must be defined before the
+ * header so the `pcre2_*` names resolve to the 8-bit API. Linked with
+ * `-lpcre2-8` (see build_executable). */
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+
 typedef struct {
     int64_t len;
     const char *data;
@@ -716,4 +722,193 @@ void *zap_reflect_names(void *type_name) {
         first = 0;
     }
     return out;
+}
+
+/* ---------------------------------------------------------------------------
+ * Regex (ticket #23, D-0010): Perl-style `m/.../` and `s/.../.../` backed by
+ * PCRE2 (8-bit API). The compiler lowers each literal to one of the entry
+ * points below (see crates/ir/src/lower.rs); patterns arrive as `ZapStr*`
+ * holding the verbatim pattern text and a flag bitmask.
+ *
+ * A match is a GC-allocated `ZapMatch` that *owns* copies of every captured
+ * group (and a copy of the pattern's name table). Because the captures live in
+ * the returned value and not in any global/thread-local state, capture state is
+ * coroutine-safe by construction (D-0010) — a goroutine that migrates between
+ * OS threads cannot observe another's "last match". It also lets us free the
+ * compiled program immediately; a compiled-pattern cache is future work.
+ *
+ * Flag bits mirror `regex_flag_bits` in lower.rs: 1=i 2=m 4=s 8=x 16=g. */
+
+#define ZAP_RE_CASELESS 1
+#define ZAP_RE_MULTILINE 2
+#define ZAP_RE_DOTALL 4
+#define ZAP_RE_EXTENDED 8
+#define ZAP_RE_GLOBAL 16
+
+typedef struct {
+    int64_t ngroups;   /* capture groups, including group 0 (whole match) */
+    ZapStr **groups;   /* ngroups entries; NULL if the group did not match */
+    int64_t nnames;    /* named capture groups */
+    ZapStr **names;    /* nnames name strings */
+    int64_t *name_num; /* parallel: the group number each name refers to */
+} ZapMatch;
+
+/* Non-null test for a reference value. Codegen's `ICmp` only compares integers,
+ * so pointer truthiness (`if match:`, `!~`) routes through this. */
+int64_t zap_ptr_nonnull(void *p) { return p != NULL ? 1 : 0; }
+
+static uint32_t zap_regex_compile_opts(int64_t flags) {
+    uint32_t o = 0;
+    if (flags & ZAP_RE_CASELESS) o |= PCRE2_CASELESS;
+    if (flags & ZAP_RE_MULTILINE) o |= PCRE2_MULTILINE;
+    if (flags & ZAP_RE_DOTALL) o |= PCRE2_DOTALL;
+    if (flags & ZAP_RE_EXTENDED) o |= PCRE2_EXTENDED;
+    return o;
+}
+
+/* Report a regex error and abort (exit 1). Literal-pattern validation is a
+ * runtime check for now; a compile-time check would need PCRE2 in the compiler,
+ * which must stay host-safe (buildable without LLVM/PCRE2 on the host). */
+static void zap_regex_fail(const char *what, int errorcode) {
+    PCRE2_UCHAR msg[256];
+    pcre2_get_error_message(errorcode, msg, sizeof(msg));
+    fprintf(stderr, "regex error: %s: %s\n", what, (const char *)msg);
+    exit(1);
+}
+
+static pcre2_code *zap_regex_compile(const ZapStr *pattern, int64_t flags) {
+    int errorcode;
+    PCRE2_SIZE erroroffset;
+    pcre2_code *re = pcre2_compile((PCRE2_SPTR)pattern->data, (PCRE2_SIZE)pattern->len,
+                                   zap_regex_compile_opts(flags), &errorcode, &erroroffset, NULL);
+    if (re == NULL) {
+        zap_regex_fail("could not compile pattern", errorcode);
+    }
+    return re;
+}
+
+/* `subject =~ m/pattern/flags` → a ZapMatch* owning its captures, or NULL (no
+ * match / falsy). */
+void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
+    ZapStr *subject = (ZapStr *)subject_;
+    ZapStr *pattern = (ZapStr *)pattern_;
+    pcre2_code *re = zap_regex_compile(pattern, flags);
+    pcre2_match_data *md = pcre2_match_data_create_from_pattern(re, NULL);
+    int rc = pcre2_match(re, (PCRE2_SPTR)subject->data, (PCRE2_SIZE)subject->len, 0, 0, md, NULL);
+    if (rc < 0) {
+        /* PCRE2_ERROR_NOMATCH (and any other error) => no match. */
+        pcre2_match_data_free(md);
+        pcre2_code_free(re);
+        return NULL;
+    }
+
+    PCRE2_SIZE *ov = pcre2_get_ovector_pointer(md);
+    uint32_t capcount = 0;
+    pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &capcount);
+    int64_t ngroups = (int64_t)capcount + 1;
+    /* rc == 0 would mean the ovector was too small; sized from the pattern it is
+     * not, but guard anyway. */
+    int64_t avail = rc > 0 ? (int64_t)rc : ngroups;
+
+    ZapMatch *m = (ZapMatch *)GC_MALLOC(sizeof(ZapMatch));
+    m->ngroups = ngroups;
+    m->groups = (ZapStr **)GC_MALLOC((size_t)ngroups * sizeof(ZapStr *));
+    for (int64_t i = 0; i < ngroups; i++) {
+        PCRE2_SIZE s = ov[2 * i];
+        PCRE2_SIZE e = ov[2 * i + 1];
+        if (i < avail && s != PCRE2_UNSET && e != PCRE2_UNSET && e >= s) {
+            m->groups[i] = (ZapStr *)zap_str_new(subject->data + s, (int64_t)(e - s));
+        } else {
+            m->groups[i] = NULL;
+        }
+    }
+
+    /* Copy the name table so lookups work after the compiled program is freed.
+     * Each entry is [group-number (2 bytes, big-endian)][name][NUL]. */
+    uint32_t namecount = 0, nameentrysize = 0;
+    PCRE2_SPTR nametable = NULL;
+    pcre2_pattern_info(re, PCRE2_INFO_NAMECOUNT, &namecount);
+    pcre2_pattern_info(re, PCRE2_INFO_NAMEENTRYSIZE, &nameentrysize);
+    pcre2_pattern_info(re, PCRE2_INFO_NAMETABLE, &nametable);
+    m->nnames = (int64_t)namecount;
+    if (namecount > 0) {
+        m->names = (ZapStr **)GC_MALLOC((size_t)namecount * sizeof(ZapStr *));
+        m->name_num = (int64_t *)GC_MALLOC((size_t)namecount * sizeof(int64_t));
+        for (uint32_t i = 0; i < namecount; i++) {
+            PCRE2_SPTR entry = nametable + (size_t)i * nameentrysize;
+            int gnum = (entry[0] << 8) | entry[1];
+            const char *nm = (const char *)(entry + 2);
+            m->names[i] = (ZapStr *)zap_str_new(nm, (int64_t)strlen(nm));
+            m->name_num[i] = gnum;
+        }
+    } else {
+        m->names = NULL;
+        m->name_num = NULL;
+    }
+
+    pcre2_match_data_free(md);
+    pcre2_code_free(re);
+    return m;
+}
+
+/* `m.group(idx)` — positional capture; 0 is the whole match. Out-of-range or
+ * non-participating groups yield the empty string. */
+void *zap_regex_group(void *m_, int64_t idx) {
+    ZapMatch *m = (ZapMatch *)m_;
+    if (m == NULL || idx < 0 || idx >= m->ngroups || m->groups[idx] == NULL) {
+        return zap_str_new("", 0);
+    }
+    return m->groups[idx];
+}
+
+/* `m.group("name")` — named capture; unknown or non-participating names yield
+ * the empty string. */
+void *zap_regex_group_name(void *m_, void *name_) {
+    ZapMatch *m = (ZapMatch *)m_;
+    ZapStr *name = (ZapStr *)name_;
+    if (m != NULL) {
+        for (int64_t i = 0; i < m->nnames; i++) {
+            if (zap_str_eq(m->names[i], name)) {
+                int64_t g = m->name_num[i];
+                if (g >= 0 && g < m->ngroups && m->groups[g] != NULL) {
+                    return m->groups[g];
+                }
+                break;
+            }
+        }
+    }
+    return zap_str_new("", 0);
+}
+
+/* `subject =~ s/pattern/replacement/flags` → a new string (subject unchanged).
+ * `g` replaces all occurrences, else the first. Replacement uses PCRE2 syntax
+ * for group references (`$1`, `${name}`). */
+void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_t flags) {
+    ZapStr *subject = (ZapStr *)subject_;
+    ZapStr *pattern = (ZapStr *)pattern_;
+    ZapStr *replacement = (ZapStr *)replacement_;
+    pcre2_code *re = zap_regex_compile(pattern, flags);
+
+    uint32_t opts = PCRE2_SUBSTITUTE_OVERFLOW_LENGTH;
+    if (flags & ZAP_RE_GLOBAL) opts |= PCRE2_SUBSTITUTE_GLOBAL;
+
+    /* OVERFLOW_LENGTH makes a too-small buffer set *outlen to the needed size
+     * (including the NUL) and return PCRE2_ERROR_NOMEMORY, so we size, grow,
+     * and retry at most once. On success *outlen is the length excluding NUL. */
+    PCRE2_SIZE outlen = (PCRE2_SIZE)subject->len + 256;
+    PCRE2_UCHAR *buf = (PCRE2_UCHAR *)GC_MALLOC_ATOMIC((size_t)outlen);
+    int rc = pcre2_substitute(re, (PCRE2_SPTR)subject->data, (PCRE2_SIZE)subject->len, 0, opts,
+                              NULL, NULL, (PCRE2_SPTR)replacement->data,
+                              (PCRE2_SIZE)replacement->len, buf, &outlen);
+    if (rc == PCRE2_ERROR_NOMEMORY) {
+        buf = (PCRE2_UCHAR *)GC_MALLOC_ATOMIC((size_t)outlen);
+        rc = pcre2_substitute(re, (PCRE2_SPTR)subject->data, (PCRE2_SIZE)subject->len, 0, opts,
+                              NULL, NULL, (PCRE2_SPTR)replacement->data,
+                              (PCRE2_SIZE)replacement->len, buf, &outlen);
+    }
+    pcre2_code_free(re);
+    if (rc < 0) {
+        zap_regex_fail("substitution failed", rc);
+    }
+    return zap_str_new((const char *)buf, (int64_t)outlen);
 }
