@@ -226,15 +226,42 @@ fn lower_fn(
         b.declare(&p.name, slot, pty);
     }
 
-    for st in &f.body.stmts {
-        b.stmt(st)?;
-    }
-
-    if !b.terminated() {
-        if is_main || ret == Ty::Void {
+    if is_main {
+        // `main` installs an implicit top-level landing pad so an exception that
+        // propagates out of the program is caught and reported (message + exit 1)
+        // rather than ending in a raw abort (RUNTIME-ABI §"Exception / unwinding
+        // ABI": "unwinds to the top frame and aborts"). Every call in `main`
+        // therefore `invoke`s to this pad.
+        let lp = b.new_block();
+        b.landing_pads.push(lp);
+        for st in &f.body.stmts {
+            b.stmt(st)?;
+        }
+        b.landing_pads.pop();
+        if !b.terminated() {
             b.set_term(Term::Ret(None));
-        } else {
+        }
+        if b.used_lps.contains(&lp) {
+            b.position(lp);
+            let exc = b.new_value(Ty::Ptr);
+            b.emit(Inst::LandingPad { dest: exc });
+            b.emit(Inst::Call {
+                dest: None,
+                func: "zap_uncaught".to_string(),
+                args: vec![exc],
+            });
             b.set_term(Term::Unreachable);
+        }
+    } else {
+        for st in &f.body.stmts {
+            b.stmt(st)?;
+        }
+        if !b.terminated() {
+            if ret == Ty::Void {
+                b.set_term(Term::Ret(None));
+            } else {
+                b.set_term(Term::Unreachable);
+            }
         }
     }
     Ok(b.func)
@@ -246,6 +273,14 @@ struct FnLower<'a> {
     scopes: Vec<HashMap<String, (Value, Ty)>>,
     loops: Vec<(BlockId, BlockId)>, // (continue, break)
     term_set: HashSet<BlockId>,     // blocks with a real terminator
+    /// Stack of active landing-pad blocks (innermost `try` last). A call emitted
+    /// while this is non-empty becomes an [`Inst::Invoke`] whose unwind edge goes
+    /// to the top entry, so a raised exception transfers to the nearest handler.
+    landing_pads: Vec<BlockId>,
+    /// Landing-pad blocks actually targeted by an [`Inst::Invoke`]. A `try` whose
+    /// body emitted no throwing call cannot raise, so its handler (and the
+    /// `landingpad` that LLVM requires an `invoke` predecessor for) is omitted.
+    used_lps: HashSet<BlockId>,
     sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &'a StructCtx,
 }
@@ -278,8 +313,33 @@ impl<'a> FnLower<'a> {
             scopes: vec![HashMap::new()],
             loops: Vec::new(),
             term_set: HashSet::new(),
+            landing_pads: Vec::new(),
+            used_lps: HashSet::new(),
             sigs,
             ctx,
+        }
+    }
+
+    /// Emit a call that may raise. Inside a `try` (a landing pad is active) this
+    /// becomes an [`Inst::Invoke`] whose unwind edge targets the nearest handler;
+    /// otherwise a plain [`Inst::Call`] (the exception, if any, unwinds through
+    /// this frame to a caller's handler or to the top-level). The caller sets the
+    /// terminator (e.g. `Unreachable` after `zap_panic`).
+    fn throwing_call(&mut self, dest: Option<Value>, func: &str, args: Vec<Value>) {
+        if let Some(&lp) = self.landing_pads.last() {
+            self.used_lps.insert(lp);
+            self.emit(Inst::Invoke {
+                dest,
+                func: func.to_string(),
+                args,
+                unwind: lp,
+            });
+        } else {
+            self.emit(Inst::Call {
+                dest,
+                func: func.to_string(),
+                args,
+            });
         }
     }
 
@@ -484,14 +544,132 @@ impl<'a> FnLower<'a> {
                 self.set_term(Term::Br(cont));
                 Ok(())
             }
-            Stmt::Raise { .. }
-            | Stmt::Try { .. }
-            | Stmt::With { .. }
-            | Stmt::Match { .. }
-            | Stmt::Spawn { .. } => Err(err(
+            Stmt::Raise { value, .. } => self.lower_raise(value.as_ref()),
+            Stmt::Try {
+                body,
+                excepts,
+                finally,
+                ..
+            } => self.lower_try(body, excepts, finally.as_ref()),
+            Stmt::With { .. } | Stmt::Match { .. } | Stmt::Spawn { .. } => Err(err(
                 "this statement is not supported by codegen yet (Phase 1 slice)",
             )),
         }
+    }
+
+    /// Balance the `__cxa_begin_catch` performed on landing-pad entry. Called on
+    /// each path that leaves a handler normally or re-raises.
+    fn emit_end_catch(&mut self) {
+        self.emit(Inst::Call {
+            dest: None,
+            func: "zap_eh_end_catch".to_string(),
+            args: Vec::new(),
+        });
+    }
+
+    /// `raise EXPR` — build the exception and begin unwinding via `zap_panic`
+    /// (RUNTIME-ABI §"Exception / unwinding ABI"). For this increment the
+    /// exception object is the message string itself; the typed exception
+    /// hierarchy (D-0029) is deferred. `zap_panic` never returns, so the normal
+    /// path is `unreachable` (inside a `try`, the invoke's unwind edge carries
+    /// control to the landing pad instead).
+    fn lower_raise(&mut self, value: Option<&Expr>) -> Result<(), LowerError> {
+        let Some(e) = value else {
+            return Err(err("bare 'raise' (re-raise) is not supported yet"));
+        };
+        let (v, vt) = self.expr(e)?;
+        if vt != Ty::Ptr {
+            return Err(err(
+                "raise currently expects a str value (the exception message)",
+            ));
+        }
+        self.throwing_call(None, "zap_panic", vec![v]);
+        if !self.terminated() {
+            self.set_term(Term::Unreachable);
+        }
+        Ok(())
+    }
+
+    /// `try: BODY except [Type [as e]]: HANDLER finally: FIN` with real stack
+    /// unwinding. Calls in BODY become `invoke`s whose unwind edge targets a
+    /// landing-pad block; the handler matches catch-all for this increment
+    /// (type-directed `except` matching is deferred). `finally` runs on the
+    /// normal path and on the handled/propagating paths. If no `except` clause
+    /// is present the exception is re-raised after `finally` (Python semantics).
+    fn lower_try(
+        &mut self,
+        body: &ast::Block,
+        excepts: &[ast::ExceptClause],
+        finally: Option<&ast::Block>,
+    ) -> Result<(), LowerError> {
+        let lp = self.new_block();
+        let after = self.new_block();
+
+        // --- protected body: calls unwind to `lp` ---
+        self.landing_pads.push(lp);
+        self.push_scope();
+        for st in &body.stmts {
+            self.stmt(st)?;
+        }
+        self.pop_scope();
+        self.landing_pads.pop();
+        // Normal completion: run `finally`, then continue past the `try`.
+        if !self.terminated() {
+            if let Some(f) = finally {
+                self.lower_block(f)?;
+            }
+            self.ensure_br(after);
+        }
+
+        // If the body emitted no throwing call it cannot raise, so the handler
+        // is dead — skip the landing pad entirely (LLVM requires a `landingpad`
+        // block to have an `invoke` predecessor).
+        if !self.used_lps.contains(&lp) {
+            self.position(after);
+            return Ok(());
+        }
+
+        // --- landing pad: entered while unwinding ---
+        self.position(lp);
+        let exc = self.new_value(Ty::Ptr);
+        self.emit(Inst::LandingPad { dest: exc });
+        if let Some(first) = excepts.first() {
+            // Catch-all handler (this increment). `as e` binds the message string.
+            self.push_scope();
+            if let Some(bind) = &first.binding {
+                let slot = self.alloca(Ty::Ptr);
+                self.store(slot, exc);
+                self.declare(bind, slot, Ty::Ptr);
+            }
+            for st in &first.body.stmts {
+                self.stmt(st)?;
+            }
+            self.pop_scope();
+            if !self.terminated() {
+                self.emit_end_catch();
+                if let Some(f) = finally {
+                    self.lower_block(f)?;
+                }
+                self.ensure_br(after);
+            }
+            // NOTE: a second/third `except` clause is currently unreachable
+            // (matching is catch-all). Type-directed dispatch is deferred.
+        } else {
+            // finally-only `try`: run cleanup, then propagate to the caller.
+            if let Some(f) = finally {
+                self.lower_block(f)?;
+            }
+            if !self.terminated() {
+                self.emit_end_catch();
+                self.throwing_call(None, "zap_panic", vec![exc]);
+                if !self.terminated() {
+                    self.set_term(Term::Unreachable);
+                }
+            }
+        }
+
+        self.position(after);
+        Ok(())
     }
 
     fn lower_block(&mut self, b: &ast::Block) -> Result<(), LowerError> {
@@ -955,11 +1133,7 @@ impl<'a> FnLower<'a> {
                 } else {
                     Some(self.new_value(ret))
                 };
-                self.emit(Inst::Call {
-                    dest,
-                    func: fname.clone(),
-                    args: argvals,
-                });
+                self.throwing_call(dest, fname, argvals);
                 let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
                 return Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }));
             }
@@ -993,11 +1167,7 @@ impl<'a> FnLower<'a> {
             } else {
                 Some(self.new_value(ret))
             };
-            self.emit(Inst::Call {
-                dest,
-                func: mangled,
-                args: argvals,
-            });
+            self.throwing_call(dest, &mangled, argvals);
             let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
             Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }))
         } else {

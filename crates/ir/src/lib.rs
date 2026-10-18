@@ -99,6 +99,30 @@ mod tests {
     }
 
     #[test]
+    fn lower_exceptions() {
+        // raise + try/except/finally lower to invoke/landingpad exception edges
+        // and the runtime unwinding entry points (#22).
+        let m = lower_ok(include_str!("../../../tests/golden/exceptions_catch.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("invoke @zap_panic"), "text:\n{text}");
+        assert!(text.contains("landingpad"), "text:\n{text}");
+        assert!(text.contains("call @zap_eh_end_catch"), "text:\n{text}");
+        // An exception raised in a callee reaches a `try` in `main` via an
+        // `invoke` of the callee (real cross-frame unwinding).
+        let m = lower_ok(include_str!(
+            "../../../tests/golden/exceptions_propagate.zap"
+        ));
+        let text = format!("{m}");
+        assert!(text.contains("invoke @boom"), "text:\n{text}");
+        // An uncaught raise routes to the implicit top-level handler in `main`.
+        let m = lower_ok(include_str!(
+            "../../../tests/golden/exceptions_uncaught.zap"
+        ));
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_uncaught"), "text:\n{text}");
+    }
+
+    #[test]
     fn unsupported_construct_errors() {
         let (ast, _p, _l) = parse_str("def main():\n    raise Oops\n");
         let (_m, errs) = lower_module(&ast);

@@ -390,3 +390,75 @@ void *zap_set_items(void *sp) {
     }
     return out;
 }
+
+/* ---------------------------------------------------------------------------
+ * Exceptions / unwinding (ticket #22, design/RUNTIME-ABI.md §"Exception /
+ * unwinding ABI"). Zap uses the platform Itanium unwinder: `zap_panic` raises,
+ * landing pads catch via the libstdc++ personality (`__gxx_personality_v0`,
+ * emitted by codegen), and `except` matching is catch-all for this increment.
+ *
+ * The thrown C++ exception just boxes a pointer to the Zap exception object,
+ * which is currently the message string itself (a ZapStr*); the typed Zap
+ * exception hierarchy (D-0029) and type-directed `except` dispatch are deferred.
+ * Keeping all the C++-ABI glue here lets codegen stay a mechanical ZIR->LLVM
+ * translator (it only emits `invoke`/`landingpad` and names these entry points).
+ * ------------------------------------------------------------------------- */
+
+/* libstdc++/libc++abi entry points (declared here, linked via -lstdc++). */
+extern void *__cxa_allocate_exception(size_t size);
+extern void __cxa_throw(void *thrown, void *type_info, void (*dest)(void *));
+extern void *__cxa_begin_catch(void *exc);
+extern void __cxa_end_catch(void);
+
+/* A minimal `std::type_info` for Zap exceptions: its vtable pointer is that of
+ * libstdc++'s `__cxxabiv1::__class_type_info` (past the two reserved slots), so
+ * the personality treats it as an ordinary class type. A catch-all landing-pad
+ * clause (`catch ptr null`) matches it regardless of its name. */
+extern const void *const _ZTVN10__cxxabiv117__class_type_infoE[];
+typedef struct {
+    const void *vtable;
+    const char *name;
+} ZapTypeInfo;
+const ZapTypeInfo zap_exception_type_info = {
+    (const void *)&_ZTVN10__cxxabiv117__class_type_infoE[2],
+    "ZapException",
+};
+
+/* Keep the in-flight Zap exception object reachable for the conservative GC
+ * while it is boxed inside the (malloc'd, unscanned) C++ exception buffer.
+ * GC-during-unwind is tracked more thoroughly in ticket #20. */
+static void *zap_current_exc;
+
+/* `raise` / built-in faults: begin unwinding carrying the Zap exception object
+ * `exc` (currently a ZapStr* message). Never returns normally. */
+void zap_panic(void *exc) {
+    zap_current_exc = exc;
+    void **slot = (void **)__cxa_allocate_exception(sizeof(void *));
+    *slot = exc;
+    __cxa_throw(slot, (void *)&zap_exception_type_info, NULL);
+}
+
+/* Landing-pad entry: recover the Zap exception object from the in-flight C++
+ * exception and enter the catch. Paired with `zap_eh_end_catch`. */
+void *zap_eh_begin_catch(void *unwind_exc) {
+    void **slot = (void **)__cxa_begin_catch(unwind_exc);
+    return *slot;
+}
+
+void zap_eh_end_catch(void) {
+    zap_current_exc = NULL;
+    __cxa_end_catch();
+}
+
+/* An exception reached the program's top-level handler: report it and exit
+ * non-zero (RUNTIME-ABI: "unwinds to the top frame and aborts with a message").
+ * A richer stack trace is a follow-up. */
+void zap_uncaught(void *exc) {
+    ZapStr *msg = (ZapStr *)exc;
+    fputs("Uncaught exception: ", stderr);
+    if (msg != NULL && msg->len > 0) {
+        fwrite(msg->data, 1, (size_t)msg->len, stderr);
+    }
+    fputc('\n', stderr);
+    exit(1);
+}

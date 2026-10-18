@@ -89,8 +89,11 @@ this matches reality and offers an optimization path, not a rewrite.)
   and `call_runtime @zap_*` for runtime entry points (RUNTIME-ABI).
 - **Control flow:** `br block(args)`, `br_if %c, then(args), else(args)`,
   `ret %v?`, `unreachable`.
-- **Reserved (later):** `invoke`/`landingpad`-style exception edges and `gc.safepoint`
-  (see Open issues and RUNTIME-ABI).
+- **Exceptions (#22):** `invoke` (a call with a normal path and an `unwind`
+  edge to a landing-pad block) and `landingpad` (a landing-pad block's entry,
+  yielding the in-flight exception object). See RUNTIME-ABI §"Exception /
+  unwinding ABI".
+- **Reserved (later):** `gc.safepoint` (see Open issues and RUNTIME-ABI).
 
 ### Example: `fib` in ZIR
 

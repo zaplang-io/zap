@@ -228,6 +228,25 @@ pub enum Inst {
         idx: u32,
         val: Value,
     },
+    /// A call that may raise (exception edge, see `design/IR.md` "Reserved" and
+    /// `design/RUNTIME-ABI.md` §"Exception / unwinding ABI"). Lowers to an LLVM
+    /// `invoke`: control continues straight-line on normal return, or transfers
+    /// to the landing-pad block `unwind` if the callee unwinds. `unwind` must be
+    /// a block whose first instruction is [`Inst::LandingPad`]. The normal
+    /// continuation is implicit (codegen splits the block after the invoke).
+    Invoke {
+        dest: Option<Value>,
+        func: String,
+        args: Vec<Value>,
+        unwind: BlockId,
+    },
+    /// The entry of a landing-pad block: receives a thrown exception during
+    /// unwinding. `dest : Ptr` is the in-flight exception object (the message
+    /// value passed to `zap_panic`). Must be the first instruction in its block,
+    /// and that block must be the `unwind` target of at least one [`Inst::Invoke`].
+    LandingPad {
+        dest: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -386,6 +405,22 @@ fn fmt_inst(i: &Inst) -> String {
         } => {
             format!("fieldset struct#{sid} %{base}.{idx} = %{val}")
         }
+        Inst::Invoke {
+            dest,
+            func,
+            args,
+            unwind,
+        } => {
+            let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
+            match dest {
+                Some(d) => format!(
+                    "%{d} = invoke @{func}({}) unwind block{unwind}",
+                    a.join(", ")
+                ),
+                None => format!("invoke @{func}({}) unwind block{unwind}", a.join(", ")),
+            }
+        }
+        Inst::LandingPad { dest } => format!("%{dest} = landingpad"),
     }
 }
 
