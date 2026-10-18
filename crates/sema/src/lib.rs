@@ -208,7 +208,7 @@ struct Checker {
     errors: Vec<TypeError>,
 }
 
-const BUILTINS: &[&str] = &["print", "range", "len"];
+const BUILTINS: &[&str] = &["print", "range", "len", "sum"];
 
 impl Checker {
     fn new() -> Checker {
@@ -328,11 +328,15 @@ impl Checker {
                     Ty::List(Box::new(el))
                 }
                 "array" => {
-                    let el = args
-                        .first()
-                        .map(|a| self.resolve_type(a))
-                        .unwrap_or(Ty::Unknown);
-                    Ty::List(Box::new(el)) // arrays modeled as lists for now
+                    // Numeric arrays (ticket #24) are typed loosely for now:
+                    // element/dtype typing stays `Unknown` so array programs
+                    // type-check without false errors (modeling them as lists
+                    // would wrongly reject `array * array`). The ZIR lowering
+                    // carries the precise dtype.
+                    for a in args {
+                        let _ = self.resolve_type(a);
+                    }
+                    Ty::Unknown
                 }
                 "dict" => {
                     let k = args
@@ -940,8 +944,26 @@ impl Checker {
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Ty {
+        // Array construction `array[dtype]([...])` (ticket #24): the callee is a
+        // subscript whose base (`array`) and index (the dtype name) are not
+        // ordinary value names, so they are not inferred as such. Typed loosely.
+        if let Expr::Index { base, .. } = callee {
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "array") {
+                for a in args {
+                    self.infer(&a.value);
+                }
+                return Ty::Unknown;
+            }
+        }
         if let Expr::Name(fname, _) = callee {
             match fname.as_str() {
+                "sum" => {
+                    // Reduction over an array -> scalar; typed loosely for now.
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
                 "print" => {
                     for a in args {
                         self.infer(&a.value);
@@ -1211,5 +1233,13 @@ mod tests {
     #[test]
     fn for_over_range_binds_int() {
         ok("def main():\n    auto s = 0\n    for i in range(0, 10):\n        s = s + i\n");
+    }
+
+    #[test]
+    fn array_programs_type_check() {
+        // Arrays are typed loosely (ticket #24): construction, element-wise ops,
+        // scalar broadcast, indexing, len, and sum must not raise false errors.
+        ok(include_str!("../../../tests/golden/array_int.zap"));
+        ok(include_str!("../../../tests/golden/array_f64.zap"));
     }
 }

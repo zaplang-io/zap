@@ -112,6 +112,32 @@ Roadmap **Phase 3, Arrays track** (design) with staged delivery:
 Phase boundaries touched: codegen (SIMD lowering) and the runtime ABI (array
 header + buffer layout, GC-managed buffer).
 
+## Implementation status
+
+**Increment 1 (shipped, ticket #24):** 1-D `array[f64]` and `array[i64]`.
+
+- Construction from a list literal: `array[f64]([1.0, 2.0, 3.0])`.
+- Indexing `a[i]` (get/set), `len(a)`.
+- Element-wise `+`, `-`, `*` on same-length arrays of the same dtype, and
+  scalar broadcast (`a + 2.0`, `a * 2`, and commutative `2.0 + a`).
+- Reduction `sum(a)` → scalar.
+- **SIMD:** the element-wise kernels lower to explicit LLVM vector
+  load/arith/store (`<4 x double>` / `<4 x i64>`) with a scalar remainder loop
+  (codegen `Inst::ArrayBinOp`). The array object is a GC-managed contiguous
+  buffer per `design/RUNTIME-ABI.md` (dtype + ndim + dims + data), allocated
+  pointer-free (`GC_MALLOC_ATOMIC`).
+
+**Deferred (clean follow-ups, noted so they are not silently missing):**
+
+- N-D shape and row-major multi-axis indexing (`m[i, j]`); `ndim` is always 1.
+- Broadcasting beyond a scalar (trailing-dim alignment, size-1 stretch).
+- Slicing / views (D-0030; likely copy-first then views).
+- Dtype promotion for mixed-dtype ops (`i64 + f64`); both operands must match.
+- `f32`/`i32` dtypes; `zeros`/`arange`/`sqrt` and axis reductions.
+- Shape-mismatch runtime exceptions on element-wise ops; element-wise ops
+  currently assume equal lengths.
+- Scalar-on-the-left of a non-commutative op (`scalar - array`).
+
 ## Open issues
 
 - **Views vs copies** for slices (NumPy returns views; this interacts with GC

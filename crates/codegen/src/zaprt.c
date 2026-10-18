@@ -392,6 +392,102 @@ void *zap_set_items(void *sp) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Numeric arrays (ticket #24, design/0002-arrays.md, design/RUNTIME-ABI.md
+ * §"Collection layout": `array[T]`).
+ *
+ * A dense, contiguous, fixed-dtype buffer. The first increment is 1-D over the
+ * dtypes `f64` and `i64` (both 8-byte element words). The object carries its
+ * dtype and shape so N-D (`ndim > 1`) and strided views can layer on later
+ * without an ABI break; this increment always sets `ndim = 1`.
+ *
+ * The element buffer is pointer-free, so it is allocated with GC_MALLOC_ATOMIC
+ * (the collector need not scan it); the shape (`dims`) is likewise atomic. The
+ * element-wise kernels (`a + b`, `a * 2.0`, ...) are *not* here: codegen lowers
+ * them to explicit LLVM vector operations (SIMD) over `zap_array_data` buffers,
+ * which is the point of ticket #24. The runtime only provides construction,
+ * element access, length, and scalar reductions.
+ *
+ * Deferred (clean follow-ups): N-D shape + row-major indexing, strides/views
+ * (D-0030), broadcasting beyond a scalar, dtype promotion, and shape-mismatch
+ * runtime checks on element-wise ops. */
+enum { DTYPE_F64 = 0, DTYPE_I64 = 1 };
+
+typedef struct {
+    int64_t dtype;  /* DTYPE_F64 | DTYPE_I64 */
+    int64_t ndim;   /* always 1 this increment */
+    int64_t *dims;  /* `ndim` dimensions; dims[0] is the length */
+    void *data;     /* contiguous row-major buffer, len * 8 bytes */
+} ZapArray;
+
+void *zap_array_new(int64_t dtype, int64_t len) {
+    ZapArray *a = (ZapArray *)GC_MALLOC(sizeof(ZapArray));
+    int64_t *dims = (int64_t *)GC_MALLOC_ATOMIC(sizeof(int64_t));
+    dims[0] = len;
+    /* f64 and i64 are both 8-byte words; the buffer holds no pointers. */
+    void *data = GC_MALLOC_ATOMIC((size_t)(len > 0 ? len : 0) * 8);
+    a->dtype = dtype;
+    a->ndim = 1;
+    a->dims = dims;
+    a->data = data;
+    return a;
+}
+
+int64_t zap_array_len(void *a) { return ((ZapArray *)a)->dims[0]; }
+
+/* The raw element buffer; codegen's SIMD kernels index this directly. */
+void *zap_array_data(void *a) { return ((ZapArray *)a)->data; }
+
+/* Out-of-range access aborts (shape-mismatch exceptions wait for a follow-up,
+ * matching the list bounds behaviour above). */
+static void zap_array_bounds(ZapArray *a, int64_t i) {
+    if (i < 0 || i >= a->dims[0]) {
+        fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
+                (long long)i, (long long)a->dims[0]);
+        abort();
+    }
+}
+
+double zap_array_get_f64(void *ap, int64_t i) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    return ((double *)a->data)[i];
+}
+void zap_array_set_f64(void *ap, int64_t i, double v) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    ((double *)a->data)[i] = v;
+}
+int64_t zap_array_get_i64(void *ap, int64_t i) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    return ((int64_t *)a->data)[i];
+}
+void zap_array_set_i64(void *ap, int64_t i, int64_t v) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    ((int64_t *)a->data)[i] = v;
+}
+
+double zap_array_sum_f64(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    const double *d = (const double *)a->data;
+    double s = 0.0;
+    for (int64_t i = 0; i < a->dims[0]; i++) {
+        s += d[i];
+    }
+    return s;
+}
+int64_t zap_array_sum_i64(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    const int64_t *d = (const int64_t *)a->data;
+    int64_t s = 0;
+    for (int64_t i = 0; i < a->dims[0]; i++) {
+        s += d[i];
+    }
+    return s;
+}
+
+/* ---------------------------------------------------------------------------
  * Exceptions / unwinding (ticket #22, design/RUNTIME-ABI.md §"Exception /
  * unwinding ABI"). Zap uses the platform Itanium unwinder: `zap_panic` raises,
  * landing pads catch via the libstdc++ personality (`__gxx_personality_v0`,
