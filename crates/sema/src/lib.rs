@@ -46,6 +46,9 @@ pub enum Ty {
     Set(Box<Ty>),
     /// A user-defined type (struct/enum), treated opaquely for now.
     Named(String),
+    /// A regex match object (result of `subject =~ m/.../`, D-0010). Truthy on
+    /// success; carries captured groups accessed via `.group(...)`.
+    Match,
     /// Not inferable yet — assignable to and from anything to avoid cascading
     /// errors.
     Unknown,
@@ -90,6 +93,7 @@ impl Ty {
             Ty::Dict(k, v) => format!("dict[{}, {}]", k.display(), v.display()),
             Ty::Set(t) => format!("set[{}]", t.display()),
             Ty::Named(n) => n.clone(),
+            Ty::Match => "Match".into(),
             Ty::Unknown => "<unknown>".into(),
         }
     }
@@ -384,6 +388,7 @@ impl Checker {
                 "char" => Ty::Char,
                 "bigint" => Ty::Bigint,
                 "complex" => Ty::Complex,
+                "Match" => Ty::Match,
                 "list" => {
                     let el = args
                         .first()
@@ -1128,12 +1133,42 @@ impl Checker {
                 Ty::Unknown
             }
             Expr::Lambda { .. } => Ty::Unknown,
-            Expr::RegexMatch { subject, .. } => {
-                self.infer(subject);
-                Ty::Unknown
+            Expr::RegexMatch {
+                subject,
+                negated,
+                span,
+                ..
+            } => {
+                let t = self.infer(subject);
+                if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
+                    self.error(
+                        format!(
+                            "the left operand of '=~'/'!~' must be a str, found {}",
+                            t.display()
+                        ),
+                        *span,
+                    );
+                }
+                // `!~` is a boolean test; `=~ m/.../` yields a match object
+                // (truthy on success, `None` on no match — D-0010).
+                if *negated {
+                    Ty::Bool
+                } else {
+                    Ty::Match
+                }
             }
-            Expr::RegexSubst { subject, .. } => {
-                self.infer(subject);
+            Expr::RegexSubst { subject, span, .. } => {
+                let t = self.infer(subject);
+                if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
+                    self.error(
+                        format!(
+                            "the left operand of a substitution 's/.../.../' must be a str, found {}",
+                            t.display()
+                        ),
+                        *span,
+                    );
+                }
+                // `s///` returns a new string; the subject is never mutated.
                 Ty::Str
             }
             Expr::ChanRecv { chan, .. } => {
@@ -1501,6 +1536,22 @@ mod tests {
     #[test]
     fn loop_sum_type_checks() {
         ok(include_str!("../../../tests/golden/loop_sum.zap"));
+    }
+
+    #[test]
+    fn regex_type_checks() {
+        // The full regex fixture type-checks (match objects, captures, `!~`,
+        // substitution) — ticket #23, D-0010.
+        ok(include_str!("../../../tests/golden/regex.zap"));
+    }
+
+    #[test]
+    fn regex_subject_must_be_a_string() {
+        // The left operand of `=~`/`!~` and of `s///` must be a str.
+        let e = errors("def main():\n    auto m = 42 =~ m/x/\n");
+        assert_eq!(e.len(), 1, "expected a subject-type error, got {e:?}");
+        let e = errors("def main():\n    auto s = 42 =~ s/a/b/\n");
+        assert_eq!(e.len(), 1, "expected a subject-type error, got {e:?}");
     }
 
     #[test]

@@ -106,6 +106,10 @@ pub enum Ty {
     /// A pointer to a numeric `array` object with the given element dtype
     /// (ticket #24).
     Array(Dtype),
+    /// A pointer to a regex match object (ticket #23, D-0010). Null means no
+    /// match (falsy); owns its captured groups. Distinct from `Ptr`/`Str` so
+    /// lowering can route `.group(...)` method dispatch.
+    Match,
     Void,
 }
 
@@ -367,6 +371,7 @@ impl fmt::Display for Ty {
             Ty::F32 => "f32",
             Ty::F64 => "f64",
             Ty::Ptr => "ptr",
+            Ty::Match => "match",
             Ty::Void => "void",
             Ty::Struct(id) => return write!(f, "struct#{id}"),
             Ty::List(e) => return write!(f, "list[{}]", e.val_suffix()),

@@ -256,6 +256,56 @@ mod tests {
         assert!(text.contains("call @zap_reflect_names"), "text:\n{text}");
     }
 
+    // --- regex (ticket #23, D-0010) ---
+
+    #[test]
+    fn lower_regex_fixture() {
+        // The golden program exercises the whole surface: m// match, positional
+        // and named capture groups, `!~`, and first/global s/// substitution.
+        let m = lower_ok(include_str!("../../../tests/golden/regex.zap"));
+        let text = format!("{m}");
+        // m// lowers to a match-object call; s/// to a substitution call.
+        assert!(text.contains("call @zap_regex_match"), "text:\n{text}");
+        assert!(text.contains("call @zap_regex_subst"), "text:\n{text}");
+        // Capture-group access lowers to the positional and named accessors.
+        assert!(text.contains("call @zap_regex_group("), "text:\n{text}");
+        assert!(
+            text.contains("call @zap_regex_group_name("),
+            "text:\n{text}"
+        );
+        // `if mt:` / `!~` test the match object for null via the runtime helper.
+        assert!(text.contains("call @zap_ptr_nonnull"), "text:\n{text}");
+        // The pattern/replacement text reaches the runtime verbatim as a string
+        // constant: regex escapes like `\d` are NOT string-unescaped (the ZIR
+        // printer's `{:?}` doubles the backslash), and `$2 $1` is untouched.
+        assert!(
+            text.contains(r#"strconst "(\\d{4})-(\\d{2})-(\\d{2})""#),
+            "text:\n{text}"
+        );
+        assert!(text.contains(r#"strconst "$2 $1""#), "text:\n{text}");
+    }
+
+    #[test]
+    fn regex_match_is_a_match_object_negation_is_bool() {
+        // `=~ m//` binds a match object (reference type); `!~` yields an i1.
+        let m = lower_ok(
+            "def main():\n    auto mt = \"x1\" =~ m/(\\d)/\n    auto no = \"x\" !~ m/\\d/\n    print(mt.group(1))\n    if no:\n        print(\"none\")\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("= call @zap_regex_match"), "text:\n{text}");
+        // The group accessor returns a string (pointer), which `print` prints.
+        assert!(text.contains("= call @zap_regex_group("), "text:\n{text}");
+    }
+
+    #[test]
+    fn regex_subject_group_method_is_checked() {
+        // An unknown match-object method reports cleanly (not a silent miscompile).
+        let (ast, _p, _l) =
+            parse_str("def main():\n    auto mt = \"a\" =~ m/a/\n    print(mt.nope())\n");
+        let (_m, errs) = lower_module(&ast);
+        assert!(!errs.is_empty(), "unknown match method should error");
+    }
+
     #[test]
     fn derive_eq_only_methods_are_callable() {
         // A struct can derive just one trait; the generated method resolves.
