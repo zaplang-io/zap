@@ -1,0 +1,103 @@
+name: CI
+
+# Build and test every push and pull request, both on a plain host (front-end
+# crates, no LLVM) and in a full environment that mirrors the LLVM 18 dev
+# container (.devcontainer/Dockerfile) so codegen and the golden end-to-end
+# tests run too.
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast path: the default members only (no LLVM). Mirrors what `cargo test`
+  # does on a host without LLVM (e.g. Intel macOS); keeps that path green.
+  host:
+    name: host (no LLVM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel (1.99.1); install it with the
+      # components we need. The pinned toolchain is picked up automatically by
+      # every subsequent cargo/rustup invocation.
+      # `rustup toolchain install` with no argument installs the toolchain
+      # pinned in rust-toolchain.toml (1.99.1), with its declared components
+      # (rustfmt, clippy). rustup 1.28+ no longer auto-installs, so be explicit.
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default members)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (default members)
+        run: cargo test
+
+  # Full path: replicate the dev container inline — install the same LLVM 18
+  # packages as .devcontainer/Dockerfile, then build and test the whole
+  # workspace with codegen enabled (includes the golden end-to-end:
+  # fib=55, loop_sum=45, hello).
+  full:
+    name: full (LLVM 18 + codegen)
+    runs-on: ubuntu-latest
+    env:
+      # Where llvm-sys / inkwell (llvm18-0) find LLVM 18. Matches the Dockerfile.
+      LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same LLVM 18 toolchain and system libraries llvm-sys links against as
+      # .devcontainer/Dockerfile. (build-essential, curl and git are already on
+      # the runner.)
+      - name: Install LLVM 18 and system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-18 \
+            llvm-18-dev \
+            libpolly-18-dev \
+            clang-18 \
+            libclang-18-dev \
+            zlib1g-dev \
+            libzstd-dev \
+            libffi-dev \
+            libedit-dev \
+            libxml2-dev \
+            libncurses-dev
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: full
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (workspace, codegen enabled)
+        run: cargo clippy --workspace --features zapc/llvm --all-targets -- -D warnings
+
+      - name: Test (workspace, codegen enabled)
+        run: cargo test --workspace --features zapc/llvm
