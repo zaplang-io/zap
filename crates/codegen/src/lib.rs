@@ -87,11 +87,14 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     let rt_path = std::env::temp_dir().join(format!("zaprt-{}.c", std::process::id()));
     std::fs::write(&rt_path, RUNTIME_C).map_err(|e| format!("failed to write runtime: {e}"))?;
 
+    // `-lgc` links the conservative Boehm collector the runtime allocates
+    // through (ticket #20, D-0009); the dev container provides `libgc-dev`.
     let status = Command::new("cc")
         .arg(&obj_path)
         .arg(&rt_path)
         .arg("-o")
         .arg(out_path)
+        .arg("-lgc")
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
