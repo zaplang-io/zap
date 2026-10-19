@@ -3215,25 +3215,38 @@ int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
     return (int64_t)w.val;
 }
 
-/* Force-wake any waiter parked on `pd` for `mode` with ZAP_POLL_OK, without
- * latching if none is parked. The hook the signal self-pipe (#77) and a future
- * cancellation-of-parked-G path use to interrupt a netpoller wait. */
+/* Force-wake the waiter parked on `pd` for `mode` with ZAP_POLL_OK; if none is
+ * parked, LATCH readiness so the next `zap_netpoll_wait` for that direction
+ * returns immediately (same edge-latch np_wake_dir_locked uses). The latch is
+ * what makes this race-free: a caller (e.g. the #77 signal-thread shutdown)
+ * that wakes while the waiter is momentarily between waits — not yet re-parked —
+ * must not have its wake silently dropped, or the waiter blocks forever. The
+ * hook the signal self-pipe (#77) and a future cancellation-of-parked-G path
+ * use to interrupt a netpoller wait. */
 void zap_netpoll_wake(void *pd_, int64_t mode) {
     PollDesc *pd = (PollDesc *)pd_;
     pthread_mutex_lock(&pd->mu);
-    if ((mode & ZAP_POLL_READ) && pd->rg) {
-        Waiter *w = pd->rg;
-        pd->rg = NULL;
-        pd->r_deadline = 0;
-        w->val = ZAP_POLL_OK;
-        goready(w);
+    if (mode & ZAP_POLL_READ) {
+        if (pd->rg) {
+            Waiter *w = pd->rg;
+            pd->rg = NULL;
+            pd->r_deadline = 0;
+            w->val = ZAP_POLL_OK;
+            goready(w);
+        } else {
+            pd->r_ready = 1; /* latch: the next read wait returns at once */
+        }
     }
-    if ((mode & ZAP_POLL_WRITE) && pd->wg) {
-        Waiter *w = pd->wg;
-        pd->wg = NULL;
-        pd->w_deadline = 0;
-        w->val = ZAP_POLL_OK;
-        goready(w);
+    if (mode & ZAP_POLL_WRITE) {
+        if (pd->wg) {
+            Waiter *w = pd->wg;
+            pd->wg = NULL;
+            pd->w_deadline = 0;
+            w->val = ZAP_POLL_OK;
+            goready(w);
+        } else {
+            pd->w_ready = 1; /* latch: the next write wait returns at once */
+        }
     }
     pthread_mutex_unlock(&pd->mu);
 }
@@ -3860,19 +3873,13 @@ static void zap_signal_shutdown(void) {
         return;
     }
     g_sig_shutdown = 1;
-    /* Wake the signal thread off its netpoller park. A self-pipe write is
-     * race-free: the netpoller LATCHES the readiness edge, so even if the thread
-     * is between waits (not parked) its next wait returns at once and observes
-     * g_sig_shutdown — whereas zap_netpoll_wake would be a lost no-op there. */
-    if (g_sig_pipe[1] >= 0) {
-        unsigned char b = ZAP_SIG_SYNC_BYTE;
-        ssize_t r;
-        do {
-            r = write(g_sig_pipe[1], &b, 1);
-        } while (r < 0 && errno == EINTR);
-    }
+    /* Wake the signal thread off its netpoller park so it observes g_sig_shutdown
+     * and exits. zap_netpoll_wake now LATCHES when the thread is momentarily
+     * between waits (not parked), so this wake is race-free — a plain self-pipe
+     * write would rely on an EPOLLET edge that is lost if the pipe is non-empty,
+     * which is exactly how this join used to hang intermittently. */
     if (g_sig_pd) {
-        zap_netpoll_wake(g_sig_pd, ZAP_POLL_READ); /* belt-and-suspenders */
+        zap_netpoll_wake(g_sig_pd, ZAP_POLL_READ);
     }
     GC_pthread_join(g_sig_thread, NULL);
     if (g_sig_pd) {
