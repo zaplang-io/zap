@@ -176,6 +176,31 @@ fn is_lvalue_read(e: &ast::Expr) -> bool {
     )
 }
 
+/// The in-place augmented-assignment dunder for an operator (D-0047): `a OP= b`
+/// calls `a.__iOP__(b)` when the LHS struct type defines it, mutating in place
+/// and avoiding the fresh allocation the binary `__OP__` form needs. Only the
+/// arithmetic / bitwise / shift operators that can appear in an augmented
+/// assignment have one; everything else returns `None` (and falls back to the
+/// derive-from-binary form).
+fn inplace_op_dunder(op: AstBin) -> Option<&'static str> {
+    use AstBin::*;
+    Some(match op {
+        Add => "__iadd__",
+        Sub => "__isub__",
+        Mul => "__imul__",
+        Div => "__itruediv__",
+        FloorDiv => "__ifloordiv__",
+        Mod => "__imod__",
+        Pow => "__ipow__",
+        BitAnd => "__iand__",
+        BitOr => "__ior__",
+        BitXor => "__ixor__",
+        Shl => "__ilshift__",
+        Shr => "__irshift__",
+        _ => return None,
+    })
+}
+
 pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     let mut errors = Vec::new();
 
@@ -1668,7 +1693,26 @@ impl<'a> FnLower<'a> {
                         .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
                     let cur = self.load(ptr, ty);
                     let (rhs, rt) = self.expr(value)?;
-                    let (res, rty) = self.binop(*op, cur, ty, rhs, rt)?;
+                    // In-place augmented assignment (D-0047): if the LHS is a user
+                    // struct that defines the matching in-place dunder, `a OP= b`
+                    // calls `a.__iOP__(b)`, which mutates the operand in place and
+                    // returns it — no fresh allocation as the binary `__OP__` form
+                    // would need. Otherwise fall back to deriving from the binary
+                    // operator (`a = a.__OP__(b)`). Reference structs share
+                    // identity (D-0023), so the in-place mutation is the intended
+                    // visible effect; the store-back is a no-op rebind for them and
+                    // keeps the value-struct / scalar paths correct.
+                    let (res, rty) = match (ty, inplace_op_dunder(*op)) {
+                        (Ty::Struct(sid), Some(dunder))
+                            if self.sigs.contains_key(&format!(
+                                "{}__{}",
+                                self.ctx.names[sid as usize], dunder
+                            )) =>
+                        {
+                            self.call_dunder(sid, dunder, vec![(cur, ty), (rhs, rt)])?
+                        }
+                        _ => self.binop(*op, cur, ty, rhs, rt)?,
+                    };
                     let res = self.coerce(res, rty, ty);
                     self.store(ptr, res);
                     Ok(())

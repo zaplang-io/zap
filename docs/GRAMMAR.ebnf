@@ -122,8 +122,9 @@ aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**="
                   (* Operator overloading (D-0047) is semantic, not grammatical:
                      each operator desugars to a dunder method (`a + b` ->
                      `a.__add__(b)`) on a compiler-known operator interface.
-                     `aug_op` desugars from the binary dunder by default; the
-                     in-place `__iadd__`-family is reserved, impl deferred. *)
+                     `aug_op` calls the in-place `__iadd__`-family dunder when
+                     the LHS type defines it, else derives from the binary
+                     dunder (`a = a.__add__(b)`) — I#61, D-0047/D-0023. *)
 target        ::= atom { trailer } ;           (* name, index, slice, attr *)
 send_stmt     ::= postfix "<-" expr ;          (* channel send: ch <- v; D-0031 *)
 

@@ -642,6 +642,58 @@ mod tests {
         );
     }
 
+    // --- in-place augmented assignment (ticket #61, D-0047/D-0023) ---
+
+    #[test]
+    fn aug_assign_uses_inplace_dunder_when_defined() {
+        // `a += b` on a struct that defines `__iadd__` lowers to a call of the
+        // in-place dunder (`Acc____iadd__`), which mutates in place — NOT the
+        // binary `__add__` form.
+        let m = lower_ok(
+            "struct Acc:\n    int64 total\n\n    \
+             def __iadd__(self, Acc other) -> Acc:\n        \
+             self.total = self.total + other.total\n        return self\n\n\
+             def main():\n    auto a = Acc(total=1)\n    auto b = Acc(total=2)\n    \
+             a += b\n    print(a.total)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@Acc____iadd__"), "text:\n{text}");
+        assert!(
+            !text.contains("@Acc____add__"),
+            "the in-place form must not call the binary __add__:\n{text}"
+        );
+    }
+
+    #[test]
+    fn aug_assign_falls_back_to_binary_dunder() {
+        // A struct that defines only `__add__` (no `__iadd__`) still supports
+        // `+=`, deriving it from the binary operator (`a = a.__add__(b)`).
+        let m = lower_ok(
+            "struct V:\n    int64 x\n\n    \
+             def __add__(self, V other) -> V:\n        return V(x=self.x + other.x)\n\n\
+             def main():\n    auto a = V(x=1)\n    auto b = V(x=2)\n    \
+             a += b\n    print(a.x)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@V____add__"), "text:\n{text}");
+        assert!(
+            !text.contains("@V____iadd__"),
+            "no __iadd__ is defined, so none should be called:\n{text}"
+        );
+    }
+
+    #[test]
+    fn aug_assign_scalar_is_a_plain_binop() {
+        // Built-in scalar `+=` is unchanged: a direct `Add`, no dunder call.
+        let m = lower_ok("def main():\n    auto a = 1\n    a += 2\n    print(a)\n");
+        let text = format!("{m}");
+        assert!(text.contains("= Add "), "scalar += is a plain Add:\n{text}");
+        assert!(
+            !text.contains("__iadd__") && !text.contains("__add__"),
+            "a scalar must not route through an operator dunder:\n{text}"
+        );
+    }
+
     // --- tuples (ticket #54, D-0049) ---
 
     #[test]
