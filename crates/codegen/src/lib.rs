@@ -21,7 +21,9 @@ use inkwell::targets::{
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, VectorType,
 };
-use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue, VectorValue};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue, VectorValue,
+};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
 use zapc_ir::{self as zir, lower_module, CastKind, CmpPred, Func, Inst, Owner, Term, Ty};
@@ -217,8 +219,12 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | FieldGet { dest, .. }
         | LandingPad { dest, .. }
         | ArrayBinOp { dest, .. }
-        | FuncAddr { dest, .. } => Some(*dest),
-        Call { dest, .. } | Invoke { dest, .. } => *dest,
+        | FuncAddr { dest, .. }
+        | IfaceMake { dest, .. } => Some(*dest),
+        Call { dest, .. }
+        | Invoke { dest, .. }
+        | IfaceCall { dest, .. }
+        | IfaceInvoke { dest, .. } => *dest,
         _ => None,
     }
 }
@@ -250,6 +256,16 @@ struct Cg<'a, 'ctx> {
     /// instead of once per execution of a loop body — otherwise a long-running
     /// loop accumulates per-iteration stack slots and overflows the stack.
     entry_block: Option<BasicBlock<'ctx>>,
+    /// Struct names by id (parallel to `structs`); used to name an implementor's
+    /// `Struct__method` when building an interface dispatch table (D-0016).
+    struct_names: Vec<String>,
+    /// Structural interfaces by id (`iid`), cloned from the ZIR module (D-0016).
+    /// Carries each interface's method slots (names + signatures) for building
+    /// itables and dynamic-dispatch call types.
+    interfaces: Vec<zir::ir::InterfaceLayout>,
+    /// Cache of interface dispatch tables: `(concrete_sid, iid)` -> the static
+    /// `[N x ptr]` itable global, built once per implementing pair.
+    itables: std::cell::RefCell<std::collections::HashMap<(u32, u32), PointerValue<'ctx>>>,
 }
 
 /// A function's shadow-stack frame (ticket #48). Codegen reserves one root slot
@@ -287,6 +303,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             gc_frame: None,
             target_data: None,
             entry_block: None,
+            struct_names: Vec::new(),
+            interfaces: Vec::new(),
+            itables: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -700,7 +719,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             let field_tys: Vec<BasicTypeEnum> = sl.fields.iter().map(|t| self.basic(*t)).collect();
             self.structs.push(self.ctx.struct_type(&field_tys, false));
             self.struct_inline.push(sl.inline);
+            self.struct_names.push(sl.name.clone());
         }
+        // Interface metadata (D-0016) for fat-pointer construction and dynamic
+        // dispatch (`Inst::IfaceMake` / `IfaceCall` / `IfaceInvoke`).
+        self.interfaces = m.interfaces.clone();
 
         // Emit a GC type descriptor per struct (ticket #48): kind PRECISE with
         // the byte offsets of the pointer fields, computed from the struct's
@@ -1726,8 +1749,200 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 let p = fv.as_global_value().as_pointer_value();
                 vals[*dest as usize] = Some(p.into());
             }
+            Inst::IfaceMake {
+                dest,
+                data,
+                iid,
+                concrete_sid,
+            } => {
+                // Build the `{data, itable}` fat pointer on the stack (D-0016,
+                // design/0006 §2.4). The ZIR value is a pointer to this inline
+                // `{ptr, ptr}` aggregate — the same shape the inline-aggregate ABI
+                // uses for a value struct — so it is passed/returned by value at
+                // call boundaries and addressed by pointer in the body.
+                let fat_sid = self.interfaces[*iid as usize].fat_sid;
+                let fat_ty = self.structs[fat_sid as usize];
+                let slot = self.entry_alloca(fat_ty.into(), "iface")?;
+                let data_ptr = b
+                    .build_struct_gep(fat_ty, slot, 0, "iface.data")
+                    .map_err(|e| e.to_string())?;
+                b.build_store(data_ptr, get(vals, *data))
+                    .map_err(|e| e.to_string())?;
+                let itable = self.itable_global(*concrete_sid, *iid)?;
+                let itable_ptr = b
+                    .build_struct_gep(fat_ty, slot, 1, "iface.itable")
+                    .map_err(|e| e.to_string())?;
+                b.build_store(itable_ptr, itable)
+                    .map_err(|e| e.to_string())?;
+                vals[*dest as usize] = Some(slot.into());
+            }
+            Inst::IfaceCall {
+                dest,
+                iface,
+                iid,
+                method,
+                args,
+            } => {
+                let (callee, fnty, argvals) =
+                    self.iface_dispatch(get(vals, *iface), *iid, *method, args, vals)?;
+                let md: Vec<BasicMetadataValueEnum> = argvals.iter().map(|v| (*v).into()).collect();
+                let cs = b
+                    .build_indirect_call(fnty, callee, &md, "ifacecall")
+                    .map_err(|e| e.to_string())?;
+                if let Some(d) = dest {
+                    if let Some(v) = cs.try_as_basic_value().left() {
+                        vals[*d as usize] = Some(self.abi_result(v)?);
+                    }
+                }
+            }
+            Inst::IfaceInvoke {
+                dest,
+                iface,
+                iid,
+                method,
+                args,
+                unwind,
+            } => {
+                let (callee, fnty, argvals) =
+                    self.iface_dispatch(get(vals, *iface), *iid, *method, args, vals)?;
+                let cont = self.ctx.append_basic_block(fv, "ifaceinvoke.cont");
+                let cs = b
+                    .build_indirect_invoke(
+                        fnty,
+                        callee,
+                        &argvals,
+                        cont,
+                        blocks[*unwind as usize],
+                        "ifaceinvoke",
+                    )
+                    .map_err(|e| e.to_string())?;
+                b.position_at_end(cont);
+                if let Some(d) = dest {
+                    if let Some(v) = cs.try_as_basic_value().left() {
+                        vals[*d as usize] = Some(self.abi_result(v)?);
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// The static interface dispatch table for the `(concrete_sid, iid)` pair
+    /// (D-0016): a constant `[N x ptr]` global whose slot *k* is the address of
+    /// the implementor's `Struct__<method_k>`, in interface declaration order.
+    /// Built once per pair and cached.
+    fn itable_global(&self, concrete_sid: u32, iid: u32) -> Result<PointerValue<'ctx>, String> {
+        if let Some(g) = self.itables.borrow().get(&(concrete_sid, iid)) {
+            return Ok(*g);
+        }
+        let iface = &self.interfaces[iid as usize];
+        let concrete = &self.struct_names[concrete_sid as usize];
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        let mut slots: Vec<PointerValue<'ctx>> = Vec::with_capacity(iface.methods.len());
+        for m in &iface.methods {
+            let mangled = format!("{concrete}__{}", m.name);
+            let fv = *self.fns.get(&mangled).ok_or_else(|| {
+                format!(
+                    "interface '{}' method '{}' not implemented by '{concrete}' (no '{mangled}')",
+                    iface.name, m.name
+                )
+            })?;
+            slots.push(fv.as_global_value().as_pointer_value());
+        }
+        let arr = p.const_array(&slots);
+        let g = self.module.add_global(
+            arr.get_type(),
+            None,
+            &format!("itable.{concrete}.{}", iface.name),
+        );
+        g.set_initializer(&arr);
+        g.set_constant(true);
+        let ptr = g.as_pointer_value();
+        self.itables.borrow_mut().insert((concrete_sid, iid), ptr);
+        Ok(ptr)
+    }
+
+    /// Resolve a dynamic dispatch through an interface value (D-0016): load the
+    /// method's function pointer from the fat pointer's itable and its `data`
+    /// word (the `self` receiver), and build the callee's LLVM function type from
+    /// the interface method's signature. Returns `(callee_ptr, fn_type, args)`
+    /// ready for an indirect call/invoke; `args[0]` is `self` (`data`).
+    fn iface_dispatch(
+        &self,
+        iface_val: BasicValueEnum<'ctx>,
+        iid: u32,
+        method: u32,
+        args: &[u32],
+        vals: &[Option<BasicValueEnum<'ctx>>],
+    ) -> Result<
+        (
+            PointerValue<'ctx>,
+            inkwell::types::FunctionType<'ctx>,
+            Vec<BasicValueEnum<'ctx>>,
+        ),
+        String,
+    > {
+        let b = self.builder;
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        let iface = &self.interfaces[iid as usize];
+        let fat_ty = self.structs[iface.fat_sid as usize];
+        let msig = &iface.methods[method as usize];
+        let base = iface_val.into_pointer_value();
+        // Load `data` (field 0) and `itable` (field 1) from the fat pointer.
+        let data_slot = b
+            .build_struct_gep(fat_ty, base, 0, "iface.data")
+            .map_err(|e| e.to_string())?;
+        let data = b
+            .build_load(p, data_slot, "iface.self")
+            .map_err(|e| e.to_string())?;
+        let itable_slot = b
+            .build_struct_gep(fat_ty, base, 1, "iface.itable")
+            .map_err(|e| e.to_string())?;
+        let itable = b
+            .build_load(p, itable_slot, "iface.vtbl")
+            .map_err(|e| e.to_string())?
+            .into_pointer_value();
+        // Load slot `method` of the itable (`[N x ptr]`).
+        let arr_ty = p.array_type(iface.methods.len() as u32);
+        let fn_slot = unsafe {
+            b.build_in_bounds_gep(
+                arr_ty,
+                itable,
+                &[
+                    self.ctx.i32_type().const_zero(),
+                    self.ctx.i32_type().const_int(method as u64, false),
+                ],
+                "iface.slot",
+            )
+            .map_err(|e| e.to_string())?
+        };
+        let callee = b
+            .build_load(p, fn_slot, "iface.fn")
+            .map_err(|e| e.to_string())?
+            .into_pointer_value();
+        // Build the callee type `(ptr self, abi(params)...) -> abi(ret)` from the
+        // interface method signature — every implementor matches it.
+        let mut param_tys: Vec<BasicMetadataTypeEnum> = vec![p.into()];
+        for pt in &msig.params {
+            param_tys.push(self.abi_ty(*pt).into());
+        }
+        let fnty = match msig.ret {
+            Ty::Void => self.ctx.void_type().fn_type(&param_tys, false),
+            rt => self.abi_ty(rt).fn_type(&param_tys, false),
+        };
+        // Arguments: `self` (data) first, then the call arguments, each loaded by
+        // value when the parameter is an inline aggregate (same ABI as `Call`).
+        let mut argvals: Vec<BasicValueEnum> = Vec::with_capacity(args.len() + 1);
+        argvals.push(data);
+        for (i, a) in args.iter().enumerate() {
+            let v = vals[*a as usize].expect("ZIR value used before definition");
+            let v = match msig.params.get(i) {
+                Some(pt) => self.abi_arg(self.abi_ty(*pt), v)?,
+                None => v,
+            };
+            argvals.push(v);
+        }
+        Ok((callee, fnty, argvals))
     }
 
     /// Build (once per target function) the spawn trampoline `ptr @__zap_thunk_F(ptr env)`

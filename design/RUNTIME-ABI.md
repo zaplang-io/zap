@@ -69,6 +69,46 @@ pointer. Methods receive the instance pointer as the first argument (`self`).
 struct Point { f64 x; f64 y }  ->  [ header(8) | x: f64(8) | y: f64(8) ]  = 24 bytes
 ```
 
+### Interface values — the `{data, itable}` fat pointer (#84, D-0016)
+
+A value of **interface type** is a two-word **fat pointer**, passed and returned
+**by value** (design/0006 §2.4 — "the one reference type wider than a single
+word"):
+
+```
+offset 0:  data   (*object)  — the underlying concrete instance   — 8 bytes
+offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
+```
+
+- `data` is the concrete reference-struct instance (a heap pointer, one word per
+  the value representation above). The object's own header/type-descriptor word
+  is unchanged — the fat pointer is *beside* the object, not in it.
+- `itable` points at a **static, immutable** dispatch table: an `[N x ptr]`
+  array of function pointers, one per interface method, in **interface
+  declaration order** (slot *k* = the implementor's method for interface method
+  *k*). The compiler emits one itable per `(concrete struct, interface)` pair
+  that occurs, built once and shared.
+- **Construction** (concrete → interface, a conversion site: assignment to an
+  interface-typed binding, an interface-typed argument, or an interface return)
+  materializes `{ data = instance, itable = &itable_for_pair }`.
+- **Dispatch** of `s.m(args…)` loads slot *k* from `s.itable` and calls it with
+  `s.data` as `self`: a single indirect call, no per-object cost beyond the
+  shared header. The callee uses the ordinary calling convention with `self` as
+  the leading pointer argument.
+- The fat pointer is a **value**: it uses the same by-value aggregate calling
+  convention as a flat `value struct` / tuple (register/sret), so there is no
+  heap allocation per conversion. Its `data` word is a GC pointer traced via the
+  originating instance's root; the `itable` word addresses static data and is
+  safely ignored by the collector (it is not a heap object).
+- `None` as an interface value would be `{ data = null, itable = null }`;
+  interface→interface conversion, interface-typed **struct fields / collection
+  elements**, and **`value struct` behind an interface** (which needs
+  copy-to-heap boxing on conversion, #75 Part 1) are **not yet realized** — the
+  current increment covers interface-typed **bindings, parameters, and returns**
+  over reference structs. #75 Part 1 hooks in at the conversion site: a value
+  struct is copied to the heap first and that heap pointer becomes `data`; the
+  fat-pointer shape is unchanged.
+
 ### String & bytes layout (coordinate with #16 / design/0007-strings)
 
 `str` is immutable UTF-8:

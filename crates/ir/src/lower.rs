@@ -116,6 +116,10 @@ impl EnumLow {
 struct TyEnv<'a> {
     ids: &'a HashMap<String, u32>,
     enums: &'a HashMap<String, EnumLow>,
+    /// Structural interfaces (D-0016): interface name -> the synthetic inline
+    /// `{ptr data, ptr itable}` struct id (`fat_sid`) that an interface value has
+    /// as its ZIR type. An interface-typed annotation resolves to this.
+    ifaces: &'a HashMap<String, u32>,
     /// Interner for anonymous tuple layouts (D-0049), shared so every
     /// `(T, U, ...)` type resolves to the same struct id across the module.
     tuples: &'a RefCell<TupleInterner>,
@@ -139,6 +143,37 @@ struct StructCtx {
     /// Interned anonymous tuple layouts (D-0049), appended to [`Module::structs`]
     /// after lowering.
     tuples: RefCell<TupleInterner>,
+    /// Structural interfaces (D-0016): interface name -> `fat_sid` (its synthetic
+    /// inline `{ptr data, ptr itable}` struct layout id). An interface value's
+    /// ZIR type is `Ty::Struct(fat_sid)`.
+    ifaces: HashMap<String, u32>,
+    /// Interface metadata, indexed by interface id (`iid`); `iid` is the position
+    /// in this vector. Used to map a `fat_sid` back to its interface for dynamic
+    /// dispatch and to build the per-method dispatch-table slots.
+    interfaces: Vec<InterfaceLow>,
+    /// Reverse map `fat_sid -> iid`, so a method call on an interface-typed
+    /// receiver resolves to the owning interface.
+    fat_to_iid: HashMap<u32, u32>,
+}
+
+/// Lowered interface metadata (D-0016). `fat_sid` is the synthetic inline
+/// `{ptr data, ptr itable}` struct layout; `methods` is the dispatch-table slot
+/// order (interface declaration order).
+#[derive(Clone)]
+struct InterfaceLow {
+    name: String,
+    fat_sid: u32,
+    methods: Vec<IfaceMethodLow>,
+}
+
+/// One interface method slot (D-0016): its name (used to resolve a call and to
+/// name the implementor's `Struct__method` in the itable) and its ZIR signature
+/// (excluding `self`), used to coerce arguments and to type the dispatch.
+#[derive(Clone)]
+struct IfaceMethodLow {
+    name: String,
+    params: Vec<Ty>,
+    ret: Ty,
 }
 
 impl StructCtx {
@@ -155,8 +190,14 @@ impl StructCtx {
         TyEnv {
             ids: &self.ids,
             enums: &self.enums,
+            ifaces: &self.ifaces,
             tuples: &self.tuples,
         }
+    }
+
+    /// If `sid` is an interface's synthetic fat-pointer layout, its interface id.
+    fn iid_of_fat_sid(&self, sid: u32) -> Option<u32> {
+        self.fat_to_iid.get(&sid).copied()
     }
 
     /// Is `sid` a `value struct` (value type, D-0051)?
@@ -263,6 +304,21 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         }
     }
 
+    // Interfaces (D-0016): each gets a synthetic inline `{ptr data, ptr itable}`
+    // struct layout (`fat_sid`) — the ZIR type of an interface value is
+    // `Ty::Struct(fat_sid)`. Reserve the ids up front (like structs/enums) so an
+    // interface-typed field/parameter resolves, and so these ids are claimed
+    // BEFORE the tuple interner captures `names.len()` as its base. The layout
+    // name is prefixed with `$iface:` so it never collides with a user type.
+    let mut ifaces: HashMap<String, u32> = HashMap::new();
+    for item in &module.items {
+        if let ast::Item::Interface(i) = item {
+            let fat_sid = names.len() as u32;
+            ifaces.insert(i.name.clone(), fat_sid);
+            names.push(format!("$iface:{}", i.name));
+        }
+    }
+
     // Anonymous tuple layouts (D-0049) are interned after the named structs, so
     // their struct ids start at `names.len()`. The interner is shared across the
     // field/signature pre-passes and all body lowering, then its layouts are
@@ -313,6 +369,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                                 &TyEnv {
                                     ids: &ids,
                                     enums: &enums,
+                                    ifaces: &ifaces,
                                     tuples: &tuples,
                                 },
                             )
@@ -345,6 +402,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         let tyenv = TyEnv {
             ids: &ids,
             enums: &enums,
+            ifaces: &ifaces,
             tuples: &tuples,
         };
         for item in &module.items {
@@ -368,6 +426,67 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 }
             }
         }
+        // Lay out each interface's synthetic fat-pointer struct as
+        // `{ ptr data, ptr itable }` (D-0016, design/0006 §2.4).
+        for &fat_sid in ifaces.values() {
+            fields[fat_sid as usize] = vec![
+                ("$data".to_string(), Ty::Ptr),
+                ("$itable".to_string(), Ty::Ptr),
+            ];
+        }
+    }
+
+    // Build the interface metadata (D-0016): per interface, resolve each method's
+    // ZIR signature (excluding `self`) in declaration order — the dispatch-table
+    // slot order. `iid` is the index into `interfaces`.
+    let mut interfaces: Vec<InterfaceLow> = Vec::new();
+    let mut fat_to_iid: HashMap<u32, u32> = HashMap::new();
+    {
+        let tyenv = TyEnv {
+            ids: &ids,
+            enums: &enums,
+            ifaces: &ifaces,
+            tuples: &tuples,
+        };
+        for item in &module.items {
+            if let ast::Item::Interface(i) = item {
+                let fat_sid = ifaces[&i.name];
+                let iid = interfaces.len() as u32;
+                fat_to_iid.insert(fat_sid, iid);
+                let methods = i
+                    .methods
+                    .iter()
+                    .map(|m| {
+                        // Parameter types excluding the leading `self`.
+                        let params = m
+                            .params
+                            .iter()
+                            .filter(|p| p.name != "self")
+                            .map(|p| {
+                                p.ty.as_ref()
+                                    .map(|t| resolve_ty(t, &tyenv).unwrap_or(Ty::Ptr))
+                                    .unwrap_or(Ty::Ptr)
+                            })
+                            .collect();
+                        let ret = m
+                            .ret
+                            .as_ref()
+                            .map(|t| resolve_ty(t, &tyenv).unwrap_or(Ty::Void))
+                            .unwrap_or(Ty::Void);
+                        IfaceMethodLow {
+                            name: m.name.clone(),
+                            params,
+                            ret,
+                        }
+                    })
+                    .collect();
+                interfaces.push(InterfaceLow {
+                    name: i.name.clone(),
+                    fat_sid,
+                    methods,
+                });
+            }
+        }
     }
     // Python imports (ticket #27, D-0012): map each imported module's in-scope
     // name to its CPython module name. The alias defaults to the module string
@@ -388,6 +507,9 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         enums,
         py,
         tuples,
+        ifaces,
+        interfaces,
+        fat_to_iid,
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -511,6 +633,27 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         out.structs[sid].inline = ctx.inline_eligible(sid as u32);
     }
 
+    // Interface fat pointers are passed/returned by value exactly like an inline
+    // value aggregate (D-0016, design/0006 §2.4: "the one reference type wider
+    // than a single word"), so force their synthetic `{ptr, ptr}` layout inline.
+    // Emit the interface table so codegen can build dispatch itables.
+    for i in &ctx.interfaces {
+        out.structs[i.fat_sid as usize].inline = true;
+        out.interfaces.push(InterfaceLayout {
+            name: i.name.clone(),
+            fat_sid: i.fat_sid,
+            methods: i
+                .methods
+                .iter()
+                .map(|m| IfaceMethod {
+                    name: m.name.clone(),
+                    params: m.params.clone(),
+                    ret: m.ret,
+                })
+                .collect(),
+        });
+    }
+
     (out, errors)
 }
 
@@ -586,6 +729,11 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                         return Ok(Ty::Struct(e.sid.expect("tier-3 enum has a struct id")));
                     }
                     return Ok(Ty::I64);
+                }
+                // An interface value is its synthetic `{ptr data, ptr itable}`
+                // fat-pointer layout (D-0016).
+                if let Some(fat_sid) = env.ifaces.get(other) {
+                    return Ok(Ty::Struct(*fat_sid));
                 }
                 match env.ids.get(other) {
                     Some(id) => Ok(Ty::Struct(*id)),
@@ -4178,6 +4326,11 @@ impl<'a> FnLower<'a> {
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
             };
+            // Dynamic dispatch through an interface value (D-0016): the receiver
+            // is an interface fat pointer, not a concrete struct.
+            if let Some(iid) = self.ctx.iid_of_fat_sid(sid) {
+                return self.lower_iface_call(recv, iid, name, args);
+            }
             let mangled = format!("{}__{}", self.ctx.names[sid as usize], name);
             let (ptys, ret) = self
                 .sigs
@@ -4210,6 +4363,75 @@ impl<'a> FnLower<'a> {
                 "only direct function calls are supported by codegen yet",
             ))
         }
+    }
+
+    /// Lower a method call on an interface-typed receiver to **dynamic dispatch**
+    /// (D-0016): resolve the method's slot in the interface's dispatch table and
+    /// emit an [`Inst::IfaceCall`] / [`Inst::IfaceInvoke`] that loads the slot
+    /// from the fat pointer's itable and calls it with `data` as `self`. The
+    /// callee's signature is the interface's declared one, so arguments are
+    /// coerced to the interface method's parameter types.
+    fn lower_iface_call(
+        &mut self,
+        iface: Value,
+        iid: u32,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let iface_info = &self.ctx.interfaces[iid as usize];
+        let method = iface_info
+            .methods
+            .iter()
+            .position(|m| m.name == name)
+            .ok_or_else(|| {
+                err(format!(
+                    "interface '{}' has no method '{name}'",
+                    iface_info.name
+                ))
+            })? as u32;
+        // Clone the slot signature (ends the borrow of `self.ctx`).
+        let msig = self.ctx.interfaces[iid as usize].methods[method as usize].clone();
+        let mut argvals = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let (v, vt) = self.expr(&a.value)?;
+            let target = *msig.params.get(i).unwrap_or(&vt);
+            let v = self.coerce(v, vt, target);
+            let v = self.copy_for_pass(v, target, &a.value);
+            argvals.push(v);
+        }
+        let dest = if msig.ret == Ty::Void {
+            None
+        } else {
+            Some(self.new_value(msig.ret))
+        };
+        if let Some(&lp) = self.landing_pads.last() {
+            self.used_lps.insert(lp);
+            self.emit(Inst::IfaceInvoke {
+                dest,
+                iface,
+                iid,
+                method,
+                args: argvals,
+                unwind: lp,
+            });
+        } else {
+            self.emit(Inst::IfaceCall {
+                dest,
+                iface,
+                iid,
+                method,
+                args: argvals,
+            });
+        }
+        let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
+        Ok((
+            rv,
+            if msig.ret == Ty::Void {
+                Ty::I32
+            } else {
+                msig.ret
+            },
+        ))
     }
 
     fn construct(&mut self, sid: u32, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
@@ -6095,6 +6317,30 @@ impl<'a> FnLower<'a> {
     fn coerce(&mut self, v: Value, from: Ty, to: Ty) -> Value {
         if from == to {
             return v;
+        }
+        // Concrete struct -> interface value: build the `{data, itable}` fat
+        // pointer (D-0016, design/0006 §2.4). Only a reference struct is boxed
+        // here; a `value struct` behind an interface (copy-to-heap on conversion)
+        // is I#75 Part 1 and is rejected until then. interface -> interface and
+        // `None` -> interface are documented follow-ups.
+        if let Ty::Struct(to_sid) = to {
+            if let Some(iid) = self.ctx.iid_of_fat_sid(to_sid) {
+                if let Ty::Struct(from_sid) = from {
+                    if self.ctx.iid_of_fat_sid(from_sid).is_none() {
+                        let dest = self.new_value(to);
+                        self.emit(Inst::IfaceMake {
+                            dest,
+                            data: v,
+                            iid,
+                            concrete_sid: from_sid,
+                        });
+                        return dest;
+                    }
+                }
+                // Not a concrete-struct source we can box — leave unchanged; sema
+                // has already rejected a non-conforming or unsupported source.
+                return v;
+            }
         }
         if let (Some(fw), Some(tw)) = (from.int_width(), to.int_width()) {
             let d = self.new_value(to);

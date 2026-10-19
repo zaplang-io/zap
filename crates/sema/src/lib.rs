@@ -175,6 +175,20 @@ fn assignable(from: &Ty, to: &Ty) -> bool {
     }
 }
 
+/// Does a concrete struct method signature `have` match what an interface
+/// requires (`want`) for structural conformance (D-0016)? The receiver (`self`,
+/// parameter 0) is ignored — it is the differing concrete/interface type — so
+/// the match compares the remaining parameter types pairwise and the return
+/// type. Comparison is by exact type identity (no widening): an interface method
+/// is satisfied by a method with the very same signature.
+fn sigs_match(have: &FnSig, want: &FnSig) -> bool {
+    let hp = &have.params.get(1..).unwrap_or(&[]);
+    let wp = &want.params.get(1..).unwrap_or(&[]);
+    hp.len() == wp.len()
+        && hp.iter().zip(wp.iter()).all(|(a, b)| a.ty == b.ty)
+        && have.ret == want.ret
+}
+
 /// A nameless, non-defaulted, non-variadic parameter of the given type — used to
 /// synthesize `@derive`d dunder signatures (D-0047).
 fn param(ty: Ty) -> ParamInfo {
@@ -407,6 +421,22 @@ impl StructInfo {
     }
 }
 
+/// A registered structural interface (D-0016). The method set is the interface's
+/// declared signatures, in declaration order (which is the dispatch-table slot
+/// order a conforming struct is checked against and lowered to).
+#[derive(Clone)]
+struct InterfaceInfo {
+    /// Interface method name -> signature (`self` is the first parameter, typed
+    /// as the interface itself), in declaration order.
+    methods: Vec<(String, FnSig)>,
+}
+
+impl InterfaceInfo {
+    fn method(&self, name: &str) -> Option<&FnSig> {
+        self.methods.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+    }
+}
+
 /// Type-check a module, returning any errors.
 pub fn check(module: &Module) -> Vec<TypeError> {
     analyze(module).0
@@ -454,6 +484,9 @@ struct Checker {
     enums: HashMap<String, EnumInfo>,
     /// Registered structs, keyed by type name (operator overloading, D-0047).
     structs: HashMap<String, StructInfo>,
+    /// Registered structural interfaces, keyed by name (D-0016). A struct is
+    /// assignable to an interface type iff it structurally conforms.
+    interfaces: HashMap<String, InterfaceInfo>,
     /// Declared `annotation` names -> their field names (D-0036). Used to
     /// validate `@Annotation(...)` applications (keyword args must name fields).
     annotations: HashMap<String, Vec<String>>,
@@ -576,6 +609,7 @@ impl Checker {
             user_types: HashSet::new(),
             enums: HashMap::new(),
             structs: HashMap::new(),
+            interfaces: HashMap::new(),
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
             scopes: Vec::new(),
@@ -679,8 +713,111 @@ impl Checker {
                     let info = self.struct_info_of(s);
                     self.structs.insert(s.name.clone(), info);
                 }
+                Item::Interface(i) => {
+                    let info = self.interface_info_of(i);
+                    self.interfaces.insert(i.name.clone(), info);
+                }
                 _ => {}
             }
+        }
+    }
+
+    /// Build an interface's [`InterfaceInfo`] (D-0016): resolve each declared
+    /// method signature, in declaration order. `self` is typed as the interface
+    /// itself; the remaining parameter and return types are resolved normally.
+    fn interface_info_of(&self, i: &InterfaceDef) -> InterfaceInfo {
+        let methods = i
+            .methods
+            .iter()
+            .map(|m| (m.name.clone(), self.sig_of_method_sig(m, &i.name)))
+            .collect();
+        InterfaceInfo { methods }
+    }
+
+    /// Resolve an interface [`MethodSig`] to a [`FnSig`] (its `self` typed as the
+    /// enclosing interface `iname`).
+    fn sig_of_method_sig(&self, m: &MethodSig, iname: &str) -> FnSig {
+        let params = m
+            .params
+            .iter()
+            .map(|p| {
+                let ty = if p.name == "self" {
+                    Ty::Named(iname.to_string())
+                } else {
+                    p.ty.as_ref()
+                        .map(|t| self.resolve_type_self(t, iname))
+                        .unwrap_or(Ty::Unknown)
+                };
+                ParamInfo {
+                    name: p.name.clone(),
+                    ty,
+                    has_default: false,
+                    variadic: p.variadic,
+                }
+            })
+            .collect();
+        let ret = m
+            .ret
+            .as_ref()
+            .map(|t| self.resolve_type_self(t, iname))
+            .unwrap_or(Ty::Unit);
+        FnSig { params, ret }
+    }
+
+    /// Is `name` a declared structural interface (D-0016)?
+    fn is_interface(&self, name: &str) -> bool {
+        self.interfaces.contains_key(name)
+    }
+
+    /// Does a value of type `from` satisfy where `to` is expected, allowing
+    /// structural interface conformance (D-0016) in addition to ordinary
+    /// [`assignable`] widening? A concrete struct conforms to an interface iff it
+    /// provides every interface method with a matching signature.
+    fn coercible(&self, from: &Ty, to: &Ty) -> bool {
+        if assignable(from, to) {
+            return true;
+        }
+        match (from, to) {
+            // A struct value used where an interface is expected: structural
+            // conformance (the concrete -> interface fat-pointer conversion,
+            // D-0016). A `value struct` behind an interface needs copy-to-heap
+            // boxing on conversion (I#75 Part 1) and is not supported yet, so it
+            // does not conform here.
+            (Ty::Named(s), Ty::Named(i)) if self.is_interface(i) => {
+                !self.is_value_struct(s) && self.conforms(s, i).is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    /// Check that struct `sname` structurally conforms to interface `iname`
+    /// (D-0016): every interface method is present with a matching signature
+    /// (parameter types excluding `self`, and return type). On failure, returns
+    /// the list of human-readable reasons (missing / mismatched methods) for a
+    /// precise diagnostic. A non-struct `sname` (e.g. not yet registered) simply
+    /// fails to conform.
+    fn conforms(&self, sname: &str, iname: &str) -> Result<(), Vec<String>> {
+        let Some(iface) = self.interfaces.get(iname) else {
+            return Err(vec![format!("'{iname}' is not an interface")]);
+        };
+        let Some(st) = self.structs.get(sname) else {
+            return Err(vec![format!("'{sname}' is not a struct")]);
+        };
+        let mut reasons = Vec::new();
+        for (mname, isig) in &iface.methods {
+            match st.methods.get(mname) {
+                None => reasons.push(format!("missing method '{mname}'")),
+                Some(msig) => {
+                    if !sigs_match(msig, isig) {
+                        reasons.push(format!("method '{mname}' has a mismatched signature"));
+                    }
+                }
+            }
+        }
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(reasons)
         }
     }
 
@@ -1497,7 +1634,7 @@ impl Checker {
                     None => self.declare(name, default_type(vt)),
                     Some(t) => {
                         let dt = self.resolve_type(t);
-                        if !assignable(&vt, &dt) {
+                        if !self.coercible(&vt, &dt) {
                             self.error(
                                 format!(
                                     "cannot assign value of type {} to {} {}",
@@ -1517,7 +1654,7 @@ impl Checker {
                 if let Expr::Name(n, span) = target {
                     match self.lookup(n) {
                         Some(dt) => {
-                            if !assignable(&vt, &dt) {
+                            if !self.coercible(&vt, &dt) {
                                 self.error(
                                     format!(
                                         "cannot assign value of type {} to {} of type {}",
@@ -1696,7 +1833,7 @@ impl Checker {
                 Some(e) => {
                     let vt = self.infer(e);
                     let ret = self.ret_ty.clone();
-                    if !assignable(&vt, &ret) {
+                    if !self.coercible(&vt, &ret) {
                         self.error(
                             format!(
                                 "return type mismatch: expected {}, found {}",
@@ -2955,6 +3092,33 @@ impl Checker {
                 }
             }
         }
+        // Dynamic dispatch on an interface-typed receiver (D-0016): resolve the
+        // method against the interface's declared set so the call is typed by its
+        // return type and a misspelled method is caught at compile time. Handled
+        // for a simple `name.method(...)` receiver (a binding or parameter), the
+        // form interface values take today.
+        if let Expr::Attr { base, name, span } = callee {
+            if let Expr::Name(bn, _) = base.as_ref() {
+                if let Some(Ty::Named(tn)) = self.lookup(bn) {
+                    if let Some(iface) = self.interfaces.get(&tn) {
+                        let ret = match iface.method(name) {
+                            Some(sig) => sig.ret.clone(),
+                            None => {
+                                self.error(
+                                    format!("interface '{tn}' has no method '{name}'"),
+                                    *span,
+                                );
+                                Ty::Unknown
+                            }
+                        };
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return ret;
+                    }
+                }
+            }
+        }
         // Method or other callable. A call through a Python handle (e.g.
         // `np.array(...)`, or a Python callable held in a variable) yields a
         // Python handle (D-0012); anything else is modeled loosely for now.
@@ -3003,7 +3167,7 @@ impl Checker {
                 None
             };
             if let Some(pt) = expected {
-                if !assignable(&at, &pt) {
+                if !self.coercible(&at, &pt) {
                     self.error(
                         format!(
                             "argument {} to '{}' has type {}, expected {}",
@@ -3023,7 +3187,7 @@ impl Checker {
             let at = self.infer(&a.value);
             match sig.params.iter().find(|p| p.name == name) {
                 Some(p) => {
-                    if !assignable(&at, &p.ty) {
+                    if !self.coercible(&at, &p.ty) {
                         self.error(
                             format!(
                                 "keyword argument '{}' to '{}' has type {}, expected {}",
@@ -3976,6 +4140,70 @@ mod tests {
             \x20   def tag(self) -> int64:\n        return 0\n",
         );
         assert!(m.contains("methods on enums"), "got:\n{m}");
+    }
+
+    // --- interfaces (ticket #84, D-0016) ---
+
+    const SHAPE_IFACE: &str =
+        "interface Shape:\n    def area(self) -> f64\n    def name(self) -> str\n\n\
+        struct Circle:\n    f64 r\n\
+        \x20   def area(self) -> f64:\n        return self.r\n\
+        \x20   def name(self) -> str:\n        return \"circle\"\n\n";
+
+    #[test]
+    fn struct_conforms_to_interface() {
+        // A struct whose method set matches the interface is assignable to the
+        // interface type (structural conformance, D-0016), and an interface
+        // method dispatches with its declared return type.
+        ok(&format!(
+            "{SHAPE_IFACE}def main():\n    Shape s = Circle(r=2.0)\n    f64 a = s.area()\n    print(a)\n    print(s.name())\n"
+        ));
+    }
+
+    #[test]
+    fn struct_missing_method_is_rejected() {
+        // A struct missing an interface method cannot be used where the interface
+        // is expected — the typo-class bug D-0016 catches at compile time.
+        let m = msgs(
+            "interface Shape:\n    def area(self) -> f64\n    def name(self) -> str\n\n\
+            struct Square:\n    f64 side\n\
+            \x20   def area(self) -> f64:\n        return self.side\n\n\
+            def main():\n    Shape s = Square(side=1.0)\n",
+        );
+        assert!(m.contains("Square") && m.contains("Shape"), "got:\n{m}");
+    }
+
+    #[test]
+    fn interface_method_typo_is_rejected() {
+        // Calling a method the interface does not declare is a compile error.
+        let m = msgs(&format!(
+            "{SHAPE_IFACE}def main():\n    Shape s = Circle(r=2.0)\n    print(s.aera())\n"
+        ));
+        assert!(m.contains("no method 'aera'"), "got:\n{m}");
+    }
+
+    #[test]
+    fn struct_passes_as_interface_argument() {
+        // A conforming struct is accepted where an interface-typed parameter is
+        // expected (a conversion site, D-0016).
+        ok(&format!(
+            "{SHAPE_IFACE}def describe(Shape s) -> f64:\n    return s.area()\n\n\
+            def main():\n    print(describe(Circle(r=1.0)))\n"
+        ));
+    }
+
+    #[test]
+    fn value_struct_behind_interface_is_rejected_for_now() {
+        // A `value struct` behind an interface needs copy-to-heap boxing on
+        // conversion (I#75 Part 1) and is not supported yet, so it does not
+        // conform even though its method set matches.
+        let m = msgs(
+            "interface Shape:\n    def area(self) -> f64\n\n\
+            value struct Vec2:\n    f64 x\n    f64 y\n\
+            \x20   def area(self) -> f64:\n        return self.x\n\n\
+            def main():\n    Shape s = Vec2(x=1.0, y=2.0)\n",
+        );
+        assert!(m.contains("Vec2") && m.contains("Shape"), "got:\n{m}");
     }
 
     // --- tuples (ticket #54, D-0049) ---
