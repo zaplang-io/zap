@@ -88,6 +88,19 @@ _Last updated: 2026-10-19_
   needs a parser accommodation before it can be written.
 - ⚪ **C FFI** (D-0012) — deferred; generalizes interop to all languages.
 - ⚪ **Precise GC** (Immix-style) replacing Boehm (D-0009).
+- ⚪ **Arena / region allocation** (à la Go's `GOEXPERIMENT=arenas`) — deferred.
+  The motivation is real (batch-free request-scoped garbage, cut GC tracing),
+  but Go has effectively frozen its own arena experiment because manual
+  `alloc`/`free` regions reintroduce use-after-free and fight the language's
+  safety promise — the same promise Zap makes. **Direction if we ever do it:**
+  never a manual `alloc`/`free` API. Bind the region to a *lexical block* —
+  reusing the structured-concurrency `scope:` block, or a dedicated
+  `region:`/`with arena:` block — so the region is freed deterministically at
+  block exit and the type system forbids references escaping the block (safe,
+  scoped bump-allocation, the safe cousin of Go's arena). This needs escape
+  analysis / lifetime checking, and the tradeoffs shift once precise GC
+  (Immix, D-0009) replaces conservative Boehm — so revisit **after** precise GC
+  lands, not before.
 - ⚪ **Array dtype promotion** rules for mixed-dtype ops (`i64 + f64`), and
   `uint8`/`bool` dtypes (`design/0002-arrays.md`).
 
