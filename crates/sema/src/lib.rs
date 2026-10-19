@@ -486,7 +486,41 @@ const BUILTIN_DECORATORS: &[&str] = &[
     "range",
     "deprecated",
     "inject",
+    // Test framework (D-0054, issue #73). These mark functions for `zap test`;
+    // normal builds strip the annotated functions, so they never reach codegen.
+    "test",
+    "before",
+    "after",
+    "before_all",
+    "after_all",
+    "parametrize",
+    "skip",
+    "skip_if",
+    "expect_raises",
 ];
+
+/// The `@test`-suite decorators (D-0054). A function carrying any of these is a
+/// test or a lifecycle hook: it is compiled only under `zap test` and excluded
+/// from release binaries.
+pub const TEST_DECORATORS: &[&str] = &[
+    "test",
+    "before",
+    "after",
+    "before_all",
+    "after_all",
+    "parametrize",
+    "skip",
+    "skip_if",
+    "expect_raises",
+];
+
+/// Does `f` carry any `@test`-suite decorator (so it belongs to the test
+/// harness, not a release binary)?
+pub fn is_test_item(f: &zapc_syntax::ast::Function) -> bool {
+    f.decorators
+        .iter()
+        .any(|d| TEST_DECORATORS.contains(&d.name.as_str()))
+}
 
 /// The traits `@derive(...)` can generate (D-0036). Only `Eq` and `Repr` are
 /// lowered to code in this increment; the rest are accepted here and reported as
@@ -1133,6 +1167,66 @@ impl Checker {
                     );
                 }
             }
+            // --- test framework (D-0054, issue #73) ---
+            "test" | "before" | "after" | "before_all" | "after_all" => {
+                self.require_target(d, target, DecoTarget::Function);
+                if !d.args.is_empty() {
+                    self.error(format!("@{} takes no arguments", d.name), d.span);
+                }
+            }
+            "skip" => {
+                self.require_target(d, target, DecoTarget::Function);
+                // Optional single positional reason string.
+                if d.args.len() > 1 || keywords != 0 {
+                    self.error(
+                        "@skip takes an optional reason string, e.g. @skip(\"flaky\")",
+                        d.span,
+                    );
+                }
+            }
+            "skip_if" => {
+                self.require_target(d, target, DecoTarget::Function);
+                // `@skip_if(cond [, reason])`: a runtime condition and an
+                // optional reason. The condition is evaluated in the harness, so
+                // it is not type-checked here.
+                if !(1..=2).contains(&positionals) || keywords != 0 {
+                    self.error(
+                        "@skip_if takes a condition and an optional reason, \
+                         e.g. @skip_if(slow, \"CI only\")",
+                        d.span,
+                    );
+                }
+            }
+            "expect_raises" => {
+                self.require_target(d, target, DecoTarget::Function);
+                // `@expect_raises(ErrType)`: exactly one positional naming the
+                // expected exception type. Typed matching is deferred (catch-all
+                // today), so the name is not resolved here.
+                if positionals != 1 || keywords != 0 {
+                    self.error(
+                        "@expect_raises takes one exception type, e.g. @expect_raises(ValueError)",
+                        d.span,
+                    );
+                }
+            }
+            "parametrize" => {
+                self.require_target(d, target, DecoTarget::Function);
+                // `@parametrize(cases=[...])`: a keyword `cases` list of case
+                // rows. Each row is spread across the test's parameters.
+                let has_cases = d.args.iter().any(|a| a.name.as_deref() == Some("cases"));
+                let only_cases = d.args.iter().all(|a| a.name.as_deref() == Some("cases"));
+                if !has_cases || !only_cases || d.args.len() != 1 {
+                    self.error(
+                        "@parametrize takes a single `cases` list, \
+                         e.g. @parametrize(cases=[(1, 2, 3), (4, 5, 9)])",
+                        d.span,
+                    );
+                } else if let Some(a) = d.args.first() {
+                    if !matches!(a.value, Expr::List(..)) {
+                        self.error("@parametrize(cases=...) expects a list of cases", d.span);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1542,6 +1636,15 @@ impl Checker {
                     }
                 }
             }
+            Stmt::Assert { cond, msg, .. } => {
+                // `assert cond [, msg]` (D-0054). The condition is inferred for
+                // its side effects / name resolution; the optional message is a
+                // normal expression (conventionally a str).
+                self.infer(cond);
+                if let Some(m) = msg {
+                    self.infer(m);
+                }
+            }
             Stmt::Try {
                 body,
                 excepts,
@@ -1566,7 +1669,13 @@ impl Checker {
             Stmt::With { items, body, .. } => {
                 self.push_scope();
                 for it in items {
-                    self.infer(&it.expr);
+                    // `with expect_raises(ErrType):` (D-0054) is the one supported
+                    // context manager: it names an exception type, not a value, so
+                    // its callee/argument are not inferred (which would flag them
+                    // as unknown names). Typed matching is deferred (D-0029).
+                    if !is_expect_raises(&it.expr) {
+                        self.infer(&it.expr);
+                    }
                     if let Some(a) = &it.alias {
                         self.declare(a, Ty::Unknown);
                     }
@@ -2948,6 +3057,12 @@ fn is_stop_iteration(e: &Expr) -> bool {
     }
 }
 
+/// `expect_raises(ErrType)` — the exception-assertion context manager (D-0054).
+fn is_expect_raises(e: &Expr) -> bool {
+    matches!(e, Expr::Call { callee, .. }
+        if matches!(callee.as_ref(), Expr::Name(n, _) if n == "expect_raises"))
+}
+
 /// `OnError.Cancel` / `OnError.Wait` — the typed `scope(on_error=...)` policy
 /// (D-0044). Recognized structurally: the `OnError` enum is a compiler-known
 /// policy in this increment (a real stdlib enum is a follow-up), so a misspelled
@@ -3022,6 +3137,33 @@ mod tests {
     #[test]
     fn fib_type_checks() {
         ok(include_str!("../../../tests/golden/fib.zap"));
+    }
+
+    #[test]
+    fn test_decorators_are_accepted() {
+        // The whole `@test` suite (D-0054) passes decorator validation.
+        ok("@test\ndef test_a():\n    assert True\n");
+        ok("@before\ndef setup():\n    print(1)\n");
+        ok("@after_all\ndef teardown():\n    print(1)\n");
+        ok("@test\n@skip(\"later\")\ndef test_s():\n    assert False\n");
+        ok("@test\n@skip_if(True, \"ci\")\ndef test_si():\n    assert False\n");
+        ok("@test\n@expect_raises(ValueError)\ndef test_r():\n    raise \"x\"\n");
+        ok("@test\n@parametrize(cases=[(1, 2)])\ndef test_p(int64 a, int64 b):\n    assert a < b\n");
+    }
+
+    #[test]
+    fn test_decorator_misuse_is_reported() {
+        // Wrong arity / shape produces a clear error (typo-catching, D-0016).
+        assert!(!errors("@test(1)\ndef t():\n    assert True\n").is_empty());
+        assert!(!errors("@expect_raises\ndef t():\n    assert True\n").is_empty());
+        assert!(!errors("@parametrize([1, 2])\ndef t():\n    assert True\n").is_empty());
+    }
+
+    #[test]
+    fn assert_and_expect_raises_check() {
+        ok("def main():\n    assert 1 == 1, \"ok\"\n");
+        ok("def boom():\n    raise \"x\"\n\
+            def main():\n    with expect_raises(ValueError):\n        boom()\n");
     }
 
     #[test]
