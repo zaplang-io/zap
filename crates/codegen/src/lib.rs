@@ -602,6 +602,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_spawn_detached", &[p.into(), p.into()], None);
         self.declare_rt("zap_checkpoint", &[], None);
         self.declare_rt("zap_g_uncaught", &[p.into()], None);
+        // Netpoller integration-test hook (ticket #80): runs the runtime's
+        // netpoller self-test and returns the number of sub-checks passed. No
+        // language I/O surface yet (sockets #79, signals #77). See `zaprt.c`.
+        self.declare_rt("zap_netpoll_selftest", &[], Some(i.into()));
         self.declare_rt("zap_chan_new", &[i.into()], Some(p.into()));
         self.declare_rt("zap_chan_send_i64", &[p.into(), i.into()], None);
         self.declare_rt("zap_chan_send_ptr", &[p.into(), p.into()], None);

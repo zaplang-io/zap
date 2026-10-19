@@ -3789,6 +3789,21 @@ impl<'a> FnLower<'a> {
                 self.throwing_call(None, "zap_checkpoint", vec![]);
                 return Ok((self.iconst(Ty::I32, 0), Ty::I32));
             }
+            // `__netpoll_selftest()` (ticket #80): internal netpoller
+            // integration-test hook; returns the number of sub-checks that
+            // passed. No arguments, no public I/O surface yet (sockets #79).
+            if fname == "__netpoll_selftest" {
+                if !args.is_empty() {
+                    return Err(err("__netpoll_selftest() takes no arguments"));
+                }
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_netpoll_selftest".to_string(),
+                    args: vec![],
+                });
+                return Ok((d, Ty::I64));
+            }
             if fname == "len" {
                 if args.len() != 1 {
                     return Err(err("len() takes exactly one argument"));

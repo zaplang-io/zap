@@ -163,6 +163,19 @@ void  zap_panic(void* exc);         // raise / built-in faults; triggers unwindi
 void* zap_eh_begin_catch(void* ue); // landing-pad entry: recover the exc object
 void  zap_eh_end_catch(void);       // balance a begin_catch when leaving a handler
 void  zap_uncaught(void* exc);      // top-level handler: report + exit non-zero
+
+// Netpoller (#80, design/0005 "Blocking syscalls"): non-blocking I/O readiness
+// for the M:N scheduler. A goroutine that would block on a not-yet-ready fd
+// registers it and PARKS its G (freeing its M to run other goroutines) instead
+// of blocking the OS thread; a poller thread re-queues the G on readiness. These
+// are the INTERNAL surface the stdlib calls — no language I/O exists yet
+// (sockets #79, signals #77). `mode` is 1=read / 2=write; `wait` returns
+// 0=ready / 1=timeout / 2=closed. `deadline_ns` is absolute CLOCK_MONOTONIC
+// nanoseconds (0 = none). Edge-triggered: callers drain to EAGAIN.
+void*   zap_netpoll_open(int64_t fd);                     // register fd; NULL if unsupported
+int64_t zap_netpoll_wait(void* pd, int64_t mode, int64_t deadline_ns); // park until ready/deadline
+void    zap_netpoll_wake(void* pd, int64_t mode);         // force-wake a parked waiter (#77 hook)
+void    zap_netpoll_close(void* pd);                      // deregister + release
 ```
 
 The first exceptions increment (#22) lands `raise`, `try`/`except`/`finally`,

@@ -472,6 +472,10 @@ const BUILTINS: &[&str] = &[
     "reflect_has",
     "reflect_names",
     "checkpoint",
+    // Internal netpoller integration-test hook (ticket #80). No public I/O
+    // surface exists yet (sockets #79, signals #77), so this drives the
+    // netpoller end-to-end from the runtime; removed/replaced when #79 lands.
+    "__netpoll_selftest",
 ];
 
 /// The curated built-in decorator set shipped in v1 (D-0036,
@@ -2683,6 +2687,15 @@ impl Checker {
                         self.error("checkpoint() takes no arguments".to_string(), span);
                     }
                     return Ty::Unit;
+                }
+                // `__netpoll_selftest()` (ticket #80): runs the netpoller
+                // integration self-test and returns the number of sub-checks
+                // that passed. Internal; takes no arguments.
+                "__netpoll_selftest" => {
+                    if !args.is_empty() {
+                        self.error("__netpoll_selftest() takes no arguments".to_string(), span);
+                    }
+                    return Ty::Int64;
                 }
                 _ => {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
