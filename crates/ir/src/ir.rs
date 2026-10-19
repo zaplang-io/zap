@@ -114,6 +114,12 @@ pub enum Ty {
     /// A pointer to a `set` object with the given element representation. Elements
     /// are hashed/compared like dict keys, so they use [`Elem::key_suffix`].
     Set(Elem),
+    /// A pointer to a `heap` object (D-0057): a binary min-heap priority queue
+    /// over the given element representation. Elements are *ordered* (not hashed),
+    /// so the element kind selects the `_i64` / `_ptr` runtime entry point and the
+    /// runtime compares `i64` words numerically and pointer words as `ZapStr`
+    /// bytes.
+    Heap(Elem),
     /// A pointer to a numeric `array` object with the given element dtype
     /// (ticket #24).
     Array(Dtype),
@@ -430,6 +436,7 @@ impl fmt::Display for Ty {
             Ty::List(e) => return write!(f, "list[{}]", e.val_suffix()),
             Ty::Dict(k, v) => return write!(f, "dict[{}, {}]", k.key_suffix(), v.val_suffix()),
             Ty::Set(e) => return write!(f, "set[{}]", e.key_suffix()),
+            Ty::Heap(e) => return write!(f, "heap[{}]", e.val_suffix()),
             Ty::Array(d) => return write!(f, "array[{}]", d.suffix()),
             Ty::Chan(e) => return write!(f, "chan[{}]", e.val_suffix()),
         };

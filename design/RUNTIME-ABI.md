@@ -100,6 +100,20 @@ struct Point { f64 x; f64 y }  ->  [ header(8) | x: f64(8) | y: f64(8) ]  = 24 b
   the struct-element-hashing unblock deferred in D-0043.
 - `array[T]` (#24): `[ header | dtype | ndim | dims: *i64 | strides: *i64 |
   data: *T ]`, contiguous row-major; views share `data`.
+- `heap[T]` (#76, D-0057): a binary min-heap priority queue — `[ header | len:
+  i64 | cap: i64 | data: *T | kind | dir ]`, a complete binary tree over a
+  growable element-word array (amortized-doubling growth). `kind` selects the
+  element word representation (`0` = `i64`, `1` = `str`), picking the typed
+  `zap_heap_{push,pop,peek}_{i64,ptr}` entry point; `dir` selects the ordering
+  (`0` = min, `1` = max). Elements are **ordered, not hashed**: `i64` words
+  compare numerically, `str` pointer words by `ZapStr` bytes (`zap_str_cmp`).
+  `push` sifts up, `pop` removes the root and sifts down, `peek` reads the root
+  (all O(log n)); `zap_heap_new(kind, dir)` constructs, `zap_heap_len` is the
+  count, and `zap_heap_items` snapshots the elements into a `list[T]` in
+  priority (root-first) order for non-destructive iteration. The comparator
+  surface is `heap[T](cmp="min"|"max")`; user-struct elements ordered via a
+  comparator / `__cmp__` function pointer, float elements, and an arbitrary
+  `cmp=` comparator function are clean follow-ups.
 
 ### Calling convention
 

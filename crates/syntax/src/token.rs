@@ -194,6 +194,7 @@ pub enum Keyword {
     List,
     Dict,
     Set,
+    Heap,
     Array,
 }
 
@@ -260,6 +261,7 @@ impl Keyword {
             "list" => List,
             "dict" => Dict,
             "set" => Set,
+            "heap" => Heap,
             "array" => Array,
             _ => return Option::None,
         })
@@ -327,6 +329,7 @@ impl Keyword {
             List => "list",
             Dict => "dict",
             Set => "set",
+            Heap => "heap",
             Array => "array",
         }
     }
@@ -353,6 +356,7 @@ impl Keyword {
                 | List
                 | Dict
                 | Set
+                | Heap
                 | Array
                 | Channel
         )

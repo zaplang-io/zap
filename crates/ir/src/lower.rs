@@ -507,6 +507,13 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                 };
                 Ok(Ty::Set(e))
             }
+            "heap" => {
+                let e = match args.first() {
+                    Some(a) => heap_elem_of(a, env)?,
+                    None => Elem::I64,
+                };
+                Ok(Ty::Heap(e))
+            }
             "channel" => {
                 // A channel's element uses the same uniform-word representation
                 // as a collection element (ticket #25, D-0031): the element kind
@@ -551,6 +558,33 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
 /// source type.
 fn elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
     elem_kind(resolve_ty(t, env)?)
+}
+
+/// The element kind of a `heap[T]` element type (D-0057). A heap orders its
+/// elements, so — unlike a general collection — only the *comparable* element
+/// kinds are supported in this increment: integers/bools/chars (compared as
+/// signed `i64`) and strings (compared by `ZapStr` bytes). User-struct elements
+/// (ordered via a comparator / `__cmp__`) and floats are a clean follow-up.
+fn heap_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
+    match resolve_ty(t, env)? {
+        Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
+        Ty::Ptr => Ok(Elem::Ptr),
+        other => Err(err(format!(
+            "heap[{other}] is not supported yet (only integer and str elements)"
+        ))),
+    }
+}
+
+/// The heap element kind named by a construction subscript like `heap[int64]`,
+/// where the element type appears as a bare name in expression position.
+fn heap_elem_from_name(name: &str) -> Result<Elem, LowerError> {
+    match name {
+        "int64" | "i64" | "int32" | "i32" | "bool" | "char" => Ok(Elem::I64),
+        "str" => Ok(Elem::Ptr),
+        other => Err(err(format!(
+            "heap[{other}] is not supported yet (only integer and str elements)"
+        ))),
+    }
 }
 
 /// The array dtype for a `array[T]` element type (ticket #24). Only `f64` and
@@ -607,6 +641,7 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
         | Ty::List(_)
         | Ty::Dict(..)
         | Ty::Set(_)
+        | Ty::Heap(_)
         | Ty::Array(_)
         | Ty::Chan(_)
         | Ty::Match
@@ -2461,6 +2496,18 @@ impl<'a> FnLower<'a> {
                 });
                 self.iterate_list(items, elem, body)
             }
+            Ty::Heap(elem) => {
+                // Iteration yields elements in priority (min-first) order without
+                // draining the heap: `zap_heap_items` returns a sorted snapshot
+                // list, which the list iterator then walks (D-0057).
+                let items = self.new_value(Ty::List(elem));
+                self.emit(Inst::Call {
+                    dest: Some(items),
+                    func: "zap_heap_items".to_string(),
+                    args: vec![val],
+                });
+                self.iterate_list(items, elem, body)
+            }
             Ty::Struct(sid) => self.drive_iteration(val, sid, body),
             other => Err(err(format!(
                 "value of type {other:?} is not iterable (D-0048)"
@@ -2739,6 +2786,9 @@ impl<'a> FnLower<'a> {
                 if let Ty::Set(elem) = lty {
                     return self.lower_for_set(target, lst, elem, body);
                 }
+                if let Ty::Heap(elem) = lty {
+                    return self.lower_for_heap(target, lst, elem, body);
+                }
                 // `for x in <user iterable>` — the general D-0048 protocol.
                 if let Ty::Struct(sid) = lty {
                     let name = match target {
@@ -2926,6 +2976,25 @@ impl<'a> FnLower<'a> {
             dest: Some(items),
             func: "zap_set_items".to_string(),
             args: vec![set_val],
+        });
+        self.lower_for_list(target, items, elem, body)
+    }
+
+    /// `for x in <heap>` (D-0057): snapshot the heap into a list in priority
+    /// (root-first) order via `zap_heap_items`, then iterate that list. The
+    /// snapshot leaves the live heap untouched.
+    fn lower_for_heap(
+        &mut self,
+        target: &Expr,
+        heap_val: Value,
+        elem: Elem,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let items = self.new_value(Ty::List(elem));
+        self.emit(Inst::Call {
+            dest: Some(items),
+            func: "zap_heap_items".to_string(),
+            args: vec![heap_val],
         });
         self.lower_for_list(target, items, elem, body)
     }
@@ -3178,6 +3247,9 @@ impl<'a> FnLower<'a> {
             if is_name(base, "channel") {
                 return self.lower_chan_new(index, args);
             }
+            if is_name(base, "heap") {
+                return self.lower_heap_new(index, args);
+            }
         }
         if let Expr::Name(fname, _) = callee {
             if fname == "sum" {
@@ -3253,9 +3325,10 @@ impl<'a> FnLower<'a> {
                     Ty::List(_) => "zap_list_len",
                     Ty::Dict(..) => "zap_dict_len",
                     Ty::Set(_) => "zap_set_len",
+                    Ty::Heap(_) => "zap_heap_len",
                     Ty::Array(_) => "zap_array_len",
                     Ty::Ptr => "zap_str_len",
-                    _ => return Err(err("len() expects a list, dict, set, array, or str")),
+                    _ => return Err(err("len() expects a list, dict, set, heap, array, or str")),
                 };
                 let d = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
@@ -3363,6 +3436,9 @@ impl<'a> FnLower<'a> {
             }
             if let Ty::Set(elem) = bty {
                 return self.lower_set_method(recv, elem, name, args);
+            }
+            if let Ty::Heap(elem) = bty {
+                return self.lower_heap_method(recv, elem, name, args);
             }
             if bty == Ty::Match {
                 return self.lower_match_method(recv, name, args);
@@ -4015,6 +4091,122 @@ impl<'a> FnLower<'a> {
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
             other => Err(err(format!("set has no method '{other}' (supported: add)"))),
+        }
+    }
+
+    /// Lower `heap[T]()` / `heap[T](cmp="max")` (D-0057). The element kind is the
+    /// subscript; the only argument is the keyword `cmp` selecting direction
+    /// (`"min"` is the default min-heap, `"max"` a max-heap). Lowers to a
+    /// `zap_heap_new(kind, dir)` runtime call where `kind` picks the element word
+    /// representation (0 = i64, 1 = str) and `dir` the ordering (0 = min, 1 = max).
+    fn lower_heap_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let Expr::Name(ename, _) = elem_expr else {
+            return Err(err(
+                "heap[...] expects an element type name, e.g. heap[int64]",
+            ));
+        };
+        let elem = heap_elem_from_name(ename)?;
+        let mut dir = 0i64; // 0 = min-heap (default), 1 = max-heap
+        for a in args {
+            match a.name.as_deref() {
+                Some("cmp") => {
+                    let Expr::Str { value, .. } = &a.value else {
+                        return Err(err(
+                            "heap cmp must be a string literal (\"min\" or \"max\")",
+                        ));
+                    };
+                    dir = match value.as_str() {
+                        "min" => 0,
+                        "max" => 1,
+                        other => {
+                            return Err(err(format!(
+                                "heap cmp must be \"min\" or \"max\", found \"{other}\""
+                            )))
+                        }
+                    };
+                }
+                Some(other) => {
+                    return Err(err(format!(
+                        "heap[T](...) has no keyword argument '{other}' (only 'cmp')"
+                    )))
+                }
+                None => {
+                    return Err(err(
+                        "heap[T](...) takes only the keyword argument 'cmp' (e.g. cmp=\"max\")",
+                    ))
+                }
+            }
+        }
+        let kind = self.iconst(Ty::I64, if elem == Elem::I64 { 0 } else { 1 });
+        let d = self.iconst(Ty::I64, dir);
+        let h = self.new_value(Ty::Heap(elem));
+        self.emit(Inst::Call {
+            dest: Some(h),
+            func: "zap_heap_new".to_string(),
+            args: vec![kind, d],
+        });
+        Ok((h, Ty::Heap(elem)))
+    }
+
+    /// Lower a heap method call (D-0057): `push(v)`, `pop()`, `peek()`. Each maps
+    /// to the element-kind-suffixed runtime entry point. `pop`/`peek` return the
+    /// element and abort at runtime on an empty heap (no exception path yet, like
+    /// an out-of-range list index).
+    fn lower_heap_method(
+        &mut self,
+        recv: Value,
+        elem: Elem,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        match name {
+            "push" => {
+                if args.len() != 1 {
+                    return Err(err("push() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if elem_kind(vt)? != elem {
+                    return Err(err("push() value has the wrong element type"));
+                }
+                let v = self.coerce(v, vt, elem.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_heap_push_{}", elem.val_suffix()),
+                    args: vec![recv, v],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            "pop" => {
+                if !args.is_empty() {
+                    return Err(err("pop() takes no arguments"));
+                }
+                let d = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_heap_pop_{}", elem.val_suffix()),
+                    args: vec![recv],
+                });
+                Ok((d, elem.ty()))
+            }
+            "peek" => {
+                if !args.is_empty() {
+                    return Err(err("peek() takes no arguments"));
+                }
+                let d = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: format!("zap_heap_peek_{}", elem.val_suffix()),
+                    args: vec![recv],
+                });
+                Ok((d, elem.ty()))
+            }
+            other => Err(err(format!(
+                "heap has no method '{other}' (supported: push, pop, peek)"
+            ))),
         }
     }
 
