@@ -16,6 +16,10 @@
 //!    (`zap_code_graph`).
 //! 4. **Targeted testing** ([`test`]) — run tests on changed/affected paths,
 //!    returning structured results (`zap_test`).
+//! 5. **Repo/org conventions** ([`conventions`]) — an organization-authored
+//!    conventions file checked into the repo, discovered at runtime and served
+//!    as a resource and via the `conventions` tool, so an agent writes code in
+//!    *this repo's* house style (issue #108).
 //!
 //! **No external dependencies**: the toolchain ships none beyond LLVM, so the
 //! JSON layer ([`json`]) and the JSON-RPC/MCP protocol here are hand-rolled,
@@ -28,6 +32,7 @@
 //! `BufRead`/`Write` pair — so adding one later is mechanical.
 
 pub mod check;
+pub mod conventions;
 pub mod graph;
 pub mod json;
 pub mod reference;
@@ -131,7 +136,7 @@ impl Server {
             "ping" => Ok(Json::obj(vec![])),
             "tools/list" => Ok(self.tools_list()),
             "tools/call" => self.tools_call(params),
-            "resources/list" => Ok(Json::obj(vec![("resources", reference::resources_json())])),
+            "resources/list" => Ok(Json::obj(vec![("resources", self.resources_list())])),
             "resources/read" => self.resources_read(params),
             "prompts/list" => Ok(Json::obj(vec![("prompts", Json::Arr(vec![]))])),
             // Notifications we accept silently.
@@ -171,7 +176,12 @@ impl Server {
                     "Zap's agent interface. Use zap_reference for the language \
                      spec/grammar/examples, zap_check to parse+type-check code \
                      without a build, zap_code_graph for a token-efficient map \
-                     of the project, and zap_test to run targeted tests.",
+                     of the project, and zap_test to run targeted tests. \
+                     Before writing or editing code in this repository, call \
+                     the `conventions` tool (or read the zap://conventions \
+                     resource) to follow the organization's house coding \
+                     practices; when no conventions file is present it says so \
+                     and you may proceed with idiomatic Zap.",
                 ),
             ),
         ])
@@ -193,9 +203,23 @@ impl Server {
             "zap_check" => self.tool_check(&args),
             "zap_code_graph" => self.tool_code_graph(&args),
             "zap_test" => self.tool_test(&args),
+            "conventions" => self.tool_conventions(&args),
             other => return Err((-32602, format!("unknown tool: {other}"))),
         };
         Ok(result.into_json())
+    }
+
+    /// The `resources/list` array: the embedded language reference plus, when
+    /// present, this repo's conventions file (discovered under the root).
+    fn resources_list(&self) -> Json {
+        let mut resources = match reference::resources_json() {
+            Json::Arr(v) => v,
+            other => vec![other],
+        };
+        if let Some(c) = conventions::discover(&self.root) {
+            resources.push(c.resource_descriptor());
+        }
+        Json::Arr(resources)
     }
 
     fn resources_read(&self, params: &Json) -> Result<Json, (i64, String)> {
@@ -203,16 +227,18 @@ impl Server {
             .get("uri")
             .and_then(Json::as_str)
             .ok_or((-32602, "missing resource uri".to_string()))?;
+
+        // The conventions resource is repo-specific (resolved under the root),
+        // so it is handled here rather than via the embedded reference catalog.
+        if uri == conventions::URI {
+            let c = conventions::discover(&self.root)
+                .ok_or((-32002, conventions::absent_message()))?;
+            return Ok(contents(conventions::URI, conventions::MIME, c.body));
+        }
+
         let doc =
             reference::find_by_uri(uri).ok_or((-32602, format!("no such resource: {uri}")))?;
-        Ok(Json::obj(vec![(
-            "contents",
-            Json::Arr(vec![Json::obj(vec![
-                ("uri", Json::str(doc.uri())),
-                ("mimeType", Json::str(doc.mime)),
-                ("text", Json::str(doc.body)),
-            ])]),
-        )]))
+        Ok(contents(&doc.uri(), doc.mime, doc.body.to_string()))
     }
 
     // ---- tool implementations ------------------------------------------------
@@ -285,6 +311,16 @@ impl Server {
             paths.push(f.to_string());
         }
         test::run(&self.root, &paths)
+    }
+
+    /// Serve this repository's coding conventions (issue #108). Returns the
+    /// file's markdown body, or a graceful "no conventions file present"
+    /// message (not an error) so absence never breaks an agent loop.
+    fn tool_conventions(&self, _args: &Json) -> ToolOutcome {
+        match conventions::discover(&self.root) {
+            Some(c) => ToolOutcome::ok_text(c.body),
+            None => ToolOutcome::ok_text(conventions::absent_message()),
+        }
     }
 }
 
@@ -449,7 +485,34 @@ fn tool_defs() -> Vec<Json> {
                 ),
             ),
         ]),
+        Json::obj(vec![
+            ("name", Json::str("conventions")),
+            (
+                "description",
+                Json::str(
+                    "Fetch THIS repository's organization-authored coding \
+                     conventions (naming, error handling, preferred modules, \
+                     layering, testing, do's and don'ts) as markdown. Consult \
+                     it BEFORE writing or editing code so your output matches \
+                     the repo's house style. Takes no arguments. If no \
+                     conventions file is present it says so (not an error).",
+                ),
+            ),
+            ("inputSchema", schema(vec![], vec![])),
+        ]),
     ]
+}
+
+/// Build a `resources/read` result: `{ contents: [{ uri, mimeType, text }] }`.
+fn contents(uri: &str, mime: &str, text: String) -> Json {
+    Json::obj(vec![(
+        "contents",
+        Json::Arr(vec![Json::obj(vec![
+            ("uri", Json::str(uri)),
+            ("mimeType", Json::str(mime)),
+            ("text", Json::str(text)),
+        ])]),
+    )])
 }
 
 /// Build a JSON-RPC success response envelope.
@@ -557,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_all_four_surfaces() {
+    fn tools_list_has_all_surfaces() {
         let resp = call(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
         let tools = resp
             .get("result")
@@ -570,9 +633,33 @@ mod tests {
             .iter()
             .filter_map(|t| t.get("name")?.as_str())
             .collect();
-        for want in ["zap_reference", "zap_check", "zap_code_graph", "zap_test"] {
+        for want in [
+            "zap_reference",
+            "zap_check",
+            "zap_code_graph",
+            "zap_test",
+            "conventions",
+        ] {
             assert!(names.contains(&want), "missing tool {want}");
         }
+    }
+
+    #[test]
+    fn initialize_instructions_advertise_conventions() {
+        let resp = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
+        );
+        let instructions = resp
+            .get("result")
+            .unwrap()
+            .get("instructions")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            instructions.contains("conventions"),
+            "instructions must tell agents to consult conventions: {instructions}"
+        );
     }
 
     #[test]
@@ -666,6 +753,155 @@ mod tests {
         assert_eq!(lines.len(), 2, "got: {text}");
         assert!(lines[0].contains("serverInfo"));
         assert!(lines[1].contains("\"id\":2"));
+    }
+
+    /// A unique temp directory to act as a server root.
+    fn tmproot() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "zap-mcp-conv-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// Drive one request line through a server rooted at `s`.
+    fn call_on(s: &Server, line: &str) -> Json {
+        let resp = s.handle_line(line).expect("expected a response");
+        json::parse(&resp).expect("response must be valid JSON")
+    }
+
+    #[test]
+    fn conventions_tool_serves_file_when_present() {
+        let root = tmproot();
+        std::fs::write(
+            root.join(conventions::DEFAULT_NAME),
+            "# House style\nUse the `errors` Result helper, never panic in library code.\n",
+        )
+        .unwrap();
+        let s = Server::new(root.clone());
+        let resp = call_on(
+            &s,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"conventions","arguments":{}}}"#,
+        );
+        let text = first_text(&resp);
+        assert!(text.contains("Result helper"), "got: {text}");
+        assert_eq!(
+            resp.get("result").unwrap().get("isError"),
+            Some(&Json::Bool(false))
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn conventions_tool_degrades_gracefully_when_absent() {
+        let root = tmproot();
+        let s = Server::new(root.clone());
+        let resp = call_on(
+            &s,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"conventions","arguments":{}}}"#,
+        );
+        let text = first_text(&resp);
+        assert!(text.contains("No conventions file present"), "got: {text}");
+        // Absence is not an error — the surface degrades gracefully.
+        assert_eq!(
+            resp.get("result").unwrap().get("isError"),
+            Some(&Json::Bool(false))
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn conventions_resource_listed_and_readable_when_present() {
+        let root = tmproot();
+        std::fs::write(
+            root.join(conventions::DEFAULT_NAME),
+            "# Conventions\nPrefer snake_case module names.\n",
+        )
+        .unwrap();
+        let s = Server::new(root.clone());
+
+        // Listed alongside the reference resources.
+        let list = call_on(&s, r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#);
+        let resources = list
+            .get("result")
+            .unwrap()
+            .get("resources")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(
+            resources
+                .iter()
+                .any(|r| r.get("uri").and_then(|u| u.as_str()) == Some(conventions::URI)),
+            "conventions resource must be listed"
+        );
+
+        // Readable by URI.
+        let read = call_on(
+            &s,
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"zap://conventions"}}"#,
+        );
+        let contents = read
+            .get("result")
+            .unwrap()
+            .get("contents")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(contents[0]
+            .get("text")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("snake_case"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn conventions_resource_absent_when_no_file() {
+        let root = tmproot();
+        let s = Server::new(root.clone());
+        let list = call_on(&s, r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#);
+        let resources = list
+            .get("result")
+            .unwrap()
+            .get("resources")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(
+            !resources
+                .iter()
+                .any(|r| r.get("uri").and_then(|u| u.as_str()) == Some(conventions::URI)),
+            "conventions resource must not be listed when no file is present"
+        );
+        // Reading it is a JSON-RPC error (nothing to serve).
+        let read = call_on(
+            &s,
+            r#"{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"zap://conventions"}}"#,
+        );
+        assert!(read.get("error").is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn conventions_tool_truncates_a_large_file() {
+        let root = tmproot();
+        let big = "x".repeat(conventions::SIZE_CAP + 5_000);
+        std::fs::write(root.join(conventions::DEFAULT_NAME), &big).unwrap();
+        let s = Server::new(root.clone());
+        let resp = call_on(
+            &s,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"conventions","arguments":{}}}"#,
+        );
+        let text = first_text(&resp);
+        assert!(text.contains("conventions truncated"), "expected truncation notice");
+        assert!(text.len() < big.len(), "served body must be smaller than the file");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn first_text(resp: &Json) -> String {
