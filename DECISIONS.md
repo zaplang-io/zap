@@ -128,12 +128,12 @@ grammar reserves generic syntax from the start so adding user generics later is
 additive, not a breaking change.
 
 ## D-0018 — Enums: tier 1 now; sum types later
-**Status:** Locked (tier 1) / Open (tier 3)
+**Status:** Locked (tier 1) — tier 3 now locked by D-0046
 **Tier 1 now:** named-constant enums — a distinct type backed by int, optional
 explicit values, `.name`, iterable (`enum Color: RED, GREEN, BLUE`).
-**Deferred:** data-carrying variants (Rust-style sum types) + a `match`
-statement — high value (state machines, AST nodes) but a later decision. See
-OPEN-QUESTIONS.
+**Tier 3 (data-carrying variants / Rust-style sum types) + `match` destructuring**
+are now locked in **D-0046** (the `match` statement itself was locked earlier in
+D-0040).
 
 ## D-0019 — Numeric types: all signed; bigint, complex, tuples
 **Status:** Locked
@@ -443,3 +443,50 @@ interacts with the exception hierarchy (**D-0029**): `ExceptionGroup` is defined
 there, and `Cancelled` (D-0044), sitting outside `Exception`, is grouped
 separately from ordinary failures. **Rationale:** losing concurrent failures
 hides bugs; the Python-aligned aggregate matches our target users' mental model.
+
+## D-0046 — Data-carrying enum variants (tier-3 sum types)
+**Status:** Locked — resolves the tier-3 half left open by D-0018
+Rust-style sum types, resolving issue #51 and finalizing `design/0006`.
+
+**Declaration** extends the `enum` block with variants that carry **type-first,
+named payload fields**; payload-free variants are allowed, and an enum may be
+generic:
+```python
+enum Shape:
+    Circle(f64 r)
+    Rect(f64 w, f64 h)
+    Unit
+```
+
+**Representation is per-enum, value-first (performance).** An enum with any
+data-carrying variant is a **tagged value** `[ tag | payload-union ]` sized to
+the largest variant, copied **by value** (D-0023) like a scalar — *not*
+heap-boxed by default. The compiler inserts a **GC pointer only where needed**:
+a field whose type is (mutually) **recursive** (to break the cycle — e.g. an AST
+`Add(Expr l, Expr r)`) or whose payload is oversized. An all-bare-constant enum
+stays the **tier-1 unboxed integer**. The two representations do **not mix**
+within one enum: any payload-carrying variant makes the whole enum a tagged
+value. (An unboxed small-enum/niche optimization beyond this is a later
+follow-up.)
+
+**Construction is qualified**, accepting named *or* positional args, like struct
+construction: `Shape.Circle(r=3.0)` or `Shape.Circle(3.0)`.
+
+**Pattern matching** reuses the D-0040 struct-pattern form on a qualified
+variant, binding fields **positionally or by name** at the developer's choice:
+`case Shape.Circle(r):` or `case Shape.Circle(r=r):`. Exhaustiveness checking
+(D-0040) extends to variant coverage.
+
+**Generics:** generic enums (`enum Option[T]: Some(T v); None`) are **reserved in
+the grammar now** and implemented by monomorphization **when user generics land**
+(D-0017 staging); non-generic data-carrying enums ship first. Shipping stdlib
+`Option[T]`/`Result[T, E]` rides on that.
+
+**Methods on enums** (a `def` with `self` in the enum block, like structs
+D-0015) are **allowed** (dispatch via `match` internally), and may be staged
+after the core.
+
+**Rationale:** value-first representation serves the performance goal while
+pointer-on-recursion keeps the motivating AST/tree types expressible; reusing the
+`match` and struct-construction surfaces means no new syntax families, and
+qualified variants keep exhaustiveness and name-collision handling clean.

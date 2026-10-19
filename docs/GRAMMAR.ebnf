@@ -1,5 +1,5 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0041.
+   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0046.
 
    Notation:
      ::=        definition
@@ -57,8 +57,16 @@ interface_def ::= "interface" IDENT [ generics ] ":" NEWLINE
                   INDENT { method_sig } DEDENT ;
 method_sig    ::= "def" IDENT "(" [ param_list ] ")" [ "->" type ] NEWLINE ;
 
-enum_def      ::= decorators "enum" IDENT ":" NEWLINE
-                  INDENT { IDENT [ "=" expr ] NEWLINE } DEDENT ;
+enum_def      ::= decorators "enum" IDENT [ generics ] ":" NEWLINE
+                  INDENT { enum_member | function } DEDENT ;
+                  (* tier-1 (all bare constants) -> unboxed int; a data-carrying
+                     variant makes the whole enum a tagged value (D-0018/D-0046).
+                     `function` = methods on the enum (D-0046); [ generics ] is
+                     reserved now, monomorphized when user generics land. *)
+enum_member   ::= IDENT [ "=" expr ] NEWLINE                 (* tier-1 constant *)
+                | IDENT "(" variant_field { "," variant_field } ")" NEWLINE ;
+                  (* tier-3 data-carrying variant; D-0046 *)
+variant_field ::= type IDENT ;                               (* type-first, named *)
 
 annotation_def ::= "annotation" IDENT ":" NEWLINE
                   INDENT { field } DEDENT ;
@@ -93,7 +101,7 @@ simple_stmt   ::= decl
                 | subst_assign
                 | "return" [ expr ]
                 | "raise" [ expr ]
-                | "spawn" call_expr
+                | "spawn" [ "detached" ] call_expr   (* "detached": D-0044 *)
                 | "break"
                 | "continue"
                 | expr ;                       (* ";" may join simple stmts *)
@@ -112,7 +120,8 @@ compound_stmt ::= if_stmt
                 | for_stmt
                 | match_stmt
                 | try_stmt
-                | with_stmt ;
+                | with_stmt
+                | scope_stmt ;
 
 if_stmt       ::= "if" expr block
                   { "elif" expr block }
@@ -131,6 +140,13 @@ try_stmt      ::= "try" block
 with_stmt     ::= "with" with_item { "," with_item } block ;  (* D-0027 *)
 with_item     ::= expr [ "as" IDENT ] ;
 
+(* ---------- Structured concurrency (D-0044) ---------- *)
+
+scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
+                  (* options are keyword args: timeout=<dur>, on_error=OnError.Cancel|Wait.
+                     Owns every `spawn` lexically inside; joins/cancels at the dedent.
+                     `spawn detached` (see simple_stmt) opts out of all scope ownership. *)
+
 (* ---------- Pattern matching (D-0040) ---------- *)
 
 match_stmt    ::= "match" expr ":" NEWLINE INDENT { case_clause } DEDENT ;
@@ -141,11 +157,14 @@ or_pattern    ::= closed_pattern { "|" closed_pattern } ;
 closed_pattern ::= "_"
                 | literal
                 | IDENT                          (* capture *)
-                | dotted_name "(" [ field_pat { "," field_pat } ] ")"
+                | dotted_name "(" [ pat_arg { "," pat_arg } ] ")"
                 | "[" [ seq_pat { "," seq_pat } ] "]"
                 | "(" [ pattern { "," pattern } ] ")" ;
 seq_pat       ::= "*" [ IDENT ] | pattern ;
-field_pat     ::= IDENT "=" pattern ;
+pat_arg       ::= IDENT "=" pattern                (* by field name *)
+                | pattern ;                        (* positional, decl order; D-0046 *)
+                  (* struct- and enum-variant patterns bind fields positionally
+                     or by name, developer's choice (D-0040/D-0046). *)
 
 (* ---------- Expressions (lowest to highest precedence) ---------- *)
 

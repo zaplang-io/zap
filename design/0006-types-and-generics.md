@@ -344,41 +344,57 @@ match c:
 Qualified names (`Color.RED`) match that constant; a bare name would
 capture-and-bind (D-0040), so enum members are always matched qualified.
 
-#### 3.3 Path to tier 3 — data-carrying variants (deferred)
+#### 3.3 Tier 3 — data-carrying variants (locked, D-0046)
 
-Data-carrying variants (Rust-style sum types) remain deferred (D-0018,
-OPEN-QUESTIONS) but this design fixes the intended path so tier 1 does not
-foreclose it:
+Rust-style sum types are **locked** (D-0046, resolving the tier-3 half of
+D-0018; issue #51). A variant may carry **type-first, named payload fields**;
+payload-free variants are allowed, and an enum may be generic:
 
 ```python
-# FUTURE (tier 3) — illustrative, not yet accepted:
 enum Shape:
     Circle(f64 r)
     Rect(f64 w, f64 h)
-    Unit                       # payload-free variant, as today
+    Unit                       # payload-free variant, as in tier 1
+
+auto sh = Shape.Circle(r=2.0)  # qualified construction; named OR positional:
+auto s2 = Shape.Rect(3.0, 4.0) #   Shape.Rect(w=3.0, h=4.0) is equivalent
 
 match sh:
-    case Circle(r):   area = 3.14159 * r * r
-    case Rect(w, h):  area = w * h
-    case Unit:        area = 1.0
+    case Shape.Circle(r):      area = 3.14159 * r * r   # positional binding
+    case Shape.Rect(w=w, h=h): area = w * h             # named binding
+    case Shape.Unit:           area = 1.0
+    # exhaustive: all variants covered, no `_` needed
 ```
 
-- A data-carrying enum becomes a **tagged union / reference type**:
-  `[ header | tag: i32 | payload... ]` where the payload is sized to the
-  largest variant (or a pointer for large/recursive variants), per the
-  RUNTIME-ABI heap-object header.
-  This is why tier-1 enums are value scalars but tier-3 enums graduate to
-  reference types — the representation changes, which is exactly the decision
-  D-0018 keeps open.
-- `match` destructures variants via the struct-pattern form already specified
-  in D-0040, so **no new `match` syntax is needed** when tier 3 lands —
-  exhaustiveness extends to variant coverage.
-- Tier 3 interacts with generics (a generic `Option[T]`/`Result[T, E]` is the
-  motivating use) — see §5 and §Open issues.
+**Representation — value-first (performance), pointer only where needed.**
+A data-carrying enum is a **tagged value** `[ tag: i32 | payload-union ]` sized
+to the largest variant and copied **by value** like a scalar (D-0023) — it does
+**not** heap-box by default. The compiler inserts a **GC pointer only where
+needed**: a field whose type is (mutually) **recursive** — to break the
+otherwise-infinite size, e.g. an AST `Add(Expr l, Expr r)` whose children are
+pointers to heap `Expr` values — or whose payload is oversized. An
+all-bare-constant enum stays the **tier-1 unboxed integer** (§3.1). The two
+representations do **not mix**: any payload-carrying variant makes the whole
+enum a tagged value, so the type descriptor reserves a `tag` slot from the
+start. (A niche/unboxed optimization beyond this is a later follow-up.)
 
-The tier-1/tier-3 boundary is the one representation discontinuity in this
-design and is called out so the enum type descriptor is designed with a `tag`
-slot reserved from the start.
+**Construction** is **qualified** (`Shape.Circle(...)`, like `Color.RED`) and
+accepts **named or positional** arguments, exactly like struct construction.
+
+**Pattern matching** reuses the struct-pattern form already specified in D-0040,
+so **no new `match` syntax is needed**: a qualified variant with fields bound
+**positionally** (`Shape.Circle(r)`, declaration order) or **by name**
+(`Shape.Circle(r=r)`), developer's choice; exhaustiveness extends to variant
+coverage.
+
+**Generics** — generic enums (`enum Option[T]: Some(T v); None`) are **reserved
+in the grammar now** and implemented by monomorphization **when user generics
+land** (D-0017 staging; §5); non-generic data-carrying enums ship first. Stdlib
+`Option[T]`/`Result[T, E]` ride on that.
+
+**Methods** on an enum (a `def` with `self` in the block, like structs §2.2,
+D-0015) are **allowed** — dispatching via `match` internally — and may be staged
+after the core destructuring.
 
 ### 4. Tuples (resolves the OPEN-QUESTIONS syntax item)
 

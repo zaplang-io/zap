@@ -13,10 +13,11 @@ _Last updated: 2026-10-19_
 - ⚪ **`**kwargs`-style arbitrary named arguments.** Deferred (D-0038) — fights
   static typing; keyword args + defaults cover the common cases. Revisit if a
   real need appears (e.g. forwarding).
-- 🟡 **Data-carrying enum variants** (enum tier 3, Rust-style sum types). The
-  `match` statement itself is locked (D-0040); this is the remaining piece —
-  variants that carry data, which `match` will destructure. Deferred past
-  tier-1 enums (D-0018); interacts with generics (D-0017).
+- ✅ **Data-carrying enum variants** (enum tier 3, Rust-style sum types) —
+  RESOLVED (D-0046, issue #51): value-first tagged representation (pointer only
+  for recursive/oversized fields), qualified construction + `match` destructuring
+  (positional or named), generic enums reserved now and monomorphized when user
+  generics land. See `design/0006-types-and-generics.md` §3.3.
 - 🟡 **`set` collection type** + set comprehensions (comprehensions are locked,
   D-0026, but a `set` type isn't).
 - 🟡 **Operator overloading for user types.** Currently built-in types only

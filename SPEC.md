@@ -161,10 +161,10 @@ Shape s = Circle(r=2.0)   # OK: Circle structurally satisfies Shape
 print(s.area())
 ```
 
-### 4.6 Enums (D-0018, tier 1)
+### 4.6 Enums (D-0018 tier 1, D-0046 tier 3)
 
-Named-constant enums — a distinct type, optional explicit values, `.name`,
-iterable. (Data-carrying variants + `match` are deferred; OPEN-QUESTIONS.)
+**Tier 1** — named-constant enums: a distinct type, optional explicit values,
+`.name`, iterable; an unboxed integer value.
 
 ```python
 enum Color:
@@ -175,6 +175,27 @@ enum Color:
 auto c = Color.GREEN
 print(c.name)         # "GREEN"
 ```
+
+**Tier 3 (D-0046)** — data-carrying variants (sum types) with type-first named
+payload fields; a tagged **value** (copied by value), with a GC pointer inserted
+only for recursive or oversized fields. Constructed qualified (named or
+positional); destructured by `match` (positional or named), with exhaustiveness.
+
+```python
+enum Shape:
+    Circle(f64 r)
+    Rect(f64 w, f64 h)
+    Unit
+
+auto sh = Shape.Circle(r=2.0)
+match sh:
+    case Shape.Circle(r):      area = 3.14159 * r * r
+    case Shape.Rect(w=w, h=h): area = w * h
+    case Shape.Unit:           area = 1.0
+```
+
+Generic enums (`enum Option[T]: Some(T v); None`) are reserved now, monomorphized
+when user generics land (D-0017). Methods on an enum are allowed (D-0046).
 
 ### 4.7 Generics (D-0017)
 
@@ -369,6 +390,13 @@ select:
         handle(v)
     case bch <- 1:
         sent()
+
+scope:                            # structured concurrency (D-0044)
+    spawn producer(ch)
+    spawn consumer(ch)
+    # dedent joins both; a child's failure cancels siblings and re-raises
+
+spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
 ```
 
 - **Channels (D-0031):** unbuffered by default; `(capacity)` makes it buffered;
@@ -376,8 +404,12 @@ select:
 - **Sync primitives (D-0032):** `Mutex`, `RWMutex`, `WaitGroup`, atomics, `Once`.
   `WaitGroup` is the primary way to wait for `spawn`ed coroutines (results come
   back over channels).
-- **Cancellation (D-0033):** structured concurrency — child coroutines are
-  scoped to a parent; leaving the scope awaits/cancels them. Surface syntax TBD.
+- **Cancellation (D-0033; surface D-0044):** structured concurrency — a `scope:`
+  block owns the coroutines spawned inside it and joins them at the dedent; a
+  child failure cancels siblings and re-raises (an aggregate `ExceptionGroup` if
+  several fail, D-0045). `scope(timeout=…, on_error=OnError.Cancel|Wait)` tunes
+  it. `spawn detached <call>` opts out of all scope ownership (daemon; Go exit
+  semantics). `Cancelled` unwinds via `finally`/`with`, outside `Exception`.
 - **Memory model (D-0034):** data-race-free programs are sequentially
   consistent; data races are bugs.
 
@@ -469,10 +501,11 @@ Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
 `def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
 `match`, `break`, `continue`, `auto`,
 `const`, `True`, `False`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
-`finally`, `with`, `as`, `yield`, `lambda`, `spawn`, `channel`, `select`,
-`case`, `close`, `struct`, `interface`, `enum`, `annotation`, `decorator`,
-`import`, `python`, `m`, `s`
-(contextual, before a delimiter), and the type keywords (`int32`, `int64`,
+`finally`, `with`, `as`, `yield`, `lambda`, `spawn`, `scope`, `channel`,
+`select`, `case`, `close`, `struct`, `interface`, `enum`, `annotation`,
+`decorator`, `import`, `python`, `m`, `s`
+(contextual, before a delimiter; `detached` is likewise contextual, only after
+`spawn`), and the type keywords (`int32`, `int64`,
 `float32`, `float64`, `i32`, `i64`, `f32`, `f64`, `bool`, `char`, `str`,
 `bytes`, `bigint`, `complex`, `list`, `dict`, `set`, `array`).
 
@@ -482,8 +515,9 @@ Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
 |---|---|
 | Declarations, scalars, functions, control flow | Locked |
 | Strings, conversions, value/reference semantics | Locked |
-| Structs, interfaces, enums (tier 1) | Locked (syntax draft) |
+| Structs, interfaces, enums (tier 1 + tier 3 sum types) | Locked (syntax draft) |
 | Generics | Reserved; staged implementation |
+| Concurrency surface (`scope:`, `spawn detached`) | Locked (D-0044/D-0045) |
 | Exceptions, resource cleanup | Locked |
 | Concurrency | Model locked; `select`/structured-concurrency syntax draft |
 | Modules & visibility | Locked |
