@@ -174,6 +174,18 @@ static size_t zap_gc_threshold = 4u * 1024u * 1024u; /* initial trigger (4 MiB) 
 static size_t zap_heap_limit = 0;           /* hard cap (ZAP_GC_HEAP_LIMIT), 0=off */
 static size_t zap_total_mapped = 0;
 
+/* Read the optional hard heap cap (ZAP_GC_HEAP_LIMIT, in bytes) once at startup;
+ * 0 (the default) disables it. Used by the GC reclamation tests. */
+__attribute__((constructor)) static void zap_gc_read_env(void) {
+    const char *e = getenv("ZAP_GC_HEAP_LIMIT");
+    if (e) {
+        long long v = atoll(e);
+        if (v > 0) {
+            zap_heap_limit = (size_t)v;
+        }
+    }
+}
+
 /* main-thread shadow-stack head (the main OS thread is a mutator but not a G). */
 void *zap_main_shadow_head = NULL;
 /* Per-thread "currently active" shadow head, maintained by compiled code. */
@@ -837,8 +849,7 @@ static void *zap_gc_alloc_sized(const ZapTypeDesc *desc, size_t payload_size) {
     size_t osize = zap_round16(ZAP_HEADER_BYTES + payload_size);
     pthread_mutex_lock(&zap_heap_mu);
     zap_bytes_since_gc += osize;
-    if (zap_bytes_since_gc >= zap_gc_threshold ||
-        (zap_heap_limit && zap_total_mapped + osize >= zap_heap_limit)) {
+    if (zap_bytes_since_gc >= zap_gc_threshold) {
         zap_gc_wanted = 1; /* collect at the next safepoint */
     }
     void *hdr;
@@ -846,6 +857,18 @@ static void *zap_gc_alloc_sized(const ZapTypeDesc *desc, size_t payload_size) {
         hdr = zap_alloc_los(osize);
     } else {
         hdr = zap_bump_small(osize);
+    }
+    /* Enforce the optional hard cap (ZAP_GC_HEAP_LIMIT) on mapped memory. Freed
+     * blocks are reused rather than unmapped, so with a working collector the
+     * mapped peak plateaus at roughly live + one threshold (well under a cap set
+     * generously above the threshold); exceeding it means the collector is not
+     * reclaiming (or a safepoint is never reached), so abort. We cannot collect
+     * here (runtime C holds unrooted temporaries), but aborting is always safe.
+     * Used only by the GC reclamation tests; the cap is unset in normal runs. */
+    if (zap_heap_limit && zap_total_mapped > zap_heap_limit) {
+        pthread_mutex_unlock(&zap_heap_mu);
+        fprintf(stderr, "zap: mapped heap exceeds ZAP_GC_HEAP_LIMIT %zu\n", zap_heap_limit);
+        abort();
     }
     pthread_mutex_unlock(&zap_heap_mu);
     void *payload = (char *)hdr + ZAP_HEADER_BYTES;
@@ -892,10 +915,24 @@ static void zap_mark_sweep(void) {
     zap_mark_reset(); /* clear survivor header bits for the next cycle */
     zap_sweep();
     zap_bytes_since_gc = 0;
-    /* Grow the threshold toward ~2x the live set to amortize collection cost. */
+    /* Enforce the optional hard cap (ZAP_GC_HEAP_LIMIT) against the LIVE set, not
+     * mapped memory: freed blocks are retained for reuse, so mapped bytes never
+     * shrink, but a correct collector keeps the live set bounded. Exceeding the
+     * cap after a full collection means genuinely too much live data (or a
+     * collector bug that retains garbage). Used by the GC reclamation tests. */
+    if (zap_heap_limit && zap_live_estimate > zap_heap_limit) {
+        fprintf(stderr, "zap: live heap %zu exceeds ZAP_GC_HEAP_LIMIT %zu\n",
+                zap_live_estimate, zap_heap_limit);
+        abort();
+    }
+    /* Grow the threshold toward ~2x the live set to amortize collection cost,
+     * but never beyond the hard cap so the cap still forces timely collections. */
     size_t want = zap_live_estimate * 2;
     if (want < 4u * 1024u * 1024u) {
         want = 4u * 1024u * 1024u;
+    }
+    if (zap_heap_limit && want > zap_heap_limit) {
+        want = zap_heap_limit;
     }
     zap_gc_threshold = want;
 }

@@ -103,5 +103,15 @@ jobs:
       - name: Clippy (workspace, codegen enabled)
         run: cargo clippy --workspace --features zapc/llvm --all-targets -- -D warnings
 
+      # Precise Immix GC (ticket #48): the same codegen path and golden suite,
+      # built with the precise collector instead of Boehm, plus the GC-specific
+      # reclamation tests. Folded into the `full` check so the two-check CI
+      # contract (host + full) is unchanged.
+      - name: Clippy (precise Immix GC)
+        run: cargo clippy --workspace --features zapc/gc-immix --all-targets -- -D warnings
+
       - name: Test (workspace, codegen enabled)
         run: cargo test --workspace --features zapc/llvm
+
+      - name: Test (precise Immix GC)
+        run: cargo test --workspace --features zapc/gc-immix

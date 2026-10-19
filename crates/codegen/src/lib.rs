@@ -140,6 +140,13 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     // `pkg-config` (the dev container / CI provide `python3-dev` + `pkg-config`)
     // so the exact libpython version and path are not hardcoded.
     cmd.args(python_embed_flags()?);
+    // Debug hook: extra cc flags from $ZAP_CC_EXTRA (e.g. "-g -fsanitize=address")
+    // for diagnosing runtime/GC issues. Unset in normal builds and CI.
+    if let Ok(extra) = std::env::var("ZAP_CC_EXTRA") {
+        for a in extra.split_whitespace() {
+            cmd.arg(a);
+        }
+    }
     let status = cmd
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
