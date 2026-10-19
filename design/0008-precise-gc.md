@@ -347,6 +347,25 @@ approved forks):
   dead-but-slotted values are harmless over-retention for a non-moving heap. The
   head is restored at each landing pad so an unwound-through frame chain is
   repaired before handler/cleanup code runs.
+- **Container interiors are traced PRECISELY, not conservatively.** A hybrid
+  (precise everywhere statically known, conservative scan of homogeneous
+  container element buffers) was considered and approved as a fallback: in a
+  non-moving v1 nothing is evacuated, so conservative interior scanning is
+  cost-free for correctness (it can only over-retain, never corrupt) and is
+  already strictly more precise than today's fully-conservative Boehm. But
+  implementation found the typed entry points (`_i64`/`_ptr`, `_str`/`_fn`)
+  already reveal each container's element/key/value pointer-ness, so a one-byte
+  per-instance flag (set lazily in those entry points) makes the element buffers
+  **fully precise** at negligible cost — so v1 takes that. A useful consequence:
+  the **element-kind tags are the v2 prerequisite for evacuating container
+  interiors, and they already exist**, so moving container contents in v2 needs
+  no new metadata (only a read/forwarding barrier).
+- **Uniform GC control surface (for ticket #77 signals).** Both backends export
+  the same symbols so a SIGUSR1 "force GC + stats" handler needs no per-backend
+  `#ifdef`: `void zap_gc_collect(void)` (force a full collection) and
+  `void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes)` (mapped-heap and
+  live/used bytes, best-effort per backend — bdwgc heap/free bytes for Boehm,
+  mapped + last-collection live estimate for Immix).
 - **v1 simplifications (follow-ups):** allocation is under one global heap lock
   (not per-P bump); finalizers are a no-op under Immix, so a `ZapPy` wrapper's
   CPython reference is not decref'd (bounded leak; Boehm keeps its finalizer);
