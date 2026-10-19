@@ -168,7 +168,11 @@ mod tests {
     #[test]
     fn discovers_default_name_at_root() {
         let dir = tmpdir();
-        write(&dir, DEFAULT_NAME, "# House style\nUse the `errors` Result helper.\n");
+        write(
+            &dir,
+            DEFAULT_NAME,
+            "# House style\nUse the `errors` Result helper.\n",
+        );
         let c = discover(&dir).expect("conventions discovered");
         assert_eq!(c.rel_path, PathBuf::from(DEFAULT_NAME));
         assert!(c.body.contains("Result helper"));
@@ -219,7 +223,9 @@ mod tests {
         let c = discover(&dir).unwrap();
         assert!(c.truncated);
         // Valid UTF-8 round-trips (truncate on a char boundary).
-        assert!(c.body.is_char_boundary(c.body.len() - TRUNCATION_NOTICE.len()));
+        assert!(c
+            .body
+            .is_char_boundary(c.body.len() - TRUNCATION_NOTICE.len()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

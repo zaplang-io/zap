@@ -231,8 +231,8 @@ impl Server {
         // The conventions resource is repo-specific (resolved under the root),
         // so it is handled here rather than via the embedded reference catalog.
         if uri == conventions::URI {
-            let c = conventions::discover(&self.root)
-                .ok_or((-32002, conventions::absent_message()))?;
+            let c =
+                conventions::discover(&self.root).ok_or((-32002, conventions::absent_message()))?;
             return Ok(contents(conventions::URI, conventions::MIME, c.body));
         }
 
@@ -899,8 +899,14 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"conventions","arguments":{}}}"#,
         );
         let text = first_text(&resp);
-        assert!(text.contains("conventions truncated"), "expected truncation notice");
-        assert!(text.len() < big.len(), "served body must be smaller than the file");
+        assert!(
+            text.contains("conventions truncated"),
+            "expected truncation notice"
+        );
+        assert!(
+            text.len() < big.len(),
+            "served body must be smaller than the file"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
