@@ -99,6 +99,8 @@ simple_stmt   ::= decl
                 | assign
                 | aug_assign
                 | subst_assign
+                | recv_bind                          (* comma-ok channel receive, D-0031 *)
+                | send_stmt                          (* channel send, D-0031 *)
                 | "return" [ expr ]
                 | "raise" [ expr ]
                 | "spawn" [ "detached" ] call_expr   (* "detached": D-0044 *)
@@ -113,6 +115,12 @@ subst_assign  ::= target "~=" subst_regex ;    (* in-place substitution, D-0010 
 aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**="
                 | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
 target        ::= atom { trailer } ;           (* name, index, slice, attr *)
+send_stmt     ::= postfix "<-" expr ;          (* channel send: ch <- v; D-0031 *)
+recv_bind     ::= ( type | "auto" ) IDENT "," IDENT "=" "<-" postfix
+                | IDENT "," IDENT "=" "<-" postfix ;   (* comma-ok receive: auto v, ok = <-ch *)
+                  (* plain receive `auto v = <-ch` is an ordinary decl; `<-` receive
+                     is an atom prefix (see `atom`). General tuple-destructuring
+                     assignment is a separate decision (tuple syntax, I#54). *)
 
 compound_stmt ::= if_stmt
                 | while_stmt
@@ -121,7 +129,8 @@ compound_stmt ::= if_stmt
                 | match_stmt
                 | try_stmt
                 | with_stmt
-                | scope_stmt ;
+                | scope_stmt
+                | select_stmt ;
 
 if_stmt       ::= "if" expr block
                   { "elif" expr block }
@@ -146,6 +155,13 @@ scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
                   (* options are keyword args: timeout=<dur>, on_error=OnError.Cancel|Wait.
                      Owns every `spawn` lexically inside; joins/cancels at the dedent.
                      `spawn detached` (see simple_stmt) opts out of all scope ownership. *)
+
+select_stmt   ::= "select" ":" NEWLINE INDENT { select_case } DEDENT ;  (* D-0031 *)
+select_case   ::= "case" select_op block
+                | "default" block ;                    (* `default` => non-blocking *)
+select_op     ::= IDENT "=" "<-" postfix               (* receive case, binds IDENT *)
+                | IDENT "," IDENT "=" "<-" postfix      (* comma-ok receive case *)
+                | postfix "<-" expr ;                   (* send case: ch <- v *)
 
 (* ---------- Pattern matching (D-0040) ---------- *)
 
