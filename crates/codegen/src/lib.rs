@@ -101,8 +101,7 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     // in. The GC collector include is written alongside so `#include
     // "zapgc.inc.c"` (relative) resolves (ticket #48).
     let build_dir = std::env::temp_dir().join(format!("zap-build-{}", std::process::id()));
-    std::fs::create_dir_all(&build_dir)
-        .map_err(|e| format!("failed to create build dir: {e}"))?;
+    std::fs::create_dir_all(&build_dir).map_err(|e| format!("failed to create build dir: {e}"))?;
     let rt_path = build_dir.join("zaprt.c");
     std::fs::write(&rt_path, RUNTIME_C).map_err(|e| format!("failed to write runtime: {e}"))?;
     std::fs::write(build_dir.join("zapgc.inc.c"), RUNTIME_GC_C)
@@ -237,11 +236,14 @@ struct Cg<'a, 'ctx> {
     /// Per-struct GC type-descriptor global (ticket #48), indexed by struct id.
     /// Passed to `zap_alloc_typed` so the precise collector can trace a struct
     /// instance's pointer fields. Empty under the Boehm build.
+    #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
     struct_descs: Vec<PointerValue<'ctx>>,
     /// The current function's shadow-stack frame (ticket #48, gc-immix). `None`
     /// under Boehm or for a function with no GC-pointer-typed values.
+    #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
     gc_frame: Option<GcFrame<'ctx>>,
     /// The target data layout, for computing GC descriptor field offsets (#48).
+    #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
     target_data: Option<TargetData>,
 }
 
@@ -252,6 +254,7 @@ struct Cg<'a, 'ctx> {
 /// every block) then finds every live pointer via the chain. Over-retention of
 /// dead-but-slotted values is safe for the non-moving collector.
 #[derive(Clone)]
+#[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
 struct GcFrame<'ctx> {
     /// Alloca of `{ ptr prev; i64 nroots; [N x ptr] roots }` in the entry block.
     frame_ptr: PointerValue<'ctx>,
@@ -750,7 +753,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             p.const_null()
         } else {
             let arr = i32t.const_array(&offsets);
-            let g = self.module.add_global(arr.get_type(), None, &format!("{name}.offs"));
+            let g = self
+                .module
+                .add_global(arr.get_type(), None, &format!("{name}.offs"));
             g.set_initializer(&arr);
             g.set_constant(true);
             g.set_linkage(inkwell::module::Linkage::Internal);
@@ -836,7 +841,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .map_err(|e| e.to_string())?;
         // frame.prev = *head; frame.nroots = n; roots[*] = null; *head = &frame.
         let head = self.gc_head();
-        let prev = b.build_load(p, head, "gc.prev").map_err(|e| e.to_string())?;
+        let prev = b
+            .build_load(p, head, "gc.prev")
+            .map_err(|e| e.to_string())?;
         let prev_slot = b
             .build_struct_gep(frame_ty, frame, 0, "gc.prevslot")
             .map_err(|e| e.to_string())?;
@@ -1402,8 +1409,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     #[cfg(feature = "gc-immix")]
                     {
                         let alloc = self.fns["zap_alloc_typed"];
-                        b.build_call(alloc, &[self.struct_descs[*sid as usize].into()], "structnew")
-                            .map_err(|e| e.to_string())?
+                        b.build_call(
+                            alloc,
+                            &[self.struct_descs[*sid as usize].into()],
+                            "structnew",
+                        )
+                        .map_err(|e| e.to_string())?
                     }
                     #[cfg(not(feature = "gc-immix"))]
                     unreachable!()
@@ -1560,8 +1571,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     {
                         let flags: Vec<bool> =
                             param_tys.iter().map(|t| t.is_pointer_type()).collect();
-                        let desc =
-                            self.emit_precise_desc(env_struct, &flags, &format!("zap.desc.env.{func}"));
+                        let desc = self.emit_precise_desc(
+                            env_struct,
+                            &flags,
+                            &format!("zap.desc.env.{func}"),
+                        );
                         let alloc = self.fns["zap_alloc_typed"];
                         b.build_call(alloc, &[desc.into()], "spawnenv")
                             .map_err(|e| e.to_string())?
