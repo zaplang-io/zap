@@ -415,6 +415,9 @@ pub fn check(module: &Module) -> Vec<TypeError> {
 /// Type-check a module, returning `(errors, warnings)`. Warnings are non-fatal
 /// diagnostics (e.g. the `Eq`-without-`Hash` dict/set key warning, D-0047).
 pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
+    // Prepend the built-in prelude (`Signal` enum, `MemStats` struct) so the
+    // signals surface reuses ordinary enum/struct type-checking (ticket #77).
+    let module = &zapc_syntax::parser::with_prelude(module);
     let mut c = Checker::new();
     c.collect_types(module);
     c.check_value_struct_recursion(module);
@@ -476,6 +479,15 @@ const BUILTINS: &[&str] = &[
     // surface exists yet (sockets #79, signals #77), so this drives the
     // netpoller end-to-end from the runtime; removed/replaced when #79 lands.
     "__netpoll_selftest",
+    // Internal signal integration-test hook (ticket #77): drives the self-pipe +
+    // netpoller + dispatch + cap-1 coalescing end-to-end from the runtime before
+    // the full `signal` surface is exercised in a program.
+    "__signal_selftest",
+    // Internal test hooks (ticket #77): send a signal to this process, and block
+    // until the signal thread has dispatched everything raised so far, so the
+    // signal goldens are deterministic. Not public surface.
+    "__raise_signal",
+    "__signal_drain",
 ];
 
 /// The curated built-in decorator set shipped in v1 (D-0036,
@@ -490,6 +502,9 @@ const BUILTIN_DECORATORS: &[&str] = &[
     "range",
     "deprecated",
     "inject",
+    // Signals (ticket #77, D-0058): `@on_signal(Signal.X)` on a function
+    // registers it as a handler for signal X (sugar over `signal.notify`).
+    "on_signal",
     // Test framework (D-0054, issue #73). These mark functions for `zap test`;
     // normal builds strip the annotated functions, so they never reach codegen.
     "test",
@@ -1109,6 +1124,35 @@ impl Checker {
                     }
                 }
             }
+            "on_signal" => {
+                // `@on_signal(Signal.X)` on a function (ticket #77, D-0058):
+                // register it as a handler for signal X. Exactly one positional
+                // argument, a `Signal` enum member.
+                self.require_target(d, target, DecoTarget::Function);
+                if positionals != 1 || keywords != 0 {
+                    self.error(
+                        "@on_signal(Signal.X) takes exactly one Signal argument, \
+                         e.g. @on_signal(Signal.SIGINT)",
+                        d.span,
+                    );
+                } else {
+                    let ok = matches!(
+                        &d.args[0].value,
+                        Expr::Attr { base, name, .. }
+                            if matches!(base.as_ref(), Expr::Name(n, _) if n == "Signal")
+                                && self
+                                    .enums
+                                    .get("Signal")
+                                    .is_some_and(|e| e.variant(name).is_some())
+                    );
+                    if !ok {
+                        self.error(
+                            "@on_signal expects a Signal member, e.g. @on_signal(Signal.SIGINT)",
+                            d.span,
+                        );
+                    }
+                }
+            }
             "default" => {
                 self.require_target(d, target, DecoTarget::Field);
                 if positionals != 1 || keywords != 0 {
@@ -1385,8 +1429,53 @@ impl Checker {
                         expr_span(&a.value),
                     );
                 }
+                // `scope(cancel_on=[Signal.X, ...])` (ticket #77, D-0058): a
+                // signal in the list cancels the scope tree. The value is a list
+                // of `Signal` members.
+                Some("cancel_on") => {
+                    if let Expr::List(elems, _) = &a.value {
+                        for e in elems {
+                            let et = self.infer(e);
+                            if !matches!(&et, Ty::Named(n) if n == "Signal")
+                                && !matches!(et, Ty::Unknown)
+                            {
+                                self.error(
+                                    format!(
+                                        "scope cancel_on expects a list of Signal, found {}",
+                                        et.display()
+                                    ),
+                                    expr_span(e),
+                                );
+                            }
+                        }
+                    } else {
+                        self.error(
+                            "scope cancel_on expects a list, e.g. \
+                             cancel_on=[Signal.SIGINT, Signal.SIGTERM]"
+                                .to_string(),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                // `scope(grace=<ms>)` (ticket #77): hard-exit deadline, in
+                // milliseconds, measured from the first cancel_on signal.
+                Some("grace") => {
+                    let gt = self.infer(&a.value);
+                    if !gt.is_int() && !matches!(gt, Ty::Unknown) {
+                        self.error(
+                            format!(
+                                "scope grace must be an integer number of milliseconds, found {}",
+                                gt.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
                 Some(other) => self.error(
-                    format!("scope() has no option '{other}' (expected 'on_error' or 'timeout')"),
+                    format!(
+                        "scope() has no option '{other}' \
+                         (expected 'on_error', 'cancel_on', or 'grace')"
+                    ),
                     expr_span(&a.value),
                 ),
                 None => self.error(
@@ -2502,6 +2591,83 @@ impl Checker {
         }
     }
 
+    /// Type-check a built-in `signal`/`gc`/`runtime` module call (ticket #77,
+    /// D-0058), returning the result type, or `None` if `module` is not a
+    /// built-in module (so the caller falls through to ordinary resolution).
+    /// These modules are compiler-known surface over the runtime diagnostics
+    /// entry points; `import signal`/`gc`/`runtime` is accepted but not required.
+    fn check_builtin_module_call(
+        &mut self,
+        module: &str,
+        method: &str,
+        args: &[Arg],
+        span: Span,
+    ) -> Option<Ty> {
+        let expect_argc = |this: &mut Self, n: usize| {
+            if args.len() != n {
+                this.error(
+                    format!(
+                        "{module}.{method}() takes {n} argument(s), found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+            }
+            for a in args {
+                this.infer(&a.value);
+            }
+        };
+        match (module, method) {
+            // signal.notify(Signal) -> channel[Signal]: a cap-1 coalescing
+            // channel delivering the given signal (D-0058).
+            ("signal", "notify") => {
+                if args.len() != 1 {
+                    self.error(
+                        format!("signal.notify(sig) takes 1 argument, found {}", args.len()),
+                        span,
+                    );
+                } else {
+                    let at = self.infer(&args[0].value);
+                    if !matches!(&at, Ty::Named(n) if n == "Signal") && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            format!("signal.notify expects a Signal, found {}", at.display()),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                }
+                Some(Ty::Chan(Box::new(Ty::Named("Signal".to_string()))))
+            }
+            // gc.collect(): force a full collection.
+            ("gc", "collect") => {
+                expect_argc(self, 0);
+                Some(Ty::Unit)
+            }
+            // gc.stats() -> MemStats: heap/live/free bytes, GC count, #goroutines.
+            ("gc", "stats") => {
+                expect_argc(self, 0);
+                Some(Ty::Named("MemStats".to_string()))
+            }
+            // runtime.goroutine_dump(): dump goroutine stacks + scheduler summary.
+            ("runtime", "goroutine_dump") => {
+                expect_argc(self, 0);
+                Some(Ty::Unit)
+            }
+            // runtime.num_goroutines() -> int64.
+            ("runtime", "num_goroutines") => {
+                expect_argc(self, 0);
+                Some(Ty::Int64)
+            }
+            ("signal" | "gc" | "runtime", _) => {
+                self.error(
+                    format!("module '{module}' has no function '{method}'"),
+                    span,
+                );
+                Some(Ty::Unknown)
+            }
+            _ => None,
+        }
+    }
+
     fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Ty {
         // Qualified enum-variant construction: `Shape.Circle(r=2.0)` /
         // `Shape.Circle(2.0)` (D-0046), accepting named or positional args.
@@ -2509,6 +2675,15 @@ impl Checker {
             if let Expr::Name(tyname, _) = base.as_ref() {
                 if let Some(info) = self.enums.get(tyname).cloned() {
                     return self.check_variant_construction(tyname, name, &info, args, span);
+                }
+                // Built-in `signal`/`gc`/`runtime` module calls (ticket #77,
+                // D-0058). Recognized only when the name is not shadowed by a
+                // local value, and is intercepted before the base is resolved as
+                // a value (these module names are not value bindings).
+                if self.lookup(tyname).is_none() {
+                    if let Some(ty) = self.check_builtin_module_call(tyname, name, args, span) {
+                        return ty;
+                    }
                 }
             }
         }
@@ -2696,6 +2871,36 @@ impl Checker {
                         self.error("__netpoll_selftest() takes no arguments".to_string(), span);
                     }
                     return Ty::Int64;
+                }
+                // `__signal_selftest()` (ticket #77): runs the signal subsystem
+                // integration self-test (self-pipe + netpoller + cap-1 coalescing)
+                // and returns the number of sub-checks that passed. Internal.
+                "__signal_selftest" => {
+                    if !args.is_empty() {
+                        self.error("__signal_selftest() takes no arguments".to_string(), span);
+                    }
+                    return Ty::Int64;
+                }
+                "__raise_signal" => {
+                    if args.len() != 1 {
+                        self.error("__raise_signal(n) takes one argument".to_string(), span);
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !at.is_int() && !matches!(at, Ty::Unknown) {
+                            self.error(
+                                "__raise_signal(n) expects an integer signal number".to_string(),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Unit;
+                }
+                "__signal_drain" => {
+                    if !args.is_empty() {
+                        self.error("__signal_drain() takes no arguments".to_string(), span);
+                    }
+                    return Ty::Unit;
                 }
                 _ => {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
@@ -3277,6 +3482,63 @@ mod tests {
     fn checkpoint_takes_no_arguments() {
         let e = errors("def main():\n    checkpoint(1)\n");
         assert_eq!(e.len(), 1, "expected a checkpoint arity error, got {e:?}");
+    }
+
+    // --- signals (ticket #77, D-0058) ---
+
+    #[test]
+    fn signal_notify_and_gc_runtime_modules_type_check() {
+        // `signal.notify` returns a channel[Signal]; `gc`/`runtime` module calls
+        // type-check; the built-in `Signal` enum and `MemStats` struct are
+        // available without an explicit declaration.
+        ok("def main():\n\
+            \x20   auto ch = signal.notify(Signal.SIGINT)\n\
+            \x20   auto s = <-ch\n\
+            \x20   gc.collect()\n\
+            \x20   auto m = gc.stats()\n\
+            \x20   print(m.heap_bytes)\n\
+            \x20   print(runtime.num_goroutines())\n\
+            \x20   runtime.goroutine_dump()\n");
+    }
+
+    #[test]
+    fn signal_notify_rejects_non_signal() {
+        let e = errors("def main():\n    auto ch = signal.notify(42)\n");
+        assert!(!e.is_empty(), "expected signal.notify(non-Signal) to error");
+    }
+
+    #[test]
+    fn unknown_module_function_is_an_error() {
+        let e = errors("def main():\n    gc.frobnicate()\n");
+        assert!(!e.is_empty(), "expected unknown gc.* function to error");
+    }
+
+    #[test]
+    fn on_signal_decorator_type_checks() {
+        ok("@on_signal(Signal.SIGTERM)\ndef cleanup():\n    print(1)\n\ndef main():\n    print(0)\n");
+    }
+
+    #[test]
+    fn on_signal_rejects_non_signal_argument() {
+        let e =
+            errors("@on_signal(42)\ndef cleanup():\n    print(1)\n\ndef main():\n    print(0)\n");
+        assert!(!e.is_empty(), "expected @on_signal(non-Signal) to error");
+    }
+
+    #[test]
+    fn scope_cancel_on_and_grace_type_check() {
+        ok("def f():\n    print(1)\n\ndef main():\n\
+            \x20   scope(cancel_on=[Signal.SIGINT, Signal.SIGTERM], grace=5000):\n\
+            \x20       spawn f()\n");
+    }
+
+    #[test]
+    fn scope_cancel_on_rejects_non_signal_list() {
+        let e = errors(
+            "def f():\n    print(1)\n\ndef main():\n\
+            \x20   scope(cancel_on=[1, 2]):\n        spawn f()\n",
+        );
+        assert!(!e.is_empty(), "expected cancel_on=[non-Signal] to error");
     }
 
     #[test]

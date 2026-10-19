@@ -176,6 +176,35 @@ void*   zap_netpoll_open(int64_t fd);                     // register fd; NULL i
 int64_t zap_netpoll_wait(void* pd, int64_t mode, int64_t deadline_ns); // park until ready/deadline
 void    zap_netpoll_wake(void* pd, int64_t mode);         // force-wake a parked waiter (#77 hook)
 void    zap_netpoll_close(void* pd);                      // deregister + release
+
+// Signals, runtime diagnostics & fault reporting (#77, D-0058). The mechanism
+// (see design/0005 "Signals"): an async-signal-safe handler on a DEDICATED
+// signal thread writes the signal number to a self-pipe REGISTERED WITH THE
+// NETPOLLER; the signal thread parks on the netpoller and dispatches in normal
+// context — fan-out to notify channels (cap-1, coalescing), arm cancel_on
+// scopes, or run a default diagnostic handler. `zap_signal_init()` runs at the
+// top of `main` and installs the default handlers (SIGQUIT -> goroutine stacks
+// + runtime dump; SIGUSR1 -> force GC + memory stats), unless the runtime is
+// built -DZAP_NO_DEFAULT_SIGNALS. Catchable signals only; FAULT signals
+// (SIGSEGV/SIGFPE/SIGBUS/SIGILL) go to a crash handler (on a sigaltstack) that
+// reports the fault + a backtrace and re-raises the default disposition.
+void  zap_signal_init(void);                              // main prologue: start + default handlers
+void* zap_signal_notify(int64_t signo);                   // -> channel[Signal] (cap-1, coalescing)
+void  zap_signal_on(int64_t signo, void* fn);             // @on_signal: detached receiver -> fn()
+void  zap_scope_cancel_on(void* scope, int64_t mask, int64_t grace_ms); // scope(cancel_on=,grace=)
+void  zap_scope_disarm(void* scope);                      // drop cancel_on (called from scope exit)
+
+// `gc`/`runtime` module + the uniform GC control surface (backend-agnostic:
+// both collectors export these, so no per-backend #ifdef). `gc.stats()` builds
+// a MemStats from these scalar getters.
+void    zap_gc_collect(void);                             // force a full collection
+void    zap_gc_stats(int64_t* heap_bytes, int64_t* live_bytes);
+int64_t zap_gc_count(void);                               // collections run so far
+int64_t zap_gc_heap_bytes(void);
+int64_t zap_gc_live_bytes(void);
+int64_t zap_gc_free_bytes(void);
+void    zap_runtime_goroutine_dump(void);                 // stacks + scheduler summary -> stderr
+int64_t zap_runtime_num_goroutines(void);
 ```
 
 The first exceptions increment (#22) lands `raise`, `try`/`except`/`finally`,

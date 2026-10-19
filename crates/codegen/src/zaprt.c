@@ -123,6 +123,7 @@ extern const ZapTypeDesc zap_desc_matchobj;
 extern const ZapTypeDesc zap_desc_pyobj;
 extern const ZapTypeDesc zap_desc_gobj;    /* scheduler G (precise)             */
 extern const ZapTypeDesc zap_desc_ptrs;    /* a generic array-of-pointers buffer */
+extern const ZapTypeDesc zap_desc_sigsub;  /* SigSub: {next, chan} (ticket #77)  */
 
 #ifdef ZAP_GC_IMMIX
 /* Precise collector entry points (defined in zapgc.inc.c, #included below). */
@@ -207,8 +208,10 @@ void *zap_alloc(int64_t size) {
  *   - zap_gc_collect(): force a full collection now.
  *   - zap_gc_stats(heap_bytes, live_bytes): current mapped-heap bytes and the
  *     live/used bytes as of the last collection (best-effort per backend).
+ *   - zap_gc_count(): number of collections run so far (GC cycle count).
  * The Immix implementations live in zapgc.inc.c (included below); the Boehm
  * ones wrap bdwgc here. */
+int64_t zap_gc_count(void);
 #ifndef ZAP_GC_IMMIX
 void zap_gc_collect(void) { GC_gcollect(); }
 void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes) {
@@ -221,6 +224,7 @@ void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes) {
         *live_bytes = (int64_t)(heap > freeb ? heap - freeb : 0);
     }
 }
+int64_t zap_gc_count(void) { return (int64_t)GC_get_gc_no(); }
 #endif
 
 /* Descriptor-typed allocation the compiler calls for struct / closure objects
@@ -2259,10 +2263,14 @@ void zap_spawn_detached(void *fn_, void *arg) {
 /* The implicit root scope's join at program exit (emitted at `main`'s return):
  * block until every spawned G (and its descendants) has finished, then stop the
  * worker Ms. A no-op if nothing ever spawned (scheduler never started). */
-static void netpoll_shutdown(void); /* fwd (netpoller section, below) */
+static void netpoll_shutdown(void);   /* fwd (netpoller section, below) */
+static void zap_signal_shutdown(void); /* fwd (signals section, #77, below) */
 void zap_rt_join_all(void) {
     if (!g_ms) {
-        netpoll_shutdown(); /* main may have used the netpoller without spawning */
+        /* main may have used signals / the netpoller without ever spawning. Stop
+         * the signal thread first (it parks ON the netpoller), then the poller. */
+        zap_signal_shutdown();
+        netpoll_shutdown();
         return;
     }
     /* Precise GC (#48): the main thread blocks here until every spawned G
@@ -2282,8 +2290,10 @@ void zap_rt_join_all(void) {
     for (int i = 0; i < g_nm; i++) {
         GC_pthread_join(g_ms[i].thread, NULL);
     }
-    /* Every spawned G has finished, so nothing is parked on an fd: stop the
-     * netpoller thread too (no-op if it never started). */
+    /* Every spawned G has finished: stop the signal thread (parked on the
+     * netpoller self-pipe) and then the netpoller thread (both no-ops if never
+     * started). */
+    zap_signal_shutdown();
     netpoll_shutdown();
 }
 
@@ -2486,9 +2496,14 @@ static void *make_exception_group(ZapStr **excs, int64_t n) {
 /* Normal-exit join (D-0044 rule 2/3): await the owned coroutines, then re-raise
  * their failure — the single exception, or an `ExceptionGroup` when several
  * failed concurrently (D-0045). No failure => returns normally. */
+void zap_scope_disarm(void *scope_); /* fwd (signals section, #77) */
 void zap_scope_exit(void *scope_) {
     Scope *sc = (Scope *)scope_;
     scope_join(sc);
+    /* The scope's lifetime ends here; drop any `cancel_on` subscription (ticket
+     * #77) AFTER the join, so a signal can still cancel during the join. A no-op
+     * for a scope with no cancel_on. */
+    zap_scope_disarm(sc);
     if (sc->nexc == 0) {
         return;
     }
@@ -2508,6 +2523,7 @@ void zap_scope_exit_cancel(void *scope_) {
     sc->cancelled = 1;
     pthread_mutex_unlock(&sc->mu);
     scope_join(sc);
+    zap_scope_disarm(sc); /* drop any cancel_on subscription (ticket #77) */
 }
 
 /* An uncaught exception reached a coroutine's base frame (ticket #50, replacing
@@ -3199,25 +3215,38 @@ int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
     return (int64_t)w.val;
 }
 
-/* Force-wake any waiter parked on `pd` for `mode` with ZAP_POLL_OK, without
- * latching if none is parked. The hook the signal self-pipe (#77) and a future
- * cancellation-of-parked-G path use to interrupt a netpoller wait. */
+/* Force-wake the waiter parked on `pd` for `mode` with ZAP_POLL_OK; if none is
+ * parked, LATCH readiness so the next `zap_netpoll_wait` for that direction
+ * returns immediately (same edge-latch np_wake_dir_locked uses). The latch is
+ * what makes this race-free: a caller (e.g. the #77 signal-thread shutdown)
+ * that wakes while the waiter is momentarily between waits — not yet re-parked —
+ * must not have its wake silently dropped, or the waiter blocks forever. The
+ * hook the signal self-pipe (#77) and a future cancellation-of-parked-G path
+ * use to interrupt a netpoller wait. */
 void zap_netpoll_wake(void *pd_, int64_t mode) {
     PollDesc *pd = (PollDesc *)pd_;
     pthread_mutex_lock(&pd->mu);
-    if ((mode & ZAP_POLL_READ) && pd->rg) {
-        Waiter *w = pd->rg;
-        pd->rg = NULL;
-        pd->r_deadline = 0;
-        w->val = ZAP_POLL_OK;
-        goready(w);
+    if (mode & ZAP_POLL_READ) {
+        if (pd->rg) {
+            Waiter *w = pd->rg;
+            pd->rg = NULL;
+            pd->r_deadline = 0;
+            w->val = ZAP_POLL_OK;
+            goready(w);
+        } else {
+            pd->r_ready = 1; /* latch: the next read wait returns at once */
+        }
     }
-    if ((mode & ZAP_POLL_WRITE) && pd->wg) {
-        Waiter *w = pd->wg;
-        pd->wg = NULL;
-        pd->w_deadline = 0;
-        w->val = ZAP_POLL_OK;
-        goready(w);
+    if (mode & ZAP_POLL_WRITE) {
+        if (pd->wg) {
+            Waiter *w = pd->wg;
+            pd->wg = NULL;
+            pd->w_deadline = 0;
+            w->val = ZAP_POLL_OK;
+            goready(w);
+        } else {
+            pd->w_ready = 1; /* latch: the next write wait returns at once */
+        }
     }
     pthread_mutex_unlock(&pd->mu);
 }
@@ -3377,6 +3406,770 @@ int64_t zap_netpoll_selftest(void) { return ZAP_NP_SELFTEST_CHECKS; }
 #endif
 
 /* ===========================================================================
+ * Signals, runtime diagnostics & fault reporting (ticket #77, D-0058)
+ * ---------------------------------------------------------------------------
+ * First-class Unix signals built on the concurrency runtime. The mechanism
+ * (D-0058): an async-signal-safe handler on a DEDICATED signal thread writes the
+ * signal number to a SELF-PIPE whose read end is REGISTERED WITH THE NETPOLLER
+ * (ticket #80); the signal thread parks on the netpoller (`zap_netpoll_wait`,
+ * the native-waiter path) and, on readiness, drains the pipe and DISPATCHES in
+ * normal (non-handler) context:
+ *   - fan-out to every `signal.notify()` subscriber channel (cap-1 buffered,
+ *     coalescing — a dropped edge, not a queue);
+ *   - arm any `scope(cancel_on=...)` whose signal fired (cooperative cancel of
+ *     the scope tree, plus an optional `grace` hard-exit deadline);
+ *   - run the built-in DEFAULT diagnostic handler for a signal that has no user
+ *     subscriber (SIGQUIT -> stacks + runtime dump; SIGUSR1 -> GC + mem stats).
+ *
+ * The capability ships in every binary and wires up LAZILY: nothing starts until
+ * the generated `main` prologue calls `zap_signal_init()` (which installs the
+ * default handlers, ON by default — opt out at build with -DZAP_NO_DEFAULT_SIGNALS)
+ * or the program first subscribes (`signal.notify`, `@on_signal`,
+ * `scope(cancel_on=...)`). `notify` TAKES OVER a signal's disposition (the OS
+ * default is suppressed; there is NO auto-exit — the program decides when to exit
+ * after cleanup). Catchable signals only; SIGKILL/SIGSTOP cannot be caught.
+ *
+ * DEVIATION (flagged for review): D-0058 describes the reader as a separate
+ * "dispatcher goroutine". Here the dedicated signal thread is itself the reader/
+ * dispatcher — it still parks on the netpoller-registered self-pipe and delivers
+ * in normal context, and fan-out is a non-blocking, non-allocating channel offer
+ * that is scheduler-safe from a native (non-M) thread. A distinct dispatcher
+ * goroutine would force the M:N worker pool onto EVERY binary (default handlers
+ * are on by default), breaking the deliberate scheduler-laziness invariant that
+ * keeps non-concurrent programs zero-cost (#47). `@on_signal` delivery DOES run
+ * on a real goroutine (a detached receiver loop over the notify channel).
+ *
+ * FAULT signals (SIGSEGV/SIGFPE/SIGBUS/SIGILL) are NOT delivered via `notify`: a
+ * crash handler (on a sigaltstack, so a stack overflow is still reportable)
+ * prints the faulting signal/address, the offending goroutine, and a native
+ * backtrace, then re-raises the default disposition so the process dies with the
+ * right status (and a core, if enabled).
+ * =========================================================================== */
+#include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
+#if defined(__GLIBC__)
+#include <execinfo.h> /* backtrace() for the fault crash report                 */
+#define ZAP_HAVE_BACKTRACE 1
+#endif
+
+#define ZAP_NSIG 65 /* table span: standard + a margin of RT signals (Linux)    */
+/* Fixed alternate-stack size: SIGSTKSZ is not a compile-time constant on recent
+ * glibc, so size the crash-handler stack explicitly (well above MINSIGSTKSZ). */
+#define ZAP_ALTSTACK_SIZE (64 * 1024)
+
+/* A `signal.notify()` subscriber: a cap-1 coalescing channel. Nodes are GC
+ * objects (precise desc {next, chan}) kept reachable by a registered root
+ * marker under Immix and by conservative scan of the static array under Boehm. */
+typedef struct SigSub {
+    struct SigSub *next; /* MUST be first two slots -> see zap_off_sigsub        */
+    void *chan;          /* ZapChan* (cap 1); delivered the signal number (i64)  */
+} SigSub;
+
+/* A `scope(cancel_on=...)` subscription: arm `scope` when the signal fires.
+ * Plain malloc (not GC): the owning `scope:` frame keeps the Scope rooted for
+ * the whole lifetime of this subscription (enter..disarm), and the node holds a
+ * refcount so a pending grace timer never dereferences freed memory. */
+typedef struct ScopeSigSub {
+    struct ScopeSigSub *next;
+    Scope *scope;
+    int64_t grace_ms;
+    int completed; /* scope left its block (disarmed) before any hard-exit       */
+    int refcnt;    /* 1 (list) + 1 per outstanding grace timer                   */
+} ScopeSigSub;
+
+static pthread_mutex_t g_sig_mu = PTHREAD_MUTEX_INITIALIZER;
+static SigSub *g_sig_subs[ZAP_NSIG];        /* notify() subscribers, per signo   */
+static ScopeSigSub *g_scope_subs[ZAP_NSIG]; /* cancel_on subscriptions, per signo */
+static int g_sig_default[ZAP_NSIG];         /* 1 => run the built-in default      */
+static int g_sig_installed[ZAP_NSIG];       /* OS handler installed for this sig  */
+
+static int g_sig_pipe[2] = {-1, -1}; /* [0]=read (netpoller), [1]=write (handler)*/
+static void *g_sig_pd = NULL;        /* PollDesc for the read end                */
+static pthread_t g_sig_thread;
+static volatile int g_sig_active = 0;    /* subsystem started                    */
+static volatile int g_sig_shutdown = 0;  /* signal thread asked to stop          */
+static pthread_once_t g_sig_once = PTHREAD_ONCE_INIT;
+static volatile sig_atomic_t g_sig_delivered = 0; /* async handler run count (test sync) */
+
+/* Drain barrier for deterministic tests (__signal_drain): a sentinel byte (0,
+ * never a real signal number) travels the self-pipe behind any pending edges;
+ * the signal thread bumps g_sig_sync_seq when it processes one, FIFO order
+ * guaranteeing every earlier edge was already dispatched. */
+#define ZAP_SIG_SYNC_BYTE 0
+static pthread_mutex_t g_sig_sync_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_sig_sync_cv = PTHREAD_COND_INITIALIZER;
+static int64_t g_sig_sync_seq = 0;
+
+/* Human-readable signal name for diagnostics (no allocation; async-safe-ish). */
+static const char *sig_name(int s) {
+    switch (s) {
+    case SIGHUP: return "SIGHUP";
+    case SIGINT: return "SIGINT";
+    case SIGQUIT: return "SIGQUIT";
+    case SIGILL: return "SIGILL";
+    case SIGABRT: return "SIGABRT";
+    case SIGBUS: return "SIGBUS";
+    case SIGFPE: return "SIGFPE";
+    case SIGUSR1: return "SIGUSR1";
+    case SIGSEGV: return "SIGSEGV";
+    case SIGUSR2: return "SIGUSR2";
+    case SIGPIPE: return "SIGPIPE";
+    case SIGALRM: return "SIGALRM";
+    case SIGTERM: return "SIGTERM";
+    case SIGCHLD: return "SIGCHLD";
+    case SIGCONT: return "SIGCONT";
+    case SIGTSTP: return "SIGTSTP";
+    case SIGWINCH: return "SIGWINCH";
+    default: return "SIG?";
+    }
+}
+
+/* ---- non-blocking, coalescing channel offer (delivery primitive) ---------- *
+ * Hand `v` to a waiting receiver or buffer it; if neither is possible (buffer
+ * full, or unbuffered with no receiver) DROP it — signals are edges, not a
+ * queue (D-0058 "coalesces; drops on overflow"). Never blocks. Returns 1 if the
+ * value was delivered/buffered, 0 if dropped. Mirrors chan_send_word's fast
+ * paths without the parking tail. */
+static int chan_offer_word(ZapChan *c, uint64_t v) {
+    pthread_mutex_lock(&c->mu);
+    if (c->closed) {
+        pthread_mutex_unlock(&c->mu);
+        return 0;
+    }
+    if (c->count == 0 && c->recvq_head) {
+        Waiter *r = q_pop(&c->recvq_head, &c->recvq_tail);
+        r->val = v;
+        r->ok = 1;
+        goready(r);
+        pthread_mutex_unlock(&c->mu);
+        return 1;
+    }
+    if (c->cap > 0 && c->count < c->cap) {
+        c->buf[c->tail] = v;
+        c->tail = (c->tail + 1) % c->cap;
+        c->count++;
+        pthread_mutex_unlock(&c->mu);
+        return 1;
+    }
+    pthread_mutex_unlock(&c->mu);
+    return 0; /* coalesce: drop this edge */
+}
+
+/* ---- diagnostics: goroutine / scheduler dump (SIGQUIT default, runtime.*) -- */
+static const char *gstate_name(GState s) {
+    switch (s) {
+    case G_RUNNABLE: return "runnable";
+    case G_RUNNING: return "running";
+    case G_PARKED: return "parked";
+    case G_DEAD: return "dead";
+    default: return "?";
+    }
+}
+
+/* Count live goroutines (runnable+running+parked). Reads the static g_all[]
+ * registry under its lock; safe from any thread. */
+int64_t zap_runtime_num_goroutines(void) {
+    pthread_mutex_lock(&g_all_mu);
+    int64_t n = g_all_len;
+    pthread_mutex_unlock(&g_all_mu);
+    return n;
+}
+
+/* Scalar GC byte getters that back `gc.stats() -> MemStats` field-by-field
+ * (so the lowerer builds the struct from plain i64 calls, no out-params). All
+ * route through the backend-agnostic zap_gc_stats. */
+int64_t zap_gc_heap_bytes(void) {
+    int64_t h = 0, l = 0;
+    zap_gc_stats(&h, &l);
+    return h;
+}
+int64_t zap_gc_live_bytes(void) {
+    int64_t h = 0, l = 0;
+    zap_gc_stats(&h, &l);
+    return l;
+}
+int64_t zap_gc_free_bytes(void) {
+    int64_t h = 0, l = 0;
+    zap_gc_stats(&h, &l);
+    return h > l ? h - l : 0;
+}
+
+/* Dump every live goroutine + a scheduler summary to `f`. v1 reports per-G
+ * identity/state/ownership and the scheduler/GC shape; full per-G symbolicated
+ * stack traces (unwinding each green stack) are a follow-up (noted in the PR). */
+static void zap_goroutine_dump_to(FILE *f) {
+    int64_t ng, maxprocs, live;
+    pthread_mutex_lock(&g_live_mu);
+    live = g_live;
+    pthread_mutex_unlock(&g_live_mu);
+    maxprocs = (int64_t)g_nm;
+    fprintf(f, "=== zap runtime dump ===\n");
+    fprintf(f, "GOMAXPROCS(M=P): %lld  root-live goroutines: %lld\n",
+            (long long)maxprocs, (long long)live);
+    int64_t heap = 0, lb = 0;
+    zap_gc_stats(&heap, &lb);
+    fprintf(f, "GC: cycles=%lld heap=%lld bytes live=%lld bytes\n",
+            (long long)zap_gc_count(), (long long)heap, (long long)lb);
+    pthread_mutex_lock(&g_all_mu);
+    ng = g_all_len;
+    fprintf(f, "goroutines: %lld\n", (long long)ng);
+    for (int64_t i = 0; i < g_all_len; i++) {
+        G *g = g_all[i];
+        if (!g) {
+            continue;
+        }
+        const char *own = g->scope ? "scoped" : (g->in_live ? "root" : "detached");
+        fprintf(f, "  goroutine %lld [%s, %s]\n", (long long)i,
+                gstate_name(g->state), own);
+    }
+    pthread_mutex_unlock(&g_all_mu);
+    fprintf(f, "========================\n");
+    fflush(f);
+}
+
+void zap_runtime_goroutine_dump(void) { zap_goroutine_dump_to(stderr); }
+
+/* ---- default diagnostic handlers ------------------------------------------ */
+static void zap_sig_run_default(int signo) {
+    if (signo == SIGUSR1) {
+        zap_gc_collect();
+        int64_t heap = 0, live = 0;
+        zap_gc_stats(&heap, &live);
+        fprintf(stderr,
+                "=== zap SIGUSR1: forced GC ===\n"
+                "heap=%lld bytes  live=%lld bytes  gc-cycles=%lld  goroutines=%lld\n",
+                (long long)heap, (long long)live, (long long)zap_gc_count(),
+                (long long)zap_runtime_num_goroutines());
+        fflush(stderr);
+    } else if (signo == SIGQUIT) {
+        zap_goroutine_dump_to(stderr);
+    }
+}
+
+/* ---- dispatch (runs on the dedicated signal thread, normal context) ------- */
+static void zap_grace_arm(ScopeSigSub *ss); /* fwd */
+static void zap_sig_dispatch(int signo) {
+    if (signo <= 0 || signo >= ZAP_NSIG) {
+        return;
+    }
+    pthread_mutex_lock(&g_sig_mu);
+    /* Any user handler for this signal — a `notify` subscriber OR a
+     * `scope(cancel_on=...)` subscription — takes over its disposition and
+     * suppresses the built-in default (D-0058 "a user notify/@on_signal for that
+     * signal wins"). */
+    int had_sub = (g_sig_subs[signo] != NULL) || (g_scope_subs[signo] != NULL);
+    for (SigSub *s = g_sig_subs[signo]; s; s = s->next) {
+        chan_offer_word((ZapChan *)s->chan, (uint64_t)(int64_t)signo);
+    }
+    /* Arm every scope watching this signal; start a grace timer once per scope. */
+    for (ScopeSigSub *ss = g_scope_subs[signo]; ss; ss = ss->next) {
+        if (ss->completed) {
+            continue;
+        }
+        Scope *sc = ss->scope;
+        pthread_mutex_lock(&sc->mu);
+        sc->cancelled = 1;
+        pthread_cond_broadcast(&sc->cv);
+        pthread_mutex_unlock(&sc->mu);
+        if (ss->grace_ms > 0) {
+            zap_grace_arm(ss);
+        }
+    }
+    int run_default = (!had_sub) && g_sig_default[signo];
+    pthread_mutex_unlock(&g_sig_mu);
+    /* A cancel_on signal may leave coroutines parked on a channel; they observe
+     * the cancel at their next cancellation point (cooperative model). Forcing a
+     * wake of an arbitrarily-parked G is the netpoller-backed follow-up. */
+    if (run_default) {
+        zap_sig_run_default(signo);
+    }
+}
+
+/* ---- the dedicated signal thread ------------------------------------------ */
+/* async-signal-safe: only writes the signo byte to the self-pipe (write(2) is
+ * async-signal-safe; a full non-blocking pipe simply coalesces the edge). */
+static void zap_sig_handler(int signo) {
+    int saved = errno;
+    unsigned char b = (unsigned char)signo;
+    ssize_t r = write(g_sig_pipe[1], &b, 1);
+    (void)r;
+    g_sig_delivered++; /* async-signal-safe (sig_atomic_t): test sync counter */
+    errno = saved;
+}
+
+static void *zap_sig_thread_main(void *arg) {
+    (void)arg;
+    /* This is the one thread with the handled async signals UNBLOCKED, so a
+     * process-directed signal is delivered here (its async-safe handler writes
+     * the self-pipe) rather than to a scheduler worker mid context-switch
+     * (D-0058 "scheduler threads mask signals"). Start from an empty mask so any
+     * signal whose handler is installed later is already unblocked here. */
+    sigset_t empty;
+    sigemptyset(&empty);
+    pthread_sigmask(SIG_SETMASK, &empty, NULL);
+    /* Registered mutator (Immix): this thread parks via zap_netpoll_wait ->
+     * gopark's native path, which brackets the wait with enter/leave_blocking;
+     * it never allocates GC memory and is GC-safe while blocked (like main). */
+    zap_mutator_register();
+    unsigned char buf[64];
+    for (;;) {
+        int64_t r = zap_netpoll_wait(g_sig_pd, ZAP_POLL_READ, 0);
+        if (g_sig_shutdown) {
+            break;
+        }
+        if (r == ZAP_POLL_CLOSED) {
+            break;
+        }
+        /* Edge-triggered: drain the pipe to EAGAIN, dispatching each signo. */
+        for (;;) {
+            ssize_t n = read(g_sig_pipe[0], buf, sizeof buf);
+            if (n <= 0) {
+                break;
+            }
+            for (ssize_t i = 0; i < n; i++) {
+                if (buf[i] == ZAP_SIG_SYNC_BYTE) {
+                    /* Drain barrier: every earlier edge in this FIFO has now been
+                     * dispatched, so release any waiter in zap_signal_drain. */
+                    pthread_mutex_lock(&g_sig_sync_mu);
+                    g_sig_sync_seq++;
+                    pthread_cond_broadcast(&g_sig_sync_cv);
+                    pthread_mutex_unlock(&g_sig_sync_mu);
+                } else {
+                    zap_sig_dispatch((int)buf[i]);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+/* ---- fault (crash) handler ------------------------------------------------ */
+static void zap_fault_handler(int signo, siginfo_t *info, void *uctx) {
+    (void)uctx;
+    char msg[256];
+    void *addr = info ? info->si_addr : NULL;
+    M *m = cur_m;
+    G *g = m ? m->current : NULL;
+    int n = snprintf(msg, sizeof msg,
+                     "\n=== zap fatal: %s (signal %d) ===\n"
+                     "faulting address: %p\n"
+                     "offending goroutine: ",
+                     sig_name(signo), signo, addr);
+    if (n > 0) {
+        ssize_t w = write(STDERR_FILENO, msg, (size_t)n);
+        (void)w;
+    }
+    if (g) {
+        int m2 = snprintf(msg, sizeof msg, "goroutine %lld [%s]\n",
+                          (long long)g->all_idx, gstate_name(g->state));
+        if (m2 > 0) {
+            ssize_t w = write(STDERR_FILENO, msg, (size_t)m2);
+            (void)w;
+        }
+    } else {
+        const char *mt = "main/native thread\n";
+        ssize_t w = write(STDERR_FILENO, mt, strlen(mt));
+        (void)w;
+    }
+#ifdef ZAP_HAVE_BACKTRACE
+    {
+        const char *hdr = "backtrace:\n";
+        ssize_t w = write(STDERR_FILENO, hdr, strlen(hdr));
+        (void)w;
+        void *frames[64];
+        int nf = backtrace(frames, 64);
+        backtrace_symbols_fd(frames, nf, STDERR_FILENO); /* async-signal-safe */
+    }
+#endif
+    /* Restore the default disposition and re-raise so the process dies with the
+     * correct status (and dumps core if enabled). */
+    signal(signo, SIG_DFL);
+    raise(signo);
+}
+
+static char g_sig_altstack[ZAP_ALTSTACK_SIZE];
+static void zap_install_fault_handlers(void) {
+    stack_t ss;
+    ss.ss_sp = g_sig_altstack;
+    ss.ss_size = sizeof g_sig_altstack;
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = zap_fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+}
+
+/* Install (idempotently) the async self-pipe handler for `signo`. Caller holds
+ * g_sig_mu. SA_RESTART so a handler interrupting a slow syscall resumes it. */
+static void zap_sig_install(int signo) {
+    if (signo <= 0 || signo >= ZAP_NSIG || g_sig_installed[signo]) {
+        return;
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = zap_sig_handler;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(signo, &sa, NULL) == 0) {
+        g_sig_installed[signo] = 1;
+        /* Block this signal on the installing thread so it is delivered to the
+         * dedicated signal thread (the only one that unblocks it). Done on the
+         * main thread at startup (so scheduler workers, created later, inherit
+         * the block); best-effort for a signal first subscribed from a worker. */
+        sigset_t s;
+        sigemptyset(&s);
+        sigaddset(&s, signo);
+        pthread_sigmask(SIG_BLOCK, &s, NULL);
+    }
+}
+
+/* ---- lazy start / shutdown ------------------------------------------------ */
+static void zap_sig_start_once(void) {
+    if (pipe(g_sig_pipe) != 0) {
+        fprintf(stderr, "zap: signal self-pipe creation failed\n");
+        return;
+    }
+    /* Non-blocking + close-on-exec on both ends (the handler's write must never
+     * block; the read end is drained edge-triggered). */
+    for (int i = 0; i < 2; i++) {
+        int fl = fcntl(g_sig_pipe[i], F_GETFL, 0);
+        fcntl(g_sig_pipe[i], F_SETFL, fl | O_NONBLOCK);
+        int fd = fcntl(g_sig_pipe[i], F_GETFD, 0);
+        fcntl(g_sig_pipe[i], F_SETFD, fd | FD_CLOEXEC);
+    }
+    g_sig_pd = zap_netpoll_open(g_sig_pipe[0]);
+    if (!g_sig_pd) {
+        /* Netpoller unavailable (non-Linux v1): signals degrade to no-ops. */
+        close(g_sig_pipe[0]);
+        close(g_sig_pipe[1]);
+        g_sig_pipe[0] = g_sig_pipe[1] = -1;
+        return;
+    }
+    zap_install_fault_handlers();
+    int rc = GC_pthread_create(&g_sig_thread, NULL, zap_sig_thread_main, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "zap: signal thread start failed (%d)\n", rc);
+        return;
+    }
+    g_sig_active = 1;
+}
+
+static int zap_signal_ensure(void) {
+    pthread_once(&g_sig_once, zap_sig_start_once);
+    return g_sig_active ? 0 : -1;
+}
+
+/* Stop the signal subsystem (program exit, from zap_rt_join_all). Wakes the
+ * signal thread off its netpoller park and joins it. No-op if never started. */
+static void zap_signal_shutdown(void) {
+    if (!g_sig_active) {
+        return;
+    }
+    g_sig_shutdown = 1;
+    /* Wake the signal thread off its netpoller park so it observes g_sig_shutdown
+     * and exits. zap_netpoll_wake now LATCHES when the thread is momentarily
+     * between waits (not parked), so this wake is race-free — a plain self-pipe
+     * write would rely on an EPOLLET edge that is lost if the pipe is non-empty,
+     * which is exactly how this join used to hang intermittently. */
+    if (g_sig_pd) {
+        zap_netpoll_wake(g_sig_pd, ZAP_POLL_READ);
+    }
+    GC_pthread_join(g_sig_thread, NULL);
+    if (g_sig_pd) {
+        zap_netpoll_close(g_sig_pd);
+        g_sig_pd = NULL;
+    }
+    if (g_sig_pipe[0] >= 0) {
+        close(g_sig_pipe[0]);
+    }
+    if (g_sig_pipe[1] >= 0) {
+        close(g_sig_pipe[1]);
+    }
+    g_sig_active = 0;
+}
+
+/* ---- public ABI: program-prologue init (default handlers) ----------------- */
+/* Emitted at the top of `main` by the lowerer. Starts the subsystem and installs
+ * the built-in default handlers, unless the runtime is built -DZAP_NO_DEFAULT_SIGNALS
+ * (opt-out, D-0058). A user `notify`/`@on_signal` for one of these signals later
+ * wins (fan-out suppresses the default — see zap_sig_dispatch). */
+void zap_signal_init(void) {
+#ifndef ZAP_NO_DEFAULT_SIGNALS
+    if (zap_signal_ensure() != 0) {
+        return;
+    }
+    pthread_mutex_lock(&g_sig_mu);
+    g_sig_default[SIGQUIT] = 1;
+    zap_sig_install(SIGQUIT);
+    g_sig_default[SIGUSR1] = 1;
+    zap_sig_install(SIGUSR1);
+    pthread_mutex_unlock(&g_sig_mu);
+#endif
+}
+
+/* ---- public ABI: signal.notify(signo) -> channel[Signal] ------------------ */
+void *zap_signal_notify(int64_t signo) {
+    if (zap_signal_ensure() != 0 || signo <= 0 || signo >= ZAP_NSIG) {
+        return zap_chan_new(1); /* inert channel: subsystem unavailable */
+    }
+    void *ch = zap_chan_new(1); /* cap-1 buffered + coalescing (D-0058) */
+    SigSub *s = (SigSub *)zap_obj(&zap_desc_sigsub);
+    s->chan = ch;
+    pthread_mutex_lock(&g_sig_mu);
+    s->next = g_sig_subs[signo];
+    g_sig_subs[signo] = s;
+    zap_sig_install((int)signo); /* notify takes over disposition */
+    pthread_mutex_unlock(&g_sig_mu);
+    return ch;
+}
+
+/* ---- public ABI: @on_signal(signo) handler registration ------------------- */
+typedef void (*zap_sig_cb)(void);
+typedef struct {
+    void *ch;
+    zap_sig_cb fn;
+} SigCbArg;
+
+/* A detached goroutine that invokes the decorated handler on each delivery. It
+ * parks on the notify channel (real G, green stack), so the handler runs in full
+ * Zap context — never on the signal thread. */
+static void *zap_sig_cb_loop(void *arg) {
+    SigCbArg *a = (SigCbArg *)arg;
+    for (;;) {
+        (void)zap_chan_recv_i64(a->ch); /* block until a signal is delivered */
+        a->fn();
+    }
+    return NULL;
+}
+
+void zap_signal_on(int64_t signo, void *fn) {
+    void *ch = zap_signal_notify(signo);
+    SigCbArg *a = (SigCbArg *)zap_buf((int64_t)sizeof(SigCbArg));
+    a->ch = ch;
+    a->fn = (zap_sig_cb)fn;
+    /* `a` holds `ch` (already rooted by its SigSub) and a code pointer; it is
+     * reachable from the spawned G's arg field, which both collectors trace. */
+    zap_spawn_detached(zap_sig_cb_loop, a);
+}
+
+/* ---- public ABI: scope(cancel_on=mask, grace=ms) -------------------------- */
+/* Grace hard-exit timer: a plain (non-GC) detached thread. It references only
+ * the malloc'd ScopeSigSub (refcounted), never the GC Scope, so it is immune to
+ * the Scope being collected after the block exits. If the scope has not left its
+ * block (completed) when the grace period elapses, force process exit. */
+static void *zap_grace_timer(void *arg) {
+    ScopeSigSub *ss = (ScopeSigSub *)arg;
+    int64_t ms = ss->grace_ms;
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+    pthread_mutex_lock(&g_sig_mu);
+    int done = ss->completed;
+    if (--ss->refcnt == 0) {
+        free(ss);
+    }
+    pthread_mutex_unlock(&g_sig_mu);
+    if (!done) {
+        fprintf(stderr,
+                "zap: graceful-shutdown grace period (%lldms) elapsed; forcing exit\n",
+                (long long)ms);
+        fflush(stderr);
+        _exit(1);
+    }
+    return NULL;
+}
+
+/* Caller holds g_sig_mu. Start one grace timer for this subscription. */
+static void zap_grace_arm(ScopeSigSub *ss) {
+    ss->refcnt++;
+    pthread_t t;
+    if (pthread_create(&t, NULL, zap_grace_timer, ss) != 0) {
+        ss->refcnt--; /* could not arm: drop the extra ref */
+        return;
+    }
+    pthread_detach(t);
+}
+
+/* `scope(cancel_on=[..], grace=ms)` (ticket #77): arm `scope` to cancel when any
+ * signal in `mask` (bit N = signal N) fires; `grace_ms > 0` adds a hard-exit
+ * deadline measured from the first such signal. Called right after
+ * zap_scope_enter; paired with zap_scope_disarm at the scope's dedent. */
+void zap_scope_cancel_on(void *scope_, int64_t mask, int64_t grace_ms) {
+    if (zap_signal_ensure() != 0 || mask == 0) {
+        return;
+    }
+    Scope *sc = (Scope *)scope_;
+    pthread_mutex_lock(&g_sig_mu);
+    for (int s = 1; s < ZAP_NSIG && s < 63; s++) {
+        if (!(mask & (1LL << s))) {
+            continue;
+        }
+        ScopeSigSub *n = (ScopeSigSub *)malloc(sizeof(ScopeSigSub));
+        if (!n) {
+            continue;
+        }
+        n->scope = sc;
+        n->grace_ms = grace_ms;
+        n->completed = 0;
+        n->refcnt = 1;
+        n->next = g_scope_subs[s];
+        g_scope_subs[s] = n;
+        zap_sig_install(s);
+    }
+    pthread_mutex_unlock(&g_sig_mu);
+}
+
+/* Remove every cancel_on subscription for `scope` (its block has exited). Marks
+ * each node completed so a pending grace timer stands down, and frees nodes with
+ * no outstanding timer. */
+void zap_scope_disarm(void *scope_) {
+    Scope *sc = (Scope *)scope_;
+    pthread_mutex_lock(&g_sig_mu);
+    for (int s = 1; s < ZAP_NSIG; s++) {
+        ScopeSigSub **pp = &g_scope_subs[s];
+        while (*pp) {
+            ScopeSigSub *n = *pp;
+            if (n->scope == sc) {
+                *pp = n->next;
+                n->completed = 1;
+                if (--n->refcnt == 0) {
+                    free(n);
+                }
+            } else {
+                pp = &n->next;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_sig_mu);
+}
+
+/* ---- Immix root marker: keep notify channels + sub nodes reachable -------- */
+#ifdef ZAP_GC_IMMIX
+static void zap_sig_mark_roots(void) {
+    pthread_mutex_lock(&g_sig_mu);
+    for (int s = 0; s < ZAP_NSIG; s++) {
+        /* Marking each head traces the whole {next, chan} chain via the precise
+         * SigSub descriptor (the marker is a transitive BFS worklist). */
+        zap_gc_mark(g_sig_subs[s]);
+    }
+    pthread_mutex_unlock(&g_sig_mu);
+}
+#endif
+
+/* ---- test-only: raise a signal to this process (ticket #77) --------------- *
+ * Backs the internal `__raise_signal(n)` builtin used by the signal goldens.
+ * PROCESS-directed (kill(getpid)) rather than thread-directed (raise), so that
+ * with the handled signals masked on the caller the kernel delivers to the
+ * dedicated signal thread — exactly the production path. Test scaffolding, like
+ * `__signal_selftest`; it is not a public language surface. */
+void zap_signal_raise(int64_t signo) {
+    int s = (int)signo;
+    int is_fault = (s == SIGSEGV || s == SIGFPE || s == SIGBUS || s == SIGILL);
+    if (is_fault || !g_sig_active) {
+        kill(getpid(), s); /* fault: the crash handler runs + re-raises (no return) */
+        return;
+    }
+    sig_atomic_t before = g_sig_delivered;
+    kill(getpid(), s);
+    /* Spin until the async handler has written this edge to the self-pipe, so a
+     * following __signal_drain sees it first in FIFO order. Bounded so a dropped
+     * signal cannot hang a test. */
+    for (int i = 0; i < 2000000 && g_sig_delivered == before; i++) {
+        sched_yield();
+    }
+}
+
+/* Block until the signal thread has dispatched every edge raised so far
+ * (ticket #77 test sync; backs `__signal_drain`). Pushes a sentinel behind the
+ * pending edges and waits for the signal thread to reach it. */
+void zap_signal_drain(void) {
+    if (!g_sig_active) {
+        return;
+    }
+    /* Precise GC (#48): this caller (typically a mutator — e.g. the main thread)
+     * blocks on the condvar below, so mark it GC-safe. Otherwise a SIGUSR1
+     * default handler's forced GC (stop-the-world, run on the signal thread)
+     * would deadlock waiting for this thread to reach a safepoint it can never
+     * reach while parked here. Its roots were flushed on entry (same contract as
+     * gopark's native-waiter path / scope_join). */
+    zap_enter_blocking();
+    pthread_mutex_lock(&g_sig_sync_mu);
+    int64_t want = g_sig_sync_seq + 1;
+    unsigned char b = ZAP_SIG_SYNC_BYTE;
+    ssize_t r;
+    do {
+        r = write(g_sig_pipe[1], &b, 1);
+    } while (r < 0 && errno == EINTR);
+    while (g_sig_sync_seq < want) {
+        pthread_cond_wait(&g_sig_sync_cv, &g_sig_sync_mu);
+    }
+    pthread_mutex_unlock(&g_sig_sync_mu);
+    zap_leave_blocking();
+}
+
+/* ---- C-level integration self-test (ticket #77) --------------------------- *
+ * No language I/O yet at bring-up, so this drives the self-pipe + netpoller +
+ * dispatch end-to-end from C (mirrors __netpoll_selftest). It subscribes to
+ * SIGUSR2, raises it twice in quick succession (the second must COALESCE on the
+ * cap-1 channel), receives exactly one delivery of the right value, confirms the
+ * second was dropped, and returns the number of sub-checks that passed
+ * (ZAP_SIG_SELFTEST_CHECKS on full success). */
+#define ZAP_SIG_SELFTEST_CHECKS 2
+int64_t zap_signal_selftest(void) {
+    int64_t passed = 0;
+    void *ch = zap_signal_notify(SIGUSR2);
+    if (!g_sig_active) {
+        fprintf(stderr, "signal selftest: subsystem inactive\n");
+        return 0;
+    }
+    /* Deliver two edges; coalescing means the cap-1 channel holds one. Must be
+     * PROCESS-directed (kill(getpid)), not thread-directed (raise): the handled
+     * signal is masked on this thread and unblocked only on the signal thread. */
+    kill(getpid(), SIGUSR2);
+    /* Spin briefly so the signal thread delivers the first edge before the
+     * second arrives (keeps the test deterministic without a second channel). */
+    for (int i = 0; i < 100; i++) {
+        struct timespec ts = {0, 1000000L}; /* 1 ms */
+        nanosleep(&ts, NULL);
+        pthread_mutex_lock(&((ZapChan *)ch)->mu);
+        int64_t cnt = ((ZapChan *)ch)->count;
+        pthread_mutex_unlock(&((ZapChan *)ch)->mu);
+        if (cnt > 0) {
+            break;
+        }
+    }
+    kill(getpid(), SIGUSR2); /* second edge: buffer full -> coalesced (dropped) */
+    struct timespec ts = {0, 20000000L}; /* 20 ms settle */
+    nanosleep(&ts, NULL);
+    int64_t got = zap_chan_recv_i64(ch); /* one delivery */
+    if (got == SIGUSR2) {
+        passed++;
+    } else {
+        fprintf(stderr, "signal selftest: delivered %lld, want %d\n",
+                (long long)got, SIGUSR2);
+    }
+    /* The coalesced edge must have left the channel empty (no second value). */
+    pthread_mutex_lock(&((ZapChan *)ch)->mu);
+    int64_t remaining = ((ZapChan *)ch)->count;
+    pthread_mutex_unlock(&((ZapChan *)ch)->mu);
+    if (remaining == 0) {
+        passed++;
+    } else {
+        fprintf(stderr, "signal selftest: %lld edges not coalesced\n",
+                (long long)remaining);
+    }
+    return passed;
+}
+
+/* ===========================================================================
  * Type descriptors for the runtime's own heap types (ticket #48). Both GC
  * builds read `.size`; the precise Immix collector also reads `.kind` and the
  * pointer-offset arrays. Codegen emits the descriptors for *user* structs and
@@ -3389,6 +4182,10 @@ static const int32_t zap_off_gobj[] = {
     (int32_t)offsetof(G, stack),
     (int32_t)offsetof(G, arg),
     (int32_t)offsetof(G, scope),
+};
+static const int32_t zap_off_sigsub[] = {
+    (int32_t)offsetof(SigSub, next),
+    (int32_t)offsetof(SigSub, chan),
 };
 
 const ZapTypeDesc zap_desc_atomic = {0, ZAP_TD_ATOMIC, 0, NULL};
@@ -3407,6 +4204,8 @@ const ZapTypeDesc zap_desc_pyobj = {(int64_t)sizeof(ZapPy), ZAP_TD_ATOMIC, 0, NU
 const ZapTypeDesc zap_desc_strobj = {(int64_t)sizeof(ZapStr), ZAP_TD_PRECISE, 1,
                                      zap_off_strobj};
 const ZapTypeDesc zap_desc_gobj = {(int64_t)sizeof(G), ZAP_TD_PRECISE, 3, zap_off_gobj};
+const ZapTypeDesc zap_desc_sigsub = {(int64_t)sizeof(SigSub), ZAP_TD_PRECISE, 2,
+                                     zap_off_sigsub};
 
 #ifdef ZAP_GC_IMMIX
 /* Custom root: the reflection registry is a static table (not a heap object)
@@ -3426,6 +4225,7 @@ static void zap_reflect_mark_roots(void) {
 __attribute__((constructor)) static void zap_gc_register_statics(void) {
     zap_gc_add_root((void **)&g_cancelled);
     zap_gc_add_root_fn(zap_reflect_mark_roots);
+    zap_gc_add_root_fn(zap_sig_mark_roots); /* ticket #77: notify subscribers    */
 }
 
 /* The precise Immix collector implementation. Included last so it sees every

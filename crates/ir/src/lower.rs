@@ -228,6 +228,10 @@ fn inplace_op_dunder(op: AstBin) -> Option<&'static str> {
 }
 
 pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
+    // Prepend the built-in prelude (`Signal` enum, `MemStats` struct) so the
+    // signals surface lowers through the ordinary enum/struct paths. Must match
+    // the set sema sees (both call the same helper), ticket #77.
+    let module = &zapc_syntax::parser::with_prelude(module);
     let mut errors = Vec::new();
 
     // Collect struct ids and tier-3-enum tagged-struct ids (a tier-3 enum is
@@ -446,7 +450,15 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     for item in &module.items {
         match item {
             ast::Item::Function(f) => {
-                match lower_fn(f, f.name.clone(), None, &sigs, &ctx, &deco.reflect_meta) {
+                match lower_fn(
+                    f,
+                    f.name.clone(),
+                    None,
+                    &sigs,
+                    &ctx,
+                    &deco.reflect_meta,
+                    &deco.on_signal_meta,
+                ) {
                     Ok(func) => out.funcs.push(func),
                     Err(e) => errors.push(e),
                 }
@@ -455,7 +467,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 let sid = ctx.ids[&s.name];
                 for m in &s.methods {
                     let name = format!("{}__{}", s.name, m.name);
-                    match lower_fn(m, name, Some(sid), &sigs, &ctx, &[]) {
+                    match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[]) {
                         Ok(func) => out.funcs.push(func),
                         Err(e) => errors.push(e),
                     }
@@ -828,6 +840,9 @@ struct DecoratorPlan {
     derived: Vec<(u32, Vec<DerivedTrait>)>,
     /// `(type_name, decorator_or_annotation_name)` pairs for runtime reflection.
     reflect_meta: Vec<(String, String)>,
+    /// `@on_signal(Signal.X)` handlers (ticket #77): `(signal_number, fn_name)`
+    /// pairs, registered at the top of `main` via `zap_signal_on`.
+    on_signal_meta: Vec<(i64, String)>,
 }
 
 impl DecoratorPlan {
@@ -854,6 +869,7 @@ impl DecoratorPlan {
 
         let mut derived: Vec<(u32, Vec<DerivedTrait>)> = Vec::new();
         let mut reflect_meta: Vec<(String, String)> = Vec::new();
+        let mut on_signal_meta: Vec<(i64, String)> = Vec::new();
 
         for item in &module.items {
             match item {
@@ -915,7 +931,40 @@ impl DecoratorPlan {
                         defer_fn_decorators(m, errors);
                     }
                 }
-                ast::Item::Function(f) => defer_fn_decorators(f, errors),
+                ast::Item::Function(f) => {
+                    // `@on_signal(Signal.X)` (ticket #77): register `f` as a
+                    // handler for signal X; a detached receiver goroutine runs it
+                    // on each delivery. Other function decorators remain deferred.
+                    for d in &f.decorators {
+                        if d.name == "on_signal" {
+                            if !f.params.is_empty() {
+                                errors.push(err(format!(
+                                    "@on_signal handler '{}' must take no parameters",
+                                    f.name
+                                )));
+                            }
+                            match on_signal_number(d, ctx) {
+                                Ok(signo) => on_signal_meta.push((signo, f.name.clone())),
+                                Err(e) => errors.push(e),
+                            }
+                        } else {
+                            errors.push(err(format!(
+                                "function decorators are not implemented yet (deferred): \
+                                 '@{}' on '{}'",
+                                d.name, f.name
+                            )));
+                        }
+                    }
+                    for p in &f.params {
+                        if !p.decorators.is_empty() {
+                            errors.push(err(format!(
+                                "parameter decorators are not implemented yet (deferred): \
+                                 '@{}' on '{}'",
+                                p.decorators[0].name, p.name
+                            )));
+                        }
+                    }
+                }
                 ast::Item::Enum(e) if !e.decorators.is_empty() => {
                     errors.push(err(format!(
                         "enum decorators are not implemented yet (deferred): '@{}'",
@@ -929,8 +978,33 @@ impl DecoratorPlan {
         DecoratorPlan {
             derived,
             reflect_meta,
+            on_signal_meta,
         }
     }
+}
+
+/// Resolve the single `Signal.X` argument of an `@on_signal(...)` decorator to
+/// its OS signal number (ticket #77). The argument must be a `Signal` enum
+/// member (a tier-1 discriminant that IS the signal number). Sema has already
+/// validated the shape; this mirrors it for lowering and errors defensively.
+fn on_signal_number(d: &ast::Decorator, ctx: &StructCtx) -> Result<i64, LowerError> {
+    if d.args.len() != 1 {
+        return Err(err(
+            "@on_signal(Signal.X) takes exactly one Signal argument".to_string(),
+        ));
+    }
+    if let Expr::Attr { base, name, .. } = &d.args[0].value {
+        if let Expr::Name(tyname, _) = base.as_ref() {
+            if tyname == "Signal" {
+                if let Some(v) = ctx.enums.get("Signal").and_then(|e| e.member_value(name)) {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+    Err(err(
+        "@on_signal expects a Signal member, e.g. @on_signal(Signal.SIGINT)".to_string(),
+    ))
 }
 
 /// Report function/parameter decorators as deferred (not implemented yet).
@@ -1324,6 +1398,7 @@ fn lower_fn(
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &StructCtx,
     reflect_meta: &[(String, String)],
+    on_signal_meta: &[(i64, String)],
 ) -> Result<Func, LowerError> {
     let (params, ret) = sigs.get(&zir_name).cloned().unwrap();
     let is_main = zir_name == "main";
@@ -1351,6 +1426,20 @@ fn lower_fn(
         // anywhere in the program see every annotated/decorated type. These are
         // plain (non-throwing) runtime calls emitted before the user body.
         b.emit_reflect_registrations(reflect_meta);
+        // Signal subsystem bootstrap (ticket #77, D-0058): start the dedicated
+        // signal thread + self-pipe and install the default diagnostic handlers
+        // (SIGQUIT -> stacks/runtime dump, SIGUSR1 -> GC + mem stats), unless the
+        // runtime is built -DZAP_NO_DEFAULT_SIGNALS. A no-op there; otherwise the
+        // handlers are live for the whole program (user notify/@on_signal wins).
+        b.emit(Inst::Call {
+            dest: None,
+            func: "zap_signal_init".to_string(),
+            args: vec![],
+        });
+        // `@on_signal(Signal.X)` handler registrations (ticket #77): each spawns
+        // a detached receiver goroutine over `signal.notify(X)` that invokes the
+        // decorated function on every delivery. Emitted at the top of `main`.
+        b.emit_on_signal_registrations(on_signal_meta);
         // `main` installs an implicit top-level landing pad so an exception that
         // propagates out of the program is caught and reported (message + exit 1)
         // rather than ending in a raw abort (RUNTIME-ABI §"Exception / unwinding
@@ -1693,6 +1782,26 @@ impl<'a> FnLower<'a> {
                 dest: None,
                 func: "zap_reflect_register".to_string(),
                 args: vec![tv, nv],
+            });
+        }
+    }
+
+    /// Emit `zap_signal_on(signo, &handler)` for every `@on_signal(Signal.X)`
+    /// handler (ticket #77). Called once at the top of `main`. The runtime
+    /// subscribes to the signal and spawns a detached goroutine that invokes the
+    /// handler on each delivery (so it runs in full Zap context).
+    fn emit_on_signal_registrations(&mut self, meta: &[(i64, String)]) {
+        for (signo, fn_name) in meta {
+            let s = self.iconst(Ty::I64, *signo);
+            let fv = self.new_value(Ty::Ptr);
+            self.emit(Inst::FuncAddr {
+                dest: fv,
+                func: fn_name.clone(),
+            });
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_signal_on".to_string(),
+                args: vec![s, fv],
             });
         }
     }
@@ -2173,6 +2282,25 @@ impl<'a> FnLower<'a> {
             args: vec![policy],
         });
 
+        // `cancel_on=[Signal.X, ...]` + optional `grace=<ms>` (ticket #77,
+        // D-0058): arm this scope so a listed signal cancels its tree, with an
+        // optional hard-exit deadline. The subscription is removed inside
+        // `zap_scope_exit`/`_cancel` (after the join), so it stays active while
+        // the scope awaits its children.
+        let cancel_mask = self.scope_cancel_mask(opts)?;
+        if cancel_mask != 0 {
+            let grace = match self.scope_grace(opts)? {
+                Some(v) => v,
+                None => self.iconst(Ty::I64, 0),
+            };
+            let maskv = self.iconst(Ty::I64, cancel_mask);
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_scope_cancel_on".to_string(),
+                args: vec![handle, maskv, grace],
+            });
+        }
+
         let lp = self.new_block();
         let after = self.new_block();
 
@@ -2255,11 +2383,63 @@ impl<'a> FnLower<'a> {
                         "scope(timeout=...) is not supported yet (the timer API is deferred)",
                     ))
                 }
+                // Handled separately by `scope_cancel_on` (ticket #77).
+                Some("cancel_on") | Some("grace") => continue,
                 Some(other) => return Err(err(format!("scope() has no option '{other}'"))),
                 None => return Err(err("scope() options must be keyword arguments")),
             }
         }
         Ok(policy)
+    }
+
+    /// The `cancel_on` signal bitmask for a `scope(cancel_on=[Signal.X, ...])`
+    /// (ticket #77, D-0058): bit N set for each listed signal number. Returns 0
+    /// when the scope has no `cancel_on`. The `Signal` members are tier-1
+    /// discriminants that ARE the OS signal numbers.
+    fn scope_cancel_mask(&self, opts: &[ast::Arg]) -> Result<i64, LowerError> {
+        let mut mask: i64 = 0;
+        for a in opts {
+            if a.name.as_deref() != Some("cancel_on") {
+                continue;
+            }
+            let Expr::List(elems, _) = &a.value else {
+                return Err(err(
+                    "scope cancel_on expects a list, e.g. cancel_on=[Signal.SIGINT]",
+                ));
+            };
+            for e in elems {
+                let signo = match e {
+                    Expr::Attr { base, name, .. } if matches!(base.as_ref(), Expr::Name(n, _) if n == "Signal") => {
+                        self.ctx
+                            .enums
+                            .get("Signal")
+                            .and_then(|en| en.member_value(name))
+                            .ok_or_else(|| err(format!("unknown Signal member '{name}'")))?
+                    }
+                    _ => {
+                        return Err(err(
+                            "scope cancel_on expects Signal members, e.g. Signal.SIGINT",
+                        ))
+                    }
+                };
+                if (1..63).contains(&signo) {
+                    mask |= 1i64 << signo;
+                }
+            }
+        }
+        Ok(mask)
+    }
+
+    /// The `grace=<ms>` hard-exit deadline expression for a `scope(...)`, lowered
+    /// to an i64 value (ticket #77); `None` when absent (no deadline).
+    fn scope_grace(&mut self, opts: &[ast::Arg]) -> Result<Option<Value>, LowerError> {
+        for a in opts {
+            if a.name.as_deref() == Some("grace") {
+                let (v, vt) = self.expr(&a.value)?;
+                return Ok(Some(self.coerce(v, vt, Ty::I64)));
+            }
+        }
+        Ok(None)
     }
 
     /// Balance the `__cxa_begin_catch` performed on landing-pad entry. Called on
@@ -3702,6 +3882,15 @@ impl<'a> FnLower<'a> {
                 if self.ctx.enums.contains_key(tyname) {
                     return self.lower_variant_construct(tyname, name, args);
                 }
+                // Built-in `signal`/`gc`/`runtime` module calls (ticket #77,
+                // D-0058), intercepted before the base is lowered as a value
+                // (these module names are not value bindings). Not intercepted
+                // when shadowed by a local of the same name.
+                if self.lookup(tyname).is_none() {
+                    if let Some(r) = self.lower_builtin_module_call(tyname, name, args)? {
+                        return Ok(r);
+                    }
+                }
             }
         }
         // Array construction `array[dtype]([...])` (ticket #24). The callee
@@ -3803,6 +3992,48 @@ impl<'a> FnLower<'a> {
                     args: vec![],
                 });
                 return Ok((d, Ty::I64));
+            }
+            // `__signal_selftest()` (ticket #77): internal signal-subsystem
+            // integration-test hook; returns the number of sub-checks that passed.
+            if fname == "__signal_selftest" {
+                if !args.is_empty() {
+                    return Err(err("__signal_selftest() takes no arguments"));
+                }
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_signal_selftest".to_string(),
+                    args: vec![],
+                });
+                return Ok((d, Ty::I64));
+            }
+            // `__raise_signal(n)` (ticket #77): internal test hook; send signal n
+            // to this process so a golden can trigger delivery deterministically.
+            if fname == "__raise_signal" {
+                if args.len() != 1 {
+                    return Err(err("__raise_signal(n) takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let n = self.coerce(v, vt, Ty::I64);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_signal_raise".to_string(),
+                    args: vec![n],
+                });
+                return Ok((self.iconst(Ty::I32, 0), Ty::I32));
+            }
+            // `__signal_drain()` (ticket #77): block until the signal thread has
+            // dispatched everything raised so far (deterministic goldens).
+            if fname == "__signal_drain" {
+                if !args.is_empty() {
+                    return Err(err("__signal_drain() takes no arguments"));
+                }
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_signal_drain".to_string(),
+                    args: vec![],
+                });
+                return Ok((self.iconst(Ty::I32, 0), Ty::I32));
             }
             if fname == "len" {
                 if args.len() != 1 {
@@ -4006,6 +4237,98 @@ impl<'a> FnLower<'a> {
                 base: dest,
                 sid,
                 idx,
+                val: v,
+            });
+        }
+        Ok((dest, Ty::Struct(sid)))
+    }
+
+    /// Lower a built-in `signal`/`gc`/`runtime` module call (ticket #77, D-0058),
+    /// or return `Ok(None)` if `(module, method)` is not one. Sema has already
+    /// type-checked these; the lowering emits the backing runtime calls.
+    fn lower_builtin_module_call(
+        &mut self,
+        module: &str,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<Option<(Value, Ty)>, LowerError> {
+        let call0 = |this: &mut Self, func: &str, ret: Ty| -> (Value, Ty) {
+            if ret == Ty::Void {
+                this.emit(Inst::Call {
+                    dest: None,
+                    func: func.to_string(),
+                    args: vec![],
+                });
+                (this.iconst(Ty::I32, 0), Ty::I32)
+            } else {
+                let d = this.new_value(ret);
+                this.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![],
+                });
+                (d, ret)
+            }
+        };
+        match (module, method) {
+            // signal.notify(Signal) -> channel[Signal]. The argument is a tier-1
+            // `Signal`, i.e. its backing i64 = the OS signal number; the channel
+            // delivers that number (recv yields i64, matching Signal's backing).
+            ("signal", "notify") => {
+                if args.len() != 1 {
+                    return Err(err("signal.notify(sig) takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let signo = self.coerce(v, vt, Ty::I64);
+                let ch = self.new_value(Ty::Chan(Elem::I64));
+                self.emit(Inst::Call {
+                    dest: Some(ch),
+                    func: "zap_signal_notify".to_string(),
+                    args: vec![signo],
+                });
+                Ok(Some((ch, Ty::Chan(Elem::I64))))
+            }
+            ("gc", "collect") => Ok(Some(call0(self, "zap_gc_collect", Ty::Void))),
+            ("gc", "stats") => Ok(Some(self.lower_gc_stats()?)),
+            ("runtime", "goroutine_dump") => {
+                Ok(Some(call0(self, "zap_runtime_goroutine_dump", Ty::Void)))
+            }
+            ("runtime", "num_goroutines") => {
+                Ok(Some(call0(self, "zap_runtime_num_goroutines", Ty::I64)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Build a `MemStats` value struct from the runtime GC/scheduler getters
+    /// (ticket #77). Field order matches the prelude's `MemStats`:
+    /// `heap_bytes, live_bytes, free_bytes, gc_count, goroutines`.
+    fn lower_gc_stats(&mut self) -> Result<(Value, Ty), LowerError> {
+        let sid = *self
+            .ctx
+            .ids
+            .get("MemStats")
+            .ok_or_else(|| err("MemStats struct unavailable (built-in prelude missing)"))?;
+        let getters = [
+            "zap_gc_heap_bytes",
+            "zap_gc_live_bytes",
+            "zap_gc_free_bytes",
+            "zap_gc_count",
+            "zap_runtime_num_goroutines",
+        ];
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        for (idx, func) in getters.iter().enumerate() {
+            let v = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(v),
+                func: (*func).to_string(),
+                args: vec![],
+            });
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: idx as u32,
                 val: v,
             });
         }

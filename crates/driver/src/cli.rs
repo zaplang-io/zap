@@ -54,6 +54,11 @@ pub enum Command {
     /// Serves over stdio. `root` is the codebase root for the code-graph and
     /// test surfaces (default: the current directory).
     Mcp { root: Option<String> },
+    /// `zap inspect <pid> [--gc]` — signal a running Zap process to dump its
+    /// runtime diagnostics (ticket #77, D-0058), so operators need not hand-run
+    /// `kill`. Default: SIGQUIT (goroutine stacks + runtime/scheduler summary).
+    /// `--gc`: SIGUSR1 (force a GC + print memory stats) instead.
+    Inspect { pid: String, gc: bool },
     /// `zap version`.
     Version,
     /// `zap help`.
@@ -146,6 +151,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::Test { file, json, watch })
         }
         "mcp" => parse_mcp(rest),
+        "inspect" => parse_inspect(rest),
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown subcommand `{other}`")),
@@ -211,6 +217,30 @@ fn parse_mcp(args: &[String]) -> Result<Command, String> {
         }
     }
     Ok(Command::Mcp { root })
+}
+
+/// Parse `zap inspect <pid> [--gc]` (ticket #77, D-0058). Exactly one positional
+/// (the pid); `--gc`/`-g` selects the SIGUSR1 (GC-stats) action over the default
+/// SIGQUIT (stack/runtime dump).
+fn parse_inspect(args: &[String]) -> Result<Command, String> {
+    let mut pid: Option<String> = None;
+    let mut gc = false;
+    for a in args {
+        match a.as_str() {
+            "--gc" | "-g" => gc = true,
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            other => {
+                if pid.is_some() {
+                    return Err(format!("unexpected extra argument `{other}`"));
+                }
+                pid = Some(other.to_string());
+            }
+        }
+    }
+    match pid {
+        Some(pid) => Ok(Command::Inspect { pid, gc }),
+        None => Err("`zap inspect` needs a process id: `zap inspect <pid> [--gc]`".to_string()),
+    }
 }
 
 /// The first non-flag argument, if any.
@@ -339,6 +369,7 @@ pub fn execute(cmd: Command) -> ExitCode {
         Command::Zenv(sub) => cmd_zenv(sub),
         Command::Test { file, json, watch } => cmd_test(file, json, watch),
         Command::Mcp { root } => crate::mcp::serve(root),
+        Command::Inspect { pid, gc } => cmd_inspect(&pid, gc),
         Command::Version => {
             println!("zap {}", crate::VERSION);
             ExitCode::SUCCESS
@@ -524,6 +555,49 @@ fn cmd_remove(name: &str) -> ExitCode {
     }
 }
 
+/// `zap inspect <pid> [--gc]` — signal a running Zap process to print its
+/// runtime diagnostics (ticket #77, D-0058). Sends SIGQUIT (goroutine stacks +
+/// runtime/scheduler summary) by default, or SIGUSR1 (force GC + memory stats)
+/// with `--gc`. The diagnostics appear on the TARGET process's stderr; this just
+/// delivers the signal (so operators need not hand-run `kill`). Dependency-free:
+/// shells out to the standard `kill` utility on the Unix target.
+fn cmd_inspect(pid: &str, gc: bool) -> ExitCode {
+    // Validate the pid is a positive integer so we never pass a process-group
+    // (negative) or garbage target to `kill`.
+    match pid.parse::<u32>() {
+        Ok(p) if p > 0 => {}
+        _ => {
+            eprintln!("zap inspect: invalid pid `{pid}` (expected a positive integer)");
+            return ExitCode::from(2);
+        }
+    }
+    let signame = if gc { "USR1" } else { "QUIT" };
+    let what = if gc {
+        "GC + memory stats"
+    } else {
+        "goroutine stacks + runtime dump"
+    };
+    match std::process::Command::new("kill")
+        .arg("-s")
+        .arg(signame)
+        .arg(pid)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            eprintln!("zap inspect: sent SIG{signame} to {pid} ({what}); see its stderr");
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!("zap inspect: could not signal {pid} (no such process, or not permitted)");
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("zap inspect: failed to run `kill`: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// `zap zenv <create|status|path|clean>` — the project environment (issue #69).
 fn cmd_zenv(sub: ZenvCmd) -> ExitCode {
     let root = Path::new(".");
@@ -639,6 +713,9 @@ agent interface:
                         a token-efficient code graph, and targeted tests (stdio)
 
 diagnostics:
+  inspect <pid>         signal a running Zap process to dump goroutine stacks +
+                        a runtime/scheduler summary to its stderr (D-0058)
+          --gc          force a GC and print memory stats instead (SIGUSR1)
   version               print the toolchain version
   help                  show this help
 
@@ -805,6 +882,38 @@ mod tests {
         assert!(p(&["mcp", "--root"]).is_err());
         assert!(p(&["mcp", "--socket"]).is_err());
         assert!(p(&["mcp", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn inspect_parses_pid_and_gc_flag() {
+        assert_eq!(
+            p(&["inspect", "1234"]).unwrap(),
+            Command::Inspect {
+                pid: "1234".into(),
+                gc: false
+            }
+        );
+        assert_eq!(
+            p(&["inspect", "1234", "--gc"]).unwrap(),
+            Command::Inspect {
+                pid: "1234".into(),
+                gc: true
+            }
+        );
+        assert_eq!(
+            p(&["inspect", "-g", "1234"]).unwrap(),
+            Command::Inspect {
+                pid: "1234".into(),
+                gc: true
+            }
+        );
+    }
+
+    #[test]
+    fn inspect_needs_a_pid() {
+        assert!(p(&["inspect"]).is_err());
+        assert!(p(&["inspect", "1", "2"]).is_err());
+        assert!(p(&["inspect", "--bogus"]).is_err());
     }
 
     #[test]
