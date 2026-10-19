@@ -70,6 +70,106 @@ static ZapBlock *zap_all_blocks = NULL;     /* every mapped block (sweep walks) 
 static ZapBlock *zap_cur_block = NULL;      /* current small allocation block     */
 static size_t zap_bytes_since_gc = 0;
 static size_t zap_live_estimate = 0;
+
+/* ---- block registry ------------------------------------------------------- *
+ * An open-addressing hash set of block base addresses, so the marker can decide
+ * in O(1) whether an arbitrary pointer addresses one of our heap blocks. This
+ * makes rooting robust: codegen roots every pointer-TYPED SSA value, but some of
+ * those are not GC-heap pointers (stack allocas, function addresses, inline
+ * value-struct pointers). A non-heap pointer's computed block base is not in the
+ * registry, so the marker safely ignores it. In precise mode (no conservative
+ * scanning) every real GC pointer addresses an object START, so membership +
+ * 16-byte alignment is sufficient to accept it; a reachable object is never
+ * freed-then-reused underneath a live pointer, so no stale pointer can alias a
+ * different live object. */
+static uintptr_t *zap_reg = NULL; /* table of block bases (0 = empty, 1 = tomb) */
+static size_t zap_reg_cap = 0;
+static size_t zap_reg_len = 0;
+
+static void zap_reg_insert(uintptr_t base);
+
+static void zap_reg_grow(void) {
+    size_t ncap = zap_reg_cap ? zap_reg_cap * 2 : 256;
+    uintptr_t *old = zap_reg;
+    size_t ocap = zap_reg_cap;
+    zap_reg = (uintptr_t *)calloc(ncap, sizeof(uintptr_t));
+    zap_reg_cap = ncap;
+    zap_reg_len = 0;
+    for (size_t i = 0; i < ocap; i++) {
+        if (old[i] > 1) {
+            zap_reg_insert(old[i]);
+        }
+    }
+    free(old);
+}
+
+static void zap_reg_insert(uintptr_t base) {
+    if ((zap_reg_len + 1) * 10 >= zap_reg_cap * 7) {
+        zap_reg_grow();
+    }
+    size_t mask = zap_reg_cap - 1;
+    size_t i = (base >> 15) & mask;
+    size_t first_tomb = (size_t)-1;
+    while (zap_reg[i] != 0) {
+        if (zap_reg[i] == base) {
+            return;
+        }
+        if (zap_reg[i] == 1 && first_tomb == (size_t)-1) {
+            first_tomb = i;
+        }
+        i = (i + 1) & mask;
+    }
+    if (first_tomb != (size_t)-1) {
+        i = first_tomb;
+    }
+    zap_reg[i] = base;
+    zap_reg_len++;
+}
+
+static void zap_reg_remove(uintptr_t base) {
+    if (!zap_reg_cap) {
+        return;
+    }
+    size_t mask = zap_reg_cap - 1;
+    size_t i = (base >> 15) & mask;
+    while (zap_reg[i] != 0) {
+        if (zap_reg[i] == base) {
+            zap_reg[i] = 1; /* tombstone */
+            zap_reg_len--;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static int zap_reg_has(uintptr_t base) {
+    if (!zap_reg_cap) {
+        return 0;
+    }
+    size_t mask = zap_reg_cap - 1;
+    size_t i = (base >> 15) & mask;
+    while (zap_reg[i] != 0) {
+        if (zap_reg[i] == base) {
+            return 1;
+        }
+        i = (i + 1) & mask;
+    }
+    return 0;
+}
+
+/* Is `p` a valid GC heap-object payload pointer? */
+static int zap_is_heap_ptr(void *p) {
+    uintptr_t u = (uintptr_t)p;
+    if (u == 0 || (u & 15u) != 0) {
+        return 0; /* payloads are 16-byte aligned (header is 16 bytes) */
+    }
+    uintptr_t base = (u - ZAP_HEADER_BYTES) & ~(uintptr_t)(ZAP_BLOCK - 1);
+    if (!zap_reg_has(base)) {
+        return 0;
+    }
+    /* Within the block's usable region (past the reserved metadata lines). */
+    return (u - ZAP_HEADER_BYTES) - base >= ZAP_RESERVED_BYTES;
+}
 static size_t zap_gc_threshold = 4u * 1024u * 1024u; /* initial trigger (4 MiB)   */
 static size_t zap_heap_limit = 0;           /* hard cap (ZAP_GC_HEAP_LIMIT), 0=off */
 static size_t zap_total_mapped = 0;
@@ -272,16 +372,14 @@ static void zap_mark_block_lines(void *payload, size_t obj_size) {
 }
 
 static void zap_mark_push(void *payload) {
-    if (payload == NULL) {
+    /* Reject null and any pointer that is not one of our heap object payloads.
+     * Codegen roots every pointer-TYPED value, some of which are stack allocas,
+     * function addresses or inline value-struct pointers — never GC objects —
+     * and a precise descriptor field could likewise hold such a pointer; the
+     * registry check safely ignores all of them. */
+    if (!zap_is_heap_ptr(payload)) {
         return;
     }
-    /* All GC pointers address a payload whose header word is the descriptor;
-     * function addresses and other non-heap pointers never reach here because
-     * codegen only roots values of pointer *type* that it allocated — but a
-     * stale shadow slot could still hold a non-heap pointer, so guard by only
-     * trusting the mark bit / descriptor once we know the pointer is ours.
-     * Since v1 does no conservative scanning, every pointer enqueued here is a
-     * real object payload; still, be defensive about the null descriptor. */
     if (ZAP_MARKED(payload)) {
         return;
     }
@@ -545,7 +643,10 @@ static void zap_sweep(void) {
                 pp = &b->all_next;
             } else {
                 *pp = b->all_next;
-                zap_total_mapped -= ((b->los_size + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
+                zap_reg_remove((uintptr_t)b);
+                zap_total_mapped -= ((b->los_size + sizeof(ZapBlock) + ZAP_BLOCK - 1) /
+                                     ZAP_BLOCK) *
+                                    ZAP_BLOCK;
                 free(b);
             }
             continue;
@@ -657,6 +758,7 @@ static ZapBlock *zap_map_block(void) {
     b->kind = ZAP_BK_SMALL;
     b->all_next = zap_all_blocks;
     zap_all_blocks = b;
+    zap_reg_insert((uintptr_t)b);
     zap_total_mapped += ZAP_BLOCK;
     zap_block_reset_marks(b);
     b->search_line = ZAP_RESERVED_LINES;
@@ -712,9 +814,11 @@ static void *zap_alloc_los(size_t osize) {
     b->los_size = osize;
     b->all_next = zap_all_blocks;
     zap_all_blocks = b;
+    zap_reg_insert((uintptr_t)b);
     zap_total_mapped += total;
-    /* Object header placed right after the block metadata, block-aligned lookup
-     * via (payload-8) & ~(BLOCK-1) lands on `b`. */
+    /* Object header placed right after the block metadata; a block-aligned
+     * lookup via (payload-16) & ~(BLOCK-1) lands on `b` (the payload sits in the
+     * first 32 KiB region). */
     return (char *)b + ZAP_RESERVED_BYTES;
 }
 
