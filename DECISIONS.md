@@ -81,6 +81,13 @@ distinct from `list[T]`. Full N-D is the target, built incrementally (1-D → N-
 Element-wise operator overloading, broadcasting, NumPy-style slicing (slices are
 **views**, D-0030). SIMD via LLVM vector ops layered on `vec[T,N]`. See
 `design/0002-arrays.md`.
+**Dtype promotion (#49):** mixed-dtype element-wise ops promote on the lattice
+`bool < uint8 < i64 < f64` (`i64 + f64 -> f64`); arithmetic never yields `bool`
+(`bool + bool -> uint8`, Python `bool`-as-`int`). Scalars are **weak** (NumPy
+NEP 50): an int scalar keeps the array dtype (`uint8 + 1` stays `uint8`), only a
+float scalar forces `f64`. Dtypes shipped: `f64`, `i64`, `uint8` (image data,
+1-byte), `bool` (masks, 1-byte); integer-array arithmetic wraps per D-0005
+(`uint8` mod 256). `f32`/`i32` dtypes remain deferred.
 
 ## D-0012 — Interop: Python-first, C later
 **Status:** Locked

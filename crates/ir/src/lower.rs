@@ -509,6 +509,10 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "int32" | "i32" => Ok(Ty::I32),
             "float64" | "f64" => Ok(Ty::F64),
             "float32" | "f32" => Ok(Ty::F32),
+            // `uint8`/`u8` is currently only an `array[T]` dtype (ticket #49),
+            // not a general scalar type; it resolves to `i8` so `dtype_of`
+            // recognizes it in a type-annotation `array[uint8]`.
+            "uint8" | "u8" => Ok(Ty::I8),
             "bool" => Ok(Ty::I1),
             "char" => Ok(Ty::I32),
             "str" | "bytes" => Ok(Ty::Ptr),
@@ -625,15 +629,17 @@ fn heap_elem_from_name(name: &str) -> Result<Elem, LowerError> {
     }
 }
 
-/// The array dtype for a `array[T]` element type (ticket #24). Only `f64` and
-/// `i64` are supported in this increment; other numeric dtypes (`f32`, `i32`)
-/// and dtype promotion are deferred.
+/// The array dtype for a `array[T]` element type (tickets #24, #49). Supported
+/// dtypes: `f64`, `i64`, `uint8` (image data), and `bool` (masks). Other
+/// numeric dtypes (`f32`, `i32`) are deferred.
 fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
     match resolve_ty(t, env)? {
         Ty::F64 => Ok(Dtype::F64),
         Ty::I64 => Ok(Dtype::I64),
+        Ty::I8 => Ok(Dtype::Uint8),
+        Ty::I1 => Ok(Dtype::Bool),
         other => Err(err(format!(
-            "array[{other}] is not supported yet (only array[f64] and array[i64])"
+            "array[{other}] is not supported yet (only array[f64], array[i64], array[uint8], array[bool])"
         ))),
     }
 }
@@ -644,8 +650,10 @@ fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
     match name {
         "float64" | "f64" => Ok(Dtype::F64),
         "int64" | "i64" => Ok(Dtype::I64),
+        "uint8" | "u8" => Ok(Dtype::Uint8),
+        "bool" => Ok(Dtype::Bool),
         other => Err(err(format!(
-            "array[{other}] is not supported yet (only array[f64] and array[i64])"
+            "array[{other}] is not supported yet (only array[f64], array[i64], array[uint8], array[bool])"
         ))),
     }
 }
@@ -5247,11 +5255,13 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Element-wise `+`/`-`/`*` on arrays, including scalar broadcast. Emits the
-    /// [`Inst::ArrayBinOp`] node codegen vectorizes. Both-array operands must
-    /// share a dtype (no promotion yet); `scalar op array` is only accepted for
-    /// the commutative `+`/`*` (reordered to `array op scalar`), so the SIMD
-    /// kernel always computes `array[i] op scalar`.
+    /// Element-wise `+`/`-`/`*` on arrays, including scalar broadcast and
+    /// mixed-dtype promotion (ticket #49). Emits the [`Inst::ArrayBinOp`] node
+    /// codegen vectorizes. Two arrays of different dtypes promote to the higher
+    /// dtype ([`Dtype::promote`], so `i64 + f64 -> f64`); a scalar is weak
+    /// ([`Dtype::promote_scalar`], so `uint8 + 1` stays `uint8`). `scalar op
+    /// array` is only accepted for the commutative `+`/`*` (reordered to `array
+    /// op scalar`), so the SIMD kernel always computes `array[i] op scalar`.
     fn array_binop(
         &mut self,
         op: AstBin,
@@ -5274,34 +5284,45 @@ impl<'a> FnLower<'a> {
         let is_scalar = |t: Ty| t.is_float() || t.int_width().is_some();
         match (lt, rt) {
             (Ty::Array(ld), Ty::Array(rd)) => {
-                if ld != rd {
-                    return Err(err(
-                        "element-wise array ops require the same dtype on both sides (dtype promotion is deferred)",
-                    ));
-                }
-                let dest = self.new_value(Ty::Array(ld));
+                let out = Dtype::promote(ld, rd);
+                let dest = self.new_value(Ty::Array(out));
                 self.emit(Inst::ArrayBinOp {
                     dest,
                     op: irop,
-                    dtype: ld,
+                    out,
                     lhs: l,
+                    lhs_dtype: ld,
                     rhs: r,
+                    rhs_dtype: rd,
                     scalar: false,
                 });
-                Ok((dest, Ty::Array(ld)))
+                Ok((dest, Ty::Array(out)))
             }
             (Ty::Array(ld), _) if is_scalar(rt) => {
-                let s = self.coerce(r, rt, ld.ty());
-                let dest = self.new_value(Ty::Array(ld));
+                // Weak scalar (NEP 50): an int scalar keeps the array's dtype,
+                // a float scalar forces `f64`. The scalar crosses to codegen as
+                // its natural `i64`/`f64` word (`rhs_dtype`); codegen converts
+                // it to `out` (possibly a narrowing `i64 -> u8`).
+                let scalar_is_float = rt.is_float();
+                let sdt = if scalar_is_float {
+                    Dtype::F64
+                } else {
+                    Dtype::I64
+                };
+                let s = self.coerce(r, rt, sdt.ty());
+                let out = Dtype::promote_scalar(ld, scalar_is_float);
+                let dest = self.new_value(Ty::Array(out));
                 self.emit(Inst::ArrayBinOp {
                     dest,
                     op: irop,
-                    dtype: ld,
+                    out,
                     lhs: l,
+                    lhs_dtype: ld,
                     rhs: s,
+                    rhs_dtype: sdt,
                     scalar: true,
                 });
-                Ok((dest, Ty::Array(ld)))
+                Ok((dest, Ty::Array(out)))
             }
             (_, Ty::Array(rd)) if is_scalar(lt) => {
                 if !matches!(op, Add | Mul) {
@@ -5309,20 +5330,29 @@ impl<'a> FnLower<'a> {
                         "scalar-on-the-left broadcast is only supported for + and * (write `a - scalar`, not `scalar - a`)",
                     ));
                 }
-                let s = self.coerce(l, lt, rd.ty());
-                let dest = self.new_value(Ty::Array(rd));
+                let scalar_is_float = lt.is_float();
+                let sdt = if scalar_is_float {
+                    Dtype::F64
+                } else {
+                    Dtype::I64
+                };
+                let s = self.coerce(l, lt, sdt.ty());
+                let out = Dtype::promote_scalar(rd, scalar_is_float);
+                let dest = self.new_value(Ty::Array(out));
                 self.emit(Inst::ArrayBinOp {
                     dest,
                     op: irop,
-                    dtype: rd,
+                    out,
                     lhs: r,
+                    lhs_dtype: rd,
                     rhs: s,
+                    rhs_dtype: sdt,
                     scalar: true,
                 });
-                Ok((dest, Ty::Array(rd)))
+                Ok((dest, Ty::Array(out)))
             }
             _ => Err(err(
-                "unsupported array operand (element-wise ops take two arrays of the same dtype or an array and a numeric scalar)",
+                "unsupported array operand (element-wise ops take two arrays or an array and a numeric scalar)",
             )),
         }
     }

@@ -389,6 +389,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_set_i64", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_array_sum_f64", &[p.into()], Some(f.into()));
         self.declare_rt("zap_array_sum_i64", &[p.into()], Some(i.into()));
+        // uint8 / bool dtypes (ticket #49): elements cross the ABI as `i64`
+        // words (the runtime truncates/normalizes on set, zero-extends on get);
+        // the compact 1-byte storage is handled by the SIMD kernel directly.
+        self.declare_rt("zap_array_get_u8", &[p.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_array_set_u8", &[p.into(), i.into(), i.into()], None);
+        self.declare_rt("zap_array_sum_u8", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_array_get_bool", &[p.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_array_set_bool", &[p.into(), i.into(), i.into()], None);
+        self.declare_rt("zap_array_sum_bool", &[p.into()], Some(i.into()));
 
         // Scalar numeric helpers (ticket #19): integer/float power (`**`) and
         // Python floor division (`//`). The lowering emits plain `Inst::Call`s
@@ -1062,14 +1071,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Inst::ArrayBinOp {
                 dest,
                 op,
-                dtype,
+                out,
                 lhs,
+                lhs_dtype,
                 rhs,
+                rhs_dtype,
                 scalar,
             } => {
                 let lv = get(vals, *lhs);
                 let rv = get(vals, *rhs);
-                let res = self.array_binop(*op, *dtype, lv, rv, *scalar, fv)?;
+                let res =
+                    self.array_binop(*op, *out, *lhs_dtype, *rhs_dtype, lv, rv, *scalar, fv)?;
                 vals[*dest as usize] = Some(res);
             }
             Inst::Spawn { func, args } => {
@@ -1232,18 +1244,26 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         Ok(thunk)
     }
 
-    /// Lower an element-wise array op to a SIMD loop (ticket #24): a vector body
-    /// that processes `VW` lanes per iteration with explicit LLVM vector
-    /// load/arith/store, followed by a scalar remainder loop for the final
-    /// `len % VW` elements. `lhs` is the source array pointer; `rhs` is either a
-    /// second array pointer (`!scalar`) or a scalar broadcast across all lanes
-    /// (`scalar`). Returns the freshly allocated result array pointer. This is
-    /// the deliberate exception to the "mechanical" rule — the whole point of
-    /// the ticket is that the arithmetic vectorizes.
+    /// Lower an element-wise array op to a SIMD loop (tickets #24, #49): a
+    /// vector body that processes `VW` lanes per iteration with explicit LLVM
+    /// vector load/arith/store, followed by a scalar remainder loop for the
+    /// final `len % VW` elements. `lhs` is the source array pointer; `rhs` is
+    /// either a second array pointer (`!scalar`) or a scalar broadcast across
+    /// all lanes (`scalar`). Returns the freshly allocated result array pointer.
+    ///
+    /// Mixed-dtype promotion (#49): each operand is loaded at its own storage
+    /// type (`lhs_dtype` / `rhs_dtype`), converted to the result dtype `out`
+    /// (widen/int-to-float for arrays, and a possible narrowing cast for a weak
+    /// scalar), then the arithmetic and store happen in `out`. This is the
+    /// deliberate exception to the "mechanical" rule — the whole point of the
+    /// ticket is that the arithmetic vectorizes.
+    #[allow(clippy::too_many_arguments)]
     fn array_binop(
         &self,
         op: zir::BinOp,
-        dtype: zir::Dtype,
+        out: zir::Dtype,
+        lhs_dtype: zir::Dtype,
+        rhs_dtype: zir::Dtype,
         lhs: BasicValueEnum<'ctx>,
         rhs: BasicValueEnum<'ctx>,
         scalar: bool,
@@ -1254,13 +1274,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let i32t = self.ctx.i32_type();
         let la = lhs.into_pointer_value();
 
-        // n = len(lhs); res = new(dtype, n). Both element buffers come back as
+        // n = len(lhs); res = new(out, n). Both element buffers come back as
         // raw pointers via `zap_array_data`, so this loop never needs to know
         // the array object's field layout.
         let n = self
             .call1("zap_array_len", &[la.into()], "n")?
             .into_int_value();
-        let code = i64t.const_int(dtype.code() as u64, false);
+        let code = i64t.const_int(out.code() as u64, false);
         let res = self
             .call1("zap_array_new", &[code.into(), n.into()], "arr")?
             .into_pointer_value();
@@ -1279,27 +1299,33 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             )
         };
 
-        let is_float = dtype.is_float();
-        let elem_ty = self.basic(dtype.ty());
+        let out_float = out.is_float();
+        let out_elem = self.basic(out.storage_ty());
+        let out_align = out.elem_size();
+        let lhs_elem = self.basic(lhs_dtype.storage_ty());
+        let lhs_align = lhs_dtype.elem_size();
+        let rhs_elem = self.basic(rhs_dtype.storage_ty());
+        let rhs_align = rhs_dtype.elem_size();
         const VW: u64 = 4;
-        let vec_ty: VectorType<'ctx> = if is_float {
-            self.ctx.f64_type().vec_type(VW as u32)
-        } else {
-            i64t.vec_type(VW as u32)
-        };
+        let out_vec = self.dtype_vec(out, VW as u32);
+        let lhs_vec = self.dtype_vec(lhs_dtype, VW as u32);
+        let rhs_vec = self.dtype_vec(rhs_dtype, VW as u32);
 
-        // Broadcast the scalar operand into a lane vector for the vector body.
-        let svec = if scalar {
-            let mut v = vec_ty.get_undef();
+        // The weak scalar crosses the ABI as its `rhs_dtype` word (`i64`/`f64`);
+        // convert it once to the result dtype (possibly a narrowing `i64 -> u8`)
+        // and broadcast it into a lane vector for the vector body.
+        let (sscalar, svec) = if scalar {
+            let s = self.convert_scalar(rhs, rhs_dtype, out, out_elem)?;
+            let mut v = out_vec.get_undef();
             for lane in 0..VW {
                 let idx = i32t.const_int(lane, false);
                 v = b
-                    .build_insert_element(v, rhs, idx, "splat")
+                    .build_insert_element(v, s, idx, "splat")
                     .map_err(|e| e.to_string())?;
             }
-            Some(v)
+            (Some(s), Some(v))
         } else {
-            None
+            (None, None)
         };
 
         // vend = n & ~(VW-1): the largest multiple of VW not exceeding n.
@@ -1326,18 +1352,22 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .map_err(|e| e.to_string())?;
 
         b.position_at_end(vbody);
-        let lvec = self.vec_load(vec_ty, elem_ty, lp, i, "lv")?;
+        let lvec = self.vec_load(lhs_vec, lhs_elem, lp, i, lhs_align, "lv")?;
+        let lvec = self.convert_vec(lvec, lhs_dtype, out, out_vec)?;
         let rvec = match rp {
-            Some(rp) => self.vec_load(vec_ty, elem_ty, rp, i, "rv")?,
+            Some(rp) => {
+                let rv = self.vec_load(rhs_vec, rhs_elem, rp, i, rhs_align, "rv")?;
+                self.convert_vec(rv, rhs_dtype, out, out_vec)?
+            }
             None => svec.unwrap(),
         };
-        let resvec = self.vec_arith(op, is_float, lvec, rvec)?;
+        let resvec = self.vec_arith(op, out_float, lvec, rvec)?;
         let optr = unsafe {
-            b.build_gep(elem_ty, op_ptr, &[i], "optr")
+            b.build_gep(out_elem, op_ptr, &[i], "optr")
                 .map_err(|e| e.to_string())?
         };
         let st = b.build_store(optr, resvec).map_err(|e| e.to_string())?;
-        st.set_alignment(8).map_err(|e| e.to_string())?;
+        st.set_alignment(out_align).map_err(|e| e.to_string())?;
         let inext = b
             .build_int_add(i, i64t.const_int(VW, false), "inext")
             .map_err(|e| e.to_string())?;
@@ -1357,17 +1387,22 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .map_err(|e| e.to_string())?;
 
         b.position_at_end(rbody);
-        let lsc = self.elem_load(elem_ty, lp, j, "ls")?;
+        let lsc = self.elem_load(lhs_elem, lp, j, "ls")?;
+        let lsc = self.convert_scalar(lsc, lhs_dtype, out, out_elem)?;
         let rsc = match rp {
-            Some(rp) => self.elem_load(elem_ty, rp, j, "rs")?,
-            None => rhs,
+            Some(rp) => {
+                let rv = self.elem_load(rhs_elem, rp, j, "rs")?;
+                self.convert_scalar(rv, rhs_dtype, out, out_elem)?
+            }
+            None => sscalar.unwrap(),
         };
-        let ressc = self.scalar_arith(op, is_float, lsc, rsc)?;
+        let ressc = self.scalar_arith(op, out_float, lsc, rsc)?;
         let optr = unsafe {
-            b.build_gep(elem_ty, op_ptr, &[j], "optrs")
+            b.build_gep(out_elem, op_ptr, &[j], "optrs")
                 .map_err(|e| e.to_string())?
         };
-        b.build_store(optr, ressc).map_err(|e| e.to_string())?;
+        let st = b.build_store(optr, ressc).map_err(|e| e.to_string())?;
+        st.set_alignment(out_align).map_err(|e| e.to_string())?;
         let jnext = b
             .build_int_add(j, i64t.const_int(1, false), "jnext")
             .map_err(|e| e.to_string())?;
@@ -1377,6 +1412,118 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
 
         b.position_at_end(done);
         Ok(res.into())
+    }
+
+    /// The `VW`-lane LLVM vector type for a dtype's storage element.
+    fn dtype_vec(&self, d: zir::Dtype, vw: u32) -> VectorType<'ctx> {
+        match d.storage_ty() {
+            Ty::F64 => self.ctx.f64_type().vec_type(vw),
+            Ty::I64 => self.ctx.i64_type().vec_type(vw),
+            Ty::I8 => self.ctx.i8_type().vec_type(vw),
+            // `storage_ty` yields only f64/i64/i8 for the array dtypes.
+            _ => unreachable!("array dtype storage is f64/i64/i8"),
+        }
+    }
+
+    /// Convert a scalar element value from `src` dtype storage to `dst` dtype
+    /// storage (ticket #49 promotion). `to` is the target LLVM scalar type.
+    /// Covers widening (array operands, always `src` rank <= `dst`) and the one
+    /// narrowing case — a weak `i64` scalar cast down to a `uint8` result.
+    fn convert_scalar(
+        &self,
+        v: BasicValueEnum<'ctx>,
+        src: zir::Dtype,
+        dst: zir::Dtype,
+        to: BasicTypeEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        if src == dst {
+            return Ok(v);
+        }
+        let b = self.builder;
+        let r: BasicValueEnum = match (src.is_float(), dst.is_float()) {
+            // int -> float: unsigned source (uint8/bool) uses uitofp, else sitofp.
+            (false, true) => {
+                let fv = to.into_float_type();
+                if src.is_unsigned() {
+                    b.build_unsigned_int_to_float(v.into_int_value(), fv, "u2f")
+                } else {
+                    b.build_signed_int_to_float(v.into_int_value(), fv, "s2f")
+                }
+                .map_err(|e| e.to_string())?
+                .into()
+            }
+            // int -> int: same storage width (bool<->uint8) is identity; widen
+            // with zext (unsigned src) / sext (signed); narrow (weak i64 scalar
+            // -> uint8) truncates.
+            (false, false) => {
+                let to_int = to.into_int_type();
+                let iv = v.into_int_value();
+                let (fw, tw) = (iv.get_type().get_bit_width(), to_int.get_bit_width());
+                if fw == tw {
+                    iv.into()
+                } else if tw > fw {
+                    if src.is_unsigned() {
+                        b.build_int_z_extend(iv, to_int, "zext")
+                    } else {
+                        b.build_int_s_extend(iv, to_int, "sext")
+                    }
+                    .map_err(|e| e.to_string())?
+                    .into()
+                } else {
+                    b.build_int_truncate(iv, to_int, "trunc")
+                        .map_err(|e| e.to_string())?
+                        .into()
+                }
+            }
+            // float -> float (f64 is the only float dtype, so `src == dst`
+            // already returned); float -> int never arises (promotion only
+            // moves up the lattice toward float).
+            _ => v,
+        };
+        Ok(r)
+    }
+
+    /// The vector form of [`Self::convert_scalar`]: convert a `VW`-lane vector
+    /// from `src` dtype storage to `dst` dtype storage. `to` is the target LLVM
+    /// vector type. Array operands only ever widen, so no truncation here.
+    fn convert_vec(
+        &self,
+        v: VectorValue<'ctx>,
+        src: zir::Dtype,
+        dst: zir::Dtype,
+        to: VectorType<'ctx>,
+    ) -> Result<VectorValue<'ctx>, String> {
+        if src == dst {
+            return Ok(v);
+        }
+        let b = self.builder;
+        let r = match (src.is_float(), dst.is_float()) {
+            (false, true) => if src.is_unsigned() {
+                b.build_unsigned_int_to_float(v, to, "vu2f")
+            } else {
+                b.build_signed_int_to_float(v, to, "vs2f")
+            }
+            .map_err(|e| e.to_string())?,
+            (false, false) => {
+                let fw = v
+                    .get_type()
+                    .get_element_type()
+                    .into_int_type()
+                    .get_bit_width();
+                let tw = to.get_element_type().into_int_type().get_bit_width();
+                if fw == tw {
+                    v
+                } else if src.is_unsigned() {
+                    b.build_int_z_extend(v, to, "vzext")
+                        .map_err(|e| e.to_string())?
+                } else {
+                    b.build_int_s_extend(v, to, "vsext")
+                        .map_err(|e| e.to_string())?
+                }
+            }
+            _ => v,
+        };
+        Ok(r)
     }
 
     /// Call a runtime function expected to return a single value.
@@ -1396,14 +1543,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .ok_or_else(|| format!("runtime call '{name}' returned void"))
     }
 
-    /// A `VW`-lane vector load from `base[idx]`, aligned to the element (8) so
-    /// the buffer need not be vector-aligned.
+    /// A `VW`-lane vector load from `base[idx]`, aligned to one element
+    /// (`align` bytes: 8 for `i64`/`f64`, 1 for `uint8`/`bool`) so the buffer
+    /// need not be vector-aligned.
     fn vec_load(
         &self,
         vec_ty: VectorType<'ctx>,
         elem_ty: BasicTypeEnum<'ctx>,
         base: PointerValue<'ctx>,
         idx: inkwell::values::IntValue<'ctx>,
+        align: u32,
         label: &str,
     ) -> Result<VectorValue<'ctx>, String> {
         let ptr = unsafe {
@@ -1418,12 +1567,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         v.into_vector_value()
             .as_instruction()
             .unwrap()
-            .set_alignment(8)
+            .set_alignment(align)
             .map_err(|e| e.to_string())?;
         Ok(v.into_vector_value())
     }
 
-    /// A scalar element load from `base[idx]`.
+    /// A scalar element load from `base[idx]`. The pointee's natural alignment
+    /// (i8 -> 1, i64/f64 -> 8) is already correct for the element-indexed GEP,
+    /// so this keeps the default.
     fn elem_load(
         &self,
         elem_ty: BasicTypeEnum<'ctx>,

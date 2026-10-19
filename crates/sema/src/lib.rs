@@ -3117,8 +3117,14 @@ mod tests {
     fn array_programs_type_check() {
         // Arrays are typed loosely (ticket #24): construction, element-wise ops,
         // scalar broadcast, indexing, len, and sum must not raise false errors.
+        // This covers the uint8/bool dtypes and mixed-dtype promotion (#49) too,
+        // since those stay loosely typed at the sema layer (the dtype lives in
+        // the ZIR lowering).
         ok(include_str!("../../../tests/golden/array_int.zap"));
         ok(include_str!("../../../tests/golden/array_f64.zap"));
+        ok(include_str!("../../../tests/golden/array_promote.zap"));
+        ok(include_str!("../../../tests/golden/array_uint8.zap"));
+        ok(include_str!("../../../tests/golden/array_bool.zap"));
     }
 
     // --- decorators & annotations (ticket #16, D-0036) ---

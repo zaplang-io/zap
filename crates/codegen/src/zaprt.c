@@ -759,36 +759,45 @@ void *zap_heap_items(void *hp) {
  * Numeric arrays (ticket #24, design/0002-arrays.md, design/RUNTIME-ABI.md
  * §"Collection layout": `array[T]`).
  *
- * A dense, contiguous, fixed-dtype buffer. The first increment is 1-D over the
- * dtypes `f64` and `i64` (both 8-byte element words). The object carries its
- * dtype and shape so N-D (`ndim > 1`) and strided views can layer on later
- * without an ABI break; this increment always sets `ndim = 1`.
+ * A dense, contiguous, fixed-dtype buffer. 1-D over the dtypes `f64` and `i64`
+ * (8-byte element words) and `uint8`/`bool` (1-byte words; ticket #49, image
+ * data and masks). The object carries its dtype and shape so N-D (`ndim > 1`)
+ * and strided views can layer on later without an ABI break; this increment
+ * always sets `ndim = 1`.
  *
  * The element buffer is pointer-free, so it is allocated with GC_MALLOC_ATOMIC
  * (the collector need not scan it); the shape (`dims`) is likewise atomic. The
- * element-wise kernels (`a + b`, `a * 2.0`, ...) are *not* here: codegen lowers
- * them to explicit LLVM vector operations (SIMD) over `zap_array_data` buffers,
- * which is the point of ticket #24. The runtime only provides construction,
- * element access, length, and scalar reductions.
+ * element-wise kernels (`a + b`, `a * 2.0`, ..., and mixed-dtype promotion) are
+ * *not* here: codegen lowers them to explicit LLVM vector operations (SIMD)
+ * over `zap_array_data` buffers, which is the point of tickets #24/#49. The
+ * runtime only provides construction, element access, length, and scalar
+ * reductions. `uint8`/`bool` elements cross the ABI as `int64_t` words (get
+ * zero-extends, set truncates to a byte / normalizes to 0|1).
  *
  * Deferred (clean follow-ups): N-D shape + row-major indexing, strides/views
- * (D-0030), broadcasting beyond a scalar, dtype promotion, and shape-mismatch
- * runtime checks on element-wise ops. */
-enum { DTYPE_F64 = 0, DTYPE_I64 = 1 };
+ * (D-0030), broadcasting beyond a scalar, and shape-mismatch runtime checks on
+ * element-wise ops. */
+enum { DTYPE_F64 = 0, DTYPE_I64 = 1, DTYPE_U8 = 2, DTYPE_BOOL = 3 };
 
 typedef struct {
-    int64_t dtype;  /* DTYPE_F64 | DTYPE_I64 */
+    int64_t dtype;  /* DTYPE_F64 | DTYPE_I64 | DTYPE_U8 | DTYPE_BOOL */
     int64_t ndim;   /* always 1 this increment */
     int64_t *dims;  /* `ndim` dimensions; dims[0] is the length */
-    void *data;     /* contiguous row-major buffer, len * 8 bytes */
+    void *data;     /* contiguous row-major buffer, len * elem-size bytes */
 } ZapArray;
+
+/* Bytes per stored element: f64/i64 are 8-byte words, uint8/bool one byte. */
+static size_t zap_array_elem_size(int64_t dtype) {
+    return (dtype == DTYPE_U8 || dtype == DTYPE_BOOL) ? 1 : 8;
+}
 
 void *zap_array_new(int64_t dtype, int64_t len) {
     ZapArray *a = (ZapArray *)GC_MALLOC(sizeof(ZapArray));
     int64_t *dims = (int64_t *)GC_MALLOC_ATOMIC(sizeof(int64_t));
     dims[0] = len;
-    /* f64 and i64 are both 8-byte words; the buffer holds no pointers. */
-    void *data = GC_MALLOC_ATOMIC((size_t)(len > 0 ? len : 0) * 8);
+    /* All current dtypes are pointer-free; the buffer never holds pointers. */
+    size_t esz = zap_array_elem_size(dtype);
+    void *data = GC_MALLOC_ATOMIC((size_t)(len > 0 ? len : 0) * esz);
     a->dtype = dtype;
     a->ndim = 1;
     a->dims = dims;
@@ -847,6 +856,49 @@ int64_t zap_array_sum_i64(void *ap) {
     int64_t s = 0;
     for (int64_t i = 0; i < a->dims[0]; i++) {
         s += d[i];
+    }
+    return s;
+}
+
+/* uint8 / bool (ticket #49): 1-byte storage, i64 ABI. `get` zero-extends the
+ * byte; `set` truncates to a byte (uint8, wraps mod 256) or normalizes to 0|1
+ * (bool). `sum` accumulates in int64 so it never overflows the narrow dtype. */
+int64_t zap_array_get_u8(void *ap, int64_t i) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    return (int64_t)((const uint8_t *)a->data)[i];
+}
+void zap_array_set_u8(void *ap, int64_t i, int64_t v) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    ((uint8_t *)a->data)[i] = (uint8_t)v;
+}
+int64_t zap_array_sum_u8(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    const uint8_t *d = (const uint8_t *)a->data;
+    int64_t s = 0;
+    for (int64_t i = 0; i < a->dims[0]; i++) {
+        s += (int64_t)d[i];
+    }
+    return s;
+}
+
+int64_t zap_array_get_bool(void *ap, int64_t i) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    return ((const uint8_t *)a->data)[i] ? 1 : 0;
+}
+void zap_array_set_bool(void *ap, int64_t i, int64_t v) {
+    ZapArray *a = (ZapArray *)ap;
+    zap_array_bounds(a, i);
+    ((uint8_t *)a->data)[i] = v ? 1 : 0;
+}
+int64_t zap_array_sum_bool(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    const uint8_t *d = (const uint8_t *)a->data;
+    int64_t s = 0;
+    for (int64_t i = 0; i < a->dims[0]; i++) {
+        s += d[i] ? 1 : 0;
     }
     return s;
 }
