@@ -543,6 +543,62 @@ re-queued when the fd is ready.
   Cancelling a coroutine already parked on an fd is now implementable via that
   hook but is not wired to `scope:` cancellation in this increment.
 
+### Signals (as built — ticket #77, D-0058)
+
+First-class Unix signals, built on the scheduler + netpoller. The capability
+ships in every binary and wires up lazily; the mechanism:
+
+- **Dedicated signal thread + self-pipe + netpoller.** The handled async signals
+  are masked on the main thread (so scheduler workers, created later, inherit the
+  block) and UNBLOCKED only on a dedicated signal thread, so an async-signal-safe
+  handler — which only `write()`s the signal number to a **self-pipe registered
+  with the netpoller** — runs there rather than on a worker mid context-switch.
+  The signal thread PARKS on the netpoller (`zap_netpoll_wait`, the native-waiter
+  path) and, on readiness, drains the pipe and **dispatches in normal context**.
+  (D-0058 describes the dispatcher as a separate goroutine; collapsing it into the
+  signal thread avoids forcing the M:N worker pool onto every binary — default
+  handlers are on by default — and fan-out is a non-blocking, non-allocating
+  channel offer that is scheduler-safe from a native thread. `@on_signal` delivery
+  still runs on a real goroutine. Flagged in the PR.)
+- **Surface.** `signal.notify(Signal.X) -> channel[Signal]` (a small **cap-1
+  buffered, coalescing** channel — signals are edges, not a queue: a second edge
+  is dropped while one is pending); `@on_signal(Signal.X)` on a function (sugar: a
+  detached receiver goroutine over `signal.notify` invokes it per delivery);
+  `scope(cancel_on=[Signal.X, ...], grace=<ms>)` — a listed signal cancels the
+  scope tree cooperatively (a child observes it at its next cancellation point),
+  with an optional hard-exit deadline that force-exits if graceful shutdown
+  overruns. `notify`/`@on_signal`/`cancel_on` **take over** a signal's disposition
+  (the OS default and any built-in default handler are suppressed; there is **no
+  auto-exit** — the program decides when to exit after cleanup).
+- **`Signal` is a compiler-known tier-1 enum** whose variant discriminants ARE the
+  Unix signal numbers (so the runtime ABI speaks raw numbers); `SIGKILL`/`SIGSTOP`
+  are excluded (uncatchable).
+- **Default diagnostic handlers** (ON by default, opt out at build with
+  `-DZAP_NO_DEFAULT_SIGNALS`, user-overridable): `SIGQUIT` -> goroutine stacks +
+  runtime/scheduler summary; `SIGUSR1` -> force a GC + print memory stats. Both
+  call the uniform `zap_gc_collect`/`zap_gc_stats` and the scheduler's `g_all[]`,
+  so they work under either collector with no per-backend `#ifdef`. (`SIGUSR2`
+  profiling is a separate deferred ticket, #78 — not built.)
+- **Fault signals** (`SIGSEGV`/`SIGFPE`/`SIGBUS`/`SIGILL`) are NOT delivered via
+  `notify`: a crash handler on a `sigaltstack` (so a stack overflow is still
+  reportable) prints the faulting signal/address, the offending goroutine and a
+  native backtrace, then re-raises the default disposition so the process dies
+  with the right status.
+- **Programmatic surface.** A compiler-known `gc`/`runtime` module —
+  `gc.collect()`, `gc.stats() -> MemStats`, `runtime.goroutine_dump()`,
+  `runtime.num_goroutines()` — over the same runtime entry points; the signals are
+  the zero-code operator path to these. **`zap inspect <pid>`** (CLI) signals a
+  running process to dump these (`SIGQUIT`, or `SIGUSR1` with `--gc`).
+- **Deferred / flagged for review:** collapsing the dispatcher into the signal
+  thread (above); `grace` is an integer-milliseconds expression (no first-class
+  `Duration`/`30.seconds` surface yet — consistent with the deferred `timeout`);
+  cooperative cancel_on reaches a coroutine already parked on a channel only at
+  its next cancellation point (the `zap_netpoll_wake` parked-G interrupt is a
+  follow-up); full per-goroutine symbolicated stack traces in the dump (v1 reports
+  per-G state/ownership + the scheduler/GC shape); and retroactively masking a
+  signal first subscribed from a worker thread (handlers are async-safe wherever
+  they run, so this is a purity gap, not a correctness one).
+
 ### Runtime entry points (additive to `libzaprt`)
 
 Sketch of the C ABI surface the scheduler needs (names illustrative):

@@ -44,6 +44,112 @@ pub fn parse_str(src: &str) -> (Module, Vec<ParseError>, Vec<crate::lexer::LexEr
     (module, parse_errors, lex_errors)
 }
 
+/// The compiler-known built-in prelude (ticket #77, D-0058): the `Signal` enum
+/// and `MemStats` struct that back the `signal`/`gc`/`runtime` surface. They are
+/// injected ahead of the user's items (see [`prelude_items`]) so every ordinary
+/// enum/struct path — member access, `match`, `channel[Signal]`, field access —
+/// works unchanged. A `Signal` variant's backing integer IS its Unix (Linux)
+/// signal number, so the runtime ABI speaks raw signal numbers. SIGKILL/SIGSTOP
+/// are intentionally absent (uncatchable). `MemStats` mirrors `gc.stats()`.
+pub const PRELUDE_SRC: &str = "\
+enum Signal:
+    SIGHUP = 1
+    SIGINT = 2
+    SIGQUIT = 3
+    SIGABRT = 6
+    SIGUSR1 = 10
+    SIGUSR2 = 12
+    SIGPIPE = 13
+    SIGALRM = 14
+    SIGTERM = 15
+    SIGCHLD = 17
+    SIGCONT = 18
+    SIGTSTP = 20
+    SIGWINCH = 28
+
+value struct MemStats:
+    int64 heap_bytes
+    int64 live_bytes
+    int64 free_bytes
+    int64 gc_count
+    int64 goroutines
+";
+
+/// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
+/// lex and parse cleanly; a failure here is a compiler bug. Callers (sema and
+/// the lowerer) prepend these ahead of the user's items, skipping any whose name
+/// the user has already defined (so a program may still declare its own type of
+/// that name without a duplicate-definition error).
+pub fn prelude_items() -> Vec<crate::ast::Item> {
+    let (module, perrs, lerrs) = parse_str(PRELUDE_SRC);
+    debug_assert!(
+        perrs.is_empty() && lerrs.is_empty(),
+        "built-in prelude must parse cleanly: {perrs:?} {lerrs:?}"
+    );
+    module.items
+}
+
+/// The declared type name of a top-level item, if it introduces one.
+fn item_type_name(item: &crate::ast::Item) -> Option<&str> {
+    use crate::ast::Item;
+    match item {
+        Item::Struct(s) => Some(&s.name),
+        Item::Enum(e) => Some(&e.name),
+        Item::Interface(i) => Some(&i.name),
+        Item::Annotation(a) => Some(&a.name),
+        _ => None,
+    }
+}
+
+/// Does `module` reference any of the signals surface (ticket #77)? Used to
+/// gate prelude injection so programs that never touch signals are byte-for-byte
+/// unchanged (no extra `Signal`/`MemStats` type in the lowered module). The scan
+/// is over the derived `Debug` of the AST with QUOTED needles, so each needle
+/// matches a whole string-valued field (an identifier, type name, decorator name
+/// or scope-option key) — `"gc"` matches `Name("gc")` but not `Name("gc_total")`.
+/// A rare false positive (e.g. a string literal `"gc"`) only injects two unused
+/// declarations, which emit no code; it never changes observable behaviour.
+fn references_prelude(module: &Module) -> bool {
+    const NEEDLES: &[&str] = &[
+        "\"Signal\"",
+        "\"MemStats\"",
+        "\"signal\"",
+        "\"gc\"",
+        "\"runtime\"",
+        "\"on_signal\"",
+        "\"cancel_on\"",
+        "\"grace\"",
+    ];
+    let dbg = format!("{module:?}");
+    NEEDLES.iter().any(|n| dbg.contains(n))
+}
+
+/// Return `module` augmented with the built-in [`prelude_items`] when it uses the
+/// signals surface (see [`references_prelude`]); otherwise return a plain clone.
+/// A prelude item is skipped if the user already declares a type of that name, so
+/// user code can still shadow `Signal`/`MemStats` without a duplicate-definition
+/// error. Both the type checker and the lowerer apply this, so they agree on the
+/// surface a program sees (ticket #77, D-0058).
+pub fn with_prelude(module: &Module) -> Module {
+    if !references_prelude(module) {
+        return module.clone();
+    }
+    let user_names: std::collections::HashSet<&str> =
+        module.items.iter().filter_map(item_type_name).collect();
+    let mut items: Vec<crate::ast::Item> = prelude_items()
+        .into_iter()
+        .filter(|it| match item_type_name(it) {
+            Some(n) => !user_names.contains(n),
+            None => true,
+        })
+        .collect();
+    items.extend(module.items.iter().cloned());
+    Module {
+        items,
+        span: module.span,
+    }
+}
+
 struct Parser {
     toks: Vec<Token>,
     pos: usize,

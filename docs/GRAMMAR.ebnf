@@ -32,6 +32,9 @@ item          ::= function
 (* ---------- Decorators & annotations (D-0036) ---------- *)
 
 decorators    ::= { "@" dotted_name [ "(" [ arg_list ] ")" ] NEWLINE } ;
+                  (* Built-in decorators include `@on_signal(Signal.X)` (D-0058,
+                     ticket #77): on a function, register it as a handler for
+                     signal X — no new syntax, it is a decorator with one arg. *)
 
 (* ---------- Functions (D-0003, D-0038) ---------- *)
 
@@ -174,7 +177,12 @@ with_item     ::= expr [ "as" IDENT ] ;
 (* ---------- Structured concurrency (D-0044) ---------- *)
 
 scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
-                  (* options are keyword args: timeout=<dur>, on_error=OnError.Cancel|Wait.
+                  (* options are keyword args: on_error=OnError.Cancel|Wait;
+                     cancel_on=[Signal.X, ...] — a listed signal cancels the scope
+                     tree (D-0058, ticket #77); grace=<ms> — a hard-exit deadline
+                     (milliseconds) from the first cancel_on signal. (timeout=<dur>
+                     is reserved but still deferred.) No new syntax: these are
+                     ordinary keyword args / a list literal / an int expression.
                      Owns every `spawn` lexically inside; joins/cancels at the dedent.
                      `spawn detached` (see simple_stmt) opts out of all scope ownership. *)
 

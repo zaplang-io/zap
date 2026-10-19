@@ -173,6 +173,7 @@ static int zap_is_heap_ptr(void *p) {
 static size_t zap_gc_threshold = 4u * 1024u * 1024u; /* initial trigger (4 MiB)   */
 static size_t zap_heap_limit = 0;           /* hard cap (ZAP_GC_HEAP_LIMIT), 0=off */
 static size_t zap_total_mapped = 0;
+static int64_t zap_gc_cycles = 0;           /* collections completed (ticket #77) */
 
 /* Read the optional hard heap cap (ZAP_GC_HEAP_LIMIT, in bytes) once at startup;
  * 0 (the default) disables it. Used by the GC reclamation tests. */
@@ -741,6 +742,7 @@ static void zap_collect_now(void) {
      * chain, a G, or a global root. Mark and sweep under the heap lock. */
     pthread_mutex_lock(&zap_heap_mu);
     zap_mark_sweep();
+    zap_gc_cycles++;
     pthread_mutex_unlock(&zap_heap_mu);
 
     pthread_mutex_lock(&zap_stw_mu);
@@ -758,6 +760,16 @@ static void zap_collect_now(void) {
 void zap_gc_collect(void) {
     zap_mutator_register();
     zap_collect_now();
+}
+
+/* Number of collections run so far (uniform ticket-#77 entry; Boehm uses
+ * GC_get_gc_no). `zap_gc_cycles` is bumped under zap_heap_mu inside
+ * zap_collect_now, so it covers both safepoint-driven and explicit cycles. */
+int64_t zap_gc_count(void) {
+    pthread_mutex_lock(&zap_heap_mu);
+    int64_t n = zap_gc_cycles;
+    pthread_mutex_unlock(&zap_heap_mu);
+    return n;
 }
 
 /* Uniform GC stats (ticket #77): mapped-heap bytes and the live bytes computed
