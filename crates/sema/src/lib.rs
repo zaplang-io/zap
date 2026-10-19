@@ -1240,7 +1240,10 @@ impl Checker {
                 self.infer(cond);
             }
             Stmt::For {
-                target, iter, body, ..
+                target,
+                iter,
+                body,
+                span,
             } => {
                 // Iterating an enum *type* yields its members in declaration
                 // order (`for col in Color:`, D-0018). The iterable is a type
@@ -1249,20 +1252,12 @@ impl Checker {
                     if self.enums.contains_key(n) {
                         Ty::Named(n.clone())
                     } else {
-                        match self.infer(iter) {
-                            Ty::Range => Ty::Int64,
-                            Ty::List(t) => *t,
-                            Ty::Str => Ty::Char,
-                            _ => Ty::Unknown,
-                        }
+                        let it = self.infer(iter);
+                        self.iter_element(&it, *span)
                     }
                 } else {
-                    match self.infer(iter) {
-                        Ty::Range => Ty::Int64,
-                        Ty::List(t) => *t,
-                        Ty::Str => Ty::Char,
-                        _ => Ty::Unknown,
-                    }
+                    let it = self.infer(iter);
+                    self.iter_element(&it, *span)
                 };
                 self.push_scope();
                 match target {
@@ -1369,8 +1364,13 @@ impl Checker {
                 }
             },
             Stmt::Raise { value, .. } => {
+                // `raise StopIteration` (the iterator exhaustion signal, D-0048)
+                // names a compiler-known exception, not a user value, so it is
+                // not inferred (which would flag it as an unknown name).
                 if let Some(e) = value {
-                    self.infer(e);
+                    if !is_stop_iteration(e) {
+                        self.infer(e);
+                    }
                 }
             }
             Stmt::Try {
@@ -1644,10 +1644,10 @@ impl Checker {
                 var,
                 iter,
                 cond,
-                ..
+                span,
             } => {
                 let it = self.infer(iter);
-                let e_ty = iter_elem(&it);
+                let e_ty = self.iter_element(&it, *span);
                 self.push_scope();
                 self.declare(var, e_ty);
                 if let Some(c) = cond {
@@ -1663,10 +1663,10 @@ impl Checker {
                 var,
                 iter,
                 cond,
-                ..
+                span,
             } => {
                 let it = self.infer(iter);
-                let e_ty = iter_elem(&it);
+                let e_ty = self.iter_element(&it, *span);
                 self.push_scope();
                 self.declare(var, e_ty);
                 if let Some(c) = cond {
@@ -1691,10 +1691,10 @@ impl Checker {
                 var,
                 iter,
                 cond,
-                ..
+                span,
             } => {
                 let it = self.infer(iter);
-                let e_ty = iter_elem(&it);
+                let e_ty = self.iter_element(&it, *span);
                 self.push_scope();
                 self.declare(var, e_ty);
                 if let Some(c) = cond {
@@ -2036,6 +2036,58 @@ impl Checker {
         None
     }
 
+    /// The element type produced by iterating a value of type `it`, following the
+    /// iteration protocol (D-0048), or `None` if `it` is not iterable.
+    ///
+    /// Built-ins (`range`/list/set/str) keep their known element types. A user
+    /// struct is iterable when it provides `__iter__` (the `Iterable` interface);
+    /// its return names the iterator, whose `__next__` (`Iterator`) gives the
+    /// element type. A struct that itself has `__next__` is treated as its own
+    /// iterator. The element type comes from `__next__`'s return signature: the
+    /// comma-ok form `-> (T, bool)` and the Python/`StopIteration` form `-> T`
+    /// both yield `T`. `Unknown`/`Py` stay permissive.
+    fn iterable_elem(&self, it: &Ty) -> Option<Ty> {
+        match it {
+            Ty::Range => Some(Ty::Int64),
+            Ty::List(t) | Ty::Set(t) => Some((**t).clone()),
+            Ty::Str => Some(Ty::Char),
+            Ty::Unknown | Ty::Py => Some(Ty::Unknown),
+            Ty::Named(_) => {
+                let info = self.struct_info(it)?;
+                let iter_ty = if let Some(sig) = info.methods.get("__iter__") {
+                    sig.ret.clone()
+                } else if info.methods.contains_key("__next__") {
+                    it.clone()
+                } else {
+                    return None;
+                };
+                let next = self.struct_info(&iter_ty)?.methods.get("__next__")?;
+                Some(next_elem(&next.ret))
+            }
+            _ => None,
+        }
+    }
+
+    /// The element type of `for`/comprehension iteration over `it`, emitting a
+    /// compile error (D-0048) when `it` is not iterable. Returns [`Ty::Unknown`]
+    /// on error so checking continues.
+    fn iter_element(&mut self, it: &Ty, span: Span) -> Ty {
+        match self.iterable_elem(it) {
+            Some(e) => e,
+            None => {
+                self.error(
+                    format!(
+                        "type '{}' is not iterable: it must define '__iter__' \
+                         (the 'Iterable' interface, D-0048)",
+                        it.display()
+                    ),
+                    span,
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
     /// The signature of a struct's dunder, if defined or derived.
     fn lookup_dunder(&self, t: &Ty, dunder: &str) -> Option<FnSig> {
         self.struct_info(t)
@@ -2073,10 +2125,24 @@ impl Checker {
     /// result type, or `None` to fall back to the built-in-type rules.
     fn check_struct_binop(&mut self, op: BinOp, l: &Ty, r: &Ty, span: Span) -> Option<Ty> {
         use BinOp::*;
-        // `x in a` dispatches on the container (right operand).
+        // `x in a` dispatches on the container (right operand). A struct that
+        // defines `__contains__` uses it; otherwise, if the container is iterable
+        // (D-0048), membership falls back to iterating and comparing. Only a
+        // struct that is neither is an error.
         if matches!(op, In) {
             if self.struct_info(r).is_some() {
-                self.require_dunder(r, "__contains__", "Contains", "in", span);
+                if self.lookup_dunder(r, "__contains__").is_none()
+                    && self.iterable_elem(r).is_none()
+                {
+                    self.error(
+                        format!(
+                            "type '{}' does not support operator 'in': define \
+                             '__contains__' or make it iterable ('__iter__', D-0048)",
+                            r.display()
+                        ),
+                        span,
+                    );
+                }
                 return Some(Ty::Bool);
             }
             return None;
@@ -2633,14 +2699,27 @@ impl Checker {
     }
 }
 
-fn iter_elem(it: &Ty) -> Ty {
-    match it {
-        Ty::Range => Ty::Int64,
-        Ty::List(t) => (**t).clone(),
-        Ty::Set(t) => (**t).clone(),
-        Ty::Str => Ty::Char,
-        _ => Ty::Unknown,
+/// `StopIteration` or `StopIteration()` — the iterator exhaustion signal
+/// (D-0048), a compiler-known exception name.
+fn is_stop_iteration(e: &Expr) -> bool {
+    match e {
+        Expr::Name(n, _) => n == "StopIteration",
+        Expr::Call { callee, .. } => {
+            matches!(callee.as_ref(), Expr::Name(n, _) if n == "StopIteration")
+        }
+        _ => false,
     }
+}
+
+/// The element type an iterator's `__next__` yields (D-0048): the comma-ok form
+/// `-> (T, bool)` yields `T`; the plain `-> T` (StopIteration) form yields `T`.
+fn next_elem(ret: &Ty) -> Ty {
+    if let Ty::Tuple(ts) = ret {
+        if ts.len() == 2 && matches!(ts[1], Ty::Bool) {
+            return ts[0].clone();
+        }
+    }
+    ret.clone()
 }
 
 fn expr_span(e: &Expr) -> Span {
@@ -3226,5 +3305,108 @@ mod tests {
     #[test]
     fn swap_reassignment_type_checks() {
         ok(include_str!("../../../tests/golden/tuple_swap.zap"));
+    }
+
+    // --- iteration protocol (D-0048) ---
+
+    /// A comma-ok user iterable: `__iter__` yields an iterator whose `__next__`
+    /// returns `(T, bool)`.
+    const RANGE_SRC: &str = "\
+struct Range:
+    int64 lo
+    int64 hi
+    def __iter__(self) -> RangeIter:
+        return RangeIter(cur=self.lo, hi=self.hi)
+
+struct RangeIter:
+    int64 cur
+    int64 hi
+    def __iter__(self) -> RangeIter:
+        return self
+    def __next__(self) -> (int64, bool):
+        if self.cur >= self.hi:
+            return (0, False)
+        auto v = self.cur
+        self.cur = self.cur + 1
+        return (v, True)
+";
+
+    #[test]
+    fn user_iterable_commaok_type_checks() {
+        ok(&format!(
+            "{RANGE_SRC}\ndef main():\n    auto total = 0\n    for x in Range(lo=0, hi=5):\n        total = total + x\n    print(total)\n"
+        ));
+    }
+
+    #[test]
+    fn user_iterable_loop_var_is_typed_from_next() {
+        // The loop variable has the element type `__next__` yields (int64 here),
+        // so an int-only use type-checks and a wrong-type use would not.
+        ok(&format!(
+            "{RANGE_SRC}\ndef main():\n    for x in Range(lo=0, hi=5):\n        int64 y = x + 1\n        print(y)\n"
+        ));
+    }
+
+    #[test]
+    fn stopiteration_iterable_type_checks() {
+        // The Python form: `__next__ -> T` raising `StopIteration` at exhaustion.
+        ok("\
+struct Count:
+    int64 n
+    def __iter__(self) -> CountIter:
+        return CountIter(cur=0, n=self.n)
+
+struct CountIter:
+    int64 cur
+    int64 n
+    def __iter__(self) -> CountIter:
+        return self
+    def __next__(self) -> int64:
+        if self.cur >= self.n:
+            raise StopIteration
+        auto v = self.cur
+        self.cur = self.cur + 1
+        return v
+
+def main():
+    auto total = 0
+    for x in Count(n=4):
+        total = total + x
+    print(total)
+");
+    }
+
+    #[test]
+    fn non_iterable_in_for_is_an_error() {
+        let e = errors(
+            "struct Point:\n    int64 x\ndef main():\n    for p in Point(x=1):\n        print(1)\n",
+        );
+        assert_eq!(e.len(), 1, "expected one not-iterable error, got {e:?}");
+        assert!(e[0].message.contains("not iterable"), "got {e:?}");
+    }
+
+    #[test]
+    fn comprehension_over_user_iterable_type_checks() {
+        ok(&format!(
+            "{RANGE_SRC}\ndef main():\n    auto squares = [x * x for x in Range(lo=1, hi=5) if x != 3]\n    print(len(squares))\n"
+        ));
+    }
+
+    #[test]
+    fn comprehension_over_non_iterable_is_an_error() {
+        let e = errors("def main():\n    auto xs = [y for y in 7]\n    print(len(xs))\n");
+        assert!(
+            e.iter().any(|e| e.message.contains("not iterable")),
+            "expected a not-iterable error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn membership_fallback_without_contains_type_checks() {
+        // A struct with no `__contains__` but which is iterable supports `in`
+        // (membership by iteration, D-0048).
+        ok(&format!(
+            "{RANGE_SRC}\ndef main():\n    auto r = Range(lo=0, hi=5)\n    if 3 in r:\n        print(1)\n"
+        ));
     }
 }

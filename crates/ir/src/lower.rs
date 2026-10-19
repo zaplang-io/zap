@@ -1247,6 +1247,16 @@ fn lower_fn(
     Ok(b.func)
 }
 
+/// The form of an iterator's `__next__` (D-0048), selected by its return
+/// signature.
+enum NextForm {
+    /// Comma-ok `-> (T, bool)`: `tuple_sid` is the `(T, bool)` layout, `elem` is
+    /// `T`. The preferred, exception-free form.
+    CommaOk { tuple_sid: u32, elem: Ty },
+    /// Python `-> T` that raises `StopIteration` at exhaustion; `elem` is `T`.
+    StopIter { elem: Ty },
+}
+
 struct FnLower<'a> {
     func: Func,
     cur: BlockId,
@@ -1857,6 +1867,21 @@ impl<'a> FnLower<'a> {
         let Some(e) = value else {
             return Err(err("bare 'raise' (re-raise) is not supported yet"));
         };
+        // `raise StopIteration` / `raise StopIteration()` (the Python iterator
+        // end-of-iteration signal, D-0048) lowers to a panic carrying a sentinel
+        // message the iteration-protocol landing pad recognizes.
+        if is_stop_iteration(e) {
+            let msg = self.new_value(Ty::Ptr);
+            self.emit(Inst::StrConst {
+                dest: msg,
+                bytes: b"StopIteration".to_vec(),
+            });
+            self.throwing_call(None, "zap_panic", vec![msg]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+            return Ok(());
+        }
         let (v, vt) = self.expr(e)?;
         if vt != Ty::Ptr {
             return Err(err(
@@ -2034,6 +2059,483 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
+    /// Resolve the iterator for a struct-typed iterable (D-0048): call
+    /// `__iter__` (the `Iterable` interface) to get a fresh iterator, or, if the
+    /// value is itself an iterator (it defines `__next__` but no `__iter__`), use
+    /// it directly. Returns the iterator value and its struct id.
+    fn setup_iter(&mut self, obj: Value, sid: u32) -> Result<(Value, u32), LowerError> {
+        let name = self.ctx.names[sid as usize].clone();
+        let iter_m = format!("{}__{}", name, "__iter__");
+        if let Some((_p, ret)) = self.sigs.get(&iter_m).cloned() {
+            let Ty::Struct(iter_sid) = ret else {
+                return Err(err(format!(
+                    "'{name}.__iter__' must return an iterator struct (the 'Iterable' \
+                     interface, D-0048)"
+                )));
+            };
+            let d = self.new_value(ret);
+            self.throwing_call(Some(d), &iter_m, vec![obj]);
+            Ok((d, iter_sid))
+        } else if self.sigs.contains_key(&format!("{}__{}", name, "__next__")) {
+            Ok((obj, sid)) // the value is already an iterator
+        } else {
+            Err(err(format!(
+                "type '{name}' is not iterable: define '__iter__' (the 'Iterable' \
+                 interface, D-0048)"
+            )))
+        }
+    }
+
+    /// Classify an iterator's `__next__` (D-0048) by its return signature: the
+    /// comma-ok form `-> (T, bool)` (preferred) versus the Python/`StopIteration`
+    /// form `-> T`. Returns the element type and, for comma-ok, the `(T, bool)`
+    /// tuple's struct id.
+    fn next_form(&self, iter_sid: u32) -> Result<NextForm, LowerError> {
+        let name = &self.ctx.names[iter_sid as usize];
+        let m = format!("{}__{}", name, "__next__");
+        let (_p, ret) = self.sigs.get(&m).cloned().ok_or_else(|| {
+            err(format!(
+                "iterator '{name}' must define '__next__' (the 'Iterator' interface, D-0048)"
+            ))
+        })?;
+        if let Ty::Struct(tsid) = ret {
+            if let Some(fields) = self.ctx.tuples.borrow().fields(tsid) {
+                if fields.len() == 2 && fields[1] == Ty::I1 {
+                    return Ok(NextForm::CommaOk {
+                        tuple_sid: tsid,
+                        elem: fields[0],
+                    });
+                }
+            }
+        }
+        Ok(NextForm::StopIter { elem: ret })
+    }
+
+    /// Drive the iteration protocol (D-0048) over struct-typed iterable `obj`
+    /// (`sid`): obtain the iterator via [`setup_iter`], then loop calling
+    /// `__next__`, invoking `body` with each element value/type. `body` owns the
+    /// loop variable / accumulation; a `for` body's `break`/`continue` target the
+    /// loop end / the next `__next__`.
+    fn drive_iteration(
+        &mut self,
+        obj: Value,
+        sid: u32,
+        mut body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        let (it, iter_sid) = self.setup_iter(obj, sid)?;
+        let next_m = format!("{}__{}", self.ctx.names[iter_sid as usize], "__next__");
+        match self.next_form(iter_sid)? {
+            NextForm::CommaOk { tuple_sid, elem } => {
+                let head = self.new_block();
+                let body_bb = self.new_block();
+                let end = self.new_block();
+                self.set_term(Term::Br(head));
+                self.position(head);
+                let res = self.new_value(Ty::Struct(tuple_sid));
+                self.throwing_call(Some(res), &next_m, vec![it]);
+                let v = self.new_value(elem);
+                self.emit(Inst::FieldGet {
+                    dest: v,
+                    base: res,
+                    sid: tuple_sid,
+                    idx: 0,
+                });
+                let ok = self.new_value(Ty::I1);
+                self.emit(Inst::FieldGet {
+                    dest: ok,
+                    base: res,
+                    sid: tuple_sid,
+                    idx: 1,
+                });
+                self.set_term(Term::BrIf {
+                    cond: ok,
+                    then_bb: body_bb,
+                    else_bb: end,
+                });
+                self.position(body_bb);
+                self.loops.push((head, end));
+                body(self, v, elem)?;
+                self.loops.pop();
+                self.ensure_br(head);
+                self.position(end);
+            }
+            NextForm::StopIter { elem } => {
+                // The Python form: `__next__` returns the element directly and
+                // raises `StopIteration` at exhaustion. Guard the call with a
+                // landing pad that ends the loop on `StopIteration` and re-raises
+                // anything else (D-0048; zero-cost table EH, D-0007).
+                let head = self.new_block();
+                let body_bb = self.new_block();
+                let lp = self.new_block();
+                let reraise = self.new_block();
+                let end = self.new_block();
+                self.set_term(Term::Br(head));
+                self.position(head);
+                self.landing_pads.push(lp);
+                let v = self.new_value(elem);
+                self.throwing_call(Some(v), &next_m, vec![it]);
+                self.landing_pads.pop();
+                self.set_term(Term::Br(body_bb));
+                self.position(body_bb);
+                self.loops.push((head, end));
+                body(self, v, elem)?;
+                self.loops.pop();
+                self.ensure_br(head);
+                // Landing pad: compare the in-flight exception message against the
+                // `StopIteration` sentinel (what `raise StopIteration` lowers to).
+                self.position(lp);
+                let exc = self.new_value(Ty::Ptr);
+                self.emit(Inst::LandingPad { dest: exc });
+                let sentinel = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrConst {
+                    dest: sentinel,
+                    bytes: b"StopIteration".to_vec(),
+                });
+                let eq = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(eq),
+                    func: "zap_str_eq".to_string(),
+                    args: vec![exc, sentinel],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let is_stop = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: is_stop,
+                    pred: CmpPred::Ne,
+                    lhs: eq,
+                    rhs: zero,
+                });
+                self.emit_end_catch();
+                self.set_term(Term::BrIf {
+                    cond: is_stop,
+                    then_bb: end,
+                    else_bb: reraise,
+                });
+                self.position(reraise);
+                self.throwing_call(None, "zap_panic", vec![exc]);
+                if !self.terminated() {
+                    self.set_term(Term::Unreachable);
+                }
+                self.position(end);
+            }
+        }
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// Iterate any supported iterable `iter`, calling `body(self, value, ty)` for
+    /// each element: `range(...)`, a `list`, a `set`, or a user struct via the
+    /// D-0048 protocol. Used by comprehensions (and the struct case of `for`).
+    fn iterate(
+        &mut self,
+        iter: &Expr,
+        mut body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        // `range(...)`: a counting loop over `[start, stop)` by `step`.
+        if let Expr::Call { callee, args, .. } = iter {
+            if is_name(callee, "range") {
+                let mut vs = Vec::new();
+                for a in args {
+                    let (v, t) = self.expr(&a.value)?;
+                    vs.push(self.coerce(v, t, Ty::I64));
+                }
+                let (start, stop, step) = match vs.len() {
+                    1 => (self.iconst(Ty::I64, 0), vs[0], self.iconst(Ty::I64, 1)),
+                    2 => (vs[0], vs[1], self.iconst(Ty::I64, 1)),
+                    3 => (vs[0], vs[1], vs[2]),
+                    n => return Err(err(format!("range() takes 1-3 arguments, got {n}"))),
+                };
+                self.push_scope();
+                let var = self.alloca(Ty::I64);
+                self.store(var, start);
+                let cond_bb = self.new_block();
+                let body_bb = self.new_block();
+                let incr_bb = self.new_block();
+                let end_bb = self.new_block();
+                self.set_term(Term::Br(cond_bb));
+                self.position(cond_bb);
+                let cur = self.load(var, Ty::I64);
+                let c = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: c,
+                    pred: CmpPred::Lt,
+                    lhs: cur,
+                    rhs: stop,
+                });
+                self.set_term(Term::BrIf {
+                    cond: c,
+                    then_bb: body_bb,
+                    else_bb: end_bb,
+                });
+                self.position(body_bb);
+                let cur_v = self.load(var, Ty::I64);
+                self.loops.push((incr_bb, end_bb));
+                body(self, cur_v, Ty::I64)?;
+                self.loops.pop();
+                self.ensure_br(incr_bb);
+                self.position(incr_bb);
+                let cur2 = self.load(var, Ty::I64);
+                let next = self.new_value(Ty::I64);
+                self.emit(Inst::Bin {
+                    dest: next,
+                    op: BinOp::Add,
+                    lhs: cur2,
+                    rhs: step,
+                });
+                self.store(var, next);
+                self.set_term(Term::Br(cond_bb));
+                self.position(end_bb);
+                self.pop_scope();
+                return Ok(());
+            }
+        }
+        let (val, ty) = self.expr(iter)?;
+        match ty {
+            Ty::List(elem) => self.iterate_list(val, elem, body),
+            Ty::Set(elem) => {
+                let items = self.new_value(Ty::List(elem));
+                self.emit(Inst::Call {
+                    dest: Some(items),
+                    func: "zap_set_items".to_string(),
+                    args: vec![val],
+                });
+                self.iterate_list(items, elem, body)
+            }
+            Ty::Struct(sid) => self.drive_iteration(val, sid, body),
+            other => Err(err(format!(
+                "value of type {other:?} is not iterable (D-0048)"
+            ))),
+        }
+    }
+
+    /// Iterate a `list[T]` value by index, re-reading the length each iteration.
+    fn iterate_list(
+        &mut self,
+        lst: Value,
+        elem: Elem,
+        mut body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![lst],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let e = self.new_value(elem.ty());
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: format!("zap_list_get_{}", elem.val_suffix()),
+            args: vec![lst, i],
+        });
+        self.loops.push((incr_bb, end_bb));
+        body(self, e, elem.ty())?;
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `[elem for var in iter if cond]` (D-0048): build a fresh list, iterate the
+    /// source through the general protocol, and push `elem` for each element that
+    /// passes the optional filter.
+    fn lower_list_comp(
+        &mut self,
+        elem_e: &Expr,
+        var: &str,
+        iter: &Expr,
+        cond: Option<&Expr>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let list = self.new_value(Ty::List(Elem::I64));
+        self.emit(Inst::Call {
+            dest: Some(list),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let kind = std::cell::Cell::new(None);
+        self.iterate(iter, |s, v, ty| {
+            s.push_scope();
+            let slot = s.alloca(ty);
+            s.store(slot, v);
+            s.declare(var, slot, ty);
+            s.comp_guard(cond, |s| {
+                let (ev, et) = s.expr(elem_e)?;
+                let ek = elem_kind(et)?;
+                kind.set(Some(ek));
+                let ev = s.coerce(ev, et, ek.ty());
+                s.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_list_push_{}", ek.val_suffix()),
+                    args: vec![list, ev],
+                });
+                Ok(())
+            })?;
+            s.pop_scope();
+            Ok(())
+        })?;
+        let elem = kind.get().unwrap_or(Elem::I64);
+        self.func.value_types[list as usize] = Ty::List(elem);
+        Ok((list, Ty::List(elem)))
+    }
+
+    /// `{elem for var in iter if cond}` (D-0048): like [`lower_list_comp`] into a
+    /// fresh set.
+    fn lower_set_comp(
+        &mut self,
+        elem_e: &Expr,
+        var: &str,
+        iter: &Expr,
+        cond: Option<&Expr>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let set = self.new_value(Ty::Set(Elem::I64));
+        self.emit(Inst::Call {
+            dest: Some(set),
+            func: "zap_set_new".to_string(),
+            args: vec![],
+        });
+        let kind = std::cell::Cell::new(None);
+        self.iterate(iter, |s, v, ty| {
+            s.push_scope();
+            let slot = s.alloca(ty);
+            s.store(slot, v);
+            s.declare(var, slot, ty);
+            s.comp_guard(cond, |s| {
+                let (ev, et) = s.expr(elem_e)?;
+                let ek = elem_kind(et)?;
+                kind.set(Some(ek));
+                let ev = s.coerce(ev, et, ek.ty());
+                let kfns = s.key_fn_args(ek)?;
+                let mut args = vec![set, ev];
+                args.extend_from_slice(&kfns);
+                s.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_set_add_{}", ek.key_suffix()),
+                    args,
+                });
+                Ok(())
+            })?;
+            s.pop_scope();
+            Ok(())
+        })?;
+        let elem = kind.get().unwrap_or(Elem::I64);
+        self.func.value_types[set as usize] = Ty::Set(elem);
+        Ok((set, Ty::Set(elem)))
+    }
+
+    /// `{key: value for var in iter if cond}` (D-0048): like [`lower_list_comp`]
+    /// into a fresh dict.
+    fn lower_dict_comp(
+        &mut self,
+        key_e: &Expr,
+        val_e: &Expr,
+        var: &str,
+        iter: &Expr,
+        cond: Option<&Expr>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let dict = self.new_value(Ty::Dict(Elem::I64, Elem::I64));
+        self.emit(Inst::Call {
+            dest: Some(dict),
+            func: "zap_dict_new".to_string(),
+            args: vec![],
+        });
+        let kinds = std::cell::Cell::new(None);
+        self.iterate(iter, |s, v, ty| {
+            s.push_scope();
+            let slot = s.alloca(ty);
+            s.store(slot, v);
+            s.declare(var, slot, ty);
+            s.comp_guard(cond, |s| {
+                let (kv, kt) = s.expr(key_e)?;
+                let (vv, vt) = s.expr(val_e)?;
+                let kk = elem_kind(kt)?;
+                let vk = elem_kind(vt)?;
+                kinds.set(Some((kk, vk)));
+                let kv = s.coerce(kv, kt, kk.ty());
+                let vv = s.coerce(vv, vt, vk.ty());
+                let kfns = s.key_fn_args(kk)?;
+                let mut args = vec![dict, kv, vv];
+                args.extend_from_slice(&kfns);
+                s.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    args,
+                });
+                Ok(())
+            })?;
+            s.pop_scope();
+            Ok(())
+        })?;
+        let (kk, vk) = kinds.get().unwrap_or((Elem::I64, Elem::I64));
+        self.func.value_types[dict as usize] = Ty::Dict(kk, vk);
+        Ok((dict, Ty::Dict(kk, vk)))
+    }
+
+    /// Emit `work` either unconditionally or guarded by `if cond:` (the optional
+    /// comprehension filter).
+    fn comp_guard(
+        &mut self,
+        cond: Option<&Expr>,
+        work: impl FnOnce(&mut FnLower<'a>) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        match cond {
+            None => work(self),
+            Some(c) => {
+                let (cv, cty) = self.expr(c)?;
+                let cc = self.truthy(cv, cty);
+                let then_bb = self.new_block();
+                let cont_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: cc,
+                    then_bb,
+                    else_bb: cont_bb,
+                });
+                self.position(then_bb);
+                work(self)?;
+                self.ensure_br(cont_bb);
+                self.position(cont_bb);
+                Ok(())
+            }
+        }
+    }
+
     fn lower_for(
         &mut self,
         target: &Expr,
@@ -2074,8 +2576,29 @@ impl<'a> FnLower<'a> {
                 if let Ty::Set(elem) = lty {
                     return self.lower_for_set(target, lst, elem, body);
                 }
+                // `for x in <user iterable>` — the general D-0048 protocol.
+                if let Ty::Struct(sid) = lty {
+                    let name = match target {
+                        Expr::Name(n, _) => n.clone(),
+                        _ => {
+                            return Err(err(
+                                "only a simple loop variable is supported by codegen yet",
+                            ))
+                        }
+                    };
+                    return self.drive_iteration(lst, sid, |s, v, ty| {
+                        let slot = s.alloca(ty);
+                        s.store(slot, v);
+                        s.declare(&name, slot, ty);
+                        for st in &body.stmts {
+                            s.stmt(st)?;
+                        }
+                        Ok(())
+                    });
+                }
                 return Err(err(
-                    "only `for ... in range(...)`, `for ... in <list>`, and `for ... in <set>` are supported by codegen yet",
+                    "only `for ... in range(...)`, `for ... in <list>`, `for ... in <set>`, and \
+                     `for ... in <user iterable>` are supported by codegen yet",
                 ));
             }
         };
@@ -2365,6 +2888,28 @@ impl<'a> FnLower<'a> {
             Expr::Dict(items, _) => self.lower_dict_lit(items),
             Expr::Set(elems, _) => self.lower_set_lit(elems),
             Expr::Tuple(elems, _) => self.lower_tuple_lit(elems),
+            Expr::ListComp {
+                elem,
+                var,
+                iter,
+                cond,
+                ..
+            } => self.lower_list_comp(elem, var, iter, cond.as_deref()),
+            Expr::SetComp {
+                elem,
+                var,
+                iter,
+                cond,
+                ..
+            } => self.lower_set_comp(elem, var, iter, cond.as_deref()),
+            Expr::DictComp {
+                key,
+                value,
+                var,
+                iter,
+                cond,
+                ..
+            } => self.lower_dict_comp(key, value, var, iter, cond.as_deref()),
             Expr::Index { base, index, .. } => self.lower_index_get(base, index),
             Expr::Attr { base, name, .. } => {
                 // Qualified enum member/variant access (`Color.RED`,
@@ -3977,8 +4522,41 @@ impl<'a> FnLower<'a> {
         }
         if matches!(op, In) {
             if let Ty::Struct(sid) = rt {
-                let (ret, rty) = self.call_dunder(sid, "__contains__", vec![(r, rt), (l, lt)])?;
-                return Ok((ret, rty));
+                let contains = format!("{}__{}", self.ctx.names[sid as usize], "__contains__");
+                if self.sigs.contains_key(&contains) {
+                    let (ret, rty) =
+                        self.call_dunder(sid, "__contains__", vec![(r, rt), (l, lt)])?;
+                    return Ok((ret, rty));
+                }
+                // No `__contains__`: membership falls back to iterating the
+                // container and comparing each element for equality (D-0048).
+                let result = self.alloca(Ty::I1);
+                let f = self.new_value(Ty::I1);
+                self.emit(Inst::BConst {
+                    dest: f,
+                    val: false,
+                });
+                self.store(result, f);
+                self.drive_iteration(r, sid, |s, ev, ety| {
+                    let (eq, _) = s.binop(AstBin::Eq, ev, ety, l, lt)?;
+                    let then_bb = s.new_block();
+                    let cont_bb = s.new_block();
+                    s.set_term(Term::BrIf {
+                        cond: eq,
+                        then_bb,
+                        else_bb: cont_bb,
+                    });
+                    s.position(then_bb);
+                    let t = s.new_value(Ty::I1);
+                    s.emit(Inst::BConst { dest: t, val: true });
+                    s.store(result, t);
+                    let (_, brk) = *s.loops.last().expect("in-iteration loop");
+                    s.set_term(Term::Br(brk));
+                    s.position(cont_bb);
+                    Ok(())
+                })?;
+                let d = self.load(result, Ty::I1);
+                return Ok((d, Ty::I1));
             }
         }
 
@@ -4446,6 +5024,16 @@ impl<'a> FnLower<'a> {
 
 fn is_name(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Name(n, _) if n == name)
+}
+
+/// `StopIteration` or `StopIteration()` — the iterator exhaustion signal
+/// (D-0048), accepted in either the bare-name or called form.
+fn is_stop_iteration(e: &Expr) -> bool {
+    match e {
+        Expr::Name(n, _) => n == "StopIteration",
+        Expr::Call { callee, .. } => is_name(callee, "StopIteration"),
+        _ => false,
+    }
 }
 
 /// The ZIR target type of an explicit numeric conversion call, by builtin name

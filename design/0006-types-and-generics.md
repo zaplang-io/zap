@@ -459,6 +459,17 @@ for x in Range(lo=0, hi=5):   # 0 1 2 3 4
     print(x)
 ```
 
+**Implementation status (#53).** The protocol ships for user structs (both
+`__next__` forms), `for`, comprehensions (`list`/`set`/`dict`), and the
+`in`-without-`__contains__` membership fallback; the built-in `list`/`set`/
+`range` loops run through the same element-at-a-time driver. The comma-ok form
+lowers directly over the tuple machinery (D-0049); the `StopIteration` form
+lowers to a landing pad (D-0007) that ends the loop when the in-flight
+exception matches the `StopIteration` sentinel and re-raises otherwise.
+**Generators (`yield`)** are deferred to a follow-up (the compiler-generated
+state machine), tracked in issue #67; they will plug into this protocol with no
+change to the `for`/comprehension side.
+
 ### 3. Enums
 
 #### 3.1 Tier 1 — named constants (D-0018)
