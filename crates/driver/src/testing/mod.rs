@@ -29,7 +29,7 @@ pub fn strip_test_items(module: &mut Module) {
 }
 
 #[cfg(feature = "llvm")]
-pub use run_impl::run;
+pub use run_impl::{run, run_json};
 
 #[cfg(feature = "llvm")]
 mod run_impl {
@@ -53,6 +53,31 @@ mod run_impl {
 
         let results = run_all(&files);
         emit(&results, json)
+    }
+
+    /// Run targeted tests and return the structured `--json` report plus an
+    /// `ok` flag. Reused by `zap mcp`'s `zap_test` tool (#72): `paths` are the
+    /// changed/affected files or directories to test; empty means the whole
+    /// project. No output is printed — the JSON string is returned to the
+    /// caller.
+    pub fn run_json(paths: &[PathBuf]) -> (String, bool) {
+        let mut files = Vec::new();
+        if paths.is_empty() {
+            files = discover::discover(None);
+        } else {
+            for p in paths {
+                let s = p.to_string_lossy();
+                files.extend(discover::discover(Some(&s)));
+            }
+        }
+        files.sort();
+        files.dedup();
+        if files.is_empty() {
+            return (report::format_json(&[]), true);
+        }
+        let results = run_all(&files);
+        let ok = report::Summary::of(&results).ok();
+        (report::format_json(&results), ok)
     }
 
     /// Compile and run every file, returning the flattened results.

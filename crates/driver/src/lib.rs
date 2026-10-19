@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use zapc_syntax::ast::Module;
 
 pub mod cli;
+pub mod mcp;
 pub mod testing;
 
 /// The toolchain version (shared by both binaries and `zap version`).

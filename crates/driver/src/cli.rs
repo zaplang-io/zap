@@ -46,8 +46,10 @@ pub enum Command {
         json: bool,
         watch: bool,
     },
-    /// `zap mcp` — stub (agent MCP server, issue #72).
-    Mcp,
+    /// `zap mcp [--root <dir>]` — the agent MCP server (D-0055, issue #72).
+    /// Serves over stdio. `root` is the codebase root for the code-graph and
+    /// test surfaces (default: the current directory).
+    Mcp { root: Option<String> },
     /// `zap version`.
     Version,
     /// `zap help`.
@@ -123,7 +125,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             }
             Ok(Command::Test { file, json, watch })
         }
-        "mcp" => Ok(Command::Mcp),
+        "mcp" => parse_mcp(rest),
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown subcommand `{other}`")),
@@ -158,6 +160,37 @@ fn parse_compile(args: &[String]) -> Result<(Option<String>, Option<String>), St
         }
     }
     Ok((file, out))
+}
+
+/// Parse `mcp [--root <dir>]`. Transport is stdio (D-0055); a socket transport
+/// is a documented follow-up, so `--socket` is rejected with a clear message
+/// rather than silently ignored.
+fn parse_mcp(args: &[String]) -> Result<Command, String> {
+    let mut root: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" => {
+                root = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| "`--root` needs a directory".to_string())?,
+                );
+                i += 2;
+            }
+            "--stdio" => i += 1, // the default and only transport today
+            "--socket" => {
+                return Err(
+                    "`zap mcp` currently serves over stdio only; a socket transport is a \
+                     follow-up (D-0055)"
+                        .to_string(),
+                );
+            }
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+    Ok(Command::Mcp { root })
 }
 
 /// The first non-flag argument, if any.
@@ -204,7 +237,7 @@ pub fn execute(cmd: Command) -> ExitCode {
             "issue #69 (package manager, D-0052)",
         ),
         Command::Test { file, json, watch } => cmd_test(file, json, watch),
-        Command::Mcp => stub("the agent MCP server", "issue #72 (zap mcp, D-0055)"),
+        Command::Mcp { root } => crate::mcp::serve(root),
         Command::Version => {
             println!("zap {}", crate::VERSION);
             ExitCode::SUCCESS
@@ -389,6 +422,11 @@ test:
        --json           emit structured results (for `zap mcp`, issue #72)
        --watch          re-run on change, targeting affected files
 
+agent interface:
+  mcp [--root dir]      start the MCP server for coding agents (D-0055): serves
+                        the language reference, parse+type-check without a build,
+                        a token-efficient code graph, and targeted tests (stdio)
+
 diagnostics:
   version               print the toolchain version
   help                  show this help
@@ -397,7 +435,6 @@ not yet implemented / pending their own tickets:
   fmt                   canonical formatter (D-0037)
   add / remove          dependency management (package manager, issue #69)
   zenv                  project environment (issue #69)
-  mcp                   agent MCP server (issue #72)
 ";
 
 #[cfg(test)]
@@ -547,8 +584,21 @@ mod tests {
         assert_eq!(p(&["add", "foo"]).unwrap(), Command::Add);
         assert_eq!(p(&["remove", "foo"]).unwrap(), Command::Remove);
         assert_eq!(p(&["zenv", "create"]).unwrap(), Command::Zenv);
-        assert_eq!(p(&["mcp"]).unwrap(), Command::Mcp);
         assert_eq!(p(&["init"]).unwrap(), Command::Init);
+    }
+
+    #[test]
+    fn mcp_parses_with_optional_root() {
+        assert_eq!(p(&["mcp"]).unwrap(), Command::Mcp { root: None });
+        assert_eq!(
+            p(&["mcp", "--root", "myproj"]).unwrap(),
+            Command::Mcp {
+                root: Some("myproj".into())
+            }
+        );
+        assert!(p(&["mcp", "--root"]).is_err());
+        assert!(p(&["mcp", "--socket"]).is_err());
+        assert!(p(&["mcp", "bogus"]).is_err());
     }
 
     #[test]
