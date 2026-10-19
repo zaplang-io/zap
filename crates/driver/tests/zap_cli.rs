@@ -4,8 +4,11 @@
 //! real binary so dispatch, scaffolding, stubs, and (under the `llvm` feature)
 //! the compile/run path are exercised as a user would hit them.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use zapc::mcp::json::{self, Json};
 
 fn zap() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zap"))
@@ -66,7 +69,6 @@ fn stubs_name_their_owning_tickets() {
         (vec!["add", "foo"], "#69"),
         (vec!["remove", "foo"], "#69"),
         (vec!["zenv", "create"], "#69"),
-        (vec!["mcp"], "#72"),
     ] {
         let out = zap().args(&args).output().unwrap();
         assert_eq!(out.status.code(), Some(2), "args: {args:?}");
@@ -313,6 +315,129 @@ fn test_reports_power_assert_on_failure() {
     assert!(stdout.contains("left:  4"), "stdout:\n{stdout}");
     assert!(stdout.contains("right: 5"), "stdout:\n{stdout}");
     assert!(stdout.contains("1 failed"), "stdout:\n{stdout}");
+}
+
+// --- `zap mcp` end-to-end (issue #72, D-0055) ---------------------------------
+
+/// Drive the real `zap mcp` server over stdio: spawn it rooted at `root`, feed
+/// one JSON-RPC request per line, close stdin, and parse each response line.
+fn mcp_session(root: &Path, requests: &[&str]) -> Vec<Json> {
+    let mut child = zap()
+        .arg("mcp")
+        .arg("--root")
+        .arg(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn zap mcp");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for r in requests {
+            writeln!(stdin, "{r}").unwrap();
+        }
+        // `stdin` drops here, signaling EOF so the server exits.
+    }
+    let out = child.wait_with_output().expect("wait for zap mcp");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| json::parse(l).expect("each response line is valid JSON"))
+        .collect()
+}
+
+/// The text of a `tools/call` result's first content block.
+fn tool_text(resp: &Json) -> String {
+    resp.get("result")
+        .unwrap()
+        .get("content")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("text")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// One session exercises three host-safe surfaces: language reference, a
+/// fast check of a known-bad snippet, and a code-graph query over the project
+/// the server is rooted at.
+#[test]
+fn mcp_reference_check_and_graph_over_stdio() {
+    let dir = scratch("mcp_e2e");
+    std::fs::write(
+        dir.join("lib.zap"),
+        "def greet(str name) -> str:\n    return name\n\nstruct Box:\n    int64 v\n",
+    )
+    .unwrap();
+
+    let responses = mcp_session(
+        &dir,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"zap_reference","arguments":{"name":"grammar"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"zap_check","arguments":{"code":"def main():\n    missing_fn()\n"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"zap_code_graph","arguments":{"name":"greet"}}}"#,
+        ],
+    );
+    assert_eq!(responses.len(), 4, "got: {responses:?}");
+
+    // initialize
+    assert_eq!(
+        responses[0]
+            .get("result")
+            .unwrap()
+            .get("serverInfo")
+            .unwrap()
+            .get("name")
+            .unwrap()
+            .as_str(),
+        Some("zap-mcp")
+    );
+
+    // reference: the grammar body
+    assert!(tool_text(&responses[1]).contains("EBNF"));
+
+    // fast check: a bad snippet reports not-ok with diagnostics
+    let check = json::parse(&tool_text(&responses[2])).unwrap();
+    assert_eq!(check.get("ok"), Some(&Json::Bool(false)));
+    assert!(!check
+        .get("diagnostics")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // code graph: finds the function we defined
+    let graph = json::parse(&tool_text(&responses[3])).unwrap();
+    assert!(graph.get("matched").unwrap().as_i64().unwrap() >= 1);
+    assert!(tool_text(&responses[3]).contains("greet"));
+}
+
+/// The targeted-test surface returns the runner's structured JSON (LLVM only).
+#[cfg(feature = "llvm")]
+#[test]
+fn mcp_zap_test_returns_structured_results() {
+    let dir = scratch("mcp_test");
+    std::fs::write(
+        dir.join("ok_test.zap"),
+        "@test\ndef test_ok():\n    assert True\n",
+    )
+    .unwrap();
+
+    let responses = mcp_session(
+        &dir,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"zap_test","arguments":{"paths":["ok_test.zap"]}}}"#,
+        ],
+    );
+    let text = tool_text(&responses[0]);
+    assert!(text.contains("\"status\": \"pass\""), "got: {text}");
+    assert!(text.contains("\"name\": \"test_ok\""), "got: {text}");
+    assert!(text.contains("\"ok\": true"), "got: {text}");
 }
 
 /// `zap test --json` emits structured results consumable by `zap mcp` (#72).
