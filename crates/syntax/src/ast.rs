@@ -132,19 +132,42 @@ pub struct MethodSig {
     pub span: Span,
 }
 
-/// A tier-1 enum: named constants with optional explicit values (D-0018).
+/// An enum definition (D-0018 tier-1 named constants; D-0046 tier-3
+/// data-carrying variants / sum types). A variant with no payload fields is a
+/// tier-1 constant (optionally with an explicit value); a variant with payload
+/// fields is a tier-3 data-carrying variant. The two tiers do not mix: any
+/// payload-carrying variant makes the whole enum a tagged value (D-0046).
 #[derive(Clone, Debug)]
 pub struct EnumDef {
     pub decorators: Vec<Decorator>,
     pub name: String,
+    /// Generic type parameters, e.g. `[T]` (reserved; D-0017/D-0046).
+    pub generics: Vec<String>,
     pub variants: Vec<EnumVariant>,
+    /// Methods declared in the enum body (`def` with `self`, D-0046). Parsed
+    /// now; lowering is a documented follow-up.
+    pub methods: Vec<Function>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug)]
 pub struct EnumVariant {
     pub name: String,
+    /// Explicit discriminant for a tier-1 constant (`GREEN = 10`); `None`
+    /// otherwise. Never set for a data-carrying variant.
     pub value: Option<Expr>,
+    /// Type-first named payload fields (`Circle(f64 r)`, D-0046); empty for a
+    /// tier-1 constant.
+    pub fields: Vec<VariantField>,
+    pub span: Span,
+}
+
+/// A type-first named payload field of a data-carrying enum variant (D-0046),
+/// e.g. the `f64 r` in `Circle(f64 r)`.
+#[derive(Clone, Debug)]
+pub struct VariantField {
+    pub ty: Type,
+    pub name: String,
     pub span: Span,
 }
 
@@ -324,14 +347,29 @@ pub enum Pattern {
     Sequence(Vec<Pattern>, Span),
     /// `(a, b)`
     Tuple(Vec<Pattern>, Span),
-    /// `Point(x=0, y=y)`
+    /// A dotted/qualified pattern: a struct pattern (`Point(x=0, y=y)`), an
+    /// enum-variant pattern (`Shape.Circle(r)`, D-0046), or a qualified
+    /// constant / payload-free variant with no parens (`Color.RED`,
+    /// `Shape.Unit`). `path` is the dotted name in declaration order
+    /// (`["Shape", "Circle"]`); `args` is `None` when there are no parentheses
+    /// (a bare qualified constant) and `Some` otherwise (fields bound
+    /// positionally or by name, developer's choice — D-0040/D-0046).
     Struct {
-        name: String,
-        fields: Vec<(String, Pattern)>,
+        path: Vec<String>,
+        args: Option<Vec<PatArg>>,
         span: Span,
     },
     /// `*rest` inside a sequence pattern.
     Rest { name: Option<String>, span: Span },
+}
+
+/// One argument of a struct/variant pattern (D-0040/D-0046). `name` is `Some`
+/// for a by-name binding (`h=h`) and `None` for a positional one (`r`).
+#[derive(Clone, Debug)]
+pub struct PatArg {
+    pub name: Option<String>,
+    pub pattern: Pattern,
+    pub span: Span,
 }
 
 // ----------------------------------------------------------------------------

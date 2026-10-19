@@ -197,6 +197,29 @@ struct FnSig {
     ret: Ty,
 }
 
+/// A registered enum type (D-0018 tier-1 / D-0046 tier-3). `is_sum` is true when
+/// any variant carries payload fields — then the whole enum is a tagged value
+/// and the two tiers do not mix (D-0046).
+#[derive(Clone)]
+struct EnumInfo {
+    is_sum: bool,
+    variants: Vec<EnumVariantInfo>,
+}
+
+#[derive(Clone)]
+struct EnumVariantInfo {
+    name: String,
+    /// Payload fields in declaration order (`(name, type)`); empty for a
+    /// tier-1 constant or a payload-free variant.
+    fields: Vec<(String, Ty)>,
+}
+
+impl EnumInfo {
+    fn variant(&self, name: &str) -> Option<&EnumVariantInfo> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+}
+
 /// Type-check a module, returning any errors.
 pub fn check(module: &Module) -> Vec<TypeError> {
     let mut c = Checker::new();
@@ -223,6 +246,8 @@ pub fn check_str(
 struct Checker {
     sigs: HashMap<String, FnSig>,
     user_types: HashSet<String>,
+    /// Registered enums (tier-1 and tier-3), keyed by type name.
+    enums: HashMap<String, EnumInfo>,
     /// Declared `annotation` names -> their field names (D-0036). Used to
     /// validate `@Annotation(...)` applications (keyword args must name fields).
     annotations: HashMap<String, Vec<String>>,
@@ -289,6 +314,7 @@ impl Checker {
         Checker {
             sigs: HashMap::new(),
             user_types: HashSet::new(),
+            enums: HashMap::new(),
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
             scopes: Vec::new(),
@@ -332,6 +358,9 @@ impl Checker {
     // --- collection passes ---
 
     fn collect_types(&mut self, module: &Module) {
+        // First register every type name so field/payload types (which may
+        // reference a type declared later, or the enum itself — a recursive
+        // variant, D-0046) resolve in the second pass.
         for item in &module.items {
             match item {
                 Item::Struct(s) => {
@@ -354,6 +383,26 @@ impl Checker {
                     self.user_decorators.insert(d.name.clone());
                 }
                 _ => {}
+            }
+        }
+        // Second pass: build the enum registry now that all type names exist.
+        for item in &module.items {
+            if let Item::Enum(e) = item {
+                let is_sum = e.variants.iter().any(|v| !v.fields.is_empty());
+                let variants = e
+                    .variants
+                    .iter()
+                    .map(|v| EnumVariantInfo {
+                        name: v.name.clone(),
+                        fields: v
+                            .fields
+                            .iter()
+                            .map(|f| (f.name.clone(), self.resolve_type(&f.ty)))
+                            .collect(),
+                    })
+                    .collect();
+                self.enums
+                    .insert(e.name.clone(), EnumInfo { is_sum, variants });
             }
         }
     }
@@ -732,6 +781,18 @@ impl Checker {
                         self.check_function(m, Some(&s.name));
                     }
                 }
+                Item::Enum(e) => {
+                    // Methods on enums are locked (D-0046) but their lowering is
+                    // a documented follow-up; reject rather than silently drop.
+                    if let Some(m) = e.methods.first() {
+                        self.error(
+                            "methods on enums are not implemented yet (deferred to a \
+                             follow-up; D-0046)"
+                                .to_string(),
+                            m.span,
+                        );
+                    }
+                }
                 Item::Stmt(st) => self.check_stmt(st),
                 _ => {}
             }
@@ -891,12 +952,27 @@ impl Checker {
             Stmt::For {
                 target, iter, body, ..
             } => {
-                let it = self.infer(iter);
-                let elem = match it {
-                    Ty::Range => Ty::Int64,
-                    Ty::List(t) => *t,
-                    Ty::Str => Ty::Char,
-                    _ => Ty::Unknown,
+                // Iterating an enum *type* yields its members in declaration
+                // order (`for col in Color:`, D-0018). The iterable is a type
+                // name, not a value, so it is matched before inferring.
+                let elem = if let Expr::Name(n, _) = iter {
+                    if self.enums.contains_key(n) {
+                        Ty::Named(n.clone())
+                    } else {
+                        match self.infer(iter) {
+                            Ty::Range => Ty::Int64,
+                            Ty::List(t) => *t,
+                            Ty::Str => Ty::Char,
+                            _ => Ty::Unknown,
+                        }
+                    }
+                } else {
+                    match self.infer(iter) {
+                        Ty::Range => Ty::Int64,
+                        Ty::List(t) => *t,
+                        Ty::Str => Ty::Char,
+                        _ => Ty::Unknown,
+                    }
                 };
                 self.push_scope();
                 match target {
@@ -916,15 +992,28 @@ impl Checker {
                 self.pop_scope();
             }
             Stmt::Match {
-                scrutinee, arms, ..
+                scrutinee,
+                arms,
+                span,
             } => {
-                self.infer(scrutinee);
+                let scrut = self.infer(scrutinee);
+                let mut covered: HashSet<String> = HashSet::new();
+                let mut has_catch_all = false;
+                let mut guarded_catch_all = false;
                 for arm in arms {
                     self.push_scope();
-                    let mut names = Vec::new();
-                    collect_pattern_bindings(&arm.pattern, &mut names);
-                    for n in names {
-                        self.declare(&n, Ty::Unknown);
+                    let (vs, catch_all) = self.check_pattern(&arm.pattern, &scrut);
+                    for v in vs {
+                        covered.insert(v);
+                    }
+                    if catch_all {
+                        // A guarded catch-all does not make the match exhaustive
+                        // (the guard may fail).
+                        if arm.guard.is_some() {
+                            guarded_catch_all = true;
+                        } else {
+                            has_catch_all = true;
+                        }
                     }
                     if let Some(g) = &arm.guard {
                         self.infer(g);
@@ -933,6 +1022,33 @@ impl Checker {
                         self.check_stmt(st);
                     }
                     self.pop_scope();
+                }
+                // Exhaustiveness (D-0040): a `match` on an enum that omits a
+                // variant and has no `_`/catch-all arm is a compile error. This
+                // one upgrade over Python applies only to enum scrutinees;
+                // non-enum matches stay Python-like (no-op on no match).
+                let _ = guarded_catch_all;
+                if let Ty::Named(ename) = &scrut {
+                    if let Some(info) = self.enums.get(ename).cloned() {
+                        if !has_catch_all {
+                            let missing: Vec<String> = info
+                                .variants
+                                .iter()
+                                .filter(|v| !covered.contains(&v.name))
+                                .map(|v| format!("{ename}.{}", v.name))
+                                .collect();
+                            if !missing.is_empty() {
+                                self.error(
+                                    format!(
+                                        "non-exhaustive match on enum '{ename}': missing {} \
+                                         (add the arm(s) or a '_' case)",
+                                        missing.join(", ")
+                                    ),
+                                    *span,
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Stmt::Return { value, span } => match value {
@@ -1186,10 +1302,43 @@ impl Checker {
                     _ => Ty::Unknown,
                 }
             }
-            Expr::Attr { base, .. } => {
+            Expr::Attr { base, name, span } => {
+                // Qualified enum member/variant access: `Color.RED`,
+                // `Shape.Unit` (D-0018/D-0046). The base is a *type* name, not a
+                // value, so it is matched before inferring the base as a value.
+                if let Expr::Name(tyname, _) = base.as_ref() {
+                    if let Some(info) = self.enums.get(tyname).cloned() {
+                        match info.variant(name) {
+                            Some(v) if v.fields.is_empty() => {
+                                return Ty::Named(tyname.clone());
+                            }
+                            Some(_) => {
+                                self.error(
+                                    format!(
+                                        "variant '{name}' of enum '{tyname}' carries data; \
+                                         construct it with '{tyname}.{name}(...)'"
+                                    ),
+                                    *span,
+                                );
+                                return Ty::Named(tyname.clone());
+                            }
+                            None => {
+                                self.error(
+                                    format!("enum '{tyname}' has no variant '{name}'"),
+                                    *span,
+                                );
+                                return Ty::Unknown;
+                            }
+                        }
+                    }
+                }
+                let b = self.infer(base);
+                // `.name` on an enum value yields its member name (D-0018).
+                if matches!(&b, Ty::Named(n) if self.enums.contains_key(n)) && name == "name" {
+                    return Ty::Str;
+                }
                 // Attribute access on a Python handle yields another Python
                 // handle (D-0012); everything else is modeled loosely for now.
-                let b = self.infer(base);
                 if matches!(b, Ty::Py) {
                     Ty::Py
                 } else {
@@ -1371,6 +1520,15 @@ impl Checker {
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Ty {
+        // Qualified enum-variant construction: `Shape.Circle(r=2.0)` /
+        // `Shape.Circle(2.0)` (D-0046), accepting named or positional args.
+        if let Expr::Attr { base, name, .. } = callee {
+            if let Expr::Name(tyname, _) = base.as_ref() {
+                if let Some(info) = self.enums.get(tyname).cloned() {
+                    return self.check_variant_construction(tyname, name, &info, args, span);
+                }
+            }
+        }
         // Array construction `array[dtype]([...])` (ticket #24): the callee is a
         // subscript whose base (`array`) and index (the dtype name) are not
         // ordinary value names, so they are not inferred as such. Typed loosely.
@@ -1472,8 +1630,12 @@ impl Checker {
                     for a in args {
                         let at = self.infer(&a.value);
                         // A Python handle is accepted: the conversion marshals it
-                        // back to a Zap number (D-0012).
-                        if !at.is_numeric() && !matches!(at, Ty::Unknown | Ty::Py) {
+                        // back to a Zap number (D-0012). A tier-1 enum converts to
+                        // its backing int (`int64(c)`, D-0018 explicit narrowing).
+                        if !at.is_numeric()
+                            && !matches!(at, Ty::Unknown | Ty::Py)
+                            && !self.is_tier1_enum(&at)
+                        {
                             self.error(
                                 format!("{}() expects a number, found {}", fname, at.display()),
                                 expr_span(&a.value),
@@ -1498,6 +1660,30 @@ impl Checker {
                 _ => {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
                         return self.check_user_call(&sig, fname, args, span);
+                    }
+                    // Tier-1 enum conversion `Color(x)` — the explicit int->enum
+                    // direction (D-0018/D-0020): one integer argument.
+                    if let Some(info) = self.enums.get(fname).cloned() {
+                        if info.is_sum {
+                            self.error(
+                                format!(
+                                    "'{fname}' is a sum type; construct a variant \
+                                     (e.g. '{fname}.Variant(...)'), not '{fname}(...)'"
+                                ),
+                                span,
+                            );
+                        } else if args.len() != 1 {
+                            self.error(format!("{fname}() takes exactly one argument"), span);
+                        } else {
+                            let at = self.infer(&args[0].value);
+                            if !at.is_int() && !matches!(at, Ty::Unknown | Ty::Py) {
+                                self.error(
+                                    format!("{fname}() expects an integer, found {}", at.display()),
+                                    expr_span(&args[0].value),
+                                );
+                            }
+                        }
+                        return Ty::Named(fname.clone());
                     }
                     // Struct construction: `StructName(fields...)`.
                     if self.user_types.contains(fname) {
@@ -1604,6 +1790,222 @@ impl Checker {
 
         sig.ret.clone()
     }
+
+    /// Is `t` a tier-1 (all-constant) enum, convertible to/from an integer?
+    fn is_tier1_enum(&self, t: &Ty) -> bool {
+        matches!(t, Ty::Named(n) if self.enums.get(n).is_some_and(|e| !e.is_sum))
+    }
+
+    /// Type a qualified enum-variant construction `Enum.Variant(args)` (D-0046),
+    /// accepting named or positional payload arguments and checking their
+    /// types. Returns the enum type.
+    fn check_variant_construction(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        info: &EnumInfo,
+        args: &[Arg],
+        span: Span,
+    ) -> Ty {
+        let Some(v) = info.variant(variant) else {
+            self.error(
+                format!("enum '{enum_name}' has no variant '{variant}'"),
+                span,
+            );
+            for a in args {
+                self.infer(&a.value);
+            }
+            return Ty::Named(enum_name.to_string());
+        };
+        let positional = args.iter().filter(|a| a.name.is_none()).count();
+        if positional > v.fields.len() {
+            self.error(
+                format!(
+                    "variant '{enum_name}.{variant}' takes {} field(s), found {}",
+                    v.fields.len(),
+                    positional
+                ),
+                span,
+            );
+        }
+        let mut pos = 0usize;
+        for a in args {
+            let at = self.infer(&a.value);
+            let field = match &a.name {
+                Some(fname) => {
+                    let f = v.fields.iter().find(|(n, _)| n == fname);
+                    if f.is_none() {
+                        self.error(
+                            format!("variant '{enum_name}.{variant}' has no field '{fname}'"),
+                            expr_span(&a.value),
+                        );
+                    }
+                    f
+                }
+                None => {
+                    let f = v.fields.get(pos);
+                    pos += 1;
+                    f
+                }
+            };
+            if let Some((fname, fty)) = field {
+                if !assignable(&at, fty) {
+                    self.error(
+                        format!(
+                            "field '{fname}' of '{enum_name}.{variant}' has type {}, found {}",
+                            fty.display(),
+                            at.display()
+                        ),
+                        expr_span(&a.value),
+                    );
+                }
+            }
+        }
+        Ty::Named(enum_name.to_string())
+    }
+
+    /// Type-check one `match` arm's pattern against the scrutinee type,
+    /// declaring its bindings into the current scope. Returns the set of enum
+    /// variant names this pattern covers (for exhaustiveness) and whether it is
+    /// an irrefutable catch-all (`_` or a bare capture).
+    fn check_pattern(&mut self, p: &Pattern, scrut: &Ty) -> (Vec<String>, bool) {
+        match p {
+            Pattern::Wildcard(_) => (Vec::new(), true),
+            Pattern::Capture { name, .. } => {
+                self.declare(name, scrut.clone());
+                (Vec::new(), true)
+            }
+            Pattern::Literal(e) => {
+                self.infer(e);
+                (Vec::new(), false)
+            }
+            Pattern::Or(ps, _) => {
+                let mut covered = Vec::new();
+                let mut catch_all = false;
+                for sub in ps {
+                    let (c, ca) = self.check_pattern(sub, scrut);
+                    covered.extend(c);
+                    catch_all |= ca;
+                }
+                (covered, catch_all)
+            }
+            Pattern::Sequence(ps, _) | Pattern::Tuple(ps, _) => {
+                for sub in ps {
+                    self.check_pattern(sub, &Ty::Unknown);
+                }
+                (Vec::new(), false)
+            }
+            Pattern::Rest { name: Some(n), .. } => {
+                self.declare(n, Ty::Unknown);
+                (Vec::new(), false)
+            }
+            Pattern::Rest { name: None, .. } => (Vec::new(), false),
+            Pattern::Struct { path, args, span } => {
+                self.check_qualified_pattern(path, args.as_deref(), *span, scrut)
+            }
+        }
+    }
+
+    /// Type a qualified/struct pattern: an enum member/variant (`Color.RED`,
+    /// `Shape.Circle(r)`) or a plain struct pattern (`Point(x=0)`). Binds
+    /// payload fields positionally or by name (D-0046). Returns covered enum
+    /// variants and whether it is a catch-all (never, for these).
+    fn check_qualified_pattern(
+        &mut self,
+        path: &[String],
+        args: Option<&[PatArg]>,
+        span: Span,
+        scrut: &Ty,
+    ) -> (Vec<String>, bool) {
+        // Qualified `Enum.Variant`: the head names an enum type.
+        if path.len() == 2 {
+            if let Some(info) = self.enums.get(&path[0]).cloned() {
+                let (enum_name, variant) = (&path[0], &path[1]);
+                // The scrutinee must be this enum (keep going to bind on error).
+                if let Ty::Named(sn) = scrut {
+                    if sn != enum_name {
+                        self.error(
+                            format!(
+                                "pattern '{enum_name}.{variant}' does not match a value of \
+                                 type {}",
+                                scrut.display()
+                            ),
+                            span,
+                        );
+                    }
+                }
+                let Some(v) = info.variant(variant) else {
+                    self.error(
+                        format!("enum '{enum_name}' has no variant '{variant}'"),
+                        span,
+                    );
+                    return (Vec::new(), false);
+                };
+                self.bind_variant_fields(enum_name, v, args, span);
+                return (vec![variant.clone()], false);
+            }
+        }
+        // A plain struct pattern (`Point(x=0, y=y)`) or an unresolved qualified
+        // name: typed loosely (struct-field typing is not modeled yet), but its
+        // bindings are still declared so arm bodies type-check.
+        if let Some(args) = args {
+            for a in args {
+                self.check_pattern(&a.pattern, &Ty::Unknown);
+            }
+        }
+        (Vec::new(), false)
+    }
+
+    /// Declare the bindings of a variant pattern's payload fields, matching them
+    /// positionally or by name and binding each capture to the field's type.
+    fn bind_variant_fields(
+        &mut self,
+        enum_name: &str,
+        v: &EnumVariantInfo,
+        args: Option<&[PatArg]>,
+        span: Span,
+    ) {
+        let Some(args) = args else {
+            return; // `case Shape.Unit:` — no fields to bind.
+        };
+        let positional = args.iter().filter(|a| a.name.is_none()).count();
+        if positional > v.fields.len() {
+            self.error(
+                format!(
+                    "pattern '{enum_name}.{}' binds {} field(s) but the variant has {}",
+                    v.name,
+                    positional,
+                    v.fields.len()
+                ),
+                span,
+            );
+        }
+        let mut pos = 0usize;
+        for a in args {
+            let fty = match &a.name {
+                Some(fname) => match v.fields.iter().find(|(n, _)| n == fname) {
+                    Some((_, t)) => t.clone(),
+                    None => {
+                        self.error(
+                            format!("variant '{enum_name}.{}' has no field '{fname}'", v.name),
+                            a.span,
+                        );
+                        Ty::Unknown
+                    }
+                },
+                None => {
+                    let t = v
+                        .fields
+                        .get(pos)
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or(Ty::Unknown);
+                    pos += 1;
+                    t
+                }
+            };
+            self.check_pattern(&a.pattern, &fty);
+        }
+    }
 }
 
 fn iter_elem(it: &Ty) -> Ty {
@@ -1613,24 +2015,6 @@ fn iter_elem(it: &Ty) -> Ty {
         Ty::Set(t) => (**t).clone(),
         Ty::Str => Ty::Char,
         _ => Ty::Unknown,
-    }
-}
-
-fn collect_pattern_bindings(p: &Pattern, out: &mut Vec<String>) {
-    match p {
-        Pattern::Capture { name, .. } => out.push(name.clone()),
-        Pattern::Rest { name: Some(n), .. } => out.push(n.clone()),
-        Pattern::Or(ps, _) | Pattern::Sequence(ps, _) | Pattern::Tuple(ps, _) => {
-            for sub in ps {
-                collect_pattern_bindings(sub, out);
-            }
-        }
-        Pattern::Struct { fields, .. } => {
-            for (_, sub) in fields {
-                collect_pattern_bindings(sub, out);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1945,5 +2329,116 @@ mod tests {
     fn pyobject_type_annotation_is_accepted() {
         // The opaque `pyobject` handle type can be written explicitly.
         ok("import python \"math\" as m\n\ndef main():\n    pyobject r = m.sqrt(2.0)\n    print(r)\n");
+    }
+
+    // --- enums & match (ticket #51, D-0018/D-0040/D-0046) ---
+
+    fn msgs(src: &str) -> String {
+        errors(src)
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tier1_enum_members_conversions_and_exhaustive_match() {
+        // Member access, explicit int<->enum conversions, and an exhaustive
+        // match all type-check (D-0018).
+        ok("enum Color:\n    RED\n    GREEN = 10\n    BLUE\n\n\
+            def main():\n    auto c = Color.GREEN\n\
+            \x20   int64 n = int64(c)\n    auto d = Color(n)\n\
+            \x20   match c:\n        case Color.RED:\n            print(1)\n\
+            \x20       case Color.GREEN:\n            print(2)\n\
+            \x20       case Color.BLUE:\n            print(3)\n");
+    }
+
+    #[test]
+    fn enum_match_missing_variant_is_an_error() {
+        // D-0040 exhaustiveness: omitting a variant with no `_` is a compile
+        // error naming the missing variant.
+        let m = msgs(
+            "enum Color:\n    RED\n    GREEN\n    BLUE\n\n\
+            def main():\n    auto c = Color.RED\n    match c:\n\
+            \x20       case Color.RED:\n            print(1)\n\
+            \x20       case Color.GREEN:\n            print(2)\n",
+        );
+        assert!(
+            m.contains("non-exhaustive") && m.contains("Color.BLUE"),
+            "expected a non-exhaustive error naming Color.BLUE, got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn enum_match_wildcard_is_exhaustive() {
+        // A `_` arm makes any enum match exhaustive.
+        ok("enum Color:\n    RED\n    GREEN\n    BLUE\n\n\
+            def main():\n    auto c = Color.RED\n    match c:\n\
+            \x20       case Color.RED:\n            print(1)\n\
+            \x20       case _:\n            print(0)\n");
+    }
+
+    #[test]
+    fn tier3_construction_and_destructuring_type_check() {
+        // Data-carrying variants construct with named or positional args and
+        // destructure positionally or by name; payload captures are typed
+        // (D-0046). The exhaustive match needs no `_`.
+        ok(
+            "enum Shape:\n    Circle(f64 r)\n    Rect(f64 w, f64 h)\n    Unit\n\n\
+            def area(Shape s) -> f64:\n    match s:\n\
+            \x20       case Shape.Circle(r):\n            return 3.14 * r * r\n\
+            \x20       case Shape.Rect(w=w, h=h):\n            return w * h\n\
+            \x20       case Shape.Unit:\n            return 1.0\n\n\
+            def main():\n\
+            \x20   print(area(Shape.Circle(r=2.0)))\n\
+            \x20   print(area(Shape.Rect(3.0, 4.0)))\n",
+        );
+    }
+
+    #[test]
+    fn tier3_unknown_variant_and_field_are_errors() {
+        let m = msgs(
+            "enum Shape:\n    Circle(f64 r)\n    Unit\n\n\
+            def main():\n    auto s = Shape.Square(1.0)\n",
+        );
+        assert!(m.contains("no variant 'Square'"), "got:\n{m}");
+        let m = msgs(
+            "enum Shape:\n    Circle(f64 r)\n    Unit\n\n\
+            def main():\n    auto s = Shape.Circle(radius=1.0)\n",
+        );
+        assert!(m.contains("no field 'radius'"), "got:\n{m}");
+    }
+
+    #[test]
+    fn recursive_enum_type_checks() {
+        // A (mutually) recursive variant field references the enum itself
+        // (D-0046); the whole vertical type-checks.
+        ok("enum Expr:\n    Num(int64 v)\n    Add(Expr l, Expr r)\n\n\
+            def eval(Expr e) -> int64:\n    match e:\n\
+            \x20       case Expr.Num(v):\n            return v\n\
+            \x20       case Expr.Add(l, r):\n            return eval(l) + eval(r)\n\n\
+            def main():\n    print(eval(Expr.Add(Expr.Num(2), Expr.Num(3))))\n");
+    }
+
+    #[test]
+    fn enum_is_a_distinct_type_from_int() {
+        // An enum is its own type: assigning a raw int to an enum (or vice
+        // versa) without an explicit conversion is rejected (D-0018/D-0020).
+        let m = msgs(
+            "enum Color:\n    RED\n    GREEN\n\n\
+            def main():\n    Color c = 1\n",
+        );
+        assert!(m.contains("int") && m.contains("Color"), "got:\n{m}");
+    }
+
+    #[test]
+    fn enum_methods_are_deferred() {
+        // Methods on enums are locked (D-0046) but their lowering is a
+        // follow-up; declaring one is reported, not silently dropped.
+        let m = msgs(
+            "enum Color:\n    RED\n    GREEN\n\n\
+            \x20   def tag(self) -> int64:\n        return 0\n",
+        );
+        assert!(m.contains("methods on enums"), "got:\n{m}");
     }
 }

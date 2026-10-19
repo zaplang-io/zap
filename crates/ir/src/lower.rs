@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use zapc_syntax::ast::{self, BinOp as AstBin, Expr, Stmt, UnOp as AstUn};
+use zapc_syntax::ast::{self, BinOp as AstBin, Expr, PatArg, Pattern, Stmt, UnOp as AstUn};
 
 use crate::ir::*;
 
@@ -18,12 +18,64 @@ pub struct LowerError {
     pub message: String,
 }
 
+/// One data-carrying variant of a tier-3 enum (D-0046), resolved for lowering.
+#[derive(Clone, Debug)]
+struct VariantLow {
+    name: String,
+    /// The discriminant stored in the tag slot (declaration order).
+    tag: i64,
+    /// Payload fields: `(name, struct-field index in the tagged struct, type)`.
+    /// The index points into the tagged struct, whose field 0 is the tag.
+    fields: Vec<(String, u32, Ty)>,
+}
+
+/// A lowered enum (D-0018 tier-1 / D-0046 tier-3).
+///
+/// A **tier-1** enum (`is_sum == false`) is an unboxed backing integer (`i64`):
+/// members carry explicit or auto-incremented discriminants. A **tier-3** enum
+/// (`is_sum == true`) is a GC-allocated **tagged struct** `{ tag:i32, payload…
+/// }`: `sid` indexes [`Module::structs`]. Reusing the struct machinery means a
+/// recursive variant field (whose type is the enum itself) is already a pointer
+/// to a heap enum value, which breaks the cycle for free (D-0046).
+#[derive(Clone, Debug)]
+struct EnumLow {
+    is_sum: bool,
+    /// Tagged-struct id (tier-3 only).
+    sid: Option<u32>,
+    /// Members in declaration order: `(name, discriminant)` (tier-1).
+    members: Vec<(String, i64)>,
+    /// Variants in declaration order (tier-3).
+    variants: Vec<VariantLow>,
+}
+
+impl EnumLow {
+    fn member_value(&self, name: &str) -> Option<i64> {
+        self.members
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| *v)
+    }
+    fn variant(&self, name: &str) -> Option<&VariantLow> {
+        self.variants.iter().find(|v| v.name == name)
+    }
+}
+
+/// The information `resolve_ty` needs to map a named type to a ZIR type: struct
+/// / tier-3-enum ids, plus the enum registry (so a tier-1 enum resolves to its
+/// backing integer and a tier-3 enum to its tagged struct).
+struct TyEnv<'a> {
+    ids: &'a HashMap<String, u32>,
+    enums: &'a HashMap<String, EnumLow>,
+}
+
 /// Lower a type-checked module to ZIR.
 /// Struct layouts/ids collected before lowering function bodies.
 struct StructCtx {
     ids: HashMap<String, u32>,
     names: Vec<String>,
     fields: Vec<Vec<(String, Ty)>>,
+    /// Registered enums (tier-1 and tier-3), keyed by type name.
+    enums: HashMap<String, EnumLow>,
     /// Python import aliases (ticket #27, D-0012): the in-scope name
     /// (`import python "numpy" as np` → `np`) mapped to the CPython module name
     /// (`numpy`). A reference to one of these names lowers to a `zap_py_import`.
@@ -39,28 +91,135 @@ impl StructCtx {
             .find(|(_, (n, _))| n == name)
             .map(|(i, (_, t))| (i as u32, *t))
     }
+
+    fn tyenv(&self) -> TyEnv<'_> {
+        TyEnv {
+            ids: &self.ids,
+            enums: &self.enums,
+        }
+    }
 }
 
 pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     let mut errors = Vec::new();
 
-    // Collect struct ids, then resolve field types (two passes so fields may
-    // reference structs declared later).
+    // Collect struct ids and tier-3-enum tagged-struct ids (a tier-3 enum is
+    // lowered as a struct, D-0046), then resolve field types. Multiple passes so
+    // fields may reference types declared later, and so a recursive enum variant
+    // (whose field type is the enum itself) resolves to a pointer.
     let mut ids: HashMap<String, u32> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
     for item in &module.items {
-        if let ast::Item::Struct(s) = item {
-            ids.insert(s.name.clone(), names.len() as u32);
-            names.push(s.name.clone());
+        match item {
+            ast::Item::Struct(s) => {
+                ids.insert(s.name.clone(), names.len() as u32);
+                names.push(s.name.clone());
+            }
+            // A data-carrying enum needs a struct id reserved up front so its
+            // own (possibly recursive) variant fields resolve to a pointer.
+            ast::Item::Enum(e) if e.variants.iter().any(|v| !v.fields.is_empty()) => {
+                ids.insert(e.name.clone(), names.len() as u32);
+                names.push(e.name.clone());
+            }
+            _ => {}
         }
     }
+
+    // Build the enum registry. For tier-1 enums, compute member discriminants
+    // (explicit, else previous + 1 from 0). For tier-3 enums, lay out the tagged
+    // struct `{ tag:i32, <flattened payload fields> }` and record each variant's
+    // tag and its fields' struct indices.
+    let mut enums: HashMap<String, EnumLow> = HashMap::new();
+    {
+        // A borrow of `ids`/`enums` is needed to resolve payload field types,
+        // but enum entries are inserted as they are built, so recursive and
+        // forward references resolve against `ids` directly.
+        for item in &module.items {
+            if let ast::Item::Enum(e) = item {
+                let is_sum = e.variants.iter().any(|v| !v.fields.is_empty());
+                if !is_sum {
+                    let mut members = Vec::new();
+                    let mut next = 0i64;
+                    for v in &e.variants {
+                        let value = v.value.as_ref().and_then(const_int_value).unwrap_or(next);
+                        members.push((v.name.clone(), value));
+                        next = value + 1;
+                    }
+                    enums.insert(
+                        e.name.clone(),
+                        EnumLow {
+                            is_sum: false,
+                            sid: None,
+                            members,
+                            variants: Vec::new(),
+                        },
+                    );
+                } else {
+                    let sid = ids[&e.name];
+                    let mut variants = Vec::new();
+                    // Struct field 0 is the tag; payload fields follow, flattened
+                    // across variants (each variant's fields occupy their own
+                    // slots — a space-optimal overlapping union is a follow-up).
+                    let mut next_idx = 1u32;
+                    for (tag, v) in e.variants.iter().enumerate() {
+                        let mut vfields = Vec::new();
+                        for f in &v.fields {
+                            let ft = resolve_ty(
+                                &f.ty,
+                                &TyEnv {
+                                    ids: &ids,
+                                    enums: &enums,
+                                },
+                            )
+                            .unwrap_or(Ty::Ptr);
+                            vfields.push((f.name.clone(), next_idx, ft));
+                            next_idx += 1;
+                        }
+                        variants.push(VariantLow {
+                            name: v.name.clone(),
+                            tag: tag as i64,
+                            fields: vfields,
+                        });
+                    }
+                    enums.insert(
+                        e.name.clone(),
+                        EnumLow {
+                            is_sum: true,
+                            sid: Some(sid),
+                            members: Vec::new(),
+                            variants,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     let mut fields: Vec<Vec<(String, Ty)>> = vec![Vec::new(); names.len()];
-    for item in &module.items {
-        if let ast::Item::Struct(s) = item {
-            let sid = ids[&s.name];
-            for fld in &s.fields {
-                let ft = resolve_ty(&fld.ty, &ids).unwrap_or(Ty::Ptr);
-                fields[sid as usize].push((fld.name.clone(), ft));
+    {
+        let tyenv = TyEnv {
+            ids: &ids,
+            enums: &enums,
+        };
+        for item in &module.items {
+            if let ast::Item::Struct(s) = item {
+                let sid = ids[&s.name];
+                for fld in &s.fields {
+                    let ft = resolve_ty(&fld.ty, &tyenv).unwrap_or(Ty::Ptr);
+                    fields[sid as usize].push((fld.name.clone(), ft));
+                }
+            }
+        }
+        // Fill in each tier-3 enum's tagged-struct layout: tag + payload slots.
+        for e in enums.values() {
+            if let (true, Some(sid)) = (e.is_sum, e.sid) {
+                let slot = &mut fields[sid as usize];
+                slot.push(("$tag".to_string(), Ty::I32));
+                for v in &e.variants {
+                    for (fname, _idx, ft) in &v.fields {
+                        slot.push((format!("{}${}", v.name, fname), *ft));
+                    }
+                }
             }
         }
     }
@@ -79,6 +238,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         ids,
         names,
         fields,
+        enums,
         py,
     };
 
@@ -91,7 +251,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 let ret = f
                     .ret
                     .as_ref()
-                    .map(|t| resolve_ty(t, &ctx.ids).unwrap_or(Ty::Void))
+                    .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
                     .unwrap_or(Ty::Void);
                 sigs.insert(f.name.clone(), (params, ret));
             }
@@ -106,7 +266,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     let ret = m
                         .ret
                         .as_ref()
-                        .map(|t| resolve_ty(t, &ctx.ids).unwrap_or(Ty::Void))
+                        .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
                         .unwrap_or(Ty::Void);
                     sigs.insert(format!("{}__{}", s.name, m.name), (params, ret));
                 }
@@ -173,7 +333,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     (out, errors)
 }
 
-fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerError> {
+fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
     match t {
         ast::Type::Named { name, args, .. } => match name.as_str() {
             "int64" | "i64" => Ok(Ty::I64),
@@ -186,32 +346,32 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
             "pyobject" => Ok(Ty::Py),
             "list" => {
                 let e = match args.first() {
-                    Some(a) => elem_of(a, ids)?,
+                    Some(a) => elem_of(a, env)?,
                     None => Elem::I64,
                 };
                 Ok(Ty::List(e))
             }
             "array" => {
                 let d = match args.first() {
-                    Some(a) => dtype_of(a, ids)?,
+                    Some(a) => dtype_of(a, env)?,
                     None => Dtype::F64,
                 };
                 Ok(Ty::Array(d))
             }
             "dict" => {
                 let k = match args.first() {
-                    Some(a) => elem_of(a, ids)?,
+                    Some(a) => elem_of(a, env)?,
                     None => Elem::I64,
                 };
                 let v = match args.get(1) {
-                    Some(a) => elem_of(a, ids)?,
+                    Some(a) => elem_of(a, env)?,
                     None => Elem::I64,
                 };
                 Ok(Ty::Dict(k, v))
             }
             "set" => {
                 let e = match args.first() {
-                    Some(a) => elem_of(a, ids)?,
+                    Some(a) => elem_of(a, env)?,
                     None => Elem::I64,
                 };
                 Ok(Ty::Set(e))
@@ -221,17 +381,27 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
                 // as a collection element (ticket #25, D-0031): the element kind
                 // picks the typed send/recv runtime entry point.
                 let e = match args.first() {
-                    Some(a) => elem_of(a, ids)?,
+                    Some(a) => elem_of(a, env)?,
                     None => Elem::I64,
                 };
                 Ok(Ty::Chan(e))
             }
-            other => match ids.get(other) {
-                Some(id) => Ok(Ty::Struct(*id)),
-                None => Err(err(format!(
-                    "type '{other}' is not supported by codegen yet"
-                ))),
-            },
+            other => {
+                // A tier-1 enum is its unboxed backing integer; a tier-3 enum is
+                // its tagged struct; a struct is its layout (D-0018/D-0046).
+                if let Some(e) = env.enums.get(other) {
+                    if e.is_sum {
+                        return Ok(Ty::Struct(e.sid.expect("tier-3 enum has a struct id")));
+                    }
+                    return Ok(Ty::I64);
+                }
+                match env.ids.get(other) {
+                    Some(id) => Ok(Ty::Struct(*id)),
+                    None => Err(err(format!(
+                        "type '{other}' is not supported by codegen yet"
+                    ))),
+                }
+            }
         },
         _ => Err(err("only named scalar types are supported by codegen yet")),
     }
@@ -239,15 +409,15 @@ fn resolve_ty(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Ty, LowerErro
 
 /// The runtime representation of a collection element/key/value given its
 /// source type.
-fn elem_of(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Elem, LowerError> {
-    elem_kind(resolve_ty(t, ids)?)
+fn elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
+    elem_kind(resolve_ty(t, env)?)
 }
 
 /// The array dtype for a `array[T]` element type (ticket #24). Only `f64` and
 /// `i64` are supported in this increment; other numeric dtypes (`f32`, `i32`)
 /// and dtype promotion are deferred.
-fn dtype_of(t: &ast::Type, ids: &HashMap<String, u32>) -> Result<Dtype, LowerError> {
-    match resolve_ty(t, ids)? {
+fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
+    match resolve_ty(t, env)? {
         Ty::F64 => Ok(Dtype::F64),
         Ty::I64 => Ok(Dtype::I64),
         other => Err(err(format!(
@@ -313,7 +483,7 @@ fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
         }
     }
     p.ty.as_ref()
-        .map(|t| resolve_ty(t, &ctx.ids).unwrap_or(Ty::Ptr))
+        .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Ptr))
         .unwrap_or(Ty::Ptr)
 }
 
@@ -934,6 +1104,11 @@ impl<'a> FnLower<'a> {
         self.emit(Inst::FConst { dest: d, val });
         d
     }
+    fn bconst(&mut self, val: bool) -> Value {
+        let d = self.new_value(Ty::I1);
+        self.emit(Inst::BConst { dest: d, val });
+        d
+    }
 
     // --- decorators & reflection (ticket #16, D-0036) ---
     //
@@ -1022,7 +1197,7 @@ impl<'a> FnLower<'a> {
             } => {
                 let (v, vt) = self.expr(value)?;
                 let declared = match ty {
-                    Some(t) => resolve_ty(t, &self.ctx.ids)?,
+                    Some(t) => resolve_ty(t, &self.ctx.tyenv())?,
                     None => vt,
                 };
                 let v = self.coerce(v, vt, declared);
@@ -1139,7 +1314,10 @@ impl<'a> FnLower<'a> {
                 ..
             } => self.lower_try(body, excepts, finally.as_ref()),
             Stmt::Spawn { call, .. } => self.lower_spawn(call),
-            Stmt::With { .. } | Stmt::Match { .. } => Err(err(
+            Stmt::Match {
+                scrutinee, arms, ..
+            } => self.lower_match(scrutinee, arms),
+            Stmt::With { .. } => Err(err(
                 "this statement is not supported by codegen yet (Phase 1 slice)",
             )),
         }
@@ -1400,6 +1578,17 @@ impl<'a> FnLower<'a> {
                 }
             }
             _ => {
+                // Iterating an enum *type* (`for col in Color:`, D-0018) is
+                // typed by sema but its lowering is a documented follow-up
+                // (it rides on the same enum-identity tracking as `.name`).
+                if let Expr::Name(n, _) = iter {
+                    if self.ctx.enums.contains_key(n) {
+                        return Err(err(
+                            "iterating an enum type is not implemented yet (deferred to a \
+                             follow-up; D-0018)",
+                        ));
+                    }
+                }
                 // `for x in <list>` — iterate by index over the list's length.
                 let (lst, lty) = self.expr(iter)?;
                 if let Ty::List(elem) = lty {
@@ -1689,12 +1878,30 @@ impl<'a> FnLower<'a> {
             Expr::Set(elems, _) => self.lower_set_lit(elems),
             Expr::Index { base, index, .. } => self.lower_index_get(base, index),
             Expr::Attr { base, name, .. } => {
+                // Qualified enum member/variant access (`Color.RED`,
+                // `Shape.Unit`): the base is a *type* name, resolved before it
+                // would be (wrongly) evaluated as a value (D-0018/D-0046).
+                if let Expr::Name(tyname, _) = base.as_ref() {
+                    if self.ctx.enums.contains_key(tyname) {
+                        return self.lower_enum_member(tyname, name);
+                    }
+                }
                 let (bv, bty) = self.expr(base)?;
                 // Attribute read on a Python handle, e.g. `np.pi` (ticket #27,
                 // D-0012). A call `np.foo(...)` is intercepted in `call` before
                 // reaching here, so this is a plain attribute access.
                 if bty == Ty::Py {
                     return Ok((self.lower_py_getattr(bv, name), Ty::Py));
+                }
+                // `.name` on an enum value (D-0018) is typed by sema but its
+                // lowering is a documented follow-up: a tier-1 enum collapses to
+                // its backing `i64` here, losing the static enum identity the
+                // member-name table lookup needs. (Preserving it needs a ZIR
+                // enum type; tracked as a follow-up.)
+                if name == "name" {
+                    return Err(err(
+                        "enum '.name' is not implemented yet (deferred to a follow-up; D-0018)",
+                    ));
                 }
                 let Ty::Struct(sid) = bty else {
                     return Err(err("field access on a non-struct value"));
@@ -1754,6 +1961,16 @@ impl<'a> FnLower<'a> {
     }
 
     fn call(&mut self, callee: &Expr, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+        // Qualified tier-3 variant construction `Shape.Circle(2.0)` (D-0046):
+        // the callee is `Enum.Variant`, intercepted before the plain-name and
+        // method-call dispatch.
+        if let Expr::Attr { base, name, .. } = callee {
+            if let Expr::Name(tyname, _) = base.as_ref() {
+                if self.ctx.enums.contains_key(tyname) {
+                    return self.lower_variant_construct(tyname, name, args);
+                }
+            }
+        }
         // Array construction `array[dtype]([...])` (ticket #24). The callee
         // parses as a subscript `array[dtype]`, so it is intercepted here before
         // the plain-name dispatch below.
@@ -1874,6 +2091,17 @@ impl<'a> FnLower<'a> {
             if fname == "reflect_has" || fname == "reflect_names" {
                 return self.lower_reflect_query(fname, args);
             }
+            // Tier-1 enum conversion `Color(x)` (D-0018/D-0020): the enum is its
+            // backing `i64`, so this is just a coercion of the int argument.
+            if let Some(info) = self.ctx.enums.get(fname) {
+                if !info.is_sum {
+                    if args.len() != 1 {
+                        return Err(err(format!("{fname}() takes exactly one argument")));
+                    }
+                    let (v, vt) = self.expr(&args[0].value)?;
+                    return Ok((self.coerce(v, vt, Ty::I64), Ty::I64));
+                }
+            }
             // Struct construction: `StructName(fields...)`.
             if let Some(&sid) = self.ctx.ids.get(fname) {
                 return self.construct(sid, args);
@@ -1979,6 +2207,347 @@ impl<'a> FnLower<'a> {
             });
         }
         Ok((dest, Ty::Struct(sid)))
+    }
+
+    // --- enums (ticket #51, D-0018/D-0046) ---
+    //
+    // A tier-1 enum is its unboxed backing `i64`; a member access lowers to the
+    // discriminant constant. A tier-3 enum is a GC-allocated tagged struct
+    // `{ tag:i32, payload… }`; a variant construction allocates it, stores the
+    // tag, and stores each payload field — reusing the struct machinery, so a
+    // recursive variant field is simply a pointer to a heap enum value (which
+    // breaks the otherwise-infinite size, D-0046). `match` branches on the
+    // backing integer (tier 1) or the tag field (tier 3).
+
+    /// Lower a qualified member/variant access with no call: `Color.RED`
+    /// (tier-1 constant) or `Shape.Unit` (tier-3 payload-free variant).
+    fn lower_enum_member(
+        &mut self,
+        enum_name: &str,
+        member: &str,
+    ) -> Result<(Value, Ty), LowerError> {
+        let info = self
+            .ctx
+            .enums
+            .get(enum_name)
+            .cloned()
+            .expect("caller checked this is an enum");
+        if !info.is_sum {
+            let val = info
+                .member_value(member)
+                .ok_or_else(|| err(format!("enum '{enum_name}' has no member '{member}'")))?;
+            return Ok((self.iconst(Ty::I64, val), Ty::I64));
+        }
+        // Tier-3: a bare variant must be payload-free (data-carrying variants are
+        // constructed through `call`).
+        let v = info
+            .variant(member)
+            .ok_or_else(|| err(format!("enum '{enum_name}' has no variant '{member}'")))?
+            .clone();
+        if !v.fields.is_empty() {
+            return Err(err(format!(
+                "variant '{enum_name}.{member}' carries data; construct it with \
+                 '{enum_name}.{member}(...)'"
+            )));
+        }
+        let sid = info.sid.expect("tier-3 enum has a struct id");
+        self.build_variant(sid, &v, &[])
+    }
+
+    /// Lower a qualified variant construction `Enum.Variant(args)` (D-0046):
+    /// allocate the tagged struct, store the tag, and store each payload field
+    /// (positional or named). Returns the enum value (a `Struct` pointer).
+    fn lower_variant_construct(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let info = self
+            .ctx
+            .enums
+            .get(enum_name)
+            .cloned()
+            .expect("caller checked this is an enum");
+        if !info.is_sum {
+            return Err(err(format!(
+                "'{enum_name}' is a tier-1 enum; '{enum_name}.{variant}(...)' is not a \
+                 constructor"
+            )));
+        }
+        let v = info
+            .variant(variant)
+            .ok_or_else(|| err(format!("enum '{enum_name}' has no variant '{variant}'")))?
+            .clone();
+        let sid = info.sid.expect("tier-3 enum has a struct id");
+        self.build_variant(sid, &v, args)
+    }
+
+    /// Allocate a tier-3 tagged struct for `variant` and fill the tag slot and
+    /// its payload fields from `args` (named or positional, declaration order).
+    fn build_variant(
+        &mut self,
+        sid: u32,
+        variant: &VariantLow,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        // Tag slot (field 0).
+        let tag = self.iconst(Ty::I32, variant.tag);
+        self.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: 0,
+            val: tag,
+        });
+        // Payload fields.
+        let mut pos = 0usize;
+        for a in args {
+            let (fidx, fty) = match &a.name {
+                Some(fname) => variant
+                    .fields
+                    .iter()
+                    .find(|(n, _, _)| n == fname)
+                    .map(|(_, idx, t)| (*idx, *t))
+                    .ok_or_else(|| {
+                        err(format!("variant '{}' has no field '{fname}'", variant.name))
+                    })?,
+                None => {
+                    let f = variant
+                        .fields
+                        .get(pos)
+                        .ok_or_else(|| err("too many fields in variant constructor"))?;
+                    pos += 1;
+                    (f.1, f.2)
+                }
+            };
+            let (val, vt) = self.expr(&a.value)?;
+            let val = self.coerce(val, vt, fty);
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: fidx,
+                val,
+            });
+        }
+        Ok((dest, Ty::Struct(sid)))
+    }
+
+    /// Lower a `match` statement (D-0040/D-0046). The scrutinee is evaluated
+    /// once; arms are tested top-to-bottom like an `if`/`elif` chain. The test
+    /// compares the backing integer (tier-1 enum / literal) or the tag field
+    /// (tier-3 enum); a matching arm binds its captures/payload fields, checks
+    /// any guard, and runs its body. Exhaustiveness is already enforced by sema.
+    fn lower_match(&mut self, scrutinee: &Expr, arms: &[ast::MatchArm]) -> Result<(), LowerError> {
+        let (sv, sty) = self.expr(scrutinee)?;
+        let merge = self.new_block();
+        for arm in arms {
+            let (cond, _catch_all) = self.pattern_cond(sv, sty, &arm.pattern)?;
+            let then_bb = self.new_block();
+            let next_bb = self.new_block();
+            self.set_term(Term::BrIf {
+                cond,
+                then_bb,
+                else_bb: next_bb,
+            });
+            self.position(then_bb);
+            self.push_scope();
+            self.bind_pattern(sv, sty, &arm.pattern)?;
+            if let Some(g) = &arm.guard {
+                // A guard runs after binding; on failure fall through to the
+                // next arm (it does not count toward exhaustiveness — sema).
+                let (gv, gty) = self.expr(g)?;
+                let gc = self.truthy(gv, gty);
+                let body_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: gc,
+                    then_bb: body_bb,
+                    else_bb: next_bb,
+                });
+                self.position(body_bb);
+            }
+            self.lower_block(&arm.body)?;
+            self.ensure_br(merge);
+            self.pop_scope();
+            self.position(next_bb);
+        }
+        // Fall-through (no arm matched): for a non-enum scrutinee this is the
+        // Python no-op; for an exhaustive enum sema guarantees this is dead.
+        self.ensure_br(merge);
+        self.position(merge);
+        Ok(())
+    }
+
+    /// Emit the test for one pattern against the scrutinee and return its `i1`
+    /// condition plus whether the pattern is an irrefutable catch-all.
+    fn pattern_cond(
+        &mut self,
+        sv: Value,
+        sty: Ty,
+        pat: &Pattern,
+    ) -> Result<(Value, bool), LowerError> {
+        match pat {
+            Pattern::Wildcard(_) | Pattern::Capture { .. } => Ok((self.bconst(true), true)),
+            Pattern::Literal(e) => {
+                let (lv, lt) = self.expr(e)?;
+                let (c, _) = self.binop(AstBin::Eq, sv, sty, lv, lt)?;
+                Ok((c, false))
+            }
+            Pattern::Or(ps, _) => {
+                let mut acc: Option<Value> = None;
+                let mut catch_all = false;
+                for sub in ps {
+                    let (c, ca) = self.pattern_cond(sv, sty, sub)?;
+                    catch_all |= ca;
+                    acc = Some(match acc {
+                        None => c,
+                        Some(prev) => {
+                            let d = self.new_value(Ty::I1);
+                            self.emit(Inst::Bin {
+                                dest: d,
+                                op: BinOp::Or,
+                                lhs: prev,
+                                rhs: c,
+                            });
+                            d
+                        }
+                    });
+                }
+                Ok((acc.unwrap_or_else(|| self.bconst(false)), catch_all))
+            }
+            Pattern::Struct {
+                path,
+                args,
+                span: _,
+            } => self.variant_cond(sv, sty, path, args.as_deref()),
+            Pattern::Tuple(..) | Pattern::Sequence(..) | Pattern::Rest { .. } => Err(err(
+                "tuple/sequence patterns in match are not supported yet (Phase 1 slice)",
+            )),
+        }
+    }
+
+    /// The test for a qualified enum pattern (`Color.RED`, `Shape.Circle(r)`):
+    /// compare the backing integer (tier 1) or the tag field (tier 3).
+    fn variant_cond(
+        &mut self,
+        sv: Value,
+        sty: Ty,
+        path: &[String],
+        _args: Option<&[PatArg]>,
+    ) -> Result<(Value, bool), LowerError> {
+        if path.len() != 2 {
+            return Err(err(
+                "only qualified enum patterns (Enum.Variant) are supported in match",
+            ));
+        }
+        let info = self
+            .ctx
+            .enums
+            .get(&path[0])
+            .cloned()
+            .ok_or_else(|| err(format!("'{}' is not an enum", path[0])))?;
+        if !info.is_sum {
+            let val = info
+                .member_value(&path[1])
+                .ok_or_else(|| err(format!("enum '{}' has no member '{}'", path[0], path[1])))?;
+            let k = self.iconst(Ty::I64, val);
+            let (c, _) = self.binop(AstBin::Eq, sv, sty, k, Ty::I64)?;
+            Ok((c, false))
+        } else {
+            let v = info
+                .variant(&path[1])
+                .ok_or_else(|| err(format!("enum '{}' has no variant '{}'", path[0], path[1])))?;
+            let sid = info.sid.expect("tier-3 enum has a struct id");
+            let tagv = self.new_value(Ty::I32);
+            self.emit(Inst::FieldGet {
+                dest: tagv,
+                base: sv,
+                sid,
+                idx: 0,
+            });
+            let k = self.iconst(Ty::I32, v.tag);
+            let (c, _) = self.binop(AstBin::Eq, tagv, Ty::I32, k, Ty::I32)?;
+            Ok((c, false))
+        }
+    }
+
+    /// Declare the bindings a matched pattern introduces into the current scope.
+    fn bind_pattern(&mut self, sv: Value, sty: Ty, pat: &Pattern) -> Result<(), LowerError> {
+        match pat {
+            Pattern::Capture { name, .. } => {
+                let slot = self.alloca(sty);
+                self.store(slot, sv);
+                self.declare(name, slot, sty);
+                Ok(())
+            }
+            Pattern::Struct {
+                path,
+                args: Some(args),
+                ..
+            } if path.len() == 2 => {
+                let info = self
+                    .ctx
+                    .enums
+                    .get(&path[0])
+                    .cloned()
+                    .ok_or_else(|| err(format!("'{}' is not an enum", path[0])))?;
+                let Some(v) = info.variant(&path[1]).cloned() else {
+                    return Ok(());
+                };
+                let sid = info.sid.expect("tier-3 enum has a struct id");
+                let mut pos = 0usize;
+                for a in args {
+                    let field = match &a.name {
+                        Some(fname) => v.fields.iter().find(|(n, _, _)| n == fname).cloned(),
+                        None => {
+                            let f = v.fields.get(pos).cloned();
+                            pos += 1;
+                            f
+                        }
+                    };
+                    let Some((_, fidx, fty)) = field else {
+                        continue;
+                    };
+                    self.bind_field(sv, sid, fidx, fty, &a.pattern)?;
+                }
+                Ok(())
+            }
+            // Payload-free qualified constant (`Color.RED`, `Shape.Unit`) and
+            // other refutable leaves bind nothing.
+            _ => Ok(()),
+        }
+    }
+
+    /// Bind one payload field's value to the capture in its sub-pattern.
+    fn bind_field(
+        &mut self,
+        base: Value,
+        sid: u32,
+        fidx: u32,
+        fty: Ty,
+        sub: &Pattern,
+    ) -> Result<(), LowerError> {
+        match sub {
+            Pattern::Wildcard(_) => Ok(()),
+            Pattern::Capture { name, .. } => {
+                let fv = self.new_value(fty);
+                self.emit(Inst::FieldGet {
+                    dest: fv,
+                    base,
+                    sid,
+                    idx: fidx,
+                });
+                let slot = self.alloca(fty);
+                self.store(slot, fv);
+                self.declare(name, slot, fty);
+                Ok(())
+            }
+            _ => Err(err(
+                "nested patterns inside a variant field are not supported yet (bind to a \
+                 name or use '_')",
+            )),
+        }
     }
 
     // --- collections (ticket #21) ---
@@ -3071,6 +3640,26 @@ fn unescape(s: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Evaluate a tier-1 enum discriminant expression (`GREEN = 10`), which the
+/// grammar allows to be an integer literal, optionally signed. Richer constant
+/// expressions are a follow-up.
+fn const_int_value(e: &ast::Expr) -> Option<i64> {
+    match e {
+        ast::Expr::Int(s, _) => Some(parse_int_lit(s)),
+        ast::Expr::Unary {
+            op: ast::UnOp::Neg,
+            expr,
+            ..
+        } => const_int_value(expr).map(|v| -v),
+        ast::Expr::Unary {
+            op: ast::UnOp::Pos,
+            expr,
+            ..
+        } => const_int_value(expr),
+        _ => None,
+    }
 }
 
 fn parse_int_lit(s: &str) -> i64 {

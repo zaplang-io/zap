@@ -89,6 +89,112 @@ mod tests {
     }
 
     #[test]
+    fn lower_tier1_enum_and_match() {
+        // A tier-1 enum is its unboxed backing int: member access is an iconst
+        // (RED=0, GREEN=10, BLUE continues at 11), and a `match` is an
+        // icmp-against-constant chain (D-0018/D-0040).
+        let m = lower_ok(
+            "enum Color:\n    RED\n    GREEN = 10\n    BLUE\n\n\
+             def classify(Color c) -> int64:\n    match c:\n\
+             \x20       case Color.RED:\n            return 1\n\
+             \x20       case Color.GREEN:\n            return 2\n\
+             \x20       case Color.BLUE:\n            return 3\n\n\
+             def main():\n    print(classify(Color.BLUE))\n",
+        );
+        // No tagged struct is allocated for a tier-1 enum.
+        assert!(
+            m.structs.is_empty(),
+            "tier-1 enum should not allocate a struct"
+        );
+        let classify = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "classify")
+            .expect("classify");
+        assert_eq!(classify.params, vec![Ty::I64], "tier-1 enum lowers to i64");
+        let text = format!("{m}");
+        // BLUE auto-continues from GREEN=10.
+        assert!(text.contains("iconst 11"), "BLUE should be 11:\n{text}");
+        assert!(
+            text.contains("icmp.Eq"),
+            "match dispatches on equality:\n{text}"
+        );
+        // The construction `Color.BLUE` is just the discriminant constant.
+        assert!(!text.contains("structnew"), "no struct for tier-1:\n{text}");
+    }
+
+    #[test]
+    fn lower_tier3_variant_construction_and_match() {
+        // A tier-3 enum is a GC-allocated tagged struct `{ tag:i32, payload… }`
+        // (D-0046). Construction stores the tag + payload fields; `match`
+        // branches on the tag and binds fields positionally or by name.
+        let m = lower_ok(
+            "enum Shape:\n    Circle(f64 r)\n    Rect(f64 w, f64 h)\n    Unit\n\n\
+             def area(Shape s) -> f64:\n    match s:\n\
+             \x20       case Shape.Circle(r):\n            return 3.14 * r * r\n\
+             \x20       case Shape.Rect(w=w, h=h):\n            return w * h\n\
+             \x20       case Shape.Unit:\n            return 1.0\n\n\
+             def main():\n\
+             \x20   print(area(Shape.Circle(r=2.0)))\n\
+             \x20   print(area(Shape.Rect(3.0, 4.0)))\n\
+             \x20   print(area(Shape.Unit))\n",
+        );
+        // One tagged struct: tag(i32) + Circle.r + Rect.w + Rect.h (flattened).
+        assert_eq!(m.structs.len(), 1, "one tagged struct for the sum type");
+        assert_eq!(m.structs[0].name, "Shape");
+        assert_eq!(
+            m.structs[0].fields,
+            vec![Ty::I32, Ty::F64, Ty::F64, Ty::F64],
+            "layout is [tag, Circle.r, Rect.w, Rect.h]"
+        );
+        let area = m.funcs.iter().find(|f| f.name == "area").expect("area");
+        assert_eq!(
+            area.params,
+            vec![Ty::Struct(0)],
+            "scrutinee is a tagged struct"
+        );
+        let text = format!("{m}");
+        assert!(text.contains("structnew struct#0"), "construction:\n{text}");
+        // tag slot written, payload written; match reads the tag and the fields.
+        assert!(
+            text.contains("fieldset struct#0 %0.0 = %1"),
+            "tag set:\n{text}"
+        );
+        assert!(
+            text.contains("fieldget struct#0"),
+            "match reads fields:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lower_recursive_enum_is_pointer() {
+        // A (mutually) recursive variant field — whose type is the enum itself —
+        // is a pointer to a heap enum value, breaking the otherwise-infinite
+        // size (D-0046). Reusing the struct machinery gives this for free: the
+        // field's ZIR type is `Struct(sid)`, i.e. a pointer.
+        let m = lower_ok(
+            "enum Expr:\n    Num(int64 v)\n    Add(Expr l, Expr r)\n\n\
+             def eval(Expr e) -> int64:\n    match e:\n\
+             \x20       case Expr.Num(v):\n            return v\n\
+             \x20       case Expr.Add(l, r):\n            return eval(l) + eval(r)\n\n\
+             def main():\n    print(eval(Expr.Add(Expr.Num(2), Expr.Num(3))))\n",
+        );
+        assert_eq!(m.structs.len(), 1);
+        // Layout: [tag:i32, Num.v:i64, Add.l:struct#0, Add.r:struct#0]. The
+        // recursive fields point back to the same tagged struct.
+        assert_eq!(
+            m.structs[0].fields,
+            vec![Ty::I32, Ty::I64, Ty::Struct(0), Ty::Struct(0)],
+            "recursive variant fields are pointers to the enum's own struct"
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("call @eval"),
+            "recursion lowers to a call:\n{text}"
+        );
+    }
+
+    #[test]
     fn lower_sets() {
         let m = lower_ok(include_str!("../../../tests/golden/set_int.zap"));
         let text = format!("{m}");
