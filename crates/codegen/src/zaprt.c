@@ -226,12 +226,19 @@ int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 /* dict[K, V]: open-addressing hash table with linear probing.
  * Key kind (int64 vs str) is passed per call; a dict is homogeneous, so this is
  * stable across a given dict's lifetime. */
-enum { KEY_I64 = 0, KEY_STR = 1 };
+/* KEY_FN (operator overloading, D-0047): a user-struct key, hashed/compared
+ * through the type's own `__hash__`/`__eq__`, which the dict/set stores as
+ * function pointers. `__hash__(self) -> i64` and `__eq__(a, b) -> bool` match the
+ * ZIR-generated signatures (an LLVM `i1` return maps to C `_Bool`). */
+enum { KEY_I64 = 0, KEY_STR = 1, KEY_FN = 2 };
 enum { SLOT_EMPTY = 0, SLOT_FULL = 1, SLOT_TOMB = 2 };
+
+typedef int64_t (*ZapHashFn)(void *self);
+typedef _Bool (*ZapEqFn)(void *a, void *b);
 
 typedef struct {
     uint8_t state;
-    int64_t key; /* key word (int64, or ZapStr* bits) */
+    int64_t key; /* key word: int64, or ZapStr/struct pointer bits */
     int64_t val; /* value word */
 } ZapEntry;
 
@@ -239,6 +246,8 @@ typedef struct {
     int64_t len;
     int64_t cap; /* number of slots; always a power of two or 0 */
     ZapEntry *entries;
+    void *hashfn; /* struct keys only (KEY_FN): the type's __hash__ / __eq__ */
+    void *eqfn;
 } ZapDict;
 
 void *zap_dict_new(void) {
@@ -246,6 +255,8 @@ void *zap_dict_new(void) {
     d->len = 0;
     d->cap = 0;
     d->entries = NULL;
+    d->hashfn = NULL;
+    d->eqfn = NULL;
     return d;
 }
 
@@ -266,18 +277,61 @@ static uint64_t zap_hash_str(const ZapStr *s) {
     return h;
 }
 
-static uint64_t zap_key_hash(int64_t key, int keykind) {
+static uint64_t zap_key_hash(int64_t key, int keykind, void *hashfn) {
+    if (keykind == KEY_FN) {
+        /* User struct key: hash via the type's __hash__ (D-0047). */
+        return (uint64_t)((ZapHashFn)hashfn)((void *)(intptr_t)key);
+    }
     return keykind == KEY_STR ? zap_hash_str((const ZapStr *)(intptr_t)key)
                               : zap_hash_i64(key);
 }
 
-static int zap_key_eq(int64_t a, int64_t b, int keykind) {
+static int zap_key_eq(int64_t a, int64_t b, int keykind, void *eqfn) {
+    if (keykind == KEY_FN) {
+        /* User struct key: compare via the type's __eq__ (D-0047). */
+        return ((ZapEqFn)eqfn)((void *)(intptr_t)a, (void *)(intptr_t)b) ? 1 : 0;
+    }
     if (keykind != KEY_STR) {
         return a == b;
     }
     const ZapStr *x = (const ZapStr *)(intptr_t)a;
     const ZapStr *y = (const ZapStr *)(intptr_t)b;
     return x->len == y->len && memcmp(x->data, y->data, (size_t)x->len) == 0;
+}
+
+/* Hashing helpers for @derive(Hash)/@derive(Ord) generated dunders (operator
+ * overloading, D-0047). `__hash__` combines each field's hash with
+ * `zap_hash_combine`; `__cmp__` compares string fields with `zap_str_cmp`. */
+int64_t zap_i64_hash(int64_t k) { return (int64_t)zap_hash_i64(k); }
+int64_t zap_str_hash(void *s) { return (int64_t)zap_hash_str((const ZapStr *)s); }
+int64_t zap_hash_combine(int64_t acc, int64_t h) {
+    /* Mix in one field hash: FNV-style multiply/xor, then a splitmix64 finalizer
+     * for good dispersion so field order matters and small values spread out. */
+    uint64_t x = (uint64_t)acc * 1099511628211ULL;
+    x ^= (uint64_t)h;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return (int64_t)(x ^ (x >> 31));
+}
+/* Lexicographic byte comparison of two strings, returning -1 / 0 / +1. */
+int64_t zap_str_cmp(void *ap, void *bp) {
+    const ZapStr *a = (const ZapStr *)ap;
+    const ZapStr *b = (const ZapStr *)bp;
+    int64_t n = a->len < b->len ? a->len : b->len;
+    int c = memcmp(a->data, b->data, (size_t)n);
+    if (c < 0) {
+        return -1;
+    }
+    if (c > 0) {
+        return 1;
+    }
+    if (a->len < b->len) {
+        return -1;
+    }
+    if (a->len > b->len) {
+        return 1;
+    }
+    return 0;
 }
 
 static void zap_dict_resize(ZapDict *d, int keykind) {
@@ -290,7 +344,7 @@ static void zap_dict_resize(ZapDict *d, int keykind) {
         if (d->entries[i].state != SLOT_FULL) {
             continue;
         }
-        uint64_t h = zap_key_hash(d->entries[i].key, keykind);
+        uint64_t h = zap_key_hash(d->entries[i].key, keykind, d->hashfn);
         int64_t j = (int64_t)(h & (uint64_t)(ncap - 1));
         while (ne[j].state == SLOT_FULL) {
             j = (j + 1) & (ncap - 1);
@@ -306,12 +360,12 @@ static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
     if (d->cap == 0 || (d->len + 1) * 4 >= d->cap * 3) { /* load factor 0.75 */
         zap_dict_resize(d, keykind);
     }
-    uint64_t h = zap_key_hash(key, keykind);
+    uint64_t h = zap_key_hash(key, keykind, d->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
     int64_t tomb = -1;
     while (d->entries[j].state != SLOT_EMPTY) {
         if (d->entries[j].state == SLOT_FULL &&
-            zap_key_eq(d->entries[j].key, key, keykind)) {
+            zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
             d->entries[j].val = val; /* overwrite existing key */
             return;
         }
@@ -336,11 +390,11 @@ static int64_t zap_dict_get(void *dp, int64_t key, int keykind) {
     if (d->cap == 0) {
         return 0;
     }
-    uint64_t h = zap_key_hash(key, keykind);
+    uint64_t h = zap_key_hash(key, keykind, d->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
     while (d->entries[j].state != SLOT_EMPTY) {
         if (d->entries[j].state == SLOT_FULL &&
-            zap_key_eq(d->entries[j].key, key, keykind)) {
+            zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
             return d->entries[j].val;
         }
         j = (j + 1) & (d->cap - 1);
@@ -375,6 +429,34 @@ void *zap_dict_get_str_ptr(void *d, void *k) {
     return (void *)(intptr_t)zap_dict_get(d, (int64_t)(intptr_t)k, KEY_STR);
 }
 
+/* Struct-keyed dict (operator overloading, D-0047): the key is a struct pointer,
+ * hashed/compared through the type's `__hash__`/`__eq__`, passed in as `hashfn`
+ * and `eqfn`. They are stored on the dict so resize/probe can reach them. */
+void zap_dict_set_fn_i64(void *dp, void *k, int64_t v, void *hashfn, void *eqfn) {
+    ZapDict *d = (ZapDict *)dp;
+    d->hashfn = hashfn;
+    d->eqfn = eqfn;
+    zap_dict_set(dp, (int64_t)(intptr_t)k, KEY_FN, v);
+}
+void zap_dict_set_fn_ptr(void *dp, void *k, void *v, void *hashfn, void *eqfn) {
+    ZapDict *d = (ZapDict *)dp;
+    d->hashfn = hashfn;
+    d->eqfn = eqfn;
+    zap_dict_set(dp, (int64_t)(intptr_t)k, KEY_FN, (int64_t)(intptr_t)v);
+}
+int64_t zap_dict_get_fn_i64(void *dp, void *k, void *hashfn, void *eqfn) {
+    ZapDict *d = (ZapDict *)dp;
+    d->hashfn = hashfn;
+    d->eqfn = eqfn;
+    return zap_dict_get(dp, (int64_t)(intptr_t)k, KEY_FN);
+}
+void *zap_dict_get_fn_ptr(void *dp, void *k, void *hashfn, void *eqfn) {
+    ZapDict *d = (ZapDict *)dp;
+    d->hashfn = hashfn;
+    d->eqfn = eqfn;
+    return (void *)(intptr_t)zap_dict_get(dp, (int64_t)(intptr_t)k, KEY_FN);
+}
+
 /* set[T]: a dict without values — open-addressing hash table of element words.
  * Shares the key hashing/equality above (RUNTIME-ABI: "dict and set can share
  * hashing"). Elements are uniform 8-byte words, like dict keys; the element
@@ -388,6 +470,8 @@ typedef struct {
     int64_t len;
     int64_t cap; /* number of slots; always a power of two or 0 */
     ZapSetEntry *entries;
+    void *hashfn; /* struct elements only (KEY_FN): the type's __hash__/__eq__ */
+    void *eqfn;
 } ZapSet;
 
 void *zap_set_new(void) {
@@ -395,6 +479,8 @@ void *zap_set_new(void) {
     s->len = 0;
     s->cap = 0;
     s->entries = NULL;
+    s->hashfn = NULL;
+    s->eqfn = NULL;
     return s;
 }
 
@@ -408,7 +494,7 @@ static void zap_set_resize(ZapSet *s, int keykind) {
         if (s->entries[i].state != SLOT_FULL) {
             continue;
         }
-        uint64_t h = zap_key_hash(s->entries[i].key, keykind);
+        uint64_t h = zap_key_hash(s->entries[i].key, keykind, s->hashfn);
         int64_t j = (int64_t)(h & (uint64_t)(ncap - 1));
         while (ne[j].state == SLOT_FULL) {
             j = (j + 1) & (ncap - 1);
@@ -424,11 +510,11 @@ static void zap_set_add(void *sp, int64_t key, int keykind) {
     if (s->cap == 0 || (s->len + 1) * 4 >= s->cap * 3) { /* load factor 0.75 */
         zap_set_resize(s, keykind);
     }
-    uint64_t h = zap_key_hash(key, keykind);
+    uint64_t h = zap_key_hash(key, keykind, s->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(s->cap - 1));
     while (s->entries[j].state != SLOT_EMPTY) {
         if (s->entries[j].state == SLOT_FULL &&
-            zap_key_eq(s->entries[j].key, key, keykind)) {
+            zap_key_eq(s->entries[j].key, key, keykind, s->eqfn)) {
             return; /* already present */
         }
         j = (j + 1) & (s->cap - 1);
@@ -443,11 +529,11 @@ static int64_t zap_set_contains(void *sp, int64_t key, int keykind) {
     if (s->cap == 0) {
         return 0;
     }
-    uint64_t h = zap_key_hash(key, keykind);
+    uint64_t h = zap_key_hash(key, keykind, s->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(s->cap - 1));
     while (s->entries[j].state != SLOT_EMPTY) {
         if (s->entries[j].state == SLOT_FULL &&
-            zap_key_eq(s->entries[j].key, key, keykind)) {
+            zap_key_eq(s->entries[j].key, key, keykind, s->eqfn)) {
             return 1;
         }
         j = (j + 1) & (s->cap - 1);
@@ -460,6 +546,19 @@ int64_t zap_set_len(void *s) { return ((ZapSet *)s)->len; }
 void zap_set_add_i64(void *s, int64_t v) { zap_set_add(s, v, KEY_I64); }
 void zap_set_add_str(void *s, void *v) {
     zap_set_add(s, (int64_t)(intptr_t)v, KEY_STR);
+}
+/* Struct-keyed set (operator overloading, D-0047). */
+void zap_set_add_fn(void *sp, void *v, void *hashfn, void *eqfn) {
+    ZapSet *s = (ZapSet *)sp;
+    s->hashfn = hashfn;
+    s->eqfn = eqfn;
+    zap_set_add(sp, (int64_t)(intptr_t)v, KEY_FN);
+}
+int64_t zap_set_contains_fn(void *sp, void *v, void *hashfn, void *eqfn) {
+    ZapSet *s = (ZapSet *)sp;
+    s->hashfn = hashfn;
+    s->eqfn = eqfn;
+    return zap_set_contains(sp, (int64_t)(intptr_t)v, KEY_FN);
 }
 int64_t zap_set_contains_i64(void *s, int64_t v) {
     return zap_set_contains(s, v, KEY_I64);
