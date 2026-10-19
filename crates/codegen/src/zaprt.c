@@ -1745,8 +1745,12 @@ void *zap_py_str(void *obj_) {
  * condvar. A non-goroutine caller (the main thread) instead blocks on a
  * per-waiter condvar, which parks that OS thread without consuming a worker M.
  *
+ * The netpoller (ticket #80) now parks a G blocked on a non-ready fd and frees
+ * its M, re-queuing the G on readiness (see the "Netpoller" section below); it
+ * reuses the `gopark`/`goready` primitive here.
+ *
  * DEFERRED (documented in the PR / OPEN-QUESTIONS; semantics unchanged): the
- * netpoller / blocking-syscall P-handoff, preemption of long CPU loops (v1 is
+ * blocking-syscall P-handoff, preemption of long CPU loops (v1 is
  * cooperative — Gs yield only at channel ops), hardware guard pages and
  * growable/segmented stacks (a PROT_NONE guard page inside a GC_MALLOC object
  * would break conservative scanning; the spec ties real guard/growable stacks
@@ -2255,8 +2259,10 @@ void zap_spawn_detached(void *fn_, void *arg) {
 /* The implicit root scope's join at program exit (emitted at `main`'s return):
  * block until every spawned G (and its descendants) has finished, then stop the
  * worker Ms. A no-op if nothing ever spawned (scheduler never started). */
+static void netpoll_shutdown(void); /* fwd (netpoller section, below) */
 void zap_rt_join_all(void) {
     if (!g_ms) {
+        netpoll_shutdown(); /* main may have used the netpoller without spawning */
         return;
     }
     /* Precise GC (#48): the main thread blocks here until every spawned G
@@ -2276,6 +2282,9 @@ void zap_rt_join_all(void) {
     for (int i = 0; i < g_nm; i++) {
         GC_pthread_join(g_ms[i].thread, NULL);
     }
+    /* Every spawned G has finished, so nothing is parked on an fd: stop the
+     * netpoller thread too (no-op if it never started). */
+    netpoll_shutdown();
 }
 
 /* ---- structured concurrency: scope / detached / ExceptionGroup ------------ *
@@ -2295,10 +2304,12 @@ void zap_rt_join_all(void) {
  * `checkpoint()` — where the runtime raises `Cancelled`. `Cancelled` rides the
  * ordinary unwinder (so `finally`/`with` cleanups run) and is *not* recorded as
  * a scope failure. Interrupting a coroutine already parked on a channel (rather
- * than one that next reaches a cancellation point) needs the netpoller-style
- * wakeup that is a documented deferral, as is parking — rather than blocking the
- * worker M — at a join reached from inside a coroutine (a nested `scope:`); both
- * work at the default MAXPROCS and the shapes the goldens exercise. */
+ * than one that next reaches a cancellation point) is not yet wired to `scope:`
+ * cancellation, though the netpoller (ticket #80) now provides the
+ * `zap_netpoll_wake` hook a later increment can build it on; parking — rather
+ * than blocking the worker M — at a join reached from inside a coroutine (a
+ * nested `scope:`) likewise remains a deferral. Both work at the default
+ * MAXPROCS and the shapes the goldens exercise. */
 
 typedef struct Scope {
     pthread_mutex_t mu;
@@ -2586,12 +2597,18 @@ static void goready(Waiter *w) {
     }
 }
 
-/* Block the current execution context on channel `c` (lock held on entry). The
- * waiter `w` is already enqueued on the relevant channel queue. Releases the
- * channel lock while blocked and guarantees it is released on return; the
- * waiter's outcome has been written by the waker. A goroutine parks its G and
- * frees its M; a non-goroutine (main) thread blocks on the waiter's condvar. */
-static void chan_block(ZapChan *c, Waiter *w) {
+/* Park the current execution context on a scheduler-keyed wait queue guarded by
+ * `mu` (held on entry). The waiter `w` is already enqueued on the relevant queue
+ * by the caller. Releases `mu` while blocked and guarantees it is released on
+ * return; the waiter's outcome has been written by the waker before `goready`.
+ * A goroutine parks its G and frees its M (the scheduler unlocks `mu` once the G
+ * is fully switched out, which closes the park/wake race); a non-goroutine
+ * (main) thread blocks on the waiter's own condvar without consuming a worker M.
+ *
+ * This is the one shared park primitive the whole runtime blocks on — channels
+ * (`chan_block`), scope joins, and the netpoller (ticket #80) all reuse it, so a
+ * blocked coroutine is always parked rather than tying up an M. */
+static void gopark(pthread_mutex_t *mu, Waiter *w) {
     M *m = cur_m;
     if (m && m->current) {
         G *g = m->current;
@@ -2599,15 +2616,15 @@ static void chan_block(ZapChan *c, Waiter *w) {
          * page under conservative GC; see the section header). */
         char probe;
         if ((char *)&probe - (char *)g->stack < ZAP_STACK_REDZONE) {
-            pthread_mutex_unlock(&c->mu);
+            pthread_mutex_unlock(mu);
             zap_panic(zap_str_new("stack overflow", 14));
             return;
         }
         w->g = g;
         g->state = G_PARKED;
-        g->parkmu = &c->mu; /* scheduler unlocks once we are fully parked */
+        g->parkmu = mu; /* scheduler unlocks once we are fully parked */
         swapcontext(&g->ctx, &m->sched_ctx);
-        /* Resumed (possibly on a different M); channel lock already released. */
+        /* Resumed (possibly on a different M); `mu` already released. */
     } else {
         w->g = NULL;
         pthread_cond_init(&w->cv, NULL);
@@ -2617,12 +2634,16 @@ static void chan_block(ZapChan *c, Waiter *w) {
          * collection need not wait for it. */
         zap_enter_blocking();
         while (!w->done) {
-            pthread_cond_wait(&w->cv, &c->mu);
+            pthread_cond_wait(&w->cv, mu);
         }
-        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_unlock(mu);
         zap_leave_blocking();
     }
 }
+
+/* Block the current execution context on channel `c` (lock held on entry); a
+ * thin wrapper over the shared `gopark` primitive keyed on the channel lock. */
+static void chan_block(ZapChan *c, Waiter *w) { gopark(&c->mu, w); }
 
 void *zap_chan_new(int64_t cap) {
     ZapChan *c = (ZapChan *)zap_obj(&zap_desc_chan);
@@ -2767,6 +2788,593 @@ void zap_chan_close(void *ch) {
     }
     pthread_mutex_unlock(&c->mu);
 }
+
+/* ===========================================================================
+ * Netpoller — non-blocking I/O readiness for the M:N scheduler
+ * (ticket #80, D-0008, design/0005-concurrency.md "Blocking syscalls").
+ *
+ * A goroutine that would block waiting for a file descriptor to become readable
+ * or writable registers the fd here and PARKS its G (freeing its M to run other
+ * goroutines) instead of blocking the OS thread in a read/write syscall. A
+ * dedicated poller OS thread waits on the readiness mechanism (epoll on Linux)
+ * and, when an fd is ready, re-queues the parked G on the scheduler. This is the
+ * Go netpoller analogue and the deferral called out in #47's PR.
+ *
+ * It reuses the scheduler's ONE park/wake primitive (`gopark` / `goready`),
+ * exactly as channels do — a parked reader frees its M; a native (main) thread
+ * caller blocks on its waiter's condvar without consuming a worker M. No
+ * parallel blocking mechanism is introduced.
+ *
+ * GC (both collectors): a `PollDesc` is plain `malloc` infra memory, never a GC
+ * object, so it needs no tracing; the G it references while parked is kept alive
+ * independently by the statically-rooted `g_all[]` registry (and under Immix is
+ * traced via its shadow chain), just like a channel-parked G. The poller thread
+ * allocates no GC memory and touches only non-traced scheduler fields (run-queue
+ * links / state) under their mutexes, so it is safe without being a registered
+ * mutator; under Boehm it is started with `GC_pthread_create` so the collector
+ * still knows the thread.
+ *
+ * Design choices (flagged for review per the ticket):
+ *   - EDGE-TRIGGERED (EPOLLET), Go-style: the fd is registered once for both
+ *     read and write interest; a readiness edge that arrives before any G parks
+ *     is LATCHED per direction so the next `wait` returns immediately. Callers
+ *     must drain to EAGAIN (the standard ET contract; documented in RUNTIME-ABI).
+ *   - Deadlines are absolute CLOCK_MONOTONIC nanoseconds (0 = none); the poller
+ *     wakes an expired waiter with ZAP_POLL_TIMEOUT. A full timer heap is a v1
+ *     follow-up — today the poller scans the (small) live-desc registry.
+ *
+ * PORTABILITY: epoll is the Linux/dev-container backend and the only one wired
+ * for v1/CI. The readiness mechanism sits behind the thin `np_backend_*` seam
+ * below so a kqueue backend (macOS/BSD) can slot in later without touching the
+ * scheduler-facing logic — a deliberate portability follow-up, NOT built here.
+ *
+ * Internal C ABI (no language surface yet; sockets/http are #79, signals #77):
+ *   void   *zap_netpoll_open(int fd)                 register fd, returns desc
+ *   int64_t zap_netpoll_wait(desc, mode, deadline_ns) park until ready/deadline
+ *   void    zap_netpoll_wake(desc, mode)             force-wake parked waiter(s)
+ *   void    zap_netpoll_close(desc)                  deregister + free
+ * `mode` is ZAP_POLL_READ / ZAP_POLL_WRITE; `wait` returns ZAP_POLL_OK /
+ * _TIMEOUT / _CLOSED. `zap_netpoll_wake` is the hook the signal self-pipe (#77)
+ * and a future cancellation-of-parked-G path build on.
+ * ========================================================================== */
+
+enum { ZAP_POLL_READ = 1, ZAP_POLL_WRITE = 2 };
+enum { ZAP_POLL_OK = 0, ZAP_POLL_TIMEOUT = 1, ZAP_POLL_CLOSED = 2 };
+
+typedef struct PollDesc {
+    int fd;
+    int closing;                 /* zap_netpoll_close has been called           */
+    pthread_mutex_t mu;          /* guards the waiter slots / latches / deadlines */
+    Waiter *rg;                  /* parked reader waiter, or NULL                */
+    Waiter *wg;                  /* parked writer waiter, or NULL                */
+    int r_ready;                 /* readiness edge latched with no reader parked  */
+    int w_ready;
+    int64_t r_deadline;          /* CLOCK_MONOTONIC ns, or 0 = none              */
+    int64_t w_deadline;
+    struct PollDesc *all_prev;   /* live-desc registry (deadline scan)           */
+    struct PollDesc *all_next;
+    struct PollDesc *free_link;  /* free list when idle                          */
+} PollDesc;
+
+/* Registry + free list + lifecycle lock. Lock order is ALWAYS g_np_mu then a
+ * PollDesc's own mu; no path takes them the other way round. */
+static pthread_mutex_t g_np_mu = PTHREAD_MUTEX_INITIALIZER;
+static PollDesc *g_np_all = NULL;   /* doubly-linked list of live descriptors   */
+static PollDesc *g_np_free = NULL;  /* recycled descriptors                      */
+
+static pthread_once_t g_np_once = PTHREAD_ONCE_INIT;
+static volatile int g_np_started = 0;
+static volatile int g_np_shutdown = 0;
+static pthread_t g_np_thread;
+
+static int64_t np_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+
+/* ---- backend seam (epoll today; kqueue is the portability follow-up) ------ */
+#if defined(__linux__)
+#define ZAP_NETPOLL_EPOLL 1
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+static int g_np_epfd = -1;   /* epoll instance                                  */
+static int g_np_wakefd = -1; /* eventfd to interrupt epoll_wait (kick/shutdown) */
+static char g_np_wake_tag;   /* sentinel: epoll_event.data.ptr for the wake fd  */
+
+static int np_backend_open(void) {
+    g_np_epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (g_np_epfd < 0) {
+        return -1;
+    }
+    g_np_wakefd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (g_np_wakefd < 0) {
+        close(g_np_epfd);
+        g_np_epfd = -1;
+        return -1;
+    }
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN; /* level-triggered wake fd: always drained below       */
+    ev.data.ptr = &g_np_wake_tag;
+    if (epoll_ctl(g_np_epfd, EPOLL_CTL_ADD, g_np_wakefd, &ev) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int np_backend_add(PollDesc *pd) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    /* One registration serves both directions; edge-triggered (see header). */
+    ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+    ev.data.ptr = pd;
+    return epoll_ctl(g_np_epfd, EPOLL_CTL_ADD, pd->fd, &ev);
+}
+
+static void np_backend_del(PollDesc *pd) {
+    epoll_ctl(g_np_epfd, EPOLL_CTL_DEL, pd->fd, NULL);
+}
+
+static void np_backend_kick(void) {
+    uint64_t one = 1;
+    ssize_t r = write(g_np_wakefd, &one, sizeof one);
+    (void)r; /* a full counter (EAGAIN) still wakes epoll_wait */
+}
+#else
+/* No readiness backend on this platform (kqueue follow-up): the netpoller
+ * degrades to "unsupported" — zap_netpoll_open returns NULL. zaprt.c is only
+ * compiled on Linux (the LLVM dev container / CI), so this path is a stub. */
+static int g_np_epfd = -1;
+static int np_backend_open(void) { return -1; }
+static int np_backend_add(PollDesc *pd) { (void)pd; return -1; }
+static void np_backend_del(PollDesc *pd) { (void)pd; }
+static void np_backend_kick(void) {}
+#endif
+
+/* ---- generic poller (backend-agnostic) ------------------------------------ */
+/* Deliver readiness/timeout/closed to one direction of `pd` (pd->mu held). A
+ * parked waiter is popped, given its outcome, and re-queued (`goready`); a bare
+ * readiness edge with no waiter is LATCHED so the next `wait` consumes it. */
+static void np_wake_dir_locked(PollDesc *pd, int is_read, int status) {
+    Waiter **slot = is_read ? &pd->rg : &pd->wg;
+    int *ready = is_read ? &pd->r_ready : &pd->w_ready;
+    int64_t *dl = is_read ? &pd->r_deadline : &pd->w_deadline;
+    if (*slot) {
+        Waiter *w = *slot;
+        *slot = NULL;
+        *dl = 0;
+        w->val = (uint64_t)status;
+        goready(w); /* enqueue the parked G, or signal a native waiter's condvar */
+    } else if (status == ZAP_POLL_OK) {
+        *ready = 1; /* edge arrived before anyone parked: latch it (edge-triggered) */
+    }
+}
+
+static void np_all_remove_locked(PollDesc *pd) { /* caller holds g_np_mu */
+    if (pd->all_prev) {
+        pd->all_prev->all_next = pd->all_next;
+    } else {
+        g_np_all = pd->all_next;
+    }
+    if (pd->all_next) {
+        pd->all_next->all_prev = pd->all_prev;
+    }
+    pd->all_prev = pd->all_next = NULL;
+}
+
+/* epoll_wait timeout (ms) = time until the nearest pending deadline, -1 if none.
+ * Capped at 1h so a far-future deadline still re-polls periodically. */
+static int np_compute_timeout(void) {
+    int have = 0;
+    int64_t best = 0;
+    pthread_mutex_lock(&g_np_mu);
+    for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
+        pthread_mutex_lock(&pd->mu);
+        int64_t d = 0;
+        if (pd->rg && pd->r_deadline) {
+            d = pd->r_deadline;
+        }
+        if (pd->wg && pd->w_deadline && (d == 0 || pd->w_deadline < d)) {
+            d = pd->w_deadline;
+        }
+        pthread_mutex_unlock(&pd->mu);
+        if (d && (!have || d < best)) {
+            best = d;
+            have = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_np_mu);
+    if (!have) {
+        return -1;
+    }
+    int64_t now = np_now_ns();
+    if (best <= now) {
+        return 0;
+    }
+    int64_t ms = (best - now + 999999) / 1000000;
+    if (ms > 3600000) {
+        ms = 3600000;
+    }
+    return (int)ms;
+}
+
+/* Wake every waiter whose deadline has passed (called after each poll wait). */
+static void np_expire_deadlines(void) {
+    int64_t now = np_now_ns();
+    pthread_mutex_lock(&g_np_mu);
+    for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
+        pthread_mutex_lock(&pd->mu);
+        if (pd->rg && pd->r_deadline && pd->r_deadline <= now) {
+            Waiter *w = pd->rg;
+            pd->rg = NULL;
+            pd->r_deadline = 0;
+            w->val = ZAP_POLL_TIMEOUT;
+            goready(w);
+        }
+        if (pd->wg && pd->w_deadline && pd->w_deadline <= now) {
+            Waiter *w = pd->wg;
+            pd->wg = NULL;
+            pd->w_deadline = 0;
+            w->val = ZAP_POLL_TIMEOUT;
+            goready(w);
+        }
+        pthread_mutex_unlock(&pd->mu);
+    }
+    pthread_mutex_unlock(&g_np_mu);
+}
+
+#if defined(ZAP_NETPOLL_EPOLL)
+static void *np_poller_main(void *arg) {
+    (void)arg;
+    struct epoll_event evs[64];
+    for (;;) {
+        int timeout = np_compute_timeout();
+        int n = epoll_wait(g_np_epfd, evs, 64, timeout);
+        if (g_np_shutdown) {
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break; /* unexpected epoll failure: stop polling */
+        }
+        for (int i = 0; i < n; i++) {
+            void *p = evs[i].data.ptr;
+            if (p == &g_np_wake_tag) {
+                uint64_t buf;
+                ssize_t r = read(g_np_wakefd, &buf, sizeof buf);
+                (void)r; /* just a kick; drain and recompute the timeout */
+                continue;
+            }
+            PollDesc *pd = (PollDesc *)p;
+            uint32_t e = evs[i].events;
+            pthread_mutex_lock(&pd->mu);
+            /* An error/hangup counts as readiness for BOTH directions so the
+             * parked G wakes and observes the condition via its next syscall. */
+            if (e & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                np_wake_dir_locked(pd, 1, ZAP_POLL_OK);
+            }
+            if (e & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
+                np_wake_dir_locked(pd, 0, ZAP_POLL_OK);
+            }
+            pthread_mutex_unlock(&pd->mu);
+        }
+        np_expire_deadlines();
+    }
+    return NULL;
+}
+#endif
+
+/* ---- lazy start / shutdown ------------------------------------------------ */
+static void np_start_once(void) {
+#if defined(ZAP_NETPOLL_EPOLL)
+    if (np_backend_open() != 0) {
+        fprintf(stderr, "zap: netpoller init failed (epoll)\n");
+        return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
+    }
+    int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "zap: netpoller thread start failed (%d)\n", rc);
+        return;
+    }
+    g_np_started = 1;
+#endif
+}
+
+static int np_ensure(void) {
+    pthread_once(&g_np_once, np_start_once);
+    return g_np_started ? 0 : -1;
+}
+
+/* Stop the poller thread. Called from zap_rt_join_all at program exit, after
+ * every spawned G has finished (so nothing is parked on an fd). No-op if the
+ * poller never started. */
+static void netpoll_shutdown(void) {
+    if (!g_np_started) {
+        return;
+    }
+    g_np_shutdown = 1;
+    np_backend_kick();
+    GC_pthread_join(g_np_thread, NULL);
+    g_np_started = 0;
+}
+
+/* ---- descriptor lifecycle ------------------------------------------------- */
+static PollDesc *np_pd_alloc(int fd) {
+    pthread_mutex_lock(&g_np_mu);
+    PollDesc *pd = g_np_free;
+    if (pd) {
+        g_np_free = pd->free_link;
+    }
+    pthread_mutex_unlock(&g_np_mu);
+    if (!pd) {
+        pd = (PollDesc *)malloc(sizeof(PollDesc));
+        if (!pd) {
+            return NULL;
+        }
+        pthread_mutex_init(&pd->mu, NULL);
+    }
+    pd->fd = fd;
+    pd->closing = 0;
+    pd->rg = pd->wg = NULL;
+    pd->r_ready = pd->w_ready = 0;
+    pd->r_deadline = pd->w_deadline = 0;
+    pd->all_prev = pd->all_next = pd->free_link = NULL;
+    return pd;
+}
+
+/* ---- public internal ABI -------------------------------------------------- */
+/* Register `fd` for readiness polling; returns an opaque descriptor, or NULL if
+ * the netpoller is unavailable (non-Linux v1) or registration failed. The caller
+ * owns `fd` and should have set it non-blocking. */
+void *zap_netpoll_open(int64_t fd) {
+    if (np_ensure() != 0) {
+        return NULL;
+    }
+    PollDesc *pd = np_pd_alloc((int)fd);
+    if (!pd) {
+        return NULL;
+    }
+    pthread_mutex_lock(&g_np_mu);
+    pd->all_prev = NULL;
+    pd->all_next = g_np_all;
+    if (g_np_all) {
+        g_np_all->all_prev = pd;
+    }
+    g_np_all = pd;
+    pthread_mutex_unlock(&g_np_mu);
+    if (np_backend_add(pd) != 0) {
+        pthread_mutex_lock(&g_np_mu);
+        np_all_remove_locked(pd);
+        pd->free_link = g_np_free;
+        g_np_free = pd;
+        pthread_mutex_unlock(&g_np_mu);
+        return NULL;
+    }
+    return pd;
+}
+
+/* Park the current G (or native thread) until `fd` is ready for `mode`
+ * (ZAP_POLL_READ / ZAP_POLL_WRITE), its `deadline_ns` (absolute CLOCK_MONOTONIC;
+ * 0 = none) passes, or it is closed. Returns ZAP_POLL_OK / _TIMEOUT / _CLOSED.
+ * A parked G frees its M (netpoller's whole point). */
+int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
+    PollDesc *pd = (PollDesc *)pd_;
+    int is_read = (mode == ZAP_POLL_READ);
+    pthread_mutex_lock(&pd->mu);
+    if (pd->closing) {
+        pthread_mutex_unlock(&pd->mu);
+        return ZAP_POLL_CLOSED;
+    }
+    int *ready = is_read ? &pd->r_ready : &pd->w_ready;
+    if (*ready) {
+        *ready = 0; /* consume a latched readiness edge without parking */
+        pthread_mutex_unlock(&pd->mu);
+        return ZAP_POLL_OK;
+    }
+    if (deadline_ns && deadline_ns <= np_now_ns()) {
+        pthread_mutex_unlock(&pd->mu);
+        return ZAP_POLL_TIMEOUT;
+    }
+    Waiter w;
+    w.val = ZAP_POLL_OK;
+    w.ok = 0;
+    w.closed = 0;
+    if (is_read) {
+        pd->rg = &w;
+        pd->r_deadline = deadline_ns;
+    } else {
+        pd->wg = &w;
+        pd->w_deadline = deadline_ns;
+    }
+    if (deadline_ns) {
+        np_backend_kick(); /* make the poller recompute its timeout */
+    }
+    gopark(&pd->mu, &w); /* releases pd->mu; the poller wakes us */
+    return (int64_t)w.val;
+}
+
+/* Force-wake any waiter parked on `pd` for `mode` with ZAP_POLL_OK, without
+ * latching if none is parked. The hook the signal self-pipe (#77) and a future
+ * cancellation-of-parked-G path use to interrupt a netpoller wait. */
+void zap_netpoll_wake(void *pd_, int64_t mode) {
+    PollDesc *pd = (PollDesc *)pd_;
+    pthread_mutex_lock(&pd->mu);
+    if ((mode & ZAP_POLL_READ) && pd->rg) {
+        Waiter *w = pd->rg;
+        pd->rg = NULL;
+        pd->r_deadline = 0;
+        w->val = ZAP_POLL_OK;
+        goready(w);
+    }
+    if ((mode & ZAP_POLL_WRITE) && pd->wg) {
+        Waiter *w = pd->wg;
+        pd->wg = NULL;
+        pd->w_deadline = 0;
+        w->val = ZAP_POLL_OK;
+        goready(w);
+    }
+    pthread_mutex_unlock(&pd->mu);
+}
+
+/* Deregister `fd` and release the descriptor. Any waiter still parked is woken
+ * with ZAP_POLL_CLOSED. The caller still owns (and should close) the fd itself. */
+void zap_netpoll_close(void *pd_) {
+    PollDesc *pd = (PollDesc *)pd_;
+    pthread_mutex_lock(&g_np_mu);
+    pthread_mutex_lock(&pd->mu);
+    pd->closing = 1;
+    np_backend_del(pd);
+    if (pd->rg) {
+        Waiter *w = pd->rg;
+        pd->rg = NULL;
+        w->val = ZAP_POLL_CLOSED;
+        goready(w);
+    }
+    if (pd->wg) {
+        Waiter *w = pd->wg;
+        pd->wg = NULL;
+        w->val = ZAP_POLL_CLOSED;
+        goready(w);
+    }
+    np_all_remove_locked(pd);
+    pthread_mutex_unlock(&pd->mu);
+    pd->free_link = g_np_free; /* recycle; a woken waiter never touches pd again */
+    g_np_free = pd;
+    pthread_mutex_unlock(&g_np_mu);
+}
+
+/* ---- integration self-test (ticket #80) ----------------------------------- *
+ * The netpoller has no language-level I/O surface yet (sockets/http are #79,
+ * signals #77), so this drives it end-to-end from C and backs the
+ * `__netpoll_selftest()` golden (run under both collectors). It forces a SINGLE
+ * worker M (`zap_sched_init(1)`) so the "a parked G frees its M" property is
+ * load-bearing: a reader goroutine blocks on a not-yet-ready pipe and MUST park
+ * (freeing the one M) or the writer goroutine could never be scheduled and the
+ * program would deadlock. Returns the number of sub-checks that passed
+ * (ZAP_NP_SELFTEST_CHECKS on full success); prints to stderr on any failure. */
+#define ZAP_NP_SELFTEST_CHECKS 2
+
+#if defined(ZAP_NETPOLL_EPOLL)
+static int g_np_t_rfd;        /* read end polled by the reader goroutine        */
+static int g_np_t_wfd;        /* write end the writer goroutine writes to       */
+static void *g_np_t_pd;       /* its PollDesc                                   */
+static void *g_np_t_done;     /* buffered channel the two goroutines signal on  */
+static volatile int g_np_t_byte;   /* byte the reader received                  */
+static volatile int g_np_t_status; /* reader's zap_netpoll_wait outcome         */
+
+static void np_set_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) {
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+}
+
+/* Reader goroutine: parks on the pipe until readable, then drains one byte. */
+static void *np_selftest_reader(void *arg) {
+    (void)arg;
+    g_np_t_status = (int)zap_netpoll_wait(g_np_t_pd, ZAP_POLL_READ, 0);
+    unsigned char b = 0;
+    if (g_np_t_status == ZAP_POLL_OK) {
+        ssize_t r = read(g_np_t_rfd, &b, 1);
+        g_np_t_byte = (r == 1) ? (int)b : -1;
+    } else {
+        g_np_t_byte = -1;
+    }
+    zap_chan_send_i64(g_np_t_done, 1);
+    return NULL;
+}
+
+/* Writer goroutine: writes the sentinel byte to wake the parked reader. Runs on
+ * the freed M while the reader is parked (single-M => this is the proof). */
+static void *np_selftest_writer(void *arg) {
+    (void)arg;
+    unsigned char b = 0x5A; /* 'Z' == 90 */
+    ssize_t r = write(g_np_t_wfd, &b, 1);
+    (void)r;
+    zap_chan_send_i64(g_np_t_done, 1);
+    return NULL;
+}
+
+int64_t zap_netpoll_selftest(void) {
+    int passed = 0;
+
+    /* Single worker M so a blocked-but-parked reader is the only way the writer
+     * ever runs (see header). Safe if the scheduler is already up (no-op then). */
+    zap_sched_init(1);
+
+    /* --- check 1: park on a not-yet-ready fd, wake on readiness --- */
+    int fds[2];
+    if (pipe(fds) == 0) {
+        g_np_t_rfd = fds[0];
+        g_np_t_wfd = fds[1];
+        np_set_nonblock(fds[0]);
+        np_set_nonblock(fds[1]);
+        g_np_t_pd = zap_netpoll_open(fds[0]);
+        if (g_np_t_pd) {
+            g_np_t_byte = 0;
+            g_np_t_status = -1;
+            g_np_t_done = zap_chan_new(2); /* buffered: senders never block */
+            /* The done channel is reachable only via this static C slot, which
+             * is not conservatively scanned under the precise collector: root it
+             * so a collection mid-test cannot reclaim it (no-op under Boehm). */
+            zap_gc_add_root(&g_np_t_done);
+            zap_spawn(np_selftest_reader, NULL);
+            zap_spawn(np_selftest_writer, NULL);
+            /* Native wait for both goroutines (parks main on the channel). */
+            (void)zap_chan_recv_i64(g_np_t_done);
+            (void)zap_chan_recv_i64(g_np_t_done);
+            if (g_np_t_status == ZAP_POLL_OK && g_np_t_byte == 90) {
+                passed++;
+            } else {
+                fprintf(stderr,
+                        "netpoll selftest: readiness check failed "
+                        "(status=%d byte=%d)\n",
+                        g_np_t_status, g_np_t_byte);
+            }
+            zap_netpoll_close(g_np_t_pd);
+        } else {
+            fprintf(stderr, "netpoll selftest: zap_netpoll_open failed\n");
+        }
+        close(fds[0]);
+        close(fds[1]);
+    } else {
+        fprintf(stderr, "netpoll selftest: pipe() failed\n");
+    }
+
+    /* --- check 2: a deadline expires when the fd never becomes ready --- */
+    int fds2[2];
+    if (pipe(fds2) == 0) {
+        np_set_nonblock(fds2[0]);
+        np_set_nonblock(fds2[1]);
+        void *pd2 = zap_netpoll_open(fds2[0]);
+        if (pd2) {
+            int64_t st = zap_netpoll_wait(pd2, ZAP_POLL_READ,
+                                          np_now_ns() + 30000000LL /* 30 ms */);
+            if (st == ZAP_POLL_TIMEOUT) {
+                passed++;
+            } else {
+                fprintf(stderr, "netpoll selftest: deadline check failed (st=%lld)\n",
+                        (long long)st);
+            }
+            zap_netpoll_close(pd2);
+        } else {
+            fprintf(stderr, "netpoll selftest: zap_netpoll_open(2) failed\n");
+        }
+        close(fds2[0]);
+        close(fds2[1]);
+    }
+
+    return passed;
+}
+#else
+int64_t zap_netpoll_selftest(void) { return ZAP_NP_SELFTEST_CHECKS; }
+#endif
 
 /* ===========================================================================
  * Type descriptors for the runtime's own heap types (ticket #48). Both GC

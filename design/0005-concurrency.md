@@ -418,9 +418,9 @@ The runtime multiplexes many coroutines (**G**) over a small pool of OS threads
   v1 is **cooperative** at these points; preemption of long CPU loops without a
   `checkpoint()` is deferred (open issue).
 - **Blocking syscalls.** A coroutine entering a blocking syscall hands its P to
-  another M so sibling coroutines keep running; non-blocking network I/O goes
-  through a poller that parks the coroutine and re-queues it on readiness (the
-  netpoller analogue).
+  another M so sibling coroutines keep running (P-handoff, still a follow-up);
+  non-blocking I/O goes through the **netpoller** (ticket #80, built), which
+  parks the coroutine and re-queues it on readiness — see "Netpoller" below.
 
 ### Green-thread stacks (and the Boehm interaction)
 
@@ -509,6 +509,40 @@ not relied on:
   stack is the live GC-malloc'd stack, so conservative scanning keeps both the
   exception and its roots alive.
 
+### Netpoller (as built — ticket #80)
+
+Non-blocking I/O readiness, so a coroutine that would block on a file descriptor
+**parks its G and frees its M** instead of blocking an OS thread, and is
+re-queued when the fd is ready.
+
+- **Reuses the one park/wake primitive.** The scheduler has a single park
+  primitive (`gopark` / `goready`): a goroutine caller parks its G and frees its
+  M; a native (`main`) caller blocks on its waiter's condvar. Channels, scope
+  joins, and the netpoller all block on it — no parallel mechanism. A parked G
+  is kept alive exactly as a channel-parked G is (the statically-rooted `g_all[]`
+  registry; under precise Immix, traced via its saved shadow chain).
+- **A dedicated poller OS thread** waits on the readiness mechanism and, on an
+  event, hands the outcome to the parked waiter via `goready` (enqueue the G, or
+  signal the native waiter). It allocates no GC memory and touches only
+  non-traced scheduler fields under their locks, so it is safe without being a
+  registered mutator; under Boehm it is started with `GC_pthread_create` so the
+  collector still knows the thread. A `PollDesc` is plain (non-GC) infra memory.
+- **Backend = epoll** (Linux / the dev container), behind a thin internal
+  `np_backend_*` seam so a **kqueue** backend (macOS/BSD) can slot in later — a
+  deliberate portability follow-up, not built in v1.
+- **Edge-triggered** (Go-style): an fd is registered once for read+write
+  interest; a readiness edge that arrives before any G parks is latched per
+  direction so the next wait returns immediately. Callers drain to `EAGAIN`.
+- **Deadlines** are absolute `CLOCK_MONOTONIC` nanoseconds (0 = none); the poller
+  wakes an expired waiter with a timeout result. v1 scans the (small) live-desc
+  registry for the nearest deadline; a timer heap is a follow-up.
+- **Internal C ABI** (`zap_netpoll_open` / `_wait` / `_wake` / `_close`, see
+  RUNTIME-ABI). There is no language-level I/O surface yet: the signal self-pipe
+  (#77) and a socket/http layer (#79) are the first callers, and `zap_netpoll_wake`
+  is the hook they (and a future cancellation-of-a-parked-G path) build on.
+  Cancelling a coroutine already parked on an fd is now implementable via that
+  hook but is not wired to `scope:` cancellation in this increment.
+
 ### Runtime entry points (additive to `libzaprt`)
 
 Sketch of the C ABI surface the scheduler needs (names illustrative):
@@ -523,11 +557,15 @@ zap_chan_close(*Chan)
 zap_select(cases[], n, has_default) -> chosen_index
 zap_mutex_* / zap_rwmutex_* / zap_waitgroup_* / zap_once_* / zap_atomic_*
 zap_cancel(*G) ; zap_checkpoint()
+# Netpoller (#80, built): park a G on fd readiness, free its M.
+zap_netpoll_open(fd) -> *PollDesc
+zap_netpoll_wait(*PollDesc, mode, deadline_ns) -> status  # ready/timeout/closed
+zap_netpoll_wake(*PollDesc, mode) ; zap_netpoll_close(*PollDesc)
 ```
 
-Channels, locks, and `WaitGroup` are built on a small internal futex-like park
-queue keyed on the scheduler, not the OS, so a blocked coroutine parks its G and
-frees its M.
+Channels, locks, `WaitGroup`, and the netpoller are built on a small internal
+futex-like park queue keyed on the scheduler, not the OS, so a blocked coroutine
+parks its G and frees its M.
 
 ### Roadmap mapping
 
