@@ -678,3 +678,34 @@ Python feel and the no-inheritance simplicity.
 **Rationale:** MVS + lockfile + decentralized checksum-verified sources give
 reproducible, dependency-hell-free builds with no central chokepoint; `zenv`
 unifies Zap and Python reproducibility under the env-var simplicity of venv.
+
+## D-0053 — Toolchain & CLI
+**Status:** Locked — resolves issue #58
+One user-facing tool, **`zap`** (the compiler binary `zapc` becomes internal,
+driven by `zap`). Core verbs:
+- `zap run <file>` / `zap run` — run a single file (no manifest needed) or the
+  project (via `zap.toml`).
+- `zap build` — build the project to a native binary (output in `target/`, or
+  under an active `zenv`).
+- `zap test` — run tests, with a **watch mode** (`zap test --watch`) that stays
+  running and **re-runs automatically** when a test file or target source
+  changes. Tests use a **`@test` annotation suite** (built on decorators,
+  D-0036); its concrete surface is designed with the test framework (issue #59).
+- `zap fmt` — canonical formatter (D-0037).
+- `zap new <name>` / `zap init` — scaffold a project (writes `zap.toml`).
+- `zap add <dep>` / `zap remove <dep>` — manage dependencies (`zap.toml` + `zap.lock`).
+- `zap zenv <create|…>` — manage the project environment (D-0052; activation stays
+  `source zenv/activate`).
+- `zap expand` — show `@derive`/decorator-generated code (D-0036).
+- `zap ir <file>` — dump ZIR (diagnostic).
+- **`zap mcp`** — start a built-in **MCP server for coding agents**: exposes tools
+  to query the language reference/grammar, type-check/compile snippets and return
+  diagnostics, run tests, and format — so AI coding agents can understand Zap
+  syntax and get structured feedback. Its concrete tool-set is designed in its own
+  ticket.
+- `zap version` / `zap help`.
+
+Both single-file and project modes are supported. `zap repl` / `zap doc` are
+deferred. **Rationale:** one predictable CLI matching modern-language
+expectations; watch-mode and a first-class MCP server directly serve fast,
+agent-driven development — the way Zap itself is being built.

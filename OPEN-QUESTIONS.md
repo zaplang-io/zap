@@ -60,7 +60,10 @@ _Last updated: 2026-10-19_
   project-local env-var-activated **`zenv`** isolating both the Zap module cache
   and a nested Python venv.
 - 🟡 **Standard-library scope & layout** for v1.
-- 🟡 **Build/run command names** (`zap build`, `zap run`, …).
+- ✅ **Build/run command names** — RESOLVED (D-0053, issue #58): one `zap` CLI
+  (run/build/test[--watch]/fmt/new/add/zenv/expand/ir/**mcp**); `zapc` becomes
+  internal. `zap test` has a watch mode and a `@test` annotation suite (surface in
+  #59); `zap mcp` serves coding agents.
 - ⚪ **In-language test framework** and **doc conventions**.
 - ⚪ **Compatibility / versioning promise** (Go-style "Go 1 compatibility"?).
 

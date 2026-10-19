@@ -546,6 +546,28 @@ Multiple decorators stack bottom-up. `zap expand` shows the generated code.
 Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
 `@deprecated`, `@inject`.
 
+## 17. Toolchain & CLI (D-0053)
+
+One user-facing tool, **`zap`** (the `zapc` compiler becomes internal):
+
+```
+zap run <file> | zap run      # run a single file, or the project (zap.toml)
+zap build                     # build project -> native binary (target/)
+zap test [--watch]            # run tests; --watch re-runs on source/test changes
+zap fmt                       # canonical formatter (D-0037)
+zap new <name> | zap init     # scaffold a project
+zap add <dep> | zap remove    # manage deps (zap.toml + zap.lock, D-0052)
+zap zenv create               # project env (activate via `source zenv/activate`)
+zap expand                    # show @derive/decorator-generated code
+zap ir <file>                 # dump ZIR (diagnostic)
+zap mcp                       # MCP server for coding agents (syntax/compile/test)
+zap version | zap help
+```
+
+Tests are written with a **`@test`** annotation suite (decorators, D-0036); the
+framework surface is issue #59. `zap mcp` ships an agent-facing interface so AI
+coding tools can query the language, compile/type-check snippets, and run tests.
+
 ## Appendix A — Reserved words (provisional)
 
 `def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
