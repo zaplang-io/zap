@@ -641,4 +641,76 @@ mod tests {
             "a user `__eq__` plus @derive(Eq) should clash"
         );
     }
+
+    // --- tuples (ticket #54, D-0049) ---
+
+    #[test]
+    fn lower_tuple_literal_and_const_index() {
+        // A tuple literal lowers to an anonymous-struct aggregate: `structnew`
+        // plus one `fieldset` per element; `t[k]` is a `fieldget` at a constant
+        // index.
+        let m = lower_ok(include_str!("../../../tests/golden/tuple_basic.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("structnew"), "text:\n{text}");
+        assert!(text.contains("fieldset"), "text:\n{text}");
+        assert!(text.contains("fieldget"), "text:\n{text}");
+        // One tuple layout `(int64, int64, int64)` was interned as a struct.
+        assert_eq!(m.structs.len(), 1, "one interned tuple layout");
+        assert_eq!(m.structs[0].fields, vec![Ty::I64, Ty::I64, Ty::I64]);
+    }
+
+    #[test]
+    fn lower_multiple_return_via_tuple_struct() {
+        // `divmod -> (int64, int64)` returns a struct aggregate; the caller
+        // destructures it with `fieldget`. The literal return tuple and the
+        // declared return type intern to the same struct id.
+        let m = lower_ok(include_str!("../../../tests/golden/tuple_multiret.zap"));
+        let divmod = m.funcs.iter().find(|f| f.name == "divmod").expect("divmod");
+        assert!(matches!(divmod.ret, Ty::Struct(_)), "ret: {:?}", divmod.ret);
+        let text = format!("{m}");
+        assert!(text.contains("fieldget"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_rest_builds_subtuple() {
+        // `(first, *rest) = (10, 20, 30, 40)`: `first` is a `fieldget`, and the
+        // rest sub-tuple is a fresh `structnew` copying the remaining fields.
+        let m = lower_ok(include_str!("../../../tests/golden/tuple_rest.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("structnew"), "text:\n{text}");
+        // The 4-tuple and the 3-element rest sub-tuple are distinct layouts.
+        assert!(
+            m.structs.iter().any(|s| s.fields.len() == 4),
+            "the source 4-tuple layout"
+        );
+        assert!(
+            m.structs.iter().any(|s| s.fields.len() == 3),
+            "the rest 3-tuple layout"
+        );
+    }
+
+    #[test]
+    fn lower_tuple_nonconstant_index_errors() {
+        // A runtime tuple index is rejected at lowering too (sema also reports
+        // it, but lowering must never emit a dynamic tuple access).
+        let (ast, _p, _l) = parse_str(
+            "def main():\n    auto t = (1, 2)\n    auto i = 0\n    auto x = t[i]\n    print(x)\n",
+        );
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("compile-time-constant")),
+            "expected a const-index error, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn lower_swap_reads_before_writing() {
+        // `(x, y) = (y, x)` builds the right-hand tuple fully before storing, so
+        // the swap is correct. The aggregate shows up as structnew + fieldget.
+        let m = lower_ok(include_str!("../../../tests/golden/tuple_swap.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("structnew"), "text:\n{text}");
+        assert!(text.contains("fieldget"), "text:\n{text}");
+    }
 }

@@ -302,8 +302,42 @@ pub enum Stmt {
         call: Expr,
         span: Span,
     },
+    /// Tuple-destructuring declaration (D-0049): `auto (a, b) = t`,
+    /// `auto (first, *rest) = xs`, `(int64, str) (a, b) = p`. `target` is always
+    /// a [`BindTarget::Tuple`] (a single-name decl stays [`Stmt::Let`]).
+    LetTuple {
+        is_const: bool,
+        /// `None` means `auto` (inferred).
+        ty: Option<Type>,
+        target: BindTarget,
+        value: Expr,
+        span: Span,
+    },
+    /// Tuple-destructuring assignment (D-0049): `(x, y) = (y, x)` (swap),
+    /// `a, b = f()`, `first, *rest = xs`. `target` is always a
+    /// [`BindTarget::Tuple`] (a single lvalue stays [`Stmt::Assign`]).
+    AssignTuple {
+        target: BindTarget,
+        value: Expr,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
+}
+
+/// A destructuring bind target (D-0049), used by [`Stmt::LetTuple`] and
+/// [`Stmt::AssignTuple`]. Positional, possibly nested, with at most one `*rest`
+/// per tuple capturing the remainder as a sub-tuple.
+#[derive(Clone, Debug)]
+pub enum BindTarget {
+    /// A leaf target: a new name (in a decl) or an lvalue (`name`, `a.b`,
+    /// `a[i]`) in an assignment.
+    Elem(Expr),
+    /// `*target` — captures the remaining elements as a tuple. At most one per
+    /// tuple (enforced in sema/lowering).
+    Rest(Box<BindTarget>, Span),
+    /// `(a, b, ...)` — positional destructuring, possibly nested.
+    Tuple(Vec<BindTarget>, Span),
 }
 
 #[derive(Clone, Debug)]

@@ -12,7 +12,7 @@ use std::fmt;
 /// §"Collection layout"): integers/bools fit directly, reference types are a
 /// pointer. This two-way split is all codegen needs; it is what selects the
 /// typed runtime entry point (e.g. `zap_list_push_i64` vs `zap_list_push_ptr`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
     /// An integer/bool element, passed as `i64`.
     I64,
@@ -61,7 +61,7 @@ impl Elem {
 /// are 8-byte element words; this is what selects the typed runtime entry point
 /// (`zap_array_*_f64` / `_i64`) and the LLVM vector element type in the SIMD
 /// element-wise lowering.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dtype {
     F64,
     I64,
@@ -95,7 +95,7 @@ impl Dtype {
 }
 
 /// A ZIR type (lower-level than a Zap type; reference types become `Ptr`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     I1,
     I8,
