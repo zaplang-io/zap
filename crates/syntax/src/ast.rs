@@ -288,6 +288,16 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
+    /// `assert cond [, msg]` with power-assert diagnostics (D-0054). Always
+    /// evaluated in v1; on failure the condition and its operand values are
+    /// reported. `cond_src` is the exact source spelling of `cond` (the parser
+    /// retains it because power-assert needs to echo the expression text).
+    Assert {
+        cond: Expr,
+        msg: Option<Expr>,
+        cond_src: String,
+        span: Span,
+    },
     /// `try: ... except ...: ... finally: ...` (D-0007/D-0029).
     Try {
         body: Block,
@@ -600,10 +610,184 @@ pub enum BinOp {
     Send,     // ch <- v  (channel send, D-0031)
 }
 
+/// The docstring of a function, if its first statement is a bare string literal
+/// (D-0041). Google-style docstrings (summary + `Args:`/`Returns:`/`Raises:`)
+/// are a plain triple-quoted first statement; this extracts the raw text. Full
+/// `zap doc` generation is deferred (D-0053), but this is the seam it will use.
+pub fn docstring(func: &Function) -> Option<&str> {
+    match func.body.stmts.first() {
+        Some(Stmt::Expr(Expr::Str {
+            value,
+            fstring: false,
+            ..
+        })) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// The source spelling of a binary operator.
+pub fn binop_str(op: BinOp) -> &'static str {
+    use BinOp::*;
+    match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        FloorDiv => "//",
+        Mod => "%",
+        Pow => "**",
+        And => "and",
+        Or => "or",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
+        In => "in",
+        Send => "<-",
+    }
+}
+
+/// Render an expression back to a readable, source-like string. This is a
+/// best-effort unparser used for diagnostics (power-assert operand labels,
+/// D-0054) and `@parametrize` case labels — not a round-tripping formatter, so
+/// spacing/parenthesization is normalized rather than preserved.
+pub fn render_expr(e: &Expr) -> String {
+    match e {
+        Expr::Int(s, _) | Expr::Float(s, _) | Expr::Imaginary(s, _) => s.clone(),
+        Expr::Str {
+            value,
+            raw,
+            bytes,
+            fstring,
+            ..
+        } => {
+            let prefix = format!(
+                "{}{}{}",
+                if *raw { "r" } else { "" },
+                if *bytes { "b" } else { "" },
+                if *fstring { "f" } else { "" },
+            );
+            format!("{prefix}\"{value}\"")
+        }
+        Expr::Bool(b, _) => if *b { "True" } else { "False" }.to_string(),
+        Expr::None(_) => "None".to_string(),
+        Expr::Name(n, _) => n.clone(),
+        Expr::Tuple(xs, _) => {
+            if xs.len() == 1 {
+                format!("({},)", render_expr(&xs[0]))
+            } else {
+                format!("({})", render_list(xs))
+            }
+        }
+        Expr::List(xs, _) => format!("[{}]", render_list(xs)),
+        Expr::Set(xs, _) => format!("{{{}}}", render_list(xs)),
+        Expr::Dict(pairs, _) => {
+            let body = pairs
+                .iter()
+                .map(|(k, v)| format!("{}: {}", render_expr(k), render_expr(v)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{body}}}")
+        }
+        Expr::Unary { op, expr, .. } => {
+            let sym = match op {
+                UnOp::Neg => "-",
+                UnOp::Pos => "+",
+                UnOp::Not => "not ",
+                UnOp::BitNot => "~",
+            };
+            format!("{sym}{}", render_expr(expr))
+        }
+        Expr::Binary { op, lhs, rhs, .. } => {
+            format!(
+                "{} {} {}",
+                render_expr(lhs),
+                binop_str(*op),
+                render_expr(rhs)
+            )
+        }
+        Expr::Call { callee, args, .. } => {
+            let a = args
+                .iter()
+                .map(|arg| match &arg.name {
+                    Some(n) => format!("{n}={}", render_expr(&arg.value)),
+                    None => render_expr(&arg.value),
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({a})", render_expr(callee))
+        }
+        Expr::Index { base, index, .. } => {
+            format!("{}[{}]", render_expr(base), render_expr(index))
+        }
+        Expr::Attr { base, name, .. } => format!("{}.{name}", render_expr(base)),
+        other => format!("{other:?}"),
+    }
+}
+
+fn render_list(xs: &[Expr]) -> String {
+    xs.iter().map(render_expr).collect::<Vec<_>>().join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::span::Span;
+
+    #[test]
+    fn docstring_extraction() {
+        use crate::parser::parse_str;
+        let (m, perrs, lerrs) = parse_str(
+            "def greet(str n) -> str:\n    \"\"\"Greet someone.\n\n    Args:\n        n: name\n    \"\"\"\n    return n\n",
+        );
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let doc = docstring(f).expect("docstring");
+        assert!(doc.starts_with("Greet someone."));
+        assert!(doc.contains("Args:"));
+
+        // A function without a leading string has no docstring.
+        let (m2, _, _) = parse_str("def f():\n    return 1\n");
+        let Item::Function(f2) = &m2.items[0] else {
+            panic!("fn");
+        };
+        assert!(docstring(f2).is_none());
+    }
+
+    #[test]
+    fn render_expr_round_trips_common_forms() {
+        use crate::parser::parse_str;
+        let cases = [
+            ("a + 1 == b", "a + 1 == b"),
+            ("f(x, y)", "f(x, y)"),
+            ("xs[0]", "xs[0]"),
+            ("not ready", "not ready"),
+            ("(1, 2)", "(1, 2)"),
+        ];
+        for (src, want) in cases {
+            let (m, perrs, lerrs) = parse_str(&format!("def main():\n    assert {src}\n"));
+            assert!(
+                perrs.is_empty() && lerrs.is_empty(),
+                "{src}: {perrs:?} {lerrs:?}"
+            );
+            let Item::Function(f) = &m.items[0] else {
+                panic!("fn");
+            };
+            let Stmt::Assert { cond, .. } = &f.body.stmts[0] else {
+                panic!("assert");
+            };
+            assert_eq!(render_expr(cond), want, "render of {src}");
+        }
+    }
 
     #[test]
     fn build_trivial_module() {

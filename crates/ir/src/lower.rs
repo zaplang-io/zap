@@ -1420,6 +1420,9 @@ struct FnLower<'a> {
     /// owned by the top scope ([`Owner::Scope`]); a `spawn` at the root is
     /// [`Owner::Root`] (D-0044, structured concurrency).
     scope_stack: Vec<Value>,
+    /// Counter handing out distinct flag names for `with expect_raises(...)`
+    /// desugaring (D-0054), so nested `with`s do not collide.
+    with_counter: u32,
     sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &'a StructCtx,
 }
@@ -1457,6 +1460,7 @@ impl<'a> FnLower<'a> {
             landing_pads: Vec::new(),
             used_lps: HashSet::new(),
             scope_stack: Vec::new(),
+            with_counter: 0,
             sigs,
             ctx,
         }
@@ -1892,6 +1896,12 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             Stmt::Raise { value, .. } => self.lower_raise(value.as_ref()),
+            Stmt::Assert {
+                cond,
+                msg,
+                cond_src,
+                ..
+            } => self.lower_assert(cond, msg.as_ref(), cond_src),
             Stmt::Try {
                 body,
                 excepts,
@@ -1913,9 +1923,7 @@ impl<'a> FnLower<'a> {
                 let (v, vt) = self.expr(value)?;
                 self.lower_bind_target(target, v, vt, false)
             }
-            Stmt::With { .. } => Err(err(
-                "this statement is not supported by codegen yet (Phase 1 slice)",
-            )),
+            Stmt::With { items, body, .. } => self.lower_with(items, body),
         }
     }
 
@@ -2300,6 +2308,252 @@ impl<'a> FnLower<'a> {
             self.set_term(Term::Unreachable);
         }
         Ok(())
+    }
+
+    /// `assert cond [, msg]` (D-0054). Always evaluated in v1: the condition is
+    /// tested, and on failure a *power-assert* message — the condition's source
+    /// text plus its operand values — is built and raised through the ordinary
+    /// `zap_panic` path (so an enclosing `try`/`except`, and the `zap test`
+    /// runner, catch it like any other exception).
+    ///
+    /// For a top-level comparison (`a == b`, `a < b`, …) each operand is
+    /// evaluated exactly once and its value retained, so the diagnostic can show
+    /// both sides without re-evaluating (no double side effects). Other
+    /// conditions fall back to showing the whole expression's truthiness.
+    fn lower_assert(
+        &mut self,
+        cond: &Expr,
+        msg: Option<&Expr>,
+        cond_src: &str,
+    ) -> Result<(), LowerError> {
+        // Decompose a comparison so both operand values can be reported.
+        let decomposed = match cond {
+            Expr::Binary { op, lhs, rhs, .. } if is_power_comparison(*op) => {
+                let (lv, lt) = self.expr(lhs)?;
+                let (rv, rt) = self.expr(rhs)?;
+                let (bit, _) = self.binop(*op, lv, lt, rv, rt)?;
+                Some((bit, (lv, lt), (rv, rt)))
+            }
+            _ => None,
+        };
+        let bit = match decomposed {
+            Some((bit, ..)) => bit,
+            None => {
+                let (cv, ct) = self.expr(cond)?;
+                self.truthy(cv, ct)
+            }
+        };
+
+        let fail = self.new_block();
+        let after = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: bit,
+            then_bb: after,
+            else_bb: fail,
+        });
+
+        // --- failure path: build the message and raise it ---
+        self.position(fail);
+        let mut acc = self.strconst("assertion failed");
+        if let Some(m) = msg {
+            let (mv, mt) = self.expr(m)?;
+            // A str message is used verbatim; anything else is stringified.
+            let ms = if mt == Ty::Ptr {
+                mv
+            } else {
+                self.value_to_str(mv, mt)
+            };
+            let sep = self.strconst(": ");
+            acc = gen_concat(self, acc, sep);
+            acc = gen_concat(self, acc, ms);
+        }
+        let srcline = self.strconst(&format!("\n  assert {cond_src}"));
+        acc = gen_concat(self, acc, srcline);
+        if let Some((_, (lv, lt), (rv, rt))) = decomposed {
+            let ls = self.value_to_str(lv, lt);
+            let rs = self.value_to_str(rv, rt);
+            let lpfx = self.strconst("\n  left:  ");
+            acc = gen_concat(self, acc, lpfx);
+            acc = gen_concat(self, acc, ls);
+            let rpfx = self.strconst("\n  right: ");
+            acc = gen_concat(self, acc, rpfx);
+            acc = gen_concat(self, acc, rs);
+        }
+        self.throwing_call(None, "zap_panic", vec![acc]);
+        if !self.terminated() {
+            self.set_term(Term::Unreachable);
+        }
+        self.position(after);
+        Ok(())
+    }
+
+    /// Best-effort stringification of a value for power-assert diagnostics.
+    /// Returns a `Ptr` (ZapStr). Never fails: an unsupported type renders as a
+    /// `<type>` placeholder so `assert` always lowers.
+    fn value_to_str(&mut self, v: Value, t: Ty) -> Value {
+        match t {
+            // Quote strings so empty/whitespace values are visible.
+            Ty::Ptr => {
+                let q = self.strconst("\"");
+                let a = gen_concat(self, q, v);
+                let q2 = self.strconst("\"");
+                gen_concat(self, a, q2)
+            }
+            Ty::I1 => {
+                let i64v = self.coerce(v, Ty::I1, Ty::I64);
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_bool_to_str".to_string(),
+                    args: vec![i64v],
+                });
+                d
+            }
+            t if t.int_width().is_some() => {
+                let i64v = self.coerce(v, t, Ty::I64);
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_i64_to_str".to_string(),
+                    args: vec![i64v],
+                });
+                d
+            }
+            t if t.is_float() => {
+                let f64v = self.coerce(v, t, Ty::F64);
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_f64_to_str".to_string(),
+                    args: vec![f64v],
+                });
+                d
+            }
+            Ty::Struct(sid) => {
+                // Use the struct's own `__str__`/`__repr__` when it has one;
+                // otherwise fall back to a type-name placeholder (never fail).
+                for dunder in ["__str__", "__repr__"] {
+                    let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
+                    if self.sigs.contains_key(&mangled) {
+                        let d = self.new_value(Ty::Ptr);
+                        self.throwing_call(Some(d), &mangled, vec![v]);
+                        return d;
+                    }
+                }
+                self.strconst(&format!("<{}>", self.ctx.names[sid as usize]))
+            }
+            _ => self.strconst("<value>"),
+        }
+    }
+
+    /// `with items: BODY` (D-0027). Only the `with expect_raises(ErrType):`
+    /// exception-assertion form is supported (D-0054): BODY must raise, or the
+    /// `with` itself fails. The general context-manager protocol
+    /// (`__enter__`/`__exit__`) is a documented follow-up.
+    ///
+    /// Desugars to the equivalent `try`/flag/`raise`:
+    /// ```text
+    /// int __er_N = 0
+    /// try: BODY
+    /// except: __er_N = 1
+    /// if __er_N == 0: raise "expected <ErrType> ... but none was raised"
+    /// ```
+    /// so a raise inside BODY is swallowed and a missing one propagates (and is
+    /// caught by an enclosing test). Typed matching is catch-all until the typed
+    /// exception hierarchy (D-0029) lands — the type name is diagnostic only.
+    fn lower_with(&mut self, items: &[ast::WithItem], body: &ast::Block) -> Result<(), LowerError> {
+        let bad = || {
+            err(
+                "`with` currently supports only `with expect_raises(ErrType):` \
+                 (general context managers are a follow-up, D-0027)",
+            )
+        };
+        if items.len() != 1 {
+            return Err(bad());
+        }
+        let Expr::Call { callee, args, .. } = &items[0].expr else {
+            return Err(bad());
+        };
+        if !is_name(callee, "expect_raises") {
+            return Err(bad());
+        }
+        let ty_name = args
+            .first()
+            .map(|a| ast::render_expr(&a.value))
+            .unwrap_or_else(|| "an exception".to_string());
+
+        // Build the desugared statements as AST and lower them, reusing the
+        // existing try / if / raise lowering.
+        let sp = body.span;
+        let flag = format!("__er_{}", self.new_with_id());
+        let miss = format!("expected {ty_name} to be raised, but the with-body returned normally");
+
+        let decl = Stmt::Let {
+            is_const: false,
+            ty: None,
+            name: flag.clone(),
+            value: Expr::Int("0".to_string(), sp),
+            span: sp,
+        };
+        let set_flag = Stmt::Assign {
+            target: Expr::Name(flag.clone(), sp),
+            value: Expr::Int("1".to_string(), sp),
+            span: sp,
+        };
+        let try_stmt = Stmt::Try {
+            body: body.clone(),
+            excepts: vec![ast::ExceptClause {
+                ty: None,
+                binding: None,
+                body: ast::Block {
+                    stmts: vec![set_flag],
+                    span: sp,
+                },
+                span: sp,
+            }],
+            finally: None,
+            span: sp,
+        };
+        let check = Stmt::If {
+            branches: vec![(
+                Expr::Binary {
+                    op: AstBin::Eq,
+                    lhs: Box::new(Expr::Name(flag.clone(), sp)),
+                    rhs: Box::new(Expr::Int("0".to_string(), sp)),
+                    span: sp,
+                },
+                ast::Block {
+                    stmts: vec![Stmt::Raise {
+                        value: Some(Expr::Str {
+                            value: miss,
+                            raw: true,
+                            bytes: false,
+                            fstring: false,
+                            span: sp,
+                        }),
+                        span: sp,
+                    }],
+                    span: sp,
+                },
+            )],
+            else_block: None,
+            span: sp,
+        };
+
+        self.push_scope();
+        self.stmt(&decl)?;
+        self.stmt(&try_stmt)?;
+        self.stmt(&check)?;
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// A monotonically increasing id so each `with` desugaring uses a distinct
+    /// flag variable (safe even when `with`s nest).
+    fn new_with_id(&mut self) -> u32 {
+        let id = self.with_counter;
+        self.with_counter += 1;
+        id
     }
 
     /// `try: BODY except [Type [as e]]: HANDLER finally: FIN` with real stack
@@ -5650,6 +5904,16 @@ impl<'a> FnLower<'a> {
 
 fn is_name(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Name(n, _) if n == name)
+}
+
+/// Comparison operators for which power-assert shows both operand values
+/// (D-0054). Membership (`in`) and the boolean connectives are deliberately
+/// excluded — their operand values read poorly side-by-side.
+fn is_power_comparison(op: AstBin) -> bool {
+    matches!(
+        op,
+        AstBin::Eq | AstBin::Ne | AstBin::Lt | AstBin::Le | AstBin::Gt | AstBin::Ge
+    )
 }
 
 /// `StopIteration` or `StopIteration()` — the iterator exhaustion signal

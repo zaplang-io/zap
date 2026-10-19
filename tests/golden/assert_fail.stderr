@@ -1,0 +1,4 @@
+Uncaught exception: assertion failed
+  assert x == y
+  left:  2
+  right: 5

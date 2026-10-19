@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use zapc_syntax::ast::Module;
 
 pub mod cli;
+pub mod testing;
 
 /// The toolchain version (shared by both binaries and `zap version`).
 pub const VERSION: &str = zapc_syntax::VERSION;
@@ -69,10 +70,13 @@ pub fn emit_ir(file: &str) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let module = match front_end(file, &src) {
+    let mut module = match front_end(file, &src) {
         Ok(m) => m,
         Err(code) => return code,
     };
+    // `@test` functions are compiled only under `zap test`, never into a normal
+    // build or diagnostic (D-0054).
+    testing::strip_test_items(&mut module);
     let (zir, errs) = zapc_ir::lower_module(&module);
     if !errs.is_empty() {
         for e in &errs {
@@ -105,10 +109,12 @@ pub fn compile(file: &str, out: Option<String>, run_after: bool) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let module = match front_end(file, &src) {
+    let mut module = match front_end(file, &src) {
         Ok(m) => m,
         Err(code) => return code,
     };
+    // `@test` functions are excluded from release binaries (D-0054).
+    testing::strip_test_items(&mut module);
     backend(&module, file, out, run_after)
 }
 
