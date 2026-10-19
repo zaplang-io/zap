@@ -713,4 +713,110 @@ mod tests {
         assert!(text.contains("structnew"), "text:\n{text}");
         assert!(text.contains("fieldget"), "text:\n{text}");
     }
+
+    // --- iteration protocol (ticket #53, D-0048) ---
+
+    const RANGE_SRC: &str = "\
+struct Range:
+    int64 lo
+    int64 hi
+    def __iter__(self) -> RangeIter:
+        return RangeIter(cur=self.lo, hi=self.hi)
+
+struct RangeIter:
+    int64 cur
+    int64 hi
+    def __iter__(self) -> RangeIter:
+        return self
+    def __next__(self) -> (int64, bool):
+        if self.cur >= self.hi:
+            return (0, False)
+        auto v = self.cur
+        self.cur = self.cur + 1
+        return (v, True)
+";
+
+    #[test]
+    fn lower_user_iterable_commaok() {
+        // `for x in Range(...)` desugars to `__iter__` then a loop over the
+        // comma-ok `__next__`, binding each tuple's value field.
+        let m = lower_ok(&format!(
+            "{RANGE_SRC}\ndef main():\n    auto total = 0\n    for x in Range(lo=0, hi=5):\n        total = total + x\n    print(total)\n"
+        ));
+        let text = format!("{m}");
+        assert!(text.contains("@Range____iter__"), "text:\n{text}");
+        assert!(text.contains("@RangeIter____next__"), "text:\n{text}");
+        // The loop reads both fields of the `(int64, bool)` result tuple.
+        assert!(text.contains("fieldget struct#2 %"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_stopiteration_iterable() {
+        // The Python form drives through a landing pad that checks the in-flight
+        // exception against the `StopIteration` sentinel.
+        let m = lower_ok(
+            "\
+struct Count:
+    int64 n
+    def __iter__(self) -> CountIter:
+        return CountIter(cur=0, n=self.n)
+
+struct CountIter:
+    int64 cur
+    int64 n
+    def __iter__(self) -> CountIter:
+        return self
+    def __next__(self) -> int64:
+        if self.cur >= self.n:
+            raise StopIteration
+        auto v = self.cur
+        self.cur = self.cur + 1
+        return v
+
+def main():
+    auto total = 0
+    for x in Count(n=4):
+        total = total + x
+    print(total)
+",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("strconst \"StopIteration\""), "text:\n{text}");
+        assert!(text.contains("@zap_str_eq"), "text:\n{text}");
+        assert!(text.contains("landingpad"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_list_comprehension_over_user_iterable() {
+        let m = lower_ok(&format!(
+            "{RANGE_SRC}\ndef main():\n    auto squares = [x * x for x in Range(lo=1, hi=5) if x != 3]\n    print(len(squares))\n"
+        ));
+        let text = format!("{m}");
+        assert!(text.contains("@zap_list_new"), "text:\n{text}");
+        assert!(text.contains("@zap_list_push_i64"), "text:\n{text}");
+        assert!(text.contains("@RangeIter____next__"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_membership_fallback_iterates() {
+        // `x in r` with no `__contains__` iterates and compares each element.
+        let m = lower_ok(&format!(
+            "{RANGE_SRC}\ndef main():\n    auto r = Range(lo=0, hi=5)\n    if 3 in r:\n        print(1)\n"
+        ));
+        let text = format!("{m}");
+        assert!(text.contains("@RangeIter____next__"), "text:\n{text}");
+        assert!(text.contains("icmp.Eq"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_non_iterable_for_errors() {
+        let (ast, _p, _l) = parse_str(
+            "struct Point:\n    int64 x\ndef main():\n    for p in Point(x=1):\n        print(1)\n",
+        );
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            !errs.is_empty(),
+            "a non-iterable struct in `for` should be rejected"
+        );
+    }
 }
