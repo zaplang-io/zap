@@ -1,5 +1,5 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0052.
+   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0055.
 
    Notation:
      ::=        definition
@@ -107,6 +107,7 @@ simple_stmt   ::= decl
                 | send_stmt                          (* channel send, D-0031 *)
                 | "return" [ expr { "," expr } ]     (* bare comma-list -> tuple return, D-0049 *)
                 | "raise" [ expr ]
+                | "assert" expr [ "," expr ]          (* power-assert; message, D-0054 *)
                 | "spawn" [ "detached" ] call_expr   (* "detached": D-0044 *)
                 | "break"
                 | "continue"

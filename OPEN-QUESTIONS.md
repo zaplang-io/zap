@@ -64,7 +64,10 @@ _Last updated: 2026-10-19_
   (run/build/test[--watch]/fmt/new/add/zenv/expand/ir/**mcp**); `zapc` becomes
   internal. `zap test` has a watch mode and a `@test` annotation suite (surface in
   #59); `zap mcp` serves coding agents.
-- ⚪ **In-language test framework** and **doc conventions**.
+- ✅ **In-language test framework** and **doc conventions** — RESOLVED (D-0054,
+  issue #59): `@test` annotation suite, power-assert `assert`, inline + `tests/`
+  discovery with build-identical import resolution, `zap test --watch/--json`,
+  Google-style docstrings. (`zap mcp` agent interface expanded in D-0055.)
 - ⚪ **Compatibility / versioning promise** (Go-style "Go 1 compatibility"?).
 
 ## Features deferred with a direction

@@ -553,7 +553,7 @@ One user-facing tool, **`zap`** (the `zapc` compiler becomes internal):
 ```
 zap run <file> | zap run      # run a single file, or the project (zap.toml)
 zap build                     # build project -> native binary (target/)
-zap test [--watch]            # run tests; --watch re-runs on source/test changes
+zap test [--watch] [--json]   # run tests; --watch re-runs (targeting changed paths); --json for agents
 zap fmt                       # canonical formatter (D-0037)
 zap new <name> | zap init     # scaffold a project
 zap add <dep> | zap remove    # manage deps (zap.toml + zap.lock, D-0052)
@@ -564,16 +564,28 @@ zap mcp                       # MCP server for coding agents (syntax/compile/tes
 zap version | zap help
 ```
 
-Tests are written with a **`@test`** annotation suite (decorators, D-0036); the
-framework surface is issue #59. `zap mcp` ships an agent-facing interface so AI
-coding tools can query the language, compile/type-check snippets, and run tests.
+**Testing (D-0054).** Tests use a **`@test`** annotation suite (`@test`,
+`@before`/`@after`, `@before_all`/`@after_all`, `@parametrize`, `@skip`/`@skip_if`,
+`@expect_raises`) built on decorators (D-0036). Assertions use a plain **`assert`**
+statement with power-assert diagnostics (failure prints the expression and operand
+values); `with expect_raises(E):` checks exceptions. Tests live inline
+(`@test`, compiled only under `zap test`) or in `*_test.zap` / `tests/`, and
+resolve imports through the **same** module resolution as the build (D-0052) — no
+test-only import path. Docstrings are triple-quoted first statements (D-0041),
+Google-style (summary + `Args`/`Returns`/`Raises`).
+
+**`zap mcp` (D-0055)** is the agent interface: it serves the language
+reference/grammar/examples (so LLMs write correct Zap without a training corpus),
+does fast **parse + type-check** validation (no full build), maintains a compact
+**code-graph** of the project (token-efficient context for agents), and runs
+**targeted** tests — all with structured output.
 
 ## Appendix A — Reserved words (provisional)
 
 `def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
 `match`, `break`, `continue`, `auto`,
 `const`, `True`, `False`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
-`finally`, `with`, `as`, `yield`, `lambda`, `spawn`, `scope`, `channel`,
+`finally`, `with`, `as`, `yield`, `lambda`, `assert`, `spawn`, `scope`, `channel`,
 `select`, `case`, `close`, `struct`, `interface`, `enum`, `annotation`,
 `decorator`, `import`, `python`, `m`, `s`
 (contextual, before a delimiter; `detached` is likewise contextual, only after
