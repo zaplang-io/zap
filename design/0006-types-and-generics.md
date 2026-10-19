@@ -512,6 +512,33 @@ land** (D-0017 staging; §5); non-generic data-carrying enums ship first. Stdlib
 D-0015) are **allowed** — dispatching via `match` internally — and may be staged
 after the core destructuring.
 
+#### 3.4 As built (ticket #51)
+
+The first implementation lands the whole vertical — front-end (parse of
+data-carrying variants and qualified/positional/named patterns), sema (distinct
+int-backed tier-1 typing, variant construction, payload-field binding, and
+**`match` exhaustiveness**), ZIR lowering, and codegen through LLVM + the Boehm
+runtime, with tier-1, tier-3, and a recursive-`Expr` golden. Representation
+choices and scoped deferrals, all consistent with D-0046:
+
+- **Tier-1** is lowered as its unboxed `i64` backing value; member access is the
+  discriminant constant and `match` is an equality chain.
+- **Tier-3** is lowered as a **GC-allocated tagged struct** `{ tag:i32,
+  payload… }`, reusing the struct machinery (`StructNew`/`FieldGet`/`FieldSet`).
+  A recursive variant field (type = the enum itself) is therefore already a
+  pointer to a heap enum value, which breaks the cycle for free — the motivating
+  AST case works with no special node. The payload union is modelled as a
+  **flattened record** (each variant's fields occupy their own slots) rather than
+  an overlapping union sized to the largest variant; the space-optimal overlap,
+  and the fully unboxed by-value representation, are a later follow-up
+  (semantically unobservable today because enum values are immutable, cf. D-0023
+  for `str`).
+- **Deferred to follow-ups** (typed by sema, not yet lowered): `.name`, `for x in
+  Enum` iteration (both need a ZIR-level enum identity that the `i64` collapse
+  drops), enum methods, and generic enums (ride on user generics, D-0017).
+  Nested sub-patterns inside a variant field (`case Shape.Circle(0.0)`) are not
+  yet lowered — bind to a name or `_`.
+
 ### 4. Tuples (resolves the OPEN-QUESTIONS syntax item)
 
 Tuples are a **fixed-arity, heterogeneous, immutable** aggregate (D-0019).

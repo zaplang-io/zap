@@ -402,23 +402,56 @@ impl Parser {
         let start = self.peek_span().start;
         self.expect_kw(Keyword::Enum, "'enum'");
         let name = self.ident("enum name");
+        let generics = self.parse_generics();
         self.expect(&TokenKind::Colon, "':'");
         self.expect(&TokenKind::Newline, "newline");
         self.expect(&TokenKind::Indent, "indented block");
         let mut variants = Vec::new();
+        let mut methods = Vec::new();
         while !self.is(&TokenKind::Dedent) && !self.at_eof() {
             let before = self.pos;
+            // Methods on the enum (D-0046): a `def` (possibly decorated) in the
+            // body, parsed exactly like a struct method.
+            let decos = self.parse_decorators();
+            if self.is_kw(Keyword::Def) {
+                methods.push(self.parse_function(decos));
+                if self.pos == before {
+                    self.bump();
+                }
+                continue;
+            }
             let vstart = self.peek_span().start;
             let vname = self.ident("variant name");
-            let value = if self.eat(&TokenKind::Assign) {
-                Some(self.parse_expr())
-            } else {
-                None
-            };
+            // A data-carrying variant: `Circle(f64 r, f64 g, ...)` (D-0046).
+            // Type-first named payload fields in parentheses.
+            let mut fields = Vec::new();
+            let mut value = None;
+            if self.eat(&TokenKind::LParen) {
+                if !self.is(&TokenKind::RParen) {
+                    loop {
+                        let fstart = self.peek_span().start;
+                        let fty = self.parse_type();
+                        let fname = self.ident("payload field name");
+                        fields.push(VariantField {
+                            ty: fty,
+                            name: fname,
+                            span: self.span_from(fstart),
+                        });
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RParen, "')'");
+            } else if self.eat(&TokenKind::Assign) {
+                // A tier-1 constant with an explicit discriminant (`GREEN = 10`).
+                value = Some(self.parse_expr());
+            }
             self.expect(&TokenKind::Newline, "newline after variant");
             variants.push(EnumVariant {
                 name: vname,
                 value,
+                fields,
                 span: self.span_from(vstart),
             });
             if self.pos == before {
@@ -429,7 +462,9 @@ impl Parser {
         EnumDef {
             decorators,
             name,
+            generics,
             variants,
+            methods,
             span: self.span_from(start),
         }
     }
@@ -1637,16 +1672,21 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.bump();
-                // Struct pattern: Name(...)
+                // A dotted/qualified name: `Color.RED`, `Shape.Circle`, ...
+                // (D-0018/D-0046). Enum members/variants are matched qualified.
+                let mut path = vec![name.clone()];
+                while self.eat(&TokenKind::Dot) {
+                    path.push(self.ident("qualified pattern name"));
+                }
+                // Struct / enum-variant pattern: `Path(pat_args)`. Arguments are
+                // positional (`r`) or by name (`h=h`), developer's choice
+                // (D-0040/D-0046).
                 if self.is(&TokenKind::LParen) {
                     self.bump();
-                    let mut fields = Vec::new();
+                    let mut args = Vec::new();
                     if !self.is(&TokenKind::RParen) {
                         loop {
-                            let fname = self.ident("field name");
-                            self.expect(&TokenKind::Assign, "'='");
-                            let pat = self.parse_pattern();
-                            fields.push((fname, pat));
+                            args.push(self.parse_pat_arg());
                             if !self.eat(&TokenKind::Comma) {
                                 break;
                             }
@@ -1654,12 +1694,21 @@ impl Parser {
                     }
                     self.expect(&TokenKind::RParen, "')'");
                     Pattern::Struct {
-                        name,
-                        fields,
+                        path,
+                        args: Some(args),
                         span: self.span_from(start),
                     }
-                } else {
+                } else if path.len() == 1 {
+                    // A bare name binds (capture, Python semantics, D-0040).
                     Pattern::Capture { name, span }
+                } else {
+                    // A qualified constant or payload-free variant with no
+                    // parens: `Color.RED`, `Shape.Unit`.
+                    Pattern::Struct {
+                        path,
+                        args: None,
+                        span: self.span_from(start),
+                    }
                 }
             }
             TokenKind::Star => {
@@ -1702,6 +1751,31 @@ impl Parser {
                 // Literal pattern (numbers, strings, True/False/None).
                 let e = self.parse_operand();
                 Pattern::Literal(e)
+            }
+        }
+    }
+
+    /// One argument of a struct/variant pattern: `IDENT "=" pattern` (by name)
+    /// or `pattern` (positional, declaration order; D-0040/D-0046).
+    fn parse_pat_arg(&mut self) -> PatArg {
+        let start = self.peek_span().start;
+        let named =
+            matches!(self.peek(), TokenKind::Ident(_)) && matches!(self.peek2(), TokenKind::Assign);
+        if named {
+            let name = self.ident("field name");
+            self.expect(&TokenKind::Assign, "'='");
+            let pattern = self.parse_pattern();
+            PatArg {
+                name: Some(name),
+                pattern,
+                span: self.span_from(start),
+            }
+        } else {
+            let pattern = self.parse_pattern();
+            PatArg {
+                name: None,
+                pattern,
+                span: self.span_from(start),
             }
         }
     }
@@ -1933,7 +2007,66 @@ mod tests {
         };
         assert_eq!(e.variants.len(), 3);
         assert!(e.variants[1].value.is_some());
+        assert!(e.variants.iter().all(|v| v.fields.is_empty()));
         assert!(matches!(&m.items[1], Item::Import(Import::Python { .. })));
+    }
+
+    #[test]
+    fn tier3_enum_variants_and_methods() {
+        // Data-carrying variants with type-first named payload fields, a
+        // payload-free variant, and a method in the body (D-0046).
+        let src = "enum Shape:\n    Circle(f64 r)\n    Rect(f64 w, f64 h)\n    Unit\n\
+                   \x20   def kind(self) -> int64:\n        return 0\n";
+        let m = parse_ok(src);
+        let Item::Enum(e) = &m.items[0] else {
+            panic!("enum");
+        };
+        assert_eq!(e.variants.len(), 3);
+        assert_eq!(e.variants[0].fields.len(), 1);
+        assert_eq!(e.variants[0].fields[0].name, "r");
+        assert_eq!(e.variants[1].fields.len(), 2);
+        assert!(e.variants[2].fields.is_empty());
+        assert_eq!(e.methods.len(), 1);
+        assert_eq!(e.methods[0].name, "kind");
+    }
+
+    #[test]
+    fn qualified_and_positional_patterns() {
+        // `Color.RED` (dotted constant), `Shape.Circle(r)` (positional), and
+        // `Shape.Rect(w=w, h=h)` (named) all parse (D-0040/D-0046).
+        let src = "def f(Shape s):\n    match s:\n\
+                   \x20       case Shape.Circle(r):\n            a()\n\
+                   \x20       case Shape.Rect(w=w, h=h):\n            b()\n\
+                   \x20       case Color.RED:\n            c()\n";
+        let m = parse_ok(src);
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        let Stmt::Match { arms, .. } = &f.body.stmts[0] else {
+            panic!("match");
+        };
+        assert_eq!(arms.len(), 3);
+        // Positional: one arg, no name.
+        let Pattern::Struct { path, args, .. } = &arms[0].pattern else {
+            panic!("variant pattern");
+        };
+        assert_eq!(path, &["Shape".to_string(), "Circle".to_string()]);
+        let args = args.as_ref().expect("has parens");
+        assert_eq!(args.len(), 1);
+        assert!(args[0].name.is_none());
+        // Named: both args carry field names.
+        let Pattern::Struct { args, .. } = &arms[1].pattern else {
+            panic!("variant pattern");
+        };
+        let args = args.as_ref().unwrap();
+        assert_eq!(args[0].name.as_deref(), Some("w"));
+        assert_eq!(args[1].name.as_deref(), Some("h"));
+        // Bare qualified constant: no parens.
+        let Pattern::Struct { path, args, .. } = &arms[2].pattern else {
+            panic!("qualified constant pattern");
+        };
+        assert_eq!(path, &["Color".to_string(), "RED".to_string()]);
+        assert!(args.is_none());
     }
 
     #[test]
