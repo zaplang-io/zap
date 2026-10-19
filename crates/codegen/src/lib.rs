@@ -245,6 +245,11 @@ struct Cg<'a, 'ctx> {
     /// The target data layout, for computing GC descriptor field offsets (#48).
     #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
     target_data: Option<TargetData>,
+    /// The current function's entry block (ticket #91). Fixed-size `alloca`s are
+    /// hoisted here via [`entry_alloca`] so they are reserved once per call
+    /// instead of once per execution of a loop body — otherwise a long-running
+    /// loop accumulates per-iteration stack slots and overflows the stack.
+    entry_block: Option<BasicBlock<'ctx>>,
 }
 
 /// A function's shadow-stack frame (ticket #48). Codegen reserves one root slot
@@ -281,7 +286,44 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             struct_descs: Vec::new(),
             gc_frame: None,
             target_data: None,
+            entry_block: None,
         }
+    }
+
+    /// Emit a fixed-size `alloca` in the current function's **entry block**
+    /// rather than at the builder's current position (ticket #91). The entry
+    /// block executes exactly once per call and dominates every other block, so
+    /// a slot reserved here is reused across loop iterations instead of being
+    /// re-allocated each time — which otherwise overflows the stack in a
+    /// long-running loop. Semantics are unchanged: only the storage location is
+    /// hoisted; each logical variable is still (re)initialized by its in-body
+    /// `store`s, so per-iteration *values* are unaffected.
+    ///
+    /// The builder is repositioned before the entry block's terminator while the
+    /// `alloca` is emitted, then restored. When the entry block is still being
+    /// built (no terminator yet — i.e. the request comes from within the entry
+    /// block itself), the alloca is appended in place, which is already correct.
+    fn entry_alloca(
+        &self,
+        ty: BasicTypeEnum<'ctx>,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, String> {
+        let entry = self
+            .entry_block
+            .ok_or("entry_alloca called with no current function")?;
+        let saved = self.builder.get_insert_block();
+        match entry.get_terminator() {
+            Some(term) => self.builder.position_before(&term),
+            None => self.builder.position_at_end(entry),
+        }
+        let p = self
+            .builder
+            .build_alloca(ty, name)
+            .map_err(|e| e.to_string())?;
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+        Ok(p)
     }
 
     /// Whether this build emits the precise Immix GC's metadata (ticket #48):
@@ -1031,6 +1073,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .map(|b| self.ctx.append_basic_block(fv, &format!("b{}", b.id)))
             .collect();
 
+        // Hoist target for fixed-size allocas (ticket #91): block 0 is the entry
+        // block, executed once per call and dominating every other block.
+        self.entry_block = Some(blocks[0]);
+
         let mut vals: Vec<Option<BasicValueEnum>> = vec![None; f.value_types.len()];
         // Position at the entry block so a by-value aggregate parameter can be
         // spilled into a stack slot there (the body addresses it through a
@@ -1081,6 +1127,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.term(f, &b.term, &blocks, &vals, fv)?;
         }
         self.gc_frame = None;
+        self.entry_block = None;
         Ok(())
     }
 
@@ -1147,10 +1194,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     /// D-0051). Non-aggregate results pass through unchanged.
     fn abi_result(&self, v: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>, String> {
         if v.is_struct_value() {
-            let slot = self
-                .builder
-                .build_alloca(v.get_type(), "ret.spill")
-                .map_err(|e| e.to_string())?;
+            // Hoisted to the entry block (ticket #91): a call that returns a
+            // by-value aggregate inside a loop would otherwise spill a fresh
+            // slot every iteration.
+            let slot = self.entry_alloca(v.get_type(), "ret.spill")?;
             self.builder
                 .build_store(slot, v)
                 .map_err(|e| e.to_string())?;
@@ -1320,9 +1367,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 vals[*dest as usize] = Some(res);
             }
             Inst::Alloca { dest, pointee } => {
-                let p = b
-                    .build_alloca(self.basic(*pointee), "slot")
-                    .map_err(|e| e.to_string())?;
+                // Hoist the stack slot to the entry block (ticket #91) so a loop
+                // body that declares a local does not re-`alloca` it each
+                // iteration and overflow the stack on a long-running loop.
+                let p = self.entry_alloca(self.basic(*pointee), "slot")?;
                 vals[*dest as usize] = Some(p.into());
             }
             Inst::Load { dest, ptr } => {
