@@ -297,6 +297,29 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into()],
             Some(p.into()),
         );
+        // dict with struct keys (operator overloading, D-0047): the key is a
+        // struct pointer hashed/compared through the `__hash__`/`__eq__` function
+        // pointers passed as the trailing two arguments.
+        self.declare_rt(
+            "zap_dict_set_fn_i64",
+            &[p.into(), p.into(), i.into(), p.into(), p.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_set_fn_ptr",
+            &[p.into(), p.into(), p.into(), p.into(), p.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_get_fn_i64",
+            &[p.into(), p.into(), p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_fn_ptr",
+            &[p.into(), p.into(), p.into(), p.into()],
+            Some(p.into()),
+        );
         // set
         self.declare_rt("zap_set_new", &[], Some(p.into()));
         self.declare_rt("zap_set_len", &[p.into()], Some(i.into()));
@@ -312,7 +335,25 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into()],
             Some(i.into()),
         );
+        // set with struct elements (operator overloading, D-0047): the element is
+        // a struct pointer hashed/compared through the `__hash__`/`__eq__`
+        // function pointers passed as the trailing two arguments.
+        self.declare_rt(
+            "zap_set_add_fn",
+            &[p.into(), p.into(), p.into(), p.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_set_contains_fn",
+            &[p.into(), p.into(), p.into(), p.into()],
+            Some(i.into()),
+        );
         self.declare_rt("zap_set_items", &[p.into()], Some(p.into()));
+        // Struct-key hashing helpers (operator overloading, D-0047).
+        self.declare_rt("zap_str_cmp", &[p.into(), p.into()], Some(i.into()));
+        self.declare_rt("zap_str_hash", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_i64_hash", &[i.into()], Some(i.into()));
+        self.declare_rt("zap_hash_combine", &[i.into(), i.into()], Some(i.into()));
 
         // Numeric-array entry points (ticket #24, see design/0002-arrays.md and
         // design/RUNTIME-ABI.md §"Collection layout"). Construction, element
@@ -920,6 +961,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 let spawn = self.fns["zap_spawn"];
                 b.build_call(spawn, &[thunk_ptr.into(), env.into()], "")
                     .map_err(|e| e.to_string())?;
+            }
+            Inst::FuncAddr { dest, func } => {
+                // The address of a top-level function as a pointer value, handed
+                // to the collection runtime as a struct key's `__hash__`/`__eq__`
+                // (operator overloading, D-0047).
+                let fv = *self
+                    .fns
+                    .get(func)
+                    .ok_or_else(|| format!("address of unknown function '{func}'"))?;
+                let p = fv.as_global_value().as_pointer_value();
+                vals[*dest as usize] = Some(p.into());
             }
         }
         Ok(())

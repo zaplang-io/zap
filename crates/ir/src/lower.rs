@@ -460,8 +460,10 @@ fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
 fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
     match t {
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
+        // A struct element carries its id so a struct *key* hashes/compares via
+        // its own `__hash__`/`__eq__` (operator overloading, D-0047).
+        Ty::Struct(sid) => Ok(Elem::Struct(sid)),
         Ty::Ptr
-        | Ty::Struct(_)
         | Ty::List(_)
         | Ty::Dict(..)
         | Ty::Set(_)
@@ -540,23 +542,30 @@ impl DerivedTrait {
         }
     }
 
-    /// The method name the generated code is reachable through (`u.eq(v)`).
+    /// The dunder method the generated code is reachable through and that the
+    /// corresponding operator desugars to (D-0047): `Eq` → `__eq__` (`==`/`!=`),
+    /// `Ord` → `__cmp__` (`< <= > >=`), `Hash` → `__hash__` (dict/set keys),
+    /// `Repr` → `__repr__` (`print` / `str`).
     fn method_name(self) -> &'static str {
         match self {
-            DerivedTrait::Eq => "eq",
-            DerivedTrait::Repr => "repr",
-            DerivedTrait::Ord => "cmp",
-            DerivedTrait::Json => "to_json",
-            DerivedTrait::Hash => "hash",
+            DerivedTrait::Eq => "__eq__",
+            DerivedTrait::Repr => "__repr__",
+            DerivedTrait::Ord => "__cmp__",
+            DerivedTrait::Json => "__json__",
+            DerivedTrait::Hash => "__hash__",
         }
     }
 
     /// The ZIR signature of the generated method, if this trait is implemented.
+    /// `__cmp__` returns an `i64` three-way result (−1 / 0 / +1); `__hash__`
+    /// returns the combined `i64` hash.
     fn signature(self, sid: u32) -> Option<(&'static str, Vec<Ty>, Ty)> {
         match self {
-            DerivedTrait::Eq => Some(("eq", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I1)),
-            DerivedTrait::Repr => Some(("repr", vec![Ty::Struct(sid)], Ty::Ptr)),
-            _ => None,
+            DerivedTrait::Eq => Some(("__eq__", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I1)),
+            DerivedTrait::Repr => Some(("__repr__", vec![Ty::Struct(sid)], Ty::Ptr)),
+            DerivedTrait::Ord => Some(("__cmp__", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I64)),
+            DerivedTrait::Hash => Some(("__hash__", vec![Ty::Struct(sid)], Ty::I64)),
+            DerivedTrait::Json => None,
         }
     }
 
@@ -571,9 +580,11 @@ impl DerivedTrait {
         match self {
             DerivedTrait::Eq => Ok(Some(gen_eq_method(sid, sigs, ctx)?)),
             DerivedTrait::Repr => Ok(Some(gen_repr_method(sid, sigs, ctx)?)),
-            DerivedTrait::Ord | DerivedTrait::Json | DerivedTrait::Hash => Err(err(format!(
+            DerivedTrait::Ord => Ok(Some(gen_cmp_method(sid, sigs, ctx)?)),
+            DerivedTrait::Hash => Ok(Some(gen_hash_method(sid, sigs, ctx)?)),
+            DerivedTrait::Json => Err(err(format!(
                 "@derive({:?}) is recognized but not implemented yet \
-                 (only Eq and Repr are generated in this increment)",
+                 (Eq, Ord, Hash, and Repr are generated; Json is a follow-up)",
                 self.name()
             ))),
         }
@@ -719,15 +730,15 @@ fn defer_fn_decorators(f: &ast::Function, errors: &mut Vec<LowerError>) {
     }
 }
 
-/// `@derive(Eq)` — a structural-equality method `Struct__eq(self, other) -> bool`
-/// that compares every field (ints/bools by value, floats by ordered compare,
-/// strings by content) and ANDs the results.
+/// `@derive(Eq)` — a structural-equality method `Struct____eq__(self, other) ->
+/// bool` (the `__eq__` dunder, D-0047) that compares every field (ints/bools by
+/// value, floats by ordered compare, strings by content) and ANDs the results.
 fn gen_eq_method(
     sid: u32,
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &StructCtx,
 ) -> Result<Func, LowerError> {
-    let name = format!("{}__eq", ctx.names[sid as usize]);
+    let name = format!("{}__{}", ctx.names[sid as usize], "__eq__");
     let mut b = FnLower::new(
         name,
         vec![Ty::Struct(sid), Ty::Struct(sid)],
@@ -815,15 +826,15 @@ fn gen_field_eq(b: &mut FnLower, a: Value, c: Value, fty: Ty) -> Result<Value, L
     Ok(bit)
 }
 
-/// `@derive(Repr)` — a debug-string method `Struct__repr(self) -> str` producing
-/// `Name(f0=v0, f1=v1, ...)`.
+/// `@derive(Repr)` — a debug-string method `Struct____repr__(self) -> str` (the
+/// `__repr__` dunder, D-0047) producing `Name(f0=v0, f1=v1, ...)`.
 fn gen_repr_method(
     sid: u32,
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &StructCtx,
 ) -> Result<Func, LowerError> {
     let sname = ctx.names[sid as usize].clone();
-    let name = format!("{sname}__repr");
+    let name = format!("{sname}__{}", "__repr__");
     let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, sigs, ctx);
     let mut acc = b.strconst(&format!("{sname}("));
     let fields = ctx.fields[sid as usize].clone();
@@ -877,6 +888,210 @@ fn gen_concat(b: &mut FnLower, a: Value, c: Value) -> Value {
         args: vec![a, c],
     });
     d
+}
+
+/// `@derive(Ord)` — a three-way comparison `Struct____cmp__(self, other) -> i64`
+/// (the `__cmp__` dunder, D-0047) returning −1 / 0 / +1 lexicographically by
+/// field. The four relational operators (`< <= > >=`) derive from it. Fields are
+/// compared in declaration order; the first non-equal field decides the result.
+fn gen_cmp_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let name = format!("{}__{}", ctx.names[sid as usize], "__cmp__");
+    let mut b = FnLower::new(
+        name,
+        vec![Ty::Struct(sid), Ty::Struct(sid)],
+        Ty::I64,
+        false,
+        sigs,
+        ctx,
+    );
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (_fname, fty)) in fields.iter().enumerate() {
+        let idx = idx as u32;
+        let a = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: a,
+            base: 0,
+            sid,
+            idx,
+        });
+        let c = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: c,
+            base: 1,
+            sid,
+            idx,
+        });
+        let cmp = gen_field_cmp(&mut b, a, c, *fty)?;
+        // `if cmp != 0: return cmp` — otherwise fall through to the next field.
+        let zero = b.iconst(Ty::I64, 0);
+        let ne = b.new_value(Ty::I1);
+        b.emit(Inst::ICmp {
+            dest: ne,
+            pred: CmpPred::Ne,
+            lhs: cmp,
+            rhs: zero,
+        });
+        let ret_bb = b.new_block();
+        let next_bb = b.new_block();
+        b.set_term(Term::BrIf {
+            cond: ne,
+            then_bb: ret_bb,
+            else_bb: next_bb,
+        });
+        b.position(ret_bb);
+        b.set_term(Term::Ret(Some(cmp)));
+        b.position(next_bb);
+    }
+    // All fields equal.
+    let zero = b.iconst(Ty::I64, 0);
+    b.set_term(Term::Ret(Some(zero)));
+    Ok(b.func)
+}
+
+/// Three-way compare one field, returning an `i64` of −1 / 0 / +1.
+fn gen_field_cmp(b: &mut FnLower, a: Value, c: Value, fty: Ty) -> Result<Value, LowerError> {
+    match fty {
+        Ty::Ptr => {
+            // Strings: lexicographic byte comparison via the runtime.
+            let d = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_str_cmp".to_string(),
+                args: vec![a, c],
+            });
+            Ok(d)
+        }
+        Ty::F32 | Ty::F64 => {
+            let gt = b.new_value(Ty::I1);
+            b.emit(Inst::FCmp {
+                dest: gt,
+                pred: CmpPred::Gt,
+                lhs: a,
+                rhs: c,
+            });
+            let lt = b.new_value(Ty::I1);
+            b.emit(Inst::FCmp {
+                dest: lt,
+                pred: CmpPred::Lt,
+                lhs: a,
+                rhs: c,
+            });
+            Ok(gen_three_way(b, gt, lt))
+        }
+        t if t.int_width().is_some() => {
+            // Compare at i64 so mixed-width fields share a type (D-0019).
+            let ai = b.coerce(a, t, Ty::I64);
+            let ci = b.coerce(c, t, Ty::I64);
+            let gt = b.new_value(Ty::I1);
+            b.emit(Inst::ICmp {
+                dest: gt,
+                pred: CmpPred::Gt,
+                lhs: ai,
+                rhs: ci,
+            });
+            let lt = b.new_value(Ty::I1);
+            b.emit(Inst::ICmp {
+                dest: lt,
+                pred: CmpPred::Lt,
+                lhs: ai,
+                rhs: ci,
+            });
+            Ok(gen_three_way(b, gt, lt))
+        }
+        other => Err(err(format!(
+            "@derive(Ord) does not support field type {other} yet \
+             (only scalars and str)"
+        ))),
+    }
+}
+
+/// Fold a `greater-than` and `less-than` bit into an `i64` of +1 / −1 / 0
+/// without integer extension pitfalls (an `i1` sign-extends to −1).
+fn gen_three_way(b: &mut FnLower, gt: Value, lt: Value) -> Value {
+    let neg1 = b.iconst(Ty::I64, -1);
+    let zero = b.iconst(Ty::I64, 0);
+    let one = b.iconst(Ty::I64, 1);
+    let tmp = b.new_value(Ty::I64);
+    b.emit(Inst::Select {
+        dest: tmp,
+        cond: lt,
+        a: neg1,
+        b: zero,
+    });
+    let d = b.new_value(Ty::I64);
+    b.emit(Inst::Select {
+        dest: d,
+        cond: gt,
+        a: one,
+        b: tmp,
+    });
+    d
+}
+
+/// `@derive(Hash)` — a hash method `Struct____hash__(self) -> i64` (the
+/// `__hash__` dunder, D-0047) combining every field's hash. The same fields feed
+/// `__eq__` and `__hash__`, so the invariant `a == b ⟹ hash(a) == hash(b)` holds
+/// (D-0047). Float fields are a documented follow-up (bit-hashing would break the
+/// invariant against `__eq__`'s value compare), so they are rejected cleanly.
+fn gen_hash_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let name = format!("{}__{}", ctx.names[sid as usize], "__hash__");
+    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::I64, false, sigs, ctx);
+    // Seed; each field hash is mixed in with `zap_hash_combine`.
+    let mut acc = b.iconst(Ty::I64, 0);
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (_fname, fty)) in fields.iter().enumerate() {
+        let fv = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: fv,
+            base: 0,
+            sid,
+            idx: idx as u32,
+        });
+        let h = match *fty {
+            Ty::Ptr => {
+                let d = b.new_value(Ty::I64);
+                b.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_hash".to_string(),
+                    args: vec![fv],
+                });
+                d
+            }
+            t if t.int_width().is_some() => {
+                let i = b.coerce(fv, t, Ty::I64);
+                let d = b.new_value(Ty::I64);
+                b.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_i64_hash".to_string(),
+                    args: vec![i],
+                });
+                d
+            }
+            other => {
+                return Err(err(format!(
+                    "@derive(Hash) does not support field type {other} yet \
+                     (only integers, bools, and str)"
+                )));
+            }
+        };
+        let next = b.new_value(Ty::I64);
+        b.emit(Inst::Call {
+            dest: Some(next),
+            func: "zap_hash_combine".to_string(),
+            args: vec![acc, h],
+        });
+        acc = next;
+    }
+    b.set_term(Term::Ret(Some(acc)));
+    Ok(b.func)
 }
 
 fn lower_fn(
@@ -1821,6 +2036,17 @@ impl<'a> FnLower<'a> {
             }
             Expr::Unary { op, expr, .. } => {
                 let (v, t) = self.expr(expr)?;
+                // Unary operator overloading on user structs (D-0047): `-a` ->
+                // `a.__neg__()`, `+a` -> `a.__pos__()`, `~a` -> `a.__invert__()`.
+                // `not a` goes through `truthy` (which calls `__bool__`).
+                if let Ty::Struct(sid) = t {
+                    match op {
+                        AstUn::Neg => return self.call_dunder(sid, "__neg__", vec![(v, t)]),
+                        AstUn::Pos => return self.call_dunder(sid, "__pos__", vec![(v, t)]),
+                        AstUn::BitNot => return self.call_dunder(sid, "__invert__", vec![(v, t)]),
+                        AstUn::Not => {}
+                    }
+                }
                 match op {
                     AstUn::Neg => {
                         let d = self.new_value(t);
@@ -2014,6 +2240,12 @@ impl<'a> FnLower<'a> {
                             args: vec![v],
                         });
                         vals.push(s);
+                    } else if let Ty::Struct(sid) = vt {
+                        // A struct prints through its `__str__`/`__repr__`
+                        // (D-0047): marshal to a string first so codegen's
+                        // `Print` renders it like any other string.
+                        let s = self.struct_to_str(sid, v)?;
+                        vals.push(s);
                     } else {
                         vals.push(v);
                     }
@@ -2042,6 +2274,10 @@ impl<'a> FnLower<'a> {
                     return Err(err("len() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
+                // Size overloading (D-0047): `len(a)` -> `a.__len__()`.
+                if let Ty::Struct(sid) = vt {
+                    return self.call_dunder(sid, "__len__", vec![(v, vt)]);
+                }
                 let func = match vt {
                     Ty::List(_) => "zap_list_len",
                     Ty::Dict(..) => "zap_dict_len",
@@ -2121,6 +2357,17 @@ impl<'a> FnLower<'a> {
                 self.throwing_call(dest, fname, argvals);
                 let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
                 return Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }));
+            }
+            // A callable user struct held in a variable (D-0047): `f(args)` where
+            // `f` is a struct value desugars to `f.__call__(args)`. `lookup`
+            // yields the variable's stack slot, so the receiver must be loaded.
+            if let Some((slot, Ty::Struct(sid))) = self.lookup(fname) {
+                let recv = self.load(slot, Ty::Struct(sid));
+                let mut dargs = vec![(recv, Ty::Struct(sid))];
+                for a in args {
+                    dargs.push(self.expr(&a.value)?);
+                }
+                return self.call_dunder(sid, "__call__", dargs);
             }
             // A Python callable held in a variable (`auto f = m.sqrt; f(2.0)`)
             // or an imported module name used as a callable (ticket #27, D-0012).
@@ -2695,6 +2942,9 @@ impl<'a> FnLower<'a> {
             args: vec![],
         });
         let set = format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix());
+        // Struct keys hash/compare through their own `__hash__`/`__eq__`, passed
+        // as function pointers to the `_fn` entry point (D-0047); empty otherwise.
+        let kfns = self.key_fn_args(kk)?;
         for ((kv, kt), (vv, vt)) in lowered {
             if elem_kind(kt)? != kk || elem_kind(vt)? != vk {
                 return Err(err(
@@ -2703,10 +2953,12 @@ impl<'a> FnLower<'a> {
             }
             let kv = self.coerce(kv, kt, kk.ty());
             let vv = self.coerce(vv, vt, vk.ty());
+            let mut cargs = vec![dict, kv, vv];
+            cargs.extend_from_slice(&kfns);
             self.emit(Inst::Call {
                 dest: None,
                 func: set.clone(),
-                args: vec![dict, kv, vv],
+                args: cargs,
             });
         }
         Ok((dict, Ty::Dict(kk, vk)))
@@ -2730,15 +2982,18 @@ impl<'a> FnLower<'a> {
             args: vec![],
         });
         let add = format!("zap_set_add_{}", elem.key_suffix());
+        let kfns = self.key_fn_args(elem)?;
         for (v, vt) in lowered {
             if elem_kind(vt)? != elem {
                 return Err(err("set elements must all have the same representation"));
             }
             let v = self.coerce(v, vt, elem.ty());
+            let mut cargs = vec![set, v];
+            cargs.extend_from_slice(&kfns);
             self.emit(Inst::Call {
                 dest: None,
                 func: add.clone(),
-                args: vec![set, v],
+                args: cargs,
             });
         }
         Ok((set, Ty::Set(elem)))
@@ -2761,10 +3016,13 @@ impl<'a> FnLower<'a> {
                     return Err(err("add() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
+                let kfns = self.key_fn_args(elem)?;
+                let mut cargs = vec![recv, v];
+                cargs.extend_from_slice(&kfns);
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_set_add_{}", elem.key_suffix()),
-                    args: vec![recv, v],
+                    args: cargs,
                 });
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
@@ -2789,11 +3047,14 @@ impl<'a> FnLower<'a> {
             Ty::Dict(kk, vk) => {
                 let (kv, kt) = self.expr(index)?;
                 let kv = self.coerce(kv, kt, kk.ty());
+                let kfns = self.key_fn_args(kk)?;
                 let d = self.new_value(vk.ty());
+                let mut cargs = vec![bv, kv];
+                cargs.extend_from_slice(&kfns);
                 self.emit(Inst::Call {
                     dest: Some(d),
                     func: format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
-                    args: vec![bv, kv],
+                    args: cargs,
                 });
                 Ok((d, vk.ty()))
             }
@@ -2809,6 +3070,11 @@ impl<'a> FnLower<'a> {
                     args: vec![bv, iv],
                 });
                 Ok((dest, d.ty()))
+            }
+            Ty::Struct(sid) => {
+                // Indexing overloading (D-0047): `a[i]` -> `a.__getitem__(i)`.
+                let (iv, it) = self.expr(index)?;
+                self.call_dunder(sid, "__getitem__", vec![(bv, bty), (iv, it)])
             }
             _ => Err(err(
                 "indexing is only supported on list, dict, and array values",
@@ -2841,10 +3107,13 @@ impl<'a> FnLower<'a> {
                 let kv = self.coerce(kv, kt, kk.ty());
                 let (v, vt) = self.expr(value)?;
                 let v = self.coerce(v, vt, vk.ty());
+                let kfns = self.key_fn_args(kk)?;
+                let mut cargs = vec![bv, kv, v];
+                cargs.extend_from_slice(&kfns);
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
-                    args: vec![bv, kv, v],
+                    args: cargs,
                 });
                 Ok(())
             }
@@ -2858,6 +3127,14 @@ impl<'a> FnLower<'a> {
                     func: format!("zap_array_set_{}", d.suffix()),
                     args: vec![bv, iv, v],
                 });
+                Ok(())
+            }
+            Ty::Struct(sid) => {
+                // Indexed-assignment overloading (D-0047):
+                // `a[i] = v` -> `a.__setitem__(i, v)`.
+                let (iv, it) = self.expr(index)?;
+                let (v, vt) = self.expr(value)?;
+                self.call_dunder(sid, "__setitem__", vec![(bv, bty), (iv, it), (v, vt)])?;
                 Ok(())
             }
             _ => Err(err(
@@ -3099,6 +3376,182 @@ impl<'a> FnLower<'a> {
         Ok(d)
     }
 
+    /// Call a struct's dunder method (operator overloading, D-0047). `args` are
+    /// `(value, type)` pairs starting with the receiver (`self`); each is coerced
+    /// to the registered parameter type. A missing dunder is a clean error (sema
+    /// normally catches it first, but the ir crate is exercised without sema).
+    fn call_dunder(
+        &mut self,
+        sid: u32,
+        dunder: &str,
+        args: Vec<(Value, Ty)>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
+        let (ptys, ret) = self.sigs.get(&mangled).cloned().ok_or_else(|| {
+            err(format!(
+                "type '{}' does not define '{}' (required by this operator; D-0047)",
+                self.ctx.names[sid as usize], dunder
+            ))
+        })?;
+        let mut argvals = Vec::with_capacity(args.len());
+        for (i, (v, vt)) in args.into_iter().enumerate() {
+            let target = *ptys.get(i).unwrap_or(&vt);
+            argvals.push(self.coerce(v, vt, target));
+        }
+        let dest = if ret == Ty::Void {
+            None
+        } else {
+            Some(self.new_value(ret))
+        };
+        self.throwing_call(dest, &mangled, argvals);
+        let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
+        Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }))
+    }
+
+    /// The extra runtime arguments for a collection *key* of the given element
+    /// kind: for a struct key (D-0047), the `__hash__` and `__eq__` function
+    /// pointers the `_fn` entry points take; for any other key, none. A struct
+    /// key without both dunders is a clean error (needs `@derive(Hash, Eq)` or
+    /// hand-written methods).
+    fn key_fn_args(&mut self, elem: Elem) -> Result<Vec<Value>, LowerError> {
+        let Elem::Struct(sid) = elem else {
+            return Ok(vec![]);
+        };
+        let name = self.ctx.names[sid as usize].clone();
+        let hashn = format!("{name}__{}", "__hash__");
+        let eqn = format!("{name}__{}", "__eq__");
+        if !self.sigs.contains_key(&hashn) {
+            return Err(err(format!(
+                "type '{name}' needs '__hash__' to be a dict/set key \
+                 (use @derive(Hash) or define it; D-0047)"
+            )));
+        }
+        if !self.sigs.contains_key(&eqn) {
+            return Err(err(format!(
+                "type '{name}' needs '__eq__' to be a dict/set key \
+                 (use @derive(Eq) or define it; D-0047)"
+            )));
+        }
+        let hv = self.new_value(Ty::Ptr);
+        self.emit(Inst::FuncAddr {
+            dest: hv,
+            func: hashn,
+        });
+        let ev = self.new_value(Ty::Ptr);
+        self.emit(Inst::FuncAddr {
+            dest: ev,
+            func: eqn,
+        });
+        Ok(vec![hv, ev])
+    }
+
+    /// Render a struct value to a string via its `__str__` (preferred) or
+    /// `__repr__` dunder (D-0047), for `print` / string contexts.
+    fn struct_to_str(&mut self, sid: u32, v: Value) -> Result<Value, LowerError> {
+        for dunder in ["__str__", "__repr__"] {
+            let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
+            if self.sigs.contains_key(&mangled) {
+                let d = self.new_value(Ty::Ptr);
+                self.throwing_call(Some(d), &mangled, vec![v]);
+                return Ok(d);
+            }
+        }
+        Err(err(format!(
+            "cannot print a '{}' value: it defines neither '__str__' nor \
+             '__repr__' (define one or use @derive(Repr); D-0047)",
+            self.ctx.names[sid as usize]
+        )))
+    }
+
+    /// Desugar a binary operator whose left operand is a user struct to the
+    /// matching dunder (D-0047). Equality/relational operators derive from
+    /// `__eq__` / `__cmp__`; `and`/`or` use truthiness; the rest call their
+    /// arithmetic/bitwise dunder directly and take its return type.
+    fn struct_binop(
+        &mut self,
+        op: AstBin,
+        sid: u32,
+        l: Value,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        use AstBin::*;
+        let lt = Ty::Struct(sid);
+        match op {
+            Eq | Ne => {
+                let (bit, _) = self.call_dunder(sid, "__eq__", vec![(l, lt), (r, rt)])?;
+                if matches!(op, Ne) {
+                    let d = self.new_value(Ty::I1);
+                    self.emit(Inst::Un {
+                        dest: d,
+                        op: UnOp::Not,
+                        val: bit,
+                    });
+                    Ok((d, Ty::I1))
+                } else {
+                    Ok((bit, Ty::I1))
+                }
+            }
+            Lt | Le | Gt | Ge => {
+                // `a < b` -> `a.__cmp__(b) < 0`, and likewise for the others.
+                let (cmp, _) = self.call_dunder(sid, "__cmp__", vec![(l, lt), (r, rt)])?;
+                let pred = match op {
+                    Lt => CmpPred::Lt,
+                    Le => CmpPred::Le,
+                    Gt => CmpPred::Gt,
+                    Ge => CmpPred::Ge,
+                    _ => unreachable!(),
+                };
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred,
+                    lhs: cmp,
+                    rhs: zero,
+                });
+                Ok((d, Ty::I1))
+            }
+            And | Or => {
+                let lb = self.truthy(l, lt);
+                let rb = self.truthy(r, rt);
+                let irop = if matches!(op, And) {
+                    BinOp::And
+                } else {
+                    BinOp::Or
+                };
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::Bin {
+                    dest: d,
+                    op: irop,
+                    lhs: lb,
+                    rhs: rb,
+                });
+                Ok((d, Ty::I1))
+            }
+            Send => Err(err("'<-' (channel send) is not an overloadable operator")),
+            In => unreachable!("'in' dispatches on the right operand"),
+            _ => {
+                let dunder = match op {
+                    Add => "__add__",
+                    Sub => "__sub__",
+                    Mul => "__mul__",
+                    Div => "__truediv__",
+                    FloorDiv => "__floordiv__",
+                    Mod => "__mod__",
+                    Pow => "__pow__",
+                    BitAnd => "__and__",
+                    BitOr => "__or__",
+                    BitXor => "__xor__",
+                    Shl => "__lshift__",
+                    Shr => "__rshift__",
+                    _ => unreachable!(),
+                };
+                self.call_dunder(sid, dunder, vec![(l, lt), (r, rt)])
+            }
+        }
+    }
+
     fn binop(
         &mut self,
         op: AstBin,
@@ -3133,6 +3586,20 @@ impl<'a> FnLower<'a> {
             return self.array_binop(op, l, lt, r, rt);
         }
 
+        // Operator overloading on user structs (D-0047): `a op b` desugars to the
+        // matching dunder method, resolved like any struct method call. `in`
+        // dispatches on the right operand (`x in a` -> `a.__contains__(x)`); every
+        // other operator dispatches on the left.
+        if let (Ty::Struct(sid), false) = (lt, matches!(op, In)) {
+            return self.struct_binop(op, sid, l, r, rt);
+        }
+        if matches!(op, In) {
+            if let Ty::Struct(sid) = rt {
+                let (ret, rty) = self.call_dunder(sid, "__contains__", vec![(r, rt), (l, lt)])?;
+                return Ok((ret, rty));
+            }
+        }
+
         // Membership: `x in <set>` -> `zap_set_contains_*`, normalized to a bool.
         if matches!(op, In) {
             let Ty::Set(elem) = rt else {
@@ -3142,11 +3609,14 @@ impl<'a> FnLower<'a> {
                 return Err(err("'in' element has the wrong type for this set"));
             }
             let l = self.coerce(l, lt, elem.ty());
+            let kfns = self.key_fn_args(elem)?;
             let word = self.new_value(Ty::I64);
+            let mut cargs = vec![r, l];
+            cargs.extend_from_slice(&kfns);
             self.emit(Inst::Call {
                 dest: Some(word),
                 func: format!("zap_set_contains_{}", elem.key_suffix()),
-                args: vec![r, l],
+                args: cargs,
             });
             let zero = self.iconst(Ty::I64, 0);
             let d = self.new_value(Ty::I1);
@@ -3532,6 +4002,18 @@ impl<'a> FnLower<'a> {
     fn truthy(&mut self, v: Value, t: Ty) -> Value {
         if t == Ty::I1 {
             return v;
+        }
+        // Truthiness overloading on user structs (D-0047): `if a:` / `not a` /
+        // `a and b` call `a.__bool__()` when defined. A struct with no `__bool__`
+        // is a non-null object, so it is truthy.
+        if let Ty::Struct(sid) = t {
+            let mangled = format!("{}__{}", self.ctx.names[sid as usize], "__bool__");
+            if self.sigs.contains_key(&mangled) {
+                let d = self.new_value(Ty::I1);
+                self.throwing_call(Some(d), &mangled, vec![v]);
+                return d;
+            }
+            return self.iconst(Ty::I1, 1);
         }
         if matches!(t, Ty::Match | Ty::Ptr | Ty::Py) {
             // Reference types are truthy when non-null. Codegen's `ICmp` only
