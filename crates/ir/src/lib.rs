@@ -819,4 +819,104 @@ def main():
             "a non-iterable struct in `for` should be rejected"
         );
     }
+
+    // --- value structs (#65, D-0051) ---
+
+    /// Count `StructNew` instructions in a function (each is one aggregate
+    /// allocation / copy).
+    fn structnews(f: &Func) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::StructNew { .. }))
+            .count()
+    }
+
+    const VEC2: &str = "value struct Vec2:\n    f64 x\n    f64 y\n\
+                        \x20   def len2(self) -> f64:\n        return self.x * self.x + self.y * self.y\n";
+    const PT: &str = "struct Pt:\n    f64 x\n    f64 y\n";
+
+    #[test]
+    fn value_struct_layout_is_flagged() {
+        // The `value` modifier is tracked end-to-end onto the ZIR layout
+        // (D-0051); a plain struct stays a reference type.
+        let m = lower_ok(&format!(
+            "{VEC2}{PT}\ndef main():\n    auto v = Vec2(x=1.0, y=2.0)\n    print(v.len2())\n"
+        ));
+        let vec2 = m.structs.iter().find(|s| s.name == "Vec2").expect("Vec2");
+        let pt = m.structs.iter().find(|s| s.name == "Pt").expect("Pt");
+        assert!(vec2.is_value, "Vec2 should be a value struct");
+        assert!(!pt.is_value, "plain struct Pt should be a reference type");
+        assert_eq!(vec2.fields, vec![Ty::F64, Ty::F64]);
+    }
+
+    #[test]
+    fn value_struct_copies_on_assignment() {
+        // `b = a` for a value struct copies it (extra StructNew + field copies),
+        // so mutating `b` cannot escape to `a`. A reference struct shares the
+        // pointer (no copy).
+        let value_src = format!(
+            "{VEC2}\ndef main():\n    auto a = Vec2(x=1.0, y=2.0)\n    auto b = a\n    print(b.len2())\n"
+        );
+        let ref_src = format!(
+            "{PT}\ndef main():\n    auto a = Pt(x=1.0, y=2.0)\n    auto b = a\n    print(a.x)\n"
+        );
+        let vm = lower_ok(&value_src);
+        let rm = lower_ok(&ref_src);
+        let vmain = vm.funcs.iter().find(|f| f.name == "main").unwrap();
+        let rmain = rm.funcs.iter().find(|f| f.name == "main").unwrap();
+        // Value: one StructNew for the constructor + one for the copy at `b = a`.
+        assert_eq!(
+            structnews(vmain),
+            2,
+            "value-struct assignment should emit a copy"
+        );
+        // Reference: just the constructor; assignment copies the pointer only.
+        assert_eq!(
+            structnews(rmain),
+            1,
+            "reference-struct assignment must not copy"
+        );
+    }
+
+    #[test]
+    fn value_struct_copies_on_pass_and_return() {
+        // Passing a value struct by value copies it (callee cannot mutate the
+        // caller's), and returning one copies it out of the callee's frame.
+        let m = lower_ok(&format!(
+            "{VEC2}\ndef scale(Vec2 v) -> Vec2:\n    return v\n\
+             def main():\n    auto a = Vec2(x=1.0, y=2.0)\n    auto b = scale(a)\n    print(b.len2())\n"
+        ));
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let scale = m.funcs.iter().find(|f| f.name == "scale").unwrap();
+        // main: construct `a` + copy at the `scale(a)` argument + copy at `b = ...`
+        // (the call result is fresh, so `auto b = scale(a)` would normally not
+        // copy; the argument copy is the by-value pass).
+        assert!(
+            structnews(main) >= 2,
+            "passing a value struct by value should copy the argument"
+        );
+        // scale: returning `v` (an lvalue) copies it out.
+        assert_eq!(
+            structnews(scale),
+            1,
+            "returning a value struct should copy it out of the frame"
+        );
+    }
+
+    #[test]
+    fn value_struct_boxed_into_list() {
+        // Storing a value struct into a collection boxes it (heap copy, D-0051),
+        // so the stored element is independent of the original.
+        let m = lower_ok(&format!(
+            "{VEC2}\ndef main():\n    auto a = Vec2(x=1.0, y=2.0)\n    auto xs = [a]\n    print(len(xs))\n"
+        ));
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        // construct `a` + box-copy on insertion into the list.
+        assert_eq!(
+            structnews(main),
+            2,
+            "storing a value struct in a list should box (copy) it"
+        );
+    }
 }

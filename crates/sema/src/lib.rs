@@ -364,6 +364,10 @@ impl EnumInfo {
 struct StructInfo {
     /// Source method name -> signature (`self` is the first parameter).
     methods: HashMap<String, FnSig>,
+    /// `true` for a `value struct` (D-0051): value semantics (copied on
+    /// assign/pass/return, no shared identity), laid out inline. A plain
+    /// `struct` is a reference type (D-0023) with `is_value == false`.
+    is_value: bool,
 }
 
 impl StructInfo {
@@ -383,6 +387,7 @@ pub fn check(module: &Module) -> Vec<TypeError> {
 pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
     let mut c = Checker::new();
     c.collect_types(module);
+    c.check_value_struct_recursion(module);
     c.collect_sigs(module);
     c.validate_decorators(module);
     c.check_module(module);
@@ -645,7 +650,95 @@ impl Checker {
                 .entry("__repr__".into())
                 .or_insert_with(|| unary(Ty::Str));
         }
-        StructInfo { methods }
+        StructInfo {
+            methods,
+            is_value: s.is_value,
+        }
+    }
+
+    /// Is `name` a `value struct` (value type, D-0051)?
+    fn is_value_struct(&self, name: &str) -> bool {
+        self.structs.get(name).is_some_and(|s| s.is_value)
+    }
+
+    /// A `value struct` is laid out inline (D-0051), so it cannot contain itself
+    /// by value — directly or through a chain of value-struct fields — as that
+    /// would be an infinitely large aggregate. (A plain/reference `struct` field,
+    /// a `list`/`dict`/`set`, or any other pointer-backed type breaks the chain,
+    /// so recursive *reference* types remain fine, D-0023.) Report a clear error
+    /// on each value struct that lies on such a cycle.
+    fn check_value_struct_recursion(&mut self, module: &Module) {
+        // Direct value-struct → value-struct field edges (by type name), with the
+        // field span for diagnostics.
+        let mut edges: HashMap<String, Vec<(String, Span)>> = HashMap::new();
+        for item in &module.items {
+            if let Item::Struct(s) = item {
+                if !s.is_value {
+                    continue;
+                }
+                let mut es = Vec::new();
+                for f in &s.fields {
+                    if let Type::Named { name, .. } = &f.ty {
+                        if self.is_value_struct(name) {
+                            es.push((name.clone(), f.span));
+                        }
+                    }
+                }
+                edges.insert(s.name.clone(), es);
+            }
+        }
+        // DFS from each value struct; a back-edge to a node on the current stack
+        // is a cycle. Report once per struct that participates in one.
+        let mut reported: HashSet<String> = HashSet::new();
+        let roots: Vec<String> = edges.keys().cloned().collect();
+        for root in roots {
+            let mut stack: Vec<String> = Vec::new();
+            let mut on_stack: HashSet<String> = HashSet::new();
+            self.detect_value_cycle(&root, &edges, &mut stack, &mut on_stack, &mut reported);
+        }
+    }
+
+    fn detect_value_cycle(
+        &mut self,
+        node: &str,
+        edges: &HashMap<String, Vec<(String, Span)>>,
+        stack: &mut Vec<String>,
+        on_stack: &mut HashSet<String>,
+        reported: &mut HashSet<String>,
+    ) {
+        if on_stack.contains(node) {
+            if !reported.contains(node) {
+                reported.insert(node.to_string());
+                // Blame the field that re-enters the cycle, if we can find it.
+                let span = stack
+                    .last()
+                    .and_then(|p| edges.get(p))
+                    .and_then(|es| es.iter().find(|(n, _)| n == node))
+                    .map(|(_, sp)| *sp)
+                    .unwrap_or_default();
+                self.error(
+                    format!(
+                        "value struct '{node}' cannot contain itself by value \
+                         (an inline value type would be infinitely large); use a \
+                         plain (reference) struct for a recursive type (D-0051)"
+                    ),
+                    span,
+                );
+            }
+            return;
+        }
+        if reported.contains(node) {
+            return;
+        }
+        stack.push(node.to_string());
+        on_stack.insert(node.to_string());
+        if let Some(es) = edges.get(node) {
+            for (next, _) in es.clone() {
+                self.detect_value_cycle(&next, edges, stack, on_stack, reported);
+            }
+        }
+        stack.pop();
+        on_stack.remove(node);
     }
 
     /// A struct method's signature, mapping the `self` receiver and any `Self`
@@ -3408,5 +3501,64 @@ def main():
         ok(&format!(
             "{RANGE_SRC}\ndef main():\n    auto r = Range(lo=0, hi=5)\n    if 3 in r:\n        print(1)\n"
         ));
+    }
+
+    // --- value structs (#65, D-0051) ---
+
+    #[test]
+    fn value_struct_type_checks_like_a_struct() {
+        // A `value struct` type-checks exactly like a reference struct: methods,
+        // construction, and field access all work (the kind only changes value
+        // semantics, D-0051).
+        ok("value struct Vec2:\n    f64 x\n    f64 y\n\
+            \x20   def len2(self) -> f64:\n        return self.x * self.x + self.y * self.y\n\
+            def main():\n    auto v = Vec2(x=3.0, y=4.0)\n    auto w = v\n    print(w.len2())\n");
+    }
+
+    #[test]
+    fn value_struct_operators_and_derive_work() {
+        // Operator overloading (D-0047) and `@derive` work identically on a value
+        // struct: `==` resolves to the derived `__eq__`, and the value struct can
+        // be used as a dict key (Eq + Hash).
+        ok("@derive(Eq, Hash)\nvalue struct Key:\n    int64 a\n    int64 b\n\
+            def main():\n    auto k = Key(a=1, b=2)\n    auto d = {k: 10}\n    if k == k:\n        print(1)\n");
+    }
+
+    #[test]
+    fn value_struct_direct_recursion_errors() {
+        // A value struct cannot contain itself by value (infinite inline size).
+        let e = errors("value struct Node:\n    int64 v\n    Node next\n");
+        assert_eq!(e.len(), 1, "expected one recursion error, got {e:?}");
+        assert!(
+            e[0].message.contains("cannot contain itself by value"),
+            "message was: {}",
+            e[0].message
+        );
+    }
+
+    #[test]
+    fn value_struct_indirect_recursion_errors() {
+        // An indirect cycle through another value struct is also rejected.
+        let e = errors("value struct A:\n    B b\n\nvalue struct B:\n    A a\n");
+        assert!(
+            !e.is_empty()
+                && e.iter()
+                    .any(|x| x.message.contains("cannot contain itself by value")),
+            "expected an indirect-recursion error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn reference_struct_recursion_is_allowed() {
+        // A plain (reference) struct may be recursive — the field is a pointer
+        // (D-0023), so no infinite-size problem.
+        ok("struct Node:\n    int64 v\n    Node next\n");
+    }
+
+    #[test]
+    fn value_struct_holding_a_reference_struct_is_fine() {
+        // A value struct may hold a reference-struct field (a pointer); that does
+        // not make it infinitely sized.
+        ok("struct Ref:\n    int64 n\n\nvalue struct Holder:\n    Ref r\n    int64 k\n");
     }
 }

@@ -100,6 +100,10 @@ pub struct StructDef {
     pub generics: Vec<String>,
     pub fields: Vec<Field>,
     pub methods: Vec<Function>,
+    /// `true` for a `value struct` (opt-in value type, D-0051): copied on
+    /// assign/pass/return, laid out inline (no heap header). A plain `struct`
+    /// stays a reference type (D-0023) and has `is_value == false`.
+    pub is_value: bool,
     pub span: Span,
 }
 
