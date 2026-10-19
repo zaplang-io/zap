@@ -8,8 +8,8 @@ pub mod ir;
 pub mod lower;
 
 pub use ir::{
-    BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem, Func, Inst, Module, Term, Ty, UnOp,
-    Value,
+    BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem, Func, Inst, Module, Owner, Term, Ty,
+    UnOp, Value,
 };
 pub use lower::{lower_module, LowerError};
 
@@ -488,11 +488,42 @@ mod tests {
             .iter()
             .flat_map(|b| &b.insts)
             .find_map(|i| match i {
-                Inst::Spawn { func, args } => Some((func.clone(), args.len())),
+                Inst::Spawn { func, args, owner } => Some((func.clone(), args.len(), *owner)),
                 _ => None,
             })
             .expect("a Spawn instruction");
-        assert_eq!(spawn, ("f".to_string(), 2));
+        // A bare `spawn` (no enclosing `scope:`) is owned by the root scope.
+        assert_eq!(spawn, ("f".to_string(), 2, Owner::Root));
+    }
+
+    #[test]
+    fn scope_spawn_detached_ownership() {
+        // A `spawn` inside a `scope:` is owned by that scope's handle; `spawn
+        // detached` is owned by nothing; a bare `spawn` by the root (D-0044).
+        let m = lower_ok(
+            "def f():\n    print(1)\n\ndef main():\n    scope:\n        spawn f()\n    spawn detached f()\n    spawn f()\n",
+        );
+        let text = format!("{m}");
+        // The scope opens with a scope_enter handle and joins with scope_exit.
+        assert!(text.contains("call @zap_scope_enter("), "text:\n{text}");
+        assert!(text.contains("@zap_scope_exit("), "text:\n{text}");
+        let main = m.funcs.iter().find(|f| f.name == "main").expect("main");
+        let owners: Vec<Owner> = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Spawn { owner, .. } => Some(*owner),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(owners.len(), 3, "three spawns");
+        assert!(
+            matches!(owners[0], Owner::Scope(_)),
+            "the scoped spawn is owned by the scope"
+        );
+        assert_eq!(owners[1], Owner::Detached, "the detached spawn");
+        assert_eq!(owners[2], Owner::Root, "the root-scoped spawn");
     }
 
     #[test]

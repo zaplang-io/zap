@@ -652,6 +652,7 @@ impl Parser {
                     | Keyword::Match
                     | Keyword::Try
                     | Keyword::With
+                    | Keyword::Scope
             )
         )
     }
@@ -665,7 +666,27 @@ impl Parser {
             TokenKind::Keyword(Keyword::Match) => self.parse_match(),
             TokenKind::Keyword(Keyword::Try) => self.parse_try(),
             TokenKind::Keyword(Keyword::With) => self.parse_with(),
+            TokenKind::Keyword(Keyword::Scope) => self.parse_scope(),
             _ => unreachable!("parse_compound called on non-compound token"),
+        }
+    }
+
+    /// `scope [ ( opts ) ]: BLOCK` (D-0044/D-0045). The optional parenthesized
+    /// `opts` configure the failure policy / deadline (`on_error=`, `timeout=`);
+    /// the block owns every `spawn` lexically inside it.
+    fn parse_scope(&mut self) -> Stmt {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::Scope, "'scope'");
+        let opts = if self.eat(&TokenKind::LParen) {
+            self.parse_args()
+        } else {
+            Vec::new()
+        };
+        let body = self.parse_block();
+        Stmt::Scope {
+            opts,
+            body,
+            span: self.span_from(start),
         }
     }
 
@@ -903,9 +924,19 @@ impl Parser {
             return Stmt::Continue(self.span_from(start));
         }
         if self.eat_kw(Keyword::Spawn) {
+            // `detached` is a contextual modifier (D-0044), not a reserved word:
+            // valid only immediately after `spawn` and only when it introduces a
+            // call (`spawn detached f(...)`). A bare `detached` identifier that is
+            // itself the callee (`spawn detached()`) stays an ordinary call.
+            let detached = matches!(self.peek(), TokenKind::Ident(n) if n == "detached")
+                && !matches!(self.peek2(), TokenKind::LParen);
+            if detached {
+                self.bump();
+            }
             let call = self.parse_expr();
             return Stmt::Spawn {
                 call,
+                detached,
                 span: self.span_from(start),
             };
         }
@@ -1990,6 +2021,45 @@ mod tests {
             }
             _ => panic!("expected function"),
         }
+    }
+
+    #[test]
+    fn scope_block_and_spawn_detached_parse() {
+        // `scope(...)` parses as a compound statement owning a `spawn`; the inner
+        // `spawn` is not detached, while `spawn detached` sets the modifier and
+        // `spawn detached()` (a call to a fn literally named `detached`) does not
+        // (ticket #50, D-0044).
+        let m = parse_ok(
+            "def main():\n    scope(on_error=OnError.Wait):\n        spawn f()\n        spawn detached g()\n    spawn detached h()\n    spawn detached()\n",
+        );
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected function");
+        };
+        let stmts = &f.body.stmts;
+        match &stmts[0] {
+            Stmt::Scope { opts, body, .. } => {
+                assert_eq!(opts.len(), 1);
+                assert_eq!(opts[0].name.as_deref(), Some("on_error"));
+                assert!(matches!(
+                    &body.stmts[0],
+                    Stmt::Spawn {
+                        detached: false,
+                        ..
+                    }
+                ));
+                assert!(matches!(&body.stmts[1], Stmt::Spawn { detached: true, .. }));
+            }
+            other => panic!("expected a scope statement, got {other:?}"),
+        }
+        assert!(matches!(&stmts[1], Stmt::Spawn { detached: true, .. }));
+        // `spawn detached()` — `detached` is the callee, not the modifier.
+        assert!(matches!(
+            &stmts[2],
+            Stmt::Spawn {
+                detached: false,
+                ..
+            }
+        ));
     }
 
     #[test]
