@@ -482,6 +482,42 @@ pub enum Inst {
         dest: Value,
         func: String,
     },
+    /// Materialize an **interface value** (the `{data, itable}` fat pointer,
+    /// D-0016, `design/0006` §2.4): wrap a concrete instance `data` as a value of
+    /// interface `iid`. `dest : Struct(fat_sid)` is the interface's synthetic
+    /// inline `{ptr data, ptr itable}` aggregate (see [`Module::interfaces`]);
+    /// `itable` is the static dispatch table for the `(concrete_sid, iid)` pair
+    /// that codegen builds once. `data` is the underlying instance pointer (a
+    /// reference struct — a `value struct` is boxed to the heap first, I#75).
+    IfaceMake {
+        dest: Value,
+        data: Value,
+        iid: u32,
+        concrete_sid: u32,
+    },
+    /// **Dynamic dispatch** through an interface value (D-0016): load method slot
+    /// `method` (interface-declaration order) from `iface`'s itable and call it
+    /// with the fat pointer's `data` as `self`. The callee signature is the
+    /// interface method's (`Module::interfaces[iid].methods[method]`). The plain
+    /// form; the exception-edge form is [`Inst::IfaceInvoke`].
+    IfaceCall {
+        dest: Option<Value>,
+        iface: Value,
+        iid: u32,
+        method: u32,
+        args: Vec<Value>,
+    },
+    /// Like [`Inst::IfaceCall`] but on the exception edge (inside a `try`): an
+    /// interface method that unwinds transfers to the landing-pad block `unwind`,
+    /// mirroring [`Inst::Invoke`] vs [`Inst::Call`].
+    IfaceInvoke {
+        dest: Option<Value>,
+        iface: Value,
+        iid: u32,
+        method: u32,
+        args: Vec<Value>,
+        unwind: BlockId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -552,10 +588,38 @@ pub struct StructLayout {
     pub inline: bool,
 }
 
+/// One method slot of an interface's dispatch table (D-0016), in interface
+/// declaration order. The signature is the **interface's** declared signature
+/// (every implementor matches it structurally), used by codegen to build the
+/// indirect-call function type for dynamic dispatch. `params` excludes the
+/// implicit `self` (which is always the leading `ptr`).
+#[derive(Clone, Debug)]
+pub struct IfaceMethod {
+    pub name: String,
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+}
+
+/// A structural interface's runtime representation (D-0016, `design/0006` §2.4).
+/// An interface *value* is a `{data, itable}` fat pointer, realized as the
+/// synthetic inline `{ptr, ptr}` struct layout `fat_sid` (indexes
+/// [`Module::structs`]); `methods` is the dispatch-table slot order.
+#[derive(Clone, Debug)]
+pub struct InterfaceLayout {
+    pub name: String,
+    pub methods: Vec<IfaceMethod>,
+    /// The `{ptr data, ptr itable}` inline struct layout that an interface value
+    /// of this interface has as its ZIR type.
+    pub fat_sid: u32,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Module {
     pub structs: Vec<StructLayout>,
     pub funcs: Vec<Func>,
+    /// Structural interfaces (D-0016); indexed by interface id (`iid`). Empty
+    /// when the program declares no interfaces.
+    pub interfaces: Vec<InterfaceLayout>,
 }
 
 // --- textual form (for `zapc ir` and tests) ---
@@ -714,6 +778,46 @@ fn fmt_inst(i: &Inst) -> String {
             format!("spawn{own} @{func}({})", a.join(", "))
         }
         Inst::FuncAddr { dest, func } => format!("%{dest} = funcaddr @{func}"),
+        Inst::IfaceMake {
+            dest,
+            data,
+            iid,
+            concrete_sid,
+        } => {
+            format!("%{dest} = ifacemake iface#{iid} struct#{concrete_sid} %{data}")
+        }
+        Inst::IfaceCall {
+            dest,
+            iface,
+            iid,
+            method,
+            args,
+        } => {
+            let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
+            let call = format!("ifacecall iface#{iid}.{method} %{iface}({})", a.join(", "));
+            match dest {
+                Some(d) => format!("%{d} = {call}"),
+                None => call,
+            }
+        }
+        Inst::IfaceInvoke {
+            dest,
+            iface,
+            iid,
+            method,
+            args,
+            unwind,
+        } => {
+            let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
+            let call = format!(
+                "ifaceinvoke iface#{iid}.{method} %{iface}({}) unwind block{unwind}",
+                a.join(", ")
+            );
+            match dest {
+                Some(d) => format!("%{d} = {call}"),
+                None => call,
+            }
+        }
     }
 }
 
