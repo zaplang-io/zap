@@ -1,20 +1,32 @@
 [package]
 name = "zapc"
-description = "The Zap compiler driver (CLI)."
+description = "The Zap toolchain: the user-facing `zap` CLI and the internal `zapc` compiler it drives."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+# Shared compile pipeline + CLI, used by both binaries below.
+[lib]
+name = "zapc"
+path = "src/lib.rs"
+
+# `zap` — the user-facing CLI (D-0053).
+[[bin]]
+name = "zap"
+path = "src/bin/zap.rs"
+
+# `zapc` — the internal compiler the `zap` driver invokes. Kept as its own
+# binary so existing flows (`cargo run -p zapc`, the golden harness) still work.
 [[bin]]
 name = "zapc"
-path = "src/main.rs"
+path = "src/bin/zapc.rs"
 
 [dependencies]
 zapc_syntax = { path = "../syntax" }
 zapc_sema = { path = "../sema" }
 zapc_ir = { path = "../ir" }
-# Codegen needs LLVM; gated behind the `llvm` feature so the driver builds
+# Codegen needs LLVM; gated behind the `llvm` feature so the toolchain builds
 # without LLVM on hosts that lack it.
 zapc_codegen = { path = "../codegen", optional = true }
 
