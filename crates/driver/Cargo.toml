@@ -32,3 +32,7 @@ zapc_codegen = { path = "../codegen", optional = true }
 
 [features]
 llvm = ["dep:zapc_codegen"]
+# Build programs with the precise Immix GC (ticket #48) instead of Boehm.
+# Implies `llvm` (the GC choice only affects native codegen). Exercised by the
+# `full` CI check's second suite run; see design/0008-precise-gc.md.
+gc-immix = ["llvm", "zapc_codegen/gc-immix"]

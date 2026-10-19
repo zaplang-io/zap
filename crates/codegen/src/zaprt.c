@@ -15,6 +15,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#ifndef ZAP_GC_IMMIX
 /* `GC_THREADS` must be defined before <gc.h> so the collector is built/used in
  * its thread-aware mode (ticket #25, D-0009/D-0013): it then knows about every
  * goroutine OS thread and scans each one's stack and registers, so live objects
@@ -25,6 +26,29 @@
  * support, and the program links `-lpthread` (see build_executable). */
 #define GC_THREADS
 #include <gc.h>
+#else
+/* Precise Immix GC build (ticket #48, design/0008-precise-gc.md): no Boehm. The
+ * scheduler's conservative-GC hooks below (thread registration, stack-bottom
+ * tracking, the alloc lock) become inert shims — the precise collector finds
+ * roots via the per-coroutine shadow stack, so it needs neither stack scanning
+ * nor bdwgc's pthread wrappers. The collector itself is #included at the bottom
+ * of this file. */
+#include <stdint.h>
+#define GC_pthread_create pthread_create
+#define GC_pthread_join pthread_join
+#define GC_call_with_alloc_lock(fn, arg) ((fn)(arg))
+struct GC_stack_base {
+    void *mem_base;
+};
+static void *GC_get_my_stackbottom(struct GC_stack_base *sb) {
+    sb->mem_base = NULL;
+    return NULL;
+}
+static void GC_set_stackbottom(void *h, struct GC_stack_base *sb) {
+    (void)h;
+    (void)sb;
+}
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -44,24 +68,145 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 
+/* ===========================================================================
+ * GC abstraction (ticket #48). The runtime and codegen allocate through a
+ * small, GC-agnostic surface so the Boehm (default) and precise Immix
+ * (`gc-immix`) collectors are interchangeable behind the same call sites:
+ *
+ *   zap_alloc_desc(desc) — a fixed-size object described by `desc` (codegen
+ *       structs, and the runtime's own collection headers).
+ *   zap_obj(desc)        — runtime-internal alias of zap_alloc_desc.
+ *   zap_buf(n)           — an n-byte leaf buffer with no pointers (string data,
+ *       numeric array data, and container element/entry buffers, whose pointer
+ *       interiors the owning container traces precisely under Immix).
+ *   zap_ptrbuf(n)        — an n-byte buffer that MAY hold pointer words. Under
+ *       Boehm it is conservatively scanned; under Immix the owning container
+ *       traces it precisely, so it is allocated as a leaf.
+ *
+ * The TypeDesc is the shared layout contract: codegen emits one per user struct
+ * (kind PRECISE with the pointer field byte-offsets); the runtime defines the
+ * CONTAINER descriptors below. Both collectors read `.size`; only Immix reads
+ * the trace fields. The kind codes are shared so both builds compile. */
+typedef struct ZapTypeDesc {
+    int64_t size;               /* payload bytes for a fixed-size object        */
+    int32_t kind;               /* ZAP_TD_* (see below)                         */
+    int32_t n_ptrs;             /* PRECISE: number of pointer offsets           */
+    const int32_t *ptr_offsets; /* PRECISE: pointer field byte offsets in payload */
+} ZapTypeDesc;
+
+enum {
+    ZAP_TD_PRECISE = 0,
+    ZAP_TD_ATOMIC = 1,
+    ZAP_TD_LIST = 2,
+    ZAP_TD_DICT = 3,
+    ZAP_TD_SET = 4,
+    ZAP_TD_HEAP = 5,
+    ZAP_TD_CHAN = 6,
+    ZAP_TD_ARRAY = 7,
+    ZAP_TD_GSTACK = 8,
+    ZAP_TD_MATCH = 9,  /* ZapMatch (regex): groups/names buffers of ZapStr*     */
+    ZAP_TD_SCOPE = 10  /* Scope: excs buffer of ZapStr* pending failures        */
+};
+
+/* Runtime-internal container descriptors (defined at the bottom of this file). */
+extern const ZapTypeDesc zap_desc_atomic;
+extern const ZapTypeDesc zap_desc_list;
+extern const ZapTypeDesc zap_desc_dict;
+extern const ZapTypeDesc zap_desc_set;
+extern const ZapTypeDesc zap_desc_heap;
+extern const ZapTypeDesc zap_desc_chan;
+extern const ZapTypeDesc zap_desc_array;
+extern const ZapTypeDesc zap_desc_scope;
+extern const ZapTypeDesc zap_desc_gstack;
+extern const ZapTypeDesc zap_desc_strobj;  /* ZapStr header (one ptr: data)     */
+extern const ZapTypeDesc zap_desc_matchobj;
+extern const ZapTypeDesc zap_desc_pyobj;
+extern const ZapTypeDesc zap_desc_gobj;    /* scheduler G (precise)             */
+extern const ZapTypeDesc zap_desc_ptrs;    /* a generic array-of-pointers buffer */
+
+#ifdef ZAP_GC_IMMIX
+/* Precise collector entry points (defined in zapgc.inc.c, #included below). */
+void *zap_gc_alloc(const ZapTypeDesc *desc);
+void *zap_gc_alloc_atomic(int64_t size);
+void *zap_gc_alloc_var(const ZapTypeDesc *desc, int64_t size);
+void zap_safepoint(void);
+void zap_gc_add_root(void **slot);
+void zap_gc_add_root_fn(void (*fn)(void));
+void zap_gc_mark(void *payload);
+void zap_gc_collect(void);
+extern __thread void *zap_shadow_head;
+extern void *zap_main_shadow_head;
+static void zap_enter_blocking(void); /* fwd (defined in zapgc.inc.c)           */
+static void zap_leave_blocking(void);
+static void zap_mutator_register(void);
+
+static inline void *zap_alloc_desc(const ZapTypeDesc *d) { return zap_gc_alloc(d); }
+static inline void *zap_obj(const ZapTypeDesc *d) { return zap_gc_alloc(d); }
+static inline void *zap_buf(int64_t n) { return zap_gc_alloc_atomic(n); }
+static inline void *zap_ptrbuf(int64_t n) { return zap_gc_alloc_atomic(n); }
+/* Scheduler infrastructure arrays (g_ps/g_ms/g_all) are read by the collector
+ * directly via C globals, not traced as Zap objects, so they use plain malloc
+ * and live for the program's lifetime. */
+#define ZAP_INFRA_ALLOC(n) malloc(n)
+#define GC_register_finalizer(obj, fn, cd, ofn, ocd)                           \
+    ((void)(obj), (void)(fn), (void)(cd), (void)(ofn), (void)(ocd))
+#else
+/* Boehm: a safepoint is a no-op, roots are found conservatively, and every
+ * allocation routes to GC_MALLOC / GC_MALLOC_ATOMIC. `desc` carries the size. */
+#define zap_safepoint() ((void)0)
+#define zap_enter_blocking() ((void)0)
+#define zap_leave_blocking() ((void)0)
+#define zap_mutator_register() ((void)0)
+#define zap_gc_add_root(slot) ((void)(slot))
+#define zap_gc_add_root_fn(fn) ((void)(fn))
+#define zap_gc_mark(p) ((void)(p))
+static inline void *zap_alloc_desc(const ZapTypeDesc *d) {
+    return GC_MALLOC((size_t)d->size);
+}
+static inline void *zap_obj(const ZapTypeDesc *d) { return GC_MALLOC((size_t)d->size); }
+static inline void *zap_buf(int64_t n) { return GC_MALLOC_ATOMIC((size_t)n); }
+static inline void *zap_ptrbuf(int64_t n) { return GC_MALLOC((size_t)n); }
+#define ZAP_INFRA_ALLOC(n) GC_MALLOC(n)
+#endif
+
 typedef struct {
     int64_t len;
     const char *data;
 } ZapStr;
 
-/* Initialize the Boehm collector exactly once, before any Zap code runs. */
+/* Runtime startup: initialize the collector before any Zap code runs. Under
+ * Boehm this is `GC_INIT`; under Immix it registers the main OS thread (which
+ * runs top-level Zap) as a mutator for the stop-the-world handshake. */
 __attribute__((constructor)) static void zap_gc_init(void) {
+#ifdef ZAP_GC_IMMIX
+    zap_mutator_register();
+#else
     GC_INIT();
+#endif
 }
 
-/* Allocate `size` zeroed, pointer-scanned bytes via the GC. */
+/* Legacy untyped allocation. Retained for ABI/source stability; under the
+ * precise collector every real allocation is descriptor-typed (codegen emits a
+ * descriptor for structs and closures), so this is used only for the Boehm
+ * build. */
 void *zap_alloc(int64_t size) {
+#ifdef ZAP_GC_IMMIX
+    /* No descriptor: treat as a pointer-free leaf. Codegen does not emit raw
+     * zap_alloc under gc-immix (it calls zap_alloc_desc), so this is a safety
+     * net rather than a hot path. */
+    return zap_gc_alloc_atomic(size);
+#else
     return GC_MALLOC((size_t)size);
+#endif
 }
+
+/* Descriptor-typed allocation the compiler calls for struct / closure objects
+ * (ticket #48). Exposed with C linkage so codegen can declare and call it. */
+void *zap_alloc_typed(const ZapTypeDesc *desc) { return zap_alloc_desc(desc); }
 
 void *zap_str_new(const char *data, int64_t len) {
-    ZapStr *s = (ZapStr *)GC_MALLOC(sizeof(ZapStr));
-    char *buf = (char *)GC_MALLOC_ATOMIC((size_t)len);
+    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
+    char *buf = (char *)zap_buf((size_t)len);
     if (len > 0) {
         memcpy(buf, data, (size_t)len);
     }
@@ -74,10 +219,10 @@ void *zap_str_concat(void *a, void *b) {
     ZapStr *x = (ZapStr *)a;
     ZapStr *y = (ZapStr *)b;
     int64_t n = x->len + y->len;
-    char *buf = (char *)GC_MALLOC_ATOMIC((size_t)n);
+    char *buf = (char *)zap_buf((size_t)n);
     memcpy(buf, x->data, (size_t)x->len);
     memcpy(buf + x->len, y->data, (size_t)y->len);
-    ZapStr *s = (ZapStr *)GC_MALLOC(sizeof(ZapStr));
+    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
     s->len = n;
     s->data = buf;
     return s;
@@ -168,10 +313,11 @@ typedef struct {
     int64_t len;
     int64_t cap;
     int64_t *data; /* `cap` element words */
+    uint8_t elem_ptr; /* 1 iff elements are GC pointers (set by _ptr push) */
 } ZapList;
 
 void *zap_list_new(void) {
-    ZapList *l = (ZapList *)GC_MALLOC(sizeof(ZapList));
+    ZapList *l = (ZapList *)zap_obj(&zap_desc_list);
     l->len = 0;
     l->cap = 0;
     l->data = NULL;
@@ -180,7 +326,7 @@ void *zap_list_new(void) {
 
 static void zap_list_grow(ZapList *l) {
     int64_t cap = l->cap < 4 ? 4 : l->cap * 2;
-    int64_t *data = (int64_t *)GC_MALLOC((size_t)cap * sizeof(int64_t));
+    int64_t *data = (int64_t *)zap_ptrbuf((int64_t)cap * (int64_t)sizeof(int64_t));
     if (l->len > 0) {
         memcpy(data, l->data, (size_t)l->len * sizeof(int64_t));
     }
@@ -207,6 +353,7 @@ static int64_t zap_list_at(ZapList *l, int64_t i) {
 
 void zap_list_push_i64(void *l, int64_t v) { zap_list_push((ZapList *)l, v); }
 void zap_list_push_ptr(void *l, void *v) {
+    ((ZapList *)l)->elem_ptr = 1; /* precise GC: elements are pointers (#48) */
     zap_list_push((ZapList *)l, (int64_t)(intptr_t)v);
 }
 int64_t zap_list_get_i64(void *l, int64_t i) { return zap_list_at((ZapList *)l, i); }
@@ -218,6 +365,7 @@ void zap_list_set_i64(void *l, int64_t i, int64_t v) {
     ((ZapList *)l)->data[i] = v;
 }
 void zap_list_set_ptr(void *l, int64_t i, void *v) {
+    ((ZapList *)l)->elem_ptr = 1;
     (void)zap_list_at((ZapList *)l, i); /* bounds-check */
     ((ZapList *)l)->data[i] = (int64_t)(intptr_t)v;
 }
@@ -248,10 +396,12 @@ typedef struct {
     ZapEntry *entries;
     void *hashfn; /* struct keys only (KEY_FN): the type's __hash__ / __eq__ */
     void *eqfn;
+    uint8_t key_ptr; /* keys are GC pointers (str/struct) */
+    uint8_t val_ptr; /* values are GC pointers */
 } ZapDict;
 
 void *zap_dict_new(void) {
-    ZapDict *d = (ZapDict *)GC_MALLOC(sizeof(ZapDict));
+    ZapDict *d = (ZapDict *)zap_obj(&zap_desc_dict);
     d->len = 0;
     d->cap = 0;
     d->entries = NULL;
@@ -336,7 +486,7 @@ int64_t zap_str_cmp(void *ap, void *bp) {
 
 static void zap_dict_resize(ZapDict *d, int keykind) {
     int64_t ncap = d->cap < 8 ? 8 : d->cap * 2;
-    ZapEntry *ne = (ZapEntry *)GC_MALLOC((size_t)ncap * sizeof(ZapEntry));
+    ZapEntry *ne = (ZapEntry *)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapEntry));
     for (int64_t i = 0; i < ncap; i++) {
         ne[i].state = SLOT_EMPTY;
     }
@@ -408,12 +558,16 @@ void zap_dict_set_i64_i64(void *d, int64_t k, int64_t v) {
     zap_dict_set(d, k, KEY_I64, v);
 }
 void zap_dict_set_i64_ptr(void *d, int64_t k, void *v) {
+    ((ZapDict *)d)->val_ptr = 1;
     zap_dict_set(d, k, KEY_I64, (int64_t)(intptr_t)v);
 }
 void zap_dict_set_str_i64(void *d, void *k, int64_t v) {
+    ((ZapDict *)d)->key_ptr = 1;
     zap_dict_set(d, (int64_t)(intptr_t)k, KEY_STR, v);
 }
 void zap_dict_set_str_ptr(void *d, void *k, void *v) {
+    ((ZapDict *)d)->key_ptr = 1;
+    ((ZapDict *)d)->val_ptr = 1;
     zap_dict_set(d, (int64_t)(intptr_t)k, KEY_STR, (int64_t)(intptr_t)v);
 }
 int64_t zap_dict_get_i64_i64(void *d, int64_t k) {
@@ -434,12 +588,15 @@ void *zap_dict_get_str_ptr(void *d, void *k) {
  * and `eqfn`. They are stored on the dict so resize/probe can reach them. */
 void zap_dict_set_fn_i64(void *dp, void *k, int64_t v, void *hashfn, void *eqfn) {
     ZapDict *d = (ZapDict *)dp;
+    d->key_ptr = 1;
     d->hashfn = hashfn;
     d->eqfn = eqfn;
     zap_dict_set(dp, (int64_t)(intptr_t)k, KEY_FN, v);
 }
 void zap_dict_set_fn_ptr(void *dp, void *k, void *v, void *hashfn, void *eqfn) {
     ZapDict *d = (ZapDict *)dp;
+    d->key_ptr = 1;
+    d->val_ptr = 1;
     d->hashfn = hashfn;
     d->eqfn = eqfn;
     zap_dict_set(dp, (int64_t)(intptr_t)k, KEY_FN, (int64_t)(intptr_t)v);
@@ -472,10 +629,11 @@ typedef struct {
     ZapSetEntry *entries;
     void *hashfn; /* struct elements only (KEY_FN): the type's __hash__/__eq__ */
     void *eqfn;
+    uint8_t elem_ptr; /* elements are GC pointers (str/struct) */
 } ZapSet;
 
 void *zap_set_new(void) {
-    ZapSet *s = (ZapSet *)GC_MALLOC(sizeof(ZapSet));
+    ZapSet *s = (ZapSet *)zap_obj(&zap_desc_set);
     s->len = 0;
     s->cap = 0;
     s->entries = NULL;
@@ -486,7 +644,7 @@ void *zap_set_new(void) {
 
 static void zap_set_resize(ZapSet *s, int keykind) {
     int64_t ncap = s->cap < 8 ? 8 : s->cap * 2;
-    ZapSetEntry *ne = (ZapSetEntry *)GC_MALLOC((size_t)ncap * sizeof(ZapSetEntry));
+    ZapSetEntry *ne = (ZapSetEntry *)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapSetEntry));
     for (int64_t i = 0; i < ncap; i++) {
         ne[i].state = SLOT_EMPTY;
     }
@@ -545,11 +703,13 @@ int64_t zap_set_len(void *s) { return ((ZapSet *)s)->len; }
 
 void zap_set_add_i64(void *s, int64_t v) { zap_set_add(s, v, KEY_I64); }
 void zap_set_add_str(void *s, void *v) {
+    ((ZapSet *)s)->elem_ptr = 1;
     zap_set_add(s, (int64_t)(intptr_t)v, KEY_STR);
 }
 /* Struct-keyed set (operator overloading, D-0047). */
 void zap_set_add_fn(void *sp, void *v, void *hashfn, void *eqfn) {
     ZapSet *s = (ZapSet *)sp;
+    s->elem_ptr = 1;
     s->hashfn = hashfn;
     s->eqfn = eqfn;
     zap_set_add(sp, (int64_t)(intptr_t)v, KEY_FN);
@@ -621,7 +781,7 @@ static int64_t zap_heap_cmp(const ZapHeap *h, int64_t a, int64_t b) {
 
 static void zap_heap_grow(ZapHeap *h) {
     int64_t cap = h->cap < 4 ? 4 : h->cap * 2;
-    int64_t *data = (int64_t *)GC_MALLOC((size_t)cap * sizeof(int64_t));
+    int64_t *data = (int64_t *)zap_ptrbuf((int64_t)cap * (int64_t)sizeof(int64_t));
     if (h->len > 0) {
         memcpy(data, h->data, (size_t)h->len * sizeof(int64_t));
     }
@@ -696,7 +856,7 @@ static void zap_heap_require(const ZapHeap *h, const char *op) {
 }
 
 void *zap_heap_new(int64_t kind, int64_t dir) {
-    ZapHeap *h = (ZapHeap *)GC_MALLOC(sizeof(ZapHeap));
+    ZapHeap *h = (ZapHeap *)zap_obj(&zap_desc_heap);
     h->len = 0;
     h->cap = 0;
     h->data = NULL;
@@ -747,7 +907,7 @@ void *zap_heap_items(void *hp) {
     ZapHeap tmp = *h;
     tmp.cap = n;
     tmp.len = n;
-    tmp.data = (int64_t *)GC_MALLOC((size_t)n * sizeof(int64_t));
+    tmp.data = (int64_t *)zap_ptrbuf((int64_t)n * (int64_t)sizeof(int64_t));
     memcpy(tmp.data, h->data, (size_t)n * sizeof(int64_t));
     while (tmp.len > 0) {
         zap_list_push(out, zap_heap_pop_word(&tmp));
@@ -792,12 +952,12 @@ static size_t zap_array_elem_size(int64_t dtype) {
 }
 
 void *zap_array_new(int64_t dtype, int64_t len) {
-    ZapArray *a = (ZapArray *)GC_MALLOC(sizeof(ZapArray));
-    int64_t *dims = (int64_t *)GC_MALLOC_ATOMIC(sizeof(int64_t));
+    ZapArray *a = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t *dims = (int64_t *)zap_buf(sizeof(int64_t));
     dims[0] = len;
     /* All current dtypes are pointer-free; the buffer never holds pointers. */
     size_t esz = zap_array_elem_size(dtype);
-    void *data = GC_MALLOC_ATOMIC((size_t)(len > 0 ? len : 0) * esz);
+    void *data = zap_buf((size_t)(len > 0 ? len : 0) * esz);
     a->dtype = dtype;
     a->ndim = 1;
     a->dims = dims;
@@ -1030,7 +1190,7 @@ void zap_reflect_register(void *type_name, void *deco_name) {
     if (t->len == t->cap) {
         int64_t ncap = t->cap == 0 ? 8 : t->cap * 2;
         ZapReflectEntry *ni =
-            (ZapReflectEntry *)GC_MALLOC((size_t)ncap * sizeof(ZapReflectEntry));
+            (ZapReflectEntry *)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapReflectEntry));
         for (int64_t i = 0; i < t->len; i++) {
             ni[i] = t->items[i];
         }
@@ -1159,9 +1319,9 @@ void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
      * not, but guard anyway. */
     int64_t avail = rc > 0 ? (int64_t)rc : ngroups;
 
-    ZapMatch *m = (ZapMatch *)GC_MALLOC(sizeof(ZapMatch));
+    ZapMatch *m = (ZapMatch *)zap_obj(&zap_desc_matchobj);
     m->ngroups = ngroups;
-    m->groups = (ZapStr **)GC_MALLOC((size_t)ngroups * sizeof(ZapStr *));
+    m->groups = (ZapStr **)zap_ptrbuf((int64_t)ngroups * (int64_t)sizeof(ZapStr *));
     for (int64_t i = 0; i < ngroups; i++) {
         PCRE2_SIZE s = ov[2 * i];
         PCRE2_SIZE e = ov[2 * i + 1];
@@ -1181,8 +1341,8 @@ void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
     pcre2_pattern_info(re, PCRE2_INFO_NAMETABLE, &nametable);
     m->nnames = (int64_t)namecount;
     if (namecount > 0) {
-        m->names = (ZapStr **)GC_MALLOC((size_t)namecount * sizeof(ZapStr *));
-        m->name_num = (int64_t *)GC_MALLOC((size_t)namecount * sizeof(int64_t));
+        m->names = (ZapStr **)zap_ptrbuf((int64_t)namecount * (int64_t)sizeof(ZapStr *));
+        m->name_num = (int64_t *)zap_buf((int64_t)namecount * (int64_t)sizeof(int64_t));
         for (uint32_t i = 0; i < namecount; i++) {
             PCRE2_SPTR entry = nametable + (size_t)i * nameentrysize;
             int gnum = (entry[0] << 8) | entry[1];
@@ -1245,12 +1405,12 @@ void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_
      * (including the NUL) and return PCRE2_ERROR_NOMEMORY, so we size, grow,
      * and retry at most once. On success *outlen is the length excluding NUL. */
     PCRE2_SIZE outlen = (PCRE2_SIZE)subject->len + 256;
-    PCRE2_UCHAR *buf = (PCRE2_UCHAR *)GC_MALLOC_ATOMIC((size_t)outlen);
+    PCRE2_UCHAR *buf = (PCRE2_UCHAR *)zap_buf((size_t)outlen);
     int rc = pcre2_substitute(re, (PCRE2_SPTR)subject->data, (PCRE2_SIZE)subject->len, 0, opts,
                               NULL, NULL, (PCRE2_SPTR)replacement->data,
                               (PCRE2_SIZE)replacement->len, buf, &outlen);
     if (rc == PCRE2_ERROR_NOMEMORY) {
-        buf = (PCRE2_UCHAR *)GC_MALLOC_ATOMIC((size_t)outlen);
+        buf = (PCRE2_UCHAR *)zap_buf((size_t)outlen);
         rc = pcre2_substitute(re, (PCRE2_SPTR)subject->data, (PCRE2_SIZE)subject->len, 0, opts,
                               NULL, NULL, (PCRE2_SPTR)replacement->data,
                               (PCRE2_SIZE)replacement->len, buf, &outlen);
@@ -1313,7 +1473,7 @@ static void zap_py_finalize(void *obj, void *client_data) {
 
 /* Wrap a *new* reference `o` (ownership transferred to the handle). */
 static ZapPy *zap_py_wrap(PyObject *o) {
-    ZapPy *h = (ZapPy *)GC_MALLOC(sizeof(ZapPy));
+    ZapPy *h = (ZapPy *)zap_obj(&zap_desc_pyobj);
     h->obj = o;
     GC_register_finalizer(h, zap_py_finalize, NULL, NULL, NULL);
     return h;
@@ -1321,7 +1481,7 @@ static ZapPy *zap_py_wrap(PyObject *o) {
 
 /* NUL-terminated copy of a ZapStr (for the C-string CPython APIs). */
 static char *zap_py_cstr(const ZapStr *s) {
-    char *buf = (char *)GC_MALLOC_ATOMIC((size_t)s->len + 1);
+    char *buf = (char *)zap_buf((size_t)s->len + 1);
     if (s->len > 0) {
         memcpy(buf, s->data, (size_t)s->len);
     }
@@ -1578,6 +1738,10 @@ typedef struct G {
     int64_t all_idx;   /* index in g_all[] for O(1) removal on death           */
     struct Scope *scope; /* owning `scope:` (ticket #50), or NULL (root/detached)*/
     int in_live;       /* 1 iff this G is counted in g_live (root-scope join)   */
+    void *shadow_head; /* precise GC (#48): saved shadow-stack head when this G
+                        * is not running on an M. A running G's live head is in
+                        * the per-thread zap_shadow_head, flushed here at a
+                        * safepoint; the collector walks this per parked G. */
 } G;
 
 typedef struct P {
@@ -1806,7 +1970,17 @@ static void switch_to_g(M *m, G *g) {
     m->current = g;
     g->state = G_RUNNING;
     set_bottom(m, &g->sb);
+#ifdef ZAP_GC_IMMIX
+    /* Restore this coroutine's shadow-stack head into the per-thread cell the
+     * compiled code mutates; save it back when the G switches out (parks /
+     * yields / dies). A running G's head thus lives in zap_shadow_head and is
+     * flushed to g->shadow_head at a safepoint or here. */
+    zap_shadow_head = g->shadow_head;
+#endif
     swapcontext(&m->sched_ctx, &g->ctx);
+#ifdef ZAP_GC_IMMIX
+    g->shadow_head = zap_shadow_head;
+#endif
     set_bottom(m, &m->native_sb);
     m->current = NULL;
     if (g->state == G_PARKED) {
@@ -1862,11 +2036,18 @@ static void *worker_main(void *arg) {
     struct GC_stack_base sb;
     m->gc_handle = GC_get_my_stackbottom(&sb);
     m->native_sb = sb;
+    /* Precise GC (#48): this worker runs compiled Zap on Gs, so register it as a
+     * mutator. It is BLOCKED (GC-safe) while in the scheduler loop and ACTIVE
+     * while a G runs on it (the G polls safepoints); zap_safepoint parks it when
+     * a collection is due. */
+    zap_mutator_register();
     for (;;) {
+        zap_enter_blocking(); /* scheduler loop: GC-safe, no un-flushed roots */
         G *g = sched_find_runnable(m);
         if (!g) {
             return NULL; /* shutdown */
         }
+        zap_leave_blocking(); /* about to run Zap; wait out any in-flight GC */
         switch_to_g(m, g);
     }
 }
@@ -1876,7 +2057,7 @@ static void all_add(G *g) {
     pthread_mutex_lock(&g_all_mu);
     if (g_all_len == g_all_cap) {
         int64_t ncap = g_all_cap ? g_all_cap * 2 : 16;
-        G **n = (G **)GC_MALLOC((size_t)ncap * sizeof(G *));
+        G **n = (G **)ZAP_INFRA_ALLOC((size_t)ncap * sizeof(G *));
         if (g_all) {
             memcpy(n, g_all, (size_t)g_all_len * sizeof(G *));
         }
@@ -1909,8 +2090,8 @@ static G *galloc(void *fn, void *arg) {
     }
     pthread_mutex_unlock(&g_free_mu);
     if (!g) {
-        g = (G *)GC_MALLOC(sizeof(G));
-        g->stack = GC_MALLOC(ss); /* pointer-bearing: scanned as heap */
+        g = (G *)zap_obj(&zap_desc_gobj);
+        g->stack = zap_ptrbuf((int64_t)ss); /* Boehm: scanned as heap. Immix: atomic buffer kept alive via the G.stack precise field; roots come from the shadow chain, not stack scanning. */
         g->stack_size = ss;
     }
     g->fn = fn;
@@ -1920,6 +2101,7 @@ static G *galloc(void *fn, void *arg) {
     g->parkmu = NULL;
     g->scope = NULL;
     g->in_live = 0;
+    g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
     /* Cold end of a down-growing stack is its high address. */
     g->sb.mem_base = (char *)g->stack + g->stack_size;
     getcontext(&g->ctx);
@@ -1975,8 +2157,8 @@ static int zap_maxprocs(void) {
 
 static void zap_sched_init_once(void) {
     g_nm = zap_maxprocs();
-    g_ps = (P *)GC_MALLOC((size_t)g_nm * sizeof(P));
-    g_ms = (M *)GC_MALLOC((size_t)g_nm * sizeof(M));
+    g_ps = (P *)ZAP_INFRA_ALLOC((size_t)g_nm * sizeof(P));
+    g_ms = (M *)ZAP_INFRA_ALLOC((size_t)g_nm * sizeof(M));
     for (int i = 0; i < g_nm; i++) {
         pthread_mutex_init(&g_ps[i].mu, NULL);
         g_ps[i].head = g_ps[i].tail = NULL;
@@ -2041,11 +2223,16 @@ void zap_rt_join_all(void) {
     if (!g_ms) {
         return;
     }
+    /* Precise GC (#48): the main thread blocks here until every spawned G
+     * finishes. Mark it GC-safe so collections triggered by the workers proceed
+     * without waiting for the (idle) main thread. */
+    zap_enter_blocking();
     pthread_mutex_lock(&g_live_mu);
     while (g_live > 0) {
         pthread_cond_wait(&g_live_cv, &g_live_mu);
     }
     pthread_mutex_unlock(&g_live_mu);
+    zap_leave_blocking();
     pthread_mutex_lock(&g_idle_mu);
     g_shutdown = 1;
     pthread_cond_broadcast(&g_idle_cv);
@@ -2164,7 +2351,7 @@ static void scope_gdone(Scope *sc) {
  * to the generated code, which keeps it live on its (conservatively scanned)
  * frame and hands it to each owned `spawn` and to the matching exit call. */
 void *zap_scope_enter(int64_t on_error) {
-    Scope *sc = (Scope *)GC_MALLOC(sizeof(Scope));
+    Scope *sc = (Scope *)zap_obj(&zap_desc_scope);
     pthread_mutex_init(&sc->mu, NULL);
     pthread_cond_init(&sc->cv, NULL);
     sc->live = 0;
@@ -2193,11 +2380,17 @@ void zap_spawn_scoped(void *fn_, void *arg, void *scope_) {
  * (a native thread) for a top-level scope; a scope reached from inside a
  * coroutine blocks that worker M here (the park-the-G variant is deferred). */
 static void scope_join(Scope *sc) {
+    /* Precise GC (#48): GC-safe while blocked (see chan_block / zap_rt_join_all).
+     * When reached from inside a coroutine this blocks the worker M; marking it
+     * BLOCKED lets a concurrent collection proceed. The scope's pending-failure
+     * exceptions (sc->excs) stay rooted via the scope object itself. */
+    zap_enter_blocking();
     pthread_mutex_lock(&sc->mu);
     while (sc->live > 0) {
         pthread_cond_wait(&sc->cv, &sc->mu);
     }
     pthread_mutex_unlock(&sc->mu);
+    zap_leave_blocking();
 }
 
 /* Order the collected failures deterministically (by message bytes) so an
@@ -2218,7 +2411,7 @@ static int exc_cmp(const void *a, const void *b) {
  * exception increment carries the message string only, RUNTIME-ABI); this
  * renders the aggregate as a deterministic multi-line message. */
 static void *make_exception_group(ZapStr **excs, int64_t n) {
-    ZapStr **sorted = (ZapStr **)GC_MALLOC((size_t)n * sizeof(ZapStr *));
+    ZapStr **sorted = (ZapStr **)zap_ptrbuf((int64_t)n * (int64_t)sizeof(ZapStr *));
     memcpy(sorted, excs, (size_t)n * sizeof(ZapStr *));
     qsort(sorted, (size_t)n, sizeof(ZapStr *), exc_cmp);
     char header[64];
@@ -2228,7 +2421,7 @@ static void *make_exception_group(ZapStr **excs, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         total += 5 + (sorted[i] ? sorted[i]->len : 0); /* "\n  - " + message */
     }
-    char *buf = (char *)GC_MALLOC_ATOMIC((size_t)total);
+    char *buf = (char *)zap_buf((size_t)total);
     int64_t off = 0;
     memcpy(buf + off, header, (size_t)hlen);
     off += hlen;
@@ -2289,7 +2482,7 @@ void zap_g_uncaught(void *exc) {
         pthread_mutex_lock(&sc->mu);
         if (sc->nexc == sc->exc_cap) {
             int64_t ncap = sc->exc_cap ? sc->exc_cap * 2 : 4;
-            ZapStr **nx = (ZapStr **)GC_MALLOC((size_t)ncap * sizeof(ZapStr *));
+            ZapStr **nx = (ZapStr **)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapStr *));
             if (sc->excs) {
                 memcpy(nx, sc->excs, (size_t)sc->nexc * sizeof(ZapStr *));
             }
@@ -2322,6 +2515,7 @@ typedef struct {
     int closed;
     Waiter *sendq_head, *sendq_tail; /* senders waiting (val = offered value) */
     Waiter *recvq_head, *recvq_tail; /* receivers waiting (to be filled)      */
+    uint8_t elem_ptr; /* buffered element words are GC pointers */
 } ZapChan;
 
 static void q_push(Waiter **head, Waiter **tail, Waiter *w) {
@@ -2382,19 +2576,24 @@ static void chan_block(ZapChan *c, Waiter *w) {
         w->g = NULL;
         pthread_cond_init(&w->cv, NULL);
         w->done = 0;
+        /* Precise GC (#48): a native (main) thread blocked here is GC-safe —
+         * its roots were flushed when it entered the blocking region, so a
+         * collection need not wait for it. */
+        zap_enter_blocking();
         while (!w->done) {
             pthread_cond_wait(&w->cv, &c->mu);
         }
         pthread_mutex_unlock(&c->mu);
+        zap_leave_blocking();
     }
 }
 
 void *zap_chan_new(int64_t cap) {
-    ZapChan *c = (ZapChan *)GC_MALLOC(sizeof(ZapChan));
+    ZapChan *c = (ZapChan *)zap_obj(&zap_desc_chan);
     pthread_mutex_init(&c->mu, NULL);
     c->cap = cap > 0 ? cap : 0;
     c->buf = c->cap > 0
-                 ? (uint64_t *)GC_MALLOC((size_t)c->cap * sizeof(uint64_t))
+                 ? (uint64_t *)zap_ptrbuf((int64_t)c->cap * (int64_t)sizeof(uint64_t))
                  : NULL;
     c->count = c->head = c->tail = 0;
     c->closed = 0;
@@ -2500,6 +2699,7 @@ void zap_chan_send_i64(void *ch, int64_t v) {
     chan_send_word((ZapChan *)ch, (uint64_t)v);
 }
 void zap_chan_send_ptr(void *ch, void *v) {
+    ((ZapChan *)ch)->elem_ptr = 1;
     chan_send_word((ZapChan *)ch, (uint64_t)(uintptr_t)v);
 }
 int64_t zap_chan_recv_i64(void *ch) {
@@ -2507,6 +2707,7 @@ int64_t zap_chan_recv_i64(void *ch) {
     return (int64_t)chan_recv_word((ZapChan *)ch, &ok);
 }
 void *zap_chan_recv_ptr(void *ch) {
+    ((ZapChan *)ch)->elem_ptr = 1;
     int ok;
     return (void *)(uintptr_t)chan_recv_word((ZapChan *)ch, &ok);
 }
@@ -2530,3 +2731,60 @@ void zap_chan_close(void *ch) {
     }
     pthread_mutex_unlock(&c->mu);
 }
+
+/* ===========================================================================
+ * Type descriptors for the runtime's own heap types (ticket #48). Both GC
+ * builds read `.size`; the precise Immix collector also reads `.kind` and the
+ * pointer-offset arrays. Codegen emits the descriptors for *user* structs and
+ * closures; these cover the built-in runtime objects. See design/0008-precise-gc.
+ * ========================================================================== */
+#include <stddef.h> /* offsetof */
+
+static const int32_t zap_off_strobj[] = {(int32_t)offsetof(ZapStr, data)};
+static const int32_t zap_off_gobj[] = {
+    (int32_t)offsetof(G, stack),
+    (int32_t)offsetof(G, arg),
+    (int32_t)offsetof(G, scope),
+};
+
+const ZapTypeDesc zap_desc_atomic = {0, ZAP_TD_ATOMIC, 0, NULL};
+const ZapTypeDesc zap_desc_ptrs = {0, ZAP_TD_ATOMIC, 0, NULL};
+const ZapTypeDesc zap_desc_gstack = {0, ZAP_TD_ATOMIC, 0, NULL};
+const ZapTypeDesc zap_desc_list = {(int64_t)sizeof(ZapList), ZAP_TD_LIST, 0, NULL};
+const ZapTypeDesc zap_desc_dict = {(int64_t)sizeof(ZapDict), ZAP_TD_DICT, 0, NULL};
+const ZapTypeDesc zap_desc_set = {(int64_t)sizeof(ZapSet), ZAP_TD_SET, 0, NULL};
+const ZapTypeDesc zap_desc_heap = {(int64_t)sizeof(ZapHeap), ZAP_TD_HEAP, 0, NULL};
+const ZapTypeDesc zap_desc_chan = {(int64_t)sizeof(ZapChan), ZAP_TD_CHAN, 0, NULL};
+const ZapTypeDesc zap_desc_array = {(int64_t)sizeof(ZapArray), ZAP_TD_ARRAY, 0, NULL};
+const ZapTypeDesc zap_desc_matchobj = {(int64_t)sizeof(ZapMatch), ZAP_TD_MATCH, 0, NULL};
+const ZapTypeDesc zap_desc_scope = {(int64_t)sizeof(Scope), ZAP_TD_SCOPE, 0, NULL};
+/* ZapPy wraps a borrowed CPython reference, not a GC pointer, so it is a leaf. */
+const ZapTypeDesc zap_desc_pyobj = {(int64_t)sizeof(ZapPy), ZAP_TD_ATOMIC, 0, NULL};
+const ZapTypeDesc zap_desc_strobj = {(int64_t)sizeof(ZapStr), ZAP_TD_PRECISE, 1,
+                                     zap_off_strobj};
+const ZapTypeDesc zap_desc_gobj = {(int64_t)sizeof(G), ZAP_TD_PRECISE, 3, zap_off_gobj};
+
+#ifdef ZAP_GC_IMMIX
+/* Custom root: the reflection registry is a static table (not a heap object)
+ * holding ZapStr* names, so it must be enumerated explicitly at each GC. */
+static void zap_reflect_mark_roots(void) {
+    ZapReflectTable *t = &zap_reflect_table;
+    if (t->items) {
+        zap_gc_mark(t->items);
+        for (int64_t i = 0; i < t->len; i++) {
+            zap_gc_mark(t->items[i].type_name);
+            zap_gc_mark(t->items[i].deco_name);
+        }
+    }
+}
+
+/* Register the precise collector's static roots once at startup. */
+__attribute__((constructor)) static void zap_gc_register_statics(void) {
+    zap_gc_add_root((void **)&g_cancelled);
+    zap_gc_add_root_fn(zap_reflect_mark_roots);
+}
+
+/* The precise Immix collector implementation. Included last so it sees every
+ * runtime type and the scheduler globals above. */
+#include "zapgc.inc.c"
+#endif

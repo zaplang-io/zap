@@ -1,0 +1,797 @@
+/* =============================================================================
+ * Precise, Immix-style garbage collector (ticket #48, D-0009,
+ * design/0008-precise-gc.md).
+ *
+ * This file is #included at the BOTTOM of zaprt.c when the program is built with
+ * the `gc-immix` codegen feature (which defines ZAP_GC_IMMIX and omits <gc.h> /
+ * -lgc). It sees every runtime type (ZapStr, ZapList, ..., the scheduler G/P/M,
+ * Scope) and the scheduler globals (g_all, cur_m, ...) defined above it; the
+ * entry points it provides are forward-declared at the top of zaprt.c.
+ *
+ * v1 is NON-MOVING: a line-marking mark-sweep over an Immix heap (32 KiB blocks
+ * / 128 B lines, bump allocation, line-granularity recycling), with a separate
+ * large-object space. Roots are found PRECISELY via a per-coroutine shadow stack
+ * (so a parked coroutine's roots are just its saved chain) plus a global-root
+ * registry; the heap is traced precisely from per-object type descriptors.
+ * Stop-the-world is cooperative: mutators poll a safepoint and park. See the
+ * design doc for the rationale and the deferred pieces (evacuation, generational
+ * barrier, per-P allocation — v1 allocates under one heap lock).
+ * ========================================================================== */
+
+#include <sys/mman.h>
+
+/* ---- geometry ------------------------------------------------------------- */
+#define ZAP_BLOCK 32768u          /* bytes per block (power of two, aligned)    */
+#define ZAP_LINE 128u             /* bytes per line                             */
+#define ZAP_LINES (ZAP_BLOCK / ZAP_LINE) /* 256 lines per block                 */
+#define ZAP_LOS_THRESHOLD 8192u   /* objects larger than this go to the LOS     */
+
+/* A block's metadata lives at the block's base; the first `ZAP_RESERVED_LINES`
+ * lines are reserved for it and never allocate objects. */
+typedef struct ZapBlock {
+    struct ZapBlock *next;        /* intrusive list link (free / recycle / all) */
+    struct ZapBlock *all_next;    /* link through every block ever mapped       */
+    uint8_t kind;                 /* ZAP_BK_SMALL or ZAP_BK_LOS                  */
+    uint8_t los_mark;             /* LOS: 1 iff marked this cycle               */
+    size_t los_size;              /* LOS: full object size incl. header         */
+    uint32_t hole_cursor;         /* small: byte offset of next alloc           */
+    uint32_t hole_limit;          /* small: end of current free run             */
+    uint32_t search_line;         /* small: line to resume hole search from     */
+    uint8_t line_mark[ZAP_LINES]; /* small: per-line liveness (set by tracing)  */
+} ZapBlock;
+
+enum { ZAP_BK_SMALL = 0, ZAP_BK_LOS = 1 };
+
+#define ZAP_RESERVED_BYTES (((sizeof(ZapBlock) + ZAP_LINE - 1) / ZAP_LINE) * ZAP_LINE)
+#define ZAP_RESERVED_LINES (ZAP_RESERVED_BYTES / ZAP_LINE)
+
+/* The ZapTypeDesc typedef and the ZAP_TD_* kind codes are defined in zaprt.c
+ * (shared with the Boehm build and with codegen's emitted descriptors). */
+
+/* Every heap object is [ desc|mark (8) | payload_size (8) | payload... ]. The
+ * user/runtime pointer is the PAYLOAD pointer. The descriptor word (payload[-2])
+ * holds the 8-byte-aligned descriptor pointer OR'd with the mark bit in bit 0.
+ * The size word (payload[-1]) holds the payload byte size, so line-marking knows
+ * an object's extent even for variable-length atomic buffers whose descriptor is
+ * shared. The 16-byte header also 16-byte-aligns every payload. */
+#define ZAP_HEADER_BYTES 16u
+#define ZAP_HDR(payload) (((uintptr_t *)(payload))[-2])
+#define ZAP_OSIZE(payload) (((size_t *)(payload))[-1])
+#define ZAP_DESC(payload) ((const ZapTypeDesc *)(ZAP_HDR(payload) & ~(uintptr_t)7))
+#define ZAP_MARKED(payload) (ZAP_HDR(payload) & 1u)
+#define ZAP_SET_MARK(payload) (ZAP_HDR(payload) |= 1u)
+#define ZAP_CLR_MARK(payload) (ZAP_HDR(payload) &= ~(uintptr_t)1)
+
+/* ---- heap globals --------------------------------------------------------- */
+static pthread_mutex_t zap_heap_mu = PTHREAD_MUTEX_INITIALIZER;
+static ZapBlock *zap_free_blocks = NULL;    /* fully-free small blocks, reusable */
+static ZapBlock *zap_recycle_blocks = NULL; /* small blocks with holes           */
+static ZapBlock *zap_all_blocks = NULL;     /* every mapped block (sweep walks)   */
+static ZapBlock *zap_cur_block = NULL;      /* current small allocation block     */
+static size_t zap_bytes_since_gc = 0;
+static size_t zap_live_estimate = 0;
+static size_t zap_gc_threshold = 4u * 1024u * 1024u; /* initial trigger (4 MiB)   */
+static size_t zap_heap_limit = 0;           /* hard cap (ZAP_GC_HEAP_LIMIT), 0=off */
+static size_t zap_total_mapped = 0;
+
+/* main-thread shadow-stack head (the main OS thread is a mutator but not a G). */
+void *zap_main_shadow_head = NULL;
+/* Per-thread "currently active" shadow head, maintained by compiled code. */
+__thread void *zap_shadow_head = NULL;
+
+/* A shadow-stack frame, emitted by codegen in each function that holds live GC
+ * pointers. Layout MUST match the codegen emission in lib.rs. */
+typedef struct ZapShadowFrame {
+    struct ZapShadowFrame *prev;
+    int64_t nroots;
+    void *roots[]; /* nroots slots */
+} ZapShadowFrame;
+
+/* ---- global roots (runtime static tables that hold GC pointers) ----------- */
+static pthread_mutex_t zap_groots_mu = PTHREAD_MUTEX_INITIALIZER;
+static void ***zap_groots = NULL; /* array of addresses of root slots           */
+static int64_t zap_groots_len = 0;
+static int64_t zap_groots_cap = 0;
+
+/* Register the ADDRESS of a static slot that holds a GC pointer, so the runtime
+ * keeps its target alive (e.g. the Cancelled sentinel, interned descriptors are
+ * static data and need no registration). Idempotent is not required. */
+void zap_gc_add_root(void **slot) {
+    pthread_mutex_lock(&zap_groots_mu);
+    if (zap_groots_len == zap_groots_cap) {
+        int64_t ncap = zap_groots_cap ? zap_groots_cap * 2 : 16;
+        void ***n = (void ***)malloc((size_t)ncap * sizeof(void **));
+        if (zap_groots) {
+            memcpy(n, zap_groots, (size_t)zap_groots_len * sizeof(void **));
+            free(zap_groots);
+        }
+        zap_groots = n;
+        zap_groots_cap = ncap;
+    }
+    zap_groots[zap_groots_len++] = slot;
+    pthread_mutex_unlock(&zap_groots_mu);
+}
+
+/* ---- cooperative stop-the-world handshake --------------------------------- */
+/* Each OS thread that runs Zap code registers a mutator node. A thread is
+ * ACTIVE while executing compiled Zap (it must poll zap_safepoint), or PARKED at
+ * a safepoint, or BLOCKED inside the runtime (roots already flushed, so the
+ * collector may run without waiting for it). */
+enum { ZAP_MUT_ACTIVE = 0, ZAP_MUT_PARKED = 1, ZAP_MUT_BLOCKED = 2 };
+
+typedef struct ZapMutator {
+    struct ZapMutator *next;
+    int state;
+} ZapMutator;
+
+static pthread_mutex_t zap_stw_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t zap_stw_cv = PTHREAD_COND_INITIALIZER;
+static ZapMutator *zap_mutators = NULL;
+static volatile int zap_gc_wanted = 0;      /* a collection is due (set by alloc)  */
+static volatile int zap_collecting = 0;     /* collection in progress             */
+static __thread ZapMutator *zap_self = NULL;
+
+static void zap_collect_now(void); /* fwd: drive one full collection (caller is
+                                    * registered, ACTIVE, about to become the
+                                    * collector; it flushes its own head) */
+
+/* Flush this thread's live shadow-stack head into the structure the collector
+ * reads: the running G (worker thread) or the main-thread slot. Called with no
+ * lock held; the collector only reads these once every mutator has parked. */
+static void zap_flush_shadow(void) {
+    M *m = cur_m;
+    if (m) {
+        /* A worker thread. If it is running a G, that G's live head is in the
+         * per-thread cell; flush it. If it is idle in the scheduler loop
+         * (m->current == NULL), it holds no Zap roots — its last G's head was
+         * already saved by switch_to_g — so there is nothing to flush. */
+        if (m->current) {
+            m->current->shadow_head = zap_shadow_head;
+        }
+    } else {
+        /* The main OS thread runs top-level Zap and is not a G. */
+        zap_main_shadow_head = zap_shadow_head;
+    }
+}
+
+static void zap_mutator_register(void) {
+    if (zap_self) {
+        return;
+    }
+    ZapMutator *mu = (ZapMutator *)malloc(sizeof(ZapMutator));
+    mu->state = ZAP_MUT_ACTIVE;
+    pthread_mutex_lock(&zap_stw_mu);
+    mu->next = zap_mutators;
+    zap_mutators = mu;
+    zap_self = mu;
+    pthread_mutex_unlock(&zap_stw_mu);
+}
+
+/* Enter a blocking region of the runtime (channel wait, scheduler idle, join):
+ * roots are flushed and the thread is marked safe so a collection need not wait
+ * for it. Paired with zap_leave_blocking. */
+static void zap_enter_blocking(void) {
+    if (!zap_self) {
+        return;
+    }
+    zap_flush_shadow();
+    pthread_mutex_lock(&zap_stw_mu);
+    zap_self->state = ZAP_MUT_BLOCKED;
+    pthread_cond_broadcast(&zap_stw_cv); /* a waiting collector may now proceed */
+    pthread_mutex_unlock(&zap_stw_mu);
+}
+
+static void zap_leave_blocking(void) {
+    if (!zap_self) {
+        return;
+    }
+    pthread_mutex_lock(&zap_stw_mu);
+    while (zap_collecting) {
+        pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
+    }
+    zap_self->state = ZAP_MUT_ACTIVE;
+    pthread_mutex_unlock(&zap_stw_mu);
+}
+
+/* A GC safepoint, polled by compiled code at function entry and loop back-edges
+ * (FORK 4a). This is the ONLY place a collection runs (plus the explicit
+ * zap_gc_collect): the runtime's own C code has no shadow frames, so GC must
+ * never fire while runtime C holds unrooted temporaries. At a safepoint, all of
+ * the current thread's live pointers are in its shadow chain, so it is safe.
+ *
+ * If a collection is due, the first thread here becomes the collector; any other
+ * thread that arrives flushes its head, parks, and waits for the collection to
+ * finish. */
+void zap_safepoint(void) {
+    if (!zap_gc_wanted && !zap_collecting) {
+        return; /* fast path: two loads, predicted not-taken */
+    }
+    if (!zap_self) {
+        return; /* a thread that never ran Zap holds no un-flushed roots */
+    }
+    pthread_mutex_lock(&zap_stw_mu);
+    if (zap_gc_wanted && !zap_collecting) {
+        pthread_mutex_unlock(&zap_stw_mu);
+        zap_collect_now(); /* become the collector */
+        return;
+    }
+    /* Another thread is collecting: flush our head and park until it finishes. */
+    zap_flush_shadow();
+    zap_self->state = ZAP_MUT_PARKED;
+    pthread_cond_broadcast(&zap_stw_cv);
+    while (zap_collecting) {
+        pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
+    }
+    zap_self->state = ZAP_MUT_ACTIVE;
+    pthread_mutex_unlock(&zap_stw_mu);
+}
+
+/* A public mark entry so runtime static-root callbacks (e.g. the reflection
+ * table) can enqueue their pointers during tracing. */
+void zap_gc_mark(void *payload); /* fwd (defined with the marker below) */
+
+/* Custom root callbacks: runtime modules with static tables of GC pointers
+ * register a function that marks them. Called during root enumeration. */
+static void (*zap_root_fns[16])(void);
+static int zap_root_fn_n = 0;
+void zap_gc_add_root_fn(void (*fn)(void)) {
+    pthread_mutex_lock(&zap_groots_mu);
+    if (zap_root_fn_n < (int)(sizeof(zap_root_fns) / sizeof(zap_root_fns[0]))) {
+        zap_root_fns[zap_root_fn_n++] = fn;
+    }
+    pthread_mutex_unlock(&zap_groots_mu);
+}
+
+/* ---- the marker ----------------------------------------------------------- */
+/* An append-only mark list (BFS worklist) avoids deep C recursion AND lets us
+ * clear every survivor's header mark bit after the trace: once the trace drains
+ * (cursor == len), list[0..len) is exactly the set of live objects, so we walk
+ * it once to reset the header bits for the next cycle. The header mark bit is
+ * used only to dedupe this worklist within one collection. */
+static void **zap_mark_list = NULL;
+static size_t zap_mark_len = 0;
+static size_t zap_mark_cursor = 0;
+static size_t zap_mark_cap = 0;
+
+static void zap_mark_block_lines(void *payload, size_t obj_size) {
+    uintptr_t base = (uintptr_t)payload - ZAP_HEADER_BYTES;
+    ZapBlock *b = (ZapBlock *)(base & ~(uintptr_t)(ZAP_BLOCK - 1));
+    if (b->kind == ZAP_BK_LOS) {
+        b->los_mark = 1;
+        return;
+    }
+    uint32_t first = (uint32_t)((base - (uintptr_t)b) / ZAP_LINE);
+    uintptr_t end = base + obj_size - 1;
+    uint32_t last = (uint32_t)((end - (uintptr_t)b) / ZAP_LINE);
+    if (last >= ZAP_LINES) {
+        last = ZAP_LINES - 1;
+    }
+    for (uint32_t i = first; i <= last; i++) {
+        b->line_mark[i] = 1;
+    }
+}
+
+static void zap_mark_push(void *payload) {
+    if (payload == NULL) {
+        return;
+    }
+    /* All GC pointers address a payload whose header word is the descriptor;
+     * function addresses and other non-heap pointers never reach here because
+     * codegen only roots values of pointer *type* that it allocated — but a
+     * stale shadow slot could still hold a non-heap pointer, so guard by only
+     * trusting the mark bit / descriptor once we know the pointer is ours.
+     * Since v1 does no conservative scanning, every pointer enqueued here is a
+     * real object payload; still, be defensive about the null descriptor. */
+    if (ZAP_MARKED(payload)) {
+        return;
+    }
+    const ZapTypeDesc *d = ZAP_DESC(payload);
+    if (d == NULL) {
+        return;
+    }
+    (void)d;
+    ZAP_SET_MARK(payload);
+    size_t osize = ZAP_HEADER_BYTES + ZAP_OSIZE(payload);
+    zap_mark_block_lines(payload, osize);
+    if (zap_mark_len == zap_mark_cap) {
+        size_t ncap = zap_mark_cap ? zap_mark_cap * 2 : 1024;
+        zap_mark_list = (void **)realloc(zap_mark_list, ncap * sizeof(void *));
+        zap_mark_cap = ncap;
+    }
+    zap_mark_list[zap_mark_len++] = payload;
+}
+
+/* Trace one already-marked object: enqueue its children per its descriptor. */
+static void zap_trace_children(void *payload) {
+    const ZapTypeDesc *d = ZAP_DESC(payload);
+    switch (d->kind) {
+    case ZAP_TD_ATOMIC:
+        return;
+    case ZAP_TD_PRECISE: {
+        const char *p = (const char *)payload;
+        for (int32_t i = 0; i < d->n_ptrs; i++) {
+            zap_mark_push(*(void **)(p + d->ptr_offsets[i]));
+        }
+        return;
+    }
+    case ZAP_TD_LIST: {
+        ZapList *l = (ZapList *)payload;
+        if (l->data) {
+            zap_mark_push(l->data);
+            if (l->elem_ptr) {
+                for (int64_t i = 0; i < l->len; i++) {
+                    zap_mark_push((void *)(intptr_t)l->data[i]);
+                }
+            }
+        }
+        return;
+    }
+    case ZAP_TD_DICT: {
+        ZapDict *dd = (ZapDict *)payload;
+        if (dd->entries) {
+            zap_mark_push(dd->entries);
+            if (dd->key_ptr || dd->val_ptr) {
+                for (int64_t i = 0; i < dd->cap; i++) {
+                    if (dd->entries[i].state != SLOT_FULL) {
+                        continue;
+                    }
+                    if (dd->key_ptr) {
+                        zap_mark_push((void *)(intptr_t)dd->entries[i].key);
+                    }
+                    if (dd->val_ptr) {
+                        zap_mark_push((void *)(intptr_t)dd->entries[i].val);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    case ZAP_TD_SET: {
+        ZapSet *s = (ZapSet *)payload;
+        if (s->entries) {
+            zap_mark_push(s->entries);
+            if (s->elem_ptr) {
+                for (int64_t i = 0; i < s->cap; i++) {
+                    if (s->entries[i].state == SLOT_FULL) {
+                        zap_mark_push((void *)(intptr_t)s->entries[i].key);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    case ZAP_TD_HEAP: {
+        ZapHeap *h = (ZapHeap *)payload;
+        if (h->data) {
+            zap_mark_push(h->data);
+            if (h->kind == HEAP_ELEM_STR) {
+                for (int64_t i = 0; i < h->len; i++) {
+                    zap_mark_push((void *)(intptr_t)h->data[i]);
+                }
+            }
+        }
+        return;
+    }
+    case ZAP_TD_CHAN: {
+        ZapChan *c = (ZapChan *)payload;
+        if (c->buf) {
+            zap_mark_push(c->buf);
+            if (c->elem_ptr && c->cap > 0) {
+                /* the `count` buffered words live at [head .. head+count) mod cap */
+                for (int64_t k = 0; k < c->count; k++) {
+                    int64_t idx = (c->head + k) % c->cap;
+                    zap_mark_push((void *)(intptr_t)c->buf[idx]);
+                }
+            }
+        }
+        /* In-flight (unbuffered rendezvous) values sit in a blocked sender's
+         * stack-local Waiter, which is rooted via that coroutine's shadow
+         * chain, so they need no marking here. */
+        return;
+    }
+    case ZAP_TD_ARRAY: {
+        ZapArray *a = (ZapArray *)payload;
+        if (a->dims) {
+            zap_mark_push(a->dims); /* int64 dims: atomic buffer */
+        }
+        if (a->data) {
+            zap_mark_push(a->data); /* numeric element buffer: atomic, no ptrs */
+        }
+        return;
+    }
+    case ZAP_TD_MATCH: {
+        ZapMatch *mm = (ZapMatch *)payload;
+        if (mm->groups) {
+            zap_mark_push(mm->groups);
+            for (int64_t i = 0; i < mm->ngroups; i++) {
+                zap_mark_push(mm->groups[i]);
+            }
+        }
+        if (mm->names) {
+            zap_mark_push(mm->names);
+            for (int64_t i = 0; i < mm->nnames; i++) {
+                zap_mark_push(mm->names[i]);
+            }
+        }
+        if (mm->name_num) {
+            zap_mark_push(mm->name_num); /* int64 buffer: atomic */
+        }
+        return;
+    }
+    case ZAP_TD_SCOPE: {
+        Scope *sc = (Scope *)payload;
+        if (sc->excs) {
+            zap_mark_push(sc->excs);
+            for (int64_t i = 0; i < sc->nexc; i++) {
+                zap_mark_push(sc->excs[i]);
+            }
+        }
+        return;
+    }
+    case ZAP_TD_GSTACK:
+        return; /* a raw stack buffer: its live pointers are reached via the G's
+                 * shadow chain, not by scanning the stack bytes. */
+    default:
+        return;
+    }
+}
+
+static void zap_mark_drain(void) {
+    while (zap_mark_cursor < zap_mark_len) {
+        zap_trace_children(zap_mark_list[zap_mark_cursor++]);
+    }
+}
+
+/* After the trace drains, list[0..len) is exactly the live set; clear each
+ * survivor's header mark bit so the next collection starts clean, then reset the
+ * worklist. */
+static void zap_mark_reset(void) {
+    for (size_t i = 0; i < zap_mark_len; i++) {
+        ZAP_CLR_MARK(zap_mark_list[i]);
+    }
+    zap_mark_len = 0;
+    zap_mark_cursor = 0;
+}
+
+/* Public mark entry for runtime static-root callbacks. */
+void zap_gc_mark(void *payload) { zap_mark_push(payload); }
+
+/* ---- root enumeration ----------------------------------------------------- */
+static void zap_mark_shadow_chain(void *head) {
+    for (ZapShadowFrame *f = (ZapShadowFrame *)head; f; f = f->prev) {
+        for (int64_t i = 0; i < f->nroots; i++) {
+            zap_mark_push(f->roots[i]);
+        }
+    }
+}
+
+static void zap_mark_roots(void) {
+    /* Global static roots (single slots) and custom root callbacks (runtime
+     * tables, e.g. the reflection registry). */
+    pthread_mutex_lock(&zap_groots_mu);
+    for (int64_t i = 0; i < zap_groots_len; i++) {
+        zap_mark_push(*zap_groots[i]);
+    }
+    for (int i = 0; i < zap_root_fn_n; i++) {
+        zap_root_fns[i]();
+    }
+    pthread_mutex_unlock(&zap_groots_mu);
+
+    /* Main-thread shadow chain (top-level Zap code runs on the main OS thread,
+     * which is not a G). Its head was flushed when it parked or blocked. */
+    zap_mark_shadow_chain(zap_main_shadow_head);
+
+    /* Every live coroutine: the G object itself (keeps its green stack buffer,
+     * closure arg and owning scope alive via zap_desc_gobj) AND its saved shadow
+     * chain. A running G's live head was flushed into the G when its M parked at
+     * the safepoint; a parked/runnable G's head was saved by switch_to_g when it
+     * left its M. g_all registers every live G (keeping parked ones reachable);
+     * run-queue linkage needs no separate tracing because every queued G is in
+     * g_all too. */
+    pthread_mutex_lock(&g_all_mu);
+    for (int64_t i = 0; i < g_all_len; i++) {
+        G *g = g_all[i];
+        if (g) {
+            zap_mark_push(g);
+            zap_mark_shadow_chain(g->shadow_head);
+        }
+    }
+    pthread_mutex_unlock(&g_all_mu);
+}
+
+/* ---- sweep ---------------------------------------------------------------- */
+static void zap_block_reset_marks(ZapBlock *b) {
+    memset(b->line_mark, 0, sizeof(b->line_mark));
+    for (uint32_t i = 0; i < ZAP_RESERVED_LINES; i++) {
+        b->line_mark[i] = 1; /* metadata lines are never allocatable */
+    }
+}
+
+/* Find the next run of free (unmarked) lines in a small block at or after
+ * `from_line`; set the block's cursor/limit to it. Returns 1 if a hole was
+ * found, 0 if the block is full. */
+static int zap_block_next_hole(ZapBlock *b) {
+    uint32_t i = b->search_line;
+    while (i < ZAP_LINES && b->line_mark[i]) {
+        i++;
+    }
+    if (i >= ZAP_LINES) {
+        b->hole_cursor = b->hole_limit = ZAP_BLOCK;
+        b->search_line = ZAP_LINES;
+        return 0;
+    }
+    uint32_t start = i;
+    while (i < ZAP_LINES && !b->line_mark[i]) {
+        i++;
+    }
+    b->hole_cursor = start * ZAP_LINE;
+    b->hole_limit = i * ZAP_LINE;
+    b->search_line = i;
+    return 1;
+}
+
+static void zap_sweep(void) {
+    zap_free_blocks = NULL;
+    zap_recycle_blocks = NULL;
+    zap_cur_block = NULL;
+    size_t live = 0;
+    ZapBlock **pp = &zap_all_blocks;
+    while (*pp) {
+        ZapBlock *b = *pp;
+        if (b->kind == ZAP_BK_LOS) {
+            if (b->los_mark) {
+                b->los_mark = 0;
+                live += b->los_size;
+                pp = &b->all_next;
+            } else {
+                *pp = b->all_next;
+                zap_total_mapped -= ((b->los_size + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
+                free(b);
+            }
+            continue;
+        }
+        /* Small block: count live lines. */
+        uint32_t used = 0;
+        for (uint32_t i = ZAP_RESERVED_LINES; i < ZAP_LINES; i++) {
+            if (b->line_mark[i]) {
+                used++;
+            }
+        }
+        live += (size_t)used * ZAP_LINE;
+        if (used == 0) {
+            zap_block_reset_marks(b);
+            b->search_line = ZAP_RESERVED_LINES;
+            zap_block_next_hole(b);
+            b->next = zap_free_blocks;
+            zap_free_blocks = b;
+        } else {
+            b->search_line = ZAP_RESERVED_LINES;
+            if (zap_block_next_hole(b)) {
+                b->next = zap_recycle_blocks;
+                zap_recycle_blocks = b;
+            }
+            /* else fully used: not placed on any alloc list this cycle. */
+        }
+        pp = &b->all_next;
+    }
+    zap_live_estimate = live;
+}
+
+/* ---- the collection ------------------------------------------------------- */
+static void zap_mark_sweep(void); /* fwd: the mark + sweep under zap_heap_mu */
+
+/* Drive one full stop-the-world collection. The caller is a registered mutator
+ * executing compiled code at a safepoint (so its own live pointers are already
+ * in its shadow chain). Only one thread collects at a time; others park in
+ * zap_safepoint / zap_*_blocking. */
+static void zap_collect_now(void) {
+    pthread_mutex_lock(&zap_stw_mu);
+    if (zap_collecting) {
+        /* Lost the race: another thread already collects. Park and wait. */
+        zap_flush_shadow();
+        if (zap_self) {
+            zap_self->state = ZAP_MUT_PARKED;
+            pthread_cond_broadcast(&zap_stw_cv);
+        }
+        while (zap_collecting) {
+            pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
+        }
+        if (zap_self) {
+            zap_self->state = ZAP_MUT_ACTIVE;
+        }
+        pthread_mutex_unlock(&zap_stw_mu);
+        return;
+    }
+    zap_collecting = 1;
+    zap_gc_wanted = 0;
+    zap_flush_shadow();
+    if (zap_self) {
+        zap_self->state = ZAP_MUT_PARKED;
+    }
+    /* Wait until no OTHER mutator is ACTIVE (each flushes its head as it parks
+     * or blocks). BLOCKED threads are already safe. */
+    for (;;) {
+        int active = 0;
+        for (ZapMutator *m = zap_mutators; m; m = m->next) {
+            if (m != zap_self && m->state == ZAP_MUT_ACTIVE) {
+                active++;
+            }
+        }
+        if (active == 0) {
+            break;
+        }
+        pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
+    }
+    pthread_mutex_unlock(&zap_stw_mu);
+
+    /* World is stopped: every live pointer is reachable from a flushed shadow
+     * chain, a G, or a global root. Mark and sweep under the heap lock. */
+    pthread_mutex_lock(&zap_heap_mu);
+    zap_mark_sweep();
+    pthread_mutex_unlock(&zap_heap_mu);
+
+    pthread_mutex_lock(&zap_stw_mu);
+    zap_collecting = 0;
+    if (zap_self) {
+        zap_self->state = ZAP_MUT_ACTIVE;
+    }
+    pthread_cond_broadcast(&zap_stw_cv);
+    pthread_mutex_unlock(&zap_stw_mu);
+}
+
+/* Explicit collection (a `gc_collect()` builtin / test hook). Safe to call from
+ * compiled Zap code, where the caller's roots are shadow-flushed. */
+void zap_gc_collect(void) {
+    zap_mutator_register();
+    zap_collect_now();
+}
+
+/* ---- block / object allocation -------------------------------------------- */
+static ZapBlock *zap_map_block(void) {
+    void *mem = NULL;
+    if (posix_memalign(&mem, ZAP_BLOCK, ZAP_BLOCK) != 0 || !mem) {
+        fprintf(stderr, "zap: out of memory (block map)\n");
+        abort();
+    }
+    ZapBlock *b = (ZapBlock *)mem;
+    b->kind = ZAP_BK_SMALL;
+    b->all_next = zap_all_blocks;
+    zap_all_blocks = b;
+    zap_total_mapped += ZAP_BLOCK;
+    zap_block_reset_marks(b);
+    b->search_line = ZAP_RESERVED_LINES;
+    zap_block_next_hole(b);
+    return b;
+}
+
+static ZapBlock *zap_take_block(void) {
+    if (zap_recycle_blocks) {
+        ZapBlock *b = zap_recycle_blocks;
+        zap_recycle_blocks = b->next;
+        return b;
+    }
+    if (zap_free_blocks) {
+        ZapBlock *b = zap_free_blocks;
+        zap_free_blocks = b->next;
+        return b;
+    }
+    return zap_map_block();
+}
+
+/* Allocate `osize` (incl. header) bytes of small-object space; returns the
+ * header address. Caller holds zap_heap_mu. */
+static void *zap_bump_small(size_t osize) {
+    for (;;) {
+        if (!zap_cur_block) {
+            zap_cur_block = zap_take_block();
+        }
+        ZapBlock *b = zap_cur_block;
+        while (b->hole_cursor + osize <= b->hole_limit) {
+            void *p = (char *)b + b->hole_cursor;
+            b->hole_cursor += (uint32_t)osize;
+            return p;
+        }
+        /* advance to next hole in this block, or get a new block */
+        if (b->hole_limit < ZAP_BLOCK && zap_block_next_hole(b)) {
+            continue;
+        }
+        zap_cur_block = NULL; /* exhausted; fetch another */
+    }
+}
+
+static void *zap_alloc_los(size_t osize) {
+    size_t total = ((osize + sizeof(ZapBlock) + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
+    void *mem = NULL;
+    if (posix_memalign(&mem, ZAP_BLOCK, total) != 0 || !mem) {
+        fprintf(stderr, "zap: out of memory (LOS map)\n");
+        abort();
+    }
+    ZapBlock *b = (ZapBlock *)mem;
+    b->kind = ZAP_BK_LOS;
+    b->los_mark = 0;
+    b->los_size = osize;
+    b->all_next = zap_all_blocks;
+    zap_all_blocks = b;
+    zap_total_mapped += total;
+    /* Object header placed right after the block metadata, block-aligned lookup
+     * via (payload-8) & ~(BLOCK-1) lands on `b`. */
+    return (char *)b + ZAP_RESERVED_BYTES;
+}
+
+/* Round an object size up to 16 bytes so every payload stays 16-byte aligned
+ * (the block base and reserved region are already 128-byte aligned). */
+static size_t zap_round16(size_t n) { return (n + 15u) & ~(size_t)15u; }
+
+/* Core allocation: `payload_size` bytes of payload for descriptor `desc`.
+ * Returns a zeroed payload pointer with the header initialized. Allocation NEVER
+ * collects — it only flags that a collection is due; the next GC safepoint in
+ * compiled code (where all live pointers are shadow-rooted) runs it. This is
+ * what makes a C runtime without shadow frames safe: GC cannot fire while the
+ * runtime holds unrooted temporaries, because the runtime never polls a
+ * safepoint mid-operation. */
+static void *zap_gc_alloc_sized(const ZapTypeDesc *desc, size_t payload_size) {
+    size_t osize = zap_round16(ZAP_HEADER_BYTES + payload_size);
+    pthread_mutex_lock(&zap_heap_mu);
+    zap_bytes_since_gc += osize;
+    if (zap_bytes_since_gc >= zap_gc_threshold ||
+        (zap_heap_limit && zap_total_mapped + osize >= zap_heap_limit)) {
+        zap_gc_wanted = 1; /* collect at the next safepoint */
+    }
+    void *hdr;
+    if (ZAP_HEADER_BYTES + payload_size > ZAP_LOS_THRESHOLD) {
+        hdr = zap_alloc_los(osize);
+    } else {
+        hdr = zap_bump_small(osize);
+    }
+    pthread_mutex_unlock(&zap_heap_mu);
+    void *payload = (char *)hdr + ZAP_HEADER_BYTES;
+    ZAP_HDR(payload) = (uintptr_t)desc; /* mark bit 0 clear */
+    ZAP_OSIZE(payload) = payload_size;
+    memset(payload, 0, payload_size);
+    return payload;
+}
+
+void *zap_gc_alloc(const ZapTypeDesc *desc) {
+    return zap_gc_alloc_sized(desc, (size_t)desc->size);
+}
+
+/* A leaf/atomic buffer of `size` bytes (string data, numeric array data,
+ * container element/entry buffers whose interiors the container traces). */
+void *zap_gc_alloc_atomic(int64_t size) {
+    return zap_gc_alloc_sized(&zap_desc_atomic, (size_t)(size < 0 ? 0 : size));
+}
+
+/* Variable-length object (descriptor is a container kind, but the payload size
+ * is runtime-determined — used for the array dims/strides buffers via atomic;
+ * kept for symmetry). */
+void *zap_gc_alloc_var(const ZapTypeDesc *desc, int64_t size) {
+    return zap_gc_alloc_sized(desc, (size_t)(size < 0 ? 0 : size));
+}
+
+/* Mark + sweep. Caller holds zap_heap_mu and the world is stopped. */
+static void zap_mark_sweep(void) {
+    /* Clear line / LOS marks (object header mark bits are already clear: every
+     * survivor of the previous cycle had its bit reset by zap_mark_reset, and
+     * fresh allocations are memset to a clear header). */
+    for (ZapBlock *b = zap_all_blocks; b; b = b->all_next) {
+        if (b->kind == ZAP_BK_SMALL) {
+            memset(b->line_mark, 0, sizeof(b->line_mark));
+            for (uint32_t i = 0; i < ZAP_RESERVED_LINES; i++) {
+                b->line_mark[i] = 1;
+            }
+        } else {
+            b->los_mark = 0;
+        }
+    }
+    zap_mark_roots();
+    zap_mark_drain();
+    zap_mark_reset(); /* clear survivor header bits for the next cycle */
+    zap_sweep();
+    zap_bytes_since_gc = 0;
+    /* Grow the threshold toward ~2x the live set to amortize collection cost. */
+    size_t want = zap_live_estimate * 2;
+    if (want < 4u * 1024u * 1024u) {
+        want = 4u * 1024u * 1024u;
+    }
+    zap_gc_threshold = want;
+}
