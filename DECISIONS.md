@@ -763,3 +763,84 @@ the language shipping its own agent interface — reference, fast checks, a
 token-efficient code map, and targeted tests — turns "no training corpus" from a
 liability into a served capability and makes agent-driven development fast and
 accurate.
+
+## D-0056 — Standard library: scope & layout (v1)
+**Status:** Locked — resolves issue #57
+**Three tiers:**
+- **Built-ins** (no import): `print`/`len`/`range`/`assert`; the scalar/container
+  types including the new **`heap`** (D-0057); enums; structs + `@derive` (which
+  replace Python dataclasses).
+- **Bundled std** (ships with the toolchain, imported by **flat short name**, no
+  `zap.toml` entry): `io`/`fs`, `os`, `sys`, `strings`, `math`, `random`,
+  `collections` (deque/bisect/ordered), `sync` (D-0032), `time`/`datetime`,
+  `json`, `csv`, `regex`, `logging`, `argparse`, `testing` (D-0054), `net`,
+  `http` (server depends on the netpoller — built first), `crypto`
+  (hashing/hmac/secrets; TLS rides with `net`/`http`), `process` (external
+  programs), `zlib`/`gzip` (so a gzip-enabled http server is trivial), `signal`
+  (D-0058), and `gc`/`runtime` (D-0058).
+- **Official non-core packages** (we author, but distributed/versioned via the
+  package manager D-0052, not bundled): `sqlite3`, `xml`, `email`, and future
+  libraries.
+
+**Imports** are whole-module with flat names (`import datetime` → `datetime.now()`);
+Zap deliberately has **no `from X import Y`**. The **concurrency model**
+(goroutines/channels/`scope`/`sync`) **replaces** Python's
+`threading`/`multiprocessing`/`asyncio`/`queue` — no such modules (no GIL, so
+goroutines give real parallelism). **Python interop (#27) is a rare relief valve**
+for libraries like NumPy/PyTorch, not an everyday-stdlib crutch.
+
+**Deferred:** `stats` (statistics), TLS (late-v1), `tar`/`zip` archives, profiling
+(D-0058), and the official `sqlite3`/`xml`/`email` packages. **Rejected:**
+`pickle` (RCE-unsafe, Python-specific — use `@derive(Json)`, or a future safe
+`@derive(Binary)` codec); `ctypes` (= C FFI, deferred D-0012).
+
+**Philosophy:** a curated **"Go-plus"** standard library — substantial enough that
+reaching for Python interop is rare, without being a Python-sized kitchen sink.
+
+## D-0057 — `heap` built-in collection
+**Status:** Locked
+A first-class **`heap[T]`** priority queue joins `list`/`dict`/`set`/`array` as a
+built-in collection — a fundamental structure most languages bury in a library
+(Python's `heapq` is functions-on-a-list). **Min-heap by default**; an optional
+**comparator** selects max-heap or custom ordering (e.g. `heap[T](cmp=…)`).
+Operations: `push`, `pop`, `peek`, `len`, iteration. `heap` becomes a reserved
+type keyword; it is a GC-managed reference type. **Rationale:** an ergonomic
+built-in heap is rare and genuinely useful — a small differentiator.
+
+## D-0058 — Signals, runtime diagnostics & fault reporting
+**Status:** Locked
+First-class Unix signal handling, built on the concurrency runtime.
+- **Mechanism:** scheduler threads mask signals; a dedicated signal thread's
+  async-signal-safe handler writes a **self-pipe registered with the netpoller**,
+  and a dispatcher goroutine delivers in normal context. The capability ships in
+  every binary; there is **no global channel** — it wires up **lazily per
+  subscription** (zero-cost when unused, apart from the default handlers below).
+- **Surface:** `signal.notify(SIG…) -> channel[Signal]` (primitive);
+  `@on_signal(SIG…)` built-in decorator (sugar); `scope(cancel_on=[SIG…],
+  grace=<dur>)` — a signal **cancels the scope tree** for structured graceful
+  shutdown, with an optional hard-exit deadline.
+- **Delivery semantics:** a **small buffered** channel (default cap 1) that
+  **coalesces** (drops on overflow — signals are edges, not a queue);
+  **fan-out** to all subscribers; `notify` **takes over disposition** (suppresses
+  the OS default; **no auto-exit** — the program decides when to exit after
+  cleanup); **asynchronous** delivery; **catchable signals only** (a `Signal`
+  enum; `SIGKILL`/`SIGSTOP` excluded).
+- **Fault signals** (`SIGSEGV`/`SIGFPE`/`SIGBUS`/`SIGILL`): **not** via `notify` —
+  a runtime crash handler prints diagnostics (faulting address/location,
+  backtrace, offending goroutine) before terminating, for debugging.
+- **Default diagnostic handlers** (ON by default, **opt-out at build time**,
+  **user-overridable** — a user `notify`/`@on_signal` for that signal wins):
+  `SIGQUIT` → dump goroutine stacks + scheduler/runtime summary; `SIGUSR1` →
+  force GC + print memory stats (heap/live/free bytes, GC count, #goroutines) via
+  Boehm `GC_gcollect`/`GC_get_*`; `SIGUSR2` → toggle profiling — **decision
+  locked, implementation deferred**.
+- **Programmatic access:** a `gc`/`runtime` stdlib module — `gc.collect()`,
+  `gc.stats() -> MemStats`, `runtime.goroutine_dump()` — the signals are just the
+  zero-code operator path to these.
+- **Diagnostic utility:** ship a small tool (a `zap` subcommand, e.g. `zap
+  inspect <pid>`) that triggers the stack-dump / GC-stats / (later) profiling of a
+  **running process by PID**, so operators need not hand-run `kill -QUIT`.
+
+**Rationale:** graceful shutdown and production observability as first-class,
+idiomatic features — critical for serverless/containers and usually an
+afterthought elsewhere.

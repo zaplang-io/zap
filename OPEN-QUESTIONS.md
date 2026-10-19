@@ -59,7 +59,11 @@ _Last updated: 2026-10-19_
   checksum DB, clean logical imports (+ aliasing, multi-import), and a
   project-local env-var-activated **`zenv`** isolating both the Zap module cache
   and a nested Python venv.
-- 🟡 **Standard-library scope & layout** for v1.
+- ✅ **Standard-library scope & layout** for v1 — RESOLVED (D-0056, issue #57):
+  curated "Go-plus" std in three tiers (built-ins incl. `heap` D-0057 / bundled
+  std / official packages); flat whole-module imports, no `from X import Y`;
+  concurrency model replaces threading/multiprocessing; signals + `gc`/`runtime`
+  first-class (D-0058); Python interop is a rare relief valve.
 - ✅ **Build/run command names** — RESOLVED (D-0053, issue #58): one `zap` CLI
   (run/build/test[--watch]/fmt/new/add/zenv/expand/ir/**mcp**); `zapc` becomes
   internal. `zap test` has a watch mode and a `@test` annotation suite (surface in

@@ -117,6 +117,7 @@ auto raw = bytes(s)  # UTF-8 bytes
 auto xs = list[int64]([1, 2, 3])
 auto m  = dict[str, int64]({"a": 1, "b": 2})
 auto a  = array[f64]([1, 2, 3])          # dense numeric, SIMD (design/0002)
+auto h  = heap[int64]()                  # min-heap priority queue (D-0057; comparator optional)
 ```
 
 (Tuples are **value** aggregates, not reference types — see §4.8.)
@@ -561,6 +562,7 @@ zap zenv create               # project env (activate via `source zenv/activate`
 zap expand                    # show @derive/decorator-generated code
 zap ir <file>                 # dump ZIR (diagnostic)
 zap mcp                       # MCP server for coding agents (syntax/compile/test)
+zap inspect <pid>             # stacks / GC+memory stats / (later) profile of a running process
 zap version | zap help
 ```
 
@@ -580,6 +582,32 @@ does fast **parse + type-check** validation (no full build), maintains a compact
 **code-graph** of the project (token-efficient context for agents), and runs
 **targeted** tests — all with structured output.
 
+## 18. Standard library & runtime (D-0056, D-0057, D-0058)
+
+A curated **"Go-plus"** standard library in three tiers: **built-ins** (no import
+— `print`/`len`/`range`/`assert`, the scalar/container types incl. **`heap`**,
+enums, structs+`@derive`); **bundled std** imported by flat short name (`io`/`fs`,
+`os`, `sys`, `strings`, `math`, `random`, `collections`, `sync`, `time`/`datetime`,
+`json`, `csv`, `regex`, `logging`, `argparse`, `testing`, `net`, `http`, `crypto`,
+`process`, `zlib`/`gzip`, `signal`, `gc`/`runtime`); and **official packages** via
+the package manager (`sqlite3`, `xml`, `email`, …). Modules import whole
+(`import datetime`); there is **no `from X import Y`**. The concurrency model
+replaces Python threading/multiprocessing; `import python` (interop) is a rare
+relief valve.
+
+**`heap[T]` (D-0057)** — built-in min-heap priority queue (comparator optional):
+`push`/`pop`/`peek`/`len`.
+
+**Signals & runtime diagnostics (D-0058).** `signal.notify(SIG…) -> channel[Signal]`
+delivers signals over a channel (async, coalesced, fan-out, `notify` takes over
+disposition); `@on_signal(SIG…)` is decorator sugar; `scope(cancel_on=[SIG…],
+grace=…)` turns `SIGTERM`/`SIGINT` into structured graceful shutdown. Fault
+signals (`SIGSEGV`/`SIGFPE`/…) print a crash diagnostic (location + backtrace).
+Default, opt-out, overridable handlers: `SIGQUIT` (stack+runtime dump), `SIGUSR1`
+(force GC + memory stats), `SIGUSR2` (profiling — deferred). The `gc`/`runtime`
+module (`gc.collect()`, `gc.stats()`, `runtime.goroutine_dump()`) exposes the same
+programmatically; `zap inspect <pid>` triggers them against a running process.
+
 ## Appendix A — Reserved words (provisional)
 
 `def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
@@ -591,7 +619,7 @@ does fast **parse + type-check** validation (no full build), maintains a compact
 (contextual, before a delimiter; `detached` is likewise contextual, only after
 `spawn`), and the type keywords (`int32`, `int64`,
 `float32`, `float64`, `i32`, `i64`, `f32`, `f64`, `bool`, `char`, `str`,
-`bytes`, `bigint`, `complex`, `list`, `dict`, `set`, `array`).
+`bytes`, `bigint`, `complex`, `list`, `dict`, `set`, `heap`, `array`).
 
 ## Appendix B — Status of sections
 
