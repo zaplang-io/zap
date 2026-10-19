@@ -952,6 +952,48 @@ def main():
         assert!(vec2.is_value, "Vec2 should be a value struct");
         assert!(!pt.is_value, "plain struct Pt should be a reference type");
         assert_eq!(vec2.fields, vec![Ty::F64, Ty::F64]);
+        // A flat value struct uses the physical inline / register / sret layout
+        // (D-0051); a reference struct never does (shared identity).
+        assert!(
+            vec2.inline,
+            "flat value struct Vec2 should be inline-laid-out"
+        );
+        assert!(!pt.inline, "reference struct Pt must not be inline");
+    }
+
+    #[test]
+    fn nested_value_struct_field_is_not_inline() {
+        // A value struct with a value-struct *field* keeps the heap layout: a
+        // by-value (shallow) aggregate copy would share the nested instance, so
+        // the inline ABI does not apply and deep-copy semantics are preserved.
+        let m = lower_ok(&format!(
+            "{VEC2}value struct Seg:\n    Vec2 a\n    Vec2 b\n\
+             def main():\n    auto s = Seg(a=Vec2(x=1.0, y=2.0), b=Vec2(x=3.0, y=4.0))\n    print(s.a.len2())\n"
+        ));
+        let seg = m.structs.iter().find(|s| s.name == "Seg").expect("Seg");
+        let vec2 = m.structs.iter().find(|s| s.name == "Vec2").expect("Vec2");
+        assert!(seg.is_value, "Seg is a value struct");
+        assert!(
+            !seg.inline,
+            "a value struct with a value-struct field keeps the heap layout"
+        );
+        assert!(vec2.inline, "the flat Vec2 field type is itself inline");
+    }
+
+    #[test]
+    fn tuple_layout_is_inline() {
+        // Tuples are value-semantic aggregates and share the inline/register/sret
+        // layout path (D-0051), when flat.
+        let m = lower_ok(
+            "def divmod(int64 a, int64 b) -> (int64, int64):\n    return a // b, a % b\n\
+             def main():\n    auto (q, r) = divmod(17, 5)\n    print(q)\n    print(r)\n",
+        );
+        let tup = m
+            .structs
+            .iter()
+            .find(|s| s.name == "(tuple)" && s.fields == vec![Ty::I64, Ty::I64])
+            .expect("(int64, int64) tuple layout");
+        assert!(tup.inline, "a flat tuple should be inline-laid-out");
     }
 
     #[test]
@@ -984,27 +1026,50 @@ def main():
     }
 
     #[test]
-    fn value_struct_copies_on_pass_and_return() {
-        // Passing a value struct by value copies it (callee cannot mutate the
-        // caller's), and returning one copies it out of the callee's frame.
+    fn inline_value_struct_pass_and_return_emit_no_copy() {
+        // A flat (inline-eligible) value struct is passed and returned *by value*
+        // via the register/sret ABI (D-0051): the ABI copy is the value-semantics
+        // copy, so lowering emits NO explicit StructNew copy at the argument or
+        // the `return`. This is the heap allocation the inline layout removes.
         let m = lower_ok(&format!(
             "{VEC2}\ndef scale(Vec2 v) -> Vec2:\n    return v\n\
              def main():\n    auto a = Vec2(x=1.0, y=2.0)\n    auto b = scale(a)\n    print(b.len2())\n"
         ));
         let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
         let scale = m.funcs.iter().find(|f| f.name == "scale").unwrap();
-        // main: construct `a` + copy at the `scale(a)` argument + copy at `b = ...`
-        // (the call result is fresh, so `auto b = scale(a)` would normally not
-        // copy; the argument copy is the by-value pass).
-        assert!(
-            structnews(main) >= 2,
-            "passing a value struct by value should copy the argument"
+        // main: only the constructor for `a`. The `scale(a)` argument is passed by
+        // value (no copy), and the call result is fresh so `auto b = ...` is not
+        // copied either.
+        assert_eq!(
+            structnews(main),
+            1,
+            "an inline value-struct argument is copied by the ABI, not a StructNew"
         );
-        // scale: returning `v` (an lvalue) copies it out.
+        // scale: returning `v` by value needs no StructNew copy.
         assert_eq!(
             structnews(scale),
-            1,
-            "returning a value struct should copy it out of the frame"
+            0,
+            "returning an inline value struct emits no copy (returned by value)"
+        );
+    }
+
+    #[test]
+    fn nested_value_struct_still_deep_copies_on_pass() {
+        // A non-inline value struct (one with a value-struct field) keeps the
+        // deep-copy-on-pass behavior: lowering still emits an explicit copy at the
+        // argument boundary, so observable value semantics are unchanged.
+        let m = lower_ok(&format!(
+            "{VEC2}value struct Seg:\n    Vec2 a\n    Vec2 b\n\
+             def mid(Seg s) -> f64:\n    return s.a.len2()\n\
+             def main():\n    auto s = Seg(a=Vec2(x=1.0, y=2.0), b=Vec2(x=3.0, y=4.0))\n    print(mid(s))\n"
+        ));
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        // Construct Seg (1) + its two Vec2 fields boxed in (2) + the deep copy at
+        // the `mid(s)` argument, which recursively copies Seg and its two Vec2s
+        // (3). So strictly more than the 3 construction StructNews.
+        assert!(
+            structnews(main) > 3,
+            "a non-inline value struct must be deep-copied at the argument boundary"
         );
     }
 

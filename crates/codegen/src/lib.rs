@@ -166,6 +166,10 @@ struct Cg<'a, 'ctx> {
     builder: &'a Builder<'ctx>,
     fns: std::collections::HashMap<String, FunctionValue<'ctx>>,
     structs: Vec<inkwell::types::StructType<'ctx>>,
+    /// Per-struct `inline` flag (D-0051, mirrors [`zir::StructLayout::inline`]):
+    /// an inline aggregate is passed/returned **by value** (register/sret) rather
+    /// than as a heap pointer. Indexed by struct id, parallel to `structs`.
+    struct_inline: Vec<bool>,
 }
 
 impl<'a, 'ctx> Cg<'a, 'ctx> {
@@ -180,6 +184,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             builder,
             fns: std::collections::HashMap::new(),
             structs: Vec::new(),
+            struct_inline: Vec::new(),
         }
     }
 
@@ -467,18 +472,54 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         for sl in &m.structs {
             let field_tys: Vec<BasicTypeEnum> = sl.fields.iter().map(|t| self.basic(*t)).collect();
             self.structs.push(self.ctx.struct_type(&field_tys, false));
+            self.struct_inline.push(sl.inline);
         }
+
+        // Functions whose address is taken (`Inst::FuncAddr`) are handed to the
+        // collection runtime as struct-key `__hash__`/`__eq__` pointers (D-0047)
+        // and called through a fixed C pointer ABI (`i64(ptr)` / `i1(ptr, ptr)`).
+        // So such a function must keep the plain pointer ABI for every parameter
+        // and its return — never the by-value aggregate convention (D-0051) —
+        // or the indirect call would not match. Direct ZIR calls stay consistent
+        // because codegen keys argument materialization off the callee signature.
+        let addr_taken: std::collections::HashSet<&str> = m
+            .funcs
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::FuncAddr { func, .. } => Some(func.as_str()),
+                _ => None,
+            })
+            .collect();
 
         // Declare all functions first (so calls resolve).
         for f in &m.funcs {
-            let params: Vec<BasicMetadataTypeEnum> =
-                f.params.iter().map(|t| self.basic(*t).into()).collect();
+            // Inline value structs / tuples are passed and returned by value
+            // (register/sret, D-0051); everything else is a scalar or a pointer.
+            // A method receiver (`self`) stays by-reference even when its type is
+            // inline (`Func::self_param`), so a mutating method sees the caller's
+            // instance (Swift-style).
+            let ptr_abi = addr_taken.contains(f.name.as_str());
+            let params: Vec<BasicMetadataTypeEnum> = f
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    if ptr_abi || (f.self_param && i == 0) {
+                        self.basic(*t).into()
+                    } else {
+                        self.abi_ty(*t).into()
+                    }
+                })
+                .collect();
             let fnty = if f.is_main {
                 i32t.fn_type(&[], false)
             } else {
                 match f.ret {
                     Ty::Void => self.ctx.void_type().fn_type(&params, false),
-                    rt => self.basic(rt).fn_type(&params, false),
+                    rt if ptr_abi => self.basic(rt).fn_type(&params, false),
+                    rt => self.abi_ty(rt).fn_type(&params, false),
                 }
             };
             let fv = self.module.add_function(&f.name, fnty, None);
@@ -537,8 +578,26 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .collect();
 
         let mut vals: Vec<Option<BasicValueEnum>> = vec![None; f.value_types.len()];
+        // Position at the entry block so a by-value aggregate parameter can be
+        // spilled into a stack slot there (the body addresses it through a
+        // pointer). Later instructions for the entry block append after these.
+        self.builder.position_at_end(blocks[0]);
         for (i, slot) in vals.iter_mut().take(f.params.len()).enumerate() {
-            *slot = Some(fv.get_nth_param(i as u32).unwrap());
+            let p = fv.get_nth_param(i as u32).unwrap();
+            if p.is_struct_value() {
+                // An inline value struct / tuple parameter arrives by value
+                // (D-0051); spill it so FieldGet/FieldSet can address it.
+                let spill = self
+                    .builder
+                    .build_alloca(p.get_type(), "param.spill")
+                    .map_err(|e| e.to_string())?;
+                self.builder
+                    .build_store(spill, p)
+                    .map_err(|e| e.to_string())?;
+                *slot = Some(spill.into());
+            } else {
+                *slot = Some(p);
+            }
         }
 
         for (bi, b) in f.blocks.iter().enumerate() {
@@ -573,6 +632,57 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Chan(_)
             | Ty::Match
             | Ty::Py => self.ctx.ptr_type(AddressSpace::default()).into(),
+        }
+    }
+
+    /// The **ABI** (calling-convention) type for `t`. Identical to [`basic`]
+    /// except that an inline value struct / tuple (D-0051) is its LLVM aggregate
+    /// type *by value* — so the backend passes small ones in registers and
+    /// returns larger ones via an `sret` pointer — instead of a heap pointer.
+    /// Used only at call boundaries (function signatures, call arguments,
+    /// returns); the function *body* still addresses every aggregate through a
+    /// pointer, which is what [`basic`] yields.
+    fn abi_ty(&self, t: Ty) -> BasicTypeEnum<'ctx> {
+        if let Ty::Struct(sid) = t {
+            if self.struct_inline[sid as usize] {
+                return self.structs[sid as usize].into();
+            }
+        }
+        self.basic(t)
+    }
+
+    /// Materialize a call argument for the ABI: when the callee expects an
+    /// inline aggregate *by value* (`param_ty` is a struct type), load it from
+    /// the pointer the body holds; otherwise pass the value through.
+    fn abi_arg(
+        &self,
+        param_ty: BasicTypeEnum<'ctx>,
+        v: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        if param_ty.is_struct_type() {
+            self.builder
+                .build_load(param_ty, v.into_pointer_value(), "arg.agg")
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(v)
+        }
+    }
+
+    /// Spill a by-value aggregate *result* into a stack slot, yielding the
+    /// pointer the rest of the body uses to address it (FieldGet/FieldSet,
+    /// D-0051). Non-aggregate results pass through unchanged.
+    fn abi_result(&self, v: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>, String> {
+        if v.is_struct_value() {
+            let slot = self
+                .builder
+                .build_alloca(v.get_type(), "ret.spill")
+                .map_err(|e| e.to_string())?;
+            self.builder
+                .build_store(slot, v)
+                .map_err(|e| e.to_string())?;
+            Ok(slot.into())
+        } else {
+            Ok(v)
         }
     }
 
@@ -773,13 +883,26 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .fns
                     .get(func)
                     .ok_or_else(|| format!("call to unknown function '{func}'"))?;
-                let argvals: Vec<_> = args.iter().map(|a| get(vals, *a).into()).collect();
+                // By-value aggregate arguments (inline value structs / tuples,
+                // D-0051) are loaded from their pointer per the callee signature;
+                // a struct result is spilled back to a pointer for the body.
+                let param_tys = fv.get_type().get_param_types();
+                let mut argvals: Vec<inkwell::values::BasicMetadataValueEnum> =
+                    Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    let v = get(vals, *a);
+                    let v = match param_tys.get(i) {
+                        Some(pt) => self.abi_arg(*pt, v)?,
+                        None => v, // variadic tail (e.g. printf) — never aggregate
+                    };
+                    argvals.push(v.into());
+                }
                 let cs = b
                     .build_call(fv, &argvals, "call")
                     .map_err(|e| e.to_string())?;
                 if let Some(d) = dest {
                     if let Some(v) = cs.try_as_basic_value().left() {
-                        vals[*d as usize] = Some(v);
+                        vals[*d as usize] = Some(self.abi_result(v)?);
                     }
                 }
             }
@@ -890,7 +1013,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .fns
                     .get(func)
                     .ok_or_else(|| format!("invoke of unknown function '{func}'"))?;
-                let argvals: Vec<BasicValueEnum> = args.iter().map(|a| get(vals, *a)).collect();
+                // Same by-value aggregate ABI as `Inst::Call` (D-0051).
+                let param_tys = callee.get_type().get_param_types();
+                let mut argvals: Vec<BasicValueEnum> = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    let v = get(vals, *a);
+                    let v = match param_tys.get(i) {
+                        Some(pt) => self.abi_arg(*pt, v)?,
+                        None => v,
+                    };
+                    argvals.push(v);
+                }
                 let cont = self.ctx.append_basic_block(fv, "invoke.cont");
                 let cs = b
                     .build_invoke(callee, &argvals, cont, blocks[*unwind as usize], "invoke")
@@ -898,7 +1031,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 b.position_at_end(cont);
                 if let Some(d) = dest {
                     if let Some(v) = cs.try_as_basic_value().left() {
-                        vals[*d as usize] = Some(v);
+                        vals[*d as usize] = Some(self.abi_result(v)?);
                     }
                 }
             }
@@ -969,8 +1102,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     let fp = b
                         .build_struct_gep(env_struct, env, i as u32, "argptr")
                         .map_err(|_| "invalid spawn argument index".to_string())?;
-                    b.build_store(fp, get(vals, *a))
-                        .map_err(|e| e.to_string())?;
+                    // A by-value aggregate argument (inline value struct / tuple,
+                    // D-0051) is stored into the GC-allocated closure by value —
+                    // an independent copy that outlives the spawning frame — so
+                    // load it from its pointer first. The trampoline loads it back
+                    // and passes it by value to the target.
+                    let v = get(vals, *a);
+                    let v = match param_tys.get(i) {
+                        Some(pt) => self.abi_arg(*pt, v)?,
+                        None => v,
+                    };
+                    b.build_store(fp, v).map_err(|e| e.to_string())?;
                 }
                 let thunk = self.spawn_thunk(func, target, env_struct)?;
                 let thunk_ptr = thunk.as_global_value().as_pointer_value();
@@ -1365,7 +1507,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         term: &Term,
         blocks: &[BasicBlock<'ctx>],
         vals: &[Option<BasicValueEnum<'ctx>>],
-        _fv: FunctionValue<'ctx>,
+        fv: FunctionValue<'ctx>,
     ) -> Result<(), String> {
         let b = self.builder;
         // The implicit root scope joins every spawned coroutine at program exit
@@ -1394,6 +1536,18 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                             .map_err(|e| e.to_string())?
                     };
                     b.build_return(Some(&r)).map_err(|e| e.to_string())?;
+                } else if let Some(ret_ty) = fv
+                    .get_type()
+                    .get_return_type()
+                    .filter(|t| t.is_struct_type())
+                {
+                    // An inline value struct / tuple is returned by value
+                    // (register/sret, D-0051): load the aggregate from the
+                    // pointer the body holds and return it.
+                    let agg = b
+                        .build_load(ret_ty, rv.into_pointer_value(), "ret.agg")
+                        .map_err(|e| e.to_string())?;
+                    b.build_return(Some(&agg)).map_err(|e| e.to_string())?;
                 } else {
                     b.build_return(Some(&rv)).map_err(|e| e.to_string())?;
                 }
@@ -1523,6 +1677,69 @@ mod tests {
         assert!(
             ir.contains("mul <4 x i64>"),
             "expected a vectorized mul in IR:\n{ir}"
+        );
+    }
+
+    // D-0051 physical layout: a flat `value struct` is passed and returned *by
+    // value* as an LLVM aggregate (register/sret ABI), not as a heap pointer.
+    #[test]
+    fn inline_value_struct_uses_by_value_abi() {
+        let ir = llvm_ir(
+            "value struct Vec2:\n    f64 x\n    f64 y\n\
+             def scale(Vec2 v) -> Vec2:\n    return v\n\
+             def main():\n    auto a = Vec2(x=1.0, y=2.0)\n    auto b = scale(a)\n    print(b.x)\n",
+        );
+        // The by-value aggregate signature (small struct → registers).
+        assert!(
+            ir.contains("define { double, double } @scale({ double, double }"),
+            "a flat value struct should pass/return by value:\n{ir}"
+        );
+    }
+
+    // A reference struct (D-0023) keeps the heap-pointer ABI — it has shared
+    // identity, so it is never laid out inline.
+    #[test]
+    fn reference_struct_keeps_pointer_abi() {
+        let ir = llvm_ir(
+            "struct Pt:\n    f64 x\n    f64 y\n\
+             def id(Pt p) -> Pt:\n    return p\n\
+             def main():\n    auto a = Pt(x=1.0, y=2.0)\n    print(id(a).x)\n",
+        );
+        assert!(
+            ir.contains("define ptr @id(ptr"),
+            "a reference struct must pass/return as a pointer:\n{ir}"
+        );
+    }
+
+    // A tuple shares the inline layout path (D-0051): a multi-return `(i64, i64)`
+    // comes back by value as an aggregate.
+    #[test]
+    fn tuple_return_uses_by_value_abi() {
+        let ir = llvm_ir(
+            "def divmod(int64 a, int64 b) -> (int64, int64):\n    return a // b, a % b\n\
+             def main():\n    auto (q, r) = divmod(17, 5)\n    print(q)\n",
+        );
+        assert!(
+            ir.contains("define { i64, i64 } @divmod("),
+            "a flat tuple should be returned by value:\n{ir}"
+        );
+    }
+
+    // The key-function ABI guard: a value struct used as a dict/set key has its
+    // `__eq__`/`__hash__` address taken and called by the runtime through a
+    // pointer ABI, so those methods must keep pointer parameters even though the
+    // struct is otherwise inline (D-0051 / D-0047).
+    #[test]
+    fn key_functions_keep_pointer_abi() {
+        let ir = llvm_ir(
+            "@derive(Eq, Hash)\nvalue struct Point:\n    int64 x\n    int64 y\n\
+             def main():\n    auto d = {Point(x=1, y=2): 10}\n    print(len(d))\n",
+        );
+        // __eq__ is called as i1(ptr, ptr) and __hash__ as i64(ptr) by the
+        // collection runtime, so both take pointers, not by-value aggregates.
+        assert!(
+            ir.contains("@Point____eq__(ptr") && ir.contains("@Point____hash__(ptr"),
+            "key functions must keep the pointer ABI:\n{ir}"
         );
     }
 

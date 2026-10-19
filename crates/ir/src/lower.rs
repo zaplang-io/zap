@@ -163,6 +163,32 @@ impl StructCtx {
     fn is_value_struct(&self, sid: u32) -> bool {
         self.value_ids.contains(&sid)
     }
+
+    /// Whether `sid` uses the physical inline / register / sret layout (D-0051):
+    /// a value struct or a tuple, all of whose fields are non-aggregate (no field
+    /// is itself a value struct or tuple). This is the single source of truth for
+    /// [`StructLayout::inline`]; lowering consults it to decide where the
+    /// by-value calling convention already supplies the value-semantics copy, so
+    /// an explicit copy can be dropped. See [`StructLayout::inline`] for why a
+    /// nested value-aggregate field keeps the heap representation.
+    fn inline_eligible(&self, sid: u32) -> bool {
+        let is_tuple = self.tuples.borrow().is_tuple(sid);
+        if !(self.is_value_struct(sid) || is_tuple) {
+            return false;
+        }
+        let blocking = |fty: &Ty| -> bool {
+            matches!(fty, Ty::Struct(fsid)
+                if self.is_value_struct(*fsid) || self.tuples.borrow().is_tuple(*fsid))
+        };
+        if is_tuple {
+            match self.tuples.borrow().fields(sid) {
+                Some(fields) => !fields.iter().any(&blocking),
+                None => false,
+            }
+        } else {
+            !self.fields[sid as usize].iter().any(|(_, f)| blocking(f))
+        }
+    }
 }
 
 /// An expression whose value is an *existing object* (an lvalue read), so a
@@ -414,6 +440,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             name: ctx.names[sid].clone(),
             fields: ctx.fields[sid].iter().map(|(_, t)| *t).collect(),
             is_value: ctx.is_value_struct(sid as u32),
+            inline: false, // set in the post-pass below, once all layouts exist
         });
     }
     for item in &module.items {
@@ -459,8 +486,19 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             name: "(tuple)".to_string(),
             fields: elems.clone(),
             is_value: false,
+            inline: false, // set in the post-pass below
         });
     }
+
+    // Physical inline-layout pass (D-0051). A value struct or a tuple is a
+    // value-semantic aggregate with no shared identity, so it can be laid out
+    // inline and passed/returned by value (register/sret) instead of as a heap
+    // pointer — but only when none of its fields is *itself* a value aggregate
+    // (see `StructCtx::inline_eligible`, the shared predicate).
+    for sid in 0..out.structs.len() {
+        out.structs[sid].inline = ctx.inline_eligible(sid as u32);
+    }
+
     (out, errors)
 }
 
@@ -919,6 +957,7 @@ fn gen_eq_method(
         vec![Ty::Struct(sid), Ty::Struct(sid)],
         Ty::I1,
         false,
+        true, // self_param: a derived method's receiver is by-reference
         sigs,
         ctx,
     );
@@ -1010,7 +1049,7 @@ fn gen_repr_method(
 ) -> Result<Func, LowerError> {
     let sname = ctx.names[sid as usize].clone();
     let name = format!("{sname}__{}", "__repr__");
-    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, sigs, ctx);
+    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, true, sigs, ctx);
     let mut acc = b.strconst(&format!("{sname}("));
     let fields = ctx.fields[sid as usize].clone();
     for (idx, (fname, fty)) in fields.iter().enumerate() {
@@ -1080,6 +1119,7 @@ fn gen_cmp_method(
         vec![Ty::Struct(sid), Ty::Struct(sid)],
         Ty::I64,
         false,
+        true, // self_param: a derived method's receiver is by-reference
         sigs,
         ctx,
     );
@@ -1218,7 +1258,7 @@ fn gen_hash_method(
     ctx: &StructCtx,
 ) -> Result<Func, LowerError> {
     let name = format!("{}__{}", ctx.names[sid as usize], "__hash__");
-    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::I64, false, sigs, ctx);
+    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::I64, false, true, sigs, ctx);
     // Seed; each field hash is mixed in with `zap_hash_combine`.
     let mut acc = b.iconst(Ty::I64, 0);
     let fields = ctx.fields[sid as usize].clone();
@@ -1279,8 +1319,15 @@ fn lower_fn(
 ) -> Result<Func, LowerError> {
     let (params, ret) = sigs.get(&zir_name).cloned().unwrap();
     let is_main = zir_name == "main";
-    let _ = self_sid;
-    let mut b = FnLower::new(zir_name, params.clone(), ret, is_main, sigs, ctx);
+    let mut b = FnLower::new(
+        zir_name,
+        params.clone(),
+        ret,
+        is_main,
+        self_sid.is_some(),
+        sigs,
+        ctx,
+    );
 
     // Parameters: values 0..n are the incoming args; copy each into a slot.
     for (i, p) in f.params.iter().enumerate() {
@@ -1370,6 +1417,7 @@ impl<'a> FnLower<'a> {
         params: Vec<Ty>,
         ret: Ty,
         is_main: bool,
+        self_param: bool,
         sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
         ctx: &'a StructCtx,
     ) -> FnLower<'a> {
@@ -1379,6 +1427,7 @@ impl<'a> FnLower<'a> {
             params,
             ret,
             is_main,
+            self_param,
             value_types,
             blocks: vec![Block {
                 id: 0,
@@ -1512,6 +1561,25 @@ impl<'a> FnLower<'a> {
             }
         }
         v
+    }
+
+    /// Like [`copy_if_value`], but for a value crossing a **by-value calling
+    /// boundary** — a function/method argument, a `return`, or a `spawn`
+    /// argument. For an [`inline-eligible`](StructCtx::inline_eligible) aggregate
+    /// (a flat value struct or tuple) no explicit copy is emitted: the
+    /// register/sret ABI passes/returns it **by value**, which is itself an
+    /// independent copy (D-0051), so a prior copy would be redundant and would
+    /// reintroduce the heap allocation the inline layout removes. Non-inline
+    /// value structs (those with a nested value-aggregate field, still a heap
+    /// pointer) fall back to [`copy_if_value`]'s deep copy, preserving the
+    /// observable value semantics unchanged.
+    fn copy_for_pass(&mut self, v: Value, ty: Ty, src: &ast::Expr) -> Value {
+        if let Ty::Struct(sid) = ty {
+            if self.ctx.inline_eligible(sid) {
+                return v;
+            }
+        }
+        self.copy_if_value(v, ty, src)
     }
 
     /// Box a value struct for storage in a collection or another aggregate
@@ -1781,10 +1849,12 @@ impl<'a> FnLower<'a> {
                         } else {
                             self.coerce(v, vt, ret)
                         };
-                        // Returning a value struct copies it (D-0051), so the
-                        // caller receives an instance independent of the callee's
-                        // locals.
-                        let v = self.copy_if_value(v, ret, e);
+                        // Returning a value struct yields an instance independent
+                        // of the callee's locals (D-0051). An inline-eligible
+                        // aggregate is returned by value (register/sret), which is
+                        // already that copy; a non-inline value struct is deep-
+                        // copied here. See `copy_for_pass`.
+                        let v = self.copy_for_pass(v, ret, e);
                         self.set_term(Term::Ret(Some(v)));
                     }
                     None => self.set_term(Term::Ret(None)),
@@ -2029,9 +2099,13 @@ impl<'a> FnLower<'a> {
             let (v, vt) = self.expr(&a.value)?;
             let target = *ptys.get(i).unwrap_or(&vt);
             let v = self.coerce(v, vt, target);
-            // A value struct captured by a goroutine is copied (D-0051); the
-            // copy is heap-allocated, so it safely outlives the spawning frame.
-            let v = self.copy_if_value(v, target, &a.value);
+            // A value struct captured by a goroutine is copied (D-0051) so it
+            // safely outlives the spawning frame. A non-inline value struct is
+            // deep-copied here (heap). An inline-eligible aggregate is copied by
+            // value into the GC-allocated spawn closure (codegen stores the
+            // aggregate, not a pointer), which outlives the frame just the same,
+            // so no explicit copy is emitted. See `copy_for_pass`.
+            let v = self.copy_for_pass(v, target, &a.value);
             argvals.push(v);
         }
         self.emit(Inst::Spawn {
@@ -3393,8 +3467,11 @@ impl<'a> FnLower<'a> {
                     let target = *ptys.get(i).unwrap_or(&vt);
                     let v = self.coerce(v, vt, target);
                     // A value struct passed by value is copied (D-0051): the
-                    // callee's mutations do not escape to the caller.
-                    let v = self.copy_if_value(v, target, &a.value);
+                    // callee's mutations do not escape to the caller. An inline-
+                    // eligible aggregate gets that copy from the register/sret
+                    // ABI; a non-inline value struct is deep-copied. See
+                    // `copy_for_pass`.
+                    let v = self.copy_for_pass(v, target, &a.value);
                     argvals.push(v);
                 }
                 let dest = if ret == Ty::Void {
@@ -3460,13 +3537,15 @@ impl<'a> FnLower<'a> {
                 .ok_or_else(|| err(format!("no method '{name}' on that struct")))?;
             // `self` is passed by reference (a value-type mutating method acts
             // on the receiver variable, Swift-style); the remaining arguments
-            // are copied when they are value structs (D-0051).
+            // are copied when they are value structs (D-0051). An inline-eligible
+            // argument is copied by the register/sret ABI, so no explicit copy is
+            // emitted for it (see `copy_for_pass`).
             let mut argvals = vec![recv]; // self
             for (i, a) in args.iter().enumerate() {
                 let (v, vt) = self.expr(&a.value)?;
                 let target = *ptys.get(i + 1).unwrap_or(&vt);
                 let v = self.coerce(v, vt, target);
-                let v = self.copy_if_value(v, target, &a.value);
+                let v = self.copy_for_pass(v, target, &a.value);
                 argvals.push(v);
             }
             let dest = if ret == Ty::Void {

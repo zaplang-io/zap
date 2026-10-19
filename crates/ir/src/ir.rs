@@ -384,6 +384,13 @@ pub struct Func {
     pub params: Vec<Ty>,
     pub ret: Ty,
     pub is_main: bool,
+    /// `true` when parameter 0 is a by-reference method receiver (`self`). A
+    /// `value struct` `self` is passed **by reference** (a pointer), Swift-style,
+    /// so a mutating method acts on the receiver variable — unlike ordinary
+    /// value-struct arguments, which are passed by value (D-0051). Codegen uses
+    /// this to keep `self` a pointer even when its type would otherwise be
+    /// [`StructLayout::inline`]. `false` for free functions.
+    pub self_param: bool,
     /// Type of every value; `value_types[0..params.len()]` are the parameters.
     pub value_types: Vec<Ty>,
     pub blocks: Vec<Block>,
@@ -403,11 +410,21 @@ pub struct StructLayout {
     /// `true` for a `value struct` (D-0051): a value type with value semantics
     /// (copied on assign/pass/return, no shared identity). A plain `struct`
     /// (reference type, D-0023) and an anonymous tuple layout have
-    /// `is_value == false`. The physical representation is identical today (a
-    /// GC-heap aggregate behind a pointer); this flag records the kind so value
-    /// semantics are applied at lowering and a future backend pass can specialize
-    /// small value structs to registers/stack (sret ABI).
+    /// `is_value == false`. The physical storage is a GC-heap aggregate behind a
+    /// pointer; value semantics are applied at lowering by explicit copies.
     pub is_value: bool,
+    /// `true` when this aggregate uses the **physical inline / register / sret**
+    /// calling convention (D-0051): it is passed and returned **by value** (an
+    /// LLVM aggregate — small ones land in registers, larger ones return via an
+    /// `sret` pointer the backend inserts) rather than as a heap pointer. Set for
+    /// a `value struct` *and* for a tuple (both are value-semantic aggregates
+    /// with no shared identity), but only when **no field is itself a value
+    /// aggregate** (value struct or tuple): a by-value aggregate copy is shallow,
+    /// so for a flat aggregate it is exactly the field-wise value-struct copy,
+    /// whereas a nested value-aggregate field would be shared by a shallow copy
+    /// and so keeps the heap representation. Reference structs (D-0023) and
+    /// tier-3 enum payload structs are never inline — they have shared identity.
+    pub inline: bool,
 }
 
 #[derive(Clone, Debug, Default)]
