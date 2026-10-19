@@ -349,6 +349,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Some(i.into()),
         );
         self.declare_rt("zap_set_items", &[p.into()], Some(p.into()));
+        // heap (ticket #76, D-0057): a binary min-heap priority queue over a
+        // growable GC array. `zap_heap_new(kind, dir)` picks the element word
+        // representation (0 = i64, 1 = str, selecting the typed push/pop/peek
+        // entry point) and the ordering (0 = min, 1 = max). `zap_heap_items`
+        // snapshots the elements into a list in priority (root-first) order for
+        // non-destructive iteration.
+        self.declare_rt("zap_heap_new", &[i.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_heap_len", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_heap_push_i64", &[p.into(), i.into()], None);
+        self.declare_rt("zap_heap_push_ptr", &[p.into(), p.into()], None);
+        self.declare_rt("zap_heap_pop_i64", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_heap_pop_ptr", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_heap_peek_i64", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_heap_peek_ptr", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_heap_items", &[p.into()], Some(p.into()));
         // Struct-key hashing helpers (operator overloading, D-0047).
         self.declare_rt("zap_str_cmp", &[p.into(), p.into()], Some(i.into()));
         self.declare_rt("zap_str_hash", &[p.into()], Some(i.into()));
@@ -553,6 +568,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::List(_)
             | Ty::Dict(..)
             | Ty::Set(_)
+            | Ty::Heap(_)
             | Ty::Array(_)
             | Ty::Chan(_)
             | Ty::Match

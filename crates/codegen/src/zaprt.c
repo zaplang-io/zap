@@ -581,6 +581,181 @@ void *zap_set_items(void *sp) {
 }
 
 /* ---------------------------------------------------------------------------
+ * heap[T]: a binary min-heap priority queue (ticket #76, D-0057).
+ *
+ * A complete binary heap over a growable GC array of 8-byte element words
+ * (`int64` values, or `ZapStr` pointer bits). Min-heap by default; the `dir`
+ * flag flips the comparator for a max-heap. Elements are *ordered* (not hashed):
+ * `int64` words compare numerically, pointer words as `ZapStr` bytes
+ * (`zap_str_cmp`). `push` sifts up, `pop` removes the root and sifts down, and
+ * `peek` reads the root — all O(log n). Iteration (`zap_heap_items`) copies the
+ * backing array and heap-sorts the copy, yielding priority (root-first) order
+ * without disturbing the live heap.
+ *
+ * Deferred (clean follow-ups): user-struct elements ordered through a comparator
+ * / `__cmp__` function pointer, float elements, and `cmp=` taking an arbitrary
+ * comparator function (the surface is a direction selector for now). */
+enum { HEAP_ELEM_I64 = 0, HEAP_ELEM_STR = 1 };
+enum { HEAP_MIN = 0, HEAP_MAX = 1 };
+
+typedef struct {
+    int64_t len;
+    int64_t cap;
+    int64_t *data; /* `cap` element words */
+    int64_t kind;  /* HEAP_ELEM_I64 | HEAP_ELEM_STR */
+    int64_t dir;   /* HEAP_MIN | HEAP_MAX */
+} ZapHeap;
+
+/* Three-way compare of two element words under the heap's ordering. Returns < 0
+ * when `a` has higher priority than `b` (should sit closer to the root): for a
+ * min-heap that is the smaller element, for a max-heap the larger. */
+static int64_t zap_heap_cmp(const ZapHeap *h, int64_t a, int64_t b) {
+    int64_t c;
+    if (h->kind == HEAP_ELEM_STR) {
+        c = zap_str_cmp((void *)(intptr_t)a, (void *)(intptr_t)b);
+    } else {
+        c = (a < b) ? -1 : (a > b ? 1 : 0);
+    }
+    return h->dir == HEAP_MAX ? -c : c;
+}
+
+static void zap_heap_grow(ZapHeap *h) {
+    int64_t cap = h->cap < 4 ? 4 : h->cap * 2;
+    int64_t *data = (int64_t *)GC_MALLOC((size_t)cap * sizeof(int64_t));
+    if (h->len > 0) {
+        memcpy(data, h->data, (size_t)h->len * sizeof(int64_t));
+    }
+    h->data = data;
+    h->cap = cap;
+}
+
+static void zap_heap_swap(ZapHeap *h, int64_t i, int64_t j) {
+    int64_t t = h->data[i];
+    h->data[i] = h->data[j];
+    h->data[j] = t;
+}
+
+static void zap_heap_sift_up(ZapHeap *h, int64_t i) {
+    while (i > 0) {
+        int64_t parent = (i - 1) / 2;
+        if (zap_heap_cmp(h, h->data[i], h->data[parent]) < 0) {
+            zap_heap_swap(h, i, parent);
+            i = parent;
+        } else {
+            break;
+        }
+    }
+}
+
+static void zap_heap_sift_down(ZapHeap *h, int64_t i) {
+    for (;;) {
+        int64_t l = 2 * i + 1;
+        int64_t r = 2 * i + 2;
+        int64_t top = i;
+        if (l < h->len && zap_heap_cmp(h, h->data[l], h->data[top]) < 0) {
+            top = l;
+        }
+        if (r < h->len && zap_heap_cmp(h, h->data[r], h->data[top]) < 0) {
+            top = r;
+        }
+        if (top == i) {
+            break;
+        }
+        zap_heap_swap(h, i, top);
+        i = top;
+    }
+}
+
+static void zap_heap_push_word(ZapHeap *h, int64_t word) {
+    if (h->len == h->cap) {
+        zap_heap_grow(h);
+    }
+    h->data[h->len] = word;
+    zap_heap_sift_up(h, h->len);
+    h->len++;
+}
+
+/* Remove and return the root word. The caller guarantees the heap is non-empty. */
+static int64_t zap_heap_pop_word(ZapHeap *h) {
+    int64_t top = h->data[0];
+    h->len--;
+    if (h->len > 0) {
+        h->data[0] = h->data[h->len];
+        zap_heap_sift_down(h, 0);
+    }
+    return top;
+}
+
+/* pop/peek on an empty heap aborts (no exception runtime path yet, like an
+ * out-of-range list index). */
+static void zap_heap_require(const ZapHeap *h, const char *op) {
+    if (h->len == 0) {
+        fprintf(stderr, "zap: heap %s on an empty heap\n", op);
+        abort();
+    }
+}
+
+void *zap_heap_new(int64_t kind, int64_t dir) {
+    ZapHeap *h = (ZapHeap *)GC_MALLOC(sizeof(ZapHeap));
+    h->len = 0;
+    h->cap = 0;
+    h->data = NULL;
+    h->kind = kind;
+    h->dir = dir;
+    return h;
+}
+
+int64_t zap_heap_len(void *h) { return ((ZapHeap *)h)->len; }
+
+void zap_heap_push_i64(void *h, int64_t v) { zap_heap_push_word((ZapHeap *)h, v); }
+void zap_heap_push_ptr(void *h, void *v) {
+    zap_heap_push_word((ZapHeap *)h, (int64_t)(intptr_t)v);
+}
+
+int64_t zap_heap_pop_i64(void *hp) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "pop");
+    return zap_heap_pop_word(h);
+}
+void *zap_heap_pop_ptr(void *hp) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "pop");
+    return (void *)(intptr_t)zap_heap_pop_word(h);
+}
+
+int64_t zap_heap_peek_i64(void *hp) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "peek");
+    return h->data[0];
+}
+void *zap_heap_peek_ptr(void *hp) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "peek");
+    return (void *)(intptr_t)h->data[0];
+}
+
+/* Snapshot the elements into a fresh list in priority (root-first) order,
+ * leaving the live heap untouched: copy the backing array into a scratch heap
+ * and drain it. */
+void *zap_heap_items(void *hp) {
+    ZapHeap *h = (ZapHeap *)hp;
+    ZapList *out = (ZapList *)zap_list_new();
+    int64_t n = h->len;
+    if (n == 0) {
+        return out;
+    }
+    ZapHeap tmp = *h;
+    tmp.cap = n;
+    tmp.len = n;
+    tmp.data = (int64_t *)GC_MALLOC((size_t)n * sizeof(int64_t));
+    memcpy(tmp.data, h->data, (size_t)n * sizeof(int64_t));
+    while (tmp.len > 0) {
+        zap_list_push(out, zap_heap_pop_word(&tmp));
+    }
+    return out;
+}
+
+/* ---------------------------------------------------------------------------
  * Numeric arrays (ticket #24, design/0002-arrays.md, design/RUNTIME-ABI.md
  * §"Collection layout": `array[T]`).
  *

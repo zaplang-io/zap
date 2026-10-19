@@ -44,6 +44,10 @@ pub enum Ty {
     List(Box<Ty>),
     Dict(Box<Ty>, Box<Ty>),
     Set(Box<Ty>),
+    /// A built-in `heap[T]` priority queue (D-0057): a min-heap by default, with
+    /// an optional `cmp=` selecting max/custom ordering. A GC-managed reference
+    /// type, joining `list`/`dict`/`set`/`array`.
+    Heap(Box<Ty>),
     /// A fixed-arity, heterogeneous, immutable tuple (D-0019/D-0049) carrying its
     /// element types in positional order. The empty tuple `()` is the unit value.
     Tuple(Vec<Ty>),
@@ -106,6 +110,7 @@ impl Ty {
             Ty::List(t) => format!("list[{}]", t.display()),
             Ty::Dict(k, v) => format!("dict[{}, {}]", k.display(), v.display()),
             Ty::Set(t) => format!("set[{}]", t.display()),
+            Ty::Heap(t) => format!("heap[{}]", t.display()),
             Ty::Tuple(ts) => {
                 let inner = ts
                     .iter()
@@ -159,6 +164,7 @@ fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::Int32 | Ty::Int64, Ty::Bigint) => true,
         (Ty::List(a), Ty::List(b)) => assignable(a, b),
         (Ty::Set(a), Ty::Set(b)) => assignable(a, b),
+        (Ty::Heap(a), Ty::Heap(b)) => assignable(a, b),
         // A tuple is assignable to a tuple of the same arity when each element is
         // (covariantly) assignable — this covers returning untyped literals into
         // a declared tuple type (`-> (int64, int64)` with `return 1, 2`).
@@ -888,6 +894,13 @@ impl Checker {
                         .map(|a| self.resolve_type(a))
                         .unwrap_or(Ty::Unknown);
                     Ty::Set(Box::new(el))
+                }
+                "heap" => {
+                    let el = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::Heap(Box::new(el))
                 }
                 "channel" => {
                     let el = args
@@ -2167,7 +2180,7 @@ impl Checker {
     fn iterable_elem(&self, it: &Ty) -> Option<Ty> {
         match it {
             Ty::Range => Some(Ty::Int64),
-            Ty::List(t) | Ty::Set(t) => Some((**t).clone()),
+            Ty::List(t) | Ty::Set(t) | Ty::Heap(t) => Some((**t).clone()),
             Ty::Str => Some(Ty::Char),
             Ty::Unknown | Ty::Py => Some(Ty::Unknown),
             Ty::Named(_) => {
@@ -2379,6 +2392,46 @@ impl Checker {
                     }
                 }
                 return Ty::Chan(Box::new(elem));
+            }
+            // Heap construction `heap[T]()` / `heap[T](cmp="max")` (D-0057). The
+            // element type `T` is the subscript; the only accepted argument is the
+            // keyword `cmp`, whose value is the string "min" (default) or "max"
+            // selecting heap direction.
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "heap") {
+                let elem = self.chan_elem_from_expr(index);
+                for a in args {
+                    let at = self.infer(&a.value);
+                    match a.name.as_deref() {
+                        Some("cmp") => {
+                            if let Expr::Str { value, .. } = &a.value {
+                                if value != "min" && value != "max" {
+                                    self.error(
+                                        format!(
+                                            "heap cmp must be \"min\" or \"max\", found {value:?}"
+                                        ),
+                                        expr_span(&a.value),
+                                    );
+                                }
+                            } else if !matches!(at, Ty::Unknown) {
+                                self.error(
+                                    "heap cmp must be a string literal (\"min\" or \"max\")"
+                                        .to_string(),
+                                    expr_span(&a.value),
+                                );
+                            }
+                        }
+                        Some(other) => self.error(
+                            format!("heap[T](...) has no keyword argument '{other}' (only 'cmp')"),
+                            expr_span(&a.value),
+                        ),
+                        None => self.error(
+                            "heap[T](...) takes only the keyword argument 'cmp' (e.g. cmp=\"max\")"
+                                .to_string(),
+                            expr_span(&a.value),
+                        ),
+                    }
+                }
+                return Ty::Heap(Box::new(elem));
             }
         }
         if let Expr::Name(fname, _) = callee {
@@ -3634,5 +3687,58 @@ def main():
         // A value struct may hold a reference-struct field (a pointer); that does
         // not make it infinitely sized.
         ok("struct Ref:\n    int64 n\n\nvalue struct Holder:\n    Ref r\n    int64 k\n");
+    }
+
+    #[test]
+    fn heap_type_checks() {
+        // heap[T] (D-0057): construction, push/pop/peek, len, and iteration all
+        // type-check. The min-heap and the max-heap-via-comparator forms are both
+        // accepted, and the full golden fixture type-checks.
+        ok(include_str!("../../../tests/golden/heap.zap"));
+    }
+
+    #[test]
+    fn heap_element_type_is_tracked() {
+        // Iterating a `heap[int64]` yields `int64` loop elements, and `len(h)` is
+        // an integer — the heap carries its element type like list/set.
+        ok("def main():\n    \
+                auto h = heap[int64]()\n    \
+                h.push(3)\n    \
+                int64 total = 0\n    \
+                for x in h:\n        total = total + x\n    \
+                print(total)\n    \
+                int64 n = len(h)\n    \
+                print(n)\n");
+    }
+
+    #[test]
+    fn heap_bad_comparator_errors() {
+        // `cmp` accepts only the string literals "min" / "max".
+        let e = errors("def main():\n    auto h = heap[int64](cmp=\"biggest\")\n");
+        assert!(
+            e.iter().any(|x| x.message.contains("cmp must be")),
+            "expected a heap-cmp error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn heap_unknown_keyword_errors() {
+        // Only the `cmp` keyword argument is accepted.
+        let e = errors("def main():\n    auto h = heap[int64](dir=\"max\")\n");
+        assert!(
+            e.iter().any(|x| x.message.contains("no keyword argument")),
+            "expected an unknown-keyword error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn heap_positional_argument_errors() {
+        // A positional argument (no `cmp=`) is rejected.
+        let e = errors("def main():\n    auto h = heap[int64](3)\n");
+        assert!(
+            e.iter()
+                .any(|x| x.message.contains("only the keyword argument")),
+            "expected a positional-argument error, got {e:?}"
+        );
     }
 }

@@ -208,6 +208,58 @@ mod tests {
     }
 
     #[test]
+    fn lower_heap() {
+        // heap[int64] (D-0057): construction, push/pop/peek/len, and the
+        // priority-order snapshot that `for x in h` iterates all lower to the
+        // heap runtime entry points. A `heap[int64]` carries its element kind in
+        // the ZIR type.
+        let m = lower_ok(include_str!("../../../tests/golden/heap.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("alloca heap[i64]"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_new"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_push_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_pop_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_peek_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_len"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_items"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_heap_str_elements() {
+        // A `heap[str]` routes through the pointer-word entry points; string
+        // elements are compared by `ZapStr` bytes in the runtime.
+        let m = lower_ok(
+            "def main():\n    \
+                 auto h = heap[str]()\n    \
+                 h.push(\"pear\")\n    \
+                 h.push(\"apple\")\n    \
+                 print(h.pop())\n    \
+                 print(h.peek())\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("alloca heap[ptr]"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_push_ptr"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_pop_ptr"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_peek_ptr"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_heap_max_comparator() {
+        // `cmp="max"` is accepted and lowers to the same `zap_heap_new(kind, dir)`
+        // construction (the direction argument carries min vs max; the runtime
+        // golden exercises the resulting largest-first ordering).
+        let m = lower_ok(
+            "def main():\n    \
+                 auto h = heap[int64](cmp=\"max\")\n    \
+                 h.push(1)\n    \
+                 print(h.pop())\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_heap_new"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_push_i64"), "text:\n{text}");
+    }
+
+    #[test]
     fn lower_exceptions() {
         // raise + try/except/finally lower to invoke/landingpad exception edges
         // and the runtime unwinding entry points (#22).
