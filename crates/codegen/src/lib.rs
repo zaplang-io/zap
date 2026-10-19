@@ -24,7 +24,7 @@ use inkwell::types::{
 use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue, VectorValue};
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
-use zapc_ir::{self as zir, lower_module, CastKind, CmpPred, Func, Inst, Term, Ty};
+use zapc_ir::{self as zir, lower_module, CastKind, CmpPred, Func, Inst, Owner, Term, Ty};
 use zapc_syntax::ast::Module as AstModule;
 
 /// A code-generation backend.
@@ -469,6 +469,23 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // takes the buffer capacity (0 = unbuffered rendezvous). See `zaprt.c`.
         self.declare_rt("zap_spawn", &[p.into(), p.into()], None);
         self.declare_rt("zap_rt_join_all", &[], None);
+        // Structured concurrency (ticket #50, D-0044/D-0045,
+        // design/0005-concurrency.md): `scope:` blocks and `spawn detached`.
+        // `zap_scope_enter(on_error)` opens a scope (0 = Cancel, 1 = Wait) and
+        // returns its handle; `zap_spawn_scoped` enqueues a coroutine owned by a
+        // scope; `zap_spawn_detached` enqueues one owned by nothing. The join
+        // barrier `zap_scope_exit` awaits owned coroutines and re-raises their
+        // failure (an aggregate `ExceptionGroup` for several concurrent failures,
+        // so it may unwind); `zap_scope_exit_cancel` cancels + awaits them without
+        // raising (the parent's own in-flight exception wins). `zap_checkpoint` is
+        // an explicit cancellation point (may raise `Cancelled`).
+        self.declare_rt("zap_scope_enter", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_scope_exit", &[p.into()], None);
+        self.declare_rt("zap_scope_exit_cancel", &[p.into()], None);
+        self.declare_rt("zap_spawn_scoped", &[p.into(), p.into(), p.into()], None);
+        self.declare_rt("zap_spawn_detached", &[p.into(), p.into()], None);
+        self.declare_rt("zap_checkpoint", &[], None);
+        self.declare_rt("zap_g_uncaught", &[p.into()], None);
         self.declare_rt("zap_chan_new", &[i.into()], Some(p.into()));
         self.declare_rt("zap_chan_send_i64", &[p.into(), i.into()], None);
         self.declare_rt("zap_chan_send_ptr", &[p.into(), p.into()], None);
@@ -1084,7 +1101,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     self.array_binop(*op, *out, *lhs_dtype, *rhs_dtype, lv, rv, *scalar, fv)?;
                 vals[*dest as usize] = Some(res);
             }
-            Inst::Spawn { func, args } => {
+            Inst::Spawn { func, args, owner } => {
                 // Launch a coroutine running `func(args...)` (ticket #25,
                 // D-0013). The evaluated arguments are copied into a
                 // GC-allocated closure whose layout is the callee's parameter
@@ -1128,9 +1145,27 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 }
                 let thunk = self.spawn_thunk(func, target, env_struct)?;
                 let thunk_ptr = thunk.as_global_value().as_pointer_value();
-                let spawn = self.fns["zap_spawn"];
-                b.build_call(spawn, &[thunk_ptr.into(), env.into()], "")
-                    .map_err(|e| e.to_string())?;
+                // Dispatch on ownership (D-0044): root spawns are joined at program
+                // exit, scoped spawns are owned by their `scope:` handle, detached
+                // spawns are owned by nothing.
+                match owner {
+                    Owner::Root => {
+                        let spawn = self.fns["zap_spawn"];
+                        b.build_call(spawn, &[thunk_ptr.into(), env.into()], "")
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Owner::Scope(s) => {
+                        let scope_v = get(vals, *s);
+                        let spawn = self.fns["zap_spawn_scoped"];
+                        b.build_call(spawn, &[thunk_ptr.into(), env.into(), scope_v.into()], "")
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Owner::Detached => {
+                        let spawn = self.fns["zap_spawn_detached"];
+                        b.build_call(spawn, &[thunk_ptr.into(), env.into()], "")
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
             }
             Inst::FuncAddr { dest, func } => {
                 // The address of a top-level function as a pointer value, handed
@@ -1172,11 +1207,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // design/0005-concurrency.md "Interaction with exception unwinding"):
         // unwinding must stop here, not run off the green stack into the
         // makecontext bootstrap. So the call to the target is an `invoke` with a
-        // catch-all landing pad that reports the uncaught exception via
-        // `zap_uncaught` (message + exit 1), mirroring the implicit top-level
-        // handler in `main`. In-goroutine `try/except` is unaffected (it unwinds
-        // through normal CFI on the green stack); this only catches what reaches
-        // the top. Requires the Itanium personality + an unwind table.
+        // catch-all landing pad that routes the uncaught exception to
+        // `zap_g_uncaught`, which decides at runtime based on the coroutine's
+        // owning scope (ticket #50, D-0044): a scoped coroutine records its
+        // failure on the scope (which re-raises it — possibly as an aggregate
+        // `ExceptionGroup` — at its dedent) and returns here so the coroutine ends
+        // cleanly; a root/detached coroutine aborts the program with the message
+        // (exit 1), exactly as `zap_uncaught` did before. In-goroutine `try/except`
+        // is unaffected (it unwinds through normal CFI on the green stack); this
+        // only catches what reaches the top. Requires the Itanium personality + an
+        // unwind table.
         let uwtable = Attribute::get_named_enum_kind_id("uwtable");
         if uwtable != 0 {
             thunk.add_attribute(
@@ -1235,9 +1275,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .try_as_basic_value()
             .left()
             .ok_or_else(|| "zap_eh_begin_catch returned no value".to_string())?;
-        b.build_call(self.fns["zap_uncaught"], &[exc.into()], "")
+        // Route to the scope-aware handler. For a scoped coroutine this records
+        // the failure and returns; for a root/detached one it exits. Either way we
+        // then balance the `__cxa_begin_catch` and end the coroutine by returning
+        // null (the return is dead for the root/detached abort path, but required
+        // for the scoped path where `zap_g_uncaught` returns).
+        b.build_call(self.fns["zap_g_uncaught"], &[exc.into()], "")
             .map_err(|e| e.to_string())?;
-        b.build_unreachable().map_err(|e| e.to_string())?;
+        b.build_call(self.fns["zap_eh_end_catch"], &[], "")
+            .map_err(|e| e.to_string())?;
+        b.build_return(Some(&ptr.const_null()))
+            .map_err(|e| e.to_string())?;
         if let Some(bb) = saved {
             b.position_at_end(bb);
         }

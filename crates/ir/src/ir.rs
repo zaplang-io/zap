@@ -244,6 +244,18 @@ pub type Value = u32;
 /// A basic-block id (index into [`Func::blocks`]).
 pub type BlockId = u32;
 
+/// Which scope owns a spawned coroutine (D-0044, structured concurrency). See
+/// [`Inst::Spawn`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// Bare `spawn`: the implicit root scope (joined at program exit).
+    Root,
+    /// `spawn` inside a `scope:` block; the value is that scope's handle.
+    Scope(Value),
+    /// `spawn detached`: owned by nothing, never awaited.
+    Detached,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -438,6 +450,14 @@ pub enum Inst {
     Spawn {
         func: String,
         args: Vec<Value>,
+        /// Structured-concurrency ownership (D-0044, `design/0005`):
+        /// - `Owner::Root` — a bare `spawn`, owned by the implicit root scope and
+        ///   joined at program exit (`zap_spawn`);
+        /// - `Owner::Scope(s)` — owned by the enclosing `scope:` whose handle is
+        ///   the value `s`; awaited/cancelled at its dedent (`zap_spawn_scoped`);
+        /// - `Owner::Detached` — `spawn detached`, owned by nothing, never
+        ///   awaited, not joined at exit (`zap_spawn_detached`).
+        owner: Owner,
     },
     /// The address of a top-level function, as a pointer value (`dest : Ptr`).
     /// Used to hand a struct type's `__hash__` / `__eq__` to the collection
@@ -669,9 +689,14 @@ fn fmt_inst(i: &Inst) -> String {
                 rhs_dtype.suffix(),
             )
         }
-        Inst::Spawn { func, args } => {
+        Inst::Spawn { func, args, owner } => {
             let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
-            format!("spawn @{func}({})", a.join(", "))
+            let own = match owner {
+                Owner::Root => String::new(),
+                Owner::Scope(s) => format!(" in scope %{s}"),
+                Owner::Detached => " detached".to_string(),
+            };
+            format!("spawn{own} @{func}({})", a.join(", "))
         }
         Inst::FuncAddr { dest, func } => format!("%{dest} = funcaddr @{func}"),
     }

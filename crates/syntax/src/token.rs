@@ -162,6 +162,7 @@ pub enum Keyword {
     Channel,
     Select,
     Close,
+    Scope,
     // Type/decl keywords
     Struct,
     Interface,
@@ -233,6 +234,7 @@ impl Keyword {
             "channel" => Channel,
             "select" => Select,
             "close" => Close,
+            "scope" => Scope,
             "struct" => Struct,
             "interface" => Interface,
             "enum" => Enum,
@@ -301,6 +303,7 @@ impl Keyword {
             Channel => "channel",
             Select => "select",
             Close => "close",
+            Scope => "scope",
             Struct => "struct",
             Interface => "interface",
             Enum => "enum",

@@ -1415,6 +1415,11 @@ struct FnLower<'a> {
     /// body emitted no throwing call cannot raise, so its handler (and the
     /// `landingpad` that LLVM requires an `invoke` predecessor for) is omitted.
     used_lps: HashSet<BlockId>,
+    /// Stack of active `scope:` handles (innermost last), each the `ptr` value
+    /// returned by `zap_scope_enter`. A `spawn` lowered while this is non-empty is
+    /// owned by the top scope ([`Owner::Scope`]); a `spawn` at the root is
+    /// [`Owner::Root`] (D-0044, structured concurrency).
+    scope_stack: Vec<Value>,
     sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &'a StructCtx,
 }
@@ -1451,6 +1456,7 @@ impl<'a> FnLower<'a> {
             term_set: HashSet::new(),
             landing_pads: Vec::new(),
             used_lps: HashSet::new(),
+            scope_stack: Vec::new(),
             sigs,
             ctx,
         }
@@ -1892,7 +1898,8 @@ impl<'a> FnLower<'a> {
                 finally,
                 ..
             } => self.lower_try(body, excepts, finally.as_ref()),
-            Stmt::Spawn { call, .. } => self.lower_spawn(call),
+            Stmt::Spawn { call, detached, .. } => self.lower_spawn(call, *detached),
+            Stmt::Scope { opts, body, .. } => self.lower_scope(opts, body),
             Stmt::Match {
                 scrutinee, arms, ..
             } => self.lower_match(scrutinee, arms),
@@ -2088,7 +2095,7 @@ impl<'a> FnLower<'a> {
     /// named top-level function is supported in this increment; method-call and
     /// lambda operands (`spawn s.handle(c)`, `spawn (lambda: ...)()`) are a
     /// documented follow-up, as is the structured-concurrency `scope:` block.
-    fn lower_spawn(&mut self, call: &Expr) -> Result<(), LowerError> {
+    fn lower_spawn(&mut self, call: &Expr, detached: bool) -> Result<(), LowerError> {
         let Expr::Call { callee, args, .. } = call else {
             return Err(err("spawn operand must be a call expression (D-0013)"));
         };
@@ -2116,11 +2123,135 @@ impl<'a> FnLower<'a> {
             let v = self.copy_for_pass(v, target, &a.value);
             argvals.push(v);
         }
+        // Ownership (D-0044): `spawn detached` opts out of all scopes; otherwise
+        // the innermost enclosing `scope:` owns it, falling back to the implicit
+        // root scope at the top level.
+        let owner = if detached {
+            Owner::Detached
+        } else if let Some(&s) = self.scope_stack.last() {
+            Owner::Scope(s)
+        } else {
+            Owner::Root
+        };
         self.emit(Inst::Spawn {
             func: fname.clone(),
             args: argvals,
+            owner,
         });
         Ok(())
+    }
+
+    /// Lower a `scope:` block (D-0044/D-0045, structured concurrency): a lexical
+    /// region that owns every `spawn` inside it and joins — or, on failure/early
+    /// exit, cancels then awaits — them at the dedent.
+    ///
+    /// Shape (mirrors `lower_try`'s landing-pad handling): a fresh scope handle is
+    /// opened with `zap_scope_enter(on_error)`, pushed onto `scope_stack` so inner
+    /// `spawn`s bind to it, and the body is lowered under a landing pad. On normal
+    /// completion `zap_scope_exit` is the join barrier — it waits for all owned
+    /// coroutines and re-raises their failure (a single exception, or an aggregate
+    /// `ExceptionGroup` for several concurrent failures, D-0045). If the body
+    /// itself raises (or leaves early by a `raise`), the landing pad calls
+    /// `zap_scope_exit_cancel` to cancel and await the children, then re-raises the
+    /// parent's in-flight exception (rule 4; the parent's failure wins over the
+    /// children's, which are cancelled).
+    fn lower_scope(&mut self, opts: &[ast::Arg], body: &ast::Block) -> Result<(), LowerError> {
+        let on_error = self.scope_on_error(opts)?;
+        let policy = self.iconst(Ty::I64, on_error);
+        let handle = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(handle),
+            func: "zap_scope_enter".to_string(),
+            args: vec![policy],
+        });
+
+        let lp = self.new_block();
+        let after = self.new_block();
+
+        // --- owned region: a raise inside unwinds to `lp` (cancel + re-raise) ---
+        self.landing_pads.push(lp);
+        self.scope_stack.push(handle);
+        self.push_scope();
+        for st in &body.stmts {
+            self.stmt(st)?;
+        }
+        self.pop_scope();
+        self.scope_stack.pop();
+        self.landing_pads.pop();
+
+        // Normal completion: the join barrier. `zap_scope_exit` awaits the owned
+        // coroutines and re-raises their failure, so it is a throwing call (an
+        // aggregate may unwind to an enclosing `try`).
+        if !self.terminated() {
+            self.throwing_call(None, "zap_scope_exit", vec![handle]);
+            self.ensure_br(after);
+        }
+
+        // If the body emitted no throwing call it cannot raise, so the cancel
+        // landing pad is dead (LLVM requires a `landingpad` to have an `invoke`
+        // predecessor) — skip it.
+        if !self.used_lps.contains(&lp) {
+            self.position(after);
+            return Ok(());
+        }
+
+        // --- cancel landing pad: the body raised; cancel + await children, then
+        // re-raise the parent's exception (rule 4). ---
+        self.position(lp);
+        let exc = self.new_value(Ty::Ptr);
+        self.emit(Inst::LandingPad { dest: exc });
+        self.emit(Inst::Call {
+            dest: None,
+            func: "zap_scope_exit_cancel".to_string(),
+            args: vec![handle],
+        });
+        if !self.terminated() {
+            self.emit_end_catch();
+            self.throwing_call(None, "zap_panic", vec![exc]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+        }
+
+        self.position(after);
+        Ok(())
+    }
+
+    /// The `on_error` policy constant for a `scope(...)` (D-0044): `0` = Cancel
+    /// (the default — a failure cancels siblings), `1` = Wait (a failure waits for
+    /// siblings instead of cancelling). Validated in sema; re-checked here so a
+    /// bad option is a lowering error rather than a silent default.
+    fn scope_on_error(&self, opts: &[ast::Arg]) -> Result<i64, LowerError> {
+        let mut policy = 0; // OnError.Cancel
+        for a in opts {
+            match a.name.as_deref() {
+                Some("on_error") => {
+                    if let Expr::Attr { base, name, .. } = &a.value {
+                        if matches!(base.as_ref(), Expr::Name(n, _) if n == "OnError") {
+                            policy = match name.as_str() {
+                                "Cancel" => 0,
+                                "Wait" => 1,
+                                _ => {
+                                    return Err(err(
+                                        "scope on_error expects OnError.Cancel or OnError.Wait",
+                                    ))
+                                }
+                            };
+                            continue;
+                        }
+                    }
+                    return Err(err("scope on_error expects OnError.Cancel or OnError.Wait"));
+                }
+                Some("timeout") => {
+                    return Err(err(
+                        "scope(timeout=...) is not supported yet (the timer API is deferred)",
+                    ))
+                }
+                Some(other) => return Err(err(format!("scope() has no option '{other}'"))),
+                None => return Err(err("scope() options must be keyword arguments")),
+            }
+        }
+        Ok(policy)
     }
 
     /// Balance the `__cxa_begin_catch` performed on landing-pad entry. Called on
@@ -3392,6 +3523,16 @@ impl<'a> FnLower<'a> {
                     return Err(err("close() expects a channel"));
                 }
                 self.throwing_call(None, "zap_chan_close", vec![v]);
+                return Ok((self.iconst(Ty::I32, 0), Ty::I32));
+            }
+            // `checkpoint()` (D-0044): a cooperative cancellation point for long
+            // CPU-bound loops. It yields the coroutine and, if its owning `scope:`
+            // has been cancelled, raises `Cancelled` — so it may unwind.
+            if fname == "checkpoint" {
+                if !args.is_empty() {
+                    return Err(err("checkpoint() takes no arguments"));
+                }
+                self.throwing_call(None, "zap_checkpoint", vec![]);
                 return Ok((self.iconst(Ty::I32, 0), Ty::I32));
             }
             if fname == "len" {

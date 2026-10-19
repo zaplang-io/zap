@@ -471,6 +471,7 @@ const BUILTINS: &[&str] = &[
     "sum",
     "reflect_has",
     "reflect_names",
+    "checkpoint",
 ];
 
 /// The curated built-in decorator set shipped in v1 (D-0036,
@@ -1262,6 +1263,43 @@ impl Checker {
         self.pop_scope();
     }
 
+    /// Check the options on a `scope(...)` block (D-0044). `on_error` takes the
+    /// `OnError` enum (`OnError.Cancel` | `OnError.Wait`) — a typed policy so a
+    /// misspelling is a compile-time error, not a silent runtime surprise. The
+    /// `timeout=` deadline is parsed but still deferred (it needs the timer API,
+    /// an open issue in `design/0005`), so it is rejected with a clear message.
+    fn check_scope_opts(&mut self, opts: &[Arg], span: Span) {
+        for a in opts {
+            match a.name.as_deref() {
+                Some("on_error") => {
+                    if !is_on_error_policy(&a.value) {
+                        self.error(
+                            "scope on_error expects OnError.Cancel or OnError.Wait".to_string(),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Some("timeout") => {
+                    self.infer(&a.value);
+                    self.error(
+                        "scope(timeout=...) is not supported yet (the timer API is deferred)"
+                            .to_string(),
+                        expr_span(&a.value),
+                    );
+                }
+                Some(other) => self.error(
+                    format!("scope() has no option '{other}' (expected 'on_error' or 'timeout')"),
+                    expr_span(&a.value),
+                ),
+                None => self.error(
+                    "scope() options must be keyword arguments (e.g. on_error=OnError.Wait)"
+                        .to_string(),
+                    span,
+                ),
+            }
+        }
+    }
+
     fn check_stmt(&mut self, st: &Stmt) {
         match st {
             Stmt::Let {
@@ -1540,6 +1578,10 @@ impl Checker {
             }
             Stmt::Spawn { call, .. } => {
                 self.infer(call);
+            }
+            Stmt::Scope { opts, body, span } => {
+                self.check_scope_opts(opts, *span);
+                self.check_block(body);
             }
             Stmt::LetTuple {
                 ty,
@@ -2525,6 +2567,14 @@ impl Checker {
                     self.check_reflect_args(fname, 1, args, span);
                     return Ty::Str;
                 }
+                // `checkpoint()` (D-0044): an explicit cancellation point for long
+                // CPU-bound loops. Takes no arguments; may raise `Cancelled`.
+                "checkpoint" => {
+                    if !args.is_empty() {
+                        self.error("checkpoint() takes no arguments".to_string(), span);
+                    }
+                    return Ty::Unit;
+                }
                 _ => {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
                         return self.check_user_call(&sig, fname, args, span);
@@ -2898,6 +2948,19 @@ fn is_stop_iteration(e: &Expr) -> bool {
     }
 }
 
+/// `OnError.Cancel` / `OnError.Wait` — the typed `scope(on_error=...)` policy
+/// (D-0044). Recognized structurally: the `OnError` enum is a compiler-known
+/// policy in this increment (a real stdlib enum is a follow-up), so a misspelled
+/// member or a non-`OnError` value is rejected by [`check_scope_opts`].
+fn is_on_error_policy(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Attr { base, name, .. }
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "OnError")
+                && (name == "Cancel" || name == "Wait")
+    )
+}
+
 /// The element type an iterator's `__next__` yields (D-0048): the comma-ok form
 /// `-> (T, bool)` yields `T`; the plain `-> T` (StopIteration) form yields `T`.
 fn next_elem(ret: &Ty) -> Ty {
@@ -2974,6 +3037,17 @@ mod tests {
     }
 
     #[test]
+    fn structured_concurrency_fixtures_type_check() {
+        // The structured-concurrency goldens type-check: `scope:` join, the
+        // aggregate-failure path, cooperative cancellation via `checkpoint()`,
+        // and `spawn detached` (ticket #50, D-0044/D-0045).
+        ok(include_str!("../../../tests/golden/scope_join.zap"));
+        ok(include_str!("../../../tests/golden/scope_group.zap"));
+        ok(include_str!("../../../tests/golden/scope_cancel.zap"));
+        ok(include_str!("../../../tests/golden/scope_detached.zap"));
+    }
+
+    #[test]
     fn channel_send_and_recv_are_typed() {
         // `<-ch` yields the element type, and a send of a compatible value is
         // accepted; the whole program type-checks.
@@ -3013,6 +3087,41 @@ mod tests {
             1,
             "expected a close-on-non-channel error, got {e:?}"
         );
+    }
+
+    #[test]
+    fn scope_block_and_spawn_detached_type_check() {
+        // A `scope:` with owned spawns, a `spawn detached`, `on_error=OnError.Wait`
+        // and a `checkpoint()` all type-check (ticket #50, D-0044).
+        ok("def f():\n    checkpoint()\n\ndef main():\n    scope(on_error=OnError.Wait):\n        spawn f()\n        spawn f()\n    spawn detached f()\n");
+    }
+
+    #[test]
+    fn scope_on_error_rejects_bad_policy() {
+        // A misspelled / non-OnError policy is a compile-time error, not a silent
+        // runtime surprise (D-0044).
+        let e = errors("def f():\n    print(1)\n\ndef main():\n    scope(on_error=OnError.Nope):\n        spawn f()\n");
+        assert_eq!(
+            e.len(),
+            1,
+            "expected a bad on_error policy error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scope_timeout_is_deferred() {
+        // `scope(timeout=...)` is parsed but not yet supported (the timer API is
+        // deferred); it is reported rather than silently ignored.
+        let e = errors(
+            "def f():\n    print(1)\n\ndef main():\n    scope(timeout=30):\n        spawn f()\n",
+        );
+        assert!(!e.is_empty(), "expected scope(timeout=...) to be reported");
+    }
+
+    #[test]
+    fn checkpoint_takes_no_arguments() {
+        let e = errors("def main():\n    checkpoint(1)\n");
+        assert_eq!(e.len(), 1, "expected a checkpoint arity error, got {e:?}");
     }
 
     #[test]

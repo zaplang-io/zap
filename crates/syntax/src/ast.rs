@@ -301,9 +301,23 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
-    /// `spawn call(...)` (D-0013).
+    /// `spawn call(...)` (D-0013), or `spawn detached call(...)` (D-0044).
+    /// A plain `spawn` is owned by the nearest enclosing [`Stmt::Scope`] (or the
+    /// program's implicit root scope); `detached` opts out of all scope
+    /// ownership (never awaited, not joined at program exit).
     Spawn {
         call: Expr,
+        detached: bool,
+        span: Span,
+    },
+    /// `scope: ...` / `scope(on_error=OnError.Wait): ...` — a structured-
+    /// concurrency region that owns every `spawn` lexically inside it and joins
+    /// (or cancels) them at the dedent (D-0044/D-0045, `design/0005`). `opts`
+    /// holds the parenthesized options (`on_error`, `timeout`); an absent
+    /// option list is the empty vec.
+    Scope {
+        opts: Vec<Arg>,
+        body: Block,
         span: Span,
     },
     /// Tuple-destructuring declaration (D-0049): `auto (a, b) = t`,

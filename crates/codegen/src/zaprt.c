@@ -1576,6 +1576,8 @@ typedef struct G {
     struct G *link;    /* run-queue / free-list link (a G is in one at a time) */
     pthread_mutex_t *parkmu; /* chan mutex the scheduler unlocks after parking */
     int64_t all_idx;   /* index in g_all[] for O(1) removal on death           */
+    struct Scope *scope; /* owning `scope:` (ticket #50), or NULL (root/detached)*/
+    int in_live;       /* 1 iff this G is counted in g_live (root-scope join)   */
 } G;
 
 typedef struct P {
@@ -1798,6 +1800,8 @@ static G *sched_find_runnable(M *m) {
  * release, completing the park/wake handoff) or finished (reclaim it). */
 static void gfree(G *g);
 static void sched_gdone(void);
+static void scope_gdone(struct Scope *sc);
+static void sched_enqueue(G *g);
 static void switch_to_g(M *m, G *g) {
     m->current = g;
     g->state = G_RUNNING;
@@ -1812,8 +1816,20 @@ static void switch_to_g(M *m, G *g) {
             pthread_mutex_unlock(mu);
         }
     } else if (g->state == G_DEAD) {
+        /* Capture ownership before gfree clears it, then signal the right join
+         * barrier: a scoped G releases its `scope:` (ticket #50); a root G
+         * releases the program-exit join; a detached G is joined by nobody. */
+        struct Scope *sc = g->scope;
+        int in_live = g->in_live;
         gfree(g);
-        sched_gdone();
+        if (sc) {
+            scope_gdone(sc);
+        } else if (in_live) {
+            sched_gdone();
+        }
+    } else if (g->state == G_RUNNABLE) {
+        /* The G yielded (`gosched`, e.g. at `checkpoint()`): requeue it. */
+        sched_enqueue(g);
     }
 }
 
@@ -1902,6 +1918,8 @@ static G *galloc(void *fn, void *arg) {
     g->state = G_RUNNABLE;
     g->link = NULL;
     g->parkmu = NULL;
+    g->scope = NULL;
+    g->in_live = 0;
     /* Cold end of a down-growing stack is its high address. */
     g->sb.mem_base = (char *)g->stack + g->stack_size;
     getcontext(&g->ctx);
@@ -1917,6 +1935,8 @@ static void gfree(G *g) {
     all_remove(g);
     g->fn = NULL;
     g->arg = NULL;
+    g->scope = NULL; /* drop the scope reference so a reused G starts clean */
+    g->in_live = 0;
     /* Keep the stack buffer for reuse (size-classed free list, one class). */
     pthread_mutex_lock(&g_free_mu);
     g->link = g_free_head;
@@ -1999,6 +2019,18 @@ void zap_spawn(void *fn_, void *arg) {
     g_live++;
     pthread_mutex_unlock(&g_live_mu);
     G *g = galloc(fn_, arg);
+    g->in_live = 1; /* joined by the implicit root scope at program exit */
+    sched_enqueue(g);
+}
+
+/* `spawn detached <call>` (ticket #50, D-0044): a coroutine owned by nothing —
+ * never awaited, and not counted in the program-exit join, so a still-running
+ * detached coroutine is terminated when `main` returns (Go goroutine
+ * semantics). */
+void zap_spawn_detached(void *fn_, void *arg) {
+    zap_sched_init(0);
+    G *g = galloc(fn_, arg);
+    /* in_live stays 0 and scope stays NULL: no join barrier owns it. */
     sched_enqueue(g);
 }
 
@@ -2021,6 +2053,257 @@ void zap_rt_join_all(void) {
     for (int i = 0; i < g_nm; i++) {
         GC_pthread_join(g_ms[i].thread, NULL);
     }
+}
+
+/* ---- structured concurrency: scope / detached / ExceptionGroup ------------ *
+ * (ticket #50, D-0044/D-0045, design/0005-concurrency.md "Structured
+ * concurrency"). A `scope:` block owns every coroutine spawned in it and is the
+ * join point at its dedent:
+ *   - normal exit  -> `zap_scope_exit`: await all owned coroutines; if any
+ *     failed, re-raise — a single exception, or an aggregate `ExceptionGroup`
+ *     carrying all of them when several failed concurrently (D-0045).
+ *   - failure / early exit -> `zap_scope_exit_cancel`: request cancellation,
+ *     await the owned coroutines, and let the parent's in-flight exception win
+ *     (its children's are discarded).
+ *
+ * Cancellation is cooperative (design/0005 "Cancellation is cooperative"): a
+ * cancelled scope arms its coroutines, and the cancel takes effect at the next
+ * cancellation point reached — a channel send/receive or an explicit
+ * `checkpoint()` — where the runtime raises `Cancelled`. `Cancelled` rides the
+ * ordinary unwinder (so `finally`/`with` cleanups run) and is *not* recorded as
+ * a scope failure. Interrupting a coroutine already parked on a channel (rather
+ * than one that next reaches a cancellation point) needs the netpoller-style
+ * wakeup that is a documented deferral, as is parking — rather than blocking the
+ * worker M — at a join reached from inside a coroutine (a nested `scope:`); both
+ * work at the default MAXPROCS and the shapes the goldens exercise. */
+
+typedef struct Scope {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;      /* broadcast when `live` reaches 0 (join barrier)   */
+    int64_t live;          /* owned coroutines not yet finished                */
+    int cancelled;         /* cancellation requested (armed cooperatively)     */
+    int on_error;          /* 0 = Cancel (default), 1 = Wait (D-0044)          */
+    ZapStr **excs;         /* collected failures from owned coroutines (GC)    */
+    int64_t nexc;
+    int64_t exc_cap;
+} Scope;
+
+/* The shared `Cancelled` sentinel (a BaseException-ish marker, design/0005): a
+ * single cached ZapStr whose pointer identity marks a cooperative cancel, so a
+ * cancelled sibling is told apart from a genuine failure by identity, not text.
+ * Held in a GC-scanned static, so it stays live. */
+static ZapStr *g_cancelled = NULL;
+static pthread_mutex_t g_cancelled_mu = PTHREAD_MUTEX_INITIALIZER;
+static ZapStr *cancelled_exc(void) {
+    pthread_mutex_lock(&g_cancelled_mu);
+    if (!g_cancelled) {
+        g_cancelled = (ZapStr *)zap_str_new("Cancelled", 9);
+    }
+    pthread_mutex_unlock(&g_cancelled_mu);
+    return g_cancelled;
+}
+
+/* Yield the current coroutine back to the scheduler (a cooperative scheduling
+ * point). A no-op on a native thread (e.g. `main`), which does not run on an M.
+ * The scheduler requeues a G left in G_RUNNABLE (see `switch_to_g`). */
+static void gosched(void) {
+    M *m = cur_m;
+    if (!m || !m->current) {
+        return;
+    }
+    G *g = m->current;
+    char probe;
+    if ((char *)&probe - (char *)g->stack < ZAP_STACK_REDZONE) {
+        zap_panic(zap_str_new("stack overflow", 14));
+        return;
+    }
+    g->state = G_RUNNABLE;
+    swapcontext(&g->ctx, &m->sched_ctx);
+}
+
+/* Is the current coroutine's owning scope cancelled? (0 on a native thread or an
+ * unowned coroutine.) */
+static int g_is_cancelled(void) {
+    M *m = cur_m;
+    G *g = m ? m->current : NULL;
+    if (!g || !g->scope) {
+        return 0;
+    }
+    Scope *sc = g->scope;
+    pthread_mutex_lock(&sc->mu);
+    int c = sc->cancelled;
+    pthread_mutex_unlock(&sc->mu);
+    return c;
+}
+
+/* A cancellation point: raise `Cancelled` if the current coroutine was armed. */
+static void zap_check_cancel(void) {
+    if (g_is_cancelled()) {
+        zap_panic((void *)cancelled_exc());
+    }
+}
+
+/* `checkpoint()` (D-0044): an explicit cancellation point for long CPU-bound
+ * loops. Observes a pending cancel, then yields so siblings make progress. */
+void zap_checkpoint(void) {
+    zap_check_cancel();
+    gosched();
+}
+
+/* An owned coroutine finished: drop it from its scope's live count and wake the
+ * join barrier when the last one leaves. */
+static void scope_gdone(Scope *sc) {
+    pthread_mutex_lock(&sc->mu);
+    if (--sc->live == 0) {
+        pthread_cond_broadcast(&sc->cv);
+    }
+    pthread_mutex_unlock(&sc->mu);
+}
+
+/* `zap_scope_enter(on_error)` opens a scope (ticket #50). The handle is returned
+ * to the generated code, which keeps it live on its (conservatively scanned)
+ * frame and hands it to each owned `spawn` and to the matching exit call. */
+void *zap_scope_enter(int64_t on_error) {
+    Scope *sc = (Scope *)GC_MALLOC(sizeof(Scope));
+    pthread_mutex_init(&sc->mu, NULL);
+    pthread_cond_init(&sc->cv, NULL);
+    sc->live = 0;
+    sc->cancelled = 0;
+    sc->on_error = on_error == 1 ? 1 : 0;
+    sc->excs = NULL;
+    sc->nexc = 0;
+    sc->exc_cap = 0;
+    return sc;
+}
+
+/* `spawn <call>` inside a `scope:` (ticket #50): a coroutine owned by `scope`,
+ * awaited at the scope's dedent rather than at program exit. */
+void zap_spawn_scoped(void *fn_, void *arg, void *scope_) {
+    zap_sched_init(0);
+    Scope *sc = (Scope *)scope_;
+    pthread_mutex_lock(&sc->mu);
+    sc->live++;
+    pthread_mutex_unlock(&sc->mu);
+    G *g = galloc(fn_, arg);
+    g->scope = sc; /* in_live stays 0: the scope, not the root join, owns it */
+    sched_enqueue(g);
+}
+
+/* Block until every coroutine owned by `sc` has finished. Called from `main`
+ * (a native thread) for a top-level scope; a scope reached from inside a
+ * coroutine blocks that worker M here (the park-the-G variant is deferred). */
+static void scope_join(Scope *sc) {
+    pthread_mutex_lock(&sc->mu);
+    while (sc->live > 0) {
+        pthread_cond_wait(&sc->cv, &sc->mu);
+    }
+    pthread_mutex_unlock(&sc->mu);
+}
+
+/* Order the collected failures deterministically (by message bytes) so an
+ * `ExceptionGroup` built from concurrent failures has a stable rendering. */
+static int exc_cmp(const void *a, const void *b) {
+    const ZapStr *x = *(const ZapStr *const *)a;
+    const ZapStr *y = *(const ZapStr *const *)b;
+    int64_t n = x->len < y->len ? x->len : y->len;
+    int c = n > 0 ? memcmp(x->data, y->data, (size_t)n) : 0;
+    if (c != 0) {
+        return c;
+    }
+    return x->len < y->len ? -1 : (x->len > y->len ? 1 : 0);
+}
+
+/* Build the aggregate `ExceptionGroup` message for `n (>= 2)` concurrent
+ * failures (D-0045). The typed `ExceptionGroup` object is a follow-up (the
+ * exception increment carries the message string only, RUNTIME-ABI); this
+ * renders the aggregate as a deterministic multi-line message. */
+static void *make_exception_group(ZapStr **excs, int64_t n) {
+    ZapStr **sorted = (ZapStr **)GC_MALLOC((size_t)n * sizeof(ZapStr *));
+    memcpy(sorted, excs, (size_t)n * sizeof(ZapStr *));
+    qsort(sorted, (size_t)n, sizeof(ZapStr *), exc_cmp);
+    char header[64];
+    int hlen = snprintf(header, sizeof(header),
+                        "ExceptionGroup (%lld sub-exceptions):", (long long)n);
+    int64_t total = hlen;
+    for (int64_t i = 0; i < n; i++) {
+        total += 5 + (sorted[i] ? sorted[i]->len : 0); /* "\n  - " + message */
+    }
+    char *buf = (char *)GC_MALLOC_ATOMIC((size_t)total);
+    int64_t off = 0;
+    memcpy(buf + off, header, (size_t)hlen);
+    off += hlen;
+    for (int64_t i = 0; i < n; i++) {
+        memcpy(buf + off, "\n  - ", 5);
+        off += 5;
+        if (sorted[i] && sorted[i]->len > 0) {
+            memcpy(buf + off, sorted[i]->data, (size_t)sorted[i]->len);
+            off += sorted[i]->len;
+        }
+    }
+    return zap_str_new(buf, off);
+}
+
+/* Normal-exit join (D-0044 rule 2/3): await the owned coroutines, then re-raise
+ * their failure — the single exception, or an `ExceptionGroup` when several
+ * failed concurrently (D-0045). No failure => returns normally. */
+void zap_scope_exit(void *scope_) {
+    Scope *sc = (Scope *)scope_;
+    scope_join(sc);
+    if (sc->nexc == 0) {
+        return;
+    }
+    if (sc->nexc == 1) {
+        zap_panic(sc->excs[0]);
+    }
+    zap_panic(make_exception_group(sc->excs, sc->nexc));
+}
+
+/* Early-exit/failure join (D-0044 rule 4): the parent block is leaving with its
+ * own in-flight exception, so cancel the owned coroutines, await them, and
+ * return — the generated landing pad then re-raises the parent's exception. Any
+ * failures the children recorded are discarded (the parent's exception wins). */
+void zap_scope_exit_cancel(void *scope_) {
+    Scope *sc = (Scope *)scope_;
+    pthread_mutex_lock(&sc->mu);
+    sc->cancelled = 1;
+    pthread_mutex_unlock(&sc->mu);
+    scope_join(sc);
+}
+
+/* An uncaught exception reached a coroutine's base frame (ticket #50, replacing
+ * the blanket `zap_uncaught` the spawn thunk used before). Decide by ownership:
+ *   - owned by a `scope:` -> record the failure (unless it is the cooperative
+ *     `Cancelled` sentinel, which is expected and dropped) and, under
+ *     OnError.Cancel, arm the scope so siblings unwind too; then return so the
+ *     coroutine ends — the scope re-raises at its dedent.
+ *   - root/detached -> abort the program with the message (exit 1), exactly the
+ *     bare-`spawn` behavior from #25 (design/0005 "Uncaught exceptions"). */
+void zap_g_uncaught(void *exc) {
+    M *m = cur_m;
+    G *g = m ? m->current : NULL;
+    if (g && g->scope) {
+        Scope *sc = g->scope;
+        if (exc == (void *)cancelled_exc()) {
+            return; /* a cooperatively-cancelled sibling: not a failure */
+        }
+        pthread_mutex_lock(&sc->mu);
+        if (sc->nexc == sc->exc_cap) {
+            int64_t ncap = sc->exc_cap ? sc->exc_cap * 2 : 4;
+            ZapStr **nx = (ZapStr **)GC_MALLOC((size_t)ncap * sizeof(ZapStr *));
+            if (sc->excs) {
+                memcpy(nx, sc->excs, (size_t)sc->nexc * sizeof(ZapStr *));
+            }
+            sc->excs = nx;
+            sc->exc_cap = ncap;
+        }
+        sc->excs[sc->nexc++] = (ZapStr *)exc;
+        if (sc->on_error == 0) {
+            sc->cancelled = 1; /* OnError.Cancel: a failure cancels siblings */
+        }
+        pthread_mutex_unlock(&sc->mu);
+        return;
+    }
+    zap_uncaught(exc); /* root/detached: abort (never returns) */
 }
 
 /* ---- channels ------------------------------------------------------------- */
@@ -2121,6 +2404,9 @@ void *zap_chan_new(int64_t cap) {
 }
 
 static void chan_send_word(ZapChan *c, uint64_t v) {
+    /* A channel op is a cancellation point (design/0005): if this coroutine's
+     * scope was cancelled, raise `Cancelled` rather than proceeding/blocking. */
+    zap_check_cancel();
     pthread_mutex_lock(&c->mu);
     if (c->closed) {
         pthread_mutex_unlock(&c->mu);
@@ -2157,6 +2443,7 @@ static void chan_send_word(ZapChan *c, uint64_t v) {
 }
 
 static uint64_t chan_recv_word(ZapChan *c, int *ok) {
+    zap_check_cancel(); /* channel op is a cancellation point (design/0005) */
     pthread_mutex_lock(&c->mu);
     /* Buffered value available: take it, then let a waiting sender refill. */
     if (c->count > 0) {
