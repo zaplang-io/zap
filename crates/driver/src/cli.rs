@@ -11,6 +11,8 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use zapc_pkg::Source;
+
 /// A parsed `zap` invocation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -34,12 +36,14 @@ pub enum Command {
     New { name: String },
     /// `zap init` — scaffold `zap.toml` in the current directory.
     Init,
-    /// `zap add <dep>` — stub (package manager, issue #69).
-    Add,
-    /// `zap remove <dep>` — stub (package manager, issue #69).
-    Remove,
-    /// `zap zenv <...>` — stub (project environment, issue #69).
-    Zenv,
+    /// `zap add <name> (--git <url> --version <v> | --path <dir>)` — add a
+    /// dependency to `zap.toml` and re-lock (package manager, issue #69).
+    Add { name: String, source: Source },
+    /// `zap remove <name>` — drop a dependency and re-lock (issue #69).
+    Remove { name: String },
+    /// `zap zenv <create|status|path|clean>` — manage the project environment
+    /// (issue #69, D-0052).
+    Zenv(ZenvCmd),
     /// `zap test [file] [--json] [--watch]` — run the `@test` suite (D-0054).
     Test {
         file: Option<String>,
@@ -54,6 +58,19 @@ pub enum Command {
     Version,
     /// `zap help`.
     Help,
+}
+
+/// A `zap zenv` subcommand (issue #69, D-0052).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ZenvCmd {
+    /// `zap zenv create [--no-venv]` — create `zenv/{pkg,venv,activate}`.
+    Create { no_venv: bool },
+    /// `zap zenv status` — report whether a zenv exists / is active.
+    Status,
+    /// `zap zenv path` — print the active Zap module search path.
+    Path,
+    /// `zap zenv clean` — remove the `zenv/` directory.
+    Clean,
 }
 
 /// Entry point used by the `zap` binary.
@@ -101,9 +118,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             None => Err("`zap new` needs a project name: `zap new <name>`".to_string()),
         },
         "init" => Ok(Command::Init),
-        "add" => Ok(Command::Add),
-        "remove" => Ok(Command::Remove),
-        "zenv" => Ok(Command::Zenv),
+        "add" => parse_add(rest),
+        "remove" => match first_positional(rest) {
+            Some(name) => Ok(Command::Remove { name }),
+            None => Err("`zap remove` needs a dependency name: `zap remove <name>`".to_string()),
+        },
+        "zenv" => parse_zenv(rest),
         "test" => {
             let mut file = None;
             let mut json = false;
@@ -206,6 +226,92 @@ fn positionals(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Parse `zap add <name> (--git <url> --version <v> | --path <dir>)`.
+fn parse_add(args: &[String]) -> Result<Command, String> {
+    let mut name: Option<String> = None;
+    let mut git: Option<String> = None;
+    let mut path: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let take = |i: usize, what: &str| {
+            args.get(i + 1)
+                .cloned()
+                .ok_or_else(|| format!("`{what}` needs a value"))
+        };
+        match args[i].as_str() {
+            "--git" => {
+                git = Some(take(i, "--git")?);
+                i += 2;
+            }
+            "--path" => {
+                path = Some(take(i, "--path")?);
+                i += 2;
+            }
+            "--version" | "-v" => {
+                version = Some(take(i, "--version")?);
+                i += 2;
+            }
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            pos => {
+                if name.is_some() {
+                    return Err(format!("unexpected extra argument `{pos}`"));
+                }
+                name = Some(pos.to_string());
+                i += 1;
+            }
+        }
+    }
+    let name = name.ok_or_else(|| {
+        "`zap add` needs a dependency name: `zap add <name> --path <dir>`".to_string()
+    })?;
+    match (git, path) {
+        (Some(_), Some(_)) => Err("give either `--git` or `--path`, not both".to_string()),
+        (Some(url), None) => {
+            let version = version.ok_or_else(|| {
+                "`--git` needs `--version <semver>` (the minimum version)".to_string()
+            })?;
+            Ok(Command::Add {
+                name,
+                source: Source::Git { url, version },
+            })
+        }
+        (None, Some(dir)) => Ok(Command::Add {
+            name,
+            source: Source::Path { dir },
+        }),
+        (None, None) => Err(
+            "`zap add <name>` needs a source: `--git <url> --version <v>` or `--path <dir>`"
+                .to_string(),
+        ),
+    }
+}
+
+/// Parse `zap zenv [create [--no-venv] | status | path | clean]`.
+/// Bare `zap zenv` prints status (read-only, the safe default).
+fn parse_zenv(args: &[String]) -> Result<Command, String> {
+    match args.first().map(String::as_str) {
+        None | Some("status") => Ok(Command::Zenv(ZenvCmd::Status)),
+        Some("create") => {
+            let mut no_venv = false;
+            for a in &args[1..] {
+                match a.as_str() {
+                    "--no-venv" => no_venv = true,
+                    other => {
+                        return Err(format!("unexpected argument `{other}` for `zenv create`"))
+                    }
+                }
+            }
+            Ok(Command::Zenv(ZenvCmd::Create { no_venv }))
+        }
+        Some("path") => Ok(Command::Zenv(ZenvCmd::Path)),
+        Some("clean") => Ok(Command::Zenv(ZenvCmd::Clean)),
+        Some(other) => Err(format!(
+            "unknown `zap zenv` subcommand `{other}` (use create|status|path|clean)"
+        )),
+    }
+}
+
 /// Run a parsed command.
 pub fn execute(cmd: Command) -> ExitCode {
     match cmd {
@@ -228,14 +334,9 @@ pub fn execute(cmd: Command) -> ExitCode {
         }
         Command::New { name } => cmd_new(&name),
         Command::Init => cmd_init(),
-        Command::Add | Command::Remove => stub(
-            "dependency management",
-            "issue #69 (package manager, D-0052)",
-        ),
-        Command::Zenv => stub(
-            "the project environment (zenv)",
-            "issue #69 (package manager, D-0052)",
-        ),
+        Command::Add { name, source } => cmd_add(&name, source),
+        Command::Remove { name } => cmd_remove(&name),
+        Command::Zenv(sub) => cmd_zenv(sub),
         Command::Test { file, json, watch } => cmd_test(file, json, watch),
         Command::Mcp { root } => crate::mcp::serve(root),
         Command::Version => {
@@ -395,10 +496,113 @@ fn cmd_test(_file: Option<String>, _json: bool, _watch: bool) -> ExitCode {
     ExitCode::from(1)
 }
 
-/// Report that a verb's underlying system is not built yet, naming the ticket.
-fn stub(what: &str, ticket: &str) -> ExitCode {
-    eprintln!("zap: {what} is not available yet — tracked in {ticket}.");
-    ExitCode::from(2)
+/// `zap add <name> <source>` — add a dependency and re-lock (issue #69).
+fn cmd_add(name: &str, source: Source) -> ExitCode {
+    match zapc_pkg::ops::add(Path::new("."), name, &source) {
+        Ok(()) => {
+            println!("added `{name}` to zap.toml and updated zap.lock");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zap: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `zap remove <name>` — drop a dependency and re-lock (issue #69).
+fn cmd_remove(name: &str) -> ExitCode {
+    match zapc_pkg::ops::remove(Path::new("."), name) {
+        Ok(()) => {
+            println!("removed `{name}` from zap.toml and updated zap.lock");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zap: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `zap zenv <create|status|path|clean>` — the project environment (issue #69).
+fn cmd_zenv(sub: ZenvCmd) -> ExitCode {
+    let root = Path::new(".");
+    match sub {
+        ZenvCmd::Create { no_venv } => match zapc_pkg::ops::zenv_create(root, no_venv) {
+            Ok(report) => {
+                println!("created {}", report.zenv_dir.display());
+                println!(
+                    "  materialized {} module(s) into zenv/pkg",
+                    report.modules_materialized
+                );
+                if report.git_modules_skipped > 0 {
+                    println!(
+                        "  {} git module(s) recorded; run `zap zenv create` with network to fetch",
+                        report.git_modules_skipped
+                    );
+                }
+                match (report.venv_created, &report.venv_skipped_reason) {
+                    (true, _) => println!("  Python venv ready at zenv/venv"),
+                    (false, Some(reason)) => println!("  Python venv skipped ({reason})"),
+                    (false, None) => {}
+                }
+                println!("activate it with:  source zenv/activate");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("zap: {e}");
+                ExitCode::from(1)
+            }
+        },
+        ZenvCmd::Status => cmd_zenv_status(root),
+        ZenvCmd::Path => {
+            let paths = zapc_pkg::zenv::module_search_paths_from_env();
+            let joined = paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(":");
+            println!("{joined}");
+            ExitCode::SUCCESS
+        }
+        ZenvCmd::Clean => match zapc_pkg::ops::zenv_clean(root) {
+            Ok(true) => {
+                println!("removed zenv/");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                println!("no zenv/ to remove");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("zap: {e}");
+                ExitCode::from(1)
+            }
+        },
+    }
+}
+
+/// `zap zenv status` — report whether a zenv exists and whether one is active.
+fn cmd_zenv_status(root: &Path) -> ExitCode {
+    let zdir = zapc_pkg::zenv::zenv_dir(root);
+    if zdir.exists() {
+        println!("zenv: present at {}", zdir.display());
+        println!(
+            "  Python venv: {}",
+            if zapc_pkg::zenv::venv_dir(root).exists() {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+    } else {
+        println!("zenv: none here (create one with `zap zenv create`)");
+    }
+    match std::env::var(zapc_pkg::zenv::ZAP_ZENV) {
+        Ok(active) if !active.is_empty() => println!("  active: yes ({active})"),
+        _ => println!("  active: no (run `source zenv/activate`)"),
+    }
+    ExitCode::SUCCESS
 }
 
 /// `zap help` text.
@@ -417,6 +621,13 @@ project:
   new <name>            scaffold a new project directory (writes zap.toml)
   init                  scaffold zap.toml in the current directory
 
+dependencies (package manager, issue #69, D-0052):
+  add <name> --git <url> --version <v>   add a VCS dependency, re-lock
+  add <name> --path <dir>                add a local dependency, re-lock
+  remove <name>                          drop a dependency, re-lock
+  zenv create [--no-venv]                create the project environment
+  zenv status | path | clean             inspect / clean the environment
+
 test:
   test [file]           run the @test suite (D-0054); a file, or the project
        --json           emit structured results (for `zap mcp`, issue #72)
@@ -433,8 +644,6 @@ diagnostics:
 
 not yet implemented / pending their own tickets:
   fmt                   canonical formatter (D-0037)
-  add / remove          dependency management (package manager, issue #69)
-  zenv                  project environment (issue #69)
 ";
 
 #[cfg(test)]
@@ -580,10 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn stub_and_project_verbs_parse() {
-        assert_eq!(p(&["add", "foo"]).unwrap(), Command::Add);
-        assert_eq!(p(&["remove", "foo"]).unwrap(), Command::Remove);
-        assert_eq!(p(&["zenv", "create"]).unwrap(), Command::Zenv);
+    fn init_verb_parses() {
         assert_eq!(p(&["init"]).unwrap(), Command::Init);
     }
 
@@ -599,6 +805,91 @@ mod tests {
         assert!(p(&["mcp", "--root"]).is_err());
         assert!(p(&["mcp", "--socket"]).is_err());
         assert!(p(&["mcp", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn add_parses_path_and_git_sources() {
+        assert_eq!(
+            p(&["add", "mathx", "--path", "../mathx"]).unwrap(),
+            Command::Add {
+                name: "mathx".into(),
+                source: Source::Path {
+                    dir: "../mathx".into()
+                }
+            }
+        );
+        assert_eq!(
+            p(&[
+                "add",
+                "jsonlib",
+                "--git",
+                "https://x/j.git",
+                "--version",
+                "1.4.0"
+            ])
+            .unwrap(),
+            Command::Add {
+                name: "jsonlib".into(),
+                source: Source::Git {
+                    url: "https://x/j.git".into(),
+                    version: "1.4.0".into()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn add_rejects_bad_source_combinations() {
+        // No source.
+        assert!(p(&["add", "foo"]).is_err());
+        // git without version.
+        assert!(p(&["add", "foo", "--git", "u"]).is_err());
+        // both sources.
+        assert!(p(&[
+            "add",
+            "foo",
+            "--git",
+            "u",
+            "--version",
+            "1.0.0",
+            "--path",
+            "p"
+        ])
+        .is_err());
+        // no name.
+        assert!(p(&["add", "--path", "p"]).is_err());
+    }
+
+    #[test]
+    fn remove_needs_a_name() {
+        assert!(p(&["remove"]).is_err());
+        assert_eq!(
+            p(&["remove", "foo"]).unwrap(),
+            Command::Remove { name: "foo".into() }
+        );
+    }
+
+    #[test]
+    fn zenv_subcommands_parse() {
+        assert_eq!(p(&["zenv"]).unwrap(), Command::Zenv(ZenvCmd::Status));
+        assert_eq!(
+            p(&["zenv", "status"]).unwrap(),
+            Command::Zenv(ZenvCmd::Status)
+        );
+        assert_eq!(
+            p(&["zenv", "create"]).unwrap(),
+            Command::Zenv(ZenvCmd::Create { no_venv: false })
+        );
+        assert_eq!(
+            p(&["zenv", "create", "--no-venv"]).unwrap(),
+            Command::Zenv(ZenvCmd::Create { no_venv: true })
+        );
+        assert_eq!(p(&["zenv", "path"]).unwrap(), Command::Zenv(ZenvCmd::Path));
+        assert_eq!(
+            p(&["zenv", "clean"]).unwrap(),
+            Command::Zenv(ZenvCmd::Clean)
+        );
+        assert!(p(&["zenv", "bogus"]).is_err());
     }
 
     #[test]

@@ -691,6 +691,12 @@ Python feel and the no-inheritance simplicity.
 reproducible, dependency-hell-free builds with no central chokepoint; `zenv`
 unifies Zap and Python reproducibility under the env-var simplicity of venv.
 
+Concrete file formats, the MVS algorithm, the `zap1:` content-checksum scheme,
+and the `zenv` activate-script are specified in `design/0009-packaging.md`
+(issue #69). Two as-built notes: the resolver's module identity is
+`(name, major)` so majors coexist; and `path` sources (local, Go-style) join
+`git` sources so local multi-module dev and hermetic builds work offline.
+
 ## D-0053 — Toolchain & CLI
 **Status:** Locked — resolves issue #58
 One user-facing tool, **`zap`** (the compiler binary `zapc` becomes internal,

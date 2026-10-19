@@ -1,0 +1,22 @@
+# The Zap package manager & project environment (issue #69, D-0052).
+#
+# Manifest (`zap.toml`) + lockfile (`zap.lock`) parsing, Go-style Minimal
+# Version Selection, content checksums, and the `zenv` project environment.
+# Host-safe (no LLVM): built by the default `cargo test`.
+[package]
+name = "zapc_pkg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Manifest/lockfile are TOML; serde gives round-trip (de)serialization. semver
+# is the canonical version implementation (already in the local cargo cache).
+# Pinned to exact versions — the workspace does not commit Cargo.lock, so pins
+# keep resolution reproducible.
+serde = { version = "=1.0.219", features = ["derive"] }
+toml = "=0.8.19"
+# Comment-preserving manifest edits (`zap add`/`remove`). Matches toml 0.8.19.
+toml_edit = "=0.22.22"
+semver = "=1.0.28"
