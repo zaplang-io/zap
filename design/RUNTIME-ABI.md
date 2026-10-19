@@ -80,9 +80,14 @@ offset 0:  data   (*object)  — the underlying concrete instance   — 8 bytes
 offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
 ```
 
-- `data` is the concrete reference-struct instance (a heap pointer, one word per
-  the value representation above). The object's own header/type-descriptor word
-  is unchanged — the fat pointer is *beside* the object, not in it.
+- `data` is a heap pointer to the concrete instance (one word per the value
+  representation above). The object's own header/type-descriptor word is
+  unchanged — the fat pointer is *beside* the object, not in it. A **reference
+  struct** is used directly (shared heap identity). A **`value struct`** has no
+  stable address — the function body addresses it through a pointer that may be a
+  stack slot under the register/sret ABI (a spilled parameter or call result), or
+  an lvalue the interface value must not alias — so on conversion it is **boxed**:
+  copied to a fresh heap instance that `data` points at (see Construction).
 - `itable` points at a **static, immutable** dispatch table: an `[N x ptr]`
   array of function pointers, one per interface method, in **interface
   declaration order** (slot *k* = the implementor's method for interface method
@@ -90,7 +95,16 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
   that occurs, built once and shared.
 - **Construction** (concrete → interface, a conversion site: assignment to an
   interface-typed binding, an interface-typed argument, or an interface return)
-  materializes `{ data = instance, itable = &itable_for_pair }`.
+  materializes `{ data = instance, itable = &itable_for_pair }`. For a **`value
+  struct`** the conversion first boxes it (#75 Part 1, D-0051): a field-wise deep
+  copy into a fresh heap instance (the same copy that collection-boxing uses —
+  nested value-aggregate fields are copied recursively, reference fields shared),
+  and that box pointer becomes `data`. The box is an ordinary GC object: it is
+  allocated with the struct's type descriptor, so the precise collector traces
+  its pointer fields, and it is kept live transitively through the fat pointer's
+  root exactly as a reference-struct `data` is. The copy makes the interface
+  value independent of the original (value semantics) and gives `data` the stable
+  heap address the fat pointer requires.
 - **Dispatch** of `s.m(args…)` loads slot *k* from `s.itable` and calls it with
   `s.data` as `self`: a single indirect call, no per-object cost beyond the
   shared header. The callee uses the ordinary calling convention with `self` as
@@ -101,13 +115,10 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
   originating instance's root; the `itable` word addresses static data and is
   safely ignored by the collector (it is not a heap object).
 - `None` as an interface value would be `{ data = null, itable = null }`;
-  interface→interface conversion, interface-typed **struct fields / collection
-  elements**, and **`value struct` behind an interface** (which needs
-  copy-to-heap boxing on conversion, #75 Part 1) are **not yet realized** — the
-  current increment covers interface-typed **bindings, parameters, and returns**
-  over reference structs. #75 Part 1 hooks in at the conversion site: a value
-  struct is copied to the heap first and that heap pointer becomes `data`; the
-  fat-pointer shape is unchanged.
+  interface→interface conversion and interface-typed **struct fields / collection
+  elements** are **not yet realized**. Interface-typed **bindings, parameters,
+  and returns** are supported over both reference structs and (via the boxing
+  above) `value struct`s.
 
 ### String & bytes layout (coordinate with #16 / design/0007-strings)
 
