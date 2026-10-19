@@ -20,8 +20,11 @@ _Last updated: 2026-10-19_
   generics land. See `design/0006-types-and-generics.md` §3.3.
 - 🟡 **`set` collection type** + set comprehensions (comprehensions are locked,
   D-0026, but a `set` type isn't).
-- 🟡 **Operator overloading for user types.** Currently built-in types only
-  (D-0011). Decide if/how user structs define `+`, `==`, etc.
+- ✅ **Operator overloading for user types** — RESOLVED (D-0047, issue #52):
+  dunder methods satisfying compiler-known structural operator interfaces; single
+  `__cmp__` for ordering, `__eq__` for equality; `@derive(Eq, Ord, Hash, Repr)`;
+  `__call__` and `__hash__` (struct keys) included; in-place `__iadd__` reserved,
+  implementation deferred. See `design/0006-types-and-generics.md` §2.5.
 - 🟡 **Iteration protocol.** How a user type becomes iterable / works with `for`
   and comprehensions (a `__iter__`-style contract, or an `Iterable` interface).
 - 🟡 **Tuple syntax & multiple return.** Tuples are locked (D-0019); their

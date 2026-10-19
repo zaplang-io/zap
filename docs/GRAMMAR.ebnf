@@ -1,5 +1,5 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0046.
+   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0047.
 
    Notation:
      ::=        definition
@@ -114,6 +114,11 @@ aug_assign    ::= target aug_op expr ;
 subst_assign  ::= target "~=" subst_regex ;    (* in-place substitution, D-0010 *)
 aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**="
                 | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
+                  (* Operator overloading (D-0047) is semantic, not grammatical:
+                     each operator desugars to a dunder method (`a + b` ->
+                     `a.__add__(b)`) on a compiler-known operator interface.
+                     `aug_op` desugars from the binary dunder by default; the
+                     in-place `__iadd__`-family is reserved, impl deferred. *)
 target        ::= atom { trailer } ;           (* name, index, slice, attr *)
 send_stmt     ::= postfix "<-" expr ;          (* channel send: ch <- v; D-0031 *)
 recv_bind     ::= ( type | "auto" ) IDENT "," IDENT "=" "<-" postfix

@@ -292,6 +292,62 @@ table; the fat-pointer itable is preferred because it makes the method-slot
 layout per-interface and resolves it at compile time (see §Rationale and
 §Open issues).
 
+#### 2.5 Operator overloading (D-0047)
+
+A user type overloads an operator by defining the matching **dunder method**,
+which the compiler recognizes through a fixed set of **structural operator
+interfaces** (so conformance is compile-time-checked exactly like any interface,
+§2, D-0016). `a + b` desugars to `a.__add__(b)` and type-checks iff `a`'s type
+satisfies `Add`:
+
+```python
+interface Add:
+    def __add__(self, other: Self) -> Self
+```
+
+**The full dunder set** — all operators are overloadable:
+
+| `a op b` / form | dunder |
+|---|---|
+| `+ - * / // % **` | `__add__ __sub__ __mul__ __truediv__ __floordiv__ __mod__ __pow__` |
+| `& \| ^ << >>` | `__and__ __or__ __xor__ __lshift__ __rshift__` |
+| `-a +a ~a` | `__neg__ __pos__ __invert__` |
+| `== !=` | `__eq__` (`!=` derived) |
+| `< <= > >=` | `__cmp__(self, other) -> int` (all four derived) |
+| `a[i]` / `a[i]=v` / `del a[i]` | `__getitem__ __setitem__ __delitem__` |
+| `x in a` / `len(a)` / `if a:` | `__contains__ __len__ __bool__` |
+| `a(args)` | `__call__` |
+| `str(a)` / `print` | `__str__ __repr__` |
+| dict/set key | `__hash__` |
+
+(`__iter__` / `for x in a` is the iteration protocol, a separate decision.)
+
+- **Single-method ordering.** Only `__cmp__` (returning −/0/+) is written; the
+  four relational operators derive from it, and `!=` derives from `__eq__`.
+- **`@derive` is the common case (D-0036).** `@derive(Eq, Ord, Hash, Repr)`
+  generates these dunders field-by-field, zero hand-written operators:
+
+  ```python
+  @derive(Eq, Ord, Hash, Repr)
+  struct Version:
+      int64 major
+      int64 minor
+      int64 patch
+  # => v1 < v2, v1 == v2, {v1: ...}, print(v1) all work; lexicographic by field.
+  ```
+
+- **Hash / struct keys.** `__hash__` (derived or hand-written) makes a struct a
+  `dict`/`set` key (unblocks D-0043's deferred struct-element hashing). Invariant
+  `a == b ⟹ hash(a) == hash(b)`: `@derive(Hash)` guarantees it; a hand-written
+  `__hash__` (e.g. hashing only a stable `id`) must preserve it. The compiler
+  warns on `Eq`-without-`Hash` used as a key.
+- **Augmented assignment** (`+=`, …) derives from the binary dunder
+  (`a = a.__add__(b)`). The **in-place** family (`__iadd__`, …) is **reserved**
+  but deferred to a later ticket — a pure allocation optimization gated on
+  aliasing rules (D-0023).
+- **Operator interfaces double as generic bounds** (D-0017): once user generics
+  land, `def sum[T: Add](xs: list[T]) -> T` constrains `T` to addable types.
+
 ### 3. Enums
 
 #### 3.1 Tier 1 — named constants (D-0018)

@@ -490,3 +490,45 @@ after the core.
 pointer-on-recursion keeps the motivating AST/tree types expressible; reusing the
 `match` and struct-construction surfaces means no new syntax families, and
 qualified variants keep exhaustiveness and name-collision handling clean.
+
+## D-0047 — Operator overloading for user types
+**Status:** Locked — resolves issue #52 (the "built-in types only" gap, D-0011)
+User types overload operators via **dunder-named methods** resolved through a
+fixed set of compiler-known, **structural, compile-time-checked** stdlib
+operator interfaces (D-0016): `a + b` desugars to `a.__add__(b)` and compiles
+**iff** `a`'s type satisfies `Add`. The dunder names are Python's — familiar to
+the target audience, collision-free, and unambiguously "operator"; the operator
+interfaces later double as **generic bounds** (D-0017, e.g. `def sum[T: Add]`).
+
+**Overloadable — all operators:** arithmetic (`__add__ __sub__ __mul__
+__truediv__ __floordiv__ __mod__ __pow__`), bitwise/shift (`__and__ __or__
+__xor__ __lshift__ __rshift__`), unary (`__neg__ __pos__ __invert__`), equality
+(`__eq__`), ordering (a single `__cmp__(self, other) -> int`), indexing
+(`__getitem__ __setitem__ __delitem__`), membership/size (`__contains__`,
+`__len__`), truthiness (`__bool__`), **call** (`__call__`), and repr (`__str__
+__repr__`). Iteration (`__iter__`) is out of scope here — it is issue #53.
+
+**Derivation:** `!=` derives from `__eq__`; the four relational operators
+(`< <= > >=`) derive from `__cmp__`. Augmented assignment (`+=`, …) desugars
+from the binary operator by default.
+
+**`@derive` integration (D-0036):** `@derive(Eq, Ord, Hash, Repr)` generates the
+corresponding dunders field-by-field, so the common value-object case needs no
+hand-written operator. The compiler **warns** if a type defines/derives `Eq`
+(equality) but no `Hash` and is then used as a `dict`/`set` key.
+
+**Hash / struct keys:** `__hash__` (hand-written or `@derive(Hash)`) is what lets
+a struct be a `dict`/`set` key — unblocking the struct-element hashing deferred
+in D-0043. Invariant: `a == b` ⟹ `hash(a) == hash(b)`; `@derive(Hash)`
+guarantees it (same fields feed `__eq__` and `__hash__`), a hand-written
+`__hash__` must preserve it.
+
+**In-place augmented assignment (`__iadd__`/`__isub__`/… family):** **reserved**
+in the grammar/spec but its **implementation is deferred to a separate ticket**.
+It is a pure allocation optimization over deriving `+=` from `__add__` and is
+gated on value/reference aliasing rules (D-0023); until it lands, `+=` always
+derives from the binary operator.
+
+**Rationale:** reusing structural interfaces keeps overloading compile-time
+typo-safe (D-0016) and makes operators usable as generic bounds; dunder names
+fit the Python audience and sidestep name collisions with ordinary methods.

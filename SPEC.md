@@ -220,6 +220,14 @@ def map[T, U](xs: list[T], f: fn(T) -> U) -> list[U]:
 - Bitwise `& | ^ ~ << >>` (on signed integers).
 - Regex bind `=~` / `!~` and in-place `~=` (D-0010).
 - Channel send/receive `ch <- v` / `<-ch` (D-0031).
+- **Operator overloading (D-0047):** user types overload operators by defining
+  **dunder methods** (`__add__`, `__eq__`, `__getitem__`, `__call__`, `__hash__`,
+  …) that satisfy compiler-known structural interfaces (`Add`, `Eq`, `Index`,
+  …), checked at compile time. Equality is `__eq__` (`!=` derived); ordering is a
+  single `__cmp__` (the four relational operators derived). `@derive(Eq, Ord,
+  Hash, Repr)` generates them field-by-field. `+=` derives from the binary
+  operator; in-place `__iadd__`-family methods are reserved, implementation
+  deferred. Iteration (`__iter__`) is specified separately.
 
 ## 6. Control flow
 
