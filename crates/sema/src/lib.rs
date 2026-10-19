@@ -4144,7 +4144,8 @@ mod tests {
 
     // --- interfaces (ticket #84, D-0016) ---
 
-    const SHAPE_IFACE: &str = "interface Shape:\n    def area(self) -> f64\n    def name(self) -> str\n\n\
+    const SHAPE_IFACE: &str =
+        "interface Shape:\n    def area(self) -> f64\n    def name(self) -> str\n\n\
         struct Circle:\n    f64 r\n\
         \x20   def area(self) -> f64:\n        return self.r\n\
         \x20   def name(self) -> str:\n        return \"circle\"\n\n";

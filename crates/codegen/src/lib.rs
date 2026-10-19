@@ -1858,9 +1858,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         g.set_initializer(&arr);
         g.set_constant(true);
         let ptr = g.as_pointer_value();
-        self.itables
-            .borrow_mut()
-            .insert((concrete_sid, iid), ptr);
+        self.itables.borrow_mut().insert((concrete_sid, iid), ptr);
         Ok(ptr)
     }
 

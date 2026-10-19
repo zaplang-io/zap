@@ -4424,7 +4424,14 @@ impl<'a> FnLower<'a> {
             });
         }
         let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
-        Ok((rv, if msig.ret == Ty::Void { Ty::I32 } else { msig.ret }))
+        Ok((
+            rv,
+            if msig.ret == Ty::Void {
+                Ty::I32
+            } else {
+                msig.ret
+            },
+        ))
     }
 
     fn construct(&mut self, sid: u32, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {

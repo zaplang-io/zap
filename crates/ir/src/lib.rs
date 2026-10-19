@@ -54,7 +54,11 @@ mod tests {
         let shape = &m.interfaces[0];
         assert_eq!(shape.name, "Shape");
         let slots: Vec<&str> = shape.methods.iter().map(|x| x.name.as_str()).collect();
-        assert_eq!(slots, vec!["area", "name"], "slot order is declaration order");
+        assert_eq!(
+            slots,
+            vec!["area", "name"],
+            "slot order is declaration order"
+        );
         // The fat-pointer layout is the inline `{ptr, ptr}` aggregate.
         let fat = &m.structs[shape.fat_sid as usize];
         assert!(fat.inline, "the fat pointer is passed by value");
@@ -62,7 +66,10 @@ mod tests {
         // The concrete->interface conversion and the dynamic dispatch are emitted.
         let text = format!("{m}");
         assert!(text.contains("ifacemake"), "conversion emitted:\n{text}");
-        assert!(text.contains("ifacecall"), "dynamic dispatch emitted:\n{text}");
+        assert!(
+            text.contains("ifacecall"),
+            "dynamic dispatch emitted:\n{text}"
+        );
     }
 
     #[test]
