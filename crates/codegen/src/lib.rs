@@ -89,14 +89,24 @@ impl Backend for LlvmBackend {
 /// Compile an AST module to a native executable (object + `cc` link).
 /// The Zap C runtime, compiled and linked with each program.
 const RUNTIME_C: &str = include_str!("zaprt.c");
+/// The precise Immix collector, `#include`d by `zaprt.c` under `ZAP_GC_IMMIX`
+/// (ticket #48). Written next to the runtime so the relative include resolves.
+const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
 
 pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), String> {
     let obj_path = out_path.with_extension("o");
     LlvmBackend.compile_object(module, &obj_path)?;
 
-    // Write the runtime to a temp .c and let cc compile + link it in.
-    let rt_path = std::env::temp_dir().join(format!("zaprt-{}.c", std::process::id()));
+    // Write the runtime into a per-build temp dir and let cc compile + link it
+    // in. The GC collector include is written alongside so `#include
+    // "zapgc.inc.c"` (relative) resolves (ticket #48).
+    let build_dir = std::env::temp_dir().join(format!("zap-build-{}", std::process::id()));
+    std::fs::create_dir_all(&build_dir)
+        .map_err(|e| format!("failed to create build dir: {e}"))?;
+    let rt_path = build_dir.join("zaprt.c");
     std::fs::write(&rt_path, RUNTIME_C).map_err(|e| format!("failed to write runtime: {e}"))?;
+    std::fs::write(build_dir.join("zapgc.inc.c"), RUNTIME_GC_C)
+        .map_err(|e| format!("failed to write gc runtime: {e}"))?;
 
     // `-lgc` links the conservative Boehm collector the runtime allocates
     // through (ticket #20, D-0009); the dev container provides `libgc-dev`.
@@ -134,7 +144,7 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
-    let _ = std::fs::remove_file(&rt_path);
+    let _ = std::fs::remove_dir_all(&build_dir);
     if !status.success() {
         return Err(format!("linker (cc) failed: {status}"));
     }
