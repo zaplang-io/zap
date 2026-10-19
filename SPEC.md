@@ -209,6 +209,27 @@ def map[T, U](xs: list[T], f: fn(T) -> U) -> list[U]:
     ...
 ```
 
+### 4.8 Tuples (D-0019, D-0049)
+
+Fixed-arity, heterogeneous, **immutable** by-value aggregates.
+
+```python
+auto t = (1, "two", 3.0)      # (int64, str, f64)
+auto one = (42,)              # 1-tuple needs the trailing comma; () is empty
+print(t[0])                   # access by COMPILE-TIME-CONSTANT index -> 1
+                              # t[i] with a runtime i is a compile error
+auto (a, b, c) = t            # positional destructuring
+auto (first, *rest) = xs      # single *rest captures the remainder (a tuple)
+(x, y) = (y, x)               # swap
+
+def divmod(int64 a, int64 b) -> (int64, int64):
+    return a // b, a % b      # multiple return IS tuple return
+auto (q, r) = divmod(17, 5)
+```
+
+Compared element-wise by `==`; `v, ok = <-ch` (D-0031) is this same
+destructuring. Not a reference type; no heap header unless boxed.
+
 ## 5. Operators & expressions
 
 - Arithmetic `+ - * / // % **`; **`/` is true division** (float), **`//` is

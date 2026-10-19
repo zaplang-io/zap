@@ -1,5 +1,5 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0048.
+   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0049.
 
    Notation:
      ::=        definition
@@ -99,17 +99,16 @@ simple_stmt   ::= decl
                 | assign
                 | aug_assign
                 | subst_assign
-                | recv_bind                          (* comma-ok channel receive, D-0031 *)
                 | send_stmt                          (* channel send, D-0031 *)
-                | "return" [ expr ]
+                | "return" [ expr { "," expr } ]     (* bare comma-list -> tuple return, D-0049 *)
                 | "raise" [ expr ]
                 | "spawn" [ "detached" ] call_expr   (* "detached": D-0044 *)
                 | "break"
                 | "continue"
                 | expr ;                       (* ";" may join simple stmts *)
 
-decl          ::= [ "const" ] ( type | "auto" ) IDENT "=" expr ;  (* D-0003 *)
-assign        ::= target "=" expr ;
+decl          ::= [ "const" ] ( type | "auto" ) bind_target "=" expr ;  (* D-0003, D-0049 *)
+assign        ::= bind_target "=" expr ;
 aug_assign    ::= target aug_op expr ;
 subst_assign  ::= target "~=" subst_regex ;    (* in-place substitution, D-0010 *)
 aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**="
@@ -121,11 +120,17 @@ aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**="
                      in-place `__iadd__`-family is reserved, impl deferred. *)
 target        ::= atom { trailer } ;           (* name, index, slice, attr *)
 send_stmt     ::= postfix "<-" expr ;          (* channel send: ch <- v; D-0031 *)
-recv_bind     ::= ( type | "auto" ) IDENT "," IDENT "=" "<-" postfix
-                | IDENT "," IDENT "=" "<-" postfix ;   (* comma-ok receive: auto v, ok = <-ch *)
-                  (* plain receive `auto v = <-ch` is an ordinary decl; `<-` receive
-                     is an atom prefix (see `atom`). General tuple-destructuring
-                     assignment is a separate decision (tuple syntax, I#54). *)
+
+(* ---------- Tuple destructuring targets (D-0049) ---------- *)
+bind_target   ::= target                        (* single target *)
+                | target_tuple                  (* bare list: a, b *)
+                | "(" target_tuple ")" ;        (* parenthesized: (a, b) *)
+target_tuple  ::= target_elem { "," target_elem } [ "," ] ;
+target_elem   ::= [ "*" ] target                (* at most one "*" per tuple (semantic) *)
+                | "(" target_tuple ")" ;        (* nested destructuring *)
+                  (* comma-ok receive `auto v, ok = <-ch` is just a bind_target with
+                     a `<-ch` receive expr; multiple return destructures a
+                     tuple-returning call the same way. *)
 
 compound_stmt ::= if_stmt
                 | while_stmt
@@ -230,7 +235,7 @@ arg           ::= [ IDENT "=" ] expr ;            (* keyword arg, D-0038 *)
 atom          ::= literal
                 | IDENT
                 | "<-" postfix                    (* channel receive, D-0031 *)
-                | "(" [ expr { "," expr } ] ")"   (* grouping / tuple *)
+                | "(" [ expr { "," expr } [ "," ] ] ")"  (* grouping / tuple; (e,) = 1-tuple, D-0049 *)
                 | list_display
                 | dict_display ;
 
