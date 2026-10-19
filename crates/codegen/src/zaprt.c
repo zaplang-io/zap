@@ -200,6 +200,29 @@ void *zap_alloc(int64_t size) {
 #endif
 }
 
+/* ---------------------------------------------------------------------------
+ * Uniform GC control surface (ticket #77 signals, backend-agnostic): one symbol
+ * each backend implements, so a SIGUSR1 "force GC + memory stats" handler (and
+ * any future runtime introspection) calls it without `#ifdef`-ing per backend.
+ *   - zap_gc_collect(): force a full collection now.
+ *   - zap_gc_stats(heap_bytes, live_bytes): current mapped-heap bytes and the
+ *     live/used bytes as of the last collection (best-effort per backend).
+ * The Immix implementations live in zapgc.inc.c (included below); the Boehm
+ * ones wrap bdwgc here. */
+#ifndef ZAP_GC_IMMIX
+void zap_gc_collect(void) { GC_gcollect(); }
+void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes) {
+    size_t heap = GC_get_heap_size();
+    size_t freeb = GC_get_free_bytes();
+    if (heap_bytes) {
+        *heap_bytes = (int64_t)heap;
+    }
+    if (live_bytes) {
+        *live_bytes = (int64_t)(heap > freeb ? heap - freeb : 0);
+    }
+}
+#endif
+
 /* Descriptor-typed allocation the compiler calls for struct / closure objects
  * (ticket #48). Exposed with C linkage so codegen can declare and call it. */
 void *zap_alloc_typed(const ZapTypeDesc *desc) { return zap_alloc_desc(desc); }
