@@ -394,6 +394,14 @@ impl Func {
 pub struct StructLayout {
     pub name: String,
     pub fields: Vec<Ty>,
+    /// `true` for a `value struct` (D-0051): a value type with value semantics
+    /// (copied on assign/pass/return, no shared identity). A plain `struct`
+    /// (reference type, D-0023) and an anonymous tuple layout have
+    /// `is_value == false`. The physical representation is identical today (a
+    /// GC-heap aggregate behind a pointer); this flag records the kind so value
+    /// semantics are applied at lowering and a future backend pass can specialize
+    /// small value structs to registers/stack (sret ABI).
+    pub is_value: bool,
 }
 
 #[derive(Clone, Debug, Default)]

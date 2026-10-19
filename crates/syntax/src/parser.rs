@@ -199,7 +199,16 @@ impl Parser {
                 items.push(Item::Function(self.parse_function(decos)))
             }
             TokenKind::Keyword(Keyword::Struct) => {
-                items.push(Item::Struct(self.parse_struct(decos)))
+                items.push(Item::Struct(self.parse_struct(decos, false)))
+            }
+            // Contextual `value struct` modifier (D-0051): `value` is an
+            // identifier, not a keyword, so only treat it as the value-type
+            // modifier when it immediately precedes `struct`.
+            TokenKind::Ident(n)
+                if n == "value" && matches!(self.peek2(), TokenKind::Keyword(Keyword::Struct)) =>
+            {
+                self.bump(); // consume `value`
+                items.push(Item::Struct(self.parse_struct(decos, true)))
             }
             TokenKind::Keyword(Keyword::Enum) => items.push(Item::Enum(self.parse_enum(decos))),
             TokenKind::Keyword(Keyword::Interface) => {
@@ -344,7 +353,7 @@ impl Parser {
         }
     }
 
-    fn parse_struct(&mut self, decorators: Vec<Decorator>) -> StructDef {
+    fn parse_struct(&mut self, decorators: Vec<Decorator>, is_value: bool) -> StructDef {
         let start = self.peek_span().start;
         self.expect_kw(Keyword::Struct, "'struct'");
         let name = self.ident("struct name");
@@ -356,6 +365,7 @@ impl Parser {
             generics,
             fields,
             methods,
+            is_value,
             span: self.span_from(start),
         }
     }
@@ -2163,6 +2173,35 @@ mod tests {
         assert_eq!(s.fields.len(), 2);
         assert_eq!(s.methods.len(), 1);
         assert_eq!(s.methods[0].params[0].name, "self");
+        assert!(!s.is_value, "a plain struct is a reference type (D-0023)");
+    }
+
+    #[test]
+    fn value_struct_modifier_parses() {
+        // The contextual `value` modifier (D-0051) sets the flag; `value` stays a
+        // usable identifier elsewhere.
+        let m = parse_ok("value struct Vec2:\n    f64 x\n    f64 y\n");
+        let Item::Struct(s) = &m.items[0] else {
+            panic!("struct");
+        };
+        assert_eq!(s.name, "Vec2");
+        assert!(s.is_value, "`value struct` should set is_value");
+
+        // `value` not immediately before `struct` is an ordinary identifier.
+        let m2 = parse_ok("def f():\n    auto value = 3\n    print(value)\n");
+        assert!(matches!(&m2.items[0], Item::Function(_)));
+    }
+
+    #[test]
+    fn value_struct_with_decorator_parses() {
+        // Decorators precede the `value` modifier (`decorators [ "value" ]
+        // "struct"`, grammar).
+        let m = parse_ok("@derive(Eq)\nvalue struct Key:\n    int64 a\n");
+        let Item::Struct(s) = &m.items[0] else {
+            panic!("struct");
+        };
+        assert!(s.is_value);
+        assert_eq!(s.decorators.len(), 1);
     }
 
     #[test]

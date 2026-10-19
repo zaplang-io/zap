@@ -127,6 +127,9 @@ struct StructCtx {
     ids: HashMap<String, u32>,
     names: Vec<String>,
     fields: Vec<Vec<(String, Ty)>>,
+    /// Struct ids that are `value struct`s (value types, D-0051). A value struct
+    /// has value semantics: copied on assign/pass/return (no shared identity).
+    value_ids: HashSet<u32>,
     /// Registered enums (tier-1 and tier-3), keyed by type name.
     enums: HashMap<String, EnumLow>,
     /// Python import aliases (ticket #27, D-0012): the in-scope name
@@ -155,6 +158,22 @@ impl StructCtx {
             tuples: &self.tuples,
         }
     }
+
+    /// Is `sid` a `value struct` (value type, D-0051)?
+    fn is_value_struct(&self, sid: u32) -> bool {
+        self.value_ids.contains(&sid)
+    }
+}
+
+/// An expression whose value is an *existing object* (an lvalue read), so a
+/// value struct obtained from it must be copied to preserve value semantics
+/// (D-0051). A freshly produced value — a constructor call, function/method
+/// call, or operator result — is already uniquely owned and needs no copy.
+fn is_lvalue_read(e: &ast::Expr) -> bool {
+    matches!(
+        e,
+        ast::Expr::Name(..) | ast::Expr::Attr { .. } | ast::Expr::Index { .. }
+    )
 }
 
 pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
@@ -166,11 +185,18 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     // (whose field type is the enum itself) resolves to a pointer.
     let mut ids: HashMap<String, u32> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
+    let mut value_ids: HashSet<u32> = HashSet::new();
     for item in &module.items {
         match item {
             ast::Item::Struct(s) => {
-                ids.insert(s.name.clone(), names.len() as u32);
+                let sid = names.len() as u32;
+                ids.insert(s.name.clone(), sid);
                 names.push(s.name.clone());
+                // Record the value-vs-reference kind (D-0051); a `value struct`
+                // gets value semantics at lowering.
+                if s.is_value {
+                    value_ids.insert(sid);
+                }
             }
             // A data-carrying enum needs a struct id reserved up front so its
             // own (possibly recursive) variant fields resolve to a pointer.
@@ -303,6 +329,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         ids,
         names,
         fields,
+        value_ids,
         enums,
         py,
         tuples,
@@ -361,6 +388,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         out.structs.push(StructLayout {
             name: ctx.names[sid].clone(),
             fields: ctx.fields[sid].iter().map(|(_, t)| *t).collect(),
+            is_value: ctx.is_value_struct(sid as u32),
         });
     }
     for item in &module.items {
@@ -405,6 +433,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         out.structs.push(StructLayout {
             name: "(tuple)".to_string(),
             fields: elems.clone(),
+            is_value: false,
         });
     }
     (out, errors)
@@ -1405,6 +1434,76 @@ impl<'a> FnLower<'a> {
         self.emit(Inst::Load { dest: d, ptr });
         d
     }
+
+    // --- value structs (D-0051) ---
+
+    /// If `v : ty` is a `value struct` obtained from an existing object
+    /// (`src` is an lvalue read), copy it so value semantics hold: the result is
+    /// an independent instance whose later mutation does not escape to `src`
+    /// (and vice-versa). A freshly produced value (constructor/call/operator
+    /// result) is already uniquely owned, so it is returned unchanged. Reference
+    /// structs (D-0023) are always returned unchanged — they share identity.
+    /// This is also the *boxing* copy used when a value struct is stored into a
+    /// collection or another aggregate (D-0051): the stored copy is independent.
+    fn copy_if_value(&mut self, v: Value, ty: Ty, src: &ast::Expr) -> Value {
+        if let Ty::Struct(sid) = ty {
+            if self.ctx.is_value_struct(sid) && is_lvalue_read(src) {
+                return self.copy_value_struct(v, sid);
+            }
+        }
+        v
+    }
+
+    /// Box a value struct for storage in a collection or another aggregate
+    /// (D-0051): a value struct stored in a list/dict/set is *boxed* — copied to
+    /// the heap — so the stored element is independent of the original and later
+    /// mutation of either does not affect the other. Unlike [`copy_if_value`],
+    /// this copies unconditionally (the collection always owns its own instance),
+    /// matching D-0051's "stored in a collection … is boxed (copied to the
+    /// heap)". Non-value types pass through unchanged.
+    fn box_if_value(&mut self, v: Value, ty: Ty) -> Value {
+        if let Ty::Struct(sid) = ty {
+            if self.ctx.is_value_struct(sid) {
+                return self.copy_value_struct(v, sid);
+            }
+        }
+        v
+    }
+
+    /// A field-wise copy of value struct `sid` at `src` into a fresh instance.
+    /// Nested value-struct fields are copied recursively (deep copy, so a nested
+    /// value aggregate is independent too); reference-typed fields — including
+    /// reference structs, strings, and collections — are shared (the pointer is
+    /// copied), matching D-0023 reference semantics and "a value struct holding
+    /// references is still GC-scanned".
+    fn copy_value_struct(&mut self, src: Value, sid: u32) -> Value {
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        let fields = self.ctx.fields[sid as usize].clone();
+        for (i, (_, fty)) in fields.iter().enumerate() {
+            let idx = i as u32;
+            let fv = self.new_value(*fty);
+            self.emit(Inst::FieldGet {
+                dest: fv,
+                base: src,
+                sid,
+                idx,
+            });
+            let fv = match *fty {
+                Ty::Struct(fsid) if self.ctx.is_value_struct(fsid) => {
+                    self.copy_value_struct(fv, fsid)
+                }
+                _ => fv,
+            };
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx,
+                val: fv,
+            });
+        }
+        dest
+    }
     fn iconst(&mut self, ty: Ty, val: i64) -> Value {
         let d = self.new_value(ty);
         self.emit(Inst::IConst { dest: d, val });
@@ -1512,6 +1611,9 @@ impl<'a> FnLower<'a> {
                     None => vt,
                 };
                 let v = self.coerce(v, vt, declared);
+                // Value structs are copied on binding (D-0051): `T b = a` makes
+                // `b` an independent instance of the value aggregate.
+                let v = self.copy_if_value(v, declared, value);
                 let slot = self.alloca(declared);
                 self.store(slot, v);
                 self.declare(name, slot, declared);
@@ -1524,6 +1626,8 @@ impl<'a> FnLower<'a> {
                         .lookup(n)
                         .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
                     let v = self.coerce(v, vt, ty);
+                    // Value structs copy on assignment (D-0051).
+                    let v = self.copy_if_value(v, ty, value);
                     self.store(ptr, v);
                     Ok(())
                 } else if let Expr::Attr { base, name, .. } = target {
@@ -1537,6 +1641,9 @@ impl<'a> FnLower<'a> {
                         .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
                     let (v, vt) = self.expr(value)?;
                     let v = self.coerce(v, vt, fty);
+                    // Storing a value struct into a field copies it (D-0051), so
+                    // the field holds an independent instance.
+                    let v = self.copy_if_value(v, fty, value);
                     self.emit(Inst::FieldSet {
                         base: bv,
                         sid,
@@ -1595,6 +1702,10 @@ impl<'a> FnLower<'a> {
                         } else {
                             self.coerce(v, vt, ret)
                         };
+                        // Returning a value struct copies it (D-0051), so the
+                        // caller receives an instance independent of the callee's
+                        // locals.
+                        let v = self.copy_if_value(v, ret, e);
                         self.set_term(Term::Ret(Some(v)));
                     }
                     None => self.set_term(Term::Ret(None)),
@@ -1838,7 +1949,11 @@ impl<'a> FnLower<'a> {
         for (i, a) in args.iter().enumerate() {
             let (v, vt) = self.expr(&a.value)?;
             let target = *ptys.get(i).unwrap_or(&vt);
-            argvals.push(self.coerce(v, vt, target));
+            let v = self.coerce(v, vt, target);
+            // A value struct captured by a goroutine is copied (D-0051); the
+            // copy is heap-allocated, so it safely outlives the spawning frame.
+            let v = self.copy_if_value(v, target, &a.value);
+            argvals.push(v);
         }
         self.emit(Inst::Spawn {
             func: fname.clone(),
@@ -2401,6 +2516,7 @@ impl<'a> FnLower<'a> {
                 let ek = elem_kind(et)?;
                 kind.set(Some(ek));
                 let ev = s.coerce(ev, et, ek.ty());
+                let ev = s.box_if_value(ev, ek.ty());
                 s.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_list_push_{}", ek.val_suffix()),
@@ -2442,6 +2558,7 @@ impl<'a> FnLower<'a> {
                 let ek = elem_kind(et)?;
                 kind.set(Some(ek));
                 let ev = s.coerce(ev, et, ek.ty());
+                let ev = s.box_if_value(ev, ek.ty());
                 let kfns = s.key_fn_args(ek)?;
                 let mut args = vec![set, ev];
                 args.extend_from_slice(&kfns);
@@ -2490,6 +2607,8 @@ impl<'a> FnLower<'a> {
                 kinds.set(Some((kk, vk)));
                 let kv = s.coerce(kv, kt, kk.ty());
                 let vv = s.coerce(vv, vt, vk.ty());
+                let kv = s.box_if_value(kv, kk.ty());
+                let vv = s.box_if_value(vv, vk.ty());
                 let kfns = s.key_fn_args(kk)?;
                 let mut args = vec![dict, kv, vv];
                 args.extend_from_slice(&kfns);
@@ -3155,7 +3274,11 @@ impl<'a> FnLower<'a> {
                 for (i, a) in args.iter().enumerate() {
                     let (v, vt) = self.expr(&a.value)?;
                     let target = *ptys.get(i).unwrap_or(&vt);
-                    argvals.push(self.coerce(v, vt, target));
+                    let v = self.coerce(v, vt, target);
+                    // A value struct passed by value is copied (D-0051): the
+                    // callee's mutations do not escape to the caller.
+                    let v = self.copy_if_value(v, target, &a.value);
+                    argvals.push(v);
                 }
                 let dest = if ret == Ty::Void {
                     None
@@ -3215,11 +3338,16 @@ impl<'a> FnLower<'a> {
                 .get(&mangled)
                 .cloned()
                 .ok_or_else(|| err(format!("no method '{name}' on that struct")))?;
+            // `self` is passed by reference (a value-type mutating method acts
+            // on the receiver variable, Swift-style); the remaining arguments
+            // are copied when they are value structs (D-0051).
             let mut argvals = vec![recv]; // self
             for (i, a) in args.iter().enumerate() {
                 let (v, vt) = self.expr(&a.value)?;
                 let target = *ptys.get(i + 1).unwrap_or(&vt);
-                argvals.push(self.coerce(v, vt, target));
+                let v = self.coerce(v, vt, target);
+                let v = self.copy_if_value(v, target, &a.value);
+                argvals.push(v);
             }
             let dest = if ret == Ty::Void {
                 None
@@ -3254,6 +3382,9 @@ impl<'a> FnLower<'a> {
             };
             let (v, vt) = self.expr(&a.value)?;
             let v = self.coerce(v, vt, fty);
+            // A value-struct field is copied in (D-0051): the new struct holds an
+            // independent instance of the aggregate.
+            let v = self.copy_if_value(v, fty, &a.value);
             self.emit(Inst::FieldSet {
                 base: dest,
                 sid,
@@ -3723,6 +3854,7 @@ impl<'a> FnLower<'a> {
                 return Err(err("list elements must all have the same representation"));
             }
             let v = self.coerce(v, vt, elem.ty());
+            let v = self.box_if_value(v, elem.ty());
             self.emit(Inst::Call {
                 dest: None,
                 func: push.clone(),
@@ -3761,6 +3893,8 @@ impl<'a> FnLower<'a> {
             }
             let kv = self.coerce(kv, kt, kk.ty());
             let vv = self.coerce(vv, vt, vk.ty());
+            let kv = self.box_if_value(kv, kk.ty());
+            let vv = self.box_if_value(vv, vk.ty());
             let mut cargs = vec![dict, kv, vv];
             cargs.extend_from_slice(&kfns);
             self.emit(Inst::Call {
@@ -3796,6 +3930,7 @@ impl<'a> FnLower<'a> {
                 return Err(err("set elements must all have the same representation"));
             }
             let v = self.coerce(v, vt, elem.ty());
+            let v = self.box_if_value(v, elem.ty());
             let mut cargs = vec![set, v];
             cargs.extend_from_slice(&kfns);
             self.emit(Inst::Call {
@@ -3824,6 +3959,7 @@ impl<'a> FnLower<'a> {
                     return Err(err("add() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
+                let v = self.box_if_value(v, elem.ty());
                 let kfns = self.key_fn_args(elem)?;
                 let mut cargs = vec![recv, v];
                 cargs.extend_from_slice(&kfns);
@@ -4008,6 +4144,7 @@ impl<'a> FnLower<'a> {
                 let iv = self.coerce(iv, it, Ty::I64);
                 let (v, vt) = self.expr(value)?;
                 let v = self.coerce(v, vt, elem.ty());
+                let v = self.box_if_value(v, elem.ty());
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_list_set_{}", elem.val_suffix()),
@@ -4018,8 +4155,10 @@ impl<'a> FnLower<'a> {
             Ty::Dict(kk, vk) => {
                 let (kv, kt) = self.expr(index)?;
                 let kv = self.coerce(kv, kt, kk.ty());
+                let kv = self.box_if_value(kv, kk.ty());
                 let (v, vt) = self.expr(value)?;
                 let v = self.coerce(v, vt, vk.ty());
+                let v = self.box_if_value(v, vk.ty());
                 let kfns = self.key_fn_args(kk)?;
                 let mut cargs = vec![bv, kv, v];
                 cargs.extend_from_slice(&kfns);
@@ -4073,6 +4212,7 @@ impl<'a> FnLower<'a> {
                     return Err(err("append() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
+                let v = self.box_if_value(v, elem.ty());
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_list_push_{}", elem.val_suffix()),
