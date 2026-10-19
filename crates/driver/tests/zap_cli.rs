@@ -63,21 +63,142 @@ fn unknown_subcommand_exits_2() {
     assert!(stderr.contains("unknown subcommand"), "got: {stderr}");
 }
 
+// --- package manager: `zap add` / `zap remove` (issue #69, D-0052) -----------
+
+/// `zap add --path` edits `zap.toml` and writes a `zap.lock` with a checksum;
+/// `zap remove` drops it again. Fully offline via a local `path` source.
 #[test]
-fn stubs_name_their_owning_tickets() {
-    for (args, ticket) in [
-        (vec!["add", "foo"], "#69"),
-        (vec!["remove", "foo"], "#69"),
-        (vec!["zenv", "create"], "#69"),
-    ] {
-        let out = zap().args(&args).output().unwrap();
-        assert_eq!(out.status.code(), Some(2), "args: {args:?}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains(ticket),
-            "args {args:?} should name {ticket}, got: {stderr}"
-        );
-    }
+fn add_and_remove_a_path_dependency() {
+    let dir = scratch("add_path");
+    // A local dependency module with its own manifest.
+    let dep = dir.join("mathx");
+    std::fs::create_dir_all(dep.join("src")).unwrap();
+    std::fs::write(
+        dep.join("zap.toml"),
+        "[package]\nname = \"mathx\"\nversion = \"0.2.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(dep.join("src").join("lib.zap"), "def area(): pass\n").unwrap();
+
+    // A fresh project next to it.
+    let app = dir.join("app");
+    assert!(zap()
+        .arg("new")
+        .arg(&app)
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let out = zap()
+        .args(["add", "mathx", "--path", "../mathx"])
+        .current_dir(&app)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let manifest = std::fs::read_to_string(app.join("zap.toml")).unwrap();
+    assert!(
+        manifest.contains("mathx = { path = \"../mathx\" }"),
+        "manifest:\n{manifest}"
+    );
+    let lock = std::fs::read_to_string(app.join("zap.lock")).unwrap();
+    assert!(lock.contains("name = \"mathx\""), "lock:\n{lock}");
+    assert!(lock.contains("version = \"0.2.0\""), "lock:\n{lock}");
+    assert!(
+        lock.contains("zap1:"),
+        "lock should carry a checksum:\n{lock}"
+    );
+
+    // Remove it and re-lock.
+    let out = zap()
+        .args(["remove", "mathx"])
+        .current_dir(&app)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let manifest = std::fs::read_to_string(app.join("zap.toml")).unwrap();
+    assert!(!manifest.contains("mathx"), "manifest:\n{manifest}");
+    let lock = std::fs::read_to_string(app.join("zap.lock")).unwrap();
+    assert!(!lock.contains("name = \"mathx\""), "lock:\n{lock}");
+}
+
+#[test]
+fn add_without_a_manifest_fails_cleanly() {
+    let dir = scratch("add_nomani");
+    let out = zap()
+        .args(["add", "x", "--path", "y"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("zap init"), "got: {stderr}");
+}
+
+// --- `zenv` activate/deactivate flips module resolution (issue #69) -----------
+
+/// `zap zenv create` writes an `activate` script and a `pkg/` cache;
+/// `zap zenv path` reports a *different* resolution path when `ZAP_ZENV` is set
+/// (as `source zenv/activate` would), demonstrating the activation flip.
+#[test]
+fn zenv_create_and_resolution_flip() {
+    let dir = scratch("zenv");
+    let app = dir.join("app");
+    assert!(zap()
+        .arg("new")
+        .arg(&app)
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    // Create the environment (skip the Python venv to stay fast/hermetic).
+    let out = zap()
+        .args(["zenv", "create", "--no-venv"])
+        .current_dir(&app)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let activate = std::fs::read_to_string(app.join("zenv").join("activate")).unwrap();
+    assert!(
+        activate.contains("export ZAP_ZENV="),
+        "activate:\n{activate}"
+    );
+    assert!(activate.contains("VIRTUAL_ENV"), "activate:\n{activate}");
+    assert!(activate.contains("deactivate()"), "activate:\n{activate}");
+    assert!(app.join("zenv").join("pkg").is_dir());
+
+    // Deactivated: resolution uses the global cache (not under the project).
+    let deactivated = zap()
+        .args(["zenv", "path"])
+        .current_dir(&app)
+        .env_remove("ZAP_ZENV")
+        .env("ZAP_CACHE", "/global/cache")
+        .output()
+        .unwrap();
+    let deactivated = String::from_utf8_lossy(&deactivated.stdout);
+    assert_eq!(deactivated.trim(), "/global/cache");
+
+    // Activated: resolution flips to the project-local zenv cache.
+    let activated = zap()
+        .args(["zenv", "path"])
+        .current_dir(&app)
+        .env("ZAP_ZENV", "/proj/zenv")
+        .env("ZAP_CACHE", "/global/cache")
+        .output()
+        .unwrap();
+    let activated = String::from_utf8_lossy(&activated.stdout);
+    assert_eq!(activated.trim(), "/proj/zenv/pkg");
+    assert_ne!(deactivated.trim(), activated.trim());
 }
 
 #[test]

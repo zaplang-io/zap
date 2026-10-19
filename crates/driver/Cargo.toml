@@ -26,6 +26,8 @@ path = "src/bin/zapc.rs"
 zapc_syntax = { path = "../syntax" }
 zapc_sema = { path = "../sema" }
 zapc_ir = { path = "../ir" }
+# Package manager & project environment (issue #69, D-0052). Host-safe.
+zapc_pkg = { path = "../pkg" }
 # Codegen needs LLVM; gated behind the `llvm` feature so the toolchain builds
 # without LLVM on hosts that lack it.
 zapc_codegen = { path = "../codegen", optional = true }

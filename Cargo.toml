@@ -9,6 +9,7 @@ members = [
     "crates/sema",
     "crates/ir",
     "crates/codegen",
+    "crates/pkg",
     "crates/driver",
 ]
 # Codegen needs LLVM, which isn't available on every host (e.g. Intel macOS).
@@ -19,6 +20,7 @@ default-members = [
     "crates/syntax",
     "crates/sema",
     "crates/ir",
+    "crates/pkg",
     "crates/driver",
 ]
 
