@@ -103,10 +103,13 @@ Python-style `None`, applicable to **reference types** (`str`, `list`, `dict`,
 …) are **not** nullable. Member access / method call on `None` throws (D-0007).
 
 ## D-0015 — User-defined types: structs + methods, no inheritance
-**Status:** Locked
+**Status:** Locked — method syntax locked (D-0050); value structs added (D-0051)
 Composite types are **structs** (data) with **methods**. **Composition only —
-no inheritance, no classes.** Go-style. (Method-definition syntax — inline vs
-receiver block — TBD; see OPEN-QUESTIONS.)
+no inheritance, no classes.** Go-style. Method-definition syntax is locked
+**inline** (D-0050). A performance-oriented opt-in **`value struct`** value type
+is added by **D-0051** (plain `struct` stays a reference type, D-0023). **Full OO
+(classes + inheritance) remains deferred** — tracked, not under active
+consideration.
 
 ## D-0016 — Interfaces: structural, compile-time checked
 **Status:** Locked
@@ -167,6 +170,8 @@ boolean contexts, *and* strict `bool`.
 passed by reference). `str` is immutable so the distinction is unobservable.
 (Note: this is the *opposite* of Go, where structs are value types — a
 deliberate choice for Python-like feel.)
+An opt-in **`value struct`** (D-0051) provides C-like value semantics for hot
+aggregates; a plain `struct` stays reference-typed as above.
 
 ## D-0024 — Division and equality
 **Status:** Locked
@@ -599,3 +604,41 @@ Fixes the literal, access, destructuring, and multiple-return surface for tuples
 **Rationale:** a Python-familiar surface; one tuple mechanism unifies multiple
 return and comma-ok; compile-time-constant indexing preserves static typing of a
 heterogeneous aggregate.
+
+## D-0050 — Method-definition syntax: inline
+**Status:** Locked — resolves the method-syntax question left open by D-0015
+Methods are **inline `def`s** in the type's block, with an explicit,
+source-untyped `self` first parameter (Python-style); the call form is
+`receiver.method(args)`. There is **no implicit `self`** and **no
+method-outside-the-body form**, except the optional `impl Interface for Struct`
+block (D-0016, §2.3) for interface-conformance clarity. Enums use the same inline
+form (D-0046). **No extension methods** — you cannot add a method to a type you
+do not own; structural interfaces (D-0016) provide polymorphism instead. Chosen
+over a Go-style receiver block or Rust-style `impl` block; the indentation-based
+syntax keeps even large type blocks readable. **Rationale:** one place for a
+type's behavior, unambiguous call sites, and functions-first simplicity (no OO
+inheritance, D-0015).
+
+## D-0051 — Value structs (opt-in value types)
+**Status:** Locked — refines D-0023; resolves the "no value structs" perf gap
+A **`value struct`** is a C-like **value type**: copied on assign/pass (value
+semantics, no shared identity), laid out **inline** (stack / registers /
+field-inline, no heap header), for hot, small aggregates. A plain **`struct`
+stays a reference type** (D-0023, Python-object-like shared mutation) and remains
+the **default**. Both kinds use the same inline methods (D-0050), structural
+interfaces (D-0016), operator overloading (D-0047), and `@derive` (D-0036);
+**neither has inheritance**. `value` is a **contextual modifier** before
+`struct`.
+
+**Interactions (documented limits):** a value struct stored in a collection or
+placed behind an interface value is **boxed** (copied to the heap), so the win is
+on locals, fields, arguments, and returns — not when erased behind an interface;
+a value struct holding references is still GC-scanned; mutating a value struct
+does not escape the copy the caller passed.
+
+This closes the main performance gap flagged against D-0023 (everything
+non-scalar being heap + indirection) **without reintroducing OO**. **Full OO
+(classes + inheritance) stays deferred** (tracked separately, not under active
+consideration). **Rationale:** gives "Python devs suffering from performance" a
+zero-indirection aggregate for hot paths while keeping the reference-default
+Python feel and the no-inheritance simplicity.

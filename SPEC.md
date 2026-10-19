@@ -117,8 +117,9 @@ auto raw = bytes(s)  # UTF-8 bytes
 auto xs = list[int64]([1, 2, 3])
 auto m  = dict[str, int64]({"a": 1, "b": 2})
 auto a  = array[f64]([1, 2, 3])          # dense numeric, SIMD (design/0002)
-auto t  = (1, "two", 3.0)                 # tuple
 ```
+
+(Tuples are **value** aggregates, not reference types — see §4.8.)
 
 `None` (D-0014) is the null value for reference types; scalars are not nullable.
 Member access on `None` throws (D-0007).
@@ -126,8 +127,7 @@ Member access on `None` throws (D-0007).
 ### 4.4 Structs & methods (D-0015)
 
 Composite types are **structs** with methods. **Composition only — no
-inheritance.** (Method-definition syntax is being finalized — see
-OPEN-QUESTIONS.)
+inheritance.** Methods are **inline** `def`s with an explicit `self` (D-0050).
 
 ```python
 struct Point:
@@ -141,7 +141,10 @@ auto p = Point(x=3.0, y=4.0)
 print(p.norm())       # 5.0
 ```
 
-Struct instances are reference types (D-0023).
+Struct instances are reference types (D-0023). A **`value struct`** is the
+opt-in **value type** — copied, laid out inline, no heap header — for hot
+aggregates (D-0051); a plain `struct` stays a reference type. Full OO (classes +
+inheritance) is deferred.
 
 ### 4.5 Interfaces (D-0016)
 

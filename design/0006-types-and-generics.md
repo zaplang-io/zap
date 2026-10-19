@@ -181,6 +181,35 @@ matters for the compile-time interface check (§2).
 Cross-cutting behavior that inheritance would provide elsewhere (equality,
 ordering, serialization, logging) comes from `@derive`/decorators (D-0036).
 
+#### 1.5 Value structs (opt-in value types, D-0051)
+
+By default a `struct` is a **reference type** (D-0023): shared identity, mutation
+visible to the caller — the Python-object feel. For hot, small aggregates where
+that heap indirection costs too much, prefix the declaration with **`value`**:
+
+```python
+value struct Vec2:
+    f64 x
+    f64 y
+    def dot(self, Vec2 o) -> f64:
+        return self.x * o.x + self.y * o.y
+```
+
+- A `value struct` is **copied** on assignment, argument passing, and return
+  (value semantics, no shared identity), laid out **inline** (stack / registers /
+  field-inline, no heap header) — the C/Swift-`struct` model.
+- It uses the **same** inline methods (§1.2), structural interfaces (§2),
+  operator overloading (§2.5) and `@derive` — and, like every Zap type, has **no
+  inheritance**.
+- **Limits:** stored in a collection or placed behind an interface value it is
+  **boxed** (copied to the heap), so the benefit is on locals/fields/args/returns,
+  not when erased behind an interface; a value struct holding references is still
+  GC-scanned; mutating it does not escape the caller's copy.
+
+Full OO (classes + inheritance) stays **deferred** (not under active
+consideration); `value struct` closes the performance gap that motivated it
+without reintroducing OO.
+
 ### 2. Interfaces (structural, compile-time checked)
 
 #### 2.1 Declaration
