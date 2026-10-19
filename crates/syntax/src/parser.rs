@@ -853,7 +853,22 @@ impl Parser {
             let value = if self.at_line_end() {
                 None
             } else {
-                Some(self.parse_expr())
+                // A bare comma-list is a tuple return (D-0049): `return a, b`
+                // builds a tuple the caller destructures — there is no separate
+                // multiple-return mechanism.
+                let first = self.parse_expr();
+                if self.is(&TokenKind::Comma) {
+                    let mut elems = vec![first];
+                    while self.eat(&TokenKind::Comma) {
+                        if self.at_line_end() {
+                            break; // trailing comma
+                        }
+                        elems.push(self.parse_expr());
+                    }
+                    Some(Expr::Tuple(elems, self.span_from(start)))
+                } else {
+                    Some(first)
+                }
             };
             return Stmt::Return {
                 value,
@@ -889,8 +904,42 @@ impl Parser {
         }
         // assignment / aug-assignment / substitution / expression statement
         let target = self.parse_expr();
+        // Bare comma-list destructuring target (D-0049): `a, b = ...`,
+        // `first, *rest = ...`. The first element was already parsed as an
+        // expression; collect the rest as target elements (which may carry `*`).
+        if self.is(&TokenKind::Comma) {
+            let mut elems = vec![BindTarget::Elem(target)];
+            while self.eat(&TokenKind::Comma) {
+                if self.is(&TokenKind::Assign) || self.at_line_end() {
+                    break; // trailing comma
+                }
+                elems.push(self.parse_target_elem());
+            }
+            let bt = BindTarget::Tuple(elems, self.span_from(start));
+            if self.eat(&TokenKind::Assign) {
+                let value = self.parse_rhs();
+                return Stmt::AssignTuple {
+                    target: bt,
+                    value,
+                    span: self.span_from(start),
+                };
+            }
+            // Not an assignment: a bare tuple expression statement.
+            return Stmt::Expr(bind_target_to_expr(bt));
+        }
         if self.eat(&TokenKind::Assign) {
-            let value = self.parse_expr();
+            // A parenthesized tuple on the left is a destructuring target
+            // (`(x, y) = (y, x)`); anything else is an ordinary lvalue.
+            if matches!(target, Expr::Tuple(..)) {
+                let bt = expr_to_bind_target(target);
+                let value = self.parse_rhs();
+                return Stmt::AssignTuple {
+                    target: bt,
+                    value,
+                    span: self.span_from(start),
+                };
+            }
+            let value = self.parse_rhs();
             return Stmt::Assign {
                 target,
                 value,
@@ -947,41 +996,132 @@ impl Parser {
     fn try_declaration(&mut self, start: u32) -> Option<Stmt> {
         let cp = (self.pos, self.errors.len());
         let is_const = self.eat_kw(Keyword::Const);
-        // `auto name = expr`
+        // `auto bind_target = expr` — a single name stays a plain [`Stmt::Let`];
+        // a tuple target (`auto (a, b) = t`, `auto first, *rest = xs`) becomes a
+        // [`Stmt::LetTuple`] (D-0049).
         if self.eat_kw(Keyword::Auto) {
-            if let Some((name, _)) = self.ident_opt() {
-                if self.eat(&TokenKind::Assign) {
-                    let value = self.parse_expr();
-                    return Some(Stmt::Let {
-                        is_const,
-                        ty: None,
-                        name,
-                        value,
-                        span: self.span_from(start),
-                    });
-                }
+            let target = self.parse_bind_target();
+            if self.eat(&TokenKind::Assign) {
+                let value = self.parse_rhs();
+                return Some(self.make_decl(is_const, None, target, value, start));
             }
             self.restore(cp);
             return None;
         }
-        // `TYPE name = expr`
+        // `TYPE bind_target = expr`
         if self.looks_like_type_start() {
             let ty = self.parse_type();
-            if let Some((name, _)) = self.ident_opt() {
-                if self.eat(&TokenKind::Assign) {
-                    let value = self.parse_expr();
-                    return Some(Stmt::Let {
-                        is_const,
-                        ty: Some(ty),
-                        name,
-                        value,
-                        span: self.span_from(start),
-                    });
-                }
+            let target = self.parse_bind_target();
+            if self.eat(&TokenKind::Assign) {
+                let value = self.parse_rhs();
+                return Some(self.make_decl(is_const, Some(ty), target, value, start));
             }
         }
         self.restore(cp);
         None
+    }
+
+    /// Build a declaration from a parsed bind target: a single `name` target is
+    /// a plain [`Stmt::Let`]; any tuple/rest target is a [`Stmt::LetTuple`].
+    fn make_decl(
+        &self,
+        is_const: bool,
+        ty: Option<Type>,
+        target: BindTarget,
+        value: Expr,
+        start: u32,
+    ) -> Stmt {
+        let span = self.span_from(start);
+        if let BindTarget::Elem(Expr::Name(name, _)) = &target {
+            return Stmt::Let {
+                is_const,
+                ty,
+                name: name.clone(),
+                value,
+                span,
+            };
+        }
+        Stmt::LetTuple {
+            is_const,
+            ty,
+            target,
+            value,
+            span,
+        }
+    }
+
+    /// The right-hand side of a declaration or assignment. A bare comma-list is a
+    /// tuple value (D-0049), mirroring the bare comma-list tuple return — so
+    /// `a, b = b, a` and `auto t = 1, 2` build tuples. A parenthesized tuple is
+    /// handled by the ordinary expression parser.
+    fn parse_rhs(&mut self) -> Expr {
+        let start = self.peek_span().start;
+        let first = self.parse_expr();
+        if self.is(&TokenKind::Comma) {
+            let mut elems = vec![first];
+            while self.eat(&TokenKind::Comma) {
+                if self.at_line_end() {
+                    break; // trailing comma
+                }
+                elems.push(self.parse_expr());
+            }
+            Expr::Tuple(elems, self.span_from(start))
+        } else {
+            first
+        }
+    }
+
+    /// A `bind_target` (D-0049): a single target, or a comma-list / parenthesized
+    /// tuple of target elements. Used after `auto`/`TYPE` in a declaration.
+    fn parse_bind_target(&mut self) -> BindTarget {
+        let start = self.peek_span().start;
+        let first = self.parse_target_elem();
+        if self.is(&TokenKind::Comma) {
+            let mut elems = vec![first];
+            while self.eat(&TokenKind::Comma) {
+                if self.is(&TokenKind::Assign) || self.at_line_end() {
+                    break; // trailing comma
+                }
+                elems.push(self.parse_target_elem());
+            }
+            BindTarget::Tuple(elems, self.span_from(start))
+        } else {
+            first
+        }
+    }
+
+    /// A `target_elem` (D-0049): `[*] target`, or a parenthesized nested tuple.
+    fn parse_target_elem(&mut self) -> BindTarget {
+        let start = self.peek_span().start;
+        if self.eat(&TokenKind::Star) {
+            let inner = self.parse_target_elem();
+            return BindTarget::Rest(Box::new(inner), self.span_from(start));
+        }
+        if self.is(&TokenKind::LParen) {
+            self.bump(); // '('
+            let mut elems = Vec::new();
+            let mut saw_comma = false;
+            if !self.is(&TokenKind::RParen) {
+                loop {
+                    elems.push(self.parse_target_elem());
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                    saw_comma = true;
+                    if self.is(&TokenKind::RParen) {
+                        break; // trailing comma
+                    }
+                }
+            }
+            self.expect(&TokenKind::RParen, "')'");
+            // A single parenthesized target with no comma is just grouping;
+            // `(x,)` (one element with a trailing comma) is a 1-tuple.
+            if elems.len() == 1 && !saw_comma && !matches!(elems[0], BindTarget::Rest(..)) {
+                return elems.into_iter().next().unwrap();
+            }
+            return BindTarget::Tuple(elems, self.span_from(start));
+        }
+        BindTarget::Elem(self.parse_postfix())
     }
 
     fn restore(&mut self, cp: (usize, usize)) {
@@ -1781,6 +1921,34 @@ impl Parser {
     }
 }
 
+/// Convert a parsed expression used as an assignment target into a
+/// [`BindTarget`] (D-0049). A tuple expression destructures positionally; any
+/// other expression is a single lvalue leaf. (`*rest` cannot appear in a parsed
+/// expression, so parenthesized rest is only reachable via a declaration's
+/// `parse_bind_target`.)
+fn expr_to_bind_target(e: Expr) -> BindTarget {
+    match e {
+        Expr::Tuple(elems, span) => {
+            BindTarget::Tuple(elems.into_iter().map(expr_to_bind_target).collect(), span)
+        }
+        other => BindTarget::Elem(other),
+    }
+}
+
+/// Reconstruct a tuple expression from a bind target that turned out not to be
+/// an assignment (a bare tuple expression statement, e.g. `a, b`).
+fn bind_target_to_expr(bt: BindTarget) -> Expr {
+    match bt {
+        BindTarget::Elem(e) => e,
+        BindTarget::Tuple(elems, span) => {
+            Expr::Tuple(elems.into_iter().map(bind_target_to_expr).collect(), span)
+        }
+        // A `*rest` in expression position is not representable; fall back to the
+        // inner expression (this only arises from malformed input).
+        BindTarget::Rest(inner, _) => bind_target_to_expr(*inner),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2113,5 +2281,98 @@ mod tests {
         // Missing ')' — should produce errors, not panic.
         let (_m, perrs, _l) = parse_str("def f(:\n    return 1\n");
         assert!(!perrs.is_empty());
+    }
+
+    // --- tuples (ticket #54, D-0049) ---
+
+    fn body(src: &str) -> Vec<Stmt> {
+        let m = parse_ok(src);
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        f.body.stmts.clone()
+    }
+
+    #[test]
+    fn single_name_decl_stays_plain_let() {
+        // A non-destructuring `auto x = ...` is still a plain `Let`, not a tuple.
+        let s = body("def f():\n    auto x = 1\n");
+        assert!(matches!(&s[0], Stmt::Let { name, .. } if name == "x"));
+    }
+
+    #[test]
+    fn parenthesized_tuple_decl_is_let_tuple() {
+        let s = body("def f():\n    auto (a, b, c) = t\n");
+        let Stmt::LetTuple { target, .. } = &s[0] else {
+            panic!("expected LetTuple, got {:?}", s[0]);
+        };
+        let BindTarget::Tuple(elems, _) = target else {
+            panic!("expected a tuple target");
+        };
+        assert_eq!(elems.len(), 3);
+        assert!(matches!(&elems[0], BindTarget::Elem(Expr::Name(n, _)) if n == "a"));
+    }
+
+    #[test]
+    fn bare_comma_decl_is_let_tuple() {
+        // `auto a, b = ...` (no parentheses) also destructures.
+        let s = body("def f():\n    auto a, b = t\n");
+        assert!(matches!(&s[0], Stmt::LetTuple { .. }));
+    }
+
+    #[test]
+    fn rest_target_parses() {
+        let s = body("def f():\n    auto (first, *rest) = xs\n");
+        let Stmt::LetTuple { target, .. } = &s[0] else {
+            panic!("expected LetTuple");
+        };
+        let BindTarget::Tuple(elems, _) = target else {
+            panic!("tuple target");
+        };
+        assert_eq!(elems.len(), 2);
+        assert!(matches!(&elems[1], BindTarget::Rest(..)));
+    }
+
+    #[test]
+    fn swap_assignment_is_assign_tuple() {
+        let s = body("def f():\n    (x, y) = (y, x)\n");
+        assert!(matches!(&s[0], Stmt::AssignTuple { .. }));
+    }
+
+    #[test]
+    fn single_lvalue_assignment_stays_plain_assign() {
+        let s = body("def f():\n    x = 1\n");
+        assert!(matches!(&s[0], Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn bare_comma_both_sides_swap() {
+        // `a, b = b, a` — both the target and the value are bare comma-lists.
+        let s = body("def f():\n    a, b = b, a\n");
+        let Stmt::AssignTuple { value, .. } = &s[0] else {
+            panic!("expected AssignTuple, got {:?}", s[0]);
+        };
+        assert!(matches!(value, Expr::Tuple(elems, _) if elems.len() == 2));
+    }
+
+    #[test]
+    fn return_comma_list_is_a_tuple() {
+        let s = body("def f():\n    return a, b\n");
+        let Stmt::Return { value: Some(e), .. } = &s[0] else {
+            panic!("expected return");
+        };
+        assert!(matches!(e, Expr::Tuple(elems, _) if elems.len() == 2));
+    }
+
+    #[test]
+    fn one_tuple_needs_trailing_comma() {
+        // `(x)` is grouping (a single `Let`); `(x,)` is a 1-tuple target.
+        let s = body("def f():\n    auto (x) = t\n");
+        assert!(matches!(&s[0], Stmt::Let { name, .. } if name == "x"));
+        let s = body("def f():\n    auto (x,) = t\n");
+        let Stmt::LetTuple { target, .. } = &s[0] else {
+            panic!("expected LetTuple for a 1-tuple target");
+        };
+        assert!(matches!(target, BindTarget::Tuple(elems, _) if elems.len() == 1));
     }
 }

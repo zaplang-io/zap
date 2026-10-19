@@ -44,6 +44,9 @@ pub enum Ty {
     List(Box<Ty>),
     Dict(Box<Ty>, Box<Ty>),
     Set(Box<Ty>),
+    /// A fixed-arity, heterogeneous, immutable tuple (D-0019/D-0049) carrying its
+    /// element types in positional order. The empty tuple `()` is the unit value.
+    Tuple(Vec<Ty>),
     /// A typed channel `channel[T]` (ticket #25, D-0031): a first-class reference
     /// value over which `T` values are sent (`ch <- v`) and received (`<-ch`).
     Chan(Box<Ty>),
@@ -103,6 +106,19 @@ impl Ty {
             Ty::List(t) => format!("list[{}]", t.display()),
             Ty::Dict(k, v) => format!("dict[{}, {}]", k.display(), v.display()),
             Ty::Set(t) => format!("set[{}]", t.display()),
+            Ty::Tuple(ts) => {
+                let inner = ts
+                    .iter()
+                    .map(|t| t.display())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // A 1-tuple prints with the Python-style trailing comma.
+                if ts.len() == 1 {
+                    format!("({inner},)")
+                } else {
+                    format!("({inner})")
+                }
+            }
             Ty::Chan(t) => format!("channel[{}]", t.display()),
             Ty::Named(n) => n.clone(),
             Ty::Match => "Match".into(),
@@ -143,6 +159,12 @@ fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::Int32 | Ty::Int64, Ty::Bigint) => true,
         (Ty::List(a), Ty::List(b)) => assignable(a, b),
         (Ty::Set(a), Ty::Set(b)) => assignable(a, b),
+        // A tuple is assignable to a tuple of the same arity when each element is
+        // (covariantly) assignable — this covers returning untyped literals into
+        // a declared tuple type (`-> (int64, int64)` with `return 1, 2`).
+        (Ty::Tuple(a), Ty::Tuple(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| assignable(x, y))
+        }
         _ => false,
     }
 }
@@ -152,6 +174,9 @@ fn default_type(t: Ty) -> Ty {
     match t {
         Ty::UntypedInt => Ty::Int64,
         Ty::UntypedFloat => Ty::Float64,
+        // Defaulting is element-wise for tuples, so `auto t = (1, 2.0)` becomes
+        // `(int64, float64)` rather than carrying untyped-literal elements.
+        Ty::Tuple(ts) => Ty::Tuple(ts.into_iter().map(default_type).collect()),
         other => other,
     }
 }
@@ -169,6 +194,51 @@ fn num_join(l: &Ty, r: &Ty) -> Ty {
         Ty::Bigint
     } else {
         Ty::Int64
+    }
+}
+
+/// A compile-time-constant non-negative integer index, if `e` is one (used for
+/// tuple element access `t[k]`, D-0049). Only integer literals (with an optional
+/// unary `+`) are constant folds here; a negative or non-literal index is not a
+/// valid tuple index.
+fn const_index(e: &Expr) -> Option<u64> {
+    match e {
+        Expr::Int(s, _) => {
+            let clean: String = s.chars().filter(|c| *c != '_').collect();
+            if let Some(h) = clean
+                .strip_prefix("0x")
+                .or_else(|| clean.strip_prefix("0X"))
+            {
+                u64::from_str_radix(h, 16).ok()
+            } else if let Some(o) = clean
+                .strip_prefix("0o")
+                .or_else(|| clean.strip_prefix("0O"))
+            {
+                u64::from_str_radix(o, 8).ok()
+            } else if let Some(b) = clean
+                .strip_prefix("0b")
+                .or_else(|| clean.strip_prefix("0B"))
+            {
+                u64::from_str_radix(b, 2).ok()
+            } else {
+                clean.parse::<u64>().ok()
+            }
+        }
+        Expr::Unary {
+            op: UnOp::Pos,
+            expr,
+            ..
+        } => const_index(expr),
+        _ => None,
+    }
+}
+
+/// The inner target of a `*rest`, or the target itself otherwise. Used when the
+/// value type is unknown and every leaf binds loosely.
+fn rest_inner(t: &BindTarget) -> &BindTarget {
+    match t {
+        BindTarget::Rest(inner, _) => inner,
+        other => other,
     }
 }
 
@@ -505,7 +575,10 @@ impl Checker {
                     }
                 }
             },
-            Type::Tuple { .. } | Type::Func { .. } => Ty::Unknown,
+            Type::Tuple { elems, .. } => {
+                Ty::Tuple(elems.iter().map(|e| self.resolve_type(e)).collect())
+            }
+            Type::Func { .. } => Ty::Unknown,
         }
     }
 
@@ -1120,7 +1193,171 @@ impl Checker {
             Stmt::Spawn { call, .. } => {
                 self.infer(call);
             }
+            Stmt::LetTuple {
+                ty,
+                target,
+                value,
+                span,
+                is_const: _,
+            } => {
+                let vt = self.infer(value);
+                let declared = match ty {
+                    Some(t) => {
+                        let dt = self.resolve_type(t);
+                        if !assignable(&vt, &dt) {
+                            self.error(
+                                format!(
+                                    "cannot assign value of type {} to {}",
+                                    vt.display(),
+                                    dt.display()
+                                ),
+                                expr_span(value),
+                            );
+                        }
+                        dt
+                    }
+                    None => default_type(vt),
+                };
+                self.bind_target(target, &declared, true, *span);
+            }
+            Stmt::AssignTuple {
+                target,
+                value,
+                span,
+            } => {
+                let vt = default_type(self.infer(value));
+                self.bind_target(target, &vt, false, *span);
+            }
             Stmt::Break(_) | Stmt::Continue(_) => {}
+        }
+    }
+
+    /// Type-check a destructuring bind target against the value type `ty`.
+    /// `is_decl` distinguishes a declaration (leaves introduce new names) from a
+    /// reassignment (leaves are existing lvalues). D-0049.
+    fn bind_target(&mut self, t: &BindTarget, ty: &Ty, is_decl: bool, _span: Span) {
+        match t {
+            BindTarget::Elem(Expr::Name(n, nspan)) => {
+                if is_decl {
+                    self.declare(n, ty.clone());
+                } else {
+                    match self.lookup(n) {
+                        Some(dt) => {
+                            if !assignable(ty, &dt) {
+                                self.error(
+                                    format!(
+                                        "cannot assign value of type {} to {} of type {}",
+                                        ty.display(),
+                                        n,
+                                        dt.display()
+                                    ),
+                                    *nspan,
+                                );
+                            }
+                        }
+                        None => {
+                            self.error(format!("assignment to undeclared variable '{n}'"), *nspan)
+                        }
+                    }
+                }
+            }
+            BindTarget::Elem(e) => {
+                if is_decl {
+                    self.error(
+                        "a declaration target must be a name".to_string(),
+                        expr_span(e),
+                    );
+                } else {
+                    // An lvalue such as `a[i]` or `a.f`: type-check it as an
+                    // ordinary expression (its mutability is enforced elsewhere).
+                    self.infer(e);
+                }
+            }
+            BindTarget::Rest(_, rspan) => {
+                self.error(
+                    "'*rest' is only valid as an element of a tuple target".to_string(),
+                    *rspan,
+                );
+            }
+            BindTarget::Tuple(elems, tspan) => match ty {
+                Ty::Tuple(ts) => self.bind_tuple(elems, ts, is_decl, *tspan),
+                Ty::Unknown => {
+                    // The value type is unknown (e.g. a Python handle): bind every
+                    // leaf loosely rather than cascading errors.
+                    for e in elems {
+                        self.bind_target(rest_inner(e), &Ty::Unknown, is_decl, *tspan);
+                    }
+                }
+                other => self.error(
+                    format!("cannot destructure a value of type {}", other.display()),
+                    *tspan,
+                ),
+            },
+        }
+    }
+
+    /// Bind a tuple pattern's element targets against the tuple's element types,
+    /// honoring at most one `*rest` which captures the remaining elements as a
+    /// sub-tuple (D-0049).
+    fn bind_tuple(&mut self, elems: &[BindTarget], ts: &[Ty], is_decl: bool, span: Span) {
+        let rest_positions: Vec<usize> = elems
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, BindTarget::Rest(..)))
+            .map(|(i, _)| i)
+            .collect();
+        if rest_positions.len() > 1 {
+            self.error(
+                "a tuple target may have at most one '*rest' element".to_string(),
+                span,
+            );
+            return;
+        }
+        match rest_positions.first() {
+            None => {
+                if elems.len() != ts.len() {
+                    self.error(
+                        format!(
+                            "tuple destructuring expects {} element(s), found {}",
+                            ts.len(),
+                            elems.len()
+                        ),
+                        span,
+                    );
+                    return;
+                }
+                for (e, t) in elems.iter().zip(ts) {
+                    self.bind_target(e, t, is_decl, span);
+                }
+            }
+            Some(&r) => {
+                // `elems.len() - 1` fixed targets (before and after the rest)
+                // must fit within the tuple's arity.
+                let fixed = elems.len() - 1;
+                if ts.len() < fixed {
+                    self.error(
+                        format!(
+                            "tuple destructuring with '*rest' needs at least {fixed} \
+                             element(s), found {}",
+                            ts.len()
+                        ),
+                        span,
+                    );
+                    return;
+                }
+                let after = elems.len() - r - 1;
+                let tail_start = ts.len() - after;
+                for (e, t) in elems[..r].iter().zip(&ts[..r]) {
+                    self.bind_target(e, t, is_decl, span);
+                }
+                let rest_ty = Ty::Tuple(ts[r..tail_start].to_vec());
+                if let BindTarget::Rest(inner, _) = &elems[r] {
+                    self.bind_target(inner, &rest_ty, is_decl, span);
+                }
+                for (e, t) in elems[r + 1..].iter().zip(&ts[tail_start..]) {
+                    self.bind_target(e, t, is_decl, span);
+                }
+            }
         }
     }
 
@@ -1151,10 +1388,14 @@ impl Checker {
                 }
             }
             Expr::Tuple(elems, _) => {
-                for el in elems {
-                    self.infer(el);
-                }
-                Ty::Unknown
+                // A tuple literal's type is the (defaulted) element types in
+                // positional order (D-0049); `()` is the empty tuple.
+                Ty::Tuple(
+                    elems
+                        .iter()
+                        .map(|el| default_type(self.infer(el)))
+                        .collect(),
+                )
             }
             Expr::List(elems, _) => {
                 let mut elem = Ty::Unknown;
@@ -1278,8 +1519,39 @@ impl Checker {
                 self.arith_result(*op, &l, &r, *span)
             }
             Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
-            Expr::Index { base, index, .. } => {
+            Expr::Index { base, index, span } => {
                 let b = self.infer(base);
+                // Tuple element access `t[k]` requires a compile-time-constant
+                // `k` and yields that position's static type (D-0049) — the key
+                // difference from `list[i]`, which takes a runtime index.
+                if let Ty::Tuple(elems) = &b {
+                    match const_index(index) {
+                        Some(k) if (k as usize) < elems.len() => {
+                            return elems[k as usize].clone();
+                        }
+                        Some(k) => {
+                            self.error(
+                                format!(
+                                    "tuple index {k} out of range for a {}-element tuple",
+                                    elems.len()
+                                ),
+                                *span,
+                            );
+                            return Ty::Unknown;
+                        }
+                        None => {
+                            self.infer(index);
+                            self.error(
+                                "a tuple index must be a compile-time-constant \
+                                 integer (a tuple is heterogeneous, so the element \
+                                 type must be known statically)"
+                                    .to_string(),
+                                *span,
+                            );
+                            return Ty::Unknown;
+                        }
+                    }
+                }
                 self.infer(index);
                 match b {
                     Ty::List(t) => *t,
@@ -2440,5 +2712,86 @@ mod tests {
             \x20   def tag(self) -> int64:\n        return 0\n",
         );
         assert!(m.contains("methods on enums"), "got:\n{m}");
+    }
+
+    // --- tuples (ticket #54, D-0049) ---
+
+    #[test]
+    fn tuple_literal_elements_are_typed() {
+        // A tuple literal carries its element types positionally: `t[1]` is a
+        // `str`, so assigning it into a `str` is fine but into an `int64` is not.
+        ok("def main():\n    auto t = (1, \"two\", 3.0)\n    str s = t[1]\n    print(s)\n");
+        let e = errors(
+            "def main():\n    auto t = (1, \"two\", 3.0)\n    int64 n = t[1]\n    print(n)\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+    }
+
+    #[test]
+    fn tuple_const_index_access_types() {
+        // Constant indices yield each position's static type.
+        ok("def main():\n    auto t = (10, 20)\n    int64 a = t[0]\n    int64 b = t[1]\n    print(a + b)\n");
+    }
+
+    #[test]
+    fn tuple_nonconstant_index_is_error() {
+        // A runtime index is rejected: a tuple is heterogeneous, so the element
+        // type must be known statically (the key difference from `list[i]`).
+        let e = errors(
+            "def main():\n    auto t = (1, 2)\n    auto i = 0\n    auto x = t[i]\n    print(x)\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("compile-time-constant"), "got {e:?}");
+    }
+
+    #[test]
+    fn tuple_index_out_of_range_is_error() {
+        let e = errors("def main():\n    auto t = (1, 2)\n    auto x = t[5]\n    print(x)\n");
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("out of range"), "got {e:?}");
+    }
+
+    #[test]
+    fn tuple_destructuring_binds_element_types() {
+        // Positional destructuring binds each name to its element's type.
+        ok("def main():\n    auto (a, b, c) = (1, \"two\", 3.0)\n    int64 x = a\n    str y = b\n    float64 z = c\n    print(x)\n    print(y)\n    print(z)\n");
+    }
+
+    #[test]
+    fn tuple_destructuring_arity_mismatch_is_error() {
+        let e = errors("def main():\n    auto (a, b) = (1, 2, 3)\n    print(a)\n");
+        assert!(
+            e.iter().any(|x| x.message.contains("element")),
+            "expected an arity error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_rest_captures_remaining_as_tuple() {
+        // `*rest` binds the remaining elements as a sub-tuple, so `rest[k]` is
+        // typed by position.
+        ok("def main():\n    auto (first, *rest) = (10, 20, 30, 40)\n    int64 a = first\n    int64 b = rest[0]\n    int64 c = rest[2]\n    print(a + b + c)\n");
+    }
+
+    #[test]
+    fn multiple_return_is_tuple_typed() {
+        // A function returning `(int64, int64)` accepts a bare comma-list return
+        // and the caller may destructure or bind-and-index it.
+        ok(include_str!("../../../tests/golden/tuple_multiret.zap"));
+    }
+
+    #[test]
+    fn multiple_return_arity_mismatch_is_error() {
+        // Returning a single value where a 2-tuple is declared is rejected.
+        let e = errors(
+            "def f() -> (int64, int64):\n    return 1\n\ndef main():\n    auto t = f()\n    print(t[0])\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("return type mismatch"), "got {e:?}");
+    }
+
+    #[test]
+    fn swap_reassignment_type_checks() {
+        ok(include_str!("../../../tests/golden/tuple_swap.zap"));
     }
 }

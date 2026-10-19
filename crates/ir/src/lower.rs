@@ -7,11 +7,61 @@
 //! truthiness) happen here, so the ZIR -> LLVM step is mechanical. Unsupported
 //! constructs produce a [`LowerError`].
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use zapc_syntax::ast::{self, BinOp as AstBin, Expr, PatArg, Pattern, Stmt, UnOp as AstUn};
+use zapc_syntax::ast::{
+    self, BinOp as AstBin, BindTarget, Expr, PatArg, Pattern, Stmt, UnOp as AstUn,
+};
 
 use crate::ir::*;
+
+/// Interns anonymous tuple layouts (D-0049). A tuple is a by-value aggregate laid
+/// out like an anonymous struct (positional order), so it reuses the struct
+/// machinery: each distinct element-type sequence gets one [`Ty::Struct`] id,
+/// allocated after the named structs (`base = number of named structs`). The
+/// interned layouts are appended to [`Module::structs`] once lowering finishes,
+/// so their ids line up with `base + index`.
+#[derive(Default)]
+struct TupleInterner {
+    base: u32,
+    layouts: Vec<Vec<Ty>>,
+    map: HashMap<Vec<Ty>, u32>,
+}
+
+impl TupleInterner {
+    fn new(base: u32) -> TupleInterner {
+        TupleInterner {
+            base,
+            layouts: Vec::new(),
+            map: HashMap::new(),
+        }
+    }
+
+    /// The struct id for a tuple with these element types (deduplicated).
+    fn intern(&mut self, elems: Vec<Ty>) -> u32 {
+        if let Some(&sid) = self.map.get(&elems) {
+            return sid;
+        }
+        let sid = self.base + self.layouts.len() as u32;
+        self.map.insert(elems.clone(), sid);
+        self.layouts.push(elems);
+        sid
+    }
+
+    /// Whether `sid` names a tuple layout (vs a user struct / tier-3 enum).
+    fn is_tuple(&self, sid: u32) -> bool {
+        sid >= self.base && ((sid - self.base) as usize) < self.layouts.len()
+    }
+
+    /// The element types of tuple `sid`, if it is one.
+    fn fields(&self, sid: u32) -> Option<Vec<Ty>> {
+        if sid < self.base {
+            return None;
+        }
+        self.layouts.get((sid - self.base) as usize).cloned()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LowerError {
@@ -66,6 +116,9 @@ impl EnumLow {
 struct TyEnv<'a> {
     ids: &'a HashMap<String, u32>,
     enums: &'a HashMap<String, EnumLow>,
+    /// Interner for anonymous tuple layouts (D-0049), shared so every
+    /// `(T, U, ...)` type resolves to the same struct id across the module.
+    tuples: &'a RefCell<TupleInterner>,
 }
 
 /// Lower a type-checked module to ZIR.
@@ -80,6 +133,9 @@ struct StructCtx {
     /// (`import python "numpy" as np` → `np`) mapped to the CPython module name
     /// (`numpy`). A reference to one of these names lowers to a `zap_py_import`.
     py: HashMap<String, String>,
+    /// Interned anonymous tuple layouts (D-0049), appended to [`Module::structs`]
+    /// after lowering.
+    tuples: RefCell<TupleInterner>,
 }
 
 impl StructCtx {
@@ -96,6 +152,7 @@ impl StructCtx {
         TyEnv {
             ids: &self.ids,
             enums: &self.enums,
+            tuples: &self.tuples,
         }
     }
 }
@@ -124,6 +181,12 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             _ => {}
         }
     }
+
+    // Anonymous tuple layouts (D-0049) are interned after the named structs, so
+    // their struct ids start at `names.len()`. The interner is shared across the
+    // field/signature pre-passes and all body lowering, then its layouts are
+    // appended to `Module::structs`.
+    let tuples = RefCell::new(TupleInterner::new(names.len() as u32));
 
     // Build the enum registry. For tier-1 enums, compute member discriminants
     // (explicit, else previous + 1 from 0). For tier-3 enums, lay out the tagged
@@ -169,6 +232,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                                 &TyEnv {
                                     ids: &ids,
                                     enums: &enums,
+                                    tuples: &tuples,
                                 },
                             )
                             .unwrap_or(Ty::Ptr);
@@ -200,6 +264,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         let tyenv = TyEnv {
             ids: &ids,
             enums: &enums,
+            tuples: &tuples,
         };
         for item in &module.items {
             if let ast::Item::Struct(s) = item {
@@ -240,6 +305,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         fields,
         enums,
         py,
+        tuples,
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -330,6 +396,17 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             }
         }
     }
+
+    // Append the interned tuple layouts (D-0049) after the named structs. Their
+    // ids were handed out as `base + index` with `base == out.structs.len()`
+    // here, so they line up positionally. A tuple is laid out exactly like an
+    // anonymous struct, so codegen needs no tuple-specific path.
+    for elems in ctx.tuples.borrow().layouts.iter() {
+        out.structs.push(StructLayout {
+            name: "(tuple)".to_string(),
+            fields: elems.clone(),
+        });
+    }
     (out, errors)
 }
 
@@ -403,6 +480,15 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                 }
             }
         },
+        // A tuple type `(T, U, ...)` is an anonymous struct laid out positionally
+        // (D-0049); it interns to a struct id reused by the struct machinery.
+        ast::Type::Tuple { elems, .. } => {
+            let tys = elems
+                .iter()
+                .map(|e| resolve_ty(e, env))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Ty::Struct(env.tuples.borrow_mut().intern(tys)))
+        }
         _ => Err(err("only named scalar types are supported by codegen yet")),
     }
 }
@@ -1317,8 +1403,184 @@ impl<'a> FnLower<'a> {
             Stmt::Match {
                 scrutinee, arms, ..
             } => self.lower_match(scrutinee, arms),
+            // Tuple-destructuring declaration / assignment (D-0049): lower the
+            // value to its tuple aggregate, then bind each target via `FieldGet`.
+            Stmt::LetTuple { target, value, .. } => {
+                let (v, vt) = self.expr(value)?;
+                self.lower_bind_target(target, v, vt, true)
+            }
+            Stmt::AssignTuple { target, value, .. } => {
+                let (v, vt) = self.expr(value)?;
+                self.lower_bind_target(target, v, vt, false)
+            }
             Stmt::With { .. } => Err(err(
                 "this statement is not supported by codegen yet (Phase 1 slice)",
+            )),
+        }
+    }
+
+    /// Bind a destructuring target to a value (D-0049). `is_decl` chooses between
+    /// introducing new locals (declaration) and storing into existing lvalues
+    /// (reassignment). A `Tuple` target reads each element out of the aggregate
+    /// with `FieldGet`; a `*rest` rebuilds the remaining elements into a sub-tuple.
+    fn lower_bind_target(
+        &mut self,
+        t: &BindTarget,
+        val: Value,
+        ty: Ty,
+        is_decl: bool,
+    ) -> Result<(), LowerError> {
+        match t {
+            BindTarget::Elem(e) => self.lower_bind_leaf(e, val, ty, is_decl),
+            BindTarget::Rest(_, _) => {
+                Err(err("'*rest' is only valid as an element of a tuple target"))
+            }
+            BindTarget::Tuple(elems, _) => {
+                let Ty::Struct(sid) = ty else {
+                    return Err(err("cannot destructure a non-tuple value"));
+                };
+                let field_tys = self
+                    .ctx
+                    .tuples
+                    .borrow()
+                    .fields(sid)
+                    .ok_or_else(|| err("cannot destructure a non-tuple value"))?;
+                self.lower_bind_tuple(elems, val, sid, &field_tys, is_decl)
+            }
+        }
+    }
+
+    /// Bind the elements of a tuple target against the aggregate's fields,
+    /// honoring at most one `*rest` (which captures the remaining fields as a
+    /// freshly built sub-tuple). Arity is validated in sema.
+    fn lower_bind_tuple(
+        &mut self,
+        elems: &[BindTarget],
+        base: Value,
+        sid: u32,
+        field_tys: &[Ty],
+        is_decl: bool,
+    ) -> Result<(), LowerError> {
+        let rest_pos = elems.iter().position(|e| matches!(e, BindTarget::Rest(..)));
+        match rest_pos {
+            None => {
+                if elems.len() != field_tys.len() {
+                    return Err(err(format!(
+                        "tuple destructuring expects {} element(s), found {}",
+                        field_tys.len(),
+                        elems.len()
+                    )));
+                }
+                for (idx, e) in elems.iter().enumerate() {
+                    let fty = field_tys[idx];
+                    let fv = self.field_get(base, sid, idx as u32, fty);
+                    self.lower_bind_target(e, fv, fty, is_decl)?;
+                }
+                Ok(())
+            }
+            Some(r) => {
+                let after = elems.len() - r - 1;
+                if field_tys.len() + 1 < elems.len() {
+                    return Err(err("tuple destructuring with '*rest' needs more elements"));
+                }
+                let tail_start = field_tys.len() - after;
+                // Fixed elements before the rest.
+                for (idx, e) in elems[..r].iter().enumerate() {
+                    let fty = field_tys[idx];
+                    let fv = self.field_get(base, sid, idx as u32, fty);
+                    self.lower_bind_target(e, fv, fty, is_decl)?;
+                }
+                // `*rest`: rebuild the middle fields into a new sub-tuple.
+                let rest_tys: Vec<Ty> = field_tys[r..tail_start].to_vec();
+                let rest_sid = self.ctx.tuples.borrow_mut().intern(rest_tys.clone());
+                let rest_val = self.new_value(Ty::Struct(rest_sid));
+                self.emit(Inst::StructNew {
+                    dest: rest_val,
+                    sid: rest_sid,
+                });
+                for (j, fty) in rest_tys.iter().enumerate() {
+                    let fv = self.field_get(base, sid, (r + j) as u32, *fty);
+                    self.emit(Inst::FieldSet {
+                        base: rest_val,
+                        sid: rest_sid,
+                        idx: j as u32,
+                        val: fv,
+                    });
+                }
+                if let BindTarget::Rest(inner, _) = &elems[r] {
+                    self.lower_bind_target(inner, rest_val, Ty::Struct(rest_sid), is_decl)?;
+                }
+                // Fixed elements after the rest.
+                for (k, e) in elems[r + 1..].iter().enumerate() {
+                    let idx = tail_start + k;
+                    let fty = field_tys[idx];
+                    let fv = self.field_get(base, sid, idx as u32, fty);
+                    self.lower_bind_target(e, fv, fty, is_decl)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Emit a `FieldGet` yielding field `idx` of tuple/struct `sid`.
+    fn field_get(&mut self, base: Value, sid: u32, idx: u32, fty: Ty) -> Value {
+        let d = self.new_value(fty);
+        self.emit(Inst::FieldGet {
+            dest: d,
+            base,
+            sid,
+            idx,
+        });
+        d
+    }
+
+    /// Bind one leaf of a destructuring target: a new local (declaration) or an
+    /// existing lvalue (reassignment — a name or a struct field).
+    fn lower_bind_leaf(
+        &mut self,
+        e: &Expr,
+        val: Value,
+        ty: Ty,
+        is_decl: bool,
+    ) -> Result<(), LowerError> {
+        if is_decl {
+            let Expr::Name(name, _) = e else {
+                return Err(err("a declaration target must be a name"));
+            };
+            let slot = self.alloca(ty);
+            self.store(slot, val);
+            self.declare(name, slot, ty);
+            return Ok(());
+        }
+        match e {
+            Expr::Name(n, _) => {
+                let (ptr, dt) = self
+                    .lookup(n)
+                    .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
+                let v = self.coerce(val, ty, dt);
+                self.store(ptr, v);
+                Ok(())
+            }
+            Expr::Attr { base, name, .. } => {
+                let (bv, bty) = self.expr(base)?;
+                let Ty::Struct(sid) = bty else {
+                    return Err(err("field assignment on a non-struct value"));
+                };
+                let (idx, fty) = self
+                    .ctx
+                    .field(sid, name)
+                    .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
+                let v = self.coerce(val, ty, fty);
+                self.emit(Inst::FieldSet {
+                    base: bv,
+                    sid,
+                    idx,
+                    val: v,
+                });
+                Ok(())
+            }
+            _ => Err(err(
+                "only name and field targets are supported in tuple destructuring assignment yet",
             )),
         }
     }
@@ -1876,6 +2138,7 @@ impl<'a> FnLower<'a> {
             Expr::List(elems, _) => self.lower_list_lit(elems),
             Expr::Dict(items, _) => self.lower_dict_lit(items),
             Expr::Set(elems, _) => self.lower_set_lit(elems),
+            Expr::Tuple(elems, _) => self.lower_tuple_lit(elems),
             Expr::Index { base, index, .. } => self.lower_index_get(base, index),
             Expr::Attr { base, name, .. } => {
                 // Qualified enum member/variant access (`Color.RED`,
@@ -2772,8 +3035,113 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Lower a tuple literal (D-0049): a by-value anonymous-struct aggregate. The
+    /// element-type sequence interns to a struct id, then `StructNew` + one
+    /// `FieldSet` per element build the value — exactly the struct path, so
+    /// codegen needs no tuple-specific handling.
+    fn lower_tuple_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
+        let mut vals = Vec::with_capacity(elems.len());
+        let mut tys = Vec::with_capacity(elems.len());
+        for e in elems {
+            let (v, t) = self.expr(e)?;
+            vals.push(v);
+            tys.push(t);
+        }
+        let sid = self.ctx.tuples.borrow_mut().intern(tys);
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        for (idx, v) in vals.into_iter().enumerate() {
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: idx as u32,
+                val: v,
+            });
+        }
+        Ok((dest, Ty::Struct(sid)))
+    }
+
+    /// Element-wise tuple comparison (D-0049). `op` is `==` or `!=`; the result
+    /// is the conjunction of the per-element `==` results (then negated for
+    /// `!=`). Elements are compared by recursing through [`binop`], so nested
+    /// tuples and scalar elements work; a reference-typed element (e.g. `str`)
+    /// currently surfaces `binop`'s "unsupported reference type" error.
+    fn tuple_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        ls: u32,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        let Ty::Struct(rs) = rt else {
+            return Err(err("a tuple can only be compared with another tuple"));
+        };
+        if ls != rs {
+            return Err(err("cannot compare tuples of different types"));
+        }
+        let field_tys = self
+            .ctx
+            .tuples
+            .borrow()
+            .fields(ls)
+            .ok_or_else(|| err("not a tuple"))?;
+        // Start from `true` and AND each element's equality.
+        let mut acc = self.new_value(Ty::I1);
+        self.emit(Inst::BConst {
+            dest: acc,
+            val: true,
+        });
+        for (i, fty) in field_tys.iter().enumerate() {
+            let lf = self.field_get(l, ls, i as u32, *fty);
+            let rf = self.field_get(r, rs, i as u32, *fty);
+            let (eq, _) = self.binop(AstBin::Eq, lf, *fty, rf, *fty)?;
+            let next = self.new_value(Ty::I1);
+            self.emit(Inst::Bin {
+                dest: next,
+                op: BinOp::And,
+                lhs: acc,
+                rhs: eq,
+            });
+            acc = next;
+        }
+        if matches!(op, AstBin::Ne) {
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::Un {
+                dest: d,
+                op: UnOp::Not,
+                val: acc,
+            });
+            return Ok((d, Ty::I1));
+        }
+        Ok((acc, Ty::I1))
+    }
+
     fn lower_index_get(&mut self, base: &Expr, index: &Expr) -> Result<(Value, Ty), LowerError> {
         let (bv, bty) = self.expr(base)?;
+        // Tuple element access `t[k]` (D-0049): `k` must be a compile-time
+        // constant (a tuple is heterogeneous), and the result is that field.
+        if let Ty::Struct(sid) = bty {
+            if let Some(field_tys) = self.ctx.tuples.borrow().fields(sid) {
+                let k = const_int_value(index)
+                    .ok_or_else(|| err("a tuple index must be a compile-time-constant integer"))?;
+                if k < 0 || k as usize >= field_tys.len() {
+                    return Err(err(format!(
+                        "tuple index {k} out of range for a {}-element tuple",
+                        field_tys.len()
+                    )));
+                }
+                let fty = field_tys[k as usize];
+                let d = self.new_value(fty);
+                self.emit(Inst::FieldGet {
+                    dest: d,
+                    base: bv,
+                    sid,
+                    idx: k as u32,
+                });
+                return Ok((d, fty));
+            }
+        }
         match bty {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
@@ -3131,6 +3499,18 @@ impl<'a> FnLower<'a> {
         // scalar broadcast `a + 2.0`, lowered to a SIMD kernel in codegen.
         if matches!(lt, Ty::Array(_)) || matches!(rt, Ty::Array(_)) {
             return self.array_binop(op, l, lt, r, rt);
+        }
+
+        // Element-wise tuple comparison (D-0049): `t1 == t2` / `t1 != t2` compares
+        // positionally, recursing into each element (so nested tuples compare
+        // element-wise too). Only tuple operands take this path; user-struct
+        // equality goes through `__eq__`/`@derive(Eq)`.
+        if matches!(op, Eq | Ne) {
+            if let Ty::Struct(ls) = lt {
+                if self.ctx.tuples.borrow().is_tuple(ls) {
+                    return self.tuple_cmp(op, l, ls, r, rt);
+                }
+            }
         }
 
         // Membership: `x in <set>` -> `zap_set_contains_*`, normalized to a bool.
