@@ -206,6 +206,30 @@ fn binary_op_dunder(op: BinOp) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// The in-place augmented-assignment dunder for an operator (D-0047): if the
+/// LHS type of `a OP= b` defines this, the assignment calls `a.__iOP__(b)`
+/// (mutating in place, D-0023) instead of deriving `a = a.__OP__(b)` from the
+/// binary operator. Only the operators that can head an augmented assignment
+/// have one. Its interface mirrors the binary one (`Add` -> `IAdd`, etc.).
+fn inplace_op_dunder(op: BinOp) -> Option<&'static str> {
+    use BinOp::*;
+    Some(match op {
+        Add => "__iadd__",
+        Sub => "__isub__",
+        Mul => "__imul__",
+        Div => "__itruediv__",
+        FloorDiv => "__ifloordiv__",
+        Mod => "__imod__",
+        Pow => "__ipow__",
+        BitAnd => "__iand__",
+        BitOr => "__ior__",
+        BitXor => "__ixor__",
+        Shl => "__ilshift__",
+        Shr => "__irshift__",
+        Eq | Ne | Lt | Le | Gt | Ge | And | Or | In | Send => return None,
+    })
+}
+
 /// The source symbol for an operator, for diagnostics.
 fn binop_symbol(op: BinOp) -> &'static str {
     use BinOp::*;
@@ -1282,9 +1306,10 @@ impl Checker {
                 if let Expr::Name(n, span) = target {
                     match self.lookup(n) {
                         Some(tt) => {
-                            // `t += v` derives from the binary operator, so a
-                            // user struct uses its `__add__` etc. (D-0047).
-                            let r = match self.check_struct_binop(*op, &tt, &vt, *span) {
+                            // `t += v` on a user struct calls the in-place dunder
+                            // (`__iadd__` etc.) when defined, else derives from the
+                            // binary operator's `__add__` etc. (D-0047).
+                            let r = match self.check_struct_aug_assign(*op, &tt, &vt, *span) {
                                 Some(ty) => ty,
                                 None => self.arith_result(*op, &tt, &vt, *span),
                             };
@@ -2261,6 +2286,22 @@ impl Checker {
         }
     }
 
+    /// Check an augmented assignment `a OP= b` with a user-struct LHS (D-0047),
+    /// returning the result type, or `None` to fall back to the built-in-type
+    /// rules. If the LHS type defines the in-place dunder (`__iadd__` etc.), the
+    /// assignment calls `a.__iOP__(b)` and is typed from that dunder's return
+    /// type; otherwise it derives from the binary operator exactly like `a OP b`
+    /// (so a struct with only `__add__` still supports `+=`).
+    fn check_struct_aug_assign(&mut self, op: BinOp, l: &Ty, r: &Ty, span: Span) -> Option<Ty> {
+        self.struct_info(l)?;
+        if let Some(dunder) = inplace_op_dunder(op) {
+            if let Some(sig) = self.lookup_dunder(l, dunder) {
+                return Some(sig.ret);
+            }
+        }
+        self.check_struct_binop(op, l, r, span)
+    }
+
     /// Check a unary operator with a user-struct operand (D-0047).
     fn check_struct_unary(&mut self, op: UnOp, t: &Ty, span: Span) -> Option<Ty> {
         self.struct_info(t)?;
@@ -3123,6 +3164,39 @@ mod tests {
             def main():\n    auto a = V(x=1)\n    auto b = V(x=2)\n    \
             auto c = a + b\n    if a == b:\n        print(1)\n    \
             if a < b:\n        print(2)\n");
+    }
+
+    #[test]
+    fn aug_assign_accepts_inplace_only_dunder() {
+        // A struct that defines only `__iadd__` (no `__add__`) type-checks `+=`:
+        // the assignment calls the in-place dunder (D-0047/D-0023).
+        ok("struct Acc:\n    int64 total\n\n    \
+            def __iadd__(self, Acc other) -> Acc:\n        \
+            self.total = self.total + other.total\n        return self\n\n\
+            def main():\n    auto a = Acc(total=1)\n    auto b = Acc(total=2)\n    \
+            a += b\n    print(a.total)\n");
+    }
+
+    #[test]
+    fn aug_assign_falls_back_to_binary_dunder() {
+        // With only `__add__` defined, `+=` still type-checks by deriving from
+        // the binary operator.
+        ok("struct V:\n    int64 x\n\n    \
+            def __add__(self, V other) -> V:\n        return V(x=self.x + other.x)\n\n\
+            def main():\n    auto a = V(x=1)\n    auto b = V(x=2)\n    \
+            a += b\n    print(a.x)\n");
+    }
+
+    #[test]
+    fn aug_assign_without_either_dunder_errors() {
+        // `+=` on a struct that defines neither `__iadd__` nor `__add__` is a
+        // clean error naming the binary dunder it would fall back to.
+        let e = errors(
+            "struct V:\n    int64 x\n\ndef main():\n    \
+             auto a = V(x=1)\n    auto b = V(x=2)\n    a += b\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("__add__"), "{e:?}");
     }
 
     #[test]

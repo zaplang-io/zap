@@ -370,10 +370,13 @@ interface Add:
   `a == b ⟹ hash(a) == hash(b)`: `@derive(Hash)` guarantees it; a hand-written
   `__hash__` (e.g. hashing only a stable `id`) must preserve it. The compiler
   warns on `Eq`-without-`Hash` used as a key.
-- **Augmented assignment** (`+=`, …) derives from the binary dunder
-  (`a = a.__add__(b)`). The **in-place** family (`__iadd__`, …) is **reserved**
-  but deferred to a later ticket — a pure allocation optimization gated on
-  aliasing rules (D-0023).
+- **Augmented assignment** (`+=`, …) calls the **in-place** dunder
+  (`a.__iadd__(b)`) when the LHS type defines it — mutating the operand in place
+  and returning it, avoiding the fresh allocation the binary form needs — and
+  otherwise derives from the binary dunder (`a = a.__add__(b)`). In-place
+  mutation is sound by D-0023: a reference struct shares identity, so the
+  mutation is the intended visible effect; a value struct copies on assign, so
+  operating on the local is fine. Implemented in ticket #61.
 - **Operator interfaces double as generic bounds** (D-0017): once user generics
   land, `def sum[T: Add](xs: list[T]) -> T` constrains `T` to addable types.
 
@@ -394,7 +397,11 @@ implementing, consistent with D-0047:
   `a == b ⟹ hash(a) == hash(b)` invariant against `__eq__`'s value comparison.
   `@derive(Json)` remains deferred.
 - **`__delitem__`** (`del a[i]`) is reserved but unimplemented (no `del`
-  statement yet); the **in-place `__iadd__` family** stays deferred (I#61).
+  statement yet). The **in-place `__iadd__` family** (`__iadd__`, `__isub__`,
+  `__imul__`, `__itruediv__`, `__ifloordiv__`, `__imod__`, `__ipow__`,
+  `__iand__`, `__ior__`, `__ixor__`, `__ilshift__`, `__irshift__`) is now
+  implemented (ticket #61): `a OP= b` uses `a.__iOP__(b)` when defined, else
+  falls back to `a = a.__OP__(b)`.
 - A struct `dict`/`set` key needs **both `__hash__` and `__eq__`**; the compiler
   warns on an `Eq`-without-`Hash` key and errors in lowering if a key type lacks
   either.

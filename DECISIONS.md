@@ -529,11 +529,16 @@ in D-0043. Invariant: `a == b` ⟹ `hash(a) == hash(b)`; `@derive(Hash)`
 guarantees it (same fields feed `__eq__` and `__hash__`), a hand-written
 `__hash__` must preserve it.
 
-**In-place augmented assignment (`__iadd__`/`__isub__`/… family):** **reserved**
-in the grammar/spec but its **implementation is deferred to a separate ticket**.
-It is a pure allocation optimization over deriving `+=` from `__add__` and is
-gated on value/reference aliasing rules (D-0023); until it lands, `+=` always
-derives from the binary operator.
+**In-place augmented assignment (`__iadd__`/`__isub__`/… family):** **implemented
+in I#61.** `a OP= b` calls the in-place dunder `a.__iOP__(b)` when the LHS type
+defines it (mutating in place and returning the operand, avoiding the fresh
+allocation of the binary form); otherwise it falls back to deriving
+`a = a.__OP__(b)`. The twelve dunders are `__iadd__`, `__isub__`, `__imul__`,
+`__itruediv__`, `__ifloordiv__`, `__imod__`, `__ipow__`, `__iand__`, `__ior__`,
+`__ixor__`, `__ilshift__`, `__irshift__`. Soundness per D-0023: a reference
+struct shares identity so the in-place mutation is the intended visible effect,
+and a value struct copies on assign so operating on the local is fine; built-in
+scalar `+=` keeps its direct lowering.
 
 **Rationale:** reusing structural interfaces keeps overloading compile-time
 typo-safe (D-0016) and makes operators usable as generic bounds; dunder names
