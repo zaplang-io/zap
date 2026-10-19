@@ -332,13 +332,17 @@ mod tests {
         // to the runtime registry.
         let m = lower_ok(include_str!("../../../tests/golden/decorators.zap"));
         // `@derive(Eq, Repr)` produced two extra top-level functions.
-        let eq = m.funcs.iter().find(|f| f.name == "User__eq").expect("eq");
+        let eq = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "User____eq__")
+            .expect("eq");
         assert_eq!(eq.params, vec![Ty::Struct(0), Ty::Struct(0)]);
         assert_eq!(eq.ret, Ty::I1);
         let repr = m
             .funcs
             .iter()
-            .find(|f| f.name == "User__repr")
+            .find(|f| f.name == "User____repr__")
             .expect("repr");
         assert_eq!(repr.params, vec![Ty::Struct(0)]);
         assert_eq!(repr.ret, Ty::Ptr);
@@ -537,10 +541,10 @@ mod tests {
         // A struct can derive just one trait; the generated method resolves.
         let m = lower_ok(
             "@derive(Eq)\nstruct P:\n    int64 x\n\ndef main():\n    \
-             auto a = P(x=1)\n    auto b = P(x=1)\n    if a.eq(b):\n        print(1)\n",
+             auto a = P(x=1)\n    auto b = P(x=1)\n    if a == b:\n        print(1)\n",
         );
-        assert!(m.funcs.iter().any(|f| f.name == "P__eq"));
-        assert!(!m.funcs.iter().any(|f| f.name == "P__repr"));
+        assert!(m.funcs.iter().any(|f| f.name == "P____eq__"));
+        assert!(!m.funcs.iter().any(|f| f.name == "P____repr__"));
     }
 
     #[test]
@@ -559,15 +563,82 @@ mod tests {
         }
     }
 
+    // --- operator overloading (ticket #52, D-0047) ---
+
+    #[test]
+    fn operator_desugars_to_dunder_call() {
+        // `a + b` / `a == b` / `a < b` on a struct lower to calls of the mangled
+        // dunder methods (`V____add__`, `V____eq__`, `V____cmp__`).
+        let m = lower_ok(
+            "struct V:\n    int64 x\n\n    \
+             def __add__(self, V other) -> V:\n        return V(x=self.x + other.x)\n\n    \
+             def __eq__(self, V other) -> bool:\n        return self.x == other.x\n\n    \
+             def __cmp__(self, V other) -> int64:\n        return 0\n\n\
+             def main():\n    auto a = V(x=1)\n    auto b = V(x=2)\n    \
+             auto c = a + b\n    if a == b:\n        print(1)\n    if a < b:\n        print(2)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@V____add__"), "text:\n{text}");
+        assert!(text.contains("@V____eq__"), "text:\n{text}");
+        assert!(text.contains("@V____cmp__"), "text:\n{text}");
+    }
+
+    #[test]
+    fn derive_ord_and_hash_generate_methods() {
+        // @derive(Ord)/(Hash) now generate `__cmp__`/`__hash__` (in addition to
+        // the existing Eq/Repr), field-wise.
+        let m = lower_ok("@derive(Eq, Ord, Hash, Repr)\nstruct V:\n    int64 x\n    str s\n");
+        assert!(
+            m.funcs.iter().any(|f| f.name == "V____cmp__"),
+            "expected a generated __cmp__"
+        );
+        assert!(
+            m.funcs.iter().any(|f| f.name == "V____hash__"),
+            "expected a generated __hash__"
+        );
+        let hash = m.funcs.iter().find(|f| f.name == "V____hash__").unwrap();
+        assert_eq!(hash.ret, Ty::I64);
+        let text = format!("{m}");
+        // Hash combines per-field hashes; cmp compares the str field via the runtime.
+        assert!(text.contains("@zap_hash_combine"), "text:\n{text}");
+        assert!(text.contains("@zap_str_cmp"), "text:\n{text}");
+    }
+
+    #[test]
+    fn struct_set_key_uses_fn_entry_points() {
+        // A struct used as a set element routes to the `_fn` runtime entry points
+        // and passes its `__hash__`/`__eq__` as function pointers (D-0047).
+        let m = lower_ok(
+            "@derive(Eq, Hash)\nstruct V:\n    int64 x\n\n\
+             def main():\n    auto a = V(x=1)\n    auto s = {a}\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_set_add_fn"), "text:\n{text}");
+        assert!(text.contains("funcaddr @V____hash__"), "text:\n{text}");
+        assert!(text.contains("funcaddr @V____eq__"), "text:\n{text}");
+    }
+
+    #[test]
+    fn operator_without_dunder_lowers_to_clean_error() {
+        // The ir crate runs without sema; a missing dunder is a clean error.
+        let (ast, _p, _l) = parse_str(
+            "struct V:\n    int64 x\n\ndef main():\n    \
+             auto a = V(x=1)\n    auto b = V(x=2)\n    auto c = a + b\n",
+        );
+        let (_m, errs) = lower_module(&ast);
+        assert!(!errs.is_empty(), "missing __add__ should error");
+        assert!(errs[0].message.contains("__add__"), "{errs:?}");
+    }
+
     #[test]
     fn derive_and_user_method_clash_errors() {
         let (ast, _p, _l) = parse_str(
-            "@derive(Eq)\nstruct S:\n    int64 x\n\n    def eq(self, S other) -> bool:\n        return True\n",
+            "@derive(Eq)\nstruct S:\n    int64 x\n\n    def __eq__(self, S other) -> bool:\n        return True\n",
         );
         let (_m, errs) = lower_module(&ast);
         assert!(
             !errs.is_empty(),
-            "a user `eq` plus @derive(Eq) should clash"
+            "a user `__eq__` plus @derive(Eq) should clash"
         );
     }
 

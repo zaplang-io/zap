@@ -16,9 +16,15 @@ use std::fmt;
 pub enum Elem {
     /// An integer/bool element, passed as `i64`.
     I64,
-    /// A reference-typed element (`str`, struct, nested collection), passed as a
-    /// pointer.
+    /// A reference-typed element (`str`, nested collection), passed as a pointer
+    /// and — as a *key* — hashed/compared by its bytes (a `ZapStr`).
     Ptr,
+    /// A user-struct element (operator overloading, D-0047). Stored as a pointer
+    /// word, but as a dict/set *key* it is hashed and compared by the struct's
+    /// own `__hash__` / `__eq__` rather than by raw bytes, so it routes to the
+    /// function-pointer runtime entry points (key suffix `fn`). The `u32` indexes
+    /// [`Module::structs`].
+    Struct(u32),
 }
 
 impl Elem {
@@ -27,21 +33,26 @@ impl Elem {
         match self {
             Elem::I64 => Ty::I64,
             Elem::Ptr => Ty::Ptr,
+            Elem::Struct(sid) => Ty::Struct(sid),
         }
     }
-    /// The runtime-entry-point suffix for an element/value of this kind.
+    /// The runtime-entry-point suffix for an element/value of this kind. Struct
+    /// *values* are stored as plain pointer words (only *keys* need per-type
+    /// hashing), so they share the `ptr` path.
     pub fn val_suffix(self) -> &'static str {
         match self {
             Elem::I64 => "i64",
-            Elem::Ptr => "ptr",
+            Elem::Ptr | Elem::Struct(_) => "ptr",
         }
     }
     /// The runtime-entry-point suffix for a *key* of this kind. Pointer keys are
-    /// strings for the current increment (hashed/compared by contents).
+    /// strings (hashed/compared by contents); struct keys use the `fn` path,
+    /// which takes the type's `__hash__`/`__eq__` as function pointers.
     pub fn key_suffix(self) -> &'static str {
         match self {
             Elem::I64 => "i64",
             Elem::Ptr => "str",
+            Elem::Struct(_) => "fn",
         }
     }
 }
@@ -332,6 +343,14 @@ pub enum Inst {
         func: String,
         args: Vec<Value>,
     },
+    /// The address of a top-level function, as a pointer value (`dest : Ptr`).
+    /// Used to hand a struct type's `__hash__` / `__eq__` to the collection
+    /// runtime so a struct can be a `dict`/`set` key (operator overloading,
+    /// D-0047). Codegen lowers it to the function's global pointer.
+    FuncAddr {
+        dest: Value,
+        func: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -528,6 +547,7 @@ fn fmt_inst(i: &Inst) -> String {
             let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
             format!("spawn @{func}({})", a.join(", "))
         }
+        Inst::FuncAddr { dest, func } => format!("%{dest} = funcaddr @{func}"),
     }
 }
 

@@ -181,6 +181,35 @@ matters for the compile-time interface check (§2).
 Cross-cutting behavior that inheritance would provide elsewhere (equality,
 ordering, serialization, logging) comes from `@derive`/decorators (D-0036).
 
+#### 1.5 Value structs (opt-in value types, D-0051)
+
+By default a `struct` is a **reference type** (D-0023): shared identity, mutation
+visible to the caller — the Python-object feel. For hot, small aggregates where
+that heap indirection costs too much, prefix the declaration with **`value`**:
+
+```python
+value struct Vec2:
+    f64 x
+    f64 y
+    def dot(self, Vec2 o) -> f64:
+        return self.x * o.x + self.y * o.y
+```
+
+- A `value struct` is **copied** on assignment, argument passing, and return
+  (value semantics, no shared identity), laid out **inline** (stack / registers /
+  field-inline, no heap header) — the C/Swift-`struct` model.
+- It uses the **same** inline methods (§1.2), structural interfaces (§2),
+  operator overloading (§2.5) and `@derive` — and, like every Zap type, has **no
+  inheritance**.
+- **Limits:** stored in a collection or placed behind an interface value it is
+  **boxed** (copied to the heap), so the benefit is on locals/fields/args/returns,
+  not when erased behind an interface; a value struct holding references is still
+  GC-scanned; mutating it does not escape the caller's copy.
+
+Full OO (classes + inheritance) stays **deferred** (not under active
+consideration); `value struct` closes the performance gap that motivated it
+without reintroducing OO.
+
 ### 2. Interfaces (structural, compile-time checked)
 
 #### 2.1 Declaration
@@ -347,6 +376,28 @@ interface Add:
   aliasing rules (D-0023).
 - **Operator interfaces double as generic bounds** (D-0017): once user generics
   land, `def sum[T: Add](xs: list[T]) -> T` constrains `T` to addable types.
+
+**Implementation status (ticket #52).** Landed end-to-end (sema checks + AST→ZIR
+desugaring + runtime): the full dunder set above — arithmetic, bitwise/shift,
+unary (`__neg__`/`__pos__`/`__invert__`), `__eq__` (with `!=` derived),
+`__cmp__` (the four relational derived), `__getitem__`/`__setitem__`,
+`__contains__`, `__len__`, `__bool__`, `__call__`, `__str__`/`__repr__`, and
+`__hash__` (struct `dict`/`set` keys). `@derive(Eq, Ord, Hash, Repr)` generates
+`__eq__`/`__cmp__`/`__hash__`/`__repr__` field-wise. Decisions made while
+implementing, consistent with D-0047:
+
+- **Dispatch is on the left operand only** — `a + b` is `a.__add__(b)`; there is
+  no reflected `__radd__`. `x in a` is the one exception (it dispatches on the
+  container `a`, as `a.__contains__(x)`).
+- **`@derive(Hash)` supports integer/bool/str fields;** a float field is a clean
+  "not supported yet" error, because bit-hashing a float would break the
+  `a == b ⟹ hash(a) == hash(b)` invariant against `__eq__`'s value comparison.
+  `@derive(Json)` remains deferred.
+- **`__delitem__`** (`del a[i]`) is reserved but unimplemented (no `del`
+  statement yet); the **in-place `__iadd__` family** stays deferred (I#61).
+- A struct `dict`/`set` key needs **both `__hash__` and `__eq__`**; the compiler
+  warns on an `Eq`-without-`Hash` key and errors in lowering if a key type lacks
+  either.
 
 #### 2.6 Iteration protocol (D-0048)
 

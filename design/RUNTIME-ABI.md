@@ -90,7 +90,14 @@ struct Point { f64 x; f64 y }  ->  [ header(8) | x: f64(8) | y: f64(8) ]  = 24 b
   for scalar `T`, pointers for reference `T`. Amortized-doubling growth.
 - `dict[K,V]`: an open-addressing hash table — `[ header | len | cap | entries:
   *Entry ]`, `Entry = { hash, key, value }`. Hashing/equality come from the key
-  type (string/bytes/scalars built-in).
+  type (string/bytes/scalars built-in). A **user-struct key** (operator
+  overloading, #52 / D-0047) is hashed/compared by the type's own
+  `__hash__`/`__eq__`: the dict/set carries those two function pointers (set on
+  first insert) and the typed entry points gain an `_fn` key variant
+  (`zap_dict_set_fn_i64`/`_ptr`, `zap_dict_get_fn_*`, `zap_set_add_fn`,
+  `zap_set_contains_fn`) that take the `__hash__`/`__eq__` pointers as trailing
+  arguments. A new `KEY_FN` key kind routes the probe loop through them. This is
+  the struct-element-hashing unblock deferred in D-0043.
 - `array[T]` (#24): `[ header | dtype | ndim | dims: *i64 | strides: *i64 |
   data: *T ]`, contiguous row-major; views share `data`.
 
@@ -122,6 +129,11 @@ void* zap_str_from_utf8(const uint8_t* bytes, int64_t len);
 void* zap_str_concat(void* a, void* b);
 
 // Collections (#21): zap_list_new/push/get/len, zap_dict_new/set/get ...
+// Struct keys (#52, D-0047): zap_dict_set_fn_*/get_fn_*, zap_set_add_fn,
+//   zap_set_contains_fn (take __hash__/__eq__ fn pointers); and the hashing
+//   helpers the @derive(Hash)/@derive(Ord) dunders call:
+//   int64_t zap_i64_hash(int64_t), zap_str_hash(void*),
+//   zap_hash_combine(int64_t acc, int64_t h), zap_str_cmp(void*, void*).
 
 // I/O
 void  zap_print_i64(int64_t v);     // or the compiler emits printf directly

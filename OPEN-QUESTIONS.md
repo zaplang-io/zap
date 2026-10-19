@@ -34,8 +34,10 @@ _Last updated: 2026-10-19_
   index, nested + single-`*rest` destructuring, multiple return = tuple return
   (unifies comma-ok `v, ok = <-ch`), immutable by-value aggregate. See
   `design/0006-types-and-generics.md` §4.
-- 🟡 **Method-definition syntax** for structs (D-0015): inline methods vs a
-  separate receiver/`impl` block.
+- ✅ **Method-definition syntax** — RESOLVED (D-0050, issue #55): inline `def`s
+  with explicit `self`; no extension methods; the `impl Interface for Struct`
+  block is the only outside-the-body form. (Opt-in `value struct` value types
+  added by D-0051; full OO deferred.)
 - ⚪ **Unsigned integers.** Deferred (D-0019); likely reintroduced only for C
   interop and array dtypes (e.g. `uint8` for image data).
 - ⚪ **`char` details** — grapheme-cluster handling, char/codepoint API surface.

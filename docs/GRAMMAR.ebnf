@@ -1,5 +1,5 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0049.
+   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0051.
 
    Notation:
      ::=        definition
@@ -49,8 +49,10 @@ param         ::= [ "@" dotted_name [ "(" [ arg_list ] ")" ] ]
 
 (* ---------- Structs, interfaces, enums (D-0015, D-0016, D-0018) ---------- *)
 
-struct_def    ::= decorators "struct" IDENT [ generics ] ":" NEWLINE
+struct_def    ::= decorators [ "value" ] "struct" IDENT [ generics ] ":" NEWLINE
                   INDENT { field | function } DEDENT ;
+                  (* "value struct" = opt-in value type (D-0051); plain struct is
+                     a reference type (D-0023). "value" is a contextual modifier. *)
 field         ::= decorators type IDENT [ "=" expr ] NEWLINE ;
 
 interface_def ::= "interface" IDENT [ generics ] ":" NEWLINE

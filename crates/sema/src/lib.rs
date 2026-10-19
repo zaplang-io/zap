@@ -169,6 +169,72 @@ fn assignable(from: &Ty, to: &Ty) -> bool {
     }
 }
 
+/// A nameless, non-defaulted, non-variadic parameter of the given type — used to
+/// synthesize `@derive`d dunder signatures (D-0047).
+fn param(ty: Ty) -> ParamInfo {
+    ParamInfo {
+        name: String::new(),
+        ty,
+        has_default: false,
+        variadic: false,
+    }
+}
+
+/// The compiler-known structural operator interfaces for arithmetic / bitwise /
+/// shift operators (D-0047): each maps to the dunder a user struct defines and
+/// the interface name that provides it. Comparison (`Eq`/`Ord`), membership
+/// (`Contains`), size (`Len`), truthiness (`Bool`), indexing (`Index`), call
+/// (`Call`), and repr (`Str`/`Repr`) are handled separately. The result of one
+/// of these operators is typed from the dunder's own return type.
+fn binary_op_dunder(op: BinOp) -> Option<(&'static str, &'static str)> {
+    use BinOp::*;
+    Some(match op {
+        Add => ("__add__", "Add"),
+        Sub => ("__sub__", "Sub"),
+        Mul => ("__mul__", "Mul"),
+        Div => ("__truediv__", "TrueDiv"),
+        FloorDiv => ("__floordiv__", "FloorDiv"),
+        Mod => ("__mod__", "Mod"),
+        Pow => ("__pow__", "Pow"),
+        BitAnd => ("__and__", "BitAnd"),
+        BitOr => ("__or__", "BitOr"),
+        BitXor => ("__xor__", "BitXor"),
+        Shl => ("__lshift__", "LShift"),
+        Shr => ("__rshift__", "RShift"),
+        // Equality/relational/membership/logical/send are not arithmetic dunders.
+        Eq | Ne | Lt | Le | Gt | Ge | And | Or | In | Send => return None,
+    })
+}
+
+/// The source symbol for an operator, for diagnostics.
+fn binop_symbol(op: BinOp) -> &'static str {
+    use BinOp::*;
+    match op {
+        Add => "+",
+        Sub => "-",
+        Mul => "*",
+        Div => "/",
+        FloorDiv => "//",
+        Mod => "%",
+        Pow => "**",
+        And => "and",
+        Or => "or",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+        Shl => "<<",
+        Shr => ">>",
+        Eq => "==",
+        Ne => "!=",
+        Lt => "<",
+        Le => "<=",
+        Gt => ">",
+        Ge => ">=",
+        In => "in",
+        Send => "<-",
+    }
+}
+
 /// Make an untyped literal type concrete (its default).
 fn default_type(t: Ty) -> Ty {
     match t {
@@ -290,14 +356,37 @@ impl EnumInfo {
     }
 }
 
+/// A registered struct type. Carries just enough to check operator overloading
+/// (D-0047): the method signatures, including the dunders `@derive(...)`
+/// generates, so an operator's result is typed from its dunder and the compiler
+/// can warn on an `Eq`-without-`Hash` dict/set key.
+#[derive(Clone)]
+struct StructInfo {
+    /// Source method name -> signature (`self` is the first parameter).
+    methods: HashMap<String, FnSig>,
+}
+
+impl StructInfo {
+    /// Does this struct provide `dunder`, either hand-written or `@derive`d?
+    fn has(&self, dunder: &str) -> bool {
+        self.methods.contains_key(dunder)
+    }
+}
+
 /// Type-check a module, returning any errors.
 pub fn check(module: &Module) -> Vec<TypeError> {
+    analyze(module).0
+}
+
+/// Type-check a module, returning `(errors, warnings)`. Warnings are non-fatal
+/// diagnostics (e.g. the `Eq`-without-`Hash` dict/set key warning, D-0047).
+pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
     let mut c = Checker::new();
     c.collect_types(module);
     c.collect_sigs(module);
     c.validate_decorators(module);
     c.check_module(module);
-    c.errors
+    (c.errors, c.warnings)
 }
 
 /// Convenience for tests: lex, parse, and type-check `src`.
@@ -313,11 +402,20 @@ pub fn check_str(
     (terrs, perrs, lerrs)
 }
 
+/// Convenience for tests: lex, parse, and type-check `src`, returning the
+/// non-fatal warnings.
+pub fn warnings_str(src: &str) -> Vec<TypeError> {
+    let (module, _perrs, _lerrs) = zapc_syntax::parser::parse_str(src);
+    analyze(&module).1
+}
+
 struct Checker {
     sigs: HashMap<String, FnSig>,
     user_types: HashSet<String>,
     /// Registered enums (tier-1 and tier-3), keyed by type name.
     enums: HashMap<String, EnumInfo>,
+    /// Registered structs, keyed by type name (operator overloading, D-0047).
+    structs: HashMap<String, StructInfo>,
     /// Declared `annotation` names -> their field names (D-0036). Used to
     /// validate `@Annotation(...)` applications (keyword args must name fields).
     annotations: HashMap<String, Vec<String>>,
@@ -326,6 +424,9 @@ struct Checker {
     scopes: Vec<HashMap<String, Ty>>,
     ret_ty: Ty,
     errors: Vec<TypeError>,
+    /// Non-fatal diagnostics (e.g. `Eq`-without-`Hash` used as a dict/set key,
+    /// D-0047). Reported by the driver but do not fail compilation.
+    warnings: Vec<TypeError>,
 }
 
 const BUILTINS: &[&str] = &[
@@ -385,16 +486,25 @@ impl Checker {
             sigs: HashMap::new(),
             user_types: HashSet::new(),
             enums: HashMap::new(),
+            structs: HashMap::new(),
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
             scopes: Vec::new(),
             ret_ty: Ty::Unit,
             errors: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
     fn error(&mut self, message: impl Into<String>, span: Span) {
         self.errors.push(TypeError {
+            message: message.into(),
+            span,
+        });
+    }
+
+    fn warn(&mut self, message: impl Into<String>, span: Span) {
+        self.warnings.push(TypeError {
             message: message.into(),
             span,
         });
@@ -455,26 +565,128 @@ impl Checker {
                 _ => {}
             }
         }
-        // Second pass: build the enum registry now that all type names exist.
+        // Second pass: build the enum and struct registries now that all type
+        // names exist (fields/methods may reference a type declared later).
         for item in &module.items {
-            if let Item::Enum(e) = item {
-                let is_sum = e.variants.iter().any(|v| !v.fields.is_empty());
-                let variants = e
-                    .variants
-                    .iter()
-                    .map(|v| EnumVariantInfo {
-                        name: v.name.clone(),
-                        fields: v
-                            .fields
-                            .iter()
-                            .map(|f| (f.name.clone(), self.resolve_type(&f.ty)))
-                            .collect(),
-                    })
-                    .collect();
-                self.enums
-                    .insert(e.name.clone(), EnumInfo { is_sum, variants });
+            match item {
+                Item::Enum(e) => {
+                    let is_sum = e.variants.iter().any(|v| !v.fields.is_empty());
+                    let variants = e
+                        .variants
+                        .iter()
+                        .map(|v| EnumVariantInfo {
+                            name: v.name.clone(),
+                            fields: v
+                                .fields
+                                .iter()
+                                .map(|f| (f.name.clone(), self.resolve_type(&f.ty)))
+                                .collect(),
+                        })
+                        .collect();
+                    self.enums
+                        .insert(e.name.clone(), EnumInfo { is_sum, variants });
+                }
+                Item::Struct(s) => {
+                    let info = self.struct_info_of(s);
+                    self.structs.insert(s.name.clone(), info);
+                }
+                _ => {}
             }
         }
+    }
+
+    /// Build a struct's [`StructInfo`] (operator overloading, D-0047): resolve
+    /// fields and method signatures, collect `@derive`d traits, and synthesize
+    /// the signatures of the dunders those derives will generate.
+    fn struct_info_of(&self, s: &StructDef) -> StructInfo {
+        let mut methods: HashMap<String, FnSig> = HashMap::new();
+        for m in &s.methods {
+            methods.insert(m.name.clone(), self.sig_of_method(m, &s.name));
+        }
+        let mut derived: HashSet<String> = HashSet::new();
+        for d in &s.decorators {
+            if d.name == "derive" {
+                for a in &d.args {
+                    if let Expr::Name(t, _) = &a.value {
+                        derived.insert(t.clone());
+                    }
+                }
+            }
+        }
+        // Dunders `@derive(...)` generates (D-0047) — registered so an operator
+        // on a derived type resolves and is typed, unless the user hand-wrote the
+        // method (then their signature wins).
+        let named = Ty::Named(s.name.clone());
+        let unary = |ret: Ty| FnSig {
+            params: vec![param(named.clone())],
+            ret,
+        };
+        let binary = |ret: Ty| FnSig {
+            params: vec![param(named.clone()), param(named.clone())],
+            ret,
+        };
+        if derived.contains("Eq") {
+            methods
+                .entry("__eq__".into())
+                .or_insert_with(|| binary(Ty::Bool));
+        }
+        if derived.contains("Ord") {
+            methods
+                .entry("__cmp__".into())
+                .or_insert_with(|| binary(Ty::Int64));
+        }
+        if derived.contains("Hash") {
+            methods
+                .entry("__hash__".into())
+                .or_insert_with(|| unary(Ty::Int64));
+        }
+        if derived.contains("Repr") {
+            methods
+                .entry("__repr__".into())
+                .or_insert_with(|| unary(Ty::Str));
+        }
+        StructInfo { methods }
+    }
+
+    /// A struct method's signature, mapping the `self` receiver and any `Self`
+    /// annotation to the enclosing struct type.
+    fn sig_of_method(&self, f: &Function, sname: &str) -> FnSig {
+        let params = f
+            .params
+            .iter()
+            .map(|p| {
+                let ty = if p.name == "self" {
+                    Ty::Named(sname.to_string())
+                } else {
+                    p.ty.as_ref()
+                        .map(|t| self.resolve_type_self(t, sname))
+                        .unwrap_or(Ty::Unknown)
+                };
+                ParamInfo {
+                    name: p.name.clone(),
+                    ty,
+                    has_default: p.default.is_some(),
+                    variadic: p.variadic,
+                }
+            })
+            .collect();
+        let ret = f
+            .ret
+            .as_ref()
+            .map(|t| self.resolve_type_self(t, sname))
+            .unwrap_or(Ty::Unit);
+        FnSig { params, ret }
+    }
+
+    /// Like [`resolve_type`], but resolves the `Self` type name to the enclosing
+    /// struct (used in dunder signatures such as `__add__(self, other: Self)`).
+    fn resolve_type_self(&self, t: &Type, sname: &str) -> Ty {
+        if let Type::Named { name, .. } = t {
+            if name == "Self" {
+                return Ty::Named(sname.to_string());
+            }
+        }
+        self.resolve_type(t)
     }
 
     fn collect_sigs(&mut self, module: &Module) {
@@ -977,7 +1189,12 @@ impl Checker {
                 if let Expr::Name(n, span) = target {
                     match self.lookup(n) {
                         Some(tt) => {
-                            let r = self.arith_result(*op, &tt, &vt, *span);
+                            // `t += v` derives from the binary operator, so a
+                            // user struct uses its `__add__` etc. (D-0047).
+                            let r = match self.check_struct_binop(*op, &tt, &vt, *span) {
+                                Some(ty) => ty,
+                                None => self.arith_result(*op, &tt, &vt, *span),
+                            };
                             if !assignable(&r, &tt) {
                                 self.error(
                                     format!(
@@ -1405,7 +1622,7 @@ impl Checker {
                 }
                 Ty::List(Box::new(elem))
             }
-            Expr::Dict(items, _) => {
+            Expr::Dict(items, span) => {
                 let mut kt = Ty::Unknown;
                 let mut vt = Ty::Unknown;
                 for (i, (k, v)) in items.iter().enumerate() {
@@ -1419,6 +1636,7 @@ impl Checker {
                         vt = join(&vt, &v2);
                     }
                 }
+                self.warn_struct_key(&kt, *span);
                 Ty::Dict(Box::new(kt), Box::new(vt))
             }
             Expr::ListComp {
@@ -1459,12 +1677,13 @@ impl Checker {
                 self.pop_scope();
                 Ty::Dict(Box::new(kt), Box::new(vt))
             }
-            Expr::Set(elems, _) => {
+            Expr::Set(elems, span) => {
                 let mut elem = Ty::Unknown;
                 for (i, el) in elems.iter().enumerate() {
                     let t = self.infer(el);
                     elem = if i == 0 { t } else { join(&elem, &t) };
                 }
+                self.warn_struct_key(&elem, *span);
                 Ty::Set(Box::new(elem))
             }
             Expr::SetComp {
@@ -1487,6 +1706,9 @@ impl Checker {
             }
             Expr::Unary { op, expr, span } => {
                 let t = self.infer(expr);
+                if let Some(ty) = self.check_struct_unary(*op, &t, *span) {
+                    return ty;
+                }
                 match op {
                     UnOp::Not => Ty::Bool,
                     UnOp::Neg | UnOp::Pos => {
@@ -1516,7 +1738,13 @@ impl Checker {
             Expr::Binary { op, lhs, rhs, span } => {
                 let l = self.infer(lhs);
                 let r = self.infer(rhs);
-                self.arith_result(*op, &l, &r, *span)
+                // Operator overloading on user structs (D-0047) takes precedence
+                // over the built-in-type rules.
+                if let Some(ty) = self.check_struct_binop(*op, &l, &r, *span) {
+                    ty
+                } else {
+                    self.arith_result(*op, &l, &r, *span)
+                }
             }
             Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
             Expr::Index { base, index, span } => {
@@ -1553,6 +1781,10 @@ impl Checker {
                     }
                 }
                 self.infer(index);
+                // Indexing overloading (D-0047): `a[i]` -> `a.__getitem__(i)`.
+                if self.struct_info(&b).is_some() {
+                    return self.op_result(&b, "__getitem__", "Index", "[]", *span);
+                }
                 match b {
                     Ty::List(t) => *t,
                     Ty::Dict(_, v) => *v,
@@ -1791,6 +2023,117 @@ impl Checker {
         }
     }
 
+    // --- operator overloading (D-0047) ---
+
+    /// The struct type behind a `Ty`, if it is a user struct (not an enum, which
+    /// is also `Ty::Named`).
+    fn struct_info(&self, t: &Ty) -> Option<&StructInfo> {
+        if let Ty::Named(n) = t {
+            if !self.enums.contains_key(n) {
+                return self.structs.get(n);
+            }
+        }
+        None
+    }
+
+    /// The signature of a struct's dunder, if defined or derived.
+    fn lookup_dunder(&self, t: &Ty, dunder: &str) -> Option<FnSig> {
+        self.struct_info(t)
+            .and_then(|i| i.methods.get(dunder).cloned())
+    }
+
+    /// Require a struct to provide `dunder` for operator `sym` (interface
+    /// `iface`), erroring with a clear message if it does not (D-0047).
+    fn require_dunder(&mut self, t: &Ty, dunder: &str, iface: &str, sym: &str, span: Span) {
+        if self.lookup_dunder(t, dunder).is_none() {
+            self.error(
+                format!(
+                    "type '{}' does not support operator '{sym}': it must define \
+                     '{dunder}' (the '{iface}' operator interface, D-0047)",
+                    t.display()
+                ),
+                span,
+            );
+        }
+    }
+
+    /// The result type of an operator whose result is the dunder's return type
+    /// (arithmetic / bitwise / unary / indexing). Errors if the dunder is missing.
+    fn op_result(&mut self, t: &Ty, dunder: &str, iface: &str, sym: &str, span: Span) -> Ty {
+        match self.lookup_dunder(t, dunder) {
+            Some(sig) => sig.ret,
+            None => {
+                self.require_dunder(t, dunder, iface, sym, span);
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Check a binary operator with a user-struct operand (D-0047), returning the
+    /// result type, or `None` to fall back to the built-in-type rules.
+    fn check_struct_binop(&mut self, op: BinOp, l: &Ty, r: &Ty, span: Span) -> Option<Ty> {
+        use BinOp::*;
+        // `x in a` dispatches on the container (right operand).
+        if matches!(op, In) {
+            if self.struct_info(r).is_some() {
+                self.require_dunder(r, "__contains__", "Contains", "in", span);
+                return Some(Ty::Bool);
+            }
+            return None;
+        }
+        // Every other operator dispatches on the left operand.
+        self.struct_info(l)?;
+        match op {
+            Eq | Ne => {
+                self.require_dunder(l, "__eq__", "Eq", binop_symbol(op), span);
+                Some(Ty::Bool)
+            }
+            Lt | Le | Gt | Ge => {
+                // The four relational operators derive from a single `__cmp__`.
+                self.require_dunder(l, "__cmp__", "Ord", binop_symbol(op), span);
+                Some(Ty::Bool)
+            }
+            And | Or => Some(Ty::Bool),
+            Send => None,
+            _ => {
+                let (dunder, iface) = binary_op_dunder(op)?;
+                Some(self.op_result(l, dunder, iface, binop_symbol(op), span))
+            }
+        }
+    }
+
+    /// Check a unary operator with a user-struct operand (D-0047).
+    fn check_struct_unary(&mut self, op: UnOp, t: &Ty, span: Span) -> Option<Ty> {
+        self.struct_info(t)?;
+        Some(match op {
+            UnOp::Not => Ty::Bool, // truthiness; `__bool__` is optional
+            UnOp::Neg => self.op_result(t, "__neg__", "Neg", "-", span),
+            UnOp::Pos => self.op_result(t, "__pos__", "Pos", "+", span),
+            UnOp::BitNot => self.op_result(t, "__invert__", "Invert", "~", span),
+        })
+    }
+
+    /// Warn when a struct that defines equality but not `__hash__` is used as a
+    /// `dict`/`set` key — then `a == b ⟹ hash(a) == hash(b)` is not guaranteed
+    /// (D-0047). `@derive(Hash)` or a hand-written `__hash__` silences it.
+    fn warn_struct_key(&mut self, key: &Ty, span: Span) {
+        let (has_eq, has_hash) = match self.struct_info(key) {
+            Some(i) => (i.has("__eq__"), i.has("__hash__")),
+            None => return,
+        };
+        if has_eq && !has_hash {
+            self.warn(
+                format!(
+                    "type '{}' defines equality but no '__hash__', yet is used as a \
+                     dict/set key; add @derive(Hash) or define '__hash__' so that \
+                     'a == b' implies 'hash(a) == hash(b)' (D-0047)",
+                    key.display()
+                ),
+                span,
+            );
+        }
+    }
+
     fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Ty {
         // Qualified enum-variant construction: `Shape.Circle(r=2.0)` /
         // `Shape.Circle(2.0)` (D-0046), accepting named or positional args.
@@ -1963,6 +2306,16 @@ impl Checker {
                             self.infer(&a.value);
                         }
                         return Ty::Named(fname.clone());
+                    }
+                    // A callable user struct held in a variable (D-0047):
+                    // `f(args)` desugars to `f.__call__(args)`.
+                    if let Some(vt) = self.lookup(fname) {
+                        if self.struct_info(&vt).is_some() {
+                            for a in args {
+                                self.infer(&a.value);
+                            }
+                            return self.op_result(&vt, "__call__", "Call", "()", span);
+                        }
                     }
                     self.error(format!("call to unknown function '{fname}'"), span);
                     for a in args {
@@ -2549,6 +2902,86 @@ mod tests {
         let e = errors("@derive(Eq)\ndef f():\n    print(1)\n");
         assert_eq!(e.len(), 1, "got {e:?}");
         assert!(e[0].message.contains("applies to a struct"), "{e:?}");
+    }
+
+    // --- operator overloading (ticket #52, D-0047) ---
+
+    #[test]
+    fn operator_on_struct_requires_the_dunder() {
+        // `a + b` on a struct with no `__add__` is a clear compile error that
+        // names the dunder and interface (D-0047).
+        let e = errors(
+            "struct V:\n    int64 x\n\ndef main():\n    \
+             auto a = V(x=1)\n    auto b = V(x=2)\n    auto c = a + b\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("__add__"), "{e:?}");
+        assert!(e[0].message.contains("Add"), "{e:?}");
+    }
+
+    #[test]
+    fn comparison_on_struct_requires_cmp() {
+        // `<` needs `__cmp__`; the error names it and the `Ord` interface.
+        let e = errors(
+            "struct V:\n    int64 x\n\ndef main():\n    \
+             auto a = V(x=1)\n    auto b = V(x=2)\n    if a < b:\n        print(1)\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("__cmp__"), "{e:?}");
+    }
+
+    #[test]
+    fn equality_on_struct_requires_eq() {
+        let e = errors(
+            "struct V:\n    int64 x\n\ndef main():\n    \
+             auto a = V(x=1)\n    auto b = V(x=2)\n    if a == b:\n        print(1)\n",
+        );
+        assert_eq!(e.len(), 1, "got {e:?}");
+        assert!(e[0].message.contains("__eq__"), "{e:?}");
+    }
+
+    #[test]
+    fn hand_written_dunders_make_operators_type_check() {
+        // A struct defining the dunders satisfies the operator interfaces; the
+        // operator's result type is the dunder's return type.
+        ok("struct V:\n    int64 x\n\n    \
+            def __add__(self, V other) -> V:\n        return V(x=self.x)\n\n    \
+            def __eq__(self, V other) -> bool:\n        return True\n\n    \
+            def __cmp__(self, V other) -> int64:\n        return 0\n\n\
+            def main():\n    auto a = V(x=1)\n    auto b = V(x=2)\n    \
+            auto c = a + b\n    if a == b:\n        print(1)\n    \
+            if a < b:\n        print(2)\n");
+    }
+
+    #[test]
+    fn derive_ord_and_hash_are_accepted() {
+        // @derive(Eq, Ord, Hash, Repr) satisfies ==, <, and makes the type a key.
+        ok("@derive(Eq, Ord, Hash, Repr)\nstruct V:\n    int64 x\n\n\
+            def main():\n    auto a = V(x=1)\n    auto b = V(x=2)\n    \
+            if a == b:\n        print(1)\n    if a < b:\n        print(2)\n    \
+            auto s = {a, b}\n");
+    }
+
+    #[test]
+    fn eq_without_hash_key_warns() {
+        // A struct with equality but no `__hash__` used as a set key warns
+        // (non-fatal) — D-0047 invariant guard.
+        let w = warnings_str(
+            "@derive(Eq)\nstruct V:\n    int64 x\n\ndef main():\n    \
+             auto a = V(x=1)\n    auto s = {a}\n",
+        );
+        assert_eq!(w.len(), 1, "expected one warning, got {w:?}");
+        assert!(w[0].message.contains("__hash__"), "{w:?}");
+    }
+
+    #[test]
+    fn eq_with_hash_key_does_not_warn() {
+        // Deriving Hash alongside Eq silences the dict/set-key warning.
+        let w = warnings_str(
+            "@derive(Eq, Hash)\nstruct V:\n    int64 x\n\ndef main():\n    \
+             auto a = V(x=1)\n    auto d = {a: 1}\n",
+        );
+        assert!(w.is_empty(), "unexpected warnings: {w:?}");
     }
 
     #[test]
