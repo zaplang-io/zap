@@ -946,6 +946,23 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let thunk = self
             .module
             .add_function(&name, ptr.fn_type(&[ptr.into()], false), None);
+        // The thunk is each goroutine's base frame (ticket #47,
+        // design/0005-concurrency.md "Interaction with exception unwinding"):
+        // unwinding must stop here, not run off the green stack into the
+        // makecontext bootstrap. So the call to the target is an `invoke` with a
+        // catch-all landing pad that reports the uncaught exception via
+        // `zap_uncaught` (message + exit 1), mirroring the implicit top-level
+        // handler in `main`. In-goroutine `try/except` is unaffected (it unwinds
+        // through normal CFI on the green stack); this only catches what reaches
+        // the top. Requires the Itanium personality + an unwind table.
+        let uwtable = Attribute::get_named_enum_kind_id("uwtable");
+        if uwtable != 0 {
+            thunk.add_attribute(
+                AttributeLoc::Function,
+                self.ctx.create_enum_attribute(uwtable, 2),
+            );
+        }
+        thunk.set_personality_function(self.fns["__gxx_personality_v0"]);
         let entry = self.ctx.append_basic_block(thunk, "entry");
         b.position_at_end(entry);
         let env = thunk
@@ -953,19 +970,52 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .ok_or_else(|| "thunk has no env parameter".to_string())?
             .into_pointer_value();
         let param_tys = target.get_type().get_param_types();
-        let mut call_args: Vec<inkwell::values::BasicMetadataValueEnum> =
-            Vec::with_capacity(param_tys.len());
+        let mut call_args: Vec<BasicValueEnum> = Vec::with_capacity(param_tys.len());
         for (i, pty) in param_tys.iter().enumerate() {
             let fp = b
                 .build_struct_gep(env_struct, env, i as u32, "argptr")
                 .map_err(|_| "invalid thunk argument index".to_string())?;
             let v = b.build_load(*pty, fp, "arg").map_err(|e| e.to_string())?;
-            call_args.push(v.into());
+            call_args.push(v);
         }
-        b.build_call(target, &call_args, "")
+        let cont = self.ctx.append_basic_block(thunk, "cont");
+        let pad = self.ctx.append_basic_block(thunk, "unwind");
+        b.build_invoke(target, &call_args, cont, pad, "")
             .map_err(|e| e.to_string())?;
+        // Normal path: the goroutine returned; hand `null` back to `zap_spawn`.
+        b.position_at_end(cont);
         b.build_return(Some(&ptr.const_null()))
             .map_err(|e| e.to_string())?;
+        // Unwind path: an exception reached the base frame -> report + exit.
+        b.position_at_end(pad);
+        let lp_ty = self
+            .ctx
+            .struct_type(&[ptr.into(), self.ctx.i32_type().into()], false);
+        let lp = b
+            .build_landing_pad(
+                lp_ty,
+                self.fns["__gxx_personality_v0"],
+                &[ptr.const_null().into()],
+                false,
+                "lp",
+            )
+            .map_err(|e| e.to_string())?;
+        let exc_ptr = b
+            .build_extract_value(lp.into_struct_value(), 0, "excptr")
+            .map_err(|e| e.to_string())?;
+        let exc = b
+            .build_call(
+                self.fns["zap_eh_begin_catch"],
+                &[exc_ptr.into()],
+                "begincatch",
+            )
+            .map_err(|e| e.to_string())?
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| "zap_eh_begin_catch returned no value".to_string())?;
+        b.build_call(self.fns["zap_uncaught"], &[exc.into()], "")
+            .map_err(|e| e.to_string())?;
+        b.build_unreachable().map_err(|e| e.to_string())?;
         if let Some(bb) = saved {
             b.position_at_end(bb);
         }

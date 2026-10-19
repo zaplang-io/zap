@@ -28,9 +28,15 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
+/* ucontext (getcontext/makecontext/swapcontext) backs the M:N scheduler's
+ * green-thread context switch (ticket #47). Available on the Linux x86_64 dev
+ * container; see the scheduler block below for the arch assumption. */
+#include <ucontext.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>   /* clock_gettime for the scheduler idle wait (#47) */
+#include <unistd.h> /* sysconf(_SC_NPROCESSORS_ONLN) for the M count (#47) */
 
 /* PCRE2, 8-bit code units (ticket #23, D-0010). Must be defined before the
  * header so the `pcre2_*` names resolve to the 8-bit API. Linked with
@@ -1173,175 +1179,708 @@ void *zap_py_str(void *obj_) {
 }
 
 /* ===========================================================================
- * Goroutines + channels (ticket #25, D-0013/D-0031/D-0033/D-0034,
- * design/0005-concurrency.md).
+ * Goroutines + channels on an M:N work-stealing scheduler
+ * (ticket #47, D-0008/D-0013/D-0031/D-0033/D-0034, design/0005-concurrency.md).
  *
- * This is a correct, shippable milestone of the locked CSP surface, backed by
- * OS threads rather than a user-space M:N scheduler:
+ * This replaces the 1:1 pthread-backed goroutine runtime shipped in #25/#46
+ * with a user-space scheduler. Language-visible semantics are UNCHANGED; this
+ * is purely a runtime swap, and every `zap_*` entry point below keeps the exact
+ * signature #25 compiled against, so lowering/codegen are untouched (the one
+ * additive codegen change is the spawn trampoline's landing pad, which only
+ * affects the uncaught-in-goroutine path).
  *
- *   - `spawn f(args)` starts one GC-registered pthread (`GC_pthread_create`)
- *     running `f` on the eagerly-evaluated argument closure. Fire-and-forget:
- *     no handle. The implicit root scope joins every spawned thread at program
- *     exit (`zap_rt_join_all`, emitted at `main`'s return), so a bare `spawn`
- *     is never truly detached (D-0013/D-0033).
- *   - Channels are `channel[T]()` (unbuffered rendezvous) and `channel[T](cap)`
- *     (buffered), with `<-` send/receive and `close`, blocking on a
- *     mutex/condvar (D-0031). Elements are uniform 8-byte words; the typed
- *     entry points reinterpret them as `int64` or pointer.
- *   - Channel/close operations are the happens-before synchronization edges the
- *     DRF-SC model needs (D-0034); the mutex/condvar provide them directly.
+ * The Go M:P:G structure:
+ *   - G  a goroutine: a fixed-size green-thread stack + a saved register
+ *        context, allocated on the GC heap.
+ *   - M  an OS worker thread, GC-registered, that runs Gs.
+ *   - P  a processor context owned by one M, holding a local run queue; idle
+ *        Ms steal from other Ps and from a global run queue (load balance with
+ *        no central lock on the hot path).
  *
- * Because every goroutine runs on a GC-registered OS thread, the collector
- * scans each one's stack and registers, so live objects reachable only from a
- * running goroutine stay alive with no extra GC machinery (the property
- * design/0005 relies on for the green-thread stacks). GC_THREADS (defined above
- * <gc.h>) and GC_pthread_create provide that registration.
+ * Green-thread stacks and the Boehm interaction (design/0005 "Green-thread
+ * stacks"): each G's stack is a `GC_MALLOC` object (non-atomic, pointer-bearing)
+ * and its saved `ucontext_t` lives inside the GC-allocated `G`. So a *suspended*
+ * G's stack and callee-saved registers are retained and conservatively scanned
+ * *as heap* with no stack maps or safepoints — the key trick. Every live G is
+ * additionally kept in the statically-rooted `g_all[]` registry, so a parked G
+ * (otherwise reachable only from a Waiter on its own stack) is never collected.
+ * A *running* G executes on its green stack on some M; so that the collector
+ * scans that stack as the M thread's stack (and does not scan a bogus
+ * cross-stack range), each context switch updates the M thread's GC stack
+ * bottom via `GC_set_stackbottom` (bdwgc's documented coroutine support).
  *
- * DEFERRED (language-visible semantics unchanged; see the PR / OPEN-QUESTIONS):
- * the user-space work-stealing M:N scheduler with green-thread stacks, the
- * `scope:` block and cooperative cancellation, `select`, the comma-ok receive
- * `v, ok = <-ch` and `for v in ch:`, and the `sync` module
- * (Mutex/WaitGroup/Once/Atomic). The runtime ABI here is additive, so these
- * drop in without changing the surface already compiled.
+ * Context switch (design/0005 "Interaction with exception unwinding"):
+ * ucontext `swapcontext` saves/restores callee-saved regs + SP + IP. ARCH
+ * ASSUMPTION: ucontext is available and correct on the Linux x86_64 dev
+ * container (LLVM 18 / glibc). The spawn trampoline is each G's base frame; an
+ * uncaught exception is caught there by a landing pad (codegen), so unwinding
+ * never crosses into the makecontext bootstrap. A G suspended mid-unwind
+ * resumes its unwind correctly because CFI is driven per frame on its own
+ * stack.
+ *
+ * Blocking (design/0005 "Runtime entry points"): channels park the G and free
+ * the M on a scheduler-keyed wait queue rather than blocking the OS thread on a
+ * condvar. A non-goroutine caller (the main thread) instead blocks on a
+ * per-waiter condvar, which parks that OS thread without consuming a worker M.
+ *
+ * DEFERRED (documented in the PR / OPEN-QUESTIONS; semantics unchanged): the
+ * netpoller / blocking-syscall P-handoff, preemption of long CPU loops (v1 is
+ * cooperative — Gs yield only at channel ops), hardware guard pages and
+ * growable/segmented stacks (a PROT_NONE guard page inside a GC_MALLOC object
+ * would break conservative scanning; the spec ties real guard/growable stacks
+ * to the precise-GC era, so v1 uses a fixed stack with a soft overflow check),
+ * and the `sync` module / `scope:` / `select` surface still pending from #25.
  * =========================================================================== */
 
+/* Fixed green-thread stack size (design/0005: 64-256 KiB fixed, no growth in
+ * v1). Overridable via ZAP_STACK_SIZE (KiB) for experimentation. */
+#define ZAP_STACK_DEFAULT (128 * 1024)
+#define ZAP_STACK_REDZONE 8192 /* soft overflow margin checked at park points */
+
+typedef enum { G_RUNNABLE, G_RUNNING, G_PARKED, G_DEAD } GState;
+
+typedef struct G {
+    ucontext_t ctx;    /* saved callee-saved regs + SP + IP (scanned as heap) */
+    void *stack;       /* GC_MALLOC'd green stack buffer (scanned as heap)     */
+    size_t stack_size;
+    struct GC_stack_base sb; /* cold end (high address) of this G's stack      */
+    void *fn;          /* trampoline `void *(*)(void *)` from zap_spawn        */
+    void *arg;         /* closure passed to the trampoline                     */
+    GState state;
+    struct G *link;    /* run-queue / free-list link (a G is in one at a time) */
+    pthread_mutex_t *parkmu; /* chan mutex the scheduler unlocks after parking */
+    int64_t all_idx;   /* index in g_all[] for O(1) removal on death           */
+} G;
+
+typedef struct P {
+    pthread_mutex_t mu; /* guards this P's local deque                         */
+    G *head;            /* LIFO: push/pop at head (locality), steal at tail    */
+    G *tail;
+} P;
+
+typedef struct M {
+    pthread_t thread;
+    ucontext_t sched_ctx;       /* the scheduler loop's context (native stack) */
+    struct GC_stack_base native_sb; /* this M's native stack cold end          */
+    void *gc_handle;            /* GC thread handle for GC_set_stackbottom      */
+    G *current;                 /* G running on this M, or NULL in scheduler    */
+    P *p;                       /* processor this M is attached to              */
+} M;
+
+/* Per-waiter node on a channel's sender/receiver queue. A goroutine waiter
+ * (`g != NULL`) is re-enqueued on the scheduler when woken; a native-thread
+ * waiter blocks on its own condvar. The waker fills `val`/`ok`/`closed` under
+ * the channel lock *before* waking, so the woken waiter reads its outcome
+ * without re-locking. */
+typedef struct Waiter {
+    struct Waiter *next;
+    G *g;                 /* NULL => native-thread (e.g. main) waiter          */
+    pthread_cond_t cv;    /* native waiter only                                */
+    volatile int done;    /* native waiter: set by the waker                   */
+    uint64_t val;         /* send: value offered; recv: value delivered        */
+    int ok;               /* recv: 1 iff a real value was delivered            */
+    int closed;           /* set iff the channel closed while this waiter slept */
+} Waiter;
+
+/* ---- scheduler globals ---------------------------------------------------- */
+static __thread M *cur_m = NULL; /* the M running this thread; NULL on main    */
+
+static M *g_ms = NULL;
+static P *g_ps = NULL;
+static int g_nm = 0;             /* number of Ms / Ps                          */
+
+static pthread_mutex_t g_global_mu = PTHREAD_MUTEX_INITIALIZER; /* global runq */
+static G *g_global_head = NULL;
+static G *g_global_tail = NULL;
+
+static pthread_mutex_t g_idle_mu = PTHREAD_MUTEX_INITIALIZER; /* idle-M parking */
+static pthread_cond_t g_idle_cv = PTHREAD_COND_INITIALIZER;
+static volatile int g_shutdown = 0;
+
+static pthread_mutex_t g_live_mu = PTHREAD_MUTEX_INITIALIZER; /* live-G count   */
+static pthread_cond_t g_live_cv = PTHREAD_COND_INITIALIZER;
+static int64_t g_live = 0;       /* runnable+running+parked Gs (root-scope join) */
+
+/* Statically-rooted registry of every live G, so parked Gs stay reachable. */
+static pthread_mutex_t g_all_mu = PTHREAD_MUTEX_INITIALIZER;
+static G **g_all = NULL;
+static int64_t g_all_len = 0;
+static int64_t g_all_cap = 0;
+
+/* Size-classed free list of finished Gs (one class: the fixed stack size). */
+static pthread_mutex_t g_free_mu = PTHREAD_MUTEX_INITIALIZER;
+static G *g_free_head = NULL;
+
+static size_t zap_stack_size(void) {
+    static size_t sz = 0;
+    if (sz == 0) {
+        sz = ZAP_STACK_DEFAULT;
+        const char *e = getenv("ZAP_STACK_SIZE");
+        if (e) {
+            long kib = atol(e);
+            if (kib >= 32 && kib <= 8192) {
+                sz = (size_t)kib * 1024;
+            }
+        }
+    }
+    return sz;
+}
+
+/* ---- GC stack-bottom tracking across switches ----------------------------- */
+/* Point the current M thread's conservatively-scanned stack at `sb`. Wrapped in
+ * the GC alloc lock (as bdwgc advises) so a concurrent collection never reads a
+ * half-updated bottom. The brief window between this and the swapcontext that
+ * moves SP is the same one bdwgc fiber runtimes accept; green stacks are also
+ * scanned as heap, so no root is ever missed. */
+struct sb_arg {
+    void *handle;
+    struct GC_stack_base *sb;
+};
+static void *set_bottom_locked(void *p) {
+    struct sb_arg *a = (struct sb_arg *)p;
+    GC_set_stackbottom(a->handle, a->sb);
+    return NULL;
+}
+static void set_bottom(M *m, struct GC_stack_base *sb) {
+    struct sb_arg a; /* per-call, on the caller's stack: no cross-M race */
+    a.handle = m->gc_handle;
+    a.sb = sb;
+    GC_call_with_alloc_lock(set_bottom_locked, &a);
+}
+
+/* ---- run queues ----------------------------------------------------------- */
+static void global_push(G *g) {
+    pthread_mutex_lock(&g_global_mu);
+    g->link = NULL;
+    if (g_global_tail) {
+        g_global_tail->link = g;
+    } else {
+        g_global_head = g;
+    }
+    g_global_tail = g;
+    pthread_mutex_unlock(&g_global_mu);
+}
+static G *global_pop(void) {
+    pthread_mutex_lock(&g_global_mu);
+    G *g = g_global_head;
+    if (g) {
+        g_global_head = g->link;
+        if (!g_global_head) {
+            g_global_tail = NULL;
+        }
+        g->link = NULL;
+    }
+    pthread_mutex_unlock(&g_global_mu);
+    return g;
+}
+static void p_push(P *p, G *g) {
+    pthread_mutex_lock(&p->mu);
+    g->link = p->head;
+    p->head = g;
+    if (!p->tail) {
+        p->tail = g;
+    }
+    pthread_mutex_unlock(&p->mu);
+}
+static G *p_pop(P *p) { /* LIFO from head (owner) */
+    pthread_mutex_lock(&p->mu);
+    G *g = p->head;
+    if (g) {
+        p->head = g->link;
+        if (!p->head) {
+            p->tail = NULL;
+        }
+        g->link = NULL;
+    }
+    pthread_mutex_unlock(&p->mu);
+    return g;
+}
+static G *p_steal(P *p) { /* FIFO from tail (thief) */
+    pthread_mutex_lock(&p->mu);
+    G *g = p->head, *prev = NULL;
+    if (g) {
+        while (g->link) {
+            prev = g;
+            g = g->link;
+        }
+        if (prev) {
+            prev->link = NULL;
+            p->tail = prev;
+        } else {
+            p->head = p->tail = NULL;
+        }
+        g->link = NULL;
+    }
+    pthread_mutex_unlock(&p->mu);
+    return g;
+}
+
+/* Make `g` runnable: push to the current M's P (locality) or the global queue,
+ * then wake one idle M. */
+static void sched_enqueue(G *g) {
+    g->state = G_RUNNABLE;
+    if (cur_m && cur_m->p) {
+        p_push(cur_m->p, g);
+    } else {
+        global_push(g);
+    }
+    pthread_mutex_lock(&g_idle_mu);
+    pthread_cond_signal(&g_idle_cv);
+    pthread_mutex_unlock(&g_idle_mu);
+}
+
+static G *sched_find_runnable(M *m) {
+    for (;;) {
+        G *g = p_pop(m->p);
+        if (g) {
+            return g;
+        }
+        g = global_pop();
+        if (g) {
+            return g;
+        }
+        for (int i = 0; i < g_nm; i++) {
+            if (&g_ps[i] != m->p) {
+                g = p_steal(&g_ps[i]);
+                if (g) {
+                    return g;
+                }
+            }
+        }
+        /* Nothing to run: park this M until work arrives or we shut down. A
+         * short timed wait re-polls, closing any enqueue/signal lost-wakeup. */
+        pthread_mutex_lock(&g_idle_mu);
+        if (g_shutdown) {
+            pthread_mutex_unlock(&g_idle_mu);
+            return NULL;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 1000000; /* 1 ms */
+        if (ts.tv_nsec >= 1000000000) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait(&g_idle_cv, &g_idle_mu, &ts);
+        pthread_mutex_unlock(&g_idle_mu);
+    }
+}
+
+/* Scheduler-side switch into `g`. Brackets the swapcontext with the GC
+ * stack-bottom update so the collector always scans the correct stack for this
+ * M. On return the G has either parked (unlock the channel mutex it asked us to
+ * release, completing the park/wake handoff) or finished (reclaim it). */
+static void gfree(G *g);
+static void sched_gdone(void);
+static void switch_to_g(M *m, G *g) {
+    m->current = g;
+    g->state = G_RUNNING;
+    set_bottom(m, &g->sb);
+    swapcontext(&m->sched_ctx, &g->ctx);
+    set_bottom(m, &m->native_sb);
+    m->current = NULL;
+    if (g->state == G_PARKED) {
+        if (g->parkmu) {
+            pthread_mutex_t *mu = g->parkmu;
+            g->parkmu = NULL;
+            pthread_mutex_unlock(mu);
+        }
+    } else if (g->state == G_DEAD) {
+        gfree(g);
+        sched_gdone();
+    }
+}
+
+static void *g_entry_fn(G *g); /* fwd */
+
+/* The makecontext bootstrap: runs on the green stack. Re-reads `cur_m` after
+ * the call returns because a G may be resumed on a different M than it started
+ * on. Never returns — switches back to whatever M's scheduler is running it. */
+static void g_bootstrap(void) {
+    M *m = cur_m;
+    G *g = m->current;
+    g_entry_fn(g);
+    m = cur_m; /* may have migrated across parks */
+    g->state = G_DEAD;
+    swapcontext(&g->ctx, &m->sched_ctx);
+    /* unreachable */
+}
+
+static void *g_entry_fn(G *g) {
+    void *(*fn)(void *) = (void *(*)(void *))g->fn;
+    return fn(g->arg);
+}
+
+/* ---- worker thread -------------------------------------------------------- */
+static void *worker_main(void *arg) {
+    M *m = (M *)arg;
+    cur_m = m;
+    /* This thread was created by GC_pthread_create, so it is registered; record
+     * its GC handle + native stack bottom for the switch bracketing. */
+    struct GC_stack_base sb;
+    m->gc_handle = GC_get_my_stackbottom(&sb);
+    m->native_sb = sb;
+    for (;;) {
+        G *g = sched_find_runnable(m);
+        if (!g) {
+            return NULL; /* shutdown */
+        }
+        switch_to_g(m, g);
+    }
+}
+
+/* ---- G lifecycle ---------------------------------------------------------- */
+static void all_add(G *g) {
+    pthread_mutex_lock(&g_all_mu);
+    if (g_all_len == g_all_cap) {
+        int64_t ncap = g_all_cap ? g_all_cap * 2 : 16;
+        G **n = (G **)GC_MALLOC((size_t)ncap * sizeof(G *));
+        if (g_all) {
+            memcpy(n, g_all, (size_t)g_all_len * sizeof(G *));
+        }
+        g_all = n;
+        g_all_cap = ncap;
+    }
+    g->all_idx = g_all_len;
+    g_all[g_all_len++] = g;
+    pthread_mutex_unlock(&g_all_mu);
+}
+static void all_remove(G *g) {
+    pthread_mutex_lock(&g_all_mu);
+    int64_t i = g->all_idx;
+    if (i >= 0 && i < g_all_len && g_all[i] == g) {
+        G *last = g_all[--g_all_len];
+        g_all[i] = last;
+        last->all_idx = i;
+        g_all[g_all_len] = NULL;
+    }
+    pthread_mutex_unlock(&g_all_mu);
+}
+
+static G *galloc(void *fn, void *arg) {
+    size_t ss = zap_stack_size();
+    G *g = NULL;
+    pthread_mutex_lock(&g_free_mu);
+    if (g_free_head) {
+        g = g_free_head;
+        g_free_head = g->link;
+    }
+    pthread_mutex_unlock(&g_free_mu);
+    if (!g) {
+        g = (G *)GC_MALLOC(sizeof(G));
+        g->stack = GC_MALLOC(ss); /* pointer-bearing: scanned as heap */
+        g->stack_size = ss;
+    }
+    g->fn = fn;
+    g->arg = arg;
+    g->state = G_RUNNABLE;
+    g->link = NULL;
+    g->parkmu = NULL;
+    /* Cold end of a down-growing stack is its high address. */
+    g->sb.mem_base = (char *)g->stack + g->stack_size;
+    getcontext(&g->ctx);
+    g->ctx.uc_stack.ss_sp = g->stack;
+    g->ctx.uc_stack.ss_size = g->stack_size;
+    g->ctx.uc_link = NULL; /* bootstrap never returns */
+    makecontext(&g->ctx, g_bootstrap, 0);
+    all_add(g);
+    return g;
+}
+
+static void gfree(G *g) {
+    all_remove(g);
+    g->fn = NULL;
+    g->arg = NULL;
+    /* Keep the stack buffer for reuse (size-classed free list, one class). */
+    pthread_mutex_lock(&g_free_mu);
+    g->link = g_free_head;
+    g_free_head = g;
+    pthread_mutex_unlock(&g_free_mu);
+}
+
+static void sched_gdone(void) {
+    pthread_mutex_lock(&g_live_mu);
+    if (--g_live == 0) {
+        pthread_cond_broadcast(&g_live_cv);
+    }
+    pthread_mutex_unlock(&g_live_mu);
+}
+
+/* ---- scheduler init (lazy, on first spawn) -------------------------------- */
+static pthread_once_t g_sched_once = PTHREAD_ONCE_INIT;
+
+static int zap_maxprocs(void) {
+    const char *e = getenv("ZAP_MAXPROCS");
+    if (e) {
+        long n = atol(e);
+        if (n >= 1 && n <= 1024) {
+            return (int)n;
+        }
+    }
+    long hw = sysconf(_SC_NPROCESSORS_ONLN);
+    if (hw < 1) {
+        hw = 1;
+    }
+    if (hw > 256) {
+        hw = 256;
+    }
+    return (int)hw;
+}
+
+static void zap_sched_init_once(void) {
+    g_nm = zap_maxprocs();
+    g_ps = (P *)GC_MALLOC((size_t)g_nm * sizeof(P));
+    g_ms = (M *)GC_MALLOC((size_t)g_nm * sizeof(M));
+    for (int i = 0; i < g_nm; i++) {
+        pthread_mutex_init(&g_ps[i].mu, NULL);
+        g_ps[i].head = g_ps[i].tail = NULL;
+        memset(&g_ms[i], 0, sizeof(M));
+        g_ms[i].p = &g_ps[i];
+    }
+    for (int i = 0; i < g_nm; i++) {
+        int rc = GC_pthread_create(&g_ms[i].thread, NULL, worker_main, &g_ms[i]);
+        if (rc != 0) {
+            fprintf(stderr, "zap: failed to start scheduler thread (%d)\n", rc);
+            abort();
+        }
+    }
+}
+
+/* `zap_sched_init(n_threads)` — the design's named entry point. A value <= 0
+ * means "use the default" (ZAP_MAXPROCS / hardware threads). The scheduler is
+ * started at most once; an explicit n only takes effect if it is the first call
+ * (before any spawn), honoring the env override otherwise. */
+void zap_sched_init(int64_t n_threads) {
+    if (n_threads > 0 && !g_ms) {
+        /* Seed the env-less default so zap_maxprocs picks this up. */
+        static char buf[32];
+        if (!getenv("ZAP_MAXPROCS")) {
+            snprintf(buf, sizeof(buf), "%lld", (long long)n_threads);
+            setenv("ZAP_MAXPROCS", buf, 0);
+        }
+    }
+    pthread_once(&g_sched_once, zap_sched_init_once);
+}
+
+/* ---- spawn + root-scope join ---------------------------------------------- */
+/* `zap_spawn(trampoline, closure)` keeps #25's signature. The trampoline is the
+ * codegen-synthesized `void *(*)(void *)` that unpacks the eagerly-evaluated
+ * argument closure and calls the target; here it becomes a new G enqueued on the
+ * scheduler (G alloc + enqueue, design/0005 "Runtime entry points"). */
+void zap_spawn(void *fn_, void *arg) {
+    zap_sched_init(0);
+    pthread_mutex_lock(&g_live_mu);
+    g_live++;
+    pthread_mutex_unlock(&g_live_mu);
+    G *g = galloc(fn_, arg);
+    sched_enqueue(g);
+}
+
+/* The implicit root scope's join at program exit (emitted at `main`'s return):
+ * block until every spawned G (and its descendants) has finished, then stop the
+ * worker Ms. A no-op if nothing ever spawned (scheduler never started). */
+void zap_rt_join_all(void) {
+    if (!g_ms) {
+        return;
+    }
+    pthread_mutex_lock(&g_live_mu);
+    while (g_live > 0) {
+        pthread_cond_wait(&g_live_cv, &g_live_mu);
+    }
+    pthread_mutex_unlock(&g_live_mu);
+    pthread_mutex_lock(&g_idle_mu);
+    g_shutdown = 1;
+    pthread_cond_broadcast(&g_idle_cv);
+    pthread_mutex_unlock(&g_idle_mu);
+    for (int i = 0; i < g_nm; i++) {
+        GC_pthread_join(g_ms[i].thread, NULL);
+    }
+}
+
+/* ---- channels ------------------------------------------------------------- */
+/* Rewritten onto the scheduler's park/wake (design/0005: "a blocked coroutine
+ * parks its G and frees its M"). The channel lock is a plain pthread mutex held
+ * only for the brief critical section; blocking happens via `chan_block`, not a
+ * condvar wait on that mutex. Unbuffered rendezvous + buffered + close/comma-ok
+ * semantics are identical to #25. */
 typedef struct {
     pthread_mutex_t mu;
-    pthread_cond_t not_full;  /* buffered: space available; unbuffered: slot emptied */
-    pthread_cond_t not_empty; /* buffered: item available; unbuffered: slot filled   */
-    pthread_cond_t drained;   /* unbuffered: the handed-off value was taken          */
-    pthread_mutex_t send_mu;  /* unbuffered: serializes senders through the slot     */
-    uint64_t *buf;            /* `cap` element words (buffered); NULL when unbuffered */
-    int64_t cap;              /* buffer capacity; 0 => unbuffered rendezvous          */
-    int64_t count;            /* items currently buffered                            */
-    int64_t head;             /* next slot to read                                   */
-    int64_t tail;             /* next slot to write                                  */
+    uint64_t *buf; /* ring buffer (buffered); NULL when unbuffered */
+    int64_t cap;   /* 0 => unbuffered rendezvous */
+    int64_t count;
+    int64_t head;
+    int64_t tail;
     int closed;
-    uint64_t u_slot; /* unbuffered rendezvous hand-off slot                 */
-    int u_has;       /* a sender has deposited a value awaiting a receiver  */
+    Waiter *sendq_head, *sendq_tail; /* senders waiting (val = offered value) */
+    Waiter *recvq_head, *recvq_tail; /* receivers waiting (to be filled)      */
 } ZapChan;
 
-/* `channel[T]()` / `channel[T](cap)`. The buffer is GC_MALLOC (pointer-scanned,
- * not atomic) so a pointer-element channel keeps its queued references alive. */
+static void q_push(Waiter **head, Waiter **tail, Waiter *w) {
+    w->next = NULL;
+    if (*tail) {
+        (*tail)->next = w;
+    } else {
+        *head = w;
+    }
+    *tail = w;
+}
+static Waiter *q_pop(Waiter **head, Waiter **tail) {
+    Waiter *w = *head;
+    if (w) {
+        *head = w->next;
+        if (!*head) {
+            *tail = NULL;
+        }
+        w->next = NULL;
+    }
+    return w;
+}
+
+/* Wake a waiter the current thread has just resolved (its outcome is already
+ * written). Called holding the channel lock. */
+static void goready(Waiter *w) {
+    if (w->g) {
+        sched_enqueue(w->g);
+    } else {
+        w->done = 1;
+        pthread_cond_signal(&w->cv);
+    }
+}
+
+/* Block the current execution context on channel `c` (lock held on entry). The
+ * waiter `w` is already enqueued on the relevant channel queue. Releases the
+ * channel lock while blocked and guarantees it is released on return; the
+ * waiter's outcome has been written by the waker. A goroutine parks its G and
+ * frees its M; a non-goroutine (main) thread blocks on the waiter's condvar. */
+static void chan_block(ZapChan *c, Waiter *w) {
+    M *m = cur_m;
+    if (m && m->current) {
+        G *g = m->current;
+        /* Soft stack-overflow guard at this scheduling point (no hardware guard
+         * page under conservative GC; see the section header). */
+        char probe;
+        if ((char *)&probe - (char *)g->stack < ZAP_STACK_REDZONE) {
+            pthread_mutex_unlock(&c->mu);
+            zap_panic(zap_str_new("stack overflow", 14));
+            return;
+        }
+        w->g = g;
+        g->state = G_PARKED;
+        g->parkmu = &c->mu; /* scheduler unlocks once we are fully parked */
+        swapcontext(&g->ctx, &m->sched_ctx);
+        /* Resumed (possibly on a different M); channel lock already released. */
+    } else {
+        w->g = NULL;
+        pthread_cond_init(&w->cv, NULL);
+        w->done = 0;
+        while (!w->done) {
+            pthread_cond_wait(&w->cv, &c->mu);
+        }
+        pthread_mutex_unlock(&c->mu);
+    }
+}
+
 void *zap_chan_new(int64_t cap) {
     ZapChan *c = (ZapChan *)GC_MALLOC(sizeof(ZapChan));
     pthread_mutex_init(&c->mu, NULL);
-    pthread_cond_init(&c->not_full, NULL);
-    pthread_cond_init(&c->not_empty, NULL);
-    pthread_cond_init(&c->drained, NULL);
-    pthread_mutex_init(&c->send_mu, NULL);
     c->cap = cap > 0 ? cap : 0;
     c->buf = c->cap > 0
                  ? (uint64_t *)GC_MALLOC((size_t)c->cap * sizeof(uint64_t))
                  : NULL;
-    c->count = 0;
-    c->head = 0;
-    c->tail = 0;
+    c->count = c->head = c->tail = 0;
     c->closed = 0;
-    c->u_slot = 0;
-    c->u_has = 0;
+    c->sendq_head = c->sendq_tail = NULL;
+    c->recvq_head = c->recvq_tail = NULL;
     return c;
 }
 
-/* `send on a closed channel` is a programming error that raises (D-0031).
- * Releases the channel lock (and, when given, the unbuffered send lock) before
- * raising so the channel is left in a consistent, unlocked state. */
-static void chan_send_closed(ZapChan *c, pthread_mutex_t *also) {
-    pthread_mutex_unlock(&c->mu);
-    if (also) {
-        pthread_mutex_unlock(also);
-    }
-    zap_panic(zap_str_new("send on closed channel", 22));
-}
-
 static void chan_send_word(ZapChan *c, uint64_t v) {
-    if (c->cap > 0) {
-        pthread_mutex_lock(&c->mu);
-        while (c->count == c->cap && !c->closed) {
-            pthread_cond_wait(&c->not_full, &c->mu);
-        }
-        if (c->closed) {
-            chan_send_closed(c, NULL);
-            return;
-        }
+    pthread_mutex_lock(&c->mu);
+    if (c->closed) {
+        pthread_mutex_unlock(&c->mu);
+        zap_panic(zap_str_new("send on closed channel", 22));
+        return;
+    }
+    /* A waiting receiver takes the value directly (rendezvous / fast path). */
+    if (c->count == 0 && c->recvq_head) {
+        Waiter *r = q_pop(&c->recvq_head, &c->recvq_tail);
+        r->val = v;
+        r->ok = 1;
+        goready(r);
+        pthread_mutex_unlock(&c->mu);
+        return;
+    }
+    if (c->cap > 0 && c->count < c->cap) {
         c->buf[c->tail] = v;
         c->tail = (c->tail + 1) % c->cap;
         c->count++;
-        pthread_cond_signal(&c->not_empty);
         pthread_mutex_unlock(&c->mu);
-    } else {
-        /* Rendezvous: only one sender occupies the hand-off slot at a time
-         * (`send_mu`), so the slot's `u_has` flag unambiguously tracks *this*
-         * sender's value — deposit it, wake a receiver, then block until the
-         * receiver takes it, so the send does not complete until a receive does
-         * (true unbuffered semantics, correct for many concurrent senders). */
-        pthread_mutex_lock(&c->send_mu);
-        pthread_mutex_lock(&c->mu);
-        if (c->closed) {
-            chan_send_closed(c, &c->send_mu);
-            return;
-        }
-        c->u_slot = v;
-        c->u_has = 1;
-        pthread_cond_signal(&c->not_empty);
-        while (c->u_has && !c->closed) {
-            pthread_cond_wait(&c->drained, &c->mu);
-        }
-        if (c->u_has && c->closed) {
-            c->u_has = 0;
-            chan_send_closed(c, &c->send_mu);
-            return;
-        }
-        pthread_mutex_unlock(&c->mu);
-        pthread_mutex_unlock(&c->send_mu);
+        return;
+    }
+    /* Would block: unbuffered with no receiver, or buffer full. Park as a
+     * sender; the matching receiver delivers/buffers our value and wakes us. */
+    Waiter w;
+    w.val = v;
+    w.ok = 0;
+    w.closed = 0;
+    q_push(&c->sendq_head, &c->sendq_tail, &w);
+    chan_block(c, &w); /* channel lock released inside */
+    if (w.closed) {
+        zap_panic(zap_str_new("send on closed channel", 22));
     }
 }
 
-/* Receive one word. `*ok` is set to 1 on a real value, 0 when the channel is
- * closed and drained (the zero-value case the comma-ok form will surface). */
 static uint64_t chan_recv_word(ZapChan *c, int *ok) {
     pthread_mutex_lock(&c->mu);
-    if (c->cap > 0) {
-        while (c->count == 0 && !c->closed) {
-            pthread_cond_wait(&c->not_empty, &c->mu);
-        }
-        if (c->count == 0 && c->closed) {
-            pthread_mutex_unlock(&c->mu);
-            if (ok) {
-                *ok = 0;
-            }
-            return 0;
-        }
+    /* Buffered value available: take it, then let a waiting sender refill. */
+    if (c->count > 0) {
         uint64_t v = c->buf[c->head];
         c->head = (c->head + 1) % c->cap;
         c->count--;
-        pthread_cond_signal(&c->not_full);
-        pthread_mutex_unlock(&c->mu);
-        if (ok) {
-            *ok = 1;
+        Waiter *s = q_pop(&c->sendq_head, &c->sendq_tail);
+        if (s) {
+            c->buf[c->tail] = s->val;
+            c->tail = (c->tail + 1) % c->cap;
+            c->count++;
+            s->ok = 1;
+            goready(s);
         }
-        return v;
-    } else {
-        while (!c->u_has && !c->closed) {
-            pthread_cond_wait(&c->not_empty, &c->mu);
-        }
-        if (!c->u_has && c->closed) {
-            pthread_mutex_unlock(&c->mu);
-            if (ok) {
-                *ok = 0;
-            }
-            return 0;
-        }
-        uint64_t v = c->u_slot;
-        c->u_has = 0;
-        pthread_cond_signal(&c->drained);  /* wake the matched sender */
-        pthread_cond_signal(&c->not_full); /* let another sender deposit */
         pthread_mutex_unlock(&c->mu);
         if (ok) {
             *ok = 1;
         }
         return v;
     }
+    /* A waiting sender hands its value over directly (rendezvous). */
+    if (c->sendq_head) {
+        Waiter *s = q_pop(&c->sendq_head, &c->sendq_tail);
+        uint64_t v = s->val;
+        s->ok = 1;
+        goready(s);
+        pthread_mutex_unlock(&c->mu);
+        if (ok) {
+            *ok = 1;
+        }
+        return v;
+    }
+    if (c->closed) {
+        pthread_mutex_unlock(&c->mu);
+        if (ok) {
+            *ok = 0;
+        }
+        return 0;
+    }
+    /* Would block: park as a receiver; a sender (or close) wakes us. */
+    Waiter w;
+    w.val = 0;
+    w.ok = 0;
+    w.closed = 0;
+    q_push(&c->recvq_head, &c->recvq_tail, &w);
+    chan_block(c, &w); /* channel lock released inside */
+    if (ok) {
+        *ok = w.ok;
+    }
+    return w.ok ? w.val : 0;
 }
 
 void zap_chan_send_i64(void *ch, int64_t v) {
@@ -1363,63 +1902,18 @@ void zap_chan_close(void *ch) {
     ZapChan *c = (ZapChan *)ch;
     pthread_mutex_lock(&c->mu);
     c->closed = 1;
-    pthread_cond_broadcast(&c->not_empty);
-    pthread_cond_broadcast(&c->not_full);
-    pthread_cond_broadcast(&c->drained);
+    /* Waiting senders fail (send on closed); waiting receivers drain to the
+     * closed zero-value with ok == 0. */
+    Waiter *w;
+    while ((w = q_pop(&c->sendq_head, &c->sendq_tail)) != NULL) {
+        w->closed = 1;
+        w->ok = 0;
+        goready(w);
+    }
+    while ((w = q_pop(&c->recvq_head, &c->recvq_tail)) != NULL) {
+        w->ok = 0;
+        w->val = 0;
+        goready(w);
+    }
     pthread_mutex_unlock(&c->mu);
-}
-
-/* --- goroutine spawn + root-scope join -------------------------------------
- *
- * The registry tracks every spawned thread so the root scope can join them all
- * at program exit. It grows under its own lock; goroutines that spawn further
- * goroutines append to the same registry, and `zap_rt_join_all` keeps joining
- * until the list is drained (so the whole coroutine tree completes). */
-static pthread_mutex_t zap_threads_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t *zap_threads = NULL;
-static int64_t zap_threads_len = 0;
-static int64_t zap_threads_cap = 0;
-static int64_t zap_threads_joined = 0;
-
-/* `zap_spawn(trampoline, closure)`: start a GC-registered thread running
- * `trampoline(closure)`. `GC_pthread_create` registers the new thread with the
- * collector so its stack and registers are scanned (keeping objects reachable
- * only from the running goroutine alive). */
-void zap_spawn(void *fn_, void *arg) {
-    void *(*fn)(void *) = (void *(*)(void *))fn_;
-    pthread_t t;
-    int rc = GC_pthread_create(&t, NULL, fn, arg);
-    if (rc != 0) {
-        fprintf(stderr, "zap: failed to spawn coroutine (pthread_create: %d)\n", rc);
-        abort();
-    }
-    pthread_mutex_lock(&zap_threads_mu);
-    if (zap_threads_len == zap_threads_cap) {
-        int64_t ncap = zap_threads_cap ? zap_threads_cap * 2 : 8;
-        pthread_t *n =
-            (pthread_t *)GC_MALLOC_ATOMIC((size_t)ncap * sizeof(pthread_t));
-        if (zap_threads) {
-            memcpy(n, zap_threads, (size_t)zap_threads_len * sizeof(pthread_t));
-        }
-        zap_threads = n;
-        zap_threads_cap = ncap;
-    }
-    zap_threads[zap_threads_len++] = t;
-    pthread_mutex_unlock(&zap_threads_mu);
-}
-
-/* Join every spawned coroutine (the implicit root scope's join at program
- * exit). Re-reads the length each iteration so coroutines spawned by other
- * coroutines are joined too. */
-void zap_rt_join_all(void) {
-    for (;;) {
-        pthread_mutex_lock(&zap_threads_mu);
-        if (zap_threads_joined >= zap_threads_len) {
-            pthread_mutex_unlock(&zap_threads_mu);
-            return;
-        }
-        pthread_t t = zap_threads[zap_threads_joined++];
-        pthread_mutex_unlock(&zap_threads_mu);
-        GC_pthread_join(t, NULL);
-    }
 }
