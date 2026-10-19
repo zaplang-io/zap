@@ -52,6 +52,58 @@ mod tests {
     }
 
     #[test]
+    fn lower_assert_power_diagnostics() {
+        // A comparison assert evaluates each operand once and, in the failure
+        // block, renders the source text plus both operand values.
+        let m = lower_ok("def main():\n    int64 x = 2\n    assert x == 3\n");
+        let text = format!("{m}");
+        assert!(text.contains("br_if"), "assert should branch:\n{text}");
+        assert!(
+            text.contains("\\n  assert x == 3"),
+            "power-assert should echo the source:\n{text}"
+        );
+        assert!(
+            text.contains("left:") && text.contains("right:"),
+            "power-assert should show both operands:\n{text}"
+        );
+        assert!(text.contains("zap_panic"), "failure raises:\n{text}");
+    }
+
+    #[test]
+    fn lower_assert_with_message() {
+        let m = lower_ok("def main():\n    assert False, \"nope\"\n");
+        let text = format!("{m}");
+        assert!(
+            text.contains("strconst \"nope\""),
+            "message literal:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lower_with_expect_raises() {
+        let m = lower_ok(
+            "def boom():\n    raise \"x\"\n\
+             def main():\n    with expect_raises(ValueError):\n        boom()\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("expected ValueError to be raised"),
+            "miss message present:\n{text}"
+        );
+    }
+
+    #[test]
+    fn with_general_context_manager_is_rejected() {
+        let (ast, _p, _l) =
+            parse_str("def main():\n    with open(\"f\") as fh:\n        print(1)\n");
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            !errs.is_empty(),
+            "general `with` should be rejected for now"
+        );
+    }
+
+    #[test]
     fn print_and_arithmetic() {
         let m = lower_ok("def main():\n    print(1 + 2 * 3)\n");
         let main = &m.funcs[0];

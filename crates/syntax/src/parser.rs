@@ -24,7 +24,14 @@ pub struct ParseError {
 
 /// Parse a token stream into a module plus any errors.
 pub fn parse(tokens: Vec<Token>) -> (Module, Vec<ParseError>) {
-    let mut p = Parser::new(tokens);
+    parse_with_source(tokens, "")
+}
+
+/// Like [`parse`], but with the original source so nodes that need to echo the
+/// exact source text (e.g. `assert` for power-assert diagnostics, D-0054) can
+/// slice it by span.
+pub fn parse_with_source(tokens: Vec<Token>, src: &str) -> (Module, Vec<ParseError>) {
+    let mut p = Parser::new(tokens, src);
     let module = p.parse_module();
     (module, p.errors)
 }
@@ -33,7 +40,7 @@ pub fn parse(tokens: Vec<Token>) -> (Module, Vec<ParseError>) {
 /// errors.
 pub fn parse_str(src: &str) -> (Module, Vec<ParseError>, Vec<crate::lexer::LexError>) {
     let (tokens, lex_errors) = tokenize(src);
-    let (module, parse_errors) = parse(tokens);
+    let (module, parse_errors) = parse_with_source(tokens, src);
     (module, parse_errors, lex_errors)
 }
 
@@ -41,10 +48,13 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     errors: Vec<ParseError>,
+    /// The original source, kept so a node can echo its exact spelling by span
+    /// (power-assert, D-0054). Empty when the source was not supplied.
+    src: String,
 }
 
 impl Parser {
-    fn new(mut toks: Vec<Token>) -> Parser {
+    fn new(mut toks: Vec<Token>, src: &str) -> Parser {
         if toks.last().map(|t| &t.kind) != Some(&TokenKind::Eof) {
             let end = toks.last().map(|t| t.span.end).unwrap_or(0);
             toks.push(Token::new(TokenKind::Eof, Span::empty_at(end)));
@@ -53,6 +63,22 @@ impl Parser {
             toks,
             pos: 0,
             errors: Vec::new(),
+            src: src.to_string(),
+        }
+    }
+
+    /// The exact source text covered by `span`, or `""` when the source was not
+    /// provided or the span is out of range.
+    fn source_slice(&self, span: Span) -> &str {
+        let (lo, hi) = (span.start as usize, span.end as usize);
+        if lo <= hi
+            && hi <= self.src.len()
+            && self.src.is_char_boundary(lo)
+            && self.src.is_char_boundary(hi)
+        {
+            &self.src[lo..hi]
+        } else {
+            ""
         }
     }
 
@@ -914,6 +940,25 @@ impl Parser {
             };
             return Stmt::Raise {
                 value,
+                span: self.span_from(start),
+            };
+        }
+        if self.eat_kw(Keyword::Assert) {
+            // `assert cond [, msg]` (D-0054). The condition's source span is
+            // captured so power-assert can echo the exact expression text.
+            let cond_start = self.peek_span().start;
+            let cond = self.parse_expr();
+            let cond_src = self.source_slice(Span::new(cond_start, self.prev_end()));
+            let cond_src = cond_src.trim().to_string();
+            let msg = if self.eat(&TokenKind::Comma) {
+                Some(self.parse_expr())
+            } else {
+                None
+            };
+            return Stmt::Assert {
+                cond,
+                msg,
+                cond_src,
                 span: self.span_from(start),
             };
         }
@@ -2021,6 +2066,30 @@ mod tests {
             }
             _ => panic!("expected function"),
         }
+    }
+
+    #[test]
+    fn assert_captures_condition_source() {
+        let m = parse_ok("def main():\n    assert x + 1 == y, \"msg\"\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected function");
+        };
+        match &f.body.stmts[0] {
+            Stmt::Assert { cond_src, msg, .. } => {
+                assert_eq!(cond_src, "x + 1 == y");
+                assert!(msg.is_some(), "message should be parsed");
+            }
+            other => panic!("expected an assert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assert_without_message_parses() {
+        let m = parse_ok("def main():\n    assert ok\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected function");
+        };
+        assert!(matches!(&f.body.stmts[0], Stmt::Assert { msg: None, .. }));
     }
 
     #[test]

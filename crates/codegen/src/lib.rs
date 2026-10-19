@@ -526,6 +526,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // (metadata registered at startup, queried by `reflect_has`/`reflect_names`).
         self.declare_rt("zap_i64_to_str", &[i.into()], Some(p.into()));
         self.declare_rt("zap_str_eq", &[p.into(), p.into()], Some(i.into()));
+        // Power-assert value rendering (ticket #73, D-0054).
+        self.declare_rt("zap_f64_to_str", &[f.into()], Some(p.into()));
+        self.declare_rt("zap_bool_to_str", &[i.into()], Some(p.into()));
         self.declare_rt("zap_reflect_register", &[p.into(), p.into()], None);
         self.declare_rt("zap_reflect_has", &[p.into(), p.into()], Some(i.into()));
         self.declare_rt("zap_reflect_names", &[p.into()], Some(p.into()));

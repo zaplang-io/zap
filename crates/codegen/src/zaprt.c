@@ -1158,6 +1158,19 @@ void *zap_i64_to_str(int64_t v) {
     return zap_str_new(tmp, (int64_t)n);
 }
 
+/* Decimal string for a double (used by power-assert diagnostics, D-0054).
+ * `%g` keeps the rendering compact and round-trippable for typical values. */
+void *zap_f64_to_str(double v) {
+    char tmp[32];
+    int n = snprintf(tmp, sizeof(tmp), "%g", v);
+    return zap_str_new(tmp, (int64_t)n);
+}
+
+/* `"True"` / `"False"` for a boolean (power-assert diagnostics, D-0054). */
+void *zap_bool_to_str(int64_t v) {
+    return v ? zap_str_new("True", 4) : zap_str_new("False", 5);
+}
+
 /* Content equality of two Zap strings (1 = equal), for `@derive(Eq)`. */
 int64_t zap_str_eq(void *a, void *b) {
     ZapStr *x = (ZapStr *)a;

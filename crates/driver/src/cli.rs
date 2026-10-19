@@ -40,8 +40,12 @@ pub enum Command {
     Remove,
     /// `zap zenv <...>` — stub (project environment, issue #69).
     Zenv,
-    /// `zap test [--watch]` — stub (`@test` framework, issue #73).
-    Test { watch: bool },
+    /// `zap test [file] [--json] [--watch]` — run the `@test` suite (D-0054).
+    Test {
+        file: Option<String>,
+        json: bool,
+        watch: bool,
+    },
     /// `zap mcp` — stub (agent MCP server, issue #72).
     Mcp,
     /// `zap version`.
@@ -98,9 +102,27 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         "add" => Ok(Command::Add),
         "remove" => Ok(Command::Remove),
         "zenv" => Ok(Command::Zenv),
-        "test" => Ok(Command::Test {
-            watch: rest.iter().any(|a| a == "--watch"),
-        }),
+        "test" => {
+            let mut file = None;
+            let mut json = false;
+            let mut watch = false;
+            for a in rest {
+                match a.as_str() {
+                    "--json" => json = true,
+                    "--watch" => watch = true,
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unknown flag `{flag}`"));
+                    }
+                    f => {
+                        if file.is_some() {
+                            return Err(format!("unexpected extra argument `{f}`"));
+                        }
+                        file = Some(f.to_string());
+                    }
+                }
+            }
+            Ok(Command::Test { file, json, watch })
+        }
         "mcp" => Ok(Command::Mcp),
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
@@ -181,7 +203,7 @@ pub fn execute(cmd: Command) -> ExitCode {
             "the project environment (zenv)",
             "issue #69 (package manager, D-0052)",
         ),
-        Command::Test { .. } => stub("the test runner", "issue #73 (the @test framework, D-0054)"),
+        Command::Test { file, json, watch } => cmd_test(file, json, watch),
         Command::Mcp => stub("the agent MCP server", "issue #72 (zap mcp, D-0055)"),
         Command::Version => {
             println!("zap {}", crate::VERSION);
@@ -326,6 +348,20 @@ fn main_template(project: &str) -> String {
     format!("def main():\n    print(\"Hello from {project}!\")\n")
 }
 
+/// `zap test [file] [--json] [--watch]` — run the `@test` suite (D-0054).
+#[cfg(feature = "llvm")]
+fn cmd_test(file: Option<String>, json: bool, watch: bool) -> ExitCode {
+    crate::testing::run(file, json, watch)
+}
+
+/// Without a backend the runner cannot compile and execute tests.
+#[cfg(not(feature = "llvm"))]
+fn cmd_test(_file: Option<String>, _json: bool, _watch: bool) -> ExitCode {
+    eprintln!("zap test: running tests needs codegen, which this build lacks");
+    eprintln!("(rebuild with --features zapc/llvm, which requires an LLVM toolchain)");
+    ExitCode::from(1)
+}
+
 /// Report that a verb's underlying system is not built yet, naming the ticket.
 fn stub(what: &str, ticket: &str) -> ExitCode {
     eprintln!("zap: {what} is not available yet — tracked in {ticket}.");
@@ -348,13 +384,17 @@ project:
   new <name>            scaffold a new project directory (writes zap.toml)
   init                  scaffold zap.toml in the current directory
 
+test:
+  test [file]           run the @test suite (D-0054); a file, or the project
+       --json           emit structured results (for `zap mcp`, issue #72)
+       --watch          re-run on change, targeting affected files
+
 diagnostics:
   version               print the toolchain version
   help                  show this help
 
 not yet implemented / pending their own tickets:
   fmt                   canonical formatter (D-0037)
-  test [--watch]        test runner (@test framework, issue #73)
   add / remove          dependency management (package manager, issue #69)
   zenv                  project environment (issue #69)
   mcp                   agent MCP server (issue #72)
@@ -464,12 +504,32 @@ mod tests {
     }
 
     #[test]
-    fn test_watch_flag() {
-        assert_eq!(p(&["test"]).unwrap(), Command::Test { watch: false });
+    fn test_flags_and_file() {
+        assert_eq!(
+            p(&["test"]).unwrap(),
+            Command::Test {
+                file: None,
+                json: false,
+                watch: false
+            }
+        );
         assert_eq!(
             p(&["test", "--watch"]).unwrap(),
-            Command::Test { watch: true }
+            Command::Test {
+                file: None,
+                json: false,
+                watch: true
+            }
         );
+        assert_eq!(
+            p(&["test", "math_test.zap", "--json"]).unwrap(),
+            Command::Test {
+                file: Some("math_test.zap".into()),
+                json: true,
+                watch: false
+            }
+        );
+        assert!(p(&["test", "--nope"]).is_err());
     }
 
     #[test]
