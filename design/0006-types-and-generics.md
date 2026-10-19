@@ -539,11 +539,11 @@ choices and scoped deferrals, all consistent with D-0046:
   Nested sub-patterns inside a variant field (`case Shape.Circle(0.0)`) are not
   yet lowered — bind to a name or `_`.
 
-### 4. Tuples (resolves the OPEN-QUESTIONS syntax item)
+### 4. Tuples (locked, D-0049)
 
 Tuples are a **fixed-arity, heterogeneous, immutable** aggregate (D-0019).
 This section fixes their literal, access, destructuring, and multi-return
-syntax (the open item).
+syntax — locked as **D-0049** (issue #54).
 
 ```python
 auto t = (1, "two", 3.0)           # tuple literal: (int64, str, f64)

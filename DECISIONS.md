@@ -572,3 +572,30 @@ closed); enums keep their compiler-generated iteration (D-0018). Iterators are
 reuses the channel pattern; accepting `StopIteration` honors the Python-porting
 pitch at negligible cost; structural interfaces keep it compile-time-checked and
 let `Iterator` serve as a generic bound once user generics land.
+
+## D-0049 — Tuple syntax & multiple return
+**Status:** Locked — resolves issue #54 (the syntax half of D-0019)
+Fixes the literal, access, destructuring, and multiple-return surface for tuples
+(their existence was locked in D-0019); fully specified in `design/0006` §4.
+- **Literals (Python-style):** `(a, b)` is a tuple, `(x,)` a 1-tuple (trailing
+  comma required), `()` the empty/unit tuple, `(e)` is just grouping; a bare
+  comma-list is a tuple in return/assignment context. Type: `(int64, str)`.
+- **Element access `t[k]`** with a **compile-time-constant** `k`; the result is
+  that position's static type. A non-constant index is a **compile error** (a
+  tuple is heterogeneous, so the type must be static) — the key difference from
+  `list[i]`.
+- **Destructuring:** positional binding in decl and assignment, **nested**, with
+  a single **`*rest`** capturing the remainder as a tuple: `auto (a, b) = t`,
+  `auto (first, *rest) = xs`, `(x, y) = (y, x)` (swap).
+- **Multiple return IS tuple return** — no separate mechanism (unlike Go):
+  `def f(...) -> (A, B): return a, b` with `auto (x, y) = f()`. The comma-ok
+  channel receive `v, ok = <-ch` (D-0031) and the iterator `__next__ -> (T, bool)`
+  (D-0048) are **this same** destructuring — no special-casing.
+- **Semantics:** immutable (no `t[0] = ...`), compared element-wise by `==`; a
+  **by-value aggregate** (anonymous-struct layout, returned in registers when
+  small / via `sret` when large, per RUNTIME-ABI), not a reference type, no heap
+  header unless boxed into a reference slot.
+
+**Rationale:** a Python-familiar surface; one tuple mechanism unifies multiple
+return and comma-ok; compile-time-constant indexing preserves static typing of a
+heterogeneous aggregate.

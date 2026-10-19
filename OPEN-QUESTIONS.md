@@ -29,9 +29,11 @@ _Last updated: 2026-10-19_
   structural interfaces; native comma-ok `__next__ -> (T, bool)`, plus a
   `StopIteration`-raising form for Python porting; generators and built-ins share
   it. See `design/0006-types-and-generics.md` §2.6.
-- 🟡 **Tuple syntax & multiple return.** Tuples are locked (D-0019); their
-  literal/destructuring syntax and whether functions return multiple values via
-  tuples is TBD.
+- ✅ **Tuple syntax & multiple return** — RESOLVED (D-0049, issue #54):
+  Python-style literals (`(a, b)`, `(x,)`, `()`), `t[k]` with compile-time-const
+  index, nested + single-`*rest` destructuring, multiple return = tuple return
+  (unifies comma-ok `v, ok = <-ch`), immutable by-value aggregate. See
+  `design/0006-types-and-generics.md` §4.
 - 🟡 **Method-definition syntax** for structs (D-0015): inline methods vs a
   separate receiver/`impl` block.
 - ⚪ **Unsigned integers.** Deferred (D-0019); likely reintroduced only for C
