@@ -54,8 +54,11 @@ _Last updated: 2026-10-19_
 
 ## Modules, packaging, tooling
 
-- 🟡 **Package-manager concrete design** (D-0035 direction locked): manifest
-  format (`zap.toml`?), resolver (MVS vs SAT/semver), registry vs decentralized.
+- ✅ **Package-manager concrete design** — RESOLVED (D-0052, issue #56):
+  `zap.toml` + `zap.lock`, **MVS** resolver, **decentralized** VCS sources +
+  checksum DB, clean logical imports (+ aliasing, multi-import), and a
+  project-local env-var-activated **`zenv`** isolating both the Zap module cache
+  and a nested Python venv.
 - 🟡 **Standard-library scope & layout** for v1.
 - 🟡 **Build/run command names** (`zap build`, `zap run`, …).
 - ⚪ **In-language test framework** and **doc conventions**.

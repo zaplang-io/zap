@@ -452,16 +452,27 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
 - **Memory model (D-0034):** data-race-free programs are sequentially
   consistent; data races are bugs.
 
-## 13. Modules, imports, visibility (D-0028)
+## 13. Modules, imports, visibility (D-0028, D-0052)
 
 ```python
-import strings                 # a Zap module
+import strings                 # a Zap module (logical name)
 import collections as col      # aliasing
+import jsonlib, boto           # multiple on one line
+import (jsonlib, boto as b)    # grouped form, per-item alias
 import python "numpy" as np    # CPython interop (design/0003)
 ```
 
 One file = one module; a directory = a package. Everything is public **except**
 names starting with `_`, which are private and enforced at compile time.
+
+**Packaging (D-0052).** Dependencies are declared in **`zap.toml`** and pinned in
+**`zap.lock`**; the resolver is **MVS** (minimal version selection, Go-style —
+reproducible, no dependency-hell), and sources are **decentralized** (VCS URL +
+semver tag, checksum-verified; no central registry). Source uses clean logical
+names that `zap.toml` maps to a source + version. A project-local,
+env-var-activated **`zenv`** (`source zenv/activate`) isolates both the Zap
+module cache and a nested Python venv at **`zenv/venv`** (which the embedded
+CPython uses), for a fully reproducible environment.
 
 ## 14. Regular expressions (D-0010)
 

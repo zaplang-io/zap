@@ -1,5 +1,5 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0051.
+   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0052.
 
    Notation:
      ::=        definition
@@ -77,8 +77,11 @@ decorator_def ::= "decorator" IDENT [ "(" [ param_list ] ")" ] block ;
 
 (* ---------- Imports (D-0028, D-0012) ---------- *)
 
-import        ::= "import" ( "python" STRING | dotted_name )
-                  [ "as" IDENT ] NEWLINE ;
+import        ::= "import" "python" STRING [ "as" IDENT ] NEWLINE   (* CPython interop, D-0012 *)
+                | "import" import_list NEWLINE ;                    (* D-0028, D-0052 *)
+import_list   ::= import_item { "," import_item }                  (* import a, b as c *)
+                | "(" import_item { "," import_item } [ "," ] ")" ; (* grouped; multi-form impl may be staged *)
+import_item   ::= dotted_name [ "as" IDENT ] ;
 
 (* ---------- Types ---------- *)
 

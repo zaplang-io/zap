@@ -250,11 +250,12 @@ established by channel ops and sync primitives. **Data races are bugs**, ideally
 caught by a race-detector tool (Go/Java/C++11/Rust family). Formal spec later.
 
 ## D-0035 — Package/dependency manager: Cargo/Go-modules style
-**Status:** Locked (direction)
+**Status:** Locked (direction) — concrete design in D-0052
 One official, bundled tool with a **manifest + lockfile + semver** and
 reproducible builds (Cargo/Go-modules style), under **Python-like import
 syntax**. Explicitly **not** pip/PyPI's model (dependency-hell, bolted-on
-isolation). Manifest format (e.g. `zap.toml`) and resolver TBD.
+isolation). Concrete design (manifest, resolver, distribution, `zenv`) locked in
+**D-0052**.
 
 ## D-0036 — Decorators / annotations
 **Status:** Locked (design) — v1 scope; user macros staged
@@ -642,3 +643,38 @@ non-scalar being heap + indirection) **without reintroducing OO**. **Full OO
 consideration). **Rationale:** gives "Python devs suffering from performance" a
 zero-indirection aggregate for hot paths while keeping the reference-default
 Python feel and the no-inheritance simplicity.
+
+## D-0052 — Package manager & project environment (concrete design)
+**Status:** Locked — resolves issue #56 (concretizes D-0035)
+- **Manifest & lockfile:** **`zap.toml`** (author-edited: dependencies, versions,
+  metadata) + **`zap.lock`** (tool-generated, committed) — TOML, Cargo-style.
+- **Resolver: Minimal Version Selection (MVS, Go-style)** — the build uses the
+  maximum of the required minimum versions; deterministic and reproducible by
+  construction, no SAT solver, no dependency-hell. Versions are **semver**; a
+  major version is the compatibility boundary.
+- **Distribution: decentralized** — dependencies resolve to **VCS sources** (git
+  URL + semver tag); **no mandatory central registry**. Integrity and reliability
+  come from a **checksum database** (+ an optional official caching proxy),
+  Go-style — the deliberate opposite of pip/PyPI (D-0035).
+- **Imports:** source uses clean **logical names**; `zap.toml` maps each to a
+  source + version (`jsonlib = { git = "…", version = "1.4" }` → `import jsonlib`).
+  Aliasing `import jsonlib as j` (already in the grammar, D-0028); **multi-import**
+  `import a, b, c` and grouped `import (a, b, c)` with per-item aliases (grammar
+  reserved now; the multi-form's implementation may be staged).
+- **`zenv` — project environment:** a project-local, **env-var-activated**
+  environment (venv-simple: `source zenv/activate` sets vars, deactivation unsets
+  them) that makes the **whole** project reproducible and self-contained. When
+  activated it acts on **both** ecosystems:
+  - **Zap deps** resolve/build against a **project-local module cache inside
+    `zenv/`** (materialized from `zap.lock` via MVS), not a global cache.
+  - **`zenv/venv/`** is a standard **Python venv** the embedded CPython (#27) is
+    pointed at (`VIRTUAL_ENV` + a `ZAP_PYENV` var), so `import python 'numpy'`
+    resolves there and `pip`/`uv` work normally inside it.
+
+  Layout: `zap.toml`, `zap.lock`, `zenv/{activate, pkg (Zap cache), venv (Python)}`.
+- **Scope:** `zap.toml` manages Zap packages; the Python side is the nested venv.
+  Build/run command names are issue #58.
+
+**Rationale:** MVS + lockfile + decentralized checksum-verified sources give
+reproducible, dependency-hell-free builds with no central chokepoint; `zenv`
+unifies Zap and Python reproducibility under the env-var simplicity of venv.
