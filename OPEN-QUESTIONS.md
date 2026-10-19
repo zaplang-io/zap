@@ -4,7 +4,7 @@ Tracked, unresolved language decisions — the backlog we work down in priority
 order (in the spirit of Go's proposal queue). When one is settled it moves to
 `DECISIONS.md` and is removed here. Tags: 🔴 blocking · 🟡 soon · ⚪ later.
 
-_Last updated: 2026-10-17_
+_Last updated: 2026-10-19_
 
 ---
 
@@ -35,8 +35,10 @@ _Last updated: 2026-10-17_
 
 ## Concurrency
 
-- 🟡 **Structured-concurrency surface syntax** (D-0033 model is locked) — the
-  scope-block form and how results/cancellation are expressed.
+- ✅ **Structured-concurrency surface syntax** — RESOLVED (D-0044/D-0045, issue
+  #50): the `scope:` block, `spawn detached`, typed `OnError` policy, and
+  aggregate `ExceptionGroup` on concurrent failure. See
+  `design/0005-concurrency.md`.
 - ⚪ **Formal memory-model spec** (principle locked, D-0034).
 - ⚪ **Race detector** tooling.
 

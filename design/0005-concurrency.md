@@ -2,7 +2,7 @@
 
 - **Author(s):** Zap team
 - **Last updated:** 2026-10-18
-- **Status:** Draft
+- **Status:** Surface locked (D-0044, D-0045); runtime in progress (#47)
 - **Discussion:** github.com/parveshgarg/zap#14
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
@@ -84,9 +84,24 @@ spawn (lambda: log(x))()     # a lambda, immediately applied
 Coordination is explicit: results flow back over channels, and completion is
 awaited with a `WaitGroup` (unstructured) or a `scope:` block (structured).
 Every coroutine is **owned** by exactly one scope (see Structured concurrency);
-a `spawn` with no enclosing `scope:` is owned by the program's implicit **root
-scope**, which the runtime joins at program exit, so a coroutine is never truly
-detached.
+a *bare* `spawn` with no enclosing `scope:` is owned by the program's implicit
+**root scope**, which the runtime joins at program exit, so an ordinary
+coroutine is never leaked.
+
+**Detached coroutines (D-0044).** `spawn detached <call>` opts a coroutine out
+of **all** scope ownership — it is never awaited, and the program does **not**
+block on it at exit; when `main` returns, a still-running detached coroutine is
+terminated (Go goroutine semantics). This is the escape hatch for true daemons —
+loggers, metrics flushers, background pollers — that must outlive the block that
+started them. `detached` is a contextual modifier valid only immediately after
+`spawn`; it reserves no hard keyword.
+
+```python
+spawn detached metrics_flusher(registry)   # runs until program exit; never joined
+```
+
+Use a plain `spawn` (structured or root-scoped) by default; reach for `detached`
+only for background work whose lifetime is deliberately the whole program.
 
 ### Channels
 
@@ -257,9 +272,11 @@ Rules:
    Reaching the dedent blocks the parent until all owned coroutines complete.
 3. **Cancel on failure.**
    If any owned coroutine raises an uncaught exception, the scope **cancels all
-   its siblings** and, once they have unwound, re-raises that exception at the
-   dedent (so failures are not silently dropped — the opposite of a bare
-   fire-and-forget `spawn`).
+   its siblings** and, once they have unwound, re-raises at the dedent (so
+   failures are not silently dropped — the opposite of a bare fire-and-forget
+   `spawn`). If **several** owned coroutines fail concurrently, the scope raises
+   an aggregate **`ExceptionGroup`** carrying all of them (D-0045), not just the
+   first; a single failure propagates as that one exception.
 4. **Cancel on early exit.**
    If the parent leaves the block by `return`, `break`, or an exception of its
    own, the scope cancels and awaits its children first (like a `with` cleanup).
@@ -271,14 +288,18 @@ Rules:
 Options on the scope configure deadlines and failure policy:
 
 ```python
-scope(timeout=30.seconds):       # cancels all children at the deadline
+scope(timeout=30.seconds):           # cancels all children at the deadline
     spawn fetch(a)
     spawn fetch(b)
 
-scope(on_error="wait"):          # default is "cancel": a failure waits for
-    spawn best_effort(x)         # siblings instead of cancelling them
+scope(on_error=OnError.Wait):        # default is OnError.Cancel: a failure waits
+    spawn best_effort(x)             # for siblings instead of cancelling them
     spawn best_effort(y)
 ```
+
+`on_error` takes an **`OnError` enum** (`Cancel` | `Wait`), not a string, so a
+misspelled policy is a compile-time error, not a silent runtime surprise (D-0044,
+consistent with the interface/decorator typo-catching ethos).
 
 Returning values is still channel-based (D-0032); a thin `Future[T]` helper over
 a one-shot channel is a convenience the stdlib may provide, but the scope itself
@@ -506,20 +527,9 @@ frees its M.
 
 ## Open issues
 
-- **`scope` keyword vs library form.**
-  This proposal reserves `scope` as a block keyword; a `with nursery() as n:`
-  library alternative remains possible if reserving the word proves too costly.
-  (Feeds the D-0033 "surface syntax" open question in OPEN-QUESTIONS.)
-- **Detached coroutines.**
-  Whether to offer an explicit "escape the scope" form (e.g. a daemon/background
-  spawn) or keep the root-scope-at-exit join as the only backstop.
 - **`select` details.**
   Confirm uniform-random fairness, the `default` non-blocking form, and whether
   send cases may appear alongside receive cases in the first implementation.
-- **Multiple sibling failures.**
-  When several owned coroutines fail concurrently, re-raise the first and attach
-  the rest, or raise an aggregate `ExceptionGroup`-style error? (Interacts with
-  the exception hierarchy, D-0029.)
 - **Preemption.**
   v1 is cooperative; whether/when to add signal- or safepoint-based preemption
   of long CPU loops that never hit a `checkpoint()`.

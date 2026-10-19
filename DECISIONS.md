@@ -232,11 +232,11 @@ because `spawn` is fire-and-forget (D-0013) — it is the primary "wait for thes
 coroutines to finish" primitive; results flow back over channels.
 
 ## D-0033 — Cancellation: structured concurrency
-**Status:** Locked (model) / syntax TBD
+**Status:** Locked (model) — surface resolved by D-0044
 Child coroutines are **scoped** to a parent; leaving the scope awaits/cancels
 children, so no coroutine is leaked and cancellation propagates automatically
-(Swift/Kotlin/trio style, chosen over Go's `context`). Surface syntax (scope
-blocks) is TBD — see OPEN-QUESTIONS.
+(Swift/Kotlin/trio style, chosen over Go's `context`). The surface syntax (the
+`scope:` block, detached spawn, and failure policy) is now locked in **D-0044**.
 
 ## D-0034 — Memory model: DRF-SC
 **Status:** Locked (principle)
@@ -391,3 +391,55 @@ values — an open-addressing hash table sharing the dict's key hashing/equality
 (per `design/RUNTIME-ABI.md`), GC-managed. Deferred, consistent with list/dict:
 float elements, set algebra (union/intersection/difference), `.remove`/`.discard`,
 and struct-element hashing.
+
+## D-0044 — Structured-concurrency surface syntax
+**Status:** Locked — resolves the surface left open by D-0033
+The surface for structured concurrency (`design/0005-concurrency.md`,
+OPEN-QUESTIONS).
+
+**`scope:` is a block keyword**, not a library nursery object. A `scope:` block
+lexically **owns** every coroutine `spawn`ed inside it: the dedent is the join
+point (awaits all children), a child's uncaught failure cancels its siblings and
+re-raises at the dedent, and an early parent `return`/`break`/exception cancels
+and awaits children first. This keeps `spawn` (D-0013) the single launch verb
+with no second `n.spawn(...)` spelling and no handle object. `scope` becomes a
+reserved word used only as a block introducer.
+
+**Detached coroutines are a v1 feature**, not deferred: `spawn detached <call>`
+opts a coroutine out of **all** scope ownership — it is never awaited, and the
+program does **not** block on it at exit; when `main` returns, a still-running
+detached coroutine is terminated (Go goroutine semantics). This is the escape
+hatch for true daemons (loggers, metrics flushers, background pollers). `detached`
+is a **contextual modifier** valid only immediately after `spawn` (no new hard
+keyword). A *bare* `spawn` with no enclosing `scope:` remains owned by the
+implicit **root scope** and **is** joined at program exit — so the default is
+leak-free and detachment is always explicit.
+
+**Scope options are typed, not stringly:** `scope(timeout=<duration>)` cancels
+all children at the deadline; `scope(on_error=OnError.Cancel | OnError.Wait)`
+selects the failure policy (`Cancel` is the default — a failing child cancels its
+siblings; `Wait` lets siblings finish). `on_error` takes an **enum**, not a
+string, so a typo is a compile-time error (consistent with the interface and
+decorator "catch typos at compile time" ethos, D-0016/D-0036).
+
+**Cancellation** is a `Cancelled` exception injected at cancellation points
+(channel ops, `select`, sleep/timer/I/O waits, nested `scope:` boundaries,
+`checkpoint()`), unwinding through ordinary `finally`/`with` cleanups (D-0027);
+`Cancelled` derives from a `BaseException` root **outside** the `Exception`
+hierarchy so a broad `except Exception:` does not swallow it.
+
+**Rationale:** block-scoped ownership gives leak-free structured concurrency by
+default (chosen over Go's `context`, D-0033) while explicit `spawn detached`
+preserves real fire-and-forget coroutines for daemons; typed options and the
+single launch verb keep the surface small and typo-safe.
+
+## D-0045 — Concurrent sibling failures: aggregate exception
+**Status:** Locked
+When several coroutines owned by the same `scope:` fail concurrently, the scope
+raises an **aggregate `ExceptionGroup`** carrying all of them (Python 3.11
+`ExceptionGroup` / trio MultiError style), rather than re-raising the first and
+dropping the rest. A single failure still propagates as that one exception. This
+interacts with the exception hierarchy (**D-0029**): `ExceptionGroup` is defined
+there, and `Cancelled` (D-0044), sitting outside `Exception`, is grouped
+separately from ordinary failures. **Rationale:** losing concurrent failures
+hides bugs; the Python-aligned aggregate matches our target users' mental model.
