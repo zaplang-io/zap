@@ -752,11 +752,27 @@ static void zap_collect_now(void) {
     pthread_mutex_unlock(&zap_stw_mu);
 }
 
-/* Explicit collection (a `gc_collect()` builtin / test hook). Safe to call from
- * compiled Zap code, where the caller's roots are shadow-flushed. */
+/* Explicit collection (a `gc_collect()` builtin / test hook, and the uniform
+ * ticket-#77 entry). Safe to call from compiled Zap code, where the caller's
+ * roots are shadow-flushed. */
 void zap_gc_collect(void) {
     zap_mutator_register();
     zap_collect_now();
+}
+
+/* Uniform GC stats (ticket #77): mapped-heap bytes and the live bytes computed
+ * at the last collection. Backend-agnostic signature matching the Boehm one. */
+void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes) {
+    pthread_mutex_lock(&zap_heap_mu);
+    size_t mapped = zap_total_mapped;
+    size_t live = zap_live_estimate;
+    pthread_mutex_unlock(&zap_heap_mu);
+    if (heap_bytes) {
+        *heap_bytes = (int64_t)mapped;
+    }
+    if (live_bytes) {
+        *live_bytes = (int64_t)live;
+    }
 }
 
 /* ---- block / object allocation -------------------------------------------- */
