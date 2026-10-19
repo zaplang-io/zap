@@ -2,7 +2,8 @@
 
 - **Author(s):** Zap team
 - **Last updated:** 2026-10-19
-- **Status:** Draft (PLAN — awaiting orchestrator ack before implementation)
+- **Status:** Implemented (v1, behind the `gc-immix` build flag; Boehm remains
+  the default). All 5 forks were approved as recommended, including 4a.
 - **Discussion:** github.com/parveshgarg/zap#48
 - **Supersedes the GC sections of:** `design/RUNTIME-ABI.md`, `design/0005-concurrency.md`
 
@@ -314,3 +315,41 @@ gated on the suite passing both ways.
   32 KiB / 128 B); whether runtime collection buffers carry headers or stay
   descriptor-by-container (recommend container-traced: the `ZapList` object has a
   header, its `data` buffer is a raw `ATOMIC`/traced-by-parent allocation).
+
+## Implementation notes (as built)
+
+Deltas from the plan above, decided during implementation (none change the
+approved forks):
+
+- **Header is behind the pointer, not a prepended field.** Every object is
+  `[ descriptor|mark (8) | payload_size (8) | payload… ]` and code holds the
+  *payload* pointer. This keeps struct field offsets and the runtime object
+  layouts byte-identical to the Boehm build (no `idx+1` GEP shift was needed).
+  The collector maps `payload -> descriptor` via `payload[-2]`. The size word
+  lets line-marking know an object's extent even for variable-length atomic
+  buffers that share one descriptor.
+- **Descriptors use a pointer-offset array, not a bitmap.** Struct fields can be
+  sub-word (i8/i16/i32/f32), so codegen emits the pointer fields' byte offsets
+  (from the LLVM `TargetData` layout) rather than a word bitmap.
+- **Pointer validation instead of per-value classification.** `Ty::Ptr` is
+  overloaded (heap pointers, stack allocas, function addresses, inline
+  value-struct pointers), so codegen roots *every* pointer-typed value and the
+  collector validates each candidate against a block registry (membership +
+  16-byte alignment) before dereferencing its header. In the non-moving design
+  no interior pointers arise, so this is precise, not conservative — it only
+  filters out the non-heap pointers safely.
+- **GC runs only at safepoints, never inside allocation.** The runtime's own C
+  code has no shadow frames, so a collection must never fire while runtime C
+  holds unrooted temporaries. Allocation only sets a "GC wanted" flag; the next
+  `zap_safepoint()` in compiled code (where all live pointers are shadow-rooted)
+  performs the collection.
+- **Shadow-stack rooting is per-ZIR-value, stored at end of the defining block;**
+  dead-but-slotted values are harmless over-retention for a non-moving heap. The
+  head is restored at each landing pad so an unwound-through frame chain is
+  repaired before handler/cleanup code runs.
+- **v1 simplifications (follow-ups):** allocation is under one global heap lock
+  (not per-P bump); finalizers are a no-op under Immix, so a `ZapPy` wrapper's
+  CPython reference is not decref'd (bounded leak; Boehm keeps its finalizer);
+  user-level cyclic *literals* can't yet be written (the front end lacks `None`
+  / struct-field mutation), though the tracing collector reclaims cycles by
+  construction, as the reclamation tests show.

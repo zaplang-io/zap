@@ -455,14 +455,34 @@ This is the load-bearing runtime decision, and the **conservative Boehm GC
 
 ### Interaction with the GC — summary
 
-- v1 needs **no GC safepoints and no stack maps** for coroutines, because
+Under the default **Boehm** build:
+
+- No GC safepoints and no stack maps are needed for coroutines, because
   suspended stacks are traced as heap and running stacks are traced as thread
-  context — exactly the property RUNTIME-ABI relies on for Boehm.
-- Stop-the-world still works: Boehm suspends the **M** OS threads (which it
-  knows about); coroutines not currently on an M are quiescent data.
-- The later precise GC adds per-coroutine stack maps and safepoints at the same
-  scheduling points listed above, and unlocks movable/growable stacks; the entry
-  points here are designed not to change.
+  context — exactly the property RUNTIME-ABI relies on.
+- Stop-the-world: Boehm suspends the **M** OS threads (which it knows about);
+  coroutines not currently on an M are quiescent data.
+
+Under the **precise Immix** build (ticket #48, D-0009, design/0008-precise-gc.md),
+this is reimplemented precisely — the Boehm-specific tricks above are replaced,
+not relied on:
+
+- **Parked-coroutine roots.** Each coroutine carries a shadow-stack head saved
+  in its `G`; `switch_to_g` saves/restores it across the `swapcontext`, so a
+  *suspended* coroutine's live pointers are found by walking its saved shadow
+  chain — a linked-list walk, with no stack scanning and no dependence on
+  retaining the green stack as traced heap. `g_all[]` still enumerates every
+  live `G` (and keeps the `G`, its green stack and its owning scope alive).
+- **Running-coroutine roots.** The running coroutine's live head is in the
+  per-thread `zap_shadow_head`; it is flushed into the `G` when the M parks at a
+  safepoint, so the collector reads every coroutine's chain uniformly.
+- **Stop-the-world.** Cooperative, not pthread suspension: codegen emits a
+  `zap_safepoint()` poll at the top of every block; an M running Zap parks there
+  when a collection is due, and an M idle in the scheduler loop, or any thread in
+  a blocking channel/join wait, marks itself GC-safe (roots already flushed).
+  The collector proceeds once no mutator is still executing Zap.
+- Movable/growable stacks remain a v2 follow-up (v1 Immix is non-moving); the
+  entry points and the fixed-stack decision above are unchanged.
 
 ### Interaction with exception unwinding
 
