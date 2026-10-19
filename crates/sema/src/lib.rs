@@ -780,12 +780,11 @@ impl Checker {
         match (from, to) {
             // A struct value used where an interface is expected: structural
             // conformance (the concrete -> interface fat-pointer conversion,
-            // D-0016). A `value struct` behind an interface needs copy-to-heap
-            // boxing on conversion (I#75 Part 1) and is not supported yet, so it
-            // does not conform here.
-            (Ty::Named(s), Ty::Named(i)) if self.is_interface(i) => {
-                !self.is_value_struct(s) && self.conforms(s, i).is_ok()
-            }
+            // D-0016). A `value struct` conforms too — on conversion it is boxed
+            // (copied to the heap) so the fat pointer's `data` word holds a
+            // stable, GC-traced pointer (I#75 Part 1, D-0051); the boxing is
+            // emitted in lowering.
+            (Ty::Named(s), Ty::Named(i)) if self.is_interface(i) => self.conforms(s, i).is_ok(),
             _ => false,
         }
     }
@@ -4193,17 +4192,14 @@ mod tests {
     }
 
     #[test]
-    fn value_struct_behind_interface_is_rejected_for_now() {
-        // A `value struct` behind an interface needs copy-to-heap boxing on
-        // conversion (I#75 Part 1) and is not supported yet, so it does not
-        // conform even though its method set matches.
-        let m = msgs(
-            "interface Shape:\n    def area(self) -> f64\n\n\
+    fn value_struct_conforms_to_interface() {
+        // A `value struct` whose method set matches conforms to the interface
+        // (I#75 Part 1): the conversion boxes it to the heap in lowering, so it
+        // is accepted here exactly like a reference struct.
+        ok("interface Shape:\n    def area(self) -> f64\n\n\
             value struct Vec2:\n    f64 x\n    f64 y\n\
             \x20   def area(self) -> f64:\n        return self.x\n\n\
-            def main():\n    Shape s = Vec2(x=1.0, y=2.0)\n",
-        );
-        assert!(m.contains("Vec2") && m.contains("Shape"), "got:\n{m}");
+            def main():\n    Shape s = Vec2(x=1.0, y=2.0)\n    print(s.area())\n");
     }
 
     // --- tuples (ticket #54, D-0049) ---

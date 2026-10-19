@@ -6319,18 +6319,26 @@ impl<'a> FnLower<'a> {
             return v;
         }
         // Concrete struct -> interface value: build the `{data, itable}` fat
-        // pointer (D-0016, design/0006 §2.4). Only a reference struct is boxed
-        // here; a `value struct` behind an interface (copy-to-heap on conversion)
-        // is I#75 Part 1 and is rejected until then. interface -> interface and
-        // `None` -> interface are documented follow-ups.
+        // pointer (D-0016, design/0006 §2.4). A reference struct is used directly
+        // as `data` (shared heap identity). A `value struct` is **boxed** first
+        // (I#75 Part 1, D-0051): copied to a fresh heap instance so `data` holds a
+        // stable, GC-traced pointer to a copy that is independent of the source
+        // (whose storage may be a stack slot under the register/sret ABI, or an
+        // lvalue that must not alias). interface -> interface and `None` ->
+        // interface are documented follow-ups.
         if let Ty::Struct(to_sid) = to {
             if let Some(iid) = self.ctx.iid_of_fat_sid(to_sid) {
                 if let Ty::Struct(from_sid) = from {
                     if self.ctx.iid_of_fat_sid(from_sid).is_none() {
+                        let data = if self.ctx.is_value_struct(from_sid) {
+                            self.copy_value_struct(v, from_sid)
+                        } else {
+                            v
+                        };
                         let dest = self.new_value(to);
                         self.emit(Inst::IfaceMake {
                             dest,
-                            data: v,
+                            data,
                             iid,
                             concrete_sid: from_sid,
                         });
