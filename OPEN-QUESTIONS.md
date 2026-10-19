@@ -25,8 +25,10 @@ _Last updated: 2026-10-19_
   `__cmp__` for ordering, `__eq__` for equality; `@derive(Eq, Ord, Hash, Repr)`;
   `__call__` and `__hash__` (struct keys) included; in-place `__iadd__` reserved,
   implementation deferred. See `design/0006-types-and-generics.md` §2.5.
-- 🟡 **Iteration protocol.** How a user type becomes iterable / works with `for`
-  and comprehensions (a `__iter__`-style contract, or an `Iterable` interface).
+- ✅ **Iteration protocol** — RESOLVED (D-0048, issue #53): `Iterable`/`Iterator`
+  structural interfaces; native comma-ok `__next__ -> (T, bool)`, plus a
+  `StopIteration`-raising form for Python porting; generators and built-ins share
+  it. See `design/0006-types-and-generics.md` §2.6.
 - 🟡 **Tuple syntax & multiple return.** Tuples are locked (D-0019); their
   literal/destructuring syntax and whether functions return multiple values via
   tuples is TBD.

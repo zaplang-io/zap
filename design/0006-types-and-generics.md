@@ -348,6 +348,66 @@ interface Add:
 - **Operator interfaces double as generic bounds** (D-0017): once user generics
   land, `def sum[T: Add](xs: list[T]) -> T` constrains `T` to addable types.
 
+#### 2.6 Iteration protocol (D-0048)
+
+`for`, comprehensions, generators, and built-in/channel iteration all run through
+one protocol, expressed as two compiler-known structural interfaces (§2, D-0016):
+
+```python
+interface Iterable:
+    def __iter__(self) -> Iterator        # produce a fresh iterator
+interface Iterator:
+    def __iter__(self) -> Iterator        # an iterator is iterable (returns self)
+    def __next__(self) -> (T, bool)       # comma-ok: (value, has_more)
+```
+
+`for x in obj` desugars to:
+
+```python
+auto __it = obj.__iter__()
+while True:
+    auto v, ok = __it.__next__()
+    if not ok: break
+    auto x = v
+    # ... body ...
+```
+
+- **Native `__next__` is comma-ok** `-> (T, bool)`: exception-free, symmetric
+  with the channel comma-ok receive (D-0031); the compiler infers element type
+  `T` from the signature (no dependency on user generics).
+- **Python-compat (support both):** a `__next__(self) -> T` that raises
+  `StopIteration` is also accepted, so ported Python iterators run unchanged. The
+  compiler picks the desugaring from `__next__`'s return type (`(T, bool)` →
+  comma-ok; `T` → catch `StopIteration`). `StopIteration` fires once at
+  exhaustion, not per element, so with zero-cost EH (D-0007) its cost is a single
+  throw per loop; comma-ok is the preferred form for new code.
+- **Generators** (`yield`, D-0026) auto-implement `Iterator` (compiler-generated
+  state machine), ending by fall-off/`return`; they compile to comma-ok.
+- **Built-ins use the same protocol:** `list`/`dict`/`set`/`array`, `str`
+  (yields `char`), and channels (`for x in ch` until closed). Enums keep their
+  compiler-generated iteration. Iterators are single-pass reference objects
+  (D-0023); `__iter__` yields a fresh one.
+
+```python
+struct Range:
+    int64 lo
+    int64 hi
+    def __iter__(self) -> RangeIter: return RangeIter(cur=self.lo, hi=self.hi)
+
+struct RangeIter:
+    int64 cur
+    int64 hi
+    def __iter__(self) -> RangeIter: return self
+    def __next__(self) -> (int64, bool):
+        if self.cur >= self.hi: return (0, False)
+        auto v = self.cur
+        self.cur += 1
+        return (v, True)
+
+for x in Range(lo=0, hi=5):   # 0 1 2 3 4
+    print(x)
+```
+
 ### 3. Enums
 
 #### 3.1 Tier 1 — named constants (D-0018)
@@ -731,10 +791,10 @@ or tuples.
   `Eq` interface and `@derive(Eq)`) or a dunder-style contract.
   This design assumes equality/ordering come from `@derive`/interfaces but does
   not fix the operator-to-method mapping.
-- **Iteration protocol** (OPEN-QUESTIONS): how a user struct becomes iterable
-  (`for x in myStruct`) — an `Iterable` interface vs a `__iter__`-style contract;
-  needed before user collections feel built-in. Enums are iterable by
-  compiler-generated support, not this protocol.
+- **Iteration protocol** — RESOLVED (D-0048, §2.6): `Iterable`/`Iterator`
+  structural interfaces with comma-ok `__next__ -> (T, bool)` (plus a
+  `StopIteration`-raising form for Python porting); generators and built-ins use
+  the same protocol. Enums remain compiler-generated, not via this protocol.
 - **Data-carrying enum variants / tier 3** (D-0018, OPEN-QUESTIONS): the tagged-
   union layout, payload sizing (inline vs boxed for large/recursive variants),
   and the generic `Option[T]`/`Result[T, E]` that motivate it.

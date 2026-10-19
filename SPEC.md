@@ -249,6 +249,13 @@ for item in xs:
     print(item)
 ```
 
+**Iteration protocol (D-0048):** `for x in obj` desugars to `it = obj.__iter__();
+while (v, ok) = it.__next__(); ok: ...`. A user type is iterable by defining
+`__iter__` + a comma-ok `__next__(self) -> (T, bool)` (exception-free, preferred);
+a Python-style `__next__ -> T` raising `StopIteration` is also accepted for
+porting. Generators (`yield`), built-in collections, `str`, and channels all use
+this one protocol; comprehensions and `in`-fallback do too.
+
 **do-while** (bottom-tested; body runs once before the test, D-0039):
 
 ```python

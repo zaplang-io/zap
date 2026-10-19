@@ -532,3 +532,43 @@ derives from the binary operator.
 **Rationale:** reusing structural interfaces keeps overloading compile-time
 typo-safe (D-0016) and makes operators usable as generic bounds; dunder names
 fit the Python audience and sidestep name collisions with ordinary methods.
+
+## D-0048 — Iteration protocol for user types
+**Status:** Locked — resolves issue #53
+One protocol underlies `for`, comprehensions, generators, and built-in/channel
+iteration, expressed as dunder methods on compiler-known **structural**
+interfaces (D-0016, consistent with operator overloading D-0047):
+- `Iterable` — `__iter__(self) -> Iterator` (produce a fresh iterator).
+- `Iterator` — `__iter__(self) -> Iterator` (returns `self`) + `__next__`.
+
+**Native `__next__` is comma-ok:** `__next__(self) -> (T, bool)` returning
+`(value, has_more)` — exception-free, symmetric with the channel comma-ok receive
+(D-0031), and needing no generics (the compiler infers element type `T` from the
+signature).
+
+**Python-compat path (support both):** a `__next__(self) -> T` that raises
+`StopIteration` is **also** accepted as a first-class form, so ported Python
+iterator classes run unchanged. The compiler selects the desugaring from
+`__next__`'s return signature: `(T, bool)` → comma-ok; `T` → the loop catches
+`StopIteration`. Comma-ok is the idiomatic/preferred form for new code;
+`StopIteration` raises once at exhaustion (not per element), so with zero-cost
+table-based EH (D-0007) its overhead is a single throw per loop.
+
+**Desugaring:** `for x in obj` → `it = obj.__iter__(); while (v, ok) =
+it.__next__(); ok: ...`. Comprehensions and the `in`-without-`__contains__`
+fallback use the same protocol.
+
+**Generators (`yield`, D-0026)** auto-implement `Iterator` via a
+compiler-generated state machine and end by falling off / `return` (NOT `raise
+StopIteration` — Python itself banned that, PEP 479); they compile to the
+comma-ok protocol.
+
+**Built-ins conform to the same protocol:** `list`/`dict`/`set`/`array`, `str`
+(yields `char`), and channels (`for x in ch` wraps comma-ok receive until
+closed); enums keep their compiler-generated iteration (D-0018). Iterators are
+**single-pass reference objects** (D-0023); `__iter__` yields a fresh one.
+
+**Rationale:** one protocol unifies all iteration; comma-ok is exception-free and
+reuses the channel pattern; accepting `StopIteration` honors the Python-porting
+pitch at negligible cost; structural interfaces keep it compile-time-checked and
+let `Iterator` serve as a generic bound once user generics land.

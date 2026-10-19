@@ -1,5 +1,5 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0047.
+   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0048.
 
    Notation:
      ::=        definition
@@ -146,6 +146,11 @@ while_stmt    ::= "while" expr block ;
 do_while_stmt ::= "do" block "while" expr NEWLINE ;   (* D-0039 *)
 
 for_stmt      ::= "for" target "in" expr block ;
+                  (* Iteration is protocol-based, not grammatical (D-0048):
+                     `for x in obj` desugars to obj.__iter__() + a comma-ok
+                     __next__ -> (T, bool) loop; a __next__ -> T raising
+                     StopIteration is also accepted (Python porting). Generators
+                     (yield), built-ins, str and channels use the same protocol. *)
 
 try_stmt      ::= "try" block
                   { "except" [ type [ "as" IDENT ] ] block }
