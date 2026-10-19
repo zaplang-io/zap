@@ -16,7 +16,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module as LlvmModule;
 use inkwell::targets::{
-    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine,
 };
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, VectorType,
@@ -50,13 +50,10 @@ impl Backend for LlvmBackend {
         let ctx = Context::create();
         let llmod = ctx.create_module("zap");
         let builder = ctx.create_builder();
-        let mut cg = Cg::new(&ctx, &llmod, &builder);
-        cg.translate(&zir_module)?;
 
-        llmod
-            .verify()
-            .map_err(|e| format!("internal error: invalid LLVM module:\n{}", e.to_string()))?;
-
+        // Create the target machine before translation so its data layout drives
+        // both the emitted object and the GC type-descriptor field offsets
+        // (ticket #48 — see Cg::translate).
         Target::initialize_native(&InitializationConfig::default())
             .map_err(|e| format!("failed to initialize native target: {e}"))?;
         let triple = TargetMachine::get_default_triple();
@@ -72,6 +69,17 @@ impl Backend for LlvmBackend {
                 CodeModel::Default,
             )
             .ok_or_else(|| "failed to create target machine".to_string())?;
+        let td = tm.get_target_data();
+        llmod.set_data_layout(&td.get_data_layout());
+        llmod.set_triple(&triple);
+
+        let mut cg = Cg::new(&ctx, &llmod, &builder);
+        cg.translate(&zir_module)?;
+
+        llmod
+            .verify()
+            .map_err(|e| format!("internal error: invalid LLVM module:\n{}", e.to_string()))?;
+
         tm.write_to_file(&llmod, FileType::Object, obj_path)
             .map_err(|e| format!("failed to write object file: {}", e.to_string()))?;
         Ok(())
@@ -81,14 +89,23 @@ impl Backend for LlvmBackend {
 /// Compile an AST module to a native executable (object + `cc` link).
 /// The Zap C runtime, compiled and linked with each program.
 const RUNTIME_C: &str = include_str!("zaprt.c");
+/// The precise Immix collector, `#include`d by `zaprt.c` under `ZAP_GC_IMMIX`
+/// (ticket #48). Written next to the runtime so the relative include resolves.
+const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
 
 pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), String> {
     let obj_path = out_path.with_extension("o");
     LlvmBackend.compile_object(module, &obj_path)?;
 
-    // Write the runtime to a temp .c and let cc compile + link it in.
-    let rt_path = std::env::temp_dir().join(format!("zaprt-{}.c", std::process::id()));
+    // Write the runtime into a per-build temp dir and let cc compile + link it
+    // in. The GC collector include is written alongside so `#include
+    // "zapgc.inc.c"` (relative) resolves (ticket #48).
+    let build_dir = std::env::temp_dir().join(format!("zap-build-{}", std::process::id()));
+    std::fs::create_dir_all(&build_dir).map_err(|e| format!("failed to create build dir: {e}"))?;
+    let rt_path = build_dir.join("zaprt.c");
     std::fs::write(&rt_path, RUNTIME_C).map_err(|e| format!("failed to write runtime: {e}"))?;
+    std::fs::write(build_dir.join("zapgc.inc.c"), RUNTIME_GC_C)
+        .map_err(|e| format!("failed to write gc runtime: {e}"))?;
 
     // `-lgc` links the conservative Boehm collector the runtime allocates
     // through (ticket #20, D-0009); the dev container provides `libgc-dev`.
@@ -96,12 +113,15 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     // `__cxa_*` exception entry points the runtime calls (ticket #22); the
     // actual stack unwinder (`_Unwind_*`) comes from libgcc, linked by default.
     let mut cmd = Command::new("cc");
-    cmd.arg(&obj_path)
-        .arg(&rt_path)
-        .arg("-o")
-        .arg(out_path)
-        .arg("-lgc")
-        .arg("-lstdc++")
+    cmd.arg(&obj_path).arg(&rt_path).arg("-o").arg(out_path);
+    // Select the collector (ticket #48): the precise Immix GC is compiled into
+    // the runtime with -DZAP_GC_IMMIX and needs no Boehm library; the default
+    // build links the conservative Boehm collector (-lgc).
+    #[cfg(feature = "gc-immix")]
+    cmd.arg("-DZAP_GC_IMMIX");
+    #[cfg(not(feature = "gc-immix"))]
+    cmd.arg("-lgc");
+    cmd.arg("-lstdc++")
         // `-lm` provides libm `pow`/`floor`, used by the scalar `**` and `//`
         // runtime helpers (ticket #19).
         .arg("-lm")
@@ -119,11 +139,18 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     // `pkg-config` (the dev container / CI provide `python3-dev` + `pkg-config`)
     // so the exact libpython version and path are not hardcoded.
     cmd.args(python_embed_flags()?);
+    // Debug hook: extra cc flags from $ZAP_CC_EXTRA (e.g. "-g -fsanitize=address")
+    // for diagnosing runtime/GC issues. Unset in normal builds and CI.
+    if let Ok(extra) = std::env::var("ZAP_CC_EXTRA") {
+        for a in extra.split_whitespace() {
+            cmd.arg(a);
+        }
+    }
     let status = cmd
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
     let _ = std::fs::remove_file(&obj_path);
-    let _ = std::fs::remove_file(&rt_path);
+    let _ = std::fs::remove_dir_all(&build_dir);
     if !status.success() {
         return Err(format!("linker (cc) failed: {status}"));
     }
@@ -160,6 +187,42 @@ fn python_embed_flags() -> Result<Vec<String>, String> {
         .to_string())
 }
 
+/// The SSA value an instruction defines, if any (ticket #48: used to root every
+/// GC-pointer-typed definition at the end of its block). Non-pointer dests are
+/// filtered out downstream by their absent root slot.
+/// Whether a block's first instruction is a `LandingPad` (which must be the
+/// block's first non-phi LLVM instruction, so no safepoint may precede it).
+#[cfg(feature = "gc-immix")]
+fn block_starts_with_landing_pad(b: &zir::Block) -> bool {
+    matches!(b.insts.first(), Some(zir::Inst::LandingPad { .. }))
+}
+
+#[cfg(feature = "gc-immix")]
+fn inst_dest(i: &zir::Inst) -> Option<u32> {
+    use zir::Inst::*;
+    match i {
+        IConst { dest, .. }
+        | FConst { dest, .. }
+        | BConst { dest, .. }
+        | Bin { dest, .. }
+        | ICmp { dest, .. }
+        | FCmp { dest, .. }
+        | Un { dest, .. }
+        | Cast { dest, .. }
+        | Alloca { dest, .. }
+        | Load { dest, .. }
+        | Select { dest, .. }
+        | StrConst { dest, .. }
+        | StructNew { dest, .. }
+        | FieldGet { dest, .. }
+        | LandingPad { dest, .. }
+        | ArrayBinOp { dest, .. }
+        | FuncAddr { dest, .. } => Some(*dest),
+        Call { dest, .. } | Invoke { dest, .. } => *dest,
+        _ => None,
+    }
+}
+
 struct Cg<'a, 'ctx> {
     ctx: &'ctx Context,
     module: &'a LlvmModule<'ctx>,
@@ -170,6 +233,36 @@ struct Cg<'a, 'ctx> {
     /// an inline aggregate is passed/returned **by value** (register/sret) rather
     /// than as a heap pointer. Indexed by struct id, parallel to `structs`.
     struct_inline: Vec<bool>,
+    /// Per-struct GC type-descriptor global (ticket #48), indexed by struct id.
+    /// Passed to `zap_alloc_typed` so the precise collector can trace a struct
+    /// instance's pointer fields. Empty under the Boehm build.
+    #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
+    struct_descs: Vec<PointerValue<'ctx>>,
+    /// The current function's shadow-stack frame (ticket #48, gc-immix). `None`
+    /// under Boehm or for a function with no GC-pointer-typed values.
+    #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
+    gc_frame: Option<GcFrame<'ctx>>,
+    /// The target data layout, for computing GC descriptor field offsets (#48).
+    #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
+    target_data: Option<TargetData>,
+}
+
+/// A function's shadow-stack frame (ticket #48). Codegen reserves one root slot
+/// per GC-pointer-typed SSA value, links the frame onto the per-thread
+/// `zap_shadow_head` on entry, stores each pointer value into its slot at the
+/// end of its defining block, and unlinks on return. A GC safepoint (top of
+/// every block) then finds every live pointer via the chain. Over-retention of
+/// dead-but-slotted values is safe for the non-moving collector.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
+struct GcFrame<'ctx> {
+    /// Alloca of `{ ptr prev; i64 nroots; [N x ptr] roots }` in the entry block.
+    frame_ptr: PointerValue<'ctx>,
+    frame_ty: inkwell::types::StructType<'ctx>,
+    /// value id -> root slot index, or `-1` if the value is not a GC pointer.
+    slot_of: Vec<i32>,
+    /// Number of root slots (the `[N x ptr]` array length).
+    n: u32,
 }
 
 impl<'a, 'ctx> Cg<'a, 'ctx> {
@@ -185,10 +278,30 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             fns: std::collections::HashMap::new(),
             structs: Vec::new(),
             struct_inline: Vec::new(),
+            struct_descs: Vec::new(),
+            gc_frame: None,
+            target_data: None,
         }
     }
 
+    /// Whether this build emits the precise Immix GC's metadata (ticket #48):
+    /// per-object type descriptors, shadow-stack roots and safepoint polls. Off
+    /// by default (the Boehm collector needs none of it).
+    #[cfg(feature = "gc-immix")]
+    const GC_IMMIX: bool = true;
+    #[cfg(not(feature = "gc-immix"))]
+    const GC_IMMIX: bool = false;
+
     fn translate(&mut self, m: &zir::Module) -> Result<(), String> {
+        // The data layout was set on the module by the caller (from the target
+        // machine); derive a TargetData for GC descriptor field offsets.
+        self.target_data = Some(TargetData::create(
+            self.module
+                .get_data_layout()
+                .as_str()
+                .to_str()
+                .map_err(|e| e.to_string())?,
+        ));
         // printf: i32 printf(ptr, ...)
         let i32t = self.ctx.i32_type();
         let i64t = self.ctx.i64_type();
@@ -496,12 +609,36 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_chan_recv_ptr", &[p.into()], Some(p.into()));
         self.declare_rt("zap_chan_close", &[p.into()], None);
 
+        // Precise GC (ticket #48): allocation that carries a type descriptor, a
+        // safepoint poll, and the per-thread shadow-stack head. Declared on both
+        // builds (harmless under Boehm, which never emits calls to them) so the
+        // helpers below can look them up unconditionally.
+        self.declare_rt("zap_alloc_typed", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_safepoint", &[], None);
+        if Self::GC_IMMIX {
+            // __thread void *zap_shadow_head; — the shadow-stack chain head the
+            // compiled frames push/pop. Thread-local so each M/coroutine and the
+            // main thread have their own.
+            let g = self.module.add_global(p, None, "zap_shadow_head");
+            g.set_thread_local(true);
+        }
+
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
         for sl in &m.structs {
             let field_tys: Vec<BasicTypeEnum> = sl.fields.iter().map(|t| self.basic(*t)).collect();
             self.structs.push(self.ctx.struct_type(&field_tys, false));
             self.struct_inline.push(sl.inline);
+        }
+
+        // Emit a GC type descriptor per struct (ticket #48): kind PRECISE with
+        // the byte offsets of the pointer fields, computed from the struct's
+        // LLVM layout. Only under the precise-GC build.
+        if Self::GC_IMMIX {
+            for sid in 0..m.structs.len() {
+                let d = self.emit_struct_desc(sid as u32, &m.structs[sid]);
+                self.struct_descs.push(d);
+            }
         }
 
         // Functions whose address is taken (`Inst::FuncAddr`) are handed to the
@@ -577,6 +714,265 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.fns.insert(name.to_string(), fv);
     }
 
+    // --- precise GC (ticket #48) codegen helpers (gc-immix only) ---
+
+    /// The LLVM layout of the runtime `ZapTypeDesc`:
+    /// `{ i64 size; i32 kind; i32 n_ptrs; ptr ptr_offsets }`.
+    #[cfg(feature = "gc-immix")]
+    fn td_type(&self) -> inkwell::types::StructType<'ctx> {
+        let i64t = self.ctx.i64_type();
+        let i32t = self.ctx.i32_type();
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        self.ctx
+            .struct_type(&[i64t.into(), i32t.into(), i32t.into(), p.into()], false)
+    }
+
+    /// Emit a PRECISE `ZapTypeDesc` global for the LLVM struct `st`: payload size
+    /// `td.get_abi_size(st)`, and the byte offsets of the fields flagged pointer
+    /// in `field_is_ptr` (computed from the struct's real LLVM layout). Returns a
+    /// pointer to the descriptor. Used for user structs and spawn closures.
+    #[cfg(feature = "gc-immix")]
+    fn emit_precise_desc(
+        &self,
+        st: inkwell::types::StructType<'ctx>,
+        field_is_ptr: &[bool],
+        name: &str,
+    ) -> PointerValue<'ctx> {
+        let td = self.target_data.as_ref().expect("target data set");
+        let i32t = self.ctx.i32_type();
+        let i64t = self.ctx.i64_type();
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        let offsets: Vec<inkwell::values::IntValue> = field_is_ptr
+            .iter()
+            .enumerate()
+            .filter(|(_, &is_ptr)| is_ptr)
+            .map(|(i, _)| {
+                let off = td.offset_of_element(&st, i as u32).unwrap_or(0);
+                i32t.const_int(off, false)
+            })
+            .collect();
+        let n = offsets.len();
+        let offsets_ptr = if n == 0 {
+            p.const_null()
+        } else {
+            let arr = i32t.const_array(&offsets);
+            let g = self
+                .module
+                .add_global(arr.get_type(), None, &format!("{name}.offs"));
+            g.set_initializer(&arr);
+            g.set_constant(true);
+            g.set_linkage(inkwell::module::Linkage::Internal);
+            g.as_pointer_value()
+        };
+        let size = td.get_abi_size(&st);
+        let desc = self.td_type().const_named_struct(&[
+            i64t.const_int(size, false).into(),
+            i32t.const_int(0, false).into(), // ZAP_TD_PRECISE
+            i32t.const_int(n as u64, false).into(),
+            offsets_ptr.into(),
+        ]);
+        let g = self.module.add_global(self.td_type(), None, name);
+        g.set_initializer(&desc);
+        g.set_constant(true);
+        g.set_linkage(inkwell::module::Linkage::Internal);
+        g.as_pointer_value()
+    }
+
+    /// Emit the descriptor for struct id `sid`.
+    #[cfg(feature = "gc-immix")]
+    fn emit_struct_desc(&self, sid: u32, sl: &zir::ir::StructLayout) -> PointerValue<'ctx> {
+        let flags: Vec<bool> = sl.fields.iter().map(|t| t.is_ptr()).collect();
+        self.emit_precise_desc(
+            self.structs[sid as usize],
+            &flags,
+            &format!("zap.desc.struct.{sid}"),
+        )
+    }
+
+    #[cfg(not(feature = "gc-immix"))]
+    fn emit_struct_desc(&self, _sid: u32, _sl: &zir::ir::StructLayout) -> PointerValue<'ctx> {
+        unreachable!("emit_struct_desc is only called under the gc-immix build")
+    }
+
+    /// Emit a GC safepoint poll (`zap_safepoint()`), the only place a collection
+    /// can run. Called at the top of every basic block (FORK 4a: covers function
+    /// entry and loop back-edges). No-op under Boehm.
+    #[cfg(feature = "gc-immix")]
+    fn gc_safepoint(&self) -> Result<(), String> {
+        let sp = self.fns["zap_safepoint"];
+        self.builder
+            .build_call(sp, &[], "")
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Address of the per-thread `zap_shadow_head` TLS global.
+    #[cfg(feature = "gc-immix")]
+    fn gc_head(&self) -> PointerValue<'ctx> {
+        self.module
+            .get_global("zap_shadow_head")
+            .expect("zap_shadow_head declared")
+            .as_pointer_value()
+    }
+
+    /// Build and link this function's shadow frame in the entry block, null-init
+    /// its roots, and store the GC-pointer-typed parameters. Sets `self.gc_frame`.
+    /// A no-op (leaves `gc_frame = None`) for functions with no GC pointers.
+    #[cfg(feature = "gc-immix")]
+    fn gc_setup_frame(&mut self, f: &zir::Func, fv: FunctionValue<'ctx>) -> Result<(), String> {
+        self.gc_frame = None;
+        let mut slot_of = vec![-1i32; f.value_types.len()];
+        let mut n: u32 = 0;
+        for (vid, ty) in f.value_types.iter().enumerate() {
+            if ty.is_ptr() {
+                slot_of[vid] = n as i32;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Ok(()); // nothing to root
+        }
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        let i64t = self.ctx.i64_type();
+        let roots_ty = p.array_type(n);
+        let frame_ty = self
+            .ctx
+            .struct_type(&[p.into(), i64t.into(), roots_ty.into()], false);
+        let b = self.builder;
+        let frame = b
+            .build_alloca(frame_ty, "gcframe")
+            .map_err(|e| e.to_string())?;
+        // frame.prev = *head; frame.nroots = n; roots[*] = null; *head = &frame.
+        let head = self.gc_head();
+        let prev = b
+            .build_load(p, head, "gc.prev")
+            .map_err(|e| e.to_string())?;
+        let prev_slot = b
+            .build_struct_gep(frame_ty, frame, 0, "gc.prevslot")
+            .map_err(|e| e.to_string())?;
+        b.build_store(prev_slot, prev).map_err(|e| e.to_string())?;
+        let nslot = b
+            .build_struct_gep(frame_ty, frame, 1, "gc.nslot")
+            .map_err(|e| e.to_string())?;
+        b.build_store(nslot, i64t.const_int(n as u64, false))
+            .map_err(|e| e.to_string())?;
+        let roots = b
+            .build_struct_gep(frame_ty, frame, 2, "gc.roots")
+            .map_err(|e| e.to_string())?;
+        // Zero the roots array in one memset.
+        b.build_memset(
+            roots,
+            8,
+            self.ctx.i8_type().const_zero(),
+            i64t.const_int((n as u64) * 8, false),
+        )
+        .map_err(|e| e.to_string())?;
+        b.build_store(head, frame).map_err(|e| e.to_string())?;
+        self.gc_frame = Some(GcFrame {
+            frame_ptr: frame,
+            frame_ty,
+            slot_of,
+            n,
+        });
+        // Root the GC-pointer-typed parameters.
+        for (i, ty) in f.params.iter().enumerate() {
+            if ty.is_ptr() {
+                if let Some(v) = fv.get_nth_param(i as u32) {
+                    self.gc_store_root(i as u32, v)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Store SSA value `vid` into its root slot, if it has one. `val` must be a
+    /// pointer value. Called at the end of the value's defining block.
+    #[cfg(feature = "gc-immix")]
+    fn gc_store_root(&self, vid: u32, val: BasicValueEnum<'ctx>) -> Result<(), String> {
+        let Some(frame) = &self.gc_frame else {
+            return Ok(());
+        };
+        let slot = frame.slot_of[vid as usize];
+        if slot < 0 || !val.is_pointer_value() {
+            return Ok(());
+        }
+        let b = self.builder;
+        let roots = b
+            .build_struct_gep(frame.frame_ty, frame.frame_ptr, 2, "gc.roots")
+            .map_err(|e| e.to_string())?;
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        let elem = unsafe {
+            b.build_in_bounds_gep(
+                p.array_type(frame.n),
+                roots,
+                &[
+                    self.ctx.i32_type().const_zero(),
+                    self.ctx.i32_type().const_int(slot as u64, false),
+                ],
+                "gc.slot",
+            )
+            .map_err(|e| e.to_string())?
+        };
+        b.build_store(elem, val.into_pointer_value())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Store every GC-pointer-typed value defined in block `b` into its slot.
+    /// Emitted just before the block terminator so the values are rooted before
+    /// any successor-block safepoint observes them.
+    #[cfg(feature = "gc-immix")]
+    fn gc_store_block_roots(
+        &self,
+        b: &zir::Block,
+        vals: &[Option<BasicValueEnum<'ctx>>],
+    ) -> Result<(), String> {
+        if self.gc_frame.is_none() {
+            return Ok(());
+        }
+        for inst in &b.insts {
+            if let Some(d) = inst_dest(inst) {
+                if let Some(Some(v)) = vals.get(d as usize) {
+                    self.gc_store_root(d, *v)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Unlink the shadow frame (`*head = frame.prev`) before a `ret`.
+    #[cfg(feature = "gc-immix")]
+    fn gc_unlink(&self) -> Result<(), String> {
+        let Some(frame) = &self.gc_frame else {
+            return Ok(());
+        };
+        let b = self.builder;
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        let prev_slot = b
+            .build_struct_gep(frame.frame_ty, frame.frame_ptr, 0, "gc.prevslot")
+            .map_err(|e| e.to_string())?;
+        let prev = b
+            .build_load(p, prev_slot, "gc.prev")
+            .map_err(|e| e.to_string())?;
+        b.build_store(self.gc_head(), prev)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Re-establish this frame as the shadow head on entry to a landing pad: the
+    /// deeper frames unwinding tore down are abandoned, and this (still-valid)
+    /// frame's prev chain reaches the live caller frames.
+    #[cfg(feature = "gc-immix")]
+    fn gc_restore_head(&self) -> Result<(), String> {
+        let Some(frame) = &self.gc_frame else {
+            return Ok(());
+        };
+        self.builder
+            .build_store(self.gc_head(), frame.frame_ptr)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn translate_fn(&mut self, f: &Func) -> Result<(), String> {
         let fv = self.fns[&f.name];
 
@@ -629,13 +1025,33 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             }
         }
 
+        // Precise GC (ticket #48): build and link this function's shadow-stack
+        // frame in the entry block, rooting the GC-pointer parameters, before any
+        // safepoint can observe them.
+        #[cfg(feature = "gc-immix")]
+        self.gc_setup_frame(f, fv)?;
+
         for (bi, b) in f.blocks.iter().enumerate() {
             self.builder.position_at_end(blocks[bi]);
+            // A GC safepoint at the top of every block (FORK 4a: covers function
+            // entry and loop back-edges) — the only place a collection runs. A
+            // landing-pad block starts with the mandatory `landingpad`
+            // instruction, so its safepoint + head-restore are emitted in the
+            // LandingPad handler instead.
+            #[cfg(feature = "gc-immix")]
+            if !block_starts_with_landing_pad(b) {
+                self.gc_safepoint()?;
+            }
             for inst in &b.insts {
                 self.inst(f, inst, &mut vals, fv, &blocks)?;
             }
+            // Root every GC pointer defined in this block before the terminator,
+            // so a successor-block safepoint sees them.
+            #[cfg(feature = "gc-immix")]
+            self.gc_store_block_roots(b, &vals)?;
             self.term(f, &b.term, &blocks, &vals, fv)?;
         }
+        self.gc_frame = None;
         Ok(())
     }
 
@@ -990,13 +1406,29 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             }
             Inst::StructNew { dest, sid } => {
                 let st = self.structs[*sid as usize];
-                let size = st
-                    .size_of()
-                    .ok_or_else(|| "struct has no size".to_string())?;
-                let alloc = self.fns["zap_alloc"];
-                let cs = b
-                    .build_call(alloc, &[size.into()], "structnew")
-                    .map_err(|e| e.to_string())?;
+                let cs = if Self::GC_IMMIX {
+                    // Precise GC (ticket #48): allocate with the struct's type
+                    // descriptor so the collector can trace its pointer fields.
+                    #[cfg(feature = "gc-immix")]
+                    {
+                        let alloc = self.fns["zap_alloc_typed"];
+                        b.build_call(
+                            alloc,
+                            &[self.struct_descs[*sid as usize].into()],
+                            "structnew",
+                        )
+                        .map_err(|e| e.to_string())?
+                    }
+                    #[cfg(not(feature = "gc-immix"))]
+                    unreachable!()
+                } else {
+                    let size = st
+                        .size_of()
+                        .ok_or_else(|| "struct has no size".to_string())?;
+                    let alloc = self.fns["zap_alloc"];
+                    b.build_call(alloc, &[size.into()], "structnew")
+                        .map_err(|e| e.to_string())?
+                };
                 vals[*dest as usize] = cs.try_as_basic_value().left();
             }
             Inst::FieldGet {
@@ -1082,6 +1514,18 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 let exc_ptr = b
                     .build_extract_value(lp.into_struct_value(), 0, "excptr")
                     .map_err(|e| e.to_string())?;
+                // Precise GC (ticket #48): unwinding tore down the deeper frames
+                // without running their ret-unlinks, so the shadow head is stale.
+                // Re-establish THIS frame as the head (its prev chain reaches the
+                // live caller frames) before any handler/cleanup code — which
+                // allocates and hits safepoints — runs. This must come right
+                // after the mandatory `landingpad` instruction. Then a safepoint,
+                // since the block's top safepoint was skipped.
+                #[cfg(feature = "gc-immix")]
+                {
+                    self.gc_restore_head()?;
+                    self.gc_safepoint()?;
+                }
                 let begin = self.fns["zap_eh_begin_catch"];
                 let cs = b
                     .build_call(begin, &[exc_ptr.into()], "begincatch")
@@ -1119,13 +1563,37 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .ok_or_else(|| format!("spawn of unknown function '{func}'"))?;
                 let param_tys = target.get_type().get_param_types();
                 let env_struct = self.ctx.struct_type(&param_tys, false);
-                let size = env_struct
-                    .size_of()
-                    .ok_or_else(|| "spawn closure has no size".to_string())?;
-                let alloc = self.fns["zap_alloc"];
-                let env = b
-                    .build_call(alloc, &[size.into()], "spawnenv")
-                    .map_err(|e| e.to_string())?
+                let env_cs = if Self::GC_IMMIX {
+                    // Precise GC (ticket #48): the closure is kept alive via the
+                    // coroutine's G (zap_desc_gobj traces G.arg), and its captured
+                    // pointer args are traced via this descriptor. (By-value
+                    // aggregate args that themselves embed pointers are a
+                    // documented v1 limitation — their inner pointers are not
+                    // traced through the closure.)
+                    #[cfg(feature = "gc-immix")]
+                    {
+                        let flags: Vec<bool> =
+                            param_tys.iter().map(|t| t.is_pointer_type()).collect();
+                        let desc = self.emit_precise_desc(
+                            env_struct,
+                            &flags,
+                            &format!("zap.desc.env.{func}"),
+                        );
+                        let alloc = self.fns["zap_alloc_typed"];
+                        b.build_call(alloc, &[desc.into()], "spawnenv")
+                            .map_err(|e| e.to_string())?
+                    }
+                    #[cfg(not(feature = "gc-immix"))]
+                    unreachable!()
+                } else {
+                    let size = env_struct
+                        .size_of()
+                        .ok_or_else(|| "spawn closure has no size".to_string())?;
+                    let alloc = self.fns["zap_alloc"];
+                    b.build_call(alloc, &[size.into()], "spawnenv")
+                        .map_err(|e| e.to_string())?
+                };
+                let env = env_cs
                     .try_as_basic_value()
                     .left()
                     .ok_or_else(|| "zap_alloc returned no value".to_string())?
@@ -1723,6 +2191,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 b.build_call(*join, &[], "").map_err(|e| e.to_string())?;
             }
         }
+        // Precise GC (ticket #48): unlink this function's shadow frame before it
+        // returns, so the per-thread head no longer points at the (about-to-be
+        // destroyed) frame.
+        #[cfg(feature = "gc-immix")]
+        if matches!(term, Term::Ret(_)) {
+            self.gc_unlink()?;
+        }
         match term {
             Term::Ret(Some(v)) => {
                 let rv = vals[*v as usize].expect("ret value");
@@ -1849,6 +2324,22 @@ mod tests {
         let ctx = Context::create();
         let llmod = ctx.create_module("test");
         let builder = ctx.create_builder();
+        Target::initialize_native(&InitializationConfig::default()).expect("init native");
+        let triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple).expect("target");
+        let tm = target
+            .create_target_machine(
+                &triple,
+                "generic",
+                "",
+                OptimizationLevel::Default,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .expect("target machine");
+        let td = tm.get_target_data();
+        llmod.set_data_layout(&td.get_data_layout());
+        let _ = &td; // data layout already set on the module; translate derives its own
         let mut cg = Cg::new(&ctx, &llmod, &builder);
         cg.translate(&zir).expect("translate");
         llmod

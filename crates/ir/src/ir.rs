@@ -237,6 +237,21 @@ impl Ty {
             _ => None,
         }
     }
+
+    /// Whether this ZIR type is a **GC-managed heap pointer** in the physical
+    /// layout codegen emits. Every reference type (`str`, collections, `array`,
+    /// channels, regex matches, Python handles, and struct instances — including
+    /// `value struct` fields, which are still stored as a pointer *inside* a
+    /// containing object, D-0051) lowers to a pointer; the scalars and `Void` do
+    /// not. The precise collector (ticket #48) uses this to decide which fields
+    /// and SSA temps are roots / traceable children. `Ptr` is the untyped
+    /// pointer (e.g. a GC-allocated closure / function address) and counts too.
+    pub fn is_ptr(self) -> bool {
+        !matches!(
+            self,
+            Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::F32 | Ty::F64 | Ty::Void
+        )
+    }
 }
 
 /// An SSA value id (index into [`Func::value_types`]).

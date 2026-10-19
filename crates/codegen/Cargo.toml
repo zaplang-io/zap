@@ -14,3 +14,11 @@ path = "src/lib.rs"
 zapc_syntax = { path = "../syntax" }
 zapc_ir = { path = "../ir" }
 inkwell = { version = "0.5.0", features = ["llvm18-0"] }
+
+[features]
+# Precise, Immix-style garbage collector (ticket #48, D-0009). Off by default:
+# the runtime links the conservative Boehm collector (`zaprt.c` + `-lgc`). When
+# enabled, codegen emits the per-object type-descriptor header, shadow-stack
+# roots and safepoint polls, and the program links the precise collector
+# (`zapgc.c`) instead of `-lgc`. See design/0008-precise-gc.md.
+gc-immix = []

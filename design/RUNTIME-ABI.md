@@ -208,15 +208,50 @@ keyword-like identifiers.)
 
 ### Garbage collection
 
-**v1 — conservative Boehm GC.** `zap_alloc*` wrap `GC_malloc` /
+Two collectors are selectable at build time behind one allocation surface
+(ticket #48, D-0009, design/0008-precise-gc.md). The default is Boehm; the
+`gc-immix` codegen feature selects the precise collector.
+
+**Default — conservative Boehm GC.** `zap_alloc*` wrap `GC_malloc` /
 `GC_malloc_atomic`; the collector conservatively scans the stack, registers and
 globals, so **no stack maps or safepoints are required**. The dev container
 adds `libgc-dev`; the runtime links `-lgc`.
 
-**Later — precise GC (Immix-style).** Needs pointer maps (from type
-descriptors), GC safepoints, and LLVM statepoint-based stack maps. The header
-layout above is forward-compatible; this is a swap behind the same `zap_alloc*`
-surface.
+**`gc-immix` — precise, non-moving Immix collector.** Enabled by building with
+`--features zapc/gc-immix` (codegen defines `ZAP_GC_IMMIX` for the runtime and
+drops `-lgc`). It is **non-moving** in v1 (mark-only line marking over a 32 KiB
+block / 128 B line heap with bump allocation, line-granularity recycling, and a
+separate large-object space); opportunistic evacuation/defragmentation is a v2
+follow-up. The precise machinery:
+
+- **Object header behind the pointer.** Every heap object is laid out
+  `[ descriptor|mark (8) | payload_size (8) | payload… ]`; the pointer handed to
+  Zap/runtime code is the **payload** pointer, so struct field offsets and the
+  runtime object layouts above are byte-identical to the Boehm build (no field
+  shift). The collector recovers an object's descriptor from `payload[-2]`.
+- **Type descriptors & pointer maps.** `zap_alloc_typed(const ZapTypeDesc*)`
+  carries a per-type descriptor. Codegen emits one PRECISE descriptor per user
+  struct and spawn closure (the pointer fields' byte offsets, computed from the
+  LLVM layout); the runtime defines descriptors for its own objects (strings,
+  the collection headers, arrays, regex matches, scheduler `G`/`Scope`). Variable
+  collection buffers are traced precisely by their owning container using a
+  per-instance element-kind flag (set in the `_ptr`/`_str`/`_fn` entry points),
+  so there is **no conservative scanning**.
+- **Roots via a per-coroutine shadow stack.** Codegen maintains an explicit
+  shadow-stack frame per function (linked onto a per-thread `zap_shadow_head`),
+  rooting every GC-pointer value. The head is saved into each coroutine's `G`, so
+  a parked coroutine's roots are just its saved chain (no stack scanning). Also
+  rooted: the main thread's chain, a global-root registry, and a reflection-table
+  callback.
+- **Safepoints & stop-the-world.** Codegen emits a `zap_safepoint()` poll at the
+  top of every basic block (function entry + loop back-edges). A collection runs
+  **only** at a safepoint (never inside runtime C, which has no shadow frames);
+  allocation merely flags that one is due. Stop-the-world is cooperative: mutator
+  threads park at safepoints or in blocking runtime calls, and the collector
+  marks + sweeps once all are parked. No write barrier / non-generational in v1.
+- **Migration.** Boehm stays the default during bring-up; the full golden suite
+  passes **both** ways and the `full` CI check runs it under both collectors. The
+  default flips to Immix only once it is proven in the field.
 
 ### Exception / unwinding ABI (coordinate with #22)
 
