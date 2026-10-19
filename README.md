@@ -23,7 +23,7 @@ metaprogramming system for keeping business logic free of boilerplate.
 Cargo.toml              workspace
 crates/
   syntax/               zapc_syntax: source spans, tokens, AST (Phase 0)
-  driver/               zapc: the compiler CLI (stub in Phase 0)
+  driver/               the `zap` CLI + the internal `zapc` compiler
 docs/GRAMMAR.ebnf       the grammar
 tests/golden/           golden programs (*.zap) + expected output (*.expected)
 ```
@@ -64,9 +64,32 @@ make docker-test                          # full suite incl. LLVM codegen
 make docker-run FILE=tests/golden/fib.zap # compile + run a program  -> 55
 ```
 
-`zapc run <file.zap>` runs the full pipeline (lex → parse → type-check → LLVM →
-link → run); `zapc build <file.zap> [-o out]` stops after producing the
-executable.
+## The `zap` CLI (D-0053)
+
+`zap` is the one user-facing tool; it drives the internal `zapc` compiler.
+
+```
+zap run [file]        compile + run a file, or the project (via zap.toml)
+zap build [file]      build a native binary (default: target/<name>)
+zap ir [file]         dump ZIR (diagnostic)
+zap expand [file]     show decorator/@derive-generated code (D-0036)
+zap new <name>        scaffold a new project (writes zap.toml)
+zap init              scaffold zap.toml in the current directory
+zap version | help
+```
+
+`zap run`/`zap build`/`zap expand`/`zap ir`, `zap new`/`init`, and
+`zap version`/`help` are implemented. `zap fmt` (D-0037), `zap test` (issue #73),
+`zap add`/`remove` and `zap zenv` (issue #69), and `zap mcp` (issue #72) are
+wired as stubs that name their owning ticket, so the command surface is stable
+while those systems land.
+
+`zap run`/`zap build` need codegen, so they run under the LLVM path:
+
+```bash
+make docker-run FILE=tests/golden/hello.zap   # uses the internal `zapc`
+# inside the container: cargo run -p zapc --features llvm --bin zap -- run <file>
+```
 
 ## Status
 
