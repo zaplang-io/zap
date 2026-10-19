@@ -709,3 +709,57 @@ Both single-file and project modes are supported. `zap repl` / `zap doc` are
 deferred. **Rationale:** one predictable CLI matching modern-language
 expectations; watch-mode and a first-class MCP server directly serve fast,
 agent-driven development — the way Zap itself is being built.
+
+## D-0054 — Test framework & doc conventions
+**Status:** Locked — resolves issue #59
+- **`@test` annotation suite** (decorators, D-0036; run by `zap test`, D-0053):
+  core set `@test`, `@before`/`@after` (per-test), `@before_all`/`@after_all`
+  (per suite), `@parametrize(cases=[…])` (table-driven), `@skip`/`@skip_if`,
+  `@expect_raises(ErrType)`. **Deferred:** `@bench`, `@timeout`.
+- **Assertions:** a plain **`assert`** statement with **power-assert
+  diagnostics** (on failure, print the expression and its operand values); no
+  matcher DSL. `with expect_raises(ErrType):` (D-0027) for exceptions. `assert` is
+  a language statement, **always evaluated** in v1 (a disable flag may come
+  later).
+- **Location & discovery:** BOTH inline `@test` functions (compiled only under
+  `zap test`, **never in release binaries**) AND `*_test.zap` files / a `tests/`
+  directory; `zap test` discovers every `@test` across the project.
+- **Imports in tests:** tests resolve imports through the **same module
+  resolution as the build** (`zap.toml`/MVS, D-0052) — no separate test path or
+  `sys.path` hacks — so Zap avoids Python's chronic "tests crib on imports"
+  problem.
+- **Runner:** human output (per-test pass/fail, power-assert diffs, summary) plus
+  **`zap test --json`** (structured, consumed by `zap mcp`); `--watch` re-runs
+  **targeting only changed/affected paths** (incremental).
+- **Doc conventions:** docstrings are the triple-quoted first statement (D-0041),
+  **Python-familiar** (summary line + `Args:`/`Returns:`/`Raises:`, Google-style).
+  `zap doc` generation is deferred (D-0053). **Doctests** (runnable docstring
+  examples run by `zap test`) are a noted future direction, deferred.
+
+**Rationale:** decorator-driven, Python-familiar tests; power-assert gives great
+DX without a matcher library; unified module resolution removes test-import pain;
+structured output + incremental watch feed the agent workflow.
+
+## D-0055 — `zap mcp`: the agent interface (beyond tests)
+**Status:** Locked — expands the `zap mcp` role (D-0053); built under issue #72
+`zap mcp` is a first-class interface for AI coding agents, not merely a test
+runner. It provides:
+1. **Language understanding** — serves the language reference, grammar
+   (`docs/GRAMMAR.ebnf`), semantics, and canonical examples so an LLM can produce
+   correct Zap **even with little open-source Zap in its training data** (directly
+   attacks the "new language, no corpus" problem).
+2. **Fast checks without a build** — validate produced code via **parse +
+   type-check only** (no LLVM build/link), returning structured diagnostics
+   quickly, so an agent can iterate in a tight loop.
+3. **Code graph / packed memory** — by default build and maintain a **compact
+   semantic index** of the current codebase (symbols, types, signatures,
+   references) that agents query to understand the project with **far fewer
+   tokens** than reading raw files.
+4. **Targeted testing** — run tests incrementally (only changed/affected paths),
+   returning structured (`--json`) results.
+
+Transport: stdio (and/or socket). **Rationale:** Zap is built by coding agents, so
+the language shipping its own agent interface — reference, fast checks, a
+token-efficient code map, and targeted tests — turns "no training corpus" from a
+liability into a served capability and makes agent-driven development fast and
+accurate.
