@@ -127,21 +127,37 @@ header + buffer layout, GC-managed buffer).
   buffer per `design/RUNTIME-ABI.md` (dtype + ndim + dims + data), allocated
   pointer-free (`GC_MALLOC_ATOMIC`).
 
+**Increment 2 (shipped, ticket #49):** dtype promotion + `uint8`/`bool` dtypes.
+
+- **Dtype promotion** for mixed-dtype element-wise ops. The promotion lattice
+  is `bool < uint8 < i64 < f64`; two array operands promote to the
+  higher-ranked dtype (`i64 + f64 -> f64`, `uint8 + i64 -> i64`). Arithmetic
+  never *yields* `bool` — `bool + bool -> uint8` (`True + True == 2`), matching
+  Python's `bool`-as-`int`. A **scalar is weak** (NumPy NEP 50): an integer
+  scalar keeps the array's dtype (`uint8_image + 1` stays `uint8`); only a float
+  scalar forces `f64`. The SIMD kernel loads each operand at its own storage
+  type, widens it to the result dtype (zext/sext/uitofp/sitofp, vectorized),
+  computes in the result dtype, and stores.
+- **`uint8`** (image data) and **`bool`** (masks) dtypes: 1-byte storage words
+  (vs the 8-byte `f64`/`i64`). `zap_array_new` sizes the buffer by dtype;
+  `uint8`/`bool` elements cross the runtime ABI as `i64` words (get
+  zero-extends, set truncates to a byte / normalizes to `0|1`). Integer-array
+  arithmetic wraps per D-0005 (`uint8` wraps mod 256).
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - N-D shape and row-major multi-axis indexing (`m[i, j]`); `ndim` is always 1.
 - Broadcasting beyond a scalar (trailing-dim alignment, size-1 stretch).
 - Slicing / views (D-0030; likely copy-first then views).
-- Dtype promotion for mixed-dtype ops (`i64 + f64`); both operands must match.
 - `f32`/`i32` dtypes; `zeros`/`arange`/`sqrt` and axis reductions.
 - Shape-mismatch runtime exceptions on element-wise ops; element-wise ops
   currently assume equal lengths.
 - Scalar-on-the-left of a non-commutative op (`scalar - array`).
+- `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 
 ## Open issues
 
 - **Views vs copies** for slices (NumPy returns views; this interacts with GC
   and aliasing — likely start with copies, add views later).
-- Dtype promotion rules for mixed-dtype ops (e.g. `i64 + f64`).
 - Whether `@simd`/alignment hints on loops are exposed to users (later).
 - Integer-array overflow: follows D-0005 (wrap) unless a checked mode is added.

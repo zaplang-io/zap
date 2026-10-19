@@ -305,6 +305,39 @@ mod tests {
     }
 
     #[test]
+    fn lower_array_dtypes_and_promotion() {
+        // Mixed-dtype element-wise ops promote to the higher dtype (#49): the
+        // ArrayBinOp carries the per-operand dtypes and a promoted `out`.
+        let m = lower_ok(include_str!("../../../tests/golden/array_promote.zap"));
+        let text = format!("{m}");
+        // i64 + f64 -> f64 (operands keep their own dtype in the node).
+        assert!(text.contains("array.Add.f64 %"), "text:\n{text}");
+        assert!(text.contains(":i64, %"), "text:\n{text}");
+        // uint8 + i64 -> i64.
+        assert!(text.contains("array.Add.i64 %"), "text:\n{text}");
+        assert!(text.contains(":u8, %"), "text:\n{text}");
+
+        // uint8 arrays select the u8-suffixed runtime entry points; a weak int
+        // scalar keeps the dtype (`a * 2` stays u8).
+        let m = lower_ok(include_str!("../../../tests/golden/array_uint8.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_array_set_u8"), "text:\n{text}");
+        assert!(text.contains("call @zap_array_sum_u8"), "text:\n{text}");
+        assert!(text.contains("call @zap_array_get_u8"), "text:\n{text}");
+        assert!(text.contains("array.Add.u8"), "text:\n{text}");
+        assert!(text.contains("array.Mul.u8"), "text:\n{text}");
+
+        // bool arrays store via the bool entry point; arithmetic promotes bool
+        // -> uint8 (so `m + n` / `m * n` are u8 results).
+        let m = lower_ok(include_str!("../../../tests/golden/array_bool.zap"));
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_array_set_bool"), "text:\n{text}");
+        assert!(text.contains("call @zap_array_sum_bool"), "text:\n{text}");
+        assert!(text.contains("array.Add.u8 %"), "text:\n{text}");
+        assert!(text.contains(":bool, %"), "text:\n{text}");
+    }
+
+    #[test]
     fn array_scalar_on_left_only_commutative() {
         // `scalar + array` is accepted (reordered); `scalar - array` is not.
         let (ast, _, _) =

@@ -57,22 +57,50 @@ impl Elem {
     }
 }
 
-/// The element dtype of a numeric `array[T]` (ticket #24). Both current dtypes
-/// are 8-byte element words; this is what selects the typed runtime entry point
-/// (`zap_array_*_f64` / `_i64`) and the LLVM vector element type in the SIMD
-/// element-wise lowering.
+/// The element dtype of a numeric `array[T]` (tickets #24, #49). `f64`/`i64`
+/// are 8-byte element words; `uint8`/`bool` are 1-byte words (image data,
+/// masks). The dtype selects the typed runtime entry point (`zap_array_*_f64` /
+/// `_i64` / `_u8` / `_bool`) and the LLVM *storage* element type of the SIMD
+/// element-wise lowering (see [`Dtype::storage_ty`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dtype {
     F64,
     I64,
+    /// 8-bit unsigned integer (`uint8`/`u8`), e.g. image pixels. Element-wise
+    /// arithmetic wraps mod 256 (D-0005).
+    Uint8,
+    /// Boolean mask (`bool`), stored as a 0/1 byte. Arithmetic on bools
+    /// promotes to `uint8` (see [`Dtype::promote`]).
+    Bool,
 }
 
 impl Dtype {
-    /// The ZIR scalar type of one element.
+    /// The ZIR scalar type of one element as it crosses the runtime ABI
+    /// (get/set/sum values). `uint8`/`bool` elements are carried as `i64` words
+    /// (the runtime truncates/normalizes on store, zero-extends on load), so
+    /// `a[i]` and `sum(a)` are ordinary integers; the compact 1-byte storage is
+    /// [`Dtype::storage_ty`].
     pub fn ty(self) -> Ty {
         match self {
             Dtype::F64 => Ty::F64,
+            Dtype::I64 | Dtype::Uint8 | Dtype::Bool => Ty::I64,
+        }
+    }
+    /// The LLVM *storage* element type in the contiguous buffer: `uint8`/`bool`
+    /// occupy one byte (`i8`), `i64`/`f64` eight. The SIMD element-wise kernel
+    /// loads/stores/GEPs with this type.
+    pub fn storage_ty(self) -> Ty {
+        match self {
+            Dtype::F64 => Ty::F64,
             Dtype::I64 => Ty::I64,
+            Dtype::Uint8 | Dtype::Bool => Ty::I8,
+        }
+    }
+    /// The size in bytes of one stored element (the SIMD load/store alignment).
+    pub fn elem_size(self) -> u32 {
+        match self {
+            Dtype::F64 | Dtype::I64 => 8,
+            Dtype::Uint8 | Dtype::Bool => 1,
         }
     }
     /// The runtime-entry-point suffix for this dtype.
@@ -80,6 +108,8 @@ impl Dtype {
         match self {
             Dtype::F64 => "f64",
             Dtype::I64 => "i64",
+            Dtype::Uint8 => "u8",
+            Dtype::Bool => "bool",
         }
     }
     /// The runtime dtype tag passed to `zap_array_new` (matches `zaprt.c`).
@@ -87,10 +117,62 @@ impl Dtype {
         match self {
             Dtype::F64 => 0,
             Dtype::I64 => 1,
+            Dtype::Uint8 => 2,
+            Dtype::Bool => 3,
         }
     }
     pub fn is_float(self) -> bool {
         matches!(self, Dtype::F64)
+    }
+    /// Whether the *stored* integer is unsigned (`uint8`/`bool`). Selects
+    /// zero-extend / unsigned-int-to-float in the promotion conversions; `i64`
+    /// is signed. (`f64` is not an integer; the result is unused for it.)
+    pub fn is_unsigned(self) -> bool {
+        matches!(self, Dtype::Uint8 | Dtype::Bool)
+    }
+    /// The promotion rank: `bool` < `uint8` < `i64` < `f64`. Mixed-dtype
+    /// element-wise ops produce the higher-ranked dtype.
+    pub fn rank(self) -> u8 {
+        match self {
+            Dtype::Bool => 0,
+            Dtype::Uint8 => 1,
+            Dtype::I64 => 2,
+            Dtype::F64 => 3,
+        }
+    }
+    fn of_rank(r: u8) -> Dtype {
+        match r {
+            0 => Dtype::Bool,
+            1 => Dtype::Uint8,
+            2 => Dtype::I64,
+            _ => Dtype::F64,
+        }
+    }
+    /// The result dtype of an element-wise arithmetic op on two array operands
+    /// (ticket #49). NumPy-style: the higher-ranked dtype wins, so
+    /// `i64 + f64 -> f64`, `uint8 + i64 -> i64`. Arithmetic never *yields* a
+    /// `bool` — `bool + bool` promotes to `uint8` (`True + True == 2`, which a
+    /// 1-bit result could not represent), matching Python's `bool`-as-`int`.
+    pub fn promote(a: Dtype, b: Dtype) -> Dtype {
+        let d = Dtype::of_rank(a.rank().max(b.rank()));
+        if matches!(d, Dtype::Bool) {
+            Dtype::Uint8
+        } else {
+            d
+        }
+    }
+    /// The result dtype of `array op scalar` broadcast (ticket #49). Scalars are
+    /// "weak" (NumPy NEP 50): an integer scalar keeps the array's dtype (so
+    /// `uint8_image + 1` stays `uint8`), and only a float scalar forces `f64`.
+    /// A `bool` array is promoted to `uint8` first (arithmetic, not a mask).
+    pub fn promote_scalar(arr: Dtype, scalar_is_float: bool) -> Dtype {
+        if scalar_is_float {
+            Dtype::F64
+        } else if matches!(arr, Dtype::Bool) {
+            Dtype::Uint8
+        } else {
+            arr
+        }
     }
 }
 
@@ -319,20 +401,28 @@ pub enum Inst {
     LandingPad {
         dest: Value,
     },
-    /// Element-wise binary op on numeric arrays (ticket #24): `dest` is a fresh
-    /// array holding `lhs[i] <op> rhs[i]` (or `lhs[i] <op> scalar` when
-    /// `scalar`). `op` is one of `Add`/`Sub`/`Mul`; `dtype` fixes the element
-    /// type. Codegen lowers this to an explicit LLVM vector loop (SIMD) with a
-    /// scalar remainder — the one non-mechanical ZIR node for arrays, mirroring
-    /// how `Invoke`/`LandingPad` carry the exception-edge shape. `lhs` is always
-    /// an array; `rhs` is an array (same dtype, same length) when `!scalar`, or
-    /// a scalar of `dtype`'s type when `scalar`.
+    /// Element-wise binary op on numeric arrays (tickets #24, #49): `dest` is a
+    /// fresh array holding `lhs[i] <op> rhs[i]` (or `lhs[i] <op> scalar` when
+    /// `scalar`). `op` is one of `Add`/`Sub`/`Mul`. Codegen lowers this to an
+    /// explicit LLVM vector loop (SIMD) with a scalar remainder — the one
+    /// non-mechanical ZIR node for arrays, mirroring how `Invoke`/`LandingPad`
+    /// carry the exception-edge shape.
+    ///
+    /// Mixed-dtype promotion (#49): the operands may have different dtypes, so
+    /// each carries its own — `lhs_dtype`/`rhs_dtype` — and `out` is the
+    /// promoted result dtype ([`Dtype::promote`] / [`Dtype::promote_scalar`]).
+    /// Codegen loads each operand at its own storage type, widens it to `out`,
+    /// does the arithmetic in `out`, and stores `out`. `lhs` is always an array;
+    /// `rhs` is an array (same length) when `!scalar`, or a scalar of
+    /// `rhs_dtype`'s [`Dtype::ty`] when `scalar`.
     ArrayBinOp {
         dest: Value,
         op: BinOp,
-        dtype: Dtype,
+        out: Dtype,
         lhs: Value,
+        lhs_dtype: Dtype,
         rhs: Value,
+        rhs_dtype: Dtype,
         scalar: bool,
     },
     /// Launch a coroutine running `func(args...)` (ticket #25, D-0013): a
@@ -564,15 +654,19 @@ fn fmt_inst(i: &Inst) -> String {
         Inst::ArrayBinOp {
             dest,
             op,
-            dtype,
+            out,
             lhs,
+            lhs_dtype,
             rhs,
+            rhs_dtype,
             scalar,
         } => {
             let kind = if *scalar { "scalar" } else { "array" };
             format!(
-                "%{dest} = array.{op:?}.{} %{lhs}, %{rhs} ({kind})",
-                dtype.suffix()
+                "%{dest} = array.{op:?}.{} %{lhs}:{}, %{rhs}:{} ({kind})",
+                out.suffix(),
+                lhs_dtype.suffix(),
+                rhs_dtype.suffix(),
             )
         }
         Inst::Spawn { func, args } => {

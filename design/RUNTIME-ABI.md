@@ -98,8 +98,13 @@ struct Point { f64 x; f64 y }  ->  [ header(8) | x: f64(8) | y: f64(8) ]  = 24 b
   `zap_set_contains_fn`) that take the `__hash__`/`__eq__` pointers as trailing
   arguments. A new `KEY_FN` key kind routes the probe loop through them. This is
   the struct-element-hashing unblock deferred in D-0043.
-- `array[T]` (#24): `[ header | dtype | ndim | dims: *i64 | strides: *i64 |
-  data: *T ]`, contiguous row-major; views share `data`.
+- `array[T]` (#24, #49): `[ header | dtype | ndim | dims: *i64 | strides: *i64 |
+  data: *T ]`, contiguous row-major; views share `data`. `dtype` tags the
+  element type — `0 = f64`, `1 = i64` (8-byte words), `2 = uint8`, `3 = bool`
+  (1-byte words). `zap_array_new(dtype, len)` sizes the buffer by dtype; `uint8`
+  /`bool` cross the typed get/set/sum entry points as `i64` words (get
+  zero-extends, set truncates/normalizes). Mixed-dtype element-wise ops promote
+  per D-0011; the SIMD kernel reads each operand buffer at its own element type.
 - `heap[T]` (#76, D-0057): a binary min-heap priority queue — `[ header | len:
   i64 | cap: i64 | data: *T | kind | dir ]`, a complete binary tree over a
   growable element-word array (amortized-doubling growth). `kind` selects the
