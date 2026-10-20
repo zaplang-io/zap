@@ -61,12 +61,16 @@ jobs:
       # Where llvm-sys / inkwell (llvm18-0) find LLVM 18. Matches the Dockerfile.
       LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
       LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+      # Link Rust's own binaries with mold (ticket #128): a fraction of GNU ld's
+      # RAM at the link peak and much faster, matching the dev container. Scoped
+      # to the Linux target so it only applies here; gcc 12+ drives `-fuse-ld`.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
     steps:
       - uses: actions/checkout@v4
 
       # Same LLVM 18 toolchain and system libraries llvm-sys links against as
-      # .devcontainer/Dockerfile. (build-essential, curl and git are already on
-      # the runner.)
+      # .devcontainer/Dockerfile, plus mold (the link-step linker, see env
+      # above). (build-essential, curl and git are already on the runner.)
       - name: Install LLVM 18 and system libraries
         run: |
           sudo apt-get update
@@ -85,7 +89,8 @@ jobs:
             libffi-dev \
             libedit-dev \
             libxml2-dev \
-            libncurses-dev
+            libncurses-dev \
+            mold
 
       - name: Install pinned Rust toolchain
         run: |
