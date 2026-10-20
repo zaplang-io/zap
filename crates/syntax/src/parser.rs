@@ -188,6 +188,43 @@ def __json_dumps(JsonValue v) -> str:
     list[str] parts = []
     __json_dump(v, parts)
     return json._join(parts)
+
+def __json_as_int(JsonValue v) -> int64:
+    match v:
+        case JsonValue.Int(i):
+            return i
+        case _:
+            return 0
+
+def __json_as_float(JsonValue v) -> float64:
+    match v:
+        case JsonValue.Float(f):
+            return f
+        case JsonValue.Int(i):
+            return 0.0
+        case _:
+            return 0.0
+
+def __json_as_bool(JsonValue v) -> bool:
+    match v:
+        case JsonValue.Bool(b):
+            return b
+        case _:
+            return False
+
+def __json_as_str(JsonValue v) -> str:
+    match v:
+        case JsonValue.Str(s):
+            return s
+        case _:
+            return \"\"
+
+def __json_field(JsonValue v, str k) -> JsonValue:
+    match v:
+        case JsonValue.Object(m):
+            return m[k]
+        case _:
+            return JsonValue.Null
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -239,6 +276,7 @@ fn references_prelude(module: &Module) -> bool {
         "\"datetime\"",
         "\"JsonValue\"",
         "\"json\"",
+        "\"Json\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

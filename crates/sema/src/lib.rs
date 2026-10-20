@@ -2884,6 +2884,37 @@ impl Checker {
                 if let Some(info) = self.enums.get(tyname).cloned() {
                     return self.check_variant_construction(tyname, name, &info, args, span);
                 }
+                // `Struct.from_json(s)` — the decode associated function a
+                // `@derive(Json)` struct gets (D-0059, I#100). Recognized when
+                // the struct derived Json (its `to_json` method is registered).
+                if name == "from_json"
+                    && self
+                        .structs
+                        .get(tyname)
+                        .is_some_and(|i| i.methods.contains_key("to_json"))
+                {
+                    if args.len() != 1 {
+                        self.error(
+                            format!(
+                                "{tyname}.from_json(s) takes 1 argument, found {}",
+                                args.len()
+                            ),
+                            span,
+                        );
+                    } else {
+                        let t = self.infer(&args[0].value);
+                        if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
+                            self.error(
+                                format!(
+                                    "{tyname}.from_json() expects a str or bytes argument, found {}",
+                                    t.display()
+                                ),
+                                expr_span(&args[0].value),
+                            );
+                        }
+                    }
+                    return Ty::Named(tyname.clone());
+                }
                 // Built-in `signal`/`gc`/`runtime` module calls (ticket #77,
                 // D-0058). Recognized only when the name is not shadowed by a
                 // local value, and is intercepted before the base is resolved as

@@ -1,0 +1,24 @@
+# Golden fixture: @derive(Json) decode direction (D-0059, I#100). The derive
+# generates a compile-time associated function `Struct.from_json(str) -> Struct`
+# that parses the JSON document and populates each field by name. Covers flat
+# scalar/str fields; bool and float decoding are verified via the clean
+# from_json -> to_json round-trip (print() rendering of bool/float is a separate
+# concern).
+#
+# (Field is `host`, not `name`: reading a struct field via `.name` is blocked by
+# a pre-existing limitation — lowering reserves `.name` for the enum `.name`
+# operation, D-0018 — orthogonal to the codec and tracked separately.)
+
+@derive(Json)
+struct Config:
+    str host
+    int64 port
+    bool debug
+    float64 ratio
+
+def main():
+    auto c = Config.from_json("{\"host\": \"srv\", \"port\": 8080, \"debug\": true, \"ratio\": 0.5}")
+    print(c.host)       # srv
+    print(c.port)       # 8080
+    # Round-trip proves debug (true) and ratio (0.5) decoded correctly.
+    print(c.to_json())  # {"host":"srv","port":8080,"debug":true,"ratio":0.5}
