@@ -222,6 +222,8 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         IConst { dest, .. }
         | FConst { dest, .. }
         | BConst { dest, .. }
+        | NullConst { dest, .. }
+        | IsNull { dest, .. }
         | Bin { dest, .. }
         | ICmp { dest, .. }
         | FCmp { dest, .. }
@@ -1275,6 +1277,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Inst::BConst { dest, val } => {
                 vals[*dest as usize] =
                     Some(self.ctx.bool_type().const_int(*val as u64, false).into());
+            }
+            // Niche-optional support (I#154, D-0064 #4). `NullConst` is the null
+            // pointer that a niche `Option`'s `None` lowers to; `IsNull` backs its
+            // tag-free `match` test. Both are ordinary pointer operations — the
+            // precise collector already skips a null pointer slot
+            // (`zap_is_heap_ptr` in `zapgc.inc.c`), so a niche optional needs no
+            // GC change.
+            Inst::NullConst { dest } => {
+                let null = self.ctx.ptr_type(AddressSpace::default()).const_null();
+                vals[*dest as usize] = Some(null.into());
+            }
+            Inst::IsNull { dest, val } => {
+                let p = get(vals, *val).into_pointer_value();
+                let c = b.build_is_null(p, "isnull").map_err(|e| e.to_string())?;
+                vals[*dest as usize] = Some(c.into());
             }
             Inst::Bin { dest, op, lhs, rhs } => {
                 let ty = f.value_ty(*dest);

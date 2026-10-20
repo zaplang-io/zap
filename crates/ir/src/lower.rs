@@ -102,6 +102,31 @@ struct EnumLow {
     members: Vec<(String, i64)>,
     /// Variants in declaration order (tier-3).
     variants: Vec<VariantLow>,
+    /// The niche optimization (I#154, D-0064 #4), set for a tier-3 enum of the
+    /// `Option` shape — exactly two variants, one payload-free and one with a
+    /// single non-nullable-pointer field. Such an enum is represented as that
+    /// single nullable pointer: the payload-free variant is the null pointer, the
+    /// one-field variant *is* the payload pointer — one word, no tag, no
+    /// allocation. `None` for a tagged enum (value-type or multi-field payloads,
+    /// or a nullable/enum payload that would collide with the null niche).
+    niche: Option<NicheLow>,
+}
+
+/// The niche layout of an `Option`-shaped tier-3 enum (I#154, D-0064 #4). The
+/// value's ZIR type stays `Struct(sid)` (so method dispatch still finds the
+/// enum's methods), but it is physically the payload pointer, with `None` the
+/// null pointer. Codegen treats every `Struct(sid)` as an opaque pointer, so no
+/// codegen type change is needed; the precise collector reads each live object's
+/// descriptor from its own header (dynamic) and skips null slots, so GC stays
+/// correct with no new mechanism.
+#[derive(Clone, Debug)]
+struct NicheLow {
+    /// The one-field (`Some`-like) variant's name.
+    some_variant: String,
+    /// The payload-free (`None`-like) variant's name.
+    none_variant: String,
+    /// The payload field's ZIR type — the niche's physical representation.
+    payload: Ty,
 }
 
 impl EnumLow {
@@ -390,6 +415,19 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     // struct `{ tag:i32, <flattened payload fields> }` and record each variant's
     // tag and its fields' struct indices.
     let mut enums: HashMap<String, EnumLow> = HashMap::new();
+    // Sids reserved for tier-3 (data-carrying) enums: a payload of one of these is
+    // itself a nullable/tagged value, so it can never be a niche's non-null
+    // payload (I#154, D-0064 #4).
+    let enum_sids: HashSet<u32> = module
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            ast::Item::Enum(e) if e.variants.iter().any(|v| !v.fields.is_empty()) => {
+                Some(ids[&e.name])
+            }
+            _ => None,
+        })
+        .collect();
     {
         // A borrow of `ids`/`enums` is needed to resolve payload field types,
         // but enum entries are inserted as they are built, so recursive and
@@ -412,6 +450,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                             sid: None,
                             members,
                             variants: Vec::new(),
+                            niche: None,
                         },
                     );
                 } else {
@@ -443,6 +482,36 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                             fields: vfields,
                         });
                     }
+                    // Niche optimization (I#154, D-0064 #4): an `Option`-shaped
+                    // enum — exactly two variants, one payload-free and one with a
+                    // single field whose type is a non-nullable pointer (a
+                    // reference type that is neither a value struct nor another
+                    // tier-3 enum) — is represented as that single nullable
+                    // pointer. Value-type payloads (scalars, value structs) and
+                    // enum/nullable payloads keep the tagged representation.
+                    let niche = if variants.len() == 2 {
+                        let empty = variants.iter().find(|v| v.fields.is_empty());
+                        let single = variants.iter().find(|v| v.fields.len() == 1);
+                        match (empty, single) {
+                            (Some(none_v), Some(some_v)) if none_v.name != some_v.name => {
+                                let payload = some_v.fields[0].2;
+                                let tagged_payload = matches!(payload, Ty::Struct(psid)
+                                    if enum_sids.contains(&psid) || value_ids.contains(&psid));
+                                if payload.is_ptr() && !tagged_payload {
+                                    Some(NicheLow {
+                                        some_variant: some_v.name.clone(),
+                                        none_variant: none_v.name.clone(),
+                                        payload,
+                                    })
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     enums.insert(
                         e.name.clone(),
                         EnumLow {
@@ -450,6 +519,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                             sid: Some(sid),
                             members: Vec::new(),
                             variants,
+                            niche,
                         },
                     );
                 }
@@ -5853,6 +5923,14 @@ impl<'a> FnLower<'a> {
             )));
         }
         let sid = info.sid.expect("tier-3 enum has a struct id");
+        // Niche optimization (I#154, D-0064 #4): the payload-free variant of a
+        // niche enum is the null pointer (`Option.None`), typed as the enum so
+        // method dispatch still resolves.
+        if info.niche.is_some() {
+            let dest = self.new_value(Ty::Struct(sid));
+            self.emit(Inst::NullConst { dest });
+            return Ok((dest, Ty::Struct(sid)));
+        }
         self.build_variant(sid, &v, &[])
     }
 
@@ -5882,6 +5960,23 @@ impl<'a> FnLower<'a> {
             .ok_or_else(|| err(format!("enum '{enum_name}' has no variant '{variant}'")))?
             .clone();
         let sid = info.sid.expect("tier-3 enum has a struct id");
+        // Niche optimization (I#154, D-0064 #4): the one-field variant of a niche
+        // enum (`Option.Some(p)`) IS the payload pointer — no allocation, no tag.
+        // The value keeps the enum's ZIR type so method dispatch resolves; it is
+        // physically the payload pointer (both are opaque pointers to codegen).
+        if let Some(n) = &info.niche {
+            let payload = n.payload;
+            if variant == n.some_variant {
+                if args.len() != 1 {
+                    return Err(err(format!(
+                        "niche variant '{enum_name}.{variant}' takes exactly one value"
+                    )));
+                }
+                let (val, vt) = self.expr(&args[0].value)?;
+                let val = self.coerce(val, vt, payload);
+                return Ok((val, Ty::Struct(sid)));
+            }
+        }
         self.build_variant(sid, &v, args)
     }
 
@@ -6061,6 +6156,26 @@ impl<'a> FnLower<'a> {
                 .variant(&path[1])
                 .ok_or_else(|| err(format!("enum '{}' has no variant '{}'", path[0], path[1])))?;
             let sid = info.sid.expect("tier-3 enum has a struct id");
+            // Niche optimization (I#154, D-0064 #4): the tag-free test — the
+            // payload-free variant matches a null pointer, the one-field variant a
+            // non-null one.
+            if let Some(n) = &info.niche {
+                let isnull = self.new_value(Ty::I1);
+                self.emit(Inst::IsNull {
+                    dest: isnull,
+                    val: sv,
+                });
+                if path[1] == n.none_variant {
+                    return Ok((isnull, false));
+                }
+                let nonnull = self.new_value(Ty::I1);
+                self.emit(Inst::Un {
+                    dest: nonnull,
+                    op: UnOp::Not,
+                    val: isnull,
+                });
+                return Ok((nonnull, false));
+            }
             let tagv = self.new_value(Ty::I32);
             self.emit(Inst::FieldGet {
                 dest: tagv,
@@ -6094,6 +6209,22 @@ impl<'a> FnLower<'a> {
                     .get(&path[0])
                     .cloned()
                     .ok_or_else(|| err(format!("'{}' is not an enum", path[0])))?;
+                // Niche optimization (I#154, D-0064 #4): `Some(x)` binds `x` to the
+                // pointer itself (reinterpreted as the payload type); `None` binds
+                // nothing. There is no tagged struct to read a field from.
+                if let Some(n) = &info.niche {
+                    if path[1] == n.some_variant {
+                        if let Some(a) = args.first() {
+                            if let Pattern::Capture { name, .. } = &a.pattern {
+                                let payload = n.payload;
+                                let slot = self.alloca(payload);
+                                self.store(slot, sv);
+                                self.declare(name, slot, payload);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
                 let Some(v) = info.variant(&path[1]).cloned() else {
                     return Ok(());
                 };
