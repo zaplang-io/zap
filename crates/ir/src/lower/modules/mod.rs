@@ -22,6 +22,7 @@ mod datetime;
 mod fs;
 mod gc;
 mod io;
+mod json;
 mod math;
 mod os;
 mod process;
@@ -64,6 +65,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     random::MODULE,
     time::MODULE,
     datetime::MODULE,
+    json::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

@@ -5845,3 +5845,244 @@ void zap_random_shuffle(void *l) {
     }
     pthread_mutex_unlock(&zap_rng_mu);
 }
+
+/* ===========================================================================
+ * json — JSON tokenizer cursor (ticket #100 / #131, D-0059)
+ *
+ * A pull lexer over an in-memory str/bytes source. The high-level tree build
+ * (json.loads) and serialization (json.dumps) live in Zap prelude functions
+ * (see PRELUDE_SRC) that drive this cursor through the internal `json._lex_*`
+ * seam primitives — so JSON<->JsonValue construction stays in compiler-emitted
+ * code and this C never needs to know the JsonValue struct layout.
+ *
+ * The cursor is a pointer-free leaf (zap_buf): it keeps a raw pointer into the
+ * source ZapStr's byte buffer (the caller keeps the source live across the
+ * parse), plus the current token's kind and decoded scalar value.
+ * ======================================================================== */
+#include <errno.h>
+
+enum {
+    ZAP_JTOK_END = 0,
+    ZAP_JTOK_NULL = 1,
+    ZAP_JTOK_TRUE = 2,
+    ZAP_JTOK_FALSE = 3,
+    ZAP_JTOK_INT = 4,
+    ZAP_JTOK_FLOAT = 5,
+    ZAP_JTOK_STR = 6,
+    ZAP_JTOK_LBRACE = 7,
+    ZAP_JTOK_RBRACE = 8,
+    ZAP_JTOK_LBRACKET = 9,
+    ZAP_JTOK_RBRACKET = 10,
+    ZAP_JTOK_COLON = 11,
+    ZAP_JTOK_COMMA = 12,
+    ZAP_JTOK_ERR = -1
+};
+
+typedef struct {
+    const char *data;
+    int64_t len;
+    int64_t pos;
+    int64_t kind;      /* current token kind (ZAP_JTOK_*) */
+    int64_t ival;      /* ZAP_JTOK_INT value */
+    double fval;       /* ZAP_JTOK_FLOAT value */
+    const char *sdata; /* ZAP_JTOK_STR: start of raw content (inside the quotes) */
+    int64_t slen;      /* ZAP_JTOK_STR: raw content length */
+    int64_t has_esc;   /* ZAP_JTOK_STR: content contains backslash escapes */
+} ZapJsonLex;
+
+/* Open a cursor over a str/bytes source (a ZapStr*). */
+void *zap_json_lex_new(void *s) {
+    ZapStr *z = (ZapStr *)s;
+    ZapJsonLex *lx = (ZapJsonLex *)zap_buf((int64_t)sizeof(ZapJsonLex));
+    lx->data = z->data;
+    lx->len = z->len;
+    lx->pos = 0;
+    lx->kind = ZAP_JTOK_END;
+    lx->ival = 0;
+    lx->fval = 0.0;
+    lx->sdata = NULL;
+    lx->slen = 0;
+    lx->has_esc = 0;
+    return lx;
+}
+
+static int zap_json_is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* Advance to and classify the next token; returns (and stores) its kind. */
+int64_t zap_json_lex_next(void *h) {
+    ZapJsonLex *lx = (ZapJsonLex *)h;
+    const char *d = lx->data;
+    int64_t n = lx->len;
+    int64_t i = lx->pos;
+    while (i < n && zap_json_is_ws(d[i])) {
+        i++;
+    }
+    if (i >= n) {
+        lx->pos = i;
+        lx->kind = ZAP_JTOK_END;
+        return ZAP_JTOK_END;
+    }
+    char c = d[i];
+    switch (c) {
+    case '{': lx->pos = i + 1; lx->kind = ZAP_JTOK_LBRACE; return lx->kind;
+    case '}': lx->pos = i + 1; lx->kind = ZAP_JTOK_RBRACE; return lx->kind;
+    case '[': lx->pos = i + 1; lx->kind = ZAP_JTOK_LBRACKET; return lx->kind;
+    case ']': lx->pos = i + 1; lx->kind = ZAP_JTOK_RBRACKET; return lx->kind;
+    case ':': lx->pos = i + 1; lx->kind = ZAP_JTOK_COLON; return lx->kind;
+    case ',': lx->pos = i + 1; lx->kind = ZAP_JTOK_COMMA; return lx->kind;
+    case '"': {
+        int64_t start = i + 1;
+        int64_t j = start;
+        int64_t esc = 0;
+        while (j < n && d[j] != '"') {
+            if (d[j] == '\\') {
+                esc = 1;
+                j += (j + 1 < n) ? 2 : 1;
+            } else {
+                j++;
+            }
+        }
+        lx->sdata = d + start;
+        lx->slen = (j <= n ? j : n) - start;
+        lx->has_esc = esc;
+        lx->kind = ZAP_JTOK_STR;
+        lx->pos = (j < n) ? j + 1 : n; /* consume the closing quote */
+        return lx->kind;
+    }
+    default:
+        break;
+    }
+    if (c == 'n' && i + 4 <= n && memcmp(d + i, "null", 4) == 0) {
+        lx->pos = i + 4;
+        lx->kind = ZAP_JTOK_NULL;
+        return lx->kind;
+    }
+    if (c == 't' && i + 4 <= n && memcmp(d + i, "true", 4) == 0) {
+        lx->pos = i + 4;
+        lx->kind = ZAP_JTOK_TRUE;
+        return lx->kind;
+    }
+    if (c == 'f' && i + 5 <= n && memcmp(d + i, "false", 5) == 0) {
+        lx->pos = i + 5;
+        lx->kind = ZAP_JTOK_FALSE;
+        return lx->kind;
+    }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        int64_t start = i;
+        int is_float = 0;
+        if (d[i] == '-') {
+            i++;
+        }
+        while (i < n && d[i] >= '0' && d[i] <= '9') {
+            i++;
+        }
+        if (i < n && d[i] == '.') {
+            is_float = 1;
+            i++;
+            while (i < n && d[i] >= '0' && d[i] <= '9') {
+                i++;
+            }
+        }
+        if (i < n && (d[i] == 'e' || d[i] == 'E')) {
+            is_float = 1;
+            i++;
+            if (i < n && (d[i] == '+' || d[i] == '-')) {
+                i++;
+            }
+            while (i < n && d[i] >= '0' && d[i] <= '9') {
+                i++;
+            }
+        }
+        int64_t tlen = i - start;
+        char buf[80];
+        int64_t cl = tlen < 79 ? tlen : 79;
+        memcpy(buf, d + start, (size_t)cl);
+        buf[cl] = 0;
+        if (!is_float) {
+            errno = 0;
+            char *end = NULL;
+            long long v = strtoll(buf, &end, 10);
+            if (errno == 0 && end == buf + cl) {
+                lx->ival = (int64_t)v;
+                lx->kind = ZAP_JTOK_INT;
+                lx->pos = i;
+                return lx->kind;
+            }
+            /* overflow / out-of-i64: fall back to float (D-0059) */
+        }
+        lx->fval = strtod(buf, NULL);
+        lx->kind = ZAP_JTOK_FLOAT;
+        lx->pos = i;
+        return lx->kind;
+    }
+    lx->pos = i + 1;
+    lx->kind = ZAP_JTOK_ERR;
+    return lx->kind;
+}
+
+int64_t zap_json_lex_int(void *h) { return ((ZapJsonLex *)h)->ival; }
+double zap_json_lex_float(void *h) { return ((ZapJsonLex *)h)->fval; }
+
+/* Build a ZapStr from the current STR token, decoding escapes if present.
+ * Escapes never expand (\uXXXX -> at most 3 UTF-8 bytes from 6 source bytes),
+ * so the raw length is a safe output capacity. */
+void *zap_json_lex_str(void *h) {
+    ZapJsonLex *lx = (ZapJsonLex *)h;
+    const char *s = lx->sdata;
+    int64_t n = lx->slen;
+    if (!lx->has_esc) {
+        return zap_str_new(s, n);
+    }
+    char *out = (char *)zap_buf(n > 0 ? n : 1);
+    int64_t o = 0;
+    for (int64_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\\' && i + 1 < n) {
+            char e = s[++i];
+            switch (e) {
+            case 'n': out[o++] = '\n'; break;
+            case 't': out[o++] = '\t'; break;
+            case 'r': out[o++] = '\r'; break;
+            case 'b': out[o++] = '\b'; break;
+            case 'f': out[o++] = '\f'; break;
+            case '/': out[o++] = '/'; break;
+            case '\\': out[o++] = '\\'; break;
+            case '"': out[o++] = '"'; break;
+            case 'u': {
+                if (i + 4 < n) {
+                    unsigned int cp = 0;
+                    for (int k = 0; k < 4; k++) {
+                        char hx = s[i + 1 + k];
+                        cp <<= 4;
+                        if (hx >= '0' && hx <= '9') {
+                            cp |= (unsigned)(hx - '0');
+                        } else if (hx >= 'a' && hx <= 'f') {
+                            cp |= (unsigned)(hx - 'a' + 10);
+                        } else if (hx >= 'A' && hx <= 'F') {
+                            cp |= (unsigned)(hx - 'A' + 10);
+                        }
+                    }
+                    i += 4;
+                    if (cp < 0x80) {
+                        out[o++] = (char)cp;
+                    } else if (cp < 0x800) {
+                        out[o++] = (char)(0xC0 | (cp >> 6));
+                        out[o++] = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        out[o++] = (char)(0xE0 | (cp >> 12));
+                        out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        out[o++] = (char)(0x80 | (cp & 0x3F));
+                    }
+                }
+                break;
+            }
+            default: out[o++] = e; break;
+            }
+        } else {
+            out[o++] = c;
+        }
+    }
+    return zap_str_new(out, o);
+}

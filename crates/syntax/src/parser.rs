@@ -97,6 +97,23 @@ enum JsonValue:
     Str(str s)
     Array(list[JsonValue] items)
     Object(dict[str, JsonValue] fields)
+
+def __json_loads(str s) -> JsonValue:
+    auto c = json._lex_new(s)
+    auto k = json._lex_next(c)
+    if k == 1:
+        return JsonValue.Null
+    if k == 2:
+        return JsonValue.Bool(True)
+    if k == 3:
+        return JsonValue.Bool(False)
+    if k == 4:
+        return JsonValue.Int(json._lex_int(c))
+    if k == 5:
+        return JsonValue.Float(json._lex_float(c))
+    if k == 6:
+        return JsonValue.Str(json._lex_str(c))
+    return JsonValue.Null
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to

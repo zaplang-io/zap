@@ -18,6 +18,7 @@ mod datetime;
 mod fs;
 mod gc;
 mod io;
+mod json;
 mod math;
 mod os;
 mod process;
@@ -44,4 +45,5 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     random::declare_rt(cg);
     time::declare_rt(cg);
     datetime::declare_rt(cg);
+    json::declare_rt(cg);
 }

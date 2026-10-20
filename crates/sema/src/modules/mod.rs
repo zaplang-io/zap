@@ -22,6 +22,7 @@ mod datetime;
 mod fs;
 mod gc;
 mod io;
+mod json;
 mod math;
 mod os;
 mod process;
@@ -59,6 +60,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     random::MODULE,
     time::MODULE,
     datetime::MODULE,
+    json::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute
