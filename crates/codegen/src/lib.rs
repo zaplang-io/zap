@@ -140,6 +140,12 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         // modules (ticket #106); the dev container / CI provide `zlib1g-dev`
         // and it ships on macOS.
         .arg("-lz")
+        // `-lssl -lcrypto` provide the system OpenSSL/LibreSSL backing the `tls`
+        // module and the `http` `https://` client (ticket #147, D-0062); the dev
+        // container / CI provide `libssl-dev` (OpenSSL 3.x on Ubuntu 24.04) and
+        // LibreSSL ships on macOS. `-lssl` depends on `-lcrypto`, so that order.
+        .arg("-lssl")
+        .arg("-lcrypto")
         // `-lpthread` backs the goroutine runtime (ticket #25): each `spawn`
         // starts a GC-registered pthread, and channels block on pthread
         // mutex/condvars. `libgc` must be thread-aware (the runtime defines

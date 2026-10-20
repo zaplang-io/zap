@@ -41,6 +41,7 @@ mod support;
 mod sync;
 mod sys;
 mod time;
+mod tls;
 mod zlib;
 
 /// A module's per-method lowering hook: lower `method(args)` to ZIR, emitting the
@@ -86,6 +87,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     sync::MODULE,
     net::MODULE,
     http::MODULE,
+    tls::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not
