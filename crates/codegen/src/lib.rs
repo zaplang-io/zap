@@ -136,6 +136,10 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         // `-lpcre2-8` provides the 8-bit PCRE2 API the regex runtime wraps
         // (ticket #23); the dev container / CI provide `libpcre2-dev`.
         .arg("-lpcre2-8")
+        // `-lz` provides the system zlib backing the `zlib`/`gzip` compression
+        // modules (ticket #106); the dev container / CI provide `zlib1g-dev`
+        // and it ships on macOS.
+        .arg("-lz")
         // `-lpthread` backs the goroutine runtime (ticket #25): each `spawn`
         // starts a GC-registered pthread, and channels block on pthread
         // mutex/condvars. `libgc` must be thread-aware (the runtime defines

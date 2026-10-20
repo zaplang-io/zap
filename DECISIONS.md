@@ -904,3 +904,39 @@ the shared substrate once rather than extract-on-second-use; a compiler built-in
 derive delivers the high-value typed path (gates AWS #89, web #107) without waiting
 on staged generics/macros; the `Int`/`Float` split honors Zap's static-typing
 pitch; recursive-descent keeps v1 small and correct with a clean SIMD upgrade path.
+
+## D-0060 — `zlib`/`gzip` compression: link system zlib on the #121 seam
+**Status:** Locked — resolves issue #106 (listed under D-0056's bundled std)
+**Surface** (flat modules on the #121 seam; `import zlib`/`import gzip` accepted,
+not required, like `crypto`/`signal`):
+- `zlib.compress(data: str|bytes, level?: int) -> bytes` — zlib wrapper (RFC 1950,
+  Adler-32 trailer). `zlib.decompress(data) -> bytes`.
+- `gzip.compress(data: str|bytes, level?: int) -> bytes` — gzip wrapper (RFC 1952,
+  **ISO CRC32**, poly 0x04C11DB7). `gzip.decompress(data) -> bytes`.
+- `zlib.crc32(data) -> int` / `zlib.adler32(data) -> int` — the running checksums
+  (unsigned 32-bit widened to `int`), the natural known-vector surface and useful
+  on their own. `level` defaults to `Z_DEFAULT_COMPRESSION` (-1).
+
+**Implementation:**
+- **Link the system zlib (`-lz`)** rather than vendoring a DEFLATE — the dev
+  container / CI already install `zlib1g-dev` and it ships on macOS, so this adds
+  a one-line link flag and a `#include <zlib.h>`, not a new package. zlib is the
+  reference DEFLATE and gets both wrappers and both checksums provably correct
+  (the gzip CRC32 is ISO CRC32, **not** the SSE4.2 CRC32C/Castagnoli).
+- Thin `zap_zlib_*` / `zap_gzip_*` wrappers in one new `zaprt.c` banner section:
+  single input buffer, output grown in ≤64 KiB steps so zlib's 32-bit `avail_out`
+  never overflows; framing selected by `windowBits` (15 = zlib, 31 = gzip).
+  Malformed/truncated input **raises a Zap exception** (`zap_panic`) instead of
+  aborting. `str`/`bytes` are the same binary-safe `ZapStr`; results are `bytes`.
+- **No grammar change** (plain module calls); **no new type** (reuses `bytes`).
+
+**Deferred (noted in the PR):** streaming/incremental compression (a `compressobj`
+/ `decompressobj`-style feed+flush handle), a raw-DEFLATE (headerless) mode,
+dictionary presets, and inputs larger than ~4 GiB (zlib's 32-bit `avail_in`).
+`tar`/`zip` archives stay deferred per D-0056.
+
+**Rationale:** linking the ubiquitous, battle-tested zlib is the lowest-risk path
+to correct DEFLATE + both framings + both checksums, keeps the runtime small, and
+makes a gzip-enabled `http` server (D-0056) trivial; a hand-rolled DEFLATE would
+be a large correctness/perf liability for no benefit when the library is already
+present in every target environment.
