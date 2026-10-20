@@ -17,9 +17,14 @@ use zapc_syntax::span::Span;
 
 use crate::{Checker, Ty};
 
+mod fs;
 mod gc;
+mod io;
+mod os;
+mod process;
 mod runtime;
 mod signal;
+mod sys;
 
 /// A built-in module's type-checking facet.
 pub(crate) struct ModuleCheck {
@@ -35,7 +40,16 @@ pub(crate) struct ModuleCheck {
 ///
 /// Add a module: create `modules/<name>.rs` with `pub(super) const MODULE:
 /// ModuleCheck` and append it here. Order is irrelevant (names are unique).
-pub(crate) const MODULES: &[ModuleCheck] = &[signal::MODULE, gc::MODULE, runtime::MODULE];
+pub(crate) const MODULES: &[ModuleCheck] = &[
+    signal::MODULE,
+    gc::MODULE,
+    runtime::MODULE,
+    os::MODULE,
+    sys::MODULE,
+    io::MODULE,
+    fs::MODULE,
+    process::MODULE,
+];
 
 /// Type-check a built-in `signal`/`gc`/`runtime`-style module call, returning the
 /// result type, or `None` if `module` is not a registered built-in module (so the

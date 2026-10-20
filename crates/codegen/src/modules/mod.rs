@@ -13,9 +13,14 @@
 
 use super::Cg;
 
+mod fs;
 mod gc;
+mod io;
+mod os;
+mod process;
 mod runtime;
 mod signal;
+mod sys;
 
 /// Declare every built-in module's runtime entry points (ticket #121). Called
 /// once from `Cg::translate`. Add a module: create `modules/<name>.rs` with
@@ -24,4 +29,9 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     signal::declare_rt(cg);
     gc::declare_rt(cg);
     runtime::declare_rt(cg);
+    os::declare_rt(cg);
+    sys::declare_rt(cg);
+    io::declare_rt(cg);
+    fs::declare_rt(cg);
+    process::declare_rt(cg);
 }
