@@ -2854,7 +2854,9 @@ mod tests {
         assert_eq!(f.generics.len(), 2);
         assert_eq!(f.generics[0].name, "T");
         // `T: Ordered` carries the bound.
-        assert!(matches!(&f.generics[0].bound, Some(Type::Named { name, .. }) if name == "Ordered"));
+        assert!(
+            matches!(&f.generics[0].bound, Some(Type::Named { name, .. }) if name == "Ordered")
+        );
         assert!(f.generics[1].bound.is_none());
     }
 

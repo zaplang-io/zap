@@ -151,16 +151,20 @@ impl<'a> Mono<'a> {
                 Item::Struct(s) => {
                     m.structs.insert(s.name.clone(), s);
                     if !s.generics.is_empty() {
-                        m.params
-                            .insert(s.name.clone(), s.generics.iter().map(|p| p.name.clone()).collect());
+                        m.params.insert(
+                            s.name.clone(),
+                            s.generics.iter().map(|p| p.name.clone()).collect(),
+                        );
                         m.gstructs.insert(s.name.clone(), s);
                     }
                 }
                 Item::Enum(e) => {
                     m.enums.insert(e.name.clone(), e);
                     if !e.generics.is_empty() {
-                        m.params
-                            .insert(e.name.clone(), e.generics.iter().map(|p| p.name.clone()).collect());
+                        m.params.insert(
+                            e.name.clone(),
+                            e.generics.iter().map(|p| p.name.clone()).collect(),
+                        );
                         m.genums.insert(e.name.clone(), e);
                     }
                 }
@@ -374,9 +378,7 @@ impl Mono<'_> {
             span: self.span,
         };
         let saved_subst = std::mem::replace(&mut self.cur_subst, subst);
-        let saved_self = self
-            .cur_self
-            .replace((generic.to_string(), args.to_vec()));
+        let saved_self = self.cur_self.replace((generic.to_string(), args.to_vec()));
 
         if let Some(s) = self.gstructs.get(generic).copied() {
             let mut fields = Vec::with_capacity(s.fields.len());
@@ -603,7 +605,11 @@ impl Mono<'_> {
                     span: *span,
                 }
             }
-            Stmt::Assign { target, value, span } => {
+            Stmt::Assign {
+                target,
+                value,
+                span,
+            } => {
                 let expected = cty_type(self.infer(target, env));
                 let (value, _) = self.rewrite_expr(value, env, expected.as_ref())?;
                 Stmt::Assign {
@@ -916,7 +922,9 @@ impl Mono<'_> {
             Expr::Float(..) => Ok((e.clone(), self.prim("float64"))),
             Expr::Imaginary(..) => Ok((e.clone(), self.prim("complex"))),
             Expr::Bool(..) => Ok((e.clone(), self.prim("bool"))),
-            Expr::Str { bytes, .. } => Ok((e.clone(), self.prim(if *bytes { "bytes" } else { "str" }))),
+            Expr::Str { bytes, .. } => {
+                Ok((e.clone(), self.prim(if *bytes { "bytes" } else { "str" })))
+            }
             Expr::None(span) => {
                 // The `None` sink (Fork I/O): when the expected type is a generic
                 // enum with a `None` variant, `None` constructs that instance's
@@ -934,11 +942,14 @@ impl Mono<'_> {
                             name: "None".to_string(),
                             span: *span,
                         };
-                        return Ok((node, CTy::Ty(Type::Named {
-                            name: name.clone(),
-                            args: args.clone(),
-                            span: *span,
-                        })));
+                        return Ok((
+                            node,
+                            CTy::Ty(Type::Named {
+                                name: name.clone(),
+                                args: args.clone(),
+                                span: *span,
+                            }),
+                        ));
                     }
                 }
                 Ok((e.clone(), CTy::NoneLit))
@@ -947,7 +958,9 @@ impl Mono<'_> {
                 let cty = env.lookup(n).unwrap_or(CTy::Unknown);
                 Ok((e.clone(), cty))
             }
-            Expr::Call { callee, args, span } => self.rewrite_call(callee, args, *span, env, expected),
+            Expr::Call { callee, args, span } => {
+                self.rewrite_call(callee, args, *span, env, expected)
+            }
             Expr::Attr { base, name, span } => self.rewrite_attr(base, name, *span, env, expected),
             Expr::Index { base, index, span } => {
                 // `G[args]` as a value is only meaningful as a construction/variant
@@ -1046,25 +1059,62 @@ impl Mono<'_> {
             // Comprehensions, lambdas, regex, yield: rewrite nested exprs where
             // they can carry generic references; bind the comprehension var as
             // unknown. These are not generic-typed in the first vertical.
-            Expr::ListComp { elem, var, iter, cond, span } => {
+            Expr::ListComp {
+                elem,
+                var,
+                iter,
+                cond,
+                span,
+            } => {
                 let iter = Box::new(self.rw(iter, env)?);
                 env.push();
                 env.declare(var, CTy::Unknown);
                 let elem = Box::new(self.rw(elem, env)?);
                 let cond = self.rw_opt(cond, env)?;
                 env.pop();
-                Ok((Expr::ListComp { elem, var: var.clone(), iter, cond, span: *span }, CTy::Unknown))
+                Ok((
+                    Expr::ListComp {
+                        elem,
+                        var: var.clone(),
+                        iter,
+                        cond,
+                        span: *span,
+                    },
+                    CTy::Unknown,
+                ))
             }
-            Expr::SetComp { elem, var, iter, cond, span } => {
+            Expr::SetComp {
+                elem,
+                var,
+                iter,
+                cond,
+                span,
+            } => {
                 let iter = Box::new(self.rw(iter, env)?);
                 env.push();
                 env.declare(var, CTy::Unknown);
                 let elem = Box::new(self.rw(elem, env)?);
                 let cond = self.rw_opt(cond, env)?;
                 env.pop();
-                Ok((Expr::SetComp { elem, var: var.clone(), iter, cond, span: *span }, CTy::Unknown))
+                Ok((
+                    Expr::SetComp {
+                        elem,
+                        var: var.clone(),
+                        iter,
+                        cond,
+                        span: *span,
+                    },
+                    CTy::Unknown,
+                ))
             }
-            Expr::DictComp { key, value, var, iter, cond, span } => {
+            Expr::DictComp {
+                key,
+                value,
+                var,
+                iter,
+                cond,
+                span,
+            } => {
                 let iter = Box::new(self.rw(iter, env)?);
                 env.push();
                 env.declare(var, CTy::Unknown);
@@ -1072,7 +1122,17 @@ impl Mono<'_> {
                 let value = Box::new(self.rw(value, env)?);
                 let cond = self.rw_opt(cond, env)?;
                 env.pop();
-                Ok((Expr::DictComp { key, value, var: var.clone(), iter, cond, span: *span }, CTy::Unknown))
+                Ok((
+                    Expr::DictComp {
+                        key,
+                        value,
+                        var: var.clone(),
+                        iter,
+                        cond,
+                        span: *span,
+                    },
+                    CTy::Unknown,
+                ))
             }
             Expr::Lambda { params, body, span } => Ok((
                 Expr::Lambda {
@@ -1104,7 +1164,11 @@ impl Mono<'_> {
         Ok(out)
     }
 
-    fn rw_opt(&mut self, x: &Option<Box<Expr>>, env: &mut Env) -> Result<Option<Box<Expr>>, LowerError> {
+    fn rw_opt(
+        &mut self,
+        x: &Option<Box<Expr>>,
+        env: &mut Env,
+    ) -> Result<Option<Box<Expr>>, LowerError> {
         Ok(match x {
             Some(e) => Some(Box::new(self.rw(e, env)?)),
             None => None,
@@ -1191,7 +1255,11 @@ impl Mono<'_> {
 
     /// If `base[index]` is a user generic type instantiation used in value
     /// position, request it and return `(mangled, generic_name, concrete_args)`.
-    fn try_type_instance(&mut self, base: &Expr, index: &Expr) -> Option<(String, String, Vec<Type>)> {
+    fn try_type_instance(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+    ) -> Option<(String, String, Vec<Type>)> {
         let Expr::Name(g, _) = base else { return None };
         if !self.is_generic(g) {
             return None;
@@ -1277,7 +1345,12 @@ impl Mono<'_> {
 
         // Generic enum variant construction: `G.Variant(...)` or
         // `G[args].Variant(...)`.
-        if let Expr::Attr { base, name: variant, span: aspan } = callee {
+        if let Expr::Attr {
+            base,
+            name: variant,
+            span: aspan,
+        } = callee
+        {
             if let Expr::Name(g, _) = base.as_ref() {
                 if self.is_generic_enum_variant(g, variant) {
                     let v = self.genums[g.as_str()]
@@ -1285,8 +1358,11 @@ impl Mono<'_> {
                         .iter()
                         .find(|v| &v.name == variant)
                         .unwrap();
-                    let fields: Vec<(String, Type)> =
-                        v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect();
+                    let fields: Vec<(String, Type)> = v
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.ty.clone()))
+                        .collect();
                     let cargs = self.instance_args(g, &fields, &argpairs, expected)?;
                     let mangled = self.request(&g.clone(), &cargs);
                     let node = Expr::Call {
@@ -1303,13 +1379,20 @@ impl Mono<'_> {
                 // Non-generic enum variant construction: leave the base, keep args.
                 if self.enums.contains_key(g) {
                     return Ok((
-                        Expr::Call { callee: Box::new(callee.clone()), args: nargs, span },
+                        Expr::Call {
+                            callee: Box::new(callee.clone()),
+                            args: nargs,
+                            span,
+                        },
                         CTy::Ty(self.named(g, Vec::new())),
                     ));
                 }
             }
             // Explicit type args on an enum variant: `G[args].Variant(...)`.
-            if let Expr::Index { base: ibase, index, .. } = base.as_ref() {
+            if let Expr::Index {
+                base: ibase, index, ..
+            } = base.as_ref()
+            {
                 if let Expr::Name(g, _) = ibase.as_ref() {
                     if self.genums.contains_key(g) {
                         if let Some(cargs) = self.type_args_from_index(index) {
@@ -1372,7 +1455,11 @@ impl Mono<'_> {
                 CTy::Unknown
             };
             return Ok((
-                Expr::Call { callee: Box::new(callee.clone()), args: nargs, span },
+                Expr::Call {
+                    callee: Box::new(callee.clone()),
+                    args: nargs,
+                    span,
+                },
                 cty,
             ));
         }
@@ -1397,7 +1484,11 @@ impl Mono<'_> {
         // Fallback: rewrite the callee structurally.
         let callee = self.rw(callee, env)?;
         Ok((
-            Expr::Call { callee: Box::new(callee), args: nargs, span },
+            Expr::Call {
+                callee: Box::new(callee),
+                args: nargs,
+                span,
+            },
             CTy::Unknown,
         ))
     }
@@ -1418,8 +1509,11 @@ impl Mono<'_> {
                     .iter()
                     .find(|v| v.name == name)
                     .unwrap();
-                let fields: Vec<(String, Type)> =
-                    v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect();
+                let fields: Vec<(String, Type)> = v
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect();
                 let cargs = self.instance_args(g, &fields, &[], expected)?;
                 let mangled = self.request(&g.clone(), &cargs);
                 return Ok((
@@ -1434,12 +1528,19 @@ impl Mono<'_> {
             // Non-generic enum member/variant value: leave as-is.
             if self.enums.contains_key(g) {
                 return Ok((
-                    Expr::Attr { base: Box::new(base.clone()), name: name.to_string(), span },
+                    Expr::Attr {
+                        base: Box::new(base.clone()),
+                        name: name.to_string(),
+                        span,
+                    },
                     CTy::Ty(self.named(g, Vec::new())),
                 ));
             }
         }
-        if let Expr::Index { base: ibase, index, .. } = base {
+        if let Expr::Index {
+            base: ibase, index, ..
+        } = base
+        {
             if let Expr::Name(g, bspan) = ibase.as_ref() {
                 if self.genums.contains_key(g) {
                     if let Some(cargs) = self.type_args_from_index(index) {
@@ -1464,13 +1565,21 @@ impl Mono<'_> {
             _ => CTy::Unknown,
         };
         Ok((
-            Expr::Attr { base: Box::new(bexpr), name: name.to_string(), span },
+            Expr::Attr {
+                base: Box::new(bexpr),
+                name: name.to_string(),
+                span,
+            },
             cty,
         ))
     }
 
     fn named(&self, name: &str, args: Vec<Type>) -> Type {
-        Type::Named { name: name.to_string(), args, span: self.span }
+        Type::Named {
+            name: name.to_string(),
+            args,
+            span: self.span,
+        }
     }
 
     /// Rewrite a match pattern, renaming a generic-enum variant path to its
@@ -1520,7 +1629,10 @@ impl Mono<'_> {
                 if let Some(t) = scty {
                     env.declare(name, CTy::Ty(t.clone()));
                 }
-                Ok(Pattern::Capture { name: name.clone(), span: *span })
+                Ok(Pattern::Capture {
+                    name: name.clone(),
+                    span: *span,
+                })
             }
             Pattern::Or(ps, span) => {
                 let mut np = Vec::with_capacity(ps.len());
@@ -1547,7 +1659,12 @@ impl Mono<'_> {
             .variants
             .iter()
             .find(|v| v.name == variant)
-            .map(|v| v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect())
+            .map(|v| {
+                v.fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut pos = 0usize;
         let mut out = Vec::with_capacity(args.len());
@@ -1580,7 +1697,12 @@ impl Mono<'_> {
             .enums
             .get(g)
             .and_then(|e| e.variants.iter().find(|v| v.name == variant))
-            .map(|v| v.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect())
+            .map(|v| {
+                v.fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut pos = 0usize;
         for a in args {
