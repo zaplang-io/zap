@@ -97,8 +97,10 @@ docker-shell:
 	docker run --rm -it $(LIMITS) $(MOUNTS) $(ENVS) $(IMAGE) bash
 
 ## Compile and run a .zap file in the container, e.g. make docker-run FILE=tests/golden/fib.zap
+# `--bin zap`: the zapc crate ships two binaries (zap, zapc) and sets no
+# default-run, so `cargo run -p zapc` alone can't pick one.
 docker-run:
-	$(DOCKER_RUN) cargo run -q -p zapc --features llvm -- run $(FILE)
+	$(DOCKER_RUN) cargo run -q -p zapc --features llvm --bin zap -- run $(FILE)
 
 ## Fast host-side type-check of the LLVM-free crates (front end + driver). No
 ## container, no codegen, no link — the quickest iteration loop. Keeps cargo's
