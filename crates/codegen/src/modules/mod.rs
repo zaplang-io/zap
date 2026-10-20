@@ -14,6 +14,8 @@
 use super::Cg;
 
 mod gc;
+mod math;
+mod random;
 mod runtime;
 mod signal;
 
@@ -24,4 +26,6 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     signal::declare_rt(cg);
     gc::declare_rt(cg);
     runtime::declare_rt(cg);
+    math::declare_rt(cg);
+    random::declare_rt(cg);
 }
