@@ -314,7 +314,15 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     // Prepend the built-in prelude (`Signal` enum, `MemStats` struct) so the
     // signals surface lowers through the ordinary enum/struct paths. Must match
     // the set sema sees (both call the same helper), ticket #77.
-    let module = &zapc_syntax::parser::with_prelude(module);
+    let module = zapc_syntax::parser::with_prelude(module);
+    // Monomorphize user generics to concrete declarations (I#154, D-0017/D-0064)
+    // before any id/type collection runs, so the rest of lowering and all of
+    // codegen only ever see concrete types.
+    let module = match crate::mono::monomorphize(&module) {
+        Ok(m) => m,
+        Err(e) => return (Module::default(), vec![e]),
+    };
+    let module = &module;
     let mut errors = Vec::new();
 
     // Collect struct ids and tier-3-enum tagged-struct ids (a tier-3 enum is
@@ -600,6 +608,27 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     sigs.insert(format!("{}__{}", s.name, m.name), (params, ret));
                 }
             }
+            // Tier-3 enum methods (D-0046; used by generic `Option[T]` etc.,
+            // I#154). A tier-3 enum lowers to a tagged struct, so `self` is that
+            // struct and a method call dispatches through the ordinary
+            // struct-method path. Tier-1 enum methods are not lowered yet.
+            ast::Item::Enum(e) => {
+                if let Some(sid) = ctx.enums.get(&e.name).and_then(|i| i.sid) {
+                    for m in &e.methods {
+                        let params = m
+                            .params
+                            .iter()
+                            .map(|p| param_ty(p, Some(sid), &ctx))
+                            .collect();
+                        let ret = m
+                            .ret
+                            .as_ref()
+                            .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
+                            .unwrap_or(Ty::Void);
+                        sigs.insert(format!("{}__{}", e.name, m.name), (params, ret));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -722,6 +751,19 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[]) {
                         Ok(func) => out.funcs.push(func),
                         Err(e) => errors.push(e),
+                    }
+                }
+            }
+            // Tier-3 enum methods (D-0046 / I#154): lowered like struct methods
+            // on the tagged-struct `self`.
+            ast::Item::Enum(e) => {
+                if let Some(sid) = ctx.enums.get(&e.name).and_then(|i| i.sid) {
+                    for m in &e.methods {
+                        let name = format!("{}__{}", e.name, m.name);
+                        match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[]) {
+                            Ok(func) => out.funcs.push(func),
+                            Err(e) => errors.push(e),
+                        }
                     }
                 }
             }

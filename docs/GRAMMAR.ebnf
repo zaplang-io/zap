@@ -77,9 +77,15 @@ enum_def      ::= decorators "enum" IDENT [ generics ] ":" NEWLINE
                      variant makes the whole enum a tagged value (D-0018/D-0046).
                      `function` = methods on the enum (D-0046); [ generics ] is
                      reserved now, monomorphized when user generics land. *)
-enum_member   ::= IDENT [ "=" expr ] NEWLINE                 (* tier-1 constant *)
-                | IDENT "(" variant_field { "," variant_field } ")" NEWLINE ;
+enum_member   ::= variant_name [ "=" expr ] NEWLINE          (* tier-1 constant *)
+                | variant_name "(" variant_field { "," variant_field } ")" NEWLINE ;
                   (* tier-3 data-carrying variant; D-0046 *)
+variant_name  ::= IDENT | "None" ;
+                  (* `None` is a keyword (the null literal) but is also accepted
+                     as a variant name — the empty variant of `Option[T]` and
+                     similar sum types (I#154 Fork O, D-0064). It is likewise
+                     accepted as a member name after `.` (`opt.None`,
+                     `case Option.None:`). *)
 variant_field ::= type IDENT ;                               (* type-first, named *)
 
 annotation_def ::= "annotation" IDENT ":" NEWLINE

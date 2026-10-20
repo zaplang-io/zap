@@ -100,6 +100,37 @@ fn immix_reclaims_with_parked_coroutines() {
     assert_eq!(stdout.trim_end(), "kept\nkept");
 }
 
+/// Reclamation of monomorphized generic instances (I#154, D-0064). A loop
+/// churns far more pointer-bearing generic heap objects (`Option[str]`,
+/// `Pair[int64, str]`) than the heap cap, keeping only a tiny live set.
+/// Completing within the cap requires the collector to reclaim them — which it
+/// can do correctly only if each monomorphized instance's `ZapTypeDesc` pointer
+/// map is right (the "GC metadata is free" theorem: a wrong map would mis-trace
+/// the `str` field or follow the `i64` field as a pointer and crash/corrupt).
+#[test]
+fn immix_reclaims_generic_instances() {
+    let src = "struct Pair[A, B]:\n    A first\n    B second\n\n\
+               def main():\n    \
+                   auto n = 0\n    \
+                   for i in range(0, 300000):\n        \
+                       Pair[int64, str] p = Pair(i, \"payload\")\n        \
+                       Option[str] o = Option.Some(p.second)\n        \
+                       Option[int64] q = Option.Some(p.first)\n        \
+                       if o.is_some():\n            \
+                           n = n + q.unwrap()\n    \
+                   print(n)\n";
+    let (ok, stdout, stderr) = run_capped(src, 24 * 1024 * 1024);
+    assert!(
+        ok,
+        "capped generic-churn program should complete via collection; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout.trim_end(),
+        "44999850000",
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+}
+
 /// Compile and run `src` with no heap cap; return (success, stdout, stderr).
 fn run(src: &str) -> (bool, String, String) {
     use std::sync::atomic::{AtomicU64, Ordering};

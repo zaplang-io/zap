@@ -6,6 +6,9 @@
 
 pub mod ir;
 pub mod lower;
+/// Monomorphization: turn user-defined generics into concrete declarations
+/// before lowering (I#154, D-0017/D-0064).
+pub mod mono;
 
 pub use ir::{
     BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem, Func, Inst, Module, Owner, Term, Ty,

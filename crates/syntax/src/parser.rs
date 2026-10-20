@@ -89,6 +89,38 @@ value struct DateTime:
     int64 minute
     int64 second
 
+enum Option[T]:
+    Some(T value)
+    None
+
+    def is_some(self) -> bool:
+        match self:
+            case Option.Some(v):
+                return True
+            case Option.None:
+                return False
+
+    def is_none(self) -> bool:
+        match self:
+            case Option.Some(v):
+                return False
+            case Option.None:
+                return True
+
+    def unwrap(self) -> T:
+        match self:
+            case Option.Some(v):
+                return v
+            case Option.None:
+                raise \"called unwrap on an Option.None value\"
+
+    def unwrap_or(self, T fallback) -> T:
+        match self:
+            case Option.Some(v):
+                return v
+            case Option.None:
+                return fallback
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -406,6 +438,9 @@ fn references_prelude(module: &Module) -> bool {
         "\"JsonScanner\"",
         "\"yaml\"",
         "\"Yaml\"",
+        // The generic `Option[T]` ships in the prelude (I#154, D-0064); inject it
+        // for any program that names it.
+        "\"Option\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
@@ -582,6 +617,20 @@ impl Parser {
         }
     }
 
+    /// A member name in a `.name` position or an `Enum.Variant` pattern path.
+    /// Accepts an ordinary identifier, plus the `None` keyword — `None` doubles
+    /// as the conventional empty-variant name of `Option[T]` and similar sum
+    /// types (I#154 Fork O), so `opt.None` / `case Option.None:` must read it as a
+    /// member rather than the null literal.
+    fn member_name(&mut self, what: &str) -> String {
+        if self.is_kw(Keyword::None) {
+            self.bump();
+            "None".to_string()
+        } else {
+            self.ident(what)
+        }
+    }
+
     fn skip_newlines(&mut self) {
         while self.is(&TokenKind::Newline) {
             self.bump();
@@ -682,12 +731,26 @@ impl Parser {
         name
     }
 
-    fn parse_generics(&mut self) -> Vec<String> {
+    fn parse_generics(&mut self) -> Vec<TypeParam> {
         let mut v = Vec::new();
         if self.eat(&TokenKind::LBracket) {
             if !self.is(&TokenKind::RBracket) {
                 loop {
-                    v.push(self.ident("type parameter"));
+                    let start = self.peek_span().start;
+                    let name = self.ident("type parameter");
+                    // Optional interface bound (`[T: Ordered]`, D-0017/I#154 Fork
+                    // B). Parsed and carried so the grammar round-trips; bound
+                    // enforcement is deferred to a later slice.
+                    let bound = if self.eat(&TokenKind::Colon) {
+                        Some(self.parse_type())
+                    } else {
+                        None
+                    };
+                    v.push(TypeParam {
+                        name,
+                        bound,
+                        span: self.span_from(start),
+                    });
                     if !self.eat(&TokenKind::Comma) {
                         break;
                     }
@@ -850,7 +913,15 @@ impl Parser {
                 continue;
             }
             let vstart = self.peek_span().start;
-            let vname = self.ident("variant name");
+            // `None` is a keyword (the null literal) but is also the conventional
+            // empty-variant name for `Option[T]` and similar sum types (I#154
+            // Fork O); accept it here as a variant name.
+            let vname = if self.is_kw(Keyword::None) {
+                self.bump();
+                "None".to_string()
+            } else {
+                self.ident("variant name")
+            };
             // A data-carrying variant: `Circle(f64 r, f64 g, ...)` (D-0046).
             // Type-first named payload fields in parentheses.
             let mut fields = Vec::new();
@@ -1970,7 +2041,7 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     self.bump();
-                    let name = self.ident("attribute name");
+                    let name = self.member_name("attribute name");
                     e = Expr::Attr {
                         base: Box::new(e),
                         name,
@@ -2046,6 +2117,27 @@ impl Parser {
                 lo,
                 hi,
                 step,
+                span: self.span_from(start),
+            }
+        } else if self.is(&TokenKind::Comma) {
+            // A comma-separated postfix `base[a, b, ...]` is a multi-element
+            // subscript. Classified in sema/monomorphization: when `base` names a
+            // type or generic callee it is call-site type arguments
+            // (`Pair[int64, str]`, `map[int64, str]`, I#154 Fork S); otherwise it
+            // is a tuple value subscript. The parser produces a uniform node: the
+            // index is a tuple of the elements.
+            let tstart = self.peek_span().start;
+            let mut elems = vec![*lo.expect("lo parsed before a comma")];
+            while self.eat(&TokenKind::Comma) {
+                if self.is(&TokenKind::RBracket) {
+                    break; // trailing comma
+                }
+                elems.push(self.parse_expr());
+            }
+            self.expect(&TokenKind::RBracket, "']'");
+            Expr::Index {
+                base: Box::new(base),
+                index: Box::new(Expr::Tuple(elems, self.span_from(tstart))),
                 span: self.span_from(start),
             }
         } else {
@@ -2295,7 +2387,7 @@ impl Parser {
                 // (D-0018/D-0046). Enum members/variants are matched qualified.
                 let mut path = vec![name.clone()];
                 while self.eat(&TokenKind::Dot) {
-                    path.push(self.ident("qualified pattern name"));
+                    path.push(self.member_name("qualified pattern name"));
                 }
                 // Struct / enum-variant pattern: `Path(pat_args)`. Arguments are
                 // positional (`r`) or by name (`h=h`), developer's choice
@@ -2734,6 +2826,63 @@ mod tests {
         };
         assert!(s.is_value);
         assert_eq!(s.decorators.len(), 1);
+    }
+
+    #[test]
+    fn generic_declarations_parse_with_params_and_bounds() {
+        // Type params on struct/enum/fn, and an optional interface bound that is
+        // parsed and carried now (I#154 Fork B); enforcement is deferred.
+        let m = parse_ok(
+            "struct Box[T]:\n    T value\nenum Option[T]:\n    Some(T value)\n    None\n\
+             def max_of[T: Ordered, U](T a, U b) -> T:\n    return a\n",
+        );
+        let Item::Struct(s) = &m.items[0] else {
+            panic!("struct");
+        };
+        assert_eq!(s.generics.len(), 1);
+        assert_eq!(s.generics[0].name, "T");
+        assert!(s.generics[0].bound.is_none());
+        let Item::Enum(e) = &m.items[1] else {
+            panic!("enum");
+        };
+        assert_eq!(e.generics.len(), 1);
+        assert_eq!(e.generics[0].name, "T");
+        assert_eq!(e.variants.len(), 2);
+        let Item::Function(f) = &m.items[2] else {
+            panic!("fn");
+        };
+        assert_eq!(f.generics.len(), 2);
+        assert_eq!(f.generics[0].name, "T");
+        // `T: Ordered` carries the bound.
+        assert!(
+            matches!(&f.generics[0].bound, Some(Type::Named { name, .. }) if name == "Ordered")
+        );
+        assert!(f.generics[1].bound.is_none());
+    }
+
+    #[test]
+    fn call_site_type_args_parse_as_postfix_subscript() {
+        // `Pair[int64, str](1, "x")`: the callee is a postfix `[...]` with a
+        // comma-separated element list, produced as a uniform tuple-index node and
+        // classified downstream (I#154 Fork S).
+        let m = parse_ok("def main():\n    auto p = Pair[int64, str](1, \"x\")\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::Let { value, .. } = &f.body.stmts[0] else {
+            panic!("let");
+        };
+        let Expr::Call { callee, .. } = value else {
+            panic!("call");
+        };
+        let Expr::Index { base, index, .. } = callee.as_ref() else {
+            panic!("expected postfix subscript callee");
+        };
+        assert!(matches!(base.as_ref(), Expr::Name(n, _) if n == "Pair"));
+        let Expr::Tuple(elems, _) = index.as_ref() else {
+            panic!("multi-arg index is a tuple node");
+        };
+        assert_eq!(elems.len(), 2);
     }
 
     #[test]

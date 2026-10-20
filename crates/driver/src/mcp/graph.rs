@@ -326,11 +326,12 @@ fn render_fn_sig(kw: &str, f: &Function) -> String {
     )
 }
 
-fn render_generics(generics: &[String]) -> String {
+fn render_generics(generics: &[ast::TypeParam]) -> String {
     if generics.is_empty() {
         String::new()
     } else {
-        format!("[{}]", generics.join(", "))
+        let names: Vec<&str> = generics.iter().map(|p| p.name.as_str()).collect();
+        format!("[{}]", names.join(", "))
     }
 }
 

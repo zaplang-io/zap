@@ -1575,15 +1575,15 @@ impl Checker {
                     }
                 }
                 Item::Enum(e) => {
-                    // Methods on enums are locked (D-0046) but their lowering is
-                    // a documented follow-up; reject rather than silently drop.
-                    if let Some(m) = e.methods.first() {
-                        self.error(
-                            "methods on enums are not implemented yet (deferred to a \
-                             follow-up; D-0046)"
-                                .to_string(),
-                            m.span,
-                        );
+                    // Methods on an enum (D-0046) — checked at definition like
+                    // struct methods, with `self` typed as the enum. For a
+                    // generic enum (`Option[T]`, I#154) the type parameters are
+                    // treated as opaque: they resolve to `Unknown`, so a method
+                    // body may use only universal operations (bind/pass/return/
+                    // match), which is the unconstrained check-at-definition rule
+                    // (Fork B/M1). Enum-method *lowering* lands in the ir slice.
+                    for m in &e.methods {
+                        self.check_function(m, Some(&e.name));
                     }
                 }
                 Item::Stmt(st) => self.check_stmt(st),
@@ -4448,14 +4448,57 @@ mod tests {
     }
 
     #[test]
-    fn enum_methods_are_deferred() {
-        // Methods on enums are locked (D-0046) but their lowering is a
-        // follow-up; declaring one is reported, not silently dropped.
-        let m = msgs(
-            "enum Color:\n    RED\n    GREEN\n\n\
-            \x20   def tag(self) -> int64:\n        return 0\n",
-        );
-        assert!(m.contains("methods on enums"), "got:\n{m}");
+    fn enum_methods_type_check_at_definition() {
+        // Methods on an enum (D-0046) are now checked at definition, with `self`
+        // typed as the enum (I#154 lifts the earlier deferral for generic-enum
+        // methods like `Option.unwrap`).
+        ok("enum Color:\n    RED\n    GREEN\n\n\
+            \x20   def tag(self) -> int64:\n        return 0\n");
+    }
+
+    #[test]
+    fn generic_struct_and_enum_type_check() {
+        // A generic struct and a generic enum with methods type-check at
+        // definition; type parameters are opaque (unconstrained, Fork B/M1), and
+        // instantiations/`None` coerce permissively (I#154 slice 1).
+        ok(r#"
+struct Box[T]:
+    T value
+    def get(self) -> T:
+        return self.value
+
+enum Maybe[T]:
+    Just(T value)
+    Nothing
+
+    def ok(self) -> bool:
+        match self:
+            case Maybe.Just(v):
+                return True
+            case Maybe.Nothing:
+                return False
+
+def main():
+    Maybe[int64] a = Maybe.Just(5)
+    Maybe[str] b = Maybe.Nothing
+    Box[int64] c = Box(7)
+    print(a.ok())
+    print(c.get())
+"#);
+    }
+
+    #[test]
+    fn prelude_option_is_usable() {
+        // Option[T] ships in the prelude (I#154 slice 3): construct, match, and
+        // call its methods without declaring it.
+        ok(r#"
+def main():
+    Option[int64] a = Option.Some(5)
+    Option[str] b = None
+    print(a.unwrap())
+    print(a.is_some())
+    print(b.unwrap_or("x"))
+"#);
     }
 
     // --- interfaces (ticket #84, D-0016) ---
