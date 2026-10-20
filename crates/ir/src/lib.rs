@@ -772,6 +772,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn derive_yaml_generates_codec() {
+        // @derive(Yaml) (D-0063, I#149) generates the encode method, the decode
+        // associated function, and reuses the shared JsonValue decode core.
+        let (ast, _p, _l) = parse_str("@derive(Yaml)\nstruct S:\n    int64 x\n    str y\n");
+        let (m, errs) = lower_module(&ast);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        for want in ["S__to_yaml", "S__from_yaml", "S__from_json_value"] {
+            assert!(
+                m.funcs.iter().any(|f| f.name == want),
+                "missing generated {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_json_and_yaml_share_decode_core() {
+        // Deriving both must emit the shared `S__from_json_value` exactly once
+        // (deduped), not twice.
+        let (ast, _p, _l) =
+            parse_str("@derive(Json)\n@derive(Yaml)\nstruct S:\n    int64 x\n    str y\n");
+        let (m, errs) = lower_module(&ast);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let n = m
+            .funcs
+            .iter()
+            .filter(|f| f.name == "S__from_json_value")
+            .count();
+        assert_eq!(n, 1, "shared decode core should be generated once, got {n}");
+    }
+
     // --- operator overloading (ticket #52, D-0047) ---
 
     #[test]

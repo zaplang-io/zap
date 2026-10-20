@@ -226,6 +226,85 @@ def __json_field(JsonValue v, str k) -> JsonValue:
         case _:
             return JsonValue.Null
 
+def __yaml_obj_empty(dict[str, JsonValue] m) -> bool:
+    for k in json._obj_keys(m):
+        return False
+    return True
+
+def __yaml_arr_empty(list[JsonValue] xs) -> bool:
+    for x in xs:
+        return False
+    return True
+
+def __yaml_inline_p(JsonValue v) -> bool:
+    match v:
+        case JsonValue.Object(m):
+            return __yaml_obj_empty(m)
+        case JsonValue.Array(xs):
+            return __yaml_arr_empty(xs)
+        case _:
+            return True
+
+def __yaml_inline(JsonValue v) -> str:
+    match v:
+        case JsonValue.Null:
+            return \"null\"
+        case JsonValue.Bool(b):
+            if b:
+                return \"true\"
+            return \"false\"
+        case JsonValue.Int(i):
+            return json._i64_str(i)
+        case JsonValue.Float(f):
+            return json._f64_str(f)
+        case JsonValue.Str(s):
+            return json._escape(s)
+        case JsonValue.Object(m):
+            return \"{}\"
+        case JsonValue.Array(xs):
+            return \"[]\"
+
+def __yaml_dump_val(JsonValue v, str pad, list[str] out):
+    match v:
+        case JsonValue.Object(m):
+            for key in json._obj_keys(m):
+                auto cv = m[key]
+                out.append(pad)
+                out.append(key)
+                if __yaml_inline_p(cv):
+                    out.append(\": \")
+                    out.append(__yaml_inline(cv))
+                    out.append(\"\\n\")
+                else:
+                    out.append(\":\\n\")
+                    __yaml_dump_val(cv, pad + \"  \", out)
+        case JsonValue.Array(xs):
+            for x in xs:
+                out.append(pad)
+                if __yaml_inline_p(x):
+                    out.append(\"- \")
+                    out.append(__yaml_inline(x))
+                    out.append(\"\\n\")
+                else:
+                    out.append(\"-\\n\")
+                    __yaml_dump_val(x, pad + \"  \", out)
+        case _:
+            out.append(pad)
+            out.append(__yaml_inline(v))
+            out.append(\"\\n\")
+
+def __yaml_dumps(JsonValue v) -> str:
+    list[str] parts = []
+    if __yaml_inline_p(v):
+        parts.append(__yaml_inline(v))
+        parts.append(\"\\n\")
+    else:
+        __yaml_dump_val(v, \"\", parts)
+    return json._join(parts)
+
+def __yaml_loads(str s) -> JsonValue:
+    return __json_loads(yaml._to_json(s))
+
 enum JsonToken:
     End
     Null
@@ -325,6 +404,8 @@ fn references_prelude(module: &Module) -> bool {
         "\"Json\"",
         "\"JsonToken\"",
         "\"JsonScanner\"",
+        "\"yaml\"",
+        "\"Yaml\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

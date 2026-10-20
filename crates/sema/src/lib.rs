@@ -593,7 +593,7 @@ pub fn is_test_item(f: &zapc_syntax::ast::Function) -> bool {
 /// The traits `@derive(...)` can generate (D-0036). Only `Eq` and `Repr` are
 /// lowered to code in this increment; the rest are accepted here and reported as
 /// deferred by the lowering pass.
-const DERIVABLE_TRAITS: &[&str] = &["Eq", "Ord", "Json", "Csv", "Repr", "Hash"];
+const DERIVABLE_TRAITS: &[&str] = &["Eq", "Ord", "Json", "Csv", "Yaml", "Repr", "Hash"];
 
 /// Where a decorator/annotation is attached — used for target-suitability
 /// checks (e.g. `@derive` only on a struct).
@@ -901,6 +901,14 @@ impl Checker {
             // decode function (resolved in `check_call`, keyed on `to_csv`).
             methods
                 .entry("to_csv".into())
+                .or_insert_with(|| unary(Ty::Str));
+        }
+        if derived.contains("Yaml") {
+            // Compile-time YAML codec (D-0063, I#149): `self.to_yaml() -> str`;
+            // `Struct.from_yaml(s)` is the associated decode function (resolved
+            // in `check_call`, keyed on `to_yaml`).
+            methods
+                .entry("to_yaml".into())
                 .or_insert_with(|| unary(Ty::Str));
         }
         StructInfo {
@@ -2898,6 +2906,7 @@ impl Checker {
                 let decode_encode = match name.as_str() {
                     "from_json" => Some("to_json"),
                     "from_csv" => Some("to_csv"),
+                    "from_yaml" => Some("to_yaml"),
                     _ => None,
                 };
                 if let Some(enc) = decode_encode {
