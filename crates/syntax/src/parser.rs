@@ -98,9 +98,7 @@ enum JsonValue:
     Array(list[JsonValue] items)
     Object(dict[str, JsonValue] fields)
 
-def __json_loads(str s) -> JsonValue:
-    auto c = json._lex_new(s)
-    auto k = json._lex_next(c)
+def __json_value(bytes c, int64 k) -> JsonValue:
     if k == 1:
         return JsonValue.Null
     if k == 2:
@@ -113,7 +111,39 @@ def __json_loads(str s) -> JsonValue:
         return JsonValue.Float(json._lex_float(c))
     if k == 6:
         return JsonValue.Str(json._lex_str(c))
+    if k == 9:
+        return __json_array(c)
+    if k == 7:
+        return __json_object(c)
     return JsonValue.Null
+
+def __json_array(bytes c) -> JsonValue:
+    list[JsonValue] xs = []
+    auto k = json._lex_next(c)
+    while k != 10:
+        xs.append(__json_value(c, k))
+        k = json._lex_next(c)
+        if k == 12:
+            k = json._lex_next(c)
+    return JsonValue.Array(xs)
+
+def __json_object(bytes c) -> JsonValue:
+    dict[str, JsonValue] m = {}
+    auto k = json._lex_next(c)
+    while k == 6:
+        auto key = json._lex_str(c)
+        json._lex_next(c)
+        auto vk = json._lex_next(c)
+        m[key] = __json_value(c, vk)
+        k = json._lex_next(c)
+        if k == 12:
+            k = json._lex_next(c)
+    return JsonValue.Object(m)
+
+def __json_loads(str s) -> JsonValue:
+    auto c = json._lex_new(s)
+    auto k = json._lex_next(c)
+    return __json_value(c, k)
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
