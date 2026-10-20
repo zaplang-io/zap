@@ -30,6 +30,7 @@ mod process;
 mod random;
 mod runtime;
 mod signal;
+mod sync;
 mod sys;
 mod time;
 
@@ -56,4 +57,5 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     deque::declare_rt(cg);
     bisect::declare_rt(cg);
     oset::declare_rt(cg);
+    sync::declare_rt(cg);
 }
