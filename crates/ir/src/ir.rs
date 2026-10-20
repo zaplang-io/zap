@@ -327,6 +327,19 @@ pub enum Inst {
         dest: Value,
         val: bool,
     },
+    /// A null pointer constant (`dest`'s value type is the pointer type). Used by
+    /// the niche `Option[T]` layout (I#154, D-0064 #4): a niche optional is a
+    /// single nullable pointer, and `None` is the null value. Codegen emits the
+    /// `const_null` of `dest`'s pointer type.
+    NullConst {
+        dest: Value,
+    },
+    /// `dest : i1` is true iff the pointer `val` is null. Backs the niche-optional
+    /// `match` tests (`None` = null, `Some` = non-null) without a tag field.
+    IsNull {
+        dest: Value,
+        val: Value,
+    },
     Bin {
         dest: Value,
         op: BinOp,
@@ -684,6 +697,8 @@ fn fmt_inst(i: &Inst) -> String {
         Inst::IConst { dest, val } => format!("%{dest} = iconst {val}"),
         Inst::FConst { dest, val } => format!("%{dest} = fconst {val}"),
         Inst::BConst { dest, val } => format!("%{dest} = bconst {val}"),
+        Inst::NullConst { dest } => format!("%{dest} = nullconst"),
+        Inst::IsNull { dest, val } => format!("%{dest} = isnull %{val}"),
         Inst::Bin { dest, op, lhs, rhs } => format!("%{dest} = {op:?} %{lhs}, %{rhs}"),
         Inst::ICmp {
             dest,
