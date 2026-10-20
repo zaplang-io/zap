@@ -862,3 +862,45 @@ First-class Unix signal handling, built on the concurrency runtime.
 **Rationale:** graceful shutdown and production observability as first-class,
 idiomatic features — critical for serverless/containers and usually an
 afterthought elsewhere.
+
+## D-0059 — `json`/`csv` design: three modes, `@derive(Json)`, substrate-first
+**Status:** Locked — resolves the open design forks of issue #100 (scope set by
+D-0056). Full spec: `design/0010-json.md`.
+
+Native (no-CPython) data-format support, built **substrate-first**: a shared,
+Zap-level, derive-driven **serde substrate** (phase 1, #131), then `json` on top
+(phase 2, #100), then `csv` on top (phase 3, #132). The recursive-descent scanner
+stays **per-format**; only the format-neutral **codec protocol** (the visitor/sink
++ derive-codegen for field-walk, key↔field mapping, defaults/optional, enum
+tagging, error-path) and an **incremental byte-reader** are shared.
+
+- **Three access modes, one scanner core per format:** (1) dynamic `json.Value`
+  DOM with `loads`/`dumps`; (2) a compile-time **typed codec** via a new
+  **compiler built-in `@derive(Json)`**; (3) a public pull `json.scan`/`Scanner`
+  (an `Iterator[Token]`, D-0048). All three ship in json v1.
+- **`@derive(Json)` is a compiler built-in** (like `Eq`/`Ord`, D-0036), generating
+  `T.from_json(s)` / `self.to_json()` + internal `__from_json_value__` /
+  `__to_json_value__` dunders — **no user generics, no user macros**. This
+  **un-defers** the `@derive(Json)` noted deferred in `design/0006`. A generic
+  `json.decode[T]`/`encode` sugar is a fast-follow once user generics (D-0017)
+  land. `@derive(Csv)` is the phase-3 mirror.
+- **`json.Value`:** a non-generic data-carrying enum (D-0046) with `Int(i64)` /
+  `Float(f64)` **split** (not JS-style f64-only); out-of-`i64` integers decode to
+  `Float` (lossy beyond 2^53); `BigInt`/`RawNumber` deferred.
+- **Parser:** recursive-descent for v1 (SIMD stage-1 a later fast-follow behind the
+  same token API). Typed decode is `Value`→struct DOM-map for v1 (token-direct
+  path deferred).
+- **Validation:** strict typed, lenient only on unknown keys
+  (`@json(deny_unknown=true)` opts into strict); errors raise exceptions carrying
+  byte offset + JSON path (typed `json.DecodeError` when typed exceptions land).
+- **Seam type-hosting:** `json.Value`/`json.Token` register as **compiler-known
+  enums** contributed by the module, extending the #121 seam — not via the
+  deferred `PRELUDE_SRC` injection.
+- **No grammar change:** the whole surface uses existing EBNF
+  (`decorators`/`enum_def`/`field`; D-0036/D-0046).
+
+**Rationale:** two fully-specced consumers (json, csv) up front justify designing
+the shared substrate once rather than extract-on-second-use; a compiler built-in
+derive delivers the high-value typed path (gates AWS #89, web #107) without waiting
+on staged generics/macros; the `Int`/`Float` split honors Zap's static-typing
+pitch; recursive-descent keeps v1 small and correct with a clean SIMD upgrade path.
