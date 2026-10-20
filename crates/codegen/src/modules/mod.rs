@@ -14,9 +14,11 @@
 use super::Cg;
 
 mod crypto;
+mod datetime;
 mod gc;
 mod runtime;
 mod signal;
+mod time;
 
 /// Declare every built-in module's runtime entry points (ticket #121). Called
 /// once from `Cg::translate`. Add a module: create `modules/<name>.rs` with
@@ -26,4 +28,6 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     gc::declare_rt(cg);
     runtime::declare_rt(cg);
     crypto::declare_rt(cg);
+    time::declare_rt(cg);
+    datetime::declare_rt(cg);
 }

@@ -4912,6 +4912,165 @@ void *zap_crypto_token_hex(int64_t n) {
 }
 
 /* ===========================================================================
+ * time & datetime (ticket #99, D-0056). Clocks, sleep, duration-unit helpers,
+ * and civil-time conversion. Durations are plain int64 nanoseconds (Go
+ * time.Duration style), so arithmetic needs no runtime support; the helpers
+ * here just convert between a unit and nanoseconds. Civil time uses the C
+ * library's gmtime_r/localtime_r/timegm, so timezone support is UTC + local
+ * only (a full tz database is a follow-up, see #99). <time.h>/<unistd.h>/
+ * <errno.h> are included near the top of this file.
+ * =========================================================================== */
+
+/* --- clocks --- */
+int64_t zap_time_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+double zap_time_monotonic_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+int64_t zap_time_wall_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+double zap_time_wall_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* --- sleep ---
+ * v1 is a plain blocking nanosleep (EINTR-resuming): it blocks the current OS
+ * thread, so under the M:N scheduler it parks that M rather than yielding
+ * cooperatively. A scheduler-aware sleep (via the netpoller timer) is a
+ * follow-up (#99). */
+void zap_time_sleep_ns(int64_t ns) {
+    if (ns <= 0) {
+        return;
+    }
+    struct timespec req;
+    req.tv_sec = (time_t)(ns / 1000000000LL);
+    req.tv_nsec = (long)(ns % 1000000000LL);
+    struct timespec rem;
+    while (nanosleep(&req, &rem) != 0 && errno == EINTR) {
+        req = rem;
+    }
+}
+void zap_time_sleep_seconds(double s) {
+    if (s <= 0.0) {
+        return;
+    }
+    zap_time_sleep_ns((int64_t)(s * 1e9));
+}
+
+/* --- duration unit constructors (-> nanoseconds) --- */
+int64_t zap_time_seconds_to_ns(int64_t s) { return s * 1000000000LL; }
+int64_t zap_time_millis_to_ns(int64_t ms) { return ms * 1000000LL; }
+int64_t zap_time_micros_to_ns(int64_t us) { return us * 1000LL; }
+
+/* --- duration unit converters (nanoseconds -> unit as float) --- */
+double zap_time_ns_to_seconds(int64_t ns) { return (double)ns / 1e9; }
+double zap_time_ns_to_millis(int64_t ns) { return (double)ns / 1e6; }
+double zap_time_ns_to_micros(int64_t ns) { return (double)ns / 1e3; }
+
+/* --- civil (calendar) time ---
+ * `is_local` selects local time (localtime_r) over UTC (gmtime_r). */
+static void zap_civil(int64_t ts, int64_t is_local, struct tm *out) {
+    time_t t = (time_t)ts;
+    if (is_local) {
+        localtime_r(&t, out);
+    } else {
+        gmtime_r(&t, out);
+    }
+}
+int64_t zap_datetime_year(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_year + 1900;
+}
+int64_t zap_datetime_month(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_mon + 1;
+}
+int64_t zap_datetime_day(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_mday;
+}
+int64_t zap_datetime_hour(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_hour;
+}
+int64_t zap_datetime_minute(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_min;
+}
+int64_t zap_datetime_second(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_sec;
+}
+
+int64_t zap_datetime_now_unix(void) { return (int64_t)time(NULL); }
+
+/* Civil components (UTC) -> Unix timestamp. Uses timegm (glibc extension; the
+ * CI toolchain provides it) so the components are interpreted as UTC. */
+int64_t zap_datetime_to_unix(int64_t y, int64_t mo, int64_t d, int64_t h,
+                             int64_t mi, int64_t s) {
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = (int)(y - 1900);
+    tm.tm_mon = (int)(mo - 1);
+    tm.tm_mday = (int)d;
+    tm.tm_hour = (int)h;
+    tm.tm_min = (int)mi;
+    tm.tm_sec = (int)s;
+    return (int64_t)timegm(&tm);
+}
+
+/* Civil components -> ISO-8601 "YYYY-MM-DDTHH:MM:SS" (returns a fresh ZapStr*). */
+void *zap_datetime_format_iso(int64_t y, int64_t mo, int64_t d, int64_t h,
+                              int64_t mi, int64_t s) {
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld",
+                     (long long)y, (long long)mo, (long long)d, (long long)h,
+                     (long long)mi, (long long)s);
+    if (n < 0) {
+        n = 0;
+    }
+    return zap_str_new(buf, (int64_t)n);
+}
+
+/* ISO-8601 string -> Unix timestamp (UTC). Accepts a date ("YYYY-MM-DD") or a
+ * full date-time with a 'T' or ' ' separator; fields left unmatched default to
+ * the start of the day. v1 parsing is lenient (sscanf): malformed input yields
+ * a best-effort timestamp rather than an error (strict parsing is a follow-up,
+ * #99). */
+int64_t zap_datetime_parse_iso(void *s) {
+    ZapStr *z = (ZapStr *)s;
+    char buf[64];
+    int64_t n = z->len;
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > 63) {
+        n = 63;
+    }
+    memcpy(buf, z->data, (size_t)n);
+    buf[n] = '\0';
+    int y = 1970, mo = 1, d = 1, h = 0, mi = 0, sec = 0;
+    sscanf(buf, "%d-%d-%d%*c%d:%d:%d", &y, &mo, &d, &h, &mi, &sec);
+    return zap_datetime_to_unix(y, mo, d, h, mi, sec);
+}
+
+/* ===========================================================================
  * Type descriptors for the runtime's own heap types (ticket #48). Both GC
  * builds read `.size`; the precise Immix collector also reads `.kind` and the
  * pointer-offset arrays. Codegen emits the descriptors for *user* structs and

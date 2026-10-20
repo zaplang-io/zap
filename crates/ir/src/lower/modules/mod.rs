@@ -18,9 +18,11 @@ use super::{FnLower, LowerError};
 use crate::ir::*;
 
 mod crypto;
+mod datetime;
 mod gc;
 mod runtime;
 mod signal;
+mod time;
 
 /// A module's per-method lowering hook: lower `method(args)` to ZIR, emitting the
 /// backing runtime calls. `Ok(Some((value, ty)))` for a method the module
@@ -40,8 +42,14 @@ pub(super) struct ModuleLower {
 /// The registered built-in modules (ticket #121). Keep in step with
 /// `zapc_sema::modules::MODULES`. Add a module: create `lower/modules/<name>.rs`
 /// with `pub(super) const MODULE: ModuleLower` and append it here.
-pub(super) const MODULES: &[ModuleLower] =
-    &[signal::MODULE, gc::MODULE, runtime::MODULE, crypto::MODULE];
+pub(super) const MODULES: &[ModuleLower] = &[
+    signal::MODULE,
+    gc::MODULE,
+    runtime::MODULE,
+    crypto::MODULE,
+    time::MODULE,
+    datetime::MODULE,
+];
 
 /// Lower a built-in `signal`/`gc`/`runtime`-style module call, or return
 /// `Ok(None)` if `module` is not a registered built-in module (so the caller
