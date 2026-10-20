@@ -528,6 +528,23 @@ generic methods (`Option.map[U]`), full argument-driven inference across functio
 type params. (`Box`/`Option` from slice 3 are generic *types* with concrete
 methods; this adds type params on *functions*.)
 
+> **Status (I#161, implemented).** Generic free functions and generic methods
+> (with their own type parameters, on generic or non-generic owners) are done,
+> extending the `mono.rs` erasure pass: a generic function is emitted on demand
+> as a mangled concrete function (deduped by mangled name); a generic method is
+> specialized per call and attached to its owner's concrete declaration, keeping
+> the GC-metadata-free theorem (every instance is concrete). Call-site inference
+> is argument-driven unification (over named/list/tuple/function type structure)
+> plus the expected-type return sink, with explicit `f[T](...)` / `recv.m[U](...)`
+> type arguments as the fallback. `Option[T]` gains a callback-free `and_opt[U]`
+> (Rust's `Option::and`). **Deferred:** the *higher-order* flavor shown above
+> (`map[T,U]` / `Option.map[U]` taking an `fn(T)->U`) needs first-class function
+> *values* — the `fn(...)->...` type does not yet parse and codegen rejects
+> `Type::Func`, so passing/calling a function value is a separate feature (its own
+> follow-up ticket). Everything in slice 4 that does not require a function value
+> is implemented and tested under both collectors (`tests/golden/generics_fn_*`,
+> `tests/golden/generics_method.zap`). Interface bounds remain slice 5.
+
 **Slice 5 — interface bounds (`[T: Iface]`).** Reuse the I#84 `iface_conforms`
 checker at instantiation; allow bound methods in the body (static dispatch); wire
 operator-dunder interfaces as bounds. (Grammar + schema already carry the bound

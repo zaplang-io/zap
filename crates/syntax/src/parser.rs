@@ -121,6 +121,13 @@ enum Option[T]:
             case Option.None:
                 return fallback
 
+    def and_opt[U](self, Option[U] other) -> Option[U]:
+        match self:
+            case Option.Some(v):
+                return other
+            case Option.None:
+                return None
+
 enum JsonValue:
     Null
     Bool(bool b)

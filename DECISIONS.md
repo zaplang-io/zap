@@ -1149,3 +1149,29 @@ type parameters (`def map[T, U]`, `Option.map[U]`); interface-bound enforcement
 `@default`-as-optionality via `Option[T]` (#100/#133); AWS SDK optional modeling
 (fork O-a, #89); `Result[T, E]`; the built-in-collection re-skin as user-generic
 surface; code-size layout-sharing; typed `UnwrapError` (rides I#12).
+
+**Update — slice 4 (I#161): generic functions & methods.** User-defined generic
+*free functions* and *methods with their own type parameters* are implemented,
+extending the same `crates/ir/src/mono.rs` erasure pass (slices 1–3 handled
+generic *types*). A generic free function is emitted on demand per call site as
+a mangled concrete function (`identity$int64`), deduped by mangled name; a
+generic method is specialized per call and **attached to its owner's concrete
+declaration** (`Box$int64.repack$str`, `Option$int64.and_opt$str`), dispatching
+through the ordinary struct-method path — so the GC-metadata-free theorem still
+holds (every instance is a concrete struct/function; no collector or `zaprt.c`
+change). Call-site inference follows Fork I: argument-driven unification (now
+also over list-literal element types and function types) plus the expected-type
+sink on the return type at `let`/`return`/argument positions; explicit call-site
+type arguments (`identity[int64](...)`, `recv.m[U](...)`) are the fallback and
+are classified in sema/mono by name resolution. Bodies are still checked
+unconstrained at definition (M1); interface bounds remain slice 5. `Option[T]`
+gains one callback-free generic method in the prelude, `and_opt[U]` (Rust's
+`Option::and`). **Deferred — higher-order generic functions** (`map[T,U]`,
+`Option.map[U]`/`and_then` taking a `fn(T)->U`): these need first-class function
+*values*, which Zap does not yet have — `parse_type` does not parse the
+`fn(...)->...` type (grammar reserves it as `func_type`), `resolve_ty` rejects
+`Type::Func`, and there is no function-address / indirect-call lowering. That is
+a separate feature (parser + codegen + calling convention; GC is already safe
+because a code pointer fails `zap_is_heap_ptr`) filed as a follow-up, not part
+of the monomorphization epic. Generics machinery is otherwise complete for
+callback-free generic functions and methods.
