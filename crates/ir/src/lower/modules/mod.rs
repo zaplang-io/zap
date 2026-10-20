@@ -17,11 +17,13 @@ use zapc_syntax::ast;
 use super::{FnLower, LowerError};
 use crate::ir::*;
 
+mod datetime;
 mod gc;
 mod math;
 mod random;
 mod runtime;
 mod signal;
+mod time;
 
 /// A module's per-method lowering hook: lower `method(args)` to ZIR, emitting the
 /// backing runtime calls. `Ok(Some((value, ty)))` for a method the module
@@ -47,6 +49,8 @@ pub(super) const MODULES: &[ModuleLower] = &[
     runtime::MODULE,
     math::MODULE,
     random::MODULE,
+    time::MODULE,
+    datetime::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

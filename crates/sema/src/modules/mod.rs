@@ -17,11 +17,13 @@ use zapc_syntax::span::Span;
 
 use crate::{Checker, Ty};
 
+mod datetime;
 mod gc;
 mod math;
 mod random;
 mod runtime;
 mod signal;
+mod time;
 
 /// A built-in module's type-checking facet.
 pub(crate) struct ModuleCheck {
@@ -43,6 +45,8 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     runtime::MODULE,
     math::MODULE,
     random::MODULE,
+    time::MODULE,
+    datetime::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute

@@ -13,11 +13,13 @@
 
 use super::Cg;
 
+mod datetime;
 mod gc;
 mod math;
 mod random;
 mod runtime;
 mod signal;
+mod time;
 
 /// Declare every built-in module's runtime entry points (ticket #121). Called
 /// once from `Cg::translate`. Add a module: create `modules/<name>.rs` with
@@ -28,4 +30,6 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     runtime::declare_rt(cg);
     math::declare_rt(cg);
     random::declare_rt(cg);
+    time::declare_rt(cg);
+    datetime::declare_rt(cg);
 }
