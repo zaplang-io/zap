@@ -44,13 +44,16 @@ pub fn parse_str(src: &str) -> (Module, Vec<ParseError>, Vec<crate::lexer::LexEr
     (module, parse_errors, lex_errors)
 }
 
-/// The compiler-known built-in prelude (ticket #77, D-0058): the `Signal` enum
-/// and `MemStats` struct that back the `signal`/`gc`/`runtime` surface. They are
-/// injected ahead of the user's items (see [`prelude_items`]) so every ordinary
-/// enum/struct path — member access, `match`, `channel[Signal]`, field access —
-/// works unchanged. A `Signal` variant's backing integer IS its Unix (Linux)
-/// signal number, so the runtime ABI speaks raw signal numbers. SIGKILL/SIGSTOP
-/// are intentionally absent (uncatchable). `MemStats` mirrors `gc.stats()`.
+/// The compiler-known built-in prelude (ticket #77, D-0058; ticket #99): the
+/// `Signal` enum and `MemStats`/`DateTime` structs that back the `signal`/`gc`/
+/// `runtime`/`datetime` surface. They are injected ahead of the user's items
+/// (see [`prelude_items`]) so every ordinary enum/struct path — member access,
+/// `match`, `channel[Signal]`, field access — works unchanged. A `Signal`
+/// variant's backing integer IS its Unix (Linux) signal number, so the runtime
+/// ABI speaks raw signal numbers. SIGKILL/SIGSTOP are intentionally absent
+/// (uncatchable). `MemStats` mirrors `gc.stats()`; `DateTime` is the civil-time
+/// value `datetime.*` produces (its methods live on the module, so the struct
+/// itself stays method-free and emits no code when a program never uses it).
 pub const PRELUDE_SRC: &str = "\
 enum Signal:
     SIGHUP = 1
@@ -73,6 +76,14 @@ value struct MemStats:
     int64 free_bytes
     int64 gc_count
     int64 goroutines
+
+value struct DateTime:
+    int64 year
+    int64 month
+    int64 day
+    int64 hour
+    int64 minute
+    int64 second
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -119,6 +130,9 @@ fn references_prelude(module: &Module) -> bool {
         "\"on_signal\"",
         "\"cancel_on\"",
         "\"grace\"",
+        "\"DateTime\"",
+        "\"time\"",
+        "\"datetime\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
