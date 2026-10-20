@@ -5847,6 +5847,238 @@ void zap_random_shuffle(void *l) {
 }
 
 /* ===========================================================================
+ * stdlib: collections extras — deque / bisect / oset (ticket #102, D-0056)
+ * ---------------------------------------------------------------------------
+ * These build on the existing collection machinery (#21/#38). Elements are i64
+ * words (ptr/str element kinds deferred to a follow-up). The module surface is
+ * the opaque-handle pattern (like crypto #105): a `_new` returns a GC handle,
+ * free functions operate on it; sema types the handle as `bytes` and lowering
+ * passes it as a pointer.
+ *
+ * deque: a double-ended ring buffer with O(1) push/pop at both ends and an
+ *   optional bounded `maxlen` (Python collections.deque). The header is a
+ *   PRECISE GC object whose single traced field is a pointer-free i64 leaf
+ *   buffer (zap_buf) — so the precise collector keeps the buffer alive
+ *   generically via `ptr_offsets`, with no zapgc.inc.c change.
+ * bisect: pure binary search / sorted-insert over the existing ZapList (i64).
+ *   No new GC type.
+ * oset (insertion-ordered set): composed from an existing list (insertion
+ *   order) + set (O(1) membership); a PRECISE 2-pointer header. Both pointees
+ *   are ordinary GC objects that trace themselves.
+ *
+ * Out-of-range access / pop-from-empty aborts, matching list's no-exception-
+ * runtime convention (ticket #22).
+ * ========================================================================== */
+
+/* ---- deque: double-ended ring buffer over i64 words ---------------------- */
+typedef struct {
+    int64_t *data;   /* `cap` element words, ring-indexed; NULL until first grow */
+    int64_t cap;     /* allocated slots (fixed = maxlen when bounded)            */
+    int64_t head;    /* ring index of the leftmost element                      */
+    int64_t len;     /* live element count                                      */
+    int64_t maxlen;  /* bound, or -1 when unbounded                             */
+} ZapDeque;
+
+static const int32_t zap_off_deque[] = {(int32_t)offsetof(ZapDeque, data)};
+static const ZapTypeDesc zap_desc_deque = {(int64_t)sizeof(ZapDeque), ZAP_TD_PRECISE, 1,
+                                           zap_off_deque};
+
+void *zap_deque_new(void) {
+    ZapDeque *d = (ZapDeque *)zap_obj(&zap_desc_deque);
+    d->maxlen = -1; /* unbounded; data/cap/head/len are zeroed by the allocator */
+    return d;
+}
+
+/* Bounded deque: a fixed `maxlen`-slot ring. A negative bound is treated as 0. */
+void *zap_deque_bounded(int64_t maxlen) {
+    ZapDeque *d = (ZapDeque *)zap_obj(&zap_desc_deque);
+    d->maxlen = maxlen < 0 ? 0 : maxlen;
+    d->cap = d->maxlen;
+    if (d->cap > 0) {
+        d->data = (int64_t *)zap_buf(d->cap * (int64_t)sizeof(int64_t));
+    }
+    return d;
+}
+
+/* Grow an unbounded deque, re-linearizing the ring into a fresh doubled buffer
+ * (head resets to 0). Only ever called for the unbounded path. */
+static void zap_deque_grow(ZapDeque *d) {
+    int64_t cap = d->cap < 4 ? 4 : d->cap * 2;
+    int64_t *data = (int64_t *)zap_buf(cap * (int64_t)sizeof(int64_t));
+    for (int64_t i = 0; i < d->len; i++) {
+        data[i] = d->data[(d->head + i) % d->cap];
+    }
+    d->data = data;
+    d->cap = cap;
+    d->head = 0;
+}
+
+void zap_deque_append(void *dp, int64_t v) {
+    ZapDeque *d = (ZapDeque *)dp;
+    if (d->maxlen == 0) {
+        return; /* a zero-bounded deque silently discards */
+    }
+    if (d->maxlen > 0 && d->len == d->maxlen) {
+        d->head = (d->head + 1) % d->cap; /* full: drop the leftmost */
+        d->len--;
+    }
+    if (d->len == d->cap) {
+        zap_deque_grow(d);
+    }
+    d->data[(d->head + d->len) % d->cap] = v;
+    d->len++;
+}
+
+void zap_deque_appendleft(void *dp, int64_t v) {
+    ZapDeque *d = (ZapDeque *)dp;
+    if (d->maxlen == 0) {
+        return;
+    }
+    if (d->maxlen > 0 && d->len == d->maxlen) {
+        d->len--; /* full: drop the rightmost */
+    }
+    if (d->len == d->cap) {
+        zap_deque_grow(d);
+    }
+    d->head = (d->head - 1 + d->cap) % d->cap;
+    d->data[d->head] = v;
+    d->len++;
+}
+
+int64_t zap_deque_pop(void *dp) {
+    ZapDeque *d = (ZapDeque *)dp;
+    if (d->len == 0) {
+        fprintf(stderr, "zap: pop from an empty deque\n");
+        abort();
+    }
+    int64_t v = d->data[(d->head + d->len - 1) % d->cap];
+    d->len--;
+    return v;
+}
+
+int64_t zap_deque_popleft(void *dp) {
+    ZapDeque *d = (ZapDeque *)dp;
+    if (d->len == 0) {
+        fprintf(stderr, "zap: pop from an empty deque\n");
+        abort();
+    }
+    int64_t v = d->data[d->head];
+    d->head = (d->head + 1) % d->cap;
+    d->len--;
+    return v;
+}
+
+int64_t zap_deque_len(void *dp) { return ((ZapDeque *)dp)->len; }
+
+/* Index from the left (0 == leftmost), so `len`+`get` give an iteration path
+ * while native `for x in deque` is deferred. */
+int64_t zap_deque_get(void *dp, int64_t i) {
+    ZapDeque *d = (ZapDeque *)dp;
+    if (i < 0 || i >= d->len) {
+        fprintf(stderr, "zap: deque index %lld out of range (len %lld)\n", (long long)i,
+                (long long)d->len);
+        abort();
+    }
+    return d->data[(d->head + i) % d->cap];
+}
+
+void zap_deque_clear(void *dp) {
+    ZapDeque *d = (ZapDeque *)dp;
+    d->head = 0;
+    d->len = 0;
+}
+
+/* ---- bisect: binary search / sorted insert over a ZapList[i64] ----------- */
+static int64_t zap_bisect_left_impl(ZapList *l, int64_t x) {
+    int64_t lo = 0, hi = l->len;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (l->data[mid] < x) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+static int64_t zap_bisect_right_impl(ZapList *l, int64_t x) {
+    int64_t lo = 0, hi = l->len;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (x < l->data[mid]) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+int64_t zap_bisect_left(void *l, int64_t x) { return zap_bisect_left_impl((ZapList *)l, x); }
+int64_t zap_bisect_right(void *l, int64_t x) { return zap_bisect_right_impl((ZapList *)l, x); }
+
+/* Insert `v` at `idx`, shifting the tail right by one (growing if full). */
+static void zap_list_insert_at(ZapList *l, int64_t idx, int64_t v) {
+    if (l->len == l->cap) {
+        zap_list_grow(l);
+    }
+    if (idx < l->len) {
+        memmove(&l->data[idx + 1], &l->data[idx], (size_t)(l->len - idx) * sizeof(int64_t));
+    }
+    l->data[idx] = v;
+    l->len++;
+}
+
+void zap_bisect_insort_left(void *l, int64_t x) {
+    ZapList *list = (ZapList *)l;
+    zap_list_insert_at(list, zap_bisect_left_impl(list, x), x);
+}
+
+void zap_bisect_insort_right(void *l, int64_t x) {
+    ZapList *list = (ZapList *)l;
+    zap_list_insert_at(list, zap_bisect_right_impl(list, x), x);
+}
+
+/* ---- oset: insertion-ordered set = list (order) + set (membership) ------- */
+typedef struct {
+    void *order;  /* ZapList* — elements in insertion order */
+    void *member; /* ZapSet*  — O(1) membership test        */
+} ZapOset;
+
+static const int32_t zap_off_oset[] = {(int32_t)offsetof(ZapOset, order),
+                                       (int32_t)offsetof(ZapOset, member)};
+static const ZapTypeDesc zap_desc_oset = {(int64_t)sizeof(ZapOset), ZAP_TD_PRECISE, 2,
+                                          zap_off_oset};
+
+void *zap_oset_new(void) {
+    ZapOset *s = (ZapOset *)zap_obj(&zap_desc_oset);
+    /* order/member are NULL until set; the allocator zeroed them, so a GC
+     * triggered inside zap_list_new()/zap_set_new() traces NULL safely. */
+    s->order = zap_list_new();
+    s->member = zap_set_new();
+    return s;
+}
+
+void zap_oset_add(void *sp, int64_t v) {
+    ZapOset *s = (ZapOset *)sp;
+    if (!zap_set_contains_i64(s->member, v)) {
+        zap_set_add_i64(s->member, v);
+        zap_list_push_i64(s->order, v);
+    }
+}
+
+int64_t zap_oset_contains(void *sp, int64_t v) {
+    return zap_set_contains_i64(((ZapOset *)sp)->member, v);
+}
+
+int64_t zap_oset_len(void *sp) { return zap_list_len(((ZapOset *)sp)->order); }
+
+int64_t zap_oset_get(void *sp, int64_t i) {
+    return zap_list_get_i64(((ZapOset *)sp)->order, i);
+}
+
+/* ===========================================================================
  * logging / argparse (ticket #101, D-0056). Application scaffolding of the
  * bundled stdlib, dispatched by flat name through the module seam (#121):
  * `logging` and `argparse` are compiler-known namespaced modules (`import`

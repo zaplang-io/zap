@@ -18,14 +18,17 @@ use super::{FnLower, LowerError};
 use crate::ir::*;
 
 mod argparse;
+mod bisect;
 mod crypto;
 mod datetime;
+mod deque;
 mod fs;
 mod gc;
 mod io;
 mod logging;
 mod math;
 mod os;
+mod oset;
 mod process;
 mod random;
 mod runtime;
@@ -68,6 +71,9 @@ pub(super) const MODULES: &[ModuleLower] = &[
     datetime::MODULE,
     logging::MODULE,
     argparse::MODULE,
+    deque::MODULE,
+    bisect::MODULE,
+    oset::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not
