@@ -9,6 +9,11 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # LLVM 18 + the system libraries llvm-sys links against, a C toolchain, and curl.
+# Plus the build-performance tools (tickets #128/#123):
+#   * mold    — a drop-in linker whose RAM peak is a fraction of GNU ld's, used
+#               for Rust's own link step (via -fuse-ld=mold); gcc 12+ drives it.
+#   * sccache — a shared compiler cache (RUSTC_WRAPPER) so sibling/successive
+#               builds reuse compiled artifacts instead of rebuilding.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -29,6 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libedit-dev \
         libxml2-dev \
         libncurses-dev \
+        mold \
+        sccache \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust, pinned to match rust-toolchain.toml.
