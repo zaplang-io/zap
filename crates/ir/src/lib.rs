@@ -748,14 +748,13 @@ mod tests {
     #[test]
     fn deferred_builtins_error() {
         // Built-ins in the locked set but not yet generated report cleanly.
-        for src in ["struct S:\n    @validate(max_len=9)\n    str x\n"] {
-            let (ast, _p, _l) = parse_str(src);
-            let (_m, errs) = lower_module(&ast);
-            assert!(
-                !errs.is_empty(),
-                "expected a deferred-feature error for:\n{src}"
-            );
-        }
+        let src = "struct S:\n    @validate(max_len=9)\n    str x\n";
+        let (ast, _p, _l) = parse_str(src);
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            !errs.is_empty(),
+            "expected a deferred-feature error for:\n{src}"
+        );
     }
 
     #[test]
