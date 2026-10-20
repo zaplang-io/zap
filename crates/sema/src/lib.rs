@@ -3864,6 +3864,73 @@ mod tests {
     }
 
     #[test]
+    fn logging_module_surface_type_checks() {
+        // Level thresholds are int64 attributes (`logging.DEBUG`), emitters and
+        // config setters return unit, `get_level` returns int64 (ticket #101).
+        // `import logging` is accepted but not required.
+        ok("import logging\n\n\
+            def main():\n\
+            \x20   logging.set_level(logging.DEBUG)\n\
+            \x20   logging.set_stream(sys.stderr_fd())\n\
+            \x20   logging.set_format(\"%(levelname)s:%(message)s\")\n\
+            \x20   logging.debug(\"d\")\n\
+            \x20   logging.info(\"i\")\n\
+            \x20   logging.warning(\"w\")\n\
+            \x20   logging.error(\"e\")\n\
+            \x20   logging.critical(\"c\")\n\
+            \x20   logging.log(logging.ERROR, \"x\")\n\
+            \x20   int64 lvl = logging.get_level()\n\
+            \x20   print(lvl)\n");
+    }
+
+    #[test]
+    fn unknown_logging_function_and_level_are_errors() {
+        assert!(
+            !errors("def main():\n    logging.frobnicate(\"x\")\n").is_empty(),
+            "expected unknown logging.* function to error"
+        );
+        // `logging.NOTSET` is not a known level, so the base resolves as a value
+        // and fails (no `logging` binding).
+        assert!(
+            !errors("def main():\n    auto x = logging.NOTSET\n").is_empty(),
+            "expected unknown logging level to error"
+        );
+    }
+
+    #[test]
+    fn argparse_module_surface_type_checks() {
+        // Declarations/parse return unit; typed getters return str/int64/bool;
+        // `format_help` -> str, `help_requested` -> bool (ticket #101).
+        ok("import argparse\n\n\
+            def main():\n\
+            \x20   argparse.set_prog(\"demo\")\n\
+            \x20   argparse.set_description(\"desc\")\n\
+            \x20   argparse.add_flag(\"verbose\")\n\
+            \x20   argparse.add_option(\"name\", \"anon\")\n\
+            \x20   argparse.add_int(\"count\", 1)\n\
+            \x20   argparse.add_positional(\"src\")\n\
+            \x20   auto argv = [\"prog\", \"src.txt\"]\n\
+            \x20   argparse.parse(argv)\n\
+            \x20   str n = argparse.get(\"name\")\n\
+            \x20   int64 c = argparse.get_int(\"count\")\n\
+            \x20   str h = argparse.format_help()\n\
+            \x20   if argparse.get_flag(\"verbose\"):\n\
+            \x20       print(n)\n\
+            \x20   if argparse.help_requested():\n\
+            \x20       print(h)\n\
+            \x20   print(c)\n\
+            \x20   argparse.reset()\n");
+    }
+
+    #[test]
+    fn unknown_argparse_function_is_an_error() {
+        assert!(
+            !errors("def main():\n    argparse.frobnicate()\n").is_empty(),
+            "expected unknown argparse.* function to error"
+        );
+    }
+
+    #[test]
     fn on_signal_decorator_type_checks() {
         ok("@on_signal(Signal.SIGTERM)\ndef cleanup():\n    print(1)\n\ndef main():\n    print(0)\n");
     }
