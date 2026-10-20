@@ -473,9 +473,19 @@ for x in Range(lo=0, hi=5):   # 0 1 2 3 4
 lowers directly over the tuple machinery (D-0049); the `StopIteration` form
 lowers to a landing pad (D-0007) that ends the loop when the in-flight
 exception matches the `StopIteration` sentinel and re-raises otherwise.
-**Generators (`yield`)** are deferred to a follow-up (the compiler-generated
-state machine), tracked in issue #67; they will plug into this protocol with no
-change to the `for`/comprehension side.
+**Generators (`yield`, I#67)** now ship: a free `def` whose body contains
+`yield` is a generator, and calling it returns a compiler-generated **state
+struct** that implements the comma-ok `Iterator` protocol — so it plugs into the
+`for`/comprehension side with no change there. The generator's live locals (and
+parameters) become fields of the state struct; its `__next__` is a state machine
+that loads those fields into per-call slots, runs to the next `yield` (storing
+them back and returning `(value, True)`), and returns `(_, False)` on fall-off
+or a bare `return` (NOT `raise StopIteration` — PEP 479). Because the state
+object is an ordinary reference struct, both collectors trace its live pointer
+locals with no extra machinery. v1 limits: `yield` must be a statement with an
+operand, generators are free functions (not methods), a generator `return`
+carries no value, and a generator yields a single element type; `yield` inside
+`try`/`with`/`scope`/`match` and nested generators are future work.
 
 ### 3. Enums
 

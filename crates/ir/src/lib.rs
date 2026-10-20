@@ -987,6 +987,47 @@ struct RangeIter:
 ";
 
     #[test]
+    fn lower_generator_state_machine() {
+        // A `def` with `yield` (I#67) lowers to a state-struct with comma-ok
+        // `__iter__`/`__next__`; the call constructs the struct (no `@count`
+        // function is emitted).
+        let m = lower_ok(
+            "\
+def count(int64 n):
+    auto i = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def main():
+    auto total = 0
+    for x in count(5):
+        total = total + x
+    print(total)
+",
+        );
+        let text = format!("{m}");
+        // The generator function itself is not emitted; its iterator methods are.
+        assert!(!m.funcs.iter().any(|f| f.name == "count"), "text:\n{text}");
+        assert!(
+            m.funcs.iter().any(|f| f.name == "$gen:count____iter__"),
+            "text:\n{text}"
+        );
+        let next = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "$gen:count____next__")
+            .expect("__next__ emitted");
+        // `__next__` returns the comma-ok `(int64, bool)` tuple.
+        assert!(matches!(next.ret, Ty::Struct(_)), "ret: {:?}", next.ret);
+        // The state machine dispatches on the `$state` field and suspends/returns.
+        assert!(text.contains("$gen:count____next__"), "text:\n{text}");
+        assert!(text.contains("icmp"), "text:\n{text}");
+        // The call site constructs the state struct rather than calling a fn.
+        assert!(!text.contains("call @count"), "text:\n{text}");
+    }
+
+    #[test]
     fn lower_user_iterable_commaok() {
         // `for x in Range(...)` desugars to `__iter__` then a loop over the
         // comma-ok `__next__`, binding each tuple's value field.
