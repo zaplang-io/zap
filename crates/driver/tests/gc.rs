@@ -99,3 +99,49 @@ fn immix_reclaims_with_parked_coroutines() {
     );
     assert_eq!(stdout.trim_end(), "kept\nkept");
 }
+
+/// Compile and run `src` with no heap cap; return (success, stdout, stderr).
+fn run(src: &str) -> (bool, String, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1_000_000);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("zapgc-test-{}-{}", std::process::id(), seq));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("prog{}_{}.zap", std::process::id(), seq));
+    std::fs::write(&path, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_zapc"))
+        .arg("run")
+        .arg(&path)
+        .output()
+        .expect("run zapc");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Finalizers (ticket #92): a registered finalizer must run when its object is
+/// collected, exactly once. The `__gc_finalizer_selftest()` runtime hook
+/// registers an incrementing stand-in finalizer on 64 unreachable objects,
+/// forces two collections, and returns how many finalizers ran — 64 iff the
+/// precise collector's post-mark finalizer queue runs each exactly once (no
+/// miss, no double-run). This is the Immix parity for the Boehm finalizer that
+/// DECREFs a `ZapPy` wrapper's CPython reference; a stand-in counter stands in
+/// for `Py_DECREF` because the v1 Python interop gives a real decref no
+/// deterministic observable effect (explained in the PR).
+#[test]
+fn immix_runs_finalizers_once_each() {
+    let src = "def main():\n    print(__gc_finalizer_selftest())\n";
+    let (ok, stdout, stderr) = run(src);
+    assert!(
+        ok,
+        "finalizer self-test should run; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout.trim_end(),
+        "64",
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+}

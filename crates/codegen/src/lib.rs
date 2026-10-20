@@ -690,6 +690,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_runtime_goroutine_dump", &[], None);
         self.declare_rt("zap_runtime_num_goroutines", &[], Some(i.into()));
         self.declare_rt("zap_signal_selftest", &[], Some(i.into()));
+        // Finalizer integration-test hook (ticket #92, gc-immix): exercises the
+        // precise collector's register + post-mark finalizer queue and returns
+        // the number of finalizers that ran. See `zapgc.inc.c`.
+        self.declare_rt("zap_gc_finalizer_selftest", &[], Some(i.into()));
         self.declare_rt("zap_signal_raise", &[i.into()], None);
         self.declare_rt("zap_signal_drain", &[], None);
         self.declare_rt("zap_chan_new", &[i.into()], Some(p.into()));

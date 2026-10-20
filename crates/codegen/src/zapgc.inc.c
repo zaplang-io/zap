@@ -355,6 +355,78 @@ void zap_gc_add_root_fn(void (*fn)(void)) {
     pthread_mutex_unlock(&zap_groots_mu);
 }
 
+/* ---- finalizers (ticket #92) ---------------------------------------------- *
+ * Boehm registers a finalizer per object (e.g. the `ZapPy` CPython-interop
+ * wrapper DECREFs its owned PyObject when collected). The precise collector
+ * mirrors that: an object registers a cleanup callback, and when it becomes
+ * unreachable the callback runs once, before the object's space is reclaimed.
+ *
+ * Semantics (documented in design/0008-precise-gc.md; chosen to match Boehm
+ * where the ZapPy path cares, and spelled out where it differs):
+ *   - ONE-SHOT. Each registration fires at most once; it is removed from the
+ *     registry when it fires. A finalizer that resurrects its object (makes it
+ *     reachable again) keeps the object, but will not run again unless the
+ *     object is re-registered. (`zap_py_finalize` NULLs its ref, so a repeat
+ *     would be a harmless no-op anyway.)
+ *   - POST-MARK QUEUE. After the normal mark from the true roots, any registered
+ *     object whose mark bit is clear is unreachable; all such objects are queued
+ *     and removed from the registry in one pass, THEN marked (with their
+ *     transitive referents) so the collector does not reclaim an object — or
+ *     anything it points at — before its finalizer has run. A finalizable object
+ *     therefore survives the collection that queues it and is reclaimed on a
+ *     later cycle, once it is no longer registered.
+ *   - FINALIZABLE CYCLES. Because the unreachable-registered SET is determined
+ *     before any of them is marked, a cycle of mutually-referencing finalizable
+ *     objects is still finalized (each exactly once). This is deliberately
+ *     simpler than Boehm, which leaves finalizable cycles uncollected; the ZapPy
+ *     wrapper never forms such a cycle (each owns one independent CPython ref),
+ *     so the observable behavior matches Boehm for the path this ticket exists
+ *     for. No ordering is guaranteed among finalizers run in one cycle.
+ *   - Finalizers run AFTER the sweep and after the world resumes (in the
+ *     collector thread, before the triggering collect returns), so they execute
+ *     in ordinary mutator context — never mid-mark — exactly as Boehm runs them
+ *     outside the collection. Py_DECREF (which takes the GIL) is safe there.
+ *
+ * The registry holds raw payload pointers; it is NOT a root (scanned only after
+ * marking). A registered object is marked live every cycle it stays registered
+ * (by the roots if reachable, or by the queue pass if not), so it is never swept
+ * while registered and the stored pointers never dangle. */
+typedef void (*ZapFinalizeFn)(void *obj, void *client_data);
+
+typedef struct ZapFinalizer {
+    void *payload;
+    ZapFinalizeFn fn;
+    void *client_data;
+} ZapFinalizer;
+
+static pthread_mutex_t zap_fin_mu = PTHREAD_MUTEX_INITIALIZER;
+static ZapFinalizer *zap_fin_reg = NULL; /* registered, still-live objects       */
+static size_t zap_fin_len = 0;
+static size_t zap_fin_cap = 0;
+static ZapFinalizer *zap_fin_pending = NULL; /* queued this cycle, run post-sweep */
+static size_t zap_fin_pending_len = 0;
+static size_t zap_fin_pending_cap = 0;
+
+/* Register `fn(payload, client_data)` to run when `payload` becomes unreachable.
+ * Backend-uniform entry (Boehm forwards to GC_register_finalizer in zaprt.c); the
+ * ZapPy wrapper is the first user. Idempotent registration is not required. */
+void zap_gc_register_finalizer(void *payload, ZapFinalizeFn fn, void *client_data) {
+    if (payload == NULL || fn == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&zap_fin_mu);
+    if (zap_fin_len == zap_fin_cap) {
+        size_t ncap = zap_fin_cap ? zap_fin_cap * 2 : 64;
+        zap_fin_reg = (ZapFinalizer *)realloc(zap_fin_reg, ncap * sizeof(ZapFinalizer));
+        zap_fin_cap = ncap;
+    }
+    zap_fin_reg[zap_fin_len].payload = payload;
+    zap_fin_reg[zap_fin_len].fn = fn;
+    zap_fin_reg[zap_fin_len].client_data = client_data;
+    zap_fin_len++;
+    pthread_mutex_unlock(&zap_fin_mu);
+}
+
 /* ---- the marker ----------------------------------------------------------- */
 /* An append-only mark list (BFS worklist) avoids deep C recursion AND lets us
  * clear every survivor's header mark bit after the trace: once the trace drains
@@ -567,6 +639,64 @@ static void zap_mark_reset(void) {
 /* Public mark entry for runtime static-root callbacks. */
 void zap_gc_mark(void *payload) { zap_mark_push(payload); }
 
+/* After the true-root mark has drained, move every registered object that is now
+ * unreachable (mark bit clear) onto the pending-finalizer queue and drop it from
+ * the registry (one-shot), THEN mark all of them — so their transitive referents
+ * survive this cycle and the finalizer can safely dereference the object. The
+ * set is collected before any marking so a finalizable cycle still finalizes.
+ * Caller holds zap_heap_mu and the world is stopped; the caller drains the mark
+ * worklist again afterward. */
+static void zap_finalize_prepare(void) {
+    pthread_mutex_lock(&zap_fin_mu);
+    size_t first_new = zap_fin_pending_len;
+    size_t i = 0;
+    while (i < zap_fin_len) {
+        if (ZAP_MARKED(zap_fin_reg[i].payload)) {
+            i++; /* still reachable: keep registered */
+            continue;
+        }
+        /* Unreachable: queue for finalization and swap-remove from the registry. */
+        if (zap_fin_pending_len == zap_fin_pending_cap) {
+            size_t ncap = zap_fin_pending_cap ? zap_fin_pending_cap * 2 : 64;
+            zap_fin_pending =
+                (ZapFinalizer *)realloc(zap_fin_pending, ncap * sizeof(ZapFinalizer));
+            zap_fin_pending_cap = ncap;
+        }
+        zap_fin_pending[zap_fin_pending_len++] = zap_fin_reg[i];
+        zap_fin_reg[i] = zap_fin_reg[--zap_fin_len];
+        /* do not advance i: the swapped-in entry must be examined */
+    }
+    /* Keep every queued object (and what it references) alive for this cycle. */
+    for (size_t k = first_new; k < zap_fin_pending_len; k++) {
+        zap_mark_push(zap_fin_pending[k].payload);
+    }
+    pthread_mutex_unlock(&zap_fin_mu);
+}
+
+/* Run and clear the pending finalizers. Called by the collector thread after the
+ * sweep and after the world has resumed, so finalizers run in ordinary mutator
+ * context (never mid-mark). The queued objects were marked live this cycle, so
+ * their memory is intact; they are reclaimed on a later cycle now that they are
+ * unregistered. No safepoint runs between resume and here, so the pointers stay
+ * valid even though they are not rooted. */
+static void zap_run_finalizers(void) {
+    /* Snapshot under the lock, then run without it (a finalizer may re-register,
+     * which takes zap_fin_mu). */
+    pthread_mutex_lock(&zap_fin_mu);
+    size_t n = zap_fin_pending_len;
+    ZapFinalizer *batch = NULL;
+    if (n) {
+        batch = (ZapFinalizer *)malloc(n * sizeof(ZapFinalizer));
+        memcpy(batch, zap_fin_pending, n * sizeof(ZapFinalizer));
+        zap_fin_pending_len = 0;
+    }
+    pthread_mutex_unlock(&zap_fin_mu);
+    for (size_t i = 0; i < n; i++) {
+        batch[i].fn(batch[i].payload, batch[i].client_data);
+    }
+    free(batch);
+}
+
 /* ---- root enumeration ----------------------------------------------------- */
 static void zap_mark_shadow_chain(void *head) {
     for (ZapShadowFrame *f = (ZapShadowFrame *)head; f; f = f->prev) {
@@ -752,6 +882,11 @@ static void zap_collect_now(void) {
     }
     pthread_cond_broadcast(&zap_stw_cv);
     pthread_mutex_unlock(&zap_stw_mu);
+
+    /* World resumed: run any finalizers queued during this collection in ordinary
+     * mutator context (ticket #92). Objects queued this cycle were marked live, so
+     * their memory is intact until a later collection reclaims them. */
+    zap_run_finalizers();
 }
 
 /* Explicit collection (a `gc_collect()` builtin / test hook, and the uniform
@@ -940,7 +1075,9 @@ static void zap_mark_sweep(void) {
     }
     zap_mark_roots();
     zap_mark_drain();
-    zap_mark_reset(); /* clear survivor header bits for the next cycle */
+    zap_finalize_prepare(); /* queue now-unreachable finalizable objects (#92) */
+    zap_mark_drain();       /* keep queued objects + their referents alive       */
+    zap_mark_reset();       /* clear survivor header bits for the next cycle      */
     zap_sweep();
     zap_bytes_since_gc = 0;
     /* Enforce the optional hard cap (ZAP_GC_HEAP_LIMIT) against the LIVE set, not
@@ -963,4 +1100,46 @@ static void zap_mark_sweep(void) {
         want = zap_heap_limit;
     }
     zap_gc_threshold = want;
+}
+
+/* ---- finalizer self-test (ticket #92) ------------------------------------- *
+ * Internal hook behind the `__gc_finalizer_selftest()` builtin. Wiring the real
+ * CPython `Py_DECREF` path into an automated assertion is impractical (the v1
+ * Python interop marshals only ints/floats/strs through module functions and
+ * caches modules, so a decref has no deterministic, observable effect), so this
+ * exercises the identical registration + post-mark queue + one-shot run machinery
+ * with a stand-in finalizer whose side effect is a counter. See the PR body.
+ *
+ * It allocates N objects, registers an incrementing finalizer on each, and keeps
+ * no reference to them (C locals are not GC roots under the precise collector),
+ * so a forced collection finds them all unreachable and runs every finalizer. A
+ * second collection proves the one-shot contract: finalizers do not run twice.
+ * Returns the number of finalizers that ran (N on success). */
+static volatile int64_t zap_fin_selftest_ran = 0;
+
+static void zap_fin_selftest_cb(void *obj, void *client_data) {
+    (void)obj;
+    (void)client_data;
+    pthread_mutex_lock(&zap_fin_mu);
+    zap_fin_selftest_ran++;
+    pthread_mutex_unlock(&zap_fin_mu);
+}
+
+int64_t zap_gc_finalizer_selftest(void) {
+    enum { N = 64 };
+    zap_mutator_register();
+    pthread_mutex_lock(&zap_fin_mu);
+    zap_fin_selftest_ran = 0;
+    pthread_mutex_unlock(&zap_fin_mu);
+    for (int i = 0; i < N; i++) {
+        void *o = zap_gc_alloc_atomic(16);
+        zap_gc_register_finalizer(o, zap_fin_selftest_cb, NULL);
+        /* `o` dies with this iteration; it is not a GC root. */
+    }
+    zap_gc_collect(); /* all N unreachable: finalizers queued + run             */
+    zap_gc_collect(); /* reclaim them; one-shot means no finalizer runs again   */
+    pthread_mutex_lock(&zap_fin_mu);
+    int64_t ran = zap_fin_selftest_ran;
+    pthread_mutex_unlock(&zap_fin_mu);
+    return ran;
 }

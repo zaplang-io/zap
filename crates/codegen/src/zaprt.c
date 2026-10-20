@@ -135,6 +135,10 @@ void zap_gc_add_root(void **slot);
 void zap_gc_add_root_fn(void (*fn)(void));
 void zap_gc_mark(void *payload);
 void zap_gc_collect(void);
+/* Finalizers (ticket #92): register cleanup for an object, run once when it
+ * becomes unreachable. `zap_py_wrap` uses it for the CPython-ref DECREF. */
+void zap_gc_register_finalizer(void *payload, void (*fn)(void *obj, void *cd), void *cd);
+int64_t zap_gc_finalizer_selftest(void); /* internal __gc_finalizer_selftest hook */
 extern __thread void *zap_shadow_head;
 extern void *zap_main_shadow_head;
 static void zap_enter_blocking(void); /* fwd (defined in zapgc.inc.c)           */
@@ -149,8 +153,6 @@ static inline void *zap_ptrbuf(int64_t n) { return zap_gc_alloc_atomic(n); }
  * directly via C globals, not traced as Zap objects, so they use plain malloc
  * and live for the program's lifetime. */
 #define ZAP_INFRA_ALLOC(n) malloc(n)
-#define GC_register_finalizer(obj, fn, cd, ofn, ocd)                           \
-    ((void)(obj), (void)(fn), (void)(cd), (void)(ofn), (void)(ocd))
 #else
 /* Boehm: a safepoint is a no-op, roots are found conservatively, and every
  * allocation routes to GC_MALLOC / GC_MALLOC_ATOMIC. `desc` carries the size. */
@@ -168,6 +170,13 @@ static inline void *zap_obj(const ZapTypeDesc *d) { return GC_MALLOC((size_t)d->
 static inline void *zap_buf(int64_t n) { return GC_MALLOC_ATOMIC((size_t)n); }
 static inline void *zap_ptrbuf(int64_t n) { return GC_MALLOC((size_t)n); }
 #define ZAP_INFRA_ALLOC(n) GC_MALLOC(n)
+/* Finalizers (ticket #92): forward to Boehm's registration so the one call site
+ * (`zap_py_wrap`) is backend-uniform. Boehm's default finalizer already provides
+ * exactly these semantics (one-shot, run when unreachable, outside the GC). */
+static inline void zap_gc_register_finalizer(void *payload,
+                                             void (*fn)(void *obj, void *cd), void *cd) {
+    GC_register_finalizer(payload, (GC_finalization_proc)fn, cd, NULL, NULL);
+}
 #endif
 
 typedef struct {
@@ -1471,7 +1480,10 @@ void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_
  * Representation & GC bridging: a Python value held by Zap is an opaque,
  * GC-managed handle `ZapPy` that OWNS one CPython reference. Capture takes a new
  * reference (the C-API calls here return new references, handed straight to
- * `zap_py_wrap`); a Boehm finalizer DECREFs when the wrapper is collected. The
+ * `zap_py_wrap`); a finalizer DECREFs when the wrapper is collected — under Boehm
+ * via GC_register_finalizer, under the precise Immix collector via its post-mark
+ * finalizer queue (ticket #92), through the one backend-uniform
+ * `zap_gc_register_finalizer` call site. The
  * wrapper is GC-scanned, and the ZapList argument vectors that carry handles are
  * GC_MALLOC'd, so a live Zap handle keeps its PyObject alive across collection.
  *
@@ -1515,7 +1527,9 @@ static void zap_py_finalize(void *obj, void *client_data) {
 static ZapPy *zap_py_wrap(PyObject *o) {
     ZapPy *h = (ZapPy *)zap_obj(&zap_desc_pyobj);
     h->obj = o;
-    GC_register_finalizer(h, zap_py_finalize, NULL, NULL, NULL);
+    /* Backend-uniform: Boehm forwards to GC_register_finalizer; the precise Immix
+     * collector runs this via its own post-mark finalizer queue (ticket #92). */
+    zap_gc_register_finalizer(h, zap_py_finalize, NULL);
     return h;
 }
 
