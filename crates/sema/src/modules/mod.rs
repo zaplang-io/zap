@@ -34,6 +34,7 @@ mod process;
 mod random;
 mod runtime;
 mod signal;
+mod sync;
 mod sys;
 mod time;
 
@@ -71,6 +72,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     deque::MODULE,
     bisect::MODULE,
     oset::MODULE,
+    sync::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute

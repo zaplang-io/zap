@@ -35,6 +35,7 @@ mod random;
 mod runtime;
 mod signal;
 mod support;
+mod sync;
 mod sys;
 mod time;
 
@@ -76,6 +77,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     deque::MODULE,
     bisect::MODULE,
     oset::MODULE,
+    sync::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not
