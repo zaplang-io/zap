@@ -19,6 +19,8 @@ use crate::ir::*;
 
 mod datetime;
 mod gc;
+mod math;
+mod random;
 mod runtime;
 mod signal;
 mod time;
@@ -45,9 +47,26 @@ pub(super) const MODULES: &[ModuleLower] = &[
     signal::MODULE,
     gc::MODULE,
     runtime::MODULE,
+    math::MODULE,
+    random::MODULE,
     time::MODULE,
     datetime::MODULE,
 ];
+
+/// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not
+/// a call) to a ZIR value, e.g. `math.pi` -> an `f64` `FConst`. An **additive**
+/// sub-registry over [`MODULES`] — only constant-bearing modules appear, so the
+/// common `ModuleLower` shape is unchanged (ticket #98).
+pub(super) struct ModuleConst {
+    /// The module's flat name as written in source (`math`, …).
+    pub name: &'static str,
+    /// Lower `name.<const>`, or `None` if the module has no such constant.
+    pub lower: fn(&mut FnLower, &str) -> Option<(Value, Ty)>,
+}
+
+/// The registered modules that expose compile-time constants (ticket #98). Keep
+/// in step with `zapc_sema::modules::CONST_MODULES`.
+pub(super) const CONST_MODULES: &[ModuleConst] = &[math::MODULE_CONST];
 
 /// Lower a built-in `signal`/`gc`/`runtime`-style module call, or return
 /// `Ok(None)` if `module` is not a registered built-in module (so the caller
@@ -63,6 +82,20 @@ pub(super) fn lower_builtin_module_call(
         Some(desc) => (desc.lower)(lowerer, method, args),
         None => Ok(None),
     }
+}
+
+/// Lower a built-in `module.CONST` attribute access (e.g. `math.pi`), or return
+/// `None` if `module` is not a registered constant-bearing module or has no such
+/// constant (so the caller falls through to ordinary attribute resolution). See
+/// `zapc_sema::modules::check_builtin_module_const` for the type-checking twin
+/// (ticket #98).
+pub(super) fn lower_builtin_module_const(
+    lowerer: &mut FnLower,
+    module: &str,
+    name: &str,
+) -> Option<(Value, Ty)> {
+    let desc = CONST_MODULES.iter().find(|m| m.name == module)?;
+    (desc.lower)(lowerer, name)
 }
 
 /// Shared helper: emit a zero-argument runtime call. A `Ty::Void` return models a

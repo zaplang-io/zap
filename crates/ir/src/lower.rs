@@ -4415,6 +4415,15 @@ impl<'a> FnLower<'a> {
                     if self.ctx.enums.contains_key(tyname) {
                         return self.lower_enum_member(tyname, name);
                     }
+                    // Built-in module constant `math.pi`-style access (ticket
+                    // #98), intercepted before the base is lowered as a value
+                    // (module names are not bindings). Not intercepted when
+                    // shadowed by a local of the same name.
+                    if self.lookup(tyname).is_none() {
+                        if let Some(r) = modules::lower_builtin_module_const(self, tyname, name) {
+                            return Ok(r);
+                        }
+                    }
                 }
                 let (bv, bty) = self.expr(base)?;
                 // Attribute read on a Python handle, e.g. `np.pi` (ticket #27,

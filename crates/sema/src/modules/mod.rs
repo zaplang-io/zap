@@ -19,6 +19,8 @@ use crate::{Checker, Ty};
 
 mod datetime;
 mod gc;
+mod math;
+mod random;
 mod runtime;
 mod signal;
 mod time;
@@ -41,9 +43,26 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     signal::MODULE,
     gc::MODULE,
     runtime::MODULE,
+    math::MODULE,
+    random::MODULE,
     time::MODULE,
     datetime::MODULE,
 ];
+
+/// A built-in module's *constant* facet: the type of a `module.CONST` attribute
+/// access (not a call), e.g. `math.pi : float64`. This is an **additive**
+/// sub-registry over [`MODULES`] — only modules that expose constants appear
+/// here, so the common `ModuleCheck` shape is unchanged (ticket #98).
+pub(crate) struct ModuleConst {
+    /// The module's flat name as written in source (`math`, …).
+    pub name: &'static str,
+    /// Type of `name.<const>`, or `None` if the module has no such constant.
+    pub const_ty: fn(&str) -> Option<Ty>,
+}
+
+/// The registered modules that expose compile-time constants (ticket #98). Add
+/// a module: expose `pub(super) const MODULE_CONST: ModuleConst` and append it.
+pub(crate) const CONST_MODULES: &[ModuleConst] = &[math::MODULE_CONST];
 
 /// Type-check a built-in `signal`/`gc`/`runtime`-style module call, returning the
 /// result type, or `None` if `module` is not a registered built-in module (so the
@@ -67,6 +86,16 @@ pub(crate) fn check_builtin_module_call(
             Ty::Unknown
         }),
     )
+}
+
+/// Type a built-in `module.CONST` attribute access (e.g. `math.pi`), or return
+/// `None` if `module` is not a registered constant-bearing module or has no such
+/// constant (so the caller falls through to ordinary attribute resolution).
+/// Like the call registry, these module names are not value bindings; the caller
+/// only consults this when `module` is not shadowed by a local (ticket #98).
+pub(crate) fn check_builtin_module_const(module: &str, name: &str) -> Option<Ty> {
+    let desc = CONST_MODULES.iter().find(|m| m.name == module)?;
+    (desc.const_ty)(name)
 }
 
 /// Shared helper: require exactly `n` arguments for `module.method`, emitting the

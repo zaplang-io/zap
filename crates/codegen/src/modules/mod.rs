@@ -15,6 +15,8 @@ use super::Cg;
 
 mod datetime;
 mod gc;
+mod math;
+mod random;
 mod runtime;
 mod signal;
 mod time;
@@ -26,6 +28,8 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     signal::declare_rt(cg);
     gc::declare_rt(cg);
     runtime::declare_rt(cg);
+    math::declare_rt(cg);
+    random::declare_rt(cg);
     time::declare_rt(cg);
     datetime::declare_rt(cg);
 }
