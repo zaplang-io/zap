@@ -4155,6 +4155,20 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((d, Ty::I64));
             }
+            // `__gc_finalizer_selftest()` (ticket #92): internal finalizer
+            // integration-test hook; returns the number of finalizers that ran.
+            if fname == "__gc_finalizer_selftest" {
+                if !args.is_empty() {
+                    return Err(err("__gc_finalizer_selftest() takes no arguments"));
+                }
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_gc_finalizer_selftest".to_string(),
+                    args: vec![],
+                });
+                return Ok((d, Ty::I64));
+            }
             // `__raise_signal(n)` (ticket #77): internal test hook; send signal n
             // to this process so a golden can trigger delivery deterministically.
             if fname == "__raise_signal" {

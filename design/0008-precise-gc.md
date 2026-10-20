@@ -1,7 +1,7 @@
 # Design: Precise (Immix-style) garbage collector
 
 - **Author(s):** Zap team
-- **Last updated:** 2026-10-19
+- **Last updated:** 2026-10-20
 - **Status:** Implemented (v1, behind the `gc-immix` build flag; Boehm remains
   the default). All 5 forks were approved as recommended, including 4a.
 - **Discussion:** github.com/parveshgarg/zap#48
@@ -366,9 +366,50 @@ approved forks):
   `void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes)` (mapped-heap and
   live/used bytes, best-effort per backend — bdwgc heap/free bytes for Boehm,
   mapped + last-collection live estimate for Immix).
+- **Finalizers / cleanup (ticket #92).** Objects that need cleanup when collected
+  (at minimum the `ZapPy` CPython-interop wrapper, which `Py_DECREF`s its owned
+  reference) register a finalizer through one backend-uniform call,
+  `zap_gc_register_finalizer(payload, fn, client_data)`. Under Boehm this
+  forwards to `GC_register_finalizer`; under Immix the collector runs it via a
+  post-mark finalizer queue. The single call site is `zap_py_wrap`, so no
+  `#ifdef` leaks into the interop code.
+  - **Mechanism.** A registry of `(payload, fn, client_data)` records live
+    registered objects. After the normal mark from the true roots drains, the
+    collector determines the full set of registered objects whose mark bit is
+    clear (unreachable), queues them and drops them from the registry in one
+    pass, *then* marks that whole set (and its transitive referents) so neither a
+    finalizable object nor anything it points at is reclaimed before its
+    finalizer runs. The mark worklist is drained again, then sweep proceeds. The
+    queued finalizers run after the sweep and after the world resumes, in the
+    collector thread before the triggering collection returns — ordinary mutator
+    context, never mid-mark — mirroring how Boehm runs finalizers outside the GC.
+    `Py_DECREF` (which takes the GIL) is safe there. The registry is never a
+    root: it is scanned only after marking, so registering an object does not by
+    itself keep it alive.
+  - **Semantics (and where they match/diverge from Boehm).** *One-shot:* each
+    registration fires at most once and is removed when it fires; a finalizer
+    that resurrects its object keeps the object but will not run again unless
+    re-registered (`zap_py_finalize` NULLs its ref, so a repeat would no-op
+    anyway). *Latency:* a finalizable object survives the collection that queues
+    it and is reclaimed on a later cycle, once unregistered. *Finalizable
+    cycles:* because the unreachable-registered set is fixed before any of it is
+    marked, a cycle of mutually-referencing finalizable objects is still
+    finalized (each exactly once) — deliberately simpler than Boehm, which leaves
+    such cycles uncollected. The `ZapPy` wrapper never forms a finalizable cycle
+    (each owns one independent CPython ref), so the observable behavior matches
+    Boehm for the path this ticket exists for. *Ordering:* none is guaranteed
+    among finalizers run in one cycle (Boehm topologically orders acyclic
+    chains); this matters only for finalizable objects that reference each other
+    and whose finalizers are order-dependent, which `ZapPy` is not.
+  - **Test.** `__gc_finalizer_selftest()` (an internal hook, gc-immix only, like
+    `__signal_selftest`) registers an incrementing stand-in finalizer on 64
+    unreachable objects, forces two collections, and returns how many ran; the
+    gc-immix driver test asserts 64 (every finalizer ran, exactly once). A
+    stand-in counter stands in for the real `Py_DECREF` because the v1 Python
+    interop (modules cached, only int/float/str marshaled through module
+    functions) gives a real decref no deterministic, observable effect; the
+    machinery exercised is identical to the `ZapPy` path.
 - **v1 simplifications (follow-ups):** allocation is under one global heap lock
-  (not per-P bump); finalizers are a no-op under Immix, so a `ZapPy` wrapper's
-  CPython reference is not decref'd (bounded leak; Boehm keeps its finalizer);
-  user-level cyclic *literals* can't yet be written (the front end lacks `None`
-  / struct-field mutation), though the tracing collector reclaims cycles by
-  construction, as the reclamation tests show.
+  (not per-P bump); user-level cyclic *literals* can't yet be written (the front
+  end lacks `None` / struct-field mutation), though the tracing collector
+  reclaims cycles by construction, as the reclamation tests show.

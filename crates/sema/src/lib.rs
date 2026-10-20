@@ -521,6 +521,10 @@ const BUILTINS: &[&str] = &[
     // signal goldens are deterministic. Not public surface.
     "__raise_signal",
     "__signal_drain",
+    // Internal finalizer integration-test hook (ticket #92): exercises the
+    // precise collector's register + post-mark finalizer queue end-to-end with a
+    // stand-in finalizer and returns the number that ran. Not public surface.
+    "__gc_finalizer_selftest",
 ];
 
 /// The curated built-in decorator set shipped in v1 (D-0036,
@@ -3014,6 +3018,18 @@ impl Checker {
                 "__signal_selftest" => {
                     if !args.is_empty() {
                         self.error("__signal_selftest() takes no arguments".to_string(), span);
+                    }
+                    return Ty::Int64;
+                }
+                // `__gc_finalizer_selftest()` (ticket #92): runs the precise
+                // collector's finalizer self-test and returns the number of
+                // finalizers that ran. Internal; takes no arguments.
+                "__gc_finalizer_selftest" => {
+                    if !args.is_empty() {
+                        self.error(
+                            "__gc_finalizer_selftest() takes no arguments".to_string(),
+                            span,
+                        );
                     }
                     return Ty::Int64;
                 }
