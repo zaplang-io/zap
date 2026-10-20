@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-dev \
         pkg-config \
         zlib1g-dev \
+        libssl-dev \
         libzstd-dev \
         libffi-dev \
         libedit-dev \

@@ -7601,9 +7601,10 @@ void zap_once_end(void *op) {
  * server, built on the netpoller (#80) and the M:N scheduler (#47): every
  * socket operation is non-blocking and PARKS the goroutine on a would-block
  * (freeing its worker M) via `zap_netpoll_wait`, rather than blocking an OS
- * thread or busy-polling. TLS/https and UDP are out of scope for v1 (plaintext
- * TCP only); keep-alive, chunked transfer-encoding and graceful shutdown are
- * follow-ups (noted in the PR / design/0005).
+ * thread or busy-polling. TLS/`https` is handled by the `tls` section below
+ * (ticket #147); UDP is out of scope (plaintext TCP only). Keep-alive, chunked
+ * transfer-encoding and graceful shutdown are follow-ups (noted in the PR /
+ * design/0005).
  *
  * GC discipline (precise Immix): a socket op parks, and the collector traces a
  * parked G by its shadow chain only — NOT the green-stack C locals of this
@@ -7988,6 +7989,450 @@ void zap_net_close(void *s_) {
     s->fd = -1;
 }
 
+/* ===========================================================================
+ * tls (ticket #147, D-0062). A TLS *client* over the `net` TCP sockets, backed
+ * by system OpenSSL (`-lssl -lcrypto`) and integrated with the netpoller (#80):
+ * the fd is non-blocking, and SSL_connect / SSL_read / SSL_write returning
+ * WANT_READ / WANT_WRITE PARK the goroutine via `zap_sock_park` (freeing its
+ * worker M) instead of blocking an OS thread or busy-polling. `tls.connect`
+ * verifies the certificate chain against the system trust store AND the hostname
+ * by default (SSL_set1_host + SSL_VERIFY_PEER); `tls.connect_insecure` is the
+ * loudly-named opt-out (never the default).
+ *
+ * Only the unified post-1.1.0 OpenSSL API is used (TLS_client_method, automatic
+ * library init, SSL_CTX_set_min_proto_version, SSL_set1_host), identical across
+ * OpenSSL 1.1.1 / 3.x and LibreSSL >= 2.7, so no version #ifdef is needed; the
+ * CI image is OpenSSL 3.0.13 on Ubuntu 24.04. The TLS server is deferred — the
+ * self-signed loopback echo server behind `tls._test_server()` is a test
+ * scaffold only (its cert gen uses the OpenSSL 3.0 API, the CI target).
+ *
+ * GC discipline mirrors the net section: the `ZapTls` handle is ATOMIC (fd is a
+ * scalar; pd / SSL* / SSL_CTX* are non-GC infra), fd/pd/SSL* are pulled into C
+ * locals before any park, payloads are copied to malloc scratch, and GC results
+ * are built only after the final park. The `SSL_set_fd` BIO is BIO_NOCLOSE, so
+ * the runtime owns the fd and closes it exactly once via `zap_sock_shutdown`.
+ * ========================================================================== */
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
+
+/* A TLS connection: an owned fd (+ netpoller desc) and its OpenSSL session. */
+typedef struct {
+    int fd;
+    void *pd;
+    SSL *ssl;
+    SSL_CTX *ctx;
+} ZapTls;
+
+/* ATOMIC: fd is a scalar; pd/ssl/ctx are non-GC heap (netpoller + OpenSSL), so
+ * nothing is traced. Freed explicitly by `tls.close_conn` (the net contract). */
+static const ZapTypeDesc zap_desc_tls = {(int64_t)sizeof(ZapTls), ZAP_TD_ATOMIC, 0, NULL};
+
+/* Classify a non-positive SSL_* return into an action:
+ *    0 -> parked and now ready; retry the SSL_* call
+ *   -1 -> the descriptor was closed under us (treat as EOF)
+ *   -2 -> a real protocol / certificate-verification error (caller raises)
+ *   -3 -> clean peer shutdown via close_notify (treat as EOF). */
+static int zap_tls_want(SSL *ssl, int ret, int fd, void *pd) {
+    int e = SSL_get_error(ssl, ret);
+    switch (e) {
+    case SSL_ERROR_WANT_READ:
+        return zap_sock_park(fd, pd, ZAP_POLL_READ);
+    case SSL_ERROR_WANT_WRITE:
+        return zap_sock_park(fd, pd, ZAP_POLL_WRITE);
+    case SSL_ERROR_ZERO_RETURN:
+        return -3;
+    default:
+        return -2;
+    }
+}
+
+/* Raise a Zap exception for a handshake failure, including the top OpenSSL error
+ * string when one is queued (e.g. "certificate verify failed"). Captures the
+ * error BEFORE any SSL_free so the queue is not disturbed. */
+static void zap_tls_handshake_panic(void) {
+    unsigned long e = ERR_get_error();
+    char msg[384];
+    if (e) {
+        char b[256];
+        ERR_error_string_n(e, b, sizeof b);
+        snprintf(msg, sizeof msg, "tls: handshake failed: %s", b);
+    } else {
+        snprintf(msg, sizeof msg, "tls: handshake failed");
+    }
+    zap_net_panic(msg);
+}
+
+/* Internal client dial WITHOUT a GC handle: TCP-connect to host:port (raises on
+ * failure via zap_net_connect), then run the TLS handshake with SNI = host. When
+ * `verify`, the chain is checked against the system trust store and the hostname
+ * against `host`; an invalid/expired/mismatched/self-signed cert raises. On
+ * success returns the SSL session and writes the owning SSL_CTX, fd and poller
+ * desc through the out-params. The caller owns the lifetime (the http transport
+ * holds the raw session like the plaintext path holds fd/pd; the module wraps it
+ * in a `ZapTls`). */
+static SSL *zap_tls_dial_raw(void *host_, int64_t port, int verify, SSL_CTX **out_ctx, int *out_fd,
+                             void **out_pd) {
+    char *hz = zap_net_dupz((const ZapStr *)host_); /* SNI + hostname check */
+    if (!hz) {
+        zap_net_panic("tls: out of memory");
+        return NULL;
+    }
+    /* TCP connect (raises on failure). Extract fd/pd immediately and never touch
+     * the ZapSock GC object again across the handshake parks (net discipline). */
+    ZapSock *sock = (ZapSock *)zap_net_connect(host_, port);
+    int fd = sock->fd;
+    void *pd = sock->pd;
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        free(hz);
+        zap_sock_shutdown(fd, pd);
+        zap_net_panic("tls: SSL_CTX_new failed");
+        return NULL;
+    }
+    (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (verify) {
+        SSL_CTX_set_default_verify_paths(ctx); /* system trust store */
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) {
+        SSL_CTX_free(ctx);
+        free(hz);
+        zap_sock_shutdown(fd, pd);
+        zap_net_panic("tls: SSL_new failed");
+        return NULL;
+    }
+    SSL_set_fd(ssl, fd);
+    (void)SSL_set_tlsext_host_name(ssl, hz); /* SNI */
+    if (verify) {
+        SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        (void)SSL_set1_host(ssl, hz); /* hostname verification */
+    }
+    SSL_set_connect_state(ssl);
+    for (;;) {
+        int r = SSL_connect(ssl);
+        if (r == 1) {
+            break;
+        }
+        int w = zap_tls_want(ssl, r, fd, pd);
+        if (w == 0) {
+            continue; /* parked -> ready, retry */
+        }
+        /* -1 closed, -2 protocol/verification error, -3 early shutdown */
+        if (w == -2) {
+            char saved[384];
+            unsigned long e = ERR_get_error();
+            if (e) {
+                char b[256];
+                ERR_error_string_n(e, b, sizeof b);
+                snprintf(saved, sizeof saved, "tls: handshake failed: %s", b);
+            } else {
+                snprintf(saved, sizeof saved, "tls: handshake failed");
+            }
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            zap_sock_shutdown(fd, pd);
+            free(hz);
+            zap_net_panic(saved);
+            return NULL;
+        }
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        zap_sock_shutdown(fd, pd);
+        free(hz);
+        zap_net_panic("tls: connection closed during handshake");
+        return NULL;
+    }
+    free(hz);
+    *out_ctx = ctx;
+    *out_fd = fd;
+    *out_pd = pd;
+    return ssl;
+}
+
+/* Shared body of tls.connect / tls.connect_insecure: dial and wrap in a GC
+ * handle built only after the handshake's last park. */
+static void *zap_tls_dial(void *host_, int64_t port, int verify) {
+    SSL_CTX *ctx = NULL;
+    int fd = -1;
+    void *pd = NULL;
+    SSL *ssl = zap_tls_dial_raw(host_, port, verify, &ctx, &fd, &pd);
+    ZapTls *t = (ZapTls *)zap_obj(&zap_desc_tls);
+    t->fd = fd;
+    t->pd = pd;
+    t->ssl = ssl;
+    t->ctx = ctx;
+    return t;
+}
+
+/* tls.connect(host, port) -> handle. Chain + hostname verification ON. */
+void *zap_tls_connect(void *host_, int64_t port) { return zap_tls_dial(host_, port, 1); }
+/* tls.connect_insecure(host, port) -> handle. Verification OFF (explicit opt-in;
+ * never the default). Documented as unsafe. */
+void *zap_tls_connect_insecure(void *host_, int64_t port) { return zap_tls_dial(host_, port, 0); }
+
+/* Write all `len` bytes of `data` over `ssl`, parking on WANT_*. `data` is
+ * caller-owned (GC-free) scratch that survives the parks. Returns 0 on success,
+ * -1 on error. Shared by tls.send and the https client transport. */
+static int zap_tls_write_all(SSL *ssl, int fd, void *pd, const char *data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = len - off;
+        if (chunk > (1u << 20)) {
+            chunk = 1u << 20; /* keep within SSL_write's int count */
+        }
+        int r = SSL_write(ssl, data + off, (int)chunk);
+        if (r > 0) {
+            off += (size_t)r;
+            continue;
+        }
+        if (zap_tls_want(ssl, r, fd, pd) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* tls.send(conn, data) -> int64 plaintext bytes written. Payload copied to
+ * malloc scratch first so no GC pointer is held across the write parks. */
+int64_t zap_tls_send(void *t_, void *data_) {
+    ZapTls *t = (ZapTls *)t_;
+    int fd = t->fd;
+    void *pd = t->pd;
+    SSL *ssl = t->ssl;
+    const ZapStr *data = (const ZapStr *)data_;
+    size_t len = (size_t)(data->len < 0 ? 0 : data->len);
+    char *scratch = (char *)malloc(len + 1);
+    if (!scratch) {
+        zap_net_panic("tls: out of memory");
+        return 0;
+    }
+    if (len > 0) {
+        memcpy(scratch, data->data, len);
+    }
+    int rc = zap_tls_write_all(ssl, fd, pd, scratch, len);
+    free(scratch);
+    if (rc < 0) {
+        zap_net_panic("tls: send failed");
+        return 0;
+    }
+    return (int64_t)len;
+}
+
+/* tls.recv(conn, n) -> str: up to `n` decrypted bytes (one readiness-gated
+ * read); an empty str on a clean peer shutdown or close. Scratch is malloc (it
+ * lives across the parks); the result is copied into a GC str at the end. */
+void *zap_tls_recv(void *t_, int64_t n) {
+    ZapTls *t = (ZapTls *)t_;
+    int fd = t->fd;
+    void *pd = t->pd;
+    SSL *ssl = t->ssl;
+    if (n <= 0) {
+        return zap_str_new("", 0);
+    }
+    if (n > (1 << 30)) {
+        n = 1 << 30; /* SSL_read's count is an int; keep it positive */
+    }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        zap_net_panic("tls: out of memory");
+        return NULL;
+    }
+    ssize_t got = 0;
+    for (;;) {
+        int r = SSL_read(ssl, buf, (int)n);
+        if (r > 0) {
+            got = r;
+            break;
+        }
+        int w = zap_tls_want(ssl, r, fd, pd);
+        if (w == 0) {
+            continue;
+        }
+        if (w == -1 || w == -3) {
+            got = 0; /* closed / clean TLS shutdown -> EOF */
+            break;
+        }
+        free(buf);
+        zap_net_panic("tls: recv failed");
+        return NULL;
+    }
+    void *out = zap_str_new(buf, (int64_t)got);
+    free(buf);
+    return out;
+}
+
+/* tls.close_conn(conn). Sends a close_notify (best-effort, single pass — does
+ * not park for the peer's), frees the OpenSSL session + context and the socket.
+ * Idempotent: a second close is a no-op. */
+void zap_tls_close(void *t_) {
+    ZapTls *t = (ZapTls *)t_;
+    if (t->ssl) {
+        SSL_shutdown(t->ssl);
+        SSL_free(t->ssl); /* BIO_NOCLOSE: does not close the fd */
+        t->ssl = NULL;
+    }
+    if (t->ctx) {
+        SSL_CTX_free(t->ctx);
+        t->ctx = NULL;
+    }
+    if (t->fd >= 0) {
+        zap_sock_shutdown(t->fd, t->pd);
+        t->pd = NULL;
+        t->fd = -1;
+    }
+}
+
+/* ---- internal self-signed loopback echo server (test scaffold) ------------ *
+ * Behind `tls._test_server()`. The public TLS server is deferred (#147); this
+ * exists only so the golden suite can drive the real client end to end against a
+ * server-generated self-signed cert with no outbound network. It generates an
+ * ephemeral RSA key + self-signed X509 (CN=localhost), binds 127.0.0.1:0, and
+ * spawns a goroutine that accepts ONE connection, handshakes, echoes one record
+ * and tears down. A client that verifies (the default) rejects the self-signed
+ * cert mid-handshake — the server side then just cleans up, never crashing. */
+typedef struct {
+    int fd;  /* listener fd */
+    void *pd; /* listener netpoller desc */
+    SSL_CTX *ctx;
+} ZapTlsTestSrv;
+
+/* Build a server SSL_CTX holding a fresh self-signed localhost cert, or NULL. */
+static SSL_CTX *zap_tls_test_make_ctx(void) {
+    EVP_PKEY *pkey = EVP_RSA_gen(2048);
+    if (!pkey) {
+        return NULL;
+    }
+    X509 *x = X509_new();
+    if (!x) {
+        EVP_PKEY_free(pkey);
+        return NULL;
+    }
+    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
+    X509_gmtime_adj(X509_getm_notBefore(x), 0);
+    X509_gmtime_adj(X509_getm_notAfter(x), 60L * 60L * 24L * 365L);
+    X509_set_pubkey(x, pkey);
+    X509_NAME *nm = X509_get_subject_name(x);
+    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC, (const unsigned char *)"localhost", -1, -1,
+                               0);
+    X509_set_issuer_name(x, nm); /* self-signed: issuer == subject */
+    SSL_CTX *ctx = NULL;
+    if (X509_sign(x, pkey, EVP_sha256()) && (ctx = SSL_CTX_new(TLS_server_method())) != NULL) {
+        (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+        if (SSL_CTX_use_certificate(ctx, x) != 1 || SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
+            SSL_CTX_free(ctx);
+            ctx = NULL;
+        }
+    }
+    X509_free(x);        /* SSL_CTX_use_certificate up-refs on success */
+    EVP_PKEY_free(pkey); /* SSL_CTX_use_PrivateKey up-refs on success */
+    return ctx;
+}
+
+/* Goroutine body: accept one conn, server-handshake, echo one record, clean up.
+ * Any failure just tears down — it must never abort the process. */
+static void *zap_tls_test_serve(void *arg) {
+    ZapTlsTestSrv *s = (ZapTlsTestSrv *)arg;
+    int lfd = s->fd;
+    void *lpd = s->pd;
+    SSL_CTX *ctx = s->ctx;
+    int cfd = -1;
+    for (;;) {
+        cfd = accept(lfd, NULL, NULL);
+        if (cfd >= 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (zap_sock_park(lfd, lpd, ZAP_POLL_READ) < 0) {
+                goto done;
+            }
+            continue;
+        }
+        goto done;
+    }
+    {
+        int fl = fcntl(cfd, F_GETFL, 0);
+        if (fl >= 0) {
+            fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+        }
+        void *cpd = zap_netpoll_open((int64_t)cfd);
+        SSL *ssl = SSL_new(ctx);
+        if (ssl) {
+            SSL_set_fd(ssl, cfd);
+            SSL_set_accept_state(ssl);
+            int ok = 1;
+            for (;;) {
+                int r = SSL_accept(ssl);
+                if (r == 1) {
+                    break;
+                }
+                if (zap_tls_want(ssl, r, cfd, cpd) != 0) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (ok) {
+                char rb[4096];
+                for (;;) {
+                    int r = SSL_read(ssl, rb, (int)sizeof rb);
+                    if (r > 0) {
+                        (void)zap_tls_write_all(ssl, cfd, cpd, rb, (size_t)r);
+                        break; /* echo one record, done */
+                    }
+                    if (zap_tls_want(ssl, r, cfd, cpd) != 0) {
+                        break;
+                    }
+                }
+            }
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
+        zap_sock_shutdown(cfd, cpd);
+    }
+done:
+    SSL_CTX_free(ctx);
+    zap_sock_shutdown(lfd, lpd);
+    free(s);
+    return NULL;
+}
+
+/* tls._test_server() -> int64 bound port. Starts the background echo server. */
+int64_t zap_tls_test_server(void) {
+    SSL_CTX *ctx = zap_tls_test_make_ctx();
+    if (!ctx) {
+        zap_net_panic("tls: test server certificate generation failed");
+        return 0;
+    }
+    ZapStr loop;
+    loop.len = 9;
+    loop.data = "127.0.0.1";
+    void *l_v = zap_net_listen(&loop, 0); /* raises on failure */
+    ZapSock *l = (ZapSock *)l_v;
+    int lfd = l->fd;
+    void *lpd = l->pd;
+    int64_t port = zap_net_port(l_v);
+    ZapTlsTestSrv *s = (ZapTlsTestSrv *)malloc(sizeof(ZapTlsTestSrv));
+    if (!s) {
+        SSL_CTX_free(ctx);
+        zap_sock_shutdown(lfd, lpd);
+        zap_net_panic("tls: out of memory");
+        return 0;
+    }
+    s->fd = lfd;
+    s->pd = lpd;
+    s->ctx = ctx;
+    zap_spawn(zap_tls_test_serve, s);
+    return port;
+}
+
 /* ---- HTTP/1.1 ------------------------------------------------------------- *
  * A growable malloc byte buffer used to accumulate a message off a socket. It is
  * NUL-terminated after every append (one spare byte) so the textual header
@@ -8168,9 +8613,82 @@ static int zap_http_split(const ZapDynBuf *b, size_t *hlen, size_t *body_off) {
     return 0;
 }
 
-/* http.request(method, url, body) -> response handle. Opens a connection, sends
- * a Connection: close request, reads the whole response to EOF, and parses it.
- * Only http:// URLs are supported; https:// raises (TLS is a follow-up). */
+/* ---- client transport (plaintext or TLS) ---------------------------------- *
+ * The client is scheme-agnostic: `http://` dials via `net` and `https://` via
+ * `tls` (ticket #147, default port 443, certificate + hostname verification ON).
+ * A `ZapHttpConn` holds the raw transport (fd/pd, plus the OpenSSL session when
+ * TLS) so the request/response code below is written once over these helpers.
+ * The TLS session is held raw — never a GC `ZapTls` handle — so nothing GC is
+ * carried across the recv parks, exactly as the plaintext path holds fd/pd. */
+typedef struct {
+    int tls;
+    int fd;
+    void *pd;
+    SSL *ssl;     /* NULL unless tls */
+    SSL_CTX *ctx; /* NULL unless tls */
+} ZapHttpConn;
+
+/* Read one chunk over an established SSL into `b`. Returns bytes read (0 = clean
+ * EOF / closed), -1 on error. The TLS twin of `zap_dyn_fill`. */
+static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd) {
+    if (zap_dyn_reserve(b, 4096) != 0) {
+        return -1;
+    }
+    size_t avail = b->cap - b->len - 1;
+    if (avail > (1u << 20)) {
+        avail = 1u << 20; /* SSL_read's count is an int; bound it */
+    }
+    for (;;) {
+        int r = SSL_read(ssl, b->buf + b->len, (int)avail);
+        if (r > 0) {
+            b->len += (size_t)r;
+            b->buf[b->len] = '\0';
+            return r;
+        }
+        int w = zap_tls_want(ssl, r, fd, pd);
+        if (w == 0) {
+            continue;
+        }
+        b->buf[b->len] = '\0';
+        return (w == -1 || w == -3) ? 0 : -1; /* closed / clean shutdown -> EOF */
+    }
+}
+
+/* Send all `len` bytes over the connection. Returns 0 on success, -1 on error. */
+static int zap_httpconn_send_all(ZapHttpConn *c, const char *data, size_t len) {
+    if (c->tls) {
+        return zap_tls_write_all(c->ssl, c->fd, c->pd, data, len);
+    }
+    return zap_sock_send_all(c->fd, c->pd, data, len) < 0 ? -1 : 0;
+}
+
+/* Read one chunk into `b`. Returns bytes read (0 = EOF), -1 on error. */
+static ssize_t zap_httpconn_fill(ZapHttpConn *c, ZapDynBuf *b) {
+    if (c->tls) {
+        return zap_http_tls_fill(b, c->ssl, c->fd, c->pd);
+    }
+    return zap_dyn_fill(b, c->fd, c->pd);
+}
+
+/* Shut down and close the connection (the TLS session + context when present). */
+static void zap_httpconn_close(ZapHttpConn *c) {
+    if (c->tls && c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+        c->ssl = NULL;
+    }
+    if (c->tls && c->ctx) {
+        SSL_CTX_free(c->ctx);
+        c->ctx = NULL;
+    }
+    zap_sock_shutdown(c->fd, c->pd);
+    c->fd = -1;
+    c->pd = NULL;
+}
+
+/* http.request(method, url, body) -> response handle. Opens a connection (plain
+ * `http://` via net, or `https://` via TLS with verification on — ticket #147),
+ * sends a Connection: close request, reads the whole response to EOF, parses it. */
 void *zap_http_request(void *method_, void *url_, void *body_) {
     const ZapStr *method = (const ZapStr *)method_;
     const ZapStr *url = (const ZapStr *)url_;
@@ -8184,14 +8702,12 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
         zap_net_panic("http: out of memory");
         return NULL;
     }
-    if (strncmp(u, "https://", 8) == 0) {
-        free(u);
-        free(mz);
-        zap_net_panic("http: https/TLS not supported yet (follow-up, see I#104)");
-        return NULL;
-    }
+    int is_tls = 0;
     const char *rest = u;
-    if (strncmp(u, "http://", 7) == 0) {
+    if (strncmp(u, "https://", 8) == 0) {
+        is_tls = 1;
+        rest = u + 8;
+    } else if (strncmp(u, "http://", 7) == 0) {
         rest = u + 7;
     }
     /* host[:port][/path] */
@@ -8208,7 +8724,7 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     }
     memcpy(host, rest, hostend);
     host[hostend] = '\0';
-    long port = 80;
+    long port = is_tls ? 443 : 80;
     const char *after = rest + hostend;
     if (*after == ':') {
         after++;
@@ -8220,16 +8736,30 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     }
     const char *path = (*after == '/') ? after : "/";
 
-    /* Build the request into malloc scratch (survives the I/O parks). */
+    /* Dial the transport: plaintext via net, or TLS via tls (verification on).
+     * Both take a ZapStr* host; the raw transport (fd/pd, and the OpenSSL session
+     * for TLS) is held in C locals so nothing GC is carried across the parks. */
     ZapStr hostz;
     hostz.len = (int64_t)strlen(host);
     hostz.data = host;
-    /* We dial via zap_net_connect, which takes a ZapStr* host. */
-    void *conn_v = zap_net_connect(&hostz, port);
+    ZapHttpConn hc;
+    memset(&hc, 0, sizeof hc);
+    if (is_tls) {
+        SSL_CTX *tctx = NULL;
+        int tfd = -1;
+        void *tpd = NULL;
+        SSL *ssl = zap_tls_dial_raw(&hostz, port, 1, &tctx, &tfd, &tpd); /* raises on failure */
+        hc.tls = 1;
+        hc.ssl = ssl;
+        hc.ctx = tctx;
+        hc.fd = tfd;
+        hc.pd = tpd;
+    } else {
+        ZapSock *conn = (ZapSock *)zap_net_connect(&hostz, port); /* raises on failure */
+        hc.fd = conn->fd;
+        hc.pd = conn->pd;
+    }
     free(host);
-    ZapSock *conn = (ZapSock *)conn_v;
-    int fd = conn->fd;
-    void *pd = conn->pd;
 
     size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
     size_t reqcap = strlen(mz) + strlen(path) + hostend + blen + 256;
@@ -8237,7 +8767,7 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     if (!req) {
         free(u);
         free(mz);
-        zap_sock_shutdown(fd, pd);
+        zap_httpconn_close(&hc);
         zap_net_panic("http: out of memory");
         return NULL;
     }
@@ -8257,10 +8787,10 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     free(u);
     free(mz);
 
-    ssize_t sent = zap_sock_send_all(fd, pd, req, (size_t)hdr);
+    int sent = zap_httpconn_send_all(&hc, req, (size_t)hdr);
     free(req);
     if (sent < 0) {
-        zap_sock_shutdown(fd, pd);
+        zap_httpconn_close(&hc);
         zap_net_panic("http: send failed");
         return NULL;
     }
@@ -8268,12 +8798,12 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     /* Read the entire response (server closes after it, Connection: close). */
     ZapDynBuf b = {NULL, 0, 0};
     for (;;) {
-        ssize_t r = zap_dyn_fill(&b, fd, pd);
+        ssize_t r = zap_httpconn_fill(&hc, &b);
         if (r <= 0) {
             break;
         }
     }
-    zap_sock_shutdown(fd, pd);
+    zap_httpconn_close(&hc);
 
     size_t hlen = 0, body_off = b.len;
     long status = 0;

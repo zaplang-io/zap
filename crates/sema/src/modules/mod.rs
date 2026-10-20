@@ -40,6 +40,7 @@ mod signal;
 mod sync;
 mod sys;
 mod time;
+mod tls;
 mod zlib;
 
 /// A built-in module's type-checking facet.
@@ -81,6 +82,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     sync::MODULE,
     net::MODULE,
     http::MODULE,
+    tls::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute

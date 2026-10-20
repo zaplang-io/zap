@@ -36,6 +36,7 @@ mod signal;
 mod sync;
 mod sys;
 mod time;
+mod tls;
 mod zlib;
 
 /// Declare every built-in module's runtime entry points (ticket #121). Called
@@ -66,4 +67,5 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     sync::declare_rt(cg);
     net::declare_rt(cg);
     http::declare_rt(cg);
+    tls::declare_rt(cg);
 }
