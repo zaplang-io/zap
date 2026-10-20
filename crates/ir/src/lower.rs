@@ -4911,12 +4911,15 @@ impl<'a> FnLower<'a> {
                 // its backing `i64` here, losing the static enum identity the
                 // member-name table lookup needs. (Preserving it needs a ZIR
                 // enum type; tracked as a follow-up.)
-                if name == "name" {
-                    return Err(err(
-                        "enum '.name' is not implemented yet (deferred to a follow-up; D-0018)",
-                    ));
-                }
+                // The receiver type decides (I#141): a struct with a field
+                // named `name` reads that field; the enum op applies only to a
+                // non-struct (enum-backed) receiver.
                 let Ty::Struct(sid) = bty else {
+                    if name == "name" {
+                        return Err(err(
+                            "enum '.name' is not implemented yet (deferred to a follow-up; D-0018)",
+                        ));
+                    }
                     return Err(err("field access on a non-struct value"));
                 };
                 let (idx, fty) = self
