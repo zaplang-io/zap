@@ -1,0 +1,14 @@
+anon
+no-v
+file.txt
+usage: demo [-h] [--verbose] [--name NAME] src
+
+A demo program.
+
+positional arguments:
+  src
+
+options:
+  -h, --help  show this help message and exit
+  --verbose
+  --name NAME

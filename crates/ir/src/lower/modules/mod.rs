@@ -17,14 +17,19 @@ use zapc_syntax::ast;
 use super::{FnLower, LowerError};
 use crate::ir::*;
 
+mod argparse;
+mod bisect;
 mod crypto;
 mod datetime;
+mod deque;
 mod fs;
 mod gc;
 mod io;
 mod json;
+mod logging;
 mod math;
 mod os;
+mod oset;
 mod process;
 mod random;
 mod runtime;
@@ -66,6 +71,11 @@ pub(super) const MODULES: &[ModuleLower] = &[
     time::MODULE,
     datetime::MODULE,
     json::MODULE,
+    logging::MODULE,
+    argparse::MODULE,
+    deque::MODULE,
+    bisect::MODULE,
+    oset::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not
@@ -81,7 +91,7 @@ pub(super) struct ModuleConst {
 
 /// The registered modules that expose compile-time constants (ticket #98). Keep
 /// in step with `zapc_sema::modules::CONST_MODULES`.
-pub(super) const CONST_MODULES: &[ModuleConst] = &[math::MODULE_CONST];
+pub(super) const CONST_MODULES: &[ModuleConst] = &[math::MODULE_CONST, logging::MODULE_CONST];
 
 /// Lower a built-in `signal`/`gc`/`runtime`-style module call, or return
 /// `Ok(None)` if `module` is not a registered built-in module (so the caller
