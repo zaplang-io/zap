@@ -593,7 +593,7 @@ pub fn is_test_item(f: &zapc_syntax::ast::Function) -> bool {
 /// The traits `@derive(...)` can generate (D-0036). Only `Eq` and `Repr` are
 /// lowered to code in this increment; the rest are accepted here and reported as
 /// deferred by the lowering pass.
-const DERIVABLE_TRAITS: &[&str] = &["Eq", "Ord", "Json", "Repr", "Hash"];
+const DERIVABLE_TRAITS: &[&str] = &["Eq", "Ord", "Json", "Csv", "Repr", "Hash"];
 
 /// Where a decorator/annotation is attached — used for target-suitability
 /// checks (e.g. `@derive` only on a struct).
@@ -889,10 +889,18 @@ impl Checker {
         }
         if derived.contains("Json") {
             // Compile-time JSON codec (D-0059, I#100): `self.to_json() -> str`.
-            // (`from_json` — the decode direction — is registered separately
-            // once associated-function support lands; tracked in the PR.)
+            // The decode direction, `Struct.from_json(s)`, is an associated
+            // function resolved in `check_call` (keyed on `to_json` existing).
             methods
                 .entry("to_json".into())
+                .or_insert_with(|| unary(Ty::Str));
+        }
+        if derived.contains("Csv") {
+            // Compile-time CSV record codec (D-0059 §4b, I#132):
+            // `self.to_csv() -> str`; `Struct.from_csv(s)` is the associated
+            // decode function (resolved in `check_call`, keyed on `to_csv`).
+            methods
+                .entry("to_csv".into())
                 .or_insert_with(|| unary(Ty::Str));
         }
         StructInfo {
@@ -2886,34 +2894,40 @@ impl Checker {
                 }
                 // `Struct.from_json(s)` — the decode associated function a
                 // `@derive(Json)` struct gets (D-0059, I#100). Recognized when
-                // the struct derived Json (its `to_json` method is registered).
-                if name == "from_json"
-                    && self
+                // the struct derived the codec (its `to_<fmt>` method exists).
+                let decode_encode = match name.as_str() {
+                    "from_json" => Some("to_json"),
+                    "from_csv" => Some("to_csv"),
+                    _ => None,
+                };
+                if let Some(enc) = decode_encode {
+                    if self
                         .structs
                         .get(tyname)
-                        .is_some_and(|i| i.methods.contains_key("to_json"))
-                {
-                    if args.len() != 1 {
-                        self.error(
-                            format!(
-                                "{tyname}.from_json(s) takes 1 argument, found {}",
-                                args.len()
-                            ),
-                            span,
-                        );
-                    } else {
-                        let t = self.infer(&args[0].value);
-                        if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
+                        .is_some_and(|i| i.methods.contains_key(enc))
+                    {
+                        if args.len() != 1 {
                             self.error(
                                 format!(
-                                    "{tyname}.from_json() expects a str or bytes argument, found {}",
-                                    t.display()
+                                    "{tyname}.{name}(s) takes 1 argument, found {}",
+                                    args.len()
                                 ),
-                                expr_span(&args[0].value),
+                                span,
                             );
+                        } else {
+                            let t = self.infer(&args[0].value);
+                            if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
+                                self.error(
+                                    format!(
+                                        "{tyname}.{name}() expects a str or bytes argument, found {}",
+                                        t.display()
+                                    ),
+                                    expr_span(&args[0].value),
+                                );
+                            }
                         }
+                        return Ty::Named(tyname.clone());
                     }
-                    return Ty::Named(tyname.clone());
                 }
                 // Built-in `signal`/`gc`/`runtime` module calls (ticket #77,
                 // D-0058). Recognized only when the name is not shadowed by a

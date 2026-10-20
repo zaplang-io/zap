@@ -596,6 +596,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // Power-assert value rendering (ticket #73, D-0054).
         self.declare_rt("zap_f64_to_str", &[f.into()], Some(p.into()));
         self.declare_rt("zap_bool_to_str", &[i.into()], Some(p.into()));
+        // @derive(Csv) record codec (ticket #132, D-0059): field quoting/join,
+        // record splitting, and string->scalar parsing for the decode direction.
+        self.declare_rt("zap_csv_quote", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_csv_join", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_csv_split", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_str_to_i64", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_str_to_f64", &[p.into()], Some(f.into()));
+        self.declare_rt("zap_str_to_bool", &[p.into()], Some(i.into()));
         self.declare_rt("zap_reflect_register", &[p.into(), p.into()], None);
         self.declare_rt("zap_reflect_has", &[p.into(), p.into()], Some(i.into()));
         self.declare_rt("zap_reflect_names", &[p.into()], Some(p.into()));

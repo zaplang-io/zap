@@ -1037,6 +1037,7 @@ enum DerivedTrait {
     Repr,
     Ord,
     Json,
+    Csv,
     Hash,
 }
 
@@ -1047,6 +1048,7 @@ impl DerivedTrait {
             "Repr" => Some(DerivedTrait::Repr),
             "Ord" => Some(DerivedTrait::Ord),
             "Json" => Some(DerivedTrait::Json),
+            "Csv" => Some(DerivedTrait::Csv),
             "Hash" => Some(DerivedTrait::Hash),
             _ => None,
         }
@@ -1062,6 +1064,7 @@ impl DerivedTrait {
             DerivedTrait::Repr => "__repr__",
             DerivedTrait::Ord => "__cmp__",
             DerivedTrait::Json => "to_json",
+            DerivedTrait::Csv => "to_csv",
             DerivedTrait::Hash => "__hash__",
         }
     }
@@ -1081,6 +1084,13 @@ impl DerivedTrait {
             DerivedTrait::Json => vec![
                 ("to_json", vec![Ty::Struct(sid)], Ty::Ptr),
                 ("from_json", vec![Ty::Ptr], Ty::Struct(sid)),
+            ],
+            // Compile-time CSV record codec (D-0059 §4b, I#132): the encode
+            // method `to_csv(self) -> str` and the decode associated function
+            // `from_csv(str) -> Self`.
+            DerivedTrait::Csv => vec![
+                ("to_csv", vec![Ty::Struct(sid)], Ty::Ptr),
+                ("from_csv", vec![Ty::Ptr], Ty::Struct(sid)),
             ],
         }
     }
@@ -1103,6 +1113,10 @@ impl DerivedTrait {
                 gen_json_from_method(sid, sigs, ctx)?,
                 gen_json_from_value_method(sid, sigs, ctx)?,
             ],
+            DerivedTrait::Csv => vec![
+                gen_csv_to_method(sid, sigs, ctx)?,
+                gen_csv_from_method(sid, sigs, ctx)?,
+            ],
         })
     }
 
@@ -1112,6 +1126,7 @@ impl DerivedTrait {
             DerivedTrait::Repr => "Repr",
             DerivedTrait::Ord => "Ord",
             DerivedTrait::Json => "Json",
+            DerivedTrait::Csv => "Csv",
             DerivedTrait::Hash => "Hash",
         }
     }
@@ -1733,6 +1748,190 @@ fn gen_json_decode_field(
                 "@derive(Json) from_json does not support field type {fty} yet \
                  (scalars, str, and nested @derive(Json) structs are; \
                  collections and enums are a follow-up)"
+            )));
+        }
+    };
+    Ok(r)
+}
+
+/// `@derive(Csv)` encode (D-0059 §4b, I#132): `Struct__to_csv(self) -> str`
+/// producing one CSV record — each field formatted and CSV-quoted as needed,
+/// joined with commas (declaration order = column order). Reuses the shared
+/// `DeriveFieldKind` walk; nested structs / collections do not map to a flat
+/// record and are rejected.
+fn gen_csv_to_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__to_csv");
+    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, true, sigs, ctx);
+    // parts = [] (list of column strings)
+    let parts = b.new_value(Ty::List(Elem::Ptr));
+    b.emit(Inst::Call {
+        dest: Some(parts),
+        func: "zap_list_new".to_string(),
+        args: vec![],
+    });
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (_fname, fty)) in fields.iter().enumerate() {
+        let fv = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: fv,
+            base: 0,
+            sid,
+            idx: idx as u32,
+        });
+        let col = gen_csv_encode_field(&mut b, fv, *fty)?;
+        b.emit(Inst::Call {
+            dest: None,
+            func: "zap_list_push_ptr".to_string(),
+            args: vec![parts, col],
+        });
+    }
+    let d = b.new_value(Ty::Ptr);
+    b.emit(Inst::Call {
+        dest: Some(d),
+        func: "zap_csv_join".to_string(),
+        args: vec![parts],
+    });
+    b.set_term(Term::Ret(Some(d)));
+    Ok(b.func)
+}
+
+/// Encode one `@derive(Csv)` field to its CSV column text.
+fn gen_csv_encode_field(b: &mut FnLower, fv: Value, fty: Ty) -> Result<Value, LowerError> {
+    let call1 = |b: &mut FnLower, func: &str, arg: Value| -> Value {
+        let d = b.new_value(Ty::Ptr);
+        b.emit(Inst::Call {
+            dest: Some(d),
+            func: func.to_string(),
+            args: vec![arg],
+        });
+        d
+    };
+    let r = match derive_field_kind(fty) {
+        // Python csv convention: booleans render as True / False.
+        Some(DeriveFieldKind::Bool) => {
+            let w = b.coerce(fv, Ty::I1, Ty::I64);
+            call1(b, "zap_bool_to_str", w)
+        }
+        Some(DeriveFieldKind::Float(w)) => {
+            let f = b.coerce(fv, w, Ty::F64);
+            call1(b, "zap_f64_to_str", f)
+        }
+        Some(DeriveFieldKind::Int(w)) => {
+            let i = b.coerce(fv, w, Ty::I64);
+            call1(b, "zap_i64_to_str", i)
+        }
+        Some(DeriveFieldKind::Str) => call1(b, "zap_csv_quote", fv),
+        Some(DeriveFieldKind::Nested(_)) | None => {
+            return Err(err(format!(
+                "@derive(Csv) does not support field type {fty} \
+                 (a CSV record is flat: scalars and str only; nested structs, \
+                 collections, and enums do not map to columns)"
+            )));
+        }
+    };
+    Ok(r)
+}
+
+/// `@derive(Csv)` decode (D-0059 §4b, I#132): `Struct__from_csv(s: str) ->
+/// Struct`, splitting one CSV record into columns and parsing each to its
+/// field's scalar type. Lenient for v1 (unparseable column → 0 / 0.0 / false).
+fn gen_csv_from_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__from_csv");
+    // One parameter: the record line (value 0); no receiver.
+    let mut b = FnLower::new(
+        name,
+        vec![Ty::Ptr],
+        Ty::Struct(sid),
+        false,
+        false,
+        sigs,
+        ctx,
+    );
+    // cols = zap_csv_split(line)
+    let cols = b.new_value(Ty::List(Elem::Ptr));
+    b.emit(Inst::Call {
+        dest: Some(cols),
+        func: "zap_csv_split".to_string(),
+        args: vec![0],
+    });
+    let dest = b.new_value(Ty::Struct(sid));
+    b.emit(Inst::StructNew { dest, sid });
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (_fname, fty)) in fields.iter().enumerate() {
+        let iidx = b.iconst(Ty::I64, idx as i64);
+        let col = b.new_value(Ty::Ptr);
+        b.emit(Inst::Call {
+            dest: Some(col),
+            func: "zap_list_get_ptr".to_string(),
+            args: vec![cols, iidx],
+        });
+        let val = gen_csv_decode_field(&mut b, col, *fty)?;
+        b.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: idx as u32,
+            val,
+        });
+    }
+    b.set_term(Term::Ret(Some(dest)));
+    Ok(b.func)
+}
+
+/// Decode one `@derive(Csv)` column string `col` to the field type `fty`.
+fn gen_csv_decode_field(b: &mut FnLower, col: Value, fty: Ty) -> Result<Value, LowerError> {
+    let r = match derive_field_kind(fty) {
+        Some(DeriveFieldKind::Bool) => {
+            let w = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(w),
+                func: "zap_str_to_bool".to_string(),
+                args: vec![col],
+            });
+            b.coerce(w, Ty::I64, Ty::I1)
+        }
+        Some(DeriveFieldKind::Float(w)) => {
+            let f = b.new_value(Ty::F64);
+            b.emit(Inst::Call {
+                dest: Some(f),
+                func: "zap_str_to_f64".to_string(),
+                args: vec![col],
+            });
+            if w == Ty::F64 {
+                f
+            } else {
+                b.coerce(f, Ty::F64, w)
+            }
+        }
+        Some(DeriveFieldKind::Int(w)) => {
+            let i = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(i),
+                func: "zap_str_to_i64".to_string(),
+                args: vec![col],
+            });
+            if w == Ty::I64 {
+                i
+            } else {
+                b.coerce(i, Ty::I64, w)
+            }
+        }
+        // The column is already the string value.
+        Some(DeriveFieldKind::Str) => col,
+        Some(DeriveFieldKind::Nested(_)) | None => {
+            return Err(err(format!(
+                "@derive(Csv) does not support field type {fty} \
+                 (a CSV record is flat: scalars and str only; nested structs, \
+                 collections, and enums do not map to columns)"
             )));
         }
     };
@@ -4886,12 +5085,12 @@ impl<'a> FnLower<'a> {
                         return Ok(r);
                     }
                 }
-                // `Struct.from_json(s)` — the @derive(Json) decode associated
-                // function (D-0059, I#100). Dispatched when the generated
-                // `{Struct}__from_json` was registered (i.e. the struct derived
-                // Json); sema has already type-checked the call.
-                if name == "from_json" {
-                    let fnname = format!("{tyname}__from_json");
+                // `Struct.from_json(s)` / `Struct.from_csv(s)` — the derived
+                // decode associated functions (D-0059, I#100/I#132). Dispatched
+                // when the generated `{Struct}__from_<fmt>` was registered (i.e.
+                // the struct derived that codec); sema type-checked the call.
+                if name == "from_json" || name == "from_csv" {
+                    let fnname = format!("{tyname}__{name}");
                     if self.sigs.contains_key(&fnname) {
                         let (s, _) = self.expr(&args[0].value)?;
                         let sid = *self
