@@ -1468,6 +1468,38 @@ fn gen_concat(b: &mut FnLower, a: Value, c: Value) -> Value {
     d
 }
 
+/// Format-neutral classification of a derived struct field's type — the shared
+/// "derive-walk core" (D-0059 §4b). The `@derive(Json)` encode/decode codegen
+/// dispatches on these kinds, and `@derive(Csv)` (PR3) reuses the same
+/// classifier, each mapping a kind to its own wire form. A field type with no
+/// kind is not yet supported by a derived codec.
+enum DeriveFieldKind {
+    /// A boolean (`i1`). Classified before `Int` (an `i1` has an integer width).
+    Bool,
+    /// A float field; carries the exact width (`F32`/`F64`).
+    Float(Ty),
+    /// An integer field; carries the exact width.
+    Int(Ty),
+    /// A `str` (reference string, lowered to `Ptr`).
+    Str,
+    /// A nested struct field; carries its struct id (must itself derive the
+    /// codec).
+    Nested(u32),
+}
+
+/// Classify a derived field's type for the shared codec walk, or `None` if no
+/// derived codec supports it yet (collections, enums, tuples, …).
+fn derive_field_kind(fty: Ty) -> Option<DeriveFieldKind> {
+    match fty {
+        Ty::I1 => Some(DeriveFieldKind::Bool),
+        Ty::F32 | Ty::F64 => Some(DeriveFieldKind::Float(fty)),
+        t if t.int_width().is_some() => Some(DeriveFieldKind::Int(t)),
+        Ty::Ptr => Some(DeriveFieldKind::Str),
+        Ty::Struct(s) => Some(DeriveFieldKind::Nested(s)),
+        _ => None,
+    }
+}
+
 /// `@derive(Json)` encode direction (D-0059, I#100): a `Struct__to_json(self)
 /// -> str` method producing the struct's compact JSON object,
 /// `{"f0":v0,"f1":v1,...}`. Field names are identifiers (no escaping needed);
@@ -1528,30 +1560,29 @@ fn gen_json_encode_field(
         });
         d
     };
-    let r = match fty {
-        // bool — before the integer arm (an `i1` has an integer width).
-        Ty::I1 => {
+    let r = match derive_field_kind(fty) {
+        Some(DeriveFieldKind::Bool) => {
             let w = b.coerce(fv, Ty::I1, Ty::I64);
             call1(b, "zap_json_bool_str", w)
         }
-        Ty::F32 | Ty::F64 => {
-            let f = b.coerce(fv, fty, Ty::F64);
+        Some(DeriveFieldKind::Float(w)) => {
+            let f = b.coerce(fv, w, Ty::F64);
             call1(b, "zap_f64_to_str", f)
         }
-        t if t.int_width().is_some() => {
-            let i = b.coerce(fv, t, Ty::I64);
+        Some(DeriveFieldKind::Int(w)) => {
+            let i = b.coerce(fv, w, Ty::I64);
             call1(b, "zap_i64_to_str", i)
         }
-        // A `str` field (reference string) — escape + quote.
-        Ty::Ptr => call1(b, "zap_json_escape", fv),
+        // A `str` field — escape + quote.
+        Some(DeriveFieldKind::Str) => call1(b, "zap_json_escape", fv),
         // A nested struct field — recurse through its own derived encoder.
-        Ty::Struct(fsid) => {
+        Some(DeriveFieldKind::Nested(fsid)) => {
             let fname = ctx.names[fsid as usize].clone();
             call1(b, &format!("{fname}__to_json"), fv)
         }
-        other => {
+        None => {
             return Err(err(format!(
-                "@derive(Json) does not support field type {other} yet \
+                "@derive(Json) does not support field type {fty} yet \
                  (scalars, str, and nested @derive(Json) structs are; \
                  collections and enums are a follow-up)"
             )));
@@ -1630,23 +1661,23 @@ fn gen_json_decode_field(b: &mut FnLower, jf: Value, fty: Ty) -> Result<Value, L
         });
         d
     };
-    let r = match fty {
-        // bool — before the integer arm (an `i1` has an integer width).
-        Ty::I1 => call1(b, "__json_as_bool", Ty::I1, jf),
-        Ty::F64 => call1(b, "__json_as_float", Ty::F64, jf),
-        Ty::F32 => {
+    let r = match derive_field_kind(fty) {
+        Some(DeriveFieldKind::Bool) => call1(b, "__json_as_bool", Ty::I1, jf),
+        Some(DeriveFieldKind::Float(Ty::F32)) => {
             let f = call1(b, "__json_as_float", Ty::F64, jf);
             b.coerce(f, Ty::F64, Ty::F32)
         }
-        Ty::I64 => call1(b, "__json_as_int", Ty::I64, jf),
-        t if t.int_width().is_some() => {
+        Some(DeriveFieldKind::Float(_)) => call1(b, "__json_as_float", Ty::F64, jf),
+        Some(DeriveFieldKind::Int(Ty::I64)) => call1(b, "__json_as_int", Ty::I64, jf),
+        Some(DeriveFieldKind::Int(w)) => {
             let i = call1(b, "__json_as_int", Ty::I64, jf);
-            b.coerce(i, Ty::I64, t)
+            b.coerce(i, Ty::I64, w)
         }
-        Ty::Ptr => call1(b, "__json_as_str", Ty::Ptr, jf),
-        other => {
+        Some(DeriveFieldKind::Str) => call1(b, "__json_as_str", Ty::Ptr, jf),
+        // Nested-struct decode needs a from-JsonValue bridge — a follow-up.
+        Some(DeriveFieldKind::Nested(_)) | None => {
             return Err(err(format!(
-                "@derive(Json) from_json does not support field type {other} yet \
+                "@derive(Json) from_json does not support field type {fty} yet \
                  (scalars and str are; nested structs, collections, and enums \
                  are a follow-up)"
             )));
