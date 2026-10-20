@@ -36,6 +36,7 @@ mod random;
 mod runtime;
 mod signal;
 mod support;
+mod sync;
 mod sys;
 mod time;
 mod zlib;
@@ -80,6 +81,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     oset::MODULE,
     zlib::MODULE,
     gzip::MODULE,
+    sync::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

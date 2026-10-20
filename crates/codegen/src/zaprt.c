@@ -7390,3 +7390,208 @@ int64_t zap_zlib_adler32(void *data) {
     a = adler32(a, (const Bytef *)s->data, (uInt)s->len);
     return (int64_t)(uint32_t)a;
 }
+
+/* ===========================================================================
+ * sync — coroutine synchronization primitives (ticket #103, D-0032)
+ * ---------------------------------------------------------------------------
+ * Mutex, WaitGroup, and Once, built on the scheduler's ONE park/wake primitive
+ * (`gopark`/`goready`) and `Waiter` queue (defined with the channel runtime
+ * above) — exactly as channels and the netpoller do. A coroutine that blocks on
+ * a contended lock, a `wait()`, or an in-flight `Once` therefore *parks its G
+ * and frees its M* rather than tying up an OS thread (design/0005 "a blocked
+ * coroutine parks its G"); a non-goroutine (main) thread falls back to a condvar
+ * inside `gopark` without consuming a worker M.
+ *
+ * Each handle is a GC object with an embedded `pthread_mutex_t` guarding its
+ * small critical section plus a FIFO `Waiter` queue. The handle carries no
+ * traced GC pointers of its own: the only pointers it holds are the wait-queue
+ * head/tail, and every queued `Waiter` is a stack local of a blocked coroutine,
+ * rooted via that coroutine's shadow chain (same arrangement as a channel's
+ * send/recv queues, which `ZAP_TD_CHAN` likewise does not trace). So the
+ * descriptors are `ZAP_TD_ATOMIC` — nothing inside to scan. The embedded mutex
+ * is safe to address across a park because v1 Immix is non-moving (see the GC
+ * header) — identical to a channel embedding its own `pthread_mutex_t`.
+ *
+ * Deferred (noted in the PR, D-0032 completeness): `RWMutex`, lock-free
+ * `Atomic[T]` (needs the generic `sync.Atomic[int64]` surface + memory-model
+ * atomic/fence lowering), and the exception-safe `with mu.lock():` /
+ * `with wg.tracked():` guards (blocked on general context managers, D-0027;
+ * `with` currently supports only `expect_raises`). Mutexes are non-reentrant
+ * (re-locking deadlocks — a bug, per D-0032).
+ * ========================================================================== */
+
+/* ---- Mutex: non-reentrant, FIFO, parks the waiter --------------------------
+ * `locked` is handed off directly on unlock: `unlock` dequeues one waiter and
+ * wakes it *without clearing* `locked`, so the woken waiter owns the lock on
+ * return from `gopark` with no re-check and no acquire race. */
+typedef struct {
+    pthread_mutex_t mu;           /* guards `locked` + the wait queue           */
+    int locked;                   /* 1 iff the lock is held                     */
+    Waiter *wq_head, *wq_tail;    /* coroutines/threads waiting to acquire      */
+} ZapMutex;
+
+static const ZapTypeDesc zap_desc_mutex = {(int64_t)sizeof(ZapMutex), ZAP_TD_ATOMIC, 0, NULL};
+
+void *zap_mutex_new(void) {
+    ZapMutex *m = (ZapMutex *)zap_obj(&zap_desc_mutex);
+    pthread_mutex_init(&m->mu, NULL);
+    m->locked = 0;
+    m->wq_head = m->wq_tail = NULL;
+    return m;
+}
+
+void zap_mutex_lock(void *mp) {
+    ZapMutex *m = (ZapMutex *)mp;
+    pthread_mutex_lock(&m->mu);
+    if (!m->locked) {
+        m->locked = 1;
+        pthread_mutex_unlock(&m->mu);
+        return;
+    }
+    /* Contended: enqueue and park. On wake the lock has been handed to us
+     * directly (see `zap_mutex_unlock`); `gopark` releases `m->mu`. */
+    Waiter w;
+    w.g = NULL;
+    q_push(&m->wq_head, &m->wq_tail, &w);
+    gopark(&m->mu, &w);
+}
+
+/* Try to acquire without blocking: 1 on success, 0 if already held. */
+int64_t zap_mutex_trylock(void *mp) {
+    ZapMutex *m = (ZapMutex *)mp;
+    pthread_mutex_lock(&m->mu);
+    int64_t got = 0;
+    if (!m->locked) {
+        m->locked = 1;
+        got = 1;
+    }
+    pthread_mutex_unlock(&m->mu);
+    return got;
+}
+
+void zap_mutex_unlock(void *mp) {
+    ZapMutex *m = (ZapMutex *)mp;
+    pthread_mutex_lock(&m->mu);
+    Waiter *nx = q_pop(&m->wq_head, &m->wq_tail);
+    if (nx) {
+        /* Direct handoff: ownership passes to `nx`; `locked` stays 1. */
+        goready(nx);
+    } else {
+        m->locked = 0;
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+
+/* ---- WaitGroup: the primary join for fire-and-forget `spawn`s (D-0032) -----
+ * `wait()` parks until the counter returns to 0. `done()` is `add(-1)`. A
+ * counter driven below 0 is a bug and panics (Go semantics). */
+typedef struct {
+    pthread_mutex_t mu;
+    int64_t count;
+    Waiter *wq_head, *wq_tail;    /* coroutines/threads blocked in `wait()`     */
+} ZapWaitGroup;
+
+static const ZapTypeDesc zap_desc_waitgroup = {(int64_t)sizeof(ZapWaitGroup), ZAP_TD_ATOMIC, 0,
+                                               NULL};
+
+void *zap_waitgroup_new(void) {
+    ZapWaitGroup *w = (ZapWaitGroup *)zap_obj(&zap_desc_waitgroup);
+    pthread_mutex_init(&w->mu, NULL);
+    w->count = 0;
+    w->wq_head = w->wq_tail = NULL;
+    return w;
+}
+
+void zap_waitgroup_add(void *wp, int64_t n) {
+    ZapWaitGroup *w = (ZapWaitGroup *)wp;
+    pthread_mutex_lock(&w->mu);
+    w->count += n;
+    if (w->count < 0) {
+        pthread_mutex_unlock(&w->mu);
+        zap_panic(zap_str_new("negative WaitGroup counter", 26));
+        return;
+    }
+    if (w->count == 0) {
+        /* Release every waiter; each returns from its `gopark`. */
+        Waiter *x;
+        while ((x = q_pop(&w->wq_head, &w->wq_tail)) != NULL) {
+            goready(x);
+        }
+    }
+    pthread_mutex_unlock(&w->mu);
+}
+
+void zap_waitgroup_done(void *wp) { zap_waitgroup_add(wp, -1); }
+
+void zap_waitgroup_wait(void *wp) {
+    ZapWaitGroup *w = (ZapWaitGroup *)wp;
+    pthread_mutex_lock(&w->mu);
+    if (w->count == 0) {
+        pthread_mutex_unlock(&w->mu);
+        return;
+    }
+    Waiter x;
+    x.g = NULL;
+    q_push(&w->wq_head, &w->wq_tail, &x);
+    gopark(&w->mu, &x); /* releases `w->mu`; woken when count hits 0 */
+}
+
+/* ---- Once: run an initializer exactly once across all coroutines -----------
+ * No first-class functions yet (so no `once.do(fn)`), so the surface is a
+ * begin/end pair:
+ *
+ *     if sync.once_begin(o):     # true for exactly one caller
+ *         init()
+ *         sync.once_end(o)       # completion is visible to every waiter
+ *
+ * `once_begin` returns 1 to the single winning caller and 0 to the rest; a
+ * loser that arrives while `init()` is still running parks until `once_end`, so
+ * the completion of `init()` happens-before the return of every `once_begin`
+ * (D-0032 / design/0005 happens-before rule for `Once.do`). A loser arriving
+ * after completion returns 0 immediately. */
+typedef struct {
+    pthread_mutex_t mu;
+    int state;                    /* 0 = fresh, 1 = running, 2 = done           */
+    Waiter *wq_head, *wq_tail;    /* losers waiting for the winner to finish     */
+} ZapOnce;
+
+static const ZapTypeDesc zap_desc_once = {(int64_t)sizeof(ZapOnce), ZAP_TD_ATOMIC, 0, NULL};
+
+void *zap_once_new(void) {
+    ZapOnce *o = (ZapOnce *)zap_obj(&zap_desc_once);
+    pthread_mutex_init(&o->mu, NULL);
+    o->state = 0;
+    o->wq_head = o->wq_tail = NULL;
+    return o;
+}
+
+int64_t zap_once_begin(void *op) {
+    ZapOnce *o = (ZapOnce *)op;
+    pthread_mutex_lock(&o->mu);
+    if (o->state == 2) {
+        pthread_mutex_unlock(&o->mu);
+        return 0; /* already completed */
+    }
+    if (o->state == 0) {
+        o->state = 1;
+        pthread_mutex_unlock(&o->mu);
+        return 1; /* winner: caller runs init, then calls once_end */
+    }
+    /* state == 1: a winner is running init; park until it completes. */
+    Waiter w;
+    w.g = NULL;
+    q_push(&o->wq_head, &o->wq_tail, &w);
+    gopark(&o->mu, &w);
+    return 0;
+}
+
+void zap_once_end(void *op) {
+    ZapOnce *o = (ZapOnce *)op;
+    pthread_mutex_lock(&o->mu);
+    o->state = 2;
+    Waiter *x;
+    while ((x = q_pop(&o->wq_head, &o->wq_tail)) != NULL) {
+        goready(x);
+    }
+    pthread_mutex_unlock(&o->mu);
+}

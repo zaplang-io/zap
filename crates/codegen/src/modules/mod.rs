@@ -31,6 +31,7 @@ mod process;
 mod random;
 mod runtime;
 mod signal;
+mod sync;
 mod sys;
 mod time;
 mod zlib;
@@ -60,4 +61,5 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     oset::declare_rt(cg);
     zlib::declare_rt(cg);
     gzip::declare_rt(cg);
+    sync::declare_rt(cg);
 }

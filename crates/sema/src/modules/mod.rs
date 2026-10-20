@@ -35,6 +35,7 @@ mod process;
 mod random;
 mod runtime;
 mod signal;
+mod sync;
 mod sys;
 mod time;
 mod zlib;
@@ -75,6 +76,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     oset::MODULE,
     zlib::MODULE,
     gzip::MODULE,
+    sync::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute
