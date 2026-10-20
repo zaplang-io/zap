@@ -25,6 +25,7 @@ mod deque;
 mod fs;
 mod gc;
 mod io;
+mod json;
 mod logging;
 mod math;
 mod os;
@@ -64,6 +65,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     random::MODULE,
     time::MODULE,
     datetime::MODULE,
+    json::MODULE,
     logging::MODULE,
     argparse::MODULE,
     deque::MODULE,

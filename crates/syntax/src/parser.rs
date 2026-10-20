@@ -54,6 +54,10 @@ pub fn parse_str(src: &str) -> (Module, Vec<ParseError>, Vec<crate::lexer::LexEr
 /// (uncatchable). `MemStats` mirrors `gc.stats()`; `DateTime` is the civil-time
 /// value `datetime.*` produces (its methods live on the module, so the struct
 /// itself stays method-free and emits no code when a program never uses it).
+/// `JsonValue` is the dynamic JSON DOM sum type (D-0059, I#100/I#131): a
+/// data-carrying enum (D-0046) with `Int(int64)`/`Float(float64)` kept distinct,
+/// and recursive `Array(list[JsonValue])` / `Object(dict[str, JsonValue])`
+/// variants; `json.loads`/`dumps` and `@derive(Json)` are built on it.
 pub const PRELUDE_SRC: &str = "\
 enum Signal:
     SIGHUP = 1
@@ -84,6 +88,106 @@ value struct DateTime:
     int64 hour
     int64 minute
     int64 second
+
+enum JsonValue:
+    Null
+    Bool(bool b)
+    Int(int64 i)
+    Float(float64 f)
+    Str(str s)
+    Array(list[JsonValue] items)
+    Object(dict[str, JsonValue] fields)
+
+def __json_value(bytes c, int64 k) -> JsonValue:
+    if k == 1:
+        return JsonValue.Null
+    if k == 2:
+        return JsonValue.Bool(True)
+    if k == 3:
+        return JsonValue.Bool(False)
+    if k == 4:
+        return JsonValue.Int(json._lex_int(c))
+    if k == 5:
+        return JsonValue.Float(json._lex_float(c))
+    if k == 6:
+        return JsonValue.Str(json._lex_str(c))
+    if k == 9:
+        return __json_array(c)
+    if k == 7:
+        return __json_object(c)
+    return JsonValue.Null
+
+def __json_array(bytes c) -> JsonValue:
+    list[JsonValue] xs = []
+    auto k = json._lex_next(c)
+    while k != 10:
+        xs.append(__json_value(c, k))
+        k = json._lex_next(c)
+        if k == 12:
+            k = json._lex_next(c)
+    return JsonValue.Array(xs)
+
+def __json_object(bytes c) -> JsonValue:
+    dict[str, JsonValue] m = {}
+    auto k = json._lex_next(c)
+    while k == 6:
+        auto key = json._lex_str(c)
+        json._lex_next(c)
+        auto vk = json._lex_next(c)
+        m[key] = __json_value(c, vk)
+        k = json._lex_next(c)
+        if k == 12:
+            k = json._lex_next(c)
+    return JsonValue.Object(m)
+
+def __json_loads(str s) -> JsonValue:
+    auto c = json._lex_new(s)
+    auto k = json._lex_next(c)
+    return __json_value(c, k)
+
+def __json_dump(JsonValue v, list[str] out):
+    match v:
+        case JsonValue.Null:
+            out.append(\"null\")
+        case JsonValue.Bool(b):
+            if b:
+                out.append(\"true\")
+            else:
+                out.append(\"false\")
+        case JsonValue.Int(i):
+            out.append(json._i64_str(i))
+        case JsonValue.Float(f):
+            out.append(json._f64_str(f))
+        case JsonValue.Str(s):
+            out.append(json._escape(s))
+        case JsonValue.Array(items):
+            out.append(\"[\")
+            auto first = True
+            for x in items:
+                if first:
+                    first = False
+                else:
+                    out.append(\",\")
+                __json_dump(x, out)
+            out.append(\"]\")
+        case JsonValue.Object(fields):
+            out.append(\"{\")
+            auto first = True
+            list[str] ks = json._obj_keys(fields)
+            for key in ks:
+                if first:
+                    first = False
+                else:
+                    out.append(\",\")
+                out.append(json._escape(key))
+                out.append(\":\")
+                __json_dump(fields[key], out)
+            out.append(\"}\")
+
+def __json_dumps(JsonValue v) -> str:
+    list[str] parts = []
+    __json_dump(v, parts)
+    return json._join(parts)
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -133,6 +237,8 @@ fn references_prelude(module: &Module) -> bool {
         "\"DateTime\"",
         "\"time\"",
         "\"datetime\"",
+        "\"JsonValue\"",
+        "\"json\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

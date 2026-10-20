@@ -172,6 +172,7 @@ fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::List(a), Ty::List(b)) => assignable(a, b),
         (Ty::Set(a), Ty::Set(b)) => assignable(a, b),
         (Ty::Heap(a), Ty::Heap(b)) => assignable(a, b),
+        (Ty::Dict(ak, av), Ty::Dict(bk, bv)) => assignable(ak, bk) && assignable(av, bv),
         // A tuple is assignable to a tuple of the same arity when each element is
         // (covariantly) assignable — this covers returning untyped literals into
         // a declared tuple type (`-> (int64, int64)` with `return 1, 2`).

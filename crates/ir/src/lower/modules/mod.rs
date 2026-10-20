@@ -25,6 +25,7 @@ mod deque;
 mod fs;
 mod gc;
 mod io;
+mod json;
 mod logging;
 mod math;
 mod os;
@@ -69,6 +70,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     random::MODULE,
     time::MODULE,
     datetime::MODULE,
+    json::MODULE,
     logging::MODULE,
     argparse::MODULE,
     deque::MODULE,
