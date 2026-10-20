@@ -16,6 +16,12 @@ use zapc_syntax::ast::{
 
 use crate::ir::*;
 
+/// Built-in stdlib module registry (ticket #121): per-module lowering lives in
+/// `lower/modules/<name>.rs`, dispatched by a data table instead of a hand-
+/// written `match (module, method)` block, so new modules are conflict-free
+/// parallel-addable. See [`modules`] for the seam contract.
+mod modules;
+
 /// Interns anonymous tuple layouts (D-0049). A tuple is a by-value aggregate laid
 /// out like an anonymous struct (positional order), so it reuses the struct
 /// machinery: each distinct element-type sequence gets one [`Ty::Struct`] id,
@@ -4592,7 +4598,7 @@ impl<'a> FnLower<'a> {
                 // (these module names are not value bindings). Not intercepted
                 // when shadowed by a local of the same name.
                 if self.lookup(tyname).is_none() {
-                    if let Some(r) = self.lower_builtin_module_call(tyname, name, args)? {
+                    if let Some(r) = modules::lower_builtin_module_call(self, tyname, name, args)? {
                         return Ok(r);
                     }
                 }
@@ -5086,98 +5092,6 @@ impl<'a> FnLower<'a> {
                 base: dest,
                 sid,
                 idx: gen_var_field(p),
-                val: v,
-            });
-        }
-        Ok((dest, Ty::Struct(sid)))
-    }
-
-    /// Lower a built-in `signal`/`gc`/`runtime` module call (ticket #77, D-0058),
-    /// or return `Ok(None)` if `(module, method)` is not one. Sema has already
-    /// type-checked these; the lowering emits the backing runtime calls.
-    fn lower_builtin_module_call(
-        &mut self,
-        module: &str,
-        method: &str,
-        args: &[ast::Arg],
-    ) -> Result<Option<(Value, Ty)>, LowerError> {
-        let call0 = |this: &mut Self, func: &str, ret: Ty| -> (Value, Ty) {
-            if ret == Ty::Void {
-                this.emit(Inst::Call {
-                    dest: None,
-                    func: func.to_string(),
-                    args: vec![],
-                });
-                (this.iconst(Ty::I32, 0), Ty::I32)
-            } else {
-                let d = this.new_value(ret);
-                this.emit(Inst::Call {
-                    dest: Some(d),
-                    func: func.to_string(),
-                    args: vec![],
-                });
-                (d, ret)
-            }
-        };
-        match (module, method) {
-            // signal.notify(Signal) -> channel[Signal]. The argument is a tier-1
-            // `Signal`, i.e. its backing i64 = the OS signal number; the channel
-            // delivers that number (recv yields i64, matching Signal's backing).
-            ("signal", "notify") => {
-                if args.len() != 1 {
-                    return Err(err("signal.notify(sig) takes exactly one argument"));
-                }
-                let (v, vt) = self.expr(&args[0].value)?;
-                let signo = self.coerce(v, vt, Ty::I64);
-                let ch = self.new_value(Ty::Chan(Elem::I64));
-                self.emit(Inst::Call {
-                    dest: Some(ch),
-                    func: "zap_signal_notify".to_string(),
-                    args: vec![signo],
-                });
-                Ok(Some((ch, Ty::Chan(Elem::I64))))
-            }
-            ("gc", "collect") => Ok(Some(call0(self, "zap_gc_collect", Ty::Void))),
-            ("gc", "stats") => Ok(Some(self.lower_gc_stats()?)),
-            ("runtime", "goroutine_dump") => {
-                Ok(Some(call0(self, "zap_runtime_goroutine_dump", Ty::Void)))
-            }
-            ("runtime", "num_goroutines") => {
-                Ok(Some(call0(self, "zap_runtime_num_goroutines", Ty::I64)))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Build a `MemStats` value struct from the runtime GC/scheduler getters
-    /// (ticket #77). Field order matches the prelude's `MemStats`:
-    /// `heap_bytes, live_bytes, free_bytes, gc_count, goroutines`.
-    fn lower_gc_stats(&mut self) -> Result<(Value, Ty), LowerError> {
-        let sid = *self
-            .ctx
-            .ids
-            .get("MemStats")
-            .ok_or_else(|| err("MemStats struct unavailable (built-in prelude missing)"))?;
-        let getters = [
-            "zap_gc_heap_bytes",
-            "zap_gc_live_bytes",
-            "zap_gc_free_bytes",
-            "zap_gc_count",
-            "zap_runtime_num_goroutines",
-        ];
-        let dest = self.new_value(Ty::Struct(sid));
-        self.emit(Inst::StructNew { dest, sid });
-        for (idx, func) in getters.iter().enumerate() {
-            let v = self.new_value(Ty::I64);
-            self.emit(Inst::Call {
-                dest: Some(v),
-                func: (*func).to_string(),
-                args: vec![],
-            });
-            self.emit(Inst::FieldSet {
-                base: dest,
-                sid,
-                idx: idx as u32,
                 val: v,
             });
         }

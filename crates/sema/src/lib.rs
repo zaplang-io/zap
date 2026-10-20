@@ -13,6 +13,12 @@ use zapc_syntax::ast::*;
 use zapc_syntax::genanalysis;
 use zapc_syntax::span::Span;
 
+/// Built-in stdlib module registry (ticket #121): per-module type-checking lives
+/// in `modules/<name>.rs`, dispatched by a data table instead of a hand-written
+/// `match (module, method)` block, so new modules are conflict-free parallel-
+/// addable. See [`modules`] for the seam contract.
+mod modules;
+
 /// A type-checking error with the offending source span.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeError {
@@ -2852,83 +2858,6 @@ impl Checker {
         }
     }
 
-    /// Type-check a built-in `signal`/`gc`/`runtime` module call (ticket #77,
-    /// D-0058), returning the result type, or `None` if `module` is not a
-    /// built-in module (so the caller falls through to ordinary resolution).
-    /// These modules are compiler-known surface over the runtime diagnostics
-    /// entry points; `import signal`/`gc`/`runtime` is accepted but not required.
-    fn check_builtin_module_call(
-        &mut self,
-        module: &str,
-        method: &str,
-        args: &[Arg],
-        span: Span,
-    ) -> Option<Ty> {
-        let expect_argc = |this: &mut Self, n: usize| {
-            if args.len() != n {
-                this.error(
-                    format!(
-                        "{module}.{method}() takes {n} argument(s), found {}",
-                        args.len()
-                    ),
-                    span,
-                );
-            }
-            for a in args {
-                this.infer(&a.value);
-            }
-        };
-        match (module, method) {
-            // signal.notify(Signal) -> channel[Signal]: a cap-1 coalescing
-            // channel delivering the given signal (D-0058).
-            ("signal", "notify") => {
-                if args.len() != 1 {
-                    self.error(
-                        format!("signal.notify(sig) takes 1 argument, found {}", args.len()),
-                        span,
-                    );
-                } else {
-                    let at = self.infer(&args[0].value);
-                    if !matches!(&at, Ty::Named(n) if n == "Signal") && !matches!(at, Ty::Unknown) {
-                        self.error(
-                            format!("signal.notify expects a Signal, found {}", at.display()),
-                            expr_span(&args[0].value),
-                        );
-                    }
-                }
-                Some(Ty::Chan(Box::new(Ty::Named("Signal".to_string()))))
-            }
-            // gc.collect(): force a full collection.
-            ("gc", "collect") => {
-                expect_argc(self, 0);
-                Some(Ty::Unit)
-            }
-            // gc.stats() -> MemStats: heap/live/free bytes, GC count, #goroutines.
-            ("gc", "stats") => {
-                expect_argc(self, 0);
-                Some(Ty::Named("MemStats".to_string()))
-            }
-            // runtime.goroutine_dump(): dump goroutine stacks + scheduler summary.
-            ("runtime", "goroutine_dump") => {
-                expect_argc(self, 0);
-                Some(Ty::Unit)
-            }
-            // runtime.num_goroutines() -> int64.
-            ("runtime", "num_goroutines") => {
-                expect_argc(self, 0);
-                Some(Ty::Int64)
-            }
-            ("signal" | "gc" | "runtime", _) => {
-                self.error(
-                    format!("module '{module}' has no function '{method}'"),
-                    span,
-                );
-                Some(Ty::Unknown)
-            }
-            _ => None,
-        }
-    }
-
     fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Ty {
         // Qualified enum-variant construction: `Shape.Circle(r=2.0)` /
         // `Shape.Circle(2.0)` (D-0046), accepting named or positional args.
@@ -2942,7 +2871,9 @@ impl Checker {
                 // local value, and is intercepted before the base is resolved as
                 // a value (these module names are not value bindings).
                 if self.lookup(tyname).is_none() {
-                    if let Some(ty) = self.check_builtin_module_call(tyname, name, args, span) {
+                    if let Some(ty) =
+                        modules::check_builtin_module_call(self, tyname, name, args, span)
+                    {
                         return ty;
                     }
                 }

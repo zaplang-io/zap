@@ -29,6 +29,12 @@ use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 use zapc_ir::{self as zir, lower_module, CastKind, CmpPred, Func, Inst, Owner, Term, Ty};
 use zapc_syntax::ast::Module as AstModule;
 
+/// Built-in stdlib module registry (ticket #121): per-module runtime-symbol
+/// declarations live in `modules/<name>.rs`, grouped by module instead of a
+/// single hand-maintained `declare_rt` cluster, so new modules are conflict-free
+/// parallel-addable. See [`modules`] for the seam contract.
+mod modules;
+
 /// A code-generation backend.
 pub trait Backend {
     /// Compile a (type-checked) AST module to a native object file.
@@ -667,35 +673,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // netpoller self-test and returns the number of sub-checks passed. No
         // language I/O surface yet (sockets #79, signals #77). See `zaprt.c`.
         self.declare_rt("zap_netpoll_selftest", &[], Some(i.into()));
-        // Signals, runtime diagnostics & fault reporting (ticket #77, D-0058).
-        // `zap_signal_init()` runs at `main`'s prologue (installs the default
-        // SIGQUIT/SIGUSR1 handlers unless built -DZAP_NO_DEFAULT_SIGNALS);
-        // `zap_signal_notify(signo)` returns a cap-1 coalescing channel[Signal];
-        // `zap_signal_on(signo, fn)` registers an `@on_signal` handler (a detached
-        // receiver goroutine); `zap_scope_cancel_on(scope, mask, grace_ms)` /
-        // `zap_scope_disarm(scope)` wire `scope(cancel_on=.., grace=..)`. The
-        // `gc`/`runtime` module entry points and a C self-test hook complete the
-        // surface. See `zaprt.c`.
-        self.declare_rt("zap_signal_init", &[], None);
-        self.declare_rt("zap_signal_notify", &[i.into()], Some(p.into()));
-        self.declare_rt("zap_signal_on", &[i.into(), p.into()], None);
-        self.declare_rt("zap_scope_cancel_on", &[p.into(), i.into(), i.into()], None);
-        self.declare_rt("zap_scope_disarm", &[p.into()], None);
-        self.declare_rt("zap_gc_collect", &[], None);
-        self.declare_rt("zap_gc_stats", &[p.into(), p.into()], None);
-        self.declare_rt("zap_gc_count", &[], Some(i.into()));
-        self.declare_rt("zap_gc_heap_bytes", &[], Some(i.into()));
-        self.declare_rt("zap_gc_live_bytes", &[], Some(i.into()));
-        self.declare_rt("zap_gc_free_bytes", &[], Some(i.into()));
-        self.declare_rt("zap_runtime_goroutine_dump", &[], None);
-        self.declare_rt("zap_runtime_num_goroutines", &[], Some(i.into()));
-        self.declare_rt("zap_signal_selftest", &[], Some(i.into()));
-        // Finalizer integration-test hook (ticket #92, gc-immix): exercises the
-        // precise collector's register + post-mark finalizer queue and returns
-        // the number of finalizers that ran. See `zapgc.inc.c`.
-        self.declare_rt("zap_gc_finalizer_selftest", &[], Some(i.into()));
-        self.declare_rt("zap_signal_raise", &[i.into()], None);
-        self.declare_rt("zap_signal_drain", &[], None);
+        // Built-in stdlib modules' runtime entry points (ticket #121): the
+        // `signal`/`gc`/`runtime` `zap_*` declarations now live in per-module
+        // files under `modules/`, so a new module's runtime surface is added in
+        // its own file rather than here. See `modules` for the seam contract.
+        modules::declare_runtime(self);
         self.declare_rt("zap_chan_new", &[i.into()], Some(p.into()));
         self.declare_rt("zap_chan_send_i64", &[p.into(), i.into()], None);
         self.declare_rt("zap_chan_send_ptr", &[p.into(), p.into()], None);
