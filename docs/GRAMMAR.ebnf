@@ -41,7 +41,16 @@ decorators    ::= { "@" dotted_name [ "(" [ arg_list ] ")" ] NEWLINE } ;
 function      ::= decorators "def" IDENT [ generics ]
                   "(" [ param_list ] ")" [ "->" type ] block ;
 
-generics      ::= "[" IDENT { "," IDENT } "]" ;
+generics      ::= "[" type_param { "," type_param } "]" ;
+type_param    ::= IDENT [ ":" type ] ;
+                  (* optional interface bound (D-0017/I#154 Fork B); the bound
+                     `type` is an interface name, possibly itself generic. *)
+type_args     ::= "[" type { "," type } "]" ;
+                  (* call-site / construction type arguments (I#154 Fork S):
+                     `Box[str](...)`, `list[T]()`, `map[int64, str](xs, f)`. A
+                     postfix `[...]` is type_args iff the head name resolves to a
+                     type or generic function, else a value subscript
+                     (`__getitem__`, D-0047); sema classifies it. *)
 
 param_list    ::= param { "," param } ;
 param         ::= [ "@" dotted_name [ "(" [ arg_list ] ")" ] ]
