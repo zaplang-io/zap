@@ -4467,21 +4467,37 @@ struct Box[T]:
     def get(self) -> T:
         return self.value
 
-enum Option[T]:
-    Some(T value)
-    None
+enum Maybe[T]:
+    Just(T value)
+    Nothing
 
-    def is_some(self) -> bool:
+    def ok(self) -> bool:
         match self:
-            case Option.Some(v):
+            case Maybe.Just(v):
                 return True
-            case Option.None:
+            case Maybe.Nothing:
                 return False
 
 def main():
+    Maybe[int64] a = Maybe.Just(5)
+    Maybe[str] b = Maybe.Nothing
+    Box[int64] c = Box(7)
+    print(a.ok())
+    print(c.get())
+"#);
+    }
+
+    #[test]
+    fn prelude_option_is_usable() {
+        // Option[T] ships in the prelude (I#154 slice 3): construct, match, and
+        // call its methods without declaring it.
+        ok(r#"
+def main():
     Option[int64] a = Option.Some(5)
     Option[str] b = None
+    print(a.unwrap())
     print(a.is_some())
+    print(b.unwrap_or("x"))
 "#);
     }
 

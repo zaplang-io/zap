@@ -1074,3 +1074,53 @@ single `---`), block scalars (`|` literal and `>` folded — deferred together
 because the line-oriented comment-strip/trim preprocessor is lossy for their
 significant whitespace), complex/non-string mapping keys, and directives. These
 are the long tail of the spec; v1 targets the 95% config/data-file use.
+
+## D-0064 — User-defined generics (first vertical) + `Option[T]`
+**Status:** Locked (ratifies the four open calls of `design/0012-generics.md`;
+implements epic I#154 slices 0–3). Builds on D-0017 (generics: yes,
+monomorphized, staged).
+
+Ratifies the design's recommendations and lands the first end-to-end vertical:
+
+- **M — monomorphization**, as a ZIR-stage AST→AST pass between sema and codegen
+  (`crates/ir/src/mono.rs`): each used `(generic, concrete-type-args)` becomes a
+  specialized concrete `struct`/`enum` with a mangled name, deduped by that name;
+  the result is a generics-free module the existing lowering and codegen handle
+  unchanged. **M1 — generic bodies are checked at *definition*** (Rust model),
+  type parameters opaque (unconstrained ⇒ universal operations only).
+- **GC metadata — no new mechanism (verified).** A monomorphized instance is a
+  plain concrete `StructLayout`, so codegen's existing per-struct `ZapTypeDesc`
+  emission (`emit_struct_desc`: pointer-field byte-offsets from the real LLVM
+  layout, `t.is_ptr()`) produces a correct precise-GC pointer map per instance
+  with zero new code. Generic enums ride the tier-3 tagged-struct path. Confirmed
+  against the real codegen and exercised by `generics_gc_stress` under both
+  collectors. GC correctness for generics is a theorem.
+- **S — subscript syntax**, plus the two additive grammar extensions (optional
+  interface bound on a type parameter; call-site `type_args`). A postfix `[...]`
+  parses as a uniform node (a multi-element list becomes a tuple index) and is
+  classified as type-arguments vs `__getitem__` by name resolution.
+- **I — inference** = argument-driven unification + an expected-type sink at
+  `let`/`return` (and variant/struct fields); explicit type args otherwise. The
+  bare `None` literal resolves to `Option.None` of the sink's instance.
+- **O — `Option[T]`** = a prelude generic enum in the tagged tier-3
+  representation (niche deferred): `Some(T)`/`None`, with `is_some`/`is_none`/
+  `unwrap` (raises a string message on `None` until typed exceptions, I#12) /
+  `unwrap_or`, consumed by methods + `match` (no `?` operator — Zap is
+  exception-based). This lifts the D-0046 enum-method deferral for tier-3 enums.
+- **X — built-in collections stay special-cased** (`list`/`dict`/`set`/`array`/
+  `heap` are not rewritten as user generics); re-skin is a future source-compat
+  nicety, not scheduled.
+- **First end-to-end vertical = slices 0–3** (generic *types* + `Option[T]`).
+
+**Open product calls — resolved as recommended:** (1) interface bounds deferred
+to a later slice (the flagship needs none; grammar + schema carry the optional
+bound now); (2) check-at-definition; (3) built-in collections stay
+special-cased; (4) `Option` tagged now, niche layout deferred.
+
+**Deferred (follow-ups, filed as later slices):** generic *functions*/methods
+with their own type parameters (`def map[T, U]`, `Option.map[U]`), interface-bound
+enforcement (reuse the I#84 conformance checker, static dispatch), `json`
+dropping `@default`-as-optionality via `Option[T]` (#100/#133), AWS SDK optional
+modeling (fork O-a, #89), `Result[T, E]`, the `Option` niche/nullable-pointer
+layout, built-in-collection re-skin, code-size layout-sharing, and typed
+`UnwrapError` (rides I#12).

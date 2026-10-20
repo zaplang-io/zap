@@ -89,6 +89,38 @@ value struct DateTime:
     int64 minute
     int64 second
 
+enum Option[T]:
+    Some(T value)
+    None
+
+    def is_some(self) -> bool:
+        match self:
+            case Option.Some(v):
+                return True
+            case Option.None:
+                return False
+
+    def is_none(self) -> bool:
+        match self:
+            case Option.Some(v):
+                return False
+            case Option.None:
+                return True
+
+    def unwrap(self) -> T:
+        match self:
+            case Option.Some(v):
+                return v
+            case Option.None:
+                raise \"called unwrap on an Option.None value\"
+
+    def unwrap_or(self, T fallback) -> T:
+        match self:
+            case Option.Some(v):
+                return v
+            case Option.None:
+                return fallback
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -406,6 +438,9 @@ fn references_prelude(module: &Module) -> bool {
         "\"JsonScanner\"",
         "\"yaml\"",
         "\"Yaml\"",
+        // The generic `Option[T]` ships in the prelude (I#154, D-0064); inject it
+        // for any program that names it.
+        "\"Option\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
