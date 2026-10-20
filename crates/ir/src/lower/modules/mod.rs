@@ -24,6 +24,7 @@ mod datetime;
 mod deque;
 mod fs;
 mod gc;
+mod gzip;
 mod io;
 mod json;
 mod logging;
@@ -38,6 +39,7 @@ mod support;
 mod sync;
 mod sys;
 mod time;
+mod zlib;
 
 /// A module's per-method lowering hook: lower `method(args)` to ZIR, emitting the
 /// backing runtime calls. `Ok(Some((value, ty)))` for a method the module
@@ -77,6 +79,8 @@ pub(super) const MODULES: &[ModuleLower] = &[
     deque::MODULE,
     bisect::MODULE,
     oset::MODULE,
+    zlib::MODULE,
+    gzip::MODULE,
     sync::MODULE,
 ];
 
