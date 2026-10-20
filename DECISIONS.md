@@ -1076,11 +1076,12 @@ significant whitespace), complex/non-string mapping keys, and directives. These
 are the long tail of the spec; v1 targets the 95% config/data-file use.
 
 ## D-0064 — User-defined generics (first vertical) + `Option[T]`
-**Status:** Locked (ratifies the four open calls of `design/0012-generics.md`;
-implements epic I#154 slices 0–3). Builds on D-0017 (generics: yes,
-monomorphized, staged).
+**Status:** Locked (ratified by the user; resolves the four open calls of
+`design/0012-generics.md` — two of them *overriding* the design's
+recommendation, see the product-calls section). Implements epic I#154 slices
+0–3. Builds on D-0017 (generics: yes, monomorphized, staged).
 
-Ratifies the design's recommendations and lands the first end-to-end vertical:
+Lands the first end-to-end vertical:
 
 - **M — monomorphization**, as a ZIR-stage AST→AST pass between sema and codegen
   (`crates/ir/src/mono.rs`): each used `(generic, concrete-type-args)` becomes a
@@ -1094,7 +1095,9 @@ Ratifies the design's recommendations and lands the first end-to-end vertical:
   layout, `t.is_ptr()`) produces a correct precise-GC pointer map per instance
   with zero new code. Generic enums ride the tier-3 tagged-struct path. Confirmed
   against the real codegen and exercised by `generics_gc_stress` under both
-  collectors. GC correctness for generics is a theorem.
+  collectors. GC correctness for generics is a theorem. (The niche `Option[ref]`
+  layout below preserves this: a niche optional is a single nullable pointer
+  slot, traced by the same pointer-map mechanism, with `None`/null a non-root.)
 - **S — subscript syntax**, plus the two additive grammar extensions (optional
   interface bound on a type parameter; call-site `type_args`). A postfix `[...]`
   parses as a uniform node (a multi-element list becomes a tuple index) and is
@@ -1102,25 +1105,41 @@ Ratifies the design's recommendations and lands the first end-to-end vertical:
 - **I — inference** = argument-driven unification + an expected-type sink at
   `let`/`return` (and variant/struct fields); explicit type args otherwise. The
   bare `None` literal resolves to `Option.None` of the sink's instance.
-- **O — `Option[T]`** = a prelude generic enum in the tagged tier-3
-  representation (niche deferred): `Some(T)`/`None`, with `is_some`/`is_none`/
-  `unwrap` (raises a string message on `None` until typed exceptions, I#12) /
-  `unwrap_or`, consumed by methods + `match` (no `?` operator — Zap is
-  exception-based). This lifts the D-0046 enum-method deferral for tier-3 enums.
+- **O — `Option[T]`** = a prelude generic enum `Some(T)`/`None`, with
+  `is_some`/`is_none`/`unwrap` (raises a string message on `None` until typed
+  exceptions, I#12) / `unwrap_or`, consumed by methods + `match` (no `?` operator
+  — Zap is exception-based). This lifts the D-0046 enum-method deferral for
+  tier-3 enums. **Representation (ratified end state): the niche layout —
+  `Option[T]` for a reference/pointer `T` is a single nullable pointer (`None` =
+  null, `Some(p)` = `p`), one word, no tag; a value-type `T` with no available
+  niche falls back to the tagged tier-3 form.** So Option is niche-where-possible,
+  tagged-otherwise. **Implementation staging:** the first vertical (this PR) ships
+  the **tagged** representation everywhere; the **niche** layout for reference `T`
+  lands as the immediate follow-up PR (it is a lowering-side representation change
+  — construction, `match`, and the methods special-cased for the nullable-pointer
+  form — observable behaviour unchanged). The GC property is preserved (a niche
+  optional is one pointer slot; null is a non-root; existing pointer-map scanning
+  applies).
 - **X — built-in collections stay special-cased** (`list`/`dict`/`set`/`array`/
-  `heap` are not rewritten as user generics); re-skin is a future source-compat
-  nicety, not scheduled.
+  `heap` are not rewritten as user generics) **for now, and are re-skinned as
+  user-generic *surface* types in a scheduled post-core-generics slice** (methods
+  lowering to the same tuned runtime entry points — a source-compatibility change,
+  not a runtime rewrite). Not "special-cased permanently."
 - **First end-to-end vertical = slices 0–3** (generic *types* + `Option[T]`).
 
-**Open product calls — resolved as recommended:** (1) interface bounds deferred
-to a later slice (the flagship needs none; grammar + schema carry the optional
-bound now); (2) check-at-definition; (3) built-in collections stay
-special-cased; (4) `Option` tagged now, niche layout deferred.
+**Open product calls — resolved (two overriding the design's recommendation):**
+(1) interface bounds deferred to slice 5 — *as recommended* (the flagship needs
+none; grammar + schema carry the optional bound now); (2) check-at-definition —
+*as recommended*; (3) **OVERRIDE** — built-in collections are re-skinned as user
+generics in a scheduled post-core-generics slice (the design recommended leaving
+them special-cased permanently); (4) **OVERRIDE** — `Option[T]` uses the niche
+layout (nullable-pointer niche for reference `T`, tagged fallback otherwise) as
+the end state (the design recommended staying tagged indefinitely).
 
-**Deferred (follow-ups, filed as later slices):** generic *functions*/methods
-with their own type parameters (`def map[T, U]`, `Option.map[U]`), interface-bound
-enforcement (reuse the I#84 conformance checker, static dispatch), `json`
-dropping `@default`-as-optionality via `Option[T]` (#100/#133), AWS SDK optional
-modeling (fork O-a, #89), `Result[T, E]`, the `Option` niche/nullable-pointer
-layout, built-in-collection re-skin, code-size layout-sharing, and typed
-`UnwrapError` (rides I#12).
+**Deferred (follow-ups, filed as later slices):** the **`Option` niche layout**
+(the immediate next PR for this epic); generic *functions*/methods with their own
+type parameters (`def map[T, U]`, `Option.map[U]`); interface-bound enforcement
+(reuse the I#84 conformance checker, static dispatch); `json` dropping
+`@default`-as-optionality via `Option[T]` (#100/#133); AWS SDK optional modeling
+(fork O-a, #89); `Result[T, E]`; the built-in-collection re-skin as user-generic
+surface; code-size layout-sharing; typed `UnwrapError` (rides I#12).
