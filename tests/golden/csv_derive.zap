@@ -3,9 +3,6 @@
 # (fields = columns, declaration order). to_csv quotes a field only when needed
 # (comma/quote/newline); from_csv splits a record and parses each column to its
 # field's scalar type. Booleans use Python's csv convention (True/False).
-#
-# (Fields avoid `name` — reading a struct field via `.name` is blocked by a
-# pre-existing limitation, I#141, orthogonal to this codec.)
 
 @derive(Csv)
 struct Row:
