@@ -46,11 +46,13 @@ type_param    ::= IDENT [ ":" type ] ;
                   (* optional interface bound (D-0017/I#154 Fork B); the bound
                      `type` is an interface name, possibly itself generic. *)
 type_args     ::= "[" type { "," type } "]" ;
-                  (* call-site / construction type arguments (I#154 Fork S):
-                     `Box[str](...)`, `list[T]()`, `map[int64, str](xs, f)`. A
-                     postfix `[...]` is type_args iff the head name resolves to a
-                     type or generic function, else a value subscript
-                     (`__getitem__`, D-0047); sema classifies it. *)
+                  (* call-site / construction type arguments (I#154 Fork S;
+                     generic functions/methods I#161): `Box[str](...)`,
+                     `list[T]()`, `identity[int64](x)`, `opt.and_opt[str](o)`. A
+                     postfix `[...]` is type_args iff the head resolves to a type,
+                     a generic function, or a generic method (an attribute of a
+                     value whose type declares that generic method), else a value
+                     subscript (`__getitem__`, D-0047); sema/mono classifies it. *)
 
 param_list    ::= param { "," param } ;
 param         ::= [ "@" dotted_name [ "(" [ arg_list ] ")" ] ]

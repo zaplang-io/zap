@@ -3027,6 +3027,41 @@ impl Checker {
                 }
                 return Ty::Heap(Box::new(elem));
             }
+            // Call-site explicit type arguments on a generic callee (I#161,
+            // Fork S): `f[T](...)`, `Type[T](...)`, or `recv.m[T](...)`. The
+            // `index` here is type arguments, not a value subscript, so it is NOT
+            // inferred as a value (its type names would otherwise be rejected as
+            // unknown names). Value arguments are still type-checked loosely.
+            let type_args_callee = match base.as_ref() {
+                Expr::Name(n, _) => {
+                    self.sigs.contains_key(n)
+                        || self.user_types.contains(n)
+                        || self.enums.contains_key(n)
+                }
+                // `recv.m[T](...)` — a generic method with explicit type args.
+                Expr::Attr { .. } => true,
+                _ => false,
+            };
+            if type_args_callee {
+                if let Expr::Attr { base: recv, .. } = base.as_ref() {
+                    self.infer(recv);
+                }
+                for a in args {
+                    self.infer(&a.value);
+                }
+                return match base.as_ref() {
+                    Expr::Name(n, _) => {
+                        if let Some(sig) = self.sigs.get(n) {
+                            sig.ret.clone()
+                        } else if self.user_types.contains(n) || self.enums.contains_key(n) {
+                            Ty::Named(n.clone())
+                        } else {
+                            Ty::Unknown
+                        }
+                    }
+                    _ => Ty::Unknown,
+                };
+            }
         }
         if let Expr::Name(fname, _) = callee {
             match fname.as_str() {

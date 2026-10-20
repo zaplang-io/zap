@@ -54,6 +54,8 @@ struct Mono<'a> {
     gstructs: HashMap<String, &'a StructDef>,
     /// Generic enum declarations by name.
     genums: HashMap<String, &'a EnumDef>,
+    /// Generic free-function declarations by name (I#161, slice 4).
+    gfuncs: HashMap<String, &'a Function>,
     /// Every struct declaration (generic or not), for field/method lookups.
     structs: HashMap<String, &'a StructDef>,
     /// Every enum declaration (generic or not), for variant/method lookups.
@@ -68,6 +70,18 @@ struct Mono<'a> {
     requested: HashSet<String>,
     /// Pending instantiations: `(generic name, concrete args)`.
     worklist: Vec<(String, Vec<Type>)>,
+    /// Specialized generic free functions to emit (I#161), deduped by mangled
+    /// name in `requested_funcs`; drained via `func_worklist`.
+    spec_funcs: Vec<Function>,
+    requested_funcs: HashSet<String>,
+    func_worklist: Vec<(String, Vec<Type>)>,
+    /// Specialized generic methods to attach to their owner's concrete
+    /// declaration (I#161): owner concrete type name -> methods. Merged into the
+    /// emitted declarations after the worklists drain. Deduped by
+    /// `owner::method$args` in `requested_methods`; drained via `method_worklist`.
+    spec_methods: HashMap<String, Vec<Function>>,
+    requested_methods: HashSet<String>,
+    method_worklist: Vec<MethodInst>,
     /// The module's items (snapshot) and span, so `run` can iterate without
     /// re-borrowing the source module while mutating `self`.
     src_items: Vec<Item>,
@@ -84,6 +98,16 @@ struct Mono<'a> {
     /// The current function's concrete declared return type, for the `return`
     /// expected-type sink.
     cur_ret: Option<Type>,
+}
+
+/// A pending generic-method instantiation (I#161): the owner generic type (with
+/// its concrete args) and the method's own name + concrete type arguments.
+#[derive(Clone, Debug)]
+struct MethodInst {
+    owner: String,
+    owner_args: Vec<Type>,
+    method: String,
+    targs: Vec<Type>,
 }
 
 /// A lexical environment mapping value names to their inferred concrete types,
@@ -133,6 +157,7 @@ impl<'a> Mono<'a> {
             params: HashMap::new(),
             gstructs: HashMap::new(),
             genums: HashMap::new(),
+            gfuncs: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
             func_ret: HashMap::new(),
@@ -140,6 +165,12 @@ impl<'a> Mono<'a> {
             spec_enums: Vec::new(),
             requested: HashSet::new(),
             worklist: Vec::new(),
+            spec_funcs: Vec::new(),
+            requested_funcs: HashSet::new(),
+            func_worklist: Vec::new(),
+            spec_methods: HashMap::new(),
+            requested_methods: HashSet::new(),
+            method_worklist: Vec::new(),
             src_items: module.items.clone(),
             span: module.span,
             cur_subst: HashMap::new(),
@@ -170,6 +201,9 @@ impl<'a> Mono<'a> {
                 }
                 Item::Function(f) => {
                     m.func_ret.insert(f.name.clone(), f.ret.clone());
+                    if !f.generics.is_empty() {
+                        m.gfuncs.insert(f.name.clone(), f);
+                    }
                 }
                 _ => {}
             }
@@ -187,19 +221,33 @@ impl<'a> Mono<'a> {
                 Item::Struct(s) if !s.generics.is_empty() => {}
                 Item::Enum(e) if !e.generics.is_empty() => {}
                 Item::Function(f) if !f.generics.is_empty() => {
-                    // Generic free functions are deferred (slice 4); a generic
-                    // function that is never instantiated is simply dropped.
+                    // Generic free functions (I#161) are emitted on demand from
+                    // call sites; one that is never instantiated is dropped.
                 }
                 Item::Struct(s) => out.push(Item::Struct(self.rewrite_struct_nongeneric(s)?)),
                 Item::Enum(e) => out.push(Item::Enum(self.rewrite_enum_nongeneric(e)?)),
-                Item::Function(f) => out.push(Item::Function(self.rewrite_fn(f, None)?)),
+                Item::Function(f) => {
+                    self.cur_subst.clear();
+                    self.cur_self = None;
+                    out.push(Item::Function(self.rewrite_fn(f, None)?))
+                }
                 other => out.push(other.clone()),
             }
         }
-        // Drain the instantiation worklist to a fixpoint (instantiating one
-        // generic may reference another), emitting specialized declarations.
-        while let Some((name, args)) = self.worklist.pop() {
-            self.emit_instance(&name, &args)?;
+        // Drain the instantiation worklists to a fixpoint (instantiating one
+        // generic may reference another generic type, function, or method),
+        // emitting specialized declarations. Types are drained first so a
+        // method's owner-type instance exists before its methods are attached.
+        loop {
+            if let Some((name, args)) = self.worklist.pop() {
+                self.emit_instance(&name, &args)?;
+            } else if let Some((name, args)) = self.func_worklist.pop() {
+                self.emit_func_instance(&name, &args)?;
+            } else if let Some(mi) = self.method_worklist.pop() {
+                self.emit_method_instance(&mi)?;
+            } else {
+                break;
+            }
         }
         // Append specialized declarations after the user's items so that any
         // non-generic type they reference is already declared earlier; the
@@ -210,6 +258,36 @@ impl<'a> Mono<'a> {
         }
         for e in std::mem::take(&mut self.spec_enums) {
             out.push(Item::Enum(e));
+        }
+        for f in std::mem::take(&mut self.spec_funcs) {
+            out.push(Item::Function(f));
+        }
+        // Attach specialized generic methods (I#161) to their owner's concrete
+        // declaration, now that every owner instance (generic or not) is emitted.
+        let spec_methods = std::mem::take(&mut self.spec_methods);
+        for (owner, methods) in spec_methods {
+            let mut attached = false;
+            for item in &mut out {
+                match item {
+                    Item::Struct(s) if s.name == owner => {
+                        s.methods.extend(methods.iter().cloned());
+                        attached = true;
+                        break;
+                    }
+                    Item::Enum(e) if e.name == owner => {
+                        e.methods.extend(methods.iter().cloned());
+                        attached = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !attached {
+                return Err(err(format!(
+                    "internal error: no concrete declaration '{owner}' to attach \
+                     its specialized generic methods to (I#161)"
+                )));
+            }
         }
         Ok(Module {
             items: out,
@@ -303,6 +381,56 @@ impl Mono<'_> {
         mangled
     }
 
+    /// The concrete declaration name for a type `generic[args]`: the plain name
+    /// for a non-generic type (empty `args`), else the mangled instance name.
+    fn instance_name(&self, generic: &str, args: &[Type]) -> String {
+        if args.is_empty() {
+            generic.to_string()
+        } else {
+            self.mangle_name(generic, args)
+        }
+    }
+
+    /// Record a generic free-function instantiation `f[args]` (I#161) and return
+    /// its specialized, mangled symbol. The args must already be concrete.
+    fn request_func(&mut self, func: &str, args: &[Type]) -> String {
+        let mangled = self.mangle_name(func, args);
+        if self.requested_funcs.insert(mangled.clone()) {
+            self.func_worklist.push((func.to_string(), args.to_vec()));
+        }
+        mangled
+    }
+
+    /// Record a generic-method instantiation `owner[owner_args].method[targs]`
+    /// (I#161) and return the specialized *method* symbol (`method$arg…`) used at
+    /// the call site. The owner type instance is requested too, so the concrete
+    /// declaration the method attaches to is emitted. All args must be concrete.
+    fn request_method(
+        &mut self,
+        owner: &str,
+        owner_args: &[Type],
+        method: &str,
+        targs: &[Type],
+    ) -> String {
+        // Ensure the owner's concrete type instance exists (a generic owner is
+        // instantiated; a non-generic owner is already emitted in pass 1).
+        if !owner_args.is_empty() {
+            self.request(owner, owner_args);
+        }
+        let owner_mangled = self.instance_name(owner, owner_args);
+        let method_spec = self.mangle_name(method, targs);
+        let key = format!("{owner_mangled}::{method_spec}");
+        if self.requested_methods.insert(key) {
+            self.method_worklist.push(MethodInst {
+                owner: owner.to_string(),
+                owner_args: owner_args.to_vec(),
+                method: method.to_string(),
+                targs: targs.to_vec(),
+            });
+        }
+        method_spec
+    }
+
     /// Rewrite a type annotation: apply the current substitution, then rename any
     /// user generic instantiation `G[args]` to its mangled concrete declaration
     /// name (requesting that instance), recursing into arguments. Built-in
@@ -389,7 +517,11 @@ impl Mono<'_> {
             }
             let mut methods = Vec::with_capacity(s.methods.len());
             for m in &s.methods {
-                methods.push(self.rewrite_fn(m, Some(self_ty.clone()))?);
+                // Generic methods (their own type parameters) are specialized on
+                // demand per call site (I#161), not emitted eagerly here.
+                if m.generics.is_empty() {
+                    methods.push(self.rewrite_fn(m, Some(self_ty.clone()))?);
+                }
             }
             let spec = StructDef {
                 decorators: s.decorators.clone(),
@@ -418,7 +550,10 @@ impl Mono<'_> {
             }
             let mut methods = Vec::with_capacity(e.methods.len());
             for m in &e.methods {
-                methods.push(self.rewrite_fn(m, Some(self_ty.clone()))?);
+                // Generic enum methods are specialized on demand (I#161).
+                if m.generics.is_empty() {
+                    methods.push(self.rewrite_fn(m, Some(self_ty.clone()))?);
+                }
             }
             let spec = EnumDef {
                 decorators: e.decorators.clone(),
@@ -456,7 +591,11 @@ impl Mono<'_> {
         }
         let mut methods = Vec::with_capacity(s.methods.len());
         for m in &s.methods {
-            methods.push(self.rewrite_fn(m, Some(self_ty.clone()))?);
+            // A generic method on a non-generic type is specialized on demand
+            // and attached later (I#161).
+            if m.generics.is_empty() {
+                methods.push(self.rewrite_fn(m, Some(self_ty.clone()))?);
+            }
         }
         self.cur_self = None;
         Ok(StructDef {
@@ -496,7 +635,10 @@ impl Mono<'_> {
         }
         let mut methods = Vec::with_capacity(e.methods.len());
         for m in &e.methods {
-            methods.push(self.rewrite_fn(m, Some(self_ty.clone()))?);
+            // A generic method on a non-generic enum is specialized on demand (I#161).
+            if m.generics.is_empty() {
+                methods.push(self.rewrite_fn(m, Some(self_ty.clone()))?);
+            }
         }
         self.cur_self = None;
         Ok(EnumDef {
@@ -509,16 +651,28 @@ impl Mono<'_> {
         })
     }
 
-    /// Rewrite a function/method. `self_ty` is the concrete (generic-form) type of
-    /// the `self` receiver for a method, `None` for a free function.
+    /// Rewrite a *non-generic* function/method (its own type-parameter list is
+    /// empty). `self_ty` is the concrete (generic-form) type of the `self`
+    /// receiver for a method, `None` for a free function. Generic functions and
+    /// methods are instead specialized on demand through [`Self::rewrite_fn_inner`]
+    /// (I#161).
     fn rewrite_fn(&mut self, f: &Function, self_ty: Option<Type>) -> Result<Function, LowerError> {
-        if !f.generics.is_empty() {
-            return Err(err(format!(
-                "generic functions/methods with their own type parameters are not \
-                 supported yet ('{}'); deferred to a later generics slice (I#154)",
-                f.name
-            )));
-        }
+        self.rewrite_fn_inner(f, self_ty, None)
+    }
+
+    /// Rewrite a function/method body under the ambient type-parameter
+    /// substitution (`cur_subst`). When specializing a generic function/method
+    /// (I#161), `cur_subst` already maps the function's own type parameters (and,
+    /// for a method, the owner's) to concrete types and `out_name` gives the
+    /// specialized, mangled symbol; the emitted declaration always has an empty
+    /// generic list. For a non-generic declaration `out_name` is `None` and the
+    /// original name is kept.
+    fn rewrite_fn_inner(
+        &mut self,
+        f: &Function,
+        self_ty: Option<Type>,
+        out_name: Option<String>,
+    ) -> Result<Function, LowerError> {
         let saved_ret = self.cur_ret.take();
         self.cur_ret = f.ret.as_ref().map(|t| self.apply_subst(t));
 
@@ -548,13 +702,95 @@ impl Mono<'_> {
         self.cur_ret = saved_ret;
         Ok(Function {
             decorators: f.decorators.clone(),
-            name: f.name.clone(),
+            name: out_name.unwrap_or_else(|| f.name.clone()),
             generics: Vec::new(),
             params,
             ret,
             body,
             span: f.span,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic function / method specialization (I#161)
+// ---------------------------------------------------------------------------
+
+impl<'a> Mono<'a> {
+    /// Find a method named `name` declared on the type `owner` (generic or not).
+    fn find_method(&self, owner: &str, name: &str) -> Option<&'a Function> {
+        if let Some(s) = self.structs.get(owner) {
+            if let Some(m) = s.methods.iter().find(|m| m.name == name) {
+                return Some(m);
+            }
+        }
+        if let Some(e) = self.enums.get(owner) {
+            if let Some(m) = e.methods.iter().find(|m| m.name == name) {
+                return Some(m);
+            }
+        }
+        None
+    }
+
+    /// Emit the specialized body of a generic free function `func[args]` (I#161):
+    /// substitute its type parameters, rewrite the body, and record it under its
+    /// mangled symbol.
+    fn emit_func_instance(&mut self, func: &str, args: &[Type]) -> Result<(), LowerError> {
+        let f = self
+            .gfuncs
+            .get(func)
+            .copied()
+            .ok_or_else(|| err(format!("'{func}' is not a generic function")))?;
+        let mangled = self.mangle_name(func, args);
+        let mut subst = HashMap::new();
+        for (p, a) in f.generics.iter().zip(args.iter()) {
+            subst.insert(p.name.clone(), a.clone());
+        }
+        let saved_subst = std::mem::replace(&mut self.cur_subst, subst);
+        let saved_self = self.cur_self.take();
+        let spec = self.rewrite_fn_inner(f, None, Some(mangled));
+        self.cur_subst = saved_subst;
+        self.cur_self = saved_self;
+        self.spec_funcs.push(spec?);
+        Ok(())
+    }
+
+    /// Emit the specialized body of a generic method and queue it for attachment
+    /// to its owner's concrete declaration (I#161). The substitution maps the
+    /// owner's type parameters (for a generic owner) and the method's own type
+    /// parameters to concrete types; `self` keeps the generic-form receiver type
+    /// so the body's `Self.Variant` / field / method references re-derive the
+    /// owner instance exactly as a non-generic method body does.
+    fn emit_method_instance(&mut self, mi: &MethodInst) -> Result<(), LowerError> {
+        let method = self.find_method(&mi.owner, &mi.method).ok_or_else(|| {
+            err(format!(
+                "type '{}' has no method '{}' (I#161)",
+                mi.owner, mi.method
+            ))
+        })?;
+        let method_spec = self.mangle_name(&mi.method, &mi.targs);
+        let mut subst = self.subst_map(&mi.owner, &mi.owner_args);
+        for (p, a) in method.generics.iter().zip(mi.targs.iter()) {
+            subst.insert(p.name.clone(), a.clone());
+        }
+        let self_ty = Type::Named {
+            name: mi.owner.clone(),
+            args: mi.owner_args.clone(),
+            span: self.span,
+        };
+        let saved_subst = std::mem::replace(&mut self.cur_subst, subst);
+        let saved_self = self
+            .cur_self
+            .replace((mi.owner.clone(), mi.owner_args.clone()));
+        let spec = self.rewrite_fn_inner(method, Some(self_ty), Some(method_spec));
+        self.cur_subst = saved_subst;
+        self.cur_self = saved_self;
+        let owner_mangled = self.instance_name(&mi.owner, &mi.owner_args);
+        self.spec_methods
+            .entry(owner_mangled)
+            .or_default()
+            .push(spec?);
+        Ok(())
     }
 }
 
@@ -1005,7 +1241,32 @@ impl Mono<'_> {
                 CTy::Unknown,
             )),
             Expr::Tuple(xs, span) => Ok((Expr::Tuple(self.rw_vec(xs, env)?, *span), CTy::Unknown)),
-            Expr::List(xs, span) => Ok((Expr::List(self.rw_vec(xs, env)?, *span), CTy::Unknown)),
+            Expr::List(xs, span) => {
+                // Infer the element type from the first element (best-effort), so
+                // a `list[T]` parameter can be inferred from a list literal
+                // argument (I#161); heterogeneous or untyped elements leave the
+                // list `Unknown`.
+                let mut out = Vec::with_capacity(xs.len());
+                let mut elem: Option<Type> = None;
+                for (i, x) in xs.iter().enumerate() {
+                    let (v, cty) = self.rewrite_expr(x, env, None)?;
+                    if i == 0 {
+                        if let CTy::Ty(t) = cty {
+                            elem = Some(t);
+                        }
+                    }
+                    out.push(v);
+                }
+                let cty = match elem {
+                    Some(t) => CTy::Ty(Type::Named {
+                        name: "list".to_string(),
+                        args: vec![t],
+                        span: *span,
+                    }),
+                    None => CTy::Unknown,
+                };
+                Ok((Expr::List(out, *span), cty))
+            }
             Expr::Set(xs, span) => Ok((Expr::Set(self.rw_vec(xs, env)?, *span), CTy::Unknown)),
             Expr::Dict(pairs, span) => {
                 let mut np = Vec::with_capacity(pairs.len());
@@ -1228,7 +1489,27 @@ fn unify(decl: &Type, actual: &Type, ps: &[String], out: &mut HashMap<String, Ty
                 }
             }
         }
-        _ => {}
+        Type::Func {
+            params: dp,
+            ret: dr,
+            ..
+        } => {
+            if let Type::Func {
+                params: ap,
+                ret: ar,
+                ..
+            } = actual
+            {
+                if dp.len() == ap.len() {
+                    for (d, a) in dp.iter().zip(ap) {
+                        unify(d, a, ps, out);
+                    }
+                }
+                if let (Some(d), Some(a)) = (dr, ar) {
+                    unify(d, a, ps, out);
+                }
+            }
+        }
     }
 }
 
@@ -1317,6 +1598,73 @@ impl Mono<'_> {
                     "cannot infer type argument '{p}' of generic '{g}'; write it \
                      explicitly (e.g. {g}[...]) (I#154)"
                 )));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Infer the concrete type arguments for a generic function's or method's own
+    /// type parameters (I#161): unify the declared value-parameter types (with any
+    /// owner-type substitution already applied) against the inferred argument
+    /// types, then fall back to the expected-type sink against the return type for
+    /// any parameter the arguments do not pin down (Fork I). Errors naming the
+    /// unresolved parameter if neither rule determines it.
+    fn infer_fn_targs(
+        &self,
+        f: &Function,
+        owner_subst: &HashMap<String, Type>,
+        argpairs: &[(Option<String>, CTy)],
+        expected: Option<&Type>,
+        what: &str,
+    ) -> Result<Vec<Type>, LowerError> {
+        let tparams: Vec<String> = f.generics.iter().map(|g| g.name.clone()).collect();
+        let tparams = tparams.as_slice();
+        let ret = f.ret.as_ref();
+        // Declared value parameters (the `self` receiver excluded), with the
+        // owner's type parameters substituted so only the fn/method's own type
+        // parameters remain free.
+        let vparams: Vec<(String, Type)> = f
+            .params
+            .iter()
+            .filter(|p| p.name != "self")
+            .filter_map(|p| {
+                p.ty.as_ref()
+                    .map(|t| (p.name.clone(), subst_with(t, owner_subst)))
+            })
+            .collect();
+        let mut map: HashMap<String, Type> = HashMap::new();
+        let mut pos = 0usize;
+        for (name, cty) in argpairs {
+            let decl = match name {
+                Some(pname) => vparams.iter().find(|(n, _)| n == pname).map(|(_, t)| t),
+                None => {
+                    let d = vparams.get(pos).map(|(_, t)| t);
+                    pos += 1;
+                    d
+                }
+            };
+            if let (Some(decl), CTy::Ty(actual)) = (decl, cty) {
+                unify(decl, actual, tparams, &mut map);
+            }
+        }
+        // Expected-type sink: unify the (owner-substituted) return type against
+        // the expected type for any parameter still unresolved.
+        if tparams.iter().any(|p| !map.contains_key(p)) {
+            if let (Some(rd), Some(exp)) = (ret, expected) {
+                let rd = subst_with(rd, owner_subst);
+                unify(&rd, exp, tparams, &mut map);
+            }
+        }
+        let mut out = Vec::with_capacity(tparams.len());
+        for p in tparams {
+            match map.get(p) {
+                Some(t) => out.push(t.clone()),
+                None => {
+                    return Err(err(format!(
+                        "cannot infer type argument '{p}' of {what}; write it \
+                         explicitly (I#161)"
+                    )))
+                }
             }
         }
         Ok(out)
@@ -1413,6 +1761,45 @@ impl Mono<'_> {
             }
             // Ordinary method call `recv.m(args)`.
             let (bexpr, bcty) = self.rewrite_expr(base, env, None)?;
+            // Generic method call (I#161): the method carries its own type
+            // parameters. Infer them (argument unification + expected-type sink)
+            // and dispatch to the specialized method symbol on the receiver's
+            // concrete type.
+            if let CTy::Ty(Type::Named {
+                name: owner,
+                args: owner_args,
+                ..
+            }) = &bcty
+            {
+                if let Some(method) = self.find_method(owner, variant) {
+                    if !method.generics.is_empty() {
+                        let (owner, owner_args) = (owner.clone(), owner_args.clone());
+                        let tparams: Vec<String> =
+                            method.generics.iter().map(|g| g.name.clone()).collect();
+                        let owner_subst = self.subst_map(&owner, &owner_args);
+                        let targs = self.infer_fn_targs(
+                            method,
+                            &owner_subst,
+                            &argpairs,
+                            expected,
+                            &format!("method '{variant}' of '{owner}'"),
+                        )?;
+                        let ret_cty =
+                            self.fn_ret_cty(method.ret.as_ref(), &owner_subst, &tparams, &targs);
+                        let method_spec = self.request_method(&owner, &owner_args, variant, &targs);
+                        let node = Expr::Call {
+                            callee: Box::new(Expr::Attr {
+                                base: Box::new(bexpr),
+                                name: method_spec,
+                                span: *aspan,
+                            }),
+                            args: nargs,
+                            span,
+                        };
+                        return Ok((node, ret_cty));
+                    }
+                }
+            }
             let ret = match &bcty {
                 CTy::Ty(bt) => self.method_ret(bt, variant),
                 _ => CTy::Unknown,
@@ -1446,6 +1833,26 @@ impl Mono<'_> {
                 };
                 return Ok((node, CTy::Ty(self.named(g, cargs))));
             }
+            // Generic free-function call `f(args)` (I#161): infer the type args.
+            if let Some(f) = self.gfuncs.get(g).copied() {
+                let tparams: Vec<String> = f.generics.iter().map(|p| p.name.clone()).collect();
+                let empty = HashMap::new();
+                let targs = self.infer_fn_targs(
+                    f,
+                    &empty,
+                    &argpairs,
+                    expected,
+                    &format!("function '{g}'"),
+                )?;
+                let ret_cty = self.fn_ret_cty(f.ret.as_ref(), &empty, &tparams, &targs);
+                let mangled = self.request_func(&g.clone(), &targs);
+                let node = Expr::Call {
+                    callee: Box::new(Expr::Name(mangled, *nspan)),
+                    args: nargs,
+                    span,
+                };
+                return Ok((node, ret_cty));
+            }
             // Non-generic struct construction or user function call.
             let cty = if self.structs.contains_key(g) || self.enums.contains_key(g) {
                 CTy::Ty(self.named(g, Vec::new()))
@@ -1464,9 +1871,11 @@ impl Mono<'_> {
             ));
         }
 
-        // Explicit type args struct construction `G[args](...)`.
+        // Explicit type args on a generic callee `G[args](...)` /
+        // `f[args](...)` / `recv.m[args](...)` (I#161, Fork S).
         if let Expr::Index { base, index, .. } = callee {
             if let Expr::Name(g, nspan) = base.as_ref() {
+                // Generic struct construction with explicit type args.
                 if self.gstructs.contains_key(g) {
                     if let Some(cargs) = self.type_args_from_index(index) {
                         let mangled = self.request(&g.clone(), &cargs);
@@ -1476,6 +1885,66 @@ impl Mono<'_> {
                             span,
                         };
                         return Ok((node, CTy::Ty(self.named(g, cargs))));
+                    }
+                }
+                // Generic free-function call with explicit type args `f[args](...)`.
+                if let Some(f) = self.gfuncs.get(g).copied() {
+                    if let Some(targs) = self.type_args_from_index(index) {
+                        let tparams: Vec<String> =
+                            f.generics.iter().map(|p| p.name.clone()).collect();
+                        let empty = HashMap::new();
+                        let ret_cty = self.fn_ret_cty(f.ret.as_ref(), &empty, &tparams, &targs);
+                        let mangled = self.request_func(&g.clone(), &targs);
+                        let node = Expr::Call {
+                            callee: Box::new(Expr::Name(mangled, *nspan)),
+                            args: nargs,
+                            span,
+                        };
+                        return Ok((node, ret_cty));
+                    }
+                }
+            }
+            // Generic method call with explicit type args `recv.m[args](...)`.
+            if let Expr::Attr {
+                base: recv,
+                name: m,
+                span: aspan,
+            } = base.as_ref()
+            {
+                let (rexpr, rcty) = self.rewrite_expr(recv, env, None)?;
+                if let CTy::Ty(Type::Named {
+                    name: owner,
+                    args: owner_args,
+                    ..
+                }) = &rcty
+                {
+                    if let Some(method) = self.find_method(owner, m) {
+                        if !method.generics.is_empty() {
+                            if let Some(targs) = self.type_args_from_index(index) {
+                                let (owner, owner_args) = (owner.clone(), owner_args.clone());
+                                let tparams: Vec<String> =
+                                    method.generics.iter().map(|g| g.name.clone()).collect();
+                                let owner_subst = self.subst_map(&owner, &owner_args);
+                                let ret_cty = self.fn_ret_cty(
+                                    method.ret.as_ref(),
+                                    &owner_subst,
+                                    &tparams,
+                                    &targs,
+                                );
+                                let method_spec =
+                                    self.request_method(&owner, &owner_args, m, &targs);
+                                let node = Expr::Call {
+                                    callee: Box::new(Expr::Attr {
+                                        base: Box::new(rexpr),
+                                        name: method_spec,
+                                        span: *aspan,
+                                    }),
+                                    args: nargs,
+                                    span,
+                                };
+                                return Ok((node, ret_cty));
+                            }
+                        }
                     }
                 }
             }
@@ -1579,6 +2048,29 @@ impl Mono<'_> {
             name: name.to_string(),
             args,
             span: self.span,
+        }
+    }
+
+    /// The call result type for a specialized generic function/method (I#161):
+    /// the declared return type with the owner substitution and the inferred
+    /// (type-param -> concrete) bindings applied, in generic form (the
+    /// nested-generic renaming happens later, during type rewriting).
+    fn fn_ret_cty(
+        &self,
+        ret: Option<&Type>,
+        owner_subst: &HashMap<String, Type>,
+        tparams: &[String],
+        targs: &[Type],
+    ) -> CTy {
+        match ret {
+            Some(rt) => {
+                let mut subst = owner_subst.clone();
+                for (p, a) in tparams.iter().zip(targs.iter()) {
+                    subst.insert(p.clone(), a.clone());
+                }
+                CTy::Ty(subst_with(rt, &subst))
+            }
+            None => CTy::Unknown,
         }
     }
 
@@ -1750,5 +2242,88 @@ fn expr_to_type(e: &Expr) -> Option<Type> {
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zapc_syntax::parser::parse_str;
+
+    fn mono_ok(src: &str) -> Module {
+        let (module, perrs, lerrs) = parse_str(src);
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        monomorphize(&module).expect("monomorphization succeeds")
+    }
+
+    fn fn_names(m: &Module) -> Vec<String> {
+        m.items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Function(f) => Some(f.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn struct_named<'a>(m: &'a Module, name: &str) -> Option<&'a StructDef> {
+        m.items.iter().find_map(|i| match i {
+            Item::Struct(s) if s.name == name => Some(s),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn generic_fn_is_monomorphized_and_deduped() {
+        // identity is instantiated at int64 twice (dedup -> one body) and str
+        // once; the generic template itself is erased (I#161).
+        let m = mono_ok(
+            "def identity[T](T x) -> T:\n    return x\n\
+             def main():\n    print(identity(1))\n    print(identity(2))\n    print(identity(\"a\"))\n",
+        );
+        let names = fn_names(&m);
+        assert_eq!(
+            names.iter().filter(|n| *n == "identity$int64").count(),
+            1,
+            "identity$int64 should be emitted exactly once (dedup): {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "identity$str").count(),
+            1,
+            "identity$str should be emitted once: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "identity"),
+            "the generic template must be erased: {names:?}"
+        );
+    }
+
+    #[test]
+    fn uninstantiated_generic_fn_is_dropped() {
+        let m = mono_ok("def unused[T](T x) -> T:\n    return x\ndef main():\n    print(1)\n");
+        let names = fn_names(&m);
+        assert!(
+            names.iter().all(|n| !n.starts_with("unused")),
+            "a never-instantiated generic fn emits nothing: {names:?}"
+        );
+    }
+
+    #[test]
+    fn generic_method_attaches_to_concrete_owner() {
+        // A generic method with its own type parameter is specialized per call
+        // and attached to the owner's concrete instance (I#161).
+        let m = mono_ok(
+            "struct Box[T]:\n    T value\n    def repack[U](self, U y) -> Box[U]:\n        return Box(y)\n\
+             def main():\n    Box[int64] b = Box(3)\n    Box[str] c = b.repack(\"s\")\n    print(c.value)\n",
+        );
+        let owner = struct_named(&m, "Box$int64").expect("Box$int64 emitted");
+        assert!(
+            owner.methods.iter().any(|mm| mm.name == "repack$str"),
+            "the specialized repack$str must be attached to Box$int64: {:?}",
+            owner.methods.iter().map(|mm| &mm.name).collect::<Vec<_>>()
+        );
+        // Box$str is the method's return instance, discovered transitively.
+        assert!(struct_named(&m, "Box$str").is_some(), "Box$str discovered");
     }
 }
