@@ -57,6 +57,18 @@ pub enum Type {
 // Declarations
 // ----------------------------------------------------------------------------
 
+/// A generic type parameter (D-0017/I#154), e.g. the `T` in `struct Box[T]` or
+/// the `T: Ordered` in `def max_of[T: Ordered](...)`. The optional interface
+/// `bound` is parsed and carried now so the grammar round-trips; bound
+/// *enforcement* is deferred to a later slice (Fork B), so the bound is unused
+/// by the first vertical.
+#[derive(Clone, Debug)]
+pub struct TypeParam {
+    pub name: String,
+    pub bound: Option<Type>,
+    pub span: Span,
+}
+
 /// A decorator/annotation application, e.g. `@retry(times=3)` (D-0036).
 #[derive(Clone, Debug)]
 pub struct Decorator {
@@ -71,7 +83,7 @@ pub struct Function {
     pub decorators: Vec<Decorator>,
     pub name: String,
     /// Generic type parameters, e.g. `[T, U]` (D-0017).
-    pub generics: Vec<String>,
+    pub generics: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Block,
@@ -97,7 +109,7 @@ pub struct Param {
 pub struct StructDef {
     pub decorators: Vec<Decorator>,
     pub name: String,
-    pub generics: Vec<String>,
+    pub generics: Vec<TypeParam>,
     pub fields: Vec<Field>,
     pub methods: Vec<Function>,
     /// `true` for a `value struct` (opt-in value type, D-0051): copied on
@@ -122,7 +134,7 @@ pub struct Field {
 #[derive(Clone, Debug)]
 pub struct InterfaceDef {
     pub name: String,
-    pub generics: Vec<String>,
+    pub generics: Vec<TypeParam>,
     pub methods: Vec<MethodSig>,
     pub span: Span,
 }
@@ -146,7 +158,7 @@ pub struct EnumDef {
     pub decorators: Vec<Decorator>,
     pub name: String,
     /// Generic type parameters, e.g. `[T]` (reserved; D-0017/D-0046).
-    pub generics: Vec<String>,
+    pub generics: Vec<TypeParam>,
     pub variants: Vec<EnumVariant>,
     /// Methods declared in the enum body (`def` with `self`, D-0046). Parsed
     /// now; lowering is a documented follow-up.
