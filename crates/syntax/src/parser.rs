@@ -54,6 +54,10 @@ pub fn parse_str(src: &str) -> (Module, Vec<ParseError>, Vec<crate::lexer::LexEr
 /// (uncatchable). `MemStats` mirrors `gc.stats()`; `DateTime` is the civil-time
 /// value `datetime.*` produces (its methods live on the module, so the struct
 /// itself stays method-free and emits no code when a program never uses it).
+/// `JsonValue` is the dynamic JSON DOM sum type (D-0059, I#100/I#131): a
+/// data-carrying enum (D-0046) with `Int(int64)`/`Float(float64)` kept distinct,
+/// and recursive `Array(list[JsonValue])` / `Object(dict[str, JsonValue])`
+/// variants; `json.loads`/`dumps` and `@derive(Json)` are built on it.
 pub const PRELUDE_SRC: &str = "\
 enum Signal:
     SIGHUP = 1
@@ -84,6 +88,15 @@ value struct DateTime:
     int64 hour
     int64 minute
     int64 second
+
+enum JsonValue:
+    Null
+    Bool(bool b)
+    Int(int64 i)
+    Float(float64 f)
+    Str(str s)
+    Array(list[JsonValue] items)
+    Object(dict[str, JsonValue] fields)
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -133,6 +146,8 @@ fn references_prelude(module: &Module) -> bool {
         "\"DateTime\"",
         "\"time\"",
         "\"datetime\"",
+        "\"JsonValue\"",
+        "\"json\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
