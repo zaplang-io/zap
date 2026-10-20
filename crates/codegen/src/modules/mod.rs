@@ -13,6 +13,7 @@
 
 use super::Cg;
 
+mod crypto;
 mod gc;
 mod runtime;
 mod signal;
@@ -24,4 +25,5 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     signal::declare_rt(cg);
     gc::declare_rt(cg);
     runtime::declare_rt(cg);
+    crypto::declare_rt(cg);
 }
