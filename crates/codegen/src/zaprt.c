@@ -4184,6 +4184,547 @@ int64_t zap_signal_selftest(void) {
 }
 
 /* ===========================================================================
+ * os / sys / io / fs / process (ticket #97, D-0056). The system, I/O and
+ * process core of the bundled stdlib, dispatched by flat name through the
+ * module seam (#121): `os`/`sys`/`io`/`fs`/`process` are compiler-known
+ * namespaced modules (`import` accepted but not required), exactly like
+ * `signal`/`gc`/`runtime`.
+ *
+ * Design (flagged in the PR):
+ *   - Files are raw int64 fds (no handle object / prelude type); the stdio
+ *     handles `sys.std{in,out,err}_fd()` are the constants 0/1/2 (lowered
+ *     inline, no runtime call here).
+ *   - `fs.stat`-style queries are separate scalar/bool entry points
+ *     (`fs.size/is_dir/is_file/exists`) so no stat struct is needed.
+ *   - `process.run(list[str])` captures stdout/stderr into temp files (NOT
+ *     pipes) and `waitpid`s, so there is no pipe-buffer deadlock and no fork;
+ *     it returns a GC `ZapProc` whose three fields the lowerer reads back into
+ *     a `(int64, str, str)` tuple = (exit_code, stdout, stderr).
+ *   - Fallible calls raise a catchable Zap exception via `zap_panic` (the
+ *     message is "<op>: <errno text>"), matching the rest of the runtime.
+ *
+ * GC safety: a collection only ever runs at a compiled-code safepoint (see
+ * zapgc.inc.c), never inside a runtime C call, so GC objects built here and
+ * held in C locals stay live for the duration of the call without rooting.
+ * The one blocking point (`waitpid`) is wrapped in zap_enter/leave_blocking so
+ * a concurrent stop-the-world GC need not wait for this thread (its roots are
+ * already flushed; no un-flushed Zap temporaries are live across the wait).
+ * ========================================================================== */
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <stddef.h> /* offsetof */
+#include <sys/stat.h>
+#include <sys/wait.h>
+#if defined(__APPLE__)
+#include <crt_externs.h> /* _NSGetArgc / _NSGetArgv */
+#endif
+
+extern char **environ;
+
+/* NUL-terminated copy of a ZapStr for the C-string syscall APIs (ZapStr data is
+ * length-prefixed, not NUL-terminated). The buffer is a GC leaf; no safepoint
+ * runs inside a runtime call, so holding it in a C local is safe. */
+static char *zap_sys_cstr(const ZapStr *s) {
+    char *buf = (char *)zap_buf((int64_t)s->len + 1);
+    if (s->len > 0) {
+        memcpy(buf, s->data, (size_t)s->len);
+    }
+    buf[s->len] = '\0';
+    return buf;
+}
+
+/* Raise a catchable Zap exception "<op>: <detail>" (never returns). */
+static void zap_sys_fail(const char *op, const char *detail) {
+    char buf[512];
+    int n = snprintf(buf, sizeof buf, "%s: %s", op, detail);
+    if (n < 0) {
+        n = 0;
+    }
+    if (n >= (int)sizeof buf) {
+        n = (int)sizeof buf - 1;
+    }
+    zap_panic(zap_str_new(buf, (int64_t)n));
+}
+
+/* --- os: environment -------------------------------------------------------- */
+
+/* os.getenv(name) -> str: the variable's value, or "" when unset (use
+ * os.hasenv to distinguish unset from empty; there is no None in v1). */
+void *zap_os_getenv(void *name_) {
+    const char *v = getenv(zap_sys_cstr((ZapStr *)name_));
+    return v ? zap_str_new(v, (int64_t)strlen(v)) : zap_str_new("", 0);
+}
+
+/* os.hasenv(name) -> bool. */
+int64_t zap_os_hasenv(void *name_) {
+    return getenv(zap_sys_cstr((ZapStr *)name_)) != NULL ? 1 : 0;
+}
+
+/* os.setenv(name, value) (overwrites). */
+void zap_os_setenv(void *name_, void *val_) {
+    if (setenv(zap_sys_cstr((ZapStr *)name_), zap_sys_cstr((ZapStr *)val_), 1) != 0) {
+        zap_sys_fail("os.setenv", strerror(errno));
+    }
+}
+
+/* os.getpid() -> int64. */
+int64_t zap_os_getpid(void) { return (int64_t)getpid(); }
+
+/* --- os: working directory & entries ---------------------------------------- */
+
+/* os.getcwd() -> str. */
+void *zap_os_getcwd(void) {
+    char buf[4096];
+    if (getcwd(buf, sizeof buf) == NULL) {
+        zap_sys_fail("os.getcwd", strerror(errno));
+    }
+    return zap_str_new(buf, (int64_t)strlen(buf));
+}
+
+/* os.chdir(path). */
+void zap_os_chdir(void *path_) {
+    if (chdir(zap_sys_cstr((ZapStr *)path_)) != 0) {
+        zap_sys_fail("os.chdir", strerror(errno));
+    }
+}
+
+/* os.mkdir(path) (mode 0777 before umask). */
+void zap_os_mkdir(void *path_) {
+    if (mkdir(zap_sys_cstr((ZapStr *)path_), 0777) != 0) {
+        zap_sys_fail("os.mkdir", strerror(errno));
+    }
+}
+
+/* os.remove(path): unlink a file. */
+void zap_os_remove(void *path_) {
+    if (unlink(zap_sys_cstr((ZapStr *)path_)) != 0) {
+        zap_sys_fail("os.remove", strerror(errno));
+    }
+}
+
+/* os.rmdir(path): remove an empty directory. */
+void zap_os_rmdir(void *path_) {
+    if (rmdir(zap_sys_cstr((ZapStr *)path_)) != 0) {
+        zap_sys_fail("os.rmdir", strerror(errno));
+    }
+}
+
+/* os.listdir(path) / fs.listdir(path) -> list[str]: entry names (excluding
+ * "." and ".."), in unspecified order. */
+void *zap_os_listdir(void *path_) {
+    char *path = zap_sys_cstr((ZapStr *)path_);
+    DIR *d = opendir(path);
+    if (d == NULL) {
+        zap_sys_fail("os.listdir", strerror(errno));
+    }
+    void *out = zap_list_new();
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        zap_list_push_ptr(out, zap_str_new(e->d_name, (int64_t)strlen(e->d_name)));
+    }
+    closedir(d);
+    return out;
+}
+
+/* --- os.path helpers (flat names: Zap dispatch is `module.method`) ---------- */
+
+/* os.path_join(a, b): join with a single '/'. An absolute `b` replaces `a`
+ * (POSIX semantics). */
+void *zap_os_path_join(void *a_, void *b_) {
+    ZapStr *a = (ZapStr *)a_;
+    ZapStr *b = (ZapStr *)b_;
+    if (b->len > 0 && b->data[0] == '/') {
+        return zap_str_new(b->data, b->len);
+    }
+    if (a->len == 0) {
+        return zap_str_new(b->data, b->len);
+    }
+    int need_sep = a->data[a->len - 1] != '/';
+    int64_t n = a->len + (need_sep ? 1 : 0) + b->len;
+    char *buf = (char *)zap_buf(n);
+    memcpy(buf, a->data, (size_t)a->len);
+    int64_t off = a->len;
+    if (need_sep) {
+        buf[off++] = '/';
+    }
+    memcpy(buf + off, b->data, (size_t)b->len);
+    return zap_str_new(buf, n);
+}
+
+/* os.path_exists(path) -> bool. */
+int64_t zap_os_path_exists(void *path_) {
+    return access(zap_sys_cstr((ZapStr *)path_), F_OK) == 0 ? 1 : 0;
+}
+
+/* os.path_basename(path): the final component ("" for a trailing-slash path). */
+void *zap_os_path_basename(void *path_) {
+    ZapStr *p = (ZapStr *)path_;
+    int64_t i = p->len;
+    while (i > 0 && p->data[i - 1] == '/') {
+        i--; /* ignore trailing slashes, like POSIX basename of "a/" -> "a" */
+    }
+    int64_t end = i;
+    while (i > 0 && p->data[i - 1] != '/') {
+        i--;
+    }
+    return zap_str_new(p->data + i, end - i);
+}
+
+/* os.path_dirname(path): everything up to the last '/' (no trailing slash);
+ * "." when there is no '/'. */
+void *zap_os_path_dirname(void *path_) {
+    ZapStr *p = (ZapStr *)path_;
+    int64_t i = p->len;
+    while (i > 0 && p->data[i - 1] == '/') {
+        i--;
+    }
+    while (i > 0 && p->data[i - 1] != '/') {
+        i--;
+    }
+    while (i > 1 && p->data[i - 1] == '/') {
+        i--; /* collapse the trailing separator(s), keeping a lone leading "/" */
+    }
+    if (i == 0) {
+        return zap_str_new(".", 1);
+    }
+    return zap_str_new(p->data, i);
+}
+
+/* --- sys -------------------------------------------------------------------- */
+
+#if defined(__APPLE__)
+static int zap_prog_argc(void) { return *_NSGetArgc(); }
+static char **zap_prog_argv(void) { return *_NSGetArgv(); }
+#else
+/* On ELF platforms the dynamic loader passes (argc, argv, envp) to init-array
+ * constructors; capture them for sys.argv (there is no argv parameter on the
+ * compiled `main`, which has the C signature `int main(void)`). */
+static int zap_saved_argc = 0;
+static char **zap_saved_argv = NULL;
+__attribute__((constructor)) static void zap_capture_argv(int argc, char **argv,
+                                                          char **envp) {
+    (void)envp;
+    zap_saved_argc = argc;
+    zap_saved_argv = argv;
+}
+static int zap_prog_argc(void) { return zap_saved_argc; }
+static char **zap_prog_argv(void) { return zap_saved_argv; }
+#endif
+
+/* sys.argv() -> list[str]: the process arguments (argv[0] is the program). */
+void *zap_sys_argv(void) {
+    int argc = zap_prog_argc();
+    char **argv = zap_prog_argv();
+    void *out = zap_list_new();
+    for (int i = 0; i < argc && argv != NULL && argv[i] != NULL; i++) {
+        zap_list_push_ptr(out, zap_str_new(argv[i], (int64_t)strlen(argv[i])));
+    }
+    return out;
+}
+
+/* sys.exit(code): terminate the process immediately with `code`. */
+void zap_sys_exit(int64_t code) { exit((int)code); }
+
+/* sys.platform() -> str. */
+void *zap_sys_platform(void) {
+#if defined(__APPLE__)
+    return zap_str_new("darwin", 6);
+#elif defined(__linux__)
+    return zap_str_new("linux", 5);
+#else
+    return zap_str_new("unknown", 7);
+#endif
+}
+
+/* --- io: fd-based file I/O -------------------------------------------------- */
+
+/* io.open(path, mode) -> fd. Modes mirror C stdio: r r+ w w+ a a+. */
+int64_t zap_io_open(void *path_, void *mode_) {
+    const char *mode = zap_sys_cstr((ZapStr *)mode_);
+    int flags;
+    if (strcmp(mode, "r") == 0) {
+        flags = O_RDONLY;
+    } else if (strcmp(mode, "r+") == 0) {
+        flags = O_RDWR;
+    } else if (strcmp(mode, "w") == 0) {
+        flags = O_WRONLY | O_CREAT | O_TRUNC;
+    } else if (strcmp(mode, "w+") == 0) {
+        flags = O_RDWR | O_CREAT | O_TRUNC;
+    } else if (strcmp(mode, "a") == 0) {
+        flags = O_WRONLY | O_CREAT | O_APPEND;
+    } else if (strcmp(mode, "a+") == 0) {
+        flags = O_RDWR | O_CREAT | O_APPEND;
+    } else {
+        zap_sys_fail("io.open", "invalid mode (want one of: r r+ w w+ a a+)");
+        return -1; /* unreachable */
+    }
+    int fd = open(zap_sys_cstr((ZapStr *)path_), flags, 0644);
+    if (fd < 0) {
+        zap_sys_fail("io.open", strerror(errno));
+    }
+    return (int64_t)fd;
+}
+
+/* io.read(fd, n) -> str: up to `n` bytes ("" at EOF). */
+void *zap_io_read(int64_t fd, int64_t n) {
+    if (n < 0) {
+        n = 0;
+    }
+    char *buf = (char *)zap_buf(n > 0 ? n : 1);
+    ssize_t got;
+    do {
+        got = read((int)fd, buf, (size_t)n);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+        zap_sys_fail("io.read", strerror(errno));
+    }
+    return zap_str_new(buf, (int64_t)got);
+}
+
+/* io.write(fd, data) -> int64: bytes written (the full string). */
+int64_t zap_io_write(int64_t fd, void *data_) {
+    ZapStr *s = (ZapStr *)data_;
+    size_t off = 0;
+    while (off < (size_t)s->len) {
+        ssize_t w = write((int)fd, s->data + off, (size_t)s->len - off);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            zap_sys_fail("io.write", strerror(errno));
+        }
+        off += (size_t)w;
+    }
+    return (int64_t)off;
+}
+
+/* io.close(fd). */
+void zap_io_close(int64_t fd) {
+    if (close((int)fd) != 0) {
+        zap_sys_fail("io.close", strerror(errno));
+    }
+}
+
+/* --- fs: path-oriented convenience + metadata ------------------------------- */
+
+/* Read an entire open fd to a fresh ZapStr (for regular files; uses the file
+ * size when seekable, otherwise grows). Caller handles open/close. */
+static void *zap_read_all_fd(int fd) {
+    off_t end = lseek(fd, 0, SEEK_END);
+    int64_t cap = (end > 0) ? (int64_t)end : 4096;
+    if (end >= 0) {
+        lseek(fd, 0, SEEK_SET);
+    }
+    char *buf = (char *)zap_buf(cap);
+    int64_t got = 0;
+    for (;;) {
+        if (got == cap) {
+            int64_t ncap = cap * 2;
+            char *nb = (char *)zap_buf(ncap);
+            memcpy(nb, buf, (size_t)got);
+            buf = nb;
+            cap = ncap;
+        }
+        ssize_t r = read(fd, buf + got, (size_t)(cap - got));
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            zap_sys_fail("fs.read_file", strerror(errno));
+        }
+        if (r == 0) {
+            break;
+        }
+        got += (int64_t)r;
+    }
+    return zap_str_new(buf, got);
+}
+
+/* fs.read_file(path) -> str: the whole file. */
+void *zap_fs_read_file(void *path_) {
+    int fd = open(zap_sys_cstr((ZapStr *)path_), O_RDONLY);
+    if (fd < 0) {
+        zap_sys_fail("fs.read_file", strerror(errno));
+    }
+    void *s = zap_read_all_fd(fd);
+    close(fd);
+    return s;
+}
+
+/* fs.write_file(path, data): create/truncate and write the whole string. */
+void zap_fs_write_file(void *path_, void *data_) {
+    int fd = open(zap_sys_cstr((ZapStr *)path_), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        zap_sys_fail("fs.write_file", strerror(errno));
+    }
+    (void)zap_io_write((int64_t)fd, data_);
+    close(fd);
+}
+
+/* fs.exists(path) -> bool. */
+int64_t zap_fs_exists(void *path_) {
+    struct stat st;
+    return stat(zap_sys_cstr((ZapStr *)path_), &st) == 0 ? 1 : 0;
+}
+
+/* fs.is_dir(path) -> bool. */
+int64_t zap_fs_is_dir(void *path_) {
+    struct stat st;
+    if (stat(zap_sys_cstr((ZapStr *)path_), &st) != 0) {
+        return 0;
+    }
+    return S_ISDIR(st.st_mode) ? 1 : 0;
+}
+
+/* fs.is_file(path) -> bool. */
+int64_t zap_fs_is_file(void *path_) {
+    struct stat st;
+    if (stat(zap_sys_cstr((ZapStr *)path_), &st) != 0) {
+        return 0;
+    }
+    return S_ISREG(st.st_mode) ? 1 : 0;
+}
+
+/* fs.size(path) -> int64: file size in bytes (raises if it does not exist). */
+int64_t zap_fs_size(void *path_) {
+    struct stat st;
+    if (stat(zap_sys_cstr((ZapStr *)path_), &st) != 0) {
+        zap_sys_fail("fs.size", strerror(errno));
+    }
+    return (int64_t)st.st_size;
+}
+
+/* fs.mkdtemp() -> str: create a unique temp directory (under $TMPDIR or /tmp)
+ * and return its path. Powers hermetic temp-dir workflows (and the goldens). */
+void *zap_fs_mkdtemp(void) {
+    const char *tmp = getenv("TMPDIR");
+    if (tmp == NULL || *tmp == '\0') {
+        tmp = "/tmp";
+    }
+    char tmpl[4096];
+    snprintf(tmpl, sizeof tmpl, "%s/zapXXXXXX", tmp);
+    if (mkdtemp(tmpl) == NULL) {
+        zap_sys_fail("fs.mkdtemp", strerror(errno));
+    }
+    return zap_str_new(tmpl, (int64_t)strlen(tmpl));
+}
+
+/* --- process: subprocess spawn + capture ------------------------------------ */
+
+/* The result of process.run: exit code + captured stdout/stderr. A precise GC
+ * object (two trailing pointer fields) so the two ZapStr captures stay live;
+ * the lowerer reads the three fields back into a (int64, str, str) tuple. */
+typedef struct {
+    int64_t code;
+    ZapStr *out;
+    ZapStr *err;
+} ZapProc;
+
+static const int32_t zap_off_proc[] = {
+    (int32_t)offsetof(ZapProc, out),
+    (int32_t)offsetof(ZapProc, err),
+};
+static const ZapTypeDesc zap_desc_proc = {(int64_t)sizeof(ZapProc), ZAP_TD_PRECISE,
+                                          2, zap_off_proc};
+
+/* process.run(argv: list[str]) -> ZapProc*: spawn argv[0] (PATH-searched) with
+ * the given arguments, capturing stdout/stderr into temp files (so there is no
+ * pipe-buffer deadlock), and wait. The exit code is the child's status, or
+ * 128+signo if it was killed by a signal. Raises on spawn failure. */
+void *zap_process_run(void *argv_list) {
+    int64_t n = zap_list_len(argv_list);
+    if (n < 1) {
+        zap_sys_fail("process.run", "empty argument list");
+    }
+    char **cargv = (char **)malloc(sizeof(char *) * (size_t)(n + 1));
+    if (cargv == NULL) {
+        zap_sys_fail("process.run", "out of memory");
+    }
+    for (int64_t i = 0; i < n; i++) {
+        cargv[i] = zap_sys_cstr((ZapStr *)zap_list_get_ptr(argv_list, i));
+    }
+    cargv[n] = NULL;
+
+    const char *tmp = getenv("TMPDIR");
+    if (tmp == NULL || *tmp == '\0') {
+        tmp = "/tmp";
+    }
+    char otmpl[4096], etmpl[4096];
+    snprintf(otmpl, sizeof otmpl, "%s/zapout_XXXXXX", tmp);
+    snprintf(etmpl, sizeof etmpl, "%s/zaperr_XXXXXX", tmp);
+    int ofd = mkstemp(otmpl);
+    if (ofd < 0) {
+        free(cargv);
+        zap_sys_fail("process.run", strerror(errno));
+    }
+    int efd = mkstemp(etmpl);
+    if (efd < 0) {
+        int e = errno;
+        close(ofd);
+        unlink(otmpl);
+        free(cargv);
+        zap_sys_fail("process.run", strerror(e));
+    }
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, ofd, 1);
+    posix_spawn_file_actions_adddup2(&fa, efd, 2);
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, cargv[0], &fa, NULL, cargv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    free(cargv);
+    if (rc != 0) {
+        close(ofd);
+        close(efd);
+        unlink(otmpl);
+        unlink(etmpl);
+        zap_sys_fail("process.run", strerror(rc));
+    }
+
+    int status = 0;
+    pid_t w;
+    zap_enter_blocking(); /* GC-safe: no un-flushed Zap temporaries across wait */
+    do {
+        w = waitpid(pid, &status, 0);
+    } while (w < 0 && errno == EINTR);
+    zap_leave_blocking();
+
+    int64_t code;
+    if (w < 0) {
+        code = -1;
+    } else if (WIFEXITED(status)) {
+        code = (int64_t)WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        code = 128 + (int64_t)WTERMSIG(status);
+    } else {
+        code = -1;
+    }
+
+    ZapProc *r = (ZapProc *)zap_obj(&zap_desc_proc);
+    r->code = code;
+    r->out = NULL;
+    r->err = NULL;
+    r->out = (ZapStr *)zap_read_all_fd(ofd);
+    r->err = (ZapStr *)zap_read_all_fd(efd);
+    close(ofd);
+    close(efd);
+    unlink(otmpl);
+    unlink(etmpl);
+    return r;
+}
+
+/* Field getters the lowerer calls to unpack the result into a tuple. */
+int64_t zap_process_result_code(void *r) { return ((ZapProc *)r)->code; }
+void *zap_process_result_stdout(void *r) { return ((ZapProc *)r)->out; }
+void *zap_process_result_stderr(void *r) { return ((ZapProc *)r)->err; }
+
+/* ===========================================================================
  * crypto module (ticket #105, D-0056): hashing, HMAC, secure random / secrets.
  * TLS is deferred (late-v1). Self-contained reference implementations of the
  * hashes (FIPS 180-4 SHA-256/SHA-512, FIPS 180-1 SHA-1, RFC 1321 MD5) so no new
@@ -5076,7 +5617,6 @@ int64_t zap_datetime_parse_iso(void *s) {
  * pointer-offset arrays. Codegen emits the descriptors for *user* structs and
  * closures; these cover the built-in runtime objects. See design/0008-precise-gc.
  * ========================================================================== */
-#include <stddef.h> /* offsetof */
 
 static const int32_t zap_off_strobj[] = {(int32_t)offsetof(ZapStr, data)};
 static const int32_t zap_off_gobj[] = {

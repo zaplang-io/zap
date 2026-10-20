@@ -19,11 +19,17 @@ use crate::ir::*;
 
 mod crypto;
 mod datetime;
+mod fs;
 mod gc;
+mod io;
 mod math;
+mod os;
+mod process;
 mod random;
 mod runtime;
 mod signal;
+mod support;
+mod sys;
 mod time;
 
 /// A module's per-method lowering hook: lower `method(args)` to ZIR, emitting the
@@ -48,6 +54,11 @@ pub(super) const MODULES: &[ModuleLower] = &[
     signal::MODULE,
     gc::MODULE,
     runtime::MODULE,
+    os::MODULE,
+    sys::MODULE,
+    io::MODULE,
+    fs::MODULE,
+    process::MODULE,
     crypto::MODULE,
     math::MODULE,
     random::MODULE,

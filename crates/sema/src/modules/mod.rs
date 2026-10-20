@@ -19,11 +19,16 @@ use crate::{Checker, Ty};
 
 mod crypto;
 mod datetime;
+mod fs;
 mod gc;
+mod io;
 mod math;
+mod os;
+mod process;
 mod random;
 mod runtime;
 mod signal;
+mod sys;
 mod time;
 
 /// A built-in module's type-checking facet.
@@ -44,6 +49,11 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     signal::MODULE,
     gc::MODULE,
     runtime::MODULE,
+    os::MODULE,
+    sys::MODULE,
+    io::MODULE,
+    fs::MODULE,
+    process::MODULE,
     crypto::MODULE,
     math::MODULE,
     random::MODULE,
