@@ -2466,6 +2466,15 @@ impl Checker {
                             }
                         }
                     }
+                    // Built-in module constant `math.pi`-style access (ticket
+                    // #98, D-0056/D-0058): recognized only when the name is not
+                    // shadowed by a local value, and intercepted before the base
+                    // is resolved as a value (module names are not bindings).
+                    if self.lookup(tyname).is_none() {
+                        if let Some(ty) = modules::check_builtin_module_const(tyname, name) {
+                            return ty;
+                        }
+                    }
                 }
                 let b = self.infer(base);
                 // `.name` on an enum value yields its member name (D-0018).
@@ -3790,6 +3799,68 @@ mod tests {
     fn unknown_module_function_is_an_error() {
         let e = errors("def main():\n    gc.frobnicate()\n");
         assert!(!e.is_empty(), "expected unknown gc.* function to error");
+    }
+
+    #[test]
+    fn math_module_functions_and_constants_type_check() {
+        // Constants are attributes (`math.pi`); functions widen their args to
+        // float64 (ticket #98). `import math` is accepted but not required.
+        ok("import math\n\n\
+            def main():\n\
+            \x20   float64 a = math.sqrt(2.0)\n\
+            \x20   float64 b = math.pow(2.0, 10.0)\n\
+            \x20   float64 c = math.sin(math.pi)\n\
+            \x20   float64 d = math.hypot(3.0, 4.0)\n\
+            \x20   float64 e = math.log(math.e)\n\
+            \x20   bool f = math.isnan(math.nan)\n\
+            \x20   bool g = math.isinf(math.inf)\n\
+            \x20   float64 h = math.floor(math.tau)\n\
+            \x20   print(a + b + c + d + e + h)\n\
+            \x20   print(f)\n\
+            \x20   print(g)\n");
+    }
+
+    #[test]
+    fn math_accepts_int_arguments() {
+        // Integer arguments widen to float64 (ticket #98).
+        ok("def main():\n    float64 r = math.sqrt(4)\n    print(r)\n");
+    }
+
+    #[test]
+    fn unknown_math_function_and_constant_are_errors() {
+        assert!(
+            !errors("def main():\n    auto x = math.frobnicate(1.0)\n").is_empty(),
+            "expected unknown math.* function to error"
+        );
+        // `math.quux` is not a known constant, so the base resolves as a value
+        // and fails (no `math` binding).
+        assert!(
+            !errors("def main():\n    auto x = math.quux\n").is_empty(),
+            "expected unknown math constant to error"
+        );
+    }
+
+    #[test]
+    fn random_module_surface_type_checks() {
+        // `choice` yields the list element type; `shuffle` returns unit
+        // (ticket #98).
+        ok("import random\n\n\
+            def main():\n\
+            \x20   random.seed(42)\n\
+            \x20   float64 a = random.random()\n\
+            \x20   float64 b = random.uniform(1.0, 2.0)\n\
+            \x20   int64 c = random.randint(1, 6)\n\
+            \x20   auto xs = [10, 20, 30]\n\
+            \x20   int64 pick = random.choice(xs)\n\
+            \x20   random.shuffle(xs)\n\
+            \x20   print(a + b)\n\
+            \x20   print(c + pick)\n");
+    }
+
+    #[test]
+    fn random_choice_requires_a_list() {
+        let e = errors("def main():\n    auto x = random.choice(5)\n");
+        assert!(!e.is_empty(), "expected random.choice(non-list) to error");
     }
 
     #[test]

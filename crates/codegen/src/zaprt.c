@@ -4725,6 +4725,893 @@ void *zap_process_result_stdout(void *r) { return ((ZapProc *)r)->out; }
 void *zap_process_result_stderr(void *r) { return ((ZapProc *)r)->err; }
 
 /* ===========================================================================
+ * crypto module (ticket #105, D-0056): hashing, HMAC, secure random / secrets.
+ * TLS is deferred (late-v1). Self-contained reference implementations of the
+ * hashes (FIPS 180-4 SHA-256/SHA-512, FIPS 180-1 SHA-1, RFC 1321 MD5) so no new
+ * external dependency is pulled in; HMAC is RFC 2104; the CSPRNG draws from the
+ * OS entropy source (getentropy, falling back to /dev/urandom).
+ *
+ * str/bytes cross as ZapStr* (len-prefixed, binary-safe). Hex digests and raw
+ * digests are returned as freshly built ZapStr objects (zap_str_new / a hex
+ * helper). A streaming handle is a `bytes` value whose ZapStr `data` buffer
+ * holds the hash context; hexdigest/digest finalize a COPY, so a handle may be
+ * digested more than once and keeps accepting updates afterwards.
+ * ========================================================================== */
+#include <fcntl.h>      /* open, O_RDONLY (CSPRNG fallback) */
+#include <sys/random.h> /* getentropy */
+
+#define ZAP_CRY_SHA256 0
+#define ZAP_CRY_SHA512 1
+#define ZAP_CRY_SHA1 2
+#define ZAP_CRY_MD5 3
+
+#define ZAP_ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define ZAP_ROL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+#define ZAP_ROR64(x, n) (((x) >> (n)) | ((x) << (64 - (n))))
+
+/* ---- SHA-256 (FIPS 180-4) ---- */
+typedef struct {
+    uint32_t h[8];
+    uint64_t len; /* total message bytes */
+    uint8_t buf[64];
+    size_t n; /* bytes buffered */
+} zap_sha256;
+
+static const uint32_t ZAP_SHA256_K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+
+static void zap_sha256_block(zap_sha256 *c, const uint8_t *p) {
+    uint32_t w[64], a, b, cc, d, e, f, g, h, t1, t2;
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+               ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+    }
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ZAP_ROR32(w[i - 15], 7) ^ ZAP_ROR32(w[i - 15], 18) ^
+                      (w[i - 15] >> 3);
+        uint32_t s1 =
+            ZAP_ROR32(w[i - 2], 17) ^ ZAP_ROR32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = c->h[0];
+    b = c->h[1];
+    cc = c->h[2];
+    d = c->h[3];
+    e = c->h[4];
+    f = c->h[5];
+    g = c->h[6];
+    h = c->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = ZAP_ROR32(e, 6) ^ ZAP_ROR32(e, 11) ^ ZAP_ROR32(e, 25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        t1 = h + S1 + ch + ZAP_SHA256_K[i] + w[i];
+        uint32_t S0 = ZAP_ROR32(a, 2) ^ ZAP_ROR32(a, 13) ^ ZAP_ROR32(a, 22);
+        uint32_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+        t2 = S0 + maj;
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = cc;
+        cc = b;
+        b = a;
+        a = t1 + t2;
+    }
+    c->h[0] += a;
+    c->h[1] += b;
+    c->h[2] += cc;
+    c->h[3] += d;
+    c->h[4] += e;
+    c->h[5] += f;
+    c->h[6] += g;
+    c->h[7] += h;
+}
+
+static void zap_sha256_init(zap_sha256 *c) {
+    c->h[0] = 0x6a09e667;
+    c->h[1] = 0xbb67ae85;
+    c->h[2] = 0x3c6ef372;
+    c->h[3] = 0xa54ff53a;
+    c->h[4] = 0x510e527f;
+    c->h[5] = 0x9b05688c;
+    c->h[6] = 0x1f83d9ab;
+    c->h[7] = 0x5be0cd19;
+    c->len = 0;
+    c->n = 0;
+}
+
+static void zap_sha256_update(zap_sha256 *c, const uint8_t *d, size_t n) {
+    c->len += n;
+    for (size_t i = 0; i < n; i++) {
+        c->buf[c->n++] = d[i];
+        if (c->n == 64) {
+            zap_sha256_block(c, c->buf);
+            c->n = 0;
+        }
+    }
+}
+
+static void zap_sha256_final(zap_sha256 *c, uint8_t *out) {
+    uint64_t bits = c->len * 8;
+    size_t i = c->n;
+    c->buf[i++] = 0x80;
+    if (i > 56) {
+        while (i < 64)
+            c->buf[i++] = 0;
+        zap_sha256_block(c, c->buf);
+        i = 0;
+    }
+    while (i < 56)
+        c->buf[i++] = 0;
+    for (int j = 7; j >= 0; j--)
+        c->buf[i++] = (uint8_t)(bits >> (j * 8));
+    zap_sha256_block(c, c->buf);
+    for (int k = 0; k < 8; k++) {
+        out[k * 4] = (uint8_t)(c->h[k] >> 24);
+        out[k * 4 + 1] = (uint8_t)(c->h[k] >> 16);
+        out[k * 4 + 2] = (uint8_t)(c->h[k] >> 8);
+        out[k * 4 + 3] = (uint8_t)c->h[k];
+    }
+}
+
+/* ---- SHA-512 (FIPS 180-4) ---- */
+typedef struct {
+    uint64_t h[8];
+    uint64_t len; /* total message bytes (< 2^61, so a 64-bit bit count fits) */
+    uint8_t buf[128];
+    size_t n;
+} zap_sha512;
+
+static const uint64_t ZAP_SHA512_K[80] = {
+    0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL,
+    0xe9b5dba58189dbbcULL, 0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
+    0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL, 0xd807aa98a3030242ULL,
+    0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+    0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL,
+    0xc19bf174cf692694ULL, 0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL,
+    0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL, 0x2de92c6f592b0275ULL,
+    0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL,
+    0xbf597fc7beef0ee4ULL, 0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL,
+    0x06ca6351e003826fULL, 0x142929670a0e6e70ULL, 0x27b70a8546d22ffcULL,
+    0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+    0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL,
+    0x92722c851482353bULL, 0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL,
+    0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL, 0xd192e819d6ef5218ULL,
+    0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL,
+    0x34b0bcb5e19b48a8ULL, 0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL,
+    0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL, 0x748f82ee5defb2fcULL,
+    0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+    0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL,
+    0xc67178f2e372532bULL, 0xca273eceea26619cULL, 0xd186b8c721c0c207ULL,
+    0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL, 0x06f067aa72176fbaULL,
+    0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL,
+    0x431d67c49c100d4cULL, 0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
+    0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL};
+
+static void zap_sha512_block(zap_sha512 *c, const uint8_t *p) {
+    uint64_t w[80], a, b, cc, d, e, f, g, h, t1, t2;
+    for (int i = 0; i < 16; i++) {
+        w[i] = 0;
+        for (int j = 0; j < 8; j++)
+            w[i] = (w[i] << 8) | (uint64_t)p[i * 8 + j];
+    }
+    for (int i = 16; i < 80; i++) {
+        uint64_t s0 = ZAP_ROR64(w[i - 15], 1) ^ ZAP_ROR64(w[i - 15], 8) ^
+                      (w[i - 15] >> 7);
+        uint64_t s1 =
+            ZAP_ROR64(w[i - 2], 19) ^ ZAP_ROR64(w[i - 2], 61) ^ (w[i - 2] >> 6);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    a = c->h[0];
+    b = c->h[1];
+    cc = c->h[2];
+    d = c->h[3];
+    e = c->h[4];
+    f = c->h[5];
+    g = c->h[6];
+    h = c->h[7];
+    for (int i = 0; i < 80; i++) {
+        uint64_t S1 = ZAP_ROR64(e, 14) ^ ZAP_ROR64(e, 18) ^ ZAP_ROR64(e, 41);
+        uint64_t ch = (e & f) ^ (~e & g);
+        t1 = h + S1 + ch + ZAP_SHA512_K[i] + w[i];
+        uint64_t S0 = ZAP_ROR64(a, 28) ^ ZAP_ROR64(a, 34) ^ ZAP_ROR64(a, 39);
+        uint64_t maj = (a & b) ^ (a & cc) ^ (b & cc);
+        t2 = S0 + maj;
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = cc;
+        cc = b;
+        b = a;
+        a = t1 + t2;
+    }
+    c->h[0] += a;
+    c->h[1] += b;
+    c->h[2] += cc;
+    c->h[3] += d;
+    c->h[4] += e;
+    c->h[5] += f;
+    c->h[6] += g;
+    c->h[7] += h;
+}
+
+static void zap_sha512_init(zap_sha512 *c) {
+    c->h[0] = 0x6a09e667f3bcc908ULL;
+    c->h[1] = 0xbb67ae8584caa73bULL;
+    c->h[2] = 0x3c6ef372fe94f82bULL;
+    c->h[3] = 0xa54ff53a5f1d36f1ULL;
+    c->h[4] = 0x510e527fade682d1ULL;
+    c->h[5] = 0x9b05688c2b3e6c1fULL;
+    c->h[6] = 0x1f83d9abfb41bd6bULL;
+    c->h[7] = 0x5be0cd19137e2179ULL;
+    c->len = 0;
+    c->n = 0;
+}
+
+static void zap_sha512_update(zap_sha512 *c, const uint8_t *d, size_t n) {
+    c->len += n;
+    for (size_t i = 0; i < n; i++) {
+        c->buf[c->n++] = d[i];
+        if (c->n == 128) {
+            zap_sha512_block(c, c->buf);
+            c->n = 0;
+        }
+    }
+}
+
+static void zap_sha512_final(zap_sha512 *c, uint8_t *out) {
+    uint64_t bits = c->len * 8;
+    size_t i = c->n;
+    c->buf[i++] = 0x80;
+    if (i > 112) {
+        while (i < 128)
+            c->buf[i++] = 0;
+        zap_sha512_block(c, c->buf);
+        i = 0;
+    }
+    while (i < 120)
+        c->buf[i++] = 0; /* high 64 bits of the 128-bit length are zero */
+    for (int j = 7; j >= 0; j--)
+        c->buf[i++] = (uint8_t)(bits >> (j * 8));
+    zap_sha512_block(c, c->buf);
+    for (int k = 0; k < 8; k++) {
+        for (int j = 0; j < 8; j++)
+            out[k * 8 + j] = (uint8_t)(c->h[k] >> ((7 - j) * 8));
+    }
+}
+
+/* ---- SHA-1 (FIPS 180-1) ---- */
+typedef struct {
+    uint32_t h[5];
+    uint64_t len;
+    uint8_t buf[64];
+    size_t n;
+} zap_sha1;
+
+static void zap_sha1_block(zap_sha1 *c, const uint8_t *p) {
+    uint32_t w[80], a, b, cc, d, e, t;
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+               ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+    }
+    for (int i = 16; i < 80; i++) {
+        uint32_t v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+        w[i] = ZAP_ROL32(v, 1);
+    }
+    a = c->h[0];
+    b = c->h[1];
+    cc = c->h[2];
+    d = c->h[3];
+    e = c->h[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20) {
+            f = (b & cc) | (~b & d);
+            k = 0x5a827999;
+        } else if (i < 40) {
+            f = b ^ cc ^ d;
+            k = 0x6ed9eba1;
+        } else if (i < 60) {
+            f = (b & cc) | (b & d) | (cc & d);
+            k = 0x8f1bbcdc;
+        } else {
+            f = b ^ cc ^ d;
+            k = 0xca62c1d6;
+        }
+        t = ZAP_ROL32(a, 5) + f + e + k + w[i];
+        e = d;
+        d = cc;
+        cc = ZAP_ROL32(b, 30);
+        b = a;
+        a = t;
+    }
+    c->h[0] += a;
+    c->h[1] += b;
+    c->h[2] += cc;
+    c->h[3] += d;
+    c->h[4] += e;
+}
+
+static void zap_sha1_init(zap_sha1 *c) {
+    c->h[0] = 0x67452301;
+    c->h[1] = 0xefcdab89;
+    c->h[2] = 0x98badcfe;
+    c->h[3] = 0x10325476;
+    c->h[4] = 0xc3d2e1f0;
+    c->len = 0;
+    c->n = 0;
+}
+
+static void zap_sha1_update(zap_sha1 *c, const uint8_t *d, size_t n) {
+    c->len += n;
+    for (size_t i = 0; i < n; i++) {
+        c->buf[c->n++] = d[i];
+        if (c->n == 64) {
+            zap_sha1_block(c, c->buf);
+            c->n = 0;
+        }
+    }
+}
+
+static void zap_sha1_final(zap_sha1 *c, uint8_t *out) {
+    uint64_t bits = c->len * 8;
+    size_t i = c->n;
+    c->buf[i++] = 0x80;
+    if (i > 56) {
+        while (i < 64)
+            c->buf[i++] = 0;
+        zap_sha1_block(c, c->buf);
+        i = 0;
+    }
+    while (i < 56)
+        c->buf[i++] = 0;
+    for (int j = 7; j >= 0; j--)
+        c->buf[i++] = (uint8_t)(bits >> (j * 8));
+    zap_sha1_block(c, c->buf);
+    for (int k = 0; k < 5; k++) {
+        out[k * 4] = (uint8_t)(c->h[k] >> 24);
+        out[k * 4 + 1] = (uint8_t)(c->h[k] >> 16);
+        out[k * 4 + 2] = (uint8_t)(c->h[k] >> 8);
+        out[k * 4 + 3] = (uint8_t)c->h[k];
+    }
+}
+
+/* ---- MD5 (RFC 1321) — little-endian ---- */
+typedef struct {
+    uint32_t h[4];
+    uint64_t len;
+    uint8_t buf[64];
+    size_t n;
+} zap_md5;
+
+static void zap_md5_block(zap_md5 *ctx, const uint8_t *p) {
+    static const uint32_t K[64] = {
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a,
+        0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340,
+        0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8,
+        0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92,
+        0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391};
+    static const uint8_t S[64] = {
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20, 5, 9,  14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
+    uint32_t m[16];
+    for (int i = 0; i < 16; i++) {
+        m[i] = (uint32_t)p[i * 4] | ((uint32_t)p[i * 4 + 1] << 8) |
+               ((uint32_t)p[i * 4 + 2] << 16) | ((uint32_t)p[i * 4 + 3] << 24);
+    }
+    uint32_t a = ctx->h[0], b = ctx->h[1], c = ctx->h[2], d = ctx->h[3];
+    for (int i = 0; i < 64; i++) {
+        uint32_t f, g;
+        if (i < 16) {
+            f = (b & c) | (~b & d);
+            g = (uint32_t)i;
+        } else if (i < 32) {
+            f = (d & b) | (~d & c);
+            g = (uint32_t)(5 * i + 1) & 15;
+        } else if (i < 48) {
+            f = b ^ c ^ d;
+            g = (uint32_t)(3 * i + 5) & 15;
+        } else {
+            f = c ^ (b | ~d);
+            g = (uint32_t)(7 * i) & 15;
+        }
+        uint32_t tmp = d;
+        d = c;
+        c = b;
+        uint32_t x = a + f + K[i] + m[g];
+        b = b + ZAP_ROL32(x, S[i]);
+        a = tmp;
+    }
+    ctx->h[0] += a;
+    ctx->h[1] += b;
+    ctx->h[2] += c;
+    ctx->h[3] += d;
+}
+
+static void zap_md5_init(zap_md5 *c) {
+    c->h[0] = 0x67452301;
+    c->h[1] = 0xefcdab89;
+    c->h[2] = 0x98badcfe;
+    c->h[3] = 0x10325476;
+    c->len = 0;
+    c->n = 0;
+}
+
+static void zap_md5_update(zap_md5 *c, const uint8_t *d, size_t n) {
+    c->len += n;
+    for (size_t i = 0; i < n; i++) {
+        c->buf[c->n++] = d[i];
+        if (c->n == 64) {
+            zap_md5_block(c, c->buf);
+            c->n = 0;
+        }
+    }
+}
+
+static void zap_md5_final(zap_md5 *c, uint8_t *out) {
+    uint64_t bits = c->len * 8;
+    size_t i = c->n;
+    c->buf[i++] = 0x80;
+    if (i > 56) {
+        while (i < 64)
+            c->buf[i++] = 0;
+        zap_md5_block(c, c->buf);
+        i = 0;
+    }
+    while (i < 56)
+        c->buf[i++] = 0;
+    for (int j = 0; j < 8; j++)
+        c->buf[i++] = (uint8_t)(bits >> (j * 8)); /* little-endian length */
+    zap_md5_block(c, c->buf);
+    for (int k = 0; k < 4; k++) {
+        out[k * 4] = (uint8_t)c->h[k];
+        out[k * 4 + 1] = (uint8_t)(c->h[k] >> 8);
+        out[k * 4 + 2] = (uint8_t)(c->h[k] >> 16);
+        out[k * 4 + 3] = (uint8_t)(c->h[k] >> 24);
+    }
+}
+
+/* ---- Unified, algorithm-tagged hash context ---- */
+typedef struct {
+    int32_t algo;
+    union {
+        zap_sha256 s256;
+        zap_sha512 s512;
+        zap_sha1 s1;
+        zap_md5 m5;
+    } u;
+} zap_hash_ctx;
+
+static size_t zap_crypto_digest_len(int algo) {
+    switch (algo) {
+    case ZAP_CRY_SHA256:
+        return 32;
+    case ZAP_CRY_SHA512:
+        return 64;
+    case ZAP_CRY_SHA1:
+        return 20;
+    case ZAP_CRY_MD5:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+static size_t zap_crypto_block_len(int algo) {
+    return algo == ZAP_CRY_SHA512 ? 128 : 64;
+}
+
+static void zap_hash_ctx_init(zap_hash_ctx *c, int algo) {
+    c->algo = algo;
+    switch (algo) {
+    case ZAP_CRY_SHA256:
+        zap_sha256_init(&c->u.s256);
+        break;
+    case ZAP_CRY_SHA512:
+        zap_sha512_init(&c->u.s512);
+        break;
+    case ZAP_CRY_SHA1:
+        zap_sha1_init(&c->u.s1);
+        break;
+    default:
+        zap_md5_init(&c->u.m5);
+        break;
+    }
+}
+
+static void zap_hash_ctx_update(zap_hash_ctx *c, const uint8_t *d, size_t n) {
+    switch (c->algo) {
+    case ZAP_CRY_SHA256:
+        zap_sha256_update(&c->u.s256, d, n);
+        break;
+    case ZAP_CRY_SHA512:
+        zap_sha512_update(&c->u.s512, d, n);
+        break;
+    case ZAP_CRY_SHA1:
+        zap_sha1_update(&c->u.s1, d, n);
+        break;
+    default:
+        zap_md5_update(&c->u.m5, d, n);
+        break;
+    }
+}
+
+/* Finalize a COPY so the caller's context stays usable (non-destructive). */
+static void zap_hash_ctx_final(const zap_hash_ctx *c, uint8_t *out) {
+    zap_hash_ctx t = *c;
+    switch (t.algo) {
+    case ZAP_CRY_SHA256:
+        zap_sha256_final(&t.u.s256, out);
+        break;
+    case ZAP_CRY_SHA512:
+        zap_sha512_final(&t.u.s512, out);
+        break;
+    case ZAP_CRY_SHA1:
+        zap_sha1_final(&t.u.s1, out);
+        break;
+    default:
+        zap_md5_final(&t.u.m5, out);
+        break;
+    }
+}
+
+/* Build a lowercase-hex ZapStr from `n` raw bytes. */
+static void *zap_crypto_hex_str(const uint8_t *d, size_t n) {
+    static const char HEX[] = "0123456789abcdef";
+    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
+    int64_t outlen = (int64_t)(n * 2);
+    char *buf = (char *)zap_buf(outlen > 0 ? outlen : 1);
+    for (size_t i = 0; i < n; i++) {
+        buf[2 * i] = HEX[d[i] >> 4];
+        buf[2 * i + 1] = HEX[d[i] & 0x0f];
+    }
+    s->len = outlen;
+    s->data = buf;
+    return s;
+}
+
+/* The hash context behind a streaming handle (a `bytes` ZapStr whose data
+ * buffer is the context). */
+static zap_hash_ctx *zap_crypto_handle_ctx(void *h) {
+    return (zap_hash_ctx *)(uintptr_t)((ZapStr *)h)->data;
+}
+
+static void *zap_crypto_oneshot_hex(int algo, void *data) {
+    ZapStr *d = (ZapStr *)data;
+    zap_hash_ctx c;
+    zap_hash_ctx_init(&c, algo);
+    zap_hash_ctx_update(&c, (const uint8_t *)d->data, (size_t)d->len);
+    uint8_t out[64];
+    zap_hash_ctx_final(&c, out);
+    return zap_crypto_hex_str(out, zap_crypto_digest_len(algo));
+}
+
+/* One-shot hex digests over a str/bytes value. */
+void *zap_crypto_sha256(void *data) {
+    return zap_crypto_oneshot_hex(ZAP_CRY_SHA256, data);
+}
+void *zap_crypto_sha512(void *data) {
+    return zap_crypto_oneshot_hex(ZAP_CRY_SHA512, data);
+}
+void *zap_crypto_sha1(void *data) {
+    return zap_crypto_oneshot_hex(ZAP_CRY_SHA1, data);
+}
+void *zap_crypto_md5(void *data) {
+    return zap_crypto_oneshot_hex(ZAP_CRY_MD5, data);
+}
+
+/* Streaming: a `bytes` handle wrapping a heap-allocated, pointer-free context. */
+void *zap_crypto_new(int64_t algo) {
+    ZapStr *h = (ZapStr *)zap_obj(&zap_desc_strobj);
+    zap_hash_ctx *c = (zap_hash_ctx *)zap_buf((int64_t)sizeof(zap_hash_ctx));
+    zap_hash_ctx_init(c, (int)algo);
+    h->len = (int64_t)sizeof(zap_hash_ctx);
+    h->data = (const char *)c;
+    return h;
+}
+
+void zap_crypto_update(void *handle, void *data) {
+    zap_hash_ctx *c = zap_crypto_handle_ctx(handle);
+    ZapStr *d = (ZapStr *)data;
+    zap_hash_ctx_update(c, (const uint8_t *)d->data, (size_t)d->len);
+}
+
+void *zap_crypto_hexdigest(void *handle) {
+    zap_hash_ctx *c = zap_crypto_handle_ctx(handle);
+    uint8_t out[64];
+    zap_hash_ctx_final(c, out);
+    return zap_crypto_hex_str(out, zap_crypto_digest_len(c->algo));
+}
+
+void *zap_crypto_digest(void *handle) {
+    zap_hash_ctx *c = zap_crypto_handle_ctx(handle);
+    uint8_t out[64];
+    size_t n = zap_crypto_digest_len(c->algo);
+    zap_hash_ctx_final(c, out);
+    return zap_str_new((const char *)out, (int64_t)n);
+}
+
+/* ---- HMAC (RFC 2104) ---- */
+static void zap_crypto_hmac(int algo, const uint8_t *key, size_t keylen,
+                            const uint8_t *msg, size_t msglen, uint8_t *out) {
+    size_t blk = zap_crypto_block_len(algo);
+    size_t dlen = zap_crypto_digest_len(algo);
+    uint8_t k[128];
+    memset(k, 0, sizeof(k));
+    if (keylen > blk) {
+        zap_hash_ctx c;
+        zap_hash_ctx_init(&c, algo);
+        zap_hash_ctx_update(&c, key, keylen);
+        zap_hash_ctx_final(&c, k);
+    } else {
+        memcpy(k, key, keylen);
+    }
+    uint8_t ipad[128], opad[128];
+    for (size_t i = 0; i < blk; i++) {
+        ipad[i] = (uint8_t)(k[i] ^ 0x36);
+        opad[i] = (uint8_t)(k[i] ^ 0x5c);
+    }
+    uint8_t inner[64];
+    zap_hash_ctx c;
+    zap_hash_ctx_init(&c, algo);
+    zap_hash_ctx_update(&c, ipad, blk);
+    zap_hash_ctx_update(&c, msg, msglen);
+    zap_hash_ctx_final(&c, inner);
+    zap_hash_ctx_init(&c, algo);
+    zap_hash_ctx_update(&c, opad, blk);
+    zap_hash_ctx_update(&c, inner, dlen);
+    zap_hash_ctx_final(&c, out);
+}
+
+static void *zap_crypto_hmac_hex(int algo, void *key, void *msg) {
+    ZapStr *k = (ZapStr *)key;
+    ZapStr *m = (ZapStr *)msg;
+    uint8_t out[64];
+    zap_crypto_hmac(algo, (const uint8_t *)k->data, (size_t)k->len,
+                    (const uint8_t *)m->data, (size_t)m->len, out);
+    return zap_crypto_hex_str(out, zap_crypto_digest_len(algo));
+}
+
+void *zap_crypto_hmac_sha256(void *key, void *msg) {
+    return zap_crypto_hmac_hex(ZAP_CRY_SHA256, key, msg);
+}
+void *zap_crypto_hmac_sha512(void *key, void *msg) {
+    return zap_crypto_hmac_hex(ZAP_CRY_SHA512, key, msg);
+}
+
+/* ---- Secure random / secrets ---- */
+static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        size_t chunk = n - off;
+        if (chunk > 256)
+            chunk = 256; /* getentropy's per-call limit */
+        if (getentropy(buf + off, chunk) == 0) {
+            off += chunk;
+            continue;
+        }
+        /* Fallback: read the kernel CSPRNG directly. */
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "zap: crypto: no CSPRNG available\n");
+            abort();
+        }
+        while (off < n) {
+            ssize_t r = read(fd, buf + off, n - off);
+            if (r <= 0) {
+                fprintf(stderr, "zap: crypto: CSPRNG read failed\n");
+                abort();
+            }
+            off += (size_t)r;
+        }
+        close(fd);
+        return;
+    }
+}
+
+void *zap_crypto_random_bytes(int64_t n) {
+    if (n < 0)
+        n = 0;
+    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
+    uint8_t *buf = (uint8_t *)zap_buf(n > 0 ? n : 1);
+    if (n > 0)
+        zap_crypto_fill_random(buf, (size_t)n);
+    s->len = n;
+    s->data = (const char *)buf;
+    return s;
+}
+
+void *zap_crypto_token_hex(int64_t n) {
+    if (n < 0)
+        n = 0;
+    uint8_t *rnd = (uint8_t *)zap_buf(n > 0 ? n : 1);
+    if (n > 0)
+        zap_crypto_fill_random(rnd, (size_t)n);
+    return zap_crypto_hex_str(rnd, (size_t)n);
+}
+
+/* ===========================================================================
+ * time & datetime (ticket #99, D-0056). Clocks, sleep, duration-unit helpers,
+ * and civil-time conversion. Durations are plain int64 nanoseconds (Go
+ * time.Duration style), so arithmetic needs no runtime support; the helpers
+ * here just convert between a unit and nanoseconds. Civil time uses the C
+ * library's gmtime_r/localtime_r/timegm, so timezone support is UTC + local
+ * only (a full tz database is a follow-up, see #99). <time.h>/<unistd.h>/
+ * <errno.h> are included near the top of this file.
+ * =========================================================================== */
+
+/* --- clocks --- */
+int64_t zap_time_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+double zap_time_monotonic_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+int64_t zap_time_wall_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+}
+double zap_time_wall_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* --- sleep ---
+ * v1 is a plain blocking nanosleep (EINTR-resuming): it blocks the current OS
+ * thread, so under the M:N scheduler it parks that M rather than yielding
+ * cooperatively. A scheduler-aware sleep (via the netpoller timer) is a
+ * follow-up (#99). */
+void zap_time_sleep_ns(int64_t ns) {
+    if (ns <= 0) {
+        return;
+    }
+    struct timespec req;
+    req.tv_sec = (time_t)(ns / 1000000000LL);
+    req.tv_nsec = (long)(ns % 1000000000LL);
+    struct timespec rem;
+    while (nanosleep(&req, &rem) != 0 && errno == EINTR) {
+        req = rem;
+    }
+}
+void zap_time_sleep_seconds(double s) {
+    if (s <= 0.0) {
+        return;
+    }
+    zap_time_sleep_ns((int64_t)(s * 1e9));
+}
+
+/* --- duration unit constructors (-> nanoseconds) --- */
+int64_t zap_time_seconds_to_ns(int64_t s) { return s * 1000000000LL; }
+int64_t zap_time_millis_to_ns(int64_t ms) { return ms * 1000000LL; }
+int64_t zap_time_micros_to_ns(int64_t us) { return us * 1000LL; }
+
+/* --- duration unit converters (nanoseconds -> unit as float) --- */
+double zap_time_ns_to_seconds(int64_t ns) { return (double)ns / 1e9; }
+double zap_time_ns_to_millis(int64_t ns) { return (double)ns / 1e6; }
+double zap_time_ns_to_micros(int64_t ns) { return (double)ns / 1e3; }
+
+/* --- civil (calendar) time ---
+ * `is_local` selects local time (localtime_r) over UTC (gmtime_r). */
+static void zap_civil(int64_t ts, int64_t is_local, struct tm *out) {
+    time_t t = (time_t)ts;
+    if (is_local) {
+        localtime_r(&t, out);
+    } else {
+        gmtime_r(&t, out);
+    }
+}
+int64_t zap_datetime_year(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_year + 1900;
+}
+int64_t zap_datetime_month(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_mon + 1;
+}
+int64_t zap_datetime_day(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_mday;
+}
+int64_t zap_datetime_hour(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_hour;
+}
+int64_t zap_datetime_minute(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_min;
+}
+int64_t zap_datetime_second(int64_t ts, int64_t is_local) {
+    struct tm tm;
+    zap_civil(ts, is_local, &tm);
+    return (int64_t)tm.tm_sec;
+}
+
+int64_t zap_datetime_now_unix(void) { return (int64_t)time(NULL); }
+
+/* Civil components (UTC) -> Unix timestamp. Uses timegm (glibc extension; the
+ * CI toolchain provides it) so the components are interpreted as UTC. */
+int64_t zap_datetime_to_unix(int64_t y, int64_t mo, int64_t d, int64_t h,
+                             int64_t mi, int64_t s) {
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = (int)(y - 1900);
+    tm.tm_mon = (int)(mo - 1);
+    tm.tm_mday = (int)d;
+    tm.tm_hour = (int)h;
+    tm.tm_min = (int)mi;
+    tm.tm_sec = (int)s;
+    return (int64_t)timegm(&tm);
+}
+
+/* Civil components -> ISO-8601 "YYYY-MM-DDTHH:MM:SS" (returns a fresh ZapStr*). */
+void *zap_datetime_format_iso(int64_t y, int64_t mo, int64_t d, int64_t h,
+                              int64_t mi, int64_t s) {
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld",
+                     (long long)y, (long long)mo, (long long)d, (long long)h,
+                     (long long)mi, (long long)s);
+    if (n < 0) {
+        n = 0;
+    }
+    return zap_str_new(buf, (int64_t)n);
+}
+
+/* ISO-8601 string -> Unix timestamp (UTC). Accepts a date ("YYYY-MM-DD") or a
+ * full date-time with a 'T' or ' ' separator; fields left unmatched default to
+ * the start of the day. v1 parsing is lenient (sscanf): malformed input yields
+ * a best-effort timestamp rather than an error (strict parsing is a follow-up,
+ * #99). */
+int64_t zap_datetime_parse_iso(void *s) {
+    ZapStr *z = (ZapStr *)s;
+    char buf[64];
+    int64_t n = z->len;
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > 63) {
+        n = 63;
+    }
+    memcpy(buf, z->data, (size_t)n);
+    buf[n] = '\0';
+    int y = 1970, mo = 1, d = 1, h = 0, mi = 0, sec = 0;
+    sscanf(buf, "%d-%d-%d%*c%d:%d:%d", &y, &mo, &d, &h, &mi, &sec);
+    return zap_datetime_to_unix(y, mo, d, h, mi, sec);
+}
+
+/* ===========================================================================
  * Type descriptors for the runtime's own heap types (ticket #48). Both GC
  * builds read `.size`; the precise Immix collector also reads `.kind` and the
  * pointer-offset arrays. Codegen emits the descriptors for *user* structs and
@@ -4786,3 +5673,175 @@ __attribute__((constructor)) static void zap_gc_register_statics(void) {
  * runtime type and the scheduler globals above. */
 #include "zapgc.inc.c"
 #endif
+
+/* ===========================================================================
+ * stdlib: math + random (ticket #98, D-0056)
+ * ---------------------------------------------------------------------------
+ * `math` — thin libm wrappers (unconditionally compiled for both collectors).
+ * `random` — a seedable xoshiro256** generator with SplitMix64 seed expansion,
+ * autoseeded from OS entropy (getentropy / arc4random) on first use. A single
+ * mutex guards the global state so concurrent goroutines never observe torn
+ * state; like CPython's module-level generator, the state itself is shared.
+ * ========================================================================== */
+
+/* --- math: libm wrappers --------------------------------------------------- */
+/* `math.pow` reuses `zap_powf` (declared with the scalar numeric helpers). */
+double zap_math_sqrt(double x) { return sqrt(x); }
+double zap_math_exp(double x) { return exp(x); }
+double zap_math_log(double x) { return log(x); }
+double zap_math_log2(double x) { return log2(x); }
+double zap_math_log10(double x) { return log10(x); }
+double zap_math_sin(double x) { return sin(x); }
+double zap_math_cos(double x) { return cos(x); }
+double zap_math_tan(double x) { return tan(x); }
+double zap_math_asin(double x) { return asin(x); }
+double zap_math_acos(double x) { return acos(x); }
+double zap_math_atan(double x) { return atan(x); }
+double zap_math_floor(double x) { return floor(x); }
+double zap_math_ceil(double x) { return ceil(x); }
+double zap_math_round(double x) { return round(x); } /* half away from zero */
+double zap_math_trunc(double x) { return trunc(x); }
+double zap_math_fabs(double x) { return fabs(x); }
+double zap_math_atan2(double y, double x) { return atan2(y, x); }
+double zap_math_hypot(double a, double b) { return hypot(a, b); }
+double zap_math_fmod(double a, double b) { return fmod(a, b); }
+int64_t zap_math_isnan(double x) { return isnan(x) ? 1 : 0; }
+int64_t zap_math_isinf(double x) { return isinf(x) ? 1 : 0; }
+
+/* --- random: xoshiro256** -------------------------------------------------- */
+static uint64_t zap_rng_s[4];
+static int zap_rng_seeded = 0;
+static pthread_mutex_t zap_rng_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* SplitMix64: expands a single 64-bit seed into the four xoshiro words. */
+static uint64_t zap_splitmix64(uint64_t *x) {
+    uint64_t z = (*x += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+/* One 64-bit word of OS entropy (never all-zero). */
+static uint64_t zap_os_entropy_u64(void) {
+    uint64_t s = 0;
+#if defined(__APPLE__)
+    arc4random_buf(&s, sizeof s);
+#elif defined(__linux__)
+    if (getentropy(&s, sizeof s) != 0) {
+        s = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 21);
+    }
+#else
+    s = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 21);
+#endif
+    if (s == 0) {
+        s = 0x9e3779b97f4a7c15ULL;
+    }
+    return s;
+}
+
+/* Reseed from a 64-bit value. Caller holds `zap_rng_mu`. */
+static void zap_rng_seed_locked(uint64_t seed) {
+    uint64_t sm = seed;
+    for (int i = 0; i < 4; i++) {
+        zap_rng_s[i] = zap_splitmix64(&sm);
+    }
+    zap_rng_seeded = 1;
+}
+
+/* Autoseed from OS entropy on first use. Caller holds `zap_rng_mu`. */
+static void zap_rng_ensure_locked(void) {
+    if (!zap_rng_seeded) {
+        zap_rng_seed_locked(zap_os_entropy_u64());
+    }
+}
+
+static inline uint64_t zap_rotl(uint64_t x, int k) {
+    return (x << k) | (x >> (64 - k));
+}
+
+/* xoshiro256** step. Caller holds `zap_rng_mu` and has ensured seeding. */
+static uint64_t zap_rng_next_locked(void) {
+    uint64_t *s = zap_rng_s;
+    const uint64_t result = zap_rotl(s[1] * 5, 7) * 9;
+    const uint64_t t = s[1] << 17;
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = zap_rotl(s[3], 45);
+    return result;
+}
+
+/* Unbiased integer in [0, n) via rejection (n >= 1). Caller holds the lock. */
+static uint64_t zap_rng_bounded_locked(uint64_t n) {
+    uint64_t threshold = (0ULL - n) % n;
+    uint64_t r;
+    do {
+        r = zap_rng_next_locked();
+    } while (r < threshold);
+    return r % n;
+}
+
+void zap_random_seed(int64_t n) {
+    pthread_mutex_lock(&zap_rng_mu);
+    zap_rng_seed_locked((uint64_t)n);
+    pthread_mutex_unlock(&zap_rng_mu);
+}
+
+/* A double in [0, 1): the top 53 bits scaled by 2^-53. */
+double zap_random_f64(void) {
+    pthread_mutex_lock(&zap_rng_mu);
+    zap_rng_ensure_locked();
+    uint64_t x = zap_rng_next_locked();
+    pthread_mutex_unlock(&zap_rng_mu);
+    return (double)(x >> 11) * (1.0 / 9007199254740992.0); /* 2^53 */
+}
+
+double zap_random_uniform(double a, double b) {
+    return a + (b - a) * zap_random_f64();
+}
+
+int64_t zap_random_randint(int64_t a, int64_t b) {
+    if (b < a) {
+        fprintf(stderr, "zap: random.randint(a, b) requires a <= b\n");
+        abort();
+    }
+    uint64_t span = (uint64_t)(b - a) + 1ULL; /* inclusive, wrap-safe */
+    pthread_mutex_lock(&zap_rng_mu);
+    zap_rng_ensure_locked();
+    uint64_t off = (span == 0ULL) /* a..b spans the full int64 width */
+                       ? zap_rng_next_locked()
+                       : zap_rng_bounded_locked(span);
+    pthread_mutex_unlock(&zap_rng_mu);
+    return (int64_t)((uint64_t)a + off);
+}
+
+/* A random valid index into a non-empty list (backs `random.choice`). */
+int64_t zap_random_list_index(void *l) {
+    ZapList *list = (ZapList *)l;
+    if (list->len <= 0) {
+        fprintf(stderr, "zap: random.choice from an empty sequence\n");
+        abort();
+    }
+    pthread_mutex_lock(&zap_rng_mu);
+    zap_rng_ensure_locked();
+    uint64_t idx = zap_rng_bounded_locked((uint64_t)list->len);
+    pthread_mutex_unlock(&zap_rng_mu);
+    return (int64_t)idx;
+}
+
+/* Fisher-Yates in place over the element words (works for any element kind;
+ * pointer words keep their GC identity, only their positions change). */
+void zap_random_shuffle(void *l) {
+    ZapList *list = (ZapList *)l;
+    pthread_mutex_lock(&zap_rng_mu);
+    zap_rng_ensure_locked();
+    for (int64_t i = list->len - 1; i > 0; i--) {
+        uint64_t j = zap_rng_bounded_locked((uint64_t)(i + 1));
+        int64_t tmp = list->data[i];
+        list->data[i] = list->data[(int64_t)j];
+        list->data[(int64_t)j] = tmp;
+    }
+    pthread_mutex_unlock(&zap_rng_mu);
+}
