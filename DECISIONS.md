@@ -1175,3 +1175,29 @@ a separate feature (parser + codegen + calling convention; GC is already safe
 because a code pointer fails `zap_is_heap_ptr`) filed as a follow-up, not part
 of the monomorphization epic. Generics machinery is otherwise complete for
 callback-free generic functions and methods.
+
+**Update — slice 5 (I#164): interface bounds on type parameters.** A type
+parameter may carry a single interface bound (`def announce[T: Display](...)`,
+`struct Box[T: Display]`); the bound syntax already parsed (slice 0) and is now
+enforced. Enforcement is split along the pipeline (sema checks; `ir` re-derives
+types and does not consume sema output, so it cannot call sema's conformance
+checker): **sema** does the check-at-definition (Fork M1) — inside a bounded body
+a method call on a value of `T: Iface` resolves through `Iface`, typed by the
+method's return and rejecting any method the bound does not declare, before any
+instantiation; an unbounded `T` stays opaque as in slices 1–4. **ir/mono**
+enforces *satisfaction* at each concrete instantiation using the same I#84
+structural-conformance rule (re-derived at the AST level), emitting a clear
+compile error that names the type, bound, and parameter when the argument does
+not conform. Because the body is monomorphized, a bound-method call substitutes
+the concrete type and lowers to a **direct call** of that type's method — **static
+dispatch, no fat pointer / vtable** (interface *values* keep the dynamic
+fat-pointer path from I#84; this is Rust's `impl Trait` vs `dyn Trait` split). The
+GC-metadata-free theorem is unchanged: every instance is a concrete struct/enum
+with its existing per-struct descriptor, so no collector or `zaprt.c` change.
+Operator-dunder interfaces (D-0047) are valid bounds for free (`def sum[T: Add]`)
+since they are ordinary interfaces. Tested under both collectors
+(`tests/golden/generics_bounds*.zap` + `mono`/`sema` unit tests). **Deferred
+(follow-ups):** multiple bounds per parameter (`T: A + B` — grammar carries a
+single bound), where-clauses, bounds referencing other type params, and
+satisfying an operator bound with a *primitive* argument (only user structs/enums
+carry the methods a bound checks today).

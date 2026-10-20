@@ -550,6 +550,32 @@ checker at instantiation; allow bound methods in the body (static dispatch); wir
 operator-dunder interfaces as bounds. (Grammar + schema already carry the bound
 from slice 0/1.)
 
+> **Status (I#164, implemented).** A type parameter may carry a single interface
+> bound (`def announce[T: Display](...)`, `struct Box[T: Display]`). Enforcement
+> lives in two places, matching the pipeline (sema checks; `ir` re-derives types
+> and does not consume sema output):
+> - **sema (check-at-definition, Fork M1).** Inside a bounded generic body a
+>   method call on a value of a bounded type parameter `T: Iface` resolves through
+>   `Iface` — typed by the method's return type, and a call to a method the bound
+>   does not declare is rejected at the definition, before any instantiation. An
+>   *unbounded* `T` stays opaque exactly as in slices 1–4.
+> - **ir/mono (satisfaction + dispatch).** At each concrete instantiation the
+>   monomorphizer checks the type argument structurally conforms to the bound
+>   (the I#84 rule, re-derived at the AST level since `ir` has no `sema`
+>   dependency); a non-conforming argument is a clear compile error naming the
+>   type, bound, and parameter. Because the body is monomorphized, a bound-method
+>   call substitutes the concrete type and lowers to a **direct call** of that
+>   type's method — **static dispatch, no fat pointer / vtable** — so bounded
+>   generics stay free at runtime and GC is unaffected (every instance is a
+>   concrete struct/enum with its existing per-struct descriptor). Operator-dunder
+>   interfaces (D-0047) are valid bounds for free since they are ordinary
+>   interfaces. Tested under both collectors (`tests/golden/generics_bounds*.zap`,
+>   plus `mono`/`sema` unit tests). **Deferred (follow-ups):** multiple bounds per
+>   parameter (`[T: A + B]` — the grammar carries a single bound today),
+>   where-clauses, bounds referencing other type params, and satisfying an
+>   operator bound with a *primitive* argument (only user structs/enums carry the
+>   methods a bound checks today).
+
 **Slice 6 — migration consumers.** (a) `json` typed codec recognizes `Option[T]`
 fields (absent/null → `None`, omit on encode); **drop `@default`-as-optionality**
 (#100/#133). (b) AWS SDK models optional shapes as `Option[T]` (fork O-a),
