@@ -1113,13 +1113,19 @@ Lands the first end-to-end vertical:
   `Option[T]` for a reference/pointer `T` is a single nullable pointer (`None` =
   null, `Some(p)` = `p`), one word, no tag; a value-type `T` with no available
   niche falls back to the tagged tier-3 form.** So Option is niche-where-possible,
-  tagged-otherwise. **Implementation staging:** the first vertical (this PR) ships
-  the **tagged** representation everywhere; the **niche** layout for reference `T`
-  lands as the immediate follow-up PR (it is a lowering-side representation change
-  — construction, `match`, and the methods special-cased for the nullable-pointer
-  form — observable behaviour unchanged). The GC property is preserved (a niche
-  optional is one pointer slot; null is a non-root; existing pointer-map scanning
-  applies).
+  tagged-otherwise. **Implementation staging:** the first vertical (PR #156)
+  shipped the **tagged** representation everywhere; the **niche** layout for
+  reference `T` landed in the immediate follow-up PR as a lowering-side change
+  (two new ZIR ops `NullConst`/`IsNull`; construction, `match`, and binding
+  special-cased — `Some(p)` = `p`, `None` = null, one word, no tag), observable
+  behaviour unchanged. Niche-eligible = an `Option`-shaped tier-3 enum (two
+  variants, one payload-free, one single field) whose payload is a non-nullable
+  pointer (a reference type that is neither a value struct nor another tier-3
+  enum — the latter would let a null niche collide with the outer `None`). The GC
+  property is preserved with no collector change: a niche optional is one pointer
+  slot, null is skipped by `zap_mark_push`/`zap_is_heap_ptr`, and a live value is
+  traced by its own object-header descriptor via the existing per-struct pointer
+  map.
 - **X — built-in collections stay special-cased** (`list`/`dict`/`set`/`array`/
   `heap` are not rewritten as user generics) **for now, and are re-skinned as
   user-generic *surface* types in a scheduled post-core-generics slice** (methods
