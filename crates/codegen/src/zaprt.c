@@ -6086,3 +6086,79 @@ void *zap_json_lex_str(void *h) {
     }
     return zap_str_new(out, o);
 }
+
+/* --- json.dumps helpers (ticket #100 / #131) ---------------------------------
+ * The serializer (`__json_dumps`) is a Zap prelude walker that emits each
+ * fragment into a list[str] and joins once; these C helpers cover the pieces
+ * Zap lacks a direct surface for: enumerating an object's keys, JSON string
+ * escaping, and the final concatenation. Object key order is unspecified (hash
+ * order), matching D-0059. */
+
+/* Collect a dict's keys (str/ptr keys) into a fresh list, for `for k in keys`. */
+void *zap_dict_keys(void *dp) {
+    ZapDict *d = (ZapDict *)dp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->entries[i].state == SLOT_FULL) {
+            zap_list_push_ptr(out, (void *)(intptr_t)d->entries[i].key);
+        }
+    }
+    return out;
+}
+
+/* JSON-escape a string and wrap it in double quotes (RFC 8259 §7). */
+void *zap_json_escape(void *sp) {
+    ZapStr *s = (ZapStr *)sp;
+    int64_t n = s->len;
+    const char *in = s->data;
+    /* worst case per byte: \u00XX (6); plus the two surrounding quotes. */
+    char *out = (char *)zap_buf(n * 6 + 2);
+    int64_t o = 0;
+    static const char hex[] = "0123456789abcdef";
+    out[o++] = '"';
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        switch (c) {
+        case '"': out[o++] = '\\'; out[o++] = '"'; break;
+        case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+        case '\n': out[o++] = '\\'; out[o++] = 'n'; break;
+        case '\t': out[o++] = '\\'; out[o++] = 't'; break;
+        case '\r': out[o++] = '\\'; out[o++] = 'r'; break;
+        case '\b': out[o++] = '\\'; out[o++] = 'b'; break;
+        case '\f': out[o++] = '\\'; out[o++] = 'f'; break;
+        default:
+            if (c < 0x20) {
+                out[o++] = '\\';
+                out[o++] = 'u';
+                out[o++] = '0';
+                out[o++] = '0';
+                out[o++] = hex[(c >> 4) & 0xF];
+                out[o++] = hex[c & 0xF];
+            } else {
+                out[o++] = (char)c;
+            }
+        }
+    }
+    out[o++] = '"';
+    return zap_str_new(out, o);
+}
+
+/* Concatenate every ZapStr* element of a list into one string. */
+void *zap_json_join(void *lp) {
+    ZapList *l = (ZapList *)lp;
+    int64_t total = 0;
+    for (int64_t i = 0; i < l->len; i++) {
+        ZapStr *part = (ZapStr *)zap_list_get_ptr(lp, i);
+        total += part->len;
+    }
+    char *out = (char *)zap_buf(total > 0 ? total : 1);
+    int64_t o = 0;
+    for (int64_t i = 0; i < l->len; i++) {
+        ZapStr *part = (ZapStr *)zap_list_get_ptr(lp, i);
+        if (part->len > 0) {
+            memcpy(out + o, part->data, (size_t)part->len);
+            o += part->len;
+        }
+    }
+    return zap_str_new(out, o);
+}

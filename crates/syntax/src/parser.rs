@@ -144,6 +144,50 @@ def __json_loads(str s) -> JsonValue:
     auto c = json._lex_new(s)
     auto k = json._lex_next(c)
     return __json_value(c, k)
+
+def __json_dump(JsonValue v, list[str] out):
+    match v:
+        case JsonValue.Null:
+            out.append(\"null\")
+        case JsonValue.Bool(b):
+            if b:
+                out.append(\"true\")
+            else:
+                out.append(\"false\")
+        case JsonValue.Int(i):
+            out.append(json._i64_str(i))
+        case JsonValue.Float(f):
+            out.append(json._f64_str(f))
+        case JsonValue.Str(s):
+            out.append(json._escape(s))
+        case JsonValue.Array(items):
+            out.append(\"[\")
+            auto first = True
+            for x in items:
+                if first:
+                    first = False
+                else:
+                    out.append(\",\")
+                __json_dump(x, out)
+            out.append(\"]\")
+        case JsonValue.Object(fields):
+            out.append(\"{\")
+            auto first = True
+            list[str] ks = json._obj_keys(fields)
+            for key in ks:
+                if first:
+                    first = False
+                else:
+                    out.append(\",\")
+                out.append(json._escape(key))
+                out.append(\":\")
+                __json_dump(fields[key], out)
+            out.append(\"}\")
+
+def __json_dumps(JsonValue v) -> str:
+    list[str] parts = []
+    __json_dump(v, parts)
+    return json._join(parts)
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to

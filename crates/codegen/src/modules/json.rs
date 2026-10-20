@@ -19,4 +19,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_json_lex_int", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_json_lex_float", &[p.into()], Some(f.into()));
     cg.declare_rt("zap_json_lex_str", &[p.into()], Some(p.into()));
+    // dumps helpers (object keys, string escaping, fragment join). Number
+    // formatting reuses the core zap_i64_to_str / zap_f64_to_str declarations.
+    cg.declare_rt("zap_dict_keys", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_json_escape", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_json_join", &[p.into()], Some(p.into()));
 }

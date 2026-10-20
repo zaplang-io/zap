@@ -48,6 +48,53 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             }
             Some(Ty::Named("JsonValue".to_string()))
         }
+        // json.dumps(v: JsonValue) -> str (compact serialization).
+        "dumps" => {
+            if args.len() != 1 {
+                checker.error(
+                    format!("json.dumps(v) takes 1 argument, found {}", args.len()),
+                    span,
+                );
+            } else {
+                let t = checker.infer(&args[0].value);
+                if !assignable(&t, &Ty::Named("JsonValue".to_string())) {
+                    checker.error(
+                        format!("json.dumps() expects a JsonValue, found {}", t.display()),
+                        expr_span(&args[0].value),
+                    );
+                }
+            }
+            Some(Ty::Str)
+        }
+        // Internal serializer helpers (driven by the prelude writer).
+        // json._escape(s: str) -> str (quoted + JSON-escaped).
+        "_escape" => {
+            if args.len() == 1 {
+                checker.infer(&args[0].value);
+            }
+            Some(Ty::Str)
+        }
+        // json._i64_str(i) -> str ; json._f64_str(f) -> str (number formatting).
+        "_i64_str" | "_f64_str" => {
+            if args.len() == 1 {
+                checker.infer(&args[0].value);
+            }
+            Some(Ty::Str)
+        }
+        // json._obj_keys(m) -> list[str] (an object's keys, for iteration).
+        "_obj_keys" => {
+            if args.len() == 1 {
+                checker.infer(&args[0].value);
+            }
+            Some(Ty::List(Box::new(Ty::Str)))
+        }
+        // json._join(parts: list[str]) -> str (concatenate fragments).
+        "_join" => {
+            if args.len() == 1 {
+                checker.infer(&args[0].value);
+            }
+            Some(Ty::Str)
+        }
         // Internal tokenizer-cursor primitives (driven by the prelude builders).
         // json._lex_new(s: str|bytes) -> bytes (opaque cursor handle).
         "_lex_new" => {
