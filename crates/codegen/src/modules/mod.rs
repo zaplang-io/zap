@@ -13,13 +13,16 @@
 
 use super::Cg;
 
+mod bisect;
 mod crypto;
 mod datetime;
+mod deque;
 mod fs;
 mod gc;
 mod io;
 mod math;
 mod os;
+mod oset;
 mod process;
 mod random;
 mod runtime;
@@ -44,4 +47,7 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     random::declare_rt(cg);
     time::declare_rt(cg);
     datetime::declare_rt(cg);
+    deque::declare_rt(cg);
+    bisect::declare_rt(cg);
+    oset::declare_rt(cg);
 }

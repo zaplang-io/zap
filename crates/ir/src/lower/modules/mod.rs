@@ -17,13 +17,16 @@ use zapc_syntax::ast;
 use super::{FnLower, LowerError};
 use crate::ir::*;
 
+mod bisect;
 mod crypto;
 mod datetime;
+mod deque;
 mod fs;
 mod gc;
 mod io;
 mod math;
 mod os;
+mod oset;
 mod process;
 mod random;
 mod runtime;
@@ -64,6 +67,9 @@ pub(super) const MODULES: &[ModuleLower] = &[
     random::MODULE,
     time::MODULE,
     datetime::MODULE,
+    deque::MODULE,
+    bisect::MODULE,
+    oset::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

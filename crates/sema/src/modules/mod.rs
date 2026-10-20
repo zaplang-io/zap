@@ -17,13 +17,16 @@ use zapc_syntax::span::Span;
 
 use crate::{Checker, Ty};
 
+mod bisect;
 mod crypto;
 mod datetime;
+mod deque;
 mod fs;
 mod gc;
 mod io;
 mod math;
 mod os;
+mod oset;
 mod process;
 mod random;
 mod runtime;
@@ -59,6 +62,9 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     random::MODULE,
     time::MODULE,
     datetime::MODULE,
+    deque::MODULE,
+    bisect::MODULE,
+    oset::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute
