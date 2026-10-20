@@ -43,6 +43,32 @@ fn lower(
         });
         return Ok(Some((d, Ty::Struct(sid))));
     }
+    // json.scan(s) -> JsonScanner: a prelude struct holding the tokenizer cursor;
+    // its __iter__/__next__ (D-0048) pull tokens. Construct it here.
+    if method == "scan" {
+        let (s, _) = lowerer.expr(&args[0].value)?;
+        let sid = lowerer
+            .ctx
+            .ids
+            .get("JsonScanner")
+            .copied()
+            .ok_or_else(|| err("JsonScanner unavailable (built-in prelude missing)"))?;
+        let cur = lowerer.new_value(Ty::Ptr);
+        lowerer.emit(Inst::Call {
+            dest: Some(cur),
+            func: "zap_json_lex_new".to_string(),
+            args: vec![s],
+        });
+        let d = lowerer.new_value(Ty::Struct(sid));
+        lowerer.emit(Inst::StructNew { dest: d, sid });
+        lowerer.emit(Inst::FieldSet {
+            base: d,
+            sid,
+            idx: 0,
+            val: cur,
+        });
+        return Ok(Some((d, Ty::Struct(sid))));
+    }
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {
         // json.dumps(v) -> str: call the prelude serializer.

@@ -610,7 +610,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     let deco = DecoratorPlan::collect(module, &ctx, &mut errors);
     for (sid, traits) in &deco.derived {
         for t in traits {
-            if let Some((mname, psig, ret)) = t.signature(*sid) {
+            for (mname, psig, ret) in t.signatures(*sid) {
                 sigs.insert(
                     format!("{}__{}", ctx.names[*sid as usize], mname),
                     (psig, ret),
@@ -734,8 +734,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     for (sid, traits) in &deco.derived {
         for t in traits {
             match t.generate(*sid, &sigs, &ctx) {
-                Ok(Some(func)) => out.funcs.push(func),
-                Ok(None) => {}
+                Ok(funcs) => out.funcs.extend(funcs),
                 Err(e) => errors.push(e),
             }
         }
@@ -1062,7 +1061,7 @@ impl DerivedTrait {
             DerivedTrait::Eq => "__eq__",
             DerivedTrait::Repr => "__repr__",
             DerivedTrait::Ord => "__cmp__",
-            DerivedTrait::Json => "__json__",
+            DerivedTrait::Json => "to_json",
             DerivedTrait::Hash => "__hash__",
         }
     }
@@ -1070,13 +1069,19 @@ impl DerivedTrait {
     /// The ZIR signature of the generated method, if this trait is implemented.
     /// `__cmp__` returns an `i64` three-way result (−1 / 0 / +1); `__hash__`
     /// returns the combined `i64` hash.
-    fn signature(self, sid: u32) -> Option<(&'static str, Vec<Ty>, Ty)> {
+    fn signatures(self, sid: u32) -> Vec<(&'static str, Vec<Ty>, Ty)> {
         match self {
-            DerivedTrait::Eq => Some(("__eq__", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I1)),
-            DerivedTrait::Repr => Some(("__repr__", vec![Ty::Struct(sid)], Ty::Ptr)),
-            DerivedTrait::Ord => Some(("__cmp__", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I64)),
-            DerivedTrait::Hash => Some(("__hash__", vec![Ty::Struct(sid)], Ty::I64)),
-            DerivedTrait::Json => None,
+            DerivedTrait::Eq => vec![("__eq__", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I1)],
+            DerivedTrait::Repr => vec![("__repr__", vec![Ty::Struct(sid)], Ty::Ptr)],
+            DerivedTrait::Ord => vec![("__cmp__", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I64)],
+            DerivedTrait::Hash => vec![("__hash__", vec![Ty::Struct(sid)], Ty::I64)],
+            // Compile-time JSON codec (D-0059, I#100): the encode method
+            // `to_json(self) -> str` and the decode associated function
+            // `from_json(str) -> Self`.
+            DerivedTrait::Json => vec![
+                ("to_json", vec![Ty::Struct(sid)], Ty::Ptr),
+                ("from_json", vec![Ty::Ptr], Ty::Struct(sid)),
+            ],
         }
     }
 
@@ -1087,18 +1092,18 @@ impl DerivedTrait {
         sid: u32,
         sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
         ctx: &'a StructCtx,
-    ) -> Result<Option<Func>, LowerError> {
-        match self {
-            DerivedTrait::Eq => Ok(Some(gen_eq_method(sid, sigs, ctx)?)),
-            DerivedTrait::Repr => Ok(Some(gen_repr_method(sid, sigs, ctx)?)),
-            DerivedTrait::Ord => Ok(Some(gen_cmp_method(sid, sigs, ctx)?)),
-            DerivedTrait::Hash => Ok(Some(gen_hash_method(sid, sigs, ctx)?)),
-            DerivedTrait::Json => Err(err(format!(
-                "@derive({:?}) is recognized but not implemented yet \
-                 (Eq, Ord, Hash, and Repr are generated; Json is a follow-up)",
-                self.name()
-            ))),
-        }
+    ) -> Result<Vec<Func>, LowerError> {
+        Ok(match self {
+            DerivedTrait::Eq => vec![gen_eq_method(sid, sigs, ctx)?],
+            DerivedTrait::Repr => vec![gen_repr_method(sid, sigs, ctx)?],
+            DerivedTrait::Ord => vec![gen_cmp_method(sid, sigs, ctx)?],
+            DerivedTrait::Hash => vec![gen_hash_method(sid, sigs, ctx)?],
+            DerivedTrait::Json => vec![
+                gen_json_to_method(sid, sigs, ctx)?,
+                gen_json_from_method(sid, sigs, ctx)?,
+                gen_json_from_value_method(sid, sigs, ctx)?,
+            ],
+        })
     }
 
     fn name(self) -> &'static str {
@@ -1462,6 +1467,276 @@ fn gen_concat(b: &mut FnLower, a: Value, c: Value) -> Value {
         args: vec![a, c],
     });
     d
+}
+
+/// Format-neutral classification of a derived struct field's type — the shared
+/// "derive-walk core" (D-0059 §4b). The `@derive(Json)` encode/decode codegen
+/// dispatches on these kinds, and `@derive(Csv)` (PR3) reuses the same
+/// classifier, each mapping a kind to its own wire form. A field type with no
+/// kind is not yet supported by a derived codec.
+enum DeriveFieldKind {
+    /// A boolean (`i1`). Classified before `Int` (an `i1` has an integer width).
+    Bool,
+    /// A float field; carries the exact width (`F32`/`F64`).
+    Float(Ty),
+    /// An integer field; carries the exact width.
+    Int(Ty),
+    /// A `str` (reference string, lowered to `Ptr`).
+    Str,
+    /// A nested struct field; carries its struct id (must itself derive the
+    /// codec).
+    Nested(u32),
+}
+
+/// Classify a derived field's type for the shared codec walk, or `None` if no
+/// derived codec supports it yet (collections, enums, tuples, …).
+fn derive_field_kind(fty: Ty) -> Option<DeriveFieldKind> {
+    match fty {
+        Ty::I1 => Some(DeriveFieldKind::Bool),
+        Ty::F32 | Ty::F64 => Some(DeriveFieldKind::Float(fty)),
+        t if t.int_width().is_some() => Some(DeriveFieldKind::Int(t)),
+        Ty::Ptr => Some(DeriveFieldKind::Str),
+        Ty::Struct(s) => Some(DeriveFieldKind::Nested(s)),
+        _ => None,
+    }
+}
+
+/// `@derive(Json)` encode direction (D-0059, I#100): a `Struct__to_json(self)
+/// -> str` method producing the struct's compact JSON object,
+/// `{"f0":v0,"f1":v1,...}`. Field names are identifiers (no escaping needed);
+/// values are encoded per field type. Reuses the DOM runtime helpers
+/// (`zap_json_escape` for strings, `zap_i64_to_str`/`zap_f64_to_str` for
+/// numbers, `zap_json_bool_str` for booleans); a nested struct field recurses
+/// through its own derived `to_json` (so nested records must also
+/// `@derive(Json)`). Collections / enum fields are a follow-up slice. This is
+/// the string-building encoder; the `__to_json_value__` DOM bridge and the
+/// `from_json` decode direction land with the shared derive-walk core.
+fn gen_json_to_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__to_json");
+    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, true, sigs, ctx);
+    let mut acc = b.strconst("{");
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (fname, fty)) in fields.iter().enumerate() {
+        if idx > 0 {
+            let sep = b.strconst(",");
+            acc = gen_concat(&mut b, acc, sep);
+        }
+        // A field name is a Zap identifier, so it needs no JSON escaping.
+        let label = b.strconst(&format!("\"{fname}\":"));
+        acc = gen_concat(&mut b, acc, label);
+        let fv = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: fv,
+            base: 0,
+            sid,
+            idx: idx as u32,
+        });
+        let vstr = gen_json_encode_field(&mut b, fv, *fty, ctx)?;
+        acc = gen_concat(&mut b, acc, vstr);
+    }
+    let close = b.strconst("}");
+    acc = gen_concat(&mut b, acc, close);
+    b.set_term(Term::Ret(Some(acc)));
+    Ok(b.func)
+}
+
+/// Encode one `@derive(Json)` field value to its JSON text.
+fn gen_json_encode_field(
+    b: &mut FnLower,
+    fv: Value,
+    fty: Ty,
+    ctx: &StructCtx,
+) -> Result<Value, LowerError> {
+    let call1 = |b: &mut FnLower, func: &str, arg: Value| -> Value {
+        let d = b.new_value(Ty::Ptr);
+        b.emit(Inst::Call {
+            dest: Some(d),
+            func: func.to_string(),
+            args: vec![arg],
+        });
+        d
+    };
+    let r = match derive_field_kind(fty) {
+        Some(DeriveFieldKind::Bool) => {
+            let w = b.coerce(fv, Ty::I1, Ty::I64);
+            call1(b, "zap_json_bool_str", w)
+        }
+        Some(DeriveFieldKind::Float(w)) => {
+            let f = b.coerce(fv, w, Ty::F64);
+            call1(b, "zap_f64_to_str", f)
+        }
+        Some(DeriveFieldKind::Int(w)) => {
+            let i = b.coerce(fv, w, Ty::I64);
+            call1(b, "zap_i64_to_str", i)
+        }
+        // A `str` field — escape + quote.
+        Some(DeriveFieldKind::Str) => call1(b, "zap_json_escape", fv),
+        // A nested struct field — recurse through its own derived encoder.
+        Some(DeriveFieldKind::Nested(fsid)) => {
+            let fname = ctx.names[fsid as usize].clone();
+            call1(b, &format!("{fname}__to_json"), fv)
+        }
+        None => {
+            return Err(err(format!(
+                "@derive(Json) does not support field type {fty} yet \
+                 (scalars, str, and nested @derive(Json) structs are; \
+                 collections and enums are a follow-up)"
+            )));
+        }
+    };
+    Ok(r)
+}
+
+/// `@derive(Json)` decode direction (D-0059, I#100): a `Struct__from_json(s:
+/// str) -> Struct` associated function: parse `s` to the DOM (`__json_loads`),
+/// then hand off to the recursive `Struct__from_json_value` core.
+fn gen_json_from_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__from_json");
+    let jv_sid = json_value_sid(ctx)?;
+    // One parameter: the source string (value 0); no receiver.
+    let mut b = FnLower::new(
+        name,
+        vec![Ty::Ptr],
+        Ty::Struct(sid),
+        false,
+        false,
+        sigs,
+        ctx,
+    );
+    let jv = b.new_value(Ty::Struct(jv_sid));
+    b.emit(Inst::Call {
+        dest: Some(jv),
+        func: "__json_loads".to_string(),
+        args: vec![0],
+    });
+    let dest = b.new_value(Ty::Struct(sid));
+    b.emit(Inst::Call {
+        dest: Some(dest),
+        func: format!("{sname}__from_json_value"),
+        args: vec![jv],
+    });
+    b.set_term(Term::Ret(Some(dest)));
+    Ok(b.func)
+}
+
+/// `@derive(Json)` decode core (D-0059, I#100): `Struct__from_json_value(v:
+/// JsonValue) -> Struct`, populating each field from the object by name via the
+/// prelude typed accessors (`__json_field` / `__json_as_*`). A nested struct
+/// field recurses through the nested type's own `from_json_value`, so nested
+/// records decode (they must also `@derive(Json)`). Strict typing is lenient for
+/// v1 (a missing/mismatched field yields the accessor's default); strict-error
+/// semantics are a follow-up.
+fn gen_json_from_value_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__from_json_value");
+    let jv_sid = json_value_sid(ctx)?;
+    // One parameter: the object JsonValue (value 0); no receiver.
+    let mut b = FnLower::new(
+        name,
+        vec![Ty::Struct(jv_sid)],
+        Ty::Struct(sid),
+        false,
+        false,
+        sigs,
+        ctx,
+    );
+    let dest = b.new_value(Ty::Struct(sid));
+    b.emit(Inst::StructNew { dest, sid });
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (fname, fty)) in fields.iter().enumerate() {
+        // jf = __json_field(v, "fname")
+        let key = b.strconst(fname);
+        let jf = b.new_value(Ty::Struct(jv_sid));
+        b.emit(Inst::Call {
+            dest: Some(jf),
+            func: "__json_field".to_string(),
+            args: vec![0, key],
+        });
+        let val = gen_json_decode_field(&mut b, jf, *fty, ctx)?;
+        b.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: idx as u32,
+            val,
+        });
+    }
+    b.set_term(Term::Ret(Some(dest)));
+    Ok(b.func)
+}
+
+/// The prelude `JsonValue` enum's struct id (its tagged-struct layout).
+fn json_value_sid(ctx: &StructCtx) -> Result<u32, LowerError> {
+    ctx.ids
+        .get("JsonValue")
+        .copied()
+        .ok_or_else(|| err("JsonValue unavailable (built-in prelude missing)"))
+}
+
+/// Decode one field: convert its `JsonValue` (`jf`) to the field type `fty` via
+/// the prelude typed accessors, recursing into a nested struct's
+/// `from_json_value`.
+fn gen_json_decode_field(
+    b: &mut FnLower,
+    jf: Value,
+    fty: Ty,
+    ctx: &StructCtx,
+) -> Result<Value, LowerError> {
+    let call1 = |b: &mut FnLower, func: &str, ret: Ty, arg: Value| -> Value {
+        let d = b.new_value(ret);
+        b.emit(Inst::Call {
+            dest: Some(d),
+            func: func.to_string(),
+            args: vec![arg],
+        });
+        d
+    };
+    let r = match derive_field_kind(fty) {
+        Some(DeriveFieldKind::Bool) => call1(b, "__json_as_bool", Ty::I1, jf),
+        Some(DeriveFieldKind::Float(Ty::F32)) => {
+            let f = call1(b, "__json_as_float", Ty::F64, jf);
+            b.coerce(f, Ty::F64, Ty::F32)
+        }
+        Some(DeriveFieldKind::Float(_)) => call1(b, "__json_as_float", Ty::F64, jf),
+        Some(DeriveFieldKind::Int(Ty::I64)) => call1(b, "__json_as_int", Ty::I64, jf),
+        Some(DeriveFieldKind::Int(w)) => {
+            let i = call1(b, "__json_as_int", Ty::I64, jf);
+            b.coerce(i, Ty::I64, w)
+        }
+        Some(DeriveFieldKind::Str) => call1(b, "__json_as_str", Ty::Ptr, jf),
+        // A nested struct field — recurse through its own decode core.
+        Some(DeriveFieldKind::Nested(fsid)) => {
+            let fname = ctx.names[fsid as usize].clone();
+            let d = b.new_value(Ty::Struct(fsid));
+            b.emit(Inst::Call {
+                dest: Some(d),
+                func: format!("{fname}__from_json_value"),
+                args: vec![jf],
+            });
+            d
+        }
+        None => {
+            return Err(err(format!(
+                "@derive(Json) from_json does not support field type {fty} yet \
+                 (scalars, str, and nested @derive(Json) structs are; \
+                 collections and enums are a follow-up)"
+            )));
+        }
+    };
+    Ok(r)
 }
 
 /// `@derive(Ord)` — a three-way comparison `Struct____cmp__(self, other) -> i64`
@@ -4609,6 +4884,28 @@ impl<'a> FnLower<'a> {
                 if self.lookup(tyname).is_none() {
                     if let Some(r) = modules::lower_builtin_module_call(self, tyname, name, args)? {
                         return Ok(r);
+                    }
+                }
+                // `Struct.from_json(s)` — the @derive(Json) decode associated
+                // function (D-0059, I#100). Dispatched when the generated
+                // `{Struct}__from_json` was registered (i.e. the struct derived
+                // Json); sema has already type-checked the call.
+                if name == "from_json" {
+                    let fnname = format!("{tyname}__from_json");
+                    if self.sigs.contains_key(&fnname) {
+                        let (s, _) = self.expr(&args[0].value)?;
+                        let sid = *self
+                            .ctx
+                            .ids
+                            .get(tyname)
+                            .ok_or_else(|| err("unknown struct in from_json"))?;
+                        let d = self.new_value(Ty::Struct(sid));
+                        self.emit(Inst::Call {
+                            dest: Some(d),
+                            func: fnname,
+                            args: vec![s],
+                        });
+                        return Ok((d, Ty::Struct(sid)));
                     }
                 }
             }

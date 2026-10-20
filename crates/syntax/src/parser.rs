@@ -188,6 +188,89 @@ def __json_dumps(JsonValue v) -> str:
     list[str] parts = []
     __json_dump(v, parts)
     return json._join(parts)
+
+def __json_as_int(JsonValue v) -> int64:
+    match v:
+        case JsonValue.Int(i):
+            return i
+        case _:
+            return 0
+
+def __json_as_float(JsonValue v) -> float64:
+    match v:
+        case JsonValue.Float(f):
+            return f
+        case JsonValue.Int(i):
+            return 0.0
+        case _:
+            return 0.0
+
+def __json_as_bool(JsonValue v) -> bool:
+    match v:
+        case JsonValue.Bool(b):
+            return b
+        case _:
+            return False
+
+def __json_as_str(JsonValue v) -> str:
+    match v:
+        case JsonValue.Str(s):
+            return s
+        case _:
+            return \"\"
+
+def __json_field(JsonValue v, str k) -> JsonValue:
+    match v:
+        case JsonValue.Object(m):
+            return m[k]
+        case _:
+            return JsonValue.Null
+
+enum JsonToken:
+    End
+    Null
+    Bool(bool b)
+    Int(int64 i)
+    Float(float64 f)
+    Str(str s)
+    BeginObject
+    EndObject
+    BeginArray
+    EndArray
+    Colon
+    Comma
+
+struct JsonScanner:
+    bytes cur
+    def __iter__(self) -> JsonScanner:
+        return self
+    def __next__(self) -> (JsonToken, bool):
+        auto k = json._lex_next(self.cur)
+        if k == 1:
+            return (JsonToken.Null, True)
+        if k == 2:
+            return (JsonToken.Bool(True), True)
+        if k == 3:
+            return (JsonToken.Bool(False), True)
+        if k == 4:
+            return (JsonToken.Int(json._lex_int(self.cur)), True)
+        if k == 5:
+            return (JsonToken.Float(json._lex_float(self.cur)), True)
+        if k == 6:
+            return (JsonToken.Str(json._lex_str(self.cur)), True)
+        if k == 7:
+            return (JsonToken.BeginObject, True)
+        if k == 8:
+            return (JsonToken.EndObject, True)
+        if k == 9:
+            return (JsonToken.BeginArray, True)
+        if k == 10:
+            return (JsonToken.EndArray, True)
+        if k == 11:
+            return (JsonToken.Colon, True)
+        if k == 12:
+            return (JsonToken.Comma, True)
+        return (JsonToken.End, False)
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -239,6 +322,9 @@ fn references_prelude(module: &Module) -> bool {
         "\"datetime\"",
         "\"JsonValue\"",
         "\"json\"",
+        "\"Json\"",
+        "\"JsonToken\"",
+        "\"JsonScanner\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

@@ -48,6 +48,18 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             }
             Some(Ty::Named("JsonValue".to_string()))
         }
+        // json.scan(s: str|bytes) -> JsonScanner (a pull Iterator[JsonToken]).
+        "scan" => {
+            if args.len() != 1 {
+                checker.error(
+                    format!("json.scan(s) takes 1 argument, found {}", args.len()),
+                    span,
+                );
+            } else {
+                expect_strbytes(checker, "scan", &args[0]);
+            }
+            Some(Ty::Named("JsonScanner".to_string()))
+        }
         // json.dumps(v: JsonValue) -> str (compact serialization).
         "dumps" => {
             if args.len() != 1 {

@@ -1,0 +1,4 @@
+srv
+8080
+{"host":"srv","port":8080,"debug":true,"ratio":0.5}
+{"tag":"x","inner":{"a":9}}
