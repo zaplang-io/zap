@@ -981,6 +981,56 @@ plaintext core on the existing netpoller is the smallest piece that unblocks the
 ecosystem epics; TLS is the one genuinely large follow-up and is best decided on
 its own.
 
+## D-0062 — `tls`: link system OpenSSL for an `https` client on the netpoller
+**Status:** Locked — resolves issue #147 (un-defers the TLS/`https` follow-up
+left open by D-0061). Unblocks `http` `https://`, the ecosystem clients #109
+(Postgres/Redis/… reuse raw TLS), and TLS serving in the web framework #107. On
+the #121 module seam (per-crate `modules/tls.rs` + one registry line each + a
+`zaprt.c` banner section); no grammar change (all generic module calls).
+
+- **Backend: link system OpenSSL/LibreSSL via `-lssl -lcrypto`** (chosen over
+  rustls-ffi and platform-native). It mirrors the existing C-runtime precedent —
+  the regex (`-lpcre2-8`) and zlib/gzip (`-lz`, D-0060) sections already link a
+  system C lib with pure-C glue in `zaprt.c` — so it is the smallest integration
+  and composes directly with the netpoller via a non-blocking socket BIO. The CI
+  image (Ubuntu 24.04, the `make docker-test` container) ships **OpenSSL 3.0.13**;
+  `libssl-dev` is added to `.devcontainer/Dockerfile` next to `zlib1g-dev`.
+  rustls-ffi (memory-safe, but a bundled static Rust lib in every Zap binary +
+  heavier build wiring) stays the fallback if OpenSSL ever proves too fragile.
+- **OpenSSL 1.1 vs 3.x drift: avoided.** The client uses only the unified
+  post-1.1.0 API — `TLS_client_method`, `SSL_CTX_set_min_proto_version`
+  (floor TLS 1.2), automatic library init, `SSL_set1_host` + `SSL_VERIFY_PEER`
+  for built-in chain **and** hostname verification, `SSL_set_tlsext_host_name`
+  for SNI — which is identical across OpenSSL 1.1.1 and 3.x (and LibreSSL ≥ 2.7),
+  so no version `#ifdef` is needed. (The test-only self-signed server cert is
+  generated with the 3.0 `EVP_RSA_gen`/`X509_*` API — the CI target — not shipped.)
+- **Netpoller-first, like D-0061.** The fd is non-blocking; `SSL_connect`/
+  `SSL_read`/`SSL_write` returning `WANT_READ`/`WANT_WRITE` PARK the goroutine via
+  `zap_sock_park` (`zap_netpoll_wait`), freeing the M — never a blocked OS thread
+  or busy-poll. Same GC discipline: fd/pd/`SSL*` are extracted to C locals (the
+  `SSL*`/`SSL_CTX*` are OpenSSL-heap, not GC), payloads copied to `malloc` scratch,
+  GC results built only after the last park.
+- **Security (on by default, non-negotiable).** `tls.connect` verifies the
+  certificate chain against the system trust store (`SSL_CTX_set_default_verify_paths`)
+  AND the hostname (`SSL_set1_host`); expired/invalid/mismatched/self-signed certs
+  are rejected (the handshake raises a catchable Zap exception). Skipping
+  verification is a separate, loudly-named entry point, `tls.connect_insecure`,
+  never the default.
+- **Surface.** `tls`: `connect(host,port)` (verify on) / `connect_insecure(host,port)`
+  (verify off) → a TLS conn handle (opaque GC object typed as `bytes`, ATOMIC, the
+  `net`/`crypto` handle pattern); `send(conn,data)->int64`; `recv(conn,n)->str`;
+  `close_conn(conn)` (`close` is the reserved channel-close token, so sockets spell
+  it `close_conn`, as in `net`). An internal `_test_server()` starts a background
+  self-signed TLS echo server and returns its port — a test scaffold for the
+  deferred server, not stable API. `http` gains `https://` (default port 443) by
+  routing the client transport through `tls` with verification on; `http://` is
+  unchanged.
+
+**Deferred (follow-ups, noted in the PR):** TLS **server**/accept as public API
+(web-fw #107); ALPN / HTTP/2; client certificates (mTLS); custom CA-bundle
+configuration; session resumption / 0-RTT; OCSP stapling. **Rationale:** a
+verified `https` **client** is the one piece that gates the whole ecosystem epic
+#109; the server and the advanced-TLS knobs are independent follow-ups.
 ## D-0063 — `yaml`: subset YAML serde on the shared JsonValue DOM / derive core
 **Status:** Locked — resolves issue #149. Promotes `yaml` out of the ecosystem
 epic (#109) into core, the third serde format on the shared substrate

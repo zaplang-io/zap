@@ -36,6 +36,7 @@ mod signal;
 mod sync;
 mod sys;
 mod time;
+mod tls;
 mod yaml;
 mod zlib;
 
@@ -68,4 +69,5 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     sync::declare_rt(cg);
     net::declare_rt(cg);
     http::declare_rt(cg);
+    tls::declare_rt(cg);
 }

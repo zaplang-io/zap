@@ -41,6 +41,7 @@ mod support;
 mod sync;
 mod sys;
 mod time;
+mod tls;
 mod yaml;
 mod zlib;
 
@@ -88,6 +89,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     sync::MODULE,
     net::MODULE,
     http::MODULE,
+    tls::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not
