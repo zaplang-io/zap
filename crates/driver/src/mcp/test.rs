@@ -13,7 +13,7 @@ use std::path::Path;
 use super::ToolOutcome;
 
 /// Run tests for `paths` (relative to `root`); empty means the whole project.
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 pub(super) fn run(root: &Path, paths: &[String]) -> ToolOutcome {
     let joined: Vec<std::path::PathBuf> = paths.iter().map(|p| root.join(p)).collect();
     let (json, _ok) = crate::testing::run_json(&joined);
@@ -23,7 +23,7 @@ pub(super) fn run(root: &Path, paths: &[String]) -> ToolOutcome {
 }
 
 /// Without a backend the runner cannot compile and execute tests.
-#[cfg(not(feature = "llvm"))]
+#[cfg(not(feature = "codegen"))]
 pub(super) fn run(_root: &Path, _paths: &[String]) -> ToolOutcome {
     ToolOutcome::err(
         "zap_test needs a codegen-enabled build (rebuild with --features \

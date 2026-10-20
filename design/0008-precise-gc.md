@@ -2,8 +2,10 @@
 
 - **Author(s):** Zap team
 - **Last updated:** 2026-10-20
-- **Status:** Implemented (v1, behind the `gc-immix` build flag; Boehm remains
-  the default). All 5 forks were approved as recommended, including 4a.
+- **Status:** Implemented and **now the default collector** (ticket #116, flipped
+  2026-10-20): a plain codegen build (`--features zapc/llvm`, or `gc-immix`) links
+  the precise Immix GC; Boehm is the opt-in fallback behind `--features
+  zapc/gc-boehm`. All 5 forks were approved as recommended, including 4a.
 - **Discussion:** github.com/parveshgarg/zap#48
 - **Supersedes the GC sections of:** `design/RUNTIME-ABI.md`, `design/0005-concurrency.md`
 
@@ -229,25 +231,26 @@ a large structure (exactly the large-live-set test) can starve the collector.
 
 ### Migration & safety (FORK 5, recommended)
 
-- **Boehm stays selectable behind a build flag.** A cargo feature pair on the
-  codegen/driver crate — `gc-boehm` (**default**) and `gc-immix` — selects which
-  runtime is compiled and linked (`-lgc` vs. the new `zapgc` objects) and which
-  `zap_alloc` ABI + header behavior codegen emits. During bring-up the default
-  stays Boehm, so the **entire existing golden suite is byte-identical and
-  green**; Immix is opt-in.
+- **Collector selected behind a build flag.** A cargo feature on the
+  codegen/driver crate selects which runtime is compiled and linked (`-lgc` vs.
+  the new `zapgc` objects) and which `zap_alloc` ABI + header behavior codegen
+  emits. As of ticket #116 the **default is Immix** (codegen's `default`
+  feature is `gc-immix`); `--features zapc/gc-boehm` is the opt-in fallback.
+  During bring-up the default was Boehm so the existing golden suite stayed
+  byte-identical and green; the suite now passes **both** ways.
 - **A/B and fallback.** The two builds share every `zap_*` entry-point name and
   observable behavior, so any program can be built both ways and diffed. If Immix
   regresses, the fallback is a one-flag change.
 - **CI — two-check contract preserved.** `host (no LLVM)` is unchanged. The
-  `full (LLVM 18 + codegen)` check additionally builds+runs the golden suite a
-  second time under `gc-immix` (and runs the new GC stress tests only there).
-  Both still roll up into the single required `full` check — no third required
-  check, contract intact. Containerized clippy runs
-  `--features zapc/llvm --all-targets -D warnings` as today; the immix runtime is
-  C compiled by the same path as `zaprt.c`.
-- **Flip criteria.** Promote `gc-immix` to default only after it passes the full
-  suite + GC stress tests; keep `gc-boehm` buildable for one release as the
-  documented fallback, then revisit removal.
+  `full (LLVM 18 + codegen)` check builds+runs the golden suite under both
+  collectors — `gc-immix` (the default/primary, which also runs the GC stress
+  tests) and `gc-boehm` (the fallback/secondary). Both roll up into the single
+  required `full` check — no third required check, contract intact.
+  Containerized clippy runs `--all-targets -D warnings` under each collector.
+- **Flip criteria (met, ticket #116).** `gc-immix` was promoted to the default
+  once it passed the full suite + GC stress tests (including the I#92 finalizer
+  work); `gc-boehm` stays buildable as the documented fallback, then revisit
+  removal.
 
 ### New GC-specific tests (Phase 2)
 
@@ -280,9 +283,9 @@ a large structure (exactly the large-live-set test) can starve the collector.
 
 The Immix path is a **breaking ABI change on its own build** (header word, shifted
 field offsets, `zap_alloc` descriptor argument, new root/safepoint entry points),
-but it is **invisible to the default Boehm build**, so no existing artifact
-changes until we flip the default. Flipping the default is the ABI break and is
-gated on the suite passing both ways.
+but it is **invisible to the Boehm build**. The default was flipped to Immix in
+ticket #116 after the suite passed both ways; the Boehm fallback build
+(`--features zapc/gc-boehm`) keeps the original ABI and byte-identical goldens.
 
 ## Implementation (Phase 2 sketch, after ack)
 

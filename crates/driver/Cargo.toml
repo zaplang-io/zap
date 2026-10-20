@@ -28,13 +28,25 @@ zapc_sema = { path = "../sema" }
 zapc_ir = { path = "../ir" }
 # Package manager & project environment (issue #69, D-0052). Host-safe.
 zapc_pkg = { path = "../pkg" }
-# Codegen needs LLVM; gated behind the `llvm` feature so the toolchain builds
-# without LLVM on hosts that lack it.
-zapc_codegen = { path = "../codegen", optional = true }
+# Codegen needs LLVM; gated behind the `codegen` feature so the toolchain
+# builds without LLVM on hosts that lack it. `default-features = false` lets the
+# `gc-boehm` feature select the conservative collector; `llvm`/`gc-immix`
+# re-enable the precise Immix default (ticket #116).
+zapc_codegen = { path = "../codegen", optional = true, default-features = false }
 
 [features]
-llvm = ["dep:zapc_codegen"]
-# Build programs with the precise Immix GC (ticket #48) instead of Boehm.
-# Implies `llvm` (the GC choice only affects native codegen). Exercised by the
-# `full` CI check's second suite run; see design/0008-precise-gc.md.
-gc-immix = ["llvm", "zapc_codegen/gc-immix"]
+# Internal: link the LLVM codegen backend. Both collector choices enable it, so
+# the driver keys its codegen paths on this (a plain `--features zapc/llvm`
+# build gets the default Immix collector; `gc-boehm` gets Boehm). The toolchain
+# still builds without LLVM when none of these are enabled.
+codegen = ["dep:zapc_codegen"]
+# LLVM codegen with the default collector — the precise Immix GC (ticket #116,
+# D-0009). This is the default build; `--features zapc/llvm` now links Immix.
+llvm = ["codegen", "zapc_codegen/gc-immix"]
+# Explicit alias for the default Immix collector. Adds the driver-side flag that
+# gates the precise-GC reclamation tests (`tests/gc.rs`); see the `full` CI
+# check. See design/0008-precise-gc.md.
+gc-immix = ["llvm"]
+# Opt-in fallback: LLVM codegen with the conservative Boehm GC (`-lgc`) instead
+# of the precise collector. Exercised as the `full` CI check's secondary suite.
+gc-boehm = ["codegen"]

@@ -15,11 +15,15 @@ DOCKER_RUN := docker run --rm $(MOUNTS) $(IMAGE)
 docker-build:
 	docker build -t $(IMAGE) -f .devcontainer/Dockerfile .
 
-## Run the full test suite (incl. LLVM codegen) in the container.
+## Run the full test suite (incl. LLVM codegen) in the container, under both
+## collectors: the default precise Immix GC (ticket #116) and the Boehm
+## fallback. Mirrors the `full` CI check.
 docker-test:
-	$(DOCKER_RUN) cargo test --workspace --features zapc/llvm
+	$(DOCKER_RUN) cargo test --workspace --features zapc/gc-immix
+	$(DOCKER_RUN) cargo test --workspace --features zapc/gc-boehm
 
-## Compile the whole workspace (incl. codegen) in the container.
+## Compile the whole workspace (incl. codegen, default Immix collector) in the
+## container.
 docker-build-crate:
 	$(DOCKER_RUN) cargo build --workspace --features zapc/llvm
 

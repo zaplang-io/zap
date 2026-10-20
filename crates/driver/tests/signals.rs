@@ -11,7 +11,7 @@
 //! Requires the `llvm` feature and an LLVM toolchain (run in the dev container,
 //! `make docker-test`).
 
-#![cfg(feature = "llvm")]
+#![cfg(feature = "codegen")]
 
 use std::io::Write;
 use std::process::Command;

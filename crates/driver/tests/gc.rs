@@ -5,7 +5,7 @@
 //! run under both collectors via the ordinary golden harness; these assert the
 //! precise collector additionally *reclaims* unreachable garbage.
 
-#![cfg(all(feature = "llvm", feature = "gc-immix"))]
+#![cfg(all(feature = "codegen", feature = "gc-immix"))]
 
 use std::process::Command;
 

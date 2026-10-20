@@ -514,13 +514,13 @@ fn main_template(project: &str) -> String {
 }
 
 /// `zap test [file] [--json] [--watch]` — run the `@test` suite (D-0054).
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 fn cmd_test(file: Option<String>, json: bool, watch: bool) -> ExitCode {
     crate::testing::run(file, json, watch)
 }
 
 /// Without a backend the runner cannot compile and execute tests.
-#[cfg(not(feature = "llvm"))]
+#[cfg(not(feature = "codegen"))]
 fn cmd_test(_file: Option<String>, _json: bool, _watch: bool) -> ExitCode {
     eprintln!("zap test: running tests needs codegen, which this build lacks");
     eprintln!("(rebuild with --features zapc/llvm, which requires an LLVM toolchain)");

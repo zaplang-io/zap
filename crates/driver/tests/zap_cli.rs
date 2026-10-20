@@ -296,7 +296,7 @@ fn ir_dumps_without_llvm() {
 
 // --- LLVM-only: the real compile/run path. ---
 
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 #[test]
 fn run_compiles_and_runs_a_file() {
     let out = zap()
@@ -313,7 +313,7 @@ fn run_compiles_and_runs_a_file() {
     assert_eq!(stdout.trim_end(), "Hello, Zap\ndone");
 }
 
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 #[test]
 fn build_produces_a_runnable_binary() {
     let dir = scratch("build");
@@ -340,7 +340,7 @@ fn build_produces_a_runnable_binary() {
     );
 }
 
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 #[test]
 fn run_in_project_mode_uses_src_main() {
     let dir = scratch("project");
@@ -368,7 +368,7 @@ fn run_in_project_mode_uses_src_main() {
 // --- `zap test` end-to-end (issue #73, D-0054) --------------------------------
 
 /// Write `contents` to `dir/rel`, creating parent directories.
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 fn write_file(dir: &Path, rel: &str, contents: &str) {
     let path = dir.join(rel);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -377,7 +377,7 @@ fn write_file(dir: &Path, rel: &str, contents: &str) {
 
 /// A whole project — inline `@test` in `src/main.zap` plus a `tests/` file that
 /// exercises hooks, `@parametrize`, `@skip` and `@expect_raises` — runs green.
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 #[test]
 fn test_runs_a_project_green() {
     let dir = scratch("test_green");
@@ -417,7 +417,7 @@ fn test_runs_a_project_green() {
 
 /// A deliberately failing test shows power-assert operand values and fails the
 /// run with a non-zero exit code.
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 #[test]
 fn test_reports_power_assert_on_failure() {
     let dir = scratch("test_fail");
@@ -539,7 +539,7 @@ fn mcp_reference_check_and_graph_over_stdio() {
 }
 
 /// The targeted-test surface returns the runner's structured JSON (LLVM only).
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 #[test]
 fn mcp_zap_test_returns_structured_results() {
     let dir = scratch("mcp_test");
@@ -562,7 +562,7 @@ fn mcp_zap_test_returns_structured_results() {
 }
 
 /// `zap test --json` emits structured results consumable by `zap mcp` (#72).
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 #[test]
 fn test_json_output() {
     let dir = scratch("test_json");
