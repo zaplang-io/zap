@@ -17,11 +17,13 @@ use zapc_syntax::span::Span;
 
 use crate::{Checker, Ty};
 
+mod argparse;
 mod crypto;
 mod datetime;
 mod fs;
 mod gc;
 mod io;
+mod logging;
 mod math;
 mod os;
 mod process;
@@ -59,6 +61,8 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     random::MODULE,
     time::MODULE,
     datetime::MODULE,
+    logging::MODULE,
+    argparse::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute
@@ -74,7 +78,7 @@ pub(crate) struct ModuleConst {
 
 /// The registered modules that expose compile-time constants (ticket #98). Add
 /// a module: expose `pub(super) const MODULE_CONST: ModuleConst` and append it.
-pub(crate) const CONST_MODULES: &[ModuleConst] = &[math::MODULE_CONST];
+pub(crate) const CONST_MODULES: &[ModuleConst] = &[math::MODULE_CONST, logging::MODULE_CONST];
 
 /// Type-check a built-in `signal`/`gc`/`runtime`-style module call, returning the
 /// result type, or `None` if `module` is not a registered built-in module (so the
