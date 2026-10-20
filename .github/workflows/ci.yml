@@ -103,17 +103,17 @@ jobs:
       # Default collector: the precise Immix GC (ticket #116). This is now the
       # primary codegen suite — the same golden end-to-end path plus the
       # GC-specific reclamation tests (tests/gc.rs).
-      - name: Clippy (default: precise Immix GC)
+      - name: "Clippy (default: precise Immix GC)"
         run: cargo clippy --workspace --features zapc/gc-immix --all-targets -- -D warnings
 
       # Fallback collector: the conservative Boehm GC (`-lgc`), kept covered as
       # the secondary suite. Folded into the `full` check so the two-check CI
       # contract (host + full) is unchanged.
-      - name: Clippy (fallback: Boehm GC)
+      - name: "Clippy (fallback: Boehm GC)"
         run: cargo clippy --workspace --features zapc/gc-boehm --all-targets -- -D warnings
 
-      - name: Test (default: precise Immix GC)
+      - name: "Test (default: precise Immix GC)"
         run: cargo test --workspace --features zapc/gc-immix
 
-      - name: Test (fallback: Boehm GC)
+      - name: "Test (fallback: Boehm GC)"
         run: cargo test --workspace --features zapc/gc-boehm
