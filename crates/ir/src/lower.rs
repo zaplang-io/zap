@@ -1062,7 +1062,7 @@ impl DerivedTrait {
             DerivedTrait::Eq => "__eq__",
             DerivedTrait::Repr => "__repr__",
             DerivedTrait::Ord => "__cmp__",
-            DerivedTrait::Json => "__json__",
+            DerivedTrait::Json => "to_json",
             DerivedTrait::Hash => "__hash__",
         }
     }
@@ -1076,7 +1076,8 @@ impl DerivedTrait {
             DerivedTrait::Repr => Some(("__repr__", vec![Ty::Struct(sid)], Ty::Ptr)),
             DerivedTrait::Ord => Some(("__cmp__", vec![Ty::Struct(sid), Ty::Struct(sid)], Ty::I64)),
             DerivedTrait::Hash => Some(("__hash__", vec![Ty::Struct(sid)], Ty::I64)),
-            DerivedTrait::Json => None,
+            // Compile-time JSON codec (D-0059, I#100): `to_json(self) -> str`.
+            DerivedTrait::Json => Some(("to_json", vec![Ty::Struct(sid)], Ty::Ptr)),
         }
     }
 
@@ -1093,11 +1094,7 @@ impl DerivedTrait {
             DerivedTrait::Repr => Ok(Some(gen_repr_method(sid, sigs, ctx)?)),
             DerivedTrait::Ord => Ok(Some(gen_cmp_method(sid, sigs, ctx)?)),
             DerivedTrait::Hash => Ok(Some(gen_hash_method(sid, sigs, ctx)?)),
-            DerivedTrait::Json => Err(err(format!(
-                "@derive({:?}) is recognized but not implemented yet \
-                 (Eq, Ord, Hash, and Repr are generated; Json is a follow-up)",
-                self.name()
-            ))),
+            DerivedTrait::Json => Ok(Some(gen_json_to_method(sid, sigs, ctx)?)),
         }
     }
 
@@ -1462,6 +1459,98 @@ fn gen_concat(b: &mut FnLower, a: Value, c: Value) -> Value {
         args: vec![a, c],
     });
     d
+}
+
+/// `@derive(Json)` encode direction (D-0059, I#100): a `Struct__to_json(self)
+/// -> str` method producing the struct's compact JSON object,
+/// `{"f0":v0,"f1":v1,...}`. Field names are identifiers (no escaping needed);
+/// values are encoded per field type. Reuses the DOM runtime helpers
+/// (`zap_json_escape` for strings, `zap_i64_to_str`/`zap_f64_to_str` for
+/// numbers, `zap_json_bool_str` for booleans); a nested struct field recurses
+/// through its own derived `to_json` (so nested records must also
+/// `@derive(Json)`). Collections / enum fields are a follow-up slice. This is
+/// the string-building encoder; the `__to_json_value__` DOM bridge and the
+/// `from_json` decode direction land with the shared derive-walk core.
+fn gen_json_to_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__to_json");
+    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, true, sigs, ctx);
+    let mut acc = b.strconst("{");
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (fname, fty)) in fields.iter().enumerate() {
+        if idx > 0 {
+            let sep = b.strconst(",");
+            acc = gen_concat(&mut b, acc, sep);
+        }
+        // A field name is a Zap identifier, so it needs no JSON escaping.
+        let label = b.strconst(&format!("\"{fname}\":"));
+        acc = gen_concat(&mut b, acc, label);
+        let fv = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: fv,
+            base: 0,
+            sid,
+            idx: idx as u32,
+        });
+        let vstr = gen_json_encode_field(&mut b, fv, *fty, ctx)?;
+        acc = gen_concat(&mut b, acc, vstr);
+    }
+    let close = b.strconst("}");
+    acc = gen_concat(&mut b, acc, close);
+    b.set_term(Term::Ret(Some(acc)));
+    Ok(b.func)
+}
+
+/// Encode one `@derive(Json)` field value to its JSON text.
+fn gen_json_encode_field(
+    b: &mut FnLower,
+    fv: Value,
+    fty: Ty,
+    ctx: &StructCtx,
+) -> Result<Value, LowerError> {
+    let call1 = |b: &mut FnLower, func: &str, arg: Value| -> Value {
+        let d = b.new_value(Ty::Ptr);
+        b.emit(Inst::Call {
+            dest: Some(d),
+            func: func.to_string(),
+            args: vec![arg],
+        });
+        d
+    };
+    let r = match fty {
+        // bool — before the integer arm (an `i1` has an integer width).
+        Ty::I1 => {
+            let w = b.coerce(fv, Ty::I1, Ty::I64);
+            call1(b, "zap_json_bool_str", w)
+        }
+        Ty::F32 | Ty::F64 => {
+            let f = b.coerce(fv, fty, Ty::F64);
+            call1(b, "zap_f64_to_str", f)
+        }
+        t if t.int_width().is_some() => {
+            let i = b.coerce(fv, t, Ty::I64);
+            call1(b, "zap_i64_to_str", i)
+        }
+        // A `str` field (reference string) — escape + quote.
+        Ty::Ptr => call1(b, "zap_json_escape", fv),
+        // A nested struct field — recurse through its own derived encoder.
+        Ty::Struct(fsid) => {
+            let fname = ctx.names[fsid as usize].clone();
+            call1(b, &format!("{fname}__to_json"), fv)
+        }
+        other => {
+            return Err(err(format!(
+                "@derive(Json) does not support field type {other} yet \
+                 (scalars, str, and nested @derive(Json) structs are; \
+                 collections and enums are a follow-up)"
+            )));
+        }
+    };
+    Ok(r)
 }
 
 /// `@derive(Ord)` — a three-way comparison `Struct____cmp__(self, other) -> i64`

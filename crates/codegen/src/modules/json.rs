@@ -24,4 +24,6 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_dict_keys", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_json_escape", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_json_join", &[p.into()], Some(p.into()));
+    // @derive(Json) `to_json` codec: JSON boolean literal.
+    cg.declare_rt("zap_json_bool_str", &[i.into()], Some(p.into()));
 }

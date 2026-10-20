@@ -7055,3 +7055,10 @@ void zap_argparse_reset(void) {
     g_ap_help = 0;
     pthread_mutex_unlock(&g_ap_mu);
 }
+
+/* JSON boolean literal — lowercase "true"/"false" (RFC 8259), for the
+ * @derive(Json) `to_json` codec (ticket #100 / #131). Distinct from
+ * zap_bool_to_str, whose Python-style "True"/"False" is not valid JSON. */
+void *zap_json_bool_str(int64_t b) {
+    return b ? zap_str_new("true", 4) : zap_str_new("false", 5);
+}

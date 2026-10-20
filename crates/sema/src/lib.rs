@@ -887,6 +887,14 @@ impl Checker {
                 .entry("__repr__".into())
                 .or_insert_with(|| unary(Ty::Str));
         }
+        if derived.contains("Json") {
+            // Compile-time JSON codec (D-0059, I#100): `self.to_json() -> str`.
+            // (`from_json` — the decode direction — is registered separately
+            // once associated-function support lands; tracked in the PR.)
+            methods
+                .entry("to_json".into())
+                .or_insert_with(|| unary(Ty::Str));
+        }
         StructInfo {
             methods,
             is_value: s.is_value,
