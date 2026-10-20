@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use zapc_syntax::ast::*;
+use zapc_syntax::genanalysis;
 use zapc_syntax::span::Span;
 
 /// A type-checking error with the offending source span.
@@ -494,6 +495,10 @@ struct Checker {
     user_decorators: HashSet<String>,
     scopes: Vec<HashMap<String, Ty>>,
     ret_ty: Ty,
+    /// `true` while checking the body of a generator function (a free `def`
+    /// whose body contains `yield`, I#67/D-0026). Gates `yield`/`return`
+    /// validation.
+    in_generator: bool,
     errors: Vec<TypeError>,
     /// Non-fatal diagnostics (e.g. `Eq`-without-`Hash` used as a dict/set key,
     /// D-0047). Reported by the driver but do not fail compilation.
@@ -618,6 +623,7 @@ impl Checker {
             user_decorators: HashSet::new(),
             scopes: Vec::new(),
             ret_ty: Ty::Unit,
+            in_generator: false,
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -1011,6 +1017,64 @@ impl Checker {
             if let Item::Function(f) = item {
                 let sig = self.sig_of(f);
                 self.sigs.insert(f.name.clone(), sig);
+            }
+        }
+        self.register_generators(module);
+    }
+
+    /// Register the compiler-synthesized iterator type for every free-function
+    /// generator (I#67, D-0026/D-0048), so a call `gen(...)` types as an
+    /// `Iterator` and drops into `for`/comprehensions through the #53 protocol.
+    ///
+    /// The synthetic type `$gen:<name>` is given the two structural `Iterator`
+    /// dunders — `__iter__(self) -> Self` and comma-ok `__next__(self) ->
+    /// (T, bool)` — and the generator function's return type is rewritten to it.
+    /// The element type `T` is left permissive (`Unknown`) here: it is not
+    /// needed to type-check the consuming side (any numeric op against it stays
+    /// permissive), and the precise element type is computed by lowering from
+    /// the `yield` operand types for codegen (`crates/ir`).
+    fn register_generators(&mut self, module: &Module) {
+        for item in &module.items {
+            let Item::Function(f) = item else { continue };
+            if !genanalysis::is_generator(f) {
+                continue;
+            }
+            // `main` and methods-with-`yield` are rejected in `check_function`;
+            // do not give them an iterator type.
+            if f.name == "main" {
+                continue;
+            }
+            let gen_name = genanalysis::gen_state_name(&f.name);
+            let self_param = |ty: Ty| ParamInfo {
+                name: "self".to_string(),
+                ty,
+                has_default: false,
+                variadic: false,
+            };
+            let mut methods = HashMap::new();
+            methods.insert(
+                "__iter__".to_string(),
+                FnSig {
+                    params: vec![self_param(Ty::Named(gen_name.clone()))],
+                    ret: Ty::Named(gen_name.clone()),
+                },
+            );
+            methods.insert(
+                "__next__".to_string(),
+                FnSig {
+                    params: vec![self_param(Ty::Named(gen_name.clone()))],
+                    ret: Ty::Tuple(vec![Ty::Unknown, Ty::Bool]),
+                },
+            );
+            self.structs.insert(
+                gen_name.clone(),
+                StructInfo {
+                    methods,
+                    is_value: false,
+                },
+            );
+            if let Some(sig) = self.sigs.get_mut(&f.name) {
+                sig.ret = Ty::Named(gen_name);
             }
         }
     }
@@ -1506,6 +1570,37 @@ impl Checker {
             .map(|t| self.resolve_type(t))
             .unwrap_or(Ty::Unit);
         let saved = std::mem::replace(&mut self.ret_ty, new_ret);
+        // Generator validation (I#67, D-0026/D-0048): a free `def` whose body
+        // contains `yield` is a generator and returns an `Iterator`. v1 does not
+        // support generator methods, a generator `main`, or an explicit return
+        // type on a generator (its return type is the synthetic iterator).
+        let is_gen = genanalysis::is_generator(f);
+        let saved_in_gen = std::mem::replace(&mut self.in_generator, is_gen);
+        if is_gen {
+            if self_ty.is_some() {
+                self.error(
+                    "generators as methods are not supported yet (I#67 v1); define \
+                     the generator as a free function"
+                        .to_string(),
+                    f.span,
+                );
+            } else if f.name == "main" {
+                self.error(
+                    "the entry point 'main' cannot be a generator (it contains \
+                     'yield', I#67)"
+                        .to_string(),
+                    f.span,
+                );
+            }
+            if f.ret.is_some() {
+                self.error(
+                    "a generator must not declare a return type: calling it returns \
+                     an Iterator over the yielded values (I#67, D-0048)"
+                        .to_string(),
+                    f.span,
+                );
+            }
+        }
         if let Some(name) = self_ty {
             self.declare("self", Ty::Named(name.to_string()));
         }
@@ -1534,6 +1629,7 @@ impl Checker {
             self.check_stmt(st);
         }
         self.ret_ty = saved;
+        self.in_generator = saved_in_gen;
         self.pop_scope();
     }
 
@@ -1830,6 +1926,20 @@ impl Checker {
                             }
                         }
                     }
+                }
+            }
+            Stmt::Return { value, span } if self.in_generator => {
+                // A generator ends by falling off the end or a bare `return`
+                // (D-0048/PEP 479); `return value` (which would set a
+                // StopIteration value in Python) is deferred past v1.
+                if let Some(e) = value {
+                    self.infer(e);
+                    self.error(
+                        "a generator's 'return' cannot carry a value yet (I#67 v1); \
+                         use a bare 'return' to end iteration"
+                            .to_string(),
+                        *span,
+                    );
                 }
             }
             Stmt::Return { value, span } => match value {
@@ -2420,9 +2530,20 @@ impl Checker {
                     }
                 }
             }
-            Expr::Yield { value, .. } => {
-                if let Some(v) = value {
-                    self.infer(v);
+            Expr::Yield { value, span } => {
+                // `yield` is only meaningful inside a generator; detection makes
+                // any free `def` containing it a generator, so an out-of-context
+                // `yield` can only occur where the function itself was already
+                // rejected (a method/`main`). v1 requires an operand so the
+                // element type `T` is well-defined.
+                match value {
+                    Some(v) => {
+                        self.infer(v);
+                    }
+                    None => self.error(
+                        "'yield' requires a value in this version (I#67 v1)".to_string(),
+                        *span,
+                    ),
                 }
                 Ty::Unknown
             }
@@ -3534,6 +3655,54 @@ mod tests {
     #[test]
     fn fib_type_checks() {
         ok(include_str!("../../../tests/golden/fib.zap"));
+    }
+
+    #[test]
+    fn generator_drives_a_for_loop() {
+        // A `def` with `yield` is a generator (I#67); its call is an Iterator
+        // and drops into a `for` loop through the D-0048 protocol.
+        ok(
+            "def count(int64 n):\n    auto i = 0\n    while i < n:\n        yield i\n        \
+            i = i + 1\n\ndef main():\n    auto total = 0\n    for x in count(5):\n        \
+            total = total + x\n    print(total)\n",
+        );
+    }
+
+    #[test]
+    fn generator_feeds_a_comprehension() {
+        ok(
+            "def ups(int64 n):\n    auto i = 0\n    while i < n:\n        yield i * i\n        \
+            i = i + 1\n\ndef main():\n    auto xs = [v for v in ups(4)]\n    print(len(xs))\n",
+        );
+    }
+
+    #[test]
+    fn generator_return_value_is_rejected() {
+        assert!(!errors(
+            "def g():\n    yield 1\n    return 7\n\ndef main():\n    for x in g():\n        \
+             print(x)\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn generator_with_declared_return_type_is_rejected() {
+        assert!(
+            !errors("def g() -> int64:\n    yield 1\n\ndef main():\n    print(1)\n").is_empty()
+        );
+    }
+
+    #[test]
+    fn yield_without_value_is_rejected() {
+        assert!(!errors(
+            "def g():\n    yield\n\ndef main():\n    for x in g():\n        print(x)\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn generator_main_is_rejected() {
+        assert!(!errors("def main():\n    yield 1\n").is_empty());
     }
 
     #[test]

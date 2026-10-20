@@ -154,6 +154,42 @@ struct StructCtx {
     /// Reverse map `fat_sid -> iid`, so a method call on an interface-typed
     /// receiver resolves to the owning interface.
     fat_to_iid: HashMap<u32, u32>,
+    /// Generator functions (I#67, D-0026/D-0048), keyed by source function name.
+    /// A call `gen(args)` constructs the function's synthetic state struct
+    /// instead of calling a function; see [`GeneratorInfo`].
+    generators: HashMap<String, GeneratorInfo>,
+}
+
+/// A compiler-generated generator (I#67, D-0026/D-0048). A free `def` whose body
+/// contains `yield` is lowered to a heap **state struct** that structurally
+/// implements the `Iterator` protocol (D-0048): `__iter__(self) -> self` and the
+/// comma-ok `__next__(self) -> (T, bool)`. Calling the generator constructs an
+/// instance of this struct (capturing the arguments); each `__next__` resumes
+/// the body to the next `yield` (or signals exhaustion).
+#[derive(Clone)]
+struct GeneratorInfo {
+    /// Source function name (also the key in [`StructCtx::generators`]).
+    name: String,
+    /// The synthetic state-struct id (indexes `Module::structs`).
+    sid: u32,
+    /// Element type `T` — the join of the `yield` operand types.
+    elem: Ty,
+    /// The `(T, bool)` tuple layout id that `__next__` returns.
+    next_tuple_sid: u32,
+    /// The state-struct fields that back the generator's live values, in field
+    /// order: `(name, type)`. The first `n_params` are the generator's
+    /// parameters (captured at construction); the rest are body locals. A var at
+    /// position `p` lives in field `p + 1` — field `0` is the `$state`
+    /// discriminant (`i64`), set to `0` at construction, to the resume id at each
+    /// `yield`, and to `-1` at exhaustion.
+    vars: Vec<(String, Ty)>,
+    /// How many leading `vars` are the generator's parameters.
+    n_params: usize,
+}
+
+/// Field index of generator var at position `p` (slot `0` is `$state`).
+fn gen_var_field(p: usize) -> u32 {
+    (p + 1) as u32
 }
 
 /// Lowered interface metadata (D-0016). `fat_sid` is the synthetic inline
@@ -299,6 +335,16 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             ast::Item::Enum(e) if e.variants.iter().any(|v| !v.fields.is_empty()) => {
                 ids.insert(e.name.clone(), names.len() as u32);
                 names.push(e.name.clone());
+            }
+            // A generator (a free `def` with `yield`, I#67) gets a synthetic
+            // state-struct id reserved up front — its layout is filled after the
+            // function signatures are known (its live locals need type inference).
+            ast::Item::Function(f)
+                if zapc_syntax::genanalysis::is_generator(f) && f.name != "main" =>
+            {
+                let name = zapc_syntax::genanalysis::gen_state_name(&f.name);
+                ids.insert(name.clone(), names.len() as u32);
+                names.push(name);
             }
             _ => {}
         }
@@ -499,7 +545,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         }
     }
 
-    let ctx = StructCtx {
+    let mut ctx = StructCtx {
         ids,
         names,
         fields,
@@ -510,6 +556,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         ifaces,
         interfaces,
         fat_to_iid,
+        generators: HashMap::new(),
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -518,11 +565,17 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         match item {
             ast::Item::Function(f) => {
                 let params = f.params.iter().map(|p| param_ty(p, None, &ctx)).collect();
-                let ret = f
-                    .ret
-                    .as_ref()
-                    .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
-                    .unwrap_or(Ty::Void);
+                // A generator's call returns its synthetic iterator state struct
+                // (I#67), not the declared/`void` type; the body is compiled into
+                // the struct's `__next__`, not a function named `f`.
+                let ret = if zapc_syntax::genanalysis::is_generator(f) && f.name != "main" {
+                    Ty::Struct(ctx.ids[&zapc_syntax::genanalysis::gen_state_name(&f.name)])
+                } else {
+                    f.ret
+                        .as_ref()
+                        .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
+                        .unwrap_or(Ty::Void)
+                };
                 sigs.insert(f.name.clone(), (params, ret));
             }
             ast::Item::Struct(s) => {
@@ -560,6 +613,67 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         }
     }
 
+    // Generators (I#67): discover each generator's live locals + element type,
+    // lay out its state struct, and register the synthetic `__iter__`/`__next__`
+    // signatures — all before body lowering, so a `for x in gen()` and the
+    // emitted methods resolve through the ordinary struct/method machinery.
+    let mut gen_map: HashMap<String, GeneratorInfo> = HashMap::new();
+    for item in &module.items {
+        let ast::Item::Function(f) = item else {
+            continue;
+        };
+        if !(zapc_syntax::genanalysis::is_generator(f) && f.name != "main") {
+            continue;
+        }
+        let (locals, elem) = match discover_generator(f, &sigs, &ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
+        };
+        let sname = zapc_syntax::genanalysis::gen_state_name(&f.name);
+        let sid = ctx.ids[&sname];
+        // State-struct vars: the parameters (captured at construction) then the
+        // discovered body locals; field index is `1 + position` (`$state` is 0).
+        let param_tys = sigs[&f.name].0.clone();
+        let mut vars: Vec<(String, Ty)> = f
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.name.clone(), param_tys[i]))
+            .collect();
+        let n_params = vars.len();
+        vars.extend(locals);
+        let next_tuple_sid = ctx.tuples.borrow_mut().intern(vec![elem, Ty::I1]);
+        // Fill the state struct's layout: `$state` discriminant + the var fields.
+        let mut layout: Vec<(String, Ty)> = vec![("$state".to_string(), Ty::I64)];
+        layout.extend(vars.iter().cloned());
+        ctx.fields[sid as usize] = layout;
+        // Register the iterator dunders so the for-loop/comprehension driver and
+        // `setup_iter`/`next_form` find them.
+        sigs.insert(
+            format!("{sname}____iter__"),
+            (vec![Ty::Struct(sid)], Ty::Struct(sid)),
+        );
+        sigs.insert(
+            format!("{sname}____next__"),
+            (vec![Ty::Struct(sid)], Ty::Struct(next_tuple_sid)),
+        );
+        gen_map.insert(
+            f.name.clone(),
+            GeneratorInfo {
+                name: f.name.clone(),
+                sid,
+                elem,
+                next_tuple_sid,
+                vars,
+                n_params,
+            },
+        );
+    }
+    ctx.generators = gen_map;
+
     let mut out = Module::default();
     for sid in 0..ctx.names.len() {
         out.structs.push(StructLayout {
@@ -571,6 +685,16 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     }
     for item in &module.items {
         match item {
+            // A generator is lowered to its state struct's `__iter__`/`__next__`
+            // (I#67), not a function named `f`.
+            ast::Item::Function(f) if ctx.generators.contains_key(&f.name) => {
+                let gi = ctx.generators[&f.name].clone();
+                out.funcs.push(lower_generator_iter(&gi, &sigs, &ctx));
+                match lower_generator_next(f, &gi, &sigs, &ctx) {
+                    Ok(func) => out.funcs.push(func),
+                    Err(e) => errors.push(e),
+                }
+            }
             ast::Item::Function(f) => {
                 match lower_fn(
                     f,
@@ -1628,6 +1752,236 @@ fn lower_fn(
     Ok(b.func)
 }
 
+/// Discover a generator's live locals and element type `T` (I#67), by lowering
+/// its body once in **discovery** mode and throwing the result away. Returns the
+/// body's `let`-bound locals as `(name, type)` in first-seen order (the state
+/// struct's local fields) and the element type (the join of the `yield` operand
+/// types). The generator's parameters are handled by the caller (they are the
+/// leading state-struct fields).
+fn discover_generator(
+    f: &ast::Function,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<(Vec<(String, Ty)>, Ty), LowerError> {
+    let (params, _ret) = sigs.get(&f.name).cloned().unwrap();
+    let mut b = FnLower::new(
+        f.name.clone(),
+        params.clone(),
+        Ty::Void,
+        false,
+        false,
+        sigs,
+        ctx,
+    );
+    b.gen_discover = Some(Vec::new());
+    for (i, p) in f.params.iter().enumerate() {
+        let pty = params[i];
+        let slot = b.alloca(pty);
+        b.store(slot, i as Value);
+        b.declare(&p.name, slot, pty);
+    }
+    for st in &f.body.stmts {
+        b.stmt(st)?;
+    }
+    let locals = b.gen_discover.take().unwrap();
+    let elem = join_yield_tys(&b.gen_elems)?;
+    Ok((locals, elem))
+}
+
+/// The element type `T` of a generator: every `yield` must produce the same ZIR
+/// type in v1 (I#67). Detection guarantees at least one `yield`.
+fn join_yield_tys(tys: &[Ty]) -> Result<Ty, LowerError> {
+    let mut it = tys.iter().copied();
+    let first = it
+        .next()
+        .ok_or_else(|| err("internal: generator has no 'yield'"))?;
+    for t in it {
+        if t != first {
+            return Err(err(
+                "a generator must yield values of a single type in this version (I#67 v1)",
+            ));
+        }
+    }
+    Ok(first)
+}
+
+/// Emit a generator's `__iter__` (I#67, D-0048): an iterator is its own iterable,
+/// so it returns `self`.
+fn lower_generator_iter(
+    gi: &GeneratorInfo,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Func {
+    let sname = zapc_syntax::genanalysis::gen_state_name(&gi.name);
+    let mangled = format!("{sname}____iter__");
+    let mut b = FnLower::new(
+        mangled,
+        vec![Ty::Struct(gi.sid)],
+        Ty::Struct(gi.sid),
+        false,
+        true,
+        sigs,
+        ctx,
+    );
+    b.set_term(Term::Ret(Some(0))); // `self` is value 0
+    b.func
+}
+
+/// Emit a generator's comma-ok `__next__` (I#67, D-0048) as a state machine.
+///
+/// Shape (ZIR is a flat CFG with no `switch`, so dispatch is a `BrIf` ladder):
+/// ```text
+/// entry:   <hoisted allocas>                 ; one per live local / parameter
+///          slot_i = FieldGet self, field_i   ; load persisted values
+///          state  = FieldGet self, 0
+///          if state == 0 -> body_start
+///          if state == 1 -> resume_1
+///          ...
+///          else          -> done
+/// body:    ... run to the first `yield` ...
+/// resume_k:... continue after the k-th `yield` ...
+/// done:    FieldSet self, 0, -1              ; latch exhausted
+///          return (zeroed, false)
+/// ```
+/// Each `yield v` (lowered in [`FnLower::lower_yield_stmt`]) stores every live
+/// slot back to its field, sets `$state`, and returns `(v, true)` — so the next
+/// call's entry dispatch resumes just past it.
+fn lower_generator_next(
+    f: &ast::Function,
+    gi: &GeneratorInfo,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = zapc_syntax::genanalysis::gen_state_name(&gi.name);
+    let mangled = format!("{sname}____next__");
+    let ret = Ty::Struct(gi.next_tuple_sid);
+    let mut b = FnLower::new(
+        mangled,
+        vec![Ty::Struct(gi.sid)],
+        ret,
+        false,
+        true,
+        sigs,
+        ctx,
+    );
+    let entry = 0; // block 0, created by `FnLower::new`
+    let done = b.new_block();
+    let body_start = b.new_block();
+
+    let mut field_idx = HashMap::new();
+    for (p, (name, _ty)) in gi.vars.iter().enumerate() {
+        field_idx.insert(name.clone(), gen_var_field(p));
+    }
+    b.gen_entry = Some(GenEntry {
+        self_val: 0,
+        sid: gi.sid,
+        entry_block: entry,
+        done_block: done,
+        next_tuple_sid: gi.next_tuple_sid,
+        elem: gi.elem,
+        field_idx,
+        slots: HashMap::new(),
+        order: Vec::new(),
+        next_state: 1,
+        resume: Vec::new(),
+    });
+
+    // Pre-create the per-call slots for the parameters (declared in the root
+    // scope) so the body can reference them and they are field-loaded at entry.
+    for p in 0..gi.n_params {
+        let (name, ty) = gi.vars[p].clone();
+        b.gen_entry_slot(&name, ty);
+    }
+
+    // Lower the body; `yield`s split it into resume blocks and `let`s create
+    // their hoisted slots lazily (see `decl_slot`).
+    b.position(body_start);
+    for st in &f.body.stmts {
+        b.stmt(st)?;
+    }
+    // Falling off the end exhausts the generator.
+    b.ensure_br(done);
+
+    // The exhaustion block: latch `$state = -1` and return `(zeroed, false)`.
+    b.position(done);
+    let neg1 = b.iconst(Ty::I64, -1);
+    b.emit(Inst::FieldSet {
+        base: 0,
+        sid: gi.sid,
+        idx: 0,
+        val: neg1,
+    });
+    let tup = b.new_value(Ty::Struct(gi.next_tuple_sid));
+    b.emit(Inst::StructNew {
+        dest: tup,
+        sid: gi.next_tuple_sid,
+    });
+    let no = b.bconst(false);
+    b.emit(Inst::FieldSet {
+        base: tup,
+        sid: gi.next_tuple_sid,
+        idx: 1,
+        val: no,
+    });
+    b.set_term(Term::Ret(Some(tup)));
+
+    // Fill the entry block: load every field into its slot, load `$state`, and
+    // branch to the start / the right resume point / `done`.
+    b.position(entry);
+    let order = b.gen_entry.as_ref().unwrap().order.clone();
+    for name in &order {
+        let (slot, ty) = b.gen_entry.as_ref().unwrap().slots[name];
+        let idx = b.gen_entry.as_ref().unwrap().field_idx[name];
+        let v = b.new_value(ty);
+        b.emit(Inst::FieldGet {
+            dest: v,
+            base: 0,
+            sid: gi.sid,
+            idx,
+        });
+        b.store(slot, v);
+    }
+    let state = b.new_value(Ty::I64);
+    b.emit(Inst::FieldGet {
+        dest: state,
+        base: 0,
+        sid: gi.sid,
+        idx: 0,
+    });
+    let mut arms: Vec<(i64, BlockId)> = vec![(0, body_start)];
+    arms.extend(b.gen_entry.as_ref().unwrap().resume.iter().copied());
+    let mut cur_cmp = entry;
+    let n = arms.len();
+    for (i, (sval, target)) in arms.into_iter().enumerate() {
+        b.position(cur_cmp);
+        let kc = b.iconst(Ty::I64, sval);
+        let cond = b.new_value(Ty::I1);
+        b.emit(Inst::ICmp {
+            dest: cond,
+            pred: CmpPred::Eq,
+            lhs: state,
+            rhs: kc,
+        });
+        if i + 1 < n {
+            let next_cmp = b.new_block();
+            b.set_term(Term::BrIf {
+                cond,
+                then_bb: target,
+                else_bb: next_cmp,
+            });
+            cur_cmp = next_cmp;
+        } else {
+            b.set_term(Term::BrIf {
+                cond,
+                then_bb: target,
+                else_bb: done,
+            });
+        }
+    }
+    b.gen_entry = None;
+    Ok(b.func)
+}
+
 /// The form of an iterator's `__next__` (D-0048), selected by its return
 /// signature.
 enum NextForm {
@@ -1660,8 +2014,49 @@ struct FnLower<'a> {
     /// Counter handing out distinct flag names for `with expect_raises(...)`
     /// desugaring (D-0054), so nested `with`s do not collide.
     with_counter: u32,
+    /// Set while **discovering** a generator's live locals (I#67): each named
+    /// binding is recorded here, first-seen first, as `(name, type)`. These
+    /// become the state struct's fields. `None` outside generator discovery.
+    gen_discover: Option<Vec<(String, Ty)>>,
+    /// `yield` operand types seen during generator **discovery** (I#67); their
+    /// join is the element type `T`. Empty otherwise.
+    gen_elems: Vec<Ty>,
+    /// Set while **emitting** a generator's `__next__` state machine (I#67).
+    /// Carries the per-call working slots and the resume-point table.
+    gen_entry: Option<GenEntry>,
     sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &'a StructCtx,
+}
+
+/// State threaded through the lowering of a generator's `__next__` (I#67). The
+/// generator's live values live in the state struct's fields; each `__next__`
+/// call loads them into per-call stack slots (allocas hoisted into the entry
+/// block so they dominate every resume point), runs to the next `yield` (which
+/// stores the slots back to the fields and returns `(value, true)`), and on
+/// fall-off / bare `return` returns `(zeroed, false)`.
+struct GenEntry {
+    /// The `self` state-struct value (parameter 0 of `__next__`).
+    self_val: Value,
+    /// The state-struct id (for `FieldGet`/`FieldSet` on `self`).
+    sid: u32,
+    /// The entry block (block 0): hoisted allocas + field→slot loads + dispatch.
+    entry_block: BlockId,
+    /// The shared exhaustion block: sets `$state = -1` and returns `(_, false)`.
+    done_block: BlockId,
+    /// The `(T, bool)` tuple layout id returned by `__next__`.
+    next_tuple_sid: u32,
+    /// Element type `T` — the `yield` operand type (for coercing each operand).
+    elem: Ty,
+    /// Generator var name → its state-struct field index.
+    field_idx: HashMap<String, u32>,
+    /// Generator var name → `(per-call slot, type)`, in `order`.
+    slots: HashMap<String, (Value, Ty)>,
+    /// Var names in the order their slots were created (stable field-load/sync).
+    order: Vec<String>,
+    /// Next resume-state id to hand out (`0` is the start; `1..` are post-yield).
+    next_state: i64,
+    /// `(state id, resume block)` for every `yield`, used to build dispatch.
+    resume: Vec<(i64, BlockId)>,
 }
 
 impl<'a> FnLower<'a> {
@@ -1698,6 +2093,9 @@ impl<'a> FnLower<'a> {
             used_lps: HashSet::new(),
             scope_stack: Vec::new(),
             with_counter: 0,
+            gen_discover: None,
+            gen_elems: Vec::new(),
+            gen_entry: None,
             sigs,
             ctx,
         }
@@ -1782,6 +2180,56 @@ impl<'a> FnLower<'a> {
     }
     fn lookup(&self, name: &str) -> Option<(Value, Ty)> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    /// Allocate and declare the stack slot for a named local binding (`let`,
+    /// `auto`), returning the slot to store the initializer into.
+    ///
+    /// Outside a generator this is just `alloca` + `declare`. While **discovering**
+    /// a generator's locals (I#67) it also records `(name, type)` so the name
+    /// becomes a state-struct field. While **emitting** a generator's `__next__`
+    /// it reuses the per-call slot created once in the entry block (so the binding
+    /// persists across `yield`s via its field, and the alloca dominates every
+    /// resume point); the first binding of each name creates that hoisted slot.
+    fn decl_slot(&mut self, name: &str, ty: Ty) -> Value {
+        if self.gen_discover.is_some() {
+            if let Some(list) = self.gen_discover.as_mut() {
+                if !list.iter().any(|(n, _)| n == name) {
+                    list.push((name.to_string(), ty));
+                }
+            }
+            let slot = self.alloca(ty);
+            self.declare(name, slot, ty);
+            return slot;
+        }
+        if self.gen_entry.is_some() {
+            if let Some(&(slot, _)) = self.gen_entry.as_ref().unwrap().slots.get(name) {
+                // Rebind the name to the existing hoisted slot (idempotent).
+                self.declare(name, slot, ty);
+                return slot;
+            }
+            return self.gen_entry_slot(name, ty);
+        }
+        let slot = self.alloca(ty);
+        self.declare(name, slot, ty);
+        slot
+    }
+
+    /// Create the per-call working slot for generator var `name` in the entry
+    /// block (hoisted so it dominates every resume point), declare it, and record
+    /// it for the entry field→slot load and the per-`yield` slot→field sync.
+    fn gen_entry_slot(&mut self, name: &str, ty: Ty) -> Value {
+        let entry = self.gen_entry.as_ref().unwrap().entry_block;
+        let d = self.new_value(Ty::Ptr);
+        self.func.blocks[entry as usize].insts.push(Inst::Alloca {
+            dest: d,
+            pointee: ty,
+        });
+        self.declare(name, d, ty);
+        let ge = self.gen_entry.as_mut().unwrap();
+        ge.slots.insert(name.to_string(), (d, ty));
+        ge.order.push(name.to_string());
+        d
     }
 
     // instruction helpers
@@ -2017,9 +2465,12 @@ impl<'a> FnLower<'a> {
                 // Value structs are copied on binding (D-0051): `T b = a` makes
                 // `b` an independent instance of the value aggregate.
                 let v = self.copy_if_value(v, declared, value);
-                let slot = self.alloca(declared);
+                // `decl_slot` is a plain alloca+declare outside a generator; in a
+                // generator it records the local (discovery) or reuses the state
+                // struct-backed per-call slot (emit), so the binding persists
+                // across `yield`s (I#67).
+                let slot = self.decl_slot(name, declared);
                 self.store(slot, v);
-                self.declare(name, slot, declared);
                 Ok(())
             }
             Stmt::Assign { target, value, .. } => {
@@ -2101,6 +2552,11 @@ impl<'a> FnLower<'a> {
                 }
             }
             Stmt::Expr(e) => {
+                // A statement-position `yield` drives the generator state machine
+                // (I#67); every other position is deferred (see `expr`).
+                if let Expr::Yield { value, .. } = e {
+                    return self.lower_yield_stmt(value.as_deref());
+                }
                 self.expr(e)?;
                 Ok(())
             }
@@ -2114,6 +2570,13 @@ impl<'a> FnLower<'a> {
             Stmt::For {
                 target, iter, body, ..
             } => self.lower_for(target, iter, body),
+            // Inside a generator, `return` ends iteration (D-0048/PEP 479): jump
+            // to the shared exhaustion block (sema rejects `return <value>`).
+            Stmt::Return { .. } if self.gen_entry.is_some() => {
+                let done = self.gen_entry.as_ref().unwrap().done_block;
+                self.set_term(Term::Br(done));
+                Ok(())
+            }
             Stmt::Return { value, .. } => {
                 match value {
                     Some(e) => {
@@ -4015,10 +4478,104 @@ impl<'a> FnLower<'a> {
                 );
                 Ok((d, ety))
             }
+            // Statement-position `yield` is handled in `stmt`; reaching the
+            // expression lowerer means a `yield` in subexpression position, which
+            // v1 does not support (I#67). In a non-generator function a `yield`
+            // cannot occur (sema makes any `def` with `yield` a generator).
+            Expr::Yield { .. } if self.gen_entry.is_some() || self.gen_discover.is_some() => Err(
+                err("'yield' is only supported as a statement in this version \
+                     (I#67 v1): e.g. `yield x`, not inside a larger expression"),
+            ),
+            Expr::Yield { .. } => Err(err("'yield' outside a generator function (I#67)")),
             _ => Err(err(
                 "this expression is not supported by codegen yet (Phase 1 slice)",
             )),
         }
+    }
+
+    /// Lower a statement-position `yield <value>` inside a generator (I#67).
+    ///
+    /// During **discovery** this only records the operand's type (a component of
+    /// the element type `T`). During **emit** it is the generator's suspend
+    /// point: store every live local back to its state-struct field, advance the
+    /// `$state` discriminant, return `(value, true)`, and continue lowering in a
+    /// fresh **resume block** that `__next__`'s entry dispatch will jump to.
+    fn lower_yield_stmt(&mut self, value: Option<&Expr>) -> Result<(), LowerError> {
+        if self.gen_discover.is_some() {
+            let t = match value {
+                Some(v) => self.expr(v)?.1,
+                None => Ty::Void,
+            };
+            self.gen_elems.push(t);
+            return Ok(());
+        }
+        if self.gen_entry.is_none() {
+            return Err(err("'yield' outside a generator function (I#67)"));
+        }
+        let value = value.ok_or_else(|| err("'yield' requires a value (I#67 v1)"))?;
+
+        let (self_val, sid, next_tuple_sid, elem) = {
+            let ge = self.gen_entry.as_ref().unwrap();
+            (ge.self_val, ge.sid, ge.next_tuple_sid, ge.elem)
+        };
+        let (v, vt) = self.expr(value)?;
+        let v = self.coerce(v, vt, elem);
+
+        // Persist every live local (and the parameters) to its field, so the
+        // next `__next__` resumes with the same values (I#67).
+        let order = self.gen_entry.as_ref().unwrap().order.clone();
+        for name in &order {
+            let (slot, ty) = self.gen_entry.as_ref().unwrap().slots[name];
+            let idx = self.gen_entry.as_ref().unwrap().field_idx[name];
+            let cur = self.load(slot, ty);
+            self.emit(Inst::FieldSet {
+                base: self_val,
+                sid,
+                idx,
+                val: cur,
+            });
+        }
+
+        // Advance the resume discriminant and return `(value, true)`.
+        let k = {
+            let ge = self.gen_entry.as_mut().unwrap();
+            let k = ge.next_state;
+            ge.next_state += 1;
+            k
+        };
+        let kc = self.iconst(Ty::I64, k);
+        self.emit(Inst::FieldSet {
+            base: self_val,
+            sid,
+            idx: 0,
+            val: kc,
+        });
+        let tup = self.new_value(Ty::Struct(next_tuple_sid));
+        self.emit(Inst::StructNew {
+            dest: tup,
+            sid: next_tuple_sid,
+        });
+        self.emit(Inst::FieldSet {
+            base: tup,
+            sid: next_tuple_sid,
+            idx: 0,
+            val: v,
+        });
+        let yes = self.bconst(true);
+        self.emit(Inst::FieldSet {
+            base: tup,
+            sid: next_tuple_sid,
+            idx: 1,
+            val: yes,
+        });
+        self.set_term(Term::Ret(Some(tup)));
+
+        // Continue in the resume block; `__next__`'s dispatch branches here when
+        // `$state == k`.
+        let resume = self.new_block();
+        self.gen_entry.as_mut().unwrap().resume.push((k, resume));
+        self.position(resume);
+        Ok(())
     }
 
     fn call(&mut self, callee: &Expr, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
@@ -4268,6 +4825,14 @@ impl<'a> FnLower<'a> {
                 }
             }
             // Struct construction: `StructName(fields...)`.
+            // A generator call `gen(args)` (I#67) constructs the compiler-
+            // generated state struct — capturing the arguments in its parameter
+            // fields and starting at `$state == 0` — rather than calling a
+            // function; the original body was compiled into the state struct's
+            // `__next__`.
+            if let Some(gi) = self.ctx.generators.get(fname).cloned() {
+                return self.construct_generator(&gi, args);
+            }
             if let Some(&sid) = self.ctx.ids.get(fname) {
                 return self.construct(sid, args);
             }
@@ -4473,6 +5038,54 @@ impl<'a> FnLower<'a> {
                 base: dest,
                 sid,
                 idx,
+                val: v,
+            });
+        }
+        Ok((dest, Ty::Struct(sid)))
+    }
+
+    /// Construct a generator's state struct for a call `gen(args)` (I#67).
+    ///
+    /// Allocates the (zeroed → `$state == 0`) state struct and stores each
+    /// argument into its parameter field, so the first `__next__` starts the body
+    /// from the top with the captured arguments. Arguments may be positional or
+    /// keyword (matched to parameter names), mirroring an ordinary call.
+    fn construct_generator(
+        &mut self,
+        gi: &GeneratorInfo,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        if args.len() != gi.n_params {
+            return Err(err(format!(
+                "generator '{}' expects {} argument(s), got {}",
+                gi.name,
+                gi.n_params,
+                args.len()
+            )));
+        }
+        let sid = gi.sid;
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        for (i, a) in args.iter().enumerate() {
+            let p = match &a.name {
+                Some(kw) => gi.vars[..gi.n_params]
+                    .iter()
+                    .position(|(n, _)| n == kw)
+                    .ok_or_else(|| {
+                        err(format!("generator '{}' has no parameter '{kw}'", gi.name))
+                    })?,
+                None => i,
+            };
+            let pty = gi.vars[p].1;
+            let (v, vt) = self.expr(&a.value)?;
+            let v = self.coerce(v, vt, pty);
+            // Capturing a value-struct argument copies it (D-0051), like any
+            // by-value parameter pass.
+            let v = self.copy_for_pass(v, pty, &a.value);
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: gen_var_field(p),
                 val: v,
             });
         }
