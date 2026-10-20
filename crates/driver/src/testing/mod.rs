@@ -28,10 +28,10 @@ pub fn strip_test_items(module: &mut Module) {
     });
 }
 
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 pub use run_impl::{run, run_json};
 
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 mod run_impl {
     use super::{discover, harness, report};
     use report::{Status, TestResult};

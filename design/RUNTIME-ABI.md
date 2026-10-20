@@ -20,7 +20,8 @@ Relevant locked decisions:
 
 - **Value vs reference semantics (D-0023):** scalars are values; `list`, `dict`,
   `array`, and `struct` instances are reference types; `str` is immutable.
-- **GC (D-0009):** conservative **Boehm** GC for v1; precise (Immix-style) later.
+- **GC (D-0009):** precise **Immix** GC by default (ticket #116); conservative
+  Boehm GC is the opt-in fallback (`--features zapc/gc-boehm`).
 - **Native target:** the compiler emits a relocatable object (via LLVM) and
   links it with `cc`. The runtime is a library linked into every program.
 - **Exceptions (D-0007):** unchecked, with real stack unwinding.
@@ -190,7 +191,7 @@ per ticket):
 ```c
 void  zap_runtime_init(void);
 
-// Allocation — routes to the GC (conservative Boehm in v1).
+// Allocation — routes to the GC (precise Immix by default; Boehm fallback).
 void* zap_alloc(size_t size, const TypeDesc* desc);   // may contain pointers
 void* zap_alloc_atomic(size_t size);                  // pointer-free (e.g. byte buffers)
 
@@ -302,17 +303,14 @@ keyword-like identifiers.)
 ### Garbage collection
 
 Two collectors are selectable at build time behind one allocation surface
-(ticket #48, D-0009, design/0008-precise-gc.md). The default is Boehm; the
-`gc-immix` codegen feature selects the precise collector.
+(ticket #48, D-0009, design/0008-precise-gc.md). As of ticket #116 the **default
+is the precise Immix collector** (codegen's `default` feature is `gc-immix`); the
+conservative Boehm collector is the opt-in fallback behind
+`--features zapc/gc-boehm`.
 
-**Default — conservative Boehm GC.** `zap_alloc*` wrap `GC_malloc` /
-`GC_malloc_atomic`; the collector conservatively scans the stack, registers and
-globals, so **no stack maps or safepoints are required**. The dev container
-adds `libgc-dev`; the runtime links `-lgc`.
-
-**`gc-immix` — precise, non-moving Immix collector.** Enabled by building with
-`--features zapc/gc-immix` (codegen defines `ZAP_GC_IMMIX` for the runtime and
-drops `-lgc`). It is **non-moving** in v1 (mark-only line marking over a 32 KiB
+**Default — precise, non-moving Immix collector.** A plain codegen build
+(`--features zapc/llvm`, or the explicit `gc-immix`) links it; codegen defines
+`ZAP_GC_IMMIX` for the runtime and drops `-lgc`. It is **non-moving** in v1 (mark-only line marking over a 32 KiB
 block / 128 B line heap with bump allocation, line-granularity recycling, and a
 separate large-object space); opportunistic evacuation/defragmentation is a v2
 follow-up. The precise machinery:
@@ -342,9 +340,16 @@ follow-up. The precise machinery:
   allocation merely flags that one is due. Stop-the-world is cooperative: mutator
   threads park at safepoints or in blocking runtime calls, and the collector
   marks + sweeps once all are parked. No write barrier / non-generational in v1.
-- **Migration.** Boehm stays the default during bring-up; the full golden suite
-  passes **both** ways and the `full` CI check runs it under both collectors. The
-  default flips to Immix only once it is proven in the field.
+**Fallback — conservative Boehm GC.** Built with `--features zapc/gc-boehm`.
+`zap_alloc*` wrap `GC_malloc` / `GC_malloc_atomic`; the collector conservatively
+scans the stack, registers and globals, so **no stack maps or safepoints are
+required**. The dev container adds `libgc-dev`; the runtime links `-lgc`. The
+runtime object layouts above are byte-identical to the Immix build.
+
+- **Migration.** The default was flipped to Immix in ticket #116 after the full
+  golden suite passed **both** ways; the `full` CI check runs it under both
+  collectors (Immix primary, Boehm secondary). Boehm stays buildable as the
+  documented fallback.
 
 ### Exception / unwinding ABI (coordinate with #22)
 

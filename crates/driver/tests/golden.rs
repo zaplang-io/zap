@@ -62,7 +62,7 @@ fn fixtures_are_paired() {
 /// fires) then fails this test deterministically instead of stalling the whole
 /// CI run until the job's global timeout. stdout/stderr are drained on threads
 /// so the child never blocks on a full pipe buffer.
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 fn run_with_timeout(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
@@ -113,7 +113,7 @@ fn run_with_timeout(
 }
 
 /// Compile + run each fixture and compare stdout. Requires the `llvm` feature.
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 #[test]
 fn golden_programs_match() {
     use std::process::Command;

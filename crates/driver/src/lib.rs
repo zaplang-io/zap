@@ -133,7 +133,7 @@ fn default_out(file: &str, run_after: bool) -> PathBuf {
     }
 }
 
-#[cfg(feature = "llvm")]
+#[cfg(feature = "codegen")]
 fn backend(module: &Module, file: &str, out: Option<String>, run_after: bool) -> ExitCode {
     use std::process::Command;
 
@@ -160,7 +160,7 @@ fn backend(module: &Module, file: &str, out: Option<String>, run_after: bool) ->
     }
 }
 
-#[cfg(not(feature = "llvm"))]
+#[cfg(not(feature = "codegen"))]
 fn backend(_module: &Module, file: &str, _out: Option<String>, _run_after: bool) -> ExitCode {
     // Keep the default-output logic exercised so it does not warn as dead code
     // on the no-LLVM host build.
