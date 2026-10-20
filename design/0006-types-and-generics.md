@@ -395,7 +395,8 @@ implementing, consistent with D-0047:
 - **`@derive(Hash)` supports integer/bool/str fields;** a float field is a clean
   "not supported yet" error, because bit-hashing a float would break the
   `a == b ⟹ hash(a) == hash(b)` invariant against `__eq__`'s value comparison.
-  `@derive(Json)` remains deferred.
+  `@derive(Json)` is now **specified and un-deferred** as a compiler built-in
+  derive — see D-0059 and `design/0010-json.md` (phase 2, I#100).
 - **`__delitem__`** (`del a[i]`) is reserved but unimplemented (no `del`
   statement yet). The **in-place `__iadd__` family** (`__iadd__`, `__isub__`,
   `__imul__`, `__itruediv__`, `__ifloordiv__`, `__imod__`, `__ipow__`,
