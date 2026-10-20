@@ -25,10 +25,12 @@ mod deque;
 mod fs;
 mod gc;
 mod gzip;
+mod http;
 mod io;
 mod json;
 mod logging;
 mod math;
+mod net;
 mod os;
 mod oset;
 mod process;
@@ -82,6 +84,8 @@ pub(super) const MODULES: &[ModuleLower] = &[
     zlib::MODULE,
     gzip::MODULE,
     sync::MODULE,
+    net::MODULE,
+    http::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

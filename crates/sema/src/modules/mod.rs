@@ -25,10 +25,12 @@ mod deque;
 mod fs;
 mod gc;
 mod gzip;
+mod http;
 mod io;
 mod json;
 mod logging;
 mod math;
+mod net;
 mod os;
 mod oset;
 mod process;
@@ -77,6 +79,8 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     zlib::MODULE,
     gzip::MODULE,
     sync::MODULE,
+    net::MODULE,
+    http::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute

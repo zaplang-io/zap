@@ -7595,3 +7595,924 @@ void zap_once_end(void *op) {
     }
     pthread_mutex_unlock(&o->mu);
 }
+
+/* ===========================================================================
+ * net / http (ticket #104, D-0056). Plaintext TCP sockets + HTTP/1.1 client and
+ * server, built on the netpoller (#80) and the M:N scheduler (#47): every
+ * socket operation is non-blocking and PARKS the goroutine on a would-block
+ * (freeing its worker M) via `zap_netpoll_wait`, rather than blocking an OS
+ * thread or busy-polling. TLS/https and UDP are out of scope for v1 (plaintext
+ * TCP only); keep-alive, chunked transfer-encoding and graceful shutdown are
+ * follow-ups (noted in the PR / design/0005).
+ *
+ * GC discipline (precise Immix): a socket op parks, and the collector traces a
+ * parked G by its shadow chain only — NOT the green-stack C locals of this
+ * runtime. So no GC pointer is held across a park: input payloads are copied
+ * into `malloc` scratch up front, all I/O uses that scratch, and the GC result
+ * objects (ZapStr, the handles below) are built only at the end with no park
+ * after. This mirrors the "malloc scratch -> copy into a GC buffer" rule the
+ * process (#97) and zlib (#106) runtime sections already follow.
+ * ========================================================================== */
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stddef.h> /* offsetof */
+#include <sys/socket.h>
+#include <sys/types.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0 /* fallback: SIGPIPE possible on peer close, but compiles */
+#endif
+
+/* First occurrence of `needle` (nlen bytes) in `hay` (hlen bytes), or NULL.
+ * A dependency-free stand-in for memmem (no _GNU_SOURCE requirement). */
+static const char *zap_memfind(const char *hay, size_t hlen, const char *needle, size_t nlen) {
+    if (nlen == 0 || hlen < nlen) {
+        return NULL;
+    }
+    for (size_t i = 0; i + nlen <= hlen; i++) {
+        if (hay[i] == needle[0] && memcmp(hay + i, needle, nlen) == 0) {
+            return hay + i;
+        }
+    }
+    return NULL;
+}
+
+/* Raise a catchable Zap exception from a C message (NUL-terminated). */
+static void zap_net_panic(const char *msg) {
+    zap_panic(zap_str_new(msg, (int64_t)strlen(msg)));
+}
+
+/* NUL-terminated malloc copy of a ZapStr's bytes (host/port/URL parsing). The
+ * caller frees. Returns NULL only on allocation failure. */
+static char *zap_net_dupz(const ZapStr *s) {
+    char *out = (char *)malloc((size_t)s->len + 1);
+    if (!out) {
+        return NULL;
+    }
+    if (s->len > 0) {
+        memcpy(out, s->data, (size_t)s->len);
+    }
+    out[s->len] = '\0';
+    return out;
+}
+
+/* ---- socket handle -------------------------------------------------------- *
+ * A listener or connection. `pd` is the netpoller descriptor (plain malloc
+ * infra, never GC) or NULL when the netpoller is unavailable (non-Linux; this
+ * file only compiles on Linux, so NULL is the defensive blocking fallback).
+ * The handle is ATOMIC — fd is a scalar and pd is non-GC, so nothing to trace. */
+typedef struct {
+    int fd;
+    void *pd;
+} ZapSock;
+
+static const ZapTypeDesc zap_desc_sock = {(int64_t)sizeof(ZapSock), ZAP_TD_ATOMIC, 0, NULL};
+
+/* Wrap an owned fd: make it non-blocking and register it with the netpoller.
+ * Returns a GC handle. No park happens here, so building the GC object is safe. */
+static ZapSock *zap_sock_wrap(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) {
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
+    void *pd = zap_netpoll_open((int64_t)fd); /* NULL => blocking-poll fallback */
+    ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
+    s->fd = fd;
+    s->pd = pd;
+    return s;
+}
+
+/* Park until `fd` is ready for `mode` (ZAP_POLL_READ / ZAP_POLL_WRITE). With the
+ * netpoller this frees the M; without it (pd == NULL) fall back to a blocking
+ * poll() bracketed by enter/leave_blocking so the collector treats us as stopped.
+ * Returns 0 on readiness, -1 if the descriptor was closed under us. */
+static int zap_sock_park(int fd, void *pd, int mode) {
+    if (pd) {
+        int64_t r = zap_netpoll_wait(pd, mode, 0);
+        return (r == ZAP_POLL_CLOSED) ? -1 : 0;
+    }
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = (short)((mode == ZAP_POLL_READ) ? POLLIN : POLLOUT);
+    pfd.revents = 0;
+    zap_enter_blocking();
+    poll(&pfd, 1, -1);
+    zap_leave_blocking();
+    return 0;
+}
+
+/* ---- net.listen / connect / accept / recv / send / port / close ----------- */
+
+/* Resolve host:port into an addrinfo list for a STREAM socket. `passive` adds
+ * AI_PASSIVE (bind side). getaddrinfo can block on real DNS, so it is bracketed
+ * by enter/leave_blocking; numeric hosts (127.0.0.1, ::1) resolve without I/O.
+ * On failure raises a Zap exception. Caller freeaddrinfo()s the result. */
+static struct addrinfo *zap_net_resolve(const ZapStr *host, int64_t port, int passive) {
+    char *hz = zap_net_dupz(host);
+    if (!hz) {
+        zap_net_panic("net: out of memory");
+        return NULL;
+    }
+    char portbuf[16];
+    snprintf(portbuf, sizeof portbuf, "%ld", (long)port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    if (passive) {
+        hints.ai_flags = AI_PASSIVE;
+    }
+    const char *node = (host->len == 0 && passive) ? NULL : hz;
+    struct addrinfo *res = NULL;
+    zap_enter_blocking();
+    int rc = getaddrinfo(node, portbuf, &hints, &res);
+    zap_leave_blocking();
+    free(hz);
+    if (rc != 0) {
+        char msg[256];
+        snprintf(msg, sizeof msg, "net: resolve failed: %s", gai_strerror(rc));
+        zap_net_panic(msg);
+        return NULL;
+    }
+    return res;
+}
+
+/* net.listen(host, port) -> listener handle. Binds + listens; SO_REUSEADDR so a
+ * server can rebind an ephemeral port promptly across test runs. Port 0 asks the
+ * OS for an ephemeral port (read back with net.port). */
+void *zap_net_listen(void *host_, int64_t port) {
+    struct addrinfo *res = zap_net_resolve((const ZapStr *)host_, port, 1);
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 128) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) {
+        zap_net_panic("net: listen failed");
+        return NULL;
+    }
+    return zap_sock_wrap(fd);
+}
+
+/* net.connect(host, port) -> connection handle. Non-blocking connect: on
+ * EINPROGRESS park for writability, then check SO_ERROR. Tries each resolved
+ * address in turn. */
+void *zap_net_connect(void *host_, int64_t port) {
+    struct addrinfo *res = zap_net_resolve((const ZapStr *)host_, port, 0);
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        int fl = fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) {
+            fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        }
+        void *pd = zap_netpoll_open((int64_t)fd);
+        int ok = 0;
+        for (;;) {
+            int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+            if (rc == 0) {
+                ok = 1;
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EINPROGRESS || errno == EALREADY) {
+                if (zap_sock_park(fd, pd, ZAP_POLL_WRITE) < 0) {
+                    break;
+                }
+                int soerr = 0;
+                socklen_t sl = sizeof soerr;
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0 || soerr != 0) {
+                    break;
+                }
+                ok = 1;
+                break;
+            }
+            if (errno == EISCONN) {
+                ok = 1;
+                break;
+            }
+            break;
+        }
+        if (ok) {
+            freeaddrinfo(res);
+            /* Reuse the descriptor opened above: wrap without re-registering. */
+            ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
+            s->fd = fd;
+            s->pd = pd;
+            return s;
+        }
+        if (pd) {
+            zap_netpoll_close(pd);
+        }
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    zap_net_panic("net: connect failed");
+    return NULL;
+}
+
+/* net.accept(listener) -> connection handle. Parks on readability until a peer
+ * connects. */
+void *zap_net_accept(void *l_) {
+    ZapSock *l = (ZapSock *)l_;
+    int lfd = l->fd;
+    void *lpd = l->pd;
+    for (;;) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd >= 0) {
+            return zap_sock_wrap(cfd);
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (zap_sock_park(lfd, lpd, ZAP_POLL_READ) < 0) {
+                zap_net_panic("net: accept on a closed listener");
+                return NULL;
+            }
+            continue;
+        }
+        zap_net_panic("net: accept failed");
+        return NULL;
+    }
+}
+
+/* net.recv(conn, n) -> str. Reads up to `n` bytes (one readiness-gated read);
+ * returns an empty str on EOF. The scratch buffer is malloc (lives across the
+ * park); the result is copied into a GC str at the end. */
+void *zap_net_recv(void *c_, int64_t n) {
+    ZapSock *c = (ZapSock *)c_;
+    int fd = c->fd;
+    void *pd = c->pd;
+    if (n < 0) {
+        n = 0;
+    }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) {
+        zap_net_panic("net: out of memory");
+        return NULL;
+    }
+    ssize_t got = 0;
+    for (;;) {
+        ssize_t r = recv(fd, buf, (size_t)n, 0);
+        if (r >= 0) {
+            got = r;
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (zap_sock_park(fd, pd, ZAP_POLL_READ) < 0) {
+                got = 0;
+                break;
+            }
+            continue;
+        }
+        free(buf);
+        zap_net_panic("net: recv failed");
+        return NULL;
+    }
+    void *out = zap_str_new(buf, (int64_t)got);
+    free(buf);
+    return out;
+}
+
+/* Write all `len` bytes of `data` to `fd`, parking on EAGAIN. MSG_NOSIGNAL
+ * suppresses SIGPIPE on a peer close (the #77 signal subsystem is left alone).
+ * `data` is malloc scratch, so it survives the parks. Returns bytes written, or
+ * -1 on a hard error. */
+static ssize_t zap_sock_send_all(int fd, void *pd, const char *data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = send(fd, data + off, len - off, MSG_NOSIGNAL);
+        if (w >= 0) {
+            off += (size_t)w;
+            continue;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (zap_sock_park(fd, pd, ZAP_POLL_WRITE) < 0) {
+                return -1;
+            }
+            continue;
+        }
+        return -1;
+    }
+    return (ssize_t)off;
+}
+
+/* net.send(conn, data) -> int64 bytes written. Copies the payload to malloc
+ * scratch first so no GC pointer is held across the write parks. */
+int64_t zap_net_send(void *c_, void *data_) {
+    ZapSock *c = (ZapSock *)c_;
+    int fd = c->fd;
+    void *pd = c->pd;
+    const ZapStr *data = (const ZapStr *)data_;
+    size_t len = (size_t)(data->len < 0 ? 0 : data->len);
+    char *scratch = (char *)malloc(len + 1);
+    if (!scratch) {
+        zap_net_panic("net: out of memory");
+        return 0;
+    }
+    if (len > 0) {
+        memcpy(scratch, data->data, len);
+    }
+    ssize_t w = zap_sock_send_all(fd, pd, scratch, len);
+    free(scratch);
+    if (w < 0) {
+        zap_net_panic("net: send failed");
+        return 0;
+    }
+    return (int64_t)w;
+}
+
+/* net.port(listener) -> int64. The locally bound port (host byte order), so an
+ * ephemeral `net.listen(host, 0)` can be discovered and dialed. */
+int64_t zap_net_port(void *s_) {
+    ZapSock *s = (ZapSock *)s_;
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    if (getsockname(s->fd, (struct sockaddr *)&ss, &sl) != 0) {
+        return 0;
+    }
+    if (ss.ss_family == AF_INET6) {
+        return (int64_t)ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+    }
+    return (int64_t)ntohs(((struct sockaddr_in *)&ss)->sin_port);
+}
+
+/* Close a raw fd + netpoller descriptor. Used both by net.close and by the HTTP
+ * client, which holds only fd+pd (never the GC handle) across its I/O parks. */
+static void zap_sock_shutdown(int fd, void *pd) {
+    if (pd) {
+        zap_netpoll_close(pd);
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+/* net.close_conn / net.close_listener. Deregisters from the netpoller (waking
+ * any parked waiter with CLOSED) and closes the fd. Idempotent-ish: a second
+ * close is a harmless EBADF. */
+void zap_net_close(void *s_) {
+    ZapSock *s = (ZapSock *)s_;
+    if (s->fd < 0) {
+        return;
+    }
+    zap_sock_shutdown(s->fd, s->pd);
+    s->pd = NULL;
+    s->fd = -1;
+}
+
+/* ---- HTTP/1.1 ------------------------------------------------------------- *
+ * A growable malloc byte buffer used to accumulate a message off a socket. It is
+ * NUL-terminated after every append (one spare byte) so the textual header
+ * scan can use memmem/strstr safely; the body may still contain NULs (length is
+ * tracked separately). Never GC — it lives across recv parks. */
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} ZapDynBuf;
+
+static int zap_dyn_reserve(ZapDynBuf *b, size_t extra) {
+    if (b->len + extra + 1 <= b->cap) {
+        return 0;
+    }
+    size_t cap = b->cap ? b->cap : 256;
+    while (b->len + extra + 1 > cap) {
+        cap *= 2;
+    }
+    char *nb = (char *)realloc(b->buf, cap);
+    if (!nb) {
+        return -1;
+    }
+    b->buf = nb;
+    b->cap = cap;
+    return 0;
+}
+
+static void zap_dyn_free(ZapDynBuf *b) {
+    free(b->buf);
+    b->buf = NULL;
+    b->len = b->cap = 0;
+}
+
+/* Read one chunk from the socket into `b`. Returns bytes read (0 = EOF), or -1
+ * on error. */
+static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd) {
+    if (zap_dyn_reserve(b, 4096) != 0) {
+        return -1;
+    }
+    for (;;) {
+        ssize_t r = recv(fd, b->buf + b->len, b->cap - b->len - 1, 0);
+        if (r > 0) {
+            b->len += (size_t)r;
+            b->buf[b->len] = '\0';
+            return r;
+        }
+        if (r == 0) {
+            b->buf[b->len] = '\0';
+            return 0;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (zap_sock_park(fd, pd, ZAP_POLL_READ) < 0) {
+                return 0; /* closed: treat as EOF */
+            }
+            continue;
+        }
+        return -1;
+    }
+}
+
+/* Case-insensitive lookup of header `name` in the raw header block [hbuf,hlen)
+ * (the bytes between the request/status line and the blank line). Writes the
+ * trimmed value into a fresh GC str via *out (empty str when absent). The header
+ * block is malloc scratch, so this is called before any further park. */
+static void *zap_http_header_value(const char *hbuf, size_t hlen, const char *name) {
+    size_t nlen = strlen(name);
+    size_t i = 0;
+    while (i < hlen) {
+        /* start of a header line */
+        size_t line = i;
+        while (i < hlen && hbuf[i] != '\n') {
+            i++;
+        }
+        size_t end = i; /* points at '\n' or hlen */
+        if (end > line && hbuf[end - 1] == '\r') {
+            end--;
+        }
+        /* does this line start with "name:" (case-insensitive)? */
+        if (end - line > nlen && hbuf[line + nlen] == ':') {
+            int match = 1;
+            for (size_t k = 0; k < nlen; k++) {
+                char a = hbuf[line + k];
+                char b = name[k];
+                if (a >= 'A' && a <= 'Z') {
+                    a = (char)(a - 'A' + 'a');
+                }
+                if (b >= 'A' && b <= 'Z') {
+                    b = (char)(b - 'A' + 'a');
+                }
+                if (a != b) {
+                    match = 0;
+                    break;
+                }
+            }
+            if (match) {
+                size_t v = line + nlen + 1;
+                while (v < end && (hbuf[v] == ' ' || hbuf[v] == '\t')) {
+                    v++;
+                }
+                return zap_str_new(hbuf + v, (int64_t)(end - v));
+            }
+        }
+        i++; /* skip the '\n' */
+    }
+    return zap_str_new("", 0);
+}
+
+/* Content-Length from a header block, or -1 if absent/unparseable. */
+static long zap_http_content_length(const char *hbuf, size_t hlen) {
+    void *v = zap_http_header_value(hbuf, hlen, "Content-Length");
+    ZapStr *s = (ZapStr *)v;
+    if (s->len <= 0) {
+        return -1;
+    }
+    long n = 0;
+    int any = 0;
+    for (int64_t k = 0; k < s->len; k++) {
+        char ch = s->data[k];
+        if (ch < '0' || ch > '9') {
+            break;
+        }
+        n = n * 10 + (ch - '0');
+        any = 1;
+    }
+    return any ? n : -1;
+}
+
+/* ---- HTTP response handle (client) ---------------------------------------- */
+typedef struct {
+    int64_t status;
+    const ZapStr *headers; /* raw header block */
+    const ZapStr *body;
+} ZapHttpResp;
+
+static const int32_t zap_off_httpresp[] = {
+    (int32_t)offsetof(ZapHttpResp, headers),
+    (int32_t)offsetof(ZapHttpResp, body),
+};
+static const ZapTypeDesc zap_desc_httpresp = {(int64_t)sizeof(ZapHttpResp), ZAP_TD_PRECISE, 2,
+                                              zap_off_httpresp};
+
+/* ---- HTTP request handle (server) ----------------------------------------- */
+typedef struct {
+    const ZapStr *method;
+    const ZapStr *path;
+    const ZapStr *headers; /* raw header block */
+    const ZapStr *body;
+} ZapHttpReq;
+
+static const int32_t zap_off_httpreq[] = {
+    (int32_t)offsetof(ZapHttpReq, method),
+    (int32_t)offsetof(ZapHttpReq, path),
+    (int32_t)offsetof(ZapHttpReq, headers),
+    (int32_t)offsetof(ZapHttpReq, body),
+};
+static const ZapTypeDesc zap_desc_httpreq = {(int64_t)sizeof(ZapHttpReq), ZAP_TD_PRECISE, 4,
+                                             zap_off_httpreq};
+
+/* Split a message in `b` at the blank line into header-block length and body
+ * offset. Returns 0 and sets *hlen (bytes up to, excluding, the blank line) and
+ * *body_off (first body byte) on success; -1 if no header terminator is present. */
+static int zap_http_split(const ZapDynBuf *b, size_t *hlen, size_t *body_off) {
+    const char *p = zap_memfind(b->buf, b->len, "\r\n\r\n", 4);
+    size_t sep = 4;
+    if (!p) {
+        p = zap_memfind(b->buf, b->len, "\n\n", 2);
+        sep = 2;
+    }
+    if (!p) {
+        return -1;
+    }
+    *hlen = (size_t)(p - b->buf);
+    *body_off = *hlen + sep;
+    return 0;
+}
+
+/* http.request(method, url, body) -> response handle. Opens a connection, sends
+ * a Connection: close request, reads the whole response to EOF, and parses it.
+ * Only http:// URLs are supported; https:// raises (TLS is a follow-up). */
+void *zap_http_request(void *method_, void *url_, void *body_) {
+    const ZapStr *method = (const ZapStr *)method_;
+    const ZapStr *url = (const ZapStr *)url_;
+    const ZapStr *body = (const ZapStr *)body_;
+
+    char *u = zap_net_dupz(url);
+    char *mz = zap_net_dupz(method);
+    if (!u || !mz) {
+        free(u);
+        free(mz);
+        zap_net_panic("http: out of memory");
+        return NULL;
+    }
+    if (strncmp(u, "https://", 8) == 0) {
+        free(u);
+        free(mz);
+        zap_net_panic("http: https/TLS not supported yet (follow-up, see I#104)");
+        return NULL;
+    }
+    const char *rest = u;
+    if (strncmp(u, "http://", 7) == 0) {
+        rest = u + 7;
+    }
+    /* host[:port][/path] */
+    size_t hostend = 0;
+    while (rest[hostend] && rest[hostend] != '/' && rest[hostend] != ':') {
+        hostend++;
+    }
+    char *host = (char *)malloc(hostend + 1);
+    if (!host) {
+        free(u);
+        free(mz);
+        zap_net_panic("http: out of memory");
+        return NULL;
+    }
+    memcpy(host, rest, hostend);
+    host[hostend] = '\0';
+    long port = 80;
+    const char *after = rest + hostend;
+    if (*after == ':') {
+        after++;
+        port = 0;
+        while (*after >= '0' && *after <= '9') {
+            port = port * 10 + (*after - '0');
+            after++;
+        }
+    }
+    const char *path = (*after == '/') ? after : "/";
+
+    /* Build the request into malloc scratch (survives the I/O parks). */
+    ZapStr hostz;
+    hostz.len = (int64_t)strlen(host);
+    hostz.data = host;
+    /* We dial via zap_net_connect, which takes a ZapStr* host. */
+    void *conn_v = zap_net_connect(&hostz, port);
+    free(host);
+    ZapSock *conn = (ZapSock *)conn_v;
+    int fd = conn->fd;
+    void *pd = conn->pd;
+
+    size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
+    size_t reqcap = strlen(mz) + strlen(path) + hostend + blen + 256;
+    char *req = (char *)malloc(reqcap);
+    if (!req) {
+        free(u);
+        free(mz);
+        zap_sock_shutdown(fd, pd);
+        zap_net_panic("http: out of memory");
+        return NULL;
+    }
+    int hdr = snprintf(req, reqcap,
+                       "%s %s HTTP/1.1\r\nHost: %.*s\r\nConnection: close\r\n",
+                       mz, path, (int)hostend, rest);
+    if (blen > 0) {
+        hdr += snprintf(req + hdr, reqcap - (size_t)hdr,
+                        "Content-Length: %zu\r\nContent-Type: text/plain; charset=utf-8\r\n",
+                        blen);
+    }
+    hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "\r\n");
+    if (blen > 0) {
+        memcpy(req + hdr, body->data, blen);
+        hdr += (int)blen;
+    }
+    free(u);
+    free(mz);
+
+    ssize_t sent = zap_sock_send_all(fd, pd, req, (size_t)hdr);
+    free(req);
+    if (sent < 0) {
+        zap_sock_shutdown(fd, pd);
+        zap_net_panic("http: send failed");
+        return NULL;
+    }
+
+    /* Read the entire response (server closes after it, Connection: close). */
+    ZapDynBuf b = {NULL, 0, 0};
+    for (;;) {
+        ssize_t r = zap_dyn_fill(&b, fd, pd);
+        if (r <= 0) {
+            break;
+        }
+    }
+    zap_sock_shutdown(fd, pd);
+
+    size_t hlen = 0, body_off = b.len;
+    long status = 0;
+    if (b.len > 0 && zap_http_split(&b, &hlen, &body_off) == 0) {
+        /* status line: "HTTP/1.1 200 ..." — find the first space, then 3 digits */
+        size_t sp = 0;
+        while (sp < hlen && b.buf[sp] != ' ') {
+            sp++;
+        }
+        sp++;
+        while (sp < hlen && b.buf[sp] >= '0' && b.buf[sp] <= '9') {
+            status = status * 10 + (b.buf[sp] - '0');
+            sp++;
+        }
+    }
+    /* status line occupies the first line of the header block; the header block
+     * for lookups starts after it. Find the end of the first line. */
+    size_t hstart = 0;
+    while (hstart < hlen && b.buf[hstart] != '\n') {
+        hstart++;
+    }
+    if (hstart < hlen) {
+        hstart++; /* past the '\n' */
+    }
+
+    /* Build GC results at the end (no park after this point). */
+    void *headers = zap_str_new(b.buf + hstart, (int64_t)(hlen > hstart ? hlen - hstart : 0));
+    void *bodyobj = zap_str_new(b.buf + body_off, (int64_t)(b.len > body_off ? b.len - body_off : 0));
+    zap_dyn_free(&b);
+
+    ZapHttpResp *resp = (ZapHttpResp *)zap_obj(&zap_desc_httpresp);
+    resp->status = (int64_t)status;
+    resp->headers = (const ZapStr *)headers;
+    resp->body = (const ZapStr *)bodyobj;
+    return resp;
+}
+
+void *zap_http_get(void *url_) {
+    ZapStr g;
+    g.len = 3;
+    g.data = "GET";
+    ZapStr empty;
+    empty.len = 0;
+    empty.data = "";
+    return zap_http_request(&g, url_, &empty);
+}
+
+void *zap_http_post(void *url_, void *body_) {
+    ZapStr p;
+    p.len = 4;
+    p.data = "POST";
+    return zap_http_request(&p, url_, body_);
+}
+
+int64_t zap_http_status(void *resp_) { return ((ZapHttpResp *)resp_)->status; }
+void *zap_http_body(void *resp_) { return (void *)((ZapHttpResp *)resp_)->body; }
+
+void *zap_http_header(void *resp_, void *name_) {
+    ZapHttpResp *resp = (ZapHttpResp *)resp_;
+    char *nz = zap_net_dupz((const ZapStr *)name_);
+    if (!nz) {
+        return zap_str_new("", 0);
+    }
+    void *v = zap_http_header_value(resp->headers->data, (size_t)resp->headers->len, nz);
+    free(nz);
+    return v;
+}
+
+/* http.url(host, port, path) -> "http://host:port/path". A convenience for
+ * dialing a server whose (ephemeral) port is only known at runtime; `path` gets
+ * a leading '/' if it lacks one. No park, so the GC result is built directly. */
+void *zap_http_url(void *host_, int64_t port, void *path_) {
+    const ZapStr *host = (const ZapStr *)host_;
+    const ZapStr *path = (const ZapStr *)path_;
+    size_t hlen = (size_t)(host->len < 0 ? 0 : host->len);
+    size_t plen = (size_t)(path->len < 0 ? 0 : path->len);
+    size_t cap = hlen + plen + 48;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        zap_net_panic("http: out of memory");
+        return NULL;
+    }
+    int n = snprintf(out, cap, "http://%.*s:%ld", (int)hlen, host->data, (long)port);
+    if (plen == 0 || path->data[0] != '/') {
+        n += snprintf(out + n, cap - (size_t)n, "/");
+    }
+    if (plen > 0) {
+        memcpy(out + n, path->data, plen);
+        n += (int)plen;
+    }
+    void *s = zap_str_new(out, (int64_t)n);
+    free(out);
+    return s;
+}
+
+/* http.read_request(conn) -> request handle. Reads headers up to the blank line,
+ * then Content-Length body bytes (default 0). Parses the request line
+ * "METHOD PATH HTTP/1.1". Keep-alive is not assumed; a client sending
+ * Connection: close is handled the same way. */
+void *zap_http_read_request(void *c_) {
+    ZapSock *c = (ZapSock *)c_;
+    int fd = c->fd;
+    void *pd = c->pd;
+
+    ZapDynBuf b = {NULL, 0, 0};
+    size_t hlen = 0, body_off = 0;
+    int have_headers = 0;
+    for (;;) {
+        if (zap_http_split(&b, &hlen, &body_off) == 0) {
+            have_headers = 1;
+            break;
+        }
+        ssize_t r = zap_dyn_fill(&b, fd, pd);
+        if (r <= 0) {
+            break;
+        }
+    }
+    if (!have_headers) {
+        zap_dyn_free(&b);
+        zap_net_panic("http: incomplete request");
+        return NULL;
+    }
+
+    /* request line */
+    size_t i = 0;
+    size_t mstart = 0;
+    while (i < hlen && b.buf[i] != ' ') {
+        i++;
+    }
+    size_t mend = i;
+    while (i < hlen && b.buf[i] == ' ') {
+        i++;
+    }
+    size_t pstart = i;
+    while (i < hlen && b.buf[i] != ' ' && b.buf[i] != '\r' && b.buf[i] != '\n') {
+        i++;
+    }
+    size_t pend = i;
+    /* header block begins after the request line */
+    size_t hstart = pend;
+    while (hstart < hlen && b.buf[hstart] != '\n') {
+        hstart++;
+    }
+    if (hstart < hlen) {
+        hstart++;
+    }
+
+    /* read the body per Content-Length (relative to the header block) */
+    long clen = zap_http_content_length(b.buf + hstart, hlen > hstart ? hlen - hstart : 0);
+    if (clen < 0) {
+        clen = 0;
+    }
+    while ((size_t)(b.len - body_off) < (size_t)clen) {
+        ssize_t r = zap_dyn_fill(&b, fd, pd);
+        if (r <= 0) {
+            break;
+        }
+    }
+    size_t bodylen = b.len - body_off;
+    if (bodylen > (size_t)clen) {
+        bodylen = (size_t)clen;
+    }
+
+    void *method = zap_str_new(b.buf + mstart, (int64_t)(mend - mstart));
+    void *path = zap_str_new(b.buf + pstart, (int64_t)(pend - pstart));
+    void *headers = zap_str_new(b.buf + hstart, (int64_t)(hlen > hstart ? hlen - hstart : 0));
+    void *bodyobj = zap_str_new(b.buf + body_off, (int64_t)bodylen);
+    zap_dyn_free(&b);
+
+    ZapHttpReq *req = (ZapHttpReq *)zap_obj(&zap_desc_httpreq);
+    req->method = (const ZapStr *)method;
+    req->path = (const ZapStr *)path;
+    req->headers = (const ZapStr *)headers;
+    req->body = (const ZapStr *)bodyobj;
+    return req;
+}
+
+void *zap_http_req_method(void *req_) { return (void *)((ZapHttpReq *)req_)->method; }
+void *zap_http_req_path(void *req_) { return (void *)((ZapHttpReq *)req_)->path; }
+void *zap_http_req_body(void *req_) { return (void *)((ZapHttpReq *)req_)->body; }
+
+void *zap_http_req_header(void *req_, void *name_) {
+    ZapHttpReq *req = (ZapHttpReq *)req_;
+    char *nz = zap_net_dupz((const ZapStr *)name_);
+    if (!nz) {
+        return zap_str_new("", 0);
+    }
+    void *v = zap_http_header_value(req->headers->data, (size_t)req->headers->len, nz);
+    free(nz);
+    return v;
+}
+
+/* Reason phrase for a status code (a small common set; "OK" otherwise). */
+static const char *zap_http_reason(int64_t status) {
+    switch (status) {
+    case 200: return "OK";
+    case 201: return "Created";
+    case 202: return "Accepted";
+    case 204: return "No Content";
+    case 301: return "Moved Permanently";
+    case 302: return "Found";
+    case 304: return "Not Modified";
+    case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
+    case 404: return "Not Found";
+    case 405: return "Method Not Allowed";
+    case 409: return "Conflict";
+    case 500: return "Internal Server Error";
+    case 501: return "Not Implemented";
+    case 503: return "Service Unavailable";
+    default: return "OK";
+    }
+}
+
+/* http.respond(conn, status, body). Writes a minimal HTTP/1.1 response with
+ * Content-Length, a text/plain content type, and Connection: close. */
+void zap_http_respond(void *c_, int64_t status, void *body_) {
+    ZapSock *c = (ZapSock *)c_;
+    int fd = c->fd;
+    void *pd = c->pd;
+    const ZapStr *body = (const ZapStr *)body_;
+    size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
+    size_t cap = blen + 256;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        zap_net_panic("http: out of memory");
+        return;
+    }
+    int hdr = snprintf(out, cap,
+                       "HTTP/1.1 %ld %s\r\nContent-Length: %zu\r\n"
+                       "Content-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n",
+                       (long)status, zap_http_reason(status), blen);
+    if (blen > 0) {
+        memcpy(out + hdr, body->data, blen);
+    }
+    ssize_t w = zap_sock_send_all(fd, pd, out, (size_t)hdr + blen);
+    free(out);
+    if (w < 0) {
+        zap_net_panic("http: respond failed");
+    }
+}
