@@ -17,6 +17,7 @@ use zapc_syntax::ast;
 use super::{FnLower, LowerError};
 use crate::ir::*;
 
+mod crypto;
 mod datetime;
 mod gc;
 mod math;
@@ -47,6 +48,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     signal::MODULE,
     gc::MODULE,
     runtime::MODULE,
+    crypto::MODULE,
     math::MODULE,
     random::MODULE,
     time::MODULE,

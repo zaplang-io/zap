@@ -13,6 +13,7 @@
 
 use super::Cg;
 
+mod crypto;
 mod datetime;
 mod gc;
 mod math;
@@ -28,6 +29,7 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     signal::declare_rt(cg);
     gc::declare_rt(cg);
     runtime::declare_rt(cg);
+    crypto::declare_rt(cg);
     math::declare_rt(cg);
     random::declare_rt(cg);
     time::declare_rt(cg);

@@ -17,6 +17,7 @@ use zapc_syntax::span::Span;
 
 use crate::{Checker, Ty};
 
+mod crypto;
 mod datetime;
 mod gc;
 mod math;
@@ -43,6 +44,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     signal::MODULE,
     gc::MODULE,
     runtime::MODULE,
+    crypto::MODULE,
     math::MODULE,
     random::MODULE,
     time::MODULE,
