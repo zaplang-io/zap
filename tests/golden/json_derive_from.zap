@@ -4,10 +4,6 @@
 # scalar/str fields; bool and float decoding are verified via the clean
 # from_json -> to_json round-trip (print() rendering of bool/float is a separate
 # concern).
-#
-# (Field is `host`, not `name`: reading a struct field via `.name` is blocked by
-# a pre-existing limitation — lowering reserves `.name` for the enum `.name`
-# operation, D-0018 — orthogonal to the codec and tracked separately.)
 
 @derive(Json)
 struct Config:
