@@ -24,6 +24,7 @@ mod datetime;
 mod deque;
 mod fs;
 mod gc;
+mod gzip;
 mod http;
 mod io;
 mod json;
@@ -39,6 +40,7 @@ mod signal;
 mod sync;
 mod sys;
 mod time;
+mod zlib;
 
 /// A built-in module's type-checking facet.
 pub(crate) struct ModuleCheck {
@@ -74,6 +76,8 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     deque::MODULE,
     bisect::MODULE,
     oset::MODULE,
+    zlib::MODULE,
+    gzip::MODULE,
     sync::MODULE,
     net::MODULE,
     http::MODULE,

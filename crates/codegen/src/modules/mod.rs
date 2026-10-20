@@ -20,6 +20,7 @@ mod datetime;
 mod deque;
 mod fs;
 mod gc;
+mod gzip;
 mod http;
 mod io;
 mod json;
@@ -35,6 +36,7 @@ mod signal;
 mod sync;
 mod sys;
 mod time;
+mod zlib;
 
 /// Declare every built-in module's runtime entry points (ticket #121). Called
 /// once from `Cg::translate`. Add a module: create `modules/<name>.rs` with
@@ -59,6 +61,8 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     deque::declare_rt(cg);
     bisect::declare_rt(cg);
     oset::declare_rt(cg);
+    zlib::declare_rt(cg);
+    gzip::declare_rt(cg);
     sync::declare_rt(cg);
     net::declare_rt(cg);
     http::declare_rt(cg);
