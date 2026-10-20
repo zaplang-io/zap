@@ -40,6 +40,7 @@ mod signal;
 mod sync;
 mod sys;
 mod time;
+mod yaml;
 mod zlib;
 
 /// A built-in module's type-checking facet.
@@ -71,6 +72,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     time::MODULE,
     datetime::MODULE,
     json::MODULE,
+    yaml::MODULE,
     logging::MODULE,
     argparse::MODULE,
     deque::MODULE,

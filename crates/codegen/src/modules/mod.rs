@@ -36,6 +36,7 @@ mod signal;
 mod sync;
 mod sys;
 mod time;
+mod yaml;
 mod zlib;
 
 /// Declare every built-in module's runtime entry points (ticket #121). Called
@@ -56,6 +57,7 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     time::declare_rt(cg);
     datetime::declare_rt(cg);
     json::declare_rt(cg);
+    yaml::declare_rt(cg);
     logging::declare_rt(cg);
     argparse::declare_rt(cg);
     deque::declare_rt(cg);

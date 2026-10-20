@@ -1,0 +1,11 @@
+name: "ada"
+id: 7
+admin: true
+addr:
+  city: "paris"
+  zip: 75001
+
+ada
+7
+paris
+75001

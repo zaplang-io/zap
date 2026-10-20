@@ -731,10 +731,20 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
 
     // Generate the bodies of the derived methods (compile-time expansion of the
     // built-in `@derive(...)` decorator, kept isolated from expression lowering).
+    // `@derive(Json)` and `@derive(Yaml)` share the DOM decode core
+    // (`{Struct}__from_json_value`); when a struct derives both, it is emitted by
+    // each, so dedup generated functions by name (keep the first).
+    let mut gen_names: HashSet<String> = HashSet::new();
     for (sid, traits) in &deco.derived {
         for t in traits {
             match t.generate(*sid, &sigs, &ctx) {
-                Ok(funcs) => out.funcs.extend(funcs),
+                Ok(funcs) => {
+                    for f in funcs {
+                        if gen_names.insert(f.name.clone()) {
+                            out.funcs.push(f);
+                        }
+                    }
+                }
                 Err(e) => errors.push(e),
             }
         }
@@ -1038,6 +1048,7 @@ enum DerivedTrait {
     Ord,
     Json,
     Csv,
+    Yaml,
     Hash,
 }
 
@@ -1049,6 +1060,7 @@ impl DerivedTrait {
             "Ord" => Some(DerivedTrait::Ord),
             "Json" => Some(DerivedTrait::Json),
             "Csv" => Some(DerivedTrait::Csv),
+            "Yaml" => Some(DerivedTrait::Yaml),
             "Hash" => Some(DerivedTrait::Hash),
             _ => None,
         }
@@ -1065,6 +1077,7 @@ impl DerivedTrait {
             DerivedTrait::Ord => "__cmp__",
             DerivedTrait::Json => "to_json",
             DerivedTrait::Csv => "to_csv",
+            DerivedTrait::Yaml => "to_yaml",
             DerivedTrait::Hash => "__hash__",
         }
     }
@@ -1092,6 +1105,13 @@ impl DerivedTrait {
                 ("to_csv", vec![Ty::Struct(sid)], Ty::Ptr),
                 ("from_csv", vec![Ty::Ptr], Ty::Struct(sid)),
             ],
+            // Compile-time YAML codec (D-0063, I#149): the encode method
+            // `to_yaml(self) -> str` and the decode associated function
+            // `from_yaml(str) -> Self`. Reuses the shared DOM decode core.
+            DerivedTrait::Yaml => vec![
+                ("to_yaml", vec![Ty::Struct(sid)], Ty::Ptr),
+                ("from_yaml", vec![Ty::Ptr], Ty::Struct(sid)),
+            ],
         }
     }
 
@@ -1117,6 +1137,14 @@ impl DerivedTrait {
                 gen_csv_to_method(sid, sigs, ctx)?,
                 gen_csv_from_method(sid, sigs, ctx)?,
             ],
+            // `from_yaml` parses to the shared `JsonValue` DOM and reuses the
+            // same `from_json_value` decode core (generated here too, deduped
+            // against `@derive(Json)` by name when a struct derives both).
+            DerivedTrait::Yaml => vec![
+                gen_yaml_to_method(sid, sigs, ctx)?,
+                gen_yaml_from_method(sid, sigs, ctx)?,
+                gen_json_from_value_method(sid, sigs, ctx)?,
+            ],
         })
     }
 
@@ -1127,6 +1155,7 @@ impl DerivedTrait {
             DerivedTrait::Ord => "Ord",
             DerivedTrait::Json => "Json",
             DerivedTrait::Csv => "Csv",
+            DerivedTrait::Yaml => "Yaml",
             DerivedTrait::Hash => "Hash",
         }
     }
@@ -1752,6 +1781,140 @@ fn gen_json_decode_field(
         }
     };
     Ok(r)
+}
+
+/// `@derive(Yaml)` encode direction (D-0063, I#149): a `Struct__to_yaml(self)
+/// -> str` method producing a YAML block mapping, one `fname: value` line per
+/// field (declaration order). Scalar values reuse the json inline formatters
+/// (strings JSON-escaped+quoted, which is valid YAML); a nested struct field
+/// recurses through its own derived `to_yaml`, re-indented by two spaces via
+/// `zap_yaml_indent`, so nested records must also `@derive(Yaml)`.
+fn gen_yaml_to_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__to_yaml");
+    let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, true, sigs, ctx);
+    let mut acc = b.strconst("");
+    let fields = ctx.fields[sid as usize].clone();
+    for (idx, (fname, fty)) in fields.iter().enumerate() {
+        let fv = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: fv,
+            base: 0,
+            sid,
+            idx: idx as u32,
+        });
+        if let Some(DeriveFieldKind::Nested(fsid)) = derive_field_kind(*fty) {
+            // `fname:\n` then the child's YAML, indented two spaces.
+            let label = b.strconst(&format!("{fname}:\n"));
+            acc = gen_concat(&mut b, acc, label);
+            let child_name = ctx.names[fsid as usize].clone();
+            let child = b.new_value(Ty::Ptr);
+            b.emit(Inst::Call {
+                dest: Some(child),
+                func: format!("{child_name}__to_yaml"),
+                args: vec![fv],
+            });
+            let pad = b.strconst("  ");
+            let indented = b.new_value(Ty::Ptr);
+            b.emit(Inst::Call {
+                dest: Some(indented),
+                func: "zap_yaml_indent".to_string(),
+                args: vec![child, pad],
+            });
+            acc = gen_concat(&mut b, acc, indented);
+        } else {
+            // `fname: <scalar>\n`
+            let label = b.strconst(&format!("{fname}: "));
+            acc = gen_concat(&mut b, acc, label);
+            let vstr = gen_yaml_encode_scalar(&mut b, fv, *fty)?;
+            acc = gen_concat(&mut b, acc, vstr);
+            let nl = b.strconst("\n");
+            acc = gen_concat(&mut b, acc, nl);
+        }
+    }
+    b.set_term(Term::Ret(Some(acc)));
+    Ok(b.func)
+}
+
+/// Encode one scalar `@derive(Yaml)` field value to its inline YAML text
+/// (reusing the json formatters; JSON scalars are valid YAML). Nested structs
+/// are handled by the caller; other field types are rejected.
+fn gen_yaml_encode_scalar(b: &mut FnLower, fv: Value, fty: Ty) -> Result<Value, LowerError> {
+    let call1 = |b: &mut FnLower, func: &str, arg: Value| -> Value {
+        let d = b.new_value(Ty::Ptr);
+        b.emit(Inst::Call {
+            dest: Some(d),
+            func: func.to_string(),
+            args: vec![arg],
+        });
+        d
+    };
+    let r = match derive_field_kind(fty) {
+        Some(DeriveFieldKind::Bool) => {
+            let w = b.coerce(fv, Ty::I1, Ty::I64);
+            call1(b, "zap_json_bool_str", w)
+        }
+        Some(DeriveFieldKind::Float(w)) => {
+            let f = b.coerce(fv, w, Ty::F64);
+            call1(b, "zap_f64_to_str", f)
+        }
+        Some(DeriveFieldKind::Int(w)) => {
+            let i = b.coerce(fv, w, Ty::I64);
+            call1(b, "zap_i64_to_str", i)
+        }
+        Some(DeriveFieldKind::Str) => call1(b, "zap_json_escape", fv),
+        Some(DeriveFieldKind::Nested(_)) | None => {
+            return Err(err(format!(
+                "@derive(Yaml) does not support field type {fty} yet \
+                 (scalars, str, and nested @derive(Yaml) structs are; \
+                 collections and enums are a follow-up)"
+            )));
+        }
+    };
+    Ok(r)
+}
+
+/// `@derive(Yaml)` decode direction (D-0063, I#149): a `Struct__from_yaml(s:
+/// str) -> Struct` associated function. YAML 1.2 is a JSON superset, so this
+/// parses `s` to the shared `JsonValue` DOM (`__yaml_loads`, which transpiles
+/// the YAML subset to JSON and reuses `__json_loads`), then hands off to the
+/// same recursive `Struct__from_json_value` decode core as `@derive(Json)`.
+fn gen_yaml_from_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let sname = ctx.names[sid as usize].clone();
+    let name = format!("{sname}__from_yaml");
+    let jv_sid = json_value_sid(ctx)?;
+    // One parameter: the source string (value 0); no receiver.
+    let mut b = FnLower::new(
+        name,
+        vec![Ty::Ptr],
+        Ty::Struct(sid),
+        false,
+        false,
+        sigs,
+        ctx,
+    );
+    let jv = b.new_value(Ty::Struct(jv_sid));
+    b.emit(Inst::Call {
+        dest: Some(jv),
+        func: "__yaml_loads".to_string(),
+        args: vec![0],
+    });
+    let dest = b.new_value(Ty::Struct(sid));
+    b.emit(Inst::Call {
+        dest: Some(dest),
+        func: format!("{sname}__from_json_value"),
+        args: vec![jv],
+    });
+    b.set_term(Term::Ret(Some(dest)));
+    Ok(b.func)
 }
 
 /// `@derive(Csv)` encode (D-0059 §4b, I#132): `Struct__to_csv(self) -> str`
@@ -5092,7 +5255,7 @@ impl<'a> FnLower<'a> {
                 // decode associated functions (D-0059, I#100/I#132). Dispatched
                 // when the generated `{Struct}__from_<fmt>` was registered (i.e.
                 // the struct derived that codec); sema type-checked the call.
-                if name == "from_json" || name == "from_csv" {
+                if name == "from_json" || name == "from_csv" || name == "from_yaml" {
                     let fnname = format!("{tyname}__{name}");
                     if self.sigs.contains_key(&fnname) {
                         let (s, _) = self.expr(&args[0].value)?;

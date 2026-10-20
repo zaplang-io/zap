@@ -41,6 +41,7 @@ mod support;
 mod sync;
 mod sys;
 mod time;
+mod yaml;
 mod zlib;
 
 /// A module's per-method lowering hook: lower `method(args)` to ZIR, emitting the
@@ -76,6 +77,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     time::MODULE,
     datetime::MODULE,
     json::MODULE,
+    yaml::MODULE,
     logging::MODULE,
     argparse::MODULE,
     deque::MODULE,

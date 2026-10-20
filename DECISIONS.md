@@ -980,3 +980,47 @@ request headers / content types; and server graceful-shutdown/SIGTERM semantics
 plaintext core on the existing netpoller is the smallest piece that unblocks the
 ecosystem epics; TLS is the one genuinely large follow-up and is best decided on
 its own.
+
+## D-0063 — `yaml`: subset YAML serde on the shared JsonValue DOM / derive core
+**Status:** Locked — resolves issue #149. Promotes `yaml` out of the ecosystem
+epic (#109) into core, the third serde format on the shared substrate
+(design/0010-json.md §4b) after json (D-0059) and csv. On the #121 module seam
+(`modules/yaml.rs` per crate + one registry line each + a `zaprt.c` banner
+section). D-0062 is the sibling TLS decision (#147).
+
+- **Reuse `JsonValue`, do not invent `YamlValue`.** YAML 1.2 is a JSON superset,
+  so the common data model (null/bool/int/float/string, sequences, mappings)
+  maps onto the existing compiler-known `JsonValue` prelude enum. `yaml.load(str)
+  -> JsonValue` and `yaml.dump(JsonValue) -> str`. A YAML-only `YamlValue` is
+  revisited only if a YAML-specific type ever forces it.
+- **Backend: hand-written YAML→JSON transpiler in C, NOT libyaml.** `yaml.load`
+  is `__yaml_loads(s) = __json_loads(yaml._to_json(s))`: a small subset scanner
+  (`zap_yaml_to_json` in `zaprt.c`) rewrites the supported YAML surface to a JSON
+  string, which the existing json tokenizer + prelude tree builder parse into
+  `JsonValue`. This keeps all DOM-layout knowledge out of the runtime (the json
+  precedent) and keeps core dependency-free. Linking system libyaml (`-lyaml`,
+  the zlib `-lz` precedent) was the documented fallback; it proved unnecessary —
+  a correct pragmatic subset was cheap on top of the json DOM. `yaml.dump` is a
+  Zap prelude block-style writer (`__yaml_dumps`) over `JsonValue`.
+- **`@derive(Yaml)`** mirrors `@derive(Json)`: `to_yaml(self) -> str` (a block
+  mapping; scalars reuse the json inline formatters, nested structs recurse and
+  are re-indented by `zap_yaml_indent`) + a `from_yaml(str) -> Self` associated
+  function that parses to the DOM and reuses the SAME `{Struct}__from_json_value`
+  decode core as `@derive(Json)`/`@derive(Csv)` (the shared `DeriveFieldKind`
+  walk). A struct deriving both Json and Yaml emits that shared core once (deduped
+  by name). Flat + nested structs; collections/enums remain the follow-up.
+- **Supported v1 subset:** block mappings + block sequences (incl. `- key: val`
+  sequences of mappings), JSON-compatible flow `{...}`/`[...]`, plain / single- /
+  double-quoted scalars, `#` comments, a single leading `---`/`...` document
+  marker, and YAML 1.2 core scalar resolution (null/~, true/false, int, float,
+  else string). Indentation is spaces only — a tab in indentation is rejected
+  (`zap_panic`).
+- **No grammar change:** the whole surface is generic module calls plus the
+  existing `@derive(...)` syntax (existing EBNF).
+
+**Deferred (follow-ups, noted in the PR):** anchors & aliases (`&`/`*`),
+custom/explicit tags (`!!`), merge keys (`<<`), multi-document streams (beyond a
+single `---`), block scalars (`|` literal and `>` folded — deferred together
+because the line-oriented comment-strip/trim preprocessor is lossy for their
+significant whitespace), complex/non-string mapping keys, and directives. These
+are the long tail of the spec; v1 targets the 95% config/data-file use.
