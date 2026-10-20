@@ -24,10 +24,12 @@ mod datetime;
 mod deque;
 mod fs;
 mod gc;
+mod http;
 mod io;
 mod json;
 mod logging;
 mod math;
+mod net;
 mod os;
 mod oset;
 mod process;
@@ -78,6 +80,8 @@ pub(super) const MODULES: &[ModuleLower] = &[
     bisect::MODULE,
     oset::MODULE,
     sync::MODULE,
+    net::MODULE,
+    http::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

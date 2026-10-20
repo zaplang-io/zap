@@ -20,10 +20,12 @@ mod datetime;
 mod deque;
 mod fs;
 mod gc;
+mod http;
 mod io;
 mod json;
 mod logging;
 mod math;
+mod net;
 mod os;
 mod oset;
 mod process;
@@ -58,4 +60,6 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     bisect::declare_rt(cg);
     oset::declare_rt(cg);
     sync::declare_rt(cg);
+    net::declare_rt(cg);
+    http::declare_rt(cg);
 }

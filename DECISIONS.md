@@ -904,3 +904,43 @@ the shared substrate once rather than extract-on-second-use; a compiler built-in
 derive delivers the high-value typed path (gates AWS #89, web #107) without waiting
 on staged generics/macros; the `Int`/`Float` split honors Zap's static-typing
 pitch; recursive-descent keeps v1 small and correct with a clean SIMD upgrade path.
+
+## D-0061 — `net`/`http`: plaintext TCP + HTTP/1.1 on the netpoller
+**Status:** Locked — resolves issue #104 (scope set by D-0056). Completes the
+core stdlib (epic #79) and unblocks AWS #89, the web framework #107, and the
+ecosystem clients #109. On the #121 module seam (per-crate `modules/{net,http}.rs`
++ one registry line each + a `zaprt.c` banner section).
+
+- **Netpoller-first I/O.** Every socket operation is non-blocking and, on a
+  would-block, PARKS the goroutine via `zap_netpoll_wait` (#80) — freeing its
+  worker M — instead of blocking an OS thread or busy-polling. A descriptor is
+  registered once per socket (edge-triggered R+W) at create time. `getaddrinfo`
+  (DNS) and the no-netpoller fallback `poll()` are bracketed by
+  `zap_enter/leave_blocking`. No GC pointer is held across a park: input payloads
+  are copied to `malloc` scratch and results built as GC objects only at the end
+  (the precise collector traces a parked G by its shadow chain, not runtime C
+  locals) — the same rule the `process`/`zlib` sections follow.
+- **Opaque handles.** Sockets (`ZapSock`) and parsed HTTP messages
+  (`ZapHttpResp`/`ZapHttpReq`) are opaque GC objects typed as `bytes` in sema
+  (the `crypto`/`sync` handle pattern) — no new `Ty`, no prelude struct. Sockets
+  are ATOMIC (fd + non-GC poller desc); message handles are PRECISE (trace their
+  `ZapStr` fields).
+- **Surface.** `net`: `listen`/`accept`/`connect`/`recv`/`send`/`port`/
+  `close_conn`/`close_listener` (socket close is not `close` — that token is the
+  reserved channel-close). `http` client: `get`/`post`/`request` →
+  `status`/`body`/`header`; `url(host,port,path)` builds a URL (there is no
+  int→str conversion yet). `http` server: `read_request` →
+  `method`/`path`/`req_header`/`req_body`, and `respond(conn,status,body)`. The
+  server's accept loop and per-connection goroutines are written in Zap
+  (`spawn handle(conn)`; `bytes` is a valid parameter type), so concurrent
+  connections ride the scheduler.
+- **No grammar change:** the whole surface is generic module calls (existing EBNF).
+
+**Deferred (follow-ups):** TLS/`https` (needs a separate un-defer decision; gates
+#109 — rejected at runtime for now); UDP; HTTP keep-alive (client sends
+`Connection: close` and reads to EOF); chunked transfer-encoding; custom client
+request headers / content types; and server graceful-shutdown/SIGTERM semantics
+(belong to the web framework #107). **Rationale:** a correct, concurrency-safe
+plaintext core on the existing netpoller is the smallest piece that unblocks the
+ecosystem epics; TLS is the one genuinely large follow-up and is best decided on
+its own.

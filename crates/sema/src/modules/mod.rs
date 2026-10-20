@@ -24,10 +24,12 @@ mod datetime;
 mod deque;
 mod fs;
 mod gc;
+mod http;
 mod io;
 mod json;
 mod logging;
 mod math;
+mod net;
 mod os;
 mod oset;
 mod process;
@@ -73,6 +75,8 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     bisect::MODULE,
     oset::MODULE,
     sync::MODULE,
+    net::MODULE,
+    http::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute
