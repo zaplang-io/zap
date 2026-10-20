@@ -64,6 +64,74 @@ make docker-test                          # full suite incl. LLVM codegen
 make docker-run FILE=tests/golden/fib.zap # compile + run a program  -> 55
 ```
 
+## Build performance: fast + memory-bounded (tickets #128, #123)
+
+A full LLVM codegen build is heavy — the link step is the RAM peak, and running
+several at once can swap a laptop to death. The build setup is tuned so a single
+run has a predictable ceiling and concurrent runs from different worktrees are
+safe. **The iteration workflow:**
+
+```bash
+make check          # host type-check of the LLVM-free crates — the quickest loop
+make docker-check   # full-workspace type-check incl. codegen (no link) in the container
+make docker-test    # FINAL GATE: full suite under both collectors — run before you push
+```
+
+Iterate with `cargo check` (`make check`, and `make docker-check` for
+codegen-touching changes); it type-checks without codegen or linking, so it is
+dramatically faster than a full build. Run the full `make docker-test` only as
+the last step before pushing.
+
+What makes it fast and bounded:
+
+- **Resource cap (#128).** Each `docker-test` run is capped (`--memory`,
+  `--cpus`) with container swap disabled, and parallel `rustc` is capped
+  (`CARGO_BUILD_JOBS`), so one run's peak is predictable and an over-budget
+  build fails fast instead of swapping the host. Tune per machine:
+
+  ```bash
+  ZAP_DOCKER_MEMORY=8g ZAP_DOCKER_CPUS=6 ZAP_BUILD_JOBS=6 make docker-test
+  ```
+
+  Two concurrent runs need the Docker VM to hold ~2× `ZAP_DOCKER_MEMORY` plus
+  headroom — raise Docker Desktop's memory allotment, or lower the cap.
+- **Isolated target per worktree (#123).** Each git worktree gets its own named
+  cargo target volume (`zap-target-<worktree-hash>`), so concurrent runs from
+  different worktrees can't reuse each other's stale artifacts (the
+  shared-`zap-target` footgun that produced spurious failures in the stdlib
+  wave). The same worktree reuses its volume across runs for a warm cache.
+  `make clean-docker-target` drops just this worktree's volume.
+- **Shared compiler cache (#128).** `sccache` is wired as `RUSTC_WRAPPER` over a
+  shared `zap-sccache` volume, so a sibling worktree or a later run reuses
+  compiled artifacts. Distinct from the target above: **the target is isolated,
+  the cache is shared.** Check it is working with `make docker-sccache-stats`.
+- **mold linker (#128).** Rust's own link step uses `mold` (via
+  `-fuse-ld=mold`), a faster, lower-RAM linker than GNU ld. On this workspace
+  (few deps, small binaries) it is mainly a link-*time* win — the compile peak
+  is dominated by parallel `rustc`, so `CARGO_BUILD_JOBS` + the hard cap are the
+  real memory levers. Mirrored in the `full` CI job.
+
+### Measured (this host: 16 GB macOS, Docker Desktop VM = 8.5 GB / 4 CPU)
+
+Full workspace incl. LLVM codegen, `CARGO_BUILD_JOBS=4`. "cold" = empty target
++ empty cache; "warm cache" = empty target but shared `sccache` populated.
+
+| metric | before (GNU ld, no cache) | after (mold + sccache) |
+|---|---|---|
+| cold full build (fresh target) | 30 s | 26 s |
+| rebuild, fresh target + warm sccache | 30 s (no cache: always cold) | **9 s** (55 reqs → 35 hits, 0 miss) |
+| warm `cargo check`, host, after editing `lower.rs` (7k lines) | ~1.4 s | ~1.4 s |
+| full `cargo test` suite (Immix, 309 tests) | — | 76 s |
+| peak RSS, cold full build | ~1.0 GB | ~1.2 GB (parallel-compile bound, not link) |
+| per-run memory ceiling | unbounded (≤ VM, could swap host) | **hard `--memory` cap, swap off** |
+
+Takeaways: the shared cache turns a sibling/repeat build from a 30 s cold
+rebuild into a **9 s** cache-hit build; a warm `cargo check` (~1.4 s) is ~18×
+faster than a cold build and ~50× faster than the full test gate; and the
+`--memory` cap with swap disabled makes each run's ceiling a hard, predictable
+bound instead of "whatever the host has" — so concurrent runs can't swap the
+machine to death.
+
 ## The `zap` CLI (D-0053)
 
 `zap` is the one user-facing tool; it drives the internal `zapc` compiler.

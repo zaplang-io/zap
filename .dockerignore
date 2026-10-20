@@ -1,0 +1,9 @@
+# Build context for `make docker-build`. The repo is mounted at /work at run
+# time (a bind volume), so the image itself needs none of the source — keep the
+# build context tiny so `docker build` doesn't ship target/ (gigabytes) to the
+# daemon. See the Makefile `docker-*` targets.
+target
+target-docker
+.git
+**/*.rs.bk
+.claude
