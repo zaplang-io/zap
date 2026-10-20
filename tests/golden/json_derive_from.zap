@@ -16,9 +16,22 @@ struct Config:
     bool debug
     float64 ratio
 
+@derive(Json)
+struct Inner:
+    int64 a
+
+@derive(Json)
+struct Outer:
+    str tag
+    Inner inner
+
 def main():
     auto c = Config.from_json("{\"host\": \"srv\", \"port\": 8080, \"debug\": true, \"ratio\": 0.5}")
     print(c.host)       # srv
     print(c.port)       # 8080
     # Round-trip proves debug (true) and ratio (0.5) decoded correctly.
     print(c.to_json())  # {"host":"srv","port":8080,"debug":true,"ratio":0.5}
+
+    # Nested decode: a nested @derive(Json) struct, via from_json_value recursion.
+    auto o = Outer.from_json("{\"tag\": \"x\", \"inner\": {\"a\": 9}}")
+    print(o.to_json())  # {"tag":"x","inner":{"a":9}}

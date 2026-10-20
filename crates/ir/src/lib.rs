@@ -748,15 +748,27 @@ mod tests {
     #[test]
     fn deferred_builtins_error() {
         // Built-ins in the locked set but not yet generated report cleanly.
-        for src in [
-            "@derive(Json)\nstruct S:\n    int64 x\n",
-            "struct S:\n    @validate(max_len=9)\n    str x\n",
-        ] {
+        for src in ["struct S:\n    @validate(max_len=9)\n    str x\n"] {
             let (ast, _p, _l) = parse_str(src);
             let (_m, errs) = lower_module(&ast);
             assert!(
                 !errs.is_empty(),
                 "expected a deferred-feature error for:\n{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_json_generates_codec() {
+        // @derive(Json) (D-0059, I#100) generates the encode method, the decode
+        // associated function, and its recursive JsonValue core.
+        let (ast, _p, _l) = parse_str("@derive(Json)\nstruct S:\n    int64 x\n    str y\n");
+        let (m, errs) = lower_module(&ast);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        for want in ["S__to_json", "S__from_json", "S__from_json_value"] {
+            assert!(
+                m.funcs.iter().any(|f| f.name == want),
+                "missing generated {want}"
             );
         }
     }
