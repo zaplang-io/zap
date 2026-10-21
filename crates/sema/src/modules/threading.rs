@@ -2,13 +2,13 @@
 //!
 //! Python-`threading`-shaped OS-thread compatibility: a **migration escape
 //! hatch**, explicitly not recommended (idiomatic Zap concurrency is coroutines
-//! + channels). `threading.Thread(target=...)` returns the prelude `struct
-//! Thread` (`crates/syntax/src/parser.rs`), whose `start`/`join`/`join_timeout`/
-//! `is_alive` methods delegate to the flat `threading._*` runtime entry points
-//! typed below. The thread runs its target on a dedicated OS thread beyond
-//! `MAXPROCS` by pinning its coroutine via the #172 LockOSThread substrate, so
-//! it still participates in precise-GC stop-the-world and the #120 moving
-//! collector through the ordinary shadow-stack roots.
+//! and channels). `threading.Thread(target=...)` returns the prelude `struct
+//! Thread` (`crates/syntax/src/parser.rs`), whose methods (`start`, `join`,
+//! `join_timeout`, `is_alive`) delegate to the flat `threading._*` runtime entry
+//! points typed below. The thread runs its target on a dedicated OS thread
+//! beyond `MAXPROCS` by pinning its coroutine via the #172 LockOSThread
+//! substrate, so it still participates in precise-GC stop-the-world and the #120
+//! moving collector through the ordinary shadow-stack roots.
 //!
 //! The `Lock`/`RLock`/`Event`/`Condition`/`Semaphore` primitives are shared with
 //! the `sync` module (implemented once in the runtime, exposed on both

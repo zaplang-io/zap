@@ -194,6 +194,97 @@ def __thread_entry(fn() target, bytes handle, bool daemon):
         threading._unpin()
         threading._finish(handle, daemon)
 
+# The synchronization primitives are implemented ONCE in the runtime and exposed
+# on two surfaces: the flat `sync.*` functions (idiomatic, over opaque handles)
+# and these Python-`threading`-shaped wrappers. Each wrapper is a thin reference
+# struct over the same handle; its methods delegate to `sync.*`. The method
+# bodies run on whatever coroutine (or dedicated Thread) calls them, parking
+# cooperatively on the shared scheduler primitive — so they work equally from a
+# coroutine and from a `threading.Thread`.
+
+# Lock — non-reentrant mutual exclusion (reuses sync.Mutex).
+struct Lock:
+    bytes _h
+
+    def acquire(self):
+        sync.lock(self._h)
+
+    def acquire_timeout(self, float64 timeout) -> bool:
+        return sync.lock_timeout(self._h, timeout)
+
+    def try_acquire(self) -> bool:
+        return sync.trylock(self._h)
+
+    def release(self):
+        sync.unlock(self._h)
+
+# RLock — reentrant lock, owned by the acquiring coroutine/Thread.
+struct RLock:
+    bytes _h
+
+    def acquire(self):
+        sync.rlock_lock(self._h)
+
+    def try_acquire(self) -> bool:
+        return sync.rlock_trylock(self._h)
+
+    def release(self):
+        sync.rlock_unlock(self._h)
+
+# Event — a latch; `wait` blocks until `set_` (Python's `set`, renamed: `set`
+# is a reserved type keyword in Zap).
+struct Event:
+    bytes _h
+
+    def set_(self):
+        sync.event_set(self._h)
+
+    def clear(self):
+        sync.event_clear(self._h)
+
+    def is_set(self) -> bool:
+        return sync.event_is_set(self._h)
+
+    def wait(self):
+        sync.event_wait(self._h)
+
+    def wait_timeout(self, float64 timeout) -> bool:
+        return sync.event_wait_timeout(self._h, timeout)
+
+# Semaphore — counting semaphore.
+struct Semaphore:
+    bytes _h
+
+    def acquire(self):
+        sync.sem_acquire(self._h)
+
+    def acquire_timeout(self, float64 timeout) -> bool:
+        return sync.sem_acquire_timeout(self._h, timeout)
+
+    def release(self):
+        sync.sem_release(self._h)
+
+# Condition — a condition variable over its own internal lock (matches Python's
+# default `Condition()`). `wait` atomically releases the lock, parks, and
+# reacquires on wake.
+struct Condition:
+    bytes _h
+
+    def acquire(self):
+        sync.cond_acquire(self._h)
+
+    def release(self):
+        sync.cond_release(self._h)
+
+    def wait(self):
+        sync.cond_wait(self._h)
+
+    def notify(self, int64 n = 1):
+        sync.cond_notify(self._h, n)
+
+    def notify_all(self):
+        sync.cond_notify_all(self._h)
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -521,6 +612,11 @@ fn references_prelude(module: &Module) -> bool {
         // that names the module or a wrapper type.
         "\"threading\"",
         "\"Thread\"",
+        "\"Lock\"",
+        "\"RLock\"",
+        "\"Event\"",
+        "\"Semaphore\"",
+        "\"Condition\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

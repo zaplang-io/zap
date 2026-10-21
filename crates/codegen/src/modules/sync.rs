@@ -27,4 +27,44 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_once_new", &[], Some(p.into()));
     cg.declare_rt("zap_once_begin", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_once_end", &[p.into()], None);
+    // I#175 primitives, shared with the `threading` wrapper surface. A timeout
+    // is an `f64` (seconds) and the timed waits return an `int64` C boolean.
+    let f = cg.ctx.f64_type();
+    cg.declare_rt(
+        "zap_mutex_lock_timeout",
+        &[p.into(), f.into()],
+        Some(i.into()),
+    );
+    // RLock
+    cg.declare_rt("zap_rlock_new", &[], Some(p.into()));
+    cg.declare_rt("zap_rlock_lock", &[p.into()], None);
+    cg.declare_rt("zap_rlock_unlock", &[p.into()], None);
+    cg.declare_rt("zap_rlock_trylock", &[p.into()], Some(i.into()));
+    // Event
+    cg.declare_rt("zap_event_new", &[], Some(p.into()));
+    cg.declare_rt("zap_event_set", &[p.into()], None);
+    cg.declare_rt("zap_event_clear", &[p.into()], None);
+    cg.declare_rt("zap_event_is_set", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_event_wait", &[p.into()], None);
+    cg.declare_rt(
+        "zap_event_wait_timeout",
+        &[p.into(), f.into()],
+        Some(i.into()),
+    );
+    // Semaphore
+    cg.declare_rt("zap_sem_new", &[i.into()], Some(p.into()));
+    cg.declare_rt("zap_sem_acquire", &[p.into()], None);
+    cg.declare_rt(
+        "zap_sem_acquire_timeout",
+        &[p.into(), f.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt("zap_sem_release", &[p.into()], None);
+    // Condition
+    cg.declare_rt("zap_cond_new", &[], Some(p.into()));
+    cg.declare_rt("zap_cond_acquire", &[p.into()], None);
+    cg.declare_rt("zap_cond_release", &[p.into()], None);
+    cg.declare_rt("zap_cond_wait", &[p.into()], None);
+    cg.declare_rt("zap_cond_notify", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_cond_notify_all", &[p.into()], None);
 }
