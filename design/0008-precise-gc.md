@@ -52,7 +52,8 @@ a pure function of `fields`. Runtime collection objects (`ZapStr`, `ZapList`,
 ## Proposal — overview
 
 - **v1 is NON-MOVING** (mark-only line marking over an Immix heap). Opportunistic
-  evacuation/defragmentation is deferred to v2. (**FORK 1**, recommended.)
+  evacuation/defragmentation was deferred to v2 (**FORK 1**, recommended) and has
+  since landed (I#120) — see "Opportunistic evacuation" under Status below.
 - **Roots are found via an explicit shadow stack**, not LLVM statepoints, in v1.
   (**FORK 2**, recommended.) This makes parked-coroutine roots *trivial* and
   avoids decoding machine stacks entirely.
@@ -178,11 +179,20 @@ roots for *suspended* coroutines — into "walk a linked list." Its cost is the
 spill/reload and frame-link overhead on ref-heavy functions. Because v1 is
 non-moving, we never need the "relocate the value the stack map points at"
 capability that justifies statepoints; that capability becomes necessary only
-when we add evacuation (v2), at which point statepoints are the natural upgrade.
-**This is a genuine fork** — the alternative is to adopt LLVM statepoints now and
-eat the complexity up front to avoid the shadow-stack runtime overhead and a
-later migration. Recommendation: **shadow stack for v1, statepoints with v2
-evacuation.**
+when we add evacuation (v2). **This is a genuine fork** — the alternative is to
+adopt LLVM statepoints now and eat the complexity up front to avoid the
+shadow-stack runtime overhead and a later migration. Recommendation: **shadow
+stack for v1, revisit statepoints with v2 evacuation.**
+
+> **Update (I#120, v2 evacuation landed).** Rather than migrate to statepoints,
+> the shadow stack was extended to support relocation cheaply: codegen reloads
+> each GC-pointer value from its shadow-frame slot at every use (load-at-use), so
+> the collector relocates an object by rewriting its slot and the mutator observes
+> the move on its next use. The escaped gcframe alloca blocks register promotion
+> while LLVM still CSEs redundant reloads between safepoints, keeping the cost to
+> ~one reload per value per safepoint-interval — so the shadow stack carried us
+> into the moving collector without a statepoint migration. Gated to gc-immix; the
+> Boehm path emits no reloads. See "Opportunistic evacuation" under Status.
 
 ### Write barrier / generational story (FORK 3)
 
@@ -440,8 +450,52 @@ approved forks):
   blocks sweep normally and each P refills fresh on resume. The GC-trigger
   counter is advanced per block at refill (by the block's recorded free
   capacity) rather than per object, avoiding an atomic on the fast path.
+- **Opportunistic evacuation / defragmentation (I#120, done — the v2 moving
+  collector).** Immix fragments over time: blocks accumulate holes as objects die
+  at line granularity, stranding whole-block capacity in sparsely-occupied blocks.
+  Evacuation makes the collector **moving**: during a collection it relocates the
+  live objects out of the sparsest blocks into dense ones and reclaims the emptied
+  blocks. The pieces:
+  - **Source selection.** At the start of each mark the collector flags the
+    sparsest small blocks as evacuation sources, using the per-block live-line
+    occupancy recorded at the *previous* sweep (this cycle's marks are not in
+    yet): a block that was non-empty but at most ~half full is a candidate, capped
+    at a fixed number per cycle so copy work and to-space stay bounded.
+  - **Slot-based moving trace.** The tracer processes reference *slots*, not
+    values. On first reaching a live object it either marks it in place or, when
+    it is a movable leaf in a source block and to-space has room, copies it to a
+    dense **to-space** block (bump-allocated from the same block allocator),
+    writes a **forwarding pointer** into the original (header bit 1, with the new
+    address stored over the dead size-word slot), and updates the slot. Any later
+    reference to the original is rewritten to the forwarding target when its slot
+    is processed. The trace walks roots (shadow chains, global root slots, the
+    `g_all` coroutines), precise struct fields, and container interiors, so every
+    reference is updated. If to-space is exhausted the object is simply kept in
+    place — evacuation is best-effort, never a correctness dependency.
+  - **The mutator observes the move.** Codegen reloads every GC-pointer value from
+    its shadow-frame slot at each use (load-at-use, gc-immix only), so after a
+    safepoint that relocated an object the mutator re-reads the collector-updated
+    slot instead of a stale register. This is the moving-collector upgrade the
+    shadow-stack design anticipated (§ "Rooting"); the Boehm path emits no reloads
+    and is unchanged. LLVM cannot promote the escaped gcframe alloca and CSEs the
+    reloads between safepoints, so the steady-state cost is roughly one reload per
+    live value per safepoint-interval.
+  - **What moves, and pinning.** v1 moves only the generic `zap_desc_atomic` leaf
+    buffers — string bytes, numeric array data, and the element/entry buffers of
+    the built-in containers — which carry no pointer children, are reached only
+    through a parent slot (updated here) or a reloaded SSA value, and are never
+    cached by raw C across a safepoint. Everything else is **pinned** (marked in
+    place, never moved): the scheduler-owned objects the runtime holds by raw C
+    pointer (the coroutine `G` and its green stack, `Scope`, `ZapChan` and its
+    ring buffer, signal subscriptions), the LOS, the CPython-interop wrapper, and
+    any object a non-slot root marks (the reflection and signal tables, via
+    `zap_gc_mark`). Pinning needs no extra state: those objects are marked before
+    any evacuation runs, and an already-marked object is never relocated. The
+    forwarding/update protocol is fully general, so widening the movable set later
+    (the container-interior element-kind tags already exist) needs no new
+    machinery. `ZAP_GC_NO_EVAC` disables the pass as a safety escape hatch;
+    `ZAP_GC_EVAC_STATS` prints one line per collection for measurement.
 - **v1 simplifications (follow-ups):** user-level cyclic *literals* can't yet be
   written (the front end lacks `None` / struct-field mutation), though the
   tracing collector reclaims cycles by construction, as the reclamation tests
-  show; evacuation/defragmentation (I#120) is the next step and builds on this
-  allocator.
+  show.

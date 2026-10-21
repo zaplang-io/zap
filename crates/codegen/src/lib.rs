@@ -954,11 +954,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .as_pointer_value()
     }
 
-    /// Build and link this function's shadow frame in the entry block, null-init
-    /// its roots, and store the GC-pointer-typed parameters. Sets `self.gc_frame`.
-    /// A no-op (leaves `gc_frame = None`) for functions with no GC pointers.
+    /// Build and link this function's shadow frame in the entry block and
+    /// null-init its roots. Sets `self.gc_frame`. The GC-pointer-typed parameters
+    /// are rooted by the caller afterwards (from `vals`, so an aggregate param's
+    /// spilled pointer is the root — see `translate_fn`). A no-op (leaves
+    /// `gc_frame = None`) for functions with no GC pointers.
     #[cfg(feature = "gc-immix")]
-    fn gc_setup_frame(&mut self, f: &zir::Func, fv: FunctionValue<'ctx>) -> Result<(), String> {
+    fn gc_setup_frame(&mut self, f: &zir::Func) -> Result<(), String> {
         self.gc_frame = None;
         let mut slot_of = vec![-1i32; f.value_types.len()];
         let mut n: u32 = 0;
@@ -1013,14 +1015,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             slot_of,
             n,
         });
-        // Root the GC-pointer-typed parameters.
-        for (i, ty) in f.params.iter().enumerate() {
-            if ty.is_ptr() {
-                if let Some(v) = fv.get_nth_param(i as u32) {
-                    self.gc_store_root(i as u32, v)?;
-                }
-            }
-        }
+        // Parameters are rooted by the caller (translate_fn) from `vals`, not from
+        // the raw LLVM params: a by-value aggregate parameter (an inline value
+        // struct / tuple, D-0051) arrives as an aggregate and is spilled to a stack
+        // slot whose POINTER lives in `vals`; that pointer — not the non-pointer
+        // aggregate — is the root, and is also what load-at-use reloads (#120).
         Ok(())
     }
 
@@ -1055,6 +1054,69 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         b.build_store(elem, val.into_pointer_value())
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Load-at-use reload for the MOVING collector (ticket #120, gc-immix only).
+    ///
+    /// The precise collector may now RELOCATE a live object during a collection
+    /// (evacuation/defrag) and rewrite every reference to it — including the
+    /// GC-pointer SSA value's shadow-frame slot (`gc_store_root` writes it at the
+    /// def site, I#167). But compiled code keeps the value in an SSA register and
+    /// never re-reads the slot, so after a safepoint that moved the object the
+    /// register would hold the stale OLD address → use-after-free. To let compiled
+    /// code observe relocations, every USE of a GC-pointer operand re-reads it from
+    /// its (collector-updated) slot instead of trusting the register.
+    ///
+    /// The slot is the canonical home: `gc_store_root` stores at the def site, the
+    /// collector updates it, and this load sits at the use site (in the using
+    /// block, dominated by the entry-block frame alloca) — so no liveness or
+    /// cross-block dominance analysis is needed. The gcframe alloca's address
+    /// escapes (`*zap_shadow_head = &frame`), so LLVM cannot promote it to a
+    /// register; it does, however, CSE redundant loads between two safepoints (a
+    /// safepoint is an opaque call that may clobber the frame), collapsing the cost
+    /// to roughly one reload per value per safepoint-interval. Non-GC pointers
+    /// (allocas, function addresses, inline value-struct pointers) are never
+    /// relocated by the collector, so reloading their slot returns the same
+    /// pointer — correct and uniform.
+    ///
+    /// Under the Boehm (non-moving) build this is a no-op returning the register
+    /// value unchanged, so that codegen is byte-for-byte identical and pays no
+    /// reload cost.
+    #[cfg_attr(not(feature = "gc-immix"), allow(unused_variables))]
+    fn gc_reload_operand(&self, vid: u32, raw: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        #[cfg(feature = "gc-immix")]
+        {
+            if raw.is_pointer_value() {
+                if let Some(frame) = &self.gc_frame {
+                    let slot = frame.slot_of[vid as usize];
+                    if slot >= 0 {
+                        let b = self.builder;
+                        let p = self.ctx.ptr_type(AddressSpace::default());
+                        if let Ok(roots) =
+                            b.build_struct_gep(frame.frame_ty, frame.frame_ptr, 2, "gc.roots")
+                        {
+                            let elem = unsafe {
+                                b.build_in_bounds_gep(
+                                    p.array_type(frame.n),
+                                    roots,
+                                    &[
+                                        self.ctx.i32_type().const_zero(),
+                                        self.ctx.i32_type().const_int(slot as u64, false),
+                                    ],
+                                    "gc.slot",
+                                )
+                            };
+                            if let Ok(elem) = elem {
+                                if let Ok(v) = b.build_load(p, elem, "gc.reload") {
+                                    return v;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        raw
     }
 
     /// Unlink the shadow frame (`*head = frame.prev`) before a `ret`.
@@ -1147,10 +1209,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         }
 
         // Precise GC (ticket #48): build and link this function's shadow-stack
-        // frame in the entry block, rooting the GC-pointer parameters, before any
-        // safepoint can observe them.
+        // frame in the entry block before any safepoint can observe it, then root
+        // the GC-pointer parameters from `vals` — which holds the spilled POINTER
+        // for a by-value aggregate parameter, so the shadow slot mirrors the value
+        // the body (and load-at-use reloads) actually uses (#120). Rooting the raw
+        // aggregate param instead would leave the slot null and the reload would
+        // read null.
         #[cfg(feature = "gc-immix")]
-        self.gc_setup_frame(f, fv)?;
+        {
+            self.gc_setup_frame(f)?;
+            for (i, slot) in vals.iter().take(f.params.len()).enumerate() {
+                if let Some(v) = slot {
+                    self.gc_store_root(i as u32, *v)?;
+                }
+            }
+        }
 
         for (bi, b) in f.blocks.iter().enumerate() {
             self.builder.position_at_end(blocks[bi]);
@@ -1481,8 +1554,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         fv: FunctionValue<'ctx>,
         blocks: &[BasicBlock<'ctx>],
     ) -> Result<(), String> {
+        // Every operand use goes through `get`, which (under the moving gc-immix
+        // collector) re-reads a GC pointer from its shadow-frame slot so compiled
+        // code observes any relocation done at an intervening safepoint (#120). A
+        // no-op passthrough under Boehm.
         let get = |vals: &[Option<BasicValueEnum<'ctx>>], v: u32| -> BasicValueEnum<'ctx> {
-            vals[v as usize].expect("ZIR value used before definition")
+            let raw = vals[v as usize].expect("ZIR value used before definition");
+            self.gc_reload_operand(v, raw)
         };
         let b = self.builder;
         match inst {
@@ -2443,6 +2521,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         argvals.push(data);
         for (i, a) in args.iter().enumerate() {
             let v = vals[*a as usize].expect("ZIR value used before definition");
+            let v = self.gc_reload_operand(*a, v);
             let v = match msig.params.get(i) {
                 Some(pt) => self.abi_arg(self.abi_ty(*pt), v)?,
                 None => v,
@@ -2999,7 +3078,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         }
         match term {
             Term::Ret(Some(v)) => {
-                let rv = vals[*v as usize].expect("ret value");
+                // Reload a returned GC pointer from its slot (#120): an interior
+                // safepoint earlier in the block may have relocated it, leaving the
+                // register stale. `gc_unlink` above only repoints the shadow head;
+                // the frame alloca (and this slot) stays valid until the function
+                // returns, and no safepoint runs between here and the `ret`.
+                let rv = self.gc_reload_operand(*v, vals[*v as usize].expect("ret value"));
                 // `main` is emitted as `i32 main()` (the C entry point), so a Zap
                 // `main` declared to return `int64` must narrow its value to i32.
                 if f.is_main {
