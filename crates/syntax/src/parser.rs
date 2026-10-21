@@ -906,6 +906,14 @@ impl Parser {
                 let fstart = self.peek_span().start;
                 let ty = self.parse_type();
                 let fname = self.ident("field name");
+                // C-style bitfield width (I#173, D-0068): `type IDENT : N`. The
+                // colon never introduces a block on a field line (fields are
+                // single-line), so it is unambiguously a bit-width annotation.
+                let bits = if self.eat(&TokenKind::Colon) {
+                    self.parse_bit_width()
+                } else {
+                    None
+                };
                 let default = if self.eat(&TokenKind::Assign) {
                     Some(self.parse_expr())
                 } else {
@@ -916,6 +924,7 @@ impl Parser {
                     decorators: decos,
                     ty,
                     name: fname,
+                    bits,
                     default,
                     span: self.span_from(fstart),
                 });
@@ -927,6 +936,26 @@ impl Parser {
         }
         self.expect(&TokenKind::Dedent, "end of block");
         (fields, methods)
+    }
+
+    /// Parse the bit width after a field's `:` (C-style bitfield, I#173). The
+    /// width is a plain decimal integer literal; the fit-to-type and 1..=64
+    /// range checks are sema's (D-0068), so this only rejects a non-decimal or
+    /// out-of-`u32` literal.
+    fn parse_bit_width(&mut self) -> Option<u32> {
+        if let TokenKind::Int(s) = self.peek().clone() {
+            self.bump();
+            match s.replace('_', "").parse::<u32>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    self.error_here("bitfield width must be a decimal integer");
+                    None
+                }
+            }
+        } else {
+            self.error_here("expected a bitfield width (an integer) after ':'");
+            None
+        }
     }
 
     fn parse_enum(&mut self, decorators: Vec<Decorator>) -> EnumDef {
@@ -2885,6 +2914,20 @@ mod tests {
         // `value` not immediately before `struct` is an ordinary identifier.
         let m2 = parse_ok("def f():\n    auto value = 3\n    print(value)\n");
         assert!(matches!(&m2.items[0], Item::Function(_)));
+    }
+
+    #[test]
+    fn bitfield_width_parses() {
+        // A C-style bit width `: N` after the field name (I#173, D-0068) is
+        // captured in `Field::bits`; a width-less field stays `None`.
+        let m =
+            parse_ok("value struct Flags:\n    int64 kind : 3\n    int64 level : 5\n    bool on\n");
+        let Item::Struct(s) = &m.items[0] else {
+            panic!("struct");
+        };
+        assert_eq!(s.fields[0].bits, Some(3));
+        assert_eq!(s.fields[1].bits, Some(5));
+        assert_eq!(s.fields[2].bits, None);
     }
 
     #[test]

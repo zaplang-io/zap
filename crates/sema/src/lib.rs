@@ -459,6 +459,7 @@ pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
     let mut c = Checker::new();
     c.collect_types(module);
     c.check_value_struct_recursion(module);
+    c.check_bitfields(module);
     c.collect_sigs(module);
     c.validate_decorators(module);
     c.check_module(module);
@@ -1008,6 +1009,194 @@ impl Checker {
         }
         stack.pop();
         on_stack.remove(node);
+    }
+
+    /// Validate C-style bitfields (I#173, D-0068). A bitfield is a field with an
+    /// explicit bit width (`int64 kind : 3`). The rules:
+    ///
+    /// * bitfields are allowed **only on a `value struct`** — never on a plain
+    ///   (reference) struct or an `annotation`;
+    /// * **all-or-nothing**: if any field declares a width, every field must
+    ///   (v1 does not mix bitfields with full-width fields — the whole value
+    ///   struct becomes a single packed scalar blob);
+    /// * each bitfield's type must be a fixed-width signed integer
+    ///   (`int32`/`int64`), `bool`, or a tier-1 (unboxed) `enum` — never a
+    ///   pointer/reference, float, `char`, `bigint`, or tagged enum;
+    /// * `1 <= width <= type_bits` (`int32`=32, `int64`=64, `bool`=1, a tier-1
+    ///   enum must hold every discriminant), and the widths of one struct sum to
+    ///   at most 64 bits (one machine word).
+    fn check_bitfields(&mut self, module: &Module) {
+        // Enum defs by name, for discriminant-range checks on enum bitfields.
+        let enum_defs: HashMap<&str, &EnumDef> = module
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Enum(e) => Some((e.name.as_str(), e)),
+                _ => None,
+            })
+            .collect();
+        for item in &module.items {
+            match item {
+                // A bitfield on an annotation field is meaningless (annotations
+                // are metadata, not laid-out values).
+                Item::Annotation(a) => {
+                    for f in &a.fields {
+                        if f.bits.is_some() {
+                            self.error(
+                                "a bit width is only allowed on a `value struct` field (D-0068)"
+                                    .to_string(),
+                                f.span,
+                            );
+                        }
+                    }
+                }
+                Item::Struct(s) => {
+                    let any_bits = s.fields.iter().any(|f| f.bits.is_some());
+                    if !any_bits {
+                        continue;
+                    }
+                    if !s.is_value {
+                        for f in s.fields.iter().filter(|f| f.bits.is_some()) {
+                            self.error(
+                                format!(
+                                    "bit widths require a `value struct`: field '{}' of the \
+                                     reference struct '{}' cannot be a bitfield (a plain struct \
+                                     is a reference type, D-0023/D-0068)",
+                                    f.name, s.name
+                                ),
+                                f.span,
+                            );
+                        }
+                        continue;
+                    }
+                    self.check_bitfield_struct(s, &enum_defs);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Validate one `value struct` that uses bitfields (every field, the widths,
+    /// and the one-word total). See [`Checker::check_bitfields`].
+    fn check_bitfield_struct(&mut self, s: &StructDef, enum_defs: &HashMap<&str, &EnumDef>) {
+        let mut total: u64 = 0;
+        for f in &s.fields {
+            let Some(width) = f.bits else {
+                // All-or-nothing: a width-less field in a bitfield struct.
+                self.error(
+                    format!(
+                        "every field of bitfield value struct '{}' must declare a bit width \
+                         (v1 does not mix bitfields with full-width fields, D-0068); field '{}' \
+                         has none",
+                        s.name, f.name
+                    ),
+                    f.span,
+                );
+                continue;
+            };
+            // The field type must be a bitfield-eligible scalar.
+            let Some((type_bits, _signed, min_bits)) =
+                self.bitfield_field_type(&f.ty, enum_defs, f.span)
+            else {
+                continue;
+            };
+            let w = u64::from(width);
+            if width == 0 {
+                self.error(
+                    format!("bitfield '{}' must be at least 1 bit wide", f.name),
+                    f.span,
+                );
+            } else if w > type_bits {
+                self.error(
+                    format!(
+                        "bitfield '{}' is {} bits wide but its type holds at most {} bits (D-0068)",
+                        f.name, width, type_bits
+                    ),
+                    f.span,
+                );
+            } else if w < min_bits {
+                self.error(
+                    format!(
+                        "bitfield '{}' is {} bits wide but its enum needs at least {} bits to \
+                         hold every discriminant (D-0068)",
+                        f.name, width, min_bits
+                    ),
+                    f.span,
+                );
+            }
+            total += w;
+        }
+        if total > 64 {
+            self.error(
+                format!(
+                    "bitfield value struct '{}' packs {} bits, more than one 64-bit machine \
+                     word (D-0068)",
+                    s.name, total
+                ),
+                s.span,
+            );
+        }
+    }
+
+    /// Classify a bitfield field type: returns `(type_bits, signed, min_bits)`
+    /// for an eligible type (`int32`/`int64`, `bool`, tier-1 `enum`), or `None`
+    /// (after reporting an error) for an ineligible one. `type_bits` is the most
+    /// bits the field may use; `min_bits` is the fewest it must (1 for integers
+    /// and `bool`; for a tier-1 enum, the bits needed to hold every
+    /// discriminant). A tier-1 enum with a **negative** discriminant cannot be an
+    /// unsigned bitfield and is rejected here.
+    fn bitfield_field_type(
+        &mut self,
+        ty: &Type,
+        enum_defs: &HashMap<&str, &EnumDef>,
+        span: Span,
+    ) -> Option<(u64, bool, u64)> {
+        if let Type::Named { name, args, .. } = ty {
+            if args.is_empty() {
+                match name.as_str() {
+                    "int64" | "i64" => return Some((64, true, 1)),
+                    "int32" | "i32" => return Some((32, true, 1)),
+                    "bool" => return Some((1, false, 1)),
+                    other => {
+                        // A tier-1 (unboxed-integer) enum is a legal bitfield; a
+                        // tagged (data-carrying) enum is a heap value and is not.
+                        if let Some(info) = self.enums.get(other) {
+                            if info.is_sum {
+                                self.error(
+                                    format!(
+                                        "a tagged enum '{other}' is a reference value and cannot \
+                                         be a bitfield (only tier-1 enums, D-0068)"
+                                    ),
+                                    span,
+                                );
+                                return None;
+                            }
+                            // Bits needed to hold the enum's largest discriminant.
+                            match enum_defs.get(other).and_then(|e| enum_discriminant_bits(e)) {
+                                Some(bits) => return Some((64, false, bits)),
+                                None => {
+                                    self.error(
+                                        format!(
+                                            "enum '{other}' has a negative discriminant and \
+                                             cannot be an unsigned bitfield (D-0068)"
+                                        ),
+                                        span,
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.error(
+            "a bitfield must be a fixed-width integer (int32/int64), bool, or a tier-1 enum — \
+             not a pointer/reference, float, char, or bigint (D-0068)"
+                .to_string(),
+            span,
+        );
+        None
     }
 
     /// A struct method's signature, mapping the `self` receiver and any `Self`
@@ -3734,6 +3923,64 @@ fn expr_span(e: &Expr) -> Span {
     }
 }
 
+/// The number of bits needed to hold every discriminant of a tier-1 enum as an
+/// **unsigned** value, or `None` if any discriminant is negative (so the enum
+/// cannot be an unsigned bitfield). Discriminants follow the C rule: an explicit
+/// value, else the previous + 1 from 0 (I#173/D-0068).
+fn enum_discriminant_bits(e: &EnumDef) -> Option<u64> {
+    let mut next: i64 = 0;
+    let mut max: i64 = 0;
+    for v in &e.variants {
+        let val = v.value.as_ref().and_then(const_int_lit).unwrap_or(next);
+        if val < 0 {
+            return None;
+        }
+        max = max.max(val);
+        next = val.wrapping_add(1);
+    }
+    Some(bits_for(max as u64))
+}
+
+/// Bits needed to represent `n` as an unsigned value (at least 1).
+fn bits_for(n: u64) -> u64 {
+    u64::from(64 - n.leading_zeros()).max(1)
+}
+
+/// Evaluate a simple constant integer expression (an int literal, optionally
+/// signed) for an enum discriminant; `None` for anything more complex.
+fn const_int_lit(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(s, _) => parse_int_lit(s),
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+            ..
+        } => const_int_lit(expr).map(|v| -v),
+        Expr::Unary {
+            op: UnOp::Pos,
+            expr,
+            ..
+        } => const_int_lit(expr),
+        _ => None,
+    }
+}
+
+/// Parse an integer literal string (decimal/hex/octal/binary with `_`
+/// separators) to an `i64`; `None` if it does not parse.
+fn parse_int_lit(s: &str) -> Option<i64> {
+    let t = s.replace('_', "");
+    let (radix, digits) = if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (16, r)
+    } else if let Some(r) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        (8, r)
+    } else if let Some(r) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        (2, r)
+    } else {
+        (10, t.as_str())
+    };
+    i64::from_str_radix(digits, radix).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4994,6 +5241,98 @@ def main():
             e.iter()
                 .any(|x| x.message.contains("only the keyword argument")),
             "expected a positional-argument error, got {e:?}"
+        );
+    }
+
+    // --- C-style bitfields on value structs (I#173, D-0068) ---
+
+    #[test]
+    fn bitfield_value_struct_ok() {
+        // A value struct whose fields all declare widths that fit their types
+        // and sum to <= 64 bits type-checks.
+        ok("enum Color:\n    RED\n    GREEN\n    BLUE\n    WHITE\n\n\
+            value struct Pack:\n    int64 a : 4\n    int64 b : 4\n    \
+            Color c : 2\n    bool d : 1\n");
+    }
+
+    #[test]
+    fn bitfield_on_reference_struct_errors() {
+        // Bitfields are a value-struct-only layout feature (D-0068).
+        let e = errors("struct Bad:\n    int64 flags : 3\n");
+        assert!(
+            e.iter()
+                .any(|x| x.message.contains("bit widths require a `value struct`")),
+            "expected a reference-struct bitfield error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn bitfield_on_pointer_field_errors() {
+        // A reference-typed field (here `str`) can never be a bitfield.
+        let e = errors("value struct Bad:\n    str name : 8\n");
+        assert!(
+            e.iter()
+                .any(|x| x.message.contains("must be a fixed-width integer")),
+            "expected an ineligible-type error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn bitfield_width_exceeds_type_errors() {
+        // A 40-bit slice does not fit an int32 (32 bits).
+        let e = errors("value struct Bad:\n    int32 x : 40\n");
+        assert!(
+            e.iter()
+                .any(|x| x.message.contains("its type holds at most")),
+            "expected a width-exceeds-type error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn bitfield_all_or_nothing_errors() {
+        // Mixing a bitfield with a full-width field is rejected in v1.
+        let e = errors("value struct Bad:\n    int64 a : 3\n    int64 b\n");
+        assert!(
+            e.iter()
+                .any(|x| x.message.contains("must declare a bit width")),
+            "expected an all-or-nothing error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn bitfield_total_exceeds_word_errors() {
+        // The widths of one struct may not exceed a 64-bit machine word.
+        let e = errors("value struct Bad:\n    int64 a : 40\n    int64 b : 40\n");
+        assert!(
+            e.iter()
+                .any(|x| x.message.contains("more than one 64-bit machine word")),
+            "expected a word-overflow error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn bitfield_tagged_enum_errors() {
+        // A data-carrying (tier-3) enum is a heap value, not a packable scalar.
+        let e = errors(
+            "enum Shape:\n    Circle(int64 r)\n    Square(int64 s)\n\n\
+            value struct Bad:\n    Shape s : 2\n",
+        );
+        assert!(
+            e.iter().any(|x| x.message.contains("tagged enum")),
+            "expected a tagged-enum bitfield error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn bitfield_enum_needs_enough_bits_errors() {
+        // A 4-variant enum needs 2 bits; 1 bit cannot hold its top discriminant.
+        let e = errors(
+            "enum Color:\n    RED\n    GREEN\n    BLUE\n    WHITE\n\n\
+            value struct Bad:\n    Color c : 1\n",
+        );
+        assert!(
+            e.iter().any(|x| x.message.contains("needs at least")),
+            "expected an enum-too-narrow error, got {e:?}"
         );
     }
 }

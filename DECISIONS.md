@@ -1413,3 +1413,68 @@ ergonomics generally. The grammar already reserved `func_type` and `lambda`
   **by value** into an environment (scalars and references work); a function value
   retrieved from a collection re-attaching its signature without a `fn(...)`
   annotation (collections store a uniform reference word).
+
+## D-0068 — C-style bitfields on value structs (I#173)
+**Status:** Locked — refines D-0051; resolves issue #173
+
+A `value struct` field may carry an explicit **bit width**, so several small
+fields pack into one machine word (C bitfields), e.g. a 3-bit mode next to a
+5-bit level in a single byte. This is deliberately the *easy* half of the old
+D-style proposal: **references are excluded**, so there is never a packed pointer
+and the precise Immix collector (D-0009/#48) stays entirely out of it — a
+bitfield value struct is just a non-traced scalar blob with masked accessors.
+
+- **Surface.** A width annotation `: N` after the field name, type-first and
+  C-recognizable (grammar `field ::= … type IDENT [ ":" INT ] [ "=" expr ]`). The
+  colon is unambiguous: a field line never opens a block.
+
+  ```
+  value struct Pixel:
+      int64 r : 5
+      int64 g : 6
+      int64 b : 5     # 16 bits total -> one u16 backing word
+  ```
+
+- **Where.** `value struct` only — a bitfield on a plain (reference) `struct`
+  (D-0023) or on an `annotation` is a compile error. **All-or-nothing in v1:** if
+  any field declares a width, **every** field must, and the whole struct becomes
+  a single packed scalar. (Mixing bitfields with full-width fields — which would
+  reintroduce pointer fields and GC scanning — is a documented follow-up.)
+
+- **Field types.** A fixed-width signed integer (`int32`/`int64`, incl. `i32`/
+  `i64`), `bool`, or a **tier-1** (unboxed-integer) `enum`. Never a
+  pointer/reference (plain struct, `str`, a collection, a nested value struct, an
+  interface, a function value), float, `char`, `bigint`, or a tagged (tier-3)
+  enum.
+
+- **Widths & limits.** `1 <= N <= type_bits` (`int32`→32, `int64`→64, `bool`→1; a
+  tier-1 enum's width must hold every discriminant — a negative discriminant is
+  rejected, since the field is unsigned). The widths of one struct sum to **≤ 64**
+  (one machine word).
+
+- **Layout & endianness.** Fields pack **least-significant-first in declaration
+  order** into the smallest unsigned backing integer (`u8`/`u16`/`u32`/`u64`) that
+  holds the total width — which is therefore `sizeof(struct)`. Bit order within
+  the word is fixed (LSB-first); the word itself is an ordinary integer, so its
+  byte order is the platform's. Values round-trip within a program; a
+  cross-platform binary layout is **not** guaranteed in v1.
+
+- **Overflow / sign.** A signed integer bitfield stores the low `N` bits and reads
+  back **sign-extended** (round-tripping `[-2^(N-1), 2^(N-1)-1]`); `bool` and enum
+  read back zero-extended. A write keeps the low `N` bits (C truncation); a
+  literal default that does not fit is a compile error.
+
+- **Lowering (ZIR/codegen).** `StructLayout.packed` carries the backing `Ty` and a
+  per-field `{offset, width, signed}` slice. Codegen emits the LLVM type as a
+  one-element `{ iN }` aggregate (so it stays pointer-addressed like any struct —
+  `StructNew`, value-copy, array element, generic type arg all work unchanged);
+  `FieldGet`/`FieldSet` become shift+mask on the backing integer instead of a GEP.
+  Because the aggregate holds no pointers, its GC type descriptor has zero pointer
+  offsets — **no `zaprt.c` / collector changes**, reusing the per-struct
+  descriptor machinery exactly as D-0067 and D-0051 do.
+
+**Rationale:** gives the "Python devs who need performance" audience C-style
+compact layouts for flags/headers/packed records on the zero-indirection value
+struct, while the no-pointer restriction keeps the precise GC and the language's
+simplicity untouched. Mixed bitfield/full-width layout and a guaranteed
+cross-platform binary encoding are the scoped follow-ups.

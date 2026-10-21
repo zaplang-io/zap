@@ -251,6 +251,10 @@ struct StructCtx {
     /// source name -> generated wrapper name, so `f` taken as a value reuses one
     /// wrapper `f$fnval`.
     fnval_wrappers: RefCell<HashMap<String, String>>,
+    /// C-style bitfield packing (I#173, D-0068), keyed by struct id. A value
+    /// struct whose fields all carry a bit width is laid out as one backing
+    /// integer with shift/mask field accessors; absent for ordinary structs.
+    packed_layouts: HashMap<u32, PackedLayout>,
 }
 
 /// A compiler-generated generator (I#67, D-0026/D-0048). A free `def` whose body
@@ -594,6 +598,9 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     }
 
     let mut fields: Vec<Vec<(String, Ty)>> = vec![Vec::new(); names.len()];
+    // C-style bitfield packing (I#173, D-0068), keyed by struct id. A value
+    // struct whose fields all carry a bit width packs into one backing integer.
+    let mut packed_layouts: HashMap<u32, PackedLayout> = HashMap::new();
     {
         let tyenv = TyEnv {
             ids: &ids,
@@ -608,6 +615,9 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 for fld in &s.fields {
                     let ft = resolve_ty(&fld.ty, &tyenv).unwrap_or(Ty::Ptr);
                     fields[sid as usize].push((fld.name.clone(), ft));
+                }
+                if let Some(pl) = packed_layout_of(s) {
+                    packed_layouts.insert(sid, pl);
                 }
             }
         }
@@ -715,6 +725,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         closure_counter: RefCell::new(0),
         captureless_env: RefCell::new(None),
         fnval_wrappers: RefCell::new(HashMap::new()),
+        packed_layouts,
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -860,6 +871,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             fields: ctx.fields[sid].iter().map(|(_, t)| *t).collect(),
             is_value: ctx.is_value_struct(sid as u32),
             inline: false, // set in the post-pass below, once all layouts exist
+            packed: ctx.packed_layouts.get(&(sid as u32)).cloned(),
         });
     }
     for item in &module.items {
@@ -958,6 +970,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             fields: elems.clone(),
             is_value: false,
             inline: false, // set in the post-pass below
+            packed: None,
         });
     }
 
@@ -8961,6 +8974,58 @@ fn unescape(s: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Compute a value struct's C-style bitfield packing (I#173, D-0068), or `None`
+/// if it is not a packed bitfield struct. A struct packs iff it is a `value
+/// struct` and **every** field declares a bit width (sema enforces that
+/// all-or-nothing rule and the per-field limits, so by the time we lower a
+/// struct that got here is valid). Fields pack least-significant-first in
+/// declaration order into the smallest `i8`/`i16`/`i32`/`i64` backing integer
+/// that holds their total width.
+fn packed_layout_of(s: &ast::StructDef) -> Option<PackedLayout> {
+    if !s.is_value || s.fields.is_empty() || !s.fields.iter().all(|f| f.bits.is_some()) {
+        return None;
+    }
+    let mut offset: u32 = 0;
+    let mut bfs = Vec::with_capacity(s.fields.len());
+    for f in &s.fields {
+        let width = f.bits.unwrap_or(1).max(1); // sema guarantees Some and >= 1
+        bfs.push(BitField {
+            offset,
+            width,
+            signed: bitfield_is_signed(&f.ty),
+        });
+        offset = offset.saturating_add(width);
+    }
+    // Defensive: a valid struct totals <= 64 bits (sema rejects more). If an
+    // invalid one slips past, do not pack rather than emit an out-of-range slice.
+    if offset > 64 {
+        return None;
+    }
+    let backing = if offset <= 8 {
+        Ty::I8
+    } else if offset <= 16 {
+        Ty::I16
+    } else if offset <= 32 {
+        Ty::I32
+    } else {
+        Ty::I64
+    };
+    Some(PackedLayout {
+        backing,
+        fields: bfs,
+    })
+}
+
+/// Whether a bitfield field reads back **sign-extended**: a signed integer
+/// (`int32`/`int64`). `bool` and tier-1 enums are unsigned (zero-extended).
+fn bitfield_is_signed(ty: &ast::Type) -> bool {
+    matches!(
+        ty,
+        ast::Type::Named { name, .. }
+            if matches!(name.as_str(), "int32" | "int64" | "i32" | "i64")
+    )
 }
 
 /// Evaluate a tier-1 enum discriminant expression (`GREEN = 10`), which the
