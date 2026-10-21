@@ -2,7 +2,8 @@
 
 - **Author(s):** I#175 session
 - **Last updated:** 2026-10-21
-- **Status:** Draft
+- **Status:** Accepted (design approved by orchestrator 2026-10-21; implementation
+  gated on I#120 merge)
 - **Discussion:** https://github.com/parveshgarg/zap/issues/175
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
@@ -114,6 +115,15 @@ Because `lock_os_thread()` creates a dedicated M with `p = NULL` that is not in
 never multiplexed onto a P — exactly Python `threading` semantics.
 `join()` receives on `done_chan` (parking the joiner coroutine the normal way).
 
+**Rooting the `target` closure (required).**  The fn-value record and its
+captures must be a **live, scanned GC root for the whole thread lifetime** — it
+is placed in a shadow-stack slot on the dedicated M's running coroutine, never
+held only as a raw C local across a safepoint.  This is what lets the captured
+heap pointers survive collection and receive I#120's load-at-use reloads.  The
+hand-off from `start()` to the new coroutine must land `target` in that slot
+before the first safepoint on the new thread (same discipline as the `spawn` and
+channel paths).
+
 ### Answers to the four hard questions
 
 **1. GC safety (raw-thread-root hazard — dissolved).**
@@ -129,6 +139,16 @@ gc-boehm it is scanned conservatively like any registered thread.  So there is
 no OS-thread stack or register set invisible to the collector.  It polls
 `zap_safepoint()` from compiled code and parks GC-safe when blocked — STW
 completes.
+
+*Explicit requirement (orchestrator note):* a dedicated-M thread blocked in a raw
+C call (a `join()`, a blocking syscall, the trampoline waiting to be handed its
+coroutine) MUST be at a GC-safe point — i.e. inside `zap_enter_blocking()` /
+`zap_leave_blocking()`, marking itself not-executing-Zap — so an STW never stalls
+on it and its shadow roots stay stable for the duration (same discipline the
+netpoller and syscall paths use).  `dedicated_worker_main` already brackets its
+idle wait in `zap_enter_blocking`/`zap_leave_blocking`; every new blocking entry
+point `threading` adds (`join`, the lock/condition waits) must do likewise before
+it blocks in C.
 
 **2. Moving collector / I#120 evacuation (no extra pinning needed for Zap
 objects).**
@@ -214,12 +234,13 @@ zapgc.inc.c + codegen hot path) and rebase onto main then, to avoid clobbering
 its sections.
 
 1. Runtime (zaprt.c, new `threading` banner section, append-only): the
-   `_thread_entry` trampoline that `lock_os_thread()`s, `CallClosure`s the
-   fn-value, closes the join channel, `unlock_os_thread()`s; plus `RLock`,
-   `Event`, `Condition`, `Semaphore` over the shared `Waiter`/`gopark` machinery.
-   The one genuinely new runtime capability is **invoking a Zap closure from
-   runtime C** (load code-ptr @0, indirect-call with the record as arg 0) — see
-   Open issues.
+   `_thread_entry` trampoline that `lock_os_thread()`s, invokes the fn-value via
+   the approved C trampoline, closes the join channel, `unlock_os_thread()`s;
+   the `daemon=` opt-out of the `g_ded_live` barrier; plus `RLock`, `Event`,
+   `Condition`, `Semaphore` over the shared `Waiter`/`gopark` machinery, with the
+   I#80 deadline path wired for the v1 timeout variants.  The one genuinely new
+   runtime capability is **invoking a Zap closure from runtime C** (load code-ptr
+   @0, indirect-call with the record as arg 0) — see Resolved decisions #1.
 2. Surface wiring on the I#121 seam (sema/ir/codegen `modules/threading.rs` + one
    registry slice entry each).
 3. Goldens (deterministic output, green under BOTH collectors, **no heap-byte
@@ -232,33 +253,36 @@ its sections.
 Phase boundaries touched: runtime ABI (new `threading` entry points, and the
 runtime→Zap closure-call convention).  No IR schema change expected.
 
+## Resolved decisions (orchestrator, 2026-10-21)
+
+1. **Calling a Zap closure from runtime C — APPROVED (option a).**  Add a tiny C
+   trampoline that treats the fn-value record as `ret (*)(void *self)` and calls
+   `code_ptr(record)`, matching the I#163 calling convention.  Two musts: (a) the
+   target closure record + captures are a live, scanned shadow-stack root for the
+   whole thread lifetime (see "Rooting the `target` closure"); (b) fix and
+   document the C ABI for args/return in the trampoline once.
+2. **`daemon=` flag — SHIP IN v1.**  Faithful migration requires it; real code
+   uses daemon threads.  Implement as an opt-*out* of the `g_ded_live`
+   join-at-exit barrier: non-daemon (default) keeps current blocking semantics
+   (`zap_rt_join_all` waits for it), daemon excludes the thread from
+   `zap_rt_join_all` — matching CPython exactly.
+3. **Timeouts — SHIP IN v1, reuse the I#80 deadline path.**  `join(timeout)`,
+   `Event.wait(timeout)`, `Lock.acquire(timeout)` are common in real code; return
+   Python-shaped results (`acquire` → bool, `wait` → bool).
+4. **`RLock`/`Event`/`Condition`/`Semaphore` — implement in the runtime ONCE,
+   expose via BOTH `sync` and `threading`.**  DRY; these are the same primitives
+   the `with lock:` context-manager work (I#185) will build on.  Names stay
+   Python-shaped on the `threading` surface.
+
 ## Open issues
 
-1. **Calling a Zap closure from runtime C.**  No stdlib module today calls *back*
-   into compiled Zap.  Options: (a) a tiny C trampoline that treats the fn-value
-   record as `ret (*)(void *self)` and calls `code_ptr(record)` — matches the
-   I#163 calling convention and is the lightest; (b) keep the trampoline body in
-   codegen (emit a `CallClosure` in a compiler-generated entry fn that the runtime
-   merely `spawn`s).  Leaning (a); needs confirmation that handing the closure
-   pointer to the new coroutine roots it correctly before the first safepoint.
-2. **`spawn`/structured-concurrency vs. detached OS threads.**  `Thread`s are
-   explicitly joined by the user, so they should be *detached* from the enclosing
-   `scope` (D-0044 `spawn detached`), not auto-joined at scope exit.  Confirm the
-   detached path plus an explicit join channel is the right composition, and what
-   happens to a never-`join()`ed `Thread` at program exit (`g_ded_live` barrier
-   already blocks `zap_rt_join_all` until dedicated Ms finish — good, but a thread
-   blocked forever would hang exit, same as Python non-daemon threads; need a
-   `daemon=` flag decision).
-3. **New `sync` primitives placement.**  `RLock`/`Event`/`Condition`/`Semaphore`
-   — add to `sync` and re-export from `threading`, or implement in `threading`
-   directly?  (`sync` already deferred RWMutex/Atomic.)  Prefer implementing the
-   primitive once in the runtime and exposing both surfaces.
-4. **`with lock:` ergonomics.**  Python idiom is `with lock:`; Zap `with` today
-   only does `expect_raises` (general context managers deferred, D-0027).  Until
-   then `threading.Lock` offers explicit `lock()/unlock()`; the transpiler can
-   emit try/finally.  Flag for the transpiler epic (I#157).
-5. **Timeouts.**  Python `join(timeout)`, `Event.wait(timeout)`,
-   `Lock.acquire(timeout)` need the timer/netpoller deadline path (I#80).  Decide
-   whether v1 ships timeouts or defers them.
-6. **Thread-locals.**  `threading.local()` is common in migrated code; it needs a
-   per-dedicated-M TLS slot.  Likely a fast-follow, not v1.
+1. **`with lock:` ergonomics.**  Python idiom is `with lock:`; Zap `with` today
+   only does `expect_raises` (general context managers deferred, D-0027, tracked
+   by I#185).  Until then `threading.Lock` offers explicit `lock()/unlock()`; the
+   transpiler can emit try/finally.  Flag for the transpiler epic (I#157).
+2. **`spawn`/structured-concurrency composition.**  `Thread`s are explicitly
+   joined by the user, so the trampoline coroutine is *detached* from the
+   enclosing `scope` (D-0044 `spawn detached`) and joined through its own
+   `done_chan`, not the scope — confirm during implementation.
+3. **Thread-locals.**  `threading.local()` is common in migrated code; it needs a
+   per-dedicated-M TLS slot.  Fast-follow, not v1.
