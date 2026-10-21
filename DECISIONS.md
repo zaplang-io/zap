@@ -1201,3 +1201,53 @@ since they are ordinary interfaces. Tested under both collectors
 single bound), where-clauses, bounds referencing other type params, and
 satisfying an operator bound with a *primitive* argument (only user structs/enums
 carry the methods a bound checks today).
+
+**Update — slice 6 (I#165), the final generics slice:** the prelude optional
+enum is **renamed `Option[T]` → `Optional[T]`** (Python `typing.Optional`;
+see D-0065) and `json` is migrated off `@default`-as-optionality onto
+`Optional[T]`. This closes the core generics epic's planned slices; the two
+remaining items — the built-in-collection re-skin as user-generic surface, and
+higher-order generic functions (which need first-class function values, I#163) —
+are tracked separately, not part of I#154. Everywhere this document says
+`Option[T]`/`Option.Some`/`Option.None` above, read `Optional[T]` etc.; the old
+name has no code left behind it (clean rename, no alias).
+
+## D-0065 — Optional type spelling (`Optional[T]`) + `json` optionality via `Optional[T]`
+**Status:** Locked (ratified by the user 2026-10-20). Implements epic I#154
+slice 6 (the final slice); builds on D-0064 (generics + the optional enum) and
+D-0059 (`json`/`@derive(Json)`). Tickets: I#165 (parent I#154); touches
+`design/0012-generics.md` and `design/0010-json.md`.
+
+- **Name — `Optional[T]`, not `Option[T]`.** The prelude optional enum is spelled
+  `Optional[T]`, matching Python's `typing.Optional`, which Zap's Python-literate
+  audience already knows. This is a **clean rename** of the shipped `Option[T]`
+  (D-0064): no deprecated alias, no `Option` left in the compiler, prelude,
+  stdlib, goldens, or grammar (pre-public, so no compatibility surface to keep).
+  **Unchanged:** the `Some`/`None` variant names, the tagged + niche
+  representations (D-0064 #4), `match` ergonomics, the bare-`None` inference sink,
+  and every method (`is_some`/`is_none`/`unwrap`/`unwrap_or`/`and_opt`). Only the
+  type identifier changes.
+- **Deferred (fast-follow, separate):** `T | None` union sugar for a fully
+  Pythonic optional spelling — out of scope here; `Optional[T]` is the canonical
+  form it would desugar to.
+
+- **`json` optionality — `Optional[T]` fields, not `@default`.** `@derive(Json)`
+  now recognizes an `Optional[T]` field as *the* way to say "nullable / may be
+  absent": on **decode**, an absent key *or* an explicit JSON `null` yields
+  `Optional.None`, and a present non-null value yields `Optional.Some(decode(v))`;
+  on **encode**, `Optional.None` **omits the key entirely** (chosen over emitting
+  `null`) and `Optional.Some(v)` emits the inner value. Omit-on-`None` is the
+  serde/pydantic default idiom (`skip_serializing_if`/`exclude_none`) and makes
+  the absent↔`None` and present↔`Some(v)` round-trips clean and symmetric. The
+  inner `T` may be any type the derive already supports (scalars, `str`, nested
+  `@derive(Json)` struct). This supersedes design/0010-json.md's original
+  "a `@default` field is optional" language (that approach predated the optional
+  type).
+- **`@default` stays, as an honest fallback.** The `=` literal field default
+  (D-0038) keeps its plain meaning — *absent → this fallback value* — matching
+  Python dataclass / pydantic defaults. Only the **abuse** of `@default` to encode
+  absent-vs-present optionality is removed; `Optional[T]` now carries that.
+- **`csv`/`yaml` (D-0063):** their `@derive` surfaces never implemented
+  `@default`-as-optionality either (the derive was lenient for v1), so no
+  migration is forced; an `Optional[T]` field in a `csv`/`yaml` derive is a
+  natural follow-up on the same shared derive core, not part of this slice.

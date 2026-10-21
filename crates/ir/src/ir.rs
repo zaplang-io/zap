@@ -328,7 +328,7 @@ pub enum Inst {
         val: bool,
     },
     /// A null pointer constant (`dest`'s value type is the pointer type). Used by
-    /// the niche `Option[T]` layout (I#154, D-0064 #4): a niche optional is a
+    /// the niche `Optional[T]` layout (I#154, D-0064 #4): a niche optional is a
     /// single nullable pointer, and `None` is the null value. Codegen emits the
     /// `const_null` of `dest`'s pointer type.
     NullConst {

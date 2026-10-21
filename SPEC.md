@@ -198,8 +198,10 @@ match sh:
     case Shape.Unit:           area = 1.0
 ```
 
-Generic enums (`enum Option[T]: Some(T v); None`) are reserved now, monomorphized
-when user generics land (D-0017). Methods on an enum are allowed (D-0046).
+Generic enums (`enum Optional[T]: Some(T v); None`) ship today, monomorphized at
+compile time (D-0017, I#154). Methods on an enum are allowed (D-0046). The
+prelude `Optional[T]` (D-0065) is the canonical optional type (Python
+`typing.Optional`).
 
 ### 4.7 Generics (D-0017)
 

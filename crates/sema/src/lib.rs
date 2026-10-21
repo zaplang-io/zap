@@ -1585,7 +1585,7 @@ impl Checker {
                 Item::Enum(e) => {
                     // Methods on an enum (D-0046) — checked at definition like
                     // struct methods, with `self` typed as the enum. For a
-                    // generic enum (`Option[T]`, I#154) the type parameters are
+                    // generic enum (`Optional[T]`, I#154) the type parameters are
                     // treated as opaque: they resolve to `Unknown`, so a method
                     // body may use only universal operations (bind/pass/return/
                     // match), which is the unconstrained check-at-definition rule
@@ -4537,7 +4537,7 @@ mod tests {
     fn enum_methods_type_check_at_definition() {
         // Methods on an enum (D-0046) are now checked at definition, with `self`
         // typed as the enum (I#154 lifts the earlier deferral for generic-enum
-        // methods like `Option.unwrap`).
+        // methods like `Optional.unwrap`).
         ok("enum Color:\n    RED\n    GREEN\n\n\
             \x20   def tag(self) -> int64:\n        return 0\n");
     }
@@ -4575,12 +4575,12 @@ def main():
 
     #[test]
     fn prelude_option_is_usable() {
-        // Option[T] ships in the prelude (I#154 slice 3): construct, match, and
+        // Optional[T] ships in the prelude (I#154 slice 3): construct, match, and
         // call its methods without declaring it.
         ok(r#"
 def main():
-    Option[int64] a = Option.Some(5)
-    Option[str] b = None
+    Optional[int64] a = Optional.Some(5)
+    Optional[str] b = None
     print(a.unwrap())
     print(a.is_some())
     print(b.unwrap_or("x"))

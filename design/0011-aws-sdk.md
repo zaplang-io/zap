@@ -2,7 +2,7 @@
 
 - **Author(s):** Claude (design session for I#89)
 - **Last updated:** 2026-10-20
-- **Status:** Under review (recommendations below; the Option[T] prioritization
+- **Status:** Under review (recommendations below; the Optional[T] prioritization
   call is being made at the orchestrator level — this doc is written to stand
   either way).
 - **Discussion:** I#89 (Official AWS package, lambda first). Depends on/coordinates
@@ -33,10 +33,10 @@ Two structural wins over boto3 fall out of being static: you compile/download
 **unused operations** (dead-code elimination), so binaries stay light and Lambda
 cold starts stay in the Rust/Go class.
 
-The design is bounded by one load-bearing language gap — `Option[T]` (user
+The design is bounded by one load-bearing language gap — `Optional[T]` (user
 generics, D-0017, staged) — which governs how faithfully optional fields can be
 modeled.
-This doc presents the preferred path (land `Option[T]`) **and** a fallback that
+This doc presents the preferred path (land `Optional[T]`) **and** a fallback that
 ships read-oriented services first without it, so the recommendation is correct
 regardless of how that call lands.
 
@@ -85,7 +85,7 @@ What the language/stdlib already provide (all landed) and the design builds on:
 What is **staged, not landed**, and therefore shapes the recommendation:
 
 - **User generics (D-0017).**
-  So a proper `Option[T]` for "field may be absent" is **not expressible yet**.
+  So a proper `Optional[T]` for "field may be absent" is **not expressible yet**.
   AWS shapes are overwhelmingly optional, so this is the single biggest constraint
   — larger than any missing module (see §3.1).
 - **Typed exception classes (I#12).**
@@ -186,14 +186,14 @@ The non-mechanical parts are three, below.
 
 AWS shapes are overwhelmingly optional; most output members and many input
 members may be absent.
-The clean model is `Option[T]` (why aws-sdk-rust wraps nearly every field), but
+The clean model is `Optional[T]` (why aws-sdk-rust wraps nearly every field), but
 that needs user generics (D-0017, **staged**).
 Without it, `json`'s answer is `@default` → a missing key uses a zero default,
 which **conflates "absent" with "present-but-zero."**
 That is tolerable for read-oriented calls but **wrong for mutating calls** (sending
 a zero you meant to omit changes the request).
 
-- **O-a — land `Option[T]`, model optional as `Option[T]` *(preferred)*.**
+- **O-a — land `Optional[T]`, model optional as `Optional[T]` *(preferred)*.**
   Cleanest and correct for all operations; couples the SDK's full scope to D-0017.
 - **O-b — v1 uses `@default`/zero**, and the **first wave is restricted to
   read-oriented operations** where absent≈zero does not corrupt requests.
@@ -202,7 +202,7 @@ a zero you meant to omit changes the request).
   optional field, protobuf-v2 "hazzer" style); the serializer omits unset fields.
   Works today without generics; costs ergonomics and generated bloat.
 
-*Recommendation: O-a if `Option[T]` is scheduled; otherwise O-b for the first
+*Recommendation: O-a if `Optional[T]` is scheduled; otherwise O-b for the first
 wave, with O-c available as a targeted patch for specific mutating operations that
 cannot wait.*
 The first-wave service list for O-b is in §8.
@@ -260,7 +260,7 @@ covers only the body-bound slice, the core routes the rest.
 *Recommendation (P):* v1 ships **JSON-family protocols only** (awsJson +
 rest-json).
 `rest-xml` + `query` (hence S3, STS, SNS, IAM, EC2) wait on an `xml` module — its
-own stdlib/pkg ticket and the main coverage gate after Option[T].
+own stdlib/pkg ticket and the main coverage gate after Optional[T].
 
 ### 5. Auth / request signing (fork A)
 
@@ -355,9 +355,9 @@ version for ~400 independently-evolving services.
 **First-wave services.**
 Driven by §4 (JSON-only) and §3.1 (optionality):
 
-- Under **O-a** (Option[T] lands): DynamoDB, SQS, Lambda (control plane + Invoke) —
+- Under **O-a** (Optional[T] lands): DynamoDB, SQS, Lambda (control plane + Invoke) —
   full read+write.
-- Under **O-b** (no Option[T]): restrict the first wave to **read-oriented**
+- Under **O-b** (no Optional[T]): restrict the first wave to **read-oriented**
   operations where absent≈zero is safe — e.g. DynamoDB `GetItem`/`Query`/`Scan`,
   SQS `ReceiveMessage`, Lambda `Invoke`, STS/`GetCallerIdentity`-style reads (once
   XML lands), and later S3 `GetObject` (once XML lands).
@@ -405,7 +405,7 @@ DynamoDB) and loops back to I#89: smaller binary = faster cold start.
   code is the whole SDK, maintainable across ~300 services because the per-service
   part is mechanical.
 - **Optionality is the real gate**, above XML: AWS is optional-heavy, and
-  absent-vs-zero correctness needs `Option[T]`.
+  absent-vs-zero correctness needs `Optional[T]`.
   Writing the doc to stand under both O-a and O-b keeps progress unblocked while the
   generics call is made.
 - **JSON-first protocol coverage** lets v1 ship entirely on existing stdlib
@@ -451,7 +451,7 @@ injected throttles; presign URL vector.
 
 ## Dependencies (with how-blocking each is)
 
-1. **`Option[T]` / user generics (D-0017)** — *load-bearing.*
+1. **`Optional[T]` / user generics (D-0017)** — *load-bearing.*
    Governs optional-field correctness (§3.1).
    O-a needs it; without it the first wave is restricted to read-oriented ops (O-b)
    or uses presence flags (O-c).
@@ -499,7 +499,7 @@ injected throttles; presign URL vector.
 
 ## Open issues (explicit product calls — not decided here)
 
-- **O (optionality):** O-a (schedule `Option[T]`, model optional properly,
+- **O (optionality):** O-a (schedule `Optional[T]`, model optional properly,
   full first wave) **vs** O-b (ship read-oriented first wave now without it) **vs**
   O-c (presence flags).
   Preferred O-a; the orchestrator is making the generics-prioritization call and

@@ -10,8 +10,8 @@ struct Pair[A, B]:
 def identity[T](T x) -> T:
     return x
 
-def wrap[T](T x) -> Option[T]:
-    return Option.Some(identity(x))
+def wrap[T](T x) -> Optional[T]:
+    return Optional.Some(identity(x))
 
 def twice[T](T x) -> Pair[T, T]:
     return Pair(identity(x), x)

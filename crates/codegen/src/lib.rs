@@ -1265,7 +1265,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     Some(self.ctx.bool_type().const_int(*val as u64, false).into());
             }
             // Niche-optional support (I#154, D-0064 #4). `NullConst` is the null
-            // pointer that a niche `Option`'s `None` lowers to; `IsNull` backs its
+            // pointer that a niche `Optional`'s `None` lowers to; `IsNull` backs its
             // tag-free `match` test. Both are ordinary pointer operations — the
             // precise collector already skips a null pointer slot
             // (`zap_is_heap_ptr` in `zapgc.inc.c`), so a niche optional needs no

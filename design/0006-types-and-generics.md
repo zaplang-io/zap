@@ -583,10 +583,10 @@ so **no new `match` syntax is needed**: a qualified variant with fields bound
 (`Shape.Circle(r=r)`), developer's choice; exhaustiveness extends to variant
 coverage.
 
-**Generics** — generic enums (`enum Option[T]: Some(T v); None`) are **reserved
+**Generics** — generic enums (`enum Optional[T]: Some(T v); None`) are **reserved
 in the grammar now** and implemented by monomorphization **when user generics
 land** (D-0017 staging; §5); non-generic data-carrying enums ship first. Stdlib
-`Option[T]`/`Result[T, E]` ride on that.
+`Optional[T]`/`Result[T, E]` ride on that.
 
 **Methods** on an enum (a `def` with `self` in the block, like structs §2.2,
 D-0015) are **allowed** — dispatching via `match` internally — and may be staged
@@ -904,7 +904,7 @@ or tuples.
   the same protocol. Enums remain compiler-generated, not via this protocol.
 - **Data-carrying enum variants / tier 3** (D-0018, OPEN-QUESTIONS): the tagged-
   union layout, payload sizing (inline vs boxed for large/recursive variants),
-  and the generic `Option[T]`/`Result[T, E]` that motivate it.
+  and the generic `Optional[T]`/`Result[T, E]` that motivate it.
   §3.3 fixes the intended direction but tier 3 is not accepted here.
 - **Interface dispatch representation:** fat pointer (chosen) vs
   type-descriptor-routed dispatch; a later optimization decision, not a semantic
