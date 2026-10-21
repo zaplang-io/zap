@@ -302,6 +302,37 @@ static void zap_mutator_register(void) {
     pthread_mutex_unlock(&zap_stw_mu);
 }
 
+/* Remove this thread's mutator node from the registry — called when a dedicated
+ * LockOSThread M exits (ticket #172). Without this, a collection would wait
+ * forever on a dead thread's ACTIVE node. Its Immix blocks (if any) are left on
+ * the heap and recovered by the next collection's sweep; the node itself is
+ * unlinked under the stop-the-world lock so the collector never walks freed
+ * memory. Must run OUTSIDE a collection (the caller is idle/blocked). */
+static void zap_mutator_unregister(void) {
+    if (!zap_self) {
+        return;
+    }
+    pthread_mutex_lock(&zap_stw_mu);
+    /* Wait out any in-flight collection so we never unlink mid-mark. */
+    while (zap_collecting) {
+        pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
+    }
+    ZapMutator **pp = &zap_mutators;
+    while (*pp && *pp != zap_self) {
+        pp = &(*pp)->next;
+    }
+    if (*pp == zap_self) {
+        *pp = zap_self->next;
+    }
+    /* Relinquish our bump blocks so the collector can reclaim their lines: a
+     * detached block simply becomes sweepable (single-owner hole state lived in
+     * the block; dropping the reference is enough — the next sweep recycles it). */
+    pthread_cond_broadcast(&zap_stw_cv);
+    pthread_mutex_unlock(&zap_stw_mu);
+    free(zap_self);
+    zap_self = NULL;
+}
+
 /* Enter a blocking region of the runtime (channel wait, scheduler idle, join):
  * roots are flushed and the thread is marked safe so a collection need not wait
  * for it. Paired with zap_leave_blocking. */
@@ -338,6 +369,18 @@ static void zap_leave_blocking(void) {
  * thread that arrives flushes its head, parks, and waits for the collection to
  * finish. */
 void zap_safepoint(void) {
+    /* Preemption (ticket #172): a monitor-flagged coroutine yields here, where
+     * the shadow chain is consistent so parking is provably GC-safe — the
+     * precise-GC safe-point machinery doubling as the async-preemption landing
+     * point. Skip while a collection is pending/running: the coroutine will park
+     * for the GC below instead, which also frees its M. */
+    {
+        M *m = cur_m;
+        if (m && m->preempt && m->current && !zap_gc_wanted && !zap_collecting) {
+            m->preempt = 0;
+            gopreempt();
+        }
+    }
     if (!zap_gc_wanted && !zap_collecting) {
         return; /* fast path: two loads, predicted not-taken */
     }

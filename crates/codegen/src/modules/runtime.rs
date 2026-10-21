@@ -10,4 +10,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     let i = cg.ctx.i64_type();
     cg.declare_rt("zap_runtime_goroutine_dump", &[], None);
     cg.declare_rt("zap_runtime_num_goroutines", &[], Some(i.into()));
+    // Scheduler controls (ticket #172): the parallelism knob `MAXPROCS` and the
+    // LockOSThread (dedicated-OS-thread) pin/unpin pair.
+    cg.declare_rt("zap_runtime_maxprocs", &[], Some(i.into()));
+    cg.declare_rt("zap_runtime_lock_os_thread", &[], None);
+    cg.declare_rt("zap_runtime_unlock_os_thread", &[], None);
 }
