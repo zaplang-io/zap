@@ -174,6 +174,45 @@ mod tests {
     }
 
     #[test]
+    fn lower_bitfield_value_struct_packs() {
+        // C-style bitfields (I#173, D-0068): a value struct whose fields all
+        // carry widths lowers to one packed backing integer. 4 + 4 + 2 + 1 = 11
+        // bits packs into a u16 (the smallest unit >= 11 bits), with each field
+        // placed least-significant-first in declaration order. Signed integer
+        // fields read back sign-extended; bool/enum are unsigned.
+        let m = lower_ok(
+            "enum Color:\n    RED\n    GREEN\n    BLUE\n    WHITE\n\n\
+             value struct Pack:\n    int64 a : 4\n    int64 b : 4\n    \
+             Color c : 2\n    bool d : 1\n\n\
+             def main():\n    auto p = Pack(a=1, b=2, c=Color.RED, d=True)\n    \
+             print(p.a)\n",
+        );
+        let pack = m
+            .structs
+            .iter()
+            .find(|s| s.name == "Pack")
+            .expect("Pack layout");
+        assert!(pack.is_value, "Pack is a value struct");
+        let pl = pack
+            .packed
+            .as_ref()
+            .expect("Pack is a packed bitfield struct");
+        // 11 bits -> the smallest backing integer is i16 (2 bytes). This is the
+        // packed word size the struct occupies.
+        assert_eq!(pl.backing, Ty::I16, "11 bits pack into a u16");
+        let got: Vec<(u32, u32, bool)> = pl
+            .fields
+            .iter()
+            .map(|b| (b.offset, b.width, b.signed))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0, 4, true), (4, 4, true), (8, 2, false), (10, 1, false)],
+            "LSB-first offsets, declared widths, signed only for the int fields"
+        );
+    }
+
+    #[test]
     fn lower_tier1_enum_and_match() {
         // A tier-1 enum is its unboxed backing int: member access is an iconst
         // (RED=0, GREEN=10, BLUE continues at 11), and a `match` is an

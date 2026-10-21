@@ -125,6 +125,12 @@ pub struct Field {
     pub decorators: Vec<Decorator>,
     pub ty: Type,
     pub name: String,
+    /// C-style bitfield width in bits (I#173, D-0068): the `3` in
+    /// `int64 kind : 3`. `Some(n)` packs this field into `n` bits of the value
+    /// struct's backing integer; `None` is an ordinary full-width field.
+    /// Only valid on `value struct` fields of a fixed-width integer, `bool`, or
+    /// tier-1 `enum` type (enforced in sema).
+    pub bits: Option<u32>,
     /// Literal field default (D-0038); computed defaults use `@default(...)`.
     pub default: Option<Expr>,
     pub span: Span,

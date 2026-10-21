@@ -74,7 +74,15 @@ struct_def    ::= decorators [ "value" ] "struct" IDENT [ generics ] ":" NEWLINE
                      Prelude generic structs use this same grammar: `Atomic[T]`
                      (the `sync` atomic cell, I#176/D-0066) is `struct Atomic[T]`
                      whose methods lower to inline LLVM atomics — no new syntax. *)
-field         ::= decorators type IDENT [ "=" expr ] NEWLINE ;
+field         ::= decorators type IDENT [ ":" INT ] [ "=" expr ] NEWLINE ;
+                  (* ":" INT is a C-style bitfield width (I#173, D-0068): the
+                     field packs into INT bits of the value struct's backing
+                     integer. Only on a `value struct`, and then EVERY field must
+                     carry a width (v1 does not mix bitfields with full-width
+                     fields). The field type must be a fixed-width integer
+                     (int32/int64), bool, or a tier-1 enum — never a
+                     pointer/reference, so the precise GC never sees packed bits.
+                     1 <= INT <= type width; widths of one struct sum to <= 64. *)
 
 interface_def ::= "interface" IDENT [ generics ] ":" NEWLINE
                   INDENT { method_sig } DEDENT ;

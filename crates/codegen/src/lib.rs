@@ -217,6 +217,17 @@ fn block_starts_with_landing_pad(b: &zir::Block) -> bool {
     matches!(b.insts.first(), Some(zir::Inst::LandingPad { .. }))
 }
 
+/// A mask of the low `width` bits set (`width` is `1..=64`), for C-style
+/// bitfield extraction/insertion (I#173). Widening to the backing integer's own
+/// width is done by `const_int`, which truncates this `u64` to the int type.
+fn width_mask(width: u32) -> u64 {
+    if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}
+
 /// The SSA value an instruction defines, if any (ticket #48: used to root every
 /// GC-pointer-typed definition at its definition site; see I#167). Non-pointer
 /// dests are filtered out downstream by their absent root slot.
@@ -267,6 +278,11 @@ struct Cg<'a, 'ctx> {
     /// an inline aggregate is passed/returned **by value** (register/sret) rather
     /// than as a heap pointer. Indexed by struct id, parallel to `structs`.
     struct_inline: Vec<bool>,
+    /// Per-struct C-style bitfield packing (I#173, mirrors
+    /// [`zir::StructLayout::packed`]). `Some` for a packed `value struct` whose
+    /// LLVM type is a single `{ iN }` backing integer and whose fields are read
+    /// and written by shift/mask instead of a GEP. Indexed by struct id.
+    struct_packed: Vec<Option<zir::ir::PackedLayout>>,
     /// Per-struct GC type-descriptor global (ticket #48), indexed by struct id.
     /// Passed to `zap_alloc_typed` so the precise collector can trace a struct
     /// instance's pointer fields. Empty under the Boehm build.
@@ -327,6 +343,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             fns: std::collections::HashMap::new(),
             structs: Vec::new(),
             struct_inline: Vec::new(),
+            struct_packed: Vec::new(),
             struct_descs: Vec::new(),
             gc_frame: None,
             target_data: None,
@@ -732,9 +749,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // Build LLVM struct types (fields are scalars or pointers, so no
         // recursive-by-value ordering concerns).
         for sl in &m.structs {
-            let field_tys: Vec<BasicTypeEnum> = sl.fields.iter().map(|t| self.basic(*t)).collect();
-            self.structs.push(self.ctx.struct_type(&field_tys, false));
+            let st = if let Some(pl) = &sl.packed {
+                // C-style bitfield struct (I#173): the whole aggregate is a single
+                // backing integer; fields are shift/mask slices of it, not LLVM
+                // struct members. Wrapping the integer in a one-element struct
+                // keeps it pointer-addressed like every other struct (StructNew,
+                // copies, arrays, generics) while `size_of` reports the unit size.
+                self.ctx.struct_type(&[self.basic(pl.backing)], false)
+            } else {
+                let field_tys: Vec<BasicTypeEnum> =
+                    sl.fields.iter().map(|t| self.basic(*t)).collect();
+                self.ctx.struct_type(&field_tys, false)
+            };
+            self.structs.push(st);
             self.struct_inline.push(sl.inline);
+            self.struct_packed.push(sl.packed.clone());
             self.struct_names.push(sl.name.clone());
         }
         // Interface metadata (D-0016) for fat-pointer construction and dynamic
@@ -1180,6 +1209,107 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Func(_)
             | Ty::Py => self.ctx.ptr_type(AddressSpace::default()).into(),
         }
+    }
+
+    /// Read a C-style bitfield (I#173, D-0068): load the struct's backing
+    /// integer, bring the field's bit slice down to bit 0, and extend it to the
+    /// field's logical type. Signed integer fields are **sign-extended**; `bool`
+    /// and tier-1 enums are zero-extended.
+    fn packed_field_get(
+        &self,
+        b: &Builder<'ctx>,
+        base: PointerValue<'ctx>,
+        st: inkwell::types::StructType<'ctx>,
+        backing: Ty,
+        bf: zir::ir::BitField,
+        dest_ty: BasicTypeEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let int_ty = self.basic(backing).into_int_type();
+        let nbits = int_ty.get_bit_width();
+        let unit_ptr = b
+            .build_struct_gep(st, base, 0, "bf.unit")
+            .map_err(|_| "bitfield backing unit".to_string())?;
+        let unit = b
+            .build_load(int_ty, unit_ptr, "bf.load")
+            .map_err(|e| e.to_string())?
+            .into_int_value();
+        let extracted = if bf.signed {
+            // Shift the field to the top of the word, then arithmetic-shift it
+            // back down: the top bit of the slice becomes the sign bit.
+            let up = (nbits - bf.width - bf.offset) as u64;
+            let shl = b
+                .build_left_shift(unit, int_ty.const_int(up, false), "bf.shl")
+                .map_err(|e| e.to_string())?;
+            b.build_right_shift(
+                shl,
+                int_ty.const_int((nbits - bf.width) as u64, false),
+                true,
+                "bf.ashr",
+            )
+            .map_err(|e| e.to_string())?
+        } else {
+            let down = b
+                .build_right_shift(
+                    unit,
+                    int_ty.const_int(bf.offset as u64, false),
+                    false,
+                    "bf.lshr",
+                )
+                .map_err(|e| e.to_string())?;
+            b.build_and(
+                down,
+                int_ty.const_int(width_mask(bf.width), false),
+                "bf.mask",
+            )
+            .map_err(|e| e.to_string())?
+        };
+        let v = b
+            .build_int_cast_sign_flag(extracted, dest_ty.into_int_type(), bf.signed, "bf.cast")
+            .map_err(|e| e.to_string())?;
+        Ok(v.into())
+    }
+
+    /// Write a C-style bitfield (I#173, D-0068): load the backing integer, clear
+    /// the field's bits, and OR in the low `width` bits of `val` shifted into
+    /// place. Only the field's bits change — neighbours are preserved.
+    fn packed_field_set(
+        &self,
+        b: &Builder<'ctx>,
+        base: PointerValue<'ctx>,
+        st: inkwell::types::StructType<'ctx>,
+        backing: Ty,
+        bf: zir::ir::BitField,
+        val: BasicValueEnum<'ctx>,
+    ) -> Result<(), String> {
+        let int_ty = self.basic(backing).into_int_type();
+        let unit_ptr = b
+            .build_struct_gep(st, base, 0, "bf.unit")
+            .map_err(|_| "bitfield backing unit".to_string())?;
+        let unit = b
+            .build_load(int_ty, unit_ptr, "bf.load")
+            .map_err(|e| e.to_string())?
+            .into_int_value();
+        // Bring the incoming value to the backing width; masking below drops any
+        // high bits, so a plain (zero-extending) cast is correct for either sign.
+        let v = b
+            .build_int_cast_sign_flag(val.into_int_value(), int_ty, false, "bf.vin")
+            .map_err(|e| e.to_string())?;
+        let masked = b
+            .build_and(v, int_ty.const_int(width_mask(bf.width), false), "bf.vmask")
+            .map_err(|e| e.to_string())?;
+        let shifted = b
+            .build_left_shift(masked, int_ty.const_int(bf.offset as u64, false), "bf.vshl")
+            .map_err(|e| e.to_string())?;
+        let clear = int_ty.const_int(!(width_mask(bf.width) << bf.offset), false);
+        let cleared = b
+            .build_and(unit, clear, "bf.clear")
+            .map_err(|e| e.to_string())?;
+        let new_unit = b
+            .build_or(cleared, shifted, "bf.or")
+            .map_err(|e| e.to_string())?;
+        b.build_store(unit_ptr, new_unit)
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// The **ABI** (calling-convention) type for `t`. Identical to [`basic`]
@@ -1650,11 +1780,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             } => {
                 let st = self.structs[*sid as usize];
                 let p = get(vals, *base).into_pointer_value();
-                let fp = b
-                    .build_struct_gep(st, p, *idx, "fieldptr")
-                    .map_err(|_| "invalid field index".to_string())?;
                 let ty = self.basic(f.value_ty(*dest));
-                let v = b.build_load(ty, fp, "field").map_err(|e| e.to_string())?;
+                let v = if let Some(pl) = &self.struct_packed[*sid as usize] {
+                    // C-style bitfield read (I#173): shift/mask the backing int.
+                    self.packed_field_get(b, p, st, pl.backing, pl.fields[*idx as usize], ty)?
+                } else {
+                    let fp = b
+                        .build_struct_gep(st, p, *idx, "fieldptr")
+                        .map_err(|_| "invalid field index".to_string())?;
+                    b.build_load(ty, fp, "field").map_err(|e| e.to_string())?
+                };
                 vals[*dest as usize] = Some(v);
             }
             Inst::FieldSet {
@@ -1665,11 +1800,23 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             } => {
                 let st = self.structs[*sid as usize];
                 let p = get(vals, *base).into_pointer_value();
-                let fp = b
-                    .build_struct_gep(st, p, *idx, "fieldptr")
-                    .map_err(|_| "invalid field index".to_string())?;
-                b.build_store(fp, get(vals, *val))
-                    .map_err(|e| e.to_string())?;
+                if let Some(pl) = &self.struct_packed[*sid as usize] {
+                    // C-style bitfield write (I#173): read-clear-or the backing int.
+                    self.packed_field_set(
+                        b,
+                        p,
+                        st,
+                        pl.backing,
+                        pl.fields[*idx as usize],
+                        get(vals, *val),
+                    )?;
+                } else {
+                    let fp = b
+                        .build_struct_gep(st, p, *idx, "fieldptr")
+                        .map_err(|_| "invalid field index".to_string())?;
+                    b.build_store(fp, get(vals, *val))
+                        .map_err(|e| e.to_string())?;
+                }
             }
             // Atomic[T] operations (I#176). Each GEPs the cell field — which sits
             // at offset 0, so the pointer is the box itself — then emits the LLVM

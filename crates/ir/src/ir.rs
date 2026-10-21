@@ -715,6 +715,40 @@ pub struct StructLayout {
     /// and so keeps the heap representation. Reference structs (D-0023) and
     /// tier-3 enum payload structs are never inline — they have shared identity.
     pub inline: bool,
+    /// C-style bitfield packing (I#173, D-0068). `Some` iff this is a packed
+    /// `value struct`: **every** field is a bitfield and the whole aggregate is a
+    /// single scalar backing integer (holding no pointers, so the precise GC
+    /// never traces it). `None` for an ordinary aggregate. When `Some`, `fields`
+    /// still lists the logical field types (so a `FieldGet` yields the right
+    /// type), while [`PackedLayout`] says how each one maps to a bit slice of the
+    /// backing integer.
+    pub packed: Option<PackedLayout>,
+}
+
+/// How a packed `value struct`'s fields pack into one backing integer (I#173).
+/// Bits are assigned least-significant-first in declaration order.
+#[derive(Clone, Debug)]
+pub struct PackedLayout {
+    /// The backing unsigned-integer unit holding every bitfield: the smallest of
+    /// `I8`/`I16`/`I32`/`I64` whose width is at least the total of all field
+    /// widths (which is at most 64).
+    pub backing: Ty,
+    /// One entry per declared field, 1:1 and in the same order as
+    /// [`StructLayout::fields`].
+    pub fields: Vec<BitField>,
+}
+
+/// One field's bit slice within a [`PackedLayout`]'s backing integer (I#173).
+#[derive(Clone, Copy, Debug)]
+pub struct BitField {
+    /// Bit offset of the field's least-significant bit from the backing integer's
+    /// bit 0.
+    pub offset: u32,
+    /// Field width in bits (`1..=64`).
+    pub width: u32,
+    /// `true` for a signed integer field (read back **sign-extended**); `false`
+    /// for `bool` / tier-1 enum (read back zero-extended).
+    pub signed: bool,
 }
 
 /// One method slot of an interface's dispatch table (D-0016), in interface
