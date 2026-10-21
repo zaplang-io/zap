@@ -47,6 +47,8 @@ typedef struct ZapBlock {
     uint32_t hole_limit;          /* small: end of current free run             */
     uint32_t search_line;         /* small: line to resume hole search from     */
     uint32_t avail;               /* small: free bytes when placed on a list    */
+    uint32_t live_lines;          /* small: live lines at the last sweep (#120) */
+    uint8_t evac_src;             /* small: selected evacuation source (#120)   */
     uint8_t line_mark[ZAP_LINES]; /* small: per-line liveness (set by tracing)  */
 } ZapBlock;
 
@@ -72,6 +74,25 @@ enum { ZAP_BK_SMALL = 0, ZAP_BK_LOS = 1 };
 #define ZAP_SET_MARK(payload) (ZAP_HDR(payload) |= 1u)
 #define ZAP_CLR_MARK(payload) (ZAP_HDR(payload) &= ~(uintptr_t)1)
 
+/* Evacuation forwarding (ticket #120). The descriptor pointer is 8-byte aligned,
+ * so header bits 0..2 are free; bit 0 is the mark bit (above), bit 1 marks an
+ * object that has been MOVED (forwarded). When an object is evacuated, its new
+ * payload address is written into the OLD object's size-word header slot
+ * (payload[-1]) — dead once the object has been copied, and always present (part
+ * of the 16-byte header), so there is no minimum-payload-size constraint. Any
+ * reference still pointing at the old object is rewritten to the target the next
+ * time the collector processes the slot. The forwarding bit is only ever set on
+ * a dead source-block object (reclaimed by the same sweep), so it never needs
+ * clearing. */
+#define ZAP_FWD_BIT 2u
+#define ZAP_IS_FWD(payload) (ZAP_HDR(payload) & ZAP_FWD_BIT)
+#define ZAP_FWD_TARGET(payload) (((void **)(payload))[-1])
+#define ZAP_SET_FWD(payload, np)                                                                   \
+    do {                                                                                           \
+        ZAP_HDR(payload) |= ZAP_FWD_BIT;                                                           \
+        ((void **)(payload))[-1] = (np);                                                           \
+    } while (0)
+
 /* ---- heap globals --------------------------------------------------------- */
 static pthread_mutex_t zap_heap_mu = PTHREAD_MUTEX_INITIALIZER;
 static ZapBlock *zap_free_blocks = NULL;    /* fully-free small blocks, reusable */
@@ -79,6 +100,45 @@ static ZapBlock *zap_recycle_blocks = NULL; /* small blocks with holes          
 static ZapBlock *zap_all_blocks = NULL;     /* every mapped block (sweep walks)   */
 static size_t zap_bytes_since_gc = 0;
 static size_t zap_live_estimate = 0;
+
+/* ---- opportunistic evacuation / defragmentation (ticket #120) ------------- *
+ * A moving second phase for the precise Immix collector. Immix fragments over
+ * time: blocks accumulate holes as objects die at line granularity, leaving many
+ * partially-occupied blocks that waste whole-block capacity. Evacuation relocates
+ * the live objects out of the SPARSEST blocks into dense fresh blocks during a
+ * collection, so the emptied source blocks are reclaimed whole and allocation
+ * locality improves.
+ *
+ * Because the collector is PRECISE — it visits every root and every pointer field
+ * — it can rewrite each reference to a moved object to its new address, so no
+ * stale pointer survives. Compiled code observes the move because codegen reloads
+ * every GC-pointer value from its shadow slot after a safepoint (load-at-use,
+ * #120 in codegen/src/lib.rs); the collector updates those slots here.
+ *
+ * SAFETY / what moves. v1 moves only `zap_desc_atomic` leaf buffers (string
+ * bytes, numeric array data, and the element/entry buffers of the built-in
+ * containers) — the dominant source of fragmentation. They have no pointer
+ * children, are reached only through a parent's pointer slot (updated here) or a
+ * reloaded SSA value, and are never cached by raw C across a safepoint (the
+ * runtime's C routines re-read the parent each call and never poll a safepoint
+ * mid-operation). Everything else is marked in place: the scheduler-owned objects
+ * the runtime holds by raw C pointer (the coroutine `G` and its green stack,
+ * `Scope`, `ZapChan`, signal subscriptions, sockets, sync primitives, the LOS),
+ * the CPython-interop wrapper (finalizer-registered), and any object a non-slot
+ * root marks (the reflection and signal tables, via `zap_gc_mark`). Pinning is
+ * achieved simply by marking those objects BEFORE any evacuation runs: an
+ * already-marked object is never moved. The forwarding/update protocol itself is
+ * fully general, so widening the movable set later needs no new machinery. */
+#define ZAP_EVAC_MAX_SRC 64u /* cap source blocks per cycle (bounds copy + to-space) */
+/* A small block is a candidate source when it is non-empty but at most this many
+ * of its usable lines were live at the previous sweep (~<=50% occupancy). */
+#define ZAP_EVAC_SPARSE_LINES (((ZAP_LINES - ZAP_RESERVED_LINES)) / 2u)
+static int zap_evac_active = 0;        /* evacuation enabled for the current cycle */
+static int zap_evac_disabled = 0;      /* ZAP_GC_NO_EVAC set: skip evacuation      */
+static ZapBlock *zap_evac_tospace = NULL; /* current dense target block            */
+static uint32_t zap_evac_cursor = 0;   /* bump offset within zap_evac_tospace      */
+static size_t zap_evac_moved = 0;      /* objects relocated this cycle (stats)     */
+static ZapBlock *zap_map_block(void);  /* fwd: map a fresh small block             */
 
 /* ---- block registry ------------------------------------------------------- *
  * An open-addressing hash set of block base addresses, so the marker can decide
@@ -193,6 +253,13 @@ __attribute__((constructor)) static void zap_gc_read_env(void) {
         if (v > 0) {
             zap_heap_limit = (size_t)v;
         }
+    }
+    /* ZAP_GC_NO_EVAC disables opportunistic evacuation/defrag (ticket #120),
+     * leaving the collector purely mark-in-place. Used to A/B evacuation and as a
+     * safety escape hatch; correctness must be identical either way. */
+    const char *ne = getenv("ZAP_GC_NO_EVAC");
+    if (ne && ne[0] && ne[0] != '0') {
+        zap_evac_disabled = 1;
     }
 }
 
@@ -521,14 +588,47 @@ static void zap_mark_block_lines(void *payload, size_t obj_size) {
     }
 }
 
+/* Append a (final-address) live object to the BFS worklist so its children are
+ * traced. The caller has already set the mark bit and the line marks. */
+static void zap_mark_enqueue(void *payload) {
+    if (zap_mark_len == zap_mark_cap) {
+        size_t ncap = zap_mark_cap ? zap_mark_cap * 2 : 1024;
+        zap_mark_list = (void **)realloc(zap_mark_list, ncap * sizeof(void *));
+        zap_mark_cap = ncap;
+    }
+    zap_mark_list[zap_mark_len++] = payload;
+}
+
+/* The small block that contains `payload` (its 32 KiB-aligned base). */
+static ZapBlock *zap_block_of(void *payload) {
+    uintptr_t base = (uintptr_t)payload - ZAP_HEADER_BYTES;
+    return (ZapBlock *)(base & ~(uintptr_t)(ZAP_BLOCK - 1));
+}
+
+/* Mark `payload` live IN PLACE (never moving it), mark its lines and enqueue it.
+ *
+ * Reject null and any pointer that is not one of our heap object payloads.
+ * Codegen roots every pointer-TYPED value, some of which are stack allocas,
+ * function addresses or inline value-struct pointers — never GC objects — and a
+ * precise descriptor field could likewise hold such a pointer; the registry check
+ * safely ignores all of them.
+ *
+ * This is the PINNING primitive (ticket #120): an object marked here before any
+ * evacuation runs can never be moved (the moving path below skips an already
+ * marked object), so it is how the collector keeps objects reached by a non-slot
+ * root — the reflection and signal tables, via the public `zap_gc_mark` — and the
+ * runtime-owned buffers of concurrency objects fixed in place. Also used for the
+ * finalizer queue, whose registered pointers must stay valid. */
 static void zap_mark_push(void *payload) {
-    /* Reject null and any pointer that is not one of our heap object payloads.
-     * Codegen roots every pointer-TYPED value, some of which are stack allocas,
-     * function addresses or inline value-struct pointers — never GC objects —
-     * and a precise descriptor field could likewise hold such a pointer; the
-     * registry check safely ignores all of them. */
     if (!zap_is_heap_ptr(payload)) {
         return;
+    }
+    if (ZAP_IS_FWD(payload)) {
+        /* Defensive: an in-place caller normally never sees a forwarded (moved)
+         * object — the pin pass runs before any evacuation and finalizer objects
+         * never move — but if one slips through, follow it to the live copy rather
+         * than resurrecting the dead stub. */
+        payload = ZAP_FWD_TARGET(payload);
     }
     if (ZAP_MARKED(payload)) {
         return;
@@ -539,36 +639,146 @@ static void zap_mark_push(void *payload) {
     }
     (void)d;
     ZAP_SET_MARK(payload);
-    size_t osize = ZAP_HEADER_BYTES + ZAP_OSIZE(payload);
-    zap_mark_block_lines(payload, osize);
-    if (zap_mark_len == zap_mark_cap) {
-        size_t ncap = zap_mark_cap ? zap_mark_cap * 2 : 1024;
-        zap_mark_list = (void **)realloc(zap_mark_list, ncap * sizeof(void *));
-        zap_mark_cap = ncap;
-    }
-    zap_mark_list[zap_mark_len++] = payload;
+    zap_mark_block_lines(payload, ZAP_HEADER_BYTES + ZAP_OSIZE(payload));
+    zap_mark_enqueue(payload);
 }
 
-/* Trace one already-marked object: enqueue its children per its descriptor. */
+/* Copy a movable object out of its sparse source block into the dense to-space,
+ * install forwarding on the original, and return the new payload — or NULL if
+ * to-space cannot be grown (out of blocks), so the caller marks in place instead.
+ * The header (incl. the descriptor and the payload size) is memcpy'd first, so
+ * the new object is self-describing; the forwarding address is then written over
+ * the ORIGINAL's now-dead size slot. The original's lines are left unmarked so
+ * the sweep reclaims them. Caller holds zap_heap_mu (the collection does). */
+static void *zap_evac_copy(void *payload) {
+    size_t osize = ZAP_HEADER_BYTES + ZAP_OSIZE(payload); /* header + live payload */
+    /* Advance the dense cursor by the 16-byte-aligned footprint (matching the
+     * allocator's zap_round16) so every copied payload stays 16-byte aligned. */
+    size_t step = (osize + 15u) & ~(size_t)15u;
+    if (!zap_evac_tospace || zap_evac_cursor + step > ZAP_BLOCK) {
+        ZapBlock *nb;
+        if (zap_free_blocks) {
+            nb = zap_free_blocks;
+            zap_free_blocks = nb->next;
+        } else {
+            nb = zap_map_block(); /* aborts on OOM; never NULL */
+        }
+        nb->evac_src = 0; /* a target is never also a source */
+        zap_evac_tospace = nb;
+        zap_evac_cursor = ZAP_RESERVED_BYTES;
+        if (zap_evac_cursor + step > ZAP_BLOCK) {
+            return NULL; /* object larger than a block's usable region (unreachable) */
+        }
+    }
+    void *old_hdr = (char *)payload - ZAP_HEADER_BYTES;
+    void *new_hdr = (char *)zap_evac_tospace + zap_evac_cursor;
+    memcpy(new_hdr, old_hdr, osize);
+    zap_evac_cursor += (uint32_t)step;
+    void *np = (char *)new_hdr + ZAP_HEADER_BYTES;
+    ZAP_SET_FWD(payload, np); /* original is now a forwarding stub (dead) */
+    zap_evac_moved++;
+    return np;
+}
+
+/* Process a reference VALUE for the (possibly moving) trace. Returns the address
+ * the reference should now hold:
+ *   - a non-heap pointer / null: unchanged;
+ *   - an already-forwarded object: its new address (the move happened earlier);
+ *   - an already-live object: unchanged;
+ *   - otherwise mark it: evacuate it (when enabled and it is a movable leaf buffer
+ *     in a sparse source block) to a new address, else mark it in place.
+ * Either way the (final) object is enqueued once for child tracing. */
+static void *zap_evac_mark(void *payload) {
+    if (!zap_is_heap_ptr(payload)) {
+        return payload;
+    }
+    if (ZAP_IS_FWD(payload)) {
+        return ZAP_FWD_TARGET(payload);
+    }
+    if (ZAP_MARKED(payload)) {
+        return payload;
+    }
+    const ZapTypeDesc *d = ZAP_DESC(payload);
+    if (d == NULL) {
+        return payload;
+    }
+    void *final = payload;
+    if (zap_evac_active && d == &zap_desc_atomic) {
+        ZapBlock *b = zap_block_of(payload);
+        if (b->kind == ZAP_BK_SMALL && b->evac_src) {
+            void *np = zap_evac_copy(payload);
+            if (np) {
+                final = np;
+            }
+        }
+    }
+    ZAP_SET_MARK(final);
+    zap_mark_block_lines(final, ZAP_HEADER_BYTES + ZAP_OSIZE(final));
+    zap_mark_enqueue(final);
+    return final;
+}
+
+/* Trace a genuine pointer-typed slot, rewriting it in place if its target moved. */
+static void zap_process_slot(void **slot) {
+    void *p = *slot;
+    void *np = zap_evac_mark(p);
+    if (np != p) {
+        *slot = np;
+    }
+}
+
+/* Trace a container interior word that holds pointer bits (list/dict/set/heap
+ * element words stored as int64), rewriting it in place if its target moved. */
+static void zap_process_word(int64_t *slot) {
+    void *p = (void *)(intptr_t)*slot;
+    void *np = zap_evac_mark(p);
+    if (np != p) {
+        *slot = (int64_t)(intptr_t)np;
+    }
+}
+
+/* Trace one already-live object: process each of its references for the (moving)
+ * collector. A genuine pointer field or buffer-pointer slot goes through
+ * `zap_process_slot` so it is rewritten in place if its target was evacuated; a
+ * container interior word (a pointer stored as int64) goes through
+ * `zap_process_word`. A container's own data/entry buffer is itself a movable
+ * `zap_desc_atomic` leaf, so its slot is processed FIRST and then re-read, so the
+ * interior is walked at the buffer's (possibly new) address.
+ *
+ * Two runtime-owned concurrency objects — `ZapChan` and `Scope` — keep their data
+ * buffer PINNED (marked in place, not moved): their C routines can hold a raw
+ * pointer to that buffer across a blocking park/resume, where a relocation would
+ * not be observed. The buffered element slots inside are still processed
+ * move-aware (those words are only read with the object's lock held, never cached
+ * across a park). The coroutine `G` is likewise scheduler-owned and held by raw C
+ * pointers, so its pointer fields are pinned in place. */
 static void zap_trace_children(void *payload) {
     const ZapTypeDesc *d = ZAP_DESC(payload);
     switch (d->kind) {
     case ZAP_TD_ATOMIC:
         return;
     case ZAP_TD_PRECISE: {
-        const char *p = (const char *)payload;
-        for (int32_t i = 0; i < d->n_ptrs; i++) {
-            zap_mark_push(*(void **)(p + d->ptr_offsets[i]));
+        char *p = (char *)payload;
+        if (d == &zap_desc_gobj) {
+            /* Scheduler-owned: pin the G's referents in place (raw C holds them). */
+            for (int32_t i = 0; i < d->n_ptrs; i++) {
+                zap_mark_push(*(void **)(p + d->ptr_offsets[i]));
+            }
+        } else {
+            for (int32_t i = 0; i < d->n_ptrs; i++) {
+                zap_process_slot((void **)(p + d->ptr_offsets[i]));
+            }
         }
         return;
     }
     case ZAP_TD_LIST: {
         ZapList *l = (ZapList *)payload;
         if (l->data) {
-            zap_mark_push(l->data);
+            zap_process_slot((void **)&l->data);
             if (l->elem_ptr) {
+                int64_t *data = l->data;
                 for (int64_t i = 0; i < l->len; i++) {
-                    zap_mark_push((void *)(intptr_t)l->data[i]);
+                    zap_process_word(&data[i]);
                 }
             }
         }
@@ -577,17 +787,18 @@ static void zap_trace_children(void *payload) {
     case ZAP_TD_DICT: {
         ZapDict *dd = (ZapDict *)payload;
         if (dd->entries) {
-            zap_mark_push(dd->entries);
+            zap_process_slot((void **)&dd->entries);
             if (dd->key_ptr || dd->val_ptr) {
+                ZapEntry *e = dd->entries;
                 for (int64_t i = 0; i < dd->cap; i++) {
-                    if (dd->entries[i].state != SLOT_FULL) {
+                    if (e[i].state != SLOT_FULL) {
                         continue;
                     }
                     if (dd->key_ptr) {
-                        zap_mark_push((void *)(intptr_t)dd->entries[i].key);
+                        zap_process_word(&e[i].key);
                     }
                     if (dd->val_ptr) {
-                        zap_mark_push((void *)(intptr_t)dd->entries[i].val);
+                        zap_process_word(&e[i].val);
                     }
                 }
             }
@@ -597,11 +808,12 @@ static void zap_trace_children(void *payload) {
     case ZAP_TD_SET: {
         ZapSet *s = (ZapSet *)payload;
         if (s->entries) {
-            zap_mark_push(s->entries);
+            zap_process_slot((void **)&s->entries);
             if (s->elem_ptr) {
+                ZapSetEntry *e = s->entries;
                 for (int64_t i = 0; i < s->cap; i++) {
-                    if (s->entries[i].state == SLOT_FULL) {
-                        zap_mark_push((void *)(intptr_t)s->entries[i].key);
+                    if (e[i].state == SLOT_FULL) {
+                        zap_process_word(&e[i].key);
                     }
                 }
             }
@@ -611,10 +823,11 @@ static void zap_trace_children(void *payload) {
     case ZAP_TD_HEAP: {
         ZapHeap *h = (ZapHeap *)payload;
         if (h->data) {
-            zap_mark_push(h->data);
+            zap_process_slot((void **)&h->data);
             if (h->kind == HEAP_ELEM_STR) {
+                int64_t *data = h->data;
                 for (int64_t i = 0; i < h->len; i++) {
-                    zap_mark_push((void *)(intptr_t)h->data[i]);
+                    zap_process_word(&data[i]);
                 }
             }
         }
@@ -623,12 +836,12 @@ static void zap_trace_children(void *payload) {
     case ZAP_TD_CHAN: {
         ZapChan *c = (ZapChan *)payload;
         if (c->buf) {
-            zap_mark_push(c->buf);
+            zap_mark_push(c->buf); /* pin: raw C may hold it across a park */
             if (c->elem_ptr && c->cap > 0) {
                 /* the `count` buffered words live at [head .. head+count) mod cap */
                 for (int64_t k = 0; k < c->count; k++) {
                     int64_t idx = (c->head + k) % c->cap;
-                    zap_mark_push((void *)(intptr_t)c->buf[idx]);
+                    zap_process_word((int64_t *)&c->buf[idx]);
                 }
             }
         }
@@ -640,38 +853,41 @@ static void zap_trace_children(void *payload) {
     case ZAP_TD_ARRAY: {
         ZapArray *a = (ZapArray *)payload;
         if (a->dims) {
-            zap_mark_push(a->dims); /* int64 dims: atomic buffer */
+            zap_process_slot((void **)&a->dims); /* int64 dims: atomic buffer */
         }
         if (a->data) {
-            zap_mark_push(a->data); /* numeric element buffer: atomic, no ptrs */
+            zap_process_slot((void **)&a->data); /* numeric data: atomic, no ptrs */
         }
         return;
     }
     case ZAP_TD_MATCH: {
         ZapMatch *mm = (ZapMatch *)payload;
         if (mm->groups) {
-            zap_mark_push(mm->groups);
+            zap_process_slot((void **)&mm->groups);
+            ZapStr **groups = mm->groups;
             for (int64_t i = 0; i < mm->ngroups; i++) {
-                zap_mark_push(mm->groups[i]);
+                zap_process_slot((void **)&groups[i]);
             }
         }
         if (mm->names) {
-            zap_mark_push(mm->names);
+            zap_process_slot((void **)&mm->names);
+            ZapStr **names = mm->names;
             for (int64_t i = 0; i < mm->nnames; i++) {
-                zap_mark_push(mm->names[i]);
+                zap_process_slot((void **)&names[i]);
             }
         }
         if (mm->name_num) {
-            zap_mark_push(mm->name_num); /* int64 buffer: atomic */
+            zap_process_slot((void **)&mm->name_num); /* int64 buffer: atomic */
         }
         return;
     }
     case ZAP_TD_SCOPE: {
         Scope *sc = (Scope *)payload;
         if (sc->excs) {
-            zap_mark_push(sc->excs);
+            zap_mark_push((void *)sc->excs); /* pin: runtime-owned buffer */
+            ZapStr **excs = sc->excs;
             for (int64_t i = 0; i < sc->nexc; i++) {
-                zap_mark_push(sc->excs[i]);
+                zap_process_slot((void **)&excs[i]);
             }
         }
         return;
@@ -763,23 +979,32 @@ static void zap_run_finalizers(void) {
 }
 
 /* ---- root enumeration ----------------------------------------------------- */
+/* A shadow frame's root slots are genuine pointer slots the collector may rewrite
+ * when an object moves — and the exact slots compiled code reloads from after a
+ * safepoint (load-at-use, #120), so a relocation is observed by the mutator. */
 static void zap_mark_shadow_chain(void *head) {
     for (ZapShadowFrame *f = (ZapShadowFrame *)head; f; f = f->prev) {
         for (int64_t i = 0; i < f->nroots; i++) {
-            zap_mark_push(f->roots[i]);
+            zap_process_slot(&f->roots[i]);
         }
     }
 }
 
 static void zap_mark_roots(void) {
-    /* Global static roots (single slots) and custom root callbacks (runtime
-     * tables, e.g. the reflection registry). */
     pthread_mutex_lock(&zap_groots_mu);
-    for (int64_t i = 0; i < zap_groots_len; i++) {
-        zap_mark_push(*zap_groots[i]);
-    }
+    /* PIN PASS FIRST (ticket #120): custom root callbacks (the reflection and
+     * signal tables) mark their objects via the non-slot `zap_gc_mark`, which
+     * cannot report back a new address, so those objects must not move. Running
+     * them before any evacuation marks them in place; the moving paths below then
+     * skip them (an already-marked object is never relocated). Nothing is
+     * forwarded yet, so no stale reference can be created here. */
     for (int i = 0; i < zap_root_fn_n; i++) {
         zap_root_fns[i]();
+    }
+    /* Global static roots: each entry is the ADDRESS of a slot holding a GC
+     * pointer, so process it move-aware to rewrite the slot if its target moves. */
+    for (int64_t i = 0; i < zap_groots_len; i++) {
+        zap_process_slot(zap_groots[i]);
     }
     pthread_mutex_unlock(&zap_groots_mu);
 
@@ -793,12 +1018,14 @@ static void zap_mark_roots(void) {
      * the safepoint; a parked/runnable G's head was saved by switch_to_g when it
      * left its M. g_all registers every live G (keeping parked ones reachable);
      * run-queue linkage needs no separate tracing because every queued G is in
-     * g_all too. */
+     * g_all too. The G is scheduler-owned (held by raw C pointers), so it is
+     * pinned in place; its green stack never moves (its own descriptor, not a
+     * movable leaf), so the shadow-frame slots processed above are stable. */
     pthread_mutex_lock(&g_all_mu);
     for (int64_t i = 0; i < g_all_len; i++) {
         G *g = g_all[i];
         if (g) {
-            zap_mark_push(g);
+            zap_mark_push(g); /* pin the G in place */
             zap_mark_shadow_chain(g->shadow_head);
         }
     }
@@ -858,13 +1085,16 @@ static void zap_sweep(void) {
             }
             continue;
         }
-        /* Small block: count live lines. */
+        /* Small block: count live lines. Record the occupancy so the NEXT
+         * collection can pick the sparsest blocks as evacuation sources (#120). */
         uint32_t used = 0;
         for (uint32_t i = ZAP_RESERVED_LINES; i < ZAP_LINES; i++) {
             if (b->line_mark[i]) {
                 used++;
             }
         }
+        b->live_lines = used;
+        b->evac_src = 0;
         live += (size_t)used * ZAP_LINE;
         if (used == 0) {
             zap_block_reset_marks(b);
@@ -1029,6 +1259,8 @@ static ZapBlock *zap_map_block(void) {
     b->search_line = ZAP_RESERVED_LINES;
     zap_block_next_hole(b);
     b->avail = (ZAP_LINES - ZAP_RESERVED_LINES) * ZAP_LINE;
+    b->live_lines = 0; /* fresh: not an evacuation candidate until a sweep (#120) */
+    b->evac_src = 0;
     return b;
 }
 
@@ -1241,17 +1473,33 @@ void *zap_gc_alloc_var(const ZapTypeDesc *desc, int64_t size) {
 static void zap_mark_sweep(void) {
     /* Clear line / LOS marks (object header mark bits are already clear: every
      * survivor of the previous cycle had its bit reset by zap_mark_reset, and
-     * fresh allocations are memset to a clear header). */
+     * fresh allocations are memset to a clear header). In the same pass, select
+     * evacuation SOURCE blocks (ticket #120): a small block that was non-empty but
+     * at most half-occupied at the previous sweep is fragmented, so relocating its
+     * few survivors frees the whole block. The occupancy is last cycle's
+     * (`live_lines`, set by zap_sweep) because this cycle's marks are not in yet;
+     * the count is capped so copy work and to-space stay bounded. */
+    int src = 0;
     for (ZapBlock *b = zap_all_blocks; b; b = b->all_next) {
         if (b->kind == ZAP_BK_SMALL) {
             memset(b->line_mark, 0, sizeof(b->line_mark));
             for (uint32_t i = 0; i < ZAP_RESERVED_LINES; i++) {
                 b->line_mark[i] = 1;
             }
+            b->evac_src = 0;
+            if (!zap_evac_disabled && b->live_lines > 0 &&
+                b->live_lines <= ZAP_EVAC_SPARSE_LINES && src < (int)ZAP_EVAC_MAX_SRC) {
+                b->evac_src = 1;
+                src++;
+            }
         } else {
             b->los_mark = 0;
         }
     }
+    zap_evac_active = (src > 0);
+    zap_evac_tospace = NULL;
+    zap_evac_cursor = 0;
+    zap_evac_moved = 0;
     zap_mark_roots();
     zap_mark_drain();
     zap_finalize_prepare(); /* queue now-unreachable finalizable objects (#92) */
@@ -1259,6 +1507,14 @@ static void zap_mark_sweep(void) {
     zap_mark_reset();       /* clear survivor header bits for the next cycle      */
     zap_sweep();
     zap_bytes_since_gc = 0;
+    /* Optional evacuation visibility (ticket #120): one line per collection naming
+     * how many source blocks were selected and how many objects were relocated.
+     * Off unless ZAP_GC_EVAC_STATS is set, so normal runs are unaffected; used to
+     * confirm evacuation fires and, later, to measure it from zap-perf. */
+    if (zap_evac_active && getenv("ZAP_GC_EVAC_STATS")) {
+        fprintf(stderr, "zap-gc: evacuation moved %zu objects from %d source blocks\n",
+                zap_evac_moved, src);
+    }
     /* Enforce the optional hard cap (ZAP_GC_HEAP_LIMIT) against the LIVE set, not
      * mapped memory: freed blocks are retained for reuse, so mapped bytes never
      * shrink, but a correct collector keeps the live set bounded. Exceeding the
