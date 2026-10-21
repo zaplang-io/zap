@@ -142,6 +142,10 @@ void zap_gc_add_root(void **slot);
 void zap_gc_add_root_fn(void (*fn)(void));
 void zap_gc_mark(void *payload);
 void zap_gc_collect(void);
+/* Defined in zapgc.inc.c (#included below) but called earlier in this file
+ * (the ticket-#77 SIGUSR1 stats handler), so it needs a forward prototype under
+ * gc-immix to avoid an implicit-declaration / conflicting-types warning. */
+void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes);
 /* Finalizers (ticket #92): register cleanup for an object, run once when it
  * becomes unreachable. `zap_py_wrap` uses it for the CPython-ref DECREF. */
 void zap_gc_register_finalizer(void *payload, void (*fn)(void *obj, void *cd), void *cd);
