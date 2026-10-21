@@ -17,14 +17,19 @@
 //! **no new mechanism**. Generic enums ride the tier-3 tagged-struct path. GC
 //! correctness for generics is therefore a theorem, not new code.
 //!
-//! Scope (first vertical): generic *types* (`struct`/`enum`) with concrete
-//! methods, and `Option[T]`. Generic *functions*/methods with their own type
-//! parameters, and interface-bound enforcement, are deferred (Fork B / slice 4).
+//! Scope: generic *types* (`struct`/`enum`) with concrete methods, `Option[T]`,
+//! generic *functions*/methods with their own type parameters (I#161), and
+//! interface *bounds* on type parameters (`[T: Iface]`, I#164). A bound is
+//! enforced at each concrete instantiation by the I#84 structural-conformance
+//! rule (re-derived here at the AST level, since ir does not depend on sema);
+//! the bound's methods then resolve statically per instance through ordinary
+//! type substitution — no fat pointer / vtable is emitted (design/0012 slice 5).
 
 use std::collections::{HashMap, HashSet};
 
 use zapc_syntax::ast::{
-    self, Arg, Block, EnumDef, Expr, Function, Item, Module, PatArg, Pattern, Stmt, StructDef, Type,
+    self, Arg, Block, EnumDef, Expr, Function, InterfaceDef, Item, MethodSig, Module, PatArg,
+    Pattern, Stmt, StructDef, Type, TypeParam,
 };
 use zapc_syntax::span::Span;
 
@@ -60,6 +65,11 @@ struct Mono<'a> {
     structs: HashMap<String, &'a StructDef>,
     /// Every enum declaration (generic or not), for variant/method lookups.
     enums: HashMap<String, &'a EnumDef>,
+    /// Every interface declaration, for static type-parameter bound satisfaction
+    /// checks (I#164, slice 5): a bound `[T: Iface]` is enforced by the same
+    /// structural-conformance rule as I#84, re-derived here at the AST level
+    /// (ir does not depend on sema; it re-derives types — see module docs).
+    interfaces: HashMap<String, &'a InterfaceDef>,
     /// Free-function return types, for inference of `f(...)` results.
     func_ret: HashMap<String, Option<Type>>,
 
@@ -151,6 +161,96 @@ fn canon_prim(name: &str) -> &str {
     }
 }
 
+/// The human-readable name of a concrete type, for bound diagnostics (I#164).
+fn type_name(t: &Type) -> String {
+    match t {
+        Type::Named { name, args, .. } => {
+            if args.is_empty() {
+                canon_prim(name).to_string()
+            } else {
+                let inner: Vec<String> = args.iter().map(type_name).collect();
+                format!("{}[{}]", canon_prim(name), inner.join(", "))
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            let inner: Vec<String> = elems.iter().map(type_name).collect();
+            format!("({})", inner.join(", "))
+        }
+        Type::Func { params, ret, .. } => {
+            let ps: Vec<String> = params.iter().map(type_name).collect();
+            match ret {
+                Some(r) => format!("fn({}) -> {}", ps.join(", "), type_name(r)),
+                None => format!("fn({})", ps.join(", ")),
+            }
+        }
+    }
+}
+
+/// Does a concrete method `have` match an interface method `want` for structural
+/// conformance (D-0016/I#84, re-derived for monomorphization, I#164)? The
+/// receiver (`self`, parameter 0) is ignored — it is the differing
+/// concrete/interface type — so the remaining parameter types are compared
+/// pairwise and the return type is compared, by structural type identity
+/// (primitive aliases canonicalized).
+fn method_sig_matches(have: &Function, want: &MethodSig) -> bool {
+    let hp = have.params.get(1..).unwrap_or(&[]);
+    let wp = want.params.get(1..).unwrap_or(&[]);
+    hp.len() == wp.len()
+        && hp
+            .iter()
+            .zip(wp.iter())
+            .all(|(a, b)| opt_type_eq(a.ty.as_ref(), b.ty.as_ref()))
+        && opt_type_eq(have.ret.as_ref(), want.ret.as_ref())
+}
+
+/// Structural equality of two optional types, treating `None` (no annotation /
+/// no return) as the unit type so an absent return matches an absent return.
+fn opt_type_eq(a: Option<&Type>, b: Option<&Type>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => type_eq(x, y),
+        _ => false,
+    }
+}
+
+/// Structural equality of two concrete types (primitive aliases canonicalized).
+fn type_eq(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (
+            Type::Named {
+                name: n1, args: a1, ..
+            },
+            Type::Named {
+                name: n2, args: a2, ..
+            },
+        ) => {
+            canon_prim(n1) == canon_prim(n2)
+                && a1.len() == a2.len()
+                && a1.iter().zip(a2.iter()).all(|(x, y)| type_eq(x, y))
+        }
+        (Type::Tuple { elems: e1, .. }, Type::Tuple { elems: e2, .. }) => {
+            e1.len() == e2.len() && e1.iter().zip(e2.iter()).all(|(x, y)| type_eq(x, y))
+        }
+        (
+            Type::Func {
+                params: p1,
+                ret: r1,
+                ..
+            },
+            Type::Func {
+                params: p2,
+                ret: r2,
+                ..
+            },
+        ) => {
+            p1.len() == p2.len()
+                && p1.iter().zip(p2.iter()).all(|(x, y)| type_eq(x, y))
+                && opt_type_eq(r1.as_deref(), r2.as_deref())
+        }
+        _ => false,
+    }
+}
+
 impl<'a> Mono<'a> {
     fn new(module: &'a Module) -> Mono<'a> {
         let mut m = Mono {
@@ -160,6 +260,7 @@ impl<'a> Mono<'a> {
             gfuncs: HashMap::new(),
             structs: HashMap::new(),
             enums: HashMap::new(),
+            interfaces: HashMap::new(),
             func_ret: HashMap::new(),
             spec_structs: Vec::new(),
             spec_enums: Vec::new(),
@@ -204,6 +305,9 @@ impl<'a> Mono<'a> {
                     if !f.generics.is_empty() {
                         m.gfuncs.insert(f.name.clone(), f);
                     }
+                }
+                Item::Interface(i) => {
+                    m.interfaces.insert(i.name.clone(), i);
                 }
                 _ => {}
             }
@@ -492,8 +596,100 @@ impl Mono<'_> {
         map
     }
 
+    // -----------------------------------------------------------------------
+    // Interface-bound satisfaction (I#164, slice 5)
+    // -----------------------------------------------------------------------
+
+    /// Enforce the interface bounds declared on a generic's type parameters at
+    /// one concrete instantiation (I#164). `generics` are the declaration's type
+    /// parameters (each optionally `T: Iface`); `args` are the concrete types
+    /// substituted for them, in order. Each bounded parameter's concrete argument
+    /// must structurally conform to the bound interface (the I#84 rule). The
+    /// bound's methods then resolve statically per instance through the ordinary
+    /// type substitution applied when the body is rewritten — no fat pointer /
+    /// vtable is emitted (design/0012 slice 5). A single bound per parameter is
+    /// supported (the grammar carries at most one; `T: A + B` is a follow-up).
+    fn check_bounds(
+        &self,
+        what: &str,
+        generics: &[TypeParam],
+        args: &[Type],
+    ) -> Result<(), LowerError> {
+        for (p, arg) in generics.iter().zip(args.iter()) {
+            let Some(bound) = &p.bound else { continue };
+            let Type::Named { name: iface, .. } = bound else {
+                return Err(err(format!(
+                    "type parameter '{}' of {what} has an invalid bound: a bound must name \
+                     an interface",
+                    p.name
+                )));
+            };
+            if let Err(reasons) = self.satisfies_bound(arg, iface) {
+                return Err(err(format!(
+                    "type '{}' does not satisfy the bound '{}' on type parameter '{}' of \
+                     {what}: {}",
+                    type_name(arg),
+                    iface,
+                    p.name,
+                    reasons.join("; ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Does the concrete type `arg` structurally conform to interface `iface`
+    /// (D-0016/I#84, re-derived at the AST level for monomorphization, I#164)?
+    /// Every interface method must be present on the concrete type with a
+    /// matching signature (parameter types excluding `self`, and return type).
+    /// Returns the human-readable reasons on failure. Only user structs and enums
+    /// carry methods; a primitive or built-in argument cannot satisfy a non-empty
+    /// interface bound (operator-dunder interfaces as bounds on primitives are a
+    /// documented follow-up).
+    fn satisfies_bound(&self, arg: &Type, iface: &str) -> Result<(), Vec<String>> {
+        let Some(idef) = self.interfaces.get(iface) else {
+            return Err(vec![format!("'{iface}' is not an interface")]);
+        };
+        let Type::Named { name: tyname, .. } = arg else {
+            return Err(vec![format!(
+                "'{}' is not a struct or enum and cannot implement interface methods",
+                type_name(arg)
+            )]);
+        };
+        let methods: &[Function] = if let Some(s) = self.structs.get(tyname.as_str()) {
+            &s.methods
+        } else if let Some(e) = self.enums.get(tyname.as_str()) {
+            &e.methods
+        } else {
+            return Err(vec![format!(
+                "'{tyname}' is not a struct or enum and cannot implement interface methods"
+            )]);
+        };
+        let mut reasons = Vec::new();
+        for im in &idef.methods {
+            match methods.iter().find(|m| m.name == im.name) {
+                None => reasons.push(format!("missing method '{}'", im.name)),
+                Some(cm) if !method_sig_matches(cm, im) => {
+                    reasons.push(format!("method '{}' has a mismatched signature", im.name));
+                }
+                Some(_) => {}
+            }
+        }
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(reasons)
+        }
+    }
+
     /// Emit the specialized declaration for `generic[args]`.
     fn emit_instance(&mut self, generic: &str, args: &[Type]) -> Result<(), LowerError> {
+        // Enforce any interface bounds on the type's parameters (I#164).
+        if let Some(s) = self.gstructs.get(generic).copied() {
+            self.check_bounds(&format!("type '{generic}'"), &s.generics, args)?;
+        } else if let Some(e) = self.genums.get(generic).copied() {
+            self.check_bounds(&format!("type '{generic}'"), &e.generics, args)?;
+        }
         let mangled = self.mangle_name(generic, args);
         let subst = self.subst_map(generic, args);
         // The receiver type used for inference is the *generic form*
@@ -741,6 +937,8 @@ impl<'a> Mono<'a> {
             .get(func)
             .copied()
             .ok_or_else(|| err(format!("'{func}' is not a generic function")))?;
+        // Enforce any interface bounds on the function's type parameters (I#164).
+        self.check_bounds(&format!("function '{func}'"), &f.generics, args)?;
         let mangled = self.mangle_name(func, args);
         let mut subst = HashMap::new();
         for (p, a) in f.generics.iter().zip(args.iter()) {
@@ -768,6 +966,14 @@ impl<'a> Mono<'a> {
                 mi.owner, mi.method
             ))
         })?;
+        // Enforce any interface bounds on the method's own type parameters
+        // (I#164). The owner type's bounds are enforced when its instance is
+        // emitted (requested from the call site via `request_method`).
+        self.check_bounds(
+            &format!("method '{}.{}'", mi.owner, mi.method),
+            &method.generics,
+            &mi.targs,
+        )?;
         let method_spec = self.mangle_name(&mi.method, &mi.targs);
         let mut subst = self.subst_map(&mi.owner, &mi.owner_args);
         for (p, a) in method.generics.iter().zip(mi.targs.iter()) {
@@ -2325,5 +2531,74 @@ mod tests {
         );
         // Box$str is the method's return instance, discovered transitively.
         assert!(struct_named(&m, "Box$str").is_some(), "Box$str discovered");
+    }
+
+    /// Run monomorphization and return its error message, expecting failure.
+    fn mono_err(src: &str) -> String {
+        let (module, perrs, lerrs) = parse_str(src);
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        monomorphize(&module)
+            .expect_err("monomorphization should reject the unsatisfied bound")
+            .message
+    }
+
+    const DISPLAY: &str = "interface Display:\n    def show(self) -> str\n\
+         struct Greeter:\n    str msg\n    def show(self) -> str:\n        return self.msg\n\
+         struct Mute:\n    int64 n\n";
+
+    #[test]
+    fn satisfied_bound_dispatches_statically() {
+        // A conforming instantiation lowers to a direct call of the concrete
+        // method — static dispatch, no fat pointer (I#164).
+        let m = mono_ok(&format!(
+            "{DISPLAY}def announce[T: Display](T x) -> str:\n    return x.show()\n\
+             def main():\n    print(announce(Greeter(msg=\"hi\")))\n"
+        ));
+        assert!(
+            fn_names(&m).iter().any(|n| n == "announce$Greeter"),
+            "the conforming instance announce$Greeter is emitted"
+        );
+    }
+
+    #[test]
+    fn unsatisfied_bound_on_function_is_rejected() {
+        let msg = mono_err(&format!(
+            "{DISPLAY}def announce[T: Display](T x) -> str:\n    return x.show()\n\
+             def main():\n    print(announce(Mute(5)))\n"
+        ));
+        assert!(
+            msg.contains("'Mute' does not satisfy the bound 'Display'")
+                && msg.contains("missing method 'show'"),
+            "clear bound-not-satisfied diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unsatisfied_bound_on_type_is_rejected() {
+        let msg = mono_err(&format!(
+            "{DISPLAY}struct Box[T: Display]:\n    T item\n    def reveal(self) -> str:\n        return self.item.show()\n\
+             def main():\n    Box[Mute] b = Box(Mute(5))\n    print(b.reveal())\n"
+        ));
+        assert!(
+            msg.contains("'Mute' does not satisfy the bound 'Display'")
+                && msg.contains("of type 'Box'"),
+            "bound checked on a generic type too, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn mismatched_signature_fails_the_bound() {
+        // `Wrong.show` returns int64, not str: present but non-conforming.
+        let msg = mono_err(
+            "interface Display:\n    def show(self) -> str\n\
+             struct Wrong:\n    int64 n\n    def show(self) -> int64:\n        return self.n\n\
+             def announce[T: Display](T x) -> str:\n    return x.show()\n\
+             def main():\n    print(announce(Wrong(1)))\n",
+        );
+        assert!(
+            msg.contains("method 'show' has a mismatched signature"),
+            "signature mismatch is reported, got: {msg}"
+        );
     }
 }

@@ -44,7 +44,11 @@ function      ::= decorators "def" IDENT [ generics ]
 generics      ::= "[" type_param { "," type_param } "]" ;
 type_param    ::= IDENT [ ":" type ] ;
                   (* optional interface bound (D-0017/I#154 Fork B); the bound
-                     `type` is an interface name, possibly itself generic. *)
+                     `type` names an interface. Enforced since I#164 (slice 5):
+                     each concrete instantiation must structurally satisfy the
+                     bound, and the body may call the bound's methods on T (static
+                     dispatch). A single bound per parameter is supported;
+                     multiple bounds (`T: A + B`) are a deferred follow-up. *)
 type_args     ::= "[" type { "," type } "]" ;
                   (* call-site / construction type arguments (I#154 Fork S;
                      generic functions/methods I#161): `Box[str](...)`,

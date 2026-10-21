@@ -501,6 +501,13 @@ struct Checker {
     /// Declared `decorator` names (behavioral, D-0036).
     user_decorators: HashSet<String>,
     scopes: Vec<HashMap<String, Ty>>,
+    /// Interface bounds on the type parameters of the declaration currently being
+    /// checked (I#164): type-parameter name -> bound interface name. Set while
+    /// checking a bounded generic body so that a method call on a value of a
+    /// bounded type parameter `T: Iface` resolves through `Iface` (static
+    /// dispatch after monomorphization), and calling a method the bound does not
+    /// provide is rejected at definition (check-at-definition, Fork M1).
+    tyvar_bounds: HashMap<String, String>,
     ret_ty: Ty,
     /// `true` while checking the body of a generator function (a free `def`
     /// whose body contains `yield`, I#67/D-0026). Gates `yield`/`return`
@@ -629,6 +636,7 @@ impl Checker {
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
             scopes: Vec::new(),
+            tyvar_bounds: HashMap::new(),
             ret_ty: Ty::Unit,
             in_generator: false,
             errors: Vec::new(),
@@ -1601,6 +1609,21 @@ impl Checker {
             .map(|t| self.resolve_type(t))
             .unwrap_or(Ty::Unit);
         let saved = std::mem::replace(&mut self.ret_ty, new_ret);
+        // Interface bounds on this declaration's own type parameters (I#164,
+        // slice 5): record `T -> Iface` for each `T: Iface` whose bound names a
+        // known interface, so that inside the body a method call on a value of a
+        // bounded type parameter resolves through the interface (static dispatch
+        // after monomorphization) and a call to a method the bound does not
+        // provide is rejected here, at definition (check-at-definition, Fork M1).
+        // Unbounded type parameters are left opaque (`Unknown`) as before.
+        let saved_bounds = std::mem::take(&mut self.tyvar_bounds);
+        for tp in &f.generics {
+            if let Some(Type::Named { name: iface, .. }) = &tp.bound {
+                if self.interfaces.contains_key(iface) {
+                    self.tyvar_bounds.insert(tp.name.clone(), iface.clone());
+                }
+            }
+        }
         // Generator validation (I#67, D-0026/D-0048): a free `def` whose body
         // contains `yield` is a generator and returns an `Iterator`. v1 does not
         // support generator methods, a generator `main`, or an explicit return
@@ -1645,10 +1668,19 @@ impl Checker {
                 );
                 continue;
             }
-            let base =
-                p.ty.as_ref()
-                    .map(|t| self.resolve_type(t))
-                    .unwrap_or(Ty::Unknown);
+            // A parameter typed exactly as a bounded type parameter `T: Iface`
+            // keeps the type-variable identity (`Ty::Named("T")`) so method calls
+            // on it resolve through the bound (I#164); other types resolve
+            // normally (an unbounded `T` stays `Unknown`).
+            let base = match &p.ty {
+                Some(Type::Named { name, args, .. })
+                    if args.is_empty() && self.tyvar_bounds.contains_key(name) =>
+                {
+                    Ty::Named(name.clone())
+                }
+                Some(t) => self.resolve_type(t),
+                None => Ty::Unknown,
+            };
             let ty = if p.variadic {
                 Ty::List(Box::new(base))
             } else {
@@ -1660,6 +1692,7 @@ impl Checker {
             self.check_stmt(st);
         }
         self.ret_ty = saved;
+        self.tyvar_bounds = saved_bounds;
         self.in_generator = saved_in_gen;
         self.pop_scope();
     }
@@ -3274,14 +3307,32 @@ impl Checker {
         if let Expr::Attr { base, name, span } = callee {
             if let Expr::Name(bn, _) = base.as_ref() {
                 if let Some(Ty::Named(tn)) = self.lookup(bn) {
-                    if let Some(iface) = self.interfaces.get(&tn) {
+                    // The receiver is either an interface-typed value (D-0016,
+                    // dynamic dispatch) or a value of a bounded type parameter
+                    // `T: Iface` (I#164, static dispatch after monomorphization).
+                    // Both resolve the call against the interface's declared set:
+                    // the call is typed by the method's return type and a method
+                    // the interface/bound does not provide is caught here.
+                    let is_iface = self.interfaces.contains_key(&tn);
+                    let iface_name = if is_iface {
+                        Some(tn.clone())
+                    } else {
+                        self.tyvar_bounds.get(&tn).cloned()
+                    };
+                    if let Some(iname) = iface_name {
+                        let iface = &self.interfaces[&iname];
                         let ret = match iface.method(name) {
                             Some(sig) => sig.ret.clone(),
                             None => {
-                                self.error(
-                                    format!("interface '{tn}' has no method '{name}'"),
-                                    *span,
-                                );
+                                let what = if is_iface {
+                                    format!("interface '{tn}' has no method '{name}'")
+                                } else {
+                                    format!(
+                                        "type parameter '{tn}' (bound '{iname}') has no \
+                                         method '{name}'"
+                                    )
+                                };
+                                self.error(what, *span);
                                 Ty::Unknown
                             }
                         };
@@ -4595,6 +4646,50 @@ def main():
             value struct Vec2:\n    f64 x\n    f64 y\n\
             \x20   def area(self) -> f64:\n        return self.x\n\n\
             def main():\n    Shape s = Vec2(x=1.0, y=2.0)\n    print(s.area())\n");
+    }
+
+    // --- interface bounds on type parameters (I#164, D-0017) ---
+
+    const DISPLAY_IFACE: &str = "interface Display:\n    def show(self) -> str\n\n\
+        struct Greeter:\n    str msg\n\
+        \x20   def show(self) -> str:\n        return self.msg\n\n";
+
+    #[test]
+    fn bound_method_call_on_type_parameter_resolves() {
+        // Inside a `[T: Display]` body, a method call on a value of T resolves
+        // through the bound interface and is typed by the method's return type
+        // (check-at-definition, Fork M1). Static dispatch is applied after
+        // monomorphization (see the ir/mono tests), so no interface value is
+        // built here.
+        ok(&format!(
+            "{DISPLAY_IFACE}def announce[T: Display](T x) -> str:\n    return x.show()\n\n\
+             def main():\n    print(announce(Greeter(msg=\"hi\")))\n"
+        ));
+    }
+
+    #[test]
+    fn calling_a_non_bound_method_is_rejected_at_definition() {
+        // The bound limits what the body may call on T: a method the bound does
+        // not declare is a compile error at the definition, even before any
+        // instantiation (the Rust rule, not C++ instantiation-time errors).
+        let m = msgs(&format!(
+            "{DISPLAY_IFACE}def announce[T: Display](T x) -> str:\n    return x.nope()\n\n\
+             def main():\n    print(1)\n"
+        ));
+        assert!(
+            m.contains("type parameter 'T'")
+                && m.contains("bound 'Display'")
+                && m.contains("no method 'nope'"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn unbounded_type_parameter_stays_opaque() {
+        // Without a bound, T is opaque: a method call on it type-checks loosely
+        // (no bound to resolve against) and is not rejected here. This keeps the
+        // unconstrained generic behavior (slices 1-4) unchanged.
+        ok("def identity[T](T x) -> T:\n    return x\n\ndef main():\n    print(identity(1))\n");
     }
 
     // --- tuples (ticket #54, D-0049) ---
