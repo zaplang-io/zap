@@ -91,6 +91,74 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "sync", "once_end", args, 1, span);
             Some(Ty::Unit)
         }
+
+        // --- Mutex timed acquire (I#175) -----------------------------------
+        // sync.lock_timeout(m, secs) -> bool: acquire within `secs`; true iff
+        // acquired. Backs threading.Lock.acquire_timeout.
+        "lock_timeout" => {
+            expect_argc(checker, "sync", "lock_timeout", args, 2, span);
+            Some(Ty::Bool)
+        }
+
+        // --- RLock: reentrant lock (I#175) ---------------------------------
+        "rlock" => {
+            expect_argc(checker, "sync", "rlock", args, 0, span);
+            Some(Ty::Bytes)
+        }
+        "rlock_lock" | "rlock_unlock" => {
+            expect_argc(checker, "sync", method, args, 1, span);
+            Some(Ty::Unit)
+        }
+        "rlock_trylock" => {
+            expect_argc(checker, "sync", "rlock_trylock", args, 1, span);
+            Some(Ty::Bool)
+        }
+
+        // --- Event: a latch (I#175) ----------------------------------------
+        "event" => {
+            expect_argc(checker, "sync", "event", args, 0, span);
+            Some(Ty::Bytes)
+        }
+        "event_set" | "event_clear" | "event_wait" => {
+            expect_argc(checker, "sync", method, args, 1, span);
+            Some(Ty::Unit)
+        }
+        "event_is_set" => {
+            expect_argc(checker, "sync", "event_is_set", args, 1, span);
+            Some(Ty::Bool)
+        }
+        "event_wait_timeout" => {
+            expect_argc(checker, "sync", "event_wait_timeout", args, 2, span);
+            Some(Ty::Bool)
+        }
+
+        // --- Semaphore: counting semaphore (I#175) -------------------------
+        "semaphore" => {
+            expect_argc(checker, "sync", "semaphore", args, 1, span);
+            Some(Ty::Bytes)
+        }
+        "sem_acquire" | "sem_release" => {
+            expect_argc(checker, "sync", method, args, 1, span);
+            Some(Ty::Unit)
+        }
+        "sem_acquire_timeout" => {
+            expect_argc(checker, "sync", "sem_acquire_timeout", args, 2, span);
+            Some(Ty::Bool)
+        }
+
+        // --- Condition: condition variable over an internal lock (I#175) ---
+        "condition" => {
+            expect_argc(checker, "sync", "condition", args, 0, span);
+            Some(Ty::Bytes)
+        }
+        "cond_acquire" | "cond_release" | "cond_wait" | "cond_notify_all" => {
+            expect_argc(checker, "sync", method, args, 1, span);
+            Some(Ty::Unit)
+        }
+        "cond_notify" => {
+            expect_argc(checker, "sync", "cond_notify", args, 2, span);
+            Some(Ty::Unit)
+        }
         _ => None,
     }
 }

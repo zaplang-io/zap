@@ -40,6 +40,32 @@ fn lower(
         "once" => call_ret(lowerer, "zap_once_new", a, Ty::Ptr, false),
         "once_begin" => call_bool(lowerer, "zap_once_begin", a),
         "once_end" => call_void(lowerer, "zap_once_end", a, false),
+        // Mutex timed acquire (I#175).
+        "lock_timeout" => call_bool(lowerer, "zap_mutex_lock_timeout", a),
+        // RLock (I#175).
+        "rlock" => call_ret(lowerer, "zap_rlock_new", a, Ty::Ptr, false),
+        "rlock_lock" => call_void(lowerer, "zap_rlock_lock", a, false),
+        "rlock_unlock" => call_void(lowerer, "zap_rlock_unlock", a, false),
+        "rlock_trylock" => call_bool(lowerer, "zap_rlock_trylock", a),
+        // Event (I#175).
+        "event" => call_ret(lowerer, "zap_event_new", a, Ty::Ptr, false),
+        "event_set" => call_void(lowerer, "zap_event_set", a, false),
+        "event_clear" => call_void(lowerer, "zap_event_clear", a, false),
+        "event_is_set" => call_bool(lowerer, "zap_event_is_set", a),
+        "event_wait" => call_void(lowerer, "zap_event_wait", a, false),
+        "event_wait_timeout" => call_bool(lowerer, "zap_event_wait_timeout", a),
+        // Semaphore (I#175).
+        "semaphore" => call_ret(lowerer, "zap_sem_new", a, Ty::Ptr, false),
+        "sem_acquire" => call_void(lowerer, "zap_sem_acquire", a, false),
+        "sem_acquire_timeout" => call_bool(lowerer, "zap_sem_acquire_timeout", a),
+        "sem_release" => call_void(lowerer, "zap_sem_release", a, false),
+        // Condition (I#175).
+        "condition" => call_ret(lowerer, "zap_cond_new", a, Ty::Ptr, false),
+        "cond_acquire" => call_void(lowerer, "zap_cond_acquire", a, false),
+        "cond_release" => call_void(lowerer, "zap_cond_release", a, false),
+        "cond_wait" => call_void(lowerer, "zap_cond_wait", a, false),
+        "cond_notify" => call_void(lowerer, "zap_cond_notify", a, false),
+        "cond_notify_all" => call_void(lowerer, "zap_cond_notify_all", a, false),
         _ => return Ok(None),
     }))
 }
