@@ -11,8 +11,8 @@ pub mod lower;
 pub mod mono;
 
 pub use ir::{
-    BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem, Func, Inst, Module, Owner, Term, Ty,
-    UnOp, Value,
+    AtomicOrd, AtomicRmwOp, BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem, Func, Inst,
+    Module, Owner, Term, Ty, UnOp, Value,
 };
 pub use lower::{lower_module, LowerError};
 

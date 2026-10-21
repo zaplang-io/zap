@@ -128,6 +128,36 @@ enum Optional[T]:
             case Optional.None:
                 return None
 
+# Atomic[T] — lock-free atomic cell (I#176, sync primitive alongside Mutex/
+# WaitGroup/Once). A machine-word wrapper over a native type T (int64/int32/bool
+# or a reference). All operations are sequentially consistent. The method bodies
+# below are compiler intrinsics: lowering recognizes an `Atomic[T]` receiver and
+# emits inline LLVM atomic instructions (atomic load/store, atomicrmw, cmpxchg)
+# over the `value` cell, so these source bodies are never executed. They are
+# written as plain field access only so the generic surface type-checks and
+# monomorphizes like any other generic struct (which also yields the correct
+# per-instance GC descriptor — a reference cell is traced, a scalar cell is not).
+struct Atomic[T]:
+    T value
+
+    def load(self) -> T:
+        return self.value
+
+    def store(self, T v):
+        self.value = v
+
+    def add(self, T n) -> T:
+        return n
+
+    def sub(self, T n) -> T:
+        return n
+
+    def swap(self, T v) -> T:
+        return v
+
+    def compare_and_swap(self, T old, T new) -> bool:
+        return False
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -448,6 +478,8 @@ fn references_prelude(module: &Module) -> bool {
         // The generic `Optional[T]` ships in the prelude (I#154, D-0064/D-0065);
         // inject it for any program that names it.
         "\"Optional\"",
+        // The generic `Atomic[T]` sync primitive ships in the prelude (I#176).
+        "\"Atomic\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

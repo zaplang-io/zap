@@ -313,6 +313,30 @@ pub enum CastKind {
     FPTrunc,
 }
 
+/// Memory-ordering for an atomic operation (`Atomic[T]`, I#176). Only the
+/// strongest ordering is emitted today — every `Atomic[T]` method is
+/// **sequentially consistent** by default — but the orderings carried by the
+/// atomic ZIR nodes are an explicit enum so relaxed / acquire-release can be
+/// added later (e.g. a `load_relaxed()` method or an ordering argument) without
+/// changing the node shapes or any existing caller. Codegen maps each variant to
+/// the corresponding inkwell `AtomicOrdering`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicOrd {
+    /// `seq_cst` — a single total order across all `SeqCst` operations.
+    SeqCst,
+}
+
+/// The read-modify-write operation of an [`Inst::AtomicRmw`] (`Atomic[T]`,
+/// I#176). `Add`/`Sub` are the integer fetch-and-op primitives (the atomic node
+/// yields the **new** value, matching Go's `atomic.Int64.Add`); `Xchg` is the
+/// unconditional swap (yields the **old** value).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicRmwOp {
+    Add,
+    Sub,
+    Xchg,
+}
+
 #[derive(Clone, Debug)]
 pub enum Inst {
     IConst {
@@ -530,6 +554,60 @@ pub enum Inst {
         method: u32,
         args: Vec<Value>,
         unwind: BlockId,
+    },
+    /// Atomic load of the cell field `idx` of the `Atomic[T]` box `base`
+    /// (`Atomic[T]`, I#176). `dest` is the loaded value, typed `elem` (the cell's
+    /// lowered type `T`). Codegen GEPs field `idx` of struct `sid` — the cell sits
+    /// at offset 0, so this is the box pointer — and emits an LLVM atomic `load`
+    /// with `order`. A reference payload is accessed as a machine word
+    /// (ptrtoint/inttoptr); `i1` (`bool`) is accessed as `i8`.
+    AtomicLoad {
+        dest: Value,
+        base: Value,
+        sid: u32,
+        idx: u32,
+        elem: Ty,
+        order: AtomicOrd,
+    },
+    /// Atomic store of `val` into the cell field `idx` of the `Atomic[T]` box
+    /// `base` (I#176). No result. Emits an LLVM atomic `store` with `order`.
+    AtomicStore {
+        base: Value,
+        sid: u32,
+        idx: u32,
+        val: Value,
+        elem: Ty,
+        order: AtomicOrd,
+    },
+    /// Atomic read-modify-write on the cell field `idx` of the `Atomic[T]` box
+    /// `base` (I#176): `atomicrmw <op>`. For `Add`/`Sub`, `dest` is the **new**
+    /// value (Go semantics); for `Xchg`, `dest` is the **old** value. `dest` is
+    /// typed `elem`. `Add`/`Sub` are integer-only (rejected in lowering for a
+    /// `bool` / reference cell).
+    AtomicRmw {
+        dest: Value,
+        base: Value,
+        sid: u32,
+        idx: u32,
+        op: AtomicRmwOp,
+        val: Value,
+        elem: Ty,
+        order: AtomicOrd,
+    },
+    /// Atomic compare-and-swap on the cell field `idx` of the `Atomic[T]` box
+    /// `base` (I#176): `cmpxchg`. Stores `desired` iff the cell currently equals
+    /// `expected`; `dest : i1` is whether the swap happened. `success`/`failure`
+    /// are the orderings of the successful / failed paths (`cmpxchg` takes both).
+    AtomicCas {
+        dest: Value,
+        base: Value,
+        sid: u32,
+        idx: u32,
+        expected: Value,
+        desired: Value,
+        elem: Ty,
+        success: AtomicOrd,
+        failure: AtomicOrd,
     },
 }
 
@@ -832,6 +910,53 @@ fn fmt_inst(i: &Inst) -> String {
                 Some(d) => format!("%{d} = {call}"),
                 None => call,
             }
+        }
+        Inst::AtomicLoad {
+            dest,
+            base,
+            sid,
+            idx,
+            elem,
+            order,
+        } => {
+            format!("%{dest} = atomic.load.{order:?} struct#{sid} %{base}.{idx} : {elem}")
+        }
+        Inst::AtomicStore {
+            base,
+            sid,
+            idx,
+            val,
+            elem,
+            order,
+        } => {
+            format!("atomic.store.{order:?} struct#{sid} %{base}.{idx} = %{val} : {elem}")
+        }
+        Inst::AtomicRmw {
+            dest,
+            base,
+            sid,
+            idx,
+            op,
+            val,
+            elem,
+            order,
+        } => {
+            format!("%{dest} = atomic.{op:?}.{order:?} struct#{sid} %{base}.{idx}, %{val} : {elem}")
+        }
+        Inst::AtomicCas {
+            dest,
+            base,
+            sid,
+            idx,
+            expected,
+            desired,
+            elem,
+            success,
+            failure,
+        } => {
+            format!(
+                "%{dest} = atomic.cas.{success:?}.{failure:?} struct#{sid} %{base}.{idx}, %{expected}, %{desired} : {elem}"
+            )
         }
     }
 }

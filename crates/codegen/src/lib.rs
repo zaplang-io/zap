@@ -22,11 +22,16 @@ use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FloatType, IntType, VectorType,
 };
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue, VectorValue,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, PointerValue, VectorValue,
 };
-use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
+use inkwell::{
+    AddressSpace, AtomicOrdering, AtomicRMWBinOp, FloatPredicate, IntPredicate, OptimizationLevel,
+};
 
-use zapc_ir::{self as zir, lower_module, CastKind, CmpPred, Func, Inst, Owner, Term, Ty};
+use zapc_ir::{
+    self as zir, lower_module, AtomicOrd, AtomicRmwOp, CastKind, CmpPred, Func, Inst, Owner, Term,
+    Ty,
+};
 use zapc_syntax::ast::Module as AstModule;
 
 /// Built-in stdlib module registry (ticket #121): per-module runtime-symbol
@@ -238,7 +243,10 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | LandingPad { dest, .. }
         | ArrayBinOp { dest, .. }
         | FuncAddr { dest, .. }
-        | IfaceMake { dest, .. } => Some(*dest),
+        | IfaceMake { dest, .. }
+        | AtomicLoad { dest, .. }
+        | AtomicRmw { dest, .. }
+        | AtomicCas { dest, .. } => Some(*dest),
         Call { dest, .. }
         | Invoke { dest, .. }
         | IfaceCall { dest, .. }
@@ -1239,6 +1247,99 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         }
     }
 
+    // --- Atomic[T] codegen helpers (I#176) ----------------------------------
+
+    /// The integer **access type** an atomic op uses for a cell of type `elem`.
+    /// `bool` (`i1`) is accessed as `i8` (LLVM atomics require a byte-sized,
+    /// power-of-two integer); a reference payload is accessed as a pointer-wide
+    /// machine word. The other integer widths map to themselves.
+    fn atom_int_ty(&self, elem: Ty) -> IntType<'ctx> {
+        match elem {
+            Ty::I1 | Ty::I8 => self.ctx.i8_type(),
+            Ty::I16 => self.ctx.i16_type(),
+            Ty::I32 => self.ctx.i32_type(),
+            Ty::I64 => self.ctx.i64_type(),
+            // A reference payload (struct/list/str/...) is a machine-word pointer.
+            _ => self.ctx.i64_type(),
+        }
+    }
+
+    /// Map a ZIR [`AtomicOrd`] to the inkwell ordering. Only `seq_cst` is emitted
+    /// today (the default); the mapping is centralized so weaker orderings slot in
+    /// here when they are added.
+    fn atom_ord(o: AtomicOrd) -> AtomicOrdering {
+        match o {
+            AtomicOrd::SeqCst => AtomicOrdering::SequentiallyConsistent,
+        }
+    }
+
+    /// GEP the cell field of an `Atomic[T]` box (field `idx` of struct `sid`),
+    /// yielding the pointer the atomic op operates on.
+    fn atomic_cell_ptr(
+        &self,
+        b: &Builder<'ctx>,
+        vals: &[Option<BasicValueEnum<'ctx>>],
+        get: &dyn Fn(&[Option<BasicValueEnum<'ctx>>], u32) -> BasicValueEnum<'ctx>,
+        base: u32,
+        sid: u32,
+        idx: u32,
+    ) -> Result<PointerValue<'ctx>, String> {
+        let st = self.structs[sid as usize];
+        let p = get(vals, base).into_pointer_value();
+        b.build_struct_gep(st, p, idx, "atomic.cell")
+            .map_err(|_| "invalid atomic cell field".to_string())
+    }
+
+    /// Convert a cell value to its integer access representation for an atomic
+    /// store / rmw / cas input: a reference becomes `ptrtoint` to the word, a
+    /// `bool` (`i1`) is zero-extended to `i8`, other integers pass through.
+    fn atom_to_int(
+        &self,
+        b: &Builder<'ctx>,
+        v: BasicValueEnum<'ctx>,
+        elem: Ty,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        if elem.is_ptr() {
+            let i64t = self.ctx.i64_type();
+            return b
+                .build_ptr_to_int(v.into_pointer_value(), i64t, "atomic.p2i")
+                .map(Into::into)
+                .map_err(|e| e.to_string());
+        }
+        if elem == Ty::I1 {
+            return b
+                .build_int_z_extend(v.into_int_value(), self.ctx.i8_type(), "atomic.zext")
+                .map(Into::into)
+                .map_err(|e| e.to_string());
+        }
+        Ok(v)
+    }
+
+    /// Convert an integer access value back to the cell type `elem` for an atomic
+    /// load / swap result: `inttoptr` for a reference, truncate `i8`→`i1` for a
+    /// `bool`, other integers pass through.
+    fn atom_from_int(
+        &self,
+        b: &Builder<'ctx>,
+        v: inkwell::values::IntValue<'ctx>,
+        elem: Ty,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        if elem.is_ptr() {
+            let pt = self.ctx.ptr_type(AddressSpace::default());
+            return b
+                .build_int_to_ptr(v, pt, "atomic.i2p")
+                .map(Into::into)
+                .map_err(|e| e.to_string());
+        }
+        if elem == Ty::I1 {
+            return b
+                .build_int_truncate(v, self.ctx.bool_type(), "atomic.trunc")
+                .map(Into::into)
+                .map_err(|e| e.to_string());
+        }
+        Ok(v.into())
+    }
+
     fn inst(
         &self,
         f: &Func,
@@ -1566,6 +1667,114 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .map_err(|_| "invalid field index".to_string())?;
                 b.build_store(fp, get(vals, *val))
                     .map_err(|e| e.to_string())?;
+            }
+            // Atomic[T] operations (I#176). Each GEPs the cell field — which sits
+            // at offset 0, so the pointer is the box itself — then emits the LLVM
+            // atomic instruction over an integer *access type* (bool→i8, int32→i32,
+            // int64→i64, a reference payload→iN-word via ptrtoint/inttoptr). The
+            // atomic load/store need an explicit alignment (natural for the access
+            // type; the box payload is 16-aligned, so field 0 is over-aligned).
+            Inst::AtomicLoad {
+                dest,
+                base,
+                sid,
+                idx,
+                elem,
+                order,
+            } => {
+                let fp = self.atomic_cell_ptr(b, vals, &get, *base, *sid, *idx)?;
+                let ai = self.atom_int_ty(*elem);
+                let load = b
+                    .build_load(ai, fp, "atomic.load")
+                    .map_err(|e| e.to_string())?;
+                let li = load
+                    .as_instruction_value()
+                    .ok_or_else(|| "atomic load has no instruction".to_string())?;
+                li.set_alignment(ai.get_bit_width() / 8)
+                    .map_err(|e| e.to_string())?;
+                li.set_atomic_ordering(Self::atom_ord(*order))
+                    .map_err(|e| e.to_string())?;
+                vals[*dest as usize] = Some(self.atom_from_int(b, load.into_int_value(), *elem)?);
+            }
+            Inst::AtomicStore {
+                base,
+                sid,
+                idx,
+                val,
+                elem,
+                order,
+            } => {
+                let fp = self.atomic_cell_ptr(b, vals, &get, *base, *sid, *idx)?;
+                let ai = self.atom_int_ty(*elem);
+                let iv = self.atom_to_int(b, get(vals, *val), *elem)?;
+                let st = b.build_store(fp, iv).map_err(|e| e.to_string())?;
+                st.set_alignment(ai.get_bit_width() / 8)
+                    .map_err(|e| e.to_string())?;
+                st.set_atomic_ordering(Self::atom_ord(*order))
+                    .map_err(|e| e.to_string())?;
+            }
+            Inst::AtomicRmw {
+                dest,
+                base,
+                sid,
+                idx,
+                op,
+                val,
+                elem,
+                order,
+            } => {
+                let fp = self.atomic_cell_ptr(b, vals, &get, *base, *sid, *idx)?;
+                let iv = self
+                    .atom_to_int(b, get(vals, *val), *elem)?
+                    .into_int_value();
+                let bin = match op {
+                    AtomicRmwOp::Add => AtomicRMWBinOp::Add,
+                    AtomicRmwOp::Sub => AtomicRMWBinOp::Sub,
+                    AtomicRmwOp::Xchg => AtomicRMWBinOp::Xchg,
+                };
+                let old = b
+                    .build_atomicrmw(bin, fp, iv, Self::atom_ord(*order))
+                    .map_err(|e| e.to_string())?;
+                // `Add`/`Sub` yield the NEW value (Go semantics); `Xchg` the old.
+                let result = match op {
+                    AtomicRmwOp::Add => b
+                        .build_int_add(old, iv, "atomic.new")
+                        .map_err(|e| e.to_string())?,
+                    AtomicRmwOp::Sub => b
+                        .build_int_sub(old, iv, "atomic.new")
+                        .map_err(|e| e.to_string())?,
+                    AtomicRmwOp::Xchg => old,
+                };
+                vals[*dest as usize] = Some(self.atom_from_int(b, result, *elem)?);
+            }
+            Inst::AtomicCas {
+                dest,
+                base,
+                sid,
+                idx,
+                expected,
+                desired,
+                elem,
+                success,
+                failure,
+            } => {
+                let fp = self.atomic_cell_ptr(b, vals, &get, *base, *sid, *idx)?;
+                let exp = self.atom_to_int(b, get(vals, *expected), *elem)?;
+                let des = self.atom_to_int(b, get(vals, *desired), *elem)?;
+                let cx = b
+                    .build_cmpxchg(
+                        fp,
+                        exp,
+                        des,
+                        Self::atom_ord(*success),
+                        Self::atom_ord(*failure),
+                    )
+                    .map_err(|e| e.to_string())?;
+                // cmpxchg yields `{ iN old, i1 success }`; the bool result is slot 1.
+                let ok = b
+                    .build_extract_value(cx, 1, "atomic.cas.ok")
+                    .map_err(|e| e.to_string())?;
+                vals[*dest as usize] = Some(ok);
             }
             Inst::Invoke {
                 dest,
