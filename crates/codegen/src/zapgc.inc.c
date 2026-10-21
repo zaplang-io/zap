@@ -13,9 +13,18 @@
  * large-object space. Roots are found PRECISELY via a per-coroutine shadow stack
  * (so a parked coroutine's roots are just its saved chain) plus a global-root
  * registry; the heap is traced precisely from per-object type descriptors.
- * Stop-the-world is cooperative: mutators poll a safepoint and park. See the
- * design doc for the rationale and the deferred pieces (evacuation, generational
- * barrier, per-P allocation — v1 allocates under one heap lock).
+ * Stop-the-world is cooperative: mutators poll a safepoint and park.
+ *
+ * Allocation is lock-free on the fast path (ticket #119): each scheduler P
+ * (realised here as a per-mutator buffer — M:P is 1:1 and pinned) owns an Immix
+ * block it bump-allocates into, plus an overflow block for medium objects, so
+ * the common case is a pointer bump with no lock. The global heap lock
+ * (zap_heap_mu) is taken only on the slow paths: refilling an exhausted buffer,
+ * large-object allocation, and the collector's sweep. At stop-the-world the
+ * collector relinquishes every P's buffers (zap_reset_alloc_bufs) so their
+ * blocks sweep normally and each P refills fresh on resume. See the design doc
+ * for the rationale and the remaining deferred pieces (evacuation/defrag,
+ * generational barrier).
  * ========================================================================== */
 
 #include <sys/mman.h>
@@ -37,6 +46,7 @@ typedef struct ZapBlock {
     uint32_t hole_cursor;         /* small: byte offset of next alloc           */
     uint32_t hole_limit;          /* small: end of current free run             */
     uint32_t search_line;         /* small: line to resume hole search from     */
+    uint32_t avail;               /* small: free bytes when placed on a list    */
     uint8_t line_mark[ZAP_LINES]; /* small: per-line liveness (set by tracing)  */
 } ZapBlock;
 
@@ -67,7 +77,6 @@ static pthread_mutex_t zap_heap_mu = PTHREAD_MUTEX_INITIALIZER;
 static ZapBlock *zap_free_blocks = NULL;    /* fully-free small blocks, reusable */
 static ZapBlock *zap_recycle_blocks = NULL; /* small blocks with holes           */
 static ZapBlock *zap_all_blocks = NULL;     /* every mapped block (sweep walks)   */
-static ZapBlock *zap_cur_block = NULL;      /* current small allocation block     */
 static size_t zap_bytes_since_gc = 0;
 static size_t zap_live_estimate = 0;
 
@@ -235,6 +244,17 @@ enum { ZAP_MUT_ACTIVE = 0, ZAP_MUT_PARKED = 1, ZAP_MUT_BLOCKED = 2 };
 typedef struct ZapMutator {
     struct ZapMutator *next;
     int state;
+    /* Per-P (per-mutator) lock-free allocation buffer (ticket #119). M:P is 1:1
+     * and P is pinned to its M, so one buffer per mutator thread == one per P
+     * (plus one for the main/aux threads that have no M). `block` is the Immix
+     * line allocator's current block (hole-walked, recyclable); `overflow` is a
+     * fresh block used to bump medium objects that do not fit `block`'s current
+     * hole. Hole/bump state lives in each ZapBlock (single owner at a time), so
+     * the common-case allocation is a pointer bump with NO lock; only refilling
+     * an exhausted buffer takes zap_heap_mu. Both are reset to NULL by the
+     * collector at stop-the-world (see zap_reset_alloc_bufs). */
+    ZapBlock *block;
+    ZapBlock *overflow;
 } ZapMutator;
 
 static pthread_mutex_t zap_stw_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -273,6 +293,8 @@ static void zap_mutator_register(void) {
     }
     ZapMutator *mu = (ZapMutator *)malloc(sizeof(ZapMutator));
     mu->state = ZAP_MUT_ACTIVE;
+    mu->block = NULL;
+    mu->overflow = NULL;
     pthread_mutex_lock(&zap_stw_mu);
     mu->next = zap_mutators;
     zap_mutators = mu;
@@ -774,7 +796,6 @@ static int zap_block_next_hole(ZapBlock *b) {
 static void zap_sweep(void) {
     zap_free_blocks = NULL;
     zap_recycle_blocks = NULL;
-    zap_cur_block = NULL;
     size_t live = 0;
     ZapBlock **pp = &zap_all_blocks;
     while (*pp) {
@@ -806,11 +827,14 @@ static void zap_sweep(void) {
             zap_block_reset_marks(b);
             b->search_line = ZAP_RESERVED_LINES;
             zap_block_next_hole(b);
+            b->avail = (ZAP_LINES - ZAP_RESERVED_LINES) * ZAP_LINE;
             b->next = zap_free_blocks;
             zap_free_blocks = b;
         } else {
             b->search_line = ZAP_RESERVED_LINES;
             if (zap_block_next_hole(b)) {
+                /* Free (unmarked, non-reserved) lines available for reuse. */
+                b->avail = (ZAP_LINES - ZAP_RESERVED_LINES - used) * ZAP_LINE;
                 b->next = zap_recycle_blocks;
                 zap_recycle_blocks = b;
             }
@@ -823,6 +847,25 @@ static void zap_sweep(void) {
 
 /* ---- the collection ------------------------------------------------------- */
 static void zap_mark_sweep(void); /* fwd: the mark + sweep under zap_heap_mu */
+
+/* Drop every mutator's per-P allocation buffers at stop-the-world (ticket #119).
+ * Called by the collector with the world stopped and zap_stw_mu held, so the
+ * mutator list is stable and no thread is mid-allocation (allocation is never a
+ * safepoint, so a thread that reached the handshake is PARKED/BLOCKED outside
+ * the allocator). The blocks the buffers referenced stay in zap_all_blocks and
+ * are swept normally: their live lines are marked by the trace, and the free
+ * tail past each bump cursor becomes a recyclable hole. Each mutator re-reads
+ * block/overflow only after re-acquiring zap_stw_mu on wake (a happens-before
+ * edge), so it observes NULL and refills a fresh block — correctly handling a
+ * coroutine that migrated Ps, a mutator that held no block, and the refill/
+ * collect race (serialized because refill keeps the thread ACTIVE, which the
+ * handshake above waits out). */
+static void zap_reset_alloc_bufs(void) {
+    for (ZapMutator *m = zap_mutators; m; m = m->next) {
+        m->block = NULL;
+        m->overflow = NULL;
+    }
+}
 
 /* Drive one full stop-the-world collection. The caller is a registered mutator
  * executing compiled code at a safepoint (so its own live pointers are already
@@ -866,6 +909,10 @@ static void zap_collect_now(void) {
         }
         pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
     }
+    /* World stopped and the mutator list is stable under zap_stw_mu: relinquish
+     * every P-local allocation buffer so the sweep can reclaim their blocks and
+     * each mutator refills fresh on resume (ticket #119). */
+    zap_reset_alloc_bufs();
     pthread_mutex_unlock(&zap_stw_mu);
 
     /* World is stopped: every live pointer is reachable from a flushed shadow
@@ -938,44 +985,140 @@ static ZapBlock *zap_map_block(void) {
     zap_block_reset_marks(b);
     b->search_line = ZAP_RESERVED_LINES;
     zap_block_next_hole(b);
+    b->avail = (ZAP_LINES - ZAP_RESERVED_LINES) * ZAP_LINE;
     return b;
 }
 
-static ZapBlock *zap_take_block(void) {
-    if (zap_recycle_blocks) {
-        ZapBlock *b = zap_recycle_blocks;
-        zap_recycle_blocks = b->next;
-        return b;
+/* ---- GC-trigger / cap accounting (ticket #119) ---------------------------- *
+ * With per-P bump buffers the fast path takes no lock, so the allocated-bytes
+ * counter is no longer bumped per object. Instead it is advanced per block at
+ * refill (the slow path, under zap_heap_mu) by that block's free capacity
+ * (`b->avail`, recorded when the block was placed on a list / mapped). A mutator
+ * consumes essentially all of a line block's holes before it refills again, so
+ * block-granularity accounting tracks real allocation closely; it can only
+ * slightly OVER-count (a medium object abandoning an overflow block's tail),
+ * which makes the collector fire a touch early — the safe direction for the
+ * ZAP_GC_HEAP_LIMIT cap. Caller holds zap_heap_mu. */
+static void zap_account_refill(ZapBlock *b) {
+    zap_bytes_since_gc += b->avail;
+    if (zap_bytes_since_gc >= zap_gc_threshold) {
+        zap_gc_wanted = 1; /* collect at the next safepoint */
     }
-    if (zap_free_blocks) {
-        ZapBlock *b = zap_free_blocks;
-        zap_free_blocks = b->next;
-        return b;
+    /* Enforce the optional hard cap (ZAP_GC_HEAP_LIMIT) on mapped memory. Freed
+     * blocks are reused rather than unmapped, so with a working collector the
+     * mapped peak plateaus at roughly live + one threshold (well under a cap set
+     * generously above the threshold); exceeding it means the collector is not
+     * reclaiming (or a safepoint is never reached), so abort. We cannot collect
+     * here (runtime C holds unrooted temporaries), but aborting is always safe.
+     * Used only by the GC reclamation tests; the cap is unset in normal runs. */
+    if (zap_heap_limit && zap_total_mapped > zap_heap_limit) {
+        fprintf(stderr, "zap: mapped heap exceeds ZAP_GC_HEAP_LIMIT %zu\n", zap_heap_limit);
+        abort();
     }
-    return zap_map_block();
 }
 
-/* Allocate `osize` (incl. header) bytes of small-object space; returns the
- * header address. Caller holds zap_heap_mu. */
-static void *zap_bump_small(size_t osize) {
+/* Refill a mutator's LINE allocator: a block that may still hold free holes is
+ * preferred (recycle), then a fully-free block, then a fresh map. Returns a
+ * block with its first hole set up. Slow path; takes zap_heap_mu. */
+static ZapBlock *zap_refill_line(void) {
+    pthread_mutex_lock(&zap_heap_mu);
+    ZapBlock *b;
+    if (zap_recycle_blocks) {
+        b = zap_recycle_blocks;
+        zap_recycle_blocks = b->next;
+    } else if (zap_free_blocks) {
+        b = zap_free_blocks;
+        zap_free_blocks = b->next;
+    } else {
+        b = zap_map_block();
+    }
+    zap_account_refill(b);
+    pthread_mutex_unlock(&zap_heap_mu);
+    return b;
+}
+
+/* Refill a mutator's OVERFLOW allocator (medium objects): only a fully-empty
+ * block will do, so the block always offers one full-block hole big enough for
+ * any medium object (<= ZAP_LOS_THRESHOLD). Recycle blocks are deliberately not
+ * used here — their fragmented holes would defeat the overflow allocator. Slow
+ * path; takes zap_heap_mu. */
+static ZapBlock *zap_refill_overflow(void) {
+    pthread_mutex_lock(&zap_heap_mu);
+    ZapBlock *b;
+    if (zap_free_blocks) {
+        b = zap_free_blocks;
+        zap_free_blocks = b->next;
+    } else {
+        b = zap_map_block();
+    }
+    zap_account_refill(b);
+    pthread_mutex_unlock(&zap_heap_mu);
+    return b;
+}
+
+/* Fast-path LINE allocation for small objects (osize <= ZAP_LINE) out of the
+ * current mutator's own block. Lock-free: a bump + limit check within an owned
+ * block (single owner at a time). Only an exhausted buffer takes the lock
+ * (zap_refill_line). */
+static void *zap_bump_line(ZapMutator *self, size_t osize) {
     for (;;) {
-        if (!zap_cur_block) {
-            zap_cur_block = zap_take_block();
+        ZapBlock *b = self->block;
+        if (b) {
+            if (b->hole_cursor + osize <= b->hole_limit) {
+                void *p = (char *)b + b->hole_cursor;
+                b->hole_cursor += (uint32_t)osize;
+                return p;
+            }
+            /* current hole too small: walk to the next hole in this block */
+            if (b->hole_limit < ZAP_BLOCK && zap_block_next_hole(b)) {
+                continue;
+            }
         }
-        ZapBlock *b = zap_cur_block;
-        while (b->hole_cursor + osize <= b->hole_limit) {
-            void *p = (char *)b + b->hole_cursor;
-            b->hole_cursor += (uint32_t)osize;
+        /* no block, or this block is exhausted: refill under the lock */
+        self->block = zap_refill_line();
+    }
+}
+
+/* Fast-path allocation for medium objects (ZAP_LINE < osize <= LOS threshold).
+ * Prefer the line block's current hole when the object fits it (density), else
+ * bump the overflow block (fresh blocks, so any medium fits). Lock-free except
+ * for overflow refill. */
+static void *zap_bump_medium(ZapMutator *self, size_t osize) {
+    ZapBlock *b = self->block;
+    if (b && b->hole_cursor + osize <= b->hole_limit) {
+        void *p = (char *)b + b->hole_cursor;
+        b->hole_cursor += (uint32_t)osize;
+        return p;
+    }
+    for (;;) {
+        ZapBlock *o = self->overflow;
+        if (o && o->hole_cursor + osize <= o->hole_limit) {
+            void *p = (char *)o + o->hole_cursor;
+            o->hole_cursor += (uint32_t)osize;
             return p;
         }
-        /* advance to next hole in this block, or get a new block */
-        if (b->hole_limit < ZAP_BLOCK && zap_block_next_hole(b)) {
-            continue;
-        }
-        zap_cur_block = NULL; /* exhausted; fetch another */
+        self->overflow = zap_refill_overflow();
     }
 }
 
+/* Allocate `osize` (incl. header) bytes of small-object space from the current
+ * mutator's lock-free per-P buffer; returns the header address. */
+static void *zap_bump_mutator(size_t osize) {
+    ZapMutator *self = zap_self;
+    if (!self) {
+        zap_mutator_register();
+        self = zap_self;
+    }
+    if (osize <= ZAP_LINE) {
+        return zap_bump_line(self, osize);
+    }
+    return zap_bump_medium(self, osize);
+}
+
+/* Large-object allocation (osize > ZAP_LOS_THRESHOLD): a dedicated mapping, one
+ * object per block. Rare and already costly, so it keeps the global lock rather
+ * than a per-P buffer. Takes zap_heap_mu (shared with the block lists, the
+ * registry and the collector's sweep). */
 static void *zap_alloc_los(size_t osize) {
     size_t total = ((osize + sizeof(ZapBlock) + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
     void *mem = NULL;
@@ -983,6 +1126,7 @@ static void *zap_alloc_los(size_t osize) {
         fprintf(stderr, "zap: out of memory (LOS map)\n");
         abort();
     }
+    pthread_mutex_lock(&zap_heap_mu);
     ZapBlock *b = (ZapBlock *)mem;
     b->kind = ZAP_BK_LOS;
     b->los_mark = 0;
@@ -991,6 +1135,16 @@ static void *zap_alloc_los(size_t osize) {
     zap_all_blocks = b;
     zap_reg_insert((uintptr_t)b);
     zap_total_mapped += total;
+    zap_bytes_since_gc += osize;
+    if (zap_bytes_since_gc >= zap_gc_threshold) {
+        zap_gc_wanted = 1; /* collect at the next safepoint */
+    }
+    if (zap_heap_limit && zap_total_mapped > zap_heap_limit) {
+        pthread_mutex_unlock(&zap_heap_mu);
+        fprintf(stderr, "zap: mapped heap exceeds ZAP_GC_HEAP_LIMIT %zu\n", zap_heap_limit);
+        abort();
+    }
+    pthread_mutex_unlock(&zap_heap_mu);
     /* Object header placed right after the block metadata; a block-aligned
      * lookup via (payload-16) & ~(BLOCK-1) lands on `b` (the payload sits in the
      * first 32 KiB region). */
@@ -1010,30 +1164,12 @@ static size_t zap_round16(size_t n) { return (n + 15u) & ~(size_t)15u; }
  * safepoint mid-operation. */
 static void *zap_gc_alloc_sized(const ZapTypeDesc *desc, size_t payload_size) {
     size_t osize = zap_round16(ZAP_HEADER_BYTES + payload_size);
-    pthread_mutex_lock(&zap_heap_mu);
-    zap_bytes_since_gc += osize;
-    if (zap_bytes_since_gc >= zap_gc_threshold) {
-        zap_gc_wanted = 1; /* collect at the next safepoint */
-    }
     void *hdr;
     if (ZAP_HEADER_BYTES + payload_size > ZAP_LOS_THRESHOLD) {
-        hdr = zap_alloc_los(osize);
+        hdr = zap_alloc_los(osize); /* large objects: global lock (rare) */
     } else {
-        hdr = zap_bump_small(osize);
+        hdr = zap_bump_mutator(osize); /* small/medium: lock-free per-P buffer */
     }
-    /* Enforce the optional hard cap (ZAP_GC_HEAP_LIMIT) on mapped memory. Freed
-     * blocks are reused rather than unmapped, so with a working collector the
-     * mapped peak plateaus at roughly live + one threshold (well under a cap set
-     * generously above the threshold); exceeding it means the collector is not
-     * reclaiming (or a safepoint is never reached), so abort. We cannot collect
-     * here (runtime C holds unrooted temporaries), but aborting is always safe.
-     * Used only by the GC reclamation tests; the cap is unset in normal runs. */
-    if (zap_heap_limit && zap_total_mapped > zap_heap_limit) {
-        pthread_mutex_unlock(&zap_heap_mu);
-        fprintf(stderr, "zap: mapped heap exceeds ZAP_GC_HEAP_LIMIT %zu\n", zap_heap_limit);
-        abort();
-    }
-    pthread_mutex_unlock(&zap_heap_mu);
     void *payload = (char *)hdr + ZAP_HEADER_BYTES;
     ZAP_HDR(payload) = (uintptr_t)desc; /* mark bit 0 clear */
     ZAP_OSIZE(payload) = payload_size;
