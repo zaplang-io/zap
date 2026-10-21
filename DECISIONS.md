@@ -1212,6 +1212,48 @@ are tracked separately, not part of I#154. Everywhere this document says
 `Option[T]`/`Option.Some`/`Option.None` above, read `Optional[T]` etc.; the old
 name has no code left behind it (clean rename, no alias).
 
+**Update — post-core slice (I#170): built-in-collection re-skin DECLINED; they
+stay special-cased (resolves Fork X / override #3).** Fork X and open-call
+override #3 above scheduled the built-in collections (`list`/`dict`/`set`/`heap`)
+to be *re-skinned* as user-generic *types* flowing through monomorphization,
+reducing their special-casing. On investigation this was **declined**: a genuine
+re-skin cannot be done without a **performance regression** and would **increase**,
+not reduce, special-casing. Three facts decide it:
+- The collections are **type-erased**: one hand-tuned C-runtime implementation per
+  (collection × machine-word kind `Elem = i64|ptr|struct`), shared across all
+  element types (`design/RUNTIME-ABI.md` §Collection layout). Monomorphization is
+  the opposite — **type-reifying**: a distinct concrete struct per full type-arg
+  tuple. Forcing collections through it would wrap the runtime handle in a struct,
+  adding a heap object + pointer indirection to every collection = a regression;
+  the alternative (register them as generics so mono mangles `list[int64]` →
+  `list$int64`, then un-mangle back to `Ty::List(Elem::I64)` in `resolve_ty`) is
+  *more* special-casing, not less.
+- Their operations are **compiler intrinsics** lowered to `zap_list_*`/`zap_dict_*`
+  runtime calls; there is no Zap surface for raw GC-word-buffer push/get/hash, so a
+  prelude `struct list[T]` (modelled on `Optional[T]`) cannot carry real method
+  bodies. Adding such surface would itself be a user-facing change — forbidden by
+  I#170's overriding zero-surface-change constraint.
+- **Interop is already achieved** without a re-skin: to the `mono` pass a
+  collection is an ordinary `Type::Named` node, so `subst_with`/`unify`/
+  `apply_subst` already substitute, unify, and infer `list[T]`/`dict[K,V]`/`set[T]`
+  uniformly with user generics (`rename_type` keeps the head and rewrites only the
+  args — the one deliberate built-in line). Verified end-to-end:
+  `firstOf[T](list[T]) -> Optional[T]`, `list[Pair[int64,str]]`,
+  `Box[list[int64]]`, `Optional[list[int64]]` all compile and run.
+
+**Shipped instead (the only safe, zero-regression change):** the one residual
+non-uniformity — a `dict`/`set` *literal* passed directly to a generic function
+did not drive type-parameter inference, though a `list` literal did — is fixed by
+mirroring the list-literal inference for `Expr::Set`/`Expr::Dict` in
+`crates/ir/src/mono.rs`. This is purely additive (the case previously errored with
+"cannot infer type argument"); typed-variable and explicit-`[K,V]` forms already
+worked. No surface, behavior, or performance change to any existing program; all
+existing collection + generics goldens pass unchanged under both collectors. New
+golden `tests/golden/generics_collections_interop.zap` exercises the interop.
+Collections remain special-cased by design — Python-surface fidelity and the tuned
+runtime both win over internal uniformity (I#170's own guidance). See
+`design/0012-generics.md` §"Built-in collections".
+
 ## D-0065 — Optional type spelling (`Optional[T]`) + `json` optionality via `Optional[T]`
 **Status:** Locked (ratified by the user 2026-10-20). Implements epic I#154
 slice 6 (the final slice); builds on D-0064 (generics + the optional enum) and
