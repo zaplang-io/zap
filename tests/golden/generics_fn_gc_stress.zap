@@ -1,7 +1,7 @@
 # GC stress for generic FUNCTIONS (I#161, building on the generic-type stress in
 # generics_gc_stress). Four goroutines each churn many heap instances allocated
 # THROUGH generic functions — make_pair[int64,str] (a pointer + scalar payload)
-# and wrap[T] (Option[str] pointer payload, Option[int64] unboxed scalar) —
+# and wrap[T] (Optional[str] pointer payload, Optional[int64] unboxed scalar) —
 # forcing collections mid-loop. Correct output under BOTH collectors proves each
 # monomorphized generic-fn instance produces instances with a correct
 # per-instance ZapTypeDesc pointer map from codegen's existing per-struct
@@ -16,15 +16,15 @@ struct Pair[A, B]:
 def make_pair[A, B](A a, B b) -> Pair[A, B]:
     return Pair(a, b)
 
-def wrap[T](T x) -> Option[T]:
-    return Option.Some(x)
+def wrap[T](T x) -> Optional[T]:
+    return Optional.Some(x)
 
 def worker(channel[int64] ch, int64 reps):
     auto acc = 0
     for i in range(0, reps):
         Pair[int64, str] p = make_pair(i, "item")
-        Option[str] o = wrap(p.second)
-        Option[int64] q = wrap(p.first)
+        Optional[str] o = wrap(p.second)
+        Optional[int64] q = wrap(p.first)
         if o.is_some():
             acc = acc + q.unwrap()
     ch <- acc

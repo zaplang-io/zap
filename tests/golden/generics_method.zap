@@ -1,7 +1,7 @@
 # Generic methods with their own type parameters (I#161): on a generic enum
-# (Option[T].and_opt[U] — Rust's Option::and: returns `other` iff self is Some)
+# (Optional[T].and_opt[U] — Rust's Optional::and: returns `other` iff self is Some)
 # and on a generic struct (Box[T].repack[U]). Each specialized method is emitted
-# onto its owner's concrete instance (Option$int64, Box$int64, ...) and
+# onto its owner's concrete instance (Optional$int64, Box$int64, ...) and
 # dispatched directly through the ordinary struct-method path. Explicit method
 # type arguments (repack[int64]) exercise the explicit path.
 struct Box[T]:
@@ -12,10 +12,10 @@ struct Box[T]:
         return Box(y)
 
 def main():
-    Option[int64] a = Option.Some(1)
-    Option[str] b = Option.Some("yes")
+    Optional[int64] a = Optional.Some(1)
+    Optional[str] b = Optional.Some("yes")
     print(a.and_opt(b).unwrap_or("no"))
-    Option[int64] n = None
+    Optional[int64] n = None
     print(n.and_opt(b).unwrap_or("defaulted"))
     Box[int64] bx = Box(3)
     print(bx.get())

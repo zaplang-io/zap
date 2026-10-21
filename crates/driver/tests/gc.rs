@@ -101,7 +101,7 @@ fn immix_reclaims_with_parked_coroutines() {
 }
 
 /// Reclamation of monomorphized generic instances (I#154, D-0064). A loop
-/// churns far more pointer-bearing generic heap objects (`Option[str]`,
+/// churns far more pointer-bearing generic heap objects (`Optional[str]`,
 /// `Pair[int64, str]`) than the heap cap, keeping only a tiny live set.
 /// Completing within the cap requires the collector to reclaim them — which it
 /// can do correctly only if each monomorphized instance's `ZapTypeDesc` pointer
@@ -114,8 +114,8 @@ fn immix_reclaims_generic_instances() {
                    auto n = 0\n    \
                    for i in range(0, 300000):\n        \
                        Pair[int64, str] p = Pair(i, \"payload\")\n        \
-                       Option[str] o = Option.Some(p.second)\n        \
-                       Option[int64] q = Option.Some(p.first)\n        \
+                       Optional[str] o = Optional.Some(p.second)\n        \
+                       Optional[int64] q = Optional.Some(p.first)\n        \
                        if o.is_some():\n            \
                            n = n + q.unwrap()\n    \
                    print(n)\n";

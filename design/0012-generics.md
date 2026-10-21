@@ -1,4 +1,4 @@
-# Proposal: User-defined generics (D-0017) + `Option[T]` flagship
+# Proposal: User-defined generics (D-0017) + `Optional[T]` flagship
 
 - **Author(s):** Claude (scoping/design session for I#154)
 - **Last updated:** 2026-10-20
@@ -11,7 +11,7 @@
   generics design), `design/0008-precise-gc.md` (the precise Immix collector and
   its per-type descriptors), `design/RUNTIME-ABI.md` (heap layout, interface fat
   pointer, name mangling), `design/0010-json.md` (the `@default` optionality
-  workaround this removes), `design/0011-aws-sdk.md` (which flagged `Option[T]`
+  workaround this removes), `design/0011-aws-sdk.md` (which flagged `Optional[T]`
   as its load-bearing blocker, fork O).
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
@@ -20,12 +20,12 @@
 ## Abstract
 
 `design/0006` §5 already pinned the *surface* of Zap generics — subscript syntax
-(`Option[T]`, `def map[T, U](...)`), monomorphization (D-0017), and interface
+(`Optional[T]`, `def map[T, U](...)`), monomorphization (D-0017), and interface
 bounds — but implementation was **staged**, and three downstream features have
 since bent around its absence: `json` used `@default` for optionality (which
 conflates *absent* with *present-but-zero*, `design/0010` §3), the AWS SDK named
-`Option[T]` its single load-bearing blocker (`design/0011` fork O), and the
-tier-3 enum work shipped non-generic only (`Option[T]`/`Result[T, E]` explicitly
+`Optional[T]` its single load-bearing blocker (`design/0011` fork O), and the
+tier-3 enum work shipped non-generic only (`Optional[T]`/`Result[T, E]` explicitly
 "ride on user generics", `design/0006` §3.3).
 
 This document turns the staged surface into an **implementation design**: it
@@ -35,7 +35,7 @@ the precise collector stays correct, how much call-site inference v1 does,
 whether bounds ship in v1, how generics mesh with value structs / interface fat
 pointers / enums / the special-cased built-in collections), and sequences the
 work as vertical slices with a thin **first end-to-end vertical** that gets
-`Option[T]` compiling and running.
+`Optional[T]` compiling and running.
 
 The central engineering finding: **monomorphization dissolves the GC-metadata
 problem rather than creating one.** A precise collector normally needs per-type
@@ -60,7 +60,7 @@ What the language provides today (all landed), that generics must mesh with:
   only. Lowered as a **GC-allocated tagged struct `{ tag: i32, <flattened
   payload> }`** reusing `StructNew`/`FieldGet`/`FieldSet` — *zero* codegen /
   `zaprt.c` change. A recursive variant field is already a `Struct(sid)` pointer.
-  `match` exhaustiveness is enforced. This is exactly the machinery `Option[T]`
+  `match` exhaustiveness is enforced. This is exactly the machinery `Optional[T]`
   needs, minus the type parameter.
 - **Interfaces as fat pointers** (D-0016, I#84, PR #113) + **value-struct boxing**
   (I#75, PR #114): an interface *value* is a `{data, itable}` fat pointer with
@@ -94,7 +94,7 @@ What the language provides today (all landed), that generics must mesh with:
   open issue this doc finalizes with concrete direction.
 
 What generics **cannot** lean on (not yet landed): typed exception classes (I#12,
-`raise` carries a string) — so `Option` error ergonomics must use the existing
+`raise` carries a string) — so `Optional` error ergonomics must use the existing
 string-message `raise`; and there is no compile-time user-macro API (D-0036
 staged) — not needed, generics is a core-compiler feature, not a derive.
 
@@ -157,11 +157,11 @@ monomorphization the question never arises at runtime:
   emits one with the `str` field's offset. **No per-instantiation GC code is
   written — the descriptor falls out of the concrete layout the pass already
   produced.**
-- **Generic enums ride the tier-3 path.** `Option[str]` monomorphizes to the same
+- **Generic enums ride the tier-3 path.** `Optional[str]` monomorphizes to the same
   `{ tag: i32, payload… }` GC tagged struct that non-generic tier-3 enums already
   lower to (enums-match #51) — so it inherits tier-3's "zero codegen / `zaprt.c`
-  change" property. The `Some` payload field is `str` for `Option[str]` (a
-  pointer in the descriptor), `i64` for `Option[int64]` (not) — again purely from
+  change" property. The `Some` payload field is `str` for `Optional[str]` (a
+  pointer in the descriptor), `i64` for `Optional[int64]` (not) — again purely from
   the concrete layout.
 - **Collections of generic element types** also stay precise: a monomorphized
   `list[Box[str]]` is a `list` whose element kind is "pointer", selecting the
@@ -206,7 +206,7 @@ struct Box[T]:
     T value
     def get(self) -> T: return self.value
 
-enum Option[T]:            # generic enum (the flagship)
+enum Optional[T]:            # generic enum (the flagship)
     Some(T value)
     None
 
@@ -219,7 +219,7 @@ interface Container[T]:    # generic interface (reserved; realized in a later sl
 
 Type parameters are used in every type position: field types, parameter types,
 return types, local declarations, and nested instantiations (`list[T]`,
-`Option[T]`).
+`Optional[T]`).
 
 **Grammar extensions (this doc updates `docs/GRAMMAR.ebnf`):**
 
@@ -236,7 +236,7 @@ return types, local declarations, and nested instantiations (`list[T]`,
    ```ebnf
    type_args   ::= "[" type { "," type } "]" ;
    ```
-   applied to a *type name* (`Box[str](...)`, `list[T]()`, `Option[int64].None`)
+   applied to a *type name* (`Box[str](...)`, `list[T]()`, `Optional[int64].None`)
    or a *generic callee* (`map[int64, str](xs, f)`).
 
 **Disambiguation from subscript indexing `a[i]` (D-0047 `__getitem__`).** `name[…]`
@@ -261,20 +261,20 @@ inference in v1.**
   auto b  = Box(value=42)            # T=int64 from the field initializer
   ```
 - **Expected-type sink** — when a generic constructor has **no argument** to infer
-  from (the `Option[T].None` problem), v1 propagates the type from the immediate
+  from (the `Optional[T].None` problem), v1 propagates the type from the immediate
   *expected type* at exactly three sinks: a typed `let`, a `return` in a function
   with a declared return type, and a typed argument position:
   ```python
-  Option[int64] x = None             # T=int64 from the binding's type
-  def find(...) -> Option[str]:
+  Optional[int64] x = None             # T=int64 from the binding's type
+  def find(...) -> Optional[str]:
       return None                    # T=str from the return type
   take_opt(None)                     # T from the parameter's declared type
   ```
-  This is the *minimum* bidirectionality that makes `None`/`Option` ergonomic; it
+  This is the *minimum* bidirectionality that makes `None`/`Optional` ergonomic; it
   is a one-level sink, not a constraint solver.
 - **Explicit type args** are always available as the fallback and are *required*
   when neither rule determines the args (`list[str]()`, `Box[str]()`,
-  `Option[int64].None` as a bare expression).
+  `Optional[int64].None` as a bare expression).
 - **Deferred:** inference through multiple statements, return-type-driven
   inference of *function* type params beyond the sink, GADT-style or
   higher-ranked inference, and defaulting of unconstrained params. v1 errors with
@@ -283,12 +283,12 @@ inference in v1.**
 ### Fork B — Constraints / bounds in v1
 
 **Recommendation: ship *unconstrained* type parameters in the first vertical
-(`Option[T]` needs no bounds); land *interface bounds* as the immediately
+(`Optional[T]` needs no bounds); land *interface bounds* as the immediately
 following slice, reusing the existing I#84 conformance checker. Designed in from
 the start (grammar + sema schema carry the optional bound now).**
 
-Rationale: the flagship — `Option[T]`, `Box[T]`, `Pair[K,V]` and their methods —
-needs **no** bounds; forcing bounds into the first vertical delays `Option[T]`
+Rationale: the flagship — `Optional[T]`, `Box[T]`, `Pair[K,V]` and their methods —
+needs **no** bounds; forcing bounds into the first vertical delays `Optional[T]`
 (which unblocks json/AWS) for machinery it does not use. And bounds are *cheap*
 when they land, because the hard part already exists:
 
@@ -331,13 +331,13 @@ def max_of[T: Ord](list[T] xs) -> T:    # body may call __cmp__; nothing else
   (interface value in a struct **field** / collection **element**) are the same
   follow-ups whether or not the enclosing type is generic — generics add nothing
   new to them.
-- **Enums (Option *is* a generic enum).** Generic enums monomorphize to the
+- **Enums (Optional *is* a generic enum).** Generic enums monomorphize to the
   tier-3 tagged struct (Fork M); `match` exhaustiveness, qualified/positional/
   named patterns, and recursive variant fields all carry over from enums-match
   #51 with the type parameter substituted. The tier-3 deferrals (`.name`,
   `for x in Enum`, enum methods) are being lifted on their own tickets; generic
-  enums need **enum methods** (for `Option.unwrap` etc.), so that deferral is
-  pulled into this epic's Option slice.
+  enums need **enum methods** (for `Optional.unwrap` etc.), so that deferral is
+  pulled into this epic's Optional slice.
 - **Built-in collections — stay special-cased in v1; documented migration path.**
   `list`/`dict`/`set`/`array`/`heap` are **not** rewritten as user generics for
   v1. Reasons: they are tuned runtime types (typed entry points, SIMD array
@@ -358,15 +358,15 @@ def max_of[T: Ord](list[T] xs) -> T:    # body may call __cmp__; nothing else
   `@derive(Json)` (D-0059) over a generic struct likewise specializes per
   instance.
 
-### Fork O — `Option[T]`, the flagship
+### Fork O — `Optional[T]`, the flagship
 
-**Recommendation: `Option[T]` is a stdlib generic enum, lowered via the tier-3
+**Recommendation: `Optional[T]` is a stdlib generic enum, lowered via the tier-3
 tagged representation (no niche optimization in v1). Ergonomics by methods +
 `match`, not a new `?` operator. This is what lets json drop `@default`-as-
 optionality and the AWS SDK model optional fields properly (fork O-a).**
 
 ```python
-enum Option[T]:
+enum Optional[T]:
     Some(T value)
     None
 
@@ -374,17 +374,17 @@ enum Option[T]:
     def is_none(self) -> bool:
     def unwrap(self) -> T:              # Some(v) -> v ; None -> raise
     def unwrap_or(self, T default) -> T
-    def map[U](self, fn(T) -> U f) -> Option[U]   # needs generic method (slice 4)
+    def map[U](self, fn(T) -> U f) -> Optional[U]   # needs generic method (slice 4)
 ```
 
-- **Representation (v1): tagged, reusing tier-3.** `Option[T]` monomorphizes to
+- **Representation (v1): tagged, reusing tier-3.** `Optional[T]` monomorphizes to
   `{ tag: i32, value: T }` — the same GC tagged struct any tier-3 enum lowers to,
-  so it inherits precise GC and zero codegen change. `Option[int64]` carries an
+  so it inherits precise GC and zero codegen change. `Optional[int64]` carries an
   unboxed `i64` payload (and so can represent "absent int", which bare `None`
-  cannot — D-0014 makes only reference types nullable); `Option[str]` carries a
+  cannot — D-0014 makes only reference types nullable); `Optional[str]` carries a
   pointer payload traced via the descriptor.
 - **Niche / nullable-pointer optimization — deferred.** When `T` is a reference
-  type, `None` *could* be the null pointer and `Option[T]` collapse to one word
+  type, `None` *could* be the null pointer and `Optional[T]` collapse to one word
   (Rust's `Option<&T>` niche). This is **semantically invisible** and a pure
   layout optimization, so v1 ships the tagged form (correctness + reuse) and
   leaves the niche as a documented follow-up — same philosophy as tier-3's
@@ -392,8 +392,8 @@ enum Option[T]:
 - **Pattern matching** is tier-3 `match` unchanged:
   ```python
   match find_user(id):
-      case Option.Some(u): print(u.name)
-      case Option.None:    print("absent")
+      case Optional.Some(u): print(u.name)
+      case Optional.None:    print("absent")
   ```
 - **Ergonomics — methods, not `?`.** Zap's error model is **exceptions**
   (D-0007), not `Result`-return, so a Rust-style `?` early-return operator does
@@ -401,32 +401,32 @@ enum Option[T]:
   ships `unwrap()` (raises a string-message error on `None` until typed exceptions
   I#12 land, then a typed `UnwrapError`), `unwrap_or(default)`, `is_some`/
   `is_none`, and (once generic methods land, slice 4) `map`/`and_then`. A future
-  **`or-else` sugar** (`x or default` when `x: Option[T]`) can desugar to
+  **`or-else` sugar** (`x or default` when `x: Optional[T]`) can desugar to
   `unwrap_or` via `__bool__`/a dedicated lowering — flagged, not v1.
 - **Null-safety story.** Two notions of "nothing" coexist and are distinct:
   `None`-as-null-pointer for reference types (D-0014, member access traps), and
-  `Option[T]` as the **typed, explicit** optional that works for *any* `T`
-  including scalars and that the type system forces you to unwrap. `Option[T]` is
+  `Optional[T]` as the **typed, explicit** optional that works for *any* `T`
+  including scalars and that the type system forces you to unwrap. `Optional[T]` is
   the recommended way to express "may be absent" in new APIs; the bare-`None`
   reference-nullability stays for interop/low-level code. (A future lint could
-  push reference-type optionality toward `Option[T]` too — out of scope.)
+  push reference-type optionality toward `Optional[T]` too — out of scope.)
 
 **(a) Letting `json` drop `@default`.** `design/0010` §3 uses `@default` (the
 `=` form) to mark a field optional, so a missing key silently becomes the zero
-value — conflating *absent* with *present-but-zero*. With `Option[T]`:
-- The typed codec recognizes an `Option[T]` field: **absent key or JSON `null`
+value — conflating *absent* with *present-but-zero*. With `Optional[T]`:
+- The typed codec recognizes an `Optional[T]` field: **absent key or JSON `null`
   → `None`**; present → `Some(decode(T))`. Encoding **omits** `None` fields (or
   emits `null` under an opt-in) and unwraps `Some`.
 - `@default` reverts to its honest meaning — "use *this* value when the key is
   absent" — and is no longer overloaded to mean "optional". The absent-vs-zero
   conflation is gone.
 - This is additive and API-compatible with `design/0010`'s stated plan ("a future
-  `Option[T]` field … decoding null/absent to `None`"); it closes the json half
+  `Optional[T]` field … decoding null/absent to `None`"); it closes the json half
   of #100/#133.
 
 **(b) Giving the AWS SDK proper optional modeling.** `design/0011` fork O's
-**preferred O-a** path ("land `Option[T]`, model optional as `Option[T]`") becomes
-available: AWS's overwhelmingly-optional shapes generate `Option[T]` fields; the
+**preferred O-a** path ("land `Optional[T]`, model optional as `Optional[T]`") becomes
+available: AWS's overwhelmingly-optional shapes generate `Optional[T]` fields; the
 serializer omits unset (`None`) members, and output members decode absent →
 `None` without the O-b "restrict the first wave to read-oriented ops where
 absent≈zero" compromise or the O-c hazzer-struct bloat. This retires AWS's
@@ -445,13 +445,13 @@ load-bearing blocker (#89).
 - **Check-at-definition** upholds the compile-time-safety ethos that already
   justifies structural interfaces (D-0016) and `match` exhaustiveness (D-0040):
   the generic is correct for all instantiations or it does not compile.
-- **Unconstrained-first, bounds-next** gets the high-value `Option[T]` landing
+- **Unconstrained-first, bounds-next** gets the high-value `Optional[T]` landing
   (json + AWS unblock) off the critical path of the (cheap, but unneeded-for-the-
   flagship) bounds machinery.
 - **Minimal inference (argument + sink)** is enough for the real surface
   (`map([...], f)`, `Box(value=…)`, `None` against a known type) without a
   constraint solver; explicit type args cover the rest honestly.
-- **Tagged `Option` + methods, no `?`** fits an exception-based language and
+- **Tagged `Optional` + methods, no `?`** fits an exception-based language and
   reuses tier-3 wholesale; the niche optimization is invisible and can wait.
 - **Built-ins stay special-cased** because they are the performance of the
   language; re-skinning them is a source nicety, not a correctness requirement,
@@ -459,8 +459,8 @@ load-bearing blocker (#89).
 
 Alternatives rejected for v1: type erasure / dictionary passing (boxes scalars,
 runtime cost, fights the ABI — D-0017); C++-style check-at-instantiation (worse
-errors, breaks "check once"); bounds in the first vertical (delays `Option[T]`
-for unused machinery); niche-optimized `Option` (invisible gain, new codegen);
+errors, breaks "check once"); bounds in the first vertical (delays `Optional[T]`
+for unused machinery); niche-optimized `Optional` (invisible gain, new codegen);
 rewriting the built-in collections as user generics (perf regression risk, no
 correctness gain).
 
@@ -489,7 +489,7 @@ correctness gain).
 
 Each slice is a shippable vertical (front-end → sema → ir → codegen → golden),
 following the project's one-ticket-per-vertical convention. The **first
-end-to-end vertical** is slices 1–3 proving `Option[T]` — the thinnest path that
+end-to-end vertical** is slices 1–3 proving `Optional[T]` — the thinnest path that
 compiles and runs a generic.
 
 **Slice 0 — front-end: parse type params (+ bounds) and call-site type args.**
@@ -514,18 +514,18 @@ hand concrete `StructLayout`s to codegen so its **existing** per-struct
 GC-correctness slice; it is mostly "let the existing path run", plus the
 collection element-kind tag for generic element types*). Codegen unchanged.
 
-**Slice 3 — `Option[T]` stdlib enum + sugar → FIRST END-TO-END VERTICAL.**
-Define `Option[T]` as a generic enum riding tier-3 lowering; implement **enum
+**Slice 3 — `Optional[T]` stdlib enum + sugar → FIRST END-TO-END VERTICAL.**
+Define `Optional[T]` as a generic enum riding tier-3 lowering; implement **enum
 methods** on a generic enum (`unwrap`/`unwrap_or`/`is_some`/`is_none`), `None`
 via the expected-type sink, and `match`. This is the first program that compiles
-and runs a user-visible generic. Goldens: `Option[int64]`/`Option[str]` construct
+and runs a user-visible generic. Goldens: `Optional[int64]`/`Optional[str]` construct
 / match / unwrap / unwrap_or; a generic `Box[T]`/`Pair[K,V]` smoke test; both GC
 collectors (the GC-correctness proof — a generic holding a pointer payload across
 a collection).
 
 **Slice 4 — generic functions + generic methods.** Free `def map[T,U](...)`,
-generic methods (`Option.map[U]`), full argument-driven inference across function
-type params. (`Box`/`Option` from slice 3 are generic *types* with concrete
+generic methods (`Optional.map[U]`), full argument-driven inference across function
+type params. (`Box`/`Optional` from slice 3 are generic *types* with concrete
 methods; this adds type params on *functions*.)
 
 > **Status (I#161, implemented).** Generic free functions and generic methods
@@ -536,9 +536,9 @@ methods; this adds type params on *functions*.)
 > the GC-metadata-free theorem (every instance is concrete). Call-site inference
 > is argument-driven unification (over named/list/tuple/function type structure)
 > plus the expected-type return sink, with explicit `f[T](...)` / `recv.m[U](...)`
-> type arguments as the fallback. `Option[T]` gains a callback-free `and_opt[U]`
+> type arguments as the fallback. `Optional[T]` gains a callback-free `and_opt[U]`
 > (Rust's `Option::and`). **Deferred:** the *higher-order* flavor shown above
-> (`map[T,U]` / `Option.map[U]` taking an `fn(T)->U`) needs first-class function
+> (`map[T,U]` / `Optional.map[U]` taking an `fn(T)->U`) needs first-class function
 > *values* — the `fn(...)->...` type does not yet parse and codegen rejects
 > `Type::Func`, so passing/calling a function value is a separate feature (its own
 > follow-up ticket). Everything in slice 4 that does not require a function value
@@ -576,13 +576,13 @@ from slice 0/1.)
 >   operator bound with a *primitive* argument (only user structs/enums carry the
 >   methods a bound checks today).
 
-**Slice 6 — migration consumers.** (a) `json` typed codec recognizes `Option[T]`
+**Slice 6 — migration consumers.** (a) `json` typed codec recognizes `Optional[T]`
 fields (absent/null → `None`, omit on encode); **drop `@default`-as-optionality**
-(#100/#133). (b) AWS SDK models optional shapes as `Option[T]` (fork O-a),
+(#100/#133). (b) AWS SDK models optional shapes as `Optional[T]` (fork O-a),
 retiring #89's blocker. These are separate tickets owned by json/AWS, gated on
 slices 1–3.
 
-**Slice 7 — optional follow-ups (not scheduled here).** `Option` niche/nullable-
+**Slice 7 — optional follow-ups (not scheduled here).** `Optional` niche/nullable-
 pointer layout optimization; `Result[T, E]`; `or-else` sugar; multiple/where-
 clause bounds; generic *interfaces* (`Container[T]`) realization; built-in
 collection re-skin as generic surface; layout-sharing for code-size.
@@ -611,12 +611,12 @@ collectors, containerized `clippy -D warnings` under `zapc/llvm` and
   name resolution.
 - **I — inference** = argument-driven unification + expected-type sink at
   `let`/`return`/arg; explicit type args required otherwise; no v1 flow inference.
-- **O — `Option[T]`** = stdlib generic enum, tagged tier-3 representation (niche
+- **O — `Optional[T]`** = stdlib generic enum, tagged tier-3 representation (niche
   deferred), ergonomics by methods + `match` (no `?` operator); it is the first
   vertical and unblocks json (drop `@default`-as-optional) and AWS (fork O-a).
 - **X — built-in collections stay special-cased** in v1; re-skin is a future
   source-compat nicety, not scheduled.
-- **First end-to-end vertical = slices 1–3** (generic *types* + `Option[T]`);
+- **First end-to-end vertical = slices 1–3** (generic *types* + `Optional[T]`);
   generic *functions* and *bounds* follow.
 
 **Open product calls for the user (see report):**
@@ -627,11 +627,11 @@ collectors, containerized `clippy -D warnings` under `zapc/llvm` and
 3. **Collections migration — ever re-skin the built-ins as user generics, or
    leave special-cased permanently?** Recommendation: leave special-cased; revisit
    only if source-compat demand appears.
-4. **`Option` niche optimization — accept the tagged form indefinitely, or
+4. **`Optional` niche optimization — accept the tagged form indefinitely, or
    schedule the one-word niche for reference `T`?** Recommendation: tagged now,
    niche only if profiling shows it matters.
 
 **Deferred (fast-follow, not v1):** generic functions beyond the flagship
 (slice 4 is still v1-ish but after the vertical); multi/where-clause bounds;
-generic interfaces; `Result[T, E]`; `?`/`or-else` sugar; niche `Option` layout;
+generic interfaces; `Result[T, E]`; `?`/`or-else` sugar; niche `Optional` layout;
 built-in re-skin; code-size layout-sharing; typed `UnwrapError` (rides I#12).

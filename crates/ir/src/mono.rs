@@ -17,7 +17,7 @@
 //! **no new mechanism**. Generic enums ride the tier-3 tagged-struct path. GC
 //! correctness for generics is therefore a theorem, not new code.
 //!
-//! Scope: generic *types* (`struct`/`enum`) with concrete methods, `Option[T]`,
+//! Scope: generic *types* (`struct`/`enum`) with concrete methods, `Optional[T]`,
 //! generic *functions*/methods with their own type parameters (I#161), and
 //! interface *bounds* on type parameters (`[T: Iface]`, I#164). A bound is
 //! enforced at each concrete instantiation by the I#84 structural-conformance
@@ -102,7 +102,7 @@ struct Mono<'a> {
     /// (empty for non-generic top-level code).
     cur_subst: HashMap<String, Type>,
     /// The enclosing generic instance (its name + concrete args), used to resolve
-    /// a bare `Self.Variant` (`Option.Some`/`Option.None`) inside a generic
+    /// a bare `Self.Variant` (`Optional.Some`/`Optional.None`) inside a generic
     /// method body to the current instantiation.
     cur_self: Option<(String, Vec<Type>)>,
     /// The current function's concrete declared return type, for the `return`
@@ -693,7 +693,7 @@ impl Mono<'_> {
         let mangled = self.mangle_name(generic, args);
         let subst = self.subst_map(generic, args);
         // The receiver type used for inference is the *generic form*
-        // (`Option[int64]`), so method/variant/pattern lookups resolve against
+        // (`Optional[int64]`), so method/variant/pattern lookups resolve against
         // the generic declaration and re-derive the instance; the specialized
         // struct name is applied during rename.
         let self_ty = Type::Named {

@@ -1,6 +1,6 @@
 # GC stress for monomorphized generics (I#154, D-0064). Four goroutines each
 # churn many generic-typed heap instances with BOTH a pointer payload
-# (Option[str], Pair[int64, str]) and an unboxed-scalar payload (Option[int64]),
+# (Optional[str], Pair[int64, str]) and an unboxed-scalar payload (Optional[int64]),
 # forcing collections mid-loop. Correct output under BOTH collectors proves each
 # monomorphized instance gets a correct per-instance ZapTypeDesc pointer map from
 # codegen's existing per-struct emission (the "GC metadata is free" theorem): a
@@ -15,8 +15,8 @@ def worker(channel[int64] ch, int64 reps):
     auto acc = 0
     for i in range(0, reps):
         Pair[int64, str] p = Pair(i, "item")
-        Option[str] o = Option.Some(p.second)
-        Option[int64] q = Option.Some(p.first)
+        Optional[str] o = Optional.Some(p.second)
+        Optional[int64] q = Optional.Some(p.first)
         if o.is_some():
             acc = acc + q.unwrap()
     ch <- acc

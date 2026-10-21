@@ -103,7 +103,7 @@ struct EnumLow {
     /// Variants in declaration order (tier-3).
     variants: Vec<VariantLow>,
     /// The niche optimization (I#154, D-0064 #4), set for a tier-3 enum of the
-    /// `Option` shape — exactly two variants, one payload-free and one with a
+    /// `Optional` shape — exactly two variants, one payload-free and one with a
     /// single non-nullable-pointer field. Such an enum is represented as that
     /// single nullable pointer: the payload-free variant is the null pointer, the
     /// one-field variant *is* the payload pointer — one word, no tag, no
@@ -112,7 +112,7 @@ struct EnumLow {
     niche: Option<NicheLow>,
 }
 
-/// The niche layout of an `Option`-shaped tier-3 enum (I#154, D-0064 #4). The
+/// The niche layout of an `Optional`-shaped tier-3 enum (I#154, D-0064 #4). The
 /// value's ZIR type stays `Struct(sid)` (so method dispatch still finds the
 /// enum's methods), but it is physically the payload pointer, with `None` the
 /// null pointer. Codegen treats every `Struct(sid)` as an opaque pointer, so no
@@ -482,7 +482,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                             fields: vfields,
                         });
                     }
-                    // Niche optimization (I#154, D-0064 #4): an `Option`-shaped
+                    // Niche optimization (I#154, D-0064 #4): an `Optional`-shaped
                     // enum — exactly two variants, one payload-free and one with a
                     // single field whose type is a non-nullable pointer (a
                     // reference type that is neither a value struct nor another
@@ -678,7 +678,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     sigs.insert(format!("{}__{}", s.name, m.name), (params, ret));
                 }
             }
-            // Tier-3 enum methods (D-0046; used by generic `Option[T]` etc.,
+            // Tier-3 enum methods (D-0046; used by generic `Optional[T]` etc.,
             // I#154). A tier-3 enum lowers to a tagged struct, so `self` is that
             // struct and a method call dispatches through the ordinary
             // struct-method path. Tier-1 enum methods are not lowered yet.
@@ -1657,6 +1657,150 @@ fn derive_field_kind(fty: Ty) -> Option<DeriveFieldKind> {
     }
 }
 
+/// Layout facts for a monomorphized `Optional[T]` instance used as a
+/// `@derive(Json)` field (I#165, D-0065). Monomorphization has already
+/// specialized `Optional[T]` to a concrete enum (`Optional$int64`, `Optional$str`,
+/// …) before lowering, so the derive sees a plain `Ty::Struct(sid)`; this records
+/// how to test/construct/extract its `Some`/`None` for the two possible layouts
+/// (niche for a reference payload, tagged otherwise — D-0064 #4).
+struct OptionalLayout {
+    /// The concrete `Optional` instance's struct id.
+    sid: u32,
+    /// The payload (`T` lowered) — what the inner codec encodes/decodes.
+    payload_ty: Ty,
+    /// Niche layout: `Some` IS the payload pointer, `None` the null pointer, one
+    /// word, no tag. `false` = the tagged `{tag, payload}` layout.
+    niche: bool,
+    /// Tagged layout only: the `Some` discriminant.
+    some_tag: i64,
+    /// Tagged layout only: the `None` discriminant.
+    none_tag: i64,
+    /// Tagged layout only: the payload field's index in the tagged struct.
+    payload_idx: u32,
+}
+
+/// Recognize a field type that is a monomorphized `Optional[T]` instance (by its
+/// mangled name `Optional` / `Optional$…`) and return its layout, else `None`.
+fn optional_layout(ctx: &StructCtx, fty: Ty) -> Option<OptionalLayout> {
+    let Ty::Struct(sid) = fty else {
+        return None;
+    };
+    let name = ctx.names.get(sid as usize)?;
+    if name != "Optional" && !name.starts_with("Optional$") {
+        return None;
+    }
+    let e = ctx.enums.get(name)?;
+    if !e.is_sum {
+        return None;
+    }
+    if let Some(n) = &e.niche {
+        return Some(OptionalLayout {
+            sid,
+            payload_ty: n.payload,
+            niche: true,
+            some_tag: 0,
+            none_tag: 0,
+            payload_idx: 0,
+        });
+    }
+    let some = e.variant("Some")?;
+    let none = e.variant("None")?;
+    let (_, pidx, pty) = some.fields.first()?;
+    Some(OptionalLayout {
+        sid,
+        payload_ty: *pty,
+        niche: false,
+        some_tag: some.tag,
+        none_tag: none.tag,
+        payload_idx: *pidx,
+    })
+}
+
+/// Emit IR constructing `Optional.None` for `opt`.
+fn gen_opt_none(b: &mut FnLower, opt: &OptionalLayout) -> Value {
+    let dest = b.new_value(Ty::Struct(opt.sid));
+    if opt.niche {
+        b.emit(Inst::NullConst { dest });
+    } else {
+        b.emit(Inst::StructNew { dest, sid: opt.sid });
+        let tag = b.iconst(Ty::I32, opt.none_tag);
+        b.emit(Inst::FieldSet {
+            base: dest,
+            sid: opt.sid,
+            idx: 0,
+            val: tag,
+        });
+    }
+    dest
+}
+
+/// Emit IR constructing `Optional.Some(inner)` (inner already typed
+/// `opt.payload_ty`).
+fn gen_opt_some(b: &mut FnLower, opt: &OptionalLayout, inner: Value) -> Value {
+    if opt.niche {
+        // The enum value IS the payload pointer; reinterpret via a slot so the
+        // result carries the enum's ZIR type.
+        let slot = b.alloca(Ty::Struct(opt.sid));
+        b.store(slot, inner);
+        return b.load(slot, Ty::Struct(opt.sid));
+    }
+    let dest = b.new_value(Ty::Struct(opt.sid));
+    b.emit(Inst::StructNew { dest, sid: opt.sid });
+    let tag = b.iconst(Ty::I32, opt.some_tag);
+    b.emit(Inst::FieldSet {
+        base: dest,
+        sid: opt.sid,
+        idx: 0,
+        val: tag,
+    });
+    b.emit(Inst::FieldSet {
+        base: dest,
+        sid: opt.sid,
+        idx: opt.payload_idx,
+        val: inner,
+    });
+    dest
+}
+
+/// Emit IR extracting the `Some` payload (typed `opt.payload_ty`) from a
+/// known-`Some` Optional value `fv`.
+fn gen_opt_payload(b: &mut FnLower, opt: &OptionalLayout, fv: Value) -> Value {
+    if opt.niche {
+        // `fv` physically IS the payload pointer; reinterpret via a slot.
+        let slot = b.alloca(opt.payload_ty);
+        b.store(slot, fv);
+        return b.load(slot, opt.payload_ty);
+    }
+    let d = b.new_value(opt.payload_ty);
+    b.emit(Inst::FieldGet {
+        dest: d,
+        base: fv,
+        sid: opt.sid,
+        idx: opt.payload_idx,
+    });
+    d
+}
+
+/// Emit IR computing `i1` = whether Optional value `fv` is `None`.
+fn gen_opt_is_none(b: &mut FnLower, opt: &OptionalLayout, fv: Value) -> Value {
+    if opt.niche {
+        let d = b.new_value(Ty::I1);
+        b.emit(Inst::IsNull { dest: d, val: fv });
+        return d;
+    }
+    let tag = b.new_value(Ty::I32);
+    b.emit(Inst::FieldGet {
+        dest: tag,
+        base: fv,
+        sid: opt.sid,
+        idx: 0,
+    });
+    let k = b.iconst(Ty::I32, opt.none_tag);
+    b.binop(AstBin::Eq, tag, Ty::I32, k, Ty::I32)
+        .expect("i32 equality is always valid")
+        .0
+}
+
 /// `@derive(Json)` encode direction (D-0059, I#100): a `Struct__to_json(self)
 /// -> str` method producing the struct's compact JSON object,
 /// `{"f0":v0,"f1":v1,...}`. Field names are identifiers (no escaping needed);
@@ -1675,28 +1819,78 @@ fn gen_json_to_method(
     let sname = ctx.names[sid as usize].clone();
     let name = format!("{sname}__to_json");
     let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, true, sigs, ctx);
-    let mut acc = b.strconst("{");
+    // Collect each *present* field's `"name":value` fragment into a list, then
+    // comma-join and brace-wrap. A list (rather than a static `idx>0` comma rule)
+    // lets an `Optional` field omit itself when `None` with no dangling comma
+    // (I#165, D-0065). `zap_csv_join` is a plain comma-join over `list[str]`.
+    let parts = b.new_value(Ty::List(Elem::Ptr));
+    b.emit(Inst::Call {
+        dest: Some(parts),
+        func: "zap_list_new".to_string(),
+        args: vec![],
+    });
     let fields = ctx.fields[sid as usize].clone();
     for (idx, (fname, fty)) in fields.iter().enumerate() {
-        if idx > 0 {
-            let sep = b.strconst(",");
-            acc = gen_concat(&mut b, acc, sep);
-        }
         // A field name is a Zap identifier, so it needs no JSON escaping.
-        let label = b.strconst(&format!("\"{fname}\":"));
-        acc = gen_concat(&mut b, acc, label);
-        let fv = b.new_value(*fty);
-        b.emit(Inst::FieldGet {
-            dest: fv,
-            base: 0,
-            sid,
-            idx: idx as u32,
-        });
-        let vstr = gen_json_encode_field(&mut b, fv, *fty, ctx)?;
-        acc = gen_concat(&mut b, acc, vstr);
+        let label = format!("\"{fname}\":");
+        if let Some(opt) = optional_layout(ctx, *fty) {
+            // `Optional[T]` field: emit `"name":<inner>` only when `Some`; a
+            // `None` omits the key entirely (D-0065 dumps rule).
+            let fv = b.new_value(*fty);
+            b.emit(Inst::FieldGet {
+                dest: fv,
+                base: 0,
+                sid,
+                idx: idx as u32,
+            });
+            let is_none = gen_opt_is_none(&mut b, &opt, fv);
+            let write_bb = b.new_block();
+            let cont_bb = b.new_block();
+            b.set_term(Term::BrIf {
+                cond: is_none,
+                then_bb: cont_bb,
+                else_bb: write_bb,
+            });
+            b.position(write_bb);
+            let payload = gen_opt_payload(&mut b, &opt, fv);
+            let vstr = gen_json_encode_field(&mut b, payload, opt.payload_ty, ctx)?;
+            let lbl = b.strconst(&label);
+            let frag = gen_concat(&mut b, lbl, vstr);
+            b.emit(Inst::Call {
+                dest: None,
+                func: "zap_list_push_ptr".to_string(),
+                args: vec![parts, frag],
+            });
+            b.set_term(Term::Br(cont_bb));
+            b.position(cont_bb);
+        } else {
+            let fv = b.new_value(*fty);
+            b.emit(Inst::FieldGet {
+                dest: fv,
+                base: 0,
+                sid,
+                idx: idx as u32,
+            });
+            let vstr = gen_json_encode_field(&mut b, fv, *fty, ctx)?;
+            let lbl = b.strconst(&label);
+            let frag = gen_concat(&mut b, lbl, vstr);
+            b.emit(Inst::Call {
+                dest: None,
+                func: "zap_list_push_ptr".to_string(),
+                args: vec![parts, frag],
+            });
+        }
     }
+    let body = b.new_value(Ty::Ptr);
+    b.emit(Inst::Call {
+        dest: Some(body),
+        func: "zap_csv_join".to_string(),
+        args: vec![parts],
+    });
+    let open = b.strconst("{");
+    let acc = gen_concat(&mut b, open, body);
     let close = b.strconst("}");
-    acc = gen_concat(&mut b, acc, close);
+    let acc = gen_concat(&mut b, acc, close);
     b.set_term(Term::Ret(Some(acc)));
     Ok(b.func)
 }
@@ -1708,6 +1902,17 @@ fn gen_json_encode_field(
     fty: Ty,
     ctx: &StructCtx,
 ) -> Result<Value, LowerError> {
+    // An `Optional[T]` is handled one level up (object-field omit on `None`); a
+    // nested `Optional` *payload* (`Optional[Optional[T]]`) has no value-position
+    // JSON form here yet — reject it clearly instead of miscompiling into a call
+    // to the Optional instance's non-existent encoder.
+    if optional_layout(ctx, fty).is_some() {
+        return Err(err(
+            "@derive(Json) does not support a nested Optional[...] payload yet \
+             (an Optional[T] json field's T must be a scalar, str, or nested \
+             @derive(Json) struct)",
+        ));
+    }
     let call1 = |b: &mut FnLower, func: &str, arg: Value| -> Value {
         let d = b.new_value(Ty::Ptr);
         b.emit(Inst::Call {
@@ -1822,7 +2027,11 @@ fn gen_json_from_value_method(
             func: "__json_field".to_string(),
             args: vec![0, key],
         });
-        let val = gen_json_decode_field(&mut b, jf, *fty, ctx)?;
+        let val = if let Some(opt) = optional_layout(ctx, *fty) {
+            gen_json_decode_optional(&mut b, jf, jv_sid, &opt, ctx)?
+        } else {
+            gen_json_decode_field(&mut b, jf, *fty, ctx)?
+        };
         b.emit(Inst::FieldSet {
             base: dest,
             sid,
@@ -1832,6 +2041,63 @@ fn gen_json_from_value_method(
     }
     b.set_term(Term::Ret(Some(dest)));
     Ok(b.func)
+}
+
+/// Decode an `Optional[T]` field (I#165, D-0065): an **absent key** (`__json_field`
+/// yields a null pointer on a dict miss) or an **explicit JSON `null`** (a present
+/// `JsonValue.Null`, tag 0) decodes to `Optional.None`; any other present value
+/// decodes to `Optional.Some(decode(v))`. The `IsNull` test is done first so the
+/// tag is never read off the absent-key null pointer.
+fn gen_json_decode_optional(
+    b: &mut FnLower,
+    jf: Value,
+    jv_sid: u32,
+    opt: &OptionalLayout,
+    ctx: &StructCtx,
+) -> Result<Value, LowerError> {
+    let slot = b.alloca(Ty::Struct(opt.sid));
+    let isnull = b.new_value(Ty::I1);
+    b.emit(Inst::IsNull {
+        dest: isnull,
+        val: jf,
+    });
+    let none_bb = b.new_block();
+    let checktag_bb = b.new_block();
+    let some_bb = b.new_block();
+    let join_bb = b.new_block();
+    // Absent key (null pointer) → None; otherwise inspect the present value.
+    b.set_term(Term::BrIf {
+        cond: isnull,
+        then_bb: none_bb,
+        else_bb: checktag_bb,
+    });
+    // Present value: explicit JSON `null` is the Null variant (tag 0).
+    b.position(checktag_bb);
+    let tag = b.new_value(Ty::I32);
+    b.emit(Inst::FieldGet {
+        dest: tag,
+        base: jf,
+        sid: jv_sid,
+        idx: 0,
+    });
+    let zero = b.iconst(Ty::I32, 0);
+    let (istag0, _) = b.binop(AstBin::Eq, tag, Ty::I32, zero, Ty::I32)?;
+    b.set_term(Term::BrIf {
+        cond: istag0,
+        then_bb: none_bb,
+        else_bb: some_bb,
+    });
+    b.position(none_bb);
+    let noneval = gen_opt_none(b, opt);
+    b.store(slot, noneval);
+    b.set_term(Term::Br(join_bb));
+    b.position(some_bb);
+    let inner = gen_json_decode_field(b, jf, opt.payload_ty, ctx)?;
+    let someval = gen_opt_some(b, opt, inner);
+    b.store(slot, someval);
+    b.set_term(Term::Br(join_bb));
+    b.position(join_bb);
+    Ok(b.load(slot, Ty::Struct(opt.sid)))
 }
 
 /// The prelude `JsonValue` enum's struct id (its tagged-struct layout).
@@ -1851,6 +2117,17 @@ fn gen_json_decode_field(
     fty: Ty,
     ctx: &StructCtx,
 ) -> Result<Value, LowerError> {
+    // A top-level `Optional[T]` field is handled by `gen_json_decode_optional`; a
+    // nested `Optional` payload (`Optional[Optional[T]]`) is not supported yet —
+    // reject it clearly rather than treat it as a nested struct and emit a call to
+    // the Optional instance's non-existent decoder.
+    if optional_layout(ctx, fty).is_some() {
+        return Err(err(
+            "@derive(Json) does not support a nested Optional[...] payload yet \
+             (an Optional[T] json field's T must be a scalar, str, or nested \
+             @derive(Json) struct)",
+        ));
+    }
     let call1 = |b: &mut FnLower, func: &str, ret: Ty, arg: Value| -> Value {
         let d = b.new_value(ret);
         b.emit(Inst::Call {
@@ -5924,7 +6201,7 @@ impl<'a> FnLower<'a> {
         }
         let sid = info.sid.expect("tier-3 enum has a struct id");
         // Niche optimization (I#154, D-0064 #4): the payload-free variant of a
-        // niche enum is the null pointer (`Option.None`), typed as the enum so
+        // niche enum is the null pointer (`Optional.None`), typed as the enum so
         // method dispatch still resolves.
         if info.niche.is_some() {
             let dest = self.new_value(Ty::Struct(sid));
@@ -5961,7 +6238,7 @@ impl<'a> FnLower<'a> {
             .clone();
         let sid = info.sid.expect("tier-3 enum has a struct id");
         // Niche optimization (I#154, D-0064 #4): the one-field variant of a niche
-        // enum (`Option.Some(p)`) IS the payload pointer — no allocation, no tag.
+        // enum (`Optional.Some(p)`) IS the payload pointer — no allocation, no tag.
         // The value keeps the enum's ZIR type so method dispatch resolves; it is
         // physically the payload pointer (both are opaque pointers to codegen).
         if let Some(n) = &info.niche {

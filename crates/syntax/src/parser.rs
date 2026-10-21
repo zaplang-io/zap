@@ -89,43 +89,43 @@ value struct DateTime:
     int64 minute
     int64 second
 
-enum Option[T]:
+enum Optional[T]:
     Some(T value)
     None
 
     def is_some(self) -> bool:
         match self:
-            case Option.Some(v):
+            case Optional.Some(v):
                 return True
-            case Option.None:
+            case Optional.None:
                 return False
 
     def is_none(self) -> bool:
         match self:
-            case Option.Some(v):
+            case Optional.Some(v):
                 return False
-            case Option.None:
+            case Optional.None:
                 return True
 
     def unwrap(self) -> T:
         match self:
-            case Option.Some(v):
+            case Optional.Some(v):
                 return v
-            case Option.None:
-                raise \"called unwrap on an Option.None value\"
+            case Optional.None:
+                raise \"called unwrap on an Optional.None value\"
 
     def unwrap_or(self, T fallback) -> T:
         match self:
-            case Option.Some(v):
+            case Optional.Some(v):
                 return v
-            case Option.None:
+            case Optional.None:
                 return fallback
 
-    def and_opt[U](self, Option[U] other) -> Option[U]:
+    def and_opt[U](self, Optional[U] other) -> Optional[U]:
         match self:
-            case Option.Some(v):
+            case Optional.Some(v):
                 return other
-            case Option.None:
+            case Optional.None:
                 return None
 
 enum JsonValue:
@@ -445,9 +445,9 @@ fn references_prelude(module: &Module) -> bool {
         "\"JsonScanner\"",
         "\"yaml\"",
         "\"Yaml\"",
-        // The generic `Option[T]` ships in the prelude (I#154, D-0064); inject it
-        // for any program that names it.
-        "\"Option\"",
+        // The generic `Optional[T]` ships in the prelude (I#154, D-0064/D-0065);
+        // inject it for any program that names it.
+        "\"Optional\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
@@ -626,9 +626,9 @@ impl Parser {
 
     /// A member name in a `.name` position or an `Enum.Variant` pattern path.
     /// Accepts an ordinary identifier, plus the `None` keyword — `None` doubles
-    /// as the conventional empty-variant name of `Option[T]` and similar sum
-    /// types (I#154 Fork O), so `opt.None` / `case Option.None:` must read it as a
-    /// member rather than the null literal.
+    /// as the conventional empty-variant name of `Optional[T]` and similar sum
+    /// types (I#154 Fork O), so `opt.None` / `case Optional.None:` must read it as
+    /// a member rather than the null literal.
     fn member_name(&mut self, what: &str) -> String {
         if self.is_kw(Keyword::None) {
             self.bump();
@@ -921,7 +921,7 @@ impl Parser {
             }
             let vstart = self.peek_span().start;
             // `None` is a keyword (the null literal) but is also the conventional
-            // empty-variant name for `Option[T]` and similar sum types (I#154
+            // empty-variant name for `Optional[T]` and similar sum types (I#154
             // Fork O); accept it here as a variant name.
             let vname = if self.is_kw(Keyword::None) {
                 self.bump();
@@ -2840,7 +2840,7 @@ mod tests {
         // Type params on struct/enum/fn, and an optional interface bound that is
         // parsed and carried now (I#154 Fork B); enforcement is deferred.
         let m = parse_ok(
-            "struct Box[T]:\n    T value\nenum Option[T]:\n    Some(T value)\n    None\n\
+            "struct Box[T]:\n    T value\nenum Optional[T]:\n    Some(T value)\n    None\n\
              def max_of[T: Ordered, U](T a, U b) -> T:\n    return a\n",
         );
         let Item::Struct(s) = &m.items[0] else {

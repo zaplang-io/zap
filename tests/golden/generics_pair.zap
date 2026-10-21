@@ -1,6 +1,6 @@
 # A user generic struct Pair[A, B] instantiated at TWO different type-arg sets
 # (proves monomorphization produces distinct concrete layouts) with a repeat of
-# the first set (proves dedup), plus a nested generic Option[Pair[int64, str]].
+# the first set (proves dedup), plus a nested generic Optional[Pair[int64, str]].
 struct Pair[A, B]:
     A first
     B second
@@ -18,10 +18,10 @@ def main():
     print(q.get_first())
     print(q.get_second())
     print(r.get_first())
-    Option[Pair[int64, str]] op = Option.Some(Pair(9, "nested"))
+    Optional[Pair[int64, str]] op = Optional.Some(Pair(9, "nested"))
     match op:
-        case Option.Some(pp):
+        case Optional.Some(pp):
             print(pp.get_first())
             print(pp.get_second())
-        case Option.None:
+        case Optional.None:
             print("none")

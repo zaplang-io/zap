@@ -1,0 +1,13 @@
+ada
+36
+countess
+{"name":"ada","age":36,"nick":"countess"}
+age-none
+nick-none
+{"name":"bob"}
+r-age-none
+r-nick-none
+{"name":"cas"}
+7
+s-nick-none
+{"name":"dot","age":7}
