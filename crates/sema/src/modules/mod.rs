@@ -39,6 +39,7 @@ mod runtime;
 mod signal;
 mod sync;
 mod sys;
+mod threading;
 mod time;
 mod tls;
 mod yaml;
@@ -82,6 +83,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     zlib::MODULE,
     gzip::MODULE,
     sync::MODULE,
+    threading::MODULE,
     net::MODULE,
     http::MODULE,
     tls::MODULE,

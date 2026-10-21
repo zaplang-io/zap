@@ -40,6 +40,7 @@ mod signal;
 mod support;
 mod sync;
 mod sys;
+mod threading;
 mod time;
 mod tls;
 mod yaml;
@@ -87,6 +88,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     zlib::MODULE,
     gzip::MODULE,
     sync::MODULE,
+    threading::MODULE,
     net::MODULE,
     http::MODULE,
     tls::MODULE,

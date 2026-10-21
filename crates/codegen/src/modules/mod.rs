@@ -35,6 +35,7 @@ mod runtime;
 mod signal;
 mod sync;
 mod sys;
+mod threading;
 mod time;
 mod tls;
 mod yaml;
@@ -67,6 +68,7 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     zlib::declare_rt(cg);
     gzip::declare_rt(cg);
     sync::declare_rt(cg);
+    threading::declare_rt(cg);
     net::declare_rt(cg);
     http::declare_rt(cg);
     tls::declare_rt(cg);

@@ -158,6 +158,42 @@ struct Atomic[T]:
     def compare_and_swap(self, T old, T new) -> bool:
         return False
 
+# threading (I#175) — Python-`threading`-shaped OS-thread compat (migration
+# escape hatch, NOT recommended; idiomatic Zap = coroutines + channels). A
+# `Thread` runs its target on a dedicated OS thread beyond MAXPROCS by pinning
+# its coroutine via the #172 LockOSThread substrate, so it still participates in
+# precise-GC stop-the-world + safepoints and roots through the shadow stack. The
+# method bodies delegate to the `threading` module's flat runtime entry points.
+struct Thread:
+    fn() _target
+    bytes _handle
+    bool _daemon
+
+    def start(self):
+        # Register liveness synchronously (before the coroutine runs, so a
+        # non-daemon thread has no exit race), then launch the pinned trampoline.
+        threading._register(self._handle, self._daemon)
+        spawn detached __thread_entry(self._target, self._handle, self._daemon)
+
+    def join(self):
+        threading._join(self._handle)
+
+    def join_timeout(self, float64 timeout) -> bool:
+        return threading._join_timeout(self._handle, timeout)
+
+    def is_alive(self) -> bool:
+        return threading._is_alive(self._handle)
+
+# The thread body: pin to a dedicated OS thread, run the target, and always
+# publish completion + unpin (even if the target raises).
+def __thread_entry(fn() target, bytes handle, bool daemon):
+    threading._pin()
+    try:
+        target()
+    finally:
+        threading._unpin()
+        threading._finish(handle, daemon)
+
 enum JsonValue:
     Null
     Bool(bool b)
@@ -480,6 +516,11 @@ fn references_prelude(module: &Module) -> bool {
         "\"Optional\"",
         // The generic `Atomic[T]` sync primitive ships in the prelude (I#176).
         "\"Atomic\"",
+        // The `threading` OS-thread compat surface (I#175): `Thread` and the
+        // other primitive wrappers ship in the prelude, injected for any program
+        // that names the module or a wrapper type.
+        "\"threading\"",
+        "\"Thread\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
