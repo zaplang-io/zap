@@ -220,6 +220,13 @@ pub enum Ty {
     /// from `Ptr` so lowering can route attribute/call dispatch and marshaling
     /// through the Python runtime (`zap_py_*`). Maps to `ptr` in codegen.
     Py,
+    /// A **first-class function value** `fn(T, U) -> R` (I#163). Physically a
+    /// pointer to a heap *closure record* `{code_ptr, captures…}` (code at
+    /// offset 0); a bare top-level function used as a value is wrapped so it has
+    /// the same shape. The `u32` indexes [`Module::fn_sigs`] for the call
+    /// signature (params + return), which lowering needs to build the indirect
+    /// call. Maps to `ptr` in codegen and is a GC-traced reference (`is_ptr`).
+    Func(u32),
     Void,
 }
 
@@ -519,6 +526,37 @@ pub enum Inst {
         dest: Value,
         func: String,
     },
+    /// Build a **first-class function value** (I#163): a closure record whose
+    /// code pointer is the top-level function `func` (a wrapper for a bare
+    /// function, or a lifted lambda body — both take the env record as their
+    /// implicit param 0) and whose captured free variables are `captures`, in
+    /// order. `env_sid` is the record's struct layout `{code_ptr, cap_tys…}`
+    /// (field 0 is the code pointer, captures follow). `dest : Func(sig)` is a
+    /// pointer to the freshly heap-allocated record. A captureless value (a bare
+    /// function, or a non-capturing lambda) has `captures` empty — the record is
+    /// just `{code_ptr}`. The record is GC-managed; the precise collector scans
+    /// its pointer captures via the record's type descriptor.
+    ClosureMake {
+        dest: Value,
+        func: String,
+        env_sid: u32,
+        captures: Vec<Value>,
+    },
+    /// **Indirect call** through a function value (I#163): load the code pointer
+    /// from `callee`'s record (field 0) and call it, passing the record itself
+    /// as the implicit env (`self`) followed by `args`. `params`/`ret` are the
+    /// value's signature (excluding the env) — codegen builds the callee type
+    /// `abi(ret) (ptr env, abi(params)…)`. When `unwind` is set the call is on an
+    /// exception edge (inside a `try`): it lowers to an `invoke` transferring to
+    /// that landing pad, mirroring [`Inst::Call`] vs [`Inst::Invoke`].
+    CallClosure {
+        dest: Option<Value>,
+        callee: Value,
+        args: Vec<Value>,
+        params: Vec<Ty>,
+        ret: Ty,
+        unwind: Option<BlockId>,
+    },
     /// Materialize an **interface value** (the `{data, itable}` fat pointer,
     /// D-0016, `design/0006` §2.4): wrap a concrete instance `data` as a value of
     /// interface `iid`. `dest : Struct(fat_sid)` is the interface's synthetic
@@ -704,10 +742,23 @@ pub struct InterfaceLayout {
     pub fat_sid: u32,
 }
 
+/// The call signature of a first-class function value (I#163): the parameter
+/// types and return type of a `fn(T, U) -> R`, **excluding** the implicit
+/// closure-environment pointer (ZIR param 0 of the code pointer). Interned in
+/// [`Module::fn_sigs`] and referenced by [`Ty::Func`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FnSig {
+    pub params: Vec<Ty>,
+    pub ret: Ty,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Module {
     pub structs: Vec<StructLayout>,
     pub funcs: Vec<Func>,
+    /// Interned first-class function-value signatures (I#163), indexed by the
+    /// `u32` in [`Ty::Func`]. Empty when the program has no function values.
+    pub fn_sigs: Vec<FnSig>,
     /// Structural interfaces (D-0016); indexed by interface id (`iid`). Empty
     /// when the program declares no interfaces.
     pub interfaces: Vec<InterfaceLayout>,
@@ -736,6 +787,7 @@ impl fmt::Display for Ty {
             Ty::Heap(e) => return write!(f, "heap[{}]", e.val_suffix()),
             Ty::Array(d) => return write!(f, "array[{}]", d.suffix()),
             Ty::Chan(e) => return write!(f, "chan[{}]", e.val_suffix()),
+            Ty::Func(idx) => return write!(f, "fn#{idx}"),
         };
         f.write_str(s)
     }
@@ -871,6 +923,35 @@ fn fmt_inst(i: &Inst) -> String {
             format!("spawn{own} @{func}({})", a.join(", "))
         }
         Inst::FuncAddr { dest, func } => format!("%{dest} = funcaddr @{func}"),
+        Inst::ClosureMake {
+            dest,
+            func,
+            env_sid,
+            captures,
+        } => {
+            let c: Vec<String> = captures.iter().map(|v| format!("%{v}")).collect();
+            format!(
+                "%{dest} = closure @{func} struct#{env_sid} [{}]",
+                c.join(", ")
+            )
+        }
+        Inst::CallClosure {
+            dest,
+            callee,
+            args,
+            unwind,
+            ..
+        } => {
+            let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
+            let uw = match unwind {
+                Some(bb) => format!(" unwind bb{bb}"),
+                None => String::new(),
+            };
+            match dest {
+                Some(d) => format!("%{d} = callclosure %{callee}({}){uw}", a.join(", ")),
+                None => format!("callclosure %{callee}({}){uw}", a.join(", ")),
+            }
+        }
         Inst::IfaceMake {
             dest,
             data,

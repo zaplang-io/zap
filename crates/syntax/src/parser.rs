@@ -1730,6 +1730,38 @@ impl Parser {
 
     fn parse_type(&mut self) -> Type {
         let start = self.peek_span().start;
+        // Function value type `fn(T, U) -> R` (I#163, grammar `func_type`). `fn`
+        // is a soft keyword, recognized only here in type position (and only when
+        // followed by `(`), so it stays a usable identifier everywhere else.
+        if matches!(self.peek(), TokenKind::Ident(n) if n == "fn")
+            && *self.peek2() == TokenKind::LParen
+        {
+            self.bump(); // `fn`
+            self.expect(&TokenKind::LParen, "'('");
+            let mut params = Vec::new();
+            if !self.is(&TokenKind::RParen) {
+                loop {
+                    params.push(self.parse_type());
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                    if self.is(&TokenKind::RParen) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&TokenKind::RParen, "')'");
+            let ret = if self.eat(&TokenKind::Arrow) {
+                Some(Box::new(self.parse_type()))
+            } else {
+                None
+            };
+            return Type::Func {
+                params,
+                ret,
+                span: self.span_from(start),
+            };
+        }
         if self.eat(&TokenKind::LParen) {
             let mut elems = Vec::new();
             if !self.is(&TokenKind::RParen) {

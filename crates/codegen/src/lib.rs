@@ -243,12 +243,14 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | LandingPad { dest, .. }
         | ArrayBinOp { dest, .. }
         | FuncAddr { dest, .. }
+        | ClosureMake { dest, .. }
         | IfaceMake { dest, .. }
         | AtomicLoad { dest, .. }
         | AtomicRmw { dest, .. }
         | AtomicCas { dest, .. } => Some(*dest),
         Call { dest, .. }
         | Invoke { dest, .. }
+        | CallClosure { dest, .. }
         | IfaceCall { dest, .. }
         | IfaceInvoke { dest, .. } => *dest,
         _ => None,
@@ -1175,6 +1177,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Array(_)
             | Ty::Chan(_)
             | Ty::Match
+            | Ty::Func(_)
             | Ty::Py => self.ctx.ptr_type(AddressSpace::default()).into(),
         }
     }
@@ -1964,6 +1967,147 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .ok_or_else(|| format!("address of unknown function '{func}'"))?;
                 let p = fv.as_global_value().as_pointer_value();
                 vals[*dest as usize] = Some(p.into());
+            }
+            Inst::ClosureMake {
+                dest,
+                func,
+                env_sid,
+                captures,
+            } => {
+                // Build a first-class function value (I#163): a GC-heap closure
+                // record `{code_ptr, captures…}`. Field 0 holds the code pointer
+                // (the lifted-lambda body or a bare-function wrapper); the rest
+                // are the captured free variables. The precise collector scans
+                // the record via its type descriptor (the code pointer is
+                // non-heap, so it is never traced; captures are traced by their
+                // ZIR pointer-kind).
+                let code_fn = *self
+                    .fns
+                    .get(func)
+                    .ok_or_else(|| format!("closure of unknown function '{func}'"))?;
+                let code_ptr = code_fn.as_global_value().as_pointer_value();
+                let env_struct = self.structs[*env_sid as usize];
+                let env_cs = if Self::GC_IMMIX {
+                    #[cfg(feature = "gc-immix")]
+                    {
+                        let mut flags = Vec::with_capacity(captures.len() + 1);
+                        flags.push(false); // code pointer word: never traced
+                        for c in captures {
+                            flags.push(f.value_types[*c as usize].is_ptr());
+                        }
+                        let desc = self.emit_precise_desc(
+                            env_struct,
+                            &flags,
+                            &format!("zap.desc.closure.{env_sid}"),
+                        );
+                        let alloc = self.fns["zap_alloc_typed"];
+                        b.build_call(alloc, &[desc.into()], "closure")
+                            .map_err(|e| e.to_string())?
+                    }
+                    #[cfg(not(feature = "gc-immix"))]
+                    unreachable!()
+                } else {
+                    let size = env_struct
+                        .size_of()
+                        .ok_or_else(|| "closure record has no size".to_string())?;
+                    let alloc = self.fns["zap_alloc"];
+                    b.build_call(alloc, &[size.into()], "closure")
+                        .map_err(|e| e.to_string())?
+                };
+                let env = env_cs
+                    .try_as_basic_value()
+                    .left()
+                    .ok_or_else(|| "closure alloc returned no value".to_string())?
+                    .into_pointer_value();
+                let code_slot = b
+                    .build_struct_gep(env_struct, env, 0, "closure.code")
+                    .map_err(|e| e.to_string())?;
+                b.build_store(code_slot, code_ptr)
+                    .map_err(|e| e.to_string())?;
+                for (i, c) in captures.iter().enumerate() {
+                    let fp = b
+                        .build_struct_gep(env_struct, env, (i + 1) as u32, "closure.cap")
+                        .map_err(|_| "invalid closure capture index".to_string())?;
+                    let v = get(vals, *c);
+                    // A captured by-value aggregate (value struct / tuple) is
+                    // stored by value — an independent copy that outlives the
+                    // capturing frame — so load it from its pointer first.
+                    let v = match env_struct.get_field_type_at_index((i + 1) as u32) {
+                        Some(ft) => self.abi_arg(ft, v)?,
+                        None => v,
+                    };
+                    b.build_store(fp, v).map_err(|e| e.to_string())?;
+                }
+                vals[*dest as usize] = Some(env.into());
+            }
+            Inst::CallClosure {
+                dest,
+                callee,
+                args,
+                params,
+                ret,
+                unwind,
+            } => {
+                // Indirect call through a function value (I#163): load the code
+                // pointer from the closure record (field 0, at offset 0) and call
+                // it, passing the record itself as the implicit env followed by
+                // the arguments. The callee type is built from the value's
+                // signature.
+                let p = self.ctx.ptr_type(AddressSpace::default());
+                let closure = get(vals, *callee).into_pointer_value();
+                let code = b
+                    .build_load(p, closure, "closure.code")
+                    .map_err(|e| e.to_string())?
+                    .into_pointer_value();
+                let mut param_tys: Vec<BasicMetadataTypeEnum> = vec![p.into()];
+                for t in params {
+                    param_tys.push(self.abi_ty(*t).into());
+                }
+                let fnty = if *ret == Ty::Void {
+                    self.ctx.void_type().fn_type(&param_tys, false)
+                } else {
+                    self.abi_ty(*ret).fn_type(&param_tys, false)
+                };
+                let mut argvals: Vec<BasicValueEnum> = Vec::with_capacity(args.len() + 1);
+                argvals.push(closure.into());
+                for (i, a) in args.iter().enumerate() {
+                    let v = get(vals, *a);
+                    let v = match params.get(i) {
+                        Some(t) => self.abi_arg(self.abi_ty(*t), v)?,
+                        None => v,
+                    };
+                    argvals.push(v);
+                }
+                if let Some(uw) = unwind {
+                    let cont = self.ctx.append_basic_block(fv, "callclosure.cont");
+                    let cs = b
+                        .build_indirect_invoke(
+                            fnty,
+                            code,
+                            &argvals,
+                            cont,
+                            blocks[*uw as usize],
+                            "callclosure",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    b.position_at_end(cont);
+                    if let Some(d) = dest {
+                        if let Some(v) = cs.try_as_basic_value().left() {
+                            vals[*d as usize] = Some(self.abi_result(v)?);
+                        }
+                    }
+                } else {
+                    let md: Vec<BasicMetadataValueEnum> =
+                        argvals.iter().map(|v| (*v).into()).collect();
+                    let cs = b
+                        .build_indirect_call(fnty, code, &md, "callclosure")
+                        .map_err(|e| e.to_string())?;
+                    if let Some(d) = dest {
+                        if let Some(v) = cs.try_as_basic_value().left() {
+                            vals[*d as usize] = Some(self.abi_result(v)?);
+                        }
+                    }
+                }
             }
             Inst::IfaceMake {
                 dest,

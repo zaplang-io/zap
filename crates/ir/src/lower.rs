@@ -55,6 +55,18 @@ impl TupleInterner {
         sid
     }
 
+    /// Append a fresh anonymous aggregate layout **without deduplication**
+    /// (I#163): used for closure-environment records, which must never share an
+    /// id with a genuine tuple — an env is forced to a non-inline reference
+    /// struct, and sharing its id with a value-semantic tuple would corrupt the
+    /// tuple's ABI. Not inserted into the dedup map, so [`Self::intern`] never
+    /// returns this id for a matching tuple.
+    fn push_layout(&mut self, elems: Vec<Ty>) -> u32 {
+        let sid = self.base + self.layouts.len() as u32;
+        self.layouts.push(elems);
+        sid
+    }
+
     /// Whether `sid` names a tuple layout (vs a user struct / tier-3 enum).
     fn is_tuple(&self, sid: u32) -> bool {
         sid >= self.base && ((sid - self.base) as usize) < self.layouts.len()
@@ -66,6 +78,32 @@ impl TupleInterner {
             return None;
         }
         self.layouts.get((sid - self.base) as usize).cloned()
+    }
+}
+
+/// Interner for first-class function-value signatures (I#163). Maps a
+/// `(params, ret)` signature to the `u32` carried by [`Ty::Func`], deduplicated,
+/// and materialized into [`Module::fn_sigs`] after lowering.
+#[derive(Default)]
+struct FnSigInterner {
+    sigs: Vec<FnSig>,
+    map: HashMap<FnSig, u32>,
+}
+
+impl FnSigInterner {
+    fn intern(&mut self, params: Vec<Ty>, ret: Ty) -> u32 {
+        let sig = FnSig { params, ret };
+        if let Some(&idx) = self.map.get(&sig) {
+            return idx;
+        }
+        let idx = self.sigs.len() as u32;
+        self.map.insert(sig.clone(), idx);
+        self.sigs.push(sig);
+        idx
+    }
+
+    fn get(&self, idx: u32) -> &FnSig {
+        &self.sigs[idx as usize]
     }
 }
 
@@ -154,6 +192,10 @@ struct TyEnv<'a> {
     /// Interner for anonymous tuple layouts (D-0049), shared so every
     /// `(T, U, ...)` type resolves to the same struct id across the module.
     tuples: &'a RefCell<TupleInterner>,
+    /// Interner for first-class function-value signatures (I#163): a
+    /// `fn(T, U) -> R` annotation resolves to `Ty::Func(idx)` where `idx` is the
+    /// interned signature.
+    fn_sigs: &'a RefCell<FnSigInterner>,
 }
 
 /// Lower a type-checked module to ZIR.
@@ -189,6 +231,26 @@ struct StructCtx {
     /// A call `gen(args)` constructs the function's synthetic state struct
     /// instead of calling a function; see [`GeneratorInfo`].
     generators: HashMap<String, GeneratorInfo>,
+    /// Interned first-class function-value signatures (I#163), materialized into
+    /// [`Module::fn_sigs`] after lowering.
+    fn_sigs: RefCell<FnSigInterner>,
+    /// Closure records (I#163): compiler-generated lifted-lambda and
+    /// bare-function-wrapper ZIR functions, collected while lowering bodies and
+    /// appended to [`Module::funcs`] afterward.
+    generated: RefCell<Vec<Func>>,
+    /// Tuple-interner ids that are closure-environment records (I#163): forced
+    /// to non-inline reference structs in the inline post-pass (an env outlives
+    /// its creating frame and has shared identity, like a reference struct).
+    closure_env_sids: RefCell<Vec<u32>>,
+    /// Hands out distinct names for compiler-generated closure functions (I#163).
+    closure_counter: RefCell<u32>,
+    /// The shared `{code_ptr}` env-record struct id for captureless function
+    /// values (I#163), interned once and reused.
+    captureless_env: RefCell<Option<u32>>,
+    /// Bare top-level functions already wrapped as function values (I#163):
+    /// source name -> generated wrapper name, so `f` taken as a value reuses one
+    /// wrapper `f$fnval`.
+    fnval_wrappers: RefCell<HashMap<String, String>>,
 }
 
 /// A compiler-generated generator (I#67, D-0026/D-0048). A free `def` whose body
@@ -259,6 +321,7 @@ impl StructCtx {
             enums: &self.enums,
             ifaces: &self.ifaces,
             tuples: &self.tuples,
+            fn_sigs: &self.fn_sigs,
         }
     }
 
@@ -409,6 +472,8 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     // field/signature pre-passes and all body lowering, then its layouts are
     // appended to `Module::structs`.
     let tuples = RefCell::new(TupleInterner::new(names.len() as u32));
+    // First-class function-value signatures (I#163) interned during lowering.
+    let fn_sigs = RefCell::new(FnSigInterner::default());
 
     // Build the enum registry. For tier-1 enums, compute member discriminants
     // (explicit, else previous + 1 from 0). For tier-3 enums, lay out the tagged
@@ -470,6 +535,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                                     enums: &enums,
                                     ifaces: &ifaces,
                                     tuples: &tuples,
+                                    fn_sigs: &fn_sigs,
                                 },
                             )
                             .unwrap_or(Ty::Ptr);
@@ -534,6 +600,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             enums: &enums,
             ifaces: &ifaces,
             tuples: &tuples,
+            fn_sigs: &fn_sigs,
         };
         for item in &module.items {
             if let ast::Item::Struct(s) = item {
@@ -577,6 +644,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             enums: &enums,
             ifaces: &ifaces,
             tuples: &tuples,
+            fn_sigs: &fn_sigs,
         };
         for item in &module.items {
             if let ast::Item::Interface(i) = item {
@@ -641,6 +709,12 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         interfaces,
         fat_to_iid,
         generators: HashMap::new(),
+        fn_sigs,
+        generated: RefCell::new(Vec::new()),
+        closure_env_sids: RefCell::new(Vec::new()),
+        closure_counter: RefCell::new(0),
+        captureless_env: RefCell::new(None),
+        fnval_wrappers: RefCell::new(HashMap::new()),
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -869,6 +943,11 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         }
     }
 
+    // Append the compiler-generated closure functions (I#163): lifted lambda
+    // bodies and bare-function value wrappers, produced while lowering the bodies
+    // above. They are already fully lowered ZIR functions.
+    out.funcs.append(&mut ctx.generated.borrow_mut());
+
     // Append the interned tuple layouts (D-0049) after the named structs. Their
     // ids were handed out as `base + index` with `base == out.structs.len()`
     // here, so they line up positionally. A tuple is laid out exactly like an
@@ -911,6 +990,17 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 .collect(),
         });
     }
+
+    // Closure-environment records (I#163) are reference structs with shared
+    // identity that outlive their creating frame, so force them non-inline
+    // regardless of what the inline-eligibility pass decided (a one-word
+    // `{code_ptr}` env would otherwise be inlined and dangle).
+    for &sid in ctx.closure_env_sids.borrow().iter() {
+        out.structs[sid as usize].inline = false;
+    }
+
+    // Materialize the interned first-class function-value signatures (I#163).
+    out.fn_sigs = std::mem::take(&mut ctx.fn_sigs.borrow_mut().sigs);
 
     (out, errors)
 }
@@ -1010,7 +1100,20 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Ty::Struct(env.tuples.borrow_mut().intern(tys)))
         }
-        _ => Err(err("only named scalar types are supported by codegen yet")),
+        // A first-class function value `fn(T, U) -> R` (I#163): a pointer to a
+        // closure record, carrying its interned call signature so the indirect
+        // call can be built. A missing `-> R` is a `Void`-returning function.
+        ast::Type::Func { params, ret, .. } => {
+            let ptys = params
+                .iter()
+                .map(|p| resolve_ty(p, env))
+                .collect::<Result<Vec<_>, _>>()?;
+            let rty = match ret {
+                Some(r) => resolve_ty(r, env)?,
+                None => Ty::Void,
+            };
+            Ok(Ty::Func(env.fn_sigs.borrow_mut().intern(ptys, rty)))
+        }
     }
 }
 
@@ -1109,6 +1212,7 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
         | Ty::Array(_)
         | Ty::Chan(_)
         | Ty::Match
+        | Ty::Func(_)
         | Ty::Py => Ok(Elem::Ptr),
         Ty::F32 | Ty::F64 => Err(err(
             "collections of floating-point elements are not supported yet",
@@ -3507,12 +3611,19 @@ impl<'a> FnLower<'a> {
             Stmt::Let {
                 ty, name, value, ..
             } => {
-                let (v, vt) = self.expr(value)?;
-                let declared = match ty {
-                    Some(t) => resolve_ty(t, &self.ctx.tyenv())?,
-                    None => vt,
+                // With a `fn(...)` annotation, a `lambda` initializer is lowered
+                // against that type (I#163) — its parameter types come from the
+                // annotation. Otherwise lower-then-coerce as usual.
+                let (v, declared) = match ty {
+                    Some(t) => {
+                        let declared = resolve_ty(t, &self.ctx.tyenv())?;
+                        (self.expr_coerced(value, declared)?, declared)
+                    }
+                    None => {
+                        let (v, vt) = self.expr(value)?;
+                        (v, vt)
+                    }
                 };
-                let v = self.coerce(v, vt, declared);
                 // Value structs are copied on binding (D-0051): `T b = a` makes
                 // `b` an independent instance of the value aggregate.
                 let v = self.copy_if_value(v, declared, value);
@@ -3544,8 +3655,9 @@ impl<'a> FnLower<'a> {
                         .ctx
                         .field(sid, name)
                         .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
-                    let (v, vt) = self.expr(value)?;
-                    let v = self.coerce(v, vt, fty);
+                    // A `fn(...)` field accepts a lambda / bare function value
+                    // (I#163), lowered against the field type.
+                    let v = self.expr_coerced(value, fty)?;
                     // Storing a value struct into a field copies it (D-0051), so
                     // the field holds an independent instance.
                     let v = self.copy_if_value(v, fty, value);
@@ -3631,12 +3743,14 @@ impl<'a> FnLower<'a> {
             Stmt::Return { value, .. } => {
                 match value {
                     Some(e) => {
-                        let (v, vt) = self.expr(e)?;
                         let ret = self.func.ret;
+                        // `return <lambda>` in a `fn(...)`-returning function is
+                        // lowered against the return type (I#163) — this is how a
+                        // function builds and returns a closure over its locals.
                         let v = if ret == Ty::Void {
-                            v
+                            self.expr(e)?.0
                         } else {
-                            self.coerce(v, vt, ret)
+                            self.expr_coerced(e, ret)?
                         };
                         // Returning a value struct yields an instance independent
                         // of the callee's locals (D-0051). An inline-eligible
@@ -5352,6 +5466,12 @@ impl<'a> FnLower<'a> {
                 if let Some((ptr, ty)) = self.lookup(n) {
                     return Ok((self.load(ptr, ty), ty));
                 }
+                // A bare top-level function used as a **value** (I#163): `g(f)`,
+                // `[inc, dec]`, `return inc`. Wrap it as a first-class function
+                // value (a closure record whose code pointer calls the function).
+                if self.sigs.contains_key(n) && !self.ctx.generators.contains_key(n) {
+                    return self.fnval_of_name(n);
+                }
                 // A bare Python import alias (`import python "math" as m`) refers
                 // to the module handle; importing is idempotent (CPython caches),
                 // so a reference lowers to a `zap_py_import` (ticket #27, D-0012).
@@ -5550,6 +5670,14 @@ impl<'a> FnLower<'a> {
                      (I#67 v1): e.g. `yield x`, not inside a larger expression"),
             ),
             Expr::Yield { .. } => Err(err("'yield' outside a generator function (I#67)")),
+            // A lambda (I#163) needs a known function type to infer its parameter
+            // types; it is lowered where that type is available (a call argument,
+            // an annotated binding, or a `fn(...)`-returning `return`). A lambda
+            // in an un-annotated context cannot be typed.
+            Expr::Lambda { .. } => Err(err(
+                "cannot infer this lambda's type here; give it a function-typed \
+                 context, e.g. a `fn(T)->R` parameter, annotation, or return type",
+            )),
             _ => Err(err(
                 "this expression is not supported by codegen yet (Phase 1 slice)",
             )),
@@ -5924,15 +6052,24 @@ impl<'a> FnLower<'a> {
             if let Some((ptys, ret)) = self.sigs.get(fname).cloned() {
                 let mut argvals = Vec::new();
                 for (i, a) in args.iter().enumerate() {
-                    let (v, vt) = self.expr(&a.value)?;
-                    let target = *ptys.get(i).unwrap_or(&vt);
-                    let v = self.coerce(v, vt, target);
-                    // A value struct passed by value is copied (D-0051): the
-                    // callee's mutations do not escape to the caller. An inline-
-                    // eligible aggregate gets that copy from the register/sret
-                    // ABI; a non-inline value struct is deep-copied. See
-                    // `copy_for_pass`.
-                    let v = self.copy_for_pass(v, target, &a.value);
+                    // A function-typed parameter accepts a `lambda` literal or a
+                    // bare function name as a first-class value (I#163), lowered
+                    // against the declared parameter type.
+                    let v = match ptys.get(i) {
+                        Some(&target) => {
+                            let v = self.expr_coerced(&a.value, target)?;
+                            // A value struct passed by value is copied (D-0051):
+                            // the callee's mutations do not escape. An inline-
+                            // eligible aggregate gets that copy from the
+                            // register/sret ABI; a non-inline value struct is
+                            // deep-copied. See `copy_for_pass`.
+                            self.copy_for_pass(v, target, &a.value)
+                        }
+                        None => {
+                            let (v, vt) = self.expr(&a.value)?;
+                            self.copy_for_pass(v, vt, &a.value)
+                        }
+                    };
                     argvals.push(v);
                 }
                 let dest = if ret == Ty::Void {
@@ -5943,6 +6080,13 @@ impl<'a> FnLower<'a> {
                 self.throwing_call(dest, fname, argvals);
                 let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
                 return Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }));
+            }
+            // A first-class function value held in a local (I#163): `f(args)`
+            // where `f` is a variable of function type is an indirect call
+            // through its closure record.
+            if let Some((slot, Ty::Func(idx))) = self.lookup(fname) {
+                let cv = self.load(slot, Ty::Func(idx));
+                return self.lower_closure_call(cv, idx, args);
             }
             // A callable user struct held in a variable (D-0047): `f(args)` where
             // `f` is a struct value desugars to `f.__call__(args)`. `lookup`
@@ -6030,10 +6174,298 @@ impl<'a> FnLower<'a> {
             let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
             Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }))
         } else {
+            // A function value produced by an arbitrary expression (I#163),
+            // e.g. `(get_fn())(x)` or a list element `fns[i](x)`: evaluate the
+            // callee and, if it is a first-class function value, call indirectly.
+            let (cv, ct) = self.expr(callee)?;
+            if let Ty::Func(idx) = ct {
+                return self.lower_closure_call(cv, idx, args);
+            }
             Err(err(
                 "only direct function calls are supported by codegen yet",
             ))
         }
+    }
+
+    /// Lower an **indirect call** through a first-class function value (I#163):
+    /// coerce each argument to the value's signature and emit an
+    /// [`Inst::CallClosure`] (an `invoke` on an exception edge). `callee` is the
+    /// closure-record pointer; `sig_idx` indexes the interned signature.
+    fn lower_closure_call(
+        &mut self,
+        callee: Value,
+        sig_idx: u32,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let sig = self.ctx.fn_sigs.borrow().get(sig_idx).clone();
+        let mut argvals = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let v = match sig.params.get(i) {
+                Some(&target) => {
+                    let v = self.expr_coerced(&a.value, target)?;
+                    self.copy_for_pass(v, target, &a.value)
+                }
+                None => {
+                    let (v, vt) = self.expr(&a.value)?;
+                    self.copy_for_pass(v, vt, &a.value)
+                }
+            };
+            argvals.push(v);
+        }
+        let dest = if sig.ret == Ty::Void {
+            None
+        } else {
+            Some(self.new_value(sig.ret))
+        };
+        let unwind = self.landing_pads.last().copied();
+        if let Some(lp) = unwind {
+            self.used_lps.insert(lp);
+        }
+        self.emit(Inst::CallClosure {
+            dest,
+            callee,
+            args: argvals,
+            params: sig.params.clone(),
+            ret: sig.ret,
+            unwind,
+        });
+        let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
+        Ok((
+            rv,
+            if sig.ret == Ty::Void {
+                Ty::I32
+            } else {
+                sig.ret
+            },
+        ))
+    }
+
+    // --- first-class function values (I#163) ---
+
+    /// The shared `{code_ptr}` closure-record struct id for a captureless
+    /// function value, interned once and reused.
+    fn captureless_env_sid(&self) -> u32 {
+        if let Some(sid) = *self.ctx.captureless_env.borrow() {
+            return sid;
+        }
+        let sid = self.ctx.tuples.borrow_mut().push_layout(vec![Ty::Ptr]);
+        self.ctx.closure_env_sids.borrow_mut().push(sid);
+        *self.ctx.captureless_env.borrow_mut() = Some(sid);
+        sid
+    }
+
+    /// The closure-record struct id `{code_ptr, cap_tys…}` for a value capturing
+    /// `cap_tys` (the captureless one when empty).
+    fn env_sid_for(&self, cap_tys: &[Ty]) -> u32 {
+        if cap_tys.is_empty() {
+            return self.captureless_env_sid();
+        }
+        let mut fields = Vec::with_capacity(cap_tys.len() + 1);
+        fields.push(Ty::Ptr);
+        fields.extend_from_slice(cap_tys);
+        let sid = self.ctx.tuples.borrow_mut().push_layout(fields);
+        self.ctx.closure_env_sids.borrow_mut().push(sid);
+        sid
+    }
+
+    /// A fresh unique name for a compiler-generated closure function (I#163).
+    fn fresh_closure_name(&self) -> String {
+        let mut c = self.ctx.closure_counter.borrow_mut();
+        let n = *c;
+        *c += 1;
+        format!("$closure${n}")
+    }
+
+    /// Build a first-class function value from a bare top-level function
+    /// (I#163): generate (once) a wrapper whose code pointer takes the implicit
+    /// env and calls the function, then emit the captureless closure record.
+    fn fnval_of_name(&mut self, fname: &str) -> Result<(Value, Ty), LowerError> {
+        let (params, ret) = self
+            .sigs
+            .get(fname)
+            .cloned()
+            .ok_or_else(|| err(format!("unknown function '{fname}'")))?;
+        let sig_idx = self.ctx.fn_sigs.borrow_mut().intern(params.clone(), ret);
+        let (wname, env_sid) = self.make_fnval_wrapper(fname, &params, ret);
+        let dest = self.new_value(Ty::Func(sig_idx));
+        self.emit(Inst::ClosureMake {
+            dest,
+            func: wname,
+            env_sid,
+            captures: Vec::new(),
+        });
+        Ok((dest, Ty::Func(sig_idx)))
+    }
+
+    /// Generate (once per source function) the wrapper `<f>$fnval(env, args…)`
+    /// that ignores the env and calls `f(args…)` — the code pointer for a bare
+    /// top-level function used as a value. Returns `(wrapper_name, env_sid)`.
+    fn make_fnval_wrapper(&self, fname: &str, params: &[Ty], ret: Ty) -> (String, u32) {
+        let env_sid = self.captureless_env_sid();
+        if let Some(w) = self.ctx.fnval_wrappers.borrow().get(fname) {
+            return (w.clone(), env_sid);
+        }
+        let wname = format!("{fname}$fnval");
+        let mut params_z = Vec::with_capacity(params.len() + 1);
+        params_z.push(Ty::Struct(env_sid));
+        params_z.extend_from_slice(params);
+        let mut lf = FnLower::new(
+            wname.clone(),
+            params_z,
+            ret,
+            false,
+            false,
+            self.sigs,
+            self.ctx,
+        );
+        // Values 1..=n are the incoming args (value 0 is the ignored env).
+        let argvals: Vec<Value> = (1..=params.len() as u32).collect();
+        let dest = if ret == Ty::Void {
+            None
+        } else {
+            Some(lf.new_value(ret))
+        };
+        lf.emit(Inst::Call {
+            dest,
+            func: fname.to_string(),
+            args: argvals,
+        });
+        lf.set_term(Term::Ret(dest));
+        self.ctx.generated.borrow_mut().push(lf.func);
+        self.ctx
+            .fnval_wrappers
+            .borrow_mut()
+            .insert(fname.to_string(), wname.clone());
+        (wname, env_sid)
+    }
+
+    /// Lower a `lambda` to a first-class function value (I#163), given the
+    /// expected signature `sig_idx` (the lambda's parameter types come from it —
+    /// Zap lambdas are untyped on the surface, like Python's). Free variables
+    /// bound in the enclosing scope are captured into a GC-managed closure
+    /// record; the body becomes a lifted top-level function that reloads them.
+    fn lower_lambda(
+        &mut self,
+        lam_params: &[String],
+        body: &Expr,
+        sig_idx: u32,
+    ) -> Result<(Value, Ty), LowerError> {
+        let sig = self.ctx.fn_sigs.borrow().get(sig_idx).clone();
+        if lam_params.len() != sig.params.len() {
+            return Err(err(format!(
+                "this lambda has {} parameter(s) but its expected type takes {}",
+                lam_params.len(),
+                sig.params.len()
+            )));
+        }
+        // Capture the free variables that are bound in the current scope; names
+        // resolved elsewhere (top-level functions, imports, builtins) are left
+        // to resolve directly inside the lifted body.
+        let free = free_names_of(lam_params, body);
+        let mut names = Vec::new();
+        let mut cap_vals = Vec::new();
+        let mut cap_tys = Vec::new();
+        for name in &free {
+            if let Some((slot, ty)) = self.lookup(name) {
+                names.push(name.clone());
+                cap_vals.push(self.load(slot, ty));
+                cap_tys.push(ty);
+            }
+        }
+        let env_sid = self.env_sid_for(&cap_tys);
+        let fname = self.fresh_closure_name();
+        let lifted = self.build_lifted_lambda(
+            &fname,
+            env_sid,
+            &names,
+            &cap_tys,
+            lam_params,
+            &sig.params,
+            sig.ret,
+            body,
+        )?;
+        self.ctx.generated.borrow_mut().push(lifted);
+        let dest = self.new_value(Ty::Func(sig_idx));
+        self.emit(Inst::ClosureMake {
+            dest,
+            func: fname,
+            env_sid,
+            captures: cap_vals,
+        });
+        Ok((dest, Ty::Func(sig_idx)))
+    }
+
+    /// Build the lifted top-level function for a lambda body (I#163): its ZIR
+    /// param 0 is the closure record, from which the captured variables are
+    /// reloaded; params 1.. are the lambda's parameters. The body expression is
+    /// lowered and returned (coerced to the declared return type).
+    #[allow(clippy::too_many_arguments)]
+    fn build_lifted_lambda(
+        &self,
+        name: &str,
+        env_sid: u32,
+        captured: &[String],
+        cap_tys: &[Ty],
+        lam_params: &[String],
+        param_tys: &[Ty],
+        ret: Ty,
+        body: &Expr,
+    ) -> Result<Func, LowerError> {
+        let mut params_z = Vec::with_capacity(param_tys.len() + 1);
+        params_z.push(Ty::Struct(env_sid));
+        params_z.extend_from_slice(param_tys);
+        let mut lf = FnLower::new(
+            name.to_string(),
+            params_z,
+            ret,
+            false,
+            false,
+            self.sigs,
+            self.ctx,
+        );
+        // Reload captured free variables from the closure record (param 0,
+        // fields 1..) into fresh locals under their source names.
+        let env_val: Value = 0;
+        for (i, (cname, cty)) in captured.iter().zip(cap_tys).enumerate() {
+            let got = lf.new_value(*cty);
+            lf.emit(Inst::FieldGet {
+                dest: got,
+                base: env_val,
+                sid: env_sid,
+                idx: (i + 1) as u32,
+            });
+            let slot = lf.alloca(*cty);
+            lf.store(slot, got);
+            lf.declare(cname, slot, *cty);
+        }
+        // Bind the lambda parameters (ZIR values 1..=n).
+        for (i, pname) in lam_params.iter().enumerate() {
+            let pty = param_tys[i];
+            let slot = lf.alloca(pty);
+            lf.store(slot, (i + 1) as Value);
+            lf.declare(pname, slot, pty);
+        }
+        let (v, vt) = lf.expr(body)?;
+        if ret == Ty::Void {
+            lf.set_term(Term::Ret(None));
+        } else {
+            let rv = lf.coerce(v, vt, ret);
+            lf.set_term(Term::Ret(Some(rv)));
+        }
+        Ok(lf.func)
+    }
+
+    /// Lower an expression in a position whose expected ZIR type is `target`
+    /// (I#163): a `lambda` is lowered against the expected function type (the
+    /// only way its parameter types are known). Everything else lowers normally
+    /// and is coerced.
+    fn expr_coerced(&mut self, e: &Expr, target: Ty) -> Result<Value, LowerError> {
+        if let (Expr::Lambda { params, body, .. }, Ty::Func(idx)) = (e, target) {
+            let (v, _) = self.lower_lambda(params, body, idx)?;
+            return Ok(v);
+        }
+        let (v, vt) = self.expr(e)?;
+        Ok(self.coerce(v, vt, target))
     }
 
     /// Lower a method call on an interface-typed receiver to **dynamic dispatch**
@@ -8305,6 +8737,152 @@ impl<'a> FnLower<'a> {
 
 fn is_name(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Name(n, _) if n == name)
+}
+
+/// The free variables of a lambda body (I#163), in first-seen order: every name
+/// referenced in `body` that is not a lambda parameter and not bound by an
+/// inner binder (a nested lambda's parameters, a comprehension's loop variable).
+/// The caller keeps only those that are actually bound in the enclosing scope;
+/// the rest (top-level functions, imports, builtins) resolve directly in the
+/// lifted body.
+fn free_names_of(params: &[String], body: &Expr) -> Vec<String> {
+    let mut bound: HashSet<String> = params.iter().cloned().collect();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    collect_free_names(body, &mut bound, &mut out, &mut seen);
+    out
+}
+
+/// Walk `e`, recording names that are free given the currently-`bound` set.
+/// A binder (nested lambda, comprehension loop var) extends `bound` only for the
+/// sub-expressions in its scope, then restores it.
+fn collect_free_names(
+    e: &Expr,
+    bound: &mut HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match e {
+        Expr::Name(n, _) => {
+            if !bound.contains(n) && seen.insert(n.clone()) {
+                out.push(n.clone());
+            }
+        }
+        Expr::Int(..)
+        | Expr::Float(..)
+        | Expr::Imaginary(..)
+        | Expr::Str { .. }
+        | Expr::Bool(..)
+        | Expr::None(_) => {}
+        Expr::Tuple(es, _) | Expr::List(es, _) | Expr::Set(es, _) => {
+            for s in es {
+                collect_free_names(s, bound, out, seen);
+            }
+        }
+        Expr::Dict(items, _) => {
+            for (k, v) in items {
+                collect_free_names(k, bound, out, seen);
+                collect_free_names(v, bound, out, seen);
+            }
+        }
+        Expr::ListComp {
+            elem,
+            var,
+            iter,
+            cond,
+            ..
+        }
+        | Expr::SetComp {
+            elem,
+            var,
+            iter,
+            cond,
+            ..
+        } => {
+            // `iter` is evaluated in the outer scope; `elem`/`cond` see `var`.
+            collect_free_names(iter, bound, out, seen);
+            let fresh = bound.insert(var.clone());
+            collect_free_names(elem, bound, out, seen);
+            if let Some(c) = cond {
+                collect_free_names(c, bound, out, seen);
+            }
+            if fresh {
+                bound.remove(var);
+            }
+        }
+        Expr::DictComp {
+            key,
+            value,
+            var,
+            iter,
+            cond,
+            ..
+        } => {
+            collect_free_names(iter, bound, out, seen);
+            let fresh = bound.insert(var.clone());
+            collect_free_names(key, bound, out, seen);
+            collect_free_names(value, bound, out, seen);
+            if let Some(c) = cond {
+                collect_free_names(c, bound, out, seen);
+            }
+            if fresh {
+                bound.remove(var);
+            }
+        }
+        Expr::Unary { expr, .. } | Expr::ChanRecv { chan: expr, .. } => {
+            collect_free_names(expr, bound, out, seen);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_free_names(lhs, bound, out, seen);
+            collect_free_names(rhs, bound, out, seen);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_free_names(callee, bound, out, seen);
+            for a in args {
+                collect_free_names(&a.value, bound, out, seen);
+            }
+        }
+        Expr::Index { base, index, .. } => {
+            collect_free_names(base, bound, out, seen);
+            collect_free_names(index, bound, out, seen);
+        }
+        Expr::Slice {
+            base, lo, hi, step, ..
+        } => {
+            collect_free_names(base, bound, out, seen);
+            for o in [lo, hi, step].into_iter().flatten() {
+                collect_free_names(o, bound, out, seen);
+            }
+        }
+        Expr::Attr { base, .. } => collect_free_names(base, bound, out, seen),
+        Expr::Lambda { params, body, .. } => {
+            // Nested lambda: its own parameters shadow within its body.
+            let added: Vec<String> = params
+                .iter()
+                .filter(|p| bound.insert((*p).clone()))
+                .cloned()
+                .collect();
+            collect_free_names(body, bound, out, seen);
+            for p in added {
+                bound.remove(&p);
+            }
+        }
+        Expr::RegexMatch { subject, .. } | Expr::RegexSubst { subject, .. } => {
+            collect_free_names(subject, bound, out, seen);
+        }
+        Expr::Yield { value, .. } => {
+            if let Some(v) = value {
+                collect_free_names(v, bound, out, seen);
+            }
+        }
+        Expr::IfElse {
+            cond, then, els, ..
+        } => {
+            collect_free_names(cond, bound, out, seen);
+            collect_free_names(then, bound, out, seen);
+            collect_free_names(els, bound, out, seen);
+        }
+    }
 }
 
 /// Comparison operators for which power-assert shows both operand values
