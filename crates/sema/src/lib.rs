@@ -4201,6 +4201,16 @@ mod tests {
     }
 
     #[test]
+    fn runtime_scheduler_controls_type_check() {
+        // Ticket #172: the MAXPROCS knob getter returns int64; LockOSThread pin /
+        // unpin are statement calls.
+        ok("def main():\n\
+            \x20   print(runtime.maxprocs())\n\
+            \x20   runtime.lock_os_thread()\n\
+            \x20   runtime.unlock_os_thread()\n");
+    }
+
+    #[test]
     fn unknown_module_function_is_an_error() {
         let e = errors("def main():\n    gc.frobnicate()\n");
         assert!(!e.is_empty(), "expected unknown gc.* function to error");

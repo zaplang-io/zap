@@ -36,6 +36,7 @@
 #include <stdint.h>
 #define GC_pthread_create pthread_create
 #define GC_pthread_join pthread_join
+#define GC_pthread_detach pthread_detach
 #define GC_call_with_alloc_lock(fn, arg) ((fn)(arg))
 struct GC_stack_base {
     void *mem_base;
@@ -61,6 +62,7 @@ static void GC_set_stackbottom(void *h, struct GC_stack_base *sb) {
 #include <string.h>
 #include <time.h>   /* clock_gettime for the scheduler idle wait (#47) */
 #include <unistd.h> /* sysconf(_SC_NPROCESSORS_ONLN) for the M count (#47) */
+#include <signal.h> /* SIGURG / sigaction / pthread_kill: async preemption (#172) */
 
 /* PCRE2, 8-bit code units (ticket #23, D-0010). Must be defined before the
  * header so the `pcre2_*` names resolve to the 8-bit API. Linked with
@@ -132,6 +134,14 @@ extern const ZapTypeDesc zap_desc_gobj;    /* scheduler G (precise)             
 extern const ZapTypeDesc zap_desc_ptrs;    /* a generic array-of-pointers buffer */
 extern const ZapTypeDesc zap_desc_sigsub;  /* SigSub: {next, chan} (ticket #77)  */
 
+/* Preemption guard (ticket #172): mark a window in which the current coroutine
+ * must not be async-preempted (it is inside a runtime critical section that
+ * holds a lock or the allocator). Defined in the scheduler section below; only
+ * the Boehm signal-based path consults it, but the paired calls compile on both
+ * builds (a harmless no-op when no coroutine is running). */
+static void zap_np_enter(void);
+static void zap_np_leave(void);
+
 #ifdef ZAP_GC_IMMIX
 /* Precise collector entry points (defined in zapgc.inc.c, #included below). */
 void *zap_gc_alloc(const ZapTypeDesc *desc);
@@ -155,6 +165,7 @@ extern void *zap_main_shadow_head;
 static void zap_enter_blocking(void); /* fwd (defined in zapgc.inc.c)           */
 static void zap_leave_blocking(void);
 static void zap_mutator_register(void);
+static void zap_mutator_unregister(void); /* dedicated-M exit (#172)            */
 
 static inline void *zap_alloc_desc(const ZapTypeDesc *d) { return zap_gc_alloc(d); }
 static inline void *zap_obj(const ZapTypeDesc *d) { return zap_gc_alloc(d); }
@@ -171,15 +182,39 @@ static inline void *zap_ptrbuf(int64_t n) { return zap_gc_alloc_atomic(n); }
 #define zap_enter_blocking() ((void)0)
 #define zap_leave_blocking() ((void)0)
 #define zap_mutator_register() ((void)0)
+#define zap_mutator_unregister() ((void)0)
 #define zap_gc_add_root(slot) ((void)(slot))
 #define zap_gc_add_root_fn(fn) ((void)(fn))
 #define zap_gc_mark(p) ((void)(p))
+/* Boehm allocation routes to GC_MALLOC, whose internal allocator lock must not
+ * be held across an async preemption (ticket #172): a switched-in sibling
+ * coroutine on the same M calling GC_MALLOC would deadlock on that lock. So each
+ * allocation is a no-preempt window — the one runtime lock a tight, yield-free
+ * compute loop actually touches. */
 static inline void *zap_alloc_desc(const ZapTypeDesc *d) {
-    return GC_MALLOC((size_t)d->size);
+    zap_np_enter();
+    void *p = GC_MALLOC((size_t)d->size);
+    zap_np_leave();
+    return p;
 }
-static inline void *zap_obj(const ZapTypeDesc *d) { return GC_MALLOC((size_t)d->size); }
-static inline void *zap_buf(int64_t n) { return GC_MALLOC_ATOMIC((size_t)n); }
-static inline void *zap_ptrbuf(int64_t n) { return GC_MALLOC((size_t)n); }
+static inline void *zap_obj(const ZapTypeDesc *d) {
+    zap_np_enter();
+    void *p = GC_MALLOC((size_t)d->size);
+    zap_np_leave();
+    return p;
+}
+static inline void *zap_buf(int64_t n) {
+    zap_np_enter();
+    void *p = GC_MALLOC_ATOMIC((size_t)n);
+    zap_np_leave();
+    return p;
+}
+static inline void *zap_ptrbuf(int64_t n) {
+    zap_np_enter();
+    void *p = GC_MALLOC((size_t)n);
+    zap_np_leave();
+    return p;
+}
 #define ZAP_INFRA_ALLOC(n) GC_MALLOC(n)
 /* Finalizers (ticket #92): forward to Boehm's registration so the one call site
  * (`zap_py_wrap`) is backend-uniform. Boehm's default finalizer already provides
@@ -1811,6 +1846,19 @@ typedef struct G {
                         * is not running on an M. A running G's live head is in
                         * the per-thread zap_shadow_head, flushed here at a
                         * safepoint; the collector walks this per parked G. */
+    /* Preemption (ticket #172). `no_preempt` > 0 marks a window where this
+     * coroutine must not be async-preempted (inside a runtime critical section
+     * that holds a lock / the allocator): the Boehm signal handler only switches
+     * when it is 0. It lives in the G (not a thread-local) so it follows the
+     * coroutine across M migrations. `preempt_requeue` asks the scheduler to
+     * requeue a preempted G on the GLOBAL queue (behind its peers) for fairness
+     * rather than back onto the local P's head. */
+    int no_preempt;
+    int preempt_requeue;
+    struct M *locked_m; /* LockOSThread (#172): dedicated M this coroutine is
+                         * pinned to, or NULL. While set, the coroutine runs only
+                         * on `locked_m` and is excluded from fairness preemption. */
+    int lock_depth;     /* LockOSThread nesting count (lock/unlock balance)      */
 } G;
 
 typedef struct P {
@@ -1826,6 +1874,20 @@ typedef struct M {
     void *gc_handle;            /* GC thread handle for GC_set_stackbottom      */
     G *current;                 /* G running on this M, or NULL in scheduler    */
     P *p;                       /* processor this M is attached to              */
+    /* Preemption monitor (ticket #172). `schedtick` is bumped every time this M
+     * picks up a coroutine; the monitor flags an M whose tick is unchanged
+     * across a monitor interval (same coroutine still running) and sets
+     * `preempt`, which the coroutine observes at its next safepoint (precise GC)
+     * or via the async signal (Boehm). `dedicated` marks a LockOSThread worker
+     * that runs a single pinned coroutine and never steals / is never flagged. */
+    volatile uint64_t schedtick;
+    volatile int preempt;
+    int dedicated;
+    G *ded_g;                   /* the single pinned coroutine (dedicated M)    */
+    pthread_mutex_t ded_mu;     /* guards ded_runnable / ded_stop               */
+    pthread_cond_t ded_cv;
+    volatile int ded_runnable;  /* the pinned coroutine is ready to run         */
+    volatile int ded_stop;      /* tear the dedicated M down                    */
 } M;
 
 /* Per-waiter node on a channel's sender/receiver queue. A goroutine waiter
@@ -1887,6 +1949,37 @@ static size_t zap_stack_size(void) {
     return sz;
 }
 
+/* ---- preemption no-preempt guard (ticket #172) ---------------------------- */
+/* Raise/lower the running coroutine's no-preempt depth. The count lives in the G
+ * so it follows the coroutine across M migrations; the Boehm async-preemption
+ * handler only switches when it is 0. A no-op on a native thread (main) or in
+ * the scheduler loop (no current coroutine), which are never async-preempted. */
+static void zap_np_enter(void) {
+    M *m = cur_m;
+    if (m && m->current) {
+        m->current->no_preempt++;
+    }
+}
+static void zap_np_leave(void) {
+    M *m = cur_m;
+    if (m && m->current && m->current->no_preempt > 0) {
+        m->current->no_preempt--;
+    }
+}
+/* Guarded lock/unlock for the runtime critical sections a long, non-parking
+ * compute loop can touch (channel fast paths, sync primitives): holding one of
+ * these mutexes across an async preemption could deadlock a switched-in sibling
+ * on the same M under Boehm. Pairs with the per-coroutine no-preempt depth; the
+ * park primitives clear the depth when a coroutine yields with a lock held. */
+static void zap_np_lock(pthread_mutex_t *mu) {
+    zap_np_enter();
+    pthread_mutex_lock(mu);
+}
+static void zap_np_unlock(pthread_mutex_t *mu) {
+    pthread_mutex_unlock(mu);
+    zap_np_leave();
+}
+
 /* ---- GC stack-bottom tracking across switches ----------------------------- */
 /* Point the current M thread's conservatively-scanned stack at `sb`. Wrapped in
  * the GC alloc lock (as bdwgc advises) so a concurrent collection never reads a
@@ -1911,7 +2004,7 @@ static void set_bottom(M *m, struct GC_stack_base *sb) {
 
 /* ---- run queues ----------------------------------------------------------- */
 static void global_push(G *g) {
-    pthread_mutex_lock(&g_global_mu);
+    zap_np_lock(&g_global_mu);
     g->link = NULL;
     if (g_global_tail) {
         g_global_tail->link = g;
@@ -1919,10 +2012,10 @@ static void global_push(G *g) {
         g_global_head = g;
     }
     g_global_tail = g;
-    pthread_mutex_unlock(&g_global_mu);
+    zap_np_unlock(&g_global_mu);
 }
 static G *global_pop(void) {
-    pthread_mutex_lock(&g_global_mu);
+    zap_np_lock(&g_global_mu);
     G *g = g_global_head;
     if (g) {
         g_global_head = g->link;
@@ -1931,20 +2024,20 @@ static G *global_pop(void) {
         }
         g->link = NULL;
     }
-    pthread_mutex_unlock(&g_global_mu);
+    zap_np_unlock(&g_global_mu);
     return g;
 }
 static void p_push(P *p, G *g) {
-    pthread_mutex_lock(&p->mu);
+    zap_np_lock(&p->mu);
     g->link = p->head;
     p->head = g;
     if (!p->tail) {
         p->tail = g;
     }
-    pthread_mutex_unlock(&p->mu);
+    zap_np_unlock(&p->mu);
 }
 static G *p_pop(P *p) { /* LIFO from head (owner) */
-    pthread_mutex_lock(&p->mu);
+    zap_np_lock(&p->mu);
     G *g = p->head;
     if (g) {
         p->head = g->link;
@@ -1953,11 +2046,11 @@ static G *p_pop(P *p) { /* LIFO from head (owner) */
         }
         g->link = NULL;
     }
-    pthread_mutex_unlock(&p->mu);
+    zap_np_unlock(&p->mu);
     return g;
 }
 static G *p_steal(P *p) { /* FIFO from tail (thief) */
-    pthread_mutex_lock(&p->mu);
+    zap_np_lock(&p->mu);
     G *g = p->head, *prev = NULL;
     if (g) {
         while (g->link) {
@@ -1972,22 +2065,40 @@ static G *p_steal(P *p) { /* FIFO from tail (thief) */
         }
         g->link = NULL;
     }
-    pthread_mutex_unlock(&p->mu);
+    zap_np_unlock(&p->mu);
     return g;
 }
 
-/* Make `g` runnable: push to the current M's P (locality) or the global queue,
+/* Make `g` runnable: route a LockOSThread-pinned coroutine to its dedicated M;
+ * a coroutine yielded by preemption to the GLOBAL queue (behind its peers, for
+ * fairness); otherwise push to the current M's P (locality) or the global queue,
  * then wake one idle M. */
 static void sched_enqueue(G *g) {
     g->state = G_RUNNABLE;
-    if (cur_m && cur_m->p) {
+    /* LockOSThread (#172): a pinned coroutine only ever runs on its dedicated M.
+     * Hand it to that M's private slot and wake it, bypassing the shared pool. */
+    if (g->locked_m) {
+        M *d = g->locked_m;
+        zap_np_lock(&d->ded_mu);
+        d->ded_runnable = 1;
+        pthread_cond_signal(&d->ded_cv);
+        zap_np_unlock(&d->ded_mu);
+        return;
+    }
+    if (g->preempt_requeue) {
+        /* A preempted coroutine goes to the back of the global queue so its peers
+         * (already queued ahead) get the M first — otherwise a local-head requeue
+         * would re-pick the same coroutine immediately and defeat preemption. */
+        g->preempt_requeue = 0;
+        global_push(g);
+    } else if (cur_m && cur_m->p) {
         p_push(cur_m->p, g);
     } else {
         global_push(g);
     }
-    pthread_mutex_lock(&g_idle_mu);
+    zap_np_lock(&g_idle_mu);
     pthread_cond_signal(&g_idle_cv);
-    pthread_mutex_unlock(&g_idle_mu);
+    zap_np_unlock(&g_idle_mu);
 }
 
 static G *sched_find_runnable(M *m) {
@@ -2010,9 +2121,9 @@ static G *sched_find_runnable(M *m) {
         }
         /* Nothing to run: park this M until work arrives or we shut down. A
          * short timed wait re-polls, closing any enqueue/signal lost-wakeup. */
-        pthread_mutex_lock(&g_idle_mu);
+        zap_np_lock(&g_idle_mu);
         if (g_shutdown) {
-            pthread_mutex_unlock(&g_idle_mu);
+            zap_np_unlock(&g_idle_mu);
             return NULL;
         }
         struct timespec ts;
@@ -2023,7 +2134,7 @@ static G *sched_find_runnable(M *m) {
             ts.tv_nsec -= 1000000000;
         }
         pthread_cond_timedwait(&g_idle_cv, &g_idle_mu, &ts);
-        pthread_mutex_unlock(&g_idle_mu);
+        zap_np_unlock(&g_idle_mu);
     }
 }
 
@@ -2038,6 +2149,11 @@ static void sched_enqueue(G *g);
 static void switch_to_g(M *m, G *g) {
     m->current = g;
     g->state = G_RUNNING;
+    /* Preemption monitor (#172): a fresh scheduling tick + a clean preempt flag.
+     * The monitor samples `schedtick`; an unchanged tick across an interval means
+     * the same coroutine monopolized this M and earns a preemption request. */
+    m->schedtick++;
+    m->preempt = 0;
     set_bottom(m, &g->sb);
 #ifdef ZAP_GC_IMMIX
     /* Restore this coroutine's shadow-stack head into the per-thread cell the
@@ -2100,6 +2216,14 @@ static void *g_entry_fn(G *g) {
 static void *worker_main(void *arg) {
     M *m = (M *)arg;
     cur_m = m;
+    /* Ensure the async-preemption signal is deliverable to this worker (#172):
+     * unblock SIGURG, which the monitor targets with pthread_kill. */
+    {
+        sigset_t s;
+        sigemptyset(&s);
+        sigaddset(&s, SIGURG);
+        pthread_sigmask(SIG_UNBLOCK, &s, NULL);
+    }
     /* This thread was created by GC_pthread_create, so it is registered; record
      * its GC handle + native stack bottom for the switch bracketing. */
     struct GC_stack_base sb;
@@ -2123,7 +2247,7 @@ static void *worker_main(void *arg) {
 
 /* ---- G lifecycle ---------------------------------------------------------- */
 static void all_add(G *g) {
-    pthread_mutex_lock(&g_all_mu);
+    zap_np_lock(&g_all_mu);
     if (g_all_len == g_all_cap) {
         int64_t ncap = g_all_cap ? g_all_cap * 2 : 16;
         G **n = (G **)ZAP_INFRA_ALLOC((size_t)ncap * sizeof(G *));
@@ -2135,10 +2259,10 @@ static void all_add(G *g) {
     }
     g->all_idx = g_all_len;
     g_all[g_all_len++] = g;
-    pthread_mutex_unlock(&g_all_mu);
+    zap_np_unlock(&g_all_mu);
 }
 static void all_remove(G *g) {
-    pthread_mutex_lock(&g_all_mu);
+    zap_np_lock(&g_all_mu);
     int64_t i = g->all_idx;
     if (i >= 0 && i < g_all_len && g_all[i] == g) {
         G *last = g_all[--g_all_len];
@@ -2146,18 +2270,18 @@ static void all_remove(G *g) {
         last->all_idx = i;
         g_all[g_all_len] = NULL;
     }
-    pthread_mutex_unlock(&g_all_mu);
+    zap_np_unlock(&g_all_mu);
 }
 
 static G *galloc(void *fn, void *arg) {
     size_t ss = zap_stack_size();
     G *g = NULL;
-    pthread_mutex_lock(&g_free_mu);
+    zap_np_lock(&g_free_mu);
     if (g_free_head) {
         g = g_free_head;
         g_free_head = g->link;
     }
-    pthread_mutex_unlock(&g_free_mu);
+    zap_np_unlock(&g_free_mu);
     if (!g) {
         g = (G *)zap_obj(&zap_desc_gobj);
         g->stack = zap_ptrbuf((int64_t)ss); /* Boehm: scanned as heap. Immix: atomic buffer kept alive via the G.stack precise field; roots come from the shadow chain, not stack scanning. */
@@ -2189,25 +2313,29 @@ static void gfree(G *g) {
     g->scope = NULL; /* drop the scope reference so a reused G starts clean */
     g->in_live = 0;
     /* Keep the stack buffer for reuse (size-classed free list, one class). */
-    pthread_mutex_lock(&g_free_mu);
+    zap_np_lock(&g_free_mu);
     g->link = g_free_head;
     g_free_head = g;
-    pthread_mutex_unlock(&g_free_mu);
+    zap_np_unlock(&g_free_mu);
 }
 
 static void sched_gdone(void) {
-    pthread_mutex_lock(&g_live_mu);
+    zap_np_lock(&g_live_mu);
     if (--g_live == 0) {
         pthread_cond_broadcast(&g_live_cv);
     }
-    pthread_mutex_unlock(&g_live_mu);
+    zap_np_unlock(&g_live_mu);
 }
 
 /* ---- scheduler init (lazy, on first spawn) -------------------------------- */
 static pthread_once_t g_sched_once = PTHREAD_ONCE_INIT;
 
+/* The parallelism knob (ticket #172): env var `MAXPROCS` sets the number of
+ * worker Ms (== Ps). Dropped the `ZAP_` prefix and the GOMAXPROCS-analogue
+ * naming — it is simply `MAXPROCS`, our term. `zap_runtime_maxprocs()` exposes
+ * the effective value to Zap. Default: the online hardware-thread count. */
 static int zap_maxprocs(void) {
-    const char *e = getenv("ZAP_MAXPROCS");
+    const char *e = getenv("MAXPROCS");
     if (e) {
         long n = atol(e);
         if (n >= 1 && n <= 1024) {
@@ -2224,6 +2352,289 @@ static int zap_maxprocs(void) {
     return (int)hw;
 }
 
+/* ===========================================================================
+ * Async (signal-based) preemption — Go 1.14 model (ticket #172, D-0008/0005)
+ * ---------------------------------------------------------------------------
+ * v1 was cooperative: a tight, allocation-free, yield-free CPU loop could
+ * monopolize its M, starve peer coroutines, and (under the precise collector)
+ * stall a pending stop-the-world GC. Preemption closes that gap WITHOUT a
+ * per-iteration codegen poll (the rejected "back-edge polling" option):
+ *
+ *   - A dedicated MONITOR thread samples each worker M's `schedtick` every
+ *     ~10 ms. An M whose tick is unchanged across an interval has run the SAME
+ *     coroutine for the whole slice (any park/yield bumps the tick via
+ *     switch_to_g); the monitor sets `m->preempt` and sends it SIGURG.
+ *   - The SIGURG handler runs ON the target worker thread. How it yields reuses
+ *     the collector's own safe-point machinery and so splits by collector:
+ *       * PRECISE (gc-immix): the handler only records the request; the yield
+ *         happens at the next `zap_safepoint()` (already emitted at function
+ *         entry and loop back-edges for the GC — FORK 4a), where the shadow
+ *         chain is consistent and parking is provably GC-safe. This is exactly
+ *         the "reuse the precise-GC safepoint/stackmap machinery" the design
+ *         calls for; a tight compiled loop reaches a safepoint within one
+ *         iteration.
+ *       * CONSERVATIVE (gc-boehm): there is no cooperative safepoint poll, but
+ *         the collector scans every coroutine's saved context + green stack
+ *         conservatively, so a coroutine preempted at an arbitrary instruction
+ *         is still GC-safe. The handler therefore switches immediately
+ *         (`gopreempt`), provided the coroutine holds no runtime lock / is not
+ *         mid-allocation (`no_preempt == 0`); otherwise it defers and the
+ *         monitor retries on the next interval. The `no_preempt` guard covers
+ *         the one lock a non-parking compute loop can touch (the allocator) plus
+ *         channel/sync fast paths, so a switched-in sibling never deadlocks on a
+ *         lock the preempted coroutine still holds.
+ *   - A preempted coroutine is requeued on the GLOBAL run queue (`gopreempt`),
+ *     behind its peers, so it cannot immediately re-grab its M.
+ *
+ * LockOSThread-pinned coroutines (below) run on a dedicated M and are never
+ * flagged (the monitor skips `dedicated` Ms) — they own their thread outright.
+ * The subsystem is lazy: the monitor starts with the scheduler (first spawn), so
+ * non-concurrent programs pay nothing.
+ * =========================================================================== */
+#define ZAP_PREEMPT_SLICE_NS 10000000L /* ~10 ms time slice before preemption   */
+static pthread_t g_monitor_thread;
+static int g_monitor_started = 0;
+static void gopreempt(void); /* fwd (scheduler yield, defined below)            */
+
+#ifndef ZAP_GC_IMMIX
+/* Boehm stop-the-world guard (ticket #172). Boehm's STW suspends threads with a
+ * signal and expects a suspended thread to stay put; an async-preemption switch
+ * fired on a thread Boehm is stopping would move it out from under the collector.
+ * `GC_set_on_collection_event` brackets STW: the flag is set BEFORE any thread is
+ * suspended (PRE_STOP_WORLD) and cleared only after all resume (POST_START_WORLD),
+ * so the preempt handler, which re-reads it, never switches during a collection. */
+static volatile sig_atomic_t g_boehm_in_stw = 0;
+static void zap_boehm_gc_event(GC_EventType e) {
+    if (e == GC_EVENT_PRE_STOP_WORLD) {
+        g_boehm_in_stw = 1;
+    } else if (e == GC_EVENT_POST_START_WORLD) {
+        g_boehm_in_stw = 0;
+    }
+}
+#endif
+static void gosched(void);   /* fwd (cooperative yield, defined below)          */
+void zap_sched_init(int64_t n_threads); /* fwd (defined below)                  */
+
+/* SIGURG handler: the preemption point. Installed process-wide; only acts on a
+ * worker thread that is currently running a (non-pinned) coroutine. */
+static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
+    (void)sig;
+    (void)info;
+    (void)uc;
+    M *m = cur_m;
+    if (!m || !m->current) {
+        return; /* main/scheduler/idle thread: nothing to preempt */
+    }
+    if (m->current->locked_m) {
+        return; /* a pinned coroutine owns its M — never fairness-preempt it */
+    }
+    m->preempt = 1; /* observed at the next safepoint (precise GC) */
+#ifndef ZAP_GC_IMMIX
+    /* Conservative GC: switch at the interrupted point directly — but ONLY when
+     * we actually interrupted the coroutine running on its green stack. The
+     * signal can also land while this worker is on its NATIVE stack inside the
+     * scheduler (switch_to_g has set m->current but not yet swapped the context
+     * in, or is just back from a swap): switching there would clobber the
+     * coroutine's saved context. Detect by testing the interrupted stack pointer
+     * against the green-stack range. Also require no runtime lock / allocation to
+     * be held (no_preempt); otherwise defer and let the monitor re-signal. */
+    if (!g_boehm_in_stw) {
+        G *g = m->current;
+        char probe;
+        char *sp = &probe;
+        char *lo = (char *)g->stack;
+        char *hi = lo + g->stack_size;
+        if (sp >= lo && sp < hi && g->no_preempt == 0) {
+            m->preempt = 0;
+            gopreempt();
+        }
+    }
+#endif
+}
+
+/* The monitor loop: a plain OS thread (it never touches the GC heap, holds no
+ * lock a collection needs, and blocks SIGURG on itself). Started with
+ * GC_pthread_create so bdwgc accounts for it. */
+static void *zap_monitor_main(void *arg) {
+    (void)arg;
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGURG);
+    pthread_sigmask(SIG_BLOCK, &block, NULL);
+    uint64_t *last = (uint64_t *)calloc((size_t)g_nm, sizeof(uint64_t));
+    if (!last) {
+        return NULL;
+    }
+    for (;;) {
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = ZAP_PREEMPT_SLICE_NS;
+        nanosleep(&ts, NULL);
+        if (g_shutdown) {
+            break;
+        }
+        for (int i = 0; i < g_nm; i++) {
+            M *m = &g_ms[i];
+            /* Read without a lock: a benign race. `current` is only tested for
+             * non-NULL (the handler re-checks on the worker thread), and a
+             * 64-bit `schedtick` read is atomic on the supported arch. */
+            uint64_t tick = m->schedtick;
+            if (m->current && tick == last[i]) {
+                m->preempt = 1;
+                pthread_kill(m->thread, SIGURG);
+            }
+            last[i] = tick;
+        }
+    }
+    free(last);
+    return NULL;
+}
+
+/* Install the SIGURG handler once (no SA_ONSTACK: the handler must run on the
+ * coroutine's own green stack so a gopreempt switch saves/restores it with the
+ * coroutine's context). Idempotent. */
+static void zap_preempt_install(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = zap_preempt_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGURG, &sa, NULL);
+}
+
+/* =====================  LockOSThread (ticket #172)  ========================
+ * `runtime.lock_os_thread()` pins the calling coroutine to a dedicated OS
+ * thread (its own M) until the matching `runtime.unlock_os_thread()`: no other
+ * coroutine runs on that thread, and the coroutine always resumes on it (across
+ * channel parks too). It is the Go `runtime.LockOSThread` analogue — for C
+ * libraries that keep thread-local state and for long jobs that want off the
+ * shared pool — and the substrate the later threading-compat library reuses.
+ *
+ * Mechanism: a dedicated M runs a single pinned coroutine via a private slot
+ * (`ded_g`/`ded_runnable`), bypassing the work-stealing pool; `sched_enqueue`
+ * routes a pinned coroutine back to it. The dedicated M is excluded from
+ * fairness preemption (not in `g_ms[]`, and `locked_m != NULL` short-circuits
+ * `gopreempt`), still polls GC safepoints, and tears down when the coroutine
+ * unlocks or finishes. `lock_depth` makes nested lock/unlock balance. */
+static pthread_mutex_t g_ded_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_ded_cv = PTHREAD_COND_INITIALIZER;
+static int64_t g_ded_live = 0; /* dedicated Ms not yet torn down (join barrier) */
+
+static void *dedicated_worker_main(void *arg) {
+    M *m = (M *)arg;
+    cur_m = m;
+    struct GC_stack_base sb;
+    m->gc_handle = GC_get_my_stackbottom(&sb);
+    m->native_sb = sb;
+    zap_mutator_register();
+    /* A pinned coroutine is not fairness-preempted, so keep SIGURG blocked on
+     * the dedicated thread (it still participates in GC via safepoints). */
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGURG);
+    pthread_sigmask(SIG_BLOCK, &block, NULL);
+    for (;;) {
+        zap_enter_blocking(); /* idle: GC-safe, no un-flushed roots */
+        zap_np_lock(&m->ded_mu);
+        while (!m->ded_runnable && !m->ded_stop) {
+            pthread_cond_wait(&m->ded_cv, &m->ded_mu);
+        }
+        int stop = m->ded_stop && !m->ded_runnable;
+        m->ded_runnable = 0;
+        zap_np_unlock(&m->ded_mu);
+        if (stop) {
+            zap_leave_blocking();
+            break;
+        }
+        zap_leave_blocking();
+        G *g = m->ded_g;
+        switch_to_g(m, g);
+        /* switch_to_g handled the outcome: a park/yield re-routed the coroutine
+         * back to us (locked) or to the shared pool (unlocked); death reclaimed
+         * it. We own this thread only while the coroutine is still pinned here. */
+        if (g->state == G_DEAD || g->locked_m != m) {
+            break;
+        }
+    }
+    /* Mark GC-safe before leaving so a collection in flight never waits on this
+     * now-exiting thread, then drop our mutator node (precise GC). */
+    zap_enter_blocking();
+    zap_mutator_unregister();
+    zap_np_lock(&g_ded_mu);
+    if (--g_ded_live == 0) {
+        pthread_cond_broadcast(&g_ded_cv);
+    }
+    zap_np_unlock(&g_ded_mu);
+    free(m);
+    return NULL;
+}
+
+/* `runtime.lock_os_thread()` — pin the calling coroutine to a dedicated M. */
+void zap_runtime_lock_os_thread(void) {
+    M *m = cur_m;
+    if (!m || !m->current) {
+        return; /* not on a coroutine (e.g. main): no-op, like Go on g0 */
+    }
+    G *g = m->current;
+    if (g->locked_m) {
+        g->lock_depth++;
+        return; /* already pinned: nest */
+    }
+    M *d = (M *)calloc(1, sizeof(M));
+    if (!d) {
+        return;
+    }
+    d->dedicated = 1;
+    d->p = NULL; /* no work-stealing P: only ever runs this one coroutine */
+    pthread_mutex_init(&d->ded_mu, NULL);
+    pthread_cond_init(&d->ded_cv, NULL);
+    d->ded_g = g;
+    zap_np_lock(&g_ded_mu);
+    g_ded_live++;
+    zap_np_unlock(&g_ded_mu);
+    if (GC_pthread_create(&d->thread, NULL, dedicated_worker_main, d) != 0) {
+        zap_np_lock(&g_ded_mu);
+        g_ded_live--;
+        zap_np_unlock(&g_ded_mu);
+        free(d);
+        return;
+    }
+    GC_pthread_detach(d->thread); /* self-cleaning; joined via g_ded_live barrier */
+    g->lock_depth = 1;
+    g->locked_m = d;
+    /* Yield: switch_to_g on the current worker will route us (locked_m set) to
+     * the dedicated M, where we resume. From here on this coroutine runs only
+     * on `d`. */
+    gosched();
+}
+
+/* `runtime.unlock_os_thread()` — release the pin (balances nested locks). */
+void zap_runtime_unlock_os_thread(void) {
+    M *m = cur_m;
+    if (!m || !m->current) {
+        return;
+    }
+    G *g = m->current;
+    if (!g->locked_m || g->lock_depth == 0) {
+        return; /* not pinned: no-op */
+    }
+    if (--g->lock_depth > 0) {
+        return; /* still nested */
+    }
+    M *d = g->locked_m;
+    g->locked_m = NULL;
+    /* Yield: switch_to_g on the dedicated M sees locked_m == NULL, routes us to
+     * the shared pool, then (coroutine no longer pinned here) tears `d` down. */
+    gosched();
+    (void)d;
+}
+
+/* The effective MAXPROCS (worker-M count). Exposed as `runtime.maxprocs()`. */
+int64_t zap_runtime_maxprocs(void) {
+    zap_sched_init(0); /* materialize the default if nothing spawned yet */
+    return (int64_t)g_nm;
+}
+
 static void zap_sched_init_once(void) {
     g_nm = zap_maxprocs();
     g_ps = (P *)ZAP_INFRA_ALLOC((size_t)g_nm * sizeof(P));
@@ -2234,12 +2645,25 @@ static void zap_sched_init_once(void) {
         memset(&g_ms[i], 0, sizeof(M));
         g_ms[i].p = &g_ps[i];
     }
+    /* Install the async-preemption handler BEFORE the workers start, so they
+     * inherit it; SIGURG stays unblocked on workers (default), the monitor and
+     * non-worker threads block it (ticket #172). */
+    zap_preempt_install();
+#ifndef ZAP_GC_IMMIX
+    /* Bracket Boehm stop-the-world so the handler never switches a thread the
+     * collector is suspending (see zap_boehm_gc_event). */
+    GC_set_on_collection_event(zap_boehm_gc_event);
+#endif
     for (int i = 0; i < g_nm; i++) {
         int rc = GC_pthread_create(&g_ms[i].thread, NULL, worker_main, &g_ms[i]);
         if (rc != 0) {
             fprintf(stderr, "zap: failed to start scheduler thread (%d)\n", rc);
             abort();
         }
+    }
+    /* The preemption monitor: samples schedticks and signals monopolizing Ms. */
+    if (GC_pthread_create(&g_monitor_thread, NULL, zap_monitor_main, NULL) == 0) {
+        g_monitor_started = 1;
     }
 }
 
@@ -2251,9 +2675,9 @@ void zap_sched_init(int64_t n_threads) {
     if (n_threads > 0 && !g_ms) {
         /* Seed the env-less default so zap_maxprocs picks this up. */
         static char buf[32];
-        if (!getenv("ZAP_MAXPROCS")) {
+        if (!getenv("MAXPROCS")) {
             snprintf(buf, sizeof(buf), "%lld", (long long)n_threads);
-            setenv("ZAP_MAXPROCS", buf, 0);
+            setenv("MAXPROCS", buf, 0);
         }
     }
     pthread_once(&g_sched_once, zap_sched_init_once);
@@ -2266,9 +2690,9 @@ void zap_sched_init(int64_t n_threads) {
  * scheduler (G alloc + enqueue, design/0005 "Runtime entry points"). */
 void zap_spawn(void *fn_, void *arg) {
     zap_sched_init(0);
-    pthread_mutex_lock(&g_live_mu);
+    zap_np_lock(&g_live_mu);
     g_live++;
-    pthread_mutex_unlock(&g_live_mu);
+    zap_np_unlock(&g_live_mu);
     G *g = galloc(fn_, arg);
     g->in_live = 1; /* joined by the implicit root scope at program exit */
     sched_enqueue(g);
@@ -2302,16 +2726,29 @@ void zap_rt_join_all(void) {
      * finishes. Mark it GC-safe so collections triggered by the workers proceed
      * without waiting for the (idle) main thread. */
     zap_enter_blocking();
-    pthread_mutex_lock(&g_live_mu);
+    zap_np_lock(&g_live_mu);
     while (g_live > 0) {
         pthread_cond_wait(&g_live_cv, &g_live_mu);
     }
-    pthread_mutex_unlock(&g_live_mu);
+    zap_np_unlock(&g_live_mu);
     zap_leave_blocking();
-    pthread_mutex_lock(&g_idle_mu);
+    /* Every pinned coroutine has finished (g_live hit 0 above), so every
+     * dedicated LockOSThread M is tearing down; wait for them before stopping
+     * the shared pool (ticket #172). */
+    zap_np_lock(&g_ded_mu);
+    while (g_ded_live > 0) {
+        pthread_cond_wait(&g_ded_cv, &g_ded_mu);
+    }
+    zap_np_unlock(&g_ded_mu);
+    zap_np_lock(&g_idle_mu);
     g_shutdown = 1;
     pthread_cond_broadcast(&g_idle_cv);
-    pthread_mutex_unlock(&g_idle_mu);
+    zap_np_unlock(&g_idle_mu);
+    /* Stop the preemption monitor (it polls g_shutdown every slice). */
+    if (g_monitor_started) {
+        GC_pthread_join(g_monitor_thread, NULL);
+        g_monitor_started = 0;
+    }
     for (int i = 0; i < g_nm; i++) {
         GC_pthread_join(g_ms[i].thread, NULL);
     }
@@ -2364,11 +2801,11 @@ typedef struct Scope {
 static ZapStr *g_cancelled = NULL;
 static pthread_mutex_t g_cancelled_mu = PTHREAD_MUTEX_INITIALIZER;
 static ZapStr *cancelled_exc(void) {
-    pthread_mutex_lock(&g_cancelled_mu);
+    zap_np_lock(&g_cancelled_mu);
     if (!g_cancelled) {
         g_cancelled = (ZapStr *)zap_str_new("Cancelled", 9);
     }
-    pthread_mutex_unlock(&g_cancelled_mu);
+    zap_np_unlock(&g_cancelled_mu);
     return g_cancelled;
 }
 
@@ -2387,6 +2824,35 @@ static void gosched(void) {
         return;
     }
     g->state = G_RUNNABLE;
+    /* A yield is a safe point: any no-preempt window the caller opened ends here
+     * (it holds no lock at a cooperative yield), so reset the depth before we
+     * switch out rather than leak it to whatever coroutine runs next. */
+    g->no_preempt = 0;
+    swapcontext(&g->ctx, &m->sched_ctx);
+}
+
+/* Preemptive yield (ticket #172): like `gosched`, but asks the scheduler to
+ * requeue this coroutine on the GLOBAL queue (behind its peers) so a long
+ * CPU-bound coroutine cannot re-grab its M immediately. Invoked from a safepoint
+ * (precise GC) or the async-preemption signal handler (Boehm). */
+static void gopreempt(void) {
+    M *m = cur_m;
+    if (!m || !m->current) {
+        return;
+    }
+    G *g = m->current;
+    /* A LockOSThread-pinned coroutine owns its M outright — never preempt it for
+     * fairness (it is not sharing the thread with anyone). */
+    if (g->locked_m) {
+        return;
+    }
+    /* No stack-redzone probe here (unlike gosched): a preemptive yield grows no
+     * user stack — it only switches away — and this can run in signal context
+     * (Boehm), where zap_panic would be unsafe. A genuinely near-full stack is
+     * still caught at the next cooperative gosched/gopark in normal context. */
+    g->state = G_RUNNABLE;
+    g->preempt_requeue = 1;
+    g->no_preempt = 0;
     swapcontext(&g->ctx, &m->sched_ctx);
 }
 
@@ -2399,9 +2865,9 @@ static int g_is_cancelled(void) {
         return 0;
     }
     Scope *sc = g->scope;
-    pthread_mutex_lock(&sc->mu);
+    zap_np_lock(&sc->mu);
     int c = sc->cancelled;
-    pthread_mutex_unlock(&sc->mu);
+    zap_np_unlock(&sc->mu);
     return c;
 }
 
@@ -2422,11 +2888,11 @@ void zap_checkpoint(void) {
 /* An owned coroutine finished: drop it from its scope's live count and wake the
  * join barrier when the last one leaves. */
 static void scope_gdone(Scope *sc) {
-    pthread_mutex_lock(&sc->mu);
+    zap_np_lock(&sc->mu);
     if (--sc->live == 0) {
         pthread_cond_broadcast(&sc->cv);
     }
-    pthread_mutex_unlock(&sc->mu);
+    zap_np_unlock(&sc->mu);
 }
 
 /* `zap_scope_enter(on_error)` opens a scope (ticket #50). The handle is returned
@@ -2450,9 +2916,9 @@ void *zap_scope_enter(int64_t on_error) {
 void zap_spawn_scoped(void *fn_, void *arg, void *scope_) {
     zap_sched_init(0);
     Scope *sc = (Scope *)scope_;
-    pthread_mutex_lock(&sc->mu);
+    zap_np_lock(&sc->mu);
     sc->live++;
-    pthread_mutex_unlock(&sc->mu);
+    zap_np_unlock(&sc->mu);
     G *g = galloc(fn_, arg);
     g->scope = sc; /* in_live stays 0: the scope, not the root join, owns it */
     sched_enqueue(g);
@@ -2467,11 +2933,11 @@ static void scope_join(Scope *sc) {
      * BLOCKED lets a concurrent collection proceed. The scope's pending-failure
      * exceptions (sc->excs) stay rooted via the scope object itself. */
     zap_enter_blocking();
-    pthread_mutex_lock(&sc->mu);
+    zap_np_lock(&sc->mu);
     while (sc->live > 0) {
         pthread_cond_wait(&sc->cv, &sc->mu);
     }
-    pthread_mutex_unlock(&sc->mu);
+    zap_np_unlock(&sc->mu);
     zap_leave_blocking();
 }
 
@@ -2544,9 +3010,9 @@ void zap_scope_exit(void *scope_) {
  * failures the children recorded are discarded (the parent's exception wins). */
 void zap_scope_exit_cancel(void *scope_) {
     Scope *sc = (Scope *)scope_;
-    pthread_mutex_lock(&sc->mu);
+    zap_np_lock(&sc->mu);
     sc->cancelled = 1;
-    pthread_mutex_unlock(&sc->mu);
+    zap_np_unlock(&sc->mu);
     scope_join(sc);
     zap_scope_disarm(sc); /* drop any cancel_on subscription (ticket #77) */
 }
@@ -2567,7 +3033,7 @@ void zap_g_uncaught(void *exc) {
         if (exc == (void *)cancelled_exc()) {
             return; /* a cooperatively-cancelled sibling: not a failure */
         }
-        pthread_mutex_lock(&sc->mu);
+        zap_np_lock(&sc->mu);
         if (sc->nexc == sc->exc_cap) {
             int64_t ncap = sc->exc_cap ? sc->exc_cap * 2 : 4;
             ZapStr **nx = (ZapStr **)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapStr *));
@@ -2581,7 +3047,7 @@ void zap_g_uncaught(void *exc) {
         if (sc->on_error == 0) {
             sc->cancelled = 1; /* OnError.Cancel: a failure cancels siblings */
         }
-        pthread_mutex_unlock(&sc->mu);
+        zap_np_unlock(&sc->mu);
         return;
     }
     zap_uncaught(exc); /* root/detached: abort (never returns) */
@@ -2664,6 +3130,10 @@ static void gopark(pthread_mutex_t *mu, Waiter *w) {
         w->g = g;
         g->state = G_PARKED;
         g->parkmu = mu; /* scheduler unlocks once we are fully parked */
+        /* Parking ends this coroutine's current runtime critical section: the
+         * scheduler releases `mu` on our behalf, so clear the no-preempt depth
+         * (ticket #172) rather than carry it past the switch. */
+        g->no_preempt = 0;
         swapcontext(&g->ctx, &m->sched_ctx);
         /* Resumed (possibly on a different M); `mu` already released. */
     } else {
@@ -2704,9 +3174,9 @@ static void chan_send_word(ZapChan *c, uint64_t v) {
     /* A channel op is a cancellation point (design/0005): if this coroutine's
      * scope was cancelled, raise `Cancelled` rather than proceeding/blocking. */
     zap_check_cancel();
-    pthread_mutex_lock(&c->mu);
+    zap_np_lock(&c->mu);
     if (c->closed) {
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         zap_panic(zap_str_new("send on closed channel", 22));
         return;
     }
@@ -2716,14 +3186,14 @@ static void chan_send_word(ZapChan *c, uint64_t v) {
         r->val = v;
         r->ok = 1;
         goready(r);
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         return;
     }
     if (c->cap > 0 && c->count < c->cap) {
         c->buf[c->tail] = v;
         c->tail = (c->tail + 1) % c->cap;
         c->count++;
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         return;
     }
     /* Would block: unbuffered with no receiver, or buffer full. Park as a
@@ -2741,7 +3211,7 @@ static void chan_send_word(ZapChan *c, uint64_t v) {
 
 static uint64_t chan_recv_word(ZapChan *c, int *ok) {
     zap_check_cancel(); /* channel op is a cancellation point (design/0005) */
-    pthread_mutex_lock(&c->mu);
+    zap_np_lock(&c->mu);
     /* Buffered value available: take it, then let a waiting sender refill. */
     if (c->count > 0) {
         uint64_t v = c->buf[c->head];
@@ -2755,7 +3225,7 @@ static uint64_t chan_recv_word(ZapChan *c, int *ok) {
             s->ok = 1;
             goready(s);
         }
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         if (ok) {
             *ok = 1;
         }
@@ -2767,14 +3237,14 @@ static uint64_t chan_recv_word(ZapChan *c, int *ok) {
         uint64_t v = s->val;
         s->ok = 1;
         goready(s);
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         if (ok) {
             *ok = 1;
         }
         return v;
     }
     if (c->closed) {
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         if (ok) {
             *ok = 0;
         }
@@ -2812,7 +3282,7 @@ void *zap_chan_recv_ptr(void *ch) {
 
 void zap_chan_close(void *ch) {
     ZapChan *c = (ZapChan *)ch;
-    pthread_mutex_lock(&c->mu);
+    zap_np_lock(&c->mu);
     c->closed = 1;
     /* Waiting senders fail (send on closed); waiting receivers drain to the
      * closed zero-value with ok == 0. */
@@ -2827,7 +3297,7 @@ void zap_chan_close(void *ch) {
         w->val = 0;
         goready(w);
     }
-    pthread_mutex_unlock(&c->mu);
+    zap_np_unlock(&c->mu);
 }
 
 /* ===========================================================================
@@ -3012,9 +3482,9 @@ static void np_all_remove_locked(PollDesc *pd) { /* caller holds g_np_mu */
 static int np_compute_timeout(void) {
     int have = 0;
     int64_t best = 0;
-    pthread_mutex_lock(&g_np_mu);
+    zap_np_lock(&g_np_mu);
     for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
-        pthread_mutex_lock(&pd->mu);
+        zap_np_lock(&pd->mu);
         int64_t d = 0;
         if (pd->rg && pd->r_deadline) {
             d = pd->r_deadline;
@@ -3022,13 +3492,13 @@ static int np_compute_timeout(void) {
         if (pd->wg && pd->w_deadline && (d == 0 || pd->w_deadline < d)) {
             d = pd->w_deadline;
         }
-        pthread_mutex_unlock(&pd->mu);
+        zap_np_unlock(&pd->mu);
         if (d && (!have || d < best)) {
             best = d;
             have = 1;
         }
     }
-    pthread_mutex_unlock(&g_np_mu);
+    zap_np_unlock(&g_np_mu);
     if (!have) {
         return -1;
     }
@@ -3046,9 +3516,9 @@ static int np_compute_timeout(void) {
 /* Wake every waiter whose deadline has passed (called after each poll wait). */
 static void np_expire_deadlines(void) {
     int64_t now = np_now_ns();
-    pthread_mutex_lock(&g_np_mu);
+    zap_np_lock(&g_np_mu);
     for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
-        pthread_mutex_lock(&pd->mu);
+        zap_np_lock(&pd->mu);
         if (pd->rg && pd->r_deadline && pd->r_deadline <= now) {
             Waiter *w = pd->rg;
             pd->rg = NULL;
@@ -3063,9 +3533,9 @@ static void np_expire_deadlines(void) {
             w->val = ZAP_POLL_TIMEOUT;
             goready(w);
         }
-        pthread_mutex_unlock(&pd->mu);
+        zap_np_unlock(&pd->mu);
     }
-    pthread_mutex_unlock(&g_np_mu);
+    zap_np_unlock(&g_np_mu);
 }
 
 #if defined(ZAP_NETPOLL_EPOLL)
@@ -3094,7 +3564,7 @@ static void *np_poller_main(void *arg) {
             }
             PollDesc *pd = (PollDesc *)p;
             uint32_t e = evs[i].events;
-            pthread_mutex_lock(&pd->mu);
+            zap_np_lock(&pd->mu);
             /* An error/hangup counts as readiness for BOTH directions so the
              * parked G wakes and observes the condition via its next syscall. */
             if (e & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
@@ -3103,7 +3573,7 @@ static void *np_poller_main(void *arg) {
             if (e & (EPOLLOUT | EPOLLERR | EPOLLHUP)) {
                 np_wake_dir_locked(pd, 0, ZAP_POLL_OK);
             }
-            pthread_mutex_unlock(&pd->mu);
+            zap_np_unlock(&pd->mu);
         }
         np_expire_deadlines();
     }
@@ -3147,12 +3617,12 @@ static void netpoll_shutdown(void) {
 
 /* ---- descriptor lifecycle ------------------------------------------------- */
 static PollDesc *np_pd_alloc(int fd) {
-    pthread_mutex_lock(&g_np_mu);
+    zap_np_lock(&g_np_mu);
     PollDesc *pd = g_np_free;
     if (pd) {
         g_np_free = pd->free_link;
     }
-    pthread_mutex_unlock(&g_np_mu);
+    zap_np_unlock(&g_np_mu);
     if (!pd) {
         pd = (PollDesc *)malloc(sizeof(PollDesc));
         if (!pd) {
@@ -3181,20 +3651,20 @@ void *zap_netpoll_open(int64_t fd) {
     if (!pd) {
         return NULL;
     }
-    pthread_mutex_lock(&g_np_mu);
+    zap_np_lock(&g_np_mu);
     pd->all_prev = NULL;
     pd->all_next = g_np_all;
     if (g_np_all) {
         g_np_all->all_prev = pd;
     }
     g_np_all = pd;
-    pthread_mutex_unlock(&g_np_mu);
+    zap_np_unlock(&g_np_mu);
     if (np_backend_add(pd) != 0) {
-        pthread_mutex_lock(&g_np_mu);
+        zap_np_lock(&g_np_mu);
         np_all_remove_locked(pd);
         pd->free_link = g_np_free;
         g_np_free = pd;
-        pthread_mutex_unlock(&g_np_mu);
+        zap_np_unlock(&g_np_mu);
         return NULL;
     }
     return pd;
@@ -3207,19 +3677,19 @@ void *zap_netpoll_open(int64_t fd) {
 int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
     PollDesc *pd = (PollDesc *)pd_;
     int is_read = (mode == ZAP_POLL_READ);
-    pthread_mutex_lock(&pd->mu);
+    zap_np_lock(&pd->mu);
     if (pd->closing) {
-        pthread_mutex_unlock(&pd->mu);
+        zap_np_unlock(&pd->mu);
         return ZAP_POLL_CLOSED;
     }
     int *ready = is_read ? &pd->r_ready : &pd->w_ready;
     if (*ready) {
         *ready = 0; /* consume a latched readiness edge without parking */
-        pthread_mutex_unlock(&pd->mu);
+        zap_np_unlock(&pd->mu);
         return ZAP_POLL_OK;
     }
     if (deadline_ns && deadline_ns <= np_now_ns()) {
-        pthread_mutex_unlock(&pd->mu);
+        zap_np_unlock(&pd->mu);
         return ZAP_POLL_TIMEOUT;
     }
     Waiter w;
@@ -3250,7 +3720,7 @@ int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
  * use to interrupt a netpoller wait. */
 void zap_netpoll_wake(void *pd_, int64_t mode) {
     PollDesc *pd = (PollDesc *)pd_;
-    pthread_mutex_lock(&pd->mu);
+    zap_np_lock(&pd->mu);
     if (mode & ZAP_POLL_READ) {
         if (pd->rg) {
             Waiter *w = pd->rg;
@@ -3273,15 +3743,15 @@ void zap_netpoll_wake(void *pd_, int64_t mode) {
             pd->w_ready = 1; /* latch: the next write wait returns at once */
         }
     }
-    pthread_mutex_unlock(&pd->mu);
+    zap_np_unlock(&pd->mu);
 }
 
 /* Deregister `fd` and release the descriptor. Any waiter still parked is woken
  * with ZAP_POLL_CLOSED. The caller still owns (and should close) the fd itself. */
 void zap_netpoll_close(void *pd_) {
     PollDesc *pd = (PollDesc *)pd_;
-    pthread_mutex_lock(&g_np_mu);
-    pthread_mutex_lock(&pd->mu);
+    zap_np_lock(&g_np_mu);
+    zap_np_lock(&pd->mu);
     pd->closing = 1;
     np_backend_del(pd);
     if (pd->rg) {
@@ -3297,10 +3767,10 @@ void zap_netpoll_close(void *pd_) {
         goready(w);
     }
     np_all_remove_locked(pd);
-    pthread_mutex_unlock(&pd->mu);
+    zap_np_unlock(&pd->mu);
     pd->free_link = g_np_free; /* recycle; a woken waiter never touches pd again */
     g_np_free = pd;
-    pthread_mutex_unlock(&g_np_mu);
+    zap_np_unlock(&g_np_mu);
 }
 
 /* ---- integration self-test (ticket #80) ----------------------------------- *
@@ -3557,9 +4027,9 @@ static const char *sig_name(int s) {
  * value was delivered/buffered, 0 if dropped. Mirrors chan_send_word's fast
  * paths without the parking tail. */
 static int chan_offer_word(ZapChan *c, uint64_t v) {
-    pthread_mutex_lock(&c->mu);
+    zap_np_lock(&c->mu);
     if (c->closed) {
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         return 0;
     }
     if (c->count == 0 && c->recvq_head) {
@@ -3567,17 +4037,17 @@ static int chan_offer_word(ZapChan *c, uint64_t v) {
         r->val = v;
         r->ok = 1;
         goready(r);
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         return 1;
     }
     if (c->cap > 0 && c->count < c->cap) {
         c->buf[c->tail] = v;
         c->tail = (c->tail + 1) % c->cap;
         c->count++;
-        pthread_mutex_unlock(&c->mu);
+        zap_np_unlock(&c->mu);
         return 1;
     }
-    pthread_mutex_unlock(&c->mu);
+    zap_np_unlock(&c->mu);
     return 0; /* coalesce: drop this edge */
 }
 
@@ -3595,9 +4065,9 @@ static const char *gstate_name(GState s) {
 /* Count live goroutines (runnable+running+parked). Reads the static g_all[]
  * registry under its lock; safe from any thread. */
 int64_t zap_runtime_num_goroutines(void) {
-    pthread_mutex_lock(&g_all_mu);
+    zap_np_lock(&g_all_mu);
     int64_t n = g_all_len;
-    pthread_mutex_unlock(&g_all_mu);
+    zap_np_unlock(&g_all_mu);
     return n;
 }
 
@@ -3625,18 +4095,18 @@ int64_t zap_gc_free_bytes(void) {
  * stack traces (unwinding each green stack) are a follow-up (noted in the PR). */
 static void zap_goroutine_dump_to(FILE *f) {
     int64_t ng, maxprocs, live;
-    pthread_mutex_lock(&g_live_mu);
+    zap_np_lock(&g_live_mu);
     live = g_live;
-    pthread_mutex_unlock(&g_live_mu);
+    zap_np_unlock(&g_live_mu);
     maxprocs = (int64_t)g_nm;
     fprintf(f, "=== zap runtime dump ===\n");
-    fprintf(f, "GOMAXPROCS(M=P): %lld  root-live goroutines: %lld\n",
+    fprintf(f, "MAXPROCS(M=P): %lld  root-live goroutines: %lld\n",
             (long long)maxprocs, (long long)live);
     int64_t heap = 0, lb = 0;
     zap_gc_stats(&heap, &lb);
     fprintf(f, "GC: cycles=%lld heap=%lld bytes live=%lld bytes\n",
             (long long)zap_gc_count(), (long long)heap, (long long)lb);
-    pthread_mutex_lock(&g_all_mu);
+    zap_np_lock(&g_all_mu);
     ng = g_all_len;
     fprintf(f, "goroutines: %lld\n", (long long)ng);
     for (int64_t i = 0; i < g_all_len; i++) {
@@ -3648,7 +4118,7 @@ static void zap_goroutine_dump_to(FILE *f) {
         fprintf(f, "  goroutine %lld [%s, %s]\n", (long long)i,
                 gstate_name(g->state), own);
     }
-    pthread_mutex_unlock(&g_all_mu);
+    zap_np_unlock(&g_all_mu);
     fprintf(f, "========================\n");
     fflush(f);
 }
@@ -3678,7 +4148,7 @@ static void zap_sig_dispatch(int signo) {
     if (signo <= 0 || signo >= ZAP_NSIG) {
         return;
     }
-    pthread_mutex_lock(&g_sig_mu);
+    zap_np_lock(&g_sig_mu);
     /* Any user handler for this signal — a `notify` subscriber OR a
      * `scope(cancel_on=...)` subscription — takes over its disposition and
      * suppresses the built-in default (D-0058 "a user notify/@on_signal for that
@@ -3693,16 +4163,16 @@ static void zap_sig_dispatch(int signo) {
             continue;
         }
         Scope *sc = ss->scope;
-        pthread_mutex_lock(&sc->mu);
+        zap_np_lock(&sc->mu);
         sc->cancelled = 1;
         pthread_cond_broadcast(&sc->cv);
-        pthread_mutex_unlock(&sc->mu);
+        zap_np_unlock(&sc->mu);
         if (ss->grace_ms > 0) {
             zap_grace_arm(ss);
         }
     }
     int run_default = (!had_sub) && g_sig_default[signo];
-    pthread_mutex_unlock(&g_sig_mu);
+    zap_np_unlock(&g_sig_mu);
     /* A cancel_on signal may leave coroutines parked on a channel; they observe
      * the cancel at their next cancellation point (cooperative model). Forcing a
      * wake of an arbitrarily-parked G is the netpoller-backed follow-up. */
@@ -3756,10 +4226,10 @@ static void *zap_sig_thread_main(void *arg) {
                 if (buf[i] == ZAP_SIG_SYNC_BYTE) {
                     /* Drain barrier: every earlier edge in this FIFO has now been
                      * dispatched, so release any waiter in zap_signal_drain. */
-                    pthread_mutex_lock(&g_sig_sync_mu);
+                    zap_np_lock(&g_sig_sync_mu);
                     g_sig_sync_seq++;
                     pthread_cond_broadcast(&g_sig_sync_cv);
-                    pthread_mutex_unlock(&g_sig_sync_mu);
+                    zap_np_unlock(&g_sig_sync_mu);
                 } else {
                     zap_sig_dispatch((int)buf[i]);
                 }
@@ -3930,12 +4400,12 @@ void zap_signal_init(void) {
     if (zap_signal_ensure() != 0) {
         return;
     }
-    pthread_mutex_lock(&g_sig_mu);
+    zap_np_lock(&g_sig_mu);
     g_sig_default[SIGQUIT] = 1;
     zap_sig_install(SIGQUIT);
     g_sig_default[SIGUSR1] = 1;
     zap_sig_install(SIGUSR1);
-    pthread_mutex_unlock(&g_sig_mu);
+    zap_np_unlock(&g_sig_mu);
 #endif
 }
 
@@ -3947,11 +4417,11 @@ void *zap_signal_notify(int64_t signo) {
     void *ch = zap_chan_new(1); /* cap-1 buffered + coalescing (D-0058) */
     SigSub *s = (SigSub *)zap_obj(&zap_desc_sigsub);
     s->chan = ch;
-    pthread_mutex_lock(&g_sig_mu);
+    zap_np_lock(&g_sig_mu);
     s->next = g_sig_subs[signo];
     g_sig_subs[signo] = s;
     zap_sig_install((int)signo); /* notify takes over disposition */
-    pthread_mutex_unlock(&g_sig_mu);
+    zap_np_unlock(&g_sig_mu);
     return ch;
 }
 
@@ -3996,12 +4466,12 @@ static void *zap_grace_timer(void *arg) {
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
-    pthread_mutex_lock(&g_sig_mu);
+    zap_np_lock(&g_sig_mu);
     int done = ss->completed;
     if (--ss->refcnt == 0) {
         free(ss);
     }
-    pthread_mutex_unlock(&g_sig_mu);
+    zap_np_unlock(&g_sig_mu);
     if (!done) {
         fprintf(stderr,
                 "zap: graceful-shutdown grace period (%lldms) elapsed; forcing exit\n",
@@ -4032,7 +4502,7 @@ void zap_scope_cancel_on(void *scope_, int64_t mask, int64_t grace_ms) {
         return;
     }
     Scope *sc = (Scope *)scope_;
-    pthread_mutex_lock(&g_sig_mu);
+    zap_np_lock(&g_sig_mu);
     for (int s = 1; s < ZAP_NSIG && s < 63; s++) {
         if (!(mask & (1LL << s))) {
             continue;
@@ -4049,7 +4519,7 @@ void zap_scope_cancel_on(void *scope_, int64_t mask, int64_t grace_ms) {
         g_scope_subs[s] = n;
         zap_sig_install(s);
     }
-    pthread_mutex_unlock(&g_sig_mu);
+    zap_np_unlock(&g_sig_mu);
 }
 
 /* Remove every cancel_on subscription for `scope` (its block has exited). Marks
@@ -4057,7 +4527,7 @@ void zap_scope_cancel_on(void *scope_, int64_t mask, int64_t grace_ms) {
  * no outstanding timer. */
 void zap_scope_disarm(void *scope_) {
     Scope *sc = (Scope *)scope_;
-    pthread_mutex_lock(&g_sig_mu);
+    zap_np_lock(&g_sig_mu);
     for (int s = 1; s < ZAP_NSIG; s++) {
         ScopeSigSub **pp = &g_scope_subs[s];
         while (*pp) {
@@ -4073,19 +4543,19 @@ void zap_scope_disarm(void *scope_) {
             }
         }
     }
-    pthread_mutex_unlock(&g_sig_mu);
+    zap_np_unlock(&g_sig_mu);
 }
 
 /* ---- Immix root marker: keep notify channels + sub nodes reachable -------- */
 #ifdef ZAP_GC_IMMIX
 static void zap_sig_mark_roots(void) {
-    pthread_mutex_lock(&g_sig_mu);
+    zap_np_lock(&g_sig_mu);
     for (int s = 0; s < ZAP_NSIG; s++) {
         /* Marking each head traces the whole {next, chan} chain via the precise
          * SigSub descriptor (the marker is a transitive BFS worklist). */
         zap_gc_mark(g_sig_subs[s]);
     }
-    pthread_mutex_unlock(&g_sig_mu);
+    zap_np_unlock(&g_sig_mu);
 }
 #endif
 
@@ -4126,7 +4596,7 @@ void zap_signal_drain(void) {
      * reach while parked here. Its roots were flushed on entry (same contract as
      * gopark's native-waiter path / scope_join). */
     zap_enter_blocking();
-    pthread_mutex_lock(&g_sig_sync_mu);
+    zap_np_lock(&g_sig_sync_mu);
     int64_t want = g_sig_sync_seq + 1;
     unsigned char b = ZAP_SIG_SYNC_BYTE;
     ssize_t r;
@@ -4136,7 +4606,7 @@ void zap_signal_drain(void) {
     while (g_sig_sync_seq < want) {
         pthread_cond_wait(&g_sig_sync_cv, &g_sig_sync_mu);
     }
-    pthread_mutex_unlock(&g_sig_sync_mu);
+    zap_np_unlock(&g_sig_sync_mu);
     zap_leave_blocking();
 }
 
@@ -4164,9 +4634,9 @@ int64_t zap_signal_selftest(void) {
     for (int i = 0; i < 100; i++) {
         struct timespec ts = {0, 1000000L}; /* 1 ms */
         nanosleep(&ts, NULL);
-        pthread_mutex_lock(&((ZapChan *)ch)->mu);
+        zap_np_lock(&((ZapChan *)ch)->mu);
         int64_t cnt = ((ZapChan *)ch)->count;
-        pthread_mutex_unlock(&((ZapChan *)ch)->mu);
+        zap_np_unlock(&((ZapChan *)ch)->mu);
         if (cnt > 0) {
             break;
         }
@@ -4182,9 +4652,9 @@ int64_t zap_signal_selftest(void) {
                 (long long)got, SIGUSR2);
     }
     /* The coalesced edge must have left the channel empty (no second value). */
-    pthread_mutex_lock(&((ZapChan *)ch)->mu);
+    zap_np_lock(&((ZapChan *)ch)->mu);
     int64_t remaining = ((ZapChan *)ch)->count;
-    pthread_mutex_unlock(&((ZapChan *)ch)->mu);
+    zap_np_unlock(&((ZapChan *)ch)->mu);
     if (remaining == 0) {
         passed++;
     } else {
@@ -5795,17 +6265,17 @@ static uint64_t zap_rng_bounded_locked(uint64_t n) {
 }
 
 void zap_random_seed(int64_t n) {
-    pthread_mutex_lock(&zap_rng_mu);
+    zap_np_lock(&zap_rng_mu);
     zap_rng_seed_locked((uint64_t)n);
-    pthread_mutex_unlock(&zap_rng_mu);
+    zap_np_unlock(&zap_rng_mu);
 }
 
 /* A double in [0, 1): the top 53 bits scaled by 2^-53. */
 double zap_random_f64(void) {
-    pthread_mutex_lock(&zap_rng_mu);
+    zap_np_lock(&zap_rng_mu);
     zap_rng_ensure_locked();
     uint64_t x = zap_rng_next_locked();
-    pthread_mutex_unlock(&zap_rng_mu);
+    zap_np_unlock(&zap_rng_mu);
     return (double)(x >> 11) * (1.0 / 9007199254740992.0); /* 2^53 */
 }
 
@@ -5819,12 +6289,12 @@ int64_t zap_random_randint(int64_t a, int64_t b) {
         abort();
     }
     uint64_t span = (uint64_t)(b - a) + 1ULL; /* inclusive, wrap-safe */
-    pthread_mutex_lock(&zap_rng_mu);
+    zap_np_lock(&zap_rng_mu);
     zap_rng_ensure_locked();
     uint64_t off = (span == 0ULL) /* a..b spans the full int64 width */
                        ? zap_rng_next_locked()
                        : zap_rng_bounded_locked(span);
-    pthread_mutex_unlock(&zap_rng_mu);
+    zap_np_unlock(&zap_rng_mu);
     return (int64_t)((uint64_t)a + off);
 }
 
@@ -5835,10 +6305,10 @@ int64_t zap_random_list_index(void *l) {
         fprintf(stderr, "zap: random.choice from an empty sequence\n");
         abort();
     }
-    pthread_mutex_lock(&zap_rng_mu);
+    zap_np_lock(&zap_rng_mu);
     zap_rng_ensure_locked();
     uint64_t idx = zap_rng_bounded_locked((uint64_t)list->len);
-    pthread_mutex_unlock(&zap_rng_mu);
+    zap_np_unlock(&zap_rng_mu);
     return (int64_t)idx;
 }
 
@@ -5846,7 +6316,7 @@ int64_t zap_random_list_index(void *l) {
  * pointer words keep their GC identity, only their positions change). */
 void zap_random_shuffle(void *l) {
     ZapList *list = (ZapList *)l;
-    pthread_mutex_lock(&zap_rng_mu);
+    zap_np_lock(&zap_rng_mu);
     zap_rng_ensure_locked();
     for (int64_t i = list->len - 1; i > 0; i--) {
         uint64_t j = zap_rng_bounded_locked((uint64_t)(i + 1));
@@ -5854,7 +6324,7 @@ void zap_random_shuffle(void *l) {
         list->data[i] = list->data[(int64_t)j];
         list->data[(int64_t)j] = tmp;
     }
-    pthread_mutex_unlock(&zap_rng_mu);
+    zap_np_unlock(&zap_rng_mu);
 }
 
 /* ===========================================================================
@@ -6520,34 +6990,34 @@ static const char *zap_log_levelname(int64_t level, char *scratch, size_t n) {
 
 /* logging.set_level(level): drop records below `level`. */
 void zap_logging_set_level(int64_t level) {
-    pthread_mutex_lock(&g_log_mu);
+    zap_np_lock(&g_log_mu);
     g_log_level = level;
-    pthread_mutex_unlock(&g_log_mu);
+    zap_np_unlock(&g_log_mu);
 }
 
 /* logging.get_level() -> int64. */
 int64_t zap_logging_get_level(void) {
-    pthread_mutex_lock(&g_log_mu);
+    zap_np_lock(&g_log_mu);
     int64_t v = g_log_level;
-    pthread_mutex_unlock(&g_log_mu);
+    zap_np_unlock(&g_log_mu);
     return v;
 }
 
 /* logging.set_stream(fd): direct output to a raw fd (e.g. sys.stdout_fd()). */
 void zap_logging_set_stream(int64_t fd) {
-    pthread_mutex_lock(&g_log_mu);
+    zap_np_lock(&g_log_mu);
     g_log_fd = (int)fd;
-    pthread_mutex_unlock(&g_log_mu);
+    zap_np_unlock(&g_log_mu);
 }
 
 /* logging.set_format(fmt): the line template (tokens %(asctime)s /
  * %(levelname)s / %(message)s). */
 void zap_logging_set_format(void *fmt_) {
     char *dup = zap_cfg_dup((ZapStr *)fmt_);
-    pthread_mutex_lock(&g_log_mu);
+    zap_np_lock(&g_log_mu);
     free(g_log_fmt);
     g_log_fmt = dup;
-    pthread_mutex_unlock(&g_log_mu);
+    zap_np_unlock(&g_log_mu);
 }
 
 /* logging.log(level, msg) and the per-level emitters: format one line per the
@@ -6555,9 +7025,9 @@ void zap_logging_set_format(void *fmt_) {
  * across the write so lines from concurrent goroutines never interleave. */
 void zap_logging_log(int64_t level, void *msg_) {
     ZapStr *msg = (ZapStr *)msg_;
-    pthread_mutex_lock(&g_log_mu);
+    zap_np_lock(&g_log_mu);
     if (level < g_log_level) {
-        pthread_mutex_unlock(&g_log_mu);
+        zap_np_unlock(&g_log_mu);
         return;
     }
     const char *fmt = g_log_fmt ? g_log_fmt : ZAP_LOG_DEFAULT_FMT;
@@ -6610,7 +7080,7 @@ void zap_logging_log(int64_t level, void *msg_) {
         off += (size_t)w;
     }
     free(b.p);
-    pthread_mutex_unlock(&g_log_mu);
+    zap_np_unlock(&g_log_mu);
 }
 
 /* ===========================================================================
@@ -6711,27 +7181,27 @@ static void zap_ap_spelling(ZapSB *b, const ApArg *a, int in_usage) {
 /* argparse.set_prog(name). */
 void zap_argparse_set_prog(void *name_) {
     char *dup = zap_cfg_dup((ZapStr *)name_);
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     free(g_ap_prog);
     g_ap_prog = dup;
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
 }
 
 /* argparse.set_description(text). */
 void zap_argparse_set_description(void *text_) {
     char *dup = zap_cfg_dup((ZapStr *)text_);
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     free(g_ap_desc);
     g_ap_desc = dup;
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
 }
 
 /* argparse.add_flag(name): a boolean "--name" (default false). */
 void zap_argparse_add_flag(void *name_) {
     char *name = zap_cfg_dup((ZapStr *)name_);
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     const char *err = zap_ap_add(name, AP_FLAG, NULL, 0);
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     free(name);
     if (err != NULL) {
         zap_ap_fail(err);
@@ -6741,9 +7211,9 @@ void zap_argparse_add_flag(void *name_) {
 /* argparse.add_positional(name): a required positional string argument. */
 void zap_argparse_add_positional(void *name_) {
     char *name = zap_cfg_dup((ZapStr *)name_);
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     const char *err = zap_ap_add(name, AP_POSITIONAL, NULL, 0);
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     free(name);
     if (err != NULL) {
         zap_ap_fail(err);
@@ -6754,9 +7224,9 @@ void zap_argparse_add_positional(void *name_) {
 void zap_argparse_add_option(void *name_, void *def_) {
     char *name = zap_cfg_dup((ZapStr *)name_);
     char *def = zap_cfg_dup((ZapStr *)def_);
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     const char *err = zap_ap_add(name, AP_OPTION, def, 0);
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     free(name);
     if (err != NULL) {
         zap_ap_fail(err);
@@ -6766,9 +7236,9 @@ void zap_argparse_add_option(void *name_, void *def_) {
 /* argparse.add_int(name, default): a "--name VALUE" int64 option. */
 void zap_argparse_add_int(void *name_, int64_t def) {
     char *name = zap_cfg_dup((ZapStr *)name_);
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     const char *err = zap_ap_add(name, AP_INT, NULL, def);
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     free(name);
     if (err != NULL) {
         zap_ap_fail(err);
@@ -6838,7 +7308,7 @@ void zap_argparse_parse(void *argv_) {
     const char *err = NULL;
     int printed_help = 0;
 
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     if (g_ap_prog == NULL && n >= 1) {
         ZapStr *p0 = (ZapStr *)zap_list_get_ptr(argv_, 0);
         g_ap_prog = zap_cfg_dup(p0);
@@ -6948,7 +7418,7 @@ void zap_argparse_parse(void *argv_) {
             }
         }
     }
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     if (err != NULL) {
         zap_ap_fail(err);
     }
@@ -6960,7 +7430,7 @@ void *zap_argparse_get(void *name_) {
     char errbuf[256];
     const char *err = NULL;
     char *val = NULL;
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     ApArg *a = zap_ap_find(name);
     if (a == NULL) {
         snprintf(errbuf, sizeof errbuf, "no such argument: '%s'", name);
@@ -6971,7 +7441,7 @@ void *zap_argparse_get(void *name_) {
     } else {
         val = strdup(a->sval ? a->sval : "");
     }
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     free(name);
     if (err != NULL) {
         zap_ap_fail(err);
@@ -6987,7 +7457,7 @@ int64_t zap_argparse_get_int(void *name_) {
     char errbuf[256];
     const char *err = NULL;
     int64_t val = 0;
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     ApArg *a = zap_ap_find(name);
     if (a == NULL) {
         snprintf(errbuf, sizeof errbuf, "no such argument: '%s'", name);
@@ -6998,7 +7468,7 @@ int64_t zap_argparse_get_int(void *name_) {
     } else {
         val = a->ival;
     }
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     free(name);
     if (err != NULL) {
         zap_ap_fail(err);
@@ -7012,7 +7482,7 @@ int64_t zap_argparse_get_flag(void *name_) {
     char errbuf[256];
     const char *err = NULL;
     int64_t val = 0;
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     ApArg *a = zap_ap_find(name);
     if (a == NULL) {
         snprintf(errbuf, sizeof errbuf, "no such argument: '%s'", name);
@@ -7023,7 +7493,7 @@ int64_t zap_argparse_get_flag(void *name_) {
     } else {
         val = a->present ? 1 : 0;
     }
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     free(name);
     if (err != NULL) {
         zap_ap_fail(err);
@@ -7033,9 +7503,9 @@ int64_t zap_argparse_get_flag(void *name_) {
 
 /* argparse.format_help() -> str: the generated usage/help text. */
 void *zap_argparse_format_help(void) {
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     char *help = zap_ap_format_help_locked();
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     void *out = zap_str_new(help, (int64_t)strlen(help));
     free(help);
     return out;
@@ -7043,15 +7513,15 @@ void *zap_argparse_format_help(void) {
 
 /* argparse.help_requested() -> int64 0/1: whether -h/--help was seen. */
 int64_t zap_argparse_help_requested(void) {
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     int64_t v = g_ap_help ? 1 : 0;
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
     return v;
 }
 
 /* argparse.reset(): clear all registered arguments and parsed state. */
 void zap_argparse_reset(void) {
-    pthread_mutex_lock(&g_ap_mu);
+    zap_np_lock(&g_ap_mu);
     for (int i = 0; i < g_ap_nargs; i++) {
         free(g_ap_args[i].name);
         free(g_ap_args[i].sval);
@@ -7064,7 +7534,7 @@ void zap_argparse_reset(void) {
     free(g_ap_desc);
     g_ap_desc = NULL;
     g_ap_help = 0;
-    pthread_mutex_unlock(&g_ap_mu);
+    zap_np_unlock(&g_ap_mu);
 }
 
 /* JSON boolean literal — lowercase "true"/"false" (RFC 8259), for the
@@ -7952,10 +8422,10 @@ void *zap_mutex_new(void) {
 
 void zap_mutex_lock(void *mp) {
     ZapMutex *m = (ZapMutex *)mp;
-    pthread_mutex_lock(&m->mu);
+    zap_np_lock(&m->mu);
     if (!m->locked) {
         m->locked = 1;
-        pthread_mutex_unlock(&m->mu);
+        zap_np_unlock(&m->mu);
         return;
     }
     /* Contended: enqueue and park. On wake the lock has been handed to us
@@ -7969,19 +8439,19 @@ void zap_mutex_lock(void *mp) {
 /* Try to acquire without blocking: 1 on success, 0 if already held. */
 int64_t zap_mutex_trylock(void *mp) {
     ZapMutex *m = (ZapMutex *)mp;
-    pthread_mutex_lock(&m->mu);
+    zap_np_lock(&m->mu);
     int64_t got = 0;
     if (!m->locked) {
         m->locked = 1;
         got = 1;
     }
-    pthread_mutex_unlock(&m->mu);
+    zap_np_unlock(&m->mu);
     return got;
 }
 
 void zap_mutex_unlock(void *mp) {
     ZapMutex *m = (ZapMutex *)mp;
-    pthread_mutex_lock(&m->mu);
+    zap_np_lock(&m->mu);
     Waiter *nx = q_pop(&m->wq_head, &m->wq_tail);
     if (nx) {
         /* Direct handoff: ownership passes to `nx`; `locked` stays 1. */
@@ -7989,7 +8459,7 @@ void zap_mutex_unlock(void *mp) {
     } else {
         m->locked = 0;
     }
-    pthread_mutex_unlock(&m->mu);
+    zap_np_unlock(&m->mu);
 }
 
 /* ---- WaitGroup: the primary join for fire-and-forget `spawn`s (D-0032) -----
@@ -8014,10 +8484,10 @@ void *zap_waitgroup_new(void) {
 
 void zap_waitgroup_add(void *wp, int64_t n) {
     ZapWaitGroup *w = (ZapWaitGroup *)wp;
-    pthread_mutex_lock(&w->mu);
+    zap_np_lock(&w->mu);
     w->count += n;
     if (w->count < 0) {
-        pthread_mutex_unlock(&w->mu);
+        zap_np_unlock(&w->mu);
         zap_panic(zap_str_new("negative WaitGroup counter", 26));
         return;
     }
@@ -8028,16 +8498,16 @@ void zap_waitgroup_add(void *wp, int64_t n) {
             goready(x);
         }
     }
-    pthread_mutex_unlock(&w->mu);
+    zap_np_unlock(&w->mu);
 }
 
 void zap_waitgroup_done(void *wp) { zap_waitgroup_add(wp, -1); }
 
 void zap_waitgroup_wait(void *wp) {
     ZapWaitGroup *w = (ZapWaitGroup *)wp;
-    pthread_mutex_lock(&w->mu);
+    zap_np_lock(&w->mu);
     if (w->count == 0) {
-        pthread_mutex_unlock(&w->mu);
+        zap_np_unlock(&w->mu);
         return;
     }
     Waiter x;
@@ -8077,14 +8547,14 @@ void *zap_once_new(void) {
 
 int64_t zap_once_begin(void *op) {
     ZapOnce *o = (ZapOnce *)op;
-    pthread_mutex_lock(&o->mu);
+    zap_np_lock(&o->mu);
     if (o->state == 2) {
-        pthread_mutex_unlock(&o->mu);
+        zap_np_unlock(&o->mu);
         return 0; /* already completed */
     }
     if (o->state == 0) {
         o->state = 1;
-        pthread_mutex_unlock(&o->mu);
+        zap_np_unlock(&o->mu);
         return 1; /* winner: caller runs init, then calls once_end */
     }
     /* state == 1: a winner is running init; park until it completes. */
@@ -8097,13 +8567,13 @@ int64_t zap_once_begin(void *op) {
 
 void zap_once_end(void *op) {
     ZapOnce *o = (ZapOnce *)op;
-    pthread_mutex_lock(&o->mu);
+    zap_np_lock(&o->mu);
     o->state = 2;
     Waiter *x;
     while ((x = q_pop(&o->wq_head, &o->wq_tail)) != NULL) {
         goready(x);
     }
-    pthread_mutex_unlock(&o->mu);
+    zap_np_unlock(&o->mu);
 }
 
 /* ===========================================================================

@@ -135,6 +135,21 @@ fn golden_programs_match() {
 
         let mut cmd = Command::new(bin);
         cmd.arg("run").arg(&zap);
+        // Optional `*.env` sidecar: `KEY=VALUE` lines set on the child's
+        // environment. Used to make a scheduler knob load-bearing in a fixture —
+        // e.g. `MAXPROCS=1` so the preemption golden forces all coroutines onto a
+        // single worker M (ticket #172).
+        if let Ok(env) = std::fs::read_to_string(zap.with_extension("env")) {
+            for line in env.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    cmd.env(k.trim(), v.trim());
+                }
+            }
+        }
         let output = run_with_timeout(cmd, per_test, &zap.display().to_string());
 
         let got = String::from_utf8_lossy(&output.stdout);

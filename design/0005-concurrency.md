@@ -409,14 +409,29 @@ The runtime multiplexes many coroutines (**G**) over a small pool of OS threads
 - **Run queues & work stealing.** Each P has a LIFO/FIFO local run queue; idle
   Ps steal from others and from a global queue, giving load balance without a
   central lock on the hot path.
-- **Count of M.** Defaults to the number of hardware threads, overridable by an
-  env var / runtime call (the `GOMAXPROCS` analogue); exact name is an open
-  issue.
+- **Count of M.** Defaults to the number of hardware threads, overridable by the
+  env var `MAXPROCS` or the runtime call `runtime.maxprocs()` (ticket #172 —
+  our term, plainly `MAXPROCS`; the old `ZAP_MAXPROCS` prefix and
+  GOMAXPROCS-analogue naming are dropped).
 - **Scheduling points.** A coroutine yields its M at channel ops, `select`,
   locks, `sleep`/timers, I/O waits, nested `scope:` boundaries, and
   `checkpoint()`.
-  v1 is **cooperative** at these points; preemption of long CPU loops without a
-  `checkpoint()` is deferred (open issue).
+  Beyond these cooperative points, a long CPU-bound coroutine is now **preempted
+  asynchronously** (ticket #172): a monitor thread detects a coroutine that has
+  run on its M past a time slice (~10 ms) and sends it `SIGURG`. Under the
+  precise collector the signal records a request honored at the next GC safepoint
+  (loop back-edge / function entry — the shadow chain is consistent there, so
+  parking is GC-safe); under the conservative Boehm collector — which scans the
+  preempted coroutine's saved context + stack conservatively — the handler
+  switches it off its M at the interrupted point directly, unless it holds a
+  runtime lock / is mid-allocation, in which case the monitor retries. A
+  preempted coroutine is requeued on the global run queue so peers run first.
+- **Dedicated OS thread (`runtime.lock_os_thread`).** A coroutine may pin itself
+  to its own dedicated OS thread until `runtime.unlock_os_thread()` (Go's
+  `LockOSThread` analogue, ticket #172): no other coroutine runs on that thread,
+  and the coroutine always resumes on it (across channel parks too). For C
+  libraries that keep thread-local state and for long jobs that want off the
+  shared pool; it is also the substrate the threading-compat library reuses.
 - **Blocking syscalls.** A coroutine entering a blocking syscall hands its P to
   another M so sibling coroutines keep running (P-handoff, still a follow-up);
   non-blocking I/O goes through the **netpoller** (ticket #80, built), which
@@ -644,14 +659,17 @@ parks its G and frees its M.
 - **`select` details.**
   Confirm uniform-random fairness, the `default` non-blocking form, and whether
   send cases may appear alongside receive cases in the first implementation.
-- **Preemption.**
-  v1 is cooperative; whether/when to add signal- or safepoint-based preemption
-  of long CPU loops that never hit a `checkpoint()`.
+- **Preemption.** RESOLVED (ticket #172): async, signal-based preemption
+  (Go 1.14 model), reusing the precise-GC safepoint machinery under the precise
+  collector and a direct in-handler switch under Boehm. See "Scheduling points".
+  Preempting a coroutine blocked in a long FFI/C call (rather than compiled Zap)
+  remains out of scope (the handler defers while `no_preempt` is held); a
+  dedicated FFI-M pool is the forward path.
 - **Growable/segmented stacks.**
   Deferred until the precise GC (D-0009) provides stack maps; until then fixed
   guard-page stacks. Initial stack size and free-list size classes to be tuned.
-- **`GOMAXPROCS` analogue.**
-  The name and mechanism for setting the M count.
+- **`MAXPROCS`.** RESOLVED (ticket #172): env var `MAXPROCS` + runtime call
+  `runtime.maxprocs()`; name finalized (no `ZAP_` prefix, no GOMAXPROCS analogy).
 - **Coroutine-local storage.**
   Whether to provide a coroutine-local (not thread-local) storage facility, and
   how it interacts with `scope:` inheritance.

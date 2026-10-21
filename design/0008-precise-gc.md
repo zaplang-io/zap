@@ -229,6 +229,19 @@ a safepoint and would stall a pending GC indefinitely. Options:
 Recommendation: **4a** — the poll is cheap, and without it a `for` loop building
 a large structure (exactly the large-live-set test) can starve the collector.
 
+**As built (4a) + preemptive reuse (ticket #172).** The back-edge/function-entry
+safepoint poll is emitted under the precise collector. Scheduler preemption now
+reuses it exactly as this fork anticipated: the async-preemption monitor sets a
+per-M `preempt` flag (and sends `SIGURG`), and `zap_safepoint` — already the one
+GC-safe point where the shadow chain is consistent — yields the coroutine there
+(`gopreempt`) when the flag is set and no collection is pending. The precise
+collector thus gets both GC safepoints and CPU-fairness preemption from one poll,
+with no extra per-iteration cost. Under the conservative Boehm build there is no
+such poll; the `SIGURG` handler switches the coroutine off its M directly, which
+is GC-safe because Boehm scans the preempted coroutine's saved context + stack
+conservatively. Either way a tight, allocation-free, yield-free compute loop can
+no longer stall a pending stop-the-world GC.
+
 ### Migration & safety (FORK 5, recommended)
 
 - **Collector selected behind a build flag.** A cargo feature on the

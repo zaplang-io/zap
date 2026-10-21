@@ -257,7 +257,20 @@ int64_t zap_gc_live_bytes(void);
 int64_t zap_gc_free_bytes(void);
 void    zap_runtime_goroutine_dump(void);                 // stacks + scheduler summary -> stderr
 int64_t zap_runtime_num_goroutines(void);
+
+// Scheduler controls (ticket #172). The parallelism knob is `MAXPROCS` (env var
+// + this runtime call; no `ZAP_` prefix). LockOSThread pins the calling
+// coroutine to a dedicated OS thread until the balanced unlock (Go analogue).
+int64_t zap_runtime_maxprocs(void);                       // effective worker-M count
+void    zap_runtime_lock_os_thread(void);                 // pin caller to its own OS thread
+void    zap_runtime_unlock_os_thread(void);               // release the pin (nestable)
 ```
+
+Long CPU-bound coroutines are preempted asynchronously (Go 1.14 model): a monitor
+thread signals (`SIGURG`) a coroutine that has monopolized its M past a ~10 ms
+slice; it yields at the next GC safepoint under the precise collector, or via a
+direct in-handler switch under Boehm. No ABI surface — it is internal to the
+scheduler/runtime.
 
 The first exceptions increment (#22) lands `raise`, `try`/`except`/`finally`,
 and propagation to an aborting top-level handler on the platform Itanium

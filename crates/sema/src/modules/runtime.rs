@@ -23,6 +23,22 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "runtime", "num_goroutines", args, 0, span);
             Some(Ty::Int64)
         }
+        // runtime.maxprocs() -> int64: the effective worker-M count (ticket #172).
+        "maxprocs" => {
+            expect_argc(checker, "runtime", "maxprocs", args, 0, span);
+            Some(Ty::Int64)
+        }
+        // runtime.lock_os_thread(): pin the calling coroutine to its own OS
+        // thread until unlock_os_thread (ticket #172, Go's LockOSThread analogue).
+        "lock_os_thread" => {
+            expect_argc(checker, "runtime", "lock_os_thread", args, 0, span);
+            Some(Ty::Unit)
+        }
+        // runtime.unlock_os_thread(): release the pin (balances nested locks).
+        "unlock_os_thread" => {
+            expect_argc(checker, "runtime", "unlock_os_thread", args, 0, span);
+            Some(Ty::Unit)
+        }
         _ => None,
     }
 }
