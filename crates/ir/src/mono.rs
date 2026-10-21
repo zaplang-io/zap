@@ -1473,13 +1473,58 @@ impl Mono<'_> {
                 };
                 Ok((Expr::List(out, *span), cty))
             }
-            Expr::Set(xs, span) => Ok((Expr::Set(self.rw_vec(xs, env)?, *span), CTy::Unknown)),
-            Expr::Dict(pairs, span) => {
-                let mut np = Vec::with_capacity(pairs.len());
-                for (k, v) in pairs {
-                    np.push((self.rw(k, env)?, self.rw(v, env)?));
+            Expr::Set(xs, span) => {
+                // Mirror the list-literal case (I#170): infer the element type
+                // from the first element (best-effort) so a `set[T]` parameter
+                // can be inferred from a set literal argument; heterogeneous or
+                // untyped elements leave the set `Unknown`.
+                let mut out = Vec::with_capacity(xs.len());
+                let mut elem: Option<Type> = None;
+                for (i, x) in xs.iter().enumerate() {
+                    let (v, cty) = self.rewrite_expr(x, env, None)?;
+                    if i == 0 {
+                        if let CTy::Ty(t) = cty {
+                            elem = Some(t);
+                        }
+                    }
+                    out.push(v);
                 }
-                Ok((Expr::Dict(np, *span), CTy::Unknown))
+                let cty = match elem {
+                    Some(t) => CTy::Ty(Type::Named {
+                        name: "set".to_string(),
+                        args: vec![t],
+                        span: *span,
+                    }),
+                    None => CTy::Unknown,
+                };
+                Ok((Expr::Set(out, *span), cty))
+            }
+            Expr::Dict(pairs, span) => {
+                // Mirror the list-literal case (I#170): infer the key/value types
+                // from the first pair (best-effort) so a `dict[K, V]` parameter
+                // can be inferred from a dict literal argument; an untyped key or
+                // value leaves the dict `Unknown`.
+                let mut np = Vec::with_capacity(pairs.len());
+                let mut kv: Option<(Type, Type)> = None;
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    let (kk, kcty) = self.rewrite_expr(k, env, None)?;
+                    let (vv, vcty) = self.rewrite_expr(v, env, None)?;
+                    if i == 0 {
+                        if let (CTy::Ty(kt), CTy::Ty(vt)) = (kcty, vcty) {
+                            kv = Some((kt, vt));
+                        }
+                    }
+                    np.push((kk, vv));
+                }
+                let cty = match kv {
+                    Some((kt, vt)) => CTy::Ty(Type::Named {
+                        name: "dict".to_string(),
+                        args: vec![kt, vt],
+                        span: *span,
+                    }),
+                    None => CTy::Unknown,
+                };
+                Ok((Expr::Dict(np, *span), cty))
             }
             Expr::Slice {
                 base,
@@ -2599,6 +2644,29 @@ mod tests {
         assert!(
             msg.contains("method 'show' has a mismatched signature"),
             "signature mismatch is reported, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn collection_literal_args_drive_type_param_inference() {
+        // I#170: a dict/set *literal* passed directly to a generic function
+        // infers the function's type parameters, exactly as a list literal
+        // already did. Before the fix mono raised "cannot infer type argument";
+        // now it resolves and emits the concrete instance. (The collections stay
+        // special-cased; this only makes their inference uniform with generics.)
+        let m = mono_ok(
+            "def countDict[K, V](dict[K, V] d) -> int64:\n    return len(d)\n\
+             def countSet[T](set[T] s) -> int64:\n    return len(s)\n\
+             def main():\n    print(countDict({\"x\": 1}))\n    print(countSet({4, 5}))\n",
+        );
+        let names = fn_names(&m);
+        assert!(
+            names.iter().any(|n| n == "countDict$str$int64"),
+            "dict literal infers K=str, V=int64: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "countSet$int64"),
+            "set literal infers T=int64: {names:?}"
         );
     }
 }

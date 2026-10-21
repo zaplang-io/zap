@@ -352,6 +352,25 @@ def max_of[T: Ord](list[T] xs) -> T:    # body may call __cmp__; nothing else
     rewrite) — e.g. a `list[T]` defined in a prelude whose `append`/`__getitem__`
     are intrinsics. This is a source-compatibility nicety, not a correctness need,
     and is explicitly out of scope for this epic.
+  - **Status — DECLINED (I#170, post-core slice; see DECISIONS.md D-0064).** The
+    scheduled re-skin was investigated and **declined**: there is no form of it
+    that is both zero-surface-change and free of a performance regression. The
+    collections are *type-erased* (one tuned C-runtime impl per machine-word kind,
+    shared across element types) whereas monomorphization is *type-reifying* (a
+    concrete struct per type-arg tuple), so re-expressing them that way either adds
+    a struct wrapper (an allocation + indirection per collection — a regression) or
+    mangles then un-mangles the type (more special-casing, not less); and their
+    operations are intrinsics with no Zap surface to express in a prelude
+    `struct list[T]` body (adding such surface would break the zero-surface
+    constraint). Crucially the *interop* the re-skin was meant to buy **already
+    exists**: `mono` treats a collection as an ordinary `Type::Named`, so
+    `list[T]`/`dict[K,V]`/`set[T]` already substitute, unify, and infer uniformly
+    alongside user generics (`generics_collections_interop.zap`). The one residual
+    gap — a `dict`/`set` *literal* argument did not drive type-param inference (a
+    `list` literal did) — is now fixed (mirror the list-literal inference for
+    `Expr::Set`/`Expr::Dict` in `mono.rs`), the only change shipped. The
+    collections stay special-cased, permanently for this reason unless the runtime
+    model changes.
 - **`@derive` / decorators (D-0036).** Derives run per monomorphized
   instantiation (each concrete `Box[int64]`/`Box[str]` gets its own derived
   `__eq__` etc., field-wise over concrete types) — no new derive machinery.
