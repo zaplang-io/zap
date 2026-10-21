@@ -205,9 +205,6 @@ fn python_embed_flags() -> Result<Vec<String>, String> {
         .to_string())
 }
 
-/// The SSA value an instruction defines, if any (ticket #48: used to root every
-/// GC-pointer-typed definition at the end of its block). Non-pointer dests are
-/// filtered out downstream by their absent root slot.
 /// Whether a block's first instruction is a `LandingPad` (which must be the
 /// block's first non-phi LLVM instruction, so no safepoint may precede it).
 #[cfg(feature = "gc-immix")]
@@ -215,6 +212,9 @@ fn block_starts_with_landing_pad(b: &zir::Block) -> bool {
     matches!(b.insts.first(), Some(zir::Inst::LandingPad { .. }))
 }
 
+/// The SSA value an instruction defines, if any (ticket #48: used to root every
+/// GC-pointer-typed definition at its definition site; see I#167). Non-pointer
+/// dests are filtered out downstream by their absent root slot.
 #[cfg(feature = "gc-immix")]
 fn inst_dest(i: &zir::Inst) -> Option<u32> {
     use zir::Inst::*;
@@ -1018,28 +1018,6 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         Ok(())
     }
 
-    /// Store every GC-pointer-typed value defined in block `b` into its slot.
-    /// Emitted just before the block terminator so the values are rooted before
-    /// any successor-block safepoint observes them.
-    #[cfg(feature = "gc-immix")]
-    fn gc_store_block_roots(
-        &self,
-        b: &zir::Block,
-        vals: &[Option<BasicValueEnum<'ctx>>],
-    ) -> Result<(), String> {
-        if self.gc_frame.is_none() {
-            return Ok(());
-        }
-        for inst in &b.insts {
-            if let Some(d) = inst_dest(inst) {
-                if let Some(Some(v)) = vals.get(d as usize) {
-                    self.gc_store_root(d, *v)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Unlink the shadow frame (`*head = frame.prev`) before a `ret`.
     #[cfg(feature = "gc-immix")]
     fn gc_unlink(&self) -> Result<(), String> {
@@ -1148,11 +1126,19 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             }
             for inst in &b.insts {
                 self.inst(f, inst, &mut vals, fv, &blocks)?;
+                // Root a GC pointer the instant it is defined — NOT deferred to
+                // the end of the block. A block may contain several calls, each an
+                // interior GC safepoint; a heap pointer defined by one call must
+                // already be in its shadow-frame slot before a *later* same-block
+                // call can trigger a cross-goroutine collection, or that object is
+                // unrooted and can be reclaimed out from under us (I#167).
+                #[cfg(feature = "gc-immix")]
+                if let Some(d) = inst_dest(inst) {
+                    if let Some(Some(v)) = vals.get(d as usize) {
+                        self.gc_store_root(d, *v)?;
+                    }
+                }
             }
-            // Root every GC pointer defined in this block before the terminator,
-            // so a successor-block safepoint sees them.
-            #[cfg(feature = "gc-immix")]
-            self.gc_store_block_roots(b, &vals)?;
             self.term(f, &b.term, &blocks, &vals, fv)?;
         }
         self.gc_frame = None;
