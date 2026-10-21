@@ -70,7 +70,10 @@ param         ::= [ "@" dotted_name [ "(" [ arg_list ] ")" ] ]
 struct_def    ::= decorators [ "value" ] "struct" IDENT [ generics ] ":" NEWLINE
                   INDENT { field | function } DEDENT ;
                   (* "value struct" = opt-in value type (D-0051); plain struct is
-                     a reference type (D-0023). "value" is a contextual modifier. *)
+                     a reference type (D-0023). "value" is a contextual modifier.
+                     Prelude generic structs use this same grammar: `Atomic[T]`
+                     (the `sync` atomic cell, I#176/D-0066) is `struct Atomic[T]`
+                     whose methods lower to inline LLVM atomics — no new syntax. *)
 field         ::= decorators type IDENT [ "=" expr ] NEWLINE ;
 
 interface_def ::= "interface" IDENT [ generics ] ":" NEWLINE

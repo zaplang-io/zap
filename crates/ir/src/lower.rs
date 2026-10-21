@@ -816,6 +816,13 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             }
             ast::Item::Struct(s) => {
                 let sid = ctx.ids[&s.name];
+                // `Atomic[T]` (I#176): its methods are compiler intrinsics lowered
+                // inline at the call site (see `lower_atomic_method`), so the
+                // prelude's placeholder bodies are never emitted — skip them rather
+                // than emit dead `Atomic$T__load`/… functions.
+                if is_atomic_struct(&ctx, sid) {
+                    continue;
+                }
                 for m in &s.methods {
                     let name = format!("{}__{}", s.name, m.name);
                     match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[]) {
@@ -1677,6 +1684,18 @@ struct OptionalLayout {
     none_tag: i64,
     /// Tagged layout only: the payload field's index in the tagged struct.
     payload_idx: u32,
+}
+
+/// Recognize a monomorphized `Atomic[T]` box by its mangled struct name
+/// (`Atomic` — never instantiated bare — or `Atomic$int64`, `Atomic$str`, …),
+/// the same name-prefix test the niche `Optional` layout uses (I#176). The box is
+/// the prelude `struct Atomic[T]: T value`; its sole cell field is accessed with
+/// inline LLVM atomics instead of ordinary struct-method dispatch.
+fn is_atomic_struct(ctx: &StructCtx, sid: u32) -> bool {
+    match ctx.names.get(sid as usize) {
+        Some(n) => n == "Atomic" || n.starts_with("Atomic$"),
+        None => false,
+    }
 }
 
 /// Recognize a field type that is a monomorphized `Optional[T]` instance (by its
@@ -5971,6 +5990,13 @@ impl<'a> FnLower<'a> {
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
             };
+            // `Atomic[T]` (I#176): a method on a monomorphized `Atomic` box
+            // (`Atomic$int64`, `Atomic$str`, …) lowers to an inline LLVM atomic on
+            // its cell, not to a struct-method call. Recognized by the mangled
+            // name prefix, exactly like the niche-`Optional` layout.
+            if is_atomic_struct(self.ctx, sid) {
+                return self.lower_atomic_method(recv, sid, name, args);
+            }
             // Dynamic dispatch through an interface value (D-0016): the receiver
             // is an interface fat pointer, not a concrete struct.
             if let Some(iid) = self.ctx.iid_of_fat_sid(sid) {
@@ -7162,6 +7188,127 @@ impl<'a> FnLower<'a> {
             }
             other => Err(err(format!(
                 "list has no method '{other}' (supported: append)"
+            ))),
+        }
+    }
+
+    /// Lower a method call on an `Atomic[T]` box (I#176) to an inline atomic ZIR
+    /// node over its cell. `recv` is already the box pointer; the cell is the sole
+    /// `value` field. Sequentially consistent by default (the ordering is carried
+    /// by the node so weaker orderings can be added later). `add`/`sub` are
+    /// integer-only — a `bool` or reference cell rejects them.
+    fn lower_atomic_method(
+        &mut self,
+        recv: Value,
+        sid: u32,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let (idx, elem) = self
+            .ctx
+            .field(sid, "value")
+            .ok_or_else(|| err("Atomic box has no cell field"))?;
+        let order = AtomicOrd::SeqCst;
+        // Lower a single coerced argument (the common shape).
+        let one_arg = |s: &mut Self, args: &[ast::Arg]| -> Result<Value, LowerError> {
+            if args.len() != 1 {
+                return Err(err(format!("{name}() takes exactly one argument")));
+            }
+            let (v, vt) = s.expr(&args[0].value)?;
+            Ok(s.coerce(v, vt, elem))
+        };
+        match name {
+            "load" => {
+                if !args.is_empty() {
+                    return Err(err("load() takes no arguments"));
+                }
+                let dest = self.new_value(elem);
+                self.emit(Inst::AtomicLoad {
+                    dest,
+                    base: recv,
+                    sid,
+                    idx,
+                    elem,
+                    order,
+                });
+                Ok((dest, elem))
+            }
+            "store" => {
+                let v = one_arg(self, args)?;
+                self.emit(Inst::AtomicStore {
+                    base: recv,
+                    sid,
+                    idx,
+                    val: v,
+                    elem,
+                    order,
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            "swap" => {
+                let v = one_arg(self, args)?;
+                let dest = self.new_value(elem);
+                self.emit(Inst::AtomicRmw {
+                    dest,
+                    base: recv,
+                    sid,
+                    idx,
+                    op: AtomicRmwOp::Xchg,
+                    val: v,
+                    elem,
+                    order,
+                });
+                Ok((dest, elem))
+            }
+            "add" | "sub" => {
+                if !matches!(elem, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64) {
+                    return Err(err(format!(
+                        "{name}() is only available on an integer Atomic (not bool or a reference)"
+                    )));
+                }
+                let v = one_arg(self, args)?;
+                let op = if name == "add" {
+                    AtomicRmwOp::Add
+                } else {
+                    AtomicRmwOp::Sub
+                };
+                let dest = self.new_value(elem);
+                self.emit(Inst::AtomicRmw {
+                    dest,
+                    base: recv,
+                    sid,
+                    idx,
+                    op,
+                    val: v,
+                    elem,
+                    order,
+                });
+                Ok((dest, elem))
+            }
+            "compare_and_swap" => {
+                if args.len() != 2 {
+                    return Err(err("compare_and_swap() takes exactly two arguments"));
+                }
+                let (e, et) = self.expr(&args[0].value)?;
+                let expected = self.coerce(e, et, elem);
+                let (d, dt) = self.expr(&args[1].value)?;
+                let desired = self.coerce(d, dt, elem);
+                let dest = self.new_value(Ty::I1);
+                self.emit(Inst::AtomicCas {
+                    dest,
+                    base: recv,
+                    sid,
+                    idx,
+                    expected,
+                    desired,
+                    elem,
+                    success: order,
+                    failure: order,
+                });
+                Ok((dest, Ty::I1))
+            }
+            other => Err(err(format!(
+                "Atomic has no method '{other}' (supported: load, store, add, sub, swap, compare_and_swap)"
             ))),
         }
     }

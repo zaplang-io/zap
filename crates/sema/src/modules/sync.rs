@@ -13,9 +13,12 @@
 //! than the OS thread — the runtime builds them on the shared `gopark`/`goready`
 //! primitive (see the `sync` section of `zaprt.c`).
 //!
-//! Deferred (noted in the PR): `RWMutex`, `Atomic[T]`, and the `with mu.lock():`
-//! / `with wg.tracked():` context-manager guards (blocked on general context
-//! managers, D-0027).
+//! `Atomic[T]` (I#176, D-0066) is a sibling `sync` primitive but is NOT part of
+//! this flat `sync.*` surface: it is the prelude generic `struct Atomic[T]`
+//! (`crates/syntax/src/parser.rs`), whose methods lower to inline LLVM atomics —
+//! see `lower_atomic_method` in `crates/ir/src/lower.rs`. Still deferred (noted in
+//! the PR): `RWMutex`, and the `with mu.lock():` / `with wg.tracked():`
+//! context-manager guards (blocked on general context managers, D-0027).
 
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;

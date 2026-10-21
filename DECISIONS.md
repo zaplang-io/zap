@@ -1293,3 +1293,54 @@ D-0059 (`json`/`@derive(Json)`). Tickets: I#165 (parent I#154); touches
   `@default`-as-optionality either (the derive was lenient for v1), so no
   migration is forced; an `Optional[T]` field in a `csv`/`yaml` derive is a
   natural follow-up on the same shared derive core, not part of this slice.
+
+## D-0066 — `Atomic[T]` lock-free atomics (I#176)
+
+The `sync` module gains `Atomic[T]`, the atomic cell deferred by I#103. Zap is
+truly parallel (no GIL), so it needs real atomics; the model follows Go
+(`sync/atomic`, `atomic.Int64`) / Rust (`AtomicUsize`) / C++ (`std::atomic<T>`),
+not Python (which has none).
+
+- **A built-in generic struct, not a special ZIR type.** `Atomic[T]` ships in
+  the parser prelude as `struct Atomic[T]: T value` — one machine-word cell — and
+  rides the merged user-generics (I#154) monomorphizer unchanged. `Atomic[int64]`
+  specializes to a concrete `Atomic$int64 { int64 value }`, `Atomic[Node]` to
+  `Atomic$Node { Node value }`, etc. This was chosen over a dedicated
+  `Ty::Atomic(..)` (the `Ty::Chan` route) specifically because it makes the
+  **GC claim fall out for free**: the pointer variant is an ordinary struct whose
+  single field is a reference, so codegen's existing per-struct `ZapTypeDesc`
+  emission marks that word as a traced pointer and the precise Immix collector
+  scans the atomic slot as a normal GC root — **zero new GC/runtime-C code** (the
+  issue's explicit "reuse the ZapTypeDesc machinery" requirement). A scalar cell
+  gets a pointer-free descriptor, exactly like `Mutex`/`WaitGroup`/`Once`.
+
+- **Methods are compiler intrinsics, lowered inline — not real functions.**
+  `load()`, `store(v)`, `add(n)`/`sub(n)` (integer cells only), `swap(v)`, and
+  `compare_and_swap(old, new) -> bool`. A method call on an `Atomic$…` receiver is
+  intercepted in lowering (by mangled-name prefix, the same trick the niche
+  `Optional` layout uses) and emitted as one of four new ZIR nodes — `AtomicLoad`,
+  `AtomicStore`, `AtomicRmw{Add,Sub,Xchg}`, `AtomicCas` — which codegen turns into
+  LLVM `load atomic` / `store atomic` / `atomicrmw` / `cmpxchg` on the cell. The
+  prelude's placeholder method bodies are never emitted (skipped in lowering); they
+  exist only so the generic surface type-checks and monomorphizes like any other
+  generic struct. `add`/`sub` yield the **new** value (Go's `Add` semantics);
+  `swap` yields the old; a failed CAS yields `False`.
+
+- **Access width.** Each op uses an integer access type derived from the cell:
+  `int64`→`i64`, `int32`→`i32`, `bool`→`i8` (LLVM atomics need a byte-sized,
+  power-of-two integer, so the `i1` cell is accessed as a byte), a reference
+  payload→pointer-wide word via `ptrtoint`/`inttoptr`. `add`/`sub` are rejected at
+  lowering for a `bool` or reference cell. Zap has no scalar `uint32`/`uint64`
+  today, so the surface is `int64`/`int32`/`bool` + a reference variant; because
+  the integer atomic ops are sign-agnostic, unsigned scalars (when added) will flow
+  through the same `i32`/`i64` paths with no new work.
+
+- **Memory ordering: sequentially consistent by default, not cornered.** Every
+  operation is `seq_cst`. The ordering is carried as an explicit `AtomicOrd` field
+  on each ZIR node (only `SeqCst` today), and `cmpxchg` carries separate
+  success/failure orderings, so relaxed / acquire-release can be added later (a
+  `load_relaxed()`-style method or an ordering argument) without changing the node
+  shapes or breaking any existing caller.
+
+- **Unblocks** lock-free / CAS collections (deferred until this landed), lock-free
+  fast paths in the runtime, and general concurrent counters/flags.
