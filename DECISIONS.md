@@ -1344,3 +1344,72 @@ not Python (which has none).
 
 - **Unblocks** lock-free / CAS collections (deferred until this landed), lock-free
   fast paths in the runtime, and general concurrent counters/flags.
+
+## D-0067 — First-class function values (`fn(...)->...` + closures, I#163)
+
+Functions become values: a `fn(T, U) -> R` type can be a parameter, field, local,
+return value, or generic type argument, and `lambda`s and bare function names are
+first-class values. This unblocks higher-order generics (`map`/`filter`/`and_then`
+over a callback), the web-framework handler model (I#107), and functional
+ergonomics generally. The grammar already reserved `func_type` and `lambda`
+(D-0026); this wires them end-to-end.
+
+- **Surface.** The type is `fn(T, U) -> R` (grammar `func_type`); `->` and the
+  return type are omitted for a `void` result. `fn` is a **soft keyword**,
+  recognized only in type position (immediately followed by `(`), so it stays a
+  usable identifier everywhere else — no lexer keyword, no churn to existing code.
+  Closure literals are Python's untyped `lambda a, b: expr` (D-0026); a lambda's
+  parameter types are **inferred from the expected function type** at its use site
+  (a `fn(...)` parameter, an annotated binding, or a `fn(...)`-returning `return`),
+  so no new annotated-lambda syntax is introduced. A lambda with no such context is
+  a compile error (its parameter types are unknowable).
+
+- **Representation: a single-pointer closure record.** A function value is ONE
+  pointer to a GC-heap record `{code_ptr, captures…}` — the code pointer at offset
+  0, the captured free variables after it. This was chosen over a two-word
+  `{code, env}` fat value (the interface route, D-0016) precisely because a single
+  pointer **stores without dangling**: in a struct field, a list element, a return
+  slot, or another closure's environment, exactly like any reference. The calling
+  convention is uniform: the code pointer has signature `R (ptr env, args…)` and
+  the record passes itself as `env`.
+  - A **bare top-level function** used as a value gets a compiler-generated wrapper
+    `f$fnval(env, args…)` that ignores `env` and calls `f(args…)`; its captureless
+    record is `{wrapper_ptr}`.
+  - A **lambda** is lifted to a top-level function `$closure$N(env, params…)` that
+    reloads its captured free variables from `env` (fields 1..); the record is
+    `{lifted_ptr, cap0, cap1, …}`. Free variables are found by a walk of the body
+    (minus the lambda's own parameters and any inner binders); only names actually
+    bound in the enclosing scope are captured (globals / top-level functions /
+    builtins resolve directly in the lifted body).
+  - Calling a value (`f(x)`, `fns[i](x)`, `op.f` then call) loads the code pointer
+    from the record and does an indirect call (an `invoke` on an exception edge),
+    passing the record as `env`.
+
+- **GC claim falls out — zero new runtime C.** The environment is an ordinary typed
+  heap object allocated through the existing `zap_alloc_typed` with a precise
+  `ZapTypeDesc` emitted exactly like a struct's: the code-pointer word is marked
+  non-pointer (never traced) and each captured word by its ZIR pointer-kind, so the
+  precise Immix collector scans captured pointers and ignores captured scalars. A
+  captureless record's static-looking code pointer and any captured top-level/static
+  references are non-heap and skipped by block-registry validation — the same
+  property interfaces (D-0016) and value structs (D-0051) already rely on. This
+  means **no changes to `zaprt.c` / the collector** (it reuses the per-struct
+  descriptor machinery, FORK 4a).
+
+- **ZIR.** `Ty::Func(idx)` (physically a pointer; `idx` interns the signature in
+  `Module::fn_sigs`) carries the call signature lowering needs; `Inst::ClosureMake`
+  builds a record and `Inst::CallClosure` is the indirect call. The environment is a
+  forced-non-inline reference struct (shared identity, outlives its creating frame).
+
+- **sema stays permissive.** Function types and lambdas type as `Unknown`
+  (assignable both ways), and a call through a function-typed local is accepted; the
+  lowerer owns the real signatures (via `Ty::Func`). Full bidirectional checking of
+  function values is a clean follow-up.
+
+- **Scoped follow-ups (noted, not built).** Wiring `Optional.map`/`and_then` and a
+  list `map[T,U]` combinator onto this; generic inference of a type argument that
+  appears only under a function-value parameter (today the callback's result type
+  `U` is given explicitly, `apply[int64, int64](...)`); a value-struct captured
+  **by value** into an environment (scalars and references work); a function value
+  retrieved from a collection re-attaching its signature without a `fn(...)`
+  annotation (collections store a uniform reference word).

@@ -119,6 +119,8 @@ named_type    ::= type_name [ "[" type { "," type } "]" ] ;
 type_name     ::= IDENT | TYPE_KEYWORD ;      (* int64, list, dict, array, ... *)
 tuple_type    ::= "(" [ type { "," type } ] ")" ;
 func_type     ::= "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
+                  (* first-class function value, I#163/D-0067; "fn" is a soft
+                     keyword recognized only in type position (followed by "(") *)
 
 (* ---------- Statements ---------- *)
 

@@ -3290,6 +3290,15 @@ impl Checker {
                             }
                             return self.op_result(&vt, "__call__", "Call", "()", span);
                         }
+                        // A first-class function value held in a variable (I#163):
+                        // `f(args)` is an indirect call. Function values are typed
+                        // loosely (`Unknown`) for now, so accept the call and
+                        // type the result loosely; the lowerer carries the real
+                        // signature.
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Unknown;
                     }
                     self.error(format!("call to unknown function '{fname}'"), span);
                     for a in args {
