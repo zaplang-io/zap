@@ -412,7 +412,23 @@ approved forks):
     interop (modules cached, only int/float/str marshaled through module
     functions) gives a real decref no deterministic, observable effect; the
     machinery exercised is identical to the `ZapPy` path.
-- **v1 simplifications (follow-ups):** allocation is under one global heap lock
-  (not per-P bump); user-level cyclic *literals* can't yet be written (the front
-  end lacks `None` / struct-field mutation), though the tracing collector
-  reclaims cycles by construction, as the reclamation tests show.
+- **Per-P bump allocation (I#119, done).** Allocation is lock-free on the fast
+  path: each scheduler `P` (realised as a per-mutator buffer — M:P is 1:1 and
+  pinned, with one extra buffer for the main/aux threads that have no M) owns an
+  Immix block it bump-allocates into, plus a fresh **overflow** block for medium
+  objects that don't fit the current block's hole. The global heap lock
+  (`zap_heap_mu`) is taken only on the slow paths: refilling an exhausted buffer,
+  large-object (LOS) allocation, and the collector's sweep. GC correctness holds
+  because allocation is never a safepoint, so a mutator mid-refill is ACTIVE and
+  the stop-the-world handshake waits it out before marking (mark/sweep never
+  overlaps a refill; refill-vs-refill is serialized by `zap_heap_mu`); at
+  stop-the-world the collector relinquishes every P's buffers
+  (`zap_reset_alloc_bufs`, under `zap_stw_mu` with the world stopped) so their
+  blocks sweep normally and each P refills fresh on resume. The GC-trigger
+  counter is advanced per block at refill (by the block's recorded free
+  capacity) rather than per object, avoiding an atomic on the fast path.
+- **v1 simplifications (follow-ups):** user-level cyclic *literals* can't yet be
+  written (the front end lacks `None` / struct-field mutation), though the
+  tracing collector reclaims cycles by construction, as the reclamation tests
+  show; evacuation/defragmentation (I#120) is the next step and builds on this
+  allocator.
