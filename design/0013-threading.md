@@ -96,24 +96,48 @@ Planned surface, mapped 1:1 from Python where feasible:
 | `threading.Semaphore(n)`       | `acquire(blocking)->bool / release()`      |
 | `threading.current_thread()`   | handle of the running thread               |
 
-### Thread model (the core mechanism)
+### Thread model (the core mechanism — as built)
 
-`Thread.start()` spawns a **detached coroutine** running an internal trampoline:
+`Thread.start()` registers the thread's liveness synchronously, then launches a
+**detached coroutine** running the prelude trampoline `__thread_entry` (ordinary
+Zap, in `PRELUDE_SRC`):
 
 ```
-_thread_entry(target, done_chan):
-    runtime.lock_os_thread()      # pin to a fresh dedicated M (its own OS thread)
-    try:
-        call target()             # CallClosure on the fn-value
-    finally:
-        done_chan.close()         # wakes any joiner
-        runtime.unlock_os_thread()
+# Thread.start(self):
+threading._register(self._handle, self._daemon)   # synchronous (see exit)
+spawn detached __thread_entry(self._target, self._handle, self._daemon)
+
+# __thread_entry(target: fn(), handle, daemon):
+threading._pin()                 # dedicated OS thread (ded_joinable = 0)
+try:
+    target()                     # CallClosure — the fn-value is called by Zap
+finally:
+    threading._unpin()           # runtime.unlock_os_thread
+    threading._finish(handle, daemon)   # wake joiners; drop non-daemon g_live
 ```
 
-Because `lock_os_thread()` creates a dedicated M with `p = NULL` that is not in
-`g_ms[]`, each `Thread` is a real OS thread **beyond the `MAXPROCS` cap** and is
-never multiplexed onto a P — exactly Python `threading` semantics.
-`join()` receives on `done_chan` (parking the joiner coroutine the normal way).
+**Note — no runtime C→Zap trampoline is needed.** Because the body runs as a
+Zap prelude function, the target closure is invoked by compiled Zap through the
+normal `CallClosure` path, and it is rooted automatically — once as an argument
+captured in the `spawn` closure record, and again in the `Thread` struct's
+`_target` field — so the approved "call the closure from runtime C" trampoline
+(Resolved decision #1) turned out to be unnecessary. This is strictly simpler
+and lower-risk, and the orchestrator's two musts still hold by construction: the
+target is a live, scanned shadow-stack root for the thread's lifetime, and a
+thread blocked in runtime C parks GC-safe (`zap_enter_blocking`).
+
+`threading._pin()` (`zap_threading_pin`) creates a dedicated M with `p = NULL`
+that is not in `g_ms[]`, so each `Thread` is a real OS thread **beyond the
+`MAXPROCS` cap** and is never multiplexed onto a P — exactly Python `threading`
+semantics. `join()` parks on the `Thread` handle's wait queue until `_finish`.
+
+**Exit semantics (as built).** The dedicated M uses `ded_joinable = 0`, so it is
+**never** in the #172 `g_ded_live` barrier. A *non-daemon* thread is instead
+registered in `g_live` (the root-scope join counter) by `_register`,
+synchronously inside `start()` so there is no start race, and dropped by
+`_finish`; `zap_rt_join_all` already waits on `g_live` (GC-safe), so no edit to
+the join path was needed. A *daemon* thread is registered in no barrier, so the
+process exits promptly and abandons it (CPython daemon semantics).
 
 **Rooting the `target` closure (required).**  The fn-value record and its
 captures must be a **live, scanned GC root for the whole thread lifetime** — it
@@ -227,48 +251,63 @@ No grammar change (ordinary method calls), so no EBNF edit beyond documenting th
 module.  No change to existing coroutine/`spawn` semantics.  gc-boehm and
 gc-immix both supported.
 
-## Implementation
+## Implementation (as built)
 
-Phased, runtime-track; sequence **after I#120 merges** (it edits zaprt.c /
-zapgc.inc.c + codegen hot path) and rebase onto main then, to avoid clobbering
-its sections.
+Built **after I#120 merged** (PR #186, main @2cbfc15); the branch was rebased
+onto it.  The runtime work is append-only plus three tiny edits to the #172
+dedicated-M region.
 
-1. Runtime (zaprt.c, new `threading` banner section, append-only): the
-   `_thread_entry` trampoline that `lock_os_thread()`s, invokes the fn-value via
-   the approved C trampoline, closes the join channel, `unlock_os_thread()`s;
-   the `daemon=` opt-out of the `g_ded_live` barrier; plus `RLock`, `Event`,
-   `Condition`, `Semaphore` over the shared `Waiter`/`gopark` machinery, with the
-   I#80 deadline path wired for the v1 timeout variants.  The one genuinely new
-   runtime capability is **invoking a Zap closure from runtime C** (load code-ptr
-   @0, indirect-call with the record as arg 0) — see Resolved decisions #1.
-2. Surface wiring on the I#121 seam (sema/ir/codegen `modules/threading.rs` + one
-   registry slice entry each).
-3. Goldens (deterministic output, green under BOTH collectors, **no heap-byte
-   asserts**): a `Thread` fan-out summing an order-independent total over a
-   channel; a `Lock`/`RLock` contention test; an `Event`/`Condition`
-   producer-consumer; a GC-stress variant that churns heap inside thread bodies
-   to exercise STW with dedicated Ms live (model
-   `immix_per_p_alloc_stress.zap`).
+1. Runtime (zaprt.c): a new append-only `threading` banner section with the
+   `Thread` handle (liveness + join/join-timeout), `zap_threading_pin`, and
+   `RLock`/`Event`/`Semaphore`/`Condition` + `zap_mutex_lock_timeout`, all over
+   the shared `Waiter`/`gopark`/`goready` machinery (untimed = cooperative park;
+   timed = `gopark_timed`, a `pthread_cond_timedwait` on the waiter's condvar —
+   no scheduler timer exists to reuse).  Three small edits to the #172 region:
+   an `M.ded_joinable` field, a `dedicated_pin(joinable)` refactor exposing
+   `zap_threading_pin` (= `dedicated_pin(0)`), and a `ded_joinable` guard on the
+   `g_ded_live` decrement.  **No** runtime C→Zap trampoline (the target is called
+   from the Zap prelude via `CallClosure`); **no** edit to `zap_rt_join_all`
+   (non-daemon liveness reuses `g_live`).
+2. Prelude (`PRELUDE_SRC`): the `Thread` struct + `__thread_entry`, and the
+   `Lock`/`RLock`/`Event`/`Semaphore`/`Condition` wrapper structs delegating to
+   `sync.*`; plus the `threading`/wrapper names added to the prelude-injection
+   needles.
+3. Surface wiring on the I#121 seam: `modules/threading.rs` in sema/ir/codegen
+   (the Python-shaped constructors) and the shared primitive flat functions added
+   to the `sync` facets (one `declare_rt` site, in `sync`, so symbols aren't
+   doubly declared).
+4. Goldens (deterministic, no heap-byte asserts): `threading_basic` (smoke),
+   `threading_counter` (8 OS threads, shared `Atomic`, exact 80000),
+   `threading_lock` (Lock-guarded counter + per-iter allocation to stress the
+   moving collector under raw OS threads, exact 40000), `threading_primitives`
+   (RLock/Semaphore/Event/Condition mechanics incl. timed waits),
+   `threading_event` (cross-thread signaling), `threading_daemon` (a daemon
+   thread must not block exit).
 
-Phase boundaries touched: runtime ABI (new `threading` entry points, and the
-runtime→Zap closure-call convention).  No IR schema change expected.
+Phase boundary touched: runtime ABI (new `threading`/`sync` entry points).  No
+IR schema change.
 
 ## Resolved decisions (orchestrator, 2026-10-21)
 
-1. **Calling a Zap closure from runtime C — APPROVED (option a).**  Add a tiny C
-   trampoline that treats the fn-value record as `ret (*)(void *self)` and calls
-   `code_ptr(record)`, matching the I#163 calling convention.  Two musts: (a) the
-   target closure record + captures are a live, scanned shadow-stack root for the
-   whole thread lifetime (see "Rooting the `target` closure"); (b) fix and
-   document the C ABI for args/return in the trampoline once.
-2. **`daemon=` flag — SHIP IN v1.**  Faithful migration requires it; real code
-   uses daemon threads.  Implement as an opt-*out* of the `g_ded_live`
-   join-at-exit barrier: non-daemon (default) keeps current blocking semantics
-   (`zap_rt_join_all` waits for it), daemon excludes the thread from
-   `zap_rt_join_all` — matching CPython exactly.
-3. **Timeouts — SHIP IN v1, reuse the I#80 deadline path.**  `join(timeout)`,
-   `Event.wait(timeout)`, `Lock.acquire(timeout)` are common in real code; return
-   Python-shaped results (`acquire` → bool, `wait` → bool).
+1. **Calling a Zap closure from runtime C — APPROVED, but NOT needed as built.**
+   The approval was for a tiny C trampoline casting the fn-value record to
+   `ret (*)(void *self)`.  In the end the thread body runs as the Zap prelude
+   `__thread_entry`, so the target is called by compiled Zap through the ordinary
+   `CallClosure` path and no runtime C→Zap call exists.  Both musts still hold by
+   construction (the target is a scanned shadow-stack root for the thread's life;
+   a thread blocked in runtime C parks GC-safe).
+2. **`daemon=` flag — SHIPPED in v1.**  As built, threading dedicated Ms are
+   never in `g_ded_live` (`ded_joinable = 0`); a non-daemon thread is awaited via
+   `g_live` instead (registered in `start()`), a daemon thread via nothing —
+   matching CPython, and with no edit to `zap_rt_join_all`.
+3. **Timeouts — SHIPPED in v1.**  No cooperative scheduler timer exists (even
+   `time.sleep` is a blocking `nanosleep`; the I#80 deadline path is fd/epoll-
+   bound), so the timed waits (`join`/`wait`/`acquire` timeout) block the calling
+   OS thread on the waiter's condvar via `pthread_cond_timedwait` (GC-safe,
+   returning Python-shaped bools).  Correct and apt for an OS-thread library; the
+   cost is that a timed wait ties up its OS thread (a worker M if the caller is an
+   ordinary coroutine) for the timeout.  A future cooperative scheduler timer
+   (benefiting `time.sleep` too) could make these park instead.
 4. **`RLock`/`Event`/`Condition`/`Semaphore` — implement in the runtime ONCE,
    expose via BOTH `sync` and `threading`.**  DRY; these are the same primitives
    the `with lock:` context-manager work (I#185) will build on.  Names stay
