@@ -4,7 +4,7 @@
 //! `main`'s prologue (installs the default SIGQUIT/SIGUSR1 handlers unless built
 //! `-DZAP_NO_DEFAULT_SIGNALS`); `zap_signal_notify(signo)` returns a cap-1
 //! coalescing channel[Signal]; `zap_signal_on(signo, fn)` registers an
-//! `@on_signal` handler (a detached receiver goroutine); `zap_scope_cancel_on
+//! `@on_signal` handler (a detached receiver coroutine); `zap_scope_cancel_on
 //! (scope, mask, grace_ms)` / `zap_scope_disarm(scope)` wire `scope(cancel_on=..,
 //! grace=..)`. `zap_signal_selftest`/`raise`/`drain` are C integration-test
 //! hooks. See `zaprt.c`.

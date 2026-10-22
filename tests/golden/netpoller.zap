@@ -6,10 +6,10 @@
 # `__netpoll_selftest()` hook, which this golden invokes. The self-test runs the
 # scheduler with a SINGLE worker M, then:
 #
-#   1. spawns a reader goroutine that blocks on a not-yet-ready pipe fd — it must
-#      PARK its G and free the one M, or the writer goroutine (which wakes it)
+#   1. spawns a reader coroutine that blocks on a not-yet-ready pipe fd — it must
+#      PARK its G and free the one M, or the writer coroutine (which wakes it)
 #      could never be scheduled and the program would deadlock — and a writer
-#      goroutine that makes the fd ready; the reader wakes on readiness and reads
+#      coroutine that makes the fd ready; the reader wakes on readiness and reads
 #      the byte. This proves a blocked G parks and its M is freed to run others.
 #   2. parks on a second fd that never becomes ready and confirms the wait
 #      returns when its deadline expires.

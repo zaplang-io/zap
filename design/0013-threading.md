@@ -56,7 +56,7 @@ over existing substrate:
   invoke.
 - **I#103 `sync`** (PR #143).
   `Mutex` (lock/unlock/trylock), `WaitGroup`, `Once`, built on the shared
-  `gopark`/`goready` park/wake primitive and a `Waiter` queue.  The lock
+  `copark`/`coready` park/wake primitive and a `Waiter` queue.  The lock
   primitives `threading` needs are the same machinery.
 
 ## Proposal
@@ -213,7 +213,7 @@ migration-only, not idiomatic; new code uses `spawn` + channels.
 ### Sync primitives
 
 `Lock` reuses `sync.Mutex`.  `RLock`, `Event`, `Condition`, `Semaphore` are new
-but are straightforward over the same `gopark`/`goready` + `Waiter` queue that
+but are straightforward over the same `copark`/`coready` + `Waiter` queue that
 `sync` and channels already use (handles are opaque heap objects with
 `ZAP_TD_ATOMIC` descriptors — nothing to trace — mirroring `sync`).  `RLock`
 tracks an owner thread id + recursion count; `Condition` releases/re-acquires its
@@ -260,8 +260,8 @@ dedicated-M region.
 1. Runtime (zaprt.c): a new append-only `threading` banner section with the
    `Thread` handle (liveness + join/join-timeout), `zap_threading_pin`, and
    `RLock`/`Event`/`Semaphore`/`Condition` + `zap_mutex_lock_timeout`, all over
-   the shared `Waiter`/`gopark`/`goready` machinery (untimed = cooperative park;
-   timed = `gopark_timed`, a `pthread_cond_timedwait` on the waiter's condvar —
+   the shared `Waiter`/`copark`/`coready` machinery (untimed = cooperative park;
+   timed = `copark_timed`, a `pthread_cond_timedwait` on the waiter's condvar —
    no scheduler timer exists to reuse).  Three small edits to the #172 region:
    an `M.ded_joinable` field, a `dedicated_pin(joinable)` refactor exposing
    `zap_threading_pin` (= `dedicated_pin(0)`), and a `ded_joinable` guard on the

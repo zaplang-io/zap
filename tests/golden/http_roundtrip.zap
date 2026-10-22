@@ -1,6 +1,6 @@
 # Golden fixture: HTTP/1.1 client<->server round-trip (ticket #104, D-0056).
 #
-# A server goroutine serves exactly one request on an ephemeral port: it parses
+# A server coroutine serves exactly one request on an ephemeral port: it parses
 # the request and replies 200 with a body echoing the method and path it saw.
 # Main is the HTTP client: it builds the URL for the ephemeral port, GETs it,
 # and prints the response status and body. Server and client each park on the

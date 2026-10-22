@@ -1,4 +1,4 @@
-# GC stress for monomorphized generics (I#154, D-0064). Four goroutines each
+# GC stress for monomorphized generics (I#154, D-0064). Four coroutines each
 # churn many generic-typed heap instances with BOTH a pointer payload
 # (Optional[str], Pair[int64, str]) and an unboxed-scalar payload (Optional[int64]),
 # forcing collections mid-loop. Correct output under BOTH collectors proves each

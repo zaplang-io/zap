@@ -531,13 +531,13 @@ Non-blocking I/O readiness, so a coroutine that would block on a file descriptor
 re-queued when the fd is ready.
 
 - **Reuses the one park/wake primitive.** The scheduler has a single park
-  primitive (`gopark` / `goready`): a goroutine caller parks its G and frees its
+  primitive (`copark` / `coready`): a coroutine caller parks its G and frees its
   M; a native (`main`) caller blocks on its waiter's condvar. Channels, scope
   joins, and the netpoller all block on it — no parallel mechanism. A parked G
   is kept alive exactly as a channel-parked G is (the statically-rooted `g_all[]`
   registry; under precise Immix, traced via its saved shadow chain).
 - **A dedicated poller OS thread** waits on the readiness mechanism and, on an
-  event, hands the outcome to the parked waiter via `goready` (enqueue the G, or
+  event, hands the outcome to the parked waiter via `coready` (enqueue the G, or
   signal the native waiter). It allocates no GC memory and touches only
   non-traced scheduler fields under their locks, so it is safe without being a
   registered mutator; under Boehm it is started with `GC_pthread_create` so the
@@ -570,15 +570,15 @@ ships in every binary and wires up lazily; the mechanism:
   with the netpoller** — runs there rather than on a worker mid context-switch.
   The signal thread PARKS on the netpoller (`zap_netpoll_wait`, the native-waiter
   path) and, on readiness, drains the pipe and **dispatches in normal context**.
-  (D-0058 describes the dispatcher as a separate goroutine; collapsing it into the
+  (D-0058 describes the dispatcher as a separate coroutine; collapsing it into the
   signal thread avoids forcing the M:N worker pool onto every binary — default
   handlers are on by default — and fan-out is a non-blocking, non-allocating
   channel offer that is scheduler-safe from a native thread. `@on_signal` delivery
-  still runs on a real goroutine. Flagged in the PR.)
+  still runs on a real coroutine. Flagged in the PR.)
 - **Surface.** `signal.notify(Signal.X) -> channel[Signal]` (a small **cap-1
   buffered, coalescing** channel — signals are edges, not a queue: a second edge
   is dropped while one is pending); `@on_signal(Signal.X)` on a function (sugar: a
-  detached receiver goroutine over `signal.notify` invokes it per delivery);
+  detached receiver coroutine over `signal.notify` invokes it per delivery);
   `scope(cancel_on=[Signal.X, ...], grace=<ms>)` — a listed signal cancels the
   scope tree cooperatively (a child observes it at its next cancellation point),
   with an optional hard-exit deadline that force-exits if graceful shutdown
@@ -589,19 +589,19 @@ ships in every binary and wires up lazily; the mechanism:
   Unix signal numbers (so the runtime ABI speaks raw numbers); `SIGKILL`/`SIGSTOP`
   are excluded (uncatchable).
 - **Default diagnostic handlers** (ON by default, opt out at build with
-  `-DZAP_NO_DEFAULT_SIGNALS`, user-overridable): `SIGQUIT` -> goroutine stacks +
+  `-DZAP_NO_DEFAULT_SIGNALS`, user-overridable): `SIGQUIT` -> coroutine stacks +
   runtime/scheduler summary; `SIGUSR1` -> force a GC + print memory stats. Both
   call the uniform `zap_gc_collect`/`zap_gc_stats` and the scheduler's `g_all[]`,
   so they work under either collector with no per-backend `#ifdef`. (`SIGUSR2`
   profiling is a separate deferred ticket, #78 — not built.)
 - **Fault signals** (`SIGSEGV`/`SIGFPE`/`SIGBUS`/`SIGILL`) are NOT delivered via
   `notify`: a crash handler on a `sigaltstack` (so a stack overflow is still
-  reportable) prints the faulting signal/address, the offending goroutine and a
+  reportable) prints the faulting signal/address, the offending coroutine and a
   native backtrace, then re-raises the default disposition so the process dies
   with the right status.
 - **Programmatic surface.** A compiler-known `gc`/`runtime` module —
-  `gc.collect()`, `gc.stats() -> MemStats`, `runtime.goroutine_dump()`,
-  `runtime.num_goroutines()` — over the same runtime entry points; the signals are
+  `gc.collect()`, `gc.stats() -> MemStats`, `runtime.coroutine_dump()`,
+  `runtime.num_coroutines()` — over the same runtime entry points; the signals are
   the zero-code operator path to these. **`zap inspect <pid>`** (CLI) signals a
   running process to dump these (`SIGQUIT`, or `SIGUSR1` with `--gc`).
 - **Deferred / flagged for review:** collapsing the dispatcher into the signal
@@ -609,7 +609,7 @@ ships in every binary and wires up lazily; the mechanism:
   `Duration`/`30.seconds` surface yet — consistent with the deferred `timeout`);
   cooperative cancel_on reaches a coroutine already parked on a channel only at
   its next cancellation point (the `zap_netpoll_wake` parked-G interrupt is a
-  follow-up); full per-goroutine symbolicated stack traces in the dump (v1 reports
+  follow-up); full per-coroutine symbolicated stack traces in the dump (v1 reports
   per-G state/ownership + the scheduler/GC shape); and retroactively masking a
   signal first subscribed from a worker thread (handlers are async-safe wherever
   they run, so this is a purity gap, not a correctness one).

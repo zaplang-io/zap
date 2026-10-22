@@ -445,7 +445,7 @@ void zap_safepoint(void) {
         M *m = cur_m;
         if (m && m->preempt && m->current && !zap_gc_wanted && !zap_collecting) {
             m->preempt = 0;
-            gopreempt();
+            copreempt();
         }
     }
     if (!zap_gc_wanted && !zap_collecting) {

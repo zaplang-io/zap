@@ -1,5 +1,5 @@
 # GC stress for generic FUNCTIONS (I#161, building on the generic-type stress in
-# generics_gc_stress). Four goroutines each churn many heap instances allocated
+# generics_gc_stress). Four coroutines each churn many heap instances allocated
 # THROUGH generic functions — make_pair[int64,str] (a pointer + scalar payload)
 # and wrap[T] (Optional[str] pointer payload, Optional[int64] unboxed scalar) —
 # forcing collections mid-loop. Correct output under BOTH collectors proves each

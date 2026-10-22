@@ -18,9 +18,9 @@
 #ifndef ZAP_GC_IMMIX
 /* `GC_THREADS` must be defined before <gc.h> so the collector is built/used in
  * its thread-aware mode (ticket #25, D-0009/D-0013): it then knows about every
- * goroutine OS thread and scans each one's stack and registers, so live objects
+ * coroutine OS thread and scans each one's stack and registers, so live objects
  * reachable only from a running or suspended coroutine are never collected. The
- * goroutine runtime starts threads with `GC_pthread_create` (declared by <gc.h>
+ * coroutine runtime starts threads with `GC_pthread_create` (declared by <gc.h>
  * in this mode) so the collector registers them automatically; channels block
  * on pthread mutex/condvars. The dev container's `libgc-dev` has thread
  * support, and the program links `-lpthread` (see build_executable). */
@@ -1349,7 +1349,7 @@ void *zap_reflect_names(void *type_name) {
  * A match is a GC-allocated `ZapMatch` that *owns* copies of every captured
  * group (and a copy of the pattern's name table). Because the captures live in
  * the returned value and not in any global/thread-local state, capture state is
- * coroutine-safe by construction (D-0010) — a goroutine that migrates between
+ * coroutine-safe by construction (D-0010) — a coroutine that migrates between
  * OS threads cannot observe another's "last match". It also lets us free the
  * compiled program immediately; a compiled-pattern cache is future work.
  *
@@ -1548,7 +1548,7 @@ void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_
  * GIL: every entry point acquires the GIL (PyGILState_Ensure) around its C-API
  * work and releases it before returning. With the single-threaded runtime of
  * this increment the main thread simply re-acquires it; GIL contention vs.
- * goroutine parallelism (#25) is a documented limitation (design open issue).
+ * coroutine parallelism (#25) is a documented limitation (design open issue).
  *
  * Exceptions: a Python error is translated to a Zap exception — the error is
  * formatted as "<type>: <message>" into a ZapStr and raised with `zap_panic`,
@@ -1556,7 +1556,7 @@ void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_
  *
  * Follow-ups (documented in the PR): list/dict/ndarray marshaling (the design's
  * container rows), keyword arguments, real `PyObject_IsTrue` truthiness, and a
- * thread-safe interpreter init for the goroutine runtime. */
+ * thread-safe interpreter init for the coroutine runtime. */
 
 typedef struct {
     PyObject *obj; /* owned reference; NULL once finalized */
@@ -1777,18 +1777,18 @@ void *zap_py_str(void *obj_) {
 }
 
 /* ===========================================================================
- * Goroutines + channels on an M:N work-stealing scheduler
+ * Coroutines + channels on an M:N work-stealing scheduler
  * (ticket #47, D-0008/D-0013/D-0031/D-0033/D-0034, design/0005-concurrency.md).
  *
- * This replaces the 1:1 pthread-backed goroutine runtime shipped in #25/#46
+ * This replaces the 1:1 pthread-backed coroutine runtime shipped in #25/#46
  * with a user-space scheduler. Language-visible semantics are UNCHANGED; this
  * is purely a runtime swap, and every `zap_*` entry point below keeps the exact
  * signature #25 compiled against, so lowering/codegen are untouched (the one
  * additive codegen change is the spawn trampoline's landing pad, which only
- * affects the uncaught-in-goroutine path).
+ * affects the uncaught-in-coroutine path).
  *
  * The Go M:P:G structure:
- *   - G  a goroutine: a fixed-size green-thread stack + a saved register
+ *   - G  a coroutine: a fixed-size green-thread stack + a saved register
  *        context, allocated on the GC heap.
  *   - M  an OS worker thread, GC-registered, that runs Gs.
  *   - P  a processor context owned by one M, holding a local run queue; idle
@@ -1818,12 +1818,12 @@ void *zap_py_str(void *obj_) {
  *
  * Blocking (design/0005 "Runtime entry points"): channels park the G and free
  * the M on a scheduler-keyed wait queue rather than blocking the OS thread on a
- * condvar. A non-goroutine caller (the main thread) instead blocks on a
+ * condvar. A non-coroutine caller (the main thread) instead blocks on a
  * per-waiter condvar, which parks that OS thread without consuming a worker M.
  *
  * The netpoller (ticket #80) now parks a G blocked on a non-ready fd and frees
  * its M, re-queuing the G on readiness (see the "Netpoller" section below); it
- * reuses the `gopark`/`goready` primitive here.
+ * reuses the `copark`/`coready` primitive here.
  *
  * DEFERRED (documented in the PR / OPEN-QUESTIONS; semantics unchanged): the
  * blocking-syscall P-handoff, preemption of long CPU loops (v1 is
@@ -1906,7 +1906,7 @@ typedef struct M {
     volatile int ded_stop;      /* tear the dedicated M down                    */
 } M;
 
-/* Per-waiter node on a channel's sender/receiver queue. A goroutine waiter
+/* Per-waiter node on a channel's sender/receiver queue. A coroutine waiter
  * (`g != NULL`) is re-enqueued on the scheduler when woken; a native-thread
  * waiter blocks on its own condvar. The waker fills `val`/`ok`/`closed` under
  * the channel lock *before* waking, so the woken waiter reads its outcome
@@ -2203,7 +2203,7 @@ static void switch_to_g(M *m, G *g) {
             sched_gdone();
         }
     } else if (g->state == G_RUNNABLE) {
-        /* The G yielded (`gosched`, e.g. at `checkpoint()`): requeue it. */
+        /* The G yielded (`cosched`, e.g. at `checkpoint()`): requeue it. */
         sched_enqueue(g);
     }
 }
@@ -2393,13 +2393,13 @@ static int zap_maxprocs(void) {
  *         the collector scans every coroutine's saved context + green stack
  *         conservatively, so a coroutine preempted at an arbitrary instruction
  *         is still GC-safe. The handler therefore switches immediately
- *         (`gopreempt`), provided the coroutine holds no runtime lock / is not
+ *         (`copreempt`), provided the coroutine holds no runtime lock / is not
  *         mid-allocation (`no_preempt == 0`); otherwise it defers and the
  *         monitor retries on the next interval. The `no_preempt` guard covers
  *         the one lock a non-parking compute loop can touch (the allocator) plus
  *         channel/sync fast paths, so a switched-in sibling never deadlocks on a
  *         lock the preempted coroutine still holds.
- *   - A preempted coroutine is requeued on the GLOBAL run queue (`gopreempt`),
+ *   - A preempted coroutine is requeued on the GLOBAL run queue (`copreempt`),
  *     behind its peers, so it cannot immediately re-grab its M.
  *
  * LockOSThread-pinned coroutines (below) run on a dedicated M and are never
@@ -2410,7 +2410,7 @@ static int zap_maxprocs(void) {
 #define ZAP_PREEMPT_SLICE_NS 10000000L /* ~10 ms time slice before preemption   */
 static pthread_t g_monitor_thread;
 static int g_monitor_started = 0;
-static void gopreempt(void); /* fwd (scheduler yield, defined below)            */
+static void copreempt(void); /* fwd (scheduler yield, defined below)            */
 
 #ifndef ZAP_GC_IMMIX
 /* Boehm stop-the-world guard (ticket #172). Boehm's STW suspends threads with a
@@ -2428,7 +2428,7 @@ static void zap_boehm_gc_event(GC_EventType e) {
     }
 }
 #endif
-static void gosched(void);   /* fwd (cooperative yield, defined below)          */
+static void cosched(void);   /* fwd (cooperative yield, defined below)          */
 void zap_sched_init(int64_t n_threads); /* fwd (defined below)                  */
 
 /* SIGURG handler: the preemption point. Installed process-wide; only acts on a
@@ -2462,7 +2462,7 @@ static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
         char *hi = lo + g->stack_size;
         if (sp >= lo && sp < hi && g->no_preempt == 0) {
             m->preempt = 0;
-            gopreempt();
+            copreempt();
         }
     }
 #endif
@@ -2507,7 +2507,7 @@ static void *zap_monitor_main(void *arg) {
 }
 
 /* Install the SIGURG handler once (no SA_ONSTACK: the handler must run on the
- * coroutine's own green stack so a gopreempt switch saves/restores it with the
+ * coroutine's own green stack so a copreempt switch saves/restores it with the
  * coroutine's context). Idempotent. */
 static void zap_preempt_install(void) {
     struct sigaction sa;
@@ -2530,7 +2530,7 @@ static void zap_preempt_install(void) {
  * (`ded_g`/`ded_runnable`), bypassing the work-stealing pool; `sched_enqueue`
  * routes a pinned coroutine back to it. The dedicated M is excluded from
  * fairness preemption (not in `g_ms[]`, and `locked_m != NULL` short-circuits
- * `gopreempt`), still polls GC safepoints, and tears down when the coroutine
+ * `copreempt`), still polls GC safepoints, and tears down when the coroutine
  * unlocks or finishes. `lock_depth` makes nested lock/unlock balance. */
 static pthread_mutex_t g_ded_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_ded_cv = PTHREAD_COND_INITIALIZER;
@@ -2633,7 +2633,7 @@ static void dedicated_pin(int joinable) {
     /* Yield: switch_to_g on the current worker will route us (locked_m set) to
      * the dedicated M, where we resume. From here on this coroutine runs only
      * on `d`. */
-    gosched();
+    cosched();
 }
 
 /* `runtime.lock_os_thread()` — pin the calling coroutine to a dedicated M. */
@@ -2661,7 +2661,7 @@ void zap_runtime_unlock_os_thread(void) {
     g->locked_m = NULL;
     /* Yield: switch_to_g on the dedicated M sees locked_m == NULL, routes us to
      * the shared pool, then (coroutine no longer pinned here) tears `d` down. */
-    gosched();
+    cosched();
     (void)d;
 }
 
@@ -2859,7 +2859,7 @@ static ZapStr *cancelled_exc(void) {
 /* Yield the current coroutine back to the scheduler (a cooperative scheduling
  * point). A no-op on a native thread (e.g. `main`), which does not run on an M.
  * The scheduler requeues a G left in G_RUNNABLE (see `switch_to_g`). */
-static void gosched(void) {
+static void cosched(void) {
     M *m = cur_m;
     if (!m || !m->current) {
         return;
@@ -2878,11 +2878,11 @@ static void gosched(void) {
     swapcontext(&g->ctx, &m->sched_ctx);
 }
 
-/* Preemptive yield (ticket #172): like `gosched`, but asks the scheduler to
+/* Preemptive yield (ticket #172): like `cosched`, but asks the scheduler to
  * requeue this coroutine on the GLOBAL queue (behind its peers) so a long
  * CPU-bound coroutine cannot re-grab its M immediately. Invoked from a safepoint
  * (precise GC) or the async-preemption signal handler (Boehm). */
-static void gopreempt(void) {
+static void copreempt(void) {
     M *m = cur_m;
     if (!m || !m->current) {
         return;
@@ -2893,10 +2893,10 @@ static void gopreempt(void) {
     if (g->locked_m) {
         return;
     }
-    /* No stack-redzone probe here (unlike gosched): a preemptive yield grows no
+    /* No stack-redzone probe here (unlike cosched): a preemptive yield grows no
      * user stack — it only switches away — and this can run in signal context
      * (Boehm), where zap_panic would be unsafe. A genuinely near-full stack is
-     * still caught at the next cooperative gosched/gopark in normal context. */
+     * still caught at the next cooperative cosched/copark in normal context. */
     g->state = G_RUNNABLE;
     g->preempt_requeue = 1;
     g->no_preempt = 0;
@@ -2929,7 +2929,7 @@ static void zap_check_cancel(void) {
  * loops. Observes a pending cancel, then yields so siblings make progress. */
 void zap_checkpoint(void) {
     zap_check_cancel();
-    gosched();
+    cosched();
 }
 
 /* An owned coroutine finished: drop it from its scope's live count and wake the
@@ -3142,7 +3142,7 @@ static Waiter *q_pop(Waiter **head, Waiter **tail) {
 
 /* Wake a waiter the current thread has just resolved (its outcome is already
  * written). Called holding the channel lock. */
-static void goready(Waiter *w) {
+static void coready(Waiter *w) {
     if (w->g) {
         sched_enqueue(w->g);
     } else {
@@ -3154,15 +3154,15 @@ static void goready(Waiter *w) {
 /* Park the current execution context on a scheduler-keyed wait queue guarded by
  * `mu` (held on entry). The waiter `w` is already enqueued on the relevant queue
  * by the caller. Releases `mu` while blocked and guarantees it is released on
- * return; the waiter's outcome has been written by the waker before `goready`.
- * A goroutine parks its G and frees its M (the scheduler unlocks `mu` once the G
- * is fully switched out, which closes the park/wake race); a non-goroutine
+ * return; the waiter's outcome has been written by the waker before `coready`.
+ * A coroutine parks its G and frees its M (the scheduler unlocks `mu` once the G
+ * is fully switched out, which closes the park/wake race); a non-coroutine
  * (main) thread blocks on the waiter's own condvar without consuming a worker M.
  *
  * This is the one shared park primitive the whole runtime blocks on — channels
  * (`chan_block`), scope joins, and the netpoller (ticket #80) all reuse it, so a
  * blocked coroutine is always parked rather than tying up an M. */
-static void gopark(pthread_mutex_t *mu, Waiter *w) {
+static void copark(pthread_mutex_t *mu, Waiter *w) {
     M *m = cur_m;
     if (m && m->current) {
         G *g = m->current;
@@ -3200,8 +3200,8 @@ static void gopark(pthread_mutex_t *mu, Waiter *w) {
 }
 
 /* Block the current execution context on channel `c` (lock held on entry); a
- * thin wrapper over the shared `gopark` primitive keyed on the channel lock. */
-static void chan_block(ZapChan *c, Waiter *w) { gopark(&c->mu, w); }
+ * thin wrapper over the shared `copark` primitive keyed on the channel lock. */
+static void chan_block(ZapChan *c, Waiter *w) { copark(&c->mu, w); }
 
 void *zap_chan_new(int64_t cap) {
     ZapChan *c = (ZapChan *)zap_obj(&zap_desc_chan);
@@ -3232,7 +3232,7 @@ static void chan_send_word(ZapChan *c, uint64_t v) {
         Waiter *r = q_pop(&c->recvq_head, &c->recvq_tail);
         r->val = v;
         r->ok = 1;
-        goready(r);
+        coready(r);
         zap_np_unlock(&c->mu);
         return;
     }
@@ -3270,7 +3270,7 @@ static uint64_t chan_recv_word(ZapChan *c, int *ok) {
             c->tail = (c->tail + 1) % c->cap;
             c->count++;
             s->ok = 1;
-            goready(s);
+            coready(s);
         }
         zap_np_unlock(&c->mu);
         if (ok) {
@@ -3283,7 +3283,7 @@ static uint64_t chan_recv_word(ZapChan *c, int *ok) {
         Waiter *s = q_pop(&c->sendq_head, &c->sendq_tail);
         uint64_t v = s->val;
         s->ok = 1;
-        goready(s);
+        coready(s);
         zap_np_unlock(&c->mu);
         if (ok) {
             *ok = 1;
@@ -3337,12 +3337,12 @@ void zap_chan_close(void *ch) {
     while ((w = q_pop(&c->sendq_head, &c->sendq_tail)) != NULL) {
         w->closed = 1;
         w->ok = 0;
-        goready(w);
+        coready(w);
     }
     while ((w = q_pop(&c->recvq_head, &c->recvq_tail)) != NULL) {
         w->ok = 0;
         w->val = 0;
-        goready(w);
+        coready(w);
     }
     zap_np_unlock(&c->mu);
 }
@@ -3351,14 +3351,14 @@ void zap_chan_close(void *ch) {
  * Netpoller — non-blocking I/O readiness for the M:N scheduler
  * (ticket #80, D-0008, design/0005-concurrency.md "Blocking syscalls").
  *
- * A goroutine that would block waiting for a file descriptor to become readable
+ * A coroutine that would block waiting for a file descriptor to become readable
  * or writable registers the fd here and PARKS its G (freeing its M to run other
- * goroutines) instead of blocking the OS thread in a read/write syscall. A
+ * coroutines) instead of blocking the OS thread in a read/write syscall. A
  * dedicated poller OS thread waits on the readiness mechanism (epoll on Linux)
  * and, when an fd is ready, re-queues the parked G on the scheduler. This is the
  * Go netpoller analogue and the deferral called out in #47's PR.
  *
- * It reuses the scheduler's ONE park/wake primitive (`gopark` / `goready`),
+ * It reuses the scheduler's ONE park/wake primitive (`copark` / `coready`),
  * exactly as channels do — a parked reader frees its M; a native (main) thread
  * caller blocks on its waiter's condvar without consuming a worker M. No
  * parallel blocking mechanism is introduced.
@@ -3495,7 +3495,7 @@ static void np_backend_kick(void) {}
 
 /* ---- generic poller (backend-agnostic) ------------------------------------ */
 /* Deliver readiness/timeout/closed to one direction of `pd` (pd->mu held). A
- * parked waiter is popped, given its outcome, and re-queued (`goready`); a bare
+ * parked waiter is popped, given its outcome, and re-queued (`coready`); a bare
  * readiness edge with no waiter is LATCHED so the next `wait` consumes it. */
 static void np_wake_dir_locked(PollDesc *pd, int is_read, int status) {
     Waiter **slot = is_read ? &pd->rg : &pd->wg;
@@ -3506,7 +3506,7 @@ static void np_wake_dir_locked(PollDesc *pd, int is_read, int status) {
         *slot = NULL;
         *dl = 0;
         w->val = (uint64_t)status;
-        goready(w); /* enqueue the parked G, or signal a native waiter's condvar */
+        coready(w); /* enqueue the parked G, or signal a native waiter's condvar */
     } else if (status == ZAP_POLL_OK) {
         *ready = 1; /* edge arrived before anyone parked: latch it (edge-triggered) */
     }
@@ -3571,14 +3571,14 @@ static void np_expire_deadlines(void) {
             pd->rg = NULL;
             pd->r_deadline = 0;
             w->val = ZAP_POLL_TIMEOUT;
-            goready(w);
+            coready(w);
         }
         if (pd->wg && pd->w_deadline && pd->w_deadline <= now) {
             Waiter *w = pd->wg;
             pd->wg = NULL;
             pd->w_deadline = 0;
             w->val = ZAP_POLL_TIMEOUT;
-            goready(w);
+            coready(w);
         }
         zap_np_unlock(&pd->mu);
     }
@@ -3753,7 +3753,7 @@ int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
     if (deadline_ns) {
         np_backend_kick(); /* make the poller recompute its timeout */
     }
-    gopark(&pd->mu, &w); /* releases pd->mu; the poller wakes us */
+    copark(&pd->mu, &w); /* releases pd->mu; the poller wakes us */
     return (int64_t)w.val;
 }
 
@@ -3774,7 +3774,7 @@ void zap_netpoll_wake(void *pd_, int64_t mode) {
             pd->rg = NULL;
             pd->r_deadline = 0;
             w->val = ZAP_POLL_OK;
-            goready(w);
+            coready(w);
         } else {
             pd->r_ready = 1; /* latch: the next read wait returns at once */
         }
@@ -3785,7 +3785,7 @@ void zap_netpoll_wake(void *pd_, int64_t mode) {
             pd->wg = NULL;
             pd->w_deadline = 0;
             w->val = ZAP_POLL_OK;
-            goready(w);
+            coready(w);
         } else {
             pd->w_ready = 1; /* latch: the next write wait returns at once */
         }
@@ -3805,13 +3805,13 @@ void zap_netpoll_close(void *pd_) {
         Waiter *w = pd->rg;
         pd->rg = NULL;
         w->val = ZAP_POLL_CLOSED;
-        goready(w);
+        coready(w);
     }
     if (pd->wg) {
         Waiter *w = pd->wg;
         pd->wg = NULL;
         w->val = ZAP_POLL_CLOSED;
-        goready(w);
+        coready(w);
     }
     np_all_remove_locked(pd);
     zap_np_unlock(&pd->mu);
@@ -3825,17 +3825,17 @@ void zap_netpoll_close(void *pd_) {
  * signals #77), so this drives it end-to-end from C and backs the
  * `__netpoll_selftest()` golden (run under both collectors). It forces a SINGLE
  * worker M (`zap_sched_init(1)`) so the "a parked G frees its M" property is
- * load-bearing: a reader goroutine blocks on a not-yet-ready pipe and MUST park
- * (freeing the one M) or the writer goroutine could never be scheduled and the
+ * load-bearing: a reader coroutine blocks on a not-yet-ready pipe and MUST park
+ * (freeing the one M) or the writer coroutine could never be scheduled and the
  * program would deadlock. Returns the number of sub-checks that passed
  * (ZAP_NP_SELFTEST_CHECKS on full success); prints to stderr on any failure. */
 #define ZAP_NP_SELFTEST_CHECKS 2
 
 #if defined(ZAP_NETPOLL_EPOLL)
-static int g_np_t_rfd;        /* read end polled by the reader goroutine        */
-static int g_np_t_wfd;        /* write end the writer goroutine writes to       */
+static int g_np_t_rfd;        /* read end polled by the reader coroutine        */
+static int g_np_t_wfd;        /* write end the writer coroutine writes to       */
 static void *g_np_t_pd;       /* its PollDesc                                   */
-static void *g_np_t_done;     /* buffered channel the two goroutines signal on  */
+static void *g_np_t_done;     /* buffered channel the two coroutines signal on  */
 static volatile int g_np_t_byte;   /* byte the reader received                  */
 static volatile int g_np_t_status; /* reader's zap_netpoll_wait outcome         */
 
@@ -3846,7 +3846,7 @@ static void np_set_nonblock(int fd) {
     }
 }
 
-/* Reader goroutine: parks on the pipe until readable, then drains one byte. */
+/* Reader coroutine: parks on the pipe until readable, then drains one byte. */
 static void *np_selftest_reader(void *arg) {
     (void)arg;
     g_np_t_status = (int)zap_netpoll_wait(g_np_t_pd, ZAP_POLL_READ, 0);
@@ -3861,7 +3861,7 @@ static void *np_selftest_reader(void *arg) {
     return NULL;
 }
 
-/* Writer goroutine: writes the sentinel byte to wake the parked reader. Runs on
+/* Writer coroutine: writes the sentinel byte to wake the parked reader. Runs on
  * the freed M while the reader is parked (single-M => this is the proof). */
 static void *np_selftest_writer(void *arg) {
     (void)arg;
@@ -3897,7 +3897,7 @@ int64_t zap_netpoll_selftest(void) {
             zap_gc_add_root(&g_np_t_done);
             zap_spawn(np_selftest_reader, NULL);
             zap_spawn(np_selftest_writer, NULL);
-            /* Native wait for both goroutines (parks main on the channel). */
+            /* Native wait for both coroutines (parks main on the channel). */
             (void)zap_chan_recv_i64(g_np_t_done);
             (void)zap_chan_recv_i64(g_np_t_done);
             if (g_np_t_status == ZAP_POLL_OK && g_np_t_byte == 90) {
@@ -3972,18 +3972,18 @@ int64_t zap_netpoll_selftest(void) { return ZAP_NP_SELFTEST_CHECKS; }
  * after cleanup). Catchable signals only; SIGKILL/SIGSTOP cannot be caught.
  *
  * DEVIATION (flagged for review): D-0058 describes the reader as a separate
- * "dispatcher goroutine". Here the dedicated signal thread is itself the reader/
+ * "dispatcher coroutine". Here the dedicated signal thread is itself the reader/
  * dispatcher — it still parks on the netpoller-registered self-pipe and delivers
  * in normal context, and fan-out is a non-blocking, non-allocating channel offer
  * that is scheduler-safe from a native (non-M) thread. A distinct dispatcher
- * goroutine would force the M:N worker pool onto EVERY binary (default handlers
+ * coroutine would force the M:N worker pool onto EVERY binary (default handlers
  * are on by default), breaking the deliberate scheduler-laziness invariant that
  * keeps non-concurrent programs zero-cost (#47). `@on_signal` delivery DOES run
- * on a real goroutine (a detached receiver loop over the notify channel).
+ * on a real coroutine (a detached receiver loop over the notify channel).
  *
  * FAULT signals (SIGSEGV/SIGFPE/SIGBUS/SIGILL) are NOT delivered via `notify`: a
  * crash handler (on a sigaltstack, so a stack overflow is still reportable)
- * prints the faulting signal/address, the offending goroutine, and a native
+ * prints the faulting signal/address, the offending coroutine, and a native
  * backtrace, then re-raises the default disposition so the process dies with the
  * right status (and a core, if enabled).
  * =========================================================================== */
@@ -4083,7 +4083,7 @@ static int chan_offer_word(ZapChan *c, uint64_t v) {
         Waiter *r = q_pop(&c->recvq_head, &c->recvq_tail);
         r->val = v;
         r->ok = 1;
-        goready(r);
+        coready(r);
         zap_np_unlock(&c->mu);
         return 1;
     }
@@ -4098,7 +4098,7 @@ static int chan_offer_word(ZapChan *c, uint64_t v) {
     return 0; /* coalesce: drop this edge */
 }
 
-/* ---- diagnostics: goroutine / scheduler dump (SIGQUIT default, runtime.*) -- */
+/* ---- diagnostics: coroutine / scheduler dump (SIGQUIT default, runtime.*) -- */
 static const char *gstate_name(GState s) {
     switch (s) {
     case G_RUNNABLE: return "runnable";
@@ -4109,9 +4109,9 @@ static const char *gstate_name(GState s) {
     }
 }
 
-/* Count live goroutines (runnable+running+parked). Reads the static g_all[]
+/* Count live coroutines (runnable+running+parked). Reads the static g_all[]
  * registry under its lock; safe from any thread. */
-int64_t zap_runtime_num_goroutines(void) {
+int64_t zap_runtime_num_coroutines(void) {
     zap_np_lock(&g_all_mu);
     int64_t n = g_all_len;
     zap_np_unlock(&g_all_mu);
@@ -4137,17 +4137,17 @@ int64_t zap_gc_free_bytes(void) {
     return h > l ? h - l : 0;
 }
 
-/* Dump every live goroutine + a scheduler summary to `f`. v1 reports per-G
+/* Dump every live coroutine + a scheduler summary to `f`. v1 reports per-G
  * identity/state/ownership and the scheduler/GC shape; full per-G symbolicated
  * stack traces (unwinding each green stack) are a follow-up (noted in the PR). */
-static void zap_goroutine_dump_to(FILE *f) {
+static void zap_coroutine_dump_to(FILE *f) {
     int64_t ng, maxprocs, live;
     zap_np_lock(&g_live_mu);
     live = g_live;
     zap_np_unlock(&g_live_mu);
     maxprocs = (int64_t)g_nm;
     fprintf(f, "=== zap runtime dump ===\n");
-    fprintf(f, "MAXPROCS(M=P): %lld  root-live goroutines: %lld\n",
+    fprintf(f, "MAXPROCS(M=P): %lld  root-live coroutines: %lld\n",
             (long long)maxprocs, (long long)live);
     int64_t heap = 0, lb = 0;
     zap_gc_stats(&heap, &lb);
@@ -4155,14 +4155,14 @@ static void zap_goroutine_dump_to(FILE *f) {
             (long long)zap_gc_count(), (long long)heap, (long long)lb);
     zap_np_lock(&g_all_mu);
     ng = g_all_len;
-    fprintf(f, "goroutines: %lld\n", (long long)ng);
+    fprintf(f, "coroutines: %lld\n", (long long)ng);
     for (int64_t i = 0; i < g_all_len; i++) {
         G *g = g_all[i];
         if (!g) {
             continue;
         }
         const char *own = g->scope ? "scoped" : (g->in_live ? "root" : "detached");
-        fprintf(f, "  goroutine %lld [%s, %s]\n", (long long)i,
+        fprintf(f, "  coroutine %lld [%s, %s]\n", (long long)i,
                 gstate_name(g->state), own);
     }
     zap_np_unlock(&g_all_mu);
@@ -4170,7 +4170,7 @@ static void zap_goroutine_dump_to(FILE *f) {
     fflush(f);
 }
 
-void zap_runtime_goroutine_dump(void) { zap_goroutine_dump_to(stderr); }
+void zap_runtime_coroutine_dump(void) { zap_coroutine_dump_to(stderr); }
 
 /* ---- default diagnostic handlers ------------------------------------------ */
 static void zap_sig_run_default(int signo) {
@@ -4180,12 +4180,12 @@ static void zap_sig_run_default(int signo) {
         zap_gc_stats(&heap, &live);
         fprintf(stderr,
                 "=== zap SIGUSR1: forced GC ===\n"
-                "heap=%lld bytes  live=%lld bytes  gc-cycles=%lld  goroutines=%lld\n",
+                "heap=%lld bytes  live=%lld bytes  gc-cycles=%lld  coroutines=%lld\n",
                 (long long)heap, (long long)live, (long long)zap_gc_count(),
-                (long long)zap_runtime_num_goroutines());
+                (long long)zap_runtime_num_coroutines());
         fflush(stderr);
     } else if (signo == SIGQUIT) {
-        zap_goroutine_dump_to(stderr);
+        zap_coroutine_dump_to(stderr);
     } else if (signo == SIGUSR2) {
         /* D-0058: SIGUSR2 toggles the CPU profiler. Runs on the dedicated signal
          * thread in normal context, so start/stop may allocate, open the output
@@ -4256,7 +4256,7 @@ static void *zap_sig_thread_main(void *arg) {
     sigemptyset(&empty);
     pthread_sigmask(SIG_SETMASK, &empty, NULL);
     /* Registered mutator (Immix): this thread parks via zap_netpoll_wait ->
-     * gopark's native path, which brackets the wait with enter/leave_blocking;
+     * copark's native path, which brackets the wait with enter/leave_blocking;
      * it never allocates GC memory and is GC-safe while blocked (like main). */
     zap_mutator_register();
     unsigned char buf[64];
@@ -4301,14 +4301,14 @@ static void zap_fault_handler(int signo, siginfo_t *info, void *uctx) {
     int n = snprintf(msg, sizeof msg,
                      "\n=== zap fatal: %s (signal %d) ===\n"
                      "faulting address: %p\n"
-                     "offending goroutine: ",
+                     "offending coroutine: ",
                      sig_name(signo), signo, addr);
     if (n > 0) {
         ssize_t w = write(STDERR_FILENO, msg, (size_t)n);
         (void)w;
     }
     if (g) {
-        int m2 = snprintf(msg, sizeof msg, "goroutine %lld [%s]\n",
+        int m2 = snprintf(msg, sizeof msg, "coroutine %lld [%s]\n",
                           (long long)g->all_idx, gstate_name(g->state));
         if (m2 > 0) {
             ssize_t w = write(STDERR_FILENO, msg, (size_t)m2);
@@ -4492,7 +4492,7 @@ typedef struct {
     zap_sig_cb fn;
 } SigCbArg;
 
-/* A detached goroutine that invokes the decorated handler on each delivery. It
+/* A detached coroutine that invokes the decorated handler on each delivery. It
  * parks on the notify channel (real G, green stack), so the handler runs in full
  * Zap context — never on the signal thread. */
 static void *zap_sig_cb_loop(void *arg) {
@@ -4654,7 +4654,7 @@ void zap_signal_drain(void) {
      * default handler's forced GC (stop-the-world, run on the signal thread)
      * would deadlock waiting for this thread to reach a safepoint it can never
      * reach while parked here. Its roots were flushed on entry (same contract as
-     * gopark's native-waiter path / scope_join). */
+     * copark's native-waiter path / scope_join). */
     zap_enter_blocking();
     zap_np_lock(&g_sig_sync_mu);
     int64_t want = g_sig_sync_seq + 1;
@@ -6232,7 +6232,7 @@ __attribute__((constructor)) static void zap_gc_register_statics(void) {
  * `math` — thin libm wrappers (unconditionally compiled for both collectors).
  * `random` — a seedable xoshiro256** generator with SplitMix64 seed expansion,
  * autoseeded from OS entropy (getentropy / arc4random) on first use. A single
- * mutex guards the global state so concurrent goroutines never observe torn
+ * mutex guards the global state so concurrent coroutines never observe torn
  * state; like CPython's module-level generator, the state itself is shared.
  * ========================================================================== */
 
@@ -6959,7 +6959,7 @@ int64_t zap_oset_get(void *sp, int64_t i) {
  *     configurable line format over the tokens %(asctime)s / %(levelname)s /
  *     %(message)s (default "%(levelname)s:%(message)s", no timestamp, so output
  *     is deterministic unless the program opts into %(asctime)s). The root
- *     config is process-global, guarded by a mutex so concurrent goroutines
+ *     config is process-global, guarded by a mutex so concurrent coroutines
  *     emit whole lines without interleaving. Named loggers and structured
  *     key-value fields are deferred (noted in the PR).
  *   - `argparse` is a GLOBAL SINGLETON parser (a notable v1 choice): with no
@@ -7093,7 +7093,7 @@ void zap_logging_set_format(void *fmt_) {
 
 /* logging.log(level, msg) and the per-level emitters: format one line per the
  * active template and write it (threshold permitting). The config mutex is held
- * across the write so lines from concurrent goroutines never interleave. */
+ * across the write so lines from concurrent coroutines never interleave. */
 void zap_logging_log(int64_t level, void *msg_) {
     ZapStr *msg = (ZapStr *)msg_;
     zap_np_lock(&g_log_mu);
@@ -8446,12 +8446,12 @@ int64_t zap_zlib_adler32(void *data) {
  * sync — coroutine synchronization primitives (ticket #103, D-0032)
  * ---------------------------------------------------------------------------
  * Mutex, WaitGroup, and Once, built on the scheduler's ONE park/wake primitive
- * (`gopark`/`goready`) and `Waiter` queue (defined with the channel runtime
+ * (`copark`/`coready`) and `Waiter` queue (defined with the channel runtime
  * above) — exactly as channels and the netpoller do. A coroutine that blocks on
  * a contended lock, a `wait()`, or an in-flight `Once` therefore *parks its G
  * and frees its M* rather than tying up an OS thread (design/0005 "a blocked
- * coroutine parks its G"); a non-goroutine (main) thread falls back to a condvar
- * inside `gopark` without consuming a worker M.
+ * coroutine parks its G"); a non-coroutine (main) thread falls back to a condvar
+ * inside `copark` without consuming a worker M.
  *
  * Each handle is a GC object with an embedded `pthread_mutex_t` guarding its
  * small critical section plus a FIFO `Waiter` queue. The handle carries no
@@ -8474,7 +8474,7 @@ int64_t zap_zlib_adler32(void *data) {
 /* ---- Mutex: non-reentrant, FIFO, parks the waiter --------------------------
  * `locked` is handed off directly on unlock: `unlock` dequeues one waiter and
  * wakes it *without clearing* `locked`, so the woken waiter owns the lock on
- * return from `gopark` with no re-check and no acquire race. */
+ * return from `copark` with no re-check and no acquire race. */
 typedef struct {
     pthread_mutex_t mu;           /* guards `locked` + the wait queue           */
     int locked;                   /* 1 iff the lock is held                     */
@@ -8500,11 +8500,11 @@ void zap_mutex_lock(void *mp) {
         return;
     }
     /* Contended: enqueue and park. On wake the lock has been handed to us
-     * directly (see `zap_mutex_unlock`); `gopark` releases `m->mu`. */
+     * directly (see `zap_mutex_unlock`); `copark` releases `m->mu`. */
     Waiter w;
     w.g = NULL;
     q_push(&m->wq_head, &m->wq_tail, &w);
-    gopark(&m->mu, &w);
+    copark(&m->mu, &w);
 }
 
 /* Try to acquire without blocking: 1 on success, 0 if already held. */
@@ -8526,7 +8526,7 @@ void zap_mutex_unlock(void *mp) {
     Waiter *nx = q_pop(&m->wq_head, &m->wq_tail);
     if (nx) {
         /* Direct handoff: ownership passes to `nx`; `locked` stays 1. */
-        goready(nx);
+        coready(nx);
     } else {
         m->locked = 0;
     }
@@ -8563,10 +8563,10 @@ void zap_waitgroup_add(void *wp, int64_t n) {
         return;
     }
     if (w->count == 0) {
-        /* Release every waiter; each returns from its `gopark`. */
+        /* Release every waiter; each returns from its `copark`. */
         Waiter *x;
         while ((x = q_pop(&w->wq_head, &w->wq_tail)) != NULL) {
-            goready(x);
+            coready(x);
         }
     }
     zap_np_unlock(&w->mu);
@@ -8584,7 +8584,7 @@ void zap_waitgroup_wait(void *wp) {
     Waiter x;
     x.g = NULL;
     q_push(&w->wq_head, &w->wq_tail, &x);
-    gopark(&w->mu, &x); /* releases `w->mu`; woken when count hits 0 */
+    copark(&w->mu, &x); /* releases `w->mu`; woken when count hits 0 */
 }
 
 /* ---- Once: run an initializer exactly once across all coroutines -----------
@@ -8632,7 +8632,7 @@ int64_t zap_once_begin(void *op) {
     Waiter w;
     w.g = NULL;
     q_push(&o->wq_head, &o->wq_tail, &w);
-    gopark(&o->mu, &w);
+    copark(&o->mu, &w);
     return 0;
 }
 
@@ -8642,7 +8642,7 @@ void zap_once_end(void *op) {
     o->state = 2;
     Waiter *x;
     while ((x = q_pop(&o->wq_head, &o->wq_tail)) != NULL) {
-        goready(x);
+        coready(x);
     }
     zap_np_unlock(&o->mu);
 }
@@ -8650,7 +8650,7 @@ void zap_once_end(void *op) {
 /* ===========================================================================
  * net / http (ticket #104, D-0056). Plaintext TCP sockets + HTTP/1.1 client and
  * server, built on the netpoller (#80) and the M:N scheduler (#47): every
- * socket operation is non-blocking and PARKS the goroutine on a would-block
+ * socket operation is non-blocking and PARKS the coroutine on a would-block
  * (freeing its worker M) via `zap_netpoll_wait`, rather than blocking an OS
  * thread or busy-polling. TLS/`https` is handled by the `tls` section below
  * (ticket #147); UDP is out of scope (plaintext TCP only). Keep-alive, chunked
@@ -9047,7 +9047,7 @@ void zap_net_close(void *s_) {
  * tls (ticket #147, D-0062). A TLS *client* over the `net` TCP sockets, backed
  * by system OpenSSL (`-lssl -lcrypto`) and integrated with the netpoller (#80):
  * the fd is non-blocking, and SSL_connect / SSL_read / SSL_write returning
- * WANT_READ / WANT_WRITE PARK the goroutine via `zap_sock_park` (freeing its
+ * WANT_READ / WANT_WRITE PARK the coroutine via `zap_sock_park` (freeing its
  * worker M) instead of blocking an OS thread or busy-polling. `tls.connect`
  * verifies the certificate chain against the system trust store AND the hostname
  * by default (SSL_set1_host + SSL_VERIFY_PEER); `tls.connect_insecure` is the
@@ -9347,7 +9347,7 @@ void zap_tls_close(void *t_) {
  * exists only so the golden suite can drive the real client end to end against a
  * server-generated self-signed cert with no outbound network. It generates an
  * ephemeral RSA key + self-signed X509 (CN=localhost), binds 127.0.0.1:0, and
- * spawns a goroutine that accepts ONE connection, handshakes, echoes one record
+ * spawns a coroutine that accepts ONE connection, handshakes, echoes one record
  * and tears down. A client that verifies (the default) rejects the self-signed
  * cert mid-handshake — the server side then just cleans up, never crashing. */
 typedef struct {
@@ -9388,7 +9388,7 @@ static SSL_CTX *zap_tls_test_make_ctx(void) {
     return ctx;
 }
 
-/* Goroutine body: accept one conn, server-handshake, echo one record, clean up.
+/* Coroutine body: accept one conn, server-handshake, echo one record, clean up.
  * Any failure just tears down — it must never abort the process. */
 static void *zap_tls_test_serve(void *arg) {
     ZapTlsTestSrv *s = (ZapTlsTestSrv *)arg;
@@ -10131,7 +10131,7 @@ void zap_http_respond(void *c_, int64_t status, void *body_) {
  * `pthread_mutex_t` and a FIFO `Waiter` queue whose nodes are stack locals of
  * the blocked coroutines (rooted via their shadow chains), exactly as the `sync`
  * module and channels arrange it. Untimed waits use the shared cooperative
- * `gopark`/`goready` primitive (a blocked coroutine parks its G and frees its
+ * `copark`/`coready` primitive (a blocked coroutine parks its G and frees its
  * M). Timed waits (`join`/`wait`/`acquire` with a timeout) have no cooperative
  * scheduler timer to reuse (even `time.sleep` is a blocking `nanosleep`; the
  * #80 deadline path is fd/epoll-bound), so they block the calling OS thread on
@@ -10156,10 +10156,10 @@ static void thr_deadline(double secs, struct timespec *ts) {
 }
 
 /* Timed park on a handle queue guarded by `mu` (held on entry and on return).
- * Returns 1 if woken by `goready` (the waker set `w->done`), 0 on timeout. The
+ * Returns 1 if woken by `coready` (the waker set `w->done`), 0 on timeout. The
  * waiter always blocks this OS thread on its own condvar (see the section
  * header); the caller dequeues `w` on timeout. GC-safe while blocked. */
-static int gopark_timed(pthread_mutex_t *mu, Waiter *w, double secs) {
+static int copark_timed(pthread_mutex_t *mu, Waiter *w, double secs) {
     w->g = NULL;
     pthread_cond_init(&w->cv, NULL);
     w->done = 0;
@@ -10242,7 +10242,7 @@ void zap_thread_finish(void *tp, int64_t daemon) {
     t->done = 1;
     Waiter *x;
     while ((x = q_pop(&t->wq_head, &t->wq_tail)) != NULL) {
-        goready(x);
+        coready(x);
     }
     zap_np_unlock(&t->mu);
     if (!daemon) {
@@ -10264,7 +10264,7 @@ void zap_thread_join(void *tp) {
     Waiter w;
     w.g = NULL;
     q_push(&t->wq_head, &t->wq_tail, &w);
-    gopark(&t->mu, &w); /* releases t->mu; woken by zap_thread_finish */
+    copark(&t->mu, &w); /* releases t->mu; woken by zap_thread_finish */
 }
 
 /* Join with a timeout (seconds). 1 if the thread finished, 0 on timeout. */
@@ -10278,7 +10278,7 @@ int64_t zap_thread_join_timeout(void *tp, double secs) {
     Waiter w;
     w.g = NULL;
     q_push(&t->wq_head, &t->wq_tail, &w);
-    int woken = gopark_timed(&t->mu, &w, secs); /* returns with t->mu held */
+    int woken = copark_timed(&t->mu, &w, secs); /* returns with t->mu held */
     if (!woken) {
         q_remove(&t->wq_head, &t->wq_tail, &w);
     }
@@ -10310,7 +10310,7 @@ int64_t zap_mutex_lock_timeout(void *mp, double secs) {
     Waiter w;
     w.g = NULL;
     q_push(&m->wq_head, &m->wq_tail, &w);
-    int woken = gopark_timed(&m->mu, &w, secs);
+    int woken = copark_timed(&m->mu, &w, secs);
     if (!woken) {
         q_remove(&m->wq_head, &m->wq_tail, &w);
     }
@@ -10371,7 +10371,7 @@ void zap_rlock_lock(void *rp) {
     Waiter w;
     w.g = NULL;
     q_push(&r->wq_head, &r->wq_tail, &w);
-    gopark(&r->mu, &w);
+    copark(&r->mu, &w);
     /* Woken by a direct handoff from zap_rlock_unlock: owner is the HANDOFF
      * sentinel and count is already 1; claim it by stamping our id. */
     zap_np_lock(&r->mu);
@@ -10415,7 +10415,7 @@ void zap_rlock_unlock(void *rp) {
          * before the woken waiter stamps its own id. */
         r->owner = ZAP_RLOCK_HANDOFF;
         r->count = 1;
-        goready(nx);
+        coready(nx);
     } else {
         r->owner = NULL;
         r->count = 0;
@@ -10446,7 +10446,7 @@ void zap_event_set(void *ep) {
     e->is_set = 1;
     Waiter *x;
     while ((x = q_pop(&e->wq_head, &e->wq_tail)) != NULL) {
-        goready(x);
+        coready(x);
     }
     zap_np_unlock(&e->mu);
 }
@@ -10476,7 +10476,7 @@ void zap_event_wait(void *ep) {
     Waiter w;
     w.g = NULL;
     q_push(&e->wq_head, &e->wq_tail, &w);
-    gopark(&e->mu, &w);
+    copark(&e->mu, &w);
 }
 
 int64_t zap_event_wait_timeout(void *ep, double secs) {
@@ -10489,7 +10489,7 @@ int64_t zap_event_wait_timeout(void *ep, double secs) {
     Waiter w;
     w.g = NULL;
     q_push(&e->wq_head, &e->wq_tail, &w);
-    int woken = gopark_timed(&e->mu, &w, secs);
+    int woken = copark_timed(&e->mu, &w, secs);
     if (!woken) {
         q_remove(&e->wq_head, &e->wq_tail, &w);
     }
@@ -10527,7 +10527,7 @@ void zap_sem_acquire(void *sp) {
     Waiter w;
     w.g = NULL;
     q_push(&s->wq_head, &s->wq_tail, &w);
-    gopark(&s->mu, &w); /* woken by a direct permit handoff */
+    copark(&s->mu, &w); /* woken by a direct permit handoff */
 }
 
 int64_t zap_sem_acquire_timeout(void *sp, double secs) {
@@ -10541,7 +10541,7 @@ int64_t zap_sem_acquire_timeout(void *sp, double secs) {
     Waiter w;
     w.g = NULL;
     q_push(&s->wq_head, &s->wq_tail, &w);
-    int woken = gopark_timed(&s->mu, &w, secs);
+    int woken = copark_timed(&s->mu, &w, secs);
     if (!woken) {
         q_remove(&s->wq_head, &s->wq_tail, &w);
     }
@@ -10554,7 +10554,7 @@ void zap_sem_release(void *sp) {
     zap_np_lock(&s->mu);
     Waiter *nx = q_pop(&s->wq_head, &s->wq_tail);
     if (nx) {
-        goready(nx); /* hand the permit straight to a waiter; count unchanged */
+        coready(nx); /* hand the permit straight to a waiter; count unchanged */
     } else {
         s->count++;
     }
@@ -10595,7 +10595,7 @@ void zap_cond_acquire(void *cp) {
     Waiter w;
     w.g = NULL;
     q_push(&c->lq_head, &c->lq_tail, &w);
-    gopark(&c->mu, &w); /* direct handoff: we own the lock on wake */
+    copark(&c->mu, &w); /* direct handoff: we own the lock on wake */
 }
 
 /* Release the condition lock: hand off to a lock-waiter, else mark unlocked.
@@ -10603,7 +10603,7 @@ void zap_cond_acquire(void *cp) {
 static void cond_release_locked(ZapCond *c) {
     Waiter *nx = q_pop(&c->lq_head, &c->lq_tail);
     if (nx) {
-        goready(nx); /* ownership passes; locked stays 1 */
+        coready(nx); /* ownership passes; locked stays 1 */
     } else {
         c->locked = 0;
     }
@@ -10624,7 +10624,7 @@ void zap_cond_wait(void *cp) {
     Waiter w;
     w.g = NULL;
     q_push(&c->cq_head, &c->cq_tail, &w);
-    gopark(&c->mu, &w);
+    copark(&c->mu, &w);
     /* notify moved us onto the lock queue and a handoff woke us: we own the
      * lock again on return. */
 }
@@ -10641,7 +10641,7 @@ static void cond_notify_n(ZapCond *c, int64_t n) {
         if (!c->locked) {
             /* Lock free: hand it straight to this waiter. */
             c->locked = 1;
-            goready(x);
+            coready(x);
         } else {
             /* Lock held: queue the waiter for the lock's handoff chain. */
             q_push(&c->lq_head, &c->lq_tail, x);

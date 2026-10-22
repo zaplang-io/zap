@@ -4095,10 +4095,10 @@ mod tests {
     }
 
     #[test]
-    fn goroutines_type_check() {
-        // The full goroutines fixture type-checks: channel construction,
+    fn coroutines_type_check() {
+        // The full coroutines fixture type-checks: channel construction,
         // `spawn`, send/receive, and `close` (ticket #25, D-0013/D-0031).
-        ok(include_str!("../../../tests/golden/goroutines.zap"));
+        ok(include_str!("../../../tests/golden/coroutines.zap"));
     }
 
     #[test]
@@ -4202,8 +4202,8 @@ mod tests {
             \x20   gc.collect()\n\
             \x20   auto m = gc.stats()\n\
             \x20   print(m.heap_bytes)\n\
-            \x20   print(runtime.num_goroutines())\n\
-            \x20   runtime.goroutine_dump()\n");
+            \x20   print(runtime.num_coroutines())\n\
+            \x20   runtime.coroutine_dump()\n");
     }
 
     #[test]

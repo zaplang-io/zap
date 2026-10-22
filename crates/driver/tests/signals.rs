@@ -1,7 +1,7 @@
 //! Signal fault-handler integration test (ticket #77, D-0058).
 //!
 //! The fault crash handler (SIGSEGV/SIGFPE/SIGBUS/SIGILL) prints a diagnostic
-//! report — faulting signal/address, offending goroutine, backtrace — and then
+//! report — faulting signal/address, offending coroutine, backtrace — and then
 //! RE-RAISES the default disposition so the process dies with the correct
 //! signal status (and a core, if enabled). Because the process is killed by a
 //! signal rather than exiting with a code, this cannot use the stdout/exit-code

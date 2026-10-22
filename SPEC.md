@@ -607,7 +607,7 @@ grace=…)` turns `SIGTERM`/`SIGINT` into structured graceful shutdown. Fault
 signals (`SIGSEGV`/`SIGFPE`/…) print a crash diagnostic (location + backtrace).
 Default, opt-out, overridable handlers: `SIGQUIT` (stack+runtime dump), `SIGUSR1`
 (force GC + memory stats), `SIGUSR2` (profiling — deferred). The `gc`/`runtime`
-module (`gc.collect()`, `gc.stats()`, `runtime.goroutine_dump()`) exposes the same
+module (`gc.collect()`, `gc.stats()`, `runtime.coroutine_dump()`) exposes the same
 programmatically; `zap inspect <pid>` triggers them against a running process.
 
 ## Appendix A — Reserved words (provisional)

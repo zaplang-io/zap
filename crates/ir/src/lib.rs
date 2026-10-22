@@ -576,14 +576,14 @@ mod tests {
         assert!(text.contains("call @zap_reflect_names"), "text:\n{text}");
     }
 
-    // --- goroutines & channels (ticket #25, D-0013/D-0031) ---
+    // --- coroutines & channels (ticket #25, D-0013/D-0031) ---
 
     #[test]
-    fn lower_goroutines_fixture() {
+    fn lower_coroutines_fixture() {
         // The golden program exercises the whole core surface: channel
         // construction (unbuffered + buffered), `spawn` of a named function,
         // channel send/receive, and `close`.
-        let m = lower_ok(include_str!("../../../tests/golden/goroutines.zap"));
+        let m = lower_ok(include_str!("../../../tests/golden/coroutines.zap"));
         let text = format!("{m}");
         // `channel[int64]()` / `channel[int64](cap)` lower to the constructor.
         assert!(text.contains("call @zap_chan_new"), "text:\n{text}");

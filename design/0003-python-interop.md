@@ -61,10 +61,10 @@ held as opaque `pyobject` handles that keep a CPython reference.
 - Python objects referenced from Zap hold a CPython reference (`Py_INCREF`);
   Zap's GC (Boehm in v1) frees the handle wrapper, whose finalizer calls
   `Py_DECREF`.
-- The **GIL** is acquired around CPython calls. Interaction with Zap goroutines:
+- The **GIL** is acquired around CPython calls. Interaction with Zap coroutines:
   calls into Python serialize on the GIL; long Python calls should release it
   where the callee allows (document the caveat — Python-heavy workloads won't
-  parallelize across goroutines unless the Python side releases the GIL).
+  parallelize across coroutines unless the Python side releases the GIL).
 
 ### Exception translation
 
@@ -99,7 +99,7 @@ Roadmap **Phase 4**. Depends on collections (`list`, `dict`) and exceptions
 
 ## Open issues
 
-- GIL vs goroutine parallelism story — document limits; consider a
+- GIL vs coroutine parallelism story — document limits; consider a
   subinterpreter or process-pool escape hatch later.
 - Zero-copy `ndarray` ↔ `array[T]` requires matching dtype + contiguous layout;
   define the fallback (copy) precisely.
