@@ -152,6 +152,10 @@ static Worker g_w;
  * trampoline restores every volatile and the loop resumes. That is precisely the
  * control-flow/register-fidelity property we are checking. */
 static volatile LONG64 g_hijack_count = 0;
+/* The per-M in-flight flag (one worker here). zap_win_preempt_try sets it; the
+ * target clears it when the preemption is "taken" — the harness stand-in for
+ * copreempt clearing cur_m->in_hijack on yield. */
+static volatile LONG g_in_hijack = 0;
 /* extern "C": assigned to the C-linkage `zap_win_preempt_target` pointer.
  * Deliberately SCRIBBLE every caller-saved (volatile) register after recording
  * the hit: GPRs rax/rcx/rdx/r8-r11 and xmm0-xmm5. The interrupted loop's live
@@ -161,6 +165,7 @@ static volatile LONG64 g_hijack_count = 0;
  * into a real register-fidelity test, not just a control-flow test. */
 extern "C" void t2_target(void) {
     InterlockedIncrement64(&g_hijack_count);
+    InterlockedExchange(&g_in_hijack, 0); /* preemption taken: allow the next */
     __asm__ __volatile__(
         "movq $0x1111111111111111, %%rax\n\t"
         "movq $0x2222222222222222, %%rcx\n\t"
@@ -227,6 +232,7 @@ static LONG64 load64(volatile LONG64 *p) {
 static void test_preempt_hijack(void) {
     zap_win_preempt_target = t2_target;
     g_hijack_count = 0;
+    g_in_hijack = 0;
     HANDLE h = start_worker();
     if (!h)
         return;
@@ -235,7 +241,7 @@ static void test_preempt_hijack(void) {
         Sleep(1);
     int hijacked = 0;
     for (int i = 0; i < 200; i++) {
-        if (zap_win_preempt_try(h, g_w.lo, g_w.hi, &g_w.no_preempt))
+        if (zap_win_preempt_try(h, g_w.lo, g_w.hi, &g_w.no_preempt, &g_in_hijack))
             hijacked++;
         Sleep(1);
     }
@@ -281,6 +287,7 @@ static DWORD WINAPI t3_collector(LPVOID) {
 static void test_stw_suspend_race(void) {
     zap_win_preempt_target = t2_target;
     g_hijack_count = 0;
+    g_in_hijack = 0;
     InitializeCriticalSection(&g_stw_mu);
     HANDLE h = start_worker();
     if (!h)
@@ -310,7 +317,7 @@ static void test_stw_suspend_race(void) {
         }
         last_seen = c;
         EnterCriticalSection(&g_stw_mu);
-        if (zap_win_preempt_try(h, g_w.lo, g_w.hi, &g_w.no_preempt))
+        if (zap_win_preempt_try(h, g_w.lo, g_w.hi, &g_w.no_preempt, &g_in_hijack))
             hijacks++;
         LeaveCriticalSection(&g_stw_mu);
     }

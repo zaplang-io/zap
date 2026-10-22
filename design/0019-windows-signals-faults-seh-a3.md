@@ -221,6 +221,35 @@ target thread):
 5. If not safe, `ResumeThread` and let the monitor retry next interval (same
    deferral semantics as the Unix `no_preempt` path).
 
+**In-flight guard — re-injection must be impossible, not merely improbable.**
+The Unix SIGURG path has no re-injection race *for free*: a signal handler
+auto-masks its own signal (no `SA_NODEFER` in `zap_preempt_install`), and
+`copreempt` does not return until the coroutine is resumed — so SIGURG stays
+blocked across the **entire** in-flight window (handler → `copreempt` → parked →
+resumed → handler returns). Windows has no such automatic masking: nothing stops
+the monitor from `SuspendThread`-injecting a **second** trampoline while the
+first is still on the green stack (its prologue, or after `copreempt` cleared but
+before it switched). That nests frames and is a real, timing-dependent race (a
+slow/descheduled worker can still be mid-trampoline when the next tick fires —
+timer spacing alone does **not** prevent it), not merely a test artifact. So the
+hijack takes a **per-M `in_hijack` flag** and `InterlockedCompareExchange`-sets
+it before suspending; while a hijack is in flight the monitor refuses to inject
+another, so re-injection is impossible regardless of timing. `copreempt` (the
+trampoline target) clears the flag once the coroutine has yielded — exactly as a
+Unix handler *returning* unblocks SIGURG. This is implemented in the primitive
+(`zap_win_preempt_try`, `zap_win_a3.c`) and verified by the harness; the
+production monitor passes `&m->in_hijack` and `copreempt` clears
+`cur_m->in_hijack`.
+
+**Trampoline alignment.** The injected trampoline is entered with `rsp =
+interrupted_rsp - 8` (so its final `ret` restores `rsp` bit-for-bit). Since the
+interrupted `rsp` is only 8-aligned, the entry `rsp` is ≡ 0 **or** 8 (mod 16);
+the trampoline must tolerate both. It saves the frame base in a callee-saved
+register, `andq $-16` aligns the call site explicitly, then restores the exact
+base — a fixed pad would mis-align the `call` for one of the two cases and `#GP`
+in the callee's aligned SSE spills (the first on-runner failure, caught by the
+harness and fixed).
+
 This needs a Win32 thread **HANDLE** per M (`SuspendThread` takes a handle, not a
 `pthread_t`); store it in `M` next to `m->thread`, obtained via
 `pthread_gethandle`/`_beginthreadex` or `OpenThread(GetThreadId(...))` at M

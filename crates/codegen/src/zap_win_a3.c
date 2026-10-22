@@ -87,9 +87,14 @@ extern void zap_win_preempt_trampoline(void);
 __asm__(".text\n"
         ".globl zap_win_preempt_trampoline\n"
         "zap_win_preempt_trampoline:\n"
-        /* entry: [rsp] = orig_rip, rsp%16 == 8.  save volatile GPRs + flags
-         * (8 pushes => rsp%16 stays 8). We never touch a register before it is
-         * saved, so the interrupted state is wholly preserved. */
+        /* entry: [rsp] = orig_rip, and rsp == (interrupted_rsp - 8). The
+         * interrupted rsp was only 8-aligned, so entry rsp may be ≡ 0 OR ≡ 8
+         * (mod 16) — the trampoline must tolerate BOTH. We save the full volatile
+         * set, then establish a 16-aligned call site via a saved frame-base in a
+         * callee-saved register (rbx) rather than a fixed pad (a fixed pad would
+         * mis-align the call for one of the two entry alignments and #GP in the
+         * callee's aligned SSE spills). We never touch a register before saving
+         * it, so the interrupted state is wholly preserved. */
         "  pushfq\n"
         "  pushq %rax\n"
         "  pushq %rcx\n"
@@ -98,6 +103,7 @@ __asm__(".text\n"
         "  pushq %r9\n"
         "  pushq %r10\n"
         "  pushq %r11\n"
+        "  pushq %rbx\n" /* callee-saved scratch: holds the frame base across the call */
         /* save volatile xmm0-xmm5 (96 bytes) with movups (no alignment needed) */
         "  subq $96, %rsp\n"
         "  movups %xmm0, 0(%rsp)\n"
@@ -106,15 +112,15 @@ __asm__(".text\n"
         "  movups %xmm3, 48(%rsp)\n"
         "  movups %xmm4, 64(%rsp)\n"
         "  movups %xmm5, 80(%rsp)\n"
-        /* 16-align the call site + 32-byte shadow space. rsp%16==8 here; subq $40
-         * => rsp%16==0 at the `call` (so the callee sees rsp%16==8 per ABI). */
-        "  subq $40, %rsp\n"
+        "  movq %rsp, %rbx\n"  /* frame base (rbx's own value is saved above)      */
+        "  andq $-16, %rsp\n"  /* align DOWN for the call (any entry alignment)    */
+        "  subq $32, %rsp\n"   /* 32-byte shadow space; rsp stays 16-aligned       */
         "  movq zap_win_preempt_target(%rip), %rax\n" /* rax already saved        */
         "  testq %rax, %rax\n"
         "  jz 1f\n"
         "  callq *%rax\n" /* copreempt(): switches away; returns here on resume   */
         "1:\n"
-        "  addq $40, %rsp\n"
+        "  movq %rbx, %rsp\n" /* restore exact frame base (rbx survives the call)  */
         "  movups 0(%rsp),  %xmm0\n"
         "  movups 16(%rsp), %xmm1\n"
         "  movups 32(%rsp), %xmm2\n"
@@ -122,6 +128,7 @@ __asm__(".text\n"
         "  movups 64(%rsp), %xmm4\n"
         "  movups 80(%rsp), %xmm5\n"
         "  addq $96, %rsp\n"
+        "  popq %rbx\n"
         "  popq %r11\n"
         "  popq %r10\n"
         "  popq %r9\n"
@@ -135,19 +142,39 @@ __asm__(".text\n"
 /* Attempt to preempt the worker thread `hthread` (a HANDLE with
  * THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT access) that is
  * running a coroutine whose green stack is [lo, hi). Returns 1 if it hijacked the
- * thread to run `zap_win_preempt_target` at its next resume, 0 if it declined
- * (and left the thread running) because the thread was not on its green stack or
- * held a runtime lock / allocation (`*no_preempt != 0`).
+ * thread to run `zap_win_preempt_target` at its next resume, 0 if it declined.
  *
- * The caller (zaprt.c's monitor) MUST hold the preempt/STW serialization mutex so
- * this never races bdwgc's own stop-the-world SuspendThread (ticket #197 Q5).
+ * In-flight guard (ticket #197 Q5, matching the Unix SIGURG property). Unix has
+ * NO re-injection race because a signal handler auto-masks its own signal
+ * (no SA_NODEFER, zap_preempt_install), and `copreempt` does not return until the
+ * coroutine resumes — so SIGURG stays blocked across the WHOLE in-flight window
+ * (handler → copreempt → parked → resumed). Windows has no such automatic
+ * masking: nothing stops the monitor from SuspendThread-injecting a SECOND
+ * trampoline while the first is still on the green stack (prologue, or after
+ * copreempt cleared but before it switched), which would nest frames — a real,
+ * timing-dependent production race, NOT merely a test-cadence effect. So this
+ * primitive takes a per-M `in_hijack` flag and atomically check-and-sets it:
+ * while a hijack is in flight (flag set), re-injection is IMPOSSIBLE regardless
+ * of timing. `copreempt` (the trampoline target) clears the flag once the
+ * coroutine has yielded, exactly as the Unix handler returning unblocks SIGURG.
+ *
+ * The caller (zaprt.c's monitor) MUST ALSO hold the preempt/STW serialization
+ * mutex so this never races bdwgc's own stop-the-world SuspendThread (Q5).
  * `no_preempt` points at the live coroutine's `g->no_preempt`; it is re-read AFTER
  * the suspend so a coroutine that entered a critical section between the monitor's
  * pre-check and the suspend is not hijacked mid-lock. */
 int zap_win_preempt_try(void *hthread, uintptr_t lo, uintptr_t hi,
-                        volatile int *no_preempt) {
+                        volatile int *no_preempt, volatile LONG *in_hijack) {
     HANDLE th = (HANDLE)hthread;
+    /* Refuse if a preemption is already in flight on this M (not yet taken by
+     * copreempt). This is the explicit guard that makes re-injection impossible;
+     * set it BEFORE suspending and clear it back on any decline below. */
+    if (in_hijack && InterlockedCompareExchange(in_hijack, 1, 0) != 0) {
+        return 0;
+    }
     if (SuspendThread(th) == (DWORD)-1) {
+        if (in_hijack)
+            InterlockedExchange(in_hijack, 0);
         return 0;
     }
     CONTEXT ctx;
@@ -155,6 +182,8 @@ int zap_win_preempt_try(void *hthread, uintptr_t lo, uintptr_t hi,
     ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
     if (!GetThreadContext(th, &ctx)) { /* synchronizes the suspend */
         ResumeThread(th);
+        if (in_hijack)
+            InterlockedExchange(in_hijack, 0);
         return 0;
     }
     uintptr_t rsp = (uintptr_t)ctx.Rsp;
@@ -163,24 +192,28 @@ int zap_win_preempt_try(void *hthread, uintptr_t lo, uintptr_t hi,
      * plus the re-checked no_preempt (lock/alloc held). */
     if (rsp < lo || rsp >= hi || (no_preempt && *no_preempt != 0)) {
         ResumeThread(th);
+        if (in_hijack)
+            InterlockedExchange(in_hijack, 0);
         return 0;
     }
-    /* Push the interrupted RIP as the trampoline's return address and land the
-     * trampoline at RSP ≡ 8 (mod 16) (natural function-entry alignment), wasting
-     * 0-8 bytes just below the interrupted RSP (ours until resume; Win x64 has no
-     * red zone, but the suspended thread cannot touch this region). */
+    /* Push the interrupted RIP as the trampoline's return address at EXACTLY
+     * rsp-8, so the trampoline's final `ret` restores rsp to the interrupted
+     * value bit-for-bit. The entry alignment (rsp-8 is 8-aligned, so ≡ 0 or 8
+     * mod 16) is handled inside the trampoline; we must NOT round `sp` (that would
+     * leave the resumed frame's rsp wrong). Win x64 has no red zone, but the
+     * suspended thread cannot touch the bytes below its own rsp. */
     uintptr_t sp = rsp - 8;
-    sp &= ~(uintptr_t)15; /* 16-align */
-    sp += 8;              /* => sp % 16 == 8 */
     *(uintptr_t *)sp = (uintptr_t)ctx.Rip;
     ctx.Rsp = (DWORD64)sp;
     ctx.Rip = (DWORD64)(uintptr_t)&zap_win_preempt_trampoline;
     if (!SetThreadContext(th, &ctx)) {
         ResumeThread(th);
+        if (in_hijack)
+            InterlockedExchange(in_hijack, 0);
         return 0;
     }
     ResumeThread(th);
-    return 1;
+    return 1; /* in_hijack stays SET; copreempt (the target) clears it on yield */
 }
 
 /* ===========================================================================
