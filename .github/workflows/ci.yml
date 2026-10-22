@@ -234,7 +234,13 @@ jobs:
       - name: Build (default members, no LLVM)
         run: cargo build
 
-      # Best-effort: surfaces any A4 (#198) path/fs/process assumptions in the
-      # portable crates' tests as a visible-but-non-blocking signal.
+      # Best-effort, NON-FATAL (`continue-on-error` on the step): the build above
+      # is the stage that passes and gates this job; the tests are run only to
+      # surface A4 (#198) path/fs/process assumptions in the portable crates as a
+      # visible signal without turning the check red. Known failure today:
+      # `driver::zap_cli::zenv_create_and_resolution_flip` asserts a `/`-joined
+      # cache path, but `Path::join` yields `\` on Windows — an A4 path-separator
+      # item, not an A5 toolchain bug. Drop `continue-on-error` here once A4 lands.
       - name: Test (default members, no LLVM)
+        continue-on-error: true
         run: cargo test

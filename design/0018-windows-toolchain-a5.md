@@ -146,6 +146,14 @@ the link step for v1).
 
 ## Open issues
 
+- **First concrete A4 (#198) finding, surfaced by the Windows CI job.** The
+  portable crates *build* on Windows, but
+  `driver::zap_cli::zenv_create_and_resolution_flip` fails: it asserts the zenv
+  cache path renders as `/proj/zenv/pkg`, but `Path::join` yields `\` on Windows
+  (`/proj/zenv\pkg`). A path-separator assumption in the `pkg`/`driver` zenv
+  resolution + its test — an A4 item, not an A5 toolchain bug. The Windows job's
+  Test step is `continue-on-error` so this stays a visible-but-non-blocking
+  signal; #198 should fix the rendering (and the test) and then drop that flag.
 - **MinGW-w64 runtime-lib sourcing on CI.** The Windows CI job does not yet
   install the MSYS2 `mingw-w64-x86_64-*` runtime libraries, because `zaprt.c`
   does not compile on Windows yet (A1/A3), so there is nothing to link them
