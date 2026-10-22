@@ -1,7 +1,7 @@
 //! Monomorphization (I#154, D-0017 / D-0064): the ZIR-stage pass between sema
 //! and codegen that turns user-defined generics into ordinary concrete code.
 //!
-//! It runs on the AST at the very top of [`crate::lower::lower_module`] and
+//! It runs on the AST at the very top of `zapc_ir`'s `lower_module` and
 //! **erases generics**: for every used `(generic, concrete-type-args)`
 //! combination it emits a specialized `struct`/`enum` declaration with a mangled
 //! name and empty generic list, substitutes the type parameters, and rewrites
@@ -33,7 +33,14 @@ use zapc_syntax::ast::{
 };
 use zapc_syntax::span::Span;
 
-use crate::lower::LowerError;
+/// A lowering error: a human-readable message. Produced by monomorphization and
+/// by the main AST->ZIR lowering pass, which share this type (monomorphization
+/// is the first lowering stage). `zapc_ir` re-exports it as `zapc_ir::LowerError`
+/// and `zapc_ir::lower::LowerError`, so downstream code is unchanged (#129).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LowerError {
+    pub message: String,
+}
 
 /// Monomorphize a module: produce an equivalent AST with all user generics
 /// instantiated to concrete declarations and every generic reference rewritten.

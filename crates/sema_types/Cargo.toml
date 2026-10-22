@@ -1,0 +1,21 @@
+# Zap source-level type model (ticket #129): the `Ty` type, function/enum/
+# struct/interface `*Info` records, and the pure type operations
+# (`assignable`/`join`/`num_join`/`default_type` and the operator-dunder
+# tables). Split out of `zapc_sema` so the common case — editing the `Checker`
+# or a per-module type-check twin — no longer recompiles this stable model, and
+# it builds in parallel with the rest. A leaf over `zapc_syntax`; `zapc_sema`
+# re-exports `Ty`, so `zapc_sema::Ty` is unchanged for downstream code.
+[package]
+name = "zapc_sema_types"
+description = "Zap semantic analysis: the source-level type model (types + pure type operations)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_sema_types"
+path = "src/lib.rs"
+
+[dependencies]
+zapc_syntax = { path = "../syntax" }

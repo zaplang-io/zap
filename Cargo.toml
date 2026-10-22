@@ -6,7 +6,10 @@
 resolver = "2"
 members = [
     "crates/syntax",
+    "crates/sema_types",
     "crates/sema",
+    "crates/ir_core",
+    "crates/mono",
     "crates/ir",
     "crates/codegen",
     "crates/pkg",
@@ -18,7 +21,10 @@ members = [
 # or `-p zapc_codegen`.
 default-members = [
     "crates/syntax",
+    "crates/sema_types",
     "crates/sema",
+    "crates/ir_core",
+    "crates/mono",
     "crates/ir",
     "crates/pkg",
     "crates/driver",
