@@ -864,7 +864,12 @@ impl Parser {
             TokenKind::Keyword(Keyword::Decorator) => {
                 items.push(Item::Decorator(self.parse_decorator_def()))
             }
-            TokenKind::Keyword(Keyword::Import) => items.push(Item::Import(self.parse_import())),
+            TokenKind::Keyword(Keyword::Import) => {
+                // Multi-import and grouped forms (D-0052) desugar to one
+                // `Item::Import` per listed module, so each resolves exactly
+                // like a standalone `import`.
+                items.extend(self.parse_import().into_iter().map(Item::Import))
+            }
             _ => {
                 if !decos.is_empty() {
                     self.error_here("decorators must precede a declaration");
@@ -1248,9 +1253,22 @@ impl Parser {
         }
     }
 
-    fn parse_import(&mut self) -> Import {
+    /// Parse an `import` statement. Returns one [`Import`] per imported module
+    /// so the multi-import and grouped forms (D-0052) desugar to a flat list of
+    /// single imports. Forms (D-0028 / D-0052):
+    ///
+    /// ```text
+    /// import python "numpy" as np      # CPython interop (D-0012), single only
+    /// import a                         # single logical module
+    /// import a as b
+    /// import a, b.c, d as e            # comma list
+    /// import (a, b.c, d as e,)         # grouped; trailing comma allowed
+    /// ```
+    fn parse_import(&mut self) -> Vec<Import> {
         let start = self.peek_span().start;
         self.expect_kw(Keyword::Import, "'import'");
+        // CPython interop (D-0012) is a single-module form only; the list and
+        // grouped forms (D-0052) apply to logical-name modules.
         if self.eat_kw(Keyword::Python) {
             let module = self.string_lit();
             let alias = if self.eat_kw(Keyword::As) {
@@ -1259,24 +1277,47 @@ impl Parser {
                 None
             };
             self.expect(&TokenKind::Newline, "newline");
-            Import::Python {
+            return vec![Import::Python {
                 module,
                 alias,
                 span: self.span_from(start),
+            }];
+        }
+        // Logical-name module import(s). The grouped form `import (...)` allows
+        // newlines inside the parens (lexer implicit continuation) and a single
+        // trailing comma; the bare comma-list form does not.
+        let grouped = self.eat(&TokenKind::LParen);
+        let mut imports = Vec::new();
+        loop {
+            imports.push(self.parse_import_item());
+            if !self.eat(&TokenKind::Comma) {
+                break;
             }
+            // A trailing comma is permitted only in the grouped form.
+            if grouped && self.is(&TokenKind::RParen) {
+                break;
+            }
+        }
+        if grouped {
+            self.expect(&TokenKind::RParen, "')'");
+        }
+        self.expect(&TokenKind::Newline, "newline");
+        imports
+    }
+
+    /// Parse a single `import_item` — `dotted_name [ "as" IDENT ]` (D-0052).
+    fn parse_import_item(&mut self) -> Import {
+        let start = self.peek_span().start;
+        let path = self.dotted_name();
+        let alias = if self.eat_kw(Keyword::As) {
+            Some(self.ident("alias"))
         } else {
-            let path = self.dotted_name();
-            let alias = if self.eat_kw(Keyword::As) {
-                Some(self.ident("alias"))
-            } else {
-                None
-            };
-            self.expect(&TokenKind::Newline, "newline");
-            Import::Module {
-                path,
-                alias,
-                span: self.span_from(start),
-            }
+            None
+        };
+        Import::Module {
+            path,
+            alias,
+            span: self.span_from(start),
         }
     }
 
@@ -3148,6 +3189,89 @@ mod tests {
         assert!(e.variants[1].value.is_some());
         assert!(e.variants.iter().all(|v| v.fields.is_empty()));
         assert!(matches!(&m.items[1], Item::Import(Import::Python { .. })));
+    }
+
+    /// Collect every `(path, alias)` from the module's logical-name imports,
+    /// in source order.
+    fn module_imports(m: &Module) -> Vec<(String, Option<String>)> {
+        m.items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Import(Import::Module { path, alias, .. }) => {
+                    Some((path.clone(), alias.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn import_single_and_aliased_and_dotted() {
+        // The pre-existing single forms (D-0028) still parse to one import each.
+        let m = parse_ok("import a\nimport b as c\nimport p.q.r\n");
+        assert_eq!(
+            module_imports(&m),
+            vec![
+                ("a".into(), None),
+                ("b".into(), Some("c".into())),
+                ("p.q.r".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_comma_list_desugars_to_many() {
+        // `import a, b.c, d as e` (D-0052) desugars to one import per module.
+        let m = parse_ok("import a, b.c, d as e\n");
+        assert_eq!(
+            module_imports(&m),
+            vec![
+                ("a".into(), None),
+                ("b.c".into(), None),
+                ("d".into(), Some("e".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_grouped_single_line() {
+        // Grouped form on one line, with a per-item alias (D-0052).
+        let m = parse_ok("import (numpy as np, boto, a.b)\n");
+        assert_eq!(
+            module_imports(&m),
+            vec![
+                ("numpy".into(), Some("np".into())),
+                ("boto".into(), None),
+                ("a.b".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_grouped_multiline_trailing_comma() {
+        // Grouped, spanning lines (lexer implicit continuation), with a trailing
+        // comma — the only form where a trailing comma is allowed (D-0052).
+        let m = parse_ok("import (\n    math,\n    random as rng,\n    time,\n)\n");
+        assert_eq!(
+            module_imports(&m),
+            vec![
+                ("math".into(), None),
+                ("random".into(), Some("rng".into())),
+                ("time".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_bare_trailing_comma_is_an_error() {
+        // A trailing comma is rejected in the bare comma-list form (only the
+        // grouped form permits it), matching Python.
+        let (_m, perrs, lerrs) = parse_str("import a, b,\n");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(
+            !perrs.is_empty(),
+            "a bare trailing comma should be a parse error"
+        );
     }
 
     #[test]
