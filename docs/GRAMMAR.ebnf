@@ -114,8 +114,8 @@ decorator_def ::= "decorator" IDENT [ "(" [ param_list ] ")" ] block ;
 
 import        ::= "import" "python" STRING [ "as" IDENT ] NEWLINE   (* CPython interop, D-0012 *)
                 | "import" import_list NEWLINE ;                    (* D-0028, D-0052 *)
-import_list   ::= import_item { "," import_item }                  (* import a, b as c *)
-                | "(" import_item { "," import_item } [ "," ] ")" ; (* grouped; multi-form impl may be staged *)
+import_list   ::= import_item { "," import_item }                  (* import a, b as c (no trailing comma) *)
+                | "(" import_item { "," import_item } [ "," ] ")" ; (* grouped; trailing comma allowed (I#70) *)
 import_item   ::= dotted_name [ "as" IDENT ] ;
 
 (* ---------- Types ---------- *)
