@@ -12,3 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 zapc_syntax = { path = "../syntax" }
+# ZIR data model + monomorphization live in their own leaf crates (#129) so
+# edits to the churny `lower.rs` don't recompile them; re-exported from `lib.rs`.
+zapc_ir_core = { path = "../ir_core" }
+zapc_mono = { path = "../mono" }

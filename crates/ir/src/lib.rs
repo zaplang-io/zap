@@ -4,17 +4,24 @@
 //! backend (`zapc_codegen`) consumes [`Module`] and translates ZIR -> LLVM.
 //! See `design/IR.md`.
 
-pub mod ir;
+// The ZIR data model lives in the dependency-free `zapc_ir_core` leaf (#129);
+// re-export it as the `ir` module so `zapc_ir::ir::*` and the in-crate
+// `crate::ir::*` paths are unchanged.
+pub use zapc_ir_core as ir;
 pub mod lower;
-/// Monomorphization: turn user-defined generics into concrete declarations
-/// before lowering (I#154, D-0017/D-0064).
-pub mod mono;
+// Monomorphization (turn user generics into concrete declarations before
+// lowering, I#154, D-0017/D-0064) lives in the `zapc_mono` leaf (#129);
+// re-export it as the `mono` module so `crate::mono::monomorphize` is unchanged.
+pub use zapc_mono as mono;
 
-pub use ir::{
+pub use lower::lower_module;
+pub use zapc_ir_core::{
     AtomicOrd, AtomicRmwOp, BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem, Func, Inst,
     Module, Owner, Term, Ty, UnOp, Value,
 };
-pub use lower::{lower_module, LowerError};
+// `LowerError` moved to `zapc_mono` with monomorphization (#129); re-export it
+// here (and at `zapc_ir::lower::LowerError`, via `lower.rs`) unchanged.
+pub use zapc_mono::LowerError;
 
 #[cfg(test)]
 mod tests {

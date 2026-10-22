@@ -1,0 +1,21 @@
+# Monomorphization (ticket #129, I#154/D-0017/D-0064): the AST->AST pass that
+# erases user-defined generics before lowering. It is a pure `zapc_syntax::ast`
+# transform (AST in, AST out), so it is a leaf over `zapc_syntax`; splitting it
+# out of `zapc_ir` means the generics-wave churn here no longer recompiles the
+# 9k-line `lower.rs`, and vice versa. It also owns the shared `LowerError`
+# lowering diagnostic (monomorphization is the first lowering stage); `zapc_ir`
+# re-exports `LowerError`, so downstream code is unchanged.
+[package]
+name = "zapc_mono"
+description = "Monomorphization: erase Zap generics to concrete declarations before ZIR lowering."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_mono"
+path = "src/lib.rs"
+
+[dependencies]
+zapc_syntax = { path = "../syntax" }

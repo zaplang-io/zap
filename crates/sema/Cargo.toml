@@ -12,3 +12,6 @@ path = "src/lib.rs"
 
 [dependencies]
 zapc_syntax = { path = "../syntax" }
+# Source-level type model lives in its own leaf crate (#129) so edits to the
+# `Checker` don't recompile it; re-exported (`Ty`) from `lib.rs`.
+zapc_sema_types = { path = "../sema_types" }

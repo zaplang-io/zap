@@ -15,6 +15,10 @@ use zapc_syntax::ast::{
 };
 
 use crate::ir::*;
+// `LowerError` lives in `zapc_mono` with monomorphization (#129). Re-export it
+// at `crate::lower::LowerError` so the stdlib module lowerers (`modules/*.rs`,
+// `use crate::lower::LowerError`) and `zapc_ir::lower::LowerError` are unchanged.
+pub use crate::mono::LowerError;
 
 /// Built-in stdlib module registry (ticket #121): per-module lowering lives in
 /// `lower/modules/<name>.rs`, dispatched by a data table instead of a hand-
@@ -105,11 +109,6 @@ impl FnSigInterner {
     fn get(&self, idx: u32) -> &FnSig {
         &self.sigs[idx as usize]
     }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct LowerError {
-    pub message: String,
 }
 
 /// One data-carrying variant of a tier-3 enum (D-0046), resolved for lowering.

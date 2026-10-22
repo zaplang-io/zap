@@ -1,0 +1,17 @@
+# ZIR data model (ticket #129): the typed SSA intermediate representation's
+# data types — `Module`, `Func`, `Block`, `Inst`, `Term`, `Value`, `Ty`,
+# `Dtype`, `Elem`, layouts — with no passes over them. A dependency-free leaf
+# (std only) so edits to the churny `lower.rs`/`mono.rs` do not recompile it,
+# and it builds in parallel with the other mid crates. `zapc_ir` re-exports it,
+# so downstream crates keep importing these types from `zapc_ir`.
+[package]
+name = "zapc_ir_core"
+description = "ZIR data model: Zap's typed SSA intermediate representation (data types only)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_ir_core"
+path = "src/lib.rs"
