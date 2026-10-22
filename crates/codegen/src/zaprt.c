@@ -6029,7 +6029,16 @@ double zap_time_wall_seconds(void) {
  * v1 is a plain blocking nanosleep (EINTR-resuming): it blocks the current OS
  * thread, so under the M:N scheduler it parks that M rather than yielding
  * cooperatively. A scheduler-aware sleep (via the netpoller timer) is a
- * follow-up (#99). */
+ * follow-up (#99).
+ *
+ * Precise GC (#48/#188): the nanosleep is bracketed in zap_enter_blocking/
+ * zap_leave_blocking so a sleeping mutator is marked GC-safe (roots flushed to
+ * its shadow chain) and the collector need not wait on it to reach a safepoint.
+ * Without this, a coroutine asleep in nanosleep stays ACTIVE, so when several
+ * coroutines sit in tight time.sleep_ns loops a stop-the-world collection can
+ * never catch them all at a safepoint at once and STW stalls indefinitely
+ * (gc-immix hang, #188 bug 2). Same discipline as the netpoller (#80), the
+ * timed park (#175) and every other blocking primitive. */
 void zap_time_sleep_ns(int64_t ns) {
     if (ns <= 0) {
         return;
@@ -6038,9 +6047,11 @@ void zap_time_sleep_ns(int64_t ns) {
     req.tv_sec = (time_t)(ns / 1000000000LL);
     req.tv_nsec = (long)(ns % 1000000000LL);
     struct timespec rem;
+    zap_enter_blocking();
     while (nanosleep(&req, &rem) != 0 && errno == EINTR) {
         req = rem;
     }
+    zap_leave_blocking();
 }
 void zap_time_sleep_seconds(double s) {
     if (s <= 0.0) {

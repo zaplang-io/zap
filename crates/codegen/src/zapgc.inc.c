@@ -1030,6 +1030,24 @@ static void zap_mark_roots(void) {
         }
     }
     pthread_mutex_unlock(&g_all_mu);
+
+    /* Pooled (freed-but-retained) coroutines: a dead G is unlinked from g_all by
+     * gfree and parked on the g_free_head free list to recycle its 128 KiB green
+     * stack (galloc reuses it rather than remapping). That free list is held only
+     * by raw C pointers, so under precise GC it is NOT otherwise a root: without
+     * this, the first collection after a G is freed reclaims the G object and
+     * unmaps its green-stack buffer, and the next spawn that pops it from the free
+     * list faults in makecontext writing the (now unmapped) stack — the gc-immix
+     * SIGSEGV under sleep+mutex+mass-spawn in #188 (bug 1). gc-boehm never saw it
+     * because it conservatively scans the static g_free_head pointer. Pin each
+     * pooled G in place (which keeps its stack/arg/scope referents alive via
+     * zap_desc_gobj); a pooled G carries no live frame, so its (stale) shadow_head
+     * is deliberately NOT traced. */
+    pthread_mutex_lock(&g_free_mu);
+    for (G *g = g_free_head; g; g = g->link) {
+        zap_mark_push(g);
+    }
+    pthread_mutex_unlock(&g_free_mu);
 }
 
 /* ---- sweep ---------------------------------------------------------------- */
