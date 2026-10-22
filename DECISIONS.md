@@ -850,8 +850,8 @@ First-class Unix signal handling, built on the concurrency runtime.
   **user-overridable** — a user `notify`/`@on_signal` for that signal wins):
   `SIGQUIT` → dump goroutine stacks + scheduler/runtime summary; `SIGUSR1` →
   force GC + print memory stats (heap/live/free bytes, GC count, #goroutines) via
-  Boehm `GC_gcollect`/`GC_get_*`; `SIGUSR2` → toggle profiling — **decision
-  locked, implementation deferred**.
+  Boehm `GC_gcollect`/`GC_get_*`; `SIGUSR2` → toggle the CPU profiler
+  (**implemented**, ticket #78, `design/0014-profiling.md`).
 - **Programmatic access:** a `gc`/`runtime` stdlib module — `gc.collect()`,
   `gc.stats() -> MemStats`, `runtime.goroutine_dump()` — the signals are just the
   zero-code operator path to these.

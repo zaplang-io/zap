@@ -157,6 +157,14 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         // `GC_THREADS` and uses `GC_pthread_create`); the dev container's
         // `libgc-dev` is built with thread support.
         .arg("-lpthread");
+    // Export program symbols to the dynamic symbol table so the CPU profiler's
+    // offline symbolication (`backtrace_symbols`, ticket #78) resolves Zap
+    // function names in folded stacks. This enlarges `.dynsym` slightly but adds
+    // NO hot-path or codegen cost (unlike forcing frame pointers) and preserves
+    // the "zero-cost when profiling is unused" property — nothing runs until a
+    // SIGUSR2 / ZAP_PROFILE toggle. On the fault-handler backtrace (ticket #77)
+    // it is a bonus: crash reports now carry symbol names too.
+    cmd.arg("-rdynamic");
     // CPython embedding flags (ticket #27, D-0012): the `-I...` cflags let
     // `zaprt.c` find `<Python.h>`, and the libs link libpython. Discovered with
     // `pkg-config` (the dev container / CI provide `python3-dev` + `pkg-config`)

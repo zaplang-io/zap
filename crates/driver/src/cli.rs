@@ -54,11 +54,18 @@ pub enum Command {
     /// Serves over stdio. `root` is the codebase root for the code-graph and
     /// test surfaces (default: the current directory).
     Mcp { root: Option<String> },
-    /// `zap inspect <pid> [--gc]` — signal a running Zap process to dump its
-    /// runtime diagnostics (ticket #77, D-0058), so operators need not hand-run
-    /// `kill`. Default: SIGQUIT (goroutine stacks + runtime/scheduler summary).
-    /// `--gc`: SIGUSR1 (force a GC + print memory stats) instead.
-    Inspect { pid: String, gc: bool },
+    /// `zap inspect <pid> [--gc | --profile [--seconds N]]` — signal a running
+    /// Zap process to dump diagnostics (ticket #77/#78, D-0058), so operators
+    /// need not hand-run `kill`. Default: SIGQUIT (goroutine stacks +
+    /// runtime/scheduler summary). `--gc`: SIGUSR1 (force a GC + print memory
+    /// stats). `--profile`: SIGUSR2 to start CPU profiling, wait `--seconds N`
+    /// (default 10), then SIGUSR2 again to stop and flush the folded profile.
+    Inspect {
+        pid: String,
+        gc: bool,
+        profile: bool,
+        seconds: u64,
+    },
     /// `zap version`.
     Version,
     /// `zap help`.
@@ -219,15 +226,32 @@ fn parse_mcp(args: &[String]) -> Result<Command, String> {
     Ok(Command::Mcp { root })
 }
 
-/// Parse `zap inspect <pid> [--gc]` (ticket #77, D-0058). Exactly one positional
-/// (the pid); `--gc`/`-g` selects the SIGUSR1 (GC-stats) action over the default
-/// SIGQUIT (stack/runtime dump).
+/// Parse `zap inspect <pid> [--gc | --profile [--seconds N]]` (ticket #77/#78,
+/// D-0058). Exactly one positional (the pid); `--gc`/`-g` selects the SIGUSR1
+/// (GC-stats) action, `--profile` the SIGUSR2 (CPU-profile toggle) action, over
+/// the default SIGQUIT (stack/runtime dump). `--gc` and `--profile` are mutually
+/// exclusive. `--seconds`/`-s N` (profile only) sets the profiling window.
 fn parse_inspect(args: &[String]) -> Result<Command, String> {
     let mut pid: Option<String> = None;
     let mut gc = false;
-    for a in args {
+    let mut profile = false;
+    let mut seconds: u64 = 10;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--gc" | "-g" => gc = true,
+            "--profile" | "-p" => profile = true,
+            "--seconds" | "-s" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| "`--seconds` needs a value (e.g. `--seconds 10`)".to_string())?;
+                seconds = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("`--seconds` expects a positive integer, got `{v}`"))?;
+                if seconds == 0 {
+                    return Err("`--seconds` must be at least 1".to_string());
+                }
+            }
             flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
             other => {
                 if pid.is_some() {
@@ -237,9 +261,20 @@ fn parse_inspect(args: &[String]) -> Result<Command, String> {
             }
         }
     }
+    if gc && profile {
+        return Err("`--gc` and `--profile` are mutually exclusive".to_string());
+    }
     match pid {
-        Some(pid) => Ok(Command::Inspect { pid, gc }),
-        None => Err("`zap inspect` needs a process id: `zap inspect <pid> [--gc]`".to_string()),
+        Some(pid) => Ok(Command::Inspect {
+            pid,
+            gc,
+            profile,
+            seconds,
+        }),
+        None => Err(
+            "`zap inspect` needs a process id: `zap inspect <pid> [--gc | --profile [--seconds N]]`"
+                .to_string(),
+        ),
     }
 }
 
@@ -369,7 +404,12 @@ pub fn execute(cmd: Command) -> ExitCode {
         Command::Zenv(sub) => cmd_zenv(sub),
         Command::Test { file, json, watch } => cmd_test(file, json, watch),
         Command::Mcp { root } => crate::mcp::serve(root),
-        Command::Inspect { pid, gc } => cmd_inspect(&pid, gc),
+        Command::Inspect {
+            pid,
+            gc,
+            profile,
+            seconds,
+        } => cmd_inspect(&pid, gc, profile, seconds),
         Command::Version => {
             println!("zap {}", crate::VERSION);
             ExitCode::SUCCESS
@@ -555,13 +595,26 @@ fn cmd_remove(name: &str) -> ExitCode {
     }
 }
 
-/// `zap inspect <pid> [--gc]` — signal a running Zap process to print its
-/// runtime diagnostics (ticket #77, D-0058). Sends SIGQUIT (goroutine stacks +
-/// runtime/scheduler summary) by default, or SIGUSR1 (force GC + memory stats)
-/// with `--gc`. The diagnostics appear on the TARGET process's stderr; this just
-/// delivers the signal (so operators need not hand-run `kill`). Dependency-free:
-/// shells out to the standard `kill` utility on the Unix target.
-fn cmd_inspect(pid: &str, gc: bool) -> ExitCode {
+/// Shell out to the standard `kill` utility to deliver `signame` to `pid`.
+/// Dependency-free (no libc crate). Returns true iff the signal was delivered.
+fn send_signal(pid: &str, signame: &str) -> Result<bool, std::io::Error> {
+    Ok(std::process::Command::new("kill")
+        .arg("-s")
+        .arg(signame)
+        .arg(pid)
+        .status()?
+        .success())
+}
+
+/// `zap inspect <pid> [--gc | --profile [--seconds N]]` — signal a running Zap
+/// process to print its runtime diagnostics (ticket #77/#78, D-0058). Sends
+/// SIGQUIT (goroutine stacks + runtime/scheduler summary) by default, SIGUSR1
+/// (force GC + memory stats) with `--gc`, or — with `--profile` — SIGUSR2 to
+/// start CPU profiling, waits `seconds`, then SIGUSR2 again to stop and flush
+/// the folded profile. The diagnostics/profile appear on the TARGET process's
+/// stderr / its `ZAP_PROFILE_OUT` file; this just delivers the signal (so
+/// operators need not hand-run `kill`). Dependency-free: shells out to `kill`.
+fn cmd_inspect(pid: &str, gc: bool, profile: bool, seconds: u64) -> ExitCode {
     // Validate the pid is a positive integer so we never pass a process-group
     // (negative) or garbage target to `kill`.
     match pid.parse::<u32>() {
@@ -571,29 +624,62 @@ fn cmd_inspect(pid: &str, gc: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let signame = if gc { "USR1" } else { "QUIT" };
-    let what = if gc {
-        "GC + memory stats"
+    if profile {
+        // SIGUSR2 toggles the profiler: start, wait the window, stop + flush.
+        match send_signal(pid, "USR2") {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "zap inspect: could not signal {pid} (no such process, or not permitted)"
+                );
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("zap inspect: failed to run `kill`: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        eprintln!("zap inspect: started CPU profiling on {pid} for {seconds}s (SIGUSR2)");
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+        match send_signal(pid, "USR2") {
+            Ok(true) => {
+                eprintln!(
+                    "zap inspect: stopped CPU profiling on {pid}; folded profile written \
+                     (see its stderr for the output path)"
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                eprintln!("zap inspect: could not stop profiling on {pid} (process gone?)");
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("zap inspect: failed to run `kill`: {e}");
+                ExitCode::from(1)
+            }
+        }
     } else {
-        "goroutine stacks + runtime dump"
-    };
-    match std::process::Command::new("kill")
-        .arg("-s")
-        .arg(signame)
-        .arg(pid)
-        .status()
-    {
-        Ok(status) if status.success() => {
-            eprintln!("zap inspect: sent SIG{signame} to {pid} ({what}); see its stderr");
-            ExitCode::SUCCESS
-        }
-        Ok(_) => {
-            eprintln!("zap inspect: could not signal {pid} (no such process, or not permitted)");
-            ExitCode::from(1)
-        }
-        Err(e) => {
-            eprintln!("zap inspect: failed to run `kill`: {e}");
-            ExitCode::from(1)
+        let signame = if gc { "USR1" } else { "QUIT" };
+        let what = if gc {
+            "GC + memory stats"
+        } else {
+            "goroutine stacks + runtime dump"
+        };
+        match send_signal(pid, signame) {
+            Ok(true) => {
+                eprintln!("zap inspect: sent SIG{signame} to {pid} ({what}); see its stderr");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                eprintln!(
+                    "zap inspect: could not signal {pid} (no such process, or not permitted)"
+                );
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                eprintln!("zap inspect: failed to run `kill`: {e}");
+                ExitCode::from(1)
+            }
         }
     }
 }
@@ -716,6 +802,8 @@ diagnostics:
   inspect <pid>         signal a running Zap process to dump goroutine stacks +
                         a runtime/scheduler summary to its stderr (D-0058)
           --gc          force a GC and print memory stats instead (SIGUSR1)
+          --profile     CPU-profile it (SIGUSR2 start/stop), writing a folded
+                        profile; --seconds N sets the window (default 10)
   version               print the toolchain version
   help                  show this help
 
@@ -890,23 +978,66 @@ mod tests {
             p(&["inspect", "1234"]).unwrap(),
             Command::Inspect {
                 pid: "1234".into(),
-                gc: false
+                gc: false,
+                profile: false,
+                seconds: 10
             }
         );
         assert_eq!(
             p(&["inspect", "1234", "--gc"]).unwrap(),
             Command::Inspect {
                 pid: "1234".into(),
-                gc: true
+                gc: true,
+                profile: false,
+                seconds: 10
             }
         );
         assert_eq!(
             p(&["inspect", "-g", "1234"]).unwrap(),
             Command::Inspect {
                 pid: "1234".into(),
-                gc: true
+                gc: true,
+                profile: false,
+                seconds: 10
             }
         );
+    }
+
+    #[test]
+    fn inspect_parses_profile_flags() {
+        assert_eq!(
+            p(&["inspect", "1234", "--profile"]).unwrap(),
+            Command::Inspect {
+                pid: "1234".into(),
+                gc: false,
+                profile: true,
+                seconds: 10
+            }
+        );
+        assert_eq!(
+            p(&["inspect", "--profile", "--seconds", "5", "1234"]).unwrap(),
+            Command::Inspect {
+                pid: "1234".into(),
+                gc: false,
+                profile: true,
+                seconds: 5
+            }
+        );
+        assert_eq!(
+            p(&["inspect", "-p", "-s", "30", "1234"]).unwrap(),
+            Command::Inspect {
+                pid: "1234".into(),
+                gc: false,
+                profile: true,
+                seconds: 30
+            }
+        );
+        // --gc and --profile are mutually exclusive.
+        assert!(p(&["inspect", "1234", "--gc", "--profile"]).is_err());
+        // --seconds needs a positive integer value.
+        assert!(p(&["inspect", "1234", "--profile", "--seconds"]).is_err());
+        assert!(p(&["inspect", "1234", "--profile", "--seconds", "0"]).is_err());
+        assert!(p(&["inspect", "1234", "--profile", "--seconds", "x"]).is_err());
     }
 
     #[test]

@@ -15,4 +15,8 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_runtime_maxprocs", &[], Some(i.into()));
     cg.declare_rt("zap_runtime_lock_os_thread", &[], None);
     cg.declare_rt("zap_runtime_unlock_os_thread", &[], None);
+    // CPU profiler controls (ticket #78, D-0058): start/stop sampling; folded
+    // output is written at stop. The SIGUSR2 signal toggles the same machinery.
+    cg.declare_rt("zap_profile_start", &[], None);
+    cg.declare_rt("zap_profile_stop", &[], None);
 }
