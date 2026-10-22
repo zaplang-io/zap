@@ -243,23 +243,74 @@ jobs:
           gcc -O2 -Wall -DZAP_CTX_TEST_BOEHM zap_ctx_win_x64_test.c -lgc -o ctxtest_gc.exe
           ./ctxtest_gc.exe
 
+  # Windows signals / preemption / faults (ticket #197, platform epic #158 /
+  # Area A3). REQUIRED (no `continue-on-error`), same rationale as
+  # `windows-ctxswitch`: a full Zap *program* cannot link on Windows until A2
+  # (#196) and A4 (#198) also compile (zaprt.c is one translation unit), but the
+  # A3 MECHANISMS are complete and verifiable TODAY in isolation. This job builds
+  # and runs the standalone harness (`zap_win_a3_test.cc`, which pulls in the
+  # shipping backends `zap_win_a3.c` + the A1 `zap_ctx_win_x64.c`) on a native
+  # windows-latest runner and asserts, under MinGW-w64 (the gc-boehm Windows v1
+  # toolchain):
+  #   T1. a C++ (SEH) exception is thrown and caught across frames living on a
+  #       hand-switched green stack — the critical A1xA3 interaction (SEH consults
+  #       the TIB stack bounds the A1 switch installs). g++ lowers try/throw/catch
+  #       to exactly the __gxx_personality_seh0 + __cxa_* SEH model Zap codegen now
+  #       targets.
+  #   T2. the boehm preemption HIJACK (SuspendThread + Get/SetThreadContext) is
+  #       control-flow- and register-faithful across many injections.
+  #   T3. the bdwgc-STW x monitor SuspendThread race (ticket #197 Q5) is closed by
+  #       mutex serialization under heavy stress (no deadlock, no corruption).
+  #   T4. the last-chance fault filter reports type/address/coroutine + a dbghelp
+  #       backtrace and lets the process die (run in a child, like I#77).
+  #   T5. console control events map to the Signal enum's reachable subset.
+  # The precise gc-immix collector is not exercised here (its heap needs the
+  # mmap->VirtualAlloc port); its flag-at-safepoint preempt path is collector-
+  # agnostic and proven behavior-neutral by the gc-immix goldens on Linux/ARM.
+  windows-a3:
+    name: "Windows signals / preemption / faults (I#197 / A3)"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # MinGW-w64 g++ (C++ for the SEH exception proxy) + the thread-aware Boehm
+      # GC is not needed here (the harness uses plain malloc'd green stacks — the
+      # GC-ownership invariant is A1's job, covered by windows-ctxswitch); dbghelp
+      # ships with MinGW-w64.
+      - name: Set up MSYS2 / MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+
+      - name: A3 primitives — SEH/green-stack, hijack, Q5 stress, fault, signals
+        shell: msys2 {0}
+        run: |
+          set -eux
+          cd crates/codegen/src
+          g++ -O2 -Wall zap_win_a3_test.cc -ldbghelp -o a3test.exe
+          ./a3test.exe
+
   # Windows bring-up (ticket #199, platform epic #158 / Area A5). NON-BLOCKING by
   # design (`continue-on-error: true`): the Windows runtime port is incomplete —
-  # the A1 coroutine context switch (#195) now lands (see the required
-  # `windows-ctxswitch` job above), but the C runtime (`crates/codegen/src/
-  # zaprt.c`) still needs the A3 signals/preemption + Itanium->SEH unwinder
-  # (#197) and A2/A4 before a Zap *program* can link and run on Windows (the
-  # runtime's platform gate fails that compile with the exact gap map). This job
-  # therefore
+  # the A1 coroutine context switch (#195) and the A3 signals/preemption/faults +
+  # SEH exception mechanisms (#197) now land (see the required `windows-ctxswitch`
+  # and `windows-a3` jobs above), but the C runtime (`crates/codegen/src/
+  # zaprt.c`) is a single translation unit and still needs A2 (#196 netpoller) and
+  # A4 (#198 fs/process/random) to compile before a Zap *program* can link and run
+  # on Windows (the runtime's platform gate fails that compile with the exact gap
+  # map). This job therefore
   # validates the stage that DOES pass today — the portable compiler front-end
   # crates (default members, no LLVM) build and test on a native Windows host —
   # and records the MinGW-w64 link toolchain A5 targets. It reports progress
   # WITHOUT blocking merges; the Linux `host`/`full` and `arm64` jobs stay
   # required and unchanged. Promote this to a required full-codegen+link job once
-  # A1/A3 land. (Clippy/fmt stay on x86 — `host`/`full` already gate them and
+  # A2/A4 land. (Clippy/fmt stay on x86 — `host`/`full` already gate them and
   # they are target-independent, matching the `arm64` job.)
   windows:
-    name: "Windows (in progress, A1/A3 pending)"
+    name: "Windows (in progress, A2/A4 pending)"
     runs-on: windows-latest
     continue-on-error: true
     steps:

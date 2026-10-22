@@ -112,6 +112,15 @@ const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
 /// `ucontext` inline in `zaprt.c`, so this is added to the link on Windows only.
 const RUNTIME_CTX_WIN_C: &str = include_str!("zap_ctx_win_x64.c");
 
+/// The Windows x86_64 A3 runtime primitives (ticket #197): the preemption thread
+/// hijack + trampoline, the last-chance fault diagnostic filter (+ dbghelp
+/// backtrace), and the console-control signal mapping. A separate translation
+/// unit — like the A1 context switch — so it links into the Windows program build
+/// AND compiles standalone in the on-Windows verification harness
+/// (`zap_win_a3_test.cc`). POSIX uses `sigaction`/`sigaltstack` inline in
+/// `zaprt.c`, so this is added to the link on Windows only.
+const RUNTIME_WIN_A3_C: &str = include_str!("zap_win_a3.c");
+
 pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), String> {
     let obj_path = out_path.with_extension("o");
     LlvmBackend.compile_object(module, &obj_path)?;
@@ -197,6 +206,15 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         std::fs::write(&ctx_path, RUNTIME_CTX_WIN_C)
             .map_err(|e| format!("failed to write ctx runtime: {e}"))?;
         cmd.arg(&ctx_path);
+        // A3 signals/preemption/faults primitives (ticket #197): hijack-based
+        // preemption, the fault diagnostic filter, and console signal mapping.
+        // Like the A1 ctx file it is a drop-in TU, dead in the link until
+        // `zaprt.c` itself compiles on Windows (still gated on A2/#196 + A4/#198);
+        // wiring it now keeps the Windows arm a single drop-in.
+        let a3_path = build_dir.join("zap_win_a3.c");
+        std::fs::write(&a3_path, RUNTIME_WIN_A3_C)
+            .map_err(|e| format!("failed to write a3 runtime: {e}"))?;
+        cmd.arg(&a3_path);
         // Windows (MinGW-w64 / `x86_64-pc-windows-gnu`) extras, ticket #199:
         //   * No `-rdynamic`: it is an ELF/dynamic-symbol-table flag; PE/COFF has
         //     no equivalent and the profiler/fault symbolication path it serves
