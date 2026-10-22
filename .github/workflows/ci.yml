@@ -122,3 +122,57 @@ jobs:
 
       - name: "Test (fallback: Boehm GC)"
         run: cargo test --workspace --features zapc/gc-boehm
+
+  # ARM-Linux (aarch64) validation (ticket #204, platform epic #158 / C2). The
+  # same codegen + golden end-to-end suite as `full`, run natively on a GitHub-
+  # hosted arm64 runner (no emulation: the runtime's ucontext coroutine switch,
+  # SIGURG preemption and epoll netpoller must be exercised on real aarch64
+  # hardware, and QEMU-user cannot faithfully emulate swapcontext-from-signal-
+  # handler). Both collectors, mirroring `full`. Clippy/fmt stay on x86 (`host`
+  # and `full` already gate them; they are target-independent).
+  arm64:
+    name: arm64 (aarch64 Linux + codegen)
+    runs-on: ubuntu-24.04-arm
+    env:
+      LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 18 and system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-18 \
+            llvm-18-dev \
+            libpolly-18-dev \
+            clang-18 \
+            libclang-18-dev \
+            libgc-dev \
+            libpcre2-dev \
+            python3-dev \
+            pkg-config \
+            zlib1g-dev \
+            libzstd-dev \
+            libffi-dev \
+            libedit-dev \
+            libxml2-dev \
+            libncurses-dev \
+            mold
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arm64
+
+      - name: "Test (default: precise Immix GC)"
+        run: cargo test --workspace --features zapc/gc-immix
+
+      - name: "Test (fallback: Boehm GC)"
+        run: cargo test --workspace --features zapc/gc-boehm
