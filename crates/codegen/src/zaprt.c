@@ -32,13 +32,12 @@
 #error "Zap: the C runtime (zaprt.c) does not yet compile/link for Windows.\n\
 The A5 build/link toolchain (I#199) is wired (target-aware link flags in\n\
 crates/codegen/src/lib.rs, MinGW-w64 libs, a non-blocking windows CI job), and\n\
-the A1 coroutine context-switch SEAM (zap_ctx_swap/zap_ctx_make) is in place\n\
-below with a Windows placeholder — but these POSIX subsystems still need a\n\
-Windows backend before a Zap program can link and run on Windows:\n\
-  * A1 (I#195): coroutine context switch. Replace the ucontext impl behind the\n\
-    zap_ctx_swap/zap_ctx_make seam with the hand-written x86_64 asm backend\n\
-    from design/0017-windows-coroutine-context-switch.md (the Windows arm of\n\
-    the seam below is the drop-in point).\n\
+the A1 coroutine context switch (I#195) is now IMPLEMENTED — the Windows arm of\n\
+the zap_ctx_swap/zap_ctx_make seam below is defined in zap_ctx_win_x64.c (linked\n\
+by build_executable's Windows arm) and verified on windows-latest by\n\
+zap_ctx_win_x64_test.c (context switch + conservative-GC parked-coroutine root\n\
+survival). These POSIX subsystems still need a Windows backend before a Zap\n\
+program can link and run on Windows:\n\
   * A3 (I#197): signals / preemption / faults. No sigaction/SIGURG/sigaltstack/\n\
     pthread_sigmask/self-pipe/backtrace_symbols on Windows — needs\n\
     SuspendThread/GetThreadContext/QueueUserAPC preemption, a vectored/SEH\n\
@@ -1908,13 +1907,16 @@ void *zap_py_str(void *obj_) {
  * deliverable that unblocks Windows; swapping POSIX to asm for the per-switch
  * sigprocmask win is an optional follow-up, I#195 step 5).
  *
- * Windows (x86_64): NOT YET IMPLEMENTED (I#195 / A1). A `zap_ctx_t` becomes a
- * single saved stack pointer and zap_ctx_swap/zap_ctx_make are the hand-written
- * asm context switch prototyped in design/0017-win-ctxswitch-spike/ (saves the
- * Windows nonvolatile GPRs + XMM6-15 and swaps the TIB StackBase/StackLimit/
- * DeallocationStack). The Windows platform gate at the top of this file halts
- * the compile before here; the declarations below mark the exact drop-in seam
- * so A1 lands as an added asm translation unit without touching the scheduler. */
+ * Windows (x86_64): IMPLEMENTED (I#195 / A1) as a separate asm translation unit
+ * `zap_ctx_win_x64.c` (linked by build_executable's Windows arm). A `zap_ctx_t`
+ * is a single saved stack pointer; zap_ctx_swap/zap_ctx_make are the hand-written
+ * asm context switch from design/0017-windows-coroutine-context-switch.md — they
+ * save the Windows nonvolatile GPRs (incl. RDI/RSI) + XMM6-15 and swap the TIB
+ * StackBase/StackLimit/DeallocationStack on every switch. The Windows platform
+ * gate at the top of this file still halts the compile before here (A3/A2/A4 are
+ * unported), so the declarations below are the forward decls the scheduler calls;
+ * the implementation lives in zap_ctx_win_x64.c and is exercised today, ahead of
+ * a full Windows runtime, by the standalone harness zap_ctx_win_x64_test.c. */
 #if defined(ZAP_PLATFORM_POSIX)
 typedef ucontext_t zap_ctx_t;
 static void zap_ctx_make(zap_ctx_t *c, void *stack, size_t stack_size,

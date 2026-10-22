@@ -183,12 +183,74 @@ jobs:
       - name: "Test (fallback: Boehm GC)"
         run: cargo test --workspace --features zapc/gc-boehm
 
+  # Windows coroutine context switch (ticket #195, platform epic #158 / Area A1).
+  # REQUIRED (no `continue-on-error`): unlike the broader `windows` job below —
+  # which stays non-blocking because a full Zap *program* cannot link on Windows
+  # until A3 (#197, exceptions/SEH) and A2/A4 land — the A1 context switch itself
+  # is complete and verifiable TODAY, in isolation from the unported subsystems.
+  # This job builds and runs the standalone verification harness
+  # (`crates/codegen/src/zap_ctx_win_x64_test.c`, which pulls in the shipping asm
+  # backend `zap_ctx_win_x64.c`) on a native windows-latest runner and asserts:
+  #   1. a coroutine switches in/out faithfully across many round-trips,
+  #      preserving the full Windows x64 nonvolatile set — callee-saved GPRs AND
+  #      XMM6-XMM15 (the Windows delta over System V) — and its own stack; and
+  #   2. under the conservative `gc-boehm` collector, a *suspended* coroutine's
+  #      heap root (reachable only via a pointer on its green stack and in a
+  #      spilled callee-saved register) survives collections that run while it is
+  #      parked — the load-bearing GC invariant native Fibers would have broken
+  #      (design/0017). This is the on-Windows GC check the spike could not run.
+  # The precise `gc-immix` collector cannot be exercised standalone (its roots
+  # come from compiler-emitted shadow-stack code and its heap uses mmap, not yet
+  # ported to VirtualAlloc); immix's parked-coroutine invariant is proven
+  # behavior-neutral through this same seam by the gc-immix goldens on the
+  # required Linux/ARM jobs (gc_parked_coroutine, immix_evac_coro_stress, ...).
+  windows-ctxswitch:
+    name: "Windows coroutine context switch (I#195 / A1)"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSYS2 / MinGW-w64 is the A5-chosen Windows toolchain (design/0017,0018).
+      # Pull in gcc and the thread-aware Boehm GC (`mingw-w64-x86_64-gc`) so the
+      # gc-boehm invariant test links `-lgc`. Pinned, no full-system update, to
+      # keep the job fast and deterministic.
+      - name: Set up MSYS2 / MinGW-w64 + Boehm GC
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gc
+
+      # (1) Context switch + full nonvolatile (GPR + XMM6-15) + stack preservation.
+      # No external deps; pure MinGW gcc. REQUIRED.
+      - name: Context switch — control flow + nonvolatile preservation
+        shell: msys2 {0}
+        run: |
+          set -eux
+          cd crates/codegen/src
+          gcc -O2 -Wall zap_ctx_win_x64_test.c -o ctxtest.exe
+          ./ctxtest.exe
+
+      # (2) THE critical A1 GC verification: parked-coroutine heap root survives
+      # collection under the conservative Boehm collector. REQUIRED.
+      - name: Context switch — gc-boehm parked-coroutine root survival
+        shell: msys2 {0}
+        run: |
+          set -eux
+          cd crates/codegen/src
+          gcc -O2 -Wall -DZAP_CTX_TEST_BOEHM zap_ctx_win_x64_test.c -lgc -o ctxtest_gc.exe
+          ./ctxtest_gc.exe
+
   # Windows bring-up (ticket #199, platform epic #158 / Area A5). NON-BLOCKING by
   # design (`continue-on-error: true`): the Windows runtime port is incomplete —
-  # the C runtime (`crates/codegen/src/zaprt.c`) still needs the A1 coroutine
-  # context switch (#195) and the A3 signals/preemption + Itanium->SEH unwinder
-  # (#197) before a Zap *program* can link and run on Windows (the runtime's
-  # platform gate fails that compile with the exact gap map). This job therefore
+  # the A1 coroutine context switch (#195) now lands (see the required
+  # `windows-ctxswitch` job above), but the C runtime (`crates/codegen/src/
+  # zaprt.c`) still needs the A3 signals/preemption + Itanium->SEH unwinder
+  # (#197) and A2/A4 before a Zap *program* can link and run on Windows (the
+  # runtime's platform gate fails that compile with the exact gap map). This job
+  # therefore
   # validates the stage that DOES pass today — the portable compiler front-end
   # crates (default members, no LLVM) build and test on a native Windows host —
   # and records the MinGW-w64 link toolchain A5 targets. It reports progress

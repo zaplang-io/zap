@@ -105,6 +105,12 @@ const RUNTIME_C: &str = include_str!("zaprt.c");
 /// The precise Immix collector, `#include`d by `zaprt.c` under `ZAP_GC_IMMIX`
 /// (ticket #48). Written next to the runtime so the relative include resolves.
 const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
+/// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
+/// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
+/// unit so it links into the Windows program build AND compiles standalone in
+/// the on-Windows verification harness (`zap_ctx_win_x64_test.c`). POSIX uses
+/// `ucontext` inline in `zaprt.c`, so this is added to the link on Windows only.
+const RUNTIME_CTX_WIN_C: &str = include_str!("zap_ctx_win_x64.c");
 
 pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), String> {
     let obj_path = out_path.with_extension("o");
@@ -180,6 +186,17 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         // `winpthreads` provides `-lpthread` with the same API.
         .arg("-lpthread");
     if is_windows {
+        // A1 coroutine context switch (ticket #195): the hand-written x86_64 asm
+        // backend for the zap_ctx_swap/zap_ctx_make seam. POSIX uses `ucontext`
+        // inline in zaprt.c; Windows has no ucontext, so this translation unit
+        // provides the implementation and is compiled + linked in only here. It
+        // is a no-op in the link until zaprt.c itself compiles on Windows (A3/A2/
+        // A4), but wiring it now keeps the Windows arm a single drop-in and lets
+        // the standalone harness (zap_ctx_win_x64_test.c) exercise the same file.
+        let ctx_path = build_dir.join("zap_ctx_win_x64.c");
+        std::fs::write(&ctx_path, RUNTIME_CTX_WIN_C)
+            .map_err(|e| format!("failed to write ctx runtime: {e}"))?;
+        cmd.arg(&ctx_path);
         // Windows (MinGW-w64 / `x86_64-pc-windows-gnu`) extras, ticket #199:
         //   * No `-rdynamic`: it is an ELF/dynamic-symbol-table flag; PE/COFF has
         //     no equivalent and the profiler/fault symbolication path it serves
