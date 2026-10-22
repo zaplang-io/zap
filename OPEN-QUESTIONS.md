@@ -4,7 +4,7 @@ Tracked, unresolved language decisions — the backlog we work down in priority
 order (in the spirit of Go's proposal queue). When one is settled it moves to
 `DECISIONS.md` and is removed here. Tags: 🔴 blocking · 🟡 soon · ⚪ later.
 
-_Last updated: 2026-10-19_
+_Last updated: 2026-10-22_
 
 ---
 
@@ -72,7 +72,14 @@ _Last updated: 2026-10-19_
   issue #59): `@test` annotation suite, power-assert `assert`, inline + `tests/`
   discovery with build-identical import resolution, `zap test --watch/--json`,
   Google-style docstrings. (`zap mcp` agent interface expanded in D-0055.)
-- ⚪ **Compatibility / versioning promise** (Go-style "Go 1 compatibility"?).
+- ✅ **Compatibility / versioning promise** (Go-style "Go 1 compatibility"?) —
+  RESOLVED (D-0070, issue #205): single SemVer 2.0.0 toolchain version with
+  per-surface bump rules (max over surfaces); 0.x makes no promise; a Go-1-style
+  1.0 promise over the **Stable** tier (Stable/Experimental/Internal tiering,
+  graduation at MINOR); deprecate-at-MINOR / remove-at-next-MAJOR; **editions
+  rejected** in favor of a `zap.toml` language pin; no public runtime ABI
+  (whole-program AOT). Full policy in `docs/STABILITY.md`. The authoritative 1.0
+  Stable-surface list is produced by the spec-freeze audit (#206).
 
 ## Features deferred with a direction
 

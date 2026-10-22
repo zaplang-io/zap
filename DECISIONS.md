@@ -8,7 +8,7 @@ time sink in language projects.
 Status legend: **Locked** · **Proposed** (baked into docs, pending confirmation)
 · **Open** · **Superseded**
 
-_Last updated: 2026-10-17_
+_Last updated: 2026-10-22_
 
 ---
 
@@ -1522,3 +1522,63 @@ point of `with`; the lock guard is the motivating case and demands that early
 `return` release the lock, which forced the shared cleanup-stack fix for
 `try/finally` too. The reduced `__exit__` arity keeps the lowering a plain
 re-raise until typed exceptions land.
+
+## D-0070 — Versioning & stability policy: the 1.0 contract (I#205)
+**Status:** Locked (policy). Full text: `docs/STABILITY.md`. Epic I#158, Area D2
+(`design/0016-platform-1.0.md`). Resolves the "compatibility / versioning
+promise" open question. Blocks the spec-freeze audit (#206) and release
+process (#207).
+
+Zap is distributed as **one artifact** (the `zap` toolchain) carrying **one
+version** — the `Cargo.toml` `[workspace.package] version` — interpreted as
+**SemVer 2.0.0**. That single version covers several surfaces (language, stdlib
+API, CLI, package format, runtime/ABI); **a release's bump is the maximum change
+class over all surfaces**.
+
+- **MAJOR** = a backward-incompatible change to any *Stable* surface; **MINOR** =
+  a backward-compatible addition (new syntax/API/flag, additive package-format
+  change, **graduating an Experimental surface to Stable**, **deprecating** a
+  Stable surface, new target platform, MSRV bump); **PATCH** = bug fixes with no
+  surface change and no behavior change to a *conforming* program.
+- **Whole-program AOT (D-0021) ⇒ no public runtime ABI.** There is no dynamic
+  linking of separately-compiled Zap code, so Zap promises **no** stable binary
+  ABI between units or compiler versions, no value-layout stability (D-0051/
+  D-0067/D-0046), and no `zaprt` ABI. The runtime/ABI tier is **Internal**; the
+  eventual C FFI (D-0012) ships **Experimental** and is governed from then on.
+- **0.x regime (now):** no compatibility promise; `0.MINOR` may break anything,
+  `0.x.PATCH` is fixes-only. The `SPEC.md` `Version:` header (0.2) is an
+  editorial doc revision; the `Cargo.toml` version is authoritative and is
+  reconciled with the spec at 1.0.
+- **1.0 promise (Go-1 style):** a program using only **Stable** surfaces that
+  compiles and runs under 1.0 keeps compiling and behaving across all of 1.x.
+  **Does not cover** Experimental/Internal surfaces, bug-for-bug behavior
+  (fixable at PATCH/MINOR), performance/GC/scheduler timing, unspecified
+  iteration order, value layout, diagnostic text, `zap ir`/`zap expand` output,
+  or security/soundness fixes (narrow carve-out allowed at MINOR/PATCH with
+  sign-off).
+- **Three tiers** (Stable / Experimental / Internal). Experimental is opt-in and
+  signposted (target: `[experimental]` allow-list in `zap.toml` + compiler warn);
+  Experimental→Stable graduates at a MINOR with a DECISIONS entry. The
+  authoritative 1.0 Stable set is produced by the **#206 audit** — `docs/STABILITY.md`
+  §4.4 provides only a provisional seed (e.g. `threading`, Python interop,
+  arrays/SIMD, C FFI, WASM provisionally Experimental).
+- **Deprecation:** a Stable surface is deprecated (warning) at a MINOR, stays
+  functional for the rest of the MAJOR, and is removed only at the next MAJOR.
+  **Breaking changes** require a design doc + DECISIONS entry + migration guide,
+  with a `zap fix`-style migrator as a goal.
+- **Editions: rejected for 1.0.** Whole-program AOT removes the cross-edition
+  linking problem editions solve; Zap uses the Go model (evolve within a MAJOR,
+  batch breaks into the next) plus a lightweight `language = "<major>.<minor>"`
+  pin in `zap.toml` instead.
+- **Windows for support window:** the §3 promise holds for all of 1.x; the prior
+  MAJOR gets security/critical fixes for ≥12 months after the next MAJOR.
+  Platform matrix: adding a platform is MINOR, dropping one is MAJOR. MSRV/LLVM
+  build-dep bumps are MINOR (not a Zap-program surface).
+
+**Rationale:** "make it public / call it 1.0" is a *commitment*, not a feature —
+it needs a precise, enforceable definition of what stable means, what can still
+change, and how surfaces graduate, before any installer is shipped or anything
+is labeled 1.0. The single-version/max-bump scheme keeps the promise simple for
+a single-artifact toolchain; the whole-program AOT model lets us refuse an ABI
+promise honestly; the Go-1 compatibility model + language pin gives long-lived
+stability without the complexity of editions.

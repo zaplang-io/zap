@@ -31,6 +31,9 @@ default-members = [
 ]
 
 [workspace.package]
+# Single SemVer 2.0.0 version for the whole `zap` toolchain; bump rules and the
+# surface tiers it covers are defined in docs/STABILITY.md (D-0070). 0.x makes no
+# compatibility promise.
 version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
