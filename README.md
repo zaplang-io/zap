@@ -11,7 +11,8 @@ metaprogramming system for keeping business logic free of boilerplate.
 ## Documents
 
 - [`SPEC.md`](SPEC.md) — the language specification (the source of truth).
-- [`DECISIONS.md`](DECISIONS.md) — the decision log (ADR), D-0001…D-0041.
+- [`DECISIONS.md`](DECISIONS.md) — the decision log (ADR), D-0001…D-0070.
+- [`docs/STABILITY.md`](docs/STABILITY.md) — versioning & stability policy (the 1.0 contract).
 - [`ROADMAP.md`](ROADMAP.md) — phased build plan + parallelization map.
 - [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) — the tracked backlog.
 - [`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf) — the grammar.
