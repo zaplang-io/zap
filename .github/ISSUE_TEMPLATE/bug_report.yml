@@ -1,0 +1,66 @@
+name: Bug report
+description: The compiler, runtime, stdlib, or `zap` CLI does something wrong.
+title: "<short description of the bug>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Security problems go through [SECURITY.md](https://github.com/parveshgarg/zap/blob/main/SECURITY.md), **not** here.
+        Please check [DECISIONS.md](https://github.com/parveshgarg/zap/blob/main/DECISIONS.md) and existing issues first.
+        Reference issues as `I#n` and PRs as `PR#n`.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: >-
+        The smallest `.zap` program that shows the problem, plus the exact command
+        (`zap run`, `zap build`, `make docker-run FILE=...`, ...). Expected vs. actual output.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Parser / syntax
+        - Type checker / generics
+        - Codegen / LLVM
+        - Runtime / GC
+        - Scheduler / coroutines / netpoller
+        - Standard library
+        - zap CLI / package manager
+        - Docs / spec
+        - Other / not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: collector
+    attributes:
+      label: Garbage collector
+      description: Runtime/GC bugs often reproduce under only one collector.
+      options:
+        - Default (precise Immix)
+        - Fallback (Boehm, zapc/gc-boehm)
+        - Both
+        - Not applicable / not sure
+  - type: input
+    id: version
+    attributes:
+      label: Version and platform
+      description: Output of `zap version` (or the commit SHA), and your OS / architecture.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Backtraces, `zap ir` output, related `I#n` / `D-NNNN` references.

@@ -1,0 +1,53 @@
+name: Feature request / proposal
+description: Propose a language, stdlib, tooling, or runtime change.
+title: "<short description of the feature>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Zap's thesis: a language optimized to be **written by coding agents, read by humans, and executed by machines**.
+        Proposals that make code more unambiguous to generate, nicer to read, or faster to run are the sweet spot.
+        Check [DECISIONS.md](https://github.com/parveshgarg/zap/blob/main/DECISIONS.md) and [OPEN-QUESTIONS.md](https://github.com/parveshgarg/zap/blob/main/OPEN-QUESTIONS.md) first: many questions are already settled.
+        Reference issues as `I#n` and PRs as `PR#n`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can't you do today, or what is painful? Show the code you'd write now.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Concrete `.zap` examples of the new syntax / API. How does it read to a human and to a code-generating agent?
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other designs, and how other languages (Python, Go, Rust, ...) handle it.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Language surface (syntax / semantics)
+        - Type system / generics
+        - Standard library
+        - Runtime / GC / concurrency
+        - Tooling (zap CLI, fmt, test, LSP, registry)
+        - Platform / packaging
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Process
+      options:
+        - label: I understand a language-level change needs a `design/` proposal and a `DECISIONS.md` entry before it is implemented (see CONTRIBUTING.md).
