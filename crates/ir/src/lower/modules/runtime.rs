@@ -26,6 +26,8 @@ fn lower(
             "zap_runtime_unlock_os_thread",
             Ty::Void,
         ))),
+        "profile_start" => Ok(Some(call0(lowerer, "zap_profile_start", Ty::Void))),
+        "profile_stop" => Ok(Some(call0(lowerer, "zap_profile_stop", Ty::Void))),
         _ => Ok(None),
     }
 }

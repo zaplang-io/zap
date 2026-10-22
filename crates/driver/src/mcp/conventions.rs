@@ -138,8 +138,15 @@ mod tests {
     use std::io::Write;
 
     fn tmpdir() -> PathBuf {
+        // Unique per call: a process-wide atomic counter plus the pid, so
+        // parallel tests never collide on a coarse-resolution clock (two tests
+        // sharing a dir would clobber each other's DEFAULT_NAME file and flake).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
-            "zap-conventions-{}",
+            "zap-conventions-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

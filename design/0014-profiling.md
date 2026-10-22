@@ -1,8 +1,8 @@
 # Proposal: Signal-triggered runtime profiler (SIGUSR2 + `zap inspect --profile`)
 
-- **Author(s):** Claude (I#78 design session)
+- **Author(s):** Claude (I#78)
 - **Last updated:** 2026-10-22
-- **Status:** Draft
+- **Status:** Accepted (implemented)
 - **Discussion:** https://github.com/parveshgarg/zap/issues/78 (D-0058)
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
@@ -96,8 +96,12 @@ The profiler must unwind the native stack; it does not reuse the shadow chain.
   `ZAP_PROFILE_HZ` (default 100) sets the sample rate; `ZAP_PROFILE_OUT` sets the
   path (default `zap-cpuprofile-<pid>.folded`).
 - **Runtime API** (the I#121 module seam, matching `runtime.*`/`gc.*`):
-  `runtime.profile_start(path)` / `runtime.profile_stop()` — thin wrappers over
-  the same toggle, so a program can bracket a region of interest.
+  `runtime.profile_start()` / `runtime.profile_stop()` — zero-arg thin wrappers
+  over the same start/stop, so a program can bracket a region of interest; the
+  output path and rate come from `ZAP_PROFILE_OUT`/`ZAP_PROFILE_HZ`, keeping the
+  surface tiny and avoiding a string-argument dependency in v1 (a `path`
+  overload, and a Python-`cProfile`-shaped `profile` module, are follow-ups — the
+  latter waits on `with`-statement context managers, I#185).
 
 ### Sampling mechanism
 
@@ -155,12 +159,19 @@ not in the hot runtime path.
 
 ### Symbolication
 
-The handler records **raw PCs** plus the module base.
-Symbolication happens offline at stop (or entirely in tooling against the
-binary): resolve each PC to `function + file:line` via the binary's symbol
-table / DWARF.
-This keeps the handler tiny and makes symbolication robust (it does not depend
-on `-rdynamic` exported dynamic symbols, which `backtrace_symbols` would need).
+The handler records **raw PCs** only.
+Symbolication happens offline at stop (normal context), via glibc
+`backtrace_symbols`, which maps each PC to `module(symbol+0xoff)`.
+To make Zap function names resolve, the link adds **`-rdynamic`** (export program
+symbols to `.dynsym`).
+This is a deliberate, cheap trade: `-rdynamic` enlarges the dynamic symbol table
+slightly but adds **no hot-path or codegen cost** — unlike forcing frame
+pointers — so the "zero-cost when profiling is unused" property holds (nothing
+runs until a toggle).
+It is also a bonus for the I#77 fault handler, whose `backtrace_symbols_fd`
+report now carries symbol names.
+A tooling-side symbolizer against the on-disk `.symtab` (dropping even
+`-rdynamic`) remains a possible follow-up.
 
 ### Diagnostic tool
 
@@ -224,22 +235,40 @@ Runtime-only plus a thin module-seam surface, disjoint from current lanes.
 Phase boundaries touched: none (no IR schema change; runtime-ABI gains
 `zap_profile_*` symbols only).
 
-## Open issues
+## Resolved (orchestrator rulings)
 
-- **A — unwinder async-safety.** glibc `backtrace()` is only *best-effort*
-  async-signal-safe (lazy libgcc init on first call).
-  Recommendation: warm it up once at profiler start.
-  Robust alternative if that proves flaky: frame-pointer walking, which needs a
-  codegen flag to force frame-pointer emission (`.eh_frame` alone does not
-  guarantee RBP chains).
-  Which path do we commit to for v1?
-- **B — output format.** Confirm folded text for v1 with pprof conversion as a
-  tooling follow-up (vs. investing in in-runtime pprof now).
-- **C — allocation profiling.** Confirm deferral to v2 (v1 = CPU only).
-- **D — surface API.** `runtime.profile_start/stop` vs a dedicated `profile`
-  module vs signal/env-only for v1 — what is most Python-faithful without a
-  `with`-statement dependency?
-- **E — SIGPROF reservation.** Confirm `SIGPROF` is reserved by the runtime and
-  excluded from `signal.notify`, paralleling `SIGURG`.
-- **F — scope.** Confirm Linux/x86-64 only for v1 (the whole signal subsystem is
-  netpoller-gated and degrades to no-op elsewhere already).
+- **A — unwinder async-safety.** WARMUP-ONLY for v1: `backtrace()` /
+  `backtrace_symbols` are warmed once at profiler start so libgcc's lazy init is
+  off the handler path.
+  The force-frame-pointer codegen flag is **not** added — it would tax all
+  compiled code even when never profiling.
+  Frame-pointer walking stays documented as the fallback if warmup proves flaky.
+- **B — output format.** Folded/collapsed-stack text for v1; pprof-protobuf is an
+  offline tooling follow-up in the Rust driver.
+- **C — allocation profiling.** Deferred to v2, reusing v1's unwinder/output.
+- **D — surface API.** `runtime.profile_start/stop` + `SIGUSR2` + `ZAP_PROFILE`
+  env for v1; a `profile` module is a later ergonomic layer (needs I#185 `with`).
+- **E — SIGPROF reservation.** `SIGPROF` is reserved by the runtime and is not a
+  member of the `Signal` prelude enum, so `signal.notify` cannot claim it —
+  exactly as `SIGURG` is reserved for preemption.
+- **F — scope.** Linux/glibc, x86-64 only for v1; a no-op elsewhere, consistent
+  with the netpoller-gated signal subsystem.
+
+### Added correctness requirement (EINTR)
+
+A SIGPROF sample interrupts whatever syscall the sampled coroutine is in.
+SA_RESTART auto-restarts the restartable syscalls; the ones it does not
+(`poll`/`epoll_wait`/`nanosleep`) are EINTR-looped at their call sites, and the
+handler skips coroutines that are off-CPU (parked/blocked) or mid-switch.
+On Linux the only blocking syscall a *sampled* (on-CPU, non-pinned) coroutine
+can be caught in is `nanosleep` (channel/netpoller waits park and free the M, so
+they are not sampled) — and the `nanosleep` loop already resumes the remaining
+time across interrupts.
+`profile_eintr.zap` profiles, at a high rate, CPU-bound coroutines (heavily
+sampled) alongside `lock_os_thread` coroutines that block in `nanosleep` on their
+dedicated OS threads, and asserts a deterministic total with no spurious failure.
+
+A pre-existing gc-immix instability (unrelated to profiling: it reproduces with
+the profiler off) means non-pinned `time.sleep_ns` in a tight loop, and
+`sleep`+mutex-contention+mass-spawn, can stall/crash under the moving collector;
+that is tracked separately, and the EINTR golden deliberately avoids it.

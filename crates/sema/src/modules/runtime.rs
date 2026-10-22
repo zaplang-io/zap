@@ -39,6 +39,18 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "runtime", "unlock_os_thread", args, 0, span);
             Some(Ty::Unit)
         }
+        // runtime.profile_start(): begin CPU profiling (ticket #78, D-0058). The
+        // output path / sample rate come from ZAP_PROFILE_OUT / ZAP_PROFILE_HZ;
+        // folded stacks are written at profile_stop. Same effect as SIGUSR2.
+        "profile_start" => {
+            expect_argc(checker, "runtime", "profile_start", args, 0, span);
+            Some(Ty::Unit)
+        }
+        // runtime.profile_stop(): stop CPU profiling and write the folded output.
+        "profile_stop" => {
+            expect_argc(checker, "runtime", "profile_stop", args, 0, span);
+            Some(Ty::Unit)
+        }
         _ => None,
     }
 }
