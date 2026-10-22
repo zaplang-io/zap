@@ -182,3 +182,59 @@ jobs:
 
       - name: "Test (fallback: Boehm GC)"
         run: cargo test --workspace --features zapc/gc-boehm
+
+  # Windows bring-up (ticket #199, platform epic #158 / Area A5). NON-BLOCKING by
+  # design (`continue-on-error: true`): the Windows runtime port is incomplete —
+  # the C runtime (`crates/codegen/src/zaprt.c`) still needs the A1 coroutine
+  # context switch (#195) and the A3 signals/preemption + Itanium->SEH unwinder
+  # (#197) before a Zap *program* can link and run on Windows (the runtime's
+  # platform gate fails that compile with the exact gap map). This job therefore
+  # validates the stage that DOES pass today — the portable compiler front-end
+  # crates (default members, no LLVM) build and test on a native Windows host —
+  # and records the MinGW-w64 link toolchain A5 targets. It reports progress
+  # WITHOUT blocking merges; the Linux `host`/`full` and `arm64` jobs stay
+  # required and unchanged. Promote this to a required full-codegen+link job once
+  # A1/A3 land. (Clippy/fmt stay on x86 — `host`/`full` already gate them and
+  # they are target-independent, matching the `arm64` job.)
+  windows:
+    name: "Windows (in progress, A1/A3 pending)"
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup component add clippy rustfmt
+
+      # MinGW-w64 is the A5-chosen Windows toolchain (its `gcc`/`cc` provides the
+      # `x86_64-pc-windows-gnu` target, with `winpthreads` + `libstdc++`,
+      # minimising the Itanium->SEH exception-ABI change vs MSVC — see
+      # design/0017-windows-coroutine-context-switch.md). It is preinstalled on
+      # `windows-latest`; print the version so the link toolchain the driver
+      # (crates/codegen/src/lib.rs) targets is visible in the log. The runtime
+      # libraries (pcre2/zlib/openssl/boehm-gc via MSYS2 `mingw-w64-x86_64-*`) are
+      # only needed when `zaprt.c` compiles, which is gated on A1/A3 and so not
+      # exercised here.
+      - name: Show MinGW-w64 toolchain
+        shell: bash
+        run: |
+          gcc --version || echo "gcc (MinGW-w64) not on PATH"
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+
+      # Portable front-end crates (syntax/sema/ir/mono/pkg/driver): no LLVM, no
+      # C runtime link, so these exercise Windows portability of the Rust side
+      # (and the new target-aware link code is type-checked by the Linux `full`
+      # job, which compiles the Windows arm even though it does not take it).
+      - name: Build (default members, no LLVM)
+        run: cargo build
+
+      # Best-effort: surfaces any A4 (#198) path/fs/process assumptions in the
+      # portable crates' tests as a visible-but-non-blocking signal.
+      - name: Test (default members, no LLVM)
+        run: cargo test

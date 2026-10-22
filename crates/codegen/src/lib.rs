@@ -120,20 +120,41 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     std::fs::write(build_dir.join("zapgc.inc.c"), RUNTIME_GC_C)
         .map_err(|e| format!("failed to write gc runtime: {e}"))?;
 
-    // `-lgc` links the conservative Boehm collector the runtime allocates
-    // through (ticket #20, D-0009); the dev container provides `libgc-dev`.
-    // `-lstdc++` pulls in the Itanium unwinding personality and the
-    // `__cxa_*` exception entry points the runtime calls (ticket #22); the
-    // actual stack unwinder (`_Unwind_*`) comes from libgcc, linked by default.
-    let mut cmd = Command::new("cc");
+    // Target-aware link step (ticket #199, platform epic #158 / Area A5). Today
+    // codegen emits for the host triple only, so "Windows target" means "running
+    // the Zap compiler on a Windows (MinGW-w64) host"; we branch on the triple
+    // string so the Windows arm is still type-checked by the Linux/macOS build
+    // (it just isn't taken there), keeping this behaviour-preserving off Windows.
+    //
+    // NOTE: a full Windows link does not succeed yet — the C runtime (`zaprt.c`)
+    // still needs the A1 context switch (#195), A3 signals/preemption/faults and
+    // unwinder (#197), and A2/A4 before it compiles on Windows; the runtime's
+    // platform gate fails the compile with that map. This arm wires the correct
+    // MinGW-w64 toolchain so that work drops straight in. See the PR body and
+    // design/0016-platform-1.0.md (Area A).
+    let triple = TargetMachine::get_default_triple();
+    let is_windows = triple.as_str().to_string_lossy().contains("windows");
+
+    // Linker driver. `cc` by default (the MinGW-w64 `gcc`/`cc` on a Windows host
+    // provides the `x86_64-pc-windows-gnu` target); override with `$ZAP_CC`
+    // (e.g. a cross driver `x86_64-w64-mingw32-gcc`). Added for the Windows
+    // bring-up but useful on every platform.
+    let cc = std::env::var("ZAP_CC").unwrap_or_else(|_| "cc".to_string());
+    let mut cmd = Command::new(&cc);
     cmd.arg(&obj_path).arg(&rt_path).arg("-o").arg(out_path);
     // Select the collector (ticket #48): the precise Immix GC is compiled into
     // the runtime with -DZAP_GC_IMMIX and needs no Boehm library; the default
-    // build links the conservative Boehm collector (-lgc).
+    // build links the conservative Boehm collector (-lgc). On Windows the Boehm
+    // library is `-lgc` too (MinGW-w64 `mingw-w64-x86_64-boehm-gc`, built with
+    // thread support — the conservative fallback the A1 spike keeps working).
     #[cfg(feature = "gc-immix")]
     cmd.arg("-DZAP_GC_IMMIX");
     #[cfg(not(feature = "gc-immix"))]
     cmd.arg("-lgc");
+    // Libraries common to the POSIX (`cc` + system libs) and Windows (MinGW-w64)
+    // link lines — the dev container / CI provide the `-dev` packages on Linux,
+    // and the MinGW-w64 `mingw-w64-x86_64-{pcre2,zlib,openssl}` packages provide
+    // the import libraries with the same `-l` names on Windows (MSYS2).
     cmd.arg("-lstdc++")
         // `-lm` provides libm `pow`/`floor`, used by the scalar `**` and `//`
         // runtime helpers (ticket #19).
@@ -155,21 +176,43 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         // starts a GC-registered pthread, and channels block on pthread
         // mutex/condvars. `libgc` must be thread-aware (the runtime defines
         // `GC_THREADS` and uses `GC_pthread_create`); the dev container's
-        // `libgc-dev` is built with thread support.
+        // `libgc-dev` is built with thread support. On Windows, MinGW-w64's
+        // `winpthreads` provides `-lpthread` with the same API.
         .arg("-lpthread");
-    // Export program symbols to the dynamic symbol table so the CPU profiler's
-    // offline symbolication (`backtrace_symbols`, ticket #78) resolves Zap
-    // function names in folded stacks. This enlarges `.dynsym` slightly but adds
-    // NO hot-path or codegen cost (unlike forcing frame pointers) and preserves
-    // the "zero-cost when profiling is unused" property — nothing runs until a
-    // SIGUSR2 / ZAP_PROFILE toggle. On the fault-handler backtrace (ticket #77)
-    // it is a bonus: crash reports now carry symbol names too.
-    cmd.arg("-rdynamic");
-    // CPython embedding flags (ticket #27, D-0012): the `-I...` cflags let
-    // `zaprt.c` find `<Python.h>`, and the libs link libpython. Discovered with
-    // `pkg-config` (the dev container / CI provide `python3-dev` + `pkg-config`)
-    // so the exact libpython version and path are not hardcoded.
-    cmd.args(python_embed_flags()?);
+    if is_windows {
+        // Windows (MinGW-w64 / `x86_64-pc-windows-gnu`) extras, ticket #199:
+        //   * No `-rdynamic`: it is an ELF/dynamic-symbol-table flag; PE/COFF has
+        //     no equivalent and the profiler/fault symbolication path it serves
+        //     is itself part of the A3 (#197) Windows work, so it is simply
+        //     omitted here.
+        //   * No `pkg-config` CPython: Python embedding is gated OFF for Windows
+        //     v1 (no reliable `python3-embed.pc` under MinGW; `import python`
+        //     support on Windows is deferred — a known A4/#198 gap).
+        //   * System libraries the *ported* runtime will need, wired ahead so A2/
+        //     A3 drop in without touching the link line: `-lws2_32` (Winsock, for
+        //     the A2/#196 IOCP netpoller), `-lbcrypt` (CNG `BCryptGenRandom`, the
+        //     Windows `getentropy` replacement for crypto, A4/#198), `-ldbghelp`
+        //     (`StackWalk64`/`SymFromAddr` for the A3/#197 fault backtrace). The
+        //     linker ignores a listed library with no referenced symbols, so
+        //     listing them now is harmless while the runtime is still stubbed.
+        cmd.arg("-lws2_32").arg("-lbcrypt").arg("-ldbghelp");
+    } else {
+        // Export program symbols to the dynamic symbol table so the CPU
+        // profiler's offline symbolication (`backtrace_symbols`, ticket #78)
+        // resolves Zap function names in folded stacks. This enlarges `.dynsym`
+        // slightly but adds NO hot-path or codegen cost (unlike forcing frame
+        // pointers) and preserves the "zero-cost when profiling is unused"
+        // property — nothing runs until a SIGUSR2 / ZAP_PROFILE toggle. On the
+        // fault-handler backtrace (ticket #77) it is a bonus: crash reports now
+        // carry symbol names too.
+        cmd.arg("-rdynamic");
+        // CPython embedding flags (ticket #27, D-0012): the `-I...` cflags let
+        // `zaprt.c` find `<Python.h>`, and the libs link libpython. Discovered
+        // with `pkg-config` (the dev container / CI provide `python3-dev` +
+        // `pkg-config`) so the exact libpython version and path are not
+        // hardcoded.
+        cmd.args(python_embed_flags()?);
+    }
     // Debug hook: extra cc flags from $ZAP_CC_EXTRA (e.g. "-g -fsanitize=address")
     // for diagnosing runtime/GC issues. Unset in normal builds and CI.
     if let Ok(extra) = std::env::var("ZAP_CC_EXTRA") {
