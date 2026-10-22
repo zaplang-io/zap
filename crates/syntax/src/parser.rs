@@ -218,6 +218,13 @@ struct Lock:
     def release(self):
         sync.unlock(self._h)
 
+    def __enter__(self) -> Lock:
+        sync.lock(self._h)
+        return self
+
+    def __exit__(self):
+        sync.unlock(self._h)
+
 # RLock — reentrant lock, owned by the acquiring coroutine/Thread.
 struct RLock:
     bytes _h
@@ -229,6 +236,13 @@ struct RLock:
         return sync.rlock_trylock(self._h)
 
     def release(self):
+        sync.rlock_unlock(self._h)
+
+    def __enter__(self) -> RLock:
+        sync.rlock_lock(self._h)
+        return self
+
+    def __exit__(self):
         sync.rlock_unlock(self._h)
 
 # Event — a latch; `wait` blocks until `set_` (Python's `set`, renamed: `set`
@@ -264,6 +278,13 @@ struct Semaphore:
     def release(self):
         sync.sem_release(self._h)
 
+    def __enter__(self) -> Semaphore:
+        sync.sem_acquire(self._h)
+        return self
+
+    def __exit__(self):
+        sync.sem_release(self._h)
+
 # Condition — a condition variable over its own internal lock (matches Python's
 # default `Condition()`). `wait` atomically releases the lock, parks, and
 # reacquires on wake.
@@ -274,6 +295,13 @@ struct Condition:
         sync.cond_acquire(self._h)
 
     def release(self):
+        sync.cond_release(self._h)
+
+    def __enter__(self) -> Condition:
+        sync.cond_acquire(self._h)
+        return self
+
+    def __exit__(self):
         sync.cond_release(self._h)
 
     def wait(self):

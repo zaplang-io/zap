@@ -2265,15 +2265,27 @@ impl Checker {
             Stmt::With { items, body, .. } => {
                 self.push_scope();
                 for it in items {
-                    // `with expect_raises(ErrType):` (D-0054) is the one supported
-                    // context manager: it names an exception type, not a value, so
-                    // its callee/argument are not inferred (which would flag them
-                    // as unknown names). Typed matching is deferred (D-0029).
-                    if !is_expect_raises(&it.expr) {
-                        self.infer(&it.expr);
+                    // `with expect_raises(ErrType):` (D-0054) is a special test
+                    // form: it names an exception type, not a value, so its
+                    // callee/argument are not inferred (which would flag them as
+                    // unknown names) and `as NAME` is typeless.
+                    if is_expect_raises(&it.expr) {
+                        if let Some(a) = &it.alias {
+                            self.declare(a, Ty::Unknown);
+                        }
+                        continue;
                     }
+                    // General context manager (I#185, D-0069): `as NAME` binds the
+                    // `__enter__` result, so give it that type when the manager is
+                    // a struct implementing the protocol (else stay permissive).
+                    let mt = self.infer(&it.expr);
                     if let Some(a) = &it.alias {
-                        self.declare(a, Ty::Unknown);
+                        let bind_ty = self
+                            .struct_info(&mt)
+                            .and_then(|si| si.methods.get("__enter__"))
+                            .map(|sig| sig.ret.clone())
+                            .unwrap_or(Ty::Unknown);
+                        self.declare(a, bind_ty);
                     }
                 }
                 for st in &body.stmts {

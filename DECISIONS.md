@@ -1478,3 +1478,47 @@ compact layouts for flags/headers/packed records on the zero-indirection value
 struct, while the no-pointer restriction keeps the precise GC and the language's
 simplicity untouched. Mixed bitfield/full-width layout and a guaranteed
 cross-platform binary encoding are the scoped follow-ups.
+
+## D-0069 — Context-manager protocol & `with` (I#185)
+**Status:** Locked — implements the general `with`; refines D-0027. Design:
+`design/0015-context-managers.md`.
+
+The `with` statement drives a Python-faithful context-manager protocol. A
+manager is any struct defining `__enter__`/`__exit__`:
+
+- `__enter__(self) -> T` runs on entry; `with M as x:` binds `x` to its result.
+- `__exit__(self)` runs on **every** exit path: normal fall-through, early
+  `return`/`break`/`continue`, and panic/unwind.
+
+```
+with lock:              # acquire on entry, release on every exit
+    critical_section()
+
+with open(path) as f:   # f closed on every path
+    use(f)
+```
+
+- **Desugaring.** `with M as x:` ≡ `x = M.__enter__()` then a finally-equivalent
+  running `M.__exit__()`. Lowered by `lower_with_items` (ir) with a per-`with`
+  landing pad for the unwind path (re-raises, chaining to any enclosing manager)
+  and a **cleanup stack** walked by `return`/`break`/`continue` for the
+  structured early exits. The *same* cleanup stack now also runs a
+  `try ... finally`'s `finally` on early exit — closing the gap I#22 deferred, so
+  `finally` is Python-faithful (always runs) and `with lock:` cannot leak the
+  lock on an early `return`.
+- **Multiple managers.** `with a, b:` nests left-to-right (`b.__exit__` before
+  `a.__exit__`); supported in v1.
+- **Std guard.** Prelude `Lock`/`RLock`/`Semaphore`/`Condition` implement the
+  protocol (`__enter__` acquires & returns self, `__exit__` releases), so
+  `with lock:` is the idiomatic mutex guard; `as NAME` is optional there.
+- **v1 divergence from CPython (deferred).** `__exit__(self)` takes no
+  `(exc_type, exc_value, tb)` triple and **cannot suppress** an in-flight
+  exception. The 4-arg suppressing form is a fast-follow gated on typed-exception
+  introspection (I#12). The surface (`with M as x:`, `__enter__`/`__exit__`)
+  stays Python-faithful; only `__exit__`'s arity is reduced for v1.
+
+**Rationale:** resource cleanup that is correct on *all* exit paths is the whole
+point of `with`; the lock guard is the motivating case and demands that early
+`return` release the lock, which forced the shared cleanup-stack fix for
+`try/finally` too. The reduced `__exit__` arity keeps the lowering a plain
+re-raise until typed exceptions land.
