@@ -378,6 +378,18 @@ struct Cg<'a, 'ctx> {
     /// Cache of interface dispatch tables: `(concrete_sid, iid)` -> the static
     /// `[N x ptr]` itable global, built once per implementing pair.
     itables: std::cell::RefCell<std::collections::HashMap<(u32, u32), PointerValue<'ctx>>>,
+    /// The C++ exception personality routine's symbol name (ticket #197, Area A3,
+    /// design/0019). The runtime's `landingpad`s name it and the backend lowers
+    /// unwind info against it. The *name* is the only Itanium/DWARF-specific piece
+    /// of the exception pipeline: `uwtable(2)` is target-agnostic (the backend
+    /// emits DWARF `.eh_frame` on ELF and SEH `.pdata`/`.xdata` on COFF from it),
+    /// and the `landingpad`/`catch ptr null` representation plus the `__cxa_*`
+    /// runtime glue are identical across the two unwind models. So the only
+    /// per-target change is this name: `__gxx_personality_v0` (Itanium, the
+    /// Linux/macOS default — byte-for-byte unchanged) vs `__gxx_personality_seh0`
+    /// (the MinGW-w64 SEH model, which keeps the `landingpad` IR and libstdc++
+    /// `__cxa_*` glue). Chosen once in [`Cg::new`] from the target triple.
+    personality: &'static str,
 }
 
 /// A function's shadow-stack frame (ticket #48). Codegen reserves one root slot
@@ -419,6 +431,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             struct_names: Vec::new(),
             interfaces: Vec::new(),
             itables: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // Pick the exception personality by target (ticket #197, A3). Codegen
+            // emits for the host triple only, so "windows" here means the Zap
+            // compiler is running on a Windows (MinGW-w64) host — exactly when the
+            // module's triple is a Windows one and the backend emits SEH tables.
+            // Off Windows this is verbatim the historical `__gxx_personality_v0`,
+            // so the emitted IR/asm is unchanged on Linux/macOS.
+            personality: if TargetMachine::get_default_triple()
+                .as_str()
+                .to_string_lossy()
+                .contains("windows")
+            {
+                "__gxx_personality_seh0"
+            } else {
+                "__gxx_personality_v0"
+            },
         }
     }
 
@@ -521,15 +548,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_eh_begin_catch", &[ptr.into()], Some(ptr.into()));
         self.declare_rt("zap_eh_end_catch", &[], None);
         self.declare_rt("zap_uncaught", &[ptr.into()], None);
-        // The Itanium personality routine (libstdc++/libgcc). Landing pads name it;
-        // it parses the unwind tables and drives phase-1/phase-2 unwinding. Its
-        // exact signature is immaterial — it is only referenced by name — so it is
-        // declared variadic `i32 (...)`.
-        let personality =
-            self.module
-                .add_function("__gxx_personality_v0", i32t.fn_type(&[], true), None);
-        self.fns
-            .insert("__gxx_personality_v0".to_string(), personality);
+        // The C++ exception personality routine (libstdc++/libgcc). Landing pads
+        // name it; it parses the unwind tables and drives phase-1/phase-2
+        // unwinding. Its exact signature is immaterial — it is only referenced by
+        // name — so it is declared variadic `i32 (...)`. The name is target-chosen
+        // (`self.personality`, ticket #197/A3): `__gxx_personality_v0` on
+        // Linux/macOS (unchanged), `__gxx_personality_seh0` on MinGW-w64 Windows.
+        let personality = self
+            .module
+            .add_function(self.personality, i32t.fn_type(&[], true), None);
+        self.fns.insert(self.personality.to_string(), personality);
 
         // Collection entry points (ticket #21, see design/RUNTIME-ABI.md). Lists
         // and dicts store uniform 8-byte element words; the lowering picks the
@@ -1240,7 +1268,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .flat_map(|b| &b.insts)
             .any(|i| matches!(i, Inst::LandingPad { .. }));
         if has_landing_pad {
-            fv.set_personality_function(self.fns["__gxx_personality_v0"]);
+            fv.set_personality_function(self.fns[self.personality]);
         }
 
         let blocks: Vec<BasicBlock> = f
@@ -2119,7 +2147,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .ctx
                     .struct_type(&[ptr_ty.into(), self.ctx.i32_type().into()], false);
                 let null = ptr_ty.const_null();
-                let pf = self.fns["__gxx_personality_v0"];
+                let pf = self.fns[self.personality];
                 let lp = b
                     .build_landing_pad(lp_ty, pf, &[null.into()], false, "lp")
                     .map_err(|e| e.to_string())?;
@@ -2641,7 +2669,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 self.ctx.create_enum_attribute(uwtable, 2),
             );
         }
-        thunk.set_personality_function(self.fns["__gxx_personality_v0"]);
+        thunk.set_personality_function(self.fns[self.personality]);
         let entry = self.ctx.append_basic_block(thunk, "entry");
         b.position_at_end(entry);
         let env = thunk
@@ -2673,7 +2701,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let lp = b
             .build_landing_pad(
                 lp_ty,
-                self.fns["__gxx_personality_v0"],
+                self.fns[self.personality],
                 &[ptr.const_null().into()],
                 false,
                 "lp",
