@@ -3164,8 +3164,15 @@ struct FnLower<'a> {
     func: Func,
     cur: BlockId,
     scopes: Vec<HashMap<String, (Value, Ty)>>,
-    loops: Vec<(BlockId, BlockId)>, // (continue, break)
-    term_set: HashSet<BlockId>,     // blocks with a real terminator
+    loops: Vec<LoopFrame>,
+    term_set: HashSet<BlockId>, // blocks with a real terminator
+    /// Stack of pending cleanups (innermost last), one per active `with`
+    /// manager and per `try ... finally` (I#185, D-0069). The unwind path is
+    /// handled by [`FnLower::landing_pads`]; this stack is walked only on the
+    /// *structured* early-exit paths (`return`/`break`/`continue`) so
+    /// `__exit__` / `finally` still run before the jump — closing the gap I#22
+    /// deferred for `try/finally`. See [`FnLower::run_cleanups`].
+    cleanups: Vec<Cleanup>,
     /// Stack of active landing-pad blocks (innermost `try` last). A call emitted
     /// while this is non-empty becomes an [`Inst::Invoke`] whose unwind edge goes
     /// to the top entry, so a raised exception transfers to the nearest handler.
@@ -3194,6 +3201,27 @@ struct FnLower<'a> {
     gen_entry: Option<GenEntry>,
     sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &'a StructCtx,
+}
+
+/// An active loop's jump targets plus the cleanup-stack depth when the loop
+/// opened. `break`/`continue` run the cleanups pushed *inside* the loop (those
+/// above `cleanup_base`) before branching (I#185).
+struct LoopFrame {
+    cont: BlockId,
+    brk: BlockId,
+    cleanup_base: usize,
+}
+
+/// A pending scope-exit action run on the structured early-exit paths
+/// (`return`/`break`/`continue`) by [`FnLower::run_cleanups`] (I#185, D-0069).
+/// The normal-completion and panic/unwind paths emit their cleanup inline, so
+/// this enum is only consulted when a jump would otherwise skip it.
+#[derive(Clone)]
+enum Cleanup {
+    /// A `with` manager: emit `exit_fn(mgr)` (the lowered `__exit__`).
+    WithExit { mgr: Value, exit_fn: String },
+    /// A `try ... finally`: re-lower the `finally` block.
+    Finally(ast::Block),
 }
 
 /// State threaded through the lowering of a generator's `__next__` (I#67). The
@@ -3256,6 +3284,7 @@ impl<'a> FnLower<'a> {
             cur: 0,
             scopes: vec![HashMap::new()],
             loops: Vec::new(),
+            cleanups: Vec::new(),
             term_set: HashSet::new(),
             landing_pads: Vec::new(),
             used_lps: HashSet::new(),
@@ -3331,6 +3360,61 @@ impl<'a> FnLower<'a> {
         if !self.terminated() {
             self.set_term(Term::Br(dest));
         }
+    }
+
+    /// Open a loop frame, recording the current cleanup-stack depth so
+    /// `break`/`continue` know which cleanups are lexically inside the loop.
+    fn push_loop(&mut self, cont: BlockId, brk: BlockId) {
+        let cleanup_base = self.cleanups.len();
+        self.loops.push(LoopFrame {
+            cont,
+            brk,
+            cleanup_base,
+        });
+    }
+
+    /// Emit the cleanup actions for the active `with`/`try-finally` entries from
+    /// the top of the stack down to (not including) `down_to`, innermost first
+    /// (I#185, D-0069). Run on the structured early-exit paths so `__exit__` /
+    /// `finally` still execute before a `return`/`break`/`continue`.
+    ///
+    /// `landing_pads` is cleared for the duration, so a cleanup call here is a
+    /// plain `Call` rather than an `Invoke` back into its own (or a sibling's)
+    /// landing pad — which would double-run the cleanup. v1 consequence: if a
+    /// cleanup *itself* raises on an early-exit path it propagates without
+    /// running the remaining pending cleanups (lock/file `__exit__` never raise,
+    /// so the motivating cases are unaffected; full chaining is a follow-up).
+    /// While running entry `i` only the strictly-outer entries stay active, so a
+    /// nested early exit inside a `finally` runs the outer cleanups correctly; if
+    /// a cleanup diverts control (e.g. a `return` inside a `finally`) the walk
+    /// stops.
+    fn run_cleanups(&mut self, down_to: usize) -> Result<(), LowerError> {
+        if self.cleanups.len() <= down_to {
+            return Ok(());
+        }
+        let saved = self.cleanups.clone();
+        let saved_lps = std::mem::take(&mut self.landing_pads);
+        let mut i = saved.len();
+        while i > down_to {
+            i -= 1;
+            self.cleanups.truncate(i);
+            match &saved[i] {
+                Cleanup::WithExit { mgr, exit_fn } => {
+                    let (mgr, exit_fn) = (*mgr, exit_fn.clone());
+                    self.throwing_call(None, &exit_fn, vec![mgr]);
+                }
+                Cleanup::Finally(block) => {
+                    let block = block.clone();
+                    self.lower_block(&block)?;
+                }
+            }
+            if self.terminated() {
+                break;
+            }
+        }
+        self.cleanups = saved;
+        self.landing_pads = saved_lps;
+        Ok(())
     }
 
     // scopes
@@ -3771,26 +3855,50 @@ impl<'a> FnLower<'a> {
                         // already that copy; a non-inline value struct is deep-
                         // copied here. See `copy_for_pass`.
                         let v = self.copy_for_pass(v, ret, e);
-                        self.set_term(Term::Ret(Some(v)));
+                        // Run `with`/`try-finally` cleanups before returning so
+                        // `__exit__`/`finally` execute on the early-return path
+                        // (I#185, D-0069). The return value is evaluated first
+                        // (Python order).
+                        self.run_cleanups(0)?;
+                        if !self.terminated() {
+                            self.set_term(Term::Ret(Some(v)));
+                        }
                     }
-                    None => self.set_term(Term::Ret(None)),
+                    None => {
+                        self.run_cleanups(0)?;
+                        if !self.terminated() {
+                            self.set_term(Term::Ret(None));
+                        }
+                    }
                 }
                 Ok(())
             }
             Stmt::Break(_) => {
-                let (_, brk) = *self
-                    .loops
-                    .last()
-                    .ok_or_else(|| err("'break' outside a loop"))?;
-                self.set_term(Term::Br(brk));
+                let (brk, base) = {
+                    let f = self
+                        .loops
+                        .last()
+                        .ok_or_else(|| err("'break' outside a loop"))?;
+                    (f.brk, f.cleanup_base)
+                };
+                self.run_cleanups(base)?;
+                if !self.terminated() {
+                    self.set_term(Term::Br(brk));
+                }
                 Ok(())
             }
             Stmt::Continue(_) => {
-                let (cont, _) = *self
-                    .loops
-                    .last()
-                    .ok_or_else(|| err("'continue' outside a loop"))?;
-                self.set_term(Term::Br(cont));
+                let (cont, base) = {
+                    let f = self
+                        .loops
+                        .last()
+                        .ok_or_else(|| err("'continue' outside a loop"))?;
+                    (f.cont, f.cleanup_base)
+                };
+                self.run_cleanups(base)?;
+                if !self.terminated() {
+                    self.set_term(Term::Br(cont));
+                }
                 Ok(())
             }
             Stmt::Raise { value, .. } => self.lower_raise(value.as_ref()),
@@ -4430,22 +4538,127 @@ impl<'a> FnLower<'a> {
     /// so a raise inside BODY is swallowed and a missing one propagates (and is
     /// caught by an enclosing test). Typed matching is catch-all until the typed
     /// exception hierarchy (D-0029) lands — the type name is diagnostic only.
+    /// `with ITEM { , ITEM } : BODY` (D-0027, D-0069). The test-only
+    /// `with expect_raises(ErrType):` (D-0054) keeps its bespoke desugaring;
+    /// every other form drives the general `__enter__`/`__exit__` context-manager
+    /// protocol (I#185). Multiple managers nest left-to-right (Python).
     fn lower_with(&mut self, items: &[ast::WithItem], body: &ast::Block) -> Result<(), LowerError> {
-        let bad = || {
-            err(
-                "`with` currently supports only `with expect_raises(ErrType):` \
-                 (general context managers are a follow-up, D-0027)",
-            )
-        };
-        if items.len() != 1 {
-            return Err(bad());
+        if items.len() == 1 {
+            if let Expr::Call { callee, .. } = &items[0].expr {
+                if is_name(callee, "expect_raises") {
+                    return self.lower_expect_raises(&items[0].expr, body);
+                }
+            }
         }
-        let Expr::Call { callee, args, .. } = &items[0].expr else {
-            return Err(bad());
-        };
-        if !is_name(callee, "expect_raises") {
-            return Err(bad());
+        self.push_scope();
+        let r = self.lower_with_items(items, body, 0);
+        self.pop_scope();
+        r
+    }
+
+    /// The context-manager protocol for one `with` item (I#185, D-0069):
+    /// evaluate the manager once, call `__enter__` (binding `as NAME` to its
+    /// result), lower the rest (the next item, or `BODY` for the last), then run
+    /// `__exit__` on every exit path — normal fall-through, panic/unwind (via a
+    /// landing pad that re-raises, chaining to any enclosing manager), and the
+    /// structured early exits (via the cleanup stack walked by
+    /// `return`/`break`/`continue`).
+    fn lower_with_items(
+        &mut self,
+        items: &[ast::WithItem],
+        body: &ast::Block,
+        idx: usize,
+    ) -> Result<(), LowerError> {
+        if idx == items.len() {
+            for st in &body.stmts {
+                self.stmt(st)?;
+            }
+            return Ok(());
         }
+        let item = &items[idx];
+        let (mgr, mty) = self.expr(&item.expr)?;
+        let Ty::Struct(sid) = mty else {
+            return Err(err(
+                "`with` manager must be a value implementing the context-manager \
+                 protocol (`__enter__`/`__exit__`)",
+            ));
+        };
+        let name = self.ctx.names[sid as usize].clone();
+        let enter_m = format!("{}__{}", name, "__enter__");
+        let exit_m = format!("{}__{}", name, "__exit__");
+        let Some((_p, enter_ret)) = self.sigs.get(&enter_m).cloned() else {
+            return Err(err(format!(
+                "type '{name}' is not a context manager: define '__enter__(self)' \
+                 and '__exit__(self)' (I#185)"
+            )));
+        };
+        if !self.sigs.contains_key(&exit_m) {
+            return Err(err(format!(
+                "context manager '{name}' defines '__enter__' but not '__exit__' (I#185)"
+            )));
+        }
+
+        // `NAME = mgr.__enter__()` on entry (result discarded without `as`).
+        let entered = self.new_value(enter_ret);
+        self.throwing_call(Some(entered), &enter_m, vec![mgr]);
+        if let Some(alias) = &item.alias {
+            let slot = self.alloca(enter_ret);
+            self.store(slot, entered);
+            self.declare(alias, slot, enter_ret);
+        }
+
+        let lp = self.new_block();
+        let after = self.new_block();
+
+        // Body: calls unwind to `lp`; an early exit runs `__exit__` via the stack.
+        self.landing_pads.push(lp);
+        self.cleanups.push(Cleanup::WithExit {
+            mgr,
+            exit_fn: exit_m.clone(),
+        });
+        self.push_scope();
+        self.lower_with_items(items, body, idx + 1)?;
+        self.pop_scope();
+        self.cleanups.pop();
+        self.landing_pads.pop();
+
+        // Normal fall-through: run `__exit__`, continue past the `with`.
+        if !self.terminated() {
+            self.throwing_call(None, &exit_m, vec![mgr]);
+            self.ensure_br(after);
+        }
+
+        // Body could not raise → no landing pad needed.
+        if !self.used_lps.contains(&lp) {
+            self.position(after);
+            return Ok(());
+        }
+
+        // Unwind path: run `__exit__`, then re-raise. With `lp` already popped,
+        // the re-raise (and an `__exit__` that itself raises) routes to the
+        // enclosing manager/`try`, so cleanup chains on exceptions.
+        self.position(lp);
+        let exc = self.new_value(Ty::Ptr);
+        self.emit(Inst::LandingPad { dest: exc });
+        self.throwing_call(None, &exit_m, vec![mgr]);
+        if !self.terminated() {
+            self.emit_end_catch();
+            self.throwing_call(None, "zap_panic", vec![exc]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+        }
+        self.position(after);
+        Ok(())
+    }
+
+    /// `with expect_raises(ErrType):` (D-0054) — the test-framework assertion
+    /// that `BODY` raises. Desugars to a flag + `try/except` + post-check,
+    /// reusing the existing try/if/raise lowering.
+    fn lower_expect_raises(&mut self, call: &Expr, body: &ast::Block) -> Result<(), LowerError> {
+        let Expr::Call { args, .. } = call else {
+            return Err(err("expect_raises must be called"));
+        };
         let ty_name = args
             .first()
             .map(|a| ast::render_expr(&a.value))
@@ -4542,11 +4755,21 @@ impl<'a> FnLower<'a> {
 
         // --- protected body: calls unwind to `lp` ---
         self.landing_pads.push(lp);
+        // Register `finally` as a cleanup so an early `return`/`break`/`continue`
+        // inside the body runs it before jumping (I#185, D-0069 — the gap I#22
+        // deferred). The unwind and normal paths emit `finally` explicitly below.
+        let has_finally_cleanup = finally.is_some();
+        if let Some(f) = finally {
+            self.cleanups.push(Cleanup::Finally(f.clone()));
+        }
         self.push_scope();
         for st in &body.stmts {
             self.stmt(st)?;
         }
         self.pop_scope();
+        if has_finally_cleanup {
+            self.cleanups.pop();
+        }
         self.landing_pads.pop();
         // Normal completion: run `finally`, then continue past the `try`.
         if !self.terminated() {
@@ -4659,7 +4882,7 @@ impl<'a> FnLower<'a> {
             else_bb: end_bb,
         });
         self.position(body_bb);
-        self.loops.push((cond_bb, end_bb));
+        self.push_loop(cond_bb, end_bb);
         self.lower_block(body)?;
         self.loops.pop();
         self.ensure_br(cond_bb);
@@ -4673,7 +4896,7 @@ impl<'a> FnLower<'a> {
         let end_bb = self.new_block();
         self.set_term(Term::Br(body_bb));
         self.position(body_bb);
-        self.loops.push((cond_bb, end_bb));
+        self.push_loop(cond_bb, end_bb);
         self.lower_block(body)?;
         self.loops.pop();
         self.ensure_br(cond_bb);
@@ -4784,7 +5007,7 @@ impl<'a> FnLower<'a> {
                     else_bb: end,
                 });
                 self.position(body_bb);
-                self.loops.push((head, end));
+                self.push_loop(head, end);
                 body(self, v, elem)?;
                 self.loops.pop();
                 self.ensure_br(head);
@@ -4808,7 +5031,7 @@ impl<'a> FnLower<'a> {
                 self.landing_pads.pop();
                 self.set_term(Term::Br(body_bb));
                 self.position(body_bb);
-                self.loops.push((head, end));
+                self.push_loop(head, end);
                 body(self, v, elem)?;
                 self.loops.pop();
                 self.ensure_br(head);
@@ -4900,7 +5123,7 @@ impl<'a> FnLower<'a> {
                 });
                 self.position(body_bb);
                 let cur_v = self.load(var, Ty::I64);
-                self.loops.push((incr_bb, end_bb));
+                self.push_loop(incr_bb, end_bb);
                 body(self, cur_v, Ty::I64)?;
                 self.loops.pop();
                 self.ensure_br(incr_bb);
@@ -4995,7 +5218,7 @@ impl<'a> FnLower<'a> {
             func: format!("zap_list_get_{}", elem.val_suffix()),
             args: vec![lst, i],
         });
-        self.loops.push((incr_bb, end_bb));
+        self.push_loop(incr_bb, end_bb);
         body(self, e, elem.ty())?;
         self.loops.pop();
         self.ensure_br(incr_bb);
@@ -5287,7 +5510,7 @@ impl<'a> FnLower<'a> {
         });
 
         self.position(body_bb);
-        self.loops.push((incr_bb, end_bb));
+        self.push_loop(incr_bb, end_bb);
         for st in &body.stmts {
             self.stmt(st)?;
         }
@@ -5372,7 +5595,7 @@ impl<'a> FnLower<'a> {
             args: vec![lst, i],
         });
         self.store(var, e);
-        self.loops.push((incr_bb, end_bb));
+        self.push_loop(incr_bb, end_bb);
         for st in &body.stmts {
             self.stmt(st)?;
         }
@@ -8222,7 +8445,7 @@ impl<'a> FnLower<'a> {
                     let t = s.new_value(Ty::I1);
                     s.emit(Inst::BConst { dest: t, val: true });
                     s.store(result, t);
-                    let (_, brk) = *s.loops.last().expect("in-iteration loop");
+                    let brk = s.loops.last().expect("in-iteration loop").brk;
                     s.set_term(Term::Br(brk));
                     s.position(cont_bb);
                     Ok(())

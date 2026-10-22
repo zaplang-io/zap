@@ -205,8 +205,16 @@ try_stmt      ::= "try" block
                   { "except" [ type [ "as" IDENT ] ] block }
                   [ "finally" block ] ;         (* D-0007, D-0029 *)
 
-with_stmt     ::= "with" with_item { "," with_item } block ;  (* D-0027 *)
+with_stmt     ::= "with" with_item { "," with_item } block ;  (* D-0027, D-0069 *)
 with_item     ::= expr [ "as" IDENT ] ;
+                  (* Each manager drives the context-manager protocol
+                     __enter__/__exit__ (I#185): __enter__ runs on entry (its
+                     result bound by `as`), __exit__ on every exit — normal,
+                     early return/break/continue, and panic/unwind. Multiple
+                     items nest left-to-right. `with expect_raises(E):` (D-0054)
+                     is a test-framework special case. v1 __exit__(self) takes no
+                     exception triple and cannot suppress (deferred, gated on
+                     typed exceptions I#12). *)
 
 (* ---------- Structured concurrency (D-0044) ---------- *)
 
