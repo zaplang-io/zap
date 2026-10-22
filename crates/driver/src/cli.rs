@@ -56,7 +56,7 @@ pub enum Command {
     Mcp { root: Option<String> },
     /// `zap inspect <pid> [--gc | --profile [--seconds N]]` — signal a running
     /// Zap process to dump diagnostics (ticket #77/#78, D-0058), so operators
-    /// need not hand-run `kill`. Default: SIGQUIT (goroutine stacks +
+    /// need not hand-run `kill`. Default: SIGQUIT (coroutine stacks +
     /// runtime/scheduler summary). `--gc`: SIGUSR1 (force a GC + print memory
     /// stats). `--profile`: SIGUSR2 to start CPU profiling, wait `--seconds N`
     /// (default 10), then SIGUSR2 again to stop and flush the folded profile.
@@ -608,7 +608,7 @@ fn send_signal(pid: &str, signame: &str) -> Result<bool, std::io::Error> {
 
 /// `zap inspect <pid> [--gc | --profile [--seconds N]]` — signal a running Zap
 /// process to print its runtime diagnostics (ticket #77/#78, D-0058). Sends
-/// SIGQUIT (goroutine stacks + runtime/scheduler summary) by default, SIGUSR1
+/// SIGQUIT (coroutine stacks + runtime/scheduler summary) by default, SIGUSR1
 /// (force GC + memory stats) with `--gc`, or — with `--profile` — SIGUSR2 to
 /// start CPU profiling, waits `seconds`, then SIGUSR2 again to stop and flush
 /// the folded profile. The diagnostics/profile appear on the TARGET process's
@@ -663,7 +663,7 @@ fn cmd_inspect(pid: &str, gc: bool, profile: bool, seconds: u64) -> ExitCode {
         let what = if gc {
             "GC + memory stats"
         } else {
-            "goroutine stacks + runtime dump"
+            "coroutine stacks + runtime dump"
         };
         match send_signal(pid, signame) {
             Ok(true) => {
@@ -799,7 +799,7 @@ agent interface:
                         a token-efficient code graph, and targeted tests (stdio)
 
 diagnostics:
-  inspect <pid>         signal a running Zap process to dump goroutine stacks +
+  inspect <pid>         signal a running Zap process to dump coroutine stacks +
                         a runtime/scheduler summary to its stderr (D-0058)
           --gc          force a GC and print memory stats instead (SIGUSR1)
           --profile     CPU-profile it (SIGUSR2 start/stop), writing a folded

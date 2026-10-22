@@ -22,7 +22,7 @@ fn lower(
 
 /// Build a `MemStats` value struct from the runtime GC/scheduler getters
 /// (ticket #77). Field order matches the prelude's `MemStats`:
-/// `heap_bytes, live_bytes, free_bytes, gc_count, goroutines`.
+/// `heap_bytes, live_bytes, free_bytes, gc_count, coroutines`.
 fn lower_gc_stats(lowerer: &mut FnLower) -> Result<(Value, Ty), LowerError> {
     let sid = *lowerer
         .ctx
@@ -34,7 +34,7 @@ fn lower_gc_stats(lowerer: &mut FnLower) -> Result<(Value, Ty), LowerError> {
         "zap_gc_live_bytes",
         "zap_gc_free_bytes",
         "zap_gc_count",
-        "zap_runtime_num_goroutines",
+        "zap_runtime_num_coroutines",
     ];
     let dest = lowerer.new_value(Ty::Struct(sid));
     lowerer.emit(Inst::StructNew { dest, sid });

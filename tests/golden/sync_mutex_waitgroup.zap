@@ -1,4 +1,4 @@
-# Golden fixture: a Mutex under real goroutine contention, joined by a
+# Golden fixture: a Mutex under real coroutine contention, joined by a
 # WaitGroup (ticket #103, D-0032). Four workers each push `iters` elements onto
 # one shared deque, serialized by a shared Mutex (deque ops are not internally
 # synchronized, so the lock is what keeps the concurrent appends from racing).

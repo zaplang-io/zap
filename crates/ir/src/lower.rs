@@ -1496,7 +1496,7 @@ impl DecoratorPlan {
                 }
                 ast::Item::Function(f) => {
                     // `@on_signal(Signal.X)` (ticket #77): register `f` as a
-                    // handler for signal X; a detached receiver goroutine runs it
+                    // handler for signal X; a detached receiver coroutine runs it
                     // on each delivery. Other function decorators remain deferred.
                     for d in &f.decorators {
                         if d.name == "on_signal" {
@@ -2877,7 +2877,7 @@ fn lower_fn(
             args: vec![],
         });
         // `@on_signal(Signal.X)` handler registrations (ticket #77): each spawns
-        // a detached receiver goroutine over `signal.notify(X)` that invokes the
+        // a detached receiver coroutine over `signal.notify(X)` that invokes the
         // decorated function on every delivery. Emitted at the top of `main`.
         b.emit_on_signal_registrations(on_signal_meta);
         // `main` installs an implicit top-level landing pad so an exception that
@@ -3636,7 +3636,7 @@ impl<'a> FnLower<'a> {
 
     /// Emit `zap_signal_on(signo, &handler)` for every `@on_signal(Signal.X)`
     /// handler (ticket #77). Called once at the top of `main`. The runtime
-    /// subscribes to the signal and spawns a detached goroutine that invokes the
+    /// subscribes to the signal and spawns a detached coroutine that invokes the
     /// handler on each delivery (so it runs in full Zap context).
     fn emit_on_signal_registrations(&mut self, meta: &[(i64, String)]) {
         for (signo, fn_name) in meta {
@@ -4128,7 +4128,7 @@ impl<'a> FnLower<'a> {
             let (v, vt) = self.expr(&a.value)?;
             let target = *ptys.get(i).unwrap_or(&vt);
             let v = self.coerce(v, vt, target);
-            // A value struct captured by a goroutine is copied (D-0051) so it
+            // A value struct captured by a coroutine is copied (D-0051) so it
             // safely outlives the spawning frame. A non-inline value struct is
             // deep-copied here (heap). An inline-eligible aggregate is copied by
             // value into the GC-allocated spawn closure (codegen stores the

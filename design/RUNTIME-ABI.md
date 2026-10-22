@@ -217,8 +217,8 @@ void  zap_eh_end_catch(void);       // balance a begin_catch when leaving a hand
 void  zap_uncaught(void* exc);      // top-level handler: report + exit non-zero
 
 // Netpoller (#80, design/0005 "Blocking syscalls"): non-blocking I/O readiness
-// for the M:N scheduler. A goroutine that would block on a not-yet-ready fd
-// registers it and PARKS its G (freeing its M to run other goroutines) instead
+// for the M:N scheduler. A coroutine that would block on a not-yet-ready fd
+// registers it and PARKS its G (freeing its M to run other coroutines) instead
 // of blocking the OS thread; a poller thread re-queues the G on readiness. These
 // are the INTERNAL surface the stdlib calls — no language I/O exists yet
 // (sockets #79, signals #77). `mode` is 1=read / 2=write; `wait` returns
@@ -235,7 +235,7 @@ void    zap_netpoll_close(void* pd);                      // deregister + releas
 // NETPOLLER; the signal thread parks on the netpoller and dispatches in normal
 // context — fan-out to notify channels (cap-1, coalescing), arm cancel_on
 // scopes, or run a default diagnostic handler. `zap_signal_init()` runs at the
-// top of `main` and installs the default handlers (SIGQUIT -> goroutine stacks
+// top of `main` and installs the default handlers (SIGQUIT -> coroutine stacks
 // + runtime dump; SIGUSR1 -> force GC + memory stats), unless the runtime is
 // built -DZAP_NO_DEFAULT_SIGNALS. Catchable signals only; FAULT signals
 // (SIGSEGV/SIGFPE/SIGBUS/SIGILL) go to a crash handler (on a sigaltstack) that
@@ -255,8 +255,8 @@ int64_t zap_gc_count(void);                               // collections run so 
 int64_t zap_gc_heap_bytes(void);
 int64_t zap_gc_live_bytes(void);
 int64_t zap_gc_free_bytes(void);
-void    zap_runtime_goroutine_dump(void);                 // stacks + scheduler summary -> stderr
-int64_t zap_runtime_num_goroutines(void);
+void    zap_runtime_coroutine_dump(void);                 // stacks + scheduler summary -> stderr
+int64_t zap_runtime_num_coroutines(void);
 
 // Scheduler controls (ticket #172). The parallelism knob is `MAXPROCS` (env var
 // + this runtime call; no `ZAP_` prefix). LockOSThread pins the calling

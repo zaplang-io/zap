@@ -10,7 +10,7 @@
 //!
 //! Blocking operations (`lock` on a contended mutex, `wait`, `once_begin` while
 //! another caller is initializing) park the coroutine on the scheduler rather
-//! than the OS thread — the runtime builds them on the shared `gopark`/`goready`
+//! than the OS thread — the runtime builds them on the shared `copark`/`coready`
 //! primitive (see the `sync` section of `zaprt.c`).
 //!
 //! `Atomic[T]` (I#176, D-0066) is a sibling `sync` primitive but is NOT part of

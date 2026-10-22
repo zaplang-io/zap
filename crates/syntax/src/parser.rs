@@ -79,7 +79,7 @@ value struct MemStats:
     int64 live_bytes
     int64 free_bytes
     int64 gc_count
-    int64 goroutines
+    int64 coroutines
 
 value struct DateTime:
     int64 year

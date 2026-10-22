@@ -73,13 +73,13 @@ What the language/stdlib already provide (all landed) and the design builds on:
   under Dependencies.
 - **`net` / `http`** (I#104) + **`tls`** (I#147) on the **netpoller** (I#80):
   `http.get/post/request` now do `https://` with certificate + hostname
-  verification ON by default, over the M:N goroutine scheduler.
+  verification ON by default, over the M:N coroutine scheduler.
   Client currently sends `Connection: close` and reads to EOF — **keep-alive /
   connection pooling is deferred** (noted under Dependencies).
 - **`datetime`** (I#99): UTC `DateTime` value struct with fields year..second —
   enough to format the SigV4 `X-Amz-Date` (`YYYYMMDD'T'HHMMSS'Z'`) and credential-
   scope date (`YYYYMMDD`).
-- **Goroutines / structured concurrency** (I#15/I#50) and the **package manager +
+- **Coroutines / structured concurrency** (I#15/I#50) and the **package manager +
   zenv** (I#69) for distribution.
 
 What is **staged, not landed**, and therefore shapes the recommendation:
@@ -299,7 +299,7 @@ file-static + IMDSv2 + container (STS/SSO/web-identity deferred with the `xml`/
 
 - **Transport:** HTTPS over `http` + `tls` on the netpoller (verify ON).
   Each service call parks on the netpoller; many calls run concurrently as
-  goroutines.
+  coroutines.
 - **Connection reuse:** `http` v1 sends `Connection: close` and reads to EOF —
   **no keep-alive/pooling yet**.
   v1 SDK is correct but one-request-per-connection; connection pooling is a
@@ -310,7 +310,7 @@ file-static + IMDSv2 + container (STS/SSO/web-identity deferred with the `xml`/
   clock-skew correction on signing errors.
   **Deferred:** adaptive mode and the client-side retry-quota token bucket.
 
-*Recommendation (X):* http+tls+netpoller transport, goroutine concurrency,
+*Recommendation (X):* http+tls+netpoller transport, coroutine concurrency,
 standard-mode backoff+jitter in v1; pooling + adaptive retries fast-follow.
 
 ### 7. Ergonomics boto3 users expect (fork Erg)
@@ -489,7 +489,7 @@ injected throttles; presign URL vector.
   codec hooks.
 - **A — auth:** SigV4 v1 (SigV4A deferred); credential chain = env + shared-file-
   static + IMDSv2 + container (STS/SSO/web-identity deferred).
-- **X — transport/retry:** http+tls+netpoller + goroutines; standard-mode
+- **X — transport/retry:** http+tls+netpoller + coroutines; standard-mode
   backoff+jitter v1; pooling + adaptive deferred.
 - **Erg:** paginators + presign + per-op types + stopgap errors v1; waiters
   deferred.

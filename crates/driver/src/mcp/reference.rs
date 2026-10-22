@@ -100,7 +100,7 @@ pub static DOCS: &[Doc] = &[
     ),
     doc!(
         "design-concurrency",
-        "Design: concurrency (goroutines/channels/scope)",
+        "Design: concurrency (coroutines/channels/scope)",
         "reference",
         "text/markdown",
         "design/0005-concurrency.md"
@@ -198,11 +198,11 @@ pub static DOCS: &[Doc] = &[
         "tests/golden/decorators.zap"
     ),
     doc!(
-        "ex-goroutines",
-        "Example: goroutines & channels",
+        "ex-coroutines",
+        "Example: coroutines & channels",
         "example",
         "text/x-zap",
-        "tests/golden/goroutines.zap"
+        "tests/golden/coroutines.zap"
     ),
     doc!(
         "ex-scope",

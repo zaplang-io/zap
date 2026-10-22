@@ -15,7 +15,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "gc", "collect", args, 0, span);
             Some(Ty::Unit)
         }
-        // gc.stats() -> MemStats: heap/live/free bytes, GC count, #goroutines.
+        // gc.stats() -> MemStats: heap/live/free bytes, GC count, #coroutines.
         "stats" => {
             expect_argc(checker, "gc", "stats", args, 0, span);
             Some(Ty::Named("MemStats".to_string()))

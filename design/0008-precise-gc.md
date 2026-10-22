@@ -31,7 +31,7 @@ collector. Three properties it provides for free must be rebuilt precisely:
    `GC_MALLOC(size)`; there is **no type-descriptor header on objects today**
    (user structs are allocated headerless and field offsets start at 0 — the
    "one-word header" in RUNTIME-ABI.md is forward-looking, not yet emitted).
-2. **Parked-coroutine roots (0005 §"Green-thread stacks").** Each goroutine `G`
+2. **Parked-coroutine roots (0005 §"Green-thread stacks").** Each coroutine `G`
    gets a `GC_malloc`'d green stack and an in-`G` saved `ucontext_t`; because
    both are ordinary traced heap, a *suspended* G's live pointers are retained
    as heap, and every live G is also held in a static-rooted `g_all[]`. A parked
@@ -244,7 +244,7 @@ safepoint poll is emitted under the precise collector. Scheduler preemption now
 reuses it exactly as this fork anticipated: the async-preemption monitor sets a
 per-M `preempt` flag (and sends `SIGURG`), and `zap_safepoint` — already the one
 GC-safe point where the shadow chain is consistent — yields the coroutine there
-(`gopreempt`) when the flag is set and no collection is pending. The precise
+(`copreempt`) when the flag is set and no collection is pending. The precise
 collector thus gets both GC safepoints and CPU-fairness preemption from one poll,
 with no extra per-iteration cost. Under the conservative Boehm build there is no
 such poll; the `SIGURG` handler switches the coroutine off its M directly, which

@@ -62,7 +62,7 @@ So native CFI unwinding of compiled Zap frames is available and proven.
 
 **Coroutine identity and liveness.**
 `G.all_idx` is a stable per-coroutine id; the statically-rooted `g_all[]`
-registry and `zap_runtime_num_goroutines()` enumerate live coroutines;
+registry and `zap_runtime_num_coroutines()` enumerate live coroutines;
 `M.current` is the on-CPU coroutine of a worker.
 
 **GC (I#48 precise Immix, default; I#120 moving).**

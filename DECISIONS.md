@@ -374,7 +374,7 @@ Adopt Python's lexical conventions throughout:
 **Status:** Locked
 Codegen lowers the type-checked AST to native code via **LLVM**, using the
 `inkwell` safe wrapper (reaffirms D-0009; chosen over Cranelift and C-emit
-because Zap's committed features — unwinding exceptions D-0007, goroutines
+because Zap's committed features — unwinding exceptions D-0007, coroutines
 D-0008, SIMD arrays D-0011 — all reward LLVM, which the lighter backends do not).
 Codegen lives in `crates/codegen` behind a small `Backend` trait so it stays
 swappable; for the vertical slice the AST lowers directly to LLVM IR (a separate
@@ -802,9 +802,9 @@ accurate.
 
 **Imports** are whole-module with flat names (`import datetime` → `datetime.now()`);
 Zap deliberately has **no `from X import Y`**. The **concurrency model**
-(goroutines/channels/`scope`/`sync`) **replaces** Python's
+(coroutines/channels/`scope`/`sync`) **replaces** Python's
 `threading`/`multiprocessing`/`asyncio`/`queue` — no such modules (no GIL, so
-goroutines give real parallelism). **Python interop (#27) is a rare relief valve**
+coroutines give real parallelism). **Python interop (#27) is a rare relief valve**
 for libraries like NumPy/PyTorch, not an everyday-stdlib crutch.
 
 **Deferred:** `stats` (statistics), TLS (late-v1), `tar`/`zip` archives, profiling
@@ -830,7 +830,7 @@ built-in heap is rare and genuinely useful — a small differentiator.
 First-class Unix signal handling, built on the concurrency runtime.
 - **Mechanism:** scheduler threads mask signals; a dedicated signal thread's
   async-signal-safe handler writes a **self-pipe registered with the netpoller**,
-  and a dispatcher goroutine delivers in normal context. The capability ships in
+  and a dispatcher coroutine delivers in normal context. The capability ships in
   every binary; there is **no global channel** — it wires up **lazily per
   subscription** (zero-cost when unused, apart from the default handlers below).
 - **Surface:** `signal.notify(SIG…) -> channel[Signal]` (primitive);
@@ -845,15 +845,15 @@ First-class Unix signal handling, built on the concurrency runtime.
   enum; `SIGKILL`/`SIGSTOP` excluded).
 - **Fault signals** (`SIGSEGV`/`SIGFPE`/`SIGBUS`/`SIGILL`): **not** via `notify` —
   a runtime crash handler prints diagnostics (faulting address/location,
-  backtrace, offending goroutine) before terminating, for debugging.
+  backtrace, offending coroutine) before terminating, for debugging.
 - **Default diagnostic handlers** (ON by default, **opt-out at build time**,
   **user-overridable** — a user `notify`/`@on_signal` for that signal wins):
-  `SIGQUIT` → dump goroutine stacks + scheduler/runtime summary; `SIGUSR1` →
-  force GC + print memory stats (heap/live/free bytes, GC count, #goroutines) via
+  `SIGQUIT` → dump coroutine stacks + scheduler/runtime summary; `SIGUSR1` →
+  force GC + print memory stats (heap/live/free bytes, GC count, #coroutines) via
   Boehm `GC_gcollect`/`GC_get_*`; `SIGUSR2` → toggle the CPU profiler
   (**implemented**, ticket #78, `design/0014-profiling.md`).
 - **Programmatic access:** a `gc`/`runtime` stdlib module — `gc.collect()`,
-  `gc.stats() -> MemStats`, `runtime.goroutine_dump()` — the signals are just the
+  `gc.stats() -> MemStats`, `runtime.coroutine_dump()` — the signals are just the
   zero-code operator path to these.
 - **Diagnostic utility:** ship a small tool (a `zap` subcommand, e.g. `zap
   inspect <pid>`) that triggers the stack-dump / GC-stats / (later) profiling of a
@@ -948,7 +948,7 @@ ecosystem clients #109. On the #121 module seam (per-crate `modules/{net,http}.r
 + one registry line each + a `zaprt.c` banner section).
 
 - **Netpoller-first I/O.** Every socket operation is non-blocking and, on a
-  would-block, PARKS the goroutine via `zap_netpoll_wait` (#80) — freeing its
+  would-block, PARKS the coroutine via `zap_netpoll_wait` (#80) — freeing its
   worker M — instead of blocking an OS thread or busy-polling. A descriptor is
   registered once per socket (edge-triggered R+W) at create time. `getaddrinfo`
   (DNS) and the no-netpoller fallback `poll()` are bracketed by
@@ -967,7 +967,7 @@ ecosystem clients #109. On the #121 module seam (per-crate `modules/{net,http}.r
   `status`/`body`/`header`; `url(host,port,path)` builds a URL (there is no
   int→str conversion yet). `http` server: `read_request` →
   `method`/`path`/`req_header`/`req_body`, and `respond(conn,status,body)`. The
-  server's accept loop and per-connection goroutines are written in Zap
+  server's accept loop and per-connection coroutines are written in Zap
   (`spawn handle(conn)`; `bytes` is a valid parameter type), so concurrent
   connections ride the scheduler.
 - **No grammar change:** the whole surface is generic module calls (existing EBNF).
@@ -1005,7 +1005,7 @@ the #121 module seam (per-crate `modules/tls.rs` + one registry line each + a
   so no version `#ifdef` is needed. (The test-only self-signed server cert is
   generated with the 3.0 `EVP_RSA_gen`/`X509_*` API — the CI target — not shipped.)
 - **Netpoller-first, like D-0061.** The fd is non-blocking; `SSL_connect`/
-  `SSL_read`/`SSL_write` returning `WANT_READ`/`WANT_WRITE` PARK the goroutine via
+  `SSL_read`/`SSL_write` returning `WANT_READ`/`WANT_WRITE` PARK the coroutine via
   `zap_sock_park` (`zap_netpoll_wait`), freeing the M — never a blocked OS thread
   or busy-poll. Same GC discipline: fd/pd/`SSL*` are extracted to C locals (the
   `SSL*`/`SSL_CTX*` are OpenSSL-heap, not GC), payloads copied to `malloc` scratch,

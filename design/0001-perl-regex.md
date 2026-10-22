@@ -94,7 +94,7 @@ name ~= s/^\s+|\s+$//g              # trim in place (shorthand)
   GC and avoid aliasing surprises; the `~=` shorthand recovers one-line
   ergonomics for the common mutate-this-variable case.
 - **Why a returned match object and no magic globals:** Zap uses an M:N
-  goroutine scheduler (D-0008). A goroutine can migrate between OS threads, so a
+  coroutine scheduler (D-0008). A coroutine can migrate between OS threads, so a
   thread-local "last match" is unstable, and any shared match state invites data
   races. A returned value bound to a local is **coroutine-safe by
   construction** — there is simply no shared match state to coordinate. This is

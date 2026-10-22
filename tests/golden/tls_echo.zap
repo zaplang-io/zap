@@ -5,9 +5,9 @@
 # scaffold). Main is the real TLS *client*: it connects with verification
 # DISABLED (the self-signed cert has no trust anchor), sends one encrypted line
 # and prints the decrypted echo. The handshake and the send/recv all ride the
-# netpoller — each WANT_READ / WANT_WRITE parks the goroutine and frees its M —
+# netpoller — each WANT_READ / WANT_WRITE parks the coroutine and frees its M —
 # so the exchange is deterministic no matter how the scheduler interleaves the
-# client and the server goroutine, under both collectors.
+# client and the server coroutine, under both collectors.
 #
 # `connect_insecure` is the explicit, loudly-named opt-out from verification;
 # the default `tls.connect` (verification ON) rejecting this same self-signed

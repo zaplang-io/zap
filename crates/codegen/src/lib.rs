@@ -151,7 +151,7 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         // LibreSSL ships on macOS. `-lssl` depends on `-lcrypto`, so that order.
         .arg("-lssl")
         .arg("-lcrypto")
-        // `-lpthread` backs the goroutine runtime (ticket #25): each `spawn`
+        // `-lpthread` backs the coroutine runtime (ticket #25): each `spawn`
         // starts a GC-registered pthread, and channels block on pthread
         // mutex/condvars. `libgc` must be thread-aware (the runtime defines
         // `GC_THREADS` and uses `GC_pthread_create`); the dev container's
@@ -698,7 +698,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_py_str", &[p.into()], Some(p.into()));
 
         // Concurrency entry points (ticket #25, D-0013/D-0031,
-        // design/0005-concurrency.md). Goroutines are backed by GC-registered OS
+        // design/0005-concurrency.md). Coroutines are backed by GC-registered OS
         // threads (`zap_spawn` takes a trampoline `ptr(ptr)` and its closure
         // `ptr`), joined by the implicit root scope at program exit
         // (`zap_rt_join_all`, emitted at `main`'s return). Channels store uniform
@@ -1250,7 +1250,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 // the end of the block. A block may contain several calls, each an
                 // interior GC safepoint; a heap pointer defined by one call must
                 // already be in its shadow-frame slot before a *later* same-block
-                // call can trigger a cross-goroutine collection, or that object is
+                // call can trigger a cross-coroutine collection, or that object is
                 // unrooted and can be reclaimed out from under us (I#167).
                 #[cfg(feature = "gc-immix")]
                 if let Some(d) = inst_dest(inst) {
@@ -2560,7 +2560,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let thunk = self
             .module
             .add_function(&name, ptr.fn_type(&[ptr.into()], false), None);
-        // The thunk is each goroutine's base frame (ticket #47,
+        // The thunk is each coroutine's base frame (ticket #47,
         // design/0005-concurrency.md "Interaction with exception unwinding"):
         // unwinding must stop here, not run off the green stack into the
         // makecontext bootstrap. So the call to the target is an `invoke` with a
@@ -2570,7 +2570,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // failure on the scope (which re-raises it — possibly as an aggregate
         // `ExceptionGroup` — at its dedent) and returns here so the coroutine ends
         // cleanly; a root/detached coroutine aborts the program with the message
-        // (exit 1), exactly as `zap_uncaught` did before. In-goroutine `try/except`
+        // (exit 1), exactly as `zap_uncaught` did before. In-coroutine `try/except`
         // is unaffected (it unwinds through normal CFI on the green stack); this
         // only catches what reaches the top. Requires the Itanium personality + an
         // unwind table.
@@ -2601,7 +2601,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let pad = self.ctx.append_basic_block(thunk, "unwind");
         b.build_invoke(target, &call_args, cont, pad, "")
             .map_err(|e| e.to_string())?;
-        // Normal path: the goroutine returned; hand `null` back to `zap_spawn`.
+        // Normal path: the coroutine returned; hand `null` back to `zap_spawn`.
         b.position_at_end(cont);
         b.build_return(Some(&ptr.const_null()))
             .map_err(|e| e.to_string())?;

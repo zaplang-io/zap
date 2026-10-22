@@ -1,6 +1,6 @@
 # Golden fixture: M:N work-stealing scheduler stress (ticket #47, D-0008).
 #
-# Spawns far more goroutines than there are worker threads (M), so the program
+# Spawns far more coroutines than there are worker threads (M), so the program
 # only produces the right answer if the Gs really multiplex over the Ms via the
 # user-space scheduler (parking a blocked G and freeing its M). Both totals are
 # order-independent, so the output is deterministic no matter how the scheduler
@@ -10,7 +10,7 @@ def sender(channel[int64] ch, int64 v):
     ch <- v
 
 def main():
-    # 200 goroutines each send their index over an unbuffered channel. Every
+    # 200 coroutines each send their index over an unbuffered channel. Every
     # send rendezvouses with a receive in `main`; the sum 0+1+...+199 = 19900 is
     # independent of the order the sends are serviced. With fewer Ms than Gs,
     # most senders park on the channel and are resumed as `main` receives.
