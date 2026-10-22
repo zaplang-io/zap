@@ -8,10 +8,56 @@
  * stack, registers and globals, so no stack maps or safepoints are needed. The
  * type-descriptor header from the ABI is added when reflection / precise GC
  * land. */
+/* ===========================================================================
+ * Platform detection (ticket #199, platform epic #158 / Area A5). The runtime
+ * is POSIX/Linux-x86_64 today; Windows support is being built out across the
+ * Area-A sub-tickets. This block classifies the target and, on Windows, fails
+ * the compile with an authoritative, up-to-date map of the remaining gaps so
+ * the port is never *silently* broken — the A5 toolchain (this ticket) wires
+ * the build/link path and the A1 context-switch seam below, but the runtime
+ * itself cannot fully compile for Windows until A1/A2/A3/A4 land.
+ *
+ * Note: this `zaprt.c` is compiled by `cc`/MinGW only at *program link* time
+ * (see build_executable in lib.rs); it is NOT compiled by `cargo build` of the
+ * compiler crates, so the Windows CI job (host-side `cargo build`) is green
+ * while this gate stands. The gate bites a developer who tries to link a Zap
+ * *program* on Windows — exactly the A1/A3 gap — and points them at the work. */
+#if defined(_WIN32)
+#define ZAP_PLATFORM_WINDOWS 1
+#else
+#define ZAP_PLATFORM_POSIX 1
+#endif
+
+#if defined(ZAP_PLATFORM_WINDOWS)
+#error "Zap: the C runtime (zaprt.c) does not yet compile/link for Windows.\n\
+The A5 build/link toolchain (I#199) is wired (target-aware link flags in\n\
+crates/codegen/src/lib.rs, MinGW-w64 libs, a non-blocking windows CI job), and\n\
+the A1 coroutine context-switch SEAM (zap_ctx_swap/zap_ctx_make) is in place\n\
+below with a Windows placeholder — but these POSIX subsystems still need a\n\
+Windows backend before a Zap program can link and run on Windows:\n\
+  * A1 (I#195): coroutine context switch. Replace the ucontext impl behind the\n\
+    zap_ctx_swap/zap_ctx_make seam with the hand-written x86_64 asm backend\n\
+    from design/0017-windows-coroutine-context-switch.md (the Windows arm of\n\
+    the seam below is the drop-in point).\n\
+  * A3 (I#197): signals / preemption / faults. No sigaction/SIGURG/sigaltstack/\n\
+    pthread_sigmask/self-pipe/backtrace_symbols on Windows — needs\n\
+    SuspendThread/GetThreadContext/QueueUserAPC preemption, a vectored/SEH\n\
+    fault handler + dbghelp StackWalk64, console control handlers, and the\n\
+    Itanium __cxa_* -> SEH exception-personality swap (A5 unwinder slice).\n\
+  * A2 (I#196): netpoller. epoll/eventfd -> IOCP; the np_backend_* seam already\n\
+    returns 'unsupported' on non-Linux, so this is additive, not a compile wall.\n\
+  * A4 (I#198): path/process/fs/env + getentropy (-> BCryptGenRandom) and the\n\
+    CPython embedding story (gated off for Windows v1 in build_executable).\n\
+See design/0016-platform-1.0.md (Area A) for the full sequencing (A5 -> A1 ->\n\
+A3 unwinder -> A2/A4)."
+#endif
+
 /* Python.h must precede the standard headers (it sets feature-test macros).
  * Embedding CPython backs the Python interop (ticket #27, D-0012); the compile
  * flags come from `pkg-config --cflags python3-embed` (see build_executable),
- * and the dev container / CI provide `python3-dev`. */
+ * and the dev container / CI provide `python3-dev`. (Windows v1 gates CPython
+ * off — see build_executable — so this is a POSIX-era dependency; the Windows
+ * gate above halts the compile before here regardless.) */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
@@ -55,8 +101,13 @@ static void GC_set_stackbottom(void *h, struct GC_stack_base *sb) {
 #include <stdint.h>
 /* ucontext (getcontext/makecontext/swapcontext) backs the M:N scheduler's
  * green-thread context switch (ticket #47). Validated on Linux x86_64 and
- * aarch64 (CI, ticket #204); see the scheduler block below for the arch note. */
+ * aarch64 (CI, ticket #204); see the scheduler block below for the arch note.
+ * POSIX-only: Windows has no ucontext — the A1 context-switch seam
+ * (zap_ctx_swap/zap_ctx_make, defined just before the scheduler section) wraps
+ * it here and is replaced by a hand-written asm backend on Windows (I#195). */
+#if defined(ZAP_PLATFORM_POSIX)
 #include <ucontext.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1834,6 +1885,59 @@ void *zap_py_str(void *obj_) {
  * and the `sync` module / `scope:` / `select` surface still pending from #25.
  * =========================================================================== */
 
+/* ===========================================================================
+ * A1 coroutine context-switch seam (ticket #195, platform epic #158 / Area A1;
+ * see design/0017-windows-coroutine-context-switch.md).
+ *
+ * The scheduler never calls ucontext directly: it goes through this thin seam
+ * so the one load-bearing POSIX dependency (stack switching) has a single, per-
+ * platform implementation.
+ *
+ *   zap_ctx_t                  an opaque saved execution context, stored inside
+ *                              the G (and the M's scheduler context). Scanned as
+ *                              heap under Boehm, exactly as the raw ucontext_t
+ *                              was, so the GC invariant is unchanged.
+ *   zap_ctx_make(c, stk, n, e) initialise *c to start executing e() on the n-byte
+ *                              stack buffer `stk` the first time it is swapped to
+ *                              (e must never return). Was getcontext+makecontext.
+ *   zap_ctx_swap(from, to)     save the current context into *from and resume
+ *                              *to. Was swapcontext.
+ *
+ * POSIX (Linux/macOS, x86_64 & aarch64): implemented as the existing ucontext
+ * calls behind the seam — a ZERO-behaviour-change refactor (the seam is the
+ * deliverable that unblocks Windows; swapping POSIX to asm for the per-switch
+ * sigprocmask win is an optional follow-up, I#195 step 5).
+ *
+ * Windows (x86_64): NOT YET IMPLEMENTED (I#195 / A1). A `zap_ctx_t` becomes a
+ * single saved stack pointer and zap_ctx_swap/zap_ctx_make are the hand-written
+ * asm context switch prototyped in design/0017-win-ctxswitch-spike/ (saves the
+ * Windows nonvolatile GPRs + XMM6-15 and swaps the TIB StackBase/StackLimit/
+ * DeallocationStack). The Windows platform gate at the top of this file halts
+ * the compile before here; the declarations below mark the exact drop-in seam
+ * so A1 lands as an added asm translation unit without touching the scheduler. */
+#if defined(ZAP_PLATFORM_POSIX)
+typedef ucontext_t zap_ctx_t;
+static void zap_ctx_make(zap_ctx_t *c, void *stack, size_t stack_size,
+                         void (*entry)(void)) {
+    getcontext(c);
+    c->uc_stack.ss_sp = stack;
+    c->uc_stack.ss_size = stack_size;
+    c->uc_link = NULL; /* bootstrap never returns */
+    makecontext(c, entry, 0);
+}
+static inline void zap_ctx_swap(zap_ctx_t *from, zap_ctx_t *to) {
+    swapcontext(from, to);
+}
+#else /* ZAP_PLATFORM_WINDOWS — A1 (I#195) drop-in point */
+typedef struct zap_ctx_t {
+    void *sp; /* single saved stack pointer; the register save-area lives on the
+               * coroutine's own (runtime-owned, Boehm-scanned) green stack */
+} zap_ctx_t;
+void zap_ctx_make(zap_ctx_t *c, void *stack, size_t stack_size,
+                  void (*entry)(void));
+void zap_ctx_swap(zap_ctx_t *from, zap_ctx_t *to);
+#endif
+
 /* Fixed green-thread stack size (design/0005: 64-256 KiB fixed, no growth in
  * v1). Overridable via ZAP_STACK_SIZE (KiB) for experimentation. */
 #define ZAP_STACK_DEFAULT (128 * 1024)
@@ -1842,7 +1946,8 @@ void *zap_py_str(void *obj_) {
 typedef enum { G_RUNNABLE, G_RUNNING, G_PARKED, G_DEAD } GState;
 
 typedef struct G {
-    ucontext_t ctx;    /* saved callee-saved regs + SP + IP (scanned as heap) */
+    zap_ctx_t ctx;     /* saved callee-saved regs + SP + IP (scanned as heap);
+                        * via the A1 seam (ucontext on POSIX, asm on Windows)  */
     void *stack;       /* GC_MALLOC'd green stack buffer (scanned as heap)     */
     size_t stack_size;
     struct GC_stack_base sb; /* cold end (high address) of this G's stack      */
@@ -1881,7 +1986,7 @@ typedef struct P {
 
 typedef struct M {
     pthread_t thread;
-    ucontext_t sched_ctx;       /* the scheduler loop's context (native stack) */
+    zap_ctx_t sched_ctx;        /* the scheduler loop's context (native stack) */
     struct GC_stack_base native_sb; /* this M's native stack cold end          */
     void *gc_handle;            /* GC thread handle for GC_set_stackbottom      */
     G *current;                 /* G running on this M, or NULL in scheduler    */
@@ -2178,7 +2283,7 @@ static void switch_to_g(M *m, G *g) {
      * flushed to g->shadow_head at a safepoint or here. */
     zap_shadow_head = g->shadow_head;
 #endif
-    swapcontext(&m->sched_ctx, &g->ctx);
+    zap_ctx_swap(&m->sched_ctx, &g->ctx);
 #ifdef ZAP_GC_IMMIX
     g->shadow_head = zap_shadow_head;
 #endif
@@ -2219,7 +2324,7 @@ static void g_bootstrap(void) {
     g_entry_fn(g);
     m = cur_m; /* may have migrated across parks */
     g->state = G_DEAD;
-    swapcontext(&g->ctx, &m->sched_ctx);
+    zap_ctx_swap(&g->ctx, &m->sched_ctx);
     /* unreachable */
 }
 
@@ -2313,11 +2418,7 @@ static G *galloc(void *fn, void *arg) {
     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
     /* Cold end of a down-growing stack is its high address. */
     g->sb.mem_base = (char *)g->stack + g->stack_size;
-    getcontext(&g->ctx);
-    g->ctx.uc_stack.ss_sp = g->stack;
-    g->ctx.uc_stack.ss_size = g->stack_size;
-    g->ctx.uc_link = NULL; /* bootstrap never returns */
-    makecontext(&g->ctx, g_bootstrap, 0);
+    zap_ctx_make(&g->ctx, g->stack, g->stack_size, g_bootstrap);
     all_add(g);
     return g;
 }
@@ -2875,7 +2976,7 @@ static void cosched(void) {
      * (it holds no lock at a cooperative yield), so reset the depth before we
      * switch out rather than leak it to whatever coroutine runs next. */
     g->no_preempt = 0;
-    swapcontext(&g->ctx, &m->sched_ctx);
+    zap_ctx_swap(&g->ctx, &m->sched_ctx);
 }
 
 /* Preemptive yield (ticket #172): like `cosched`, but asks the scheduler to
@@ -2900,7 +3001,7 @@ static void copreempt(void) {
     g->state = G_RUNNABLE;
     g->preempt_requeue = 1;
     g->no_preempt = 0;
-    swapcontext(&g->ctx, &m->sched_ctx);
+    zap_ctx_swap(&g->ctx, &m->sched_ctx);
 }
 
 /* Is the current coroutine's owning scope cancelled? (0 on a native thread or an
@@ -3181,7 +3282,7 @@ static void copark(pthread_mutex_t *mu, Waiter *w) {
          * scheduler releases `mu` on our behalf, so clear the no-preempt depth
          * (ticket #172) rather than carry it past the switch. */
         g->no_preempt = 0;
-        swapcontext(&g->ctx, &m->sched_ctx);
+        zap_ctx_swap(&g->ctx, &m->sched_ctx);
         /* Resumed (possibly on a different M); `mu` already released. */
     } else {
         w->g = NULL;
