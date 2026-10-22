@@ -121,6 +121,16 @@ const RUNTIME_CTX_WIN_C: &str = include_str!("zap_ctx_win_x64.c");
 /// `zaprt.c`, so this is added to the link on Windows only.
 const RUNTIME_WIN_A3_C: &str = include_str!("zap_win_a3.c");
 
+/// The Windows IOCP netpoller backend (ticket #196 / A2): the AFD-readiness-over-
+/// IOCP mechanism that implements the `np_backend_*` seam on Windows (see
+/// design/0020). A separate translation unit — like the A1 context switch and A3
+/// primitives — so it links into the Windows program build AND compiles standalone
+/// in the on-Windows verification harness (`zap_np_iocp_test.c`). POSIX uses epoll
+/// inline in `zaprt.c`, so this is added to the link on Windows only. Its header is
+/// `#include`d by `zaprt.c`'s Windows arm, so it is written alongside the runtime.
+const RUNTIME_NP_IOCP_C: &str = include_str!("zap_np_iocp.c");
+const RUNTIME_NP_IOCP_H: &str = include_str!("zap_np_iocp.h");
+
 pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), String> {
     let obj_path = out_path.with_extension("o");
     LlvmBackend.compile_object(module, &obj_path)?;
@@ -215,6 +225,19 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         std::fs::write(&a3_path, RUNTIME_WIN_A3_C)
             .map_err(|e| format!("failed to write a3 runtime: {e}"))?;
         cmd.arg(&a3_path);
+        // A2 IOCP netpoller backend (ticket #196): the AFD-readiness-over-IOCP
+        // mechanism behind the np_backend_* seam. Its header is written alongside
+        // `zaprt.c` so the Windows arm's `#include "zap_np_iocp.h"` resolves; the
+        // `.c` is added to the link. Like the A1/A3 files it is a drop-in TU, dead
+        // in the link until `zaprt.c` itself compiles on Windows (still gated on
+        // A4/#198). The `-lws2_32` the Winsock calls need is already on the link
+        // line above.
+        std::fs::write(build_dir.join("zap_np_iocp.h"), RUNTIME_NP_IOCP_H)
+            .map_err(|e| format!("failed to write iocp header: {e}"))?;
+        let iocp_path = build_dir.join("zap_np_iocp.c");
+        std::fs::write(&iocp_path, RUNTIME_NP_IOCP_C)
+            .map_err(|e| format!("failed to write iocp runtime: {e}"))?;
+        cmd.arg(&iocp_path);
         // Windows (MinGW-w64 / `x86_64-pc-windows-gnu`) extras, ticket #199:
         //   * No `-rdynamic`: it is an ELF/dynamic-symbol-table flag; PE/COFF has
         //     no equivalent and the profiler/fault symbolication path it serves

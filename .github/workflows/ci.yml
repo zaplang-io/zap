@@ -186,7 +186,7 @@ jobs:
   # Windows coroutine context switch (ticket #195, platform epic #158 / Area A1).
   # REQUIRED (no `continue-on-error`): unlike the broader `windows` job below —
   # which stays non-blocking because a full Zap *program* cannot link on Windows
-  # until A3 (#197, exceptions/SEH) and A2/A4 land — the A1 context switch itself
+  # until A4 (#198, fs/process/sockets) lands — the A1 context switch itself
   # is complete and verifiable TODAY, in isolation from the unported subsystems.
   # This job builds and runs the standalone verification harness
   # (`crates/codegen/src/zap_ctx_win_x64_test.c`, which pulls in the shipping asm
@@ -293,13 +293,63 @@ jobs:
           g++ -O2 -Wall zap_win_a3_test.cc -ldbghelp -o a3test.exe
           ./a3test.exe
 
+  # Windows IOCP netpoller backend (ticket #196, platform epic #158 / Area A2).
+  # REQUIRED (no `continue-on-error`), same rationale as `windows-ctxswitch` /
+  # `windows-a3`: a full Zap *program* cannot link on Windows until A4 (#198) also
+  # compiles (zaprt.c is one translation unit), but the A2 MECHANISM is complete and
+  # verifiable TODAY in isolation. This job builds and runs the standalone harness
+  # (`zap_np_iocp_test.c`, which links the shipping backend `zap_np_iocp.c`) on a
+  # native windows-latest runner under MinGW-w64 and asserts, over a raw-Winsock
+  # loopback socket pair (NOT the Zap net module — A4 is out of A2 scope):
+  #   T1. an armed AFD READ poll times out while the socket is not readable and
+  #       completes (right userkey + readable) once the peer sends — the
+  #       IOCP-completion -> readiness bridge the design rests on.
+  #   T2. the park/wake round-trip: a waiter parked on a condvar is woken by a
+  #       completion the real zap_iocp_wait poller loop delivers (the copark/coready
+  #       analogue).
+  #   T3. the PostQueuedCompletionStatus kick (`zap_iocp_kick`) promptly unblocks a
+  #       poller parked in zap_iocp_wait (the eventfd/self-pipe-kick equivalent).
+  #   T4. tearing down a descriptor with an in-flight poll (CancelIoEx) and reaping
+  #       the cancelled completion does not leak or crash.
+  # The precise gc-immix collector is not exercised here (its heap needs the
+  # mmap->VirtualAlloc port); the netpoller is collector-agnostic and its full
+  # copark/coready + latch + deadline logic is proven behavior-neutral by the
+  # `netpoller.zap` golden on the required Linux/ARM jobs under both collectors.
+  windows-netpoller:
+    name: "Windows IOCP netpoller (I#196 / A2)"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # MinGW-w64 gcc only: the harness needs Winsock (`-lws2_32`, preinstalled)
+      # and resolves the ntdll AFD entry points at runtime (no `-lntdll`). The
+      # thread-aware Boehm GC is not needed here — the harness uses Win32 threads
+      # and the netpoller allocates no GC memory (the GC-ownership invariant is
+      # A1's job, covered by `windows-ctxswitch`).
+      - name: Set up MSYS2 / MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+
+      - name: A2 netpoller — AFD readiness, park/wake, kick, teardown
+        shell: msys2 {0}
+        run: |
+          set -eux
+          cd crates/codegen/src
+          gcc -O2 -Wall zap_np_iocp_test.c zap_np_iocp.c -lws2_32 -o nptest.exe
+          ./nptest.exe
+
   # Windows bring-up (ticket #199, platform epic #158 / Area A5). NON-BLOCKING by
   # design (`continue-on-error: true`): the Windows runtime port is incomplete —
-  # the A1 coroutine context switch (#195) and the A3 signals/preemption/faults +
-  # SEH exception mechanisms (#197) now land (see the required `windows-ctxswitch`
-  # and `windows-a3` jobs above), but the C runtime (`crates/codegen/src/
-  # zaprt.c`) is a single translation unit and still needs A2 (#196 netpoller) and
-  # A4 (#198 fs/process/random) to compile before a Zap *program* can link and run
+  # the A1 coroutine context switch (#195), the A3 signals/preemption/faults +
+  # SEH exception mechanisms (#197), and the A2 IOCP netpoller (#196) now land (see
+  # the required `windows-ctxswitch`, `windows-a3`, and `windows-netpoller` jobs
+  # above), but the C runtime (`crates/codegen/src/
+  # zaprt.c`) is a single translation unit and still needs A4 (#198
+  # fs/process/random/sockets) to compile before a Zap *program* can link and run
   # on Windows (the runtime's platform gate fails that compile with the exact gap
   # map). This job therefore
   # validates the stage that DOES pass today — the portable compiler front-end
@@ -307,10 +357,10 @@ jobs:
   # and records the MinGW-w64 link toolchain A5 targets. It reports progress
   # WITHOUT blocking merges; the Linux `host`/`full` and `arm64` jobs stay
   # required and unchanged. Promote this to a required full-codegen+link job once
-  # A2/A4 land. (Clippy/fmt stay on x86 — `host`/`full` already gate them and
+  # A4 lands. (Clippy/fmt stay on x86 — `host`/`full` already gate them and
   # they are target-independent, matching the `arm64` job.)
   windows:
-    name: "Windows (in progress, A2/A4 pending)"
+    name: "Windows (in progress, A4 pending)"
     runs-on: windows-latest
     continue-on-error: true
     steps:

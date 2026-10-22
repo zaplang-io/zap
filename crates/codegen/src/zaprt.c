@@ -31,32 +31,32 @@
 #if defined(ZAP_PLATFORM_WINDOWS)
 #error "Zap: the C runtime (zaprt.c) does not yet compile/link for Windows.\n\
 DONE: A5 build/link toolchain (I#199, target-aware link flags), A1 coroutine\n\
-context switch (I#195, zap_ctx_win_x64.c), and A3 (I#197) — the exception\n\
+context switch (I#195, zap_ctx_win_x64.c), A3 (I#197) — the exception\n\
 personality is now target-conditional in codegen (__gxx_personality_seh0; the\n\
 landingpad IR + __cxa_* glue are unchanged, MinGW-w64 SEH model) and the A3\n\
 signals/preemption/fault PRIMITIVES are implemented in zap_win_a3.c (hijack-based\n\
 preemption for gc-boehm, a last-chance SetUnhandledExceptionFilter + dbghelp\n\
-fault report, and SetConsoleCtrlHandler -> Signal-enum mapping), linked by\n\
-build_executable's Windows arm and verified on windows-latest by\n\
-zap_win_a3_test.cc (incl. SEH unwinding across a green stack and the Q5 STW x\n\
-SuspendThread stress). See design/0019-windows-signals-faults-seh-a3.md.\n\
+fault report, and SetConsoleCtrlHandler -> Signal-enum mapping; design/0019), and\n\
+A2 (I#196) — the netpoller's np_backend_* seam is implemented on IOCP via an\n\
+AFD-readiness adapter in zap_np_iocp.c (completion->readiness, no seam widening,\n\
+epoll path byte-for-byte unchanged), linked by build_executable's Windows arm and\n\
+verified on windows-latest by zap_np_iocp_test.c (AFD-poll readiness wake, the\n\
+park/wake round-trip, and the PostQueuedCompletionStatus kick). See\n\
+design/0020-windows-iocp-netpoller-a2.md.\n\
 \n\
 REMAINING before a Zap program links+runs on Windows (this TU is a single\n\
 compilation unit, so ALL must compile):\n\
-  * A2 (I#196): netpoller. epoll/eventfd -> IOCP; the np_backend_* seam already\n\
-    returns 'unsupported' on non-Linux, but <sys/epoll.h> is only #if __linux__.\n\
-    The #77 signal dispatch's self-pipe+netpoller park must also become the\n\
-    netpoller-free Windows path (console handler -> condvar; design/0019 §5).\n\
   * A4 (I#198): path/process/fs/env + getentropy (-> BCryptGenRandom) — the\n\
     fs/process (#97, <sys/stat.h>/<sys/wait.h>/spawn), crypto-random (#105,\n\
     <sys/random.h>) and socket (#104, <netinet/in.h>/<sys/socket.h>/<poll.h>)\n\
-    sections are still UNGUARDED POSIX includes = genuine compile walls. Plus the\n\
-    CPython embedding story (gated off for Windows v1 in build_executable).\n\
+    sections are still UNGUARDED POSIX includes = genuine compile walls. The A2\n\
+    netpoller is ready to drive Windows sockets the moment A4 guards those. Plus\n\
+    the CPython embedding story (gated off for Windows v1 in build_executable).\n\
   * immix on Windows: zapgc.inc.c uses <sys/mman.h>/mmap -> needs a VirtualAlloc\n\
     port (GC-track ticket). Windows v1 runs under gc-boehm; A3's boehm hijack is\n\
     the v1 preempt path, and the immix flag-at-safepoint path lights up for free\n\
     once that port lands.\n\
-Once A2/A4 lift this gate, wire the A3 primitives into the scheduler/signal\n\
+Once A4 lifts this gate, wire the A3 primitives into the scheduler/signal\n\
 sections per design/0019 §Implementation (the Windows arms of the preempt\n\
 monitor, fault install, and signal dispatch). See design/0016-platform-1.0.md\n\
 (Area A) for the full sequencing."
@@ -3529,6 +3529,14 @@ typedef struct PollDesc {
     struct PollDesc *all_prev;   /* live-desc registry (deadline scan)           */
     struct PollDesc *all_next;
     struct PollDesc *free_link;  /* free list when idle                          */
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* IOCP backend (I#196 / A2): the socket handle (the ABI's int64_t fd carries a
+     * Windows SOCKET, which the `int fd` above cannot hold — Q3) and the opaque
+     * zap_np_iocp.c descriptor. Windows-only, #ifdef-guarded so the Linux struct
+     * layout is byte-for-byte unchanged. */
+    uint64_t sock;
+    void *afd;
+#endif
 } PollDesc;
 
 /* Registry + free list + lifecycle lock. Lock order is ALWAYS g_np_mu then a
@@ -3599,10 +3607,39 @@ static void np_backend_kick(void) {
     ssize_t r = write(g_np_wakefd, &one, sizeof one);
     (void)r; /* a full counter (EAGAIN) still wakes epoll_wait */
 }
+#elif defined(ZAP_PLATFORM_WINDOWS)
+#define ZAP_NETPOLL_IOCP 1
+#include "zap_np_iocp.h"
+
+/* IOCP backend (I#196 / A2; design/0020). The readiness-oriented seam is bridged
+ * to IOCP's completion model by zap_np_iocp.c's AFD-poll layer, WITHOUT widening
+ * the seam or touching the epoll arm. `np_backend_add` registers the socket (and
+ * the owning PollDesc as the completion userkey); arming is lazy and gated in the
+ * Windows np_poller_main (Q1), so there is no edge-triggered "register once"
+ * EPOLLET analogue to do here. `np_backend_kick` posts a sentinel completion. */
+static int np_backend_open(void) { return zap_iocp_global_open(); }
+
+static int np_backend_add(PollDesc *pd) {
+    pd->afd = zap_iocp_register(pd->sock, pd);
+    if (!pd->afd) {
+        fprintf(stderr, "zap: netpoller could not register socket (IOCP/AFD err %d)\n",
+                zap_iocp_last_error());
+        return -1;
+    }
+    return 0;
+}
+
+static void np_backend_del(PollDesc *pd) {
+    if (pd->afd) {
+        zap_iocp_unregister(pd->afd);
+        pd->afd = NULL;
+    }
+}
+
+static void np_backend_kick(void) { zap_iocp_kick(); }
 #else
 /* No readiness backend on this platform (kqueue follow-up): the netpoller
- * degrades to "unsupported" — zap_netpoll_open returns NULL. zaprt.c is only
- * compiled on Linux (the LLVM dev container / CI), so this path is a stub. */
+ * degrades to "unsupported" — zap_netpoll_open returns NULL. */
 static int g_np_epfd = -1;
 static int np_backend_open(void) { return -1; }
 static int np_backend_add(PollDesc *pd) { (void)pd; return -1; }
@@ -3745,11 +3782,83 @@ static void *np_poller_main(void *arg) {
 }
 #endif
 
+#if defined(ZAP_NETPOLL_IOCP)
+/* Ensure each live descriptor has a one-shot AFD poll in flight for every
+ * direction that still wants readiness, GATED so a latched-but-undrained socket
+ * is not re-polled (I#196 Q1): arm READ while a reader is parked (pd->rg) or no
+ * read edge is latched (!pd->r_ready), and symmetrically for WRITE. A direction
+ * already armed is left alone (zap_iocp_arm is a no-op then); a latched edge with
+ * no waiter leaves that direction unarmed, so it cannot busy-spin. Runs each
+ * poller iteration (same cadence/cost as np_compute_timeout's registry scan). */
+static void np_iocp_arm_needed(void) {
+    zap_np_lock(&g_np_mu);
+    for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
+        if (!pd->afd) {
+            continue;
+        }
+        zap_np_lock(&pd->mu);
+        int want_read = (pd->rg != NULL) || (pd->r_ready == 0);
+        int want_write = (pd->wg != NULL) || (pd->w_ready == 0);
+        if (want_read) {
+            zap_iocp_arm(pd->afd, ZAP_IOCP_READ);
+        }
+        if (want_write) {
+            zap_iocp_arm(pd->afd, ZAP_IOCP_WRITE);
+        }
+        zap_np_unlock(&pd->mu);
+    }
+    zap_np_unlock(&g_np_mu);
+}
+
+static void *np_poller_main(void *arg) {
+    (void)arg;
+    zap_iocp_ready readies[64];
+    for (;;) {
+        np_iocp_arm_needed();
+        int timeout = np_compute_timeout();
+        int n = zap_iocp_wait(readies, 64, timeout);
+        if (g_np_shutdown) {
+            break;
+        }
+        if (n < 0) {
+            break; /* unexpected IOCP failure: stop polling */
+        }
+        for (int i = 0; i < n; i++) {
+            PollDesc *pd = (PollDesc *)readies[i].userkey;
+            zap_np_lock(&pd->mu);
+            /* An error/hangup (closed) counts as readiness for BOTH directions so
+             * the parked G wakes and observes the condition via its next socket
+             * call — the IOCP analogue of the epoll EPOLLERR/EPOLLHUP handling. */
+            if (readies[i].readable) {
+                np_wake_dir_locked(pd, 1, ZAP_POLL_OK);
+            }
+            if (readies[i].writable) {
+                np_wake_dir_locked(pd, 0, ZAP_POLL_OK);
+            }
+            zap_np_unlock(&pd->mu);
+        }
+        np_expire_deadlines();
+    }
+    return NULL;
+}
+#endif
+
 /* ---- lazy start / shutdown ------------------------------------------------ */
 static void np_start_once(void) {
 #if defined(ZAP_NETPOLL_EPOLL)
     if (np_backend_open() != 0) {
         fprintf(stderr, "zap: netpoller init failed (epoll)\n");
+        return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
+    }
+    int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "zap: netpoller thread start failed (%d)\n", rc);
+        return;
+    }
+    g_np_started = 1;
+#elif defined(ZAP_NETPOLL_IOCP)
+    if (np_backend_open() != 0) {
+        fprintf(stderr, "zap: netpoller init failed (IOCP err %d)\n", zap_iocp_last_error());
         return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
     }
     int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
@@ -3777,6 +3886,11 @@ static void netpoll_shutdown(void) {
     np_backend_kick();
     GC_pthread_join(g_np_thread, NULL);
     g_np_started = 0;
+#if defined(ZAP_NETPOLL_IOCP)
+    /* The poller thread has joined, so no completion can still reference the port
+     * or the AFD helper handle — release them. */
+    zap_iocp_global_close();
+#endif
 }
 
 /* ---- descriptor lifecycle ------------------------------------------------- */
@@ -3800,6 +3914,10 @@ static PollDesc *np_pd_alloc(int fd) {
     pd->r_ready = pd->w_ready = 0;
     pd->r_deadline = pd->w_deadline = 0;
     pd->all_prev = pd->all_next = pd->free_link = NULL;
+#if defined(ZAP_PLATFORM_WINDOWS)
+    pd->sock = 0;
+    pd->afd = NULL;
+#endif
     return pd;
 }
 
@@ -3815,6 +3933,11 @@ void *zap_netpoll_open(int64_t fd) {
     if (!pd) {
         return NULL;
     }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* The ABI's int64_t fd carries a Windows SOCKET (pointer-width), which the
+     * `int fd` field above truncates; the IOCP backend uses the full handle (Q3). */
+    pd->sock = (uint64_t)fd;
+#endif
     zap_np_lock(&g_np_mu);
     pd->all_prev = NULL;
     pd->all_next = g_np_all;
