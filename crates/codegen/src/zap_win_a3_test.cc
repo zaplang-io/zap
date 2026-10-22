@@ -51,6 +51,14 @@ extern "C" {
 }
 
 static int g_failures = 0;
+/* Progress markers: CHECK only prints on failure, so a crash leaves no trace of
+ * which test died. MARK prints + flushes a boundary so a segfault localizes to a
+ * specific test on the CI log. */
+#define MARK(m)                                                                 \
+    do {                                                                        \
+        fprintf(stderr, "[mark] %s\n", (m));                                    \
+        fflush(stderr);                                                         \
+    } while (0)
 #define CHECK(cond, msg)                                                        \
     do {                                                                        \
         if (!(cond)) {                                                          \
@@ -182,9 +190,10 @@ extern "C" void t2_spin(void) { /* extern "C": passed to zap_ctx_make */
         local += 1;
         g_w.counter = local;
         g_w.checksum = local * 2654435761LL; /* a value kept across the hijack */
-        /* a little volatile work so the loop isn't optimized away and spends
-         * most time ON the green stack (hijackable) */
-        for (volatile int i = 0; i < 64; i++) {
+        /* a little work the optimizer can't elide, so the loop spends most time
+         * ON the green stack (hijackable) */
+        for (int i = 0; i < 64; i++) {
+            __asm__ __volatile__("" ::: "memory");
         }
     }
     /* verify our own invariant before leaving */
@@ -248,7 +257,7 @@ static void test_preempt_hijack(void) {
  * ===========================================================================*/
 static CRITICAL_SECTION g_stw_mu; /* the serialization lock (zaprt.c: preempt/STW) */
 static volatile int g_stw_stop = 0;
-static volatile int g_stw_deadlock_guard = 0;
+static volatile LONG g_stw_deadlock_guard = 0;
 
 /* A fake collector: under the SAME lock, suspend the worker, read its context
  * (as bdwgc STW does to scan it), resume. Hammering this concurrently with the
@@ -264,7 +273,7 @@ static DWORD WINAPI t3_collector(LPVOID) {
             ResumeThread(g_w.thread);
         }
         LeaveCriticalSection(&g_stw_mu);
-        g_stw_deadlock_guard++;
+        InterlockedIncrement(&g_stw_deadlock_guard);
     }
     return 0;
 }
@@ -279,17 +288,36 @@ static void test_stw_suspend_race(void) {
     for (int i = 0; i < 1000 && load64(&g_w.counter) < 10; i++)
         Sleep(1);
     HANDLE col = CreateThread(NULL, 0, t3_collector, NULL, 0, NULL);
-    /* Monitor side: hammer preemption under the same lock. */
-    const int ITERS = 20000;
-    LONG64 guard_start = g_stw_deadlock_guard;
-    for (int i = 0; i < ITERS && !g_w.done; i++) {
+    /* Monitor side: race the collector on SuspendThread under the same lock, for
+     * a bounded duration. Each hijack is gated on the worker having ADVANCED its
+     * counter since the last one — i.e. it resumed into real loop code and the
+     * previous async trampoline has fully returned. This mirrors reality (a
+     * coroutine is preempted at most once per ~10 ms slice, and copreempt parks
+     * it) and, crucially, prevents the test from re-injecting a trampoline while
+     * a prior one is still on the green stack, which would nest frames faster than
+     * they unwind and overflow the fixed green stack (a test-cadence artifact, not
+     * a hijack-correctness or serialization bug). */
+    LONG guard_start = g_stw_deadlock_guard;
+    LONG64 hijacks = 0;
+    LONG64 last_seen = load64(&g_w.counter);
+    ULONGLONG t0 = GetTickCount64();
+    while (GetTickCount64() - t0 < 2000 && !g_w.done) {
+        /* wait for the worker to make real progress (prior trampoline done) */
+        LONG64 c;
+        int spins = 0;
+        while ((c = load64(&g_w.counter)) == last_seen && spins++ < 1000000 &&
+               !g_w.done) {
+        }
+        last_seen = c;
         EnterCriticalSection(&g_stw_mu);
-        zap_win_preempt_try(h, g_w.lo, g_w.hi, &g_w.no_preempt);
+        if (zap_win_preempt_try(h, g_w.lo, g_w.hi, &g_w.no_preempt))
+            hijacks++;
         LeaveCriticalSection(&g_stw_mu);
     }
+    CHECK(hijacks > 0, "T3 landed hijacks while the collector raced on suspend");
     /* If the collector is still advancing, there was no deadlock. */
     Sleep(50);
-    LONG64 guard_end = g_stw_deadlock_guard;
+    LONG guard_end = g_stw_deadlock_guard;
     g_stw_stop = 1;
     g_w.done = 1;
     DWORD wc = WaitForSingleObject(col, 5000);
@@ -400,11 +428,21 @@ int main(int argc, char **argv) {
         run_fault_child();
         return 0; /* unreachable */
     }
+    MARK("T1 begin (SEH across green stack)");
     test_seh_across_green_stack();
+    MARK("T1 end");
+    MARK("T2 begin (preempt hijack)");
     test_preempt_hijack();
+    MARK("T2 end");
+    MARK("T3 begin (Q5 STW x SuspendThread stress)");
     test_stw_suspend_race();
+    MARK("T3 end");
+    MARK("T4 begin (fault filter child)");
     test_fault_filter();
+    MARK("T4 end");
+    MARK("T5 begin (console mapping)");
     test_console_mapping();
+    MARK("T5 end");
     if (g_failures == 0) {
         fprintf(stderr, "zap_win_a3_test: all checks passed\n");
         return 0;
