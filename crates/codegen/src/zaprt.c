@@ -30,25 +30,36 @@
 
 #if defined(ZAP_PLATFORM_WINDOWS)
 #error "Zap: the C runtime (zaprt.c) does not yet compile/link for Windows.\n\
-The A5 build/link toolchain (I#199) is wired (target-aware link flags in\n\
-crates/codegen/src/lib.rs, MinGW-w64 libs, a non-blocking windows CI job), and\n\
-the A1 coroutine context switch (I#195) is now IMPLEMENTED — the Windows arm of\n\
-the zap_ctx_swap/zap_ctx_make seam below is defined in zap_ctx_win_x64.c (linked\n\
-by build_executable's Windows arm) and verified on windows-latest by\n\
-zap_ctx_win_x64_test.c (context switch + conservative-GC parked-coroutine root\n\
-survival). These POSIX subsystems still need a Windows backend before a Zap\n\
-program can link and run on Windows:\n\
-  * A3 (I#197): signals / preemption / faults. No sigaction/SIGURG/sigaltstack/\n\
-    pthread_sigmask/self-pipe/backtrace_symbols on Windows — needs\n\
-    SuspendThread/GetThreadContext/QueueUserAPC preemption, a vectored/SEH\n\
-    fault handler + dbghelp StackWalk64, console control handlers, and the\n\
-    Itanium __cxa_* -> SEH exception-personality swap (A5 unwinder slice).\n\
+DONE: A5 build/link toolchain (I#199, target-aware link flags), A1 coroutine\n\
+context switch (I#195, zap_ctx_win_x64.c), and A3 (I#197) — the exception\n\
+personality is now target-conditional in codegen (__gxx_personality_seh0; the\n\
+landingpad IR + __cxa_* glue are unchanged, MinGW-w64 SEH model) and the A3\n\
+signals/preemption/fault PRIMITIVES are implemented in zap_win_a3.c (hijack-based\n\
+preemption for gc-boehm, a last-chance SetUnhandledExceptionFilter + dbghelp\n\
+fault report, and SetConsoleCtrlHandler -> Signal-enum mapping), linked by\n\
+build_executable's Windows arm and verified on windows-latest by\n\
+zap_win_a3_test.cc (incl. SEH unwinding across a green stack and the Q5 STW x\n\
+SuspendThread stress). See design/0019-windows-signals-faults-seh-a3.md.\n\
+\n\
+REMAINING before a Zap program links+runs on Windows (this TU is a single\n\
+compilation unit, so ALL must compile):\n\
   * A2 (I#196): netpoller. epoll/eventfd -> IOCP; the np_backend_* seam already\n\
-    returns 'unsupported' on non-Linux, so this is additive, not a compile wall.\n\
-  * A4 (I#198): path/process/fs/env + getentropy (-> BCryptGenRandom) and the\n\
+    returns 'unsupported' on non-Linux, but <sys/epoll.h> is only #if __linux__.\n\
+    The #77 signal dispatch's self-pipe+netpoller park must also become the\n\
+    netpoller-free Windows path (console handler -> condvar; design/0019 §5).\n\
+  * A4 (I#198): path/process/fs/env + getentropy (-> BCryptGenRandom) — the\n\
+    fs/process (#97, <sys/stat.h>/<sys/wait.h>/spawn), crypto-random (#105,\n\
+    <sys/random.h>) and socket (#104, <netinet/in.h>/<sys/socket.h>/<poll.h>)\n\
+    sections are still UNGUARDED POSIX includes = genuine compile walls. Plus the\n\
     CPython embedding story (gated off for Windows v1 in build_executable).\n\
-See design/0016-platform-1.0.md (Area A) for the full sequencing (A5 -> A1 ->\n\
-A3 unwinder -> A2/A4)."
+  * immix on Windows: zapgc.inc.c uses <sys/mman.h>/mmap -> needs a VirtualAlloc\n\
+    port (GC-track ticket). Windows v1 runs under gc-boehm; A3's boehm hijack is\n\
+    the v1 preempt path, and the immix flag-at-safepoint path lights up for free\n\
+    once that port lands.\n\
+Once A2/A4 lift this gate, wire the A3 primitives into the scheduler/signal\n\
+sections per design/0019 §Implementation (the Windows arms of the preempt\n\
+monitor, fault install, and signal dispatch). See design/0016-platform-1.0.md\n\
+(Area A) for the full sequencing."
 #endif
 
 /* Python.h must precede the standard headers (it sets feature-test macros).
@@ -1209,9 +1220,12 @@ int64_t zap_array_sum_bool(void *ap) {
 
 /* ---------------------------------------------------------------------------
  * Exceptions / unwinding (ticket #22, design/RUNTIME-ABI.md §"Exception /
- * unwinding ABI"). Zap uses the platform Itanium unwinder: `zap_panic` raises,
- * landing pads catch via the libstdc++ personality (`__gxx_personality_v0`,
- * emitted by codegen), and `except` matching is catch-all for this increment.
+ * unwinding ABI"). Zap uses the platform C++ unwinder: `zap_panic` raises,
+ * landing pads catch via the libstdc++ personality (`__gxx_personality_v0` on
+ * Linux/macOS, `__gxx_personality_seh0` on MinGW-w64 Windows — the name is chosen
+ * by codegen from the target triple, ticket #197/A3; the glue below is identical
+ * across both unwind models), and `except` matching is catch-all for this
+ * increment.
  *
  * The thrown C++ exception just boxes a pointer to the Zap exception object,
  * which is currently the message string itself (a ZapStr*); the typed Zap
