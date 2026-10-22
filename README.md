@@ -16,6 +16,7 @@ metaprogramming system for keeping business logic free of boilerplate.
 - [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) — the tracked backlog.
 - [`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf) — the grammar.
 - [`design/`](design/) — per-feature design docs.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) · [`SECURITY.md`](SECURITY.md) — contributing, conduct, and vulnerability reporting.
 
 ## Repository layout
 
@@ -177,6 +178,8 @@ Licensed under either of
 at your option.
 
 ### Contribution
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build, test, and send a change.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
