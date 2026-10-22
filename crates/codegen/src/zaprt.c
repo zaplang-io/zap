@@ -54,8 +54,8 @@ static void GC_set_stackbottom(void *h, struct GC_stack_base *sb) {
 #include <pthread.h>
 #include <stdint.h>
 /* ucontext (getcontext/makecontext/swapcontext) backs the M:N scheduler's
- * green-thread context switch (ticket #47). Available on the Linux x86_64 dev
- * container; see the scheduler block below for the arch assumption. */
+ * green-thread context switch (ticket #47). Validated on Linux x86_64 and
+ * aarch64 (CI, ticket #204); see the scheduler block below for the arch note. */
 #include <ucontext.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1809,8 +1809,8 @@ void *zap_py_str(void *obj_) {
  *
  * Context switch (design/0005 "Interaction with exception unwinding"):
  * ucontext `swapcontext` saves/restores callee-saved regs + SP + IP. ARCH
- * ASSUMPTION: ucontext is available and correct on the Linux x86_64 dev
- * container (LLVM 18 / glibc). The spawn trampoline is each G's base frame; an
+ * NOTE: ucontext is available and correct on glibc Linux for both x86_64 and
+ * aarch64 (both exercised in CI, ticket #204: the `full` and `arm64` jobs). The spawn trampoline is each G's base frame; an
  * uncaught exception is caught there by a landing pad (codegen), so unwinding
  * never crosses into the makecontext bootstrap. A G suspended mid-unwind
  * resumes its unwind correctly because CFI is driven per frame on its own

@@ -140,6 +140,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fail loudly if the runner label ever silently resolves to x86-64, which
+      # would turn this job into a duplicate of `full`.
+      - name: Assert aarch64 host
+        run: |
+          test "$(uname -m)" = aarch64
+
       - name: Install LLVM 18 and system libraries
         run: |
           sudo apt-get update
