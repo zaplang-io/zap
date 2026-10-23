@@ -28,38 +28,15 @@
 #define ZAP_PLATFORM_POSIX 1
 #endif
 
-#if defined(ZAP_PLATFORM_WINDOWS)
-#error "Zap: the C runtime (zaprt.c) does not yet compile/link for Windows.\n\
-DONE: A5 build/link toolchain (I#199, target-aware link flags), A1 coroutine\n\
-context switch (I#195, zap_ctx_win_x64.c), A3 (I#197) — the exception\n\
-personality is now target-conditional in codegen (__gxx_personality_seh0; the\n\
-landingpad IR + __cxa_* glue are unchanged, MinGW-w64 SEH model) and the A3\n\
-signals/preemption/fault PRIMITIVES are implemented in zap_win_a3.c (hijack-based\n\
-preemption for gc-boehm, a last-chance SetUnhandledExceptionFilter + dbghelp\n\
-fault report, and SetConsoleCtrlHandler -> Signal-enum mapping; design/0019), and\n\
-A2 (I#196) — the netpoller's np_backend_* seam is implemented on IOCP via an\n\
-AFD-readiness adapter in zap_np_iocp.c (completion->readiness, no seam widening,\n\
-epoll path byte-for-byte unchanged), linked by build_executable's Windows arm and\n\
-verified on windows-latest by zap_np_iocp_test.c (AFD-poll readiness wake, the\n\
-park/wake round-trip, and the PostQueuedCompletionStatus kick). See\n\
-design/0020-windows-iocp-netpoller-a2.md.\n\
-\n\
-REMAINING before a Zap program links+runs on Windows (this TU is a single\n\
-compilation unit, so ALL must compile):\n\
-  * A4 (I#198): path/process/fs/env + getentropy (-> BCryptGenRandom) — the\n\
-    fs/process (#97, <sys/stat.h>/<sys/wait.h>/spawn), crypto-random (#105,\n\
-    <sys/random.h>) and socket (#104, <netinet/in.h>/<sys/socket.h>/<poll.h>)\n\
-    sections are still UNGUARDED POSIX includes = genuine compile walls. The A2\n\
-    netpoller is ready to drive Windows sockets the moment A4 guards those. Plus\n\
-    the CPython embedding story (gated off for Windows v1 in build_executable).\n\
-  * immix on Windows: zapgc.inc.c uses <sys/mman.h>/mmap -> needs a VirtualAlloc\n\
-    port (GC-track ticket). Windows v1 runs under gc-boehm; A3's boehm hijack is\n\
-    the v1 preempt path, and the immix flag-at-safepoint path lights up for free\n\
-    once that port lands.\n\
-Once A4 lifts this gate, wire the A3 primitives into the scheduler/signal\n\
-sections per design/0019 §Implementation (the Windows arms of the preempt\n\
-monitor, fault install, and signal dispatch). See design/0016-platform-1.0.md\n\
-(Area A) for the full sequencing."
+#if defined(ZAP_PLATFORM_WINDOWS) && defined(ZAP_GC_IMMIX)
+#error "Zap on Windows (v1) runs under the conservative Boehm collector only.\n\
+The precise Immix collector is not yet ported to Windows: zapgc.inc.c maps heap\n\
+with <sys/mman.h>/mmap and scans with POSIX primitives, so it needs a separate\n\
+VirtualAlloc/Win32 port (I#218, GC track). Build the Windows runtime WITHOUT\n\
+-DZAP_GC_IMMIX (the default gc-boehm configuration). Full Windows program support\n\
+under gc-boehm is complete: A5 toolchain (I#199), A1 context switch (I#195), A3\n\
+signals/preemption/faults (I#197), A2 IOCP netpoller (I#196) and A4\n\
+path/process/fs/env/sockets/random (I#198). See design/0016-platform-1.0.md."
 #endif
 
 /* Python.h must precede the standard headers (it sets feature-test macros).
@@ -68,8 +45,15 @@ monitor, fault install, and signal dispatch). See design/0016-platform-1.0.md\n\
  * and the dev container / CI provide `python3-dev`. (Windows v1 gates CPython
  * off — see build_executable — so this is a POSIX-era dependency; the Windows
  * gate above halts the compile before here regardless.) */
+/* CPython embedding is gated OFF for Windows v1 (I#198): there is no reliable
+ * `python3-embed.pc` under MinGW-w64, so build_executable omits the CPython
+ * cflags/libs on Windows and the `import python` entry points below become
+ * catchable-error stubs. Guard the header so the TU compiles without Python.h. */
+#if defined(ZAP_PLATFORM_POSIX)
+#define ZAP_HAVE_CPYTHON 1
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#endif
 
 #ifndef ZAP_GC_IMMIX
 /* `GC_THREADS` must be defined before <gc.h> so the collector is built/used in
@@ -81,6 +65,17 @@ monitor, fault install, and signal dispatch). See design/0016-platform-1.0.md\n\
  * on pthread mutex/condvars. The dev container's `libgc-dev` has thread
  * support, and the program links `-lpthread` (see build_executable). */
 #define GC_THREADS
+#if defined(_WIN32)
+/* On Windows, `GC_THREADS` alone selects bdwgc's native-Win32-threads model, under
+ * which <gc.h> does NOT declare the `GC_pthread_*` wrappers (gc_config_macros.h:
+ * GC_PTHREADS is gated on `!GC_WIN32_THREADS || GC_WIN32_PTHREADS`). The runtime
+ * creates coroutine/worker threads with `GC_pthread_create` and links winpthreads
+ * (`-lpthread`), so request bdwgc's pthreads-on-Win32 model — this declares the
+ * wrappers and makes the collector register each winpthreads thread for stack
+ * scanning. MSYS2's `mingw-w64-x86_64-gc` is built with POSIX (winpthreads)
+ * thread support, so the wrappers also link. (I#198 / A4.) */
+#define GC_WIN32_PTHREADS
+#endif
 #include <gc.h>
 #else
 /* Precise Immix GC build (ticket #48, design/0008-precise-gc.md): no Boehm. The
@@ -124,6 +119,128 @@ static void GC_set_stackbottom(void *h, struct GC_stack_base *sb) {
 #include <time.h>   /* clock_gettime for the scheduler idle wait (#47) */
 #include <unistd.h> /* sysconf(_SC_NPROCESSORS_ONLN) for the M count (#47) */
 #include <signal.h> /* SIGURG / sigaction / pthread_kill: async preemption (#172) */
+
+#if defined(ZAP_PLATFORM_WINDOWS)
+/* Windows system headers (platform epic #158 / Area A4, I#198). The POSIX
+ * subsystems the runtime is built on — process/fs/env (#97), the TCP sockets the
+ * netpoller drives (#104), the CSPRNG (#105), and the A3 signal/preempt/fault
+ * primitives (#197) — reach Win32 here, behind the `ZAP_PLATFORM_WINDOWS` seam,
+ * keeping the POSIX branches byte-for-byte unchanged. `<winsock2.h>` MUST precede
+ * `<windows.h>` (otherwise the legacy `<winsock.h>` it pulls in clashes), and
+ * WIN32_LEAN_AND_MEAN / NOMINMAX keep windows.h from defining `min`/`max` and the
+ * GDI surface that would collide with runtime identifiers. winpthreads provides
+ * `<pthread.h>` and a native-HANDLE accessor used by the preempt monitor. */
+#define WIN32_LEAN_AND_MEAN 1
+#define NOMINMAX 1
+#define NOGDI 1
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <bcrypt.h>
+#include <direct.h> /* _getcwd / _chdir / _mkdir / _rmdir                        */
+#include <io.h>     /* _open / _read / _write / _close / _lseeki64 / _access     */
+#include <process.h> /* _getpid                                                  */
+#include <sys/stat.h>
+#include <sys/types.h>
+/* A3 (I#197) Windows primitives, implemented in the self-contained zap_win_a3.c
+ * and wired into the scheduler/#77 signal/fault sections below (I#198). Declared
+ * here, before the first use (the preempt monitor, the signal section, and the
+ * per-worker fault headroom in worker_main). */
+extern void (*zap_win_preempt_target)(void);
+extern int zap_win_preempt_try(void *hthread, uintptr_t lo, uintptr_t hi,
+                               volatile int *no_preempt, volatile LONG *in_hijack);
+extern void (*zap_win_fault_describe)(char *buf, size_t n);
+extern void zap_win_install_fault_filter(void);
+extern void zap_win_fault_thread_init(void);
+extern int (*zap_win_console_deliver)(int signo);
+extern int zap_win_console_install(void);
+extern void zap_win_console_uninstall(void);
+
+/* The Zap `Signal` prelude enum uses the Linux signal numbers as its
+ * discriminants (crates/syntax/src/parser.rs), and codegen emits those values;
+ * the #77 dispatch tables are indexed by them. MinGW-w64's <signal.h> defines a
+ * small, differently-numbered subset (SIGINT/SIGILL/SIGFPE/SIGSEGV/SIGTERM happen
+ * to match Linux). Define the remaining names to their LINUX values so the signal
+ * section compiles and the table indexing stays consistent with codegen; the
+ * Windows-reachable subset is only SIGINT/SIGQUIT/SIGTERM (console events, see
+ * zap_win_a3.c), and every other discriminant is inert on Windows. */
+#ifndef SIGHUP
+#define SIGHUP 1
+#endif
+#ifndef SIGQUIT
+#define SIGQUIT 3
+#endif
+#ifndef SIGBUS
+#define SIGBUS 7
+#endif
+#ifndef SIGKILL
+#define SIGKILL 9
+#endif
+#ifndef SIGUSR1
+#define SIGUSR1 10
+#endif
+#ifndef SIGUSR2
+#define SIGUSR2 12
+#endif
+#ifndef SIGPIPE
+#define SIGPIPE 13
+#endif
+#ifndef SIGALRM
+#define SIGALRM 14
+#endif
+#ifndef SIGCHLD
+#define SIGCHLD 17
+#endif
+#ifndef SIGCONT
+#define SIGCONT 18
+#endif
+#ifndef SIGSTOP
+#define SIGSTOP 19
+#endif
+#ifndef SIGTSTP
+#define SIGTSTP 20
+#endif
+#ifndef SIGURG
+#define SIGURG 23
+#endif
+#ifndef SIGPROF
+#define SIGPROF 27
+#endif
+#ifndef SIGWINCH
+#define SIGWINCH 28
+#endif
+#endif
+
+/* Portable setenv (I#198): POSIX has setenv(name, value, overwrite); the MSVCRT
+ * MinGW-w64 links against has no setenv, so route Windows through _putenv_s with
+ * the same overwrite semantics. Returns 0 on success, non-zero on failure. Used
+ * by the scheduler's MAXPROCS seed and os.setenv. */
+static int zap_setenv_compat(const char *name, const char *value, int overwrite) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    if (!overwrite && getenv(name) != NULL) {
+        return 0;
+    }
+    return _putenv_s(name, value);
+#else
+    return setenv(name, value, overwrite);
+#endif
+}
+
+#if defined(ZAP_PLATFORM_WINDOWS)
+/* POSIX reentrant time helpers the datetime section (#99) uses. MinGW-w64 ships
+ * the MSVCRT *_s variants (note the reversed argument order) and _mkgmtime for
+ * the timegm glibc extension; alias them so the shared civil-time code compiles
+ * unchanged. */
+static struct tm *zap_win_localtime_r(const time_t *t, struct tm *out) {
+    return localtime_s(out, t) == 0 ? out : NULL;
+}
+static struct tm *zap_win_gmtime_r(const time_t *t, struct tm *out) {
+    return gmtime_s(out, t) == 0 ? out : NULL;
+}
+#define localtime_r zap_win_localtime_r
+#define gmtime_r zap_win_gmtime_r
+#define timegm _mkgmtime
+#endif
 
 /* PCRE2, 8-bit code units (ticket #23, D-0010). Must be defined before the
  * header so the `pcre2_*` names resolve to the 8-bit API. Linked with
@@ -1622,6 +1739,7 @@ void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_
  * container rows), keyword arguments, real `PyObject_IsTrue` truthiness, and a
  * thread-safe interpreter init for the coroutine runtime. */
 
+#if defined(ZAP_HAVE_CPYTHON)
 typedef struct {
     PyObject *obj; /* owned reference; NULL once finalized */
 } ZapPy;
@@ -1839,6 +1957,67 @@ void *zap_py_str(void *obj_) {
     PyGILState_Release(g);
     return out;
 }
+#else /* !ZAP_HAVE_CPYTHON — Windows v1 (I#198): CPython embedding gated off */
+/* `import python` and its attribute/call/convert entry points still lower and
+ * link on Windows, but CPython is not embedded (no python3-embed under MinGW-w64,
+ * see build_executable), so each raises a catchable Zap exception at runtime
+ * rather than failing the link. The wrapper type keeps its shape so the shared
+ * `zap_desc_pyobj` descriptor (sizeof) compiles. Full Windows Python interop is a
+ * post-v1 follow-up. */
+typedef struct {
+    void *obj;
+} ZapPy;
+static void *zap_py_unavailable(void) {
+    const char *m = "python interop is unavailable on this platform "
+                    "(Windows v1; see I#198)";
+    zap_panic(zap_str_new(m, (int64_t)strlen(m)));
+    return NULL;
+}
+void *zap_py_import(void *name_) {
+    (void)name_;
+    return zap_py_unavailable();
+}
+void *zap_py_getattr(void *obj_, void *name_) {
+    (void)obj_;
+    (void)name_;
+    return zap_py_unavailable();
+}
+void *zap_py_call(void *callable_, void *arglist_) {
+    (void)callable_;
+    (void)arglist_;
+    return zap_py_unavailable();
+}
+void *zap_py_from_i64(int64_t v) {
+    (void)v;
+    return zap_py_unavailable();
+}
+void *zap_py_from_f64(double v) {
+    (void)v;
+    return zap_py_unavailable();
+}
+void *zap_py_from_bool(int64_t v) {
+    (void)v;
+    return zap_py_unavailable();
+}
+void *zap_py_from_str(void *s_) {
+    (void)s_;
+    return zap_py_unavailable();
+}
+int64_t zap_py_to_i64(void *obj_) {
+    (void)obj_;
+    zap_py_unavailable();
+    return 0;
+}
+double zap_py_to_f64(void *obj_) {
+    (void)obj_;
+    zap_py_unavailable();
+    return 0;
+}
+void *zap_py_str(void *obj_) {
+    (void)obj_;
+    return zap_py_unavailable();
+}
+#endif /* ZAP_HAVE_CPYTHON */
 
 /* ===========================================================================
  * Coroutines + channels on an M:N work-stealing scheduler
@@ -2025,6 +2204,18 @@ typedef struct M {
     pthread_cond_t ded_cv;
     volatile int ded_runnable;  /* the pinned coroutine is ready to run         */
     volatile int ded_stop;      /* tear the dedicated M down                    */
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* Preemption on Windows (I#198 wiring of the A3/#197 primitive): the monitor
+     * has no SIGURG to deliver, so it HIJACKS this worker (SuspendThread +
+     * SetThreadContext) via zap_win_preempt_try. `win_thread` is a real,
+     * full-access duplicate of the worker's thread handle (captured in
+     * worker_main); `in_hijack` is the per-M in-flight guard the primitive
+     * check-and-sets and copreempt clears, so a second hijack can never nest on
+     * the green stack (ticket #197 Q5). Windows-only #ifdef: the Linux/macOS M
+     * layout is byte-for-byte unchanged. */
+    void *win_thread;
+    volatile LONG in_hijack;
+#endif
 } M;
 
 /* Per-waiter node on a channel's sender/receiver queue. A coroutine waiter
@@ -2353,6 +2544,25 @@ static void *g_entry_fn(G *g) {
 static void *worker_main(void *arg) {
     M *m = (M *)arg;
     cur_m = m;
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* Preemption on Windows (#172 via the A3 hijack): the monitor needs a real,
+     * full-access handle to this worker thread to SuspendThread/SetThreadContext
+     * it. GetCurrentThread() is a pseudo-handle usable only by this thread, so
+     * duplicate it into a real one the monitor can use. Also give this thread the
+     * fault handler's stack headroom (the sigaltstack analogue; A3). */
+    {
+        HANDLE real = NULL;
+        if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                            GetCurrentProcess(), &real,
+                            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                THREAD_SET_CONTEXT,
+                            FALSE, 0)) {
+            m->win_thread = real;
+        }
+        m->in_hijack = 0;
+        zap_win_fault_thread_init();
+    }
+#else
     /* Ensure the async-preemption signal is deliverable to this worker (#172):
      * unblock SIGURG, which the monitor targets with pthread_kill. */
     {
@@ -2361,6 +2571,7 @@ static void *worker_main(void *arg) {
         sigaddset(&s, SIGURG);
         pthread_sigmask(SIG_UNBLOCK, &s, NULL);
     }
+#endif
     /* This thread was created by GC_pthread_create, so it is registered; record
      * its GC handle + native stack bottom for the switch bracketing. */
     struct GC_stack_base sb;
@@ -2475,7 +2686,13 @@ static int zap_maxprocs(void) {
             return (int)n;
         }
     }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    long hw = (long)si.dwNumberOfProcessors;
+#else
     long hw = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if (hw < 1) {
         hw = 1;
     }
@@ -2529,25 +2746,45 @@ static pthread_t g_monitor_thread;
 static int g_monitor_started = 0;
 static void copreempt(void); /* fwd (scheduler yield, defined below)            */
 
+#if defined(ZAP_PLATFORM_WINDOWS)
+/* Serializes the monitor's SuspendThread hijack against bdwgc's own
+ * stop-the-world SuspendThread (ticket #197 Q5): the monitor holds it across a
+ * preempt attempt, and the Boehm STW event bracket (below) holds it PRE..POST, so
+ * the two never suspend a worker concurrently. A real mutex, not the racy flag
+ * the POSIX path uses — Windows has no signal-mask serialization. */
+static pthread_mutex_t g_preempt_stw_mu = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 #ifndef ZAP_GC_IMMIX
 /* Boehm stop-the-world guard (ticket #172). Boehm's STW suspends threads with a
  * signal and expects a suspended thread to stay put; an async-preemption switch
  * fired on a thread Boehm is stopping would move it out from under the collector.
  * `GC_set_on_collection_event` brackets STW: the flag is set BEFORE any thread is
  * suspended (PRE_STOP_WORLD) and cleared only after all resume (POST_START_WORLD),
- * so the preempt handler, which re-reads it, never switches during a collection. */
+ * so the preempt handler, which re-reads it, never switches during a collection.
+ * On Windows the preempt path is a monitor-side thread hijack (no in-thread signal
+ * handler to re-read a flag), so the bracket ALSO acquires/releases
+ * `g_preempt_stw_mu` — the monitor holds that same mutex across a hijack, which is
+ * the real serialization against bdwgc's SuspendThread-based STW (Q5). */
 static volatile sig_atomic_t g_boehm_in_stw = 0;
 static void zap_boehm_gc_event(GC_EventType e) {
     if (e == GC_EVENT_PRE_STOP_WORLD) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+        pthread_mutex_lock(&g_preempt_stw_mu);
+#endif
         g_boehm_in_stw = 1;
     } else if (e == GC_EVENT_POST_START_WORLD) {
         g_boehm_in_stw = 0;
+#if defined(ZAP_PLATFORM_WINDOWS)
+        pthread_mutex_unlock(&g_preempt_stw_mu);
+#endif
     }
 }
 #endif
 static void cosched(void);   /* fwd (cooperative yield, defined below)          */
 void zap_sched_init(int64_t n_threads); /* fwd (defined below)                  */
 
+#if defined(ZAP_PLATFORM_POSIX)
 /* SIGURG handler: the preemption point. Installed process-wide; only acts on a
  * worker thread that is currently running a (non-pinned) coroutine. */
 static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
@@ -2584,25 +2821,32 @@ static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
     }
 #endif
 }
+#endif /* ZAP_PLATFORM_POSIX */
 
 /* The monitor loop: a plain OS thread (it never touches the GC heap, holds no
  * lock a collection needs, and blocks SIGURG on itself). Started with
  * GC_pthread_create so bdwgc accounts for it. */
 static void *zap_monitor_main(void *arg) {
     (void)arg;
+#if defined(ZAP_PLATFORM_POSIX)
     sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, SIGURG);
     pthread_sigmask(SIG_BLOCK, &block, NULL);
+#endif
     uint64_t *last = (uint64_t *)calloc((size_t)g_nm, sizeof(uint64_t));
     if (!last) {
         return NULL;
     }
     for (;;) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+        Sleep((DWORD)(ZAP_PREEMPT_SLICE_NS / 1000000L));
+#else
         struct timespec ts;
         ts.tv_sec = 0;
         ts.tv_nsec = ZAP_PREEMPT_SLICE_NS;
         nanosleep(&ts, NULL);
+#endif
         if (g_shutdown) {
             break;
         }
@@ -2614,7 +2858,25 @@ static void *zap_monitor_main(void *arg) {
             uint64_t tick = m->schedtick;
             if (m->current && tick == last[i]) {
                 m->preempt = 1;
+#if defined(ZAP_PLATFORM_WINDOWS)
+                /* No SIGURG: hijack the worker directly. Snapshot the green-stack
+                 * range of the coroutine we believe is running; zap_win_preempt_try
+                 * re-validates RSP ∈ [lo,hi) and no_preempt AFTER suspending, so a
+                 * stale read (the coroutine parked between here and the suspend) is
+                 * declined, not mis-hijacked. Hold the STW mutex so this never races
+                 * bdwgc's own SuspendThread (Q5). Skip pinned coroutines. */
+                G *g = m->current;
+                if (g && !g->locked_m && m->win_thread) {
+                    uintptr_t lo = (uintptr_t)g->stack;
+                    uintptr_t hi = lo + (uintptr_t)g->stack_size;
+                    pthread_mutex_lock(&g_preempt_stw_mu);
+                    zap_win_preempt_try(m->win_thread, lo, hi, &g->no_preempt,
+                                        &m->in_hijack);
+                    pthread_mutex_unlock(&g_preempt_stw_mu);
+                }
+#else
                 pthread_kill(m->thread, SIGURG);
+#endif
             }
             last[i] = tick;
         }
@@ -2623,16 +2885,21 @@ static void *zap_monitor_main(void *arg) {
     return NULL;
 }
 
-/* Install the SIGURG handler once (no SA_ONSTACK: the handler must run on the
- * coroutine's own green stack so a copreempt switch saves/restores it with the
- * coroutine's context). Idempotent. */
+/* Install the preemption primitive once. POSIX: the SIGURG handler (no SA_ONSTACK
+ * — the handler must run on the coroutine's own green stack so a copreempt switch
+ * saves/restores it with the coroutine's context). Windows: point the A3 hijack
+ * trampoline at copreempt (the monitor does the suspend/redirect). Idempotent. */
 static void zap_preempt_install(void) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    zap_win_preempt_target = copreempt;
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = zap_preempt_handler;
     sa.sa_flags = SA_SIGINFO | SA_RESTART;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGURG, &sa, NULL);
+#endif
 }
 
 /* =====================  LockOSThread (ticket #172)  ========================
@@ -2660,12 +2927,18 @@ static void *dedicated_worker_main(void *arg) {
     m->gc_handle = GC_get_my_stackbottom(&sb);
     m->native_sb = sb;
     zap_mutator_register();
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* Give this thread the fault-handler stack headroom; a pinned coroutine owns
+     * its M and is never hijacked by the monitor (it is not in g_ms). */
+    zap_win_fault_thread_init();
+#else
     /* A pinned coroutine is not fairness-preempted, so keep SIGURG blocked on
      * the dedicated thread (it still participates in GC via safepoints). */
     sigset_t block;
     sigemptyset(&block);
     sigaddset(&block, SIGURG);
     pthread_sigmask(SIG_BLOCK, &block, NULL);
+#endif
     for (;;) {
         zap_enter_blocking(); /* idle: GC-safe, no un-flushed roots */
         zap_np_lock(&m->ded_mu);
@@ -2833,7 +3106,7 @@ void zap_sched_init(int64_t n_threads) {
         static char buf[32];
         if (!getenv("MAXPROCS")) {
             snprintf(buf, sizeof(buf), "%lld", (long long)n_threads);
-            setenv("MAXPROCS", buf, 0);
+            zap_setenv_compat("MAXPROCS", buf, 0);
         }
     }
     pthread_once(&g_sched_once, zap_sched_init_once);
@@ -3017,6 +3290,14 @@ static void copreempt(void) {
     g->state = G_RUNNABLE;
     g->preempt_requeue = 1;
     g->no_preempt = 0;
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* The coroutine has now yielded (we are about to swap away): clear the per-M
+     * in-flight guard so the monitor may hijack this M again on a later slice —
+     * the exact analogue of the Unix handler returning and unblocking SIGURG
+     * (ticket #197 Q5). The swap below happens immediately, so the window before
+     * it in which the ~10 ms monitor could re-fire is effectively nil. */
+    InterlockedExchange(&m->in_hijack, 0);
+#endif
     zap_ctx_swap(&g->ctx, &m->sched_ctx);
 }
 
@@ -4473,7 +4754,14 @@ static void zap_sig_dispatch(int signo) {
     }
 }
 
-/* ---- the dedicated signal thread ------------------------------------------ */
+/* ---- the dedicated signal thread (POSIX) ---------------------------------- *
+ * The self-pipe + netpoller + reader-thread transport is a POSIX-signal
+ * mechanism. On Windows there are no async POSIX signals: the A3 (#197) console
+ * control handler calls `zap_sig_dispatch` directly from its own OS thread (no
+ * self-pipe, no netpoller — design/0019 §5 decouples the two), so this whole
+ * transport is POSIX-only and the Windows start/shutdown paths below install the
+ * console handler + fault filter instead. */
+#if defined(ZAP_PLATFORM_POSIX)
 /* async-signal-safe: only writes the signo byte to the self-pipe (write(2) is
  * async-signal-safe; a full non-blocking pipe simply coalesces the edge). */
 static void zap_sig_handler(int signo) {
@@ -4530,8 +4818,10 @@ static void *zap_sig_thread_main(void *arg) {
     }
     return NULL;
 }
+#endif /* ZAP_PLATFORM_POSIX (self-pipe signal transport) */
 
 /* ---- fault (crash) handler ------------------------------------------------ */
+#if defined(ZAP_PLATFORM_POSIX)
 static void zap_fault_handler(int signo, siginfo_t *info, void *uctx) {
     (void)uctx;
     char msg[256];
@@ -4592,13 +4882,41 @@ static void zap_install_fault_handlers(void) {
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
 }
+#else  /* ZAP_PLATFORM_WINDOWS: faults via the A3 last-chance filter */
+/* Mirror the POSIX fault handler's middle line ("offending coroutine: ...") into
+ * `buf`; zap_win_fault_filter (zap_win_a3.c) prints the type/address header and
+ * the dbghelp backtrace around it. A hardware fault (SEH exception) is reported
+ * by SetUnhandledExceptionFilter, which then lets the OS default run — the
+ * analogue of the POSIX handler's "restore SIG_DFL and re-raise". */
+static void zap_win_fault_describe_cb(char *buf, size_t n) {
+    M *m = cur_m;
+    G *g = m ? m->current : NULL;
+    if (g) {
+        snprintf(buf, n, "coroutine %lld [%s]\n", (long long)g->all_idx,
+                 gstate_name(g->state));
+    } else {
+        snprintf(buf, n, "main/native thread\n");
+    }
+}
+static void zap_install_fault_handlers(void) {
+    zap_win_fault_describe = zap_win_fault_describe_cb;
+    zap_win_install_fault_filter();
+}
+#endif /* ZAP_PLATFORM_POSIX fault handler */
 
-/* Install (idempotently) the async self-pipe handler for `signo`. Caller holds
- * g_sig_mu. SA_RESTART so a handler interrupting a slow syscall resumes it. */
+/* Install (idempotently) the handler for `signo`. Caller holds g_sig_mu. POSIX:
+ * the async self-pipe handler, SA_RESTART so a slow syscall resumes; also block
+ * the signal on the installing thread so it is delivered to the dedicated signal
+ * thread. Windows: the single SetConsoleCtrlHandler (installed in start_once)
+ * already catches every console-reachable signal, so this just records the
+ * subscription — a non-console signal is inert but still table-tracked. */
 static void zap_sig_install(int signo) {
     if (signo <= 0 || signo >= ZAP_NSIG || g_sig_installed[signo]) {
         return;
     }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    g_sig_installed[signo] = 1;
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = zap_sig_handler;
@@ -4615,9 +4933,39 @@ static void zap_sig_install(int signo) {
         sigaddset(&s, signo);
         pthread_sigmask(SIG_BLOCK, &s, NULL);
     }
+#endif
 }
 
 /* ---- lazy start / shutdown ------------------------------------------------ */
+#if defined(ZAP_PLATFORM_WINDOWS)
+/* The console control handler runs on an OS-spawned thread (A3/#197): route a
+ * mapped console event straight into the shared dispatch core. Returns 1 iff a
+ * user subscription (notify / cancel_on) exists for the signal, so A3 suppresses
+ * the OS default (process termination); otherwise the default (terminate) runs. */
+static int zap_win_console_deliver_cb(int signo) {
+    if (signo <= 0 || signo >= ZAP_NSIG) {
+        return 0;
+    }
+    zap_np_lock(&g_sig_mu);
+    int had_sub = (g_sig_subs[signo] != NULL) || (g_scope_subs[signo] != NULL);
+    zap_np_unlock(&g_sig_mu);
+    zap_sig_dispatch(signo);
+    return had_sub;
+}
+
+static void zap_sig_start_once(void) {
+    /* No self-pipe/netpoller/reader-thread on Windows: install the last-chance
+     * fault filter and the console control handler, wiring the latter to the
+     * dispatch core. Signal delivery is synchronous on the handler's own thread. */
+    zap_install_fault_handlers();
+    zap_win_console_deliver = zap_win_console_deliver_cb;
+    if (zap_win_console_install() != 0) {
+        fprintf(stderr, "zap: SetConsoleCtrlHandler failed\n");
+        return;
+    }
+    g_sig_active = 1;
+}
+#else
 static void zap_sig_start_once(void) {
     if (pipe(g_sig_pipe) != 0) {
         fprintf(stderr, "zap: signal self-pipe creation failed\n");
@@ -4647,6 +4995,7 @@ static void zap_sig_start_once(void) {
     }
     g_sig_active = 1;
 }
+#endif /* ZAP_PLATFORM_WINDOWS signal start */
 
 static int zap_signal_ensure(void) {
     pthread_once(&g_sig_once, zap_sig_start_once);
@@ -4659,6 +5008,15 @@ static void zap_signal_shutdown(void) {
     if (!g_sig_active) {
         return;
     }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* No reader thread or self-pipe to tear down on Windows: just remove the
+     * console control handler. Dispatch is synchronous on the handler's thread. */
+    g_sig_shutdown = 1;
+    zap_win_console_uninstall();
+    zap_win_console_deliver = NULL;
+    g_sig_active = 0;
+    return;
+#else
     g_sig_shutdown = 1;
     /* Wake the signal thread off its netpoller park so it observes g_sig_shutdown
      * and exits. zap_netpoll_wake now LATCHES when the thread is momentarily
@@ -4680,6 +5038,7 @@ static void zap_signal_shutdown(void) {
         close(g_sig_pipe[1]);
     }
     g_sig_active = 0;
+#endif /* ZAP_PLATFORM_WINDOWS signal shutdown */
 }
 
 /* ---- public ABI: program-prologue init (default handlers) ----------------- */
@@ -4868,6 +5227,18 @@ static void zap_sig_mark_roots(void) {
 void zap_signal_raise(int64_t signo) {
     int s = (int)signo;
     int is_fault = (s == SIGSEGV || s == SIGFPE || s == SIGBUS || s == SIGILL);
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* No kill(2)/process-directed signals on Windows. A fault signal terminates
+     * via the CRT raise(); any other signal is delivered straight through the
+     * (synchronous) dispatch core — the same path the console handler uses. */
+    if (is_fault) {
+        raise(s);
+        return;
+    }
+    if (g_sig_active) {
+        zap_sig_dispatch(s);
+    }
+#else
     if (is_fault || !g_sig_active) {
         kill(getpid(), s); /* fault: the crash handler runs + re-raises (no return) */
         return;
@@ -4880,6 +5251,7 @@ void zap_signal_raise(int64_t signo) {
     for (int i = 0; i < 2000000 && g_sig_delivered == before; i++) {
         sched_yield();
     }
+#endif
 }
 
 /* Block until the signal thread has dispatched every edge raised so far
@@ -4889,6 +5261,12 @@ void zap_signal_drain(void) {
     if (!g_sig_active) {
         return;
     }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* Windows dispatch is synchronous (the console handler calls zap_sig_dispatch
+     * inline, and zap_signal_raise dispatches directly), so every edge raised so
+     * far has already been delivered — nothing to drain. */
+    return;
+#else
     /* Precise GC (#48): this caller (typically a mutator — e.g. the main thread)
      * blocks on the condvar below, so mark it GC-safe. Otherwise a SIGUSR1
      * default handler's forced GC (stop-the-world, run on the signal thread)
@@ -4908,6 +5286,7 @@ void zap_signal_drain(void) {
     }
     zap_np_unlock(&g_sig_sync_mu);
     zap_leave_blocking();
+#endif /* ZAP_PLATFORM_WINDOWS */
 }
 
 /* ---- C-level integration self-test (ticket #77) --------------------------- *
@@ -4925,9 +5304,18 @@ int64_t zap_signal_selftest(void) {
         fprintf(stderr, "signal selftest: subsystem inactive\n");
         return 0;
     }
-    /* Deliver two edges; coalescing means the cap-1 channel holds one. Must be
-     * PROCESS-directed (kill(getpid)), not thread-directed (raise): the handled
-     * signal is masked on this thread and unblocked only on the signal thread. */
+    /* Deliver two edges; coalescing means the cap-1 channel holds one. */
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* Windows dispatch is synchronous (zap_signal_raise -> zap_sig_dispatch), so
+     * after the first raise the cap-1 channel already holds the edge and the
+     * second coalesces; no spin/settle needed. SIGUSR2 is not console-reachable,
+     * which is exactly why the direct-dispatch path is exercised here. */
+    zap_signal_raise(SIGUSR2);
+    zap_signal_raise(SIGUSR2); /* second edge: buffer full -> coalesced (dropped) */
+#else
+    /* POSIX: must be PROCESS-directed (kill(getpid)), not thread-directed (raise):
+     * the handled signal is masked on this thread and unblocked only on the signal
+     * thread. */
     kill(getpid(), SIGUSR2);
     /* Spin briefly so the signal thread delivers the first edge before the
      * second arrives (keeps the test deterministic without a second channel). */
@@ -4944,6 +5332,7 @@ int64_t zap_signal_selftest(void) {
     kill(getpid(), SIGUSR2); /* second edge: buffer full -> coalesced (dropped) */
     struct timespec ts = {0, 20000000L}; /* 20 ms settle */
     nanosleep(&ts, NULL);
+#endif
     int64_t got = zap_chan_recv_i64(ch); /* one delivery */
     if (got == SIGUSR2) {
         passed++;
@@ -4991,18 +5380,33 @@ int64_t zap_signal_selftest(void) {
  * a concurrent stop-the-world GC need not wait for this thread (its roots are
  * already flushed; no un-flushed Zap temporaries are live across the wait).
  * ========================================================================== */
-#include <dirent.h>
+#include <dirent.h> /* MinGW-w64 ships a dirent shim over FindFirstFile          */
 #include <errno.h>
 #include <fcntl.h>
-#include <spawn.h>
 #include <stddef.h> /* offsetof */
 #include <sys/stat.h>
-#include <sys/wait.h>
+#if defined(ZAP_PLATFORM_POSIX)
+#include <spawn.h>    /* posix_spawn: process.run (POSIX)                        */
+#include <sys/wait.h> /* waitpid                                                 */
+#endif
 #if defined(__APPLE__)
 #include <crt_externs.h> /* _NSGetArgc / _NSGetArgv */
 #endif
 
-extern char **environ;
+#if defined(ZAP_PLATFORM_POSIX)
+extern char **environ; /* process.run passes it to posix_spawnp (Windows inherits
+                        * the environment via CreateProcessW, so it is unused) */
+#endif
+
+/* Windows opens file descriptors in TEXT mode by default, translating CRLF and
+ * stopping at ^Z — corrupting binary data and byte counts. Zap's io/fs surface is
+ * byte-exact (Python-faithful binary-safe strings), so every open() ORs in
+ * O_BINARY on Windows; it is a no-op (0) on POSIX, keeping those paths unchanged. */
+#if defined(ZAP_PLATFORM_WINDOWS)
+#define ZAP_O_BINARY O_BINARY
+#else
+#define ZAP_O_BINARY 0
+#endif
 
 /* NUL-terminated copy of a ZapStr for the C-string syscall APIs (ZapStr data is
  * length-prefixed, not NUL-terminated). The buffer is a GC leaf; no safepoint
@@ -5045,7 +5449,8 @@ int64_t zap_os_hasenv(void *name_) {
 
 /* os.setenv(name, value) (overwrites). */
 void zap_os_setenv(void *name_, void *val_) {
-    if (setenv(zap_sys_cstr((ZapStr *)name_), zap_sys_cstr((ZapStr *)val_), 1) != 0) {
+    if (zap_setenv_compat(zap_sys_cstr((ZapStr *)name_), zap_sys_cstr((ZapStr *)val_),
+                          1) != 0) {
         zap_sys_fail("os.setenv", strerror(errno));
     }
 }
@@ -5071,9 +5476,14 @@ void zap_os_chdir(void *path_) {
     }
 }
 
-/* os.mkdir(path) (mode 0777 before umask). */
+/* os.mkdir(path) (mode 0777 before umask on POSIX; Windows has no mode arg and
+ * applies the default ACL — _mkdir takes the path only). */
 void zap_os_mkdir(void *path_) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    if (_mkdir(zap_sys_cstr((ZapStr *)path_)) != 0) {
+#else
     if (mkdir(zap_sys_cstr((ZapStr *)path_), 0777) != 0) {
+#endif
         zap_sys_fail("os.mkdir", strerror(errno));
     }
 }
@@ -5114,18 +5524,49 @@ void *zap_os_listdir(void *path_) {
 
 /* --- os.path helpers (flat names: Zap dispatch is `module.method`) ---------- */
 
-/* os.path_join(a, b): join with a single '/'. An absolute `b` replaces `a`
- * (POSIX semantics). */
+/* Is `c` a path separator? Zap uses '/' as its one portable, Python-readable
+ * separator on every platform; on Windows a '\\' that appears in user input (or
+ * a native API result) is ALSO a separator, so join recognises it rather than
+ * doubling it. POSIX is unchanged ('/' only). */
+static int zap_path_is_sep(char c) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+/* Is `b` absolute (so a join should discard the left operand)? POSIX: a leading
+ * '/'. Windows (Python-faithful): a leading separator OR a drive-qualified path
+ * like "C:\\x" / "C:/x" (os.path.join("a", "C:\\x") -> "C:\\x"). */
+static int zap_path_is_abs(const ZapStr *b) {
+    if (b->len > 0 && zap_path_is_sep(b->data[0])) {
+        return 1;
+    }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    if (b->len >= 2 && b->data[1] == ':' &&
+        ((b->data[0] >= 'A' && b->data[0] <= 'Z') ||
+         (b->data[0] >= 'a' && b->data[0] <= 'z'))) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
+/* os.path_join(a, b): join with a single '/'. An absolute `b` replaces `a`.
+ * The inserted separator is always '/' (Zap's portable, Python-readable choice,
+ * accepted by every Windows API); an existing trailing '/' or '\\' on `a` is not
+ * doubled. */
 void *zap_os_path_join(void *a_, void *b_) {
     ZapStr *a = (ZapStr *)a_;
     ZapStr *b = (ZapStr *)b_;
-    if (b->len > 0 && b->data[0] == '/') {
+    if (b->len > 0 && zap_path_is_abs(b)) {
         return zap_str_new(b->data, b->len);
     }
     if (a->len == 0) {
         return zap_str_new(b->data, b->len);
     }
-    int need_sep = a->data[a->len - 1] != '/';
+    int need_sep = !zap_path_is_sep(a->data[a->len - 1]);
     int64_t n = a->len + (need_sep ? 1 : 0) + b->len;
     char *buf = (char *)zap_buf(n);
     memcpy(buf, a->data, (size_t)a->len);
@@ -5181,6 +5622,12 @@ void *zap_os_path_dirname(void *path_) {
 #if defined(__APPLE__)
 static int zap_prog_argc(void) { return *_NSGetArgc(); }
 static char **zap_prog_argv(void) { return *_NSGetArgv(); }
+#elif defined(ZAP_PLATFORM_WINDOWS)
+/* The MSVCRT startup populates the __argc / __argv globals (declared by
+ * <stdlib.h>) before main runs — the Windows analogue of the ELF init-array
+ * (argc, argv) capture below. */
+static int zap_prog_argc(void) { return __argc; }
+static char **zap_prog_argv(void) { return __argv; }
 #else
 /* On ELF platforms the dynamic loader passes (argc, argv, envp) to init-array
  * constructors; capture them for sys.argv (there is no argv parameter on the
@@ -5211,12 +5658,15 @@ void *zap_sys_argv(void) {
 /* sys.exit(code): terminate the process immediately with `code`. */
 void zap_sys_exit(int64_t code) { exit((int)code); }
 
-/* sys.platform() -> str. */
+/* sys.platform() -> str. Mirrors CPython's sys.platform values ("win32" on all
+ * Windows, 64-bit included, per Python convention). */
 void *zap_sys_platform(void) {
 #if defined(__APPLE__)
     return zap_str_new("darwin", 6);
 #elif defined(__linux__)
     return zap_str_new("linux", 5);
+#elif defined(ZAP_PLATFORM_WINDOWS)
+    return zap_str_new("win32", 5);
 #else
     return zap_str_new("unknown", 7);
 #endif
@@ -5244,7 +5694,7 @@ int64_t zap_io_open(void *path_, void *mode_) {
         zap_sys_fail("io.open", "invalid mode (want one of: r r+ w w+ a a+)");
         return -1; /* unreachable */
     }
-    int fd = open(zap_sys_cstr((ZapStr *)path_), flags, 0644);
+    int fd = open(zap_sys_cstr((ZapStr *)path_), flags | ZAP_O_BINARY, 0644);
     if (fd < 0) {
         zap_sys_fail("io.open", strerror(errno));
     }
@@ -5328,7 +5778,7 @@ static void *zap_read_all_fd(int fd) {
 
 /* fs.read_file(path) -> str: the whole file. */
 void *zap_fs_read_file(void *path_) {
-    int fd = open(zap_sys_cstr((ZapStr *)path_), O_RDONLY);
+    int fd = open(zap_sys_cstr((ZapStr *)path_), O_RDONLY | ZAP_O_BINARY);
     if (fd < 0) {
         zap_sys_fail("fs.read_file", strerror(errno));
     }
@@ -5339,7 +5789,8 @@ void *zap_fs_read_file(void *path_) {
 
 /* fs.write_file(path, data): create/truncate and write the whole string. */
 void zap_fs_write_file(void *path_, void *data_) {
-    int fd = open(zap_sys_cstr((ZapStr *)path_), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(zap_sys_cstr((ZapStr *)path_), O_WRONLY | O_CREAT | O_TRUNC | ZAP_O_BINARY,
+                  0644);
     if (fd < 0) {
         zap_sys_fail("fs.write_file", strerror(errno));
     }
@@ -5380,16 +5831,87 @@ int64_t zap_fs_size(void *path_) {
     return (int64_t)st.st_size;
 }
 
-/* fs.mkdtemp() -> str: create a unique temp directory (under $TMPDIR or /tmp)
- * and return its path. Powers hermetic temp-dir workflows (and the goldens). */
-void *zap_fs_mkdtemp(void) {
-    const char *tmp = getenv("TMPDIR");
-    if (tmp == NULL || *tmp == '\0') {
-        tmp = "/tmp";
+/* The temp directory: $TMPDIR else /tmp on POSIX (unchanged); $TMP / $TEMP else
+ * the Windows default on Windows — the Python tempfile search order per platform.
+ * '/' works as a separator on Windows too, so the "%s/zap..." templates below are
+ * unchanged across platforms. */
+static const char *zap_tempdir(void) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    const char *t = getenv("TMP");
+    if (t == NULL || *t == '\0') {
+        t = getenv("TEMP");
     }
+    if (t == NULL || *t == '\0') {
+        t = "C:/Windows/Temp";
+    }
+    return t;
+#else
+    const char *t = getenv("TMPDIR");
+    if (t == NULL || *t == '\0') {
+        t = "/tmp";
+    }
+    return t;
+#endif
+}
+
+#if defined(ZAP_PLATFORM_WINDOWS)
+/* Fill the trailing "XXXXXX" of `tmpl` in place with a pseudo-unique suffix. The
+ * replacements for POSIX mkstemp/mkdtemp, which MinGW-w64 does not provide; the
+ * O_EXCL / EEXIST retry below is what makes them atomic-enough for temp use. */
+static void zap_win_fill_template(char *tmpl) {
+    static const char cs[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    size_t len = strlen(tmpl);
+    static volatile LONG seq = 0;
+    unsigned long long r = (unsigned long long)GetCurrentProcessId();
+    r ^= (unsigned long long)GetTickCount64();
+    r ^= (unsigned long long)InterlockedIncrement(&seq) * 2654435761ULL;
+    for (int i = 0; i < 6 && len >= 6; i++) {
+        tmpl[len - 6 + i] = cs[r % 36];
+        r = r / 36 + 0x9e3779b97f4a7c15ULL;
+    }
+}
+
+/* mkstemp replacement: create+open a unique file (O_EXCL), returning an fd. */
+static int zap_win_mkstemp(char *tmpl) {
+    for (int attempt = 0; attempt < 256; attempt++) {
+        zap_win_fill_template(tmpl);
+        int fd = _open(tmpl, _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY,
+                       _S_IREAD | _S_IWRITE);
+        if (fd >= 0) {
+            return fd;
+        }
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+/* mkdtemp replacement: create a unique directory, returning tmpl or NULL. */
+static char *zap_win_mkdtemp(char *tmpl) {
+    for (int attempt = 0; attempt < 256; attempt++) {
+        zap_win_fill_template(tmpl);
+        if (_mkdir(tmpl) == 0) {
+            return tmpl;
+        }
+        if (errno != EEXIST) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+#endif /* ZAP_PLATFORM_WINDOWS */
+
+/* fs.mkdtemp() -> str: create a unique temp directory (under the platform temp
+ * dir) and return its path. Powers hermetic temp-dir workflows (and the goldens). */
+void *zap_fs_mkdtemp(void) {
     char tmpl[4096];
-    snprintf(tmpl, sizeof tmpl, "%s/zapXXXXXX", tmp);
+    snprintf(tmpl, sizeof tmpl, "%s/zapXXXXXX", zap_tempdir());
+#if defined(ZAP_PLATFORM_WINDOWS)
+    if (zap_win_mkdtemp(tmpl) == NULL) {
+#else
     if (mkdtemp(tmpl) == NULL) {
+#endif
         zap_sys_fail("fs.mkdtemp", strerror(errno));
     }
     return zap_str_new(tmpl, (int64_t)strlen(tmpl));
@@ -5413,10 +5935,75 @@ static const int32_t zap_off_proc[] = {
 static const ZapTypeDesc zap_desc_proc = {(int64_t)sizeof(ZapProc), ZAP_TD_PRECISE,
                                           2, zap_off_proc};
 
+#if defined(ZAP_PLATFORM_WINDOWS)
+/* Build a single Windows command line from an argv vector, applying the MSVCRT
+ * `CommandLineToArgvW`/`parse_cmdline` quoting rules so each argument round-trips
+ * through the child's argv exactly (quote args with spaces/tabs/quotes; escape
+ * embedded quotes with backslashes; double the backslashes that precede a quote).
+ * Returns a malloc'd NUL-terminated string the caller frees, or NULL on OOM. */
+static char *zap_win_build_cmdline(char **argv, int64_t n) {
+    size_t cap = 16;
+    for (int64_t i = 0; i < n; i++) {
+        cap += strlen(argv[i]) * 2 + 4; /* worst case: every char escaped + quotes */
+    }
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        return NULL;
+    }
+    size_t o = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (i > 0) {
+            out[o++] = ' ';
+        }
+        const char *a = argv[i];
+        int needq = (*a == '\0');
+        for (const char *p = a; *p; p++) {
+            if (*p == ' ' || *p == '\t' || *p == '"') {
+                needq = 1;
+                break;
+            }
+        }
+        if (!needq) {
+            for (const char *p = a; *p; p++) {
+                out[o++] = *p;
+            }
+            continue;
+        }
+        out[o++] = '"';
+        for (const char *p = a;; p++) {
+            size_t nbs = 0;
+            while (*p == '\\') {
+                nbs++;
+                p++;
+            }
+            if (*p == '\0') {
+                for (size_t k = 0; k < nbs * 2; k++) {
+                    out[o++] = '\\'; /* all backslashes before the closing quote */
+                }
+                break;
+            } else if (*p == '"') {
+                for (size_t k = 0; k < nbs * 2 + 1; k++) {
+                    out[o++] = '\\'; /* escape the embedded quote */
+                }
+                out[o++] = '"';
+            } else {
+                for (size_t k = 0; k < nbs; k++) {
+                    out[o++] = '\\';
+                }
+                out[o++] = *p;
+            }
+        }
+        out[o++] = '"';
+    }
+    out[o] = '\0';
+    return out;
+}
+#endif /* ZAP_PLATFORM_WINDOWS */
+
 /* process.run(argv: list[str]) -> ZapProc*: spawn argv[0] (PATH-searched) with
  * the given arguments, capturing stdout/stderr into temp files (so there is no
  * pipe-buffer deadlock), and wait. The exit code is the child's status, or
- * 128+signo if it was killed by a signal. Raises on spawn failure. */
+ * 128+signo if it was killed by a signal (POSIX). Raises on spawn failure. */
 void *zap_process_run(void *argv_list) {
     int64_t n = zap_list_len(argv_list);
     if (n < 1) {
@@ -5431,19 +6018,24 @@ void *zap_process_run(void *argv_list) {
     }
     cargv[n] = NULL;
 
-    const char *tmp = getenv("TMPDIR");
-    if (tmp == NULL || *tmp == '\0') {
-        tmp = "/tmp";
-    }
+    const char *tmp = zap_tempdir();
     char otmpl[4096], etmpl[4096];
     snprintf(otmpl, sizeof otmpl, "%s/zapout_XXXXXX", tmp);
     snprintf(etmpl, sizeof etmpl, "%s/zaperr_XXXXXX", tmp);
+#if defined(ZAP_PLATFORM_WINDOWS)
+    int ofd = zap_win_mkstemp(otmpl);
+#else
     int ofd = mkstemp(otmpl);
+#endif
     if (ofd < 0) {
         free(cargv);
         zap_sys_fail("process.run", strerror(errno));
     }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    int efd = zap_win_mkstemp(etmpl);
+#else
     int efd = mkstemp(etmpl);
+#endif
     if (efd < 0) {
         int e = errno;
         close(ofd);
@@ -5452,6 +6044,53 @@ void *zap_process_run(void *argv_list) {
         zap_sys_fail("process.run", strerror(e));
     }
 
+    int64_t code;
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* CreateProcessW with stdout/stderr redirected to the temp files. The child
+     * inherits the two file handles (marked inheritable); the command line carries
+     * argv with MSVCRT quoting, and a NULL application name lets CreateProcess do
+     * the PATH search posix_spawnp would (Python-faithful). There is no signal
+     * exit status on Windows, so `code` is just the process exit code. */
+    char *cmdline = zap_win_build_cmdline(cargv, n);
+    free(cargv);
+    if (!cmdline) {
+        close(ofd);
+        close(efd);
+        unlink(otmpl);
+        unlink(etmpl);
+        zap_sys_fail("process.run", "out of memory");
+    }
+    HANDLE oh = (HANDLE)_get_osfhandle(ofd);
+    HANDLE eh = (HANDLE)_get_osfhandle(efd);
+    SetHandleInformation(oh, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(eh, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    STARTUPINFOA si;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = oh;
+    si.hStdError = eh;
+    PROCESS_INFORMATION pi;
+    memset(&pi, 0, sizeof pi);
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    free(cmdline);
+    if (!ok) {
+        close(ofd);
+        close(efd);
+        unlink(otmpl);
+        unlink(etmpl);
+        zap_sys_fail("process.run", "CreateProcess failed");
+    }
+    zap_enter_blocking(); /* GC-safe: no un-flushed Zap temporaries across wait */
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    zap_leave_blocking();
+    DWORD exit_code = 1;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    code = (int64_t)exit_code;
+#else
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, ofd, 1);
@@ -5476,7 +6115,6 @@ void *zap_process_run(void *argv_list) {
     } while (w < 0 && errno == EINTR);
     zap_leave_blocking();
 
-    int64_t code;
     if (w < 0) {
         code = -1;
     } else if (WIFEXITED(status)) {
@@ -5486,6 +6124,7 @@ void *zap_process_run(void *argv_list) {
     } else {
         code = -1;
     }
+#endif
 
     ZapProc *r = (ZapProc *)zap_obj(&zap_desc_proc);
     r->code = code;
@@ -5518,8 +6157,10 @@ void *zap_process_result_stderr(void *r) { return ((ZapProc *)r)->err; }
  * holds the hash context; hexdigest/digest finalize a COPY, so a handle may be
  * digested more than once and keeps accepting updates afterwards.
  * ========================================================================== */
-#include <fcntl.h>      /* open, O_RDONLY (CSPRNG fallback) */
-#include <sys/random.h> /* getentropy */
+#include <fcntl.h> /* open, O_RDONLY (CSPRNG fallback) */
+#if defined(ZAP_PLATFORM_POSIX)
+#include <sys/random.h> /* getentropy (Windows uses BCryptGenRandom, see below)  */
+#endif
 
 #define ZAP_CRY_SHA256 0
 #define ZAP_CRY_SHA512 1
@@ -6184,6 +6825,16 @@ void *zap_crypto_hmac_sha512(void *key, void *msg) {
 
 /* ---- Secure random / secrets ---- */
 static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* CNG system CSPRNG: the Windows replacement for getentropy/_urandom. With the
+     * BCRYPT_USE_SYSTEM_PREFERRED_RNG flag no algorithm handle is needed. The call
+     * fills the whole buffer in one go (no 256-byte per-call limit). */
+    if (BCryptGenRandom(NULL, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        fprintf(stderr, "zap: crypto: no CSPRNG available (BCryptGenRandom)\n");
+        abort();
+    }
+    return;
+#else
     size_t off = 0;
     while (off < n) {
         size_t chunk = n - off;
@@ -6210,6 +6861,7 @@ static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
         close(fd);
         return;
     }
+#endif /* ZAP_PLATFORM_WINDOWS */
 }
 
 void *zap_crypto_random_bytes(int64_t n) {
@@ -6520,6 +7172,11 @@ static uint64_t zap_os_entropy_u64(void) {
     arc4random_buf(&s, sizeof s);
 #elif defined(__linux__)
     if (getentropy(&s, sizeof s) != 0) {
+        s = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 21);
+    }
+#elif defined(ZAP_PLATFORM_WINDOWS)
+    if (BCryptGenRandom(NULL, (PUCHAR)&s, (ULONG)sizeof s,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
         s = (uint64_t)time(NULL) ^ ((uint64_t)clock() << 21);
     }
 #else
@@ -8906,16 +9563,76 @@ void zap_once_end(void *op) {
  * process (#97) and zlib (#106) runtime sections already follow.
  * ========================================================================== */
 #include <errno.h>
+#include <stddef.h> /* offsetof */
+#if defined(ZAP_PLATFORM_POSIX)
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <stddef.h> /* offsetof */
 #include <sys/socket.h>
 #include <sys/types.h>
+#else
+/* Windows TCP sockets run on Winsock2 (<winsock2.h>/<ws2tcpip.h>, included at the
+ * top under the platform seam). getaddrinfo/sockaddr_in/ntohs and the SOCKET type
+ * come from there; the fd model is the netpoller's int64_t-carries-SOCKET
+ * convention (A2 #196), so sockets created here are IOCP/AFD-pollable. */
+#endif
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0 /* fallback: SIGPIPE possible on peer close, but compiles */
+#endif
+
+/* ---- socket compatibility seam (I#198) ------------------------------------ *
+ * On POSIX a socket is an int fd and errors come from errno; on Windows it is a
+ * SOCKET (pointer-width — so the handle type is zap_fd_t, carried into the
+ * netpoller as the int64_t that A2's IOCP/AFD backend expects) and errors come
+ * from WSAGetLastError with the WSAE* constants. These predicates keep the shared
+ * accept/connect/recv/send loops below single-shape: on POSIX they reduce to the
+ * exact errno checks the Linux build always used. `socket()`/`accept()` return
+ * standard Winsock sockets, which SIO_BASE_HANDLE unwraps, so they are pollable
+ * by the A2 netpoller with no change to the fd model. */
+#if defined(ZAP_PLATFORM_WINDOWS)
+typedef SOCKET zap_fd_t;
+#define ZAP_INVALID_FD INVALID_SOCKET /* SOCKET is unsigned: socket() errors give
+                                       * INVALID_SOCKET, never a negative value */
+#define ZAP_FD_VALID(fd) ((fd) != INVALID_SOCKET)
+#define ZAP_SOCK_ERR() WSAGetLastError()
+#define ZAP_SOCK_EINTR(e) ((e) == WSAEINTR)
+#define ZAP_SOCK_WOULDBLOCK(e) ((e) == WSAEWOULDBLOCK)
+#define ZAP_SOCK_INPROGRESS(e) ((e) == WSAEWOULDBLOCK || (e) == WSAEINPROGRESS)
+#define ZAP_SOCK_ALREADY(e) ((e) == WSAEALREADY || (e) == WSAEWOULDBLOCK)
+#define ZAP_SOCK_ISCONN(e) ((e) == WSAEISCONN)
+static void zap_sock_close_fd(zap_fd_t fd) { closesocket(fd); }
+static int zap_sock_make_nonblocking(zap_fd_t fd) {
+    u_long m = 1;
+    return ioctlsocket(fd, FIONBIO, &m);
+}
+/* Winsock needs WSAStartup before any socket call; refcounted + idempotent. */
+static void zap_net_startup_once(void) {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+}
+static pthread_once_t g_net_startup_once = PTHREAD_ONCE_INIT;
+static void zap_net_startup(void) { pthread_once(&g_net_startup_once, zap_net_startup_once); }
+#else
+typedef int zap_fd_t;
+#define ZAP_INVALID_FD (-1)
+#define ZAP_FD_VALID(fd) ((fd) >= 0)
+#define ZAP_SOCK_ERR() errno
+#define ZAP_SOCK_EINTR(e) ((e) == EINTR)
+#define ZAP_SOCK_WOULDBLOCK(e) ((e) == EAGAIN || (e) == EWOULDBLOCK)
+#define ZAP_SOCK_INPROGRESS(e) ((e) == EINPROGRESS)
+#define ZAP_SOCK_ALREADY(e) ((e) == EALREADY)
+#define ZAP_SOCK_ISCONN(e) ((e) == EISCONN)
+static void zap_sock_close_fd(zap_fd_t fd) { close(fd); }
+static int zap_sock_make_nonblocking(zap_fd_t fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+static void zap_net_startup(void) {}
 #endif
 
 /* First occurrence of `needle` (nlen bytes) in `hay` (hlen bytes), or NULL.
@@ -8953,11 +9670,11 @@ static char *zap_net_dupz(const ZapStr *s) {
 
 /* ---- socket handle -------------------------------------------------------- *
  * A listener or connection. `pd` is the netpoller descriptor (plain malloc
- * infra, never GC) or NULL when the netpoller is unavailable (non-Linux; this
- * file only compiles on Linux, so NULL is the defensive blocking fallback).
- * The handle is ATOMIC — fd is a scalar and pd is non-GC, so nothing to trace. */
+ * infra, never GC) or NULL when the netpoller is unavailable (the defensive
+ * blocking fallback). The handle is ATOMIC — `fd` is a scalar (int on POSIX,
+ * SOCKET on Windows) and `pd` is non-GC, so nothing to trace. */
 typedef struct {
-    int fd;
+    zap_fd_t fd;
     void *pd;
 } ZapSock;
 
@@ -8965,11 +9682,8 @@ static const ZapTypeDesc zap_desc_sock = {(int64_t)sizeof(ZapSock), ZAP_TD_ATOMI
 
 /* Wrap an owned fd: make it non-blocking and register it with the netpoller.
  * Returns a GC handle. No park happens here, so building the GC object is safe. */
-static ZapSock *zap_sock_wrap(int fd) {
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) {
-        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    }
+static ZapSock *zap_sock_wrap(zap_fd_t fd) {
+    zap_sock_make_nonblocking(fd);
     void *pd = zap_netpoll_open((int64_t)fd); /* NULL => blocking-poll fallback */
     ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
     s->fd = fd;
@@ -8981,11 +9695,23 @@ static ZapSock *zap_sock_wrap(int fd) {
  * netpoller this frees the M; without it (pd == NULL) fall back to a blocking
  * poll() bracketed by enter/leave_blocking so the collector treats us as stopped.
  * Returns 0 on readiness, -1 if the descriptor was closed under us. */
-static int zap_sock_park(int fd, void *pd, int mode) {
+static int zap_sock_park(zap_fd_t fd, void *pd, int mode) {
     if (pd) {
         int64_t r = zap_netpoll_wait(pd, mode, 0);
         return (r == ZAP_POLL_CLOSED) ? -1 : 0;
     }
+#if defined(ZAP_PLATFORM_WINDOWS)
+    /* The netpoller is always available on Windows (IOCP), so this is only a
+     * defensive fallback. WSAPoll is the poll() analogue. */
+    WSAPOLLFD pfd;
+    pfd.fd = fd;
+    pfd.events = (SHORT)((mode == ZAP_POLL_READ) ? POLLRDNORM : POLLWRNORM);
+    pfd.revents = 0;
+    zap_enter_blocking();
+    WSAPoll(&pfd, 1, -1);
+    zap_leave_blocking();
+    return 0;
+#else
     struct pollfd pfd;
     pfd.fd = fd;
     pfd.events = (short)((mode == ZAP_POLL_READ) ? POLLIN : POLLOUT);
@@ -8997,6 +9723,7 @@ static int zap_sock_park(int fd, void *pd, int mode) {
     }
     zap_leave_blocking();
     return 0;
+#endif
 }
 
 /* ---- net.listen / connect / accept / recv / send / port / close ----------- */
@@ -9040,23 +9767,25 @@ static struct addrinfo *zap_net_resolve(const ZapStr *host, int64_t port, int pa
  * server can rebind an ephemeral port promptly across test runs. Port 0 asks the
  * OS for an ephemeral port (read back with net.port). */
 void *zap_net_listen(void *host_, int64_t port) {
+    zap_net_startup();
     struct addrinfo *res = zap_net_resolve((const ZapStr *)host_, port, 1);
-    int fd = -1;
+    zap_fd_t fd = ZAP_INVALID_FD;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) {
+        if (!ZAP_FD_VALID(fd)) {
             continue;
         }
         int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 128) == 0) {
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+        if (bind(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen) == 0 &&
+            listen(fd, 128) == 0) {
             break;
         }
-        close(fd);
-        fd = -1;
+        zap_sock_close_fd(fd);
+        fd = ZAP_INVALID_FD;
     }
     freeaddrinfo(res);
-    if (fd < 0) {
+    if (!ZAP_FD_VALID(fd)) {
         zap_net_panic("net: listen failed");
         return NULL;
     }
@@ -9067,41 +9796,41 @@ void *zap_net_listen(void *host_, int64_t port) {
  * EINPROGRESS park for writability, then check SO_ERROR. Tries each resolved
  * address in turn. */
 void *zap_net_connect(void *host_, int64_t port) {
+    zap_net_startup();
     struct addrinfo *res = zap_net_resolve((const ZapStr *)host_, port, 0);
-    int fd = -1;
+    zap_fd_t fd = ZAP_INVALID_FD;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) {
+        if (!ZAP_FD_VALID(fd)) {
             continue;
         }
-        int fl = fcntl(fd, F_GETFL, 0);
-        if (fl >= 0) {
-            fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-        }
+        zap_sock_make_nonblocking(fd);
         void *pd = zap_netpoll_open((int64_t)fd);
         int ok = 0;
         for (;;) {
-            int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+            int rc = connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen);
             if (rc == 0) {
                 ok = 1;
                 break;
             }
-            if (errno == EINTR) {
+            int e = ZAP_SOCK_ERR();
+            if (ZAP_SOCK_EINTR(e)) {
                 continue;
             }
-            if (errno == EINPROGRESS || errno == EALREADY) {
+            if (ZAP_SOCK_INPROGRESS(e) || ZAP_SOCK_ALREADY(e)) {
                 if (zap_sock_park(fd, pd, ZAP_POLL_WRITE) < 0) {
                     break;
                 }
                 int soerr = 0;
                 socklen_t sl = sizeof soerr;
-                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) < 0 || soerr != 0) {
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&soerr, &sl) < 0 ||
+                    soerr != 0) {
                     break;
                 }
                 ok = 1;
                 break;
             }
-            if (errno == EISCONN) {
+            if (ZAP_SOCK_ISCONN(e)) {
                 ok = 1;
                 break;
             }
@@ -9118,8 +9847,8 @@ void *zap_net_connect(void *host_, int64_t port) {
         if (pd) {
             zap_netpoll_close(pd);
         }
-        close(fd);
-        fd = -1;
+        zap_sock_close_fd(fd);
+        fd = ZAP_INVALID_FD;
     }
     freeaddrinfo(res);
     zap_net_panic("net: connect failed");
@@ -9130,17 +9859,18 @@ void *zap_net_connect(void *host_, int64_t port) {
  * connects. */
 void *zap_net_accept(void *l_) {
     ZapSock *l = (ZapSock *)l_;
-    int lfd = l->fd;
+    zap_fd_t lfd = l->fd;
     void *lpd = l->pd;
     for (;;) {
-        int cfd = accept(lfd, NULL, NULL);
-        if (cfd >= 0) {
+        zap_fd_t cfd = accept(lfd, NULL, NULL);
+        if (ZAP_FD_VALID(cfd)) {
             return zap_sock_wrap(cfd);
         }
-        if (errno == EINTR) {
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
             continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
             if (zap_sock_park(lfd, lpd, ZAP_POLL_READ) < 0) {
                 zap_net_panic("net: accept on a closed listener");
                 return NULL;
@@ -9157,7 +9887,7 @@ void *zap_net_accept(void *l_) {
  * park); the result is copied into a GC str at the end. */
 void *zap_net_recv(void *c_, int64_t n) {
     ZapSock *c = (ZapSock *)c_;
-    int fd = c->fd;
+    zap_fd_t fd = c->fd;
     void *pd = c->pd;
     if (n < 0) {
         n = 0;
@@ -9169,15 +9899,16 @@ void *zap_net_recv(void *c_, int64_t n) {
     }
     ssize_t got = 0;
     for (;;) {
-        ssize_t r = recv(fd, buf, (size_t)n, 0);
+        ssize_t r = (ssize_t)recv(fd, buf, (size_t)n, 0);
         if (r >= 0) {
             got = r;
             break;
         }
-        if (errno == EINTR) {
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
             continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
             if (zap_sock_park(fd, pd, ZAP_POLL_READ) < 0) {
                 got = 0;
                 break;
@@ -9197,18 +9928,19 @@ void *zap_net_recv(void *c_, int64_t n) {
  * suppresses SIGPIPE on a peer close (the #77 signal subsystem is left alone).
  * `data` is malloc scratch, so it survives the parks. Returns bytes written, or
  * -1 on a hard error. */
-static ssize_t zap_sock_send_all(int fd, void *pd, const char *data, size_t len) {
+static ssize_t zap_sock_send_all(zap_fd_t fd, void *pd, const char *data, size_t len) {
     size_t off = 0;
     while (off < len) {
-        ssize_t w = send(fd, data + off, len - off, MSG_NOSIGNAL);
+        ssize_t w = (ssize_t)send(fd, data + off, len - off, MSG_NOSIGNAL);
         if (w >= 0) {
             off += (size_t)w;
             continue;
         }
-        if (errno == EINTR) {
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
             continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
             if (zap_sock_park(fd, pd, ZAP_POLL_WRITE) < 0) {
                 return -1;
             }
@@ -9223,7 +9955,7 @@ static ssize_t zap_sock_send_all(int fd, void *pd, const char *data, size_t len)
  * scratch first so no GC pointer is held across the write parks. */
 int64_t zap_net_send(void *c_, void *data_) {
     ZapSock *c = (ZapSock *)c_;
-    int fd = c->fd;
+    zap_fd_t fd = c->fd;
     void *pd = c->pd;
     const ZapStr *data = (const ZapStr *)data_;
     size_t len = (size_t)(data->len < 0 ? 0 : data->len);
@@ -9261,12 +9993,12 @@ int64_t zap_net_port(void *s_) {
 
 /* Close a raw fd + netpoller descriptor. Used both by net.close and by the HTTP
  * client, which holds only fd+pd (never the GC handle) across its I/O parks. */
-static void zap_sock_shutdown(int fd, void *pd) {
+static void zap_sock_shutdown(zap_fd_t fd, void *pd) {
     if (pd) {
         zap_netpoll_close(pd);
     }
-    if (fd >= 0) {
-        close(fd);
+    if (ZAP_FD_VALID(fd)) {
+        zap_sock_close_fd(fd);
     }
 }
 
@@ -9637,14 +10369,17 @@ static void *zap_tls_test_serve(void *arg) {
     SSL_CTX *ctx = s->ctx;
     int cfd = -1;
     for (;;) {
-        cfd = accept(lfd, NULL, NULL);
+        /* OpenSSL's SSL_set_fd takes an int fd on every platform; a Windows socket
+         * handle fits (INVALID_SOCKET truncates to -1, so the `< 0` check holds). */
+        cfd = (int)accept(lfd, NULL, NULL);
         if (cfd >= 0) {
             break;
         }
-        if (errno == EINTR) {
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
             continue;
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
             if (zap_sock_park(lfd, lpd, ZAP_POLL_READ) < 0) {
                 goto done;
             }
@@ -9653,10 +10388,7 @@ static void *zap_tls_test_serve(void *arg) {
         goto done;
     }
     {
-        int fl = fcntl(cfd, F_GETFL, 0);
-        if (fl >= 0) {
-            fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
-        }
+        zap_sock_make_nonblocking(cfd);
         void *cpd = zap_netpoll_open((int64_t)cfd);
         SSL *ssl = SSL_new(ctx);
         if (ssl) {

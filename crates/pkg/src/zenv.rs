@@ -41,16 +41,30 @@ pub fn module_search_paths(
     home: Option<&str>,
 ) -> Vec<PathBuf> {
     if let Some(z) = zap_zenv.filter(|s| !s.is_empty()) {
-        return vec![Path::new(z).join(PKG_SUBDIR)];
+        return vec![join_slash(z, &[PKG_SUBDIR])];
     }
     if let Some(c) = zap_cache.filter(|s| !s.is_empty()) {
         return vec![PathBuf::from(c)];
     }
-    let base = home
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    vec![base.join(".zap").join(PKG_SUBDIR)]
+    let base = home.filter(|s| !s.is_empty()).unwrap_or(".");
+    vec![join_slash(base, &[".zap", PKG_SUBDIR])]
+}
+
+/// Join path components with a forward slash, the one separator Zap uses on every
+/// platform (Python-faithful: Python uses `/` and Windows accepts it in every API;
+/// `std::path::Path::join` would insert a backslash on Windows, which is both
+/// non-portable in Zap module paths and user-visible in `zap zenv path`). On POSIX
+/// this is byte-identical to the previous `Path::join`. A component that is already
+/// absolute (or the base already ending in a separator) is not double-separated.
+fn join_slash(base: &str, subs: &[&str]) -> PathBuf {
+    let mut s = base.to_string();
+    for sub in subs {
+        if !s.is_empty() && !s.ends_with('/') && !s.ends_with('\\') {
+            s.push('/');
+        }
+        s.push_str(sub);
+    }
+    PathBuf::from(s)
 }
 
 /// Read the real process environment and return the active module search path.
