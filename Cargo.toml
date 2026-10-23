@@ -12,6 +12,7 @@ members = [
     "crates/mono",
     "crates/ir",
     "crates/codegen",
+    "crates/fmt",
     "crates/pkg",
     "crates/driver",
 ]
@@ -26,6 +27,7 @@ default-members = [
     "crates/ir_core",
     "crates/mono",
     "crates/ir",
+    "crates/fmt",
     "crates/pkg",
     "crates/driver",
 ]
