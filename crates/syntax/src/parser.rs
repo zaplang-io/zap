@@ -11,9 +11,10 @@
 //! `*`/`/`/`//`/`%` · unary `+`/`-`/`~` · `**` · call/index/slice/attr.
 
 use crate::ast::*;
-use crate::lexer::tokenize;
+use crate::lexer::{tokenize, tokenize_with_trivia};
 use crate::span::Span;
 use crate::token::{Keyword, Token, TokenKind};
+use crate::trivia::Comment;
 
 /// A parse error with the offending source span.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +43,23 @@ pub fn parse_str(src: &str) -> (Module, Vec<ParseError>, Vec<crate::lexer::LexEr
     let (tokens, lex_errors) = tokenize(src);
     let (module, parse_errors) = parse_with_source(tokens, src);
     (module, parse_errors, lex_errors)
+}
+
+/// Like [`parse_str`], but also recovers comment trivia (I#157/A1, #225) for
+/// tooling that must re-emit source faithfully (`zap fmt`, `zap doc`). The
+/// `Module`/errors are identical to [`parse_str`]; the `Vec<Comment>` is the
+/// additive side-channel.
+pub fn parse_str_with_trivia(
+    src: &str,
+) -> (
+    Module,
+    Vec<ParseError>,
+    Vec<crate::lexer::LexError>,
+    Vec<Comment>,
+) {
+    let (tokens, lex_errors, comments) = tokenize_with_trivia(src);
+    let (module, parse_errors) = parse_with_source(tokens, src);
+    (module, parse_errors, lex_errors, comments)
 }
 
 /// The compiler-known built-in prelude (ticket #77, D-0058; ticket #99): the

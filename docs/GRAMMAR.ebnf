@@ -327,5 +327,6 @@ dotted_name   ::= IDENT { "." IDENT } ;
    TYPE_KEYWORD  int32 int64 float32 float64 i32 i64 f32 f64 bool char str
                  bytes bigint complex list dict set heap array
    DELIM      a regex delimiter char after m/s (e.g. "/", "{", "!")
-   Comments   "#" to end of line.
+   Comments   "#" to end of line. Discarded by the parser, but recoverable as
+              trivia for tooling (zap fmt/doc) via tokenize_with_trivia (#225).
    ---------------------------------------------------------------------- *)

@@ -11,6 +11,7 @@ pub mod lexer;
 pub mod parser;
 pub mod span;
 pub mod token;
+pub mod trivia;
 
 /// The language/compiler version these definitions target.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
