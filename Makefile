@@ -63,7 +63,7 @@ LIMITS := --memory=$(ZAP_DOCKER_MEMORY) --memory-swap=$(ZAP_DOCKER_MEMORY) \
 DOCKER_RUN := docker run --rm --init $(LIMITS) $(MOUNTS) $(ENVS) $(IMAGE)
 
 .PHONY: docker-build docker-test docker-check docker-build-crate docker-shell \
-        docker-run docker-sccache-stats check clean-docker-target
+        docker-run docker-sccache-stats check clean-docker-target repro-223
 
 ## Build the dev container image.
 docker-build:
@@ -76,6 +76,21 @@ docker-build:
 docker-test:
 	$(DOCKER_RUN) cargo test --workspace --features zapc/gc-immix
 	$(DOCKER_RUN) cargo test --workspace --features zapc/gc-boehm
+
+## I#223 regression gate (open bug): build the amp evacuation-stress repro and
+## loop it at MAXPROCS=2 and 4 under BOTH collectors, reporting the failure rate.
+## On aarch64 this FAILS today (~97%); on x86 it is 0/N. A fix must drive it to
+## 0/N on both at MAXPROCS 2+4 on real aarch64. See tests/repro223/RESUME.md.
+## (Not part of `docker-test` — it is a known-failing diagnostic gate, run on
+## demand; on aarch64 run it natively or under the arm64 dev image.)
+repro-223:
+	$(DOCKER_RUN) bash -c 'set -e; \
+	  cargo build -p zapc --features zapc/llvm,zapc/gc-immix; \
+	  ZAPC=$$(find $$CARGO_TARGET_DIR -name zapc -type f -path "*/debug/*" | head -1); \
+	  echo "=== gc-immix ==="; ZAPC=$$ZAPC N=$${N:-200} bash tests/repro223/regress.sh || true; \
+	  cargo build -p zapc --features zapc/llvm,zapc/gc-boehm; \
+	  ZAPC=$$(find $$CARGO_TARGET_DIR -name zapc -type f -path "*/debug/*" | head -1); \
+	  echo "=== gc-boehm ==="; ZAPC=$$ZAPC N=$${N:-200} bash tests/repro223/regress.sh || true'
 
 ## Fast full-workspace type-check in the container (codegen included, NO
 ## codegen/link). Use this to iterate on codegen-touching changes; far cheaper

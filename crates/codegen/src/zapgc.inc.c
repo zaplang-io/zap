@@ -136,6 +136,27 @@ static size_t zap_live_estimate = 0;
 static int zap_evac_active = 0;        /* evacuation enabled for the current cycle */
 static int zap_evac_disabled = 0;      /* ZAP_GC_NO_EVAC set: skip evacuation      */
 static int zap_evac_poison = 0;        /* ZAP_GC_EVAC_POISON: clobber moved-from (#223) */
+static int zap_gc_no_reclaim = 0;      /* ZAP_GC_NO_RECLAIM: mark but never reuse (#223 diag) */
+static int zap_gc_verify_roots = 0;    /* ZAP_GC_VERIFY_ROOTS: scan stacks for missed roots (#223) */
+/* DIAGNOSTIC (#223): detect a mutator executing compiled code / allocating while
+ * the collector is in its mark phase (world supposedly stopped). If this fires,
+ * the STW handshake let a mutator on another core keep running during marking =
+ * the base cross-core root-capture race. `zap_in_mark` is set by the collector
+ * around root enumeration + trace; `zap_self_collecting` (per-thread) marks the
+ * collector itself so it never flags its own activity. */
+static volatile int zap_in_mark = 0;
+static __thread int zap_self_collecting = 0;
+static int zap_gc_mark_race = 0;       /* ZAP_GC_MARK_RACE: detect mutation during mark (#223) */
+static int zap_gc_poison_free = 0;     /* ZAP_GC_POISON_FREE: 0xAB free lines at sweep (#223) */
+static int zap_gc_no_recycle = 0;      /* ZAP_GC_NO_RECYCLE: no hole-reuse in partial blocks (#223) */
+static void zap_mark_race_check(const char *where) {
+    if (zap_in_mark && !zap_self_collecting && zap_gc_mark_race) {
+        M *m = cur_m;
+        G *g = m ? m->current : NULL;
+        fprintf(stderr, "zap-gc MARK-RACE: mutator ran '%s' during mark (coro=%lld)\n",
+                where, g ? (long long)g->all_idx : -1);
+    }
+}
 static ZapBlock *zap_evac_tospace = NULL; /* current dense target block            */
 static uint32_t zap_evac_cursor = 0;   /* bump offset within zap_evac_tospace      */
 static size_t zap_evac_moved = 0;      /* objects relocated this cycle (stats)     */
@@ -273,6 +294,38 @@ __attribute__((constructor)) static void zap_gc_read_env(void) {
     if (pe && pe[0] && pe[0] != '0') {
         zap_evac_poison = 1;
     }
+    /* DIAGNOSTIC (#223): ZAP_GC_NO_RECLAIM marks live objects normally but NEVER
+     * returns dead space to any allocation list (no free/recycle/LOS-free), so no
+     * memory is ever reused. If a crash/corruption DISAPPEARS under this flag, the
+     * bug is a premature free of a still-live object (a missed GC root); if it
+     * PERSISTS, the corruption is a write (allocator overlap / collector writing a
+     * live payload), not a free. Leaks by design; for bounded repros only. */
+    const char *nr = getenv("ZAP_GC_NO_RECLAIM");
+    if (nr && nr[0] && nr[0] != '0') {
+        zap_gc_no_reclaim = 1;
+    }
+    const char *vr = getenv("ZAP_GC_VERIFY_ROOTS");
+    if (vr && vr[0] && vr[0] != '0') {
+        zap_gc_verify_roots = 1;
+    }
+    const char *mr = getenv("ZAP_GC_MARK_RACE");
+    if (mr && mr[0] && mr[0] != '0') {
+        zap_gc_mark_race = 1;
+    }
+    const char *pf = getenv("ZAP_GC_POISON_FREE");
+    if (pf && pf[0] && pf[0] != '0') {
+        zap_gc_poison_free = 1;
+    }
+    const char *nrc = getenv("ZAP_GC_NO_RECYCLE");
+    if (nrc && nrc[0] && nrc[0] != '0') {
+        zap_gc_no_recycle = 1;
+    }
+    /* #223: diagnostic fprintf()s to stderr are lost on a SIGSEGV when stderr is
+     * fully buffered (redirected to a file). Make stderr unbuffered whenever a
+     * diagnostic is enabled so detector output survives the crash. */
+    if (zap_gc_mark_race || zap_gc_verify_roots || getenv("ZAP_DBG_SCHED")) {
+        setvbuf(stderr, NULL, _IONBF, 0);
+    }
 }
 
 /* main-thread shadow-stack head (the main OS thread is a mutator but not a G). */
@@ -359,6 +412,7 @@ static void zap_flush_shadow(void) {
          * already saved by switch_to_g — so there is nothing to flush. */
         if (m->current) {
             m->current->shadow_head = zap_shadow_head;
+            m->current->shadow_valid = 1; /* #223 diag: flushed => valid snapshot */
         }
     } else {
         /* The main OS thread runs top-level Zap and is not a G. */
@@ -448,6 +502,7 @@ static void zap_leave_blocking(void) {
  * thread that arrives flushes its head, parks, and waits for the collection to
  * finish. */
 void zap_safepoint(void) {
+    zap_mark_race_check("safepoint"); /* #223 diag: mutator running during mark? */
     /* Preemption (ticket #172): a monitor-flagged coroutine yields here, where
      * the shadow chain is consistent so parking is provably GC-safe — the
      * precise-GC safe-point machinery doubling as the async-preemption landing
@@ -1044,6 +1099,12 @@ static void zap_mark_roots(void) {
     for (int64_t i = 0; i < g_all_len; i++) {
         G *g = g_all[i];
         if (g) {
+            if (zap_gc_mark_race && !g->shadow_valid) {
+                fprintf(stderr,
+                        "zap-gc STALE-ROOTS: enumerating coro %lld with INVALID "
+                        "shadow_head snapshot (state=%d) — in-transit/running\n",
+                        (long long)g->all_idx, (int)g->state);
+            }
             zap_mark_push(g); /* pin the G in place */
             zap_mark_shadow_chain(g->shadow_head);
         }
@@ -1108,7 +1169,7 @@ static void zap_sweep(void) {
     while (*pp) {
         ZapBlock *b = *pp;
         if (b->kind == ZAP_BK_LOS) {
-            if (b->los_mark) {
+            if (b->los_mark || zap_gc_no_reclaim) {
                 b->los_mark = 0;
                 live += b->los_size;
                 pp = &b->all_next;
@@ -1133,6 +1194,25 @@ static void zap_sweep(void) {
         b->live_lines = used;
         b->evac_src = 0;
         live += (size_t)used * ZAP_LINE;
+        /* DIAGNOSTIC (#223): poison the free (unmarked) lines of a surviving block
+         * with 0xAB. If a still-LIVE object's lines are wrongly considered free
+         * here (a sweep/line-mark bug that recycles live memory), its payload is
+         * overwritten with 0xAB NOW — so corruption appears even without a later
+         * realloc, and a crash's faulting address / a wrong sum carries the 0xAB
+         * pattern, localizing it to sweep. Gated by ZAP_GC_POISON_FREE. */
+        if (zap_gc_poison_free && used > 0 && used < (ZAP_LINES - ZAP_RESERVED_LINES)) {
+            for (uint32_t i = ZAP_RESERVED_LINES; i < ZAP_LINES; i++) {
+                if (!b->line_mark[i]) {
+                    memset((char *)b + (size_t)i * ZAP_LINE, 0xAB, ZAP_LINE);
+                }
+            }
+        }
+        if (zap_gc_no_reclaim) {
+            /* Retain every block; never place it on a free/recycle list so no
+             * dead space is ever reused (#223 diagnostic). */
+            pp = &b->all_next;
+            continue;
+        }
         if (used == 0) {
             zap_block_reset_marks(b);
             b->search_line = ZAP_RESERVED_LINES;
@@ -1140,7 +1220,7 @@ static void zap_sweep(void) {
             b->avail = (ZAP_LINES - ZAP_RESERVED_LINES) * ZAP_LINE;
             b->next = zap_free_blocks;
             zap_free_blocks = b;
-        } else {
+        } else if (!zap_gc_no_recycle) {
             b->search_line = ZAP_RESERVED_LINES;
             if (zap_block_next_hole(b)) {
                 /* Free (unmarked, non-reserved) lines available for reuse. */
@@ -1150,6 +1230,9 @@ static void zap_sweep(void) {
             }
             /* else fully used: not placed on any alloc list this cycle. */
         }
+        /* ZAP_GC_NO_RECYCLE (#223 diag): partially-live blocks are NOT recycled
+         * (their holes never reused); only fully-free blocks feed the allocator.
+         * Isolates whether the UAF is in hole-reuse within partially-live blocks. */
         pp = &b->all_next;
     }
     zap_live_estimate = live;
@@ -1416,6 +1499,7 @@ static void *zap_bump_medium(ZapMutator *self, size_t osize) {
 /* Allocate `osize` (incl. header) bytes of small-object space from the current
  * mutator's lock-free per-P buffer; returns the header address. */
 static void *zap_bump_mutator(size_t osize) {
+    zap_mark_race_check("alloc"); /* #223 diag: mutator allocating during mark? */
     ZapMutator *self = zap_self;
     if (!self) {
         zap_mutator_register();
@@ -1506,6 +1590,64 @@ void *zap_gc_alloc_var(const ZapTypeDesc *desc, int64_t size) {
     return zap_gc_alloc_sized(desc, (size_t)(size < 0 ? 0 : size));
 }
 
+/* DIAGNOSTIC (#223): after mark+drain, conservatively scan every coroutine's
+ * green stack for a LIST object that is live-looking (non-null data, plausible
+ * len/cap) but was left UNMARKED by precise tracing. Such an object is about to
+ * be swept out from under a running coroutine = a missed root. Prints the G
+ * index/state and the list so we can see WHICH coroutine's roots the collector
+ * failed to enumerate. Gated by ZAP_GC_VERIFY_ROOTS; caller holds the world. */
+static void zap_verify_roots(void) {
+    for (int64_t gi = 0; gi < g_all_len; gi++) {
+        G *g = g_all[gi];
+        if (!g || !g->stack) {
+            continue;
+        }
+        uintptr_t lo = (uintptr_t)g->stack;
+        uintptr_t hi = lo + g->stack_size;
+        for (uintptr_t p = lo; p + sizeof(void *) <= hi; p += sizeof(void *)) {
+            void *cand = *(void **)p;
+            if (!zap_is_heap_ptr(cand)) {
+                continue;
+            }
+            if (ZAP_IS_FWD(cand) || ZAP_MARKED(cand)) {
+                continue;
+            }
+            if (ZAP_DESC(cand) != &zap_desc_list) {
+                continue; /* focus on list objects (the repro's `keep`) */
+            }
+            ZapList *lv = (ZapList *)cand;
+            /* Require a plausible list AND a data buffer that is itself a valid,
+             * unmarked heap object — stale stack slots rarely satisfy both, which
+             * cuts the false-positive noise from scanning dead stack words. */
+            if (!(lv->data && lv->len > 0 && lv->len <= lv->cap && lv->cap < (1 << 24))) {
+                continue;
+            }
+            if (!zap_is_heap_ptr(lv->data) || ZAP_MARKED(lv->data)) {
+                continue;
+            }
+            /* Is this list reachable from THIS coroutine's own shadow-stack chain
+             * (what the collector enumerates)? If NOT, its root was never published
+             * to the chain (codegen/migration publish gap); if YES, the chain
+             * enumeration itself dropped it. */
+            int in_chain = 0;
+            for (ZapShadowFrame *f = (ZapShadowFrame *)g->shadow_head; f && !in_chain;
+                 f = f->prev) {
+                for (int64_t r = 0; r < f->nroots; r++) {
+                    if (f->roots[r] == cand) {
+                        in_chain = 1;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr,
+                    "zap-gc VERIFY: UNMARKED live list %p coro=%lld state=%d "
+                    "len=%lld cap=%lld data=%p in_shadow_chain=%s\n",
+                    cand, (long long)g->all_idx, (int)g->state, (long long)lv->len,
+                    (long long)lv->cap, (void *)lv->data, in_chain ? "YES" : "NO");
+        }
+    }
+}
+
 /* Mark + sweep. Caller holds zap_heap_mu and the world is stopped. */
 static void zap_mark_sweep(void) {
     /* Clear line / LOS marks (object header mark bits are already clear: every
@@ -1537,10 +1679,33 @@ static void zap_mark_sweep(void) {
     zap_evac_tospace = NULL;
     zap_evac_cursor = 0;
     zap_evac_moved = 0;
+    zap_self_collecting = 1; /* #223 diag: this thread is the collector */
+    zap_in_mark = 1;         /* #223 diag: mark phase in progress (world stopped) */
+    if (zap_gc_mark_race) {
+        /* #223 diag: at this point every OTHER mutator must be non-ACTIVE
+         * (PARKED/BLOCKED). Any ACTIVE one slipped the handshake and is running
+         * compiled code concurrently with marking — even if it never hits a
+         * safepoint/alloc to trip zap_mark_race_check. */
+        int active = 0;
+        for (ZapMutator *mm = zap_mutators; mm; mm = mm->next) {
+            if (mm != zap_self && mm->state == ZAP_MUT_ACTIVE) {
+                active++;
+            }
+        }
+        if (active) {
+            fprintf(stderr, "zap-gc MARK-ACTIVE: %d mutator(s) ACTIVE at mark start\n",
+                    active);
+        }
+    }
     zap_mark_roots();
     zap_mark_drain();
     zap_finalize_prepare(); /* queue now-unreachable finalizable objects (#92) */
     zap_mark_drain();       /* keep queued objects + their referents alive       */
+    zap_in_mark = 0;
+    zap_self_collecting = 0;
+    if (zap_gc_verify_roots) {
+        zap_verify_roots(); /* #223 diagnostic: catch a live object left unmarked */
+    }
     zap_mark_reset();       /* clear survivor header bits for the next cycle      */
     zap_sweep();
     zap_bytes_since_gc = 0;

@@ -4,10 +4,9 @@
 # the whole CI matrix. See tests/repro223/loop.sh.
 name: repro-223
 
+# Manual-dispatch only: this is the I#223 arm64 regression gate (known-failing),
+# run on demand against the GitHub arm64 runner — not auto-fired on push.
 on:
-  push:
-    branches:
-      - feature/gc-aarch64-evac-race-223-b2f03c
   workflow_dispatch:
 
 jobs:

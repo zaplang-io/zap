@@ -2171,6 +2171,8 @@ typedef struct G {
                          * pinned to, or NULL. While set, the coroutine runs only
                          * on `locked_m` and is excluded from fairness preemption. */
     int lock_depth;     /* LockOSThread nesting count (lock/unlock balance)      */
+    volatile int dbg_running; /* #223 diag: 1 while running on an M (double-run check) */
+    volatile int shadow_valid; /* #223 diag: 1 iff g->shadow_head is a current root snapshot */
 } G;
 
 typedef struct P {
@@ -2475,6 +2477,23 @@ static void sched_gdone(void);
 static void scope_gdone(struct Scope *sc);
 static void sched_enqueue(G *g);
 static void switch_to_g(M *m, G *g) {
+    /* #223 diag: detect the same coroutine being run by two Ms at once (a
+     * scheduler double-run / double-dequeue). ZAP_DBG_SCHED enables it. */
+    {
+        static int dbg = -1;
+        if (dbg < 0) {
+            const char *e = getenv("ZAP_DBG_SCHED");
+            dbg = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (dbg) {
+            int prev = __atomic_exchange_n(&g->dbg_running, 1, __ATOMIC_SEQ_CST);
+            if (prev != 0) {
+                fprintf(stderr, "zap-sched DOUBLE-RUN: coro %lld entered on M %p "
+                                "while already running\n",
+                        (long long)g->all_idx, (void *)m);
+            }
+        }
+    }
     m->current = g;
     g->state = G_RUNNING;
     /* Preemption monitor (#172): a fresh scheduling tick + a clean preempt flag.
@@ -2489,11 +2508,14 @@ static void switch_to_g(M *m, G *g) {
      * yields / dies). A running G's head thus lives in zap_shadow_head and is
      * flushed to g->shadow_head at a safepoint or here. */
     zap_shadow_head = g->shadow_head;
+    g->shadow_valid = 0; /* #223 diag: g->shadow_head goes stale while g runs */
 #endif
     zap_ctx_swap(&m->sched_ctx, &g->ctx);
 #ifdef ZAP_GC_IMMIX
     g->shadow_head = zap_shadow_head;
+    g->shadow_valid = 1; /* #223 diag: saved at switch-out => valid snapshot */
 #endif
+    __atomic_store_n(&g->dbg_running, 0, __ATOMIC_SEQ_CST); /* #223 diag: switched out */
     set_bottom(m, &m->native_sb);
     m->current = NULL;
     if (g->state == G_PARKED) {
@@ -2643,6 +2665,8 @@ static G *galloc(void *fn, void *arg) {
     g->scope = NULL;
     g->in_live = 0;
     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
+    g->dbg_running = 0;    /* #223 diag */
+    g->shadow_valid = 1;   /* #223 diag: empty chain is a valid snapshot */
     /* Cold end of a down-growing stack is its high address. */
     g->sb.mem_base = (char *)g->stack + g->stack_size;
     zap_ctx_make(&g->ctx, g->stack, g->stack_size, g_bootstrap);
@@ -3087,9 +3111,26 @@ static void zap_sched_init_once(void) {
             abort();
         }
     }
-    /* The preemption monitor: samples schedticks and signals monopolizing Ms. */
-    if (GC_pthread_create(&g_monitor_thread, NULL, zap_monitor_main, NULL) == 0) {
-        g_monitor_started = 1;
+    /* The preemption monitor: samples schedticks and signals monopolizing Ms.
+     *
+     * #223 knobs — the monitor (async preemption) is a 10x amplifier of the
+     * open aarch64 multicore GC use-after-free (tests/repro223/RESUME.md):
+     *   - Runtime `ZAP_NO_PREEMPT=1` skips it (diagnostic / amplifier-off).
+     *   - Compile-time `-DZAP_MITIGATE_223_PREEMPT_OFF` is a PREPARED, reversible
+     *     STOPGAP that disables async preemption outright. It is OFF by default
+     *     and is NOT a fix: it only drops the aarch64 failure rate ~97% -> ~8%
+     *     (still a ~1-in-12 UAF, not shippable) and reintroduces the I#172
+     *     preemption-starvation risk. Do not enable without an explicit decision. */
+    {
+        const char *npe = getenv("ZAP_NO_PREEMPT");
+#ifdef ZAP_MITIGATE_223_PREEMPT_OFF
+        npe = "1";
+#endif
+        if (!(npe && npe[0] && npe[0] != '0')) {
+            if (GC_pthread_create(&g_monitor_thread, NULL, zap_monitor_main, NULL) == 0) {
+                g_monitor_started = 1;
+            }
+        }
     }
     /* ZAP_PROFILE=cpu: start the CPU profiler now that the worker Ms it samples
      * exist (ticket #78). A no-op unless the env requested it. */
