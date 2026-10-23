@@ -1,0 +1,25 @@
+# Zap queryable analysis API (I#157/B1, issue #228): the LSP's frontend
+# foundation. A leaf tooling crate over the frontend (`syntax`/`sema`/
+# `sema_types`/`diag`) with no LLVM dependency — it runs lex→parse→type-check
+# via `zapc_sema::analyze_queryable`, retains the resolver state the compile
+# path discards, and exposes position-keyed queries (symbol/type/def at
+# position, references, document symbols, diagnostics). The LSP server (#229)
+# and #230's interactive features call this in-process; `zap doc`/`zap fmt` may
+# reuse it later.
+[package]
+name = "zapc_analysis"
+description = "Zap queryable frontend analysis: position-keyed symbol/type/definition queries for tooling (LSP)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_analysis"
+path = "src/lib.rs"
+
+[dependencies]
+zapc_diag = { path = "../diag" }
+zapc_syntax = { path = "../syntax" }
+zapc_sema = { path = "../sema" }
+zapc_sema_types = { path = "../sema_types" }

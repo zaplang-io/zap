@@ -1639,3 +1639,45 @@ metric I#178 charts).
 fmt) a durable handle on each diagnostic that survives the message-wording churn
 the stability policy explicitly disclaims — turning "parse the prose" into "look
 up the code", which is both more reliable for machines and cheaper to document.
+
+## D-0072 — Queryable frontend analysis API (I#157/B1, #228)
+**Status:** Locked (API shape). Full text: `design/0022-analysis-api.md`. Issue
+#228, epic I#157 (`design/0021-tooling.md`, Area B). The LSP's foundation,
+consumed by #229/#230.
+
+The frontend gains a **position-keyed analysis surface** so tooling (LSP first)
+can ask "what symbol / type / definition is at this offset?" — the state the
+resolver already computes but the compile path discards.
+
+- **New leaf crate `zapc_analysis`** over `syntax`/`sema`/`sema_types`/`diag`
+  (no LLVM), not a `sema` module: keeps the type checker's surface to the two
+  gated hooks below and gives #229 one in-process dependency. It exposes
+  `Analysis::analyze(src)` with `diagnostics`, `type_at`, `symbol_at`,
+  `definition_of`, `references`, `document_symbols`, and a `LineIndex`
+  (byte-offset ⇆ 1-based line/col; the LSP UTF-16 layer is #229's, layered on
+  top). Keyed by byte offset ([`Pos`]).
+- **Resolver-state retention is additive and opt-in.** `zapc_sema::Checker`
+  gains an `Option<AnalysisFacts>` sink, set only by the new
+  `analyze_queryable` entry point; `check`/`analyze` leave it `None`, so the
+  **compile/codegen path records nothing and is byte-identical** (proven by
+  unchanged goldens + a parity test). The facts are three span-keyed tables
+  (expr types, local use→def resolutions, binding def sites); globals are
+  AST-derived in `zapc_analysis`. The only always-on change is `declare` taking
+  a `Copy` def span it drops when not analysing.
+- **Incremental:** recompute-per-document now (the #129 crate split makes it
+  cheap); the immutable-per-snapshot, offset-keyed handle is the boundary a
+  future salsa-style engine memoizes behind, so #229/#230 are insulated.
+  Cross-file go-to-def widens the def target to `(file, span)` in a later
+  multi-module ticket (D-0052/#190) without changing query names.
+- **Def-span fidelity:** name-precise for name uses / `for` targets / match
+  captures; construct-granular for `let`/params/comprehension vars (no name-only
+  sub-span on those declarations yet) — tightens for free when A1 (#225) lands.
+- **Tier:** a new public tooling surface, shipped **Experimental** under the
+  stability policy (D-0070), like the LSP/`zap doc` surfaces.
+
+**Rationale:** the diagnostics half of an LSP was already free (`check_source`);
+the interactive half needs the resolver's decisions kept, not recomputed. Making
+retention an opt-in side-table — rather than restructuring the checker — buys
+symbol/type/def-at-position without touching compile behaviour or perf, and the
+leaf-crate boundary matches #129's intent (frontend reused by tooling without
+LLVM).
