@@ -135,6 +135,7 @@ static size_t zap_live_estimate = 0;
 #define ZAP_EVAC_SPARSE_LINES (((ZAP_LINES - ZAP_RESERVED_LINES)) / 2u)
 static int zap_evac_active = 0;        /* evacuation enabled for the current cycle */
 static int zap_evac_disabled = 0;      /* ZAP_GC_NO_EVAC set: skip evacuation      */
+static int zap_evac_poison = 0;        /* ZAP_GC_EVAC_POISON: clobber moved-from (#223) */
 static ZapBlock *zap_evac_tospace = NULL; /* current dense target block            */
 static uint32_t zap_evac_cursor = 0;   /* bump offset within zap_evac_tospace      */
 static size_t zap_evac_moved = 0;      /* objects relocated this cycle (stats)     */
@@ -260,6 +261,17 @@ __attribute__((constructor)) static void zap_gc_read_env(void) {
     const char *ne = getenv("ZAP_GC_NO_EVAC");
     if (ne && ne[0] && ne[0] != '0') {
         zap_evac_disabled = 1;
+    }
+    /* DIAGNOSTIC (ticket #223): ZAP_GC_EVAC_POISON clobbers the moved-FROM payload
+     * of every evacuated object with a sentinel right after forwarding is
+     * installed (during STW, so no race with the poisoning itself). If any
+     * reference to a relocated buffer was NOT rewritten by the trace — a stale
+     * pointer / tracing gap — the stale reader then observes the sentinel instead
+     * of the live copy, turning silent corruption into a loud, reproducible,
+     * architecture-independent failure. A clean collector is unaffected. */
+    const char *pe = getenv("ZAP_GC_EVAC_POISON");
+    if (pe && pe[0] && pe[0] != '0') {
+        zap_evac_poison = 1;
     }
 }
 
@@ -676,6 +688,13 @@ static void *zap_evac_copy(void *payload) {
     zap_evac_cursor += (uint32_t)step;
     void *np = (char *)new_hdr + ZAP_HEADER_BYTES;
     ZAP_SET_FWD(payload, np); /* original is now a forwarding stub (dead) */
+    /* DIAGNOSTIC (#223): clobber the moved-FROM payload so a surviving stale
+     * reference reads a sentinel, not the live copy. Leaves the header (desc +
+     * fwd bits at [-2]) and the forwarding target (at [-1]) intact; only the
+     * payload bytes are poisoned. Off unless ZAP_GC_EVAC_POISON is set. */
+    if (zap_evac_poison) {
+        memset(payload, 0x7E, osize - ZAP_HEADER_BYTES);
+    }
     zap_evac_moved++;
     return np;
 }

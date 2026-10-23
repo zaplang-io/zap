@@ -1,0 +1,56 @@
+# TEMPORARY aarch64 reproduction/measurement workflow for ticket #223.
+# Removed before the ticket's PR is merged. Runs ONLY on the fix branch and ONLY
+# the arm64 evacuation-stress loop, so the fix can be iterated without paying for
+# the whole CI matrix. See tests/repro223/loop.sh.
+name: repro-223 (aarch64 evac race)
+
+on:
+  push:
+    branches:
+      - "feature/gc-aarch64-evac-race-223-**"
+
+concurrency:
+  group: repro-223-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64-repro:
+    name: arm64 evac-stress loop
+    runs-on: ubuntu-24.04-arm
+    env:
+      LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
+      N: "300"
+      MAXPROCS: "4"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert aarch64 host
+        run: test "$(uname -m)" = aarch64
+      - name: Install LLVM 18 and system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-18 llvm-18-dev libpolly-18-dev clang-18 libclang-18-dev \
+            libgc-dev libpcre2-dev python3-dev pkg-config zlib1g-dev \
+            libzstd-dev libffi-dev libedit-dev libxml2-dev libncurses-dev mold
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: arm64
+      - name: Build zapc (gc-immix)
+        run: cargo build -p zapc --features zapc/llvm,zapc/gc-immix
+      - name: Measure (gc-immix: default / no-evac / poison)
+        run: |
+          ZAPC="$(find target -name zapc -type f -path '*/debug/*' | head -1)"
+          echo "zapc = $ZAPC"
+          ZAPC="$ZAPC" bash tests/repro223/loop.sh
+      - name: Build zapc (gc-boehm)
+        run: cargo build -p zapc --features zapc/llvm,zapc/gc-boehm
+      - name: Measure (gc-boehm: default only)
+        run: |
+          ZAPC="$(find target -name zapc -type f -path '*/debug/*' | head -1)"
+          echo "zapc = $ZAPC"
+          ZAPC="$ZAPC" N=150 bash tests/repro223/loop.sh 2>&1 | grep -E 'FAILRATE .*/default|got'
