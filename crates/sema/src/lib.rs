@@ -109,6 +109,32 @@ pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
     (c.errors, c.warnings)
 }
 
+/// Type-check a module in **analysis mode** (I#228), returning the same
+/// `(errors, warnings)` as [`analyze`] *plus* the retained resolver state
+/// ([`AnalysisFacts`]) that the normal path discards.
+///
+/// This runs the identical passes in the identical order as [`analyze`] — so
+/// the diagnostics are byte-identical — and differs only in that the checker
+/// records, as it goes, the per-expression types, the local use→def
+/// resolutions, and the binding definition sites. The `zapc_analysis` crate
+/// turns those facts into the position-keyed query surface.
+///
+/// The prelude is prepended exactly as in [`analyze`] (diagnostic parity); its
+/// items carry no expression bodies, so they contribute no facts.
+pub fn analyze_queryable(module: &Module) -> (Vec<TypeError>, Vec<TypeError>, AnalysisFacts) {
+    let module = &zapc_syntax::parser::with_prelude(module);
+    let mut c = Checker::new();
+    c.analysis = Some(AnalysisFacts::default());
+    c.collect_types(module);
+    c.check_value_struct_recursion(module);
+    c.check_bitfields(module);
+    c.collect_sigs(module);
+    c.validate_decorators(module);
+    c.check_module(module);
+    let facts = c.analysis.take().unwrap_or_default();
+    (c.errors, c.warnings, facts)
+}
+
 /// Convenience for tests: lex, parse, and type-check `src`.
 pub fn check_str(
     src: &str,
@@ -161,6 +187,40 @@ struct Checker {
     /// Non-fatal diagnostics (e.g. `Eq`-without-`Hash` used as a dict/set key,
     /// D-0047). Reported by the driver but do not fail compilation.
     warnings: Vec<TypeError>,
+    /// Analysis-mode sink (I#228). `None` on the normal compile path, so codegen
+    /// builds record nothing and pay nothing beyond dropping a `Copy` span in
+    /// `declare`. `Some` only under [`analyze_queryable`], where the checker
+    /// retains the resolver decisions it would otherwise discard (expr types by
+    /// span, local use→def resolutions, binding definition sites).
+    analysis: Option<AnalysisFacts>,
+    /// Parallel scope stack mirroring `scopes`, carrying each binding's
+    /// definition span and kind so a name *use* can be linked to its definition
+    /// *site* (go-to-def / references). Populated and maintained only while
+    /// `analysis` is `Some`; the type-checking `scopes` and every `lookup`
+    /// against it are untouched.
+    def_scopes: Vec<HashMap<String, (Span, bool)>>,
+}
+
+/// The resolver state retained in analysis mode (I#228), handed to
+/// `zapc_analysis` which turns it into the position-keyed query surface. All
+/// three tables are empty unless the check ran via [`analyze_queryable`].
+///
+/// Spans are raw byte offsets ([`Span`]); presentation (line/col, UTF-16,
+/// document symbols) lives in the analysis crate, not here.
+#[derive(Clone, Debug, Default)]
+pub struct AnalysisFacts {
+    /// The inferred type of every expression the checker visited, keyed by the
+    /// expression's span, in visitation (post-order) sequence. The basis of
+    /// `type_at` / `symbol_at`.
+    pub expr_types: Vec<(Span, Ty)>,
+    /// `(use_span, def_span)` for every name *use* that resolved to a *local*
+    /// binding (param, let, loop/comprehension var, match capture, …). Global
+    /// resolutions (functions, types) are AST-derivable and are reconstructed in
+    /// the analysis crate, so they are deliberately not recorded here.
+    pub resolutions: Vec<(Span, Span)>,
+    /// Every binding's definition site: `(def_span, ty, is_param)`. Lets
+    /// `symbol_at` answer when the cursor sits on the definition itself.
+    pub local_defs: Vec<(Span, Ty, bool)>,
 }
 
 const BUILTINS: &[&str] = &[
@@ -285,6 +345,8 @@ impl Checker {
             in_generator: false,
             errors: Vec::new(),
             warnings: Vec::new(),
+            analysis: None,
+            def_scopes: Vec::new(),
         }
     }
 
@@ -308,15 +370,42 @@ impl Checker {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        if self.analysis.is_some() {
+            self.def_scopes.push(HashMap::new());
+        }
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        if self.analysis.is_some() {
+            self.def_scopes.pop();
+        }
     }
 
-    fn declare(&mut self, name: &str, ty: Ty) {
+    /// Introduce a binding `name: ty` whose definition is at `def`. `def` is a
+    /// `Copy` span dropped on the normal compile path; only in analysis mode is
+    /// the definition site recorded (into `def_scopes` for use→def linkage and
+    /// into `local_defs` for symbol-at-definition). Type-checking reads only the
+    /// `scopes` entry, exactly as before.
+    fn declare(&mut self, name: &str, ty: Ty, def: Span) {
+        self.declare_kind(name, ty, def, false);
+    }
+
+    /// As [`declare`], marking the binding a parameter (vs. an ordinary local)
+    /// so the analysis surface can distinguish the two.
+    fn declare_param(&mut self, name: &str, ty: Ty, def: Span) {
+        self.declare_kind(name, ty, def, true);
+    }
+
+    fn declare_kind(&mut self, name: &str, ty: Ty, def: Span, is_param: bool) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name.to_string(), ty);
+            scope.insert(name.to_string(), ty.clone());
+        }
+        if let Some(facts) = &mut self.analysis {
+            facts.local_defs.push((def, ty, is_param));
+            if let Some(ds) = self.def_scopes.last_mut() {
+                ds.insert(name.to_string(), (def, is_param));
+            }
         }
     }
 
@@ -324,6 +413,17 @@ impl Checker {
         for scope in self.scopes.iter().rev() {
             if let Some(t) = scope.get(name) {
                 return Some(t.clone());
+            }
+        }
+        None
+    }
+
+    /// The definition span of the innermost local binding of `name`, if any
+    /// (analysis mode only). Mirrors [`lookup`] against `def_scopes`.
+    fn lookup_def(&self, name: &str) -> Option<Span> {
+        for scope in self.def_scopes.iter().rev() {
+            if let Some((def, _)) = scope.get(name) {
+                return Some(*def);
             }
         }
         None
@@ -1451,11 +1551,13 @@ impl Checker {
         // function defined before the `import` still sees the alias.
         for item in &module.items {
             if let Item::Import(Import::Python {
-                module: m, alias, ..
+                module: m,
+                alias,
+                span,
             }) = item
             {
                 let name = alias.clone().unwrap_or_else(|| m.clone());
-                self.declare(&name, Ty::Py);
+                self.declare(&name, Ty::Py, *span);
             }
         }
         for item in &module.items {
@@ -1543,15 +1645,16 @@ impl Checker {
             }
         }
         if let Some(name) = self_ty {
-            self.declare("self", Ty::Named(name.to_string()));
+            self.declare_param("self", Ty::Named(name.to_string()), f.span);
         }
         for p in &f.params {
             if p.name == "self" {
-                self.declare(
+                self.declare_param(
                     "self",
                     self_ty
                         .map(|n| Ty::Named(n.to_string()))
                         .unwrap_or(Ty::Unknown),
+                    p.span,
                 );
                 continue;
             }
@@ -1573,7 +1676,7 @@ impl Checker {
             } else {
                 base
             };
-            self.declare(&p.name, ty);
+            self.declare_param(&p.name, ty, p.span);
         }
         for st in &f.body.stmts {
             self.check_stmt(st);
@@ -1684,11 +1787,15 @@ impl Checker {
     fn check_stmt(&mut self, st: &Stmt) {
         match st {
             Stmt::Let {
-                ty, name, value, ..
+                ty,
+                name,
+                value,
+                span,
+                ..
             } => {
                 let vt = self.infer(value);
                 match ty {
-                    None => self.declare(name, default_type(vt)),
+                    None => self.declare(name, default_type(vt), *span),
                     Some(t) => {
                         let dt = self.resolve_type(t);
                         if !self.coercible(&vt, &dt) {
@@ -1703,7 +1810,7 @@ impl Checker {
                                 expr_span(value),
                             );
                         }
-                        self.declare(name, dt);
+                        self.declare(name, dt, *span);
                     }
                 }
             }
@@ -1818,11 +1925,11 @@ impl Checker {
                 };
                 self.push_scope();
                 match target {
-                    Expr::Name(n, _) => self.declare(n, elem),
+                    Expr::Name(n, s) => self.declare(n, elem, *s),
                     Expr::Tuple(elems, _) => {
                         for e in elems {
-                            if let Expr::Name(n, _) = e {
-                                self.declare(n, Ty::Unknown);
+                            if let Expr::Name(n, s) = e {
+                                self.declare(n, Ty::Unknown, *s);
                             }
                         }
                     }
@@ -1967,7 +2074,7 @@ impl Checker {
                 for ex in excepts {
                     self.push_scope();
                     if let Some(b) = &ex.binding {
-                        self.declare(b, Ty::Unknown);
+                        self.declare(b, Ty::Unknown, ex.span);
                     }
                     for st in &ex.body.stmts {
                         self.check_stmt(st);
@@ -1987,7 +2094,7 @@ impl Checker {
                     // unknown names) and `as NAME` is typeless.
                     if is_expect_raises(&it.expr) {
                         if let Some(a) = &it.alias {
-                            self.declare(a, Ty::Unknown);
+                            self.declare(a, Ty::Unknown, it.span);
                         }
                         continue;
                     }
@@ -2001,7 +2108,7 @@ impl Checker {
                             .and_then(|si| si.methods.get("__enter__"))
                             .map(|sig| sig.ret.clone())
                             .unwrap_or(Ty::Unknown);
-                        self.declare(a, bind_ty);
+                        self.declare(a, bind_ty, it.span);
                     }
                 }
                 for st in &body.stmts {
@@ -2063,7 +2170,7 @@ impl Checker {
         match t {
             BindTarget::Elem(Expr::Name(n, nspan)) => {
                 if is_decl {
-                    self.declare(n, ty.clone());
+                    self.declare(n, ty.clone(), *nspan);
                 } else {
                     match self.lookup(n) {
                         Some(dt) => {
@@ -2196,7 +2303,19 @@ impl Checker {
 
     // --- expression inference ---
 
+    /// Infer the type of `e`, recording `(span, ty)` in analysis mode. The
+    /// inference logic lives in [`infer_inner`]; this thin wrapper is the single
+    /// place that retains the per-expression type for `type_at` (I#228). On the
+    /// normal compile path (`analysis == None`) it is just a tail call.
     fn infer(&mut self, e: &Expr) -> Ty {
+        let ty = self.infer_inner(e);
+        if let Some(facts) = &mut self.analysis {
+            facts.expr_types.push((expr_span(e), ty.clone()));
+        }
+        ty
+    }
+
+    fn infer_inner(&mut self, e: &Expr) -> Ty {
         match e {
             Expr::Int(..) => Ty::UntypedInt,
             Expr::Float(..) => Ty::UntypedFloat,
@@ -2212,6 +2331,17 @@ impl Checker {
             Expr::None(_) => Ty::Unknown,
             Expr::Name(n, span) => {
                 if let Some(t) = self.lookup(n) {
+                    // Record this use → its local definition site (I#228). Global
+                    // resolutions (functions/types) are AST-derivable, so the
+                    // analysis crate reconstructs those rather than us recording
+                    // them here.
+                    if self.analysis.is_some() {
+                        if let Some(def) = self.lookup_def(n) {
+                            if let Some(facts) = &mut self.analysis {
+                                facts.resolutions.push((*span, def));
+                            }
+                        }
+                    }
                     t
                 } else if self.sigs.contains_key(n) || BUILTINS.contains(&n.as_str()) {
                     Ty::Unknown // a function used as a value
@@ -2265,7 +2395,7 @@ impl Checker {
                 let it = self.infer(iter);
                 let e_ty = self.iter_element(&it, *span);
                 self.push_scope();
-                self.declare(var, e_ty);
+                self.declare(var, e_ty, *span);
                 if let Some(c) = cond {
                     self.infer(c);
                 }
@@ -2284,7 +2414,7 @@ impl Checker {
                 let it = self.infer(iter);
                 let e_ty = self.iter_element(&it, *span);
                 self.push_scope();
-                self.declare(var, e_ty);
+                self.declare(var, e_ty, *span);
                 if let Some(c) = cond {
                     self.infer(c);
                 }
@@ -2312,7 +2442,7 @@ impl Checker {
                 let it = self.infer(iter);
                 let e_ty = self.iter_element(&it, *span);
                 self.push_scope();
-                self.declare(var, e_ty);
+                self.declare(var, e_ty, *span);
                 if let Some(c) = cond {
                     self.infer(c);
                 }
@@ -3529,8 +3659,8 @@ impl Checker {
     fn check_pattern(&mut self, p: &Pattern, scrut: &Ty) -> (Vec<String>, bool) {
         match p {
             Pattern::Wildcard(_) => (Vec::new(), true),
-            Pattern::Capture { name, .. } => {
-                self.declare(name, scrut.clone());
+            Pattern::Capture { name, span } => {
+                self.declare(name, scrut.clone(), *span);
                 (Vec::new(), true)
             }
             Pattern::Literal(e) => {
@@ -3553,8 +3683,11 @@ impl Checker {
                 }
                 (Vec::new(), false)
             }
-            Pattern::Rest { name: Some(n), .. } => {
-                self.declare(n, Ty::Unknown);
+            Pattern::Rest {
+                name: Some(n),
+                span,
+            } => {
+                self.declare(n, Ty::Unknown, *span);
                 (Vec::new(), false)
             }
             Pattern::Rest { name: None, .. } => (Vec::new(), false),
