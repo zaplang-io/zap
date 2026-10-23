@@ -75,6 +75,30 @@ impl<'a> PositionMapper<'a> {
     pub fn range(&self, span: Span) -> (LspPos, LspPos) {
         (self.position(span.start), self.position(span.end))
     }
+
+    /// The byte offset of an LSP `(line, character)` position — the inverse of
+    /// [`position`](Self::position), used to turn a client request's cursor into
+    /// an analysis byte offset (#230). `character` counts UTF-16 code units. A
+    /// `character` past the line's end clamps to the end of the line's content
+    /// (just before the newline); a `line` past the end returns `None`.
+    pub fn offset(&self, line: u32, character: u32) -> Option<u32> {
+        let line_start = *self.line_starts.get(line as usize)?;
+        let line_end = self
+            .line_starts
+            .get(line as usize + 1)
+            .map(|&s| s - 1) // drop the '\n' that starts the next line
+            .unwrap_or(self.src.len());
+        let mut utf16 = 0u32;
+        let mut off = line_start;
+        for c in self.src[line_start..line_end].chars() {
+            if utf16 >= character {
+                break;
+            }
+            utf16 += c.len_utf16() as u32;
+            off += c.len_utf8();
+        }
+        Some(off as u32)
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +186,36 @@ mod tests {
                 character: 2
             }
         );
+    }
+
+    #[test]
+    fn offset_is_inverse_of_position() {
+        let src = "let x = 1\nlet y = 2\n";
+        let m = PositionMapper::new(src);
+        for off in 0..=src.len() as u32 {
+            let p = m.position(off);
+            // Round-trips for offsets that are the start of a character.
+            if src.is_char_boundary(off as usize) {
+                assert_eq!(m.offset(p.line, p.character), Some(off), "offset {off}");
+            }
+        }
+    }
+
+    #[test]
+    fn offset_utf16_and_clamping() {
+        // "π😀x": π(0..2,1u) 😀(2..6,2u) x(6..7,1u)
+        let src = "π😀x\nq";
+        let m = PositionMapper::new(src);
+        assert_eq!(m.offset(0, 0), Some(0)); // π
+        assert_eq!(m.offset(0, 1), Some(2)); // 😀
+        assert_eq!(m.offset(0, 3), Some(6)); // x (after π=1 + 😀=2 units)
+        assert_eq!(m.offset(0, 4), Some(7)); // end of line content
+                                             // A character past the line end clamps to the newline, not line 1.
+        assert_eq!(m.offset(0, 99), Some(7));
+        // Line 1 starts after the '\n' at byte 8.
+        assert_eq!(m.offset(1, 0), Some(8));
+        // A line past the end is None.
+        assert_eq!(m.offset(5, 0), None);
     }
 
     #[test]
