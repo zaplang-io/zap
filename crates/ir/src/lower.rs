@@ -1245,7 +1245,10 @@ fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
 }
 
 fn err(m: impl Into<String>) -> LowerError {
-    LowerError { message: m.into() }
+    LowerError {
+        code: zapc_diag::ErrorCode::ZAP6001,
+        message: m.into(),
+    }
 }
 
 // ----------------------------------------------------------------------------

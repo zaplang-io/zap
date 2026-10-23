@@ -5,6 +5,7 @@
 //! `choice(seq)`, `shuffle(seq)`. A "sequence" is a `list[T]`: `choice` yields
 //! an element (`T`), `shuffle` permutes it in place.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -58,6 +59,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
 fn require_list(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Ty {
     if args.len() != 1 {
         checker.error(
+            ErrorCode::ZAP4025,
             format!(
                 "random.{method}(seq) takes 1 argument, found {}",
                 args.len()
@@ -74,6 +76,7 @@ fn require_list(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -
         Ty::Unknown => Ty::Unknown,
         other => {
             checker.error(
+                ErrorCode::ZAP4024,
                 format!("random.{method} expects a list, found {}", other.display()),
                 expr_span(&args[0].value),
             );

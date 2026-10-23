@@ -184,7 +184,9 @@ not supported — it may change in **any** release, including a PATCH:
 - **Value representation and memory layout** — see §1.5.
 - **Diagnostics** — the text, formatting, and wording of error/warning messages,
   stack-trace rendering, and `--help` prose. (A `--json` diagnostic schema is
-  covered **only** once explicitly stabilized.)
+  covered **only** once explicitly stabilized.) **Exception:** the stable
+  `ZAPnnnn` **error codes** — their numbers and documented *meaning*, not the
+  message prose — are a covered surface once marked Stable; see **§3.4**.
 - **Diagnostic/introspection command output** — `zap ir`, `zap expand`, and the
   format of runtime dumps (`SIGQUIT`/`runtime.coroutine_dump()`, D-0058).
 - **The runtime/ABI** (§1.5) and anything under `design/IR.md`,
@@ -218,6 +220,41 @@ there is no compatible alternative, change the behavior of a Stable surface in a
 
 This carve-out is **not** a general backdoor around §6; it exists only for
 security and soundness.
+
+### 3.4 Error codes (I#157/F1)
+
+Every diagnostic the toolchain emits carries a stable **error code** of the form
+`ZAPnnnn` (`ZAP` + four digits; the leading digit groups by category/phase —
+`1` lex, `2` parse, `3` name, `4` type, `5` semantic, `6` back end). The code,
+**not** the human-readable message, is the machine-parseable, compatibility-
+governed identifier that tools and coding agents key off. `zap explain <ZAPnnnn>`
+prints a code's category, title, and meaning.
+
+For a code marked **Stable** (see §4), within a MAJOR:
+
+- A code's **documented meaning** — its category and the condition it identifies,
+  as recorded in the code registry / `zap explain` — is **stable**. The same
+  condition keeps reporting the same code.
+- **Adding** a new code is a backward-compatible **MINOR** change (§1.2).
+- **Renumbering, removing, or repurposing** a Stable code (making it identify a
+  different condition) is **breaking → MAJOR**, after deprecation (§5).
+- The **message text** attached to a code is **not** stable and may change in any
+  release, PATCH included. Consumers must key off the code, never the prose.
+- **Broadening** a code — making it cover more cases while its documented meaning
+  still holds — is a MINOR change. **Narrowing** it — so a condition that
+  previously produced the code now produces a different one — is breaking for the
+  old code (it is a repurposing from that condition's point of view).
+- A code's recommended **severity** may be relaxed (error → warning) at a MINOR;
+  **tightening** it (warning → error) can turn a program that compiled into one
+  that does not, so it is governed as a language change (MAJOR, or the §3.2
+  bug-fix carve-out when the program was non-conforming).
+- The `--json` / `zap mcp` diagnostic `code` field is part of that diagnostic
+  schema, and per §3.1 the schema is covered only once explicitly stabilized.
+
+**Tiering.** Error codes ship **Experimental** (§4): pre-1.0 (§2) makes no promise
+and codes may be **renumbered freely** until the stable set is frozen. The
+authoritative Stable set is ratified by the **#206 spec-freeze audit** at 1.0;
+from that release the rules above bind every code in it.
 
 ---
 
@@ -299,6 +336,7 @@ final freeze. #206 may move any row.
 | `set` type, `**kwargs`, user-defined macros/decorators beyond `@derive` | **Experimental** / not-yet | Open questions; ship Experimental if present. |
 | C FFI (D-0012), arenas, WASM target | **Experimental** when shipped | Deferred / post-1.0. |
 | `zap mcp`, `zap inspect`, `zap zenv`, `zap expand`, `zap ir` | **mixed** | Commands Stable where listed; their *output formats* Internal unless a `--json` schema is stabilized. |
+| Error codes (`ZAPnnnn`) + `zap explain` (I#157/F1) | **Experimental** (Stable-audited target) | Code *meaning* stable per §3.4 once ratified; message **text** never stable. #206 freezes the Stable set. |
 | ZIR (`design/IR.md`), `zaprt`/ABI (`design/RUNTIME-ABI.md`), GC algorithm, scheduler internals, codegen output | **Internal** | §1.5; never promised. |
 
 ---

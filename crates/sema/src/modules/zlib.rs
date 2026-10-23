@@ -11,6 +11,7 @@
 //!
 //! `gzip` (the RFC 1952 / CRC32 framing) is the sibling module `gzip`.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -28,6 +29,7 @@ pub(super) fn expect_data(checker: &mut Checker, module: &str, func: &str, arg: 
     let t = checker.infer(&arg.value);
     if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
         checker.error(
+            ErrorCode::ZAP4024,
             format!(
                 "{module}.{func}() expects a str or bytes argument, found {}",
                 t.display()
@@ -43,6 +45,7 @@ pub(super) fn expect_data(checker: &mut Checker, module: &str, func: &str, arg: 
 pub(super) fn check_compress(checker: &mut Checker, module: &str, args: &[Arg], span: Span) {
     if args.is_empty() || args.len() > 2 {
         checker.error(
+            ErrorCode::ZAP4025,
             format!(
                 "{module}.compress(data, level?) takes 1 or 2 arguments, found {}",
                 args.len()
@@ -59,6 +62,7 @@ pub(super) fn check_compress(checker: &mut Checker, module: &str, args: &[Arg], 
         let lt = checker.infer(&level.value);
         if !lt.is_numeric() && !matches!(lt, Ty::Unknown) {
             checker.error(
+                ErrorCode::ZAP4024,
                 format!(
                     "{module}.compress() level must be an int, found {}",
                     lt.display()
@@ -74,6 +78,7 @@ pub(super) fn check_compress(checker: &mut Checker, module: &str, args: &[Arg], 
 pub(super) fn check_decompress(checker: &mut Checker, module: &str, args: &[Arg], span: Span) {
     if args.len() != 1 {
         checker.error(
+            ErrorCode::ZAP4025,
             format!(
                 "{module}.decompress(data) takes 1 argument, found {}",
                 args.len()
@@ -105,6 +110,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "crc32" | "adler32" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("zlib.{method}(data) takes 1 argument, found {}", args.len()),
                     span,
                 );

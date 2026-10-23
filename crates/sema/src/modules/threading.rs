@@ -14,6 +14,7 @@
 //! the `sync` module (implemented once in the runtime, exposed on both
 //! surfaces); their Python-shaped wrapper constructors are typed here.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -42,6 +43,7 @@ fn infer_all(
             format!("{min}..{max}")
         };
         checker.error(
+            ErrorCode::ZAP4025,
             format!(
                 "threading.{method}() takes {want} argument(s), found {}",
                 args.len()

@@ -7,6 +7,7 @@
 
 use super::json::Json;
 use super::span_to_line_col;
+use zapc_diag::ErrorCode;
 
 /// The severity of a diagnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,13 +25,17 @@ impl Severity {
     }
 }
 
-/// One diagnostic, carrying both the raw byte span and a resolved line/column
-/// (1-based) so agents can map it back to their source without re-deriving it.
+/// One diagnostic, carrying its stable error code, the raw byte span, and a
+/// resolved line/column (1-based) so agents can map it back to their source
+/// without re-deriving it. The `code` (e.g. `"ZAP4001"`) is the machine-stable
+/// identifier; `message` is prose that may change between releases (#239).
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub severity: Severity,
     /// The producing phase: `lex`, `parse`, `type`, or `warning`.
     pub phase: &'static str,
+    /// The stable `ZAPnnnn` error code.
+    pub code: ErrorCode,
     pub message: String,
     pub start: u32,
     pub end: u32,
@@ -43,6 +48,7 @@ impl Diagnostic {
         Json::obj(vec![
             ("severity", Json::str(self.severity.as_str())),
             ("phase", Json::str(self.phase)),
+            ("code", Json::str(self.code.to_string())),
             ("message", Json::str(self.message.clone())),
             ("start", Json::int(self.start as i64)),
             ("end", Json::int(self.end as i64)),
@@ -66,10 +72,24 @@ pub fn check_source(src: &str) -> CheckResult {
     let mut diags = Vec::new();
 
     for e in &lerrs {
-        diags.push(make(src, Severity::Error, "lex", &e.message, e.span));
+        diags.push(make(
+            src,
+            Severity::Error,
+            "lex",
+            e.code,
+            &e.message,
+            e.span,
+        ));
     }
     for e in &perrs {
-        diags.push(make(src, Severity::Error, "parse", &e.message, e.span));
+        diags.push(make(
+            src,
+            Severity::Error,
+            "parse",
+            e.code,
+            &e.message,
+            e.span,
+        ));
     }
 
     // Only run the type checker when the program parsed cleanly: sema assumes a
@@ -77,10 +97,24 @@ pub fn check_source(src: &str) -> CheckResult {
     if lerrs.is_empty() && perrs.is_empty() {
         let (errors, warnings) = zapc_sema::analyze(&module);
         for e in &errors {
-            diags.push(make(src, Severity::Error, "type", &e.message, e.span));
+            diags.push(make(
+                src,
+                Severity::Error,
+                "type",
+                e.code,
+                &e.message,
+                e.span,
+            ));
         }
         for w in &warnings {
-            diags.push(make(src, Severity::Warning, "warning", &w.message, w.span));
+            diags.push(make(
+                src,
+                Severity::Warning,
+                "warning",
+                w.code,
+                &w.message,
+                w.span,
+            ));
         }
     }
 
@@ -94,10 +128,12 @@ pub fn check_source(src: &str) -> CheckResult {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make(
     src: &str,
     severity: Severity,
     phase: &'static str,
+    code: ErrorCode,
     message: &str,
     span: zapc_syntax::span::Span,
 ) -> Diagnostic {
@@ -105,6 +141,7 @@ fn make(
     Diagnostic {
         severity,
         phase,
+        code,
         message: message.to_string(),
         start: span.start,
         end: span.end,
@@ -190,5 +227,7 @@ mod tests {
         assert!(j.contains("\"ok\":false"));
         assert!(j.contains("\"diagnostics\""));
         assert!(j.contains("\"errors\""));
+        // The stable error code is part of the structured payload (#239).
+        assert!(j.contains("\"code\":\"ZAP"));
     }
 }

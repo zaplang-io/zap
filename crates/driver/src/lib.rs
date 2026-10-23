@@ -37,23 +37,23 @@ fn front_end(file: &str, src: &str) -> Result<Module, ExitCode> {
     let mut failed = false;
     for e in &lerrs {
         eprintln!(
-            "{file}: lex error: {} [{}..{}]",
-            e.message, e.span.start, e.span.end
+            "{file}: error[{}]: {} [{}..{}]",
+            e.code, e.message, e.span.start, e.span.end
         );
         failed = true;
     }
     for e in &perrs {
         eprintln!(
-            "{file}: parse error: {} [{}..{}]",
-            e.message, e.span.start, e.span.end
+            "{file}: error[{}]: {} [{}..{}]",
+            e.code, e.message, e.span.start, e.span.end
         );
         failed = true;
     }
     if !failed {
         for e in zapc_sema::check(&module) {
             eprintln!(
-                "{file}: type error: {} [{}..{}]",
-                e.message, e.span.start, e.span.end
+                "{file}: error[{}]: {} [{}..{}]",
+                e.code, e.message, e.span.start, e.span.end
             );
             failed = true;
         }
@@ -81,7 +81,7 @@ pub fn emit_ir(file: &str) -> ExitCode {
     let (zir, errs) = zapc_ir::lower_module(&module);
     if !errs.is_empty() {
         for e in &errs {
-            eprintln!("{file}: lowering error: {}", e.message);
+            eprintln!("{file}: error[{}]: {}", e.code, e.message);
         }
         return ExitCode::from(1);
     }

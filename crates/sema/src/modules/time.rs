@@ -8,6 +8,7 @@
 //! below just convert between a human unit and nanoseconds. `import time` is
 //! accepted but not required (D-0056), like `signal`/`gc`/`runtime`.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -24,6 +25,7 @@ pub(super) const MODULE: ModuleCheck = ModuleCheck {
 fn expect_numeric1(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
     if args.len() != 1 {
         checker.error(
+            ErrorCode::ZAP4025,
             format!("time.{method}() takes 1 argument, found {}", args.len()),
             span,
         );
@@ -35,6 +37,7 @@ fn expect_numeric1(checker: &mut Checker, method: &str, args: &[Arg], span: Span
     let at = checker.infer(&args[0].value);
     if !at.is_numeric() && !matches!(at, Ty::Unknown) {
         checker.error(
+            ErrorCode::ZAP4024,
             format!("time.{method}() expects a number, found {}", at.display()),
             expr_span(&args[0].value),
         );

@@ -5,6 +5,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/diag",
     "crates/syntax",
     "crates/sema_types",
     "crates/sema",
@@ -21,6 +22,7 @@ members = [
 # LLVM; build it explicitly (in the dev container) with `--features zapc/llvm`
 # or `-p zapc_codegen`.
 default-members = [
+    "crates/diag",
     "crates/syntax",
     "crates/sema_types",
     "crates/sema",

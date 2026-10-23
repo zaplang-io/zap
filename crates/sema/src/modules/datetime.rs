@@ -8,6 +8,7 @@
 //! database is deferred (D-0056). `import datetime` is accepted but not
 //! required, like `signal`/`gc`/`runtime`.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -36,6 +37,7 @@ fn expect1(
 ) {
     if args.len() != 1 {
         checker.error(
+            ErrorCode::ZAP4025,
             format!("datetime.{method}() takes 1 argument, found {}", args.len()),
             span,
         );
@@ -47,6 +49,7 @@ fn expect1(
     let at = checker.infer(&args[0].value);
     if !ok(&at) && !matches!(at, Ty::Unknown) {
         checker.error(
+            ErrorCode::ZAP4024,
             format!("datetime.{method}() expects {want}, found {}", at.display()),
             expr_span(&args[0].value),
         );

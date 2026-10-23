@@ -7,6 +7,7 @@
 //! (other element types are a documented follow-up); the value argument is an
 //! integer. The caller is responsible for the list being sorted.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -23,6 +24,7 @@ pub(super) const MODULE: ModuleCheck = ModuleCheck {
 fn check_list_and_value(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
     if args.len() != 2 {
         checker.error(
+            ErrorCode::ZAP4025,
             format!(
                 "bisect.{method}(xs, x) takes 2 arguments, found {}",
                 args.len()
@@ -37,6 +39,7 @@ fn check_list_and_value(checker: &mut Checker, method: &str, args: &[Arg], span:
     let t = checker.infer(&args[0].value);
     if !matches!(t, Ty::List(_)) {
         checker.error(
+            ErrorCode::ZAP4024,
             format!(
                 "bisect.{method}() expects a list argument, found {}",
                 t.display()
