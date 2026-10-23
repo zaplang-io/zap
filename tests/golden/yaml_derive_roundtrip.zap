@@ -18,7 +18,7 @@ def main():
     auto u = User(name="ada", id=7, admin=True, addr=Addr(city="paris", zip=75001))
     print(u.to_yaml())
     auto v = User.from_yaml(u.to_yaml())
-    print(v.name)        # ada
-    print(v.id)          # 7
-    print(v.addr.city)   # paris
-    print(v.addr.zip)    # 75001
+    print(v.name)  # ada
+    print(v.id)  # 7
+    print(v.addr.city)  # paris
+    print(v.addr.zip)  # 75001

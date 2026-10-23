@@ -8,24 +8,24 @@ def main():
     h.push(3)
     h.push(2)
     h.push(4)
-    print(len(h))        # 5
-    print(h.peek())      # 1  (min stays in the heap)
-    print(h.pop())       # 1
-    print(h.pop())       # 2
-    print(h.pop())       # 3
-    print(len(h))        # 2
+    print(len(h))  # 5
+    print(h.peek())  # 1  (min stays in the heap)
+    print(h.pop())  # 1
+    print(h.pop())  # 2
+    print(h.pop())  # 3
+    print(len(h))  # 2
     # Iteration yields priority (min-first) order and does not drain the heap.
     auto total = 0
     for x in h:
         total = total + x
-    print(total)         # 4 + 5 = 9
-    print(len(h))        # 2
+    print(total)  # 4 + 5 = 9
+    print(len(h))  # 2
 
     # Max-heap via the comparator: pops emerge largest-first.
     auto mx = heap[int64](cmp="max")
     mx.push(5)
     mx.push(1)
     mx.push(3)
-    print(mx.pop())      # 5
-    print(mx.pop())      # 3
-    print(mx.pop())      # 1
+    print(mx.pop())  # 5
+    print(mx.pop())  # 3
+    print(mx.pop())  # 1

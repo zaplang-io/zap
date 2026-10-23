@@ -31,19 +31,19 @@ struct Vec:
 
 def main():
     auto a = Acc(total=10)
-    auto alias = a            # shares identity with `a` (reference struct)
+    auto alias = a  # shares identity with `a` (reference struct)
     auto b = Acc(total=5)
 
-    a += b                    # in-place: mutates the shared instance
-    print(a.total)            # 15
-    print(alias.total)        # 15 — the in-place effect is visible via the alias
+    a += b  # in-place: mutates the shared instance
+    print(a.total)  # 15
+    print(alias.total)  # 15 — the in-place effect is visible via the alias
 
-    a -= Acc(total=3)         # in-place again
-    print(a.total)            # 12
-    print(alias.total)        # 12
+    a -= Acc(total=3)  # in-place again
+    print(a.total)  # 12
+    print(alias.total)  # 12
 
     auto v = Vec(x=1)
-    auto valias = v           # shares identity with `v`
-    v += Vec(x=2)             # fallback: rebinds `v` to a fresh Vec, no mutation
-    print(v.x)                # 3
-    print(valias.x)           # 1 — the original instance is left unchanged
+    auto valias = v  # shares identity with `v`
+    v += Vec(x=2)  # fallback: rebinds `v` to a fresh Vec, no mutation
+    print(v.x)  # 3
+    print(valias.x)  # 1 — the original instance is left unchanged

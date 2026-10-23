@@ -7,6 +7,6 @@ struct User:
 
 def main():
     auto u = User.from_json("{\"name\": \"ada\", \"id\": 7}")
-    print(u.name)           # ada
-    print(u.id)             # 7
-    print(u.to_json())      # {"name":"ada","id":7}
+    print(u.name)  # ada
+    print(u.id)  # 7
+    print(u.to_json())  # {"name":"ada","id":7}

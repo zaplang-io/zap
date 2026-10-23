@@ -50,6 +50,12 @@ jobs:
       - name: Test (default members)
         run: cargo test
 
+      # Zap fmt gate (D-0037, #227): every `.zap` source must be in canonical
+      # form. `zap fmt` is host-safe (no LLVM), so it runs here. Fix locally
+      # with `cargo run --bin zap -- fmt tests/golden`.
+      - name: Zap fmt check
+        run: cargo run -q --bin zap -- fmt --check tests/golden
+
   # Full path: replicate the dev container inline — install the same LLVM 18
   # packages as .devcontainer/Dockerfile, then build and test the whole
   # workspace with codegen enabled (includes the golden end-to-end:

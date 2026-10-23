@@ -11,14 +11,14 @@ value struct Point:
 def main():
     auto p = Point(x=1, y=2)
     auto q = Point(x=1, y=2)
-    if p == q:                 # derived __eq__ on a value struct
+    if p == q:  # derived __eq__ on a value struct
         print("p == q")
-    print(p)                   # derived __repr__
+    print(p)  # derived __repr__
 
     auto d = {p: 100}
-    p.x = 99                   # mutate the ORIGINAL after insertion
+    p.x = 99  # mutate the ORIGINAL after insertion
     auto orig = Point(x=1, y=2)
-    print(d[orig])             # 100 — the boxed key copy is unaffected by p.x=99
+    print(d[orig])  # 100 — the boxed key copy is unaffected by p.x=99
 
     # Two equal value structs collapse to a single set element (hashed/compared
     # via the derived dunders).

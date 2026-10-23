@@ -7,13 +7,13 @@
 
 def main():
     # Duration units compose with ordinary int64 arithmetic.
-    auto d = time.seconds(1) + time.millis(500)   # 1_500_000_000 ns
-    print(d)                                       # 1500000000
-    print(time.millis(250))                        # 250000000
-    print(time.micros(7))                          # 7000
-    print(time.nanos(42))                          # 42
-    print(time.to_seconds(time.seconds(2)))        # 2.000000
-    print(time.to_millis(time.millis(5)))          # 5.000000
+    auto d = time.seconds(1) + time.millis(500)  # 1_500_000_000 ns
+    print(d)  # 1500000000
+    print(time.millis(250))  # 250000000
+    print(time.micros(7))  # 7000
+    print(time.nanos(42))  # 42
+    print(time.to_seconds(time.seconds(2)))  # 2.000000
+    print(time.to_millis(time.millis(5)))  # 5.000000
 
     # Monotonic clock: sleeping advances it by at least the requested span.
     auto start = time.monotonic_ns()

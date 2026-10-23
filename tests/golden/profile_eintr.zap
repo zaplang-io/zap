@@ -24,10 +24,10 @@ def cpu(Atomic[int64] c, bytes wg):
     sync.done(wg)
 
 def pinned_io(Atomic[int64] c, bytes wg):
-    runtime.lock_os_thread()          # OS-thread lock (ticket #172/#175 substrate)
+    runtime.lock_os_thread()  # OS-thread lock (ticket #172/#175 substrate)
     auto i = 0
     while i < 20:
-        time.sleep_ns(time.millis(1)) # blocking nanosleep on the dedicated M
+        time.sleep_ns(time.millis(1))  # blocking nanosleep on the dedicated M
         i = i + 1
     runtime.unlock_os_thread()
     c.add(1)

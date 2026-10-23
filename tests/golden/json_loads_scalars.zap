@@ -21,23 +21,23 @@ def tag(JsonValue v) -> str:
             return "object"
 
 def main():
-    print(tag(json.loads("null")))        # null
-    print(tag(json.loads("true")))        # bool
-    print(tag(json.loads("false")))       # bool
-    print(tag(json.loads("  42 ")))       # int (leading/trailing ws ignored)
-    print(tag(json.loads("3.5")))         # float
-    print(tag(json.loads("\"hi\"")))      # str
+    print(tag(json.loads("null")))  # null
+    print(tag(json.loads("true")))  # bool
+    print(tag(json.loads("false")))  # bool
+    print(tag(json.loads("  42 ")))  # int (leading/trailing ws ignored)
+    print(tag(json.loads("3.5")))  # float
+    print(tag(json.loads("\"hi\"")))  # str
 
     # Integer value fidelity (negative).
     match json.loads("-7"):
         case JsonValue.Int(i):
-            print(i)                      # -7
+            print(i)  # -7
         case _:
             print("notint")
 
     # String escape decoding: JSON "a\nb" -> a<newline>b.
     match json.loads("\"a\\nb\""):
         case JsonValue.Str(s):
-            print(s)                      # a / b on two lines
+            print(s)  # a / b on two lines
         case _:
             print("notstr")

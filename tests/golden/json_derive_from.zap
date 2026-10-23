@@ -22,9 +22,11 @@ struct Outer:
     Inner inner
 
 def main():
-    auto c = Config.from_json("{\"host\": \"srv\", \"port\": 8080, \"debug\": true, \"ratio\": 0.5}")
-    print(c.host)       # srv
-    print(c.port)       # 8080
+    auto c = Config.from_json(
+        "{\"host\": \"srv\", \"port\": 8080, \"debug\": true, \"ratio\": 0.5}",
+    )
+    print(c.host)  # srv
+    print(c.port)  # 8080
     # Round-trip proves debug (true) and ratio (0.5) decoded correctly.
     print(c.to_json())  # {"host":"srv","port":8080,"debug":true,"ratio":0.5}
 

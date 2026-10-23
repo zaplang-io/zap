@@ -34,15 +34,15 @@ def sum_quad(Quad q) -> int64:
 
 def main():
     auto v = mk_vec(3.0, 4.0)
-    print(v.x)               # 3.0  (returned in registers)
-    print(v.y)               # 4.0
-    auto w = bump_vec(v)     # callee bumps its own copy and returns it
-    print(w.x)               # 4.0
-    print(v.x)               # 3.0  — caller's v unchanged by the by-value pass
+    print(v.x)  # 3.0  (returned in registers)
+    print(v.y)  # 4.0
+    auto w = bump_vec(v)  # callee bumps its own copy and returns it
+    print(w.x)  # 4.0
+    print(v.x)  # 3.0  — caller's v unchanged by the by-value pass
 
-    auto q = mk_quad(1, 2, 3, 4)   # returned via sret
-    print(sum_quad(q))       # 10
-    auto r = q               # value copy (independent instance)
-    r.a = 100                # mutate the copy only
-    print(sum_quad(q))       # 10   — original unaffected
-    print(sum_quad(r))       # 109
+    auto q = mk_quad(1, 2, 3, 4)  # returned via sret
+    print(sum_quad(q))  # 10
+    auto r = q  # value copy (independent instance)
+    r.a = 100  # mutate the copy only
+    print(sum_quad(q))  # 10   — original unaffected
+    print(sum_quad(r))  # 109

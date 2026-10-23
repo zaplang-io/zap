@@ -11,14 +11,14 @@ struct Team:
 
 def main():
     auto p = Person(name="Ada", age=36)
-    print(p.name)           # Ada
+    print(p.name)  # Ada
     p.name = "Grace"
-    print(p.name)           # Grace
-    print(p.age)            # 36
+    print(p.name)  # Grace
+    print(p.age)  # 36
 
     # Nested: a struct whose field is `name`, reached through another struct.
     auto t = Team(lead=Person(name="Linus", age=54), name="core")
-    print(t.name)           # core
-    print(t.lead.name)      # Linus
+    print(t.name)  # core
+    print(t.lead.name)  # Linus
     t.lead.name = "Guido"
-    print(t.lead.name)      # Guido
+    print(t.lead.name)  # Guido

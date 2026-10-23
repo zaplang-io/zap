@@ -45,10 +45,10 @@ def main():
     # Boxing independence: `s` holds a heap copy of `r` taken at the conversion.
     auto r = Rect(w=2.0, h=3.0)
     Shape s = r
-    r.w = 100.0          # mutate the ORIGINAL after it was boxed behind `s`
+    r.w = 100.0  # mutate the ORIGINAL after it was boxed behind `s`
     r.h = 100.0
-    print(s.area())      # 6.000000      — the boxed copy is unaffected
-    print(r.area())      # 10000.000000  — the original did change
+    print(s.area())  # 6.000000      — the boxed copy is unaffected
+    print(r.area())  # 10000.000000  — the original did change
     # Dynamic dispatch through an interface-typed parameter, two implementors.
-    print(describe(Rect(w=4.0, h=5.0)))   # rect / 20.000000
-    print(describe(Square(side=6.0)))     # square / 36.000000
+    print(describe(Rect(w=4.0, h=5.0)))  # rect / 20.000000
+    print(describe(Square(side=6.0)))  # square / 36.000000
