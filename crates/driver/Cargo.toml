@@ -26,6 +26,9 @@ path = "src/bin/zapc.rs"
 zapc_diag = { path = "../diag" }
 zapc_syntax = { path = "../syntax" }
 zapc_sema = { path = "../sema" }
+# Queryable frontend analysis (I#228) — the in-process surface the LSP server
+# (`zap lsp`, I#229) runs for live diagnostics. Host-safe, no LLVM.
+zapc_analysis = { path = "../analysis" }
 zapc_ir = { path = "../ir" }
 # Canonical formatter (`zap fmt`, D-0037). Host-safe, no LLVM.
 zapc_fmt = { path = "../fmt" }

@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::json::Json;
+use crate::json::Json;
 
 /// The MCP resource URI under which the conventions file is served.
 pub const URI: &str = "zap://conventions";

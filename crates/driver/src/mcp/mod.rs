@@ -34,7 +34,6 @@
 pub mod check;
 pub mod conventions;
 pub mod graph;
-pub mod json;
 pub mod reference;
 pub mod test;
 
@@ -42,7 +41,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use json::Json;
+use crate::json::{self, Json};
 
 /// The MCP protocol revision this server implements. Broadly supported by
 /// current clients; if a client requests a different one at `initialize`, we

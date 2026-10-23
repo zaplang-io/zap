@@ -5,8 +5,8 @@
 //! tight-loop surface: an agent produces Zap, calls `zap_check`, and gets back
 //! precise, machine-readable errors in milliseconds.
 
-use super::json::Json;
 use super::span_to_line_col;
+use crate::json::Json;
 use zapc_diag::ErrorCode;
 
 /// The severity of a diagnostic.

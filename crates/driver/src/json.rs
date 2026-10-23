@@ -2,9 +2,10 @@
 //!
 //! The toolchain deliberately ships **no external dependencies** beyond LLVM
 //! (the `--json` test reporter is hand-built for the same reason; see
-//! `testing/report.rs`). The MCP server speaks JSON-RPC 2.0, so it needs to
-//! both read and write JSON — this module provides just enough for that, with
-//! no `serde`.
+//! `testing/report.rs`). Both the MCP server (`zap mcp`) and the LSP server
+//! (`zap lsp`) speak JSON-RPC 2.0, so they need to both read and write JSON —
+//! this module provides just enough for that, with no `serde`, and is shared by
+//! both ([`crate::mcp`] and [`crate::lsp`]).
 //!
 //! The parser is a straightforward recursive-descent over the UTF-8 bytes of
 //! the input; the serializer emits compact, single-line JSON (the MCP stdio

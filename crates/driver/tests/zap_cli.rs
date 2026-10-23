@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use zapc::mcp::json::{self, Json};
+use zapc::json::{self, Json};
 
 fn zap() -> Command {
     Command::new(env!("CARGO_BIN_EXE_zap"))

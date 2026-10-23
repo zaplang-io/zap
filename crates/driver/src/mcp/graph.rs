@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use zapc_syntax::ast::{self, EnumDef, Function, InterfaceDef, Item, StructDef, Type};
 
-use super::json::Json;
 use super::span_to_line_col;
+use crate::json::Json;
 
 /// One indexed symbol.
 #[derive(Clone, Debug)]
