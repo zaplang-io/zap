@@ -8,7 +8,7 @@ time sink in language projects.
 Status legend: **Locked** · **Proposed** (baked into docs, pending confirmation)
 · **Open** · **Superseded**
 
-_Last updated: 2026-10-22_
+_Last updated: 2026-10-23_
 
 ---
 
@@ -1582,3 +1582,37 @@ is labeled 1.0. The single-version/max-bump scheme keeps the promise simple for
 a single-artifact toolchain; the whole-program AOT model lets us refuse an ABI
 promise honestly; the Go-1 compatibility model + language pin gives long-lived
 stability without the complexity of editions.
+
+## D-0071 — Stable error-code scheme: `ZAPnnnn` (I#157/F1, #239)
+**Status:** Locked (scheme). Full text: `docs/STABILITY.md` §3.4. Issue #239,
+epic I#157 (`design/0021-tooling.md`, Area F). Extends the 1.0 contract (D-0070).
+
+Every diagnostic the toolchain emits carries a stable **error code** `ZAPnnnn`
+(`ZAP` + four digits). The code — **not** the message prose — is the
+machine-parseable identifier tools and coding agents key off; this is the
+pillar-1 (agent-authorship) multiplier that lowers iterations-to-green (the
+metric I#178 charts).
+
+- **Format:** `ZAP` + four digits. Severity (error/warning) is **orthogonal** —
+  carried by the diagnostic, not encoded in the code. The leading digit is the
+  category/phase: `1` lex, `2` parse, `3` name/resolution, `4` type, `5` semantic/
+  declaration validation, `6` back end (lowering/IR/codegen); `0` reserved for
+  meta (ICE, not-yet-implemented), `7`–`9` reserved for future phases.
+- **Single source of truth:** a registry in the `zapc_diag` leaf crate generates
+  both the typed constants used at emission sites (so an unregistered code cannot
+  be emitted) and the data behind `zap explain <ZAPnnnn>`. A code identifies a
+  *condition*, so one condition reuses one code across sites.
+- **Surfaced** on the CLI (`error[ZAPnnnn]: …`), on the `zap mcp` / `--json`
+  structured diagnostic surface (additive `code` field), and via `zap explain`.
+- **Stability (see STABILITY.md §3.4):** a Stable code's documented *meaning* is
+  stable within a MAJOR; adding a code is MINOR; renumbering/removing/repurposing
+  is breaking (MAJOR, after deprecation); **message text is never stable**;
+  broadening is MINOR, narrowing is breaking for the old code; severity relax is
+  MINOR, tighten is a language-level change.
+- **Tier:** codes ship **Experimental** and may be **renumbered freely pre-1.0**;
+  the **#206** spec-freeze audit ratifies the Stable set at 1.0.
+
+**Rationale:** stable, phase-categorised codes give agents and tooling (LSP, MCP,
+fmt) a durable handle on each diagnostic that survives the message-wording churn
+the stability policy explicitly disclaims — turning "parse the prose" into "look
+up the code", which is both more reliable for machines and cheaper to document.
