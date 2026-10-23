@@ -28,27 +28,37 @@ compile() {
     "$ZAPC" build "$src" -o "$WORKDIR/$name" || { echo "COMPILE FAILED: $name"; exit 1; }
 }
 
+TIMEOUT="${TIMEOUT:-25}"   # per-run wall-clock cap; a hang counts as a failure
 run_arm() {
     local name=$1 label=$2; shift 2
     local exp=${EXP[$name]} bin="$WORKDIR/$name"
-    local fail=0 i out
+    local wrong=0 hang=0 i out rc
     for i in $(seq 1 "$N"); do
-        out=$(env "$@" MAXPROCS="$P" "$bin" 2>/dev/null)
-        if [ "$out" != "$exp" ]; then
-            fail=$((fail + 1))
-            [ "$fail" -le 10 ] && echo "  [$name/$label] run $i: got '$out' want '$exp'"
+        out=$(env "$@" MAXPROCS="$P" timeout -s KILL "$TIMEOUT" "$bin" 2>/dev/null)
+        rc=$?
+        if [ "$rc" = 137 ] || [ "$rc" = 124 ]; then
+            hang=$((hang + 1))
+            [ $((wrong + hang)) -le 12 ] && echo "  [$name/$label] run $i: HANG (timeout ${TIMEOUT}s, rc=$rc)"
+        elif [ "$out" != "$exp" ]; then
+            wrong=$((wrong + 1))
+            [ $((wrong + hang)) -le 12 ] && echo "  [$name/$label] run $i: got '$out' want '$exp' (rc=$rc)"
         fi
     done
-    echo "FAILRATE $name/$label: $fail / $N   (MAXPROCS=$P)"
+    echo "FAILRATE $name/$label: wrong=$wrong hang=$hang / $N   (MAXPROCS=$P)"
 }
 
 compile amp_evac tests/repro223/amp_evac.zap
 compile immix_evac_coro_stress tests/golden/immix_evac_coro_stress.zap
 
 echo "================ #223 measurement (N=$N, MAXPROCS=$P) ================"
-for name in amp_evac immix_evac_coro_stress; do
-    run_arm "$name" default
-    run_arm "$name" no-evac   ZAP_GC_NO_EVAC=1
-    run_arm "$name" poison    ZAP_GC_EVAC_POISON=1
+: "${ARMS:=default no-evac poison}"
+for name in immix_evac_coro_stress amp_evac; do
+    for arm in $ARMS; do
+        case $arm in
+            default) run_arm "$name" default ;;
+            no-evac) run_arm "$name" no-evac ZAP_GC_NO_EVAC=1 ;;
+            poison)  run_arm "$name" poison  ZAP_GC_EVAC_POISON=1 ;;
+        esac
+    done
 done
 echo "======================================================================"

@@ -14,13 +14,14 @@ jobs:
   arm64-repro:
     name: arm64 evac-stress loop
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
       LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
-      N: "300"
+      N: "200"
       MAXPROCS: "4"
+      TIMEOUT: "25"
     steps:
       - uses: actions/checkout@v4
       - name: Assert aarch64 host
@@ -45,3 +46,10 @@ jobs:
           ZAPC="$(find target -name zapc -type f -path '*/debug/*' | head -1)"
           echo "zapc = $ZAPC"
           ZAPC="$ZAPC" bash tests/repro223/loop.sh
+      - name: Build zapc (gc-boehm)
+        run: cargo build -p zapc --features zapc/llvm,zapc/gc-boehm
+      - name: Measure (gc-boehm) default only
+        run: |
+          ZAPC="$(find target -name zapc -type f -path '*/debug/*' | head -1)"
+          echo "zapc = $ZAPC"
+          ARMS=default WORKDIR=/tmp/repro223-boehm ZAPC="$ZAPC" bash tests/repro223/loop.sh
