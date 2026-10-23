@@ -143,7 +143,7 @@ host CI job and need no collector matrix — a point in their favour for velocit
 
 Ordering within A: **A1 → A2 → A3**.
 
-- **A1. Comment-trivia preservation in the frontend.**
+- **A1 (#225). Comment-trivia preservation in the frontend.**
   Attach lexer comments + significant blank lines to adjacent AST nodes (leading
   / trailing / dangling), or introduce a lossless concrete-syntax layer the
   formatter consumes.
@@ -151,7 +151,7 @@ Ordering within A: **A1 → A2 → A3**.
   Keep it additive so existing sema/codegen consumers ignore the new trivia.
   Shared with `zap doc` (C1) and improves LSP later.
   **Size M.** No dependencies. **Blocks A2, C1 (partly).**
-- **A2. The formatter.**
+- **A2 (#226). The formatter.**
   Define and implement the one canonical Python-faithful style (indentation,
   blank-line rules between defs/classes, import ordering, line-wrapping of long
   calls/collections/signatures, string-quote normalization, trailing commas) and
@@ -160,7 +160,7 @@ Ordering within A: **A1 → A2 → A3**.
   comment-preservation, enforced by a golden + round-trip property test corpus.
   Reuses the parser; no new parser.
   **Size M.** Depends on A1. **Blocks A3.**
-- **A3. `zap fmt --check` + CLI wiring + community fmt-gate.**
+- **A3 (#227). `zap fmt --check` + CLI wiring + community fmt-gate.**
   Replace the stub in `cli.rs`; implement in-place rewrite, stdin/stdout, and a
   non-zero `--check` mode for CI; document the style; add the fmt-gate to the
   project's own CI and the contributor docs.
@@ -171,7 +171,7 @@ Ordering within A: **A1 → A2 → A3**.
 Ordering within B: **B1 → B2 → B3 → B4** (B2 can start against stub analysis in
 parallel with B1).
 
-- **B1. Queryable analysis API on the frontend.**
+- **B1 (#228). Queryable analysis API on the frontend.**
   Promote the internal resolver state into a public, position-indexed result:
   symbol-at-position, type-of-expression-at-position, definition-site,
   document-symbol tree; re-analyze a single changed document cheaply (the I#129
@@ -179,19 +179,19 @@ parallel with B1).
   This is the substance of LSP support; reuses sema + `check_source`.
   **Size L.** Depends on nothing new (A1 trivia helps ranges but is not
   required). **Blocks B3.**
-- **B2. LSP skeleton + diagnostics.**
+- **B2 (#229). LSP skeleton + diagnostics.**
   JSON-RPC/LSP transport (evaluate `tower-lsp` vs hand-rolled to keep the dep
   surface small), `textDocument` open/change/close lifecycle, UTF-16 line-index
   position mapping (promote `span_to_line_col`), and `publishDiagnostics` wired
   straight to `check_source`.
   Ships a usable "red squiggles + live errors" server on its own.
   **Size M.** Depends on nothing (diagnostics already exist). **Pairs with B1.**
-- **B3. Interactive language features.**
+- **B3 (#230). Interactive language features.**
   `completion`, `hover` (inferred types — a strong teaching feature for a typed
   language), `definition`, `documentSymbol`; `rename` + `references` as a
   fast-follow.
   **Size L.** Depends on B1 + B2.
-- **B4. VS Code extension (first editor).**
+- **B4 (#231). VS Code extension (first editor).**
   LSP client wiring + a TextMate grammar for syntax highlighting + packaging.
   VS Code first (largest agent/human overlap); Neovim (`nvim-lspconfig`) is a
   near-free follow-on; JetBrains later.
@@ -199,36 +199,36 @@ parallel with B1).
 
 ### Area C — `zap doc` (API docs) — deferred at D-0053, built here
 
-- **C1. Doc model extraction.**
+- **C1 (#232). Doc model extraction.**
   Walk the AST, collect triple-quoted docstrings (D-0041) + signatures +
   inferred types (reuse sema) + visibility, into a serializable doc IR.
   Docstrings need no trivia work; attaching *narrative `#` comments* to
   declarations needs A1.
   **Size M.** Soft dependency on A1 for comment capture; docstring-only can ship
   without it.
-- **C2. Renderers (HTML + Markdown).**
+- **C2 (#233). Renderers (HTML + Markdown).**
   Render the doc IR to a static site (HTML) and Markdown; the docs website
   consumes the output.
   **Size M.** Depends on C1.
-- **C3. Doctests (stretch).**
+- **C3 (#234). Doctests (stretch).**
   Execute runnable docstring examples via the test framework (I#73) + the JIT
   (I#159); keeps docs honest.
   **Size M.** Depends on C1 + I#159. **Defer** to after the REPL lands.
 
 ### Area D — Package registry (discovery + checksum index) — builds on I#69
 
-- **D1. Registry design doc + hosting/auth model.**
+- **D1 (#235). Registry design doc + hosting/auth model.**
   Decide what "registry" means on top of the decentralized D-0052 model: an
   **index/discovery service + checksum/transparency log** (and optional caching
   proxy), *not* a mandatory code host; publish/auth flow; namespacing under the
   zaplang-io org; relationship to `zaplang.org`.
   **Size M (policy/design).** Coordinates with the org move (held until sessions
   are quiet) and I#158 community-infra.
-- **D2. Index + checksum/notary service.**
+- **D2 (#236). Index + checksum/notary service.**
   Implement the hosted index + checksum database (the thing `zap.lock` verifies
   against) and a search/discovery endpoint.
   **Size L.** Depends on D1.
-- **D3. Publish/discovery client.**
+- **D3 (#237). Publish/discovery client.**
   `zap publish` + discovery/search in the CLI, integrated with `pkg`/zenv.
   **Size M.** Depends on D2.
 
@@ -237,7 +237,7 @@ parallel with B1).
 
 ### Area E — Web playground — gated on I#159
 
-- **E1. Playground frontend + share-a-snippet.**
+- **E1 (#238). Playground frontend + share-a-snippet.**
   A browser REPL on the docs site driven by the I#159 JIT engine — either
   server-side evaluation (sandboxed) or a WASM build (which ties to the I#158
   WASM target).
@@ -248,7 +248,7 @@ parallel with B1).
 
 ### Area F — Diagnostics-quality pass — the pillar-1 multiplier
 
-- **F1. Diagnostics-quality pass (ongoing).**
+- **F1 (#239). Diagnostics-quality pass (ongoing).**
   Audit and improve error-message clarity across lex/parse/type: precise spans,
   "did you mean" suggestions, consistent phrasing, stable **error codes**, and
   secondary/labelled spans.
@@ -299,13 +299,13 @@ instead of retrofitting them.
 
 ### Recommended global sequence
 
-1. **A1 → A2 → A3** (`zap fmt`), with **F1** (diagnostics pass, error codes
+1. **A1 (#225) → A2 (#226) → A3 (#227)** (`zap fmt`), with **F1 (#239)** (diagnostics, error codes
    first) in parallel. ← first slice
-2. **B2** (LSP diagnostics skeleton) + **B1** (analysis API) → **B3** → **B4**
-   (VS Code). ← biggest adoption lever, second
-3. **C1 → C2** (`zap doc`), reusing A1. (C3 doctests waits on I#159.)
-4. **E1** (playground) — after I#159 lands.
-5. **D1 → D2 → D3** (registry) — last; waits on the org move, blocks nothing.
+2. **B2 (#229)** (LSP diagnostics skeleton) + **B1 (#228)** (analysis API) → **B3
+   (#230)** → **B4 (#231)** (VS Code). ← biggest adoption lever, second
+3. **C1 (#232) → C2 (#233)** (`zap doc`), reusing A1. (C3 #234 doctests waits on I#159.)
+4. **E1 (#238)** (playground) — after I#159 lands.
+5. **D1 (#235) → D2 (#236) → D3 (#237)** (registry) — last; waits on the org move, blocks nothing.
 
 ## Compatibility
 
