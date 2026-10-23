@@ -20,11 +20,11 @@ def main() -> int64:
     Atomic[int64] c = Atomic(0)
     auto wg = sync.waitgroup()
     sync.add(wg, 1)
-    spawn busy(c, wg)        # the scheduler (worker Ms) now exists
-    __raise_signal(12)       # SIGUSR2 -> start profiling
+    spawn busy(c, wg)  # the scheduler (worker Ms) now exists
+    __raise_signal(12)  # SIGUSR2 -> start profiling
     __signal_drain()
-    sync.wait(wg)            # busy runs on a worker M and is sampled
-    __raise_signal(12)       # SIGUSR2 -> stop + flush + banner
+    sync.wait(wg)  # busy runs on a worker M and is sampled
+    __raise_signal(12)  # SIGUSR2 -> stop + flush + banner
     __signal_drain()
     print(c.load())
     return 0

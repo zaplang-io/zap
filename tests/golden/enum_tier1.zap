@@ -20,8 +20,8 @@ def is_weekend(Day d) -> int64:
             return 0
 
 def main():
-    print(is_weekend(Day.WED))      # 0
-    print(is_weekend(Day.SAT))      # 1
-    print(int64(Day.FRI))           # 4  (backing integer)
-    auto d = Day(6)                 # int -> enum  (SUN)
-    print(is_weekend(d))            # 1
+    print(is_weekend(Day.WED))  # 0
+    print(is_weekend(Day.SAT))  # 1
+    print(int64(Day.FRI))  # 4  (backing integer)
+    auto d = Day(6)  # int -> enum  (SUN)
+    print(is_weekend(d))  # 1

@@ -30,8 +30,10 @@ pub enum Command {
     Ir { file: Option<String> },
     /// `zap expand [file]` — show decorator/`@derive`-generated code (D-0036).
     Expand { file: Option<String> },
-    /// `zap fmt [paths...]` — canonical formatter (D-0037; not yet implemented).
-    Fmt { paths: Vec<String> },
+    /// `zap fmt [--check] [paths...]` — canonical formatter (D-0037). With no
+    /// paths, formats stdin to stdout. `--check` writes nothing and exits
+    /// non-zero if any input is not already formatted (CI / fmt-gate mode).
+    Fmt { paths: Vec<String>, check: bool },
     /// `zap new <name>` — scaffold a new project directory.
     New { name: String },
     /// `zap init` — scaffold `zap.toml` in the current directory.
@@ -127,6 +129,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }),
         "fmt" => Ok(Command::Fmt {
             paths: positionals(rest),
+            check: rest.iter().any(|a| a == "--check"),
         }),
         "new" => match first_positional(rest) {
             Some(name) => Ok(Command::New { name }),
@@ -298,6 +301,103 @@ fn positionals(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// `zap fmt` (D-0037). With no paths, formats stdin to stdout. With paths,
+/// rewrites `.zap` files in place (directories are walked recursively). `--check`
+/// writes nothing and exits non-zero if any input is not already formatted.
+fn cmd_fmt(paths: Vec<String>, check: bool) -> ExitCode {
+    use std::io::Read;
+
+    if paths.is_empty() {
+        let mut src = String::new();
+        if std::io::stdin().read_to_string(&mut src).is_err() {
+            eprintln!("zap fmt: failed to read stdin");
+            return ExitCode::from(2);
+        }
+        return match zapc_fmt::format_source(&src) {
+            Ok(out) if check => {
+                if out == src {
+                    ExitCode::SUCCESS
+                } else {
+                    eprintln!("zap fmt: stdin is not formatted");
+                    ExitCode::from(1)
+                }
+            }
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("zap fmt: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
+    let mut files = Vec::new();
+    for p in &paths {
+        collect_zap_files(Path::new(p), &mut files);
+    }
+
+    let mut unformatted = Vec::new();
+    let mut had_error = false;
+    for file in &files {
+        let src = match fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("zap fmt: {}: {e}", file.display());
+                had_error = true;
+                continue;
+            }
+        };
+        match zapc_fmt::format_source(&src) {
+            Ok(out) => {
+                if out == src {
+                    continue;
+                }
+                if check {
+                    unformatted.push(file.display().to_string());
+                } else if let Err(e) = fs::write(file, &out) {
+                    eprintln!("zap fmt: {}: {e}", file.display());
+                    had_error = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("zap fmt: {}: {e}", file.display());
+                had_error = true;
+            }
+        }
+    }
+
+    if had_error {
+        return ExitCode::from(2);
+    }
+    if check && !unformatted.is_empty() {
+        eprintln!("the following files are not formatted (run `zap fmt`):");
+        for f in &unformatted {
+            eprintln!("  {f}");
+        }
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Collect `.zap` files under `path` (a single file, or a directory walked
+/// recursively) into `out`.
+fn collect_zap_files(path: &Path, out: &mut Vec<std::path::PathBuf>) {
+    if path.is_dir() {
+        let mut entries: Vec<_> = match fs::read_dir(path) {
+            Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+            Err(_) => return,
+        };
+        entries.sort();
+        for e in entries {
+            collect_zap_files(&e, out);
+        }
+    } else if path.extension().map(|x| x == "zap").unwrap_or(false) {
+        out.push(path.to_path_buf());
+    }
+}
+
 /// Parse `zap add <name> (--git <url> --version <v> | --path <dir>)`.
 fn parse_add(args: &[String]) -> Result<Command, String> {
     let mut name: Option<String> = None;
@@ -400,10 +500,7 @@ pub fn execute(cmd: Command) -> ExitCode {
             Ok(f) => crate::emit_expand(&f),
             Err(code) => code,
         },
-        Command::Fmt { .. } => {
-            eprintln!("zap fmt: the canonical formatter is not yet implemented (D-0037).");
-            ExitCode::from(2)
-        }
+        Command::Fmt { paths, check } => cmd_fmt(paths, check),
         Command::New { name } => cmd_new(&name),
         Command::Init => cmd_init(),
         Command::Add { name, source } => cmd_add(&name, source),
@@ -836,8 +933,12 @@ diagnostics:
   version               print the toolchain version
   help                  show this help
 
-not yet implemented / pending their own tickets:
-  fmt                   canonical formatter (D-0037)
+format:
+  fmt [paths...]        rewrite files in place in the canonical style (D-0037);
+                        a directory is formatted recursively; no paths formats
+                        stdin to stdout
+      --check           write nothing; exit non-zero and list any files that
+                        are not already formatted (CI / fmt-gate mode)
 ";
 
 #[cfg(test)]

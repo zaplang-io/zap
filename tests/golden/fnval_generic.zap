@@ -2,7 +2,7 @@
 # function value `fn(T)->U`. Monomorphization specializes both the value types
 # and the function-value signature, so `apply` instantiates at (int64,int64) and
 # (str,int64). Exercised with a top-level function AND a lambda as the callback.
-def apply[T, U](T x, fn(T)->U f) -> U:
+def apply[T, U](T x, fn(T) -> U f) -> U:
     return f(x)
 
 def double(int64 n) -> int64:

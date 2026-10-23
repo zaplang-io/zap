@@ -23,44 +23,44 @@ def main():
     # Array: length + element values by index.
     match json.loads("[10, 20, 30]"):
         case JsonValue.Array(items):
-            print(len(items))             # 3
+            print(len(items))  # 3
             match items[0]:
                 case JsonValue.Int(i):
-                    print(i)              # 10
+                    print(i)  # 10
                 case _:
                     print("?")
             match items[2]:
                 case JsonValue.Int(i):
-                    print(i)              # 30
+                    print(i)  # 30
                 case _:
                     print("?")
         case _:
             print("notarray")
 
-    print(describe(json.loads("[]")))     # array (empty)
+    print(describe(json.loads("[]")))  # array (empty)
 
     # Object: length + values by key.
     match json.loads("{\"a\": 1, \"b\": \"hi\"}"):
         case JsonValue.Object(fields):
-            print(len(fields))            # 2
+            print(len(fields))  # 2
             match fields["a"]:
                 case JsonValue.Int(i):
-                    print(i)              # 1
+                    print(i)  # 1
                 case _:
                     print("?")
             match fields["b"]:
                 case JsonValue.Str(s):
-                    print(s)              # hi
+                    print(s)  # hi
                 case _:
                     print("?")
         case _:
             print("notobject")
 
-    print(describe(json.loads("{}")))     # object (empty)
+    print(describe(json.loads("{}")))  # object (empty)
 
     # Nesting: an object whose value is an array.
     match json.loads("{\"xs\": [true, null]}"):
         case JsonValue.Object(fields):
-            print(describe(fields["xs"])) # array
+            print(describe(fields["xs"]))  # array
         case _:
             print("?")

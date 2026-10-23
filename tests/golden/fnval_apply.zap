@@ -8,7 +8,7 @@ def inc(int64 x) -> int64:
 def twice(int64 x) -> int64:
     return x * 2
 
-def apply(fn(int64)->int64 f, int64 x) -> int64:
+def apply(fn(int64) -> int64 f, int64 x) -> int64:
     return f(x)
 
 def main():

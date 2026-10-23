@@ -29,7 +29,7 @@ def worker(channel[int64] ready, channel[int64] go, channel[int64] done):
         auto s = "payload-" + itos(i)
         if i % 100 == 0:
             keep.append(s)
-    ready <- 1       # built; now park on `go` (roots held in the pinned stack)
+    ready <- 1  # built; now park on `go` (roots held in the pinned stack)
     auto g0 = <-go
     for s in keep:
         print(s)
@@ -44,9 +44,9 @@ def main():
     auto go = channel[int64]()
     auto done = channel[int64]()
     spawn worker(ready, go, done)
-    auto r1 = <-ready   # the worker has built its list and is parked on `go`
+    auto r1 = <-ready  # the worker has built its list and is parked on `go`
     for r in range(0, 8):
         churn(8000)
-        gc.collect()    # evacuate the parked worker's string buffers
+        gc.collect()  # evacuate the parked worker's string buffers
     go <- 1
     auto r2 = <-done

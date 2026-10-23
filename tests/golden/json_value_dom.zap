@@ -22,16 +22,16 @@ def tag(JsonValue v) -> str:
             return "object"
 
 def main():
-    print(tag(JsonValue.Null))                 # null
-    print(tag(JsonValue.Bool(True)))           # bool
-    print(tag(JsonValue.Int(42)))              # int
-    print(tag(JsonValue.Float(3.5)))           # float
-    print(tag(JsonValue.Str("hi")))            # str
+    print(tag(JsonValue.Null))  # null
+    print(tag(JsonValue.Bool(True)))  # bool
+    print(tag(JsonValue.Int(42)))  # int
+    print(tag(JsonValue.Float(3.5)))  # float
+    print(tag(JsonValue.Str("hi")))  # str
 
     # Recursive nesting: an array holding scalar elements.
     auto xs = [JsonValue.Int(1), JsonValue.Int(2)]
-    print(tag(JsonValue.Array(xs)))            # array
+    print(tag(JsonValue.Array(xs)))  # array
 
     # And an object mapping string keys to JsonValue.
     auto m = {"a": JsonValue.Bool(False)}
-    print(tag(JsonValue.Object(m)))            # object
+    print(tag(JsonValue.Object(m)))  # object

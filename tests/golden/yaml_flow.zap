@@ -8,22 +8,22 @@ def main():
         case JsonValue.Object(m):
             match m["a"]:
                 case JsonValue.Int(i):
-                    print(i)              # 1
+                    print(i)  # 1
                 case _:
                     print("?")
             match m["b"]:
                 case JsonValue.Array(xs):
-                    print(len(xs))        # 3
+                    print(len(xs))  # 3
                     match xs[2]:
                         case JsonValue.Int(i):
-                            print(i)      # 30
+                            print(i)  # 30
                         case _:
                             print("?")
                 case _:
                     print("?")
             match m["c"]:
                 case JsonValue.Str(s):
-                    print(s)              # hi
+                    print(s)  # hi
                 case _:
                     print("?")
         case _:

@@ -4,7 +4,7 @@
 # `fn(...)`-annotated binding (collection elements are stored as uniform
 # reference words, so the annotation re-attaches the call signature).
 struct Op:
-    fn(int64)->int64 f
+    fn(int64) -> int64 f
     str name
 
 def inc(int64 x) -> int64:
@@ -19,6 +19,6 @@ def main():
     print(op.name, g(41))
 
     auto ops = [inc, dec]
-    fn(int64)->int64 g0 = ops[0]
-    fn(int64)->int64 g1 = ops[1]
+    fn(int64) -> int64 g0 = ops[0]
+    fn(int64) -> int64 g1 = ops[1]
     print(g0(10), g1(10))

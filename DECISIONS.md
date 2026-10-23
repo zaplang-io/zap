@@ -290,9 +290,32 @@ compile-time macros** are the hardest piece, targeted for v1 or an immediate
 fast-follow. See `design/0004-decorators.md`.
 
 ## D-0037 — Canonical formatter
-**Status:** Locked (direction)
-A single canonical formatter enforcing **Python-style** formatting (one true
-style, gofmt-spirit). Tooling detail, built later.
+**Status:** Locked
+A single canonical formatter (`zap fmt`) enforcing **Python-style** formatting
+(one true style, gofmt-spirit); no options. It reuses the parser and comment
+trivia (#225) and refuses to format source that does not parse. Guarantees:
+**idempotence** (`fmt(fmt(x)) == fmt(x)`), AST-preservation, and comment
+preservation.
+
+Style specifics pinned (I#157/A2, #226; full spec in `docs/FORMAT.md`):
+- **Indentation:** 4 spaces (per D-0041).
+- **Max line width:** 88 columns.
+- **Strings:** prefer double quotes; fall back to single only to avoid escaping;
+  triple-quote values containing a newline; prefixes lowercased, ordered r/b/f.
+- **Blank lines:** collapse to ≤2 between top-level items, ≤1 inside blocks and
+  between type members; none at a block's start.
+- **Trailing commas:** added when a call/collection/signature is wrapped across
+  lines; absent when it fits on one line. Wrapping is **width-triggered**; a
+  Black-style magic trailing comma is **not** adopted in this slice (a comment
+  inside a collection does force a wrap so it keeps its place).
+- **Imports:** one module per `import` line (the comma-list/grouped forms, D-0052,
+  normalize to this); import **ordering is not rewritten** in this slice
+  (deferred, to protect comment attachment).
+- **Comments:** preserved in place; standalone on their own line, trailing glued
+  with two spaces before `#`; one space after `#` (except `#!`/`#:`); column
+  alignment not preserved.
+
+`zap fmt --check` is the non-writing CI mode (D-0037 fmt-gate, #227).
 
 ## D-0038 — Function arguments: defaults, keyword calls, variadics
 **Status:** Locked

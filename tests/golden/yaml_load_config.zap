@@ -21,35 +21,37 @@ def describe(JsonValue v) -> str:
             return "object"
 
 def main():
-    auto doc = yaml.load("# service config\nname: web\nport: 8080\ndebug: true\nratio: 1.5\ntags:\n  - alpha\n  - beta\ndb:\n  host: localhost\n  pool: 5\n")
+    auto doc = yaml.load(
+        "# service config\nname: web\nport: 8080\ndebug: true\nratio: 1.5\ntags:\n  - alpha\n  - beta\ndb:\n  host: localhost\n  pool: 5\n",
+    )
     match doc:
         case JsonValue.Object(fields):
             match fields["name"]:
                 case JsonValue.Str(s):
-                    print(s)                  # web
+                    print(s)  # web
                 case _:
                     print("?")
             match fields["port"]:
                 case JsonValue.Int(i):
-                    print(i)                  # 8080
+                    print(i)  # 8080
                 case _:
                     print("?")
             match fields["debug"]:
                 case JsonValue.Bool(b):
                     if b:
-                        print(1)              # 1
+                        print(1)  # 1
                     else:
                         print(0)
                 case _:
                     print("?")
             print(describe(fields["ratio"]))  # float
-            print(describe(fields["tags"]))   # array
+            print(describe(fields["tags"]))  # array
             match fields["tags"]:
                 case JsonValue.Array(items):
-                    print(len(items))         # 2
+                    print(len(items))  # 2
                     match items[0]:
                         case JsonValue.Str(s):
-                            print(s)          # alpha
+                            print(s)  # alpha
                         case _:
                             print("?")
                 case _:
@@ -58,12 +60,12 @@ def main():
                 case JsonValue.Object(inner):
                     match inner["host"]:
                         case JsonValue.Str(s):
-                            print(s)          # localhost
+                            print(s)  # localhost
                         case _:
                             print("?")
                     match inner["pool"]:
                         case JsonValue.Int(i):
-                            print(i)          # 5
+                            print(i)  # 5
                         case _:
                             print("?")
                 case _:

@@ -9,6 +9,6 @@ def identity[T](T x) -> T:
 def main():
     print(identity(5))
     print(identity("hi"))
-    print(identity(9))            # dedup: reuses identity$int64
-    print(identity[int64](7))     # explicit type args
-    print(identity[str]("x"))     # explicit type args
+    print(identity(9))  # dedup: reuses identity$int64
+    print(identity[int64](7))  # explicit type args
+    print(identity[str]("x"))  # explicit type args
