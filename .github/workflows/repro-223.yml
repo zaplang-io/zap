@@ -39,8 +39,28 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: arm64
+      - name: Install gdb
+        run: sudo apt-get install -y --no-install-recommends gdb
       - name: Build zapc (gc-immix)
         run: cargo build -p zapc --features zapc/llvm,zapc/gc-immix
+      - name: Crash backtrace (gc-immix, amp_evac under gdb)
+        run: |
+          ZAPC="$(find target -name zapc -type f -path '*/debug/*' | head -1)"
+          echo "zapc = $ZAPC"
+          "$ZAPC" build tests/repro223/amp_evac.zap -o /tmp/amp_evac
+          ulimit -c unlimited || true
+          # Crash is ~97%/run, so a handful of gdb runs should catch it.
+          for i in $(seq 1 10); do
+            echo "===== gdb attempt $i ====="
+            MAXPROCS=4 gdb -batch -q \
+              -ex 'handle SIGURG nostop noprint pass' \
+              -ex 'run' \
+              -ex 'echo \n==== faulting thread bt ====\n' -ex 'bt' \
+              -ex 'echo \n==== all threads ====\n' -ex 'thread apply all bt' \
+              -ex 'echo \n==== registers ====\n' -ex 'info registers' \
+              /tmp/amp_evac 2>&1 | sed -n '1,160p'
+            echo "===== attempt $i exit ====="
+          done
       - name: Measure (gc-immix) default / no-evac / poison
         run: |
           ZAPC="$(find target -name zapc -type f -path '*/debug/*' | head -1)"
