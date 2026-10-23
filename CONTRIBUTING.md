@@ -79,6 +79,9 @@ cargo clippy --workspace --features zapc/gc-boehm --all-targets -- -D warnings  
 # 3. Tests — the full suite under BOTH garbage collectors
 make docker-test        # = cargo test --workspace --features zapc/gc-immix
                         #   + cargo test --workspace --features zapc/gc-boehm
+
+# 4. Zap fmt gate (host job): every .zap source must be canonically formatted
+cargo run -q --bin zap -- fmt --check tests/golden   # fix with: ... fmt tests/golden
 ```
 
 Notes that have bitten people:
@@ -90,6 +93,10 @@ Notes that have bitten people:
   against LLVM, so on a host without it run them inside `make docker-shell`.
 - **`cargo fmt` is a gate, not a nicety.** "Format check" is the most common
   reason a PR goes red. Run `cargo fmt --all` before every push.
+- **`.zap` sources have a fmt gate too** (D-0037). The host job runs
+  `zap fmt --check tests/golden`; a new or edited `*.zap` must be canonically
+  formatted. Fix with `cargo run --bin zap -- fmt tests/golden` (or
+  `zap fmt <file>`). The style is specified in `docs/FORMAT.md`.
 - **Docs-only PRs still run every gate.** CI doesn't skip on file type; verify
   the checks for *both* the `pull_request` and `push` triggers are green before
   asking for review. A `push` run can fail when the `pull_request` run passed

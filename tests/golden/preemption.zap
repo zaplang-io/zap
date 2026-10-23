@@ -39,6 +39,6 @@ def main():
     for k in range(0, n):
         sync.add(wg, 1)
         spawn peer(counter, wg)
-    sync.wait(wg)       # returns only once every peer has run
-    done.store(True)    # release the spinner
+    sync.wait(wg)  # returns only once every peer has run
+    done.store(True)  # release the spinner
     print(counter.load())

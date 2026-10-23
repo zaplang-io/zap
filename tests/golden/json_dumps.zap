@@ -5,16 +5,16 @@
 # so multi-key objects are exercised only via round-trip structure, not here.
 
 def main():
-    print(json.dumps(JsonValue.Null))             # null
-    print(json.dumps(JsonValue.Bool(True)))       # true
-    print(json.dumps(JsonValue.Int(42)))          # 42
-    print(json.dumps(JsonValue.Str("hi")))        # "hi"
-    print(json.dumps(JsonValue.Str("a\"b\nc")))   # "a\"b\nc" (escaped)
+    print(json.dumps(JsonValue.Null))  # null
+    print(json.dumps(JsonValue.Bool(True)))  # true
+    print(json.dumps(JsonValue.Int(42)))  # 42
+    print(json.dumps(JsonValue.Str("hi")))  # "hi"
+    print(json.dumps(JsonValue.Str("a\"b\nc")))  # "a\"b\nc" (escaped)
 
     auto xs = [JsonValue.Int(1), JsonValue.Int(2), JsonValue.Null]
-    print(json.dumps(JsonValue.Array(xs)))        # [1,2,null]
+    print(json.dumps(JsonValue.Array(xs)))  # [1,2,null]
 
     auto m = {"k": JsonValue.Bool(False)}
-    print(json.dumps(JsonValue.Object(m)))        # {"k":false}
+    print(json.dumps(JsonValue.Object(m)))  # {"k":false}
 
     print(json.dumps(json.loads("[true, 3, \"x\"]")))  # [true,3,"x"]

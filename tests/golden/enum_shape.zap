@@ -9,14 +9,14 @@ enum Shape:
 
 def area(Shape s) -> f64:
     match s:
-        case Shape.Circle(r):          # positional binding
+        case Shape.Circle(r):  # positional binding
             return 3.14159 * r * r
-        case Shape.Rect(w=w, h=h):     # named binding
+        case Shape.Rect(w=w, h=h):  # named binding
             return w * h
-        case Shape.Unit:               # payload-free variant
+        case Shape.Unit:  # payload-free variant
             return 1.0
 
 def main():
-    print(area(Shape.Circle(r=2.0)))   # 12.566360
+    print(area(Shape.Circle(r=2.0)))  # 12.566360
     print(area(Shape.Rect(3.0, 4.0)))  # 12.000000
-    print(area(Shape.Unit))            # 1.000000
+    print(area(Shape.Unit))  # 1.000000

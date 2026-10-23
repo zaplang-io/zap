@@ -9,5 +9,5 @@ struct Tag:
 
 def main():
     auto t = Tag(name="x")
-    print(t.name)           # x
+    print(t.name)  # x
     print(int64(Color.GREEN))  # 1

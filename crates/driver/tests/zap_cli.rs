@@ -212,11 +212,59 @@ fn test_with_no_tests_fails_cleanly() {
 }
 
 #[test]
-fn fmt_reports_not_implemented() {
-    let out = zap().arg("fmt").output().unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("D-0037"), "got: {stderr}");
+fn fmt_formats_stdin_to_stdout() {
+    let mut child = zap()
+        .arg("fmt")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"x=1+2\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "x = 1 + 2\n");
+}
+
+#[test]
+fn fmt_check_reports_unformatted() {
+    // Unformatted stdin under --check exits non-zero and writes nothing to stdout.
+    let mut child = zap()
+        .arg("fmt")
+        .arg("--check")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"x=1\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty under --check"
+    );
+}
+
+#[test]
+fn fmt_check_passes_formatted_file() {
+    let dir = scratch("fmt");
+    let f = dir.join("ok.zap");
+    std::fs::write(&f, "x = 1\n").unwrap();
+    let out = zap().arg("fmt").arg("--check").arg(&f).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn fmt_rewrites_file_in_place() {
+    let dir = scratch("fmt");
+    let f = dir.join("messy.zap");
+    std::fs::write(&f, "x=1\n").unwrap();
+    let out = zap().arg("fmt").arg(&f).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "x = 1\n");
 }
 
 #[test]

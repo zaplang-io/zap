@@ -23,7 +23,7 @@
 
 def sleeper(Atomic[int64] c, bytes wg):
     time.sleep_ns(time.micros(300))
-    auto junk = [1, 2, 3]            # a little heap churn to feed the collector
+    auto junk = [1, 2, 3]  # a little heap churn to feed the collector
     c.add(1)
     sync.done(wg)
 
@@ -48,9 +48,9 @@ def main() -> int64:
             spawn sleeper(c, wg)
             spawn locker(mu, c, wg)
             k = k + 1
-        sync.wait(wg)               # every coroutine of this wave is now pooled
-        gc.collect()                # pre-fix: reclaims the pooled stacks -> next
-                                    # wave reuses dangling memory -> SIGSEGV
+        sync.wait(wg)  # every coroutine of this wave is now pooled
+        gc.collect()  # pre-fix: reclaims the pooled stacks -> next
+        # wave reuses dangling memory -> SIGSEGV
         w = w + 1
     # 6 waves * 20 * 2 workers = 240.
     print(c.load())

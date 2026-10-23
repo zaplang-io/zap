@@ -20,14 +20,14 @@
 # collection never waited on the sleeper, so this is stable there too.
 
 def long_sleeper(Atomic[int64] ready):
-    ready.store(1)          # announce we are about to block
-    time.sleep(120.0)       # one long blocking sleep on this daemon's dedicated M
+    ready.store(1)  # announce we are about to block
+    time.sleep(120.0)  # one long blocking sleep on this daemon's dedicated M
 
 def main() -> int64:
     Atomic[int64] ready = Atomic(0)
     auto t = threading.Thread(target=lambda: long_sleeper(ready), daemon=True)
     t.start()
-    while ready.load() == 0:   # wait until the daemon has reached its sleep
+    while ready.load() == 0:  # wait until the daemon has reached its sleep
         auto spin = 0
     # Hammer stop-the-world while the daemon is parked in its long sleep. Pre-fix
     # the first of these blocks until the 120s sleep ends -> harness timeout;

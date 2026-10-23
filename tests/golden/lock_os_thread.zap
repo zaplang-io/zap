@@ -13,7 +13,7 @@
 
 def pinned(channel[int64] ch, Atomic[int64] out, bytes wg):
     runtime.lock_os_thread()
-    auto v = <-ch                 # park while pinned; resume on the dedicated M
+    auto v = <-ch  # park while pinned; resume on the dedicated M
     auto s = v * 2
     runtime.unlock_os_thread()
     out.store(s)
@@ -25,6 +25,6 @@ def main():
     auto wg = sync.waitgroup()
     sync.add(wg, 1)
     spawn pinned(ch, out, wg)
-    ch <- 21                       # rendezvous with the pinned receiver
+    ch <- 21  # rendezvous with the pinned receiver
     sync.wait(wg)
     print(out.load())

@@ -3,7 +3,7 @@
 # has returned, so the captured environment cannot live in the returning frame —
 # it is a GC-managed heap record. Two independent closures prove each captures
 # its own `n`.
-def make_adder(int64 n) -> fn(int64)->int64:
+def make_adder(int64 n) -> fn(int64) -> int64:
     return lambda x: x + n
 
 def main():

@@ -5,8 +5,8 @@
 def main():
     auto a = array[uint8]([10, 20, 30, 40, 250])
     auto b = array[uint8]([1, 2, 3, 4, 10])
-    print(sum(a + b))    # 11,22,33,44,(260 % 256 = 4) -> 114
-    print(sum(a * 2))    # 20,40,60,80,(500 % 256 = 244) -> 444
-    print(sum(a))        # 10+20+30+40+250 = 350 (accumulates in i64)
-    print(a[4])          # 250 (get zero-extends the byte)
-    print(len(a))        # 5
+    print(sum(a + b))  # 11,22,33,44,(260 % 256 = 4) -> 114
+    print(sum(a * 2))  # 20,40,60,80,(500 % 256 = 244) -> 444
+    print(sum(a))  # 10+20+30+40+250 = 350 (accumulates in i64)
+    print(a[4])  # 250 (get zero-extends the byte)
+    print(len(a))  # 5

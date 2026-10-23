@@ -7,7 +7,7 @@
 # the `str` (use-after-free / garbage length) or trace a non-pointer word.
 # The per-iteration work (len("item") == 4) makes the sum order-independent, so
 # the result is deterministic regardless of scheduler interleaving.
-def make_tagger(str tag) -> fn(int64)->str:
+def make_tagger(str tag) -> fn(int64) -> str:
     return lambda x: tag
 
 def worker(channel[int64] ch, int64 reps):

@@ -38,10 +38,10 @@ def main():
     # Dispatch through interface-typed bindings.
     Shape a = Circle(r=2.0)
     Shape b = Square(side=3.0)
-    print(a.name())     # circle
-    print(a.area())     # 12.566371  (pi * 2 * 2)
-    print(b.name())     # square
-    print(b.area())     # 9.000000   (3 * 3)
+    print(a.name())  # circle
+    print(a.area())  # 12.566371  (pi * 2 * 2)
+    print(b.name())  # square
+    print(b.area())  # 9.000000   (3 * 3)
     # Dispatch through an interface-typed parameter.
     print(describe(a))  # circle / 12.566371
     print(describe(b))  # square / 9.000000
