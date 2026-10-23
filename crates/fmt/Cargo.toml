@@ -1,0 +1,14 @@
+[package]
+name = "zapc_fmt"
+description = "The canonical Zap source formatter (`zap fmt`, D-0037). Host-only: reuses the parser + comment trivia, no LLVM."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_fmt"
+path = "src/lib.rs"
+
+[dependencies]
+zapc_syntax = { path = "../syntax" }
