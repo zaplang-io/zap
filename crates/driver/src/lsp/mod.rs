@@ -34,10 +34,12 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use zapc_analysis::{Analysis, Severity};
+use zapc_analysis::{
+    Analysis, Completion, CompletionKind, DocumentSymbol, Severity, SymbolKind, SymbolRef, Ty,
+};
 
 use crate::json::{self, Json};
-use position::PositionMapper;
+use position::{LspPos, PositionMapper};
 
 /// LSP `DiagnosticSeverity`.
 const SEVERITY_ERROR: i64 = 1;
@@ -161,6 +163,26 @@ impl Server {
             "textDocument/didSave" => self.did_save(&params, out),
             "textDocument/didClose" => self.did_close(&params, out),
 
+            // --- language features (#230) ---
+            "textDocument/definition" if is_request => {
+                out.push(result_response(
+                    id.unwrap(),
+                    self.definition(&params).unwrap_or(Json::Null),
+                ));
+            }
+            "textDocument/hover" if is_request => {
+                out.push(result_response(
+                    id.unwrap(),
+                    self.hover(&params).unwrap_or(Json::Null),
+                ));
+            }
+            "textDocument/completion" if is_request => {
+                out.push(result_response(id.unwrap(), self.completion(&params)));
+            }
+            "textDocument/documentSymbol" if is_request => {
+                out.push(result_response(id.unwrap(), self.document_symbol(&params)));
+            }
+
             // Unknown requests get a proper error; unknown notifications are
             // ignored (the client may send capabilities we don't implement).
             other => {
@@ -176,9 +198,10 @@ impl Server {
         Flow::Continue
     }
 
-    /// The `initialize` result — advertises only the capabilities #229
-    /// implements: full-text document sync (open/close/save) and pushed
-    /// diagnostics, with UTF-16 position encoding.
+    /// The `initialize` result — advertises full-text document sync
+    /// (open/close/save) and pushed diagnostics (#229) plus the interactive
+    /// features (#230): completion (triggered on `.`), hover, go-to-definition,
+    /// and document symbols. Position encoding is UTF-16.
     fn initialize(&self) -> Json {
         Json::obj(vec![
             (
@@ -193,6 +216,16 @@ impl Server {
                             ("save", Json::obj(vec![("includeText", Json::Bool(false))])),
                         ]),
                     ),
+                    (
+                        "completionProvider",
+                        Json::obj(vec![
+                            ("triggerCharacters", Json::Arr(vec![Json::str(".")])),
+                            ("resolveProvider", Json::Bool(false)),
+                        ]),
+                    ),
+                    ("hoverProvider", Json::Bool(true)),
+                    ("definitionProvider", Json::Bool(true)),
+                    ("documentSymbolProvider", Json::Bool(true)),
                 ]),
             ),
             (
@@ -287,6 +320,91 @@ impl Server {
             .collect();
         out.push(publish_diagnostics(uri, diags));
     }
+
+    /// Resolve a request's `textDocument.uri` + `position` to the held document
+    /// text and a byte offset into it, or `None` if the document is unknown or
+    /// the position is out of range.
+    fn locate<'a>(&'a self, params: &'a Json) -> Option<(&'a str, &'a str, u32)> {
+        let uri = params
+            .get("textDocument")
+            .and_then(|d| d.get("uri"))
+            .and_then(Json::as_str)?;
+        let text = self.docs.get(uri)?;
+        let pos = params.get("position")?;
+        let line = pos.get("line").and_then(Json::as_i64)? as u32;
+        let character = pos.get("character").and_then(Json::as_i64)? as u32;
+        let offset = PositionMapper::new(text).offset(line, character)?;
+        Some((uri, text, offset))
+    }
+
+    /// `textDocument/definition` → a `Location` in the same document (or null).
+    /// Backed by [`zapc_analysis::Analysis::definition_of`].
+    fn definition(&self, params: &Json) -> Option<Json> {
+        let (uri, text, offset) = self.locate(params)?;
+        let analysis = Analysis::analyze(text);
+        let def = analysis.definition_of(offset)?;
+        let mapper = PositionMapper::new(text);
+        let (start, end) = mapper.range(def);
+        Some(location(uri, start, end))
+    }
+
+    /// `textDocument/hover` → a `Hover` with the symbol's signature or type and
+    /// its docstring. Backed by [`zapc_analysis::Analysis::symbol_at`].
+    fn hover(&self, params: &Json) -> Option<Json> {
+        let (_, text, offset) = self.locate(params)?;
+        let analysis = Analysis::analyze(text);
+        let sym = analysis.symbol_at(offset)?;
+        let value = render_hover(&sym);
+        let mut fields = vec![(
+            "contents",
+            Json::obj(vec![
+                ("kind", Json::str("markdown")),
+                ("value", Json::str(value)),
+            ]),
+        )];
+        if let Some(range) = analysis.name_range_at(offset) {
+            let (start, end) = PositionMapper::new(text).range(range);
+            fields.push(("range", lsp_range(start, end)));
+        }
+        Some(Json::obj(fields))
+    }
+
+    /// `textDocument/completion` → a `CompletionList`. Backed by
+    /// [`zapc_analysis::Analysis::completions`].
+    fn completion(&self, params: &Json) -> Json {
+        let items = match self.locate(params) {
+            Some((_, text, offset)) => Analysis::analyze(text)
+                .completions(offset)
+                .iter()
+                .map(lsp_completion_item)
+                .collect(),
+            None => Vec::new(),
+        };
+        Json::obj(vec![
+            ("isIncomplete", Json::Bool(false)),
+            ("items", Json::Arr(items)),
+        ])
+    }
+
+    /// `textDocument/documentSymbol` → the outline tree. Backed by
+    /// [`zapc_analysis::Analysis::document_symbols`].
+    fn document_symbol(&self, params: &Json) -> Json {
+        let uri = params
+            .get("textDocument")
+            .and_then(|d| d.get("uri"))
+            .and_then(Json::as_str);
+        let Some(text) = uri.and_then(|u| self.docs.get(u)) else {
+            return Json::Arr(Vec::new());
+        };
+        let analysis = Analysis::analyze(text);
+        let mapper = PositionMapper::new(text);
+        let syms = analysis
+            .document_symbols()
+            .iter()
+            .map(|s| lsp_document_symbol(&mapper, s))
+            .collect();
+        Json::Arr(syms)
+    }
 }
 
 /// Map one [`zapc_analysis::Diagnostic`] to an LSP `Diagnostic` JSON object,
@@ -314,11 +432,112 @@ fn lsp_diagnostic(mapper: &PositionMapper, d: &zapc_analysis::Diagnostic) -> Jso
     ])
 }
 
-fn lsp_position(p: position::LspPos) -> Json {
+fn lsp_position(p: LspPos) -> Json {
     Json::obj(vec![
         ("line", Json::int(p.line as i64)),
         ("character", Json::int(p.character as i64)),
     ])
+}
+
+/// An LSP `Range` object from a `(start, end)` position pair.
+fn lsp_range(start: LspPos, end: LspPos) -> Json {
+    Json::obj(vec![
+        ("start", lsp_position(start)),
+        ("end", lsp_position(end)),
+    ])
+}
+
+/// An LSP `Location` — a URI plus a range — for go-to-definition.
+fn location(uri: &str, start: LspPos, end: LspPos) -> Json {
+    Json::obj(vec![
+        ("uri", Json::str(uri)),
+        ("range", lsp_range(start, end)),
+    ])
+}
+
+/// Render a [`SymbolRef`] as the markdown body of a hover: a fenced `zap` code
+/// block with the symbol's signature (functions/types) or `name: type`
+/// (locals/params/fields), followed by its docstring if any.
+fn render_hover(sym: &SymbolRef) -> String {
+    let code = match &sym.signature {
+        Some(sig) => sig.clone(),
+        None if matches!(sym.ty, Ty::Unknown) => sym.name.clone(),
+        None => format!("{}: {}", sym.name, sym.ty.display()),
+    };
+    let mut md = format!("```zap\n{code}\n```");
+    if let Some(doc) = &sym.doc {
+        md.push_str("\n\n");
+        md.push_str(doc);
+    }
+    md
+}
+
+/// Map one [`Completion`] to an LSP `CompletionItem`.
+fn lsp_completion_item(c: &Completion) -> Json {
+    let mut fields = vec![
+        ("label", Json::str(c.label.clone())),
+        ("kind", Json::int(completion_item_kind(c.kind))),
+    ];
+    if let Some(detail) = &c.detail {
+        fields.push(("detail", Json::str(detail.clone())));
+    }
+    Json::obj(fields)
+}
+
+/// The LSP `CompletionItemKind` number for a [`CompletionKind`]. (Params and
+/// locals map to `Variable`; imports to `Module`.)
+fn completion_item_kind(k: CompletionKind) -> i64 {
+    match k {
+        CompletionKind::Method => 2,
+        CompletionKind::Function => 3,
+        CompletionKind::Field => 5,
+        CompletionKind::Param | CompletionKind::Local => 6,
+        CompletionKind::Interface => 8,
+        CompletionKind::Import => 9,
+        CompletionKind::Enum => 13,
+        CompletionKind::Keyword => 14,
+        CompletionKind::EnumVariant => 20,
+        CompletionKind::Struct => 22,
+    }
+}
+
+/// Map one analysis [`DocumentSymbol`] to an LSP `DocumentSymbol` (hierarchical).
+fn lsp_document_symbol(mapper: &PositionMapper, s: &DocumentSymbol) -> Json {
+    let (rstart, rend) = mapper.range(s.span);
+    let (sstart, send) = mapper.range(s.name_span);
+    let mut fields = vec![
+        ("name", Json::str(s.name.clone())),
+        ("kind", Json::int(document_symbol_kind(s.kind))),
+        ("range", lsp_range(rstart, rend)),
+        ("selectionRange", lsp_range(sstart, send)),
+    ];
+    if let Some(detail) = &s.detail {
+        fields.push(("detail", Json::str(detail.clone())));
+    }
+    if !s.children.is_empty() {
+        let children = s
+            .children
+            .iter()
+            .map(|c| lsp_document_symbol(mapper, c))
+            .collect();
+        fields.push(("children", Json::Arr(children)));
+    }
+    Json::obj(fields)
+}
+
+/// The LSP `SymbolKind` number for an analysis [`SymbolKind`].
+fn document_symbol_kind(k: SymbolKind) -> i64 {
+    match k {
+        SymbolKind::Method => 6,
+        SymbolKind::Field => 8,
+        SymbolKind::Enum => 10,
+        SymbolKind::Interface => 11,
+        SymbolKind::Function | SymbolKind::Annotation | SymbolKind::Decorator => 12,
+        SymbolKind::Param | SymbolKind::Local | SymbolKind::Builtin => 13,
+        SymbolKind::EnumVariant => 22,
+        SymbolKind::Struct => 23,
+        SymbolKind::Import => 2,
+    }
 }
 
 /// A `textDocument/publishDiagnostics` notification for `uri`.
@@ -452,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_only_implemented_capabilities() {
+    fn initialize_advertises_sync_and_interactive_capabilities() {
         let out = drive(&[r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#]);
         let msgs = bodies(&out);
         assert_eq!(msgs.len(), 1);
@@ -464,10 +683,17 @@ mod tests {
         let sync = caps.get("textDocumentSync").unwrap();
         assert_eq!(sync.get("openClose"), Some(&Json::Bool(true)));
         assert_eq!(sync.get("change").unwrap().as_i64(), Some(SYNC_FULL));
-        // Nothing beyond #229's surface is advertised.
-        assert!(caps.get("completionProvider").is_none());
-        assert!(caps.get("hoverProvider").is_none());
-        assert!(caps.get("definitionProvider").is_none());
+        // #230 interactive features are advertised.
+        assert_eq!(caps.get("hoverProvider"), Some(&Json::Bool(true)));
+        assert_eq!(caps.get("definitionProvider"), Some(&Json::Bool(true)));
+        assert_eq!(caps.get("documentSymbolProvider"), Some(&Json::Bool(true)));
+        let completion = caps.get("completionProvider").expect("completionProvider");
+        let triggers = completion
+            .get("triggerCharacters")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(triggers[0].as_str(), Some("."));
     }
 
     #[test]
@@ -553,7 +779,8 @@ mod tests {
 
     #[test]
     fn unknown_request_gets_method_not_found() {
-        let out = drive(&[r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/hover","params":{}}"#]);
+        let out =
+            drive(&[r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/rename","params":{}}"#]);
         let msgs = bodies(&out);
         assert_eq!(msgs.len(), 1);
         assert_eq!(

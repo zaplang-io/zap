@@ -270,3 +270,114 @@ fn analysis_mode_does_not_change_diagnostics() {
         assert_eq!(plain.1, qw, "warnings differ for:\n{src}");
     }
 }
+
+// --- hover: signature + docstring (#230) ------------------------------------
+
+#[test]
+fn symbol_at_function_has_signature_and_doc() {
+    let src = "def add(int64 a, int64 b) -> int64:\n    \"Sum two ints.\"\n    return a + b\n\ndef main():\n    auto r = add(1, 2)\n";
+    let a = Analysis::analyze(src);
+    // On the call `add(1, 2)`.
+    let call = at(src, "add", 1);
+    let s = a.symbol_at(call).expect("add symbol");
+    assert_eq!(s.kind, SymbolKind::Function);
+    assert_eq!(
+        s.signature.as_deref(),
+        Some("def add(int64 a, int64 b) -> int64")
+    );
+    assert_eq!(s.doc.as_deref(), Some("Sum two ints."));
+}
+
+#[test]
+fn symbol_at_generic_function_signature() {
+    let src = "def first[T](list[T] xs) -> T:\n    return xs[0]\n\ndef main():\n    auto r = first([1])\n";
+    let a = Analysis::analyze(src);
+    let call = at(src, "first", 1);
+    let s = a.symbol_at(call).expect("first symbol");
+    assert_eq!(
+        s.signature.as_deref(),
+        Some("def first[T](list[T] xs) -> T")
+    );
+}
+
+#[test]
+fn symbol_at_struct_header_signature() {
+    let src = "struct Point:\n    int64 x\n    int64 y\n\ndef main():\n    auto p = Point(1, 2)\n";
+    let a = Analysis::analyze(src);
+    let ctor = at(src, "Point", 1); // the `Point(1, 2)` use
+    let s = a.symbol_at(ctor).expect("Point symbol");
+    assert_eq!(s.kind, SymbolKind::Struct);
+    assert_eq!(s.signature.as_deref(), Some("struct Point"));
+}
+
+// --- completion: scope (#230) -----------------------------------------------
+
+#[test]
+fn completions_scope_includes_params_locals_and_globals() {
+    let src = "def helper() -> int64:\n    return 1\n\ndef main(int64 arg):\n    int64 local = 2\n    auto z = \n";
+    let a = Analysis::analyze(src);
+    // Cursor at the end, after `auto z = ` (empty prefix) — inside `main`.
+    let pos = src.len() as u32 - 1; // on the final newline, inside main's body
+    let items = a.completions(pos);
+    let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels.contains(&"arg"), "param in scope: {labels:?}");
+    assert!(labels.contains(&"local"), "local in scope: {labels:?}");
+    assert!(labels.contains(&"helper"), "global fn in scope: {labels:?}");
+    assert!(labels.contains(&"main"), "global fn in scope: {labels:?}");
+    // A keyword is offered too.
+    assert!(labels.contains(&"return"), "keyword offered: {labels:?}");
+}
+
+#[test]
+fn completions_scope_filters_by_prefix() {
+    let src = "def alpha() -> int64:\n    return 1\n\ndef main():\n    al\n";
+    let a = Analysis::analyze(src);
+    let pos = (src.rfind("al").unwrap() + 2) as u32;
+    let items = a.completions(pos);
+    let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels.contains(&"alpha"), "prefix match: {labels:?}");
+    assert!(
+        !labels.contains(&"main"),
+        "non-matching filtered: {labels:?}"
+    );
+}
+
+// --- completion: member after `.` (#230) ------------------------------------
+
+#[test]
+fn completions_member_fields_and_methods() {
+    let src = "struct Point:\n    int64 x\n    int64 y\n\n    def mag(self) -> int64:\n        return self.x\n\ndef main():\n    auto p = Point(1, 2)\n    auto q = p.\n";
+    let a = Analysis::analyze(src);
+    // Cursor right after the trailing `p.`
+    let dot = src.rfind("p.").unwrap() + 2;
+    let items = a.completions(dot as u32);
+    let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels.contains(&"x"), "field x: {labels:?}");
+    assert!(labels.contains(&"y"), "field y: {labels:?}");
+    assert!(labels.contains(&"mag"), "method mag: {labels:?}");
+    // Kinds are correct.
+    let x = items.iter().find(|c| c.label == "x").unwrap();
+    assert_eq!(x.kind, zapc_analysis::CompletionKind::Field);
+    let mag = items.iter().find(|c| c.label == "mag").unwrap();
+    assert_eq!(mag.kind, zapc_analysis::CompletionKind::Method);
+}
+
+#[test]
+fn completions_member_filters_by_partial() {
+    let src = "struct Rec:\n    int64 count\n    int64 cost\n    int64 name\n\ndef main():\n    auto r = Rec(1, 2, 3)\n    auto v = r.co\n";
+    let a = Analysis::analyze(src);
+    let pos = (src.rfind("r.co").unwrap() + "r.co".len()) as u32;
+    let items = a.completions(pos);
+    let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels.contains(&"count"), "co* count: {labels:?}");
+    assert!(labels.contains(&"cost"), "co* cost: {labels:?}");
+    assert!(!labels.contains(&"name"), "name filtered out: {labels:?}");
+}
+
+#[test]
+fn completions_member_on_non_type_is_empty() {
+    let src = "def main():\n    int64 n = 1\n    auto v = n.\n";
+    let a = Analysis::analyze(src);
+    let dot = src.rfind("n.").unwrap() + 2;
+    assert!(a.completions(dot as u32).is_empty());
+}
