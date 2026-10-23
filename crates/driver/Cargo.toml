@@ -23,6 +23,7 @@ name = "zapc"
 path = "src/bin/zapc.rs"
 
 [dependencies]
+zapc_diag = { path = "../diag" }
 zapc_syntax = { path = "../syntax" }
 zapc_sema = { path = "../sema" }
 zapc_ir = { path = "../ir" }

@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::*;
 use zapc_syntax::genanalysis;
 use zapc_syntax::span::Span;
@@ -28,9 +29,16 @@ use zapc_sema_types::*;
 /// addable. See [`modules`] for the seam contract.
 mod modules;
 
-/// A type-checking error with the offending source span.
+/// A type-checking diagnostic with its stable [`ErrorCode`] and the offending
+/// source span.
+///
+/// Despite the name this carries both errors and warnings (the severity is
+/// decided by which list — `errors` or `warnings` — it lands in). The `code` is
+/// the machine-parseable identifier (see `zapc_diag`); `message` is human-facing
+/// prose that may change between releases.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeError {
+    pub code: ErrorCode,
     pub message: String,
     pub span: Span,
 }
@@ -280,15 +288,17 @@ impl Checker {
         }
     }
 
-    fn error(&mut self, message: impl Into<String>, span: Span) {
+    fn error(&mut self, code: ErrorCode, message: impl Into<String>, span: Span) {
         self.errors.push(TypeError {
+            code,
             message: message.into(),
             span,
         });
     }
 
-    fn warn(&mut self, message: impl Into<String>, span: Span) {
+    fn warn(&mut self, code: ErrorCode, message: impl Into<String>, span: Span) {
         self.warnings.push(TypeError {
+            code,
             message: message.into(),
             span,
         });
@@ -622,6 +632,7 @@ impl Checker {
                     .map(|(_, sp)| *sp)
                     .unwrap_or_default();
                 self.error(
+                    ErrorCode::ZAP5001,
                     format!(
                         "value struct '{node}' cannot contain itself by value \
                          (an inline value type would be infinitely large); use a \
@@ -678,6 +689,7 @@ impl Checker {
                     for f in &a.fields {
                         if f.bits.is_some() {
                             self.error(
+                                ErrorCode::ZAP5010,
                                 "a bit width is only allowed on a `value struct` field (D-0068)"
                                     .to_string(),
                                 f.span,
@@ -693,6 +705,7 @@ impl Checker {
                     if !s.is_value {
                         for f in s.fields.iter().filter(|f| f.bits.is_some()) {
                             self.error(
+                                ErrorCode::ZAP5010,
                                 format!(
                                     "bit widths require a `value struct`: field '{}' of the \
                                      reference struct '{}' cannot be a bitfield (a plain struct \
@@ -719,6 +732,7 @@ impl Checker {
             let Some(width) = f.bits else {
                 // All-or-nothing: a width-less field in a bitfield struct.
                 self.error(
+                    ErrorCode::ZAP5011,
                     format!(
                         "every field of bitfield value struct '{}' must declare a bit width \
                          (v1 does not mix bitfields with full-width fields, D-0068); field '{}' \
@@ -738,11 +752,13 @@ impl Checker {
             let w = u64::from(width);
             if width == 0 {
                 self.error(
+                    ErrorCode::ZAP5012,
                     format!("bitfield '{}' must be at least 1 bit wide", f.name),
                     f.span,
                 );
             } else if w > type_bits {
                 self.error(
+                    ErrorCode::ZAP5013,
                     format!(
                         "bitfield '{}' is {} bits wide but its type holds at most {} bits (D-0068)",
                         f.name, width, type_bits
@@ -751,6 +767,7 @@ impl Checker {
                 );
             } else if w < min_bits {
                 self.error(
+                    ErrorCode::ZAP5014,
                     format!(
                         "bitfield '{}' is {} bits wide but its enum needs at least {} bits to \
                          hold every discriminant (D-0068)",
@@ -763,6 +780,7 @@ impl Checker {
         }
         if total > 64 {
             self.error(
+                ErrorCode::ZAP5015,
                 format!(
                     "bitfield value struct '{}' packs {} bits, more than one 64-bit machine \
                      word (D-0068)",
@@ -798,6 +816,7 @@ impl Checker {
                         if let Some(info) = self.enums.get(other) {
                             if info.is_sum {
                                 self.error(
+                                    ErrorCode::ZAP5016,
                                     format!(
                                         "a tagged enum '{other}' is a reference value and cannot \
                                          be a bitfield (only tier-1 enums, D-0068)"
@@ -811,6 +830,7 @@ impl Checker {
                                 Some(bits) => return Some((64, false, bits)),
                                 None => {
                                     self.error(
+                                        ErrorCode::ZAP5017,
                                         format!(
                                             "enum '{other}' has a negative discriminant and \
                                              cannot be an unsigned bitfield (D-0068)"
@@ -826,6 +846,7 @@ impl Checker {
             }
         }
         self.error(
+            ErrorCode::ZAP5018,
             "a bitfield must be a fixed-width integer (int32/int64), bool, or a tier-1 enum — \
              not a pointer/reference, float, char, or bigint (D-0068)"
                 .to_string(),
@@ -1126,6 +1147,7 @@ impl Checker {
                 if let Some(argname) = &a.name {
                     if !fields.contains(argname) {
                         self.error(
+                            ErrorCode::ZAP5030,
                             format!("annotation '@{}' has no field '{argname}'", d.name),
                             d.span,
                         );
@@ -1134,6 +1156,7 @@ impl Checker {
             }
             if d.args.len() > fields.len() {
                 self.error(
+                    ErrorCode::ZAP5031,
                     format!(
                         "annotation '@{}' takes at most {} argument(s), found {}",
                         d.name,
@@ -1152,6 +1175,7 @@ impl Checker {
             return;
         }
         self.error(
+            ErrorCode::ZAP5032,
             format!(
                 "unknown decorator or annotation '@{}' (not a built-in, \
                  `annotation`, or `decorator`)",
@@ -1169,16 +1193,22 @@ impl Checker {
                 self.require_target(d, target, DecoTarget::Struct);
                 if d.args.is_empty() {
                     self.error(
+                        ErrorCode::ZAP5033,
                         "@derive(...) needs at least one trait, e.g. @derive(Eq, Repr)",
                         d.span,
                     );
                 }
                 for a in &d.args {
                     if a.name.is_some() {
-                        self.error("@derive takes positional trait names, not keywords", d.span);
+                        self.error(
+                            ErrorCode::ZAP5034,
+                            "@derive takes positional trait names, not keywords",
+                            d.span,
+                        );
                     } else if let Expr::Name(t, _) = &a.value {
                         if !DERIVABLE_TRAITS.contains(&t.as_str()) {
                             self.error(
+                                ErrorCode::ZAP5035,
                                 format!(
                                     "unknown derivable trait '{t}' (expected one of \
                                      Eq, Ord, Json, Repr, Hash)"
@@ -1187,7 +1217,11 @@ impl Checker {
                             );
                         }
                     } else {
-                        self.error("@derive expects trait names, e.g. @derive(Eq)", d.span);
+                        self.error(
+                            ErrorCode::ZAP5036,
+                            "@derive expects trait names, e.g. @derive(Eq)",
+                            d.span,
+                        );
                     }
                 }
             }
@@ -1198,6 +1232,7 @@ impl Checker {
                 self.require_target(d, target, DecoTarget::Function);
                 if positionals != 1 || keywords != 0 {
                     self.error(
+                        ErrorCode::ZAP5037,
                         "@on_signal(Signal.X) takes exactly one Signal argument, \
                          e.g. @on_signal(Signal.SIGINT)",
                         d.span,
@@ -1214,6 +1249,7 @@ impl Checker {
                     );
                     if !ok {
                         self.error(
+                            ErrorCode::ZAP5037,
                             "@on_signal expects a Signal member, e.g. @on_signal(Signal.SIGINT)",
                             d.span,
                         );
@@ -1224,6 +1260,7 @@ impl Checker {
                 self.require_target(d, target, DecoTarget::Field);
                 if positionals != 1 || keywords != 0 {
                     self.error(
+                        ErrorCode::ZAP5038,
                         "@default(expr) takes exactly one expression, e.g. @default(now())",
                         d.span,
                     );
@@ -1233,6 +1270,7 @@ impl Checker {
                 self.require_target(d, target, DecoTarget::Field);
                 if positionals != 0 {
                     self.error(
+                        ErrorCode::ZAP5039,
                         "@range(...) takes keyword bounds: @range(min=0, max=150)",
                         d.span,
                     );
@@ -1241,6 +1279,7 @@ impl Checker {
                     if let Some(n) = &a.name {
                         if n != "min" && n != "max" {
                             self.error(
+                                ErrorCode::ZAP5039,
                                 format!("@range has no bound '{n}' (expected 'min' or 'max')"),
                                 d.span,
                             );
@@ -1248,13 +1287,18 @@ impl Checker {
                     }
                 }
                 if d.args.is_empty() {
-                    self.error("@range(...) needs at least one of min/max", d.span);
+                    self.error(
+                        ErrorCode::ZAP5039,
+                        "@range(...) needs at least one of min/max",
+                        d.span,
+                    );
                 }
             }
             "validate" => {
                 self.require_target(d, target, DecoTarget::Field);
                 if positionals != 0 {
                     self.error(
+                        ErrorCode::ZAP5040,
                         "@validate(...) takes keyword constraints, e.g. @validate(max_len=50)",
                         d.span,
                     );
@@ -1263,13 +1307,13 @@ impl Checker {
             "cache" => {
                 self.require_target(d, target, DecoTarget::Function);
                 if !d.args.is_empty() {
-                    self.error("@cache takes no arguments", d.span);
+                    self.error(ErrorCode::ZAP5041, "@cache takes no arguments", d.span);
                 }
             }
             "inject" => {
                 self.require_target(d, target, DecoTarget::Field);
                 if !d.args.is_empty() {
-                    self.error("@inject takes no arguments", d.span);
+                    self.error(ErrorCode::ZAP5041, "@inject takes no arguments", d.span);
                 }
             }
             "deprecated" => {
@@ -1277,6 +1321,7 @@ impl Checker {
                 let well_formed = d.args.len() <= 1 && keywords == 0;
                 if !well_formed {
                     self.error(
+                        ErrorCode::ZAP5042,
                         "@deprecated takes an optional message string, e.g. @deprecated(\"use X\")",
                         d.span,
                     );
@@ -1286,7 +1331,11 @@ impl Checker {
             "test" | "before" | "after" | "before_all" | "after_all" => {
                 self.require_target(d, target, DecoTarget::Function);
                 if !d.args.is_empty() {
-                    self.error(format!("@{} takes no arguments", d.name), d.span);
+                    self.error(
+                        ErrorCode::ZAP5041,
+                        format!("@{} takes no arguments", d.name),
+                        d.span,
+                    );
                 }
             }
             "skip" => {
@@ -1294,6 +1343,7 @@ impl Checker {
                 // Optional single positional reason string.
                 if d.args.len() > 1 || keywords != 0 {
                     self.error(
+                        ErrorCode::ZAP5043,
                         "@skip takes an optional reason string, e.g. @skip(\"flaky\")",
                         d.span,
                     );
@@ -1306,6 +1356,7 @@ impl Checker {
                 // it is not type-checked here.
                 if !(1..=2).contains(&positionals) || keywords != 0 {
                     self.error(
+                        ErrorCode::ZAP5044,
                         "@skip_if takes a condition and an optional reason, \
                          e.g. @skip_if(slow, \"CI only\")",
                         d.span,
@@ -1319,6 +1370,7 @@ impl Checker {
                 // today), so the name is not resolved here.
                 if positionals != 1 || keywords != 0 {
                     self.error(
+                        ErrorCode::ZAP5045,
                         "@expect_raises takes one exception type, e.g. @expect_raises(ValueError)",
                         d.span,
                     );
@@ -1332,13 +1384,18 @@ impl Checker {
                 let only_cases = d.args.iter().all(|a| a.name.as_deref() == Some("cases"));
                 if !has_cases || !only_cases || d.args.len() != 1 {
                     self.error(
+                        ErrorCode::ZAP5046,
                         "@parametrize takes a single `cases` list, \
                          e.g. @parametrize(cases=[(1, 2, 3), (4, 5, 9)])",
                         d.span,
                     );
                 } else if let Some(a) = d.args.first() {
                     if !matches!(a.value, Expr::List(..)) {
-                        self.error("@parametrize(cases=...) expects a list of cases", d.span);
+                        self.error(
+                            ErrorCode::ZAP5046,
+                            "@parametrize(cases=...) expects a list of cases",
+                            d.span,
+                        );
                     }
                 }
             }
@@ -1349,6 +1406,7 @@ impl Checker {
     fn require_target(&mut self, d: &Decorator, got: DecoTarget, want: DecoTarget) {
         if got != want {
             self.error(
+                ErrorCode::ZAP5047,
                 format!(
                     "@{} applies to {}, not {}",
                     d.name,
@@ -1363,6 +1421,7 @@ impl Checker {
     fn check_reflect_args(&mut self, fname: &str, arity: usize, args: &[Arg], span: Span) {
         if args.len() != arity {
             self.error(
+                ErrorCode::ZAP4025,
                 format!(
                     "{fname}() takes exactly {arity} argument(s), found {}",
                     args.len()
@@ -1374,6 +1433,7 @@ impl Checker {
             let t = self.infer(&a.value);
             if !matches!(t, Ty::Str | Ty::Unknown) {
                 self.error(
+                    ErrorCode::ZAP4024,
                     format!("{fname}() expects str arguments, found {}", t.display()),
                     span,
                 );
@@ -1457,6 +1517,7 @@ impl Checker {
         if is_gen {
             if self_ty.is_some() {
                 self.error(
+                    ErrorCode::ZAP5060,
                     "generators as methods are not supported yet (I#67 v1); define \
                      the generator as a free function"
                         .to_string(),
@@ -1464,6 +1525,7 @@ impl Checker {
                 );
             } else if f.name == "main" {
                 self.error(
+                    ErrorCode::ZAP5061,
                     "the entry point 'main' cannot be a generator (it contains \
                      'yield', I#67)"
                         .to_string(),
@@ -1472,6 +1534,7 @@ impl Checker {
             }
             if f.ret.is_some() {
                 self.error(
+                    ErrorCode::ZAP5062,
                     "a generator must not declare a return type: calling it returns \
                      an Iterator over the yielded values (I#67, D-0048)"
                         .to_string(),
@@ -1540,6 +1603,7 @@ impl Checker {
                 Some("on_error") => {
                     if !is_on_error_policy(&a.value) {
                         self.error(
+                            ErrorCode::ZAP5070,
                             "scope on_error expects OnError.Cancel or OnError.Wait".to_string(),
                             expr_span(&a.value),
                         );
@@ -1548,6 +1612,7 @@ impl Checker {
                 Some("timeout") => {
                     self.infer(&a.value);
                     self.error(
+                        ErrorCode::ZAP5071,
                         "scope(timeout=...) is not supported yet (the timer API is deferred)"
                             .to_string(),
                         expr_span(&a.value),
@@ -1564,6 +1629,7 @@ impl Checker {
                                 && !matches!(et, Ty::Unknown)
                             {
                                 self.error(
+                                    ErrorCode::ZAP5072,
                                     format!(
                                         "scope cancel_on expects a list of Signal, found {}",
                                         et.display()
@@ -1574,6 +1640,7 @@ impl Checker {
                         }
                     } else {
                         self.error(
+                            ErrorCode::ZAP5072,
                             "scope cancel_on expects a list, e.g. \
                              cancel_on=[Signal.SIGINT, Signal.SIGTERM]"
                                 .to_string(),
@@ -1587,6 +1654,7 @@ impl Checker {
                     let gt = self.infer(&a.value);
                     if !gt.is_int() && !matches!(gt, Ty::Unknown) {
                         self.error(
+                            ErrorCode::ZAP5073,
                             format!(
                                 "scope grace must be an integer number of milliseconds, found {}",
                                 gt.display()
@@ -1596,6 +1664,7 @@ impl Checker {
                     }
                 }
                 Some(other) => self.error(
+                    ErrorCode::ZAP5074,
                     format!(
                         "scope() has no option '{other}' \
                          (expected 'on_error', 'cancel_on', or 'grace')"
@@ -1603,6 +1672,7 @@ impl Checker {
                     expr_span(&a.value),
                 ),
                 None => self.error(
+                    ErrorCode::ZAP5075,
                     "scope() options must be keyword arguments (e.g. on_error=OnError.Wait)"
                         .to_string(),
                     span,
@@ -1623,6 +1693,7 @@ impl Checker {
                         let dt = self.resolve_type(t);
                         if !self.coercible(&vt, &dt) {
                             self.error(
+                                ErrorCode::ZAP4001,
                                 format!(
                                     "cannot assign value of type {} to {} {}",
                                     vt.display(),
@@ -1643,6 +1714,7 @@ impl Checker {
                         Some(dt) => {
                             if !self.coercible(&vt, &dt) {
                                 self.error(
+                                    ErrorCode::ZAP4001,
                                     format!(
                                         "cannot assign value of type {} to {} of type {}",
                                         vt.display(),
@@ -1653,9 +1725,11 @@ impl Checker {
                                 );
                             }
                         }
-                        None => {
-                            self.error(format!("assignment to undeclared variable '{n}'"), *span)
-                        }
+                        None => self.error(
+                            ErrorCode::ZAP3002,
+                            format!("assignment to undeclared variable '{n}'"),
+                            *span,
+                        ),
                     }
                 } else {
                     self.infer(target);
@@ -1677,6 +1751,7 @@ impl Checker {
                             };
                             if !assignable(&r, &tt) {
                                 self.error(
+                                    ErrorCode::ZAP4002,
                                     format!(
                                         "augmented assignment produces {} but '{}' has type {}",
                                         r.display(),
@@ -1687,9 +1762,11 @@ impl Checker {
                                 );
                             }
                         }
-                        None => {
-                            self.error(format!("assignment to undeclared variable '{n}'"), *span)
-                        }
+                        None => self.error(
+                            ErrorCode::ZAP3002,
+                            format!("assignment to undeclared variable '{n}'"),
+                            *span,
+                        ),
                     }
                 } else {
                     self.infer(target);
@@ -1804,6 +1881,7 @@ impl Checker {
                                 .collect();
                             if !missing.is_empty() {
                                 self.error(
+                                    ErrorCode::ZAP5080,
                                     format!(
                                         "non-exhaustive match on enum '{ename}': missing {} \
                                          (add the arm(s) or a '_' case)",
@@ -1823,6 +1901,7 @@ impl Checker {
                 if let Some(e) = value {
                     self.infer(e);
                     self.error(
+                        ErrorCode::ZAP5063,
                         "a generator's 'return' cannot carry a value yet (I#67 v1); \
                          use a bare 'return' to end iteration"
                             .to_string(),
@@ -1836,6 +1915,7 @@ impl Checker {
                     let ret = self.ret_ty.clone();
                     if !self.coercible(&vt, &ret) {
                         self.error(
+                            ErrorCode::ZAP4003,
                             format!(
                                 "return type mismatch: expected {}, found {}",
                                 ret.display(),
@@ -1848,6 +1928,7 @@ impl Checker {
                 None => {
                     if !matches!(self.ret_ty, Ty::Unit | Ty::Unknown) {
                         self.error(
+                            ErrorCode::ZAP4004,
                             format!(
                                 "function must return a value of type {}",
                                 self.ret_ty.display()
@@ -1948,6 +2029,7 @@ impl Checker {
                         let dt = self.resolve_type(t);
                         if !assignable(&vt, &dt) {
                             self.error(
+                                ErrorCode::ZAP4001,
                                 format!(
                                     "cannot assign value of type {} to {}",
                                     vt.display(),
@@ -1987,6 +2069,7 @@ impl Checker {
                         Some(dt) => {
                             if !assignable(ty, &dt) {
                                 self.error(
+                                    ErrorCode::ZAP4001,
                                     format!(
                                         "cannot assign value of type {} to {} of type {}",
                                         ty.display(),
@@ -1997,15 +2080,18 @@ impl Checker {
                                 );
                             }
                         }
-                        None => {
-                            self.error(format!("assignment to undeclared variable '{n}'"), *nspan)
-                        }
+                        None => self.error(
+                            ErrorCode::ZAP3002,
+                            format!("assignment to undeclared variable '{n}'"),
+                            *nspan,
+                        ),
                     }
                 }
             }
             BindTarget::Elem(e) => {
                 if is_decl {
                     self.error(
+                        ErrorCode::ZAP5090,
                         "a declaration target must be a name".to_string(),
                         expr_span(e),
                     );
@@ -2017,6 +2103,7 @@ impl Checker {
             }
             BindTarget::Rest(_, rspan) => {
                 self.error(
+                    ErrorCode::ZAP5091,
                     "'*rest' is only valid as an element of a tuple target".to_string(),
                     *rspan,
                 );
@@ -2031,6 +2118,7 @@ impl Checker {
                     }
                 }
                 other => self.error(
+                    ErrorCode::ZAP5092,
                     format!("cannot destructure a value of type {}", other.display()),
                     *tspan,
                 ),
@@ -2050,6 +2138,7 @@ impl Checker {
             .collect();
         if rest_positions.len() > 1 {
             self.error(
+                ErrorCode::ZAP5093,
                 "a tuple target may have at most one '*rest' element".to_string(),
                 span,
             );
@@ -2059,6 +2148,7 @@ impl Checker {
             None => {
                 if elems.len() != ts.len() {
                     self.error(
+                        ErrorCode::ZAP5094,
                         format!(
                             "tuple destructuring expects {} element(s), found {}",
                             ts.len(),
@@ -2078,6 +2168,7 @@ impl Checker {
                 let fixed = elems.len() - 1;
                 if ts.len() < fixed {
                     self.error(
+                        ErrorCode::ZAP5094,
                         format!(
                             "tuple destructuring with '*rest' needs at least {fixed} \
                              element(s), found {}",
@@ -2125,7 +2216,7 @@ impl Checker {
                 } else if self.sigs.contains_key(n) || BUILTINS.contains(&n.as_str()) {
                     Ty::Unknown // a function used as a value
                 } else {
-                    self.error(format!("unknown name '{n}'"), *span);
+                    self.error(ErrorCode::ZAP3001, format!("unknown name '{n}'"), *span);
                     Ty::Unknown
                 }
             }
@@ -2241,6 +2332,7 @@ impl Checker {
                             t
                         } else {
                             self.error(
+                                ErrorCode::ZAP4010,
                                 format!("unary operator needs a number, found {}", t.display()),
                                 *span,
                             );
@@ -2252,6 +2344,7 @@ impl Checker {
                             t
                         } else {
                             self.error(
+                                ErrorCode::ZAP4011,
                                 format!("'~' needs an integer, found {}", t.display()),
                                 *span,
                             );
@@ -2284,6 +2377,7 @@ impl Checker {
                         }
                         Some(k) => {
                             self.error(
+                                ErrorCode::ZAP4050,
                                 format!(
                                     "tuple index {k} out of range for a {}-element tuple",
                                     elems.len()
@@ -2295,6 +2389,7 @@ impl Checker {
                         None => {
                             self.infer(index);
                             self.error(
+                                ErrorCode::ZAP4051,
                                 "a tuple index must be a compile-time-constant \
                                  integer (a tuple is heterogeneous, so the element \
                                  type must be known statically)"
@@ -2343,6 +2438,7 @@ impl Checker {
                             }
                             Some(_) => {
                                 self.error(
+                                    ErrorCode::ZAP4061,
                                     format!(
                                         "variant '{name}' of enum '{tyname}' carries data; \
                                          construct it with '{tyname}.{name}(...)'"
@@ -2353,6 +2449,7 @@ impl Checker {
                             }
                             None => {
                                 self.error(
+                                    ErrorCode::ZAP4060,
                                     format!("enum '{tyname}' has no variant '{name}'"),
                                     *span,
                                 );
@@ -2393,6 +2490,7 @@ impl Checker {
                 let t = self.infer(subject);
                 if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
                     self.error(
+                        ErrorCode::ZAP4040,
                         format!(
                             "the left operand of '=~'/'!~' must be a str, found {}",
                             t.display()
@@ -2411,7 +2509,7 @@ impl Checker {
             Expr::RegexSubst { subject, span, .. } => {
                 let t = self.infer(subject);
                 if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
-                    self.error(
+                    self.error(ErrorCode::ZAP4041,
                         format!(
                             "the left operand of a substitution 's/.../.../' must be a str, found {}",
                             t.display()
@@ -2429,6 +2527,7 @@ impl Checker {
                     Ty::Unknown => Ty::Unknown,
                     other => {
                         self.error(
+                            ErrorCode::ZAP4030,
                             format!(
                                 "the operand of '<-' (receive) must be a channel, found {}",
                                 other.display()
@@ -2450,6 +2549,7 @@ impl Checker {
                         self.infer(v);
                     }
                     None => self.error(
+                        ErrorCode::ZAP5064,
                         "'yield' requires a value in this version (I#67 v1)".to_string(),
                         *span,
                     ),
@@ -2483,6 +2583,7 @@ impl Checker {
                     l.clone()
                 } else {
                     self.error(
+                        ErrorCode::ZAP4012,
                         format!("cannot add {} and {}", l.display(), r.display()),
                         span,
                     );
@@ -2494,6 +2595,7 @@ impl Checker {
                     num_join(l, r)
                 } else {
                     self.error(
+                        ErrorCode::ZAP4012,
                         format!(
                             "arithmetic needs numbers, found {} and {}",
                             l.display(),
@@ -2509,6 +2611,7 @@ impl Checker {
                     Ty::Float64
                 } else {
                     self.error(
+                        ErrorCode::ZAP4013,
                         format!(
                             "division needs numbers, found {} and {}",
                             l.display(),
@@ -2526,6 +2629,7 @@ impl Checker {
                     Ty::Int64
                 } else {
                     self.error(
+                        ErrorCode::ZAP4014,
                         format!(
                             "bitwise operator needs integers, found {} and {}",
                             l.display(),
@@ -2545,6 +2649,7 @@ impl Checker {
                     Ty::Chan(elem) => {
                         if !assignable(r, elem) {
                             self.error(
+                                ErrorCode::ZAP4032,
                                 format!(
                                     "cannot send a value of type {} on a channel[{}]",
                                     r.display(),
@@ -2556,6 +2661,7 @@ impl Checker {
                     }
                     Ty::Unknown => {}
                     other => self.error(
+                        ErrorCode::ZAP4031,
                         format!(
                             "the left operand of '<-' (send) must be a channel, found {}",
                             other.display()
@@ -2621,6 +2727,7 @@ impl Checker {
             Some(e) => e,
             None => {
                 self.error(
+                    ErrorCode::ZAP4070,
                     format!(
                         "type '{}' is not iterable: it must define '__iter__' \
                          (the 'Iterable' interface, D-0048)",
@@ -2644,6 +2751,7 @@ impl Checker {
     fn require_dunder(&mut self, t: &Ty, dunder: &str, iface: &str, sym: &str, span: Span) {
         if self.lookup_dunder(t, dunder).is_none() {
             self.error(
+                ErrorCode::ZAP4071,
                 format!(
                     "type '{}' does not support operator '{sym}': it must define \
                      '{dunder}' (the '{iface}' operator interface, D-0047)",
@@ -2680,6 +2788,7 @@ impl Checker {
                     && self.iterable_elem(r).is_none()
                 {
                     self.error(
+                        ErrorCode::ZAP4072,
                         format!(
                             "type '{}' does not support operator 'in': define \
                              '__contains__' or make it iterable ('__iter__', D-0048)",
@@ -2750,6 +2859,7 @@ impl Checker {
         };
         if has_eq && !has_hash {
             self.warn(
+                ErrorCode::ZAP5120,
                 format!(
                     "type '{}' defines equality but no '__hash__', yet is used as a \
                      dict/set key; add @derive(Hash) or define '__hash__' so that \
@@ -2786,6 +2896,7 @@ impl Checker {
                     {
                         if args.len() != 1 {
                             self.error(
+                                ErrorCode::ZAP4025,
                                 format!(
                                     "{tyname}.{name}(s) takes 1 argument, found {}",
                                     args.len()
@@ -2795,7 +2906,7 @@ impl Checker {
                         } else {
                             let t = self.infer(&args[0].value);
                             if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
-                                self.error(
+                                self.error(ErrorCode::ZAP4024,
                                     format!(
                                         "{tyname}.{name}() expects a str or bytes argument, found {}",
                                         t.display()
@@ -2837,6 +2948,7 @@ impl Checker {
                 let elem = self.chan_elem_from_expr(index);
                 if args.len() > 1 {
                     self.error(
+                        ErrorCode::ZAP4025,
                         "channel[T](...) takes at most one argument (the buffer capacity)"
                             .to_string(),
                         span,
@@ -2846,6 +2958,7 @@ impl Checker {
                     let at = self.infer(&a.value);
                     if !at.is_int() && !matches!(at, Ty::Unknown) {
                         self.error(
+                            ErrorCode::ZAP4033,
                             format!(
                                 "channel capacity must be an integer, found {}",
                                 at.display()
@@ -2869,6 +2982,7 @@ impl Checker {
                             if let Expr::Str { value, .. } = &a.value {
                                 if value != "min" && value != "max" {
                                     self.error(
+                                        ErrorCode::ZAP5100,
                                         format!(
                                             "heap cmp must be \"min\" or \"max\", found {value:?}"
                                         ),
@@ -2877,6 +2991,7 @@ impl Checker {
                                 }
                             } else if !matches!(at, Ty::Unknown) {
                                 self.error(
+                                    ErrorCode::ZAP5101,
                                     "heap cmp must be a string literal (\"min\" or \"max\")"
                                         .to_string(),
                                     expr_span(&a.value),
@@ -2884,10 +2999,12 @@ impl Checker {
                             }
                         }
                         Some(other) => self.error(
+                            ErrorCode::ZAP5102,
                             format!("heap[T](...) has no keyword argument '{other}' (only 'cmp')"),
                             expr_span(&a.value),
                         ),
                         None => self.error(
+                            ErrorCode::ZAP5103,
                             "heap[T](...) takes only the keyword argument 'cmp' (e.g. cmp=\"max\")"
                                 .to_string(),
                             expr_span(&a.value),
@@ -2952,6 +3069,7 @@ impl Checker {
                         let t = self.infer(&a.value);
                         if !t.is_int() && !matches!(t, Ty::Unknown) {
                             self.error(
+                                ErrorCode::ZAP4024,
                                 format!("range expects integers, found {}", t.display()),
                                 expr_span(&a.value),
                             );
@@ -2968,12 +3086,17 @@ impl Checker {
                 // `close(ch)` (ticket #25, D-0031): the argument must be a channel.
                 "close" => {
                     if args.len() != 1 {
-                        self.error("close() takes exactly one argument".to_string(), span);
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "close() takes exactly one argument".to_string(),
+                            span,
+                        );
                     }
                     for a in args {
                         let at = self.infer(&a.value);
                         if !matches!(at, Ty::Chan(_) | Ty::Unknown) {
                             self.error(
+                                ErrorCode::ZAP4024,
                                 format!("close() expects a channel, found {}", at.display()),
                                 expr_span(&a.value),
                             );
@@ -2991,7 +3114,11 @@ impl Checker {
                         _ => Ty::Float64,
                     };
                     if args.len() != 1 {
-                        self.error(format!("{fname}() takes exactly one argument"), span);
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("{fname}() takes exactly one argument"),
+                            span,
+                        );
                     }
                     for a in args {
                         let at = self.infer(&a.value);
@@ -3003,6 +3130,7 @@ impl Checker {
                             && !self.is_tier1_enum(&at)
                         {
                             self.error(
+                                ErrorCode::ZAP4024,
                                 format!("{}() expects a number, found {}", fname, at.display()),
                                 expr_span(&a.value),
                             );
@@ -3027,7 +3155,11 @@ impl Checker {
                 // CPU-bound loops. Takes no arguments; may raise `Cancelled`.
                 "checkpoint" => {
                     if !args.is_empty() {
-                        self.error("checkpoint() takes no arguments".to_string(), span);
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "checkpoint() takes no arguments".to_string(),
+                            span,
+                        );
                     }
                     return Ty::Unit;
                 }
@@ -3036,7 +3168,11 @@ impl Checker {
                 // that passed. Internal; takes no arguments.
                 "__netpoll_selftest" => {
                     if !args.is_empty() {
-                        self.error("__netpoll_selftest() takes no arguments".to_string(), span);
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "__netpoll_selftest() takes no arguments".to_string(),
+                            span,
+                        );
                     }
                     return Ty::Int64;
                 }
@@ -3045,7 +3181,11 @@ impl Checker {
                 // and returns the number of sub-checks that passed. Internal.
                 "__signal_selftest" => {
                     if !args.is_empty() {
-                        self.error("__signal_selftest() takes no arguments".to_string(), span);
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "__signal_selftest() takes no arguments".to_string(),
+                            span,
+                        );
                     }
                     return Ty::Int64;
                 }
@@ -3055,6 +3195,7 @@ impl Checker {
                 "__gc_finalizer_selftest" => {
                     if !args.is_empty() {
                         self.error(
+                            ErrorCode::ZAP4025,
                             "__gc_finalizer_selftest() takes no arguments".to_string(),
                             span,
                         );
@@ -3063,12 +3204,17 @@ impl Checker {
                 }
                 "__raise_signal" => {
                     if args.len() != 1 {
-                        self.error("__raise_signal(n) takes one argument".to_string(), span);
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "__raise_signal(n) takes one argument".to_string(),
+                            span,
+                        );
                     }
                     for a in args {
                         let at = self.infer(&a.value);
                         if !at.is_int() && !matches!(at, Ty::Unknown) {
                             self.error(
+                                ErrorCode::ZAP4024,
                                 "__raise_signal(n) expects an integer signal number".to_string(),
                                 expr_span(&a.value),
                             );
@@ -3078,7 +3224,11 @@ impl Checker {
                 }
                 "__signal_drain" => {
                     if !args.is_empty() {
-                        self.error("__signal_drain() takes no arguments".to_string(), span);
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "__signal_drain() takes no arguments".to_string(),
+                            span,
+                        );
                     }
                     return Ty::Unit;
                 }
@@ -3091,6 +3241,7 @@ impl Checker {
                     if let Some(info) = self.enums.get(fname).cloned() {
                         if info.is_sum {
                             self.error(
+                                ErrorCode::ZAP5110,
                                 format!(
                                     "'{fname}' is a sum type; construct a variant \
                                      (e.g. '{fname}.Variant(...)'), not '{fname}(...)'"
@@ -3098,11 +3249,16 @@ impl Checker {
                                 span,
                             );
                         } else if args.len() != 1 {
-                            self.error(format!("{fname}() takes exactly one argument"), span);
+                            self.error(
+                                ErrorCode::ZAP4025,
+                                format!("{fname}() takes exactly one argument"),
+                                span,
+                            );
                         } else {
                             let at = self.infer(&args[0].value);
                             if !at.is_int() && !matches!(at, Ty::Unknown | Ty::Py) {
                                 self.error(
+                                    ErrorCode::ZAP4024,
                                     format!("{fname}() expects an integer, found {}", at.display()),
                                     expr_span(&args[0].value),
                                 );
@@ -3136,7 +3292,11 @@ impl Checker {
                         }
                         return Ty::Unknown;
                     }
-                    self.error(format!("call to unknown function '{fname}'"), span);
+                    self.error(
+                        ErrorCode::ZAP3003,
+                        format!("call to unknown function '{fname}'"),
+                        span,
+                    );
                     for a in args {
                         self.infer(&a.value);
                     }
@@ -3177,7 +3337,7 @@ impl Checker {
                                          method '{name}'"
                                     )
                                 };
-                                self.error(what, *span);
+                                self.error(ErrorCode::ZAP4080, what, *span);
                                 Ty::Unknown
                             }
                         };
@@ -3216,12 +3376,14 @@ impl Checker {
 
         if !has_var && positional.len() > non_variadic {
             self.error(
+                ErrorCode::ZAP4020,
                 format!("too many arguments to '{fname}' (expected at most {non_variadic})"),
                 span,
             );
         }
         if positional.len() + keyword.len() < required {
             self.error(
+                ErrorCode::ZAP4020,
                 format!("too few arguments to '{fname}' (expected at least {required})"),
                 span,
             );
@@ -3239,6 +3401,7 @@ impl Checker {
             if let Some(pt) = expected {
                 if !self.coercible(&at, &pt) {
                     self.error(
+                        ErrorCode::ZAP4021,
                         format!(
                             "argument {} to '{}' has type {}, expected {}",
                             i + 1,
@@ -3259,6 +3422,7 @@ impl Checker {
                 Some(p) => {
                     if !self.coercible(&at, &p.ty) {
                         self.error(
+                            ErrorCode::ZAP4022,
                             format!(
                                 "keyword argument '{}' to '{}' has type {}, expected {}",
                                 name,
@@ -3271,6 +3435,7 @@ impl Checker {
                     }
                 }
                 None => self.error(
+                    ErrorCode::ZAP4023,
                     format!("'{fname}' has no parameter named '{name}'"),
                     expr_span(&a.value),
                 ),
@@ -3298,6 +3463,7 @@ impl Checker {
     ) -> Ty {
         let Some(v) = info.variant(variant) else {
             self.error(
+                ErrorCode::ZAP4060,
                 format!("enum '{enum_name}' has no variant '{variant}'"),
                 span,
             );
@@ -3309,6 +3475,7 @@ impl Checker {
         let positional = args.iter().filter(|a| a.name.is_none()).count();
         if positional > v.fields.len() {
             self.error(
+                ErrorCode::ZAP4062,
                 format!(
                     "variant '{enum_name}.{variant}' takes {} field(s), found {}",
                     v.fields.len(),
@@ -3325,6 +3492,7 @@ impl Checker {
                     let f = v.fields.iter().find(|(n, _)| n == fname);
                     if f.is_none() {
                         self.error(
+                            ErrorCode::ZAP4063,
                             format!("variant '{enum_name}.{variant}' has no field '{fname}'"),
                             expr_span(&a.value),
                         );
@@ -3340,6 +3508,7 @@ impl Checker {
             if let Some((fname, fty)) = field {
                 if !assignable(&at, fty) {
                     self.error(
+                        ErrorCode::ZAP4064,
                         format!(
                             "field '{fname}' of '{enum_name}.{variant}' has type {}, found {}",
                             fty.display(),
@@ -3414,6 +3583,7 @@ impl Checker {
                 if let Ty::Named(sn) = scrut {
                     if sn != enum_name {
                         self.error(
+                            ErrorCode::ZAP5081,
                             format!(
                                 "pattern '{enum_name}.{variant}' does not match a value of \
                                  type {}",
@@ -3425,6 +3595,7 @@ impl Checker {
                 }
                 let Some(v) = info.variant(variant) else {
                     self.error(
+                        ErrorCode::ZAP4060,
                         format!("enum '{enum_name}' has no variant '{variant}'"),
                         span,
                     );
@@ -3460,6 +3631,7 @@ impl Checker {
         let positional = args.iter().filter(|a| a.name.is_none()).count();
         if positional > v.fields.len() {
             self.error(
+                ErrorCode::ZAP5082,
                 format!(
                     "pattern '{enum_name}.{}' binds {} field(s) but the variant has {}",
                     v.name,
@@ -3476,6 +3648,7 @@ impl Checker {
                     Some((_, t)) => t.clone(),
                     None => {
                         self.error(
+                            ErrorCode::ZAP4063,
                             format!("variant '{enum_name}.{}' has no field '{fname}'", v.name),
                             a.span,
                         );

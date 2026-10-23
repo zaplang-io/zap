@@ -14,10 +14,15 @@ use crate::ast::*;
 use crate::lexer::tokenize;
 use crate::span::Span;
 use crate::token::{Keyword, Token, TokenKind};
+use zapc_diag::ErrorCode;
 
-/// A parse error with the offending source span.
+/// A parse error with its stable [`ErrorCode`] and the offending source span.
+///
+/// The `code` is the machine-parseable identifier (see `zapc_diag`); `message`
+/// is human-facing prose that may change between releases.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParseError {
+    pub code: ErrorCode,
     pub message: String,
     pub span: Span,
 }
@@ -779,18 +784,19 @@ impl Parser {
 
     fn expect(&mut self, k: &TokenKind, what: &str) {
         if !self.eat(k) {
-            self.error_here(format!("expected {what}"));
+            self.error_here(ErrorCode::ZAP2001, format!("expected {what}"));
         }
     }
 
     fn expect_kw(&mut self, kw: Keyword, what: &str) {
         if !self.eat_kw(kw) {
-            self.error_here(format!("expected {what}"));
+            self.error_here(ErrorCode::ZAP2001, format!("expected {what}"));
         }
     }
 
-    fn error_here(&mut self, message: impl Into<String>) {
+    fn error_here(&mut self, code: ErrorCode, message: impl Into<String>) {
         self.errors.push(ParseError {
+            code,
             message: message.into(),
             span: self.peek_span(),
         });
@@ -815,7 +821,7 @@ impl Parser {
         match self.ident_opt() {
             Some((name, _)) => name,
             None => {
-                self.error_here(format!("expected {what}"));
+                self.error_here(ErrorCode::ZAP2001, format!("expected {what}"));
                 "<error>".to_string()
             }
         }
@@ -853,7 +859,7 @@ impl Parser {
             self.skip_newlines();
             if self.pos == before {
                 // No progress: skip a token to avoid an infinite loop.
-                self.error_here("unexpected token at top level");
+                self.error_here(ErrorCode::ZAP2002, "unexpected token at top level");
                 self.bump();
                 self.skip_newlines();
             }
@@ -900,7 +906,7 @@ impl Parser {
             }
             _ => {
                 if !decos.is_empty() {
-                    self.error_here("decorators must precede a declaration");
+                    self.error_here(ErrorCode::ZAP2003, "decorators must precede a declaration");
                 }
                 let mut stmts = Vec::new();
                 self.parse_line(&mut stmts);
@@ -1100,7 +1106,7 @@ impl Parser {
                 });
             }
             if self.pos == before {
-                self.error_here("unexpected token in struct body");
+                self.error_here(ErrorCode::ZAP2004, "unexpected token in struct body");
                 self.bump();
             }
         }
@@ -1118,12 +1124,18 @@ impl Parser {
             match s.replace('_', "").parse::<u32>() {
                 Ok(n) => Some(n),
                 Err(_) => {
-                    self.error_here("bitfield width must be a decimal integer");
+                    self.error_here(
+                        ErrorCode::ZAP2005,
+                        "bitfield width must be a decimal integer",
+                    );
                     None
                 }
             }
         } else {
-            self.error_here("expected a bitfield width (an integer) after ':'");
+            self.error_here(
+                ErrorCode::ZAP2006,
+                "expected a bitfield width (an integer) after ':'",
+            );
             None
         }
     }
@@ -1355,7 +1367,7 @@ impl Parser {
             self.bump();
             v
         } else {
-            self.error_here("expected a string literal");
+            self.error_here(ErrorCode::ZAP2007, "expected a string literal");
             String::new()
         }
     }
@@ -1372,7 +1384,7 @@ impl Parser {
             let before = self.pos;
             self.parse_line(&mut stmts);
             if self.pos == before {
-                self.error_here("unexpected token in block");
+                self.error_here(ErrorCode::ZAP2008, "unexpected token in block");
                 self.bump();
             }
         }
@@ -1401,7 +1413,7 @@ impl Parser {
             break;
         }
         if !self.eat(&TokenKind::Newline) && !self.at_eof() && !self.is(&TokenKind::Dedent) {
-            self.error_here("expected newline after statement");
+            self.error_here(ErrorCode::ZAP2009, "expected newline after statement");
         }
     }
 
@@ -1498,7 +1510,7 @@ impl Parser {
         self.expect_kw(Keyword::While, "'while'");
         let cond = self.parse_expr();
         if !self.eat(&TokenKind::Newline) && !self.at_eof() && !self.is(&TokenKind::Dedent) {
-            self.error_here("expected newline after 'do'-'while'");
+            self.error_here(ErrorCode::ZAP2009, "expected newline after 'do'-'while'");
         }
         Stmt::DoWhile {
             body,
@@ -2028,7 +2040,7 @@ impl Parser {
                 s
             }
             _ => {
-                self.error_here("expected a type");
+                self.error_here(ErrorCode::ZAP2010, "expected a type");
                 "<error>".to_string()
             }
         };
@@ -2230,7 +2242,10 @@ impl Parser {
                 }
             }
             _ => {
-                self.error_here("expected a regex literal after '=~'/'!~'");
+                self.error_here(
+                    ErrorCode::ZAP2011,
+                    "expected a regex literal after '=~'/'!~'",
+                );
                 subject
             }
         }
@@ -2254,7 +2269,10 @@ impl Parser {
                 }
             }
             _ => {
-                self.error_here("expected a substitution literal after '~='");
+                self.error_here(
+                    ErrorCode::ZAP2012,
+                    "expected a substitution literal after '~='",
+                );
                 subject
             }
         }
@@ -2449,7 +2467,7 @@ impl Parser {
         } else {
             self.expect(&TokenKind::RBracket, "']'");
             let index = lo.unwrap_or_else(|| {
-                self.error_here("expected an index expression");
+                self.error_here(ErrorCode::ZAP2013, "expected an index expression");
                 Box::new(Expr::None(self.peek_span()))
             });
             Expr::Index {
@@ -2520,7 +2538,7 @@ impl Parser {
             TokenKind::LBracket => self.parse_list(start),
             TokenKind::LBrace => self.parse_brace(start),
             _ => {
-                self.error_here("expected an expression");
+                self.error_here(ErrorCode::ZAP2014, "expected an expression");
                 self.bump();
                 Expr::None(span)
             }

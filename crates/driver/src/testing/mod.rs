@@ -105,8 +105,12 @@ mod run_impl {
         if !lerrs.is_empty() || !perrs.is_empty() {
             let msg = lerrs
                 .iter()
-                .map(|e| format!("lex error: {}", e.message))
-                .chain(perrs.iter().map(|e| format!("parse error: {}", e.message)))
+                .map(|e| format!("error[{}]: {}", e.code, e.message))
+                .chain(
+                    perrs
+                        .iter()
+                        .map(|e| format!("error[{}]: {}", e.code, e.message)),
+                )
                 .collect::<Vec<_>>()
                 .join("\n");
             results.push(file_error(&display, msg));
@@ -116,7 +120,7 @@ mod run_impl {
         if !sema_errs.is_empty() {
             let msg = sema_errs
                 .iter()
-                .map(|e| format!("type error: {}", e.message))
+                .map(|e| format!("error[{}]: {}", e.code, e.message))
                 .collect::<Vec<_>>()
                 .join("\n");
             results.push(file_error(&display, msg));

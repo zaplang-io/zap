@@ -12,6 +12,7 @@
 //! the runtime-symbol twin is `zapc_codegen::modules`. Behaviour is identical to
 //! the pre-seam twin `match` blocks.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -120,6 +121,7 @@ pub(crate) fn check_builtin_module_call(
     Some(
         (desc.check)(checker, method, args, span).unwrap_or_else(|| {
             checker.error(
+                ErrorCode::ZAP3003,
                 format!("module '{module}' has no function '{method}'"),
                 span,
             );
@@ -152,6 +154,7 @@ pub(super) fn expect_argc(
 ) {
     if args.len() != n {
         checker.error(
+            ErrorCode::ZAP4025,
             format!(
                 "{module}.{method}() takes {n} argument(s), found {}",
                 args.len()

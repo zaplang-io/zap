@@ -39,6 +39,9 @@ use zapc_syntax::span::Span;
 /// and `zapc_ir::lower::LowerError`, so downstream code is unchanged (#129).
 #[derive(Clone, Debug, PartialEq)]
 pub struct LowerError {
+    /// Stable diagnostic identifier. Lowering is a back-end phase, so these are
+    /// `ZAP6xxx` (Experimental, per `docs/STABILITY.md`).
+    pub code: zapc_diag::ErrorCode,
     pub message: String,
 }
 
@@ -152,7 +155,10 @@ impl Env {
 }
 
 fn err(m: impl Into<String>) -> LowerError {
-    LowerError { message: m.into() }
+    LowerError {
+        code: zapc_diag::ErrorCode::ZAP6001,
+        message: m.into(),
+    }
 }
 
 /// Canonicalize a primitive type-name alias so `int64`/`i64` (etc.) mangle to

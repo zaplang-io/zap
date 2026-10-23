@@ -18,4 +18,5 @@ name = "zapc_mono"
 path = "src/lib.rs"
 
 [dependencies]
+zapc_diag = { path = "../diag" }
 zapc_syntax = { path = "../syntax" }

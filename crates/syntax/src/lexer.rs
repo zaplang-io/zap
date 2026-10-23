@@ -19,10 +19,15 @@
 
 use crate::span::Span;
 use crate::token::{Keyword, StrFlags, Token, TokenKind};
+use zapc_diag::ErrorCode;
 
-/// A lexing error with the offending source span.
+/// A lexing error with its stable [`ErrorCode`] and the offending source span.
+///
+/// The `code` is the machine-parseable identifier (see `zapc_diag`); `message`
+/// is human-facing prose that may change between releases.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LexError {
+    pub code: ErrorCode,
     pub message: String,
     pub span: Span,
 }
@@ -85,8 +90,9 @@ impl<'a> Lexer<'a> {
             .push(Token::new(kind, Span::new(start as u32, self.pos as u32)));
     }
 
-    fn error(&mut self, message: impl Into<String>, start: usize) {
+    fn error(&mut self, code: ErrorCode, message: impl Into<String>, start: usize) {
         self.errors.push(LexError {
+            code,
             message: message.into(),
             span: Span::new(start as u32, self.pos as u32),
         });
@@ -169,6 +175,7 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'\t') => {
                     self.error(
+                        ErrorCode::ZAP1008,
                         "tabs are not allowed in indentation (use spaces)",
                         line_start,
                     );
@@ -194,7 +201,7 @@ impl<'a> Lexer<'a> {
                 self.emit(TokenKind::Dedent, self.pos);
             }
             if *self.indents.last().unwrap() != col {
-                self.error("inconsistent dedent", self.pos);
+                self.error(ErrorCode::ZAP1005, "inconsistent dedent", self.pos);
                 // Recover by treating this column as a new level.
                 self.indents.push(col);
             }
@@ -301,7 +308,7 @@ impl<'a> Lexer<'a> {
         loop {
             match self.peek() {
                 None => {
-                    self.error("unterminated string literal", start);
+                    self.error(ErrorCode::ZAP1001, "unterminated string literal", start);
                     break;
                 }
                 Some(b'\\') => {
@@ -330,7 +337,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 Some(b'\n') if !triple => {
-                    self.error("unterminated string literal", start);
+                    self.error(ErrorCode::ZAP1001, "unterminated string literal", start);
                     break;
                 }
                 Some(_) => {
@@ -353,7 +360,7 @@ impl<'a> Lexer<'a> {
         let close = if open == b'{' { b'}' } else { open };
         let pattern = self.read_regex_part(close, start);
         if !self.at(close) {
-            self.error("unterminated regex literal", start);
+            self.error(ErrorCode::ZAP1002, "unterminated regex literal", start);
             self.emit_regex(start, is_subst, pattern, String::new());
             return;
         }
@@ -363,7 +370,11 @@ impl<'a> Lexer<'a> {
             // Second part. For bracket delimiters expect a fresh `{...}`.
             if open == b'{' {
                 if !self.at(b'{') {
-                    self.error("expected replacement delimiter in s{...}{...}", start);
+                    self.error(
+                        ErrorCode::ZAP1004,
+                        "expected replacement delimiter in s{...}{...}",
+                        start,
+                    );
                     self.emit_regex(start, true, pattern, String::new());
                     return;
                 }
@@ -371,7 +382,11 @@ impl<'a> Lexer<'a> {
             }
             let replacement = self.read_regex_part(close, start);
             if !self.at(close) {
-                self.error("unterminated substitution literal", start);
+                self.error(
+                    ErrorCode::ZAP1003,
+                    "unterminated substitution literal",
+                    start,
+                );
                 self.emit_regex(start, true, pattern, replacement);
                 return;
             }
@@ -417,7 +432,7 @@ impl<'a> Lexer<'a> {
             match self.peek() {
                 None => break,
                 Some(b'\n') => {
-                    self.error("unterminated regex literal", start);
+                    self.error(ErrorCode::ZAP1002, "unterminated regex literal", start);
                     break;
                 }
                 Some(b'\\') => {
@@ -634,7 +649,11 @@ impl<'a> Lexer<'a> {
                 } else if self.eat(b'~') {
                     TokenKind::RegexNotBind
                 } else {
-                    self.error("unexpected '!' (did you mean '!=' or 'not'?)", start);
+                    self.error(
+                        ErrorCode::ZAP1007,
+                        "unexpected `!` (did you mean `!=` or `not`?)",
+                        start,
+                    );
                     return;
                 }
             }
@@ -676,7 +695,11 @@ impl<'a> Lexer<'a> {
                 }
             }
             other => {
-                self.error(format!("unexpected character {:?}", other as char), start);
+                self.error(
+                    ErrorCode::ZAP1006,
+                    format!("unexpected character {:?}", other as char),
+                    start,
+                );
                 return;
             }
         };

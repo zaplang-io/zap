@@ -18,6 +18,7 @@
 //! Secure random from the OS CSPRNG (getentropy / /dev/urandom):
 //!   `crypto.random_bytes(n) -> bytes` ; `crypto.token_hex(n) -> str`
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -35,6 +36,7 @@ fn expect_data(checker: &mut Checker, func: &str, arg: &Arg) {
     let t = checker.infer(&arg.value);
     if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
         checker.error(
+            ErrorCode::ZAP4024,
             format!(
                 "{func}() expects a str or bytes argument, found {}",
                 t.display()
@@ -50,6 +52,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "sha256" | "sha512" | "sha1" | "md5" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!(
                         "crypto.{method}(data) takes 1 argument, found {}",
                         args.len()
@@ -70,6 +73,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "update" => {
             if args.len() != 2 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!(
                         "crypto.update(h, data) takes 2 arguments, found {}",
                         args.len()
@@ -99,6 +103,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "hmac_sha256" | "hmac_sha512" => {
             if args.len() != 2 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!(
                         "crypto.{method}(key, msg) takes 2 arguments, found {}",
                         args.len()

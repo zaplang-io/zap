@@ -10,6 +10,7 @@
 //! supported YAML surface to a JSON string for the existing json tokenizer.
 //! `@derive(Yaml)` (handled in the lowerer) adds `to_yaml`/`from_yaml`.
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -27,6 +28,7 @@ fn expect_strbytes(checker: &mut Checker, func: &str, arg: &Arg) {
     let t = checker.infer(&arg.value);
     if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
         checker.error(
+            ErrorCode::ZAP4024,
             format!(
                 "yaml.{func}() expects a str or bytes argument, found {}",
                 t.display()
@@ -42,6 +44,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "load" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("yaml.load(s) takes 1 argument, found {}", args.len()),
                     span,
                 );
@@ -54,6 +57,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "dump" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("yaml.dump(v) takes 1 argument, found {}", args.len()),
                     span,
                 );
@@ -61,6 +65,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                 let t = checker.infer(&args[0].value);
                 if !assignable(&t, &Ty::Named("JsonValue".to_string())) {
                     checker.error(
+                        ErrorCode::ZAP4024,
                         format!("yaml.dump() expects a JsonValue, found {}", t.display()),
                         expr_span(&args[0].value),
                     );

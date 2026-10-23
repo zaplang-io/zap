@@ -1,0 +1,11 @@
+[package]
+name = "zapc_diag"
+description = "Zap diagnostics: the stable error-code scheme (ZAPnnnn) and its registry (I#157/F1, #239)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_diag"
+path = "src/lib.rs"

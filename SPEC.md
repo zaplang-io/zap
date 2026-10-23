@@ -565,8 +565,18 @@ zap expand                    # show @derive/decorator-generated code
 zap ir <file>                 # dump ZIR (diagnostic)
 zap mcp                       # MCP server for coding agents (syntax/compile/test)
 zap inspect <pid>             # stacks / GC+memory stats / (later) profile of a running process
+zap explain <ZAPnnnn>         # explain a diagnostic's stable error code (I#157/F1)
 zap version | zap help
 ```
+
+**Error codes (I#157/F1).** Every diagnostic carries a stable `ZAPnnnn` code
+(`ZAP` + four digits; the leading digit is the phase/category — lex `1`, parse
+`2`, name `3`, type `4`, semantic `5`, back end `6`). The code — not the
+human-readable message, which may change — is the machine-parseable identifier
+tools and coding agents key off; it is rendered as `error[ZAPnnnn]: …` on the
+CLI and as a `code` field on the `zap mcp` / `--json` diagnostic surface, and
+`zap explain <ZAPnnnn>` prints its documented meaning. Codes are **Experimental**
+until the 1.0 spec-freeze audit (#206) ratifies the stable set.
 
 **Testing (D-0054).** Tests use a **`@test`** annotation suite (`@test`,
 `@before`/`@after`, `@before_all`/`@after_all`, `@parametrize`, `@skip`/`@skip_if`,

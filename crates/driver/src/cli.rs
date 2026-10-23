@@ -66,6 +66,9 @@ pub enum Command {
         profile: bool,
         seconds: u64,
     },
+    /// `zap explain <ZAPnnnn>` — print the meaning of a stable error code
+    /// (I#157/F1, #239). The code, not the message text, is the stable surface.
+    Explain { code: String },
     /// `zap version`.
     Version,
     /// `zap help`.
@@ -159,6 +162,10 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         }
         "mcp" => parse_mcp(rest),
         "inspect" => parse_inspect(rest),
+        "explain" => match first_positional(rest) {
+            Some(code) => Ok(Command::Explain { code }),
+            None => Err("`zap explain` needs an error code: `zap explain ZAP4001`".to_string()),
+        },
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown subcommand `{other}`")),
@@ -410,6 +417,7 @@ pub fn execute(cmd: Command) -> ExitCode {
             profile,
             seconds,
         } => cmd_inspect(&pid, gc, profile, seconds),
+        Command::Explain { code } => cmd_explain(&code),
         Command::Version => {
             println!("zap {}", crate::VERSION);
             ExitCode::SUCCESS
@@ -604,6 +612,26 @@ fn send_signal(pid: &str, signame: &str) -> Result<bool, std::io::Error> {
         .arg(pid)
         .status()?
         .success())
+}
+
+/// `zap explain <ZAPnnnn>` — print the stable meaning of an error code
+/// (I#157/F1, #239). The code and its documented meaning are the machine-stable
+/// surface an agent keys off; the message text a build prints is not stable.
+fn cmd_explain(code: &str) -> ExitCode {
+    let Some(ec) = zapc_diag::ErrorCode::parse(code) else {
+        eprintln!(
+            "zap explain: `{code}` is not a known error code (expected e.g. `ZAP4001`).\n\
+             Error codes look like `ZAPnnnn`; the one a diagnostic prints appears in \
+             brackets, as in `error[ZAP4001]: ...`."
+        );
+        return ExitCode::from(2);
+    };
+    // `parse` only returns registered codes, so `info()` is always `Some`.
+    let info = ec.info().expect("registered code has registry info");
+    println!("{ec} [{}]: {}", info.category().slug(), info.title);
+    println!();
+    println!("{}", info.explanation);
+    ExitCode::SUCCESS
 }
 
 /// `zap inspect <pid> [--gc | --profile [--seconds N]]` — signal a running Zap
@@ -804,6 +832,7 @@ diagnostics:
           --gc          force a GC and print memory stats instead (SIGUSR1)
           --profile     CPU-profile it (SIGUSR2 start/stop), writing a folded
                         profile; --seconds N sets the window (default 10)
+  explain <ZAPnnnn>     explain a stable error code (e.g. `zap explain ZAP4001`)
   version               print the toolchain version
   help                  show this help
 
@@ -817,6 +846,17 @@ mod tests {
 
     fn p(args: &[&str]) -> Result<Command, String> {
         parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn explain_parses_a_code_and_requires_one() {
+        assert_eq!(
+            p(&["explain", "ZAP4001"]),
+            Ok(Command::Explain {
+                code: "ZAP4001".to_string()
+            })
+        );
+        assert!(p(&["explain"]).is_err());
     }
 
     #[test]

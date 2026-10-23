@@ -8,6 +8,7 @@
 //! never depends on the `JsonValue` layout. `json.dumps` and the typed
 //! `@derive(Json)` codec are follow-up slices (D-0059).
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
 
@@ -25,6 +26,7 @@ fn expect_strbytes(checker: &mut Checker, func: &str, arg: &Arg) {
     let t = checker.infer(&arg.value);
     if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
         checker.error(
+            ErrorCode::ZAP4024,
             format!(
                 "{func}() expects a str or bytes argument, found {}",
                 t.display()
@@ -40,6 +42,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "loads" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("json.loads(s) takes 1 argument, found {}", args.len()),
                     span,
                 );
@@ -52,6 +55,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "scan" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("json.scan(s) takes 1 argument, found {}", args.len()),
                     span,
                 );
@@ -64,6 +68,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "dumps" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("json.dumps(v) takes 1 argument, found {}", args.len()),
                     span,
                 );
@@ -71,6 +76,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                 let t = checker.infer(&args[0].value);
                 if !assignable(&t, &Ty::Named("JsonValue".to_string())) {
                     checker.error(
+                        ErrorCode::ZAP4024,
                         format!("json.dumps() expects a JsonValue, found {}", t.display()),
                         expr_span(&args[0].value),
                     );
@@ -112,6 +118,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "_lex_new" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("json._lex_new(s) takes 1 argument, found {}", args.len()),
                     span,
                 );
@@ -124,6 +131,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "_lex_next" | "_lex_int" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("json.{method}(h) takes 1 argument, found {}", args.len()),
                     span,
                 );
@@ -136,6 +144,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "_lex_float" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("json._lex_float(h) takes 1 argument, found {}", args.len()),
                     span,
                 );
@@ -148,6 +157,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "_lex_str" => {
             if args.len() != 1 {
                 checker.error(
+                    ErrorCode::ZAP4025,
                     format!("json._lex_str(h) takes 1 argument, found {}", args.len()),
                     span,
                 );
