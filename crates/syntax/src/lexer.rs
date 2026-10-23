@@ -19,6 +19,7 @@
 
 use crate::span::Span;
 use crate::token::{Keyword, StrFlags, Token, TokenKind};
+use crate::trivia::{Comment, CommentPlacement};
 
 /// A lexing error with the offending source span.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,10 +30,23 @@ pub struct LexError {
 
 /// Tokenize `src`, returning the token stream and any errors. The stream always
 /// ends with [`TokenKind::Eof`] even when there are errors.
+///
+/// Comments are discarded here; use [`tokenize_with_trivia`] to also recover
+/// them. This function's output is byte-identical whether or not trivia is
+/// collected, so the parser and everything downstream are unaffected (#225).
 pub fn tokenize(src: &str) -> (Vec<Token>, Vec<LexError>) {
+    let (tokens, errors, _comments) = tokenize_with_trivia(src);
+    (tokens, errors)
+}
+
+/// Tokenize `src` and additionally recover every `#` comment as trivia
+/// (I#157/A1, #225). The returned `tokens`/`errors` are identical to what
+/// [`tokenize`] produces; the extra `Vec<Comment>` is an additive side-channel
+/// for tooling (`zap fmt`, `zap doc`) that must re-emit source faithfully.
+pub fn tokenize_with_trivia(src: &str) -> (Vec<Token>, Vec<LexError>, Vec<Comment>) {
     let mut lexer = Lexer::new(src);
     lexer.run();
-    (lexer.tokens, lexer.errors)
+    (lexer.tokens, lexer.errors, lexer.comments)
 }
 
 struct Lexer<'a> {
@@ -40,6 +54,7 @@ struct Lexer<'a> {
     pos: usize,
     tokens: Vec<Token>,
     errors: Vec<LexError>,
+    comments: Vec<Comment>,
     indents: Vec<u32>,
     paren_depth: i32,
     line_has_tokens: bool,
@@ -52,6 +67,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             tokens: Vec::new(),
             errors: Vec::new(),
+            comments: Vec::new(),
             indents: vec![0],
             paren_depth: 0,
             line_has_tokens: false,
@@ -103,7 +119,12 @@ impl<'a> Lexer<'a> {
                 match self.peek() {
                     None => break,
                     Some(b'\n') | Some(b'#') => {
-                        // Blank or comment-only line: no layout tokens.
+                        // Blank or comment-only line: no layout tokens. A `#`
+                        // here is a standalone (own-line) comment — recorded as
+                        // trivia but still producing no tokens (#225).
+                        if self.at(b'#') {
+                            self.consume_comment();
+                        }
                         self.skip_to_eol();
                         if self.at(b'\n') {
                             self.bump();
@@ -118,6 +139,10 @@ impl<'a> Lexer<'a> {
 
             self.skip_inline_ws();
             if self.at(b'#') {
+                // Inline/own-line comment mid-run (e.g. a trailing `# note`, or
+                // a standalone comment inside brackets): recorded as trivia,
+                // emits no token (#225).
+                self.consume_comment();
                 self.skip_to_eol();
             }
 
@@ -211,6 +236,43 @@ impl<'a> Lexer<'a> {
         while !matches!(self.peek(), None | Some(b'\n')) {
             self.bump();
         }
+    }
+
+    /// Record the `#` comment starting at the cursor as trivia (#225). Does not
+    /// advance the cursor — the caller's `skip_to_eol` consumes it. The stored
+    /// lexeme keeps the leading `#` and drops trailing whitespace/CR.
+    fn consume_comment(&mut self) {
+        let start = self.pos;
+        let mut end = start;
+        while !matches!(self.src.get(end).copied(), None | Some(b'\n')) {
+            end += 1;
+        }
+        while end > start && matches!(self.src[end - 1], b' ' | b'\t' | b'\r') {
+            end -= 1;
+        }
+        let text = String::from_utf8_lossy(&self.src[start..end]).into_owned();
+        let placement = self.comment_placement(start);
+        self.comments.push(Comment {
+            span: Span::new(start as u32, end as u32),
+            text,
+            placement,
+        });
+    }
+
+    /// Classify a comment by scanning back to the previous newline: own-line if
+    /// only whitespace precedes the `#`, otherwise trailing (end-of-line). Driven
+    /// off the source so it is correct even for comments inside `()`/`[]`/`{}`,
+    /// where the lexer's line state is not reset.
+    fn comment_placement(&self, hash_pos: usize) -> CommentPlacement {
+        let mut i = hash_pos;
+        while i > 0 {
+            match self.src[i - 1] {
+                b'\n' => break,
+                b' ' | b'\t' | b'\r' => i -= 1,
+                _ => return CommentPlacement::EndOfLine,
+            }
+        }
+        CommentPlacement::OwnLine
     }
 
     // --- token dispatch ---
@@ -954,6 +1016,89 @@ mod tests {
     fn tab_indentation_is_an_error() {
         let (_toks, errs) = tokenize("def f():\n\treturn 1\n");
         assert!(!errs.is_empty(), "tab in indentation should error");
+    }
+
+    // --- comment trivia (#225) ---
+
+    use crate::trivia::CommentPlacement as CP;
+
+    /// The plain `tokenize` path and the trivia path produce byte-identical
+    /// token streams — the core behavior-preservation guarantee of #225.
+    #[test]
+    fn trivia_path_tokens_are_identical() {
+        let srcs = [
+            "x = 1\n",
+            "# header\nx = 1  # trailing\n\n# between\ny = 2\n",
+            "def f():\n    # body comment\n    return 1  # ret\n",
+            "xs = [\n    1,  # one\n    # dangling\n    2,\n]\n",
+            "def fib(int64 n) -> int64:\n    if n < 2:\n        return n\n    return fib(n - 1)\n",
+        ];
+        for src in srcs {
+            let (plain, plain_errs) = tokenize(src);
+            let (with, with_errs, _comments) = tokenize_with_trivia(src);
+            assert_eq!(plain, with, "token streams differ for {src:?}");
+            assert_eq!(plain_errs, with_errs, "errors differ for {src:?}");
+        }
+    }
+
+    #[test]
+    fn own_line_and_trailing_comments() {
+        let src = "# header\nx = 1  # trailing\n";
+        let (_t, errs, comments) = tokenize_with_trivia(src);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].text, "# header");
+        assert_eq!(comments[0].placement, CP::OwnLine);
+        assert_eq!(comments[1].text, "# trailing");
+        assert_eq!(comments[1].placement, CP::EndOfLine);
+        // Spans point at the real source text (trailing whitespace trimmed).
+        let c0 = comments[0].span;
+        assert_eq!(&src[c0.start as usize..c0.end as usize], "# header");
+    }
+
+    #[test]
+    fn comment_only_and_blank_lines() {
+        let src = "x = 1\n\n   # indented standalone\ny = 2\n";
+        let (_t, _e, comments) = tokenize_with_trivia(src);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].text, "# indented standalone");
+        assert_eq!(comments[0].placement, CP::OwnLine);
+    }
+
+    #[test]
+    fn dangling_comment_inside_brackets() {
+        // A comment on its own line inside brackets is still own-line, even
+        // though the lexer keeps `line_has_tokens` set across the continuation.
+        let src = "xs = [\n    1,\n    # dangling\n    2,  # two\n]\n";
+        let (_t, _e, comments) = tokenize_with_trivia(src);
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].text, "# dangling");
+        assert_eq!(comments[0].placement, CP::OwnLine);
+        assert_eq!(comments[1].text, "# two");
+        assert_eq!(comments[1].placement, CP::EndOfLine);
+    }
+
+    #[test]
+    fn comment_whitespace_is_trimmed_but_inner_kept() {
+        let src = "x = 1  #   spaced out   \n";
+        let (_t, _e, comments) = tokenize_with_trivia(src);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].text, "#   spaced out");
+    }
+
+    #[test]
+    fn trailing_eof_comment_without_newline() {
+        let src = "x = 1\n# last";
+        let (_t, _e, comments) = tokenize_with_trivia(src);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].text, "# last");
+        assert_eq!(comments[0].placement, CP::OwnLine);
+    }
+
+    #[test]
+    fn no_comments_yields_empty_trivia() {
+        let (_t, _e, comments) = tokenize_with_trivia("def f():\n    return 1\n");
+        assert!(comments.is_empty());
     }
 
     #[test]
