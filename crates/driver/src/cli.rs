@@ -56,6 +56,10 @@ pub enum Command {
     /// Serves over stdio. `root` is the codebase root for the code-graph and
     /// test surfaces (default: the current directory).
     Mcp { root: Option<String> },
+    /// `zap lsp` — the language server (I#157/B2, issue #229). Serves the LSP
+    /// over a `Content-Length`-framed JSON-RPC stdio transport: live
+    /// diagnostics on open/change/save. No options in #229.
+    Lsp,
     /// `zap inspect <pid> [--gc | --profile [--seconds N]]` — signal a running
     /// Zap process to dump diagnostics (ticket #77/#78, D-0058), so operators
     /// need not hand-run `kill`. Default: SIGQUIT (coroutine stacks +
@@ -164,6 +168,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::Test { file, json, watch })
         }
         "mcp" => parse_mcp(rest),
+        "lsp" => parse_lsp(rest),
         "inspect" => parse_inspect(rest),
         "explain" => match first_positional(rest) {
             Some(code) => Ok(Command::Explain { code }),
@@ -234,6 +239,20 @@ fn parse_mcp(args: &[String]) -> Result<Command, String> {
         }
     }
     Ok(Command::Mcp { root })
+}
+
+/// Parse `lsp`. The language server (#229) takes no options yet; the transport
+/// is `Content-Length`-framed JSON-RPC over stdio, so `--stdio` is accepted as a
+/// no-op and any other flag is rejected with a clear message.
+fn parse_lsp(args: &[String]) -> Result<Command, String> {
+    for a in args {
+        match a.as_str() {
+            "--stdio" => {} // the default and only transport today
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+    Ok(Command::Lsp)
 }
 
 /// Parse `zap inspect <pid> [--gc | --profile [--seconds N]]` (ticket #77/#78,
@@ -508,6 +527,7 @@ pub fn execute(cmd: Command) -> ExitCode {
         Command::Zenv(sub) => cmd_zenv(sub),
         Command::Test { file, json, watch } => cmd_test(file, json, watch),
         Command::Mcp { root } => crate::mcp::serve(root),
+        Command::Lsp => crate::lsp::serve(),
         Command::Inspect {
             pid,
             gc,
@@ -923,6 +943,10 @@ agent interface:
                         the language reference, parse+type-check without a build,
                         a token-efficient code graph, and targeted tests (stdio)
 
+editor integration:
+  lsp                   start the language server (LSP, issue #229): live
+                        diagnostics over a JSON-RPC stdio transport, for editors
+
 diagnostics:
   inspect <pid>         signal a running Zap process to dump coroutine stacks +
                         a runtime/scheduler summary to its stderr (D-0058)
@@ -1111,6 +1135,14 @@ mod tests {
         assert!(p(&["mcp", "--root"]).is_err());
         assert!(p(&["mcp", "--socket"]).is_err());
         assert!(p(&["mcp", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn lsp_parses_and_rejects_args() {
+        assert_eq!(p(&["lsp"]).unwrap(), Command::Lsp);
+        assert_eq!(p(&["lsp", "--stdio"]).unwrap(), Command::Lsp);
+        assert!(p(&["lsp", "--socket"]).is_err());
+        assert!(p(&["lsp", "bogus"]).is_err());
     }
 
     #[test]

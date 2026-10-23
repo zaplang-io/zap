@@ -12,7 +12,7 @@
 //! (`zap://reference/<name>`, `zap://example/<name>`) for resource-aware
 //! clients, and through the `zap_reference` **tool** for tool-only clients.
 
-use super::json::Json;
+use crate::json::Json;
 
 /// A single reference document.
 pub struct Doc {

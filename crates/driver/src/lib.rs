@@ -16,6 +16,8 @@ use std::process::ExitCode;
 use zapc_syntax::ast::Module;
 
 pub mod cli;
+pub mod json;
+pub mod lsp;
 pub mod mcp;
 pub mod testing;
 
