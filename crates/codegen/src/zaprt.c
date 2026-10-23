@@ -65,6 +65,17 @@ path/process/fs/env/sockets/random (I#198). See design/0016-platform-1.0.md."
  * on pthread mutex/condvars. The dev container's `libgc-dev` has thread
  * support, and the program links `-lpthread` (see build_executable). */
 #define GC_THREADS
+#if defined(_WIN32)
+/* On Windows, `GC_THREADS` alone selects bdwgc's native-Win32-threads model, under
+ * which <gc.h> does NOT declare the `GC_pthread_*` wrappers (gc_config_macros.h:
+ * GC_PTHREADS is gated on `!GC_WIN32_THREADS || GC_WIN32_PTHREADS`). The runtime
+ * creates coroutine/worker threads with `GC_pthread_create` and links winpthreads
+ * (`-lpthread`), so request bdwgc's pthreads-on-Win32 model — this declares the
+ * wrappers and makes the collector register each winpthreads thread for stack
+ * scanning. MSYS2's `mingw-w64-x86_64-gc` is built with POSIX (winpthreads)
+ * thread support, so the wrappers also link. (I#198 / A4.) */
+#define GC_WIN32_PTHREADS
+#endif
 #include <gc.h>
 #else
 /* Precise Immix GC build (ticket #48, design/0008-precise-gc.md): no Boehm. The
