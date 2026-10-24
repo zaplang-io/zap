@@ -129,6 +129,7 @@ pub fn serve() -> ExitCode {
 // Meta-commands
 // ----------------------------------------------------------------------------
 
+#[cfg(feature = "codegen")]
 enum MetaCommand {
     Quit,
     Help,
@@ -136,6 +137,7 @@ enum MetaCommand {
     Type(String),
 }
 
+#[cfg(feature = "codegen")]
 fn meta_command(line: &str) -> Option<MetaCommand> {
     match line {
         ":quit" | ":q" | ":exit" => Some(MetaCommand::Quit),
@@ -159,13 +161,11 @@ fn print_help() {
     );
 }
 
-#[cfg(not(feature = "codegen"))]
-fn print_help() {}
-
 /// Decide whether the accumulated `buffer` forms a complete entry, given the
 /// line just read (Python-ish continuation). An entry continues while brackets
 /// are unbalanced, and while an indented block is open (a logical line ended in
 /// `:`) until a blank line closes it.
+#[cfg(feature = "codegen")]
 fn entry_complete(buffer: &str, last_line: &str) -> bool {
     if bracket_depth(buffer) > 0 {
         return false;
@@ -181,6 +181,7 @@ fn entry_complete(buffer: &str, last_line: &str) -> bool {
 
 /// Net bracket nesting depth, ignoring string contents crudely (good enough for
 /// deciding continuation; a precise lexer-based check is a follow-up).
+#[cfg(feature = "codegen")]
 fn bracket_depth(s: &str) -> i32 {
     let mut depth = 0i32;
     let mut in_str: Option<char> = None;
@@ -210,6 +211,7 @@ fn bracket_depth(s: &str) -> i32 {
 
 /// True if any logical line in the buffer ends with `:` (an indented block was
 /// opened), so the entry needs a blank line to close.
+#[cfg(feature = "codegen")]
 fn has_open_block(buffer: &str) -> bool {
     buffer
         .lines()
