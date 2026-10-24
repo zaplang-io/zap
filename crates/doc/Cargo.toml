@@ -1,0 +1,23 @@
+# Zap API-doc model extraction (I#157/C1, issue #232): the `zap doc` front half.
+# A host-only leaf tooling crate over the frontend — it walks a parsed module,
+# collects public declarations, their signatures, docstrings (D-0041) and
+# visibility (D-0028), and emits a stable, serializable doc model (the JSON
+# contract #233's HTML/Markdown renderers consume). No LLVM, no codegen; reuses
+# `zapc_analysis` for signature rendering (identical to hover) and inferred
+# const types. Renderers are #233; doctests are #234 (gated on the REPL, #159).
+[package]
+name = "zapc_doc"
+description = "Zap API-doc model extraction: a serializable doc model (signatures, docstrings, visibility) for `zap doc`."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_doc"
+path = "src/lib.rs"
+
+[dependencies]
+zapc_syntax = { path = "../syntax" }
+zapc_analysis = { path = "../analysis" }
+zapc_sema_types = { path = "../sema_types" }

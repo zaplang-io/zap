@@ -818,7 +818,11 @@ fn completion_kind(k: SymbolKind) -> CompletionKind {
 
 /// A readable one-line signature for a function/method declaration, matching
 /// Zap's type-first surface syntax: `def name[generics](TYPE p, …) -> ret`.
-fn render_fn_signature(f: &Function) -> String {
+///
+/// Public so other frontend tooling (e.g. `zap doc`, I#232) renders function
+/// signatures identically to hover; generic *bounds* are omitted here (as in
+/// hover) and surfaced structurally by consumers that need them.
+pub fn render_fn_signature(f: &Function) -> String {
     let generics = if f.generics.is_empty() {
         String::new()
     } else {
@@ -1425,7 +1429,10 @@ impl Walk {
 }
 
 /// A readable rendering of a type annotation (for document-symbol detail).
-fn render_type(t: &Type) -> String {
+///
+/// Public so other frontend tooling (e.g. `zap doc`, I#232) renders type
+/// annotations identically to hover/document-symbol detail.
+pub fn render_type(t: &Type) -> String {
     match t {
         Type::Named { name, args, .. } => {
             if args.is_empty() {
