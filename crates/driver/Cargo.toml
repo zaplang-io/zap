@@ -32,6 +32,8 @@ zapc_analysis = { path = "../analysis" }
 zapc_ir = { path = "../ir" }
 # Canonical formatter (`zap fmt`, D-0037). Host-safe, no LLVM.
 zapc_fmt = { path = "../fmt" }
+# API-doc model extraction (`zap doc`, I#232). Host-safe, no LLVM.
+zapc_doc = { path = "../doc" }
 # Package manager & project environment (issue #69, D-0052). Host-safe.
 zapc_pkg = { path = "../pkg" }
 # Codegen needs LLVM; gated behind the `codegen` feature so the toolchain
