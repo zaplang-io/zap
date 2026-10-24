@@ -268,6 +268,13 @@ void *zap_main_shadow_head = NULL;
 /* Per-thread "currently active" shadow head, maintained by compiled code. */
 __thread void *zap_shadow_head = NULL;
 
+/* The address of this thread's `zap_shadow_head` slot. The REPL JIT (I#159)
+ * calls this from JIT'd code instead of taking a direct dynamic-TLS reference,
+ * which MCJIT cannot resolve correctly for a `__thread` global in a dlopen'd
+ * library. AOT code keeps referencing the TLS global directly (never calls
+ * this). */
+void **zap_shadow_head_addr(void) { return &zap_shadow_head; }
+
 /* A shadow-stack frame, emitted by codegen in each function that holds live GC
  * pointers. Layout MUST match the codegen emission in lib.rs. */
 typedef struct ZapShadowFrame {

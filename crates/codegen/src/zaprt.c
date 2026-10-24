@@ -119,6 +119,7 @@ static void GC_set_stackbottom(void *h, struct GC_stack_base *sb) {
 #include <time.h>   /* clock_gettime for the scheduler idle wait (#47) */
 #include <unistd.h> /* sysconf(_SC_NPROCESSORS_ONLN) for the M count (#47) */
 #include <signal.h> /* SIGURG / sigaction / pthread_kill: async preemption (#172) */
+#include <setjmp.h> /* zap_repl_call: catch an uncaught exception at a REPL entry (I#159) */
 
 #if defined(ZAP_PLATFORM_WINDOWS)
 /* Windows system headers (platform epic #158 / Area A4, I#198). The POSIX
@@ -1400,7 +1401,113 @@ void zap_eh_end_catch(void) {
 /* An exception reached the program's top-level handler: report it and exit
  * non-zero (RUNTIME-ABI: "unwinds to the top frame and aborts with a message").
  * A richer stack trace is a follow-up. */
+/* ---------------------------------------------------------------------------
+ * REPL support (I#159, design/0025-repl.md).
+ *
+ * The REPL (`zap repl`) JIT-compiles each entry into one long-lived process and
+ * runs it through `zap_repl_call`, which installs a non-exiting catch so an
+ * uncaught exception in an entry returns to the loop instead of ending the
+ * session. Session `let`/binding values persist in a fixed table of 64-bit
+ * slots whose addresses are stable for the process lifetime: a pointer slot is
+ * registered once as a precise-GC root (so its target survives collection and
+ * is forwarded under evacuation), and under Boehm the static array is scanned
+ * conservatively, so both collectors keep slot pointers alive with no per-entry
+ * work. Only the driver (which assigns slot indices) emits slot access, via the
+ * `zap_repl_slot_*` entry points; see design/RUNTIME-ABI.md.
+ * ------------------------------------------------------------------------- */
+
+/* Installed catch for the entry currently running under `zap_repl_call`, and
+ * the exception it caught (read by the driver via `zap_repl_last_exc` right
+ * after a non-zero return, before any allocation). Thread-local: entries run on
+ * the main thread, like `main`. */
+static __thread jmp_buf *zap_repl_catch = NULL;
+static __thread void *zap_repl_exc = NULL;
+
+/* Run one REPL entry thunk. Returns 0 on normal completion, 1 if an exception
+ * propagated out of the thunk (caught here instead of aborting the process).
+ * The thunk is a JIT-compiled `__repl_entry` function carrying `main`'s
+ * implicit top-level landing pad, so an uncaught exception reaches
+ * `zap_uncaught`, which longjmps back here when a catch is installed. */
+int64_t zap_repl_call(void (*thunk)(void)) {
+    jmp_buf env;
+    jmp_buf *saved = zap_repl_catch;
+    zap_repl_catch = &env;
+    zap_repl_exc = NULL;
+    int64_t rc;
+    if (setjmp(env) == 0) {
+        thunk();
+        rc = 0;
+    } else {
+        rc = 1;
+    }
+    zap_repl_catch = saved;
+    return rc;
+}
+
+/* The `ZapStr *` message of the exception caught by the most recent
+ * `zap_repl_call` that returned non-zero (or NULL). */
+void *zap_repl_last_exc(void) { return zap_repl_exc; }
+
+/* Expose the caught exception message as (data, len) for the Rust driver, which
+ * copies it out immediately (before any allocation). Returns the length and
+ * sets `*out_data` to the message bytes (NULL / 0 if there was none). */
+int64_t zap_repl_last_exc_bytes(const char **out_data) {
+    ZapStr *s = (ZapStr *)zap_repl_exc;
+    if (s == NULL) {
+        *out_data = NULL;
+        return 0;
+    }
+    *out_data = s->data;
+    return s->len;
+}
+
+/* Session binding slots. A fixed, process-lifetime static array gives every
+ * cell a stable address; pointer slots are rooted on first store (idempotent). */
+#define ZAP_REPL_MAX_SLOTS 4096
+static int64_t zap_repl_slots[ZAP_REPL_MAX_SLOTS];
+static uint8_t zap_repl_slot_rooted[ZAP_REPL_MAX_SLOTS];
+
+static void zap_sys_fail(const char *op, const char *detail); /* defined below */
+
+static void zap_repl_slot_check(int64_t i) {
+    if (i < 0 || i >= ZAP_REPL_MAX_SLOTS) {
+        zap_sys_fail("repl", "session has too many live bindings");
+    }
+}
+
+int64_t zap_repl_slot_get_i64(int64_t i) {
+    zap_repl_slot_check(i);
+    return zap_repl_slots[i];
+}
+void zap_repl_slot_set_i64(int64_t i, int64_t v) {
+    zap_repl_slot_check(i);
+    zap_repl_slots[i] = v;
+}
+void *zap_repl_slot_get_ptr(int64_t i) {
+    zap_repl_slot_check(i);
+    return (void *)zap_repl_slots[i];
+}
+void zap_repl_slot_set_ptr(int64_t i, void *p) {
+    zap_repl_slot_check(i);
+    zap_repl_slots[i] = (int64_t)p;
+    if (!zap_repl_slot_rooted[i]) {
+        zap_repl_slot_rooted[i] = 1;
+        /* No-op under Boehm (the static array is scanned conservatively); under
+         * precise Immix this registers the stable slot address so the target is
+         * marked and forwarded. */
+        zap_gc_add_root((void **)&zap_repl_slots[i]);
+    }
+}
+
 void zap_uncaught(void *exc) {
+    if (zap_repl_catch != NULL) {
+        /* REPL mode: hand the message to the loop and unwind to zap_repl_call
+         * instead of exiting. The unwinder has already run frame cleanups and
+         * the top-level landing pad restored the shadow head, so the longjmp
+         * leaves the runtime in a consistent state. */
+        zap_repl_exc = exc;
+        longjmp(*zap_repl_catch, 1);
+    }
     ZapStr *msg = (ZapStr *)exc;
     fputs("Uncaught exception: ", stderr);
     if (msg != NULL && msg->len > 0) {
