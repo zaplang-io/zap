@@ -1,0 +1,91 @@
+{
+  "name": "zap-lang",
+  "displayName": "Zap",
+  "description": "Zap language support: live diagnostics, completion, hover, go-to-definition and syntax highlighting, powered by the `zap lsp` language server.",
+  "version": "0.1.0",
+  "publisher": "zaplang",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/parveshgarg/zap.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:zap"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "zap",
+        "aliases": [
+          "Zap",
+          "zap"
+        ],
+        "extensions": [
+          ".zap"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "zap",
+        "scopeName": "source.zap",
+        "path": "./syntaxes/zap.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Zap",
+      "properties": {
+        "zap.lsp.serverPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `zap` executable used to launch the language server (`zap lsp`). When empty, `zap` is looked up on your `PATH`."
+        },
+        "zap.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the Zap language server."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "zap.restartServer",
+        "title": "Zap: Restart Language Server"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "check": "tsc -p ./ --noEmit",
+    "watch": "tsc -p ./ -w",
+    "test": "node test/tokenize.mjs",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^2.26.1",
+    "typescript": "^5.4.5",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.1.0"
+  }
+}

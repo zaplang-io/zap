@@ -1,0 +1,5 @@
+# Node / VS Code extension build artifacts (the Rust workspace's root
+# .gitignore covers Cargo/target; this scopes Node output to the extension).
+node_modules/
+out/
+*.vsix

@@ -1,0 +1,11 @@
+# vsce packages production dependencies automatically and prunes devDeps, so we
+# only strip sources and build/test scaffolding — NOT node_modules (that holds
+# the runtime dep vscode-languageclient the extension needs at load time).
+.vscode/**
+.gitignore
+tsconfig.json
+src/**
+test/**
+**/*.ts
+**/*.map
+!out/**/*.js
