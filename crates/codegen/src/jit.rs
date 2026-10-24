@@ -19,6 +19,7 @@
 use std::ffi::{c_char, c_void, CString};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
@@ -26,18 +27,54 @@ use inkwell::OptimizationLevel;
 
 use zapc_syntax::ast::Module as AstModule;
 
-/// A live REPL JIT session: a loaded runtime, a leaked LLVM context, and one
-/// MCJIT execution engine that accumulates per-entry modules.
+/// The process-global runtime: the C runtime is compiled and `dlopen`ed exactly
+/// once per process (its GC constructor runs once, and a single Immix heap /
+/// scheduler backs the whole process), and every [`ReplJit`] shares it. The
+/// handle is stored as a `usize` so the `OnceLock` stays `Send`/`Sync`; it is
+/// intentionally never `dlclose`d (process-lifetime).
+static RUNTIME: OnceLock<Result<usize, String>> = OnceLock::new();
+
+/// Build + load the runtime once; return its `dlopen` handle.
+fn runtime_handle() -> Result<*mut c_void, String> {
+    let r = RUNTIME.get_or_init(|| {
+        let (dir, lib) = build_runtime_dylib()?;
+        let handle = unsafe {
+            let path = CString::new(lib.to_string_lossy().as_bytes())
+                .map_err(|e| format!("runtime path has an interior NUL: {e}"))?;
+            libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL)
+        };
+        if handle.is_null() {
+            let _ = std::fs::remove_dir_all(&dir);
+            let err = unsafe { libc::dlerror() };
+            let detail = if err.is_null() {
+                "unknown error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(err) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            return Err(format!("failed to load the Zap runtime: {detail}"));
+        }
+        // The runtime lives for the whole process: keep the temp files and the
+        // handle (never removed / closed), so its symbols and GC stay live.
+        std::mem::forget(dir);
+        Ok(handle as usize)
+    });
+    match r {
+        Ok(h) => Ok(*h as *mut c_void),
+        Err(e) => Err(e.clone()),
+    }
+}
+
+/// A live REPL JIT session: a leaked LLVM context and one MCJIT execution engine
+/// that accumulates per-entry modules, over the process-global runtime.
 pub struct ReplJit {
     /// The leaked LLVM context (lives for the whole session).
     ctx: &'static Context,
     /// The MCJIT engine; every entry module is added here.
     engine: ExecutionEngine<'static>,
-    /// `dlopen` handle for the runtime shared library (kept open for the
-    /// session so its symbols stay resolvable and its GC stays live).
+    /// `dlopen` handle for the process-global runtime (for `dlsym`; not owned).
     rt_handle: *mut c_void,
-    /// The temp directory holding the compiled runtime (removed on drop).
-    rt_dir: PathBuf,
     /// Monotonic entry counter, used to give each module a unique name.
     gen: u32,
 }
@@ -51,30 +88,11 @@ pub struct EntryOutcome {
 }
 
 impl ReplJit {
-    /// Start a session: compile + load the runtime, then create the engine.
+    /// Start a session over the process-global runtime (loading it on first
+    /// use so its GC constructor runs and MCJIT can resolve `zap_*` symbols by
+    /// `dlsym`), then create this session's MCJIT engine.
     pub fn new() -> Result<Self, String> {
-        let (rt_dir, rt_lib) = build_runtime_dylib()?;
-
-        // Load the runtime globally so (a) its `__attribute__((constructor))`
-        // GC init runs now, and (b) MCJIT's symbol resolver (dlsym on the
-        // process) finds every `zap_*` entry point the JIT'd code calls.
-        let handle = unsafe {
-            let path = CString::new(rt_lib.to_string_lossy().as_bytes())
-                .map_err(|e| format!("runtime path has an interior NUL: {e}"))?;
-            libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL)
-        };
-        if handle.is_null() {
-            let _ = std::fs::remove_dir_all(&rt_dir);
-            let err = unsafe { libc::dlerror() };
-            let detail = if err.is_null() {
-                "unknown error".to_string()
-            } else {
-                unsafe { std::ffi::CStr::from_ptr(err) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            return Err(format!("failed to load the Zap runtime: {detail}"));
-        }
+        let handle = runtime_handle()?;
 
         // A leaked context lives for the whole session; the engine and every
         // module borrow it for `'static`.
@@ -88,7 +106,6 @@ impl ReplJit {
             ctx,
             engine,
             rt_handle: handle,
-            rt_dir,
             gen: 0,
         })
     }
@@ -172,16 +189,6 @@ impl ReplJit {
     }
 }
 
-impl Drop for ReplJit {
-    fn drop(&mut self) {
-        // The leaked context is intentionally not freed (it may still back JIT'd
-        // code). Close the runtime and remove its temp files.
-        if !self.rt_handle.is_null() {
-            unsafe { libc::dlclose(self.rt_handle) };
-        }
-        let _ = std::fs::remove_dir_all(&self.rt_dir);
-    }
-}
 
 /// Compile the C runtime to a shared library for the session. Returns the temp
 /// directory (removed when the session drops) and the library path. POSIX-only:
