@@ -56,6 +56,40 @@ jobs:
       - name: Zap fmt check
         run: cargo run -q --bin zap -- fmt --check tests/golden
 
+  # VS Code extension (ticket #231, tooling epic #157 / Area B). The editor
+  # client is Node/TypeScript and lives entirely outside the Cargo workspace
+  # (editors/vscode/), so it is never touched by the Rust jobs above. This job
+  # is purely additive — it type-checks the extension, runs the TextMate grammar
+  # tokenizer smoke test, and proves `vsce package` produces a .vsix. No LLVM, so
+  # it is cheap and host-only.
+  vscode-extension:
+    name: vscode extension (Node/TS)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check and compile
+        run: npm run compile
+
+      - name: TextMate grammar tokenizer test
+        run: npm test
+
+      - name: Package .vsix
+        run: npx @vscode/vsce package --out zap-lang.vsix
+
   # Full path: replicate the dev container inline — install the same LLVM 18
   # packages as .devcontainer/Dockerfile, then build and test the whole
   # workspace with codegen enabled (includes the golden end-to-end:
