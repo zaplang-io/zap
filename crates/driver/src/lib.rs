@@ -19,6 +19,7 @@ pub mod cli;
 pub mod json;
 pub mod lsp;
 pub mod mcp;
+pub mod repl;
 pub mod testing;
 
 /// The toolchain version (shared by both binaries and `zap version`).
