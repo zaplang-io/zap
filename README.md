@@ -143,16 +143,25 @@ zap run [file]        compile + run a file, or the project (via zap.toml)
 zap build [file]      build a native binary (default: target/<name>)
 zap ir [file]         dump ZIR (diagnostic)
 zap expand [file]     show decorator/@derive-generated code (D-0036)
+zap fmt [paths]       rewrite source in the canonical style (D-0037)
+zap doc <file>        render API docs — HTML site, Markdown, or JSON model
 zap new <name>        scaffold a new project (writes zap.toml)
 zap init              scaffold zap.toml in the current directory
 zap version | help
 ```
 
-`zap run`/`zap build`/`zap expand`/`zap ir`, `zap new`/`init`, and
-`zap version`/`help` are implemented. `zap fmt` (D-0037), `zap test` (issue #73),
-`zap add`/`remove` and `zap zenv` (issue #69), and `zap mcp` (issue #72) are
-wired as stubs that name their owning ticket, so the command surface is stable
-while those systems land.
+`zap run`/`zap build`/`zap expand`/`zap ir`, `zap fmt` (D-0037), `zap doc`
+(issues #232/#233), `zap new`/`init`, and `zap version`/`help` are implemented.
+`zap test` (issue #73), `zap add`/`remove` and `zap zenv` (issue #69), and
+`zap mcp` (issue #72) are wired as stubs that name their owning ticket, so the
+command surface is stable while those systems land.
+
+`zap doc <file>` renders one module's public API (functions, types with their
+fields and methods, enums, interfaces, and constants, with signatures and
+docstrings). `--format html` (the default) writes a self-contained static site
+to `--out` (default `doc/`); `--format md` emits Markdown; `--format json`
+prints the serializable doc model (issue #232). `--private` includes
+`_`-prefixed declarations (D-0028).
 
 `zap run`/`zap build` need codegen, so they run under the LLVM path:
 

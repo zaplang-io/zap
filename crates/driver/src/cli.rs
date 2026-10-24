@@ -13,6 +13,18 @@ use std::process::ExitCode;
 
 use zapc_pkg::Source;
 
+/// The output form for `zap doc` (I#233).
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum DocFormat {
+    /// A self-contained static HTML site (the default).
+    #[default]
+    Html,
+    /// A single Markdown page.
+    Md,
+    /// The serializable doc model as JSON (the #233 contract; #232 behaviour).
+    Json,
+}
+
 /// A parsed `zap` invocation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -34,13 +46,16 @@ pub enum Command {
     /// paths, formats stdin to stdout. `--check` writes nothing and exits
     /// non-zero if any input is not already formatted (CI / fmt-gate mode).
     Fmt { paths: Vec<String>, check: bool },
-    /// `zap doc [--json] [--private] <file>` — API-doc model extraction (I#232).
-    /// `--json` emits the serializable doc model to stdout (the contract #233's
-    /// HTML/Markdown renderers consume); `--private` includes `_`-prefixed
-    /// declarations. The rendering half of `zap doc` is #233.
+    /// `zap doc [--format html|md|json] [--out <dir>] [--private] <file>` —
+    /// render API documentation (I#232 model, I#233 renderers). `--format html`
+    /// (the default) writes a self-contained static site into `--out` (default
+    /// `doc`); `--format md` writes `<out>/<module>.md` or prints to stdout;
+    /// `--format json` prints the serializable model (the #233 contract) to
+    /// stdout. `--private` includes `_`-prefixed declarations (D-0028).
     Doc {
         file: Option<String>,
-        json: bool,
+        format: DocFormat,
+        out: Option<String>,
         private: bool,
     },
     /// `zap new <name>` — scaffold a new project directory.
@@ -265,17 +280,41 @@ fn parse_lsp(args: &[String]) -> Result<Command, String> {
     Ok(Command::Lsp)
 }
 
-/// Parse `zap doc [--json] [--private] <file>` (I#232). Exactly one positional
-/// (the source file). `--json` selects JSON model emission (the only output in
-/// C1; rendering is #233); `--private` includes `_`-prefixed declarations.
+/// Parse `zap doc [--format html|md|json] [--out <dir>] [--private] <file>`
+/// (I#232 model, I#233 renderers). Exactly one positional (the source file).
+/// `--format` selects the output form (default `html`); `--json` is kept as a
+/// back-compat alias for `--format json`; `--out <dir>` sets the output
+/// directory (HTML/Markdown); `--private` includes `_`-prefixed declarations.
 fn parse_doc(args: &[String]) -> Result<Command, String> {
     let mut file: Option<String> = None;
-    let mut json = false;
+    let mut format: Option<DocFormat> = None;
+    let mut out: Option<String> = None;
     let mut private = false;
-    for a in args {
-        match a.as_str() {
-            "--json" => json = true,
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => format = Some(DocFormat::Json),
             "--private" => private = true,
+            "--format" | "-f" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| "`--format` needs a value (html|md|json)".to_string())?;
+                format = Some(match v.as_str() {
+                    "html" => DocFormat::Html,
+                    "md" | "markdown" => DocFormat::Md,
+                    "json" => DocFormat::Json,
+                    other => return Err(format!("unknown doc format `{other}` (html|md|json)")),
+                });
+                i += 1;
+            }
+            "--out" | "-o" => {
+                out = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| "`--out` needs a directory".to_string())?
+                        .clone(),
+                );
+                i += 1;
+            }
             flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
             f => {
                 if file.is_some() {
@@ -284,10 +323,12 @@ fn parse_doc(args: &[String]) -> Result<Command, String> {
                 file = Some(f.to_string());
             }
         }
+        i += 1;
     }
     Ok(Command::Doc {
         file,
-        json,
+        format: format.unwrap_or_default(),
+        out,
         private,
     })
 }
@@ -437,22 +478,22 @@ fn cmd_fmt(paths: Vec<String>, check: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `zap doc` (I#232). Extracts the serializable doc model from a source file.
-/// `--json` prints the model to stdout (the contract #233's renderers consume);
-/// without it, a note points at #233 for HTML/Markdown rendering. `--private`
-/// includes `_`-prefixed (private, D-0028) declarations.
-fn cmd_doc(file: Option<String>, json: bool, private: bool) -> ExitCode {
+/// `zap doc` (I#232 model, I#233 renderers). Extracts the doc model from a
+/// source file and renders it: `Html` writes a self-contained static site into
+/// the output directory (default `doc`), `Md` writes a Markdown page there (or
+/// to stdout when no `--out`), and `Json` prints the serializable model to
+/// stdout (the #233 contract). `--private` includes `_`-prefixed (private,
+/// D-0028) declarations.
+fn cmd_doc(
+    file: Option<String>,
+    format: DocFormat,
+    out: Option<String>,
+    private: bool,
+) -> ExitCode {
     let Some(file) = file else {
-        eprintln!("zap doc: needs a source file: `zap doc --json <file.zap>`");
+        eprintln!("zap doc: needs a source file: `zap doc <file.zap>`");
         return ExitCode::from(2);
     };
-    if !json {
-        eprintln!(
-            "zap doc: HTML/Markdown rendering lands in #233; \
-             use `zap doc --json {file}` to emit the doc model"
-        );
-        return ExitCode::SUCCESS;
-    }
     let src = match fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
@@ -461,13 +502,53 @@ fn cmd_doc(file: Option<String>, json: bool, private: bool) -> ExitCode {
         }
     };
     // The module's logical name is its file stem (D-0028: one file = one module).
-    let module_name = Path::new(&file).file_stem().and_then(|s| s.to_str());
+    let stem = Path::new(&file).file_stem().and_then(|s| s.to_str());
+    let module_name = stem.unwrap_or("module");
     let opts = zapc_doc::DocOptions {
         include_private: private,
     };
-    let model = zapc_doc::DocModel::from_source(&src, module_name, &opts);
-    println!("{}", model.to_json_string());
-    ExitCode::SUCCESS
+    let model = zapc_doc::DocModel::from_source(&src, Some(module_name), &opts);
+
+    match format {
+        DocFormat::Json => {
+            println!("{}", model.to_json_string());
+            ExitCode::SUCCESS
+        }
+        DocFormat::Md => {
+            let md = model.to_markdown();
+            match out {
+                Some(dir) => write_doc_file(&dir, &format!("{module_name}.md"), &md),
+                None => {
+                    print!("{md}");
+                    ExitCode::SUCCESS
+                }
+            }
+        }
+        DocFormat::Html => {
+            let dir = out.unwrap_or_else(|| "doc".to_string());
+            write_doc_file(&dir, "index.html", &model.to_html())
+        }
+    }
+}
+
+/// Write one rendered doc file into `dir`, creating the directory. Reports the
+/// path written to stderr.
+fn write_doc_file(dir: &str, name: &str, contents: &str) -> ExitCode {
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!("zap doc: {dir}: {e}");
+        return ExitCode::from(2);
+    }
+    let path = Path::new(dir).join(name);
+    match fs::write(&path, contents) {
+        Ok(()) => {
+            eprintln!("zap doc: wrote {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zap doc: {}: {e}", path.display());
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// Collect `.zap` files under `path` (a single file, or a directory walked
@@ -592,9 +673,10 @@ pub fn execute(cmd: Command) -> ExitCode {
         Command::Fmt { paths, check } => cmd_fmt(paths, check),
         Command::Doc {
             file,
-            json,
+            format,
+            out,
             private,
-        } => cmd_doc(file, json, private),
+        } => cmd_doc(file, format, out, private),
         Command::New { name } => cmd_new(&name),
         Command::Init => cmd_init(),
         Command::Add { name, source } => cmd_add(&name, source),
@@ -1040,9 +1122,11 @@ format:
                         are not already formatted (CI / fmt-gate mode)
 
 documentation:
-  doc <file>            extract API docs from a source file (I#232)
-      --json            emit the serializable doc model to stdout (the contract
-                        the #233 HTML/Markdown renderers consume)
+  doc <file>            render API documentation for a source file (I#232/#233)
+      --format <fmt>    html (default: a self-contained static site), md, or
+                        json (the serializable doc model)
+      --out <dir>       output directory for html/md (default: doc)
+      --json            alias for --format json (emit the model to stdout)
       --private         include _-prefixed (private, D-0028) declarations
 ";
 
@@ -1228,22 +1312,47 @@ mod tests {
 
     #[test]
     fn doc_parses_file_and_flags() {
+        // Default format is HTML.
         assert_eq!(
             p(&["doc", "m.zap"]).unwrap(),
             Command::Doc {
                 file: Some("m.zap".into()),
-                json: false,
+                format: DocFormat::Html,
+                out: None,
                 private: false,
             }
         );
+        // `--json` is the back-compat alias for `--format json`.
         assert_eq!(
             p(&["doc", "--json", "--private", "m.zap"]).unwrap(),
             Command::Doc {
                 file: Some("m.zap".into()),
-                json: true,
+                format: DocFormat::Json,
+                out: None,
                 private: true,
             }
         );
+        assert_eq!(
+            p(&["doc", "--format", "md", "--out", "site", "m.zap"]).unwrap(),
+            Command::Doc {
+                file: Some("m.zap".into()),
+                format: DocFormat::Md,
+                out: Some("site".into()),
+                private: false,
+            }
+        );
+        assert_eq!(
+            p(&["doc", "-f", "json", "m.zap"]).unwrap(),
+            Command::Doc {
+                file: Some("m.zap".into()),
+                format: DocFormat::Json,
+                out: None,
+                private: false,
+            }
+        );
+        assert!(p(&["doc", "--format", "pdf", "m.zap"]).is_err());
+        assert!(p(&["doc", "--format"]).is_err());
+        assert!(p(&["doc", "--out"]).is_err());
         assert!(p(&["doc", "--bogus", "m.zap"]).is_err());
         assert!(p(&["doc", "a.zap", "b.zap"]).is_err());
     }
