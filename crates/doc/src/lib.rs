@@ -43,6 +43,10 @@ use zapc_syntax::span::Span;
 mod json;
 use json::Json;
 
+pub mod html;
+pub mod markdown;
+mod render;
+
 // ----------------------------------------------------------------------------
 // Options
 // ----------------------------------------------------------------------------
@@ -292,6 +296,18 @@ impl DocModel {
     /// consumes (`design/0023-doc-model.md`).
     pub fn to_json_string(&self) -> String {
         self.to_json().to_pretty(0)
+    }
+
+    /// Render the module to a single, byte-stable Markdown page (I#233). See
+    /// [`markdown`] for the layout.
+    pub fn to_markdown(&self) -> String {
+        markdown::render(self)
+    }
+
+    /// Render the module to a self-contained static HTML page (I#233). See
+    /// [`html`] for the structure and styling.
+    pub fn to_html(&self) -> String {
+        html::render(self)
     }
 
     fn to_json(&self) -> Json {
@@ -690,8 +706,9 @@ fn parse_docstring(raw: &str) -> DocString {
 
 /// `inspect.cleandoc`-style normalization: drop a leading blank line, strip the
 /// common leading indentation of the continuation lines, and trim surrounding
-/// blank lines.
-fn cleandoc(raw: &str) -> String {
+/// blank lines. Shared with the renderers (I#233), which show the dedented
+/// docstring prose.
+pub(crate) fn cleandoc(raw: &str) -> String {
     let lines: Vec<&str> = raw.lines().collect();
     if lines.is_empty() {
         return String::new();
