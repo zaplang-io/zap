@@ -3420,7 +3420,7 @@ mod tests {
         let td = tm.get_target_data();
         llmod.set_data_layout(&td.get_data_layout());
         let _ = &td; // data layout already set on the module; translate derives its own
-        let mut cg = Cg::new(&ctx, &llmod, &builder);
+        let mut cg = Cg::new(&ctx, &llmod, &builder, false);
         cg.translate(&zir).expect("translate");
         llmod
             .verify()

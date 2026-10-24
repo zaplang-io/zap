@@ -564,10 +564,22 @@ zap zenv create               # project env (activate via `source zenv/activate`
 zap expand                    # show @derive/decorator-generated code
 zap ir <file>                 # dump ZIR (diagnostic)
 zap mcp                       # MCP server for coding agents (syntax/compile/test)
+zap repl                      # interactive REPL (JIT, I#159)
 zap inspect <pid>             # stacks / GC+memory stats / (later) profile of a running process
 zap explain <ZAPnnnn>         # explain a diagnostic's stable error code (I#157/F1)
 zap version | zap help
 ```
+
+**`zap repl` (I#159).** An interactive read-eval-print loop. Each entry is
+compiled and executed through the real `AST → ZIR → LLVM` backend in one
+long-lived process via an in-process LLVM MCJIT, so REPL code has **identical
+semantics to compiled code** (same monomorphization, value-struct layout,
+exceptions, Immix GC) rather than a second interpreter. Session `let`/binding
+values persist across entries in GC-rooted runtime slots; a trailing expression
+is auto-printed; a compile error (`ZAPnnnn`) or an uncaught runtime exception is
+reported and the session continues. Meta-commands: `:type <expr>`, `:reset`,
+`:help`, `:quit`. The same session engine backs runnable doc examples (#234) and
+the web playground (#238). See design/0025-repl.md.
 
 **Error codes (I#157/F1).** Every diagnostic carries a stable `ZAPnnnn` code
 (`ZAP` + four digits; the leading digit is the phase/category — lex `1`, parse

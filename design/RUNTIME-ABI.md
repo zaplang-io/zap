@@ -378,6 +378,38 @@ with a Zap **personality function**:
   the (still-live) stack handles this in v1.
 - An uncaught exception unwinds to the top frame and aborts with a stack trace.
 
+### REPL JIT entry points (I#159, design/0025-repl.md)
+
+`zap repl` executes typed Zap incrementally in one process via an in-process
+MCJIT that reuses this ABI unchanged. It adds a small, pay-only-when-used
+surface (no effect on ordinary program builds):
+
+- **`int64 zap_repl_call(void (*thunk)(void))`** runs one entry thunk (a JIT'd
+  `__repl_entry*` function that carries `main`'s implicit top-level landing pad).
+  It installs a non-exiting catch: an uncaught exception that reaches
+  `zap_uncaught` unwinds back here (the top-level pad already restored the shadow
+  head) instead of `exit`ing, so the session survives. Returns 0 normally, 1 if
+  an exception was caught.
+- **`void *zap_repl_last_exc(void)` / `int64 zap_repl_last_exc_bytes(const char
+  **out)`** expose the caught exception's message to the driver (read before any
+  allocation).
+- **Session slots** persist `let`/binding values across entries in a fixed,
+  process-lifetime array of 64-bit cells with stable addresses:
+  `zap_repl_slot_{get,set}_i64` for integer/bool/char bindings and
+  `zap_repl_slot_{get,set}_ptr` for GC pointers (`str`/`bytes`/collections). A
+  pointer store registers the slot once with the global-root registry
+  (`zap_gc_add_root`), so the target is marked and forwarded under precise Immix
+  and conservatively scanned under Boehm. The driver assigns indices and emits
+  these via the `__repl_load_*`/`__repl_store_*` lowering intrinsics.
+- **`void **zap_shadow_head_addr(void)`** (precise GC only) returns this thread's
+  `zap_shadow_head` slot. JIT'd code calls it instead of taking a direct
+  dynamic-TLS reference, which MCJIT cannot resolve to a `__thread` global in the
+  dlopen'd runtime; AOT code keeps referencing the TLS global directly.
+
+The session runs on one thread (the runtime's one "main mutator"); the C runtime
+is compiled once and loaded with `RTLD_GLOBAL` so its GC constructor runs and
+MCJIT resolves `zap_*` symbols by `dlsym`.
+
 ### Name mangling
 
 Exported/user symbols use a stable mangling scheme (to be specified) that

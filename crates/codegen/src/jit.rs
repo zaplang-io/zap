@@ -189,7 +189,6 @@ impl ReplJit {
     }
 }
 
-
 /// Compile the C runtime to a shared library for the session. Returns the temp
 /// directory (removed when the session drops) and the library path. POSIX-only:
 /// the JIT is a host developer tool and Windows program linking is not yet

@@ -70,9 +70,8 @@ fn runtime_exception_is_caught_and_the_session_survives() {
 fn multi_line_block_then_use_the_result() {
     // A multi-line `for` block (closed by a blank line) mutates a prior binding;
     // the next entry reads the accumulated value.
-    let (stdout, _stderr, code) = repl(
-        "auto total = 0\nfor i in range(4):\n    total = total + i\n\ntotal\n",
-    );
+    let (stdout, _stderr, code) =
+        repl("auto total = 0\nfor i in range(4):\n    total = total + i\n\ntotal\n");
     assert_eq!(code, 0);
     assert!(stdout.contains('6'), "0+1+2+3 == 6; stdout: {stdout:?}");
 }
@@ -81,9 +80,8 @@ fn multi_line_block_then_use_the_result() {
 fn closure_captures_a_session_binding() {
     // A closure binding (explicit `fn` type so it persists) captures a prior
     // session binding, then is invoked from a later entry through its slot.
-    let (stdout, _stderr, code) = repl(
-        "auto base = 10\nfn(int64) -> int64 adder = lambda y: base + y\nprint(adder(5))\n",
-    );
+    let (stdout, _stderr, code) =
+        repl("auto base = 10\nfn(int64) -> int64 adder = lambda y: base + y\nprint(adder(5))\n");
     assert_eq!(code, 0);
     assert!(stdout.contains("15"), "stdout: {stdout:?}");
 }

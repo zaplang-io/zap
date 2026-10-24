@@ -54,7 +54,10 @@ def __repl_entry_1():
 ",
     );
     let o = jit.run_entry(&m, "__repl_entry_1").expect("entry 1");
-    assert!(o.runtime_error.is_none(), "entry 1 should complete normally");
+    assert!(
+        o.runtime_error.is_none(),
+        "entry 1 should complete normally"
+    );
 
     // Entry 2: bind an int into slot 0.
     let m = parse("def __repl_entry_2():\n    __repl_store_i64(0, 41)\n");

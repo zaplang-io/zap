@@ -335,9 +335,7 @@ mod engine {
                 return Err(errs);
             }
             let pos = probe.rfind("__t = (").map(|p| (p + 7) as u32);
-            let ty = pos
-                .and_then(|p| analysis.type_at(p))
-                .unwrap_or(Ty::Unknown);
+            let ty = pos.and_then(|p| analysis.type_at(p)).unwrap_or(Ty::Unknown);
             Ok(render_ty(&ty).unwrap_or_else(|| ty.display()))
         }
 
@@ -545,20 +543,10 @@ mod engine {
                     continue;
                 }
                 let b = &self.bindings[name];
-                body.push_str(&format!(
-                    "    {}({}, {})\n",
-                    b.rep.store_fn(),
-                    b.slot,
-                    name
-                ));
+                body.push_str(&format!("    {}({}, {})\n", b.rep.store_fn(), b.slot, name));
             }
             for (name, b) in commits {
-                body.push_str(&format!(
-                    "    {}({}, {})\n",
-                    b.rep.store_fn(),
-                    b.slot,
-                    name
-                ));
+                body.push_str(&format!("    {}({}, {})\n", b.rep.store_fn(), b.slot, name));
             }
             if body.trim().is_empty() {
                 body.push_str("    pass\n");
@@ -751,7 +739,10 @@ mod engine {
     fn parse_ok(src: &str) -> Result<Module, String> {
         let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
         if let Some(e) = lerrs.first() {
-            return Err(format!("internal REPL error: generated code lex error: {}", e.message));
+            return Err(format!(
+                "internal REPL error: generated code lex error: {}",
+                e.message
+            ));
         }
         if let Some(e) = perrs.first() {
             return Err(format!(
