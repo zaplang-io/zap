@@ -145,6 +145,7 @@ zap ir [file]         dump ZIR (diagnostic)
 zap expand [file]     show decorator/@derive-generated code (D-0036)
 zap fmt [paths]       rewrite source in the canonical style (D-0037)
 zap doc <file>        render API docs — HTML site, Markdown, or JSON model
+zap test [--doc]      run the @test suite, or docstring examples with --doc (#234)
 zap new <name>        scaffold a new project (writes zap.toml)
 zap init              scaffold zap.toml in the current directory
 zap version | help
@@ -162,6 +163,14 @@ docstrings). `--format html` (the default) writes a self-contained static site
 to `--out` (default `doc/`); `--format md` emits Markdown; `--format json`
 prints the serializable doc model (issue #232). `--private` includes
 `_`-prefixed declarations (D-0028).
+
+`zap test --doc [path]` runs **doctests** (issue #234, D-0074): a fenced
+```` ```zap ```` block in any docstring is a runnable example, executed through
+the REPL engine (identical semantics to compiled code) and checked against its
+`#`-comment directives — `# => <line>` for expected stdout, `# raises: <substr>`
+for a runtime exception, `# error: ZAPnnnn` for an expected compile error (no
+directive = must run clean). Examples are self-contained (run in a fresh
+session); doctests reuse the `zap test` report and exit non-zero on any failure.
 
 `zap run`/`zap build` need codegen, so they run under the LLVM path:
 

@@ -8,7 +8,7 @@ time sink in language projects.
 Status legend: **Locked** · **Proposed** (baked into docs, pending confirmation)
 · **Open** · **Superseded**
 
-_Last updated: 2026-10-23_
+_Last updated: 2026-10-25_
 
 ---
 
@@ -1722,3 +1722,46 @@ resolution, both validated).
   cross-entry top-level `def`/type persistence, and readline history. Host-only
   (needs LLVM), gated on the `codegen` feature like `zap run`. New dep: `libc`
   (dlopen/dlsym) in codegen.
+
+## D-0074 — Doctests: runnable docstring examples (`zap test --doc`, I#234)
+
+**Status:** Accepted. Issue #234, epic I#157 (`design/0021-tooling.md`); builds on
+the doc model (#232, D-0041), the Markdown renderers (#233), and the REPL
+`Session` engine (#159, [[D-0073]]).
+
+A *doctest* is a runnable example embedded in a docstring. `zap test --doc [path]`
+extracts the examples from every docstring under `path`, runs each through the
+REPL `Session` (so a documented example has **identical semantics to compiled
+code** — no second executor), and checks it against its stated behaviour; exit is
+non-zero on any failure.
+
+- **Example format.** A fenced ```` ```zap ```` block in a docstring is one
+  example, run as a single `Session::eval` in a fresh (reset) session — so
+  examples are self-contained and isolated. Other fences (```` ```text ````,
+  bare) are ignored. Expectations are `#` comment directives, keeping the block
+  plain, Python-readable, agent-writable Zap:
+  - `# => <text>` — one expected **stdout** line (repeat, in order; a trailing
+    bare expression auto-prints, so `x` + `# => 42` asserts the value);
+  - `# raises: <substr>` — must raise an uncaught runtime exception whose message
+    contains `<substr>`;
+  - `# error: ZAPnnnn` (or `# error[ZAPnnnn]`) — must fail to compile with that
+    stable code ([[D-0071]]);
+  - no directive — must compile and run clean (stdout unchecked).
+  `# =>` and `# raises:` combine; `# error:` is exclusive. A block that produces
+  diagnostics with no `# error:` directive is a **failure** (a broken example).
+- **Self-contained first cut.** The session does not load the enclosing module's
+  declarations (cross-entry/module `def`/type persistence is deferred, I#252), so
+  an example cannot yet call the item it documents by name — it uses literals,
+  builtins, stdlib imports, and inline logic. Auto-loading the module into the
+  doctest session is the obvious follow-up.
+- **Slots into `zap test`.** Doctests ride the test verb (cf. `pytest
+  --doctest-modules`): `zap test --doc` discovers **all** `.zap` under the path
+  (docstrings live in ordinary source), reuses the `@test` framework's report
+  model (human + `--json`), and is codegen-gated like `zap run`/`zap repl`. The
+  `@test` path, its report API, and all goldens are unchanged.
+- **Stdout capture.** The landed `EvalOutcome` surfaces `diagnostics` +
+  `runtime_error` only, and auto-print is emitted as `print(...)`, so the runner
+  captures each snippet's output at the **file-descriptor** level (redirect fd 1,
+  `fflush`, restore) rather than changing the shared engine or the REPL loop. New
+  dep: `libc` on the driver (codegen-gated). No grammar change — example syntax is
+  docstring *content*, not Zap grammar.

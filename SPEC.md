@@ -557,6 +557,7 @@ One user-facing tool, **`zap`** (the `zapc` compiler becomes internal):
 zap run <file> | zap run      # run a single file, or the project (zap.toml)
 zap build                     # build project -> native binary (target/)
 zap test [--watch] [--json]   # run tests; --watch re-runs (targeting changed paths); --json for agents
+zap test --doc [path]         # run docstring examples (doctests, #234) through the REPL engine
 zap fmt                       # canonical formatter (D-0037)
 zap new <name> | zap init     # scaffold a project
 zap add <dep> | zap remove    # manage deps (zap.toml + zap.lock, D-0052)
@@ -599,6 +600,19 @@ values); `with expect_raises(E):` checks exceptions. Tests live inline
 resolve imports through the **same** module resolution as the build (D-0052) — no
 test-only import path. Docstrings are triple-quoted first statements (D-0041),
 Google-style (summary + `Args`/`Returns`/`Raises`).
+
+**Doctests (D-0074).** A fenced ```` ```zap ```` block in a docstring is a
+runnable example. `zap test --doc [path]` extracts every such block under `path`
+and runs it through the REPL `Session` engine (#159) — identical semantics to
+compiled code, no second executor — checking it against its `#`-comment
+directives: `# => <line>` for expected stdout (a trailing bare expression
+auto-prints), `# raises: <substr>` for an uncaught runtime exception, and
+`# error: ZAPnnnn` for an expected compile error; a block with no directive must
+compile and run clean. Each example runs in a fresh session, so first-cut
+examples are self-contained (they cannot yet call the item they document by name;
+that waits on cross-module session loading, I#252). Doctests reuse the `@test`
+report surface (human + `--json`), exit non-zero on any failure, and are
+codegen-gated like `zap run`. See design/0025-repl.md §Reuse and D-0074.
 
 **`zap mcp` (D-0055)** is the agent interface: it serves the language
 reference/grammar/examples (so LLMs write correct Zap without a training corpus),
