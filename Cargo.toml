@@ -6,6 +6,7 @@
 resolver = "2"
 members = [
     "crates/diag",
+    "crates/json",
     "crates/syntax",
     "crates/sema_types",
     "crates/sema",
@@ -25,6 +26,7 @@ members = [
 # or `-p zapc_codegen`.
 default-members = [
     "crates/diag",
+    "crates/json",
     "crates/syntax",
     "crates/sema_types",
     "crates/sema",

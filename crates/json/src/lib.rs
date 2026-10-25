@@ -1,11 +1,13 @@
 //! A minimal JSON value, parser, and serializer.
 //!
 //! The toolchain deliberately ships **no external dependencies** beyond LLVM
-//! (the `--json` test reporter is hand-built for the same reason; see
-//! `testing/report.rs`). Both the MCP server (`zap mcp`) and the LSP server
-//! (`zap lsp`) speak JSON-RPC 2.0, so they need to both read and write JSON —
-//! this module provides just enough for that, with no `serde`, and is shared by
-//! both ([`crate::mcp`] and [`crate::lsp`]).
+//! (the `--json` test reporter is hand-built for the same reason). Several
+//! components speak JSON and need to both read and write it with no `serde`:
+//! the MCP server (`zap mcp`) and LSP server (`zap lsp`) speak JSON-RPC 2.0,
+//! and the package registry (`crates/pkg`, I#236) parses its static index
+//! files. This crate is the one in-house codec they all share — originally
+//! `zapc`'s `json` module, lifted into its own leaf crate so the lower-level
+//! `zapc_pkg` can depend on it without a dependency inversion.
 //!
 //! The parser is a straightforward recursive-descent over the UTF-8 bytes of
 //! the input; the serializer emits compact, single-line JSON (the MCP stdio

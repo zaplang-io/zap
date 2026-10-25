@@ -16,7 +16,10 @@ use std::process::ExitCode;
 use zapc_syntax::ast::Module;
 
 pub mod cli;
-pub mod json;
+// The JSON codec now lives in its own leaf crate (`zapc_json`, I#236) so the
+// lower-level `zapc_pkg` can share it; re-exported here as `crate::json` so the
+// MCP/LSP/playground call sites are unchanged.
+pub use zapc_json as json;
 pub mod lsp;
 pub mod mcp;
 pub mod playground;

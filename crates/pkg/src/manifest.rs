@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::name::RegistryName;
 
 /// A parsed `zap.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +18,11 @@ pub struct Manifest {
     pub package: Package,
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
+    /// Named alternate indexes: an index id -> its static-index base URL
+    /// (design/0027-registry.md §8.3). The default index is unnamed; a
+    /// `registry` dependency may name one of these with `index = "<id>"`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registries: BTreeMap<String, RegistryDef>,
 }
 
 /// The `[package]` table.
@@ -26,15 +32,32 @@ pub struct Package {
     pub version: String,
 }
 
+/// A `[registries.<id>]` entry: where an alternate static index lives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryDef {
+    /// The index base URL (an `https://` or `file://` root holding
+    /// `config.json` and the per-package files, §1.1).
+    pub index: String,
+}
+
 /// A `[dependencies]` value: exactly one source key plus an optional version.
 ///
-/// `jsonlib = { git = "…", version = "1.4.0" }` or `mathx = { path = "../mathx" }`.
+/// `jsonlib = { git = "…", version = "1.4.0" }`, `mathx = { path = "../mathx" }`,
+/// or `json = { registry = "jsonlib", version = "1.4.0" }` (§3.1).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Dependency {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub git: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub path: Option<String>,
+    /// The registry (global) name a `registry` dependency resolves — distinct
+    /// from the table key, which is the logical name `import` binds (§3.1).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub registry: Option<String>,
+    /// For a `registry` dependency, the id of a `[registries]` entry to resolve
+    /// it through; absent means the default index.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub version: Option<String>,
 }
@@ -46,31 +69,63 @@ pub enum Source {
     Git { url: String, version: String },
     /// A local directory containing a `zap.toml`.
     Path { dir: String },
+    /// A registry source: a global package name resolved through a static
+    /// index, with an optional minimum semver and an optional alternate index
+    /// id (design/0027-registry.md §3.1). `version` is a **minimum**, exactly
+    /// like `git`'s, so MVS is unchanged.
+    Registry {
+        name: String,
+        version: Option<String>,
+        index: Option<String>,
+    },
 }
 
 impl Dependency {
     /// Validate the table into a [`Source`], or explain why it is malformed.
     pub fn source(&self, name: &str) -> Result<Source> {
-        match (&self.git, &self.path) {
-            (Some(_), Some(_)) => Err(Error::Manifest(format!(
-                "dependency `{name}` has both `git` and `path`; pick one"
-            ))),
-            (Some(url), None) => {
-                let version = self.version.clone().ok_or_else(|| {
-                    Error::Manifest(format!(
-                        "git dependency `{name}` needs a `version` (its minimum semver)"
-                    ))
-                })?;
-                Ok(Source::Git {
-                    url: url.clone(),
-                    version,
-                })
+        // Exactly one of `git` / `path` / `registry` must be present.
+        let keys = [
+            self.git.is_some(),
+            self.path.is_some(),
+            self.registry.is_some(),
+        ];
+        match keys.iter().filter(|p| **p).count() {
+            0 => {
+                return Err(Error::Manifest(format!(
+                    "dependency `{name}` has no source; give `git`+`version`, `path`, \
+                     or `registry`"
+                )))
             }
-            (None, Some(dir)) => Ok(Source::Path { dir: dir.clone() }),
-            (None, None) => Err(Error::Manifest(format!(
-                "dependency `{name}` has no source; give `git`+`version` or `path`"
-            ))),
+            1 => {}
+            _ => {
+                return Err(Error::Manifest(format!(
+                    "dependency `{name}` has more than one source key (`git`/`path`/\
+                     `registry`); pick one"
+                )))
+            }
         }
+
+        if let Some(url) = &self.git {
+            let version = self.version.clone().ok_or_else(|| {
+                Error::Manifest(format!(
+                    "git dependency `{name}` needs a `version` (its minimum semver)"
+                ))
+            })?;
+            return Ok(Source::Git {
+                url: url.clone(),
+                version,
+            });
+        }
+        if let Some(dir) = &self.path {
+            return Ok(Source::Path { dir: dir.clone() });
+        }
+        // Registry: `version` is optional (a minimum); `index` is optional.
+        let reg = self.registry.clone().unwrap();
+        Ok(Source::Registry {
+            name: reg,
+            version: self.version.clone(),
+            index: self.index.clone(),
+        })
     }
 }
 
@@ -80,22 +135,44 @@ impl Source {
         match self {
             Source::Git { url, version } => Dependency {
                 git: Some(url.clone()),
-                path: None,
                 version: Some(version.clone()),
+                ..Dependency::default()
             },
             Source::Path { dir } => Dependency {
-                git: None,
                 path: Some(dir.clone()),
-                version: None,
+                ..Dependency::default()
+            },
+            Source::Registry {
+                name,
+                version,
+                index,
+            } => Dependency {
+                registry: Some(name.clone()),
+                index: index.clone(),
+                version: version.clone(),
+                ..Dependency::default()
             },
         }
     }
 
     /// The `source = "…"` string recorded in `zap.lock`.
+    ///
+    /// A registry source is `registry+<index-id>#<name>`, with the default
+    /// index id elided to `registry+<name>` (§3.1); `<name>` is the normalized
+    /// registry name so the pin is spelling-independent.
     pub fn lock_string(&self) -> String {
         match self {
             Source::Git { url, .. } => format!("git+{url}"),
             Source::Path { dir } => format!("path+{dir}"),
+            Source::Registry { name, index, .. } => {
+                let norm = RegistryName::parse(name)
+                    .map(|n| n.normalized())
+                    .unwrap_or_else(|_| name.clone());
+                match index {
+                    Some(id) => format!("registry+{id}#{norm}"),
+                    None => format!("registry+{norm}"),
+                }
+            }
         }
     }
 }
@@ -141,6 +218,19 @@ pub mod edit {
             }
             Source::Path { dir } => {
                 it.insert("path", Value::from(dir.as_str()));
+            }
+            Source::Registry {
+                name: reg,
+                version,
+                index,
+            } => {
+                it.insert("registry", Value::from(reg.as_str()));
+                if let Some(id) = index {
+                    it.insert("index", Value::from(id.as_str()));
+                }
+                if let Some(v) = version {
+                    it.insert("version", Value::from(v.as_str()));
+                }
             }
         }
         deps.insert(name, Item::Value(Value::InlineTable(it)));
@@ -202,8 +292,7 @@ mathx = { path = \"../mathx\" }
     fn git_without_version_is_rejected() {
         let d = Dependency {
             git: Some("u".into()),
-            path: None,
-            version: None,
+            ..Dependency::default()
         };
         assert!(d.source("x").is_err());
     }
@@ -214,8 +303,90 @@ mathx = { path = \"../mathx\" }
             git: Some("u".into()),
             path: Some("p".into()),
             version: Some("1.0.0".into()),
+            ..Dependency::default()
         };
         assert!(d.source("x").is_err());
+        // git + registry is also rejected.
+        let d = Dependency {
+            git: Some("u".into()),
+            registry: Some("r".into()),
+            version: Some("1.0.0".into()),
+            ..Dependency::default()
+        };
+        assert!(d.source("x").is_err());
+    }
+
+    #[test]
+    fn registry_source_round_trips() {
+        let text = "\
+[package]
+name = \"demo\"
+version = \"0.1.0\"
+
+[registries]
+corp = { index = \"https://corp.example/index/\" }
+
+[dependencies]
+json = { registry = \"jsonlib\", version = \"1.4.0\" }
+widget = { registry = \"@acme/widgets\", version = \"0.3.0\" }
+intl = { registry = \"icu\", version = \"2.0.0\", index = \"corp\" }
+bare = { registry = \"tiny\" }
+";
+        let m = Manifest::parse(text).unwrap();
+        assert_eq!(m.registries["corp"].index, "https://corp.example/index/");
+        assert_eq!(
+            m.dependencies["json"].source("json").unwrap(),
+            Source::Registry {
+                name: "jsonlib".into(),
+                version: Some("1.4.0".into()),
+                index: None,
+            }
+        );
+        // The lock string uses the normalized name; default index id elided.
+        assert_eq!(
+            m.dependencies["json"].source("json").unwrap().lock_string(),
+            "registry+jsonlib"
+        );
+        assert_eq!(
+            m.dependencies["intl"].source("intl").unwrap().lock_string(),
+            "registry+corp#icu"
+        );
+        assert_eq!(
+            m.dependencies["widget"]
+                .source("widget")
+                .unwrap()
+                .lock_string(),
+            "registry+@acme/widgets"
+        );
+        // A registry dep needs no version (the minimum is optional).
+        assert_eq!(
+            m.dependencies["bare"].source("bare").unwrap(),
+            Source::Registry {
+                name: "tiny".into(),
+                version: None,
+                index: None,
+            }
+        );
+    }
+
+    #[test]
+    fn edit_adds_registry_inline() {
+        let text = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+        let out = edit::add_dependency(
+            text,
+            "json",
+            &Source::Registry {
+                name: "jsonlib".into(),
+                version: Some("1.4.0".into()),
+                index: Some("corp".into()),
+            },
+        )
+        .unwrap();
+        assert!(out.contains("registry = \"jsonlib\""), "{out}");
+        assert!(out.contains("index = \"corp\""), "{out}");
+        assert!(out.contains("version = \"1.4.0\""), "{out}");
+        let m = Manifest::parse(&out).unwrap();
+        assert!(m.dependencies.contains_key("json"));
     }
 
     #[test]
