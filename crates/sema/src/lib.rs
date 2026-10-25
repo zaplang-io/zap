@@ -231,6 +231,12 @@ const BUILTINS: &[&str] = &[
     "reflect_has",
     "reflect_names",
     "checkpoint",
+    // REPL session-binding slot intrinsics (I#159): synthesized by the `zap repl`
+    // driver to persist `let` values across entries, never written by users.
+    "__repl_load_i64",
+    "__repl_load_ptr",
+    "__repl_store_i64",
+    "__repl_store_ptr",
     // Internal netpoller integration-test hook (ticket #80). No public I/O
     // surface exists yet (sockets #79, signals #77), so this drives the
     // netpoller end-to-end from the runtime; removed/replaced when #79 lands.
@@ -3189,6 +3195,23 @@ impl Checker {
                     return Ty::Unknown;
                 }
                 "print" => {
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unit;
+                }
+                // REPL session-binding slot intrinsics (I#159, design/0025-repl.md).
+                // Synthesized only by the `zap repl` driver, never written by
+                // users. A load yields `Unknown` so it coerces into the binding's
+                // declared type; a store is a statement (`Unit`). `Unknown` is
+                // universally assignable, so `<T> x = __repl_load_*(i)` checks.
+                "__repl_load_i64" | "__repl_load_ptr" => {
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
+                "__repl_store_i64" | "__repl_store_ptr" => {
                     for a in args {
                         self.infer(&a.value);
                     }

@@ -14,6 +14,9 @@ path = "src/lib.rs"
 zapc_syntax = { path = "../syntax" }
 zapc_ir = { path = "../ir" }
 inkwell = { version = "0.5.0", features = ["llvm18-0"] }
+# dlopen/dlsym for the REPL JIT (I#159): load the compiled C runtime into the
+# process so its GC constructor runs and MCJIT resolves `zap_*` symbols.
+libc = "0.2.169"
 
 [features]
 # Precise, Immix-style garbage collector (ticket #48, D-0009). ON by default

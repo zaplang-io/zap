@@ -2844,6 +2844,9 @@ fn lower_fn(
 ) -> Result<Func, LowerError> {
     let (params, ret) = sigs.get(&zir_name).cloned().unwrap();
     let is_main = zir_name == "main";
+    // `main` and each REPL entry thunk (`__repl_entry*`, I#159) get the implicit
+    // top-level landing pad (computed before `zir_name` is moved into FnLower).
+    let wants_top_handler = is_main || zir_name.starts_with("__repl_entry");
     let mut b = FnLower::new(
         zir_name,
         params.clone(),
@@ -2882,11 +2885,17 @@ fn lower_fn(
         // a detached receiver coroutine over `signal.notify(X)` that invokes the
         // decorated function on every delivery. Emitted at the top of `main`.
         b.emit_on_signal_registrations(on_signal_meta);
-        // `main` installs an implicit top-level landing pad so an exception that
-        // propagates out of the program is caught and reported (message + exit 1)
-        // rather than ending in a raw abort (RUNTIME-ABI §"Exception / unwinding
-        // ABI": "unwinds to the top frame and aborts"). Every call in `main`
-        // therefore `invoke`s to this pad.
+    }
+    // `main` — and each REPL entry thunk (`__repl_entry`, I#159) — installs an
+    // implicit top-level landing pad so an exception that propagates out is
+    // caught by `zap_uncaught` rather than ending in a raw abort (RUNTIME-ABI
+    // §"Exception / unwinding ABI"). Every call therefore `invoke`s to this pad.
+    // For a REPL entry `zap_uncaught` does not exit: when `zap_repl_call`
+    // installed a catch it unwinds back to the loop, keeping the session alive.
+    // The REPL entry gets the pad but NOT `main`'s bootstrap/`join_all`/C-`main`
+    // signature (its ZIR `is_main` is false), so it is emitted as a plain
+    // `void` function the JIT invokes once per entry.
+    if wants_top_handler {
         let lp = b.new_block();
         b.landing_pads.push(lp);
         for st in &f.body.stmts {
@@ -6106,6 +6115,54 @@ impl<'a> FnLower<'a> {
                     }
                 }
                 self.emit(Inst::Print { args: vals });
+                return Ok((self.iconst(Ty::I32, 0), Ty::I32));
+            }
+            // REPL session-binding slot access (I#159, design/0025-repl.md). The
+            // driver synthesizes these calls to persist `let` values across
+            // entries: a load reads a slot (integer bindings via `_i64`, GC
+            // pointers via `_ptr`), a store writes one back. The slot index is
+            // the driver-assigned integer literal.
+            if let Some((rt, ret)) = match fname.as_str() {
+                "__repl_load_i64" => Some(("zap_repl_slot_get_i64", Ty::I64)),
+                "__repl_load_ptr" => Some(("zap_repl_slot_get_ptr", Ty::Ptr)),
+                _ => None,
+            } {
+                if args.len() != 1 {
+                    return Err(err(format!("{fname}() takes one slot index")));
+                }
+                let (idx, idxty) = self.expr(&args[0].value)?;
+                let idx = self.coerce(idx, idxty, Ty::I64);
+                let dest = self.new_value(ret);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: rt.to_string(),
+                    args: vec![idx],
+                });
+                return Ok((dest, ret));
+            }
+            if let Some((rt, as_ptr)) = match fname.as_str() {
+                "__repl_store_i64" => Some(("zap_repl_slot_set_i64", false)),
+                "__repl_store_ptr" => Some(("zap_repl_slot_set_ptr", true)),
+                _ => None,
+            } {
+                if args.len() != 2 {
+                    return Err(err(format!("{fname}() takes a slot index and a value")));
+                }
+                let (idx, idxty) = self.expr(&args[0].value)?;
+                let idx = self.coerce(idx, idxty, Ty::I64);
+                let (val, valty) = self.expr(&args[1].value)?;
+                // Integer/bool bindings widen to the i64 slot cell; pointer
+                // bindings pass through unchanged.
+                let val = if as_ptr {
+                    val
+                } else {
+                    self.coerce(val, valty, Ty::I64)
+                };
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: rt.to_string(),
+                    args: vec![idx, val],
+                });
                 return Ok((self.iconst(Ty::I32, 0), Ty::I32));
             }
             if fname == "range" {

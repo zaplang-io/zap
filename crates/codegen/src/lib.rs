@@ -40,6 +40,11 @@ use zapc_syntax::ast::Module as AstModule;
 /// parallel-addable. See [`modules`] for the seam contract.
 mod modules;
 
+/// The REPL JIT engine (I#159): executes typed Zap incrementally in one
+/// long-lived process via an in-process MCJIT, reusing this crate's ZIR->LLVM
+/// translation so REPL code has identical semantics to compiled code.
+pub mod jit;
+
 /// A code-generation backend.
 pub trait Backend {
     /// Compile a (type-checked) AST module to a native object file.
@@ -51,52 +56,69 @@ pub struct LlvmBackend;
 
 impl Backend for LlvmBackend {
     fn compile_object(&self, module: &AstModule, obj_path: &Path) -> Result<(), String> {
-        let (zir_module, errs) = lower_module(module);
-        if !errs.is_empty() {
-            return Err(errs
-                .iter()
-                .map(|e| e.message.clone())
-                .collect::<Vec<_>>()
-                .join("; "));
-        }
-
         let ctx = Context::create();
-        let llmod = ctx.create_module("zap");
         let builder = ctx.create_builder();
-
-        // Create the target machine before translation so its data layout drives
-        // both the emitted object and the GC type-descriptor field offsets
-        // (ticket #48 — see Cg::translate).
-        Target::initialize_native(&InitializationConfig::default())
-            .map_err(|e| format!("failed to initialize native target: {e}"))?;
-        let triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&triple)
-            .map_err(|e| format!("unknown target: {}", e.to_string()))?;
-        let tm = target
-            .create_target_machine(
-                &triple,
-                "generic",
-                "",
-                OptimizationLevel::Default,
-                RelocMode::PIC,
-                CodeModel::Default,
-            )
-            .ok_or_else(|| "failed to create target machine".to_string())?;
-        let td = tm.get_target_data();
-        llmod.set_data_layout(&td.get_data_layout());
-        llmod.set_triple(&triple);
-
-        let mut cg = Cg::new(&ctx, &llmod, &builder);
-        cg.translate(&zir_module)?;
-
-        llmod
-            .verify()
-            .map_err(|e| format!("internal error: invalid LLVM module:\n{}", e.to_string()))?;
-
+        let (llmod, tm) = build_llvm_module(&ctx, &builder, module, "zap", false)?;
         tm.write_to_file(&llmod, FileType::Object, obj_path)
             .map_err(|e| format!("failed to write object file: {}", e.to_string()))?;
         Ok(())
     }
+}
+
+/// Lower a type-checked AST module to a verified in-memory LLVM module (shared
+/// by the object-file backend and the REPL JIT, I#159). Returns the module and
+/// the host target machine whose data layout drove the GC type-descriptor field
+/// offsets (ticket #48). The `builder` must outlive the returned module's
+/// construction; it is unused afterwards. `jit` selects the REPL JIT code path
+/// (shadow-head access via a runtime helper; see [`Cg::gc_head`]).
+pub(crate) fn build_llvm_module<'ctx>(
+    ctx: &'ctx Context,
+    builder: &Builder<'ctx>,
+    module: &AstModule,
+    name: &str,
+    jit: bool,
+) -> Result<(LlvmModule<'ctx>, TargetMachine), String> {
+    let (zir_module, errs) = lower_module(module);
+    if !errs.is_empty() {
+        return Err(errs
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join("; "));
+    }
+
+    let llmod = ctx.create_module(name);
+
+    // Create the target machine before translation so its data layout drives
+    // both the emitted code and the GC type-descriptor field offsets
+    // (ticket #48 — see Cg::translate).
+    Target::initialize_native(&InitializationConfig::default())
+        .map_err(|e| format!("failed to initialize native target: {e}"))?;
+    let triple = TargetMachine::get_default_triple();
+    let target =
+        Target::from_triple(&triple).map_err(|e| format!("unknown target: {}", e.to_string()))?;
+    let tm = target
+        .create_target_machine(
+            &triple,
+            "generic",
+            "",
+            OptimizationLevel::Default,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .ok_or_else(|| "failed to create target machine".to_string())?;
+    let td = tm.get_target_data();
+    llmod.set_data_layout(&td.get_data_layout());
+    llmod.set_triple(&triple);
+
+    let mut cg = Cg::new(ctx, &llmod, builder, jit);
+    cg.translate(&zir_module)?;
+
+    llmod
+        .verify()
+        .map_err(|e| format!("internal error: invalid LLVM module:\n{}", e.to_string()))?;
+
+    Ok((llmod, tm))
 }
 
 /// Compile an AST module to a native executable (object + `cc` link).
@@ -295,7 +317,7 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
 /// fallback for older layouts. Includes both `--cflags` (so `zaprt.c` finds
 /// `<Python.h>`) and `--libs` (so libpython links). The `python3-dev` and
 /// `pkg-config` packages provide these (added to the dev container and CI).
-fn python_embed_flags() -> Result<Vec<String>, String> {
+pub(crate) fn python_embed_flags() -> Result<Vec<String>, String> {
     for module in ["python3-embed", "python3"] {
         let out = Command::new("pkg-config")
             .args(["--cflags", "--libs", module])
@@ -431,6 +453,13 @@ struct Cg<'a, 'ctx> {
     /// (the MinGW-w64 SEH model, which keeps the `landingpad` IR and libstdc++
     /// `__cxa_*` glue). Chosen once in [`Cg::new`] from the target triple.
     personality: &'static str,
+    /// REPL JIT mode (I#159): when true, the shadow-stack head is reached via the
+    /// `zap_shadow_head_addr()` runtime helper instead of a direct `__thread`
+    /// global reference, because MCJIT cannot emit a correct dynamic-TLS access
+    /// to a thread-local defined in the dlopen'd runtime. Only affects
+    /// [`Cg::gc_head`]; false for the AOT object-file path.
+    #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
+    jit: bool,
 }
 
 /// A function's shadow-stack frame (ticket #48). Codegen reserves one root slot
@@ -456,11 +485,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         ctx: &'ctx Context,
         module: &'a LlvmModule<'ctx>,
         builder: &'a Builder<'ctx>,
+        jit: bool,
     ) -> Cg<'a, 'ctx> {
         Cg {
             ctx,
             module,
             builder,
+            jit,
             fns: std::collections::HashMap::new(),
             structs: Vec::new(),
             struct_inline: Vec::new(),
@@ -589,6 +620,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_eh_begin_catch", &[ptr.into()], Some(ptr.into()));
         self.declare_rt("zap_eh_end_catch", &[], None);
         self.declare_rt("zap_uncaught", &[ptr.into()], None);
+        // REPL session-binding slots (I#159, design/0025-repl.md). Each binding
+        // persists across entries in a 64-bit slot; the driver assigns indices
+        // and emits these per the binding's representation (integer/bool -> i64,
+        // GC pointer -> ptr). A pointer store roots the slot for the collector.
+        self.declare_rt("zap_repl_slot_get_i64", &[i64t.into()], Some(i64t.into()));
+        self.declare_rt("zap_repl_slot_set_i64", &[i64t.into(), i64t.into()], None);
+        self.declare_rt("zap_repl_slot_get_ptr", &[i64t.into()], Some(ptr.into()));
+        self.declare_rt("zap_repl_slot_set_ptr", &[i64t.into(), ptr.into()], None);
         // The C++ exception personality routine (libstdc++/libgcc). Landing pads
         // name it; it parses the unwind tables and drives phase-1/phase-2
         // unwinding. Its exact signature is immaterial — it is only referenced by
@@ -881,6 +920,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             // main thread have their own.
             let g = self.module.add_global(p, None, "zap_shadow_head");
             g.set_thread_local(true);
+            // REPL JIT (I#159): MCJIT cannot emit a correct dynamic-TLS access to
+            // a `__thread` global defined in the dlopen'd runtime, so in JIT mode
+            // the shadow-head slot address is fetched via this runtime helper
+            // (`void **zap_shadow_head_addr(void)`) instead of a direct TLS
+            // reference. Harmless to declare on the AOT path (never called there).
+            self.declare_rt("zap_shadow_head_addr", &[], Some(p.into()));
         }
 
         // Build LLVM struct types (fields are scalars or pointers, so no
@@ -1082,9 +1127,24 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         Ok(())
     }
 
-    /// Address of the per-thread `zap_shadow_head` TLS global.
+    /// Address of the per-thread `zap_shadow_head` TLS slot. In REPL JIT mode
+    /// (I#159) this is obtained by calling the runtime helper
+    /// `zap_shadow_head_addr()`, since MCJIT cannot emit a correct dynamic-TLS
+    /// access to the `__thread` global in the dlopen'd runtime; the AOT path
+    /// references the TLS global directly as before.
     #[cfg(feature = "gc-immix")]
     fn gc_head(&self) -> PointerValue<'ctx> {
+        if self.jit {
+            let f = self.fns["zap_shadow_head_addr"];
+            return self
+                .builder
+                .build_call(f, &[], "shadow_head_addr")
+                .expect("call zap_shadow_head_addr")
+                .try_as_basic_value()
+                .left()
+                .expect("zap_shadow_head_addr returns a pointer")
+                .into_pointer_value();
+        }
         self.module
             .get_global("zap_shadow_head")
             .expect("zap_shadow_head declared")
@@ -3360,7 +3420,7 @@ mod tests {
         let td = tm.get_target_data();
         llmod.set_data_layout(&td.get_data_layout());
         let _ = &td; // data layout already set on the module; translate derives its own
-        let mut cg = Cg::new(&ctx, &llmod, &builder);
+        let mut cg = Cg::new(&ctx, &llmod, &builder, false);
         cg.translate(&zir).expect("translate");
         llmod
             .verify()

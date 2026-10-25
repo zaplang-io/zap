@@ -1681,3 +1681,44 @@ retention an opt-in side-table — rather than restructuring the checker — buy
 symbol/type/def-at-position without touching compile behaviour or perf, and the
 leaf-crate boundary matches #129's intent (frontend reused by tooling without
 LLVM).
+
+## D-0073 — Interactive REPL via in-process LLVM JIT (I#159)
+
+**Status:** Accepted. Full text: `design/0025-repl.md`. Issue #159, epic I#157
+(`design/0021-tooling.md`). The engine behind runnable doc examples (#234) and
+the web playground (#238).
+
+`zap repl` executes typed Zap incrementally by reusing the real
+`AST → ZIR → LLVM` backend through an **in-process MCJIT**, so REPL code has
+**identical semantics to compiled code** (same monomorphization, value-struct
+layout, exceptions, Immix GC). A second (tree-walking) interpreter was rejected
+as a divergent second semantics — fatal for a "prototype == ship" language. ORCv2
+was the stated target, but inkwell 0.5 exposes no safe ORCv2, so MCJIT is used
+(functionally equivalent for the REPL: multi-module engine + process-symbol
+resolution, both validated).
+
+- **One process, one session, one thread.** The C runtime is compiled once and
+  loaded `RTLD_GLOBAL` (its GC constructor runs; MCJIT resolves `zap_*` by
+  `dlsym`); the runtime's one "main mutator" means a session runs on one thread.
+- **Session state = runtime slots.** The ZIR has no module-level globals, so a
+  `let` value persists in a fixed table of 64-bit runtime slots (stable
+  addresses; a pointer slot is GC-rooted once via the existing `zap_gc_add_root`,
+  evacuation-safe, and conservatively scanned under Boehm). Each entry re-declares
+  prior bindings from their slots in a generated `__repl_entry` prelude and writes
+  new/updated values back on success; a failed entry commits nothing. Shadowing
+  assigns a fresh slot. The only new frontend surface is the
+  `__repl_load_*`/`__repl_store_*` lowering intrinsics (sema builtins → runtime
+  slot calls) and the `__repl_entry*` top-level landing pad.
+- **Errors.** A compile error is reported with its `ZAPnnnn` code and the entry
+  discarded; an uncaught runtime exception is caught by `zap_repl_call` (a
+  non-exiting boundary; `zap_uncaught` unwinds back to the loop) and reported.
+  The session survives both.
+- **MCJIT + dynamic TLS.** MCJIT cannot emit a correct access to the `__thread`
+  `zap_shadow_head` in the dlopen'd runtime, so codegen gains a JIT mode that
+  fetches the shadow-head slot via a `zap_shadow_head_addr()` runtime helper; the
+  AOT object path is unchanged.
+- **First cut.** Persists `int*/bool/char/str/bytes/list/dict/set` and
+  explicit-typed bindings (incl. `fn(...)` closures); defers float bindings,
+  cross-entry top-level `def`/type persistence, and readline history. Host-only
+  (needs LLVM), gated on the `codegen` feature like `zap run`. New dep: `libc`
+  (dlopen/dlsym) in codegen.

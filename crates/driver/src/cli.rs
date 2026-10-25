@@ -80,6 +80,9 @@ pub enum Command {
     /// Serves over stdio. `root` is the codebase root for the code-graph and
     /// test surfaces (default: the current directory).
     Mcp { root: Option<String> },
+    /// `zap repl` — the interactive REPL (I#159). Reads entries from stdin and
+    /// executes each through the in-process JIT, persisting session bindings.
+    Repl,
     /// `zap lsp` — the language server (I#157/B2, issue #229). Serves the LSP
     /// over a `Content-Length`-framed JSON-RPC stdio transport: live
     /// diagnostics on open/change/save. No options in #229.
@@ -193,6 +196,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::Test { file, json, watch })
         }
         "mcp" => parse_mcp(rest),
+        "repl" => parse_repl(rest),
         "lsp" => parse_lsp(rest),
         "inspect" => parse_inspect(rest),
         "explain" => match first_positional(rest) {
@@ -264,6 +268,15 @@ fn parse_mcp(args: &[String]) -> Result<Command, String> {
         }
     }
     Ok(Command::Mcp { root })
+}
+
+/// Parse `repl` (I#159). The REPL takes no options yet; it reads entries from
+/// stdin and serves over the terminal.
+fn parse_repl(args: &[String]) -> Result<Command, String> {
+    if let Some(a) = args.first() {
+        return Err(format!("unexpected argument `{a}`"));
+    }
+    Ok(Command::Repl)
 }
 
 /// Parse `lsp`. The language server (#229) takes no options yet; the transport
@@ -684,6 +697,7 @@ pub fn execute(cmd: Command) -> ExitCode {
         Command::Zenv(sub) => cmd_zenv(sub),
         Command::Test { file, json, watch } => cmd_test(file, json, watch),
         Command::Mcp { root } => crate::mcp::serve(root),
+        Command::Repl => crate::repl::serve(),
         Command::Lsp => crate::lsp::serve(),
         Command::Inspect {
             pid,
@@ -1103,6 +1117,8 @@ agent interface:
 editor integration:
   lsp                   start the language server (LSP, issue #229): live
                         diagnostics over a JSON-RPC stdio transport, for editors
+  repl                  start the interactive REPL (I#159): JIT-executes each
+                        entry, persisting session bindings across entries
 
 diagnostics:
   inspect <pid>         signal a running Zap process to dump coroutine stacks +
