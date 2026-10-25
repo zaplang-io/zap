@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zap Playground</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Zap Playground</h1>
+      <span class="note">runs server-side &mdash; local, loopback only (I#238)</span>
+    </header>
+
+    <main>
+      <section class="editor">
+        <div class="toolbar">
+          <button id="run" type="button">Run <kbd>Ctrl</kbd>+<kbd>Enter</kbd></button>
+          <button id="share" type="button" class="secondary">Copy share link</button>
+          <span id="sharenote" class="sharenote" aria-live="polite"></span>
+        </div>
+        <textarea
+          id="code"
+          spellcheck="false"
+          autocapitalize="off"
+          autocomplete="off"
+          aria-label="Zap source code"
+        >def main():
+    print("hello from zap")
+</textarea>
+      </section>
+
+      <section class="output">
+        <div class="status-line">
+          <span id="status" class="status">ready</span>
+        </div>
+        <h2>Output</h2>
+        <pre id="stdout" class="stdout" aria-live="polite"></pre>
+        <div id="diagnostics" class="diagnostics"></div>
+        <pre id="runtime" class="runtime"></pre>
+        <pre id="message" class="message"></pre>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

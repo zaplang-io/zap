@@ -566,6 +566,7 @@ zap expand                    # show @derive/decorator-generated code
 zap ir <file>                 # dump ZIR (diagnostic)
 zap mcp                       # MCP server for coding agents (syntax/compile/test)
 zap repl                      # interactive REPL (JIT, I#159)
+zap playground [--port N]     # local web playground: editor + sandboxed server-side run (I#238)
 zap inspect <pid>             # stacks / GC+memory stats / (later) profile of a running process
 zap explain <ZAPnnnn>         # explain a diagnostic's stable error code (I#157/F1)
 zap version | zap help
@@ -613,6 +614,21 @@ examples are self-contained (they cannot yet call the item they document by name
 that waits on cross-module session loading, I#252). Doctests reuse the `@test`
 report surface (human + `--json`), exit non-zero on any failure, and are
 codegen-gated like `zap run`. See design/0025-repl.md §Reuse and D-0074.
+
+**Playground (D-0075).** `zap playground` starts a local web UI (an editor page
+and a `POST /run` endpoint) that compiles and runs a snippet server-side through
+the same REPL `Session` engine (#159) and shows its stdout, auto-printed value,
+and `ZAPnnnn` diagnostics. Because the WASM target is post-1.0, a snippet cannot
+run in the browser; the server executes untrusted native code, so **each request
+runs in its own short-lived worker process** (`zap playground-worker`) under
+resource limits (CPU, address space, file size, no core) with the parent
+enforcing a per-snippet time budget (an `alarm` armed after startup), an output
+cap, and a cap on concurrent workers. A hard fault in a snippet kills only its
+worker — the server reports it and stays up — and no two requests share a heap,
+GC, or scheduler. It binds `127.0.0.1` by default; true filesystem/network
+denial (an OS sandbox) is deployment hardening required before any public
+exposure. Share links are stateless (the snippet is encoded in the URL
+fragment). Codegen-gated like `zap run`. See design/0026-playground.md.
 
 **`zap mcp` (D-0055)** is the agent interface: it serves the language
 reference/grammar/examples (so LLMs write correct Zap without a training corpus),
