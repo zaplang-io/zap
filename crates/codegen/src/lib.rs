@@ -180,7 +180,16 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     // MinGW-w64 toolchain so that work drops straight in. See the PR body and
     // design/0016-platform-1.0.md (Area A).
     let triple = TargetMachine::get_default_triple();
-    let is_windows = triple.as_str().to_string_lossy().contains("windows");
+    let triple_str = triple.as_str().to_string_lossy().into_owned();
+    let is_windows = triple_str.contains("windows");
+    // macOS (ticket #224, platform epic #158 / macOS Area). macOS is POSIX and
+    // links like Linux (it takes the `else` arm below, NOT the Windows arm), with
+    // one difference: the C++ runtime providing the Itanium EH glue the runtime
+    // uses (__gxx_personality_v0 / __cxa_* / _Unwind_*) is **libc++** (`-lc++`),
+    // not libstdc++ — modern macOS SDKs (and all Apple-Silicon ones) ship no
+    // `libstdc++.dylib`, but libc++abi exposes those exact Itanium symbols. See
+    // design/0029-macos.md.
+    let is_macos = triple_str.contains("apple") || triple_str.contains("darwin");
 
     // Linker driver. `cc` by default (the MinGW-w64 `gcc`/`cc` on a Windows host
     // provides the `x86_64-pc-windows-gnu` target); override with `$ZAP_CC`
@@ -202,7 +211,10 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     // link lines — the dev container / CI provide the `-dev` packages on Linux,
     // and the MinGW-w64 `mingw-w64-x86_64-{pcre2,zlib,openssl}` packages provide
     // the import libraries with the same `-l` names on Windows (MSYS2).
-    cmd.arg("-lstdc++")
+    // The C++ runtime for the Itanium EH glue: libc++ on macOS (`-lc++`),
+    // libstdc++ everywhere else (`-lstdc++` — Linux system libstdc++, MinGW-w64's
+    // on Windows). Both expose __gxx_personality_v0 / __cxa_* / _Unwind_*.
+    cmd.arg(if is_macos { "-lc++" } else { "-lstdc++" })
         // `-lm` provides libm `pow`/`floor`, used by the scalar `**` and `//`
         // runtime helpers (ticket #19).
         .arg("-lm")

@@ -222,7 +222,9 @@ fn build_runtime_dylib() -> Result<(PathBuf, PathBuf), String> {
     cmd.arg("-DZAP_GC_IMMIX");
     #[cfg(not(feature = "gc-immix"))]
     cmd.arg("-lgc");
-    cmd.arg("-lstdc++")
+    // libc++ on macOS, libstdc++ elsewhere — the Itanium EH glue the runtime uses
+    // lives in libc++abi on macOS (ticket #224; mirrors build_executable).
+    cmd.arg(if is_macos { "-lc++" } else { "-lstdc++" })
         .arg("-lm")
         .arg("-lpcre2-8")
         .arg("-lz")

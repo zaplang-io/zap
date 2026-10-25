@@ -223,6 +223,168 @@ jobs:
       - name: "Test (fallback: Boehm GC)"
         run: cargo test --workspace --features zapc/gc-boehm
 
+  # macOS (ticket #224, platform epic #158 / macOS Area). REQUIRED. The macOS
+  # milestone: the C runtime (`zaprt.c`) compiles and LINKS on macOS and a Zap
+  # *program* runs, with the netpoller on the new kqueue backend. macOS is POSIX +
+  # the Itanium C++ ABI, so it reuses the Linux POSIX paths (NOT the Windows seams)
+  # — the whole full+golden suite runs here under BOTH collectors, like `full`.
+  #
+  # Arch = x86_64 on `macos-13` (Intel), DELIBERATELY (design/0029, D-0076): the
+  # macos-latest runners are arm64 (Apple Silicon), and I#223 is a parked
+  # aarch64-ONLY weak-memory bug in the precise-Immix multicore path — its finding
+  # proves x86_64 is clean (0/120 at MAXPROCS 4/8/16) while arm64 fails ~97%. Intel
+  # shares Linux's memory model, so this gate is green and genuinely exercises the
+  # multicore GC. The arm64 macOS job below stays best-effort (MAXPROCS=1) until
+  # I#223 lands, so #223 does NOT block landing macOS support.
+  macos:
+    name: "macOS (x86_64 + codegen)"
+    runs-on: macos-13
+    env:
+      # llvm-sys / inkwell (llvm18-0) find LLVM 18 via Homebrew's keg.
+      LLVM_SYS_180_PREFIX: /usr/local/opt/llvm@18
+      LLVM_SYS_181_PREFIX: /usr/local/opt/llvm@18
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail loudly if the runner ever silently resolves to arm64 (which would turn
+      # this required job into an I#223-affected flake factory).
+      - name: Assert x86_64 host
+        run: test "$(uname -m)" = x86_64
+
+      # The link-time runtime deps build_executable's POSIX arm needs
+      # (`-lpcre2-8 -lz -lssl -lcrypto -lc++` + CPython embed via pkg-config), the
+      # Boehm collector (`-lgc`, for the gc-boehm suite), and LLVM 18 for codegen.
+      # zlib + libc++ ship with the SDK; the rest come from Homebrew.
+      - name: Install LLVM 18 and runtime libraries (Homebrew)
+        run: |
+          brew install llvm@18 pcre2 openssl@3 bdw-gc pkg-config python@3.12
+
+      # Export the Homebrew prefixes so `cc` (the linker driver) and `pkg-config`
+      # find the keg-only libraries regardless of the Intel/arm prefix. openssl is
+      # keg-only, so its pkgconfig + lib/include dirs are added explicitly.
+      - name: Configure Homebrew library/include/pkg-config paths
+        run: |
+          set -eux
+          BREW="$(brew --prefix)"
+          OPENSSL="$(brew --prefix openssl@3)"
+          GC="$(brew --prefix bdw-gc)"
+          PY="$(brew --prefix python@3.12)"
+          echo "LIBRARY_PATH=${BREW}/lib:${OPENSSL}/lib:${GC}/lib" >> "$GITHUB_ENV"
+          echo "CPATH=${BREW}/include:${OPENSSL}/include:${GC}/include" >> "$GITHUB_ENV"
+          # openssl is keg-only; python@3.12 ships python3-embed.pc in its keg.
+          echo "PKG_CONFIG_PATH=${OPENSSL}/lib/pkgconfig:${PY}/lib/pkgconfig:${BREW}/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+
+      # Fast, LLVM-free pre-check: the standalone kqueue netpoller harness
+      # (`zap_np_kqueue_test.c`) links the REAL runtime (`zaprt.c`) and drives the
+      # in-runtime park/wake + deadline self-test through the kqueue backend + the
+      # ucontext context switch, under BOTH collectors — the on-macOS analogue of
+      # the Windows A2 harness. Fails fast before the full suite if the backend or
+      # the ctx-switch seam regresses.
+      - name: "kqueue netpoller harness (immix + boehm)"
+        run: |
+          set -eux
+          cd crates/codegen/src
+          PYFLAGS="$(pkg-config --cflags --libs python3-embed)"
+          cc -std=c11 -DZAP_GC_IMMIX zap_np_kqueue_test.c zaprt.c -o /tmp/kqnp_immix \
+            $PYFLAGS -lc++ -lm -lpcre2-8 -lz -lssl -lcrypto -lpthread
+          /tmp/kqnp_immix
+          cc -std=c11 zap_np_kqueue_test.c zaprt.c -o /tmp/kqnp_boehm \
+            $PYFLAGS -lc++ -lm -lpcre2-8 -lz -lssl -lcrypto -lpthread -lgc
+          /tmp/kqnp_boehm
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: "Clippy (default: precise Immix GC)"
+        run: cargo clippy --workspace --features zapc/gc-immix --all-targets -- -D warnings
+
+      - name: "Clippy (fallback: Boehm GC)"
+        run: cargo clippy --workspace --features zapc/gc-boehm --all-targets -- -D warnings
+
+      - name: "Test (default: precise Immix GC)"
+        run: cargo test --workspace --features zapc/gc-immix
+
+      - name: "Test (fallback: Boehm GC)"
+        run: cargo test --workspace --features zapc/gc-boehm
+
+  # macOS on Apple Silicon (ticket #224). BEST-EFFORT (`continue-on-error: true`)
+  # until I#223 (the aarch64 multicore-GC weak-memory bug) lands: the suite runs
+  # with `MAXPROCS=1` so the known-good single-worker path is exercised on arm64
+  # macOS — proving codegen, the ucontext switch, the kqueue netpoller and signals
+  # work on Apple Silicon — while the #223 multicore race is quarantined (a
+  # non-pinned arm64 run would be ~97% red and carry no signal). It surfaces any
+  # NON-#223 arm64-macOS regression without gating the merge; promoting it to
+  # required (multi-worker) is the follow-up that lands with the I#223 fix.
+  macos-arm64:
+    name: "macOS (arm64, best-effort / MAXPROCS=1)"
+    runs-on: macos-14
+    continue-on-error: true
+    env:
+      LLVM_SYS_180_PREFIX: /opt/homebrew/opt/llvm@18
+      LLVM_SYS_181_PREFIX: /opt/homebrew/opt/llvm@18
+      # Single worker M: avoids the parked I#223 multicore precise-Immix race while
+      # still exercising the full codegen/runtime path on Apple Silicon.
+      MAXPROCS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert arm64 host
+        run: test "$(uname -m)" = arm64
+
+      - name: Install LLVM 18 and runtime libraries (Homebrew)
+        run: |
+          brew install llvm@18 pcre2 openssl@3 bdw-gc pkg-config python@3.12
+
+      - name: Configure Homebrew library/include/pkg-config paths
+        run: |
+          set -eux
+          BREW="$(brew --prefix)"
+          OPENSSL="$(brew --prefix openssl@3)"
+          GC="$(brew --prefix bdw-gc)"
+          PY="$(brew --prefix python@3.12)"
+          echo "LIBRARY_PATH=${BREW}/lib:${OPENSSL}/lib:${GC}/lib" >> "$GITHUB_ENV"
+          echo "CPATH=${BREW}/include:${OPENSSL}/include:${GC}/include" >> "$GITHUB_ENV"
+          # openssl is keg-only; python@3.12 ships python3-embed.pc in its keg.
+          echo "PKG_CONFIG_PATH=${OPENSSL}/lib/pkgconfig:${PY}/lib/pkgconfig:${BREW}/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-arm64
+
+      - name: "kqueue netpoller harness (immix + boehm)"
+        run: |
+          set -eux
+          cd crates/codegen/src
+          PYFLAGS="$(pkg-config --cflags --libs python3-embed)"
+          cc -std=c11 -DZAP_GC_IMMIX zap_np_kqueue_test.c zaprt.c -o /tmp/kqnp_immix \
+            $PYFLAGS -lc++ -lm -lpcre2-8 -lz -lssl -lcrypto -lpthread
+          /tmp/kqnp_immix
+          cc -std=c11 zap_np_kqueue_test.c zaprt.c -o /tmp/kqnp_boehm \
+            $PYFLAGS -lc++ -lm -lpcre2-8 -lz -lssl -lcrypto -lpthread -lgc
+          /tmp/kqnp_boehm
+
+      - name: "Test (default: precise Immix GC, MAXPROCS=1)"
+        run: cargo test --workspace --features zapc/gc-immix
+
+      - name: "Test (fallback: Boehm GC, MAXPROCS=1)"
+        run: cargo test --workspace --features zapc/gc-boehm
+
   # Windows coroutine context switch (ticket #195, platform epic #158 / Area A1).
   # REQUIRED (no `continue-on-error`): unlike the broader `windows` job below —
   # which stays non-blocking because a full Zap *program* cannot link on Windows
