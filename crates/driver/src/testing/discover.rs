@@ -40,6 +40,29 @@ pub fn discover(explicit: Option<&str>) -> Vec<PathBuf> {
     files
 }
 
+/// Resolve the `.zap` files for a `zap test --doc` run (#234). Doctests live in
+/// the docstrings of *ordinary* source, not just `*_test.zap`, so this collects
+/// **every** `.zap` file under the target (a single file is used directly; a
+/// directory, or no path at all, is walked recursively), skipping build/VCS
+/// directories.
+pub fn discover_all(explicit: Option<&str>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let root = match explicit {
+        Some(p) => {
+            let path = Path::new(p);
+            if !path.is_dir() {
+                return vec![path.to_path_buf()];
+            }
+            path.to_path_buf()
+        }
+        None => PathBuf::from("."),
+    };
+    collect_zap(&root, &mut files);
+    files.sort();
+    files.dedup();
+    files
+}
+
 /// Is `name` a candidate test file by name (`*_test.zap`)?
 fn is_test_named(name: &str) -> bool {
     name.ends_with("_test.zap")

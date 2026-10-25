@@ -71,10 +71,15 @@ pub enum Command {
     /// (issue #69, D-0052).
     Zenv(ZenvCmd),
     /// `zap test [file] [--json] [--watch]` — run the `@test` suite (D-0054).
+    /// With `--doc`, instead run the docstring examples (doctests, #234, D-0074)
+    /// under the path: every ```` ```zap ```` block in a docstring is executed
+    /// through the REPL engine and checked against its `# =>`/`# error:`/
+    /// `# raises:` expectations. `--doc` needs codegen (like `zap run`).
     Test {
         file: Option<String>,
         json: bool,
         watch: bool,
+        doc: bool,
     },
     /// `zap mcp [--root <dir>]` — the agent MCP server (D-0055, issue #72).
     /// Serves over stdio. `root` is the codebase root for the code-graph and
@@ -178,10 +183,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             let mut file = None;
             let mut json = false;
             let mut watch = false;
+            let mut doc = false;
             for a in rest {
                 match a.as_str() {
                     "--json" => json = true,
                     "--watch" => watch = true,
+                    "--doc" => doc = true,
                     flag if flag.starts_with('-') => {
                         return Err(format!("unknown flag `{flag}`"));
                     }
@@ -193,7 +200,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                     }
                 }
             }
-            Ok(Command::Test { file, json, watch })
+            if doc && watch {
+                return Err("`zap test --doc` does not support `--watch` yet".to_string());
+            }
+            Ok(Command::Test {
+                file,
+                json,
+                watch,
+                doc,
+            })
         }
         "mcp" => parse_mcp(rest),
         "repl" => parse_repl(rest),
@@ -695,7 +710,12 @@ pub fn execute(cmd: Command) -> ExitCode {
         Command::Add { name, source } => cmd_add(&name, source),
         Command::Remove { name } => cmd_remove(&name),
         Command::Zenv(sub) => cmd_zenv(sub),
-        Command::Test { file, json, watch } => cmd_test(file, json, watch),
+        Command::Test {
+            file,
+            json,
+            watch,
+            doc,
+        } => cmd_test(file, json, watch, doc),
         Command::Mcp { root } => crate::mcp::serve(root),
         Command::Repl => crate::repl::serve(),
         Command::Lsp => crate::lsp::serve(),
@@ -851,13 +871,16 @@ fn main_template(project: &str) -> String {
 
 /// `zap test [file] [--json] [--watch]` — run the `@test` suite (D-0054).
 #[cfg(feature = "codegen")]
-fn cmd_test(file: Option<String>, json: bool, watch: bool) -> ExitCode {
+fn cmd_test(file: Option<String>, json: bool, watch: bool, doc: bool) -> ExitCode {
+    if doc {
+        return crate::testing::doctest::run(file, json);
+    }
     crate::testing::run(file, json, watch)
 }
 
 /// Without a backend the runner cannot compile and execute tests.
 #[cfg(not(feature = "codegen"))]
-fn cmd_test(_file: Option<String>, _json: bool, _watch: bool) -> ExitCode {
+fn cmd_test(_file: Option<String>, _json: bool, _watch: bool, _doc: bool) -> ExitCode {
     eprintln!("zap test: running tests needs codegen, which this build lacks");
     eprintln!("(rebuild with --features zapc/llvm, which requires an LLVM toolchain)");
     ExitCode::from(1)
@@ -1108,6 +1131,9 @@ test:
   test [file]           run the @test suite (D-0054); a file, or the project
        --json           emit structured results (for `zap mcp`, issue #72)
        --watch          re-run on change, targeting affected files
+       --doc            instead run docstring examples (doctests, #234): every
+                        ```zap block in a docstring is executed and checked
+                        against its # => / # error: / # raises: expectations
 
 agent interface:
   mcp [--root dir]      start the MCP server for coding agents (D-0055): serves
@@ -1267,7 +1293,8 @@ mod tests {
             Command::Test {
                 file: None,
                 json: false,
-                watch: false
+                watch: false,
+                doc: false
             }
         );
         assert_eq!(
@@ -1275,7 +1302,8 @@ mod tests {
             Command::Test {
                 file: None,
                 json: false,
-                watch: true
+                watch: true,
+                doc: false
             }
         );
         assert_eq!(
@@ -1283,9 +1311,21 @@ mod tests {
             Command::Test {
                 file: Some("math_test.zap".into()),
                 json: true,
-                watch: false
+                watch: false,
+                doc: false
             }
         );
+        assert_eq!(
+            p(&["test", "--doc", "src"]).unwrap(),
+            Command::Test {
+                file: Some("src".into()),
+                json: false,
+                watch: false,
+                doc: true
+            }
+        );
+        // Doctests don't support `--watch` yet.
+        assert!(p(&["test", "--doc", "--watch"]).is_err());
         assert!(p(&["test", "--nope"]).is_err());
     }
 

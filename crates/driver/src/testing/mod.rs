@@ -13,6 +13,10 @@
 //!   report, with `--json` and `--watch`.
 
 pub mod discover;
+/// Doctests: runnable examples extracted from docstrings (`zap test --doc`,
+/// issue #234). The extraction + matching is host-safe; the runner needs the
+/// REPL `Session`, so it is codegen-gated inside the module.
+pub mod doctest;
 pub mod harness;
 pub mod report;
 

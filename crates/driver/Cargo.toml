@@ -41,13 +41,16 @@ zapc_pkg = { path = "../pkg" }
 # `gc-boehm` feature select the conservative collector; `llvm`/`gc-immix`
 # re-enable the precise Immix default (ticket #116).
 zapc_codegen = { path = "../codegen", optional = true, default-features = false }
+# Doctests (#234) redirect the process stdout fd around each JIT'd snippet to
+# capture what it prints; only needed on the codegen-gated doctest path.
+libc = { version = "0.2.169", optional = true }
 
 [features]
 # Internal: link the LLVM codegen backend. Both collector choices enable it, so
 # the driver keys its codegen paths on this (a plain `--features zapc/llvm`
 # build gets the default Immix collector; `gc-boehm` gets Boehm). The toolchain
 # still builds without LLVM when none of these are enabled.
-codegen = ["dep:zapc_codegen"]
+codegen = ["dep:zapc_codegen", "dep:libc"]
 # LLVM codegen with the default collector — the precise Immix GC (ticket #116,
 # D-0009). This is the default build; `--features zapc/llvm` now links Immix.
 llvm = ["codegen", "zapc_codegen/gc-immix"]
