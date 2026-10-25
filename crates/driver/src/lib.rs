@@ -19,6 +19,7 @@ pub mod cli;
 pub mod json;
 pub mod lsp;
 pub mod mcp;
+pub mod playground;
 pub mod repl;
 pub mod testing;
 

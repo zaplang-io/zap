@@ -92,6 +92,16 @@ pub enum Command {
     /// over a `Content-Length`-framed JSON-RPC stdio transport: live
     /// diagnostics on open/change/save. No options in #229.
     Lsp,
+    /// `zap playground [--host H] [--port N] [--open]` — a local web playground
+    /// (I#157/E1, issue #238). Serves an editor page and a `POST /run` endpoint
+    /// that executes a snippet server-side through the REPL `Session` engine, in
+    /// an isolated worker process per request (see design/0026-playground.md).
+    /// Binds `127.0.0.1` by default; needs codegen (like `zap run`).
+    Playground { host: String, port: u16, open: bool },
+    /// `zap playground-worker` — the hidden per-request worker the playground
+    /// spawns: it reads one snippet from stdin, runs it through a fresh
+    /// `Session`, and prints a JSON result. Not for direct use.
+    PlaygroundWorker,
     /// `zap inspect <pid> [--gc | --profile [--seconds N]]` — signal a running
     /// Zap process to dump diagnostics (ticket #77/#78, D-0058), so operators
     /// need not hand-run `kill`. Default: SIGQUIT (coroutine stacks +
@@ -213,6 +223,8 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         "mcp" => parse_mcp(rest),
         "repl" => parse_repl(rest),
         "lsp" => parse_lsp(rest),
+        "playground" => parse_playground(rest),
+        "playground-worker" => parse_playground_worker(rest),
         "inspect" => parse_inspect(rest),
         "explain" => match first_positional(rest) {
             Some(code) => Ok(Command::Explain { code }),
@@ -306,6 +318,43 @@ fn parse_lsp(args: &[String]) -> Result<Command, String> {
         }
     }
     Ok(Command::Lsp)
+}
+
+/// Parse `playground [--host H] [--port N] [--open]` (I#238). Defaults to
+/// `127.0.0.1:8238`, loopback only; a non-loopback host is accepted but the
+/// server warns (it runs untrusted code).
+fn parse_playground(args: &[String]) -> Result<Command, String> {
+    let mut host = "127.0.0.1".to_string();
+    let mut port: u16 = 8238;
+    let mut open = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                host = args.get(i).ok_or("`--host` needs a value")?.clone();
+            }
+            "--port" => {
+                i += 1;
+                let v = args.get(i).ok_or("`--port` needs a value")?;
+                port = v.parse().map_err(|_| format!("invalid port `{v}`"))?;
+            }
+            "--open" => open = true,
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+        i += 1;
+    }
+    Ok(Command::Playground { host, port, open })
+}
+
+/// Parse `playground-worker` (hidden). Takes no arguments; it is driven by the
+/// playground server over stdin/stdout.
+fn parse_playground_worker(args: &[String]) -> Result<Command, String> {
+    if let Some(a) = args.first() {
+        return Err(format!("unexpected argument `{a}`"));
+    }
+    Ok(Command::PlaygroundWorker)
 }
 
 /// Parse `zap doc [--format html|md|json] [--out <dir>] [--private] <file>`
@@ -719,6 +768,8 @@ pub fn execute(cmd: Command) -> ExitCode {
         Command::Mcp { root } => crate::mcp::serve(root),
         Command::Repl => crate::repl::serve(),
         Command::Lsp => crate::lsp::serve(),
+        Command::Playground { host, port, open } => crate::playground::serve(host, port, open),
+        Command::PlaygroundWorker => crate::playground::worker_main(),
         Command::Inspect {
             pid,
             gc,
@@ -1145,6 +1196,10 @@ editor integration:
                         diagnostics over a JSON-RPC stdio transport, for editors
   repl                  start the interactive REPL (I#159): JIT-executes each
                         entry, persisting session bindings across entries
+  playground            start the local web playground (I#238): an editor page
+       [--host H]        and POST /run that executes a snippet server-side in an
+       [--port N]        isolated worker process (default 127.0.0.1:8238);
+       [--open]          --open launches a browser. Needs codegen.
 
 diagnostics:
   inspect <pid>         signal a running Zap process to dump coroutine stacks +
@@ -1364,6 +1419,32 @@ mod tests {
         assert_eq!(p(&["lsp", "--stdio"]).unwrap(), Command::Lsp);
         assert!(p(&["lsp", "--socket"]).is_err());
         assert!(p(&["lsp", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn playground_parses_defaults_and_flags() {
+        assert_eq!(
+            p(&["playground"]).unwrap(),
+            Command::Playground {
+                host: "127.0.0.1".to_string(),
+                port: 8238,
+                open: false,
+            }
+        );
+        assert_eq!(
+            p(&["playground", "--host", "0.0.0.0", "--port", "9000", "--open"]).unwrap(),
+            Command::Playground {
+                host: "0.0.0.0".to_string(),
+                port: 9000,
+                open: true,
+            }
+        );
+        assert!(p(&["playground", "--port", "nope"]).is_err());
+        assert!(p(&["playground", "--bogus"]).is_err());
+        assert!(p(&["playground", "extra"]).is_err());
+        // The hidden worker verb takes no arguments.
+        assert_eq!(p(&["playground-worker"]).unwrap(), Command::PlaygroundWorker);
+        assert!(p(&["playground-worker", "x"]).is_err());
     }
 
     #[test]

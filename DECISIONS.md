@@ -1765,3 +1765,53 @@ non-zero on any failure.
   `fflush`, restore) rather than changing the shared engine or the REPL loop. New
   dep: `libc` on the driver (codegen-gated). No grammar change — example syntax is
   docstring *content*, not Zap grammar.
+
+## D-0075 — Web playground over the shared `Session` engine (`zap playground`, I#238)
+
+**Status:** Accepted. Issue #238, epic I#157 (`design/0021-tooling.md`, Area E);
+builds on the REPL `Session` engine (#159, [[D-0073]]) and shares its single
+executor with doctests ([[D-0074]]). See `design/0026-playground.md`.
+
+A *playground* is a local web UI — a code editor and a **Run** button — that
+compiles and runs a Zap snippet and shows its stdout, auto-printed value, and
+`ZAPnnnn` diagnostics. `zap playground [--host H] [--port N] [--open]` serves it;
+it is codegen-gated like `zap run`/`zap repl`.
+
+- **Server-side native execution, not WASM.** The WASM target is post-1.0
+  (B-track, deferred), so a snippet cannot run in the browser. It runs
+  server-side through the same REPL `Session` (`Session::eval` → `EvalOutcome`),
+  so a snippet behaves exactly as it will when compiled — **one semantics**, no
+  second executor. Rendering of stdout/value/diagnostics is therefore identical
+  to `zap repl`/doctests.
+- **The server runs untrusted native code, so the sandbox is the design.** Each
+  `POST /run` executes in **its own short-lived worker process**
+  (`zap playground-worker`), never a shared in-process `Session`: the engine is
+  in-process MCJIT with a process-global GC/scheduler and hard faults abort the
+  process, so a shared session would leak state across requests and a single
+  segfault would take the server down. One process per request gives isolation
+  (no shared heap/GC/scheduler) and crash containment (a segfault/abort kills
+  only the worker; the parent reports `crashed` and stays up) by construction.
+- **What the first cut enforces.** In the worker: `RLIMIT_CPU`, `RLIMIT_AS`,
+  `RLIMIT_FSIZE`, `RLIMIT_CORE=0`, and an `alarm` armed *after* startup so the
+  per-snippet time budget does not include compiling the runtime / JIT init. In
+  the parent: a wall-clock backstop (snippet budget + startup grace), an output
+  byte cap (truncate runaway prints), a cap on concurrent workers (HTTP 429 on
+  excess), and process-group kill on timeout. Terminating signals map to stable
+  statuses (`timeout`/`output_limit`/`crashed`). Binds `127.0.0.1` by default; a
+  non-loopback bind warns.
+- **What it defers (deployment hardening).** True filesystem/network/syscall
+  **denial** needs an OS sandbox (seccomp / namespaces / a container), which is
+  platform-specific and depends on the deployment target; it is a **gating
+  follow-up before any exposure beyond loopback**. The residual risk (a dev-host
+  worker can still read the filesystem / reach the network) is accepted only
+  because the deliverable is a not-yet-deployed, loopback-only local server.
+- **Minimal surface, no new crates.** A hand-written `std::net` HTTP/1.1 server
+  (four routes) over the in-house `json` codec — no web framework — mirroring the
+  LSP/MCP decision to take no transport dependency; the sandbox uses `libc`
+  (already a codegen-gated driver dep) for `setrlimit`/`alarm`/`setpgid`/`kill`;
+  the editor is one embedded HTML page with vanilla JS (no bundler/framework).
+  Share links are stateless — the snippet is encoded in the URL fragment
+  (`#code=`), so nothing is stored server-side. No grammar change (a tool, not
+  language). Deferred follow-ups: OS-sandbox hardening, incremental output
+  streaming (SSE over the worker pipe), a cached precompiled-runtime image for
+  faster per-request startup, and a server-side share/paste store.

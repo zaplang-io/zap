@@ -146,6 +146,7 @@ zap expand [file]     show decorator/@derive-generated code (D-0036)
 zap fmt [paths]       rewrite source in the canonical style (D-0037)
 zap doc <file>        render API docs — HTML site, Markdown, or JSON model
 zap test [--doc]      run the @test suite, or docstring examples with --doc (#234)
+zap playground        local web playground: editor + sandboxed server-side run (#238)
 zap new <name>        scaffold a new project (writes zap.toml)
 zap init              scaffold zap.toml in the current directory
 zap version | help
@@ -171,6 +172,19 @@ the REPL engine (identical semantics to compiled code) and checked against its
 for a runtime exception, `# error: ZAPnnnn` for an expected compile error (no
 directive = must run clean). Examples are self-contained (run in a fresh
 session); doctests reuse the `zap test` report and exit non-zero on any failure.
+
+`zap playground` (issue #238, D-0075) starts a local web UI — an editor and a
+**Run** button — that compiles and runs a snippet server-side through the same
+REPL `Session` engine and shows its stdout, auto-printed value, and `ZAPnnnn`
+diagnostics. Because WASM is post-1.0, snippets cannot run in the browser, so the
+server executes untrusted native code: **each request runs in its own short-lived
+worker process** under resource limits (CPU, memory, file size, no core) with the
+parent enforcing a per-snippet time budget, an output cap, and a concurrency cap.
+A crashing snippet kills only its worker; the server stays up, and no two requests
+share state. It binds `127.0.0.1` by default and is codegen-gated like `zap run`;
+true filesystem/network denial (an OS sandbox) is deployment hardening required
+before any public exposure. Share links are stateless (the snippet is encoded in
+the URL fragment). See `design/0026-playground.md`.
 
 `zap run`/`zap build` need codegen, so they run under the LLVM path:
 

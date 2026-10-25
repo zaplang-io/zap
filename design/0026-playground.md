@@ -2,7 +2,7 @@
 
 - **Author(s):** Playground lane (I#238)
 - **Last updated:** 2026-10-25
-- **Status:** Draft — design-first; stops for review before the run/sandbox path is built
+- **Status:** Accepted — first cut implemented (D-0075)
 - **Discussion:** I#238 (tooling epic I#157, Area E); engine I#159 (REPL), sibling I#234 (doctests)
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
@@ -374,3 +374,46 @@ CI triggers (pull_request AND push) green at run level before reporting. PR
   when wanted.
 - **Server-side share links / paste store** — deferred; `#code=` covers sharing
   without storage for now.
+
+## Implementation (landed, first cut)
+
+Approved model built as described; one refinement during implementation.
+
+- **Module** `crates/driver/src/playground/` (codegen-gated, like `zap repl`):
+  - `server.rs` — a `std::net` HTTP/1.1 server (thread-per-connection,
+    loopback-default): `GET /`, `GET /static/{app.js,style.css}`, `POST /run`,
+    `GET /healthz`; a counting semaphore sheds load past `max_concurrent` with
+    HTTP 429; bodies use the in-house `json`. `serve_on(listener, config)` is
+    exposed so tests drive the full surface on an ephemeral port.
+  - `sandbox.rs` — `handle_run(code, config)` spawns one worker per request
+    (its own process group via `pre_exec` `setpgid`), feeds the snippet on
+    stdin, drains stdout capped on a thread, waits with a deadline
+    (`mpsc::recv_timeout`), kills the group on expiry, and maps the exit /
+    terminating signal to a `Status` (`ok`/`error`/`runtime_error`/`timeout`/
+    `output_limit`/`crashed`/`internal`).
+  - `worker.rs` — `zap playground-worker`: reads the snippet, lowers its own
+    `RLIMIT_CPU`/`RLIMIT_AS`/`RLIMIT_FSIZE`/`RLIMIT_CORE`, runs one `Session`
+    with fd-1 capture (a local copy of the doctest helper, so #159/#234 are
+    untouched), truncates to the output cap, and prints one JSON result.
+  - `assets/` — one embedded HTML page + vanilla `app.js` (Ctrl-Enter to run,
+    stateless `#code=` share links) + `style.css` (light/dark).
+- **Refinement vs the sketch — per-snippet time budget via `alarm`.** The worker
+  compiles the C runtime and initializes the JIT per process, so counting that
+  startup against the wall-clock falsely timed out clean snippets under parallel
+  load. The worker now arms `alarm(budget)` *after* startup, right before
+  `eval`, so the budget bounds user code only; the parent wall-clock became a
+  generous backstop (budget + startup grace) for a worker that never starts.
+  `SIGALRM`/`SIGXCPU` → `timeout`, `SIGXFSZ` → `output_limit`, other fatal
+  signals → `crashed`.
+- **`EvalOutcome` left unchanged.** Worker-local fd-1 capture was used rather
+  than adding a `stdout`/`value` field to the shared engine, keeping the fresh
+  #159 contract untouched (the engine-field refinement remains the cleaner end
+  state and a small follow-up).
+- **CLI**: `zap playground [--host H] [--port N] [--open]` (default
+  `127.0.0.1:8238`) + the hidden `zap playground-worker`.
+- **Deps added: none** beyond `libc` (already a codegen-gated driver dep).
+- **Tests** (`crates/driver/tests/playground.rs`, codegen-gated, both
+  collectors): clean snippet, auto-print, `ZAPnnnn` type error, runtime `raise`,
+  infinite-loop timeout + server survival, runaway-output cap + survival, two
+  concurrent requests proving no shared state, and the HTTP surface
+  (`GET /`, `POST /run`, 404). The compile path and all goldens are unchanged.
