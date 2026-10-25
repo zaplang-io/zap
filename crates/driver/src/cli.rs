@@ -1432,7 +1432,15 @@ mod tests {
             }
         );
         assert_eq!(
-            p(&["playground", "--host", "0.0.0.0", "--port", "9000", "--open"]).unwrap(),
+            p(&[
+                "playground",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "9000",
+                "--open"
+            ])
+            .unwrap(),
             Command::Playground {
                 host: "0.0.0.0".to_string(),
                 port: 9000,
@@ -1443,7 +1451,10 @@ mod tests {
         assert!(p(&["playground", "--bogus"]).is_err());
         assert!(p(&["playground", "extra"]).is_err());
         // The hidden worker verb takes no arguments.
-        assert_eq!(p(&["playground-worker"]).unwrap(), Command::PlaygroundWorker);
+        assert_eq!(
+            p(&["playground-worker"]).unwrap(),
+            Command::PlaygroundWorker
+        );
         assert!(p(&["playground-worker", "x"]).is_err());
     }
 
