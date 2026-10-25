@@ -484,6 +484,37 @@ define_codes! {
     ZAP6001 = 6001 : "lowering error",
         "The front-end accepted the program but it could not be lowered to IR. \
          The message gives the specific reason.";
+
+    // ---- ZAP6xxx — package registry (Experimental, D-0070 §4; I#236) -------
+    // The registry client is a host-side (back-end-category) tool surface; its
+    // conditions carry stable codes so an agent can map a failure to a fix
+    // without parsing prose (D-0071). Codes name conditions; severity is on the
+    // diagnostic (e.g. ZAP6102 is a warning).
+    ZAP6100 = 6100 : "package checksum mismatch",
+        "A downloaded registry package's content hash does not match the \
+         `zap1:` checksum pinned in the index or the lockfile. The package was \
+         discarded; the bytes have been tampered with or corrupted, or the \
+         lockfile pins a different version's content.";
+    ZAP6101 = 6101 : "package archive digest mismatch",
+        "A downloaded registry archive's byte digest does not match the one the \
+         index records. This is the cheap pre-unpack transfer check; re-fetch \
+         the archive, which may have been truncated or corrupted in transit.";
+    ZAP6102 = 6102 : "yanked version selected",
+        "Resolution selected a version that has been yanked from the registry. \
+         A yanked version still builds for an existing lock, but a fresh \
+         resolve should raise the requirement's minimum to an unyanked version.";
+    ZAP6103 = 6103 : "toolchain too old for package",
+        "A registry package declares a `min_zap` toolchain version newer than \
+         the one in use. Upgrade the Zap toolchain, or pin an earlier version \
+         of the package whose `min_zap` this toolchain satisfies.";
+    ZAP6104 = 6104 : "registry package name conflict",
+        "A registry package name is invalid, reserved, or normalizes to the \
+         same identity as another dependency (names fold case and `-`/`_`, so \
+         `json-lib` and `json_lib` are the same). Rename or deduplicate it.";
+    ZAP6105 = 6105 : "malformed or unreachable registry index",
+        "A registry's `config.json` or a package index file could not be \
+         fetched or parsed, or a requested version is absent from the index. \
+         Check the index base URL and network access.";
 }
 
 #[cfg(test)]

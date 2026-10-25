@@ -645,11 +645,17 @@ fn collect_zap_files(path: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// Parse `zap add <name> (--git <url> --version <v> | --path <dir>)`.
+/// Parse `zap add <name>` with a `--git`/`--path`/`--registry` source.
+///
+/// `zap add json --registry jsonlib --version 1.4.0 [--index <id>]` adds a
+/// registry dependency (D-0027 §3.1); `--version` is optional for a registry
+/// source (it is a minimum).
 fn parse_add(args: &[String]) -> Result<Command, String> {
     let mut name: Option<String> = None;
     let mut git: Option<String> = None;
     let mut path: Option<String> = None;
+    let mut registry: Option<String> = None;
+    let mut index: Option<String> = None;
     let mut version: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -665,6 +671,14 @@ fn parse_add(args: &[String]) -> Result<Command, String> {
             }
             "--path" => {
                 path = Some(take(i, "--path")?);
+                i += 2;
+            }
+            "--registry" => {
+                registry = Some(take(i, "--registry")?);
+                i += 2;
+            }
+            "--index" => {
+                index = Some(take(i, "--index")?);
                 i += 2;
             }
             "--version" | "-v" => {
@@ -684,26 +698,43 @@ fn parse_add(args: &[String]) -> Result<Command, String> {
     let name = name.ok_or_else(|| {
         "`zap add` needs a dependency name: `zap add <name> --path <dir>`".to_string()
     })?;
-    match (git, path) {
-        (Some(_), Some(_)) => Err("give either `--git` or `--path`, not both".to_string()),
-        (Some(url), None) => {
-            let version = version.ok_or_else(|| {
-                "`--git` needs `--version <semver>` (the minimum version)".to_string()
-            })?;
-            Ok(Command::Add {
-                name,
-                source: Source::Git { url, version },
-            })
-        }
-        (None, Some(dir)) => Ok(Command::Add {
+    if index.is_some() && registry.is_none() {
+        return Err("`--index` is only valid with `--registry`".to_string());
+    }
+    let sources = [git.is_some(), path.is_some(), registry.is_some()];
+    if sources.iter().filter(|p| **p).count() > 1 {
+        return Err("give exactly one of `--git`, `--path`, or `--registry`".to_string());
+    }
+    if let Some(url) = git {
+        let version = version.ok_or_else(|| {
+            "`--git` needs `--version <semver>` (the minimum version)".to_string()
+        })?;
+        return Ok(Command::Add {
+            name,
+            source: Source::Git { url, version },
+        });
+    }
+    if let Some(dir) = path {
+        return Ok(Command::Add {
             name,
             source: Source::Path { dir },
-        }),
-        (None, None) => Err(
-            "`zap add <name>` needs a source: `--git <url> --version <v>` or `--path <dir>`"
-                .to_string(),
-        ),
+        });
     }
+    if let Some(reg) = registry {
+        return Ok(Command::Add {
+            name,
+            source: Source::Registry {
+                name: reg,
+                version,
+                index,
+            },
+        });
+    }
+    Err(
+        "`zap add <name>` needs a source: `--git <url> --version <v>`, `--path <dir>`, or \
+         `--registry <name> [--version <v>] [--index <id>]`"
+            .to_string(),
+    )
 }
 
 /// Parse `zap zenv [create [--no-venv] | status | path | clean]`.
@@ -940,8 +971,11 @@ fn cmd_test(_file: Option<String>, _json: bool, _watch: bool, _doc: bool) -> Exi
 /// `zap add <name> <source>` — add a dependency and re-lock (issue #69).
 fn cmd_add(name: &str, source: Source) -> ExitCode {
     match zapc_pkg::ops::add(Path::new("."), name, &source) {
-        Ok(()) => {
+        Ok(warnings) => {
             println!("added `{name}` to zap.toml and updated zap.lock");
+            for w in &warnings {
+                eprintln!("zap: {w}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1082,14 +1116,17 @@ fn cmd_zenv(sub: ZenvCmd) -> ExitCode {
             Ok(report) => {
                 println!("created {}", report.zenv_dir.display());
                 println!(
-                    "  materialized {} module(s) into zenv/pkg",
-                    report.modules_materialized
+                    "  materialized {} path + {} registry module(s) into zenv/pkg",
+                    report.modules_materialized, report.registry_modules_materialized
                 );
                 if report.git_modules_skipped > 0 {
                     println!(
                         "  {} git module(s) recorded; run `zap zenv create` with network to fetch",
                         report.git_modules_skipped
                     );
+                }
+                for w in &report.warnings {
+                    eprintln!("zap: {w}");
                 }
                 match (report.venv_created, &report.venv_skipped_reason) {
                     (true, _) => println!("  Python venv ready at zenv/venv"),

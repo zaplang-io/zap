@@ -11,6 +11,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Stable diagnostic codes (ZAPnnnn) for registry conditions — checksum
+# mismatch, yanked selection, min_zap, name conflict (D-0071, I#236).
+zapc_diag = { path = "../diag" }
+# The in-house JSON codec for parsing the static registry index (I#236); the
+# same hand-written codec the MCP/LSP servers use, no external JSON crate.
+zapc_json = { path = "../json" }
 # Manifest/lockfile are TOML; serde gives round-trip (de)serialization. semver
 # is the canonical version implementation (already in the local cargo cache).
 # Pinned to exact versions — the workspace does not commit Cargo.lock, so pins

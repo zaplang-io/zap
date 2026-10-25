@@ -14,13 +14,18 @@
 //!
 //! The design is specified in `design/0009-packaging.md`.
 
+pub mod archive;
 pub mod checksum;
 pub mod error;
+pub mod index;
 pub mod lockfile;
 pub mod manifest;
+pub mod name;
 pub mod ops;
+pub mod registry;
 pub mod resolver;
 pub mod zenv;
 
-pub use error::{Error, Result};
-pub use manifest::{Dependency, Manifest, Package, Source};
+pub use error::{Error, Result, Warning};
+pub use manifest::{Dependency, Manifest, Package, RegistryDef, Source};
+pub use name::RegistryName;

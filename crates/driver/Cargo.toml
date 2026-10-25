@@ -24,6 +24,8 @@ path = "src/bin/zapc.rs"
 
 [dependencies]
 zapc_diag = { path = "../diag" }
+# The in-house JSON codec, shared with `zapc_pkg` (re-exported as `crate::json`).
+zapc_json = { path = "../json" }
 zapc_syntax = { path = "../syntax" }
 zapc_sema = { path = "../sema" }
 # Queryable frontend analysis (I#228) — the in-process surface the LSP server

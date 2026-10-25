@@ -1,0 +1,15 @@
+# The in-house JSON codec, shared across the toolchain (no `serde`, no external
+# JSON dependency). Originally `zapc`'s private `json` module; lifted into its
+# own leaf crate (I#236) so the lower-level `zapc_pkg` can parse registry index
+# files with the same codec the MCP/LSP servers use. Host-safe, no LLVM.
+[package]
+name = "zapc_json"
+description = "Zap's minimal in-house JSON value, parser, and serializer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zapc_json"
+path = "src/lib.rs"
