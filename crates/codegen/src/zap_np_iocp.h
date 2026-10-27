@@ -74,8 +74,9 @@ int zap_iocp_last_error(void);
 
 /* Register `sock` (a Windows `SOCKET`, carried in the netpoller ABI's `int64_t
  * fd`) for readiness polling; `userkey` is echoed back by `zap_iocp_wait`.
- * Unwraps the base socket handle via `SIO_BASE_HANDLE` (I#196 Q2: the exotic
- * layered-LSP `SIO_BSP_HANDLE_POLL` fallback is a documented follow-up, not v1).
+ * Unwraps the base socket handle via `SIO_BASE_HANDLE`, falling back to the
+ * layered-LSP `SIO_BSP_HANDLE_POLL` / `SIO_BSP_HANDLE` descent chain for non-IFS
+ * LSPs that break `SIO_BASE_HANDLE` (I#221, follow-up to I#196 Q2; mirrors wepoll).
  * Returns an opaque descriptor, or NULL on failure (un-unwrappable socket / OOM;
  * `zap_iocp_last_error` is set) — the caller reports it, never hangs. */
 void *zap_iocp_register(uint64_t sock, void *userkey);
