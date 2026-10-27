@@ -23,6 +23,7 @@ There is no CLA and no separate sign-off step.
 
 | Path | What |
 |---|---|
+| [`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md) | "Where to find what" in the code: pipeline, crate map, runtime/GC, stdlib seam, tooling, tests |
 | [`SPEC.md`](SPEC.md) | The language specification — the source of truth |
 | [`DECISIONS.md`](DECISIONS.md) | Decision log (ADR): `D-NNNN` entries, never deleted, only superseded |
 | [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) | Tracked backlog of unresolved questions |
