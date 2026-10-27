@@ -330,6 +330,7 @@ impl<'a> Printer<'a> {
                 self.take_trailing(import_span(imp).end);
             }
             Item::Stmt(s) => self.render_stmt(s),
+            Item::Cfg(c) => self.emit_cfg_item(c),
         }
     }
 
@@ -710,7 +711,70 @@ impl<'a> Printer<'a> {
                 self.take_header_trailing(body.span.start);
                 self.emit_block(body);
             }
+            Stmt::Cfg(c) => self.emit_cfg_stmt(c),
         }
+    }
+
+    /// Render a statement-position `when target.*` block (I#139, D-0079): one
+    /// `when`/`elif` line per arm plus an optional `else`, each over a statement
+    /// block. Mirrors [`Self::emit_if`].
+    fn emit_cfg_stmt(&mut self, c: &CfgStmtBlock) {
+        for (i, arm) in c.arms.iter().enumerate() {
+            let kw = if i == 0 { "when" } else { "elif" };
+            if i > 0 {
+                self.advance_to(arm.span.start, 1);
+            }
+            self.push_line(&format!("{kw} {}:", cfg_predicate_str(&arm.predicate)));
+            self.take_header_trailing(arm.body.span.start);
+            self.emit_block(&arm.body);
+        }
+        if let Some(eb) = &c.else_body {
+            if let Some(es) = c.else_span {
+                self.advance_to(es.start, 1);
+            }
+            self.push_line("else:");
+            self.take_header_trailing(eb.span.start);
+            self.emit_block(eb);
+        }
+    }
+
+    /// Render an item-position `when target.*` block (I#139, D-0079): one
+    /// `when`/`elif` line per arm plus an optional `else`, each over a block of
+    /// items (imports/declarations/bare statements).
+    fn emit_cfg_item(&mut self, c: &CfgItemBlock) {
+        for (i, arm) in c.arms.iter().enumerate() {
+            let kw = if i == 0 { "when" } else { "elif" };
+            if i > 0 {
+                self.advance_to(arm.span.start, 1);
+            }
+            self.push_line(&format!("{kw} {}:", cfg_predicate_str(&arm.predicate)));
+            let body_start = arm.body.first().map_or(arm.span.end, item_start);
+            self.take_header_trailing(body_start);
+            self.emit_item_block(&arm.body, arm.span.end);
+        }
+        if let Some(eb) = &c.else_body {
+            if let Some(es) = c.else_span {
+                self.advance_to(es.start, 1);
+            }
+            self.push_line("else:");
+            let body_start = eb.first().map_or(c.span.end, item_start);
+            self.take_header_trailing(body_start);
+            self.emit_item_block(eb, c.span.end);
+        }
+    }
+
+    /// Emit an indented block of items (the body of an item-position `when`
+    /// arm). The item counterpart of [`Self::emit_block`].
+    fn emit_item_block(&mut self, items: &[Item], end: u32) {
+        self.indent += 1;
+        self.block_fresh = true;
+        for it in items {
+            self.advance_to(item_start(it), 2);
+            self.emit_item(it);
+        }
+        self.flush_dangling(end);
+        self.indent -= 1;
+        self.block_fresh = false;
     }
 
     fn emit_if(&mut self, branches: &[(Expr, Block)], else_block: &Option<Block>) {
@@ -935,6 +999,15 @@ fn import_span(imp: &Import) -> Span {
     }
 }
 
+/// Render a `when target.*` predicate back to source (I#139, D-0079).
+fn cfg_predicate_str(p: &CfgPredicate) -> String {
+    match p {
+        CfgPredicate::Arch(a) => format!("target.arch == .{}", a.as_str()),
+        CfgPredicate::Os(o) => format!("target.os == .{}", o.as_str()),
+        CfgPredicate::HasFeature(f) => format!("target.has(.{f})"),
+    }
+}
+
 fn item_start(item: &Item) -> u32 {
     match item {
         Item::Function(f) => f.decorators.first().map_or(f.span.start, |d| d.span.start),
@@ -945,6 +1018,7 @@ fn item_start(item: &Item) -> u32 {
         Item::Decorator(d) => d.span.start,
         Item::Import(imp) => import_span(imp).start,
         Item::Stmt(s) => stmt_span(s).start,
+        Item::Cfg(c) => c.span.start,
     }
 }
 
@@ -966,7 +1040,8 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::Spawn { span, .. }
         | Stmt::Scope { span, .. }
         | Stmt::LetTuple { span, .. }
-        | Stmt::AssignTuple { span, .. } => *span,
+        | Stmt::AssignTuple { span, .. }
+        | Stmt::Cfg(CfgStmtBlock { span, .. }) => *span,
         Stmt::Expr(e) => espan(e),
         Stmt::Break(span) | Stmt::Continue(span) => *span,
     }

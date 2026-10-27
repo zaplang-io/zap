@@ -143,7 +143,11 @@ impl Index {
 }
 
 fn index_module(module: &ast::Module, file: &str, src: &str, out: &mut Vec<Symbol>) {
-    for item in &module.items {
+    index_items(&module.items, file, src, out);
+}
+
+fn index_items(items: &[Item], file: &str, src: &str, out: &mut Vec<Symbol>) {
+    for item in items {
         match item {
             Item::Function(f) => out.push(function_symbol(f, file, src)),
             Item::Struct(s) => out.push(struct_symbol(s, file, src)),
@@ -181,6 +185,16 @@ fn index_module(module: &ast::Module, file: &str, src: &str, out: &mut Vec<Symbo
             }),
             // Bare top-level statements and imports are not symbols.
             Item::Import(_) | Item::Stmt(_) => {}
+            // `when target.*` (I#139): index symbols from every arm so the code
+            // graph covers all targets, not just the one being built.
+            Item::Cfg(c) => {
+                for arm in &c.arms {
+                    index_items(&arm.body, file, src, out);
+                }
+                if let Some(eb) = &c.else_body {
+                    index_items(eb, file, src, out);
+                }
+            }
         }
     }
 }

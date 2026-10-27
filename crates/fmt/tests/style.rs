@@ -224,3 +224,29 @@ fn empty_module_is_empty() {
     assert_eq!(fmt(""), "");
     assert_eq!(fmt("\n\n\n"), "");
 }
+
+#[test]
+fn when_target_block_item_position() {
+    // `when target.*` conditional compilation (I#139, D-0079): messy spacing in
+    // the predicate normalizes; `when`/`elif`/`else` keep their own lines.
+    check(
+        "when target.arch==.x86_64:\n    def step()->int64:\n        return 1\nelif target.arch == .aarch64:\n    def step() -> int64:\n        return 2\nelse:\n    def step() -> int64:\n        return 3\n",
+        "when target.arch == .x86_64:\n    def step() -> int64:\n        return 1\nelif target.arch == .aarch64:\n    def step() -> int64:\n        return 2\nelse:\n    def step() -> int64:\n        return 3\n",
+    );
+}
+
+#[test]
+fn when_target_block_stmt_position_and_has() {
+    check(
+        "def f() -> int64:\n    when target.has(.sse4_2):\n        auto v = 1\n    else:\n        auto v = 0\n    return v\n",
+        "def f() -> int64:\n    when target.has(.sse4_2):\n        auto v = 1\n    else:\n        auto v = 0\n    return v\n",
+    );
+}
+
+#[test]
+fn when_target_os_predicate() {
+    check(
+        "when target.os==.linux:\n    def plat() -> str:\n        return \"linux\"\n",
+        "when target.os == .linux:\n    def plat() -> str:\n        return \"linux\"\n",
+    );
+}

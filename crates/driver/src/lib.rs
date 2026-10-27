@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use zapc_syntax::ast::Module;
+use zapc_syntax::cfg::Target;
 
 pub mod cli;
 // The JSON codec now lives in its own leaf crate (`zapc_json`, I#236) so the
@@ -37,10 +38,24 @@ fn read_source(file: &str) -> Result<String, ExitCode> {
     })
 }
 
-/// Run the front-end (lex → parse → type-check), printing diagnostics to
-/// stderr. Returns the parsed [`Module`] when the program is well-formed.
-fn front_end(file: &str, src: &str) -> Result<Module, ExitCode> {
-    let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+/// The build target `when target.*` conditional compilation is evaluated
+/// against (I#139, D-0079). In Phase 1 the architecture/OS come from the host
+/// the compiler runs on (Zap builds natively); compile-time features are taken
+/// from `--target-feature` flags so `target.has(.f)` is reachable without
+/// cross-compilation.
+fn build_target(features: &[String]) -> Target {
+    let mut t = Target::host();
+    t.features = features.to_vec();
+    t
+}
+
+/// Run the front end, evaluating `when target.*` against `target` (I#139).
+fn front_end_for(file: &str, src: &str, target: &Target) -> Result<Module, ExitCode> {
+    let (mut module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+    // Resolve compile-time conditional compilation *before* type-checking so
+    // dead arms are never checked against a target they were not written for
+    // (D-0079 "dead-arm skip").
+    zapc_syntax::cfg::resolve_cfg(&mut module, target);
     let mut failed = false;
     for e in &lerrs {
         eprintln!(
@@ -74,11 +89,17 @@ fn front_end(file: &str, src: &str) -> Result<Module, ExitCode> {
 /// Front-end + AST→ZIR lowering. Host-safe (no LLVM needed). Used by both
 /// `zap ir` and the `zapc ir` subcommand.
 pub fn emit_ir(file: &str) -> ExitCode {
+    emit_ir_for(file, &[])
+}
+
+/// Like [`emit_ir`], but with compile-time `--target-feature`s for `when`
+/// evaluation (I#139).
+pub fn emit_ir_for(file: &str, features: &[String]) -> ExitCode {
     let src = match read_source(file) {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let mut module = match front_end(file, &src) {
+    let mut module = match front_end_for(file, &src, &build_target(features)) {
         Ok(m) => m,
         Err(code) => return code,
     };
@@ -113,11 +134,23 @@ pub fn emit_expand(file: &str) -> ExitCode {
 /// `out` is the output path; when `None`, a default is chosen (a temp path for
 /// `run`, the file stem for `build`).
 pub fn compile(file: &str, out: Option<String>, run_after: bool) -> ExitCode {
+    compile_for(file, out, run_after, &[])
+}
+
+/// Like [`compile`], but with compile-time `--target-feature`s for `when`
+/// evaluation (I#139). Phase 1 still generates code for the host; the features
+/// only steer which `when target.has(.f)` arm is kept.
+pub fn compile_for(
+    file: &str,
+    out: Option<String>,
+    run_after: bool,
+    features: &[String],
+) -> ExitCode {
     let src = match read_source(file) {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let mut module = match front_end(file, &src) {
+    let mut module = match front_end_for(file, &src, &build_target(features)) {
         Ok(m) => m,
         Err(code) => return code,
     };

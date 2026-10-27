@@ -132,6 +132,17 @@ fn each_yield_in_stmt<'a>(st: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)) {
         Stmt::LetTuple { value, .. } | Stmt::AssignTuple { value, .. } => {
             each_yield_in_expr(value, visit)
         }
+        // A `when target.*` block is normally cfg-resolved away before generator
+        // analysis runs; if one is still present, visit every arm (a `yield`
+        // inside any arm still belongs to this function).
+        Stmt::Cfg(block) => {
+            for arm in &block.arms {
+                each_yield_in_block(&arm.body, visit);
+            }
+            if let Some(b) = &block.else_body {
+                each_yield_in_block(b, visit);
+            }
+        }
         Stmt::Break(_) | Stmt::Continue(_) => {}
     }
 }
