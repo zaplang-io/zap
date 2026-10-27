@@ -19,6 +19,7 @@ use crate::ir::*;
 
 mod argparse;
 mod bisect;
+mod concurrent;
 mod crypto;
 mod datetime;
 mod deque;
@@ -92,6 +93,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     net::MODULE,
     http::MODULE,
     tls::MODULE,
+    concurrent::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not

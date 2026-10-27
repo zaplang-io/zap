@@ -4386,6 +4386,37 @@ def main():
     }
 
     #[test]
+    fn concurrent_module_surface_type_checks() {
+        // `concurrent.Counter()`/`Counter(start)` yield the prelude `Counter`
+        // (its `add`/`incr`/`get` return int64); the MPSC `Queue[T]` is a bare
+        // prelude generic built with `new_queue[T]()`, with comma-ok `pop`
+        // (ticket #184, D-0078). Both pointer and non-pointer payloads type-check.
+        ok("import concurrent\n\n\
+            def main():\n\
+            \x20   Counter c = concurrent.Counter()\n\
+            \x20   print(c.get())\n\
+            \x20   print(c.add(2))\n\
+            \x20   print(c.incr())\n\
+            \x20   Counter c2 = concurrent.Counter(10)\n\
+            \x20   print(c2.get())\n\
+            \x20   Queue[int64] q = new_queue()\n\
+            \x20   q.push(5)\n\
+            \x20   auto v, ok = q.pop()\n\
+            \x20   if ok:\n\
+            \x20       print(v.unwrap())\n\
+            \x20   Queue[str] qs = new_queue[str]()\n\
+            \x20   qs.push(\"x\")\n");
+    }
+
+    #[test]
+    fn unknown_concurrent_function_is_an_error() {
+        assert!(
+            !errors("def main():\n    concurrent.frobnicate()\n").is_empty(),
+            "expected unknown concurrent.* function to error"
+        );
+    }
+
+    #[test]
     fn on_signal_decorator_type_checks() {
         ok("@on_signal(Signal.SIGTERM)\ndef cleanup():\n    print(1)\n\ndef main():\n    print(0)\n");
     }

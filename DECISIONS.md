@@ -1885,3 +1885,47 @@ young/fragile surfaces Experimental so they can still evolve, refuses to promise
 what CI does not continuously verify (macOS), and follows gofmt in not freezing
 exact formatter output — all one-way doors chosen deliberately and reversibly
 only in the additive direction.
+
+## D-0078 — `concurrent` lock-free collections (I#184)
+**Status:** Accepted (ratified 2026-10-27). Design: `design/0031-concurrent-collections.md`.
+Builds on D-0066 (`Atomic[T]`) and D-0008/D-0009/I#120 (precise moving Immix GC);
+governed by D-0076 (1.0 freeze) as an additive **Experimental** surface.
+
+Zap ships a small `concurrent` stdlib module of CAS-based collections built on
+`Atomic[T]`. **Phase 1** (this ticket) is exactly a lock-free **`Counter`** (over
+`Atomic[int64]`) and an unbounded **MPSC `Queue[T]`** (Vyukov: a multi-producer
+atomic tail-swap + publish, a single-consumer `pop`). The concurrent map is
+**deferred** (a later sharded-`Mutex`+`dict` ticket, not a CAS map); MPMC is a
+later additive phase.
+
+- **Reclamation: lean on the GC.** Nodes are ordinary heap structs; reclamation
+  is the tracing moving collector — **no** hazard pointers, epochs, write/read
+  barriers, or pinning, and **no new `zaprt.c`/`zapgc`/runtime-C code**. This is
+  sound because evacuation is stop-the-world, mutators observe moves load-at-use,
+  and tracing reclaims only the unreachable (design §4).
+- **Binding invariant (§4.4):** every stored pointer lives in a **genuine
+  reference slot** (an `Atomic[T]` cell or a struct field) — never packed, tagged
+  or integer-cast — so precise tracing sees and (under the moving collector)
+  forwards it. ABA is moot because a referenced node is never reclaimed, so
+  version-counter pointer-packing is neither needed nor allowed.
+- **Memory ordering:** `seq_cst` throughout (the only `Atomic[T]` order today).
+  Non-pointer instantiations (`Queue[int64]`, handles) are correct on every
+  platform; a **reference-payload** `Queue[T]` additionally relies on the moving
+  collector relocating pointer graphs and therefore inherits the open
+  aarch64-Linux evacuation race **I#223**, so it is trustworthy on that platform
+  only once I#223 is fixed (§4.6).
+- **Surface:** concurrency lives in the **type name**, with **no new syntax** and
+  no change to any existing type. `concurrent.Counter()` is a module constructor
+  (non-generic, the `threading.Thread()` pattern); the generic `Queue[T]` is a
+  bare prelude type built with `new_queue[T]()` — the language already uses bare
+  generics (`Atomic[T]`, `Optional[T]`) and reserves module-qualification for
+  non-generic types, because a module-qualified *generic type path* is not in the
+  grammar and adding it was out of scope. No `len()`/iteration (a lock-free queue
+  has no consistent snapshot); `pop()` is comma-ok (`v, ok = q.pop()`), returning
+  `(Optional[T], bool)`.
+
+**Rationale:** lock-free earns its complexity only for a counter and a
+contended producer/consumer queue; a map is better served by sharded mutexes.
+Leaning on the existing GC (rather than building a reclamation subsystem) is both
+correct here and an order of magnitude less code (design §4/§5), and keeps the
+whole feature additive and runtime-free.

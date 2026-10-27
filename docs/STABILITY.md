@@ -357,6 +357,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `signal`/`gc`/`runtime` — the **API** (`signal.notify`, `gc.collect/stats`, `runtime.coroutine_dump`) | **S** |
 | `signal`/`gc`/`runtime` — the dump/stats **output format** | **I** |
 | `crypto`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`; `threading` (migration-only) | **E** |
+| `concurrent` — lock-free `Counter` + MPSC `Queue[T]` (D-0078); reference-payload `Queue[T]` is further gated on aarch64 by I#223 | **E** |
 
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**
 
