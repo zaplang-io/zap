@@ -145,6 +145,12 @@ Changes to the phase-boundary contracts (`design/IR.md`, `design/RUNTIME-ABI.md`
 need extra care: they are what lets front-end, middle-end, and runtime work
 proceed in parallel.
 
+**Changelog.** Any change to a public surface (language, stdlib, CLI, package
+format) also adds an entry under `[Unreleased]` in
+[`CHANGELOG.md`](CHANGELOG.md), and the PR states its change class
+(PATCH/MINOR/MAJOR) per [`docs/STABILITY.md`](docs/STABILITY.md). How a release
+is cut and how the version bumps is [`docs/RELEASING.md`](docs/RELEASING.md).
+
 ## Conventions
 
 - **Issue and PR references.** Zap's issues and PRs share one number space on
