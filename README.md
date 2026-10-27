@@ -10,7 +10,7 @@ metaprogramming system for keeping business logic free of boilerplate.
 
 ## Documents
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — "where to find what": the compiler pipeline, crate map, runtime/GC, stdlib, tooling, and tests.
+- [`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md) — "where to find what": the compiler pipeline, crate map, runtime/GC, stdlib, tooling, and tests.
 - [`SPEC.md`](SPEC.md) — the language specification (the source of truth).
 - [`DECISIONS.md`](DECISIONS.md) — the decision log (ADR), D-0001…D-0070.
 - [`docs/STABILITY.md`](docs/STABILITY.md) — versioning & stability policy (the 1.0 contract).
