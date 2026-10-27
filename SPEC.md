@@ -1,12 +1,19 @@
 # Zap Language Specification
 
-**Version:** 0.2 (draft, living document)
-**Last updated:** 2026-10-17
+**Version:** 0.3 (1.0 Stable set frozen — #206 / D-0076)
+**Last updated:** 2026-10-27
 
 This is the authoritative, examples-driven description of the Zap language.
 Where this document and any implementation disagree, this document wins (until
 amended). Significant changes go through a design doc in `design/` and are
 recorded in `DECISIONS.md`. Unresolved items live in `OPEN-QUESTIONS.md`.
+
+**Stability.** The 1.0 surface classification (Stable / Experimental / Internal)
+is ratified by the spec-freeze audit (#206, D-0076); Appendix B carries the
+per-section tier and `docs/STABILITY.md` §4.4 is the cross-surface source of
+truth. The editorial `Version:` above is still `0.x` (the toolchain version in
+`Cargo.toml` is authoritative, `docs/STABILITY.md` §2); it is reconciled to
+`1.0` at the 1.0.0 **release** (#207), not at the freeze.
 
 Zap is a statically typed, ahead-of-time compiled language with Python-like
 readability, aimed at Python developers who need native performance.
@@ -458,8 +465,8 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
 ## 13. Modules, imports, visibility (D-0028, D-0052)
 
 ```python
-import strings                 # a Zap module (logical name)
-import collections as col      # aliasing
+import math                    # a Zap module (logical name)
+import datetime as dt          # aliasing
 import jsonlib, boto           # multiple on one line
 import (jsonlib, boto as b)    # grouped form, per-item alias
 import python "numpy" as np    # CPython interop (design/0003)
@@ -559,6 +566,7 @@ zap build                     # build project -> native binary (target/)
 zap test [--watch] [--json]   # run tests; --watch re-runs (targeting changed paths); --json for agents
 zap test --doc [path]         # run docstring examples (doctests, #234) through the REPL engine
 zap fmt                       # canonical formatter (D-0037)
+zap doc [--format html|md|json] [--out <dir>] [--private]  # render API docs (I#232/233)
 zap new <name> | zap init     # scaffold a project
 zap add <dep> | zap remove    # manage deps (zap.toml + zap.lock, D-0052)
 zap zenv create               # project env (activate via `source zenv/activate`)
@@ -566,6 +574,7 @@ zap expand                    # show @derive/decorator-generated code
 zap ir <file>                 # dump ZIR (diagnostic)
 zap mcp                       # MCP server for coding agents (syntax/compile/test)
 zap repl                      # interactive REPL (JIT, I#159)
+zap lsp                       # language server over JSON-RPC stdio (I#229)
 zap playground [--port N]     # local web playground: editor + sandboxed server-side run (I#238)
 zap inspect <pid>             # stacks / GC+memory stats / (later) profile of a running process
 zap explain <ZAPnnnn>         # explain a diagnostic's stable error code (I#157/F1)
@@ -589,8 +598,10 @@ the web playground (#238). See design/0025-repl.md.
 human-readable message, which may change — is the machine-parseable identifier
 tools and coding agents key off; it is rendered as `error[ZAPnnnn]: …` on the
 CLI and as a `code` field on the `zap mcp` / `--json` diagnostic surface, and
-`zap explain <ZAPnnnn>` prints its documented meaning. Codes are **Experimental**
-until the 1.0 spec-freeze audit (#206) ratifies the stable set.
+`zap explain <ZAPnnnn>` prints its documented meaning. The #206 spec-freeze audit
+(D-0076) ratifies the Stable code set: every non-meta code's documented *meaning*
+is **Stable**; the meta band (`ZAP0001` ICE, `ZAP0002` not-yet-implemented) is
+excluded; message **text** is never stable (STABILITY.md §3.4).
 
 **Testing (D-0054).** Tests use a **`@test`** annotation suite (`@test`,
 `@before`/`@after`, `@before_all`/`@after_all`, `@parametrize`, `@skip`/`@skip_if`,
@@ -638,16 +649,27 @@ does fast **parse + type-check** validation (no full build), maintains a compact
 
 ## 18. Standard library & runtime (D-0056, D-0057, D-0058)
 
-A curated **"Go-plus"** standard library in three tiers: **built-ins** (no import
-— `print`/`len`/`range`/`assert`, the scalar/container types incl. **`heap`**,
-enums, structs+`@derive`); **bundled std** imported by flat short name (`io`/`fs`,
-`os`, `sys`, `strings`, `math`, `random`, `collections`, `sync`, `time`/`datetime`,
-`json`, `csv`, `regex`, `logging`, `argparse`, `testing`, `net`, `http`, `crypto`,
-`process`, `zlib`/`gzip`, `signal`, `gc`/`runtime`); and **official packages** via
-the package manager (`sqlite3`, `xml`, `email`, …). Modules import whole
-(`import datetime`); there is **no `from X import Y`**. The concurrency model
-replaces Python threading/multiprocessing; `import python` (interop) is a rare
-relief valve.
+A curated **"Go-plus"** standard library in three tiers.
+
+**Built-ins** (no import): `print`/`len`/`range`/`assert`; the scalar and
+container types incl. **`heap`**; enums; structs + `@derive`. String operations
+are **methods on `str`** (there is no `strings` module), regex is built-in
+**operator** syntax (`=~`/`!~`/`~=`, §14 — not a module), and the core
+containers (`list`/`dict`/`set`/`heap`) are built-in (there is no `collections`
+module — the collection *extras* ship as the `deque`/`bisect`/`oset` modules).
+
+**Bundled std** imported whole by flat short name (`import datetime`; there is
+**no `from X import Y`**). The modules shipped today
+(`crates/sema/src/modules/`): `io`, `fs`, `os`, `sys`, `process`, `math`,
+`random`, `time`, `datetime`, `json`, `logging`, `argparse`, `deque`, `bisect`,
+`oset`, `sync`, `signal`, `gc`, `runtime` — **Stable**; `crypto`, `net`, `http`,
+`tls`, `zlib`, `gzip`, `yaml`, `threading` — **Experimental** (STABILITY.md
+§4.4). CSV is a **`@derive(Csv)`** (`to_csv`/`from_csv`), not a module; `testing`
+is the **`@test`** annotation framework (§17), not an importable module.
+
+**Official packages** via the package manager (`sqlite3`, `xml`, `email`, …).
+The concurrency model replaces Python threading/multiprocessing; the
+`threading` compat module and `import python` (interop) are rare relief valves.
 
 **`heap[T]` (D-0057)** — built-in min-heap priority queue (comparator optional):
 `push`/`pop`/`peek`/`len`.
@@ -675,20 +697,30 @@ programmatically; `zap inspect <pid>` triggers them against a running process.
 `float32`, `float64`, `i32`, `i64`, `f32`, `f64`, `bool`, `char`, `str`,
 `bytes`, `bigint`, `complex`, `list`, `dict`, `set`, `heap`, `array`).
 
-## Appendix B — Status of sections
+## Appendix B — Status & 1.0 stability tier of sections
 
-| Section | Status |
-|---|---|
-| Declarations, scalars, functions, control flow | Locked |
-| Strings, conversions, value/reference semantics | Locked |
-| Structs, interfaces, enums (tier 1 + tier 3 sum types) | Locked (syntax draft) |
-| Generics | Reserved; staged implementation |
-| Concurrency surface (`scope:`, `spawn detached`) | Locked (D-0044/D-0045) |
-| Exceptions, resource cleanup | Locked |
-| Concurrency | Model locked; `select`/structured-concurrency syntax draft |
-| Modules & visibility | Locked |
-| Regex, arrays | Locked (design docs 0001/0002) |
-| Function args: defaults, keyword, variadics | Locked (D-0038) |
-| Decorators & annotations | Locked (D-0036, design/0004) |
-| do-while, match-case | Locked (D-0039, D-0040) |
-| `set`, `**kwargs`, data-carrying enums | Open (see OPEN-QUESTIONS) |
+Tier is the ratified 1.0 classification (#206 / D-0076; see `docs/STABILITY.md`
+§4.4): **S** Stable (frozen for 1.x — a valid Stable program keeps compiling and
+keeps its specified behavior), **E** Experimental (shipped, not promised, may
+change), **I** Internal (no contract). Sections marked **S** are **frozen for
+1.0**.
+
+| Section | Status | Tier |
+|---|---|---|
+| Declarations, scalars, functions, control flow | Locked | **S** |
+| Strings, conversions, value/reference semantics | Locked | **S** |
+| Structs, interfaces, enums (tier 1 + tier 3 sum types) | Locked | **S** |
+| Generics (incl. bounds) | Locked (D-0064) | **S** |
+| First-class function values + closures | Locked (D-0067) | **S** |
+| Concurrency model + surface (`select`, `scope:`, `spawn detached`) | Locked (D-0031/D-0044/D-0045) | **S** |
+| Sync primitives + `Atomic[T]` | Locked (D-0032/D-0066) | **S** |
+| Exceptions, resource cleanup (`with` / context managers) | Locked (D-0069) | **S** |
+| Modules & visibility | Locked | **S** |
+| Regex | Locked (design 0001) | **S** |
+| Function args: defaults, keyword, variadics | Locked (D-0038) | **S** |
+| Decorators & annotations core | Locked (D-0036, design/0004) | **S** |
+| do-while, match-case | Locked (D-0039, D-0040) | **S** |
+| Numeric arrays / SIMD | Locked design, promotion open | **E** |
+| `set` type | Shipped, surface open | **E** |
+| C-style bitfields on `value struct` | Locked (D-0068) | **E** |
+| `**kwargs` arbitrary named args | Deferred (D-0038) | n/a |

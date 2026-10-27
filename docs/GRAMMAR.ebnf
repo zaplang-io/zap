@@ -1,5 +1,8 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0058.
+   Zap grammar (EBNF) — tracks SPEC.md v0.3 and DECISIONS D-0001..D-0076.
+   The Stable 1.0 language surface (#206 / D-0076, docs/STABILITY.md §4.4) is
+   frozen; Experimental surfaces (arrays/SIMD, `set`, bitfields) are marked at
+   their productions. Additions post-freeze are backward-compatible (MINOR).
 
    Notation:
      ::=        definition
