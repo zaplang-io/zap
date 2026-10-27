@@ -9,6 +9,7 @@
 //!     data)`, `zap_crypto_hexdigest(handle) -> str`, `zap_crypto_digest(handle)
 //!     -> bytes`
 //!   - `zap_crypto_hmac_sha256/512(key, msg) -> str` (hex)
+//!   - `zap_crypto_hmac_sha256_raw(key, msg) -> bytes` (raw digest, #153)
 //!   - `zap_crypto_random_bytes(n) -> bytes`, `zap_crypto_token_hex(n) -> str`
 
 use inkwell::AddressSpace;
@@ -36,6 +37,12 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     );
     cg.declare_rt(
         "zap_crypto_hmac_sha512",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    // Raw-bytes HMAC-SHA256: (key, msg) -> bytes (the 32-byte digest, #153).
+    cg.declare_rt(
+        "zap_crypto_hmac_sha256_raw",
         &[p.into(), p.into()],
         Some(p.into()),
     );

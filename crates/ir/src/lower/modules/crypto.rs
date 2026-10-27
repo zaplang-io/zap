@@ -115,6 +115,21 @@ fn lower(
             });
             Ok(Some((d, Ty::Ptr)))
         }
+        // crypto.hmac_sha256_raw(key, msg) -> bytes: the raw 32-byte digest (#153).
+        "hmac_sha256_raw" => {
+            if args.len() != 2 {
+                return Err(err("crypto.hmac_sha256_raw takes exactly two arguments"));
+            }
+            let (key, _) = lowerer.expr(&args[0].value)?;
+            let (msg, _) = lowerer.expr(&args[1].value)?;
+            let d = lowerer.new_value(Ty::Ptr);
+            lowerer.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_crypto_hmac_sha256_raw".to_string(),
+                args: vec![key, msg],
+            });
+            Ok(Some((d, Ty::Ptr)))
+        }
         // crypto.random_bytes(n) / crypto.token_hex(n): count coerces to i64.
         "random_bytes" | "token_hex" => {
             if args.len() != 1 {

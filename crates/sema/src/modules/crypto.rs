@@ -14,6 +14,8 @@
 //!
 //! HMAC over (key, message), returning the lowercase hex digest:
 //!   `crypto.hmac_sha256(key, msg) -> str` ; `crypto.hmac_sha512(key, msg) -> str`
+//! The raw-bytes HMAC-SHA256 digest (for chaining, e.g. AWS SigV4, #153):
+//!   `crypto.hmac_sha256_raw(key, msg) -> bytes`
 //!
 //! Secure random from the OS CSPRNG (getentropy / /dev/urandom):
 //!   `crypto.random_bytes(n) -> bytes` ; `crypto.token_hex(n) -> str`
@@ -118,6 +120,28 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                 expect_data(checker, method, &args[1]);
             }
             Some(Ty::Str)
+        }
+        // Raw-bytes HMAC-SHA256: crypto.hmac_sha256_raw(key, msg) -> bytes (the
+        // 32-byte digest). Lets a digest be fed as the next step's key without a
+        // lossy hex round-trip (AWS SigV4 signing-key derivation, #153).
+        "hmac_sha256_raw" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(key, msg) takes 2 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+            }
+            Some(Ty::Bytes)
         }
         // crypto.random_bytes(n) -> bytes: n cryptographically secure random bytes.
         "random_bytes" => {
