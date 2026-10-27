@@ -2,8 +2,7 @@
 
 - **Author(s):** Zap toolchain team
 - **Last updated:** 2026-10-27
-- **Status:** Draft (design-only; awaiting maintainer review — proposes D-0078,
-  not accepted)
+- **Status:** Accepted (ratified 2026-10-27 as D-0078)
 - **Discussion:** issue #184. Builds on D-0066 (`Atomic[T]`, I#176/PR#177) and
   D-0008/D-0009 (precise moving Immix GC, `design/0008-precise-gc.md`, I#120).
   Constrained by D-0076 (1.0 spec-freeze): anything shipped here is **additive /
@@ -42,8 +41,8 @@ The recommendation (§6) is to **ship the minimum useful set first** — a
 `ConcurrentCounter` and a lock-free **MPSC queue** — and **defer the map**, for
 which a sharded `Mutex`+`dict` is almost always the right engineering answer
 rather than a CAS map.
-The proposed decision is **D-0078**, Proposed/pending ratification, with three
-load-bearing calls surfaced in §7 for the maintainer to rule on.
+The decision is **D-0078** (ratified 2026-10-27); the three load-bearing calls
+surfaced in §7 were ruled on as recommended.
 
 **This is a design-only ticket.**
 It adds this one file and changes no compiler, runtime, stdlib, parser, or
@@ -392,16 +391,16 @@ GC-safety protocol (§4) and the CI testing story (§5) on the simplest possible
 structures; proving the protocol once, in the small, is the prerequisite for
 trusting it anywhere else.
 
-## 7. Recommendation + proposed decision (D-0078, pending ratification)
+## 7. Recommendation + decision (D-0078, ratified 2026-10-27)
 
 **Recommendation (one line):** ship a lock-free `Counter` + MPSC `Queue` built on
 `Atomic[T]`, leaning entirely on the tracing moving GC for reclamation (no
 hazard/epoch pointers, no new GC barriers), with pointers stored only in genuine
 reference slots; defer the map to a sharded-mutex design.
 
-### Proposed decision
+### Decision
 
-> **D-0078 (Proposed — pending maintainer ratification; NOT accepted).**
+> **D-0078 (Accepted — ratified 2026-10-27).**
 > Zap ships a small `concurrent` stdlib module (Experimental, per D-0076) of
 > CAS-based collections built on `Atomic[T]` (D-0066): a `Counter` and an
 > unbounded MPSC `Queue[T]`, optionally a Treiber `Stack[T]`.
