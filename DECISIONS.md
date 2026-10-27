@@ -1815,3 +1815,73 @@ it is codegen-gated like `zap run`/`zap repl`.
   language). Deferred follow-ups: OS-sandbox hardening, incremental output
   streaming (SSE over the worker pipe), a cached precompiled-runtime image for
   faster per-request startup, and a server-side share/paste store.
+
+## D-0076 — 1.0 spec-freeze: the ratified Stable set (I#206)
+**Status:** Locked (ratification). Full audit: `design/0029-spec-freeze.md`.
+Epic I#158, Area D1. Ratifies the Stable set that D-0070 (`docs/STABILITY.md`
+§4.4) and D-0071 (§3.4) explicitly deferred to this audit; recorded in
+`docs/STABILITY.md` §4.4 (surfaces) and §7.3 (platforms), with `SPEC.md`
+Appendix B carrying the matching per-section tier.
+
+The #206 audit surveyed the implemented tree (not just the docs) and fixes the
+authoritative 1.0 Stable / Experimental / Internal classification. Posture is
+**conservative**: promising stability is a one-way door (frozen for all of 1.x),
+so a young/under-specified/platform-fragile surface ships **Experimental** and
+graduates later at a MINOR (§4.2) — cheap and additive — rather than being
+frozen prematurely.
+
+- **Language Stable:** declarations/scalars/strings/collections/tuples, structs
+  (+`value struct`)/interfaces/enums (tier-1 **and** tier-3 sum types), operators
+  + overloading + `@derive(Eq,Ord,Hash,Repr)`, control flow + iteration protocol,
+  functions/lambdas/generators + default/keyword/variadic args, **first-class fn
+  values + closures** (D-0067), comprehensions/slicing, exceptions, `with`/context
+  managers (D-0069), modules/imports/visibility, regex, decorators core +
+  `@derive(Json)`, **generics incl. bounds** (D-0064), coroutines/channels/
+  `select`/`scope:`/`spawn detached`, sync primitives + **`Atomic[T]`** (D-0066),
+  `Optional[T]` (D-0065). **Experimental:** numeric arrays/SIMD, `set`, C-style
+  bitfields (D-0068), Python interop, `@derive(Yaml)`/`@derive(Csv)`;
+  `__iadd__`-family in-place ops remain **not-yet**. **Internal:** value/memory
+  layout, representation, GC/scheduler (§1.5).
+- **Stdlib (per module) Stable:** built-ins (+`heap`), `io`/`fs`/`os`/`sys`/
+  `process`, `math`/`random`, `time`/`datetime`, `collections` extras (`deque`/
+  `bisect`/`oset`), `sync`, `json`, `logging`/`argparse`, and the `signal`/`gc`/
+  `runtime` **API** (their dump/stats *format* stays Internal). **Experimental:**
+  `crypto`, `net`/`http`/`tls`, `zlib`/`gzip`, `yaml`, `threading` (migration-
+  only). `strings`/`collections`/`csv`/`testing` are **not** importable modules
+  (str methods / built-in containers + the extras / `@derive(Csv)` / the `@test`
+  framework) — SPEC §18 corrected.
+- **CLI Stable:** `run`/`build`/`test`/`fmt`/`new`/`init`/`add`/`remove`/`zenv`/
+  `explain`/`doc`/`version`/`help` (verbs + flags + exit codes). `mcp`/`lsp`/
+  `repl`/`playground` verbs Stable, protocols Experimental; `ir`/`expand`/
+  `inspect` output Internal; all `--json` schemas Experimental until stabilized;
+  `playground-worker` Internal. (SPEC §17 gained the shipped `doc` and `lsp`.)
+- **Package format Stable:** `zap.toml`/`zap.lock`/MVS resolver/`git`+`path`
+  sources/checksum DB (D-0052). **Experimental:** the registry read path (D-0027,
+  read-only, no publish path).
+- **Diagnostics:** the `ZAPnnnn` scheme + `zap explain` + the documented
+  **meaning** of every non-meta code (117 of the 119 registered) are **Stable**;
+  the meta band (`ZAP0001` ICE, `ZAP0002` not-yet-implemented) is excluded;
+  message **text** is never stable (§3.4).
+- **`zap fmt`:** the tool + its parse-preserving/idempotence contract + exit
+  codes are **Stable**; the **exact byte-for-byte rendering is not promised** (the
+  Go/`gofmt` stance — it may be refined within 1.x; a reformat is never a semantic
+  change).
+- **Platform matrix (§7.3):** Linux x86-64 and Windows x86-64 **tier-1 (Stable,
+  CI-gated)**; macOS x86-64 **tier-2 (Supported — not yet CI-gated, NOT under the
+  §3 promise)** pending a macOS CI runner + PR#259, graduating at a MINOR; macOS
+  arm64 **experimental** (#260 JIT unwinder); aarch64-Linux **experimental**
+  (#223 multicore GC race); WASM post-1.0. "Stable" for a platform means the §3
+  promise is continuously CI-verified there.
+- **Freeze mechanism:** recorded as the `docs/STABILITY.md` §4.4 Stable-set table
+  + §7.3 matrix and `SPEC.md` Appendix B per-section tiers + "frozen for 1.0"
+  markers; post-freeze additions stay additive (MINOR, §1.2/§4.2). The editorial
+  `SPEC.md` `Version:` is bumped to `0.3` (freeze revision) but **not** stamped
+  `1.0` — that reconciliation happens at the 1.0.0 **release** (#207), per §2;
+  the toolchain version in `Cargo.toml` stays authoritative.
+
+**Rationale:** "call it 1.0" is a commitment, not a feature (D-0070). The audit
+makes the commitment concrete and honest: it freezes the mature core, keeps the
+young/fragile surfaces Experimental so they can still evolve, refuses to promise
+what CI does not continuously verify (macOS), and follows gofmt in not freezing
+exact formatter output — all one-way doors chosen deliberately and reversibly
+only in the additive direction.
