@@ -3716,6 +3716,14 @@ impl<'a> FnLower<'a> {
 
     fn stmt(&mut self, st: &Stmt) -> Result<(), LowerError> {
         match st {
+            // `when target.*` conditional-compilation blocks are expanded by
+            // `zapc_syntax::cfg::resolve_cfg` before lowering (the driver resolves
+            // against the active target; sema re-resolves for the host). One
+            // reaching lowering is an internal invariant violation (I#139).
+            Stmt::Cfg(_) => Err(err(
+                "internal error: unresolved `when target.*` block reached \
+                 lowering (expected cfg resolution first)",
+            )),
             Stmt::Let {
                 ty, name, value, ..
             } => {

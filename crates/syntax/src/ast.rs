@@ -27,6 +27,109 @@ pub enum Item {
     Decorator(DecoratorDef),
     Import(Import),
     Stmt(Stmt),
+    /// A compile-time `when target.*:` conditional-compilation block in
+    /// declaration/import position (I#139, D-0079). The arm whose predicate
+    /// matches the active build target is spliced into the enclosing item list
+    /// during cfg resolution ([`crate::cfg::resolve_cfg`]); the other arms are
+    /// parsed (so they must be syntactically valid) but never name-resolved,
+    /// type-checked, or lowered against the wrong target ("dead-arm skip").
+    Cfg(CfgItemBlock),
+}
+
+// ----------------------------------------------------------------------------
+// Conditional compilation (`when target.*`, I#139 / D-0079)
+// ----------------------------------------------------------------------------
+
+/// A single `when`/`elif` predicate over the build target (I#139). Only the
+/// closed v1 surface is representable: an architecture or OS equality, or a
+/// compile-time feature probe. Boolean combinators are intentionally absent
+/// (deferred); each arm carries exactly one atomic predicate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CfgPredicate {
+    /// `target.arch == .<arch>` — true when the active target's architecture is
+    /// `arch`.
+    Arch(CfgArch),
+    /// `target.os == .<os>` — true when the active target's OS is `os`.
+    Os(CfgOs),
+    /// `target.has(.<feature>)` — true when `feature` was baked into the build
+    /// (via `--target-feature`). This is the **compile-time** feature probe,
+    /// distinct from the (later) runtime `cpu.has` (§4/§6.3).
+    HasFeature(String),
+}
+
+/// The closed v1 set of target architectures (design/0032 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CfgArch {
+    X86_64,
+    Aarch64,
+}
+
+impl CfgArch {
+    /// The canonical spelling used after the `.` in `target.arch == .<arch>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CfgArch::X86_64 => "x86_64",
+            CfgArch::Aarch64 => "aarch64",
+        }
+    }
+}
+
+/// The closed v1 set of target operating systems (design/0032 §4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CfgOs {
+    Linux,
+    Windows,
+    Macos,
+}
+
+impl CfgOs {
+    /// The canonical spelling used after the `.` in `target.os == .<os>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CfgOs::Linux => "linux",
+            CfgOs::Windows => "windows",
+            CfgOs::Macos => "macos",
+        }
+    }
+}
+
+/// One `when`/`elif` arm: a predicate and the body it guards.
+#[derive(Clone, Debug)]
+pub struct CfgItemArm {
+    pub predicate: CfgPredicate,
+    pub body: Vec<Item>,
+    pub span: Span,
+}
+
+/// A `when target.*:` block in item position (D-0079). Holds every arm in
+/// source order plus the optional `else` body; cfg resolution keeps the first
+/// matching arm (or the `else`) and discards the rest.
+#[derive(Clone, Debug)]
+pub struct CfgItemBlock {
+    pub arms: Vec<CfgItemArm>,
+    pub else_body: Option<Vec<Item>>,
+    /// Span of the `else` keyword when `else_body` is present (used by the
+    /// formatter to place the `else:` line and any comments before it).
+    pub else_span: Option<Span>,
+    pub span: Span,
+}
+
+/// One `when`/`elif` arm in statement position.
+#[derive(Clone, Debug)]
+pub struct CfgStmtArm {
+    pub predicate: CfgPredicate,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// A `when target.*:` block in statement position (D-0079).
+#[derive(Clone, Debug)]
+pub struct CfgStmtBlock {
+    pub arms: Vec<CfgStmtArm>,
+    pub else_body: Option<Block>,
+    /// Span of the `else` keyword when `else_body` is present.
+    pub else_span: Option<Span>,
+    pub span: Span,
 }
 
 // ----------------------------------------------------------------------------
@@ -296,6 +399,11 @@ pub enum Stmt {
         arms: Vec<MatchArm>,
         span: Span,
     },
+    /// A compile-time `when target.*:` conditional-compilation block in
+    /// statement position (I#139, D-0079). Resolved exactly like the item-level
+    /// form: the matching arm's statements are spliced into the enclosing block
+    /// and the dead arms are skipped (parsed, never checked/lowered).
+    Cfg(CfgStmtBlock),
     /// `return [expr]`.
     Return {
         value: Option<Expr>,
