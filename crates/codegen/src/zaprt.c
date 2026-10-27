@@ -6930,6 +6930,22 @@ void *zap_crypto_hmac_sha512(void *key, void *msg) {
     return zap_crypto_hmac_hex(ZAP_CRY_SHA512, key, msg);
 }
 
+/* Raw-bytes HMAC: the digest as a `bytes` value rather than hex. Needed to chain
+ * HMAC-SHA256 (e.g. the AWS SigV4 signing-key derivation, ticket #153), where one
+ * step's raw digest is the key for the next and a hex round-trip would be lossy. */
+static void *zap_crypto_hmac_raw(int algo, void *key, void *msg) {
+    ZapStr *k = (ZapStr *)key;
+    ZapStr *m = (ZapStr *)msg;
+    uint8_t out[64];
+    zap_crypto_hmac(algo, (const uint8_t *)k->data, (size_t)k->len,
+                    (const uint8_t *)m->data, (size_t)m->len, out);
+    return zap_str_new((const char *)out, (int64_t)zap_crypto_digest_len(algo));
+}
+
+void *zap_crypto_hmac_sha256_raw(void *key, void *msg) {
+    return zap_crypto_hmac_raw(ZAP_CRY_SHA256, key, msg);
+}
+
 /* ---- Secure random / secrets ---- */
 static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
 #if defined(ZAP_PLATFORM_WINDOWS)
