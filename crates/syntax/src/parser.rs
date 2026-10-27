@@ -597,6 +597,98 @@ struct JsonScanner:
         if k == 12:
             return (JsonToken.Comma, True)
         return (JsonToken.End, False)
+
+# concurrent (I#184, D-0078) — Experimental lock-free collections built on the
+# prelude Atomic[T] (D-0066). Reclamation leans entirely on the tracing moving
+# Immix collector (D-0008/I#120): a node is an ordinary GC heap struct and every
+# stored pointer lives in a genuine reference slot (an Atomic cell or a struct
+# field), never packed into an integer word, so the existing GC machinery traces
+# and (under the moving collector) forwards every link with NO new runtime code.
+# These types ship Experimental (STABILITY.md 4.4) and are namespaced under
+# `import concurrent`; concurrency lives in the type name, not in new syntax.
+
+# A lock-free counter: a thin, discoverable wrapper over Atomic[int64]. Every op
+# is an indivisible seq_cst atomic, so concurrent increments never lose an update
+# the way a non-atomic load/add/store would. Correct on every platform, aarch64
+# included (no pointer payload). Build one with concurrent.Counter().
+struct Counter:
+    Atomic[int64] _cell
+
+    # add(n): atomically add n and return the NEW value (Go atomic.Int64 add).
+    def add(self, int64 n) -> int64:
+        return self._cell.add(n)
+
+    # incr(): add 1 and return the new value.
+    def incr(self) -> int64:
+        return self._cell.add(1)
+
+    # get(): the current value (a seq_cst atomic load).
+    def get(self) -> int64:
+        return self._cell.load()
+
+# The backing constructor for `concurrent.Counter(start)` (its lowering emits a
+# call to this; see crates/ir/src/lower/modules/concurrent.rs). Kept internal
+# (`__`-prefixed) so the public surface is `concurrent.Counter()`.
+def __concurrent_counter(int64 start) -> Counter:
+    return Counter(_cell=Atomic(start))
+
+# An internal node of the MPSC Queue. `value` is None only for the sentinel/stub
+# node; a live node carries Some(payload). `next` is an atomic nullable link
+# (None == no successor yet) — a genuine traced reference slot, so the moving
+# collector scans and forwards it with no special runtime code.
+struct QNode[T]:
+    Optional[T] value
+    Atomic[Optional[QNode[T]]] next
+
+# An unbounded multi-producer / single-consumer (MPSC) lock-free FIFO queue
+# (Vyukov). ANY number of producers may call push() concurrently; EXACTLY ONE
+# consumer calls pop(). A permanent stub node keeps _head/_tail non-null, so a
+# drained queue refills correctly. There is intentionally no len()/iteration: a
+# lock-free queue has no consistent snapshot, so exposing either would be a
+# Python-faithful lie (D-0078). Construct with new_queue[T]().
+#
+# For a NON-pointer payload (int64, an opaque handle) the queue touches the GC
+# only through its node links and is correct on every platform. For a REFERENCE
+# payload it additionally relies on the moving collector relocating pointer
+# graphs correctly, so it inherits the open aarch64 evacuation race (I#223) and
+# is trustworthy on that platform only once I#223 is fixed (D-0078 4.6).
+struct Queue[T]:
+    Atomic[QNode[T]] _head   # consumer end: the stub / last-consumed node
+    Atomic[QNode[T]] _tail   # producer end: the most recently pushed node
+
+    # push(v): enqueue v. Safe from any number of producer coroutines/threads.
+    # The atomic swap on _tail is the single serialization point; the follow-up
+    # store links the previous tail to the new node, publishing it to the
+    # consumer. seq_cst throughout (Atomic[T], D-0066).
+    def push(self, T v):
+        Optional[QNode[T]] empty = None
+        QNode[T] n = QNode(value=Optional.Some(v), next=Atomic(empty))
+        auto prev = self._tail.swap(n)
+        prev.next.store(Optional.Some(n))
+
+    # pop() -> (Optional[T], bool): dequeue the oldest element. Call from the
+    # SINGLE consumer only. Returns (Some(v), True) on success and (None, False)
+    # when the queue is observably empty — which also covers the transient window
+    # where a producer has swapped the tail but not yet linked its node, so the
+    # consumer simply retries. comma-ok, like a channel receive: `v, ok = q.pop()`.
+    def pop(self) -> (Optional[T], bool):
+        auto head = self._head.load()
+        auto nxt = head.next.load()
+        if nxt.is_none():
+            Optional[T] none = None
+            return (none, False)
+        auto nn = nxt.unwrap()
+        self._head.store(nn)
+        return (nn.value, True)
+
+# Build an empty MPSC Queue[T]. A free constructor (rather than a bare, field-
+# defaulted `Queue()`) because the stub node and its nullable atomic links must
+# be initialized from typed None values.
+def new_queue[T]() -> Queue[T]:
+    Optional[QNode[T]] elink = None
+    Optional[T] eval = None
+    QNode[T] stub = QNode(value=eval, next=Atomic(elink))
+    return Queue(_head=Atomic(stub), _tail=Atomic(stub))
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -668,6 +760,15 @@ fn references_prelude(module: &Module) -> bool {
         "\"Event\"",
         "\"Semaphore\"",
         "\"Condition\"",
+        // The `concurrent` module (I#184, D-0078): the lock-free `Counter` and
+        // the MPSC `Queue[T]` (+ its `QNode[T]` and `new_queue` constructor)
+        // ship in the prelude, injected for any program that names the module or
+        // one of these types.
+        "\"concurrent\"",
+        "\"Counter\"",
+        "\"Queue\"",
+        "\"QNode\"",
+        "\"new_queue\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

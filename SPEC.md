@@ -663,8 +663,11 @@ module — the collection *extras* ship as the `deque`/`bisect`/`oset` modules).
 (`crates/sema/src/modules/`): `io`, `fs`, `os`, `sys`, `process`, `math`,
 `random`, `time`, `datetime`, `json`, `logging`, `argparse`, `deque`, `bisect`,
 `oset`, `sync`, `signal`, `gc`, `runtime` — **Stable**; `crypto`, `net`, `http`,
-`tls`, `zlib`, `gzip`, `yaml`, `threading` — **Experimental** (STABILITY.md
-§4.4). CSV is a **`@derive(Csv)`** (`to_csv`/`from_csv`), not a module; `testing`
+`tls`, `zlib`, `gzip`, `yaml`, `threading`, `concurrent` — **Experimental**
+(STABILITY.md §4.4). The `concurrent` module (D-0078) adds a lock-free `Counter`
+and an unbounded MPSC `Queue[T]` built on `Atomic[T]`; concurrency lives in the
+type name (no new syntax), and a reference-payload `Queue[T]` inherits the open
+aarch64 evacuation caveat (I#223). CSV is a **`@derive(Csv)`** (`to_csv`/`from_csv`), not a module; `testing`
 is the **`@test`** annotation framework (§17), not an importable module.
 
 **Official packages** via the package manager (`sqlite3`, `xml`, `email`, …).
