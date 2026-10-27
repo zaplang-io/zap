@@ -206,6 +206,8 @@ changes are gated in review.
 | [`SPEC.md`](../SPEC.md) | The language specification — source of truth |
 | [`docs/GRAMMAR.ebnf`](GRAMMAR.ebnf) | The grammar; update **whenever syntax changes** |
 | [`docs/STABILITY.md`](STABILITY.md) | Versioning & stability policy; the D-0076 Stable/Experimental/Internal tiering and the 1.0 contract (D-0070) |
+| [`docs/RELEASING.md`](RELEASING.md) | Release process: `vX.Y.Z` tag convention, how the version bumps, how the changelog rolls (I#207) |
+| [`CHANGELOG.md`](../CHANGELOG.md) | Notable changes, Keep a Changelog format (pre-1.0 / editorial 0.x) |
 | [`design/IR.md`](../design/IR.md) | ZIR — the typed SSA IR (front-end ↔ backend contract) |
 | [`design/RUNTIME-ABI.md`](../design/RUNTIME-ABI.md) | Compiled-code ↔ runtime contract |
 | [`docs/FORMAT.md`](FORMAT.md) | The canonical `zap fmt` style |
