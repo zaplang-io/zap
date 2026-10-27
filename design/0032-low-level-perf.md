@@ -2,7 +2,7 @@
 
 - **Author(s):** Zap toolchain team
 - **Last updated:** 2026-10-27
-- **Status:** Under review (proposes **D-0079**, pending ratification)
+- **Status:** Accepted (ratified 2026-10-27 as D-0079)
 - **Discussion:** issue #139. Depends on I#121 (module-registration seam,
   PR#122), I#24/PR#41 (numeric arrays / portable SIMD), I#67/PR#118 (generators
   → stackless state machine), I#106 (zlib/gzip, CRC32C-vs-ISO-CRC32).
@@ -32,8 +32,8 @@ The recommendation (§7) is to **ship the core first** and gate the rest behind
 it, and to **sequence every ifunc/Mach-O/Apple-Silicon piece behind the
 Linux/ELF path** because that hardware is PARKED (no CI runner).
 
-The decision is proposed as **D-0079** (pending ratification); the four
-load-bearing calls the maintainer should rule on are in §8.
+The decision is **D-0079** (ratified 2026-10-27); the four load-bearing calls
+surfaced in §8 were ruled on as recommended.
 
 **This is a design-only ticket.**
 It adds this one file and changes no compiler, runtime, stdlib, parser, or
@@ -442,7 +442,7 @@ first in **Phase 3** (ifunc/resolver ABI).
   demand signal (recommended: ship it — it's small and makes the wrapper honest
   on non-SSE4.2 targets).
 
-## Recommendation + proposed decision (D-0079 — PROPOSED, pending ratification)
+## Recommendation + decision (D-0079, ratified 2026-10-27)
 
 **Recommendation (one line):** ship a minimal, memory-safe escape hatch first —
 `cfg` conditional compilation, then an `arch.{x86_64,aarch64}` module exposing
@@ -451,9 +451,9 @@ Linux/ELF, plus a `std.hash.crc32c` wrapper — and defer multiversioning/ifunc,
 SSE4.2 string ops, inline asm, the MLP helper, and **all Mach-O/Apple-Silicon
 work (parked hardware)** to later additive phases sequenced behind the ELF path.
 
-### Proposed decision
+### Decision
 
-> **D-0079 (PROPOSED — pending maintainer ratification).**
+> **D-0079 (Accepted — ratified 2026-10-27).**
 > Zap gains an opt-in, Experimental (per D-0076), post-1.0 low-level escape
 > hatch, delivered in phases.
 > **v1 = `cfg`/`when target.*` compile-time conditional compilation (its own
@@ -477,7 +477,7 @@ work (parked hardware)** to later additive phases sequenced behind the ELF path.
 > module rides the I#121 seam and the three safe ops lower to existing
 > backend-known LLVM intrinsics with no IR-schema or runtime-ABI change.
 
-### The load-bearing calls for the maintainer to rule on
+### The load-bearing calls (ruled on as recommended)
 
 1. **v1 scope cut line (§1).**
    Confirm v1 = `crc32c` + `popcount` + `prefetch` only (memory-safe, no runtime
