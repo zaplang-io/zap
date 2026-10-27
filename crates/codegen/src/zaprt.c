@@ -19,25 +19,22 @@
  *
  * Note: this `zaprt.c` is compiled by `cc`/MinGW only at *program link* time
  * (see build_executable in lib.rs); it is NOT compiled by `cargo build` of the
- * compiler crates, so the Windows CI job (host-side `cargo build`) is green
- * while this gate stands. The gate bites a developer who tries to link a Zap
- * *program* on Windows — exactly the A1/A3 gap — and points them at the work. */
+ * compiler crates. With A1/A2/A3/A4/A5 and now the Immix GC port (I#218) landed,
+ * it compiles and links on Windows under BOTH collectors; the `windows-runtime`
+ * CI job proves this by building + running the integration harness under each. */
 #if defined(_WIN32)
 #define ZAP_PLATFORM_WINDOWS 1
 #else
 #define ZAP_PLATFORM_POSIX 1
 #endif
 
-#if defined(ZAP_PLATFORM_WINDOWS) && defined(ZAP_GC_IMMIX)
-#error "Zap on Windows (v1) runs under the conservative Boehm collector only.\n\
-The precise Immix collector is not yet ported to Windows: zapgc.inc.c maps heap\n\
-with <sys/mman.h>/mmap and scans with POSIX primitives, so it needs a separate\n\
-VirtualAlloc/Win32 port (I#218, GC track). Build the Windows runtime WITHOUT\n\
--DZAP_GC_IMMIX (the default gc-boehm configuration). Full Windows program support\n\
-under gc-boehm is complete: A5 toolchain (I#199), A1 context switch (I#195), A3\n\
-signals/preemption/faults (I#197), A2 IOCP netpoller (I#196) and A4\n\
-path/process/fs/env/sockets/random (I#198). See design/0016-platform-1.0.md."
-#endif
+/* Windows now builds under BOTH collectors. gc-boehm (the conservative fallback)
+ * landed with A5/A1/A2/A3/A4; the precise Immix collector — Zap's DEFAULT — is
+ * ported to Windows by I#218 (I#158/A-GC): its aligned-block heap in
+ * zapgc.inc.c uses `_aligned_malloc`/`_aligned_free` on Windows (the seam there;
+ * the allocator never used mmap, so there is no VirtualAlloc reserve/commit
+ * layer to carry). The former `#error` that blocked ZAP_GC_IMMIX on Windows is
+ * therefore retired. See design/0016-platform-1.0.md. */
 
 /* Python.h must precede the standard headers (it sets feature-test macros).
  * Embedding CPython backs the Python interop (ticket #27, D-0012); the compile
