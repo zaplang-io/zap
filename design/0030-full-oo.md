@@ -2,7 +2,8 @@
 
 - **Author(s):** Zap language team
 - **Last updated:** 2026-10-27
-- **Status:** Draft (design-only evaluation; recommends a verdict)
+- **Status:** Accepted (design-only evaluation; verdict ratified as D-0077,
+  2026-10-27)
 - **Discussion:** issue #66 ([deferred] Full OO: classes with inheritance);
   re-examines the deferral against D-0015 (no classes/inheritance), D-0016
   (structural interfaces), D-0023/D-0051 (value vs reference), D-0050 (inline
@@ -38,8 +39,8 @@ smallest defensible increment is **interface default methods** (additive, MINOR,
 dispatched through the *existing* interface machinery), optionally paired with
 **explicit delegation sugar** for composition — not classes, not
 implementation inheritance, not a second nominal dispatch mechanism.
-This proposes **D-0077 (Proposed, pending maintainer ratification)** to record
-that verdict; it is not marked accepted.
+This records **D-0077 (Accepted; ratified by the maintainer 2026-10-27)** as
+that verdict.
 
 ## Background
 
@@ -388,11 +389,11 @@ The reasoning, against the #66 bar:
    thesis; classes are the single largest available step away from it, and #139
    already sits last on the roadmap.
 
-**Proposed decision — D-0077 (Proposed; to be ratified by the maintainer, not
-accepted here):**
+**Decision — D-0077 (Accepted; ratified by the maintainer 2026-10-27):**
 
 > **D-0077 — Full OO (classes + implementation inheritance): declined; the
 > method-reuse gap addressed, if justified, via interface default methods.**
+> **Status:** Accepted — ratified by the maintainer 2026-10-27.
 > Full OO is **declined** for Zap.
 > Composition (D-0015), structural interfaces (D-0016), the struct/value-struct
 > split (D-0023/D-0051), and the existing static + `{data, itable}` dynamic
@@ -425,13 +426,13 @@ are explicitly out of scope by this verdict.
 ## Implementation
 
 **None in this ticket.**
-This is a STEP 1 evaluation that ends in a proposed verdict for maintainer
-ratification.
+This is a STEP 1 evaluation that ends in a verdict (D-0077), ratified by the
+maintainer 2026-10-27.
 
-If the maintainer ratifies D-0077 as written, the follow-on is **not**
-scheduled now: a separate design doc + implementation ticket for *interface
-default methods* (Alt A) would be written only once real-use friction is logged,
-sequenced after the 1.0 release per the roadmap.
+Per the ratified D-0077, the follow-on is **not** scheduled now: a separate
+design doc + implementation ticket for *interface default methods* (Alt A) would
+be written only once real-use friction is logged, sequenced after the 1.0
+release per the roadmap.
 If the maintainer instead wants full classes scoped despite this
 recommendation, that is a new, large design doc of its own — this document is
 the argument for not writing it.
@@ -440,7 +441,8 @@ No IR-schema or runtime-ABI boundary is touched by this doc.
 
 ## Open issues
 
-Load-bearing calls for the maintainer to weigh in on:
+The verdict (D-0077) is ratified; these are the follow-on calls it leaves for
+when the escape-hatch path is next considered:
 
 1. **Accept the verdict?**
    Decline full classes + keep #66 deferred, with interface default methods as
@@ -457,5 +459,6 @@ Load-bearing calls for the maintainer to weigh in on:
 5. **Ticket hygiene.**
    Keep #66 open-but-deferred as the tracker, or close it in favor of a narrower
    "interface default methods" ticket when/if that path is taken?
-6. **D-0077 id and wording** — confirm the number (next free after D-0076) and
-   the phrasing before it is recorded as anything beyond *Proposed*.
+6. **D-0077 id and wording** — ratified as written (number next free after
+   D-0076); to be transcribed into `DECISIONS.md` as a Locked entry in a
+   follow-up.
