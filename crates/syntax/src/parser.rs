@@ -921,6 +921,16 @@ impl Parser {
         });
     }
 
+    /// Record an error at an explicit span (e.g. the offending value's span,
+    /// which may already have been consumed).
+    fn error_at(&mut self, span: Span, code: ErrorCode, message: impl Into<String>) {
+        self.errors.push(ParseError {
+            code,
+            message: message.into(),
+            span,
+        });
+    }
+
     fn span_from(&self, start: u32) -> Span {
         Span::new(start, self.prev_end())
     }
@@ -1022,6 +1032,12 @@ impl Parser {
                 // `Item::Import` per listed module, so each resolves exactly
                 // like a standalone `import`.
                 items.extend(self.parse_import().into_iter().map(Item::Import))
+            }
+            TokenKind::Keyword(Keyword::When) => {
+                if !decos.is_empty() {
+                    self.error_here(ErrorCode::ZAP2003, "decorators must precede a declaration");
+                }
+                items.push(Item::Cfg(self.parse_cfg_items()))
             }
             _ => {
                 if !decos.is_empty() {
@@ -1548,6 +1564,7 @@ impl Parser {
                     | Keyword::Try
                     | Keyword::With
                     | Keyword::Scope
+                    | Keyword::When
             )
         )
     }
@@ -1562,8 +1579,191 @@ impl Parser {
             TokenKind::Keyword(Keyword::Try) => self.parse_try(),
             TokenKind::Keyword(Keyword::With) => self.parse_with(),
             TokenKind::Keyword(Keyword::Scope) => self.parse_scope(),
+            TokenKind::Keyword(Keyword::When) => Stmt::Cfg(self.parse_cfg_stmt()),
             _ => unreachable!("parse_compound called on non-compound token"),
         }
+    }
+
+    // --- conditional compilation (`when target.*`, I#139 / D-0079) ---
+
+    /// `when target.*` in item position: each arm's body is a block of items
+    /// (imports, declarations, bare statements). The dead arms are parsed so
+    /// they must be well-formed, but cfg resolution ([`crate::cfg`]) keeps only
+    /// the matching arm before any later phase runs.
+    fn parse_cfg_items(&mut self) -> CfgItemBlock {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::When, "'when'");
+        let mut arms = Vec::new();
+        let pred = self.parse_cfg_predicate();
+        let body = self.parse_item_block();
+        arms.push(CfgItemArm {
+            predicate: pred,
+            body,
+            span: self.span_from(start),
+        });
+        while self.is_kw(Keyword::Elif) {
+            let arm_start = self.peek_span().start;
+            self.bump();
+            let pred = self.parse_cfg_predicate();
+            let body = self.parse_item_block();
+            arms.push(CfgItemArm {
+                predicate: pred,
+                body,
+                span: self.span_from(arm_start),
+            });
+        }
+        let (else_body, else_span) = if self.is_kw(Keyword::Else) {
+            let es = self.peek_span();
+            self.bump();
+            (Some(self.parse_item_block()), Some(es))
+        } else {
+            (None, None)
+        };
+        CfgItemBlock {
+            arms,
+            else_body,
+            else_span,
+            span: self.span_from(start),
+        }
+    }
+
+    /// `when target.*` in statement position: each arm's body is an ordinary
+    /// statement block, reusing [`Self::parse_block`].
+    fn parse_cfg_stmt(&mut self) -> CfgStmtBlock {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::When, "'when'");
+        let mut arms = Vec::new();
+        let pred = self.parse_cfg_predicate();
+        let body = self.parse_block();
+        arms.push(CfgStmtArm {
+            predicate: pred,
+            body,
+            span: self.span_from(start),
+        });
+        while self.is_kw(Keyword::Elif) {
+            let arm_start = self.peek_span().start;
+            self.bump();
+            let pred = self.parse_cfg_predicate();
+            let body = self.parse_block();
+            arms.push(CfgStmtArm {
+                predicate: pred,
+                body,
+                span: self.span_from(arm_start),
+            });
+        }
+        let (else_body, else_span) = if self.is_kw(Keyword::Else) {
+            let es = self.peek_span();
+            self.bump();
+            (Some(self.parse_block()), Some(es))
+        } else {
+            (None, None)
+        };
+        CfgStmtBlock {
+            arms,
+            else_body,
+            else_span,
+            span: self.span_from(start),
+        }
+    }
+
+    /// `: NEWLINE INDENT { item } DEDENT` — the item-list counterpart of
+    /// [`Self::parse_block`], used by item-position `when` arms.
+    fn parse_item_block(&mut self) -> Vec<Item> {
+        self.expect(&TokenKind::Colon, "':'");
+        self.expect(&TokenKind::Newline, "newline");
+        self.expect(&TokenKind::Indent, "indented block");
+        let mut items = Vec::new();
+        self.skip_newlines();
+        while !self.is(&TokenKind::Dedent) && !self.at_eof() {
+            let before = self.pos;
+            self.parse_top_level(&mut items);
+            self.skip_newlines();
+            if self.pos == before {
+                self.error_here(ErrorCode::ZAP2008, "unexpected token in `when` block");
+                self.bump();
+                self.skip_newlines();
+            }
+        }
+        self.expect(&TokenKind::Dedent, "end of block");
+        items
+    }
+
+    /// Parse one atomic `when`/`elif` target predicate (D-0079 §4), one of:
+    /// `target.arch == .<arch>`, `target.os == .<os>`, `target.has(.<feature>)`.
+    fn parse_cfg_predicate(&mut self) -> CfgPredicate {
+        let start = self.peek_span().start;
+        // `target`
+        match self.ident_opt() {
+            Some((name, _)) if name == "target" => {}
+            _ => {
+                self.error_here(
+                    ErrorCode::ZAP2015,
+                    "a `when` predicate must start with `target`",
+                );
+                return CfgPredicate::Arch(CfgArch::X86_64);
+            }
+        }
+        self.expect(&TokenKind::Dot, "'.' after `target`");
+        let field = self.ident("`arch`, `os`, or `has`");
+        match field.as_str() {
+            "arch" => {
+                self.expect(&TokenKind::EqEq, "'==' after `target.arch`");
+                let (val, span) = self.parse_dot_name();
+                match crate::cfg::arch_from_str(&val) {
+                    Some(a) => CfgPredicate::Arch(a),
+                    None => {
+                        self.error_at(
+                            span,
+                            ErrorCode::ZAP2016,
+                            format!(
+                                "unknown target arch `.{val}` (expected `.x86_64` or `.aarch64`)"
+                            ),
+                        );
+                        CfgPredicate::Arch(CfgArch::X86_64)
+                    }
+                }
+            }
+            "os" => {
+                self.expect(&TokenKind::EqEq, "'==' after `target.os`");
+                let (val, span) = self.parse_dot_name();
+                match crate::cfg::os_from_str(&val) {
+                    Some(o) => CfgPredicate::Os(o),
+                    None => {
+                        self.error_at(
+                            span,
+                            ErrorCode::ZAP2016,
+                            format!(
+                                "unknown target os `.{val}` (expected `.linux`, `.windows`, or `.macos`)"
+                            ),
+                        );
+                        CfgPredicate::Os(CfgOs::Linux)
+                    }
+                }
+            }
+            "has" => {
+                self.expect(&TokenKind::LParen, "'(' after `target.has`");
+                let (val, _) = self.parse_dot_name();
+                self.expect(&TokenKind::RParen, "')' to close `target.has(...)`");
+                CfgPredicate::HasFeature(val)
+            }
+            _ => {
+                self.error_at(
+                    self.span_from(start),
+                    ErrorCode::ZAP2015,
+                    "a `when` predicate tests `target.arch`, `target.os`, or `target.has(...)`",
+                );
+                CfgPredicate::Arch(CfgArch::X86_64)
+            }
+        }
+    }
+
+    /// Parse a leading-dot enum-style name `.ident` and return the identifier
+    /// plus its span.
+    fn parse_dot_name(&mut self) -> (String, Span) {
+        let start = self.peek_span().start;
+        self.expect(&TokenKind::Dot, "'.' before a target value");
+        let name = self.ident("a target value name");
+        (name, self.span_from(start))
     }
 
     /// `scope [ ( opts ) ]: BLOCK` (D-0044/D-0045). The optional parenthesized

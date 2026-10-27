@@ -317,6 +317,42 @@ match command:
         unknown()
 ```
 
+**Conditional compilation — `when target.*` (I#139, D-0079; Experimental).**
+A compile-time `when` selects code by the build target. The compiler evaluates
+each arm's predicate against the active target and keeps only the first match
+(or the `else`); the other arms are **dead arms** — parsed, so they must be
+well-formed, but never name-resolved, type-checked, or lowered, so an arm
+written for another target cannot break the build ("dead-arm skip"). It is
+block-level (declaration/import and statement position) and introduces no new
+scope: the surviving arm's declarations land in the enclosing module/block. The
+v1 predicates are `target.arch == .x86_64|.aarch64`, `target.os ==
+.linux|.windows|.macos`, and `target.has(.<feature>)` for a **compile-time**
+feature baked into the build via `--target-feature` (distinct from runtime CPU
+detection). Boolean combinators are not in v1. This is the portable guard for
+the opt-in `arch.*` intrinsics (a later phase of D-0079): an off-target intrinsic
+import is a hard error, and `when` is how a program writes both paths.
+
+```python
+when target.os == .windows:
+    def path_sep() -> str:
+        return "\\"
+else:
+    def path_sep() -> str:
+        return "/"
+
+# Later phases add an off-target-import-guarded `arch.*` intrinsic module; a
+# program selects the right one the same way:
+when target.arch == .x86_64:
+    import arch.x86_64 as a           # (a later phase adds the arch module)
+elif target.arch == .aarch64:
+    import arch.aarch64 as a
+```
+
+In Phase 1 the architecture/OS come from the host the compiler runs on (Zap
+builds natively; cross-target selection via `--target` arrives with
+cross-compilation in a later phase). `--target-feature <name>` is repeatable and
+makes `target.has(.name)` true in the build.
+
 ## 7. Functions, lambdas, generators (D-0026)
 
 ```python
@@ -690,7 +726,7 @@ programmatically; `zap inspect <pid>` triggers them against a running process.
 ## Appendix A — Reserved words (provisional)
 
 `def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
-`match`, `break`, `continue`, `auto`,
+`match`, `when`, `break`, `continue`, `auto`,
 `const`, `True`, `False`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
 `finally`, `with`, `as`, `yield`, `lambda`, `assert`, `spawn`, `scope`, `channel`,
 `select`, `case`, `close`, `struct`, `interface`, `enum`, `annotation`,
@@ -726,4 +762,5 @@ change), **I** Internal (no contract). Sections marked **S** are **frozen for
 | Numeric arrays / SIMD | Locked design, promotion open | **E** |
 | `set` type | Shipped, surface open | **E** |
 | C-style bitfields on `value struct` | Locked (D-0068) | **E** |
+| `when target.*` conditional compilation | Shipped Phase 1 (D-0079) | **E** |
 | `**kwargs` arbitrary named args | Deferred (D-0038) | n/a |

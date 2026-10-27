@@ -264,6 +264,15 @@ define_codes! {
         "An indexing `[...]` must contain an index expression.";
     ZAP2014 = 2014 : "expected an expression",
         "An expression is required here and none was found.";
+    ZAP2015 = 2015 : "invalid `when` target predicate",
+        "A `when target.*` arm must test the build target in one of the v1 \
+         forms: `target.arch == .<arch>`, `target.os == .<os>`, or \
+         `target.has(.<feature>)` (I#139, D-0079). Boolean combinators are not \
+         supported yet.";
+    ZAP2016 = 2016 : "unknown target name in `when`",
+        "The architecture or OS named in a `when target.*` predicate is not one \
+         the compiler knows. v1 accepts `.x86_64`/`.aarch64` for `target.arch` \
+         and `.linux`/`.windows`/`.macos` for `target.os`.";
 
     // ---- ZAP3xxx — name resolution / imports -------------------------------
     ZAP3001 = 3001 : "unknown name",

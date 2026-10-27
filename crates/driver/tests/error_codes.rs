@@ -34,6 +34,16 @@ fn lexical_codes() {
 fn syntax_codes() {
     // A dangling binary operator — an expression was required.
     assert_code("def main():\n    x = 1 +\n", "ZAP2014");
+    // A malformed `when target.*` predicate (I#139, D-0079).
+    assert_code(
+        "when target.cpu == .x86_64:\n    def f():\n        pass\n",
+        "ZAP2015",
+    );
+    // An unknown architecture in a `when target.arch` predicate.
+    assert_code(
+        "when target.arch == .sparc:\n    def f():\n        pass\n",
+        "ZAP2016",
+    );
 }
 
 #[test]

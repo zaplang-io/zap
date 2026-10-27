@@ -344,6 +344,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Generics incl. bounds (D-0064) | **S** |
 | Coroutines/channels/`select`/`scope:`/`spawn detached` (D-0031/0044/0045); sync primitives + `Atomic[T]` (D-0032/0066); `Optional[T]` (D-0065) | **S** |
 | Numeric arrays / SIMD + dtype promotion (D-0011); `set` type; C-style bitfields (D-0068); Python interop; `@derive(Yaml)`/`@derive(Csv)` | **E** |
+| `when target.*` compile-time conditional compilation (D-0079, I#139 Phase 1) | **E** |
 | Value/memory layout, enum/closure representation (§1.5) | **I** |
 
 **Standard library (per module; `crates/sema/src/modules/`, D-0056).**

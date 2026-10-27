@@ -1088,6 +1088,21 @@ impl Walk {
                 });
             }
             Item::Stmt(st) => self.stmt(st),
+            // `when target.*` conditional compilation (I#139): for analysis
+            // (symbols, go-to-def, hover) walk *every* arm so editor features
+            // see declarations regardless of which target is active.
+            Item::Cfg(c) => {
+                for arm in &c.arms {
+                    for it in &arm.body {
+                        self.item(it);
+                    }
+                }
+                if let Some(eb) = &c.else_body {
+                    for it in eb {
+                        self.item(it);
+                    }
+                }
+            }
         }
     }
 
@@ -1308,6 +1323,15 @@ impl Walk {
                 self.expr(value);
             }
             Stmt::AssignTuple { value, .. } => self.expr(value),
+            // `when target.*` (I#139): walk every arm for analysis purposes.
+            Stmt::Cfg(c) => {
+                for arm in &c.arms {
+                    self.block(&arm.body);
+                }
+                if let Some(eb) = &c.else_body {
+                    self.block(eb);
+                }
+            }
             Stmt::Break(_) | Stmt::Continue(_) => {}
         }
     }
