@@ -17,3 +17,18 @@ zapc_syntax = { path = "../syntax" }
 # edits to the churny `lower.rs` don't recompile them; re-exported from `lib.rs`.
 zapc_ir_core = { path = "../ir_core" }
 zapc_mono = { path = "../mono" }
+
+# loom is pulled in ONLY under `--cfg loom` (the exhaustive-interleaving model
+# check of the `concurrent.Queue` MPSC CAS protocol, I#184/D-0078 §5 — see
+# `tests/concurrent_loom.rs`). A target-cfg dependency so an ordinary build /
+# CI run never fetches or compiles it; run the model with
+# `RUSTFLAGS="--cfg loom" cargo test -p zapc_ir --test concurrent_loom`.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+# `--cfg loom` is a deliberate, externally-set build cfg (not a Cargo feature),
+# so declare it as known — otherwise the `unexpected_cfgs` lint warns on the
+# `#![cfg(loom)]` in `tests/concurrent_loom.rs`, which CI's `-D warnings` would
+# promote to an error even on an ordinary (non-loom) build.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
