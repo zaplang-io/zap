@@ -30,5 +30,16 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     let six = [i.into(), i.into(), i.into(), i.into(), i.into(), i.into()];
     cg.declare_rt("zap_datetime_to_unix", &six, Some(i.into()));
     cg.declare_rt("zap_datetime_format_iso", &six, Some(p.into()));
+    // (year, month, day, hour, minute, second, fmt: ZapStr*) -> ZapStr* (#286)
+    let six_and_fmt = [
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        i.into(),
+        p.into(),
+    ];
+    cg.declare_rt("zap_datetime_strftime", &six_and_fmt, Some(p.into()));
     cg.declare_rt("zap_datetime_parse_iso", &[p.into()], Some(i.into()));
 }

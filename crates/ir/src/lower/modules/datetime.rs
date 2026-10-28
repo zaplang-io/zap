@@ -5,8 +5,10 @@
 //! `MemStats`: `StructNew` then a `FieldSet` per component, each fed by a
 //! `zap_datetime_<field>(ts, is_local)` runtime getter. `to_timestamp`/`format`
 //! read the six fields back with `FieldGet` and hand them to a single runtime
-//! call. `parse` lowers an ISO-8601 string to a Unix timestamp and then builds a
-//! UTC `DateTime` from it, reusing the getters.
+//! call. `strftime` / 2-arg `format(dt, fmt)` read the same six fields and pass
+//! them plus the format `ZapStr*` to `zap_datetime_strftime` (#286). `parse`
+//! lowers an ISO-8601 string to a Unix timestamp and then builds a UTC
+//! `DateTime` from it, reusing the getters.
 
 use zapc_syntax::ast;
 
@@ -82,6 +84,22 @@ fn read_components(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<Vec<Value
     Ok(comps)
 }
 
+/// Lower a `(DateTime, fmt)` custom-format call: read the six fields of the
+/// first argument, lower the format string, and hand both to the runtime
+/// `zap_datetime_strftime` (#286). The result is a fresh `str` (`Ty::Ptr`).
+fn strftime(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+    let mut call_args = read_components(lowerer, args)?;
+    let (fmt, _) = lowerer.expr(&args[1].value)?;
+    call_args.push(fmt);
+    let d = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(d),
+        func: "zap_datetime_strftime".to_string(),
+        args: call_args,
+    });
+    Ok((d, Ty::Ptr))
+}
+
 fn lower(
     lowerer: &mut FnLower,
     method: &str,
@@ -124,6 +142,8 @@ fn lower(
             });
             (d, Ty::I64)
         }
+        // One arg: ISO-8601. Two args: strftime-style custom format (#286).
+        "format" if args.len() == 2 => strftime(lowerer, args)?,
         "format" => {
             let comps = read_components(lowerer, args)?;
             let d = lowerer.new_value(Ty::Ptr);
@@ -134,6 +154,7 @@ fn lower(
             });
             (d, Ty::Ptr)
         }
+        "strftime" => strftime(lowerer, args)?,
         _ => return Ok(None),
     };
     Ok(Some(r))

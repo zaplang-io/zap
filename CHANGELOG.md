@@ -45,7 +45,8 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   C-style bitfields (D-0068); Python interop; `@derive(Json/Yaml/Csv)`; and
   `when target.*` compile-time conditional compilation (D-0079, Experimental).
 - **Standard library.** `io`, `fs`, `os`, `sys`, `process`, `math`, `random`,
-  `time`, `datetime`; `collections` extras (`deque`, `bisect`, `oset`), `sync`,
+  `time`, `datetime` (incl. `strftime` / 2-arg `format` custom date formatting,
+  #286); `collections` extras (`deque`, `bisect`, `oset`), `sync`,
   `json`, `logging`, `argparse`; the `signal`/`gc`/`runtime` APIs; and the
   Experimental `crypto`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`,
   migration-only `threading`, and `concurrent` lock-free `Counter` + MPSC

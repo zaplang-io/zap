@@ -60,6 +60,47 @@ fn is_datetime(t: &Ty) -> bool {
     matches!(t, Ty::Named(n) if n == DATETIME)
 }
 
+/// Check a `(DateTime, str)` custom-format call (`strftime` / 2-arg `format`),
+/// inferring both operands so each is type-checked (#286).
+fn check_strftime(checker: &mut Checker, method: &str, args: &[Arg], span: Span) {
+    if args.len() != 2 {
+        checker.error(
+            ErrorCode::ZAP4025,
+            format!(
+                "datetime.{method}() takes 2 arguments, found {}",
+                args.len()
+            ),
+            span,
+        );
+        for a in args {
+            checker.infer(&a.value);
+        }
+        return;
+    }
+    let dt = checker.infer(&args[0].value);
+    if !is_datetime(&dt) && !matches!(dt, Ty::Unknown) {
+        checker.error(
+            ErrorCode::ZAP4024,
+            format!(
+                "datetime.{method}() expects a DateTime, found {}",
+                dt.display()
+            ),
+            expr_span(&args[0].value),
+        );
+    }
+    let fmt = checker.infer(&args[1].value);
+    if !matches!(fmt, Ty::Str | Ty::Unknown) {
+        checker.error(
+            ErrorCode::ZAP4024,
+            format!(
+                "datetime.{method}() expects a str format, found {}",
+                fmt.display()
+            ),
+            expr_span(&args[1].value),
+        );
+    }
+}
+
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     match method {
         // DateTime from a Unix timestamp (seconds since the epoch).
@@ -77,9 +118,20 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect1(checker, method, args, span, "a DateTime", is_datetime);
             Some(Ty::Int64)
         }
-        // DateTime -> ISO-8601 string.
+        // DateTime -> string. One arg: ISO-8601. Two args: strftime-style
+        // custom format (`format(dt, fmt)`), the overload of `strftime` (#286).
         "format" => {
-            expect1(checker, method, args, span, "a DateTime", is_datetime);
+            if args.len() == 2 {
+                check_strftime(checker, method, args, span);
+            } else {
+                expect1(checker, method, args, span, "a DateTime", is_datetime);
+            }
+            Some(Ty::Str)
+        }
+        // DateTime + strftime format string -> string (#286). Python-faithful
+        // directives built from the numeric fields; see the runtime.
+        "strftime" => {
+            check_strftime(checker, method, args, span);
             Some(Ty::Str)
         }
         // ISO-8601 string -> DateTime (UTC).
