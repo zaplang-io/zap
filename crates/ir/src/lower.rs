@@ -8249,6 +8249,12 @@ impl<'a> FnLower<'a> {
         name: &str,
         args: &[ast::Arg],
     ) -> Result<(Value, Ty), LowerError> {
+        // `dict.get(key) -> Optional[V]` (ticket #281). Monomorphization has
+        // encoded the concrete `Optional$V` instance name into the method symbol
+        // (`get$Optional$str`), since the lossy `Elem` kind here cannot name it.
+        if let Some(opt_name) = name.strip_prefix("get$") {
+            return self.lower_dict_get(recv, kk, vk, opt_name, args);
+        }
         if !args.is_empty() {
             return Err(err(format!("dict.{name}() takes no arguments")));
         }
@@ -8281,10 +8287,109 @@ impl<'a> FnLower<'a> {
                 Ok((d, Ty::Dict(kk, vk)))
             }
             "items" => self.lower_dict_items(recv, kk, vk),
+            "get" => Err(err(
+                "dict.get()'s result type could not be resolved; annotate the \
+                 result as `Optional[V]` or give the dict a concrete type \
+                 (ticket #281)",
+            )),
             other => Err(err(format!(
-                "dict has no method '{other}' (supported: keys, values, items, copy)"
+                "dict has no method '{other}' (supported: keys, values, items, copy, get)"
             ))),
         }
+    }
+
+    /// Lower `d.get(key) -> Optional[V]` (ticket #281): a safe, non-aborting read
+    /// — `Some(value)` when the key is present, `None` when absent. The precise
+    /// `Optional$V` instance name is passed in `opt_name` (encoded into the method
+    /// symbol by monomorphization, which alone knew the concrete `V`). Presence is
+    /// decided by the `#299` membership probe (`zap_dict_contains_*`), never by the
+    /// fetched word, so a legitimately-stored `0`/null value is reported as
+    /// `Some`, not confused with a miss. The branch builds `Some`/`None` with the
+    /// shared niche/tagged `Optional` helpers and joins through a slot.
+    fn lower_dict_get(
+        &mut self,
+        recv: Value,
+        kk: Elem,
+        vk: Elem,
+        opt_name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        if args.len() != 1 {
+            return Err(err(format!(
+                "dict.get() takes exactly one argument (the key), got {}",
+                args.len()
+            )));
+        }
+        let sid = self.ctx.ids.get(opt_name).copied().ok_or_else(|| {
+            err(format!(
+                "dict.get()'s result type '{opt_name}' was not instantiated (internal; ticket #281)"
+            ))
+        })?;
+        let opt = optional_layout(self.ctx, Ty::Struct(sid)).ok_or_else(|| {
+            err(format!(
+                "dict.get()'s result type '{opt_name}' is not an Optional instance (internal)"
+            ))
+        })?;
+
+        // The key, coerced to the dict's key kind, plus the struct-key hash/eq
+        // function pointers (empty for scalar/string keys), shared by the
+        // presence probe and the value fetch.
+        let (kv, kt) = self.expr(&args[0].value)?;
+        let key = self.coerce(kv, kt, kk.ty());
+        let kfns = self.key_fn_args(kk)?;
+
+        // present = (contains(d, key) != 0)
+        let word = self.new_value(Ty::I64);
+        let mut cargs = vec![recv, key];
+        cargs.extend_from_slice(&kfns);
+        self.emit(Inst::Call {
+            dest: Some(word),
+            func: format!("zap_dict_contains_{}", kk.key_suffix()),
+            args: cargs,
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        let present = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: present,
+            pred: CmpPred::Ne,
+            lhs: word,
+            rhs: zero,
+        });
+
+        let slot = self.alloca(Ty::Struct(sid));
+        let some_bb = self.new_block();
+        let none_bb = self.new_block();
+        let join_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: present,
+            then_bb: some_bb,
+            else_bb: none_bb,
+        });
+
+        // present -> Some(d[key])
+        self.position(some_bb);
+        let raw = self.new_value(vk.ty());
+        let mut gargs = vec![recv, key];
+        gargs.extend_from_slice(&kfns);
+        self.emit(Inst::Call {
+            dest: Some(raw),
+            func: format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
+            args: gargs,
+        });
+        let inner = self.coerce(raw, vk.ty(), opt.payload_ty);
+        let someval = gen_opt_some(self, &opt, inner);
+        self.store(slot, someval);
+        self.set_term(Term::Br(join_bb));
+
+        // absent -> None
+        self.position(none_bb);
+        let noneval = gen_opt_none(self, &opt);
+        self.store(slot, noneval);
+        self.set_term(Term::Br(join_bb));
+
+        self.position(join_bb);
+        let out = self.load(slot, Ty::Struct(sid));
+        Ok((out, Ty::Struct(sid)))
     }
 
     /// Lower `d.items()` to a `list[(K, V)]` (ticket #299): snapshot the keys,

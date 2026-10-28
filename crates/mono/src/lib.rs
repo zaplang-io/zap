@@ -199,6 +199,29 @@ fn type_name(t: &Type) -> String {
     }
 }
 
+/// The value type `V` of a `dict[K, V]` receiver type, else `None` (ticket #281,
+/// used to resolve `dict.get`'s `Optional[V]` result instance).
+fn dict_value_ty(cty: &CTy) -> Option<Type> {
+    if let CTy::Ty(Type::Named { name, args, .. }) = cty {
+        if name == "dict" && args.len() == 2 {
+            return Some(args[1].clone());
+        }
+    }
+    None
+}
+
+/// The payload type `V` of an expected `Optional[V]` type, else `None` (ticket
+/// #281): the binding's declared-type sink that fixes `dict.get`'s result when
+/// the receiver's dict type is opaque to this inferer.
+fn optional_payload_ty(expected: Option<&Type>) -> Option<Type> {
+    if let Some(Type::Named { name, args, .. }) = expected {
+        if name == "Optional" && args.len() == 1 {
+            return Some(args[0].clone());
+        }
+    }
+    None
+}
+
 /// Does a concrete method `have` match an interface method `want` for structural
 /// conformance (D-0016/I#84, re-derived for monomorphization, I#164)? The
 /// receiver (`self`, parameter 0) is ignored — it is the differing
@@ -2035,6 +2058,29 @@ impl Mono<'_> {
             }
             // Ordinary method call `recv.m(args)`.
             let (bexpr, bcty) = self.rewrite_expr(base, env, None)?;
+            // Built-in `dict.get(key) -> Optional[V]` (ticket #281): a safe read.
+            // Lowering sees only the lossy element *kind* (ptr vs scalar), never
+            // the precise value type, so it cannot pick the right `Optional$V`
+            // enum instance on its own. Here — where the concrete `V` is known —
+            // request that instance and encode its mangled name into the method
+            // symbol (`get$Optional$str`), which lowering decodes. `V` comes from
+            // the receiver's dict type, or (when the receiver's type is opaque to
+            // this inferer) from the expected `Optional[..]` sink of the binding.
+            if variant == "get" {
+                if let Some(vty) = dict_value_ty(&bcty).or_else(|| optional_payload_ty(expected)) {
+                    let opt_mangled = self.request("Optional", std::slice::from_ref(&vty));
+                    let node = Expr::Call {
+                        callee: Box::new(Expr::Attr {
+                            base: Box::new(bexpr),
+                            name: format!("get${opt_mangled}"),
+                            span: *aspan,
+                        }),
+                        args: nargs,
+                        span,
+                    };
+                    return Ok((node, CTy::Ty(self.named("Optional", vec![vty]))));
+                }
+            }
             // Generic method call (I#161): the method carries its own type
             // parameters. Infer them (argument unification + expected-type sink)
             // and dispatch to the specialized method symbol on the receiver's
