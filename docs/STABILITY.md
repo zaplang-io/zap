@@ -382,7 +382,9 @@ headers on the server `http.respond` is the companion gap tracked in #279.
 | Surface | Tier |
 |---|---|
 | `zap.toml`, `zap.lock`, MVS resolver, `git`/`path` sources, checksum DB | **S** (per §1.4) |
-| Registry index + `registry` source + `Source::Registry` (read path, D-0027) | **E** (new; read-only, no publish path) |
+| Registry index + `registry` source + `Source::Registry` (read path, D-0027) | **E** (read path; I#236) |
+| `zap publish` / `zap login` / `zap search` / `zap info` (write + discovery, D-0027/D-0083, I#237) | **E** (new; additive CLI verbs per D-0076; hosted write API gated on the org move) |
+| `ZAPnnnn` registry/publish diagnostics `ZAP6100`–`ZAP6109` | **E** (meaning per §3.4) |
 
 **Diagnostics (`ZAPnnnn`, D-0071, §3.4) and `zap fmt` (D-0037).**
 

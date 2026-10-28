@@ -609,6 +609,20 @@ env-var-activated **`zenv`** (`source zenv/activate`) isolates both the Zap
 module cache and a nested Python venv at **`zenv/venv`** (which the embedded
 CPython uses), for a fully reproducible environment.
 
+**Optional registry (D-0027, experimental).** On top of the decentralized model
+there is an *additive* static-file package registry: a fourth `registry` source
+resolved through an HTTPS/`file://` index of names → versions → `zap1:`
+checksums, verified client-side against the same tree hash a `git`/`path` pin
+uses. The CLI covers both ends: `zap publish` packages the current project and
+appends its index line + archive to a **static index** (today a local/`file://`
+index; an `https://` index needs the hosted authenticated write API, which is
+gated on the org move); `zap search <query>` lists packages in a local index and
+`zap info <name>` shows a package's published versions, checksums and yank state
+from any static index. `zap login` stores a bearer token outside the repo for
+the (gated) hosted write path. These verbs are **experimental** (the 1.0 CLI
+surface is frozen, D-0076, so they are additive). Full design in
+`design/0027-registry.md`.
+
 ## 14. Regular expressions (D-0010)
 
 Perl-style literals with PCRE2; `m`/`s` prefixes required. Full details in
