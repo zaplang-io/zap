@@ -34,6 +34,10 @@ impl Project {
     fn entry(&self, rel: &str) -> String {
         self.dir.join(rel).display().to_string()
     }
+
+    fn path(&self, rel: &str) -> PathBuf {
+        self.dir.join(rel)
+    }
 }
 
 impl Drop for Project {
@@ -185,4 +189,88 @@ fn local_shadowing_an_import_is_not_treated_as_module_access() {
     // local, not a bare module name).
     let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
     assert!(fn_names(&m).contains(&"main".to_string()));
+}
+
+// --- Stage B: cross-package dependency imports (via explicit pkg roots) ------
+
+#[test]
+fn dependency_import_resolves_and_mangles() {
+    // A dependency `aws_core` materialized at <pkg>/aws_core/src/aws_core.zap.
+    let p = Project::new("dep");
+    p.write(
+        "pkg/aws_core/src/aws_core.zap",
+        "def sign(int64 n) -> int64:\n    return n + 1\n",
+    );
+    p.write(
+        "proj/main.zap",
+        "import aws_core\n\ndef main():\n    print(aws_core.sign(5))\n",
+    );
+    let m = load_program_with(&p.entry("proj/main.zap"), &target(), vec![p.path("pkg")])
+        .expect("links against the dependency");
+    let names = fn_names(&m);
+    assert!(names.contains(&"main".to_string()));
+    assert!(
+        names.iter().any(|n| n.contains("sign") && n != "sign"),
+        "dependency symbol should be mangled, got {names:?}"
+    );
+}
+
+#[test]
+fn dependency_submodule_resolves() {
+    // `import aws_core.sigv4` -> <pkg>/aws_core/src/sigv4.zap.
+    let p = Project::new("depsub");
+    p.write(
+        "pkg/aws_core/src/sigv4.zap",
+        "def canon(int64 n) -> int64:\n    return n * 2\n",
+    );
+    p.write(
+        "proj/main.zap",
+        "import aws_core.sigv4\n\ndef main():\n    print(sigv4.canon(3))\n",
+    );
+    let m = load_program_with(&p.entry("proj/main.zap"), &target(), vec![p.path("pkg")])
+        .expect("links the submodule");
+    assert!(fn_names(&m).iter().any(|n| n.contains("canon")));
+}
+
+#[test]
+fn service_depends_on_core_transitively() {
+    // main -> aws_s3 (dep) -> aws_core (dep): a service package whose own module
+    // imports the shared core, mirroring D-0011 §8.
+    let p = Project::new("svc");
+    p.write(
+        "pkg/aws_core/src/aws_core.zap",
+        "def sign(int64 n) -> int64:\n    return n + 1\n",
+    );
+    p.write(
+        "pkg/aws_s3/src/aws_s3.zap",
+        "import aws_core\n\ndef put(int64 n) -> int64:\n    return aws_core.sign(n) + 10\n",
+    );
+    p.write(
+        "proj/main.zap",
+        "import aws_s3\n\ndef main():\n    print(aws_s3.put(5))\n",
+    );
+    let m = load_program_with(&p.entry("proj/main.zap"), &target(), vec![p.path("pkg")])
+        .expect("links the service + core");
+    // All three modules contributed functions; each dep symbol is mangled.
+    let names = fn_names(&m);
+    assert!(names.contains(&"main".to_string()));
+    assert!(names.iter().any(|n| n.contains("put")));
+    assert!(names.iter().any(|n| n.contains("sign")));
+}
+
+#[test]
+fn missing_dependency_module_reports() {
+    // The dependency dir exists but the requested module file does not.
+    let p = Project::new("depmissing");
+    p.write(
+        "pkg/aws_core/src/aws_core.zap",
+        "def sign() -> int64:\n    return 1\n",
+    );
+    p.write(
+        "proj/main.zap",
+        "import aws_core.nope\n\ndef main():\n    print(1)\n",
+    );
+    let err =
+        load_program_with(&p.entry("proj/main.zap"), &target(), vec![p.path("pkg")]).unwrap_err();
+    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3010));
 }

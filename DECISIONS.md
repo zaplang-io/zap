@@ -1971,8 +1971,8 @@ New dep: `rustyline` (codegen feature). Still host-only (needs LLVM), POSIX-only
 ## D-0081 — Zap-to-Zap module & package imports (I#283)
 
 **Status:** Accepted — full text in `design/0034-modules.md`. **Stage A**
-(intra-project local modules) is implemented; **Stage B** (cross-package
-dependency imports via `zenv`) is the follow-up. Concretizes [[D-0028]]
+(intra-project local modules) and **Stage B** (cross-package dependency imports
+resolved through `zenv`, D-0052) are both implemented. Concretizes [[D-0028]]
 (module/visibility model) and
 [[D-0052]] (logical dependency names via `zenv`) into the compiler front end so
 user code can span files and a library package can be imported. Surfaced by

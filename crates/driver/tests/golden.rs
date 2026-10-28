@@ -237,6 +237,22 @@ fn golden_projects_match() {
 
         let mut cmd = Command::new(bin);
         cmd.arg("run").arg(&main);
+        // Optional `env` sidecar: `KEY=VALUE` lines set on the child's
+        // environment, with `$PROJDIR` expanded to the project's absolute path.
+        // Used by the cross-package fixture to point `ZAP_ZENV` at a prebuilt
+        // `zenv/` holding materialized dependency packages (I#283/D-0081 Stage B).
+        if let Ok(env) = std::fs::read_to_string(proj.join("env")) {
+            let projdir = proj.display().to_string();
+            for line in env.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    cmd.env(k.trim(), v.trim().replace("$PROJDIR", &projdir));
+                }
+            }
+        }
         let output = run_with_timeout(cmd, per_test, &main.display().to_string());
 
         let got = String::from_utf8_lossy(&output.stdout);
