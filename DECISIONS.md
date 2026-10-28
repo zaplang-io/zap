@@ -1968,6 +1968,51 @@ the accepted MCJIT + runtime-slot model (no architectural extension).
 New dep: `rustyline` (codegen feature). Still host-only (needs LLVM), POSIX-only
 (the JIT does not yet support Windows, so `$HOME` locates the history file).
 
+## D-0081 — Zap-to-Zap module & package imports (I#283)
+
+**Status:** Proposed — awaiting maintainer review; full text in
+`design/0034-modules.md`. Concretizes [[D-0028]] (module/visibility model) and
+[[D-0052]] (logical dependency names via `zenv`) into the compiler front end so
+user code can span files and a library package can be imported. Surfaced by
+dogfooding the AWS SDK (D-0011 §8); governed by D-0076 (modules/imports/
+visibility is already Stable).
+
+- **A module is a file; a package is a directory with a `zap.toml`** (D-0028).
+  Members are accessed **qualified** through the imported name (`a.helper()`),
+  as stdlib is today; there is **no** `from x import y` form (I#70).
+- **Path resolution.** Within a search root, `x.y.z` → `<root>/src/x/y/z.zap`
+  and bare `x` → `<root>/src/x.zap`. The first segment picks the root, in fixed
+  precedence: (1) compiler-known **stdlib** module (D-0056, unchanged), (2) a
+  **dependency** logical name → that package under `$ZAP_ZENV/pkg/<name>` with
+  the remaining segments mapped within it (D-0052), (3) otherwise a **local**
+  module within the importing file's own package `src/`. A local file colliding
+  with a stdlib/dependency name is shadowed (warning); higher precedence wins
+  deterministically because those names are 1.0-stable surface.
+- **Visibility** (D-0028, enforced): public = top-level name not starting with
+  `_`; a qualified access to another module's `_name` is a compile error; no
+  export marker, no re-export in v1.
+- **Entry & graph.** Entry stays `src/main.zap` / the explicit file; the compiler
+  discovers the import graph transitively and compiles the closure. **Non-entry
+  modules are declaration-only** (a top-level executable statement is an error) —
+  so importing has no import-time side effects or init order, which makes the
+  compilation strategy sound and cycles a pure naming question. v1 **rejects**
+  import cycles with a diagnostic (open: allow-now, since declaration-only makes
+  it sound).
+- **Compilation strategy (internal, not observable).** Merge the import graph
+  into **one** AST module before lowering, with module-qualified internal
+  symbols, and reuse the existing single-module `lower_module` →
+  `build_executable` path. AOT stays a single LLVM module, so the [[D-0080]]
+  JIT internal-linkage behavior (REPL MCJIT only) is not involved and
+  monomorphized generics keep working. Separate-object linking is rejected for
+  v1 (would commit a cross-object symbol ABI).
+- **Staging.** Stage A = intra-project local modules (closes the #283 repro);
+  Stage B = cross-package dependency imports via `zenv` (reuses Stage A; most
+  coupled to D-0052/D-0027). No IR-schema or runtime-ABI boundary is touched; no
+  new external deps.
+- **Open:** cycle policy (reject vs allow), package root-module convention
+  (`src/<name>.zap` vs `src/lib.zap`), re-export/aggregation, shadowing
+  (warning vs error).
+
 ## D-0082 — macOS support: ucontext behind the seam, kqueue netpoller, Intel-required CI (I#224)
 
 **Status:** Accepted. Issue #224, epic I#158 (`design/0016-platform-1.0.md`);
