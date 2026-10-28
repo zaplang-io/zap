@@ -3716,6 +3716,14 @@ impl<'a> FnLower<'a> {
 
     fn stmt(&mut self, st: &Stmt) -> Result<(), LowerError> {
         match st {
+            // `when target.*` conditional-compilation blocks are expanded by
+            // `zapc_syntax::cfg::resolve_cfg` before lowering (the driver resolves
+            // against the active target; sema re-resolves for the host). One
+            // reaching lowering is an internal invariant violation (I#139).
+            Stmt::Cfg(_) => Err(err(
+                "internal error: unresolved `when target.*` block reached \
+                 lowering (expected cfg resolution first)",
+            )),
             Stmt::Let {
                 ty, name, value, ..
             } => {
@@ -6125,6 +6133,7 @@ impl<'a> FnLower<'a> {
             if let Some((rt, ret)) = match fname.as_str() {
                 "__repl_load_i64" => Some(("zap_repl_slot_get_i64", Ty::I64)),
                 "__repl_load_ptr" => Some(("zap_repl_slot_get_ptr", Ty::Ptr)),
+                "__repl_load_f64" => Some(("zap_repl_slot_get_f64", Ty::F64)),
                 _ => None,
             } {
                 if args.len() != 1 {
@@ -6140,9 +6149,12 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((dest, ret));
             }
-            if let Some((rt, as_ptr)) = match fname.as_str() {
-                "__repl_store_i64" => Some(("zap_repl_slot_set_i64", false)),
-                "__repl_store_ptr" => Some(("zap_repl_slot_set_ptr", true)),
+            // `None` as the target type means a pointer store (pass through);
+            // `Some(t)` coerces the value to `t` for the slot cell.
+            if let Some((rt, target)) = match fname.as_str() {
+                "__repl_store_i64" => Some(("zap_repl_slot_set_i64", Some(Ty::I64))),
+                "__repl_store_ptr" => Some(("zap_repl_slot_set_ptr", None)),
+                "__repl_store_f64" => Some(("zap_repl_slot_set_f64", Some(Ty::F64))),
                 _ => None,
             } {
                 if args.len() != 2 {
@@ -6151,12 +6163,11 @@ impl<'a> FnLower<'a> {
                 let (idx, idxty) = self.expr(&args[0].value)?;
                 let idx = self.coerce(idx, idxty, Ty::I64);
                 let (val, valty) = self.expr(&args[1].value)?;
-                // Integer/bool bindings widen to the i64 slot cell; pointer
-                // bindings pass through unchanged.
-                let val = if as_ptr {
-                    val
-                } else {
-                    self.coerce(val, valty, Ty::I64)
+                // Integer/bool bindings widen to the i64 slot cell and floats to
+                // the f64 slot ABI; pointer bindings pass through unchanged.
+                let val = match target {
+                    Some(t) => self.coerce(val, valty, t),
+                    None => val,
                 };
                 self.emit(Inst::Call {
                     dest: None,

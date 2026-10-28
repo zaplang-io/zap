@@ -1,5 +1,8 @@
 (* ======================================================================
-   Zap grammar (EBNF) — draft, tracks SPEC.md v0.2 and DECISIONS D-0001..D-0058.
+   Zap grammar (EBNF) — tracks SPEC.md v0.3 and DECISIONS D-0001..D-0076.
+   The Stable 1.0 language surface (#206 / D-0076, docs/STABILITY.md §4.4) is
+   frozen; Experimental surfaces (arrays/SIMD, `set`, bitfields) are marked at
+   their productions. Additions post-freeze are backward-compatible (MINOR).
 
    Notation:
      ::=        definition
@@ -27,6 +30,7 @@ item          ::= function
                 | annotation_def
                 | decorator_def
                 | import
+                | cfg_item          (* `when target.*` conditional compilation (I#139) *)
                 | statement ;
 
 (* ---------- Decorators & annotations (D-0036) ---------- *)
@@ -184,6 +188,7 @@ compound_stmt ::= if_stmt
                 | try_stmt
                 | with_stmt
                 | scope_stmt
+                | cfg_stmt           (* `when target.*` conditional compilation (I#139) *)
                 | select_stmt ;
 
 if_stmt       ::= "if" expr block
@@ -227,6 +232,29 @@ scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
                      ordinary keyword args / a list literal / an int expression.
                      Owns every `spawn` lexically inside; joins/cancels at the dedent.
                      `spawn detached` (see simple_stmt) opts out of all scope ownership. *)
+
+(* ---------- Conditional compilation (`when target.*`, I#139 / D-0079) ---------- *)
+
+(* Compile-time conditional compilation: the compiler evaluates each predicate
+   against the active build target and keeps only the first matching arm (or the
+   `else`), splicing its body into the enclosing scope. The dead arms are parsed
+   (so they must be well-formed) but are never name-resolved, type-checked, or
+   lowered ("dead-arm skip"), so an arm written for another target does not break
+   the build. A `when` block introduces no new scope. `cfg_item` carries a block
+   of items (imports/declarations); `cfg_stmt` carries ordinary statement blocks.
+   Experimental, additive (D-0076); post-1.0. Boolean combinators are not in v1. *)
+cfg_item      ::= "when" cfg_pred item_block
+                  { "elif" cfg_pred item_block }
+                  [ "else" item_block ] ;
+cfg_stmt      ::= "when" cfg_pred block
+                  { "elif" cfg_pred block }
+                  [ "else" block ] ;
+item_block    ::= ":" NEWLINE INDENT { item } DEDENT ;
+cfg_pred      ::= "target" "." "arch" "==" "." arch_name
+                | "target" "." "os" "==" "." os_name
+                | "target" "." "has" "(" "." IDENT ")" ;   (* compile-time feature *)
+arch_name     ::= "x86_64" | "aarch64" ;
+os_name       ::= "linux" | "windows" | "macos" ;
 
 select_stmt   ::= "select" ":" NEWLINE INDENT { select_case } DEDENT ;  (* D-0031 *)
 select_case   ::= "case" select_op block

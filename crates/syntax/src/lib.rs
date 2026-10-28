@@ -6,6 +6,7 @@
 //! (see `ROADMAP.md`). No lexing or parsing *logic* lives here yet.
 
 pub mod ast;
+pub mod cfg;
 pub mod genanalysis;
 pub mod lexer;
 pub mod parser;

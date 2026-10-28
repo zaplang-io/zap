@@ -10,9 +10,12 @@ metaprogramming system for keeping business logic free of boilerplate.
 
 ## Documents
 
+- [`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md) — "where to find what": the compiler pipeline, crate map, runtime/GC, stdlib, tooling, and tests.
 - [`SPEC.md`](SPEC.md) — the language specification (the source of truth).
-- [`DECISIONS.md`](DECISIONS.md) — the decision log (ADR), D-0001…D-0070.
+- [`DECISIONS.md`](DECISIONS.md) — the decision log (ADR), D-0001…D-0079.
 - [`docs/STABILITY.md`](docs/STABILITY.md) — versioning & stability policy (the 1.0 contract).
+- [`CHANGELOG.md`](CHANGELOG.md) — notable changes, per [Keep a Changelog](https://keepachangelog.com/) (pre-1.0 / editorial 0.x).
+- [`docs/RELEASING.md`](docs/RELEASING.md) — the release process: tag convention and how the version bumps.
 - [`ROADMAP.md`](ROADMAP.md) — phased build plan + parallelization map.
 - [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) — the tracked backlog.
 - [`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf) — the grammar.

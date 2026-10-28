@@ -35,9 +35,17 @@
 
 /* SIO_BASE_HANDLE lives in <mstcpip.h> in the Windows SDK and in MinGW-w64, but
  * its header has moved across SDK versions; define it from its well-known value
- * if the headers above did not provide it (the _WSAIOR macro is in winsock2.h). */
+ * if the headers above did not provide it (the _WSAIOR macro is in winsock2.h).
+ * SIO_BSP_HANDLE_POLL / SIO_BSP_HANDLE are the layered-LSP fallbacks (I#221) and
+ * use the same mstcpip.h values / _WSAIOR convention. */
 #ifndef SIO_BASE_HANDLE
 #define SIO_BASE_HANDLE _WSAIOR(IOC_WS2, 34)
+#endif
+#ifndef SIO_BSP_HANDLE_POLL
+#define SIO_BSP_HANDLE_POLL _WSAIOR(IOC_WS2, 29)
+#endif
+#ifndef SIO_BSP_HANDLE
+#define SIO_BSP_HANDLE _WSAIOR(IOC_WS2, 27)
 #endif
 
 /* NtCreateFile disposition, provided by the DDK headers; define from the public
@@ -232,16 +240,75 @@ void zap_iocp_global_close(void) {
     }
 }
 
-/* Unwrap the base socket handle (I#196 Q2: SIO_BASE_HANDLE only in v1; a layered
- * LSP that refuses it is a documented follow-up — we fail loudly, never hang). */
-static SOCKET zap_iocp_base_handle(SOCKET s) {
-    SOCKET base = INVALID_SOCKET;
+/* One WSAIoctl base/BSP-handle unwrap; returns the handle, or INVALID_SOCKET on
+ * failure (the caller inspects WSAGetLastError when it needs the reason). */
+static SOCKET zap_iocp_ioctl_handle(SOCKET s, DWORD ioctl_code) {
+    SOCKET out = INVALID_SOCKET;
     DWORD bytes = 0;
-    if (WSAIoctl(s, SIO_BASE_HANDLE, NULL, 0, &base, sizeof base, &bytes, NULL, NULL) !=
+    if (WSAIoctl(s, ioctl_code, NULL, 0, &out, sizeof out, &bytes, NULL, NULL) !=
         SOCKET_ERROR) {
-        return base;
+        return out;
     }
-    zap_iocp_set_error(WSAGetLastError());
+    return INVALID_SOCKET;
+}
+
+/* Unwrap the pollable *base* socket handle — the one at the bottom of any layered
+ * service provider (LSP) stack, which is what IOCTL_AFD_POLL must target.
+ *
+ * v1 (#196) used SIO_BASE_HANDLE only and, per I#196 Q2, failed loudly if that did
+ * not yield a base handle rather than hanging. I#221 adds the layered-LSP fallback
+ * chain, mirroring wepoll's `ws_get_base_socket` ordering, for the rare non-IFS
+ * LSPs (antivirus / VPN) that break SIO_BASE_HANDLE:
+ *
+ *   - SIO_BASE_HANDLE on the current handle. If it returns a handle that differs
+ *     from the one queried, that is the real base below a layer -> use it.
+ *   - If it returns the *same* handle, that is the base for a plain (non-layered)
+ *     socket (the common case) — but a Komodia-style LSP can also make it echo the
+ *     layered handle. Remember it as a fallback, then try to descend one layer
+ *     (SIO_BSP_HANDLE_POLL, then SIO_BSP_HANDLE) and retry SIO_BASE_HANDLE lower.
+ *   - If SIO_BASE_HANDLE fails outright (a broken LSP intercepting it), descend the
+ *     same way and retry on the lower handle.
+ *
+ * The loop ends when SIO_BASE_HANDLE yields a lower base, when we can descend no
+ * further (return the best same-as-queried base we saw — the plain-socket case), or
+ * when nothing is pollable. In that last case we keep the v1 contract: record the
+ * error and return INVALID_SOCKET so zap_iocp_register returns NULL and the caller
+ * reports it. We never hang. A small hop cap guards against a malformed LSP that
+ * returns a descent cycle instead of strictly descending.
+ */
+static SOCKET zap_iocp_base_handle(SOCKET s) {
+    SOCKET cur = s;
+    SOCKET best = INVALID_SOCKET; /* lowest "base == queried" handle seen         */
+    int last_err = 0;
+    for (int hop = 0; hop < 16; hop++) {
+        SOCKET base = zap_iocp_ioctl_handle(cur, SIO_BASE_HANDLE);
+        if (base != INVALID_SOCKET) {
+            if (base != cur) {
+                return base; /* real base one or more layers down                */
+            }
+            best = base; /* plain-socket base, or a layered handle to fall back on */
+        } else {
+            last_err = WSAGetLastError();
+            if (last_err == WSAENOTSOCK) {
+                break; /* not a socket at all — nothing to unwrap                 */
+            }
+        }
+        /* Descend one layer toward the base: SIO_BSP_HANDLE_POLL, then the older
+         * SIO_BSP_HANDLE, and retry SIO_BASE_HANDLE on whatever is lower. */
+        SOCKET lower = zap_iocp_ioctl_handle(cur, SIO_BSP_HANDLE_POLL);
+        if (lower == INVALID_SOCKET || lower == cur) {
+            lower = zap_iocp_ioctl_handle(cur, SIO_BSP_HANDLE);
+        }
+        if (lower != INVALID_SOCKET && lower != cur) {
+            cur = lower;
+            continue;
+        }
+        break; /* cannot descend further                                         */
+    }
+    if (best != INVALID_SOCKET) {
+        return best; /* plain socket, or best layered guess (still pollable)      */
+    }
+    zap_iocp_set_error(last_err ? last_err : WSAGetLastError());
     return INVALID_SOCKET;
 }
 

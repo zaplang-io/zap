@@ -20,6 +20,26 @@
  *       for deadline-recompute and shutdown.
  *   T4. Teardown: unregistering a descriptor with an in-flight poll (the CancelIoEx
  *       path) and reaping the cancelled completion does not leak or crash.
+ *   T5. Base-handle unwrap (I#221): register on a plain loopback socket succeeds and
+ *       the returned descriptor polls — i.e. the SIO_BASE_HANDLE path still yields a
+ *       pollable base, and the new layered-LSP fallback chain does not regress the
+ *       common (non-layered) case.
+ *
+ * LAYERED-LSP FALLBACK — WHY CI CANNOT EXERCISE THE FALLBACK ITSELF (I#221).
+ *   The I#221 fallback (`zap_iocp_base_handle`: SIO_BSP_HANDLE_POLL / SIO_BSP_HANDLE
+ *   descent when SIO_BASE_HANDLE fails or echoes the layered handle) only fires for a
+ *   socket created *behind a non-IFS layered service provider* — the kind installed
+ *   by some antivirus/VPN products (e.g. Komodia-based LSPs). The stock
+ *   windows-latest GitHub runner has no such LSP installed, and one cannot be
+ *   synthesized from the test: installing an LSP requires administrator rights plus a
+ *   provider DLL registered via WSCInstallProvider into the Winsock catalog, and the
+ *   catalog change only takes effect for newly created sockets (effectively a fresh
+ *   process). None of that is available or reproducible on a stock CI image. So T5
+ *   exercises the SIO_BASE_HANDLE path and the no-regression guarantee; the fallback
+ *   branches are verified by code inspection against wepoll's ws_get_base_socket and
+ *   are intended to be exercised manually on a VM with a layered LSP installed
+ *   (install an antivirus/VPN with a non-IFS LSP, confirm a socket that fails
+ *   SIO_BASE_HANDLE is still registered and polled).
  *
  * The full M:N copark/coready + per-direction latch + deadline logic lives in
  * `zaprt.c` and is exercised unchanged by the Linux `netpoller.zap` golden under
@@ -275,6 +295,34 @@ static void test_teardown_armed(void) {
     closesocket(wr);
 }
 
+/* ---- T5: base-handle unwrap / layered-LSP fallback no-regression (I#221) --- */
+static void test_base_handle_unwrap(void) {
+    SOCKET rd, wr;
+    CHECK(make_socket_pair(&rd, &wr) == 0, "T5 loopback socket pair");
+    int marker = 0x21;
+    /* register() -> zap_iocp_base_handle(): on a plain socket SIO_BASE_HANDLE
+     * yields a pollable base; the fallback chain must not break this path. */
+    void *pd = zap_iocp_register((uint64_t)rd, &marker);
+    CHECK(pd != NULL, "T5 register unwraps a pollable base handle (SIO_BASE_HANDLE)");
+    if (!pd) {
+        closesocket(rd);
+        closesocket(wr);
+        return;
+    }
+    /* Confirm the unwrapped base is actually pollable: arm + a peer send completes. */
+    CHECK(zap_iocp_arm(pd, ZAP_IOCP_READ) == 0, "T5 arm read on the base handle");
+    zap_iocp_ready readies[8];
+    char msg = 'B';
+    CHECK(send(wr, &msg, 1, 0) == 1, "T5 peer send");
+    int n = zap_iocp_wait(readies, 8, 2000);
+    CHECK(n == 1 && readies[0].readable, "T5 base handle polls (readiness arrives)");
+    char buf = 0;
+    CHECK(recv(rd, &buf, 1, 0) == 1 && buf == 'B', "T5 drains the byte");
+    zap_iocp_unregister(pd);
+    closesocket(rd);
+    closesocket(wr);
+}
+
 int main(void) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -295,6 +343,8 @@ int main(void) {
     test_kick();
     fprintf(stderr, "== T4 teardown of an armed descriptor ==\n");
     test_teardown_armed();
+    fprintf(stderr, "== T5 base-handle unwrap / layered-LSP fallback no-regression ==\n");
+    test_base_handle_unwrap();
 
     zap_iocp_global_close();
     WSACleanup();

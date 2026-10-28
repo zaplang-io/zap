@@ -20,6 +20,7 @@ use crate::{Checker, Ty};
 
 mod argparse;
 mod bisect;
+mod concurrent;
 mod crypto;
 mod datetime;
 mod deque;
@@ -88,6 +89,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     net::MODULE,
     http::MODULE,
     tls::MODULE,
+    concurrent::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute

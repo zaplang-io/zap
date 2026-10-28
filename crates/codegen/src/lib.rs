@@ -188,7 +188,7 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
     // uses (__gxx_personality_v0 / __cxa_* / _Unwind_*) is **libc++** (`-lc++`),
     // not libstdc++ — modern macOS SDKs (and all Apple-Silicon ones) ship no
     // `libstdc++.dylib`, but libc++abi exposes those exact Itanium symbols. See
-    // design/0029-macos.md.
+    // design/0033-macos.md.
     let is_macos = triple_str.contains("apple") || triple_str.contains("darwin");
 
     // Linker driver. `cc` by default (the MinGW-w64 `gcc`/`cc` on a Windows host
@@ -640,6 +640,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_repl_slot_set_i64", &[i64t.into(), i64t.into()], None);
         self.declare_rt("zap_repl_slot_get_ptr", &[i64t.into()], Some(ptr.into()));
         self.declare_rt("zap_repl_slot_set_ptr", &[i64t.into(), ptr.into()], None);
+        // Float bindings reuse the same 64-bit slot cell, reinterpreted as a
+        // `double` in the runtime (I#252); no GC rooting (floats are not ptrs).
+        let f64t = self.ctx.f64_type();
+        self.declare_rt("zap_repl_slot_get_f64", &[i64t.into()], Some(f64t.into()));
+        self.declare_rt("zap_repl_slot_set_f64", &[i64t.into(), f64t.into()], None);
         // The C++ exception personality routine (libstdc++/libgcc). Landing pads
         // name it; it parses the unwind tables and drives phase-1/phase-2
         // unwinding. Its exact signature is immaterial — it is only referenced by
@@ -1022,6 +1027,18 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 }
             };
             let fv = self.module.add_function(&f.name, fnty, None);
+            // REPL JIT (I#252): a session re-emits its accumulated `def`/`type`
+            // declarations into every entry module so each entry type-checks and
+            // links against them. Those re-emitted definitions would collide as
+            // duplicate external symbols across the MCJIT's accumulated modules,
+            // so give every function internal linkage except the symbols the
+            // engine looks up by name — `main` (whole-program smoke tests) and
+            // the per-entry `__repl_entry_N` thunk. Each module then carries its
+            // own private copy, callable within that module. No effect on the
+            // AOT path (`jit` is false there).
+            if self.jit && !f.is_main && !f.name.starts_with("__repl_entry_") {
+                fv.set_linkage(inkwell::module::Linkage::Internal);
+            }
             self.fns.insert(f.name.clone(), fv);
         }
 

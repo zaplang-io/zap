@@ -597,6 +597,98 @@ struct JsonScanner:
         if k == 12:
             return (JsonToken.Comma, True)
         return (JsonToken.End, False)
+
+# concurrent (I#184, D-0078) — Experimental lock-free collections built on the
+# prelude Atomic[T] (D-0066). Reclamation leans entirely on the tracing moving
+# Immix collector (D-0008/I#120): a node is an ordinary GC heap struct and every
+# stored pointer lives in a genuine reference slot (an Atomic cell or a struct
+# field), never packed into an integer word, so the existing GC machinery traces
+# and (under the moving collector) forwards every link with NO new runtime code.
+# These types ship Experimental (STABILITY.md 4.4) and are namespaced under
+# `import concurrent`; concurrency lives in the type name, not in new syntax.
+
+# A lock-free counter: a thin, discoverable wrapper over Atomic[int64]. Every op
+# is an indivisible seq_cst atomic, so concurrent increments never lose an update
+# the way a non-atomic load/add/store would. Correct on every platform, aarch64
+# included (no pointer payload). Build one with concurrent.Counter().
+struct Counter:
+    Atomic[int64] _cell
+
+    # add(n): atomically add n and return the NEW value (Go atomic.Int64 add).
+    def add(self, int64 n) -> int64:
+        return self._cell.add(n)
+
+    # incr(): add 1 and return the new value.
+    def incr(self) -> int64:
+        return self._cell.add(1)
+
+    # get(): the current value (a seq_cst atomic load).
+    def get(self) -> int64:
+        return self._cell.load()
+
+# The backing constructor for `concurrent.Counter(start)` (its lowering emits a
+# call to this; see crates/ir/src/lower/modules/concurrent.rs). Kept internal
+# (`__`-prefixed) so the public surface is `concurrent.Counter()`.
+def __concurrent_counter(int64 start) -> Counter:
+    return Counter(_cell=Atomic(start))
+
+# An internal node of the MPSC Queue. `value` is None only for the sentinel/stub
+# node; a live node carries Some(payload). `next` is an atomic nullable link
+# (None == no successor yet) — a genuine traced reference slot, so the moving
+# collector scans and forwards it with no special runtime code.
+struct QNode[T]:
+    Optional[T] value
+    Atomic[Optional[QNode[T]]] next
+
+# An unbounded multi-producer / single-consumer (MPSC) lock-free FIFO queue
+# (Vyukov). ANY number of producers may call push() concurrently; EXACTLY ONE
+# consumer calls pop(). A permanent stub node keeps _head/_tail non-null, so a
+# drained queue refills correctly. There is intentionally no len()/iteration: a
+# lock-free queue has no consistent snapshot, so exposing either would be a
+# Python-faithful lie (D-0078). Construct with new_queue[T]().
+#
+# For a NON-pointer payload (int64, an opaque handle) the queue touches the GC
+# only through its node links and is correct on every platform. For a REFERENCE
+# payload it additionally relies on the moving collector relocating pointer
+# graphs correctly, so it inherits the open aarch64 evacuation race (I#223) and
+# is trustworthy on that platform only once I#223 is fixed (D-0078 4.6).
+struct Queue[T]:
+    Atomic[QNode[T]] _head   # consumer end: the stub / last-consumed node
+    Atomic[QNode[T]] _tail   # producer end: the most recently pushed node
+
+    # push(v): enqueue v. Safe from any number of producer coroutines/threads.
+    # The atomic swap on _tail is the single serialization point; the follow-up
+    # store links the previous tail to the new node, publishing it to the
+    # consumer. seq_cst throughout (Atomic[T], D-0066).
+    def push(self, T v):
+        Optional[QNode[T]] empty = None
+        QNode[T] n = QNode(value=Optional.Some(v), next=Atomic(empty))
+        auto prev = self._tail.swap(n)
+        prev.next.store(Optional.Some(n))
+
+    # pop() -> (Optional[T], bool): dequeue the oldest element. Call from the
+    # SINGLE consumer only. Returns (Some(v), True) on success and (None, False)
+    # when the queue is observably empty — which also covers the transient window
+    # where a producer has swapped the tail but not yet linked its node, so the
+    # consumer simply retries. comma-ok, like a channel receive: `v, ok = q.pop()`.
+    def pop(self) -> (Optional[T], bool):
+        auto head = self._head.load()
+        auto nxt = head.next.load()
+        if nxt.is_none():
+            Optional[T] none = None
+            return (none, False)
+        auto nn = nxt.unwrap()
+        self._head.store(nn)
+        return (nn.value, True)
+
+# Build an empty MPSC Queue[T]. A free constructor (rather than a bare, field-
+# defaulted `Queue()`) because the stub node and its nullable atomic links must
+# be initialized from typed None values.
+def new_queue[T]() -> Queue[T]:
+    Optional[QNode[T]] elink = None
+    Optional[T] eval = None
+    QNode[T] stub = QNode(value=eval, next=Atomic(elink))
+    return Queue(_head=Atomic(stub), _tail=Atomic(stub))
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -668,6 +760,15 @@ fn references_prelude(module: &Module) -> bool {
         "\"Event\"",
         "\"Semaphore\"",
         "\"Condition\"",
+        // The `concurrent` module (I#184, D-0078): the lock-free `Counter` and
+        // the MPSC `Queue[T]` (+ its `QNode[T]` and `new_queue` constructor)
+        // ship in the prelude, injected for any program that names the module or
+        // one of these types.
+        "\"concurrent\"",
+        "\"Counter\"",
+        "\"Queue\"",
+        "\"QNode\"",
+        "\"new_queue\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
@@ -820,6 +921,16 @@ impl Parser {
         });
     }
 
+    /// Record an error at an explicit span (e.g. the offending value's span,
+    /// which may already have been consumed).
+    fn error_at(&mut self, span: Span, code: ErrorCode, message: impl Into<String>) {
+        self.errors.push(ParseError {
+            code,
+            message: message.into(),
+            span,
+        });
+    }
+
     fn span_from(&self, start: u32) -> Span {
         Span::new(start, self.prev_end())
     }
@@ -921,6 +1032,12 @@ impl Parser {
                 // `Item::Import` per listed module, so each resolves exactly
                 // like a standalone `import`.
                 items.extend(self.parse_import().into_iter().map(Item::Import))
+            }
+            TokenKind::Keyword(Keyword::When) => {
+                if !decos.is_empty() {
+                    self.error_here(ErrorCode::ZAP2003, "decorators must precede a declaration");
+                }
+                items.push(Item::Cfg(self.parse_cfg_items()))
             }
             _ => {
                 if !decos.is_empty() {
@@ -1447,6 +1564,7 @@ impl Parser {
                     | Keyword::Try
                     | Keyword::With
                     | Keyword::Scope
+                    | Keyword::When
             )
         )
     }
@@ -1461,8 +1579,191 @@ impl Parser {
             TokenKind::Keyword(Keyword::Try) => self.parse_try(),
             TokenKind::Keyword(Keyword::With) => self.parse_with(),
             TokenKind::Keyword(Keyword::Scope) => self.parse_scope(),
+            TokenKind::Keyword(Keyword::When) => Stmt::Cfg(self.parse_cfg_stmt()),
             _ => unreachable!("parse_compound called on non-compound token"),
         }
+    }
+
+    // --- conditional compilation (`when target.*`, I#139 / D-0079) ---
+
+    /// `when target.*` in item position: each arm's body is a block of items
+    /// (imports, declarations, bare statements). The dead arms are parsed so
+    /// they must be well-formed, but cfg resolution ([`crate::cfg`]) keeps only
+    /// the matching arm before any later phase runs.
+    fn parse_cfg_items(&mut self) -> CfgItemBlock {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::When, "'when'");
+        let mut arms = Vec::new();
+        let pred = self.parse_cfg_predicate();
+        let body = self.parse_item_block();
+        arms.push(CfgItemArm {
+            predicate: pred,
+            body,
+            span: self.span_from(start),
+        });
+        while self.is_kw(Keyword::Elif) {
+            let arm_start = self.peek_span().start;
+            self.bump();
+            let pred = self.parse_cfg_predicate();
+            let body = self.parse_item_block();
+            arms.push(CfgItemArm {
+                predicate: pred,
+                body,
+                span: self.span_from(arm_start),
+            });
+        }
+        let (else_body, else_span) = if self.is_kw(Keyword::Else) {
+            let es = self.peek_span();
+            self.bump();
+            (Some(self.parse_item_block()), Some(es))
+        } else {
+            (None, None)
+        };
+        CfgItemBlock {
+            arms,
+            else_body,
+            else_span,
+            span: self.span_from(start),
+        }
+    }
+
+    /// `when target.*` in statement position: each arm's body is an ordinary
+    /// statement block, reusing [`Self::parse_block`].
+    fn parse_cfg_stmt(&mut self) -> CfgStmtBlock {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::When, "'when'");
+        let mut arms = Vec::new();
+        let pred = self.parse_cfg_predicate();
+        let body = self.parse_block();
+        arms.push(CfgStmtArm {
+            predicate: pred,
+            body,
+            span: self.span_from(start),
+        });
+        while self.is_kw(Keyword::Elif) {
+            let arm_start = self.peek_span().start;
+            self.bump();
+            let pred = self.parse_cfg_predicate();
+            let body = self.parse_block();
+            arms.push(CfgStmtArm {
+                predicate: pred,
+                body,
+                span: self.span_from(arm_start),
+            });
+        }
+        let (else_body, else_span) = if self.is_kw(Keyword::Else) {
+            let es = self.peek_span();
+            self.bump();
+            (Some(self.parse_block()), Some(es))
+        } else {
+            (None, None)
+        };
+        CfgStmtBlock {
+            arms,
+            else_body,
+            else_span,
+            span: self.span_from(start),
+        }
+    }
+
+    /// `: NEWLINE INDENT { item } DEDENT` — the item-list counterpart of
+    /// [`Self::parse_block`], used by item-position `when` arms.
+    fn parse_item_block(&mut self) -> Vec<Item> {
+        self.expect(&TokenKind::Colon, "':'");
+        self.expect(&TokenKind::Newline, "newline");
+        self.expect(&TokenKind::Indent, "indented block");
+        let mut items = Vec::new();
+        self.skip_newlines();
+        while !self.is(&TokenKind::Dedent) && !self.at_eof() {
+            let before = self.pos;
+            self.parse_top_level(&mut items);
+            self.skip_newlines();
+            if self.pos == before {
+                self.error_here(ErrorCode::ZAP2008, "unexpected token in `when` block");
+                self.bump();
+                self.skip_newlines();
+            }
+        }
+        self.expect(&TokenKind::Dedent, "end of block");
+        items
+    }
+
+    /// Parse one atomic `when`/`elif` target predicate (D-0079 §4), one of:
+    /// `target.arch == .<arch>`, `target.os == .<os>`, `target.has(.<feature>)`.
+    fn parse_cfg_predicate(&mut self) -> CfgPredicate {
+        let start = self.peek_span().start;
+        // `target`
+        match self.ident_opt() {
+            Some((name, _)) if name == "target" => {}
+            _ => {
+                self.error_here(
+                    ErrorCode::ZAP2015,
+                    "a `when` predicate must start with `target`",
+                );
+                return CfgPredicate::Arch(CfgArch::X86_64);
+            }
+        }
+        self.expect(&TokenKind::Dot, "'.' after `target`");
+        let field = self.ident("`arch`, `os`, or `has`");
+        match field.as_str() {
+            "arch" => {
+                self.expect(&TokenKind::EqEq, "'==' after `target.arch`");
+                let (val, span) = self.parse_dot_name();
+                match crate::cfg::arch_from_str(&val) {
+                    Some(a) => CfgPredicate::Arch(a),
+                    None => {
+                        self.error_at(
+                            span,
+                            ErrorCode::ZAP2016,
+                            format!(
+                                "unknown target arch `.{val}` (expected `.x86_64` or `.aarch64`)"
+                            ),
+                        );
+                        CfgPredicate::Arch(CfgArch::X86_64)
+                    }
+                }
+            }
+            "os" => {
+                self.expect(&TokenKind::EqEq, "'==' after `target.os`");
+                let (val, span) = self.parse_dot_name();
+                match crate::cfg::os_from_str(&val) {
+                    Some(o) => CfgPredicate::Os(o),
+                    None => {
+                        self.error_at(
+                            span,
+                            ErrorCode::ZAP2016,
+                            format!(
+                                "unknown target os `.{val}` (expected `.linux`, `.windows`, or `.macos`)"
+                            ),
+                        );
+                        CfgPredicate::Os(CfgOs::Linux)
+                    }
+                }
+            }
+            "has" => {
+                self.expect(&TokenKind::LParen, "'(' after `target.has`");
+                let (val, _) = self.parse_dot_name();
+                self.expect(&TokenKind::RParen, "')' to close `target.has(...)`");
+                CfgPredicate::HasFeature(val)
+            }
+            _ => {
+                self.error_at(
+                    self.span_from(start),
+                    ErrorCode::ZAP2015,
+                    "a `when` predicate tests `target.arch`, `target.os`, or `target.has(...)`",
+                );
+                CfgPredicate::Arch(CfgArch::X86_64)
+            }
+        }
+    }
+
+    /// Parse a leading-dot enum-style name `.ident` and return the identifier
+    /// plus its span.
+    fn parse_dot_name(&mut self) -> (String, Span) {
+        let start = self.peek_span().start;
+        self.expect(&TokenKind::Dot, "'.' before a target value");
+        let name = self.ident("a target value name");
+        (name, self.span_from(start))
     }
 
     /// `scope [ ( opts ) ]: BLOCK` (D-0044/D-0045). The optional parenthesized

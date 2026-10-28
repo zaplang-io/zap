@@ -35,25 +35,22 @@
  *
  * Note: this `zaprt.c` is compiled by `cc`/MinGW only at *program link* time
  * (see build_executable in lib.rs); it is NOT compiled by `cargo build` of the
- * compiler crates, so the Windows CI job (host-side `cargo build`) is green
- * while this gate stands. The gate bites a developer who tries to link a Zap
- * *program* on Windows — exactly the A1/A3 gap — and points them at the work. */
+ * compiler crates. With A1/A2/A3/A4/A5 and now the Immix GC port (I#218) landed,
+ * it compiles and links on Windows under BOTH collectors; the `windows-runtime`
+ * CI job proves this by building + running the integration harness under each. */
 #if defined(_WIN32)
 #define ZAP_PLATFORM_WINDOWS 1
 #else
 #define ZAP_PLATFORM_POSIX 1
 #endif
 
-#if defined(ZAP_PLATFORM_WINDOWS) && defined(ZAP_GC_IMMIX)
-#error "Zap on Windows (v1) runs under the conservative Boehm collector only.\n\
-The precise Immix collector is not yet ported to Windows: zapgc.inc.c maps heap\n\
-with <sys/mman.h>/mmap and scans with POSIX primitives, so it needs a separate\n\
-VirtualAlloc/Win32 port (I#218, GC track). Build the Windows runtime WITHOUT\n\
--DZAP_GC_IMMIX (the default gc-boehm configuration). Full Windows program support\n\
-under gc-boehm is complete: A5 toolchain (I#199), A1 context switch (I#195), A3\n\
-signals/preemption/faults (I#197), A2 IOCP netpoller (I#196) and A4\n\
-path/process/fs/env/sockets/random (I#198). See design/0016-platform-1.0.md."
-#endif
+/* Windows now builds under BOTH collectors. gc-boehm (the conservative fallback)
+ * landed with A5/A1/A2/A3/A4; the precise Immix collector — Zap's DEFAULT — is
+ * ported to Windows by I#218 (I#158/A-GC): its aligned-block heap in
+ * zapgc.inc.c uses `_aligned_malloc`/`_aligned_free` on Windows (the seam there;
+ * the allocator never used mmap, so there is no VirtualAlloc reserve/commit
+ * layer to carry). The former `#error` that blocked ZAP_GC_IMMIX on Windows is
+ * therefore retired. See design/0016-platform-1.0.md. */
 
 /* Python.h must precede the standard headers (it sets feature-test macros).
  * Embedding CPython backs the Python interop (ticket #27, D-0012); the compile
@@ -1498,6 +1495,28 @@ int64_t zap_repl_slot_get_i64(int64_t i) {
 void zap_repl_slot_set_i64(int64_t i, int64_t v) {
     zap_repl_slot_check(i);
     zap_repl_slots[i] = v;
+}
+/* Float bindings (I#252) reuse the same 64-bit slot cell, reinterpreted as a
+ * `double`. A float is not a GC pointer, so the slot is never rooted. `float32`
+ * bindings round-trip exactly (widened to `double` at the store, narrowed back
+ * at the load). */
+double zap_repl_slot_get_f64(int64_t i) {
+    zap_repl_slot_check(i);
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.i = zap_repl_slots[i];
+    return u.d;
+}
+void zap_repl_slot_set_f64(int64_t i, double v) {
+    zap_repl_slot_check(i);
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.d = v;
+    zap_repl_slots[i] = u.i;
 }
 void *zap_repl_slot_get_ptr(int64_t i) {
     zap_repl_slot_check(i);
@@ -7086,6 +7105,22 @@ void *zap_crypto_hmac_sha256(void *key, void *msg) {
 }
 void *zap_crypto_hmac_sha512(void *key, void *msg) {
     return zap_crypto_hmac_hex(ZAP_CRY_SHA512, key, msg);
+}
+
+/* Raw-bytes HMAC: the digest as a `bytes` value rather than hex. Needed to chain
+ * HMAC-SHA256 (e.g. the AWS SigV4 signing-key derivation, ticket #153), where one
+ * step's raw digest is the key for the next and a hex round-trip would be lossy. */
+static void *zap_crypto_hmac_raw(int algo, void *key, void *msg) {
+    ZapStr *k = (ZapStr *)key;
+    ZapStr *m = (ZapStr *)msg;
+    uint8_t out[64];
+    zap_crypto_hmac(algo, (const uint8_t *)k->data, (size_t)k->len,
+                    (const uint8_t *)m->data, (size_t)m->len, out);
+    return zap_str_new((const char *)out, (int64_t)zap_crypto_digest_len(algo));
+}
+
+void *zap_crypto_hmac_sha256_raw(void *key, void *msg) {
+    return zap_crypto_hmac_raw(ZAP_CRY_SHA256, key, msg);
 }
 
 /* ---- Secure random / secrets ---- */

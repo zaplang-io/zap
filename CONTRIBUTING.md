@@ -23,6 +23,7 @@ There is no CLA and no separate sign-off step.
 
 | Path | What |
 |---|---|
+| [`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md) | "Where to find what" in the code: pipeline, crate map, runtime/GC, stdlib seam, tooling, tests |
 | [`SPEC.md`](SPEC.md) | The language specification — the source of truth |
 | [`DECISIONS.md`](DECISIONS.md) | Decision log (ADR): `D-NNNN` entries, never deleted, only superseded |
 | [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) | Tracked backlog of unresolved questions |
@@ -143,6 +144,12 @@ the language surface, the IR schema, or the runtime ABI goes through docs
 Changes to the phase-boundary contracts (`design/IR.md`, `design/RUNTIME-ABI.md`)
 need extra care: they are what lets front-end, middle-end, and runtime work
 proceed in parallel.
+
+**Changelog.** Any change to a public surface (language, stdlib, CLI, package
+format) also adds an entry under `[Unreleased]` in
+[`CHANGELOG.md`](CHANGELOG.md), and the PR states its change class
+(PATCH/MINOR/MAJOR) per [`docs/STABILITY.md`](docs/STABILITY.md). How a release
+is cut and how the version bumps is [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Conventions
 

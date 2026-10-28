@@ -17,10 +17,97 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Change detection (ticket: CI path filtering for doc-only PRs). Cheap,
+  # always-run, no LLVM. Decides whether this change touches *code* (=> run the
+  # full matrix) or is *docs-only* (=> skip the heavy jobs). Everything downstream
+  # gates on `outputs.code`. FAIL SAFE: any ambiguity, missing ref, or error
+  # defaults to code=true, so we never skip real CI by mistake.
+  #
+  # Self-contained git-diff script (no external action) so the push/PR ref logic
+  # and the zero-before-SHA edge case are explicit and auditable:
+  #   * pull_request -> diff against the PR base SHA.
+  #   * push         -> diff against github.event.before; the all-zeros before-SHA
+  #                     (branch creation / first push) is treated as code=true;
+  #                     an unusable before-SHA falls back to HEAD~1, else code=true.
+  # A change is docs-only (code=false) iff EVERY changed path is a doc path.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base / before SHAs are present for the diff.
+          fetch-depth: 0
+
+      - name: Detect code vs docs-only changes
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          # No `set -e`: we handle every failure explicitly and fail safe to code=true.
+          set -uo pipefail
+
+          emit() { echo "code=$1" >> "$GITHUB_OUTPUT"; echo "Decision: code=$1"; }
+
+          files=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+            if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              files="$(git diff --name-only "$base" HEAD)"
+            else
+              echo "PR base SHA unavailable ($base); fail safe."; emit true; exit 0
+            fi
+          elif [ "$EVENT_NAME" = "push" ]; then
+            before="$PUSH_BEFORE"
+            zero="0000000000000000000000000000000000000000"
+            if [ -z "$before" ] || [ "$before" = "$zero" ]; then
+              echo "Initial push / zero before-SHA; fail safe."; emit true; exit 0
+            elif git cat-file -e "${before}^{commit}" 2>/dev/null; then
+              files="$(git diff --name-only "$before" HEAD)"
+            elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+              echo "before-SHA $before not fetched; falling back to HEAD~1."
+              files="$(git diff --name-only HEAD~1 HEAD)"
+            else
+              echo "No usable before-SHA or HEAD~1; fail safe."; emit true; exit 0
+            fi
+          else
+            echo "Unknown event $EVENT_NAME; fail safe."; emit true; exit 0
+          fi
+
+          echo "Changed files:"; printf '%s\n' "$files"
+
+          if [ -z "$files" ]; then
+            echo "No changed files detected; treating as docs-only."; emit false; exit 0
+          fi
+
+          # Docs paths (safe to skip heavy CI). `case` patterns match '/' with '*',
+          # so `*.md` covers **/*.md (incl. editors/**/*.md) and `docs/*` covers
+          # docs/**. ANY path that is not a doc path flips the whole change to code.
+          code=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md) ;;
+              docs/*) ;;
+              design/*) ;;
+              LICENSE*) ;;
+              .github/ISSUE_TEMPLATE/*) ;;
+              *) echo "code path: $f"; code=true ;;
+            esac
+          done <<< "$files"
+
+          emit "$code"
+
   # Fast path: the default members only (no LLVM). Mirrors what `cargo test`
   # does on a host without LLVM (e.g. Intel macOS); keeps that path green.
   host:
     name: host (no LLVM)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +151,8 @@ jobs:
   # it is cheap and host-only.
   vscode-extension:
     name: vscode extension (Node/TS)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -96,6 +185,8 @@ jobs:
   # fib=55, loop_sum=45, hello).
   full:
     name: full (LLVM 18 + codegen)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
       # Where llvm-sys / inkwell (llvm18-0) find LLVM 18. Matches the Dockerfile.
@@ -172,6 +263,8 @@ jobs:
   # and `full` already gate them; they are target-independent).
   arm64:
     name: arm64 (aarch64 Linux + codegen)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04-arm
     env:
       LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
@@ -229,7 +322,7 @@ jobs:
   # the Itanium C++ ABI, so it reuses the Linux POSIX paths (NOT the Windows seams)
   # — the whole full+golden suite runs here under BOTH collectors, like `full`.
   #
-  # Arch = x86_64 on `macos-13` (Intel), DELIBERATELY (design/0029, D-0076): the
+  # Arch = x86_64 on `macos-13` (Intel), DELIBERATELY (design/0033, D-0081): the
   # macos-latest runners are arm64 (Apple Silicon), and I#223 is a parked
   # aarch64-ONLY weak-memory bug in the precise-Immix multicore path — its finding
   # proves x86_64 is clean (0/120 at MAXPROCS 4/8/16) while arm64 fails ~97%. Intel
@@ -238,6 +331,8 @@ jobs:
   # I#223 lands, so #223 does NOT block landing macOS support.
   macos:
     name: "macOS (x86_64 + codegen)"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-13
     env:
       # llvm-sys / inkwell (llvm18-0) find LLVM 18 via Homebrew's keg.
@@ -327,6 +422,8 @@ jobs:
   # required (multi-worker) is the follow-up that lands with the I#223 fix.
   macos-arm64:
     name: "macOS (arm64, best-effort / MAXPROCS=1)"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-14
     continue-on-error: true
     env:
@@ -401,13 +498,17 @@ jobs:
   #      spilled callee-saved register) survives collections that run while it is
   #      parked — the load-bearing GC invariant native Fibers would have broken
   #      (design/0017). This is the on-Windows GC check the spike could not run.
-  # The precise `gc-immix` collector cannot be exercised standalone (its roots
-  # come from compiler-emitted shadow-stack code and its heap uses mmap, not yet
-  # ported to VirtualAlloc); immix's parked-coroutine invariant is proven
-  # behavior-neutral through this same seam by the gc-immix goldens on the
-  # required Linux/ARM jobs (gc_parked_coroutine, immix_evac_coro_stress, ...).
+  # The precise `gc-immix` collector cannot be exercised by THIS standalone A1
+  # harness (its roots come from compiler-emitted shadow-stack code, which a
+  # hand-written C harness does not carry). Its aligned-block heap now builds and
+  # runs on Windows (I#218) and is exercised on the `windows-runtime` job below;
+  # immix's parked-coroutine invariant is proven behavior-neutral through this
+  # same seam by the gc-immix goldens on the required Linux/ARM jobs
+  # (gc_parked_coroutine, immix_evac_coro_stress, ...).
   windows-ctxswitch:
     name: "Windows coroutine context switch (I#195 / A1)"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -466,11 +567,14 @@ jobs:
   #   T4. the last-chance fault filter reports type/address/coroutine + a dbghelp
   #       backtrace and lets the process die (run in a child, like I#77).
   #   T5. console control events map to the Signal enum's reachable subset.
-  # The precise gc-immix collector is not exercised here (its heap needs the
-  # mmap->VirtualAlloc port); its flag-at-safepoint preempt path is collector-
-  # agnostic and proven behavior-neutral by the gc-immix goldens on Linux/ARM.
+  # The precise gc-immix collector is not exercised by this A3-isolated harness;
+  # its flag-at-safepoint preempt path is collector-agnostic and proven
+  # behavior-neutral by the gc-immix goldens on Linux/ARM. (The immix heap itself
+  # now builds and runs on Windows, I#218 — see the `windows-runtime` job.)
   windows-a3:
     name: "Windows signals / preemption / faults (I#197 / A3)"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -513,12 +617,15 @@ jobs:
   #       poller parked in zap_iocp_wait (the eventfd/self-pipe-kick equivalent).
   #   T4. tearing down a descriptor with an in-flight poll (CancelIoEx) and reaping
   #       the cancelled completion does not leak or crash.
-  # The precise gc-immix collector is not exercised here (its heap needs the
-  # mmap->VirtualAlloc port); the netpoller is collector-agnostic and its full
-  # copark/coready + latch + deadline logic is proven behavior-neutral by the
-  # `netpoller.zap` golden on the required Linux/ARM jobs under both collectors.
+  # The precise gc-immix collector is not exercised by this A2-isolated harness;
+  # the netpoller is collector-agnostic and its full copark/coready + latch +
+  # deadline logic is proven behavior-neutral by the `netpoller.zap` golden on the
+  # required Linux/ARM jobs under both collectors. (The immix heap itself now
+  # builds and runs on Windows, I#218 — see the `windows-runtime` job.)
   windows-netpoller:
     name: "Windows IOCP netpoller (I#196 / A2)"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -552,18 +659,31 @@ jobs:
   # env/sockets/random) all landed, this job builds the shipping runtime TUs plus
   # an integration harness against the real MinGW-w64 / MSYS2 runtime libraries
   # (gc/pcre2/zlib/openssl + Winsock/BCrypt/DbgHelp — CPython is gated off for v1)
-  # on a native windows-latest runner under the conservative Boehm collector (the
-  # Windows v1 collector; precise Immix needs the mmap->VirtualAlloc port, I#218),
-  # and RUNS it. The harness (`zap_win_a4_test.c`) drives the public runtime ABI
-  # end-to-end — byte-exact fs/io, os/env, the Path::join separator fix, the
-  # BCryptGenRandom CSPRNG, an ephemeral Winsock listener with IOCP/AFD netpoller
-  # registration, and a coroutine spawned on the M:N scheduler sending over a
-  # channel to the main thread (the A1 context switch running a real program under
-  # the scheduler). The Zap-source goldens additionally run once the LLVM-18-backed
-  # compiler is built on Windows (tracked separately — see the PR body); the
-  # portable front-end crates still build+test best-effort in `windows-crates`.
+  # on a native windows-latest runner, and RUNS it — under BOTH collectors: the
+  # conservative Boehm GC (the Windows v1 fallback) AND the precise Immix GC (Zap's
+  # DEFAULT), whose aligned-block heap now builds on Windows via I#218's
+  # `_aligned_malloc`/`_aligned_free` seam. The gc-immix build is the proof the
+  # port works: it compiles zaprt.c with -DZAP_GC_IMMIX (which `#include`s
+  # zapgc.inc.c) and runs the harness, exercising the Immix allocator's
+  # mutator registration, block map, bump allocation and safepoint/STW wiring
+  # under a real multi-subsystem program on a real Windows runner. (A C harness
+  # carries no compiler-emitted shadow-stack roots, so it deliberately does NOT
+  # drive a collection; the sweep + large-object reclamation paths are compile-
+  # checked here and behaviorally proven by the ROOTED Zap-source gc-immix goldens
+  # on the required Linux/ARM jobs — gc_large_live_set, immix_evac_coro_stress.)
+  # The harness (`zap_win_a4_test.c`) drives the public runtime ABI end-to-end — byte-exact
+  # fs/io, os/env, the Path::join separator fix, the BCryptGenRandom CSPRNG, an
+  # ephemeral Winsock listener with IOCP/AFD netpoller registration, and a
+  # coroutine spawned on the M:N scheduler sending over a channel to the main
+  # thread (the A1 context switch running a real program under the scheduler). The
+  # Zap-*source* goldens additionally run once the LLVM-18-backed compiler is built
+  # on Windows (tracked separately — see the PR body); until then this C harness is
+  # the on-Windows proof for the Immix allocator. The portable front-end crates
+  # still build+test best-effort in `windows-crates`.
   windows-runtime:
     name: "Windows full-program runtime (I#198 / A4)"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -589,8 +709,8 @@ jobs:
       # Compile + link the shipping runtime (zaprt.c + the A1/A2/A3 Windows TUs)
       # with the A4 integration harness, exactly as build_executable's Windows arm
       # links a program (minus CPython, gated off for v1), under gc-boehm. This is
-      # the proof that zaprt.c COMPILES and LINKS on Windows (the #error gate now
-      # only blocks the still-unported precise Immix collector).
+      # the proof that zaprt.c COMPILES and LINKS on Windows (the former #error gate
+      # that blocked ZAP_GC_IMMIX on Windows is retired by I#218).
       - name: Build the runtime + A4 integration harness (gc-boehm)
         shell: msys2 {0}
         run: |
@@ -605,12 +725,39 @@ jobs:
       # coroutine/channel round-trip through the scheduler — Zap's runtime running
       # on Windows. Non-zero exit (a failed check or an uncaught runtime fault)
       # fails the job.
-      - name: Run the A4 integration harness
+      - name: Run the A4 integration harness (gc-boehm)
         shell: msys2 {0}
         run: |
           set -eux
           cd crates/codegen/src
           ./a4test.exe
+
+      # Same build + run under the DEFAULT precise Immix collector (I#218): add
+      # -DZAP_GC_IMMIX (which `#include`s zapgc.inc.c at the bottom of zaprt.c) and
+      # DROP -lgc (the precise collector links no Boehm), exactly as
+      # build_executable's `gc-immix` arm does; -lpthread stays (winpthreads backs
+      # the heap/STW locks). This is the proof the Windows aligned-block heap port
+      # works: the `_aligned_malloc` block map + bump allocation and the
+      # safepoint/STW wiring run under a real program on a real Windows runner (the
+      # `_aligned_free`/sweep/LOS paths are compile-checked here and reclamation-
+      # proven by the rooted gc-immix goldens on Linux/ARM — see the job header).
+      # The default collector reaching Windows parity with Linux/macOS.
+      - name: Build the runtime + A4 integration harness (gc-immix, DEFAULT)
+        shell: msys2 {0}
+        run: |
+          set -eux
+          cd crates/codegen/src
+          gcc -O2 -Wall -DZAP_GC_IMMIX -o a4test_immix.exe \
+            zap_win_a4_test.c zaprt.c zap_ctx_win_x64.c zap_win_a3.c zap_np_iocp.c \
+            -lstdc++ -lm -lpcre2-8 -lz -lssl -lcrypto -lpthread \
+            -lws2_32 -lbcrypt -ldbghelp
+
+      - name: Run the A4 integration harness (gc-immix, DEFAULT)
+        shell: msys2 {0}
+        run: |
+          set -eux
+          cd crates/codegen/src
+          ./a4test_immix.exe
 
   # Windows front-end crates (ticket #199 / A5). BEST-EFFORT (`continue-on-error`):
   # the portable compiler crates (syntax/sema/ir/mono/pkg/driver; no LLVM, no C
@@ -621,6 +768,8 @@ jobs:
   # follow-up), so codegen-dependent tests cannot run on this host yet.
   windows-crates:
     name: "Windows front-end crates (I#199 / A5)"
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     continue-on-error: true
     steps:
@@ -642,3 +791,52 @@ jobs:
       - name: Test (default members, no LLVM)
         continue-on-error: true
         run: cargo test
+
+  # Aggregate status gate. THIS is the single required status check for `main`
+  # (branch-protection ruleset), replacing the per-matrix contexts. It runs on
+  # BOTH triggers, is never path-gated (always reports a status), and depends on
+  # every heavy job plus `changes`. `if: always()` makes it run even when a
+  # dependency was skipped (docs-only) or failed.
+  #
+  # Pass/fail rule: GREEN when every needed job is `success` OR `skipped`; RED if
+  # any is `failure` or `cancelled`. So a docs-only change (heavy jobs skipped) is
+  # green, and a code change is green only when the whole matrix passed. This is
+  # the standard pattern that avoids the GitHub footgun where a *skipped* required
+  # matrix check would block merge forever.
+  #
+  # `windows-crates` is intentionally NOT a dependency: it is best-effort
+  # (`continue-on-error: true`) and must stay non-blocking, so it is excluded from
+  # the gate rather than being allowed to turn the gate red.
+  ci-gate:
+    name: CI gate
+    needs:
+      - changes
+      - host
+      - vscode-extension
+      - full
+      - arm64
+      - windows-ctxswitch
+      - windows-a3
+      - windows-netpoller
+      - windows-runtime
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all required jobs succeeded or were skipped
+        run: |
+          set -u
+          echo "changes:           ${{ needs.changes.result }}"
+          echo "host:              ${{ needs.host.result }}"
+          echo "vscode-extension:  ${{ needs.vscode-extension.result }}"
+          echo "full:              ${{ needs.full.result }}"
+          echo "arm64:             ${{ needs.arm64.result }}"
+          echo "windows-ctxswitch: ${{ needs.windows-ctxswitch.result }}"
+          echo "windows-a3:        ${{ needs.windows-a3.result }}"
+          echo "windows-netpoller: ${{ needs.windows-netpoller.result }}"
+          echo "windows-runtime:   ${{ needs.windows-runtime.result }}"
+          bad="${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}"
+          if [ "$bad" = "true" ]; then
+            echo "::error::A required job failed or was cancelled — CI gate is RED."
+            exit 1
+          fi
+          echo "All required jobs succeeded or were skipped — CI gate is GREEN."

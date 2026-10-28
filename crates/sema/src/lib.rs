@@ -98,7 +98,14 @@ pub fn check(module: &Module) -> Vec<TypeError> {
 pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
     // Prepend the built-in prelude (`Signal` enum, `MemStats` struct) so the
     // signals surface reuses ordinary enum/struct type-checking (ticket #77).
-    let module = &zapc_syntax::parser::with_prelude(module);
+    let mut module = zapc_syntax::parser::with_prelude(module);
+    // Resolve compile-time `when target.*` conditional compilation (I#139,
+    // D-0079) before any checking, so dead arms are never type-checked against a
+    // target they were not written for. The driver resolves against the active
+    // `--target` first; here (e.g. the LSP path) the host target is used, and
+    // the re-resolve is a no-op on an already-resolved module.
+    zapc_syntax::cfg::resolve_cfg(&mut module, &zapc_syntax::cfg::Target::host());
+    let module = &module;
     let mut c = Checker::new();
     c.collect_types(module);
     c.check_value_struct_recursion(module);
@@ -122,7 +129,9 @@ pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
 /// The prelude is prepended exactly as in [`analyze`] (diagnostic parity); its
 /// items carry no expression bodies, so they contribute no facts.
 pub fn analyze_queryable(module: &Module) -> (Vec<TypeError>, Vec<TypeError>, AnalysisFacts) {
-    let module = &zapc_syntax::parser::with_prelude(module);
+    let mut module = zapc_syntax::parser::with_prelude(module);
+    zapc_syntax::cfg::resolve_cfg(&mut module, &zapc_syntax::cfg::Target::host());
+    let module = &module;
     let mut c = Checker::new();
     c.analysis = Some(AnalysisFacts::default());
     c.collect_types(module);
@@ -235,8 +244,10 @@ const BUILTINS: &[&str] = &[
     // driver to persist `let` values across entries, never written by users.
     "__repl_load_i64",
     "__repl_load_ptr",
+    "__repl_load_f64",
     "__repl_store_i64",
     "__repl_store_ptr",
+    "__repl_store_f64",
     // Internal netpoller integration-test hook (ticket #80). No public I/O
     // surface exists yet (sockets #79, signals #77), so this drives the
     // netpoller end-to-end from the runtime; removed/replaced when #79 lands.
@@ -1792,6 +1803,13 @@ impl Checker {
 
     fn check_stmt(&mut self, st: &Stmt) {
         match st {
+            // Conditional-compilation blocks are expanded by `resolve_cfg`
+            // before type-checking (see `analyze`), so the checker never sees
+            // one. Reaching here means that invariant was violated.
+            Stmt::Cfg(_) => unreachable!(
+                "`when target.*` must be cfg-resolved before type-checking \
+                 (zapc_syntax::cfg::resolve_cfg)"
+            ),
             Stmt::Let {
                 ty,
                 name,
@@ -3205,13 +3223,13 @@ impl Checker {
                 // users. A load yields `Unknown` so it coerces into the binding's
                 // declared type; a store is a statement (`Unit`). `Unknown` is
                 // universally assignable, so `<T> x = __repl_load_*(i)` checks.
-                "__repl_load_i64" | "__repl_load_ptr" => {
+                "__repl_load_i64" | "__repl_load_ptr" | "__repl_load_f64" => {
                     for a in args {
                         self.infer(&a.value);
                     }
                     return Ty::Unknown;
                 }
-                "__repl_store_i64" | "__repl_store_ptr" => {
+                "__repl_store_i64" | "__repl_store_ptr" | "__repl_store_f64" => {
                     for a in args {
                         self.infer(&a.value);
                     }
@@ -3979,6 +3997,54 @@ mod tests {
     }
 
     #[test]
+    fn cfg_dead_arm_is_not_type_checked() {
+        // Dead-arm skip (I#139, D-0079): the Windows arm calls an undefined
+        // function. `analyze` resolves `when target.*` against the host, so on a
+        // non-Windows host the arm is dead and must never be type-checked —
+        // compiling must succeed with no errors. (The workspace test suite runs
+        // on Linux hosts; guard the negative assertion so a future Windows
+        // `cargo test` job, where that arm would be live, does not flake.)
+        let src = "\
+when target.os == .windows:
+    def plat() -> int64:
+        return undefined_windows_fn()
+else:
+    def plat() -> int64:
+        return 0
+
+def main():
+    print(plat())
+";
+        if !cfg!(target_os = "windows") {
+            ok(src);
+        }
+    }
+
+    #[test]
+    fn cfg_live_arm_is_type_checked() {
+        // The complement: a type error in the *selected* arm is still reported.
+        // The `else` arm is live on every non-Windows host and returns a `str`
+        // where `int64` is declared, which must be a type error.
+        let src = "\
+when target.os == .windows:
+    def plat() -> int64:
+        return 0
+else:
+    def plat() -> int64:
+        return \"not an int\"
+
+def main():
+    print(plat())
+";
+        if !cfg!(target_os = "windows") {
+            assert!(
+                !errors(src).is_empty(),
+                "a type error in the live arm must be reported"
+            );
+        }
+    }
+
+    #[test]
     fn generator_drives_a_for_loop() {
         // A `def` with `yield` is a generator (I#67); its call is an Iterator
         // and drops into a `for` loop through the D-0048 protocol.
@@ -4318,6 +4384,37 @@ mod tests {
         assert!(
             !errors("def main():\n    argparse.frobnicate()\n").is_empty(),
             "expected unknown argparse.* function to error"
+        );
+    }
+
+    #[test]
+    fn concurrent_module_surface_type_checks() {
+        // `concurrent.Counter()`/`Counter(start)` yield the prelude `Counter`
+        // (its `add`/`incr`/`get` return int64); the MPSC `Queue[T]` is a bare
+        // prelude generic built with `new_queue[T]()`, with comma-ok `pop`
+        // (ticket #184, D-0078). Both pointer and non-pointer payloads type-check.
+        ok("import concurrent\n\n\
+            def main():\n\
+            \x20   Counter c = concurrent.Counter()\n\
+            \x20   print(c.get())\n\
+            \x20   print(c.add(2))\n\
+            \x20   print(c.incr())\n\
+            \x20   Counter c2 = concurrent.Counter(10)\n\
+            \x20   print(c2.get())\n\
+            \x20   Queue[int64] q = new_queue()\n\
+            \x20   q.push(5)\n\
+            \x20   auto v, ok = q.pop()\n\
+            \x20   if ok:\n\
+            \x20       print(v.unwrap())\n\
+            \x20   Queue[str] qs = new_queue[str]()\n\
+            \x20   qs.push(\"x\")\n");
+    }
+
+    #[test]
+    fn unknown_concurrent_function_is_an_error() {
+        assert!(
+            !errors("def main():\n    concurrent.frobnicate()\n").is_empty(),
+            "expected unknown concurrent.* function to error"
         );
     }
 

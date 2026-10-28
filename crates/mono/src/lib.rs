@@ -1036,6 +1036,16 @@ impl Mono<'_> {
 
     fn rewrite_stmt(&mut self, st: &Stmt, env: &mut Env) -> Result<Stmt, LowerError> {
         Ok(match st {
+            // `when target.*` blocks are cfg-resolved away before
+            // monomorphization (the driver and sema both call
+            // `zapc_syntax::cfg::resolve_cfg`), so one appearing here is an
+            // internal invariant violation.
+            Stmt::Cfg(_) => {
+                return Err(err(
+                    "internal error: unresolved `when target.*` block reached \
+                     monomorphization (expected cfg resolution first)",
+                ));
+            }
             Stmt::Let {
                 is_const,
                 ty,

@@ -1,8 +1,10 @@
 # Zap — Versioning & Stability Policy (the 1.0 contract)
 
 **Status:** Locked (policy). See `DECISIONS.md` D-0070, issue #205, epic #158
-(`design/0016-platform-1.0.md`, Area D2).
-**Last updated:** 2026-10-22
+(`design/0016-platform-1.0.md`, Area D2). The 1.0 Stable set (§4.4) and the
+platform matrix (§7.3) are **ratified** by the #206 spec-freeze audit
+(D-0076, `design/0029-spec-freeze.md`).
+**Last updated:** 2026-10-27
 
 This document defines what the word **"stable"** means for Zap: the versioning
 scheme, what a version bump promises for each surface, how features move between
@@ -251,10 +253,13 @@ For a code marked **Stable** (see §4), within a MAJOR:
 - The `--json` / `zap mcp` diagnostic `code` field is part of that diagnostic
   schema, and per §3.1 the schema is covered only once explicitly stabilized.
 
-**Tiering.** Error codes ship **Experimental** (§4): pre-1.0 (§2) makes no promise
-and codes may be **renumbered freely** until the stable set is frozen. The
-authoritative Stable set is ratified by the **#206 spec-freeze audit** at 1.0;
-from that release the rules above bind every code in it.
+**Tiering.** Pre-1.0 (§2) makes no promise and codes may be **renumbered freely**
+until the stable set is frozen. The **#206 spec-freeze audit** (D-0076) ratifies
+the Stable set: **every non-meta code** — the lex/parse/name/type/semantic/
+back-end categories — is **Stable**, and the rules above bind it. The **meta
+band** (`ZAP0001` ICE, `ZAP0002` feature-not-yet-implemented) is **excluded**:
+an ICE is Internal and "not-yet-implemented" is transient, so neither carries a
+meaning promise. See §4.4.
 
 ---
 
@@ -308,36 +313,83 @@ stable" is never a valid assumption.
   promise is a breaking change (§6) and happens only at a MAJOR, after
   deprecation (§5).
 
-### 4.4 Provisional 1.0 tiering (to be ratified by #206)
+### 4.4 The ratified 1.0 Stable set (#206)
 
-The **authoritative** Stable/Experimental/Internal classification for 1.0 is
-produced by the **spec-freeze audit (#206, epic Area D1)**, which this document
-unblocks. The table below is the **framework and a provisional seed** for that
-audit, derived from `SPEC.md` Appendix B and the decision log — **not** the
-final freeze. #206 may move any row.
+This is the **authoritative** Stable/Experimental/Internal classification for
+1.0, ratified by the spec-freeze audit (#206, epic Area D1) and recorded in
+**D-0076** (`design/0029-spec-freeze.md`, which carries the per-surface
+justification and the surveyed implementation evidence). It supersedes the
+provisional seed that previously sat here. Post-freeze, surfaces graduate
+Experimental→Stable additively at a MINOR (§4.2); the Stable set only grows
+within 1.x (§1.2).
 
-| Surface | Provisional tier | Note |
-|---|---|---|
-| Declarations, scalars, operators, control flow, functions/lambdas | **Stable** | `SPEC.md` §3–§7, Locked. |
-| Strings, interpolation, conversions, value/reference semantics | **Stable** | Locked. |
-| Structs, interfaces, enums (incl. data-carrying, D-0046) | **Stable** | Syntax Locked; audit to confirm sum-type surface. |
-| Exceptions, `try/except/finally`, `with` / context managers (D-0069) | **Stable** | Locked. |
-| Modules, imports, visibility (D-0028, D-0052) | **Stable** | Locked. |
-| Generics (incl. bounds) | **Stable** (candidate) | Recently shipped; audit confirms. |
-| Coroutines, channels, `select`, structured `scope:` (D-0044/45) | **Stable** (candidate) | Model Locked; some surface marked "syntax draft". |
-| First-class function values + closures (D-0067 era) | **Stable** (candidate) | Recently shipped. |
-| Regex (D-0010), decorators/annotations core + `@derive(Eq, Repr)` | **Stable** | Locked. |
-| Core built-ins and core `std` (`io`/`fs`, `os`, `sys`, `strings`, `math`, `collections`, `time`, `json`, `regex`, `logging`, …) | **Stable** (per-module, audited) | #206 classifies module-by-module. |
-| CLI: `run`, `build`, `test`, `fmt`, `new`/`init`, `add`/`remove`, `version`, `help` | **Stable** | `SPEC.md` §17. |
-| `zap.toml` / `zap.lock` / resolver (D-0052) | **Stable** | Per §1.4. |
-| `threading` compat module (I#175) | **Experimental** | Flagged migration-only; prefer coroutines. |
-| Python interop (`import python`, D-0003/design 0003) | **Experimental** | "Rare relief valve." |
-| Numeric arrays / SIMD, dtype promotion (D-0011, design 0002) | **Experimental** | Incremental; promotion rules open. |
-| `set` type, `**kwargs`, user-defined macros/decorators beyond `@derive` | **Experimental** / not-yet | Open questions; ship Experimental if present. |
-| C FFI (D-0012), arenas, WASM target | **Experimental** when shipped | Deferred / post-1.0. |
-| `zap mcp`, `zap inspect`, `zap zenv`, `zap expand`, `zap ir` | **mixed** | Commands Stable where listed; their *output formats* Internal unless a `--json` schema is stabilized. |
-| Error codes (`ZAPnnnn`) + `zap explain` (I#157/F1) | **Experimental** (Stable-audited target) | Code *meaning* stable per §3.4 once ratified; message **text** never stable. #206 freezes the Stable set. |
-| ZIR (`design/IR.md`), `zaprt`/ABI (`design/RUNTIME-ABI.md`), GC algorithm, scheduler internals, codegen output | **Internal** | §1.5; never promised. |
+Tier key: **S** Stable (covered by the §3 promise), **E** Experimental (shipped,
+not promised), **I** Internal (no contract). `SPEC.md` Appendix B carries the
+matching per-section tier; this table is the cross-surface source of truth.
+
+**Language (`SPEC.md` §1–§16).**
+
+| Surface | Tier |
+|---|---|
+| Lexical structure/literals; declarations + `const`; scalars + conversions | **S** |
+| `str`/`bytes` + interpolation + codepoint slicing/views | **S** |
+| `list`/`dict`/tuples + value/reference semantics | **S** |
+| Structs + methods + `value struct`; interfaces; enums tier-1 **and** tier-3 sum types (D-0046) | **S** |
+| Operators + overloading + `@derive(Eq, Ord, Hash, Repr)` (in-place `__iadd__`-family **not-yet**) | **S** |
+| Control flow (incl. `do`/`while`, `match`); iteration protocol (D-0048) | **S** |
+| Functions/lambdas/generators; default/keyword/variadic args; comprehensions/slicing | **S** |
+| First-class function values + closures (D-0067) | **S** |
+| Exceptions; `with` / context managers (D-0069); modules/imports/visibility | **S** |
+| Regex (D-0010); decorators & annotations core (D-0036) + `@derive(Json)` | **S** |
+| Generics incl. bounds (D-0064) | **S** |
+| Coroutines/channels/`select`/`scope:`/`spawn detached` (D-0031/0044/0045); sync primitives + `Atomic[T]` (D-0032/0066); `Optional[T]` (D-0065) | **S** |
+| Numeric arrays / SIMD + dtype promotion (D-0011); `set` type; C-style bitfields (D-0068); Python interop; `@derive(Yaml)`/`@derive(Csv)` | **E** |
+| `when target.*` compile-time conditional compilation (D-0079, I#139 Phase 1) | **E** |
+| Value/memory layout, enum/closure representation (§1.5) | **I** |
+
+**Standard library (per module; `crates/sema/src/modules/`, D-0056).**
+
+| Surface | Tier |
+|---|---|
+| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`) | **S** |
+| `io`, `fs`, `os`, `sys`, `process`, `math`, `random`, `time`, `datetime` | **S** |
+| `collections` extras (`deque`, `bisect`, `oset`); `sync`; `json`; `logging`; `argparse` | **S** |
+| `signal`/`gc`/`runtime` — the **API** (`signal.notify`, `gc.collect/stats`, `runtime.coroutine_dump`) | **S** |
+| `signal`/`gc`/`runtime` — the dump/stats **output format** | **I** |
+| `crypto`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`; `threading` (migration-only) | **E** |
+| `concurrent` — lock-free `Counter` + MPSC `Queue[T]` (D-0078); reference-payload `Queue[T]` is further gated on aarch64 by I#223 | **E** |
+
+**CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**
+
+| Surface | Tier |
+|---|---|
+| `run`, `build`, `test`, `fmt`, `new`, `init`, `add`, `remove`, `zenv`, `explain`, `doc`, `version`, `help` — the verbs + flags + exit codes | **S** |
+| `mcp`, `lsp`, `repl`, `playground` — the verb exists; its protocol/semantics | **S** / **E** |
+| `ir`, `expand`, `inspect` — the verb; its output format | **S** / **I** |
+| Every `--json` schema (`test --json`, `mcp`, `doc --format json`) | **E** (until explicitly stabilized, §3.1) |
+| `playground-worker` (hidden internal subprocess) | **I** |
+
+**Package format (D-0052, D-0027).**
+
+| Surface | Tier |
+|---|---|
+| `zap.toml`, `zap.lock`, MVS resolver, `git`/`path` sources, checksum DB | **S** (per §1.4) |
+| Registry index + `registry` source + `Source::Registry` (read path, D-0027) | **E** (new; read-only, no publish path) |
+
+**Diagnostics (`ZAPnnnn`, D-0071, §3.4) and `zap fmt` (D-0037).**
+
+| Surface | Tier |
+|---|---|
+| The `ZAPnnnn` scheme + `zap explain`; the documented **meaning** of every non-meta code (lex/parse/name/type/semantic/back-end) | **S** |
+| Meta band `ZAP0001` (ICE), `ZAP0002` (feature-not-yet-implemented) | **E/I** (excluded from the Stable set) |
+| Message **text** of any code | never stable (§3.4) |
+| `zap fmt` / `--check` + its parse-preserving & idempotence contract + exit codes | **S** |
+| The **exact byte-for-byte canonical rendering** | **not promised** (Go/`gofmt` stance — may be refined within 1.x; a reformat is never a semantic change) |
+
+**Internal (never promised, §1.5):** ZIR (`design/IR.md`), `zaprt`/ABI
+(`design/RUNTIME-ABI.md`), GC algorithm, scheduler internals, codegen output.
+The eventual **C FFI** (D-0012, deferred) and the **WASM** target (post-1.0)
+ship **Experimental** when they land and are governed from then on.
 
 ---
 
@@ -410,10 +462,29 @@ last `1.x` release.
 
 ### 7.3 Platform support matrix
 
-- **1.0 targets Linux + macOS + Windows**; WASM is a post-1.0 fast-follow (epic
-  #158, `design/0016-platform-1.0.md`). The authoritative, per-architecture
-  matrix (tier-1 CI-gated vs tier-2 best-effort) lives with the platform work.
-- **Adding** a platform/architecture is a backward-compatible **MINOR** change.
+"**Stable**" for a platform means the §3 promise is **continuously CI-verified**
+on it. A platform whose CI is not currently green is **not** under the promise,
+however complete its implementation is — "supported" never means "promised".
+The three tiers:
+
+- **tier-1** — CI-gated; the §3 promise holds. **Stable.**
+- **tier-2** — supported/best-effort; CI pending or partial; **not** under the
+  §3 promise. Graduates to tier-1 (Stable) at a MINOR once CI gates it.
+- **experimental** — known issues (linked); not under the promise.
+
+The ratified 1.0 matrix (#206, D-0076; `design/0016-platform-1.0.md`):
+
+| Platform | Tier | Basis |
+|---|---|---|
+| **Linux x86-64** | **tier-1 (Stable)** | Primary dev/CI target. |
+| **Windows x86-64** | **tier-1 (Stable)** | A-track #195–199; CI-gated. |
+| **macOS x86-64** | **tier-2 (Supported — not yet CI-gated)** | Implemented (PR#259) but parked pending a macOS CI runner; **not** under the §3 promise until the runner lands and PR#259 merges, then graduates at a MINOR. |
+| **macOS arm64** | **experimental** | Known issue #260 (JIT exception-unwinding gap; AOT fine, JIT/REPL affected). |
+| **aarch64-Linux** | **experimental** | Known issue #223 (multicore Immix GC use-after-free, parked). |
+| **WASM** | **post-1.0** | Fast-follow (epic #158); not a 1.0 target. |
+
+- **Adding** a platform/architecture, or **graduating** a tier-2 platform to
+  tier-1, is a backward-compatible **MINOR** change.
 - **Dropping** a platform/architecture from the supported matrix is **breaking**
   → MAJOR (it can make a previously-buildable project unbuildable).
 

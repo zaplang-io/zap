@@ -1816,11 +1816,167 @@ it is codegen-gated like `zap run`/`zap repl`.
   streaming (SSE over the worker pipe), a cached precompiled-runtime image for
   faster per-request startup, and a server-side share/paste store.
 
-## D-0076 — macOS support: ucontext behind the seam, kqueue netpoller, Intel-required CI (I#224)
+## D-0076 — 1.0 spec-freeze: the ratified Stable set (I#206)
+**Status:** Locked (ratification). Full audit: `design/0029-spec-freeze.md`.
+Epic I#158, Area D1. Ratifies the Stable set that D-0070 (`docs/STABILITY.md`
+§4.4) and D-0071 (§3.4) explicitly deferred to this audit; recorded in
+`docs/STABILITY.md` §4.4 (surfaces) and §7.3 (platforms), with `SPEC.md`
+Appendix B carrying the matching per-section tier.
+
+The #206 audit surveyed the implemented tree (not just the docs) and fixes the
+authoritative 1.0 Stable / Experimental / Internal classification. Posture is
+**conservative**: promising stability is a one-way door (frozen for all of 1.x),
+so a young/under-specified/platform-fragile surface ships **Experimental** and
+graduates later at a MINOR (§4.2) — cheap and additive — rather than being
+frozen prematurely.
+
+- **Language Stable:** declarations/scalars/strings/collections/tuples, structs
+  (+`value struct`)/interfaces/enums (tier-1 **and** tier-3 sum types), operators
+  + overloading + `@derive(Eq,Ord,Hash,Repr)`, control flow + iteration protocol,
+  functions/lambdas/generators + default/keyword/variadic args, **first-class fn
+  values + closures** (D-0067), comprehensions/slicing, exceptions, `with`/context
+  managers (D-0069), modules/imports/visibility, regex, decorators core +
+  `@derive(Json)`, **generics incl. bounds** (D-0064), coroutines/channels/
+  `select`/`scope:`/`spawn detached`, sync primitives + **`Atomic[T]`** (D-0066),
+  `Optional[T]` (D-0065). **Experimental:** numeric arrays/SIMD, `set`, C-style
+  bitfields (D-0068), Python interop, `@derive(Yaml)`/`@derive(Csv)`;
+  `__iadd__`-family in-place ops remain **not-yet**. **Internal:** value/memory
+  layout, representation, GC/scheduler (§1.5).
+- **Stdlib (per module) Stable:** built-ins (+`heap`), `io`/`fs`/`os`/`sys`/
+  `process`, `math`/`random`, `time`/`datetime`, `collections` extras (`deque`/
+  `bisect`/`oset`), `sync`, `json`, `logging`/`argparse`, and the `signal`/`gc`/
+  `runtime` **API** (their dump/stats *format* stays Internal). **Experimental:**
+  `crypto`, `net`/`http`/`tls`, `zlib`/`gzip`, `yaml`, `threading` (migration-
+  only). `strings`/`collections`/`csv`/`testing` are **not** importable modules
+  (str methods / built-in containers + the extras / `@derive(Csv)` / the `@test`
+  framework) — SPEC §18 corrected.
+- **CLI Stable:** `run`/`build`/`test`/`fmt`/`new`/`init`/`add`/`remove`/`zenv`/
+  `explain`/`doc`/`version`/`help` (verbs + flags + exit codes). `mcp`/`lsp`/
+  `repl`/`playground` verbs Stable, protocols Experimental; `ir`/`expand`/
+  `inspect` output Internal; all `--json` schemas Experimental until stabilized;
+  `playground-worker` Internal. (SPEC §17 gained the shipped `doc` and `lsp`.)
+- **Package format Stable:** `zap.toml`/`zap.lock`/MVS resolver/`git`+`path`
+  sources/checksum DB (D-0052). **Experimental:** the registry read path (D-0027,
+  read-only, no publish path).
+- **Diagnostics:** the `ZAPnnnn` scheme + `zap explain` + the documented
+  **meaning** of every non-meta code (117 of the 119 registered) are **Stable**;
+  the meta band (`ZAP0001` ICE, `ZAP0002` not-yet-implemented) is excluded;
+  message **text** is never stable (§3.4).
+- **`zap fmt`:** the tool + its parse-preserving/idempotence contract + exit
+  codes are **Stable**; the **exact byte-for-byte rendering is not promised** (the
+  Go/`gofmt` stance — it may be refined within 1.x; a reformat is never a semantic
+  change).
+- **Platform matrix (§7.3):** Linux x86-64 and Windows x86-64 **tier-1 (Stable,
+  CI-gated)**; macOS x86-64 **tier-2 (Supported — not yet CI-gated, NOT under the
+  §3 promise)** pending a macOS CI runner + PR#259, graduating at a MINOR; macOS
+  arm64 **experimental** (#260 JIT unwinder); aarch64-Linux **experimental**
+  (#223 multicore GC race); WASM post-1.0. "Stable" for a platform means the §3
+  promise is continuously CI-verified there.
+- **Freeze mechanism:** recorded as the `docs/STABILITY.md` §4.4 Stable-set table
+  + §7.3 matrix and `SPEC.md` Appendix B per-section tiers + "frozen for 1.0"
+  markers; post-freeze additions stay additive (MINOR, §1.2/§4.2). The editorial
+  `SPEC.md` `Version:` is bumped to `0.3` (freeze revision) but **not** stamped
+  `1.0` — that reconciliation happens at the 1.0.0 **release** (#207), per §2;
+  the toolchain version in `Cargo.toml` stays authoritative.
+
+**Rationale:** "call it 1.0" is a commitment, not a feature (D-0070). The audit
+makes the commitment concrete and honest: it freezes the mature core, keeps the
+young/fragile surfaces Experimental so they can still evolve, refuses to promise
+what CI does not continuously verify (macOS), and follows gofmt in not freezing
+exact formatter output — all one-way doors chosen deliberately and reversibly
+only in the additive direction.
+
+## D-0078 — `concurrent` lock-free collections (I#184)
+**Status:** Accepted (ratified 2026-10-27). Design: `design/0031-concurrent-collections.md`.
+Builds on D-0066 (`Atomic[T]`) and D-0008/D-0009/I#120 (precise moving Immix GC);
+governed by D-0076 (1.0 freeze) as an additive **Experimental** surface.
+
+Zap ships a small `concurrent` stdlib module of CAS-based collections built on
+`Atomic[T]`. **Phase 1** (this ticket) is exactly a lock-free **`Counter`** (over
+`Atomic[int64]`) and an unbounded **MPSC `Queue[T]`** (Vyukov: a multi-producer
+atomic tail-swap + publish, a single-consumer `pop`). The concurrent map is
+**deferred** (a later sharded-`Mutex`+`dict` ticket, not a CAS map); MPMC is a
+later additive phase.
+
+- **Reclamation: lean on the GC.** Nodes are ordinary heap structs; reclamation
+  is the tracing moving collector — **no** hazard pointers, epochs, write/read
+  barriers, or pinning, and **no new `zaprt.c`/`zapgc`/runtime-C code**. This is
+  sound because evacuation is stop-the-world, mutators observe moves load-at-use,
+  and tracing reclaims only the unreachable (design §4).
+- **Binding invariant (§4.4):** every stored pointer lives in a **genuine
+  reference slot** (an `Atomic[T]` cell or a struct field) — never packed, tagged
+  or integer-cast — so precise tracing sees and (under the moving collector)
+  forwards it. ABA is moot because a referenced node is never reclaimed, so
+  version-counter pointer-packing is neither needed nor allowed.
+- **Memory ordering:** `seq_cst` throughout (the only `Atomic[T]` order today).
+  Non-pointer instantiations (`Queue[int64]`, handles) are correct on every
+  platform; a **reference-payload** `Queue[T]` additionally relies on the moving
+  collector relocating pointer graphs and therefore inherits the open
+  aarch64-Linux evacuation race **I#223**, so it is trustworthy on that platform
+  only once I#223 is fixed (§4.6).
+- **Surface:** concurrency lives in the **type name**, with **no new syntax** and
+  no change to any existing type. `concurrent.Counter()` is a module constructor
+  (non-generic, the `threading.Thread()` pattern); the generic `Queue[T]` is a
+  bare prelude type built with `new_queue[T]()` — the language already uses bare
+  generics (`Atomic[T]`, `Optional[T]`) and reserves module-qualification for
+  non-generic types, because a module-qualified *generic type path* is not in the
+  grammar and adding it was out of scope. No `len()`/iteration (a lock-free queue
+  has no consistent snapshot); `pop()` is comma-ok (`v, ok = q.pop()`), returning
+  `(Optional[T], bool)`.
+
+**Rationale:** lock-free earns its complexity only for a counter and a
+contended producer/consumer queue; a map is better served by sharded mutexes.
+Leaning on the existing GC (rather than building a reclamation subsystem) is both
+correct here and an order of magnitude less code (design §4/§5), and keeps the
+whole feature additive and runtime-free.
+
+## D-0080 — REPL v1 polish: cross-entry declarations, floats, readline, user-type render (I#252)
+
+**Status:** Accepted. Follow-up to [[D-0073]] (I#159); full text in
+`design/0025-repl.md`. Finishes the four items the REPL MVP deferred, all within
+the accepted MCJIT + runtime-slot model (no architectural extension).
+
+- **Cross-entry top-level `def`/`type`/`enum`/interface persistence** — the
+  session accumulates top-level declarations by name (newest wins, position
+  preserved) exactly as it already accumulates imports, and re-emits them at
+  module scope in every later entry so each entry type-checks and links against
+  them. To keep those re-emitted definitions from colliding as duplicate symbols
+  across the MCJIT's accumulated modules, codegen's JIT mode gives every function
+  **internal linkage** except the symbols the engine looks up (`main`,
+  `__repl_entry_N`); each entry module then carries its own private copy. The AOT
+  path is unchanged. *Limitation:* a persisted top-level `def` cannot reference a
+  session `let`-binding (bindings are thunk-locals, not module globals), and a
+  struct/enum **instance** still does not persist (only the type definition does).
+- **Float session bindings** — `float64`/`float32` bindings persist in the same
+  64-bit slot cell, reinterpreted as a `double` by new `zap_repl_slot_{get,set}_f64`
+  runtime entry points (a float is never a GC pointer, so the slot is unrooted;
+  `float32` round-trips exactly via widen-on-store / narrow-on-load). New
+  `__repl_load_f64`/`__repl_store_f64` lowering intrinsics mirror the i64/ptr pair.
+- **Readline + persistent history** — an interactive terminal gets line editing
+  and `~/.zap_history` via `rustyline` (`default-features = false` +
+  `with-file-history`, codegen-gated to the REPL). A piped/non-interactive stdin
+  (the scripted-stdin test harness) falls back to the plain line reader, so test
+  input stays byte-for-byte predictable; the line editor is never engaged there.
+- **User-type rendering (minimal).** A bare user value auto-prints through
+  `print(...)` only when its type carries a renderer (`__str__`/`__repr__` or
+  `@derive(Repr)`); otherwise it falls back to a `<TypeName>` placeholder instead
+  of a compile error. The **general `repr`/Display protocol is explicitly NOT
+  designed here** — it is shared with `print()` and is language-wide (see the
+  follow-up on I#252); the `@ 0x…` address form is deferred with it (no address
+  intrinsic exists yet).
+
+New dep: `rustyline` (codegen feature). Still host-only (needs LLVM), POSIX-only
+(the JIT does not yet support Windows, so `$HOME` locates the history file).
+
+## D-0081 — macOS support: ucontext behind the seam, kqueue netpoller, Intel-required CI (I#224)
 
 **Status:** Accepted. Issue #224, epic I#158 (`design/0016-platform-1.0.md`);
 reuses the A1 context-switch seam (design/0017) and the `np_backend_*` netpoller
-seam (#80, [[D-0061]]). See `design/0029-macos.md`.
+seam (#80, [[D-0061]]). See `design/0033-macos.md`. The 1.0 platform-tier
+classification for macOS lives in [[D-0076]] (§7.3): macOS x86-64 is **tier-2
+(Supported — not yet CI-gated)** and macOS arm64 is **experimental** (#260);
+promoting macOS x86-64 to a CI-gated tier-1 is a later maintainer call, not made
+here.
 
 macOS is the last 1.0-target platform (Linux + macOS + Windows). It is POSIX and
 uses the Itanium C++ ABI like Linux, so — unlike Windows — it reuses the Linux
@@ -1854,6 +2010,11 @@ netpoller backend. Decisions:
   weak-memory bug; its finding proves x86_64 is clean (0/120 at MAXPROCS 4/8/16)
   while arm64 fails ~97%. The required Intel job shares Linux's memory model and is
   genuinely green while exercising the multicore GC; the arm64 job is quarantined
-  single-worker until I#223 lands. So **I#223 does not block macOS support**.
-  Follow-ups: macOS/BSD asm `zap_ctx_*`, arm64-required (multi-worker) after I#223,
+  single-worker until I#223 lands. The macOS jobs stay **outside the blocking
+  `CI gate`** for now (reported, non-blocking) — the same posture as the
+  best-effort `windows-crates` job — so neither the arm64 #260 JIT-unwinder gap
+  nor runner availability can wedge the merge queue; wiring macOS x86-64 into the
+  required gate is the maintainer tier-1 promotion above. So **I#223 does not
+  block macOS support**. Follow-ups: macOS/BSD asm `zap_ctx_*`, arm64-required
+  (multi-worker) after I#223, macOS arm64 JIT EH-frame registration (#260),
   FreeBSD/OpenBSD (the kqueue arm is written to extend). No grammar change.

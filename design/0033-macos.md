@@ -3,7 +3,7 @@
 - **Author(s):** macos-224 session (I#224)
 - **Last updated:** 2026-10-25
 - **Status:** Draft
-- **Discussion:** https://github.com/parveshgarg/zap/issues/224
+- **Discussion:** https://github.com/zaplang-io/zap/issues/224
 - **Epic:** I#158 (platform/1.0). See `design/0016-platform-1.0.md`,
   `design/0017-windows-coroutine-context-switch.md` (the A1 ctx-switch seam).
 
@@ -226,7 +226,7 @@ until #223 lands (documented in the job comment).
   macOS; libc++abi provides the identical Itanium symbols. Verified on-host.
 - **Why Intel-required / arm64-best-effort** rather than arm64-required with
   quarantine? See the CI section — it is the only split that is both green today
-  and honest about I#223. D-0076.
+  and honest about I#223. D-0081.
 
 ## Compatibility
 
@@ -253,7 +253,7 @@ leave a non-building intermediate):
    `zap_np_iocp_test.c`, for a cheap required check even on a no-LLVM path.
 4. `.github/workflows/ci.yml`: `macos` (macos-13, x86_64, both collectors,
    required) + `macos-arm64` (macos-14, best-effort, MAXPROCS-pinned goldens).
-5. `DECISIONS.md`: D-0076 (the CI arch split).
+5. `DECISIONS.md`: D-0081 (the CI arch split).
 
 Gates (standing): `cargo fmt`; clippy both collectors `--all-targets -D warnings`;
 `make docker-test` both collectors (Linux gate); `zap fmt --check tests/golden`;

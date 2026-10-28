@@ -52,9 +52,11 @@
  * This translation unit is self-contained (no other runtime headers) so it both
  * links into the Zap program build (wired into build_executable's Windows arm,
  * crates/codegen/src/lib.rs) AND compiles standalone in the on-Windows context-
- * switch + GC verification harness (zap_ctx_win_x64_test.c), which is the only
- * way the A1 GC invariant can be exercised on Windows before the full runtime
- * compiles there (that needs A3 exceptions + the immix mmap->VirtualAlloc port).
+ * switch + GC verification harness (zap_ctx_win_x64_test.c), which isolated the
+ * A1 GC invariant on Windows before the full runtime compiled there. The full
+ * runtime now builds + links on Windows under both collectors (A3 landed; the
+ * precise Immix heap was ported in I#218), so the integration proof also runs in
+ * the `windows-runtime` CI job; this standalone harness remains the focused A1 check.
  * ========================================================================== */
 #include <stddef.h>
 #include <stdint.h>

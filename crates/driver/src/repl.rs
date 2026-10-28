@@ -17,11 +17,12 @@
 
 use std::process::ExitCode;
 
-/// Run `zap repl`: read entries from stdin, evaluate each, loop until EOF.
+/// Run `zap repl`: read entries, evaluate each, loop until EOF. An interactive
+/// terminal gets line editing + persistent history (I#252, via `rustyline`); a
+/// piped/non-interactive stdin (the scripted-stdin test harness, `|`, `<`) uses
+/// a plain line reader so input is byte-for-byte predictable.
 #[cfg(feature = "codegen")]
 pub fn serve() -> ExitCode {
-    use std::io::Write;
-
     let mut session = match Session::new() {
         Ok(s) => s,
         Err(e) => {
@@ -30,20 +31,91 @@ pub fn serve() -> ExitCode {
         }
     };
 
-    let stdin = std::io::stdin();
-    let is_tty = std::io::IsTerminal::is_terminal(&stdin);
-    if is_tty {
-        eprintln!("Zap REPL (I#159). Type `:help` for commands, Ctrl-D to exit.");
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        serve_interactive(&mut session)
+    } else {
+        serve_piped(&mut session)
+    }
+}
+
+/// What feeding one input line to the session did.
+#[cfg(feature = "codegen")]
+enum Feed {
+    /// `:quit` / `:exit` — leave the loop.
+    Quit,
+    /// The entry is incomplete; read another line (continuation).
+    More,
+    /// The line was handled (a meta-command, or a complete entry evaluated).
+    Done,
+}
+
+/// Feed one newline-free input `line` into the pending `buffer`, evaluating a
+/// complete entry. `interactive` gates terminal-only chatter (the reset notice).
+#[cfg(feature = "codegen")]
+fn feed_line(session: &mut Session, buffer: &mut String, line: &str, interactive: bool) -> Feed {
+    // A meta-command (`:...`) is only recognized at the start of an entry.
+    if buffer.is_empty() {
+        match meta_command(line.trim()) {
+            Some(MetaCommand::Quit) => return Feed::Quit,
+            Some(MetaCommand::Help) => {
+                print_help();
+                return Feed::Done;
+            }
+            Some(MetaCommand::Reset) => {
+                session.reset();
+                if interactive {
+                    eprintln!("session reset");
+                }
+                return Feed::Done;
+            }
+            Some(MetaCommand::Type(expr)) => {
+                match session.type_of(&expr) {
+                    Ok(ty) => println!("{ty}"),
+                    Err(diags) => {
+                        for d in diags {
+                            eprintln!("{d}");
+                        }
+                    }
+                }
+                return Feed::Done;
+            }
+            None => {}
+        }
     }
 
+    buffer.push_str(line);
+    buffer.push('\n');
+    if !entry_complete(buffer, line) {
+        return Feed::More;
+    }
+
+    let entry = std::mem::take(buffer);
+    if entry.trim().is_empty() {
+        return Feed::Done;
+    }
+    eval_and_report(session, &entry);
+    Feed::Done
+}
+
+/// Evaluate one entry and print its diagnostics / uncaught-exception message.
+#[cfg(feature = "codegen")]
+fn eval_and_report(session: &mut Session, entry: &str) {
+    let outcome = session.eval(entry);
+    for d in &outcome.diagnostics {
+        eprintln!("{d}");
+    }
+    if let Some(err) = &outcome.runtime_error {
+        eprintln!("Uncaught exception: {err}");
+    }
+}
+
+/// The non-interactive path: a plain line reader over piped stdin. Keeps the
+/// scripted-stdin test harness trivial — no terminal, no editing, no history.
+#[cfg(feature = "codegen")]
+fn serve_piped(session: &mut Session) -> ExitCode {
+    let stdin = std::io::stdin();
     let mut buffer = String::new();
     loop {
-        // Prompt on stderr so stdout carries only program/eval output.
-        if is_tty {
-            eprint!("{}", if buffer.is_empty() { "zap> " } else { "...  " });
-            let _ = std::io::stderr().flush();
-        }
-
         let mut line = String::new();
         match stdin.read_line(&mut line) {
             Ok(0) => break, // EOF
@@ -53,67 +125,78 @@ pub fn serve() -> ExitCode {
                 break;
             }
         }
+        // `read_line` keeps the newline; `feed_line` works on one logical line.
+        let line = line.trim_end_matches(['\n', '\r']);
+        if let Feed::Quit = feed_line(session, &mut buffer, line, false) {
+            break;
+        }
+    }
+    flush_trailing(session, &buffer);
+    ExitCode::SUCCESS
+}
 
-        // A meta-command (`:...`) is only recognized at the start of an entry.
-        if buffer.is_empty() {
-            let t = line.trim();
-            match meta_command(t) {
-                Some(MetaCommand::Quit) => break,
-                Some(MetaCommand::Help) => {
-                    print_help();
-                    continue;
+/// The interactive path: `rustyline` line editing + persistent history, loaded
+/// from and saved to `~/.zap_history`. Ctrl-C abandons the current entry;
+/// Ctrl-D (at an empty prompt) exits.
+#[cfg(feature = "codegen")]
+fn serve_interactive(session: &mut Session) -> ExitCode {
+    use rustyline::error::ReadlineError;
+
+    let mut rl = match rustyline::DefaultEditor::new() {
+        Ok(rl) => rl,
+        // Falling back keeps the REPL usable even if a terminal denies raw mode.
+        Err(e) => {
+            eprintln!("zap repl: line editor unavailable ({e}); using a plain reader");
+            return serve_piped(session);
+        }
+    };
+    let history = history_path();
+    if let Some(p) = &history {
+        let _ = rl.load_history(p);
+    }
+    eprintln!("Zap REPL (I#252). Type `:help` for commands, Ctrl-D to exit.");
+
+    let mut buffer = String::new();
+    loop {
+        let prompt = if buffer.is_empty() { "zap> " } else { "...  " };
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                if let Feed::Quit = feed_line(session, &mut buffer, &line, true) {
+                    break;
                 }
-                Some(MetaCommand::Reset) => {
-                    session.reset();
-                    if is_tty {
-                        eprintln!("session reset");
-                    }
-                    continue;
-                }
-                Some(MetaCommand::Type(expr)) => {
-                    match session.type_of(&expr) {
-                        Ok(ty) => println!("{ty}"),
-                        Err(diags) => {
-                            for d in diags {
-                                eprintln!("{d}");
-                            }
-                        }
-                    }
-                    continue;
-                }
-                None => {}
+            }
+            // Ctrl-C abandons whatever entry is being typed.
+            Err(ReadlineError::Interrupted) => buffer.clear(),
+            // Ctrl-D exits.
+            Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("zap repl: input error: {e}");
+                break;
             }
         }
-
-        buffer.push_str(&line);
-        if !entry_complete(&buffer, &line) {
-            continue;
-        }
-
-        let entry = std::mem::take(&mut buffer);
-        if entry.trim().is_empty() {
-            continue;
-        }
-        let outcome = session.eval(&entry);
-        for d in &outcome.diagnostics {
-            eprintln!("{d}");
-        }
-        if let Some(err) = &outcome.runtime_error {
-            eprintln!("Uncaught exception: {err}");
-        }
     }
-
-    // A trailing incomplete entry at EOF is evaluated best-effort.
-    if !buffer.trim().is_empty() {
-        let outcome = session.eval(&buffer);
-        for d in &outcome.diagnostics {
-            eprintln!("{d}");
-        }
-        if let Some(err) = &outcome.runtime_error {
-            eprintln!("Uncaught exception: {err}");
-        }
+    flush_trailing(session, &buffer);
+    if let Some(p) = &history {
+        let _ = rl.save_history(p);
     }
     ExitCode::SUCCESS
+}
+
+/// Evaluate a trailing incomplete entry left in the buffer at EOF (best-effort).
+#[cfg(feature = "codegen")]
+fn flush_trailing(session: &mut Session, buffer: &str) {
+    if !buffer.trim().is_empty() {
+        eval_and_report(session, buffer);
+    }
+}
+
+/// The persistent-history file (`~/.zap_history`). `None` if `$HOME` is unset.
+/// The REPL is POSIX-only (the JIT does not yet support Windows, I#159), so
+/// `$HOME` suffices and no extra dependency is needed to find it.
+#[cfg(feature = "codegen")]
+fn history_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".zap_history"))
 }
 
 /// Without the `codegen` feature the toolchain cannot execute Zap, so the REPL
@@ -169,6 +252,9 @@ fn print_help() {
 fn entry_complete(buffer: &str, last_line: &str) -> bool {
     if bracket_depth(buffer) > 0 {
         return false;
+    }
+    if last_line.trim_start().starts_with('@') {
+        return false; // a decorator line attaches to the declaration that follows
     }
     if last_line.trim_end().ends_with(':') {
         return false; // just opened a block header
@@ -239,11 +325,19 @@ mod engine {
         s.start as usize..s.end as usize
     }
 
+    /// Filler for a generated function body that would otherwise be empty (an
+    /// imports-only or pure-declaration entry). Zap has no `pass`; a throwaway
+    /// `let` is an always-valid no-op statement.
+    const NOOP_STMT: &str = "    auto __repl_nop = 0\n";
+
     /// How a binding's value is represented in its runtime slot.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Rep {
         /// An `i64`-class scalar (`int64`, `int32`, `bool`, `char`).
         I64,
+        /// A `double`-class scalar (`float64`, `float32`), reinterpreted into
+        /// the shared 64-bit slot cell (I#252).
+        F64,
         /// A GC pointer (`str`, `bytes`, `list`, `dict`, `set`).
         Ptr,
     }
@@ -252,12 +346,14 @@ mod engine {
         fn load_fn(self) -> &'static str {
             match self {
                 Rep::I64 => "__repl_load_i64",
+                Rep::F64 => "__repl_load_f64",
                 Rep::Ptr => "__repl_load_ptr",
             }
         }
         fn store_fn(self) -> &'static str {
             match self {
                 Rep::I64 => "__repl_store_i64",
+                Rep::F64 => "__repl_store_f64",
                 Rep::Ptr => "__repl_store_ptr",
             }
         }
@@ -295,6 +391,18 @@ mod engine {
     /// executed incrementally on one JIT.
     pub struct Session {
         imports: Vec<String>,
+        /// Top-level declaration names in insertion order (drives the order the
+        /// accumulated `def`/`type`/`enum`/interface decls are re-emitted).
+        decl_order: Vec<String>,
+        /// Accumulated top-level declarations by name → source (I#252). Re-fed at
+        /// module top level in every later entry so a `def`/`type` defined once
+        /// is type-checked and callable afterwards; a redefinition replaces the
+        /// entry (newest wins) while keeping its position.
+        decls: HashMap<String, String>,
+        /// User types (struct/enum) that carry a value renderer (`__str__`,
+        /// `__repr__`, or `@derive(Repr)`), so a bare instance auto-prints
+        /// through `print(...)` rather than the `<TypeName>` placeholder (I#252).
+        displayable: std::collections::HashSet<String>,
         /// Binding names in insertion order (drives the prelude order).
         order: Vec<String>,
         bindings: HashMap<String, Binding>,
@@ -308,6 +416,9 @@ mod engine {
         pub fn new() -> Result<Self, String> {
             Ok(Self {
                 imports: Vec::new(),
+                decl_order: Vec::new(),
+                decls: HashMap::new(),
+                displayable: std::collections::HashSet::new(),
                 order: Vec::new(),
                 bindings: HashMap::new(),
                 next_slot: 0,
@@ -316,10 +427,14 @@ mod engine {
             })
         }
 
-        /// Forget all bindings and imports (the `:reset` meta-command). Slots are
-        /// not reused, so stale slot values simply become unreferenced.
+        /// Forget all bindings, declarations, and imports (the `:reset`
+        /// meta-command). Slots are not reused, so stale slot values simply
+        /// become unreferenced.
         pub fn reset(&mut self) {
             self.imports.clear();
+            self.decl_order.clear();
+            self.decls.clear();
+            self.displayable.clear();
             self.order.clear();
             self.bindings.clear();
         }
@@ -327,8 +442,9 @@ mod engine {
         /// The inferred type of `expr` in the current session (`:type`).
         pub fn type_of(&self, expr: &str) -> Result<String, Vec<String>> {
             let probe = format!(
-                "{}\ndef __repl_type_probe():\n{}    auto __t = ({expr})\n",
+                "{}\n{}def __repl_type_probe():\n{}    auto __t = ({expr})\n",
                 self.imports.join("\n"),
+                self.decls_src(&[]),
                 self.prelude(&[]),
             );
             let analysis = Analysis::analyze(&probe);
@@ -412,21 +528,25 @@ mod engine {
                 }
             }
 
-            // Does the trailing expression carry a printable value?
-            let auto_print = plan.trailing_expr.is_some_and(|span| {
-                let needle = "__retprobe = (";
-                probe
-                    .rfind(needle)
-                    .and_then(|p| analysis.type_at((p + needle.len()) as u32))
-                    .map(printable)
-                    .unwrap_or(false)
-                    && (span.end as usize) <= src.len()
-            });
+            // Decide how (and whether) to auto-print the trailing expression.
+            let auto_print = match plan.trailing_expr {
+                Some(span) if (span.end as usize) <= src.len() => {
+                    // The last `__retprobe` occurrence is the bare reference line
+                    // (see `build_probe`), whose narrowest covering span is the
+                    // binding itself — so this is the whole expression's type.
+                    let ty = probe
+                        .rfind("__retprobe")
+                        .and_then(|p| analysis.type_at(p as u32))
+                        .unwrap_or(Ty::Unknown);
+                    self.auto_print_for(&ty, &plan.new_decls)
+                }
+                _ => AutoPrint::None,
+            };
 
             // Build and run the executable entry.
             self.gen += 1;
             let entry = format!("__repl_entry_{}", self.gen);
-            let exec = self.build_exec(&plan, src, &shadowed, &commits, auto_print, &entry);
+            let exec = self.build_exec(&plan, src, &shadowed, &commits, &auto_print, &entry);
             let exec_mod = match parse_ok(&exec) {
                 Ok(m) => m,
                 Err(d) => {
@@ -454,10 +574,26 @@ mod engine {
                 };
             }
 
-            // Commit: imports + new bindings (shadowing replaces the old slot).
+            // Commit: imports + accumulated declarations + new bindings
+            // (shadowing / redefinition replaces the old entry).
             for imp in &plan.imports {
                 if !self.imports.contains(imp) {
                     self.imports.push(imp.clone());
+                }
+            }
+            for d in &plan.new_decls {
+                if !self.decls.contains_key(&d.name) {
+                    self.decl_order.push(d.name.clone());
+                }
+                self.decls.insert(d.name.clone(), d.src.clone());
+                match d.displayable {
+                    Some(true) => {
+                        self.displayable.insert(d.name.clone());
+                    }
+                    Some(false) => {
+                        self.displayable.remove(&d.name);
+                    }
+                    None => {}
                 }
             }
             for (name, binding) in commits {
@@ -503,17 +639,23 @@ mod engine {
             let mut body = self.prelude(shadowed);
             body.push_str(&indent(&plan.body_src(src)));
             if body.trim().is_empty() {
-                body.push_str("    pass\n");
+                body.push_str(NOOP_STMT);
             }
             for (i, l) in plan.new_lets.iter().enumerate() {
                 body.push_str(&format!("    auto __probe_{i} = {}\n", l.name));
             }
             if let Some(span) = plan.trailing_expr {
+                // Bind the trailing expression, then reference it on its own: a
+                // bare name's recorded span is exactly the binding, so `type_at`
+                // reports the whole expression's type (not an inner sub-expr like
+                // the receiver of `recv.method()`).
                 body.push_str(&format!("    auto __retprobe = ({})\n", &src[rng(span)]));
+                body.push_str("    __retprobe\n");
             }
             format!(
-                "{}\ndef __repl_probe():\n{}",
+                "{}\n{}def __repl_probe():\n{}",
                 self.imports_and(&plan.imports),
+                self.decls_src(&plan.new_decls),
                 body
             )
         }
@@ -528,16 +670,21 @@ mod engine {
             src: &str,
             shadowed: &[String],
             commits: &[(String, Binding)],
-            auto_print: bool,
+            auto_print: &AutoPrint,
             entry: &str,
         ) -> String {
             let mut body = self.prelude(shadowed);
-            let user = if auto_print {
-                plan.body_src_autoprint(src)
-            } else {
-                plan.body_src(src)
+            let user = match auto_print {
+                AutoPrint::Value => plan.body_src_autoprint(src),
+                _ => plan.body_src(src),
             };
             body.push_str(&indent(&user));
+            if let AutoPrint::Placeholder(name) = auto_print {
+                // A user value with no renderer (`__str__`/`__repr__`/
+                // `@derive(Repr)`) prints a type-name placeholder (I#252); the
+                // trailing expression above still evaluated for its effects.
+                body.push_str(&format!("    print(\"<{name}>\")\n"));
+            }
 
             // Epilogue: persist every live binding (prior non-shadowed + new).
             for name in &self.order {
@@ -551,13 +698,55 @@ mod engine {
                 body.push_str(&format!("    {}({}, {})\n", b.rep.store_fn(), b.slot, name));
             }
             if body.trim().is_empty() {
-                body.push_str("    pass\n");
+                body.push_str(NOOP_STMT);
             }
             format!(
-                "{}\ndef {entry}():\n{}",
+                "{}\n{}def {entry}():\n{}",
                 self.imports_and(&plan.imports),
+                self.decls_src(&plan.new_decls),
                 body
             )
+        }
+
+        /// The accumulated top-level declarations re-emitted at module scope:
+        /// every prior decl whose name is not redefined by this entry, followed
+        /// by this entry's new decls (so a redefinition replaces the old one).
+        fn decls_src(&self, new: &[DeclInfo]) -> String {
+            let mut out = String::new();
+            for name in &self.decl_order {
+                if new.iter().any(|d| &d.name == name) {
+                    continue;
+                }
+                out.push_str(&self.decls[name]);
+                out.push('\n');
+            }
+            for d in new {
+                out.push_str(&d.src);
+                out.push('\n');
+            }
+            out
+        }
+
+        /// How a trailing expression of type `ty` should be auto-printed. A user
+        /// type (struct/enum) renders through `print(...)` only when it carries a
+        /// value renderer; otherwise it falls back to a `<TypeName>` placeholder
+        /// (I#252). A general `repr`/Display protocol is a separate ticket.
+        fn auto_print_for(&self, ty: &Ty, new_decls: &[DeclInfo]) -> AutoPrint {
+            match ty {
+                Ty::Unit | Ty::Unknown => AutoPrint::None,
+                Ty::Named(name) => {
+                    let displayable = self.displayable.contains(name)
+                        || new_decls
+                            .iter()
+                            .any(|d| &d.name == name && d.displayable == Some(true));
+                    if displayable {
+                        AutoPrint::Value
+                    } else {
+                        AutoPrint::Placeholder(name.clone())
+                    }
+                }
+                _ => AutoPrint::Value,
+            }
         }
 
         fn imports_and(&self, extra: &[String]) -> String {
@@ -570,20 +759,62 @@ mod engine {
             all.join("\n")
         }
 
-        /// Split an entry into imports, body statements, new `let` bindings, and
-        /// a trailing printable expression. Rejects top-level type/decorator
-        /// declarations (not supported in the first cut).
+        /// Split an entry into imports, accumulated top-level declarations
+        /// (`def`/`type`/`enum`/interface — persisted across entries, I#252),
+        /// body statements, new `let` bindings, and a trailing expression.
         fn classify(&self, module: &Module, src: &str) -> Result<EntryPlan, String> {
             let mut imports = Vec::new();
+            let mut new_decls = Vec::new();
             let mut body_spans = Vec::new();
             let mut new_lets = Vec::new();
             let mut trailing_expr = None;
+
+            // Source for a declaration, extended to cover any decorator lines
+            // above it so the re-emitted copy keeps them.
+            let decl_src = |own: Span, decs: &[ast::Decorator]| -> String {
+                let start = decs
+                    .iter()
+                    .map(|d| d.span.start as usize)
+                    .min()
+                    .unwrap_or(own.start as usize)
+                    .min(own.start as usize);
+                src[start..own.end as usize].to_string()
+            };
 
             let n = module.items.len();
             for (idx, item) in module.items.iter().enumerate() {
                 match item {
                     Item::Import(i) => imports.push(src[rng(import_span(i))].trim().to_string()),
-                    Item::Function(f) => body_spans.push(f.span),
+                    Item::Function(f) => new_decls.push(DeclInfo {
+                        name: f.name.clone(),
+                        src: decl_src(f.span, &f.decorators),
+                        displayable: None,
+                    }),
+                    Item::Struct(s) => new_decls.push(DeclInfo {
+                        name: s.name.clone(),
+                        src: decl_src(s.span, &s.decorators),
+                        displayable: Some(has_renderer(&s.decorators, &s.methods)),
+                    }),
+                    Item::Enum(e) => new_decls.push(DeclInfo {
+                        name: e.name.clone(),
+                        src: decl_src(e.span, &e.decorators),
+                        displayable: Some(has_renderer(&e.decorators, &e.methods)),
+                    }),
+                    Item::Interface(i) => new_decls.push(DeclInfo {
+                        name: i.name.clone(),
+                        src: decl_src(i.span, &[]),
+                        displayable: None,
+                    }),
+                    Item::Annotation(a) => new_decls.push(DeclInfo {
+                        name: a.name.clone(),
+                        src: decl_src(a.span, &[]),
+                        displayable: None,
+                    }),
+                    Item::Decorator(d) => new_decls.push(DeclInfo {
+                        name: d.name.clone(),
+                        src: decl_src(d.span, &[]),
+                        displayable: None,
+                    }),
                     Item::Stmt(s) => {
                         if let Stmt::Let { name, ty, .. } = s {
                             new_lets.push(LetInfo {
@@ -599,10 +830,10 @@ mod engine {
                         }
                         body_spans.push(span);
                     }
-                    _ => {
+                    Item::Cfg(_) => {
                         return Err(
-                            "error: defining types/structs/enums/decorators at the REPL is not \
-                             supported yet (I#159 first cut); bind values with `let` instead"
+                            "error: `when target.*` conditional-compilation blocks are not \
+                             supported at the REPL (I#252); use them in a compiled module"
                                 .to_string(),
                         )
                     }
@@ -610,11 +841,50 @@ mod engine {
             }
             Ok(EntryPlan {
                 imports,
+                new_decls,
                 body_spans,
                 new_lets,
                 trailing_expr,
             })
         }
+    }
+
+    /// How a trailing expression should be rendered automatically.
+    enum AutoPrint {
+        /// Do not print (unit / unknown).
+        None,
+        /// Print the value itself via `print(expr)`.
+        Value,
+        /// Print a `<TypeName>` placeholder for a user value with no renderer.
+        Placeholder(String),
+    }
+
+    /// A top-level declaration an entry introduced (I#252).
+    struct DeclInfo {
+        name: String,
+        /// The declaration's verbatim source, re-emitted at module scope in each
+        /// later entry.
+        src: String,
+        /// For a struct/enum, whether it carries a value renderer (`Some(bool)`);
+        /// `None` for declarations that are never auto-printed.
+        displayable: Option<bool>,
+    }
+
+    /// True if a struct/enum carries a value renderer: a `__str__`/`__repr__`
+    /// method, or a `@derive(Repr)` that synthesizes one (D-0047).
+    fn has_renderer(decorators: &[ast::Decorator], methods: &[ast::Function]) -> bool {
+        if methods
+            .iter()
+            .any(|m| m.name == "__str__" || m.name == "__repr__")
+        {
+            return true;
+        }
+        decorators.iter().any(|d| {
+            d.name == "derive"
+                && d.args
+                    .iter()
+                    .any(|a| matches!(&a.value, Expr::Name(n, _) if n == "Repr"))
+        })
     }
 
     struct LetInfo {
@@ -627,6 +897,8 @@ mod engine {
     /// The parsed shape of one entry (spans into the entry source).
     struct EntryPlan {
         imports: Vec<String>,
+        /// Top-level declarations this entry introduces (persisted, I#252).
+        new_decls: Vec<DeclInfo>,
         body_spans: Vec<Span>,
         new_lets: Vec<LetInfo>,
         trailing_expr: Option<Span>,
@@ -688,6 +960,7 @@ mod engine {
             .collect();
         match head.as_str() {
             "int64" | "int32" | "int" | "bool" | "char" => Some(Rep::I64),
+            "float64" | "float32" | "float" => Some(Rep::F64),
             "str" | "bytes" | "list" | "dict" | "set" => Some(Rep::Ptr),
             // A function type `fn(...) -> ...` is a GC pointer (closure record).
             "fn" if decl.trim_start().starts_with("fn") => Some(Rep::Ptr),
@@ -700,6 +973,7 @@ mod engine {
     fn rep_of(ty: &Ty) -> Option<Rep> {
         match ty {
             Ty::Int64 | Ty::Int32 | Ty::Bool | Ty::Char | Ty::UntypedInt => Some(Rep::I64),
+            Ty::Float64 | Ty::Float32 | Ty::UntypedFloat => Some(Rep::F64),
             Ty::Str | Ty::Bytes | Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) => Some(Rep::Ptr),
             _ => None,
         }
@@ -711,6 +985,8 @@ mod engine {
         Some(match ty {
             Ty::Int64 | Ty::UntypedInt => "int64".to_string(),
             Ty::Int32 => "int32".to_string(),
+            Ty::Float64 | Ty::UntypedFloat => "float64".to_string(),
+            Ty::Float32 => "float32".to_string(),
             Ty::Bool => "bool".to_string(),
             Ty::Char => "char".to_string(),
             Ty::Str => "str".to_string(),
@@ -720,12 +996,6 @@ mod engine {
             Ty::Dict(k, v) => format!("dict[{}, {}]", render_ty(k)?, render_ty(v)?),
             _ => return None,
         })
-    }
-
-    /// True if a trailing expression's type is worth auto-printing (a value,
-    /// not unit).
-    fn printable(ty: Ty) -> bool {
-        !matches!(ty, Ty::Unit | Ty::Unknown)
     }
 
     /// Error-severity diagnostics, formatted `error[ZAPnnnn]: message`.

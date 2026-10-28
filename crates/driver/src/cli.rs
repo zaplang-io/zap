@@ -28,18 +28,28 @@ pub enum DocFormat {
 /// A parsed `zap` invocation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `zap run [file] [-o out]` — compile and run a file or the project.
+    /// `zap run [file] [-o out] [--target-feature f]` — compile and run a file
+    /// or the project.
     Run {
         file: Option<String>,
         out: Option<String>,
+        /// Compile-time CPU features for `when target.has(.f)` (I#139).
+        features: Vec<String>,
     },
-    /// `zap build [file] [-o out]` — build a native binary into `target/`.
+    /// `zap build [file] [-o out] [--target-feature f]` — build a native binary
+    /// into `target/`.
     Build {
         file: Option<String>,
         out: Option<String>,
+        /// Compile-time CPU features for `when target.has(.f)` (I#139).
+        features: Vec<String>,
     },
-    /// `zap ir [file]` — dump ZIR (diagnostic).
-    Ir { file: Option<String> },
+    /// `zap ir [file] [--target-feature f]` — dump ZIR (diagnostic).
+    Ir {
+        file: Option<String>,
+        /// Compile-time CPU features for `when target.has(.f)` (I#139).
+        features: Vec<String>,
+    },
     /// `zap expand [file]` — show decorator/`@derive`-generated code (D-0036).
     Expand { file: Option<String> },
     /// `zap fmt [--check] [paths...]` — canonical formatter (D-0037). With no
@@ -160,16 +170,33 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let rest = &args[1..];
     match verb {
         "run" => {
-            let (file, out) = parse_compile(rest)?;
-            Ok(Command::Run { file, out })
+            let CompileArgs {
+                file,
+                out,
+                features,
+            } = parse_compile(rest)?;
+            Ok(Command::Run {
+                file,
+                out,
+                features,
+            })
         }
         "build" => {
-            let (file, out) = parse_compile(rest)?;
-            Ok(Command::Build { file, out })
+            let CompileArgs {
+                file,
+                out,
+                features,
+            } = parse_compile(rest)?;
+            Ok(Command::Build {
+                file,
+                out,
+                features,
+            })
         }
-        "ir" => Ok(Command::Ir {
-            file: first_positional(rest),
-        }),
+        "ir" => {
+            let CompileArgs { file, features, .. } = parse_compile(rest)?;
+            Ok(Command::Ir { file, features })
+        }
         "expand" => Ok(Command::Expand {
             file: first_positional(rest),
         }),
@@ -236,10 +263,20 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     }
 }
 
-/// Parse the `[-o <out>] [file]` form shared by `run` and `build`.
-fn parse_compile(args: &[String]) -> Result<(Option<String>, Option<String>), String> {
+/// The parsed arguments shared by `run`, `build`, and `ir`.
+struct CompileArgs {
+    file: Option<String>,
+    out: Option<String>,
+    /// `--target-feature` values for `when target.has(.f)` (I#139).
+    features: Vec<String>,
+}
+
+/// Parse the `[-o <out>] [--target-feature f]... [file]` form shared by `run`,
+/// `build`, and `ir`.
+fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
+    let mut features: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -249,6 +286,17 @@ fn parse_compile(args: &[String]) -> Result<(Option<String>, Option<String>), St
                         .cloned()
                         .ok_or_else(|| "`-o` needs an output path".to_string())?,
                 );
+                i += 2;
+            }
+            // `--target-feature <name>` (repeatable): a compile-time CPU feature
+            // assumed present in this build, consulted by `when target.has(.f)`
+            // (I#139, D-0079). Distinct from runtime detection.
+            "--target-feature" => {
+                let f = args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or_else(|| "`--target-feature` needs a feature name".to_string())?;
+                features.push(f);
                 i += 2;
             }
             flag if flag.starts_with('-') => {
@@ -263,7 +311,11 @@ fn parse_compile(args: &[String]) -> Result<(Option<String>, Option<String>), St
             }
         }
     }
-    Ok((file, out))
+    Ok(CompileArgs {
+        file,
+        out,
+        features,
+    })
 }
 
 /// Parse `mcp [--root <dir>]`. Transport is stdio (D-0055); a socket transport
@@ -765,13 +817,21 @@ fn parse_zenv(args: &[String]) -> Result<Command, String> {
 /// Run a parsed command.
 pub fn execute(cmd: Command) -> ExitCode {
     match cmd {
-        Command::Run { file, out } => match resolve_entry(file) {
-            Ok(f) => crate::compile(&f, out, true),
+        Command::Run {
+            file,
+            out,
+            features,
+        } => match resolve_entry(file) {
+            Ok(f) => crate::compile_for(&f, out, true, &features),
             Err(code) => code,
         },
-        Command::Build { file, out } => cmd_build(file, out),
-        Command::Ir { file } => match resolve_entry(file) {
-            Ok(f) => crate::emit_ir(&f),
+        Command::Build {
+            file,
+            out,
+            features,
+        } => cmd_build(file, out, &features),
+        Command::Ir { file, features } => match resolve_entry(file) {
+            Ok(f) => crate::emit_ir_for(&f, &features),
             Err(code) => code,
         },
         Command::Expand { file } => match resolve_entry(file) {
@@ -821,7 +881,7 @@ pub fn execute(cmd: Command) -> ExitCode {
 
 /// `zap build` — like `run` but stops at the binary, defaulting output to
 /// `target/<stem>`.
-fn cmd_build(file: Option<String>, out: Option<String>) -> ExitCode {
+fn cmd_build(file: Option<String>, out: Option<String>, features: &[String]) -> ExitCode {
     let entry = match resolve_entry(file) {
         Ok(f) => f,
         Err(code) => return code,
@@ -840,7 +900,7 @@ fn cmd_build(file: Option<String>, out: Option<String>) -> ExitCode {
             format!("target/{stem}")
         }
     };
-    crate::compile(&entry, Some(out), false)
+    crate::compile_for(&entry, Some(out), false, features)
 }
 
 /// Resolve the input for `run`/`build`/`ir`/`expand`.
@@ -1203,6 +1263,9 @@ compile & run:
   build [file] [-o out] build a native binary (default: target/<name>)
   ir [file]             dump ZIR (diagnostic)
   expand [file]         show decorator/@derive-generated code (D-0036)
+       --target-feature <name>   (run/build/ir; repeatable) assume a compile-time
+                        CPU feature is present, for `when target.has(.name)`
+                        conditional compilation (I#139, D-0079, experimental)
 
 project:
   new <name>            scaffold a new project directory (writes zap.toml)
@@ -1302,14 +1365,16 @@ mod tests {
             p(&["run", "a.zap"]).unwrap(),
             Command::Run {
                 file: Some("a.zap".into()),
-                out: None
+                out: None,
+                features: vec![],
             }
         );
         assert_eq!(
             p(&["run", "-o", "bin/a", "a.zap"]).unwrap(),
             Command::Run {
                 file: Some("a.zap".into()),
-                out: Some("bin/a".into())
+                out: Some("bin/a".into()),
+                features: vec![],
             }
         );
     }
@@ -1320,7 +1385,8 @@ mod tests {
             p(&["run"]).unwrap(),
             Command::Run {
                 file: None,
-                out: None
+                out: None,
+                features: vec![],
             }
         );
     }
@@ -1331,9 +1397,33 @@ mod tests {
             p(&["build", "--out", "x", "a.zap"]).unwrap(),
             Command::Build {
                 file: Some("a.zap".into()),
-                out: Some("x".into())
+                out: Some("x".into()),
+                features: vec![],
             }
         );
+    }
+
+    #[test]
+    fn target_feature_flag_is_collected() {
+        // `--target-feature` is repeatable and feeds `when target.has(.f)`
+        // (I#139, D-0079).
+        assert_eq!(
+            p(&[
+                "run",
+                "a.zap",
+                "--target-feature",
+                "sse4_2",
+                "--target-feature",
+                "avx2",
+            ])
+            .unwrap(),
+            Command::Run {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec!["sse4_2".into(), "avx2".into()],
+            }
+        );
+        assert!(p(&["run", "a.zap", "--target-feature"]).is_err());
     }
 
     #[test]
@@ -1356,7 +1446,8 @@ mod tests {
         assert_eq!(
             p(&["ir", "a.zap"]).unwrap(),
             Command::Ir {
-                file: Some("a.zap".into())
+                file: Some("a.zap".into()),
+                features: vec![],
             }
         );
         assert_eq!(

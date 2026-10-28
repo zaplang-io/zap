@@ -15,15 +15,16 @@
  *       exactly the invariant native Fibers would have broken and the whole
  *       reason A1 uses runtime-owned stacks (design/0017 GC table).
  *
- * It deliberately does NOT depend on the rest of zaprt.c (pthreads, the netpoller
- * epoll path, the immix mmap allocator, the Itanium/SEH exception glue) — none of
- * which is ported to Windows yet (A2/A3/A4) — so it can run on Windows TODAY and
- * isolate the A1 mechanism. The precise `gc-immix` collector cannot be exercised
- * standalone (its roots come from compiler-emitted shadow-stack code and its heap
- * uses mmap, not yet VirtualAlloc); immix's parked-coroutine invariant is instead
- * proven behavior-neutral by the existing Zap goldens under gc-immix on Linux/ARM
- * (gc_parked_coroutine, immix_evac_coro_stress, ...), which already run through
- * this same seam. See the PR body for the exact remaining A3/immix-port gap.
+ * It deliberately does NOT depend on the rest of zaprt.c (pthreads, the netpoller,
+ * the immix allocator, the Itanium/SEH exception glue) — so it isolates the A1
+ * mechanism and ran on Windows from the start, before those subsystems were ported
+ * (A2/A3/A4 and the immix heap are now all on Windows). The precise `gc-immix`
+ * collector cannot be exercised by THIS harness (its roots come from compiler-
+ * emitted shadow-stack code, which a hand-written C harness does not carry); its
+ * parked-coroutine invariant is proven behavior-neutral by the Zap goldens under
+ * gc-immix on Linux/ARM (gc_parked_coroutine, immix_evac_coro_stress, ...), which
+ * run through this same seam, and the immix heap now builds + runs on Windows in
+ * the `windows-runtime` CI job (I#218).
  *
  * Build (on Windows, MinGW-w64):
  *   control-flow:  gcc -O2 zap_ctx_win_x64_test.c -o t      && ./t

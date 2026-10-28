@@ -27,7 +27,36 @@
  * generational barrier).
  * ========================================================================== */
 
-#include <sys/mman.h>
+/* ---- OS aligned-block allocation seam (I#218, I#158/A-GC) -----------------
+ * The Immix heap gets its memory as whole, naturally-ZAP_BLOCK-aligned chunks
+ * straight from the OS allocator: 32 KiB small blocks (zap_map_block) and
+ * one-shot large-object blocks (zap_alloc_los). It is a plain aligned-malloc /
+ * free model — there is NO mmap reserve/commit, lazy commit, decommit or page
+ * protection anywhere in this collector (the historical `#include <sys/mman.h>`
+ * was vestigial — the precise collector never called an mmap primitive).
+ *
+ * POSIX provides this via `posix_memalign` + `free`. Windows has no
+ * `posix_memalign`; `_aligned_malloc` returns an equivalently-aligned block,
+ * but such a block MUST be released with `_aligned_free` (passing it to plain
+ * `free` is undefined). So the seam covers BOTH ends — every OS-level block
+ * allocation and every matching free goes through it. All Windows-specific code
+ * is confined here; the POSIX path keeps calling `posix_memalign`/`free`
+ * exactly as before (byte-for-byte). See design/0016-platform-1.0.md. */
+#if defined(_WIN32)
+#include <malloc.h> /* _aligned_malloc / _aligned_free */
+static inline int zap_os_aligned_alloc(void **memptr, size_t align, size_t size) {
+    void *p = _aligned_malloc(size, align);
+    *memptr = p;
+    return p ? 0 : -1; /* mirror posix_memalign: 0 on success, nonzero on failure */
+}
+static inline void zap_os_aligned_free(void *p) { _aligned_free(p); }
+#else
+#include <sys/mman.h> /* (historical; kept POSIX-only — the heap is malloc-backed) */
+static inline int zap_os_aligned_alloc(void **memptr, size_t align, size_t size) {
+    return posix_memalign(memptr, align, size);
+}
+static inline void zap_os_aligned_free(void *p) { free(p); }
+#endif
 
 /* ---- geometry ------------------------------------------------------------- */
 #define ZAP_BLOCK 32768u          /* bytes per block (power of two, aligned)    */
@@ -1106,7 +1135,7 @@ static void zap_sweep(void) {
                 zap_total_mapped -= ((b->los_size + sizeof(ZapBlock) + ZAP_BLOCK - 1) /
                                      ZAP_BLOCK) *
                                     ZAP_BLOCK;
-                free(b);
+                zap_os_aligned_free(b); /* aligned block: _aligned_free on Windows (I#218) */
             }
             continue;
         }
@@ -1270,7 +1299,7 @@ void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes) {
 /* ---- block / object allocation -------------------------------------------- */
 static ZapBlock *zap_map_block(void) {
     void *mem = NULL;
-    if (posix_memalign(&mem, ZAP_BLOCK, ZAP_BLOCK) != 0 || !mem) {
+    if (zap_os_aligned_alloc(&mem, ZAP_BLOCK, ZAP_BLOCK) != 0 || !mem) {
         fprintf(stderr, "zap: out of memory (block map)\n");
         abort();
     }
@@ -1422,7 +1451,7 @@ static void *zap_bump_mutator(size_t osize) {
 static void *zap_alloc_los(size_t osize) {
     size_t total = ((osize + sizeof(ZapBlock) + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
     void *mem = NULL;
-    if (posix_memalign(&mem, ZAP_BLOCK, total) != 0 || !mem) {
+    if (zap_os_aligned_alloc(&mem, ZAP_BLOCK, total) != 0 || !mem) {
         fprintf(stderr, "zap: out of memory (LOS map)\n");
         abort();
     }
