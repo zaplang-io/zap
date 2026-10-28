@@ -3,7 +3,7 @@
 - **Author(s):** Zap team
 - **Last updated:** 2026-10-18
 - **Status:** Surface locked (D-0044, D-0045); runtime in progress (#47)
-- **Discussion:** github.com/parveshgarg/zap#14
+- **Discussion:** github.com/zaplang-io/zap#14
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
 > each sentence on a new line. This keeps review comments precise and diffs

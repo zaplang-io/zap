@@ -4,7 +4,7 @@
 - **Last updated:** 2026-10-21
 - **Status:** Accepted (design approved by orchestrator 2026-10-21; implementation
   gated on I#120 merge)
-- **Discussion:** https://github.com/parveshgarg/zap/issues/175
+- **Discussion:** https://github.com/zaplang-io/zap/issues/175
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
 > each sentence on a new line.

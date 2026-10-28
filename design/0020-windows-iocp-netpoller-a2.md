@@ -3,7 +3,7 @@
 - **Author(s):** win-iocp-netpoller session (I#196)
 - **Last updated:** 2026-10-23
 - **Status:** Draft (design — pending orchestrator sign-off before implementation)
-- **Discussion:** https://github.com/parveshgarg/zap/issues/196
+- **Discussion:** https://github.com/zaplang-io/zap/issues/196
 - **Epic:** I#158 (platform/1.0), Area A2. See `design/0016-platform-1.0.md`,
   and the sibling Windows lanes `design/0017` (A1 ctxswitch), `design/0018`
   (A5 toolchain), `design/0019` (A3 signals/faults/SEH).

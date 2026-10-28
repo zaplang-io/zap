@@ -1,6 +1,6 @@
 # Zap for VS Code
 
-The official VS Code extension for the [Zap](https://github.com/parveshgarg/zap)
+The official VS Code extension for the [Zap](https://github.com/zaplang-io/zap)
 programming language. It provides:
 
 - **Syntax highlighting** via a TextMate grammar grounded in Zap's real grammar

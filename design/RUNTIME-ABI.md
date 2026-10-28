@@ -3,7 +3,7 @@
 - **Author(s):** Zap team
 - **Last updated:** 2026-10-18
 - **Status:** Accepted (design) — implemented incrementally per runtime tickets
-- **Discussion:** github.com/parveshgarg/zap#13
+- **Discussion:** github.com/zaplang-io/zap#13
 
 ## Abstract
 

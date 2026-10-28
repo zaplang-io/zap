@@ -3,7 +3,7 @@
 - **Author(s):** win-signals-seh session (I#197)
 - **Last updated:** 2026-10-22
 - **Status:** Draft (design — pending orchestrator sign-off before implementation)
-- **Discussion:** https://github.com/parveshgarg/zap/issues/197
+- **Discussion:** https://github.com/zaplang-io/zap/issues/197
 - **Epic:** I#158 (platform/1.0), Area A3. See `design/0016-platform-1.0.md`,
   the A1 spike `design/0017-windows-coroutine-context-switch.md`, and the A5
   toolchain `design/0018-windows-toolchain-a5.md`.

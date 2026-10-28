@@ -3,7 +3,7 @@
 - **Author(s):** platform-scoping session (I#158)
 - **Last updated:** 2026-10-22
 - **Status:** Draft
-- **Discussion:** https://github.com/parveshgarg/zap/issues/158
+- **Discussion:** https://github.com/zaplang-io/zap/issues/158
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
 > each sentence on a new line.
