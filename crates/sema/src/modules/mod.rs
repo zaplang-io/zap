@@ -107,6 +107,15 @@ pub(crate) struct ModuleConst {
 /// a module: expose `pub(super) const MODULE_CONST: ModuleConst` and append it.
 pub(crate) const CONST_MODULES: &[ModuleConst] = &[math::MODULE_CONST, logging::MODULE_CONST];
 
+/// Whether `name` is a compiler-known built-in (stdlib) module — one registered
+/// in [`MODULES`] or exposing constants in [`CONST_MODULES`] (D-0056). Zap-to-Zap
+/// module resolution (I#283/D-0081) consults this so an `import <name>` whose
+/// leading segment is a stdlib module is left to the existing built-in handling
+/// instead of being resolved to a user file.
+pub fn is_builtin_module(name: &str) -> bool {
+    MODULES.iter().any(|m| m.name == name) || CONST_MODULES.iter().any(|m| m.name == name)
+}
+
 /// Type-check a built-in `signal`/`gc`/`runtime`-style module call, returning the
 /// result type, or `None` if `module` is not a registered built-in module (so the
 /// caller falls through to ordinary resolution). These modules are compiler-known

@@ -29,6 +29,11 @@ use zapc_sema_types::*;
 /// addable. See [`modules`] for the seam contract.
 mod modules;
 
+/// Whether `name` is a compiler-known built-in (stdlib) module (D-0056). Used by
+/// the driver's Zap-to-Zap module resolver (I#283/D-0081) to leave stdlib imports
+/// to the existing built-in handling.
+pub use modules::is_builtin_module;
+
 /// A type-checking diagnostic with its stable [`ErrorCode`] and the offending
 /// source span.
 ///
