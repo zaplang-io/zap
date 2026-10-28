@@ -1968,7 +1968,7 @@ the accepted MCJIT + runtime-slot model (no architectural extension).
 New dep: `rustyline` (codegen feature). Still host-only (needs LLVM), POSIX-only
 (the JIT does not yet support Windows, so `$HOME` locates the history file).
 
-## D-0081 — macOS support: ucontext behind the seam, kqueue netpoller, Intel-required CI (I#224)
+## D-0082 — macOS support: ucontext behind the seam, kqueue netpoller, Intel-required CI (I#224)
 
 **Status:** Accepted. Issue #224, epic I#158 (`design/0016-platform-1.0.md`);
 reuses the A1 context-switch seam (design/0017) and the `np_backend_*` netpoller
