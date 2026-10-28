@@ -255,6 +255,96 @@ struct StructCtx {
     /// struct whose fields all carry a bit width is laid out as one backing
     /// integer with shift/mask field accessors; absent for ordinary structs.
     packed_layouts: HashMap<u32, PackedLayout>,
+    /// Call-site argument-assembly metadata for default and keyword arguments
+    /// (D-0038, I#298), keyed by free-function name (the same key as `sigs`) and
+    /// parallel to that signature's `Ty` vector. A call that omits a defaulted
+    /// parameter or passes keyword arguments out of declaration order is
+    /// reordered and filled against this before lowering; see [`FnLower::call`].
+    call_params: HashMap<String, Vec<ParamInfo>>,
+}
+
+/// Per-parameter metadata used to assemble a call's arguments in declaration
+/// order (D-0038, I#298). One entry per declared parameter, in order, parallel
+/// to the parameter `Ty` vector held in `sigs`.
+#[derive(Clone)]
+struct ParamInfo {
+    /// The parameter's name, for matching a keyword argument (`name=value`).
+    name: String,
+    /// The default-value expression, if any. It is lowered fresh in the
+    /// caller's context at each call site so the value is recomputed per call
+    /// (D-0038: mutable defaults like `[]` are therefore safe).
+    default: Option<Expr>,
+    /// `true` for a `TYPE... name` variadic parameter (D-0038). A function with
+    /// a variadic parameter falls back to positional lowering (reorder/fill is
+    /// not attempted), preserving existing behavior.
+    variadic: bool,
+}
+
+/// Where one assembled call argument comes from (I#298): an expression written
+/// at the call site, or a parameter's default expression supplied for an
+/// omitted argument.
+enum ArgSlot {
+    /// Index into the call's argument list.
+    Given(usize),
+    /// Index of the parameter whose default fills this (omitted) argument.
+    Default(usize),
+}
+
+/// Assemble a call's arguments into declaration order (D-0038, I#298).
+///
+/// Positional arguments (`name == None`) bind to parameters left to right;
+/// keyword arguments (`name == Some`) bind to the parameter they name. Any
+/// parameter left unbound is filled from its default, or reported as missing.
+/// The result has exactly one [`ArgSlot`] per parameter, in declaration order,
+/// so the caller can lower each against the matching parameter type.
+///
+/// Sema (`check_user_call`) has already validated arities, keyword names, and
+/// types; the errors here are a defensive backstop that keeps a malformed call
+/// from reaching codegen as an invalid module.
+fn plan_call_args(
+    fname: &str,
+    params: &[ParamInfo],
+    args: &[ast::Arg],
+) -> Result<Vec<ArgSlot>, LowerError> {
+    let n = params.len();
+    let mut chosen: Vec<Option<ArgSlot>> = (0..n).map(|_| None).collect();
+    let mut next_pos = 0usize;
+    for (j, a) in args.iter().enumerate() {
+        match &a.name {
+            None => {
+                if next_pos >= n {
+                    return Err(err(format!("too many positional arguments to '{fname}'")));
+                }
+                chosen[next_pos] = Some(ArgSlot::Given(j));
+                next_pos += 1;
+            }
+            Some(nm) => {
+                let Some(pi) = params.iter().position(|p| &p.name == nm) else {
+                    return Err(err(format!("'{fname}' has no parameter named '{nm}'")));
+                };
+                if chosen[pi].is_some() {
+                    return Err(err(format!(
+                        "'{fname}' got multiple values for parameter '{nm}'"
+                    )));
+                }
+                chosen[pi] = Some(ArgSlot::Given(j));
+            }
+        }
+    }
+    let mut plan = Vec::with_capacity(n);
+    for (i, slot) in chosen.into_iter().enumerate() {
+        match slot {
+            Some(s) => plan.push(s),
+            None if params[i].default.is_some() => plan.push(ArgSlot::Default(i)),
+            None => {
+                return Err(err(format!(
+                    "missing required argument '{}' to '{fname}'",
+                    params[i].name
+                )));
+            }
+        }
+    }
+    Ok(plan)
 }
 
 /// A compiler-generated generator (I#67, D-0026/D-0048). A free `def` whose body
@@ -726,14 +816,30 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         captureless_env: RefCell::new(None),
         fnval_wrappers: RefCell::new(HashMap::new()),
         packed_layouts,
+        call_params: HashMap::new(),
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
     let mut sigs: HashMap<String, (Vec<Ty>, Ty)> = HashMap::new();
+    // Per-function parameter metadata for default/keyword argument assembly
+    // (D-0038, I#298). Collected for free functions, whose calls go through the
+    // name-dispatch path that honors defaults and keyword reordering.
+    let mut call_params: HashMap<String, Vec<ParamInfo>> = HashMap::new();
     for item in &module.items {
         match item {
             ast::Item::Function(f) => {
                 let params = f.params.iter().map(|p| param_ty(p, None, &ctx)).collect();
+                call_params.insert(
+                    f.name.clone(),
+                    f.params
+                        .iter()
+                        .map(|p| ParamInfo {
+                            name: p.name.clone(),
+                            default: p.default.clone(),
+                            variadic: p.variadic,
+                        })
+                        .collect(),
+                );
                 // A generator's call returns its synthetic iterator state struct
                 // (I#67), not the declared/`void` type; the body is compiled into
                 // the struct's `__next__`, not a function named `f`.
@@ -863,6 +969,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         );
     }
     ctx.generators = gen_map;
+    ctx.call_params = call_params;
 
     let mut out = Module::default();
     for sid in 0..ctx.names.len() {
@@ -6799,27 +6906,65 @@ impl<'a> FnLower<'a> {
                 return self.construct(sid, args);
             }
             if let Some((ptys, ret)) = self.sigs.get(fname).cloned() {
+                // `self.ctx` is a shared `&'a` reference; copy it out so the
+                // parameter metadata it holds can be borrowed across the
+                // `&mut self` lowering calls below.
+                let ctx = self.ctx;
+                // Default arguments and out-of-order keyword arguments (D-0038,
+                // I#298): assemble the call's arguments into declaration order,
+                // filling omitted defaulted parameters, before lowering. A
+                // variadic function (or one with no recorded metadata) keeps the
+                // positional lowering path.
+                let plan = match ctx.call_params.get(fname) {
+                    Some(pinfo) if !pinfo.iter().any(|p| p.variadic) => {
+                        Some((pinfo, plan_call_args(fname, pinfo, args)?))
+                    }
+                    _ => None,
+                };
                 let mut argvals = Vec::new();
-                for (i, a) in args.iter().enumerate() {
-                    // A function-typed parameter accepts a `lambda` literal or a
-                    // bare function name as a first-class value (I#163), lowered
-                    // against the declared parameter type.
-                    let v = match ptys.get(i) {
-                        Some(&target) => {
-                            let v = self.expr_coerced(&a.value, target)?;
-                            // A value struct passed by value is copied (D-0051):
-                            // the callee's mutations do not escape. An inline-
-                            // eligible aggregate gets that copy from the
-                            // register/sret ABI; a non-inline value struct is
-                            // deep-copied. See `copy_for_pass`.
-                            self.copy_for_pass(v, target, &a.value)
-                        }
-                        None => {
-                            let (v, vt) = self.expr(&a.value)?;
-                            self.copy_for_pass(v, vt, &a.value)
-                        }
-                    };
-                    argvals.push(v);
+                if let Some((pinfo, plan)) = plan {
+                    for (i, slot) in plan.iter().enumerate() {
+                        // Either an expression written at the call site or the
+                        // omitted parameter's default (lowered fresh here, so it
+                        // is recomputed per call — D-0038).
+                        let e: &Expr = match slot {
+                            ArgSlot::Given(j) => &args[*j].value,
+                            ArgSlot::Default(p) => pinfo[*p].default.as_ref().unwrap(),
+                        };
+                        // A function-typed parameter accepts a `lambda` literal or
+                        // a bare function name as a first-class value (I#163),
+                        // lowered against the declared parameter type.
+                        let v = match ptys.get(i) {
+                            Some(&target) => {
+                                let v = self.expr_coerced(e, target)?;
+                                // A value struct passed by value is copied
+                                // (D-0051): the callee's mutations do not escape.
+                                // An inline-eligible aggregate gets that copy from
+                                // the register/sret ABI; a non-inline value struct
+                                // is deep-copied. See `copy_for_pass`.
+                                self.copy_for_pass(v, target, e)
+                            }
+                            None => {
+                                let (v, vt) = self.expr(e)?;
+                                self.copy_for_pass(v, vt, e)
+                            }
+                        };
+                        argvals.push(v);
+                    }
+                } else {
+                    for (i, a) in args.iter().enumerate() {
+                        let v = match ptys.get(i) {
+                            Some(&target) => {
+                                let v = self.expr_coerced(&a.value, target)?;
+                                self.copy_for_pass(v, target, &a.value)
+                            }
+                            None => {
+                                let (v, vt) = self.expr(&a.value)?;
+                                self.copy_for_pass(v, vt, &a.value)
+                            }
+                        };
+                        argvals.push(v);
+                    }
                 }
                 let dest = if ret == Ty::Void {
                     None
