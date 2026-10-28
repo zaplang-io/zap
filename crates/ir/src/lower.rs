@@ -5467,6 +5467,11 @@ impl<'a> FnLower<'a> {
                 if let Ty::Heap(elem) = lty {
                     return self.lower_for_heap(target, lst, elem, body);
                 }
+                // `for c in s` where `s : str` — iterate codepoints (`char`),
+                // walking the UTF-8 buffer once (D-0025).
+                if lty == Ty::Ptr {
+                    return self.lower_for_str(target, lst, body);
+                }
                 // `for x in <user iterable>` — the general D-0048 protocol.
                 if let Ty::Struct(sid) = lty {
                     let name = match target {
@@ -5632,6 +5637,91 @@ impl<'a> FnLower<'a> {
             rhs: one,
         });
         self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `for c in s` where `s : str` (lowered to `Ptr`). Walks the UTF-8 buffer
+    /// by byte offset, yielding each codepoint as a `char` (`i32`) — one pass,
+    /// O(n) regardless of the ASCII flag (D-0025).
+    fn lower_for_str(
+        &mut self,
+        target: &Expr,
+        s: Value,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let name = match target {
+            Expr::Name(n, _) => n.clone(),
+            _ => {
+                return Err(err(
+                    "only a simple loop variable is supported by codegen yet",
+                ))
+            }
+        };
+
+        self.push_scope();
+        // Byte cursor into the UTF-8 buffer, and the total byte length.
+        let off = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(off, zero);
+        let nbytes = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(nbytes),
+            func: "zap_str_len".to_string(),
+            args: vec![s],
+        });
+        let var = self.alloca(Ty::I32);
+        self.declare(&name, var, Ty::I32);
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(off, Ty::I64);
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: nbytes,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let cur_off = self.load(off, Ty::I64);
+        let cp = self.new_value(Ty::I32);
+        self.emit(Inst::Call {
+            dest: Some(cp),
+            func: "zap_str_cp_at_byte".to_string(),
+            args: vec![s, cur_off],
+        });
+        self.store(var, cp);
+        self.push_loop(incr_bb, end_bb);
+        for st in &body.stmts {
+            self.stmt(st)?;
+        }
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+
+        self.position(incr_bb);
+        let cur2 = self.load(off, Ty::I64);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(next),
+            func: "zap_str_adv_byte".to_string(),
+            args: vec![s, cur2],
+        });
+        self.store(off, next);
         self.set_term(Term::Br(cond_bb));
 
         self.position(end_bb);
@@ -5827,6 +5917,9 @@ impl<'a> FnLower<'a> {
                 ..
             } => self.lower_dict_comp(key, value, var, iter, cond.as_deref()),
             Expr::Index { base, index, .. } => self.lower_index_get(base, index),
+            Expr::Slice {
+                base, lo, hi, step, ..
+            } => self.lower_slice(base, lo.as_deref(), hi.as_deref(), step.as_deref()),
             Expr::Attr { base, name, .. } => {
                 // Qualified enum member/variant access (`Color.RED`,
                 // `Shape.Unit`): the base is a *type* name, resolved before it
@@ -6288,6 +6381,14 @@ impl<'a> FnLower<'a> {
                     Ty::Set(_) => "zap_set_len",
                     Ty::Heap(_) => "zap_heap_len",
                     Ty::Array(_) => "zap_array_len",
+                    // `str` and `bytes` both lower to `Ptr`. `len` is the byte
+                    // length here: it is correct for `bytes` (indexed by byte),
+                    // and for ASCII `str` it equals the codepoint count. Making
+                    // `len(str)` codepoint-based (D-0025) requires telling `str`
+                    // and `bytes` apart in the IR, where they share `Ptr` — a
+                    // load-bearing change deferred for maintainer ratification
+                    // (ticket #284). Indexing/slicing/iteration are already
+                    // codepoint-based, so this only differs for non-ASCII `str`.
                     Ty::Ptr => "zap_str_len",
                     _ => return Err(err("len() expects a list, dict, set, heap, array, or str")),
                 };
@@ -6298,6 +6399,74 @@ impl<'a> FnLower<'a> {
                     args: vec![v],
                 });
                 return Ok((d, Ty::I64));
+            }
+            // String/char builtins (ticket #284, D-0025).
+            if fname == "ord" {
+                // ord(c): the codepoint number of a `char`, as an `int`.
+                if args.len() != 1 {
+                    return Err(err("ord() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                return Ok((self.coerce(v, vt, Ty::I64), Ty::I64));
+            }
+            if fname == "chr" || fname == "char" {
+                // chr(n)/char(n): the `char` whose codepoint is `n` (validated).
+                if args.len() != 1 {
+                    return Err(err(format!("{fname}() takes exactly one argument")));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let v = self.coerce(v, vt, Ty::I64);
+                let d = self.new_value(Ty::I32);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_chr".to_string(),
+                    args: vec![v],
+                });
+                return Ok((d, Ty::I32));
+            }
+            if fname == "str" {
+                // str(x): the textual form of a scalar/string. `char` (an `i32`)
+                // yields its one-codepoint string; a plain int is `i64`, so
+                // `str(42)` is decimal. (int32 and char share the `i32`
+                // representation, so `str(int32_v)` also renders a character —
+                // format an int32 as decimal via `str(int64(x))`; a full fix
+                // needs `char` threaded through the IR — follow-up.)
+                if args.len() != 1 {
+                    return Err(err("str() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let (func, arg) = match vt {
+                    Ty::Ptr => return Ok((v, Ty::Ptr)),
+                    Ty::I32 => ("zap_char_to_str", v),
+                    Ty::I1 => ("zap_bool_to_str", self.coerce(v, vt, Ty::I64)),
+                    Ty::I64 => ("zap_i64_to_str", v),
+                    Ty::F32 | Ty::F64 => ("zap_f64_to_str", self.as_f64(v, vt)),
+                    _ => return Err(err("str() expects a str, char, int, float, or bool")),
+                };
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![arg],
+                });
+                return Ok((d, Ty::Ptr));
+            }
+            if fname == "int" {
+                // int(x): parse a `str` to an `int`, or convert a number to int.
+                if args.len() != 1 {
+                    return Err(err("int() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if vt == Ty::Ptr {
+                    let d = self.new_value(Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_str_parse_int".to_string(),
+                        args: vec![v],
+                    });
+                    return Ok((d, Ty::I64));
+                }
+                return Ok((self.convert(v, vt, Ty::I64), Ty::I64));
             }
             // Explicit numeric conversion: `int32(x)`, `float64(x)`, ... (D-0020).
             // These are the way to narrow or cross the int/float boundary, which
@@ -6436,6 +6605,12 @@ impl<'a> FnLower<'a> {
                 // read the bound attribute, then call it with marshaled args.
                 let callable = self.lower_py_getattr(recv, name);
                 return self.lower_py_call(callable, args);
+            }
+            // `str` methods (ticket #284): `str` lowers to `Ptr`, so a method
+            // call on a `Ptr` receiver is a string method (sema has already
+            // rejected any other `Ptr`-typed method receiver).
+            if bty == Ty::Ptr {
+                return self.lower_str_method(recv, name, args);
             }
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
@@ -7829,10 +8004,67 @@ impl<'a> FnLower<'a> {
                 let (iv, it) = self.expr(index)?;
                 self.call_dunder(sid, "__getitem__", vec![(bv, bty), (iv, it)])
             }
+            // `str` lowers to `Ptr`; `s[i]` yields the codepoint at codepoint
+            // index `i` as a `char` (an `i32`), Python semantics (D-0025).
+            Ty::Ptr => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let d = self.new_value(Ty::I32);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_index".to_string(),
+                    args: vec![bv, iv],
+                });
+                Ok((d, Ty::I32))
+            }
             _ => Err(err(
-                "indexing is only supported on list, dict, and array values",
+                "indexing is only supported on str, list, dict, and array values",
             )),
         }
+    }
+
+    /// One slice bound → `(value, present-flag)`. An omitted bound passes 0 with
+    /// the flag clear, and the runtime defaults it by the step's sign (D-0025).
+    fn slice_bound(&mut self, e: Option<&Expr>) -> Result<(Value, Value), LowerError> {
+        match e {
+            Some(x) => {
+                let (v, t) = self.expr(x)?;
+                let v = self.coerce(v, t, Ty::I64);
+                let present = self.iconst(Ty::I64, 1);
+                Ok((v, present))
+            }
+            None => {
+                let zero = self.iconst(Ty::I64, 0);
+                Ok((zero, zero))
+            }
+        }
+    }
+
+    /// `s[lo:hi:step]` on a `str` → a new `str`, Python slice semantics by
+    /// codepoint (D-0025). List/array slicing remains a follow-up.
+    fn lower_slice(
+        &mut self,
+        base: &Expr,
+        lo: Option<&Expr>,
+        hi: Option<&Expr>,
+        step: Option<&Expr>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let (bv, bty) = self.expr(base)?;
+        if bty != Ty::Ptr {
+            return Err(err(
+                "slicing is only supported on str values (list/array slicing is a follow-up)",
+            ));
+        }
+        let (lo_v, has_lo) = self.slice_bound(lo)?;
+        let (hi_v, has_hi) = self.slice_bound(hi)?;
+        let (st_v, has_st) = self.slice_bound(step)?;
+        let d = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(d),
+            func: "zap_str_slice".to_string(),
+            args: vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+        });
+        Ok((d, Ty::Ptr))
     }
 
     fn lower_index_set(
@@ -8120,6 +8352,155 @@ impl<'a> FnLower<'a> {
             args: vec![sv, pv, rv, fv],
         });
         Ok((d, Ty::Ptr))
+    }
+
+    /// `str` methods (ticket #284, D-0025). The receiver `recv` is the string
+    /// (`Ptr`). Sema has already type-checked the method name, arity, and
+    /// argument types, so this is a mechanical lowering to the `zap_str_*`
+    /// runtime entry points. Case folding / whitespace are ASCII in v1.
+    fn lower_str_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        // Lower a single `str`-typed argument (its ZIR type is `Ptr`).
+        let one_str = |s: &mut Self| -> Result<Value, LowerError> {
+            if args.len() != 1 {
+                return Err(err(format!("str.{name}() takes exactly one argument")));
+            }
+            let (v, _t) = s.expr(&args[0].value)?;
+            Ok(v)
+        };
+        match name {
+            "upper" | "lower" => {
+                if !args.is_empty() {
+                    return Err(err(format!("str.{name}() takes no arguments")));
+                }
+                let func = if name == "upper" {
+                    "zap_str_upper"
+                } else {
+                    "zap_str_lower"
+                };
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![recv],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            "strip" | "lstrip" | "rstrip" => {
+                if !args.is_empty() {
+                    return Err(err(format!("str.{name}() takes no arguments")));
+                }
+                let mode = match name {
+                    "strip" => 0,
+                    "lstrip" => 1,
+                    _ => 2,
+                };
+                let m = self.iconst(Ty::I64, mode);
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_strip".to_string(),
+                    args: vec![recv, m],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            "startswith" | "endswith" | "contains" => {
+                let a = one_str(self)?;
+                let func = match name {
+                    "startswith" => "zap_str_startswith",
+                    "endswith" => "zap_str_endswith",
+                    _ => "zap_str_contains",
+                };
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: func.to_string(),
+                    args: vec![recv, a],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: raw,
+                    rhs: zero,
+                });
+                Ok((d, Ty::I1))
+            }
+            "find" | "index" => {
+                let a = one_str(self)?;
+                let func = if name == "find" {
+                    "zap_str_find"
+                } else {
+                    "zap_str_index_of"
+                };
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![recv, a],
+                });
+                Ok((d, Ty::I64))
+            }
+            "replace" => {
+                if args.len() != 2 {
+                    return Err(err("str.replace() takes exactly two arguments"));
+                }
+                let (o, _) = self.expr(&args[0].value)?;
+                let (n, _) = self.expr(&args[1].value)?;
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_replace".to_string(),
+                    args: vec![recv, o, n],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            "split" => {
+                let a = one_str(self)?;
+                let d = self.new_value(Ty::List(Elem::Ptr));
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_split".to_string(),
+                    args: vec![recv, a],
+                });
+                Ok((d, Ty::List(Elem::Ptr)))
+            }
+            "join" => {
+                // `sep.join(parts)`: the receiver is the separator; the single
+                // argument is a `list[str]`.
+                if args.len() != 1 {
+                    return Err(err("str.join() takes exactly one argument"));
+                }
+                let (lv, _lt) = self.expr(&args[0].value)?;
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_join".to_string(),
+                    args: vec![recv, lv],
+                });
+                Ok((d, Ty::Ptr))
+            }
+            "encode" => {
+                // UTF-8 byte values as a `list[int]` — the reachable byte view
+                // for SigV4 until the full `bytes` type lands.
+                if !args.is_empty() {
+                    return Err(err("str.encode() takes no arguments"));
+                }
+                let d = self.new_value(Ty::List(Elem::I64));
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_encode".to_string(),
+                    args: vec![recv],
+                });
+                Ok((d, Ty::List(Elem::I64)))
+            }
+            _ => Err(err(format!("str has no method '{name}'"))),
+        }
     }
 
     /// Methods on a match object: `m.group(n)` (positional, 0 = whole match) and
@@ -8525,6 +8906,26 @@ impl<'a> FnLower<'a> {
             }
         }
 
+        // Substring membership: `sub in s` -> `zap_str_contains` (ticket #284).
+        // Both operands lower to `Ptr` (str); sema has checked the types.
+        if matches!(op, In) && lt == Ty::Ptr && rt == Ty::Ptr {
+            let raw = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(raw),
+                func: "zap_str_contains".to_string(),
+                args: vec![r, l],
+            });
+            let zero = self.iconst(Ty::I64, 0);
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: d,
+                pred: CmpPred::Ne,
+                lhs: raw,
+                rhs: zero,
+            });
+            return Ok((d, Ty::I1));
+        }
+
         // Membership: `x in <set>` -> `zap_set_contains_*`, normalized to a bool.
         if matches!(op, In) {
             let Ty::Set(elem) = rt else {
@@ -8554,19 +8955,71 @@ impl<'a> FnLower<'a> {
             return Ok((d, Ty::I1));
         }
 
-        // Reference-typed operands: the only supported one is `str + str`.
+        // Reference-typed operands: `str` (lowered to `Ptr`) supports `+`
+        // (concatenation), `==`/`!=` (content equality), and ordering
+        // `< <= > >=` (lexicographic by codepoint == byte-wise for UTF-8,
+        // D-0025). Everything else on a reference type is unsupported.
         if matches!(lt, Ty::Ptr) || matches!(rt, Ty::Ptr) {
-            if matches!(op, Add) && lt == Ty::Ptr && rt == Ty::Ptr {
-                let d = self.new_value(Ty::Ptr);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_str_concat".to_string(),
-                    args: vec![l, r],
-                });
-                return Ok((d, Ty::Ptr));
+            if lt == Ty::Ptr && rt == Ty::Ptr {
+                if matches!(op, Add) {
+                    let d = self.new_value(Ty::Ptr);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_str_concat".to_string(),
+                        args: vec![l, r],
+                    });
+                    return Ok((d, Ty::Ptr));
+                }
+                if matches!(op, Eq | Ne) {
+                    // `zap_str_eq` returns 1/0; `!=` negates via comparing to 0.
+                    let raw = self.new_value(Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(raw),
+                        func: "zap_str_eq".to_string(),
+                        args: vec![l, r],
+                    });
+                    let zero = self.iconst(Ty::I64, 0);
+                    let d = self.new_value(Ty::I1);
+                    self.emit(Inst::ICmp {
+                        dest: d,
+                        pred: if matches!(op, Eq) {
+                            CmpPred::Ne
+                        } else {
+                            CmpPred::Eq
+                        },
+                        lhs: raw,
+                        rhs: zero,
+                    });
+                    return Ok((d, Ty::I1));
+                }
+                if matches!(op, Lt | Le | Gt | Ge) {
+                    // `zap_str_cmp` returns -1/0/1; compare it against 0.
+                    let raw = self.new_value(Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(raw),
+                        func: "zap_str_cmp".to_string(),
+                        args: vec![l, r],
+                    });
+                    let zero = self.iconst(Ty::I64, 0);
+                    let pred = match op {
+                        Lt => CmpPred::Lt,
+                        Le => CmpPred::Le,
+                        Gt => CmpPred::Gt,
+                        Ge => CmpPred::Ge,
+                        _ => unreachable!(),
+                    };
+                    let d = self.new_value(Ty::I1);
+                    self.emit(Inst::ICmp {
+                        dest: d,
+                        pred,
+                        lhs: raw,
+                        rhs: zero,
+                    });
+                    return Ok((d, Ty::I1));
+                }
             }
             return Err(err(
-                "unsupported operation on a reference type (only str + str)",
+                "unsupported operation on a reference type (str supports +, ==, !=, <, <=, >, >=)",
             ));
         }
 

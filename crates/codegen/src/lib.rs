@@ -611,6 +611,51 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 .add_function("zap_str_len", i64t.fn_type(&[ptr.into()], false), None);
         self.fns.insert("zap_str_len".to_string(), str_len);
 
+        // String surface (ticket #284, design/0007-strings.md): codepoint
+        // indexing/slicing/len/iteration, char conversions, and the core method
+        // set. `char` is an `i32` Unicode scalar; `str`/`list` are `ptr`.
+        {
+            let p = ptr;
+            let i = i64t;
+            let c = i32t;
+            self.declare_rt("zap_str_len_cp", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_index", &[p.into(), i.into()], Some(c.into()));
+            self.declare_rt("zap_str_cp_at_byte", &[p.into(), i.into()], Some(c.into()));
+            self.declare_rt("zap_str_adv_byte", &[p.into(), i.into()], Some(i.into()));
+            self.declare_rt(
+                "zap_str_slice",
+                &[
+                    p.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                ],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_chr", &[i.into()], Some(c.into()));
+            self.declare_rt("zap_char_to_str", &[c.into()], Some(p.into()));
+            self.declare_rt("zap_str_parse_int", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_upper", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_lower", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_strip", &[p.into(), i.into()], Some(p.into()));
+            self.declare_rt("zap_str_startswith", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_endswith", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_contains", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_find", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_index_of", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt(
+                "zap_str_replace",
+                &[p.into(), p.into(), p.into()],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_str_split", &[p.into(), p.into()], Some(p.into()));
+            self.declare_rt("zap_str_join", &[p.into(), p.into()], Some(p.into()));
+            self.declare_rt("zap_str_encode", &[p.into()], Some(p.into()));
+        }
+
         // Exception / unwinding entry points (ticket #22, see
         // design/RUNTIME-ABI.md §"Exception / unwinding ABI"). `zap_panic` begins
         // unwinding; the landing-pad glue extracts the in-flight exception object

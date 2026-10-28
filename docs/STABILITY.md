@@ -332,7 +332,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Surface | Tier |
 |---|---|
 | Lexical structure/literals; declarations + `const`; scalars + conversions | **S** |
-| `str`/`bytes` + interpolation + codepoint slicing/views | **S** |
+| `str`/`bytes` + interpolation; codepoint indexing/slicing/iteration + comparison + methods (`upper`/`lower`/`strip`/`split`/`join`/`find`/`index`/`replace`/`startswith`/`endswith`/`contains`/`encode`) + `ord`/`chr`/`char`/`str`/`int` (#284; additive to the Stable `str` type, ASCII-only case folding in v1) | **S** |
 | `list`/`dict`/tuples + value/reference semantics | **S** |
 | Structs + methods + `value struct`; interfaces; enums tier-1 **and** tier-3 sum types (D-0046) | **S** |
 | Operators + overloading + `@derive(Eq, Ord, Hash, Repr)` (in-place `__iadd__`-family **not-yet**) | **S** |
@@ -351,7 +351,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 
 | Surface | Tier |
 |---|---|
-| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`) | **S** |
+| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`, `ord`/`chr`/`char`/`str`/`int` #284) | **S** |
 | `io`, `fs`, `os`, `sys`, `process`, `math`, `random`, `time`, `datetime` | **S** |
 | `collections` extras (`deque`, `bisect`, `oset`); `sync`; `json`; `logging`; `argparse` | **S** |
 | `signal`/`gc`/`runtime` — the **API** (`signal.notify`, `gc.collect/stats`, `runtime.coroutine_dump`) | **S** |

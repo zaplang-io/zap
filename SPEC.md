@@ -412,7 +412,53 @@ auto head = xs[0:3]       # list slice -> a copy (D-0030)
 auto view = a[0:3]        # array slice -> a view (D-0030)
 ```
 
-## 9. Strings: interpolation
+## 9. Strings: operations, methods, interpolation
+
+### 9.1 Operations (ticket #284, D-0025)
+
+`str` indexing, slicing and iteration are **by Unicode codepoint**; `s[i]`
+yields a `char`, a slice yields a `str`, and iteration yields `char`. Comparison
+is content-based (`==`/`!=`) and lexicographic by codepoint (`< <= > >=`, which
+for UTF-8 equals byte order). `+` concatenates; `in` tests for a substring.
+
+```python
+auto s = "Hello, World"
+print(ord(s[0]))         # 72   (s[i] -> char; ord(char) -> int)
+print(s[7:])             # "World"   (slice -> str; Python bounds, negatives, step)
+print(s[::-1])           # "dlroW ,olleH"
+print("abc" < "abd")     # True
+for c in s:              # iterate codepoints (char)
+    pass
+if "World" in s:         # substring membership
+    pass
+```
+
+`char` is a Unicode scalar (an `i32`). Conversions: `ord(c)` → codepoint `int`;
+`chr(n)` / `char(n)` → the `char` for codepoint `n` (a non-scalar `n` is a
+`ValueError`); `str(c)` → the one-codepoint string; `str(n)`/`str(x)` renders an
+int, float, bool, char or str; `int(s)` parses a decimal integer from a string.
+
+> `len(s)` currently returns the **byte** length (it equals the codepoint count
+> for ASCII). A codepoint-based `len(str)` is pending the `str`/`bytes`
+> representation split (#284). The reachable byte view for byte-level work (e.g.
+> SigV4 percent-encoding) is `s.encode()`, a `list[int]` of the UTF-8 bytes.
+
+### 9.2 Methods (ticket #284)
+
+String operations are **methods on `str`** (there is no `strings` module):
+
+| Method | Result | Notes |
+|---|---|---|
+| `s.upper()` / `s.lower()` | `str` | ASCII case in v1 |
+| `s.strip()` / `s.lstrip()` / `s.rstrip()` | `str` | ASCII whitespace |
+| `s.split(sep)` | `list[str]` | non-empty `sep` |
+| `sep.join(parts)` | `str` | `parts : list[str]` |
+| `s.find(sub)` / `s.index(sub)` | `int` | codepoint index; `find` → -1, `index` raises when absent |
+| `s.replace(old, new)` | `str` | all occurrences |
+| `s.startswith(p)` / `s.endswith(p)` / `s.contains(sub)` | `bool` | |
+| `s.encode()` | `list[int]` | UTF-8 byte values |
+
+### 9.3 Interpolation
 
 f-strings (D-0026):
 

@@ -237,6 +237,12 @@ const BUILTINS: &[&str] = &[
     "range",
     "len",
     "sum",
+    // String / char builtins (ticket #284, D-0025).
+    "ord",
+    "chr",
+    "char",
+    "str",
+    "int",
     "reflect_has",
     "reflect_names",
     "checkpoint",
@@ -3254,6 +3260,102 @@ impl Checker {
                     }
                     return Ty::Int64;
                 }
+                // String / char builtins (ticket #284, D-0025).
+                "ord" => {
+                    // ord(c): the codepoint number of a `char`.
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "ord() takes exactly one argument".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !matches!(at, Ty::Char | Ty::Unknown) && !at.is_int() {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("ord() expects a char, found {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Int64;
+                }
+                "chr" | "char" => {
+                    // chr(n)/char(n): the `char` whose codepoint is `n`.
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("{fname}() takes exactly one argument"),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !at.is_int() && !matches!(at, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "{fname}() expects an integer codepoint, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Char;
+                }
+                "str" => {
+                    // str(x): the textual form of a scalar or string.
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "str() takes exactly one argument".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !matches!(at, Ty::Str | Ty::Char | Ty::Bool | Ty::Unknown | Ty::Py)
+                            && !at.is_numeric()
+                        {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "str() expects a str, char, int, float, or bool, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Str;
+                }
+                "int" => {
+                    // int(x): parse a `str`, or convert a number, to an `int`.
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "int() takes exactly one argument".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !matches!(at, Ty::Str | Ty::Char | Ty::Unknown | Ty::Py)
+                            && !at.is_numeric()
+                            && !self.is_tier1_enum(&at)
+                        {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("int() expects a str or number, found {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Int64;
+                }
                 // `close(ch)` (ticket #25, D-0031): the argument must be a channel.
                 "close" => {
                     if args.len() != 1 {
@@ -3520,9 +3622,24 @@ impl Checker {
                 }
             }
         }
-        // Method or other callable. A call through a Python handle (e.g.
-        // `np.array(...)`, or a Python callable held in a variable) yields a
-        // Python handle (D-0012); anything else is modeled loosely for now.
+        // Method call `recv.method(args)`. `str` methods (ticket #284, D-0025)
+        // are typed precisely (e.g. `s.split(",")` is `list[str]`); a call
+        // through a Python handle yields a Python handle (D-0012); anything else
+        // is modeled loosely for now.
+        if let Expr::Attr { base, name, span } = callee {
+            let bt = self.infer(base);
+            if matches!(bt, Ty::Str) {
+                return self.check_str_method(name, args, *span);
+            }
+            for a in args {
+                self.infer(&a.value);
+            }
+            return if matches!(bt, Ty::Py) {
+                Ty::Py
+            } else {
+                Ty::Unknown
+            };
+        }
         let ct = self.infer(callee);
         for a in args {
             self.infer(&a.value);
@@ -3531,6 +3648,114 @@ impl Checker {
             Ty::Py
         } else {
             Ty::Unknown
+        }
+    }
+
+    /// Type-check a `str` method call (ticket #284, D-0025), returning its
+    /// result type. Arity and argument types are checked here so a misspelled
+    /// or misused method is caught at compile time.
+    fn check_str_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
+        // Methods taking no arguments → `str`.
+        let no_arg_str = matches!(name, "upper" | "lower" | "strip" | "lstrip" | "rstrip");
+        // Methods taking a single `str` argument, with their result type.
+        let one_str_arg: Option<Ty> = match name {
+            "startswith" | "endswith" | "contains" => Some(Ty::Bool),
+            "find" | "index" => Some(Ty::Int64),
+            "split" => Some(Ty::List(Box::new(Ty::Str))),
+            _ => None,
+        };
+        if no_arg_str {
+            if !args.is_empty() {
+                self.error(
+                    ErrorCode::ZAP4025,
+                    format!("str.{name}() takes no arguments"),
+                    span,
+                );
+                for a in args {
+                    self.infer(&a.value);
+                }
+            }
+            return Ty::Str;
+        }
+        if let Some(ret) = one_str_arg {
+            self.check_str_args(name, args, 1, span);
+            return ret;
+        }
+        match name {
+            "replace" => {
+                self.check_str_args(name, args, 2, span);
+                Ty::Str
+            }
+            "join" => {
+                // `sep.join(parts)`: one `list[str]` argument.
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "str.join() takes exactly one argument".to_string(),
+                        span,
+                    );
+                }
+                for a in args {
+                    let at = self.infer(&a.value);
+                    if !assignable(&at, &Ty::List(Box::new(Ty::Str))) && !matches!(at, Ty::Unknown)
+                    {
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            format!("str.join() expects a list[str], found {}", at.display()),
+                            expr_span(&a.value),
+                        );
+                    }
+                }
+                Ty::Str
+            }
+            "encode" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "str.encode() takes no arguments".to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                }
+                Ty::List(Box::new(Ty::Int64))
+            }
+            _ => {
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!("str has no method '{name}'"),
+                    span,
+                );
+                for a in args {
+                    self.infer(&a.value);
+                }
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Check that a `str` method got exactly `n` `str` arguments.
+    fn check_str_args(&mut self, name: &str, args: &[Arg], n: usize, span: Span) {
+        if args.len() != n {
+            self.error(
+                ErrorCode::ZAP4025,
+                format!("str.{name}() takes exactly {n} argument(s)"),
+                span,
+            );
+        }
+        for a in args {
+            let at = self.infer(&a.value);
+            if !assignable(&at, &Ty::Str) && !matches!(at, Ty::Unknown) {
+                self.error(
+                    ErrorCode::ZAP4024,
+                    format!(
+                        "str.{name}() expects a str argument, found {}",
+                        at.display()
+                    ),
+                    expr_span(&a.value),
+                );
+            }
         }
     }
 
