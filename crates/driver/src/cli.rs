@@ -28,21 +28,26 @@ pub enum DocFormat {
 /// A parsed `zap` invocation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `zap run [file] [-o out] [--target-feature f]` — compile and run a file
-    /// or the project.
+    /// `zap run [file] [-o out] [--target-feature f] [--portable]` — compile and
+    /// run a file or the project.
     Run {
         file: Option<String>,
         out: Option<String>,
         /// Compile-time CPU features for `when target.has(.f)` (I#139).
         features: Vec<String>,
+        /// Portable static link profile (I#287).
+        portable: bool,
     },
-    /// `zap build [file] [-o out] [--target-feature f]` — build a native binary
-    /// into `target/`.
+    /// `zap build [file] [-o out] [--target-feature f] [--portable]` — build a
+    /// native binary into `target/`.
     Build {
         file: Option<String>,
         out: Option<String>,
         /// Compile-time CPU features for `when target.has(.f)` (I#139).
         features: Vec<String>,
+        /// Portable static link profile (I#287): a self-contained binary that
+        /// runs on minimal / older-glibc distros such as Amazon Linux 2023.
+        portable: bool,
     },
     /// `zap ir [file] [--target-feature f]` — dump ZIR (diagnostic).
     Ir {
@@ -174,11 +179,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 file,
                 out,
                 features,
+                portable,
             } = parse_compile(rest)?;
             Ok(Command::Run {
                 file,
                 out,
                 features,
+                portable,
             })
         }
         "build" => {
@@ -186,11 +193,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 file,
                 out,
                 features,
+                portable,
             } = parse_compile(rest)?;
             Ok(Command::Build {
                 file,
                 out,
                 features,
+                portable,
             })
         }
         "ir" => {
@@ -269,14 +278,17 @@ struct CompileArgs {
     out: Option<String>,
     /// `--target-feature` values for `when target.has(.f)` (I#139).
     features: Vec<String>,
+    /// `--portable`: the self-contained static link profile (I#287).
+    portable: bool,
 }
 
-/// Parse the `[-o <out>] [--target-feature f]... [file]` form shared by `run`,
-/// `build`, and `ir`.
+/// Parse the `[-o <out>] [--target-feature f]... [--portable] [file]` form shared
+/// by `run`, `build`, and `ir`.
 fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
     let mut features: Vec<String> = Vec::new();
+    let mut portable = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -287,6 +299,13 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
                         .ok_or_else(|| "`-o` needs an output path".to_string())?,
                 );
                 i += 2;
+            }
+            // `--portable`: build a self-contained binary (static link, CPython
+            // interop dropped) that runs on minimal / older-glibc distros such as
+            // Amazon Linux 2023 (I#287). Meaningful for `build`; harmless for `run`.
+            "--portable" => {
+                portable = true;
+                i += 1;
             }
             // `--target-feature <name>` (repeatable): a compile-time CPU feature
             // assumed present in this build, consulted by `when target.has(.f)`
@@ -315,6 +334,7 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
         file,
         out,
         features,
+        portable,
     })
 }
 
@@ -821,15 +841,17 @@ pub fn execute(cmd: Command) -> ExitCode {
             file,
             out,
             features,
+            portable,
         } => match resolve_entry(file) {
-            Ok(f) => crate::compile_for(&f, out, true, &features),
+            Ok(f) => crate::compile_for(&f, out, true, &features, portable),
             Err(code) => code,
         },
         Command::Build {
             file,
             out,
             features,
-        } => cmd_build(file, out, &features),
+            portable,
+        } => cmd_build(file, out, &features, portable),
         Command::Ir { file, features } => match resolve_entry(file) {
             Ok(f) => crate::emit_ir_for(&f, &features),
             Err(code) => code,
@@ -881,7 +903,12 @@ pub fn execute(cmd: Command) -> ExitCode {
 
 /// `zap build` — like `run` but stops at the binary, defaulting output to
 /// `target/<stem>`.
-fn cmd_build(file: Option<String>, out: Option<String>, features: &[String]) -> ExitCode {
+fn cmd_build(
+    file: Option<String>,
+    out: Option<String>,
+    features: &[String],
+    portable: bool,
+) -> ExitCode {
     let entry = match resolve_entry(file) {
         Ok(f) => f,
         Err(code) => return code,
@@ -900,7 +927,7 @@ fn cmd_build(file: Option<String>, out: Option<String>, features: &[String]) -> 
             format!("target/{stem}")
         }
     };
-    crate::compile_for(&entry, Some(out), false, features)
+    crate::compile_for(&entry, Some(out), false, features, portable)
 }
 
 /// Resolve the input for `run`/`build`/`ir`/`expand`.
@@ -1266,6 +1293,9 @@ compile & run:
        --target-feature <name>   (run/build/ir; repeatable) assume a compile-time
                         CPU feature is present, for `when target.has(.name)`
                         conditional compilation (I#139, D-0079, experimental)
+       --portable       (run/build) self-contained static link; drops CPython
+                        interop so the binary runs on minimal / older-glibc
+                        distros such as Amazon Linux 2023 (I#287, experimental)
 
 project:
   new <name>            scaffold a new project directory (writes zap.toml)
@@ -1367,6 +1397,7 @@ mod tests {
                 file: Some("a.zap".into()),
                 out: None,
                 features: vec![],
+                portable: false,
             }
         );
         assert_eq!(
@@ -1375,6 +1406,7 @@ mod tests {
                 file: Some("a.zap".into()),
                 out: Some("bin/a".into()),
                 features: vec![],
+                portable: false,
             }
         );
     }
@@ -1387,6 +1419,7 @@ mod tests {
                 file: None,
                 out: None,
                 features: vec![],
+                portable: false,
             }
         );
     }
@@ -1399,6 +1432,50 @@ mod tests {
                 file: Some("a.zap".into()),
                 out: Some("x".into()),
                 features: vec![],
+                portable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn portable_flag_is_parsed() {
+        // `--portable` selects the self-contained static link profile (I#287).
+        assert_eq!(
+            p(&["build", "a.zap", "--portable"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: true,
+            }
+        );
+        // Order-independent and composes with `-o`; also accepted by `run`.
+        assert_eq!(
+            p(&["build", "--portable", "-o", "x", "a.zap"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: Some("x".into()),
+                features: vec![],
+                portable: true,
+            }
+        );
+        assert_eq!(
+            p(&["run", "a.zap", "--portable"]).unwrap(),
+            Command::Run {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: true,
+            }
+        );
+        // Absent by default.
+        assert_eq!(
+            p(&["build", "a.zap"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
             }
         );
     }
@@ -1421,6 +1498,7 @@ mod tests {
                 file: Some("a.zap".into()),
                 out: None,
                 features: vec!["sse4_2".into(), "avx2".into()],
+                portable: false,
             }
         );
         assert!(p(&["run", "a.zap", "--target-feature"]).is_err());

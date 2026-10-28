@@ -46,11 +46,28 @@
  * `python3-embed.pc` under MinGW-w64, so build_executable omits the CPython
  * cflags/libs on Windows and the `import python` entry points below become
  * catchable-error stubs. Guard the header so the TU compiles without Python.h. */
-#if defined(ZAP_PLATFORM_POSIX)
+/* CPython embedding is enabled on POSIX, UNLESS the portable build profile is
+ * selected (`zap build --portable` / `ZAP_PORTABLE=1`, I#287): that profile
+ * drops libpython so the program is self-contained and statically linkable, and
+ * runs on minimal / older-glibc distros such as Amazon Linux 2023 (the AWS
+ * `provided.al2023` Lambda base). build_executable then passes `-DZAP_NO_CPYTHON`
+ * and omits the `pkg-config python3-embed` cflags/libs, so the `import python`
+ * entry points below become the same catchable-error stubs Windows v1 (I#198)
+ * uses. Guard the header so the TU still compiles without Python.h. */
+#if defined(ZAP_PLATFORM_POSIX) && !defined(ZAP_NO_CPYTHON)
 #define ZAP_HAVE_CPYTHON 1
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #endif
+
+/* `NULL` / `size_t` for the code between here and the standard-header block
+ * below (e.g. the precise-Immix `GC_get_my_stackbottom` shim). When CPython is
+ * embedded, `<Python.h>` above already pulls these in; when it is NOT — the
+ * portable profile (`-DZAP_NO_CPYTHON`, I#287) or Windows v1 (I#198) — nothing
+ * has yet, so include the freestanding `<stddef.h>` explicitly. It defines no
+ * feature-test-gated declarations, so it is safe before the other headers (the
+ * "Python.h must precede the standard headers" ordering above is unaffected). */
+#include <stddef.h>
 
 #ifndef ZAP_GC_IMMIX
 /* `GC_THREADS` must be defined before <gc.h> so the collector is built/used in
@@ -2769,19 +2786,21 @@ void *zap_py_str(void *obj_) {
     PyGILState_Release(g);
     return out;
 }
-#else /* !ZAP_HAVE_CPYTHON — Windows v1 (I#198): CPython embedding gated off */
+#else /* !ZAP_HAVE_CPYTHON — CPython embedding gated off: Windows v1 (I#198) or
+       * the portable build profile (`--portable`, I#287), which drops libpython
+       * for a self-contained AL2023-runnable binary. */
 /* `import python` and its attribute/call/convert entry points still lower and
- * link on Windows, but CPython is not embedded (no python3-embed under MinGW-w64,
- * see build_executable), so each raises a catchable Zap exception at runtime
- * rather than failing the link. The wrapper type keeps its shape so the shared
- * `zap_desc_pyobj` descriptor (sizeof) compiles. Full Windows Python interop is a
- * post-v1 follow-up. */
+ * link, but CPython is not embedded (no python3-embed under MinGW-w64, or the
+ * portable profile deliberately omits it, see build_executable), so each raises a
+ * catchable Zap exception at runtime rather than failing the link. The wrapper
+ * type keeps its shape so the shared `zap_desc_pyobj` descriptor (sizeof)
+ * compiles. Full Windows Python interop is a post-v1 follow-up. */
 typedef struct {
     void *obj;
 } ZapPy;
 static void *zap_py_unavailable(void) {
-    const char *m = "python interop is unavailable on this platform "
-                    "(Windows v1; see I#198)";
+    const char *m = "python interop is unavailable in this build "
+                    "(portable profile, see I#287; or Windows v1, see I#198)";
     zap_panic(zap_str_new(m, (int64_t)strlen(m)));
     return NULL;
 }

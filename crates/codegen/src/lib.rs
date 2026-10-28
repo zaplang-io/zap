@@ -153,7 +153,17 @@ const RUNTIME_WIN_A3_C: &str = include_str!("zap_win_a3.c");
 const RUNTIME_NP_IOCP_C: &str = include_str!("zap_np_iocp.c");
 const RUNTIME_NP_IOCP_H: &str = include_str!("zap_np_iocp.h");
 
-pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), String> {
+/// Build a native executable. With `portable`, use the portable link profile
+/// (I#287): statically link (`-static`) and drop CPython embedding
+/// (`-DZAP_NO_CPYTHON`, no `pkg-config python3-embed`) so the binary is
+/// self-contained and runs on minimal / older-glibc distros such as Amazon
+/// Linux 2023 (the AWS `provided.al2023` Lambda base), which a dynamically
+/// glibc-2.39-linked Ubuntu build cannot. `ZAP_PORTABLE=1` forces it on too, so
+/// a toolchain image / CI can default every build to portable without the flag.
+pub fn build_executable(module: &AstModule, out_path: &Path, portable: bool) -> Result<(), String> {
+    // `ZAP_PORTABLE` (any value) is an environment-level alias for `--portable`:
+    // it lets a deployment image default all builds to the portable profile.
+    let portable = portable || std::env::var_os("ZAP_PORTABLE").is_some();
     let obj_path = out_path.with_extension("o");
     LlvmBackend.compile_object(module, &obj_path)?;
 
@@ -276,6 +286,38 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         //     linker ignores a listed library with no referenced symbols, so
         //     listing them now is harmless while the runtime is still stubbed.
         cmd.arg("-lws2_32").arg("-lbcrypt").arg("-ldbghelp");
+    } else if portable {
+        // Portable link profile (I#287, D-0082): produce a self-contained binary
+        // that runs on minimal / older-glibc distros — in particular Amazon Linux
+        // 2023 (glibc 2.34, the AWS `provided.al2023` Lambda base), where a
+        // dynamically glibc-2.39-linked Ubuntu build fails to start (exit 127).
+        //
+        //   * `-static`: link everything statically, so there is NO glibc symbol-
+        //     version floor at all — the binary carries its own libc, libstdc++,
+        //     PCRE2, zlib, OpenSSL and (Immix) GC. The `-dev` packages in the
+        //     toolchain image ship the `.a` archives these resolve against. (A
+        //     dynamic glibc floor would instead require building on an older-glibc
+        //     host; a full static link needs no such host and runs anywhere.)
+        //   * `-DZAP_NO_CPYTHON`: drop CPython embedding. libpython is not present
+        //     on AL2023 and static libpython is impractical, and CPython embedding
+        //     is fundamentally at odds with a self-contained static binary. zaprt.c
+        //     then compiles its `import python` entry points as catchable-error
+        //     stubs (the same path Windows v1 uses, I#198) instead of linking
+        //     libpython, so no `pkg-config python3-embed` flags are added below.
+        //   * No `-rdynamic`: it is a dynamic-symbol-table flag at odds with a
+        //     static link; the profiler/fault symbolication it serves is a dev
+        //     feature, deliberately omitted from deployment binaries.
+        //
+        // Documented trade-offs (see docs/DOCKER.md): static glibc means NSS-backed
+        // `getaddrinfo` cannot dlopen nsswitch plugins (standard DNS resolution is
+        // unaffected), OpenSSL engine dlopen is unavailable (unused by the TLS
+        // client), the binary is larger, and `import python` raises at runtime.
+        //
+        // `-ldl` after `-lcrypto`: static `libcrypto.a` references `dlopen`/`dlsym`
+        // (engine loading), so a static link needs libdl explicitly and in this
+        // order (GNU ld is single-pass). On glibc ≥ 2.34 libdl is a stub merged
+        // into libc, so this is harmless where it is not strictly required.
+        cmd.arg("-static").arg("-DZAP_NO_CPYTHON").arg("-ldl");
     } else {
         // Export program symbols to the dynamic symbol table so the CPU
         // profiler's offline symbolication (`backtrace_symbols`, ticket #78)
