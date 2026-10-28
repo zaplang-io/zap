@@ -34,13 +34,16 @@ name = "smoke"
 version = "0.0.0"
 TOML
 cat >"$work/pkg/smoke_test.zap" <<'ZAP'
+def dbl(int64 n) -> int64:
+    return n * 2
+
 @test
 def test_arith():
     assert 2 + 2 == 4
 
 @test
-def test_str():
-    assert "a" + "b" == "ab"
+def test_call():
+    assert dbl(21) == 42
 ZAP
 
 run() { docker run --rm -v "$work":/w -w /w "$IMAGE" "$@"; }
