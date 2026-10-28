@@ -67,6 +67,52 @@ pub fn parse_str_with_trivia(
     (module, parse_errors, lex_errors, comments)
 }
 
+/// Parse a single stand-alone expression from `src` (an f-string replacement
+/// field, D-0026). Token spans are shifted by `base` so diagnostics land inside
+/// the enclosing f-string literal rather than at offset 0. Returns the parsed
+/// expression together with any lex/parse errors, including a trailing-token
+/// error when `src` is not a single expression (e.g. `f"{a b}"`).
+pub fn parse_expr_fragment(src: &str, base: u32) -> (Expr, Vec<ParseError>) {
+    let (mut tokens, lex_errors) = tokenize(src);
+    for t in &mut tokens {
+        t.span = Span::new(
+            t.span.start.saturating_add(base),
+            t.span.end.saturating_add(base),
+        );
+    }
+    let mut errors: Vec<ParseError> = lex_errors
+        .into_iter()
+        .map(|e| ParseError {
+            code: e.code,
+            message: e.message,
+            span: Span::new(
+                e.span.start.saturating_add(base),
+                e.span.end.saturating_add(base),
+            ),
+        })
+        .collect();
+    let mut p = Parser::new(tokens, "");
+    let expr = p.parse_expr();
+    // A bare expression lexes with trailing layout tokens (a synthesized
+    // `Newline`, then `Eof`); only a real token left over means the field held
+    // more than one expression.
+    while matches!(
+        p.peek(),
+        TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent
+    ) {
+        p.bump();
+    }
+    if !matches!(p.peek(), TokenKind::Eof) {
+        errors.push(ParseError {
+            code: ErrorCode::ZAP2017,
+            message: "f-string field must be a single expression".to_string(),
+            span: p.peek_span(),
+        });
+    }
+    errors.append(&mut p.errors);
+    (expr, errors)
+}
+
 /// The compiler-known built-in prelude (ticket #77, D-0058; ticket #99): the
 /// `Signal` enum and `MemStats`/`DateTime` structs that back the `signal`/`gc`/
 /// `runtime`/`datetime` surface. They are injected ahead of the user's items

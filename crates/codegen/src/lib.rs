@@ -654,6 +654,53 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.declare_rt("zap_str_split", &[p.into(), p.into()], Some(p.into()));
             self.declare_rt("zap_str_join", &[p.into(), p.into()], Some(p.into()));
             self.declare_rt("zap_str_encode", &[p.into()], Some(p.into()));
+            let f = self.ctx.f64_type();
+            // Strict float parse for `float(s)` (#282/#285), the f64 analog of
+            // `zap_str_parse_int`; faults on a malformed string.
+            self.declare_rt("zap_str_parse_float", &[p.into()], Some(f.into()));
+            // f-string / `format()` mini-language (D-0026). All spec fields are
+            // passed as i64 so the IR can emit plain integer constants; width
+            // and precision use -1 for "unset".
+            self.declare_rt(
+                "zap_fmt_int",
+                &[
+                    i.into(), // value
+                    i.into(), // base (2/8/10/16)
+                    i.into(), // upper (0/1)
+                    i.into(), // alt (0/1, '#')
+                    i.into(), // sign (0='-',1='+',2=' ')
+                    i.into(), // width (-1 = unset)
+                    i.into(), // fill char
+                    i.into(), // align ('<','>','^','=' or 0)
+                    i.into(), // zero (0/1)
+                ],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_fmt_flt",
+                &[
+                    f.into(), // value
+                    i.into(), // ftype ('e','f','g')
+                    i.into(), // sign
+                    i.into(), // width (-1 = unset)
+                    i.into(), // precision (-1 = unset)
+                    i.into(), // fill char
+                    i.into(), // align
+                    i.into(), // zero
+                ],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_fmt_str",
+                &[
+                    p.into(), // value
+                    i.into(), // width (-1 = unset)
+                    i.into(), // precision (-1 = unset, else truncate)
+                    i.into(), // fill char
+                    i.into(), // align
+                ],
+                Some(p.into()),
+            );
         }
 
         // Exception / unwinding entry points (ticket #22, see

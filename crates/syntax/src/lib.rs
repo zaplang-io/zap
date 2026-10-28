@@ -7,6 +7,7 @@
 
 pub mod ast;
 pub mod cfg;
+pub mod fstring;
 pub mod genanalysis;
 pub mod lexer;
 pub mod parser;

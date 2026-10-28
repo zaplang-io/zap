@@ -1849,6 +1849,227 @@ int64_t zap_str_parse_int(void *sp) {
     return neg ? -(int64_t)acc : (int64_t)acc;
 }
 
+/* float(s): parse a float, Python-style (surrounding ASCII whitespace allowed,
+ * a C float literal otherwise). Faults on a malformed string, matching int()'s
+ * strictness. Distinct from the lenient `zap_str_to_f64` the CSV codec uses. */
+double zap_str_parse_float(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char stackbuf[64];
+    char *tmp = stackbuf;
+    char *heap = NULL;
+    if (s->len >= (int64_t)sizeof(stackbuf)) {
+        heap = (char *)malloc((size_t)s->len + 1);
+        tmp = heap;
+    }
+    memcpy(tmp, s->data, (size_t)s->len);
+    tmp[s->len] = '\0';
+    char *p = tmp;
+    while (*p && zap_is_ascii_ws((unsigned char)*p)) {
+        p++;
+    }
+    char *end = NULL;
+    double v = strtod(p, &end);
+    int bad = (end == p);
+    if (end != NULL) {
+        while (*end && zap_is_ascii_ws((unsigned char)*end)) {
+            end++;
+        }
+        if (*end != '\0') {
+            bad = 1;
+        }
+    }
+    if (heap) {
+        free(heap);
+    }
+    if (bad) {
+        fprintf(stderr, "zap: float() cannot parse a float from this string\n");
+        abort();
+    }
+    return v;
+}
+
+/* ---------------------------------------------------------------------------
+ * f-string / `format()` formatting mini-language (ticket #285, D-0026).
+ *
+ * The compiler parses the spec at compile time and passes it decomposed as
+ * integer arguments (width/precision use -1 for "unset"; `align`/`fill` are
+ * character codepoints; `sign` is 0='-' only, 1='+', 2=' '). These helpers do
+ * the base conversion / `printf` rendering plus fill/align/width padding.
+ *
+ * Padding width is counted in BYTES (so it is exact for ASCII, the overwhelming
+ * case, and matches the v1 byte-length `len`, design/0007-strings.md); string
+ * precision truncates on a UTF-8 codepoint boundary. Non-ASCII fill characters
+ * fall back to a space. A full Unicode-width formatter is a follow-up.
+ * ------------------------------------------------------------------------- */
+
+/* Place `head` (sign/prefix) and `body` (digits/text) into a width-`width`
+ * field with `fill`/`align`. `align`: '<' left, '>' right, '^' center, '='
+ * pad between head and body (sign-aware). */
+static void *zap_fmt_pad(const char *head, int64_t hl, const char *body, int64_t bl,
+                         int64_t width, int fill, int align) {
+    int64_t content = hl + bl;
+    if (width < 0 || content >= width) {
+        char *buf = (char *)zap_buf((size_t)content);
+        memcpy(buf, head, (size_t)hl);
+        memcpy(buf + hl, body, (size_t)bl);
+        return zap_str_adopt(buf, content);
+    }
+    int64_t pad = width - content;
+    char fc = (fill > 0 && fill < 128) ? (char)fill : ' ';
+    char *buf = (char *)zap_buf((size_t)width);
+    int64_t pos = 0;
+    if (align == '=') {
+        memcpy(buf, head, (size_t)hl);
+        pos = hl;
+        memset(buf + pos, fc, (size_t)pad);
+        pos += pad;
+        memcpy(buf + pos, body, (size_t)bl);
+    } else if (align == '<') {
+        memcpy(buf, head, (size_t)hl);
+        pos = hl;
+        memcpy(buf + pos, body, (size_t)bl);
+        pos += bl;
+        memset(buf + pos, fc, (size_t)pad);
+    } else if (align == '^') {
+        int64_t left = pad / 2;
+        int64_t right = pad - left;
+        memset(buf, fc, (size_t)left);
+        pos = left;
+        memcpy(buf + pos, head, (size_t)hl);
+        pos += hl;
+        memcpy(buf + pos, body, (size_t)bl);
+        pos += bl;
+        memset(buf + pos, fc, (size_t)right);
+    } else { /* '>' or default right */
+        memset(buf, fc, (size_t)pad);
+        pos = pad;
+        memcpy(buf + pos, head, (size_t)hl);
+        pos += hl;
+        memcpy(buf + pos, body, (size_t)bl);
+    }
+    return zap_str_adopt(buf, width);
+}
+
+void *zap_fmt_int(int64_t v, int64_t base, int64_t upper, int64_t alt, int64_t sign,
+                  int64_t width, int64_t fill, int64_t align, int64_t zero) {
+    uint64_t mag;
+    int neg = 0;
+    if (v < 0) {
+        neg = 1;
+        mag = (uint64_t)(-(v + 1)) + 1ULL; /* avoids UB at INT64_MIN */
+    } else {
+        mag = (uint64_t)v;
+    }
+    const char *alpha = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    char rev[72];
+    int di = 0;
+    if (mag == 0) {
+        rev[di++] = '0';
+    }
+    while (mag > 0) {
+        rev[di++] = alpha[mag % (uint64_t)base];
+        mag /= (uint64_t)base;
+    }
+    char body[72];
+    for (int k = 0; k < di; k++) {
+        body[k] = rev[di - 1 - k];
+    }
+    char head[8];
+    int hl = 0;
+    if (neg) {
+        head[hl++] = '-';
+    } else if (sign == 1) {
+        head[hl++] = '+';
+    } else if (sign == 2) {
+        head[hl++] = ' ';
+    }
+    if (alt) {
+        if (base == 16) {
+            head[hl++] = '0';
+            head[hl++] = upper ? 'X' : 'x';
+        } else if (base == 8) {
+            head[hl++] = '0';
+            head[hl++] = 'o';
+        } else if (base == 2) {
+            head[hl++] = '0';
+            head[hl++] = 'b';
+        }
+    }
+    int al = (int)align;
+    int fc = (int)fill;
+    if (zero && al == 0) {
+        al = '=';
+        fc = '0';
+    }
+    if (al == 0) {
+        al = '>'; /* numbers are right-aligned by default */
+    }
+    return zap_fmt_pad(head, hl, body, (int64_t)di, width, fc, al);
+}
+
+void *zap_fmt_flt(double v, int64_t ftype, int64_t sign, int64_t width, int64_t prec,
+                  int64_t fill, int64_t align, int64_t zero) {
+    char t = (char)ftype;
+    int neg = 0;
+    double mag = v;
+    if (v < 0.0 || (v == 0.0 && signbit(v))) {
+        neg = 1;
+        mag = -v;
+    }
+    char body[96];
+    if (prec < 0 && (t == 'g' || t == 'G')) {
+        /* Default float rendering: match str(float) (compact %g). */
+        snprintf(body, sizeof(body), (t == 'G') ? "%G" : "%g", mag);
+    } else {
+        int p = (prec >= 0) ? (int)prec : 6;
+        char spec[12];
+        snprintf(spec, sizeof(spec), "%%.%d%c", p, t);
+        snprintf(body, sizeof(body), spec, mag);
+    }
+    int64_t bl = (int64_t)strlen(body);
+    char head[2];
+    int hl = 0;
+    if (neg) {
+        head[hl++] = '-';
+    } else if (sign == 1) {
+        head[hl++] = '+';
+    } else if (sign == 2) {
+        head[hl++] = ' ';
+    }
+    int al = (int)align;
+    int fc = (int)fill;
+    if (zero && al == 0) {
+        al = '=';
+        fc = '0';
+    }
+    if (al == 0) {
+        al = '>';
+    }
+    return zap_fmt_pad(head, hl, body, bl, width, fc, al);
+}
+
+void *zap_fmt_str(void *sp, int64_t width, int64_t prec, int64_t fill, int64_t align) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t bl = s->len;
+    if (prec >= 0) {
+        /* Truncate to `prec` codepoints (UTF-8 boundary safe). */
+        int64_t cp = 0;
+        int64_t i = 0;
+        while (i < s->len && cp < prec) {
+            unsigned char c = (unsigned char)s->data[i];
+            i += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+            cp++;
+        }
+        bl = (i < s->len) ? i : s->len;
+    }
+    int al = (int)align;
+    int fc = (int)fill;
+    if (al == 0) {
+        al = '<'; /* strings are left-aligned by default */
+    }
+    return zap_fmt_pad("", 0, s->data, bl, width, fc, al);
+}
+
 void *zap_str_upper(void *sp) {
     const ZapStr *s = (const ZapStr *)sp;
     char *buf = (char *)zap_buf((size_t)s->len);

@@ -273,6 +273,10 @@ define_codes! {
         "The architecture or OS named in a `when target.*` predicate is not one \
          the compiler knows. v1 accepts `.x86_64`/`.aarch64` for `target.arch` \
          and `.linux`/`.windows`/`.macos` for `target.os`.";
+    ZAP2017 = 2017 : "malformed f-string",
+        "An f-string replacement field is ill-formed (D-0026): an unmatched \
+         `{` or `}` (write `{{`/`}}` for a literal brace), an empty `{}`, or a \
+         field whose contents are not a single valid expression.";
 
     // ---- ZAP3xxx — name resolution / imports -------------------------------
     ZAP3001 = 3001 : "unknown name",
@@ -345,6 +349,13 @@ define_codes! {
          the spelling.";
     ZAP4024 = 4024 : "built-in argument type mismatch",
         "A built-in was called with an argument of the wrong type.";
+    ZAP4026 = 4026 : "invalid format spec",
+        "A format spec (`{expr:spec}` in an f-string, or the second argument to \
+         `format`) is not valid for the value's type, or uses a feature this \
+         toolchain does not support (D-0026). v1 supports the common Python \
+         mini-language: `[[fill]align][sign][#][0][width][.precision][type]`, \
+         with integer types `b/o/x/X/d`, float types `e/f/g`, and `s` for \
+         strings; the `!r`/`!a` conversions require the Display protocol (#274).";
     ZAP4025 = 4025 : "wrong number of arguments to built-in",
         "A built-in was called with the wrong number of arguments.";
     ZAP4030 = 4030 : "receive needs a channel",
