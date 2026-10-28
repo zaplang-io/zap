@@ -171,7 +171,10 @@ from the commit step.
 - **Prebuilt binaries + installers** (per-platform artifacts, shell installer,
   Homebrew / Scoop): **I#208 / Area E2.** It depends on the platform work it
   ships and on this process. macOS artifacts are additionally hardware-gated
-  (no CI runner yet) and parked.
+  (no CI runner yet) and parked. The **prebuilt Docker image**
+  (`ghcr.io/zaplang-io/zap`, [`docs/DOCKER.md`](DOCKER.md)) is the containerized
+  slice of this track and is already wired: it publishes `latest` + a commit tag
+  on every `main` push and the `X.Y.Z` / `X.Y` tags on each `v*` release.
 - **Release CI / publish automation:** not set up here. Releases are cut by hand
   per §3 until the artifact track (I#208) lands.
 - **Changing the versioning or stability rules:** those live in
