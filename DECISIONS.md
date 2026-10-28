@@ -1970,8 +1970,10 @@ New dep: `rustyline` (codegen feature). Still host-only (needs LLVM), POSIX-only
 
 ## D-0081 — Zap-to-Zap module & package imports (I#283)
 
-**Status:** Proposed — awaiting maintainer review; full text in
-`design/0034-modules.md`. Concretizes [[D-0028]] (module/visibility model) and
+**Status:** Accepted — full text in `design/0034-modules.md`. **Stage A**
+(intra-project local modules) and **Stage B** (cross-package dependency imports
+resolved through `zenv`, D-0052) are both implemented. Concretizes [[D-0028]]
+(module/visibility model) and
 [[D-0052]] (logical dependency names via `zenv`) into the compiler front end so
 user code can span files and a library package can be imported. Surfaced by
 dogfooding the AWS SDK (D-0011 §8); governed by D-0076 (modules/imports/
@@ -2013,7 +2015,52 @@ visibility is already Stable).
   (`src/<name>.zap` vs `src/lib.zap`), re-export/aggregation, shadowing
   (warning vs error).
 
-## D-0082 — macOS support: ucontext behind the seam, kqueue netpoller, Intel-required CI (I#224)
+## D-0082 — Portable link profile for AL2023 / AWS Lambda (I#287)
+
+**Status:** Accepted — implemented. A `zap build --portable` / `zap run
+--portable` flag (env `ZAP_PORTABLE=1`) that produces a **self-contained static
+binary** that runs on minimal / older-glibc distros — specifically **Amazon
+Linux 2023** (glibc 2.34), the AWS `provided.al2023` Lambda base. Surfaced by the
+aws-lambda-runtime Docker image (I#89a): the prebuilt Ubuntu-24.04 toolchain
+image ([[D-0081]] companion, #277) emits a binary dynamically linked against
+glibc 2.39, which exits 127 on AL2023 because glibc symbol versions are fixed at
+link time. Governed by D-0076 (`run`/`build` are Stable; this is a new, additive,
+**Experimental** flag — STABILITY §12.5).
+
+- **Why static over the alternatives.** Three options unblock the AWS base image:
+  (a) an AL2023-based toolchain image variant, (b) a static/musl link mode, (c) a
+  CPython-off build. We take **(b)+(c)**: a full static (`-static`) link removes
+  the glibc symbol-version floor **entirely**, so one bootstrap runs on AL2023
+  *and* every other Linux — broader than an AL2023-only image, and built from the
+  **existing** image with no new base. A glibc-version-floor-via-old-base build
+  was rejected as narrower (binary stays dynamic; needs a dedicated old-glibc
+  build host).
+- **CPython is dropped in `--portable` only** (`-DZAP_NO_CPYTHON`; no `pkg-config
+  python3-embed`; no `-rdynamic`). libpython3.12 is absent on AL2023 and static
+  libpython is impractical, and CPython embedding (D-0012, #27) is fundamentally
+  at odds with a self-contained static binary. This **reuses the existing
+  `ZAP_HAVE_CPYTHON` guard + stub path** that Windows v1 ([[D-0012]] context,
+  I#198) already ships: `import python` lowers and links but raises a *catchable*
+  Zap exception at runtime. **The default build is unchanged** — CPython interop,
+  `-rdynamic` profiler symbolication and dynamic linking all stay on without the
+  flag.
+- **Documented trade-offs (accepted for a deploy bootstrap).** Static glibc means
+  NSS-backed `getaddrinfo` cannot `dlopen` nsswitch plugins (standard DNS
+  resolution is unaffected — fine for Lambda's resolver); OpenSSL engine `dlopen`
+  is unavailable (unused by the TLS client); the binary is larger; `import
+  python` is unavailable at runtime.
+- **Proof.** `scripts/docker-smoke.sh` builds a program with `--portable` in the
+  toolchain image and runs the *same* binary inside stock
+  `public.ecr.aws/amazonlinux/amazonlinux:2023` (exit 0) — the decisive check a
+  default dynamic build fails. Runs in the `docker.yml` PR job.
+- **Follow-up (not this change).** Switch `zaplang-io/aws-lambda-runtime`'s Lambda
+  image onto the AWS `provided.al2023` base now that `--portable` exists.
+- **Open:** a musl variant for truly libc-independent binaries (needs a musl
+  toolchain + musl builds of PCRE2/OpenSSL/zlib/GC in the image); a dynamically
+  `dlopen`-ed libpython so portable binaries can still opt into Python at runtime;
+  cross-build (`--target`) once codegen emits for non-host triples (#203).
+
+## D-0083 — macOS support: ucontext behind the seam, kqueue netpoller, Intel-required CI (I#224)
 
 **Status:** Accepted. Issue #224, epic I#158 (`design/0016-platform-1.0.md`);
 reuses the A1 context-switch seam (design/0017) and the `np_backend_*` netpoller

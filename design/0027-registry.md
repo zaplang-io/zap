@@ -591,3 +591,73 @@ clear target and the org move is a config change, not a redesign.
   A signed, append-only `zap.sum` transparency log and mirror cross-checking; a
   `zap vendor` in-repo vendoring command; a dormant-name reclamation policy;
   hash agility to a `zap2:` scheme.
+
+## Addendum (I#237): the implemented publish/discovery client — D-0083 (Proposed)
+
+> **Status: Proposed** (implemented and tested; not yet accepted). This addendum
+> records what I#237 actually builds on top of the §5 spec and names the one
+> decision it concretizes, so the maintainer can accept or amend it. The
+> hosting/auth infrastructure it depends on (§5.2, §7, Open issues) is still a
+> deployment decision and is **not** decided here.
+
+**Decision.** `zap publish` targets a **writable static index on a local path or
+`file://` URL** as its concrete, implementable realization of the §5 flow, and
+the hosted authenticated `api` write path (§5 step 3–4) stays **gated** until
+the infrastructure exists.
+
+Rationale: §1 already makes the *read* side a tree of static files, and §8.3 /
+Open issues already anticipate "private/corporate static indexes work with the
+same client — just configuration." Publishing to such an index is therefore not
+a new trust model, it is the inverse of the read path: build the deterministic
+archive (§2.1), compute the `zap1:` tree hash + archive digest (§2.2), append
+one index line (§1.2), and write `config.json` on first use. This is exactly
+what a CI job staging to object storage, or an operator maintaining an internal
+mirror, does — and it needs no server, so it is fully testable offline and
+deployable today. Inventing a bespoke hosted service to satisfy #237 is what the
+design explicitly tells us *not* to do before the org move (§5.2).
+
+**What landed (host-side `crates/pkg` + CLI only; no phase boundary touched):**
+
+- `crates/pkg/src/publish.rs` — validate `[package]`, package the tree, and
+  publish to a local static index: create `config.json` (default `dl` =
+  `<index>/archives/{name}/{name}-{vers}.zap.tar`, the current `Store` codec) on
+  first use, write the archive, and **append** the version's index line.
+  Immutability (§4) is enforced: re-publishing an existing `(name, version)` is
+  refused. Also the out-of-repo credential store for `zap login`
+  (`$ZAP_CACHE/credentials`), per §5 step 3.
+- `crates/pkg/src/discovery.rs` — `zap search` enumerates a local/`file://`
+  index tree and matches on the normalized name; `zap info` is a direct
+  name → one-file lookup that works against **any** static index (local or
+  remote), reusing the §6 read client.
+- CLI verbs `zap publish [--index|--registry] [--dry-run]`,
+  `zap login [--index|--registry] [--token]`, `zap search <query>`,
+  `zap info <name>` (D-0053 surface; additive/Experimental under D-0076).
+
+**The hosting gap this surfaces (unchanged from §5.2 / §7 / Open issues).** The
+authenticated HTTP write API, the token-issuing account service, and the archive
+bucket are real hosted infrastructure that does not exist and is gated on the
+org move. The client is honest about it rather than faking it:
+
+- Publishing to an `https://` index returns `ZAP6108` ("registry publish target
+  unavailable"), naming the gap and pointing at a local/`file://` index.
+- `zap login` writes a real local token store, but the token is only *consumed*
+  by that gated remote path; a local index needs none. This is stated at the
+  point of use.
+- `zap search` over a remote static index returns a clear error (no directory
+  listing exists to enumerate; §1.4 rejected a dynamic search service), pointing
+  at `zap info` for a direct lookup. A hosted search endpoint (served from
+  `config.json`'s `api`, or a generated catalog file) is a follow-up on the same
+  hosting decision.
+
+**New diagnostics (D-0071; back-end category `6`, Experimental):** `ZAP6106`
+(version already published), `ZAP6107` (incomplete package for publish),
+`ZAP6108` (publish target unavailable / hosted write API gated), `ZAP6109`
+(missing or invalid registry credentials).
+
+**Open for the maintainer (the deployment decision, not this ticket):** stand up
+the write `api` + token/account service + archive bucket under the `zaplang.org`
+host; decide the default index base baked into the client (provisional until the
+move, Open issues); and whether remote discovery gets a search endpoint or a
+generated catalog. When those land, the client re-points via `config.json` /
+`[registries]` / `ZAP_REGISTRY` with no format change, and the `https://` publish
+path can be ungated behind the token store that already exists.

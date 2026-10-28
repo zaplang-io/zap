@@ -4,7 +4,7 @@
 (`design/0016-platform-1.0.md`, Area D2). The 1.0 Stable set (§4.4) and the
 platform matrix (§7.3) are **ratified** by the #206 spec-freeze audit
 (D-0076, `design/0029-spec-freeze.md`).
-**Last updated:** 2026-10-27
+**Last updated:** 2026-10-28
 
 This document defines what the word **"stable"** means for Zap: the versioning
 scheme, what a version bump promises for each surface, how features move between
@@ -332,14 +332,15 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Surface | Tier |
 |---|---|
 | Lexical structure/literals; declarations + `const`; scalars + conversions | **S** |
-| `str`/`bytes` + interpolation + codepoint slicing/views | **S** |
+| `str`/`bytes` + interpolation; codepoint indexing/slicing/iteration + comparison + methods (`upper`/`lower`/`strip`/`split`/`join`/`find`/`index`/`replace`/`startswith`/`endswith`/`contains`/`encode`) + `ord`/`chr`/`char`/`str`/`int` (#284; additive to the Stable `str` type, ASCII-only case folding in v1) | **S** |
+| f-string codegen + the format mini-language (`{expr}`, `{expr:spec}`, D-0026) + the `str`/`int`/`float`/`bool`/`format` conversion builtins (#285/#282; additive; `!r`/`!a` conversions and user-type rendering deferred to the Display protocol #274) | **S** |
 | `list`/`dict`/tuples + value/reference semantics | **S** |
 | Structs + methods + `value struct`; interfaces; enums tier-1 **and** tier-3 sum types (D-0046) | **S** |
 | Operators + overloading + `@derive(Eq, Ord, Hash, Repr)` (in-place `__iadd__`-family **not-yet**) | **S** |
 | Control flow (incl. `do`/`while`, `match`); iteration protocol (D-0048) | **S** |
 | Functions/lambdas/generators; default/keyword/variadic args; comprehensions/slicing | **S** |
 | First-class function values + closures (D-0067) | **S** |
-| Exceptions; `with` / context managers (D-0069); modules/imports/visibility | **S** |
+| Exceptions; `with` / context managers (D-0069); modules/imports/visibility (D-0028/D-0081, `design/0034-modules.md`) | **S** |
 | Regex (D-0010); decorators & annotations core (D-0036) + `@derive(Json)` | **S** |
 | Generics incl. bounds (D-0064) | **S** |
 | Coroutines/channels/`select`/`scope:`/`spawn detached` (D-0031/0044/0045); sync primitives + `Atomic[T]` (D-0032/0066); `Optional[T]` (D-0065) | **S** |
@@ -351,13 +352,20 @@ matching per-section tier; this table is the cross-surface source of truth.
 
 | Surface | Tier |
 |---|---|
-| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`) | **S** |
-| `io`, `fs`, `os`, `sys`, `process`, `math`, `random`, `time`, `datetime` | **S** |
+| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`, `ord`/`chr`/`char`/`str`/`int` #284, `float`/`bool`/`format` #285) | **S** |
+| `io`, `fs`, `os`, `sys`, `process`, `math`, `random`, `time`, `datetime` (incl. `strftime` / 2-arg `format` custom formatting, #286) | **S** |
 | `collections` extras (`deque`, `bisect`, `oset`); `sync`; `json`; `logging`; `argparse` | **S** |
 | `signal`/`gc`/`runtime` — the **API** (`signal.notify`, `gc.collect/stats`, `runtime.coroutine_dump`) | **S** |
 | `signal`/`gc`/`runtime` — the dump/stats **output format** | **I** |
 | `crypto`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`; `threading` (migration-only) | **E** |
 | `concurrent` — lock-free `Counter` + MPSC `Queue[T]` (D-0078); reference-payload `Queue[T]` is further gated on aarch64 by I#223 | **E** |
+
+The `http` client verbs `get`/`post`/`request` gained an **optional trailing
+`dict[str, str]` of request headers** (#280) and already expose response
+`status`/`header`/`body` accessors, and the server-side `http.respond` gained
+the matching **optional trailing `dict[str, str]` of response headers** (#279);
+because `http` is **Experimental**, both are additive surface changes requiring
+no stability promise.
 
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**
 
@@ -366,6 +374,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `run`, `build`, `test`, `fmt`, `new`, `init`, `add`, `remove`, `zenv`, `explain`, `doc`, `version`, `help` — the verbs + flags + exit codes | **S** |
 | `mcp`, `lsp`, `repl`, `playground` — the verb exists; its protocol/semantics | **S** / **E** |
 | `ir`, `expand`, `inspect` — the verb; its output format | **S** / **I** |
+| `run`/`build` `--portable` — the self-contained static link profile (#287, D-0082) | **E** (new; flag name stable, the exact link recipe + CPython-drop trade-off may be refined) |
 | Every `--json` schema (`test --json`, `mcp`, `doc --format json`) | **E** (until explicitly stabilized, §3.1) |
 | `playground-worker` (hidden internal subprocess) | **I** |
 
@@ -374,7 +383,9 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Surface | Tier |
 |---|---|
 | `zap.toml`, `zap.lock`, MVS resolver, `git`/`path` sources, checksum DB | **S** (per §1.4) |
-| Registry index + `registry` source + `Source::Registry` (read path, D-0027) | **E** (new; read-only, no publish path) |
+| Registry index + `registry` source + `Source::Registry` (read path, D-0027) | **E** (read path; I#236) |
+| `zap publish` / `zap login` / `zap search` / `zap info` (write + discovery, D-0027/D-0083, I#237) | **E** (new; additive CLI verbs per D-0076; hosted write API gated on the org move) |
+| `ZAPnnnn` registry/publish diagnostics `ZAP6100`–`ZAP6109` | **E** (meaning per §3.4) |
 
 **Diagnostics (`ZAPnnnn`, D-0071, §3.4) and `zap fmt` (D-0037).**
 

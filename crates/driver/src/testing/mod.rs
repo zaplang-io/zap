@@ -138,7 +138,9 @@ mod run_impl {
 
         // Compile the harness to a temporary executable.
         let exe = temp_exe(path);
-        if let Err(e) = zapc_codegen::build_executable(&harness_module, &exe) {
+        // Test harnesses always use the full (non-portable) link: they run on the
+        // build host, where CPython and the dynamic libs are present (I#287).
+        if let Err(e) = zapc_codegen::build_executable(&harness_module, &exe, false) {
             results.push(file_error(&display, format!("codegen error: {e}")));
             return;
         }

@@ -287,6 +287,21 @@ The result is that a `str` literal's stored buffer is final UTF-8 bytes and its
 
 ### f-string lowering (D-0026, D-0041)
 
+> **Implemented (#285).** The f-string is kept **opaque** in the AST — an
+> ordinary string literal with an `fstring` flag — and expanded in the type
+> checker and lowerer (both share `zapc_syntax::fstring`), rather than desugared
+> at parse time as sketched below. This keeps `zap fmt` / `zap doc` re-emitting
+> the f-string verbatim (they render from the AST), while the semantics are
+> exactly the parse-time desugaring: each field is a real, type-checked
+> expression and the literal lowers to a concatenation of `str` pieces. The
+> `format(value, spec)` builtin is public; its `spec` is a string literal in v1.
+> The v1 format mini-language is `[[fill]align][sign][#][0][width][.prec][type]`
+> with int types `b/o/x/X/d`, float `e/E/f/F/g/G`, and `s` for strings; `!r`/`!a`
+> and user-type rendering wait on the Display protocol (#274). A field cannot
+> embed a string quoted with the f-string's own quote (use the other quote);
+> nested `{...}` specs and non-ASCII fill are unsupported; width is byte-counted
+> (exact for ASCII, matching the v1 byte-length `len`).
+
 An f-string `f"...{expr[:spec]}..."` is **syntactic sugar lowered during
 parsing / AST construction** into ordinary expressions, so neither the type
 checker nor codegen needs special f-string support:
@@ -407,10 +422,13 @@ depend only on `str` concat (already shipped) plus `format`.
 
 - **Done (#17):** `str` literals, `str + str` concat, `str` params/returns,
   `print(str)` — on a minimal `malloc` `{ len, data }` object, no GC, no header.
-- **Remaining:** `is_ascii` flag; `s[i]` indexing; slicing (views + step
-  materialization); `len(s)`; comparison/ordering; iteration; the `char` type;
-  the `bytes` type and `str`/`bytes` conversions; f-strings and `format`; and
-  GC-managed allocation with the ABI header (#10).
+- **Done (#285):** f-string codegen (`{expr}` / `{expr:spec}`) and the
+  `str`/`int`/`float`/`bool`/`format` conversion builtins, sharing one
+  value→string path; the v1 format mini-language subset above.
+- **Remaining:** `is_ascii` flag; `len(s)` as codepoints (pending the
+  `str`/`bytes` representation split); the `bytes` type and `str`/`bytes`
+  conversions; `!r`/`!a` / user-type rendering (Display protocol #274); full
+  Unicode case folding and spec width.
 
 ## Open issues
 

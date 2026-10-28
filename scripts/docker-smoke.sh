@@ -64,4 +64,36 @@ printf '%s\n' "$out"
 echo "== zap test (package with smoke_test.zap) =="
 docker run --rm -v "$work/pkg":/w -w /w "$IMAGE" zap test
 
+# --------------------------------------------------------------------------
+# Portability proof (I#287): `zap build --portable` produces a self-contained
+# static binary that runs on Amazon Linux 2023 (glibc 2.34, the AWS
+# `provided.al2023` Lambda base) — where the default dynamically-glibc-2.39-linked
+# Ubuntu build fails to start (exit 127). Build in the (Ubuntu) toolchain image,
+# then execute the SAME binary inside a stock AL2023 container with no toolchain.
+# --------------------------------------------------------------------------
+AL2023_IMAGE="${AL2023_IMAGE:-public.ecr.aws/amazonlinux/amazonlinux:2023}"
+
+echo "== zap build --portable hello.zap -> static binary =="
+# `ldd` ships with glibc (libc-bin); on a static binary it reports "not a dynamic
+# executable" and exits non-zero, so the grep (not ldd's status) is the check.
+if docker run --rm -v "$work":/w -w /w "$IMAGE" bash -c '
+      set -e
+      zap build --portable hello.zap -o hello-portable
+      echo "-- ldd --"; ldd hello-portable 2>&1 || true
+      ldd hello-portable 2>&1 | grep -q "not a dynamic executable"
+   '; then
+    echo "OK: portable binary is statically linked (no dynamic glibc floor)"
+else
+    echo "FAIL: --portable binary is not statically linked"; exit 1
+fi
+
+# The decisive proof: the SAME binary runs on stock Amazon Linux 2023 (glibc
+# 2.34). A default dynamic build (glibc 2.39) would exit 127 here.
+echo "== run the portable binary on Amazon Linux 2023 ($AL2023_IMAGE) =="
+docker pull -q "$AL2023_IMAGE" >/dev/null
+out="$(docker run --rm -v "$work":/w -w /w "$AL2023_IMAGE" ./hello-portable)"
+printf '%s\n' "$out"
+[ "$out" = $'55\nhello from the zap container' ] || { echo "FAIL: portable binary did not run correctly on AL2023"; exit 1; }
+echo "OK: portable binary runs on Amazon Linux 2023"
+
 echo "ALL SMOKE CHECKS PASSED for $IMAGE"

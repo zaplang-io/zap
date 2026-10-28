@@ -117,10 +117,15 @@ decorator_def ::= "decorator" IDENT [ "(" [ param_list ] ")" ] block ;
 (* ---------- Imports (D-0028, D-0012) ---------- *)
 
 import        ::= "import" "python" STRING [ "as" IDENT ] NEWLINE   (* CPython interop, D-0012 *)
-                | "import" import_list NEWLINE ;                    (* D-0028, D-0052 *)
+                | "import" import_list NEWLINE ;                    (* D-0028, D-0052, D-0081 *)
 import_list   ::= import_item { "," import_item }                  (* import a, b as c (no trailing comma) *)
                 | "(" import_item { "," import_item } [ "," ] ")" ; (* grouped; trailing comma allowed (I#70) *)
 import_item   ::= dotted_name [ "as" IDENT ] ;
+                  (* A Zap module resolves to a file: `a` -> <src>/a.zap,
+                     `a.b` -> <src>/a/b.zap; a stdlib name is left to the
+                     built-in handling (I#283/D-0081). The bound name is the
+                     alias, else the path's last segment. Members are accessed
+                     qualified (`a.item`); there is no `from a import item`. *)
 
 (* ---------- Types ---------- *)
 
@@ -128,7 +133,9 @@ type          ::= named_type
                 | tuple_type
                 | func_type ;
 named_type    ::= type_name [ "[" type { "," type } "]" ] ;
-type_name     ::= IDENT | TYPE_KEYWORD ;      (* int64, list, dict, array, ... *)
+type_name     ::= IDENT { "." IDENT }         (* `Point`, or module-qualified
+                                                 `mod.Type` (I#283/D-0081) *)
+                | TYPE_KEYWORD ;              (* int64, list, dict, array, ... *)
 tuple_type    ::= "(" [ type { "," type } ] ")" ;
 func_type     ::= "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
                   (* first-class function value, I#163/D-0067; "fn" is a soft
@@ -352,6 +359,12 @@ dotted_name   ::= IDENT { "." IDENT } ;
    FLOAT      3.14 | .5 | 1. | 1e10 | 1.5e-3
    IMAGINARY  <int|float> "j"
    STRING     '...' | "..." | '''...''' | """...""" with r/b/f (+rb/rf) prefixes
+   F_FIELD    inside an f-string (f"...") the content splits into text and
+              replacement fields "{" expr [ "!" ("r"|"s"|"a") ] [ ":" spec ] "}"
+              ("{{"/"}}" are literal braces); the field expr is a full Zap
+              expression, parsed and type-checked like any other (#285, D-0026).
+              spec = [[fill]align][sign]["#"]["0"][width]["." precision][type]
+              (Python format mini-language subset; see SPEC §9.3).
    TYPE_KEYWORD  int32 int64 float32 float64 i32 i64 f32 f64 bool char str
                  bytes bigint complex list dict set heap array
    DELIM      a regex delimiter char after m/s (e.g. "/", "{", "!")

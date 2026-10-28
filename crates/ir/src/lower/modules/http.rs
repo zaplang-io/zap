@@ -25,9 +25,13 @@ fn lower(
 ) -> Result<Option<(Value, Ty)>, LowerError> {
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {
-        // client
+        // client — the headers-bearing forms (one extra `dict[str,str]` arg,
+        // #280) lower to the `_h` runtime entry points; sema fixes the arities.
+        "get" if a.len() == 2 => call_ret(lowerer, "zap_http_get_h", a, Ty::Ptr, true),
         "get" => call_ret(lowerer, "zap_http_get", a, Ty::Ptr, true),
+        "post" if a.len() == 3 => call_ret(lowerer, "zap_http_post_h", a, Ty::Ptr, true),
         "post" => call_ret(lowerer, "zap_http_post", a, Ty::Ptr, true),
+        "request" if a.len() == 4 => call_ret(lowerer, "zap_http_request_h", a, Ty::Ptr, true),
         "request" => call_ret(lowerer, "zap_http_request", a, Ty::Ptr, true),
         "status" => call_ret(lowerer, "zap_http_status", a, Ty::I64, false),
         "body" => call_ret(lowerer, "zap_http_body", a, Ty::Ptr, false),
@@ -39,6 +43,9 @@ fn lower(
         "path" => call_ret(lowerer, "zap_http_req_path", a, Ty::Ptr, false),
         "req_header" => call_ret(lowerer, "zap_http_req_header", a, Ty::Ptr, false),
         "req_body" => call_ret(lowerer, "zap_http_req_body", a, Ty::Ptr, false),
+        // respond — the headers-bearing form (one extra `dict[str,str]` arg,
+        // #279) lowers to the `_h` entry point; sema fixes the arities.
+        "respond" if a.len() == 4 => call_void(lowerer, "zap_http_respond_h", a, true),
         "respond" => call_void(lowerer, "zap_http_respond", a, true),
         _ => return Ok(None),
     }))

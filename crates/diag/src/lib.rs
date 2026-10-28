@@ -273,6 +273,10 @@ define_codes! {
         "The architecture or OS named in a `when target.*` predicate is not one \
          the compiler knows. v1 accepts `.x86_64`/`.aarch64` for `target.arch` \
          and `.linux`/`.windows`/`.macos` for `target.os`.";
+    ZAP2017 = 2017 : "malformed f-string",
+        "An f-string replacement field is ill-formed (D-0026): an unmatched \
+         `{` or `}` (write `{{`/`}}` for a literal brace), an empty `{}`, or a \
+         field whose contents are not a single valid expression.";
 
     // ---- ZAP3xxx — name resolution / imports -------------------------------
     ZAP3001 = 3001 : "unknown name",
@@ -284,6 +288,30 @@ define_codes! {
     ZAP3003 = 3003 : "call to unknown function",
         "The called function is not defined or imported. Check the spelling or \
          add the definition/import.";
+    // Zap-to-Zap module & package imports (I#283, D-0081).
+    ZAP3010 = 3010 : "module not found",
+        "An `import` names a Zap module that could not be resolved to a file. A \
+         module `a` resolves to `<src>/a.zap` and `a.b` to `<src>/a/b.zap` \
+         (D-0081). Check the path and that the file exists.";
+    ZAP3011 = 3011 : "circular import",
+        "Two or more modules import each other, forming a cycle. v1 rejects \
+         import cycles (D-0081); break the cycle, e.g. by moving the shared \
+         declarations into a third module both import.";
+    ZAP3012 = 3012 : "access to a private module member",
+        "A name beginning with `_` is private to its defining module and cannot \
+         be accessed through an import (D-0028, enforced). Remove the leading \
+         underscore to export it, or access it only from within its module.";
+    ZAP3013 = 3013 : "no such public member in module",
+        "The imported module has no public top-level declaration with this name. \
+         Check the spelling, or that the declaration exists and is not private \
+         (a leading `_`).";
+    ZAP3014 = 3014 : "top-level statement in an imported module",
+        "Only the entry module runs top-level statements; an imported module is \
+         declaration-only (D-0081). Move executable code into a function the \
+         importer calls.";
+    ZAP3015 = 3015 : "module name used as a value",
+        "An imported module's name is not a value — use it only to qualify a \
+         member access (`m.item`), not on its own.";
 
     // ---- ZAP4xxx — type checking -------------------------------------------
     ZAP4001 = 4001 : "type mismatch in assignment",
@@ -321,6 +349,13 @@ define_codes! {
          the spelling.";
     ZAP4024 = 4024 : "built-in argument type mismatch",
         "A built-in was called with an argument of the wrong type.";
+    ZAP4026 = 4026 : "invalid format spec",
+        "A format spec (`{expr:spec}` in an f-string, or the second argument to \
+         `format`) is not valid for the value's type, or uses a feature this \
+         toolchain does not support (D-0026). v1 supports the common Python \
+         mini-language: `[[fill]align][sign][#][0][width][.precision][type]`, \
+         with integer types `b/o/x/X/d`, float types `e/f/g`, and `s` for \
+         strings; the `!r`/`!a` conversions require the Display protocol (#274).";
     ZAP4025 = 4025 : "wrong number of arguments to built-in",
         "A built-in was called with the wrong number of arguments.";
     ZAP4030 = 4030 : "receive needs a channel",
@@ -524,6 +559,27 @@ define_codes! {
         "A registry's `config.json` or a package index file could not be \
          fetched or parsed, or a requested version is absent from the index. \
          Check the index base URL and network access.";
+
+    // ---- `zap publish` write path (Experimental, D-0083; I#237) -----------
+    ZAP6106 = 6106 : "package version already published",
+        "`zap publish` refused to overwrite a `(name, version)` that the index \
+         already records. Published versions are immutable (D-0027 §4): bump \
+         the `[package].version` and publish again, or `yank` the old one.";
+    ZAP6107 = 6107 : "incomplete package for publish",
+        "`zap publish` requires a well-formed `[package]` table: a `name` that \
+         is a valid, non-reserved registry name and a `version` that parses as \
+         SemVer. Fix `zap.toml` and retry.";
+    ZAP6108 = 6108 : "registry publish target unavailable",
+        "`zap publish` can write to a static index served from a local path or \
+         `file://` URL, but the chosen target needs the hosted, authenticated \
+         write API (an `https://` index), which is not yet deployed (gated on \
+         the org move, D-0027 §5.2/§7). Publish to a local/`file://` index, or \
+         point `--index`/`ZAP_REGISTRY` at one.";
+    ZAP6109 = 6109 : "missing or invalid registry credentials",
+        "A registry operation needs an authentication token (`zap login`), or \
+         the stored token is empty/unreadable. Tokens live outside the repo in \
+         `$ZAP_CACHE/credentials` and are only consumed by the hosted write \
+         API; a local/`file://` index needs none.";
 }
 
 #[cfg(test)]

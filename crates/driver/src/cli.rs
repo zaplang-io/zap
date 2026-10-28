@@ -28,21 +28,26 @@ pub enum DocFormat {
 /// A parsed `zap` invocation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `zap run [file] [-o out] [--target-feature f]` — compile and run a file
-    /// or the project.
+    /// `zap run [file] [-o out] [--target-feature f] [--portable]` — compile and
+    /// run a file or the project.
     Run {
         file: Option<String>,
         out: Option<String>,
         /// Compile-time CPU features for `when target.has(.f)` (I#139).
         features: Vec<String>,
+        /// Portable static link profile (I#287).
+        portable: bool,
     },
-    /// `zap build [file] [-o out] [--target-feature f]` — build a native binary
-    /// into `target/`.
+    /// `zap build [file] [-o out] [--target-feature f] [--portable]` — build a
+    /// native binary into `target/`.
     Build {
         file: Option<String>,
         out: Option<String>,
         /// Compile-time CPU features for `when target.has(.f)` (I#139).
         features: Vec<String>,
+        /// Portable static link profile (I#287): a self-contained binary that
+        /// runs on minimal / older-glibc distros such as Amazon Linux 2023.
+        portable: bool,
     },
     /// `zap ir [file] [--target-feature f]` — dump ZIR (diagnostic).
     Ir {
@@ -127,6 +132,38 @@ pub enum Command {
     /// `zap explain <ZAPnnnn>` — print the meaning of a stable error code
     /// (I#157/F1, #239). The code, not the message text, is the stable surface.
     Explain { code: String },
+    /// `zap publish [--index <id> | --registry <url>] [--dry-run]` — package the
+    /// current project and publish it to a static registry index (I#237,
+    /// D-0083, Experimental). Writes to a local/`file://` index; an `https://`
+    /// index needs the hosted write API (gated on the org move).
+    Publish {
+        index: Option<String>,
+        registry: Option<String>,
+        dry_run: bool,
+    },
+    /// `zap login [--index <id> | --registry <url>] [--token <t>]` — store a
+    /// bearer token for a registry in the out-of-repo credential store (I#237).
+    /// Without `--token`, the token is read from stdin (so it is not in argv).
+    Login {
+        index: Option<String>,
+        registry: Option<String>,
+        token: Option<String>,
+    },
+    /// `zap search <query> [--index <id> | --registry <url>]` — list packages
+    /// in a local/`file://` static index whose name matches `query` (I#237).
+    Search {
+        query: String,
+        index: Option<String>,
+        registry: Option<String>,
+    },
+    /// `zap info <name> [--index <id> | --registry <url>]` — show a package's
+    /// published versions (checksums, yank status, deps) from any static index,
+    /// local or remote (I#237).
+    Info {
+        name: String,
+        index: Option<String>,
+        registry: Option<String>,
+    },
     /// `zap version`.
     Version,
     /// `zap help`.
@@ -174,11 +211,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 file,
                 out,
                 features,
+                portable,
             } = parse_compile(rest)?;
             Ok(Command::Run {
                 file,
                 out,
                 features,
+                portable,
             })
         }
         "build" => {
@@ -186,11 +225,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 file,
                 out,
                 features,
+                portable,
             } = parse_compile(rest)?;
             Ok(Command::Build {
                 file,
                 out,
                 features,
+                portable,
             })
         }
         "ir" => {
@@ -257,6 +298,10 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Some(code) => Ok(Command::Explain { code }),
             None => Err("`zap explain` needs an error code: `zap explain ZAP4001`".to_string()),
         },
+        "publish" => parse_publish(rest),
+        "login" => parse_login(rest),
+        "search" => parse_search(rest),
+        "info" => parse_info(rest),
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown subcommand `{other}`")),
@@ -269,14 +314,17 @@ struct CompileArgs {
     out: Option<String>,
     /// `--target-feature` values for `when target.has(.f)` (I#139).
     features: Vec<String>,
+    /// `--portable`: the self-contained static link profile (I#287).
+    portable: bool,
 }
 
-/// Parse the `[-o <out>] [--target-feature f]... [file]` form shared by `run`,
-/// `build`, and `ir`.
+/// Parse the `[-o <out>] [--target-feature f]... [--portable] [file]` form shared
+/// by `run`, `build`, and `ir`.
 fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
     let mut features: Vec<String> = Vec::new();
+    let mut portable = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -287,6 +335,13 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
                         .ok_or_else(|| "`-o` needs an output path".to_string())?,
                 );
                 i += 2;
+            }
+            // `--portable`: build a self-contained binary (static link, CPython
+            // interop dropped) that runs on minimal / older-glibc distros such as
+            // Amazon Linux 2023 (I#287). Meaningful for `build`; harmless for `run`.
+            "--portable" => {
+                portable = true;
+                i += 1;
             }
             // `--target-feature <name>` (repeatable): a compile-time CPU feature
             // assumed present in this build, consulted by `when target.has(.f)`
@@ -315,6 +370,7 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
         file,
         out,
         features,
+        portable,
     })
 }
 
@@ -789,6 +845,163 @@ fn parse_add(args: &[String]) -> Result<Command, String> {
     )
 }
 
+/// Shared `--index <id>` / `--registry <url>` target flags for the registry
+/// verbs. At most one of the two may be given (they are two ways to name the
+/// same thing).
+#[derive(Default)]
+struct RegistryTarget {
+    index: Option<String>,
+    registry: Option<String>,
+}
+
+impl RegistryTarget {
+    fn check(self) -> Result<RegistryTarget, String> {
+        if self.index.is_some() && self.registry.is_some() {
+            return Err("give at most one of `--index <id>` or `--registry <url>`".to_string());
+        }
+        Ok(self)
+    }
+}
+
+/// Parse `zap publish [--index <id> | --registry <url>] [--dry-run]` (I#237).
+fn parse_publish(args: &[String]) -> Result<Command, String> {
+    let mut t = RegistryTarget::default();
+    let mut dry_run = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--index" => {
+                t.index = Some(take_value(args, i, "--index")?);
+                i += 2;
+            }
+            "--registry" => {
+                t.registry = Some(take_value(args, i, "--registry")?);
+                i += 2;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+    let t = t.check()?;
+    Ok(Command::Publish {
+        index: t.index,
+        registry: t.registry,
+        dry_run,
+    })
+}
+
+/// Parse `zap login [--index <id> | --registry <url>] [--token <t>]` (I#237).
+fn parse_login(args: &[String]) -> Result<Command, String> {
+    let mut t = RegistryTarget::default();
+    let mut token = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--index" => {
+                t.index = Some(take_value(args, i, "--index")?);
+                i += 2;
+            }
+            "--registry" => {
+                t.registry = Some(take_value(args, i, "--registry")?);
+                i += 2;
+            }
+            "--token" => {
+                token = Some(take_value(args, i, "--token")?);
+                i += 2;
+            }
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            other => return Err(format!("unexpected argument `{other}`")),
+        }
+    }
+    let t = t.check()?;
+    Ok(Command::Login {
+        index: t.index,
+        registry: t.registry,
+        token,
+    })
+}
+
+/// Parse `zap search <query> [--index <id> | --registry <url>]` (I#237).
+fn parse_search(args: &[String]) -> Result<Command, String> {
+    let mut t = RegistryTarget::default();
+    let mut query: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--index" => {
+                t.index = Some(take_value(args, i, "--index")?);
+                i += 2;
+            }
+            "--registry" => {
+                t.registry = Some(take_value(args, i, "--registry")?);
+                i += 2;
+            }
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            other => {
+                if query.is_some() {
+                    return Err(format!("unexpected extra argument `{other}`"));
+                }
+                query = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let t = t.check()?;
+    let query =
+        query.ok_or_else(|| "`zap search` needs a query: `zap search <query>`".to_string())?;
+    Ok(Command::Search {
+        query,
+        index: t.index,
+        registry: t.registry,
+    })
+}
+
+/// Parse `zap info <name> [--index <id> | --registry <url>]` (I#237).
+fn parse_info(args: &[String]) -> Result<Command, String> {
+    let mut t = RegistryTarget::default();
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--index" => {
+                t.index = Some(take_value(args, i, "--index")?);
+                i += 2;
+            }
+            "--registry" => {
+                t.registry = Some(take_value(args, i, "--registry")?);
+                i += 2;
+            }
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            other => {
+                if name.is_some() {
+                    return Err(format!("unexpected extra argument `{other}`"));
+                }
+                name = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let t = t.check()?;
+    let name =
+        name.ok_or_else(|| "`zap info` needs a package name: `zap info <name>`".to_string())?;
+    Ok(Command::Info {
+        name,
+        index: t.index,
+        registry: t.registry,
+    })
+}
+
+/// Fetch the value following the flag at `args[i]`, or a clear error.
+fn take_value(args: &[String], i: usize, flag: &str) -> Result<String, String> {
+    args.get(i + 1)
+        .cloned()
+        .ok_or_else(|| format!("`{flag}` needs a value"))
+}
+
 /// Parse `zap zenv [create [--no-venv] | status | path | clean]`.
 /// Bare `zap zenv` prints status (read-only, the safe default).
 fn parse_zenv(args: &[String]) -> Result<Command, String> {
@@ -821,15 +1034,17 @@ pub fn execute(cmd: Command) -> ExitCode {
             file,
             out,
             features,
+            portable,
         } => match resolve_entry(file) {
-            Ok(f) => crate::compile_for(&f, out, true, &features),
+            Ok(f) => crate::compile_for(&f, out, true, &features, portable),
             Err(code) => code,
         },
         Command::Build {
             file,
             out,
             features,
-        } => cmd_build(file, out, &features),
+            portable,
+        } => cmd_build(file, out, &features, portable),
         Command::Ir { file, features } => match resolve_entry(file) {
             Ok(f) => crate::emit_ir_for(&f, &features),
             Err(code) => code,
@@ -868,6 +1083,26 @@ pub fn execute(cmd: Command) -> ExitCode {
             seconds,
         } => cmd_inspect(&pid, gc, profile, seconds),
         Command::Explain { code } => cmd_explain(&code),
+        Command::Publish {
+            index,
+            registry,
+            dry_run,
+        } => cmd_publish(index.as_deref(), registry.as_deref(), dry_run),
+        Command::Login {
+            index,
+            registry,
+            token,
+        } => cmd_login(index.as_deref(), registry.as_deref(), token.as_deref()),
+        Command::Search {
+            query,
+            index,
+            registry,
+        } => cmd_search(&query, index.as_deref(), registry.as_deref()),
+        Command::Info {
+            name,
+            index,
+            registry,
+        } => cmd_info(&name, index.as_deref(), registry.as_deref()),
         Command::Version => {
             println!("zap {}", crate::VERSION);
             ExitCode::SUCCESS
@@ -881,7 +1116,12 @@ pub fn execute(cmd: Command) -> ExitCode {
 
 /// `zap build` — like `run` but stops at the binary, defaulting output to
 /// `target/<stem>`.
-fn cmd_build(file: Option<String>, out: Option<String>, features: &[String]) -> ExitCode {
+fn cmd_build(
+    file: Option<String>,
+    out: Option<String>,
+    features: &[String],
+    portable: bool,
+) -> ExitCode {
     let entry = match resolve_entry(file) {
         Ok(f) => f,
         Err(code) => return code,
@@ -900,7 +1140,7 @@ fn cmd_build(file: Option<String>, out: Option<String>, features: &[String]) -> 
             format!("target/{stem}")
         }
     };
-    crate::compile_for(&entry, Some(out), false, features)
+    crate::compile_for(&entry, Some(out), false, features, portable)
 }
 
 /// Resolve the input for `run`/`build`/`ir`/`expand`.
@@ -1056,6 +1296,161 @@ fn cmd_remove(name: &str) -> ExitCode {
             eprintln!("zap: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// `zap publish [--index <id> | --registry <url>] [--dry-run]` — package the
+/// current project and publish it to a static registry index (I#237, D-0083).
+fn cmd_publish(index: Option<&str>, registry: Option<&str>, dry_run: bool) -> ExitCode {
+    match zapc_pkg::ops::publish(Path::new("."), index, registry, dry_run) {
+        Ok(p) => {
+            for w in &p.warnings {
+                eprintln!("zap: {w}");
+            }
+            let verb = if p.dry_run {
+                "would publish"
+            } else {
+                "published"
+            };
+            println!("{verb} {} {}", p.name, p.version);
+            println!("  checksum {}", p.cksum);
+            println!("  archive  {} ({} bytes)", p.acksum, p.archive_len);
+            if let Some(idx) = &p.index_file {
+                println!("  index    {}", idx.display());
+            }
+            if let Some(arc) = &p.archive_file {
+                println!("  package  {}", arc.display());
+            }
+            if p.dry_run && p.index_file.is_none() {
+                println!("  (no target resolved; validated and packaged only)");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zap: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `zap login [--index <id> | --registry <url>] [--token <t>]` — store a
+/// registry token outside the repo (I#237). Without `--token`, read it from
+/// stdin so it never lands in argv/shell history.
+fn cmd_login(index: Option<&str>, registry: Option<&str>, token: Option<&str>) -> ExitCode {
+    use std::io::Read;
+    let token = match token {
+        Some(t) => t.to_string(),
+        None => {
+            eprintln!("zap login: reading token from stdin (input not echoed by your shell)...");
+            let mut s = String::new();
+            if std::io::stdin().read_to_string(&mut s).is_err() {
+                eprintln!("zap login: failed to read the token from stdin");
+                return ExitCode::from(2);
+            }
+            s.trim().to_string()
+        }
+    };
+    match zapc_pkg::ops::login(Some(Path::new(".")), index, registry, &token) {
+        Ok(path) => {
+            println!("stored registry token in {}", path.display());
+            eprintln!(
+                "note: tokens are only used by the hosted write API, which is not yet deployed \
+                 (gated on the org move); a local/file:// index needs none"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zap: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `zap search <query> [--index <id> | --registry <url>]` — list matching
+/// packages in a local/`file://` static index (I#237).
+fn cmd_search(query: &str, index: Option<&str>, registry: Option<&str>) -> ExitCode {
+    let root = project_root();
+    match zapc_pkg::ops::search(root.as_deref(), index, registry, query) {
+        Ok(hits) => {
+            if hits.is_empty() {
+                println!("no packages match `{query}`");
+                return ExitCode::SUCCESS;
+            }
+            for h in &hits {
+                let yank = if h.all_yanked {
+                    "  (all versions yanked)"
+                } else {
+                    ""
+                };
+                println!(
+                    "{}  {}  ({} version{}){yank}",
+                    h.name,
+                    h.latest,
+                    h.versions,
+                    if h.versions == 1 { "" } else { "s" }
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zap: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `zap info <name> [--index <id> | --registry <url>]` — show a package's
+/// published versions from any static index (I#237).
+fn cmd_info(name: &str, index: Option<&str>, registry: Option<&str>) -> ExitCode {
+    let root = project_root();
+    match zapc_pkg::ops::info(root.as_deref(), index, registry, name) {
+        Ok(entries) => {
+            if entries.is_empty() {
+                println!("`{name}` has no published versions");
+                return ExitCode::SUCCESS;
+            }
+            let latest = zapc_pkg::discovery::latest(&entries);
+            println!("{}", entries[0].name);
+            if let Some((v, _)) = &latest {
+                println!("  latest: {v}");
+            }
+            println!("  versions:");
+            for e in &entries {
+                let mut tags = Vec::new();
+                if e.yanked {
+                    tags.push("yanked".to_string());
+                }
+                if let Some(mz) = &e.min_zap {
+                    tags.push(format!("needs zap>={mz}"));
+                }
+                let tagstr = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", tags.join(", "))
+                };
+                println!("    {}  {}{tagstr}", e.vers, e.cksum);
+                for d in &e.deps {
+                    println!("      -> {} {}", d.name, d.req);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zap: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// The current directory as a project root, if it holds a `zap.toml` (so a
+/// `--index <id>` can resolve against `[registries]`); `None` otherwise, which
+/// is fine when a `--registry <url>` or `ZAP_REGISTRY` names the index.
+fn project_root() -> Option<std::path::PathBuf> {
+    let cwd = Path::new(".");
+    if cwd.join("zap.toml").exists() {
+        Some(cwd.to_path_buf())
+    } else {
+        None
     }
 }
 
@@ -1266,6 +1661,9 @@ compile & run:
        --target-feature <name>   (run/build/ir; repeatable) assume a compile-time
                         CPU feature is present, for `when target.has(.name)`
                         conditional compilation (I#139, D-0079, experimental)
+       --portable       (run/build) self-contained static link; drops CPython
+                        interop so the binary runs on minimal / older-glibc
+                        distros such as Amazon Linux 2023 (I#287, experimental)
 
 project:
   new <name>            scaffold a new project directory (writes zap.toml)
@@ -1277,6 +1675,19 @@ dependencies (package manager, issue #69, D-0052):
   remove <name>                          drop a dependency, re-lock
   zenv create [--no-venv]                create the project environment
   zenv status | path | clean             inspect / clean the environment
+
+registry (publish & discovery, issue #237, D-0027/D-0083, experimental):
+  publish [--index id|--registry url]    package the project and publish it to a
+          [--dry-run]                    static index (local/file://; an https
+                                         index needs the hosted write API, which
+                                         is gated on the org move). --dry-run
+                                         validates and packages, writing nothing
+  login [--index id|--registry url]      store a registry token outside the repo
+        [--token t]                      (read from stdin if --token is omitted)
+  search <query> [--index id|            list packages matching <query> in a
+                 --registry url]         local/file:// index
+  info <name> [--index id|               show a package's published versions,
+              --registry url]            checksums, yank status and deps
 
 test:
   test [file]           run the @test suite (D-0054); a file, or the project
@@ -1367,6 +1778,7 @@ mod tests {
                 file: Some("a.zap".into()),
                 out: None,
                 features: vec![],
+                portable: false,
             }
         );
         assert_eq!(
@@ -1375,6 +1787,7 @@ mod tests {
                 file: Some("a.zap".into()),
                 out: Some("bin/a".into()),
                 features: vec![],
+                portable: false,
             }
         );
     }
@@ -1387,6 +1800,7 @@ mod tests {
                 file: None,
                 out: None,
                 features: vec![],
+                portable: false,
             }
         );
     }
@@ -1399,6 +1813,50 @@ mod tests {
                 file: Some("a.zap".into()),
                 out: Some("x".into()),
                 features: vec![],
+                portable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn portable_flag_is_parsed() {
+        // `--portable` selects the self-contained static link profile (I#287).
+        assert_eq!(
+            p(&["build", "a.zap", "--portable"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: true,
+            }
+        );
+        // Order-independent and composes with `-o`; also accepted by `run`.
+        assert_eq!(
+            p(&["build", "--portable", "-o", "x", "a.zap"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: Some("x".into()),
+                features: vec![],
+                portable: true,
+            }
+        );
+        assert_eq!(
+            p(&["run", "a.zap", "--portable"]).unwrap(),
+            Command::Run {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: true,
+            }
+        );
+        // Absent by default.
+        assert_eq!(
+            p(&["build", "a.zap"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
             }
         );
     }
@@ -1421,6 +1879,7 @@ mod tests {
                 file: Some("a.zap".into()),
                 out: None,
                 features: vec!["sse4_2".into(), "avx2".into()],
+                portable: false,
             }
         );
         assert!(p(&["run", "a.zap", "--target-feature"]).is_err());
@@ -1791,6 +2250,83 @@ mod tests {
             Command::Zenv(ZenvCmd::Clean)
         );
         assert!(p(&["zenv", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn publish_parses_targets_and_dry_run() {
+        assert_eq!(
+            p(&["publish"]).unwrap(),
+            Command::Publish {
+                index: None,
+                registry: None,
+                dry_run: false
+            }
+        );
+        assert_eq!(
+            p(&["publish", "--index", "test", "--dry-run"]).unwrap(),
+            Command::Publish {
+                index: Some("test".into()),
+                registry: None,
+                dry_run: true
+            }
+        );
+        assert_eq!(
+            p(&["publish", "--registry", "file:///tmp/idx"]).unwrap(),
+            Command::Publish {
+                index: None,
+                registry: Some("file:///tmp/idx".into()),
+                dry_run: false
+            }
+        );
+        // --index and --registry are mutually exclusive.
+        assert!(p(&["publish", "--index", "a", "--registry", "b"]).is_err());
+        assert!(p(&["publish", "--index"]).is_err());
+        assert!(p(&["publish", "extra"]).is_err());
+    }
+
+    #[test]
+    fn login_parses_token_and_targets() {
+        assert_eq!(
+            p(&["login", "--registry", "file:///i", "--token", "abc"]).unwrap(),
+            Command::Login {
+                index: None,
+                registry: Some("file:///i".into()),
+                token: Some("abc".into())
+            }
+        );
+        // Token optional (read from stdin otherwise).
+        assert_eq!(
+            p(&["login", "--index", "corp"]).unwrap(),
+            Command::Login {
+                index: Some("corp".into()),
+                registry: None,
+                token: None
+            }
+        );
+        assert!(p(&["login", "--token"]).is_err());
+    }
+
+    #[test]
+    fn search_and_info_parse() {
+        assert_eq!(
+            p(&["search", "json", "--index", "test"]).unwrap(),
+            Command::Search {
+                query: "json".into(),
+                index: Some("test".into()),
+                registry: None
+            }
+        );
+        assert!(p(&["search"]).is_err());
+        assert_eq!(
+            p(&["info", "jsonlib", "--registry", "file:///i"]).unwrap(),
+            Command::Info {
+                name: "jsonlib".into(),
+                index: None,
+                registry: Some("file:///i".into())
+            }
+        );
+        assert!(p(&["info"]).is_err());
+        assert!(p(&["info", "a", "b"]).is_err());
     }
 
     #[test]

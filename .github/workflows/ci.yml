@@ -322,7 +322,7 @@ jobs:
   # the Itanium C++ ABI, so it reuses the Linux POSIX paths (NOT the Windows seams)
   # — the whole full+golden suite runs here under BOTH collectors, like `full`.
   #
-  # Arch = x86_64 on `macos-13` (Intel), DELIBERATELY (design/0033, D-0082): the
+  # Arch = x86_64 on `macos-13` (Intel), DELIBERATELY (design/0033, D-0083): the
   # macos-latest runners are arm64 (Apple Silicon), and I#223 is a parked
   # aarch64-ONLY weak-memory bug in the precise-Immix multicore path — its finding
   # proves x86_64 is clean (0/120 at MAXPROCS 4/8/16) while arm64 fails ~97%. Intel

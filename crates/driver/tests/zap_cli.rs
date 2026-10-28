@@ -635,3 +635,165 @@ fn test_json_output() {
     );
     assert!(stdout.contains("\"ok\": true"), "stdout:\n{stdout}");
 }
+
+// --- registry publish & discovery: `zap publish`/`search`/`info` (I#237) -----
+
+/// A `file://` URL for a local path (absolute), matching the index base shape a
+/// `[registries]` entry / `--registry` expects.
+fn file_url(path: &Path) -> String {
+    let p = path.to_string_lossy().replace('\\', "/");
+    match p.strip_prefix('/') {
+        Some(rest) => format!("file:///{rest}"),
+        None => format!("file:///{p}"),
+    }
+}
+
+/// Write a minimal publishable package project.
+fn package_project(root: &Path, name: &str, version: &str) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("zap.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src").join("lib.zap"),
+        format!("# {name} {version}\ndef f(): pass\n"),
+    )
+    .unwrap();
+}
+
+/// End-to-end, offline: publish a package to a local `file://` static index,
+/// discover it with `search`/`info`, then resolve + materialize it into a
+/// consumer's zenv — closing the publish -> discover -> import loop through the
+/// real binary, with no network and no hosting.
+#[test]
+fn publish_then_search_info_then_resolve_end_to_end() {
+    let dir = scratch("registry_e2e");
+    let index = dir.join("index");
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let index_url = file_url(&index);
+
+    // 1. Publish `widgets` 1.0.0 to the local index.
+    let widgets = dir.join("widgets");
+    package_project(&widgets, "widgets", "1.0.0");
+    let out = zap()
+        .args(["publish", "--registry", &index_url])
+        .current_dir(&widgets)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "publish failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("published widgets 1.0.0"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("zap1:"), "stdout:\n{stdout}");
+    assert!(index.join("config.json").exists(), "index config written");
+
+    // Re-publishing the same version is refused (immutability, ZAP6106).
+    let dup = zap()
+        .args(["publish", "--registry", &index_url])
+        .current_dir(&widgets)
+        .output()
+        .unwrap();
+    assert!(!dup.status.success(), "re-publish must fail");
+    assert!(
+        String::from_utf8_lossy(&dup.stderr).contains("ZAP6106"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&dup.stderr)
+    );
+
+    // Publish a second version so discovery has a range to report.
+    package_project(&widgets, "widgets", "1.1.0");
+    assert!(zap()
+        .args(["publish", "--registry", &index_url])
+        .current_dir(&widgets)
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    // 2. `zap search` lists the package from the local index.
+    let search = zap()
+        .args(["search", "widg", "--registry", &index_url])
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let s = String::from_utf8_lossy(&search.stdout);
+    assert!(s.contains("widgets"), "search stdout:\n{s}");
+    assert!(s.contains("1.1.0"), "search should report latest:\n{s}");
+
+    // 3. `zap info` shows both published versions.
+    let info = zap()
+        .args(["info", "widgets", "--registry", &index_url])
+        .output()
+        .unwrap();
+    assert!(info.status.success());
+    let i = String::from_utf8_lossy(&info.stdout);
+    assert!(
+        i.contains("1.0.0") && i.contains("1.1.0"),
+        "info stdout:\n{i}"
+    );
+    assert!(i.contains("latest: 1.1.0"), "info stdout:\n{i}");
+
+    // 4. A consumer resolves + materializes the published package (import loop).
+    let app = dir.join("app");
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::write(
+        app.join("zap.toml"),
+        format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [registries]\ntest = {{ index = \"{index_url}\" }}\n\n\
+             [dependencies]\n\
+             w = {{ registry = \"widgets\", version = \"1.0.0\", index = \"test\" }}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(app.join("src").join("main.zap"), "def main(): pass\n").unwrap();
+
+    let zenv = zap()
+        .args(["zenv", "create", "--no-venv"])
+        .current_dir(&app)
+        .env("ZAP_CACHE", &cache)
+        .output()
+        .unwrap();
+    assert!(
+        zenv.status.success(),
+        "zenv create failed: {}",
+        String::from_utf8_lossy(&zenv.stderr)
+    );
+    // The published tree is downloaded, verified, and materialized under zenv.
+    assert!(
+        app.join("zenv/pkg/widgets/src/lib.zap").exists(),
+        "widgets not materialized into the consumer's zenv"
+    );
+    let lock = std::fs::read_to_string(app.join("zap.lock")).unwrap();
+    assert!(lock.contains("registry+test#widgets"), "lock:\n{lock}");
+    assert!(lock.contains("version = \"1.0.0\""), "lock:\n{lock}");
+}
+
+/// Publishing to an `https://` index surfaces the hosting gap (ZAP6108) rather
+/// than inventing a service.
+#[test]
+fn publish_to_https_index_is_gated() {
+    let dir = scratch("registry_gated");
+    let widgets = dir.join("widgets");
+    package_project(&widgets, "widgets", "1.0.0");
+    let out = zap()
+        .args(["publish", "--registry", "https://index.zaplang.org/"])
+        .current_dir(&widgets)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ZAP6108"),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

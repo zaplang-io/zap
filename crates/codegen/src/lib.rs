@@ -153,7 +153,17 @@ const RUNTIME_WIN_A3_C: &str = include_str!("zap_win_a3.c");
 const RUNTIME_NP_IOCP_C: &str = include_str!("zap_np_iocp.c");
 const RUNTIME_NP_IOCP_H: &str = include_str!("zap_np_iocp.h");
 
-pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), String> {
+/// Build a native executable. With `portable`, use the portable link profile
+/// (I#287): statically link (`-static`) and drop CPython embedding
+/// (`-DZAP_NO_CPYTHON`, no `pkg-config python3-embed`) so the binary is
+/// self-contained and runs on minimal / older-glibc distros such as Amazon
+/// Linux 2023 (the AWS `provided.al2023` Lambda base), which a dynamically
+/// glibc-2.39-linked Ubuntu build cannot. `ZAP_PORTABLE=1` forces it on too, so
+/// a toolchain image / CI can default every build to portable without the flag.
+pub fn build_executable(module: &AstModule, out_path: &Path, portable: bool) -> Result<(), String> {
+    // `ZAP_PORTABLE` (any value) is an environment-level alias for `--portable`:
+    // it lets a deployment image default all builds to the portable profile.
+    let portable = portable || std::env::var_os("ZAP_PORTABLE").is_some();
     let obj_path = out_path.with_extension("o");
     LlvmBackend.compile_object(module, &obj_path)?;
 
@@ -288,6 +298,38 @@ pub fn build_executable(module: &AstModule, out_path: &Path) -> Result<(), Strin
         //     linker ignores a listed library with no referenced symbols, so
         //     listing them now is harmless while the runtime is still stubbed.
         cmd.arg("-lws2_32").arg("-lbcrypt").arg("-ldbghelp");
+    } else if portable {
+        // Portable link profile (I#287, D-0082): produce a self-contained binary
+        // that runs on minimal / older-glibc distros — in particular Amazon Linux
+        // 2023 (glibc 2.34, the AWS `provided.al2023` Lambda base), where a
+        // dynamically glibc-2.39-linked Ubuntu build fails to start (exit 127).
+        //
+        //   * `-static`: link everything statically, so there is NO glibc symbol-
+        //     version floor at all — the binary carries its own libc, libstdc++,
+        //     PCRE2, zlib, OpenSSL and (Immix) GC. The `-dev` packages in the
+        //     toolchain image ship the `.a` archives these resolve against. (A
+        //     dynamic glibc floor would instead require building on an older-glibc
+        //     host; a full static link needs no such host and runs anywhere.)
+        //   * `-DZAP_NO_CPYTHON`: drop CPython embedding. libpython is not present
+        //     on AL2023 and static libpython is impractical, and CPython embedding
+        //     is fundamentally at odds with a self-contained static binary. zaprt.c
+        //     then compiles its `import python` entry points as catchable-error
+        //     stubs (the same path Windows v1 uses, I#198) instead of linking
+        //     libpython, so no `pkg-config python3-embed` flags are added below.
+        //   * No `-rdynamic`: it is a dynamic-symbol-table flag at odds with a
+        //     static link; the profiler/fault symbolication it serves is a dev
+        //     feature, deliberately omitted from deployment binaries.
+        //
+        // Documented trade-offs (see docs/DOCKER.md): static glibc means NSS-backed
+        // `getaddrinfo` cannot dlopen nsswitch plugins (standard DNS resolution is
+        // unaffected), OpenSSL engine dlopen is unavailable (unused by the TLS
+        // client), the binary is larger, and `import python` raises at runtime.
+        //
+        // `-ldl` after `-lcrypto`: static `libcrypto.a` references `dlopen`/`dlsym`
+        // (engine loading), so a static link needs libdl explicitly and in this
+        // order (GNU ld is single-pass). On glibc ≥ 2.34 libdl is a stub merged
+        // into libc, so this is harmless where it is not strictly required.
+        cmd.arg("-static").arg("-DZAP_NO_CPYTHON").arg("-ldl");
     } else {
         // Export program symbols to the dynamic symbol table so the CPU
         // profiler's offline symbolication (`backtrace_symbols`, ticket #78)
@@ -622,6 +664,98 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.module
                 .add_function("zap_str_len", i64t.fn_type(&[ptr.into()], false), None);
         self.fns.insert("zap_str_len".to_string(), str_len);
+
+        // String surface (ticket #284, design/0007-strings.md): codepoint
+        // indexing/slicing/len/iteration, char conversions, and the core method
+        // set. `char` is an `i32` Unicode scalar; `str`/`list` are `ptr`.
+        {
+            let p = ptr;
+            let i = i64t;
+            let c = i32t;
+            self.declare_rt("zap_str_len_cp", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_index", &[p.into(), i.into()], Some(c.into()));
+            self.declare_rt("zap_str_cp_at_byte", &[p.into(), i.into()], Some(c.into()));
+            self.declare_rt("zap_str_adv_byte", &[p.into(), i.into()], Some(i.into()));
+            self.declare_rt(
+                "zap_str_slice",
+                &[
+                    p.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                ],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_chr", &[i.into()], Some(c.into()));
+            self.declare_rt("zap_char_to_str", &[c.into()], Some(p.into()));
+            self.declare_rt("zap_str_parse_int", &[p.into()], Some(i.into()));
+            self.declare_rt("zap_str_upper", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_lower", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_str_strip", &[p.into(), i.into()], Some(p.into()));
+            self.declare_rt("zap_str_startswith", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_endswith", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_contains", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_find", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt("zap_str_index_of", &[p.into(), p.into()], Some(i.into()));
+            self.declare_rt(
+                "zap_str_replace",
+                &[p.into(), p.into(), p.into()],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_str_split", &[p.into(), p.into()], Some(p.into()));
+            self.declare_rt("zap_str_join", &[p.into(), p.into()], Some(p.into()));
+            self.declare_rt("zap_str_encode", &[p.into()], Some(p.into()));
+            let f = self.ctx.f64_type();
+            // Strict float parse for `float(s)` (#282/#285), the f64 analog of
+            // `zap_str_parse_int`; faults on a malformed string.
+            self.declare_rt("zap_str_parse_float", &[p.into()], Some(f.into()));
+            // f-string / `format()` mini-language (D-0026). All spec fields are
+            // passed as i64 so the IR can emit plain integer constants; width
+            // and precision use -1 for "unset".
+            self.declare_rt(
+                "zap_fmt_int",
+                &[
+                    i.into(), // value
+                    i.into(), // base (2/8/10/16)
+                    i.into(), // upper (0/1)
+                    i.into(), // alt (0/1, '#')
+                    i.into(), // sign (0='-',1='+',2=' ')
+                    i.into(), // width (-1 = unset)
+                    i.into(), // fill char
+                    i.into(), // align ('<','>','^','=' or 0)
+                    i.into(), // zero (0/1)
+                ],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_fmt_flt",
+                &[
+                    f.into(), // value
+                    i.into(), // ftype ('e','f','g')
+                    i.into(), // sign
+                    i.into(), // width (-1 = unset)
+                    i.into(), // precision (-1 = unset)
+                    i.into(), // fill char
+                    i.into(), // align
+                    i.into(), // zero
+                ],
+                Some(p.into()),
+            );
+            self.declare_rt(
+                "zap_fmt_str",
+                &[
+                    p.into(), // value
+                    i.into(), // width (-1 = unset)
+                    i.into(), // precision (-1 = unset, else truncate)
+                    i.into(), // fill char
+                    i.into(), // align
+                ],
+                Some(p.into()),
+            );
+        }
 
         // Exception / unwinding entry points (ticket #22, see
         // design/RUNTIME-ABI.md §"Exception / unwinding ABI"). `zap_panic` begins

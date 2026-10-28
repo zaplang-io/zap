@@ -1,0 +1,5 @@
+200
+GET trace=t-1 auth=Bearer tok ct=application/json body=
+text/plain; charset=utf-8
+POST trace=t-1 auth=Bearer tok ct=application/json body=name=zap
+PUT trace=t-1 auth=Bearer tok ct=application/json body=x=1

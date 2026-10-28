@@ -74,7 +74,9 @@ fn curl_fetch(url: &str) -> Result<Vec<u8>> {
 }
 
 /// Convert a `file://` URL to a filesystem path, or `None` if not a file URL.
-fn file_url_to_path(url: &str) -> Option<String> {
+/// Public so the publish write path ([`crate::publish`]) can map a static
+/// index's `file://` base and `dl` template to directories it writes into.
+pub fn file_url_to_path(url: &str) -> Option<String> {
     let rest = url.strip_prefix("file://")?;
     // `file:///abs` -> `/abs`; `file://host/abs` is uncommon — take the path.
     let path = match rest.strip_prefix('/') {

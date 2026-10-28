@@ -743,6 +743,117 @@ pub fn zenv_clean(root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+// --- registry write path & discovery (I#237, D-0083) -----------------------
+
+/// Resolve the index base URL/path for a publish or discovery operation, in
+/// priority order: an explicit `--registry <url>`, a `--index <id>` naming a
+/// `[registries]` entry (requires a manifest under `root`), else `$ZAP_REGISTRY`.
+/// `None` means no base is configured (the caller decides if that is fatal).
+fn resolve_index_base(
+    root: Option<&Path>,
+    index_id: Option<&str>,
+    registry_url: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(url) = registry_url {
+        return Ok(Some(url.to_string()));
+    }
+    if let Some(id) = index_id {
+        let root = root.ok_or_else(|| {
+            Error::registry(
+                ErrorCode::ZAP6105,
+                format!("`--index {id}` needs a zap.toml with a `[registries.{id}]` entry"),
+            )
+        })?;
+        let manifest = load_manifest(root)?;
+        let base = manifest
+            .registries
+            .get(id)
+            .map(|d| d.index.clone())
+            .ok_or_else(|| {
+                Error::registry(
+                    ErrorCode::ZAP6105,
+                    format!("no `[registries.{id}]` entry in zap.toml"),
+                )
+            })?;
+        return Ok(Some(base));
+    }
+    Ok(std::env::var(registry::ZAP_REGISTRY)
+        .ok()
+        .filter(|s| !s.is_empty()))
+}
+
+/// `zap publish [--index <id> | --registry <url>] [--dry-run]` — package the
+/// project at `root` and publish it to the resolved index (I#237).
+pub fn publish(
+    root: &Path,
+    index_id: Option<&str>,
+    registry_url: Option<&str>,
+    dry_run: bool,
+) -> Result<crate::publish::Published> {
+    let base = resolve_index_base(Some(root), index_id, registry_url)?;
+    crate::publish::publish(root, base.as_deref(), dry_run)
+}
+
+/// `zap login [--index <id> | --registry <url>]` — store a bearer token for the
+/// resolved index in the out-of-repo credential store (I#237, §5 step 3).
+pub fn login(
+    root: Option<&Path>,
+    index_id: Option<&str>,
+    registry_url: Option<&str>,
+    token: &str,
+) -> Result<PathBuf> {
+    let base = resolve_index_base(root, index_id, registry_url)?.ok_or_else(|| {
+        Error::registry(
+            ErrorCode::ZAP6109,
+            "`zap login` needs a registry: pass `--registry <url>`, `--index <id>`, or set \
+             ZAP_REGISTRY",
+        )
+    })?;
+    crate::publish::store_token(&base, token)
+}
+
+/// `zap search <query> [--index <id> | --registry <url>]` — list packages in a
+/// local/`file://` index whose name matches `query` (I#237).
+pub fn search(
+    root: Option<&Path>,
+    index_id: Option<&str>,
+    registry_url: Option<&str>,
+    query: &str,
+) -> Result<Vec<crate::discovery::PackageSummary>> {
+    let base = resolve_index_base(root, index_id, registry_url)?.ok_or_else(|| {
+        Error::registry(
+            ErrorCode::ZAP6105,
+            "no index to search: pass `--registry <url>`, `--index <id>`, or set ZAP_REGISTRY",
+        )
+    })?;
+    crate::discovery::search(&base, query)
+}
+
+/// `zap info <name> [--index <id> | --registry <url>]` — fetch a package's
+/// published versions from any static index (local or remote) (I#237).
+pub fn info(
+    root: Option<&Path>,
+    index_id: Option<&str>,
+    registry_url: Option<&str>,
+    name: &str,
+) -> Result<Vec<IndexEntry>> {
+    let base = resolve_index_base(root, index_id, registry_url)?.ok_or_else(|| {
+        Error::registry(
+            ErrorCode::ZAP6105,
+            "no index to query: pass `--registry <url>`, `--index <id>`, or set ZAP_REGISTRY",
+        )
+    })?;
+    let rn = RegistryName::parse(name)?;
+    let fetcher = DefaultFetcher;
+    let reg = Registry::new(
+        &fetcher,
+        Some(base),
+        BTreeMap::new(),
+        registry::toolchain_version(),
+    );
+    reg.package(None, &rn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -412,14 +412,103 @@ auto head = xs[0:3]       # list slice -> a copy (D-0030)
 auto view = a[0:3]        # array slice -> a view (D-0030)
 ```
 
-## 9. Strings: interpolation
+## 9. Strings: operations, methods, interpolation
 
-f-strings (D-0026):
+### 9.1 Operations (ticket #284, D-0025)
+
+`str` indexing, slicing and iteration are **by Unicode codepoint**; `s[i]`
+yields a `char`, a slice yields a `str`, and iteration yields `char`. Comparison
+is content-based (`==`/`!=`) and lexicographic by codepoint (`< <= > >=`, which
+for UTF-8 equals byte order). `+` concatenates; `in` tests for a substring.
+
+```python
+auto s = "Hello, World"
+print(ord(s[0]))         # 72   (s[i] -> char; ord(char) -> int)
+print(s[7:])             # "World"   (slice -> str; Python bounds, negatives, step)
+print(s[::-1])           # "dlroW ,olleH"
+print("abc" < "abd")     # True
+for c in s:              # iterate codepoints (char)
+    pass
+if "World" in s:         # substring membership
+    pass
+```
+
+`char` is a Unicode scalar (an `i32`). Conversions: `ord(c)` → codepoint `int`;
+`chr(n)` / `char(n)` → the `char` for codepoint `n` (a non-scalar `n` is a
+`ValueError`); `str(c)` → the one-codepoint string; `str(n)`/`str(x)` renders an
+int, float, bool, char or str.
+
+Value ⇄ string conversion builtins (#285/#282, D-0026):
+
+| Builtin | Result | Notes |
+|---|---|---|
+| `str(x)` | `str` | renders an int/float/bool/char/str (user types → Display protocol, #274) |
+| `int(s)` | `int64` | parses a decimal integer; faults on a malformed string |
+| `float(s)` | `float64` | parses a float; faults on a malformed string (also converts a number/bool) |
+| `bool(x)` | `bool` | Python truthiness: a number/char is false at zero, a str false when empty, a bool is itself |
+| `format(x, spec)` | `str` | renders `x` through the format spec (§9.3); `spec` is a string literal in v1 |
+
+`int(x)` also converts a number to `int64`; `float(x)` converts a number/bool
+to `float64`. `int`/`float` are the string-**parsing** conversions; the
+width-specific numeric casts (`int32`/`int64`/`float32`/`float64`, D-0020) do
+not parse strings.
+
+> `len(s)` currently returns the **byte** length (it equals the codepoint count
+> for ASCII). A codepoint-based `len(str)` is pending the `str`/`bytes`
+> representation split (#284). The reachable byte view for byte-level work (e.g.
+> SigV4 percent-encoding) is `s.encode()`, a `list[int]` of the UTF-8 bytes.
+
+### 9.2 Methods (ticket #284)
+
+String operations are **methods on `str`** (there is no `strings` module):
+
+| Method | Result | Notes |
+|---|---|---|
+| `s.upper()` / `s.lower()` | `str` | ASCII case in v1 |
+| `s.strip()` / `s.lstrip()` / `s.rstrip()` | `str` | ASCII whitespace |
+| `s.split(sep)` | `list[str]` | non-empty `sep` |
+| `sep.join(parts)` | `str` | `parts : list[str]` |
+| `s.find(sub)` / `s.index(sub)` | `int` | codepoint index; `find` → -1, `index` raises when absent |
+| `s.replace(old, new)` | `str` | all occurrences |
+| `s.startswith(p)` / `s.endswith(p)` / `s.contains(sub)` | `bool` | |
+| `s.encode()` | `list[int]` | UTF-8 byte values |
+
+### 9.3 Interpolation (f-strings, #285/D-0026)
+
+An f-string `f"...{expr[!conv][:spec]}..."` interpolates expressions. Each
+replacement field holds a full Zap expression; `{{` and `}}` are literal
+braces. A field with no spec renders via `str(expr)` (so `str(n)` and `f"{n}"`
+produce byte-identical text), and a field with a `:spec` renders via
+`format(expr, "spec")`. An f-string lowers to the concatenation of its literal
+runs and formatted fields.
 
 ```python
 auto n = 5
+auto x = 3.14159
 print(f"there are {n} items ({n*2} halves)")
+print(f"{n:04d} {n:#x}")        # 0005 0x5
+print(f"{x:.2f}")               # 3.14
+print(f"%{255:02X}")            # %FF   (byte -> percent-encoding, SigV4)
 ```
+
+**Format mini-language** (`spec`, a subset of Python's): `[[fill]align][sign]["#"]["0"][width]["." precision][type]`.
+
+| Field | Meaning |
+|---|---|
+| `fill`+`align` | `<` left, `>` right, `^` center, `=` pad after the sign; `fill` is any char |
+| `sign` | `+` always, `-` negatives only (default), space for a leading space on non-negatives |
+| `#` | alternate form — `0b`/`0o`/`0x` prefix on int types |
+| `0` | zero-pad to `width` (sign-aware) |
+| `width` | minimum field width (counted in bytes; exact for ASCII) |
+| `.precision` | float decimal places, or a string truncation length (codepoints) |
+| `type` | int `b`/`o`/`x`/`X`/`d`, float `e`/`E`/`f`/`F`/`g`/`G`, string `s` |
+
+v1 limitations (documented): the `!r`/`!a` conversions (only `!s` is accepted)
+and user-type rendering need the Display protocol (#274); a field cannot contain
+a string delimited by the same quote as the f-string (use the other quote);
+nested `{...}` inside a spec, and non-ASCII `fill` characters, are not supported;
+`format`'s spec must be a string literal. A malformed field is `ZAP2017`; an
+invalid spec is `ZAP4026`.
 
 ## 10. Errors & exceptions (D-0007, D-0029)
 
@@ -519,6 +608,20 @@ names that `zap.toml` maps to a source + version. A project-local,
 env-var-activated **`zenv`** (`source zenv/activate`) isolates both the Zap
 module cache and a nested Python venv at **`zenv/venv`** (which the embedded
 CPython uses), for a fully reproducible environment.
+
+**Optional registry (D-0027, experimental).** On top of the decentralized model
+there is an *additive* static-file package registry: a fourth `registry` source
+resolved through an HTTPS/`file://` index of names → versions → `zap1:`
+checksums, verified client-side against the same tree hash a `git`/`path` pin
+uses. The CLI covers both ends: `zap publish` packages the current project and
+appends its index line + archive to a **static index** (today a local/`file://`
+index; an `https://` index needs the hosted authenticated write API, which is
+gated on the org move); `zap search <query>` lists packages in a local index and
+`zap info <name>` shows a package's published versions, checksums and yank state
+from any static index. `zap login` stores a bearer token outside the repo for
+the (gated) hosted write path. These verbs are **experimental** (the 1.0 CLI
+surface is frozen, D-0076, so they are additive). Full design in
+`design/0027-registry.md`.
 
 ## 14. Regular expressions (D-0010)
 
@@ -711,6 +814,34 @@ and an unbounded MPSC `Queue[T]` built on `Atomic[T]`; concurrency lives in the
 type name (no new syntax), and a reference-payload `Queue[T]` inherits the open
 aarch64 evacuation caveat (I#223). CSV is a **`@derive(Csv)`** (`to_csv`/`from_csv`), not a module; `testing`
 is the **`@test`** annotation framework (§17), not an importable module.
+
+**`datetime` formatting (#286).** A `DateTime` renders as ISO-8601 extended via
+`datetime.format(dt)`; `datetime.strftime(dt, fmt)` (equivalently the 2-arg
+`datetime.format(dt, fmt)`) renders a custom format with a Python-faithful
+`strftime` directive set — `%Y %y %m %d %H %I %M %S %p %j %A %a %B %b %Z %z %%`,
+built directly from the numeric fields. `DateTime` is naive (it carries no
+zone), so `%Z`/`%z` expand to the empty string, as in Python; a literal `Z` in
+the format (e.g. `"%Y%m%dT%H%M%SZ"`) is emitted verbatim. This produces the
+SigV4 `X-Amz-Date` (`%Y%m%dT%H%M%SZ`) and credential-scope (`%Y%m%d`) stamps,
+HTTP `Date`, and similar, from a UTC `DateTime` without run-time string slicing.
+
+**`http` client (#104, #280).** The plaintext/TLS HTTP/1.1 client verbs
+`http.get(url)`, `http.post(url, body)` and `http.request(method, url, body)`
+each take an **optional trailing `dict[str, str]` of request headers** —
+`http.get(url, headers)`, `http.post(url, body, headers)`,
+`http.request(method, url, body, headers)` — sent verbatim on the wire. A
+caller-supplied `Content-Type` overrides the default `text/plain`; the
+transport-managed `Host`, `Content-Length` and `Connection` headers are always
+computed by the client and any same-named map entry is ignored (so the request
+carries exactly one). The response is an opaque handle read back with
+`http.status(resp) -> int64`, `http.header(resp, name) -> str` (case-insensitive,
+`""` when absent) and `http.body(resp) -> str`. The server-side `http.respond`
+(#104) likewise takes an **optional trailing `dict[str, str]` of response
+headers** — `http.respond(conn, status, body, headers)` (#279) — written on the
+wire; a caller-supplied `Content-Type` overrides the default `text/plain`, while
+the server-managed `Content-Length` and `Connection: close` are always computed
+and any same-named map entry is ignored. `http` is **Experimental**
+(STABILITY.md §4.4).
 
 **Official packages** via the package manager (`sqlite3`, `xml`, `email`, …).
 The concurrency model replaces Python threading/multiprocessing; the

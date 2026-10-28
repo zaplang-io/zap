@@ -77,11 +77,47 @@ The default collector is the precise Immix GC (D-0009). The Boehm collector's
 library (`libgc`) is present too, so a toolchain rebuilt with `--features
 gc-boehm` also links.
 
+## Portable builds for Amazon Linux 2023 / AWS Lambda
+
+By default `zap build` emits a binary **dynamically linked** against the image's
+glibc (2.39 on Ubuntu 24.04) plus libstdc++, PCRE2, zlib, OpenSSL and
+libpython3.12. That binary **does not run on older-glibc distros** — notably
+**Amazon Linux 2023** (glibc 2.34), the base of the AWS `provided.al2023` Lambda
+runtime, where it exits 127 because glibc symbol versions are fixed at link time
+(installing the libraries on AL2023 does not help). See issue #287.
+
+Pass `--portable` (or set `ZAP_PORTABLE=1`) to build a **self-contained static
+binary** that runs on AL2023 and essentially any Linux, with no toolchain or
+shared libraries required at the destination (D-0082):
+
+```bash
+# Build in the toolchain image, deploy the binary anywhere — e.g. an AL2023 /
+# provided.al2023 Lambda custom runtime, a scratch/distroless image, Alpine.
+docker run --rm -v "$PWD":/w -w /w ghcr.io/zaplang-io/zap:latest \
+    zap build --portable bootstrap.zap -o bootstrap
+```
+
+`--portable` links statically (`-static`, so there is **no glibc version floor
+at all**) and **drops CPython interop**: libpython is not present on AL2023 and
+static libpython is impractical, so a portable binary's `import python` raises a
+catchable runtime error instead of linking the interpreter. Use the default
+(non-portable) build when you need `import python` (D-0012, #27).
+
+**Trade-offs** (accepted for a deploy bootstrap): static glibc means NSS-backed
+`getaddrinfo` cannot load nsswitch plugins (ordinary DNS resolution is
+unaffected), OpenSSL engine loading via `dlopen` is unavailable (the TLS client
+does not use it), and the binary is larger. `ZAP_PORTABLE=1` lets an image or CI
+job default every build to portable without the flag.
+
+The smoke test below proves a `--portable` binary built in this (Ubuntu) image
+runs unchanged inside stock `public.ecr.aws/amazonlinux/amazonlinux:2023`.
+
 ## Smoke test
 
 [`scripts/docker-smoke.sh`](../scripts/docker-smoke.sh) verifies an image can
-compile+run (`zap run`), build a native binary and execute it (`zap build`), and
-run `zap test` — the full codegen→link→execute path:
+compile+run (`zap run`), build a native binary and execute it (`zap build`),
+run `zap test`, and build a `--portable` binary and run it inside stock Amazon
+Linux 2023 (the #287 portability proof) — the full codegen→link→execute path:
 
 ```bash
 scripts/docker-smoke.sh ghcr.io/zaplang-io/zap:latest

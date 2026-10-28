@@ -62,11 +62,28 @@
  * `python3-embed.pc` under MinGW-w64, so build_executable omits the CPython
  * cflags/libs on Windows and the `import python` entry points below become
  * catchable-error stubs. Guard the header so the TU compiles without Python.h. */
-#if defined(ZAP_PLATFORM_POSIX)
+/* CPython embedding is enabled on POSIX, UNLESS the portable build profile is
+ * selected (`zap build --portable` / `ZAP_PORTABLE=1`, I#287): that profile
+ * drops libpython so the program is self-contained and statically linkable, and
+ * runs on minimal / older-glibc distros such as Amazon Linux 2023 (the AWS
+ * `provided.al2023` Lambda base). build_executable then passes `-DZAP_NO_CPYTHON`
+ * and omits the `pkg-config python3-embed` cflags/libs, so the `import python`
+ * entry points below become the same catchable-error stubs Windows v1 (I#198)
+ * uses. Guard the header so the TU still compiles without Python.h. */
+#if defined(ZAP_PLATFORM_POSIX) && !defined(ZAP_NO_CPYTHON)
 #define ZAP_HAVE_CPYTHON 1
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #endif
+
+/* `NULL` / `size_t` for the code between here and the standard-header block
+ * below (e.g. the precise-Immix `GC_get_my_stackbottom` shim). When CPython is
+ * embedded, `<Python.h>` above already pulls these in; when it is NOT — the
+ * portable profile (`-DZAP_NO_CPYTHON`, I#287) or Windows v1 (I#198) — nothing
+ * has yet, so include the freestanding `<stddef.h>` explicitly. It defines no
+ * feature-test-gated declarations, so it is safe before the other headers (the
+ * "Python.h must precede the standard headers" ordering above is unaffected). */
+#include <stddef.h>
 
 #ifndef ZAP_GC_IMMIX
 /* `GC_THREADS` must be defined before <gc.h> so the collector is built/used in
@@ -1601,6 +1618,692 @@ int64_t zap_str_eq(void *a, void *b) {
     return memcmp(x->data, y->data, (size_t)x->len) == 0 ? 1 : 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * String surface (ticket #284, design/0007-strings.md).
+ *
+ * `str` is immutable UTF-8. Indexing, slicing, `len` and iteration are all by
+ * **Unicode codepoint** (Python semantics, D-0025) with an ASCII fast path;
+ * `char` is a Unicode scalar passed as `i32`. The byte buffer is reachable for
+ * byte-level work (SigV4 percent-encoding) via `ord`/iteration on the ASCII
+ * fast path and `zap_str_encode` (UTF-8 byte values as a `list[int]`).
+ *
+ * Case folding and whitespace stripping are ASCII-only in v1 (documented in
+ * SPEC/STABILITY); the full Unicode tables are a follow-up.
+ * ------------------------------------------------------------------------- */
+
+/* Byte width of the UTF-8 sequence whose lead byte is `c`. An invalid lead is
+ * treated as width 1 so a malformed buffer still makes forward progress (the
+ * lexer guarantees literals are valid UTF-8; this is defensive). */
+static int zap_utf8_width(unsigned char c) {
+    if (c < 0x80) {
+        return 1;
+    }
+    if ((c >> 5) == 0x6) {
+        return 2;
+    }
+    if ((c >> 4) == 0xE) {
+        return 3;
+    }
+    if ((c >> 3) == 0x1E) {
+        return 4;
+    }
+    return 1;
+}
+
+/* Decode the codepoint of the `w`-byte UTF-8 sequence at `d + off`. */
+static int32_t zap_utf8_decode(const unsigned char *d, int64_t off, int w) {
+    switch (w) {
+    case 2:
+        return (int32_t)(((d[off] & 0x1F) << 6) | (d[off + 1] & 0x3F));
+    case 3:
+        return (int32_t)(((d[off] & 0x0F) << 12) | ((d[off + 1] & 0x3F) << 6) |
+                         (d[off + 2] & 0x3F));
+    case 4:
+        return (int32_t)(((d[off] & 0x07) << 18) | ((d[off + 1] & 0x3F) << 12) |
+                         ((d[off + 2] & 0x3F) << 6) | (d[off + 3] & 0x3F));
+    default:
+        return (int32_t)d[off];
+    }
+}
+
+/* Encode scalar `cp` into `out` (up to 4 bytes); returns the byte width. */
+static int zap_utf8_encode(int32_t cp, char *out) {
+    unsigned int c = (unsigned int)cp;
+    if (c < 0x80) {
+        out[0] = (char)c;
+        return 1;
+    }
+    if (c < 0x800) {
+        out[0] = (char)(0xC0 | (c >> 6));
+        out[1] = (char)(0x80 | (c & 0x3F));
+        return 2;
+    }
+    if (c < 0x10000) {
+        out[0] = (char)(0xE0 | (c >> 12));
+        out[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (c & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (c >> 18));
+    out[1] = (char)(0x80 | ((c >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((c >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (c & 0x3F));
+    return 4;
+}
+
+/* Wrap an already-owned GC buffer in a `str` object without copying. */
+static void *zap_str_adopt(char *buf, int64_t len) {
+    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
+    s->len = len;
+    s->data = buf;
+    return s;
+}
+
+static int zap_is_ascii_ws(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+/* len(s): codepoint count (O(1) on the ASCII fast path, O(n) otherwise). */
+int64_t zap_str_len_cp(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t n = 0;
+    int64_t i = 0;
+    while (i < s->len) {
+        i += zap_utf8_width(d[i]);
+        n++;
+    }
+    return n;
+}
+
+/* Byte offset of codepoint index `cp_idx` (clamped at the end). */
+static int64_t zap_str_byteoff(const ZapStr *s, int64_t cp_idx) {
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t i = 0;
+    int64_t k = 0;
+    while (i < s->len && k < cp_idx) {
+        i += zap_utf8_width(d[i]);
+        k++;
+    }
+    return i;
+}
+
+/* s[i] -> char. Negative indices count from the end; out-of-range faults (the
+ * typed `IndexError` lands with the exception runtime, D-0029). */
+int32_t zap_str_index(void *sp, int64_t idx) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t count = zap_str_len_cp(sp);
+    if (idx < 0) {
+        idx += count;
+    }
+    if (idx < 0 || idx >= count) {
+        fprintf(stderr, "zap: string index out of range\n");
+        abort();
+    }
+    int64_t off = zap_str_byteoff(s, idx);
+    return zap_utf8_decode(d, off, zap_utf8_width(d[off]));
+}
+
+/* Codepoint at byte offset `off` (for iteration). */
+int32_t zap_str_cp_at_byte(void *sp, int64_t off) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    return zap_utf8_decode(d, off, zap_utf8_width(d[off]));
+}
+
+/* Byte offset of the codepoint after the one at `off` (for iteration). */
+int64_t zap_str_adv_byte(void *sp, int64_t off) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    return off + zap_utf8_width(d[off]);
+}
+
+/* Normalize a positive-step slice bound to [0, n]. */
+static int64_t zap_slice_pos(int64_t v, int64_t n) {
+    if (v < 0) {
+        v += n;
+    }
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > n) {
+        v = n;
+    }
+    return v;
+}
+
+/* Normalize a negative-step slice bound to [-1, n-1]. */
+static int64_t zap_slice_neg(int64_t v, int64_t n) {
+    if (v < 0) {
+        v += n;
+    }
+    if (v < -1) {
+        v = -1;
+    }
+    if (v > n - 1) {
+        v = n - 1;
+    }
+    return v;
+}
+
+/* s[lo:hi:step] -> str, Python slice semantics by codepoint. The `has_*` flags
+ * mark which bounds were written (an omitted bound defaults by the step sign).
+ * step==1 copies the contiguous byte range; a general step re-encodes the
+ * selected codepoints. */
+void *zap_str_slice(void *sp, int64_t lo, int64_t hi, int64_t step, int64_t has_lo,
+                    int64_t has_hi, int64_t has_step) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t n = zap_str_len_cp(sp);
+    int64_t st = has_step ? step : 1;
+    if (st == 0) {
+        fprintf(stderr, "zap: slice step cannot be zero\n");
+        abort();
+    }
+    int64_t start;
+    int64_t stop;
+    if (st > 0) {
+        start = has_lo ? zap_slice_pos(lo, n) : 0;
+        stop = has_hi ? zap_slice_pos(hi, n) : n;
+    } else {
+        start = has_lo ? zap_slice_neg(lo, n) : n - 1;
+        stop = has_hi ? zap_slice_neg(hi, n) : -1;
+    }
+    if (st == 1) {
+        if (start >= stop) {
+            return zap_str_new("", 0);
+        }
+        int64_t a = zap_str_byteoff(s, start);
+        int64_t b = zap_str_byteoff(s, stop);
+        return zap_str_new(s->data + a, b - a);
+    }
+    /* General step: collect codepoints and re-encode. */
+    char *buf = (char *)zap_buf((size_t)s->len + 4);
+    int64_t outlen = 0;
+    const unsigned char *d = (const unsigned char *)s->data;
+    for (int64_t k = start; (st > 0) ? (k < stop) : (k > stop); k += st) {
+        int64_t off = zap_str_byteoff(s, k);
+        int w = zap_utf8_width(d[off]);
+        int32_t cp = zap_utf8_decode(d, off, w);
+        outlen += zap_utf8_encode(cp, buf + outlen);
+    }
+    return zap_str_adopt(buf, outlen);
+}
+
+/* char(n) / chr(n): validate `n` is a Unicode scalar (not a surrogate, in
+ * range) and return it as a `char`. Faults on an invalid value (the typed
+ * `ValueError` lands with the exception runtime). */
+int32_t zap_chr(int64_t n) {
+    if (n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF)) {
+        fprintf(stderr, "zap: chr() argument is not a valid Unicode scalar value\n");
+        abort();
+    }
+    return (int32_t)n;
+}
+
+/* str(ch): the one-codepoint string that is `ch`'s UTF-8 encoding. */
+void *zap_char_to_str(int32_t cp) {
+    char buf[4];
+    int w = zap_utf8_encode(cp, buf);
+    return zap_str_new(buf, w);
+}
+
+/* int(s): parse a decimal integer, Python-style (surrounding ASCII whitespace
+ * allowed, optional sign, at least one digit, nothing else). Faults on a
+ * malformed string (the typed `ValueError` lands with the exception runtime).
+ * Distinct from the lenient `zap_str_to_i64` the CSV codec uses. */
+int64_t zap_str_parse_int(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const char *d = s->data;
+    int64_t i = 0;
+    int64_t n = s->len;
+    while (i < n && zap_is_ascii_ws((unsigned char)d[i])) {
+        i++;
+    }
+    int neg = 0;
+    if (i < n && (d[i] == '+' || d[i] == '-')) {
+        neg = d[i] == '-';
+        i++;
+    }
+    int64_t start = i;
+    unsigned long long acc = 0;
+    while (i < n && d[i] >= '0' && d[i] <= '9') {
+        acc = acc * 10 + (unsigned long long)(d[i] - '0');
+        i++;
+    }
+    int64_t digits = i - start;
+    while (i < n && zap_is_ascii_ws((unsigned char)d[i])) {
+        i++;
+    }
+    if (digits == 0 || i != n) {
+        fprintf(stderr, "zap: int() cannot parse an integer from this string\n");
+        abort();
+    }
+    return neg ? -(int64_t)acc : (int64_t)acc;
+}
+
+/* float(s): parse a float, Python-style (surrounding ASCII whitespace allowed,
+ * a C float literal otherwise). Faults on a malformed string, matching int()'s
+ * strictness. Distinct from the lenient `zap_str_to_f64` the CSV codec uses. */
+double zap_str_parse_float(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char stackbuf[64];
+    char *tmp = stackbuf;
+    char *heap = NULL;
+    if (s->len >= (int64_t)sizeof(stackbuf)) {
+        heap = (char *)malloc((size_t)s->len + 1);
+        tmp = heap;
+    }
+    memcpy(tmp, s->data, (size_t)s->len);
+    tmp[s->len] = '\0';
+    char *p = tmp;
+    while (*p && zap_is_ascii_ws((unsigned char)*p)) {
+        p++;
+    }
+    char *end = NULL;
+    double v = strtod(p, &end);
+    int bad = (end == p);
+    if (end != NULL) {
+        while (*end && zap_is_ascii_ws((unsigned char)*end)) {
+            end++;
+        }
+        if (*end != '\0') {
+            bad = 1;
+        }
+    }
+    if (heap) {
+        free(heap);
+    }
+    if (bad) {
+        fprintf(stderr, "zap: float() cannot parse a float from this string\n");
+        abort();
+    }
+    return v;
+}
+
+/* ---------------------------------------------------------------------------
+ * f-string / `format()` formatting mini-language (ticket #285, D-0026).
+ *
+ * The compiler parses the spec at compile time and passes it decomposed as
+ * integer arguments (width/precision use -1 for "unset"; `align`/`fill` are
+ * character codepoints; `sign` is 0='-' only, 1='+', 2=' '). These helpers do
+ * the base conversion / `printf` rendering plus fill/align/width padding.
+ *
+ * Padding width is counted in BYTES (so it is exact for ASCII, the overwhelming
+ * case, and matches the v1 byte-length `len`, design/0007-strings.md); string
+ * precision truncates on a UTF-8 codepoint boundary. Non-ASCII fill characters
+ * fall back to a space. A full Unicode-width formatter is a follow-up.
+ * ------------------------------------------------------------------------- */
+
+/* Place `head` (sign/prefix) and `body` (digits/text) into a width-`width`
+ * field with `fill`/`align`. `align`: '<' left, '>' right, '^' center, '='
+ * pad between head and body (sign-aware). */
+static void *zap_fmt_pad(const char *head, int64_t hl, const char *body, int64_t bl,
+                         int64_t width, int fill, int align) {
+    int64_t content = hl + bl;
+    if (width < 0 || content >= width) {
+        char *buf = (char *)zap_buf((size_t)content);
+        memcpy(buf, head, (size_t)hl);
+        memcpy(buf + hl, body, (size_t)bl);
+        return zap_str_adopt(buf, content);
+    }
+    int64_t pad = width - content;
+    char fc = (fill > 0 && fill < 128) ? (char)fill : ' ';
+    char *buf = (char *)zap_buf((size_t)width);
+    int64_t pos = 0;
+    if (align == '=') {
+        memcpy(buf, head, (size_t)hl);
+        pos = hl;
+        memset(buf + pos, fc, (size_t)pad);
+        pos += pad;
+        memcpy(buf + pos, body, (size_t)bl);
+    } else if (align == '<') {
+        memcpy(buf, head, (size_t)hl);
+        pos = hl;
+        memcpy(buf + pos, body, (size_t)bl);
+        pos += bl;
+        memset(buf + pos, fc, (size_t)pad);
+    } else if (align == '^') {
+        int64_t left = pad / 2;
+        int64_t right = pad - left;
+        memset(buf, fc, (size_t)left);
+        pos = left;
+        memcpy(buf + pos, head, (size_t)hl);
+        pos += hl;
+        memcpy(buf + pos, body, (size_t)bl);
+        pos += bl;
+        memset(buf + pos, fc, (size_t)right);
+    } else { /* '>' or default right */
+        memset(buf, fc, (size_t)pad);
+        pos = pad;
+        memcpy(buf + pos, head, (size_t)hl);
+        pos += hl;
+        memcpy(buf + pos, body, (size_t)bl);
+    }
+    return zap_str_adopt(buf, width);
+}
+
+void *zap_fmt_int(int64_t v, int64_t base, int64_t upper, int64_t alt, int64_t sign,
+                  int64_t width, int64_t fill, int64_t align, int64_t zero) {
+    uint64_t mag;
+    int neg = 0;
+    if (v < 0) {
+        neg = 1;
+        mag = (uint64_t)(-(v + 1)) + 1ULL; /* avoids UB at INT64_MIN */
+    } else {
+        mag = (uint64_t)v;
+    }
+    const char *alpha = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    char rev[72];
+    int di = 0;
+    if (mag == 0) {
+        rev[di++] = '0';
+    }
+    while (mag > 0) {
+        rev[di++] = alpha[mag % (uint64_t)base];
+        mag /= (uint64_t)base;
+    }
+    char body[72];
+    for (int k = 0; k < di; k++) {
+        body[k] = rev[di - 1 - k];
+    }
+    char head[8];
+    int hl = 0;
+    if (neg) {
+        head[hl++] = '-';
+    } else if (sign == 1) {
+        head[hl++] = '+';
+    } else if (sign == 2) {
+        head[hl++] = ' ';
+    }
+    if (alt) {
+        if (base == 16) {
+            head[hl++] = '0';
+            head[hl++] = upper ? 'X' : 'x';
+        } else if (base == 8) {
+            head[hl++] = '0';
+            head[hl++] = 'o';
+        } else if (base == 2) {
+            head[hl++] = '0';
+            head[hl++] = 'b';
+        }
+    }
+    int al = (int)align;
+    int fc = (int)fill;
+    if (zero && al == 0) {
+        al = '=';
+        fc = '0';
+    }
+    if (al == 0) {
+        al = '>'; /* numbers are right-aligned by default */
+    }
+    return zap_fmt_pad(head, hl, body, (int64_t)di, width, fc, al);
+}
+
+void *zap_fmt_flt(double v, int64_t ftype, int64_t sign, int64_t width, int64_t prec,
+                  int64_t fill, int64_t align, int64_t zero) {
+    char t = (char)ftype;
+    int neg = 0;
+    double mag = v;
+    if (v < 0.0 || (v == 0.0 && signbit(v))) {
+        neg = 1;
+        mag = -v;
+    }
+    char body[96];
+    if (prec < 0 && (t == 'g' || t == 'G')) {
+        /* Default float rendering: match str(float) (compact %g). */
+        snprintf(body, sizeof(body), (t == 'G') ? "%G" : "%g", mag);
+    } else {
+        int p = (prec >= 0) ? (int)prec : 6;
+        char spec[12];
+        snprintf(spec, sizeof(spec), "%%.%d%c", p, t);
+        snprintf(body, sizeof(body), spec, mag);
+    }
+    int64_t bl = (int64_t)strlen(body);
+    char head[2];
+    int hl = 0;
+    if (neg) {
+        head[hl++] = '-';
+    } else if (sign == 1) {
+        head[hl++] = '+';
+    } else if (sign == 2) {
+        head[hl++] = ' ';
+    }
+    int al = (int)align;
+    int fc = (int)fill;
+    if (zero && al == 0) {
+        al = '=';
+        fc = '0';
+    }
+    if (al == 0) {
+        al = '>';
+    }
+    return zap_fmt_pad(head, hl, body, bl, width, fc, al);
+}
+
+void *zap_fmt_str(void *sp, int64_t width, int64_t prec, int64_t fill, int64_t align) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t bl = s->len;
+    if (prec >= 0) {
+        /* Truncate to `prec` codepoints (UTF-8 boundary safe). */
+        int64_t cp = 0;
+        int64_t i = 0;
+        while (i < s->len && cp < prec) {
+            unsigned char c = (unsigned char)s->data[i];
+            i += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+            cp++;
+        }
+        bl = (i < s->len) ? i : s->len;
+    }
+    int al = (int)align;
+    int fc = (int)fill;
+    if (al == 0) {
+        al = '<'; /* strings are left-aligned by default */
+    }
+    return zap_fmt_pad("", 0, s->data, bl, width, fc, al);
+}
+
+void *zap_str_upper(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char *buf = (char *)zap_buf((size_t)s->len);
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
+    }
+    return zap_str_adopt(buf, s->len);
+}
+
+void *zap_str_lower(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char *buf = (char *)zap_buf((size_t)s->len);
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+    }
+    return zap_str_adopt(buf, s->len);
+}
+
+/* strip(mode): 0 both ends, 1 left only, 2 right only. ASCII whitespace. */
+void *zap_str_strip(void *sp, int64_t mode) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t a = 0;
+    int64_t b = s->len;
+    if (mode != 2) {
+        while (a < b && zap_is_ascii_ws((unsigned char)s->data[a])) {
+            a++;
+        }
+    }
+    if (mode != 1) {
+        while (b > a && zap_is_ascii_ws((unsigned char)s->data[b - 1])) {
+            b--;
+        }
+    }
+    return zap_str_new(s->data + a, b - a);
+}
+
+int64_t zap_str_startswith(void *sp, void *pp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *p = (const ZapStr *)pp;
+    if (p->len > s->len) {
+        return 0;
+    }
+    return memcmp(s->data, p->data, (size_t)p->len) == 0 ? 1 : 0;
+}
+
+int64_t zap_str_endswith(void *sp, void *pp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *p = (const ZapStr *)pp;
+    if (p->len > s->len) {
+        return 0;
+    }
+    return memcmp(s->data + (s->len - p->len), p->data, (size_t)p->len) == 0 ? 1 : 0;
+}
+
+/* First byte offset of `sub` in `s`, or -1. Both are valid UTF-8, so a byte
+ * match is codepoint-aligned. */
+static int64_t zap_str_find_bytes(const ZapStr *s, const ZapStr *sub) {
+    if (sub->len == 0) {
+        return 0;
+    }
+    for (int64_t i = 0; i + sub->len <= s->len; i++) {
+        if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int64_t zap_str_contains(void *sp, void *subp) {
+    return zap_str_find_bytes((const ZapStr *)sp, (const ZapStr *)subp) >= 0 ? 1 : 0;
+}
+
+/* find(sub): codepoint index of the first match, or -1. */
+int64_t zap_str_find(void *sp, void *subp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t off = zap_str_find_bytes(s, (const ZapStr *)subp);
+    if (off < 0) {
+        return -1;
+    }
+    int64_t k = 0;
+    int64_t j = 0;
+    const unsigned char *d = (const unsigned char *)s->data;
+    while (j < off) {
+        j += zap_utf8_width(d[j]);
+        k++;
+    }
+    return k;
+}
+
+/* index(sub): like find, but faults when `sub` is absent (Python's ValueError;
+ * the typed exception lands with the exception runtime). */
+int64_t zap_str_index_of(void *sp, void *subp) {
+    int64_t r = zap_str_find(sp, subp);
+    if (r < 0) {
+        fprintf(stderr, "zap: substring not found\n");
+        abort();
+    }
+    return r;
+}
+
+/* replace(old, new): replace every non-overlapping occurrence. An empty `old`
+ * returns the string unchanged (Python inserts `new` between codepoints; left
+ * as a follow-up). */
+void *zap_str_replace(void *sp, void *oldp, void *newp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *o = (const ZapStr *)oldp;
+    const ZapStr *nw = (const ZapStr *)newp;
+    if (o->len == 0) {
+        return zap_str_new(s->data, s->len);
+    }
+    int64_t count = 0;
+    for (int64_t i = 0; i + o->len <= s->len;) {
+        if (memcmp(s->data + i, o->data, (size_t)o->len) == 0) {
+            count++;
+            i += o->len;
+        } else {
+            i++;
+        }
+    }
+    int64_t outlen = s->len + count * (nw->len - o->len);
+    char *buf = (char *)zap_buf((size_t)(outlen > 0 ? outlen : 1));
+    int64_t w = 0;
+    for (int64_t i = 0; i < s->len;) {
+        if (i + o->len <= s->len && memcmp(s->data + i, o->data, (size_t)o->len) == 0) {
+            memcpy(buf + w, nw->data, (size_t)nw->len);
+            w += nw->len;
+            i += o->len;
+        } else {
+            buf[w++] = s->data[i++];
+        }
+    }
+    return zap_str_adopt(buf, outlen);
+}
+
+/* split(sep) -> list[str] on a non-empty separator. An empty separator yields
+ * a one-element list with the whole string (Python raises ValueError; left as
+ * a follow-up). */
+void *zap_str_split(void *sp, void *sepp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *sep = (const ZapStr *)sepp;
+    void *out = zap_list_new();
+    if (sep->len == 0) {
+        zap_list_push_ptr(out, zap_str_new(s->data, s->len));
+        return out;
+    }
+    int64_t start = 0;
+    for (int64_t i = 0; i + sep->len <= s->len;) {
+        if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {
+            zap_list_push_ptr(out, zap_str_new(s->data + start, i - start));
+            i += sep->len;
+            start = i;
+        } else {
+            i++;
+        }
+    }
+    zap_list_push_ptr(out, zap_str_new(s->data + start, s->len - start));
+    return out;
+}
+
+/* sep.join(parts): concatenate `parts` (a list[str]) with `sep` between them. */
+void *zap_str_join(void *sepp, void *listp) {
+    const ZapStr *sep = (const ZapStr *)sepp;
+    int64_t n = zap_list_len(listp);
+    if (n <= 0) {
+        return zap_str_new("", 0);
+    }
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const ZapStr *e = (const ZapStr *)zap_list_get_ptr(listp, i);
+        total += e->len;
+        if (i > 0) {
+            total += sep->len;
+        }
+    }
+    char *buf = (char *)zap_buf((size_t)(total > 0 ? total : 1));
+    int64_t w = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (i > 0) {
+            memcpy(buf + w, sep->data, (size_t)sep->len);
+            w += sep->len;
+        }
+        const ZapStr *e = (const ZapStr *)zap_list_get_ptr(listp, i);
+        memcpy(buf + w, e->data, (size_t)e->len);
+        w += e->len;
+    }
+    return zap_str_adopt(buf, total);
+}
+
+/* encode() -> list[int]: the UTF-8 byte values of `s` (0..255). The reachable
+ * byte-level view (SigV4 percent-encoding) until the full `bytes` type lands. */
+void *zap_str_encode(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < s->len; i++) {
+        zap_list_push_i64(out, (int64_t)(unsigned char)s->data[i]);
+    }
+    return out;
+}
+
 typedef struct {
     ZapStr *type_name;
     ZapStr *deco_name;
@@ -2099,19 +2802,21 @@ void *zap_py_str(void *obj_) {
     PyGILState_Release(g);
     return out;
 }
-#else /* !ZAP_HAVE_CPYTHON — Windows v1 (I#198): CPython embedding gated off */
+#else /* !ZAP_HAVE_CPYTHON — CPython embedding gated off: Windows v1 (I#198) or
+       * the portable build profile (`--portable`, I#287), which drops libpython
+       * for a self-contained AL2023-runnable binary. */
 /* `import python` and its attribute/call/convert entry points still lower and
- * link on Windows, but CPython is not embedded (no python3-embed under MinGW-w64,
- * see build_executable), so each raises a catchable Zap exception at runtime
- * rather than failing the link. The wrapper type keeps its shape so the shared
- * `zap_desc_pyobj` descriptor (sizeof) compiles. Full Windows Python interop is a
- * post-v1 follow-up. */
+ * link, but CPython is not embedded (no python3-embed under MinGW-w64, or the
+ * portable profile deliberately omits it, see build_executable), so each raises a
+ * catchable Zap exception at runtime rather than failing the link. The wrapper
+ * type keeps its shape so the shared `zap_desc_pyobj` descriptor (sizeof)
+ * compiles. Full Windows Python interop is a post-v1 follow-up. */
 typedef struct {
     void *obj;
 } ZapPy;
 static void *zap_py_unavailable(void) {
-    const char *m = "python interop is unavailable on this platform "
-                    "(Windows v1; see I#198)";
+    const char *m = "python interop is unavailable in this build "
+                    "(portable profile, see I#287; or Windows v1, see I#198)";
     zap_panic(zap_str_new(m, (int64_t)strlen(m)));
     return NULL;
 }
@@ -7333,6 +8038,179 @@ void *zap_datetime_format_iso(int64_t y, int64_t mo, int64_t d, int64_t h,
     return zap_str_new(buf, (int64_t)n);
 }
 
+/* Civil components -> a `strftime`-style custom-formatted string (#286).
+ *
+ * A Python-faithful subset of `strftime` directives, built **directly from the
+ * integer fields** (so it does not depend on run-time string slicing, #284):
+ *
+ *   %Y  year, >=4 digits, zero-padded   %y  year mod 100, 2 digits
+ *   %m  month 01-12                     %d  day of month 01-31
+ *   %H  hour 00-23                      %I  hour 01-12 (12-hour clock)
+ *   %M  minute 00-59                    %S  second 00-59
+ *   %p  AM / PM                         %j  day of year 001-366
+ *   %A  weekday name (Sunday)           %a  weekday abbr (Sun)
+ *   %B  month name (January)            %b  month abbr (Jan)
+ *   %Z  time-zone name                  %z  UTC offset (+HHMM)
+ *   %%  a literal percent
+ *
+ * `DateTime` is naive (it carries no zone), so — like Python's `strftime` on a
+ * naive datetime — `%Z` and `%z` expand to the empty string. An unknown `%X`
+ * is emitted verbatim (`%` then `X`), matching CPython. Returns a fresh
+ * `ZapStr*`. Weekday / day-of-year are derived by recomposing the instant in
+ * UTC (`timegm` then `gmtime_r`), reusing the civil-time path above. */
+void *zap_datetime_strftime(int64_t y, int64_t mo, int64_t d, int64_t h,
+                            int64_t mi, int64_t s, void *fmt) {
+    static const char *const MON_FULL[12] = {
+        "January", "February", "March",     "April",   "May",      "June",
+        "July",    "August",   "September", "October", "November", "December"};
+    static const char *const MON_ABBR[12] = {"Jan", "Feb", "Mar", "Apr",
+                                             "May", "Jun", "Jul", "Aug",
+                                             "Sep", "Oct", "Nov", "Dec"};
+    static const char *const DAY_FULL[7] = {"Sunday",   "Monday", "Tuesday",
+                                            "Wednesday", "Thursday",
+                                            "Friday",   "Saturday"};
+    static const char *const DAY_ABBR[7] = {"Sun", "Mon", "Tue", "Wed",
+                                            "Thu", "Fri", "Sat"};
+    ZapStr *f = (ZapStr *)fmt;
+    int64_t flen = f->len < 0 ? 0 : f->len;
+
+    /* Derive weekday (0=Sunday) and 1-based day-of-year by recomposing the
+     * civil components into a UTC instant and splitting them back out. */
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = (int)(y - 1900);
+    tm.tm_mon = (int)(mo - 1);
+    tm.tm_mday = (int)d;
+    tm.tm_hour = (int)h;
+    tm.tm_min = (int)mi;
+    tm.tm_sec = (int)s;
+    time_t t = timegm(&tm);
+    struct tm norm;
+    gmtime_r(&t, &norm);
+    int wday = norm.tm_wday; /* 0=Sunday .. 6=Saturday */
+    int yday = norm.tm_yday + 1;
+
+    /* Upper bound: the widest single directive ("Wednesday"/"September") is 9
+     * bytes for 2 input bytes; literal bytes map 1:1. `flen*9 + 1` is safe. */
+    size_t cap = (size_t)flen * 9 + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        return zap_str_new("", 0);
+    }
+    size_t n = 0;
+    for (int64_t i = 0; i < flen; i++) {
+        char c = f->data[i];
+        if (c != '%' || i + 1 >= flen) {
+            out[n++] = c;
+            continue;
+        }
+        char dir = f->data[++i];
+        char tmp[16];
+        int w;
+        switch (dir) {
+        case 'Y':
+            w = snprintf(tmp, sizeof tmp, "%04lld", (long long)y);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'y':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)(((y % 100) + 100) % 100));
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'm':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)mo);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'd':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)d);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'H':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)h);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'I': {
+            long long h12 = (long long)(h % 12);
+            if (h12 == 0) {
+                h12 = 12;
+            }
+            w = snprintf(tmp, sizeof tmp, "%02lld", h12);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        }
+        case 'M':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)mi);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'S':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)s);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'j':
+            w = snprintf(tmp, sizeof tmp, "%03d", yday);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'p': {
+            const char *ampm = (h < 12) ? "AM" : "PM";
+            memcpy(out + n, ampm, 2);
+            n += 2;
+            break;
+        }
+        case 'A': {
+            const char *nm = DAY_FULL[(wday % 7 + 7) % 7];
+            size_t l = strlen(nm);
+            memcpy(out + n, nm, l);
+            n += l;
+            break;
+        }
+        case 'a': {
+            const char *nm = DAY_ABBR[(wday % 7 + 7) % 7];
+            size_t l = strlen(nm);
+            memcpy(out + n, nm, l);
+            n += l;
+            break;
+        }
+        case 'B': {
+            const char *nm = MON_FULL[((mo - 1) % 12 + 12) % 12];
+            size_t l = strlen(nm);
+            memcpy(out + n, nm, l);
+            n += l;
+            break;
+        }
+        case 'b': {
+            const char *nm = MON_ABBR[((mo - 1) % 12 + 12) % 12];
+            size_t l = strlen(nm);
+            memcpy(out + n, nm, l);
+            n += l;
+            break;
+        }
+        case 'Z':
+        case 'z':
+            /* Naive DateTime: no zone, so these expand empty (Python-faithful). */
+            break;
+        case '%':
+            out[n++] = '%';
+            break;
+        default:
+            /* Unknown directive: emit verbatim, like CPython. */
+            out[n++] = '%';
+            out[n++] = dir;
+            break;
+        }
+    }
+    void *z = zap_str_new(out, (int64_t)n);
+    free(out);
+    return z;
+}
+
 /* ISO-8601 string -> Unix timestamp (UTC). Accepts a date ("YYYY-MM-DD") or a
  * full date-time with a 'T' or ' ' separator; fields left unmatched default to
  * the start of the day. v1 parsing is lenient (sscanf): malformed input yields
@@ -11015,10 +11893,51 @@ static void zap_httpconn_close(ZapHttpConn *c) {
 /* http.request(method, url, body) -> response handle. Opens a connection (plain
  * `http://` via net, or `https://` via TLS with verification on — ticket #147),
  * sends a Connection: close request, reads the whole response to EOF, parses it. */
-void *zap_http_request(void *method_, void *url_, void *body_) {
+/* Case-insensitive compare of a ZapStr header name against a NUL-terminated
+ * ASCII name. Used to spot transport-managed / defaulted headers in a
+ * caller-supplied header map so we don't emit duplicates. */
+static int zap_http_name_eq(const ZapStr *name, const char *lit) {
+    size_t llen = strlen(lit);
+    if (name->len != (int64_t)llen) {
+        return 0;
+    }
+    for (size_t k = 0; k < llen; k++) {
+        char a = name->data[k];
+        char b = lit[k];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Is `name` a header the transport computes itself (Host / Content-Length /
+ * Connection)? Such a header from a caller-supplied map is dropped so the wire
+ * request carries exactly one. Content-Type is NOT here: callers may override
+ * the default (that is the whole point of #280 for JSON/SigV4 clients). */
+static int zap_http_hdr_managed(const ZapStr *name) {
+    return zap_http_name_eq(name, "Host") || zap_http_name_eq(name, "Content-Length") ||
+           zap_http_name_eq(name, "Connection");
+}
+
+/* HTTP/1.1 client core (ticket #104; request headers #280). `headers_` is an
+ * optional `dict[str,str]` (NULL for the no-header forms): each live entry is
+ * emitted as a `Name: Value` header line, except the transport-managed ones
+ * (zap_http_hdr_managed). A caller-supplied Content-Type suppresses the default
+ * text/plain. Keys and values are copied into the malloc request buffer before
+ * any send, so the GC dict is only touched while it is still rooted by the
+ * caller's frame. */
+void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
     const ZapStr *method = (const ZapStr *)method_;
     const ZapStr *url = (const ZapStr *)url_;
     const ZapStr *body = (const ZapStr *)body_;
+    const ZapDict *hdrs = (const ZapDict *)headers_;
 
     char *u = zap_net_dupz(url);
     char *mz = zap_net_dupz(method);
@@ -11088,7 +12007,30 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     free(host);
 
     size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
-    size_t reqcap = strlen(mz) + strlen(path) + hostend + blen + 256;
+    /* Size the request buffer: request/Host/Connection line + body + the
+     * caller's header map (name + ": " + value + CRLF for each live entry). */
+    size_t hdrbytes = 0;
+    int caller_content_type = 0;
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            const ZapEntry *ent = &hdrs->entries[e];
+            if (ent->state != SLOT_FULL) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
+            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            if (zap_http_hdr_managed(name)) {
+                continue;
+            }
+            if (zap_http_name_eq(name, "Content-Type")) {
+                caller_content_type = 1;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdrbytes += nl + vl + 4; /* ": " + "\r\n" */
+        }
+    }
+    size_t reqcap = strlen(mz) + strlen(path) + hostend + blen + hdrbytes + 256;
     char *req = (char *)malloc(reqcap);
     if (!req) {
         free(u);
@@ -11101,9 +12043,29 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
                        "%s %s HTTP/1.1\r\nHost: %.*s\r\nConnection: close\r\n",
                        mz, path, (int)hostend, rest);
     if (blen > 0) {
-        hdr += snprintf(req + hdr, reqcap - (size_t)hdr,
-                        "Content-Length: %zu\r\nContent-Type: text/plain; charset=utf-8\r\n",
-                        blen);
+        hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "Content-Length: %zu\r\n", blen);
+        if (!caller_content_type) {
+            hdr += snprintf(req + hdr, reqcap - (size_t)hdr,
+                            "Content-Type: text/plain; charset=utf-8\r\n");
+        }
+    }
+    /* Caller-supplied headers, copied out of the GC dict into the buffer. */
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            const ZapEntry *ent = &hdrs->entries[e];
+            if (ent->state != SLOT_FULL) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
+            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            if (zap_http_hdr_managed(name)) {
+                continue;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "%.*s: %.*s\r\n", (int)nl,
+                            name->data, (int)vl, val->data);
+        }
     }
     hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "\r\n");
     if (blen > 0) {
@@ -11167,6 +12129,16 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     return resp;
 }
 
+/* http.request(method, url, body) — no caller headers. */
+void *zap_http_request(void *method_, void *url_, void *body_) {
+    return zap_http_do(method_, url_, body_, NULL);
+}
+
+/* http.request(method, url, body, headers) — with a `dict[str,str]` (#280). */
+void *zap_http_request_h(void *method_, void *url_, void *body_, void *headers_) {
+    return zap_http_do(method_, url_, body_, headers_);
+}
+
 void *zap_http_get(void *url_) {
     ZapStr g;
     g.len = 3;
@@ -11174,14 +12146,31 @@ void *zap_http_get(void *url_) {
     ZapStr empty;
     empty.len = 0;
     empty.data = "";
-    return zap_http_request(&g, url_, &empty);
+    return zap_http_do(&g, url_, &empty, NULL);
+}
+
+void *zap_http_get_h(void *url_, void *headers_) {
+    ZapStr g;
+    g.len = 3;
+    g.data = "GET";
+    ZapStr empty;
+    empty.len = 0;
+    empty.data = "";
+    return zap_http_do(&g, url_, &empty, headers_);
 }
 
 void *zap_http_post(void *url_, void *body_) {
     ZapStr p;
     p.len = 4;
     p.data = "POST";
-    return zap_http_request(&p, url_, body_);
+    return zap_http_do(&p, url_, body_, NULL);
+}
+
+void *zap_http_post_h(void *url_, void *body_, void *headers_) {
+    ZapStr p;
+    p.len = 4;
+    p.data = "POST";
+    return zap_http_do(&p, url_, body_, headers_);
 }
 
 int64_t zap_http_status(void *resp_) { return ((ZapHttpResp *)resp_)->status; }
@@ -11345,24 +12334,84 @@ static const char *zap_http_reason(int64_t status) {
     }
 }
 
-/* http.respond(conn, status, body). Writes a minimal HTTP/1.1 response with
- * Content-Length, a text/plain content type, and Connection: close. */
-void zap_http_respond(void *c_, int64_t status, void *body_) {
+/* Response headers always computed by the server and never taken from the
+ * caller's map, so exactly one of each appears on the wire. Content-Type is
+ * NOT reserved: a caller entry overrides the text/plain default (mirrors the
+ * client's zap_http_hdr_managed, minus the request-only Host). */
+static int zap_http_resp_hdr_managed(const ZapStr *name) {
+    return zap_http_name_eq(name, "Content-Length") || zap_http_name_eq(name, "Connection");
+}
+
+/* Core of http.respond. Writes an HTTP/1.1 response: the status line, a
+ * server-managed Content-Length and Connection: close, a default
+ * Content-Type: text/plain unless the caller overrides it, then every live
+ * caller header (reserved names dropped). `headers_` is a ZapDict* (#279) or
+ * NULL for the bare three-arg form. Header names/values are copied out of the
+ * GC dict into the malloc buffer before any send, so the dict is only touched
+ * while it is still rooted by the caller's frame. */
+static void zap_http_respond_do(void *c_, int64_t status, void *body_, void *headers_) {
     ZapSock *c = (ZapSock *)c_;
     int fd = c->fd;
     void *pd = c->pd;
     const ZapStr *body = (const ZapStr *)body_;
+    const ZapDict *hdrs = (const ZapDict *)headers_;
     size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
-    size_t cap = blen + 256;
+
+    /* Size the buffer: status/Content-Length/Content-Type/Connection lines +
+     * body + the caller's header map (name + ": " + value + CRLF per entry). */
+    size_t hdrbytes = 0;
+    int caller_content_type = 0;
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            const ZapEntry *ent = &hdrs->entries[e];
+            if (ent->state != SLOT_FULL) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
+            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            if (zap_http_resp_hdr_managed(name)) {
+                continue;
+            }
+            if (zap_http_name_eq(name, "Content-Type")) {
+                caller_content_type = 1;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdrbytes += nl + vl + 4; /* ": " + "\r\n" */
+        }
+    }
+    size_t cap = blen + hdrbytes + 256;
     char *out = (char *)malloc(cap);
     if (!out) {
         zap_net_panic("http: out of memory");
         return;
     }
-    int hdr = snprintf(out, cap,
-                       "HTTP/1.1 %ld %s\r\nContent-Length: %zu\r\n"
-                       "Content-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n",
-                       (long)status, zap_http_reason(status), blen);
+    int hdr = snprintf(out, cap, "HTTP/1.1 %ld %s\r\nContent-Length: %zu\r\n", (long)status,
+                       zap_http_reason(status), blen);
+    if (!caller_content_type) {
+        hdr += snprintf(out + hdr, cap - (size_t)hdr,
+                        "Content-Type: text/plain; charset=utf-8\r\n");
+    }
+    hdr += snprintf(out + hdr, cap - (size_t)hdr, "Connection: close\r\n");
+    /* Caller-supplied headers, copied out of the GC dict into the buffer. */
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            const ZapEntry *ent = &hdrs->entries[e];
+            if (ent->state != SLOT_FULL) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
+            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            if (zap_http_resp_hdr_managed(name)) {
+                continue;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdr += snprintf(out + hdr, cap - (size_t)hdr, "%.*s: %.*s\r\n", (int)nl, name->data,
+                            (int)vl, val->data);
+        }
+    }
+    hdr += snprintf(out + hdr, cap - (size_t)hdr, "\r\n");
     if (blen > 0) {
         memcpy(out + hdr, body->data, blen);
     }
@@ -11371,6 +12420,19 @@ void zap_http_respond(void *c_, int64_t status, void *body_) {
     if (w < 0) {
         zap_net_panic("http: respond failed");
     }
+}
+
+/* http.respond(conn, status, body). Writes a minimal HTTP/1.1 response with
+ * Content-Length, a text/plain content type, and Connection: close. */
+void zap_http_respond(void *c_, int64_t status, void *body_) {
+    zap_http_respond_do(c_, status, body_, NULL);
+}
+
+/* http.respond(conn, status, body, headers) — the headers-bearing form (#279).
+ * `headers` is a dict[str,str] merged with the server-managed set: the caller
+ * may override Content-Type, Content-Length and Connection stay server-owned. */
+void zap_http_respond_h(void *c_, int64_t status, void *body_, void *headers_) {
+    zap_http_respond_do(c_, status, body_, headers_);
 }
 
 /* ===========================================================================

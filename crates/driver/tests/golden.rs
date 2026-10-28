@@ -38,6 +38,46 @@ fn zap_fixtures() -> Vec<PathBuf> {
     out
 }
 
+/// `<repo>/tests/golden_projects` — multi-file project fixtures (I#283/D-0081).
+/// Each subdirectory is a project with an entry `main.zap`, its sibling module
+/// files, and an `expected` file (plus optional `exit`/`stderr` sidecars).
+fn golden_projects_dir() -> PathBuf {
+    golden_dir()
+        .parent()
+        .expect("golden dir has a parent")
+        .join("golden_projects")
+}
+
+/// The entry `main.zap` of each project fixture.
+fn project_fixtures() -> Vec<PathBuf> {
+    let dir = golden_projects_dir();
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd {
+            let p = entry.expect("dir entry").path();
+            let main = p.join("main.zap");
+            if p.is_dir() && main.exists() {
+                out.push(main);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every project fixture has an `expected` file. Runs everywhere.
+#[test]
+fn project_fixtures_are_paired() {
+    for main in project_fixtures() {
+        let expected = main.parent().expect("project dir").join("expected");
+        assert!(
+            expected.exists(),
+            "missing `expected` for project {}",
+            main.display()
+        );
+    }
+}
+
 /// Every `.zap` fixture has a matching `.expected` file. Runs everywhere.
 #[test]
 fn fixtures_are_paired() {
@@ -172,6 +212,69 @@ fn golden_programs_match() {
                 got_err.contains(want_err),
                 "stderr for {} should contain {want_err:?}, got:\n{got_err}",
                 zap.display()
+            );
+        }
+    }
+}
+
+/// Compile + run each multi-file project fixture (I#283/D-0081) by its entry
+/// `main.zap` and compare stdout. Requires the `llvm` feature.
+#[cfg(feature = "codegen")]
+#[test]
+fn golden_projects_match() {
+    use std::process::Command;
+    let per_test = std::time::Duration::from_secs(60);
+    let bin = env!("CARGO_BIN_EXE_zapc");
+    for main in project_fixtures() {
+        let proj = main.parent().expect("project dir");
+        let expected =
+            std::fs::read_to_string(proj.join("expected")).expect("expected output present");
+        let expected_exit: i32 = std::fs::read_to_string(proj.join("exit"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let expected_stderr = std::fs::read_to_string(proj.join("stderr")).ok();
+
+        let mut cmd = Command::new(bin);
+        cmd.arg("run").arg(&main);
+        // Optional `env` sidecar: `KEY=VALUE` lines set on the child's
+        // environment, with `$PROJDIR` expanded to the project's absolute path.
+        // Used by the cross-package fixture to point `ZAP_ZENV` at a prebuilt
+        // `zenv/` holding materialized dependency packages (I#283/D-0081 Stage B).
+        if let Ok(env) = std::fs::read_to_string(proj.join("env")) {
+            let projdir = proj.display().to_string();
+            for line in env.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = line.split_once('=') {
+                    cmd.env(k.trim(), v.trim().replace("$PROJDIR", &projdir));
+                }
+            }
+        }
+        let output = run_with_timeout(cmd, per_test, &main.display().to_string());
+
+        let got = String::from_utf8_lossy(&output.stdout);
+        let got_err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "exit code mismatch for {} (stderr:\n{got_err})",
+            main.display()
+        );
+        assert_eq!(
+            got.trim_end(),
+            expected.trim_end(),
+            "stdout mismatch for {} (stderr:\n{got_err})",
+            main.display()
+        );
+        if let Some(want_err) = expected_stderr {
+            let want_err = want_err.trim_end();
+            assert!(
+                got_err.contains(want_err),
+                "stderr for {} should contain {want_err:?}, got:\n{got_err}",
+                main.display()
             );
         }
     }

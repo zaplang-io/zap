@@ -6,21 +6,23 @@ use std::path::PathBuf;
 
 fn mask_spans(debug: &str) -> String {
     // AST nodes derive Debug; spans appear as `Span { start: N, end: M }`.
+    // Char-boundary-safe: a `.zap` source (hence its debug dump) may contain
+    // multibyte UTF-8, so scan by substring rather than by byte index.
     let mut out = String::with_capacity(debug.len());
-    let bytes = debug.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if debug[i..].starts_with("Span { start: ") {
-            // skip to the closing '}'
-            if let Some(rel) = debug[i..].find('}') {
+    let mut rest = debug;
+    while let Some(pos) = rest.find("Span { start: ") {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos..];
+        match rest.find('}') {
+            // '}' is ASCII, so `close + 1` is a char boundary.
+            Some(close) => {
                 out.push_str("Span");
-                i += rel + 1;
-                continue;
+                rest = &rest[close + 1..];
             }
+            None => break,
         }
-        out.push(bytes[i] as char);
-        i += 1;
     }
+    out.push_str(rest);
     out
 }
 
