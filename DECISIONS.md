@@ -1929,3 +1929,41 @@ contended producer/consumer queue; a map is better served by sharded mutexes.
 Leaning on the existing GC (rather than building a reclamation subsystem) is both
 correct here and an order of magnitude less code (design §4/§5), and keeps the
 whole feature additive and runtime-free.
+
+## D-0080 — REPL v1 polish: cross-entry declarations, floats, readline, user-type render (I#252)
+
+**Status:** Accepted. Follow-up to [[D-0073]] (I#159); full text in
+`design/0025-repl.md`. Finishes the four items the REPL MVP deferred, all within
+the accepted MCJIT + runtime-slot model (no architectural extension).
+
+- **Cross-entry top-level `def`/`type`/`enum`/interface persistence** — the
+  session accumulates top-level declarations by name (newest wins, position
+  preserved) exactly as it already accumulates imports, and re-emits them at
+  module scope in every later entry so each entry type-checks and links against
+  them. To keep those re-emitted definitions from colliding as duplicate symbols
+  across the MCJIT's accumulated modules, codegen's JIT mode gives every function
+  **internal linkage** except the symbols the engine looks up (`main`,
+  `__repl_entry_N`); each entry module then carries its own private copy. The AOT
+  path is unchanged. *Limitation:* a persisted top-level `def` cannot reference a
+  session `let`-binding (bindings are thunk-locals, not module globals), and a
+  struct/enum **instance** still does not persist (only the type definition does).
+- **Float session bindings** — `float64`/`float32` bindings persist in the same
+  64-bit slot cell, reinterpreted as a `double` by new `zap_repl_slot_{get,set}_f64`
+  runtime entry points (a float is never a GC pointer, so the slot is unrooted;
+  `float32` round-trips exactly via widen-on-store / narrow-on-load). New
+  `__repl_load_f64`/`__repl_store_f64` lowering intrinsics mirror the i64/ptr pair.
+- **Readline + persistent history** — an interactive terminal gets line editing
+  and `~/.zap_history` via `rustyline` (`default-features = false` +
+  `with-file-history`, codegen-gated to the REPL). A piped/non-interactive stdin
+  (the scripted-stdin test harness) falls back to the plain line reader, so test
+  input stays byte-for-byte predictable; the line editor is never engaged there.
+- **User-type rendering (minimal).** A bare user value auto-prints through
+  `print(...)` only when its type carries a renderer (`__str__`/`__repr__` or
+  `@derive(Repr)`); otherwise it falls back to a `<TypeName>` placeholder instead
+  of a compile error. The **general `repr`/Display protocol is explicitly NOT
+  designed here** — it is shared with `print()` and is language-wide (see the
+  follow-up on I#252); the `@ 0x…` address form is deferred with it (no address
+  intrinsic exists yet).
+
+New dep: `rustyline` (codegen feature). Still host-only (needs LLVM), POSIX-only
+(the JIT does not yet support Windows, so `$HOME` locates the history file).

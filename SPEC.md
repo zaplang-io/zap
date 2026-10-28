@@ -622,11 +622,17 @@ compiled and executed through the real `AST → ZIR → LLVM` backend in one
 long-lived process via an in-process LLVM MCJIT, so REPL code has **identical
 semantics to compiled code** (same monomorphization, value-struct layout,
 exceptions, Immix GC) rather than a second interpreter. Session `let`/binding
-values persist across entries in GC-rooted runtime slots; a trailing expression
-is auto-printed; a compile error (`ZAPnnnn`) or an uncaught runtime exception is
-reported and the session continues. Meta-commands: `:type <expr>`, `:reset`,
-`:help`, `:quit`. The same session engine backs runnable doc examples (#234) and
-the web playground (#238). See design/0025-repl.md.
+values (including floats, I#252) persist across entries in runtime slots, and
+top-level `def`/`type`/`enum`/interface declarations persist too, so a helper
+defined in one entry is usable in later ones (I#252). A trailing expression is
+auto-printed (a user value with no `__str__`/`__repr__`/`@derive(Repr)` renderer
+prints a `<TypeName>` placeholder; the general `repr` protocol is a follow-up); a
+compile error (`ZAPnnnn`) or an uncaught runtime exception is reported and the
+session continues. An interactive terminal gets line editing and persistent
+history (`~/.zap_history`); piped stdin uses a plain reader. Meta-commands:
+`:type <expr>`, `:reset`, `:help`, `:quit`. The same session engine backs
+runnable doc examples (#234) and the web playground (#238). See
+design/0025-repl.md.
 
 **Error codes (I#157/F1).** Every diagnostic carries a stable `ZAPnnnn` code
 (`ZAP` + four digits; the leading digit is the phase/category — lex `1`, parse

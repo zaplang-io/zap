@@ -395,12 +395,16 @@ surface (no effect on ordinary program builds):
   allocation).
 - **Session slots** persist `let`/binding values across entries in a fixed,
   process-lifetime array of 64-bit cells with stable addresses:
-  `zap_repl_slot_{get,set}_i64` for integer/bool/char bindings and
-  `zap_repl_slot_{get,set}_ptr` for GC pointers (`str`/`bytes`/collections). A
-  pointer store registers the slot once with the global-root registry
-  (`zap_gc_add_root`), so the target is marked and forwarded under precise Immix
-  and conservatively scanned under Boehm. The driver assigns indices and emits
-  these via the `__repl_load_*`/`__repl_store_*` lowering intrinsics.
+  `zap_repl_slot_{get,set}_i64` for integer/bool/char bindings,
+  `zap_repl_slot_{get,set}_f64` for `float64`/`float32` bindings (I#252 — the
+  same cell reinterpreted as a `double`; a float is never a GC pointer, so the
+  slot is not rooted, and `float32` round-trips exactly via widen-on-store /
+  narrow-on-load), and `zap_repl_slot_{get,set}_ptr` for GC pointers
+  (`str`/`bytes`/collections). A pointer store registers the slot once with the
+  global-root registry (`zap_gc_add_root`), so the target is marked and forwarded
+  under precise Immix and conservatively scanned under Boehm. The driver assigns
+  indices and emits these via the `__repl_load_*`/`__repl_store_*` lowering
+  intrinsics.
 - **`void **zap_shadow_head_addr(void)`** (precise GC only) returns this thread's
   `zap_shadow_head` slot. JIT'd code calls it instead of taking a direct
   dynamic-TLS reference, which MCJIT cannot resolve to a `__thread` global in the

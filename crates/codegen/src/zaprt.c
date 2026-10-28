@@ -1480,6 +1480,28 @@ void zap_repl_slot_set_i64(int64_t i, int64_t v) {
     zap_repl_slot_check(i);
     zap_repl_slots[i] = v;
 }
+/* Float bindings (I#252) reuse the same 64-bit slot cell, reinterpreted as a
+ * `double`. A float is not a GC pointer, so the slot is never rooted. `float32`
+ * bindings round-trip exactly (widened to `double` at the store, narrowed back
+ * at the load). */
+double zap_repl_slot_get_f64(int64_t i) {
+    zap_repl_slot_check(i);
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.i = zap_repl_slots[i];
+    return u.d;
+}
+void zap_repl_slot_set_f64(int64_t i, double v) {
+    zap_repl_slot_check(i);
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.d = v;
+    zap_repl_slots[i] = u.i;
+}
 void *zap_repl_slot_get_ptr(int64_t i) {
     zap_repl_slot_check(i);
     return (void *)zap_repl_slots[i];
