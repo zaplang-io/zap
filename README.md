@@ -69,6 +69,10 @@ make docker-test                          # full suite incl. LLVM codegen
 make docker-run FILE=tests/golden/fib.zap # compile + run a program  -> 55
 ```
 
+To **use** the toolchain (rather than hack on it) without building from source,
+pull the prebuilt image `ghcr.io/zaplang-io/zap` — handy as a CI `container:`
+for Zap package repos. See [`docs/DOCKER.md`](docs/DOCKER.md).
+
 ## Build performance: fast + memory-bounded (tickets #128, #123)
 
 A full LLVM codegen build is heavy — the link step is the RAM peak, and running
