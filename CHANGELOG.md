@@ -86,4 +86,4 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 - _Nothing yet. Security/soundness fixes are documented here and in
   `SECURITY.md` (STABILITY §3.3)._
 
-[Unreleased]: https://github.com/parveshgarg/zap/commits/main
+[Unreleased]: https://github.com/zaplang-io/zap/commits/main

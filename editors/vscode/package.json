@@ -7,7 +7,7 @@
   "license": "(MIT OR Apache-2.0)",
   "repository": {
     "type": "git",
-    "url": "https://github.com/parveshgarg/zap.git",
+    "url": "https://github.com/zaplang-io/zap.git",
     "directory": "editors/vscode"
   },
   "engines": {

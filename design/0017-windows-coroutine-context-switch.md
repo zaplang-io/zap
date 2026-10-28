@@ -3,7 +3,7 @@
 - **Author(s):** win-ctxswitch spike session (I#195)
 - **Last updated:** 2026-10-22
 - **Status:** Draft (spike / recommendation — not an implementation)
-- **Discussion:** https://github.com/parveshgarg/zap/issues/195
+- **Discussion:** https://github.com/zaplang-io/zap/issues/195
 - **Epic:** I#158 (platform/1.0), Area A1. See `design/0016-platform-1.0.md`.
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start

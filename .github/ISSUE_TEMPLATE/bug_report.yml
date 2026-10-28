@@ -6,8 +6,8 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting! Security problems go through [SECURITY.md](https://github.com/parveshgarg/zap/blob/main/SECURITY.md), **not** here.
-        Please check [DECISIONS.md](https://github.com/parveshgarg/zap/blob/main/DECISIONS.md) and existing issues first.
+        Thanks for reporting! Security problems go through [SECURITY.md](https://github.com/zaplang-io/zap/blob/main/SECURITY.md), **not** here.
+        Please check [DECISIONS.md](https://github.com/zaplang-io/zap/blob/main/DECISIONS.md) and existing issues first.
         Reference issues as `I#n` and PRs as `PR#n`.
   - type: textarea
     id: summary

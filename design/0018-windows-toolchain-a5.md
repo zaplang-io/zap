@@ -3,7 +3,7 @@
 - **Author(s):** win-toolchain session (I#199)
 - **Last updated:** 2026-10-22
 - **Status:** Draft (implementation — the toolchain half of A5)
-- **Discussion:** https://github.com/parveshgarg/zap/issues/199
+- **Discussion:** https://github.com/zaplang-io/zap/issues/199
 - **Epic:** I#158 (platform/1.0), Area A5. See `design/0016-platform-1.0.md`
   and the A1 spike `design/0017-windows-coroutine-context-switch.md`.
 

@@ -6,7 +6,7 @@
   2026-10-20): a plain codegen build (`--features zapc/llvm`, or `gc-immix`) links
   the precise Immix GC; Boehm is the opt-in fallback behind `--features
   zapc/gc-boehm`. All 5 forks were approved as recommended, including 4a.
-- **Discussion:** github.com/parveshgarg/zap#48
+- **Discussion:** github.com/zaplang-io/zap#48
 - **Supersedes the GC sections of:** `design/RUNTIME-ABI.md`, `design/0005-concurrency.md`
 
 ## Abstract

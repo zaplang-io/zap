@@ -8,7 +8,7 @@ body:
       value: |
         Zap's thesis: a language optimized to be **written by coding agents, read by humans, and executed by machines**.
         Proposals that make code more unambiguous to generate, nicer to read, or faster to run are the sweet spot.
-        Check [DECISIONS.md](https://github.com/parveshgarg/zap/blob/main/DECISIONS.md) and [OPEN-QUESTIONS.md](https://github.com/parveshgarg/zap/blob/main/OPEN-QUESTIONS.md) first: many questions are already settled.
+        Check [DECISIONS.md](https://github.com/zaplang-io/zap/blob/main/DECISIONS.md) and [OPEN-QUESTIONS.md](https://github.com/zaplang-io/zap/blob/main/OPEN-QUESTIONS.md) first: many questions are already settled.
         Reference issues as `I#n` and PRs as `PR#n`.
   - type: textarea
     id: problem

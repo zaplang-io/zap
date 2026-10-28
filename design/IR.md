@@ -3,7 +3,7 @@
 - **Author(s):** Zap team
 - **Last updated:** 2026-10-18
 - **Status:** Accepted (design) — implementation staged (refactor of `crates/codegen`)
-- **Discussion:** github.com/parveshgarg/zap#12
+- **Discussion:** github.com/zaplang-io/zap#12
 
 ## Abstract
 

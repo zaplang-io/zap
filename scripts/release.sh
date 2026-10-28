@@ -18,7 +18,7 @@
 #
 set -euo pipefail
 
-REPO_URL="https://github.com/parveshgarg/zap"
+REPO_URL="https://github.com/zaplang-io/zap"
 
 usage() {
   sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
