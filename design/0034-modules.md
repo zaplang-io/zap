@@ -4,8 +4,8 @@
 - **Last updated:** 2026-10-28
 - **Status:** Accepted
 - **Discussion:** zaplang-io/zap#283 (parent D-0028, D-0052, D-0011 §8)
-- **Implementation:** Stage A (intra-project local modules) landed; Stage B
-  (cross-package dependency imports via `zenv`) is the follow-up.
+- **Implementation:** Stage A (intra-project local modules) and Stage B
+  (cross-package dependency imports via `zenv`) are both implemented.
 
 > Formatting convention (from Go): wrap text near the 80-column mark and start
 > each sentence on a new line.

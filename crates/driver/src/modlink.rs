@@ -2,25 +2,33 @@
 //! (I#283, D-0081).
 //!
 //! Today the compiler reads a single entry file. This module turns the entry
-//! into a *program*: it discovers the local import graph, parses each module
-//! once, enforces the module rules (declaration-only non-entry modules,
-//! `_`-privacy, no import cycles), and **merges** the whole graph into one AST
-//! [`Module`] with module-qualified symbols — so the existing single-module
+//! into a *program*: it discovers the import graph, parses each module once,
+//! enforces the module rules (declaration-only non-entry modules, `_`-privacy,
+//! no import cycles), and **merges** the whole graph into one AST [`Module`]
+//! with module-qualified symbols — so the existing single-module
 //! lower → codegen → link path (and the AOT single-LLVM-module invariant, which
 //! keeps the D-0080 REPL/JIT internal-linkage behaviour out of scope) is reused
 //! unchanged.
 //!
-//! Stage A (this cut) resolves **intra-project local modules** only: a module
-//! `a` resolves to `<root>/a.zap` and `a.b` to `<root>/a/b.zap`, where `<root>`
-//! is the entry file's own directory. Cross-package (dependency) imports — the
-//! leading segment being a dependency logical name resolved through `zenv` — are
-//! Stage B and reuse this same loader (only root selection differs).
+//! Resolution (D-0081), by the import path's leading segment, in precedence
+//! order:
+//!   1. a compiler-known **stdlib** module (`math`, `os`, …) — left to the
+//!      existing built-in handling, never resolved to a file; `import python`
+//!      is untouched.
+//!   2. a **dependency** logical name — resolved through `zenv`: the package
+//!      lives at `<pkg_root>/<name>` and the module is `<pkg_root>/<name>/src/…`
+//!      (Stage B); the remaining path segments map inside the package's `src/`,
+//!      and a bare `import <name>` selects `src/<name>.zap`.
+//!   3. a **local** module — resolved relative to the *importing* file's own
+//!      package source root: `a` → `<root>/a.zap`, `a.b` → `<root>/a/b.zap`
+//!      (Stage A). For the entry file `<root>` is its own directory.
 //!
-//! Resolution precedence (D-0081): a leading segment that names a compiler-known
-//! stdlib module (`math`, `os`, …) is left to the existing built-in handling and
-//! never resolved to a file; `import python` is untouched.
+//! Module identity is per loaded file (not per dotted path), so two packages may
+//! each contain a module of the same path without colliding; mangle prefixes are
+//! keyed by the loaded-module index.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use zapc_diag::ErrorCode;
@@ -40,43 +48,34 @@ pub struct ModDiag {
     pub file: String,
 }
 
-/// The mangle prefix for a module's top-level symbols. The entry module keeps
-/// its original names (so `main` stays `main` and the single-file path is byte-
-/// identical); every imported module gets a reserved, collision-free prefix.
-fn mangle_prefix(sanitized: &str, is_entry: bool) -> String {
-    if is_entry {
-        String::new()
-    } else {
-        format!("__zm_{sanitized}__")
-    }
-}
-
-/// Turn a dotted module path into a prefix-safe token (`a.b` → `a_b`).
-fn sanitize(path: &str) -> String {
-    path.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
 /// A module after parsing + cfg resolution, before merging.
 struct SrcModule {
-    /// Dotted module path (`a`, `a.b`); `<entry>` for the entry module.
+    /// Dotted module path as written at the import that first loaded it
+    /// (`a`, `a.b`, a dependency's `<name>…`); `<entry>` for the entry module.
     path: String,
-    /// Mangle prefix for this module's top-level symbols.
+    /// Mangle prefix for this module's top-level symbols (empty for the entry).
     prefix: String,
     file: String,
+    /// The package source root this module lives in — the directory its own
+    /// sibling (`local`) imports resolve against. The entry's is its directory;
+    /// a dependency module's is `<pkg_root>/<name>/src`.
+    src_root: PathBuf,
     ast: Module,
     is_entry: bool,
-    /// `bound name -> module path` for each resolved local `import` in this file.
-    imports: Vec<ResolvedImport>,
 }
 
-struct ResolvedImport {
-    /// The name this import binds in the importing module (alias, else the
-    /// module path's last segment).
+/// One resolved `import` edge: the name it binds and the loaded-module index it
+/// points at.
+struct Edge {
     bound: String,
-    /// The target module's dotted path.
-    target_path: String,
+    target: usize,
+    span: Span,
+}
+
+/// A raw (unresolved) import scanned from a parsed module.
+struct RawImport {
+    bound: String,
+    path: String,
     span: Span,
 }
 
@@ -87,12 +86,23 @@ struct ModuleFacts {
     symbols: HashSet<String>,
 }
 
-/// Load the program rooted at `entry_path`: discover + parse the local import
-/// graph, enforce the module rules, and return the single merged, qualified
-/// [`Module`]. On any linker diagnostic, prints them and returns the diagnostics
-/// so the caller can fail the build.
+/// Load the program rooted at `entry_path`, resolving dependency imports through
+/// the active `zenv` search paths (D-0052). Returns the single merged, qualified
+/// [`Module`], or the linker diagnostics.
 pub fn load_program(entry_path: &str, target: &Target) -> Result<Module, Vec<ModDiag>> {
-    let mut loader = Loader::new(target);
+    let pkg_roots = zapc_pkg::zenv::module_search_paths_from_env();
+    load_program_with(entry_path, target, pkg_roots)
+}
+
+/// Like [`load_program`], but with explicit dependency package-search roots (each
+/// a directory containing `<name>/src/…`). Used by tests to avoid touching the
+/// process environment.
+pub fn load_program_with(
+    entry_path: &str,
+    target: &Target,
+    pkg_roots: Vec<PathBuf>,
+) -> Result<Module, Vec<ModDiag>> {
+    let mut loader = Loader::new(target, pkg_roots);
     let merged = loader.run(entry_path);
     if loader.diags.is_empty() {
         merged.ok_or_else(Vec::new)
@@ -103,60 +113,70 @@ pub fn load_program(entry_path: &str, target: &Target) -> Result<Module, Vec<Mod
 
 struct Loader<'t> {
     target: &'t Target,
-    /// Project source root — the entry file's directory. All Stage-A local
-    /// imports resolve under it.
-    root: PathBuf,
+    /// Dependency package-search roots (`$ZAP_ZENV/pkg`, …): a dependency
+    /// `<name>` is the directory `<root>/<name>`.
+    pkg_roots: Vec<PathBuf>,
     /// Canonical file path -> loaded module index, so each file loads once.
     loaded: HashMap<PathBuf, usize>,
     modules: Vec<SrcModule>,
+    /// Raw imports scanned from each module, parallel to `modules`.
+    raw: Vec<Vec<RawImport>>,
+    /// Resolved import edges per module, parallel to `modules`.
+    edges: Vec<Vec<Edge>>,
     diags: Vec<ModDiag>,
 }
 
 impl<'t> Loader<'t> {
-    fn new(target: &'t Target) -> Self {
+    fn new(target: &'t Target, pkg_roots: Vec<PathBuf>) -> Self {
         Loader {
             target,
-            root: PathBuf::new(),
+            pkg_roots,
             loaded: HashMap::new(),
             modules: Vec::new(),
+            raw: Vec::new(),
+            edges: Vec::new(),
             diags: Vec::new(),
         }
     }
 
     fn run(&mut self, entry_path: &str) -> Option<Module> {
         let entry = PathBuf::from(entry_path);
-        self.root = entry.parent().map(Path::to_path_buf).unwrap_or_default();
-        // Load the entry and, transitively, every local module it imports.
-        let entry_idx = self.load_file(&entry, "<entry>", true)?;
+        let root = entry.parent().map(Path::to_path_buf).unwrap_or_default();
+        let entry_idx = self.load_file(&entry, "<entry>", root, true)?;
+        // BFS the import graph, resolving each edge to a loaded-module index.
         let mut queue = vec![entry_idx];
         while let Some(idx) = queue.pop() {
-            // Clone the small import list to avoid holding a borrow of `self`.
-            let imports: Vec<(String, Span)> = self.modules[idx]
-                .imports
+            let importer_root = self.modules[idx].src_root.clone();
+            let raw: Vec<(String, String, Span)> = self.raw[idx]
                 .iter()
-                .map(|i| (i.target_path.clone(), i.span))
+                .map(|r| (r.bound.clone(), r.path.clone(), r.span))
                 .collect();
             let file = self.modules[idx].file.clone();
-            for (path, span) in imports {
-                let Some(target_file) = self.resolve_module_file(&path) else {
-                    self.diag(
-                        ErrorCode::ZAP3010,
-                        format!(
-                            "cannot find module `{path}` (looked for `{}`)",
-                            self.expected_rel(&path)
-                        ),
-                        span,
-                        &file,
-                    );
-                    continue;
+            for (bound, path, span) in raw {
+                let Some((target_file, dep_src_root)) =
+                    self.resolve_import(&importer_root, &path, span, &file)
+                else {
+                    continue; // diagnostic already pushed (or stdlib: skipped)
                 };
                 let canon = canonical(&target_file);
-                if self.loaded.contains_key(&canon) {
-                    continue;
-                }
-                if let Some(new_idx) = self.load_file(&target_file, &path, false) {
-                    queue.push(new_idx);
-                }
+                let tidx = match self.loaded.get(&canon) {
+                    Some(&i) => i,
+                    None => {
+                        let root = dep_src_root.unwrap_or_else(|| importer_root.clone());
+                        match self.load_file(&target_file, &path, root, false) {
+                            Some(i) => {
+                                queue.push(i);
+                                i
+                            }
+                            None => continue,
+                        }
+                    }
+                };
+                self.edges[idx].push(Edge {
+                    bound,
+                    target: tidx,
+                    span,
+                });
             }
         }
         if self.diags.is_empty() {
@@ -171,27 +191,74 @@ impl<'t> Loader<'t> {
         Some(self.merge())
     }
 
-    /// The path we expected a module to live at, for the "not found" message.
-    fn expected_rel(&self, path: &str) -> String {
-        let rel: PathBuf = path.split('.').collect::<PathBuf>();
-        self.root
-            .join(rel)
-            .with_extension("zap")
-            .display()
-            .to_string()
+    /// Resolve one import path from a module whose own package source root is
+    /// `importer_root`. Returns the target file and, when it is a dependency
+    /// module, that dependency's own source root. `None` means either a stdlib
+    /// import (skipped, no diagnostic) or an unresolved one (diagnostic pushed).
+    fn resolve_import(
+        &mut self,
+        importer_root: &Path,
+        path: &str,
+        span: Span,
+        file: &str,
+    ) -> Option<(PathBuf, Option<PathBuf>)> {
+        let first = path.split('.').next().unwrap_or(path);
+        // (1) stdlib — left to the built-in handling.
+        if zapc_sema::is_builtin_module(first) {
+            return None;
+        }
+        // (2) dependency package (D-0052): `<pkg_root>/<first>` is a directory.
+        for pkg_root in &self.pkg_roots {
+            let pkg_dir = pkg_root.join(first);
+            if !pkg_dir.is_dir() {
+                continue;
+            }
+            let dep_src = pkg_dir.join("src");
+            // The remaining segments map inside the package's `src/`; a bare
+            // `import <name>` selects `src/<name>.zap`.
+            let rest = path.strip_prefix(first).unwrap_or("");
+            let rest = rest.strip_prefix('.').unwrap_or(rest);
+            let within = if rest.is_empty() { first } else { rest };
+            let rel: PathBuf = within.split('.').collect();
+            let f = dep_src.join(rel).with_extension("zap");
+            if f.exists() {
+                return Some((f, Some(dep_src)));
+            }
+            self.diag(
+                ErrorCode::ZAP3010,
+                format!(
+                    "cannot find module `{path}` in dependency `{first}` (looked for `{}`)",
+                    f.display()
+                ),
+                span,
+                file,
+            );
+            return None;
+        }
+        // (3) local module relative to the importing file's package root.
+        let rel: PathBuf = path.split('.').collect();
+        let f = importer_root.join(&rel).with_extension("zap");
+        if f.exists() {
+            return Some((f, None));
+        }
+        self.diag(
+            ErrorCode::ZAP3010,
+            format!("cannot find module `{path}` (looked for `{}`)", f.display()),
+            span,
+            file,
+        );
+        None
     }
 
-    /// Resolve a dotted module path to a file under the project root, or `None`
-    /// if no such file exists. Stage A: local only.
-    fn resolve_module_file(&self, path: &str) -> Option<PathBuf> {
-        let rel: PathBuf = path.split('.').collect::<PathBuf>();
-        let file = self.root.join(rel).with_extension("zap");
-        file.exists().then_some(file)
-    }
-
-    /// Parse + cfg-resolve a file, record it, and return its module index.
-    /// Lex/parse errors are collected and reported.
-    fn load_file(&mut self, file: &Path, path: &str, is_entry: bool) -> Option<usize> {
+    /// Parse + cfg-resolve a file, record it (with its package source root), and
+    /// return its module index. Lex/parse errors are collected and reported.
+    fn load_file(
+        &mut self,
+        file: &Path,
+        path: &str,
+        src_root: PathBuf,
+        is_entry: bool,
+    ) -> Option<usize> {
         let canon = canonical(file);
         if let Some(&idx) = self.loaded.get(&canon) {
             return Some(idx);
@@ -223,61 +290,51 @@ impl<'t> Loader<'t> {
         if had_err {
             return None;
         }
-        let prefix = mangle_prefix(&sanitize(path), is_entry);
-        let imports = collect_imports(&ast);
         let idx = self.modules.len();
+        // Unique, collision-free prefix per loaded module (entry keeps names).
+        let prefix = if is_entry {
+            String::new()
+        } else {
+            format!("__zm{idx}_{}__", sanitize(path))
+        };
+        let raw = collect_imports(&ast);
         self.modules.push(SrcModule {
             path: path.to_string(),
             prefix,
             file: file_label,
+            src_root,
             ast,
             is_entry,
-            imports,
         });
+        self.raw.push(raw);
+        self.edges.push(Vec::new());
         self.loaded.insert(canon, idx);
         Some(idx)
     }
 
     /// Reject import cycles (D-0081): a DFS back-edge over the resolved graph.
-    /// The entry is index 0; every module is reachable from it by construction.
     fn detect_cycles(&mut self) {
         let n = self.modules.len();
-        // Precompute each module's out-edges (as module indices).
-        let by_path: HashMap<&str, usize> = self
-            .modules
+        let adj: Vec<Vec<usize>> = self
+            .edges
             .iter()
-            .enumerate()
-            .map(|(i, m)| (m.path.as_str(), i))
+            .map(|es| es.iter().map(|e| e.target).collect())
             .collect();
-        let edges: Vec<Vec<usize>> = self
-            .modules
-            .iter()
-            .map(|m| {
-                m.imports
-                    .iter()
-                    .filter_map(|i| by_path.get(i.target_path.as_str()).copied())
-                    .collect()
-            })
-            .collect();
-        // 0 = white (unvisited), 1 = gray (on the DFS stack), 2 = black (done).
-        let mut color = vec![0u8; n];
+        let mut color = vec![0u8; n]; // 0 white, 1 gray, 2 black
         let mut path: Vec<usize> = Vec::new();
         for start in 0..n {
             if color[start] == 0 {
-                if let Some(cycle) = dfs_cycle(start, &edges, &mut color, &mut path) {
+                if let Some(cycle) = dfs_cycle(start, &adj, &mut color, &mut path) {
                     let names: Vec<String> = cycle
                         .iter()
                         .map(|&i| self.modules[i].display_name())
                         .collect();
-                    // Attribute the diagnostic to the import edge that closed
-                    // the cycle (the last node importing the first).
                     let last = *cycle.last().unwrap();
                     let first = cycle[0];
-                    let (span, file) = self.modules[last]
-                        .imports
+                    let (span, file) = self.edges[last]
                         .iter()
-                        .find(|imp| by_path.get(imp.target_path.as_str()) == Some(&first))
-                        .map(|imp| (imp.span, self.modules[last].file.clone()))
+                        .find(|e| e.target == first)
+                        .map(|e| (e.span, self.modules[last].file.clone()))
                         .unwrap_or((Span::new(0, 0), self.modules[last].file.clone()));
                     self.diag(
                         ErrorCode::ZAP3011,
@@ -324,32 +381,21 @@ impl<'t> Loader<'t> {
     /// Qualify every module's symbols and references, then concatenate into one
     /// AST module.
     fn merge(&mut self) -> Module {
-        // Facts about every module, keyed by dotted path, for cross-module
-        // qualified-access resolution.
-        let facts: HashMap<String, ModuleFacts> = self
+        let facts: Vec<ModuleFacts> = self
             .modules
             .iter()
-            .map(|m| {
-                (
-                    m.path.clone(),
-                    ModuleFacts {
-                        prefix: m.prefix.clone(),
-                        symbols: top_level_symbols(&m.ast),
-                    },
-                )
+            .map(|m| ModuleFacts {
+                prefix: m.prefix.clone(),
+                symbols: top_level_symbols(&m.ast),
             })
             .collect();
 
         let mut items: Vec<Item> = Vec::new();
-        // Collect diagnostics from the per-module rewrite without borrowing
-        // `self.diags` across the module loop.
         let mut rw_diags: Vec<ModDiag> = Vec::new();
-        for m in &self.modules {
-            // `alias -> target facts` for this module's imports.
-            let aliases: HashMap<String, &ModuleFacts> = m
-                .imports
+        for (idx, m) in self.modules.iter().enumerate() {
+            let aliases: HashMap<String, &ModuleFacts> = self.edges[idx]
                 .iter()
-                .filter_map(|i| facts.get(&i.target_path).map(|f| (i.bound.clone(), f)))
+                .map(|e| (e.bound.clone(), &facts[e.target]))
                 .collect();
             let own = top_level_symbols(&m.ast);
             let mut rw = rewrite::Rewriter {
@@ -403,22 +449,56 @@ impl SrcModule {
     }
 }
 
-/// Resolve an import list of a parsed module into bound-name/target-path pairs,
-/// skipping `import python` and stdlib modules (left to the built-in handling).
-fn collect_imports(ast: &Module) -> Vec<ResolvedImport> {
+/// Turn a dotted module path into a prefix-safe token (`a.b` → `a_b`).
+fn sanitize(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Recursive DFS for cycle detection. Returns the nodes of a cycle (the gray
+/// node first, through to the node whose edge closed it) on the first back-edge,
+/// else `None`.
+fn dfs_cycle(
+    node: usize,
+    adj: &[Vec<usize>],
+    color: &mut [u8],
+    path: &mut Vec<usize>,
+) -> Option<Vec<usize>> {
+    color[node] = 1;
+    path.push(node);
+    for &next in &adj[node] {
+        match color[next] {
+            1 => {
+                let pos = path.iter().position(|&n| n == next).unwrap();
+                return Some(path[pos..].to_vec());
+            }
+            0 => {
+                if let Some(c) = dfs_cycle(next, adj, color, path) {
+                    return Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    path.pop();
+    color[node] = 2;
+    None
+}
+
+/// Scan a parsed module's `import` statements into raw (bound-name, path) pairs,
+/// skipping `import python`. Stdlib vs dependency vs local is decided later, at
+/// resolution time, since it depends on the importing module's package root.
+fn collect_imports(ast: &Module) -> Vec<RawImport> {
     let mut out = Vec::new();
     for item in &ast.items {
         if let Item::Import(Import::Module { path, alias, span }) = item {
-            let first = path.split('.').next().unwrap_or(path);
-            if zapc_sema::is_builtin_module(first) {
-                continue;
-            }
             let bound = alias
                 .clone()
                 .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path).to_string());
-            out.push(ResolvedImport {
+            out.push(RawImport {
                 bound,
-                target_path: path.clone(),
+                path: path.clone(),
                 span: *span,
             });
         }
@@ -450,37 +530,6 @@ fn top_level_symbols(ast: &Module) -> HashSet<String> {
         }
     }
     s
-}
-
-/// Recursive DFS for cycle detection. Returns the nodes of a cycle (the gray
-/// node first, through to the node whose edge closed it) on the first back-edge,
-/// else `None`.
-fn dfs_cycle(
-    node: usize,
-    edges: &[Vec<usize>],
-    color: &mut [u8],
-    path: &mut Vec<usize>,
-) -> Option<Vec<usize>> {
-    color[node] = 1; // gray
-    path.push(node);
-    for &next in &edges[node] {
-        match color[next] {
-            1 => {
-                // Back-edge: the cycle is path[pos(next)..].
-                let pos = path.iter().position(|&n| n == next).unwrap();
-                return Some(path[pos..].to_vec());
-            }
-            0 => {
-                if let Some(c) = dfs_cycle(next, edges, color, path) {
-                    return Some(c);
-                }
-            }
-            _ => {}
-        }
-    }
-    path.pop();
-    color[node] = 2; // black
-    None
 }
 
 /// Canonicalize a path for load-once identity, falling back to the lexical path
