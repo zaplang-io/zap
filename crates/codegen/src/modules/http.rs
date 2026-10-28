@@ -4,7 +4,9 @@
 //! optional `_h` request-header forms taking a `dict[str,str]` — #280) returns
 //! an opaque `ZapHttpResp` handle unpacked by `status`/`body`/`header`; the
 //! server (`read_request`) returns an opaque `ZapHttpReq` handle unpacked by
-//! `req_method`/`req_path`/`req_header`/`req_body`, and `respond` writes a reply.
+//! `req_method`/`req_path`/`req_header`/`req_body`, and `respond` writes a reply
+//! (with an optional `_h` form taking a `dict[str,str]` of response headers —
+//! #279).
 //! Handles flow as `ptr`, status as `int64`, URLs/headers/bodies as `str`.
 //! See the "net / http (#104)" section of `zaprt.c`.
 
@@ -49,4 +51,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_http_req_header", &[p.into(), p.into()], Some(p.into()));
     cg.declare_rt("zap_http_req_body", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_http_respond", &[p.into(), i.into(), p.into()], None);
+    cg.declare_rt(
+        "zap_http_respond_h",
+        &[p.into(), i.into(), p.into(), p.into()],
+        None,
+    );
 }

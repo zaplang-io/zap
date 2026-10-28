@@ -12157,24 +12157,84 @@ static const char *zap_http_reason(int64_t status) {
     }
 }
 
-/* http.respond(conn, status, body). Writes a minimal HTTP/1.1 response with
- * Content-Length, a text/plain content type, and Connection: close. */
-void zap_http_respond(void *c_, int64_t status, void *body_) {
+/* Response headers always computed by the server and never taken from the
+ * caller's map, so exactly one of each appears on the wire. Content-Type is
+ * NOT reserved: a caller entry overrides the text/plain default (mirrors the
+ * client's zap_http_hdr_managed, minus the request-only Host). */
+static int zap_http_resp_hdr_managed(const ZapStr *name) {
+    return zap_http_name_eq(name, "Content-Length") || zap_http_name_eq(name, "Connection");
+}
+
+/* Core of http.respond. Writes an HTTP/1.1 response: the status line, a
+ * server-managed Content-Length and Connection: close, a default
+ * Content-Type: text/plain unless the caller overrides it, then every live
+ * caller header (reserved names dropped). `headers_` is a ZapDict* (#279) or
+ * NULL for the bare three-arg form. Header names/values are copied out of the
+ * GC dict into the malloc buffer before any send, so the dict is only touched
+ * while it is still rooted by the caller's frame. */
+static void zap_http_respond_do(void *c_, int64_t status, void *body_, void *headers_) {
     ZapSock *c = (ZapSock *)c_;
     int fd = c->fd;
     void *pd = c->pd;
     const ZapStr *body = (const ZapStr *)body_;
+    const ZapDict *hdrs = (const ZapDict *)headers_;
     size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
-    size_t cap = blen + 256;
+
+    /* Size the buffer: status/Content-Length/Content-Type/Connection lines +
+     * body + the caller's header map (name + ": " + value + CRLF per entry). */
+    size_t hdrbytes = 0;
+    int caller_content_type = 0;
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            const ZapEntry *ent = &hdrs->entries[e];
+            if (ent->state != SLOT_FULL) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
+            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            if (zap_http_resp_hdr_managed(name)) {
+                continue;
+            }
+            if (zap_http_name_eq(name, "Content-Type")) {
+                caller_content_type = 1;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdrbytes += nl + vl + 4; /* ": " + "\r\n" */
+        }
+    }
+    size_t cap = blen + hdrbytes + 256;
     char *out = (char *)malloc(cap);
     if (!out) {
         zap_net_panic("http: out of memory");
         return;
     }
-    int hdr = snprintf(out, cap,
-                       "HTTP/1.1 %ld %s\r\nContent-Length: %zu\r\n"
-                       "Content-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n",
-                       (long)status, zap_http_reason(status), blen);
+    int hdr = snprintf(out, cap, "HTTP/1.1 %ld %s\r\nContent-Length: %zu\r\n", (long)status,
+                       zap_http_reason(status), blen);
+    if (!caller_content_type) {
+        hdr += snprintf(out + hdr, cap - (size_t)hdr,
+                        "Content-Type: text/plain; charset=utf-8\r\n");
+    }
+    hdr += snprintf(out + hdr, cap - (size_t)hdr, "Connection: close\r\n");
+    /* Caller-supplied headers, copied out of the GC dict into the buffer. */
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            const ZapEntry *ent = &hdrs->entries[e];
+            if (ent->state != SLOT_FULL) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
+            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            if (zap_http_resp_hdr_managed(name)) {
+                continue;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdr += snprintf(out + hdr, cap - (size_t)hdr, "%.*s: %.*s\r\n", (int)nl, name->data,
+                            (int)vl, val->data);
+        }
+    }
+    hdr += snprintf(out + hdr, cap - (size_t)hdr, "\r\n");
     if (blen > 0) {
         memcpy(out + hdr, body->data, blen);
     }
@@ -12183,6 +12243,19 @@ void zap_http_respond(void *c_, int64_t status, void *body_) {
     if (w < 0) {
         zap_net_panic("http: respond failed");
     }
+}
+
+/* http.respond(conn, status, body). Writes a minimal HTTP/1.1 response with
+ * Content-Length, a text/plain content type, and Connection: close. */
+void zap_http_respond(void *c_, int64_t status, void *body_) {
+    zap_http_respond_do(c_, status, body_, NULL);
+}
+
+/* http.respond(conn, status, body, headers) — the headers-bearing form (#279).
+ * `headers` is a dict[str,str] merged with the server-managed set: the caller
+ * may override Content-Type, Content-Length and Connection stay server-owned. */
+void zap_http_respond_h(void *c_, int64_t status, void *body_, void *headers_) {
+    zap_http_respond_do(c_, status, body_, headers_);
 }
 
 /* ===========================================================================
