@@ -901,6 +901,112 @@ void *zap_dict_get_fn_ptr(void *dp, void *k, void *hashfn, void *eqfn) {
     return (void *)(intptr_t)zap_dict_get(dp, (int64_t)(intptr_t)k, KEY_FN);
 }
 
+/* --- dict enumeration / membership / copy (ticket #299) ---------------------
+ * A dict is an open-addressing hash table with no insertion-order tracking, so
+ * enumeration order is unspecified (hash/probe order) — the same guarantee the
+ * json object-key walker documents (D-0059). The key/value word kind (int64 vs
+ * pointer) is known statically by codegen, which picks the matching entry
+ * point; keys/values are collected with the typed list push so the snapshot
+ * list's element tag is set and precise GC still traces pointer elements even
+ * if the source dict later dies. */
+
+/* Presence probe (distinct from `zap_dict_get`, whose 0 is ambiguous with a
+ * stored 0 word): report whether `key` has a live slot. */
+static int zap_dict_has(void *dp, int64_t key, int keykind) {
+    ZapDict *d = (ZapDict *)dp;
+    if (d->cap == 0) {
+        return 0;
+    }
+    uint64_t h = zap_key_hash(key, keykind, d->hashfn);
+    int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
+    while (d->entries[j].state != SLOT_EMPTY) {
+        if (d->entries[j].state == SLOT_FULL &&
+            zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
+            return 1;
+        }
+        j = (j + 1) & (d->cap - 1);
+    }
+    return 0;
+}
+
+void *zap_dict_keys_i64(void *dp) {
+    ZapDict *d = (ZapDict *)dp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->entries[i].state == SLOT_FULL) {
+            zap_list_push_i64(out, d->entries[i].key);
+        }
+    }
+    return out;
+}
+void *zap_dict_keys_ptr(void *dp) {
+    ZapDict *d = (ZapDict *)dp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->entries[i].state == SLOT_FULL) {
+            zap_list_push_ptr(out, (void *)(intptr_t)d->entries[i].key);
+        }
+    }
+    return out;
+}
+void *zap_dict_values_i64(void *dp) {
+    ZapDict *d = (ZapDict *)dp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->entries[i].state == SLOT_FULL) {
+            zap_list_push_i64(out, d->entries[i].val);
+        }
+    }
+    return out;
+}
+void *zap_dict_values_ptr(void *dp) {
+    ZapDict *d = (ZapDict *)dp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->entries[i].state == SLOT_FULL) {
+            zap_list_push_ptr(out, (void *)(intptr_t)d->entries[i].val);
+        }
+    }
+    return out;
+}
+int64_t zap_dict_contains_i64(void *d, int64_t k) {
+    return zap_dict_has(d, k, KEY_I64);
+}
+int64_t zap_dict_contains_str(void *d, void *k) {
+    return zap_dict_has(d, (int64_t)(intptr_t)k, KEY_STR);
+}
+int64_t zap_dict_contains_fn(void *dp, void *k, void *hashfn, void *eqfn) {
+    ZapDict *d = (ZapDict *)dp;
+    d->hashfn = hashfn;
+    d->eqfn = eqfn;
+    return zap_dict_has(dp, (int64_t)(intptr_t)k, KEY_FN);
+}
+
+/* Shallow copy: a fresh dict with the same entries. Key and value words are
+ * copied verbatim, so referenced objects (str/struct/nested collections) are
+ * shared, not cloned — letting a caller extend a map without mutating the
+ * original (e.g. default headers + per-call overrides). */
+void *zap_dict_copy(void *sp) {
+    ZapDict *s = (ZapDict *)sp;
+    ZapDict *d = (ZapDict *)zap_dict_new();
+    d->key_ptr = s->key_ptr;
+    d->val_ptr = s->val_ptr;
+    d->hashfn = s->hashfn;
+    d->eqfn = s->eqfn;
+    if (s->cap == 0) {
+        return d;
+    }
+    ZapEntry *ne =
+        (ZapEntry *)zap_ptrbuf(s->cap * (int64_t)sizeof(ZapEntry));
+    for (int64_t i = 0; i < s->cap; i++) {
+        ne[i] = s->entries[i];
+    }
+    d->entries = ne;
+    d->cap = s->cap;
+    d->len = s->len;
+    return d;
+}
+
 /* set[T]: a dict without values — open-addressing hash table of element words.
  * Shares the key hashing/equality above (RUNTIME-ABI: "dict and set can share
  * hashing"). Elements are uniform 8-byte words, like dict keys; the element

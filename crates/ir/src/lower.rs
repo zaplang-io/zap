@@ -5813,6 +5813,9 @@ impl<'a> FnLower<'a> {
                 if let Ty::Set(elem) = lty {
                     return self.lower_for_set(target, lst, elem, body);
                 }
+                if let Ty::Dict(kk, _vk) = lty {
+                    return self.lower_for_dict(target, lst, kk, body);
+                }
                 if let Ty::Heap(elem) = lty {
                     return self.lower_for_heap(target, lst, elem, body);
                 }
@@ -5842,8 +5845,9 @@ impl<'a> FnLower<'a> {
                     });
                 }
                 return Err(err(
-                    "only `for ... in range(...)`, `for ... in <list>`, `for ... in <set>`, and \
-                     `for ... in <user iterable>` are supported by codegen yet",
+                    "only `for ... in range(...)`, `for ... in <list>`, `for ... in <set>`, \
+                     `for ... in <dict>`, and `for ... in <user iterable>` are supported by \
+                     codegen yet",
                 ));
             }
         };
@@ -5916,21 +5920,30 @@ impl<'a> FnLower<'a> {
         elem: Elem,
         body: &ast::Block,
     ) -> Result<(), LowerError> {
-        let name = match target {
-            Expr::Name(n, _) => n.clone(),
+        // The loop target is a simple name, or a tuple destructured from a tuple
+        // element (`for k, v in d.items()`, ticket #299). A name binds once to a
+        // hoisted slot stored each iteration; a tuple rebinds its names from the
+        // element's fields inside the loop body.
+        match target {
+            Expr::Name(_, _) | Expr::Tuple(_, _) => {}
             _ => {
                 return Err(err(
                     "only a simple loop variable is supported by codegen yet",
                 ))
             }
-        };
+        }
 
         self.push_scope();
         let idx = self.alloca(Ty::I64);
         let zero = self.iconst(Ty::I64, 0);
         self.store(idx, zero);
-        let var = self.alloca(elem.ty());
-        self.declare(&name, var, elem.ty());
+        let single_var = if let Expr::Name(n, _) = target {
+            let var = self.alloca(elem.ty());
+            self.declare(n, var, elem.ty());
+            Some(var)
+        } else {
+            None
+        };
 
         let cond_bb = self.new_block();
         let body_bb = self.new_block();
@@ -5967,7 +5980,11 @@ impl<'a> FnLower<'a> {
             func: format!("zap_list_get_{}", elem.val_suffix()),
             args: vec![lst, i],
         });
-        self.store(var, e);
+        match target {
+            Expr::Name(_, _) => self.store(single_var.expect("name slot"), e),
+            Expr::Tuple(elems, _) => self.bind_tuple_loop_target(elems, e, elem.ty())?,
+            _ => unreachable!("validated above"),
+        }
         self.push_loop(incr_bb, end_bb);
         for st in &body.stmts {
             self.stmt(st)?;
@@ -5990,6 +6007,49 @@ impl<'a> FnLower<'a> {
 
         self.position(end_bb);
         self.pop_scope();
+        Ok(())
+    }
+
+    /// Bind a tuple loop target (`for k, v in ...`, ticket #299) to the current
+    /// element: the element must be a statically-known tuple of matching arity,
+    /// and each sub-target a simple name. Each name gets a fresh slot per
+    /// iteration carrying its field's value (and precise type).
+    fn bind_tuple_loop_target(
+        &mut self,
+        elems: &[Expr],
+        elem_val: Value,
+        elem_ty: Ty,
+    ) -> Result<(), LowerError> {
+        let Ty::Struct(sid) = elem_ty else {
+            return Err(err(
+                "a tuple loop target requires a tuple element (e.g. `for k, v in d.items()`)",
+            ));
+        };
+        let field_tys = self
+            .ctx
+            .tuples
+            .borrow()
+            .fields(sid)
+            .ok_or_else(|| err("a tuple loop target requires a tuple element"))?;
+        if elems.len() != field_tys.len() {
+            return Err(err(format!(
+                "tuple loop target expects {} variable(s), found {}",
+                field_tys.len(),
+                elems.len()
+            )));
+        }
+        for (idx, e) in elems.iter().enumerate() {
+            let Expr::Name(n, _) = e else {
+                return Err(err(
+                    "only simple names are supported in a tuple loop target",
+                ));
+            };
+            let fty = field_tys[idx];
+            let fv = self.field_get(elem_val, sid, idx as u32, fty);
+            let slot = self.alloca(fty);
+            self.store(slot, fv);
+            self.declare(n, slot, fty);
+        }
         Ok(())
     }
 
@@ -6095,6 +6155,25 @@ impl<'a> FnLower<'a> {
             args: vec![set_val],
         });
         self.lower_for_list(target, items, elem, body)
+    }
+
+    /// `for k in d` where `d : dict[K, V]` (ticket #299). Snapshots the dict's
+    /// keys into a fresh list (order unspecified — hash order) and iterates that
+    /// list, exactly like `set`. `for k, v in d.items()` is the key/value form.
+    fn lower_for_dict(
+        &mut self,
+        target: &Expr,
+        dict_val: Value,
+        key: Elem,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let keys = self.new_value(Ty::List(key));
+        self.emit(Inst::Call {
+            dest: Some(keys),
+            func: format!("zap_dict_keys_{}", key.val_suffix()),
+            args: vec![dict_val],
+        });
+        self.lower_for_list(target, keys, key, body)
     }
 
     /// `for x in <heap>` (D-0057): snapshot the heap into a list in priority
@@ -7012,6 +7091,9 @@ impl<'a> FnLower<'a> {
             }
             if let Ty::Set(elem) = bty {
                 return self.lower_set_method(recv, elem, name, args);
+            }
+            if let Ty::Dict(kk, vk) = bty {
+                return self.lower_dict_method(recv, kk, vk, name, args);
             }
             if let Ty::Heap(elem) = bty {
                 return self.lower_heap_method(recv, elem, name, args);
@@ -8154,6 +8236,163 @@ impl<'a> FnLower<'a> {
             }
             other => Err(err(format!("set has no method '{other}' (supported: add)"))),
         }
+    }
+
+    /// Lower a built-in `dict[K, V]` method call (ticket #299). All four take no
+    /// arguments: `keys()`/`values()` snapshot a `list`; `items()` builds a
+    /// `list[(K, V)]`; `copy()` makes a shallow dict copy. Sema has checked arity.
+    fn lower_dict_method(
+        &mut self,
+        recv: Value,
+        kk: Elem,
+        vk: Elem,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        if !args.is_empty() {
+            return Err(err(format!("dict.{name}() takes no arguments")));
+        }
+        match name {
+            "keys" => {
+                let list = self.new_value(Ty::List(kk));
+                self.emit(Inst::Call {
+                    dest: Some(list),
+                    func: format!("zap_dict_keys_{}", kk.val_suffix()),
+                    args: vec![recv],
+                });
+                Ok((list, Ty::List(kk)))
+            }
+            "values" => {
+                let list = self.new_value(Ty::List(vk));
+                self.emit(Inst::Call {
+                    dest: Some(list),
+                    func: format!("zap_dict_values_{}", vk.val_suffix()),
+                    args: vec![recv],
+                });
+                Ok((list, Ty::List(vk)))
+            }
+            "copy" => {
+                let d = self.new_value(Ty::Dict(kk, vk));
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_dict_copy".to_string(),
+                    args: vec![recv],
+                });
+                Ok((d, Ty::Dict(kk, vk)))
+            }
+            "items" => self.lower_dict_items(recv, kk, vk),
+            other => Err(err(format!(
+                "dict has no method '{other}' (supported: keys, values, items, copy)"
+            ))),
+        }
+    }
+
+    /// Lower `d.items()` to a `list[(K, V)]` (ticket #299): snapshot the keys,
+    /// then walk them building a `(key, value)` tuple per entry and pushing it.
+    /// The element list is a list of tuple pointers, so `for k, v in d.items()`
+    /// rides the ordinary list iterator + tuple-destructuring loop target.
+    fn lower_dict_items(
+        &mut self,
+        recv: Value,
+        kk: Elem,
+        vk: Elem,
+    ) -> Result<(Value, Ty), LowerError> {
+        let tuple_sid = self.ctx.tuples.borrow_mut().intern(vec![kk.ty(), vk.ty()]);
+        let out_elem = Elem::Struct(tuple_sid);
+        // keys snapshot, result list, and the struct-key function pointers.
+        let keys = self.new_value(Ty::List(kk));
+        self.emit(Inst::Call {
+            dest: Some(keys),
+            func: format!("zap_dict_keys_{}", kk.val_suffix()),
+            args: vec![recv],
+        });
+        let out = self.new_value(Ty::List(out_elem));
+        self.emit(Inst::Call {
+            dest: Some(out),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let kfns = self.key_fn_args(kk)?;
+        let get_fn = format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix());
+
+        // for i in 0..len(keys): out.push((keys[i], d[keys[i]]))
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![keys],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let key = self.new_value(kk.ty());
+        self.emit(Inst::Call {
+            dest: Some(key),
+            func: format!("zap_list_get_{}", kk.val_suffix()),
+            args: vec![keys, i],
+        });
+        let val = self.new_value(vk.ty());
+        let mut gargs = vec![recv, key];
+        gargs.extend_from_slice(&kfns);
+        self.emit(Inst::Call {
+            dest: Some(val),
+            func: get_fn,
+            args: gargs,
+        });
+        let tup = self.new_value(Ty::Struct(tuple_sid));
+        self.emit(Inst::StructNew {
+            dest: tup,
+            sid: tuple_sid,
+        });
+        self.emit(Inst::FieldSet {
+            base: tup,
+            sid: tuple_sid,
+            idx: 0,
+            val: key,
+        });
+        self.emit(Inst::FieldSet {
+            base: tup,
+            sid: tuple_sid,
+            idx: 1,
+            val,
+        });
+        self.emit(Inst::Call {
+            dest: None,
+            func: "zap_list_push_ptr".to_string(),
+            args: vec![out, tup],
+        });
+        let next = self.new_value(Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: i,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        Ok((out, Ty::List(out_elem)))
     }
 
     /// Lower `heap[T]()` / `heap[T](cmp="max")` (D-0057). The element kind is the
@@ -9343,6 +9582,33 @@ impl<'a> FnLower<'a> {
                 rhs: zero,
             });
             return Ok((d, Ty::I1));
+        }
+
+        // Key membership: `k in <dict>` -> `zap_dict_contains_*`, normalized to a
+        // bool (ticket #299). The key kind selects the entry point; a struct key
+        // passes its `__hash__`/`__eq__` as the trailing function pointers.
+        if matches!(op, In) {
+            if let Ty::Dict(kk, _vk) = rt {
+                let l = self.coerce(l, lt, kk.ty());
+                let kfns = self.key_fn_args(kk)?;
+                let word = self.new_value(Ty::I64);
+                let mut cargs = vec![r, l];
+                cargs.extend_from_slice(&kfns);
+                self.emit(Inst::Call {
+                    dest: Some(word),
+                    func: format!("zap_dict_contains_{}", kk.key_suffix()),
+                    args: cargs,
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: word,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
         }
 
         // Membership: `x in <set>` -> `zap_set_contains_*`, normalized to a bool.
