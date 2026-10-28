@@ -244,8 +244,10 @@ const BUILTINS: &[&str] = &[
     // driver to persist `let` values across entries, never written by users.
     "__repl_load_i64",
     "__repl_load_ptr",
+    "__repl_load_f64",
     "__repl_store_i64",
     "__repl_store_ptr",
+    "__repl_store_f64",
     // Internal netpoller integration-test hook (ticket #80). No public I/O
     // surface exists yet (sockets #79, signals #77), so this drives the
     // netpoller end-to-end from the runtime; removed/replaced when #79 lands.
@@ -3221,13 +3223,13 @@ impl Checker {
                 // users. A load yields `Unknown` so it coerces into the binding's
                 // declared type; a store is a statement (`Unit`). `Unknown` is
                 // universally assignable, so `<T> x = __repl_load_*(i)` checks.
-                "__repl_load_i64" | "__repl_load_ptr" => {
+                "__repl_load_i64" | "__repl_load_ptr" | "__repl_load_f64" => {
                     for a in args {
                         self.infer(&a.value);
                     }
                     return Ty::Unknown;
                 }
-                "__repl_store_i64" | "__repl_store_ptr" => {
+                "__repl_store_i64" | "__repl_store_ptr" | "__repl_store_f64" => {
                     for a in args {
                         self.infer(&a.value);
                     }

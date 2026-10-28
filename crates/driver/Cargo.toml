@@ -46,13 +46,19 @@ zapc_codegen = { path = "../codegen", optional = true, default-features = false 
 # Doctests (#234) redirect the process stdout fd around each JIT'd snippet to
 # capture what it prints; only needed on the codegen-gated doctest path.
 libc = { version = "0.2.169", optional = true }
+# Interactive `zap repl` line editing + persistent history (I#252). Only pulled
+# in on the codegen-gated REPL path; `default-features = false` keeps the
+# dependency footprint minimal (editing + file history, no fuzzy/derive/etc).
+rustyline = { version = "14.0", optional = true, default-features = false, features = [
+    "with-file-history",
+] }
 
 [features]
 # Internal: link the LLVM codegen backend. Both collector choices enable it, so
 # the driver keys its codegen paths on this (a plain `--features zapc/llvm`
 # build gets the default Immix collector; `gc-boehm` gets Boehm). The toolchain
 # still builds without LLVM when none of these are enabled.
-codegen = ["dep:zapc_codegen", "dep:libc"]
+codegen = ["dep:zapc_codegen", "dep:libc", "dep:rustyline"]
 # LLVM codegen with the default collector — the precise Immix GC (ticket #116,
 # D-0009). This is the default build; `--features zapc/llvm` now links Immix.
 llvm = ["codegen", "zapc_codegen/gc-immix"]
