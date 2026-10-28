@@ -43,6 +43,9 @@ fn lower(
         "path" => call_ret(lowerer, "zap_http_req_path", a, Ty::Ptr, false),
         "req_header" => call_ret(lowerer, "zap_http_req_header", a, Ty::Ptr, false),
         "req_body" => call_ret(lowerer, "zap_http_req_body", a, Ty::Ptr, false),
+        // respond — the headers-bearing form (one extra `dict[str,str]` arg,
+        // #279) lowers to the `_h` entry point; sema fixes the arities.
+        "respond" if a.len() == 4 => call_void(lowerer, "zap_http_respond_h", a, true),
         "respond" => call_void(lowerer, "zap_http_respond", a, true),
         _ => return Ok(None),
     }))

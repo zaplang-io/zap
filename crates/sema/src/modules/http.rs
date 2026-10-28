@@ -111,9 +111,11 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "http", method, args, 1, span);
             Ty::Str
         }
-        // http.respond(conn, status, body) -> unit
+        // http.respond(conn, status, body) / http.respond(conn, status, body,
+        // headers) -> unit. The optional trailing arg is a `dict[str,str]` of
+        // response headers written on the wire (#279).
         "respond" => {
-            expect_argc(checker, "http", method, args, 3, span);
+            expect_argc_or_headers(checker, method, args, 3, span);
             Ty::Unit
         }
         _ => return None,

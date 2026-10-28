@@ -4,7 +4,7 @@
 (`design/0016-platform-1.0.md`, Area D2). The 1.0 Stable set (§4.4) and the
 platform matrix (§7.3) are **ratified** by the #206 spec-freeze audit
 (D-0076, `design/0029-spec-freeze.md`).
-**Last updated:** 2026-10-27
+**Last updated:** 2026-10-28
 
 This document defines what the word **"stable"** means for Zap: the versioning
 scheme, what a version bump promises for each surface, how features move between
@@ -362,9 +362,10 @@ matching per-section tier; this table is the cross-surface source of truth.
 
 The `http` client verbs `get`/`post`/`request` gained an **optional trailing
 `dict[str, str]` of request headers** (#280) and already expose response
-`status`/`header`/`body` accessors; because `http` is **Experimental**, this is
-an additive surface change requiring no stability promise. Setting response
-headers on the server `http.respond` is the companion gap tracked in #279.
+`status`/`header`/`body` accessors, and the server-side `http.respond` gained
+the matching **optional trailing `dict[str, str]` of response headers** (#279);
+because `http` is **Experimental**, both are additive surface changes requiring
+no stability promise.
 
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**
 

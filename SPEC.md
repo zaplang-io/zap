@@ -835,9 +835,13 @@ transport-managed `Host`, `Content-Length` and `Connection` headers are always
 computed by the client and any same-named map entry is ignored (so the request
 carries exactly one). The response is an opaque handle read back with
 `http.status(resp) -> int64`, `http.header(resp, name) -> str` (case-insensitive,
-`""` when absent) and `http.body(resp) -> str`. Setting response headers from the
-server `http.respond` is the companion gap tracked in #279. `http` is
-**Experimental** (STABILITY.md §4.4).
+`""` when absent) and `http.body(resp) -> str`. The server-side `http.respond`
+(#104) likewise takes an **optional trailing `dict[str, str]` of response
+headers** — `http.respond(conn, status, body, headers)` (#279) — written on the
+wire; a caller-supplied `Content-Type` overrides the default `text/plain`, while
+the server-managed `Content-Length` and `Connection: close` are always computed
+and any same-named map entry is ignored. `http` is **Experimental**
+(STABILITY.md §4.4).
 
 **Official packages** via the package manager (`sqlite3`, `xml`, `email`, …).
 The concurrency model replaces Python threading/multiprocessing; the
