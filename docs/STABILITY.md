@@ -339,7 +339,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Control flow (incl. `do`/`while`, `match`); iteration protocol (D-0048) | **S** |
 | Functions/lambdas/generators; default/keyword/variadic args; comprehensions/slicing | **S** |
 | First-class function values + closures (D-0067) | **S** |
-| Exceptions; `with` / context managers (D-0069); modules/imports/visibility | **S** |
+| Exceptions; `with` / context managers (D-0069); modules/imports/visibility (D-0028/D-0081, `design/0034-modules.md`) | **S** |
 | Regex (D-0010); decorators & annotations core (D-0036) + `@derive(Json)` | **S** |
 | Generics incl. bounds (D-0064) | **S** |
 | Coroutines/channels/`select`/`scope:`/`spawn detached` (D-0031/0044/0045); sync primitives + `Atomic[T]` (D-0032/0066); `Optional[T]` (D-0065) | **S** |

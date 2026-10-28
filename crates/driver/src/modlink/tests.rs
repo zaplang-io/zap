@@ -1,0 +1,188 @@
+//! Unit tests for the module linker (I#283/D-0081). These build a temporary
+//! project tree on disk, run [`load_program`], and assert on the merged AST or
+//! the linker diagnostics — no LLVM needed.
+
+use super::*;
+use std::io::Write;
+
+/// A throwaway project directory under the OS temp dir, cleaned on drop.
+struct Project {
+    dir: PathBuf,
+}
+
+impl Project {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "zap-modlink-{tag}-{}-{}",
+            std::process::id(),
+            fastrand_u64()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Project { dir }
+    }
+
+    fn write(&self, rel: &str, src: &str) -> PathBuf {
+        let path = self.dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        path
+    }
+
+    fn entry(&self, rel: &str) -> String {
+        self.dir.join(rel).display().to_string()
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+// A tiny non-crypto pseudo-random for unique temp names (avoids a dep).
+fn fastrand_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}
+
+fn target() -> Target {
+    Target::host()
+}
+
+/// Collect every function name present in a merged module.
+fn fn_names(m: &Module) -> Vec<String> {
+    m.items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Function(f) => Some(f.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn single_file_no_imports_is_unchanged() {
+    let p = Project::new("single");
+    p.write("src/main.zap", "def main():\n    print(1)\n");
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert_eq!(fn_names(&m), vec!["main".to_string()]);
+}
+
+#[test]
+fn imported_function_is_mangled_and_call_rewritten() {
+    // The #283 repro: a.zap defines helper, main imports + calls it.
+    let p = Project::new("repro");
+    p.write("src/a.zap", "def helper() -> int64:\n    return 7\n");
+    p.write(
+        "src/main.zap",
+        "import a\n\ndef main():\n    print(a.helper())\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    let names = fn_names(&m);
+    // main keeps its name; helper is mangled under a's prefix.
+    assert!(names.contains(&"main".to_string()));
+    assert!(
+        names.iter().any(|n| n.contains("helper") && n != "helper"),
+        "helper should be mangled, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"helper".to_string()),
+        "the bare name must not survive: {names:?}"
+    );
+    // The call site now references the mangled symbol, not `a.helper`.
+    let mangled = names.iter().find(|n| n.contains("helper")).unwrap();
+    let main_fn = m
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Item::Function(f) if f.name == "main" => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    let body = format!("{main_fn:?}");
+    assert!(body.contains(mangled), "call not rewritten: {body}");
+}
+
+#[test]
+fn private_member_access_is_rejected() {
+    let p = Project::new("priv");
+    p.write("src/a.zap", "def _secret() -> int64:\n    return 1\n");
+    p.write(
+        "src/main.zap",
+        "import a\n\ndef main():\n    print(a._secret())\n",
+    );
+    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    assert!(
+        err.iter().any(|d| d.code == ErrorCode::ZAP3012),
+        "expected ZAP3012, got {:?}",
+        err.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn missing_module_is_reported() {
+    let p = Project::new("missing");
+    p.write("src/main.zap", "import nope\n\ndef main():\n    print(1)\n");
+    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3010));
+}
+
+#[test]
+fn circular_import_is_rejected() {
+    let p = Project::new("cycle");
+    p.write(
+        "src/a.zap",
+        "import b\n\ndef fa() -> int64:\n    return 1\n",
+    );
+    p.write(
+        "src/b.zap",
+        "import a\n\ndef fb() -> int64:\n    return 2\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import a\nimport b\n\ndef main():\n    print(a.fa())\n",
+    );
+    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    assert!(
+        err.iter().any(|d| d.code == ErrorCode::ZAP3011),
+        "expected ZAP3011, got {:?}",
+        err.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn top_level_statement_in_imported_module_is_rejected() {
+    let p = Project::new("declonly");
+    p.write(
+        "src/a.zap",
+        "print(1)\n\ndef helper() -> int64:\n    return 1\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import a\n\ndef main():\n    print(a.helper())\n",
+    );
+    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3014));
+}
+
+#[test]
+fn local_shadowing_an_import_is_not_treated_as_module_access() {
+    // A local variable named like the import: `a.foo` is a value attr, not a
+    // module access, so nothing is rewritten and no privacy error fires.
+    let p = Project::new("shadow");
+    p.write("src/a.zap", "def foo() -> int64:\n    return 1\n");
+    p.write(
+        "src/main.zap",
+        "import a\n\ndef main():\n    a = 3\n    print(a)\n",
+    );
+    // Links cleanly; `a` as a value is left alone (no ZAP3015 because it is a
+    // local, not a bare module name).
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+}

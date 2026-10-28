@@ -284,6 +284,30 @@ define_codes! {
     ZAP3003 = 3003 : "call to unknown function",
         "The called function is not defined or imported. Check the spelling or \
          add the definition/import.";
+    // Zap-to-Zap module & package imports (I#283, D-0081).
+    ZAP3010 = 3010 : "module not found",
+        "An `import` names a Zap module that could not be resolved to a file. A \
+         module `a` resolves to `<src>/a.zap` and `a.b` to `<src>/a/b.zap` \
+         (D-0081). Check the path and that the file exists.";
+    ZAP3011 = 3011 : "circular import",
+        "Two or more modules import each other, forming a cycle. v1 rejects \
+         import cycles (D-0081); break the cycle, e.g. by moving the shared \
+         declarations into a third module both import.";
+    ZAP3012 = 3012 : "access to a private module member",
+        "A name beginning with `_` is private to its defining module and cannot \
+         be accessed through an import (D-0028, enforced). Remove the leading \
+         underscore to export it, or access it only from within its module.";
+    ZAP3013 = 3013 : "no such public member in module",
+        "The imported module has no public top-level declaration with this name. \
+         Check the spelling, or that the declaration exists and is not private \
+         (a leading `_`).";
+    ZAP3014 = 3014 : "top-level statement in an imported module",
+        "Only the entry module runs top-level statements; an imported module is \
+         declaration-only (D-0081). Move executable code into a function the \
+         importer calls.";
+    ZAP3015 = 3015 : "module name used as a value",
+        "An imported module's name is not a value — use it only to qualify a \
+         member access (`m.item`), not on its own.";
 
     // ---- ZAP4xxx — type checking -------------------------------------------
     ZAP4001 = 4001 : "type mismatch in assignment",

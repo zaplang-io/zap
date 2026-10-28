@@ -17,6 +17,7 @@ use zapc_syntax::ast::Module;
 use zapc_syntax::cfg::Target;
 
 pub mod cli;
+mod modlink;
 // The JSON codec now lives in its own leaf crate (`zapc_json`, I#236) so the
 // lower-level `zapc_pkg` can share it; re-exported here as `crate::json` so the
 // MCP/LSP/playground call sites are unchanged.
@@ -30,14 +31,6 @@ pub mod testing;
 /// The toolchain version (shared by both binaries and `zap version`).
 pub const VERSION: &str = zapc_syntax::VERSION;
 
-/// Read a source file, printing a diagnostic to stderr on failure.
-fn read_source(file: &str) -> Result<String, ExitCode> {
-    std::fs::read_to_string(file).map_err(|e| {
-        eprintln!("zap: cannot read {file}: {e}");
-        ExitCode::from(1)
-    })
-}
-
 /// The build target `when target.*` conditional compilation is evaluated
 /// against (I#139, D-0079). In Phase 1 the architecture/OS come from the host
 /// the compiler runs on (Zap builds natively); compile-time features are taken
@@ -49,38 +42,31 @@ fn build_target(features: &[String]) -> Target {
     t
 }
 
-/// Run the front end, evaluating `when target.*` against `target` (I#139).
-fn front_end_for(file: &str, src: &str, target: &Target) -> Result<Module, ExitCode> {
-    let (mut module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
-    // Resolve compile-time conditional compilation *before* type-checking so
-    // dead arms are never checked against a target they were not written for
-    // (D-0079 "dead-arm skip").
-    zapc_syntax::cfg::resolve_cfg(&mut module, target);
-    let mut failed = false;
-    for e in &lerrs {
-        eprintln!(
-            "{file}: error[{}]: {} [{}..{}]",
-            e.code, e.message, e.span.start, e.span.end
-        );
-        failed = true;
-    }
-    for e in &perrs {
-        eprintln!(
-            "{file}: error[{}]: {} [{}..{}]",
-            e.code, e.message, e.span.start, e.span.end
-        );
-        failed = true;
-    }
-    if !failed {
-        for e in zapc_sema::check(&module) {
+/// Run the whole-program front end: discover and link the local module import
+/// graph (I#283/D-0081) into one merged, qualified module, then type-check it.
+/// A single file with no local imports links to just itself, so the single-file
+/// path is unchanged. `when target.*` is resolved per file inside the loader.
+fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
+    let module = match modlink::load_program(entry, target) {
+        Ok(m) => m,
+        Err(diags) => {
+            for d in &diags {
+                eprintln!(
+                    "{}: error[{}]: {} [{}..{}]",
+                    d.file, d.code, d.message, d.span.start, d.span.end
+                );
+            }
+            return Err(ExitCode::from(1));
+        }
+    };
+    let errs = zapc_sema::check(&module);
+    if !errs.is_empty() {
+        for e in &errs {
             eprintln!(
-                "{file}: error[{}]: {} [{}..{}]",
+                "{entry}: error[{}]: {} [{}..{}]",
                 e.code, e.message, e.span.start, e.span.end
             );
-            failed = true;
         }
-    }
-    if failed {
         return Err(ExitCode::from(1));
     }
     Ok(module)
@@ -95,11 +81,7 @@ pub fn emit_ir(file: &str) -> ExitCode {
 /// Like [`emit_ir`], but with compile-time `--target-feature`s for `when`
 /// evaluation (I#139).
 pub fn emit_ir_for(file: &str, features: &[String]) -> ExitCode {
-    let src = match read_source(file) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let mut module = match front_end_for(file, &src, &build_target(features)) {
+    let mut module = match front_end_program(file, &build_target(features)) {
         Ok(m) => m,
         Err(code) => return code,
     };
@@ -146,11 +128,7 @@ pub fn compile_for(
     run_after: bool,
     features: &[String],
 ) -> ExitCode {
-    let src = match read_source(file) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let mut module = match front_end_for(file, &src, &build_target(features)) {
+    let mut module = match front_end_program(file, &build_target(features)) {
         Ok(m) => m,
         Err(code) => return code,
     };

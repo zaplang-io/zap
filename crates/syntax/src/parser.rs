@@ -2347,22 +2347,33 @@ impl Parser {
                 span: self.span_from(start),
             };
         }
-        let name = match self.peek() {
+        let (mut name, dotted_ok) = match self.peek() {
             TokenKind::Keyword(k) if k.is_type() => {
                 let s = k.as_str().to_string();
                 self.bump();
-                s
+                (s, false)
             }
             TokenKind::Ident(n) => {
                 let s = n.clone();
                 self.bump();
-                s
+                (s, true)
             }
             _ => {
                 self.error_here(ErrorCode::ZAP2010, "expected a type");
-                "<error>".to_string()
+                ("<error>".to_string(), false)
             }
         };
+        // A module-qualified type name, `mod.Type` (I#283/D-0081): an identifier
+        // base may be followed by `.ident` segments. The qualifier is resolved to
+        // the imported module's type during module linking. Keyword types
+        // (`int64`, …) are never dotted.
+        if dotted_ok {
+            while self.is(&TokenKind::Dot) {
+                self.bump();
+                name.push('.');
+                name.push_str(&self.ident("type name"));
+            }
+        }
         let mut args = Vec::new();
         if self.eat(&TokenKind::LBracket) {
             if !self.is(&TokenKind::RBracket) {
