@@ -559,6 +559,27 @@ define_codes! {
         "A registry's `config.json` or a package index file could not be \
          fetched or parsed, or a requested version is absent from the index. \
          Check the index base URL and network access.";
+
+    // ---- `zap publish` write path (Experimental, D-0083; I#237) -----------
+    ZAP6106 = 6106 : "package version already published",
+        "`zap publish` refused to overwrite a `(name, version)` that the index \
+         already records. Published versions are immutable (D-0027 §4): bump \
+         the `[package].version` and publish again, or `yank` the old one.";
+    ZAP6107 = 6107 : "incomplete package for publish",
+        "`zap publish` requires a well-formed `[package]` table: a `name` that \
+         is a valid, non-reserved registry name and a `version` that parses as \
+         SemVer. Fix `zap.toml` and retry.";
+    ZAP6108 = 6108 : "registry publish target unavailable",
+        "`zap publish` can write to a static index served from a local path or \
+         `file://` URL, but the chosen target needs the hosted, authenticated \
+         write API (an `https://` index), which is not yet deployed (gated on \
+         the org move, D-0027 §5.2/§7). Publish to a local/`file://` index, or \
+         point `--index`/`ZAP_REGISTRY` at one.";
+    ZAP6109 = 6109 : "missing or invalid registry credentials",
+        "A registry operation needs an authentication token (`zap login`), or \
+         the stored token is empty/unreadable. Tokens live outside the repo in \
+         `$ZAP_CACHE/credentials` and are only consumed by the hosted write \
+         API; a local/`file://` index needs none.";
 }
 
 #[cfg(test)]
