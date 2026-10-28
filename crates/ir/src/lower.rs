@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use zapc_syntax::ast::{
     self, BinOp as AstBin, BindTarget, Expr, PatArg, Pattern, Stmt, UnOp as AstUn,
 };
+use zapc_syntax::fstring::{self, Align, FStringPart, FormatSpec};
 
 use crate::ir::*;
 // `LowerError` lives in `zapc_mono` with monomorphization (#129). Re-export it
@@ -3614,6 +3615,247 @@ impl<'a> FnLower<'a> {
         d
     }
 
+    // --- value <-> string conversions and f-strings (D-0025/D-0026) ---
+
+    /// Render a scalar/char/bool/str value to a `str` (the `str(x)` path).
+    /// f-string fields with no format spec share this exact lowering, so
+    /// `str(42)` and `f"{42}"` produce byte-identical output.
+    fn render_str(&mut self, v: Value, vt: Ty) -> Result<Value, LowerError> {
+        // `char` (an `i32`) renders its one-codepoint string; a plain `i64`
+        // renders decimal. int32/char share the `i32` representation, so an
+        // int32 renders as a character here too (format it as decimal via
+        // `str(int64(x))`); a full fix needs `char` threaded through the IR.
+        let (func, arg) = match vt {
+            Ty::Ptr => return Ok(v),
+            Ty::I32 => ("zap_char_to_str", v),
+            Ty::I1 => ("zap_bool_to_str", self.coerce(v, vt, Ty::I64)),
+            Ty::I8 | Ty::I16 | Ty::I64 => ("zap_i64_to_str", self.coerce(v, vt, Ty::I64)),
+            Ty::F32 | Ty::F64 => ("zap_f64_to_str", self.as_f64(v, vt)),
+            _ => return Err(err("cannot render this value as a string")),
+        };
+        let d = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(d),
+            func: func.to_string(),
+            args: vec![arg],
+        });
+        Ok(d)
+    }
+
+    /// Python-style truthiness: a number/char is falsey at zero, a str when
+    /// empty, a bool is itself.
+    fn value_to_bool(&mut self, v: Value, vt: Ty) -> Result<Value, LowerError> {
+        match vt {
+            Ty::I1 => Ok(v),
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => {
+                let z = self.iconst(vt, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: v,
+                    rhs: z,
+                });
+                Ok(d)
+            }
+            Ty::F32 | Ty::F64 => {
+                let fv = self.as_f64(v, vt);
+                let z = self.fconst(Ty::F64, 0.0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::FCmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: fv,
+                    rhs: z,
+                });
+                Ok(d)
+            }
+            Ty::Ptr => {
+                // Non-empty string is truthy: compare its byte length to 0.
+                let len = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_str_len".to_string(),
+                    args: vec![v],
+                });
+                let z = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: CmpPred::Ne,
+                    lhs: len,
+                    rhs: z,
+                });
+                Ok(d)
+            }
+            _ => Err(err("bool() expects a str, char, number or bool")),
+        }
+    }
+
+    /// Lower an f-string (D-0026) into a left-folded `zap_str_concat` of its
+    /// literal runs and formatted fields. The split and spec parsing are shared
+    /// with the type checker via `zapc_syntax::fstring`.
+    fn lower_fstring(
+        &mut self,
+        value: &str,
+        raw: bool,
+        span_start: u32,
+    ) -> Result<(Value, Ty), LowerError> {
+        let base = span_start.saturating_add(2);
+        let (parts, errors) = fstring::split_fstring(value, base);
+        if let Some(e) = errors.into_iter().next() {
+            // sema already reported these with proper spans; this is defensive.
+            return Err(err(e.message));
+        }
+        let mut acc: Option<Value> = None;
+        for part in &parts {
+            let piece = match part {
+                FStringPart::Text(t) => {
+                    let data = if raw {
+                        t.clone().into_bytes()
+                    } else {
+                        unescape(t)
+                    };
+                    let d = self.new_value(Ty::Ptr);
+                    self.emit(Inst::StrConst {
+                        dest: d,
+                        bytes: data,
+                    });
+                    d
+                }
+                FStringPart::Field { expr, spec, .. } => {
+                    let (v, vt) = self.expr(expr)?;
+                    match spec {
+                        None => self.render_str(v, vt)?,
+                        Some(fs) => self.format_value(v, vt, fs)?,
+                    }
+                }
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(prev) => {
+                    let d = self.new_value(Ty::Ptr);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_str_concat".to_string(),
+                        args: vec![prev, piece],
+                    });
+                    d
+                }
+            });
+        }
+        let result = match acc {
+            Some(v) => v,
+            None => {
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrConst {
+                    dest: d,
+                    bytes: Vec::new(),
+                });
+                d
+            }
+        };
+        Ok((result, Ty::Ptr))
+    }
+
+    /// Render a value through a format spec (D-0026). Dispatches to the runtime
+    /// `zap_fmt_int`/`zap_fmt_flt`/`zap_fmt_str` with the spec decomposed into
+    /// integer constants.
+    fn format_value(&mut self, v: Value, vt: Ty, spec: &FormatSpec) -> Result<Value, LowerError> {
+        let align_code = match spec.align {
+            Some(Align::Left) => '<' as i64,
+            Some(Align::Right) => '>' as i64,
+            Some(Align::Center) => '^' as i64,
+            Some(Align::SignAware) => '=' as i64,
+            None => 0,
+        };
+        let sign_code = match spec.sign {
+            '+' => 1,
+            ' ' => 2,
+            _ => 0,
+        };
+        let fill_code = spec.fill as i64;
+        let width = spec.width.map(|w| w as i64).unwrap_or(-1);
+        let prec = spec.precision.map(|p| p as i64).unwrap_or(-1);
+
+        // Choose the rendering family: an explicit type wins; otherwise the
+        // value's own kind decides (int/float numeric, char/bool/str textual).
+        let want_int = match spec.ty {
+            Some(t) if FormatSpec::is_int_type(t) => true,
+            Some(t) if FormatSpec::is_float_type(t) || t == 's' => false,
+            _ => matches!(vt, Ty::I8 | Ty::I16 | Ty::I64),
+        };
+        let want_flt = match spec.ty {
+            Some(t) if FormatSpec::is_float_type(t) => true,
+            Some(_) => false,
+            None => matches!(vt, Ty::F32 | Ty::F64),
+        };
+
+        if want_int {
+            let (base, upper) = match spec.ty {
+                Some('b') => (2, 0),
+                Some('o') => (8, 0),
+                Some('x') => (16, 0),
+                Some('X') => (16, 1),
+                _ => (10, 0),
+            };
+            let iv = self.coerce(v, vt, Ty::I64);
+            let b = self.iconst(Ty::I64, base);
+            let up = self.iconst(Ty::I64, upper);
+            let alt = self.iconst(Ty::I64, spec.alt as i64);
+            let sign = self.iconst(Ty::I64, sign_code);
+            let w = self.iconst(Ty::I64, width);
+            let fill = self.iconst(Ty::I64, fill_code);
+            let al = self.iconst(Ty::I64, align_code);
+            let zero = self.iconst(Ty::I64, spec.zero as i64);
+            let d = self.new_value(Ty::Ptr);
+            self.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_fmt_int".to_string(),
+                args: vec![iv, b, up, alt, sign, w, fill, al, zero],
+            });
+            return Ok(d);
+        }
+
+        if want_flt {
+            let ftype = match spec.ty {
+                Some('e') => 'e' as i64,
+                Some('E') => 'E' as i64,
+                Some('f') | Some('F') => 'f' as i64,
+                _ => 'g' as i64, // 'g'/'G'/none default to compact
+            };
+            let fv = self.as_f64(v, vt);
+            let ft = self.iconst(Ty::I64, ftype);
+            let sign = self.iconst(Ty::I64, sign_code);
+            let w = self.iconst(Ty::I64, width);
+            let p = self.iconst(Ty::I64, prec);
+            let fill = self.iconst(Ty::I64, fill_code);
+            let al = self.iconst(Ty::I64, align_code);
+            let zero = self.iconst(Ty::I64, spec.zero as i64);
+            let d = self.new_value(Ty::Ptr);
+            self.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_fmt_flt".to_string(),
+                args: vec![fv, ft, sign, w, p, fill, al, zero],
+            });
+            return Ok(d);
+        }
+
+        // Textual: render char/bool/str to a string, then pad/truncate.
+        let s = self.render_str(v, vt)?;
+        let w = self.iconst(Ty::I64, width);
+        let p = self.iconst(Ty::I64, prec);
+        let fill = self.iconst(Ty::I64, fill_code);
+        let al = self.iconst(Ty::I64, align_code);
+        let d = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(d),
+            func: "zap_fmt_str".to_string(),
+            args: vec![s, w, p, fill, al],
+        });
+        Ok(d)
+    }
+
     // --- decorators & reflection (ticket #16, D-0036) ---
     //
     // This section is self-contained: it builds a string constant object, emits
@@ -5789,10 +6031,10 @@ impl<'a> FnLower<'a> {
                 raw,
                 bytes,
                 fstring,
-                ..
+                span,
             } => {
                 if *fstring {
-                    return Err(err("f-strings are not supported by codegen yet"));
+                    return self.lower_fstring(value, *raw, span.start);
                 }
                 let data = if *raw {
                     value.clone().into_bytes()
@@ -6435,21 +6677,7 @@ impl<'a> FnLower<'a> {
                     return Err(err("str() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
-                let (func, arg) = match vt {
-                    Ty::Ptr => return Ok((v, Ty::Ptr)),
-                    Ty::I32 => ("zap_char_to_str", v),
-                    Ty::I1 => ("zap_bool_to_str", self.coerce(v, vt, Ty::I64)),
-                    Ty::I64 => ("zap_i64_to_str", v),
-                    Ty::F32 | Ty::F64 => ("zap_f64_to_str", self.as_f64(v, vt)),
-                    _ => return Err(err("str() expects a str, char, int, float, or bool")),
-                };
-                let d = self.new_value(Ty::Ptr);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: func.to_string(),
-                    args: vec![arg],
-                });
-                return Ok((d, Ty::Ptr));
+                return Ok((self.render_str(v, vt)?, Ty::Ptr));
             }
             if fname == "int" {
                 // int(x): parse a `str` to an `int`, or convert a number to int.
@@ -6467,6 +6695,52 @@ impl<'a> FnLower<'a> {
                     return Ok((d, Ty::I64));
                 }
                 return Ok((self.convert(v, vt, Ty::I64), Ty::I64));
+            }
+            if fname == "float" {
+                // float(x): parse a `str` to a float, or convert a number/bool.
+                if args.len() != 1 {
+                    return Err(err("float() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                if vt == Ty::Ptr {
+                    let d = self.new_value(Ty::F64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_str_parse_float".to_string(),
+                        args: vec![v],
+                    });
+                    return Ok((d, Ty::F64));
+                }
+                return Ok((self.as_f64(v, vt), Ty::F64));
+            }
+            if fname == "bool" {
+                // bool(x): Python-style truthiness to an `i1` (#285).
+                if args.len() != 1 {
+                    return Err(err("bool() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                return Ok((self.value_to_bool(v, vt)?, Ty::I1));
+            }
+            if fname == "format" {
+                // format(value, "spec"): render per the format mini-language
+                // (D-0026). The spec is a compile-time string literal in v1
+                // (sema enforces), so it lowers to the same formatter f-string
+                // fields use.
+                if args.len() != 2 {
+                    return Err(err("format() takes exactly two arguments"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                let Expr::Str {
+                    value,
+                    fstring: false,
+                    ..
+                } = &args[1].value
+                else {
+                    return Err(err("format() spec must be a string literal"));
+                };
+                let spec = fstring::parse_format_spec(value)
+                    .map_err(|m| err(format!("invalid format spec: {m}")))?;
+                return Ok((self.format_value(v, vt, &spec)?, Ty::Ptr));
             }
             // Explicit numeric conversion: `int32(x)`, `float64(x)`, ... (D-0020).
             // These are the way to narrow or cross the int/float boundary, which

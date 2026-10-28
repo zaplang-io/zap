@@ -333,6 +333,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 |---|---|
 | Lexical structure/literals; declarations + `const`; scalars + conversions | **S** |
 | `str`/`bytes` + interpolation; codepoint indexing/slicing/iteration + comparison + methods (`upper`/`lower`/`strip`/`split`/`join`/`find`/`index`/`replace`/`startswith`/`endswith`/`contains`/`encode`) + `ord`/`chr`/`char`/`str`/`int` (#284; additive to the Stable `str` type, ASCII-only case folding in v1) | **S** |
+| f-string codegen + the format mini-language (`{expr}`, `{expr:spec}`, D-0026) + the `str`/`int`/`float`/`bool`/`format` conversion builtins (#285/#282; additive; `!r`/`!a` conversions and user-type rendering deferred to the Display protocol #274) | **S** |
 | `list`/`dict`/tuples + value/reference semantics | **S** |
 | Structs + methods + `value struct`; interfaces; enums tier-1 **and** tier-3 sum types (D-0046) | **S** |
 | Operators + overloading + `@derive(Eq, Ord, Hash, Repr)` (in-place `__iadd__`-family **not-yet**) | **S** |
@@ -351,7 +352,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 
 | Surface | Tier |
 |---|---|
-| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`, `ord`/`chr`/`char`/`str`/`int` #284) | **S** |
+| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`, `ord`/`chr`/`char`/`str`/`int` #284, `float`/`bool`/`format` #285) | **S** |
 | `io`, `fs`, `os`, `sys`, `process`, `math`, `random`, `time`, `datetime` (incl. `strftime` / 2-arg `format` custom formatting, #286) | **S** |
 | `collections` extras (`deque`, `bisect`, `oset`); `sync`; `json`; `logging`; `argparse` | **S** |
 | `signal`/`gc`/`runtime` — the **API** (`signal.notify`, `gc.collect/stats`, `runtime.coroutine_dump`) | **S** |

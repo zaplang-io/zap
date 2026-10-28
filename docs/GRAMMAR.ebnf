@@ -352,6 +352,12 @@ dotted_name   ::= IDENT { "." IDENT } ;
    FLOAT      3.14 | .5 | 1. | 1e10 | 1.5e-3
    IMAGINARY  <int|float> "j"
    STRING     '...' | "..." | '''...''' | """...""" with r/b/f (+rb/rf) prefixes
+   F_FIELD    inside an f-string (f"...") the content splits into text and
+              replacement fields "{" expr [ "!" ("r"|"s"|"a") ] [ ":" spec ] "}"
+              ("{{"/"}}" are literal braces); the field expr is a full Zap
+              expression, parsed and type-checked like any other (#285, D-0026).
+              spec = [[fill]align][sign]["#"]["0"][width]["." precision][type]
+              (Python format mini-language subset; see SPEC §9.3).
    TYPE_KEYWORD  int32 int64 float32 float64 i32 i64 f32 f64 bool char str
                  bytes bigint complex list dict set heap array
    DELIM      a regex delimiter char after m/s (e.g. "/", "{", "!")

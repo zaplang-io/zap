@@ -436,7 +436,22 @@ if "World" in s:         # substring membership
 `char` is a Unicode scalar (an `i32`). Conversions: `ord(c)` → codepoint `int`;
 `chr(n)` / `char(n)` → the `char` for codepoint `n` (a non-scalar `n` is a
 `ValueError`); `str(c)` → the one-codepoint string; `str(n)`/`str(x)` renders an
-int, float, bool, char or str; `int(s)` parses a decimal integer from a string.
+int, float, bool, char or str.
+
+Value ⇄ string conversion builtins (#285/#282, D-0026):
+
+| Builtin | Result | Notes |
+|---|---|---|
+| `str(x)` | `str` | renders an int/float/bool/char/str (user types → Display protocol, #274) |
+| `int(s)` | `int64` | parses a decimal integer; faults on a malformed string |
+| `float(s)` | `float64` | parses a float; faults on a malformed string (also converts a number/bool) |
+| `bool(x)` | `bool` | Python truthiness: a number/char is false at zero, a str false when empty, a bool is itself |
+| `format(x, spec)` | `str` | renders `x` through the format spec (§9.3); `spec` is a string literal in v1 |
+
+`int(x)` also converts a number to `int64`; `float(x)` converts a number/bool
+to `float64`. `int`/`float` are the string-**parsing** conversions; the
+width-specific numeric casts (`int32`/`int64`/`float32`/`float64`, D-0020) do
+not parse strings.
 
 > `len(s)` currently returns the **byte** length (it equals the codepoint count
 > for ASCII). A codepoint-based `len(str)` is pending the `str`/`bytes`
@@ -458,14 +473,42 @@ String operations are **methods on `str`** (there is no `strings` module):
 | `s.startswith(p)` / `s.endswith(p)` / `s.contains(sub)` | `bool` | |
 | `s.encode()` | `list[int]` | UTF-8 byte values |
 
-### 9.3 Interpolation
+### 9.3 Interpolation (f-strings, #285/D-0026)
 
-f-strings (D-0026):
+An f-string `f"...{expr[!conv][:spec]}..."` interpolates expressions. Each
+replacement field holds a full Zap expression; `{{` and `}}` are literal
+braces. A field with no spec renders via `str(expr)` (so `str(n)` and `f"{n}"`
+produce byte-identical text), and a field with a `:spec` renders via
+`format(expr, "spec")`. An f-string lowers to the concatenation of its literal
+runs and formatted fields.
 
 ```python
 auto n = 5
+auto x = 3.14159
 print(f"there are {n} items ({n*2} halves)")
+print(f"{n:04d} {n:#x}")        # 0005 0x5
+print(f"{x:.2f}")               # 3.14
+print(f"%{255:02X}")            # %FF   (byte -> percent-encoding, SigV4)
 ```
+
+**Format mini-language** (`spec`, a subset of Python's): `[[fill]align][sign]["#"]["0"][width]["." precision][type]`.
+
+| Field | Meaning |
+|---|---|
+| `fill`+`align` | `<` left, `>` right, `^` center, `=` pad after the sign; `fill` is any char |
+| `sign` | `+` always, `-` negatives only (default), space for a leading space on non-negatives |
+| `#` | alternate form — `0b`/`0o`/`0x` prefix on int types |
+| `0` | zero-pad to `width` (sign-aware) |
+| `width` | minimum field width (counted in bytes; exact for ASCII) |
+| `.precision` | float decimal places, or a string truncation length (codepoints) |
+| `type` | int `b`/`o`/`x`/`X`/`d`, float `e`/`E`/`f`/`F`/`g`/`G`, string `s` |
+
+v1 limitations (documented): the `!r`/`!a` conversions (only `!s` is accepted)
+and user-type rendering need the Display protocol (#274); a field cannot contain
+a string delimited by the same quote as the f-string (use the other quote);
+nested `{...}` inside a spec, and non-ASCII `fill` characters, are not supported;
+`format`'s spec must be a string literal. A malformed field is `ZAP2017`; an
+invalid spec is `ZAP4026`.
 
 ## 10. Errors & exceptions (D-0007, D-0029)
 

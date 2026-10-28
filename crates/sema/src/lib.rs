@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use zapc_diag::ErrorCode;
 use zapc_syntax::ast::*;
+use zapc_syntax::fstring::{self, FStringPart, FormatSpec};
 use zapc_syntax::genanalysis;
 use zapc_syntax::span::Span;
 
@@ -243,6 +244,9 @@ const BUILTINS: &[&str] = &[
     "char",
     "str",
     "int",
+    "float",
+    "bool",
+    "format",
     "reflect_has",
     "reflect_names",
     "checkpoint",
@@ -2345,12 +2349,107 @@ impl Checker {
         ty
     }
 
+    /// Type-check an f-string literal (D-0026). Each `{expr[!conv][:spec]}`
+    /// field is split out, its expression type-checked like any other, and its
+    /// conversion/format-spec validated against that type. The literal itself
+    /// is a `str`. Errors inside a field land at the field's source location
+    /// (best-effort span inside the literal).
+    fn check_fstring(&mut self, value: &str, span: Span) -> Ty {
+        // The literal's content begins after the one-char `f` prefix and the
+        // opening quote; triple/raw-prefixed f-strings shift this by a little,
+        // which only nudges field diagnostics within the literal.
+        let base = span.start.saturating_add(2);
+        let (parts, errors) = fstring::split_fstring(value, base);
+        for e in errors {
+            self.error(e.code, e.message, e.span);
+        }
+        for part in &parts {
+            if let FStringPart::Field {
+                expr,
+                conv,
+                spec,
+                field_span,
+                ..
+            } = part
+            {
+                let ty = self.infer(expr);
+                self.check_renderable(&ty, *field_span);
+                if matches!(conv, Some('r') | Some('a')) {
+                    self.error(
+                        ErrorCode::ZAP4026,
+                        "the '!r'/'!a' conversions require the Display protocol (#274); \
+                         only '!s' is supported in v1"
+                            .to_string(),
+                        *field_span,
+                    );
+                }
+                if let Some(fs) = spec {
+                    self.check_spec_type(fs, &ty, *field_span);
+                }
+            }
+        }
+        Ty::Str
+    }
+
+    /// A value is renderable to text (via `str()` / an f-string field) when it
+    /// is a scalar, char, bool or string. General user-type rendering is the
+    /// Display protocol (#274), out of scope here.
+    fn check_renderable(&mut self, ty: &Ty, span: Span) {
+        if !matches!(ty, Ty::Str | Ty::Char | Ty::Bool | Ty::Unknown | Ty::Py) && !ty.is_numeric() {
+            self.error(
+                ErrorCode::ZAP4024,
+                format!(
+                    "cannot render {} in an f-string: only str, char, int, float \
+                     and bool are supported (user types need the Display protocol, #274)",
+                    ty.display()
+                ),
+                span,
+            );
+        }
+    }
+
+    /// Validate a format spec's presentation type against the value type.
+    fn check_spec_type(&mut self, spec: &FormatSpec, ty: &Ty, span: Span) {
+        let Some(t) = spec.ty else { return };
+        if matches!(ty, Ty::Unknown | Ty::Py) {
+            return;
+        }
+        let ok = if FormatSpec::is_int_type(t) {
+            // Integer presentation accepts integers, chars and bools.
+            ty.is_int() || matches!(ty, Ty::Char | Ty::Bool)
+        } else if FormatSpec::is_float_type(t) {
+            ty.is_numeric()
+        } else {
+            // 's' — strings only.
+            matches!(ty, Ty::Str)
+        };
+        if !ok {
+            self.error(
+                ErrorCode::ZAP4026,
+                format!(
+                    "format type '{t}' is not valid for a value of type {}",
+                    ty.display()
+                ),
+                span,
+            );
+        }
+    }
+
     fn infer_inner(&mut self, e: &Expr) -> Ty {
         match e {
             Expr::Int(..) => Ty::UntypedInt,
             Expr::Float(..) => Ty::UntypedFloat,
             Expr::Imaginary(..) => Ty::Complex,
-            Expr::Str { bytes, .. } => {
+            Expr::Str {
+                bytes,
+                fstring,
+                value,
+                span,
+                ..
+            } => {
+                if *fstring {
+                    return self.check_fstring(value, *span);
+                }
                 if *bytes {
                     Ty::Bytes
                 } else {
@@ -3355,6 +3454,104 @@ impl Checker {
                         }
                     }
                     return Ty::Int64;
+                }
+                "float" => {
+                    // float(x): parse a `str`, or convert a number/bool, to a
+                    // float (#282/#285). Distinct from `float64(x)`, which only
+                    // converts numbers (it does not parse strings).
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "float() takes exactly one argument".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !matches!(at, Ty::Str | Ty::Bool | Ty::Unknown | Ty::Py)
+                            && !at.is_numeric()
+                        {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("float() expects a str or number, found {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Float64;
+                }
+                "bool" => {
+                    // bool(x): Python-style truthiness (#285). A number/char is
+                    // falsey when zero, a str when empty, a bool is itself.
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "bool() takes exactly one argument".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !matches!(at, Ty::Str | Ty::Char | Ty::Bool | Ty::Unknown | Ty::Py)
+                            && !at.is_numeric()
+                        {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "bool() expects a str, char, number or bool, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Bool;
+                }
+                "format" => {
+                    // format(value, spec): render `value` per the format
+                    // mini-language `spec` (D-0026). The spec must be a string
+                    // literal in v1 (the same parser the f-string fields use),
+                    // so the spec is validated against the value's type here.
+                    if args.len() != 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "format() takes exactly two arguments (value, spec)".to_string(),
+                            span,
+                        );
+                        for a in args {
+                            self.infer(&a.value);
+                        }
+                        return Ty::Str;
+                    }
+                    let vt = self.infer(&args[0].value);
+                    self.check_renderable(&vt, expr_span(&args[0].value));
+                    let st = self.infer(&args[1].value);
+                    match &args[1].value {
+                        Expr::Str {
+                            value,
+                            fstring: false,
+                            bytes: false,
+                            ..
+                        } => match fstring::parse_format_spec(value) {
+                            Ok(fs) => self.check_spec_type(&fs, &vt, expr_span(&args[1].value)),
+                            Err(msg) => self.error(
+                                ErrorCode::ZAP4026,
+                                format!("invalid format spec '{value}': {msg}"),
+                                expr_span(&args[1].value),
+                            ),
+                        },
+                        _ => {
+                            if !matches!(st, Ty::Unknown) {
+                                self.error(
+                                    ErrorCode::ZAP4026,
+                                    "format()'s spec must be a plain string literal in v1"
+                                        .to_string(),
+                                    expr_span(&args[1].value),
+                                );
+                            }
+                        }
+                    }
+                    return Ty::Str;
                 }
                 // `close(ch)` (ticket #25, D-0031): the argument must be a channel.
                 "close" => {
@@ -5641,6 +5838,65 @@ def main():
         assert!(
             e.iter().any(|x| x.message.contains("needs at least")),
             "expected an enum-too-narrow error, got {e:?}"
+        );
+    }
+
+    // --- f-strings and conversion builtins (#285, D-0026) ---
+
+    #[test]
+    fn fstring_fields_type_check() {
+        ok("def main():\n    auto n = 42\n    auto x = 3.14\n    print(f\"{n} {x} {n:02x}\")\n");
+        // A field referencing an undefined name is reported.
+        let e = errors("def main():\n    print(f\"{missing}\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP3001),
+            "expected an unknown-name error inside the field, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn fstring_bad_spec_and_conv() {
+        // A hex spec on a string value is invalid.
+        let e = errors("def main():\n    auto s = \"hi\"\n    print(f\"{s:x}\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4026),
+            "expected ZAP4026 for a hex spec on a str, got {e:?}"
+        );
+        // The repr conversion is not supported in v1.
+        let e = errors("def main():\n    auto n = 1\n    print(f\"{n!r}\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4026),
+            "expected ZAP4026 for the !r conversion, got {e:?}"
+        );
+        // A malformed spec grammar.
+        let e = errors("def main():\n    auto n = 1\n    print(f\"{n:0q}\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4026),
+            "expected ZAP4026 for an unknown format type, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn fstring_unmatched_brace() {
+        let e = errors("def main():\n    print(f\"a}b\")\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP2017),
+            "expected ZAP2017 for a single '}}', got {e:?}"
+        );
+    }
+
+    #[test]
+    fn conversion_builtins_type_check() {
+        ok(
+            "def main():\n    auto a = float(\"3.14\")\n    auto b = bool(0)\n    \
+            auto c = bool(\"x\")\n    auto d = format(255, \"02x\")\n    print(a)\n    \
+            print(d)\n",
+        );
+        // format's spec must be a string literal in v1.
+        let e = errors("def main():\n    auto s = \"02x\"\n    print(format(1, s))\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4026),
+            "expected ZAP4026 for a non-literal format spec, got {e:?}"
         );
     }
 }
