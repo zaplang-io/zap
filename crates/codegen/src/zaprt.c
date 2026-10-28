@@ -11495,10 +11495,51 @@ static void zap_httpconn_close(ZapHttpConn *c) {
 /* http.request(method, url, body) -> response handle. Opens a connection (plain
  * `http://` via net, or `https://` via TLS with verification on — ticket #147),
  * sends a Connection: close request, reads the whole response to EOF, parses it. */
-void *zap_http_request(void *method_, void *url_, void *body_) {
+/* Case-insensitive compare of a ZapStr header name against a NUL-terminated
+ * ASCII name. Used to spot transport-managed / defaulted headers in a
+ * caller-supplied header map so we don't emit duplicates. */
+static int zap_http_name_eq(const ZapStr *name, const char *lit) {
+    size_t llen = strlen(lit);
+    if (name->len != (int64_t)llen) {
+        return 0;
+    }
+    for (size_t k = 0; k < llen; k++) {
+        char a = name->data[k];
+        char b = lit[k];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Is `name` a header the transport computes itself (Host / Content-Length /
+ * Connection)? Such a header from a caller-supplied map is dropped so the wire
+ * request carries exactly one. Content-Type is NOT here: callers may override
+ * the default (that is the whole point of #280 for JSON/SigV4 clients). */
+static int zap_http_hdr_managed(const ZapStr *name) {
+    return zap_http_name_eq(name, "Host") || zap_http_name_eq(name, "Content-Length") ||
+           zap_http_name_eq(name, "Connection");
+}
+
+/* HTTP/1.1 client core (ticket #104; request headers #280). `headers_` is an
+ * optional `dict[str,str]` (NULL for the no-header forms): each live entry is
+ * emitted as a `Name: Value` header line, except the transport-managed ones
+ * (zap_http_hdr_managed). A caller-supplied Content-Type suppresses the default
+ * text/plain. Keys and values are copied into the malloc request buffer before
+ * any send, so the GC dict is only touched while it is still rooted by the
+ * caller's frame. */
+void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
     const ZapStr *method = (const ZapStr *)method_;
     const ZapStr *url = (const ZapStr *)url_;
     const ZapStr *body = (const ZapStr *)body_;
+    const ZapDict *hdrs = (const ZapDict *)headers_;
 
     char *u = zap_net_dupz(url);
     char *mz = zap_net_dupz(method);
@@ -11568,7 +11609,30 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     free(host);
 
     size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
-    size_t reqcap = strlen(mz) + strlen(path) + hostend + blen + 256;
+    /* Size the request buffer: request/Host/Connection line + body + the
+     * caller's header map (name + ": " + value + CRLF for each live entry). */
+    size_t hdrbytes = 0;
+    int caller_content_type = 0;
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            const ZapEntry *ent = &hdrs->entries[e];
+            if (ent->state != SLOT_FULL) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
+            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            if (zap_http_hdr_managed(name)) {
+                continue;
+            }
+            if (zap_http_name_eq(name, "Content-Type")) {
+                caller_content_type = 1;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdrbytes += nl + vl + 4; /* ": " + "\r\n" */
+        }
+    }
+    size_t reqcap = strlen(mz) + strlen(path) + hostend + blen + hdrbytes + 256;
     char *req = (char *)malloc(reqcap);
     if (!req) {
         free(u);
@@ -11581,9 +11645,29 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
                        "%s %s HTTP/1.1\r\nHost: %.*s\r\nConnection: close\r\n",
                        mz, path, (int)hostend, rest);
     if (blen > 0) {
-        hdr += snprintf(req + hdr, reqcap - (size_t)hdr,
-                        "Content-Length: %zu\r\nContent-Type: text/plain; charset=utf-8\r\n",
-                        blen);
+        hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "Content-Length: %zu\r\n", blen);
+        if (!caller_content_type) {
+            hdr += snprintf(req + hdr, reqcap - (size_t)hdr,
+                            "Content-Type: text/plain; charset=utf-8\r\n");
+        }
+    }
+    /* Caller-supplied headers, copied out of the GC dict into the buffer. */
+    if (hdrs) {
+        for (int64_t e = 0; e < hdrs->cap; e++) {
+            const ZapEntry *ent = &hdrs->entries[e];
+            if (ent->state != SLOT_FULL) {
+                continue;
+            }
+            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
+            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            if (zap_http_hdr_managed(name)) {
+                continue;
+            }
+            size_t nl = (size_t)(name->len < 0 ? 0 : name->len);
+            size_t vl = (size_t)(val->len < 0 ? 0 : val->len);
+            hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "%.*s: %.*s\r\n", (int)nl,
+                            name->data, (int)vl, val->data);
+        }
     }
     hdr += snprintf(req + hdr, reqcap - (size_t)hdr, "\r\n");
     if (blen > 0) {
@@ -11647,6 +11731,16 @@ void *zap_http_request(void *method_, void *url_, void *body_) {
     return resp;
 }
 
+/* http.request(method, url, body) — no caller headers. */
+void *zap_http_request(void *method_, void *url_, void *body_) {
+    return zap_http_do(method_, url_, body_, NULL);
+}
+
+/* http.request(method, url, body, headers) — with a `dict[str,str]` (#280). */
+void *zap_http_request_h(void *method_, void *url_, void *body_, void *headers_) {
+    return zap_http_do(method_, url_, body_, headers_);
+}
+
 void *zap_http_get(void *url_) {
     ZapStr g;
     g.len = 3;
@@ -11654,14 +11748,31 @@ void *zap_http_get(void *url_) {
     ZapStr empty;
     empty.len = 0;
     empty.data = "";
-    return zap_http_request(&g, url_, &empty);
+    return zap_http_do(&g, url_, &empty, NULL);
+}
+
+void *zap_http_get_h(void *url_, void *headers_) {
+    ZapStr g;
+    g.len = 3;
+    g.data = "GET";
+    ZapStr empty;
+    empty.len = 0;
+    empty.data = "";
+    return zap_http_do(&g, url_, &empty, headers_);
 }
 
 void *zap_http_post(void *url_, void *body_) {
     ZapStr p;
     p.len = 4;
     p.data = "POST";
-    return zap_http_request(&p, url_, body_);
+    return zap_http_do(&p, url_, body_, NULL);
+}
+
+void *zap_http_post_h(void *url_, void *body_, void *headers_) {
+    ZapStr p;
+    p.len = 4;
+    p.data = "POST";
+    return zap_http_do(&p, url_, body_, headers_);
 }
 
 int64_t zap_http_status(void *resp_) { return ((ZapHttpResp *)resp_)->status; }
