@@ -7175,6 +7175,179 @@ void *zap_datetime_format_iso(int64_t y, int64_t mo, int64_t d, int64_t h,
     return zap_str_new(buf, (int64_t)n);
 }
 
+/* Civil components -> a `strftime`-style custom-formatted string (#286).
+ *
+ * A Python-faithful subset of `strftime` directives, built **directly from the
+ * integer fields** (so it does not depend on run-time string slicing, #284):
+ *
+ *   %Y  year, >=4 digits, zero-padded   %y  year mod 100, 2 digits
+ *   %m  month 01-12                     %d  day of month 01-31
+ *   %H  hour 00-23                      %I  hour 01-12 (12-hour clock)
+ *   %M  minute 00-59                    %S  second 00-59
+ *   %p  AM / PM                         %j  day of year 001-366
+ *   %A  weekday name (Sunday)           %a  weekday abbr (Sun)
+ *   %B  month name (January)            %b  month abbr (Jan)
+ *   %Z  time-zone name                  %z  UTC offset (+HHMM)
+ *   %%  a literal percent
+ *
+ * `DateTime` is naive (it carries no zone), so — like Python's `strftime` on a
+ * naive datetime — `%Z` and `%z` expand to the empty string. An unknown `%X`
+ * is emitted verbatim (`%` then `X`), matching CPython. Returns a fresh
+ * `ZapStr*`. Weekday / day-of-year are derived by recomposing the instant in
+ * UTC (`timegm` then `gmtime_r`), reusing the civil-time path above. */
+void *zap_datetime_strftime(int64_t y, int64_t mo, int64_t d, int64_t h,
+                            int64_t mi, int64_t s, void *fmt) {
+    static const char *const MON_FULL[12] = {
+        "January", "February", "March",     "April",   "May",      "June",
+        "July",    "August",   "September", "October", "November", "December"};
+    static const char *const MON_ABBR[12] = {"Jan", "Feb", "Mar", "Apr",
+                                             "May", "Jun", "Jul", "Aug",
+                                             "Sep", "Oct", "Nov", "Dec"};
+    static const char *const DAY_FULL[7] = {"Sunday",   "Monday", "Tuesday",
+                                            "Wednesday", "Thursday",
+                                            "Friday",   "Saturday"};
+    static const char *const DAY_ABBR[7] = {"Sun", "Mon", "Tue", "Wed",
+                                            "Thu", "Fri", "Sat"};
+    ZapStr *f = (ZapStr *)fmt;
+    int64_t flen = f->len < 0 ? 0 : f->len;
+
+    /* Derive weekday (0=Sunday) and 1-based day-of-year by recomposing the
+     * civil components into a UTC instant and splitting them back out. */
+    struct tm tm;
+    memset(&tm, 0, sizeof tm);
+    tm.tm_year = (int)(y - 1900);
+    tm.tm_mon = (int)(mo - 1);
+    tm.tm_mday = (int)d;
+    tm.tm_hour = (int)h;
+    tm.tm_min = (int)mi;
+    tm.tm_sec = (int)s;
+    time_t t = timegm(&tm);
+    struct tm norm;
+    gmtime_r(&t, &norm);
+    int wday = norm.tm_wday; /* 0=Sunday .. 6=Saturday */
+    int yday = norm.tm_yday + 1;
+
+    /* Upper bound: the widest single directive ("Wednesday"/"September") is 9
+     * bytes for 2 input bytes; literal bytes map 1:1. `flen*9 + 1` is safe. */
+    size_t cap = (size_t)flen * 9 + 1;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        return zap_str_new("", 0);
+    }
+    size_t n = 0;
+    for (int64_t i = 0; i < flen; i++) {
+        char c = f->data[i];
+        if (c != '%' || i + 1 >= flen) {
+            out[n++] = c;
+            continue;
+        }
+        char dir = f->data[++i];
+        char tmp[16];
+        int w;
+        switch (dir) {
+        case 'Y':
+            w = snprintf(tmp, sizeof tmp, "%04lld", (long long)y);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'y':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)(((y % 100) + 100) % 100));
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'm':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)mo);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'd':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)d);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'H':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)h);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'I': {
+            long long h12 = (long long)(h % 12);
+            if (h12 == 0) {
+                h12 = 12;
+            }
+            w = snprintf(tmp, sizeof tmp, "%02lld", h12);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        }
+        case 'M':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)mi);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'S':
+            w = snprintf(tmp, sizeof tmp, "%02lld", (long long)s);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'j':
+            w = snprintf(tmp, sizeof tmp, "%03d", yday);
+            memcpy(out + n, tmp, (size_t)w);
+            n += (size_t)w;
+            break;
+        case 'p': {
+            const char *ampm = (h < 12) ? "AM" : "PM";
+            memcpy(out + n, ampm, 2);
+            n += 2;
+            break;
+        }
+        case 'A': {
+            const char *nm = DAY_FULL[(wday % 7 + 7) % 7];
+            size_t l = strlen(nm);
+            memcpy(out + n, nm, l);
+            n += l;
+            break;
+        }
+        case 'a': {
+            const char *nm = DAY_ABBR[(wday % 7 + 7) % 7];
+            size_t l = strlen(nm);
+            memcpy(out + n, nm, l);
+            n += l;
+            break;
+        }
+        case 'B': {
+            const char *nm = MON_FULL[((mo - 1) % 12 + 12) % 12];
+            size_t l = strlen(nm);
+            memcpy(out + n, nm, l);
+            n += l;
+            break;
+        }
+        case 'b': {
+            const char *nm = MON_ABBR[((mo - 1) % 12 + 12) % 12];
+            size_t l = strlen(nm);
+            memcpy(out + n, nm, l);
+            n += l;
+            break;
+        }
+        case 'Z':
+        case 'z':
+            /* Naive DateTime: no zone, so these expand empty (Python-faithful). */
+            break;
+        case '%':
+            out[n++] = '%';
+            break;
+        default:
+            /* Unknown directive: emit verbatim, like CPython. */
+            out[n++] = '%';
+            out[n++] = dir;
+            break;
+        }
+    }
+    void *z = zap_str_new(out, (int64_t)n);
+    free(out);
+    return z;
+}
+
 /* ISO-8601 string -> Unix timestamp (UTC). Accepts a date ("YYYY-MM-DD") or a
  * full date-time with a 'T' or ' ' separator; fields left unmatched default to
  * the start of the day. v1 parsing is lenient (sscanf): malformed input yields

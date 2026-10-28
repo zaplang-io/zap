@@ -712,6 +712,16 @@ type name (no new syntax), and a reference-payload `Queue[T]` inherits the open
 aarch64 evacuation caveat (I#223). CSV is a **`@derive(Csv)`** (`to_csv`/`from_csv`), not a module; `testing`
 is the **`@test`** annotation framework (§17), not an importable module.
 
+**`datetime` formatting (#286).** A `DateTime` renders as ISO-8601 extended via
+`datetime.format(dt)`; `datetime.strftime(dt, fmt)` (equivalently the 2-arg
+`datetime.format(dt, fmt)`) renders a custom format with a Python-faithful
+`strftime` directive set — `%Y %y %m %d %H %I %M %S %p %j %A %a %B %b %Z %z %%`,
+built directly from the numeric fields. `DateTime` is naive (it carries no
+zone), so `%Z`/`%z` expand to the empty string, as in Python; a literal `Z` in
+the format (e.g. `"%Y%m%dT%H%M%SZ"`) is emitted verbatim. This produces the
+SigV4 `X-Amz-Date` (`%Y%m%dT%H%M%SZ`) and credential-scope (`%Y%m%d`) stamps,
+HTTP `Date`, and similar, from a UTC `DateTime` without run-time string slicing.
+
 **Official packages** via the package manager (`sqlite3`, `xml`, `email`, …).
 The concurrency model replaces Python threading/multiprocessing; the
 `threading` compat module and `import python` (interop) are rare relief valves.
