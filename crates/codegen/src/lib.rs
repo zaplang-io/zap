@@ -312,7 +312,12 @@ pub fn build_executable(module: &AstModule, out_path: &Path, portable: bool) -> 
         // `getaddrinfo` cannot dlopen nsswitch plugins (standard DNS resolution is
         // unaffected), OpenSSL engine dlopen is unavailable (unused by the TLS
         // client), the binary is larger, and `import python` raises at runtime.
-        cmd.arg("-static").arg("-DZAP_NO_CPYTHON");
+        //
+        // `-ldl` after `-lcrypto`: static `libcrypto.a` references `dlopen`/`dlsym`
+        // (engine loading), so a static link needs libdl explicitly and in this
+        // order (GNU ld is single-pass). On glibc ≥ 2.34 libdl is a stub merged
+        // into libc, so this is harmless where it is not strictly required.
+        cmd.arg("-static").arg("-DZAP_NO_CPYTHON").arg("-ldl");
     } else {
         // Export program symbols to the dynamic symbol table so the CPU
         // profiler's offline symbolication (`backtrace_symbols`, ticket #78)

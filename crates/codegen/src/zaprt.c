@@ -60,6 +60,15 @@
 #include <Python.h>
 #endif
 
+/* `NULL` / `size_t` for the code between here and the standard-header block
+ * below (e.g. the precise-Immix `GC_get_my_stackbottom` shim). When CPython is
+ * embedded, `<Python.h>` above already pulls these in; when it is NOT — the
+ * portable profile (`-DZAP_NO_CPYTHON`, I#287) or Windows v1 (I#198) — nothing
+ * has yet, so include the freestanding `<stddef.h>` explicitly. It defines no
+ * feature-test-gated declarations, so it is safe before the other headers (the
+ * "Python.h must precede the standard headers" ordering above is unaffected). */
+#include <stddef.h>
+
 #ifndef ZAP_GC_IMMIX
 /* `GC_THREADS` must be defined before <gc.h> so the collector is built/used in
  * its thread-aware mode (ticket #25, D-0009/D-0013): it then knows about every
