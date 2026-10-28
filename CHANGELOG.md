@@ -26,7 +26,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 ### Added
 
 - **Language.** Type-first declarations and `const` (D-0003); scalars and
-  conversions; `str`/`bytes` with interpolation and codepoint slicing;
+  conversions; `str`/`bytes` with interpolation, codepoint indexing/slicing/
+  iteration, comparison, substring `in`, the core method set
+  (`upper`/`lower`/`strip`/`split`/`join`/`find`/`index`/`replace`/
+  `startswith`/`endswith`/`contains`/`encode`) and `ord`/`chr`/`char`/`str`/
+  `int` conversions (#284);
   `list`/`dict`/tuples/`set` with value/reference semantics; structs, methods
   and `value struct` (D-0051); interfaces; enums — tier-1 and tier-3 sum types
   (D-0046); operators with overloading and `@derive(Eq, Ord, Hash, Repr)`;

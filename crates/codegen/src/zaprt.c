@@ -1585,6 +1585,471 @@ int64_t zap_str_eq(void *a, void *b) {
     return memcmp(x->data, y->data, (size_t)x->len) == 0 ? 1 : 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * String surface (ticket #284, design/0007-strings.md).
+ *
+ * `str` is immutable UTF-8. Indexing, slicing, `len` and iteration are all by
+ * **Unicode codepoint** (Python semantics, D-0025) with an ASCII fast path;
+ * `char` is a Unicode scalar passed as `i32`. The byte buffer is reachable for
+ * byte-level work (SigV4 percent-encoding) via `ord`/iteration on the ASCII
+ * fast path and `zap_str_encode` (UTF-8 byte values as a `list[int]`).
+ *
+ * Case folding and whitespace stripping are ASCII-only in v1 (documented in
+ * SPEC/STABILITY); the full Unicode tables are a follow-up.
+ * ------------------------------------------------------------------------- */
+
+/* Byte width of the UTF-8 sequence whose lead byte is `c`. An invalid lead is
+ * treated as width 1 so a malformed buffer still makes forward progress (the
+ * lexer guarantees literals are valid UTF-8; this is defensive). */
+static int zap_utf8_width(unsigned char c) {
+    if (c < 0x80) {
+        return 1;
+    }
+    if ((c >> 5) == 0x6) {
+        return 2;
+    }
+    if ((c >> 4) == 0xE) {
+        return 3;
+    }
+    if ((c >> 3) == 0x1E) {
+        return 4;
+    }
+    return 1;
+}
+
+/* Decode the codepoint of the `w`-byte UTF-8 sequence at `d + off`. */
+static int32_t zap_utf8_decode(const unsigned char *d, int64_t off, int w) {
+    switch (w) {
+    case 2:
+        return (int32_t)(((d[off] & 0x1F) << 6) | (d[off + 1] & 0x3F));
+    case 3:
+        return (int32_t)(((d[off] & 0x0F) << 12) | ((d[off + 1] & 0x3F) << 6) |
+                         (d[off + 2] & 0x3F));
+    case 4:
+        return (int32_t)(((d[off] & 0x07) << 18) | ((d[off + 1] & 0x3F) << 12) |
+                         ((d[off + 2] & 0x3F) << 6) | (d[off + 3] & 0x3F));
+    default:
+        return (int32_t)d[off];
+    }
+}
+
+/* Encode scalar `cp` into `out` (up to 4 bytes); returns the byte width. */
+static int zap_utf8_encode(int32_t cp, char *out) {
+    unsigned int c = (unsigned int)cp;
+    if (c < 0x80) {
+        out[0] = (char)c;
+        return 1;
+    }
+    if (c < 0x800) {
+        out[0] = (char)(0xC0 | (c >> 6));
+        out[1] = (char)(0x80 | (c & 0x3F));
+        return 2;
+    }
+    if (c < 0x10000) {
+        out[0] = (char)(0xE0 | (c >> 12));
+        out[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (c & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (c >> 18));
+    out[1] = (char)(0x80 | ((c >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((c >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (c & 0x3F));
+    return 4;
+}
+
+/* Wrap an already-owned GC buffer in a `str` object without copying. */
+static void *zap_str_adopt(char *buf, int64_t len) {
+    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
+    s->len = len;
+    s->data = buf;
+    return s;
+}
+
+static int zap_is_ascii_ws(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+/* len(s): codepoint count (O(1) on the ASCII fast path, O(n) otherwise). */
+int64_t zap_str_len_cp(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t n = 0;
+    int64_t i = 0;
+    while (i < s->len) {
+        i += zap_utf8_width(d[i]);
+        n++;
+    }
+    return n;
+}
+
+/* Byte offset of codepoint index `cp_idx` (clamped at the end). */
+static int64_t zap_str_byteoff(const ZapStr *s, int64_t cp_idx) {
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t i = 0;
+    int64_t k = 0;
+    while (i < s->len && k < cp_idx) {
+        i += zap_utf8_width(d[i]);
+        k++;
+    }
+    return i;
+}
+
+/* s[i] -> char. Negative indices count from the end; out-of-range faults (the
+ * typed `IndexError` lands with the exception runtime, D-0029). */
+int32_t zap_str_index(void *sp, int64_t idx) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t count = zap_str_len_cp(sp);
+    if (idx < 0) {
+        idx += count;
+    }
+    if (idx < 0 || idx >= count) {
+        fprintf(stderr, "zap: string index out of range\n");
+        abort();
+    }
+    int64_t off = zap_str_byteoff(s, idx);
+    return zap_utf8_decode(d, off, zap_utf8_width(d[off]));
+}
+
+/* Codepoint at byte offset `off` (for iteration). */
+int32_t zap_str_cp_at_byte(void *sp, int64_t off) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    return zap_utf8_decode(d, off, zap_utf8_width(d[off]));
+}
+
+/* Byte offset of the codepoint after the one at `off` (for iteration). */
+int64_t zap_str_adv_byte(void *sp, int64_t off) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    return off + zap_utf8_width(d[off]);
+}
+
+/* Normalize a positive-step slice bound to [0, n]. */
+static int64_t zap_slice_pos(int64_t v, int64_t n) {
+    if (v < 0) {
+        v += n;
+    }
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > n) {
+        v = n;
+    }
+    return v;
+}
+
+/* Normalize a negative-step slice bound to [-1, n-1]. */
+static int64_t zap_slice_neg(int64_t v, int64_t n) {
+    if (v < 0) {
+        v += n;
+    }
+    if (v < -1) {
+        v = -1;
+    }
+    if (v > n - 1) {
+        v = n - 1;
+    }
+    return v;
+}
+
+/* s[lo:hi:step] -> str, Python slice semantics by codepoint. The `has_*` flags
+ * mark which bounds were written (an omitted bound defaults by the step sign).
+ * step==1 copies the contiguous byte range; a general step re-encodes the
+ * selected codepoints. */
+void *zap_str_slice(void *sp, int64_t lo, int64_t hi, int64_t step, int64_t has_lo,
+                    int64_t has_hi, int64_t has_step) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t n = zap_str_len_cp(sp);
+    int64_t st = has_step ? step : 1;
+    if (st == 0) {
+        fprintf(stderr, "zap: slice step cannot be zero\n");
+        abort();
+    }
+    int64_t start;
+    int64_t stop;
+    if (st > 0) {
+        start = has_lo ? zap_slice_pos(lo, n) : 0;
+        stop = has_hi ? zap_slice_pos(hi, n) : n;
+    } else {
+        start = has_lo ? zap_slice_neg(lo, n) : n - 1;
+        stop = has_hi ? zap_slice_neg(hi, n) : -1;
+    }
+    if (st == 1) {
+        if (start >= stop) {
+            return zap_str_new("", 0);
+        }
+        int64_t a = zap_str_byteoff(s, start);
+        int64_t b = zap_str_byteoff(s, stop);
+        return zap_str_new(s->data + a, b - a);
+    }
+    /* General step: collect codepoints and re-encode. */
+    char *buf = (char *)zap_buf((size_t)s->len + 4);
+    int64_t outlen = 0;
+    const unsigned char *d = (const unsigned char *)s->data;
+    for (int64_t k = start; (st > 0) ? (k < stop) : (k > stop); k += st) {
+        int64_t off = zap_str_byteoff(s, k);
+        int w = zap_utf8_width(d[off]);
+        int32_t cp = zap_utf8_decode(d, off, w);
+        outlen += zap_utf8_encode(cp, buf + outlen);
+    }
+    return zap_str_adopt(buf, outlen);
+}
+
+/* char(n) / chr(n): validate `n` is a Unicode scalar (not a surrogate, in
+ * range) and return it as a `char`. Faults on an invalid value (the typed
+ * `ValueError` lands with the exception runtime). */
+int32_t zap_chr(int64_t n) {
+    if (n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF)) {
+        fprintf(stderr, "zap: chr() argument is not a valid Unicode scalar value\n");
+        abort();
+    }
+    return (int32_t)n;
+}
+
+/* str(ch): the one-codepoint string that is `ch`'s UTF-8 encoding. */
+void *zap_char_to_str(int32_t cp) {
+    char buf[4];
+    int w = zap_utf8_encode(cp, buf);
+    return zap_str_new(buf, w);
+}
+
+/* int(s): parse a decimal integer, Python-style (surrounding ASCII whitespace
+ * allowed, optional sign, at least one digit, nothing else). Faults on a
+ * malformed string (the typed `ValueError` lands with the exception runtime).
+ * Distinct from the lenient `zap_str_to_i64` the CSV codec uses. */
+int64_t zap_str_parse_int(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const char *d = s->data;
+    int64_t i = 0;
+    int64_t n = s->len;
+    while (i < n && zap_is_ascii_ws((unsigned char)d[i])) {
+        i++;
+    }
+    int neg = 0;
+    if (i < n && (d[i] == '+' || d[i] == '-')) {
+        neg = d[i] == '-';
+        i++;
+    }
+    int64_t start = i;
+    unsigned long long acc = 0;
+    while (i < n && d[i] >= '0' && d[i] <= '9') {
+        acc = acc * 10 + (unsigned long long)(d[i] - '0');
+        i++;
+    }
+    int64_t digits = i - start;
+    while (i < n && zap_is_ascii_ws((unsigned char)d[i])) {
+        i++;
+    }
+    if (digits == 0 || i != n) {
+        fprintf(stderr, "zap: int() cannot parse an integer from this string\n");
+        abort();
+    }
+    return neg ? -(int64_t)acc : (int64_t)acc;
+}
+
+void *zap_str_upper(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char *buf = (char *)zap_buf((size_t)s->len);
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : (char)c;
+    }
+    return zap_str_adopt(buf, s->len);
+}
+
+void *zap_str_lower(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    char *buf = (char *)zap_buf((size_t)s->len);
+    for (int64_t i = 0; i < s->len; i++) {
+        unsigned char c = (unsigned char)s->data[i];
+        buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+    }
+    return zap_str_adopt(buf, s->len);
+}
+
+/* strip(mode): 0 both ends, 1 left only, 2 right only. ASCII whitespace. */
+void *zap_str_strip(void *sp, int64_t mode) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t a = 0;
+    int64_t b = s->len;
+    if (mode != 2) {
+        while (a < b && zap_is_ascii_ws((unsigned char)s->data[a])) {
+            a++;
+        }
+    }
+    if (mode != 1) {
+        while (b > a && zap_is_ascii_ws((unsigned char)s->data[b - 1])) {
+            b--;
+        }
+    }
+    return zap_str_new(s->data + a, b - a);
+}
+
+int64_t zap_str_startswith(void *sp, void *pp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *p = (const ZapStr *)pp;
+    if (p->len > s->len) {
+        return 0;
+    }
+    return memcmp(s->data, p->data, (size_t)p->len) == 0 ? 1 : 0;
+}
+
+int64_t zap_str_endswith(void *sp, void *pp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *p = (const ZapStr *)pp;
+    if (p->len > s->len) {
+        return 0;
+    }
+    return memcmp(s->data + (s->len - p->len), p->data, (size_t)p->len) == 0 ? 1 : 0;
+}
+
+/* First byte offset of `sub` in `s`, or -1. Both are valid UTF-8, so a byte
+ * match is codepoint-aligned. */
+static int64_t zap_str_find_bytes(const ZapStr *s, const ZapStr *sub) {
+    if (sub->len == 0) {
+        return 0;
+    }
+    for (int64_t i = 0; i + sub->len <= s->len; i++) {
+        if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int64_t zap_str_contains(void *sp, void *subp) {
+    return zap_str_find_bytes((const ZapStr *)sp, (const ZapStr *)subp) >= 0 ? 1 : 0;
+}
+
+/* find(sub): codepoint index of the first match, or -1. */
+int64_t zap_str_find(void *sp, void *subp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    int64_t off = zap_str_find_bytes(s, (const ZapStr *)subp);
+    if (off < 0) {
+        return -1;
+    }
+    int64_t k = 0;
+    int64_t j = 0;
+    const unsigned char *d = (const unsigned char *)s->data;
+    while (j < off) {
+        j += zap_utf8_width(d[j]);
+        k++;
+    }
+    return k;
+}
+
+/* index(sub): like find, but faults when `sub` is absent (Python's ValueError;
+ * the typed exception lands with the exception runtime). */
+int64_t zap_str_index_of(void *sp, void *subp) {
+    int64_t r = zap_str_find(sp, subp);
+    if (r < 0) {
+        fprintf(stderr, "zap: substring not found\n");
+        abort();
+    }
+    return r;
+}
+
+/* replace(old, new): replace every non-overlapping occurrence. An empty `old`
+ * returns the string unchanged (Python inserts `new` between codepoints; left
+ * as a follow-up). */
+void *zap_str_replace(void *sp, void *oldp, void *newp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *o = (const ZapStr *)oldp;
+    const ZapStr *nw = (const ZapStr *)newp;
+    if (o->len == 0) {
+        return zap_str_new(s->data, s->len);
+    }
+    int64_t count = 0;
+    for (int64_t i = 0; i + o->len <= s->len;) {
+        if (memcmp(s->data + i, o->data, (size_t)o->len) == 0) {
+            count++;
+            i += o->len;
+        } else {
+            i++;
+        }
+    }
+    int64_t outlen = s->len + count * (nw->len - o->len);
+    char *buf = (char *)zap_buf((size_t)(outlen > 0 ? outlen : 1));
+    int64_t w = 0;
+    for (int64_t i = 0; i < s->len;) {
+        if (i + o->len <= s->len && memcmp(s->data + i, o->data, (size_t)o->len) == 0) {
+            memcpy(buf + w, nw->data, (size_t)nw->len);
+            w += nw->len;
+            i += o->len;
+        } else {
+            buf[w++] = s->data[i++];
+        }
+    }
+    return zap_str_adopt(buf, outlen);
+}
+
+/* split(sep) -> list[str] on a non-empty separator. An empty separator yields
+ * a one-element list with the whole string (Python raises ValueError; left as
+ * a follow-up). */
+void *zap_str_split(void *sp, void *sepp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const ZapStr *sep = (const ZapStr *)sepp;
+    void *out = zap_list_new();
+    if (sep->len == 0) {
+        zap_list_push_ptr(out, zap_str_new(s->data, s->len));
+        return out;
+    }
+    int64_t start = 0;
+    for (int64_t i = 0; i + sep->len <= s->len;) {
+        if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {
+            zap_list_push_ptr(out, zap_str_new(s->data + start, i - start));
+            i += sep->len;
+            start = i;
+        } else {
+            i++;
+        }
+    }
+    zap_list_push_ptr(out, zap_str_new(s->data + start, s->len - start));
+    return out;
+}
+
+/* sep.join(parts): concatenate `parts` (a list[str]) with `sep` between them. */
+void *zap_str_join(void *sepp, void *listp) {
+    const ZapStr *sep = (const ZapStr *)sepp;
+    int64_t n = zap_list_len(listp);
+    if (n <= 0) {
+        return zap_str_new("", 0);
+    }
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const ZapStr *e = (const ZapStr *)zap_list_get_ptr(listp, i);
+        total += e->len;
+        if (i > 0) {
+            total += sep->len;
+        }
+    }
+    char *buf = (char *)zap_buf((size_t)(total > 0 ? total : 1));
+    int64_t w = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (i > 0) {
+            memcpy(buf + w, sep->data, (size_t)sep->len);
+            w += sep->len;
+        }
+        const ZapStr *e = (const ZapStr *)zap_list_get_ptr(listp, i);
+        memcpy(buf + w, e->data, (size_t)e->len);
+        w += e->len;
+    }
+    return zap_str_adopt(buf, total);
+}
+
+/* encode() -> list[int]: the UTF-8 byte values of `s` (0..255). The reachable
+ * byte-level view (SigV4 percent-encoding) until the full `bytes` type lands. */
+void *zap_str_encode(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < s->len; i++) {
+        zap_list_push_i64(out, (int64_t)(unsigned char)s->data[i]);
+    }
+    return out;
+}
+
 typedef struct {
     ZapStr *type_name;
     ZapStr *deco_name;
