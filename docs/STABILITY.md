@@ -359,6 +359,12 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `crypto`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`; `threading` (migration-only) | **E** |
 | `concurrent` — lock-free `Counter` + MPSC `Queue[T]` (D-0078); reference-payload `Queue[T]` is further gated on aarch64 by I#223 | **E** |
 
+The `http` client verbs `get`/`post`/`request` gained an **optional trailing
+`dict[str, str]` of request headers** (#280) and already expose response
+`status`/`header`/`body` accessors; because `http` is **Experimental**, this is
+an additive surface change requiring no stability promise. Setting response
+headers on the server `http.respond` is the companion gap tracked in #279.
+
 **CLI (`SPEC.md` §17, `crates/driver/src/cli.rs`).**
 
 | Surface | Tier |

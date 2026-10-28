@@ -1,6 +1,7 @@
 //! `http` module — runtime-symbol declarations (ticket #104, D-0056).
 //!
-//! HTTP/1.1 over the `net` sockets. The client (`get`/`post`/`request`) returns
+//! HTTP/1.1 over the `net` sockets. The client (`get`/`post`/`request`, with
+//! optional `_h` request-header forms taking a `dict[str,str]` — #280) returns
 //! an opaque `ZapHttpResp` handle unpacked by `status`/`body`/`header`; the
 //! server (`read_request`) returns an opaque `ZapHttpReq` handle unpacked by
 //! `req_method`/`req_path`/`req_header`/`req_body`, and `respond` writes a reply.
@@ -16,10 +17,21 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     let p = cg.ctx.ptr_type(AddressSpace::default());
     // client
     cg.declare_rt("zap_http_get", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_http_get_h", &[p.into(), p.into()], Some(p.into()));
     cg.declare_rt("zap_http_post", &[p.into(), p.into()], Some(p.into()));
+    cg.declare_rt(
+        "zap_http_post_h",
+        &[p.into(), p.into(), p.into()],
+        Some(p.into()),
+    );
     cg.declare_rt(
         "zap_http_request",
         &[p.into(), p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_http_request_h",
+        &[p.into(), p.into(), p.into(), p.into()],
         Some(p.into()),
     );
     cg.declare_rt("zap_http_status", &[p.into()], Some(i.into()));

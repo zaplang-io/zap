@@ -768,6 +768,20 @@ the format (e.g. `"%Y%m%dT%H%M%SZ"`) is emitted verbatim. This produces the
 SigV4 `X-Amz-Date` (`%Y%m%dT%H%M%SZ`) and credential-scope (`%Y%m%d`) stamps,
 HTTP `Date`, and similar, from a UTC `DateTime` without run-time string slicing.
 
+**`http` client (#104, #280).** The plaintext/TLS HTTP/1.1 client verbs
+`http.get(url)`, `http.post(url, body)` and `http.request(method, url, body)`
+each take an **optional trailing `dict[str, str]` of request headers** —
+`http.get(url, headers)`, `http.post(url, body, headers)`,
+`http.request(method, url, body, headers)` — sent verbatim on the wire. A
+caller-supplied `Content-Type` overrides the default `text/plain`; the
+transport-managed `Host`, `Content-Length` and `Connection` headers are always
+computed by the client and any same-named map entry is ignored (so the request
+carries exactly one). The response is an opaque handle read back with
+`http.status(resp) -> int64`, `http.header(resp, name) -> str` (case-insensitive,
+`""` when absent) and `http.body(resp) -> str`. Setting response headers from the
+server `http.respond` is the companion gap tracked in #279. `http` is
+**Experimental** (STABILITY.md §4.4).
+
 **Official packages** via the package manager (`sqlite3`, `xml`, `email`, …).
 The concurrency model replaces Python threading/multiprocessing; the
 `threading` compat module and `import python` (interop) are rare relief valves.
