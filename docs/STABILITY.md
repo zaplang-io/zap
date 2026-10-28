@@ -373,6 +373,7 @@ headers on the server `http.respond` is the companion gap tracked in #279.
 | `run`, `build`, `test`, `fmt`, `new`, `init`, `add`, `remove`, `zenv`, `explain`, `doc`, `version`, `help` — the verbs + flags + exit codes | **S** |
 | `mcp`, `lsp`, `repl`, `playground` — the verb exists; its protocol/semantics | **S** / **E** |
 | `ir`, `expand`, `inspect` — the verb; its output format | **S** / **I** |
+| `run`/`build` `--portable` — the self-contained static link profile (#287, D-0082) | **E** (new; flag name stable, the exact link recipe + CPython-drop trade-off may be refined) |
 | Every `--json` schema (`test --json`, `mcp`, `doc --format json`) | **E** (until explicitly stabilized, §3.1) |
 | `playground-worker` (hidden internal subprocess) | **I** |
 

@@ -116,17 +116,20 @@ pub fn emit_expand(file: &str) -> ExitCode {
 /// `out` is the output path; when `None`, a default is chosen (a temp path for
 /// `run`, the file stem for `build`).
 pub fn compile(file: &str, out: Option<String>, run_after: bool) -> ExitCode {
-    compile_for(file, out, run_after, &[])
+    compile_for(file, out, run_after, &[], false)
 }
 
 /// Like [`compile`], but with compile-time `--target-feature`s for `when`
-/// evaluation (I#139). Phase 1 still generates code for the host; the features
-/// only steer which `when target.has(.f)` arm is kept.
+/// evaluation (I#139) and the `portable` link profile (I#287). Phase 1 still
+/// generates code for the host; the features only steer which
+/// `when target.has(.f)` arm is kept. `portable` selects the self-contained
+/// static link (see [`zapc_codegen::build_executable`]).
 pub fn compile_for(
     file: &str,
     out: Option<String>,
     run_after: bool,
     features: &[String],
+    portable: bool,
 ) -> ExitCode {
     let mut module = match front_end_program(file, &build_target(features)) {
         Ok(m) => m,
@@ -134,7 +137,7 @@ pub fn compile_for(
     };
     // `@test` functions are excluded from release binaries (D-0054).
     testing::strip_test_items(&mut module);
-    backend(&module, file, out, run_after)
+    backend(&module, file, out, run_after, portable)
 }
 
 /// Default output path for a compile when `-o` is not given.
@@ -152,7 +155,13 @@ fn default_out(file: &str, run_after: bool) -> PathBuf {
 }
 
 #[cfg(feature = "codegen")]
-fn backend(module: &Module, file: &str, out: Option<String>, run_after: bool) -> ExitCode {
+fn backend(
+    module: &Module,
+    file: &str,
+    out: Option<String>,
+    run_after: bool,
+    portable: bool,
+) -> ExitCode {
     use std::process::Command;
 
     let exe: PathBuf = match out {
@@ -160,7 +169,7 @@ fn backend(module: &Module, file: &str, out: Option<String>, run_after: bool) ->
         None => default_out(file, run_after),
     };
 
-    if let Err(e) = zapc_codegen::build_executable(module, &exe) {
+    if let Err(e) = zapc_codegen::build_executable(module, &exe, portable) {
         eprintln!("{file}: codegen error: {e}");
         return ExitCode::from(1);
     }
@@ -179,7 +188,13 @@ fn backend(module: &Module, file: &str, out: Option<String>, run_after: bool) ->
 }
 
 #[cfg(not(feature = "codegen"))]
-fn backend(_module: &Module, file: &str, _out: Option<String>, _run_after: bool) -> ExitCode {
+fn backend(
+    _module: &Module,
+    file: &str,
+    _out: Option<String>,
+    _run_after: bool,
+    _portable: bool,
+) -> ExitCode {
     // Keep the default-output logic exercised so it does not warn as dead code
     // on the no-LLVM host build.
     let _ = default_out(file, _run_after);
