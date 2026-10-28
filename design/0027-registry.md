@@ -654,10 +654,20 @@ org move. The client is honest about it rather than faking it:
 `ZAP6108` (publish target unavailable / hosted write API gated), `ZAP6109`
 (missing or invalid registry credentials).
 
+**Default index base (decided).** The built-in default is
+**`https://pkg.zaplang.org/`** (`registry::DEFAULT_INDEX`), overridable by
+`$ZAP_REGISTRY`, a `[registries]` entry, or `--registry` (env/flags win). It is
+provisional until the registry service is live (I#303/#304) and is consulted
+only by a `registry` dependency with no explicit `index`; a pure `git`/`path`
+project never contacts it, so resolution stays network-free. A `zap publish`
+with no explicit target therefore aims at the hosted default and returns
+`ZAP6108` until the write API is deployed (a `--dry-run` still validates and
+packages).
+
 **Open for the maintainer (the deployment decision, not this ticket):** stand up
 the write `api` + token/account service + archive bucket under the `zaplang.org`
-host; decide the default index base baked into the client (provisional until the
-move, Open issues); and whether remote discovery gets a search endpoint or a
+host (I#304); host the static index + archives at `pkg.zaplang.org` behind a CDN
+(I#303); and decide whether remote discovery gets a search endpoint or a
 generated catalog. When those land, the client re-points via `config.json` /
 `[registries]` / `ZAP_REGISTRY` with no format change, and the `https://` publish
 path can be ungated behind the token store that already exists.

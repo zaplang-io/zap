@@ -220,6 +220,20 @@ pub fn publish(root: &Path, base: Option<&str>, dry_run: bool) -> Result<Publish
     };
 
     match resolve_target(base) {
+        // A dry-run still reports what it built even against the hosted target
+        // (the default `pkg.zaplang.org`), so `zap publish --dry-run` is a
+        // useful pre-flight; only a real publish there hits the gate.
+        Target::HostedApi(_) if dry_run => Ok(Published {
+            name: pkg.name.normalized(),
+            version: pkg.version,
+            cksum: pkg.cksum,
+            acksum: pkg.acksum,
+            archive_len: pkg.archive.len(),
+            index_file: None,
+            archive_file: None,
+            warnings: pkg.warnings,
+            dry_run: true,
+        }),
         Target::HostedApi(url) => Err(Error::registry(
             ErrorCode::ZAP6108,
             format!(
@@ -570,8 +584,21 @@ mod tests {
         let base = tmp("gated");
         let proj = base.join("proj");
         sample_project(&proj, "p", "1.0.0", "");
-        let err = publish(&proj, Some("https://index.zaplang.org/"), false).unwrap_err();
+        let err = publish(&proj, Some("https://pkg.zaplang.org/"), false).unwrap_err();
         assert!(matches!(err, Error::Registry { code, .. } if code == ErrorCode::ZAP6108));
+    }
+
+    #[test]
+    fn hosted_https_dry_run_reports_the_plan() {
+        // A dry-run against the hosted (default) target still validates and
+        // packages, rather than hitting the gate — a useful pre-flight.
+        let base = tmp("gated-dry");
+        let proj = base.join("proj");
+        sample_project(&proj, "p", "1.0.0", "");
+        let out = publish(&proj, Some("https://pkg.zaplang.org/"), true).unwrap();
+        assert!(out.dry_run);
+        assert!(out.cksum.starts_with("zap1:"));
+        assert!(out.index_file.is_none());
     }
 
     #[test]

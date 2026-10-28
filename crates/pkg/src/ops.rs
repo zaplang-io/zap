@@ -747,15 +747,16 @@ pub fn zenv_clean(root: &Path) -> Result<bool> {
 
 /// Resolve the index base URL/path for a publish or discovery operation, in
 /// priority order: an explicit `--registry <url>`, a `--index <id>` naming a
-/// `[registries]` entry (requires a manifest under `root`), else `$ZAP_REGISTRY`.
-/// `None` means no base is configured (the caller decides if that is fatal).
+/// `[registries]` entry (requires a manifest under `root`), `$ZAP_REGISTRY`,
+/// else the built-in default ([`registry::DEFAULT_INDEX`], `pkg.zaplang.org`).
+/// Always resolves to a base — there is a baked-in default.
 fn resolve_index_base(
     root: Option<&Path>,
     index_id: Option<&str>,
     registry_url: Option<&str>,
-) -> Result<Option<String>> {
+) -> Result<String> {
     if let Some(url) = registry_url {
-        return Ok(Some(url.to_string()));
+        return Ok(url.to_string());
     }
     if let Some(id) = index_id {
         let root = root.ok_or_else(|| {
@@ -765,7 +766,7 @@ fn resolve_index_base(
             )
         })?;
         let manifest = load_manifest(root)?;
-        let base = manifest
+        return manifest
             .registries
             .get(id)
             .map(|d| d.index.clone())
@@ -774,12 +775,9 @@ fn resolve_index_base(
                     ErrorCode::ZAP6105,
                     format!("no `[registries.{id}]` entry in zap.toml"),
                 )
-            })?;
-        return Ok(Some(base));
+            });
     }
-    Ok(std::env::var(registry::ZAP_REGISTRY)
-        .ok()
-        .filter(|s| !s.is_empty()))
+    Ok(registry::default_index_base())
 }
 
 /// `zap publish [--index <id> | --registry <url>] [--dry-run]` — package the
@@ -791,7 +789,7 @@ pub fn publish(
     dry_run: bool,
 ) -> Result<crate::publish::Published> {
     let base = resolve_index_base(Some(root), index_id, registry_url)?;
-    crate::publish::publish(root, base.as_deref(), dry_run)
+    crate::publish::publish(root, Some(&base), dry_run)
 }
 
 /// `zap login [--index <id> | --registry <url>]` — store a bearer token for the
@@ -802,13 +800,7 @@ pub fn login(
     registry_url: Option<&str>,
     token: &str,
 ) -> Result<PathBuf> {
-    let base = resolve_index_base(root, index_id, registry_url)?.ok_or_else(|| {
-        Error::registry(
-            ErrorCode::ZAP6109,
-            "`zap login` needs a registry: pass `--registry <url>`, `--index <id>`, or set \
-             ZAP_REGISTRY",
-        )
-    })?;
+    let base = resolve_index_base(root, index_id, registry_url)?;
     crate::publish::store_token(&base, token)
 }
 
@@ -820,12 +812,7 @@ pub fn search(
     registry_url: Option<&str>,
     query: &str,
 ) -> Result<Vec<crate::discovery::PackageSummary>> {
-    let base = resolve_index_base(root, index_id, registry_url)?.ok_or_else(|| {
-        Error::registry(
-            ErrorCode::ZAP6105,
-            "no index to search: pass `--registry <url>`, `--index <id>`, or set ZAP_REGISTRY",
-        )
-    })?;
+    let base = resolve_index_base(root, index_id, registry_url)?;
     crate::discovery::search(&base, query)
 }
 
@@ -837,12 +824,7 @@ pub fn info(
     registry_url: Option<&str>,
     name: &str,
 ) -> Result<Vec<IndexEntry>> {
-    let base = resolve_index_base(root, index_id, registry_url)?.ok_or_else(|| {
-        Error::registry(
-            ErrorCode::ZAP6105,
-            "no index to query: pass `--registry <url>`, `--index <id>`, or set ZAP_REGISTRY",
-        )
-    })?;
+    let base = resolve_index_base(root, index_id, registry_url)?;
     let rn = RegistryName::parse(name)?;
     let fetcher = DefaultFetcher;
     let reg = Registry::new(

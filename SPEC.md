@@ -619,7 +619,10 @@ index; an `https://` index needs the hosted authenticated write API, which is
 gated on the org move); `zap search <query>` lists packages in a local index and
 `zap info <name>` shows a package's published versions, checksums and yank state
 from any static index. `zap login` stores a bearer token outside the repo for
-the (gated) hosted write path. These verbs are **experimental** (the 1.0 CLI
+the (gated) hosted write path. The default index is **`pkg.zaplang.org`**,
+overridable with `$ZAP_REGISTRY`, a `[registries]` entry, or `--registry`; a
+project with only `git`/`path` dependencies never contacts it. These verbs are
+**experimental** (the 1.0 CLI
 surface is frozen, D-0076, so they are additive). Full design in
 `design/0027-registry.md`.
 

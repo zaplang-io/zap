@@ -1295,7 +1295,7 @@ fn cmd_publish(index: Option<&str>, registry: Option<&str>, dry_run: bool) -> Ex
                 println!("  package  {}", arc.display());
             }
             if p.dry_run && p.index_file.is_none() {
-                println!("  (no target resolved; validated and packaged only)");
+                println!("  (validated and packaged; nothing written)");
             }
             ExitCode::SUCCESS
         }
@@ -1658,6 +1658,8 @@ registry (publish & discovery, issue #237, D-0027/D-0083, experimental):
                  --registry url]         local/file:// index
   info <name> [--index id|               show a package's published versions,
               --registry url]            checksums, yank status and deps
+     the default index is pkg.zaplang.org; override with $ZAP_REGISTRY, a
+     [registries] entry, or --registry (git/path deps never contact it)
 
 test:
   test [file]           run the @test suite (D-0054); a file, or the project

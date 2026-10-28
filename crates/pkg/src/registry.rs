@@ -26,6 +26,14 @@ use crate::name::RegistryName;
 /// The environment variable overriding the default index base URL (§8).
 pub const ZAP_REGISTRY: &str = "ZAP_REGISTRY";
 
+/// The built-in default index base: the official Zap registry under the
+/// `zaplang.org` host (design/0027-registry.md §8). `$ZAP_REGISTRY` overrides
+/// it, a `[registries]` entry names an alternate, and a `registry` dep's
+/// `index = "<id>"` selects one — so re-pointing after the org move is a config
+/// change, not a code change. Provisional until the registry service is live
+/// (I#303/#304); a consumer with no registry dependencies never contacts it.
+pub const DEFAULT_INDEX: &str = "https://pkg.zaplang.org/";
+
 /// Fetches the bytes at an index URL. Abstracted so the transport (`file://`,
 /// `curl`) is swappable and so tests can resolve against a fixture tree.
 pub trait Fetcher {
@@ -212,15 +220,29 @@ fn join_url(base: &str, rel: &str) -> String {
     format!("{base}/{rel}")
 }
 
+/// The default index base: `$ZAP_REGISTRY` when set and non-empty, else the
+/// built-in [`DEFAULT_INDEX`] (`pkg.zaplang.org`). Env always wins.
+pub fn default_index_base() -> String {
+    std::env::var(ZAP_REGISTRY)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_INDEX.to_string())
+}
+
 /// Build the default client wiring from the process environment and a manifest's
-/// `[registries]` table. `default_base` is `$ZAP_REGISTRY` if set (no live
-/// hosting default is baked in pre-launch, §8 Open issues).
+/// `[registries]` table. `default_base` is `$ZAP_REGISTRY` if set, else the
+/// built-in [`DEFAULT_INDEX`] (§8). A pure `git`/`path` project never consults
+/// it, so resolution stays network-free.
 pub fn default_registry<'f>(
     fetcher: &'f dyn Fetcher,
     named: BTreeMap<String, String>,
 ) -> Registry<'f> {
-    let default_base = std::env::var(ZAP_REGISTRY).ok().filter(|s| !s.is_empty());
-    Registry::new(fetcher, default_base, named, toolchain_version())
+    Registry::new(
+        fetcher,
+        Some(default_index_base()),
+        named,
+        toolchain_version(),
+    )
 }
 
 /// A `file://` URL for a local path (used to point the client at a fixture
@@ -257,6 +279,21 @@ mod tests {
     fn join_url_single_slash() {
         assert_eq!(join_url("file:///a/", "b/c.json"), "file:///a/b/c.json");
         assert_eq!(join_url("https://h/i", "/x"), "https://h/i/x");
+    }
+
+    #[test]
+    fn default_index_base_prefers_env_then_builtin() {
+        // Serialized within this test; ZAP_REGISTRY is read only here among the
+        // registry unit tests, and path/git resolution never consults the base.
+        std::env::remove_var(ZAP_REGISTRY);
+        assert_eq!(default_index_base(), DEFAULT_INDEX);
+        assert_eq!(DEFAULT_INDEX, "https://pkg.zaplang.org/");
+        std::env::set_var(ZAP_REGISTRY, "file:///tmp/my-index");
+        assert_eq!(default_index_base(), "file:///tmp/my-index");
+        // An empty override falls back to the built-in default.
+        std::env::set_var(ZAP_REGISTRY, "");
+        assert_eq!(default_index_base(), DEFAULT_INDEX);
+        std::env::remove_var(ZAP_REGISTRY);
     }
 
     #[test]
