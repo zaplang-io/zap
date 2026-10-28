@@ -8,9 +8,9 @@ def app(int64 x, list[int64] acc = []) -> int64:
     return len(acc)
 
 def main():
-    print(app(1))            # 1  (fresh [])
-    print(app(2))            # 1  (fresh [] again — not 2)
-    print(app(3))            # 1  (still fresh)
+    print(app(1))  # 1  (fresh [])
+    print(app(2))  # 1  (fresh [] again — not 2)
+    print(app(3))  # 1  (still fresh)
     auto shared = [10, 20]
-    print(app(99, shared))   # 3  (explicit list appended)
-    print(len(shared))       # 3  (caller's list was mutated — reference type)
+    print(app(99, shared))  # 3  (explicit list appended)
+    print(len(shared))  # 3  (caller's list was mutated — reference type)

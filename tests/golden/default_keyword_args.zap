@@ -13,20 +13,20 @@ def g(str a, str b, int64 c) -> str:
 
 def main():
     # --- still-working baselines: every parameter, in declaration order ------
-    print(f("x", "Y", 9))            # xY9  (all positional)
-    print(f(a="x", b="Y", c=9))      # xY9  (all by-name, in order)
+    print(f("x", "Y", 9))  # xY9  (all positional)
+    print(f(a="x", b="Y", c=9))  # xY9  (all by-name, in order)
 
     # --- omitted defaults ----------------------------------------------------
-    print(f("x"))                    # xB3  (both defaults)
-    print(f("x", "Y"))               # xY3  (trailing default)
+    print(f("x"))  # xB3  (both defaults)
+    print(f("x", "Y"))  # xY3  (trailing default)
 
     # --- keyword fill skipping a middle default ------------------------------
-    print(f("x", c=9))               # xB9  (b defaulted, c by name)
-    print(f(a="z", c=5))             # zB5  (a by name, b defaulted, c by name)
+    print(f("x", c=9))  # xB9  (b defaulted, c by name)
+    print(f(a="z", c=5))  # zB5  (a by name, b defaulted, c by name)
 
     # --- out-of-order keywords, no defaults ----------------------------------
-    print(g("x", c=9, b="Y"))        # xY9  (positional a, then c, b by name)
-    print(g(c=9, a="x", b="Y"))      # xY9  (all by-name, fully scrambled)
+    print(g("x", c=9, b="Y"))  # xY9  (positional a, then c, b by name)
+    print(g(c=9, a="x", b="Y"))  # xY9  (all by-name, fully scrambled)
 
     # --- compose: positional + out-of-order keyword + omitted default --------
-    print(f("x", c=7))               # xB7
+    print(f("x", c=7))  # xB7
