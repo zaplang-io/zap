@@ -1965,10 +1965,22 @@ impl Checker {
                 self.push_scope();
                 match target {
                     Expr::Name(n, s) => self.declare(n, elem, *s),
+                    // Tuple-destructuring target (`for k, v in d.items()`,
+                    // ticket #299): bind each name to the matching element-type
+                    // field when the element is a statically-known tuple;
+                    // otherwise (e.g. an `Unknown` element) fall back to loose.
                     Expr::Tuple(elems, _) => {
-                        for e in elems {
+                        let field_tys = match &elem {
+                            Ty::Tuple(ts) if ts.len() == elems.len() => Some(ts.clone()),
+                            _ => None,
+                        };
+                        for (i, e) in elems.iter().enumerate() {
                             if let Expr::Name(n, s) = e {
-                                self.declare(n, Ty::Unknown, *s);
+                                let t = field_tys
+                                    .as_ref()
+                                    .map(|ts| ts[i].clone())
+                                    .unwrap_or(Ty::Unknown);
+                                self.declare(n, t, *s);
                             }
                         }
                     }
@@ -2965,6 +2977,9 @@ impl Checker {
         match it {
             Ty::Range => Some(Ty::Int64),
             Ty::List(t) | Ty::Set(t) | Ty::Heap(t) => Some((**t).clone()),
+            // Iterating a dict yields its keys (Python semantics, ticket #299);
+            // `for k, v` uses `d.items()`. Order is unspecified (hash order).
+            Ty::Dict(k, _) => Some((**k).clone()),
             Ty::Str => Some(Ty::Char),
             Ty::Unknown | Ty::Py => Some(Ty::Unknown),
             Ty::Named(_) => {
@@ -3833,6 +3848,13 @@ impl Checker {
             if matches!(bt, Ty::Str) {
                 return self.check_str_method(name, args, *span);
             }
+            // Built-in `dict` methods (ticket #299), typed precisely so that
+            // `for k in d.keys()`, `for k, v in d.items()`, and a `copy()` that
+            // is then indexed all check against the real element types.
+            if let Ty::Dict(k, v) = &bt {
+                let (k, v) = (k.clone(), v.clone());
+                return self.check_dict_method(name, args, &k, &v, *span);
+            }
             for a in args {
                 self.infer(&a.value);
             }
@@ -3935,6 +3957,43 @@ impl Checker {
                 Ty::Unknown
             }
         }
+    }
+
+    /// Type-check a built-in `dict[K, V]` method call (ticket #299). All four
+    /// methods take no arguments: `keys() -> list[K]`, `values() -> list[V]`,
+    /// `items() -> list[(K, V)]`, and `copy() -> dict[K, V]` (a shallow copy).
+    fn check_dict_method(&mut self, name: &str, args: &[Arg], k: &Ty, v: &Ty, span: Span) -> Ty {
+        let ret = match name {
+            "keys" => Ty::List(Box::new(k.clone())),
+            "values" => Ty::List(Box::new(v.clone())),
+            "items" => Ty::List(Box::new(Ty::Tuple(vec![k.clone(), v.clone()]))),
+            "copy" => Ty::Dict(Box::new(k.clone()), Box::new(v.clone())),
+            other => {
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!(
+                        "dict has no method '{other}' \
+                         (supported: keys, values, items, copy)"
+                    ),
+                    span,
+                );
+                for a in args {
+                    self.infer(&a.value);
+                }
+                return Ty::Unknown;
+            }
+        };
+        if !args.is_empty() {
+            self.error(
+                ErrorCode::ZAP4025,
+                format!("dict.{name}() takes no arguments"),
+                span,
+            );
+            for a in args {
+                self.infer(&a.value);
+            }
+        }
+        ret
     }
 
     /// Check that a `str` method got exactly `n` `str` arguments.

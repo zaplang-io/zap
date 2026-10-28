@@ -859,6 +859,29 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), p.into(), p.into()],
             Some(p.into()),
         );
+        // dict enumeration / membership / shallow copy (ticket #299). Keys and
+        // values are snapshotted into a fresh list (word kind picked by codegen);
+        // `contains` probes for a live key; `copy` shares referenced objects.
+        self.declare_rt("zap_dict_keys_i64", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_dict_keys_ptr", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_dict_values_i64", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_dict_values_ptr", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_dict_contains_i64",
+            &[p.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_dict_contains_str",
+            &[p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_dict_contains_fn",
+            &[p.into(), p.into(), p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt("zap_dict_copy", &[p.into()], Some(p.into()));
         // set
         self.declare_rt("zap_set_new", &[], Some(p.into()));
         self.declare_rt("zap_set_len", &[p.into()], Some(i.into()));

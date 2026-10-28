@@ -150,6 +150,14 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
   `zap_set_contains_fn`) that take the `__hash__`/`__eq__` pointers as trailing
   arguments. A new `KEY_FN` key kind routes the probe loop through them. This is
   the struct-element-hashing unblock deferred in D-0043.
+  Enumeration, membership, and shallow copy (#299): `zap_dict_keys_{i64,ptr}` /
+  `zap_dict_values_{i64,ptr}` snapshot keys/values into a fresh `list` (the word
+  kind is chosen by codegen from the static key/value type); `for k in d`
+  iterates the key snapshot and `d.items()` builds a `list[(K,V)]` from it.
+  `zap_dict_contains_{i64,str,fn}` probes for a live key (`k in d`), distinct
+  from `get` whose `0` is ambiguous with a stored `0`. `zap_dict_copy` returns a
+  fresh dict sharing the referenced key/value objects. **Enumeration order is
+  unspecified** (hash/probe order), matching the json object-key walker (D-0059).
 - `array[T]` (#24, #49): `[ header | dtype | ndim | dims: *i64 | strides: *i64 |
   data: *T ]`, contiguous row-major; views share `data`. `dtype` tags the
   element type — `0 = f64`, `1 = i64` (8-byte words), `2 = uint8`, `3 = bool`
