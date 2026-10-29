@@ -1,9 +1,8 @@
-# diff: diverge BUG: using a list or dict directly in a boolean context — `if
-# xs:` / `if not d:` — crashes Zap codegen (panic "Found PointerValue but
-# expected the IntValue variant", exit 101) instead of applying Python
-# truthiness (empty is falsy, non-empty truthy). SCALAR/string truthiness works
-# (see truthiness.zap); only container truthiness faults. A real codegen bug to
-# triage. CPython: empty-falsy / full-truthy / dict-empty-falsy; Zap: crash.
+# diff: match
+# Container truthiness (#382): a list or dict used directly in a boolean
+# context is falsy when empty and truthy otherwise (Python / D-0022). Fixed by
+# routing container `truthy`/`bool()` lowering through the size runtime; Zap now
+# agrees with CPython (empty-falsy / full-truthy / dict-empty-falsy).
 def main():
     list[int64] empty = []
     if not empty:
