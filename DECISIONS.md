@@ -2060,7 +2060,7 @@ link time. Governed by D-0076 (`run`/`build` are Stable; this is a new, additive
   `dlopen`-ed libpython so portable binaries can still opt into Python at runtime;
   cross-build (`--target`) once codegen emits for non-host triples (#203).
 
-## D-0083 — `encoding/url` percent-encoding module (I#335)
+## D-0084 — `encoding/url` percent-encoding module (I#335)
 
 **Status:** Accepted — implemented. A built-in **`url`** stdlib module (the
 `crates/sema|ir|codegen/.../modules/` seam, D-0056; pure, dependency-free C in
@@ -2097,3 +2097,37 @@ canonicalization variant required by every REST and query AWS protocol.
   `encode_query` for order-preserving / repeated-key query strings (needs
   tuple-list iteration in the runtime); percent-decoding straight into a `bytes`
   value once a distinct `bytes` type lands (I#284 follow-up).
+
+## D-0083 — Stable list sort: `xs.sort()` / `sorted(xs)` (I#336)
+
+**Status:** Accepted. Stable in-place `list.sort()` and a copying `sorted(xs)`
+with optional `key=` / `reverse=`, needed for canonical SigV4 header/query
+ordering and deterministic JSON/XML serialization (D-0011). ABI in
+`design/RUNTIME-ABI.md` §"Collection layout".
+
+- **Surface (Python-readable).** `xs.sort(key=f, reverse=True)` sorts in place;
+  `sorted(xs, key=f, reverse=True)` returns a new list and leaves `xs` untouched.
+  `key` / `reverse` are keyword-only, matching Python. No positional comparator:
+  a `key=` projection covers the ordering need without a second ABI shape.
+- **Stable by construction.** A bottom-up merge sort over an index permutation;
+  equal keys keep input order, and `reverse=True` keeps that stability (it flips
+  only the key comparison, as Python does), which is what canonical ordering and
+  reproducible output require.
+- **One core entry point, alias-safe.** `zap_list_sort_by(dst, keys, cmp_kind,
+  reverse)` orders `dst` by a parallel `keys` list; the no-key case passes
+  `keys == dst` (compare elements by their own word). The key array is fully read
+  to order the indices before any element moves, so the alias is safe. `cmp_kind`
+  is `0` (signed `i64`: int/bool) or `1` (byte-wise `ZapStr`: str).
+- **`key=` runs in compiled code.** The projection (a first-class function value,
+  [[D-0067]]) is applied per element to build `keys` in generated ZIR, not in the
+  C runtime: the growing list must stay a GC root across each call's safepoint,
+  which a C loop calling back into Zap cannot guarantee. `zap_list_sort_by` then
+  makes no call into Zap and allocates only non-GC scratch, so it is a GC leaf.
+  The key's **return type** selects `cmp_kind`.
+- **No new runtime GC work.** `zap_list_copy` (for `sorted`) reuses the list
+  descriptor's precise tracing; the sort touches no collector internals.
+- **Limits (clean follow-ups).** Element types without an ordering and no `key=`
+  are a compile error; `float` lists remain unsupported in collections generally;
+  an inline `lambda` key needs a function-typed context it does not get here, so
+  `key=` wants a named function or a `fn(T)->R` binding in v1; a user-struct
+  `__cmp__`/`Ord`-driven ordering is deferred.
