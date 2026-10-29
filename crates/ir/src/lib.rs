@@ -38,6 +38,31 @@ mod tests {
     }
 
     #[test]
+    fn lower_chained_comparison_single_eval_and_short_circuit() {
+        // `1 < f(2) < 3` is Python-chained (I#386): it must evaluate the
+        // interior operand `f(2)` exactly once, reuse that value as the left
+        // side of the second comparison, and only reach the second link (which
+        // materializes the last operand `3`) when the first link holds.
+        let m = lower_ok(
+            "def f(int64 n) -> int64:\n    return n\n\ndef main():\n    print(str(1 < f(2) < 3))\n",
+        );
+        let text = format!("{m}");
+        // The side-effecting middle operand is called exactly once.
+        let calls = text.matches("@f(%2)").count();
+        assert_eq!(calls, 1, "f must be evaluated exactly once:\n{text}");
+        // Two comparison links.
+        assert_eq!(
+            text.matches("icmp.Lt").count(),
+            2,
+            "two comparison links:\n{text}"
+        );
+        // The chain short-circuits through a conditional branch, and the result
+        // is merged through a single i1 stack slot.
+        assert!(text.contains("alloca i1"), "merge slot:\n{text}");
+        assert!(text.contains("br_if"), "short-circuit branch:\n{text}");
+    }
+
+    #[test]
     fn lower_fib_fixture() {
         let m = lower_ok(include_str!("../../../tests/golden/fib.zap"));
         assert_eq!(m.funcs.len(), 2);

@@ -6889,6 +6889,43 @@ impl<'a> FnLower<'a> {
                 let (r, rt) = self.expr(rhs)?;
                 self.binop(*op, l, lt, r, rt)
             }
+            // Chained comparison `x0 op1 x1 op2 x2 ...` with Python semantics
+            // (I#386): equivalent to `(x0 op1 x1) and (x1 op2 x2) and ...` where
+            // each operand is evaluated exactly once, left to right, and the
+            // chain short-circuits at the first link that is falsy. We carry the
+            // previous operand's already-computed value forward so an interior
+            // operand with side effects (e.g. a call) runs a single time, and we
+            // branch to a shared join after each link just like `and` does. The
+            // IR has no phi, so the result is merged through a stack slot.
+            Expr::Compare { first, rest, .. } => {
+                let slot = self.alloca(Ty::I1);
+                let join_bb = self.new_block();
+                let (mut prev_v, mut prev_t) = self.expr(first)?;
+                let last = rest.len() - 1;
+                for (i, (op, rhs)) in rest.iter().enumerate() {
+                    let (rv, rt) = self.expr(rhs)?;
+                    let (cv, ct) = self.binop(*op, prev_v, prev_t, rv, rt)?;
+                    let cb = self.truthy(cv, ct);
+                    self.store(slot, cb);
+                    if i != last {
+                        // Evaluate the next operand only if this link held.
+                        let next_bb = self.new_block();
+                        self.set_term(Term::BrIf {
+                            cond: cb,
+                            then_bb: next_bb,
+                            else_bb: join_bb,
+                        });
+                        self.position(next_bb);
+                    }
+                    // The right operand becomes the next link's left operand,
+                    // reusing the value computed above (evaluated once).
+                    prev_v = rv;
+                    prev_t = rt;
+                }
+                self.ensure_br(join_bb);
+                self.position(join_bb);
+                Ok((self.load(slot, Ty::I1), Ty::I1))
+            }
             Expr::Call { callee, args, .. } => self.call(callee, args),
             Expr::RegexMatch {
                 subject,
@@ -11393,6 +11430,12 @@ fn collect_free_names(
         Expr::Binary { lhs, rhs, .. } => {
             collect_free_names(lhs, bound, out, seen);
             collect_free_names(rhs, bound, out, seen);
+        }
+        Expr::Compare { first, rest, .. } => {
+            collect_free_names(first, bound, out, seen);
+            for (_, operand) in rest {
+                collect_free_names(operand, bound, out, seen);
+            }
         }
         Expr::Call { callee, args, .. } => {
             collect_free_names(callee, bound, out, seen);

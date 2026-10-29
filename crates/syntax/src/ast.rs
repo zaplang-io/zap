@@ -635,6 +635,20 @@ pub enum Expr {
         span: Span,
     },
 
+    /// Chained comparison `x0 op1 x1 op2 x2 ... opn xn` with Python semantics
+    /// (I#386): equivalent to `(x0 op1 x1) and (x1 op2 x2) and ...`, where each
+    /// operand is evaluated exactly once, left to right, and evaluation stops at
+    /// the first link that does not hold (so a later operand with side effects
+    /// does not run). The parser only builds this when two or more comparison
+    /// operators appear at the same level without parentheses; a single
+    /// comparison stays an [`Expr::Binary`]. `rest` is always non-empty with at
+    /// least two links.
+    Compare {
+        first: Box<Expr>,
+        rest: Vec<(BinOp, Expr)>,
+        span: Span,
+    },
+
     Call {
         callee: Box<Expr>,
         args: Vec<Arg>,

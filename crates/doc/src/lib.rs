@@ -676,6 +676,7 @@ fn expr_start(e: &Expr) -> u32 {
         | Expr::SetComp { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
+        | Expr::Compare { span, .. }
         | Expr::Call { span, .. }
         | Expr::Index { span, .. }
         | Expr::Slice { span, .. }

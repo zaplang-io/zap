@@ -38,10 +38,18 @@ fn binop_prec(op: BinOp) -> (u8, bool /* right-assoc */) {
     }
 }
 
+/// Whether `op` is a (now non-associative) comparison operator, i.e. one that
+/// participates in Python-style chaining (I#386).
+fn is_cmp_op(op: BinOp) -> bool {
+    use BinOp::*;
+    matches!(op, Eq | Ne | Lt | Le | Gt | Ge | In)
+}
+
 /// The precedence of an expression as a whole (how tightly it already binds).
 fn prec(e: &Expr) -> u8 {
     match e {
         Expr::Binary { op, .. } => binop_prec(*op).0,
+        Expr::Compare { .. } => P_CMP,
         Expr::Unary { op: UnOp::Not, .. } => P_NOT,
         Expr::Unary { .. } | Expr::ChanRecv { .. } => P_UNARY,
         Expr::IfElse { .. } => P_TERNARY,
@@ -128,13 +136,39 @@ pub fn render(e: &Expr) -> String {
         },
         Expr::Binary { op, lhs, rhs, .. } => {
             let (p, right_assoc) = binop_prec(*op);
-            let (lmin, rmin) = if right_assoc { (p + 1, p) } else { (p, p + 1) };
+            // Comparison operators are non-associative now that `a < b < c`
+            // chains (I#386): a comparison nested as an operand of another
+            // comparison — e.g. `(a < b) < c` — must keep its parentheses, or it
+            // would re-parse as a chain. So both children of a comparison bind
+            // at `p + 1`, not the left-associative `(p, p + 1)`.
+            let (lmin, rmin) = if is_cmp_op(*op) {
+                (p + 1, p + 1)
+            } else if right_assoc {
+                (p + 1, p)
+            } else {
+                (p, p + 1)
+            };
             format!(
                 "{} {} {}",
                 pexpr(lhs, lmin),
                 binop_str(*op),
                 pexpr(rhs, rmin)
             )
+        }
+        Expr::Compare { first, rest, .. } => {
+            // Render the chain flat: `a < b < c`. Operands bind tighter than a
+            // comparison, so each is printed at `P_CMP + 1`, which also re-parens
+            // a genuine nested comparison (an `Expr::Binary`) so it does not
+            // re-parse as a chain.
+            let mut out = pexpr(first, P_CMP + 1);
+            for (op, operand) in rest {
+                out.push_str(&format!(
+                    " {} {}",
+                    binop_str(*op),
+                    pexpr(operand, P_CMP + 1)
+                ));
+            }
+            out
         }
         Expr::ChanRecv { chan, .. } => format!("<-{}", pexpr(chan, P_UNARY)),
         Expr::Yield { value, .. } => match value {

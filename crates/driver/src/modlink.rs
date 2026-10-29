@@ -578,6 +578,7 @@ fn expr_span(e: &Expr) -> Span {
         | SetComp { span, .. }
         | Unary { span, .. }
         | Binary { span, .. }
+        | Compare { span, .. }
         | Call { span, .. }
         | Index { span, .. }
         | Slice { span, .. }

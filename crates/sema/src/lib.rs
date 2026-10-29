@@ -2739,6 +2739,26 @@ impl Checker {
                     self.arith_result(*op, &l, &r, *span)
                 }
             }
+            Expr::Compare { first, rest, span } => {
+                // A chained comparison type-checks like the sequence of pairwise
+                // comparisons it desugars to (I#386). Each operand is inferred
+                // exactly once (so names resolve and errors report once), then
+                // every adjacent pair is checked as the corresponding `Binary`
+                // comparison would be. The whole expression is a strict `bool`.
+                let mut tys = Vec::with_capacity(rest.len() + 1);
+                tys.push(self.infer(first));
+                for (_, operand) in rest {
+                    tys.push(self.infer(operand));
+                }
+                for (i, (op, _)) in rest.iter().enumerate() {
+                    let l = &tys[i];
+                    let r = &tys[i + 1];
+                    if self.check_struct_binop(*op, l, r, *span).is_none() {
+                        self.arith_result(*op, l, r, *span);
+                    }
+                }
+                Ty::Bool
+            }
             Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
             Expr::Index { base, index, span } => {
                 let b = self.infer(base);
@@ -4608,6 +4628,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::SetComp { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
+        | Expr::Compare { span, .. }
         | Expr::Call { span, .. }
         | Expr::Index { span, .. }
         | Expr::Slice { span, .. }

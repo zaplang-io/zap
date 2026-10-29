@@ -686,8 +686,9 @@ fn curated_corpus_matches_cpython() {
 /// Generate a seeded corpus of pure-`print` programs over the safe shared
 /// grammar and require byte-identical stdout + exit under both engines. The
 /// grammar deliberately excludes the known divergences (int64 overflow, true
-/// division's float repr, non-bool `and`/`or` values, chained comparison, dict
-/// iteration order), so a failure here is a genuine, newly-found divergence.
+/// division's float repr, non-bool `and`/`or` values, dict iteration order), so
+/// a failure here is a genuine, newly-found divergence. Comparison chaining
+/// (`a < b < c`) is included now that it matches CPython (I#386).
 ///
 /// Deterministic in CI via a fixed seed and a modest count; override with
 /// `ZAP_DIFF_SEED` / `ZAP_DIFF_COUNT` to fuzz harder locally.
@@ -786,13 +787,13 @@ pub mod gen {
         /// One `print(...)` statement drawn from the safe kinds. The grammar is
         /// deliberately restricted to constructs Zap and CPython agree on *and*
         /// Zap codegen fully supports today: integer `+`/`-`/`*` with unary
-        /// minus, boolean logic over boolean operands, single comparisons,
-        /// string concat/len, ternaries, and a comprehension count. It avoids
-        /// every known divergence/gap this PR documents — int64 overflow, true
-        /// division's float repr, non-bool `and`/`or` values, chained
-        /// comparison, `%` sign on negatives, dict iteration order, and the
-        /// unsupported list slice/`in`/negative-index — so a failure here is a
-        /// genuine, newly-found divergence.
+        /// minus, boolean logic over boolean operands, comparisons (single and
+        /// Python-chained, I#386), string concat/len, ternaries, and a
+        /// comprehension count. It avoids every known divergence/gap — int64
+        /// overflow, true division's float repr, non-bool `and`/`or` values,
+        /// `%` sign on negatives, dict iteration order, and the unsupported list
+        /// slice/`in`/negative-index — so a failure here is a genuine,
+        /// newly-found divergence.
         fn statement(&mut self) -> String {
             match self.below(5) {
                 0 => format!("print({})", self.int_expr(3)),
@@ -855,7 +856,8 @@ pub mod gen {
         /// are always boolean (comparisons or bool literals), so the result
         /// value is a plain bool in both languages — Zap's strict-bool `and`/`or`
         /// (D-0022) only diverges from CPython for *non-bool* operands, which
-        /// this generator never produces. Comparisons are never chained.
+        /// this generator never produces. Comparisons may be chained
+        /// (`a < b < c`), which now matches CPython (I#386).
         fn bool_expr(&mut self, depth: u32) -> String {
             if depth == 0 || self.below(3) == 0 {
                 return self.comparison();
@@ -877,10 +879,24 @@ pub mod gen {
         }
 
         fn comparison(&mut self) -> String {
-            let op = *["<", "<=", ">", ">=", "==", "!="]
-                .get(self.below(6) as usize)
-                .unwrap();
-            format!("({} {} {})", self.int_expr(2), op, self.int_expr(2))
+            let ops = ["<", "<=", ">", ">=", "==", "!="];
+            // Roughly a third of the time, emit a *chained* comparison
+            // (`a < b < c`) to fuzz Python-style comparison chaining
+            // (I#386); otherwise a single comparison. The operands are
+            // parenthesized integer expressions, so the only unparenthesized
+            // operators are the chaining comparisons themselves.
+            let links = if self.below(3) == 0 {
+                2 + self.below(2) as usize
+            } else {
+                1
+            };
+            let mut s = format!("({}", self.int_expr(2));
+            for _ in 0..links {
+                let op = ops[self.below(6) as usize];
+                s.push_str(&format!(" {} {}", op, self.int_expr(2)));
+            }
+            s.push(')');
+            s
         }
 
         /// Fully-parenthesized string expression over a small literal pool.

@@ -1,0 +1,24 @@
+True
+False
+True
+False
+True
+False
+True
+True
+True
+False
+True
+eval 0
+True
+eval 3
+False
+False
+eval 4
+eval 5
+eval 6
+True
+eval 7
+eval 8
+False
+done

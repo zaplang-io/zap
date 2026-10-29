@@ -2690,6 +2690,9 @@ impl Parser {
 
     /// Precedence-climbing over comparison/bitwise/shift/arithmetic operators
     /// and the regex-bind operators. `min_bp` is the minimum left binding power.
+    ///
+    /// Comparison operators are additionally *chained* rather than left-folded
+    /// (see [`is_chain_cmp`] and [`Expr::Compare`]).
     fn parse_bin(&mut self, min_bp: u8) -> Expr {
         let start = self.peek_span().start;
         let mut lhs = self.parse_operand();
@@ -2710,6 +2713,40 @@ impl Parser {
             if bp < min_bp {
                 break;
             }
+            // Chained comparison (Python semantics, I#386): a run of two or more
+            // comparison operators at the same level — `a < b < c` — is NOT
+            // left-associative `(a < b) < c`; it desugars to `(a < b) and
+            // (b < c)` with each operand evaluated once. Collect the whole run
+            // here so the parser can emit a single [`Expr::Compare`]; a lone
+            // comparison falls through to the ordinary left-associative
+            // `Expr::Binary` below.
+            if Self::is_chain_cmp(op) {
+                self.bump();
+                let mut rest = vec![(op, self.parse_bin(bp + 1))];
+                while let Some((bp2, op2)) = self.bin_bp() {
+                    if !Self::is_chain_cmp(op2) {
+                        break;
+                    }
+                    self.bump();
+                    rest.push((op2, self.parse_bin(bp2 + 1)));
+                }
+                lhs = if rest.len() == 1 {
+                    let (op1, rhs) = rest.pop().expect("one link");
+                    Expr::Binary {
+                        op: op1,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                        span: self.span_from(start),
+                    }
+                } else {
+                    Expr::Compare {
+                        first: Box::new(lhs),
+                        rest,
+                        span: self.span_from(start),
+                    }
+                };
+                continue;
+            }
             self.bump();
             let rhs = self.parse_bin(bp + 1);
             lhs = Expr::Binary {
@@ -2720,6 +2757,17 @@ impl Parser {
             };
         }
         lhs
+    }
+
+    /// Whether `op` is a comparison operator that participates in Python-style
+    /// comparison chaining (`<`, `<=`, `>`, `>=`, `==`, `!=`, `in`). The regex
+    /// binds (`=~`/`!~`), `Send`, and the bitwise/arithmetic operators do not
+    /// chain. Zap has no `is`/`is not`/`not in` operators (see [`BinOp`]).
+    fn is_chain_cmp(op: BinOp) -> bool {
+        matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::In
+        )
     }
 
     fn bin_bp(&self) -> Option<(u8, BinOp)> {
@@ -3532,6 +3580,64 @@ mod tests {
         };
         assert_eq!(*op, BinOp::Add);
         assert!(matches!(rhs.as_ref(), Expr::Binary { op: BinOp::Mul, .. }));
+    }
+
+    #[test]
+    fn chained_comparison_builds_compare_node() {
+        // `a < b < c` is a Python-chained comparison, NOT left-associative
+        // `(a < b) < c` (I#386): the parser emits a single `Compare`.
+        let m = parse_ok("x = a < b < c\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Compare { first, rest, .. } = value else {
+            panic!("expected Compare, got {value:?}");
+        };
+        assert!(matches!(first.as_ref(), Expr::Name(n, _) if n == "a"));
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].0, BinOp::Lt);
+        assert_eq!(rest[1].0, BinOp::Lt);
+        assert!(matches!(&rest[0].1, Expr::Name(n, _) if n == "b"));
+        assert!(matches!(&rest[1].1, Expr::Name(n, _) if n == "c"));
+    }
+
+    #[test]
+    fn chained_comparison_mixed_ops_and_length() {
+        // A four-operand chain with mixed operators: `1 < a <= b == c`.
+        let m = parse_ok("x = 1 < a <= b == c\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Compare { rest, .. } = value else {
+            panic!("expected Compare, got {value:?}");
+        };
+        let ops: Vec<BinOp> = rest.iter().map(|(op, _)| *op).collect();
+        assert_eq!(ops, vec![BinOp::Lt, BinOp::Le, BinOp::Eq]);
+    }
+
+    #[test]
+    fn single_comparison_stays_binary() {
+        // A lone comparison is unchanged — still an `Expr::Binary`.
+        let m = parse_ok("x = a < b\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        assert!(matches!(value, Expr::Binary { op: BinOp::Lt, .. }));
+    }
+
+    #[test]
+    fn parenthesized_comparison_is_not_chained() {
+        // Explicit parens defeat chaining: `(a < b) < c` really does compare a
+        // bool against `c`, so it is nested `Binary`, not a `Compare`.
+        let m = parse_ok("x = (a < b) < c\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Binary { op, lhs, .. } = value else {
+            panic!("expected Binary, got {value:?}");
+        };
+        assert_eq!(*op, BinOp::Lt);
+        assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Lt, .. }));
     }
 
     #[test]
