@@ -8592,6 +8592,230 @@ int64_t zap_datetime_parse_iso(void *s) {
     return zap_datetime_to_unix(y, mo, d, h, mi, sec);
 }
 
+/* --- strptime support (#338) ---
+ * Read up to `maxw` consecutive ASCII digits from `p[*pos..plen]`, advancing
+ * `*pos`; returns the parsed value (0 if none). Bounding the width lets packed
+ * forms such as "%Y%m%d" over "20260101" split without a separator. */
+static int64_t zap_read_digits(const char *p, int64_t plen, int64_t *pos,
+                               int maxw) {
+    int64_t v = 0;
+    int count = 0;
+    while (*pos < plen && count < maxw && p[*pos] >= '0' && p[*pos] <= '9') {
+        v = v * 10 + (p[*pos] - '0');
+        (*pos)++;
+        count++;
+    }
+    return v;
+}
+
+/* If `word` occurs at `p[pos..]` (ASCII case-insensitive), return its length,
+ * else 0. Used for the English weekday/month name directives so parsing stays
+ * locale-free and deterministic. */
+static int zap_ci_prefix(const char *p, int64_t plen, int64_t pos,
+                         const char *word) {
+    int64_t wl = (int64_t)strlen(word);
+    if (pos + wl > plen) {
+        return 0;
+    }
+    for (int64_t k = 0; k < wl; k++) {
+        char a = p[pos + k];
+        char b = word[k];
+        if (a >= 'A' && a <= 'Z') {
+            a = (char)(a - 'A' + 'a');
+        }
+        if (b >= 'A' && b <= 'Z') {
+            b = (char)(b - 'A' + 'a');
+        }
+        if (a != b) {
+            return 0;
+        }
+    }
+    return (int)wl;
+}
+
+/* Parse `s` against a strftime-style `fmt` into a UTC Unix timestamp (#338).
+ *
+ * This is the inverse of `zap_datetime_strftime`: it recognises the same
+ * Python-faithful directive subset and is likewise deterministic and
+ * locale-free (%A/%a/%B/%b match our own English tables, never the C locale):
+ *
+ *   %Y year (<=4 digits)   %y year mod 100 (-> 2000+yy)   %j day-of-year (skip)
+ *   %m %d %H %M %S  numeric fields (<=2 digits each, padding optional)
+ *   %I 12-hour clock + %p AM/PM     %B/%b month name -> month
+ *   %A/%a weekday name (consumed, ignored)
+ *   %z UTC offset (Z or [+-]HH[:]MM, consumed) %Z zone name (consumed)
+ *   %%  a literal percent
+ *
+ * `DateTime` is naive UTC, so the zone directives are read and discarded.
+ * Whitespace in the format matches a run of input whitespace; any other literal
+ * byte must match the input. Parsing is lenient — matching `parse`'s v1
+ * contract (#99) — so on a mismatch it stops and recomposes a best-effort
+ * timestamp from the fields read so far. Returns Unix seconds (UTC). */
+int64_t zap_datetime_strptime(void *s, void *fmt) {
+    static const char *const MON_FULL[12] = {
+        "January", "February", "March",     "April",   "May",      "June",
+        "July",    "August",   "September", "October", "November", "December"};
+    static const char *const MON_ABBR[12] = {"Jan", "Feb", "Mar", "Apr",
+                                             "May", "Jun", "Jul", "Aug",
+                                             "Sep", "Oct", "Nov", "Dec"};
+    static const char *const DAY_FULL[7] = {
+        "Sunday",   "Monday", "Tuesday",  "Wednesday",
+        "Thursday", "Friday", "Saturday"};
+    static const char *const DAY_ABBR[7] = {"Sun", "Mon", "Tue", "Wed",
+                                            "Thu", "Fri", "Sat"};
+    ZapStr *zs = (ZapStr *)s;
+    ZapStr *zf = (ZapStr *)fmt;
+    const char *in = zs->data;
+    int64_t ilen = zs->len < 0 ? 0 : zs->len;
+    const char *f = zf->data;
+    int64_t flen = zf->len < 0 ? 0 : zf->len;
+    int64_t ip = 0;
+    int64_t fp = 0;
+    int y = 1970, mo = 1, d = 1, h = 0, mi = 0, sec = 0;
+    int hour12 = -1; /* raw %I value, if a 12-hour clock was parsed */
+    int pm = -1;     /* -1 unknown, 0 AM, 1 PM */
+
+    while (fp < flen) {
+        char fc = f[fp];
+        if (fc == '%' && fp + 1 < flen) {
+            char dir = f[fp + 1];
+            fp += 2;
+            switch (dir) {
+            case 'Y':
+                y = (int)zap_read_digits(in, ilen, &ip, 4);
+                break;
+            case 'y':
+                y = 2000 + (int)zap_read_digits(in, ilen, &ip, 2);
+                break;
+            case 'm':
+                mo = (int)zap_read_digits(in, ilen, &ip, 2);
+                break;
+            case 'd':
+                d = (int)zap_read_digits(in, ilen, &ip, 2);
+                break;
+            case 'H':
+                h = (int)zap_read_digits(in, ilen, &ip, 2);
+                break;
+            case 'I':
+                hour12 = (int)zap_read_digits(in, ilen, &ip, 2);
+                break;
+            case 'M':
+                mi = (int)zap_read_digits(in, ilen, &ip, 2);
+                break;
+            case 'S':
+                sec = (int)zap_read_digits(in, ilen, &ip, 2);
+                break;
+            case 'j':
+                (void)zap_read_digits(in, ilen, &ip, 3); /* redundant */
+                break;
+            case 'p':
+                if (zap_ci_prefix(in, ilen, ip, "AM")) {
+                    pm = 0;
+                    ip += 2;
+                } else if (zap_ci_prefix(in, ilen, ip, "PM")) {
+                    pm = 1;
+                    ip += 2;
+                }
+                break;
+            case 'B':
+            case 'b': {
+                int matched = 0;
+                for (int k = 0; k < 12; k++) {
+                    int l = zap_ci_prefix(in, ilen, ip, MON_FULL[k]);
+                    if (!l) {
+                        l = zap_ci_prefix(in, ilen, ip, MON_ABBR[k]);
+                    }
+                    if (l) {
+                        mo = k + 1;
+                        ip += l;
+                        matched = 1;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    goto done;
+                }
+                break;
+            }
+            case 'A':
+            case 'a': {
+                int matched = 0;
+                for (int k = 0; k < 7; k++) {
+                    int l = zap_ci_prefix(in, ilen, ip, DAY_FULL[k]);
+                    if (!l) {
+                        l = zap_ci_prefix(in, ilen, ip, DAY_ABBR[k]);
+                    }
+                    if (l) {
+                        ip += l;
+                        matched = 1;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    goto done;
+                }
+                break;
+            }
+            case 'z':
+                if (ip < ilen && (in[ip] == 'Z' || in[ip] == 'z')) {
+                    ip++;
+                } else if (ip < ilen && (in[ip] == '+' || in[ip] == '-')) {
+                    ip++;
+                    (void)zap_read_digits(in, ilen, &ip, 2);
+                    if (ip < ilen && in[ip] == ':') {
+                        ip++;
+                    }
+                    (void)zap_read_digits(in, ilen, &ip, 2);
+                }
+                break;
+            case 'Z':
+                while (ip < ilen && ((in[ip] >= 'A' && in[ip] <= 'Z') ||
+                                     (in[ip] >= 'a' && in[ip] <= 'z'))) {
+                    ip++;
+                }
+                break;
+            case '%':
+                if (ip < ilen && in[ip] == '%') {
+                    ip++;
+                } else {
+                    goto done;
+                }
+                break;
+            default:
+                /* Unknown directive: mirror strftime, which emits "%X". */
+                if (ip < ilen && in[ip] == '%') {
+                    ip++;
+                }
+                if (ip < ilen && in[ip] == dir) {
+                    ip++;
+                }
+                break;
+            }
+        } else if (fc == ' ' || fc == '\t' || fc == '\n') {
+            fp++;
+            while (ip < ilen &&
+                   (in[ip] == ' ' || in[ip] == '\t' || in[ip] == '\n')) {
+                ip++;
+            }
+        } else {
+            if (ip < ilen && in[ip] == fc) {
+                ip++;
+                fp++;
+            } else {
+                goto done;
+            }
+        }
+    }
+done:
+    if (hour12 >= 0) {
+        h = hour12 % 12;
+        if (pm == 1) {
+            h += 12;
+        }
+    }
+    return zap_datetime_to_unix(y, mo, d, h, mi, sec);
+}
+
 /* ===========================================================================
  * Type descriptors for the runtime's own heap types (ticket #48). Both GC
  * builds read `.size`; the precise Immix collector also reads `.kind` and the
