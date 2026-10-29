@@ -140,6 +140,27 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
 
 - `list[T]`: `[ header | len: i64 | cap: i64 | data: *T ]`. Elements are unboxed
   for scalar `T`, pointers for reference `T`. Amortized-doubling growth.
+  Stable sort (#336): `xs.sort()` sorts in place and `sorted(xs)` returns a new
+  list (`zap_list_copy` makes the shallow copy first, leaving the input
+  untouched). Both lower to one core entry point, `zap_list_sort_by(dst, keys,
+  cmp_kind, reverse)`: a **stable bottom-up merge over an index permutation**,
+  keyed by a parallel `keys` list of the same length (`keys == dst` for the
+  no-key case, so elements compare by their own word). `cmp_kind` is `0` for a
+  signed `i64` compare (int/bool) or `1` for a byte-wise `ZapStr` compare
+  (`zap_str_cmp`); `reverse` flips the order while **preserving stability**
+  (equal keys keep input order, as Python's `reverse=True`). The key array is
+  read in full to order the indices before any element moves, so the `keys ==
+  dst` alias is safe. A `key=` projection (a first-class function value, I#163)
+  is applied to every element to build `keys` in **compiled** code — the growing
+  list must be a GC root across each call's safepoint, which a C loop calling
+  back into Zap could not guarantee — and the key's return type selects
+  `cmp_kind`. `zap_list_sort_by` itself makes no call into compiled Zap and
+  allocates only non-GC scratch, so it is a leaf (no safepoint) and every
+  element/key word stays rooted through `dst`/`keys` for the whole sort. Inline
+  `lambda` keys need a function-typed context they don't get here, so a named
+  function or a `fn(T)->R` binding is required for `key=` in v1 (clean
+  follow-up). Element types without an ordering and no `key=` are a compile
+  error.
 - `dict[K,V]`: an open-addressing hash table — `[ header | len | cap | entries:
   *Entry ]`, `Entry = { hash, key, value }`. Hashing/equality come from the key
   type (string/bytes/scalars built-in). A **user-struct key** (operator

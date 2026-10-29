@@ -2213,7 +2213,14 @@ impl Parser {
         if self.looks_like_type_start() {
             let ty = self.parse_type();
             let target = self.parse_bind_target();
-            if self.eat(&TokenKind::Assign) {
+            // Commit only on a *clean* parse that reaches the declaration `=`.
+            // A bare expression statement that merely starts like a type — e.g.
+            // a call with keyword arguments, `xs.sort(reverse=True)` /
+            // `f(x=1)` — makes the speculative type/target parse over-consume and
+            // emit errors, and the kwarg's own `=` then looks like the
+            // declaration's. Rolling back when errors were produced lets the
+            // expression-statement parser (below) handle it instead (I#336).
+            if self.errors.len() == cp.1 && self.eat(&TokenKind::Assign) {
                 let value = self.parse_rhs();
                 return Some(self.make_decl(is_const, Some(ty), target, value, start));
             }
@@ -3798,6 +3805,37 @@ mod tests {
         // Missing ')' — should produce errors, not panic.
         let (_m, perrs, _l) = parse_str("def f(:\n    return 1\n");
         assert!(!perrs.is_empty());
+    }
+
+    #[test]
+    fn bare_statement_call_with_keyword_args_parses() {
+        // A call used as a statement (not a declaration RHS) must still parse
+        // keyword arguments. The speculative `TYPE name = ...` declaration probe
+        // used to over-consume `xs.sort(reverse=True)` / `f(x=1)` and mistake the
+        // kwarg's `=` for the declaration's, corrupting the parse (I#336).
+        let (m, perrs, lerrs) =
+            parse_str("def f():\n    xs.sort(key=g, reverse=True)\n    h(x=1)\n");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected a function");
+        };
+        // `xs.sort(key=g, reverse=True)` — a method call with two keyword args.
+        let Stmt::Expr(Expr::Call { callee, args, .. }) = &f.body.stmts[0] else {
+            panic!(
+                "expected an expression-statement call, got {:?}",
+                f.body.stmts[0]
+            );
+        };
+        assert!(matches!(callee.as_ref(), Expr::Attr { name, .. } if name == "sort"));
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0].name.as_deref(), Some("key"));
+        assert_eq!(args[1].name.as_deref(), Some("reverse"));
+        // `h(x=1)` — a plain function call statement with a keyword arg.
+        let Stmt::Expr(Expr::Call { args, .. }) = &f.body.stmts[1] else {
+            panic!("expected a call statement, got {:?}", f.body.stmts[1]);
+        };
+        assert_eq!(args[0].name.as_deref(), Some("x"));
     }
 
     // --- tuples (ticket #54, D-0049) ---
