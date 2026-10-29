@@ -1,0 +1,9 @@
+full-list-truthy
+empty-list-falsy
+empty-dict-falsy
+full-dict-truthy
+while-list-truthy
+while-empty-skipped
+and-both-truthy
+or-picks-truthy
+and-short-circuits

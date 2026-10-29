@@ -10693,6 +10693,36 @@ impl<'a> FnLower<'a> {
             });
             return d;
         }
+        // Built-in containers (list/dict/set/heap/array) follow Python / D-0022
+        // truthiness: empty is falsy, non-empty truthy. They are heap pointers,
+        // so the integer `ICmp` fallthrough below would feed a `PointerValue`
+        // where codegen expects an `IntValue` and crash (#382). Route through the
+        // size runtime and compare the element count to zero instead.
+        let len_fn = match t {
+            Ty::List(_) => Some("zap_list_len"),
+            Ty::Dict(..) => Some("zap_dict_len"),
+            Ty::Set(_) => Some("zap_set_len"),
+            Ty::Heap(_) => Some("zap_heap_len"),
+            Ty::Array(_) => Some("zap_array_len"),
+            _ => None,
+        };
+        if let Some(len_fn) = len_fn {
+            let len = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(len),
+                func: len_fn.to_string(),
+                args: vec![v],
+            });
+            let z = self.iconst(Ty::I64, 0);
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: d,
+                pred: CmpPred::Ne,
+                lhs: len,
+                rhs: z,
+            });
+            return d;
+        }
         if t.is_float() {
             let z = self.fconst(t, 0.0);
             let d = self.new_value(Ty::I1);
