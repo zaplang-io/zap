@@ -18,6 +18,7 @@ use super::{FnLower, LowerError};
 use crate::ir::*;
 
 mod argparse;
+mod base64;
 mod bisect;
 mod concurrent;
 mod crypto;
@@ -26,6 +27,7 @@ mod deque;
 mod fs;
 mod gc;
 mod gzip;
+mod hex;
 mod http;
 mod io;
 mod json;
@@ -76,6 +78,8 @@ pub(super) const MODULES: &[ModuleLower] = &[
     fs::MODULE,
     process::MODULE,
     crypto::MODULE,
+    base64::MODULE,
+    hex::MODULE,
     math::MODULE,
     random::MODULE,
     time::MODULE,

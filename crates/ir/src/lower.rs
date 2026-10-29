@@ -1138,7 +1138,8 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "uint8" | "u8" => Ok(Ty::I8),
             "bool" => Ok(Ty::I1),
             "char" => Ok(Ty::I32),
-            "str" | "bytes" => Ok(Ty::Ptr),
+            "str" => Ok(Ty::Ptr),
+            "bytes" => Ok(Ty::Bytes),
             "pyobject" => Ok(Ty::Py),
             "list" => {
                 let e = match args.first() {
@@ -1325,6 +1326,7 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
         // its own `__hash__`/`__eq__` (operator overloading, D-0047).
         Ty::Struct(sid) => Ok(Elem::Struct(sid)),
         Ty::Ptr
+        | Ty::Bytes
         | Ty::List(_)
         | Ty::Dict(..)
         | Ty::Set(_)
@@ -3732,6 +3734,14 @@ impl<'a> FnLower<'a> {
         // renders decimal. int32/char share the `i32` representation, so an
         // int32 renders as a character here too (format it as decimal via
         // `str(int64(x))`); a full fix needs `char` threaded through the IR.
+        // `str(bytes)`: decode the UTF-8 bytes, raising a catchable exception on
+        // invalid UTF-8 (I#337). It can raise, so it routes through
+        // `throwing_call` (an `invoke` to the nearest handler / top-level).
+        if matches!(vt, Ty::Bytes) {
+            let d = self.new_value(Ty::Ptr);
+            self.throwing_call(Some(d), "zap_bytes_to_str", vec![v]);
+            return Ok(d);
+        }
         let (func, arg) = match vt {
             Ty::Ptr => return Ok(v),
             Ty::I32 => ("zap_char_to_str", v),
@@ -3777,8 +3787,8 @@ impl<'a> FnLower<'a> {
                 });
                 Ok(d)
             }
-            Ty::Ptr => {
-                // Non-empty string is truthy: compare its byte length to 0.
+            // A non-empty `str` or `bytes` is truthy: compare byte length to 0.
+            Ty::Ptr | Ty::Bytes => {
                 let len = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
                     dest: Some(len),
@@ -3795,7 +3805,7 @@ impl<'a> FnLower<'a> {
                 });
                 Ok(d)
             }
-            _ => Err(err("bool() expects a str, char, number or bool")),
+            _ => Err(err("bool() expects a str, bytes, char, number or bool")),
         }
     }
 
@@ -6227,13 +6237,18 @@ impl<'a> FnLower<'a> {
                 } else {
                     unescape(value)
                 };
-                let _ = bytes; // byte strings share the string object for now
-                let d = self.new_value(Ty::Ptr);
+                // `b"..."` and `"..."` share the `ZapStr` object; only the static
+                // type differs so byte-wise ops route correctly (I#337). The
+                // literal's bytes are the UTF-8 encoding of the escaped text —
+                // `unescape` has no `\xNN` form, so arbitrary non-UTF-8 bytes use
+                // `bytes([...])`.
+                let ty = if *bytes { Ty::Bytes } else { Ty::Ptr };
+                let d = self.new_value(ty);
                 self.emit(Inst::StrConst {
                     dest: d,
                     bytes: data,
                 });
-                Ok((d, Ty::Ptr))
+                Ok((d, ty))
             }
             Expr::Name(n, _) => {
                 if let Some((ptr, ty)) = self.lookup(n) {
@@ -6297,6 +6312,54 @@ impl<'a> FnLower<'a> {
                         Ok((d, t))
                     }
                 }
+            }
+            // Boolean `and` / `or` short-circuit left-to-right (Python
+            // semantics): the right operand is evaluated only when the left
+            // does not already decide the result, so a guard idiom like
+            // `i < len(xs) and xs[i] == v` never evaluates (and thus never
+            // faults on) `xs[i]` when the bound check is false. The result is a
+            // strict `bool` (D-0022): each operand is truthiness-tested, and
+            // the surviving operand's truthy bit is the value. We merge the two
+            // paths through a stack slot (the IR has no phi; cf. the Optional
+            // build and the `in` fallback).
+            Expr::Binary {
+                op: op @ (AstBin::And | AstBin::Or),
+                lhs,
+                rhs,
+                ..
+            } => {
+                let is_and = matches!(op, AstBin::And);
+                let (l, lt) = self.expr(lhs)?;
+                let lb = self.truthy(l, lt);
+                // Default result is the left operand's truthy bit — the value
+                // when we short-circuit (`false and _` -> false, `true or _`
+                // -> true).
+                let slot = self.alloca(Ty::I1);
+                self.store(slot, lb);
+                let rhs_bb = self.new_block();
+                let join_bb = self.new_block();
+                // `and`: descend into the right operand only when the left is
+                // truthy. `or`: only when the left is falsy.
+                if is_and {
+                    self.set_term(Term::BrIf {
+                        cond: lb,
+                        then_bb: rhs_bb,
+                        else_bb: join_bb,
+                    });
+                } else {
+                    self.set_term(Term::BrIf {
+                        cond: lb,
+                        then_bb: join_bb,
+                        else_bb: rhs_bb,
+                    });
+                }
+                self.position(rhs_bb);
+                let (r, rt) = self.expr(rhs)?;
+                let rb = self.truthy(r, rt);
+                self.store(slot, rb);
+                self.ensure_br(join_bb);
+                self.position(join_bb);
+                Ok((self.load(slot, Ty::I1), Ty::I1))
             }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (l, lt) = self.expr(lhs)?;
@@ -6818,7 +6881,14 @@ impl<'a> FnLower<'a> {
                     // (ticket #284). Indexing/slicing/iteration are already
                     // codepoint-based, so this only differs for non-ASCII `str`.
                     Ty::Ptr => "zap_str_len",
-                    _ => return Err(err("len() expects a list, dict, set, heap, array, or str")),
+                    // `bytes`: byte count (I#337). `zap_str_len` returns the
+                    // ZapStr length, which is the byte count for a `bytes`.
+                    Ty::Bytes => "zap_str_len",
+                    _ => {
+                        return Err(err(
+                            "len() expects a list, dict, set, heap, array, str, or bytes",
+                        ))
+                    }
                 };
                 let d = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
@@ -6864,6 +6934,34 @@ impl<'a> FnLower<'a> {
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
                 return Ok((self.render_str(v, vt)?, Ty::Ptr));
+            }
+            if fname == "bytes" {
+                // bytes(): empty; bytes(str): the UTF-8 bytes (shares the ZapStr
+                // buffer — both are immutable); bytes(list[int64]): one byte per
+                // element, each validated to 0..=255 (I#337).
+                if args.is_empty() {
+                    let d = self.new_value(Ty::Bytes);
+                    self.emit(Inst::StrConst {
+                        dest: d,
+                        bytes: Vec::new(),
+                    });
+                    return Ok((d, Ty::Bytes));
+                }
+                if args.len() != 1 {
+                    return Err(err("bytes() takes at most one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                return match vt {
+                    // str / bytes share the ZapStr repr — relabel, no copy.
+                    Ty::Ptr | Ty::Bytes => Ok((v, Ty::Bytes)),
+                    Ty::List(_) => {
+                        // Validates each element is 0..=255, raising otherwise.
+                        let d = self.new_value(Ty::Bytes);
+                        self.throwing_call(Some(d), "zap_bytes_from_list", vec![v]);
+                        Ok((d, Ty::Bytes))
+                    }
+                    _ => Err(err("bytes() expects a str or list[int64] argument")),
+                };
             }
             if fname == "int" {
                 // int(x): parse a `str` to an `int`, or convert a number to int.
@@ -8767,6 +8865,20 @@ impl<'a> FnLower<'a> {
                 let (iv, it) = self.expr(index)?;
                 self.call_dunder(sid, "__getitem__", vec![(bv, bty), (iv, it)])
             }
+            // `bytes` indexing (I#337): `b[i]` yields the byte at byte index `i`
+            // as an `int64` in 0..=255. Negative indices count from the end;
+            // out-of-range faults. Distinct from `str`'s codepoint indexing.
+            Ty::Bytes => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_bytes_index".to_string(),
+                    args: vec![bv, iv],
+                });
+                Ok((d, Ty::I64))
+            }
             // `str` lowers to `Ptr`; `s[i]` yields the codepoint at codepoint
             // index `i` as a `char` (an `i32`), Python semantics (D-0025).
             Ty::Ptr => {
@@ -8813,21 +8925,28 @@ impl<'a> FnLower<'a> {
         step: Option<&Expr>,
     ) -> Result<(Value, Ty), LowerError> {
         let (bv, bty) = self.expr(base)?;
-        if bty != Ty::Ptr {
-            return Err(err(
-                "slicing is only supported on str values (list/array slicing is a follow-up)",
-            ));
-        }
+        // `str` slices by codepoint (D-0025); `bytes` slices by byte (I#337).
+        // Both produce a new value of the same type via distinct runtime entry
+        // points.
+        let (func, out_ty) = match bty {
+            Ty::Ptr => ("zap_str_slice", Ty::Ptr),
+            Ty::Bytes => ("zap_bytes_slice", Ty::Bytes),
+            _ => {
+                return Err(err(
+                    "slicing is only supported on str and bytes values (list/array slicing is a follow-up)",
+                ))
+            }
+        };
         let (lo_v, has_lo) = self.slice_bound(lo)?;
         let (hi_v, has_hi) = self.slice_bound(hi)?;
         let (st_v, has_st) = self.slice_bound(step)?;
-        let d = self.new_value(Ty::Ptr);
+        let d = self.new_value(out_ty);
         self.emit(Inst::Call {
             dest: Some(d),
-            func: "zap_str_slice".to_string(),
+            func: func.to_string(),
             args: vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
         });
-        Ok((d, Ty::Ptr))
+        Ok((d, out_ty))
     }
 
     fn lower_index_set(
@@ -9743,6 +9862,71 @@ impl<'a> FnLower<'a> {
                 rhs: zero,
             });
             return Ok((d, Ty::I1));
+        }
+
+        // `bytes` operands (I#337): `+` (concatenation -> bytes), `==`/`!=`
+        // (content equality), and ordering `< <= > >=` (byte-wise), reusing the
+        // `ZapStr` byte-wise runtime. Both operands share the physical repr, so
+        // the comparison helpers are identical to `str`'s; `+` yields `bytes`.
+        // Sema has checked that both sides are `bytes`.
+        if lt == Ty::Bytes && rt == Ty::Bytes {
+            if matches!(op, Add) {
+                let d = self.new_value(Ty::Bytes);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_concat".to_string(),
+                    args: vec![l, r],
+                });
+                return Ok((d, Ty::Bytes));
+            }
+            if matches!(op, Eq | Ne) {
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: "zap_str_eq".to_string(),
+                    args: vec![l, r],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: if matches!(op, Eq) {
+                        CmpPred::Ne
+                    } else {
+                        CmpPred::Eq
+                    },
+                    lhs: raw,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
+            if matches!(op, Lt | Le | Gt | Ge) {
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: "zap_str_cmp".to_string(),
+                    args: vec![l, r],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let pred = match op {
+                    Lt => CmpPred::Lt,
+                    Le => CmpPred::Le,
+                    Gt => CmpPred::Gt,
+                    Ge => CmpPred::Ge,
+                    _ => unreachable!(),
+                };
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred,
+                    lhs: raw,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
+            return Err(err(
+                "unsupported operation on bytes (bytes supports +, ==, !=, <, <=, >, >=)",
+            ));
         }
 
         // Reference-typed operands: `str` (lowered to `Ptr`) supports `+`
