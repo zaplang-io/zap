@@ -1,0 +1,10 @@
+AZaz09-._~
+a%20b%2Fc%3Fd%3De%26f
+/foo%20bar/baz
+caf%C3%A9%20%E2%82%AC
+roundtrip-ok
+%zz-%2-a+b
+a b c
+q=a%20b%26c
+Param1=value1&Param2=value2
+Action=ListUsers&Delimiter=a%2Fb%20c&Version=2011-06-15

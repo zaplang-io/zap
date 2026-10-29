@@ -40,6 +40,7 @@ mod sys;
 mod threading;
 mod time;
 mod tls;
+mod url;
 mod yaml;
 mod zlib;
 
@@ -76,4 +77,5 @@ pub(crate) fn declare_runtime(cg: &mut Cg) {
     net::declare_rt(cg);
     http::declare_rt(cg);
     tls::declare_rt(cg);
+    url::declare_rt(cg);
 }
