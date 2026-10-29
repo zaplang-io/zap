@@ -243,6 +243,7 @@ const BUILTINS: &[&str] = &[
     "range",
     "len",
     "sum",
+    "sorted",
     // String / char builtins (ticket #284, D-0025).
     "ord",
     "chr",
@@ -3336,6 +3337,22 @@ impl Checker {
                         self.infer(&a.value);
                     }
                     return Ty::Unknown;
+                }
+                // `sorted(xs, key=..., reverse=...)` -> a new list of the same
+                // element type, leaving `xs` unchanged (ticket #336). The element
+                // type is carried through so the result can be indexed/iterated
+                // with precise types.
+                "sorted" => {
+                    let mut result = Ty::Unknown;
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if a.name.is_none() {
+                            if let Ty::List(_) = &at {
+                                result = at.clone();
+                            }
+                        }
+                    }
+                    return result;
                 }
                 "print" => {
                     for a in args {

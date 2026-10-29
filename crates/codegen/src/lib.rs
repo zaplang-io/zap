@@ -793,6 +793,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_list_set_i64", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_list_set_ptr", &[p.into(), i.into(), p.into()], None);
         self.declare_rt("zap_list_len", &[p.into()], Some(i.into()));
+        // list sort (ticket #336): `sorted()` copies first; `zap_list_sort_by`
+        // sorts a list in place by a parallel key list (self for the no-key case).
+        self.declare_rt("zap_list_copy", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_list_sort_by",
+            &[p.into(), p.into(), i.into(), i.into()],
+            None,
+        );
         // dict
         self.declare_rt("zap_dict_new", &[], Some(p.into()));
         self.declare_rt("zap_dict_len", &[p.into()], Some(i.into()));

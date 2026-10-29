@@ -6618,6 +6618,47 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((dest, d.ty()));
             }
+            // `sorted(xs, key=..., reverse=...)` — a new sorted list, leaving the
+            // input untouched (ticket #336). The list is positional; `key` /
+            // `reverse` are keyword-only, same as `xs.sort(...)`.
+            if fname == "sorted" {
+                let mut list_arg: Option<&Expr> = None;
+                let mut rest: Vec<ast::Arg> = Vec::new();
+                for a in args {
+                    if a.name.is_none() {
+                        if list_arg.is_some() {
+                            return Err(err(
+                                "sorted() takes a single positional argument (the list)",
+                            ));
+                        }
+                        list_arg = Some(&a.value);
+                    } else {
+                        rest.push(a.clone());
+                    }
+                }
+                let Some(list_expr) = list_arg else {
+                    return Err(err("sorted() takes the list to sort as its argument"));
+                };
+                let (lst, lt) = self.expr(list_expr)?;
+                let Ty::List(elem) = lt else {
+                    return Err(err("sorted() expects a list value"));
+                };
+                // Copy first so the caller's list is left unchanged, then build
+                // the sort arguments against the copy and sort it in place.
+                let copy = self.new_value(Ty::List(elem));
+                self.emit(Inst::Call {
+                    dest: Some(copy),
+                    func: "zap_list_copy".to_string(),
+                    args: vec![lst],
+                });
+                let (keys, kind, reverse) = self.prepare_sort(copy, elem, "sorted", &rest)?;
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_sort_by".to_string(),
+                    args: vec![copy, keys, kind, reverse],
+                });
+                return Ok((copy, Ty::List(elem)));
+            }
             if fname == "print" {
                 let mut vals = Vec::new();
                 for a in args {
@@ -8919,10 +8960,218 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
+            // `xs.sort(key=..., reverse=...)` — stable, in place (ticket #336).
+            "sort" => {
+                let (keys, kind, reverse) = self.prepare_sort(recv, elem, "sort", args)?;
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_sort_by".to_string(),
+                    args: vec![recv, keys, kind, reverse],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
             other => Err(err(format!(
-                "list has no method '{other}' (supported: append)"
+                "list has no method '{other}' (supported: append, sort)"
             ))),
         }
+    }
+
+    /// Build the shared arguments for a `zap_list_sort_by` call from the optional
+    /// `key=` / `reverse=` keyword arguments of `sort()` / `sorted()` (ticket
+    /// #336). Returns `(keys, cmp_kind, reverse)` where `keys` is the list whose
+    /// words order the sort (the list itself when there is no `key=`), `cmp_kind`
+    /// is `0` (signed int) or `1` (byte-wise str), and `reverse` is a `0/1` flag.
+    ///
+    /// `fname` is the caller's name for diagnostics. A `key=` projection is a
+    /// first-class function value (I#163) whose return type selects `cmp_kind`;
+    /// its key list is built in compiled code by [`Self::build_key_list`] so the
+    /// growing list stays a GC root across the per-element calls.
+    fn prepare_sort(
+        &mut self,
+        lst: Value,
+        elem: Elem,
+        fname: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Value, Value), LowerError> {
+        let mut key_expr: Option<&Expr> = None;
+        let mut reverse_expr: Option<&Expr> = None;
+        for a in args {
+            match a.name.as_deref() {
+                Some("key") => key_expr = Some(&a.value),
+                Some("reverse") => reverse_expr = Some(&a.value),
+                Some(other) => {
+                    return Err(err(format!(
+                        "{fname}() got an unexpected keyword argument '{other}' \
+                         (expected 'key' and/or 'reverse')"
+                    )))
+                }
+                None => {
+                    return Err(err(format!(
+                        "{fname}() takes only the keyword arguments 'key' and 'reverse'"
+                    )))
+                }
+            }
+        }
+        // `reverse` is a 0/1 flag; default ascending.
+        let reverse = match reverse_expr {
+            Some(e) => {
+                let (v, vt) = self.expr(e)?;
+                self.coerce(v, vt, Ty::I64)
+            }
+            None => self.iconst(Ty::I64, 0),
+        };
+        let orderable_kind = |k: Elem, what: &str| -> Result<i64, LowerError> {
+            match k {
+                Elem::I64 => Ok(0),
+                Elem::Ptr => Ok(1),
+                Elem::Struct(_) => Err(err(format!(
+                    "{what} is not orderable; pass key= to sort by an orderable \
+                     projection (an int or str)"
+                ))),
+            }
+        };
+        let (keys, kind) = match key_expr {
+            Some(e) => {
+                let (kv, kt) = self.expr(e)?;
+                let Ty::Func(sig_idx) = kt else {
+                    return Err(err(format!(
+                        "{fname}() key= must be a function value — a named function \
+                         or a fn(T)->R binding"
+                    )));
+                };
+                let ret = self.ctx.fn_sigs.borrow().get(sig_idx).ret;
+                let kind = orderable_kind(elem_kind(ret)?, "the sort key's return value")?;
+                let keys = self.build_key_list(lst, elem, kv, sig_idx, ret)?;
+                (keys, self.iconst(Ty::I64, kind))
+            }
+            None => {
+                let kind = orderable_kind(elem, "this list's elements")?;
+                (lst, self.iconst(Ty::I64, kind))
+            }
+        };
+        Ok((keys, kind, reverse))
+    }
+
+    /// Emit a compiled loop that applies the `key` function to every element of
+    /// `lst`, collecting the results into a fresh list returned for use as sort
+    /// keys (ticket #336). Running in compiled code (not the C runtime) is what
+    /// keeps the growing key list reachable as a GC root across each key call's
+    /// safepoint. `ret` is the key function's return type (int or str).
+    fn build_key_list(
+        &mut self,
+        lst: Value,
+        elem: Elem,
+        keyfn: Value,
+        sig_idx: u32,
+        ret: Ty,
+    ) -> Result<Value, LowerError> {
+        let kkind = elem_kind(ret)?;
+        let keys = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(keys),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![lst],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let e = self.new_value(elem.ty());
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: format!("zap_list_get_{}", elem.val_suffix()),
+            args: vec![lst, i],
+        });
+        let (k, _kt) = self.emit_closure_call(keyfn, sig_idx, vec![e])?;
+        self.emit(Inst::Call {
+            dest: None,
+            func: format!("zap_list_push_{}", kkind.val_suffix()),
+            args: vec![keys, k],
+        });
+        self.set_term(Term::Br(incr_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        Ok(keys)
+    }
+
+    /// Call a first-class function value (I#163) with already-lowered argument
+    /// values, via [`Inst::CallClosure`]. A lower-level companion to
+    /// [`Self::lower_closure_call`], which lowers AST argument expressions.
+    fn emit_closure_call(
+        &mut self,
+        callee: Value,
+        sig_idx: u32,
+        argvals: Vec<Value>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let sig = self.ctx.fn_sigs.borrow().get(sig_idx).clone();
+        let dest = if sig.ret == Ty::Void {
+            None
+        } else {
+            Some(self.new_value(sig.ret))
+        };
+        let unwind = self.landing_pads.last().copied();
+        if let Some(lp) = unwind {
+            self.used_lps.insert(lp);
+        }
+        self.emit(Inst::CallClosure {
+            dest,
+            callee,
+            args: argvals,
+            params: sig.params.clone(),
+            ret: sig.ret,
+            unwind,
+        });
+        let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
+        Ok((
+            rv,
+            if sig.ret == Ty::Void {
+                Ty::I32
+            } else {
+                sig.ret
+            },
+        ))
     }
 
     /// Lower a method call on an `Atomic[T]` box (I#176) to an inline atomic ZIR

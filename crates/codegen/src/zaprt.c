@@ -658,6 +658,116 @@ void zap_list_set_ptr(void *l, int64_t i, void *v) {
 }
 int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 
+/* Shallow copy: a fresh list with the same element words (shared referents) and
+ * the same `elem_ptr` kind, so the precise collector traces the copy correctly.
+ * Used by `sorted()` (ticket #336) to leave its input untouched. */
+void *zap_list_copy(void *lp) {
+    ZapList *l = (ZapList *)lp;
+    ZapList *o = (ZapList *)zap_list_new();
+    if (l->len > 0) {
+        o->data = (int64_t *)zap_ptrbuf((int64_t)l->len * (int64_t)sizeof(int64_t));
+        memcpy(o->data, l->data, (size_t)l->len * sizeof(int64_t));
+        o->len = l->len;
+        o->cap = l->len;
+        o->elem_ptr = l->elem_ptr;
+    }
+    return o;
+}
+
+/* ---------------------------------------------------------------------------
+ * Stable list sort (ticket #336, design/RUNTIME-ABI.md §"list.sort / sorted").
+ *
+ * `zap_list_sort_by` sorts `dst` in place using a parallel `keys` list of the
+ * same length: element `dst[i]` is ordered by key `keys[i]`. The no-key cases
+ * (`xs.sort()` / `sorted(xs)`) pass `keys == dst`, so elements are compared by
+ * their own word; a `key=` projection passes a separately-built key list (the
+ * compiler builds it in compiled code, where the growing list is a GC root — a
+ * C loop calling back into Zap could not hold it safely across a safepoint).
+ *
+ * The sort is a stable bottom-up merge over an index permutation: the key array
+ * is fully read to order the indices *before* any element is moved, so aliasing
+ * `keys == dst` is safe. It makes NO call back into compiled Zap and allocates
+ * only non-GC scratch, so no safepoint runs inside it and every element/key
+ * word stays rooted (through `dst`/`keys`) for the whole sort.
+ *
+ * `cmp_kind` selects how two key words compare: ZAP_SORT_I64 is a signed 64-bit
+ * compare (int/bool), ZAP_SORT_STR a byte-wise `ZapStr` compare. `reverse` flips
+ * the order while preserving stability (equal keys keep their input order, as in
+ * Python's `reverse=True`). ------------------------------------------------- */
+enum { ZAP_SORT_I64 = 0, ZAP_SORT_STR = 1 };
+
+/* Three-way compare of two key words under `cmp_kind`. */
+static int64_t zap_sort_cmp(int64_t a, int64_t b, int64_t cmp_kind) {
+    if (cmp_kind == ZAP_SORT_STR) {
+        return zap_str_cmp((void *)(intptr_t)a, (void *)(intptr_t)b);
+    }
+    return (a < b) ? -1 : (a > b ? 1 : 0);
+}
+
+/* Stable merge sort of the index array `idx[0..n)` by `keys[idx[.]]`. `tmp` is
+ * caller-provided scratch of `n` words. Equal keys keep their relative order
+ * (take from the left run on a tie), which holds under `reverse` too since the
+ * tie branch is independent of the sign flip. */
+static void zap_sort_indices(int64_t *idx, int64_t *tmp, int64_t n,
+                             const int64_t *keys, int64_t cmp_kind, int64_t reverse) {
+    for (int64_t width = 1; width < n; width *= 2) {
+        for (int64_t lo = 0; lo < n; lo += 2 * width) {
+            int64_t mid = lo + width < n ? lo + width : n;
+            int64_t hi = lo + 2 * width < n ? lo + 2 * width : n;
+            int64_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                int64_t c = zap_sort_cmp(keys[idx[i]], keys[idx[j]], cmp_kind);
+                if (reverse) {
+                    c = -c;
+                }
+                if (c <= 0) {
+                    tmp[k++] = idx[i++]; /* <= keeps the left (earlier) run first */
+                } else {
+                    tmp[k++] = idx[j++];
+                }
+            }
+            while (i < mid) {
+                tmp[k++] = idx[i++];
+            }
+            while (j < hi) {
+                tmp[k++] = idx[j++];
+            }
+        }
+        memcpy(idx, tmp, (size_t)n * sizeof(int64_t));
+    }
+}
+
+void zap_list_sort_by(void *dstp, void *keysp, int64_t cmp_kind, int64_t reverse) {
+    ZapList *dst = (ZapList *)dstp;
+    ZapList *keys = (ZapList *)keysp;
+    int64_t n = dst->len;
+    if (n < 2) {
+        return;
+    }
+    /* All scratch is plain C memory, freed before returning: this routine makes
+     * no allocation that can trigger a collection, so raw buffers are safe. */
+    int64_t *idx = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    int64_t *tmp = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    int64_t *out = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    if (!idx || !tmp || !out) {
+        fprintf(stderr, "zap: out of memory sorting a list of %lld\n", (long long)n);
+        abort();
+    }
+    for (int64_t i = 0; i < n; i++) {
+        idx[i] = i;
+    }
+    zap_sort_indices(idx, tmp, n, keys->data, cmp_kind, reverse);
+    /* Gather the permuted elements, then write them back in one pass — reading
+     * every element before overwriting keeps a `keys == dst` alias correct. */
+    for (int64_t i = 0; i < n; i++) {
+        out[i] = dst->data[idx[i]];
+    }
+    memcpy(dst->data, out, (size_t)n * sizeof(int64_t));
+    free(idx);
+    free(tmp);
+    free(out);
+}
+
 /* dict[K, V]: open-addressing hash table with linear probing.
  * Key kind (int64 vs str) is passed per call; a dict is homogeneous, so this is
  * stable across a given dict's lifetime. */
