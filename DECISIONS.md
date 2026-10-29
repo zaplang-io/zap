@@ -2059,3 +2059,41 @@ link time. Governed by D-0076 (`run`/`build` are Stable; this is a new, additive
   toolchain + musl builds of PCRE2/OpenSSL/zlib/GC in the image); a dynamically
   `dlopen`-ed libpython so portable binaries can still opt into Python at runtime;
   cross-build (`--target`) once codegen emits for non-host triples (#203).
+
+## D-0083 — `encoding/url` percent-encoding module (I#335)
+
+**Status:** Accepted — implemented. A built-in **`url`** stdlib module (the
+`crates/sema|ir|codegen/.../modules/` seam, D-0056; pure, dependency-free C in
+`zaprt.c`, no external library — "pure" in the same sense as `json`/`yaml`),
+providing RFC-3986 percent-encoding/decoding and the AWS SigV4 query
+canonicalization variant required by every REST and query AWS protocol.
+
+- **Why a built-in, not a pure-Zap source module.** There is no pure-Zap stdlib
+  search root (D-0056: stdlib resolves to compiler-known builtins only; D-0081
+  Zap-to-Zap imports resolve local-project files or `zenv` dep packages, never
+  stdlib), and the aws-core signer is compiled as a single bundled file, so only
+  a built-in is universally `import`-able by it today. Matches all existing
+  stdlib modules. "Pure-Zap" in I#335 is read as "self-contained, no third-party
+  C dependency", which a from-scratch percent codec satisfies.
+- **Surface (idiomatic, Python-flavoured names).** `quote`/`unquote` (+
+  `unquote_plus`) for the byte codec, `quote_path` for the keep-`/` path form,
+  and `encode_query`/`canonical_query` for building a query string from a
+  `dict[str,str]`.
+- **Unreserved set** is RFC-3986 §2.3 (`A-Z a-z 0-9 - . _ ~`); every other byte
+  → `%XX` **UPPERCASE**. Encoding is **byte-by-byte over the UTF-8 encoding**, so
+  multibyte codepoints are correct. Space → `%20` (never `+`) — this is exactly
+  the SigV4 URI-encode, so `quote` is the signer's primitive for query
+  keys/values and single path segments. `unquote` is lenient (a malformed `%`
+  escape and a bare `+` pass through).
+- **SigV4 path double-encoding** is expressed through `quote_path` (encodeSlash
+  off): the CanonicalURI is `url.quote_path(path)` for **S3** and the
+  double-encoded `url.quote_path(url.quote_path(path))` for every other service.
+- **`canonical_query`** is the SigV4 CanonicalQueryString: each key/value
+  `quote`-encoded, pairs sorted by encoded key then value, joined with `&`.
+  `encode_query` is the unsorted sibling (dict iteration order is unspecified —
+  open-addressing hash order — so callers who need determinism use
+  `canonical_query`).
+- **Follow-up (not this change).** A `list[(str,str)]` overload of
+  `encode_query` for order-preserving / repeated-key query strings (needs
+  tuple-list iteration in the runtime); percent-decoding straight into a `bytes`
+  value once a distinct `bytes` type lands (I#284 follow-up).

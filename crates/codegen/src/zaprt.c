@@ -8739,6 +8739,179 @@ void *zap_json_join(void *lp) {
 }
 
 /* ===========================================================================
+ * stdlib: encoding/url — RFC-3986 percent-encoding + decoding (ticket #335)
+ * ---------------------------------------------------------------------------
+ * Pure, dependency-free percent-encoding over raw bytes. A `ZapStr` is a byte
+ * buffer and a `str`'s bytes ARE its UTF-8 encoding, so encoding proceeds
+ * byte-by-byte and is automatically correct for multibyte codepoints. The
+ * "unreserved" set is RFC-3986 §2.3 (`A-Z a-z 0-9 - . _ ~`); every other byte
+ * encodes as `%XX` with UPPERCASE hex. This is exactly AWS SigV4's URI-encode
+ * (space -> `%20`, never `+`), so `zap_url_quote` is the primitive the signer
+ * calls for query keys/values and single path segments; `zap_url_quote_path`
+ * leaves `/` unescaped for a whole path (encodeSlash=0). SigV4's non-S3
+ * CanonicalURI double-encodes the path, i.e. quote_path(quote_path(path)); S3
+ * encodes once. Decoding is the shared inverse (`%XX` -> byte), with a `_plus`
+ * variant that also maps `+` -> space for form-encoded query values.
+ * =========================================================================== */
+
+/* RFC-3986 §2.3 unreserved set: never percent-encoded. */
+static int zap_url_is_unreserved(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~';
+}
+
+/* Percent-encode `sp` byte-by-byte. `keep_slash` passes `/` through unescaped
+ * (path form); otherwise `/` is encoded too (strict / query / segment form). */
+static void *zap_url_encode(void *sp, int keep_slash) {
+    ZapStr *s = (ZapStr *)sp;
+    int64_t n = s->len;
+    const unsigned char *in = (const unsigned char *)s->data;
+    static const char hex[] = "0123456789ABCDEF";
+    /* worst case: every byte becomes "%XX" (3 bytes). */
+    char *out = (char *)zap_buf(n > 0 ? n * 3 : 1);
+    int64_t o = 0;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = in[i];
+        if (zap_url_is_unreserved(c) || (keep_slash && c == '/')) {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[(c >> 4) & 0xF];
+            out[o++] = hex[c & 0xF];
+        }
+    }
+    return zap_str_new(out, o);
+}
+
+void *zap_url_quote(void *sp) { return zap_url_encode(sp, 0); }
+void *zap_url_quote_path(void *sp) { return zap_url_encode(sp, 1); }
+
+/* Hex digit value, or -1 if `c` is not a hex digit. */
+static int zap_url_hexval(unsigned char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* Decode `%XX` escapes back to bytes. A `%` not followed by two hex digits is
+ * left literal (lenient, like Python's urllib). `plus` maps `+` -> space. */
+static void *zap_url_decode(void *sp, int plus) {
+    ZapStr *s = (ZapStr *)sp;
+    int64_t n = s->len;
+    const unsigned char *in = (const unsigned char *)s->data;
+    /* output is never longer than the input. */
+    char *out = (char *)zap_buf(n > 0 ? n : 1);
+    int64_t o = 0;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = in[i];
+        if (c == '%' && i + 2 < n) {
+            int hi = zap_url_hexval(in[i + 1]);
+            int lo = zap_url_hexval(in[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out[o++] = (char)((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+            out[o++] = (char)c; /* malformed escape: keep the literal '%'. */
+        } else if (plus && c == '+') {
+            out[o++] = ' ';
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    return zap_str_new(out, o);
+}
+
+void *zap_url_unquote(void *sp) { return zap_url_decode(sp, 0); }
+void *zap_url_unquote_plus(void *sp) { return zap_url_decode(sp, 1); }
+
+/* Byte-lexicographic compare of two ZapStr* (shorter sorts first on a prefix
+ * tie) — the ordering AWS SigV4 applies to encoded query components. */
+static int zap_url_strcmp(void *ap, void *bp) {
+    ZapStr *a = (ZapStr *)ap;
+    ZapStr *b = (ZapStr *)bp;
+    int64_t m = a->len < b->len ? a->len : b->len;
+    int c = memcmp(a->data, b->data, (size_t)m);
+    if (c != 0) {
+        return c < 0 ? -1 : 1;
+    }
+    if (a->len == b->len) {
+        return 0;
+    }
+    return a->len < b->len ? -1 : 1;
+}
+
+/* Build a query string from a dict[str,str]. Every key and value is percent-
+ * encoded with `zap_url_quote`. When `do_sort`, the `k=v` pairs are ordered by
+ * encoded key then encoded value (SigV4 CanonicalQueryString); otherwise the
+ * dict's iteration order is kept (unspecified — open-addressing hash order).
+ * The encoded keys/values are held in traced
+ * ZapLists (so a GC during the loop keeps them live) and only an int64 index
+ * array — pointer-free, safe in a `zap_buf` leaf — is sorted. */
+static void *zap_url_build_query(void *dp, int do_sort) {
+    void *keys = zap_dict_keys_ptr(dp);
+    int64_t m = zap_list_len(keys);
+    void *ek = zap_list_new(); /* encoded keys   (traced) */
+    void *ev = zap_list_new(); /* encoded values (traced) */
+    for (int64_t i = 0; i < m; i++) {
+        void *k = zap_list_get_ptr(keys, i);
+        void *v = zap_dict_get_str_ptr(dp, k);
+        if (v == NULL) {
+            v = zap_str_new("", 0);
+        }
+        zap_list_push_ptr(ek, zap_url_quote(k));
+        zap_list_push_ptr(ev, zap_url_quote(v));
+    }
+    int64_t *idx = (int64_t *)zap_buf((int64_t)sizeof(int64_t) * (m > 0 ? m : 1));
+    for (int64_t i = 0; i < m; i++) {
+        idx[i] = i;
+    }
+    if (do_sort) {
+        /* insertion sort (query param counts are small); stable. */
+        for (int64_t i = 1; i < m; i++) {
+            int64_t cur = idx[i];
+            void *ck = zap_list_get_ptr(ek, cur);
+            void *cv = zap_list_get_ptr(ev, cur);
+            int64_t j = i - 1;
+            while (j >= 0) {
+                void *jk = zap_list_get_ptr(ek, idx[j]);
+                int c = zap_url_strcmp(jk, ck);
+                if (c == 0) {
+                    c = zap_url_strcmp(zap_list_get_ptr(ev, idx[j]), cv);
+                }
+                if (c <= 0) {
+                    break;
+                }
+                idx[j + 1] = idx[j];
+                j--;
+            }
+            idx[j + 1] = cur;
+        }
+    }
+    void *parts = zap_list_new();
+    for (int64_t t = 0; t < m; t++) {
+        int64_t i = idx[t];
+        if (t > 0) {
+            zap_list_push_ptr(parts, zap_str_new("&", 1));
+        }
+        zap_list_push_ptr(parts, zap_list_get_ptr(ek, i));
+        zap_list_push_ptr(parts, zap_str_new("=", 1));
+        zap_list_push_ptr(parts, zap_list_get_ptr(ev, i));
+    }
+    return zap_json_join(parts); /* generic ZapStr*-list concatenator */
+}
+
+void *zap_url_encode_query(void *dp) { return zap_url_build_query(dp, 0); }
+void *zap_url_canonical_query(void *dp) { return zap_url_build_query(dp, 1); }
+
+/* ===========================================================================
  * stdlib: collections extras — deque / bisect / oset (ticket #102, D-0056)
  * ---------------------------------------------------------------------------
  * These build on the existing collection machinery (#21/#38). Elements are i64
