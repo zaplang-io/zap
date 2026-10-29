@@ -1,0 +1,16 @@
+2
+a
+b
+3
+x
+y
+z
+<Object key="photo.jpg"/>
+photo.jpg
+<CreateBucketConfiguration><LocationConstraint>us-west-2</LocationConstraint></CreateBucketConfiguration>
+urn:aws
+AccessDenied
+denied
+abc
+NoSuchKey
+missing

@@ -47,6 +47,7 @@ mod threading;
 mod time;
 mod tls;
 mod url;
+mod xml;
 mod yaml;
 mod zlib;
 
@@ -100,6 +101,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     tls::MODULE,
     url::MODULE,
     concurrent::MODULE,
+    xml::MODULE,
 ];
 
 /// A module's *constant* lowering hook: lower `module.CONST` (an attribute, not
