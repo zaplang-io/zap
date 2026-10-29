@@ -1,10 +1,9 @@
-# diff: diverge BUG: the `%` operator does not use Python's sign-of-divisor
-# (floored) semantics for negative operands — it uses C-style truncated
-# remainder (sign of the dividend). This is INCONSISTENT with `//`, which DOES
-# floor (see floor_div_negatives.zap), so the identity `a == (a // b) * b +
-# (a % b)` is broken: e.g. `-7 // 2` is -4 but `-7 % 2` is -1 (should be 1, since
-# -7 == -4*2 + 1). A real bug to triage (D-0024 says modulo is Python-style).
-# CPython: 1, -1, 2, -3; Zap: -1, 1, -1, 1.
+# diff: match
+# Integer `%` uses Python's sign-of-divisor (floored) semantics for negative
+# operands (I#381, D-0024), consistent with floored `//` (see
+# floor_div_negatives.zap), so the identity `a == (a // b) * b + (a % b)` holds:
+# e.g. `-7 // 2` is -4 and `-7 % 2` is 1, since -7 == -4*2 + 1.
+# CPython and Zap both print: 1, -1, 2, -3.
 def main():
     print(-7 % 2)
     print(7 % -2)

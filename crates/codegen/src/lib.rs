@@ -990,6 +990,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_powf", &[f.into(), f.into()], Some(f.into()));
         self.declare_rt("zap_ifloordiv", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_ffloordiv", &[f.into(), f.into()], Some(f.into()));
+        self.declare_rt("zap_imod", &[i.into(), i.into()], Some(i.into()));
 
         // Decorators & reflection (ticket #16, D-0036). `zap_i64_to_str` and
         // `zap_str_eq` back the `@derive(Repr)` / `@derive(Eq)` generated methods;

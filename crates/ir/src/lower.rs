@@ -10864,12 +10864,11 @@ impl<'a> FnLower<'a> {
         }
 
         match op {
-            Add | Sub | Mul | Mod => {
+            Add | Sub | Mul => {
                 let irop = match op {
                     Add => BinOp::Add,
                     Sub => BinOp::Sub,
                     Mul => BinOp::Mul,
-                    Mod => BinOp::Rem,
                     _ => unreachable!(),
                 };
                 if is_float {
@@ -10896,6 +10895,35 @@ impl<'a> FnLower<'a> {
                         op: irop,
                         lhs: li,
                         rhs: ri,
+                    });
+                    Ok((d, Ty::I64))
+                }
+            }
+            Mod => {
+                // Modulo (D-0024) takes the sign of the divisor (Python
+                // floored modulo), consistent with floored `//` so that
+                // `a == (a // b) * b + (a % b)` holds. Floats use LLVM `frem`
+                // directly; integers go through a runtime helper that corrects
+                // C's truncated remainder, mirroring `zap_ifloordiv`.
+                if is_float {
+                    let lf = self.as_f64(l, lt);
+                    let rf = self.as_f64(r, rt);
+                    let d = self.new_value(Ty::F64);
+                    self.emit(Inst::Bin {
+                        dest: d,
+                        op: BinOp::Rem,
+                        lhs: lf,
+                        rhs: rf,
+                    });
+                    Ok((d, Ty::F64))
+                } else {
+                    let li = self.coerce(l, lt, Ty::I64);
+                    let ri = self.coerce(r, rt, Ty::I64);
+                    let d = self.new_value(Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_imod".to_string(),
+                        args: vec![li, ri],
                     });
                     Ok((d, Ty::I64))
                 }

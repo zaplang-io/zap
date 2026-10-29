@@ -580,6 +580,24 @@ int64_t zap_ifloordiv(int64_t a, int64_t b) {
  * (+/-inf or NaN) rather than faulting. */
 double zap_ffloordiv(double a, double b) { return floor(a / b); }
 
+/* Floored modulo for signed integers (Python semantics, D-0024): the result
+ * takes the sign of the divisor, consistent with `zap_ifloordiv` so that the
+ * identity `a == (a // b) * b + (a % b)` holds. C `%` truncates toward zero
+ * (sign of the dividend), so correct the remainder when it is non-zero and the
+ * operand signs differ. Modulo by zero is a fault (aborts with the same message
+ * as floor division). */
+int64_t zap_imod(int64_t a, int64_t b) {
+    if (b == 0) {
+        fprintf(stderr, "zap: integer division or modulo by zero\n");
+        abort();
+    }
+    int64_t r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) {
+        r += b;
+    }
+    return r;
+}
+
 int64_t zap_str_len(void *s) { return ((ZapStr *)s)->len; }
 
 /* ---------------------------------------------------------------------------
