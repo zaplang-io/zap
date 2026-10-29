@@ -646,12 +646,28 @@ static void zap_list_push(ZapList *l, int64_t word) {
     l->data[l->len++] = word;
 }
 
-/* Out-of-range access aborts (no exception runtime yet, ticket #22). */
+/* Forward declaration: `zap_panic` (the `raise`/unwind entry point) is defined
+ * further down with the exception glue, but the collection fault paths above it
+ * route out-of-range faults through it (#383). */
+void zap_panic(void *exc);
+
+/* Out-of-range access raises a catchable Zap exception (#383): the fault
+ * unwinds through `zap_panic` like `raise`, so a `try/except` around the
+ * indexing intercepts it (and an uncaught one still terminates non-zero via
+ * `zap_uncaught`). Matches D-0007 ("built-in faults ... try/except handles
+ * them") and CPython's `IndexError`. */
 static int64_t zap_list_at(ZapList *l, int64_t i) {
     if (i < 0 || i >= l->len) {
-        fprintf(stderr, "zap: list index %lld out of range (len %lld)\n",
-                (long long)i, (long long)l->len);
-        abort();
+        char buf[96];
+        int n = snprintf(buf, sizeof buf, "list index %lld out of range (len %lld)",
+                         (long long)i, (long long)l->len);
+        if (n < 0) {
+            n = 0;
+        }
+        if (n >= (int)sizeof buf) {
+            n = (int)sizeof buf - 1;
+        }
+        zap_panic(zap_str_new(buf, (int64_t)n));
     }
     return l->data[i];
 }
@@ -1980,8 +1996,10 @@ static int64_t zap_str_byteoff(const ZapStr *s, int64_t cp_idx) {
     return i;
 }
 
-/* s[i] -> char. Negative indices count from the end; out-of-range faults (the
- * typed `IndexError` lands with the exception runtime, D-0029). */
+/* s[i] -> char. Negative indices count from the end; out-of-range raises a
+ * catchable Zap exception (#383), so a surrounding `try/except` intercepts it
+ * (matching CPython's `IndexError`); an uncaught one still terminates via
+ * `zap_uncaught`. */
 int32_t zap_str_index(void *sp, int64_t idx) {
     const ZapStr *s = (const ZapStr *)sp;
     const unsigned char *d = (const unsigned char *)s->data;
@@ -1990,8 +2008,7 @@ int32_t zap_str_index(void *sp, int64_t idx) {
         idx += count;
     }
     if (idx < 0 || idx >= count) {
-        fprintf(stderr, "zap: string index out of range\n");
-        abort();
+        zap_panic(zap_str_new("string index out of range", 25));
     }
     int64_t off = zap_str_byteoff(s, idx);
     return zap_utf8_decode(d, off, zap_utf8_width(d[off]));
