@@ -77,7 +77,6 @@ Bugs found on `main` (for triage; NOT fixed in this PR):
 | `collection_truthiness` | `if <list>:` / `if <dict>:` crashes codegen (panic, exit 101) instead of applying truthiness |
 | `except_builtin_fault` | a built-in fault (index-out-of-range) is not caught by `except` (contradicts D-0007) |
 | `float_str_integral` | `str()` of an integral float drops the `.0` (`str(6 / 2)` is `"3"`, not `"3.0"`) |
-| `string_truthiness` | `""` is truthy (Zap treats every string as truthy); CPython makes empty strings falsy |
 | `chained_comparison` | `a < b < c` parses left-associative `(a < b) < c`, not Python-chained |
 
 Feature gaps vs CPython (for triage):

@@ -1,9 +1,10 @@
-# diff: diverge BUG: an empty string is truthy in Zap. CPython truthiness
-# (D-0022, which Zap claims to follow) makes "" falsy, but Zap treats every
-# string as truthy regardless of length, so `if "":` takes the then-branch and
-# `not ""` is False. Numeric falsiness (0, 0.0) and non-empty-string truthiness
-# DO match (see truthiness.zap) — only the empty-string case diverges. A real
-# bug to triage. CPython: empty / notfalse; Zap: nonempty / isfalse... (differs).
+# diff: match
+# String truthiness (#385, D-0022): an empty string is falsy and a non-empty
+# string is truthy, matching CPython. Zap used to treat every string as truthy
+# regardless of length (a `str` is a non-null heap pointer), so `if "":` took
+# the then-branch and `not ""` was False; the `truthy` lowering now emits a byte
+# length check (len 0 -> false). Numeric falsiness (0, 0.0) and non-empty-string
+# truthiness already matched (see truthiness.zap).
 def tag(bool b) -> str:
     if b:
         return "T"
