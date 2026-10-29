@@ -1,11 +1,19 @@
 name: CI
 
-# Build and test every push and pull request, both on a plain host (front-end
-# crates, no LLVM) and in a full environment that mirrors the LLVM 18 dev
-# container (.devcontainer/Dockerfile) so codegen and the golden end-to-end
-# tests run too.
+# Build and test on every pull request and on every push to `main`, both on a
+# plain host (front-end crates, no LLVM) and in a full environment that mirrors
+# the LLVM 18 dev container (.devcontainer/Dockerfile) so codegen and the golden
+# end-to-end tests run too.
+#
+# The `push` trigger is restricted to `main` on purpose: PR-branch commits are
+# already built by the `pull_request` event, and because that event and the
+# `push` event land in different `concurrency` groups (github.ref is
+# refs/pull/<n>/merge vs refs/heads/<branch>) an unrestricted `push` trigger ran
+# the whole matrix twice for every PR commit. Limiting `push` to `main` keeps the
+# merge-to-main run while leaving PR commits to the single pull_request run.
 on:
   push:
+    branches: [main]
   pull_request:
 
 # Cancel superseded runs on the same ref to save CI minutes.
