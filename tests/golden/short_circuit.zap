@@ -63,9 +63,9 @@ def main():
     bool b = True and False
     bool c = False or True
     bool d = False or False
-    print(str(a))   # True
-    print(str(b))   # False
-    print(str(c))   # True
-    print(str(d))   # False
+    print(str(a))  # True
+    print(str(b))  # False
+    print(str(c))  # True
+    print(str(d))  # False
 
     print("survived")
