@@ -9446,11 +9446,13 @@ impl<'a> FnLower<'a> {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce(iv, it, Ty::I64);
                 let d = self.new_value(elem.ty());
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: format!("zap_list_get_{}", elem.val_suffix()),
-                    args: vec![bv, iv],
-                });
+                // Out-of-range raises a catchable Zap exception (#383), so this
+                // must be an `invoke` inside a `try` for the handler to catch it.
+                self.throwing_call(
+                    Some(d),
+                    &format!("zap_list_get_{}", elem.val_suffix()),
+                    vec![bv, iv],
+                );
                 Ok((d, elem.ty()))
             }
             Ty::Dict(kk, vk) => {
@@ -9505,11 +9507,9 @@ impl<'a> FnLower<'a> {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce(iv, it, Ty::I64);
                 let d = self.new_value(Ty::I32);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_str_index".to_string(),
-                    args: vec![bv, iv],
-                });
+                // Out-of-range raises a catchable Zap exception (#383); use an
+                // `invoke` inside a `try` so the handler catches it.
+                self.throwing_call(Some(d), "zap_str_index", vec![bv, iv]);
                 Ok((d, Ty::I32))
             }
             _ => Err(err(

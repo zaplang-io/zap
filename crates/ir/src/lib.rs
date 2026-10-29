@@ -440,6 +440,63 @@ mod tests {
     }
 
     #[test]
+    fn lower_builtin_fault_catchable() {
+        // #383: a built-in fault (index-out-of-range) inside a `try` lowers the
+        // indexing to an `invoke` whose unwind edge is the handler, so the fault
+        // (raised via `zap_panic` in the runtime) is caught like a `raise`.
+        let m = lower_ok(
+            "def main():\n    \
+                 list[int64] xs = [1, 2]\n    \
+                 str s = \"hi\"\n    \
+                 try:\n        \
+                     auto v = xs[5]\n        \
+                     auto c = s[9]\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("invoke @zap_list_get_i64") && text.contains("unwind"),
+            "list index in `try` must be an invoke, text:\n{text}"
+        );
+        assert!(
+            text.contains("invoke @zap_str_index"),
+            "str index in `try` must be an invoke, text:\n{text}"
+        );
+        assert!(text.contains("landingpad"), "text:\n{text}");
+
+        // Even without an explicit `try`, `main` carries an implicit top-level
+        // handler, so an uncaught fault still reaches it via an `invoke` (and
+        // `zap_uncaught` reports it) rather than unwinding past the frame.
+        let m = lower_ok(
+            "def main():\n    \
+                 list[int64] xs = [1, 2]\n    \
+                 auto v = xs[5]\n    \
+                 print(v)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("invoke @zap_list_get_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_uncaught"), "text:\n{text}");
+
+        // In a non-`main` function with no active handler the indexing is a
+        // plain `call`; the fault unwinds through this frame to the caller's
+        // handler (here `main`'s `try`, reached via `invoke @get`).
+        let m = lower_ok(
+            "def get(list[int64] xs) -> int64:\n    \
+                 return xs[5]\n\
+             def main():\n    \
+                 list[int64] xs = [1, 2]\n    \
+                 try:\n        \
+                     print(get(xs))\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_list_get_i64"), "text:\n{text}");
+        assert!(text.contains("invoke @get"), "text:\n{text}");
+    }
+
+    #[test]
     fn lower_arrays() {
         // Construction, element access, len, and sum lower to the array runtime
         // entry points; element-wise ops lower to the dedicated ArrayBinOp node.

@@ -1,0 +1,6 @@
+before
+caught list
+list index 9 out of range (len 3)
+cleanup
+caught str
+after
