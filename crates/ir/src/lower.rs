@@ -10670,7 +10670,7 @@ impl<'a> FnLower<'a> {
             }
             return self.iconst(Ty::I1, 1);
         }
-        if matches!(t, Ty::Match | Ty::Ptr | Ty::Py) {
+        if matches!(t, Ty::Match | Ty::Py) {
             // Reference types are truthy when non-null. Codegen's `ICmp` only
             // compares integers, so go through the runtime (`zap_ptr_nonnull`
             // returns 0/1) and compare that i64 against zero. For a match
@@ -10693,12 +10693,16 @@ impl<'a> FnLower<'a> {
             });
             return d;
         }
-        // Built-in containers (list/dict/set/heap/array) follow Python / D-0022
-        // truthiness: empty is falsy, non-empty truthy. They are heap pointers,
-        // so the integer `ICmp` fallthrough below would feed a `PointerValue`
-        // where codegen expects an `IntValue` and crash (#382). Route through the
-        // size runtime and compare the element count to zero instead.
+        // Strings/bytes and built-in containers (list/dict/set/heap/array) follow
+        // Python / D-0022 truthiness: empty is falsy, non-empty truthy. They are
+        // heap pointers, so the integer `ICmp` fallthrough below would feed a
+        // `PointerValue` where codegen expects an `IntValue` and crash (#382), and
+        // the old `zap_ptr_nonnull` path made every non-null `str` truthy so `""`
+        // was wrongly truthy (#385). Route through the length runtime and compare
+        // the element/byte count to zero instead. `str` and `bytes` share the
+        // `ZapStr {len, data}` layout, so both use `zap_str_len`.
         let len_fn = match t {
+            Ty::Ptr | Ty::Bytes => Some("zap_str_len"),
             Ty::List(_) => Some("zap_list_len"),
             Ty::Dict(..) => Some("zap_dict_len"),
             Ty::Set(_) => Some("zap_set_len"),

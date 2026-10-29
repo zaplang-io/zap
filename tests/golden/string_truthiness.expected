@@ -1,0 +1,11 @@
+full-str-truthy
+empty-str-falsy
+empty-str-else
+full-str-if
+while-str-truthy
+while-empty-skipped
+and-both-truthy
+or-picks-truthy
+and-short-circuits
+ternary-full
+ternary-empty
