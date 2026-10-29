@@ -50,6 +50,8 @@ container defined in `.devcontainer/Dockerfile`, wrapped by the `Makefile`:
 ```bash
 make docker-build   # build the LLVM 18 dev image (once)
 make check          # quickest loop: host type-check of the LLVM-free crates
+make fmt-check      # host-job formatting gates: cargo fmt + the .zap golden gate
+make lint           # fmt-check + the LLVM-free clippy run (warnings are errors)
 make docker-check   # type-check the whole workspace incl. codegen (no link)
 make docker-test    # the final gate: full suite under BOTH collectors
 make docker-run FILE=tests/golden/fib.zap   # compile + run a program
@@ -69,20 +71,22 @@ jobs — `host` (no LLVM) and `full` (LLVM 18 + codegen). A PR is mergeable only
 when all of it is green. Run these locally first:
 
 ```bash
-# 1. Formatting (both jobs)
-cargo fmt --all -- --check          # fix with: cargo fmt --all
+# 1. Formatting + the LLVM-free clippy run (the host-job style gates, as one
+#    target). `make docker-test` also runs `fmt-check` as a prerequisite, so an
+#    unformatted golden or a rustfmt miss fails locally before you push.
+make lint               # = cargo fmt --all -- --check
+                        #   + cargo run -q --bin zap -- fmt --check tests/golden   (D-0037)
+                        #   + cargo clippy --all-targets -- -D warnings
+                        # fix formatting with: cargo fmt --all
+                        #                      cargo run --bin zap -- fmt tests/golden
 
-# 2. Clippy, warnings are errors
-cargo clippy --all-targets -- -D warnings                                          # host: default members
+# 2. Clippy under BOTH collectors (these link LLVM, so run in the container)
 cargo clippy --workspace --features zapc/gc-immix --all-targets -- -D warnings     # full: default collector
 cargo clippy --workspace --features zapc/gc-boehm --all-targets -- -D warnings     # full: fallback collector
 
-# 3. Tests — the full suite under BOTH garbage collectors
+# 3. Tests — the full suite under BOTH garbage collectors (runs `fmt-check` first)
 make docker-test        # = cargo test --workspace --features zapc/gc-immix
                         #   + cargo test --workspace --features zapc/gc-boehm
-
-# 4. Zap fmt gate (host job): every .zap source must be canonically formatted
-cargo run -q --bin zap -- fmt --check tests/golden   # fix with: ... fmt tests/golden
 ```
 
 Notes that have bitten people:
@@ -96,8 +100,10 @@ Notes that have bitten people:
   reason a PR goes red. Run `cargo fmt --all` before every push.
 - **`.zap` sources have a fmt gate too** (D-0037). The host job runs
   `zap fmt --check tests/golden`; a new or edited `*.zap` must be canonically
-  formatted. Fix with `cargo run --bin zap -- fmt tests/golden` (or
-  `zap fmt <file>`). The style is specified in `docs/FORMAT.md`.
+  formatted. `make fmt-check` (and therefore `make docker-test`) now runs this
+  locally, so it fails before you push instead of reddening CI after. Fix with
+  `cargo run --bin zap -- fmt tests/golden` (or `zap fmt <file>`). The style is
+  specified in `docs/FORMAT.md`.
 - **Docs-only PRs still run every gate.** CI doesn't skip on file type; verify
   the checks for *both* the `pull_request` and `push` triggers are green before
   asking for review. A `push` run can fail when the `pull_request` run passed
