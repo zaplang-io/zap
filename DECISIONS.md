@@ -2180,3 +2180,48 @@ aws-codegen layer maps shape traits onto them.
   timestamp formatting, base64 blob decoding, percent-encoding. A streaming
   pull-parser for huge S3 listings is a later follow-up — a DOM parse suffices for
   v1. No grammar change (a library, not syntax).
+
+## D-0086 — `@derive(Json)` AWS codec hooks: timestamps, blobs, open enums (I#346)
+
+**Status:** Accepted — implemented. Three opt-in extensions to the compiler
+built-in `@derive(Json)` codec ([[D-0059]]) so model-driven AWS shape structs
+round-trip, part of the broad-coverage program (epic #366). The later
+aws-codegen layer ([[I#347]]) emits Zap shape types that use these; plain
+(non-AWS) JSON derive is unchanged — every hook is opt-in per field or type.
+
+- **Timestamps.** A `DateTime` field (the prelude value struct, [[D-0056]])
+  (de)serializes in a wire form chosen per field with a **field decorator**
+  `@json(timestamp="epoch")` or `@json(timestamp="iso8601")`. `epoch` is a JSON
+  **number**, Unix seconds UTC (via `zap_datetime_to_unix` / the epoch getters);
+  `iso8601` is a JSON **string** (`zap_datetime_format_iso` / `zap_datetime_parse_iso`,
+  `2023-11-14T22:13:20`). **Default (no decorator) is `epoch`** — the AWS awsJson
+  protocols' default `timestampFormat`. This is the first wired *field* decorator
+  (field decorators were deferred before; others stay deferred).
+- **Blobs.** A `bytes` field ([[D-0025]], ticket #337) is **type-driven**: it
+  (de)serializes as a base64 (standard alphabet, padded) JSON string via
+  encoding/base64 (`zap_base64_encode` / `zap_base64_decode`), round-tripping the
+  exact bytes — including non-UTF-8 binary. No annotation; using `bytes` *is* the
+  opt-in. `bytes` and `str` share the `ZapStr` layout but are distinct ZIR types
+  (`Ty::Bytes` vs `Ty::Ptr`), so the derive routes them apart with no ambiguity.
+- **Open enums.** `@derive(Json)` + the **enum decorator** `@json(open)` makes an
+  enum a forward-compatible string enum. It must be a tier-3 ([[D-0046]]) enum
+  whose known variants are **payload-free** and which carries exactly one fallback
+  variant `Unknown(str value)`; at least two known variants are required (a lone
+  known variant beside `Unknown(str)` would collapse into the `Optional` niche,
+  [[D-0064]], leaving no tag to switch on). Encode: a known variant → its name as
+  a JSON string, `Unknown(s)` → the carried string. Decode: a string matching a
+  known variant name → that variant, **any other string → `Unknown(raw)`** instead
+  of erroring, so AWS adding an enum value never breaks a client. The derive
+  generates `to_json` / `from_json` / `from_json_value` on the enum (the first
+  enum JSON derive — derive was struct-only before), so an open enum nests as a
+  struct field and round-trips there too. A **closed** string enum (no `@json(open)`)
+  is a documented follow-up; `@derive(Json)` on an enum without `@json(open)` is a
+  clear compile error.
+- **Scope / validation.** Strict-typing posture is unchanged ([[D-0059]] fork E):
+  the open-enum `Unknown` fallback is the one deliberate leniency, mirroring
+  "ignore unknown keys". Not in scope (follow-ups): `@json(name=...)` field rename,
+  struct-level `@json(tag=...)`/`@json(deny_unknown=...)`, closed string-enum
+  derive, and timestamp formats beyond epoch/iso8601 (e.g. AWS `http-date`).
+- **No grammar change.** `@json(...)` and `@derive(Json)` reuse the existing
+  `decorators` production on fields and enums (D-0036/[[D-0046]]); `docs/GRAMMAR.ebnf`
+  needs no new rule. See `design/0010-json.md` §"AWS codec hooks".

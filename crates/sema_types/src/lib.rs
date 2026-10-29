@@ -333,6 +333,10 @@ pub struct FnSig {
 pub struct EnumInfo {
     pub is_sum: bool,
     pub variants: Vec<EnumVariantInfo>,
+    /// `true` when the enum carries `@derive(Json)` (ticket #346, D-0086): an
+    /// open string-enum codec. Gates recognition of the `Enum.from_json(s)`
+    /// associated decode function, mirroring the struct codec.
+    pub derives_json: bool,
 }
 
 #[derive(Clone)]
