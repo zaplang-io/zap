@@ -261,6 +261,53 @@ struct StructCtx {
     /// parameter or passes keyword arguments out of declaration order is
     /// reordered and filled against this before lowering; see [`FnLower::call`].
     call_params: HashMap<String, Vec<ParamInfo>>,
+    /// Per-struct-id `@json(...)` field options (ticket #346, D-0086): the inner
+    /// vec is parallel to `fields[sid]`. Absent sid = no json field options on
+    /// that struct; only `@derive(Json)` structs ever read it.
+    json_field_opts: HashMap<u32, Vec<JsonFieldOpts>>,
+}
+
+/// The wire form of a `DateTime` field under `@derive(Json)` (ticket #346,
+/// D-0086), chosen per field via `@json(timestamp=...)`.
+#[derive(Clone, Copy, PartialEq)]
+enum TsFormat {
+    /// JSON number — Unix epoch seconds (UTC). The default when a `DateTime`
+    /// field carries no `@json(timestamp=...)` (matches the AWS awsJson default).
+    Epoch,
+    /// JSON string — ISO-8601 (`2023-11-14T22:13:20`, UTC).
+    Iso8601,
+}
+
+/// Per-field `@json(...)` options for a `@derive(Json)` struct (ticket #346,
+/// D-0086). One entry per struct field, parallel to `StructCtx.fields[sid]`.
+#[derive(Clone, Default)]
+struct JsonFieldOpts {
+    /// `Some` on a `DateTime` field with `@json(timestamp=...)`; `None` means the
+    /// default form (epoch) applies. Ignored on non-`DateTime` fields.
+    timestamp: Option<TsFormat>,
+}
+
+/// Parse a struct field's `@json(...)` decorators into [`JsonFieldOpts`]. Sema
+/// has already validated the option names/values (ticket #346); this mirrors
+/// that for lowering and is lenient on anything it does not recognize.
+fn parse_json_field_opts(fld: &ast::Field) -> JsonFieldOpts {
+    let mut opts = JsonFieldOpts::default();
+    for d in &fld.decorators {
+        if d.name != "json" {
+            continue;
+        }
+        for a in &d.args {
+            if a.name.as_deref() == Some("timestamp") {
+                if let ast::Expr::Str { value, .. } = &a.value {
+                    opts.timestamp = match value.as_str() {
+                        "iso8601" => Some(TsFormat::Iso8601),
+                        _ => Some(TsFormat::Epoch),
+                    };
+                }
+            }
+        }
+    }
+    opts
 }
 
 /// Per-parameter metadata used to assemble a call's arguments in declaration
@@ -691,6 +738,8 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     // C-style bitfield packing (I#173, D-0068), keyed by struct id. A value
     // struct whose fields all carry a bit width packs into one backing integer.
     let mut packed_layouts: HashMap<u32, PackedLayout> = HashMap::new();
+    // Per-field `@json(...)` options (ticket #346, D-0086), keyed by struct id.
+    let mut json_field_opts: HashMap<u32, Vec<JsonFieldOpts>> = HashMap::new();
     {
         let tyenv = TyEnv {
             ids: &ids,
@@ -702,9 +751,14 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         for item in &module.items {
             if let ast::Item::Struct(s) = item {
                 let sid = ids[&s.name];
+                let mut opts: Vec<JsonFieldOpts> = Vec::with_capacity(s.fields.len());
                 for fld in &s.fields {
                     let ft = resolve_ty(&fld.ty, &tyenv).unwrap_or(Ty::Ptr);
                     fields[sid as usize].push((fld.name.clone(), ft));
+                    opts.push(parse_json_field_opts(fld));
+                }
+                if opts.iter().any(|o| o.timestamp.is_some()) {
+                    json_field_opts.insert(sid, opts);
                 }
                 if let Some(pl) = packed_layout_of(s) {
                     packed_layouts.insert(sid, pl);
@@ -817,6 +871,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         fnval_wrappers: RefCell::new(HashMap::new()),
         packed_layouts,
         call_params: HashMap::new(),
+        json_field_opts,
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -906,6 +961,23 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     (psig, ret),
                 );
             }
+        }
+    }
+    // Open string-enum JSON codec signatures (ticket #346, D-0086): `to_json`
+    // (self -> str), `from_json` (str -> Self), and the DOM bridge
+    // `from_json_value` (JsonValue -> Self) so a nested enum field decodes.
+    if let Some(jv_sid) = ctx.ids.get("JsonValue").copied() {
+        for &sid in &deco.json_enums {
+            let name = ctx.names[sid as usize].clone();
+            sigs.insert(format!("{name}__to_json"), (vec![Ty::Struct(sid)], Ty::Ptr));
+            sigs.insert(
+                format!("{name}__from_json"),
+                (vec![Ty::Ptr], Ty::Struct(sid)),
+            );
+            sigs.insert(
+                format!("{name}__from_json_value"),
+                (vec![Ty::Struct(jv_sid)], Ty::Struct(sid)),
+            );
         }
     }
 
@@ -1059,6 +1131,19 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 }
                 Err(e) => errors.push(e),
             }
+        }
+    }
+    // Open string-enum JSON codec functions (ticket #346, D-0086).
+    for &sid in &deco.json_enums {
+        match gen_open_enum_json(sid, &sigs, &ctx) {
+            Ok(funcs) => {
+                for f in funcs {
+                    if gen_names.insert(f.name.clone()) {
+                        out.funcs.push(f);
+                    }
+                }
+            }
+            Err(e) => errors.push(e),
         }
     }
 
@@ -1518,6 +1603,10 @@ struct DecoratorPlan {
     /// `@on_signal(Signal.X)` handlers (ticket #77): `(signal_number, fn_name)`
     /// pairs, registered at the top of `main` via `zap_signal_on`.
     on_signal_meta: Vec<(i64, String)>,
+    /// Open string enums carrying `@derive(Json)` + `@json(open)` (ticket #346,
+    /// D-0086): the enum's tagged-struct id. Each gets `to_json` / `from_json` /
+    /// `from_json_value` generated by the enum JSON path.
+    json_enums: Vec<u32>,
 }
 
 impl DecoratorPlan {
@@ -1545,6 +1634,7 @@ impl DecoratorPlan {
         let mut derived: Vec<(u32, Vec<DerivedTrait>)> = Vec::new();
         let mut reflect_meta: Vec<(String, String)> = Vec::new();
         let mut on_signal_meta: Vec<(i64, String)> = Vec::new();
+        let mut json_enums: Vec<u32> = Vec::new();
 
         for item in &module.items {
             match item {
@@ -1592,14 +1682,18 @@ impl DecoratorPlan {
                     if !traits.is_empty() {
                         derived.push((sid, traits));
                     }
-                    // Field / method decorators are deferred this increment.
+                    // `@json(...)` field decorators are honored by the JSON codec
+                    // (ticket #346, collected into `StructCtx.json_field_opts`);
+                    // any other field decorator stays deferred.
                     for fld in &s.fields {
-                        if !fld.decorators.is_empty() {
-                            errors.push(err(format!(
-                                "field decorators are not implemented yet (deferred): \
-                                 '@{}' on field '{}'",
-                                fld.decorators[0].name, fld.name
-                            )));
+                        for d in &fld.decorators {
+                            if d.name != "json" {
+                                errors.push(err(format!(
+                                    "field decorators are not implemented yet (deferred): \
+                                     '@{}' on field '{}'",
+                                    d.name, fld.name
+                                )));
+                            }
                         }
                     }
                     for m in &s.methods {
@@ -1641,10 +1735,40 @@ impl DecoratorPlan {
                     }
                 }
                 ast::Item::Enum(e) if !e.decorators.is_empty() => {
-                    errors.push(err(format!(
-                        "enum decorators are not implemented yet (deferred): '@{}'",
-                        e.decorators[0].name
-                    )));
+                    // `@derive(Json)` + `@json(open)` on an enum (ticket #346,
+                    // D-0086): an open string-enum codec. Any other enum
+                    // decorator stays deferred.
+                    let derives_json = e.decorators.iter().any(|d| {
+                        d.name == "derive"
+                            && d.args
+                                .iter()
+                                .any(|a| matches!(&a.value, ast::Expr::Name(t, _) if t == "Json"))
+                    });
+                    let is_open = e.decorators.iter().any(|d| {
+                        d.name == "json"
+                            && d.args
+                                .iter()
+                                .any(|a| matches!(&a.value, ast::Expr::Name(n, _) if n == "open"))
+                    });
+                    for d in &e.decorators {
+                        if d.name != "derive" && d.name != "json" {
+                            errors.push(err(format!(
+                                "enum decorators are not implemented yet (deferred): '@{}'",
+                                d.name
+                            )));
+                        }
+                    }
+                    if derives_json {
+                        match validate_open_enum(e, ctx, is_open) {
+                            Ok(sid) => json_enums.push(sid),
+                            Err(e) => errors.push(e),
+                        }
+                    } else if is_open {
+                        errors.push(err(format!(
+                            "enum '{}' has @json(open) but no @derive(Json) (ticket #346)",
+                            e.name
+                        )));
+                    }
                 }
                 _ => {}
             }
@@ -1653,6 +1777,7 @@ impl DecoratorPlan {
         DecoratorPlan {
             derived,
             reflect_meta,
+            json_enums,
             on_signal_meta,
         }
     }
@@ -1680,6 +1805,68 @@ fn on_signal_number(d: &ast::Decorator, ctx: &StructCtx) -> Result<i64, LowerErr
     Err(err(
         "@on_signal expects a Signal member, e.g. @on_signal(Signal.SIGINT)".to_string(),
     ))
+}
+
+/// Validate an `@derive(Json)` enum (ticket #346, D-0086) and return its
+/// tagged-struct id. The enum must be an **open** string enum: it carries
+/// `@json(open)`, is a tier-3 tagged enum, every known variant is payload-free,
+/// and exactly one fallback variant `Unknown(str)` carries the raw wire string.
+/// At least two known variants are required so the value keeps its tag (a lone
+/// known variant beside `Unknown(str)` would collapse into the `Optional`
+/// niche, which has no tag to switch on).
+fn validate_open_enum(e: &ast::EnumDef, ctx: &StructCtx, is_open: bool) -> Result<u32, LowerError> {
+    if !is_open {
+        return Err(err(format!(
+            "@derive(Json) on enum '{}' requires @json(open) with an Unknown(str) \
+             fallback variant (closed string enums are a follow-up)",
+            e.name
+        )));
+    }
+    let info = ctx
+        .enums
+        .get(&e.name)
+        .ok_or_else(|| err(format!("enum '{}' not registered", e.name)))?;
+    let sid = match (info.is_sum, info.sid) {
+        (true, Some(sid)) => sid,
+        _ => {
+            return Err(err(format!(
+                "@json(open) enum '{}' must have an Unknown(str) payload variant \
+                 (ticket #346)",
+                e.name
+            )))
+        }
+    };
+    if info.niche.is_some() {
+        return Err(err(format!(
+            "@json(open) enum '{}' needs at least two known variants besides \
+             Unknown(str) (ticket #346)",
+            e.name
+        )));
+    }
+    let unknown = info.variant("Unknown").ok_or_else(|| {
+        err(format!(
+            "@json(open) enum '{}' must declare a fallback variant 'Unknown(str value)' \
+             (ticket #346)",
+            e.name
+        ))
+    })?;
+    if unknown.fields.len() != 1 || unknown.fields[0].2 != Ty::Ptr {
+        return Err(err(format!(
+            "@json(open) enum '{}': the Unknown variant must carry exactly one str \
+             field, e.g. Unknown(str value) (ticket #346)",
+            e.name
+        )));
+    }
+    for v in &info.variants {
+        if v.name != "Unknown" && !v.fields.is_empty() {
+            return Err(err(format!(
+                "@json(open) enum '{}': known variant '{}' must be payload-free \
+                 (open string enums map each variant to its name; ticket #346)",
+                e.name, v.name
+            )));
+        }
+    }
+    Ok(sid)
 }
 
 /// Report function/parameter decorators as deferred (not implemented yet).
@@ -2081,6 +2268,7 @@ fn gen_json_to_method(
     for (idx, (fname, fty)) in fields.iter().enumerate() {
         // A field name is a Zap identifier, so it needs no JSON escaping.
         let label = format!("\"{fname}\":");
+        let fopts = field_json_opts(ctx, sid, idx);
         if let Some(opt) = optional_layout(ctx, *fty) {
             // `Optional[T]` field: emit `"name":<inner>` only when `Some`; a
             // `None` omits the key entirely (D-0065 dumps rule).
@@ -2101,7 +2289,7 @@ fn gen_json_to_method(
             });
             b.position(write_bb);
             let payload = gen_opt_payload(&mut b, &opt, fv);
-            let vstr = gen_json_encode_field(&mut b, payload, opt.payload_ty, ctx)?;
+            let vstr = gen_json_encode_field(&mut b, payload, opt.payload_ty, &fopts, ctx)?;
             let lbl = b.strconst(&label);
             let frag = gen_concat(&mut b, lbl, vstr);
             b.emit(Inst::Call {
@@ -2119,7 +2307,7 @@ fn gen_json_to_method(
                 sid,
                 idx: idx as u32,
             });
-            let vstr = gen_json_encode_field(&mut b, fv, *fty, ctx)?;
+            let vstr = gen_json_encode_field(&mut b, fv, *fty, &fopts, ctx)?;
             let lbl = b.strconst(&label);
             let frag = gen_concat(&mut b, lbl, vstr);
             b.emit(Inst::Call {
@@ -2143,11 +2331,14 @@ fn gen_json_to_method(
     Ok(b.func)
 }
 
-/// Encode one `@derive(Json)` field value to its JSON text.
+/// Encode one `@derive(Json)` field value to its JSON text. `opts` carries the
+/// field's `@json(...)` options (AWS codec hooks, ticket #346): the timestamp
+/// wire form of a `DateTime` field; a `bytes` field is always base64.
 fn gen_json_encode_field(
     b: &mut FnLower,
     fv: Value,
     fty: Ty,
+    opts: &JsonFieldOpts,
     ctx: &StructCtx,
 ) -> Result<Value, LowerError> {
     // An `Optional[T]` is handled one level up (object-field omit on `None`); a
@@ -2170,6 +2361,47 @@ fn gen_json_encode_field(
         });
         d
     };
+    // AWS codec hooks (ticket #346, D-0086), checked before the scalar/nested
+    // walk since both `bytes` and `DateTime` would otherwise mis-route.
+    // `bytes` → base64 JSON string; exact round-trip via encoding/base64.
+    if fty == Ty::Bytes {
+        let urlsafe = b.iconst(Ty::I64, 0);
+        let pad = b.iconst(Ty::I64, 1);
+        let b64 = b.new_value(Ty::Ptr);
+        b.emit(Inst::Call {
+            dest: Some(b64),
+            func: "zap_base64_encode".to_string(),
+            args: vec![fv, urlsafe, pad],
+        });
+        return Ok(call1(b, "zap_json_escape", b64));
+    }
+    // A `DateTime` field: epoch seconds (JSON number, default) or ISO-8601
+    // (JSON string), per `@json(timestamp=...)`.
+    if let Ty::Struct(s) = fty {
+        if Some(s) == datetime_sid_opt(ctx) {
+            let comps = gen_dt_read_components(b, s, fv);
+            return Ok(match opts.timestamp.unwrap_or(TsFormat::Epoch) {
+                TsFormat::Epoch => {
+                    let ts = b.new_value(Ty::I64);
+                    b.emit(Inst::Call {
+                        dest: Some(ts),
+                        func: "zap_datetime_to_unix".to_string(),
+                        args: comps,
+                    });
+                    call1(b, "zap_i64_to_str", ts)
+                }
+                TsFormat::Iso8601 => {
+                    let iso = b.new_value(Ty::Ptr);
+                    b.emit(Inst::Call {
+                        dest: Some(iso),
+                        func: "zap_datetime_format_iso".to_string(),
+                        args: comps,
+                    });
+                    call1(b, "zap_json_escape", iso)
+                }
+            });
+        }
+    }
     let r = match derive_field_kind(fty) {
         Some(DeriveFieldKind::Bool) => {
             let w = b.coerce(fv, Ty::I1, Ty::I64);
@@ -2275,10 +2507,11 @@ fn gen_json_from_value_method(
             func: "__json_field".to_string(),
             args: vec![0, key],
         });
+        let fopts = field_json_opts(ctx, sid, idx);
         let val = if let Some(opt) = optional_layout(ctx, *fty) {
-            gen_json_decode_optional(&mut b, jf, jv_sid, &opt, ctx)?
+            gen_json_decode_optional(&mut b, jf, jv_sid, &opt, &fopts, ctx)?
         } else {
-            gen_json_decode_field(&mut b, jf, *fty, ctx)?
+            gen_json_decode_field(&mut b, jf, *fty, &fopts, ctx)?
         };
         b.emit(Inst::FieldSet {
             base: dest,
@@ -2301,6 +2534,7 @@ fn gen_json_decode_optional(
     jf: Value,
     jv_sid: u32,
     opt: &OptionalLayout,
+    fopts: &JsonFieldOpts,
     ctx: &StructCtx,
 ) -> Result<Value, LowerError> {
     let slot = b.alloca(Ty::Struct(opt.sid));
@@ -2340,7 +2574,7 @@ fn gen_json_decode_optional(
     b.store(slot, noneval);
     b.set_term(Term::Br(join_bb));
     b.position(some_bb);
-    let inner = gen_json_decode_field(b, jf, opt.payload_ty, ctx)?;
+    let inner = gen_json_decode_field(b, jf, opt.payload_ty, fopts, ctx)?;
     let someval = gen_opt_some(b, opt, inner);
     b.store(slot, someval);
     b.set_term(Term::Br(join_bb));
@@ -2356,6 +2590,265 @@ fn json_value_sid(ctx: &StructCtx) -> Result<u32, LowerError> {
         .ok_or_else(|| err("JsonValue unavailable (built-in prelude missing)"))
 }
 
+/// The per-field `@json(...)` options for struct `sid`'s field `idx` (ticket
+/// #346), or the default (no options) when the struct has none.
+fn field_json_opts(ctx: &StructCtx, sid: u32, idx: usize) -> JsonFieldOpts {
+    ctx.json_field_opts
+        .get(&sid)
+        .and_then(|v| v.get(idx))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The prelude `DateTime` value-struct id, if the prelude provides it (ticket
+/// #346 timestamp codec). `None` when no `datetime` surface is in scope.
+fn datetime_sid_opt(ctx: &StructCtx) -> Option<u32> {
+    ctx.ids.get("DateTime").copied()
+}
+
+/// The `DateTime` field getters `zap_datetime_<field>(ts, is_local)`, in field
+/// order (year, month, day, hour, minute, second) — mirrors the `datetime`
+/// lowering facet.
+const DT_GETTERS: [&str; 6] = [
+    "zap_datetime_year",
+    "zap_datetime_month",
+    "zap_datetime_day",
+    "zap_datetime_hour",
+    "zap_datetime_minute",
+    "zap_datetime_second",
+];
+
+/// Read a `DateTime` value's six civil components into a `[y,mo,d,h,mi,s]` arg
+/// vector, ready for `zap_datetime_to_unix` / `zap_datetime_format_iso`.
+fn gen_dt_read_components(b: &mut FnLower, dt_sid: u32, dt: Value) -> Vec<Value> {
+    (0..6)
+        .map(|idx| b.field_get(dt, dt_sid, idx, Ty::I64))
+        .collect()
+}
+
+/// Build a UTC `DateTime` value from a Unix-timestamp value (`is_local == 0`),
+/// one `zap_datetime_<field>` getter per component — mirrors `datetime`'s
+/// `build_datetime`.
+fn gen_dt_from_epoch(b: &mut FnLower, dt_sid: u32, ts: Value) -> Value {
+    let local = b.iconst(Ty::I64, 0);
+    let dest = b.new_value(Ty::Struct(dt_sid));
+    b.emit(Inst::StructNew { dest, sid: dt_sid });
+    for (idx, func) in DT_GETTERS.iter().enumerate() {
+        let v = b.new_value(Ty::I64);
+        b.emit(Inst::Call {
+            dest: Some(v),
+            func: (*func).to_string(),
+            args: vec![ts, local],
+        });
+        b.emit(Inst::FieldSet {
+            base: dest,
+            sid: dt_sid,
+            idx: idx as u32,
+            val: v,
+        });
+    }
+    dest
+}
+
+/// `@derive(Json)` + `@json(open)` enum codec (ticket #346, D-0086): generate
+/// `to_json` / `from_json` / `from_json_value` for an open string enum. Known
+/// (payload-free) variants map to their name as a JSON string; the `Unknown(str)`
+/// variant carries the raw wire string for a value the enum does not name.
+fn gen_open_enum_json(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Vec<Func>, LowerError> {
+    Ok(vec![
+        gen_enum_json_to(sid, sigs, ctx)?,
+        gen_enum_json_from(sid, sigs, ctx)?,
+        gen_enum_json_from_value(sid, sigs, ctx)?,
+    ])
+}
+
+/// The lowered variants of the enum whose tagged-struct id is `sid`.
+fn enum_variants_of(ctx: &StructCtx, sid: u32) -> Result<Vec<VariantLow>, LowerError> {
+    let name = &ctx.names[sid as usize];
+    ctx.enums
+        .get(name)
+        .map(|e| e.variants.clone())
+        .ok_or_else(|| err(format!("enum '{name}' not registered for JSON derive")))
+}
+
+/// Allocate an open-enum tagged value for `v`, storing its tag and (for
+/// `Unknown`) the single carried string payload.
+fn build_enum_variant(b: &mut FnLower, sid: u32, v: &VariantLow, payload: Option<Value>) -> Value {
+    let dest = b.new_value(Ty::Struct(sid));
+    b.emit(Inst::StructNew { dest, sid });
+    let tag = b.iconst(Ty::I32, v.tag);
+    b.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 0,
+        val: tag,
+    });
+    if let Some(p) = payload {
+        b.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: v.fields[0].1,
+            val: p,
+        });
+    }
+    dest
+}
+
+/// `{Enum}__to_json(self) -> str`: switch on the tag; a known variant emits its
+/// quoted name, `Unknown(s)` emits the escaped carried string.
+fn gen_enum_json_to(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let name = ctx.names[sid as usize].clone();
+    let variants = enum_variants_of(ctx, sid)?;
+    let mut b = FnLower::new(
+        format!("{name}__to_json"),
+        vec![Ty::Struct(sid)],
+        Ty::Ptr,
+        false,
+        true,
+        sigs,
+        ctx,
+    );
+    let tag = b.new_value(Ty::I32);
+    b.emit(Inst::FieldGet {
+        dest: tag,
+        base: 0,
+        sid,
+        idx: 0,
+    });
+    for v in &variants {
+        let then_bb = b.new_block();
+        let next_bb = b.new_block();
+        let k = b.iconst(Ty::I32, v.tag);
+        let (cond, _) = b.binop(AstBin::Eq, tag, Ty::I32, k, Ty::I32)?;
+        b.set_term(Term::BrIf {
+            cond,
+            then_bb,
+            else_bb: next_bb,
+        });
+        b.position(then_bb);
+        let result = if v.name == "Unknown" {
+            let payload = b.new_value(Ty::Ptr);
+            b.emit(Inst::FieldGet {
+                dest: payload,
+                base: 0,
+                sid,
+                idx: v.fields[0].1,
+            });
+            let d = b.new_value(Ty::Ptr);
+            b.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_json_escape".to_string(),
+                args: vec![payload],
+            });
+            d
+        } else {
+            // A variant name is an identifier, so the literal needs no escaping.
+            b.strconst(&format!("\"{}\"", v.name))
+        };
+        b.set_term(Term::Ret(Some(result)));
+        b.position(next_bb);
+    }
+    // Unreachable (the tag always names a variant); emit a safe default.
+    let nullv = b.strconst("null");
+    b.set_term(Term::Ret(Some(nullv)));
+    Ok(b.func)
+}
+
+/// `{Enum}__from_json(s) -> Self`: parse to the DOM then hand to the decode core.
+fn gen_enum_json_from(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let name = ctx.names[sid as usize].clone();
+    let jv_sid = json_value_sid(ctx)?;
+    let mut b = FnLower::new(
+        format!("{name}__from_json"),
+        vec![Ty::Ptr],
+        Ty::Struct(sid),
+        false,
+        false,
+        sigs,
+        ctx,
+    );
+    let jv = b.new_value(Ty::Struct(jv_sid));
+    b.emit(Inst::Call {
+        dest: Some(jv),
+        func: "__json_loads".to_string(),
+        args: vec![0],
+    });
+    let dest = b.new_value(Ty::Struct(sid));
+    b.emit(Inst::Call {
+        dest: Some(dest),
+        func: format!("{name}__from_json_value"),
+        args: vec![jv],
+    });
+    b.set_term(Term::Ret(Some(dest)));
+    Ok(b.func)
+}
+
+/// `{Enum}__from_json_value(v) -> Self`: read the string and match it against
+/// each known variant name; an unrecognized string becomes `Unknown(raw)`
+/// (forward-compatible with AWS adding enum values).
+fn gen_enum_json_from_value(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let name = ctx.names[sid as usize].clone();
+    let jv_sid = json_value_sid(ctx)?;
+    let variants = enum_variants_of(ctx, sid)?;
+    let mut b = FnLower::new(
+        format!("{name}__from_json_value"),
+        vec![Ty::Struct(jv_sid)],
+        Ty::Struct(sid),
+        false,
+        false,
+        sigs,
+        ctx,
+    );
+    // s = __json_as_str(v) — the wire string (v is value 0).
+    let s = b.new_value(Ty::Ptr);
+    b.emit(Inst::Call {
+        dest: Some(s),
+        func: "__json_as_str".to_string(),
+        args: vec![0],
+    });
+    for v in &variants {
+        if v.name == "Unknown" {
+            continue;
+        }
+        let then_bb = b.new_block();
+        let next_bb = b.new_block();
+        let lit = b.strconst(&v.name);
+        let (cond, _) = b.binop(AstBin::Eq, s, Ty::Ptr, lit, Ty::Ptr)?;
+        b.set_term(Term::BrIf {
+            cond,
+            then_bb,
+            else_bb: next_bb,
+        });
+        b.position(then_bb);
+        let built = build_enum_variant(&mut b, sid, v, None);
+        b.set_term(Term::Ret(Some(built)));
+        b.position(next_bb);
+    }
+    let unknown = variants
+        .iter()
+        .find(|v| v.name == "Unknown")
+        .ok_or_else(|| err(format!("open enum '{name}' lost its Unknown variant")))?;
+    let built = build_enum_variant(&mut b, sid, unknown, Some(s));
+    b.set_term(Term::Ret(Some(built)));
+    Ok(b.func)
+}
+
 /// Decode one field: convert its `JsonValue` (`jf`) to the field type `fty` via
 /// the prelude typed accessors, recursing into a nested struct's
 /// `from_json_value`.
@@ -2363,6 +2856,7 @@ fn gen_json_decode_field(
     b: &mut FnLower,
     jf: Value,
     fty: Ty,
+    opts: &JsonFieldOpts,
     ctx: &StructCtx,
 ) -> Result<Value, LowerError> {
     // A top-level `Optional[T]` field is handled by `gen_json_decode_optional`; a
@@ -2385,6 +2879,35 @@ fn gen_json_decode_field(
         });
         d
     };
+    // AWS codec hooks (ticket #346, D-0086) — mirror of the encode side.
+    // `bytes` ← a base64 JSON string, decoded via encoding/base64 (throwing on a
+    // malformed string, like `base64.decode`).
+    if fty == Ty::Bytes {
+        let s = call1(b, "__json_as_str", Ty::Ptr, jf);
+        let urlsafe = b.iconst(Ty::I64, 0);
+        let d = b.new_value(Ty::Bytes);
+        b.throwing_call(Some(d), "zap_base64_decode", vec![s, urlsafe]);
+        return Ok(d);
+    }
+    // A `DateTime` field ← epoch-seconds number (default) or ISO-8601 string.
+    if let Ty::Struct(s) = fty {
+        if Some(s) == datetime_sid_opt(ctx) {
+            let ts = match opts.timestamp.unwrap_or(TsFormat::Epoch) {
+                TsFormat::Epoch => call1(b, "__json_as_int", Ty::I64, jf),
+                TsFormat::Iso8601 => {
+                    let iso = call1(b, "__json_as_str", Ty::Ptr, jf);
+                    let t = b.new_value(Ty::I64);
+                    b.emit(Inst::Call {
+                        dest: Some(t),
+                        func: "zap_datetime_parse_iso".to_string(),
+                        args: vec![iso],
+                    });
+                    t
+                }
+            };
+            return Ok(gen_dt_from_epoch(b, s, ts));
+        }
+    }
     let r = match derive_field_kind(fty) {
         Some(DeriveFieldKind::Bool) => call1(b, "__json_as_bool", Ty::I1, jf),
         Some(DeriveFieldKind::Float(Ty::F32)) => {
@@ -6615,6 +7138,25 @@ impl<'a> FnLower<'a> {
         if let Expr::Attr { base, name, .. } = callee {
             if let Expr::Name(tyname, _) = base.as_ref() {
                 if self.ctx.enums.contains_key(tyname) {
+                    // `Enum.from_json(s)` — an open string-enum's decode function
+                    // (ticket #346, D-0086), intercepted before variant
+                    // construction so `from_json` is not read as a variant name.
+                    let fnname = format!("{tyname}__from_json");
+                    if name == "from_json" && self.sigs.contains_key(&fnname) {
+                        let (s, _) = self.expr(&args[0].value)?;
+                        let sid = *self
+                            .ctx
+                            .ids
+                            .get(tyname)
+                            .ok_or_else(|| err("unknown enum in from_json"))?;
+                        let d = self.new_value(Ty::Struct(sid));
+                        self.emit(Inst::Call {
+                            dest: Some(d),
+                            func: fnname,
+                            args: vec![s],
+                        });
+                        return Ok((d, Ty::Struct(sid)));
+                    }
                     return self.lower_variant_construct(tyname, name, args);
                 }
                 // Built-in `signal`/`gc`/`runtime` module calls (ticket #77,

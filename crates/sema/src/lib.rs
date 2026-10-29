@@ -295,6 +295,10 @@ const BUILTIN_DECORATORS: &[&str] = &[
     "range",
     "deprecated",
     "inject",
+    // JSON codec hooks (ticket #346, D-0086): `@json(timestamp="epoch"|"iso8601")`
+    // on a `DateTime` field selects its wire form; `@json(open)` on an enum marks
+    // it an open (forward-compatible) string enum. See `design/0010-json.md`.
+    "json",
     // Signals (ticket #77, D-0058): `@on_signal(Signal.X)` on a function
     // registers it as a handler for signal X (sugar over `signal.notify`).
     "on_signal",
@@ -510,8 +514,20 @@ impl Checker {
                                 .collect(),
                         })
                         .collect();
-                    self.enums
-                        .insert(e.name.clone(), EnumInfo { is_sum, variants });
+                    let derives_json = e.decorators.iter().any(|d| {
+                        d.name == "derive"
+                            && d.args
+                                .iter()
+                                .any(|a| matches!(&a.value, Expr::Name(t, _) if t == "Json"))
+                    });
+                    self.enums.insert(
+                        e.name.clone(),
+                        EnumInfo {
+                            is_sum,
+                            variants,
+                            derives_json,
+                        },
+                    );
                 }
                 Item::Struct(s) => {
                     let info = self.struct_info_of(s);
@@ -1323,7 +1339,25 @@ impl Checker {
         let positionals = d.args.len() - keywords;
         match d.name.as_str() {
             "derive" => {
-                self.require_target(d, target, DecoTarget::Struct);
+                // `@derive(...)` applies to a struct, and additionally to an enum
+                // when every derived trait is `Json` — an open string-enum codec
+                // (ticket #346, D-0086). Other traits on an enum stay unsupported.
+                if target == DecoTarget::Enum {
+                    let all_json = d
+                        .args
+                        .iter()
+                        .all(|a| matches!(&a.value, Expr::Name(t, _) if t == "Json"));
+                    if !all_json {
+                        self.error(
+                            ErrorCode::ZAP5047,
+                            "only @derive(Json) is supported on an enum (ticket #346); \
+                             other derivable traits apply to a struct",
+                            d.span,
+                        );
+                    }
+                } else {
+                    self.require_target(d, target, DecoTarget::Struct);
+                }
                 if d.args.is_empty() {
                     self.error(
                         ErrorCode::ZAP5033,
@@ -1356,6 +1390,70 @@ impl Checker {
                             d.span,
                         );
                     }
+                }
+            }
+            "json" => {
+                // JSON codec hooks (ticket #346, D-0086). On a field:
+                // `@json(timestamp="epoch"|"iso8601")` selects a DateTime field's
+                // wire form. On an enum: `@json(open)` marks an open string enum.
+                match target {
+                    DecoTarget::Field => {
+                        if positionals != 0 {
+                            self.error(
+                                ErrorCode::ZAP5047,
+                                "@json(...) on a field takes keyword options, e.g. \
+                                 @json(timestamp=\"iso8601\")",
+                                d.span,
+                            );
+                        }
+                        for a in &d.args {
+                            match a.name.as_deref() {
+                                Some("timestamp") => {
+                                    let ok = matches!(
+                                        &a.value,
+                                        Expr::Str { value, .. }
+                                            if value == "epoch" || value == "iso8601"
+                                    );
+                                    if !ok {
+                                        self.error(
+                                            ErrorCode::ZAP5047,
+                                            "@json(timestamp=...) must be \"epoch\" or \"iso8601\"",
+                                            d.span,
+                                        );
+                                    }
+                                }
+                                Some(other) => self.error(
+                                    ErrorCode::ZAP5047,
+                                    format!(
+                                        "@json(...) on a field has no option '{other}' \
+                                         (only 'timestamp')"
+                                    ),
+                                    d.span,
+                                ),
+                                None => {}
+                            }
+                        }
+                    }
+                    DecoTarget::Enum => {
+                        let ok = keywords == 0
+                            && positionals == 1
+                            && matches!(&d.args[0].value, Expr::Name(n, _) if n == "open");
+                        if !ok {
+                            self.error(
+                                ErrorCode::ZAP5047,
+                                "@json(...) on an enum takes only the flag `open`, i.e. @json(open)",
+                                d.span,
+                            );
+                        }
+                    }
+                    _ => self.error(
+                        ErrorCode::ZAP5047,
+                        format!(
+                            "@json applies to a field or an enum, not {}",
+                            target.describe()
+                        ),
+                        d.span,
+                    ),
                 }
             }
             "on_signal" => {
@@ -3165,6 +3263,35 @@ impl Checker {
         if let Expr::Attr { base, name, .. } = callee {
             if let Expr::Name(tyname, _) = base.as_ref() {
                 if let Some(info) = self.enums.get(tyname).cloned() {
+                    // `Enum.from_json(s)` — the decode associated function an
+                    // `@derive(Json)` (open) enum gets (ticket #346, D-0086).
+                    // Intercepted before variant construction so `from_json` is
+                    // not mistaken for a variant name.
+                    if name == "from_json" && info.derives_json {
+                        if args.len() != 1 {
+                            self.error(
+                                ErrorCode::ZAP4025,
+                                format!(
+                                    "{tyname}.from_json(s) takes 1 argument, found {}",
+                                    args.len()
+                                ),
+                                span,
+                            );
+                        } else {
+                            let t = self.infer(&args[0].value);
+                            if !assignable(&t, &Ty::Str) && !assignable(&t, &Ty::Bytes) {
+                                self.error(
+                                    ErrorCode::ZAP4024,
+                                    format!(
+                                        "{tyname}.from_json() expects a str or bytes argument, found {}",
+                                        t.display()
+                                    ),
+                                    expr_span(&args[0].value),
+                                );
+                            }
+                        }
+                        return Ty::Named(tyname.clone());
+                    }
                     return self.check_variant_construction(tyname, name, &info, args, span);
                 }
                 // `Struct.from_json(s)` — the decode associated function a
