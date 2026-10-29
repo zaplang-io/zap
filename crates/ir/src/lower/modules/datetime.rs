@@ -8,7 +8,9 @@
 //! call. `strftime` / 2-arg `format(dt, fmt)` read the same six fields and pass
 //! them plus the format `ZapStr*` to `zap_datetime_strftime` (#286). `parse`
 //! lowers an ISO-8601 string to a Unix timestamp and then builds a UTC
-//! `DateTime` from it, reusing the getters.
+//! `DateTime` from it, reusing the getters. `strptime(str, fmt)` is the inverse
+//! of `strftime`: it hands both strings to `zap_datetime_strptime` and builds a
+//! UTC `DateTime` from the resulting timestamp (#338).
 
 use zapc_syntax::ast;
 
@@ -108,7 +110,13 @@ fn lower(
     let r = match method {
         "from_timestamp" | "from_timestamp_local" => {
             let (v, vt) = lowerer.expr(&args[0].value)?;
-            let ts = lowerer.coerce(v, vt, Ty::I64);
+            // A float timestamp (AWS fractional `unixTimestamp`) is truncated to
+            // whole seconds via `convert` (FPToSI); `coerce` only widens (#338).
+            let ts = if vt.is_float() {
+                lowerer.convert(v, vt, Ty::I64)
+            } else {
+                lowerer.coerce(v, vt, Ty::I64)
+            };
             let is_local = i64::from(method == "from_timestamp_local");
             build_datetime(lowerer, ts, is_local)?
         }
@@ -129,6 +137,18 @@ fn lower(
                 dest: Some(ts),
                 func: "zap_datetime_parse_iso".to_string(),
                 args: vec![s],
+            });
+            build_datetime(lowerer, ts, 0)?
+        }
+        // (str, strftime format) -> UTC Unix timestamp -> DateTime (#338).
+        "strptime" => {
+            let (s, _) = lowerer.expr(&args[0].value)?;
+            let (fmt, _) = lowerer.expr(&args[1].value)?;
+            let ts = lowerer.new_value(Ty::I64);
+            lowerer.emit(Inst::Call {
+                dest: Some(ts),
+                func: "zap_datetime_strptime".to_string(),
+                args: vec![s, fmt],
             });
             build_datetime(lowerer, ts, 0)?
         }

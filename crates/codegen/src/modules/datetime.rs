@@ -6,6 +6,9 @@
 //! `now` / `parse`. `zap_datetime_to_unix(y,mo,d,h,mi,s)` recomposes a UTC
 //! timestamp; `zap_datetime_format_iso(...)` renders an ISO-8601 `ZapStr*`;
 //! `zap_datetime_parse_iso(ZapStr*)` parses ISO-8601 to a UTC timestamp;
+//! `zap_datetime_strptime(ZapStr* s, ZapStr* fmt)` parses `s` against a
+//! strftime-style `fmt` to a UTC timestamp — the inverse of `strftime`, and the
+//! basis for the AWS SigV4 / iso8601 / rfc822 parse forms (#338);
 //! `zap_datetime_now_unix()` is the current wall-clock time in whole seconds.
 //! See `zaprt.c`.
 
@@ -42,4 +45,10 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     ];
     cg.declare_rt("zap_datetime_strftime", &six_and_fmt, Some(p.into()));
     cg.declare_rt("zap_datetime_parse_iso", &[p.into()], Some(i.into()));
+    // (str: ZapStr*, fmt: ZapStr*) -> unix seconds (#338)
+    cg.declare_rt(
+        "zap_datetime_strptime",
+        &[p.into(), p.into()],
+        Some(i.into()),
+    );
 }

@@ -2,11 +2,13 @@
 //!
 //! Civil (calendar) date-time over a Unix timestamp. Values are the built-in
 //! prelude `value struct DateTime` (year/month/day/hour/minute/second), built
-//! from a timestamp and rendered/parsed as ISO-8601. Timezone handling is
-//! **UTC + local only** in v1: `from_timestamp`/`now`/`format`/`parse` operate
-//! in UTC, the `*_local` variants in the host's local zone; a full timezone
-//! database is deferred (D-0056). `import datetime` is accepted but not
-//! required, like `signal`/`gc`/`runtime`.
+//! from a timestamp and rendered/parsed as ISO-8601, or via `strftime` /
+//! `strptime` custom formats (the AWS SigV4 / epoch / iso8601 / rfc822 forms,
+//! #286 and #338). Timezone handling is **UTC + local only** in v1:
+//! `from_timestamp`/`now`/`format`/`parse`/`strptime` operate in UTC, the
+//! `*_local` variants in the host's local zone; a full timezone database is
+//! deferred (D-0056). `import datetime` is accepted but not required, like
+//! `signal`/`gc`/`runtime`.
 
 use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
@@ -101,11 +103,50 @@ fn check_strftime(checker: &mut Checker, method: &str, args: &[Arg], span: Span)
     }
 }
 
+/// Check a `(str, str)` parse call (`strptime`), inferring both operands so
+/// each is type-checked (#338). Mirrors `strftime` but with the string/format
+/// argument order of Python's `datetime.strptime`.
+fn check_strptime(checker: &mut Checker, args: &[Arg], span: Span) {
+    if args.len() != 2 {
+        checker.error(
+            ErrorCode::ZAP4025,
+            format!(
+                "datetime.strptime() takes 2 arguments, found {}",
+                args.len()
+            ),
+            span,
+        );
+        for a in args {
+            checker.infer(&a.value);
+        }
+        return;
+    }
+    for (idx, what) in [(0usize, "a str"), (1usize, "a str format")] {
+        let t = checker.infer(&args[idx].value);
+        if !matches!(t, Ty::Str | Ty::Unknown) {
+            checker.error(
+                ErrorCode::ZAP4024,
+                format!("datetime.strptime() expects {what}, found {}", t.display()),
+                expr_span(&args[idx].value),
+            );
+        }
+    }
+}
+
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     match method {
-        // DateTime from a Unix timestamp (seconds since the epoch).
+        // DateTime from a Unix timestamp (seconds since the epoch). Accepts a
+        // float too (AWS `unixTimestamp` may be fractional); it is truncated to
+        // whole seconds, the resolution `DateTime` carries.
         "from_timestamp" | "from_timestamp_local" => {
-            expect1(checker, method, args, span, "an int timestamp", Ty::is_int);
+            expect1(
+                checker,
+                method,
+                args,
+                span,
+                "an int or float timestamp",
+                |t| t.is_int() || matches!(t, Ty::Float64 | Ty::Float32 | Ty::UntypedFloat),
+            );
             Some(Ty::Named(DATETIME.to_string()))
         }
         // Current civil time.
@@ -139,6 +180,12 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect1(checker, method, args, span, "a str", |t| {
                 matches!(t, Ty::Str)
             });
+            Some(Ty::Named(DATETIME.to_string()))
+        }
+        // (str, strftime format) -> DateTime (UTC). The inverse of `strftime`;
+        // parses the AWS SigV4 / iso8601 / rfc822 forms (#338).
+        "strptime" => {
+            check_strptime(checker, args, span);
             Some(Ty::Named(DATETIME.to_string()))
         }
         _ => None,
