@@ -304,7 +304,12 @@ and_test      ::= not_test { "and" not_test } ;
 not_test      ::= "not" not_test | comparison ;
 comparison    ::= bit_or { comp_op bit_or }
                 | bit_or ( "=~" | "!~" ) match_regex
-                | bit_or "=~" subst_regex ;
+                | bit_or "=~" subst_regex ;   (* A run of two or more comp_ops —
+                     `a < b < c` — is a Python-style *chained* comparison, NOT
+                     left-associative `(a < b) < c`: it means
+                     `(a < b) and (b < c) and ...` with each operand evaluated
+                     exactly once, left to right, short-circuiting at the first
+                     false link (I#386). Parenthesize to defeat chaining. *)
 comp_op       ::= "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" ;
 
 bit_or        ::= bit_xor { "|" bit_xor } ;

@@ -349,6 +349,12 @@ impl Rewriter<'_> {
                 self.expr(lhs, locals);
                 self.expr(rhs, locals);
             }
+            Expr::Compare { first, rest, .. } => {
+                self.expr(first, locals);
+                for (_, operand) in rest.iter_mut() {
+                    self.expr(operand, locals);
+                }
+            }
             Expr::Tuple(xs, _) | Expr::List(xs, _) | Expr::Set(xs, _) => {
                 for x in xs {
                     self.expr(x, locals);
@@ -811,6 +817,12 @@ fn collect_expr_bindings(e: &Expr, s: &mut HashSet<String>) {
         Expr::Binary { lhs, rhs, .. } => {
             collect_expr_bindings(lhs, s);
             collect_expr_bindings(rhs, s);
+        }
+        Expr::Compare { first, rest, .. } => {
+            collect_expr_bindings(first, s);
+            for (_, operand) in rest {
+                collect_expr_bindings(operand, s);
+            }
         }
         Expr::Unary { expr, .. } => collect_expr_bindings(expr, s),
         Expr::Index { base, index, .. } => {

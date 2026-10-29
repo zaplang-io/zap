@@ -77,7 +77,6 @@ Bugs found on `main` (for triage; NOT fixed in this PR):
 | `collection_truthiness` | `if <list>:` / `if <dict>:` crashes codegen (panic, exit 101) instead of applying truthiness |
 | `except_builtin_fault` | a built-in fault (index-out-of-range) is not caught by `except` (contradicts D-0007) |
 | `float_str_integral` | `str()` of an integral float drops the `.0` (`str(6 / 2)` is `"3"`, not `"3.0"`) |
-| `chained_comparison` | `a < b < c` parses left-associative `(a < b) < c`, not Python-chained |
 
 Feature gaps vs CPython (for triage):
 
@@ -101,10 +100,11 @@ Feature gaps vs CPython (for triage):
 
 `random_programs_match_cpython` emits a seeded corpus of fully-parenthesized
 `print(...)` programs over the subset where the two engines are *required* to
-agree (bounded int arithmetic, boolean logic with boolean operands, single
-comparisons, string concat, in-range list/dict indexing, ternaries, and
-comprehension counts). It deliberately avoids every divergence above, so a
-failure is a genuine, newly-found bug. Deterministic in CI (fixed seed, modest
+agree (bounded int arithmetic, boolean logic with boolean operands, comparisons
+— single and Python-chained (I#386) — string concat, in-range list/dict
+indexing, ternaries, and comprehension counts). It deliberately avoids every
+divergence above, so a failure is a genuine, newly-found bug. Deterministic in
+CI (fixed seed, modest
 count); fuzz harder locally:
 
 ```bash

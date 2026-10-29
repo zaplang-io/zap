@@ -1492,6 +1492,21 @@ impl Mono<'_> {
                 },
                 CTy::Unknown,
             )),
+            Expr::Compare { first, rest, span } => {
+                let first = Box::new(self.rw(first, env)?);
+                let mut new_rest = Vec::with_capacity(rest.len());
+                for (op, operand) in rest {
+                    new_rest.push((*op, self.rw(operand, env)?));
+                }
+                Ok((
+                    Expr::Compare {
+                        first,
+                        rest: new_rest,
+                        span: *span,
+                    },
+                    self.prim("bool"),
+                ))
+            }
             Expr::Tuple(xs, span) => Ok((Expr::Tuple(self.rw_vec(xs, env)?, *span), CTy::Unknown)),
             Expr::List(xs, span) => {
                 // Infer the element type from the first element (best-effort), so

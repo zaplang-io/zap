@@ -1406,6 +1406,12 @@ impl Walk {
                 self.expr(lhs);
                 self.expr(rhs);
             }
+            Expr::Compare { first, rest, .. } => {
+                self.expr(first);
+                for (_, operand) in rest {
+                    self.expr(operand);
+                }
+            }
             Expr::Call { callee, args, .. } => {
                 self.expr(callee);
                 for a in args {
@@ -1499,6 +1505,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::SetComp { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
+        | Expr::Compare { span, .. }
         | Expr::Call { span, .. }
         | Expr::Index { span, .. }
         | Expr::Slice { span, .. }

@@ -211,6 +211,12 @@ fn each_yield_in_expr<'a>(e: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
             each_yield_in_expr(lhs, visit);
             each_yield_in_expr(rhs, visit);
         }
+        Expr::Compare { first, rest, .. } => {
+            each_yield_in_expr(first, visit);
+            for (_, operand) in rest {
+                each_yield_in_expr(operand, visit);
+            }
+        }
         Expr::Call { callee, args, .. } => {
             each_yield_in_expr(callee, visit);
             for a in args {
