@@ -791,7 +791,7 @@ pub mod gen {
         /// Python-chained, I#386), string concat/len, ternaries, and a
         /// comprehension count. It avoids every known divergence/gap — int64
         /// overflow, true division's float repr, non-bool `and`/`or` values,
-        /// `%` sign on negatives, dict iteration order, and the unsupported list
+        /// dict iteration order, and the unsupported list
         /// slice/`in`/negative-index — so a failure here is a genuine,
         /// newly-found divergence.
         fn statement(&mut self) -> String {
@@ -812,8 +812,8 @@ pub mod gen {
                         )
                     } else {
                         // `i` ranges over 0..k and the divisor `m` is positive,
-                        // so the `%` here is always non-negative — the sign bug
-                        // documented in mod_negatives.zap is never triggered.
+                        // so the `%` here is always non-negative. (Negative-sign
+                        // `%` now also matches CPython — see mod_negatives.zap.)
                         let k = 1 + self.below(5);
                         let m = 1 + self.below(4);
                         let r = self.below(m);
@@ -824,9 +824,9 @@ pub mod gen {
         }
 
         /// Fully-parenthesized integer expression; leaves are 0..=9 with an
-        /// explicit unary-minus node. Only `+`/`-`/`*` — division (`/` float
-        /// repr, `//`/`%` sign) is excluded because it is a documented
-        /// divergence point (see division.zap, mod_negatives.zap). Bounded depth
+        /// explicit unary-minus node. Only `+`/`-`/`*` — true division (`/`) is
+        /// excluded for its float repr (a documented divergence point, see
+        /// division.zap). Bounded depth
         /// keeps results well inside int64, so the two engines must agree.
         fn int_expr(&mut self, depth: u32) -> String {
             if depth == 0 || self.below(3) == 0 {
