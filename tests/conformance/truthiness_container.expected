@@ -1,0 +1,4 @@
+empty-list-falsy
+full-list-truthy
+empty-dict-falsy
+dict-truthy

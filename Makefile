@@ -118,10 +118,10 @@ check:
 ## container. `docker-test` depends on this, and you should run it before every
 ## push. Fix a failure with:
 ##   cargo fmt --all                                     # Rust formatting
-##   cargo run --bin zap -- fmt tests/golden tests/diff  # .zap formatting (D-0037)
+##   cargo run --bin zap -- fmt tests/golden tests/diff tests/conformance  # .zap fmt (D-0037)
 fmt-check:
 	cargo fmt --all -- --check
-	cargo run -q --bin zap -- fmt --check tests/golden tests/diff
+	cargo run -q --bin zap -- fmt --check tests/golden tests/diff tests/conformance
 
 ## The full host-job style gate: `fmt-check` plus the LLVM-free clippy run
 ## (warnings are errors). Run before you push to catch the lint gaps the local

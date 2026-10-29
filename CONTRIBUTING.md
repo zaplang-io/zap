@@ -32,6 +32,8 @@ There is no CLA and no separate sign-off step.
 | [`design/`](design/) | Per-feature design docs (`NNNN-name.md`, from [`TEMPLATE.md`](design/TEMPLATE.md)); `IR.md` and `RUNTIME-ABI.md` are the phase-boundary contracts |
 | `crates/` | The compiler workspace (`syntax`, `sema`, `ir`, `codegen`, `driver`, …) and the runtime |
 | `tests/golden/` | Golden end-to-end programs: `name.zap` + `name.expected` (+ optional `.exit`/`.stderr`/`.env`) |
+| `tests/conformance/` | Spec-conformance goldens (I#376): each case cites the `SPEC.md` claim it pins; `CLAIMS.md` is the claim index |
+| [`docs/DIVERGENCE_CHECKLIST.md`](docs/DIVERGENCE_CHECKLIST.md) | Python-divergence checklist, required for every language PR / `D-00xx` |
 
 ## Getting set up
 
@@ -99,11 +101,12 @@ Notes that have bitten people:
 - **`cargo fmt` is a gate, not a nicety.** "Format check" is the most common
   reason a PR goes red. Run `cargo fmt --all` before every push.
 - **`.zap` sources have a fmt gate too** (D-0037). The host job runs
-  `zap fmt --check tests/golden`; a new or edited `*.zap` must be canonically
-  formatted. `make fmt-check` (and therefore `make docker-test`) now runs this
-  locally, so it fails before you push instead of reddening CI after. Fix with
-  `cargo run --bin zap -- fmt tests/golden` (or `zap fmt <file>`). The style is
-  specified in `docs/FORMAT.md`.
+  `zap fmt --check tests/golden tests/diff tests/conformance`; a new or edited
+  `*.zap` must be canonically formatted. `make fmt-check` (and therefore
+  `make docker-test`) now runs this locally, so it fails before you push instead
+  of reddening CI after. Fix with
+  `cargo run --bin zap -- fmt tests/golden tests/diff tests/conformance` (or
+  `zap fmt <file>`). The style is specified in `docs/FORMAT.md`.
 - **Docs-only PRs still run every gate.** CI doesn't skip on file type; verify
   the checks for *both* the `pull_request` and `push` triggers are green before
   asking for review. A `push` run can fail when the `pull_request` run passed
@@ -119,9 +122,18 @@ Notes that have bitten people:
   *not* assert exact heap-byte counts — assert reclamation (e.g. "under a bound",
   "stays bounded") instead. Exact byte counts differ between runs and collectors
   and turn one CI trigger green and the other red.
+- **Conformance cases** (`tests/conformance/`) pin `SPEC.md`'s normative
+  behavior — including the places Zap **deliberately** diverges from Python
+  (strict-`bool` `and`/`or`, per-call defaults, wrapping int64), which the
+  CPython differential harness (`tests/diff/`, I#375) cannot assert. Every
+  language-feature PR and every `D-00xx` decision must add edge-case conformance
+  cases and walk the [Python-divergence
+  checklist](docs/DIVERGENCE_CHECKLIST.md) (epic #374 / I#376). A case cites the
+  `SPEC.md` claim it pins; `tests/conformance/CLAIMS.md` is the claim index that
+  makes coverage measurable. See `tests/conformance/README.md`.
 - Unit tests live next to the code in each crate; the `driver` crate also has
-  integration suites (`golden.rs`, `gc.rs`, `signals.rs`, `profiling.rs`,
-  `zap_cli.rs`).
+  integration suites (`golden.rs`, `conformance.rs`, `diff_cpython.rs`, `gc.rs`,
+  `signals.rs`, `profiling.rs`, `zap_cli.rs`).
 
 ## Making a design change: the doc workflow
 
@@ -141,7 +153,10 @@ the language surface, the IR schema, or the runtime ABI goes through docs
    delete an entry; mark a superseded one *Superseded* and point at its
    replacement.
 5. **Update the spec** ([`SPEC.md`](SPEC.md)) — it is the source of truth, so it
-   must match what the compiler does.
+   must match what the compiler does. Walk the [Python-divergence
+   checklist](docs/DIVERGENCE_CHECKLIST.md) and pin the new/changed semantics
+   (and any intentional divergence) with conformance cases in
+   `tests/conformance/`, flipping their `CLAIMS.md` rows to `covered`.
 6. **Update the grammar** ([`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf)) **whenever
    syntax changes.** Parser changes without an EBNF change will be sent back.
 7. Park genuinely unresolved questions in

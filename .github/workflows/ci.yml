@@ -146,12 +146,14 @@ jobs:
         run: cargo test
 
       # Zap fmt gate (D-0037, #227): every `.zap` source must be in canonical
-      # form. `zap fmt` is host-safe (no LLVM), so it runs here. Fix locally
-      # with `cargo run --bin zap -- fmt tests/golden tests/diff`. tests/diff is
-      # the CPython differential corpus (I#375); its .zap programs are gated here
-      # too. (The differential run itself rides the `full`/`arm64` cargo tests.)
+      # form. `zap fmt` is host-safe (no LLVM), so it runs here. Fix locally with
+      # `cargo run --bin zap -- fmt tests/golden tests/diff tests/conformance`.
+      # tests/diff is the CPython differential corpus (I#375) and tests/conformance
+      # is the spec-conformance suite (I#376); their .zap programs are gated here
+      # too. (The differential / conformance runs ride the `full`/`arm64` cargo
+      # tests, not this host job.)
       - name: Zap fmt check
-        run: cargo run -q --bin zap -- fmt --check tests/golden tests/diff
+        run: cargo run -q --bin zap -- fmt --check tests/golden tests/diff tests/conformance
 
   # VS Code extension (ticket #231, tooling epic #157 / Area B). The editor
   # client is Node/TypeScript and lives entirely outside the Cargo workspace
