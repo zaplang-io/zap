@@ -353,7 +353,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Surface | Tier |
 |---|---|
 | Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`, `ord`/`chr`/`char`/`str`/`int` #284, `float`/`bool`/`format` #285) | **S** |
-| `io`, `fs`, `os`, `sys`, `process`, `math`, `random`, `time`, `datetime` (incl. `strftime` / 2-arg `format` custom formatting, #286) | **S** |
+| `io`, `fs`, `os`, `sys`, `process`, `math`, `random`, `time`, `datetime` (incl. `strftime` / 2-arg `format` custom formatting, #286; `strptime` parsing + SigV4/epoch/iso8601/rfc822 round-trips, #338) | **S** |
 | `collections` extras (`deque`, `bisect`, `oset`); `sync`; `json`; `logging`; `argparse` | **S** |
 | `signal`/`gc`/`runtime` — the **API** (`signal.notify`, `gc.collect/stats`, `runtime.coroutine_dump`) | **S** |
 | `signal`/`gc`/`runtime` — the dump/stats **output format** | **I** |
