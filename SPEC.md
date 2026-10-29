@@ -106,8 +106,19 @@ narrowing that can lose data is explicit (`int32(x)`, `int64(y)`).
 ### 4.2 Strings & bytes (D-0025)
 
 `str` is **immutable, UTF-8**. Indexing and slicing are **codepoint-based**
-(Python semantics), with an ASCII fast path; iteration yields `char`. `bytes`
-holds raw bytes. String slices are cheap **views** (strings are immutable).
+(Python semantics), with an ASCII fast path; iteration yields `char`.
+
+`bytes` is an **immutable byte sequence** (ticket #337), a distinct type from
+`str`. It shares `str`'s length-prefixed, GC-managed buffer but its operations
+are **byte-based**: `len(b)` is the byte count, `b[i]` is an `int64` byte value
+in `0..=255` (not a `char`), and a slice `b[lo:hi:step]` is `bytes`. `==`/`!=`
+and ordering are byte-wise; `b1 + b2` concatenates. Construct it with the
+`b"..."` literal (its content is the UTF-8 encoding of the escaped text — there
+is no `\xNN` escape yet, so arbitrary non-UTF-8 bytes use `bytes([...])`),
+`bytes(s)` (UTF-8 encode), `bytes([…])` (from a `list` of ints in `0..=255`), or
+`bytes()` (empty). `str(b)` decodes the bytes as UTF-8, raising on invalid
+UTF-8. Encoding codecs live in the `base64` and `hex` modules (§8). String
+slices are cheap **views** (strings are immutable).
 
 ```python
 auto s = "héllo"
@@ -115,7 +126,10 @@ print(s[0])          # 'h'  (a char)
 print(s[1:3])        # "él" (a view)
 for ch in s:
     print(ch)
-auto raw = bytes(s)  # UTF-8 bytes
+auto raw = bytes(s)  # UTF-8 bytes (a `bytes` value)
+print(raw[0])        # 104   (a byte, as int64)
+print(str(raw))      # "héllo" (UTF-8 decode)
+auto blob = bytes([0, 255, 16])
 ```
 
 ### 4.3 Reference types (shared — passed by reference, D-0023)
@@ -442,7 +456,8 @@ Value ⇄ string conversion builtins (#285/#282, D-0026):
 
 | Builtin | Result | Notes |
 |---|---|---|
-| `str(x)` | `str` | renders an int/float/bool/char/str (user types → Display protocol, #274) |
+| `str(x)` | `str` | renders an int/float/bool/char/str; decodes `bytes` as UTF-8 (raises on invalid); user types → Display protocol, #274 |
+| `bytes(x)` | `bytes` | `bytes()` empty · `bytes(str)` UTF-8 encode · `bytes(list[int])` each byte `0..=255` (#337) |
 | `int(s)` | `int64` | parses a decimal integer; faults on a malformed string |
 | `float(s)` | `float64` | parses a float; faults on a malformed string (also converts a number/bool) |
 | `bool(x)` | `bool` | Python truthiness: a number/char is false at zero, a str false when empty, a bool is itself |
@@ -807,7 +822,8 @@ module — the collection *extras* ship as the `deque`/`bisect`/`oset` modules).
 **no `from X import Y`**). The modules shipped today
 (`crates/sema/src/modules/`): `io`, `fs`, `os`, `sys`, `process`, `math`,
 `random`, `time`, `datetime`, `json`, `logging`, `argparse`, `deque`, `bisect`,
-`oset`, `sync`, `signal`, `gc`, `runtime` — **Stable**; `crypto`, `net`, `http`,
+`oset`, `sync`, `signal`, `gc`, `runtime` — **Stable**; `crypto`, `base64`,
+`hex`, `net`, `http`,
 `tls`, `zlib`, `gzip`, `yaml`, `threading`, `concurrent` — **Experimental**
 (STABILITY.md §4.4). The `concurrent` module (D-0078) adds a lock-free `Counter`
 and an unbounded MPSC `Queue[T]` built on `Atomic[T]`; concurrency lives in the
@@ -824,6 +840,16 @@ zone), so `%Z`/`%z` expand to the empty string, as in Python; a literal `Z` in
 the format (e.g. `"%Y%m%dT%H%M%SZ"`) is emitted verbatim. This produces the
 SigV4 `X-Amz-Date` (`%Y%m%dT%H%M%SZ`) and credential-scope (`%Y%m%d`) stamps,
 HTTP `Date`, and similar, from a UTC `DateTime` without run-time string slicing.
+
+**`base64` / `hex` codecs (#337).** Transfer encodings over `bytes`/`str`.
+`base64.encode(data)` (standard, padded) plus `encode_nopad`, `urlsafe_encode`
+and `urlsafe_encode_nopad` cover the standard and URL-safe alphabets with and
+without `=` padding; `base64.decode(s)` and `base64.urlsafe_decode(s)` return
+`bytes` and tolerate missing padding (both accept either alphabet).
+`hex.encode(data)` is lowercase hex and `hex.decode(s)` parses `[0-9a-fA-F]`
+(even length). Malformed codec input raises a catchable exception. Together with
+`crypto` (SHA-256/HMAC over `str`/`bytes`), these cover request-body, checksum
+and SigV4 payload-hashing needs.
 
 **`http` client (#104, #280).** The plaintext/TLS HTTP/1.1 client verbs
 `http.get(url)`, `http.post(url, body)` and `http.request(method, url, body)`

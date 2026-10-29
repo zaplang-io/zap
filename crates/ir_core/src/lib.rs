@@ -211,6 +211,13 @@ pub enum Ty {
     /// vs `zap_chan_send_ptr`), exactly like [`Ty::List`]. Maps to `ptr` in
     /// codegen.
     Chan(Elem),
+    /// A pointer to an immutable `bytes` object (ticket #337): physically the
+    /// same `ZapStr {len, data}` length-prefixed byte buffer as `str`, so it maps
+    /// to `ptr` in codegen and coerces to/from `Ptr` as a no-op bitcast. Kept
+    /// distinct from `Ptr`/`Str` purely so lowering can route the byte-wise
+    /// operations (`b[i]` -> an `int64` byte, byte-based slicing, `str(b)` UTF-8
+    /// decode) that differ from `str`'s codepoint semantics (D-0025).
+    Bytes,
     /// A pointer to a regex match object (ticket #23, D-0010). Null means no
     /// match (falsy); owns its captured groups. Distinct from `Ptr`/`Str` so
     /// lowering can route `.group(...)` method dispatch.
@@ -811,6 +818,7 @@ impl fmt::Display for Ty {
             Ty::F32 => "f32",
             Ty::F64 => "f64",
             Ty::Ptr => "ptr",
+            Ty::Bytes => "bytes",
             Ty::Match => "match",
             Ty::Py => "py",
             Ty::Void => "void",

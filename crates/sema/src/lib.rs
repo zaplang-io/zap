@@ -2685,6 +2685,9 @@ impl Checker {
                     Ty::List(t) => *t,
                     Ty::Dict(_, v) => *v,
                     Ty::Str => Ty::Char,
+                    // `bytes` indexing yields the byte value as an `int64`
+                    // (0..=255), not a char (I#337).
+                    Ty::Bytes => Ty::Int64,
                     Ty::Range => Ty::Int64,
                     _ => Ty::Unknown,
                 }
@@ -2699,6 +2702,8 @@ impl Checker {
                 match b {
                     Ty::List(_) => b,
                     Ty::Str => Ty::Str,
+                    // A `bytes` slice is `bytes` (byte-based, I#337).
+                    Ty::Bytes => Ty::Bytes,
                     _ => Ty::Unknown,
                 }
             }
@@ -2855,6 +2860,9 @@ impl Checker {
                     Ty::Unknown
                 } else if matches!(l, Ty::Str) && matches!(r, Ty::Str) {
                     Ty::Str
+                } else if matches!(l, Ty::Bytes) && matches!(r, Ty::Bytes) {
+                    // `bytes + bytes` concatenates (I#337).
+                    Ty::Bytes
                 } else if matches!(l, Ty::List(_)) && matches!(r, Ty::List(_)) {
                     l.clone()
                 } else {
@@ -3436,13 +3444,17 @@ impl Checker {
                     }
                     for a in args {
                         let at = self.infer(&a.value);
-                        if !matches!(at, Ty::Str | Ty::Char | Ty::Bool | Ty::Unknown | Ty::Py)
-                            && !at.is_numeric()
+                        // `str(bytes)` decodes UTF-8 (I#337); invalid UTF-8 faults
+                        // at runtime.
+                        if !matches!(
+                            at,
+                            Ty::Str | Ty::Bytes | Ty::Char | Ty::Bool | Ty::Unknown | Ty::Py
+                        ) && !at.is_numeric()
                         {
                             self.error(
                                 ErrorCode::ZAP4024,
                                 format!(
-                                    "str() expects a str, char, int, float, or bool, found {}",
+                                    "str() expects a str, bytes, char, int, float, or bool, found {}",
                                     at.display()
                                 ),
                                 expr_span(&a.value),
@@ -3450,6 +3462,33 @@ impl Checker {
                         }
                     }
                     return Ty::Str;
+                }
+                "bytes" => {
+                    // bytes(): empty; bytes(str): UTF-8 encode; bytes(list[int64]
+                    // | list[int32]): one byte per element (0..=255 at runtime).
+                    if args.len() > 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "bytes() takes at most one argument".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        let ok = matches!(at, Ty::Str | Ty::Bytes | Ty::Unknown | Ty::Py)
+                            || matches!(&at, Ty::List(e) if e.is_int() || matches!(**e, Ty::Unknown));
+                        if !ok {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!(
+                                    "bytes() expects a str or list of integers, found {}",
+                                    at.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Bytes;
                 }
                 "int" => {
                     // int(x): parse a `str`, or convert a number, to an `int`.
@@ -5996,6 +6035,48 @@ def main():
         assert!(
             e.iter().any(|x| x.code == ErrorCode::ZAP4026),
             "expected ZAP4026 for a non-literal format spec, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn bytes_type_checks() {
+        // Construction, byte indexing (-> int64), slicing (-> bytes), len,
+        // concatenation, comparison, and the str<->bytes round-trip (I#337).
+        ok("def main():\n    \
+            auto b = b\"hi\"\n    \
+            auto c = bytes(\"hi\")\n    \
+            auto d = bytes([104, 105])\n    \
+            auto e = bytes()\n    \
+            int64 n = b[0]\n    \
+            bytes sl = b[0:1]\n    \
+            int64 l = len(b)\n    \
+            bytes cat = b + c\n    \
+            bool eq = b == c\n    \
+            str s = str(b)\n    \
+            print(s)\n    \
+            print(n)\n");
+        // bytes(int) is not a valid construction.
+        let e = errors("def main():\n    auto b = bytes(5)\n    print(b)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "expected ZAP4024 for bytes(int), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn base64_hex_modules_type_check() {
+        ok("def main():\n    \
+            auto e = base64.encode(b\"x\")\n    \
+            auto u = base64.urlsafe_encode_nopad(b\"x\")\n    \
+            bytes d = base64.decode(\"eA==\")\n    \
+            auto h = hex.encode(b\"x\")\n    \
+            bytes hd = hex.decode(\"78\")\n    \
+            print(e)\n    print(u)\n    print(h)\n");
+        // A codec needs a str/bytes argument, not an int.
+        let e = errors("def main():\n    print(hex.encode(5))\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4024),
+            "expected ZAP4024 for hex.encode(int), got {e:?}"
         );
     }
 }
