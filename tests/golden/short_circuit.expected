@@ -1,0 +1,12 @@
+and-not-taken
+or-taken
+and-skipped
+or-short
+chain-and-not-taken
+chain-or-taken
+mixed-taken
+True
+False
+True
+False
+survived

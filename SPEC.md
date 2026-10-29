@@ -250,7 +250,12 @@ destructuring. Not a reference type; no heap header unless boxed.
 - Comparison `== != < <= > >=`; `==` is built-in for scalars and strings —
   collections and user types **define their own equality** (D-0024).
 - Boolean `and`, `or`, `not`; **truthiness** is Python-style (empty/zero/`None`
-  falsy) *and* strict `bool` is allowed (D-0022).
+  falsy) *and* strict `bool` is allowed (D-0022). `and`/`or` **short-circuit**
+  left-to-right: the right operand is evaluated only when the left does not
+  already decide the result (`a and b` skips `b` when `a` is falsy; `a or b`
+  skips `b` when `a` is truthy), so guard idioms like `i < len(xs) and xs[i]`
+  never evaluate the guarded side-effecting operand when the guard fails. The
+  result is a strict `bool` (the surviving operand's truthiness).
 - Bitwise `& | ^ ~ << >>` (on signed integers).
 - Regex bind `=~` / `!~` and in-place `~=` (D-0010).
 - Channel send/receive `ch <- v` / `<-ch` (D-0031).
