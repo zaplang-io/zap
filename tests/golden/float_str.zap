@@ -7,13 +7,13 @@
 import math
 
 def main():
-    print(str(6 / 2))      # 3.0   (integral float keeps .0)
+    print(str(6 / 2))  # 3.0   (integral float keeps .0)
     print(str(3.0 * 2.0))  # 6.0
-    print(str(-4.0))       # -4.0  (negative integral)
-    print(str(0.0))        # 0.0   (zero)
-    print(str(100.0))      # 100.0
-    print(str(3.5))        # 3.5   (non-integral unchanged)
-    print(str(0.25))       # 0.25
-    print(str(math.inf))   # inf
+    print(str(-4.0))  # -4.0  (negative integral)
+    print(str(0.0))  # 0.0   (zero)
+    print(str(100.0))  # 100.0
+    print(str(3.5))  # 3.5   (non-integral unchanged)
+    print(str(0.25))  # 0.25
+    print(str(math.inf))  # inf
     print(str(-math.inf))  # -inf
-    print(str(math.nan))   # nan
+    print(str(math.nan))  # nan
