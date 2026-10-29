@@ -63,7 +63,7 @@ LIMITS := --memory=$(ZAP_DOCKER_MEMORY) --memory-swap=$(ZAP_DOCKER_MEMORY) \
 DOCKER_RUN := docker run --rm --init $(LIMITS) $(MOUNTS) $(ENVS) $(IMAGE)
 
 .PHONY: docker-build docker-test docker-check docker-build-crate docker-shell \
-        docker-run docker-sccache-stats check clean-docker-target
+        docker-run docker-sccache-stats check fmt-check lint clean-docker-target
 
 ## Build the dev container image.
 docker-build:
@@ -73,7 +73,12 @@ docker-build:
 ## collectors: the default precise Immix GC (ticket #116) and the Boehm
 ## fallback. Mirrors the `full` CI check. This is the FINAL GATE — iterate with
 ## `make check` / `make docker-check` and run this before you push.
-docker-test:
+##
+## Depends on `fmt-check` so the host-job formatting gates (Rust rustfmt + the
+## `.zap` golden gate, D-0037/#227) fail HERE, before the slow container run and
+## before you push — not red on CI after. The local test flow used to skip these
+## host-only gates, so unformatted goldens passed locally and only reddened CI.
+docker-test: fmt-check
 	$(DOCKER_RUN) cargo test --workspace --features zapc/gc-immix
 	$(DOCKER_RUN) cargo test --workspace --features zapc/gc-boehm
 
@@ -107,6 +112,23 @@ docker-run:
 ## incremental default on. Codegen type-errors still need `make docker-check`.
 check:
 	cargo check --all-targets
+
+## The host-job FORMATTING gates, mirrored EXACTLY from CI's `host` job
+## (.github/workflows/ci.yml). All LLVM-free, so they run on the host — no
+## container. `docker-test` depends on this, and you should run it before every
+## push. Fix a failure with:
+##   cargo fmt --all                          # Rust formatting
+##   cargo run --bin zap -- fmt tests/golden  # .zap golden formatting (D-0037)
+fmt-check:
+	cargo fmt --all -- --check
+	cargo run -q --bin zap -- fmt --check tests/golden
+
+## The full host-job style gate: `fmt-check` plus the LLVM-free clippy run
+## (warnings are errors). Run before you push to catch the lint gaps the local
+## test flow doesn't. The two `--features zapc/gc-*` clippy configs link LLVM,
+## so run those inside `make docker-shell` (see CONTRIBUTING.md "The CI gates").
+lint: fmt-check
+	cargo clippy --all-targets -- -D warnings
 
 ## Remove this worktree's isolated target volume (frees disk; forces a cold
 ## rebuild next run). The shared registry/sccache volumes are left intact.

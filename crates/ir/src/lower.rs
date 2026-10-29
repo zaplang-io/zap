@@ -1138,7 +1138,8 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "uint8" | "u8" => Ok(Ty::I8),
             "bool" => Ok(Ty::I1),
             "char" => Ok(Ty::I32),
-            "str" | "bytes" => Ok(Ty::Ptr),
+            "str" => Ok(Ty::Ptr),
+            "bytes" => Ok(Ty::Bytes),
             "pyobject" => Ok(Ty::Py),
             "list" => {
                 let e = match args.first() {
@@ -1325,6 +1326,7 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
         // its own `__hash__`/`__eq__` (operator overloading, D-0047).
         Ty::Struct(sid) => Ok(Elem::Struct(sid)),
         Ty::Ptr
+        | Ty::Bytes
         | Ty::List(_)
         | Ty::Dict(..)
         | Ty::Set(_)
@@ -3732,6 +3734,14 @@ impl<'a> FnLower<'a> {
         // renders decimal. int32/char share the `i32` representation, so an
         // int32 renders as a character here too (format it as decimal via
         // `str(int64(x))`); a full fix needs `char` threaded through the IR.
+        // `str(bytes)`: decode the UTF-8 bytes, raising a catchable exception on
+        // invalid UTF-8 (I#337). It can raise, so it routes through
+        // `throwing_call` (an `invoke` to the nearest handler / top-level).
+        if matches!(vt, Ty::Bytes) {
+            let d = self.new_value(Ty::Ptr);
+            self.throwing_call(Some(d), "zap_bytes_to_str", vec![v]);
+            return Ok(d);
+        }
         let (func, arg) = match vt {
             Ty::Ptr => return Ok(v),
             Ty::I32 => ("zap_char_to_str", v),
@@ -3777,8 +3787,8 @@ impl<'a> FnLower<'a> {
                 });
                 Ok(d)
             }
-            Ty::Ptr => {
-                // Non-empty string is truthy: compare its byte length to 0.
+            // A non-empty `str` or `bytes` is truthy: compare byte length to 0.
+            Ty::Ptr | Ty::Bytes => {
                 let len = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
                     dest: Some(len),
@@ -3795,7 +3805,7 @@ impl<'a> FnLower<'a> {
                 });
                 Ok(d)
             }
-            _ => Err(err("bool() expects a str, char, number or bool")),
+            _ => Err(err("bool() expects a str, bytes, char, number or bool")),
         }
     }
 
@@ -6227,13 +6237,18 @@ impl<'a> FnLower<'a> {
                 } else {
                     unescape(value)
                 };
-                let _ = bytes; // byte strings share the string object for now
-                let d = self.new_value(Ty::Ptr);
+                // `b"..."` and `"..."` share the `ZapStr` object; only the static
+                // type differs so byte-wise ops route correctly (I#337). The
+                // literal's bytes are the UTF-8 encoding of the escaped text —
+                // `unescape` has no `\xNN` form, so arbitrary non-UTF-8 bytes use
+                // `bytes([...])`.
+                let ty = if *bytes { Ty::Bytes } else { Ty::Ptr };
+                let d = self.new_value(ty);
                 self.emit(Inst::StrConst {
                     dest: d,
                     bytes: data,
                 });
-                Ok((d, Ty::Ptr))
+                Ok((d, ty))
             }
             Expr::Name(n, _) => {
                 if let Some((ptr, ty)) = self.lookup(n) {
@@ -6297,6 +6312,54 @@ impl<'a> FnLower<'a> {
                         Ok((d, t))
                     }
                 }
+            }
+            // Boolean `and` / `or` short-circuit left-to-right (Python
+            // semantics): the right operand is evaluated only when the left
+            // does not already decide the result, so a guard idiom like
+            // `i < len(xs) and xs[i] == v` never evaluates (and thus never
+            // faults on) `xs[i]` when the bound check is false. The result is a
+            // strict `bool` (D-0022): each operand is truthiness-tested, and
+            // the surviving operand's truthy bit is the value. We merge the two
+            // paths through a stack slot (the IR has no phi; cf. the Optional
+            // build and the `in` fallback).
+            Expr::Binary {
+                op: op @ (AstBin::And | AstBin::Or),
+                lhs,
+                rhs,
+                ..
+            } => {
+                let is_and = matches!(op, AstBin::And);
+                let (l, lt) = self.expr(lhs)?;
+                let lb = self.truthy(l, lt);
+                // Default result is the left operand's truthy bit — the value
+                // when we short-circuit (`false and _` -> false, `true or _`
+                // -> true).
+                let slot = self.alloca(Ty::I1);
+                self.store(slot, lb);
+                let rhs_bb = self.new_block();
+                let join_bb = self.new_block();
+                // `and`: descend into the right operand only when the left is
+                // truthy. `or`: only when the left is falsy.
+                if is_and {
+                    self.set_term(Term::BrIf {
+                        cond: lb,
+                        then_bb: rhs_bb,
+                        else_bb: join_bb,
+                    });
+                } else {
+                    self.set_term(Term::BrIf {
+                        cond: lb,
+                        then_bb: join_bb,
+                        else_bb: rhs_bb,
+                    });
+                }
+                self.position(rhs_bb);
+                let (r, rt) = self.expr(rhs)?;
+                let rb = self.truthy(r, rt);
+                self.store(slot, rb);
+                self.ensure_br(join_bb);
+                self.position(join_bb);
+                Ok((self.load(slot, Ty::I1), Ty::I1))
             }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (l, lt) = self.expr(lhs)?;
@@ -6618,6 +6681,47 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((dest, d.ty()));
             }
+            // `sorted(xs, key=..., reverse=...)` — a new sorted list, leaving the
+            // input untouched (ticket #336). The list is positional; `key` /
+            // `reverse` are keyword-only, same as `xs.sort(...)`.
+            if fname == "sorted" {
+                let mut list_arg: Option<&Expr> = None;
+                let mut rest: Vec<ast::Arg> = Vec::new();
+                for a in args {
+                    if a.name.is_none() {
+                        if list_arg.is_some() {
+                            return Err(err(
+                                "sorted() takes a single positional argument (the list)",
+                            ));
+                        }
+                        list_arg = Some(&a.value);
+                    } else {
+                        rest.push(a.clone());
+                    }
+                }
+                let Some(list_expr) = list_arg else {
+                    return Err(err("sorted() takes the list to sort as its argument"));
+                };
+                let (lst, lt) = self.expr(list_expr)?;
+                let Ty::List(elem) = lt else {
+                    return Err(err("sorted() expects a list value"));
+                };
+                // Copy first so the caller's list is left unchanged, then build
+                // the sort arguments against the copy and sort it in place.
+                let copy = self.new_value(Ty::List(elem));
+                self.emit(Inst::Call {
+                    dest: Some(copy),
+                    func: "zap_list_copy".to_string(),
+                    args: vec![lst],
+                });
+                let (keys, kind, reverse) = self.prepare_sort(copy, elem, "sorted", &rest)?;
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_sort_by".to_string(),
+                    args: vec![copy, keys, kind, reverse],
+                });
+                return Ok((copy, Ty::List(elem)));
+            }
             if fname == "print" {
                 let mut vals = Vec::new();
                 for a in args {
@@ -6818,7 +6922,14 @@ impl<'a> FnLower<'a> {
                     // (ticket #284). Indexing/slicing/iteration are already
                     // codepoint-based, so this only differs for non-ASCII `str`.
                     Ty::Ptr => "zap_str_len",
-                    _ => return Err(err("len() expects a list, dict, set, heap, array, or str")),
+                    // `bytes`: byte count (I#337). `zap_str_len` returns the
+                    // ZapStr length, which is the byte count for a `bytes`.
+                    Ty::Bytes => "zap_str_len",
+                    _ => {
+                        return Err(err(
+                            "len() expects a list, dict, set, heap, array, str, or bytes",
+                        ))
+                    }
                 };
                 let d = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
@@ -6864,6 +6975,34 @@ impl<'a> FnLower<'a> {
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
                 return Ok((self.render_str(v, vt)?, Ty::Ptr));
+            }
+            if fname == "bytes" {
+                // bytes(): empty; bytes(str): the UTF-8 bytes (shares the ZapStr
+                // buffer — both are immutable); bytes(list[int64]): one byte per
+                // element, each validated to 0..=255 (I#337).
+                if args.is_empty() {
+                    let d = self.new_value(Ty::Bytes);
+                    self.emit(Inst::StrConst {
+                        dest: d,
+                        bytes: Vec::new(),
+                    });
+                    return Ok((d, Ty::Bytes));
+                }
+                if args.len() != 1 {
+                    return Err(err("bytes() takes at most one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                return match vt {
+                    // str / bytes share the ZapStr repr — relabel, no copy.
+                    Ty::Ptr | Ty::Bytes => Ok((v, Ty::Bytes)),
+                    Ty::List(_) => {
+                        // Validates each element is 0..=255, raising otherwise.
+                        let d = self.new_value(Ty::Bytes);
+                        self.throwing_call(Some(d), "zap_bytes_from_list", vec![v]);
+                        Ok((d, Ty::Bytes))
+                    }
+                    _ => Err(err("bytes() expects a str or list[int64] argument")),
+                };
             }
             if fname == "int" {
                 // int(x): parse a `str` to an `int`, or convert a number to int.
@@ -8767,6 +8906,20 @@ impl<'a> FnLower<'a> {
                 let (iv, it) = self.expr(index)?;
                 self.call_dunder(sid, "__getitem__", vec![(bv, bty), (iv, it)])
             }
+            // `bytes` indexing (I#337): `b[i]` yields the byte at byte index `i`
+            // as an `int64` in 0..=255. Negative indices count from the end;
+            // out-of-range faults. Distinct from `str`'s codepoint indexing.
+            Ty::Bytes => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_bytes_index".to_string(),
+                    args: vec![bv, iv],
+                });
+                Ok((d, Ty::I64))
+            }
             // `str` lowers to `Ptr`; `s[i]` yields the codepoint at codepoint
             // index `i` as a `char` (an `i32`), Python semantics (D-0025).
             Ty::Ptr => {
@@ -8813,21 +8966,28 @@ impl<'a> FnLower<'a> {
         step: Option<&Expr>,
     ) -> Result<(Value, Ty), LowerError> {
         let (bv, bty) = self.expr(base)?;
-        if bty != Ty::Ptr {
-            return Err(err(
-                "slicing is only supported on str values (list/array slicing is a follow-up)",
-            ));
-        }
+        // `str` slices by codepoint (D-0025); `bytes` slices by byte (I#337).
+        // Both produce a new value of the same type via distinct runtime entry
+        // points.
+        let (func, out_ty) = match bty {
+            Ty::Ptr => ("zap_str_slice", Ty::Ptr),
+            Ty::Bytes => ("zap_bytes_slice", Ty::Bytes),
+            _ => {
+                return Err(err(
+                    "slicing is only supported on str and bytes values (list/array slicing is a follow-up)",
+                ))
+            }
+        };
         let (lo_v, has_lo) = self.slice_bound(lo)?;
         let (hi_v, has_hi) = self.slice_bound(hi)?;
         let (st_v, has_st) = self.slice_bound(step)?;
-        let d = self.new_value(Ty::Ptr);
+        let d = self.new_value(out_ty);
         self.emit(Inst::Call {
             dest: Some(d),
-            func: "zap_str_slice".to_string(),
+            func: func.to_string(),
             args: vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
         });
-        Ok((d, Ty::Ptr))
+        Ok((d, out_ty))
     }
 
     fn lower_index_set(
@@ -8919,10 +9079,218 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
+            // `xs.sort(key=..., reverse=...)` — stable, in place (ticket #336).
+            "sort" => {
+                let (keys, kind, reverse) = self.prepare_sort(recv, elem, "sort", args)?;
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_sort_by".to_string(),
+                    args: vec![recv, keys, kind, reverse],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
             other => Err(err(format!(
-                "list has no method '{other}' (supported: append)"
+                "list has no method '{other}' (supported: append, sort)"
             ))),
         }
+    }
+
+    /// Build the shared arguments for a `zap_list_sort_by` call from the optional
+    /// `key=` / `reverse=` keyword arguments of `sort()` / `sorted()` (ticket
+    /// #336). Returns `(keys, cmp_kind, reverse)` where `keys` is the list whose
+    /// words order the sort (the list itself when there is no `key=`), `cmp_kind`
+    /// is `0` (signed int) or `1` (byte-wise str), and `reverse` is a `0/1` flag.
+    ///
+    /// `fname` is the caller's name for diagnostics. A `key=` projection is a
+    /// first-class function value (I#163) whose return type selects `cmp_kind`;
+    /// its key list is built in compiled code by [`Self::build_key_list`] so the
+    /// growing list stays a GC root across the per-element calls.
+    fn prepare_sort(
+        &mut self,
+        lst: Value,
+        elem: Elem,
+        fname: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Value, Value), LowerError> {
+        let mut key_expr: Option<&Expr> = None;
+        let mut reverse_expr: Option<&Expr> = None;
+        for a in args {
+            match a.name.as_deref() {
+                Some("key") => key_expr = Some(&a.value),
+                Some("reverse") => reverse_expr = Some(&a.value),
+                Some(other) => {
+                    return Err(err(format!(
+                        "{fname}() got an unexpected keyword argument '{other}' \
+                         (expected 'key' and/or 'reverse')"
+                    )))
+                }
+                None => {
+                    return Err(err(format!(
+                        "{fname}() takes only the keyword arguments 'key' and 'reverse'"
+                    )))
+                }
+            }
+        }
+        // `reverse` is a 0/1 flag; default ascending.
+        let reverse = match reverse_expr {
+            Some(e) => {
+                let (v, vt) = self.expr(e)?;
+                self.coerce(v, vt, Ty::I64)
+            }
+            None => self.iconst(Ty::I64, 0),
+        };
+        let orderable_kind = |k: Elem, what: &str| -> Result<i64, LowerError> {
+            match k {
+                Elem::I64 => Ok(0),
+                Elem::Ptr => Ok(1),
+                Elem::Struct(_) => Err(err(format!(
+                    "{what} is not orderable; pass key= to sort by an orderable \
+                     projection (an int or str)"
+                ))),
+            }
+        };
+        let (keys, kind) = match key_expr {
+            Some(e) => {
+                let (kv, kt) = self.expr(e)?;
+                let Ty::Func(sig_idx) = kt else {
+                    return Err(err(format!(
+                        "{fname}() key= must be a function value — a named function \
+                         or a fn(T)->R binding"
+                    )));
+                };
+                let ret = self.ctx.fn_sigs.borrow().get(sig_idx).ret;
+                let kind = orderable_kind(elem_kind(ret)?, "the sort key's return value")?;
+                let keys = self.build_key_list(lst, elem, kv, sig_idx, ret)?;
+                (keys, self.iconst(Ty::I64, kind))
+            }
+            None => {
+                let kind = orderable_kind(elem, "this list's elements")?;
+                (lst, self.iconst(Ty::I64, kind))
+            }
+        };
+        Ok((keys, kind, reverse))
+    }
+
+    /// Emit a compiled loop that applies the `key` function to every element of
+    /// `lst`, collecting the results into a fresh list returned for use as sort
+    /// keys (ticket #336). Running in compiled code (not the C runtime) is what
+    /// keeps the growing key list reachable as a GC root across each key call's
+    /// safepoint. `ret` is the key function's return type (int or str).
+    fn build_key_list(
+        &mut self,
+        lst: Value,
+        elem: Elem,
+        keyfn: Value,
+        sig_idx: u32,
+        ret: Ty,
+    ) -> Result<Value, LowerError> {
+        let kkind = elem_kind(ret)?;
+        let keys = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(keys),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let idx = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(idx, zero);
+
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(idx, Ty::I64);
+        let len = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(len),
+            func: "zap_list_len".to_string(),
+            args: vec![lst],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: len,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+
+        self.position(body_bb);
+        let i = self.load(idx, Ty::I64);
+        let e = self.new_value(elem.ty());
+        self.emit(Inst::Call {
+            dest: Some(e),
+            func: format!("zap_list_get_{}", elem.val_suffix()),
+            args: vec![lst, i],
+        });
+        let (k, _kt) = self.emit_closure_call(keyfn, sig_idx, vec![e])?;
+        self.emit(Inst::Call {
+            dest: None,
+            func: format!("zap_list_push_{}", kkind.val_suffix()),
+            args: vec![keys, k],
+        });
+        self.set_term(Term::Br(incr_bb));
+
+        self.position(incr_bb);
+        let cur2 = self.load(idx, Ty::I64);
+        let one = self.iconst(Ty::I64, 1);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Bin {
+            dest: next,
+            op: BinOp::Add,
+            lhs: cur2,
+            rhs: one,
+        });
+        self.store(idx, next);
+        self.set_term(Term::Br(cond_bb));
+
+        self.position(end_bb);
+        Ok(keys)
+    }
+
+    /// Call a first-class function value (I#163) with already-lowered argument
+    /// values, via [`Inst::CallClosure`]. A lower-level companion to
+    /// [`Self::lower_closure_call`], which lowers AST argument expressions.
+    fn emit_closure_call(
+        &mut self,
+        callee: Value,
+        sig_idx: u32,
+        argvals: Vec<Value>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let sig = self.ctx.fn_sigs.borrow().get(sig_idx).clone();
+        let dest = if sig.ret == Ty::Void {
+            None
+        } else {
+            Some(self.new_value(sig.ret))
+        };
+        let unwind = self.landing_pads.last().copied();
+        if let Some(lp) = unwind {
+            self.used_lps.insert(lp);
+        }
+        self.emit(Inst::CallClosure {
+            dest,
+            callee,
+            args: argvals,
+            params: sig.params.clone(),
+            ret: sig.ret,
+            unwind,
+        });
+        let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
+        Ok((
+            rv,
+            if sig.ret == Ty::Void {
+                Ty::I32
+            } else {
+                sig.ret
+            },
+        ))
     }
 
     /// Lower a method call on an `Atomic[T]` box (I#176) to an inline atomic ZIR
@@ -9743,6 +10111,71 @@ impl<'a> FnLower<'a> {
                 rhs: zero,
             });
             return Ok((d, Ty::I1));
+        }
+
+        // `bytes` operands (I#337): `+` (concatenation -> bytes), `==`/`!=`
+        // (content equality), and ordering `< <= > >=` (byte-wise), reusing the
+        // `ZapStr` byte-wise runtime. Both operands share the physical repr, so
+        // the comparison helpers are identical to `str`'s; `+` yields `bytes`.
+        // Sema has checked that both sides are `bytes`.
+        if lt == Ty::Bytes && rt == Ty::Bytes {
+            if matches!(op, Add) {
+                let d = self.new_value(Ty::Bytes);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_concat".to_string(),
+                    args: vec![l, r],
+                });
+                return Ok((d, Ty::Bytes));
+            }
+            if matches!(op, Eq | Ne) {
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: "zap_str_eq".to_string(),
+                    args: vec![l, r],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: if matches!(op, Eq) {
+                        CmpPred::Ne
+                    } else {
+                        CmpPred::Eq
+                    },
+                    lhs: raw,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
+            if matches!(op, Lt | Le | Gt | Ge) {
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: "zap_str_cmp".to_string(),
+                    args: vec![l, r],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let pred = match op {
+                    Lt => CmpPred::Lt,
+                    Le => CmpPred::Le,
+                    Gt => CmpPred::Gt,
+                    Ge => CmpPred::Ge,
+                    _ => unreachable!(),
+                };
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred,
+                    lhs: raw,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
+            return Err(err(
+                "unsupported operation on bytes (bytes supports +, ==, !=, <, <=, >, >=)",
+            ));
         }
 
         // Reference-typed operands: `str` (lowered to `Ptr`) supports `+`

@@ -1,4 +1,4 @@
-//! `xml` module — lowering facet (ticket #351, D-0083).
+//! `xml` module — lowering facet (ticket #351, D-0084).
 //!
 //! `xml.parse(s)` / `xml.dumps(e)` / `xml.element(name)` lower to the Zap prelude
 //! builders `__xml_parse` / `__xml_dumps` / `__xml_element` (which construct and

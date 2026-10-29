@@ -1,4 +1,4 @@
-//! `xml` module — sema facet (ticket #351, D-0083).
+//! `xml` module — sema facet (ticket #351, D-0084).
 //!
 //! Core XML DOM for the AWS rest-xml / query protocols. The public surface is
 //! `xml.parse(str|bytes) -> XmlElement` (the DOM root; `XmlElement`/`XmlAttr` are

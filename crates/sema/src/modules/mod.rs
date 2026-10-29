@@ -19,6 +19,7 @@ use zapc_syntax::span::Span;
 use crate::{Checker, Ty};
 
 mod argparse;
+mod base64;
 mod bisect;
 mod concurrent;
 mod crypto;
@@ -27,6 +28,7 @@ mod deque;
 mod fs;
 mod gc;
 mod gzip;
+mod hex;
 mod http;
 mod io;
 mod json;
@@ -72,6 +74,8 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     fs::MODULE,
     process::MODULE,
     crypto::MODULE,
+    base64::MODULE,
+    hex::MODULE,
     math::MODULE,
     random::MODULE,
     time::MODULE,

@@ -1,4 +1,4 @@
-//! `xml` module — runtime-symbol declarations (ticket #351, D-0083).
+//! `xml` module — runtime-symbol declarations (ticket #351, D-0084).
 //!
 //! The XML tokenizer cursor lives in the xml section of `zaprt.c`; the high-level
 //! tree build (`xml.parse`) and serialize walk (`xml.dumps`) are Zap prelude

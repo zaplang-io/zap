@@ -677,6 +677,25 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 ],
                 Some(p.into()),
             );
+            // `bytes` surface (ticket #337): byte-wise index/slice, construction
+            // from a list of ints, and UTF-8 decode. All operate on the ZapStr
+            // layout (a `ptr`); `b[i]` yields an `int64` byte.
+            self.declare_rt("zap_bytes_index", &[p.into(), i.into()], Some(i.into()));
+            self.declare_rt(
+                "zap_bytes_slice",
+                &[
+                    p.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                    i.into(),
+                ],
+                Some(p.into()),
+            );
+            self.declare_rt("zap_bytes_from_list", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_bytes_to_str", &[p.into()], Some(p.into()));
             self.declare_rt("zap_chr", &[i.into()], Some(c.into()));
             self.declare_rt("zap_char_to_str", &[c.into()], Some(p.into()));
             self.declare_rt("zap_str_parse_int", &[p.into()], Some(i.into()));
@@ -793,6 +812,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_list_set_i64", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_list_set_ptr", &[p.into(), i.into(), p.into()], None);
         self.declare_rt("zap_list_len", &[p.into()], Some(i.into()));
+        // list sort (ticket #336): `sorted()` copies first; `zap_list_sort_by`
+        // sorts a list in place by a parallel key list (self for the no-key case).
+        self.declare_rt("zap_list_copy", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_list_sort_by",
+            &[p.into(), p.into(), i.into(), i.into()],
+            None,
+        );
         // dict
         self.declare_rt("zap_dict_new", &[], Some(p.into()));
         self.declare_rt("zap_dict_len", &[p.into()], Some(i.into()));
@@ -1649,6 +1676,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Heap(_)
             | Ty::Array(_)
             | Ty::Chan(_)
+            | Ty::Bytes
             | Ty::Match
             | Ty::Func(_)
             | Ty::Py => self.ctx.ptr_type(AddressSpace::default()).into(),
@@ -2148,7 +2176,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     }
                     let ty = f.value_ty(*a);
                     let v = get(vals, *a);
-                    if matches!(ty, Ty::Ptr) {
+                    // `bytes` prints its raw bytes like a `str` (both are ZapStr).
+                    if matches!(ty, Ty::Ptr | Ty::Bytes) {
                         let print_str = self.fns["zap_print_str"];
                         b.build_call(print_str, &[v.into()], "")
                             .map_err(|e| e.to_string())?;

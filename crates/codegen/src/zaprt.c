@@ -658,6 +658,22 @@ void zap_list_set_ptr(void *l, int64_t i, void *v) {
 }
 int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 
+/* Shallow copy: a fresh list with the same element words (shared referents) and
+ * the same `elem_ptr` kind, so the precise collector traces the copy correctly.
+ * Used by `sorted()` (ticket #336) to leave its input untouched. */
+void *zap_list_copy(void *lp) {
+    ZapList *l = (ZapList *)lp;
+    ZapList *o = (ZapList *)zap_list_new();
+    if (l->len > 0) {
+        o->data = (int64_t *)zap_ptrbuf((int64_t)l->len * (int64_t)sizeof(int64_t));
+        memcpy(o->data, l->data, (size_t)l->len * sizeof(int64_t));
+        o->len = l->len;
+        o->cap = l->len;
+        o->elem_ptr = l->elem_ptr;
+    }
+    return o;
+}
+
 /* dict[K, V]: open-addressing hash table with linear probing.
  * Key kind (int64 vs str) is passed per call; a dict is homogeneous, so this is
  * stable across a given dict's lifetime. */
@@ -769,6 +785,102 @@ int64_t zap_str_cmp(void *ap, void *bp) {
         return 1;
     }
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Stable list sort (ticket #336, design/RUNTIME-ABI.md §"list.sort / sorted").
+ * Defined here, after `zap_str_cmp`, so the str comparator is in scope (the heap
+ * section below relies on the same ordering).
+ *
+ * `zap_list_sort_by` sorts `dst` in place using a parallel `keys` list of the
+ * same length: element `dst[i]` is ordered by key `keys[i]`. The no-key cases
+ * (`xs.sort()` / `sorted(xs)`) pass `keys == dst`, so elements are compared by
+ * their own word; a `key=` projection passes a separately-built key list (the
+ * compiler builds it in compiled code, where the growing list is a GC root — a
+ * C loop calling back into Zap could not hold it safely across a safepoint).
+ *
+ * The sort is a stable bottom-up merge over an index permutation: the key array
+ * is fully read to order the indices *before* any element is moved, so aliasing
+ * `keys == dst` is safe. It makes NO call back into compiled Zap and allocates
+ * only non-GC scratch, so no safepoint runs inside it and every element/key
+ * word stays rooted (through `dst`/`keys`) for the whole sort.
+ *
+ * `cmp_kind` selects how two key words compare: ZAP_SORT_I64 is a signed 64-bit
+ * compare (int/bool), ZAP_SORT_STR a byte-wise `ZapStr` compare. `reverse` flips
+ * the order while preserving stability (equal keys keep their input order, as in
+ * Python's `reverse=True`). ------------------------------------------------- */
+enum { ZAP_SORT_I64 = 0, ZAP_SORT_STR = 1 };
+
+/* Three-way compare of two key words under `cmp_kind`. */
+static int64_t zap_sort_cmp(int64_t a, int64_t b, int64_t cmp_kind) {
+    if (cmp_kind == ZAP_SORT_STR) {
+        return zap_str_cmp((void *)(intptr_t)a, (void *)(intptr_t)b);
+    }
+    return (a < b) ? -1 : (a > b ? 1 : 0);
+}
+
+/* Stable merge sort of the index array `idx[0..n)` by `keys[idx[.]]`. `tmp` is
+ * caller-provided scratch of `n` words. Equal keys keep their relative order
+ * (take from the left run on a tie), which holds under `reverse` too since the
+ * tie branch is independent of the sign flip. */
+static void zap_sort_indices(int64_t *idx, int64_t *tmp, int64_t n,
+                             const int64_t *keys, int64_t cmp_kind, int64_t reverse) {
+    for (int64_t width = 1; width < n; width *= 2) {
+        for (int64_t lo = 0; lo < n; lo += 2 * width) {
+            int64_t mid = lo + width < n ? lo + width : n;
+            int64_t hi = lo + 2 * width < n ? lo + 2 * width : n;
+            int64_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                int64_t c = zap_sort_cmp(keys[idx[i]], keys[idx[j]], cmp_kind);
+                if (reverse) {
+                    c = -c;
+                }
+                if (c <= 0) {
+                    tmp[k++] = idx[i++]; /* <= keeps the left (earlier) run first */
+                } else {
+                    tmp[k++] = idx[j++];
+                }
+            }
+            while (i < mid) {
+                tmp[k++] = idx[i++];
+            }
+            while (j < hi) {
+                tmp[k++] = idx[j++];
+            }
+        }
+        memcpy(idx, tmp, (size_t)n * sizeof(int64_t));
+    }
+}
+
+void zap_list_sort_by(void *dstp, void *keysp, int64_t cmp_kind, int64_t reverse) {
+    ZapList *dst = (ZapList *)dstp;
+    ZapList *keys = (ZapList *)keysp;
+    int64_t n = dst->len;
+    if (n < 2) {
+        return;
+    }
+    /* All scratch is plain C memory, freed before returning: this routine makes
+     * no allocation that can trigger a collection, so raw buffers are safe. */
+    int64_t *idx = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    int64_t *tmp = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    int64_t *out = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+    if (!idx || !tmp || !out) {
+        fprintf(stderr, "zap: out of memory sorting a list of %lld\n", (long long)n);
+        abort();
+    }
+    for (int64_t i = 0; i < n; i++) {
+        idx[i] = i;
+    }
+    zap_sort_indices(idx, tmp, n, keys->data, cmp_kind, reverse);
+    /* Gather the permuted elements, then write them back in one pass — reading
+     * every element before overwriting keeps a `keys == dst` alias correct. */
+    for (int64_t i = 0; i < n; i++) {
+        out[i] = dst->data[idx[i]];
+    }
+    memcpy(dst->data, out, (size_t)n * sizeof(int64_t));
+    free(idx);
+    free(tmp);
+    free(out);
 }
 
 static void zap_dict_resize(ZapDict *d, int keykind) {
@@ -7839,6 +7951,305 @@ void *zap_crypto_token_hex(int64_t n) {
 }
 
 /* ===========================================================================
+ * bytes + base64 + hex (ticket #337). `bytes` reuses the ZapStr length-prefixed
+ * byte buffer; these entry points give it byte-wise indexing/slicing/decoding,
+ * construction from a list of ints, and the base64 / hex transfer codecs. Every
+ * result is a freshly allocated ZapStr over a pointer-free leaf buffer, so the
+ * precise collector traces it correctly. `bytes` and `str` share the ZapStr
+ * object — the only runtime distinction is these byte-wise helpers.
+ * =========================================================================== */
+
+/* Raise a catchable Zap exception carrying `msg` (so a bad codec input behaves
+ * like `raise`: a `try/except` can catch it, and an uncaught one exits 1 with
+ * the message, ticket #337). Never returns. */
+__attribute__((noreturn)) static void zap_bytes_raise(const char *msg) {
+    zap_panic(zap_str_new(msg, (int64_t)strlen(msg)));
+    abort(); /* unreachable: zap_panic unwinds and never returns */
+}
+
+/* b[i] -> the byte at byte index `i` as an int64 in 0..=255. Negative indices
+ * count from the end; out-of-range faults (matches zap_str_index behavior). */
+int64_t zap_bytes_index(void *bp, int64_t idx) {
+    const ZapStr *b = (const ZapStr *)bp;
+    int64_t n = b->len;
+    if (idx < 0) {
+        idx += n;
+    }
+    if (idx < 0 || idx >= n) {
+        fprintf(stderr, "zap: bytes index out of range\n");
+        abort();
+    }
+    return (int64_t)(unsigned char)b->data[idx];
+}
+
+/* b[lo:hi:step] -> bytes, Python slice semantics by byte. Mirrors
+ * zap_str_slice but indexes raw bytes (no UTF-8 decoding). */
+void *zap_bytes_slice(void *bp, int64_t lo, int64_t hi, int64_t step, int64_t has_lo,
+                      int64_t has_hi, int64_t has_step) {
+    const ZapStr *b = (const ZapStr *)bp;
+    int64_t n = b->len;
+    int64_t st = has_step ? step : 1;
+    if (st == 0) {
+        fprintf(stderr, "zap: slice step cannot be zero\n");
+        abort();
+    }
+    int64_t start;
+    int64_t stop;
+    if (st > 0) {
+        start = has_lo ? zap_slice_pos(lo, n) : 0;
+        stop = has_hi ? zap_slice_pos(hi, n) : n;
+    } else {
+        start = has_lo ? zap_slice_neg(lo, n) : n - 1;
+        stop = has_hi ? zap_slice_neg(hi, n) : -1;
+    }
+    if (st == 1) {
+        if (start >= stop) {
+            return zap_str_new("", 0);
+        }
+        return zap_str_new(b->data + start, stop - start);
+    }
+    char *buf = (char *)zap_buf(n > 0 ? n : 1);
+    int64_t outlen = 0;
+    for (int64_t k = start; (st > 0) ? (k < stop) : (k > stop); k += st) {
+        buf[outlen++] = b->data[k];
+    }
+    return zap_str_adopt(buf, outlen);
+}
+
+/* bytes([...]): build bytes from a list of int64 element words, each validated
+ * to lie in 0..=255 (Python raises ValueError; v1 faults). */
+void *zap_bytes_from_list(void *lp) {
+    ZapList *l = (ZapList *)lp;
+    int64_t n = l->len;
+    char *buf = (char *)zap_buf(n > 0 ? n : 1);
+    for (int64_t i = 0; i < n; i++) {
+        int64_t v = l->data[i];
+        if (v < 0 || v > 255) {
+            zap_bytes_raise("bytes(): list element out of range(0..256)");
+        }
+        buf[i] = (char)(unsigned char)v;
+    }
+    return zap_str_adopt(buf, n);
+}
+
+/* Strict UTF-8 well-formedness check (RFC 3629): rejects overlong encodings,
+ * surrogates (U+D800..U+DFFF) and code points above U+10FFFF. On failure returns
+ * 0 and sets *bad to the offending byte offset. */
+static int zap_utf8_valid(const unsigned char *d, int64_t n, int64_t *bad) {
+    int64_t i = 0;
+    while (i < n) {
+        unsigned char c = d[i];
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+        int w;
+        uint32_t cp;
+        uint32_t min;
+        if ((c & 0xE0) == 0xC0) {
+            w = 2;
+            cp = c & 0x1F;
+            min = 0x80;
+        } else if ((c & 0xF0) == 0xE0) {
+            w = 3;
+            cp = c & 0x0F;
+            min = 0x800;
+        } else if ((c & 0xF8) == 0xF0) {
+            w = 4;
+            cp = c & 0x07;
+            min = 0x10000;
+        } else {
+            *bad = i;
+            return 0;
+        }
+        if (i + w > n) {
+            *bad = i;
+            return 0;
+        }
+        for (int k = 1; k < w; k++) {
+            unsigned char cc = d[i + k];
+            if ((cc & 0xC0) != 0x80) {
+                *bad = i + k;
+                return 0;
+            }
+            cp = (cp << 6) | (uint32_t)(cc & 0x3F);
+        }
+        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            *bad = i;
+            return 0;
+        }
+        i += w;
+    }
+    return 1;
+}
+
+/* str(bytes): validate the bytes are well-formed UTF-8 (faulting with a clear
+ * error otherwise) and return them as a str. str/bytes share the ZapStr layout,
+ * so the result is a fresh str over a copy of the same bytes. */
+void *zap_bytes_to_str(void *bp) {
+    const ZapStr *b = (const ZapStr *)bp;
+    int64_t bad = 0;
+    if (!zap_utf8_valid((const unsigned char *)b->data, b->len, &bad)) {
+        zap_bytes_raise("str(bytes): invalid UTF-8");
+    }
+    return zap_str_new(b->data, b->len);
+}
+
+/* ---- base64 (RFC 4648) ---- */
+static const char ZAP_B64_STD[65] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const char ZAP_B64_URL[65] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/* encode(data, urlsafe, pad) -> str. `urlsafe` picks the `-_` alphabet; `pad`
+ * adds the `=` padding to a multiple of 4 chars. */
+void *zap_base64_encode(void *bp, int64_t urlsafe, int64_t pad) {
+    const ZapStr *b = (const ZapStr *)bp;
+    const unsigned char *d = (const unsigned char *)b->data;
+    int64_t n = b->len;
+    const char *alpha = urlsafe ? ZAP_B64_URL : ZAP_B64_STD;
+    int64_t groups = (n + 2) / 3;
+    char *out = (char *)zap_buf(groups * 4 + 1);
+    int64_t o = 0;
+    int64_t i = 0;
+    while (i + 3 <= n) {
+        uint32_t v =
+            ((uint32_t)d[i] << 16) | ((uint32_t)d[i + 1] << 8) | (uint32_t)d[i + 2];
+        out[o++] = alpha[(v >> 18) & 0x3F];
+        out[o++] = alpha[(v >> 12) & 0x3F];
+        out[o++] = alpha[(v >> 6) & 0x3F];
+        out[o++] = alpha[v & 0x3F];
+        i += 3;
+    }
+    int64_t rem = n - i;
+    if (rem == 1) {
+        uint32_t v = (uint32_t)d[i] << 16;
+        out[o++] = alpha[(v >> 18) & 0x3F];
+        out[o++] = alpha[(v >> 12) & 0x3F];
+        if (pad) {
+            out[o++] = '=';
+            out[o++] = '=';
+        }
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)d[i] << 16) | ((uint32_t)d[i + 1] << 8);
+        out[o++] = alpha[(v >> 18) & 0x3F];
+        out[o++] = alpha[(v >> 12) & 0x3F];
+        out[o++] = alpha[(v >> 6) & 0x3F];
+        if (pad) {
+            out[o++] = '=';
+        }
+    }
+    return zap_str_adopt(out, o);
+}
+
+/* The 6-bit value of a base64 character, or -1. Accepts both the standard
+ * (`+`/`/`) and URL-safe (`-`/`_`) alphabets, so decode is lenient about which
+ * variant it is given. */
+static int zap_b64_val(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') {
+        return c - 'A';
+    }
+    if (c >= 'a' && c <= 'z') {
+        return c - 'a' + 26;
+    }
+    if (c >= '0' && c <= '9') {
+        return c - '0' + 52;
+    }
+    if (c == '+' || c == '-') {
+        return 62;
+    }
+    if (c == '/' || c == '_') {
+        return 63;
+    }
+    return -1;
+}
+
+/* decode(s, urlsafe) -> bytes. Padding is optional (the bit count drives the
+ * output), ASCII whitespace/newlines are skipped, and an invalid character
+ * faults. The `urlsafe` flag is accepted for API symmetry; both alphabets are
+ * always decoded. */
+void *zap_base64_decode(void *sp, int64_t urlsafe) {
+    (void)urlsafe;
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t n = s->len;
+    unsigned char *out = (unsigned char *)zap_buf((n / 4 + 1) * 3 + 3);
+    int64_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = d[i];
+        if (c == '=') {
+            break;
+        }
+        if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+            continue;
+        }
+        int v = zap_b64_val(c);
+        if (v < 0) {
+            zap_bytes_raise("base64.decode: invalid character");
+        }
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (unsigned char)((acc >> bits) & 0xFF);
+        }
+    }
+    return zap_str_adopt((char *)out, o);
+}
+
+/* ---- hex ---- */
+/* encode(data) -> lowercase hex str (two chars per byte). */
+void *zap_hex_encode(void *bp) {
+    static const char HEX[] = "0123456789abcdef";
+    const ZapStr *b = (const ZapStr *)bp;
+    const unsigned char *d = (const unsigned char *)b->data;
+    int64_t n = b->len;
+    char *out = (char *)zap_buf(n * 2 > 0 ? n * 2 : 1);
+    for (int64_t i = 0; i < n; i++) {
+        out[i * 2] = HEX[(d[i] >> 4) & 0xF];
+        out[i * 2 + 1] = HEX[d[i] & 0xF];
+    }
+    return zap_str_adopt(out, n * 2);
+}
+
+static int zap_hex_val(unsigned char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/* decode(s) -> bytes. Requires an even number of hex digits ([0-9a-fA-F]);
+ * malformed input faults. */
+void *zap_hex_decode(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    const unsigned char *d = (const unsigned char *)s->data;
+    int64_t n = s->len;
+    if (n % 2 != 0) {
+        zap_bytes_raise("hex.decode: odd-length hex string");
+    }
+    int64_t m = n / 2;
+    char *out = (char *)zap_buf(m > 0 ? m : 1);
+    for (int64_t i = 0; i < m; i++) {
+        int hi = zap_hex_val(d[i * 2]);
+        int lo = zap_hex_val(d[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            zap_bytes_raise("hex.decode: invalid hex digit");
+        }
+        out[i] = (char)((hi << 4) | lo);
+    }
+    return zap_str_adopt(out, m);
+}
+
+/* ===========================================================================
  * time & datetime (ticket #99, D-0056). Clocks, sleep, duration-unit helpers,
  * and civil-time conversion. Durations are plain int64 nanoseconds (Go
  * time.Duration style), so arithmetic needs no runtime support; the helpers
@@ -8739,7 +9150,7 @@ void *zap_json_join(void *lp) {
 }
 
 /* ===========================================================================
- * stdlib: xml — core XML DOM tokenizer + escaping (ticket #351, D-0083)
+ * stdlib: xml — core XML DOM tokenizer + escaping (ticket #351, D-0084)
  * ---------------------------------------------------------------------------
  * A flat, stateful pull-tokenizer over the UTF-8 source, mirroring the json
  * tokenizer (D-0059). The high-level tree build (`xml.parse`) and serialize walk
