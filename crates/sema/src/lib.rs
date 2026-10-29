@@ -3959,10 +3959,45 @@ impl Checker {
         }
     }
 
-    /// Type-check a built-in `dict[K, V]` method call (ticket #299). All four
-    /// methods take no arguments: `keys() -> list[K]`, `values() -> list[V]`,
-    /// `items() -> list[(K, V)]`, and `copy() -> dict[K, V]` (a shallow copy).
+    /// Type-check a built-in `dict[K, V]` method call (tickets #299, #281).
+    /// `keys() -> list[K]`, `values() -> list[V]`,
+    /// `items() -> list[(K, V)]`, and `copy() -> dict[K, V]` (a shallow copy)
+    /// take no arguments; `get(key) -> Optional[V]` (ticket #281) takes the key
+    /// and returns the value wrapped in `Some`, or `None` when the key is absent
+    /// — a safe, non-aborting read (unlike `d[key]`, which raises on a miss).
     fn check_dict_method(&mut self, name: &str, args: &[Arg], k: &Ty, v: &Ty, span: Span) -> Ty {
+        // `get(key)` is the one dict method that takes an argument (the key),
+        // so it is handled before the shared no-argument check below. Its result
+        // is the prelude `Optional[V]`, spelled `Ty::Named("Optional")` exactly as
+        // every other `Optional[T]` annotation resolves (I#154) — so it matches,
+        // `is_none()`/`unwrap_or(...)`, and binding all type-check unchanged.
+        if name == "get" {
+            if args.len() != 1 {
+                self.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "dict.get() takes exactly one argument (the key), got {}",
+                        args.len()
+                    ),
+                    span,
+                );
+            }
+            for a in args {
+                let at = self.infer(&a.value);
+                if args.len() == 1 && !assignable(&at, k) && !matches!(at, Ty::Unknown) {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "dict.get() key has type {}, but this dict is keyed by {}",
+                            at.display(),
+                            k.display()
+                        ),
+                        span,
+                    );
+                }
+            }
+            return Ty::Named("Optional".to_string());
+        }
         let ret = match name {
             "keys" => Ty::List(Box::new(k.clone())),
             "values" => Ty::List(Box::new(v.clone())),
@@ -3973,7 +4008,7 @@ impl Checker {
                     ErrorCode::ZAP4080,
                     format!(
                         "dict has no method '{other}' \
-                         (supported: keys, values, items, copy)"
+                         (supported: keys, values, items, copy, get)"
                     ),
                     span,
                 );

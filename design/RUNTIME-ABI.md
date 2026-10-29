@@ -158,6 +158,12 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
   from `get` whose `0` is ambiguous with a stored `0`. `zap_dict_copy` returns a
   fresh dict sharing the referenced key/value objects. **Enumeration order is
   unspecified** (hash/probe order), matching the json object-key walker (D-0059).
+  The safe read `d.get(key) -> Optional[V]` (#281) adds no new entry point: it
+  pairs `zap_dict_contains_*` (presence) with `zap_dict_get_*` (value), so a
+  present key stored as `0`/null still reports `Some`, never a miss. Lowering
+  sees only the lossy element *kind*, so monomorphization — which alone knows the
+  concrete `V` — encodes the `Optional$V` instance into the method symbol
+  (`get$Optional$str`) for lowering to pick the right niche/tagged enum.
 - `array[T]` (#24, #49): `[ header | dtype | ndim | dims: *i64 | strides: *i64 |
   data: *T ]`, contiguous row-major; views share `data`. `dtype` tags the
   element type — `0 = f64`, `1 = i64` (8-byte words), `2 = uint8`, `3 = bool`
