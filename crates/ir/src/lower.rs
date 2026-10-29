@@ -10663,6 +10663,92 @@ impl<'a> FnLower<'a> {
             }
         }
 
+        // List membership: `x in <list>` — a list has no hash index, so this is a
+        // linear scan comparing each element to `x` for equality (ticket #399). The
+        // comparison routes through `binop(Eq, ..)`, so elements use the same
+        // equality semantics as `==` (numeric joins, `str` by contents, a struct's
+        // `__eq__`). Lowered in-IR like a `for` loop, breaking on the first match.
+        if matches!(op, In) {
+            if let Ty::List(elem) = rt {
+                let result = self.alloca(Ty::I1);
+                let f = self.new_value(Ty::I1);
+                self.emit(Inst::BConst {
+                    dest: f,
+                    val: false,
+                });
+                self.store(result, f);
+                let idx = self.alloca(Ty::I64);
+                let zero = self.iconst(Ty::I64, 0);
+                self.store(idx, zero);
+
+                let cond_bb = self.new_block();
+                let body_bb = self.new_block();
+                let incr_bb = self.new_block();
+                let end_bb = self.new_block();
+
+                self.set_term(Term::Br(cond_bb));
+                self.position(cond_bb);
+                let cur = self.load(idx, Ty::I64);
+                let len = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_list_len".to_string(),
+                    args: vec![r],
+                });
+                let c = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: c,
+                    pred: CmpPred::Lt,
+                    lhs: cur,
+                    rhs: len,
+                });
+                self.set_term(Term::BrIf {
+                    cond: c,
+                    then_bb: body_bb,
+                    else_bb: end_bb,
+                });
+
+                self.position(body_bb);
+                let i = self.load(idx, Ty::I64);
+                let e = self.new_value(elem.ty());
+                self.emit(Inst::Call {
+                    dest: Some(e),
+                    func: format!("zap_list_get_{}", elem.val_suffix()),
+                    args: vec![r, i],
+                });
+                let (eq, _) = self.binop(AstBin::Eq, e, elem.ty(), l, lt)?;
+                let found_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: eq,
+                    then_bb: found_bb,
+                    else_bb: incr_bb,
+                });
+
+                self.position(found_bb);
+                let t = self.new_value(Ty::I1);
+                self.emit(Inst::BConst { dest: t, val: true });
+                self.store(result, t);
+                self.set_term(Term::Br(end_bb));
+
+                self.position(incr_bb);
+                let cur2 = self.load(idx, Ty::I64);
+                let one = self.iconst(Ty::I64, 1);
+                let next = self.new_value(Ty::I64);
+                self.emit(Inst::Bin {
+                    dest: next,
+                    op: BinOp::Add,
+                    lhs: cur2,
+                    rhs: one,
+                });
+                self.store(idx, next);
+                self.set_term(Term::Br(cond_bb));
+
+                self.position(end_bb);
+                let d = self.load(result, Ty::I1);
+                return Ok((d, Ty::I1));
+            }
+        }
+
         // Membership: `x in <set>` -> `zap_set_contains_*`, normalized to a bool.
         if matches!(op, In) {
             let Ty::Set(elem) = rt else {

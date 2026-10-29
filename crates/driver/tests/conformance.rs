@@ -73,17 +73,20 @@ fn fixture_stem(p: &std::path::Path) -> String {
 // ---------------------------------------------------------------------------
 
 /// A claim id is `AREA-N`: an uppercase area tag, a hyphen, and a number
-/// (`TRUTH-1`, `NUM-4`, `DICT-2`). Kept deliberately simple so both the fixture
-/// directive and the `CLAIMS.md` table can be parsed by eye and by this harness.
+/// (`TRUTH-1`, `NUM-4`, `DICT-2`). The area tag may itself contain hyphens
+/// (`OP-IN-2` → area `OP-IN`, number `2`), so the number is split off at the
+/// *last* hyphen. Kept deliberately simple so both the fixture directive and the
+/// `CLAIMS.md` table can be parsed by eye and by this harness.
 fn is_claim_id(s: &str) -> bool {
-    let Some((area, num)) = s.split_once('-') else {
+    let Some((area, num)) = s.rsplit_once('-') else {
         return false;
     };
     !area.is_empty()
         && area
             .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '-')
         && area.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && area.chars().last().is_some_and(|c| c != '-')
         && !num.is_empty()
         && num.chars().all(|c| c.is_ascii_digit())
 }
@@ -404,11 +407,11 @@ fn conformance_programs_match() {
 
 #[test]
 fn claim_id_shape() {
-    for ok in ["TRUTH-1", "NUM-4", "DICT-2", "CMP-10", "A1-2"] {
+    for ok in ["TRUTH-1", "NUM-4", "DICT-2", "CMP-10", "A1-2", "OP-IN-2"] {
         assert!(is_claim_id(ok), "{ok} should be a claim id");
     }
     for bad in [
-        "truth-1", "TRUTH", "TRUTH-", "-1", "TRUTH-1a", "TR UTH-1", "",
+        "truth-1", "TRUTH", "TRUTH-", "-1", "TRUTH-1a", "TR UTH-1", "OP--1", "",
     ] {
         assert!(!is_claim_id(bad), "{bad} should NOT be a claim id");
     }

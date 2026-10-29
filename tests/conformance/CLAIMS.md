@@ -74,7 +74,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | CMP-3 | §9.1 | string ordering is lexicographic by codepoint (D-0025) | covered | comparison_string_lex |
 | CMP-4 | §5 | `==`/`!=` are built-in for scalars and strings | TODO | — |
 | OP-IN-1 | §5/§9 | `in` tests dict-key / substring membership | TODO | — |
-| OP-IN-2 | §5 | `x in <list>` tests list membership | TODO | — (impl gap: list `in` unsupported, #375) |
+| OP-IN-2 | §5 | `x in <list>` tests list membership | covered | list_membership |
 | IDX-1 | §9.1 | negative index counts from the end for lists too | covered | list_negative_index |
 | SLICE-1 | §8 | list slice yields a copy; array slice a view (D-0030) | TODO | — (impl gap: list slicing unsupported, #375) |
 
