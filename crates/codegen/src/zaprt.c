@@ -1812,11 +1812,43 @@ void *zap_i64_to_str(int64_t v) {
     return zap_str_new(tmp, (int64_t)n);
 }
 
-/* Decimal string for a double (used by power-assert diagnostics, D-0054).
- * `%g` keeps the rendering compact and round-trippable for typical values. */
+/* Render a double the way CPython's `str(float)` does for the common case:
+ * `%g`/`%G` for a compact body, but with a trailing `.0` restored on an
+ * integral finite value so a float stays visibly a float (`3.0` -> "3.0", not
+ * "3"; I#384). Non-integral values and `inf`/`nan` are left exactly as `%g`
+ * prints them. `out` must have room for at least 32 bytes; returns the length
+ * written. */
+static int zap_f64_fmt_g(double v, int upper, char *out, size_t outsz) {
+    int n = snprintf(out, outsz, upper ? "%G" : "%g", v);
+    if (n < 0) {
+        return 0;
+    }
+    if ((size_t)n >= outsz) {
+        return n; /* truncated; leave as-is */
+    }
+    /* Integral iff the whole rendering is an optional leading '-' then digits:
+     * no '.', no exponent, and not "inf"/"nan". */
+    int integral = (n > 0);
+    for (int i = 0; i < n; i++) {
+        char c = out[i];
+        if (!((c >= '0' && c <= '9') || (i == 0 && c == '-'))) {
+            integral = 0;
+            break;
+        }
+    }
+    if (integral && (size_t)n + 3 <= outsz) {
+        out[n++] = '.';
+        out[n++] = '0';
+        out[n] = '\0';
+    }
+    return n;
+}
+
+/* Decimal string for a double (`str(float)`, print, default f-string interp,
+ * JSON number serialization; also power-assert diagnostics, D-0054). */
 void *zap_f64_to_str(double v) {
     char tmp[32];
-    int n = snprintf(tmp, sizeof(tmp), "%g", v);
+    int n = zap_f64_fmt_g(v, 0, tmp, sizeof(tmp));
     return zap_str_new(tmp, (int64_t)n);
 }
 
@@ -2271,8 +2303,9 @@ void *zap_fmt_flt(double v, int64_t ftype, int64_t sign, int64_t width, int64_t 
     }
     char body[96];
     if (prec < 0 && (t == 'g' || t == 'G')) {
-        /* Default float rendering: match str(float) (compact %g). */
-        snprintf(body, sizeof(body), (t == 'G') ? "%G" : "%g", mag);
+        /* Default float rendering: match str(float) — compact %g with a
+         * trailing `.0` restored on integral values (I#384). */
+        zap_f64_fmt_g(mag, t == 'G', body, sizeof(body));
     } else {
         int p = (prec >= 0) ? (int)prec : 6;
         char spec[12];
