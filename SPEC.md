@@ -828,8 +828,8 @@ module — the collection *extras* ship as the `deque`/`bisect`/`oset` modules).
 (`crates/sema/src/modules/`): `io`, `fs`, `os`, `sys`, `process`, `math`,
 `random`, `time`, `datetime`, `json`, `logging`, `argparse`, `deque`, `bisect`,
 `oset`, `sync`, `signal`, `gc`, `runtime` — **Stable**; `crypto`, `base64`,
-`hex`, `net`, `http`,
-`tls`, `zlib`, `gzip`, `yaml`, `threading`, `concurrent` — **Experimental**
+`hex`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`, `threading`, `concurrent`,
+`url` — **Experimental**
 (STABILITY.md §4.4). The `concurrent` module (D-0078) adds a lock-free `Counter`
 and an unbounded MPSC `Queue[T]` built on `Atomic[T]`; concurrency lives in the
 type name (no new syntax), and a reference-payload `Queue[T]` inherits the open
@@ -872,6 +872,28 @@ headers** — `http.respond(conn, status, body, headers)` (#279) — written on 
 wire; a caller-supplied `Content-Type` overrides the default `text/plain`, while
 the server-managed `Content-Length` and `Connection: close` are always computed
 and any same-named map entry is ignored. `http` is **Experimental**
+(STABILITY.md §4.4).
+
+**`url` — `encoding/url` percent-encoding (#335).** RFC-3986 percent-encoding and
+decoding over raw UTF-8 bytes, plus the AWS-query canonicalization variant used
+by SigV4. A `str`'s bytes are its UTF-8 encoding, so every function encodes
+byte-by-byte and is multibyte-correct. The surface:
+`url.quote(s) -> str` leaves the **unreserved** set (`A-Z a-z 0-9 - . _ ~`,
+RFC-3986 §2.3) as-is and encodes every other byte (including `/` and space,
+which becomes `%20`, never `+`) as `%XX` with **UPPERCASE** hex — this is exactly
+the SigV4 URI-encode, so it is the primitive the signer applies to query
+keys/values and single path segments; `url.quote_path(s) -> str` is the same but
+leaves `/` unescaped (a whole path), so a SigV4 CanonicalURI is
+`url.quote_path(path)` for S3 and the double-encoded
+`url.quote_path(url.quote_path(path))` for every other service;
+`url.unquote(s) -> str` is the exact inverse (`%XX` back to a byte; a bare `+`
+stays literal and a malformed/truncated escape passes through unchanged), and
+`url.unquote_plus(s) -> str` additionally maps `+` -> space for
+`application/x-www-form-urlencoded` values. `url.encode_query(d: dict[str,str])
+-> str` builds `k=v&…` with each key/value `quote`-encoded in the dict's
+(unspecified) iteration order, and `url.canonical_query(d: dict[str,str]) -> str`
+is the SigV4 **CanonicalQueryString**: each key/value `quote`-encoded, the pairs
+sorted by encoded key then value and joined with `&`. `url` is **Experimental**
 (STABILITY.md §4.4).
 
 **Official packages** via the package manager (`sqlite3`, `xml`, `email`, …).

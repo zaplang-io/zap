@@ -736,7 +736,7 @@ def new_queue[T]() -> Queue[T]:
     QNode[T] stub = QNode(value=eval, next=Atomic(elink))
     return Queue(_head=Atomic(stub), _tail=Atomic(stub))
 
-# xml (I#351, D-0084) — Experimental core XML DOM for the AWS rest-xml / query
+# xml (I#351, D-0085) — Experimental core XML DOM for the AWS rest-xml / query
 # protocols. `XmlElement`/`XmlAttr` are compiler-known reference structs (like
 # `JsonValue`); the tree build + serialize walk live in these prelude functions,
 # which drive the `xml._lex_*` C tokenizer and the `_esc_*`/`_join` C helpers, so
@@ -958,7 +958,7 @@ fn references_prelude(module: &Module) -> bool {
         "\"Queue\"",
         "\"QNode\"",
         "\"new_queue\"",
-        // The `xml` core DOM (I#351, D-0084): `XmlElement`/`XmlAttr` and the
+        // The `xml` core DOM (I#351, D-0085): `XmlElement`/`XmlAttr` and the
         // `__xml_*` build/serialize helpers ship in the prelude, injected for any
         // program that names the module or one of these types.
         "\"xml\"",

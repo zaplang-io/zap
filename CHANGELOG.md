@@ -50,7 +50,7 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `json`, `logging`, `argparse`; the `signal`/`gc`/`runtime` APIs; and the
   Experimental `crypto`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`,
   `xml` — a core DOM parser + deterministic serializer for the AWS rest-xml /
-  query protocols (D-0084, #351);
+  query protocols (D-0085, #351);
   migration-only `threading`, and `concurrent` lock-free `Counter` + MPSC
   `Queue[T]` (D-0078).
 - **Runtime & GC.** Boehm and precise moving-Immix collectors with finalizers

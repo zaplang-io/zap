@@ -46,6 +46,7 @@ mod sys;
 mod threading;
 mod time;
 mod tls;
+mod url;
 mod xml;
 mod yaml;
 mod zlib;
@@ -94,6 +95,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     net::MODULE,
     http::MODULE,
     tls::MODULE,
+    url::MODULE,
     concurrent::MODULE,
     xml::MODULE,
 ];
