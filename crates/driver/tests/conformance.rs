@@ -332,19 +332,28 @@ fn run_with_timeout(
     }
 }
 
-/// Compile + run each conformance program and assert its stdout, exit code
+/// Compile + run each conformance program and check its stdout, exit code
 /// (optional `.exit` sidecar, default 0) and, when present, an expected-stderr
 /// substring (`.stderr` sidecar) — the same contract as the golden suite, so a
 /// conformance case is a golden that additionally cites the SPEC.md claim it
 /// pins. Requires the `codegen` feature (LLVM).
+///
+/// Every case is run and every mismatch is collected before the test fails, so
+/// one CI run reports the complete set of divergences (not just the first) —
+/// important because the codegen path only runs in CI, not on the typical
+/// no-LLVM dev host.
 #[cfg(feature = "codegen")]
 #[test]
 fn conformance_programs_match() {
+    use std::fmt::Write as _;
     use std::process::Command;
     let per_test = std::time::Duration::from_secs(60);
     let bin = env!("CARGO_BIN_EXE_zapc");
     let mut ran = 0usize;
+    let mut failures = String::new();
+
     for zap in zap_fixtures() {
+        let name = fixture_stem(&zap);
         let expected = std::fs::read_to_string(zap.with_extension("expected"))
             .expect("expected output present");
         let expected_exit: i32 = std::fs::read_to_string(zap.with_extension("exit"))
@@ -359,29 +368,34 @@ fn conformance_programs_match() {
 
         let got = String::from_utf8_lossy(&output.stdout);
         let got_err = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            output.status.code(),
-            Some(expected_exit),
-            "exit code mismatch for {} (stderr:\n{got_err})",
-            zap.display()
-        );
-        assert_eq!(
-            got.trim_end(),
-            expected.trim_end(),
-            "stdout mismatch for {} (stderr:\n{got_err})",
-            zap.display()
-        );
+        if output.status.code() != Some(expected_exit) {
+            let _ = write!(
+                failures,
+                "\n[{name}] exit code: want {expected_exit}, got {:?}\n  stderr: {got_err}",
+                output.status.code()
+            );
+        }
+        if got.trim_end() != expected.trim_end() {
+            let _ = write!(
+                failures,
+                "\n[{name}] stdout mismatch:\n  want: {:?}\n  got:  {:?}\n  stderr: {got_err}",
+                expected.trim_end(),
+                got.trim_end()
+            );
+        }
         if let Some(want_err) = expected_stderr {
             let want_err = want_err.trim_end();
-            assert!(
-                got_err.contains(want_err),
-                "stderr for {} should contain {want_err:?}, got:\n{got_err}",
-                zap.display()
-            );
+            if !got_err.contains(want_err) {
+                let _ = write!(
+                    failures,
+                    "\n[{name}] stderr should contain {want_err:?}, got:\n{got_err}"
+                );
+            }
         }
         ran += 1;
     }
     eprintln!("conformance: ran {ran} programs end-to-end");
+    assert!(failures.is_empty(), "conformance mismatches:{failures}");
 }
 
 // ---------------------------------------------------------------------------

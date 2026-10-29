@@ -82,12 +82,13 @@ The initial cases cover the semantic **danger zones** the #375 differential
 tester flagged, and their neighbors: truthiness, boolean short-circuit + value,
 numeric `/`/`//`/`%`/overflow, `str()` rendering, chained comparison, dict
 `get`→`Optional` and iteration, built-in-fault catchability, tuples, function
-arguments (defaults/keyword/variadic), comprehensions, control flow.
+arguments (defaults, keyword), comprehensions, control flow.
 
 `CLAIMS.md` additionally lists dozens of `TODO` claims across the rest of
 `SPEC.md`, so coverage is measurable and grows by adding a case and flipping a
 row. Broadening coverage toward the whole spec is incremental follow-up (see the
 epic #374 note). A few `TODO`s are flagged **(impl gap …)** — `SPEC.md`
 specifies the behavior but the compiler does not match it yet (list `in`, list
-slicing, list negative indexing, divide-by-zero catchability); they stay `TODO`
-until the gap closes rather than being pinned as passing.
+slicing, list negative indexing, variadic-param list iteration, divide-by-zero
+catchability); they stay `TODO` until the gap closes rather than being pinned as
+passing.
