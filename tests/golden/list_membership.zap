@@ -13,7 +13,7 @@ def main():
         print(1)
     else:
         print(0)
-    if not (99 in xs):
+    if not 99 in xs:
         print(1)
     else:
         print(0)
@@ -26,7 +26,7 @@ def main():
         print(1)
     else:
         print(0)
-    if not ("go" in langs):
+    if not "go" in langs:
         print(1)
     else:
         print(0)
