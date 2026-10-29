@@ -651,16 +651,24 @@ static void zap_list_push(ZapList *l, int64_t word) {
  * route out-of-range faults through it (#383). */
 void zap_panic(void *exc);
 
-/* Out-of-range access raises a catchable Zap exception (#383): the fault
+/* Normalize a (possibly negative) list index and bounds-check it, returning the
+ * resolved non-negative index. Negative indices count from the end (`xs[-1]` is
+ * the last element), mirroring strings (`zap_str_index`, #398) and CPython.
+ *
+ * Out-of-range access raises a catchable Zap exception (#383): the fault
  * unwinds through `zap_panic` like `raise`, so a `try/except` around the
  * indexing intercepts it (and an uncaught one still terminates non-zero via
  * `zap_uncaught`). Matches D-0007 ("built-in faults ... try/except handles
- * them") and CPython's `IndexError`. */
-static int64_t zap_list_at(ZapList *l, int64_t i) {
+ * them") and CPython's `IndexError`. The error reports the index as written. */
+static int64_t zap_list_norm(ZapList *l, int64_t i) {
+    int64_t orig = i;
+    if (i < 0) {
+        i += l->len;
+    }
     if (i < 0 || i >= l->len) {
         char buf[96];
         int n = snprintf(buf, sizeof buf, "list index %lld out of range (len %lld)",
-                         (long long)i, (long long)l->len);
+                         (long long)orig, (long long)l->len);
         if (n < 0) {
             n = 0;
         }
@@ -669,7 +677,11 @@ static int64_t zap_list_at(ZapList *l, int64_t i) {
         }
         zap_panic(zap_str_new(buf, (int64_t)n));
     }
-    return l->data[i];
+    return i;
+}
+
+static int64_t zap_list_at(ZapList *l, int64_t i) {
+    return l->data[zap_list_norm(l, i)];
 }
 
 void zap_list_push_i64(void *l, int64_t v) { zap_list_push((ZapList *)l, v); }
@@ -682,13 +694,13 @@ void *zap_list_get_ptr(void *l, int64_t i) {
     return (void *)(intptr_t)zap_list_at((ZapList *)l, i);
 }
 void zap_list_set_i64(void *l, int64_t i, int64_t v) {
-    (void)zap_list_at((ZapList *)l, i); /* bounds-check */
-    ((ZapList *)l)->data[i] = v;
+    int64_t k = zap_list_norm((ZapList *)l, i); /* normalize + bounds-check */
+    ((ZapList *)l)->data[k] = v;
 }
 void zap_list_set_ptr(void *l, int64_t i, void *v) {
     ((ZapList *)l)->elem_ptr = 1;
-    (void)zap_list_at((ZapList *)l, i); /* bounds-check */
-    ((ZapList *)l)->data[i] = (int64_t)(intptr_t)v;
+    int64_t k = zap_list_norm((ZapList *)l, i); /* normalize + bounds-check */
+    ((ZapList *)l)->data[k] = (int64_t)(intptr_t)v;
 }
 int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 

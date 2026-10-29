@@ -75,7 +75,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | CMP-4 | §5 | `==`/`!=` are built-in for scalars and strings | TODO | — |
 | OP-IN-1 | §5/§9 | `in` tests dict-key / substring membership | TODO | — |
 | OP-IN-2 | §5 | `x in <list>` tests list membership | TODO | — (impl gap: list `in` unsupported, #375) |
-| IDX-1 | §9.1 | negative index counts from the end for lists too | TODO | — (impl gap: list `xs[-1]` faults, #375) |
+| IDX-1 | §9.1 | negative index counts from the end for lists too | covered | list_negative_index |
 | SLICE-1 | §8 | list slice yields a copy; array slice a view (D-0030) | TODO | — (impl gap: list slicing unsupported, #375) |
 
 ## Dicts & Optional (§18, #281/#299/#299, D-0056)
