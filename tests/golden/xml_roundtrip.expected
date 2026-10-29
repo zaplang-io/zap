@@ -1,0 +1,7 @@
+<Config xmlns="urn:s3"><Name>my-bucket</Name><Versioning/></Config>
+roundtrip-ok
+<Msg>a &lt; b &amp; c &gt; d</Msg>
+a < b & c > d
+<E v="x&lt;y&amp;z&quot;w"/>
+x<y&z"w
+<D k="2"/>

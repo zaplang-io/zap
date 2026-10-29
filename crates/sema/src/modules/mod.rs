@@ -44,6 +44,7 @@ mod sys;
 mod threading;
 mod time;
 mod tls;
+mod xml;
 mod yaml;
 mod zlib;
 
@@ -90,6 +91,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     http::MODULE,
     tls::MODULE,
     concurrent::MODULE,
+    xml::MODULE,
 ];
 
 /// A built-in module's *constant* facet: the type of a `module.CONST` attribute

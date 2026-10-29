@@ -2059,3 +2059,52 @@ link time. Governed by D-0076 (`run`/`build` are Stable; this is a new, additive
   toolchain + musl builds of PCRE2/OpenSSL/zlib/GC in the image); a dynamically
   `dlopen`-ed libpython so portable binaries can still opt into Python at runtime;
   cross-build (`--target`) once codegen emits for non-host triples (#203).
+
+## D-0083 — core `xml` module: DOM parse + deterministic serialize (I#351)
+
+**Status:** Accepted — implemented. A core `xml` stdlib module (design/0033-xml.md)
+for the AWS **rest-xml** (S3) and **query** (STS/SNS/IAM/EC2) protocols, part of
+the broad-coverage program (epic #366). It provides the XML **primitives**; the
+aws-codegen layer maps shape traits onto them.
+
+- **DOM shape.** Two compiler-known prelude reference structs (like `JsonValue`,
+  [[D-0059]]): `XmlElement` (`name`, resolved `namespace` URI, `text`,
+  `list[XmlAttr] attrs`, `list[XmlElement] children`) and `XmlAttr` (`name`,
+  `value`). A **data model**, not a full infoset: each element has one `text`
+  field plus child elements. True mixed content (text interleaved between child
+  elements, order significant) is flattened — the one documented v1 limitation; it
+  never arises in AWS payloads. Lists (not dicts) back `attrs`/`children` so
+  **document order is preserved** and output is deterministic with no sort pass —
+  required for signing canonicalization and golden tests — and repeated siblings
+  (flattened lists) and duplicate attributes survive.
+- **Surface.** `xml.parse(str|bytes) -> XmlElement` (the root), `xml.dumps(
+  XmlElement) -> str` (deterministic), `xml.element(str) -> XmlElement` (builder
+  entry). Navigation methods: `find`/`find_all` (first vs **all** matching
+  children — `find_all` is what makes flattened lists navigable),
+  `get_attr`/`get_text`/`local_name`. Builder methods (each returns `self`):
+  `set_text`/`set_attr`/`add_child`.
+- **Namespaces.** A declaration is an ordinary attribute (`xmlns` / `xmlns:ns`),
+  so it round-trips through `attrs` with no special serialize handling; a prefixed
+  name is just a name with a colon. On parse, `namespace` is the **resolved URI**,
+  with the in-scope default + prefix bindings threaded down the tree so children
+  inherit (e.g. `<Error>` under `<ErrorResponse xmlns="…">`); `local_name()`
+  strips the prefix.
+- **AWS features expressed** (not hard-coded): `xmlAttribute` via
+  `get_attr`/`set_attr`; `locationName` by choosing the tag name; wrapped lists
+  via `find` + `find_all`; flattened lists via `find_all` on the parent; error
+  docs via plain navigation of both `<ErrorResponse><Error><Code>` and the bare
+  `<Error><Code>` forms.
+- **Implementation (module seam, [[D-0056]]).** Mirrors `json` ([[D-0059]]): a
+  flat C pull-tokenizer in `zaprt.c` (`zap_xml_lex_*`) that skips the XML
+  declaration / PIs / comments / DOCTYPE, emits CDATA as literal text, and decodes
+  entities (`&lt; &gt; &amp; &quot; &apos;` + numeric `&#DD;`/`&#xHH;` → UTF-8);
+  the tree build (`__xml_parse`) and serialize walk (`__xml_dumps`) are Zap prelude
+  functions, so the runtime never depends on the DOM layout. Escaping helpers
+  `zap_xml_esc_text` (`& < >`) / `zap_xml_esc_attr` (`& < "`, quoted); the fragment
+  join reuses `zap_json_join`. Keeping the C side a dumb, reusable tokenizer
+  (no tree, no scope stack) is deliberate — the later streaming pull-parser
+  follow-up reuses it, and namespace policy stays readable in Zap.
+- **Out of scope** (separate codec tickets; the module carries text only):
+  timestamp formatting, base64 blob decoding, percent-encoding. A streaming
+  pull-parser for huge S3 listings is a later follow-up — a DOM parse suffices for
+  v1. No grammar change (a library, not syntax).

@@ -735,6 +735,149 @@ def new_queue[T]() -> Queue[T]:
     Optional[T] eval = None
     QNode[T] stub = QNode(value=eval, next=Atomic(elink))
     return Queue(_head=Atomic(stub), _tail=Atomic(stub))
+
+# xml (I#351, D-0083) — Experimental core XML DOM for the AWS rest-xml / query
+# protocols. `XmlElement`/`XmlAttr` are compiler-known reference structs (like
+# `JsonValue`); the tree build + serialize walk live in these prelude functions,
+# which drive the `xml._lex_*` C tokenizer and the `_esc_*`/`_join` C helpers, so
+# the runtime never depends on the DOM layout (design/0033-xml.md).
+struct XmlAttr:
+    str name
+    str value
+
+struct XmlElement:
+    str name
+    str namespace
+    str text
+    list[XmlAttr] attrs
+    list[XmlElement] children
+
+    def find(self, str name) -> Optional[XmlElement]:
+        for c in self.children:
+            if c.name == name:
+                return Optional.Some(c)
+        return Optional.None
+
+    def find_all(self, str name) -> list[XmlElement]:
+        list[XmlElement] out = []
+        for c in self.children:
+            if c.name == name:
+                out.append(c)
+        return out
+
+    def get_attr(self, str name) -> Optional[str]:
+        for a in self.attrs:
+            if a.name == name:
+                return Optional.Some(a.value)
+        return Optional.None
+
+    def get_text(self) -> str:
+        return self.text
+
+    def local_name(self) -> str:
+        auto i = self.name.find(\":\")
+        if i < 0:
+            return self.name
+        return self.name[i + 1:]
+
+    def set_text(self, str t) -> XmlElement:
+        self.text = t
+        return self
+
+    def set_attr(self, str name, str value) -> XmlElement:
+        for a in self.attrs:
+            if a.name == name:
+                a.value = value
+                return self
+        self.attrs.append(XmlAttr(name=name, value=value))
+        return self
+
+    def add_child(self, XmlElement c) -> XmlElement:
+        self.children.append(c)
+        return self
+
+# xml.element(name): a fresh empty element — the builder entry point.
+def __xml_element(str name) -> XmlElement:
+    list[XmlAttr] a = []
+    list[XmlElement] c = []
+    return XmlElement(name=name, namespace=\"\", text=\"\", attrs=a, children=c)
+
+# Resolve an element's namespace URI from its (possibly prefixed) name and the
+# in-scope default + prefix bindings.
+def __xml_resolve_ns(str nm, str cdef, dict[str, str] cpre) -> str:
+    auto i = nm.find(\":\")
+    if i < 0:
+        return cdef
+    auto p = nm[0:i]
+    return cpre.get(p).unwrap_or(\"\")
+
+# Build the element whose OPEN token the cursor currently sits on, recursing into
+# children. `pdef`/`ppre` are the inherited default namespace and prefix map.
+def __xml_build(bytes c, str pdef, dict[str, str] ppre) -> XmlElement:
+    str nm = xml._lex_name(c)
+    list[XmlAttr] at = []
+    auto k = xml._lex_next(c)
+    while k == 2:
+        at.append(XmlAttr(name=xml._lex_name(c), value=xml._lex_value(c)))
+        k = xml._lex_next(c)
+    str cdef = pdef
+    dict[str, str] cpre = ppre.copy()
+    for a in at:
+        if a.name == \"xmlns\":
+            cdef = a.value
+        elif a.name.startswith(\"xmlns:\"):
+            cpre[a.name[6:]] = a.value
+    str ns = __xml_resolve_ns(nm, cdef, cpre)
+    list[XmlElement] ch = []
+    list[str] tx = []
+    if k == 3:
+        k = xml._lex_next(c)
+        while k != 6 and k != 0:
+            if k == 5:
+                tx.append(xml._lex_value(c))
+            elif k == 1:
+                ch.append(__xml_build(c, cdef, cpre))
+            k = xml._lex_next(c)
+    return XmlElement(name=nm, namespace=ns, text=xml._join(tx), attrs=at, children=ch)
+
+# xml.parse(s): parse a document and return its root element.
+def __xml_parse(str s) -> XmlElement:
+    auto c = xml._lex_new(s)
+    dict[str, str] pre = {}
+    auto k = xml._lex_next(c)
+    while k == 5:
+        k = xml._lex_next(c)
+    if k == 1:
+        return __xml_build(c, \"\", pre)
+    return __xml_element(\"\")
+
+# Serialize one element (and its subtree) into the fragment list.
+def __xml_dump(XmlElement e, list[str] out):
+    out.append(\"<\")
+    out.append(e.name)
+    for a in e.attrs:
+        out.append(\" \")
+        out.append(a.name)
+        out.append(\"=\")
+        out.append(xml._esc_attr(a.value))
+    auto has_text = e.text != \"\"
+    if len(e.children) == 0 and not has_text:
+        out.append(\"/>\")
+        return
+    out.append(\">\")
+    if has_text:
+        out.append(xml._esc_text(e.text))
+    for ch in e.children:
+        __xml_dump(ch, out)
+    out.append(\"</\")
+    out.append(e.name)
+    out.append(\">\")
+
+# xml.dumps(e): deterministic serialization of an element tree.
+def __xml_dumps(XmlElement e) -> str:
+    list[str] parts = []
+    __xml_dump(e, parts)
+    return xml._join(parts)
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -815,6 +958,12 @@ fn references_prelude(module: &Module) -> bool {
         "\"Queue\"",
         "\"QNode\"",
         "\"new_queue\"",
+        // The `xml` core DOM (I#351, D-0083): `XmlElement`/`XmlAttr` and the
+        // `__xml_*` build/serialize helpers ship in the prelude, injected for any
+        // program that names the module or one of these types.
+        "\"xml\"",
+        "\"XmlElement\"",
+        "\"XmlAttr\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))
