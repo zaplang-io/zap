@@ -2059,3 +2059,54 @@ link time. Governed by D-0076 (`run`/`build` are Stable; this is a new, additive
   toolchain + musl builds of PCRE2/OpenSSL/zlib/GC in the image); a dynamically
   `dlopen`-ed libpython so portable binaries can still opt into Python at runtime;
   cross-build (`--target`) once codegen emits for non-host triples (#203).
+
+## D-0083 — macOS support: ucontext behind the seam, kqueue netpoller, Intel-required CI (I#224)
+
+**Status:** Accepted. Issue #224, epic I#158 (`design/0016-platform-1.0.md`);
+reuses the A1 context-switch seam (design/0017) and the `np_backend_*` netpoller
+seam (#80, [[D-0061]]). See `design/0033-macos.md`. The 1.0 platform-tier
+classification for macOS lives in [[D-0076]] (§7.3): macOS x86-64 is **tier-2
+(Supported — not yet CI-gated)** and macOS arm64 is **experimental** (#260);
+promoting macOS x86-64 to a CI-gated tier-1 is a later maintainer call, not made
+here.
+
+macOS is the last 1.0-target platform (Linux + macOS + Windows). It is POSIX and
+uses the Itanium C++ ABI like Linux, so — unlike Windows — it reuses the Linux
+POSIX runtime paths wholesale; the only genuinely new mechanism is a kqueue
+netpoller backend. Decisions:
+
+- **Context switch = ucontext behind the A1 seam, not asm (for the first cut).**
+  macOS is `ZAP_PLATFORM_POSIX`, so `zap_ctx_swap`/`zap_ctx_make` use the same
+  `ucontext` backend as Linux. Apple's `<ucontext.h>` `#error`s without
+  `_XOPEN_SOURCE`, so the runtime defines `_XOPEN_SOURCE 700` + `_DARWIN_C_SOURCE`
+  (to keep arc4random / `_NSGet*` / kqueue constants visible) at the top of
+  `zaprt.c`, and silences the deprecation warning locally. ucontext is
+  deprecated-but-functional on macOS; a macOS/BSD asm backend is an optional perf
+  follow-up, same status as Linux.
+- **Netpoller = a kqueue backend behind `np_backend_*`** (parallel to epoll/IOCP):
+  `EVFILT_READ`/`EVFILT_WRITE` with `EV_CLEAR` (edge-triggered, matching the
+  `EPOLLET` drain-to-EAGAIN contract), `EVFILT_USER`+`NOTE_TRIGGER` as the
+  kick/shutdown wake (no eventfd/self-pipe), `EV_EOF` → wake both directions. No
+  new `PollDesc` fields (readiness model over the same `int fd`). This is required,
+  not optional: signals (#77), net and http (#104) all park on the netpoller.
+- **Link = `-lc++` on macOS** (libstdc++ is absent on modern/Apple-Silicon SDKs;
+  libc++abi provides the identical Itanium `__gxx_personality_v0`/`__cxa_*`
+  symbols). Everything else on the POSIX link line (`-rdynamic`, pcre2/zlib/
+  openssl, CPython embed via pkg-config) works unchanged; CPython stays enabled
+  (unlike the Windows v1 gate).
+- **GC:** both collectors work with no macOS-specific code — Immix is
+  `posix_memalign`/`calloc` (no `mmap`), Boehm is Homebrew `-lgc`. The
+  shadow-stack/safepoint/evacuation machinery is OS-neutral.
+- **CI arch = x86_64 required (`macos-13`), arm64 best-effort (`macos-14`,
+  `MAXPROCS=1`).** I#223 is a parked *aarch64-only* multicore precise-Immix
+  weak-memory bug; its finding proves x86_64 is clean (0/120 at MAXPROCS 4/8/16)
+  while arm64 fails ~97%. The required Intel job shares Linux's memory model and is
+  genuinely green while exercising the multicore GC; the arm64 job is quarantined
+  single-worker until I#223 lands. The macOS jobs stay **outside the blocking
+  `CI gate`** for now (reported, non-blocking) — the same posture as the
+  best-effort `windows-crates` job — so neither the arm64 #260 JIT-unwinder gap
+  nor runner availability can wedge the merge queue; wiring macOS x86-64 into the
+  required gate is the maintainer tier-1 promotion above. So **I#223 does not
+  block macOS support**. Follow-ups: macOS/BSD asm `zap_ctx_*`, arm64-required
+  (multi-worker) after I#223, macOS arm64 JIT EH-frame registration (#260),
+  FreeBSD/OpenBSD (the kqueue arm is written to extend). No grammar change.

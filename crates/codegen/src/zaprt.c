@@ -8,6 +8,22 @@
  * stack, registers and globals, so no stack maps or safepoints are needed. The
  * type-descriptor header from the ABI is added when reflection / precise GC
  * land. */
+/* macOS feature-test macros (ticket #224, platform epic #158 / macOS Area). These
+ * MUST precede every system header (they gate what the SDK headers declare), so
+ * they sit at the very top of the translation unit:
+ *   - _XOPEN_SOURCE un-gates <ucontext.h>, whose Apple copy #errors without it
+ *     ("deprecated ucontext routines require _XOPEN_SOURCE"). ucontext is
+ *     deprecated-but-fully-functional on macOS and is the A1 context-switch seam's
+ *     POSIX backend (same as Linux; design/0017, design/0029). A hand-asm backend
+ *     is an optional perf follow-up, not required for the first cut.
+ *   - _DARWIN_C_SOURCE restores the BSD/Darwin extensions that _XOPEN_SOURCE alone
+ *     would hide — arc4random (crypto entropy, #105), _NSGetArgc/_NSGetArgv (argv
+ *     capture), and the kqueue EVFILT, EV and NOTE constants the macOS netpoller
+ *     backend below uses. Linux/Windows never see these (guarded on __APPLE__). */
+#if defined(__APPLE__)
+#define _XOPEN_SOURCE 700
+#define _DARWIN_C_SOURCE 1
+#endif
 /* ===========================================================================
  * Platform detection (ticket #199, platform epic #158 / Area A5). The runtime
  * is POSIX/Linux-x86_64 today; Windows support is being built out across the
@@ -3048,6 +3064,13 @@ void *zap_py_str(void *obj_) {
  * the implementation lives in zap_ctx_win_x64.c and is exercised today, ahead of
  * a full Windows runtime, by the standalone harness zap_ctx_win_x64_test.c. */
 #if defined(ZAP_PLATFORM_POSIX)
+/* macOS marks get/make/swapcontext deprecated (functional since 10.6); the seam is
+ * deliberately built on them (design/0029), so silence the warning locally rather
+ * than spraying it across -Wall builds. No-op on Linux. */
+#if defined(__APPLE__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
 typedef ucontext_t zap_ctx_t;
 static void zap_ctx_make(zap_ctx_t *c, void *stack, size_t stack_size,
                          void (*entry)(void)) {
@@ -3060,6 +3083,9 @@ static void zap_ctx_make(zap_ctx_t *c, void *stack, size_t stack_size,
 static inline void zap_ctx_swap(zap_ctx_t *from, zap_ctx_t *to) {
     swapcontext(from, to);
 }
+#if defined(__APPLE__)
+#pragma clang diagnostic pop
+#endif
 #else /* ZAP_PLATFORM_WINDOWS — A1 (I#195) drop-in point */
 typedef struct zap_ctx_t {
     void *sp; /* single saved stack pointer; the register save-area lives on the
@@ -4825,6 +4851,66 @@ static void np_backend_kick(void) {
     ssize_t r = write(g_np_wakefd, &one, sizeof one);
     (void)r; /* a full counter (EAGAIN) still wakes epoll_wait */
 }
+#elif defined(__APPLE__)
+#define ZAP_NETPOLL_KQUEUE 1
+#include <sys/event.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <errno.h>
+
+/* kqueue backend (I#224 / macOS Area; design/0029). The macOS/BSD readiness model,
+ * parallel to the Linux epoll arm: EVFILT_READ + EVFILT_WRITE registered with
+ * EV_CLEAR (edge-triggered, matching EPOLLET — callers drain to EAGAIN, per
+ * RUNTIME-ABI). The kick/shutdown wake is EVFILT_USER + NOTE_TRIGGER (the eventfd
+ * analogue; no self-pipe fd needed). One fd serves both directions via two filter
+ * registrations, and readiness state lives in the PollDesc, so this arm adds NO
+ * backend-specific PollDesc fields (contrast the IOCP arm's sock/afd). Extends to
+ * the BSDs by widening the guard. */
+#define ZAP_KQ_WAKE_IDENT 0 /* EVFILT_USER ident (its own namespace, not an fd)  */
+
+static int g_np_kqfd = -1;
+
+static int np_backend_open(void) {
+    g_np_kqfd = kqueue();
+    if (g_np_kqfd < 0) {
+        return -1;
+    }
+    (void)fcntl(g_np_kqfd, F_SETFD, FD_CLOEXEC); /* best-effort; leak-on-exec is benign */
+    struct kevent ev;
+    EV_SET(&ev, ZAP_KQ_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(g_np_kqfd, &ev, 1, NULL, 0, NULL) < 0) {
+        close(g_np_kqfd);
+        g_np_kqfd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static int np_backend_add(PollDesc *pd) {
+    /* One registration per direction; edge-triggered. macOS accepts EVFILT_WRITE
+     * on a non-writable fd (e.g. a pipe read end) without error — it simply never
+     * fires — so both are armed unconditionally, mirroring epoll's single
+     * EPOLLIN|EPOLLOUT add. udata carries the PollDesc (the data.ptr analogue). */
+    struct kevent ch[2];
+    EV_SET(&ch[0], pd->fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, pd);
+    EV_SET(&ch[1], pd->fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, pd);
+    return kevent(g_np_kqfd, ch, 2, NULL, 0, NULL);
+}
+
+static void np_backend_del(PollDesc *pd) {
+    struct kevent ch[2];
+    EV_SET(&ch[0], pd->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    EV_SET(&ch[1], pd->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+    /* Ignore ENOENT: a direction the kernel auto-removed on close, or one that was
+     * never retained. kqueue also drops all filters when the fd is closed. */
+    (void)kevent(g_np_kqfd, ch, 2, NULL, 0, NULL);
+}
+
+static void np_backend_kick(void) {
+    struct kevent ev;
+    EV_SET(&ev, ZAP_KQ_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void)kevent(g_np_kqfd, &ev, 1, NULL, 0, NULL);
+}
 #elif defined(ZAP_PLATFORM_WINDOWS)
 #define ZAP_NETPOLL_IOCP 1
 #include "zap_np_iocp.h"
@@ -5000,6 +5086,60 @@ static void *np_poller_main(void *arg) {
 }
 #endif
 
+#if defined(ZAP_NETPOLL_KQUEUE)
+/* kqueue poller loop (I#224), the readiness twin of the epoll np_poller_main. The
+ * timeout is the same np_compute_timeout() (ms) converted to a timespec (NULL =
+ * block forever); each returned event dispatches by filter, EV_EOF counts as
+ * readiness, and EVFILT_USER is the drained kick. */
+static void *np_poller_main(void *arg) {
+    (void)arg;
+    struct kevent evs[64];
+    for (;;) {
+        int to_ms = np_compute_timeout();
+        struct timespec ts;
+        struct timespec *tsp = NULL;
+        if (to_ms >= 0) {
+            ts.tv_sec = to_ms / 1000;
+            ts.tv_nsec = (long)(to_ms % 1000) * 1000000L;
+            tsp = &ts;
+        }
+        int n = kevent(g_np_kqfd, NULL, 0, evs, 64, tsp);
+        if (g_np_shutdown) {
+            break;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break; /* unexpected kqueue failure: stop polling */
+        }
+        for (int i = 0; i < n; i++) {
+            if (evs[i].filter == EVFILT_USER) {
+                continue; /* a kick (deadline-recompute / shutdown); nothing to do */
+            }
+            PollDesc *pd = (PollDesc *)evs[i].udata;
+            if (!pd) {
+                continue;
+            }
+            int is_read = (evs[i].filter == EVFILT_READ);
+            zap_np_lock(&pd->mu);
+            np_wake_dir_locked(pd, is_read, ZAP_POLL_OK);
+            /* EV_EOF (peer hangup / socket error) is reported on the fired filter;
+             * wake the OTHER direction too so a waiter there also observes the
+             * condition on its next syscall — the kqueue analogue of epoll waking
+             * both directions on EPOLLHUP|EPOLLERR. np_wake_dir_locked just latches
+             * readiness if no waiter is parked, so the extra wake is harmless. */
+            if (evs[i].flags & EV_EOF) {
+                np_wake_dir_locked(pd, is_read ? 0 : 1, ZAP_POLL_OK);
+            }
+            zap_np_unlock(&pd->mu);
+        }
+        np_expire_deadlines();
+    }
+    return NULL;
+}
+#endif
+
 #if defined(ZAP_NETPOLL_IOCP)
 /* Ensure each live descriptor has a one-shot AFD poll in flight for every
  * direction that still wants readiness, GATED so a latched-but-undrained socket
@@ -5066,6 +5206,17 @@ static void np_start_once(void) {
 #if defined(ZAP_NETPOLL_EPOLL)
     if (np_backend_open() != 0) {
         fprintf(stderr, "zap: netpoller init failed (epoll)\n");
+        return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
+    }
+    int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "zap: netpoller thread start failed (%d)\n", rc);
+        return;
+    }
+    g_np_started = 1;
+#elif defined(ZAP_NETPOLL_KQUEUE)
+    if (np_backend_open() != 0) {
+        fprintf(stderr, "zap: netpoller init failed (kqueue)\n");
         return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
     }
     int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
@@ -5289,7 +5440,11 @@ void zap_netpoll_close(void *pd_) {
  * (ZAP_NP_SELFTEST_CHECKS on full success); prints to stderr on any failure. */
 #define ZAP_NP_SELFTEST_CHECKS 2
 
-#if defined(ZAP_NETPOLL_EPOLL)
+/* Runs on any readiness backend (epoll or kqueue): the body is pure POSIX pipe +
+ * scheduler + channel code, exercising the real backend end-to-end. The IOCP arm
+ * has its own in-tree harness (zap_np_iocp_test.c); the no-backend fallback below
+ * returns success without testing. */
+#if defined(ZAP_NETPOLL_EPOLL) || defined(ZAP_NETPOLL_KQUEUE)
 static int g_np_t_rfd;        /* read end polled by the reader coroutine        */
 static int g_np_t_wfd;        /* write end the writer coroutine writes to       */
 static void *g_np_t_pd;       /* its PollDesc                                   */
@@ -5448,8 +5603,11 @@ int64_t zap_netpoll_selftest(void) { return ZAP_NP_SELFTEST_CHECKS; }
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
-#if defined(__GLIBC__)
-#include <execinfo.h> /* backtrace() for the fault crash report                 */
+#if defined(__GLIBC__) || defined(__APPLE__)
+/* backtrace()/backtrace_symbols_fd() for the fault crash report and the CPU
+ * profiler (#78). glibc and macOS/libSystem both ship <execinfo.h>; other libcs
+ * (musl) do not, so the fault handler there degrades to no native trace. */
+#include <execinfo.h>
 #define ZAP_HAVE_BACKTRACE 1
 #endif
 

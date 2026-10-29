@@ -118,9 +118,18 @@ fn print_json(value: &Json) {
     let _ = out.flush();
 }
 
+/// The `resource` argument type of `get/setrlimit` differs by libc: glibc/Linux
+/// uses the `__rlimit_resource_t` enum typedef, while macOS/BSD use a plain
+/// `c_int` (ticket #224). The `RLIMIT_*` constants are typed to match on each
+/// platform, so aliasing the parameter type keeps the call sites unchanged.
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_os = "linux"))]
+type RlimitResource = libc::c_int;
+
 /// Lower a soft resource limit to `value`, leaving the hard limit alone (we only
 /// ever tighten). Best-effort: a failure is non-fatal.
-fn set_rlimit(resource: libc::__rlimit_resource_t, value: u64) {
+fn set_rlimit(resource: RlimitResource, value: u64) {
     // SAFETY: read the current limit, lower the soft limit, write it back.
     unsafe {
         let mut lim = libc::rlimit {
