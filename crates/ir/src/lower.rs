@@ -6298,6 +6298,54 @@ impl<'a> FnLower<'a> {
                     }
                 }
             }
+            // Boolean `and` / `or` short-circuit left-to-right (Python
+            // semantics): the right operand is evaluated only when the left
+            // does not already decide the result, so a guard idiom like
+            // `i < len(xs) and xs[i] == v` never evaluates (and thus never
+            // faults on) `xs[i]` when the bound check is false. The result is a
+            // strict `bool` (D-0022): each operand is truthiness-tested, and
+            // the surviving operand's truthy bit is the value. We merge the two
+            // paths through a stack slot (the IR has no phi; cf. the Optional
+            // build and the `in` fallback).
+            Expr::Binary {
+                op: op @ (AstBin::And | AstBin::Or),
+                lhs,
+                rhs,
+                ..
+            } => {
+                let is_and = matches!(op, AstBin::And);
+                let (l, lt) = self.expr(lhs)?;
+                let lb = self.truthy(l, lt);
+                // Default result is the left operand's truthy bit — the value
+                // when we short-circuit (`false and _` -> false, `true or _`
+                // -> true).
+                let slot = self.alloca(Ty::I1);
+                self.store(slot, lb);
+                let rhs_bb = self.new_block();
+                let join_bb = self.new_block();
+                // `and`: descend into the right operand only when the left is
+                // truthy. `or`: only when the left is falsy.
+                if is_and {
+                    self.set_term(Term::BrIf {
+                        cond: lb,
+                        then_bb: rhs_bb,
+                        else_bb: join_bb,
+                    });
+                } else {
+                    self.set_term(Term::BrIf {
+                        cond: lb,
+                        then_bb: join_bb,
+                        else_bb: rhs_bb,
+                    });
+                }
+                self.position(rhs_bb);
+                let (r, rt) = self.expr(rhs)?;
+                let rb = self.truthy(r, rt);
+                self.store(slot, rb);
+                self.ensure_br(join_bb);
+                self.position(join_bb);
+                Ok((self.load(slot, Ty::I1), Ty::I1))
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (l, lt) = self.expr(lhs)?;
                 let (r, rt) = self.expr(rhs)?;
