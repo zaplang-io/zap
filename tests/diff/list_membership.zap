@@ -1,8 +1,8 @@
-# diff: diverge GAP: `x in <list>` is not supported by codegen ("'in' is only
-# supported with a set on the right"), so a program using it fails to compile
-# (exit 1) rather than testing membership. CPython supports list membership. Dict
-# and string `in` DO work (see dict_lookup.zap) — only list `in` is missing. A
-# documented gap to triage. CPython: True / False; Zap: compile error.
+# diff: match
+# List membership: `x in <list>` is a linear scan comparing each element for
+# equality, matching CPython (dict and string `in` already worked — see
+# dict_lookup.zap). Closed the #399 (conformance OP-IN-2) gap. CPython and Zap
+# both print: 1 / 0.
 def mark(bool b) -> int64:
     if b:
         return 1
