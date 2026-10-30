@@ -100,6 +100,10 @@ jobs:
             [ -z "$f" ] && continue
             case "$f" in
               *.md) ;;
+              # docs/GRAMMAR.ebnf is load-bearing (I#396): a grammar test lints
+              # it and runs a conformance corpus against the real parser, so an
+              # edit to it must trigger the host job even though it lives in docs/.
+              docs/GRAMMAR.ebnf) echo "code path (load-bearing grammar): $f"; code=true ;;
               docs/*) ;;
               design/*) ;;
               LICENSE*) ;;
