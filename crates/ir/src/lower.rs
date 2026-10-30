@@ -592,6 +592,23 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             ast::Item::Enum(e) if e.variants.iter().any(|v| !v.fields.is_empty()) => {
                 ids.insert(e.name.clone(), names.len() as u32);
                 names.push(e.name.clone());
+                // An enum method generator (I#449): same synthetic state struct
+                // as a struct method generator (I#429) / free generator (I#67),
+                // keyed on the mangled `Enum__method`. `self` (the tagged-struct
+                // receiver) becomes one of its captured fields. Layout filled once
+                // signatures are known. Only data-carrying (tier-3) enum methods
+                // lower — tier-1 enum method generators are rejected in sema
+                // (ZAP5060), so no state struct is reserved for them here.
+                for m in &e.methods {
+                    if zapc_syntax::genanalysis::is_generator(m) {
+                        let name = zapc_syntax::genanalysis::gen_state_name(&format!(
+                            "{}__{}",
+                            e.name, m.name
+                        ));
+                        ids.insert(name.clone(), names.len() as u32);
+                        names.push(name);
+                    }
+                }
             }
             // A generator (a free `def` with `yield`, I#67) gets a synthetic
             // state-struct id reserved up front — its layout is filled after the
@@ -958,12 +975,20 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                             .iter()
                             .map(|p| param_ty(p, Some(sid), &ctx))
                             .collect();
-                        let ret = m
-                            .ret
-                            .as_ref()
-                            .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
-                            .unwrap_or(Ty::Void);
-                        sigs.insert(format!("{}__{}", e.name, m.name), (params, ret));
+                        let mangled = format!("{}__{}", e.name, m.name);
+                        // An enum method generator (I#449): calling it returns its
+                        // synthetic iterator state struct (like a struct method
+                        // generator, I#429), not the declared/`void` type — its
+                        // body is compiled into the state struct's `__next__`.
+                        let ret = if zapc_syntax::genanalysis::is_generator(m) {
+                            Ty::Struct(ctx.ids[&zapc_syntax::genanalysis::gen_state_name(&mangled)])
+                        } else {
+                            m.ret
+                                .as_ref()
+                                .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
+                                .unwrap_or(Ty::Void)
+                        };
+                        sigs.insert(mangled, (params, ret));
                     }
                 }
             }
@@ -1027,6 +1052,18 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 for m in &s.methods {
                     if zapc_syntax::genanalysis::is_generator(m) {
                         gen_funcs.push((format!("{}__{}", s.name, m.name), m));
+                    }
+                }
+            }
+            // Tier-3 enum method generators (I#449): collected exactly like
+            // struct method generators — keyed on the mangled `Enum__method`, the
+            // captured `self` being the tagged-struct receiver. Gated on the
+            // tagged-struct id (data-carrying enums only); tier-1 enum method
+            // generators never reach here (rejected in sema, ZAP5060).
+            ast::Item::Enum(e) if ctx.enums.get(&e.name).and_then(|i| i.sid).is_some() => {
+                for m in &e.methods {
+                    if zapc_syntax::genanalysis::is_generator(m) {
+                        gen_funcs.push((format!("{}__{}", e.name, m.name), m));
                     }
                 }
             }
@@ -1158,6 +1195,19 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 if let Some(sid) = ctx.enums.get(&e.name).and_then(|i| i.sid) {
                     for m in &e.methods {
                         let name = format!("{}__{}", e.name, m.name);
+                        // An enum method generator (I#449) is lowered to its state
+                        // struct's `__iter__`/`__next__` — exactly like a struct
+                        // method generator (I#429). Its captured `self` (the
+                        // tagged-struct receiver) is the leading state-struct field.
+                        if let Some(gi) = ctx.generators.get(&name) {
+                            let gi = gi.clone();
+                            out.funcs.push(lower_generator_iter(&gi, &sigs, &ctx));
+                            match lower_generator_next(m, &gi, &sigs, &ctx) {
+                                Ok(func) => out.funcs.push(func),
+                                Err(e) => errors.push(e),
+                            }
+                            continue;
+                        }
                         match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[]) {
                             Ok(func) => out.funcs.push(func),
                             Err(e) => errors.push(e),
