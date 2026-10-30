@@ -720,6 +720,41 @@ void *zap_list_copy(void *lp) {
     return o;
 }
 
+/* list[T] slice `xs[lo:hi:step]` -> a NEW list (a copy, D-0030; contrast array
+ * slices, which are views). Python bounds: negatives count from the end, out-of-
+ * range clamps (no fault — unlike indexing), and `step` may be negative. The
+ * element words are copied verbatim and `elem_ptr` is inherited, so the precise
+ * collector traces the copy correctly and the operation is element-type-agnostic
+ * (one entry point serves both the i64 and ptr element kinds). The slice-bound
+ * clamps (`zap_slice_pos`/`zap_slice_neg`) are shared with `zap_str_slice` and
+ * are defined with the string helpers below; forward-declare them here. */
+static int64_t zap_slice_pos(int64_t v, int64_t n);
+static int64_t zap_slice_neg(int64_t v, int64_t n);
+void *zap_list_slice(void *lp, int64_t lo, int64_t hi, int64_t step, int64_t has_lo,
+                     int64_t has_hi, int64_t has_step) {
+    ZapList *l = (ZapList *)lp;
+    int64_t n = l->len;
+    int64_t st = has_step ? step : 1;
+    if (st == 0) {
+        zap_panic(zap_str_new("slice step cannot be zero", 25));
+    }
+    int64_t start;
+    int64_t stop;
+    if (st > 0) {
+        start = has_lo ? zap_slice_pos(lo, n) : 0;
+        stop = has_hi ? zap_slice_pos(hi, n) : n;
+    } else {
+        start = has_lo ? zap_slice_neg(lo, n) : n - 1;
+        stop = has_hi ? zap_slice_neg(hi, n) : -1;
+    }
+    ZapList *o = (ZapList *)zap_list_new();
+    o->elem_ptr = l->elem_ptr;
+    for (int64_t k = start; (st > 0) ? (k < stop) : (k > stop); k += st) {
+        zap_list_push(o, l->data[k]);
+    }
+    return o;
+}
+
 /* dict[K, V]: open-addressing hash table with linear probing.
  * Key kind (int64 vs str) is passed per call; a dict is homogeneous, so this is
  * stable across a given dict's lifetime. */
@@ -1494,8 +1529,15 @@ typedef struct {
     int64_t dtype;  /* DTYPE_F64 | DTYPE_I64 | DTYPE_U8 | DTYPE_BOOL */
     int64_t ndim;   /* always 1 this increment */
     int64_t *dims;  /* `ndim` dimensions; dims[0] is the length */
-    void *data;     /* contiguous row-major buffer, len * elem-size bytes */
+    void *data;     /* GC buffer base; `off` elements precede this array's first */
+    int64_t off;    /* element offset of this array's first element into `data` */
 } ZapArray;
+/* `off` is a non-zero element offset only for a slice *view* (D-0030): a view
+ * shares its parent's `data` buffer (pointing at the buffer BASE, not into its
+ * middle — the precise collector forwards `data` as an object start under
+ * evacuation, so an interior pointer would corrupt), carrying its window as
+ * `off` (first element) + `dims[0]` (length). All element access adds `off`, and
+ * `zap_array_data` returns the window base so the SIMD kernels stay contiguous. */
 
 /* Bytes per stored element: f64/i64 are 8-byte words, uint8/bool one byte. */
 static size_t zap_array_elem_size(int64_t dtype) {
@@ -1513,13 +1555,41 @@ void *zap_array_new(int64_t dtype, int64_t len) {
     a->ndim = 1;
     a->dims = dims;
     a->data = data;
+    a->off = 0;
     return a;
 }
 
 int64_t zap_array_len(void *a) { return ((ZapArray *)a)->dims[0]; }
 
-/* The raw element buffer; codegen's SIMD kernels index this directly. */
-void *zap_array_data(void *a) { return ((ZapArray *)a)->data; }
+/* The raw element buffer at this array's first element; codegen's SIMD kernels
+ * index this directly from 0. For a slice view this is the parent base advanced
+ * by `off` elements, so the kernels stay oblivious to views (D-0030). */
+void *zap_array_data(void *a) {
+    ZapArray *arr = (ZapArray *)a;
+    return (char *)arr->data + (size_t)arr->off * zap_array_elem_size(arr->dtype);
+}
+
+/* A slice view `a[lo:hi]` -> a NEW array header SHARING the parent's buffer
+ * (D-0030): mutations through either alias. Python bounds (negatives from the
+ * end, out-of-range clamps). Step is handled by the caller: only the contiguous
+ * `step == 1` case reaches here, since a strided view would need strides the
+ * 1-D array has not got (a documented D-0030 follow-up). */
+void *zap_array_slice(void *ap, int64_t lo, int64_t hi, int64_t has_lo, int64_t has_hi) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t n = a->dims[0];
+    int64_t start = has_lo ? zap_slice_pos(lo, n) : 0;
+    int64_t stop = has_hi ? zap_slice_pos(hi, n) : n;
+    int64_t len = stop > start ? stop - start : 0;
+    ZapArray *v = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t *dims = (int64_t *)zap_buf(sizeof(int64_t));
+    dims[0] = len;
+    v->dtype = a->dtype;
+    v->ndim = 1;
+    v->dims = dims;
+    v->data = a->data;          /* share the parent buffer base (GC-safe) */
+    v->off = a->off + start;    /* window begins `start` elements in */
+    return v;
+}
 
 /* Out-of-range access aborts (shape-mismatch exceptions wait for a follow-up,
  * matching the list bounds behaviour above). */
@@ -1534,27 +1604,27 @@ static void zap_array_bounds(ZapArray *a, int64_t i) {
 double zap_array_get_f64(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    return ((double *)a->data)[i];
+    return ((double *)a->data)[a->off + i];
 }
 void zap_array_set_f64(void *ap, int64_t i, double v) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    ((double *)a->data)[i] = v;
+    ((double *)a->data)[a->off + i] = v;
 }
 int64_t zap_array_get_i64(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    return ((int64_t *)a->data)[i];
+    return ((int64_t *)a->data)[a->off + i];
 }
 void zap_array_set_i64(void *ap, int64_t i, int64_t v) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    ((int64_t *)a->data)[i] = v;
+    ((int64_t *)a->data)[a->off + i] = v;
 }
 
 double zap_array_sum_f64(void *ap) {
     ZapArray *a = (ZapArray *)ap;
-    const double *d = (const double *)a->data;
+    const double *d = (const double *)a->data + a->off;
     double s = 0.0;
     for (int64_t i = 0; i < a->dims[0]; i++) {
         s += d[i];
@@ -1563,7 +1633,7 @@ double zap_array_sum_f64(void *ap) {
 }
 int64_t zap_array_sum_i64(void *ap) {
     ZapArray *a = (ZapArray *)ap;
-    const int64_t *d = (const int64_t *)a->data;
+    const int64_t *d = (const int64_t *)a->data + a->off;
     int64_t s = 0;
     for (int64_t i = 0; i < a->dims[0]; i++) {
         s += d[i];
@@ -1577,16 +1647,16 @@ int64_t zap_array_sum_i64(void *ap) {
 int64_t zap_array_get_u8(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    return (int64_t)((const uint8_t *)a->data)[i];
+    return (int64_t)((const uint8_t *)a->data)[a->off + i];
 }
 void zap_array_set_u8(void *ap, int64_t i, int64_t v) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    ((uint8_t *)a->data)[i] = (uint8_t)v;
+    ((uint8_t *)a->data)[a->off + i] = (uint8_t)v;
 }
 int64_t zap_array_sum_u8(void *ap) {
     ZapArray *a = (ZapArray *)ap;
-    const uint8_t *d = (const uint8_t *)a->data;
+    const uint8_t *d = (const uint8_t *)a->data + a->off;
     int64_t s = 0;
     for (int64_t i = 0; i < a->dims[0]; i++) {
         s += (int64_t)d[i];
@@ -1597,16 +1667,16 @@ int64_t zap_array_sum_u8(void *ap) {
 int64_t zap_array_get_bool(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    return ((const uint8_t *)a->data)[i] ? 1 : 0;
+    return ((const uint8_t *)a->data)[a->off + i] ? 1 : 0;
 }
 void zap_array_set_bool(void *ap, int64_t i, int64_t v) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    ((uint8_t *)a->data)[i] = v ? 1 : 0;
+    ((uint8_t *)a->data)[a->off + i] = v ? 1 : 0;
 }
 int64_t zap_array_sum_bool(void *ap) {
     ZapArray *a = (ZapArray *)ap;
-    const uint8_t *d = (const uint8_t *)a->data;
+    const uint8_t *d = (const uint8_t *)a->data + a->off;
     int64_t s = 0;
     for (int64_t i = 0; i < a->dims[0]; i++) {
         s += d[i] ? 1 : 0;
