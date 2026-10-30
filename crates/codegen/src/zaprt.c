@@ -557,15 +557,21 @@ int64_t zap_ipow(int64_t base, int64_t exp) {
 /* Floating-point power via libm. */
 double zap_powf(double base, double exp) { return pow(base, exp); }
 
+/* Forward declaration: `zap_panic` (the `raise`/unwind entry point) is defined
+ * further down with the exception glue, but the built-in fault paths above it —
+ * integer divide/modulo by zero (EXC-3) and the collection out-of-range faults
+ * (#398/#383) — route their faults through it so `except` can catch them. */
+void zap_panic(void *exc);
+
 /* Floor division for signed integers (Python semantics, D-0024): rounds toward
  * negative infinity. C `/` truncates toward zero, so correct the quotient when
  * the remainder is non-zero and the operand signs differ. Division by zero is a
- * fault (aborts, matching the index-out-of-range behaviour until the typed
- * exception runtime lands). */
+ * **catchable** built-in fault (EXC-3, D-0007): it unwinds through `zap_panic`
+ * like `raise`, so a `try`/`except` around the `//` catches it (the lowering
+ * emits an `invoke`, mirroring the index faults of #398/#383). */
 int64_t zap_ifloordiv(int64_t a, int64_t b) {
     if (b == 0) {
-        fprintf(stderr, "zap: integer division or modulo by zero\n");
-        abort();
+        zap_panic(zap_str_new("integer division or modulo by zero", 34));
     }
     int64_t q = a / b;
     int64_t r = a % b;
@@ -584,12 +590,11 @@ double zap_ffloordiv(double a, double b) { return floor(a / b); }
  * takes the sign of the divisor, consistent with `zap_ifloordiv` so that the
  * identity `a == (a // b) * b + (a % b)` holds. C `%` truncates toward zero
  * (sign of the dividend), so correct the remainder when it is non-zero and the
- * operand signs differ. Modulo by zero is a fault (aborts with the same message
- * as floor division). */
+ * operand signs differ. Modulo by zero is a **catchable** built-in fault (EXC-3,
+ * D-0007) raised with the same message as floor division. */
 int64_t zap_imod(int64_t a, int64_t b) {
     if (b == 0) {
-        fprintf(stderr, "zap: integer division or modulo by zero\n");
-        abort();
+        zap_panic(zap_str_new("integer division or modulo by zero", 34));
     }
     int64_t r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) {
@@ -645,11 +650,6 @@ static void zap_list_push(ZapList *l, int64_t word) {
     }
     l->data[l->len++] = word;
 }
-
-/* Forward declaration: `zap_panic` (the `raise`/unwind entry point) is defined
- * further down with the exception glue, but the collection fault paths above it
- * route out-of-range faults through it (#383). */
-void zap_panic(void *exc);
 
 /* Normalize a (possibly negative) list index and bounds-check it, returning the
  * resolved non-negative index. Negative indices count from the end (`xs[-1]` is

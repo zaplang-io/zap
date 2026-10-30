@@ -1,0 +1,6 @@
+before
+caught
+member access on None
+cleanup
+3
+after

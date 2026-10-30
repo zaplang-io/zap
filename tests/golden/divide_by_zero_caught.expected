@@ -1,0 +1,6 @@
+before
+caught div
+integer division or modulo by zero
+cleanup
+caught mod
+after
