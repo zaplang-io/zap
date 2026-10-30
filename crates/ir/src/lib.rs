@@ -1286,6 +1286,51 @@ def main():
     }
 
     #[test]
+    fn lower_generator_method_captures_self() {
+        // A struct *method* generator (I#429) lowers to the same state machine as
+        // a free generator (I#67); `self` is captured into the state frame like
+        // any other parameter, and reads through it (`self.start`) persist across
+        // resumes. Keyed on the mangled `Seq__nums`, so `$gen:Seq__nums____*`.
+        let m = lower_ok(include_str!("../../../tests/golden/generator_method.zap"));
+        let text = format!("{m}");
+        // The method function itself is NOT emitted; its iterator methods are.
+        assert!(
+            !m.funcs.iter().any(|f| f.name == "Seq__nums"),
+            "method body is not emitted as a plain fn:\n{text}"
+        );
+        assert!(
+            m.funcs.iter().any(|f| f.name == "$gen:Seq__nums____iter__"),
+            "iter emitted:\n{text}"
+        );
+        let next = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "$gen:Seq__nums____next__")
+            .expect("__next__ emitted");
+        assert!(matches!(next.ret, Ty::Struct(_)), "ret: {:?}", next.ret);
+        // The state struct's layout captures `self` as its leading parameter
+        // field (field 0 is `$state`): `[$state:i64, self:Seq, n:i64, …locals]`.
+        let gen_sid = match next.params.first() {
+            Some(Ty::Struct(sid)) => *sid,
+            other => panic!("__next__ self param: {other:?}"),
+        };
+        let seq_sid = m
+            .structs
+            .iter()
+            .position(|s| s.name == "Seq")
+            .expect("Seq laid out") as u32;
+        assert_eq!(
+            m.structs[gen_sid as usize].fields.get(1),
+            Some(&Ty::Struct(seq_sid)),
+            "field 1 captures `self` (the Seq receiver):\n{text}"
+        );
+        // The call site `c.nums(5)` constructs the state struct (capturing the
+        // receiver + arg) rather than calling a `Seq__nums` function.
+        assert!(!text.contains("call @Seq__nums"), "text:\n{text}");
+        assert!(text.contains("$gen:Seq__nums____next__"), "text:\n{text}");
+    }
+
+    #[test]
     fn lower_user_iterable_commaok() {
         // `for x in Range(...)` desugars to `__iter__` then a loop over the
         // comma-ok `__next__`, binding each tuple's value field.
