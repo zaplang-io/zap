@@ -23,7 +23,9 @@ cat > "$CTX/Dockerfile" <<'DOCKER'
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ARG PROXY=http://127.0.0.1:43717
-ENV http_proxy=${PROXY} https_proxy=${PROXY} HTTP_PROXY=${PROXY} HTTPS_PROXY=${PROXY}
+# Only HTTPS goes through the proxy; apt (HTTP) resolves + fetches directly,
+# which is known-good here — proxying it risks breaking the big apt step.
+ENV https_proxy=${PROXY} HTTPS_PROXY=${PROXY}
 ENV no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1
 COPY ca-bundle.crt /usr/local/share/ca-certificates/agent-proxy-ca.crt
 COPY ca-bundle.crt /etc/ssl/agent-ca-bundle.crt
