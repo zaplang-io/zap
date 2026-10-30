@@ -4,6 +4,12 @@
    frozen; Experimental surfaces (arrays/SIMD, `set`, bitfields) are marked at
    their productions. Additions post-freeze are backward-compatible (MINOR).
 
+   This file is load-bearing (I#396): `crates/syntax/tests/grammar.rs` lints it
+   (every nonterminal defined, reachable from `module`, no dups, brackets
+   balanced) and runs an accept/reject conformance corpus against the real
+   hand-written parser. Edits here run in CI's host (no-LLVM) job, so keep the
+   grammar well-formed and in step with the parser.
+
    Notation:
      ::=        definition
      |          alternation
@@ -132,7 +138,7 @@ import_item   ::= dotted_name [ "as" IDENT ] ;
 type          ::= named_type
                 | tuple_type
                 | func_type ;
-named_type    ::= type_name [ "[" type { "," type } "]" ] ;
+named_type    ::= type_name [ type_args ] ;   (* `list[int64]`, `dict[str, V]` *)
 type_name     ::= IDENT { "." IDENT }         (* `Point`, or module-qualified
                                                  `mod.Type` (I#283/D-0081) *)
                 | TYPE_KEYWORD ;              (* int64, list, dict, array, ... *)
