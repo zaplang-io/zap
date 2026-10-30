@@ -1,0 +1,120 @@
+diff --git a/crates/codegen/src/zapgc.inc.c b/crates/codegen/src/zapgc.inc.c
+index 7a1d03b..e07e5b5 100644
+--- a/crates/codegen/src/zapgc.inc.c
++++ b/crates/codegen/src/zapgc.inc.c
+@@ -411,6 +411,17 @@ static void zap_flush_shadow(void) {
+          * (m->current == NULL), it holds no Zap roots — its last G's head was
+          * already saved by switch_to_g — so there is nothing to flush. */
+         if (m->current) {
++            /* #223 diag: flush writing a NULL head over a coroutine that had a
++             * real chain — would orphan its live frames. */
++            if (zap_shadow_head == NULL && m->current->dbg_ever_nonnull &&
++                getenv("ZAP_DBG_SAVE")) {
++                unsigned msk = m->current->dbg_m_mask;
++                int nm = __builtin_popcount(msk);
++                fprintf(stderr, "zap-gc FLUSH-NULL-LIVE: coro=%lld state=%d "
++                        "distinct_Ms=%d mask=0x%x\n",
++                        (long long)m->current->all_idx, (int)m->current->state,
++                        nm, msk);
++            }
+             m->current->shadow_head = zap_shadow_head;
+             m->current->shadow_valid = 1; /* #223 diag: flushed => valid snapshot */
+         }
+@@ -1644,6 +1655,26 @@ static void zap_verify_roots(void) {
+                     "len=%lld cap=%lld data=%p in_shadow_chain=%s\n",
+                     cand, (long long)g->all_idx, (int)g->state, (long long)lv->len,
+                     (long long)lv->cap, (void *)lv->data, in_chain ? "YES" : "NO");
++            /* #223: for a LARGE victim (keep, not per-iteration garbage), dump the
++             * coroutine's chain shape so we can tell a truncated/empty/stale chain
++             * from a complete chain that merely omits this slot. Also walk the
++             * per-thread head of whatever M currently points at this G (if any),
++             * to compare g->shadow_head (saved) against the live zap_shadow_head. */
++            if (lv->len >= 64) {
++                int64_t frames = 0, roots = 0; int found_deep = 0;
++                for (ZapShadowFrame *f = (ZapShadowFrame *)g->shadow_head; f; f = f->prev) {
++                    frames++; roots += f->nroots;
++                    for (int64_t r = 0; r < f->nroots; r++) {
++                        if (f->roots[r] == cand) { found_deep = 1; }
++                    }
++                    if (frames > 100000) { frames = -1; break; } /* runaway/corrupt */
++                }
++                fprintf(stderr,
++                        "zap-gc VERIFY-BIG: coro=%lld shadow_head=%p frames=%lld "
++                        "roots=%lld found_in_full_walk=%d\n",
++                        (long long)g->all_idx, g->shadow_head,
++                        (long long)frames, (long long)roots, found_deep);
++            }
+         }
+     }
+ }
+diff --git a/crates/codegen/src/zaprt.c b/crates/codegen/src/zaprt.c
+index 014bbe6..8bcca17 100644
+--- a/crates/codegen/src/zaprt.c
++++ b/crates/codegen/src/zaprt.c
+@@ -2173,6 +2173,8 @@ typedef struct G {
+     int lock_depth;     /* LockOSThread nesting count (lock/unlock balance)      */
+     volatile int dbg_running; /* #223 diag: 1 while running on an M (double-run check) */
+     volatile int shadow_valid; /* #223 diag: 1 iff g->shadow_head is a current root snapshot */
++    int dbg_ever_nonnull;     /* #223 diag: 1 once this G has had a non-NULL shadow head */
++    unsigned dbg_m_mask;      /* #223 diag: bitmask of M indices this G has run on */
+ } G;
+ 
+ typedef struct P {
+@@ -2507,11 +2509,28 @@ static void switch_to_g(M *m, G *g) {
+      * compiled code mutates; save it back when the G switches out (parks /
+      * yields / dies). A running G's head thus lives in zap_shadow_head and is
+      * flushed to g->shadow_head at a safepoint or here. */
++    { int mi = (int)(m - g_ms); if (mi >= 0 && mi < g_nm) g->dbg_m_mask |= (1u << mi); }
++    if (getenv("ZAP_DBG_SAVE") && g->shadow_head == NULL && g->dbg_ever_nonnull) {
++        fprintf(stderr, "zap-gc RESTORE-NULL-LIVE: coro=%lld (scheduled with NULL head)\n",
++                (long long)g->all_idx);
++    }
+     zap_shadow_head = g->shadow_head;
++    if (g->shadow_head != NULL) g->dbg_ever_nonnull = 1; /* #223: had a real chain */
+     g->shadow_valid = 0; /* #223 diag: g->shadow_head goes stale while g runs */
+ #endif
+     zap_ctx_swap(&m->sched_ctx, &g->ctx);
+ #ifdef ZAP_GC_IMMIX
++    if (zap_shadow_head != NULL) g->dbg_ever_nonnull = 1;
++    /* #223 diag: catch a coroutine that PREVIOUSLY had a real (non-NULL) shadow
++     * chain now being saved with a NULL head while still alive — that orphans all
++     * its live frames (incl. keep's). A fresh coroutine yielding before its first
++     * push legitimately saves NULL (dbg_ever_nonnull==0) and is harmless. */
++    if (getenv("ZAP_DBG_SAVE") && zap_shadow_head == NULL && g->state != G_DEAD &&
++        g->dbg_ever_nonnull) {
++        fprintf(stderr, "zap-gc SAVE-NULL-LIVE: coro=%lld state=%d "
++                "(G with prior chain saved NULL head)\n",
++                (long long)g->all_idx, (int)g->state);
++    }
+     g->shadow_head = zap_shadow_head;
+     g->shadow_valid = 1; /* #223 diag: saved at switch-out => valid snapshot */
+ #endif
+@@ -2666,6 +2685,8 @@ static G *galloc(void *fn, void *arg) {
+     g->in_live = 0;
+     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
+     g->dbg_running = 0;    /* #223 diag */
++    g->dbg_ever_nonnull = 0; /* #223 diag: reset for a reused pooled G */
++    g->dbg_m_mask = 0;     /* #223 diag */
+     g->shadow_valid = 1;   /* #223 diag: empty chain is a valid snapshot */
+     /* Cold end of a down-growing stack is its high address. */
+     g->sb.mem_base = (char *)g->stack + g->stack_size;
+@@ -3328,6 +3349,19 @@ static void copreempt(void) {
+      * user stack — it only switches away — and this can run in signal context
+      * (Boehm), where zap_panic would be unsafe. A genuinely near-full stack is
+      * still caught at the next cooperative cosched/copark in normal context. */
++#ifdef ZAP_GC_IMMIX
++    {
++        static int dbg = -1;
++        if (dbg < 0) dbg = getenv("ZAP_DBG_SAVE") ? 1 : 0;
++        if (dbg) {
++            static long n_copreempt = 0;
++            long n = __atomic_add_fetch(&n_copreempt, 1, __ATOMIC_RELAXED);
++            if (zap_shadow_head == NULL)
++                fprintf(stderr, "zap-gc COPREEMPT-NULLHEAD: coro=%lld ever=%d "
++                        "n=%ld\n", (long long)g->all_idx, g->dbg_ever_nonnull, n);
++        }
++    }
++#endif
+     g->state = G_RUNNABLE;
+     g->preempt_requeue = 1;
+     g->no_preempt = 0;

@@ -1133,11 +1133,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             // main thread have their own.
             let g = self.module.add_global(p, None, "zap_shadow_head");
             g.set_thread_local(true);
-            // REPL JIT (I#159): MCJIT cannot emit a correct dynamic-TLS access to
-            // a `__thread` global defined in the dlopen'd runtime, so in JIT mode
-            // the shadow-head slot address is fetched via this runtime helper
-            // (`void **zap_shadow_head_addr(void)`) instead of a direct TLS
-            // reference. Harmless to declare on the AOT path (never called there).
+            // The shadow-head slot address is always fetched via this runtime
+            // helper (`void **zap_shadow_head_addr(void)`), never by referencing
+            // the `__thread` global directly: compiled coroutine code may migrate
+            // OS threads at a safepoint, and a cached TLS base would then point at
+            // the previous M's slot (I#223). Required by the REPL JIT too (I#159:
+            // MCJIT cannot emit a dynamic-TLS access to the dlopen'd runtime's
+            // `__thread` global). See `gc_head`.
             self.declare_rt("zap_shadow_head_addr", &[], Some(p.into()));
         }
 
@@ -1352,28 +1354,34 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         Ok(())
     }
 
-    /// Address of the per-thread `zap_shadow_head` TLS slot. In REPL JIT mode
-    /// (I#159) this is obtained by calling the runtime helper
-    /// `zap_shadow_head_addr()`, since MCJIT cannot emit a correct dynamic-TLS
-    /// access to the `__thread` global in the dlopen'd runtime; the AOT path
-    /// references the TLS global directly as before.
+    /// Address of the per-thread `zap_shadow_head` TLS slot, always obtained by
+    /// calling the runtime helper `zap_shadow_head_addr()` so the thread-local
+    /// base is re-resolved on the CURRENT OS thread at every push/pop.
+    ///
+    /// A coroutine runs on an M:N green stack and may MIGRATE to a different OS
+    /// thread (M) at any safepoint/yield; the shadow head is thread-local (one
+    /// slot per M). Referencing the `zap_shadow_head` TLS global directly lets
+    /// LLVM materialize the thread-pointer base once and keep it in a
+    /// callee-saved register for the whole function. `swapcontext` preserves that
+    /// register across a migration, so after the coroutine resumes on another M
+    /// its push/pop still target the PREVIOUS M's slot — desyncing
+    /// `g->shadow_head` from the real frames and freeing live objects (I#223,
+    /// aarch64-only in practice: the x86 `%fs`-relative access is re-materialized
+    /// per use). Routing through the non-inlinable call forces re-resolution on
+    /// whichever M is current. (REPL JIT / I#159 already required this call,
+    /// because MCJIT cannot emit a dynamic-TLS access to the dlopen'd runtime's
+    /// `__thread` global; the AOT path now shares it for correctness under
+    /// migration.)
     #[cfg(feature = "gc-immix")]
     fn gc_head(&self) -> PointerValue<'ctx> {
-        if self.jit {
-            let f = self.fns["zap_shadow_head_addr"];
-            return self
-                .builder
-                .build_call(f, &[], "shadow_head_addr")
-                .expect("call zap_shadow_head_addr")
-                .try_as_basic_value()
-                .left()
-                .expect("zap_shadow_head_addr returns a pointer")
-                .into_pointer_value();
-        }
-        self.module
-            .get_global("zap_shadow_head")
-            .expect("zap_shadow_head declared")
-            .as_pointer_value()
+        let f = self.fns["zap_shadow_head_addr"];
+        self.builder
+            .build_call(f, &[], "shadow_head_addr")
+            .expect("call zap_shadow_head_addr")
+            .try_as_basic_value()
+            .left()
+            .expect("zap_shadow_head_addr returns a pointer")
+            .into_pointer_value()
     }
 
     /// Build and link this function's shadow frame in the entry block and
