@@ -2819,6 +2819,10 @@ impl Checker {
                     self.infer(part);
                 }
                 match b {
+                    // A `list[T]` slice is a `list[T]` copy (D-0030). An
+                    // `array[T]` slice is a view of the same type, but arrays are
+                    // typed loosely (ticket #24), so the base is already
+                    // `Unknown` and falls through below.
                     Ty::List(_) => b,
                     Ty::Str => Ty::Str,
                     // A `bytes` slice is `bytes` (byte-based, I#337).

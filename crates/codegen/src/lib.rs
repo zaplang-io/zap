@@ -812,6 +812,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_list_set_i64", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_list_set_ptr", &[p.into(), i.into(), p.into()], None);
         self.declare_rt("zap_list_len", &[p.into()], Some(i.into()));
+        // list slice `xs[lo:hi:step]` -> a NEW list (a copy, D-0030). Same bound
+        // triple + present-flags as the str/bytes slice; element-type-agnostic.
+        self.declare_rt(
+            "zap_list_slice",
+            &[
+                p.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+            ],
+            Some(p.into()),
+        );
         // list sort (ticket #336): `sorted()` copies first; `zap_list_sort_by`
         // sorts a list in place by a parallel key list (self for the no-key case).
         self.declare_rt("zap_list_copy", &[p.into()], Some(p.into()));
@@ -967,6 +982,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_new", &[i.into(), i.into()], Some(p.into()));
         self.declare_rt("zap_array_len", &[p.into()], Some(i.into()));
         self.declare_rt("zap_array_data", &[p.into()], Some(p.into()));
+        // array slice `a[lo:hi]` -> a VIEW sharing the buffer (D-0030, contiguous
+        // only). Bounds `(lo, hi)` + their present-flags; no step (strided views
+        // are a follow-up, so codegen rejects a non-unit step before here).
+        self.declare_rt(
+            "zap_array_slice",
+            &[p.into(), i.into(), i.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
         self.declare_rt("zap_array_get_f64", &[p.into(), i.into()], Some(f.into()));
         self.declare_rt("zap_array_set_f64", &[p.into(), i.into(), f.into()], None);
         self.declare_rt("zap_array_get_i64", &[p.into(), i.into()], Some(i.into()));

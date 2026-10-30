@@ -76,7 +76,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | OP-IN-1 | §5/§9 | `in` tests dict-key / substring membership | TODO | — |
 | OP-IN-2 | §5 | `x in <list>` tests list membership | covered | list_membership |
 | IDX-1 | §9.1 | negative index counts from the end for lists too | covered | list_negative_index |
-| SLICE-1 | §8 | list slice yields a copy; array slice a view (D-0030) | TODO | — (impl gap: list slicing unsupported, #375) |
+| SLICE-1 | §8 | list slice yields a copy; array slice a view (D-0030) | covered | list_slice |
 
 ## Dicts & Optional (§18, #281/#299/#299, D-0056)
 

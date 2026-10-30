@@ -9535,8 +9535,10 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// `s[lo:hi:step]` on a `str` → a new `str`, Python slice semantics by
-    /// codepoint (D-0025). List/array slicing remains a follow-up.
+    /// `s[lo:hi:step]` → a new value. `str` slices by codepoint (D-0025) and
+    /// `bytes` by byte (I#337), both producing a fresh value of the same type. A
+    /// `list[T]` slice is a **copy** and an `array[T]` slice is a **view**
+    /// (D-0030): the runtime distinguishes the two.
     fn lower_slice(
         &mut self,
         base: &Expr,
@@ -9545,18 +9547,66 @@ impl<'a> FnLower<'a> {
         step: Option<&Expr>,
     ) -> Result<(Value, Ty), LowerError> {
         let (bv, bty) = self.expr(base)?;
-        // `str` slices by codepoint (D-0025); `bytes` slices by byte (I#337).
-        // Both produce a new value of the same type via distinct runtime entry
-        // points.
-        let (func, out_ty) = match bty {
-            Ty::Ptr => ("zap_str_slice", Ty::Ptr),
-            Ty::Bytes => ("zap_bytes_slice", Ty::Bytes),
-            _ => {
-                return Err(err(
-                    "slicing is only supported on str and bytes values (list/array slicing is a follow-up)",
-                ))
+        match bty {
+            // `list[T]` slice -> a NEW list (a copy, D-0030). Element-type-
+            // agnostic: one runtime entry point copies the words and inherits
+            // the element kind, so the result is `list[T]` with the same `T`.
+            Ty::List(elem) => {
+                let (lo_v, has_lo) = self.slice_bound(lo)?;
+                let (hi_v, has_hi) = self.slice_bound(hi)?;
+                let (st_v, has_st) = self.slice_bound(step)?;
+                let out = Ty::List(elem);
+                let d = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_list_slice".to_string(),
+                    args: vec![bv, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+                });
+                Ok((d, out))
             }
-        };
+            // `array[T]` slice -> a VIEW sharing the buffer (D-0030). A view is
+            // contiguous, so only an absent or literal-`1` step is supported; a
+            // strided view would need strides the 1-D array has not got (a
+            // documented D-0030 follow-up).
+            Ty::Array(dt) => {
+                if let Some(s) = step {
+                    if const_int_value(s) != Some(1) {
+                        return Err(err(
+                            "a stepped array slice is not supported yet (an array slice is a \
+                             contiguous view and strided views are a D-0030 follow-up)",
+                        ));
+                    }
+                }
+                let (lo_v, has_lo) = self.slice_bound(lo)?;
+                let (hi_v, has_hi) = self.slice_bound(hi)?;
+                let out = Ty::Array(dt);
+                let d = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_array_slice".to_string(),
+                    args: vec![bv, lo_v, hi_v, has_lo, has_hi],
+                });
+                Ok((d, out))
+            }
+            Ty::Ptr => self.emit_seq_slice(bv, "zap_str_slice", Ty::Ptr, lo, hi, step),
+            Ty::Bytes => self.emit_seq_slice(bv, "zap_bytes_slice", Ty::Bytes, lo, hi, step),
+            _ => Err(err(
+                "slicing is only supported on str, bytes, list, and array values",
+            )),
+        }
+    }
+
+    /// Shared tail for the `str`/`bytes` slice path: emit a call to `func` with
+    /// the three Python slice bounds `(lo, hi, step)` and their present-flags.
+    fn emit_seq_slice(
+        &mut self,
+        bv: Value,
+        func: &str,
+        out_ty: Ty,
+        lo: Option<&Expr>,
+        hi: Option<&Expr>,
+        step: Option<&Expr>,
+    ) -> Result<(Value, Ty), LowerError> {
         let (lo_v, has_lo) = self.slice_bound(lo)?;
         let (hi_v, has_hi) = self.slice_bound(hi)?;
         let (st_v, has_st) = self.slice_bound(step)?;

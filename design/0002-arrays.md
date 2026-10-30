@@ -148,7 +148,15 @@ header + buffer layout, GC-managed buffer).
 
 - N-D shape and row-major multi-axis indexing (`m[i, j]`); `ndim` is always 1.
 - Broadcasting beyond a scalar (trailing-dim alignment, size-1 stretch).
-- Slicing / views (D-0030; likely copy-first then views).
+- **Strided** slice views (`a[::2]`, `a[::-1]`). A *contiguous* 1-D slice
+  (`a[lo:hi]`, `a[:]`, `a[lo:]`, `a[:hi]`) is now a view (#400, D-0030): the
+  slice header shares the parent buffer and carries an element `off`set + length
+  (see `ZapArray.off` in `zaprt.c`), so a write through either side aliases.
+  Pointing a view's `data` into the buffer's interior is unsafe — the precise
+  collector forwards `data` as an object start under evacuation — so `data` stays
+  at the base and `off` carries the window. A strided view would need per-axis
+  strides the 1-D `ZapArray` has not got, so a stepped array slice is rejected at
+  compile time for now (a list slice, a copy, supports any step).
 - `f32`/`i32` dtypes; `zeros`/`arange`/`sqrt` and axis reductions.
 - Shape-mismatch runtime exceptions on element-wise ops; element-wise ops
   currently assume equal lengths.
@@ -157,7 +165,8 @@ header + buffer layout, GC-managed buffer).
 
 ## Open issues
 
-- **Views vs copies** for slices (NumPy returns views; this interacts with GC
-  and aliasing — likely start with copies, add views later).
+- **Views vs copies** for slices: settled (D-0030, #400) — an array slice is a
+  view, a list slice is a copy. Contiguous array views ship now; strided views
+  (which need per-axis strides) remain deferred above.
 - Whether `@simd`/alignment hints on loops are exposed to users (later).
 - Integer-array overflow: follows D-0005 (wrap) unless a checked mode is added.
