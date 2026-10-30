@@ -465,10 +465,12 @@ define_codes! {
     ZAP5047 = 5047 : "decorator on wrong target",
         "This decorator does not apply to the kind of declaration it was placed \
          on.";
-    ZAP5060 = 5060 : "generator enum method not supported",
-        "Generators as enum methods are not supported yet (I#429 extended the \
-         struct-method case only); define the generator as a free function or a \
-         struct method.";
+    ZAP5060 = 5060 : "generator tier-1 enum method not supported",
+        "Generators on a tier-1 (unboxed-integer) enum method are not supported \
+         yet — tier-1 enum methods do not lower at all yet, generator or not. \
+         I#449 enabled generators on tier-3 data-carrying enum methods (I#429 \
+         did the struct-method case). Define the generator as a free function, a \
+         struct method, or a method on a data-carrying enum.";
     ZAP5061 = 5061 : "`main` cannot be a generator",
         "The entry point `main` must not contain `yield`.";
     ZAP5062 = 5062 : "generator must not declare a return type",

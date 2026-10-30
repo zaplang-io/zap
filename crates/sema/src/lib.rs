@@ -1776,13 +1776,15 @@ impl Checker {
             }
         }
         // Generator validation (I#67, D-0026/D-0048): a `def` whose body contains
-        // `yield` is a generator and returns an `Iterator`. Free functions and
-        // struct methods may be generators (I#429 extended the method case; see
-        // `register_generators`): `self` is captured into the state frame like
-        // any other parameter. A generator `main` is still rejected, as is an
-        // explicit return type (its return type is the synthetic iterator), and
-        // an *enum* method generator stays rejected while enum-method lowering is
-        // a documented follow-up (EnumDef).
+        // `yield` is a generator and returns an `Iterator`. Free functions,
+        // struct methods, and tier-3 (data-carrying) enum methods may be
+        // generators (I#429 extended the struct-method case; I#449 the enum one):
+        // `self` is captured into the state frame like any other parameter. A
+        // generator `main` is still rejected, as is an explicit return type (its
+        // return type is the synthetic iterator). A *tier-1* enum method
+        // generator stays rejected: tier-1 (unboxed-integer) enum methods do not
+        // lower at all yet, generator or not, so this is the broader tier-1
+        // method-lowering gap rather than anything generator-specific (EnumDef).
         let is_gen = genanalysis::is_generator(f);
         let saved_in_gen = std::mem::replace(&mut self.in_generator, is_gen);
         if is_gen {
@@ -1797,12 +1799,14 @@ impl Checker {
                     f.span,
                 );
             }
-            if self_ty.is_some_and(|n| self.enums.contains_key(n)) {
+            if self_ty.is_some_and(|n| self.enums.get(n).is_some_and(|e| !e.is_sum)) {
                 self.error(
                     ErrorCode::ZAP5060,
-                    "generators as enum methods are not supported yet (I#429 \
-                     extended the struct-method case only); define the generator \
-                     as a free function or a struct method"
+                    "generators on a tier-1 enum method are not supported yet \
+                     (tier-1 enum methods do not lower at all yet; I#449 enabled \
+                     generators on tier-3 data-carrying enum methods); define the \
+                     generator as a free function, a struct method, or a method \
+                     on a data-carrying enum"
                         .to_string(),
                     f.span,
                 );
@@ -4909,13 +4913,28 @@ def main():
     }
 
     #[test]
-    fn generator_enum_method_is_rejected() {
-        // Enum-method lowering is a documented follow-up (EnumDef), so a
-        // generator enum method is still rejected (I#429 covers structs only).
+    fn generator_tier1_enum_method_is_rejected() {
+        // A tier-1 (unboxed-integer) enum has no methods lowered yet (generator
+        // or not), so a generator on one is rejected up front (ZAP5060). This is
+        // the broader tier-1 method-lowering gap, not anything generator-specific.
         assert!(!errors(
             "enum E:\n    A\n    B\n    def nums(self):\n        yield 1\n\ndef main():\n    print(1)\n"
         )
         .is_empty());
+    }
+
+    #[test]
+    fn generator_tier3_enum_method_is_accepted() {
+        // A tier-3 (data-carrying) enum lowers to a tagged struct, so its methods
+        // dispatch through the struct-method path — a generator method on one is
+        // accepted and captures `self` into the state frame (I#449, like I#429).
+        ok(
+            "enum Box:\n    Hold(int64 start)\n    def nums(self, int64 n):\n        \
+             match self:\n            case Box.Hold(start):\n                auto i = 0\n                \
+             while i < n:\n                    yield start + i\n                    i = i + 1\n\n\
+             def main():\n    auto total = 0\n    for x in Box.Hold(10).nums(5):\n        \
+             total = total + x\n    print(total)\n",
+        );
     }
 
     #[test]

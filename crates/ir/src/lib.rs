@@ -1331,6 +1331,85 @@ def main():
     }
 
     #[test]
+    fn lower_generator_enum_method_captures_self() {
+        // An *enum* method generator (I#449) lowers through the exact same state
+        // machine as a struct method generator (I#429) / free generator (I#67);
+        // the only delta is that `self` is a tier-3 (tagged-struct) enum receiver.
+        // It is captured into the state frame like any other parameter, and the
+        // body reads its payload (`match self: case IntBox.Hold(start)`) across
+        // resumes. Keyed on the mangled `IntBox__nums`, so `$gen:IntBox__nums____*`.
+        let m = lower_ok(include_str!(
+            "../../../tests/golden/generator_enum_method.zap"
+        ));
+        let text = format!("{m}");
+        // The method function itself is NOT emitted; its iterator methods are.
+        assert!(
+            !m.funcs.iter().any(|f| f.name == "IntBox__nums"),
+            "method body is not emitted as a plain fn:\n{text}"
+        );
+        assert!(
+            m.funcs
+                .iter()
+                .any(|f| f.name == "$gen:IntBox__nums____iter__"),
+            "iter emitted:\n{text}"
+        );
+        let next = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "$gen:IntBox__nums____next__")
+            .expect("__next__ emitted");
+        assert!(matches!(next.ret, Ty::Struct(_)), "ret: {:?}", next.ret);
+        // The state struct's layout captures `self` as its leading parameter
+        // field (field 0 is `$state`): `[$state:i64, self:IntBox, n:i64, …locals]`.
+        let gen_sid = match next.params.first() {
+            Some(Ty::Struct(sid)) => *sid,
+            other => panic!("__next__ self param: {other:?}"),
+        };
+        let intbox_sid =
+            m.structs
+                .iter()
+                .position(|s| s.name == "IntBox")
+                .expect("IntBox laid out (tier-3 enum -> tagged struct)") as u32;
+        assert_eq!(
+            m.structs[gen_sid as usize].fields.get(1),
+            Some(&Ty::Struct(intbox_sid)),
+            "field 1 captures `self` (the IntBox enum receiver):\n{text}"
+        );
+        // The call site `c.nums(5)` constructs the state struct (capturing the
+        // receiver + arg) rather than calling an `IntBox__nums` function.
+        assert!(!text.contains("call @IntBox__nums"), "text:\n{text}");
+        assert!(
+            text.contains("$gen:IntBox__nums____next__"),
+            "text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lower_generator_enum_method_discriminant_dependent() {
+        // A generator method whose control flow depends on the enum discriminant
+        // (I#449): `match self` yields a different count per variant. Proves the
+        // captured receiver carries both tag and payload across resumes, and that
+        // `yield` inside match arms lowers. Two variants -> one state machine.
+        let m = lower_ok(include_str!(
+            "../../../tests/golden/generator_enum_method_variant.zap"
+        ));
+        let text = format!("{m}");
+        assert!(
+            !m.funcs.iter().any(|f| f.name == "Steps__items"),
+            "method body is not emitted as a plain fn:\n{text}"
+        );
+        assert!(
+            m.funcs
+                .iter()
+                .any(|f| f.name == "$gen:Steps__items____next__"),
+            "__next__ emitted:\n{text}"
+        );
+        // Both `counted.items()` and `paired.items()` construct the state struct
+        // rather than calling a `Steps__items` function.
+        assert!(!text.contains("call @Steps__items"), "text:\n{text}");
+    }
+
+    #[test]
     fn lower_user_iterable_commaok() {
         // `for x in Range(...)` desugars to `__iter__` then a loop over the
         // comma-ok `__next__`, binding each tuple's value field.
