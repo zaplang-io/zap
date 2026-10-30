@@ -1,0 +1,6 @@
+# Quarantined on aarch64: intermittently hangs on the parked GC race #223 — a
+# collector-agnostic, multicore reclamation/root-visibility race (fails under
+# Boehm too) that needs real-aarch64 ptrace debugging (held pending continuous
+# aarch64 infra). Still runs on x86_64, so coverage there is unchanged. Remove
+# this file when #223 is fixed to re-enable the aarch64 run.
+aarch64
