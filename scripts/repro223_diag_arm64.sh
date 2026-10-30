@@ -69,7 +69,7 @@ docker run --rm --platform linux/arm64 --network=host -m 8g \
   -w /work -e CARGO_TARGET_DIR=/work/target-arm64 \
   zap-dev-arm64 \
   bash -c '
-    set -eux
+    set -ux    # NOT -e: amp_evac is EXPECTED to crash (that is the repro)
     echo "GUEST arch: $(uname -m)"
     cargo build -p zapc --features zapc/llvm,zapc/gc-immix 2>&1 | tail -25
     ZAPC=$(find /work/target-arm64 -name zapc -type f -path "*/debug/*" | head -1)
@@ -82,7 +82,7 @@ docker run --rm --platform linux/arm64 --network=host -m 8g \
       local label="$1"; shift
       local n="${N:-20}" p="${P:-4}" ok=0 wrong=0 crash=0 out rc
       for i in $(seq 1 "$n"); do
-        out=$(env "$@" MAXPROCS="$p" timeout -s KILL 40 "$BIN" 2>/dev/null); rc=$?
+        out=$(env "$@" MAXPROCS="$p" timeout -s KILL 40 "$BIN" 2>/dev/null) || true; rc=$?
         if [ "$rc" = 137 ] || [ "$rc" = 139 ] || [ "$rc" = 134 ] || [ "$rc" = 124 ]; then crash=$((crash+1));
         elif [ "$out" != "$EXP" ]; then wrong=$((wrong+1)); else ok=$((ok+1)); fi
       done
