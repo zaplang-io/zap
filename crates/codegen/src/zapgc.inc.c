@@ -297,12 +297,23 @@ void *zap_main_shadow_head = NULL;
 /* Per-thread "currently active" shadow head, maintained by compiled code. */
 __thread void *zap_shadow_head = NULL;
 
-/* The address of this thread's `zap_shadow_head` slot. The REPL JIT (I#159)
- * calls this from JIT'd code instead of taking a direct dynamic-TLS reference,
- * which MCJIT cannot resolve correctly for a `__thread` global in a dlopen'd
- * library. AOT code keeps referencing the TLS global directly (never calls
- * this). */
-void **zap_shadow_head_addr(void) { return &zap_shadow_head; }
+/* The address of this thread's `zap_shadow_head` slot, resolved on the CURRENT
+ * OS thread. ALL compiled code (AOT and the REPL JIT, I#159) reaches the shadow
+ * head through this call rather than a direct `__thread` reference.
+ *
+ * Correctness (I#223): a coroutine runs on an M:N green stack and may migrate to
+ * a different OS thread (M) at any safepoint/yield. If compiled code cached the
+ * thread-local base (as LLVM does for a direct TLS reference — once per function,
+ * in a callee-saved register), `swapcontext` would carry that base to the new M,
+ * so the coroutine's shadow push/pop would keep hitting the PREVIOUS M's slot and
+ * the collector would see a stale/empty `g->shadow_head` and free live objects.
+ * `noinline` keeps this an opaque call the compiler cannot fold into a cached
+ * base, forcing the thread pointer to be re-read on the current M at each use.
+ * (The REPL JIT also needs it: MCJIT cannot emit a dynamic-TLS access to a
+ * `__thread` global in the dlopen'd runtime.) */
+__attribute__((noinline)) void **zap_shadow_head_addr(void) {
+    return &zap_shadow_head;
+}
 
 /* A shadow-stack frame, emitted by codegen in each function that holds live GC
  * pointers. Layout MUST match the codegen emission in lib.rs. */
