@@ -42,9 +42,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         libxml2-dev libncurses-dev mold \
     && rm -rf /var/lib/apt/lists/*
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.99.1 --profile minimal
+# The egress policy blocks sh.rustup.rs (403) but allows static.rust-lang.org,
+# where the rustup-init binary and all toolchains live — install from there.
+RUN curl --proto '=https' --tlsv1.2 -sSf \
+        https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-gnu/rustup-init \
+        -o /tmp/rustup-init \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --default-toolchain 1.99.1 --profile minimal \
+    && rm -f /tmp/rustup-init
 ENV PATH="/root/.cargo/bin:${PATH}"
+ENV RUSTUP_DIST_SERVER=https://static.rust-lang.org \
+    RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
 RUN rustc --version && cargo --version
 ENV LLVM_SYS_180_PREFIX=/usr/lib/llvm-18 LLVM_SYS_181_PREFIX=/usr/lib/llvm-18
 WORKDIR /work
