@@ -114,7 +114,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | FN-1 | §7 | default arguments are evaluated per call (divergence) | covered | function_default_per_call |
 | FN-2 | §7 | any parameter may be passed by name | covered | function_keyword_defaults |
 | FN-3 | §7 | positional args precede keyword args; defaults may be omitted | covered | function_keyword_defaults |
-| FN-4 | §7 | a variadic `TYPE... name` is received as a list | TODO | — (impl gap: a variadic param is not yet iterable/indexable in codegen) |
+| FN-4 | §7 | a variadic `TYPE... name` is received as a list | covered | function_variadics |
 | FN-5 | §7 | lambda expressions | TODO | — |
 | FN-6 | §7 | first-class function values + closures (D-0067) | TODO | — |
 | GENR-1 | §7 | generators via `yield` follow the iteration protocol | TODO | — |
