@@ -1434,9 +1434,24 @@ fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
             return Ty::Struct(sid);
         }
     }
-    p.ty.as_ref()
-        .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Ptr))
-        .unwrap_or(Ty::Ptr)
+    let base =
+        p.ty.as_ref()
+            .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Ptr))
+            .unwrap_or(Ty::Ptr);
+    // A `TYPE... name` variadic parameter is "received as a `list`" (SPEC §7,
+    // D-0038): the callee iterates / indexes / `len`s it like any other list,
+    // and the caller packs its trailing arguments into that list (see the
+    // variadic branch of `call`). This matches how sema types the body binding.
+    // A float/void element has no list representation yet, so such a variadic
+    // degrades to its base type (already unsupported by the collection runtime).
+    if p.variadic {
+        match elem_kind(base) {
+            Ok(elem) => Ty::List(elem),
+            Err(_) => base,
+        }
+    } else {
+        base
+    }
 }
 
 fn err(m: impl Into<String>) -> LowerError {
@@ -7748,6 +7763,51 @@ impl<'a> FnLower<'a> {
                         };
                         argvals.push(v);
                     }
+                } else if let Some(vi) = ctx
+                    .call_params
+                    .get(fname)
+                    .and_then(|pinfo| pinfo.iter().position(|p| p.variadic))
+                {
+                    // A variadic function (D-0038): the fixed parameters before
+                    // the variadic are lowered positionally, then the remaining
+                    // arguments are packed into a fresh `list` of the variadic's
+                    // element type — "received as a `list`" (SPEC §7). A bare
+                    // `f()` with no trailing arguments passes an empty list.
+                    for (i, a) in args.iter().take(vi).enumerate() {
+                        let v = match ptys.get(i) {
+                            Some(&target) => {
+                                let v = self.expr_coerced(&a.value, target)?;
+                                self.copy_for_pass(v, target, &a.value)
+                            }
+                            None => {
+                                let (v, vt) = self.expr(&a.value)?;
+                                self.copy_for_pass(v, vt, &a.value)
+                            }
+                        };
+                        argvals.push(v);
+                    }
+                    let elem = match ptys.get(vi) {
+                        Some(&Ty::List(e)) => e,
+                        _ => Elem::I64,
+                    };
+                    let list = self.new_value(Ty::List(elem));
+                    self.emit(Inst::Call {
+                        dest: Some(list),
+                        func: "zap_list_new".to_string(),
+                        args: vec![],
+                    });
+                    let push = format!("zap_list_push_{}", elem.val_suffix());
+                    for a in args.iter().skip(vi) {
+                        let (v, vt) = self.expr(&a.value)?;
+                        let v = self.coerce(v, vt, elem.ty());
+                        let v = self.box_if_value(v, elem.ty());
+                        self.emit(Inst::Call {
+                            dest: None,
+                            func: push.clone(),
+                            args: vec![list, v],
+                        });
+                    }
+                    argvals.push(list);
                 } else {
                     for (i, a) in args.iter().enumerate() {
                         let v = match ptys.get(i) {
