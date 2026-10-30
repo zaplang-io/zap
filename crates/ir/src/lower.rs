@@ -3980,6 +3980,38 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Guard a member access against a `None` receiver (EXC-4, D-0007/D-0014):
+    /// if `recv` (a reference value) is the null pointer, raise a catchable
+    /// exception through `zap_panic` — an `invoke` inside a `try`, so `except`
+    /// catches it, exactly like the index/divide faults (#383/EXC-3). On the
+    /// non-null path execution falls through to the access. Callers apply this
+    /// only to genuinely nullable reference receivers (not value structs).
+    fn null_guard(&mut self, recv: Value, msg: &str) {
+        let is_none = self.new_value(Ty::I1);
+        self.emit(Inst::IsNull {
+            dest: is_none,
+            val: recv,
+        });
+        let throw_bb = self.new_block();
+        let cont_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: is_none,
+            then_bb: throw_bb,
+            else_bb: cont_bb,
+        });
+        self.position(throw_bb);
+        let m = self.new_value(Ty::Ptr);
+        self.emit(Inst::StrConst {
+            dest: m,
+            bytes: msg.as_bytes().to_vec(),
+        });
+        self.throwing_call(None, "zap_panic", vec![m]);
+        if !self.terminated() {
+            self.set_term(Term::Unreachable);
+        }
+        self.position(cont_bb);
+    }
+
     // --- builder primitives ---
 
     fn new_value(&mut self, ty: Ty) -> Value {
@@ -7031,6 +7063,13 @@ impl<'a> FnLower<'a> {
                     .ctx
                     .field(sid, name)
                     .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
+                // Member access on `None` throws (EXC-4, D-0007/D-0014): a
+                // reference struct receiver may be the null pointer, so guard the
+                // read with a catchable null check. Value structs are inline, not
+                // nullable, so they need no guard (and `IsNull` would be wrong).
+                if !self.ctx.is_value_struct(sid) {
+                    self.null_guard(bv, "member access on None");
+                }
                 let d = self.new_value(fty);
                 self.emit(Inst::FieldGet {
                     dest: d,
@@ -8223,6 +8262,26 @@ impl<'a> FnLower<'a> {
         if let (Expr::Lambda { params, body, .. }, Ty::Func(idx)) = (e, target) {
             let (v, _) = self.lower_lambda(params, body, idx)?;
             return Ok(v);
+        }
+        // `None` bound to a reference-typed slot (D-0014): the null pointer. Mono
+        // has already rewritten `None` for an `Optional`-shaped enum target into
+        // `Optional.None`, so an `Expr::None` reaching here always targets a plain
+        // reference type (a struct instance, `str`, or a collection), whose null
+        // value IS the null pointer. Member access on it then throws (D-0007,
+        // EXC-4), enforced by the null-guard at the access site. Value structs
+        // are not nullable (D-0014), so `None` is rejected for them.
+        if matches!(e, Expr::None(_)) && target.is_ptr() {
+            if let Ty::Struct(sid) = target {
+                if self.ctx.is_value_struct(sid) {
+                    return Err(err(
+                        "None cannot be assigned to a value struct (value types are \
+                         not nullable, D-0014)",
+                    ));
+                }
+            }
+            let d = self.new_value(target);
+            self.emit(Inst::NullConst { dest: d });
+            return Ok(d);
         }
         let (v, vt) = self.expr(e)?;
         Ok(self.coerce(v, vt, target))
@@ -11116,11 +11175,11 @@ impl<'a> FnLower<'a> {
                     let li = self.coerce(l, lt, Ty::I64);
                     let ri = self.coerce(r, rt, Ty::I64);
                     let d = self.new_value(Ty::I64);
-                    self.emit(Inst::Call {
-                        dest: Some(d),
-                        func: "zap_imod".to_string(),
-                        args: vec![li, ri],
-                    });
+                    // Modulo by zero is a catchable built-in fault (EXC-3,
+                    // D-0007): `zap_imod` raises through `zap_panic`, so this is
+                    // a `throwing_call` (an `invoke` inside a `try`) rather than
+                    // a plain `call`, which could not reach the landing pad.
+                    self.throwing_call(Some(d), "zap_imod", vec![li, ri]);
                     Ok((d, Ty::I64))
                 }
             }
@@ -11143,11 +11202,11 @@ impl<'a> FnLower<'a> {
                     let li = self.coerce(l, lt, Ty::I64);
                     let ri = self.coerce(r, rt, Ty::I64);
                     let d = self.new_value(Ty::I64);
-                    self.emit(Inst::Call {
-                        dest: Some(d),
-                        func: "zap_ifloordiv".to_string(),
-                        args: vec![li, ri],
-                    });
+                    // Divide by zero is a catchable built-in fault (EXC-3,
+                    // D-0007): `zap_ifloordiv` raises through `zap_panic`, so
+                    // this is a `throwing_call` (an `invoke` inside a `try`)
+                    // rather than a plain `call` that could not reach the pad.
+                    self.throwing_call(Some(d), "zap_ifloordiv", vec![li, ri]);
                     Ok((d, Ty::I64))
                 }
             }

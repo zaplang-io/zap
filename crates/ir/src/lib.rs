@@ -497,6 +497,86 @@ mod tests {
     }
 
     #[test]
+    fn lower_divide_by_zero_catchable() {
+        // EXC-3: integer `//` and `%` inside a `try` lower to an `invoke` of the
+        // runtime helper (which raises via `zap_panic` on a zero divisor), so the
+        // divide-by-zero fault unwinds to the handler and is caught like a
+        // `raise` — not a process abort.
+        let m = lower_ok(
+            "def main():\n    \
+                 int64 z = 0\n    \
+                 try:\n        \
+                     auto q = 1 // z\n        \
+                     auto r = 1 % z\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("invoke @zap_ifloordiv") && text.contains("unwind"),
+            "`//` in `try` must be an invoke, text:\n{text}"
+        );
+        assert!(
+            text.contains("invoke @zap_imod"),
+            "`%` in `try` must be an invoke, text:\n{text}"
+        );
+        assert!(text.contains("landingpad"), "text:\n{text}");
+
+        // Without an explicit `try`, `main`'s implicit top-level handler still
+        // makes the divide an `invoke`, so an uncaught fault reaches
+        // `zap_uncaught` rather than unwinding past the frame.
+        let m = lower_ok(
+            "def main():\n    \
+                 int64 z = 0\n    \
+                 print(1 // z)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("invoke @zap_ifloordiv"), "text:\n{text}");
+        assert!(text.contains("call @zap_uncaught"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_none_member_access_catchable() {
+        // EXC-4: `None` bound to a reference struct lowers to a null pointer, and
+        // a field read guards the receiver with a null check that raises via
+        // `zap_panic` through an `invoke` to the handler — so member access on
+        // `None` inside a `try` is caught like a `raise` (D-0007/D-0014).
+        let m = lower_ok(
+            "struct Point:\n    \
+                 int64 x\n\
+             def main():\n    \
+                 Point p = None\n    \
+                 try:\n        \
+                     auto v = p.x\n    \
+                 except Exception as e:\n        \
+                     print(\"caught\")\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("nullconst"),
+            "`None` must lower to a null pointer, text:\n{text}"
+        );
+        assert!(
+            text.contains("isnull") && text.contains("invoke @zap_panic"),
+            "field read on a reference struct must null-guard via invoke, text:\n{text}"
+        );
+        assert!(text.contains("landingpad"), "text:\n{text}");
+
+        // Without an explicit `try`, the guard's `zap_panic` still routes to the
+        // implicit top-level handler (`zap_uncaught`) in `main`.
+        let m = lower_ok(
+            "struct Point:\n    \
+                 int64 x\n\
+             def main():\n    \
+                 Point p = None\n    \
+                 print(p.x)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("invoke @zap_panic"), "text:\n{text}");
+        assert!(text.contains("call @zap_uncaught"), "text:\n{text}");
+    }
+
+    #[test]
     fn lower_arrays() {
         // Construction, element access, len, and sum lower to the array runtime
         // entry points; element-wise ops lower to the dedicated ArrayBinOp node.
@@ -580,7 +660,10 @@ mod tests {
                                                           // Power and floor-division lower to runtime helpers.
         assert!(text.contains("call @zap_ipow"), "text:\n{text}");
         assert!(text.contains("call @zap_powf"), "text:\n{text}");
-        assert!(text.contains("call @zap_ifloordiv"), "text:\n{text}");
+        // Integer `//` is a catchable divide-by-zero fault (EXC-3), so in `main`
+        // (which has the implicit top-level handler) it is an `invoke`; the float
+        // helper never faults (IEEE semantics), so it stays a plain `call`.
+        assert!(text.contains("invoke @zap_ifloordiv"), "text:\n{text}");
         assert!(text.contains("call @zap_ffloordiv"), "text:\n{text}");
     }
 
@@ -599,7 +682,9 @@ mod tests {
         // floor-correcting runtime helper (D-0024).
         let m = lower_ok("def main():\n    print(7 // 2)\n");
         let text = format!("{m}");
-        assert!(text.contains("call @zap_ifloordiv"), "text:\n{text}");
+        // In `main` the integer helper is an `invoke` (EXC-3: divide-by-zero is a
+        // catchable fault reaching the implicit top-level handler).
+        assert!(text.contains("invoke @zap_ifloordiv"), "text:\n{text}");
         assert!(!text.contains("= Div "), "no raw div for int //:\n{text}");
         let m = lower_ok("def main():\n    print(7.0 // 2.0)\n");
         assert!(format!("{m}").contains("call @zap_ffloordiv"));

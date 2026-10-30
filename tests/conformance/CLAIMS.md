@@ -93,8 +93,8 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 |---|---|---|---|---|
 | EXC-1 | §10 | a built-in fault (index-out-of-range) is catchable by `except` (#383) | covered | exception_builtin_fault |
 | EXC-2 | §10 | `finally` runs during unwinding; execution continues after | covered | exception_builtin_fault |
-| EXC-3 | §10 | divide-by-zero is a catchable built-in fault | TODO | — (impl: confirm routed through unwinder) |
-| EXC-4 | §10 | member access on `None` throws (D-0007) | TODO | — |
+| EXC-3 | §10 | divide-by-zero is a catchable built-in fault | covered | exception_divide_by_zero |
+| EXC-4 | §10 | member access on `None` throws (D-0007) | covered | exception_none_access |
 | EXC-5 | §10 | a `raise`d user exception is caught by a matching `except` | TODO | — |
 | EXC-6 | §10 | an uncaught exception unwinds and exits non-zero | TODO | — |
 
