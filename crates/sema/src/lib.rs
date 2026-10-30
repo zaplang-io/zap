@@ -4104,6 +4104,28 @@ impl Checker {
                 let (k, v) = (k.clone(), v.clone());
                 return self.check_dict_method(name, args, &k, &v, *span);
             }
+            // A method call on a user struct `recv.method(args)` is typed by the
+            // method's declared return type (D-0009). The struct's method table
+            // already carries the resolved signature, with `self`/`Self` bound to
+            // the receiver's type (`sig_of_method`) and a generator method rewritten
+            // to its synthetic iterator (I#429), so the return type is read straight
+            // off it. Resolving it here — rather than falling back to `Unknown` —
+            // lets a method-chain result drive operator overloading: the fluent
+            // `Key("pk").eq(x) & Attr("age").gt(y)` condition builders (operators
+            // #52) now dispatch `&`/`|`/`~` on the struct instead of collapsing to
+            // the built-in int64 bitwise rule. Args stay inferred but otherwise
+            // unconstrained, matching the loose arity behavior other receiver paths
+            // rely on. An unknown method keeps the former loose `Unknown` fallback.
+            if let Some(ret) = self
+                .struct_info(&bt)
+                .and_then(|i| i.methods.get(name))
+                .map(|sig| sig.ret.clone())
+            {
+                for a in args {
+                    self.infer(&a.value);
+                }
+                return ret;
+            }
             for a in args {
                 self.infer(&a.value);
             }
@@ -5491,6 +5513,52 @@ def main():
         );
         assert_eq!(e.len(), 1, "got {e:?}");
         assert!(e[0].message.contains("__add__"), "{e:?}");
+    }
+
+    #[test]
+    fn user_struct_method_return_type_is_resolved() {
+        // A user-struct method call `recv.method(args)` is typed by the method's
+        // declared return type (D-0009), not the former loose `Unknown`. The
+        // result is assignable to a binding of that declared type.
+        ok("struct Box:\n    int64 n\n\n    \
+            def make(self, int64 v) -> Box:\n        return Box(n=v)\n\n\
+            def main():\n    Box b = Box(n=1).make(2)\n    print(b.n)\n");
+        // Crucially the result is the *concrete* struct type, not `Unknown`:
+        // assigning it to an incompatible declared type is a real error. An
+        // `Unknown` result would have silently passed (Unknown is assignable to
+        // anything), so this is what distinguishes the fix from the old behavior.
+        let e = errors(
+            "struct Box:\n    int64 n\n\n    \
+             def make(self, int64 v) -> Box:\n        return Box(n=v)\n\n\
+             def main():\n    int64 bad = Box(n=1).make(2)\n    print(bad)\n",
+        );
+        assert!(
+            !e.is_empty(),
+            "method result should be typed Box, not Unknown: {e:?}"
+        );
+    }
+
+    #[test]
+    fn method_chain_result_drives_operator_overloading() {
+        // The gap this fixes (D-0009): a method returning its own struct, chained
+        // into an overloaded operator, must dispatch that operator on the struct.
+        // Before the fix the method result was typed `Unknown`, so `Unknown &
+        // Unknown` (and `~Unknown`) collapsed to the built-in bitwise `int64` rule
+        // and the hand-written `__and__` / `__or__` / `__invert__` never ran —
+        // exactly what blocked the fluent `Key("pk").eq(x) & Attr("age").gt(y)`
+        // condition builders (operators #52) the generated AWS SDK emits. The
+        // `Cond` bindings below pin each operator result to `Cond`; were any result
+        // `int64`, the assignment would be a type error.
+        ok("struct Cond:\n    int64 tag\n\n    \
+            def __and__(self, Cond other) -> Cond:\n        return Cond(tag=self.tag)\n\n    \
+            def __or__(self, Cond other) -> Cond:\n        return Cond(tag=self.tag)\n\n    \
+            def __invert__(self) -> Cond:\n        return Cond(tag=self.tag)\n\n    \
+            def eq(self, int64 v) -> Cond:\n        return Cond(tag=v)\n\n\
+            def main():\n    \
+            Cond both = Cond(tag=0).eq(1) & Cond(tag=0).eq(2)\n    \
+            Cond either = Cond(tag=0).eq(1) | Cond(tag=0).eq(2)\n    \
+            Cond neg = ~Cond(tag=0).eq(3)\n    \
+            print(both.tag + either.tag + neg.tag)\n");
     }
 
     #[test]
