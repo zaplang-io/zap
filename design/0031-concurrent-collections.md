@@ -25,10 +25,18 @@ a recipe for stale pointers and use-after-collect.
 
 The analysis (§4) resolves that interaction and reaches a clean split:
 
-- **Non-pointer collections** (a counter, and a queue/stack of `int64` or opaque
-  handle payloads) touch the GC not at all.
-  They are correct on every platform today, including aarch64-Linux, and depend
-  on nothing but `Atomic[T]`'s existing `seq_cst` guarantee.
+- **Non-pointer collections.** A `Counter` touches the GC not at all and is
+  correct on every platform. A **non-pointer _queue/stack_** (`int64`/handle
+  payload) stores no pointer in its mutable slots, but — unlike the counter — it
+  still allocates a GC-managed **node per element**, and those nodes' liveness
+  depends on the collector's root scan. **Correction (2026-10-30, empirical):**
+  this does **not** make the queue aarch64-safe. I#223 turns out to be a
+  **collector-agnostic reclamation / root-visibility race**, not an
+  evacuation-only bug — the `concurrent_queue_mpsc_coro_stress` golden
+  (`int64` payload) SIGSEGVs on aarch64 under the **non-moving Boehm** collector
+  too. So the non-pointer queue/stack **also inherits I#223** on aarch64 and is
+  **not trustworthy there until I#223 is fixed** (see §4.5/§4.6, as amended).
+  Only the counter (no per-element node) is unconditionally correct.
 - **Pointer-holding collections** *are* safe under the moving collector —
   **but only** because three runtime properties already hold (evacuation is
   stop-the-world, mutators reload pointers load-at-use, and reclamation is
@@ -266,9 +274,16 @@ and the `Counter` store **no pointers in their mutable slots** (the queue's
 *nodes* are still heap objects, but a node of a non-pointer queue has a
 pointer-free payload and only its `next` link is a reference — a link that is an
 ordinary traced slot, updated by the moving trace like any other).
-These instantiations therefore have **no novel GC interaction at all**, need no
-new runtime guarantee, and are correct on every platform including
-aarch64-Linux.
+These instantiations need no new runtime guarantee for *payload tracing*.
+**Correction (2026-10-30):** the original claim that they are therefore "correct
+on every platform including aarch64-Linux" was wrong. The queue's per-element
+nodes are GC-managed heap objects whose *liveness* still rides the collector's
+root scan, and I#223 is a collector-agnostic reclamation/root-visibility race
+(it reclaims a still-live node; it fails under the non-moving Boehm collector,
+not just under evacuation — see §4.6 as amended). So a non-pointer *queue/stack*
+inherits I#223 on aarch64 exactly like the reference-payload variant; only the
+node-free `Counter` is unconditionally correct. This is proven by the
+`concurrent_queue_mpsc_coro_stress` golden (`int64`) SIGSEGV-ing on aarch64.
 This is the ticket's design-question-1 escape hatch ("store only non-pointer
 payloads"), and its cost is exactly the obvious one: the caller indirects through
 an integer handle / index into a side table instead of holding the object
@@ -288,15 +303,21 @@ Two distinct ordering stories, which must not be conflated:
   **the first cut pins itself to `seq_cst`** and does not opt into relaxed order.
 - **The collector's own ordering** is a *separate* concern and is where the one
   real platform caveat lives. **I#223** is an open, intermittent **aarch64-Linux**
-  failure in the moving collector's evacuation path (a suspected missing
-  acquire/release around forwarding-pointer installs / to-space writes exposed by
-  aarch64's weaker model; x86-TSO hides it). It is independent of `Atomic[T]` and
-  independent of these collections — but any **pointer-holding** concurrent
-  collection depends on the moving collector relocating pointer graphs correctly,
-  so it **inherits** I#223 and is **not trustworthy on aarch64-Linux until I#223
-  is fixed**.
-  Non-pointer collections (§4.5) do not depend on evacuation of pointer graphs
-  and are unaffected.
+  collector bug. **Correction (2026-10-30, after investigation):** it was first
+  framed here as a moving-collector *evacuation* bug (a suspected missing
+  acquire/release), but it is actually a **collector-agnostic reclamation /
+  root-visibility race** — a still-live heap object is reclaimed under true
+  multicore on aarch64. It reproduces under the **non-moving, conservative Boehm**
+  collector as well as precise Immix, needs ≥2 scheduler threads, and is NOT a
+  C-runtime data race that ThreadSanitizer can see (see I#223 and
+  `tests/repro223/RESUME.md`). It is independent of `Atomic[T]`, but any concurrent
+  collection that **allocates GC-managed nodes** depends on the collector keeping
+  those nodes alive, so it **inherits** I#223 and is **not trustworthy on
+  aarch64-Linux until I#223 is fixed**.
+  This applies to **both** reference-payload collections (which also need pointer
+  graphs relocated correctly) **and** non-pointer *queues/stacks* (§4.5): their
+  per-element nodes are GC-managed, so they inherit I#223 too. The only variant
+  genuinely unaffected is the node-free `Counter`.
   This mirrors the D-0076 platform matrix, which already lists aarch64-Linux as
   *Experimental — known issue (I#223)*.
 
@@ -305,7 +326,7 @@ Two distinct ordering stories, which must not be conflated:
 | Variant | GC interaction | Reclamation | aarch64 today |
 |---|---|---|---|
 | `Counter` | none | n/a | fine |
-| `Queue[int64]` / `Queue[Handle]`, `Stack[int64]` | node links only (ordinary traced slots) | GC | fine |
+| `Queue[int64]` / `Queue[Handle]`, `Stack[int64]` | GC-managed nodes (node liveness via root scan) | GC (lean-on) | **blocked on I#223** (node reclamation; see §4.5/§4.6) |
 | `Queue[T]` / `Stack[T]` (reference payload) | payload slots traced + forwarded | GC (lean-on, §4.3) | **blocked on I#223** |
 
 No pinning, no hazard pointers, no epochs, and no new write/read barrier are
@@ -410,9 +431,15 @@ reference slots; defer the map to a sharded-mutex design.
 > and tracing reclaims only the unreachable (§4).
 > The binding invariant is that **every stored pointer lives in a genuine
 > reference slot** (no packed/tagged/integer-cast pointers).
-> Non-pointer instantiations are correct on all platforms; reference-payload
-> instantiations inherit the open aarch64 evacuation race **I#223** and are gated
-> on its fix for that platform.
+> The `Counter` is correct on all platforms. **Correction (2026-10-30):** the
+> original decision said "non-pointer instantiations are correct on all
+> platforms" — that is wrong for the *queue/stack*. Every node-allocating
+> collection (both non-pointer `Queue[int64]`/`Stack[int64]` and reference-payload
+> variants) inherits the open aarch64 **I#223** race — now understood to be a
+> **collector-agnostic reclamation / root-visibility** race (it reclaims a
+> still-live node; reproduces under non-moving Boehm too), not an
+> evacuation-only bug — and is **gated on I#223's fix** on aarch64-Linux.
+> Only the node-free `Counter` is exempt.
 > No new language syntax; concurrency is expressed in the type name.
 
 ### The load-bearing calls I want the maintainer to rule on

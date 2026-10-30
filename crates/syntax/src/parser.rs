@@ -693,11 +693,14 @@ struct QNode[T]:
 # lock-free queue has no consistent snapshot, so exposing either would be a
 # Python-faithful lie (D-0078). Construct with new_queue[T]().
 #
-# For a NON-pointer payload (int64, an opaque handle) the queue touches the GC
-# only through its node links and is correct on every platform. For a REFERENCE
-# payload it additionally relies on the moving collector relocating pointer
-# graphs correctly, so it inherits the open aarch64 evacuation race (I#223) and
-# is trustworthy on that platform only once I#223 is fixed (D-0078 4.6).
+# The queue allocates a GC-managed node per element whatever the payload type, so
+# node liveness rides the collector's root scan. On aarch64-Linux it therefore
+# inherits the open I#223 race (a collector-agnostic reclamation/root-visibility
+# bug that reclaims a still-live node under true multicore; it fails under the
+# non-moving Boehm collector too, not just under moving evacuation) and is NOT
+# trustworthy on that platform until I#223 is fixed — this holds for BOTH
+# non-pointer (int64/handle) and reference payloads (D-0078 §4.5/§4.6, amended
+# 2026-10-30). Only the node-free concurrent.Counter is exempt.
 struct Queue[T]:
     Atomic[QNode[T]] _head   # consumer end: the stub / last-consumed node
     Atomic[QNode[T]] _tail   # producer end: the most recently pushed node
