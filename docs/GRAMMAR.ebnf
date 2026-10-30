@@ -301,8 +301,10 @@ expr          ::= lambda | yield_expr | ternary ;
 lambda        ::= "lambda" [ IDENT { "," IDENT } ] ":" expr ;   (* D-0026 *)
 yield_expr    ::= "yield" [ expr ] ;   (* generator suspend; a `def` whose body
                      contains `yield` is a generator returning an Iterator
-                     (I#67, D-0026/D-0048). v1 requires an operand and only
-                     supports `yield` in statement position. *)
+                     (I#67, D-0026/D-0048). A free function or a struct method
+                     may be a generator — a method captures `self` into the state
+                     frame (I#429). v1 requires an operand and only supports
+                     `yield` in statement position. *)
 ternary       ::= or_test [ "if" or_test "else" expr ] ;
 
 or_test       ::= and_test { "or" and_test } ;

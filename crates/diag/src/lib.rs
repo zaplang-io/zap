@@ -465,9 +465,10 @@ define_codes! {
     ZAP5047 = 5047 : "decorator on wrong target",
         "This decorator does not apply to the kind of declaration it was placed \
          on.";
-    ZAP5060 = 5060 : "generator method not supported",
-        "Generators as methods are not supported yet (I#67 v1); define the \
-         generator as a free function.";
+    ZAP5060 = 5060 : "generator enum method not supported",
+        "Generators as enum methods are not supported yet (I#429 extended the \
+         struct-method case only); define the generator as a free function or a \
+         struct method.";
     ZAP5061 = 5061 : "`main` cannot be a generator",
         "The entry point `main` must not contain `yield`.";
     ZAP5062 = 5062 : "generator must not declare a return type",

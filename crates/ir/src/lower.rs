@@ -572,6 +572,20 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 if s.is_value {
                     value_ids.insert(sid);
                 }
+                // A struct method generator (I#429): same synthetic state struct
+                // as a free generator, keyed on the mangled `Struct__method` so
+                // it is unique across types. `self` becomes one of its captured
+                // fields. Its layout is filled once the signatures are known.
+                for m in &s.methods {
+                    if zapc_syntax::genanalysis::is_generator(m) {
+                        let name = zapc_syntax::genanalysis::gen_state_name(&format!(
+                            "{}__{}",
+                            s.name, m.name
+                        ));
+                        ids.insert(name.clone(), names.len() as u32);
+                        names.push(name);
+                    }
+                }
             }
             // A data-carrying enum needs a struct id reserved up front so its
             // own (possibly recursive) variant fields resolve to a pointer.
@@ -916,12 +930,20 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                         .iter()
                         .map(|p| param_ty(p, Some(sid), &ctx))
                         .collect();
-                    let ret = m
-                        .ret
-                        .as_ref()
-                        .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
-                        .unwrap_or(Ty::Void);
-                    sigs.insert(format!("{}__{}", s.name, m.name), (params, ret));
+                    let mangled = format!("{}__{}", s.name, m.name);
+                    // A generator method (I#429): calling it returns its synthetic
+                    // iterator state struct (like a free generator, I#67), not the
+                    // declared/`void` type — its body is compiled into the state
+                    // struct's `__next__`, not a function named `Struct__method`.
+                    let ret = if zapc_syntax::genanalysis::is_generator(m) {
+                        Ty::Struct(ctx.ids[&zapc_syntax::genanalysis::gen_state_name(&mangled)])
+                    } else {
+                        m.ret
+                            .as_ref()
+                            .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
+                            .unwrap_or(Ty::Void)
+                    };
+                    sigs.insert(mangled, (params, ret));
                 }
             }
             // Tier-3 enum methods (D-0046; used by generic `Optional[T]` etc.,
@@ -981,30 +1003,51 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         }
     }
 
-    // Generators (I#67): discover each generator's live locals + element type,
-    // lay out its state struct, and register the synthetic `__iter__`/`__next__`
-    // signatures — all before body lowering, so a `for x in gen()` and the
-    // emitted methods resolve through the ordinary struct/method machinery.
-    let mut gen_map: HashMap<String, GeneratorInfo> = HashMap::new();
+    // Generators (I#67, I#429): discover each generator's live locals + element
+    // type, lay out its state struct, and register the synthetic
+    // `__iter__`/`__next__` signatures — all before body lowering, so a
+    // `for x in gen()` / `for x in obj.gen()` and the emitted methods resolve
+    // through the ordinary struct/method machinery.
+    //
+    // A generator's **callable key** in `sigs` is a free generator's own name or
+    // a struct method generator's mangled `Struct__method` (I#429); the key is
+    // also the base of the synthetic state-struct name (`$gen:<key>`). The two
+    // cases share all the layout/registration logic below, keyed only on this
+    // string and the generator's AST `&Function` (its `self`, when present, is
+    // simply the leading captured parameter).
+    let mut gen_funcs: Vec<(String, &ast::Function)> = Vec::new();
     for item in &module.items {
-        let ast::Item::Function(f) = item else {
-            continue;
-        };
-        if !(zapc_syntax::genanalysis::is_generator(f) && f.name != "main") {
-            continue;
+        match item {
+            ast::Item::Function(f)
+                if zapc_syntax::genanalysis::is_generator(f) && f.name != "main" =>
+            {
+                gen_funcs.push((f.name.clone(), f));
+            }
+            ast::Item::Struct(s) => {
+                for m in &s.methods {
+                    if zapc_syntax::genanalysis::is_generator(m) {
+                        gen_funcs.push((format!("{}__{}", s.name, m.name), m));
+                    }
+                }
+            }
+            _ => {}
         }
-        let (locals, elem) = match discover_generator(f, &sigs, &ctx) {
+    }
+    let mut gen_map: HashMap<String, GeneratorInfo> = HashMap::new();
+    for (key, f) in gen_funcs {
+        let (locals, elem) = match discover_generator(f, &key, &sigs, &ctx) {
             Ok(v) => v,
             Err(e) => {
                 errors.push(e);
                 continue;
             }
         };
-        let sname = zapc_syntax::genanalysis::gen_state_name(&f.name);
+        let sname = zapc_syntax::genanalysis::gen_state_name(&key);
         let sid = ctx.ids[&sname];
-        // State-struct vars: the parameters (captured at construction) then the
-        // discovered body locals; field index is `1 + position` (`$state` is 0).
-        let param_tys = sigs[&f.name].0.clone();
+        // State-struct vars: the parameters (captured at construction; `self` is
+        // simply the leading one for a method generator) then the discovered body
+        // locals; field index is `1 + position` (`$state` is 0).
+        let param_tys = sigs[&key].0.clone();
         let mut vars: Vec<(String, Ty)> = f
             .params
             .iter()
@@ -1029,9 +1072,9 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             (vec![Ty::Struct(sid)], Ty::Struct(next_tuple_sid)),
         );
         gen_map.insert(
-            f.name.clone(),
+            key.clone(),
             GeneratorInfo {
-                name: f.name.clone(),
+                name: key,
                 sid,
                 elem,
                 next_tuple_sid,
@@ -1090,6 +1133,19 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 }
                 for m in &s.methods {
                     let name = format!("{}__{}", s.name, m.name);
+                    // A generator method (I#429) is lowered to its state struct's
+                    // `__iter__`/`__next__`, not to a function named
+                    // `Struct__method` — exactly like a free generator (I#67). Its
+                    // captured `self` is the leading state-struct field.
+                    if let Some(gi) = ctx.generators.get(&name) {
+                        let gi = gi.clone();
+                        out.funcs.push(lower_generator_iter(&gi, &sigs, &ctx));
+                        match lower_generator_next(m, &gi, &sigs, &ctx) {
+                            Ok(func) => out.funcs.push(func),
+                            Err(e) => errors.push(e),
+                        }
+                        continue;
+                    }
                     match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[]) {
                         Ok(func) => out.funcs.push(func),
                         Err(e) => errors.push(e),
@@ -3587,12 +3643,15 @@ fn lower_fn(
 /// leading state-struct fields).
 fn discover_generator(
     f: &ast::Function,
+    key: &str,
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &StructCtx,
 ) -> Result<(Vec<(String, Ty)>, Ty), LowerError> {
-    let (params, _ret) = sigs.get(&f.name).cloned().unwrap();
+    // `key` is the generator's callable name in `sigs`: a free generator's own
+    // name, or a method generator's mangled `Struct__method` (I#429).
+    let (params, _ret) = sigs.get(key).cloned().unwrap();
     let mut b = FnLower::new(
-        f.name.clone(),
+        key.to_string(),
         params.clone(),
         Ty::Void,
         false,
@@ -7946,6 +8005,15 @@ impl<'a> FnLower<'a> {
                 return self.lower_iface_call(recv, iid, name, args);
             }
             let mangled = format!("{}__{}", self.ctx.names[sid as usize], name);
+            // A generator method call `obj.gen(args)` (I#429) constructs the
+            // compiler-generated state struct — capturing the receiver in `self`'s
+            // field and the arguments in the remaining parameter fields, starting
+            // at `$state == 0` — rather than calling a function; the body was
+            // compiled into the state struct's `__next__` (like a free generator,
+            // I#67).
+            if let Some(gi) = self.ctx.generators.get(&mangled).cloned() {
+                return self.construct_generator_method(&gi, recv, args);
+            }
             let (ptys, ret) = self
                 .sigs
                 .get(&mangled)
@@ -8424,6 +8492,69 @@ impl<'a> FnLower<'a> {
             let v = self.coerce(v, vt, pty);
             // Capturing a value-struct argument copies it (D-0051), like any
             // by-value parameter pass.
+            let v = self.copy_for_pass(v, pty, &a.value);
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: gen_var_field(p),
+                val: v,
+            });
+        }
+        Ok((dest, Ty::Struct(sid)))
+    }
+
+    /// Construct a **generator method**'s state struct (I#429) for a call
+    /// `obj.gen(args)`. Identical to [`Self::construct_generator`] except the
+    /// receiver `recv` (already lowered) is captured into the leading `self`
+    /// field; the explicit `args` fill the remaining parameter fields. `self` is
+    /// thus just another captured value in the generator frame.
+    fn construct_generator_method(
+        &mut self,
+        gi: &GeneratorInfo,
+        recv: Value,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        // Param 0 is `self`; the remaining `n_params - 1` are the user arguments.
+        let want = gi.n_params - 1;
+        if args.len() != want {
+            return Err(err(format!(
+                "generator method '{}' expects {} argument(s), got {}",
+                gi.name,
+                want,
+                args.len()
+            )));
+        }
+        let sid = gi.sid;
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        // Capture `self` (the receiver) into field 0 of the parameter block. The
+        // receiver is captured as-is — passed by reference like any method `self`
+        // (D-0051), so iteration reads the live receiver.
+        self.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: gen_var_field(0),
+            val: recv,
+        });
+        // Capture the explicit arguments into params `1..n_params` (positional or
+        // by keyword, matching the free-generator constructor).
+        for (i, a) in args.iter().enumerate() {
+            let p = match &a.name {
+                Some(kw) => gi.vars[1..gi.n_params]
+                    .iter()
+                    .position(|(n, _)| n == kw)
+                    .map(|j| j + 1)
+                    .ok_or_else(|| {
+                        err(format!(
+                            "generator method '{}' has no parameter '{kw}'",
+                            gi.name
+                        ))
+                    })?,
+                None => i + 1,
+            };
+            let pty = gi.vars[p].1;
+            let (v, vt) = self.expr(&a.value)?;
+            let v = self.coerce(v, vt, pty);
             let v = self.copy_for_pass(v, pty, &a.value);
             self.emit(Inst::FieldSet {
                 base: dest,

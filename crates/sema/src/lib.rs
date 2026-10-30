@@ -1055,61 +1055,95 @@ impl Checker {
         self.register_generators(module);
     }
 
-    /// Register the compiler-synthesized iterator type for every free-function
-    /// generator (I#67, D-0026/D-0048), so a call `gen(...)` types as an
-    /// `Iterator` and drops into `for`/comprehensions through the #53 protocol.
+    /// Register the compiler-synthesized iterator type for every generator
+    /// (I#67, D-0026/D-0048), so a call `gen(...)` — or a generator method call
+    /// `obj.gen(...)` (I#429) — types as an `Iterator` and drops into
+    /// `for`/comprehensions through the #53 protocol.
     ///
     /// The synthetic type `$gen:<name>` is given the two structural `Iterator`
     /// dunders — `__iter__(self) -> Self` and comma-ok `__next__(self) ->
-    /// (T, bool)` — and the generator function's return type is rewritten to it.
+    /// (T, bool)` — and the generator's return type is rewritten to it. For a
+    /// method the synthetic name is keyed on the mangled `Struct__method` so it
+    /// cannot collide across types; `self` is simply a captured parameter of the
+    /// generator (handled by lowering), not part of this consuming-side typing.
     /// The element type `T` is left permissive (`Unknown`) here: it is not
     /// needed to type-check the consuming side (any numeric op against it stays
     /// permissive), and the precise element type is computed by lowering from
     /// the `yield` operand types for codegen (`crates/ir`).
     fn register_generators(&mut self, module: &Module) {
         for item in &module.items {
-            let Item::Function(f) = item else { continue };
-            if !genanalysis::is_generator(f) {
-                continue;
-            }
-            // `main` and methods-with-`yield` are rejected in `check_function`;
-            // do not give them an iterator type.
-            if f.name == "main" {
-                continue;
-            }
-            let gen_name = genanalysis::gen_state_name(&f.name);
-            let self_param = |ty: Ty| ParamInfo {
-                name: "self".to_string(),
-                ty,
-                has_default: false,
-                variadic: false,
-            };
-            let mut methods = HashMap::new();
-            methods.insert(
-                "__iter__".to_string(),
-                FnSig {
-                    params: vec![self_param(Ty::Named(gen_name.clone()))],
-                    ret: Ty::Named(gen_name.clone()),
-                },
-            );
-            methods.insert(
-                "__next__".to_string(),
-                FnSig {
-                    params: vec![self_param(Ty::Named(gen_name.clone()))],
-                    ret: Ty::Tuple(vec![Ty::Unknown, Ty::Bool]),
-                },
-            );
-            self.structs.insert(
-                gen_name.clone(),
-                StructInfo {
-                    methods,
-                    is_value: false,
-                },
-            );
-            if let Some(sig) = self.sigs.get_mut(&f.name) {
-                sig.ret = Ty::Named(gen_name);
+            match item {
+                Item::Function(f) => {
+                    if !genanalysis::is_generator(f) {
+                        continue;
+                    }
+                    // A free `main` is rejected in `check_function`; do not give
+                    // it an iterator type.
+                    if f.name == "main" {
+                        continue;
+                    }
+                    let gen_name = genanalysis::gen_state_name(&f.name);
+                    self.register_generator_iter_type(&gen_name);
+                    if let Some(sig) = self.sigs.get_mut(&f.name) {
+                        sig.ret = Ty::Named(gen_name);
+                    }
+                }
+                // Struct method generators (I#429): a `self`-bearing method whose
+                // body `yield`s is a generator too (this is the paginator shape
+                // the generated AWS clients emit). Key its synthetic type on the
+                // mangled `Struct__method` so it cannot collide across types, and
+                // rewrite the method entry in the struct's method table so a call
+                // `obj.gen(...)` types as the iterator.
+                Item::Struct(StructDef { name, methods, .. }) => {
+                    for m in methods {
+                        if !genanalysis::is_generator(m) {
+                            continue;
+                        }
+                        let gen_name = genanalysis::gen_state_name(&format!("{name}__{}", m.name));
+                        self.register_generator_iter_type(&gen_name);
+                        if let Some(info) = self.structs.get_mut(name) {
+                            if let Some(sig) = info.methods.get_mut(&m.name) {
+                                sig.ret = Ty::Named(gen_name);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
+    }
+
+    /// Insert the synthetic iterator `StructInfo` for a generator's state type
+    /// `gen_name` (`$gen:…`): the two structural `Iterator` dunders over `self`.
+    fn register_generator_iter_type(&mut self, gen_name: &str) {
+        let self_param = |ty: Ty| ParamInfo {
+            name: "self".to_string(),
+            ty,
+            has_default: false,
+            variadic: false,
+        };
+        let mut methods = HashMap::new();
+        methods.insert(
+            "__iter__".to_string(),
+            FnSig {
+                params: vec![self_param(Ty::Named(gen_name.to_string()))],
+                ret: Ty::Named(gen_name.to_string()),
+            },
+        );
+        methods.insert(
+            "__next__".to_string(),
+            FnSig {
+                params: vec![self_param(Ty::Named(gen_name.to_string()))],
+                ret: Ty::Tuple(vec![Ty::Unknown, Ty::Bool]),
+            },
+        );
+        self.structs.insert(
+            gen_name.to_string(),
+            StructInfo {
+                methods,
+                is_value: false,
+            },
+        );
     }
 
     fn sig_of(&self, f: &Function) -> FnSig {
@@ -1741,26 +1775,34 @@ impl Checker {
                 }
             }
         }
-        // Generator validation (I#67, D-0026/D-0048): a free `def` whose body
-        // contains `yield` is a generator and returns an `Iterator`. v1 does not
-        // support generator methods, a generator `main`, or an explicit return
-        // type on a generator (its return type is the synthetic iterator).
+        // Generator validation (I#67, D-0026/D-0048): a `def` whose body contains
+        // `yield` is a generator and returns an `Iterator`. Free functions and
+        // struct methods may be generators (I#429 extended the method case; see
+        // `register_generators`): `self` is captured into the state frame like
+        // any other parameter. A generator `main` is still rejected, as is an
+        // explicit return type (its return type is the synthetic iterator), and
+        // an *enum* method generator stays rejected while enum-method lowering is
+        // a documented follow-up (EnumDef).
         let is_gen = genanalysis::is_generator(f);
         let saved_in_gen = std::mem::replace(&mut self.in_generator, is_gen);
         if is_gen {
-            if self_ty.is_some() {
-                self.error(
-                    ErrorCode::ZAP5060,
-                    "generators as methods are not supported yet (I#67 v1); define \
-                     the generator as a free function"
-                        .to_string(),
-                    f.span,
-                );
-            } else if f.name == "main" {
+            // Only a *free* `main` is the entry point; a method named `main` is
+            // not and may be a generator.
+            if self_ty.is_none() && f.name == "main" {
                 self.error(
                     ErrorCode::ZAP5061,
                     "the entry point 'main' cannot be a generator (it contains \
                      'yield', I#67)"
+                        .to_string(),
+                    f.span,
+                );
+            }
+            if self_ty.is_some_and(|n| self.enums.contains_key(n)) {
+                self.error(
+                    ErrorCode::ZAP5060,
+                    "generators as enum methods are not supported yet (I#429 \
+                     extended the struct-method case only); define the generator \
+                     as a free function or a struct method"
                         .to_string(),
                     f.span,
                 );
@@ -4819,6 +4861,39 @@ def main():
     #[test]
     fn generator_main_is_rejected() {
         assert!(!errors("def main():\n    yield 1\n").is_empty());
+    }
+
+    #[test]
+    fn generator_method_is_accepted() {
+        // A `self`-bearing method whose body `yield`s is a generator (I#429):
+        // calling it is an Iterator (captured `self.start` persists across
+        // resumes), so it drops into a `for` loop through the D-0048 protocol.
+        ok(
+            "struct Seq:\n    int64 start\n    def nums(self, int64 n):\n        auto i = 0\n        \
+             while i < n:\n            yield self.start + i\n            i = i + 1\n\ndef main():\n    \
+             auto total = 0\n    for x in Seq(start=10).nums(5):\n        total = total + x\n    \
+             print(total)\n",
+        );
+    }
+
+    #[test]
+    fn generator_method_with_declared_return_type_is_rejected() {
+        // A generator (method or free) must not declare a return type: its type
+        // is the synthetic iterator (I#67, D-0048).
+        assert!(!errors(
+            "struct Seq:\n    def nums(self) -> int64:\n        yield 1\n\ndef main():\n    print(1)\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn generator_enum_method_is_rejected() {
+        // Enum-method lowering is a documented follow-up (EnumDef), so a
+        // generator enum method is still rejected (I#429 covers structs only).
+        assert!(!errors(
+            "enum E:\n    A\n    B\n    def nums(self):\n        yield 1\n\ndef main():\n    print(1)\n"
+        )
+        .is_empty());
     }
 
     #[test]
