@@ -183,7 +183,7 @@ impl<'t> Loader<'t> {
             self.detect_cycles();
         }
         if self.diags.is_empty() {
-            self.check_declaration_only();
+            self.check_toplevel_statements();
         }
         if !self.diags.is_empty() {
             return None;
@@ -352,29 +352,44 @@ impl<'t> Loader<'t> {
         }
     }
 
-    /// Non-entry modules are declaration-only (D-0081): a top-level executable
-    /// statement is an error.
-    fn check_declaration_only(&mut self) {
+    /// Top-level executable statements are rejected in every module (D-0081,
+    /// ticket #459). A compiled Zap program runs from `def main()`; a bare
+    /// statement at module scope never lowers to code (the IR carries no
+    /// top-level landing spot for one — it is silently dropped), so it is an
+    /// error rather than a no-op, in the entry module (ZAP3016) and imported
+    /// modules alike (ZAP3014, which also keeps them declaration-only). The one
+    /// exception is a **module docstring** (D-0041): a bare, non-f-string string
+    /// literal carries no behaviour, so it is allowed at module scope.
+    fn check_toplevel_statements(&mut self) {
         let mut found = Vec::new();
         for m in &self.modules {
-            if m.is_entry {
-                continue;
-            }
             for item in &m.ast.items {
                 if let Item::Stmt(st) = item {
-                    found.push((stmt_span(st), m.file.clone()));
+                    if is_doc_stmt(st) {
+                        continue;
+                    }
+                    let code = if m.is_entry {
+                        ErrorCode::ZAP3016
+                    } else {
+                        ErrorCode::ZAP3014
+                    };
+                    found.push((code, stmt_span(st), m.file.clone()));
                 }
             }
         }
-        for (span, file) in found {
-            self.diag(
-                ErrorCode::ZAP3014,
+        for (code, span, file) in found {
+            let message = if code == ErrorCode::ZAP3016 {
+                "top-level executable statement: a compiled program runs from \
+                 `def main()`, so this would never run — move it (and any \
+                 `@receiver.method(...)` decorator on a `def`) into `def main()`"
+                    .to_string()
+            } else {
                 "top-level statements are not allowed in an imported module \
-                 (only the entry module runs top-level code)"
-                    .to_string(),
-                span,
-                &file,
-            );
+                 (only declarations and a leading docstring); move executable \
+                 code into a function the importer calls"
+                    .to_string()
+            };
+            self.diag(code, message, span, &file);
         }
     }
 
@@ -538,7 +553,16 @@ fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// The source span of a statement (for the declaration-only diagnostic).
+/// A module docstring (D-0041): a bare, non-f-string string-literal statement.
+/// Such a statement carries no runtime behaviour (it never lowers to code), so
+/// it is allowed at module scope where an executable statement is not. An
+/// f-string is *not* a docstring — its interpolations are executable — so it is
+/// not exempted here.
+fn is_doc_stmt(st: &Stmt) -> bool {
+    matches!(st, Stmt::Expr(Expr::Str { fstring: false, .. }))
+}
+
+/// The source span of a statement (for the top-level-statement diagnostic).
 fn stmt_span(st: &Stmt) -> Span {
     match st {
         Stmt::Let { span, .. }

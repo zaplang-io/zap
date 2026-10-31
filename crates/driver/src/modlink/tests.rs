@@ -176,6 +176,77 @@ fn top_level_statement_in_imported_module_is_rejected() {
 }
 
 #[test]
+fn top_level_binding_before_decorated_def_is_diagnosed_not_ice() {
+    // The exact ticket #459 repro: a module-level binding before a decorated
+    // `def`. This used to hit `unreachable!("entry statements handled via merge
+    // list")` in the rewrite. It must now be a clean diagnostic (ZAP3016), not
+    // a panic: a compiled program runs from `def main()`, so the top-level
+    // `auto app = App(0)` would never run.
+    let p = Project::new("entrystmt_ice");
+    p.write(
+        "src/main.zap",
+        "auto app = App(0)\n@app.get(\"/x\")\ndef h() -> int64:\n    return 0\n",
+    );
+    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    assert!(
+        err.iter().any(|d| d.code == ErrorCode::ZAP3016),
+        "expected ZAP3016, got {err:?}"
+    );
+}
+
+#[test]
+fn top_level_executable_statement_in_entry_is_rejected() {
+    // A bare executable statement at entry-module scope (no decorator involved)
+    // is rejected the same way — it would silently never run otherwise.
+    let p = Project::new("entrystmt_plain");
+    p.write("src/main.zap", "print(1)\n");
+    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3016));
+}
+
+#[test]
+fn top_level_statement_between_defs_in_entry_is_rejected() {
+    // Interleaving places too: a statement sandwiched between two `def`s.
+    let p = Project::new("entrystmt_between");
+    p.write(
+        "src/main.zap",
+        "def a() -> int64:\n    return 1\nauto x = 2\ndef main() -> int64:\n    return a()\n",
+    );
+    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3016));
+}
+
+#[test]
+fn module_docstring_is_allowed_in_entry() {
+    // A leading bare-string module docstring (D-0041) carries no behaviour, so
+    // it is allowed at module scope even though an executable statement is not.
+    let p = Project::new("entry_doc");
+    p.write(
+        "src/main.zap",
+        "\"\"\"My entry module.\"\"\"\ndef main() -> int64:\n    return 0\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+}
+
+#[test]
+fn module_docstring_is_allowed_in_imported_module() {
+    // The docstring exemption applies to imported modules too: a declaration-
+    // only module may still carry a leading docstring.
+    let p = Project::new("imported_doc");
+    p.write(
+        "src/a.zap",
+        "\"\"\"Module a.\"\"\"\ndef helper() -> int64:\n    return 1\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import a\n\ndef main():\n    print(a.helper())\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).iter().any(|n| n.contains("helper")));
+}
+
+#[test]
 fn local_shadowing_an_import_is_not_treated_as_module_access() {
     // A local variable named like the import: `a.foo` is a value attr, not a
     // module access, so nothing is rewritten and no privacy error fires.
