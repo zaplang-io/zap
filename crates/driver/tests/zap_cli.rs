@@ -443,7 +443,7 @@ fn test_runs_a_project_green() {
          @test\n@parametrize(cases=[(1, 2, 3), (10, 20, 30)])\n\
          def test_param(int64 a, int64 b, int64 want):\n    assert a + b == want\n\n\
          @test\n@skip(\"not ready\")\ndef test_skipped():\n    assert False\n\n\
-         @test\n@expect_raises(ValueError)\ndef test_raises():\n    raise \"boom\"\n",
+         @test\n@expect_raises(ValueError)\ndef test_raises():\n    raise ValueError(\"boom\")\n",
     );
 
     let out = zap().arg("test").current_dir(&dir).output().unwrap();

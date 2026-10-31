@@ -310,10 +310,11 @@ scheduler/runtime.
 The first exceptions increment (#22) lands `raise`, `try`/`except`/`finally`,
 and propagation to an aborting top-level handler on the platform Itanium
 unwinder (libstdc++ personality `__gxx_personality_v0`, linked with `-lstdc++`;
-the `_Unwind_*` unwinder comes from libgcc). The in-flight exception object is
-currently the message string; the typed exception hierarchy (D-0029),
-type-directed `except` matching, built-in faults (div-by-zero,
-index-out-of-range, `None` access), and stack traces are follow-ups.
+the `_Unwind_*` unwinder comes from libgcc). Typed exceptions use the runtime
+object `{ type_id, message }`, and the runtime's parent table implements the
+built-in hierarchy from SPEC §10. Built-in divide-by-zero and index faults use
+`ZeroDivisionError` and `IndexError`; other unclassified runtime faults and
+`raise "message"` use `Exception`.
 
 The Phase 1 slice calls libc `printf` directly; those calls migrate behind
 `zap_print_*` as the runtime grows.
@@ -408,9 +409,10 @@ with a Zap **personality function**:
 - `try` bodies install **landing pads**; `except` clauses match on the
   exception's type descriptor; `finally` and `with` cleanup run via cleanup
   landing pads during unwind.
-- The **exception object** is a heap object: `[ header | type | message | payload ]`,
-  GC-managed. Unwinding must preserve GC roots; conservative Boehm scanning of
-  the (still-live) stack handles this in v1.
+- The **exception object** is a GC-managed heap object containing a stable type
+  id and a message pointer. Its precise descriptor traces the message; a
+  registered runtime root keeps the in-flight value live while it is boxed in
+  the C++ unwinder's allocation.
 - An uncaught exception unwinds to the top frame and aborts with a stack trace.
 
 ### REPL JIT entry points (I#159, design/0025-repl.md)

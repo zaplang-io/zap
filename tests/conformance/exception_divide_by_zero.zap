@@ -10,11 +10,11 @@ def main():
         print("body")
         auto q = 1 // z
         print(q)
-    except Exception as e:
+    except ArithmeticError as e:
         print("caught div")
     try:
         auto r = 1 % z
         print(r)
-    except Exception as e:
+    except ArithmeticError as e:
         print("caught mod")
     print("after")

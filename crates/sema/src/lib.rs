@@ -264,6 +264,19 @@ const BUILTINS: &[&str] = &[
     "reflect_param_annotations",
     "reflect_sig",
     "checkpoint",
+    "BaseException",
+    "Exception",
+    "ValueError",
+    "TypeError",
+    "LookupError",
+    "IndexError",
+    "KeyError",
+    "ArithmeticError",
+    "ZeroDivisionError",
+    "RuntimeError",
+    "StopIteration",
+    "Cancelled",
+    "ExceptionGroup",
     // REPL session-binding slot intrinsics (I#159): synthesized by the `zap repl`
     // driver to persist `let` values across entries, never written by users.
     "__repl_load_i64",
@@ -290,6 +303,25 @@ const BUILTINS: &[&str] = &[
     // stand-in finalizer and returns the number that ran. Not public surface.
     "__gc_finalizer_selftest",
 ];
+
+fn is_exception_type(name: &str) -> bool {
+    matches!(
+        name,
+        "BaseException"
+            | "Exception"
+            | "ValueError"
+            | "TypeError"
+            | "LookupError"
+            | "IndexError"
+            | "KeyError"
+            | "ArithmeticError"
+            | "ZeroDivisionError"
+            | "RuntimeError"
+            | "StopIteration"
+            | "Cancelled"
+            | "ExceptionGroup"
+    )
+}
 
 /// The curated built-in decorator set shipped in v1 (D-0036,
 /// `design/0004-decorators.md` §"Built-in set"). An `@name` whose name is not in
@@ -2384,7 +2416,31 @@ impl Checker {
                 ..
             } => {
                 self.check_block(body);
-                for ex in excepts {
+                for (i, ex) in excepts.iter().enumerate() {
+                    match &ex.ty {
+                        Some(Type::Named { name, args, .. })
+                            if args.is_empty()
+                                && (is_exception_type(name) || self.user_types.contains(name)) => {}
+                        Some(Type::Named { name, .. }) => self.error(
+                            ErrorCode::ZAP3001,
+                            format!("unknown exception type '{name}'"),
+                            ex.span,
+                        ),
+                        Some(_) => self.error(
+                            ErrorCode::ZAP3001,
+                            "except expects a named exception type".to_string(),
+                            ex.span,
+                        ),
+                        None => {
+                            if i + 1 < excepts.len() {
+                                self.error(
+                                    ErrorCode::ZAP3001,
+                                    "a catch-all except clause must be last".to_string(),
+                                    ex.span,
+                                );
+                            }
+                        }
+                    }
                     self.push_scope();
                     if let Some(b) = &ex.binding {
                         self.declare(b, Ty::Unknown, ex.span);
@@ -2406,6 +2462,20 @@ impl Checker {
                     // callee/argument are not inferred (which would flag them as
                     // unknown names) and `as NAME` is typeless.
                     if is_expect_raises(&it.expr) {
+                        if let Expr::Call { args, .. } = &it.expr {
+                            let type_ok = args.len() == 1
+                                && matches!(
+                                    args.first().map(|a| &a.value),
+                                    Some(Expr::Name(name, _)) if is_exception_type(name)
+                                );
+                            if !type_ok {
+                                self.error(
+                                    ErrorCode::ZAP3001,
+                                    "expect_raises expects one built-in exception type".to_string(),
+                                    it.span,
+                                );
+                            }
+                        }
                         if let Some(a) = &it.alias {
                             self.declare(a, Ty::Unknown, it.span);
                         }
@@ -3702,6 +3772,26 @@ impl Checker {
         }
         if let Expr::Name(fname, _) = callee {
             match fname.as_str() {
+                name if is_exception_type(name) => {
+                    if args.len() != 1 || args[0].name.is_some() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            format!("{name}() takes one positional message"),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !matches!(at, Ty::Str | Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("{name}() message must be str, found {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Unknown;
+                }
                 "sum" => {
                     // Reduction over an array -> scalar; typed loosely for now.
                     for a in args {

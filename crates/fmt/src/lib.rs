@@ -1100,4 +1100,16 @@ mod tests {
         let source = include_str!("../../../tests/conformance/enum_tier1_iteration.zap");
         assert_eq!(format_source(source).unwrap(), source);
     }
+
+    #[test]
+    fn typed_exception_fixture_is_canonically_formatted() {
+        let source = include_str!("../../../tests/conformance/exception_typed_dispatch.zap");
+        assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
+    fn typed_division_exception_fixture_is_canonically_formatted() {
+        let source = include_str!("../../../tests/conformance/exception_divide_by_zero.zap");
+        assert_eq!(format_source(source).unwrap(), source);
+    }
 }

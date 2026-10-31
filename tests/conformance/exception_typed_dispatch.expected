@@ -1,0 +1,10 @@
+caught custom bad syntax
+caught bad value
+finally handled
+after handled
+caught lookup parent
+finally propagating
+caught propagated propagate me
+finally in handler
+caught replacement replacement
+caught base exception

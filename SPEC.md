@@ -571,15 +571,12 @@ invalid spec is `ZAP4026`.
 Unchecked exceptions; nothing is ever forced to be caught.
 
 ```python
-def parse_int(str s) -> int64:
-    if not is_number(s):
-        raise ParseError("bad int: " + s)
-    return ...
-
 try:
-    auto n = parse_int(user_input)
-except ParseError as e:
-    print("recovering:", e)
+    raise ValueError("bad integer")
+except TypeError:
+    print("wrong kind of error")
+except ValueError as e:
+    print("recovering:", e)  # e is the exception message (a str)
 finally:
     cleanup()
 ```
@@ -590,6 +587,22 @@ finally:
   unwinding.
 - Uncaught exceptions unwind to the top of the coroutine and terminate with a
   stack trace. Exception types form a Python-like hierarchy.
+- Built-in exception types are `BaseException`, `Exception`, `ValueError`,
+  `TypeError`, `LookupError`, `IndexError`, `KeyError`, `ArithmeticError`,
+  `ZeroDivisionError`, `RuntimeError`, `StopIteration`, `Cancelled`, and
+  `ExceptionGroup`. `IndexError` and `KeyError` derive from `LookupError`;
+  `ZeroDivisionError` derives from `ArithmeticError`; those intermediate types
+  derive from `Exception`. `Cancelled` derives directly from `BaseException`,
+  so `except Exception` does not suppress cancellation. The remaining listed
+  leaf types derive from `Exception`; `Exception` derives from `BaseException`.
+- `raise E(message)` constructs a typed built-in exception. Raising a string is
+  shorthand for raising `Exception(message)`. A typed `except E` catches `E`
+  and its subclasses; clauses are tested in source order. A bare `except` is a
+  catch-all and must be last. In `except E as e`, `e` is the message string.
+- A user-defined struct may be raised as an exception with one string message
+  (`raise MyError(message)`). User-defined exception types derive from
+  `Exception`; they can be named in `except` clauses and retain their identity
+  when propagated.
 
 ## 11. Resource cleanup (D-0027)
 

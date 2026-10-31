@@ -770,6 +770,19 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // (`zap_eh_begin_catch`) and balances the catch (`zap_eh_end_catch`);
         // `zap_uncaught` reports an exception that reached the top-level handler.
         self.declare_rt("zap_panic", &[ptr.into()], None);
+        self.declare_rt("zap_panic_typed", &[i64t.into(), ptr.into()], None);
+        self.declare_rt("zap_raise", &[ptr.into()], None);
+        self.declare_rt(
+            "zap_exception_new",
+            &[i64t.into(), ptr.into()],
+            Some(ptr.into()),
+        );
+        self.declare_rt("zap_exception_message", &[ptr.into()], Some(ptr.into()));
+        self.declare_rt(
+            "zap_exception_is_a",
+            &[ptr.into(), i64t.into()],
+            Some(i64t.into()),
+        );
         self.declare_rt("zap_eh_begin_catch", &[ptr.into()], Some(ptr.into()));
         self.declare_rt("zap_eh_end_catch", &[], None);
         self.declare_rt("zap_uncaught", &[ptr.into()], None);
@@ -2547,10 +2560,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             }
             Inst::LandingPad { dest } => {
                 // The landing-pad result is `{ ptr (exception), i32 (selector) }`.
-                // A single catch-all clause (`catch ptr null`) matches any Zap
-                // exception; selector-based `except` dispatch is deferred, so the
-                // selector is unused. `zap_eh_begin_catch` turns the in-flight
-                // `_Unwind_Exception*` into the Zap exception object.
+                // The catch-all C++ clause accepts Zap's single transport type;
+                // language-level dispatch checks the carried Zap type id in IR.
+                // `zap_eh_begin_catch` turns the in-flight `_Unwind_Exception*`
+                // into the typed Zap exception object.
                 let ptr_ty = self.ctx.ptr_type(AddressSpace::default());
                 let lp_ty = self
                     .ctx
