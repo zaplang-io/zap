@@ -10,6 +10,7 @@ enum Color:
 enum Empty:
     pass
 
+
 def main():
     auto alias = Color.ALSO_RED
     print(alias.name)
