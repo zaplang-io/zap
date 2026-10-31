@@ -159,11 +159,14 @@ conversions that can lose data (`int64→int32`, `float→int`) require an
 **explicit** conversion (e.g. `int32(x)`). **Rationale:** silent narrowing is a
 classic bug source.
 
-## D-0021 — Execution model: top-level code, else `def main()`
-**Status:** Locked
-Code outside functions runs **top to bottom**; a program may instead define
-`def main()`. Because Zap is AOT-compiled as a whole program, **no
-forward-declaration is required** — definitions may follow uses.
+## D-0021 — Execution model: `def main()` entry point
+**Status:** Locked; original top-level execution wording superseded by D-0090
+A compiled program runs from `def main()`. Executable statements at module
+scope are rejected in both entry and imported modules (D-0090); a bare,
+non-f-string module docstring is permitted (D-0041). The parser still accepts
+statements in module position, but that is not an execution promise. Because
+Zap is AOT-compiled as a whole program, **no forward-declaration is required**
+— definitions may follow uses.
 
 ## D-0022 — Truthiness: Python-falsy and strict bool
 **Status:** Locked
@@ -2281,9 +2284,9 @@ the receiver's binding** (`auto app = …`) in the function that declares it
 (`main` in practice), preserving decorated-def source order among routes. This is
 #459-independent: it needs no module-level execution. The receiver is a local, the
 handler is a top-level `def` referenced by name — the precise pattern that already
-type-checks and codegens today. When module-level top-level execution lands
-(zap#459), a module-level `app` registers identically (right after its module-init
-binding) with no further decorator work.
+type-checks and codegens today. If a future design adds module-scope execution,
+the registration semantics for a module-level `app` will need to be specified
+alongside its initialization order; D-0090 currently rejects that form.
 
 **Scope boundary for #458.** The registering method just takes a `fn(Request)->
 Response` value; per-parameter typed injection (`@app.get(id: int, q: str=…)`,
