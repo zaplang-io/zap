@@ -471,6 +471,12 @@ define_codes! {
     ZAP5047 = 5047 : "decorator on wrong target",
         "This decorator does not apply to the kind of declaration it was placed \
          on.";
+    ZAP5048 = 5048 : "invalid dependency injection",
+        "A handler parameter default `Depends(provider)` (I#466, D-0092) could \
+         not be resolved into a request-time adapter: the provider must name a \
+         top-level function, each provider parameter must itself be \
+         `Depends(...)` (request-derived dependencies are not injected in v1), \
+         and the dependency graph must be acyclic.";
     ZAP5060 = 5060 : "generator tier-1 enum method not supported",
         "Generators on a tier-1 (unboxed-integer) enum method are not supported \
          yet — tier-1 enum methods do not lower at all yet, generator or not. \

@@ -63,7 +63,19 @@ fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
     // Desugar registering (dotted) function decorators — `@app.get("/x")` — into
     // the method-call registration the receiver already accepts, before sema, so
     // the synthesized call is type-checked normally (I#457, D-0087).
-    decorator_desugar::desugar_registering_decorators(&mut module);
+    // `@app.get(...)` + `Depends(...)` adapter synthesis (I#457/D-0087,
+    // I#466/D-0092); any invalid-injection diagnostics are reported as sema-
+    // style errors before type-checking.
+    let deco_diags = decorator_desugar::desugar_registering_decorators(&mut module);
+    if !deco_diags.is_empty() {
+        for e in &deco_diags {
+            eprintln!(
+                "{entry}: error[{}]: {} [{}..{}]",
+                e.code, e.message, e.span.start, e.span.end
+            );
+        }
+        return Err(ExitCode::from(1));
+    }
     let errs = zapc_sema::check(&module);
     if !errs.is_empty() {
         for e in &errs {
