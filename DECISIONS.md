@@ -2292,3 +2292,10 @@ reflection-driven adapter over this same seam — no change to this desugar.
 
 **No grammar change.** `@ dotted_name ( args )` already parses (`docs/GRAMMAR.ebnf`
 `decorators`, D-0036); this is sema/driver/lowering only.
+
+**Test note.** The registering golden (`tests/golden/fn_decorator_register.zap`)
+is reduced to a **field-free** `App` to avoid **zap#461** — struct field defaults
+are dropped at construction when the field is omitted, so a `list[Route] routes =
+[]` field left null SIGSEGVs on `.append`. That is a separate codegen bug, not in
+the decorator path: the `@app.get` desugar lowers correctly either way (verified
+in ZIR). Restore the `list[Route]` router form in the golden once zap#461 lands.
