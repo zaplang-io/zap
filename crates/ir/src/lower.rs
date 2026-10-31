@@ -8309,7 +8309,7 @@ impl<'a> FnLower<'a> {
                     self.throwing_call(Some(raw), helper, vec![v]);
                     return Ok((self.convert(raw, mid, to), to));
                 }
-                if !(vt.is_float() || vt.int_width().is_some()) {
+                if !(vt.is_float() || vt.int_width().is_some() || vt == Ty::Bigint) {
                     return Err(err(format!("{fname}() expects a numeric value")));
                 }
                 return Ok((self.convert(v, vt, to), to));
