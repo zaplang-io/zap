@@ -3967,6 +3967,13 @@ struct FnLower<'a> {
     /// Set while **emitting** a generator's `__next__` state machine (I#67).
     /// Carries the per-call working slots and the resume-point table.
     gen_entry: Option<GenEntry>,
+    /// Per-function counter handing out unique synthetic names for a `for`
+    /// loop's control state (induction index, cached iterable handle, loop-
+    /// invariant bounds) when the loop is lowered inside a generator (I#453).
+    /// Both generator passes — discovery and `__next__` emission — walk the
+    /// body in the same order, so the names line up and the state-struct layout
+    /// stays consistent. Only consulted inside a generator body.
+    gen_loop_seq: u32,
     sigs: &'a HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &'a StructCtx,
 }
@@ -4061,6 +4068,7 @@ impl<'a> FnLower<'a> {
             gen_discover: None,
             gen_elems: Vec::new(),
             gen_entry: None,
+            gen_loop_seq: 0,
             sigs,
             ctx,
         }
@@ -4282,6 +4290,62 @@ impl<'a> FnLower<'a> {
         ge.slots.insert(name.to_string(), (d, ty));
         ge.order.push(name.to_string());
         d
+    }
+
+    /// Whether lowering is currently inside a generator body — in either the
+    /// discovery pass (`gen_discover`) or the `__next__` emission pass
+    /// (`gen_entry`). A `for` loop's control state must then live in hoisted
+    /// state-struct slots so it survives a `yield` in the loop body (I#453).
+    fn in_generator_body(&self) -> bool {
+        self.gen_discover.is_some() || self.gen_entry.is_some()
+    }
+
+    /// A slot for a synthesized `for`-loop control value — the induction index
+    /// or a spilled loop-invariant (the iterable handle, a `range` bound).
+    /// Inside a generator this is a **hoisted** slot (reloaded at each resume
+    /// entry and synced back at every `yield`, exactly like an `auto` local),
+    /// under a synthetic name that is deterministic across the discovery and
+    /// emission passes; elsewhere it is a plain `alloca` (unchanged behaviour,
+    /// no extra state). This is why a `for` loop in a generator body did not
+    /// survive suspend/resume before I#453: its index was a per-call `alloca`
+    /// that read uninitialized on resume, and its iterable handle was an SSA
+    /// value defined at loop setup that did not dominate the resume re-entry.
+    fn for_control_slot(&mut self, ty: Ty) -> Value {
+        if self.in_generator_body() {
+            let n = self.gen_loop_seq;
+            self.gen_loop_seq += 1;
+            let name = format!("$for:{n}");
+            self.decl_slot(&name, ty)
+        } else {
+            self.alloca(ty)
+        }
+    }
+
+    /// Spill a loop-invariant SSA value (the iterable handle, a `range`
+    /// bound/step, a string length) so it can be reloaded across a `yield`
+    /// resume when the loop is lowered inside a generator: store it into a
+    /// hoisted [`for_control_slot`] and return `Some(slot)`. Outside a generator
+    /// no spill is needed and this returns `None` (the caller keeps using the
+    /// SSA value directly). See [`reload_invariant`]. (I#453)
+    fn spill_invariant(&mut self, v: Value, ty: Ty) -> Option<Value> {
+        if self.in_generator_body() {
+            let slot = self.for_control_slot(ty);
+            self.store(slot, v);
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    /// Reload a value spilled by [`spill_invariant`]: inside a generator load it
+    /// from its hoisted slot (so the current block, which may be a resume
+    /// re-entry, sees a dominating definition); otherwise return the original
+    /// SSA value. (I#453)
+    fn reload_invariant(&mut self, slot: Option<Value>, orig: Value, ty: Ty) -> Value {
+        match slot {
+            Some(s) => self.load(s, ty),
+            None => orig,
+        }
     }
 
     // instruction helpers
@@ -6550,9 +6614,15 @@ impl<'a> FnLower<'a> {
         };
 
         self.push_scope();
-        let var = self.alloca(Ty::I64);
+        // The loop variable *is* the induction counter here; hoist it so it
+        // survives a `yield` in the body, and spill the `stop`/`step` bounds —
+        // loop-invariant SSA values used in the cond/incr blocks, which the
+        // resume re-entry does not dominate (I#453). Outside a generator this
+        // is a plain alloca and the bounds stay SSA.
+        let var = self.decl_slot(&name, Ty::I64);
         self.store(var, start);
-        self.declare(&name, var, Ty::I64);
+        let stop_slot = self.spill_invariant(stop, Ty::I64);
+        let step_slot = self.spill_invariant(step, Ty::I64);
 
         let cond_bb = self.new_block();
         let body_bb = self.new_block();
@@ -6562,12 +6632,13 @@ impl<'a> FnLower<'a> {
         self.set_term(Term::Br(cond_bb));
         self.position(cond_bb);
         let cur = self.load(var, Ty::I64);
+        let stop_c = self.reload_invariant(stop_slot, stop, Ty::I64);
         let c = self.new_value(Ty::I1);
         self.emit(Inst::ICmp {
             dest: c,
             pred: CmpPred::Lt,
             lhs: cur,
-            rhs: stop,
+            rhs: stop_c,
         });
         self.set_term(Term::BrIf {
             cond: c,
@@ -6585,12 +6656,13 @@ impl<'a> FnLower<'a> {
 
         self.position(incr_bb);
         let cur2 = self.load(var, Ty::I64);
+        let step_i = self.reload_invariant(step_slot, step, Ty::I64);
         let next = self.new_value(Ty::I64);
         self.emit(Inst::Bin {
             dest: next,
             op: BinOp::Add,
             lhs: cur2,
-            rhs: step,
+            rhs: step_i,
         });
         self.store(var, next);
         self.set_term(Term::Br(cond_bb));
@@ -6623,13 +6695,20 @@ impl<'a> FnLower<'a> {
         }
 
         self.push_scope();
-        let idx = self.alloca(Ty::I64);
+        // Inside a generator body the induction index and the iterable handle
+        // must live in hoisted state-struct slots so they survive a `yield` in
+        // the loop body (I#453): otherwise the index is a per-call alloca that
+        // reads uninitialized on resume, and the handle — an SSA value defined
+        // here at loop setup — does not dominate the resume re-entry. Outside a
+        // generator these stay a plain index alloca and the SSA handle.
+        let idx = self.for_control_slot(Ty::I64);
         let zero = self.iconst(Ty::I64, 0);
         self.store(idx, zero);
+        let lst_slot = self.spill_invariant(lst, Ty::List(elem));
         let single_var = if let Expr::Name(n, _) = target {
-            let var = self.alloca(elem.ty());
-            self.declare(n, var, elem.ty());
-            Some(var)
+            // The loop variable is live across a `yield` placed after its use in
+            // the body, so hoist it too (a plain alloca outside a generator).
+            Some(self.decl_slot(n, elem.ty()))
         } else {
             None
         };
@@ -6643,10 +6722,11 @@ impl<'a> FnLower<'a> {
         self.position(cond_bb);
         let cur = self.load(idx, Ty::I64);
         let len = self.new_value(Ty::I64);
+        let lst_c = self.reload_invariant(lst_slot, lst, Ty::List(elem));
         self.emit(Inst::Call {
             dest: Some(len),
             func: "zap_list_len".to_string(),
-            args: vec![lst],
+            args: vec![lst_c],
         });
         let c = self.new_value(Ty::I1);
         self.emit(Inst::ICmp {
@@ -6664,10 +6744,11 @@ impl<'a> FnLower<'a> {
         self.position(body_bb);
         let i = self.load(idx, Ty::I64);
         let e = self.new_value(elem.ty());
+        let lst_b = self.reload_invariant(lst_slot, lst, Ty::List(elem));
         self.emit(Inst::Call {
             dest: Some(e),
             func: format!("zap_list_get_{}", elem.val_suffix()),
-            args: vec![lst, i],
+            args: vec![lst_b, i],
         });
         match target {
             Expr::Name(_, _) => self.store(single_var.expect("name slot"), e),
@@ -6761,8 +6842,12 @@ impl<'a> FnLower<'a> {
         };
 
         self.push_scope();
-        // Byte cursor into the UTF-8 buffer, and the total byte length.
-        let off = self.alloca(Ty::I64);
+        // Byte cursor into the UTF-8 buffer, and the total byte length. Inside a
+        // generator the cursor, the string handle, and the length must survive a
+        // `yield` in the body, so the cursor is a hoisted slot and the handle /
+        // length are spilled and reloaded (I#453); outside a generator the
+        // cursor is a plain alloca and both stay SSA.
+        let off = self.for_control_slot(Ty::I64);
         let zero = self.iconst(Ty::I64, 0);
         self.store(off, zero);
         let nbytes = self.new_value(Ty::I64);
@@ -6771,8 +6856,9 @@ impl<'a> FnLower<'a> {
             func: "zap_str_len".to_string(),
             args: vec![s],
         });
-        let var = self.alloca(Ty::I32);
-        self.declare(&name, var, Ty::I32);
+        let nbytes_slot = self.spill_invariant(nbytes, Ty::I64);
+        let s_slot = self.spill_invariant(s, Ty::Ptr);
+        let var = self.decl_slot(&name, Ty::I32);
 
         let cond_bb = self.new_block();
         let body_bb = self.new_block();
@@ -6782,12 +6868,13 @@ impl<'a> FnLower<'a> {
         self.set_term(Term::Br(cond_bb));
         self.position(cond_bb);
         let cur = self.load(off, Ty::I64);
+        let nbytes_c = self.reload_invariant(nbytes_slot, nbytes, Ty::I64);
         let c = self.new_value(Ty::I1);
         self.emit(Inst::ICmp {
             dest: c,
             pred: CmpPred::Lt,
             lhs: cur,
-            rhs: nbytes,
+            rhs: nbytes_c,
         });
         self.set_term(Term::BrIf {
             cond: c,
@@ -6797,11 +6884,12 @@ impl<'a> FnLower<'a> {
 
         self.position(body_bb);
         let cur_off = self.load(off, Ty::I64);
+        let s_b = self.reload_invariant(s_slot, s, Ty::Ptr);
         let cp = self.new_value(Ty::I32);
         self.emit(Inst::Call {
             dest: Some(cp),
             func: "zap_str_cp_at_byte".to_string(),
-            args: vec![s, cur_off],
+            args: vec![s_b, cur_off],
         });
         self.store(var, cp);
         self.push_loop(incr_bb, end_bb);
@@ -6813,11 +6901,12 @@ impl<'a> FnLower<'a> {
 
         self.position(incr_bb);
         let cur2 = self.load(off, Ty::I64);
+        let s_i = self.reload_invariant(s_slot, s, Ty::Ptr);
         let next = self.new_value(Ty::I64);
         self.emit(Inst::Call {
             dest: Some(next),
             func: "zap_str_adv_byte".to_string(),
-            args: vec![s, cur2],
+            args: vec![s_i, cur2],
         });
         self.store(off, next);
         self.set_term(Term::Br(cond_bb));
