@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn harness_expect_raises_lowers() {
-        let m = module("@test\n@expect_raises(ValueError)\ndef test_boom():\n    raise \"nope\"\n");
+        let m = module("@test\n@expect_raises(ValueError)\ndef test_boom():\n    raise ValueError(\"nope\")\n");
         let (h, _n) = harness::build_harness(&m);
         assert!(zapc_sema::check(&h).is_empty());
         let (_zir, errs) = zapc_ir::lower_module(&h);
