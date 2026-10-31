@@ -2205,8 +2205,17 @@ impl Checker {
                 // order (`for col in Color:`, D-0018). The iterable is a type
                 // name, not a value, so it is matched before inferring.
                 let elem = if let Expr::Name(n, _) = iter {
-                    if self.enums.contains_key(n) {
-                        Ty::Named(n.clone())
+                    if let Some(info) = self.enums.get(n) {
+                        if info.is_sum {
+                            self.error(
+                                ErrorCode::ZAP4070,
+                                "only tier-1 enum types can be iterated".to_string(),
+                                expr_span(iter),
+                            );
+                            Ty::Unknown
+                        } else {
+                            Ty::Named(n.clone())
+                        }
                     } else {
                         let it = self.infer(iter);
                         self.iter_element(&it, *span)
@@ -4219,6 +4228,12 @@ impl Checker {
                                 ),
                                 span,
                             );
+                        } else if info.variants.is_empty() {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("empty enum '{fname}' has no values to construct"),
+                                span,
+                            );
                         } else if args.len() != 1 {
                             self.error(
                                 ErrorCode::ZAP4025,
@@ -5929,6 +5944,18 @@ def main():
             \x20   match c:\n        case Color.RED:\n            print(1)\n\
             \x20       case Color.GREEN:\n            print(2)\n\
             \x20       case Color.BLUE:\n            print(3)\n");
+    }
+
+    #[test]
+    fn tier3_enum_type_iteration_is_rejected_in_sema() {
+        let m = msgs(
+            "enum Shape:\n    Circle(float64 radius)\n\n\
+             def main():\n    for shape in Shape:\n        print(shape)\n",
+        );
+        assert!(
+            m.contains("only tier-1 enum types can be iterated"),
+            "expected an early tier-3 iteration diagnostic, got:\n{m}"
+        );
     }
 
     #[test]

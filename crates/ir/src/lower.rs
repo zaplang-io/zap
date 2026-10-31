@@ -133,6 +133,9 @@ struct VariantLow {
 /// to a heap enum value, which breaks the cycle for free (D-0046).
 #[derive(Clone, Debug)]
 struct EnumLow {
+    /// Stable index assigned in declaration order; carried by tier-1 ZIR values.
+    enum_id: u32,
+    enum_name: String,
     is_sum: bool,
     /// Tagged-struct id (tier-3 only).
     sid: Option<u32>,
@@ -677,8 +680,11 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         // A borrow of `ids`/`enums` is needed to resolve payload field types,
         // but enum entries are inserted as they are built, so recursive and
         // forward references resolve against `ids` directly.
+        let mut next_enum_id = 0u32;
         for item in &module.items {
             if let ast::Item::Enum(e) = item {
+                let enum_id = next_enum_id;
+                next_enum_id += 1;
                 let is_sum = e.variants.iter().any(|v| !v.fields.is_empty());
                 if !is_sum {
                     let mut members = Vec::new();
@@ -691,6 +697,8 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     enums.insert(
                         e.name.clone(),
                         EnumLow {
+                            enum_id,
+                            enum_name: e.name.clone(),
                             is_sum: false,
                             sid: None,
                             members,
@@ -761,6 +769,8 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     enums.insert(
                         e.name.clone(),
                         EnumLow {
+                            enum_id,
+                            enum_name: e.name.clone(),
                             is_sum: true,
                             sid: Some(sid),
                             members: Vec::new(),
@@ -1404,7 +1414,7 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                     if e.is_sum {
                         return Ok(Ty::Struct(e.sid.expect("tier-3 enum has a struct id")));
                     }
-                    return Ok(Ty::I64);
+                    return Ok(Ty::Enum(e.enum_id));
                 }
                 // An interface value is its synthetic `{ptr data, ptr itable}`
                 // fat-pointer layout (D-0016).
@@ -1459,6 +1469,7 @@ fn elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
 fn heap_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
     match resolve_ty(t, env)? {
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
+        Ty::Enum(id) => Ok(Elem::Enum(id)),
         Ty::Ptr => Ok(Elem::Ptr),
         other => Err(err(format!(
             "heap[{other}] is not supported yet (only integer and str elements)"
@@ -1529,6 +1540,7 @@ fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
 fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
     match t {
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
+        Ty::Enum(id) => Ok(Elem::Enum(id)),
         // A struct element carries its id so a struct *key* hashes/compares via
         // its own `__hash__`/`__eq__` (operator overloading, D-0047).
         Ty::Struct(sid) => Ok(Elem::Struct(sid)),
@@ -6847,15 +6859,11 @@ impl<'a> FnLower<'a> {
                 }
             }
             _ => {
-                // Iterating an enum *type* (`for col in Color:`, D-0018) is
-                // typed by sema but its lowering is a documented follow-up
-                // (it rides on the same enum-identity tracking as `.name`).
                 if let Expr::Name(n, _) = iter {
-                    if self.ctx.enums.contains_key(n) {
-                        return Err(err(
-                            "iterating an enum type is not implemented yet (deferred to a \
-                             follow-up; D-0018)",
-                        ));
+                    if let Some(info) = self.ctx.enums.get(n).cloned() {
+                        if !info.is_sum {
+                            return self.lower_for_enum(target, &info, body);
+                        }
                     }
                 }
                 // `for x in <list>` — iterate by index over the list's length.
@@ -6970,6 +6978,96 @@ impl<'a> FnLower<'a> {
         self.position(end_bb);
         self.pop_scope();
         Ok(())
+    }
+
+    /// Lower `for member in Enum` as an ordered list of the enum's canonical
+    /// discriminants. Duplicate discriminants are aliases and are omitted from
+    /// iteration, matching the first-declaration canonical name used by `.name`.
+    fn lower_for_enum(
+        &mut self,
+        target: &Expr,
+        info: &EnumLow,
+        body: &ast::Block,
+    ) -> Result<(), LowerError> {
+        let elem = Elem::Enum(info.enum_id);
+        let list_ty = Ty::List(elem);
+        let list = self.new_value(list_ty);
+        self.emit(Inst::Call {
+            dest: Some(list),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let mut seen = HashSet::new();
+        for (_, value) in &info.members {
+            if seen.insert(*value) {
+                let member = self.iconst(Ty::Enum(info.enum_id), *value);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_push_i64".to_string(),
+                    args: vec![list, member],
+                });
+            }
+        }
+        self.lower_for_list(target, list, elem, body)
+    }
+
+    /// Resolve a tier-1 enum discriminant to its canonical source name. Explicit
+    /// integer-to-enum conversions can produce unknown discriminants, which
+    /// raise a catchable runtime fault instead of returning a fabricated name.
+    fn lower_enum_name(&mut self, value: Value, enum_id: u32) -> Result<(Value, Ty), LowerError> {
+        let info = self
+            .ctx
+            .enums
+            .values()
+            .find(|info| !info.is_sum && info.enum_id == enum_id)
+            .cloned()
+            .ok_or_else(|| err("enum identity is not registered"))?;
+        let result_slot = self.alloca(Ty::Ptr);
+        let merge = self.new_block();
+        let mut check = self.cur;
+        let mut seen = HashSet::new();
+        for (name, discriminant) in &info.members {
+            if !seen.insert(*discriminant) {
+                continue;
+            }
+            self.position(check);
+            let expected = self.iconst(Ty::Enum(enum_id), *discriminant);
+            let matches = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: matches,
+                pred: CmpPred::Eq,
+                lhs: value,
+                rhs: expected,
+            });
+            let found = self.new_block();
+            let next = self.new_block();
+            self.set_term(Term::BrIf {
+                cond: matches,
+                then_bb: found,
+                else_bb: next,
+            });
+            self.position(found);
+            let string = self.new_value(Ty::Ptr);
+            self.emit(Inst::StrConst {
+                dest: string,
+                bytes: name.as_bytes().to_vec(),
+            });
+            self.store(result_slot, string);
+            self.ensure_br(merge);
+            check = next;
+        }
+        self.position(check);
+        let message = self.new_value(Ty::Ptr);
+        self.emit(Inst::StrConst {
+            dest: message,
+            bytes: format!("invalid value for enum {}", info.enum_name).into_bytes(),
+        });
+        self.throwing_call(None, "zap_panic", vec![message]);
+        if !self.terminated() {
+            self.set_term(Term::Unreachable);
+        }
+        self.position(merge);
+        Ok((self.load(result_slot, Ty::Ptr), Ty::Ptr))
     }
 
     /// `for x in xs` where `xs : list[T]`. Re-reads the length each iteration so
@@ -7590,20 +7688,13 @@ impl<'a> FnLower<'a> {
                 if bty == Ty::Py {
                     return Ok((self.lower_py_getattr(bv, name), Ty::Py));
                 }
-                // `.name` on an enum value (D-0018) is typed by sema but its
-                // lowering is a documented follow-up: a tier-1 enum collapses to
-                // its backing `i64` here, losing the static enum identity the
-                // member-name table lookup needs. (Preserving it needs a ZIR
-                // enum type; tracked as a follow-up.)
+                if let Ty::Enum(enum_id) = bty {
+                    return self.lower_enum_name(bv, enum_id);
+                }
                 // The receiver type decides (I#141): a struct with a field
                 // named `name` reads that field; the enum op applies only to a
                 // non-struct (enum-backed) receiver.
                 let Ty::Struct(sid) = bty else {
-                    if name == "name" {
-                        return Err(err(
-                            "enum '.name' is not implemented yet (deferred to a follow-up; D-0018)",
-                        ));
-                    }
                     return Err(err("field access on a non-struct value"));
                 };
                 let (idx, fty) = self
@@ -8341,7 +8432,8 @@ impl<'a> FnLower<'a> {
                         return Err(err(format!("{fname}() takes exactly one argument")));
                     }
                     let (v, vt) = self.expr(&args[0].value)?;
-                    return Ok((self.coerce(v, vt, Ty::I64), Ty::I64));
+                    let ty = Ty::Enum(info.enum_id);
+                    return Ok((self.coerce(v, vt, ty), ty));
                 }
             }
             // Struct construction: `StructName(fields...)`.
@@ -9295,7 +9387,8 @@ impl<'a> FnLower<'a> {
             let val = info
                 .member_value(member)
                 .ok_or_else(|| err(format!("enum '{enum_name}' has no member '{member}'")))?;
-            return Ok((self.iconst(Ty::I64, val), Ty::I64));
+            let ty = Ty::Enum(info.enum_id);
+            return Ok((self.iconst(ty, val), ty));
         }
         // Tier-3: a bare variant must be payload-free (data-carrying variants are
         // constructed through `call`).
@@ -10723,6 +10816,7 @@ impl<'a> FnLower<'a> {
         let orderable_kind = |k: Elem, what: &str| -> Result<i64, LowerError> {
             match k {
                 Elem::I64 => Ok(0),
+                Elem::Enum(_) => Ok(0),
                 Elem::Ptr => Ok(1),
                 Elem::Struct(_) => Err(err(format!(
                     "{what} is not orderable; pass key= to sort by an orderable \
@@ -12427,6 +12521,9 @@ impl<'a> FnLower<'a> {
             }
         }
         if let (Some(fw), Some(tw)) = (from.int_width(), to.int_width()) {
+            if fw == tw {
+                return v;
+            }
             let d = self.new_value(to);
             let kind = if tw > fw {
                 CastKind::SExt
@@ -12494,6 +12591,9 @@ impl<'a> FnLower<'a> {
         }
         let kind = match (from, to) {
             (f, t) if f.int_width().is_some() && t.int_width().is_some() => {
+                if f.int_width() == t.int_width() {
+                    return v;
+                }
                 if t.int_width().unwrap() > f.int_width().unwrap() {
                     CastKind::SExt
                 } else {

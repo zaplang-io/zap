@@ -1514,6 +1514,12 @@ impl Parser {
         let mut methods = Vec::new();
         while !self.is(&TokenKind::Dedent) && !self.at_eof() {
             let before = self.pos;
+            // A pass-only body is the explicit spelling of an empty enum.
+            if matches!(self.peek(), TokenKind::Ident(name) if name == "pass") {
+                self.bump();
+                self.expect(&TokenKind::Newline, "newline after 'pass'");
+                continue;
+            }
             // Methods on the enum (D-0046): a `def` (possibly decorated) in the
             // body, parsed exactly like a struct method.
             let decos = self.parse_decorators();
@@ -3905,6 +3911,15 @@ mod tests {
         assert!(e.variants[1].value.is_some());
         assert!(e.variants.iter().all(|v| v.fields.is_empty()));
         assert!(matches!(&m.items[1], Item::Import(Import::Python { .. })));
+    }
+
+    #[test]
+    fn pass_declares_an_empty_enum() {
+        let m = parse_ok("enum Empty:\n    pass\n");
+        let Item::Enum(e) = &m.items[0] else {
+            panic!("enum");
+        };
+        assert!(e.variants.is_empty());
     }
 
     /// Collect every `(path, alias)` from the module's logical-name imports,

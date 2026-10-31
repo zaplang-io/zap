@@ -16,6 +16,8 @@ use std::fmt;
 pub enum Elem {
     /// An integer/bool element, passed as `i64`.
     I64,
+    /// A tier-1 enum discriminant, passed as `i64` but retaining enum identity.
+    Enum(u32),
     /// A reference-typed element (`str`, nested collection), passed as a pointer
     /// and — as a *key* — hashed/compared by its bytes (a `ZapStr`).
     Ptr,
@@ -32,6 +34,7 @@ impl Elem {
     pub fn ty(self) -> Ty {
         match self {
             Elem::I64 => Ty::I64,
+            Elem::Enum(id) => Ty::Enum(id),
             Elem::Ptr => Ty::Ptr,
             Elem::Struct(sid) => Ty::Struct(sid),
         }
@@ -41,7 +44,7 @@ impl Elem {
     /// hashing), so they share the `ptr` path.
     pub fn val_suffix(self) -> &'static str {
         match self {
-            Elem::I64 => "i64",
+            Elem::I64 | Elem::Enum(_) => "i64",
             Elem::Ptr | Elem::Struct(_) => "ptr",
         }
     }
@@ -50,7 +53,7 @@ impl Elem {
     /// which takes the type's `__hash__`/`__eq__` as function pointers.
     pub fn key_suffix(self) -> &'static str {
         match self {
-            Elem::I64 => "i64",
+            Elem::I64 | Elem::Enum(_) => "i64",
             Elem::Ptr => "str",
             Elem::Struct(_) => "fn",
         }
@@ -184,6 +187,9 @@ pub enum Ty {
     I16,
     I32,
     I64,
+    /// A tier-1 enum value carried as its `i64` discriminant. The id preserves
+    /// the source enum identity through lowering without changing its ABI.
+    Enum(u32),
     F32,
     F64,
     Ptr,
@@ -253,7 +259,7 @@ impl Ty {
             Ty::I8 => Some(8),
             Ty::I16 => Some(16),
             Ty::I32 => Some(32),
-            Ty::I64 => Some(64),
+            Ty::I64 | Ty::Enum(_) => Some(64),
             _ => None,
         }
     }
@@ -269,7 +275,15 @@ impl Ty {
     pub fn is_ptr(self) -> bool {
         !matches!(
             self,
-            Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::F32 | Ty::F64 | Ty::Void
+            Ty::I1
+                | Ty::I8
+                | Ty::I16
+                | Ty::I32
+                | Ty::I64
+                | Ty::Enum(_)
+                | Ty::F32
+                | Ty::F64
+                | Ty::Void
         )
     }
 }
@@ -821,6 +835,7 @@ impl fmt::Display for Ty {
             Ty::I16 => "i16",
             Ty::I32 => "i32",
             Ty::I64 => "i64",
+            Ty::Enum(id) => return write!(f, "enum#{id}"),
             Ty::F32 => "f32",
             Ty::F64 => "f64",
             Ty::Ptr => "ptr",

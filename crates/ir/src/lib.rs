@@ -249,16 +249,18 @@ mod tests {
 
     #[test]
     fn lower_tier1_enum_and_match() {
-        // A tier-1 enum is its unboxed backing int: member access is an iconst
-        // (RED=0, GREEN=10, BLUE continues at 11), and a `match` is an
-        // icmp-against-constant chain (D-0018/D-0040).
+        // A tier-1 enum is an unboxed discriminant with a distinct ZIR identity:
+        // member access is an iconst (RED=0, GREEN=10, BLUE continues at 11),
+        // and a `match` is an icmp-against-constant chain (D-0018/D-0040).
         let m = lower_ok(
             "enum Color:\n    RED\n    GREEN = 10\n    BLUE\n\n\
              def classify(Color c) -> int64:\n    match c:\n\
              \x20       case Color.RED:\n            return 1\n\
              \x20       case Color.GREEN:\n            return 2\n\
              \x20       case Color.BLUE:\n            return 3\n\n\
-             def main():\n    print(classify(Color.BLUE))\n",
+             def main():\n    print(classify(Color.BLUE))\n\
+             \x20   print(Color.GREEN.name)\n\x20   for color in Color:\n\
+             \x20       print(color.name)\n",
         );
         // No tagged struct is allocated for a tier-1 enum.
         assert!(
@@ -270,13 +272,25 @@ mod tests {
             .iter()
             .find(|f| f.name == "classify")
             .expect("classify");
-        assert_eq!(classify.params, vec![Ty::I64], "tier-1 enum lowers to i64");
+        assert_eq!(
+            classify.params,
+            vec![Ty::Enum(0)],
+            "tier-1 enum keeps its identity while using the i64 ABI"
+        );
         let text = format!("{m}");
         // BLUE auto-continues from GREEN=10.
         assert!(text.contains("iconst 11"), "BLUE should be 11:\n{text}");
         assert!(
             text.contains("icmp.Eq"),
             "match dispatches on equality:\n{text}"
+        );
+        assert!(
+            text.contains("zap_list_push_i64"),
+            "enum iteration stores discriminants in declaration order:\n{text}"
+        );
+        assert!(
+            text.contains("invalid value for enum Color"),
+            "enum .name rejects unknown discriminants:\n{text}"
         );
         // The construction `Color.BLUE` is just the discriminant constant.
         assert!(!text.contains("structnew"), "no struct for tier-1:\n{text}");

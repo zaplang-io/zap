@@ -405,7 +405,7 @@ impl<'a> Printer<'a> {
         members.extend(s.fields.iter().map(Member::Field));
         members.extend(s.methods.iter().map(Member::Method));
         members.sort_by_key(|m| m.start());
-        self.emit_members(&members, s.span.end);
+        self.emit_members(&members, s.span.end, None);
     }
 
     fn emit_enum(&mut self, e: &EnumDef) {
@@ -418,7 +418,7 @@ impl<'a> Printer<'a> {
         members.extend(e.variants.iter().map(Member::Variant));
         members.extend(e.methods.iter().map(Member::Method));
         members.sort_by_key(|m| m.start());
-        self.emit_members(&members, e.span.end);
+        self.emit_members(&members, e.span.end, (members.is_empty()).then_some("pass"));
     }
 
     fn emit_interface(&mut self, i: &InterfaceDef) {
@@ -443,7 +443,7 @@ impl<'a> Printer<'a> {
     fn emit_annotation(&mut self, a: &AnnotationDef) {
         self.push_line(&format!("annotation {}:", a.name));
         let members: Vec<Member> = a.fields.iter().map(Member::Field).collect();
-        self.emit_members(&members, a.span.end);
+        self.emit_members(&members, a.span.end, None);
     }
 
     fn emit_decorator_def(&mut self, d: &DecoratorDef) {
@@ -465,7 +465,7 @@ impl<'a> Printer<'a> {
     }
 
     /// Emit the members of a struct/enum/annotation body in source order.
-    fn emit_members(&mut self, members: &[Member], body_end: u32) {
+    fn emit_members(&mut self, members: &[Member], body_end: u32, empty: Option<&str>) {
         self.indent += 1;
         self.block_fresh = true;
         for m in members {
@@ -478,6 +478,11 @@ impl<'a> Printer<'a> {
                     self.take_trailing(v.span.end);
                 }
                 Member::Method(f) => self.emit_function(f),
+            }
+        }
+        if members.is_empty() {
+            if let Some(placeholder) = empty {
+                self.push_line(placeholder);
             }
         }
         self.flush_dangling(body_end);
@@ -1077,5 +1082,22 @@ fn espan(e: &Expr) -> Span {
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
         | Expr::IfElse { span, .. } => *span,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_source;
+
+    #[test]
+    fn empty_enum_keeps_its_pass_body() {
+        let source = "enum Empty:\n    pass\n";
+        assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
+    fn enum_conformance_fixture_is_canonically_formatted() {
+        let source = include_str!("../../../tests/conformance/enum_tier1_iteration.zap");
+        assert_eq!(format_source(source).unwrap(), source);
     }
 }

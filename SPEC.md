@@ -231,6 +231,12 @@ auto c = Color.GREEN
 print(c.name)         # "GREEN"
 ```
 
+An explicit value may be reused as an alias. The first declaration for a value
+is its canonical name: `.name` returns that name and iteration yields that value
+once, in the position of its first declaration. A pass-only enum body declares
+an empty enum; iterating it runs zero times. Accessing `.name` on an enum value
+whose discriminant is not declared raises a runtime error.
+
 **Tier 3 (D-0046)** — data-carrying variants (sum types) with type-first named
 payload fields; a tagged **value** (copied by value), with a GC pointer inserted
 only for recursive or oversized fields. Constructed qualified (named or

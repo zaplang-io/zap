@@ -1767,6 +1767,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Ty::I16 => self.ctx.i16_type().into(),
             Ty::I32 => self.ctx.i32_type().into(),
             Ty::I64 => self.ctx.i64_type().into(),
+            Ty::Enum(_) => self.ctx.i64_type().into(),
             Ty::F32 => self.ctx.f32_type().into(),
             Ty::F64 => self.ctx.f64_type().into(),
             Ty::Ptr

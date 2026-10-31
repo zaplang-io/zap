@@ -114,7 +114,7 @@ interface_def ::= "interface" IDENT [ generics ] ":" NEWLINE
 method_sig    ::= "def" IDENT "(" [ param_list ] ")" [ "->" type ] NEWLINE ;
 
 enum_def      ::= decorators "enum" IDENT [ generics ] ":" NEWLINE
-                  INDENT { enum_member | function } DEDENT ;
+                  INDENT { enum_member | function | "pass" NEWLINE } DEDENT ;
                   (* tier-1 (all bare constants) -> unboxed int; a data-carrying
                      variant makes the whole enum a tagged value (D-0018/D-0046).
                      `function` = methods on the enum (D-0046); [ generics ] is
