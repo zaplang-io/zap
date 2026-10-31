@@ -17,12 +17,12 @@
 
 struct Route:
     str path
-    fn(str)->str handler
+    fn(str) -> str handler
 
 struct App:
     list[Route] routes = []
 
-    def get(self, str path, fn(str)->str handler):
+    def get(self, str path, fn(str) -> str handler):
         self.routes.append(Route(path=path, handler=handler))
         print("registered " + path)
 
@@ -31,7 +31,7 @@ struct App:
         while i < len(self.routes):
             auto r = self.routes[i]
             if r.path == path:
-                fn(str)->str h = r.handler
+                fn(str) -> str h = r.handler
                 return h(body)
             i = i + 1
         return "404"
