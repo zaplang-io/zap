@@ -1,5 +1,5 @@
 def boom():
-    raise "kaboom"
+    raise ValueError("kaboom")
 
 def main():
     with expect_raises(ValueError):

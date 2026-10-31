@@ -4194,6 +4194,8 @@ enum Cleanup {
     WithExit { mgr: Value, exit_fn: String },
     /// A `try ... finally`: re-lower the `finally` block.
     Finally(ast::Block),
+    /// Balance a landing-pad `__cxa_begin_catch` on a structured early exit.
+    EndCatch,
 }
 
 /// State threaded through the lowering of a generator's `__next__` (I#67). The
@@ -4319,7 +4321,8 @@ impl<'a> FnLower<'a> {
             dest: m,
             bytes: msg.as_bytes().to_vec(),
         });
-        self.throwing_call(None, "zap_panic", vec![m]);
+        let type_error = self.iconst(Ty::I64, 4);
+        self.throwing_call(None, "zap_panic_typed", vec![type_error, m]);
         if !self.terminated() {
             self.set_term(Term::Unreachable);
         }
@@ -4412,6 +4415,7 @@ impl<'a> FnLower<'a> {
                     let block = block.clone();
                     self.lower_block(&block)?;
                 }
+                Cleanup::EndCatch => self.emit_end_catch(),
             }
             if self.terminated() {
                 break;
@@ -5673,7 +5677,7 @@ impl<'a> FnLower<'a> {
         });
         if !self.terminated() {
             self.emit_end_catch();
-            self.throwing_call(None, "zap_panic", vec![exc]);
+            self.throwing_call(None, "zap_raise", vec![exc]);
             if !self.terminated() {
                 self.set_term(Term::Unreachable);
             }
@@ -5782,12 +5786,9 @@ impl<'a> FnLower<'a> {
         });
     }
 
-    /// `raise EXPR` — build the exception and begin unwinding via `zap_panic`
-    /// (RUNTIME-ABI §"Exception / unwinding ABI"). For this increment the
-    /// exception object is the message string itself; the typed exception
-    /// hierarchy (D-0029) is deferred. `zap_panic` never returns, so the normal
-    /// path is `unreachable` (inside a `try`, the invoke's unwind edge carries
-    /// control to the landing pad instead).
+    /// `raise EXPR` begins unwinding with a typed exception value. Raising a
+    /// string uses the compatibility `zap_panic` entry, which wraps it in the
+    /// base `Exception` type.
     fn lower_raise(&mut self, value: Option<&Expr>) -> Result<(), LowerError> {
         let Some(e) = value else {
             return Err(err("bare 'raise' (re-raise) is not supported yet"));
@@ -5801,11 +5802,48 @@ impl<'a> FnLower<'a> {
                 dest: msg,
                 bytes: b"StopIteration".to_vec(),
             });
-            self.throwing_call(None, "zap_panic", vec![msg]);
+            let ty = self.iconst(Ty::I64, 11);
+            let exc = self.new_value(Ty::Ptr);
+            self.emit(Inst::Call {
+                dest: Some(exc),
+                func: "zap_exception_new".to_string(),
+                args: vec![ty, msg],
+            });
+            self.throwing_call(None, "zap_raise", vec![exc]);
             if !self.terminated() {
                 self.set_term(Term::Unreachable);
             }
             return Ok(());
+        }
+        if let Expr::Call { callee, args, .. } = e {
+            if let Expr::Name(name, _) = callee.as_ref() {
+                let custom_exception = self.ctx.ids.contains_key(name)
+                    && !self.ctx.enums.contains_key(name)
+                    && !self.sigs.contains_key(name);
+                if let Some(type_id) = exception_type_id_name(name)
+                    .or_else(|| custom_exception.then(|| custom_exception_type_id(name)))
+                {
+                    if args.len() != 1 || args[0].name.is_some() {
+                        return Err(err(format!("{name}() takes one positional message")));
+                    }
+                    let (message, ty) = self.expr(&args[0].value)?;
+                    if ty != Ty::Ptr {
+                        return Err(err(format!("{name}() message must be a str")));
+                    }
+                    let id = self.iconst(Ty::I64, type_id);
+                    let exc = self.new_value(Ty::Ptr);
+                    self.emit(Inst::Call {
+                        dest: Some(exc),
+                        func: "zap_exception_new".to_string(),
+                        args: vec![id, message],
+                    });
+                    self.throwing_call(None, "zap_raise", vec![exc]);
+                    if !self.terminated() {
+                        self.set_term(Term::Unreachable);
+                    }
+                    return Ok(());
+                }
+            }
         }
         let (v, vt) = self.expr(e)?;
         if vt != Ty::Ptr {
@@ -5968,9 +6006,8 @@ impl<'a> FnLower<'a> {
     /// except: __er_N = 1
     /// if __er_N == 0: raise "expected <ErrType> ... but none was raised"
     /// ```
-    /// so a raise inside BODY is swallowed and a missing one propagates (and is
-    /// caught by an enclosing test). Typed matching is catch-all until the typed
-    /// exception hierarchy (D-0029) lands — the type name is diagnostic only.
+    /// so only a matching raise inside BODY is swallowed and a missing or
+    /// mismatched one propagates (and is caught by an enclosing test).
     /// `with ITEM { , ITEM } : BODY` (D-0027, D-0069). The test-only
     /// `with expect_raises(ErrType):` (D-0054) keeps its bespoke desugaring;
     /// every other form drives the general `__enter__`/`__exit__` context-manager
@@ -6073,10 +6110,10 @@ impl<'a> FnLower<'a> {
         self.position(lp);
         let exc = self.new_value(Ty::Ptr);
         self.emit(Inst::LandingPad { dest: exc });
+        self.emit_end_catch();
         self.throwing_call(None, &exit_m, vec![mgr]);
         if !self.terminated() {
-            self.emit_end_catch();
-            self.throwing_call(None, "zap_panic", vec![exc]);
+            self.throwing_call(None, "zap_raise", vec![exc]);
             if !self.terminated() {
                 self.set_term(Term::Unreachable);
             }
@@ -6096,6 +6133,14 @@ impl<'a> FnLower<'a> {
             .first()
             .map(|a| ast::render_expr(&a.value))
             .unwrap_or_else(|| "an exception".to_string());
+        let caught_ty = args.first().and_then(|a| match &a.value {
+            Expr::Name(name, span) => Some(ast::Type::Named {
+                name: name.clone(),
+                args: Vec::new(),
+                span: *span,
+            }),
+            _ => None,
+        });
 
         // Build the desugared statements as AST and lower them, reusing the
         // existing try / if / raise lowering.
@@ -6118,7 +6163,7 @@ impl<'a> FnLower<'a> {
         let try_stmt = Stmt::Try {
             body: body.clone(),
             excepts: vec![ast::ExceptClause {
-                ty: None,
+                ty: caught_ty,
                 binding: None,
                 body: ast::Block {
                     stmts: vec![set_flag],
@@ -6171,12 +6216,11 @@ impl<'a> FnLower<'a> {
         id
     }
 
-    /// `try: BODY except [Type [as e]]: HANDLER finally: FIN` with real stack
-    /// unwinding. Calls in BODY become `invoke`s whose unwind edge targets a
-    /// landing-pad block; the handler matches catch-all for this increment
-    /// (type-directed `except` matching is deferred). `finally` runs on the
-    /// normal path and on the handled/propagating paths. If no `except` clause
-    /// is present the exception is re-raised after `finally` (Python semantics).
+    /// `try: BODY except [Type [as e]]: HANDLER finally: FIN` with typed,
+    /// source-ordered dispatch. Calls in BODY become `invoke`s whose unwind edge
+    /// targets a landing-pad block. Every clause gets a chance to match before
+    /// the exception is propagated; `finally` runs on normal, handled, and
+    /// unmatched paths.
     fn lower_try(
         &mut self,
         body: &ast::Block,
@@ -6224,17 +6268,63 @@ impl<'a> FnLower<'a> {
         self.position(lp);
         let exc = self.new_value(Ty::Ptr);
         self.emit(Inst::LandingPad { dest: exc });
-        if let Some(first) = excepts.first() {
-            // Catch-all handler (this increment). `as e` binds the message string.
+        let mut has_catch_all = false;
+        for clause in excepts {
+            let matched = self.new_block();
+            let type_id = clause.ty.as_ref().and_then(exception_type_id);
+            let next = type_id.map(|_| self.new_block());
+            if let Some(type_id) = type_id {
+                let expected = self.iconst(Ty::I64, type_id);
+                let is_a = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(is_a),
+                    func: "zap_exception_is_a".to_string(),
+                    args: vec![exc, expected],
+                });
+                let cond = self.new_value(Ty::I1);
+                let zero = self.iconst(Ty::I64, 0);
+                self.emit(Inst::ICmp {
+                    dest: cond,
+                    pred: CmpPred::Ne,
+                    lhs: is_a,
+                    rhs: zero,
+                });
+                self.set_term(Term::BrIf {
+                    cond,
+                    then_bb: matched,
+                    else_bb: next.unwrap(),
+                });
+            } else {
+                self.set_term(Term::Br(matched));
+                has_catch_all = true;
+            }
+
+            self.position(matched);
             self.push_scope();
-            if let Some(bind) = &first.binding {
+            if let Some(bind) = &clause.binding {
+                let message = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(message),
+                    func: "zap_exception_message".to_string(),
+                    args: vec![exc],
+                });
                 let slot = self.alloca(Ty::Ptr);
-                self.store(slot, exc);
+                self.store(slot, message);
                 self.declare(bind, slot, Ty::Ptr);
             }
-            for st in &first.body.stmts {
+            let handler_lp = self.new_block();
+            self.landing_pads.push(handler_lp);
+            let cleanup_depth = self.cleanups.len();
+            if let Some(f) = finally {
+                self.cleanups.push(Cleanup::Finally(f.clone()));
+            }
+            self.cleanups.push(Cleanup::EndCatch);
+            for st in &clause.body.stmts {
                 self.stmt(st)?;
             }
+            self.landing_pads.pop();
+            let handler_throws = self.used_lps.contains(&handler_lp);
+            self.cleanups.truncate(cleanup_depth);
             self.pop_scope();
             if !self.terminated() {
                 self.emit_end_catch();
@@ -6243,19 +6333,41 @@ impl<'a> FnLower<'a> {
                 }
                 self.ensure_br(after);
             }
-            // NOTE: a second/third `except` clause is currently unreachable
-            // (matching is catch-all). Type-directed dispatch is deferred.
-        } else {
-            // finally-only `try`: run cleanup, then propagate to the caller.
+            if handler_throws {
+                // A new exception raised by the handler replaces the caught one,
+                // but `finally` still runs. Close both active C++ catches before
+                // executing cleanup so a failure in `finally` propagates cleanly.
+                self.position(handler_lp);
+                let replacement = self.new_value(Ty::Ptr);
+                self.emit(Inst::LandingPad { dest: replacement });
+                self.emit_end_catch();
+                self.emit_end_catch();
+                if let Some(f) = finally {
+                    self.lower_block(f)?;
+                }
+                if !self.terminated() {
+                    self.throwing_call(None, "zap_raise", vec![replacement]);
+                    if !self.terminated() {
+                        self.set_term(Term::Unreachable);
+                    }
+                }
+            }
+            if has_catch_all {
+                break;
+            }
+            self.position(next.unwrap());
+        }
+
+        // A finally-only try, or an exception for which no typed clause matched:
+        // run cleanup and rethrow the same typed exception value.
+        if !has_catch_all {
+            self.emit_end_catch();
             if let Some(f) = finally {
                 self.lower_block(f)?;
             }
+            self.throwing_call(None, "zap_raise", vec![exc]);
             if !self.terminated() {
-                self.emit_end_catch();
-                self.throwing_call(None, "zap_panic", vec![exc]);
-                if !self.terminated() {
-                    self.set_term(Term::Unreachable);
-                }
+                self.set_term(Term::Unreachable);
             }
         }
 
@@ -6468,21 +6580,16 @@ impl<'a> FnLower<'a> {
                 body(self, v, elem)?;
                 self.loops.pop();
                 self.ensure_br(head);
-                // Landing pad: compare the in-flight exception message against the
-                // `StopIteration` sentinel (what `raise StopIteration` lowers to).
+                // Landing pad: match the typed StopIteration signal.
                 self.position(lp);
                 let exc = self.new_value(Ty::Ptr);
                 self.emit(Inst::LandingPad { dest: exc });
-                let sentinel = self.new_value(Ty::Ptr);
-                self.emit(Inst::StrConst {
-                    dest: sentinel,
-                    bytes: b"StopIteration".to_vec(),
-                });
+                let stop_id = self.iconst(Ty::I64, 11);
                 let eq = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
                     dest: Some(eq),
-                    func: "zap_str_eq".to_string(),
-                    args: vec![exc, sentinel],
+                    func: "zap_exception_is_a".to_string(),
+                    args: vec![exc, stop_id],
                 });
                 let zero = self.iconst(Ty::I64, 0);
                 let is_stop = self.new_value(Ty::I1);
@@ -6499,7 +6606,7 @@ impl<'a> FnLower<'a> {
                     else_bb: reraise,
                 });
                 self.position(reraise);
-                self.throwing_call(None, "zap_panic", vec![exc]);
+                self.throwing_call(None, "zap_raise", vec![exc]);
                 if !self.terminated() {
                     self.set_term(Term::Unreachable);
                 }
@@ -12740,6 +12847,47 @@ impl<'a> FnLower<'a> {
 
 fn is_name(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Name(n, _) if n == name)
+}
+
+/// Stable runtime ids for the built-in exception hierarchy (I#471). Keep these
+/// in sync with the `ZAP_EXC_*` constants in `zaprt.c` and the table in §10.
+fn exception_type_id_name(name: &str) -> Option<i64> {
+    Some(match name {
+        "BaseException" => 1,
+        "Exception" => 2,
+        "ValueError" => 3,
+        "TypeError" => 4,
+        "LookupError" => 5,
+        "IndexError" => 6,
+        "KeyError" => 7,
+        "ArithmeticError" => 8,
+        "ZeroDivisionError" => 9,
+        "RuntimeError" => 10,
+        "StopIteration" => 11,
+        "Cancelled" => 12,
+        "ExceptionGroup" => 13,
+        _ => return None,
+    })
+}
+
+fn exception_type_id(ty: &ast::Type) -> Option<i64> {
+    match ty {
+        ast::Type::Named { name, args, .. } if args.is_empty() => {
+            Some(exception_type_id_name(name).unwrap_or_else(|| custom_exception_type_id(name)))
+        }
+        _ => None,
+    }
+}
+
+/// Stable per-name ids for user exception types. They use a disjoint range from
+/// the built-ins and have `Exception` as their implicit parent in the runtime.
+fn custom_exception_type_id(name: &str) -> i64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    ((hash & 0x1fff_ffff_ffff_ffff) + 1024) as i64
 }
 
 /// The free variables of a lambda body (I#163), in first-seen order: every name

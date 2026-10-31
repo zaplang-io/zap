@@ -38,8 +38,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   (D-0018/D-0046); operators with overloading and `@derive(Eq, Ord, Hash, Repr)`;
   control flow including `match` and the iteration protocol (D-0048);
   functions, lambdas, generators, default/keyword/variadic args, comprehensions
-  and slicing; first-class function values and closures (D-0067); exceptions and
-  `with`/context managers (D-0069); modules, imports and visibility; regex
+  and slicing; first-class function values and closures (D-0067); typed built-in
+  exceptions with source-order `except` dispatch and subclass matching; `with`/
+  context managers (D-0069); modules, imports and visibility; regex
   (D-0010); decorators and annotations (D-0036); generics with bounds (D-0064);
   coroutines, channels, `select`, `scope:` and `spawn detached`
   (D-0031/0044/0045); sync primitives and `Atomic[T]` (D-0032/0066);

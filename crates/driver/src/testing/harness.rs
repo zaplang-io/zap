@@ -34,8 +34,7 @@ struct Modifiers {
     skip: Option<Option<String>>,
     /// `@skip_if(cond [, reason])` — skipped at runtime when `cond` is truthy.
     skip_if: Option<(Expr, Option<String>)>,
-    /// `@expect_raises(ErrType)` — the test must raise (type name is display
-    /// only; matching is catch-all until typed exceptions land).
+    /// `@expect_raises(ErrType)` — the test must raise a matching exception.
     expect_raises: Option<String>,
     /// `@parametrize(cases=[...])` — one sub-test per case row.
     cases: Option<Vec<Expr>>,
@@ -253,6 +252,11 @@ fn run_body(
 ) -> Vec<Stmt> {
     let mut out: Vec<Stmt> = Vec::new();
     let expecting = mods.expect_raises.is_some();
+    let expected_type = mods.expect_raises.as_ref().map(|name| Type::Named {
+        name: name.clone(),
+        args: Vec::new(),
+        span: SP,
+    });
 
     // `__zt_fail` is the outcome flag (0 = pass, 1 = fail). String comparison is
     // not lowered yet, so an integer flag keeps the generated code inside the
@@ -292,7 +296,7 @@ fn run_body(
     out.push(Stmt::Try {
         body: block(body),
         excepts: vec![ExceptClause {
-            ty: None,
+            ty: expected_type,
             binding: Some("__zt_e".to_string()),
             body: block(handler),
             span: SP,

@@ -932,7 +932,7 @@ static void zap_trace_children(void *payload) {
         Scope *sc = (Scope *)payload;
         if (sc->excs) {
             zap_mark_push((void *)sc->excs); /* pin: runtime-owned buffer */
-            ZapStr **excs = sc->excs;
+            void **excs = sc->excs;
             for (int64_t i = 0; i < sc->nexc; i++) {
                 zap_process_slot((void **)&excs[i]);
             }

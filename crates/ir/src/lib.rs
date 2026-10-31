@@ -1545,7 +1545,7 @@ def main():
     #[test]
     fn lower_stopiteration_iterable() {
         // The Python form drives through a landing pad that checks the in-flight
-        // exception against the `StopIteration` sentinel.
+        // exception's runtime type against `StopIteration`.
         let m = lower_ok(
             "\
 struct Count:
@@ -1574,8 +1574,21 @@ def main():
         );
         let text = format!("{m}");
         assert!(text.contains("strconst \"StopIteration\""), "text:\n{text}");
-        assert!(text.contains("@zap_str_eq"), "text:\n{text}");
+        assert!(text.contains("@zap_exception_is_a"), "text:\n{text}");
         assert!(text.contains("landingpad"), "text:\n{text}");
+    }
+
+    #[test]
+    fn lower_typed_exception_dispatch_and_message_binding() {
+        let m = lower_ok(include_str!(
+            "../../../tests/conformance/exception_typed_dispatch.zap"
+        ));
+        let text = format!("{m}");
+        assert!(text.contains("@zap_exception_new"), "text:\n{text}");
+        assert!(text.contains("@zap_exception_is_a"), "text:\n{text}");
+        assert!(text.contains("@zap_exception_message"), "text:\n{text}");
+        assert!(text.contains("@zap_raise"), "text:\n{text}");
+        assert!(text.contains("@zap_eh_end_catch"), "text:\n{text}");
     }
 
     #[test]

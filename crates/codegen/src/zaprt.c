@@ -435,6 +435,74 @@ typedef struct {
     const char *data;
 } ZapStr;
 
+/* Typed Zap exception values (I#471). The thrown C++ object still carries one
+ * pointer, but that pointer now identifies the Zap type and its message. */
+typedef struct {
+    uint64_t magic;
+    int64_t type_id;
+    void *message;
+} ZapException;
+#define ZAP_EXCEPTION_MAGIC UINT64_C(0x5a41504558434550)
+static const int32_t zap_exc_ptr_offsets[] = {(int32_t)offsetof(ZapException, message)};
+static const ZapTypeDesc zap_desc_exception = {
+    (int64_t)sizeof(ZapException), ZAP_TD_PRECISE, 1, zap_exc_ptr_offsets};
+static void *zap_current_exc;
+
+enum {
+    ZAP_EXC_BASE = 1,
+    ZAP_EXC_EXCEPTION = 2,
+    ZAP_EXC_VALUE_ERROR = 3,
+    ZAP_EXC_TYPE_ERROR = 4,
+    ZAP_EXC_LOOKUP_ERROR = 5,
+    ZAP_EXC_INDEX_ERROR = 6,
+    ZAP_EXC_KEY_ERROR = 7,
+    ZAP_EXC_ARITHMETIC_ERROR = 8,
+    ZAP_EXC_ZERO_DIVISION_ERROR = 9,
+    ZAP_EXC_RUNTIME_ERROR = 10,
+    ZAP_EXC_STOP_ITERATION = 11,
+    ZAP_EXC_CANCELLED = 12,
+    ZAP_EXC_EXCEPTION_GROUP = 13,
+};
+
+void *zap_exception_new(int64_t type_id, void *message) {
+    ZapException *e = (ZapException *)zap_obj(&zap_desc_exception);
+    e->magic = ZAP_EXCEPTION_MAGIC;
+    e->type_id = type_id;
+    e->message = message;
+    return e;
+}
+
+void *zap_exception_message(void *exc) {
+    ZapException *e = (ZapException *)exc;
+    return e && e->magic == ZAP_EXCEPTION_MAGIC ? e->message : NULL;
+}
+
+static int64_t zap_exception_parent(int64_t type_id) {
+    switch (type_id) {
+    case ZAP_EXC_EXCEPTION: return ZAP_EXC_BASE;
+    case ZAP_EXC_VALUE_ERROR: case ZAP_EXC_TYPE_ERROR: case ZAP_EXC_LOOKUP_ERROR:
+    case ZAP_EXC_ARITHMETIC_ERROR: case ZAP_EXC_RUNTIME_ERROR:
+    case ZAP_EXC_STOP_ITERATION: case ZAP_EXC_EXCEPTION_GROUP:
+        return ZAP_EXC_EXCEPTION;
+    case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
+    case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;
+    case ZAP_EXC_CANCELLED: return ZAP_EXC_BASE;
+    default: return type_id >= 1024 ? ZAP_EXC_EXCEPTION : 0;
+    }
+}
+
+int64_t zap_exception_is_a(void *exc, int64_t expected) {
+    if (!exc) return 0;
+    ZapException *e = (ZapException *)exc;
+    if (e->magic != ZAP_EXCEPTION_MAGIC) return 0;
+    int64_t actual = e->type_id;
+    while (actual != 0) {
+        if (actual == expected) return 1;
+        actual = zap_exception_parent(actual);
+    }
+    return 0;
+}
+
 /* Runtime startup: initialize the collector before any Zap code runs. Under
  * Boehm this is `GC_INIT`; under Immix it registers the main OS thread (which
  * runs top-level Zap) as a mutator for the stop-the-world handshake. */
@@ -510,6 +578,8 @@ typedef struct {
     double im;
 } ZapComplex;
 void zap_panic(void *exc);
+void zap_raise(void *exc);
+void zap_panic_typed(int64_t type_id, void *message);
 
 static ZapComplex *zap_complex_alloc(double re, double im) {
     ZapComplex *z = (ZapComplex *)zap_buf((int64_t)sizeof(ZapComplex));
@@ -541,7 +611,8 @@ void *zap_complex_div(void *ap, void *bp) {
     const ZapComplex *b = (const ZapComplex *)bp;
     double d = b->re * b->re + b->im * b->im;
     if (d == 0.0) {
-        zap_panic(zap_str_new("complex division by zero", 24));
+        zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR,
+                        zap_str_new("complex division by zero", 24));
     }
     return zap_complex_alloc((a->re * b->re + a->im * b->im) / d,
                              (a->im * b->re - a->re * b->im) / d);
@@ -843,7 +914,7 @@ void *zap_bigint_mul(void *ap, void *bp) {
     ZapBigInt*v=zap_big_make(a->sign*b->sign,r.limb,r.n);free(r.limb);return v;
 }
 static void zap_big_divmod_signed(const ZapBigInt*a,const ZapBigInt*b,ZapBigRaw*q,ZapBigRaw*r,int*qs,int*rs){
-    if(!b->sign)zap_panic(zap_str_new("integer division or modulo by zero",34));
+    if(!b->sign)zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR,zap_str_new("integer division or modulo by zero",34));
     zap_big_raw_divmod(a->limb,a->n,b->limb,b->n,q,r);
     *qs=a->sign*b->sign;*rs=a->sign;
     if(a->sign!=b->sign&&r->n){
@@ -928,7 +999,7 @@ void zap_panic(void *exc);
  * emits an `invoke`, mirroring the index faults of #398/#383). */
 int64_t zap_ifloordiv(int64_t a, int64_t b) {
     if (b == 0) {
-        zap_panic(zap_str_new("integer division or modulo by zero", 34));
+        zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("integer division or modulo by zero", 34));
     }
     int64_t q = a / b;
     int64_t r = a % b;
@@ -951,7 +1022,7 @@ double zap_ffloordiv(double a, double b) { return floor(a / b); }
  * D-0007) raised with the same message as floor division. */
 int64_t zap_imod(int64_t a, int64_t b) {
     if (b == 0) {
-        zap_panic(zap_str_new("integer division or modulo by zero", 34));
+        zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("integer division or modulo by zero", 34));
     }
     int64_t r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) {
@@ -1032,7 +1103,7 @@ static int64_t zap_list_norm(ZapList *l, int64_t i) {
         if (n >= (int)sizeof buf) {
             n = (int)sizeof buf - 1;
         }
-        zap_panic(zap_str_new(buf, (int64_t)n));
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(buf, (int64_t)n));
     }
     return i;
 }
@@ -2047,12 +2118,10 @@ int64_t zap_array_sum_bool(void *ap) {
  * landing pads catch via the libstdc++ personality (`__gxx_personality_v0` on
  * Linux/macOS, `__gxx_personality_seh0` on MinGW-w64 Windows — the name is chosen
  * by codegen from the target triple, ticket #197/A3; the glue below is identical
- * across both unwind models), and `except` matching is catch-all for this
- * increment.
+ * across both unwind models). The C++ clause catches Zap's single transport
+ * type; language-level dispatch uses the runtime type id in the Zap object.
  *
- * The thrown C++ exception just boxes a pointer to the Zap exception object,
- * which is currently the message string itself (a ZapStr*); the typed Zap
- * exception hierarchy (D-0029) and type-directed `except` dispatch are deferred.
+ * The thrown C++ exception boxes a pointer to a typed Zap exception object.
  * Keeping all the C++-ABI glue here lets codegen stay a mechanical ZIR->LLVM
  * translator (it only emits `invoke`/`landingpad` and names these entry points).
  * ------------------------------------------------------------------------- */
@@ -2077,18 +2146,23 @@ const ZapTypeInfo zap_exception_type_info = {
     "ZapException",
 };
 
-/* Keep the in-flight Zap exception object reachable for the conservative GC
- * while it is boxed inside the (malloc'd, unscanned) C++ exception buffer.
- * GC-during-unwind is tracked more thoroughly in ticket #20. */
-static void *zap_current_exc;
+/* Keep the in-flight Zap exception object reachable while it is boxed inside
+ * the (malloc'd, unscanned) C++ exception buffer. */
+/* Legacy `raise "message"` and unclassified runtime faults are Exception. */
+void zap_panic(void *message) {
+    zap_raise(zap_exception_new(ZAP_EXC_EXCEPTION, message));
+}
 
-/* `raise` / built-in faults: begin unwinding carrying the Zap exception object
- * `exc` (currently a ZapStr* message). Never returns normally. */
-void zap_panic(void *exc) {
+/* Begin unwinding with an already-typed Zap exception object. */
+void zap_raise(void *exc) {
     zap_current_exc = exc;
     void **slot = (void **)__cxa_allocate_exception(sizeof(void *));
     *slot = exc;
     __cxa_throw(slot, (void *)&zap_exception_type_info, NULL);
+}
+
+void zap_panic_typed(int64_t type_id, void *message) {
+    zap_raise(zap_exception_new(type_id, message));
 }
 
 /* Landing-pad entry: recover the Zap exception object from the in-flight C++
@@ -2151,13 +2225,13 @@ int64_t zap_repl_call(void (*thunk)(void)) {
 
 /* The `ZapStr *` message of the exception caught by the most recent
  * `zap_repl_call` that returned non-zero (or NULL). */
-void *zap_repl_last_exc(void) { return zap_repl_exc; }
+void *zap_repl_last_exc(void) { return zap_exception_message(zap_repl_exc); }
 
 /* Expose the caught exception message as (data, len) for the Rust driver, which
  * copies it out immediately (before any allocation). Returns the length and
  * sets `*out_data` to the message bytes (NULL / 0 if there was none). */
 int64_t zap_repl_last_exc_bytes(const char **out_data) {
-    ZapStr *s = (ZapStr *)zap_repl_exc;
+    ZapStr *s = (ZapStr *)zap_exception_message(zap_repl_exc);
     if (s == NULL) {
         *out_data = NULL;
         return 0;
@@ -2233,9 +2307,11 @@ void zap_uncaught(void *exc) {
          * the top-level landing pad restored the shadow head, so the longjmp
          * leaves the runtime in a consistent state. */
         zap_repl_exc = exc;
+        zap_eh_end_catch();
         longjmp(*zap_repl_catch, 1);
     }
-    ZapStr *msg = (ZapStr *)exc;
+    ZapStr *msg = (ZapStr *)zap_exception_message(exc);
+    zap_eh_end_catch();
     fputs("Uncaught exception: ", stderr);
     if (msg != NULL && msg->len > 0) {
         fwrite(msg->data, 1, (size_t)msg->len, stderr);
@@ -2447,7 +2523,7 @@ int32_t zap_str_index(void *sp, int64_t idx) {
         idx += count;
     }
     if (idx < 0 || idx >= count) {
-        zap_panic(zap_str_new("string index out of range", 25));
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new("string index out of range", 25));
     }
     int64_t off = zap_str_byteoff(s, idx);
     return zap_utf8_decode(d, off, zap_utf8_width(d[off]));
@@ -3481,8 +3557,24 @@ static char *zap_py_cstr(const ZapStr *s) {
 }
 
 /* Translate the current Python error to a Zap exception and raise it. Releases
- * the GIL first (the caller passes its gstate), then calls `zap_panic`, which
+ * the GIL first (the caller passes its gstate), then raises the mapped Zap type,
  * unwinds and never returns. */
+static int64_t zap_py_exception_type_id(const char *name) {
+    const char *short_name = strrchr(name, '.');
+    if (short_name != NULL) name = short_name + 1;
+    if (strcmp(name, "ValueError") == 0) return ZAP_EXC_VALUE_ERROR;
+    if (strcmp(name, "TypeError") == 0) return ZAP_EXC_TYPE_ERROR;
+    if (strcmp(name, "IndexError") == 0) return ZAP_EXC_INDEX_ERROR;
+    if (strcmp(name, "KeyError") == 0) return ZAP_EXC_KEY_ERROR;
+    if (strcmp(name, "ZeroDivisionError") == 0) return ZAP_EXC_ZERO_DIVISION_ERROR;
+    if (strcmp(name, "ArithmeticError") == 0) return ZAP_EXC_ARITHMETIC_ERROR;
+    if (strcmp(name, "LookupError") == 0) return ZAP_EXC_LOOKUP_ERROR;
+    if (strcmp(name, "RuntimeError") == 0) return ZAP_EXC_RUNTIME_ERROR;
+    if (strcmp(name, "ExceptionGroup") == 0) return ZAP_EXC_EXCEPTION_GROUP;
+    if (strcmp(name, "BaseException") == 0) return ZAP_EXC_BASE;
+    return ZAP_EXC_EXCEPTION;
+}
+
 static void zap_py_raise(PyGILState_STATE g) {
     PyObject *type = NULL, *value = NULL, *tb = NULL;
     PyErr_Fetch(&type, &value, &tb);
@@ -3501,11 +3593,12 @@ static void zap_py_raise(PyGILState_STATE g) {
             Py_DECREF(s);
         }
     }
+    int64_t type_id = zap_py_exception_type_id(tname);
     Py_XDECREF(type);
     Py_XDECREF(value);
     Py_XDECREF(tb);
     PyGILState_Release(g);
-    zap_panic(msg);
+    zap_panic_typed(type_id, msg);
 }
 
 /* `import python "module"` → a module handle. */
@@ -4925,7 +5018,7 @@ typedef struct Scope {
     int64_t live;          /* owned coroutines not yet finished                */
     int cancelled;         /* cancellation requested (armed cooperatively)     */
     int on_error;          /* 0 = Cancel (default), 1 = Wait (D-0044)          */
-    ZapStr **excs;         /* collected failures from owned coroutines (GC)    */
+    void **excs;           /* collected typed exceptions from owned coroutines */
     int64_t nexc;
     int64_t exc_cap;
 } Scope;
@@ -4934,12 +5027,12 @@ typedef struct Scope {
  * single cached ZapStr whose pointer identity marks a cooperative cancel, so a
  * cancelled sibling is told apart from a genuine failure by identity, not text.
  * Held in a GC-scanned static, so it stays live. */
-static ZapStr *g_cancelled = NULL;
+static void *g_cancelled = NULL;
 static pthread_mutex_t g_cancelled_mu = PTHREAD_MUTEX_INITIALIZER;
-static ZapStr *cancelled_exc(void) {
+static void *cancelled_exc(void) {
     zap_np_lock(&g_cancelled_mu);
     if (!g_cancelled) {
-        g_cancelled = (ZapStr *)zap_str_new("Cancelled", 9);
+        g_cancelled = zap_exception_new(ZAP_EXC_CANCELLED, zap_str_new("Cancelled", 9));
     }
     zap_np_unlock(&g_cancelled_mu);
     return g_cancelled;
@@ -5018,7 +5111,7 @@ static int g_is_cancelled(void) {
 /* A cancellation point: raise `Cancelled` if the current coroutine was armed. */
 static void zap_check_cancel(void) {
     if (g_is_cancelled()) {
-        zap_panic((void *)cancelled_exc());
+        zap_raise(cancelled_exc());
     }
 }
 
@@ -5088,8 +5181,8 @@ static void scope_join(Scope *sc) {
 /* Order the collected failures deterministically (by message bytes) so an
  * `ExceptionGroup` built from concurrent failures has a stable rendering. */
 static int exc_cmp(const void *a, const void *b) {
-    const ZapStr *x = *(const ZapStr *const *)a;
-    const ZapStr *y = *(const ZapStr *const *)b;
+    const ZapStr *x = (const ZapStr *)zap_exception_message(*(void *const *)a);
+    const ZapStr *y = (const ZapStr *)zap_exception_message(*(void *const *)b);
     int64_t n = x->len < y->len ? x->len : y->len;
     int c = n > 0 ? memcmp(x->data, y->data, (size_t)n) : 0;
     if (c != 0) {
@@ -5099,19 +5192,18 @@ static int exc_cmp(const void *a, const void *b) {
 }
 
 /* Build the aggregate `ExceptionGroup` message for `n (>= 2)` concurrent
- * failures (D-0045). The typed `ExceptionGroup` object is a follow-up (the
- * exception increment carries the message string only, RUNTIME-ABI); this
- * renders the aggregate as a deterministic multi-line message. */
-static void *make_exception_group(ZapStr **excs, int64_t n) {
-    ZapStr **sorted = (ZapStr **)zap_ptrbuf((int64_t)n * (int64_t)sizeof(ZapStr *));
-    memcpy(sorted, excs, (size_t)n * sizeof(ZapStr *));
-    qsort(sorted, (size_t)n, sizeof(ZapStr *), exc_cmp);
+ * failures (D-0045); the caller wraps it in the typed exception. */
+static void *make_exception_group(void **excs, int64_t n) {
+    void **sorted = (void **)zap_ptrbuf((int64_t)n * (int64_t)sizeof(void *));
+    memcpy(sorted, excs, (size_t)n * sizeof(void *));
+    qsort(sorted, (size_t)n, sizeof(void *), exc_cmp);
     char header[64];
     int hlen = snprintf(header, sizeof(header),
                         "ExceptionGroup (%lld sub-exceptions):", (long long)n);
     int64_t total = hlen;
     for (int64_t i = 0; i < n; i++) {
-        total += 5 + (sorted[i] ? sorted[i]->len : 0); /* "\n  - " + message */
+        ZapStr *msg = (ZapStr *)zap_exception_message(sorted[i]);
+        total += 5 + (msg ? msg->len : 0); /* "\n  - " + message */
     }
     char *buf = (char *)zap_buf((size_t)total);
     int64_t off = 0;
@@ -5120,9 +5212,10 @@ static void *make_exception_group(ZapStr **excs, int64_t n) {
     for (int64_t i = 0; i < n; i++) {
         memcpy(buf + off, "\n  - ", 5);
         off += 5;
-        if (sorted[i] && sorted[i]->len > 0) {
-            memcpy(buf + off, sorted[i]->data, (size_t)sorted[i]->len);
-            off += sorted[i]->len;
+        ZapStr *msg = (ZapStr *)zap_exception_message(sorted[i]);
+        if (msg && msg->len > 0) {
+            memcpy(buf + off, msg->data, (size_t)msg->len);
+            off += msg->len;
         }
     }
     return zap_str_new(buf, off);
@@ -5143,9 +5236,10 @@ void zap_scope_exit(void *scope_) {
         return;
     }
     if (sc->nexc == 1) {
-        zap_panic(sc->excs[0]);
+        zap_raise(sc->excs[0]);
     }
-    zap_panic(make_exception_group(sc->excs, sc->nexc));
+    zap_raise(zap_exception_new(ZAP_EXC_EXCEPTION_GROUP,
+                                make_exception_group(sc->excs, sc->nexc)));
 }
 
 /* Early-exit/failure join (D-0044 rule 4): the parent block is leaving with its
@@ -5175,23 +5269,25 @@ void zap_g_uncaught(void *exc) {
     if (g && g->scope) {
         Scope *sc = g->scope;
         if (exc == (void *)cancelled_exc()) {
+            zap_eh_end_catch();
             return; /* a cooperatively-cancelled sibling: not a failure */
         }
         zap_np_lock(&sc->mu);
         if (sc->nexc == sc->exc_cap) {
             int64_t ncap = sc->exc_cap ? sc->exc_cap * 2 : 4;
-            ZapStr **nx = (ZapStr **)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapStr *));
+            void **nx = (void **)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(void *));
             if (sc->excs) {
-                memcpy(nx, sc->excs, (size_t)sc->nexc * sizeof(ZapStr *));
+                memcpy(nx, sc->excs, (size_t)sc->nexc * sizeof(void *));
             }
             sc->excs = nx;
             sc->exc_cap = ncap;
         }
-        sc->excs[sc->nexc++] = (ZapStr *)exc;
+        sc->excs[sc->nexc++] = exc;
         if (sc->on_error == 0) {
             sc->cancelled = 1; /* OnError.Cancel: a failure cancels siblings */
         }
         zap_np_unlock(&sc->mu);
+        zap_eh_end_catch();
         return;
     }
     zap_uncaught(exc); /* root/detached: abort (never returns) */
@@ -9540,6 +9636,7 @@ static void zap_reflect_mark_roots(void) {
 /* Register the precise collector's static roots once at startup. */
 __attribute__((constructor)) static void zap_gc_register_statics(void) {
     zap_gc_add_root((void **)&g_cancelled);
+    zap_gc_add_root((void **)&zap_current_exc);
     zap_gc_add_root_fn(zap_reflect_mark_roots);
     zap_gc_add_root_fn(zap_sig_mark_roots); /* ticket #77: notify subscribers    */
 }

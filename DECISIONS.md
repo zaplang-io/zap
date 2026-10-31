@@ -229,6 +229,12 @@ Python-like `try` / `except` / `raise` / `finally`, with a Python-like exception
 hierarchy (user-defined exceptions subclass a base). Resolves the D-0007
 keyword question → **`except`** (not `catch`).
 
+The built-in hierarchy and typed dispatch are specified in SPEC §10. Exception
+objects carry their runtime type identity and message; `except E` matches `E`
+and its subclasses in source order. `Cancelled` is a `BaseException` outside
+`Exception`, so ordinary `except Exception` handlers do not swallow
+cancellation.
+
 ## D-0030 — Slicing semantics: list copies, array views
 **Status:** Locked
 Python-style slice syntax everywhere. **`list[T]` slices are copies** (Python
