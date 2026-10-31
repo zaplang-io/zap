@@ -55,7 +55,7 @@ fn lower_thread_ctor(lowerer: &mut FnLower, args: &[ast::Arg]) -> Result<(Value,
         .first()
         .map(|(_, t)| *t)
         .ok_or_else(|| err("Thread struct layout missing its target field"))?;
-    let target_v = lowerer.expr_coerced(target_expr, target_ty)?;
+    let target_v = lowerer.expr_coerced(target_expr, target_ty, zapc_diag::ErrorCode::ZAP4021)?;
     let daemon_v = match daemon_expr {
         Some(e) => lowerer.expr(e)?.0,
         None => {
