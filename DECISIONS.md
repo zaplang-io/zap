@@ -2329,3 +2329,56 @@ covers the repro plus mixed scalar/str/list/nested-struct defaults under fully-
 and partially-omitted construction, asserting parity with the explicit-arg form
 and mutable-default independence. Follow-up: restore the `list[Route]` router
 form in `fn_decorator_register` (D-0087), now unblocked.
+
+## D-0089 — Function/callable signature reflection (I#458)
+**Status:** Locked — extends [[D-0036]] (struct/type reflection) and [[D-0087]]
+(function-level reflection) to **signatures**.
+
+D-0036 shipped struct/type annotation reflection (`reflect_has`/`reflect_names`)
+and D-0087 keyed it to functions; both expose only decorator/annotation *names*.
+There was no way to introspect a callable's *shape* — parameter names, declared
+types, defaults, or per-parameter annotations — which is the substrate
+FastAPI-style typed per-parameter injection and `Depends(...)` dependency
+injection need (the fastzap web framework, I#312 / fastzap#7, "capability B";
+pairs with D-0087's `@app.get` lowering for the fully-typed `@app.get(id: int,
+q: str = ...)` form).
+
+**Surface.** Five string-keyed query builtins, mirroring the existing reflection
+shape. The `owner` is a function name (top-level `def`) or `"Type.method"` (struct
+or tier-3 enum method); the implicit `self` receiver is excluded:
+- `reflect_params(owner) -> str` — comma-joined parameter names, declaration order
+  (parallels `reflect_names`); `""` if none/unknown.
+- `reflect_sig(owner) -> str` — a readable one-line signature built at compile time,
+  e.g. `(id: int, q: str = ...) -> str`; a defaulted param is marked `= ...` and an
+  annotated one is `@anno`-prefixed. `""` for an unknown owner.
+- `reflect_param_type(owner, param) -> str` — rendered declared type (`list[str]`,
+  `fn(Request) -> Response`); `""` if untyped/not found.
+- `reflect_param_has_default(owner, param) -> bool` (parallels `reflect_has`).
+- `reflect_param_annotations(owner, param) -> str` — comma-joined per-param
+  annotation names; `""` if none.
+
+**Per-parameter annotations.** A *declared* `annotation`/`decorator` on a parameter
+(`def h(@Inject Svc dep)`) is now recorded as reflectable metadata instead of the
+old blanket "parameter decorators are not implemented yet (deferred)" IR error —
+the same model D-0087 established for function-level annotations. Behavioral and
+unknown names stay deferred (unknowns already rejected by sema's ZAP5032). This is
+a **small grammar change**: the parser now accepts inline `@name(args)` prefixes in
+a parameter list (the `Param.decorators` AST field already existed; `GRAMMAR.ebnf`
+`param` loosened from `[ … ]` to `{ … }`), and `zap fmt` round-trips them.
+
+**Mechanism.** `DecoratorPlan::collect` (`crates/ir/src/lower.rs`) gathers one
+`FnReflect` per top-level function and per struct/enum method in the user module;
+each holds the per-parameter metadata and a precomputed signature string. These are
+emitted once at the top of `main`, beside the D-0036 struct-registry bootstrap, via
+`zap_reflect_param_register` / `zap_reflect_sig_register` into two static runtime
+tables (`crates/codegen/src/zaprt.c`), enumerated by the existing Immix
+`zap_reflect_mark_roots` custom GC root. Reflection metadata is present for **any**
+named function (not only decorated ones), since route handlers are plain `def`s.
+
+**First-class values.** Opaque first-class function values / closures (D-0067,
+I#163) are not reflectable *by value* — you reflect the named `def`; a parameter
+*typed* `fn(...)->...` is reflected by its rendered type (statically known).
+
+Golden `tests/golden/reflect_params` (CI full-LLVM + arm64) exercises a plain fn, a
+defaulted/annotated fn, a struct method, and unknown owner/param lookups; an IR unit
+test asserts the registration + query lowering host-side.

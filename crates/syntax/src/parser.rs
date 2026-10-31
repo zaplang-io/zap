@@ -1353,11 +1353,17 @@ impl Parser {
 
     fn parse_param(&mut self) -> Param {
         let start = self.peek_span().start;
+        // Inline parameter decorators/annotations (I#458, D-0089): `@Inject` in
+        // `def f(@Inject Svc dep)`. Unlike item-level decorators these sit inline
+        // with the type/name, so no trailing newline is consumed. A *declared*
+        // annotation/decorator here is reflectable metadata; anything else is
+        // rejected downstream (sema ZAP5032 / IR deferral).
+        let decorators = self.parse_inline_param_decorators();
         // `self` receiver (untyped).
         if matches!(self.peek(), TokenKind::Ident(n) if n == "self") {
             self.bump();
             return Param {
-                decorators: Vec::new(),
+                decorators,
                 ty: None,
                 name: "self".to_string(),
                 default: None,
@@ -1374,13 +1380,36 @@ impl Parser {
             None
         };
         Param {
-            decorators: Vec::new(),
+            decorators,
             ty,
             name,
             default,
             variadic,
             span: self.span_from(start),
         }
+    }
+
+    /// Parse zero or more inline parameter decorators `@name(args)` (I#458). No
+    /// trailing newline is consumed — the decorators immediately precede the
+    /// parameter's type.
+    fn parse_inline_param_decorators(&mut self) -> Vec<Decorator> {
+        let mut v = Vec::new();
+        while self.is(&TokenKind::At) {
+            let start = self.peek_span().start;
+            self.bump();
+            let name = self.dotted_name();
+            let args = if self.eat(&TokenKind::LParen) {
+                self.parse_args()
+            } else {
+                Vec::new()
+            };
+            v.push(Decorator {
+                name,
+                args,
+                span: self.span_from(start),
+            });
+        }
+        v
     }
 
     fn parse_struct(&mut self, decorators: Vec<Decorator>, is_value: bool) -> StructDef {

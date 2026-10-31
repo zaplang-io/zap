@@ -255,6 +255,12 @@ const BUILTINS: &[&str] = &[
     "format",
     "reflect_has",
     "reflect_names",
+    // Function/callable signature reflection (I#458, D-0089).
+    "reflect_params",
+    "reflect_param_type",
+    "reflect_param_has_default",
+    "reflect_param_annotations",
+    "reflect_sig",
     "checkpoint",
     // REPL session-binding slot intrinsics (I#159): synthesized by the `zap repl`
     // driver to persist `let` values across entries, never written by users.
@@ -3894,6 +3900,23 @@ impl Checker {
                     self.check_reflect_args(fname, 1, args, span);
                     return Ty::Str;
                 }
+                // Function/callable signature reflection (I#458, D-0089). All are
+                // string-keyed like the struct/type surface above: the owner is a
+                // function name (top-level `def`) or `"Type.method"`. `reflect_params`
+                // / `reflect_sig` take just the owner; the per-parameter queries take
+                // the owner plus a parameter name. See `design/0004-decorators.md`.
+                "reflect_params" | "reflect_sig" => {
+                    self.check_reflect_args(fname, 1, args, span);
+                    return Ty::Str;
+                }
+                "reflect_param_type" | "reflect_param_annotations" => {
+                    self.check_reflect_args(fname, 2, args, span);
+                    return Ty::Str;
+                }
+                "reflect_param_has_default" => {
+                    self.check_reflect_args(fname, 2, args, span);
+                    return Ty::Bool;
+                }
                 // `checkpoint()` (D-0044): an explicit cancellation point for long
                 // CPU-bound loops. Takes no arguments; may raise `Cancelled`.
                 "checkpoint" => {
@@ -5630,6 +5653,24 @@ def main():
         // Non-string argument is rejected.
         let e = errors("def main():\n    print(reflect_has(1, 2))\n");
         assert!(!e.is_empty(), "reflect_has should want str args");
+    }
+
+    #[test]
+    fn signature_reflection_builtins_type_check() {
+        // Signature reflection (I#458, D-0089): string-keyed queries returning
+        // str / bool. A declared annotation on a parameter is accepted.
+        ok("annotation Inject:\n    str service = \"\"\n\n\
+            def h(str name, @Inject int64 dep, str q = \"x\") -> str:\n    return name\n\n\
+            def main():\n    print(reflect_params(\"h\"))\n    print(reflect_sig(\"h\"))\n    \
+            print(reflect_param_type(\"h\", \"name\"))\n    \
+            print(reflect_param_annotations(\"h\", \"dep\"))\n    \
+            if reflect_param_has_default(\"h\", \"q\"):\n        print(\"d\")\n");
+        // Wrong arity: the per-parameter queries take exactly two string args.
+        let e = errors("def main():\n    print(reflect_param_type(\"h\"))\n");
+        assert!(!e.is_empty(), "reflect_param_type wants 2 args");
+        // Non-string argument is rejected.
+        let e = errors("def main():\n    print(reflect_params(1))\n");
+        assert!(!e.is_empty(), "reflect_params should want a str arg");
     }
 
     // --- Python interop (ticket #27, D-0012) ---

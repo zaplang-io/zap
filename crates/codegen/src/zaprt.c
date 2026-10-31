@@ -2719,6 +2719,149 @@ void *zap_reflect_names(void *type_name) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Function/callable signature reflection (I#458, D-0089). A parallel registry
+ * to the struct/type one above, keyed by an `owner` string — a function name
+ * (top-level `def`) or `"Type.method"`. Two flat tables, populated once at the
+ * top of `main`: one `ZapParamEntry` per reflectable parameter (in declaration
+ * order), and one `ZapSigEntry` per function holding its precomputed readable
+ * signature. Queried by `reflect_params`/`reflect_sig`/`reflect_param_*`.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    ZapStr *owner;
+    ZapStr *name;
+    ZapStr *type_disp; /* declared type display, "" if untyped */
+    int64_t has_default;
+    ZapStr *annos; /* comma-joined per-param annotation names, "" if none */
+} ZapParamEntry;
+
+typedef struct {
+    ZapParamEntry *items;
+    int64_t len;
+    int64_t cap;
+} ZapParamTable;
+
+typedef struct {
+    ZapStr *owner;
+    ZapStr *sig;
+} ZapSigEntry;
+
+typedef struct {
+    ZapSigEntry *items;
+    int64_t len;
+    int64_t cap;
+} ZapSigTable;
+
+static ZapParamTable zap_param_table;
+static ZapSigTable zap_sig_table;
+
+/* Record one reflectable parameter of `owner` (append preserves declaration
+ * order). */
+void zap_reflect_param_register(void *owner, void *name, void *type_disp,
+                                int64_t has_default, void *annos) {
+    ZapParamTable *t = &zap_param_table;
+    if (t->len == t->cap) {
+        int64_t ncap = t->cap == 0 ? 8 : t->cap * 2;
+        ZapParamEntry *ni =
+            (ZapParamEntry *)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapParamEntry));
+        for (int64_t i = 0; i < t->len; i++) {
+            ni[i] = t->items[i];
+        }
+        t->items = ni;
+        t->cap = ncap;
+    }
+    t->items[t->len].owner = (ZapStr *)owner;
+    t->items[t->len].name = (ZapStr *)name;
+    t->items[t->len].type_disp = (ZapStr *)type_disp;
+    t->items[t->len].has_default = has_default;
+    t->items[t->len].annos = (ZapStr *)annos;
+    t->len++;
+}
+
+/* Record the precomputed readable signature of `owner`. */
+void zap_reflect_sig_register(void *owner, void *sig) {
+    ZapSigTable *t = &zap_sig_table;
+    if (t->len == t->cap) {
+        int64_t ncap = t->cap == 0 ? 8 : t->cap * 2;
+        ZapSigEntry *ni = (ZapSigEntry *)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapSigEntry));
+        for (int64_t i = 0; i < t->len; i++) {
+            ni[i] = t->items[i];
+        }
+        t->items = ni;
+        t->cap = ncap;
+    }
+    t->items[t->len].owner = (ZapStr *)owner;
+    t->items[t->len].sig = (ZapStr *)sig;
+    t->len++;
+}
+
+/* The comma-joined parameter names of `owner` ("" if none/unknown), in
+ * declaration order. */
+void *zap_reflect_params(void *owner) {
+    ZapParamTable *t = &zap_param_table;
+    ZapStr *out = (ZapStr *)zap_str_new("", 0);
+    int first = 1;
+    for (int64_t i = 0; i < t->len; i++) {
+        if (!zap_str_eq(t->items[i].owner, owner)) {
+            continue;
+        }
+        if (!first) {
+            out = (ZapStr *)zap_str_concat(out, zap_str_new(", ", 2));
+        }
+        out = (ZapStr *)zap_str_concat(out, t->items[i].name);
+        first = 0;
+    }
+    return out;
+}
+
+/* The declared type display of `owner`'s parameter `name` ("" if untyped or not
+ * found). The first matching (owner, name) wins. */
+void *zap_reflect_param_type(void *owner, void *name) {
+    ZapParamTable *t = &zap_param_table;
+    for (int64_t i = 0; i < t->len; i++) {
+        if (zap_str_eq(t->items[i].owner, owner) && zap_str_eq(t->items[i].name, name)) {
+            return t->items[i].type_disp;
+        }
+    }
+    return zap_str_new("", 0);
+}
+
+/* 1 if `owner`'s parameter `name` has a default value, else 0 (also 0 if not
+ * found). */
+int64_t zap_reflect_param_has_default(void *owner, void *name) {
+    ZapParamTable *t = &zap_param_table;
+    for (int64_t i = 0; i < t->len; i++) {
+        if (zap_str_eq(t->items[i].owner, owner) && zap_str_eq(t->items[i].name, name)) {
+            return t->items[i].has_default;
+        }
+    }
+    return 0;
+}
+
+/* The comma-joined annotation names on `owner`'s parameter `name` ("" if none or
+ * not found). */
+void *zap_reflect_param_annotations(void *owner, void *name) {
+    ZapParamTable *t = &zap_param_table;
+    for (int64_t i = 0; i < t->len; i++) {
+        if (zap_str_eq(t->items[i].owner, owner) && zap_str_eq(t->items[i].name, name)) {
+            return t->items[i].annos;
+        }
+    }
+    return zap_str_new("", 0);
+}
+
+/* The precomputed readable signature of `owner` ("" if unknown). */
+void *zap_reflect_sig(void *owner) {
+    ZapSigTable *t = &zap_sig_table;
+    for (int64_t i = 0; i < t->len; i++) {
+        if (zap_str_eq(t->items[i].owner, owner)) {
+            return t->items[i].sig;
+        }
+    }
+    return zap_str_new("", 0);
+}
+
+/* ---------------------------------------------------------------------------
  * Regex (ticket #23, D-0010): Perl-style `m/.../` and `s/.../.../` backed by
  * PCRE2 (8-bit API). The compiler lowers each literal to one of the entry
  * points below (see crates/ir/src/lower.rs); patterns arrive as `ZapStr*`
@@ -9013,6 +9156,26 @@ static void zap_reflect_mark_roots(void) {
         for (int64_t i = 0; i < t->len; i++) {
             zap_gc_mark(t->items[i].type_name);
             zap_gc_mark(t->items[i].deco_name);
+        }
+    }
+    /* Signature-reflection registry (I#458, D-0089): two more static tables of
+     * ZapStr* names, enumerated the same way. */
+    ZapParamTable *pt = &zap_param_table;
+    if (pt->items) {
+        zap_gc_mark(pt->items);
+        for (int64_t i = 0; i < pt->len; i++) {
+            zap_gc_mark(pt->items[i].owner);
+            zap_gc_mark(pt->items[i].name);
+            zap_gc_mark(pt->items[i].type_disp);
+            zap_gc_mark(pt->items[i].annos);
+        }
+    }
+    ZapSigTable *st = &zap_sig_table;
+    if (st->items) {
+        zap_gc_mark(st->items);
+        for (int64_t i = 0; i < st->len; i++) {
+            zap_gc_mark(st->items[i].owner);
+            zap_gc_mark(st->items[i].sig);
         }
     }
 }
