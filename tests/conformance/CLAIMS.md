@@ -51,6 +51,8 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | NUM-5 | §5 | `**` is exponentiation | TODO | — |
 | NUM-6 | §5 | bitwise and/or/xor/not/shift operators on signed integers | TODO | — |
 | NUM-7 | §4.1 | widening implicit, narrowing explicit (D-0020) | TODO | — |
+| BIG-1 | §4.1 | bigint arithmetic and comparisons retain arbitrary precision; conversions are explicit and range-checked | covered | bigint_arithmetic |
+| CPLX-1 | §4.1 | imaginary literals, complex arithmetic, equality, and rendering use the documented complex value model | covered | complex_arithmetic |
 
 ## `str()` / value rendering (§9, D-0026)
 

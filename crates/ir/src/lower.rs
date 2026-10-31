@@ -1345,6 +1345,8 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "char" => Ok(Ty::I32),
             "str" => Ok(Ty::Ptr),
             "bytes" => Ok(Ty::Bytes),
+            "bigint" => Ok(Ty::Bigint),
+            "complex" => Ok(Ty::Complex),
             "pyobject" => Ok(Ty::Py),
             "list" => {
                 let e = match args.first() {
@@ -1541,6 +1543,9 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
         | Ty::Match
         | Ty::Func(_)
         | Ty::Py => Ok(Elem::Ptr),
+        Ty::Bigint | Ty::Complex => Err(err(
+            "collections of bigint or complex values are not supported yet",
+        )),
         Ty::F32 | Ty::F64 => Err(err(
             "collections of floating-point elements are not supported yet",
         )),
@@ -4667,6 +4672,24 @@ impl<'a> FnLower<'a> {
         }
         let (func, arg) = match vt {
             Ty::Ptr => return Ok(v),
+            Ty::Bigint => {
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_bigint_to_str".to_string(),
+                    args: vec![v],
+                });
+                return Ok(d);
+            }
+            Ty::Complex => {
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_complex_to_str".to_string(),
+                    args: vec![v],
+                });
+                return Ok(d);
+            }
             Ty::I32 => ("zap_char_to_str", v),
             Ty::I1 => ("zap_bool_to_str", self.coerce(v, vt, Ty::I64)),
             Ty::I8 | Ty::I16 | Ty::I64 => ("zap_i64_to_str", self.coerce(v, vt, Ty::I64)),
@@ -7255,12 +7278,43 @@ impl<'a> FnLower<'a> {
     fn expr(&mut self, e: &Expr) -> Result<(Value, Ty), LowerError> {
         match e {
             Expr::Int(s, _) => {
-                let v = parse_int_lit(s);
-                Ok((self.iconst(Ty::I64, v), Ty::I64))
+                if let Some(v) = parse_int_lit_opt(s) {
+                    Ok((self.iconst(Ty::I64, v), Ty::I64))
+                } else {
+                    let literal = self.new_value(Ty::Ptr);
+                    self.emit(Inst::StrConst {
+                        dest: literal,
+                        bytes: s.as_bytes().to_vec(),
+                    });
+                    let value = self.new_value(Ty::Bigint);
+                    self.emit(Inst::Call {
+                        dest: Some(value),
+                        func: "zap_bigint_from_str".to_string(),
+                        args: vec![literal],
+                    });
+                    Ok((value, Ty::Bigint))
+                }
             }
             Expr::Float(s, _) => {
                 let v: f64 = s.replace('_', "").parse().unwrap_or(0.0);
                 Ok((self.fconst(Ty::F64, v), Ty::F64))
+            }
+            Expr::Imaginary(s, _) => {
+                let text = s
+                    .strip_suffix('j')
+                    .or_else(|| s.strip_suffix('J'))
+                    .unwrap_or(s)
+                    .replace('_', "");
+                let im = text.parse::<f64>().unwrap_or(0.0);
+                let re_v = self.fconst(Ty::F64, 0.0);
+                let im_v = self.fconst(Ty::F64, im);
+                let dest = self.new_value(Ty::Complex);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_complex_new".to_string(),
+                    args: vec![re_v, im_v],
+                });
+                Ok((dest, Ty::Complex))
             }
             Expr::Bool(b, _) => {
                 let d = self.new_value(Ty::I1);
@@ -7328,6 +7382,24 @@ impl<'a> FnLower<'a> {
                 }
                 match op {
                     AstUn::Neg => {
+                        if t == Ty::Bigint {
+                            let d = self.new_value(Ty::Bigint);
+                            self.emit(Inst::Call {
+                                dest: Some(d),
+                                func: "zap_bigint_neg".to_string(),
+                                args: vec![v],
+                            });
+                            return Ok((d, t));
+                        }
+                        if t == Ty::Complex {
+                            let d = self.new_value(Ty::Complex);
+                            self.emit(Inst::Call {
+                                dest: Some(d),
+                                func: "zap_complex_neg".to_string(),
+                                args: vec![v],
+                            });
+                            return Ok((d, t));
+                        }
                         let d = self.new_value(t);
                         self.emit(Inst::Un {
                             dest: d,
@@ -7851,6 +7923,8 @@ impl<'a> FnLower<'a> {
                         // `Print` renders it like any other string.
                         let s = self.struct_to_str(sid, v)?;
                         vals.push(s);
+                    } else if vt == Ty::Complex || vt == Ty::Bigint {
+                        vals.push(self.render_str(v, vt)?);
                     } else {
                         vals.push(v);
                     }
@@ -8071,6 +8145,44 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((d, Ty::I32));
             }
+            if fname == "bigint" {
+                if args.len() != 1 {
+                    return Err(err("bigint() takes exactly one argument"));
+                }
+                let (v, vt) = self.expr(&args[0].value)?;
+                return Ok((self.coerce(v, vt, Ty::Bigint), Ty::Bigint));
+            }
+            if fname == "complex" {
+                if args.is_empty() {
+                    let zero = self.fconst(Ty::F64, 0.0);
+                    let d = self.new_value(Ty::Complex);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_complex_from_f64".to_string(),
+                        args: vec![zero],
+                    });
+                    return Ok((d, Ty::Complex));
+                }
+                if args.len() == 1 {
+                    let (v, vt) = self.expr(&args[0].value)?;
+                    let d = self.coerce(v, vt, Ty::Complex);
+                    return Ok((d, Ty::Complex));
+                }
+                if args.len() == 2 {
+                    let (re, ret) = self.expr(&args[0].value)?;
+                    let (im, imt) = self.expr(&args[1].value)?;
+                    let re = self.as_f64(re, ret);
+                    let im = self.as_f64(im, imt);
+                    let d = self.new_value(Ty::Complex);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_complex_new".to_string(),
+                        args: vec![re, im],
+                    });
+                    return Ok((d, Ty::Complex));
+                }
+                return Err(err("complex() takes at most two arguments"));
+            }
             if fname == "str" {
                 // str(x): the textual form of a scalar/string. `char` (an `i32`)
                 // yields its one-codepoint string; a plain int is `i64`, so
@@ -8197,7 +8309,7 @@ impl<'a> FnLower<'a> {
                     self.throwing_call(Some(raw), helper, vec![v]);
                     return Ok((self.convert(raw, mid, to), to));
                 }
-                if !(vt.is_float() || vt.int_width().is_some()) {
+                if !(vt.is_float() || vt.int_width().is_some() || vt == Ty::Bigint) {
                     return Err(err(format!("{fname}() expects a numeric value")));
                 }
                 return Ok((self.convert(v, vt, to), to));
@@ -11445,6 +11557,114 @@ impl<'a> FnLower<'a> {
             return self.array_binop(op, l, lt, r, rt);
         }
 
+        if lt == Ty::Complex || rt == Ty::Complex {
+            let l = self.coerce(l, lt, Ty::Complex);
+            let r = self.coerce(r, rt, Ty::Complex);
+            if matches!(op, Eq | Ne) {
+                let raw = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: "zap_complex_eq".to_string(),
+                    args: vec![l, r],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred: if matches!(op, Eq) {
+                        CmpPred::Ne
+                    } else {
+                        CmpPred::Eq
+                    },
+                    lhs: raw,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
+            let func = match op {
+                Add => "zap_complex_add",
+                Sub => "zap_complex_sub",
+                Mul => "zap_complex_mul",
+                Div => "zap_complex_div",
+                Pow => "zap_complex_pow",
+                _ => return Err(err("unsupported operation on complex values")),
+            };
+            let d = self.new_value(Ty::Complex);
+            if matches!(op, Div) {
+                self.throwing_call(Some(d), func, vec![l, r]);
+            } else {
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![l, r],
+                });
+            }
+            return Ok((d, Ty::Complex));
+        }
+
+        if (lt == Ty::Bigint || rt == Ty::Bigint) && !lt.is_float() && !rt.is_float() {
+            if matches!(op, Div) {
+                let lf = self.as_f64(l, lt);
+                let rf = self.as_f64(r, rt);
+                let d = self.new_value(Ty::F64);
+                self.emit(Inst::Bin {
+                    dest: d,
+                    op: BinOp::Div,
+                    lhs: lf,
+                    rhs: rf,
+                });
+                return Ok((d, Ty::F64));
+            }
+            let l = self.coerce(l, lt, Ty::Bigint);
+            let r = self.coerce(r, rt, Ty::Bigint);
+            if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+                let cmp = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(cmp),
+                    func: "zap_bigint_cmp".to_string(),
+                    args: vec![l, r],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let d = self.new_value(Ty::I1);
+                let pred = match op {
+                    Eq => CmpPred::Eq,
+                    Ne => CmpPred::Ne,
+                    Lt => CmpPred::Lt,
+                    Le => CmpPred::Le,
+                    Gt => CmpPred::Gt,
+                    Ge => CmpPred::Ge,
+                    _ => unreachable!(),
+                };
+                self.emit(Inst::ICmp {
+                    dest: d,
+                    pred,
+                    lhs: cmp,
+                    rhs: zero,
+                });
+                return Ok((d, Ty::I1));
+            }
+            let (func, can_throw) = match op {
+                Add => ("zap_bigint_add", false),
+                Sub => ("zap_bigint_sub", false),
+                Mul => ("zap_bigint_mul", false),
+                FloorDiv => ("zap_bigint_floordiv", true),
+                Mod => ("zap_bigint_mod", true),
+                Pow => ("zap_bigint_pow", true),
+                _ => return Err(err("unsupported operation on bigint values")),
+            };
+            let d = self.new_value(Ty::Bigint);
+            if can_throw {
+                self.throwing_call(Some(d), func, vec![l, r]);
+            } else {
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: func.to_string(),
+                    args: vec![l, r],
+                });
+            }
+            return Ok((d, Ty::Bigint));
+        }
+
         // Element-wise tuple comparison (D-0049): `t1 == t2` / `t1 != t2` compares
         // positionally, recursing into each element (so nested tuples compare
         // element-wise too). A tuple is an anonymous struct but not a *user*
@@ -12124,6 +12344,56 @@ impl<'a> FnLower<'a> {
         if from == to {
             return v;
         }
+        if to == Ty::Bigint {
+            let d = self.new_value(Ty::Bigint);
+            if from.int_width().is_some() {
+                let arg = self.coerce(v, from, Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_bigint_from_i64".to_string(),
+                    args: vec![arg],
+                });
+            } else if from.is_float() {
+                let arg = self.as_f64(v, from);
+                self.throwing_call(Some(d), "zap_bigint_from_f64", vec![arg]);
+            } else {
+                return v;
+            }
+            return d;
+        }
+        if from == Ty::Bigint && to == Ty::Complex {
+            let real = self.coerce(v, from, Ty::F64);
+            let d = self.new_value(Ty::Complex);
+            self.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_complex_from_f64".to_string(),
+                args: vec![real],
+            });
+            return d;
+        }
+        if from == Ty::Bigint && to.is_float() {
+            let f64v = self.new_value(Ty::F64);
+            self.emit(Inst::Call {
+                dest: Some(f64v),
+                func: "zap_bigint_to_f64".to_string(),
+                args: vec![v],
+            });
+            return if to == Ty::F64 {
+                f64v
+            } else {
+                self.coerce(f64v, Ty::F64, to)
+            };
+        }
+        if to == Ty::Complex && (from.int_width().is_some() || from.is_float()) {
+            let real = self.as_f64(v, from);
+            let d = self.new_value(Ty::Complex);
+            self.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_complex_from_f64".to_string(),
+                args: vec![real],
+            });
+            return d;
+        }
         // Concrete struct -> interface value: build the `{data, itable}` fat
         // pointer (D-0016, design/0006 §2.4). A reference struct is used directly
         // as `data` (shared heap identity). A `value struct` is **boxed** first
@@ -12209,6 +12479,19 @@ impl<'a> FnLower<'a> {
         if from == to {
             return v;
         }
+        if from == Ty::Bigint && to.int_width().is_some() {
+            if to == Ty::I32 {
+                let i32v = self.new_value(Ty::I32);
+                self.throwing_call(Some(i32v), "zap_bigint_to_i32", vec![v]);
+                return i32v;
+            }
+            let i64v = self.new_value(Ty::I64);
+            self.throwing_call(Some(i64v), "zap_bigint_to_i64", vec![v]);
+            return self.coerce(i64v, Ty::I64, to);
+        }
+        if from == Ty::Bigint && to.is_float() {
+            return self.coerce(v, from, to);
+        }
         let kind = match (from, to) {
             (f, t) if f.int_width().is_some() && t.int_width().is_some() => {
                 if t.int_width().unwrap() > f.int_width().unwrap() {
@@ -12240,6 +12523,27 @@ impl<'a> FnLower<'a> {
     fn truthy(&mut self, v: Value, t: Ty) -> Value {
         if t == Ty::I1 {
             return v;
+        }
+        if t == Ty::Complex || t == Ty::Bigint {
+            let raw = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(raw),
+                func: if t == Ty::Complex {
+                    "zap_complex_truthy".to_string()
+                } else {
+                    "zap_bigint_truthy".to_string()
+                },
+                args: vec![v],
+            });
+            let zero = self.iconst(Ty::I64, 0);
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: d,
+                pred: CmpPred::Ne,
+                lhs: raw,
+                rhs: zero,
+            });
+            return d;
         }
         // Truthiness overloading on user structs (D-0047): `if a:` / `not a` /
         // `a and b` call `a.__bool__()` when defined. A struct with no `__bool__`
@@ -12641,24 +12945,27 @@ fn const_int_value(e: &ast::Expr) -> Option<i64> {
 }
 
 fn parse_int_lit(s: &str) -> i64 {
+    parse_int_lit_opt(s).unwrap_or(0)
+}
+
+fn parse_int_lit_opt(s: &str) -> Option<i64> {
     let clean: String = s.chars().filter(|c| *c != '_').collect();
-    let r = |b: &str, radix: u32| i64::from_str_radix(b, radix).unwrap_or(0);
     if let Some(h) = clean
         .strip_prefix("0x")
         .or_else(|| clean.strip_prefix("0X"))
     {
-        r(h, 16)
+        i64::from_str_radix(h, 16).ok()
     } else if let Some(o) = clean
         .strip_prefix("0o")
         .or_else(|| clean.strip_prefix("0O"))
     {
-        r(o, 8)
+        i64::from_str_radix(o, 8).ok()
     } else if let Some(bn) = clean
         .strip_prefix("0b")
         .or_else(|| clean.strip_prefix("0B"))
     {
-        r(bn, 2)
+        i64::from_str_radix(bn, 2).ok()
     } else {
-        clean.parse::<i64>().unwrap_or(0)
+        clean.parse::<i64>().ok()
     }
 }

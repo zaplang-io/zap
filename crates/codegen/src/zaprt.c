@@ -502,6 +502,363 @@ void *zap_str_new(const char *data, int64_t len) {
     return s;
 }
 
+/* Complex scalars are immutable, pointer-free GC objects. Keeping their two
+ * doubles behind a stable pointer makes the ABI uniform for calls, locals and
+ * return values on every native target. */
+typedef struct {
+    double re;
+    double im;
+} ZapComplex;
+void zap_panic(void *exc);
+
+static ZapComplex *zap_complex_alloc(double re, double im) {
+    ZapComplex *z = (ZapComplex *)zap_buf((int64_t)sizeof(ZapComplex));
+    z->re = re;
+    z->im = im;
+    return z;
+}
+
+void *zap_complex_new(double re, double im) { return zap_complex_alloc(re, im); }
+void *zap_complex_from_f64(double re) { return zap_complex_alloc(re, 0.0); }
+void *zap_complex_add(void *ap, void *bp) {
+    const ZapComplex *a = (const ZapComplex *)ap;
+    const ZapComplex *b = (const ZapComplex *)bp;
+    return zap_complex_alloc(a->re + b->re, a->im + b->im);
+}
+void *zap_complex_sub(void *ap, void *bp) {
+    const ZapComplex *a = (const ZapComplex *)ap;
+    const ZapComplex *b = (const ZapComplex *)bp;
+    return zap_complex_alloc(a->re - b->re, a->im - b->im);
+}
+void *zap_complex_mul(void *ap, void *bp) {
+    const ZapComplex *a = (const ZapComplex *)ap;
+    const ZapComplex *b = (const ZapComplex *)bp;
+    return zap_complex_alloc(a->re * b->re - a->im * b->im,
+                             a->re * b->im + a->im * b->re);
+}
+void *zap_complex_div(void *ap, void *bp) {
+    const ZapComplex *a = (const ZapComplex *)ap;
+    const ZapComplex *b = (const ZapComplex *)bp;
+    double d = b->re * b->re + b->im * b->im;
+    if (d == 0.0) {
+        zap_panic(zap_str_new("complex division by zero", 24));
+    }
+    return zap_complex_alloc((a->re * b->re + a->im * b->im) / d,
+                             (a->im * b->re - a->re * b->im) / d);
+}
+void *zap_complex_pow(void *ap, void *bp) {
+    const ZapComplex *a = (const ZapComplex *)ap;
+    const ZapComplex *b = (const ZapComplex *)bp;
+    double radius = hypot(a->re, a->im);
+    if (radius == 0.0) {
+        if (b->re == 0.0 && b->im == 0.0) {
+            return zap_complex_alloc(1.0, 0.0);
+        }
+        return zap_complex_alloc(0.0, 0.0);
+    }
+    double log_r = log(radius);
+    double theta = atan2(a->im, a->re);
+    double magnitude = exp(b->re * log_r - b->im * theta);
+    double phase = b->im * log_r + b->re * theta;
+    return zap_complex_alloc(magnitude * cos(phase), magnitude * sin(phase));
+}
+int64_t zap_complex_eq(void *ap, void *bp) {
+    const ZapComplex *a = (const ZapComplex *)ap;
+    const ZapComplex *b = (const ZapComplex *)bp;
+    return a->re == b->re && a->im == b->im;
+}
+int64_t zap_complex_truthy(void *p) {
+    const ZapComplex *z = (const ZapComplex *)p;
+    return z->re != 0.0 || z->im != 0.0;
+}
+void *zap_complex_neg(void *p) {
+    const ZapComplex *z = (const ZapComplex *)p;
+    return zap_complex_alloc(-z->re, -z->im);
+}
+void *zap_complex_to_str(void *p) {
+    const ZapComplex *z = (const ZapComplex *)p;
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "(%g%+gj)", z->re, z->im);
+    return zap_str_new(buf, (int64_t)n);
+}
+
+/* Arbitrary precision integers use immutable base-2^32 limbs in pointer-free
+ * GC objects. Temporary limb buffers use malloc and only the final result is
+ * published to the GC, so intermediate C locals never need to be traced. */
+typedef struct {
+    int32_t sign;
+    uint32_t n;
+    uint32_t limb[];
+} ZapBigInt;
+
+typedef struct {
+    uint32_t n;
+    uint32_t *limb;
+} ZapBigRaw;
+
+static void zap_big_trim(ZapBigRaw *a) {
+    while (a->n && a->limb[a->n - 1] == 0) a->n--;
+}
+static int zap_big_cmp_abs(const ZapBigInt *a, const ZapBigInt *b) {
+    if (a->n != b->n) return a->n < b->n ? -1 : 1;
+    for (uint32_t i = a->n; i; i--) {
+        if (a->limb[i - 1] != b->limb[i - 1])
+            return a->limb[i - 1] < b->limb[i - 1] ? -1 : 1;
+    }
+    return 0;
+}
+static ZapBigInt *zap_big_make(int sign, const uint32_t *limbs, uint32_t n) {
+    while (n && limbs[n - 1] == 0) n--;
+    ZapBigInt *v = (ZapBigInt *)zap_buf((int64_t)(sizeof(ZapBigInt) + n * sizeof(uint32_t)));
+    v->sign = n ? (sign < 0 ? -1 : 1) : 0;
+    v->n = n;
+    if (n) memcpy(v->limb, limbs, n * sizeof(uint32_t));
+    return v;
+}
+static ZapBigRaw zap_big_raw_copy(const ZapBigInt *a) {
+    ZapBigRaw r = {a->n, NULL};
+    if (r.n) {
+        r.limb = (uint32_t *)calloc(r.n, sizeof(uint32_t));
+        if (!r.limb) abort();
+        memcpy(r.limb, a->limb, r.n * sizeof(uint32_t));
+    }
+    return r;
+}
+static ZapBigRaw zap_big_raw_mul(const uint32_t *a, uint32_t an,
+                                const uint32_t *b, uint32_t bn) {
+    ZapBigRaw r = {an + bn, NULL};
+    r.limb = (uint32_t *)calloc(r.n ? r.n : 1, sizeof(uint32_t));
+    if (!r.limb) abort();
+    for (uint32_t i = 0; i < an; i++) {
+        uint64_t carry = 0;
+        for (uint32_t j = 0; j < bn; j++) {
+            uint64_t x = (uint64_t)a[i] * b[j] + r.limb[i + j] + carry;
+            r.limb[i + j] = (uint32_t)x;
+            carry = x >> 32;
+        }
+        uint32_t k = i + bn;
+        while (carry && k < r.n) {
+            uint64_t x = (uint64_t)r.limb[k] + carry;
+            r.limb[k++] = (uint32_t)x;
+            carry = x >> 32;
+        }
+    }
+    zap_big_trim(&r);
+    return r;
+}
+static int zap_big_raw_cmp(const uint32_t *a, uint32_t an,
+                           const uint32_t *b, uint32_t bn) {
+    if (an != bn) return an < bn ? -1 : 1;
+    for (uint32_t i = an; i; i--) {
+        if (a[i - 1] != b[i - 1]) return a[i - 1] < b[i - 1] ? -1 : 1;
+    }
+    return 0;
+}
+static void zap_big_raw_sub(uint32_t *a, uint32_t *an,
+                            const uint32_t *b, uint32_t bn) {
+    uint64_t borrow = 0;
+    for (uint32_t i = 0; i < *an; i++) {
+        uint64_t av = a[i];
+        uint64_t bv = (i < bn ? b[i] : 0) + borrow;
+        a[i] = (uint32_t)(av - bv);
+        borrow = av < bv;
+    }
+    while (*an && a[*an - 1] == 0) (*an)--;
+}
+static void zap_big_raw_add(uint32_t *a, uint32_t *an,
+                            const uint32_t *b, uint32_t bn, uint32_t cap) {
+    uint64_t carry = 0;
+    uint32_t n = *an > bn ? *an : bn;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t x = (i < *an ? a[i] : 0) + (uint64_t)(i < bn ? b[i] : 0) + carry;
+        a[i] = (uint32_t)x;
+        carry = x >> 32;
+    }
+    *an = n;
+    if (carry && n < cap) a[(*an)++] = (uint32_t)carry;
+}
+static void zap_big_raw_divmod(const uint32_t *a, uint32_t an,
+                               const uint32_t *b, uint32_t bn,
+                               ZapBigRaw *q, ZapBigRaw *r) {
+    q->n = an;
+    q->limb = (uint32_t *)calloc(an ? an : 1, sizeof(uint32_t));
+    r->n = bn + 1;
+    r->limb = (uint32_t *)calloc(r->n, sizeof(uint32_t));
+    if (!q->limb || !r->limb) abort();
+    if (!bn) {
+        free(q->limb); free(r->limb); q->limb = r->limb = NULL;
+        q->n = r->n = 0;
+        return;
+    }
+    for (uint64_t bit = (uint64_t)an * 32; bit; bit--) {
+        uint64_t k = bit - 1;
+        uint64_t carry = (a[k / 32] >> (k % 32)) & 1u;
+        for (uint32_t i = 0; i < bn + 1; i++) {
+            uint64_t x = ((uint64_t)r->limb[i] << 1) | carry;
+            r->limb[i] = (uint32_t)x;
+            carry = x >> 32;
+        }
+        r->n = bn + 1;
+        zap_big_trim(r);
+        if (zap_big_raw_cmp(r->limb, r->n, b, bn) >= 0) {
+            zap_big_raw_sub(r->limb, &r->n, b, bn);
+            q->limb[k / 32] |= (uint32_t)1u << (k % 32);
+        }
+    }
+    zap_big_trim(q);
+}
+static ZapBigInt *zap_big_parse_chars(const char *s, int64_t len) {
+    int sign = 1;
+    int64_t i = 0;
+    if (i < len && (s[i] == '-' || s[i] == '+')) {
+        if (s[i++] == '-') sign = -1;
+    }
+    unsigned radix = 10;
+    if (i + 1 < len && s[i] == '0') {
+        if (s[i + 1] == 'x' || s[i + 1] == 'X') radix = 16;
+        else if (s[i + 1] == 'o' || s[i + 1] == 'O') radix = 8;
+        else if (s[i + 1] == 'b' || s[i + 1] == 'B') radix = 2;
+        if (radix != 10) i += 2;
+    }
+    uint32_t cap = (uint32_t)(len * 2 / 8 + 2);
+    uint32_t *limbs = (uint32_t *)calloc(cap, sizeof(uint32_t));
+    if (!limbs) abort();
+    uint32_t n = 0;
+    for (; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '_') continue;
+        unsigned d = c >= '0' && c <= '9' ? c - '0'
+                   : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                   : c >= 'A' && c <= 'F' ? c - 'A' + 10 : radix;
+        if (d >= radix) {
+            free(limbs);
+            zap_panic(zap_str_new("invalid bigint literal", 22));
+            return NULL;
+        }
+        uint64_t carry = d;
+        for (uint32_t j = 0; j < n; j++) {
+            uint64_t x = (uint64_t)limbs[j] * radix + carry;
+            limbs[j] = (uint32_t)x;
+            carry = x >> 32;
+        }
+        if (carry && n < cap) limbs[n++] = (uint32_t)carry;
+    }
+    ZapBigInt *v = zap_big_make(sign, limbs, n);
+    free(limbs);
+    return v;
+}
+void *zap_bigint_from_str(void *sp) {
+    const ZapStr *s = (const ZapStr *)sp;
+    return zap_big_parse_chars(s->data, s->len);
+}
+void *zap_bigint_from_i64(int64_t x) {
+    uint64_t mag = x < 0 ? (uint64_t)(-(x + 1)) + 1 : (uint64_t)x;
+    uint32_t limbs[2] = {(uint32_t)mag, (uint32_t)(mag >> 32)};
+    return zap_big_make(x < 0 ? -1 : 1, limbs, limbs[1] ? 2 : limbs[0] ? 1 : 0);
+}
+void *zap_bigint_from_f64(double x) {
+    if (!isfinite(x)) zap_panic(zap_str_new("cannot convert non-finite float to bigint", 41));
+    char buf[384];
+    int n = snprintf(buf, sizeof(buf), "%.0f", trunc(x));
+    return zap_big_parse_chars(buf, n);
+}
+double zap_bigint_to_f64(void *p) {
+    const ZapBigInt *a = (const ZapBigInt *)p;
+    double x = 0.0;
+    for (uint32_t i = a->n; i; i--) x = ldexp(x, 32) + a->limb[i - 1];
+    return a->sign < 0 ? -x : x;
+}
+int64_t zap_bigint_to_i64(void *p) {
+    const ZapBigInt *a = (const ZapBigInt *)p;
+    if (a->n > 2 || (a->n == 2 &&
+        ((a->sign >= 0 && a->limb[1] > 0x7fffffffU) ||
+         (a->sign < 0 && (a->limb[1] > 0x80000000U ||
+          (a->limb[1] == 0x80000000U && a->limb[0] != 0)))))) {
+        zap_panic(zap_str_new("bigint does not fit in int64", 28));
+    }
+    uint64_t mag = a->n ? a->limb[0] : 0;
+    if (a->n > 1) mag |= (uint64_t)a->limb[1] << 32;
+    if (a->sign < 0) return mag == (1ULL << 63) ? INT64_MIN : -(int64_t)mag;
+    return (int64_t)mag;
+}
+int32_t zap_bigint_to_i32(void *p) {
+    const ZapBigInt *a = (const ZapBigInt *)p;
+    if (a->n > 1 || (a->n == 1 &&
+        ((a->sign >= 0 && a->limb[0] > INT32_MAX) ||
+         (a->sign < 0 && a->limb[0] > (uint32_t)INT32_MAX + 1u)))) {
+        zap_panic(zap_str_new("bigint does not fit in int32", 28));
+    }
+    uint32_t mag = a->n ? a->limb[0] : 0;
+    if (a->sign < 0) return mag == 0x80000000u ? INT32_MIN : -(int32_t)mag;
+    return (int32_t)mag;
+}
+int64_t zap_bigint_cmp(void *ap, void *bp) {
+    const ZapBigInt *a = (const ZapBigInt *)ap;
+    const ZapBigInt *b = (const ZapBigInt *)bp;
+    if (a->sign != b->sign) return a->sign < b->sign ? -1 : 1;
+    return a->sign < 0 ? -zap_big_cmp_abs(a, b) : zap_big_cmp_abs(a, b);
+}
+void *zap_bigint_neg(void *p) {
+    const ZapBigInt *a = (const ZapBigInt *)p;
+    return zap_big_make(-a->sign, a->limb, a->n);
+}
+void *zap_bigint_add(void *ap, void *bp) {
+    const ZapBigInt *a = (const ZapBigInt *)ap, *b = (const ZapBigInt *)bp;
+    uint32_t cap = (a->n > b->n ? a->n : b->n) + 1;
+    uint32_t *out = (uint32_t *)calloc(cap, sizeof(uint32_t)); if (!out) abort();
+    uint32_t n = a->n;
+    if (!a->sign) { memcpy(out,b->limb,b->n*4); n=b->n; }
+    else if (!b->sign) memcpy(out,a->limb,a->n*4);
+    else if (a->sign && b->sign && a->sign == b->sign) {
+        memcpy(out,a->limb,a->n*4); n=a->n;
+        zap_big_raw_add(out,&n,b->limb,b->n,cap);
+    } else if (a->sign && b->sign && a->sign != b->sign) {
+        int c = zap_big_cmp_abs(a,b);
+        const ZapBigInt *big = c >= 0 ? a : b, *small = c >= 0 ? b : a;
+        memcpy(out,big->limb,big->n*4); n=big->n;
+        zap_big_raw_sub(out,&n,small->limb,small->n);
+    }
+    int sign = !a->sign ? b->sign : !b->sign ? a->sign :
+               a->sign == b->sign ? a->sign : zap_big_cmp_abs(a,b) >= 0 ? a->sign : b->sign;
+    ZapBigInt *v = zap_big_make(sign,out,n); free(out); return v;
+}
+void *zap_bigint_sub(void *ap, void *bp) {
+    const ZapBigInt *b = (const ZapBigInt *)bp;
+    /* The operand is immutable; subtract through magnitude/sign cases. */
+    const ZapBigInt *a = (const ZapBigInt *)ap;
+    uint32_t cap = (a->n > b->n ? a->n : b->n) + 1;
+    uint32_t *out=(uint32_t *)calloc(cap,sizeof(uint32_t)); if(!out) abort();
+    uint32_t n=a->n;
+    int bs=-b->sign;
+    if(!a->sign){memcpy(out,b->limb,b->n*4);n=b->n;}
+    else if(!b->sign)memcpy(out,a->limb,a->n*4);
+    else if(a->sign==bs){memcpy(out,a->limb,a->n*4);zap_big_raw_add(out,&n,b->limb,b->n,cap);}
+    else {int c=zap_big_cmp_abs(a,b);const ZapBigInt*big=c>=0?a:b,*small=c>=0?b:a;memcpy(out,big->limb,big->n*4);n=big->n;zap_big_raw_sub(out,&n,small->limb,small->n);}
+    int sign=!a->sign?bs:!b->sign?a->sign:a->sign==bs?a->sign:zap_big_cmp_abs(a,b)>=0?a->sign:bs;
+    ZapBigInt*v=zap_big_make(sign,out,n);free(out);return v;
+}
+void *zap_bigint_mul(void *ap, void *bp) {
+    const ZapBigInt *a=(const ZapBigInt*)ap,*b=(const ZapBigInt*)bp;
+    ZapBigRaw r=zap_big_raw_mul(a->limb,a->n,b->limb,b->n);
+    ZapBigInt*v=zap_big_make(a->sign*b->sign,r.limb,r.n);free(r.limb);return v;
+}
+static void zap_big_divmod_signed(const ZapBigInt*a,const ZapBigInt*b,ZapBigRaw*q,ZapBigRaw*r,int*qs,int*rs){
+    if(!b->sign)zap_panic(zap_str_new("integer division or modulo by zero",34));
+    zap_big_raw_divmod(a->limb,a->n,b->limb,b->n,q,r);
+    *qs=a->sign*b->sign;*rs=a->sign;
+    if(a->sign!=b->sign&&r->n){
+        /* floor quotient: |q| += 1, |r| = |b| - |r|; remainder follows b. */
+        uint64_t carry=1;for(uint32_t i=0;i<q->n&&carry;i++){uint64_t x=(uint64_t)q->limb[i]+carry;q->limb[i]=(uint32_t)x;carry=x>>32;}
+        if(carry){q->limb=(uint32_t*)realloc(q->limb,(q->n+1)*4);q->limb[q->n++]=(uint32_t)carry;}
+        uint32_t *tmp=(uint32_t*)calloc(b->n+1,4);if(!tmp)abort();memcpy(tmp,b->limb,b->n*4);uint32_t tn=b->n;zap_big_raw_sub(tmp,&tn,r->limb,r->n);free(r->limb);r->limb=tmp;r->n=tn;*rs=b->sign;
+    }else *rs=b->sign;
+}
+void *zap_bigint_floordiv(void *ap,void *bp){const ZapBigInt*a=ap,*b=bp;ZapBigRaw q,r;int qs,rs;zap_big_divmod_signed(a,b,&q,&r,&qs,&rs);ZapBigInt*v=zap_big_make(qs,q.limb,q.n);free(q.limb);free(r.limb);return v;}
+void *zap_bigint_mod(void *ap,void *bp){const ZapBigInt*a=ap,*b=bp;ZapBigRaw q,r;int qs,rs;zap_big_divmod_signed(a,b,&q,&r,&qs,&rs);ZapBigInt*v=zap_big_make(rs,r.limb,r.n);free(q.limb);free(r.limb);return v;}
+void *zap_bigint_pow(void *bp,void *ep){const ZapBigInt*b=bp,*e=ep;if(e->sign<0){if(!b->sign)zap_panic(zap_str_new("zero cannot be raised to a negative power",41));if(b->n==1&&b->limb[0]==1)return zap_bigint_from_i64(b->sign<0&&(e->limb[0]&1)?-1:1);return zap_bigint_from_i64(b->sign<0&&(e->limb[0]&1)?-1:0);}ZapBigRaw acc={1,calloc(1,4)},base=zap_big_raw_copy(b);if(!acc.limb||!base.limb)abort();acc.limb[0]=1;for(uint32_t i=0;i<e->n;i++)for(uint32_t bit=0;bit<32;bit++){if((e->limb[i]>>bit)&1){ZapBigRaw m=zap_big_raw_mul(acc.limb,acc.n,base.limb,base.n);free(acc.limb);acc=m;}if(i+1<e->n||bit<31){ZapBigRaw m=zap_big_raw_mul(base.limb,base.n,base.limb,base.n);free(base.limb);base=m;}}ZapBigInt*v=zap_big_make(b->sign<0&&(e->n&&e->limb[0]&1)?-1:1,acc.limb,acc.n);free(acc.limb);free(base.limb);return v;}
+int64_t zap_bigint_truthy(void*p){return ((ZapBigInt*)p)->sign!=0;}
+void *zap_bigint_to_str(void*p){const ZapBigInt*a=p;if(!a->sign)return zap_str_new("0",1);ZapBigRaw r=zap_big_raw_copy(a);uint32_t *chunks=(uint32_t*)calloc(r.n*2+1,4);if(!chunks)abort();uint32_t cn=0;while(r.n){uint64_t rem=0;for(uint32_t i=r.n;i;i--){uint64_t x=(rem<<32)|r.limb[i-1];r.limb[i-1]=(uint32_t)(x/1000000000u);rem=x%1000000000u;}zap_big_trim(&r);chunks[cn++]=(uint32_t)rem;}size_t cap=(size_t)cn*9+2;char*buf=(char*)malloc(cap);if(!buf)abort();size_t n=0;if(a->sign<0)buf[n++]='-';n+=(size_t)snprintf(buf+n,cap-n,"%u",chunks[cn-1]);for(uint32_t i=cn-1;i;i--)n+=(size_t)snprintf(buf+n,cap-n,"%09u",chunks[i-1]);void*s=zap_str_new(buf,(int64_t)n);free(buf);free(chunks);free(r.limb);return s;}
+
 void *zap_str_concat(void *a, void *b) {
     ZapStr *x = (ZapStr *)a;
     ZapStr *y = (ZapStr *)b;

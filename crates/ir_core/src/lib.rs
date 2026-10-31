@@ -227,6 +227,12 @@ pub enum Ty {
     /// from `Ptr` so lowering can route attribute/call dispatch and marshaling
     /// through the Python runtime (`zap_py_*`). Maps to `ptr` in codegen.
     Py,
+    /// A GC-managed arbitrary-precision signed integer (D-0019), represented
+    /// by an immutable runtime bignum object.
+    Bigint,
+    /// A GC-managed IEEE-754 complex number (D-0019), represented by an
+    /// immutable runtime object containing real and imaginary components.
+    Complex,
     /// A **first-class function value** `fn(T, U) -> R` (I#163). Physically a
     /// pointer to a heap *closure record* `{code_ptr, captures…}` (code at
     /// offset 0); a bare top-level function used as a value is wrapped so it has
@@ -821,6 +827,8 @@ impl fmt::Display for Ty {
             Ty::Bytes => "bytes",
             Ty::Match => "match",
             Ty::Py => "py",
+            Ty::Bigint => "bigint",
+            Ty::Complex => "complex",
             Ty::Void => "void",
             Ty::Struct(id) => return write!(f, "struct#{id}"),
             Ty::List(e) => return write!(f, "list[{}]", e.val_suffix()),

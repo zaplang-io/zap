@@ -155,6 +155,7 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
         (Ty::Int32 | Ty::Int64, Ty::Float64 | Ty::Float32) => true,
         (Ty::Float32, Ty::Float64) => true,
         (Ty::Int32 | Ty::Int64, Ty::Bigint) => true,
+        (Ty::Int32 | Ty::Int64 | Ty::Float32 | Ty::Float64 | Ty::Bigint, Ty::Complex) => true,
         (Ty::List(a), Ty::List(b)) => assignable(a, b),
         (Ty::Set(a), Ty::Set(b)) => assignable(a, b),
         (Ty::Heap(a), Ty::Heap(b)) => assignable(a, b),

@@ -251,6 +251,8 @@ const BUILTINS: &[&str] = &[
     "str",
     "int",
     "float",
+    "bigint",
+    "complex",
     "bool",
     "format",
     "reflect_has",
@@ -373,6 +375,79 @@ impl DecoTarget {
 }
 
 impl Checker {
+    /// Bigint and complex values are scalar ABI values, but collection element
+    /// storage does not support them yet. Reject these shapes during checking
+    /// instead of allowing lowering to fail later.
+    fn check_numeric_container_type(&mut self, ty: &Type) {
+        fn contains_numeric(ty: &Type, in_container: bool) -> bool {
+            match ty {
+                Type::Named { name, args, .. } => {
+                    let is_container = matches!(
+                        name.as_str(),
+                        "list" | "dict" | "set" | "array" | "heap" | "channel"
+                    );
+                    let now_in_container = in_container || is_container;
+                    (now_in_container && matches!(name.as_str(), "bigint" | "complex"))
+                        || args
+                            .iter()
+                            .any(|arg| contains_numeric(arg, now_in_container))
+                }
+                Type::Tuple { elems, .. } => elems
+                    .iter()
+                    .any(|elem| contains_numeric(elem, in_container)),
+                Type::Func { params, ret, .. } => {
+                    params
+                        .iter()
+                        .any(|param| contains_numeric(param, in_container))
+                        || ret
+                            .as_deref()
+                            .is_some_and(|ret| contains_numeric(ret, in_container))
+                }
+            }
+        }
+
+        if contains_numeric(ty, false) {
+            let span = match ty {
+                Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Func { span, .. } => {
+                    *span
+                }
+            };
+            self.error(
+                ErrorCode::ZAP4024,
+                "bigint and complex values are not supported as collection elements yet"
+                    .to_string(),
+                span,
+            );
+        }
+    }
+
+    fn check_numeric_container_value(&mut self, ty: &Ty, span: Span) {
+        fn contains_numeric(ty: &Ty, in_container: bool) -> bool {
+            match ty {
+                Ty::Bigint | Ty::Complex => in_container,
+                Ty::List(elem) | Ty::Set(elem) | Ty::Heap(elem) | Ty::Chan(elem) => {
+                    contains_numeric(elem, true)
+                }
+                Ty::Dict(key, value) => {
+                    contains_numeric(key, true) || contains_numeric(value, true)
+                }
+                Ty::Tuple(elems) => elems
+                    .iter()
+                    .any(|elem| contains_numeric(elem, in_container)),
+                _ => false,
+            }
+        }
+
+        if contains_numeric(ty, false) {
+            self.error(
+                ErrorCode::ZAP4024,
+                "bigint and complex values are not supported as collection elements yet"
+                    .to_string(),
+                span,
+            );
+        }
+    }
+
     fn new() -> Checker {
         Checker {
             sigs: HashMap::new(),
@@ -507,6 +582,11 @@ impl Checker {
         for item in &module.items {
             match item {
                 Item::Enum(e) => {
+                    for v in &e.variants {
+                        for f in &v.fields {
+                            self.check_numeric_container_type(&f.ty);
+                        }
+                    }
                     let is_sum = e.variants.iter().any(|v| !v.fields.is_empty());
                     let variants = e
                         .variants
@@ -536,10 +616,23 @@ impl Checker {
                     );
                 }
                 Item::Struct(s) => {
+                    for f in &s.fields {
+                        self.check_numeric_container_type(&f.ty);
+                    }
                     let info = self.struct_info_of(s);
                     self.structs.insert(s.name.clone(), info);
                 }
                 Item::Interface(i) => {
+                    for m in &i.methods {
+                        for p in &m.params {
+                            if let Some(t) = &p.ty {
+                                self.check_numeric_container_type(t);
+                            }
+                        }
+                        if let Some(t) = &m.ret {
+                            self.check_numeric_container_type(t);
+                        }
+                    }
                     let info = self.interface_info_of(i);
                     self.interfaces.insert(i.name.clone(), info);
                 }
@@ -1759,6 +1852,14 @@ impl Checker {
     }
 
     fn check_function(&mut self, f: &Function, self_ty: Option<&str>) {
+        for p in &f.params {
+            if let Some(t) = &p.ty {
+                self.check_numeric_container_type(t);
+            }
+        }
+        if let Some(t) = &f.ret {
+            self.check_numeric_container_type(t);
+        }
         self.push_scope();
         let new_ret = f
             .ret
@@ -1987,6 +2088,7 @@ impl Checker {
                 match ty {
                     None => self.declare(name, default_type(vt), *span),
                     Some(t) => {
+                        self.check_numeric_container_type(t);
                         let dt = self.resolve_type(t);
                         if !self.coercible(&vt, &dt) {
                             self.error(
@@ -2335,6 +2437,7 @@ impl Checker {
                 let vt = self.infer(value);
                 let declared = match ty {
                     Some(t) => {
+                        self.check_numeric_container_type(t);
                         let dt = self.resolve_type(t);
                         if !assignable(&vt, &dt) {
                             self.error(
@@ -2567,7 +2670,7 @@ impl Checker {
             self.error(
                 ErrorCode::ZAP4024,
                 format!(
-                    "cannot render {} in an f-string: only str, char, int, float \
+                    "cannot render {} in an f-string: only str, char, int, float, complex \
                      and bool are supported (user types need the Display protocol, #274)",
                     ty.display()
                 ),
@@ -2586,7 +2689,7 @@ impl Checker {
             // Integer presentation accepts integers, chars and bools.
             ty.is_int() || matches!(ty, Ty::Char | Ty::Bool)
         } else if FormatSpec::is_float_type(t) {
-            ty.is_numeric()
+            ty.is_numeric() && !matches!(ty, Ty::Complex)
         } else {
             // 's' — strings only.
             matches!(ty, Ty::Str)
@@ -2605,7 +2708,13 @@ impl Checker {
 
     fn infer_inner(&mut self, e: &Expr) -> Ty {
         match e {
-            Expr::Int(..) => Ty::UntypedInt,
+            Expr::Int(s, _) => {
+                if parse_int_lit(s).is_some() {
+                    Ty::UntypedInt
+                } else {
+                    Ty::Bigint
+                }
+            }
             Expr::Float(..) => Ty::UntypedFloat,
             Expr::Imaginary(..) => Ty::Complex,
             Expr::Str {
@@ -2663,7 +2772,9 @@ impl Checker {
                     let t = self.infer(el);
                     elem = if i == 0 { t } else { join(&elem, &t) };
                 }
-                Ty::List(Box::new(elem))
+                let ty = Ty::List(Box::new(elem));
+                self.check_numeric_container_value(&ty, expr_span(e));
+                ty
             }
             Expr::Dict(items, span) => {
                 let mut kt = Ty::Unknown;
@@ -2680,7 +2791,9 @@ impl Checker {
                     }
                 }
                 self.warn_struct_key(&kt, *span);
-                Ty::Dict(Box::new(kt), Box::new(vt))
+                let ty = Ty::Dict(Box::new(kt), Box::new(vt));
+                self.check_numeric_container_value(&ty, *span);
+                ty
             }
             Expr::ListComp {
                 elem,
@@ -2698,7 +2811,9 @@ impl Checker {
                 }
                 let et = self.infer(elem);
                 self.pop_scope();
-                Ty::List(Box::new(et))
+                let ty = Ty::List(Box::new(et));
+                self.check_numeric_container_value(&ty, *span);
+                ty
             }
             Expr::DictComp {
                 key,
@@ -2718,7 +2833,9 @@ impl Checker {
                 let kt = self.infer(key);
                 let vt = self.infer(value);
                 self.pop_scope();
-                Ty::Dict(Box::new(kt), Box::new(vt))
+                let ty = Ty::Dict(Box::new(kt), Box::new(vt));
+                self.check_numeric_container_value(&ty, *span);
+                ty
             }
             Expr::Set(elems, span) => {
                 let mut elem = Ty::Unknown;
@@ -2727,7 +2844,9 @@ impl Checker {
                     elem = if i == 0 { t } else { join(&elem, &t) };
                 }
                 self.warn_struct_key(&elem, *span);
-                Ty::Set(Box::new(elem))
+                let ty = Ty::Set(Box::new(elem));
+                self.check_numeric_container_value(&ty, *span);
+                ty
             }
             Expr::SetComp {
                 elem,
@@ -2745,7 +2864,9 @@ impl Checker {
                 }
                 let et = self.infer(elem);
                 self.pop_scope();
-                Ty::Set(Box::new(et))
+                let ty = Ty::Set(Box::new(et));
+                self.check_numeric_container_value(&ty, *span);
+                ty
             }
             Expr::Unary { op, expr, span } => {
                 let t = self.infer(expr);
@@ -2767,7 +2888,7 @@ impl Checker {
                         }
                     }
                     UnOp::BitNot => {
-                        if t.is_int() || matches!(t, Ty::Unknown) {
+                        if (t.is_int() && !matches!(t, Ty::Bigint)) || matches!(t, Ty::Unknown) {
                             t
                         } else {
                             self.error(
@@ -3049,7 +3170,7 @@ impl Checker {
                     Ty::Unknown
                 }
             }
-            Sub | Mul | FloorDiv | Mod | Pow => {
+            Sub | Mul | Pow => {
                 if numeric {
                     num_join(l, r)
                 } else {
@@ -3065,9 +3186,28 @@ impl Checker {
                     Ty::Unknown
                 }
             }
+            FloorDiv | Mod => {
+                if numeric && !matches!(l, Ty::Complex) && !matches!(r, Ty::Complex) {
+                    num_join(l, r)
+                } else {
+                    self.error(
+                        ErrorCode::ZAP4012,
+                        format!(
+                            "operator '{}' is not supported for complex values",
+                            binop_symbol(op)
+                        ),
+                        span,
+                    );
+                    Ty::Unknown
+                }
+            }
             Div => {
                 if numeric {
-                    Ty::Float64
+                    if matches!(l, Ty::Complex) || matches!(r, Ty::Complex) {
+                        Ty::Complex
+                    } else {
+                        Ty::Float64
+                    }
                 } else {
                     self.error(
                         ErrorCode::ZAP4013,
@@ -3082,8 +3222,8 @@ impl Checker {
                 }
             }
             BitAnd | BitOr | BitXor | Shl | Shr => {
-                if (l.is_int() || matches!(l, Ty::Unknown))
-                    && (r.is_int() || matches!(r, Ty::Unknown))
+                if ((l.is_int() && !matches!(l, Ty::Bigint)) || matches!(l, Ty::Unknown))
+                    && ((r.is_int() && !matches!(r, Ty::Bigint)) || matches!(r, Ty::Unknown))
                 {
                     Ty::Int64
                 } else {
@@ -3099,7 +3239,18 @@ impl Checker {
                     Ty::Unknown
                 }
             }
-            Eq | Ne | Lt | Le | Gt | Ge | In => Ty::Bool,
+            Eq | Ne => Ty::Bool,
+            Lt | Le | Gt | Ge => {
+                if matches!(l, Ty::Complex) || matches!(r, Ty::Complex) {
+                    self.error(
+                        ErrorCode::ZAP4012,
+                        "complex values do not support ordering comparisons".to_string(),
+                        span,
+                    );
+                }
+                Ty::Bool
+            }
+            In => Ty::Bool,
             And | Or => Ty::Bool,
             // Channel send `ch <- v` (ticket #25, D-0031): the left operand must
             // be a channel and the value must be assignable to its element type.
@@ -3722,7 +3873,7 @@ impl Checker {
                     for a in args {
                         let at = self.infer(&a.value);
                         if !matches!(at, Ty::Str | Ty::Char | Ty::Unknown | Ty::Py)
-                            && !at.is_numeric()
+                            && (!at.is_numeric() || matches!(at, Ty::Complex))
                             && !self.is_tier1_enum(&at)
                         {
                             self.error(
@@ -3748,7 +3899,7 @@ impl Checker {
                     for a in args {
                         let at = self.infer(&a.value);
                         if !matches!(at, Ty::Str | Ty::Bool | Ty::Unknown | Ty::Py)
-                            && !at.is_numeric()
+                            && (!at.is_numeric() || matches!(at, Ty::Complex))
                         {
                             self.error(
                                 ErrorCode::ZAP4024,
@@ -3853,6 +4004,54 @@ impl Checker {
                     }
                     return Ty::Unit;
                 }
+                "bigint" => {
+                    if args.len() != 1 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "bigint() takes exactly one numeric argument".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if (!at.is_numeric() || matches!(at, Ty::Complex))
+                            && !matches!(at, Ty::Unknown)
+                        {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("bigint() expects a real number, found {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Bigint;
+                }
+                "complex" => {
+                    if args.len() > 2 {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "complex() takes at most two numeric arguments".to_string(),
+                            span,
+                        );
+                    }
+                    for a in args {
+                        let at = self.infer(&a.value);
+                        if !at.is_numeric() && !matches!(at, Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("complex() expects a number, found {}", at.display()),
+                                expr_span(&a.value),
+                            );
+                        } else if args.len() == 2 && matches!(at, Ty::Complex) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                "complex(real, imag) arguments must be real numbers".to_string(),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                    return Ty::Complex;
+                }
                 "int32" | "int64" | "float32" | "float64" | "i32" | "i64" | "f32" | "f64" => {
                     // Explicit numeric conversion (D-0020): the way to narrow or
                     // cross the int/float boundary that implicit widening refuses.
@@ -3881,6 +4080,12 @@ impl Checker {
                             self.error(
                                 ErrorCode::ZAP4024,
                                 format!("{}() expects a number, found {}", fname, at.display()),
+                                expr_span(&a.value),
+                            );
+                        } else if matches!(at, Ty::Complex) {
+                            self.error(
+                                ErrorCode::ZAP4024,
+                                format!("{}() cannot convert a complex value", fname),
                                 expr_span(&a.value),
                             );
                         }
@@ -6407,6 +6612,29 @@ def main():
         assert!(
             e.iter().any(|x| x.code == ErrorCode::ZAP4026),
             "expected ZAP4026 for a non-literal format spec, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn bigint_and_complex_numeric_forms_type_check() {
+        ok("def main():\n    \
+            bigint large = 123456789012345678901234567890\n    \
+            bigint rounded = bigint(10.75)\n    \
+            bigint total = large + rounded\n    \
+            int64 small = int64(rounded)\n    \
+            complex z = complex(1.0, 2.0) + 3j\n    \
+            complex product = z * 2j\n    \
+            bool same = product == product\n    \
+            print(str(total))\n    \
+            print(str(z))\n");
+    }
+
+    #[test]
+    fn complex_ordering_is_rejected() {
+        let e = errors("def main():\n    bool ordered = 1j < 2j\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4012),
+            "expected ZAP4012 for ordered complex comparison, got {e:?}"
         );
     }
 

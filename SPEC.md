@@ -107,14 +107,31 @@ const f64 PI = 3.14159
 | `float64`/`f64`, `float32`/`f32` | IEEE floating point |
 | `bool` | `True` / `False` |
 | `char` | a Unicode scalar (codepoint) |
-| `bigint` | arbitrary-precision integer (D-0019) |
-| `complex` | complex number (D-0019) |
+| `bigint` | arbitrary-precision signed integer (D-0019) |
+| `complex` | pair of IEEE-754 `float64` components (D-0019) |
 
 Short aliases `i32`, `i64`, `f32`, `f64` are available. All integers are
 **signed** (D-0019).
 
 **Conversions (D-0020):** widening is implicit (`int32→int64`, `int→float`);
 narrowing that can lose data is explicit (`int32(x)`, `int64(y)`).
+
+**`bigint`.** Integer literals outside the signed `int64` range have type
+`bigint`; smaller integer literals default to `int64`. `bigint(x)` converts an
+integer or truncates a finite float toward zero. `int64(x)` / `int32(x)` convert
+back and raise an overflow error when the value does not fit. `float64(x)`
+converts to the nearest representable binary floating-point value. `+`, `-`,
+`*`, `//`, `%`, and `**` preserve arbitrary precision; `/` returns `float64`.
+Comparisons are exact. Negative `//` and `%` follow Python floor-division
+semantics (the remainder has the divisor's sign).
+
+**`complex`.** `2j` and `3.5j` are imaginary literals. `complex()` is zero;
+`complex(x)` converts a real numeric value (or copies a complex value), and
+`complex(real, imag)` constructs from two real numbers. `+`, `-`, `*`, `/`, and
+`**` are supported. `==` and `!=` compare both components; ordering comparisons
+are invalid. `bool(z)` is false only when both components are zero. `str(z)` and
+`print(z)` use the form `(real±imagj)` with `%g`-style decimal component
+formatting, such as `(1+2j)`.
 
 ### 4.2 Strings & bytes (D-0025)
 

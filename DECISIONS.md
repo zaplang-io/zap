@@ -146,11 +146,12 @@ are now locked in **D-0046** (the `match` statement itself was locked earlier in
 D-0040).
 
 ## D-0019 — Numeric types: all signed; bigint, complex, tuples
-**Status:** Locked
+**Status:** Locked; bigint and complex are implemented for native codegen
 All integer types are **signed** for v1 (`int32`, `int64`; default `int64`).
 Unsigned deferred (interop + array dtypes only — see OPEN-QUESTIONS). Provide
-**`bigint`** and **`complex`**. Provide **tuples**. **No type aliases** (they
-hurt cross-project readability).
+**`bigint`** (arbitrary-precision signed integer) and **`complex`** (pair of
+IEEE-754 doubles, with imaginary-suffix literals and complex arithmetic).
+Provide **tuples**. **No type aliases** (they hurt cross-project readability).
 
 ## D-0020 — Numeric conversions: implicit widening, explicit narrowing
 **Status:** Locked
