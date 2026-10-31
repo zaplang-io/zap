@@ -170,9 +170,11 @@ From the entry the compiler **discovers the import graph** — it transitively
 reads `Import::Module` statements, loading each module file **once** — and
 compiles the closure together.
 
-**Non-entry modules are declaration-only.**
-A top-level *executable statement* (an `Item::Stmt`) in an imported module is an
-error (new `ZAP43xx`); only the entry module's top level runs (via `main`).
+**Modules are declaration-only apart from a module docstring.**
+A top-level *executable statement* (an `Item::Stmt`) is an error in every
+module: `ZAP3016` in the entry module and `ZAP3014` in an imported module. The
+compiled program runs from `def main()` in the entry module. A bare,
+non-f-string module docstring is allowed (D-0041/D-0090).
 This is the load-bearing simplification: it means importing a module has **no
 import-time side effects and no initialization order**, so the merge-compile
 strategy (§Implementation) is sound and cycles are a pure naming question rather

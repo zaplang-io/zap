@@ -16,7 +16,8 @@ pub struct Module {
     pub span: Span,
 }
 
-/// A top-level item. Bare statements are allowed at top level (D-0021).
+/// A top-level item. The parser represents bare statements here; module
+/// linking rejects executable ones (D-0090), while allowing a module docstring.
 #[derive(Clone, Debug)]
 pub enum Item {
     Function(Function),

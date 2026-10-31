@@ -148,7 +148,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | DECL-3 | §3 | bindings are mutable by default; `const` is immutable (D-0006) | TODO | — |
 | SCAL-1 | §4.1 | scalars have value semantics (copied on assign/pass, D-0023) | TODO | — |
 | REF-1 | §4.3 | list/dict/struct instances are passed by reference (D-0023) | TODO | — |
-| ENTRY-1 | §2 | top-level code runs top to bottom; `main` is auto-run (D-0021) | TODO | — |
+| ENTRY-1 | §2 | compiled programs run from `main`; executable module-scope statements are rejected; a module docstring is allowed (D-0021/D-0090) | covered | entry_main |
 | LEX-1 | §1 | definitions may follow uses — no forward declarations (D-0021) | TODO | — |
 
 ## Structs, interfaces, enums, generics (§4.4–§4.7)

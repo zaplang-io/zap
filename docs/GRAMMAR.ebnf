@@ -38,6 +38,11 @@ item          ::= function
                 | import
                 | cfg_item          (* `when target.*` conditional compilation (I#139) *)
                 | statement ;
+                  (* The parser accepts a statement here for recovery and AST
+                     compatibility, but module linking rejects executable
+                     statements (ZAP3016 in the entry module, ZAP3014 in an
+                     imported module). A bare module docstring is allowed;
+                     see SPEC §2 and D-0090. *)
 
 (* ---------- Decorators & annotations (D-0036) ---------- *)
 

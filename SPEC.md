@@ -48,19 +48,32 @@ readability, aimed at Python developers who need native performance.
   implicitly inside `()` / `[]` / `{}`; `;` may separate statements on one line.
 - **Indentation:** spaces, consistent per block; no tab/space mixing.
 
-## 2. Program entry (D-0021)
+## 2. Program entry (D-0021, D-0090)
 
-Top-level code runs top to bottom:
+A compiled Zap program runs from `def main()`. Executable statements are not
+allowed at module scope, in either the entry module or imported modules; move
+them into `main` (or another function). A bare, non-f-string string literal as
+the first statement is a module docstring and is allowed at module scope
+(D-0041). The grammar accepts statements in module position, but the compiler
+rejects executable ones semantically.
+
+```python
+"""Example program."""
+
+def greet():
+    print("hello from Zap")
+
+def main():
+    greet()
+```
+
+Definitions may follow uses because the whole program is AOT-compiled; no
+forward declarations are required (D-0021).
+
+This is invalid because the call is an executable module-scope statement:
 
 ```python
 print("hello from Zap")
-```
-
-…or a program may define `main`:
-
-```python
-def main():
-    print("hello from Zap")
 ```
 
 ## 3. Declarations (D-0003)
