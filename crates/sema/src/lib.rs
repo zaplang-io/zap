@@ -4919,8 +4919,9 @@ impl Checker {
                     return (Vec::new(), false);
                 };
                 self.bind_variant_fields(enum_name, v, args, span);
-                let covers_payload =
-                    args.is_none_or(|args| args.iter().all(|a| pattern_is_irrefutable(&a.pattern)));
+                let covers_payload = args.map_or(true, |args| {
+                    args.iter().all(|a| pattern_is_irrefutable(&a.pattern))
+                });
                 return (
                     if covers_payload {
                         vec![variant.clone()]

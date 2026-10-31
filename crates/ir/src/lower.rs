@@ -9635,7 +9635,7 @@ impl<'a> FnLower<'a> {
                     None
                 };
                 let rest = patterns.iter().any(|p| matches!(p, Pattern::Rest { .. }));
-                if fields.is_none_or(|fields| {
+                if fields.map_or(true, |fields| {
                     if rest {
                         fields.len() + 1 < patterns.len()
                     } else {
