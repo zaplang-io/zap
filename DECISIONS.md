@@ -2299,3 +2299,33 @@ are dropped at construction when the field is omitted, so a `list[Route] routes 
 []` field left null SIGSEGVs on `.append`. That is a separate codegen bug, not in
 the decorator path: the `@app.get` desugar lowers correctly either way (verified
 in ZIR). Restore the `list[Route]` router form in the golden once zap#461 lands.
+
+## D-0088 — Struct field defaults are materialized for omitted fields (I#461)
+**Status:** Locked — fixes a codegen gap in [[D-0038]] (literal field defaults).
+
+D-0038 gives a struct field a literal default (`list[int64] xs = []`), evaluated
+**per construction** so mutable defaults are safe. But struct-construction
+lowering (`FnLower::construct`, `crates/ir/src/lower.rs`) only emitted a
+`FieldSet` for fields the **caller supplied**: an omitted defaulted field got no
+store, leaving it whatever `StructNew` left there — null for a pointer field.
+`Box(xs=[])` worked; `Box()` left `xs` null, so `.append` SIGSEGV'd (and other
+pointer-typed defaults — `str`, `dict`, nested `struct` — read null silently).
+This was severe enough that the #457 decorator golden had to drop its
+`list[Route]` field to a field-free `App` to dodge it (D-0087 test note).
+
+**Fix.** `construct` now tracks which field slots the caller sets, then for every
+**omitted** field with a declared default it lowers that default expression and
+emits the `FieldSet`, in **declaration order**, in the constructor's scope — so
+`Box()` is identical to `Box(xs=[])`. The default reuses the explicit-argument
+lowering path exactly (same `coerce` + value-struct copy, D-0051), which keeps
+the D-0038 **fresh-per-construction** guarantee: each `Box()` gets its own `[]`.
+Defaults are stored on the struct layout (`StructCtx::field_defaults`, parallel
+to `fields`) at the same pass that records field types. Scope covers all
+defaulted field kinds — scalar, `str`, heap (`list`/`dict`), and nested struct.
+
+**No grammar change** (the `TYPE name = expr` field-default syntax is unchanged,
+D-0038/D-0015); this is lowering only. Golden: `tests/golden/struct_field_defaults`
+covers the repro plus mixed scalar/str/list/nested-struct defaults under fully-
+and partially-omitted construction, asserting parity with the explicit-arg form
+and mutable-default independence. Follow-up: restore the `list[Route]` router
+form in `fn_decorator_register` (D-0087), now unblocked.
