@@ -8812,11 +8812,20 @@ impl<'a> FnLower<'a> {
         Ok(self.coerce(v, vt, target))
     }
 
-    /// Reject coercing a value to a `fn(...)` type unless it is a function value
-    /// of the **same** structural signature (I#465, D-0067). There is no
-    /// fn-subtyping: a coercing adapter thunk (e.g. dropping defaulted trailing
-    /// parameters) is a separate design decision tracked with #466, so an exact
-    /// match on arity, each parameter type, and the return type is required.
+    /// Reject coercing a **function value with a known signature** to a
+    /// `fn(...)` type whose signature differs (I#465, D-0067). First-class
+    /// function values are monomorphic; there is no fn-subtyping, so an exact
+    /// match on arity, each parameter type, and the return type is required (a
+    /// coercing adapter thunk — e.g. dropping defaulted trailing parameters — is
+    /// a separate design decision tracked with #466).
+    ///
+    /// The check fires only when the source is itself a `Ty::Func`, i.e. a value
+    /// whose exact signature is *known* to disagree (a bare function name, a
+    /// lambda-typed binding, a struct field read). A value that has already lost
+    /// its signature — a collection element or other uniform reference word read
+    /// back as a plain `ptr` — carries no contradicting signature, so
+    /// re-attaching the expected call signature is the legitimate D-0067
+    /// round-trip (see `fnval_store`), not a mismatch, and is left to `coerce`.
     fn check_fn_coercion(
         &self,
         from: &Ty,
@@ -8824,52 +8833,48 @@ impl<'a> FnLower<'a> {
         code: zapc_diag::ErrorCode,
     ) -> Result<(), LowerError> {
         // Interned signatures are deduplicated, so equal signatures share the
-        // same index — a matching `Ty::Func` is exactly `Ty::Func(to_idx)`.
-        if *from == Ty::Func(to_idx) {
+        // same index — a matching `Ty::Func` is exactly `Ty::Func(to_idx)`, and
+        // any other `Ty::Func(from_idx)` is a genuine structural mismatch.
+        let Ty::Func(from_idx) = from else {
+            return Ok(());
+        };
+        if *from_idx == to_idx {
             return Ok(());
         }
         let expected = self.ctx.fn_sigs.borrow().get(to_idx).clone();
         let want = self.render_fn_sig(&expected);
-        let message = if let Ty::Func(from_idx) = from {
-            let got_sig = self.ctx.fn_sigs.borrow().get(*from_idx).clone();
-            let got = self.render_fn_sig(&got_sig);
-            let detail = if got_sig.params.len() != expected.params.len() {
-                format!(
-                    "it takes {} argument(s), but `{want}` takes {}",
-                    got_sig.params.len(),
-                    expected.params.len()
-                )
-            } else if let Some((i, (g, e))) = got_sig
-                .params
-                .iter()
-                .zip(expected.params.iter())
-                .enumerate()
-                .find(|(_, (g, e))| g != e)
-            {
-                format!(
-                    "parameter {} is `{}`, but `{}` is expected",
-                    i + 1,
-                    self.render_ty(g),
-                    self.render_ty(e)
-                )
-            } else {
-                format!(
-                    "its return type `{}` is not `{}`",
-                    self.render_ty(&got_sig.ret),
-                    self.render_ty(&expected.ret)
-                )
-            };
+        let got_sig = self.ctx.fn_sigs.borrow().get(*from_idx).clone();
+        let got = self.render_fn_sig(&got_sig);
+        let detail = if got_sig.params.len() != expected.params.len() {
             format!(
-                "function value of type `{got}` is not compatible with the \
-                 expected type `{want}`: {detail}"
+                "it takes {} argument(s), but `{want}` takes {}",
+                got_sig.params.len(),
+                expected.params.len()
+            )
+        } else if let Some((i, (g, e))) = got_sig
+            .params
+            .iter()
+            .zip(expected.params.iter())
+            .enumerate()
+            .find(|(_, (g, e))| g != e)
+        {
+            format!(
+                "parameter {} is `{}`, but `{}` is expected",
+                i + 1,
+                self.render_ty(g),
+                self.render_ty(e)
             )
         } else {
             format!(
-                "a value of type `{}` is not a function; a function value of \
-                 type `{want}` is expected",
-                self.render_ty(from)
+                "its return type `{}` is not `{}`",
+                self.render_ty(&got_sig.ret),
+                self.render_ty(&expected.ret)
             )
         };
+        let message = format!(
+            "function value of type `{got}` is not compatible with the \
+             expected type `{want}`: {detail}"
+        );
         Err(LowerError { code, message })
     }
 

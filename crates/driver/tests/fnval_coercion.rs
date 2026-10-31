@@ -136,6 +136,25 @@ fn lambda_still_accepted() {
 }
 
 #[test]
+fn container_roundtrip_accepted() {
+    // A function value stored in a `list` element loses its signature (elements
+    // are uniform reference words, read back as a plain `ptr`); re-attaching the
+    // expected call signature at the `fn(...)`-annotated binding is the
+    // legitimate D-0067 round-trip, NOT a mismatch. The check must only fire on
+    // a source whose exact signature is known to disagree — this mirrors the
+    // `fnval_store` golden and guards the check against over-rejecting (the
+    // first cut rejected this as "a value of type `ptr` is not a function").
+    let src = "def inc(int64 x) -> int64:\n    return x + 1\n\n\
+               def main():\n    auto ops = [inc]\n    \
+               fn(int64) -> int64 g = ops[0]\n    print(g(41))\n";
+    let errs = lower_errors(src);
+    assert!(
+        errs.is_empty(),
+        "a `ptr` collection element re-typed to `fn(...)` should lower: {errs:?}"
+    );
+}
+
+#[test]
 fn incompatible_let_binding_rejected() {
     // The coercion funnel also guards `fn(...)`-annotated `let` bindings
     // (assignment), reported as a type mismatch in assignment.

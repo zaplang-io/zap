@@ -2448,13 +2448,22 @@ AST→ZIR lowering — the same stage that already validates lambda arity and re
 coercion funnel `expr_coerced` (argument, `let`/field assignment, and `return`
 positions) plus the bare-name reassignment path.
 
-**Rule.** A value coerced into a `fn(...)` slot must be a function value of the
-**exact** interned signature of that slot — equal arity, each parameter type equal, and
-the return type equal. Because signatures are deduplicated, a compatible `Ty::Func` is
-literally the same index. Any mismatch is rejected with a precise type error naming both
-signatures and the first discrepancy, keyed to the position: `ZAP4021` (argument),
+**Rule.** A **function value whose signature is known** (`Ty::Func`) coerced into a
+`fn(...)` slot must have the **exact** interned signature of that slot — equal arity,
+each parameter type equal, and the return type equal. Because signatures are
+deduplicated, a compatible `Ty::Func` is literally the same index, and any other
+`Ty::Func` is a genuine structural mismatch, rejected with a precise type error naming
+both signatures and the first discrepancy, keyed to the position: `ZAP4021` (argument),
 `ZAP4001` (assignment), `ZAP4003` (return) — the same codes a direct call / assignment /
 return with a wrong type already uses.
+
+**Only a known-signature source is checked.** The check fires solely when the source is
+itself a `Ty::Func`. A function value that has already lost its signature — a collection
+element or other uniform reference word read back as a plain `ptr` (D-0067 stores fn
+values as single reference words) — carries no contradicting signature, so re-attaching
+the expected call signature at a `fn(...)`-annotated binding is the legitimate round-trip
+(`fnval_store`), left to `coerce`. Over-rejecting that bare-`ptr` case was the first
+cut's bug, now covered by a regression test.
 
 **No fn-subtyping.** This deliberately rejects *all* non-identical signatures, including
 ones that might seem assignable (e.g. a function with defaulted trailing parameters
@@ -2469,9 +2478,10 @@ matches by construction.
 one, so the `<fn>$fnval` thunk is always emitted to a signature identical to the call
 site's — no residual mismatch. The thunk emission path is unchanged.
 
-**No grammar change** (a sema/lowering type-compatibility fix). Coverage: seven host
+**No grammar change** (a sema/lowering type-compatibility fix). Coverage: eight host
 `fnval_coercion` tests (the three repro mismatches assert code + message; compatible
-handler, lambda, incompatible `let`, and incompatible `return` cases) and a
+handler, lambda, `container_roundtrip` (bare-`ptr` element re-typed to `fn(...)` — the
+over-rejection guard), incompatible `let`, and incompatible `return` cases) and a
 `fnval_struct_handler` golden that dispatches struct-typed handlers through a
 `fn(Req) -> Resp` parameter end-to-end, so CI's full-LLVM + arm64 jobs confirm the
 legitimate D-0067 path still runs.
