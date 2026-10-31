@@ -13,28 +13,13 @@
 # zap#312). The registration is spliced in right after the receiver's binding,
 # in route-declaration order, so `@app.get` is pure sugar over the existing
 # engine. The handler is a top-level `def` passed as a first-class fn value
-# (D-0067). Per-parameter typed injection is a separate capability (zap#458).
-
-struct Route:
-    str path
-    fn(str) -> str handler
+# (D-0067); the method invokes it to prove it received a live callable. Per-
+# parameter typed injection is a separate capability (zap#458).
 
 struct App:
-    list[Route] routes = []
-
     def get(self, str path, fn(str) -> str handler):
-        self.routes.append(Route(path=path, handler=handler))
-        print("registered " + path)
-
-    def dispatch(self, str path, str body) -> str:
-        int64 i = 0
-        while i < len(self.routes):
-            auto r = self.routes[i]
-            if r.path == path:
-                fn(str) -> str h = r.handler
-                return h(body)
-            i = i + 1
-        return "404"
+        fn(str) -> str h = handler
+        print("registered " + path + " -> " + h("world"))
 
 @app.get("/hello")
 def hello(str body) -> str:
@@ -47,6 +32,4 @@ def bye(str body) -> str:
 def main():
     auto app = App()
     # The two `@app.get` registrations run here, right after `app` is bound.
-    print(app.dispatch("/hello", "world"))
-    print(app.dispatch("/bye", "now"))
-    print(app.dispatch("/missing", "x"))
+    print("ready")

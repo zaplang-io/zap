@@ -1,5 +1,3 @@
-registered /hello
-registered /bye
-hello world
-bye now
-404
+registered /hello -> hello world
+registered /bye -> bye world
+ready
