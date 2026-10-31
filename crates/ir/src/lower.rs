@@ -4196,6 +4196,8 @@ enum Cleanup {
     Finally(ast::Block),
     /// Balance a landing-pad `__cxa_begin_catch` on a structured early exit.
     EndCatch,
+    /// Leaving a structured concurrency region cancels and awaits its children.
+    ScopeCancel(Value),
 }
 
 /// State threaded through the lowering of a generator's `__next__` (I#67). The
@@ -4416,6 +4418,13 @@ impl<'a> FnLower<'a> {
                     self.lower_block(&block)?;
                 }
                 Cleanup::EndCatch => self.emit_end_catch(),
+                Cleanup::ScopeCancel(handle) => {
+                    self.emit(Inst::Call {
+                        dest: None,
+                        func: "zap_scope_exit_cancel".to_string(),
+                        args: vec![*handle],
+                    });
+                }
             }
             if self.terminated() {
                 break;
@@ -5544,8 +5553,8 @@ impl<'a> FnLower<'a> {
     /// yields no handle; the root scope joins all spawned threads at program exit
     /// (`zap_rt_join_all`, emitted at `main`'s return). Only a direct call to a
     /// named top-level function is supported in this increment; method-call and
-    /// lambda operands (`spawn s.handle(c)`, `spawn (lambda: ...)()`) are a
-    /// documented follow-up, as is the structured-concurrency `scope:` block.
+    /// lambda operands (`spawn s.handle(c)`, `spawn (lambda: ...)()`) are
+    /// rejected during semantic checking (I#475). Scoped ownership is supported.
     fn lower_spawn(&mut self, call: &Expr, detached: bool) -> Result<(), LowerError> {
         let Expr::Call { callee, args, .. } = call else {
             return Err(err("spawn operand must be a call expression (D-0013)"));
@@ -5560,6 +5569,12 @@ impl<'a> FnLower<'a> {
             .get(fname)
             .cloned()
             .ok_or_else(|| err(format!("spawn of unknown function '{fname}'")))?;
+        if self.lookup(fname).is_some()
+            || args.len() != ptys.len()
+            || args.iter().any(|a| a.name.is_some())
+        {
+            return Err(err("spawn requires a named top-level function with all arguments supplied positionally"));
+        }
         let mut argvals = Vec::new();
         for (i, a) in args.iter().enumerate() {
             let (v, vt) = self.expr(&a.value)?;
@@ -5641,12 +5656,14 @@ impl<'a> FnLower<'a> {
         // --- owned region: a raise inside unwinds to `lp` (cancel + re-raise) ---
         self.landing_pads.push(lp);
         self.scope_stack.push(handle);
+        self.cleanups.push(Cleanup::ScopeCancel(handle));
         self.push_scope();
         for st in &body.stmts {
             self.stmt(st)?;
         }
         self.pop_scope();
         self.scope_stack.pop();
+        self.cleanups.pop();
         self.landing_pads.pop();
 
         // Normal completion: the join barrier. `zap_scope_exit` awaits the owned

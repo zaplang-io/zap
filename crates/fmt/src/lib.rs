@@ -1090,6 +1090,12 @@ mod tests {
     use super::format_source;
 
     #[test]
+    fn scope_cleanup_fixture_is_formatted() {
+        let source = include_str!("../../../tests/conformance/scope_cleanup.zap");
+        assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
     fn structural_match_fixture_is_formatted() {
         let source = include_str!("../../../tests/conformance/match_structural.zap");
         assert_eq!(format_source(source).unwrap(), source);

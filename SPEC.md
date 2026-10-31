@@ -656,9 +656,14 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
 - **Cancellation (D-0033; surface D-0044):** structured concurrency — a `scope:`
   block owns the coroutines spawned inside it and joins them at the dedent; a
   child failure cancels siblings and re-raises (an aggregate `ExceptionGroup` if
-  several fail, D-0045). `scope(timeout=…, on_error=OnError.Cancel|Wait)` tunes
-  it. `spawn detached <call>` opts out of all scope ownership (daemon; Go exit
+  several fail, D-0045). `scope(on_error=OnError.Cancel|Wait)` selects the
+  failure policy. Supported scope options are `on_error`, `cancel_on`, and
+  `grace`; `timeout` is unsupported and rejected by semantic checking. `spawn detached <call>` opts out of all scope ownership (daemon; Go exit
   semantics). `Cancelled` unwinds via `finally`/`with`, outside `Exception`.
+- **Spawn call forms:** the operand must call a named top-level function with
+  every argument supplied positionally. Methods, lambdas, local function values,
+  keyword arguments, and omitted defaults are rejected by semantic checking
+  (`ZAP5076`). Arguments are evaluated eagerly in the parent, before spawning.
 - **Memory model (D-0034):** data-race-free programs are sequentially
   consistent; data races are bugs.
 

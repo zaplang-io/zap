@@ -173,7 +173,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | OP-3 | §5 | user types overload operators via dunder methods (D-0047) | TODO | — |
 | WITH-1 | §11 | `with` closes the resource on block exit, even on exception (D-0027) | TODO | — |
 | CHAN-1 | §12 | channels: send/receive, comma-ok receive, `close` (D-0031) | TODO | — |
-| SCOPE-1 | §12 | `scope:` joins spawned coroutines; a child failure cancels siblings (D-0044) | TODO | — |
+| SCOPE-1 | §12 | `scope:` joins spawned coroutines; a child failure cancels siblings (D-0044) | covered | scope_cleanup |
 | MOD-1 | §13 | names starting with `_` are private, enforced at compile time (D-0028) | TODO | — |
 | MOD-2 | §13 | whole-module import by short name; no `from X import Y` (D-0052) | TODO | — |
 
