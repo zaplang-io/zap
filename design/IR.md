@@ -48,6 +48,7 @@ ZIR types are lower-level than Zap types (which lower *into* them):
 | ZIR type | From Zap |
 |---|---|
 | `i1`, `i8`, `i16`, `i32`, `i64` | `bool`, `char` (i32), `int32`, `int64` |
+| `enum#N` | Tier-1 enum with identity `N`, physically an `i64` discriminant |
 | `f32`, `f64` | `float32`, `float64` |
 | `ptr` | all reference types (opaque pointer; see RUNTIME-ABI) |
 | `struct { ... }` / named aggregate | `struct` instances' *layout* (allocated behind a `ptr`) |

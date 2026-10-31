@@ -33,8 +33,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `startswith`/`endswith`/`contains`/`encode`) and `ord`/`chr`/`char`/`str`/
   `int` conversions (#284);
   `list`/`dict`/tuples/`set` with value/reference semantics; structs, methods
-  and `value struct` (D-0051); interfaces; enums — tier-1 and tier-3 sum types
-  (D-0046); operators with overloading and `@derive(Eq, Ord, Hash, Repr)`;
+  and `value struct` (D-0051); interfaces; enums — tier-1 values with
+  canonical `.name` and source-order iteration, plus tier-3 sum types
+  (D-0018/D-0046); operators with overloading and `@derive(Eq, Ord, Hash, Repr)`;
   control flow including `match` and the iteration protocol (D-0048);
   functions, lambdas, generators, default/keyword/variadic args, comprehensions
   and slicing; first-class function values and closures (D-0067); exceptions and

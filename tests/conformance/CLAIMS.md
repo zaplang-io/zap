@@ -160,7 +160,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | STRUCT-1 | §4.4 | structs are reference types with `self` methods (D-0015) | TODO | — |
 | VSTRUCT-1 | §4.4 | a `value struct` is copied by value (D-0051) | TODO | — |
 | IFACE-1 | §4.5 | interfaces are structural, satisfied implicitly, checked at compile time | TODO | — |
-| ENUM-1 | §4.6 | tier-1 enum: distinct type, `.name`, iterable (D-0018) | TODO | — |
+| ENUM-1 | §4.6 | tier-1 enum: distinct type, `.name`, iterable (D-0018) | covered | enum_tier1_iteration |
 | ENUM-2 | §4.6 | tier-3 data-carrying variants destructured by `match`, exhaustive (D-0046) | TODO | — |
 | OPT-1 | §4.6 | prelude `Optional[T]` is the canonical optional type (D-0065) | TODO | — |
 | GEN-1 | §4.7 | built-in containers are generic (`list`/`dict`/`set`/`array`) | TODO | — |

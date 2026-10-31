@@ -140,7 +140,10 @@ additive, not a breaking change.
 ## D-0018 — Enums: tier 1 now; sum types later
 **Status:** Locked (tier 1) — tier 3 now locked by D-0046
 **Tier 1 now:** named-constant enums — a distinct type backed by int, optional
-explicit values, `.name`, iterable (`enum Color: RED, GREEN, BLUE`).
+explicit values, `.name`, iterable (`enum Color: RED, GREEN, BLUE`). Repeated
+values are aliases: the first declaration is canonical for `.name` and iteration
+visits each distinct value once in first-declaration order. An enum with `pass`
+has no members and iterates zero times.
 **Tier 3 (data-carrying variants / Rust-style sum types) + `match` destructuring**
 are now locked in **D-0046** (the `match` statement itself was locked earlier in
 D-0040).
