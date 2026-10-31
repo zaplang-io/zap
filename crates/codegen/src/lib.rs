@@ -1035,6 +1035,32 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_reflect_register", &[p.into(), p.into()], None);
         self.declare_rt("zap_reflect_has", &[p.into(), p.into()], Some(i.into()));
         self.declare_rt("zap_reflect_names", &[p.into()], Some(p.into()));
+        // Function/callable signature reflection (I#458, D-0089): a parallel
+        // registry keyed by function name / `"Type.method"`, populated at startup
+        // and queried by `reflect_params`/`reflect_sig`/`reflect_param_*`.
+        self.declare_rt(
+            "zap_reflect_param_register",
+            &[p.into(), p.into(), p.into(), i.into(), p.into()],
+            None,
+        );
+        self.declare_rt("zap_reflect_sig_register", &[p.into(), p.into()], None);
+        self.declare_rt("zap_reflect_params", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_reflect_sig", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_reflect_param_type",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_reflect_param_annotations",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_reflect_param_has_default",
+            &[p.into(), p.into()],
+            Some(i.into()),
+        );
 
         // Regex entry points (ticket #23, D-0010), backed by PCRE2 (linked with
         // `-lpcre2-8`). `m/.../` → `zap_regex_match` (match object, null = no

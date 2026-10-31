@@ -1,0 +1,13 @@
+a, b
+(a: int64, b: int64) -> int64
+name, dep, times
+(name: str, @Inject dep: Svc, times: int64 = ...) -> str
+str
+Svc
+Inject
+times has default
+name has no default
+id, q
+(id: int64, q: str = ...) -> int64
+
+nope not found

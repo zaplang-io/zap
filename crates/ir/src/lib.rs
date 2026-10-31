@@ -47,8 +47,11 @@ mod tests {
             "def f(int64 n) -> int64:\n    return n\n\ndef main():\n    print(str(1 < f(2) < 3))\n",
         );
         let text = format!("{m}");
-        // The side-effecting middle operand is called exactly once.
-        let calls = text.matches("@f(%2)").count();
+        // The side-effecting middle operand is called exactly once. (Match the
+        // call site by callee, not a specific SSA value — `main`'s value numbers
+        // shift as unrelated bootstrap is emitted, e.g. the signature-reflection
+        // registry, I#458.)
+        let calls = text.matches("invoke @f(").count() + text.matches("call @f(").count();
         assert_eq!(calls, 1, "f must be evaluated exactly once:\n{text}");
         // Two comparison links.
         assert_eq!(
@@ -312,8 +315,12 @@ mod tests {
         let text = format!("{m}");
         assert!(text.contains("structnew struct#0"), "construction:\n{text}");
         // tag slot written, payload written; match reads the tag and the fields.
+        // (Match the tag-field write structurally rather than by exact SSA value,
+        // which shifts as unrelated `main` bootstrap is emitted — e.g. the
+        // signature-reflection registry, I#458.)
         assert!(
-            text.contains("fieldset struct#0 %0.0 = %1"),
+            text.lines()
+                .any(|l| l.contains("fieldset struct#0") && l.contains(".0 = %")),
             "tag set:\n{text}"
         );
         assert!(
@@ -748,6 +755,61 @@ mod tests {
         assert!(text.contains("call @zap_reflect_register"), "text:\n{text}");
         assert!(text.contains("call @zap_reflect_has"), "text:\n{text}");
         assert!(text.contains("call @zap_reflect_names"), "text:\n{text}");
+    }
+
+    // --- signature reflection (I#458, D-0089) ---
+
+    #[test]
+    fn lower_param_reflection() {
+        // Every top-level fn and struct method is registered with its parameter
+        // metadata + a precomputed signature at the top of `main`; the queries
+        // lower to the matching runtime entry points.
+        let m = lower_ok(
+            "annotation Inject:\n    str service = \"\"\n\n\
+             struct Svc:\n    int64 n\n\n\
+             \x20   def handle(self, int64 id, str q = \"x\") -> int64:\n        return id\n\n\
+             def greet(str name, @Inject Svc dep, int64 times = 3) -> str:\n    return name\n\n\
+             def main():\n    print(reflect_params(\"greet\"))\n    \
+             print(reflect_sig(\"greet\"))\n    \
+             print(reflect_param_type(\"greet\", \"times\"))\n    \
+             print(reflect_param_annotations(\"greet\", \"dep\"))\n    \
+             if reflect_param_has_default(\"greet\", \"times\"):\n        print(\"d\")\n",
+        );
+        let text = format!("{m}");
+        // Registration bootstrap: param + signature entries.
+        assert!(
+            text.contains("call @zap_reflect_param_register"),
+            "text:\n{text}"
+        );
+        assert!(
+            text.contains("call @zap_reflect_sig_register"),
+            "text:\n{text}"
+        );
+        // The rendered signature includes the annotated param and the `= ...`
+        // default marker, and the owner key is the bare fn name.
+        assert!(
+            text.contains("strconst \"(name: str, @Inject dep: Svc, times: int64 = ...) -> str\""),
+            "text:\n{text}"
+        );
+        assert!(text.contains("strconst \"greet\""), "text:\n{text}");
+        // A method is keyed `Type.method`, and `self` is excluded.
+        assert!(text.contains("strconst \"Svc.handle\""), "text:\n{text}");
+        assert!(
+            text.contains("strconst \"(id: int64, q: str = ...) -> int64\""),
+            "text:\n{text}"
+        );
+        // The per-param annotation is recorded (not the deferred-decorator error).
+        assert!(text.contains("strconst \"Inject\""), "text:\n{text}");
+        // Each query lowers to its runtime entry point.
+        for f in [
+            "zap_reflect_params",
+            "zap_reflect_sig",
+            "zap_reflect_param_type",
+            "zap_reflect_param_annotations",
+            "zap_reflect_param_has_default",
+        ] {
+            assert!(text.contains(&format!("call @{f}")), "missing {f}\n{text}");
+        }
     }
 
     // --- coroutines & channels (ticket #25, D-0013/D-0031) ---

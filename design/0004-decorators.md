@@ -128,6 +128,32 @@ Database db            # a DI/framework decorator fills it
   dynamic frameworks (ORMs, DI containers, serializers chosen at runtime) can be
   written. Opt-in; pay only when used.
 
+Two complementary string-keyed surfaces exist:
+
+- **Type/function annotations** (D-0036, extended to functions by D-0087):
+  `reflect_has(owner, name) -> bool` and `reflect_names(owner) -> str` report the
+  annotation/decorator *names* carried by a struct/enum type or a function.
+- **Signature reflection** (D-0089, I#458): the *shape* of a callable — its
+  parameter names, declared types, defaults, and per-parameter annotations. The
+  `owner` is a function name (top-level `def`) or `"Type.method"`:
+  - `reflect_params(owner) -> str` — comma-joined parameter names, declaration
+    order (the implicit `self` receiver is excluded).
+  - `reflect_sig(owner) -> str` — a readable one-line signature, e.g.
+    `(id: int, q: str = ...) -> str`; a defaulted parameter is marked `= ...` and
+    an annotated one is `@anno`-prefixed.
+  - `reflect_param_type(owner, param) -> str` — the rendered declared type (`""`
+    if the parameter is untyped or not found).
+  - `reflect_param_has_default(owner, param) -> bool`.
+  - `reflect_param_annotations(owner, param) -> str` — comma-joined per-parameter
+    annotation names.
+
+  A *declared* annotation/decorator on a parameter (`def h(@Inject Svc dep)`) is
+  recorded as reflectable metadata — the same model as the fn/type level — while
+  behavioral or unknown names stay deferred. Opaque first-class function values
+  and closures are not reflectable by value; reflect the named `def`. This is the
+  substrate for typed per-parameter injection and `Depends(...)`-style DI (the
+  fastzap web framework, zap#312 / fastzap#7).
+
 ### Composition & order
 
 Multiple decorators stack; they apply **bottom-up** (the decorator nearest the

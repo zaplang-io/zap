@@ -1166,6 +1166,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     &sigs,
                     &ctx,
                     &deco.reflect_meta,
+                    &deco.param_meta,
                     &deco.on_signal_meta,
                 ) {
                     Ok(func) => out.funcs.push(func),
@@ -1196,7 +1197,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                         }
                         continue;
                     }
-                    match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[]) {
+                    match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[], &[]) {
                         Ok(func) => out.funcs.push(func),
                         Err(e) => errors.push(e),
                     }
@@ -1221,7 +1222,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                             }
                             continue;
                         }
-                        match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[]) {
+                        match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[], &[]) {
                             Ok(func) => out.funcs.push(func),
                             Err(e) => errors.push(e),
                         }
@@ -1728,12 +1729,115 @@ impl DerivedTrait {
     }
 }
 
+/// A reflectable parameter of a function/method (I#458, D-0089). `self` is
+/// excluded by the collector.
+struct ParamReflect {
+    name: String,
+    /// Rendered declared type (`int`, `list[str]`, `fn(Request) -> Response`),
+    /// or `""` when the parameter is untyped.
+    type_disp: String,
+    has_default: bool,
+    /// Declared annotation/decorator names on the parameter, in source order.
+    annos: Vec<String>,
+}
+
+/// Reflectable signature metadata for one function/method (I#458, D-0089). The
+/// `owner` is the key callers pass to `reflect_params`/`reflect_sig`: a function
+/// name for a top-level `def`, or `"Type.method"` for a method.
+struct FnReflect {
+    owner: String,
+    params: Vec<ParamReflect>,
+    /// Readable one-line signature, built at compile time (e.g.
+    /// `(id: int, q: str = ...) -> int64`).
+    sig: String,
+}
+
+/// Render an `ast::Type` to its source-like display (mirrors `analysis::render_type`,
+/// duplicated here to avoid an `ir -> analysis` dependency).
+fn render_ast_type(t: &ast::Type) -> String {
+    match t {
+        ast::Type::Named { name, args, .. } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let inner: Vec<String> = args.iter().map(render_ast_type).collect();
+                format!("{}[{}]", name, inner.join(", "))
+            }
+        }
+        ast::Type::Tuple { elems, .. } => {
+            let inner: Vec<String> = elems.iter().map(render_ast_type).collect();
+            format!("({})", inner.join(", "))
+        }
+        ast::Type::Func { params, ret, .. } => {
+            let ps: Vec<String> = params.iter().map(render_ast_type).collect();
+            match ret {
+                Some(r) => format!("fn({}) -> {}", ps.join(", "), render_ast_type(r)),
+                None => format!("fn({})", ps.join(", ")),
+            }
+        }
+    }
+}
+
+/// Collect the reflectable signature metadata for one function/method body
+/// (I#458, D-0089). `owner` is the reflection key; `meta_names` is the set of
+/// declared annotation/decorator names (the only param decorators recorded —
+/// everything else stays deferred/rejected, mirroring the fn-level model).
+/// Returns `None` when the function has no reflectable parameters AND no return
+/// type (nothing worth a registry entry — a bare `def f(): ...`).
+fn collect_fn_reflect(f: &ast::Function, owner: String, meta_names: &HashSet<String>) -> FnReflect {
+    let mut params = Vec::new();
+    let mut parts = Vec::new();
+    for p in &f.params {
+        // The implicit receiver is not part of the reflectable signature.
+        if p.name == "self" {
+            continue;
+        }
+        let type_disp = p.ty.as_ref().map(render_ast_type).unwrap_or_default();
+        let annos: Vec<String> = p
+            .decorators
+            .iter()
+            .filter(|d| meta_names.contains(&d.name))
+            .map(|d| d.name.clone())
+            .collect();
+        // Readable rendering for `reflect_sig`: `@anno name: type = ...`.
+        let mut part = String::new();
+        for a in &annos {
+            part.push('@');
+            part.push_str(a);
+            part.push(' ');
+        }
+        part.push_str(&p.name);
+        if !type_disp.is_empty() {
+            part.push_str(": ");
+            part.push_str(&type_disp);
+        }
+        if p.default.is_some() {
+            part.push_str(" = ...");
+        }
+        parts.push(part);
+        params.push(ParamReflect {
+            name: p.name.clone(),
+            type_disp,
+            has_default: p.default.is_some(),
+            annos,
+        });
+    }
+    let mut sig = format!("({})", parts.join(", "));
+    if let Some(r) = &f.ret {
+        sig.push_str(" -> ");
+        sig.push_str(&render_ast_type(r));
+    }
+    FnReflect { owner, params, sig }
+}
+
 /// The result of scanning a module's decorators/annotations.
 struct DecoratorPlan {
     /// Per struct (by id), the traits to derive.
     derived: Vec<(u32, Vec<DerivedTrait>)>,
     /// `(type_name, decorator_or_annotation_name)` pairs for runtime reflection.
     reflect_meta: Vec<(String, String)>,
+    /// Per function/method, the reflectable signature metadata (I#458, D-0089).
+    param_meta: Vec<FnReflect>,
     /// `@on_signal(Signal.X)` handlers (ticket #77): `(signal_number, fn_name)`
     /// pairs, registered at the top of `main` via `zap_signal_on`.
     on_signal_meta: Vec<(i64, String)>,
@@ -1769,6 +1873,9 @@ impl DecoratorPlan {
         let mut reflect_meta: Vec<(String, String)> = Vec::new();
         let mut on_signal_meta: Vec<(i64, String)> = Vec::new();
         let mut json_enums: Vec<u32> = Vec::new();
+        // Signature reflection (I#458, D-0089): every top-level function and every
+        // struct/enum method in the user module is reflectable by name.
+        let mut param_meta: Vec<FnReflect> = Vec::new();
 
         for item in &module.items {
             match item {
@@ -1831,7 +1938,12 @@ impl DecoratorPlan {
                         }
                     }
                     for m in &s.methods {
-                        defer_fn_decorators(m, errors);
+                        defer_fn_decorators(m, &meta_names, errors);
+                        param_meta.push(collect_fn_reflect(
+                            m,
+                            format!("{}.{}", s.name, m.name),
+                            &meta_names,
+                        ));
                     }
                 }
                 ast::Item::Function(f) => {
@@ -1877,49 +1989,70 @@ impl DecoratorPlan {
                         }
                     }
                     for p in &f.params {
-                        if !p.decorators.is_empty() {
-                            errors.push(err(format!(
-                                "parameter decorators are not implemented yet (deferred): \
-                                 '@{}' on '{}'",
-                                p.decorators[0].name, p.name
-                            )));
+                        for d in &p.decorators {
+                            // A *declared* annotation/decorator on a parameter is
+                            // recorded as reflectable metadata (I#458, D-0089),
+                            // mirroring the fn-level model (D-0087): the parameter
+                            // binds unchanged and the annotation is queryable via
+                            // `reflect_param_annotations`. Behavioral wrap and any
+                            // unknown name stay deferred (the latter already caught
+                            // by sema's ZAP5032; this is defensive).
+                            if !meta_names.contains(&d.name) {
+                                errors.push(err(format!(
+                                    "parameter decorators are not implemented yet (deferred): \
+                                     '@{}' on '{}'",
+                                    d.name, p.name
+                                )));
+                            }
                         }
                     }
+                    param_meta.push(collect_fn_reflect(f, f.name.clone(), &meta_names));
                 }
-                ast::Item::Enum(e) if !e.decorators.is_empty() => {
-                    // `@derive(Json)` + `@json(open)` on an enum (ticket #346,
-                    // D-0086): an open string-enum codec. Any other enum
-                    // decorator stays deferred.
-                    let derives_json = e.decorators.iter().any(|d| {
-                        d.name == "derive"
-                            && d.args
-                                .iter()
-                                .any(|a| matches!(&a.value, ast::Expr::Name(t, _) if t == "Json"))
-                    });
-                    let is_open = e.decorators.iter().any(|d| {
-                        d.name == "json"
-                            && d.args
-                                .iter()
-                                .any(|a| matches!(&a.value, ast::Expr::Name(n, _) if n == "open"))
-                    });
-                    for d in &e.decorators {
-                        if d.name != "derive" && d.name != "json" {
+                ast::Item::Enum(e) => {
+                    if !e.decorators.is_empty() {
+                        // `@derive(Json)` + `@json(open)` on an enum (ticket #346,
+                        // D-0086): an open string-enum codec. Any other enum
+                        // decorator stays deferred.
+                        let derives_json = e.decorators.iter().any(|d| {
+                            d.name == "derive"
+                                && d.args.iter().any(
+                                    |a| matches!(&a.value, ast::Expr::Name(t, _) if t == "Json"),
+                                )
+                        });
+                        let is_open = e.decorators.iter().any(|d| {
+                            d.name == "json"
+                                && d.args.iter().any(
+                                    |a| matches!(&a.value, ast::Expr::Name(n, _) if n == "open"),
+                                )
+                        });
+                        for d in &e.decorators {
+                            if d.name != "derive" && d.name != "json" {
+                                errors.push(err(format!(
+                                    "enum decorators are not implemented yet (deferred): '@{}'",
+                                    d.name
+                                )));
+                            }
+                        }
+                        if derives_json {
+                            match validate_open_enum(e, ctx, is_open) {
+                                Ok(sid) => json_enums.push(sid),
+                                Err(e) => errors.push(e),
+                            }
+                        } else if is_open {
                             errors.push(err(format!(
-                                "enum decorators are not implemented yet (deferred): '@{}'",
-                                d.name
+                                "enum '{}' has @json(open) but no @derive(Json) (ticket #346)",
+                                e.name
                             )));
                         }
                     }
-                    if derives_json {
-                        match validate_open_enum(e, ctx, is_open) {
-                            Ok(sid) => json_enums.push(sid),
-                            Err(e) => errors.push(e),
-                        }
-                    } else if is_open {
-                        errors.push(err(format!(
-                            "enum '{}' has @json(open) but no @derive(Json) (ticket #346)",
-                            e.name
-                        )));
+                    // Tier-3 enum methods (D-0046) are reflectable like struct
+                    // methods (I#458, D-0089).
+                    for m in &e.methods {
+                        param_meta.push(collect_fn_reflect(
+                            m,
+                            format!("{}.{}", e.name, m.name),
+                            &meta_names,
+                        ));
                     }
                 }
                 _ => {}
@@ -1929,6 +2062,7 @@ impl DecoratorPlan {
         DecoratorPlan {
             derived,
             reflect_meta,
+            param_meta,
             json_enums,
             on_signal_meta,
         }
@@ -2022,7 +2156,11 @@ fn validate_open_enum(e: &ast::EnumDef, ctx: &StructCtx, is_open: bool) -> Resul
 }
 
 /// Report function/parameter decorators as deferred (not implemented yet).
-fn defer_fn_decorators(f: &ast::Function, errors: &mut Vec<LowerError>) {
+fn defer_fn_decorators(
+    f: &ast::Function,
+    meta_names: &HashSet<String>,
+    errors: &mut Vec<LowerError>,
+) {
     if !f.decorators.is_empty() {
         errors.push(err(format!(
             "function decorators are not implemented yet (deferred): '@{}' on '{}'",
@@ -2030,11 +2168,16 @@ fn defer_fn_decorators(f: &ast::Function, errors: &mut Vec<LowerError>) {
         )));
     }
     for p in &f.params {
-        if !p.decorators.is_empty() {
-            errors.push(err(format!(
-                "parameter decorators are not implemented yet (deferred): '@{}' on '{}'",
-                p.decorators[0].name, p.name
-            )));
+        for d in &p.decorators {
+            // A declared annotation/decorator on a method parameter is reflectable
+            // metadata (I#458, D-0089), like top-level fn params; anything else
+            // stays deferred.
+            if !meta_names.contains(&d.name) {
+                errors.push(err(format!(
+                    "parameter decorators are not implemented yet (deferred): '@{}' on '{}'",
+                    d.name, p.name
+                )));
+            }
         }
     }
 }
@@ -3618,6 +3761,7 @@ fn gen_hash_method(
     Ok(b.func)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_fn(
     f: &ast::Function,
     zir_name: String,
@@ -3625,6 +3769,7 @@ fn lower_fn(
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
     ctx: &StructCtx,
     reflect_meta: &[(String, String)],
+    param_meta: &[FnReflect],
     on_signal_meta: &[(i64, String)],
 ) -> Result<Func, LowerError> {
     let (params, ret) = sigs.get(&zir_name).cloned().unwrap();
@@ -3656,6 +3801,10 @@ fn lower_fn(
         // anywhere in the program see every annotated/decorated type. These are
         // plain (non-throwing) runtime calls emitted before the user body.
         b.emit_reflect_registrations(reflect_meta);
+        // Signature reflection bootstrap (I#458, D-0089): record every reflectable
+        // function/method's parameter metadata and precomputed signature string, so
+        // `reflect_params`/`reflect_sig`/`reflect_param_*` queries resolve anywhere.
+        b.emit_param_reflect_registrations(param_meta);
         // Signal subsystem bootstrap (ticket #77, D-0058): start the dedicated
         // signal thread + self-pipe and install the default diagnostic handlers
         // (SIGQUIT -> stacks/runtime dump, SIGUSR1 -> GC + mem stats), unless the
@@ -4778,6 +4927,33 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Emit the signature-reflection registry population (I#458, D-0089): for
+    /// every reflectable function/method, one `zap_reflect_param_register` per
+    /// parameter (in declaration order) plus one `zap_reflect_sig_register` for
+    /// the precomputed readable signature. Called once at the top of `main`.
+    fn emit_param_reflect_registrations(&mut self, meta: &[FnReflect]) {
+        for fr in meta {
+            let owner = self.strconst(&fr.owner);
+            for p in &fr.params {
+                let name = self.strconst(&p.name);
+                let tyd = self.strconst(&p.type_disp);
+                let hasdef = self.iconst(Ty::I64, if p.has_default { 1 } else { 0 });
+                let annos = self.strconst(&p.annos.join(", "));
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_reflect_param_register".to_string(),
+                    args: vec![owner, name, tyd, hasdef, annos],
+                });
+            }
+            let sig = self.strconst(&fr.sig);
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_reflect_sig_register".to_string(),
+                args: vec![owner, sig],
+            });
+        }
+    }
+
     /// Emit `zap_signal_on(signo, &handler)` for every `@on_signal(Signal.X)`
     /// handler (ticket #77). Called once at the top of `main`. The runtime
     /// subscribes to the signal and spawns a detached coroutine that invokes the
@@ -4843,6 +5019,68 @@ impl<'a> FnLower<'a> {
             rhs: zero,
         });
         Ok((d, Ty::I1))
+    }
+
+    /// Lower the signature-reflection queries (I#458, D-0089):
+    /// `reflect_params(owner)`, `reflect_sig(owner)`, `reflect_param_type(owner,
+    /// param)`, `reflect_param_annotations(owner, param)` (all `-> str`), and
+    /// `reflect_param_has_default(owner, param) -> bool`. Each forwards string
+    /// arguments to its runtime entry point; the only one returning an `i64` is
+    /// normalized to a `bool`.
+    fn lower_reflect_param_query(
+        &mut self,
+        fname: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let arity = if fname == "reflect_params" || fname == "reflect_sig" {
+            1
+        } else {
+            2
+        };
+        if args.len() != arity {
+            return Err(err(format!("{fname}() takes exactly {arity} argument(s)")));
+        }
+        let mut argvals = Vec::new();
+        for a in args {
+            let (v, vt) = self.expr(&a.value)?;
+            if vt != Ty::Ptr {
+                return Err(err(format!("{fname}() expects str arguments")));
+            }
+            argvals.push(v);
+        }
+        let rtfn = match fname {
+            "reflect_params" => "zap_reflect_params",
+            "reflect_sig" => "zap_reflect_sig",
+            "reflect_param_type" => "zap_reflect_param_type",
+            "reflect_param_annotations" => "zap_reflect_param_annotations",
+            "reflect_param_has_default" => "zap_reflect_param_has_default",
+            _ => return Err(err(format!("unknown reflection query '{fname}'"))),
+        };
+        if fname == "reflect_param_has_default" {
+            // The runtime returns 1/0 as i64; normalize to a bool.
+            let word = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(word),
+                func: rtfn.to_string(),
+                args: argvals,
+            });
+            let zero = self.iconst(Ty::I64, 0);
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: d,
+                pred: CmpPred::Ne,
+                lhs: word,
+                rhs: zero,
+            });
+            return Ok((d, Ty::I1));
+        }
+        let d = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(d),
+            func: rtfn.to_string(),
+            args: argvals,
+        });
+        Ok((d, Ty::Ptr))
     }
 
     // --- statements ---
@@ -7961,6 +8199,19 @@ impl<'a> FnLower<'a> {
             // the top of `main`. Both take string arguments.
             if fname == "reflect_has" || fname == "reflect_names" {
                 return self.lower_reflect_query(fname, args);
+            }
+            // Signature reflection (I#458, D-0089): `reflect_params`/`reflect_sig`
+            // and the per-parameter queries read the signature registry populated
+            // alongside the struct/type registry at the top of `main`.
+            if matches!(
+                fname.as_str(),
+                "reflect_params"
+                    | "reflect_sig"
+                    | "reflect_param_type"
+                    | "reflect_param_annotations"
+                    | "reflect_param_has_default"
+            ) {
+                return self.lower_reflect_param_query(fname, args);
             }
             // Tier-1 enum conversion `Color(x)` (D-0018/D-0020): the enum is its
             // backing `i64`, so this is just a coercion of the int argument.

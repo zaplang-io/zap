@@ -360,15 +360,28 @@ pub fn type_str(t: &Type) -> String {
 }
 
 pub fn param_str(p: &Param) -> String {
+    // Inline parameter decorators (I#458): `@Inject Svc dep`. Rendered as a
+    // space-separated prefix so the formatter round-trips param annotations.
+    let decos: String = p
+        .decorators
+        .iter()
+        .map(|d| {
+            if d.args.is_empty() {
+                format!("@{} ", d.name)
+            } else {
+                format!("@{}({}) ", d.name, render_args(&d.args))
+            }
+        })
+        .collect();
     match &p.ty {
-        None => p.name.clone(), // untyped `self`
+        None => format!("{decos}{}", p.name), // untyped `self`
         Some(ty) => {
             let dots = if p.variadic { "..." } else { "" };
             let default = match &p.default {
                 Some(d) => format!(" = {}", pexpr(d, P_LAMBDA)),
                 None => String::new(),
             };
-            format!("{}{} {}{}", type_str(ty), dots, p.name, default)
+            format!("{decos}{}{} {}{}", type_str(ty), dots, p.name, default)
         }
     }
 }
