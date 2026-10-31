@@ -26,7 +26,8 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 ### Added
 
 - **Language.** Type-first declarations and `const` (D-0003); scalars and
-  conversions; `str`/`bytes` with interpolation, codepoint indexing/slicing/
+  conversions, including arbitrary-precision `bigint` and native `complex`
+  arithmetic (D-0019); `str`/`bytes` with interpolation, codepoint indexing/slicing/
   iteration, comparison, substring `in`, the core method set
   (`upper`/`lower`/`strip`/`split`/`join`/`find`/`index`/`replace`/
   `startswith`/`endswith`/`contains`/`encode`) and `ord`/`chr`/`char`/`str`/

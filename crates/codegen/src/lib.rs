@@ -1015,6 +1015,50 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_ffloordiv", &[f.into(), f.into()], Some(f.into()));
         self.declare_rt("zap_imod", &[i.into(), i.into()], Some(i.into()));
 
+        // Complex scalars are immutable GC objects with a pointer ABI. The
+        // runtime owns construction/arithmetic so both AOT and the REPL JIT use
+        // the same representation and semantics.
+        self.declare_rt("zap_complex_new", &[f.into(), f.into()], Some(p.into()));
+        self.declare_rt("zap_complex_from_f64", &[f.into()], Some(p.into()));
+        for name in [
+            "zap_complex_add",
+            "zap_complex_sub",
+            "zap_complex_mul",
+            "zap_complex_div",
+            "zap_complex_pow",
+        ] {
+            self.declare_rt(name, &[p.into(), p.into()], Some(p.into()));
+        }
+        self.declare_rt("zap_complex_eq", &[p.into(), p.into()], Some(i.into()));
+        self.declare_rt("zap_complex_truthy", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_complex_neg", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_complex_to_str", &[p.into()], Some(p.into()));
+
+        self.declare_rt("zap_bigint_from_str", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_bigint_from_i64", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_bigint_from_f64", &[f.into()], Some(p.into()));
+        self.declare_rt("zap_bigint_to_i64", &[p.into()], Some(i.into()));
+        self.declare_rt(
+            "zap_bigint_to_i32",
+            &[p.into()],
+            Some(self.ctx.i32_type().into()),
+        );
+        self.declare_rt("zap_bigint_to_f64", &[p.into()], Some(f.into()));
+        self.declare_rt("zap_bigint_cmp", &[p.into(), p.into()], Some(i.into()));
+        self.declare_rt("zap_bigint_neg", &[p.into()], Some(p.into()));
+        for name in [
+            "zap_bigint_add",
+            "zap_bigint_sub",
+            "zap_bigint_mul",
+            "zap_bigint_floordiv",
+            "zap_bigint_mod",
+            "zap_bigint_pow",
+        ] {
+            self.declare_rt(name, &[p.into(), p.into()], Some(p.into()));
+        }
+        self.declare_rt("zap_bigint_truthy", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_bigint_to_str", &[p.into()], Some(p.into()));
+
         // Decorators & reflection (ticket #16, D-0036). `zap_i64_to_str` and
         // `zap_str_eq` back the `@derive(Repr)` / `@derive(Eq)` generated methods;
         // the `zap_reflect_*` entry points back the runtime-reflection surface
@@ -1737,7 +1781,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Bytes
             | Ty::Match
             | Ty::Func(_)
-            | Ty::Py => self.ctx.ptr_type(AddressSpace::default()).into(),
+            | Ty::Py
+            | Ty::Bigint
+            | Ty::Complex => self.ctx.ptr_type(AddressSpace::default()).into(),
         }
     }
 
