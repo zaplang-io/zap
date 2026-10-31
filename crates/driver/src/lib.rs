@@ -17,6 +17,7 @@ use zapc_syntax::ast::Module;
 use zapc_syntax::cfg::Target;
 
 pub mod cli;
+mod decorator_desugar;
 mod modlink;
 // The JSON codec now lives in its own leaf crate (`zapc_json`, I#236) so the
 // lower-level `zapc_pkg` can share it; re-exported here as `crate::json` so the
@@ -47,7 +48,7 @@ fn build_target(features: &[String]) -> Target {
 /// A single file with no local imports links to just itself, so the single-file
 /// path is unchanged. `when target.*` is resolved per file inside the loader.
 fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
-    let module = match modlink::load_program(entry, target) {
+    let mut module = match modlink::load_program(entry, target) {
         Ok(m) => m,
         Err(diags) => {
             for d in &diags {
@@ -59,6 +60,10 @@ fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
             return Err(ExitCode::from(1));
         }
     };
+    // Desugar registering (dotted) function decorators — `@app.get("/x")` — into
+    // the method-call registration the receiver already accepts, before sema, so
+    // the synthesized call is type-checked normally (I#457, D-0087).
+    decorator_desugar::desugar_registering_decorators(&mut module);
     let errs = zapc_sema::check(&module);
     if !errs.is_empty() {
         for e in &errs {

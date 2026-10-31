@@ -2225,3 +2225,77 @@ aws-codegen layer ([[I#347]]) emits Zap shape types that use these; plain
 - **No grammar change.** `@json(...)` and `@derive(Json)` reuse the existing
   `decorators` production on fields and enums (D-0036/[[D-0046]]); `docs/GRAMMAR.ebnf`
   needs no new rule. See `design/0010-json.md` §"AWS codec hooks".
+
+## D-0087 — Function decorators: metadata + registering targets (I#457)
+**Status:** Locked (capability A) — supersedes the "deferred" stub for function
+decorators left by [[D-0036]]/#26.
+
+#26 shipped `@derive` + struct/field/enum reflection but left **function**
+decorators unimplemented: any `@deco` on a `def` errored `ZAP6001` ("function
+decorators are not implemented yet (deferred)", `crates/ir/lower.rs`), and a
+dotted decorator name like `@app.get("/x")` was rejected at `ZAP5032` ("unknown
+decorator or annotation") because a bound method on a runtime instance is not a
+declared decorator/annotation/built-in. Both gates blocked the idiomatic
+FastAPI-style handler surface that fastzap (zap#312, fastzap#8) wants. This
+decision defines function-decorator semantics and lifts both gates for
+**capability A** (a uniform `fn(Request)->Response` handler; per-parameter typed
+injection is capability B, function-parameter reflection, tracked as zap#458 and
+explicitly **not** built here).
+
+Two kinds, split by the decorator-name shape, both resolved at **compile time**
+(consistent with D-0036's compile-time-first rule). In **neither** case is the
+decorated function rebound or wrapped — it keeps its name, signature and
+callability. There is no Python-style runtime decorator application; a decorator
+is either *metadata on* the function or *a registration of* the function.
+
+### (1) Bare name → declared annotation/decorator → reflection metadata
+`@route(path="/x")` where `route` is a declared `annotation`/`decorator` (a bare,
+in-module name) attaches **reflection metadata keyed by the function's name**,
+exactly mirroring the struct-level model (D-0036): lowering emits
+`zap_reflect_register("<fn>", "<deco>")` at the top of `main`, so
+`reflect_has("h","route")` / `reflect_names("h")` answer for functions just as
+they do for types. The function body lowers unchanged. This clears ZAP6001 for
+declared decorators. **Behavioral `wrap`/`before`/`after` code generation stays
+deferred** (it is the user-macro piece, D-0036 "staged"); only metadata is
+attached in v1. Deferred built-in function decorators (`@cache`, `@validate`,
+`@inject`, …) keep their clean "not implemented yet" error.
+
+### (2) Dotted name → registering callable target → registration call
+`@app.get("/x")` on `def h(...)` desugars to the **registration call**
+`app.get("/x", h)` — the decorated function is passed as a trailing first-class
+function value (D-0067) to the receiver's method. This is *exactly* the
+method-call registration surface fastzap v1 already compiles and runs
+(`app.get(path, handler)`); `@app.get` is pure sugar over it. The desugar runs
+as a whole-program AST pass **before sema** (`crates/driver`), so:
+- ZAP5032 is resolved **not** by loosening sema's decorator check but by removing
+  the dotted decorator and letting sema **type-check the resulting call** — an
+  unknown receiver, a missing method, or a wrong arg shape now produces a precise
+  error at the call instead of a blanket "unknown decorator".
+- The rule is syntactic and safe: **every** existing decorator (built-ins,
+  declared annotations/decorators) is a *bare* name, so a **dotted** decorator
+  name is unambiguously a registering target. (Cross-module/bare user decorators
+  that wrap remain the deferred user-macro API.)
+
+**Placement / ordering.** The registration call is inserted **immediately after
+the receiver's binding** (`auto app = …`) in the function that declares it
+(`main` in practice), preserving decorated-def source order among routes. This is
+#459-independent: it needs no module-level execution. The receiver is a local, the
+handler is a top-level `def` referenced by name — the precise pattern that already
+type-checks and codegens today. When module-level top-level execution lands
+(zap#459), a module-level `app` registers identically (right after its module-init
+binding) with no further decorator work.
+
+**Scope boundary for #458.** The registering method just takes a `fn(Request)->
+Response` value; per-parameter typed injection (`@app.get(id: int, q: str=…)`,
+`Depends`) needs function-parameter reflection (zap#458) and composes later as a
+reflection-driven adapter over this same seam — no change to this desugar.
+
+**No grammar change.** `@ dotted_name ( args )` already parses (`docs/GRAMMAR.ebnf`
+`decorators`, D-0036); this is sema/driver/lowering only.
+
+**Test note.** The registering golden (`tests/golden/fn_decorator_register.zap`)
+is reduced to a **field-free** `App` to avoid **zap#461** — struct field defaults
+are dropped at construction when the field is omitted, so a `list[Route] routes =
+[]` field left null SIGSEGVs on `.append`. That is a separate codegen bug, not in
+the decorator path: the `@app.get` desugar lowers correctly either way (verified
+in ZIR). Restore the `list[Route]` router form in the golden once zap#461 lands.

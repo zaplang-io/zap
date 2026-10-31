@@ -1824,7 +1824,7 @@ impl DecoratorPlan {
                 ast::Item::Function(f) => {
                     // `@on_signal(Signal.X)` (ticket #77): register `f` as a
                     // handler for signal X; a detached receiver coroutine runs it
-                    // on each delivery. Other function decorators remain deferred.
+                    // on each delivery.
                     for d in &f.decorators {
                         if d.name == "on_signal" {
                             if !f.params.is_empty() {
@@ -1837,7 +1837,25 @@ impl DecoratorPlan {
                                 Ok(signo) => on_signal_meta.push((signo, f.name.clone())),
                                 Err(e) => errors.push(e),
                             }
+                        } else if meta_names.contains(&d.name) {
+                            // A declared `annotation`/`decorator` on a function
+                            // (I#457, D-0087): attach reflection metadata keyed by
+                            // the function name, mirroring the struct-level model
+                            // (D-0036). The function body lowers unchanged; its
+                            // decorator is queryable via reflect_has/reflect_names.
+                            // Behavioral wrap/before/after codegen stays deferred.
+                            reflect_meta.push((f.name.clone(), d.name.clone()));
+                        } else if DEFERRED_BUILTINS.contains(&d.name.as_str()) {
+                            errors.push(err(format!(
+                                "built-in decorator '@{}' is not implemented yet (deferred)",
+                                d.name
+                            )));
                         } else {
+                            // Dotted registering targets (`@app.get(...)`, D-0087)
+                            // are desugared to a registration call before sema, so
+                            // they never reach here. A bare name that is neither a
+                            // declared decorator/annotation nor a known built-in was
+                            // already rejected by sema (ZAP5032); this is defensive.
                             errors.push(err(format!(
                                 "function decorators are not implemented yet (deferred): \
                                  '@{}' on '{}'",
