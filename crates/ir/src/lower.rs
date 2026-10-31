@@ -255,6 +255,14 @@ struct StructCtx {
     /// struct whose fields all carry a bit width is laid out as one backing
     /// integer with shift/mask field accessors; absent for ordinary structs.
     packed_layouts: HashMap<u32, PackedLayout>,
+    /// Literal field defaults (D-0038), parallel to [`StructCtx::fields`]: for
+    /// struct id `sid`, `field_defaults[sid][i]` is the default expression of
+    /// field `i`, or `None` if the field is undefaulted. A caller that omits a
+    /// defaulted field at construction (`Box()` vs `Box(xs=[])`) has that
+    /// default lowered fresh in the constructor's scope (#461). Entries for
+    /// enum/interface synthetic layouts are empty (they are never constructed
+    /// through [`FnLower::construct`]).
+    field_defaults: Vec<Vec<Option<Expr>>>,
     /// Call-site argument-assembly metadata for default and keyword arguments
     /// (D-0038, I#298), keyed by free-function name (the same key as `sigs`) and
     /// parallel to that signature's `Ty` vector. A call that omits a defaulted
@@ -766,6 +774,9 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     }
 
     let mut fields: Vec<Vec<(String, Ty)>> = vec![Vec::new(); names.len()];
+    // Literal field defaults (D-0038), parallel to `fields` (#461). Filled only
+    // for named-struct fields; enum/interface synthetic layouts stay empty.
+    let mut field_defaults: Vec<Vec<Option<Expr>>> = vec![Vec::new(); names.len()];
     // C-style bitfield packing (I#173, D-0068), keyed by struct id. A value
     // struct whose fields all carry a bit width packs into one backing integer.
     let mut packed_layouts: HashMap<u32, PackedLayout> = HashMap::new();
@@ -786,6 +797,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 for fld in &s.fields {
                     let ft = resolve_ty(&fld.ty, &tyenv).unwrap_or(Ty::Ptr);
                     fields[sid as usize].push((fld.name.clone(), ft));
+                    field_defaults[sid as usize].push(fld.default.clone());
                     opts.push(parse_json_field_opts(fld));
                 }
                 if opts.iter().any(|o| o.timestamp.is_some()) {
@@ -901,6 +913,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         captureless_env: RefCell::new(None),
         fnval_wrappers: RefCell::new(HashMap::new()),
         packed_layouts,
+        field_defaults,
         call_params: HashMap::new(),
         json_field_opts,
     };
@@ -8584,6 +8597,9 @@ impl<'a> FnLower<'a> {
     fn construct(&mut self, sid: u32, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
         let dest = self.new_value(Ty::Struct(sid));
         self.emit(Inst::StructNew { dest, sid });
+        // Track which field slots the caller supplies, so every omitted field
+        // that carries a declared default (D-0038) is still initialized (#461).
+        let mut set = vec![false; self.ctx.fields[sid as usize].len()];
         for (i, a) in args.iter().enumerate() {
             let (idx, fty) = match &a.name {
                 Some(fname) => self
@@ -8606,6 +8622,40 @@ impl<'a> FnLower<'a> {
                 base: dest,
                 sid,
                 idx,
+                val: v,
+            });
+            if let Some(slot) = set.get_mut(idx as usize) {
+                *slot = true;
+            }
+        }
+        // Fill omitted fields from their declared defaults (D-0038, #461), in
+        // declaration order. Without this a defaulted field the caller omits
+        // (`Box()` vs `Box(xs=[])`) is left null — a silent null read for
+        // pointer-typed defaults and a SIGSEGV when that null is used as, e.g.,
+        // a list. The default is lowered fresh per construction in the caller's
+        // scope, matching the explicit-argument path (same coerce + value-struct
+        // copy), so a mutable default like `[]` is a distinct object each time.
+        for (idx, is_set) in set.iter().enumerate() {
+            if *is_set {
+                continue;
+            }
+            let default = self
+                .ctx
+                .field_defaults
+                .get(sid as usize)
+                .and_then(|d| d.get(idx))
+                .and_then(|d| d.clone());
+            let Some(default) = default else {
+                continue;
+            };
+            let fty = self.ctx.fields[sid as usize][idx].1;
+            let (v, vt) = self.expr(&default)?;
+            let v = self.coerce(v, vt, fty);
+            let v = self.copy_if_value(v, fty, &default);
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: idx as u32,
                 val: v,
             });
         }
