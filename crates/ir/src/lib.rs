@@ -1410,6 +1410,49 @@ def main():
     }
 
     #[test]
+    fn lower_generator_for_loop_spills_induction_state() {
+        // A `for` loop INSIDE a generator body (I#453): the loop's induction
+        // index and the iterable handle are synthesized, not named `auto`
+        // locals, yet they are live across the `yield` in the loop body. They
+        // must be hoisted into the generator state struct (like an explicit
+        // local) so they survive suspend/resume — otherwise the index reads
+        // uninitialized on resume and the handle (an SSA value defined at loop
+        // setup) does not dominate the resume re-entry, crashing `__next__`.
+        let m = lower_ok(include_str!(
+            "../../../tests/golden/generator_for_in_body.zap"
+        ));
+        let text = format!("{m}");
+        let next = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "$gen:emit____next__")
+            .expect("__next__ emitted");
+        let gen_sid = match next.params.first() {
+            Some(Ty::Struct(sid)) => *sid,
+            other => panic!("__next__ self param: {other:?}"),
+        };
+        // State-struct layout: [$state:i64, xs:list, $for:idx:i64,
+        // $for:handle:list, x:i64]. Before the fix only `$state` + `xs` were
+        // captured (the index was a per-call alloca, the handle a bare SSA
+        // value), so the frame had just 2 fields; the for-loop control state
+        // adds the index, the spilled iterable handle, and the loop variable.
+        let fields = &m.structs[gen_sid as usize].fields;
+        assert!(
+            fields.len() >= 5,
+            "for-loop induction index, iterable handle, and loop var are captured \
+             into the generator frame (got {} field(s)):\n{text}",
+            fields.len()
+        );
+        // field 0 is `$state`; the induction index and loop variable are i64;
+        // the spilled iterable handle is the `list[i64]` being walked.
+        assert_eq!(fields[0], Ty::I64, "field 0 is $state:\n{text}");
+        assert!(
+            fields.iter().any(|t| matches!(t, Ty::List(_))),
+            "the iterable handle is spilled into the frame as a list field:\n{text}"
+        );
+    }
+
+    #[test]
     fn lower_user_iterable_commaok() {
         // `for x in Range(...)` desugars to `__iter__` then a loop over the
         // comma-ok `__next__`, binding each tuple's value field.
