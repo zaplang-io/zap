@@ -306,12 +306,18 @@ define_codes! {
          Check the spelling, or that the declaration exists and is not private \
          (a leading `_`).";
     ZAP3014 = 3014 : "top-level statement in an imported module",
-        "Only the entry module runs top-level statements; an imported module is \
-         declaration-only (D-0081). Move executable code into a function the \
-         importer calls.";
+        "An imported module is declaration-only (D-0081): it may hold only \
+         declarations (and an optional leading docstring), not executable \
+         statements. Move executable code into a function the importer calls.";
     ZAP3015 = 3015 : "module name used as a value",
         "An imported module's name is not a value — use it only to qualify a \
          member access (`m.item`), not on its own.";
+    ZAP3016 = 3016 : "top-level executable statement",
+        "A compiled Zap program runs from `def main()`, not from top-level \
+         statements: an executable statement at module scope would never run \
+         (D-0081/D-0021, ticket #459). Move it — and any registering decorator \
+         such as `@app.get(...)` on a `def` — inside `def main()` (or another \
+         function). A leading bare-string module docstring is still allowed.";
 
     // ---- ZAP4xxx — type checking -------------------------------------------
     ZAP4001 = 4001 : "type mismatch in assignment",

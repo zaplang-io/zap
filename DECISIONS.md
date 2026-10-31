@@ -2382,3 +2382,46 @@ I#163) are not reflectable *by value* — you reflect the named `def`; a paramet
 Golden `tests/golden/reflect_params` (CI full-LLVM + arm64) exercises a plain fn, a
 defaulted/annotated fn, a struct method, and unknown owner/param lookups; an IR unit
 test asserts the registration + query lowering host-side.
+
+## D-0090 — Top-level executable statements are a diagnostic, not an ICE (I#459)
+**Status:** Locked — robustness fix over [[D-0081]] (module linking) and [[D-0021]]
+(bare statements parse at top level); surfaced building fastzap (zap#312).
+
+**The bug.** `auto app = App(0)` (or any bare statement) at entry-module scope hit
+`unreachable!("entry statements handled via merge list")` in the module linker's
+rewrite (`crates/driver/src/modlink/rewrite.rs`). The claimed "merge list" never
+existed: `Loader::merge` feeds **every** entry item — `Item::Stmt` included — to the
+per-module `Rewriter`, so the panic fired on the first top-level statement. Latent
+since D-0081 (every program now routes through the linker), but only the #457
+decorator work put a top-level statement in front of a `def` in anger. The ticket's
+repro (binding before an `@app.get` def) is just the minimal trigger; a lone
+`print(1)` panicked too.
+
+**Why a diagnostic, not "make it run".** A compiled Zap program runs from
+`def main()`. Top-level executable statements have **never** executed: pre-D-0081
+AST→ZIR lowering dropped them via its item catch-all, and there is no module-global
+storage, no init-order rule, and no `main`-interaction design for them. Making them
+"compile and run" is a new language feature with its own design decision, not a
+robustness fix — and silently dropping executable code is a footgun. So the honest
+behaviour is to **reject** them.
+
+**Rule.** `Loader::check_toplevel_statements` rejects a top-level `Item::Stmt` in
+**every** module: `ZAP3016` in the entry module (new code — "would never run, move
+it into `def main()`"), `ZAP3014` in imported modules (declaration-only, D-0081).
+The one exception is a **module docstring** (D-0041): a bare, non-f-string string
+literal carries no behaviour, so `is_doc_stmt` exempts it at module scope (this also
+lifts the prior over-broad ZAP3014 that rejected docstrings in imported modules). An
+f-string is *not* exempt — its interpolations are executable. The rewrite's
+`Item::Stmt` arm no longer panics: it rewrites the statement normally (only a
+docstring can still reach it, and a string literal has nothing to rewrite), keeping
+the arm total.
+
+**Fastzap impact:** none. The supported `@app.get` surface (D-0087) already lives
+inside `def main()` — the receiver is a `main` local and the decorated handlers are
+module-level `def`s — so `fn_decorator_register` is unchanged. ZAP3016 now points a
+user who wrote the registration at module scope to that working form.
+
+**No grammar change** (`item ::= … | statement` still parses, D-0021; the
+restriction is semantic). Coverage: five `modlink` unit tests — the exact #459 repro
+(asserts ZAP3016, not a panic), a lone top-level statement, a statement between two
+`def`s, and docstrings allowed in both entry and imported modules.

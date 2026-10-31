@@ -80,8 +80,14 @@ impl Rewriter<'_> {
                 }
                 self.block(&mut d.body, &locals, &tl);
             }
-            // Top-level statements (entry module only — enforced earlier).
-            Item::Stmt(_) => unreachable!("entry statements handled via merge list"),
+            // A top-level statement. Executable ones are rejected before the
+            // merge (ZAP3016/ZAP3014 in `check_toplevel_statements`, ticket
+            // #459), so the only statement that reaches a successful rewrite is
+            // a module docstring (a bare string literal). Rewrite it like any
+            // other statement — there are no references in a string literal, so
+            // this is effectively a no-op, but it keeps the arm total and panic-
+            // free for any statement the checker chooses to allow in future.
+            Item::Stmt(st) => self.stmt(st, &HashSet::new(), &HashSet::new()),
             Item::Import(_) => {}
             Item::Cfg(_) => unreachable!("cfg resolved before linking"),
         }
