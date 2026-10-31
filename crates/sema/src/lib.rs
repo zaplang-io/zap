@@ -2297,8 +2297,10 @@ impl Checker {
                 for arm in arms {
                     self.push_scope();
                     let (vs, catch_all) = self.check_pattern(&arm.pattern, &scrut);
-                    for v in vs {
-                        covered.insert(v);
+                    if arm.guard.is_none() {
+                        for v in vs {
+                            covered.insert(v);
+                        }
                     }
                     if catch_all {
                         // A guarded catch-all does not make the match exhaustive
@@ -4847,7 +4849,19 @@ impl Checker {
                 }
                 (covered, catch_all)
             }
-            Pattern::Sequence(ps, _) | Pattern::Tuple(ps, _) => {
+            Pattern::Sequence(ps, span) | Pattern::Tuple(ps, span) => {
+                if ps
+                    .iter()
+                    .filter(|p| matches!(p, Pattern::Rest { .. }))
+                    .count()
+                    > 1
+                {
+                    self.error(
+                        ErrorCode::ZAP3001,
+                        "a pattern may contain only one rest capture".to_string(),
+                        *span,
+                    );
+                }
                 for sub in ps {
                     self.check_pattern(sub, &Ty::Unknown);
                 }
@@ -4905,7 +4919,17 @@ impl Checker {
                     return (Vec::new(), false);
                 };
                 self.bind_variant_fields(enum_name, v, args, span);
-                return (vec![variant.clone()], false);
+                let covers_payload = args.map_or(true, |args| {
+                    args.iter().all(|a| pattern_is_irrefutable(&a.pattern))
+                });
+                return (
+                    if covers_payload {
+                        vec![variant.clone()]
+                    } else {
+                        Vec::new()
+                    },
+                    false,
+                );
             }
         }
         // A plain struct pattern (`Point(x=0, y=y)`) or an unresolved qualified
@@ -4970,6 +4994,15 @@ impl Checker {
             };
             self.check_pattern(&a.pattern, &fty);
         }
+    }
+}
+
+// Only these payload patterns cover every value of a variant field.
+fn pattern_is_irrefutable(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Wildcard(_) | Pattern::Capture { .. } => true,
+        Pattern::Or(ps, _) => ps.iter().any(pattern_is_irrefutable),
+        _ => false,
     }
 }
 
@@ -5119,6 +5152,29 @@ mod tests {
     fn ok(src: &str) {
         let e = errors(src);
         assert!(e.is_empty(), "unexpected type errors: {e:?}");
+    }
+
+    #[test]
+    fn structural_match_conformance_typechecks() {
+        let (module, parse, lex) = zapc_syntax::parser::parse_str(include_str!(
+            "../../../tests/conformance/match_structural.zap"
+        ));
+        assert!(parse.is_empty() && lex.is_empty());
+        let errors = check(&module);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn refutable_payload_and_guard_do_not_cover_a_variant() {
+        for arm in ["case Box.Value(1):", "case Box.Value(n) if n > 0:"] {
+            let source = format!("enum Box:\n    Value(int64 n)\ndef main():\n    match Box.Value(1):\n        {arm}\n            print(1)\n");
+            let (module, _, _) = zapc_syntax::parser::parse_str(&source);
+            let errors = check(&module);
+            assert!(
+                errors.iter().any(|e| e.message.contains("non-exhaustive")),
+                "{errors:?}"
+            );
+        }
     }
 
     #[test]

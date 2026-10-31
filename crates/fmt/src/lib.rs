@@ -1090,6 +1090,12 @@ mod tests {
     use super::format_source;
 
     #[test]
+    fn structural_match_fixture_is_formatted() {
+        let source = include_str!("../../../tests/conformance/match_structural.zap");
+        assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
     fn empty_enum_keeps_its_pass_body() {
         let source = "enum Empty:\n    pass\n";
         assert_eq!(format_source(source).unwrap(), source);

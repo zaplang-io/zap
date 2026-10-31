@@ -139,7 +139,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | CTRL-4 | §6 | `for x in coll` iterates a collection's elements | TODO | — |
 | ITER-1 | §6 | iteration protocol: `__iter__` + comma-ok `__next__` (D-0048) | TODO | — |
 | DOWHILE-1 | §6 | `do` runs its body once before the `while` test (D-0039) | TODO | — |
-| MATCH-1 | §6 | `match`/`case` structural patterns; enum exhaustiveness (D-0040) | TODO | — |
+| MATCH-1 | §6 | `match`/`case` structural patterns; enum exhaustiveness (D-0040) | covered | match_structural |
 | WHEN-1 | §6 | `when target.*` keeps only the first matching arm (D-0079) | TODO | — |
 
 ## Declarations, scalars, lexical (§1–§4.1, D-0003/D-0021/D-0023)
