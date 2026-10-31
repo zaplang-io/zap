@@ -77,7 +77,13 @@ param         ::= { "@" dotted_name [ "(" [ arg_list ] ")" ] }
                      Inline "@name" decorators are parameter annotations
                      (I#458, D-0089): a declared annotation/decorator is
                      reflectable via `reflect_param_annotations`; the
-                     parameter binds unchanged. *)
+                     parameter binds unchanged.
+                     No new syntax for dependency injection (I#466, D-0092): a
+                     default of the form "Depends(provider)" on a handler
+                     decorated with a registering "@recv.method(...)" is a
+                     compile-time marker (recognized by callee name "Depends"),
+                     consumed by adapter synthesis before sema and never a
+                     runtime value. *)
 
 (* ---------- Structs, interfaces, enums (D-0015, D-0016, D-0018) ---------- *)
 

@@ -2485,3 +2485,105 @@ over-rejection guard), incompatible `let`, and incompatible `return` cases) and 
 `fnval_struct_handler` golden that dispatches struct-typed handlers through a
 `fn(Req) -> Resp` parameter end-to-end, so CI's full-LLVM + arm64 jobs confirm the
 legitimate D-0067 path still runs.
+
+## D-0092 — Reflection-driven handler adapters: `Depends(...)` injection (I#466)
+**Status:** Locked (capability C) — composes [[D-0087]] (`@app.get` registering
+decorators), [[D-0089]] (signature reflection), and [[D-0091]] (fn-value coercion
+soundness) into the FastAPI-style dependency-injection surface. Unblocks fastzap#7.
+
+D-0089 shipped signature **reflection** as the stated substrate for FastAPI-style
+per-parameter injection and `Depends(...)`. Building fastzap#7 on it showed
+reflection is necessary but **not sufficient**: it can *describe* a signature but
+cannot *drive* injection. The idiomatic form is a handler that declares a
+dependency as a parameter:
+
+```zap
+@app.get("/items")
+def list_items(Request req, DB db = Depends(get_db)) -> Response:
+    return Response(db.conn)
+```
+
+Per request the framework must resolve `db` (run `get_db`, recursively resolve
+*its* deps, cache once per request) and then call `list_items(req, <DB>)`. Three
+walls blocked that (I#466): (1) the `@app.get` seam holds an opaque
+`fn(Request)->Response` **value**, not a name, and values are not reflectable
+(D-0089); (2) `reflect_param_annotations` returns annotation **names** only, so a
+`Depends(get_db)` provider is unrecoverable; (3) there is no way to invoke a
+handler with reflectively-built args — a `fn(Request,DB)->Response` handler does
+not match the `fn(Request)->Response` seam, now correctly **rejected** (D-0091),
+having previously been silently miscompiled with the default dropped.
+
+### Decision — compile-time per-handler adapter synthesis
+Resolve all three walls **at the decoration site, at compile time**, not with a
+runtime dynamic-invoke primitive. The `@app.get` desugar (`crates/driver/
+decorator_desugar.rs`) already runs as a whole-program AST pass **before sema**,
+where the compiler statically holds the handler's full signature and every
+provider's `def`. For a decorated handler that declares one or more
+`Depends(provider)` parameters, it synthesizes a **statically-typed adapter**
+
+```zap
+def list_items$adapter(Request req) -> Response:
+    DB get_db$dep = get_db()              # resolve deps, deps-first, once each
+    return list_items(req, get_db$dep)
+```
+
+and registers **that** (`app.get("/items", list_items$adapter)`) on the uniform
+seam. The adapter's parameters are the handler's non-`Depends` parameters, so its
+type **is** the seam's `fn(Request)->Response` — checked by sema/D-0091 like any
+registration. Walls 1 and 2 dissolve (no value-reflection, no runtime annotation
+recovery: the name and the provider are in the AST); wall 3 is a plain typed call.
+No new runtime, no new IR, no grammar change. A handler with no `Depends`
+parameter is registered directly — unchanged, zero overhead.
+
+### `Depends` is a compiler-recognized marker (not a library value)
+A parameter default whose callee is the bare name `Depends` with a single
+positional provider-name argument is recognized by the desugar and **consumed** —
+it is never a runtime value and never lowered. A library `Depends` value cannot
+work: recovering its provider at the seam is exactly wall 2. Outside a handler
+parameter default, `Depends(...)` remains an ordinary unknown call (ZAP3003).
+
+### Per-request caching
+The adapter body is the per-request scope (one adapter call per request). Each
+distinct provider is resolved into exactly one local (`<provider>$dep`) and
+reused; nested `Depends` in a provider's own signature resolve recursively,
+deps-first. This yields FastAPI's default `use_cache=True` (resolve-once-per-
+request, shared across sub-dependencies) with no cache data structure and full
+static typing. App-scoped / cross-request singletons are a separate future knob.
+
+### Scope boundary — what the compiler binds
+v1 binds **only** `Depends(provider)` injection plus positional pass-through of
+the handler's non-`Depends` parameters (the Request). Path/query/body extraction
+stays **framework-side** — the handler reads typed values off `req` (as fastzap v1
+does) — because binding them would require a compiler-known Request extraction
+protocol, coupling the language to one framework's API. Consequently a `Depends`
+provider's own parameters must each be `Depends(...)` (or it takes none): a
+request-derived provider parameter is the path/query/body case and is rejected
+(ZAP5048). A future per-param source annotation (`@query`/`@path`, framework-
+declared extraction) is a distinct capability, not this issue.
+
+### No runtime invoke-by-name
+Deliberately rejected. The compile-time adapter is statically typed and
+consistent with D-0091; a runtime invoke-by-name would reopen exactly the
+unsoundness D-0091 closed and commit the language to a large dynamic surface.
+
+### Errors (ZAP5048 "invalid dependency injection")
+Raised by the desugar, reported as sema-style errors before type-checking:
+an unknown provider (not a top-level function), a malformed `Depends(...)` (wrong
+arity / non-name argument), a provider parameter that is not itself `Depends(...)`
+(request-derived, unsupported in v1), and a `Depends` dependency **cycle**.
+
+### Tests
+Ten host unit tests in `decorator_desugar.rs` (adapter shape, deps-first order,
+resolve-once dedup, no-`Depends` direct registration, and each ZAP5048 path).
+Three CI full-LLVM + arm64 goldens: `depends_inject` (injection produces the
+right Response), `depends_nested` (nested `Depends`, deps-first), `depends_cache`
+(shared provider resolved once per request). Docker is down locally, so runtime
+behavior is CI-gated.
+
+### Downstream — fastzap#7 migration
+Replace the `src/fastzap/di.zap` prototype (D-FZ-0009: `Cell[T]`/`resolve` memo +
+a hand-built per-request context struct) with handler parameters
+`T x = Depends(provider)`; providers become plain `def provider(...) -> T` with
+their own deps as `Depends` parameters. Drop the manual per-request context — the
+adapter resolves once per request. Request-derived values (headers, path, query,
+body) stay read off `req` inside providers/handlers (scope boundary above).
