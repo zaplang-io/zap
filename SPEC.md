@@ -357,6 +357,12 @@ while line != ""          # trailing while (no colon) closes the do block
 **match-case** — Python-style structural pattern matching (D-0040): literals,
 capture, wildcard `_`, or-patterns, guards, and sequence/tuple/struct patterns.
 Matches on `enum` scrutinees are checked for exhaustiveness at compile time.
+Tuple patterns require matching arity; list patterns require matching length.
+One `*rest` may appear anywhere in either pattern: it captures the middle as a
+tuple or a fresh list, respectively, and allows an empty remainder. Nested
+patterns test fields recursively. Bindings belong to their arm; if its guard
+fails, matching continues with the next arm. A guarded or refutable payload
+pattern does not by itself cover its entire enum variant.
 
 ```python
 match command:

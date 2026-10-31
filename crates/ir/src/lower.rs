@@ -9627,6 +9627,24 @@ impl<'a> FnLower<'a> {
         let (sv, sty) = self.expr(scrutinee)?;
         let merge = self.new_block();
         for arm in arms {
+            // A statically incompatible tuple shape cannot reach its bindings.
+            if let Pattern::Tuple(patterns, _) = &arm.pattern {
+                let fields = if let Ty::Struct(sid) = sty {
+                    self.ctx.tuples.borrow().fields(sid)
+                } else {
+                    None
+                };
+                let rest = patterns.iter().any(|p| matches!(p, Pattern::Rest { .. }));
+                if fields.is_none_or(|fields| {
+                    if rest {
+                        fields.len() + 1 < patterns.len()
+                    } else {
+                        fields.len() != patterns.len()
+                    }
+                }) {
+                    continue;
+                }
+            }
             let (cond, _catch_all) = self.pattern_cond(sv, sty, &arm.pattern)?;
             let then_bb = self.new_block();
             let next_bb = self.new_block();
@@ -9705,75 +9723,309 @@ impl<'a> FnLower<'a> {
                 args,
                 span: _,
             } => self.variant_cond(sv, sty, path, args.as_deref()),
-            Pattern::Tuple(..) | Pattern::Sequence(..) | Pattern::Rest { .. } => Err(err(
-                "tuple/sequence patterns in match are not supported yet (Phase 1 slice)",
-            )),
+            Pattern::Tuple(patterns, _) => {
+                let Ty::Struct(sid) = sty else {
+                    return Ok((self.bconst(false), false));
+                };
+                let fields = self.ctx.tuples.borrow().fields(sid);
+                let rest = patterns
+                    .iter()
+                    .position(|p| matches!(p, Pattern::Rest { .. }));
+                let exact = rest.is_none();
+                let Some(fields) = fields.filter(|fields| {
+                    if exact {
+                        fields.len() == patterns.len()
+                    } else {
+                        fields.len() + 1 >= patterns.len()
+                    }
+                }) else {
+                    return Ok((self.bconst(false), false));
+                };
+                let required = patterns.len() - usize::from(rest.is_some());
+                let len_ok = self.bconst(if exact {
+                    fields.len() == required
+                } else {
+                    fields.len() >= required
+                });
+                let mut result = self.bconst(true);
+                for (index, pattern) in patterns.iter().enumerate() {
+                    if matches!(pattern, Pattern::Rest { .. }) {
+                        continue;
+                    }
+                    let field_index = if rest.is_some_and(|r| index > r) {
+                        fields.len() - (patterns.len() - index)
+                    } else {
+                        index
+                    };
+                    let field_ty = fields[field_index];
+                    let value = self.new_value(field_ty);
+                    self.emit(Inst::FieldGet {
+                        dest: value,
+                        base: sv,
+                        sid,
+                        idx: field_index as u32,
+                    });
+                    let (condition, _) = self.pattern_cond(value, field_ty, pattern)?;
+                    let combined = self.new_value(Ty::I1);
+                    self.emit(Inst::Bin {
+                        dest: combined,
+                        op: BinOp::And,
+                        lhs: result,
+                        rhs: condition,
+                    });
+                    result = combined;
+                }
+                let combined = self.new_value(Ty::I1);
+                self.emit(Inst::Bin {
+                    dest: combined,
+                    op: BinOp::And,
+                    lhs: result,
+                    rhs: len_ok,
+                });
+                result = combined;
+                Ok((result, false))
+            }
+            Pattern::Sequence(patterns, _) => {
+                let Ty::List(elem) = sty else {
+                    return Ok((self.bconst(false), false));
+                };
+                let rest = patterns
+                    .iter()
+                    .position(|p| matches!(p, Pattern::Rest { .. }));
+                let len = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_list_len".to_string(),
+                    args: vec![sv],
+                });
+                let needed = self.iconst(
+                    Ty::I64,
+                    (patterns.len() - usize::from(rest.is_some())) as i64,
+                );
+                let len_ok = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: len_ok,
+                    pred: if rest.is_some() {
+                        CmpPred::Ge
+                    } else {
+                        CmpPred::Eq
+                    },
+                    lhs: len,
+                    rhs: needed,
+                });
+                let result = self.guarded_pattern(len_ok, |this| {
+                    let mut result = this.bconst(true);
+                    for (index, pattern) in patterns.iter().enumerate() {
+                        if matches!(pattern, Pattern::Rest { .. }) {
+                            continue;
+                        }
+                        let idx = if rest.is_some_and(|r| index > r) {
+                            let off = patterns.len() - index;
+                            let n = this.iconst(Ty::I64, off as i64);
+                            let v = this.new_value(Ty::I64);
+                            this.emit(Inst::Bin {
+                                dest: v,
+                                op: BinOp::Sub,
+                                lhs: len,
+                                rhs: n,
+                            });
+                            v
+                        } else {
+                            this.iconst(Ty::I64, index as i64)
+                        };
+                        let value = this.new_value(elem.ty());
+                        this.emit(Inst::Call {
+                            dest: Some(value),
+                            func: format!("zap_list_get_{}", elem.val_suffix()),
+                            args: vec![sv, idx],
+                        });
+                        let (condition, _) = this.pattern_cond(value, elem.ty(), pattern)?;
+                        let combined = this.new_value(Ty::I1);
+                        this.emit(Inst::Bin {
+                            dest: combined,
+                            op: BinOp::And,
+                            lhs: result,
+                            rhs: condition,
+                        });
+                        result = combined;
+                    }
+                    Ok(result)
+                })?;
+                Ok((result, false))
+            }
+            Pattern::Rest { .. } => Ok((self.bconst(true), true)),
         }
     }
 
-    /// The test for a qualified enum pattern (`Color.RED`, `Shape.Circle(r)`):
-    /// compare the backing integer (tier 1) or the tag field (tier 3).
+    /// Evaluate a nested test only after its enclosing shape/length matched.
+    fn guarded_pattern(
+        &mut self,
+        condition: Value,
+        test: impl FnOnce(&mut Self) -> Result<Value, LowerError>,
+    ) -> Result<Value, LowerError> {
+        let slot = self.alloca(Ty::I1);
+        let no = self.bconst(false);
+        self.store(slot, no);
+        let yes_bb = self.new_block();
+        let end = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: condition,
+            then_bb: yes_bb,
+            else_bb: end,
+        });
+        self.position(yes_bb);
+        let result = test(self)?;
+        self.store(slot, result);
+        self.ensure_br(end);
+        self.position(end);
+        Ok(self.load(slot, Ty::I1))
+    }
+
+    fn pattern_fields(
+        &self,
+        sid: u32,
+        args: &[PatArg],
+    ) -> Result<Vec<(u32, Ty, Pattern)>, LowerError> {
+        let mut pos = 0;
+        args.iter()
+            .map(|a| {
+                let (idx, ty) = if let Some(name) = &a.name {
+                    self.ctx
+                        .field(sid, name)
+                        .ok_or_else(|| err(format!("unknown pattern field '{name}'")))?
+                } else {
+                    let idx = pos;
+                    pos += 1;
+                    let ty = self.ctx.fields[sid as usize]
+                        .get(idx)
+                        .ok_or_else(|| err("too many pattern fields"))?
+                        .1;
+                    (idx as u32, ty)
+                };
+                Ok((idx, ty, a.pattern.clone()))
+            })
+            .collect()
+    }
+
+    fn pattern_field_conditions(
+        &mut self,
+        sv: Value,
+        sid: u32,
+        fields: &[(u32, Ty, Pattern)],
+    ) -> Result<Value, LowerError> {
+        let mut result = self.bconst(true);
+        for (idx, ty, pattern) in fields {
+            result = self.guarded_pattern(result, |this| {
+                let value = this.field_get(sv, sid, *idx, *ty);
+                Ok(this.pattern_cond(value, *ty, pattern)?.0)
+            })?;
+        }
+        Ok(result)
+    }
+
+    /// Test the outer constructor before inspecting any nested payload.
     fn variant_cond(
         &mut self,
         sv: Value,
         sty: Ty,
         path: &[String],
-        _args: Option<&[PatArg]>,
+        args: Option<&[PatArg]>,
     ) -> Result<(Value, bool), LowerError> {
+        if path.len() == 1 {
+            let sid = *self
+                .ctx
+                .ids
+                .get(&path[0])
+                .ok_or_else(|| err("unknown struct pattern"))?;
+            if sty != Ty::Struct(sid) {
+                return Ok((self.bconst(false), false));
+            }
+            let fields = self.pattern_fields(sid, args.unwrap_or(&[]))?;
+            let nonnull = if self.ctx.is_value_struct(sid) {
+                self.bconst(true)
+            } else {
+                let null = self.new_value(Ty::I1);
+                self.emit(Inst::IsNull {
+                    dest: null,
+                    val: sv,
+                });
+                let value = self.new_value(Ty::I1);
+                self.emit(Inst::Un {
+                    dest: value,
+                    op: UnOp::Not,
+                    val: null,
+                });
+                value
+            };
+            let condition = self.guarded_pattern(nonnull, |this| {
+                this.pattern_field_conditions(sv, sid, &fields)
+            })?;
+            return Ok((condition, false));
+        }
         if path.len() != 2 {
-            return Err(err(
-                "only qualified enum patterns (Enum.Variant) are supported in match",
-            ));
+            return Err(err("invalid constructor pattern"));
         }
         let info = self
             .ctx
             .enums
             .get(&path[0])
             .cloned()
-            .ok_or_else(|| err(format!("'{}' is not an enum", path[0])))?;
+            .ok_or_else(|| err("unknown enum pattern"))?;
         if !info.is_sum {
             let val = info
                 .member_value(&path[1])
-                .ok_or_else(|| err(format!("enum '{}' has no member '{}'", path[0], path[1])))?;
+                .ok_or_else(|| err("unknown enum member"))?;
             let k = self.iconst(Ty::I64, val);
-            let (c, _) = self.binop(AstBin::Eq, sv, sty, k, Ty::I64)?;
-            Ok((c, false))
-        } else {
-            let v = info
-                .variant(&path[1])
-                .ok_or_else(|| err(format!("enum '{}' has no variant '{}'", path[0], path[1])))?;
-            let sid = info.sid.expect("tier-3 enum has a struct id");
-            // Niche optimization (I#154, D-0064 #4): the tag-free test — the
-            // payload-free variant matches a null pointer, the one-field variant a
-            // non-null one.
-            if let Some(n) = &info.niche {
-                let isnull = self.new_value(Ty::I1);
-                self.emit(Inst::IsNull {
-                    dest: isnull,
-                    val: sv,
-                });
-                if path[1] == n.none_variant {
-                    return Ok((isnull, false));
-                }
-                let nonnull = self.new_value(Ty::I1);
-                self.emit(Inst::Un {
-                    dest: nonnull,
-                    op: UnOp::Not,
-                    val: isnull,
-                });
-                return Ok((nonnull, false));
-            }
-            let tagv = self.new_value(Ty::I32);
-            self.emit(Inst::FieldGet {
-                dest: tagv,
-                base: sv,
-                sid,
-                idx: 0,
-            });
-            let k = self.iconst(Ty::I32, v.tag);
-            let (c, _) = self.binop(AstBin::Eq, tagv, Ty::I32, k, Ty::I32)?;
-            Ok((c, false))
+            return Ok((self.binop(AstBin::Eq, sv, sty, k, Ty::I64)?.0, false));
         }
+        let v = info
+            .variant(&path[1])
+            .ok_or_else(|| err("unknown enum variant"))?;
+        let sid = info.sid.expect("sum enum layout");
+        if let Some(n) = &info.niche {
+            let null = self.new_value(Ty::I1);
+            self.emit(Inst::IsNull {
+                dest: null,
+                val: sv,
+            });
+            if path[1] == n.none_variant {
+                return Ok((null, false));
+            }
+            let nonnull = self.new_value(Ty::I1);
+            self.emit(Inst::Un {
+                dest: nonnull,
+                op: UnOp::Not,
+                val: null,
+            });
+            let condition = self.guarded_pattern(nonnull, |this| {
+                if let Some(a) = args.and_then(|a| a.first()) {
+                    Ok(this.pattern_cond(sv, n.payload, &a.pattern)?.0)
+                } else {
+                    Ok(this.bconst(true))
+                }
+            })?;
+            return Ok((condition, false));
+        }
+        let mut fields = Vec::new();
+        let mut pos = 0;
+        for a in args.unwrap_or(&[]) {
+            let (_, idx, ty) = if let Some(name) = &a.name {
+                v.fields.iter().find(|(n, _, _)| n == name)
+            } else {
+                let field = v.fields.get(pos);
+                pos += 1;
+                field
+            }
+            .ok_or_else(|| err("unknown variant pattern field"))?;
+            fields.push((*idx, *ty, a.pattern.clone()));
+        }
+        let tag = self.field_get(sv, sid, 0, Ty::I32);
+        let expected = self.iconst(Ty::I32, v.tag);
+        let condition = self.binop(AstBin::Eq, tag, Ty::I32, expected, Ty::I32)?.0;
+        let condition = self.guarded_pattern(condition, |this| {
+            this.pattern_field_conditions(sv, sid, &fields)
+        })?;
+        Ok((condition, false))
     }
 
     /// Declare the bindings a matched pattern introduces into the current scope.
@@ -9783,6 +10035,197 @@ impl<'a> FnLower<'a> {
                 let slot = self.alloca(sty);
                 self.store(slot, sv);
                 self.declare(name, slot, sty);
+                Ok(())
+            }
+            Pattern::Tuple(patterns, _) => {
+                let Ty::Struct(sid) = sty else {
+                    return Ok(());
+                };
+                let Some(fields) = self.ctx.tuples.borrow().fields(sid) else {
+                    return Ok(());
+                };
+                let rest = patterns
+                    .iter()
+                    .position(|p| matches!(p, Pattern::Rest { .. }));
+                if if rest.is_some() {
+                    fields.len() + 1 < patterns.len()
+                } else {
+                    fields.len() != patterns.len()
+                } {
+                    return Ok(());
+                }
+                let mut index = 0usize;
+                for (i, pattern) in patterns.iter().enumerate() {
+                    if let Pattern::Rest {
+                        name: Some(name), ..
+                    } = pattern
+                    {
+                        let after = patterns.len() - i - 1;
+                        let end = fields.len().saturating_sub(after);
+                        let types = fields[index..end].to_vec();
+                        let sid2 = self.ctx.tuples.borrow_mut().intern(types.clone());
+                        let value = self.new_value(Ty::Struct(sid2));
+                        self.emit(Inst::StructNew {
+                            dest: value,
+                            sid: sid2,
+                        });
+                        for (j, ty) in types.iter().enumerate() {
+                            let item = self.field_get(sv, sid, (index + j) as u32, *ty);
+                            self.emit(Inst::FieldSet {
+                                base: value,
+                                sid: sid2,
+                                idx: j as u32,
+                                val: item,
+                            });
+                        }
+                        let slot = self.alloca(Ty::Struct(sid2));
+                        self.store(slot, value);
+                        self.declare(name, slot, Ty::Struct(sid2));
+                        index = end;
+                    } else if !matches!(pattern, Pattern::Rest { .. }) {
+                        if rest.is_some_and(|r| i > r) {
+                            index = fields.len().saturating_sub(patterns.len() - i);
+                        }
+                        let ty = fields[index];
+                        let item = self.field_get(sv, sid, index as u32, ty);
+                        self.bind_pattern(item, ty, pattern)?;
+                        index += 1;
+                    }
+                }
+                Ok(())
+            }
+            Pattern::Sequence(patterns, _) => {
+                let Ty::List(elem) = sty else {
+                    return Ok(());
+                };
+                let len = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_list_len".into(),
+                    args: vec![sv],
+                });
+                let rest = patterns
+                    .iter()
+                    .position(|p| matches!(p, Pattern::Rest { .. }));
+                for (i, pattern) in patterns.iter().enumerate() {
+                    if let Pattern::Rest {
+                        name: Some(name), ..
+                    } = pattern
+                    {
+                        let lo = self.iconst(Ty::I64, i as i64);
+                        let hi = self.iconst(Ty::I64, -((patterns.len() - i - 1) as i64));
+                        let step = self.iconst(Ty::I64, 1);
+                        let flag = self.iconst(Ty::I64, 1);
+                        let no = self.iconst(Ty::I64, 0);
+                        let value = self.new_value(Ty::List(elem));
+                        self.emit(Inst::Call {
+                            dest: Some(value),
+                            func: "zap_list_slice".into(),
+                            args: vec![
+                                sv,
+                                lo,
+                                hi,
+                                step,
+                                flag,
+                                if i + 1 == patterns.len() { no } else { flag },
+                                no,
+                            ],
+                        });
+                        let slot = self.alloca(Ty::List(elem));
+                        self.store(slot, value);
+                        self.declare(name, slot, Ty::List(elem));
+                    } else if !matches!(pattern, Pattern::Rest { .. }) {
+                        let idx = if rest.is_some_and(|r| i > r) {
+                            let off = self.iconst(Ty::I64, (patterns.len() - i) as i64);
+                            let v = self.new_value(Ty::I64);
+                            self.emit(Inst::Bin {
+                                dest: v,
+                                op: BinOp::Sub,
+                                lhs: len,
+                                rhs: off,
+                            });
+                            v
+                        } else {
+                            self.iconst(Ty::I64, i as i64)
+                        };
+                        let item = self.new_value(elem.ty());
+                        self.emit(Inst::Call {
+                            dest: Some(item),
+                            func: format!("zap_list_get_{}", elem.val_suffix()),
+                            args: vec![sv, idx],
+                        });
+                        self.bind_pattern(item, elem.ty(), pattern)?;
+                    }
+                }
+                Ok(())
+            }
+            Pattern::Rest {
+                name: Some(name), ..
+            } => {
+                let slot = self.alloca(sty);
+                self.store(slot, sv);
+                self.declare(name, slot, sty);
+                Ok(())
+            }
+            Pattern::Or(patterns, _) => {
+                let entry = self.cur;
+                let end = self.new_block();
+                let mut shared: HashMap<String, (Value, Ty)> = HashMap::new();
+                for pattern in patterns {
+                    let condition = self.pattern_cond(sv, sty, pattern)?.0;
+                    let matched = self.new_block();
+                    let next = self.new_block();
+                    self.set_term(Term::BrIf {
+                        cond: condition,
+                        then_bb: matched,
+                        else_bb: next,
+                    });
+                    self.position(matched);
+                    self.push_scope();
+                    self.bind_pattern(sv, sty, pattern)?;
+                    let mut bindings: Vec<_> = self.scopes.pop().unwrap().into_iter().collect();
+                    bindings.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (name, (local, ty)) in bindings {
+                        let slot = if let Some((slot, expected)) = shared.get(&name) {
+                            if *expected != ty {
+                                return Err(err("or-pattern bindings must have matching types"));
+                            }
+                            *slot
+                        } else {
+                            let slot = self.new_value(Ty::Ptr);
+                            self.func.blocks[entry as usize].insts.push(Inst::Alloca {
+                                dest: slot,
+                                pointee: ty,
+                            });
+                            shared.insert(name, (slot, ty));
+                            slot
+                        };
+                        let value = self.load(local, ty);
+                        self.store(slot, value);
+                    }
+                    self.ensure_br(end);
+                    self.position(next);
+                }
+                self.set_term(Term::Unreachable);
+                self.position(end);
+                for (name, (slot, ty)) in shared {
+                    self.declare(&name, slot, ty);
+                }
+                Ok(())
+            }
+            Pattern::Struct {
+                path,
+                args: Some(args),
+                ..
+            } if path.len() == 1 => {
+                let sid = *self
+                    .ctx
+                    .ids
+                    .get(&path[0])
+                    .ok_or_else(|| err("unknown struct pattern"))?;
+                for (idx, ty, pattern) in self.pattern_fields(sid, args)? {
+                    self.bind_field(sv, sid, idx, ty, &pattern)?;
+                }
                 Ok(())
             }
             Pattern::Struct {
@@ -9802,12 +10245,7 @@ impl<'a> FnLower<'a> {
                 if let Some(n) = &info.niche {
                     if path[1] == n.some_variant {
                         if let Some(a) = args.first() {
-                            if let Pattern::Capture { name, .. } = &a.pattern {
-                                let payload = n.payload;
-                                let slot = self.alloca(payload);
-                                self.store(slot, sv);
-                                self.declare(name, slot, payload);
-                            }
+                            self.bind_pattern(sv, n.payload, &a.pattern)?;
                         }
                     }
                     return Ok(());
@@ -9850,7 +10288,7 @@ impl<'a> FnLower<'a> {
     ) -> Result<(), LowerError> {
         match sub {
             Pattern::Wildcard(_) => Ok(()),
-            Pattern::Capture { name, .. } => {
+            _ => {
                 let fv = self.new_value(fty);
                 self.emit(Inst::FieldGet {
                     dest: fv,
@@ -9858,15 +10296,8 @@ impl<'a> FnLower<'a> {
                     sid,
                     idx: fidx,
                 });
-                let slot = self.alloca(fty);
-                self.store(slot, fv);
-                self.declare(name, slot, fty);
-                Ok(())
+                self.bind_pattern(fv, fty, sub)
             }
-            _ => Err(err(
-                "nested patterns inside a variant field are not supported yet (bind to a \
-                 name or use '_')",
-            )),
         }
     }
 

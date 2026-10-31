@@ -38,6 +38,13 @@ mod tests {
     }
 
     #[test]
+    fn lower_structural_match_conformance() {
+        lower_ok(include_str!(
+            "../../../tests/conformance/match_structural.zap"
+        ));
+    }
+
+    #[test]
     fn lower_chained_comparison_single_eval_and_short_circuit() {
         // `1 < f(2) < 3` is Python-chained (I#386): it must evaluate the
         // interior operand `f(2)` exactly once, reuse that value as the left

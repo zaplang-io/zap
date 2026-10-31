@@ -25,6 +25,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- Structural `match` lowering for tuples and lists with rest captures, recursive
+  enum/struct payload tests and bindings, and guard fallthrough (#474).
+
 - **Language.** Type-first declarations and `const` (D-0003); scalars and
   conversions, including arbitrary-precision `bigint` and native `complex`
   arithmetic (D-0019); `str`/`bytes` with interpolation, codepoint indexing/slicing/
