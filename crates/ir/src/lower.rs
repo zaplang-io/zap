@@ -5104,7 +5104,10 @@ impl<'a> FnLower<'a> {
                 let (v, declared) = match ty {
                     Some(t) => {
                         let declared = resolve_ty(t, &self.ctx.tyenv())?;
-                        (self.expr_coerced(value, declared)?, declared)
+                        (
+                            self.expr_coerced(value, declared, zapc_diag::ErrorCode::ZAP4001)?,
+                            declared,
+                        )
                     }
                     None => {
                         let (v, vt) = self.expr(value)?;
@@ -5128,6 +5131,11 @@ impl<'a> FnLower<'a> {
                     let (ptr, ty) = self
                         .lookup(n)
                         .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
+                    // Reassigning a `fn(...)`-typed binding is still a coercion
+                    // into a function slot, so it must match structurally (I#465).
+                    if let Ty::Func(t_idx) = ty {
+                        self.check_fn_coercion(&vt, t_idx, zapc_diag::ErrorCode::ZAP4001)?;
+                    }
                     let v = self.coerce(v, vt, ty);
                     // Value structs copy on assignment (D-0051).
                     let v = self.copy_if_value(v, ty, value);
@@ -5144,7 +5152,7 @@ impl<'a> FnLower<'a> {
                         .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
                     // A `fn(...)` field accepts a lambda / bare function value
                     // (I#163), lowered against the field type.
-                    let v = self.expr_coerced(value, fty)?;
+                    let v = self.expr_coerced(value, fty, zapc_diag::ErrorCode::ZAP4001)?;
                     // Storing a value struct into a field copies it (D-0051), so
                     // the field holds an independent instance.
                     let v = self.copy_if_value(v, fty, value);
@@ -5237,7 +5245,7 @@ impl<'a> FnLower<'a> {
                         let v = if ret == Ty::Void {
                             self.expr(e)?.0
                         } else {
-                            self.expr_coerced(e, ret)?
+                            self.expr_coerced(e, ret, zapc_diag::ErrorCode::ZAP4003)?
                         };
                         // Returning a value struct yields an instance independent
                         // of the callee's locals (D-0051). An inline-eligible
@@ -8267,7 +8275,8 @@ impl<'a> FnLower<'a> {
                         // lowered against the declared parameter type.
                         let v = match ptys.get(i) {
                             Some(&target) => {
-                                let v = self.expr_coerced(e, target)?;
+                                let v =
+                                    self.expr_coerced(e, target, zapc_diag::ErrorCode::ZAP4021)?;
                                 // A value struct passed by value is copied
                                 // (D-0051): the callee's mutations do not escape.
                                 // An inline-eligible aggregate gets that copy from
@@ -8295,7 +8304,11 @@ impl<'a> FnLower<'a> {
                     for (i, a) in args.iter().take(vi).enumerate() {
                         let v = match ptys.get(i) {
                             Some(&target) => {
-                                let v = self.expr_coerced(&a.value, target)?;
+                                let v = self.expr_coerced(
+                                    &a.value,
+                                    target,
+                                    zapc_diag::ErrorCode::ZAP4021,
+                                )?;
                                 self.copy_for_pass(v, target, &a.value)
                             }
                             None => {
@@ -8331,7 +8344,11 @@ impl<'a> FnLower<'a> {
                     for (i, a) in args.iter().enumerate() {
                         let v = match ptys.get(i) {
                             Some(&target) => {
-                                let v = self.expr_coerced(&a.value, target)?;
+                                let v = self.expr_coerced(
+                                    &a.value,
+                                    target,
+                                    zapc_diag::ErrorCode::ZAP4021,
+                                )?;
                                 self.copy_for_pass(v, target, &a.value)
                             }
                             None => {
@@ -8490,7 +8507,7 @@ impl<'a> FnLower<'a> {
         for (i, a) in args.iter().enumerate() {
             let v = match sig.params.get(i) {
                 Some(&target) => {
-                    let v = self.expr_coerced(&a.value, target)?;
+                    let v = self.expr_coerced(&a.value, target, zapc_diag::ErrorCode::ZAP4021)?;
                     self.copy_for_pass(v, target, &a.value)
                 }
                 None => {
@@ -8747,8 +8764,16 @@ impl<'a> FnLower<'a> {
     /// (I#163): a `lambda` is lowered against the expected function type (the
     /// only way its parameter types are known). Everything else lowers normally
     /// and is coerced.
-    fn expr_coerced(&mut self, e: &Expr, target: Ty) -> Result<Value, LowerError> {
+    fn expr_coerced(
+        &mut self,
+        e: &Expr,
+        target: Ty,
+        mismatch_code: zapc_diag::ErrorCode,
+    ) -> Result<Value, LowerError> {
         if let (Expr::Lambda { params, body, .. }, Ty::Func(idx)) = (e, target) {
+            // A `lambda` takes its parameter types from the expected signature,
+            // so it matches `target` by construction (`lower_lambda` checks the
+            // parameter count) — no compatibility check needed here.
             let (v, _) = self.lower_lambda(params, body, idx)?;
             return Ok(v);
         }
@@ -8773,7 +8798,114 @@ impl<'a> FnLower<'a> {
             return Ok(d);
         }
         let (v, vt) = self.expr(e)?;
+        // A function value coerced to a `fn(...)` slot (argument / assignment /
+        // return) must have the *exact* structural signature of that slot
+        // (I#465). First-class function values are monomorphic: the
+        // `<fn>$fnval` thunk is emitted to the source function's own signature
+        // while the indirect call site uses the expected `fn`-type, so any
+        // disagreement on arity, parameter types, or return type miscompiles
+        // under codegen. Reject it here with a precise type error, the same way
+        // a direct call with a wrong argument is rejected.
+        if let Ty::Func(t_idx) = target {
+            self.check_fn_coercion(&vt, t_idx, mismatch_code)?;
+        }
         Ok(self.coerce(v, vt, target))
+    }
+
+    /// Reject coercing a **function value with a known signature** to a
+    /// `fn(...)` type whose signature differs (I#465, D-0067). First-class
+    /// function values are monomorphic; there is no fn-subtyping, so an exact
+    /// match on arity, each parameter type, and the return type is required (a
+    /// coercing adapter thunk — e.g. dropping defaulted trailing parameters — is
+    /// a separate design decision tracked with #466).
+    ///
+    /// The check fires only when the source is itself a `Ty::Func`, i.e. a value
+    /// whose exact signature is *known* to disagree (a bare function name, a
+    /// lambda-typed binding, a struct field read). A value that has already lost
+    /// its signature — a collection element or other uniform reference word read
+    /// back as a plain `ptr` — carries no contradicting signature, so
+    /// re-attaching the expected call signature is the legitimate D-0067
+    /// round-trip (see `fnval_store`), not a mismatch, and is left to `coerce`.
+    fn check_fn_coercion(
+        &self,
+        from: &Ty,
+        to_idx: u32,
+        code: zapc_diag::ErrorCode,
+    ) -> Result<(), LowerError> {
+        // Interned signatures are deduplicated, so equal signatures share the
+        // same index — a matching `Ty::Func` is exactly `Ty::Func(to_idx)`, and
+        // any other `Ty::Func(from_idx)` is a genuine structural mismatch.
+        let Ty::Func(from_idx) = from else {
+            return Ok(());
+        };
+        if *from_idx == to_idx {
+            return Ok(());
+        }
+        let expected = self.ctx.fn_sigs.borrow().get(to_idx).clone();
+        let want = self.render_fn_sig(&expected);
+        let got_sig = self.ctx.fn_sigs.borrow().get(*from_idx).clone();
+        let got = self.render_fn_sig(&got_sig);
+        let detail = if got_sig.params.len() != expected.params.len() {
+            format!(
+                "it takes {} argument(s), but `{want}` takes {}",
+                got_sig.params.len(),
+                expected.params.len()
+            )
+        } else if let Some((i, (g, e))) = got_sig
+            .params
+            .iter()
+            .zip(expected.params.iter())
+            .enumerate()
+            .find(|(_, (g, e))| g != e)
+        {
+            format!(
+                "parameter {} is `{}`, but `{}` is expected",
+                i + 1,
+                self.render_ty(g),
+                self.render_ty(e)
+            )
+        } else {
+            format!(
+                "its return type `{}` is not `{}`",
+                self.render_ty(&got_sig.ret),
+                self.render_ty(&expected.ret)
+            )
+        };
+        let message = format!(
+            "function value of type `{got}` is not compatible with the \
+             expected type `{want}`: {detail}"
+        );
+        Err(LowerError { code, message })
+    }
+
+    /// Render a ZIR type as a readable source-ish type for a diagnostic: a
+    /// struct id resolves to its declared name, a function type to its
+    /// `fn(...) -> ...` form, and everything else to its ZIR spelling.
+    fn render_ty(&self, t: &Ty) -> String {
+        match t {
+            Ty::Struct(sid) => self
+                .ctx
+                .names
+                .get(*sid as usize)
+                .cloned()
+                .unwrap_or_else(|| format!("struct#{sid}")),
+            Ty::Func(idx) => {
+                let sig = self.ctx.fn_sigs.borrow().get(*idx).clone();
+                self.render_fn_sig(&sig)
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// Render an interned function signature as `fn(P, Q) -> R` for diagnostics.
+    fn render_fn_sig(&self, sig: &FnSig) -> String {
+        let params = sig
+            .params
+            .iter()
+            .map(|p| self.render_ty(p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("fn({params}) -> {}", self.render_ty(&sig.ret))
     }
 
     /// Lower a method call on an interface-typed receiver to **dynamic dispatch**

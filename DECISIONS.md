@@ -2425,3 +2425,63 @@ user who wrote the registration at module scope to that working form.
 restriction is semantic). Coverage: five `modlink` unit tests — the exact #459 repro
 (asserts ZAP3016, not a panic), a lone top-level statement, a statement between two
 `def`s, and docstrings allowed in both entry and imported modules.
+
+## D-0091 — Reject structurally incompatible `fn(...)` coercions in lowering (I#465)
+**Status:** Locked — soundness fix over [[D-0067]] (first-class function values);
+surfaced building fastzap's `@app.get` routing seam (zap#312, fastzap#8).
+
+**The bug.** A named function (or any `fn(...)` value) coerced to a structurally
+**incompatible** `fn(...)` type was accepted with **no diagnostic**. First-class
+function values are monomorphic (D-0067): a bare top-level function used as a value
+lowers to a `<fn>$fnval` thunk emitted to the function's **own** signature, while the
+indirect call site (`CallClosure`) uses the **expected** `fn`-type. When the two
+disagree on arity, a parameter type, or the return type, they miscompile under codegen
+— a dropped argument, a `Req` read as a `str`, or a scalar `i64` field-accessed as a
+`Resp` struct. `zap ir` exited `0` for all three mismatch kinds.
+
+**Why lowering, not sema.** Sema is permissive about function types: a `fn(...)`
+annotation resolves to `Ty::Unknown` (sema has no function-type model — see
+`sema_types::Ty`), which is universally assignable, so sema cannot compare signatures.
+The real interned signatures (`Ty::Func(idx)` over `Module::fn_sigs`) exist only in
+AST→ZIR lowering — the same stage that already validates lambda arity and rejects
+`None` bound to a value struct. So the structural check lives there, at the single
+coercion funnel `expr_coerced` (argument, `let`/field assignment, and `return`
+positions) plus the bare-name reassignment path.
+
+**Rule.** A **function value whose signature is known** (`Ty::Func`) coerced into a
+`fn(...)` slot must have the **exact** interned signature of that slot — equal arity,
+each parameter type equal, and the return type equal. Because signatures are
+deduplicated, a compatible `Ty::Func` is literally the same index, and any other
+`Ty::Func` is a genuine structural mismatch, rejected with a precise type error naming
+both signatures and the first discrepancy, keyed to the position: `ZAP4021` (argument),
+`ZAP4001` (assignment), `ZAP4003` (return) — the same codes a direct call / assignment /
+return with a wrong type already uses.
+
+**Only a known-signature source is checked.** The check fires solely when the source is
+itself a `Ty::Func`. A function value that has already lost its signature — a collection
+element or other uniform reference word read back as a plain `ptr` (D-0067 stores fn
+values as single reference words) — carries no contradicting signature, so re-attaching
+the expected call signature at a `fn(...)`-annotated binding is the legitimate round-trip
+(`fnval_store`), left to `coerce`. Over-rejecting that bare-`ptr` case was the first
+cut's bug, now covered by a regression test.
+
+**No fn-subtyping.** This deliberately rejects *all* non-identical signatures, including
+ones that might seem assignable (e.g. a function with defaulted trailing parameters
+coerced to a shorter `fn` type). Any such widening needs an explicit decision **and** a
+coercing adapter thunk — today the default is silently dropped and the arity still
+mismatches — tracked with the reflection-driven `Depends` injection work (zap#466). A
+`lambda` is unaffected: it takes its parameter types from the expected signature, so it
+matches by construction.
+
+**Thunk/call-site agreement.** With incompatible coercions rejected, a coercion into a
+`fn(...)` slot only succeeds when the source function's signature equals the expected
+one, so the `<fn>$fnval` thunk is always emitted to a signature identical to the call
+site's — no residual mismatch. The thunk emission path is unchanged.
+
+**No grammar change** (a sema/lowering type-compatibility fix). Coverage: eight host
+`fnval_coercion` tests (the three repro mismatches assert code + message; compatible
+handler, lambda, `container_roundtrip` (bare-`ptr` element re-typed to `fn(...)` — the
+over-rejection guard), incompatible `let`, and incompatible `return` cases) and a
+`fnval_struct_handler` golden that dispatches struct-typed handlers through a
+`fn(Req) -> Resp` parameter end-to-end, so CI's full-LLVM + arm64 jobs confirm the
+legitimate D-0067 path still runs.
