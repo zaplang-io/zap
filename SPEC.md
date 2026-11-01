@@ -1007,7 +1007,15 @@ request off a connection into an opaque handle read back with
 `http.req_version(req) -> str` (the request-line HTTP version token, e.g.
 `"HTTP/1.1"`; `""` for an HTTP/0.9-style line with no version — #486),
 `http.req_header(req, name) -> str` (case-insensitive, `""` when absent) and
-`http.req_body(req) -> str`. `http` is **Experimental** (STABILITY.md §4.4).
+`http.req_body(req) -> str`. Both `http.read_request` and `http.respond` accept
+**either** a plaintext `net` connection **or** a TLS connection from
+`tls.accept` (both are the one opaque connection handle) — the request parser and
+response writer drive the connection through a transport seam, reading/writing
+over `SSL_read`/`SSL_write` for a TLS conn and `recv`/`send` for a plaintext one,
+so an HTTPS server terminates TLS through the same `http` surface (#556). The
+read deadline (`net.set_read_timeout`, above) applies uniformly, so a read
+timeout raises `TimeoutError` over a TLS conn as well. `http` is **Experimental**
+(STABILITY.md §4.4).
 
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain

@@ -2825,3 +2825,38 @@ by `try` rather than aborting.
 **Default path unchanged.** With no timeout set (the default), every read passes
 `0` to the park primitive exactly as before; `connect`/`accept`/`send` always pass
 `0` (no write/accept deadline). The no-timeout path is byte-for-byte identical.
+## D-0097 — `http.read_request` / `http.respond` over TLS via a transport seam (I#556)
+**Status:** Locked — extends the `http` server surface (D-0056) to TLS connections (D-0062/D-0093), unblocking HTTPS termination.
+
+`http.read_request` and `http.respond` previously cast the connection straight to
+the plaintext `ZapSock` and read/wrote with raw `recv`/`send`. A `tls.accept`
+connection (`ZapTls`, an OpenSSL session) could not be read: the bytes on the fd
+are encrypted TLS records, so the plaintext parser saw garbage. A server built on
+the stdlib `http` (e.g. zaplang-io/fastzap) therefore could not parse a single
+request off a TLS conn, blocking HTTPS termination outright — even though the
+server-side TLS primitives (`tls.listen`/`accept`/`port`/`close_listener`, #488)
+already worked.
+
+**Either transport, one parser.** At the Zap type level a connection is the one
+opaque handle (`bytes`), so `http.read_request(conn)` / `http.respond(conn, ...)`
+already accept a `tls.accept` conn with no front-end change — the same mechanism
+`net`/`tls`/`crypto` already use for their handles. The discrimination is at
+runtime: both `ZapSock` and `ZapTls` lead with an `int kind` tag (a C
+common-initial-sequence, read through a tiny `ZapConnHdr`), and the server
+request/response path drives the connection through **one** read seam and **one**
+write seam that dispatch on that tag — plaintext via `recv`/`send` + the
+netpoller park, TLS via `SSL_read`/`SSL_write` + the WANT_READ/WANT_WRITE park.
+There is a single HTTP request parser and a single response writer; the TLS path
+does **not** duplicate parsing (rejected: a second parser drifts, and the
+language-first rule forbids papering over the gap in the library).
+
+**Read deadline is uniform.** The #485 read timeout (`net.set_read_timeout` +
+`TimeoutError`) applies over TLS too: `ZapTls` carries the same
+`read_timeout_ms`, `net.set_read_timeout` dispatches on the tag to set it, and the
+TLS fill threads the deadline into its park. The timeout is raised through the
+same `zap_panic_typed`/`__cxa_throw` path, so it is caught by `try` over a TLS
+conn exactly as over a plaintext one.
+
+**Plaintext unchanged.** A plaintext `http.read_request`/`respond` takes the same
+`recv`/`send` path as before; the TLS fill with a `0` timeout (the client's HTTPS
+transport) is byte-for-byte identical to the prior behavior.
