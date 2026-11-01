@@ -348,6 +348,24 @@ enum ArgSlot {
     Default(usize),
 }
 
+/// Per-parameter metadata for a struct/enum method's call sites (I#481),
+/// dropping the implicit `self` receiver (always the first declared parameter).
+/// The result lines up one-to-one with a method call's explicit arguments, so
+/// [`plan_call_args`] can fill omitted defaults and reorder keyword arguments
+/// exactly as it does for free functions; the method-call lowering re-adds
+/// `self` when it emits the call.
+fn method_param_info(m: &ast::Function) -> Vec<ParamInfo> {
+    m.params
+        .iter()
+        .skip(1)
+        .map(|p| ParamInfo {
+            name: p.name.clone(),
+            default: p.default.clone(),
+            variadic: p.variadic,
+        })
+        .collect()
+}
+
 /// Assemble a call's arguments into declaration order (D-0038, I#298).
 ///
 /// Positional arguments (`name == None`) bind to parameters left to right;
@@ -983,6 +1001,12 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                             .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
                             .unwrap_or(Ty::Void)
                     };
+                    // Default/keyword argument metadata for method calls (I#481,
+                    // parity with free functions I#298). The implicit `self`
+                    // receiver is dropped so the recorded params line up with the
+                    // call site's explicit arguments; the method-call path re-adds
+                    // `self` when it assembles the call.
+                    call_params.insert(mangled.clone(), method_param_info(m));
                     sigs.insert(mangled, (params, ret));
                 }
             }
@@ -1011,6 +1035,9 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                                 .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
                                 .unwrap_or(Ty::Void)
                         };
+                        // Method default/keyword argument metadata (I#481), as
+                        // for struct methods above — `self` dropped.
+                        call_params.insert(mangled.clone(), method_param_info(m));
                         sigs.insert(mangled, (params, ret));
                     }
                 }
@@ -8845,12 +8872,49 @@ impl<'a> FnLower<'a> {
             // argument is copied by the register/sret ABI, so no explicit copy is
             // emitted for it (see `copy_for_pass`).
             let mut argvals = vec![recv]; // self
-            for (i, a) in args.iter().enumerate() {
-                let (v, vt) = self.expr(&a.value)?;
-                let target = *ptys.get(i + 1).unwrap_or(&vt);
-                let v = self.coerce(v, vt, target);
-                let v = self.copy_for_pass(v, target, &a.value);
-                argvals.push(v);
+                                          // Default arguments and out-of-order keyword arguments on methods
+                                          // (I#481, parity with free functions I#298): assemble the explicit
+                                          // arguments into declaration order, filling omitted defaulted
+                                          // parameters, before lowering. The recorded `call_params` drop the
+                                          // implicit `self`, so a plan slot `i` corresponds to parameter type
+                                          // `ptys[i + 1]`. A variadic method (or one with no recorded metadata,
+                                          // e.g. a derived method) keeps the positional lowering path.
+            let ctx = self.ctx;
+            let plan = match ctx.call_params.get(&mangled) {
+                Some(pinfo) if !pinfo.iter().any(|p| p.variadic) => {
+                    Some((pinfo, plan_call_args(&mangled, pinfo, args)?))
+                }
+                _ => None,
+            };
+            if let Some((pinfo, plan)) = plan {
+                for (i, slot) in plan.iter().enumerate() {
+                    // Either an expression written at the call site or the
+                    // omitted parameter's default (lowered fresh here, so it is
+                    // recomputed per call — D-0038).
+                    let e: &Expr = match slot {
+                        ArgSlot::Given(j) => &args[*j].value,
+                        ArgSlot::Default(p) => pinfo[*p].default.as_ref().unwrap(),
+                    };
+                    let v = match ptys.get(i + 1) {
+                        Some(&target) => {
+                            let v = self.expr_coerced(e, target, zapc_diag::ErrorCode::ZAP4021)?;
+                            self.copy_for_pass(v, target, e)
+                        }
+                        None => {
+                            let (v, vt) = self.expr(e)?;
+                            self.copy_for_pass(v, vt, e)
+                        }
+                    };
+                    argvals.push(v);
+                }
+            } else {
+                for (i, a) in args.iter().enumerate() {
+                    let (v, vt) = self.expr(&a.value)?;
+                    let target = *ptys.get(i + 1).unwrap_or(&vt);
+                    let v = self.coerce(v, vt, target);
+                    let v = self.copy_for_pass(v, target, &a.value);
+                    argvals.push(v);
+                }
             }
             let dest = if ret == Ty::Void {
                 None
