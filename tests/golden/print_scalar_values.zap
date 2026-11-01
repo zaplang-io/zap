@@ -8,12 +8,12 @@
 # `str()` and are pinned here as a no-regression guard, as is the space-joined
 # multi-argument line.
 def main():
-    print(27.5)             # 27.5   (not 27.500000)
-    print(6.0)              # 6.0    (integral float keeps its .0, I#384)
-    print(-4.5)             # -4.5
-    print(True)             # True   (not -1)
-    print(False)            # False
-    print(42)               # 42
-    print(-7)               # -7
-    print("hello")          # hello
-    print(1.5, True, 42)    # 1.5 True 42   (space-separated, each via str())
+    print(27.5)  # 27.5   (not 27.500000)
+    print(6.0)  # 6.0    (integral float keeps its .0, I#384)
+    print(-4.5)  # -4.5
+    print(True)  # True   (not -1)
+    print(False)  # False
+    print(42)  # 42
+    print(-7)  # -7
+    print("hello")  # hello
+    print(1.5, True, 42)  # 1.5 True 42   (space-separated, each via str())
