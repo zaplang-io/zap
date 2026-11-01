@@ -1,0 +1,2 @@
+200
+GET /ping HTTP/1.1
