@@ -656,14 +656,26 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
 - **Cancellation (D-0033; surface D-0044):** structured concurrency — a `scope:`
   block owns the coroutines spawned inside it and joins them at the dedent; a
   child failure cancels siblings and re-raises (an aggregate `ExceptionGroup` if
-  several fail, D-0045). `scope(on_error=OnError.Cancel|Wait)` selects the
-  failure policy. Supported scope options are `on_error`, `cancel_on`, and
-  `grace`; `timeout` is unsupported and rejected by semantic checking. `spawn detached <call>` opts out of all scope ownership (daemon; Go exit
-  semantics). `Cancelled` unwinds via `finally`/`with`, outside `Exception`.
-- **Spawn call forms:** the operand must call a named top-level function with
-  every argument supplied positionally. Methods, lambdas, local function values,
-  keyword arguments, and omitted defaults are rejected by semantic checking
-  (`ZAP5076`). Arguments are evaluated eagerly in the parent, before spawning.
+  several fail, D-0045). `scope(timeout=30.seconds, on_error=OnError.Cancel|Wait)`
+  adds a deadline and selects the failure policy. Timeout values are nonnegative
+  integer milliseconds, or integer `.seconds` / `.milliseconds` expressions.
+  At expiry, cancellation reaches owned children (including nested scopes and
+  parked channel operations); `finally`/`with` run and the scope awaits them.
+  After draining, a timeout raises `Cancelled`; an already recorded child
+  failure takes precedence. `grace` is an optional integer-millisecond drain
+  limit measured from deadline/signal cancellation, after which the runtime
+  forces process exit.
+  Completion before the deadline disarms the timer. A zero timeout cancels
+  immediately. Cancellation remains cooperative; CPU loops must checkpoint.
+  `spawn detached <call>` opts out of scope ownership (daemon; Go exit semantics).
+  `Cancelled` is outside `Exception`.
+- **Spawn call forms:** named functions, method calls such as
+  `spawn server.handle(conn)`, and immediate lambda calls such as
+  `spawn (lambda: log(x))()` are intended. Arguments and receiver/closure capture
+  are eager in the parent. **Implementation gap (#475):** method/lambda/function
+  value capture and full keyword/default handling remain outstanding; current
+  lowering supports fully supplied positional named-function calls. The existing
+  diagnostic marks this gap and does not remove these capabilities from the design.
 - **Memory model (D-0034):** data-race-free programs are sequentially
   consistent; data races are bugs.
 

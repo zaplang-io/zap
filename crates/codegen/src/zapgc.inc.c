@@ -930,6 +930,7 @@ static void zap_trace_children(void *payload) {
     }
     case ZAP_TD_SCOPE: {
         Scope *sc = (Scope *)payload;
+        if (sc->parent) zap_mark_push(sc->parent);
         if (sc->excs) {
             zap_mark_push((void *)sc->excs); /* pin: runtime-owned buffer */
             void **excs = sc->excs;

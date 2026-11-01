@@ -1182,6 +1182,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // raising (the parent's own in-flight exception wins). `zap_checkpoint` is
         // an explicit cancellation point (may raise `Cancelled`).
         self.declare_rt("zap_scope_enter", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_scope_set_parent", &[p.into(), p.into()], None);
+        self.declare_rt(
+            "zap_scope_timeout",
+            &[p.into(), i.into(), i.into(), i.into()],
+            None,
+        );
         self.declare_rt("zap_scope_exit", &[p.into()], None);
         self.declare_rt("zap_scope_exit_cancel", &[p.into()], None);
         self.declare_rt("zap_spawn_scoped", &[p.into(), p.into(), p.into()], None);

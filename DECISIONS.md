@@ -469,11 +469,13 @@ selects the failure policy (`Cancel` is the default — a failing child cancels 
 siblings; `Wait` lets siblings finish). `on_error` takes an **enum**, not a
 string, so a typo is a compile-time error (consistent with the interface and
 decorator "catch typos at compile time" ethos, D-0016/D-0036).
-The supported options are `on_error`, `cancel_on`, and `grace`. There is no
-scope timeout API: `scope(timeout=...)` is a semantic error (`ZAP5071`, I#475).
-A future deadline design must define durations and wake parked children before
-it can promise cancellation and join at a deadline.
-
+`scope(timeout=30.seconds, grace=5000)` cancels and drains owned children at a
+deadline. Timeout values are nonnegative integer milliseconds, with contextual
+`.seconds`/`.milliseconds` suffixes. Expiry uses the shared cancellation path,
+including nested scope ancestry and parked channel wakeup. Cleanup runs before
+`Cancelled` propagates; recorded child failures take precedence. `grace` is the
+existing integer-millisecond hard-exit backstop for an uncooperative drain.
+Method/lambda spawn capture remains intended and open in #475.
 
 **Cancellation** is a `Cancelled` exception injected at cancellation points
 (channel ops, `select`, sleep/timer/I/O waits, nested `scope:` boundaries,

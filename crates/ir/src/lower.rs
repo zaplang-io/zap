@@ -5631,6 +5631,48 @@ impl<'a> FnLower<'a> {
             args: vec![policy],
         });
 
+        if let Some(parent) = self.scope_stack.last().copied() {
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_scope_set_parent".to_string(),
+                args: vec![handle, parent],
+            });
+        }
+        let mut cached_grace = None;
+        for option in opts {
+            if option.name.as_deref() != Some("timeout") {
+                continue;
+            }
+            let (duration, scale) = match &option.value {
+                Expr::Attr { base, name, .. } if name == "seconds" || name == "milliseconds" => {
+                    (base.as_ref(), if name == "seconds" { 1000 } else { 1 })
+                }
+                value => (value, 1),
+            };
+            let (duration, ty) = self.expr(duration)?;
+            if ty.int_width().is_none() {
+                return Err(err("scope timeout requires an integer duration"));
+            }
+            let duration = self.coerce(duration, ty, Ty::I64);
+            let scale = self.iconst(Ty::I64, scale);
+            let grace = match cached_grace {
+                Some(value) => value,
+                None => {
+                    let value = match self.scope_grace(opts)? {
+                        Some(value) => value,
+                        None => self.iconst(Ty::I64, 0),
+                    };
+                    cached_grace = Some(value);
+                    value
+                }
+            };
+            self.throwing_call(
+                None,
+                "zap_scope_timeout",
+                vec![handle, duration, scale, grace],
+            );
+        }
+
         // `cancel_on=[Signal.X, ...]` + optional `grace=<ms>` (ticket #77,
         // D-0058): arm this scope so a listed signal cancels its tree, with an
         // optional hard-exit deadline. The subscription is removed inside
@@ -5638,9 +5680,12 @@ impl<'a> FnLower<'a> {
         // the scope awaits its children.
         let cancel_mask = self.scope_cancel_mask(opts)?;
         if cancel_mask != 0 {
-            let grace = match self.scope_grace(opts)? {
-                Some(v) => v,
-                None => self.iconst(Ty::I64, 0),
+            let grace = match cached_grace {
+                Some(value) => value,
+                None => match self.scope_grace(opts)? {
+                    Some(value) => value,
+                    None => self.iconst(Ty::I64, 0),
+                },
             };
             let maskv = self.iconst(Ty::I64, cancel_mask);
             self.emit(Inst::Call {
@@ -5729,11 +5774,7 @@ impl<'a> FnLower<'a> {
                     }
                     return Err(err("scope on_error expects OnError.Cancel or OnError.Wait"));
                 }
-                Some("timeout") => {
-                    return Err(err(
-                        "scope(timeout=...) is not supported yet (the timer API is deferred)",
-                    ))
-                }
+                Some("timeout") => continue,
                 // Handled separately by `scope_cancel_on` (ticket #77).
                 Some("cancel_on") | Some("grace") => continue,
                 Some(other) => return Err(err(format!("scope() has no option '{other}'"))),

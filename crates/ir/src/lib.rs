@@ -38,6 +38,15 @@ mod tests {
     }
 
     #[test]
+    fn lower_scope_timeout_fixture() {
+        let module = lower_ok(include_str!("../../../tests/conformance/scope_timeout.zap"));
+        assert!(format!("{module}").contains("zap_scope_timeout"));
+        lower_ok(include_str!(
+            "../../../tests/conformance/scope_timeout_grace.zap"
+        ));
+    }
+
+    #[test]
     fn lower_scope_cleanup_conformance() {
         let module = lower_ok(include_str!("../../../tests/conformance/scope_cleanup.zap"));
         let early = module

@@ -25,6 +25,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- Scope deadlines accept integer milliseconds and contextual `.seconds` /
+  `.milliseconds`, cancel and await children through the shared channel-aware
+  cancellation path, preserve cleanup, and reuse the grace drain timer (#475).
+  Nested joins park their coroutine. Intended callable-spawn forms are restored
+  to the design and remain tracked in #475.
+
 - Scope cleanup cancels and awaits children on return/break/continue; unsupported
   spawn call forms now report `ZAP5076` during semantic checking (#475). The
   concurrency contract documents supported scope options without a timeout API.

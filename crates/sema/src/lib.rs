@@ -2013,9 +2013,8 @@ impl Checker {
 
     /// Check the options on a `scope(...)` block (D-0044). `on_error` takes the
     /// `OnError` enum (`OnError.Cancel` | `OnError.Wait`) — a typed policy so a
-    /// misspelling is a compile-time error, not a silent runtime surprise. The
-    /// `timeout=` deadline is parsed but still deferred (it needs the timer API,
-    /// an open issue in `design/0005`), so it is rejected with a clear message.
+    /// misspelling is a compile-time error, not a silent runtime surprise.
+    /// Deadlines use integer milliseconds or explicit seconds/milliseconds units.
     fn check_scope_opts(&mut self, opts: &[Arg], span: Span) {
         for a in opts {
             match a.name.as_deref() {
@@ -2029,13 +2028,18 @@ impl Checker {
                     }
                 }
                 Some("timeout") => {
-                    self.infer(&a.value);
-                    self.error(
-                        ErrorCode::ZAP5071,
-                        "scope(timeout=...) is not supported yet (the timer API is deferred)"
-                            .to_string(),
-                        expr_span(&a.value),
-                    );
+                    let duration = match &a.value {
+                        Expr::Attr { base, name, .. }
+                            if name == "seconds" || name == "milliseconds" =>
+                        {
+                            base.as_ref()
+                        }
+                        value => value,
+                    };
+                    let ty = self.infer(duration);
+                    if !matches!(ty, Ty::Int32 | Ty::Int64 | Ty::UntypedInt | Ty::Unknown) {
+                        self.error(ErrorCode::ZAP4024, "scope timeout requires an integer duration in milliseconds (or .seconds/.milliseconds)".to_string(), expr_span(&a.value));
+                    }
                 }
                 // `scope(cancel_on=[Signal.X, ...])` (ticket #77, D-0058): a
                 // signal in the list cancels the scope tree. The value is a list
@@ -2086,7 +2090,7 @@ impl Checker {
                     ErrorCode::ZAP5074,
                     format!(
                         "scope() has no option '{other}' \
-                         (expected 'on_error', 'cancel_on', or 'grace')"
+                         (expected 'timeout', 'on_error', 'cancel_on', or 'grace')"
                     ),
                     expr_span(&a.value),
                 ),
@@ -5477,15 +5481,17 @@ def main():
     }
 
     #[test]
-    fn scope_timeout_is_deferred() {
-        // `scope(timeout=...)` is parsed but not yet supported (the timer API is
-        // deferred); it is reported rather than silently ignored.
-        let e = errors(
-            "def f():\n    print(1)\n\ndef main():\n    scope(timeout=30):\n        spawn f()\n",
-        );
+    fn scope_timeout_typechecks() {
+        ok(include_str!("../../../tests/conformance/scope_timeout.zap"));
+        ok(include_str!(
+            "../../../tests/conformance/scope_timeout_grace.zap"
+        ));
+        ok("def main():\n    scope(timeout=30.seconds, grace=100):\n        checkpoint()\n");
+        ok("def main():\n    scope(timeout=10.milliseconds):\n        auto done = 1\n");
         assert!(
-            e.iter().any(|e| e.code == ErrorCode::ZAP5071),
-            "expected scope(timeout=...) to be reported"
+            errors("def main():\n    scope(timeout=1.5):\n        auto done = 1\n")
+                .iter()
+                .any(|e| e.code == ErrorCode::ZAP4024)
         );
     }
 

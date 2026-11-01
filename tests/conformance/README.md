@@ -74,7 +74,8 @@ def main():
 * **Codegen (LLVM), in CI's `full` + `arm64` jobs:** `conformance_programs_match`
   compiles + runs each program and checks stdout/exit/stderr — riding the
   existing `cargo test --workspace --features zapc/gc-*` steps (no new CI job),
-  the same way goldens and the diff harness do.
+  the same way goldens and the diff harness do. An optional `.env` sidecar supplies
+  `KEY=VALUE` entries, for example `MAXPROCS=1` to exercise single-worker joins.
 
 ## Scope of the first cut
 

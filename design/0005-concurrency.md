@@ -76,12 +76,14 @@ race with the parent continuing.
 
 ```python
 spawn worker(ch)             # launch; parent continues at once
+spawn server.handle(conn)    # intended: eagerly capture the receiver
+spawn (lambda: log(x))()     # intended: eagerly capture the closure
 ```
 
-The supported operand calls a named top-level function with all arguments
-supplied positionally. Method, lambda, function-value, keyword, and omitted-default
-calls are rejected during semantic checking (`ZAP5076`, I#475). Broader callable
-forms require a separate implementation of receiver/closure capture.
+Method/lambda/function-value capture and complete keyword/default handling are
+intended capabilities whose implementation is still tracked by #475. Current
+lowering handles named functions with all arguments supplied positionally; the
+existing semantic diagnostic identifies that implementation gap.
 
 `spawn` is a statement and yields no handle (fire-and-forget).
 Coordination is explicit: results flow back over channels, and completion is
@@ -288,17 +290,36 @@ Rules:
    that created it, and cancellation flows down the tree without a `context`
    object threaded through every call (D-0033, chosen over Go).
 
-Options on the scope configure failure and signal cancellation policy.
-The supported options are `on_error`, `cancel_on`, and `grace`. There is no
-scope timeout/deadline API; `scope(timeout=...)` is rejected during semantic
-checking (`ZAP5071`). A future deadline API must first define duration units and
-wake cancellation-aware parked children before a deadline can safely join them.
+Scope options configure deadlines, failure policy, and signal cancellation:
 
 ```python
-scope(on_error=OnError.Wait):        # default is OnError.Cancel: a failure waits
-    spawn best_effort(x)             # for siblings instead of cancelling them
+scope(timeout=30.seconds, grace=5000):  # deadline, then at most 5s to drain
+    spawn fetch(a)
+    spawn fetch(b)
+
+scope(on_error=OnError.Wait):
+    spawn best_effort(x)
     spawn best_effort(y)
 ```
+
+`timeout` is a nonnegative integer number of milliseconds; `.seconds` and
+`.milliseconds` suffixes are accepted in this option (not a general Duration
+type). Deadlines use a relative monotonic wait. Zero cancels immediately;
+negative/overflowing durations raise `ValueError`. A completed scope disarms its
+timer, so a late timer cannot touch a subsequent scope. Expiry follows the same
+cancellation path as child failure, signal cancellation, and early exit:
+checkpointing children unwind, blocked channel senders/receivers are dequeued
+and resumed, and descendants observe cancellation through scope ancestry.
+Nested joins park the coroutine, so one worker can run its children.
+
+After all children finish cleanup, timeout raises `Cancelled`. Recorded child
+failures take precedence over this marker (including `on_error=OnError.Wait`);
+a parent's own exception remains dominant during unwind. `grace` reuses the
+signal drain timer and forces process exit if children cannot finish in the
+given milliseconds. It cannot guarantee cleanup for a child that never reaches
+a cancellation point. `cancel_on` remains supported alongside these options.
+General I/O/FFI interruption is still subject to the cancellation points of that
+operation; this change adds interruption for parked channel operations.
 
 `on_error` takes an **`OnError` enum** (`Cancel` | `Wait`), not a string, so a
 misspelled policy is a compile-time error, not a silent runtime surprise (D-0044,
@@ -608,11 +629,9 @@ ships in every binary and wires up lazily; the mechanism:
   the zero-code operator path to these. **`zap inspect <pid>`** (CLI) signals a
   running process to dump these (`SIGQUIT`, or `SIGUSR1` with `--gc`).
 - **Deferred / flagged for review:** collapsing the dispatcher into the signal
-  thread (above); `grace` is an integer-milliseconds expression (no first-class
-  `Duration`/`30.seconds` surface yet — consistent with the deferred `timeout`);
-  cooperative cancel_on reaches a coroutine already parked on a channel only at
-  its next cancellation point (the `zap_netpoll_wake` parked-G interrupt is a
-  follow-up); full per-coroutine symbolicated stack traces in the dump (v1 reports
+  thread (above); first-class Duration values beyond the contextual scope
+  timeout units; cancellation of arbitrary parked I/O/FFI operations beyond the
+  channel wake path; full per-coroutine symbolicated stack traces in the dump (v1 reports
   per-G state/ownership + the scheduler/GC shape); and retroactively masking a
   signal first subscribed from a worker thread (handlers are async-safe wherever
   they run, so this is a purity gap, not a correctness one).
@@ -678,8 +697,8 @@ parks its G and frees its M.
   how it interacts with `scope:` inheritance.
 - **Formal memory-model spec** (D-0034) and the **race-detector** tool
   (both already tracked in OPEN-QUESTIONS).
-- **Timers/deadlines API** — the concrete `after()`, `sleep()`, and
-  `scope(timeout=...)` surface and its clock.
+- **General timer API** — concrete `after()` and `sleep()` surfaces; scope
+  deadlines now support integer milliseconds and contextual `.seconds` units.
 - **Blocking FFI.**
   How CPython interop (D-0012) and its GIL interact with coroutines that must not
   block an M (likely a dedicated M pool for FFI calls).
