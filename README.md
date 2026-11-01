@@ -5,18 +5,21 @@ readability** and **native performance** — aimed at Python developers who need
 speed. Python feel, Go-style toolchain and concurrency, with a compile-time
 metaprogramming system for keeping business logic free of boilerplate.
 
-> Status: **early design + Phase 0 scaffold.** The language is fully specified
-> (see below); the compiler is just getting started.
+> Status: **active pre-1.0 development.** The compiler and toolchain already
+> cover a broad language surface, including native code generation and project
+> tooling. The exact contract varies by feature: see the [stability policy](docs/STABILITY.md)
+> for Stable, Experimental, and Internal tiers, and the [specification](SPEC.md)
+> for language behavior.
 
 ## Documents
 
 - [`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md) — "where to find what": the compiler pipeline, crate map, runtime/GC, stdlib, tooling, and tests.
 - [`SPEC.md`](SPEC.md) — the language specification (the source of truth).
-- [`DECISIONS.md`](DECISIONS.md) — the decision log (ADR), D-0001…D-0079.
+- [`DECISIONS.md`](DECISIONS.md) — the language and implementation decision log.
 - [`docs/STABILITY.md`](docs/STABILITY.md) — versioning & stability policy (the 1.0 contract).
 - [`CHANGELOG.md`](CHANGELOG.md) — notable changes, per [Keep a Changelog](https://keepachangelog.com/) (pre-1.0 / editorial 0.x).
 - [`docs/RELEASING.md`](docs/RELEASING.md) — the release process: tag convention and how the version bumps.
-- [`ROADMAP.md`](ROADMAP.md) — phased build plan + parallelization map.
+- [`ROADMAP.md`](ROADMAP.md) — the original phased build plan; use the issue tracker and stability policy for current project status.
 - [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) — the tracked backlog.
 - [`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf) — the grammar.
 - [`design/`](design/) — per-feature design docs.
@@ -25,17 +28,24 @@ metaprogramming system for keeping business logic free of boilerplate.
 ## Repository layout
 
 ```
-Cargo.toml              workspace
+Cargo.toml              Rust workspace
 crates/
-  syntax/               zapc_syntax: source spans, tokens, AST (Phase 0)
-  driver/               the `zap` CLI + the internal `zapc` compiler
-docs/GRAMMAR.ebnf       the grammar
-tests/golden/           golden programs (*.zap) + expected output (*.expected)
+  syntax/               lexer, parser, AST, source spans
+  sema/                 semantic analysis and built-in module contracts
+  ir/                   typed intermediate representation and lowering
+  codegen/              LLVM backend and native runtime
+  driver/                `zap` CLI, project workflows, and test harnesses
+  fmt/, doc/, pkg/, ...  formatter, API docs, package tooling, and support crates
+docs/                    language tooling and platform documentation
+design/                  feature and runtime designs
+tests/
+  golden/               language and runtime regression programs
+  conformance/           executable checks for documented language claims
+  diff/                  CPython differential tests for the shared subset
 ```
 
-The compiler pipeline (mirrors Go's structure) will be:
-lex → parse → type-check → typed IR → lower → LLVM codegen → native binary.
-See `ROADMAP.md`.
+The compiler pipeline is:
+lex → parse → semantic analysis → typed IR → lowering → LLVM codegen → native binary.
 
 ## Building
 
@@ -52,16 +62,16 @@ cargo build
 cargo test
 ```
 
-This builds the front-end crates (`zapc_syntax`, `zapc_sema`) and the driver.
-**Codegen needs LLVM** and is excluded from the default build (it's gated behind
-the driver's `llvm` feature), so `cargo build`/`cargo test` work on any host.
+The default workspace build and test run cover the host-side compiler and
+tooling crates. **Codegen needs LLVM** and is excluded from the default build
+(it is gated behind the driver's `llvm` feature), so `cargo build` and the
+default `cargo test` do not require LLVM.
 
 ## Compiling and running Zap programs (codegen)
 
-Codegen lowers the type-checked AST to native code via **LLVM** (D-0042). Because
-LLVM isn't available as a Homebrew binary on Intel macOS, the LLVM build runs in
-a dev container (`.devcontainer/Dockerfile`: Ubuntu + LLVM 18 + Rust). The
-`Makefile` wraps it:
+Codegen lowers typed IR to native code via **LLVM** (D-0042). The backend
+requires LLVM 18. The provided dev container (`.devcontainer/Dockerfile`) pins
+that toolchain, and the `Makefile` wraps its common workflows:
 
 ```bash
 make docker-build                         # build the LLVM 18 dev image (once)
@@ -73,7 +83,7 @@ To **use** the toolchain (rather than hack on it) without building from source,
 pull the prebuilt image `ghcr.io/zaplang-io/zap` — handy as a CI `container:`
 for Zap package repos. See [`docs/DOCKER.md`](docs/DOCKER.md).
 
-## Build performance: fast + memory-bounded (tickets #128, #123)
+## Build performance and workflow: cached and memory-bounded (tickets #128, #123)
 
 A full LLVM codegen build is heavy — the link step is the RAM peak, and running
 several at once can swap a laptop to death. The build setup is tuned so a single
@@ -120,26 +130,10 @@ What makes it fast and bounded:
   is dominated by parallel `rustc`, so `CARGO_BUILD_JOBS` + the hard cap are the
   real memory levers. Mirrored in the `full` CI job.
 
-### Measured (this host: 16 GB macOS, Docker Desktop VM = 8.5 GB / 4 CPU)
-
-Full workspace incl. LLVM codegen, `CARGO_BUILD_JOBS=4`. "cold" = empty target
-+ empty cache; "warm cache" = empty target but shared `sccache` populated.
-
-| metric | before (GNU ld, no cache) | after (mold + sccache) |
-|---|---|---|
-| cold full build (fresh target) | 30 s | 26 s |
-| rebuild, fresh target + warm sccache | 30 s (no cache: always cold) | **9 s** (55 reqs → 35 hits, 0 miss) |
-| warm `cargo check`, host, after editing `lower.rs` (7k lines) | ~1.4 s | ~1.4 s |
-| full `cargo test` suite (Immix, 309 tests) | — | 76 s |
-| peak RSS, cold full build | ~1.0 GB | ~1.2 GB (parallel-compile bound, not link) |
-| per-run memory ceiling | unbounded (≤ VM, could swap host) | **hard `--memory` cap, swap off** |
-
-Takeaways: the shared cache turns a sibling/repeat build from a 30 s cold
-rebuild into a **9 s** cache-hit build; a warm `cargo check` (~1.4 s) is ~18×
-faster than a cold build and ~50× faster than the full test gate; and the
-`--memory` cap with swap disabled makes each run's ceiling a hard, predictable
-bound instead of "whatever the host has" — so concurrent runs can't swap the
-machine to death.
+Build times and test counts change with the workspace and host. The Makefile
+keeps the target isolated per worktree, shares compiled artifacts through
+`sccache`, and caps Docker resources. Use `make check` and `make docker-check`
+while iterating, then run `make docker-test` for the full gate.
 
 ## The `zap` CLI (D-0053)
 
@@ -153,17 +147,29 @@ zap expand [file]     show decorator/@derive-generated code (D-0036)
 zap fmt [paths]       rewrite source in the canonical style (D-0037)
 zap doc <file>        render API docs — HTML site, Markdown, or JSON model
 zap test [--doc]      run the @test suite, or docstring examples with --doc (#234)
-zap playground        local web playground: editor + sandboxed server-side run (#238)
 zap new <name>        scaffold a new project (writes zap.toml)
 zap init              scaffold zap.toml in the current directory
-zap version | help
+zap add/remove        manage manifest dependencies
+zap zenv              manage the project environment
+zap publish/login     publish a package or manage registry credentials (experimental)
+zap search/info       discover packages in a registry (experimental)
+zap mcp               serve language reference and code tools over stdio
+zap lsp               start the language server over stdio
+zap repl              start the interactive JIT session
+zap playground        start the local web playground (#238)
+zap inspect           inspect a running process and its runtime
+zap explain <code>    explain a ZAP diagnostic code
+zap version           print the toolchain version
+zap help              print usage
 ```
 
-`zap run`/`zap build`/`zap expand`/`zap ir`, `zap fmt` (D-0037), `zap doc`
-(issues #232/#233), `zap new`/`init`, and `zap version`/`help` are implemented.
-`zap test` (issue #73), `zap add`/`remove` and `zap zenv` (issue #69), and
-`zap mcp` (issue #72) are wired as stubs that name their owning ticket, so the
-command surface is stable while those systems land.
+`zap fmt --check` checks formatting without changing files. `zap run`,
+`zap build`, `zap test`, `zap repl`, and `zap playground` require the LLVM
+codegen feature; front-end and project commands can be built without LLVM.
+Stability varies by surface: package publishing/discovery, the playground, and
+several standard-library modules are Experimental. The hosted HTTPS publish API
+is not enabled; local and `file://` indexes are supported. See
+[`docs/STABILITY.md`](docs/STABILITY.md) for the current tiers.
 
 `zap doc <file>` renders one module's public API (functions, types with their
 fields and methods, enums, interfaces, and constants, with signatures and
@@ -200,13 +206,18 @@ make docker-run FILE=tests/golden/hello.zap   # uses the internal `zapc`
 # inside the container: cargo run -p zapc --features llvm --bin zap -- run <file>
 ```
 
-## Status
+## Language and toolchain status
 
-The vertical slice runs end to end: `fib.zap` → `55` and `loop_sum.zap` → `45`.
-Implemented so far — lexer, parser, type checker (scalars + functions with
-inference), and LLVM codegen for the slice (int64/f64/bool, functions incl.
-recursion, control flow, `for`-over-`range`, calls, `print`). See `ROADMAP.md`
-for what's next.
+Zap has an end-to-end native compiler and an actively developed toolchain. The
+implemented language includes typed declarations and inference, functions and
+closures, control flow and pattern matching, structs and enums, exceptions,
+generators, collections, modules, and structured concurrency. The repository
+also includes an LLVM runtime, standard-library modules, package management,
+tests and doctests, formatting, API documentation, an LSP server, an MCP server,
+and a REPL. This list describes available implementation areas, not a promise
+that every feature is complete on every target. The authoritative per-feature
+status is in [`docs/STABILITY.md`](docs/STABILITY.md); documented behavior is in
+[`SPEC.md`](SPEC.md).
 
 ## License
 
