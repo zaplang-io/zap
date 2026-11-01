@@ -203,6 +203,73 @@ fn perr(code: ErrorCode, message: impl Into<String>, span: Span) -> ParseError {
     }
 }
 
+/// Normalize a replacement-field expression so it parses as an ordinary Zap
+/// expression fragment.
+///
+/// Inline string literals may be written with the f-string's delimiter quote
+/// escaped — the pre-#498 workaround, e.g. `f"{d.get(\"k\")}"`. Those `\q`
+/// delimiters are stripped here so the fragment becomes `d.get("k")`. Unescaped
+/// inline quotes (PEP 701, `f"{d["k"]}"` / `f'{d.get('k')}'`) and any escapes
+/// *inside* a normally-delimited nested string are copied through verbatim, so
+/// the fragment lexer re-processes them exactly as it would any string literal.
+fn normalize_field_expr(src: &str) -> String {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        let c = b[i];
+        if c == b'\\' && i + 1 < n && (b[i + 1] == b'\'' || b[i + 1] == b'"') {
+            // Escaped-delimiter inline string: `\q ... \q`. Drop the two
+            // delimiter backslashes; copy the inner bytes verbatim.
+            let q = b[i + 1];
+            out.push(q as char);
+            i += 2;
+            while i < n {
+                if b[i] == b'\\' && i + 1 < n && b[i + 1] == q {
+                    out.push(q as char);
+                    i += 2;
+                    break;
+                }
+                let ch = src[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        } else if c == b'\'' || c == b'"' {
+            // A normally-delimited nested string literal (including triple
+            // quotes): copy it verbatim, escapes and all.
+            let q = c;
+            let triple = i + 2 < n && b[i + 1] == q && b[i + 2] == q;
+            let start = i;
+            i += if triple { 3 } else { 1 };
+            while i < n {
+                if b[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                if triple {
+                    if i + 2 < n && b[i] == q && b[i + 1] == q && b[i + 2] == q {
+                        i += 3;
+                        break;
+                    }
+                    i += 1;
+                } else if b[i] == q {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push_str(&src[start..i.min(n)]);
+        } else {
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 /// Split an f-string's raw inner text into literal runs and replacement fields.
 ///
 /// `value` is the literal's inner text (exactly as it appears between the
@@ -247,6 +314,23 @@ pub fn split_fstring(value: &str, value_base: u32) -> (Vec<FStringPart>, Vec<Par
             while j < n {
                 let cj = b[j];
                 match cj {
+                    b'\\' if j + 1 < n && (b[j + 1] == b'\'' || b[j + 1] == b'"') => {
+                        // An inline string literal written with the OUTER quote
+                        // escaped (`\"`/`\'`): the pre-#498 workaround and a Zap
+                        // superset of PEP 701. Treat `\q ... \q` as one string so
+                        // its braces/colons don't end the field;
+                        // `normalize_field_expr` later drops the delimiter
+                        // backslashes before the fragment is parsed.
+                        let q = b[j + 1];
+                        j += 2;
+                        while j < n {
+                            if b[j] == b'\\' && j + 1 < n && b[j + 1] == q {
+                                j += 2;
+                                break;
+                            }
+                            j += 1;
+                        }
+                    }
                     b'\'' | b'"' => {
                         // Skip an embedded string literal so its `}`/`:`/`!`
                         // don't terminate the field.
@@ -334,7 +418,7 @@ pub fn split_fstring(value: &str, value_base: u32) -> (Vec<FStringPart>, Vec<Par
                 }
             };
             let ee = expr_end.unwrap_or(fe.saturating_sub(1)).min(n);
-            let expr_src = &value[expr_start..ee];
+            let expr_src = normalize_field_expr(&value[expr_start..ee]);
             let fspan = span_at(field_start, fe);
 
             if expr_src.trim().is_empty() {
@@ -348,7 +432,7 @@ pub fn split_fstring(value: &str, value_base: u32) -> (Vec<FStringPart>, Vec<Par
             }
 
             let (expr, perrs) =
-                parse_expr_fragment(expr_src, value_base.saturating_add(expr_start as u32));
+                parse_expr_fragment(&expr_src, value_base.saturating_add(expr_start as u32));
             errors.extend(perrs);
 
             let (spec, had_spec) = match spec_range {
@@ -455,6 +539,55 @@ mod tests {
         let p = fields("{d[\"a}b\"]}");
         assert_eq!(p.len(), 1);
         assert!(matches!(&p[0], FStringPart::Field { .. }));
+    }
+
+    #[test]
+    fn normalize_strips_escaped_delimiter_quotes() {
+        // Pre-#498 escaped form -> clean fragment.
+        assert_eq!(normalize_field_expr(r#"d.get(\"k\")"#), r#"d.get("k")"#);
+        assert_eq!(normalize_field_expr(r#"d.get(\'k\')"#), r#"d.get('k')"#);
+        // Unescaped PEP 701 forms are untouched.
+        assert_eq!(normalize_field_expr(r#"d["k"]"#), r#"d["k"]"#);
+        assert_eq!(normalize_field_expr(r#"d.get('k')"#), r#"d.get('k')"#);
+        // Escapes *inside* a normally-delimited nested string are preserved.
+        assert_eq!(normalize_field_expr(r#"f("a\"b")"#), r#"f("a\"b")"#);
+        assert_eq!(normalize_field_expr(r#"f("a\nb")"#), r#"f("a\nb")"#);
+        // No quotes at all: identity.
+        assert_eq!(normalize_field_expr("a + b * 2"), "a + b * 2");
+    }
+
+    #[test]
+    fn field_with_nested_same_quote_subscript() {
+        // `{d["k"]}` — inline subscript reusing the outer quote (PEP 701).
+        let p = fields(r#"{d["k"]}"#);
+        assert_eq!(p.len(), 1);
+        assert!(matches!(&p[0], FStringPart::Field { .. }));
+    }
+
+    #[test]
+    fn field_with_escaped_quote_call_arg() {
+        // `{d.get(\"k\")}` — the pre-#498 escaped workaround now parses.
+        let p = fields(r#"{d.get(\"k\")}"#);
+        assert_eq!(p.len(), 1);
+        assert!(matches!(&p[0], FStringPart::Field { .. }));
+    }
+
+    #[test]
+    fn field_with_single_quote_outer() {
+        // Single-quote outer with an escaped single quote inside the field.
+        let p = fields(r#"{d.get(\'k\')}"#);
+        assert_eq!(p.len(), 1);
+        assert!(matches!(&p[0], FStringPart::Field { .. }));
+    }
+
+    #[test]
+    fn genuinely_unterminated_field_still_errors() {
+        // No closing `}` — ZAP2017 must still fire, even with a nested string.
+        let (_p, errs) = split_fstring(r#"{d["k"]"#, 0);
+        assert!(
+            errs.iter().any(|e| e.code == ErrorCode::ZAP2017),
+            "expected ZAP2017 for an unterminated field, got {errs:?}"
+        );
     }
 
     #[test]

@@ -404,6 +404,12 @@ dotted_name   ::= IDENT { "." IDENT } ;
               replacement fields "{" expr [ "!" ("r"|"s"|"a") ] [ ":" spec ] "}"
               ("{{"/"}}" are literal braces); the field expr is a full Zap
               expression, parsed and type-checked like any other (#285, D-0026).
+              The field expr may contain string literals that reuse the outer
+              delimiter quote (PEP 701, #498): the lexer tracks "{...}" nesting
+              so an inner quote inside a field opens a nested string rather than
+              ending the f-string (f"{d["k"]}", f'{d.get('k')}'). An inner quote
+              written as an escaped delimiter (\" / \') is also accepted and is
+              treated as the quote (the pre-#498 form, f"{d.get(\"k\")}").
               spec = [[fill]align][sign]["#"]["0"][width]["." precision][type]
               (Python format mini-language subset; see SPEC §9.3).
    TYPE_KEYWORD  int32 int64 float32 float64 i32 i64 f32 f64 bool char str

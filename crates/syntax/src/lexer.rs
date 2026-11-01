@@ -367,6 +367,10 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         let body_start = self.pos;
+        // For f-strings we track the replacement-field nesting depth so that a
+        // quote inside a `{ ... }` field (PEP 701) does not end the literal.
+        // `{{`/`}}` are literal braces only at depth 0 (in the text portion).
+        let mut field_depth: u32 = 0;
         loop {
             match self.peek() {
                 None => {
@@ -379,6 +383,30 @@ impl<'a> Lexer<'a> {
                     if self.peek().is_some() {
                         self.bump();
                     }
+                }
+                Some(b'{') if flags.fstring => {
+                    if field_depth == 0 && self.peek_at(1) == Some(b'{') {
+                        self.bump();
+                        self.bump();
+                    } else {
+                        field_depth += 1;
+                        self.bump();
+                    }
+                }
+                Some(b'}') if flags.fstring => {
+                    if field_depth == 0 && self.peek_at(1) == Some(b'}') {
+                        self.bump();
+                        self.bump();
+                    } else {
+                        field_depth = field_depth.saturating_sub(1);
+                        self.bump();
+                    }
+                }
+                // A quote inside a replacement field opens a nested string
+                // literal (PEP 701); scan past it so it does not terminate the
+                // f-string, even when it reuses the outer delimiter quote.
+                Some(c) if flags.fstring && field_depth > 0 && (c == b'\'' || c == b'"') => {
+                    self.scan_nested_string(c);
                 }
                 Some(c) if c == quote => {
                     if triple {
@@ -414,6 +442,51 @@ impl<'a> Lexer<'a> {
 
     fn slice_string(&self, from: usize, to: usize) -> String {
         String::from_utf8_lossy(&self.src[from..to]).into_owned()
+    }
+
+    /// Consume a nested string literal inside an f-string replacement field,
+    /// cursor positioned on its opening quote. Honors `\` escapes and triple
+    /// quotes, so an inner `}`/`:`/`!` or the outer delimiter quote inside the
+    /// nested string does not terminate the enclosing f-string (PEP 701). On an
+    /// unterminated nested string (EOF or, for a single-quoted one, a newline)
+    /// it stops without consuming the terminator, leaving the outer scanner to
+    /// report the f-string as unterminated.
+    fn scan_nested_string(&mut self, quote: u8) {
+        self.bump(); // opening quote
+        let triple = self.peek() == Some(quote) && self.peek_at(1) == Some(quote);
+        if triple {
+            self.bump();
+            self.bump();
+        }
+        loop {
+            match self.peek() {
+                None => return,
+                Some(b'\\') => {
+                    self.bump();
+                    if self.peek().is_some() {
+                        self.bump();
+                    }
+                }
+                Some(b'\n') if !triple => return,
+                Some(c) if c == quote => {
+                    if triple {
+                        if self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote) {
+                            self.bump();
+                            self.bump();
+                            self.bump();
+                            return;
+                        }
+                        self.bump();
+                    } else {
+                        self.bump();
+                        return;
+                    }
+                }
+                Some(_) => {
+                    self.bump();
+                }
+            }
+        }
     }
 
     fn lex_regex(&mut self, start: usize, is_subst: bool) {
@@ -909,6 +982,57 @@ mod tests {
                 fstring: true,
             },
         }));
+    }
+
+    /// Pull the single f-string value out of a token stream, asserting a clean lex.
+    fn fstring_value(src: &str) -> String {
+        let (toks, errs) = tokenize(src);
+        assert!(
+            errs.is_empty(),
+            "unexpected lex errors for {src:?}: {errs:?}"
+        );
+        toks.into_iter()
+            .find_map(|t| match t.kind {
+                TokenKind::Str { value, flags } if flags.fstring => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no f-string token in {src:?}"))
+    }
+
+    #[test]
+    fn fstring_nested_same_quote_does_not_terminate() {
+        // PEP 701: a replacement field may reuse the outer delimiter quote.
+        assert_eq!(fstring_value(r#"f"{d["k"]}""#), r#"{d["k"]}"#);
+        assert_eq!(fstring_value(r#"f"{d.get("k")}""#), r#"{d.get("k")}"#);
+        assert_eq!(fstring_value(r#"f'{d.get('k')}'"#), r#"{d.get('k')}"#);
+    }
+
+    #[test]
+    fn fstring_escaped_quote_in_field_captured() {
+        // The pre-#498 escaped workaround still lexes to the full field.
+        assert_eq!(fstring_value(r#"f"{d.get(\"k\")}""#), r#"{d.get(\"k\")}"#);
+    }
+
+    #[test]
+    fn fstring_brace_in_nested_string_not_counted() {
+        // A `}` inside a nested string must not close the field early.
+        assert_eq!(fstring_value(r#"f"{d["}"]}""#), r#"{d["}"]}"#);
+        assert_eq!(fstring_value(r#"f"{ {"a": 1} }""#), r#"{ {"a": 1} }"#);
+    }
+
+    #[test]
+    fn fstring_escaped_braces_unchanged() {
+        assert_eq!(fstring_value(r#"f"{{braces}} {x}""#), r#"{{braces}} {x}"#);
+    }
+
+    #[test]
+    fn fstring_unterminated_with_nested_quote_errors() {
+        // Missing the outer closing quote: still an unterminated string.
+        let (_toks, errs) = tokenize("x = f\"{d[\"k\"]}\ny = 1\n");
+        assert!(
+            errs.iter().any(|e| e.code == ErrorCode::ZAP1001),
+            "expected an unterminated-string error, got {errs:?}"
+        );
     }
 
     #[test]
