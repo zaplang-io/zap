@@ -67,6 +67,13 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | BYTES-1 | §4.2 | `bytes` is byte-based; `b[i]` is an int64 in `0..=255` | TODO | — |
 | BYTES-2 | §4.2 | `str(bytes)` decodes UTF-8, raising on invalid | TODO | — |
 
+## string → value conversions (§9, #456)
+
+| Claim | Section | Statement | Status | Case |
+|---|---|---|---|---|
+| CONV-1 | §9 | `int(s)` on a malformed string raises a *catchable* `ValueError` (#456) | covered | conversion_int_valueerror |
+| CONV-2 | §9 | an uncaught `int(s)` `ValueError` prints a clean message and exits 1, not an abort (#456) | covered | conversion_int_valueerror_uncaught |
+
 ## Comparison (§5, §9.1)
 
 | Claim | Section | Statement | Status | Case |
