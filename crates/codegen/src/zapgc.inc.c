@@ -1144,7 +1144,7 @@ static void zap_sweep(void) {
             } else {
                 *pp = b->all_next;
                 zap_reg_remove((uintptr_t)b);
-                zap_total_mapped -= ((b->los_size + sizeof(ZapBlock) + ZAP_BLOCK - 1) /
+                zap_total_mapped -= ((b->los_size + ZAP_RESERVED_BYTES + ZAP_BLOCK - 1) /
                                      ZAP_BLOCK) *
                                     ZAP_BLOCK;
                 zap_os_aligned_free(b); /* aligned block: _aligned_free on Windows (I#218) */
@@ -1461,7 +1461,9 @@ static void *zap_bump_mutator(size_t osize) {
  * than a per-P buffer. Takes zap_heap_mu (shared with the block lists, the
  * registry and the collector's sweep). */
 static void *zap_alloc_los(size_t osize) {
-    size_t total = ((osize + sizeof(ZapBlock) + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
+    /* The header starts AFTER the line-aligned metadata region. Using
+     * sizeof(ZapBlock) here underallocates near a block boundary (#537). */
+    size_t total = ((osize + ZAP_RESERVED_BYTES + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
     void *mem = NULL;
     if (zap_os_aligned_alloc(&mem, ZAP_BLOCK, total) != 0 || !mem) {
         fprintf(stderr, "zap: out of memory (LOS map)\n");
