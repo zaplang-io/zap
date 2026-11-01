@@ -740,6 +740,7 @@ impl Checker {
                     ty,
                     has_default: false,
                     variadic: p.variadic,
+                    keyword_only: p.keyword_only,
                 }
             })
             .collect();
@@ -1190,6 +1191,7 @@ impl Checker {
                     ty,
                     has_default: p.default.is_some(),
                     variadic: p.variadic,
+                    keyword_only: p.keyword_only,
                 }
             })
             .collect();
@@ -1288,6 +1290,7 @@ impl Checker {
             ty,
             has_default: false,
             variadic: false,
+            keyword_only: false,
         };
         let mut methods = HashMap::new();
         methods.insert(
@@ -1326,6 +1329,7 @@ impl Checker {
                     .unwrap_or(Ty::Unknown),
                 has_default: p.default.is_some(),
                 variadic: p.variadic,
+                keyword_only: p.keyword_only,
             })
             .collect();
         let ret = f
@@ -4783,6 +4787,24 @@ impl Checker {
 
         for (i, a) in positional.iter().enumerate() {
             let at = self.infer(&a.value);
+            // A parameter after the bare `*` separator is keyword-only (I#496) and
+            // cannot be filled positionally. Positional args bind to params by
+            // index, and keyword-only params always follow the positional-or-
+            // keyword ones, so a positional arg landing on one is the violation.
+            if let Some(p) = sig.params.get(i) {
+                if p.keyword_only {
+                    self.error(
+                        ErrorCode::ZAP4029,
+                        format!(
+                            "parameter '{}' of '{}' is keyword-only and must be \
+                             passed by name ('{}=...')",
+                            p.name, fname, p.name
+                        ),
+                        expr_span(&a.value),
+                    );
+                    continue;
+                }
+            }
             let expected = if let Some(p) = sig.params.get(i) {
                 Some(p.ty.clone())
             } else if has_var {
@@ -5277,6 +5299,38 @@ mod tests {
         assert!(errors("def f(list[f64] xs):\n    pass\n")
             .iter()
             .any(|e| e.code == ErrorCode::ZAP4027));
+    }
+
+    #[test]
+    fn keyword_only_params_enforced_at_call_site() {
+        // #298 defaults + keyword args compose with the I#496 keyword-only marker.
+        // Supplying a keyword-only parameter by name works, and a default lets it
+        // be omitted entirely.
+        ok(
+            "def f(int64 a, *, int64 b = 1) -> int64:\n    return a + b\n\
+            def main():\n    auto x = f(1)\n    auto y = f(1, b=5)\n",
+        );
+
+        // Passing a keyword-only parameter positionally is rejected (ZAP4029).
+        assert!(errors(
+            "def f(int64 a, *, int64 b = 1) -> int64:\n    return a + b\n\
+             def main():\n    auto x = f(1, 5)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP4029));
+
+        // A required keyword-only parameter omitted at the call site is a missing
+        // required argument (ZAP4020).
+        assert!(errors(
+            "def f(int64 a, *, int64 b) -> int64:\n    return a + b\n\
+             def main():\n    auto x = f(1)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP4020));
+
+        // A required keyword-only parameter supplied by name is accepted.
+        ok("def f(int64 a, *, int64 b) -> int64:\n    return a + b\n\
+            def main():\n    auto x = f(1, b=2)\n");
     }
 
     #[test]

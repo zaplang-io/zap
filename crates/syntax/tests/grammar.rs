@@ -330,6 +330,10 @@ const CORPUS: &[Case] = &[
     case("function", Accept, "def f():\n    return\n"),
     case("param", Accept, "def s(int64... xs) -> int64:\n    return 0\n"),      // variadic, D-0038
     case("param", Accept, "def g(int64 a, str b = \"x\"):\n    return\n"),      // default, D-0038
+    case("param_list", Accept, "def f(int64 a, *, int64 b = 1):\n    return\n"),// kw-only, I#496
+    case("param_list", Accept, "def f(*, int64 b):\n    return\n"),             // kw-only only, I#496
+    case("param_list", Reject, "def f(int64 a, *):\n    return\n"),             // bare '*' with nothing after
+    case("param_list", Reject, "def f(int64 a, *, *, int64 b):\n    return\n"), // duplicate '*'
     case("decorators", Accept, "@cache\ndef f():\n    return\n"),               // D-0036
     case("decorators", Accept, "@retry(3)\ndef f():\n    return\n"),
     case("generics", Accept, "def id[T](T x) -> T:\n    return x\n"),           // D-0017

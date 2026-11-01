@@ -192,6 +192,7 @@ pub fn param(ty: Ty) -> ParamInfo {
         ty,
         has_default: false,
         variadic: false,
+        keyword_only: false,
     }
 }
 
@@ -319,6 +320,9 @@ pub struct ParamInfo {
     pub ty: Ty,
     pub has_default: bool,
     pub variadic: bool,
+    /// `true` when the parameter follows the bare `*` separator and is therefore
+    /// keyword-only (I#496): it may only be supplied by name at a call site.
+    pub keyword_only: bool,
 }
 
 #[derive(Clone)]

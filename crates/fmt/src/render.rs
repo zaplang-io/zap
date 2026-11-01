@@ -359,6 +359,22 @@ pub fn type_str(t: &Type) -> String {
     }
 }
 
+/// Render a parameter list into comma-joinable pieces, inserting a bare `*`
+/// keyword-only separator (I#496) before the first keyword-only parameter so the
+/// formatter round-trips `def f(a, *, b)`.
+pub fn param_pieces(params: &[Param]) -> Vec<String> {
+    let mut out = Vec::with_capacity(params.len() + 1);
+    let mut marked = false;
+    for p in params {
+        if p.keyword_only && !marked {
+            out.push("*".to_string());
+            marked = true;
+        }
+        out.push(param_str(p));
+    }
+    out
+}
+
 pub fn param_str(p: &Param) -> String {
     // Inline parameter decorators (I#458): `@Inject Svc dep`. Rendered as a
     // space-separated prefix so the formatter round-trips param annotations.

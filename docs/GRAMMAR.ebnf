@@ -73,7 +73,14 @@ type_args     ::= "[" type { "," type } "]" ;
                      value whose type declares that generic method), else a value
                      subscript (`__getitem__`, D-0047); sema/mono classifies it. *)
 
-param_list    ::= param { "," param } ;
+param_list    ::= [ param { "," param } "," ] "*" param { "," param }
+                | param { "," param } ;
+                  (* The first alternative carries a bare "*" separator: every
+                     parameter after it is keyword-only (I#496, D-0095, Python
+                     semantics) and may only be supplied by name at a call site.
+                     The "*" appears at most once and must be followed by at
+                     least one parameter; keyword-only parameters may be required
+                     or have a default. *)
 param         ::= { "@" dotted_name [ "(" [ arg_list ] ")" ] }
                   ( "self"
                   | type [ "..." ] IDENT [ "=" expr ] ) ;

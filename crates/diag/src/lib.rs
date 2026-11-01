@@ -277,6 +277,10 @@ define_codes! {
         "An f-string replacement field is ill-formed (D-0026): an unmatched \
          `{` or `}` (write `{{`/`}}` for a literal brace), an empty `{}`, or a \
          field whose contents are not a single valid expression.";
+    ZAP2018 = 2018 : "misplaced keyword-only marker",
+        "The bare `*` keyword-only separator in a parameter list is misplaced \
+         (I#496). It must be followed by at least one parameter — every \
+         parameter after it is keyword-only — and may appear at most once.";
 
     // ---- ZAP3xxx — name resolution / imports -------------------------------
     ZAP3001 = 3001 : "unknown name",
@@ -370,6 +374,9 @@ define_codes! {
     ZAP4028 = 4028 : "unsupported array construction",
         "Experimental arrays require one flat list literal and a supported dtype: \
          f64, i64, uint8, or bool (including their documented aliases).";
+    ZAP4029 = 4029 : "keyword-only argument supplied positionally",
+        "A parameter declared after the bare `*` separator is keyword-only \
+         (I#496) and must be passed by name (`name=value`), not positionally.";
     ZAP4030 = 4030 : "receive needs a channel",
         "The `<-` receive operator requires a channel operand.";
     ZAP4031 = 4031 : "send needs a channel",

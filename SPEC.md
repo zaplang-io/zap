@@ -457,6 +457,21 @@ connect("localhost", tls=True)
 connect(host="localhost", port=80)
 ```
 
+**Keyword-only parameters (D-0095, I#496)** — a bare `*` separator in the
+parameter list makes every parameter after it keyword-only: it may only be
+supplied by name at a call site, never positionally (Python semantics). A
+keyword-only parameter may be required or carry a default, and the `*` appears
+at most once and must be followed by at least one parameter:
+
+```python
+def open(str path, *, bool create = False, int64 mode) -> File:
+    ...
+open("a", mode=0)                    # create defaults to False
+open("a", create=True, mode=0)       # by name, in any order
+# open("a", True, 0)                 # error: create/mode are keyword-only
+# open("a")                          # error: required keyword-only `mode` omitted
+```
+
 **Variadics** — homogeneous, Java-style `TYPE... name`, received as a list:
 
 ```python
