@@ -17,13 +17,13 @@ def main():
     dict[str, int64] lookup = {"one": 1}
     print("dict", lookup["one"])
     set[int64] unique = {1, 2, 1}
-    print("set", len(unique), str(2 in unique))
+    print("set", len(unique), 2 in unique)
     list[Color] colors = [Color.RED, Color.BLUE]
     print("enum", colors[1].name)
     list[Measurement] samples = [Measurement(1.5)]
-    print("struct float", str(samples[0].value))
+    print("struct float", samples[0].value)
     auto pair = (2.5, 4)
-    print("tuple float", str(pair[0]))
+    print("tuple float", pair[0])
     auto queue = heap[int64]()
     queue.push(3)
     queue.push(1)
