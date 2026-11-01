@@ -1000,7 +1000,13 @@ fn references_optional_get(module: &Module) -> bool {
 /// other program byte-for-byte unchanged.
 pub fn with_prelude(module: &Module) -> Module {
     let full = references_prelude(module);
-    let optional_only = !full && references_optional_get(module);
+    // `dict.get(key) -> Optional[V]` produces an `Optional` without the program
+    // ever naming it. `references_optional_get` catches a parsed `.get(...)`
+    // call (#497/#555); a `.get` that occurs only inside an f-string field is
+    // hidden in the literal's text (re-parsed only at lowering), so also inject
+    // for any program that uses a dict (#498). Either way only the generic
+    // `Optional[T]` enum is added, and an unused injection emits no code.
+    let optional_only = !full && (references_optional_get(module) || uses_dict(module));
     if !full && !optional_only {
         return module.clone();
     }
@@ -1025,6 +1031,16 @@ pub fn with_prelude(module: &Module) -> Module {
         items,
         span: module.span,
     }
+}
+
+/// Does `module` use a `dict` in any form (typed binding/param/field, literal,
+/// or comprehension)? Used to make `Optional[T]` available for `dict.get`'s
+/// implicit `Optional[V]` result (#498). Like [`references_prelude`], this is a
+/// coarse scan over the AST's `Debug`; a false positive only injects the unused
+/// generic, which emits no code.
+fn uses_dict(module: &Module) -> bool {
+    let dbg = format!("{module:?}");
+    dbg.contains("\"dict\"") || dbg.contains("Dict(") || dbg.contains("DictComp")
 }
 
 struct Parser {
@@ -3194,6 +3210,7 @@ impl Parser {
                     bytes: flags.bytes,
                     fstring: flags.fstring,
                     span,
+                    fstring_fields: Vec::new(),
                 }
             }
             TokenKind::Keyword(Keyword::True) => {

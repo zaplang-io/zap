@@ -1410,8 +1410,54 @@ impl Mono<'_> {
             Expr::Float(..) => Ok((e.clone(), self.prim("float64"))),
             Expr::Imaginary(..) => Ok((e.clone(), self.prim("complex"))),
             Expr::Bool(..) => Ok((e.clone(), self.prim("bool"))),
-            Expr::Str { bytes, .. } => {
-                Ok((e.clone(), self.prim(if *bytes { "bytes" } else { "str" })))
+            Expr::Str {
+                value,
+                raw,
+                bytes,
+                fstring,
+                span,
+                ..
+            } => {
+                let cty = self.prim(if *bytes { "bytes" } else { "str" });
+                // An f-string's replacement fields are re-parsed at lowering
+                // time and so are invisible to this pass; monomorphize each one
+                // here (with the current environment) and record the rewritten
+                // expressions for lowering, so inline generics / `dict.get` in a
+                // field are specialized (#498). On any split/rewrite trouble we
+                // fall back to the untouched literal (lowering re-parses it).
+                if *fstring {
+                    let base = span.start.saturating_add(2);
+                    let (parts, errs) = zapc_syntax::fstring::split_fstring(value, base);
+                    if errs.is_empty() {
+                        let mut fields = Vec::new();
+                        let mut ok = true;
+                        for part in &parts {
+                            if let zapc_syntax::fstring::FStringPart::Field { expr, .. } = part {
+                                match self.rewrite_expr(expr, env, None) {
+                                    Ok((ne, _)) => fields.push(ne),
+                                    Err(_) => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if ok {
+                            return Ok((
+                                Expr::Str {
+                                    value: value.clone(),
+                                    raw: *raw,
+                                    bytes: *bytes,
+                                    fstring: *fstring,
+                                    span: *span,
+                                    fstring_fields: fields,
+                                },
+                                cty,
+                            ));
+                        }
+                    }
+                }
+                Ok((e.clone(), cty))
             }
             Expr::None(span) => {
                 // The `None` sink (Fork I/O): when the expected type is a generic

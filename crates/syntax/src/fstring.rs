@@ -243,10 +243,33 @@ pub fn split_fstring(value: &str, value_base: u32) -> (Vec<FStringPart>, Vec<Par
             let mut conv: Option<char> = None;
             let mut spec_range: Option<(usize, usize)> = None;
             let mut field_end: Option<usize> = None;
+            // Offset of a backslash-escaped delimiter quote (`\"`/`\'`) at the
+            // top level of the field, if any — rejected below (#498).
+            let mut escaped_quote_at: Option<usize> = None;
 
             while j < n {
                 let cj = b[j];
                 match cj {
+                    b'\\' if j + 1 < n && (b[j + 1] == b'\'' || b[j + 1] == b'"') => {
+                        // A string literal inside the field written with the
+                        // OUTER quote escaped (`\"`/`\'`). PEP 701 does not allow
+                        // this (and neither does Python 3.12+); record it so the
+                        // field is rejected with a clear message. Scan the
+                        // `\q ... \q` span so the field end is still found and we
+                        // don't emit a misleading "unterminated field" instead.
+                        if escaped_quote_at.is_none() {
+                            escaped_quote_at = Some(j);
+                        }
+                        let q = b[j + 1];
+                        j += 2;
+                        while j < n {
+                            if b[j] == b'\\' && j + 1 < n && b[j + 1] == q {
+                                j += 2;
+                                break;
+                            }
+                            j += 1;
+                        }
+                    }
                     b'\'' | b'"' => {
                         // Skip an embedded string literal so its `}`/`:`/`!`
                         // don't terminate the field.
@@ -336,6 +359,21 @@ pub fn split_fstring(value: &str, value_base: u32) -> (Vec<FStringPart>, Vec<Par
             let ee = expr_end.unwrap_or(fe.saturating_sub(1)).min(n);
             let expr_src = &value[expr_start..ee];
             let fspan = span_at(field_start, fe);
+
+            // Reject a string literal that escapes the delimiter quote (PEP 701
+            // / Python 3.12+ do not allow it): write it unescaped, reusing the
+            // outer quote (f"{d["k"]}") or using the other quote.
+            if let Some(bs) = escaped_quote_at {
+                errors.push(perr(
+                    ErrorCode::ZAP2017,
+                    "a string literal in an f-string field must not escape the \
+                     delimiter quote; write it unescaped, e.g. f\"{d[\"k\"]}\" \
+                     or f'{d[\"k\"]}'",
+                    span_at(bs, bs + 2),
+                ));
+                i = fe;
+                continue;
+            }
 
             if expr_src.trim().is_empty() {
                 errors.push(perr(
@@ -455,6 +493,50 @@ mod tests {
         let p = fields("{d[\"a}b\"]}");
         assert_eq!(p.len(), 1);
         assert!(matches!(&p[0], FStringPart::Field { .. }));
+    }
+
+    #[test]
+    fn field_with_nested_same_quote_subscript() {
+        // `{d["k"]}` — inline subscript reusing the outer quote (PEP 701).
+        let p = fields(r#"{d["k"]}"#);
+        assert_eq!(p.len(), 1);
+        assert!(matches!(&p[0], FStringPart::Field { .. }));
+    }
+
+    #[test]
+    fn field_with_nested_same_quote_call_arg() {
+        // `{d.get("k")}` — a call argument reusing the outer quote (PEP 701).
+        let p = fields(r#"{d.get("k")}"#);
+        assert_eq!(p.len(), 1);
+        assert!(matches!(&p[0], FStringPart::Field { .. }));
+    }
+
+    #[test]
+    fn escaped_delimiter_quote_is_rejected() {
+        // Escaping the delimiter quote (`\"`/`\'`) is not allowed (PEP 701):
+        // one clear ZAP2017, not a misleading "unterminated field".
+        for src in [r#"{d.get(\"k\")}"#, r#"{d.get(\'k\')}"#, r#"{d[\"k\"]}"#] {
+            let (_p, errs) = split_fstring(src, 0);
+            assert_eq!(errs.len(), 1, "{src:?} should give exactly one error");
+            assert_eq!(errs[0].code, ErrorCode::ZAP2017, "{src:?}");
+            assert!(
+                errs[0]
+                    .message
+                    .contains("must not escape the delimiter quote"),
+                "{src:?}: {}",
+                errs[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn genuinely_unterminated_field_still_errors() {
+        // No closing `}` — ZAP2017 must still fire, even with a nested string.
+        let (_p, errs) = split_fstring(r#"{d["k"]"#, 0);
+        assert!(
+            errs.iter().any(|e| e.code == ErrorCode::ZAP2017),
+            "expected ZAP2017 for an unterminated field, got {errs:?}"
+        );
     }
 
     #[test]

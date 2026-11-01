@@ -1166,6 +1166,48 @@ mod tests {
         assert_eq!(n, 1, "shared decode core should be generated once, got {n}");
     }
 
+    // --- f-string replacement fields (#498) ---
+
+    #[test]
+    fn fstring_field_dict_get_is_monomorphized() {
+        // #498: `dict.get(key)` used directly in an f-string field lowers
+        // cleanly — monomorphization sees the re-parsed field (threaded via
+        // `fstring_fields`), instantiates `Optional$str`, and emits the dict.get
+        // runtime call. Without the fix this errored with ZAP6001.
+        let m = lower_ok(
+            "def main():\n    dict[str, str] d = {\"k\": \"v\"}\n    print(f\"{d.get(\"k\")}\")\n",
+        );
+        let has_get = m
+            .funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::Call { func, .. } if func.starts_with("zap_dict_get")));
+        assert!(
+            has_get,
+            "expected a zap_dict_get_* call lowered from the field"
+        );
+    }
+
+    #[test]
+    fn fstring_field_optional_renders() {
+        // #498: an `Optional[T]` field lowers (null-niche check + "None"
+        // literal) rather than erroring as non-renderable.
+        let m = lower_ok(
+            "def main():\n    Optional[str] o = Optional.Some(\"v\")\n    print(f\"{o}\")\n",
+        );
+        let has_none = m
+            .funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::StrConst { bytes, .. } if bytes == b"None"));
+        assert!(
+            has_none,
+            "expected a \"None\" literal from Optional rendering"
+        );
+    }
+
     // --- operator overloading (ticket #52, D-0047) ---
 
     #[test]

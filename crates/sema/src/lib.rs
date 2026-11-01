@@ -2802,9 +2802,19 @@ impl Checker {
     }
 
     /// A value is renderable to text (via `str()` / an f-string field) when it
-    /// is a scalar, char, bool or string. General user-type rendering is the
-    /// Display protocol (#274), out of scope here.
+    /// is a scalar, char, bool or string, or an `Optional[T]` of one (rendered
+    /// as its payload when present, `None` when absent — #498, matching
+    /// Python's `f"{d.get(k)}"`). General user-type rendering is the Display
+    /// protocol (#274), out of scope here.
     fn check_renderable(&mut self, ty: &Ty, span: Span) {
+        // `Optional[T]` is the prelude generic enum (I#154); sema tracks it
+        // opaquely as `Named("Optional")` without its payload type, so the
+        // payload's own renderability is enforced later by the lowerer.
+        if let Ty::Named(n) = ty {
+            if n == "Optional" || n.starts_with("Optional$") {
+                return;
+            }
+        }
         if !matches!(ty, Ty::Str | Ty::Char | Ty::Bool | Ty::Unknown | Ty::Py) && !ty.is_numeric() {
             self.error(
                 ErrorCode::ZAP4024,
@@ -6462,6 +6472,31 @@ def main():
     print(a.unwrap())
     print(a.is_some())
     print(b.unwrap_or("x"))
+"#);
+    }
+
+    #[test]
+    fn optional_is_renderable_in_fstring() {
+        // #498: an `Optional[T]` field renders (payload when present, `None`
+        // when absent) rather than being rejected as a non-renderable type.
+        ok(r#"
+def main():
+    Optional[str] o = Optional.Some("v")
+    Optional[int64] n = None
+    print(f"{o}")
+    print(f"n={n}")
+"#);
+    }
+
+    #[test]
+    fn dict_get_renders_in_fstring() {
+        // #498: `dict.get(key) -> Optional[V]` used directly in an f-string field
+        // type-checks (the field is renderable; the Optional payload is known).
+        ok(r#"
+def main():
+    dict[str, str] d = {"k": "v"}
+    print(f"{d.get("k")}")
+    print(f"{d["k"]}")
 "#);
     }
 

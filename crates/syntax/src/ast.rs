@@ -588,6 +588,16 @@ pub enum Expr {
         bytes: bool,
         fstring: bool,
         span: Span,
+        /// Monomorphized replacement-field expressions, in source order, for an
+        /// f-string (`fstring == true`). Empty everywhere else, and empty until
+        /// monomorphization fills it (#498): the parser leaves f-string fields
+        /// inside `value`, and sema/lowering re-split them. Because f-string
+        /// field expressions are re-parsed at lowering time they are invisible
+        /// to the monomorphization pass, so inline generics/`dict.get` in a
+        /// field would never be specialized; monomorphization records the
+        /// rewritten field expressions here for lowering to use instead of the
+        /// freshly-parsed ones.
+        fstring_fields: Vec<Expr>,
     },
     Bool(bool, Span),
     None(Span),
