@@ -994,6 +994,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let f = self.ctx.f64_type();
         self.declare_rt("zap_array_new", &[i.into(), i.into()], Some(p.into()));
         self.declare_rt("zap_array_len", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_array_check_shape", &[p.into(), p.into()], None);
         self.declare_rt("zap_array_data", &[p.into()], Some(p.into()));
         // array slice `a[lo:hi]` -> a VIEW sharing the buffer (D-0030, contiguous
         // only). Bounds `(lo, hi)` + their present-flags; no step (strided views

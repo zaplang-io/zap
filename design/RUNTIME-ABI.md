@@ -139,7 +139,9 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
 ### Collection layout (coordinate with #21)
 
 - `list[T]`: `[ header | len: i64 | cap: i64 | data: *T ]`. Elements are unboxed
-  for scalar `T`, pointers for reference `T`. Amortized-doubling growth.
+  for supported scalar `T`, pointers for reference `T`. Native floats are not
+  supported in direct collection slots; dense floats use `array[f64]` (I#476).
+  Amortized-doubling growth.
   Stable sort (#336): `xs.sort()` sorts in place and `sorted(xs)` returns a new
   list (`zap_list_copy` makes the shallow copy first, leaving the input
   untouched). Both lower to one core entry point, `zap_list_sort_by(dst, keys,
@@ -185,8 +187,12 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
   sees only the lossy element *kind*, so monomorphization — which alone knows the
   concrete `V` — encodes the `Optional$V` instance into the method symbol
   (`get$Optional$str`) for lowering to pick the right niche/tagged enum.
-- `array[T]` (#24, #49): `[ header | dtype | ndim | dims: *i64 | strides: *i64 |
-  data: *T ]`, contiguous row-major; views share `data`. `dtype` tags the
+- `array[T]` (#24, #49, #476): `[ header | dtype | ndim | dims: *i64 |
+  data: *T | off: i64 ]`. The current layout is 1-D (`ndim = 1`); it has no
+  strides. Contiguous views share the buffer base and retain an element offset
+  in `off`; `zap_array_data` returns the window start for SIMD kernels.
+  `zap_array_check_shape(lhs, rhs)` checks equal lengths and raises `ValueError`
+  before a binary kernel reads its buffers. `dtype` tags the
   element type — `0 = f64`, `1 = i64` (8-byte words), `2 = uint8`, `3 = bool`
   (1-byte words). `zap_array_new(dtype, len)` sizes the buffer by dtype; `uint8`
   /`bool` cross the typed get/set/sum entry points as `i64` words (get

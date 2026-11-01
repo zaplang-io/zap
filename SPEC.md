@@ -264,6 +264,14 @@ prelude `Optional[T]` (D-0065) is the canonical optional type (Python
 
 Built-in containers are generic today (`list[T]`, `dict[K,V]`, `set[T]`,
 `array[T]`).
+
+Native floating-point values are currently unsupported as direct `list`, `dict`
+(key or value), `set`, `heap`, or `channel` elements (`ZAP4027`). Integer, boolean,
+character, string/bytes, enum, and supported reference/aggregate element types
+retain their existing storage rules; tuple and struct fields may be floats.
+Use `array[f64]` for dense floating-point data. `array` dtypes have the narrower
+Experimental contract in §15; `bigint` and `complex` collection elements are
+also unsupported.
 User-defined generics (monomorphized) are staged in later; the syntax is
 reserved now:
 
@@ -719,13 +727,38 @@ if line =~ m/(?<year>\d{4})-(?<month>\d{2})/ as mt:
 
 ## 15. Numeric arrays (D-0011)
 
-Dense, shaped, SIMD-accelerated numeric arrays — no import. Slices are **views**
-(D-0030). See `design/0002-arrays.md`.
+The current **Experimental** surface is dense, one-dimensional numeric arrays
+with SIMD element-wise kernels. `len(a)` is the length; shape tuples and
+multi-axis indexing are not exposed. This is the supported subset of the
+longer-term N-D design in `design/0002-arrays.md`.
+
+| Surface | Supported now |
+| --- | --- |
+| Dtypes | `f64`/`float64`, `i64`/`int64`, `uint8`/`u8`, `bool` |
+| Construction | One positional, flat list literal: `array[f64]([1, 2.5])`; empty literals are allowed |
+| Access | One integer index for get/set; use an in-bounds, nonnegative index |
+| Arithmetic | Element-wise `+`, `-`, `*`; two arrays require equal lengths |
+| Scalar broadcast | `a + n`, `a - n`, `a * n`; `n + a` and `n * a` |
+| Reduction | `sum(a)` returns `f64` for `f64`, otherwise `int64` |
+| Slicing | Contiguous views `a[lo:hi]`, with omitted bounds or literal step `1`; writes alias the parent |
+
+Mixed array dtypes promote on `bool < uint8 < i64 < f64`; arithmetic on two
+boolean arrays yields `uint8`. Integer scalars retain the array dtype (boolean
+arithmetic promotes to `uint8`), while floating scalars promote to `f64`.
+`uint8` arithmetic wraps modulo 256. Unequal array lengths raise catchable
+`ValueError` before the SIMD kernel reads the buffers.
+
+N-D literals, list-variable/iterable constructors, `zeros`/`arange`, `f32`/`i32`
+dtypes, element-wise unary negation/bitwise operations, array division/comparisons,
+axis reductions, broadcasting beyond a
+scalar, `scalar - array`, and strided/reversed array views are unsupported.
+Semantic or lowering diagnostics reject these forms.
 
 ```python
 auto a = array[f64]([1, 2, 3])
-auto c = a + 1.0          # element-wise + scalar broadcast (SIMD)
-auto col = m[:, 1]        # a view
+auto c = a + 1.0
+auto window = a[1:3]      # contiguous view
+window[0] = 9.0          # a[1] is now 9.0
 ```
 
 ---

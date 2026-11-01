@@ -25,6 +25,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- Array length mismatches raise `ValueError` before SIMD kernels run; the
+  Experimental array contract records supported 1-D dtypes, construction,
+  arithmetic and contiguous views. Unsupported array constructors and native
+  floating-point collection slots have semantic diagnostics (#476).
+
 - Scope cleanup cancels and awaits children on return/break/continue; unsupported
   spawn call forms now report `ZAP5076` during semantic checking (#475). The
   concurrency contract documents supported scope options without a timeout API.

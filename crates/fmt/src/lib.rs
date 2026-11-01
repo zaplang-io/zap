@@ -1090,6 +1090,16 @@ mod tests {
     use super::format_source;
 
     #[test]
+    fn array_collection_contract_fixtures_are_formatted() {
+        for source in [
+            include_str!("../../../tests/conformance/array_contract.zap"),
+            include_str!("../../../tests/conformance/collection_elements.zap"),
+        ] {
+            assert_eq!(format_source(source).unwrap(), source);
+        }
+    }
+
+    #[test]
     fn scope_cleanup_fixture_is_formatted() {
         let source = include_str!("../../../tests/conformance/scope_cleanup.zap");
         assert_eq!(format_source(source).unwrap(), source);

@@ -38,6 +38,43 @@ mod tests {
     }
 
     #[test]
+    fn lower_array_collection_contract_fixtures() {
+        let module = lower_ok(include_str!(
+            "../../../tests/conformance/array_contract.zap"
+        ));
+        assert!(format!("{module}").contains("zap_array_check_shape"));
+        lower_ok(include_str!(
+            "../../../tests/conformance/collection_elements.zap"
+        ));
+    }
+
+    #[test]
+    fn unsupported_array_operations_have_lowering_errors() {
+        for (operation, message) in [
+            ("auto x = a[::2]", "stepped array slice"),
+            ("auto x = a[::-1]", "stepped array slice"),
+            ("auto x = a / a", "only +, -, and *"),
+            ("auto x = 1 - a", "scalar-on-the-left"),
+            ("auto x = a[0, 1]", "one integer index"),
+            ("a[0, 1] = 2", "one integer index"),
+            ("auto x = a[0.5:]", "slice bounds must be integers"),
+            ("auto x = a.shape", "array attribute 'shape' is unsupported"),
+            ("auto x = a == a", "only +, -, and *"),
+            ("auto x = -a", "unary array operations are unsupported"),
+            ("a[0] = \"x\"", "assignment requires a numeric scalar"),
+        ] {
+            let source = format!("def main():\n    auto a = array[i64]([1,2])\n    {operation}\n");
+            let (ast, parse, lex) = parse_str(&source);
+            assert!(parse.is_empty() && lex.is_empty());
+            let (_, errors) = lower_module(&ast);
+            assert!(
+                errors.iter().any(|e| e.message.contains(message)),
+                "{operation}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn lower_scope_cleanup_conformance() {
         let module = lower_ok(include_str!("../../../tests/conformance/scope_cleanup.zap"));
         let early = module

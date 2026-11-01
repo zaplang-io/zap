@@ -164,7 +164,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | ENUM-1 | §4.6 | tier-1 enum: distinct type, `.name`, iterable (D-0018) | covered | enum_tier1_iteration |
 | ENUM-2 | §4.6 | tier-3 data-carrying variants destructured by `match`, exhaustive (D-0046) | TODO | — |
 | OPT-1 | §4.6 | prelude `Optional[T]` is the canonical optional type (D-0065) | TODO | — |
-| GEN-1 | §4.7 | built-in containers are generic (`list`/`dict`/`set`/`array`) | TODO | — |
+| GEN-1 | §4.7 | built-in containers are generic (`list`/`dict`/`set`/`array`) | covered | collection_elements |
 
 ## Operators overloading, modules, concurrency, cleanup (§5, §11–§13)
 
@@ -181,6 +181,6 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 
 | Claim | Section | Statement | Status | Case |
 |---|---|---|---|---|
-| ARR-1 | §15 | numeric array: element-wise ops + scalar broadcast; slices are views (D-0011) | TODO | — |
+| ARR-1 | §15 | numeric array: element-wise ops + scalar broadcast; slices are views (D-0011) | covered | array_contract |
 | DEC-1 | §16 | `@derive(...)` generates field-by-field code at compile time (D-0036) | TODO | — |
 | DEC-2 | §16 | multiple decorators stack bottom-up | TODO | — |
