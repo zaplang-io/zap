@@ -972,23 +972,52 @@ fn references_prelude(module: &Module) -> bool {
     NEEDLES.iter().any(|n| dbg.contains(n))
 }
 
+/// Does `module` contain a `.get(...)` attribute access? The built-in
+/// `dict.get(key)` returns the prelude `Optional[V]` (I#154/#281) without the
+/// program ever spelling `Optional`, so an inline `d.get(k).unwrap_or(...)`
+/// still needs the `Optional[T]` enum injected even though [`references_prelude`]
+/// — which keys off the spelled type name — does not fire (#497). The scan is
+/// over the derived `Debug` of the AST for the `name: "get"` field of an
+/// `Expr::Attr`, mirroring the quoted-needle style of [`references_prelude`]. A
+/// false positive (a `.get` on some other receiver) only injects an *unused*
+/// generic `Optional[T]`, which monomorphization drops (it emits no code), so it
+/// never changes observable behaviour or output.
+fn references_optional_get(module: &Module) -> bool {
+    format!("{module:?}").contains("name: \"get\"")
+}
+
 /// Return `module` augmented with the built-in [`prelude_items`] when it uses the
 /// signals surface (see [`references_prelude`]); otherwise return a plain clone.
 /// A prelude item is skipped if the user already declares a type of that name, so
 /// user code can still shadow `Signal`/`MemStats` without a duplicate-definition
 /// error. Both the type checker and the lowerer apply this, so they agree on the
 /// surface a program sees (ticket #77, D-0058).
+///
+/// When the heavier prelude surface is not referenced but the program uses a
+/// `.get(...)` call (see [`references_optional_get`]), only the generic
+/// `Optional[T]` enum is injected — just enough for an inline
+/// `d.get(k).unwrap_or(...)` to resolve and monomorphize (#497) — keeping every
+/// other program byte-for-byte unchanged.
 pub fn with_prelude(module: &Module) -> Module {
-    if !references_prelude(module) {
+    let full = references_prelude(module);
+    let optional_only = !full && references_optional_get(module);
+    if !full && !optional_only {
         return module.clone();
     }
     let user_names: std::collections::HashSet<&str> =
         module.items.iter().filter_map(item_type_name).collect();
     let mut items: Vec<crate::ast::Item> = prelude_items()
         .into_iter()
-        .filter(|it| match item_type_name(it) {
-            Some(n) => !user_names.contains(n),
-            None => true,
+        .filter(|it| {
+            // In the `Optional`-only path, inject nothing but the `Optional[T]`
+            // enum (it is self-contained — its methods reference only itself).
+            if optional_only {
+                return item_type_name(it) == Some("Optional") && !user_names.contains("Optional");
+            }
+            match item_type_name(it) {
+                Some(n) => !user_names.contains(n),
+                None => true,
+            }
         })
         .collect();
     items.extend(module.items.iter().cloned());
@@ -4321,5 +4350,65 @@ mod tests {
             panic!("expected LetTuple for a 1-tuple target");
         };
         assert!(matches!(target, BindTarget::Tuple(elems, _) if elems.len() == 1));
+    }
+
+    // --- prelude injection (ticket #77, #281, #497) ---
+
+    /// The names of the top-level types `with_prelude` leaves in the module.
+    fn type_names(m: &Module) -> Vec<String> {
+        m.items
+            .iter()
+            .filter_map(|it| item_type_name(it).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn plain_program_gets_no_prelude() {
+        // A program that touches no prelude surface is byte-for-byte unchanged:
+        // nothing is injected (ticket #77, D-0058).
+        let m = with_prelude(&parse_ok("def main():\n    print(1)\n"));
+        assert!(
+            !type_names(&m).iter().any(|n| n == "Optional"),
+            "no prelude type should be injected: {:?}",
+            type_names(&m)
+        );
+    }
+
+    #[test]
+    fn inline_dict_get_injects_only_optional() {
+        // `d.get(k)` returns the prelude `Optional[V]` (#281) even when the
+        // program never spells `Optional`, so an inline `d.get(k).unwrap_or(...)`
+        // must still get the enum injected (#497) — but ONLY that enum, so a
+        // program using `.get` and nothing else stays lean (no `Signal`,
+        // `DateTime`, `Thread`, … dragged in).
+        let m = with_prelude(&parse_ok(
+            "def main():\n    dict[str, str] d = {\"k\": \"v\"}\n    print(d.get(\"k\").unwrap_or(\"x\"))\n",
+        ));
+        let names = type_names(&m);
+        assert!(
+            names.iter().any(|n| n == "Optional"),
+            "`.get` must pull in the prelude `Optional[T]`: {names:?}"
+        );
+        for heavy in ["Signal", "MemStats", "DateTime", "Thread", "Atomic"] {
+            assert!(
+                !names.iter().any(|n| n == heavy),
+                "the `Optional`-only path must not inject {heavy}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn naming_optional_injects_full_prelude() {
+        // Spelling `Optional` (the annotated-local form) takes the full-prelude
+        // path, unchanged by #497: the heavier surface rides along as before.
+        let m = with_prelude(&parse_ok(
+            "def main():\n    Optional[int64] x = Optional.Some(1)\n    print(x.unwrap_or(0))\n",
+        ));
+        let names = type_names(&m);
+        assert!(names.iter().any(|n| n == "Optional"), "{names:?}");
+        assert!(
+            names.iter().any(|n| n == "DateTime"),
+            "the full prelude should ride along when a needle fires: {names:?}"
+        );
     }
 }

@@ -95,6 +95,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | DICT-2 | §18 | dict iterates keys; `values()`; `k in d`; order unspecified (#299) | covered | dict_iteration |
 | DICT-3 | §18 | `d.items()` yields `(k, v)` pairs | TODO | — |
 | DICT-4 | §18 | `d[missing]` is a catchable fault (not `get`) | TODO | — |
+| DICT-5 | §18 | inline `d.get(k).unwrap_or(default)` chains without an annotated local (#497) | covered | dict_get_inline_optional |
 
 ## Exceptions (§10, D-0007)
 

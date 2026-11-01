@@ -6465,6 +6465,20 @@ def main():
 "#);
     }
 
+    #[test]
+    fn inline_dict_get_is_a_method_receiver() {
+        // The `Optional[V]` from `d.get(k)` is a method receiver in its own
+        // right: an inline `d.get(k).unwrap_or(...)` / `.is_none()` type-checks
+        // and dispatches without first binding to an annotated `Optional[V]`
+        // local, and without the program ever spelling `Optional` (#497).
+        ok(r#"
+def main():
+    dict[str, str] d = {"k": "v"}
+    print(d.get("k").unwrap_or("x"))
+    print(str(d.get("absent").is_none()))
+"#);
+    }
+
     // --- interfaces (ticket #84, D-0016) ---
 
     const SHAPE_IFACE: &str =
