@@ -528,7 +528,7 @@ Value ⇄ string conversion builtins (#285/#282, D-0026):
 |---|---|---|
 | `str(x)` | `str` | renders an int/float/bool/char/str; decodes `bytes` as UTF-8 (raises on invalid); user types → Display protocol, #274 |
 | `bytes(x)` | `bytes` | `bytes()` empty · `bytes(str)` UTF-8 encode · `bytes(list[int])` each byte `0..=255` (#337) |
-| `int(s)` | `int64` | parses a decimal integer; faults on a malformed string |
+| `int(s)` | `int64` | parses a decimal integer; raises a catchable `ValueError` on a malformed string (#456) |
 | `float(s)` | `float64` | parses a float; faults on a malformed string (also converts a number/bool) |
 | `bool(x)` | `bool` | Python truthiness: a number/char is false at zero, a str false when empty, a bool is itself |
 | `format(x, spec)` | `str` | renders `x` through the format spec (§9.3); `spec` is a string literal in v1 |

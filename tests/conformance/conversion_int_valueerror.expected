@@ -1,0 +1,4 @@
+caught
+invalid literal for int() with base 10: 'abc'
+after
+-42

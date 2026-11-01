@@ -2648,9 +2648,9 @@ void *zap_char_to_str(int32_t cp) {
 }
 
 /* int(s): parse a decimal integer, Python-style (surrounding ASCII whitespace
- * allowed, optional sign, at least one digit, nothing else). Faults on a
- * malformed string (the typed `ValueError` lands with the exception runtime).
- * Distinct from the lenient `zap_str_to_i64` the CSV codec uses. */
+ * allowed, optional sign, at least one digit, nothing else). Raises a catchable
+ * `ValueError` on a malformed string (Python parity), so `try/except` can
+ * recover. Distinct from the lenient `zap_str_to_i64` the CSV codec uses. */
 int64_t zap_str_parse_int(void *sp) {
     const ZapStr *s = (const ZapStr *)sp;
     const char *d = s->data;
@@ -2675,8 +2675,17 @@ int64_t zap_str_parse_int(void *sp) {
         i++;
     }
     if (digits == 0 || i != n) {
-        fprintf(stderr, "zap: int() cannot parse an integer from this string\n");
-        abort();
+        char buf[128];
+        int m = snprintf(buf, sizeof buf,
+                         "invalid literal for int() with base 10: '%.*s'",
+                         (int)s->len, s->data);
+        if (m < 0) {
+            m = 0;
+        }
+        if (m >= (int)sizeof buf) {
+            m = (int)sizeof buf - 1;
+        }
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(buf, (int64_t)m));
     }
     return neg ? -(int64_t)acc : (int64_t)acc;
 }
