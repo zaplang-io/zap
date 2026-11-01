@@ -2789,3 +2789,39 @@ positionals, so an API could not *force* call-site keyword use the way
 Python/boto3-style signatures do — the gap surfaced writing the AWS SDK
 credential chain. Reusing Python's exact `*` marker closes it with no new
 concept and no backend cost.
+
+## D-0096 — Socket read deadline: `net.set_read_timeout` + `TimeoutError` (I#485)
+**Status:** Locked — adds a Zap-visible read timeout to the `net`/`http` server surface (D-0056).
+
+`net.recv` and `http.read_request` previously parked on the netpoller with the
+deadline hard-coded to `0` (park forever), so a server built on the stdlib
+`net`/`http` (e.g. zaplang-io/fastzap) could not bound how long a socket read
+blocks — an idle keep-alive connection, or an abandoned/slowloris client, held a
+coroutine + fd until the peer closed. The netpoller already took an absolute
+`deadline_ns`; this decision plumbs it to a Zap API.
+
+**Surface.** `net.set_read_timeout(conn, ms)` stores a per-read deadline on the
+socket handle. `ms == 0` is the default (no timeout, park forever, behaviourally
+identical to before); a negative `ms` raises `ValueError`. The timeout is a
+**property on the connection**, not a `recv_timeout` call variant, so it composes
+uniformly with `http.read_request`'s internal recv loop and with the future TLS
+transport seam (I#556) without threading a timeout argument through every read.
+
+**Semantics.** The timeout bounds a **single wait-for-readiness** (SO_RCVTIMEO
+style), recomputed into an absolute monotonic deadline on each park. It therefore
+caps each idle wait rather than a whole multi-chunk operation — which directly
+solves the stated case (a connection idle-parked between keep-alive requests times
+out after `ms`). Bounding a whole slow-dribble (mid-request slowloris) request
+would need a total-request deadline; that is a tracked follow-up, not this change.
+
+**Outcome.** When the deadline elapses the read raises **`TimeoutError`** (new
+built-in exception, derives from `Exception`), *not* a bare empty string — an
+empty `recv` already means clean EOF, so a distinct type is what lets a server
+tell "idle timeout" from "client closed." `recv`/`read_request` already lower as
+throwing calls (`invoke`), and the timeout is raised through the same
+`zap_panic_typed`/`__cxa_throw` path as every other runtime error, so it is caught
+by `try` rather than aborting.
+
+**Default path unchanged.** With no timeout set (the default), every read passes
+`0` to the park primitive exactly as before; `connect`/`accept`/`send` always pass
+`0` (no write/accept deadline). The no-timeout path is byte-for-byte identical.

@@ -619,14 +619,17 @@ finally:
 - Built-in exception types are `BaseException`, `Exception`, `ValueError`,
   `TypeError`, `LookupError`, `IndexError`, `KeyError`, `ArithmeticError`,
   `ZeroDivisionError`, `RuntimeError`, `StopIteration`, `Cancelled`,
-  `ScopeTimeout`, and `ExceptionGroup`. `IndexError` and `KeyError` derive from
-  `LookupError`; `ZeroDivisionError` derives from `ArithmeticError`; those
+  `ScopeTimeout`, `ExceptionGroup`, and `TimeoutError`. `IndexError` and `KeyError`
+  derive from `LookupError`; `ZeroDivisionError` derives from `ArithmeticError`; those
   intermediate types derive from `Exception`. `Cancelled` derives directly from
   `BaseException`, so `except Exception` does not suppress cancellation.
   `ScopeTimeout` (raised to the caller when a `scope(timeout=…)` deadline expires)
-  derives from `Exception` and so is catchable by `except Exception`. The remaining
-  listed leaf types derive from `Exception`; `Exception` derives from
-  `BaseException`.
+  derives from `Exception` and so is catchable by `except Exception`. `TimeoutError`
+  (raised when a socket read exceeds the deadline set by `net.set_read_timeout`)
+  likewise derives from `Exception`, and is distinct from a clean EOF (an empty
+  `net.recv` result) so a server can tell an idle/read timeout apart from a peer
+  close. The remaining listed leaf types derive from `Exception`; `Exception`
+  derives from `BaseException`.
 - `raise E(message)` constructs a typed built-in exception. Raising a string is
   shorthand for raising `Exception(message)`. A typed `except E` catches `E`
   and its subclasses; clauses are tested in source order. A bare `except` is a

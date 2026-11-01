@@ -467,6 +467,11 @@ enum {
      * ordinary catchable exception under `Exception` — distinct from `Cancelled`,
      * which the cancelled children receive and which stays outside `Exception`. */
     ZAP_EXC_SCOPE_TIMEOUT = 14,
+    /* Raised by a socket read that exceeds its `net.set_read_timeout` deadline
+     * (I#485). Distinct from a clean EOF (an empty `recv` result) so a server can
+     * tell an idle/read timeout apart from a peer close. An ordinary catchable
+     * exception under `Exception`. */
+    ZAP_EXC_TIMEOUT_ERROR = 15,
 };
 
 void *zap_exception_new(int64_t type_id, void *message) {
@@ -488,7 +493,7 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_VALUE_ERROR: case ZAP_EXC_TYPE_ERROR: case ZAP_EXC_LOOKUP_ERROR:
     case ZAP_EXC_ARITHMETIC_ERROR: case ZAP_EXC_RUNTIME_ERROR:
     case ZAP_EXC_STOP_ITERATION: case ZAP_EXC_EXCEPTION_GROUP:
-    case ZAP_EXC_SCOPE_TIMEOUT:
+    case ZAP_EXC_SCOPE_TIMEOUT: case ZAP_EXC_TIMEOUT_ERROR:
         return ZAP_EXC_EXCEPTION;
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
     case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;
@@ -3596,6 +3601,7 @@ static int64_t zap_py_exception_type_id(const char *name) {
     if (strcmp(name, "RuntimeError") == 0) return ZAP_EXC_RUNTIME_ERROR;
     if (strcmp(name, "ExceptionGroup") == 0) return ZAP_EXC_EXCEPTION_GROUP;
     if (strcmp(name, "ScopeTimeout") == 0) return ZAP_EXC_SCOPE_TIMEOUT;
+    if (strcmp(name, "TimeoutError") == 0) return ZAP_EXC_TIMEOUT_ERROR;
     if (strcmp(name, "BaseException") == 0) return ZAP_EXC_BASE;
     return ZAP_EXC_EXCEPTION;
 }
@@ -13186,6 +13192,10 @@ static char *zap_net_dupz(const ZapStr *s) {
 typedef struct {
     zap_fd_t fd;
     void *pd;
+    /* Per-read deadline in milliseconds set via `net.set_read_timeout` (I#485);
+     * 0 = no timeout (park forever, the default). Consulted by `recv` and by
+     * `http.read_request`'s recv loop, which bound each wait-for-readiness. */
+    int64_t read_timeout_ms;
 } ZapSock;
 
 static const ZapTypeDesc zap_desc_sock = {(int64_t)sizeof(ZapSock), ZAP_TD_ATOMIC, 0, NULL};
@@ -13198,18 +13208,29 @@ static ZapSock *zap_sock_wrap(zap_fd_t fd) {
     ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
     s->fd = fd;
     s->pd = pd;
+    s->read_timeout_ms = 0; /* ATOMIC objects are not zeroed; init explicitly. */
     return s;
 }
 
 /* Park until `fd` is ready for `mode` (ZAP_POLL_READ / ZAP_POLL_WRITE). With the
  * netpoller this frees the M; without it (pd == NULL) fall back to a blocking
  * poll() bracketed by enter/leave_blocking so the collector treats us as stopped.
- * Returns 0 on readiness, -1 if the descriptor was closed under us. */
-static int zap_sock_park(zap_fd_t fd, void *pd, int mode) {
+ * `timeout_ms` bounds this single wait (0 = no timeout, the default); it is
+ * recomputed into an absolute monotonic deadline per park (SO_RCVTIMEO-style),
+ * so it caps each wait-for-readiness rather than a whole multi-read operation.
+ * Returns 0 on readiness, -1 if the descriptor was closed under us, -2 on a
+ * timeout. Writers (connect/accept/send) pass 0 and only test `< 0`. */
+static int zap_sock_park(zap_fd_t fd, void *pd, int mode, int64_t timeout_ms) {
     if (pd) {
-        int64_t r = zap_netpoll_wait(pd, mode, 0);
-        return (r == ZAP_POLL_CLOSED) ? -1 : 0;
+        int64_t deadline_ns = (timeout_ms > 0) ? np_now_ns() + timeout_ms * 1000000LL : 0;
+        int64_t r = zap_netpoll_wait(pd, mode, deadline_ns);
+        if (r == ZAP_POLL_CLOSED) {
+            return -1;
+        }
+        return (r == ZAP_POLL_TIMEOUT) ? -2 : 0;
     }
+    /* poll() timeout is a relative int ms; -1 means block forever. */
+    int poll_ms = (timeout_ms > 0) ? (int)timeout_ms : -1;
 #if defined(ZAP_PLATFORM_WINDOWS)
     /* The netpoller is always available on Windows (IOCP), so this is only a
      * defensive fallback. WSAPoll is the poll() analogue. */
@@ -13218,25 +13239,35 @@ static int zap_sock_park(zap_fd_t fd, void *pd, int mode) {
     pfd.events = (SHORT)((mode == ZAP_POLL_READ) ? POLLRDNORM : POLLWRNORM);
     pfd.revents = 0;
     zap_enter_blocking();
-    WSAPoll(&pfd, 1, -1);
+    int n = WSAPoll(&pfd, 1, poll_ms);
     zap_leave_blocking();
-    return 0;
+    return (n == 0 && poll_ms >= 0) ? -2 : 0;
 #else
     struct pollfd pfd;
     pfd.fd = fd;
     pfd.events = (short)((mode == ZAP_POLL_READ) ? POLLIN : POLLOUT);
     pfd.revents = 0;
     zap_enter_blocking();
+    int n;
     /* Retry on EINTR: a profiler SIGPROF sample (ticket #78) — or any async
      * signal — interrupts poll(), which SA_RESTART does NOT auto-resume. */
-    while (poll(&pfd, 1, -1) < 0 && errno == EINTR) {
+    while ((n = poll(&pfd, 1, poll_ms)) < 0 && errno == EINTR) {
     }
     zap_leave_blocking();
-    return 0;
+    return (n == 0 && poll_ms >= 0) ? -2 : 0;
 #endif
 }
 
-/* ---- net.listen / connect / accept / recv / send / port / close ----------- */
+/* Raise the catchable timeout exception (I#485): a socket read exceeded its
+ * `net.set_read_timeout` deadline. Distinct type (TimeoutError) so it is told
+ * apart from a clean EOF; thrown via the typed-panic/invoke path so it is caught
+ * inside a `try` rather than aborting. */
+static void zap_net_timeout_panic(void) {
+    zap_panic_typed(ZAP_EXC_TIMEOUT_ERROR, zap_str_new("net: read timed out", 19));
+}
+
+/* ---- net.listen / connect / accept / recv / send / port / set_read_timeout /
+ * close --------------------------------------------------------------------- */
 
 /* Resolve host:port into an addrinfo list for a STREAM socket. `passive` adds
  * AI_PASSIVE (bind side). getaddrinfo can block on real DNS, so it is bracketed
@@ -13328,7 +13359,7 @@ void *zap_net_connect(void *host_, int64_t port) {
                 continue;
             }
             if (ZAP_SOCK_INPROGRESS(e) || ZAP_SOCK_ALREADY(e)) {
-                if (zap_sock_park(fd, pd, ZAP_POLL_WRITE) < 0) {
+                if (zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0) < 0) {
                     break;
                 }
                 int soerr = 0;
@@ -13352,6 +13383,7 @@ void *zap_net_connect(void *host_, int64_t port) {
             ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
             s->fd = fd;
             s->pd = pd;
+            s->read_timeout_ms = 0; /* ATOMIC objects are not zeroed. */
             return s;
         }
         if (pd) {
@@ -13381,7 +13413,7 @@ void *zap_net_accept(void *l_) {
             continue;
         }
         if (ZAP_SOCK_WOULDBLOCK(e)) {
-            if (zap_sock_park(lfd, lpd, ZAP_POLL_READ) < 0) {
+            if (zap_sock_park(lfd, lpd, ZAP_POLL_READ, 0) < 0) {
                 zap_net_panic("net: accept on a closed listener");
                 return NULL;
             }
@@ -13399,6 +13431,7 @@ void *zap_net_recv(void *c_, int64_t n) {
     ZapSock *c = (ZapSock *)c_;
     zap_fd_t fd = c->fd;
     void *pd = c->pd;
+    int64_t timeout_ms = c->read_timeout_ms;
     if (n < 0) {
         n = 0;
     }
@@ -13419,7 +13452,13 @@ void *zap_net_recv(void *c_, int64_t n) {
             continue;
         }
         if (ZAP_SOCK_WOULDBLOCK(e)) {
-            if (zap_sock_park(fd, pd, ZAP_POLL_READ) < 0) {
+            int p = zap_sock_park(fd, pd, ZAP_POLL_READ, timeout_ms);
+            if (p == -2) {
+                free(buf);
+                zap_net_timeout_panic();
+                return NULL;
+            }
+            if (p < 0) {
                 got = 0;
                 break;
             }
@@ -13451,7 +13490,7 @@ static ssize_t zap_sock_send_all(zap_fd_t fd, void *pd, const char *data, size_t
             continue;
         }
         if (ZAP_SOCK_WOULDBLOCK(e)) {
-            if (zap_sock_park(fd, pd, ZAP_POLL_WRITE) < 0) {
+            if (zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0) < 0) {
                 return -1;
             }
             continue;
@@ -13525,6 +13564,21 @@ void zap_net_close(void *s_) {
     s->fd = -1;
 }
 
+/* net.set_read_timeout(conn, ms) (I#485). Store a per-read deadline on the socket
+ * handle: `recv` and `http.read_request` bound each wait-for-readiness by it and
+ * raise a catchable TimeoutError when it elapses. `ms == 0` restores the default
+ * (no timeout, park forever). A negative `ms` is a ValueError (mirrors
+ * `scope(timeout=...)`). Setting it on a listener is harmless (only reads consult
+ * it). */
+void zap_net_set_read_timeout(void *s_, int64_t ms) {
+    if (ms < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("net: read timeout must be non-negative", 39));
+        return;
+    }
+    ((ZapSock *)s_)->read_timeout_ms = ms;
+}
+
 /* ===========================================================================
  * tls (ticket #147, D-0062). A TLS *client* over the `net` TCP sockets, backed
  * by system OpenSSL (`-lssl -lcrypto`) and integrated with the netpoller (#80):
@@ -13577,9 +13631,9 @@ static int zap_tls_want(SSL *ssl, int ret, int fd, void *pd) {
     int e = SSL_get_error(ssl, ret);
     switch (e) {
     case SSL_ERROR_WANT_READ:
-        return zap_sock_park(fd, pd, ZAP_POLL_READ);
+        return zap_sock_park(fd, pd, ZAP_POLL_READ, 0);
     case SSL_ERROR_WANT_WRITE:
-        return zap_sock_park(fd, pd, ZAP_POLL_WRITE);
+        return zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0);
     case SSL_ERROR_ZERO_RETURN:
         return -3;
     default:
@@ -13967,7 +14021,7 @@ void *zap_tls_accept(void *l_) {
                 continue;
             }
             if (ZAP_SOCK_WOULDBLOCK(e)) {
-                if (zap_sock_park(lfd, lpd, ZAP_POLL_READ) < 0) {
+                if (zap_sock_park(lfd, lpd, ZAP_POLL_READ, 0) < 0) {
                     zap_net_panic("tls: accept on a closed listener");
                     return NULL;
                 }
@@ -14094,7 +14148,7 @@ static void *zap_tls_test_serve(void *arg) {
             continue;
         }
         if (ZAP_SOCK_WOULDBLOCK(e)) {
-            if (zap_sock_park(lfd, lpd, ZAP_POLL_READ) < 0) {
+            if (zap_sock_park(lfd, lpd, ZAP_POLL_READ, 0) < 0) {
                 goto done;
             }
             continue;
@@ -14192,9 +14246,10 @@ static void zap_dyn_free(ZapDynBuf *b) {
     b->len = b->cap = 0;
 }
 
-/* Read one chunk from the socket into `b`. Returns bytes read (0 = EOF), or -1
- * on error. */
-static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd) {
+/* Read one chunk from the socket into `b`. Returns bytes read (0 = EOF), -1 on
+ * error, or -2 when a `timeout_ms > 0` read deadline elapses (I#485) — a sentinel
+ * the caller turns into a catchable TimeoutError rather than a silent EOF. */
+static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd, int64_t timeout_ms) {
     if (zap_dyn_reserve(b, 4096) != 0) {
         return -1;
     }
@@ -14213,7 +14268,11 @@ static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd) {
             continue;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (zap_sock_park(fd, pd, ZAP_POLL_READ) < 0) {
+            int p = zap_sock_park(fd, pd, ZAP_POLL_READ, timeout_ms);
+            if (p == -2) {
+                return -2; /* read deadline elapsed */
+            }
+            if (p < 0) {
                 return 0; /* closed: treat as EOF */
             }
             continue;
@@ -14392,7 +14451,7 @@ static ssize_t zap_httpconn_fill(ZapHttpConn *c, ZapDynBuf *b) {
     if (c->tls) {
         return zap_http_tls_fill(b, c->ssl, c->fd, c->pd);
     }
-    return zap_dyn_fill(b, c->fd, c->pd);
+    return zap_dyn_fill(b, c->fd, c->pd, 0); /* client has no read-timeout surface */
 }
 
 /* Shut down and close the connection (the TLS session + context when present). */
@@ -14743,6 +14802,7 @@ void *zap_http_read_request(void *c_) {
     ZapSock *c = (ZapSock *)c_;
     int fd = c->fd;
     void *pd = c->pd;
+    int64_t timeout_ms = c->read_timeout_ms; /* I#485: bounds each recv park */
 
     ZapDynBuf b = {NULL, 0, 0};
     size_t hlen = 0, body_off = 0;
@@ -14752,7 +14812,12 @@ void *zap_http_read_request(void *c_) {
             have_headers = 1;
             break;
         }
-        ssize_t r = zap_dyn_fill(&b, fd, pd);
+        ssize_t r = zap_dyn_fill(&b, fd, pd, timeout_ms);
+        if (r == -2) {
+            zap_dyn_free(&b);
+            zap_net_timeout_panic();
+            return NULL;
+        }
         if (r <= 0) {
             break;
         }
@@ -14793,7 +14858,12 @@ void *zap_http_read_request(void *c_) {
         clen = 0;
     }
     while ((size_t)(b.len - body_off) < (size_t)clen) {
-        ssize_t r = zap_dyn_fill(&b, fd, pd);
+        ssize_t r = zap_dyn_fill(&b, fd, pd, timeout_ms);
+        if (r == -2) {
+            zap_dyn_free(&b);
+            zap_net_timeout_panic();
+            return NULL;
+        }
         if (r <= 0) {
             break;
         }

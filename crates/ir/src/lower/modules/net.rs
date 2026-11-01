@@ -27,6 +27,8 @@ fn lower(
         "recv" => call_ret(lowerer, "zap_net_recv", a, Ty::Ptr, true),
         "send" => call_ret(lowerer, "zap_net_send", a, Ty::I64, true),
         "port" => call_ret(lowerer, "zap_net_port", a, Ty::I64, false),
+        // Throwing: a negative timeout raises ValueError (checked in the runtime).
+        "set_read_timeout" => call_void(lowerer, "zap_net_set_read_timeout", a, true),
         "close_conn" | "close_listener" => call_void(lowerer, "zap_net_close", a, false),
         _ => return Ok(None),
     }))
