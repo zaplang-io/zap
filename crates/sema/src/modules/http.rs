@@ -4,8 +4,8 @@
 //! `request`, each also taking an optional trailing `dict[str,str]` of request
 //! headers — #280 — and returning an opaque response handle with
 //! `status`/`body`/`header` accessors) and the server-side helpers (`read_request` parses a request off a
-//! connection into an opaque request handle with `method`/`path`/`req_header`/
-//! `req_body` accessors; `respond` writes a response). Response/request handles
+//! connection into an opaque request handle with `method`/`path`/`req_version`/
+//! `req_header`/`req_body` accessors; `respond` writes a response). Response/request handles
 //! are opaque GC objects typed as `bytes` (the `crypto`/`sync` pattern). `https`
 //! is rejected at runtime — TLS is a follow-up (out of scope for this PR).
 //! `import http` is accepted but not required.
@@ -108,6 +108,11 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         }
         // http.req_body(req) -> str
         "req_body" => {
+            expect_argc(checker, "http", method, args, 1, span);
+            Ty::Str
+        }
+        // http.req_version(req) -> str (request-line HTTP version, e.g. "HTTP/1.1")
+        "req_version" => {
             expect_argc(checker, "http", method, args, 1, span);
             Ty::Str
         }

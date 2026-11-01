@@ -14368,15 +14368,15 @@ typedef struct {
     const ZapStr *path;
     const ZapStr *headers; /* raw header block */
     const ZapStr *body;
+    const ZapStr *version; /* request-line HTTP version token, e.g. "HTTP/1.1" */
 } ZapHttpReq;
 
 static const int32_t zap_off_httpreq[] = {
-    (int32_t)offsetof(ZapHttpReq, method),
-    (int32_t)offsetof(ZapHttpReq, path),
-    (int32_t)offsetof(ZapHttpReq, headers),
-    (int32_t)offsetof(ZapHttpReq, body),
+    (int32_t)offsetof(ZapHttpReq, method),  (int32_t)offsetof(ZapHttpReq, path),
+    (int32_t)offsetof(ZapHttpReq, headers), (int32_t)offsetof(ZapHttpReq, body),
+    (int32_t)offsetof(ZapHttpReq, version),
 };
-static const ZapTypeDesc zap_desc_httpreq = {(int64_t)sizeof(ZapHttpReq), ZAP_TD_PRECISE, 4,
+static const ZapTypeDesc zap_desc_httpreq = {(int64_t)sizeof(ZapHttpReq), ZAP_TD_PRECISE, 5,
                                              zap_off_httpreq};
 
 /* Split a message in `b` at the blank line into header-block length and body
@@ -14843,6 +14843,17 @@ void *zap_http_read_request(void *c_) {
         i++;
     }
     size_t pend = i;
+    /* HTTP version token: skip the single space after the path, then read up to
+     * CR/LF/space. Absent (HTTP/0.9-style request line) leaves an empty token. */
+    size_t vcur = pend;
+    while (vcur < hlen && b.buf[vcur] == ' ') {
+        vcur++;
+    }
+    size_t vstart = vcur;
+    while (vcur < hlen && b.buf[vcur] != ' ' && b.buf[vcur] != '\r' && b.buf[vcur] != '\n') {
+        vcur++;
+    }
+    size_t vend = vcur;
     /* header block begins after the request line */
     size_t hstart = pend;
     while (hstart < hlen && b.buf[hstart] != '\n') {
@@ -14877,6 +14888,7 @@ void *zap_http_read_request(void *c_) {
     void *path = zap_str_new(b.buf + pstart, (int64_t)(pend - pstart));
     void *headers = zap_str_new(b.buf + hstart, (int64_t)(hlen > hstart ? hlen - hstart : 0));
     void *bodyobj = zap_str_new(b.buf + body_off, (int64_t)bodylen);
+    void *version = zap_str_new(b.buf + vstart, (int64_t)(vend - vstart));
     zap_dyn_free(&b);
 
     ZapHttpReq *req = (ZapHttpReq *)zap_obj(&zap_desc_httpreq);
@@ -14884,12 +14896,14 @@ void *zap_http_read_request(void *c_) {
     req->path = (const ZapStr *)path;
     req->headers = (const ZapStr *)headers;
     req->body = (const ZapStr *)bodyobj;
+    req->version = (const ZapStr *)version;
     return req;
 }
 
 void *zap_http_req_method(void *req_) { return (void *)((ZapHttpReq *)req_)->method; }
 void *zap_http_req_path(void *req_) { return (void *)((ZapHttpReq *)req_)->path; }
 void *zap_http_req_body(void *req_) { return (void *)((ZapHttpReq *)req_)->body; }
+void *zap_http_req_version(void *req_) { return (void *)((ZapHttpReq *)req_)->version; }
 
 void *zap_http_req_header(void *req_, void *name_) {
     ZapHttpReq *req = (ZapHttpReq *)req_;

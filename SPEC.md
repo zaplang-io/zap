@@ -1001,8 +1001,13 @@ carries exactly one). The response is an opaque handle read back with
 headers** — `http.respond(conn, status, body, headers)` (#279) — written on the
 wire; a caller-supplied `Content-Type` overrides the default `text/plain`, while
 the server-managed `Content-Length` and `Connection: close` are always computed
-and any same-named map entry is ignored. `http` is **Experimental**
-(STABILITY.md §4.4).
+and any same-named map entry is ignored. `http.read_request(conn)` parses a
+request off a connection into an opaque handle read back with
+`http.method(req) -> str`, `http.path(req) -> str`,
+`http.req_version(req) -> str` (the request-line HTTP version token, e.g.
+`"HTTP/1.1"`; `""` for an HTTP/0.9-style line with no version — #486),
+`http.req_header(req, name) -> str` (case-insensitive, `""` when absent) and
+`http.req_body(req) -> str`. `http` is **Experimental** (STABILITY.md §4.4).
 
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain
