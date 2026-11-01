@@ -660,7 +660,7 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
   block owns the coroutines spawned inside it and joins them at the dedent; a
   child failure cancels siblings and re-raises (an aggregate `ExceptionGroup` if
   several fail, D-0045). `scope(timeout=<ms>, on_error=OnError.Cancel|Wait)`
-  adds a deadline and selects the failure policy (D-0093). The `timeout` value is a
+  adds a deadline and selects the failure policy (D-0094). The `timeout` value is a
   **nonnegative integer number of milliseconds** — no unit suffix and no `Duration`
   type (`_` digit separators are allowed, e.g. `timeout=30_000`); a negative value
   raises `ValueError`, and zero cancels immediately. At expiry, cancellation reaches

@@ -31,7 +31,7 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `ScopeTimeout` exception to the caller. `ScopeTimeout` reports the deadline and
   every coroutine still outstanding at it (by name and park reason), never a sample.
   `timeout`, `on_error`, and `cancel_on` are orthogonal; `grace` still bounds an
-  uncooperative drain. Nested joins park their coroutine (#475, D-0093).
+  uncooperative drain. Nested joins park their coroutine (#475, D-0094).
 
 - Scope cleanup cancels and awaits children on return/break/continue; unsupported
   spawn call forms now report `ZAP5076` during semantic checking (#475). The

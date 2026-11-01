@@ -7269,7 +7269,7 @@ static void *zap_scope_deadline_main(void *arg) {
     return NULL;
 }
 
-/* `scope(timeout=<ms>[, grace=<ms>])` (I#475, D-0093): arm a relative deadline in
+/* `scope(timeout=<ms>[, grace=<ms>])` (I#475, D-0094): arm a relative deadline in
  * integer milliseconds. `timeout=0` cancels immediately; a negative duration is a
  * `ValueError`. At expiry the tree is cancelled (running `finally`/`with`) and the
  * scope then raises `ScopeTimeout` to its caller. Orthogonal to `on_error` and

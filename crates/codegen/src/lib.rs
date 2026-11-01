@@ -1184,7 +1184,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_scope_enter", &[i.into()], Some(p.into()));
         self.declare_rt("zap_scope_set_parent", &[p.into(), p.into()], None);
         // `zap_scope_timeout(scope, duration_ms, grace_ms)`: integer-millisecond
-        // deadline (D-0093). Negative/overflow raises `ValueError` at runtime.
+        // deadline (D-0094). Negative/overflow raises `ValueError` at runtime.
         self.declare_rt("zap_scope_timeout", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_scope_exit", &[p.into()], None);
         self.declare_rt("zap_scope_exit_cancel", &[p.into()], None);

@@ -470,7 +470,7 @@ siblings; `Wait` lets siblings finish). `on_error` takes an **enum**, not a
 string, so a typo is a compile-time error (consistent with the interface and
 decorator "catch typos at compile time" ethos, D-0016/D-0036).
 `scope(timeout=<ms>, grace=5000)` cancels and drains owned children at a deadline
-(see **D-0093** for the finalized model). Timeout values are a nonnegative integer
+(see **D-0094** for the finalized model). Timeout values are a nonnegative integer
 number of **milliseconds** — no unit suffix (`_` digit separators are fine, e.g.
 `timeout=30_000`). Expiry uses the shared cancellation path, including nested
 scope ancestry and parked channel wakeup; cleanup runs, then the scope raises
@@ -2607,7 +2607,7 @@ their own deps as `Depends` parameters. Drop the manual per-request context — 
 adapter resolves once per request. Request-derived values (headers, path, query,
 body) stay read off `req` inside providers/handlers (scope boundary above).
 
-## D-0093 — Scope deadlines: `timeout=<ms>`, `ScopeTimeout`, and the pending set (I#475)
+## D-0094 — Scope deadlines: `timeout=<ms>`, `ScopeTimeout`, and the pending set (I#475)
 **Status:** Locked — finalizes the deadline half of structured concurrency (D-0044).
 
 `scope:` stays a pure **join barrier**: it owns the coroutines spawned inside it

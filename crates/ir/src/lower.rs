@@ -5644,7 +5644,7 @@ impl<'a> FnLower<'a> {
                 continue;
             }
             // `timeout` is a nonnegative integer number of milliseconds (no unit
-            // suffix; D-0093). Negative/overflow is rejected at runtime (ValueError).
+            // suffix; D-0094). Negative/overflow is rejected at runtime (ValueError).
             let (duration, ty) = self.expr(&option.value)?;
             if ty.int_width().is_none() {
                 return Err(err(

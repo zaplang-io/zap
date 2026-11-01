@@ -646,7 +646,7 @@ ships in every binary and wires up lazily; the mechanism:
   running process to dump these (`SIGQUIT`, or `SIGUSR1` with `--gc`).
 - **Deferred / flagged for review:** collapsing the dispatcher into the signal
   thread (above); a first-class `Duration` type (scope `timeout` is integer
-  milliseconds, D-0093); cancellation of arbitrary parked I/O/FFI operations beyond
+  milliseconds, D-0094); cancellation of arbitrary parked I/O/FFI operations beyond
   the channel wake path; the `spawn`-site `file:line` in `ScopeTimeout`/dump reports
   and a programmatic attribute surface on caught exceptions (today the pending set
   is rendered into the `ScopeTimeout` message — the compiler carries no
@@ -719,7 +719,7 @@ parks its G and frees its M.
 - **Formal memory-model spec** (D-0034) and the **race-detector** tool
   (both already tracked in OPEN-QUESTIONS).
 - **General timer API** — concrete `after()` and `sleep()` surfaces; scope
-  deadlines are integer milliseconds (`scope(timeout=<ms>)`, D-0093).
+  deadlines are integer milliseconds (`scope(timeout=<ms>)`, D-0094).
 - **Blocking FFI.**
   How CPython interop (D-0012) and its GIL interact with coroutines that must not
   block an M (likely a dedicated M pool for FFI calls).
