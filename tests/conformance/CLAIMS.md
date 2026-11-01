@@ -174,6 +174,9 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | WITH-1 | §11 | `with` closes the resource on block exit, even on exception (D-0027) | TODO | — |
 | CHAN-1 | §12 | channels: send/receive, comma-ok receive, `close` (D-0031) | TODO | — |
 | SCOPE-1 | §12 | `scope:` joins spawned coroutines; a child failure cancels siblings (D-0044) | covered | scope_cleanup |
+| SCOPE-2 | §12 | `scope(timeout=<ms>)` cancels and drains children, preserves cleanup, raises `ScopeTimeout` to the caller, and composes orthogonally with the failure policy (a child failure outranks the timeout) | covered | scope_timeout |
+| SCOPE-3 | §12 | scope grace bounds an uncooperative drain after the deadline | covered | scope_timeout_grace |
+| SCOPE-4 | §12 | `ScopeTimeout` reports every coroutine still outstanding at the deadline, not a sample | covered | scope_timeout_pending |
 | MOD-1 | §13 | names starting with `_` are private, enforced at compile time (D-0028) | TODO | — |
 | MOD-2 | §13 | whole-module import by short name; no `from X import Y` (D-0052) | TODO | — |
 

@@ -253,13 +253,19 @@ with_item     ::= expr [ "as" IDENT ] ;
 
 scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
                   (* options are keyword args: on_error=OnError.Cancel|Wait;
+                     timeout=<int-ms> — a relative deadline in a nonnegative integer
+                     number of milliseconds (no unit suffix; D-0094). On expiry the
+                     scope cancels its tree and raises `ScopeTimeout` to the caller;
+                     0 cancels immediately, a negative value raises ValueError.
                      cancel_on=[Signal.X, ...] — a listed signal cancels the scope
                      tree (D-0058, ticket #77); grace=<ms> — a hard-exit deadline
-                     (milliseconds) from the first cancel_on signal. (timeout=<dur>
-                     is reserved but still deferred.) No new syntax: these are
-                     ordinary keyword args / a list literal / an int expression.
-                     Owns every `spawn` lexically inside; joins/cancels at the dedent.
-                     `spawn detached` (see simple_stmt) opts out of all scope ownership. *)
+                     (milliseconds) from the first cancel_on signal or timeout.
+                     timeout/on_error/cancel_on are orthogonal. No new syntax: these
+                     are ordinary keyword args / a list literal / an int expression.
+                     Owns every `spawn` lexically inside; joins/cancels at the dedent,
+                     and may raise `ScopeTimeout` (or a child failure / ExceptionGroup)
+                     there. `spawn detached` (see simple_stmt) opts out of all scope
+                     ownership. *)
 
 (* ---------- Conditional compilation (`when target.*`, I#139 / D-0079) ---------- *)
 

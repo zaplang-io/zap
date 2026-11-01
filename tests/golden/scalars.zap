@@ -18,20 +18,20 @@ def main():
     print(b)  # 14
 
     float32 f = 1.5
-    print(f)  # 1.500000
+    print(f)  # 1.5
     float64 g = f  # implicit float32 -> float64 widening
-    print(g + 0.5)  # 2.000000
+    print(g + 0.5)  # 2.0
 
     int64 big = 300
     int32 small = int32(big)  # explicit narrowing int64 -> int32
     print(small)  # 300
-    print(float64(a))  # 7.000000  (int -> float)
+    print(float64(a))  # 7.0  (int -> float)
     print(int64(2.9))  # 2         (float -> int, truncates toward zero)
 
     print(2 ** 10)  # 1024      (integer power)
-    print(2.0 ** 0.5)  # 1.414214  (float power, sqrt 2)
+    print(2.0 ** 0.5)  # 1.41421  (float power, sqrt 2)
 
     print(7 // 2)  # 3
     print(-7 // 2)  # -4        (toward -inf; C truncation gives -3)
     print(7 // -2)  # -4
-    print(-7.0 // 2.0)  # -4.000000 (float floor division)
+    print(-7.0 // 2.0)  # -4.0 (float floor division)

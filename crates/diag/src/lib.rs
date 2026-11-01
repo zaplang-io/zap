@@ -501,8 +501,6 @@ define_codes! {
         "In this version `yield` must carry a value (I#67 v1).";
     ZAP5070 = 5070 : "invalid scope on_error",
         "`scope(on_error=...)` expects `OnError.Cancel` or `OnError.Wait`.";
-    ZAP5071 = 5071 : "scope timeout not supported",
-        "`scope(timeout=...)` is not supported yet (the timer API is deferred).";
     ZAP5072 = 5072 : "invalid scope cancel_on",
         "`scope(cancel_on=...)` expects a list of `Signal`.";
     ZAP5073 = 5073 : "invalid scope grace",

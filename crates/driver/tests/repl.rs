@@ -150,18 +150,20 @@ fn redefining_a_function_uses_the_newest() {
 #[test]
 fn float_binding_persists_across_entries() {
     // A `float64` binding (inferred from a float literal) carries into a later
-    // entry via its runtime slot.
+    // entry via its runtime slot. The auto-print renders via `str()` (I#493),
+    // so `1.0`, not C `%f`'s `1.000000`.
     let (stdout, _stderr, code) = repl("auto half = 0.5\nhalf + 0.5\n");
     assert_eq!(code, 0);
-    assert!(stdout.contains("1.000000"), "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "1.0", "stdout: {stdout:?}");
 }
 
 #[test]
 fn float32_binding_persists_across_entries() {
-    // An explicit `float32` binding round-trips through the shared slot.
+    // An explicit `float32` binding round-trips through the shared slot. The
+    // auto-print renders via `str()` (I#493), so `3.0`, not `3.000000`.
     let (stdout, _stderr, code) = repl("float32 q = 1.5\nq + q\n");
     assert_eq!(code, 0);
-    assert!(stdout.contains("3.000000"), "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "3.0", "stdout: {stdout:?}");
 }
 
 // ---------------------------------------------------------------------------
