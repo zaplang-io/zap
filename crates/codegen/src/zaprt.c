@@ -13184,12 +13184,32 @@ static char *zap_net_dupz(const ZapStr *s) {
     return out;
 }
 
+/* ---- connection transport tag (I#556) ------------------------------------- *
+ * `http.read_request` / `http.respond` accept EITHER a plaintext (`net`,
+ * `ZapSock`) or a TLS (`tls.accept`, `ZapTls`) connection — at the Zap type level
+ * both are the one opaque `bytes` handle, so the parser/emitter must tell them
+ * apart at runtime. Both handles lead with this `int kind` tag (its only aliased
+ * field, read through `ZapConnHdr` — the C common-initial-sequence rule makes
+ * reading a shared leading `int` well defined even where later fields differ in
+ * size, e.g. `fd` is `int` vs `SOCKET` across platforms). The server transport
+ * seam dispatches on it; everything else casts to the concrete handle type. */
+enum { ZAP_CONN_PLAIN = 0, ZAP_CONN_TLS = 1 };
+typedef struct {
+    int kind;
+} ZapConnHdr;
+
+/* Store a read deadline on either connection flavor (defined once `ZapTls` is in
+ * scope). Lets `net.set_read_timeout`, declared above the TLS section, reach the
+ * TLS handle's own `read_timeout_ms` field. */
+static void zap_conn_set_read_timeout(void *c_, int64_t ms);
+
 /* ---- socket handle -------------------------------------------------------- *
  * A listener or connection. `pd` is the netpoller descriptor (plain malloc
  * infra, never GC) or NULL when the netpoller is unavailable (the defensive
  * blocking fallback). The handle is ATOMIC — `fd` is a scalar (int on POSIX,
  * SOCKET on Windows) and `pd` is non-GC, so nothing to trace. */
 typedef struct {
+    int kind; /* ZAP_CONN_PLAIN; shared leading tag with ZapTls (I#556). */
     zap_fd_t fd;
     void *pd;
     /* Per-read deadline in milliseconds set via `net.set_read_timeout` (I#485);
@@ -13206,6 +13226,7 @@ static ZapSock *zap_sock_wrap(zap_fd_t fd) {
     zap_sock_make_nonblocking(fd);
     void *pd = zap_netpoll_open((int64_t)fd); /* NULL => blocking-poll fallback */
     ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
+    s->kind = ZAP_CONN_PLAIN; /* ATOMIC objects are not zeroed; init explicitly. */
     s->fd = fd;
     s->pd = pd;
     s->read_timeout_ms = 0; /* ATOMIC objects are not zeroed; init explicitly. */
@@ -13381,6 +13402,7 @@ void *zap_net_connect(void *host_, int64_t port) {
             freeaddrinfo(res);
             /* Reuse the descriptor opened above: wrap without re-registering. */
             ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
+            s->kind = ZAP_CONN_PLAIN; /* ATOMIC objects are not zeroed. */
             s->fd = fd;
             s->pd = pd;
             s->read_timeout_ms = 0; /* ATOMIC objects are not zeroed. */
@@ -13576,7 +13598,10 @@ void zap_net_set_read_timeout(void *s_, int64_t ms) {
                         zap_str_new("net: read timeout must be non-negative", 39));
         return;
     }
-    ((ZapSock *)s_)->read_timeout_ms = ms;
+    /* Dispatch on the transport tag so it also works on a TLS connection (I#556):
+     * `http.read_request` over TLS honors the same deadline because the TLS fill
+     * path reads `ZapTls.read_timeout_ms`, which lives at the handle's own offset. */
+    zap_conn_set_read_timeout(s_, ms);
 }
 
 /* ===========================================================================
@@ -13610,10 +13635,15 @@ void zap_net_set_read_timeout(void *s_, int64_t ms) {
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
-/* A TLS connection: an owned fd (+ netpoller desc) and its OpenSSL session. */
+/* A TLS connection: an owned fd (+ netpoller desc) and its OpenSSL session. The
+ * leading `kind` tag (ZAP_CONN_TLS) lets the HTTP server transport seam tell it
+ * apart from a plaintext `ZapSock` (I#556); `read_timeout_ms` mirrors `ZapSock`
+ * so `net.set_read_timeout` + `http.read_request`'s deadline apply over TLS. */
 typedef struct {
+    int kind; /* ZAP_CONN_TLS; shared leading tag with ZapSock (I#556). */
     int fd;
     void *pd;
+    int64_t read_timeout_ms; /* I#556: TLS read deadline (0 = none, the default). */
     SSL *ssl;
     SSL_CTX *ctx;
 } ZapTls;
@@ -13621,6 +13651,17 @@ typedef struct {
 /* ATOMIC: fd is a scalar; pd/ssl/ctx are non-GC heap (netpoller + OpenSSL), so
  * nothing is traced. Freed explicitly by `tls.close_conn` (the net contract). */
 static const ZapTypeDesc zap_desc_tls = {(int64_t)sizeof(ZapTls), ZAP_TD_ATOMIC, 0, NULL};
+
+/* Store a read deadline on either flavor of connection handle, dispatching on the
+ * transport tag (I#556). Backs `net.set_read_timeout`, which is declared above
+ * the TLS section but must reach `ZapTls.read_timeout_ms` for a TLS conn. */
+static void zap_conn_set_read_timeout(void *c_, int64_t ms) {
+    if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
+        ((ZapTls *)c_)->read_timeout_ms = ms;
+    } else {
+        ((ZapSock *)c_)->read_timeout_ms = ms;
+    }
+}
 
 /* Classify a non-positive SSL_* return into an action:
  *    0 -> parked and now ready; retry the SSL_* call
@@ -13756,8 +13797,10 @@ static void *zap_tls_dial(void *host_, int64_t port, int verify) {
     void *pd = NULL;
     SSL *ssl = zap_tls_dial_raw(host_, port, verify, &ctx, &fd, &pd);
     ZapTls *t = (ZapTls *)zap_obj(&zap_desc_tls);
+    t->kind = ZAP_CONN_TLS;  /* ATOMIC objects are not zeroed; init explicitly. */
     t->fd = fd;
     t->pd = pd;
+    t->read_timeout_ms = 0;  /* ATOMIC objects are not zeroed. */
     t->ssl = ssl;
     t->ctx = ctx;
     return t;
@@ -13887,8 +13930,9 @@ void zap_tls_close(void *t_) {
  * into a server SSL_CTX and binds host:port; `tls.accept` accepts a socket and
  * runs the SERVER-side handshake over the netpoller (WANT_READ/WANT_WRITE park
  * the coroutine), returning the SAME `ZapTls` handle the client produces — so
- * `tls.send`/`recv`/`close_conn`, and `http.read_request`/`_write` layered over
- * them, work unchanged. Closing the listener wakes a coroutine parked in
+ * `tls.send`/`recv`/`close_conn` drive it directly, and `http.read_request` /
+ * `http.respond` accept it through their transport seam (I#556; the handle's
+ * `kind` tag selects the TLS fill/send path). Closing the listener wakes a coroutine parked in
  * `tls.accept` with CLOSED so it RAISES, exactly as `net.close_listener`
  * unblocks `net.accept` (the staged graceful-shutdown contract #488 needs).
  *
@@ -14040,8 +14084,10 @@ void *zap_tls_accept(void *l_) {
             continue; /* bad handshake — skip this peer, keep accepting */
         }
         ZapTls *t = (ZapTls *)zap_obj(&zap_desc_tls);
+        t->kind = ZAP_CONN_TLS; /* ATOMIC objects are not zeroed; init explicitly. */
         t->fd = cfd;
         t->pd = cpd;
+        t->read_timeout_ms = 0; /* ATOMIC objects are not zeroed. */
         t->ssl = ssl;
         t->ctx = ctx; /* up-ref'd above; close_conn's SSL_CTX_free balances it */
         return t;
@@ -14413,8 +14459,12 @@ typedef struct {
 } ZapHttpConn;
 
 /* Read one chunk over an established SSL into `b`. Returns bytes read (0 = clean
- * EOF / closed), -1 on error. The TLS twin of `zap_dyn_fill`. */
-static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd) {
+ * EOF / closed), -1 on error, or -2 when a `timeout_ms > 0` read deadline elapses
+ * (I#485 over TLS, I#556) — the sentinel the caller turns into a catchable
+ * TimeoutError. The TLS twin of `zap_dyn_fill`. `timeout_ms == 0` means park
+ * forever (the client always passes 0, so its behavior is unchanged); the server
+ * read path threads the connection's `net.set_read_timeout` deadline through. */
+static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd, int64_t timeout_ms) {
     if (zap_dyn_reserve(b, 4096) != 0) {
         return -1;
     }
@@ -14429,12 +14479,27 @@ static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd) {
             b->buf[b->len] = '\0';
             return r;
         }
-        int w = zap_tls_want(ssl, r, fd, pd);
-        if (w == 0) {
-            continue;
+        /* Classify the non-positive return. WANT_READ/WANT_WRITE park (bounded by
+         * `timeout_ms`); a read-deadline timeout is the -2 sentinel; a closed fd
+         * or a clean close_notify is EOF; anything else is a hard error. This
+         * mirrors `zap_tls_want` but threads the deadline so the park can time
+         * out (that helper hardcodes an unbounded park). */
+        int e = SSL_get_error(ssl, r);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+            int mode = (e == SSL_ERROR_WANT_WRITE) ? ZAP_POLL_WRITE : ZAP_POLL_READ;
+            int p = zap_sock_park(fd, pd, mode, timeout_ms);
+            if (p == -2) {
+                b->buf[b->len] = '\0';
+                return -2; /* read deadline elapsed */
+            }
+            if (p < 0) {
+                b->buf[b->len] = '\0';
+                return 0; /* closed under us -> EOF */
+            }
+            continue; /* parked -> ready, retry SSL_read */
         }
         b->buf[b->len] = '\0';
-        return (w == -1 || w == -3) ? 0 : -1; /* closed / clean shutdown -> EOF */
+        return (e == SSL_ERROR_ZERO_RETURN) ? 0 : -1; /* clean shutdown -> EOF */
     }
 }
 
@@ -14449,7 +14514,7 @@ static int zap_httpconn_send_all(ZapHttpConn *c, const char *data, size_t len) {
 /* Read one chunk into `b`. Returns bytes read (0 = EOF), -1 on error. */
 static ssize_t zap_httpconn_fill(ZapHttpConn *c, ZapDynBuf *b) {
     if (c->tls) {
-        return zap_http_tls_fill(b, c->ssl, c->fd, c->pd);
+        return zap_http_tls_fill(b, c->ssl, c->fd, c->pd, 0); /* client: no read-timeout surface */
     }
     return zap_dyn_fill(b, c->fd, c->pd, 0); /* client has no read-timeout surface */
 }
@@ -14468,6 +14533,39 @@ static void zap_httpconn_close(ZapHttpConn *c) {
     zap_sock_shutdown(c->fd, c->pd);
     c->fd = -1;
     c->pd = NULL;
+}
+
+/* ---- server transport seam (I#556) ---------------------------------------- *
+ * `http.read_request` and `http.respond` take a connection as the opaque `bytes`
+ * handle, which is EITHER a plaintext `ZapSock` (net.accept) or a TLS `ZapTls`
+ * (tls.accept). These two helpers are the only transport-aware code in the
+ * server request/response path: they dispatch on the handle's leading `kind` tag
+ * so the ONE request parser and the ONE response writer below serve both
+ * transports — plaintext through recv()/send() + the netpoller park, TLS through
+ * SSL_read/SSL_write + the WANT_READ/WANT_WRITE park. The per-connection read
+ * deadline (net.set_read_timeout, I#485) is read from whichever handle it is and
+ * threaded into the fill, so a read timeout fires uniformly over TLS too. */
+
+/* Read one chunk from a server connection into `b`. Returns bytes read (0 = EOF),
+ * -1 on error, -2 when the read deadline elapses (caller raises TimeoutError). */
+static ssize_t zap_http_srv_fill(void *c_, ZapDynBuf *b) {
+    if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
+        ZapTls *t = (ZapTls *)c_;
+        return zap_http_tls_fill(b, t->ssl, t->fd, t->pd, t->read_timeout_ms);
+    }
+    ZapSock *s = (ZapSock *)c_;
+    return zap_dyn_fill(b, s->fd, s->pd, s->read_timeout_ms);
+}
+
+/* Write all `len` bytes over a server connection. Returns 0 on success, -1 on
+ * error. The response-write twin of `zap_http_srv_fill`. */
+static int zap_http_srv_send_all(void *c_, const char *data, size_t len) {
+    if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
+        ZapTls *t = (ZapTls *)c_;
+        return zap_tls_write_all(t->ssl, t->fd, t->pd, data, len);
+    }
+    ZapSock *s = (ZapSock *)c_;
+    return zap_sock_send_all(s->fd, s->pd, data, len) < 0 ? -1 : 0;
 }
 
 /* http.request(method, url, body) -> response handle. Opens a connection (plain
@@ -14797,13 +14895,11 @@ void *zap_http_url(void *host_, int64_t port, void *path_) {
 /* http.read_request(conn) -> request handle. Reads headers up to the blank line,
  * then Content-Length body bytes (default 0). Parses the request line
  * "METHOD PATH HTTP/1.1". Keep-alive is not assumed; a client sending
- * Connection: close is handled the same way. */
+ * Connection: close is handled the same way. Transport-agnostic (I#556): `c_` is
+ * either a plaintext `net` conn or a TLS `tls.accept` conn, and every byte read
+ * goes through the `zap_http_srv_fill` seam, so this single parser serves both.
+ * The read deadline (I#485) is carried by the seam and fires over TLS too. */
 void *zap_http_read_request(void *c_) {
-    ZapSock *c = (ZapSock *)c_;
-    int fd = c->fd;
-    void *pd = c->pd;
-    int64_t timeout_ms = c->read_timeout_ms; /* I#485: bounds each recv park */
-
     ZapDynBuf b = {NULL, 0, 0};
     size_t hlen = 0, body_off = 0;
     int have_headers = 0;
@@ -14812,7 +14908,7 @@ void *zap_http_read_request(void *c_) {
             have_headers = 1;
             break;
         }
-        ssize_t r = zap_dyn_fill(&b, fd, pd, timeout_ms);
+        ssize_t r = zap_http_srv_fill(c_, &b);
         if (r == -2) {
             zap_dyn_free(&b);
             zap_net_timeout_panic();
@@ -14869,7 +14965,7 @@ void *zap_http_read_request(void *c_) {
         clen = 0;
     }
     while ((size_t)(b.len - body_off) < (size_t)clen) {
-        ssize_t r = zap_dyn_fill(&b, fd, pd, timeout_ms);
+        ssize_t r = zap_http_srv_fill(c_, &b);
         if (r == -2) {
             zap_dyn_free(&b);
             zap_net_timeout_panic();
@@ -14955,9 +15051,6 @@ static int zap_http_resp_hdr_managed(const ZapStr *name) {
  * GC dict into the malloc buffer before any send, so the dict is only touched
  * while it is still rooted by the caller's frame. */
 static void zap_http_respond_do(void *c_, int64_t status, void *body_, void *headers_) {
-    ZapSock *c = (ZapSock *)c_;
-    int fd = c->fd;
-    void *pd = c->pd;
     const ZapStr *body = (const ZapStr *)body_;
     const ZapDict *hdrs = (const ZapDict *)headers_;
     size_t blen = (size_t)(body->len < 0 ? 0 : body->len);
@@ -15020,7 +15113,9 @@ static void zap_http_respond_do(void *c_, int64_t status, void *body_, void *hea
     if (blen > 0) {
         memcpy(out + hdr, body->data, blen);
     }
-    ssize_t w = zap_sock_send_all(fd, pd, out, (size_t)hdr + blen);
+    /* I#556: dispatch the write over the transport seam so a response is emitted
+     * over a TLS conn (SSL_write) just as over a plaintext one (send). */
+    int w = zap_http_srv_send_all(c_, out, (size_t)hdr + blen);
     free(out);
     if (w < 0) {
         zap_net_panic("http: respond failed");
