@@ -13508,6 +13508,7 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "Cancelled" => 12,
         "ExceptionGroup" => 13,
         "ScopeTimeout" => 14,
+        "TimeoutError" => 15,
         _ => return None,
     })
 }

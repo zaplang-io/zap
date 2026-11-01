@@ -48,6 +48,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "net", method, args, 1, span);
             Ty::Int64
         }
+        // net.set_read_timeout(conn, ms) -> unit. Bounds each read park by `ms`
+        // (0 = no timeout, the default); a `recv`/`read_request` that exceeds it
+        // raises TimeoutError. Negative `ms` is a ValueError at runtime.
+        "set_read_timeout" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
         // `close` is a reserved keyword (channel close); a socket close is spelled
         // `net.close_conn` / `net.close_listener` (both close any socket handle).
         "close_conn" | "close_listener" => {
