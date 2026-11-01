@@ -469,11 +469,13 @@ selects the failure policy (`Cancel` is the default — a failing child cancels 
 siblings; `Wait` lets siblings finish). `on_error` takes an **enum**, not a
 string, so a typo is a compile-time error (consistent with the interface and
 decorator "catch typos at compile time" ethos, D-0016/D-0036).
-The supported options are `on_error`, `cancel_on`, and `grace`. There is no
-scope timeout API: `scope(timeout=...)` is a semantic error (`ZAP5071`, I#475).
-A future deadline design must define durations and wake parked children before
-it can promise cancellation and join at a deadline.
-
+`scope(timeout=<ms>, grace=5000)` cancels and drains owned children at a deadline
+(see **D-0094** for the finalized model). Timeout values are a nonnegative integer
+number of **milliseconds** — no unit suffix (`_` digit separators are fine, e.g.
+`timeout=30_000`). Expiry uses the shared cancellation path, including nested
+scope ancestry and parked channel wakeup; cleanup runs, then the scope raises
+`ScopeTimeout` **to its caller**. Method/lambda spawn capture remains intended and
+open in #475.
 
 **Cancellation** is a `Cancelled` exception injected at cancellation points
 (channel ops, `select`, sleep/timer/I/O waits, nested `scope:` boundaries,
@@ -2654,3 +2656,85 @@ a shared helper).
 **Still deferred (noted in D-0062, unchanged):** ALPN / HTTP/2; client
 certificates (mTLS); custom CA-bundle configuration; session resumption / 0-RTT;
 OCSP stapling.
+## D-0094 — Scope deadlines: `timeout=<ms>`, `ScopeTimeout`, and the pending set (I#475)
+**Status:** Locked — finalizes the deadline half of structured concurrency (D-0044).
+
+`scope:` stays a pure **join barrier**: it owns the coroutines spawned inside it
+and joins them at the dedent. Every failure — a child's, or the whole scope's — is
+reported through an **exception**, the single un-suppressible outcome channel. No
+scope option ever silences a failure.
+
+**Trigger.** `scope(timeout=<ms>)` arms a relative deadline. The value is a
+**nonnegative integer number of milliseconds** — no unit suffix, no `Duration`
+type (`_` digit separators are fine: `timeout=30_000`). `timeout=0` cancels
+immediately; a negative duration raises `ValueError`. On expiry the scope tree is
+cancelled (running `finally`/`with`/cleanup), then the scope raises `ScopeTimeout`.
+There is deliberately **no `.seconds`/`.milliseconds` surface**: an earlier draft
+added a lexer rule making `30.seconds` lex as member access; that global change was
+reverted (it perturbs float/imaginary literals for one option's sugar).
+
+**Two exception tiers.**
+- *Child-level:* a spawned call that raises propagates as its own exception, or an
+  aggregate `ExceptionGroup` when several fail (D-0045).
+- *Block-level:* a whole-scope failure that is no single child — today just
+  `ScopeTimeout`; the tier is open for more later.
+
+**Exception hierarchy.**
+- `Cancelled` is what *children receive*, and the generic external cancel. It stays
+  **outside `Exception`** (D-0044) so a child's `except Exception:` cannot swallow
+  its own cancellation.
+- `ScopeTimeout` is **new** and is raised *to the caller* on deadline expiry. The
+  caller is outside the scope and is not itself cancelled, so `ScopeTimeout` is an
+  ordinary catchable exception **under `Exception`**. An inner scope's uncaught
+  `ScopeTimeout` therefore naturally becomes a child-failure of an enclosing scope.
+
+**`ScopeTimeout` reports the COMPLETE pending set.** Reporting one coroutine, or a
+sample, is wrong — it would imply the unreported ones succeeded. At the instant the
+deadline fires (before cancellation drains anyone) the runtime snapshots **every**
+coroutine still outstanding in the scope tree and renders them — each by name and
+by what it is parked on — together with the deadline, into the `ScopeTimeout`
+message. This aligns with the D-0058 `coroutine_dump`.
+
+*Realized surface (and its limits).* A caught exception in Zap binds to its
+**message string** (there is no attribute access on caught exceptions), so the
+pending set is surfaced **through the message**, exactly as `ExceptionGroup`
+surfaces its sub-exceptions (D-0045) — not as programmatic `.pending`/`.deadline_ms`
+attributes, which would need a new exception-object/attribute language feature.
+Each entry reports the **spawn target name** (a static C-string carried on the G)
+and its **parked-on reason** (channel / nested scope / io, else the scheduler
+g-state). The **`spawn`-site `file:line`** is *not* reported in v1: the IR/codegen
+carry no source-location table (spans are raw byte offsets, no debug info), so it
+needs separate source-location plumbing — tracked as a follow-up. The same report
+enriches the `coroutine_dump`. A signal-driven `Cancelled` is a shared singleton
+and cannot carry per-scope identity, so the pending report is `ScopeTimeout`-only.
+
+**Policy knobs are orthogonal — all still raise.**
+- `on_error = OnError.Cancel | OnError.Wait` reacts **only to a child failure**
+  (cancel siblings now vs. let healthy ones finish, then raise). It is **fully
+  independent of `timeout`; neither references the other** — there is no "timeout
+  caps Wait" coupling. If both a child failure and a deadline occur, each mechanism
+  acts on its own.
+- `cancel_on = [Signal.…]` stays **strictly opt-in and signal-only**: a bare
+  `scope:` or `scope(timeout=…)` installs no signal handling. It composes through
+  the existing signal fan-out (notify channels + `cancel_on` + `@on_signal` all
+  receive the signal). Note: the first subscription to a signal anywhere takes over
+  its disposition **process-wide**, so **applications own shutdown; libraries should
+  not grab signals**. Generalizing `cancel_on` to channel/token triggers is deferred
+  (`zaplang-io/zap#492`).
+- `grace = <ms>` is the existing hard-exit backstop for an uncooperative drain,
+  reusing the signal grace timer.
+
+**Precedence (reporting only).** A recorded child failure outranks a block-level
+`ScopeTimeout`/`Cancelled`: it decides *which* exception surfaces, not the trigger
+behavior. When *this* scope's own deadline cancelled its body, the caller sees
+`ScopeTimeout` rather than the raw `Cancelled`; a `Cancelled` injected by an
+*enclosing* scope, or a genuine error from the body, propagates unchanged.
+
+**Spawn-call forms** are unchanged by this decision: method/lambda/function-value
+capture and full keyword/default handling remain the honest implementation gap
+tracked by #475 (`ZAP5076`); this PR does not close #475.
+
+**Rationale.** One trigger unit (ms) with no sugar keeps the surface tiny and the
+lexer unperturbed; exceptions as the sole outcome channel keep failures
+un-suppressible; the complete pending set turns a timeout into an actionable
+diagnostic instead of a bare "timed out".

@@ -1090,6 +1090,17 @@ mod tests {
     use super::format_source;
 
     #[test]
+    fn scope_timeout_fixture_is_formatted() {
+        for source in [
+            include_str!("../../../tests/conformance/scope_timeout.zap"),
+            include_str!("../../../tests/conformance/scope_timeout_grace.zap"),
+            include_str!("../../../tests/conformance/scope_timeout_pending.zap"),
+        ] {
+            assert_eq!(format_source(source).unwrap(), source);
+        }
+    }
+
+    #[test]
     fn scope_cleanup_fixture_is_formatted() {
         let source = include_str!("../../../tests/conformance/scope_cleanup.zap");
         assert_eq!(format_source(source).unwrap(), source);

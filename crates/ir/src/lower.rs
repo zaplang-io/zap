@@ -5631,6 +5631,41 @@ impl<'a> FnLower<'a> {
             args: vec![policy],
         });
 
+        if let Some(parent) = self.scope_stack.last().copied() {
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_scope_set_parent".to_string(),
+                args: vec![handle, parent],
+            });
+        }
+        let mut cached_grace = None;
+        for option in opts {
+            if option.name.as_deref() != Some("timeout") {
+                continue;
+            }
+            // `timeout` is a nonnegative integer number of milliseconds (no unit
+            // suffix; D-0094). Negative/overflow is rejected at runtime (ValueError).
+            let (duration, ty) = self.expr(&option.value)?;
+            if ty.int_width().is_none() {
+                return Err(err(
+                    "scope timeout requires an integer duration in milliseconds",
+                ));
+            }
+            let duration = self.coerce(duration, ty, Ty::I64);
+            let grace = match cached_grace {
+                Some(value) => value,
+                None => {
+                    let value = match self.scope_grace(opts)? {
+                        Some(value) => value,
+                        None => self.iconst(Ty::I64, 0),
+                    };
+                    cached_grace = Some(value);
+                    value
+                }
+            };
+            self.throwing_call(None, "zap_scope_timeout", vec![handle, duration, grace]);
+        }
+
         // `cancel_on=[Signal.X, ...]` + optional `grace=<ms>` (ticket #77,
         // D-0058): arm this scope so a listed signal cancels its tree, with an
         // optional hard-exit deadline. The subscription is removed inside
@@ -5638,9 +5673,12 @@ impl<'a> FnLower<'a> {
         // the scope awaits its children.
         let cancel_mask = self.scope_cancel_mask(opts)?;
         if cancel_mask != 0 {
-            let grace = match self.scope_grace(opts)? {
-                Some(v) => v,
-                None => self.iconst(Ty::I64, 0),
+            let grace = match cached_grace {
+                Some(value) => value,
+                None => match self.scope_grace(opts)? {
+                    Some(value) => value,
+                    None => self.iconst(Ty::I64, 0),
+                },
             };
             let maskv = self.iconst(Ty::I64, cancel_mask);
             self.emit(Inst::Call {
@@ -5683,18 +5721,22 @@ impl<'a> FnLower<'a> {
         }
 
         // --- cancel landing pad: the body raised; cancel + await children, then
-        // re-raise the parent's exception (rule 4). ---
+        // re-raise (rule 4). `zap_scope_exit_cancel_exc` returns which exception
+        // surfaces: a recorded child failure outranks a block-level `ScopeTimeout`
+        // or `Cancelled`, and when *this* scope's own deadline cancelled the body
+        // the caller sees `ScopeTimeout` rather than the raw `Cancelled` (I#475).
         self.position(lp);
         let exc = self.new_value(Ty::Ptr);
         self.emit(Inst::LandingPad { dest: exc });
+        let surfaced = self.new_value(Ty::Ptr);
         self.emit(Inst::Call {
-            dest: None,
-            func: "zap_scope_exit_cancel".to_string(),
-            args: vec![handle],
+            dest: Some(surfaced),
+            func: "zap_scope_exit_cancel_exc".to_string(),
+            args: vec![handle, exc],
         });
         if !self.terminated() {
             self.emit_end_catch();
-            self.throwing_call(None, "zap_raise", vec![exc]);
+            self.throwing_call(None, "zap_raise", vec![surfaced]);
             if !self.terminated() {
                 self.set_term(Term::Unreachable);
             }
@@ -5729,11 +5771,7 @@ impl<'a> FnLower<'a> {
                     }
                     return Err(err("scope on_error expects OnError.Cancel or OnError.Wait"));
                 }
-                Some("timeout") => {
-                    return Err(err(
-                        "scope(timeout=...) is not supported yet (the timer API is deferred)",
-                    ))
-                }
+                Some("timeout") => continue,
                 // Handled separately by `scope_cancel_on` (ticket #77).
                 Some("cancel_on") | Some("grace") => continue,
                 Some(other) => return Err(err(format!("scope() has no option '{other}'"))),
@@ -13314,6 +13352,7 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "StopIteration" => 11,
         "Cancelled" => 12,
         "ExceptionGroup" => 13,
+        "ScopeTimeout" => 14,
         _ => return None,
     })
 }
