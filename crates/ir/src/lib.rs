@@ -38,6 +38,21 @@ mod tests {
     }
 
     #[test]
+    fn lower_scope_cleanup_conformance() {
+        let module = lower_ok(include_str!("../../../tests/conformance/scope_cleanup.zap"));
+        let early = module
+            .funcs
+            .iter()
+            .find(|f| f.name == "return_from_scope")
+            .unwrap();
+        assert!(early
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Call { func, .. } if func == "zap_scope_exit_cancel")));
+    }
+
+    #[test]
     fn lower_structural_match_conformance() {
         lower_ok(include_str!(
             "../../../tests/conformance/match_structural.zap"

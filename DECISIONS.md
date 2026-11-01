@@ -464,12 +464,16 @@ keyword). A *bare* `spawn` with no enclosing `scope:` remains owned by the
 implicit **root scope** and **is** joined at program exit — so the default is
 leak-free and detachment is always explicit.
 
-**Scope options are typed, not stringly:** `scope(timeout=<duration>)` cancels
-all children at the deadline; `scope(on_error=OnError.Cancel | OnError.Wait)`
+**Scope options are typed, not stringly:** `scope(on_error=OnError.Cancel | OnError.Wait)`
 selects the failure policy (`Cancel` is the default — a failing child cancels its
 siblings; `Wait` lets siblings finish). `on_error` takes an **enum**, not a
 string, so a typo is a compile-time error (consistent with the interface and
 decorator "catch typos at compile time" ethos, D-0016/D-0036).
+The supported options are `on_error`, `cancel_on`, and `grace`. There is no
+scope timeout API: `scope(timeout=...)` is a semantic error (`ZAP5071`, I#475).
+A future deadline design must define durations and wake parked children before
+it can promise cancellation and join at a deadline.
+
 
 **Cancellation** is a `Cancelled` exception injected at cancellation points
 (channel ops, `select`, sleep/timer/I/O waits, nested `scope:` boundaries,

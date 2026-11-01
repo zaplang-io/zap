@@ -2502,6 +2502,21 @@ impl Checker {
                 self.pop_scope();
             }
             Stmt::Spawn { call, .. } => {
+                let supported = match call {
+                    Expr::Call { callee, args, .. } => match callee.as_ref() {
+                        Expr::Name(name, _) if self.lookup(name).is_none() => {
+                            self.sigs.get(name).is_some_and(|sig| {
+                                args.len() == sig.params.len()
+                                    && args.iter().all(|a| a.name.is_none())
+                            })
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !supported {
+                    self.error(ErrorCode::ZAP5076, "spawn requires a named top-level function with all arguments supplied positionally".to_string(), expr_span(call));
+                }
                 self.infer(call);
             }
             Stmt::Scope { opts, body, span } => {
@@ -5155,6 +5170,30 @@ mod tests {
     }
 
     #[test]
+    fn scope_cleanup_fixture_typechecks() {
+        ok(include_str!("../../../tests/conformance/scope_cleanup.zap"));
+    }
+
+    #[test]
+    fn unsupported_spawn_forms_fail_in_sema() {
+        for call in [
+            "g()",
+            "(lambda: print(1))()",
+            "worker(value=1)",
+            "worker()",
+            "worker",
+        ] {
+            let source = format!("def worker(int64 value=1):\n    print(value)\ndef main():\n    auto g = lambda: print(1)\n    spawn {call}\n");
+            assert!(
+                errors(&source).iter().any(|e| e.code == ErrorCode::ZAP5076),
+                "{call}"
+            );
+        }
+        let method = "struct Worker:\n    def run(self):\n        print(1)\ndef main():\n    auto w = Worker()\n    spawn w.run()\n";
+        assert!(errors(method).iter().any(|e| e.code == ErrorCode::ZAP5076));
+    }
+
+    #[test]
     fn structural_match_conformance_typechecks() {
         let (module, parse, lex) = zapc_syntax::parser::parse_str(include_str!(
             "../../../tests/conformance/match_structural.zap"
@@ -5444,7 +5483,10 @@ def main():
         let e = errors(
             "def f():\n    print(1)\n\ndef main():\n    scope(timeout=30):\n        spawn f()\n",
         );
-        assert!(!e.is_empty(), "expected scope(timeout=...) to be reported");
+        assert!(
+            e.iter().any(|e| e.code == ErrorCode::ZAP5071),
+            "expected scope(timeout=...) to be reported"
+        );
     }
 
     #[test]

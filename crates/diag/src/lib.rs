@@ -506,6 +506,9 @@ define_codes! {
     ZAP5075 = 5075 : "scope options must be keywords",
         "`scope()` options must be keyword arguments, e.g. \
          `on_error=OnError.Wait`.";
+    ZAP5076 = 5076 : "unsupported spawn call",
+        "`spawn` requires a named top-level function, with all arguments supplied \
+         positionally. Method, lambda, and function-value calls are not supported.";
     ZAP5080 = 5080 : "non-exhaustive match",
         "A `match` on an enum does not cover every variant. Add the missing \
          arm(s) or a wildcard `_`.";

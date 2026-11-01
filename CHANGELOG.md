@@ -25,6 +25,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- Scope cleanup cancels and awaits children on return/break/continue; unsupported
+  spawn call forms now report `ZAP5076` during semantic checking (#475). The
+  concurrency contract documents supported scope options without a timeout API.
+
 - Structural `match` lowering for tuples and lists with rest captures, recursive
   enum/struct payload tests and bindings, and guard fallthrough (#474).
 

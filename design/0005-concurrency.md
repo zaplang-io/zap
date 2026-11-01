@@ -76,9 +76,12 @@ race with the parent continuing.
 
 ```python
 spawn worker(ch)             # launch; parent continues at once
-spawn server.handle(conn)    # a method call is a call
-spawn (lambda: log(x))()     # a lambda, immediately applied
 ```
+
+The supported operand calls a named top-level function with all arguments
+supplied positionally. Method, lambda, function-value, keyword, and omitted-default
+calls are rejected during semantic checking (`ZAP5076`, I#475). Broader callable
+forms require a separate implementation of receiver/closure capture.
 
 `spawn` is a statement and yields no handle (fire-and-forget).
 Coordination is explicit: results flow back over channels, and completion is
@@ -285,13 +288,13 @@ Rules:
    that created it, and cancellation flows down the tree without a `context`
    object threaded through every call (D-0033, chosen over Go).
 
-Options on the scope configure deadlines and failure policy:
+Options on the scope configure failure and signal cancellation policy.
+The supported options are `on_error`, `cancel_on`, and `grace`. There is no
+scope timeout/deadline API; `scope(timeout=...)` is rejected during semantic
+checking (`ZAP5071`). A future deadline API must first define duration units and
+wake cancellation-aware parked children before a deadline can safely join them.
 
 ```python
-scope(timeout=30.seconds):           # cancels all children at the deadline
-    spawn fetch(a)
-    spawn fetch(b)
-
 scope(on_error=OnError.Wait):        # default is OnError.Cancel: a failure waits
     spawn best_effort(x)             # for siblings instead of cancelling them
     spawn best_effort(y)
