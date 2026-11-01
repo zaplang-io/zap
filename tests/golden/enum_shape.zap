@@ -17,6 +17,6 @@ def area(Shape s) -> f64:
             return 1.0
 
 def main():
-    print(area(Shape.Circle(r=2.0)))  # 12.566360
-    print(area(Shape.Rect(3.0, 4.0)))  # 12.000000
-    print(area(Shape.Unit))  # 1.000000
+    print(area(Shape.Circle(r=2.0)))  # 12.5664
+    print(area(Shape.Rect(3.0, 4.0)))  # 12.0
+    print(area(Shape.Unit))  # 1.0
