@@ -160,6 +160,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | Claim | Section | Statement | Status | Case |
 |---|---|---|---|---|
 | STRUCT-1 | §4.4 | structs are reference types with `self` methods (D-0015) | TODO | — |
+| STRUCT-2 | §4.4 | struct methods honor default + keyword arguments like free functions (D-0038, I#481) | covered | method_default_args |
 | VSTRUCT-1 | §4.4 | a `value struct` is copied by value (D-0051) | TODO | — |
 | IFACE-1 | §4.5 | interfaces are structural, satisfied implicitly, checked at compile time | TODO | — |
 | ENUM-1 | §4.6 | tier-1 enum: distinct type, `.name`, iterable (D-0018) | covered | enum_tier1_iteration |
