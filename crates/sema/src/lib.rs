@@ -276,6 +276,7 @@ const BUILTINS: &[&str] = &[
     "RuntimeError",
     "StopIteration",
     "Cancelled",
+    "ScopeTimeout",
     "ExceptionGroup",
     // REPL session-binding slot intrinsics (I#159): synthesized by the `zap repl`
     // driver to persist `let` values across entries, never written by users.
@@ -319,6 +320,7 @@ fn is_exception_type(name: &str) -> bool {
             | "RuntimeError"
             | "StopIteration"
             | "Cancelled"
+            | "ScopeTimeout"
             | "ExceptionGroup"
     )
 }
@@ -2014,7 +2016,8 @@ impl Checker {
     /// Check the options on a `scope(...)` block (D-0044). `on_error` takes the
     /// `OnError` enum (`OnError.Cancel` | `OnError.Wait`) — a typed policy so a
     /// misspelling is a compile-time error, not a silent runtime surprise.
-    /// Deadlines use integer milliseconds or explicit seconds/milliseconds units.
+    /// Deadlines are a nonnegative integer number of milliseconds (no unit
+    /// suffix; `_` digit separators are fine, e.g. `timeout=30_000`).
     fn check_scope_opts(&mut self, opts: &[Arg], span: Span) {
         for a in opts {
             match a.name.as_deref() {
@@ -2028,17 +2031,14 @@ impl Checker {
                     }
                 }
                 Some("timeout") => {
-                    let duration = match &a.value {
-                        Expr::Attr { base, name, .. }
-                            if name == "seconds" || name == "milliseconds" =>
-                        {
-                            base.as_ref()
-                        }
-                        value => value,
-                    };
-                    let ty = self.infer(duration);
+                    let ty = self.infer(&a.value);
                     if !matches!(ty, Ty::Int32 | Ty::Int64 | Ty::UntypedInt | Ty::Unknown) {
-                        self.error(ErrorCode::ZAP4024, "scope timeout requires an integer duration in milliseconds (or .seconds/.milliseconds)".to_string(), expr_span(&a.value));
+                        self.error(
+                            ErrorCode::ZAP4024,
+                            "scope timeout requires an integer duration in milliseconds"
+                                .to_string(),
+                            expr_span(&a.value),
+                        );
                     }
                 }
                 // `scope(cancel_on=[Signal.X, ...])` (ticket #77, D-0058): a
@@ -5486,8 +5486,8 @@ def main():
         ok(include_str!(
             "../../../tests/conformance/scope_timeout_grace.zap"
         ));
-        ok("def main():\n    scope(timeout=30.seconds, grace=100):\n        checkpoint()\n");
-        ok("def main():\n    scope(timeout=10.milliseconds):\n        auto done = 1\n");
+        ok("def main():\n    scope(timeout=30_000, grace=100):\n        checkpoint()\n");
+        ok("def main():\n    scope(timeout=10):\n        auto done = 1\n");
         assert!(
             errors("def main():\n    scope(timeout=1.5):\n        auto done = 1\n")
                 .iter()

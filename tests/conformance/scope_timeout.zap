@@ -29,20 +29,20 @@ def fail():
     raise ValueError("child failure")
 
 def main():
-    scope(timeout=1.seconds):
+    scope(timeout=1000):
         auto done = 1
     print("finished before deadline")
     auto ready = channel[int64]()
     auto ch = channel[int64]()
     try:
-        scope(timeout=1.seconds, grace=5000):
+        scope(timeout=1000, grace=5000):
             spawn receiver(ready, ch)
             auto started = <-ready
             gc.collect()
-    except Cancelled:
+    except ScopeTimeout:
         print("receiver timed out")
     try:
-        scope(timeout=1000.milliseconds, on_error=OnError.Wait, grace=5000):
+        scope(timeout=1000, on_error=OnError.Wait, grace=5000):
             spawn sender(ready, ch)
             auto started = <-ready
             gc.collect()
@@ -50,17 +50,17 @@ def main():
     except ValueError as e:
         print("failure wins", e)
     try:
-        scope(timeout=1.seconds):
+        scope(timeout=1000):
             scope:
                 spawn receiver(ready, ch)
                 auto started = <-ready
                 gc.collect()
-    except Cancelled:
+    except ScopeTimeout:
         print("nested timed out")
     try:
         scope(timeout=0):
             auto done = 1
-    except Cancelled:
+    except ScopeTimeout:
         print("immediate deadline")
     try:
         scope(timeout=-1):

@@ -549,13 +549,7 @@ impl<'a> Lexer<'a> {
             self.bump();
         }
         // Fraction.
-        let imaginary = matches!(self.peek_at(1), Some(b'j' | b'J'))
-            && !self.peek_at(2).is_some_and(Self::is_ident_continue);
-        let member = !imaginary
-            && matches!(self.peek_at(1), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
-            && !(matches!(self.peek_at(1), Some(b'e' | b'E'))
-                && matches!(self.peek_at(2), Some(b'0'..=b'9' | b'+' | b'-')));
-        if self.at(b'.') && !matches!(self.peek_at(1), Some(b'.')) && !member {
+        if self.at(b'.') && !matches!(self.peek_at(1), Some(b'.')) {
             is_float = true;
             self.bump();
             while matches!(self.peek(), Some(b'0'..=b'9') | Some(b'_')) {
@@ -797,25 +791,6 @@ mod tests {
 
     use Keyword as K;
     use TokenKind as T;
-
-    #[test]
-    fn numeric_members_preserve_float_and_imaginary_forms() {
-        assert_eq!(
-            kinds("30.seconds 2.milliseconds 1.e2 1.j\n"),
-            vec![
-                T::Int("30".into()),
-                T::Dot,
-                T::Ident("seconds".into()),
-                T::Int("2".into()),
-                T::Dot,
-                T::Ident("milliseconds".into()),
-                T::Float("1.e2".into()),
-                T::Imaginary("1.j".into()),
-                T::Newline,
-                T::Eof,
-            ]
-        );
-    }
 
     #[test]
     fn empty_source() {

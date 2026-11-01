@@ -25,11 +25,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
-- Scope deadlines accept integer milliseconds and contextual `.seconds` /
-  `.milliseconds`, cancel and await children through the shared channel-aware
-  cancellation path, preserve cleanup, and reuse the grace drain timer (#475).
-  Nested joins park their coroutine. Intended callable-spawn forms are restored
-  to the design and remain tracked in #475.
+- `scope(timeout=<ms>)` deadlines (integer milliseconds, no unit suffix): on
+  expiry the scope cancels and awaits its children through the shared channel-aware
+  cancellation path (preserving `finally`/`with` cleanup), then raises the new
+  `ScopeTimeout` exception to the caller. `ScopeTimeout` reports the deadline and
+  every coroutine still outstanding at it (by name and park reason), never a sample.
+  `timeout`, `on_error`, and `cancel_on` are orthogonal; `grace` still bounds an
+  uncooperative drain. Nested joins park their coroutine (#475, D-0093).
 
 - Scope cleanup cancels and awaits children on return/break/continue; unsupported
   spawn call forms now report `ZAP5076` during semantic checking (#475). The

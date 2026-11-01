@@ -7,6 +7,6 @@ def uncooperative(channel[int64] ready):
 
 def main():
     auto ready = channel[int64]()
-    scope(timeout=1.seconds, grace=50):
+    scope(timeout=1000, grace=50):
         spawn uncooperative(ready)
         auto started = <-ready

@@ -44,6 +44,9 @@ mod tests {
         lower_ok(include_str!(
             "../../../tests/conformance/scope_timeout_grace.zap"
         ));
+        lower_ok(include_str!(
+            "../../../tests/conformance/scope_timeout_pending.zap"
+        ));
     }
 
     #[test]

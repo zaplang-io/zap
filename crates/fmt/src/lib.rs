@@ -1094,6 +1094,7 @@ mod tests {
         for source in [
             include_str!("../../../tests/conformance/scope_timeout.zap"),
             include_str!("../../../tests/conformance/scope_timeout_grace.zap"),
+            include_str!("../../../tests/conformance/scope_timeout_pending.zap"),
         ] {
             assert_eq!(format_source(source).unwrap(), source);
         }

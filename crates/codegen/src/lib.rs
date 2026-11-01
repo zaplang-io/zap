@@ -1183,14 +1183,27 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // an explicit cancellation point (may raise `Cancelled`).
         self.declare_rt("zap_scope_enter", &[i.into()], Some(p.into()));
         self.declare_rt("zap_scope_set_parent", &[p.into(), p.into()], None);
-        self.declare_rt(
-            "zap_scope_timeout",
-            &[p.into(), i.into(), i.into(), i.into()],
-            None,
-        );
+        // `zap_scope_timeout(scope, duration_ms, grace_ms)`: integer-millisecond
+        // deadline (D-0093). Negative/overflow raises `ValueError` at runtime.
+        self.declare_rt("zap_scope_timeout", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_scope_exit", &[p.into()], None);
         self.declare_rt("zap_scope_exit_cancel", &[p.into()], None);
-        self.declare_rt("zap_spawn_scoped", &[p.into(), p.into(), p.into()], None);
+        // `zap_scope_exit_cancel_exc(scope, pending)`: the early-exit/failure join
+        // that also decides which exception surfaces (child failure > block-level
+        // `ScopeTimeout`/`Cancelled`); returns the exception to re-raise.
+        self.declare_rt(
+            "zap_scope_exit_cancel_exc",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+        // `zap_spawn_scoped(thunk, env, scope, name)`: `name` is a static C-string
+        // of the spawn target, used to identify the coroutine in `ScopeTimeout`
+        // reports and the coroutine dump (D-0058).
+        self.declare_rt(
+            "zap_spawn_scoped",
+            &[p.into(), p.into(), p.into(), p.into()],
+            None,
+        );
         self.declare_rt("zap_spawn_detached", &[p.into(), p.into()], None);
         self.declare_rt("zap_checkpoint", &[], None);
         self.declare_rt("zap_g_uncaught", &[p.into()], None);
@@ -2696,8 +2709,19 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     Owner::Scope(s) => {
                         let scope_v = get(vals, *s);
                         let spawn = self.fns["zap_spawn_scoped"];
-                        b.build_call(spawn, &[thunk_ptr.into(), env.into(), scope_v.into()], "")
-                            .map_err(|e| e.to_string())?;
+                        // A static C-string naming the spawn target, so a
+                        // `ScopeTimeout` can report every outstanding coroutine by
+                        // name (D-0058 diagnostics / I#475).
+                        let name = b
+                            .build_global_string_ptr(func, "spawnname")
+                            .map_err(|e| e.to_string())?
+                            .as_pointer_value();
+                        b.build_call(
+                            spawn,
+                            &[thunk_ptr.into(), env.into(), scope_v.into(), name.into()],
+                            "",
+                        )
+                        .map_err(|e| e.to_string())?;
                     }
                     Owner::Detached => {
                         let spawn = self.fns["zap_spawn_detached"];

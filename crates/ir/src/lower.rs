@@ -5643,18 +5643,15 @@ impl<'a> FnLower<'a> {
             if option.name.as_deref() != Some("timeout") {
                 continue;
             }
-            let (duration, scale) = match &option.value {
-                Expr::Attr { base, name, .. } if name == "seconds" || name == "milliseconds" => {
-                    (base.as_ref(), if name == "seconds" { 1000 } else { 1 })
-                }
-                value => (value, 1),
-            };
-            let (duration, ty) = self.expr(duration)?;
+            // `timeout` is a nonnegative integer number of milliseconds (no unit
+            // suffix; D-0093). Negative/overflow is rejected at runtime (ValueError).
+            let (duration, ty) = self.expr(&option.value)?;
             if ty.int_width().is_none() {
-                return Err(err("scope timeout requires an integer duration"));
+                return Err(err(
+                    "scope timeout requires an integer duration in milliseconds",
+                ));
             }
             let duration = self.coerce(duration, ty, Ty::I64);
-            let scale = self.iconst(Ty::I64, scale);
             let grace = match cached_grace {
                 Some(value) => value,
                 None => {
@@ -5666,11 +5663,7 @@ impl<'a> FnLower<'a> {
                     value
                 }
             };
-            self.throwing_call(
-                None,
-                "zap_scope_timeout",
-                vec![handle, duration, scale, grace],
-            );
+            self.throwing_call(None, "zap_scope_timeout", vec![handle, duration, grace]);
         }
 
         // `cancel_on=[Signal.X, ...]` + optional `grace=<ms>` (ticket #77,
@@ -5728,18 +5721,22 @@ impl<'a> FnLower<'a> {
         }
 
         // --- cancel landing pad: the body raised; cancel + await children, then
-        // re-raise the parent's exception (rule 4). ---
+        // re-raise (rule 4). `zap_scope_exit_cancel_exc` returns which exception
+        // surfaces: a recorded child failure outranks a block-level `ScopeTimeout`
+        // or `Cancelled`, and when *this* scope's own deadline cancelled the body
+        // the caller sees `ScopeTimeout` rather than the raw `Cancelled` (I#475).
         self.position(lp);
         let exc = self.new_value(Ty::Ptr);
         self.emit(Inst::LandingPad { dest: exc });
+        let surfaced = self.new_value(Ty::Ptr);
         self.emit(Inst::Call {
-            dest: None,
-            func: "zap_scope_exit_cancel".to_string(),
-            args: vec![handle],
+            dest: Some(surfaced),
+            func: "zap_scope_exit_cancel_exc".to_string(),
+            args: vec![handle, exc],
         });
         if !self.terminated() {
             self.emit_end_catch();
-            self.throwing_call(None, "zap_raise", vec![exc]);
+            self.throwing_call(None, "zap_raise", vec![surfaced]);
             if !self.terminated() {
                 self.set_term(Term::Unreachable);
             }
@@ -13355,6 +13352,7 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "StopIteration" => 11,
         "Cancelled" => 12,
         "ExceptionGroup" => 13,
+        "ScopeTimeout" => 14,
         _ => return None,
     })
 }

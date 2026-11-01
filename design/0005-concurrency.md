@@ -293,7 +293,7 @@ Rules:
 Scope options configure deadlines, failure policy, and signal cancellation:
 
 ```python
-scope(timeout=30.seconds, grace=5000):  # deadline, then at most 5s to drain
+scope(timeout=30_000, grace=5000):  # 30s deadline, then at most 5s to drain
     spawn fetch(a)
     spawn fetch(b)
 
@@ -302,24 +302,34 @@ scope(on_error=OnError.Wait):
     spawn best_effort(y)
 ```
 
-`timeout` is a nonnegative integer number of milliseconds; `.seconds` and
-`.milliseconds` suffixes are accepted in this option (not a general Duration
-type). Deadlines use a relative monotonic wait. Zero cancels immediately;
-negative/overflowing durations raise `ValueError`. A completed scope disarms its
-timer, so a late timer cannot touch a subsequent scope. Expiry follows the same
-cancellation path as child failure, signal cancellation, and early exit:
-checkpointing children unwind, blocked channel senders/receivers are dequeued
-and resumed, and descendants observe cancellation through scope ancestry.
-Nested joins park the coroutine, so one worker can run its children.
+`timeout` is a **nonnegative integer number of milliseconds** — no unit suffix and
+no general `Duration` type (`_` digit separators are fine, e.g. `timeout=30_000`).
+Deadlines use a relative monotonic wait. Zero cancels immediately; a negative
+duration raises `ValueError`. A completed scope disarms its timer, so a late timer
+cannot touch a subsequent scope. Expiry follows the same cancellation path as child
+failure, signal cancellation, and early exit: checkpointing children unwind, blocked
+channel senders/receivers are dequeued and resumed, and descendants observe
+cancellation through scope ancestry. Nested joins park the coroutine, so one worker
+can run its children.
 
-After all children finish cleanup, timeout raises `Cancelled`. Recorded child
-failures take precedence over this marker (including `on_error=OnError.Wait`);
-a parent's own exception remains dominant during unwind. `grace` reuses the
-signal drain timer and forces process exit if children cannot finish in the
-given milliseconds. It cannot guarantee cleanup for a child that never reaches
-a cancellation point. `cancel_on` remains supported alongside these options.
-General I/O/FFI interruption is still subject to the cancellation points of that
-operation; this change adds interruption for parked channel operations.
+After all children finish cleanup, the scope raises **`ScopeTimeout`** to its caller
+— a normal `Exception` subtype (the caller is outside the scope and is not itself
+cancelled), distinct from the `Cancelled` the children received. `ScopeTimeout`
+reports the deadline and the **complete** set of coroutines that were still
+outstanding at the deadline (each by name and what it was parked on), so a caught
+timeout never implies the unreported ones succeeded. Because the caught exception
+binds to its message, this set is surfaced through the message (as `ExceptionGroup`
+surfaces its sub-exceptions), not as programmatic attributes; a caught inner
+`ScopeTimeout` that is not handled becomes a child-failure of an enclosing scope.
+Recorded child failures take precedence over the timeout marker (including
+`on_error=OnError.Wait`); a parent's own exception remains dominant during unwind.
+`timeout`, `on_error`, and `cancel_on` are **orthogonal** — none caps or references
+another. `grace` reuses the signal drain timer and forces process exit if children
+cannot finish in the given milliseconds. It cannot guarantee cleanup for a child
+that never reaches a cancellation point. `cancel_on` remains supported alongside
+these options. General I/O/FFI interruption is still subject to the cancellation
+points of that operation; this change adds interruption for parked channel
+operations.
 
 `on_error` takes an **`OnError` enum** (`Cancel` | `Wait`), not a string, so a
 misspelled policy is a compile-time error, not a silent runtime surprise (D-0044,
@@ -608,7 +618,13 @@ ships in every binary and wires up lazily; the mechanism:
   with an optional hard-exit deadline that force-exits if graceful shutdown
   overruns. `notify`/`@on_signal`/`cancel_on` **take over** a signal's disposition
   (the OS default and any built-in default handler are suppressed; there is **no
-  auto-exit** — the program decides when to exit after cleanup).
+  auto-exit** — the program decides when to exit after cleanup). `cancel_on` is
+  strictly **opt-in and signal-only**: a bare `scope:` or `scope(timeout=…)`
+  installs no signal handling. The **first subscription to a signal anywhere takes
+  over its disposition process-wide**, so **applications own shutdown; libraries
+  should not grab signals** out from under the program that embeds them.
+  Generalizing `cancel_on` beyond signals (channel / cancellation-token triggers)
+  is deferred — tracked as `zaplang-io/zap#492`.
 - **`Signal` is a compiler-known tier-1 enum** whose variant discriminants ARE the
   Unix signal numbers (so the runtime ABI speaks raw numbers); `SIGKILL`/`SIGSTOP`
   are excluded (uncatchable).
@@ -629,12 +645,17 @@ ships in every binary and wires up lazily; the mechanism:
   the zero-code operator path to these. **`zap inspect <pid>`** (CLI) signals a
   running process to dump these (`SIGQUIT`, or `SIGUSR1` with `--gc`).
 - **Deferred / flagged for review:** collapsing the dispatcher into the signal
-  thread (above); first-class Duration values beyond the contextual scope
-  timeout units; cancellation of arbitrary parked I/O/FFI operations beyond the
-  channel wake path; full per-coroutine symbolicated stack traces in the dump (v1 reports
-  per-G state/ownership + the scheduler/GC shape); and retroactively masking a
-  signal first subscribed from a worker thread (handlers are async-safe wherever
-  they run, so this is a purity gap, not a correctness one).
+  thread (above); a first-class `Duration` type (scope `timeout` is integer
+  milliseconds, D-0093); cancellation of arbitrary parked I/O/FFI operations beyond
+  the channel wake path; the `spawn`-site `file:line` in `ScopeTimeout`/dump reports
+  and a programmatic attribute surface on caught exceptions (today the pending set
+  is rendered into the `ScopeTimeout` message — the compiler carries no
+  source-location table and caught exceptions bind to their message string);
+  generalizing `cancel_on` beyond signals (`zaplang-io/zap#492`); full per-coroutine
+  symbolicated stack traces in the dump (v1 reports per-G name/state/ownership + the
+  scheduler/GC shape); and retroactively masking a signal first subscribed from a
+  worker thread (handlers are async-safe wherever they run, so this is a purity gap,
+  not a correctness one).
 
 ### Runtime entry points (additive to `libzaprt`)
 
@@ -698,7 +719,7 @@ parks its G and frees its M.
 - **Formal memory-model spec** (D-0034) and the **race-detector** tool
   (both already tracked in OPEN-QUESTIONS).
 - **General timer API** — concrete `after()` and `sleep()` surfaces; scope
-  deadlines now support integer milliseconds and contextual `.seconds` units.
+  deadlines are integer milliseconds (`scope(timeout=<ms>)`, D-0093).
 - **Blocking FFI.**
   How CPython interop (D-0012) and its GIL interact with coroutines that must not
   block an M (likely a dedicated M pool for FFI calls).

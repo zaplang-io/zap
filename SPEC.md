@@ -595,12 +595,15 @@ finally:
   stack trace. Exception types form a Python-like hierarchy.
 - Built-in exception types are `BaseException`, `Exception`, `ValueError`,
   `TypeError`, `LookupError`, `IndexError`, `KeyError`, `ArithmeticError`,
-  `ZeroDivisionError`, `RuntimeError`, `StopIteration`, `Cancelled`, and
-  `ExceptionGroup`. `IndexError` and `KeyError` derive from `LookupError`;
-  `ZeroDivisionError` derives from `ArithmeticError`; those intermediate types
-  derive from `Exception`. `Cancelled` derives directly from `BaseException`,
-  so `except Exception` does not suppress cancellation. The remaining listed
-  leaf types derive from `Exception`; `Exception` derives from `BaseException`.
+  `ZeroDivisionError`, `RuntimeError`, `StopIteration`, `Cancelled`,
+  `ScopeTimeout`, and `ExceptionGroup`. `IndexError` and `KeyError` derive from
+  `LookupError`; `ZeroDivisionError` derives from `ArithmeticError`; those
+  intermediate types derive from `Exception`. `Cancelled` derives directly from
+  `BaseException`, so `except Exception` does not suppress cancellation.
+  `ScopeTimeout` (raised to the caller when a `scope(timeout=…)` deadline expires)
+  derives from `Exception` and so is catchable by `except Exception`. The remaining
+  listed leaf types derive from `Exception`; `Exception` derives from
+  `BaseException`.
 - `raise E(message)` constructs a typed built-in exception. Raising a string is
   shorthand for raising `Exception(message)`. A typed `except E` catches `E`
   and its subclasses; clauses are tested in source order. A bare `except` is a
@@ -656,19 +659,23 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
 - **Cancellation (D-0033; surface D-0044):** structured concurrency — a `scope:`
   block owns the coroutines spawned inside it and joins them at the dedent; a
   child failure cancels siblings and re-raises (an aggregate `ExceptionGroup` if
-  several fail, D-0045). `scope(timeout=30.seconds, on_error=OnError.Cancel|Wait)`
-  adds a deadline and selects the failure policy. Timeout values are nonnegative
-  integer milliseconds, or integer `.seconds` / `.milliseconds` expressions.
-  At expiry, cancellation reaches owned children (including nested scopes and
-  parked channel operations); `finally`/`with` run and the scope awaits them.
-  After draining, a timeout raises `Cancelled`; an already recorded child
-  failure takes precedence. `grace` is an optional integer-millisecond drain
-  limit measured from deadline/signal cancellation, after which the runtime
-  forces process exit.
-  Completion before the deadline disarms the timer. A zero timeout cancels
-  immediately. Cancellation remains cooperative; CPU loops must checkpoint.
-  `spawn detached <call>` opts out of scope ownership (daemon; Go exit semantics).
-  `Cancelled` is outside `Exception`.
+  several fail, D-0045). `scope(timeout=<ms>, on_error=OnError.Cancel|Wait)`
+  adds a deadline and selects the failure policy (D-0093). The `timeout` value is a
+  **nonnegative integer number of milliseconds** — no unit suffix and no `Duration`
+  type (`_` digit separators are allowed, e.g. `timeout=30_000`); a negative value
+  raises `ValueError`, and zero cancels immediately. At expiry, cancellation reaches
+  owned children (including nested scopes and parked channel operations);
+  `finally`/`with` run and the scope awaits them. After draining, the scope raises
+  **`ScopeTimeout`** to its caller — an `Exception` subtype carrying the deadline and
+  the complete set of coroutines still outstanding at the deadline (each by name and
+  what it was parked on). A recorded child failure takes precedence over the
+  timeout. `timeout`, `on_error`, and `cancel_on` are orthogonal: none caps or
+  references another. `grace` is an optional integer-millisecond drain limit
+  measured from deadline/signal cancellation, after which the runtime forces process
+  exit. Completion before the deadline disarms the timer. Cancellation remains
+  cooperative; CPU loops must `checkpoint()`. `spawn detached <call>` opts out of
+  scope ownership (daemon; Go exit semantics). The children receive `Cancelled`,
+  which is outside `Exception`.
 - **Spawn call forms:** named functions, method calls such as
   `spawn server.handle(conn)`, and immediate lambda calls such as
   `spawn (lambda: log(x))()` are intended. Arguments and receiver/closure capture

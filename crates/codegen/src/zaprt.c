@@ -462,6 +462,11 @@ enum {
     ZAP_EXC_STOP_ITERATION = 11,
     ZAP_EXC_CANCELLED = 12,
     ZAP_EXC_EXCEPTION_GROUP = 13,
+    /* Raised *to the caller* when a `scope(timeout=...)` deadline expires (I#475).
+     * The caller is outside the scope and is not itself cancelled, so this is an
+     * ordinary catchable exception under `Exception` — distinct from `Cancelled`,
+     * which the cancelled children receive and which stays outside `Exception`. */
+    ZAP_EXC_SCOPE_TIMEOUT = 14,
 };
 
 void *zap_exception_new(int64_t type_id, void *message) {
@@ -483,6 +488,7 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_VALUE_ERROR: case ZAP_EXC_TYPE_ERROR: case ZAP_EXC_LOOKUP_ERROR:
     case ZAP_EXC_ARITHMETIC_ERROR: case ZAP_EXC_RUNTIME_ERROR:
     case ZAP_EXC_STOP_ITERATION: case ZAP_EXC_EXCEPTION_GROUP:
+    case ZAP_EXC_SCOPE_TIMEOUT:
         return ZAP_EXC_EXCEPTION;
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
     case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;
@@ -3571,6 +3577,7 @@ static int64_t zap_py_exception_type_id(const char *name) {
     if (strcmp(name, "LookupError") == 0) return ZAP_EXC_LOOKUP_ERROR;
     if (strcmp(name, "RuntimeError") == 0) return ZAP_EXC_RUNTIME_ERROR;
     if (strcmp(name, "ExceptionGroup") == 0) return ZAP_EXC_EXCEPTION_GROUP;
+    if (strcmp(name, "ScopeTimeout") == 0) return ZAP_EXC_SCOPE_TIMEOUT;
     if (strcmp(name, "BaseException") == 0) return ZAP_EXC_BASE;
     return ZAP_EXC_EXCEPTION;
 }
@@ -3963,6 +3970,12 @@ typedef struct G {
                          * pinned to, or NULL. While set, the coroutine runs only
                          * on `locked_m` and is excluded from fairness preemption. */
     int lock_depth;     /* LockOSThread nesting count (lock/unlock balance)      */
+    /* Diagnostics (I#475 / D-0058). Both are static C-strings (codegen globals or
+     * runtime literals), never GC-managed, so they need no tracing and stay valid
+     * for the process lifetime. `name` is the spawn target; `park_reason` is what
+     * this G last parked on (set at each park site), reported while it is PARKED. */
+    const char *name;
+    const char *park_reason;
 } G;
 
 typedef struct P {
@@ -4434,6 +4447,8 @@ static G *galloc(void *fn, void *arg) {
     g->parkmu = NULL;
     g->scope = NULL;
     g->in_live = 0;
+    g->name = NULL;
+    g->park_reason = NULL;
     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
     /* Cold end of a down-growing stack is its high address. */
     g->sb.mem_base = (char *)g->stack + g->stack_size;
@@ -5019,6 +5034,13 @@ typedef struct Scope {
     void **excs;           /* collected typed exceptions from owned coroutines */
     int64_t nexc;
     int64_t exc_cap;
+    /* Deadline reporting (I#475). Captured by the deadline at the moment it
+     * fires — i.e. the complete set of coroutines still outstanding — and read
+     * back when `ScopeTimeout` is built. `timeout_msg` is a malloc'd C buffer
+     * (not GC-managed), freed when the exception is built. */
+    int64_t deadline_ms;
+    char *timeout_msg;
+    int64_t timeout_msg_len;
 } Scope;
 
 /* The shared `Cancelled` sentinel (a BaseException-ish marker, design/0005): a
@@ -5154,6 +5176,9 @@ void *zap_scope_enter(int64_t on_error) {
     sc->excs = NULL;
     sc->nexc = 0;
     sc->exc_cap = 0;
+    sc->deadline_ms = 0;
+    sc->timeout_msg = NULL;
+    sc->timeout_msg_len = 0;
     return sc;
 }
 
@@ -5162,10 +5187,24 @@ void zap_scope_set_parent(void *scope_, void *parent_) {
     ((Scope *)scope_)->parent = (Scope *)parent_;
 }
 static void scope_request_cancel(Scope *sc); /* shared channel-aware cancel */
+static void *scope_timeout_exc(Scope *sc);    /* build ScopeTimeout w/ pending set */
+/* Release the captured pending-set buffer when a deadline fired but `ScopeTimeout`
+ * is NOT what surfaces (a child failure outranks it), so the malloc'd report does
+ * not leak. */
+static void scope_discard_timeout_msg(Scope *sc) {
+    zap_np_lock(&sc->mu);
+    char *buf = sc->timeout_msg;
+    sc->timeout_msg = NULL;
+    sc->timeout_msg_len = 0;
+    zap_np_unlock(&sc->mu);
+    free(buf);
+}
 
 /* `spawn <call>` inside a `scope:` (ticket #50): a coroutine owned by `scope`,
- * awaited at the scope's dedent rather than at program exit. */
-void zap_spawn_scoped(void *fn_, void *arg, void *scope_) {
+ * awaited at the scope's dedent rather than at program exit. `name` is a static
+ * C-string identifying the spawn target, carried for `ScopeTimeout` reports and
+ * the coroutine dump (I#475 / D-0058). */
+void zap_spawn_scoped(void *fn_, void *arg, void *scope_, const char *name) {
     zap_sched_init(0);
     Scope *sc = (Scope *)scope_;
     zap_np_lock(&sc->mu);
@@ -5173,6 +5212,7 @@ void zap_spawn_scoped(void *fn_, void *arg, void *scope_) {
     zap_np_unlock(&sc->mu);
     G *g = galloc(fn_, arg);
     g->scope = sc; /* in_live stays 0: the scope, not the root join, owns it */
+    g->name = name;
     sched_enqueue(g);
 }
 
@@ -5181,6 +5221,7 @@ void zap_spawn_scoped(void *fn_, void *arg, void *scope_) {
  * coroutine parks its G so a single worker can run the owned children. */
 static void scope_join(Scope *sc) {
     if (cur_m && cur_m->current) {
+        cur_m->current->park_reason = "nested scope"; /* I#475 diagnostics */
         zap_np_lock(&sc->mu);
         while (sc->live > 0) {
             Waiter w = {0};
@@ -5253,10 +5294,14 @@ void zap_scope_exit(void *scope_) {
      * for a scope with no cancel_on. */
     zap_scope_disarm(sc);
     if (sc->nexc == 0) {
-        if (sc->timed_out) zap_raise(cancelled_exc());
+        /* A recorded child failure would outrank the deadline; with none, the
+         * scope's own deadline surfaces as `ScopeTimeout` to the caller (I#475).
+         * Otherwise an enclosing scope may have cancelled us -> `Cancelled`. */
+        if (sc->timed_out) zap_raise(scope_timeout_exc(sc));
         zap_check_cancel();
         return;
     }
+    if (sc->timed_out) scope_discard_timeout_msg(sc); /* child failure outranks it */
     if (sc->nexc == 1) {
         zap_raise(sc->excs[0]);
     }
@@ -5273,6 +5318,35 @@ void zap_scope_exit_cancel(void *scope_) {
     scope_request_cancel(sc);
     scope_join(sc);
     zap_scope_disarm(sc); /* drop any cancel_on subscription (ticket #77) */
+}
+
+/* The exception landing-pad variant: cancel + await children exactly like
+ * `zap_scope_exit_cancel`, then decide which exception the caller sees and return
+ * it for the generated pad to re-raise (I#475). Precedence (reporting only):
+ *   1. a recorded child failure outranks a block-level `ScopeTimeout`/`Cancelled`
+ *      (so a failing child is never masked by the cancel it triggered);
+ *   2. otherwise, if THIS scope's own deadline fired, the in-flight `Cancelled`
+ *      the body received is replaced by `ScopeTimeout` (the caller is outside the
+ *      scope and should learn it timed out, not that it was cancelled);
+ *   3. otherwise the body's own exception wins — a genuine error, or a `Cancelled`
+ *      injected by an *enclosing* scope, which must propagate upward unchanged. */
+void *zap_scope_exit_cancel_exc(void *scope_, void *pending) {
+    Scope *sc = (Scope *)scope_;
+    scope_request_cancel(sc);
+    scope_join(sc);
+    zap_scope_disarm(sc);
+    int pending_is_cancel = zap_exception_is_a(pending, ZAP_EXC_CANCELLED);
+    if (pending_is_cancel && sc->nexc > 0) {
+        if (sc->timed_out) scope_discard_timeout_msg(sc); /* child failure outranks */
+        if (sc->nexc == 1) return sc->excs[0];
+        return zap_exception_new(ZAP_EXC_EXCEPTION_GROUP,
+                                 make_exception_group(sc->excs, sc->nexc));
+    }
+    if (pending_is_cancel && sc->timed_out) {
+        return scope_timeout_exc(sc);
+    }
+    if (sc->timed_out) scope_discard_timeout_msg(sc); /* body's own exception wins */
+    return pending;
 }
 
 /* An uncaught exception reached a coroutine's base frame (ticket #50, replacing
@@ -5483,6 +5557,7 @@ static void scope_request_cancel(Scope *sc) {
 
 static void chan_block(ZapChan *c, Waiter *w) {
     G *g = cur_m ? cur_m->current : NULL;
+    if (g) g->park_reason = "channel"; /* I#475 diagnostics */
     ScopeWait *node = NULL;
     if (g && g->scope) {
         node = (ScopeWait *)zap_ptrbuf(sizeof(ScopeWait));
@@ -6184,6 +6259,7 @@ int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
     w.val = ZAP_POLL_OK;
     w.ok = 0;
     w.closed = 0;
+    if (cur_m && cur_m->current) cur_m->current->park_reason = "io"; /* I#475 */
     if (is_read) {
         pd->rg = &w;
         pd->r_deadline = deadline_ns;
@@ -6605,8 +6681,14 @@ static void zap_coroutine_dump_to(FILE *f) {
             continue;
         }
         const char *own = g->scope ? "scoped" : (g->in_live ? "root" : "detached");
-        fprintf(f, "  coroutine %lld [%s, %s]\n", (long long)i,
-                gstate_name(g->state), own);
+        const char *nm = g->name ? g->name : "<anonymous>";
+        if (g->state == G_PARKED && g->park_reason) {
+            fprintf(f, "  coroutine %lld %s [%s on %s, %s]\n", (long long)i, nm,
+                    gstate_name(g->state), g->park_reason, own);
+        } else {
+            fprintf(f, "  coroutine %lld %s [%s, %s]\n", (long long)i, nm,
+                    gstate_name(g->state), own);
+        }
     }
     zap_np_unlock(&g_all_mu);
     fprintf(f, "========================\n");
@@ -7069,6 +7151,106 @@ static void zap_grace_arm(ScopeSigSub *ss) {
     pthread_detach(t);
 }
 
+/* Build the `ScopeTimeout` the timed-out scope raises to its caller (I#475). The
+ * message carries the deadline and the COMPLETE set of coroutines still
+ * outstanding at the deadline, captured by `scope_fire_timeout` before any were
+ * cancelled — so a caught timeout never implies the unreported ones succeeded.
+ * The rendered buffer is malloc'd (not GC-managed); copy it into a GC string and
+ * release it here, since the exception is built exactly once per timed-out scope. */
+static void *scope_timeout_exc(Scope *sc) {
+    /* Detach the rendered buffer under the lock, then build the GC string outside
+     * it — no GC allocation is performed while holding `sc->mu`. */
+    zap_np_lock(&sc->mu);
+    char *buf = sc->timeout_msg;
+    int64_t buflen = sc->timeout_msg_len;
+    int64_t deadline = sc->deadline_ms;
+    sc->timeout_msg = NULL;
+    sc->timeout_msg_len = 0;
+    zap_np_unlock(&sc->mu);
+    void *msg;
+    if (buf) {
+        msg = zap_str_new(buf, buflen);
+        free(buf);
+    } else {
+        char tmp[64];
+        int n = snprintf(tmp, sizeof(tmp), "scope timed out after %lld ms",
+                         (long long)deadline);
+        msg = zap_str_new(tmp, n < 0 ? 0 : n);
+    }
+    return zap_exception_new(ZAP_EXC_SCOPE_TIMEOUT, msg);
+}
+
+/* A deadline (or an immediate `timeout=0`) fired on `sc`. Snapshot every
+ * coroutine still outstanding in `sc`'s tree — the complete set by construction,
+ * since the snapshot runs BEFORE cancellation drains them — render the report,
+ * record it on the scope, then cancel the tree through the shared channel-aware
+ * path. The scope's exit reads the report back to build `ScopeTimeout`. Only the
+ * name + last park reason are reported; both are static C-strings already carried
+ * on the G, so no allocation happens under `g_all_mu`. */
+static void scope_fire_timeout(Scope *sc, int64_t deadline_ms) {
+    struct pend_row { const char *name; const char *park; } *rows = NULL;
+    size_t nrows = 0, cap = 0;
+    zap_np_lock(&g_all_mu);
+    for (int64_t i = 0; i < g_all_len; i++) {
+        G *g = g_all[i];
+        if (!g || g->state == G_DEAD || !scope_contains(sc, g->scope)) {
+            continue;
+        }
+        if (nrows == cap) {
+            cap = cap ? cap * 2 : 8;
+            rows = (struct pend_row *)realloc(rows, cap * sizeof(*rows));
+            if (!rows) abort();
+        }
+        rows[nrows].name = g->name ? g->name : "<anonymous>";
+        rows[nrows].park = (g->state == G_PARKED && g->park_reason)
+                               ? g->park_reason
+                               : gstate_name(g->state);
+        nrows++;
+    }
+    zap_np_unlock(&g_all_mu);
+
+    size_t len = 0, mcap = 256;
+    char *msg = (char *)malloc(mcap);
+    if (!msg) abort();
+#define SCOPE_TIMEOUT_APPEND(...)                                              \
+    do {                                                                       \
+        for (;;) {                                                             \
+            int need = snprintf(msg + len, mcap - len, __VA_ARGS__);           \
+            if (need < 0) abort();                                             \
+            if ((size_t)need < mcap - len) {                                   \
+                len += (size_t)need;                                           \
+                break;                                                         \
+            }                                                                  \
+            mcap = (len + (size_t)need + 1) * 2;                               \
+            msg = (char *)realloc(msg, mcap);                                  \
+            if (!msg) abort();                                                 \
+        }                                                                      \
+    } while (0)
+    SCOPE_TIMEOUT_APPEND("scope timed out after %lld ms with %zu coroutine(s) still running",
+                         (long long)deadline_ms, nrows);
+    if (nrows == 0) {
+        SCOPE_TIMEOUT_APPEND(".");
+    } else {
+        SCOPE_TIMEOUT_APPEND(":");
+        for (size_t i = 0; i < nrows; i++) {
+            SCOPE_TIMEOUT_APPEND("\n  - %s [parked on %s]", rows[i].name, rows[i].park);
+        }
+    }
+#undef SCOPE_TIMEOUT_APPEND
+    free(rows);
+
+    zap_np_lock(&sc->mu);
+    sc->timed_out = 1;
+    sc->deadline_ms = deadline_ms;
+    if (sc->timeout_msg) {
+        free(sc->timeout_msg); /* defensive: a scope never fires twice (disarm) */
+    }
+    sc->timeout_msg = msg;
+    sc->timeout_msg_len = (int64_t)len;
+    zap_np_unlock(&sc->mu);
+    scope_request_cancel(sc);
+}
+
 static void *zap_scope_deadline_main(void *arg) {
     ScopeSigSub *ss = (ScopeSigSub *)arg;
     zap_mutator_register();
@@ -7078,9 +7260,7 @@ static void *zap_scope_deadline_main(void *arg) {
     zap_leave_blocking();
     zap_np_lock(&g_sig_mu);
     if (!ss->completed) {
-        Scope *sc = ss->scope;
-        zap_np_lock(&sc->mu); sc->timed_out = 1; zap_np_unlock(&sc->mu);
-        scope_request_cancel(sc);
+        scope_fire_timeout(ss->scope, ss->timeout_ms);
         if (ss->grace_ms > 0) zap_grace_arm(ss);
     }
     if (--ss->refcnt == 0) free(ss);
@@ -7089,21 +7269,24 @@ static void *zap_scope_deadline_main(void *arg) {
     return NULL;
 }
 
-/* Durations are integer milliseconds; seconds syntax supplies scale=1000. */
-void zap_scope_timeout(void *scope_, int64_t duration, int64_t scale, int64_t grace_ms) {
-    if (duration < 0 || duration > INT64_MAX / scale) {
-        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("invalid scope timeout duration", 30));
+/* `scope(timeout=<ms>[, grace=<ms>])` (I#475, D-0093): arm a relative deadline in
+ * integer milliseconds. `timeout=0` cancels immediately; a negative duration is a
+ * `ValueError`. At expiry the tree is cancelled (running `finally`/`with`) and the
+ * scope then raises `ScopeTimeout` to its caller. Orthogonal to `on_error` and
+ * `cancel_on`; `grace` reuses the signal hard-exit drain timer. */
+void zap_scope_timeout(void *scope_, int64_t duration_ms, int64_t grace_ms) {
+    if (duration_ms < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("scope timeout must be a nonnegative number of milliseconds", 58));
     }
     ScopeSigSub *ss = (ScopeSigSub *)calloc(1, sizeof(*ss));
     if (!ss) abort();
-    ss->scope = (Scope *)scope_; ss->timeout_ms = duration * scale;
+    ss->scope = (Scope *)scope_; ss->timeout_ms = duration_ms;
     ss->grace_ms = grace_ms; ss->refcnt = 2;
     zap_np_lock(&g_sig_mu);
     ss->next = g_scope_deadlines; g_scope_deadlines = ss;
     if (ss->timeout_ms == 0) {
-        Scope *sc = ss->scope;
-        zap_np_lock(&sc->mu); sc->timed_out = 1; zap_np_unlock(&sc->mu);
-        scope_request_cancel(sc);
+        scope_fire_timeout(ss->scope, 0);
         if (ss->grace_ms > 0) zap_grace_arm(ss);
         ss->refcnt--; /* no deadline thread for immediate cancellation */
         zap_np_unlock(&g_sig_mu);
