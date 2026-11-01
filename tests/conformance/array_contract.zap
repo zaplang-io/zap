@@ -2,13 +2,13 @@
 # SPEC §15 (I#476): supported one-dimensional array operations and views.
 def main():
     auto empty = array[f64]([])
-    print("empty", len(empty), sum(empty))
+    print("empty", len(empty), str(sum(empty)))
     auto a = array[i64]([1, 2, 3, 4, 5])
     auto b = array[int64]([5, 4, 3, 2, 1])
     print("ops", sum(a + b), sum(a - b), sum(a * b))
     print("broadcast", sum(a + 2), sum(a - 1), sum(2 * a))
     auto f = array[float64]([0.5, 1.5, 2.5, 3.5, 4.5])
-    print("promotion", sum(a + f), sum(a + 0.5))
+    print("promotion", str(sum(a + f)), str(sum(a + 0.5)))
     auto bytes = array[u8]([250, 10])
     print("bytes", sum(bytes), sum(bytes + 10), bytes[0])
     auto flags = array[bool]([True, False, True])
