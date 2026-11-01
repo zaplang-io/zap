@@ -78,6 +78,11 @@ always division). `s///` returns a copy. Captures via a returned match object
 **Status:** Locked (design) / incremental implementation
 Built-in dense numeric array type (`array[T]` / tensor) with a **shape**,
 distinct from `list[T]`. Full N-D is the target, built incrementally (1-D → N-D).
+The supported Experimental subset is specified in SPEC §15 (I#476): flat
+literal construction, four dtypes, `+`/`-`/`*`, scalar broadcasting, `len`/`sum`,
+and contiguous views. Unsupported forms are diagnosed; unequal lengths raise
+`ValueError`. Native floats in direct general-collection slots remain unsupported;
+float fields of tuple/struct values and `array[f64]` remain supported.
 Element-wise operator overloading, broadcasting, NumPy-style slicing (slices are
 **views**, D-0030). SIMD via LLVM vector ops layered on `vec[T,N]`. See
 `design/0002-arrays.md`.

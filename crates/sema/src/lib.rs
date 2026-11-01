@@ -413,6 +413,25 @@ impl Checker {
     /// storage does not support them yet. Reject these shapes during checking
     /// instead of allowing lowering to fail later.
     fn check_numeric_container_type(&mut self, ty: &Type) {
+        let span = match ty {
+            Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Func { span, .. } => *span,
+        };
+        fn float_slots(ty: &Type) -> bool {
+            match ty {
+                Type::Named { name, args, .. } => {
+                    let direct = matches!(name.as_str(), "list" | "dict" | "set" | "heap" | "channel")
+                        && args.iter().any(|a| matches!(a, Type::Named { name, .. } if matches!(name.as_str(), "f32" | "float32" | "f64" | "float64")));
+                    direct || args.iter().any(float_slots)
+                }
+                Type::Tuple { elems, .. } => elems.iter().any(float_slots),
+                Type::Func { params, ret, .. } => {
+                    params.iter().any(float_slots) || ret.as_deref().is_some_and(float_slots)
+                }
+            }
+        }
+        if float_slots(ty) {
+            self.error(ErrorCode::ZAP4027, "floating-point collection elements are unsupported; use array[f64] for dense numeric data".to_string(), span);
+        }
         fn contains_numeric(ty: &Type, in_container: bool) -> bool {
             match ty {
                 Type::Named { name, args, .. } => {
@@ -479,6 +498,21 @@ impl Checker {
                     .to_string(),
                 span,
             );
+        }
+    }
+
+    fn check_float_container_value(&mut self, ty: &Ty, span: Span) {
+        fn unsupported(ty: &Ty) -> bool {
+            let float = |t: &Ty| matches!(t, Ty::Float32 | Ty::Float64 | Ty::UntypedFloat);
+            match ty {
+                Ty::List(t) | Ty::Set(t) | Ty::Heap(t) | Ty::Chan(t) => float(t) || unsupported(t),
+                Ty::Dict(k, v) => float(k) || float(v) || unsupported(k) || unsupported(v),
+                Ty::Tuple(ts) => ts.iter().any(unsupported),
+                _ => false,
+            }
+        }
+        if unsupported(ty) {
+            self.error(ErrorCode::ZAP4027, "floating-point collection elements are unsupported; use array[f64] for dense numeric data".to_string(), span);
         }
     }
 
@@ -2714,6 +2748,7 @@ impl Checker {
     /// normal compile path (`analysis == None`) it is just a tail call.
     fn infer(&mut self, e: &Expr) -> Ty {
         let ty = self.infer_inner(e);
+        self.check_float_container_value(&ty, expr_span(e));
         if let Some(facts) = &mut self.analysis {
             facts.expr_types.push((expr_span(e), ty.clone()));
         }
@@ -3678,8 +3713,44 @@ impl Checker {
         // ordinary value names, so they are not inferred as such. Typed loosely.
         if let Expr::Index { base, index, .. } = callee {
             if matches!(base.as_ref(), Expr::Name(n, _) if n == "array") {
+                let valid_dtype = matches!(index.as_ref(), Expr::Name(n, _) if matches!(n.as_str(), "f64" | "float64" | "i64" | "int64" | "uint8" | "u8" | "bool"));
+                if !valid_dtype {
+                    self.error(
+                        ErrorCode::ZAP4028,
+                        "unsupported array dtype; expected f64, i64, uint8, or bool".to_string(),
+                        expr_span(index),
+                    );
+                }
+                if args.len() != 1 || args.first().is_some_and(|a| a.name.is_some()) {
+                    self.error(
+                        ErrorCode::ZAP4028,
+                        "array[dtype] requires one positional flat list literal".to_string(),
+                        span,
+                    );
+                }
                 for a in args {
-                    self.infer(&a.value);
+                    if let Expr::List(elements, _) = &a.value {
+                        for element in elements {
+                            let ty = self.infer(element);
+                            if !matches!(
+                                ty,
+                                Ty::Unknown
+                                    | Ty::Bool
+                                    | Ty::Char
+                                    | Ty::Int32
+                                    | Ty::Int64
+                                    | Ty::UntypedInt
+                                    | Ty::Float32
+                                    | Ty::Float64
+                                    | Ty::UntypedFloat
+                            ) {
+                                self.error(ErrorCode::ZAP4028, "array elements must be numeric scalars in a flat list literal; nested arrays are unsupported".to_string(), expr_span(element));
+                            }
+                        }
+                    } else {
+                        self.infer(&a.value);
+                        self.error(ErrorCode::ZAP4028, "array construction supports only a flat list literal, not a list variable or iterable".to_string(), expr_span(&a.value));
+                    }
                 }
                 return Ty::Unknown;
             }
@@ -5171,6 +5242,62 @@ mod tests {
     fn ok(src: &str) {
         let e = errors(src);
         assert!(e.is_empty(), "unexpected type errors: {e:?}");
+    }
+
+    #[test]
+    fn array_collection_contract_fixtures_typecheck() {
+        ok(include_str!(
+            "../../../tests/conformance/array_contract.zap"
+        ));
+        ok(include_str!(
+            "../../../tests/conformance/collection_elements.zap"
+        ));
+    }
+
+    #[test]
+    fn floating_collection_slots_are_diagnosed() {
+        for source in [
+            "auto x = [1.5]",
+            "auto x = {1.5}",
+            "auto x = {1.5: 1}",
+            "auto x = {1: 1.5}",
+            "auto x = [f64(n) for n in [1, 2]]",
+            "auto x = channel[f64]()",
+            "auto x = heap[f64]()",
+            "list[f32] x = []",
+            "dict[str, f64] x = {}",
+            "list[list[f64]] x = []",
+        ] {
+            let source = format!("def main():\n    {source}\n");
+            assert!(
+                errors(&source).iter().any(|e| e.code == ErrorCode::ZAP4027),
+                "{source}"
+            );
+        }
+        assert!(errors("def f(list[f64] xs):\n    pass\n")
+            .iter()
+            .any(|e| e.code == ErrorCode::ZAP4027));
+    }
+
+    #[test]
+    fn unsupported_array_constructors_are_diagnosed() {
+        for value in [
+            "array[f32]([1])",
+            "array[i32]([1])",
+            "array[str]([1])",
+            "array[f64]([[1]])",
+            "array[f64]([\"x\"])",
+            "array[f64]()",
+            "array[f64](values=[1])",
+            "array[f64]([1], [2])",
+            "array[i64](values)",
+        ] {
+            let source = format!("def main():\n    auto values = [1,2]\n    auto a = {value}\n");
+            assert!(
+                errors(&source).iter().any(|e| e.code == ErrorCode::ZAP4028),
+                "{source}"
+            );
+        }
     }
 
     #[test]

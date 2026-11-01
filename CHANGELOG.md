@@ -25,6 +25,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- Array length mismatches raise `ValueError` before SIMD kernels run; the
+  Experimental array contract records supported 1-D dtypes, construction,
+  arithmetic and contiguous views. Unsupported array constructors and native
+  floating-point collection slots have semantic diagnostics (#476).
+
 - `scope(timeout=<ms>)` deadlines (integer milliseconds, no unit suffix): on
   expiry the scope cancels and awaits its children through the shared channel-aware
   cancellation path (preserving `finally`/`with` cleanup), then raises the new

@@ -51,9 +51,9 @@ so a fixed gap gets promoted to `# diff: match` instead of silently rotting.
   add your own top-level `main()` call — Zap would run `main` twice.
 * Reduce observations to scalars/strings/bools where possible; don't depend on
   container repr formatting.
-* Render floats and bools through `str(...)` — Zap's bare `print` float/bool
-  format differs from CPython's repr *by design* (see
-  `tests/golden/conversions.zap`); `str(...)` is the Python-faithful rendering.
+* Floats and bools can be printed directly — bare `print` routes scalars
+  through `str(...)`, so a float or bool renders in the same Python-faithful
+  form as `str(...)` with no wrapping needed.
 * Keep every case valid in **both** languages. Zap-only constructs
   (`match`/`case`, `.contains()`, `raise "string"`, `try … else`) are not part
   of the shared subset and belong in the golden suite, not here.

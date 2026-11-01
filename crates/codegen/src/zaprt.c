@@ -1954,9 +1954,8 @@ void *zap_heap_items(void *hp) {
  * reductions. `uint8`/`bool` elements cross the ABI as `int64_t` words (get
  * zero-extends, set truncates to a byte / normalizes to 0|1).
  *
- * Deferred (clean follow-ups): N-D shape + row-major indexing, strides/views
- * (D-0030), broadcasting beyond a scalar, and shape-mismatch runtime checks on
- * element-wise ops. */
+ * Deferred: N-D shape + multi-axis indexing, strided views, and broadcasting
+ * beyond a scalar. Contiguous views and shape checks are supported (I#476). */
 enum { DTYPE_F64 = 0, DTYPE_I64 = 1, DTYPE_U8 = 2, DTYPE_BOOL = 3 };
 
 typedef struct {
@@ -2032,6 +2031,16 @@ static void zap_array_bounds(ZapArray *a, int64_t i) {
         fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
                 (long long)i, (long long)a->dims[0]);
         abort();
+    }
+}
+
+/* Validate both operands before a SIMD kernel reads either data buffer. */
+void zap_array_check_shape(void *left, void *right) {
+    ZapArray *a = (ZapArray *)left;
+    ZapArray *b = (ZapArray *)right;
+    if (a->dims[0] != b->dims[0]) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("array length mismatch", 21));
     }
 }
 

@@ -23,7 +23,24 @@ differentiator. This type is distinct from `list[T]`:
 - `list[T]` — generic, growable, heterogeneous-capable container.
 - `array[T]` (aka tensor) — dense, contiguous, fixed-dtype, shaped, vectorized.
 
-## Proposal
+## Current Experimental contract (I#476)
+
+The normative supported subset is SPEC §15: one-dimensional arrays constructed
+from a single flat list literal; dtypes `f64`/`float64`, `i64`/`int64`,
+`uint8`/`u8`, and `bool`; one integer index; `len`, `sum`, element-wise `+`/`-`/`*`,
+scalar broadcasting (`+`/`*` on either side, `-` with array on the left), mixed
+dtype promotion, and contiguous view slices (optional literal step `1`).
+Unequal lengths raise `ValueError` before entering the SIMD kernel. Empty arrays
+are supported. No shape/ndim attribute is exposed; length is the only dimension.
+
+N-D shapes, `zeros`/`arange`/`sqrt`, axis reductions, division/comparison kernels,
+strided views, `f32`/`i32`, and list-variable/iterable constructors are future
+design work. The broader examples below describe that future design rather than
+an available surface. Unsupported forms receive semantic or lowering errors.
+Native floats remain unsupported in direct general-collection slots; float
+fields inside tuples/structs remain valid. Numeric float buffers use `array[f64]`.
+
+## Proposal (future N-D design)
 
 ### Type
 
@@ -158,8 +175,6 @@ header + buffer layout, GC-managed buffer).
   strides the 1-D `ZapArray` has not got, so a stepped array slice is rejected at
   compile time for now (a list slice, a copy, supports any step).
 - `f32`/`i32` dtypes; `zeros`/`arange`/`sqrt` and axis reductions.
-- Shape-mismatch runtime exceptions on element-wise ops; element-wise ops
-  currently assume equal lengths.
 - Scalar-on-the-left of a non-commutative op (`scalar - array`).
 - `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 

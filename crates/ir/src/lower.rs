@@ -7629,6 +7629,9 @@ impl<'a> FnLower<'a> {
             }
             Expr::Unary { op, expr, .. } => {
                 let (v, t) = self.expr(expr)?;
+                if matches!(t, Ty::Array(_)) && matches!(op, AstUn::Neg | AstUn::BitNot) {
+                    return Err(err("element-wise unary array operations are unsupported"));
+                }
                 // Unary operator overloading on user structs (D-0047): `-a` ->
                 // `a.__neg__()`, `+a` -> `a.__pos__()`, `~a` -> `a.__invert__()`.
                 // `not a` goes through `truthy` (which calls `__bool__`).
@@ -7844,6 +7847,9 @@ impl<'a> FnLower<'a> {
                     }
                 }
                 let (bv, bty) = self.expr(base)?;
+                if matches!(bty, Ty::Array(_)) {
+                    return Err(err(format!("array attribute '{name}' is unsupported; arrays are one-dimensional and expose length via len(a)")));
+                }
                 // Attribute read on a Python handle, e.g. `np.pi` (ticket #27,
                 // D-0012). A call `np.foo(...)` is intercepted in `call` before
                 // reaching here, so this is a plain attribute access.
@@ -10390,10 +10396,8 @@ impl<'a> FnLower<'a> {
             return Err(err("array[...] expects a dtype name, e.g. array[f64]"));
         };
         let dtype = dtype_from_name(dname)?;
-        if args.len() != 1 {
-            return Err(err(
-                "array[T](...) takes exactly one argument (a list literal)",
-            ));
+        if args.len() != 1 || args[0].name.is_some() {
+            return Err(err("array[T](...) takes one positional flat list literal"));
         }
         let Expr::List(elems, _) = &args[0].value else {
             return Err(err(
@@ -10412,6 +10416,11 @@ impl<'a> FnLower<'a> {
         let setter = format!("zap_array_set_{}", dtype.suffix());
         for (i, e) in elems.iter().enumerate() {
             let (v, vt) = self.expr(e)?;
+            if vt.int_width().is_none() && !vt.is_float() {
+                return Err(err(
+                    "array construction requires numeric scalars in one flat list literal",
+                ));
+            }
             let v = self.coerce(v, vt, dtype.ty());
             let idx = self.iconst(Ty::I64, i as i64);
             self.emit(Inst::Call {
@@ -11118,9 +11127,11 @@ impl<'a> FnLower<'a> {
                 Ok((d, vk.ty()))
             }
             Ty::Array(d) => {
-                // 1-D element access `a[i]`. Multi-axis indexing `m[i, j]` and
-                // slices are deferred (N-D track).
+                // One-dimensional access; reject multi-axis indices before coercion.
                 let (iv, it) = self.expr(index)?;
+                if it.int_width().is_none() {
+                    return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
+                }
                 let iv = self.coerce(iv, it, Ty::I64);
                 let dest = self.new_value(d.ty());
                 self.emit(Inst::Call {
@@ -11183,6 +11194,21 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    fn array_slice_bound(&mut self, expr: Option<&Expr>) -> Result<(Value, Value), LowerError> {
+        if let Some(expr) = expr {
+            let (value, ty) = self.expr(expr)?;
+            if ty.int_width().is_none() {
+                return Err(err("array slice bounds must be integers"));
+            }
+            let value = self.coerce(value, ty, Ty::I64);
+            let present = self.iconst(Ty::I64, 1);
+            Ok((value, present))
+        } else {
+            let zero = self.iconst(Ty::I64, 0);
+            Ok((zero, zero))
+        }
+    }
+
     /// `s[lo:hi:step]` → a new value. `str` slices by codepoint (D-0025) and
     /// `bytes` by byte (I#337), both producing a fresh value of the same type. A
     /// `list[T]` slice is a **copy** and an `array[T]` slice is a **view**
@@ -11225,8 +11251,8 @@ impl<'a> FnLower<'a> {
                         ));
                     }
                 }
-                let (lo_v, has_lo) = self.slice_bound(lo)?;
-                let (hi_v, has_hi) = self.slice_bound(hi)?;
+                let (lo_v, has_lo) = self.array_slice_bound(lo)?;
+                let (hi_v, has_hi) = self.array_slice_bound(hi)?;
                 let out = Ty::Array(dt);
                 let d = self.new_value(out);
                 self.emit(Inst::Call {
@@ -11307,8 +11333,14 @@ impl<'a> FnLower<'a> {
             }
             Ty::Array(d) => {
                 let (iv, it) = self.expr(index)?;
+                if it.int_width().is_none() {
+                    return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
+                }
                 let iv = self.coerce(iv, it, Ty::I64);
                 let (v, vt) = self.expr(value)?;
+                if vt.int_width().is_none() && !vt.is_float() {
+                    return Err(err("array element assignment requires a numeric scalar"));
+                }
                 let v = self.coerce(v, vt, d.ty());
                 self.emit(Inst::Call {
                     dest: None,
@@ -12962,6 +12994,7 @@ impl<'a> FnLower<'a> {
         let is_scalar = |t: Ty| t.is_float() || t.int_width().is_some();
         match (lt, rt) {
             (Ty::Array(ld), Ty::Array(rd)) => {
+                self.throwing_call(None, "zap_array_check_shape", vec![l, r]);
                 let out = Dtype::promote(ld, rd);
                 let dest = self.new_value(Ty::Array(out));
                 self.emit(Inst::ArrayBinOp {

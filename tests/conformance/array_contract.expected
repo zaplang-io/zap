@@ -1,0 +1,11 @@
+empty 0 0.0
+ops 30 0 35
+broadcast 25 10 30
+promotion 27.5 17.5
+bytes 260 24 250
+bool 2 4
+view 3 20 40 20
+nested 30 72
+empty view 0 0
+shape error array length mismatch
+empty shape error

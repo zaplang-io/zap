@@ -364,6 +364,12 @@ define_codes! {
          strings; the `!r`/`!a` conversions require the Display protocol (#274).";
     ZAP4025 = 4025 : "wrong number of arguments to built-in",
         "A built-in was called with the wrong number of arguments.";
+    ZAP4027 = 4027 : "unsupported floating-point collection",
+        "Floating-point values are not supported as direct list, dict, set, heap, \
+         or channel elements. Use array[f64] for dense numeric data.";
+    ZAP4028 = 4028 : "unsupported array construction",
+        "Experimental arrays require one flat list literal and a supported dtype: \
+         f64, i64, uint8, or bool (including their documented aliases).";
     ZAP4030 = 4030 : "receive needs a channel",
         "The `<-` receive operator requires a channel operand.";
     ZAP4031 = 4031 : "send needs a channel",

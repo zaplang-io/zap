@@ -1,0 +1,10 @@
+ints 2 3
+bools 2
+strings one
+dict 1
+set 2 True
+enum BLUE
+struct float 1.5
+tuple float 2.5
+heap 1
+channel 7
