@@ -13520,9 +13520,12 @@ void zap_net_close(void *s_) {
  * Only the unified post-1.1.0 OpenSSL API is used (TLS_client_method, automatic
  * library init, SSL_CTX_set_min_proto_version, SSL_set1_host), identical across
  * OpenSSL 1.1.1 / 3.x and LibreSSL >= 2.7, so no version #ifdef is needed; the
- * CI image is OpenSSL 3.0.13 on Ubuntu 24.04. The TLS server is deferred — the
- * self-signed loopback echo server behind `tls._test_server()` is a test
- * scaffold only (its cert gen uses the OpenSSL 3.0 API, the CI target).
+ * CI image is OpenSSL 3.0.13 on Ubuntu 24.04. The public TLS **server**
+ * (`tls.listen`/`accept`/`port`/`close_listener`, ticket #488, D-0093) lives
+ * just below the client; it loads a cert+key from disk and runs the server-side
+ * handshake over the same netpoller machinery. The self-signed loopback echo
+ * server behind `tls._test_server()` remains an internal test scaffold (its cert
+ * gen uses the OpenSSL 3.0 API, the CI target).
  *
  * GC discipline mirrors the net section: the `ZapTls` handle is ATOMIC (fd is a
  * scalar; pd / SSL* / SSL_CTX* are non-GC infra), fd/pd/SSL* are pulled into C
@@ -13806,8 +13809,209 @@ void zap_tls_close(void *t_) {
     }
 }
 
+/* ---- public TLS server (ticket #488, D-0093) ------------------------------ *
+ * The server half of D-0062, generalized from the `_test_server` scaffold into a
+ * caller-driven surface: `tls.listen` loads a cert+key from PEM files on disk
+ * into a server SSL_CTX and binds host:port; `tls.accept` accepts a socket and
+ * runs the SERVER-side handshake over the netpoller (WANT_READ/WANT_WRITE park
+ * the coroutine), returning the SAME `ZapTls` handle the client produces — so
+ * `tls.send`/`recv`/`close_conn`, and `http.read_request`/`_write` layered over
+ * them, work unchanged. Closing the listener wakes a coroutine parked in
+ * `tls.accept` with CLOSED so it RAISES, exactly as `net.close_listener`
+ * unblocks `net.accept` (the staged graceful-shutdown contract #488 needs).
+ *
+ * The shared server SSL_CTX is reference-counted: the listener holds one ref
+ * (released by `tls.close_listener`) and each accepted conn takes its own via
+ * SSL_CTX_up_ref (released by the existing SSL_CTX_free in `tls.close_conn`), so
+ * a conn safely outlives its listener. Same unified post-1.1.0 OpenSSL API as
+ * the client (TLS_server_method, SSL_CTX_set_min_proto_version) — no new crypto.
+ *
+ * A TLS listener handle: an owned listening fd (+ netpoller desc) and the shared
+ * server SSL_CTX every accepted connection is cloned from. ATOMIC like
+ * ZapSock/ZapTls (fd is a scalar; pd/ctx are non-GC infra). Freed explicitly by
+ * `tls.close_listener`. */
+typedef struct {
+    int fd;
+    void *pd;
+    SSL_CTX *ctx;
+} ZapTlsListener;
+
+static const ZapTypeDesc zap_desc_tls_listener = {(int64_t)sizeof(ZapTlsListener), ZAP_TD_ATOMIC, 0,
+                                                  NULL};
+
+/* Build a server SSL_CTX from a PEM certificate(-chain) file and a PEM private
+ * key file, both on disk. Floors at TLS 1.2, as the client. Returns NULL on any
+ * failure (bad path, malformed PEM, key/cert mismatch); the OpenSSL error queue
+ * carries the reason for the caller's raise. */
+static SSL_CTX *zap_tls_make_server_ctx(const char *cert_path, const char *key_path) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        return NULL;
+    }
+    (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_path) != 1 ||
+        SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) != 1 ||
+        SSL_CTX_check_private_key(ctx) != 1) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+/* Run the SERVER-side TLS handshake on an already-accepted, non-blocking client
+ * fd `cfd` (+ netpoller desc `cpd`) using `ctx` (whose ref the caller already
+ * holds). Parks on WANT_READ/WANT_WRITE. On success returns the SSL session, now
+ * owned by the caller; on failure returns NULL having freed its own SSL but
+ * leaving cfd/cpd and the ctx ref for the caller to clean up. Shared by
+ * `tls.accept` and the `_test_server` scaffold. */
+static SSL *zap_tls_server_handshake(int cfd, void *cpd, SSL_CTX *ctx) {
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) {
+        return NULL;
+    }
+    SSL_set_fd(ssl, cfd);
+    SSL_set_accept_state(ssl);
+    for (;;) {
+        int r = SSL_accept(ssl);
+        if (r == 1) {
+            return ssl;
+        }
+        if (zap_tls_want(ssl, r, cfd, cpd) != 0) {
+            SSL_free(ssl); /* BIO_NOCLOSE: leaves cfd for the caller */
+            return NULL;
+        }
+    }
+}
+
+/* tls.listen(host, port, cert_path, key_path) -> listener handle. Loads the
+ * cert+key into a server SSL_CTX, then binds+listens via the shared net path
+ * (SO_REUSEADDR; port 0 => OS-assigned ephemeral, read back with tls.port). */
+void *zap_tls_listen(void *host_, int64_t port, void *cert_, void *key_) {
+    char *cert = zap_net_dupz((const ZapStr *)cert_);
+    char *key = zap_net_dupz((const ZapStr *)key_);
+    if (!cert || !key) {
+        free(cert);
+        free(key);
+        zap_net_panic("tls: out of memory");
+        return NULL;
+    }
+    SSL_CTX *ctx = zap_tls_make_server_ctx(cert, key);
+    if (!ctx) {
+        char saved[384];
+        unsigned long e = ERR_get_error();
+        if (e) {
+            char b[256];
+            ERR_error_string_n(e, b, sizeof b);
+            snprintf(saved, sizeof saved, "tls: listen: loading cert/key failed: %s", b);
+        } else {
+            snprintf(saved, sizeof saved, "tls: listen: loading cert/key failed");
+        }
+        free(cert);
+        free(key);
+        zap_net_panic(saved);
+        return NULL;
+    }
+    free(cert);
+    free(key);
+    /* Bind+listen (raises on failure). Pull fd/pd out of the GC ZapSock; the
+     * listener is a distinct ATOMIC handle that also owns the shared server ctx. */
+    void *l_v = zap_net_listen(host_, port);
+    ZapSock *s = (ZapSock *)l_v;
+    int fd = s->fd;
+    void *pd = s->pd;
+    ZapTlsListener *l = (ZapTlsListener *)zap_obj(&zap_desc_tls_listener);
+    l->fd = fd;
+    l->pd = pd;
+    l->ctx = ctx;
+    return l;
+}
+
+/* tls.accept(listener) -> conn handle. Accepts a socket (parking on the listener
+ * until a peer connects) and runs the server-side handshake over the netpoller,
+ * looping past any client whose handshake fails so one bad peer never kills the
+ * accept loop. Callable repeatedly — one wrapped conn per accepted socket.
+ * Closing the listener wakes the parked accept with CLOSED, which RAISES (the
+ * net contract). fd/pd/ctx are pulled into C locals up front (the GC listener is
+ * never touched across a park), and the GC ZapTls is built only after the last
+ * handshake park. */
+void *zap_tls_accept(void *l_) {
+    ZapTlsListener *l = (ZapTlsListener *)l_;
+    zap_fd_t lfd = l->fd;
+    void *lpd = l->pd;
+    SSL_CTX *ctx = l->ctx;
+    for (;;) {
+        /* SSL_set_fd takes an int fd on every platform; a Windows socket handle
+         * fits (INVALID_SOCKET truncates to -1, so the `< 0` check holds). */
+        int cfd = (int)accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+            int e = ZAP_SOCK_ERR();
+            if (ZAP_SOCK_EINTR(e)) {
+                continue;
+            }
+            if (ZAP_SOCK_WOULDBLOCK(e)) {
+                if (zap_sock_park(lfd, lpd, ZAP_POLL_READ) < 0) {
+                    zap_net_panic("tls: accept on a closed listener");
+                    return NULL;
+                }
+                continue;
+            }
+            zap_net_panic("tls: accept failed");
+            return NULL;
+        }
+        zap_sock_make_nonblocking(cfd);
+        void *cpd = zap_netpoll_open((int64_t)cfd);
+        SSL_CTX_up_ref(ctx); /* the conn's own ref, released by tls.close_conn */
+        SSL *ssl = zap_tls_server_handshake(cfd, cpd, ctx);
+        if (!ssl) {
+            SSL_CTX_free(ctx); /* undo the up-ref for this failed conn */
+            zap_sock_shutdown(cfd, cpd);
+            continue; /* bad handshake — skip this peer, keep accepting */
+        }
+        ZapTls *t = (ZapTls *)zap_obj(&zap_desc_tls);
+        t->fd = cfd;
+        t->pd = cpd;
+        t->ssl = ssl;
+        t->ctx = ctx; /* up-ref'd above; close_conn's SSL_CTX_free balances it */
+        return t;
+    }
+}
+
+/* tls.port(listener) -> int64 bound local port (resolves an ephemeral 0), so a
+ * `tls.listen(host, 0, ...)` can be discovered. Mirrors net.port. */
+int64_t zap_tls_port(void *l_) {
+    ZapTlsListener *l = (ZapTlsListener *)l_;
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    if (getsockname(l->fd, (struct sockaddr *)&ss, &sl) != 0) {
+        return 0;
+    }
+    if (ss.ss_family == AF_INET6) {
+        return (int64_t)ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+    }
+    return (int64_t)ntohs(((struct sockaddr_in *)&ss)->sin_port);
+}
+
+/* tls.close_listener(listener). Deregisters the listening fd from the netpoller
+ * — waking any coroutine parked in tls.accept with CLOSED so it RAISES, the
+ * graceful-shutdown contract (#488) — closes the fd and releases the listener's
+ * server-ctx ref. Accepted conns hold their own ctx refs, so they survive.
+ * Idempotent: a second close is a no-op. */
+void zap_tls_close_listener(void *l_) {
+    ZapTlsListener *l = (ZapTlsListener *)l_;
+    if (l->fd < 0) {
+        return;
+    }
+    zap_sock_shutdown(l->fd, l->pd);
+    l->pd = NULL;
+    l->fd = -1;
+    if (l->ctx) {
+        SSL_CTX_free(l->ctx);
+        l->ctx = NULL;
+    }
+}
+
 /* ---- internal self-signed loopback echo server (test scaffold) ------------ *
- * Behind `tls._test_server()`. The public TLS server is deferred (#147); this
+ * Behind `tls._test_server()`. Predates the public server above (#488); this
  * exists only so the golden suite can drive the real client end to end against a
  * server-generated self-signed cert with no outbound network. It generates an
  * ephemeral RSA key + self-signed X509 (CN=localhost), binds 127.0.0.1:0, and
@@ -13882,32 +14086,17 @@ static void *zap_tls_test_serve(void *arg) {
     {
         zap_sock_make_nonblocking(cfd);
         void *cpd = zap_netpoll_open((int64_t)cfd);
-        SSL *ssl = SSL_new(ctx);
+        SSL *ssl = zap_tls_server_handshake(cfd, cpd, ctx); /* shared with tls.accept */
         if (ssl) {
-            SSL_set_fd(ssl, cfd);
-            SSL_set_accept_state(ssl);
-            int ok = 1;
+            char rb[4096];
             for (;;) {
-                int r = SSL_accept(ssl);
-                if (r == 1) {
-                    break;
+                int r = SSL_read(ssl, rb, (int)sizeof rb);
+                if (r > 0) {
+                    (void)zap_tls_write_all(ssl, cfd, cpd, rb, (size_t)r);
+                    break; /* echo one record, done */
                 }
                 if (zap_tls_want(ssl, r, cfd, cpd) != 0) {
-                    ok = 0;
                     break;
-                }
-            }
-            if (ok) {
-                char rb[4096];
-                for (;;) {
-                    int r = SSL_read(ssl, rb, (int)sizeof rb);
-                    if (r > 0) {
-                        (void)zap_tls_write_all(ssl, cfd, cpd, rb, (size_t)r);
-                        break; /* echo one record, done */
-                    }
-                    if (zap_tls_want(ssl, r, cfd, cpd) != 0) {
-                        break;
-                    }
                 }
             }
             SSL_shutdown(ssl);

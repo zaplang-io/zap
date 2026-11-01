@@ -1,10 +1,12 @@
-//! `tls` module — lowering facet (ticket #147, D-0062).
+//! `tls` module — lowering facet (tickets #147, #488; D-0062, D-0093).
 //!
 //! Each call lowers to a backing `zap_tls_*` runtime entry point over
-//! `str`/`int64`/handle (`ptr`) words. The handshake, I/O and the test server
-//! can raise (connect failure, certificate verification failure, protocol
-//! error) so they are emitted with `throwing_call` (catchable inside `try`);
-//! `close_conn` is infallible. See the "tls (#147)" section of `zaprt.c`.
+//! `str`/`int64`/handle (`ptr`) words. The handshake, I/O, `listen`/`accept` and
+//! the test server can raise (connect/bind failure, certificate verification
+//! failure, protocol error, accept on a closed listener) so they are emitted
+//! with `throwing_call` (catchable inside `try`); `port`, `close_conn` and
+//! `close_listener` are infallible plain calls. See the "tls" sections of
+//! `zaprt.c`.
 
 use zapc_syntax::ast;
 
@@ -24,9 +26,13 @@ fn lower(
     Ok(Some(match method {
         "connect" => call_ret(lowerer, "zap_tls_connect", a, Ty::Ptr, true),
         "connect_insecure" => call_ret(lowerer, "zap_tls_connect_insecure", a, Ty::Ptr, true),
+        "listen" => call_ret(lowerer, "zap_tls_listen", a, Ty::Ptr, true),
+        "accept" => call_ret(lowerer, "zap_tls_accept", a, Ty::Ptr, true),
+        "port" => call_ret(lowerer, "zap_tls_port", a, Ty::I64, false),
         "recv" => call_ret(lowerer, "zap_tls_recv", a, Ty::Ptr, true),
         "send" => call_ret(lowerer, "zap_tls_send", a, Ty::I64, true),
         "close_conn" => call_void(lowerer, "zap_tls_close", a, false),
+        "close_listener" => call_void(lowerer, "zap_tls_close_listener", a, false),
         "_test_server" => call_ret(lowerer, "zap_tls_test_server", a, Ty::I64, true),
         _ => return Ok(None),
     }))
