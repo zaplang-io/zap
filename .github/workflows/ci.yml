@@ -199,11 +199,41 @@ jobs:
   # packages as .devcontainer/Dockerfile, then build and test the whole
   # workspace with codegen enabled (includes the golden end-to-end:
   # fib=55, loop_sum=45, hello).
+  #
+  # The two garbage collectors (default precise Immix, fallback Boehm) run as
+  # CONCURRENT matrix legs rather than two sequential `cargo` runs in one job.
+  # Running the whole workspace test suite once per collector back-to-back was
+  # ~9.5 min of the ~11 min job; as parallel legs each leg is ~half that in
+  # wall-clock. `fail-fast: false` keeps the other collector running when one
+  # fails. Each leg caches independently via a per-collector `shared-key`, so a
+  # leg builds its own feature set from a warm cache instead of flipping the
+  # `zapc/gc-*` feature in one checkout and recompiling. Clippy for a leg's own
+  # collector rides that leg, preserving clippy coverage of BOTH feature sets
+  # (fmt is already gated by the `host` job, so it is not repeated here).
+  #
+  # The job id stays `full`: `ci-gate`'s `needs: [full]` waits for ALL legs and
+  # is green only if every leg succeeds, so the required "CI gate" status check
+  # is unchanged (the per-leg check runs just gain a `(gc-immix)`/`(gc-boehm)`
+  # suffix).
+  #
+  # NOTE (container follow-up): the prebuilt ghcr.io/zaplang-io/zap image is the
+  # SLIM runtime stage of the root Dockerfile (just the `zap` CLI + a C link
+  # toolchain — "No Rust, no LLVM dev libraries", see docs/DOCKER.md), published
+  # for downstream package repos to run `zap test`. It cannot build the
+  # LLVM-linked compiler from source, which is what this job does, so the apt
+  # step below stays. Using a container here would require publishing the
+  # Dockerfile's *builder* stage as its own image (a docker.yml change, out of
+  # scope for this PR).
   full:
     name: full (LLVM 18 + codegen)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      # Run both collectors concurrently; don't cancel one leg if the other fails.
+      fail-fast: false
+      matrix:
+        gc: [gc-immix, gc-boehm]
     env:
       # Where llvm-sys / inkwell (llvm18-0) find LLVM 18. Matches the Dockerfile.
       LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
@@ -247,41 +277,42 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: full
+          shared-key: full-${{ matrix.gc }}
 
-      - name: Format check
-        run: cargo fmt --all -- --check
+      # Clippy for THIS leg's collector. The immix leg gates the gc-immix feature
+      # set and the boehm leg gates gc-boehm, so both are covered — just spread
+      # across the two parallel legs instead of run twice in one job.
+      - name: "Clippy (${{ matrix.gc }})"
+        run: cargo clippy --workspace --features zapc/${{ matrix.gc }} --all-targets -- -D warnings
 
-      # Default collector: the precise Immix GC (ticket #116). This is now the
-      # primary codegen suite — the same golden end-to-end path plus the
-      # GC-specific reclamation tests (tests/gc.rs).
-      - name: "Clippy (default: precise Immix GC)"
-        run: cargo clippy --workspace --features zapc/gc-immix --all-targets -- -D warnings
-
-      # Fallback collector: the conservative Boehm GC (`-lgc`), kept covered as
-      # the secondary suite. Folded into the `full` check so the two-check CI
-      # contract (host + full) is unchanged.
-      - name: "Clippy (fallback: Boehm GC)"
-        run: cargo clippy --workspace --features zapc/gc-boehm --all-targets -- -D warnings
-
-      - name: "Test (default: precise Immix GC)"
-        run: cargo test --workspace --features zapc/gc-immix
-
-      - name: "Test (fallback: Boehm GC)"
-        run: cargo test --workspace --features zapc/gc-boehm
+      # Test THIS leg's collector only (the golden end-to-end path plus the
+      # GC-specific reclamation tests for this collector).
+      - name: "Test (${{ matrix.gc }})"
+        run: cargo test --workspace --features zapc/${{ matrix.gc }}
 
   # ARM-Linux (aarch64) validation (ticket #204, platform epic #158 / C2). The
   # same codegen + golden end-to-end suite as `full`, run natively on a GitHub-
   # hosted arm64 runner (no emulation: the runtime's ucontext coroutine switch,
   # SIGURG preemption and epoll netpoller must be exercised on real aarch64
   # hardware, and QEMU-user cannot faithfully emulate swapcontext-from-signal-
-  # handler). Both collectors, mirroring `full`. Clippy/fmt stay on x86 (`host`
+  # handler). Both collectors, mirroring `full` — and like `full` they now run as
+  # CONCURRENT matrix legs (see the `full` header) instead of two sequential
+  # `cargo` runs, halving this job's wall-clock. Clippy/fmt stay on x86 (`host`
   # and `full` already gate them; they are target-independent).
+  #
+  # No container here: the prebuilt ghcr.io/zaplang-io/zap image is amd64-only
+  # (docker.yml's build-push sets no `platforms:`) AND is the slim runtime image
+  # that cannot build the compiler from source (see the `full` header), so the
+  # apt install stays. A multi-arch *builder* image would be a future follow-up.
   arm64:
     name: arm64 (aarch64 Linux + codegen)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        gc: [gc-immix, gc-boehm]
     env:
       LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
       LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
@@ -324,13 +355,10 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: arm64
+          shared-key: arm64-${{ matrix.gc }}
 
-      - name: "Test (default: precise Immix GC)"
-        run: cargo test --workspace --features zapc/gc-immix
-
-      - name: "Test (fallback: Boehm GC)"
-        run: cargo test --workspace --features zapc/gc-boehm
+      - name: "Test (${{ matrix.gc }})"
+        run: cargo test --workspace --features zapc/${{ matrix.gc }}
 
   # Windows coroutine context switch (ticket #195, platform epic #158 / Area A1).
   # REQUIRED (no `continue-on-error`): unlike the broader `windows` job below —
