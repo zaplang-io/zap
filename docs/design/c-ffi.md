@@ -424,6 +424,40 @@ Proposed epic: **"C FFI (D-0012)"**. Sub-issues, ordered by dependency:
 **hiredis** (async-fd → netpoller path, modest surface), then `postgres` over
 **libpq**.
 
+### Prerequisites & accelerants (sequence first)
+
+Several existing deferred/open decisions materially change FFI's cost or
+soundness and should be sequenced ahead of the FFI tickets.
+
+**Prerequisites** (FFI is weaker or dishonest without them):
+
+- **Scheduler P-handoff** (deferred — I#119: "M:P 1:1 … no P-handoff"). Without
+  it a blocking C call stalls its P's coroutines; the async-fd→netpoller path
+  (§7b) is the only way around it. *Gates FFI-0 for synchronous C libraries.*
+- **Unsigned integers** (D-0019, deferred — OPEN-QUESTIONS: "likely reintroduced
+  only for C interop"). C APIs are saturated with `uint8/uint16/uint32/size_t`;
+  without real unsigned types §4's mapping and `@repr(c)` are casts-and-prayers.
+  *Do before FFI-2 / FFI-4.*
+
+**Accelerants** (FFI ships faster / safer / more static):
+
+- **musl / fully-static link mode** (Open; the #287 portability work notes "a
+  static/musl link mode" needing musl builds of OpenSSL/zlib/GC). Gives `-sys`
+  packages clean self-contained static binaries and makes the Appendix-A
+  interposition viable; shares the vendored-C build muscle FFI-7 needs. *Pairs
+  with FFI-7.*
+- **Arena / region allocation** (deferred — its own gate, "revisit **after**
+  precise GC lands," is now satisfied by I#116/I#120). A `scope:`-bound,
+  non-moving, escape-checked region is the principled primitive for pinning
+  buffers across a C section (§5) and for the segregated C arena (§9.3 /
+  Appendix A). *Feeds FFI-4 and FFI-11.*
+- **Richer reflection + field/parameter decorators + macro API** (the D-0036
+  remainder; D-0087/D-0089 already landed). Makes `@repr(c)` a natural field
+  decorator and enables the header→binding generator (FFI-10). *Pairs with
+  FFI-2 / FFI-10.*
+
+Explicitly **not** prerequisites: the `set` type and `**kwargs` — no FFI bearing.
+
 ### Ecosystem payoff
 
 With FFI in place, many `#333` tickets drop from **L/XL → S/M** (bind + wrap
