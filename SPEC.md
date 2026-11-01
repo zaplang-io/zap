@@ -934,6 +934,24 @@ the server-managed `Content-Length` and `Connection: close` are always computed
 and any same-named map entry is ignored. `http` is **Experimental**
 (STABILITY.md §4.4).
 
+**`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
+*Client (#147):* `tls.connect(host, port)` verifies the certificate chain
+against the system trust store **and** the hostname (on by default);
+`tls.connect_insecure(host, port)` is the loudly-named opt-out (never the
+default). *Server (#488):* `tls.listen(host, port, cert_path, key_path)` loads a
+certificate(-chain) and private key from **PEM files on disk** into a server
+context and binds host:port (port `0` → OS-assigned ephemeral, read back with
+`tls.port(listener) -> int64`); `tls.accept(listener)` accepts a socket, runs the
+**server-side** handshake over the netpoller and returns a conn — the **same
+opaque handle** the client produces, callable in a loop (one conn per accept).
+`tls.close_listener(listener)` closes a listener, which makes a coroutine parked
+in `tls.accept` **raise**, exactly as `net.close_listener` unblocks `net.accept`
+(the graceful-shutdown contract). Both ends share `tls.send(conn, data) ->
+int64`, `tls.recv(conn, n) -> str` and `tls.close_conn(conn)` (`close` is the
+reserved channel-close token, so sockets spell it `close_conn` / `close_listener`,
+as in `net`). `http` routes `https://` through the client with verification on.
+`tls` is **Experimental** (STABILITY.md §4.4).
+
 **`url` — `encoding/url` percent-encoding (#335).** RFC-3986 percent-encoding and
 decoding over raw UTF-8 bytes, plus the AWS-query canonicalization variant used
 by SigV4. A `str`'s bytes are its UTF-8 encoding, so every function encodes

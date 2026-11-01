@@ -2604,3 +2604,53 @@ a hand-built per-request context struct) with handler parameters
 their own deps as `Depends` parameters. Drop the manual per-request context — the
 adapter resolves once per request. Request-derived values (headers, path, query,
 body) stay read off `req` inside providers/handlers (scope boundary above).
+## D-0093 — `tls`: public TLS **server** surface (un-defer the #147 server half)
+**Status:** Locked — resolves issue #488, un-defers the TLS **server** that
+[[D-0062]] (`tls` client) explicitly left as a follow-up. Directly unblocks
+fastzap#5 (HTTPS / TLS termination): fastzap's accept loop wraps `net.accept`
+with a server-side handshake and relies on listener-close unblocking accept. No
+grammar change (all generic module calls); same OpenSSL backend and netpoller
+discipline as D-0062 — this is **surfacing + cert/key-from-disk + an accept-loop
+shape**, not new crypto. The only server path before this was the internal
+`tls._test_server()` scaffold (hardwired ephemeral self-signed cert, one-shot
+echo); its OpenSSL machinery (server `SSL_CTX`, `SSL_accept` over the netpoller,
+server-side read/write parking) is generalized here, and `_test_server` keeps
+working for the `tls_echo`/`tls_verify_reject` goldens (the handshake loop is now
+a shared helper).
+
+- **Surface.** `tls`: `listen(host, port, cert_path, key_path)` → an opaque TLS
+  **listener** handle (`bytes`, a new ATOMIC `ZapTlsListener` = fd + poller desc
+  + a server `SSL_CTX` built from the cert+key **PEM files on disk**);
+  `accept(listener)` → a TLS **conn** handle that runs the SERVER-side handshake
+  over the netpoller — **the SAME `ZapTls` handle the client produces**, so
+  `send`/`recv`/`close_conn` (and `http.read_request`/`_write` layered over them)
+  are shared verbatim; `port(listener)` → `int64` bound port (resolves an
+  ephemeral `0`, as `net.port`); `close_listener(listener)` closes it.
+- **Handle unification + ctx lifetime.** `accept` returns the client's `ZapTls`,
+  so one opaque conn type flows through `http` unchanged. The server `SSL_CTX` is
+  shared and **reference-counted**: the listener holds one ref (released by
+  `close_listener`); each accepted conn takes its own via `SSL_CTX_up_ref`,
+  released by the existing `SSL_CTX_free` in `close_conn` — so a conn safely
+  outlives its listener and no new close verb is needed.
+- **Close-raises-accept (non-negotiable, mirrors `net`).** `close_listener`
+  deregisters the listening fd from the netpoller, waking any coroutine parked in
+  `accept` with `CLOSED`, which **raises** a catchable exception — exactly as
+  `net.close_listener` unblocks `net.accept`. This is the contract fastzap's
+  staged graceful-shutdown depends on to drain its accept loop.
+- **Robust accept loop.** `accept` is caller-driven and loopable (one wrapped
+  conn per accepted socket, never one-shot). A client whose handshake fails is
+  torn down and the loop continues — one bad peer never kills the server — so
+  `accept` returns only on a completed handshake or raises only on a closed
+  listener. Netpoller-first like the client: `SSL_accept`/`SSL_read`/`SSL_write`
+  WANT_READ/WANT_WRITE PARK the coroutine; fd/pd/`SSL_CTX*` are pulled to C
+  locals before any park and the GC `ZapTls` is built only after the last park.
+- **Same unified post-1.1.0 OpenSSL API** as D-0062 (`TLS_server_method`,
+  `SSL_CTX_set_min_proto_version` floor TLS 1.2, `SSL_CTX_use_certificate_chain_file`
+  + `SSL_CTX_use_PrivateKey_file` + `SSL_CTX_check_private_key`), so no version
+  `#ifdef`; CI is OpenSSL 3.0.13. A client↔server round-trip golden
+  (`tls_server_echo`) drives `listen`→`accept`→server `recv`/`send` against
+  `connect_insecure` with a self-signed cert+key written to a temp dir on disk.
+
+**Still deferred (noted in D-0062, unchanged):** ALPN / HTTP/2; client
+certificates (mTLS); custom CA-bundle configuration; session resumption / 0-RTT;
+OCSP stapling.

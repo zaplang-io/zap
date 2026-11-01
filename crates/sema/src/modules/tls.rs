@@ -1,4 +1,4 @@
-//! `tls` module — sema facet (ticket #147, D-0062).
+//! `tls` module — sema facet (tickets #147, #488; D-0062, D-0093).
 //!
 //! A TLS **client** over a `net`-style TCP connection, backed by system OpenSSL
 //! (`-lssl -lcrypto`): `connect`/`connect_insecure` perform the TCP connect and
@@ -9,9 +9,15 @@
 //! AND the hostname by default; `connect_insecure` is the loudly-named opt-out
 //! (never the default). `import tls` is accepted but not required.
 //!
-//! The TLS **server** is deferred (issue #147); `_test_server` is an internal
-//! test scaffold (a self-signed loopback echo server) for the golden suite, not
-//! stable API.
+//! The TLS **server** (#488, D-0093) mirrors the `net` server shape:
+//! `listen(host, port, cert_path, key_path)` loads a cert+key from disk into a
+//! server context and binds, `accept(listener)` runs the server-side handshake
+//! and yields a conn (the SAME opaque `bytes` handle as the client, so
+//! `send`/`recv`/`close_conn` are shared), `port(listener)` reports the bound
+//! port, and `close_listener(listener)` closes the listener — which makes a
+//! parked `accept` raise, as `net.close_listener` does for `net.accept`.
+//! `_test_server` is an internal test scaffold (a self-signed loopback echo
+//! server) for the golden suite, not stable API.
 
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
@@ -30,6 +36,23 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "tls", method, args, 2, span);
             Ty::Bytes
         }
+        // tls.listen(host, port, cert_path, key_path) -> TLS listener handle
+        // (server SSL_CTX from the cert+key PEM files on disk, bound to host:port).
+        "listen" => {
+            expect_argc(checker, "tls", method, args, 4, span);
+            Ty::Bytes
+        }
+        // tls.accept(listener) -> TLS connection handle (server-side handshake).
+        // The handle unifies with the client's, so send/recv/close_conn are shared.
+        "accept" => {
+            expect_argc(checker, "tls", method, args, 1, span);
+            Ty::Bytes
+        }
+        // tls.port(listener) -> int64 (bound local port; resolves an ephemeral 0).
+        "port" => {
+            expect_argc(checker, "tls", method, args, 1, span);
+            Ty::Int64
+        }
         // tls.recv(conn, n) -> str (up to n decrypted bytes; empty on clean EOF)
         "recv" => {
             expect_argc(checker, "tls", method, args, 2, span);
@@ -41,8 +64,8 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             Ty::Int64
         }
         // `close` is the reserved channel-close token, so a TLS close is spelled
-        // `tls.close_conn` (mirrors `net.close_conn`).
-        "close_conn" => {
+        // `tls.close_conn` / `tls.close_listener` (mirrors `net`).
+        "close_conn" | "close_listener" => {
             expect_argc(checker, "tls", method, args, 1, span);
             Ty::Unit
         }
