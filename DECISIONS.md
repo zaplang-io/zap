@@ -2743,3 +2743,49 @@ tracked by #475 (`ZAP5076`); this PR does not close #475.
 lexer unperturbed; exceptions as the sole outcome channel keep failures
 un-suppressible; the complete pending set turns a timeout into an actionable
 diagnostic instead of a bare "timed out".
+
+## D-0095 — Keyword-only parameters via the bare `*` separator (I#496)
+**Status:** Locked — extends the parameter model (D-0038) with Python's `*` marker.
+
+A bare `*` in a parameter list makes every parameter after it **keyword-only**:
+it may only be supplied by name at a call site, never positionally. This is
+exactly Python's `def f(a, *, b)` separator, adopted unchanged so signatures read
+the same across the two languages.
+
+```python
+def open(str path, *, bool create = False, int64 mode) -> File:
+    ...
+open("a", mode=0)                    # create defaults to False
+open("a", create=True, mode=0)       # keyword-only params, in any order
+# open("a", True, 0)                 # error: create/mode are keyword-only
+# open("a")                          # error: required keyword-only `mode` omitted
+```
+
+**Surface.** The `*` is a **separator, not a parameter** — it carries no name,
+type or default and does not appear in the function's parameter list. It may
+appear **at most once** and **must be followed by at least one parameter** (a
+bare `*` with nothing after it has nothing to make keyword-only, so it is a parse
+error, matching Python). Parameters before `*` stay positional-or-keyword as
+before; parameters after it may be required or carry a default (D-0038 defaults
+compose unchanged, #298 keyword passing composes unchanged).
+
+**Enforcement is front-end.** The parser records a `keyword_only` flag per
+parameter; sema enforces it at the call site. Supplying a keyword-only parameter
+positionally is `ZAP4029`; omitting a required keyword-only parameter is the
+ordinary missing-argument error `ZAP4020`; a misplaced or duplicated `*` is
+`ZAP2018`. Because keyword-only is purely a **call-site admissibility** rule and
+every supplied keyword-only argument is an ordinary keyword/default argument by
+the time it reaches lowering, **nothing in the IR, calling convention or codegen
+changes** — the restriction never reaches the backend.
+
+**Scope.** Enforcement targets free-function calls, where arity/keyword binding is
+already checked. User-method calls are still typed loosely (return type only), so
+keyword-only is not yet enforced on methods; that waits on the method default-arg
+work (`zaplang-io/zap#481`). `**kwargs`-style arbitrary named parameters remain
+deferred (D-0038).
+
+**Rationale.** Optional parameters could previously only be trailing defaulted
+positionals, so an API could not *force* call-site keyword use the way
+Python/boto3-style signatures do — the gap surfaced writing the AWS SDK
+credential chain. Reusing Python's exact `*` marker closes it with no new
+concept and no backend cost.

@@ -379,7 +379,8 @@ impl<'a> Printer<'a> {
             None => String::new(),
         };
         let tail = format!("){ret_s}{}", if colon { ":" } else { "" });
-        let params_s = params.iter().map(param_str).collect::<Vec<_>>().join(", ");
+        let pieces = param_pieces(params);
+        let params_s = pieces.join(", ");
         let inline = format!("{head}{params_s}{tail}");
         if self.fits(&inline) || params.is_empty() {
             self.push_line(&inline);
@@ -387,8 +388,8 @@ impl<'a> Printer<'a> {
         }
         self.push_line(&head);
         self.indent += 1;
-        for p in params {
-            self.push_line(&format!("{},", param_str(p)));
+        for piece in &pieces {
+            self.push_line(&format!("{piece},"));
         }
         self.indent -= 1;
         self.push_line(&tail);
@@ -450,14 +451,7 @@ impl<'a> Printer<'a> {
         let params = if d.params.is_empty() {
             String::new()
         } else {
-            format!(
-                "({})",
-                d.params
-                    .iter()
-                    .map(param_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+            format!("({})", param_pieces(&d.params).join(", "))
         };
         self.push_line(&format!("decorator {}{params}:", d.name));
         self.take_header_trailing(d.body.span.start);
@@ -1120,6 +1114,17 @@ mod tests {
     fn structural_match_fixture_is_formatted() {
         let source = include_str!("../../../tests/conformance/match_structural.zap");
         assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
+    fn keyword_only_separator_round_trips() {
+        // The bare `*` keyword-only separator (I#496) is rendered back verbatim.
+        for source in [
+            "def f(int64 a, *, int64 b = 1) -> int64:\n    return a + b\n",
+            "def f(*, int64 b):\n    return b\n",
+        ] {
+            assert_eq!(format_source(source).unwrap(), source);
+        }
     }
 
     #[test]

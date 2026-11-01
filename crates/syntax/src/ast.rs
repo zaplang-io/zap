@@ -205,6 +205,9 @@ pub struct Param {
     pub default: Option<Expr>,
     /// `true` for a `TYPE... name` variadic (D-0038).
     pub variadic: bool,
+    /// `true` when this parameter follows the bare `*` separator and is therefore
+    /// keyword-only (I#496): it may only be supplied by name at a call site.
+    pub keyword_only: bool,
     pub span: Span,
 }
 

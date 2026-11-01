@@ -118,6 +118,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | FN-2 | §7 | any parameter may be passed by name | covered | function_keyword_defaults |
 | FN-3 | §7 | positional args precede keyword args; defaults may be omitted | covered | function_keyword_defaults |
 | FN-4 | §7 | a variadic `TYPE... name` is received as a list | covered | function_variadics |
+| FN-7 | §7 | a bare `*` makes following params keyword-only (D-0095, I#496) | covered | function_keyword_only |
 | FN-5 | §7 | lambda expressions | TODO | — |
 | FN-6 | §7 | first-class function values + closures (D-0067) | TODO | — |
 | GENR-1 | §7 | generators via `yield` follow the iteration protocol | TODO | — |

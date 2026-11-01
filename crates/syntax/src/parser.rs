@@ -1339,13 +1339,56 @@ impl Parser {
         if self.is(&TokenKind::RParen) {
             return params;
         }
+        // A bare `*` separator makes every following parameter keyword-only
+        // (I#496, Python semantics). Track whether we have passed it and how
+        // many parameters followed, so a trailing `*` with nothing after it is
+        // reported rather than silently accepted.
+        let mut keyword_only = false;
+        let mut star_span: Option<Span> = None;
+        let mut params_after_star = 0usize;
         loop {
-            params.push(self.parse_param());
+            if self.is(&TokenKind::Star) {
+                let span = self.peek_span();
+                self.bump();
+                if keyword_only {
+                    self.error_at(
+                        span,
+                        ErrorCode::ZAP2018,
+                        "a `*` keyword-only separator may appear at most once in a parameter list",
+                    );
+                }
+                keyword_only = true;
+                star_span = Some(span);
+                // The separator must be followed by `, <param>...`; anything
+                // else (`*)` or `*,)`) leaves nothing to make keyword-only.
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                if self.is(&TokenKind::RParen) {
+                    break; // trailing comma after `*`
+                }
+                continue;
+            }
+            let mut p = self.parse_param();
+            p.keyword_only = keyword_only;
+            if keyword_only {
+                params_after_star += 1;
+            }
+            params.push(p);
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
             if self.is(&TokenKind::RParen) {
                 break; // trailing comma
+            }
+        }
+        if let Some(span) = star_span {
+            if params_after_star == 0 {
+                self.error_at(
+                    span,
+                    ErrorCode::ZAP2018,
+                    "a `*` keyword-only separator must be followed by at least one parameter",
+                );
             }
         }
         params
@@ -1368,6 +1411,7 @@ impl Parser {
                 name: "self".to_string(),
                 default: None,
                 variadic: false,
+                keyword_only: false,
                 span: self.span_from(start),
             };
         }
@@ -1385,6 +1429,7 @@ impl Parser {
             name,
             default,
             variadic,
+            keyword_only: false,
             span: self.span_from(start),
         }
     }
@@ -4100,6 +4145,51 @@ mod tests {
         assert_eq!(f.params.len(), 3);
         assert!(f.params[1].default.is_some());
         assert!(f.params[2].variadic);
+    }
+
+    #[test]
+    fn keyword_only_separator_flags_following_params() {
+        // `*` makes every following parameter keyword-only (I#496); params before
+        // it stay positional-or-keyword. The `*` is a separator, not a parameter,
+        // so it does not appear in `params`.
+        let m = parse_ok("def f(int64 a, *, int64 b = 1, int64 c) -> int64:\n    return a\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        assert_eq!(f.params.len(), 3);
+        assert!(!f.params[0].keyword_only);
+        assert!(f.params[1].keyword_only);
+        assert!(f.params[1].default.is_some());
+        assert!(f.params[2].keyword_only);
+    }
+
+    #[test]
+    fn keyword_only_separator_with_no_leading_positional() {
+        let m = parse_ok("def f(*, int64 b):\n    return\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        assert_eq!(f.params.len(), 1);
+        assert!(f.params[0].keyword_only);
+    }
+
+    #[test]
+    fn bare_star_with_nothing_after_is_rejected() {
+        let (_m, perrs, lerrs) = parse_str("def f(int64 a, *):\n    return\n");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2018),
+            "expected ZAP2018, got {perrs:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_star_is_rejected() {
+        let (_m, perrs, _l) = parse_str("def f(int64 a, *, *, int64 b):\n    return\n");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2018),
+            "expected ZAP2018, got {perrs:?}"
+        );
     }
 
     #[test]
