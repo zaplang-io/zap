@@ -979,16 +979,30 @@ fn references_prelude(module: &Module) -> bool {
 /// error. Both the type checker and the lowerer apply this, so they agree on the
 /// surface a program sees (ticket #77, D-0058).
 pub fn with_prelude(module: &Module) -> Module {
-    if !references_prelude(module) {
+    let full = references_prelude(module);
+    // `dict.get(key) -> Optional[V]` (and other builtins) can produce an
+    // `Optional` *implicitly*, without the program ever naming it, so the
+    // name-scan above misses it. Inject the generic for any program that uses a
+    // dict so monomorphization can instantiate `Optional$V` (#498). `Optional[T]`
+    // is a generic template: an unused injection emits no code.
+    let needs_optional = full || uses_dict(module);
+    if !needs_optional {
         return module.clone();
     }
     let user_names: std::collections::HashSet<&str> =
         module.items.iter().filter_map(item_type_name).collect();
     let mut items: Vec<crate::ast::Item> = prelude_items()
         .into_iter()
-        .filter(|it| match item_type_name(it) {
-            Some(n) => !user_names.contains(n),
-            None => true,
+        .filter(|it| {
+            // Without the full signals/stdlib prelude, inject only the
+            // self-contained `Optional[T]` enum (skipping a user-shadowed one).
+            if !full && item_type_name(it) != Some("Optional") {
+                return false;
+            }
+            match item_type_name(it) {
+                Some(n) => !user_names.contains(n),
+                None => full,
+            }
         })
         .collect();
     items.extend(module.items.iter().cloned());
@@ -996,6 +1010,16 @@ pub fn with_prelude(module: &Module) -> Module {
         items,
         span: module.span,
     }
+}
+
+/// Does `module` use a `dict` in any form (typed binding/param/field, literal,
+/// or comprehension)? Used to make `Optional[T]` available for `dict.get`'s
+/// implicit `Optional[V]` result (#498). Like [`references_prelude`], this is a
+/// coarse scan over the AST's `Debug`; a false positive only injects the unused
+/// generic, which emits no code.
+fn uses_dict(module: &Module) -> bool {
+    let dbg = format!("{module:?}");
+    dbg.contains("\"dict\"") || dbg.contains("Dict(") || dbg.contains("DictComp")
 }
 
 struct Parser {
@@ -3165,6 +3189,7 @@ impl Parser {
                     bytes: flags.bytes,
                     fstring: flags.fstring,
                     span,
+                    fstring_fields: Vec::new(),
                 }
             }
             TokenKind::Keyword(Keyword::True) => {

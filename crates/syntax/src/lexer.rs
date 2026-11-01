@@ -1009,7 +1009,9 @@ mod tests {
 
     #[test]
     fn fstring_escaped_quote_in_field_captured() {
-        // The pre-#498 escaped workaround still lexes to the full field.
+        // The lexer keeps escapes verbatim and still captures the whole literal
+        // when a field escapes the delimiter quote; the field splitter is what
+        // rejects that form (PEP 701, see fstring.rs). No lex error here.
         assert_eq!(fstring_value(r#"f"{d.get(\"k\")}""#), r#"{d.get(\"k\")}"#);
     }
 

@@ -4722,6 +4722,33 @@ impl<'a> FnLower<'a> {
             self.throwing_call(Some(d), "zap_bytes_to_str", vec![v]);
             return Ok(d);
         }
+        // `Optional[T]` renders its payload when `Some`, and the literal
+        // `"None"` when `None` (#498, matching Python's `f"{d.get(k)}"`). The
+        // payload is rendered recursively, so a non-renderable payload falls
+        // through to the error below.
+        if let Some(opt) = optional_layout(self.ctx, vt) {
+            let slot = self.alloca(Ty::Ptr);
+            let is_none = gen_opt_is_none(self, &opt, v);
+            let none_bb = self.new_block();
+            let some_bb = self.new_block();
+            let join_bb = self.new_block();
+            self.set_term(Term::BrIf {
+                cond: is_none,
+                then_bb: none_bb,
+                else_bb: some_bb,
+            });
+            self.position(none_bb);
+            let none_str = self.strconst("None");
+            self.store(slot, none_str);
+            self.set_term(Term::Br(join_bb));
+            self.position(some_bb);
+            let payload = gen_opt_payload(self, &opt, v);
+            let some_str = self.render_str(payload, opt.payload_ty)?;
+            self.store(slot, some_str);
+            self.set_term(Term::Br(join_bb));
+            self.position(join_bb);
+            return Ok(self.load(slot, Ty::Ptr));
+        }
         let (func, arg) = match vt {
             Ty::Ptr => return Ok(v),
             Ty::Bigint => {
@@ -4815,6 +4842,7 @@ impl<'a> FnLower<'a> {
         value: &str,
         raw: bool,
         span_start: u32,
+        mono_fields: &[ast::Expr],
     ) -> Result<(Value, Ty), LowerError> {
         let base = span_start.saturating_add(2);
         let (parts, errors) = fstring::split_fstring(value, base);
@@ -4822,6 +4850,18 @@ impl<'a> FnLower<'a> {
             // sema already reported these with proper spans; this is defensive.
             return Err(err(e.message));
         }
+        // Monomorphization records the specialized field expressions here, since
+        // it cannot see the ones re-parsed above (#498). Use them positionally
+        // when present (their count matches the re-split fields), so inline
+        // generics / `dict.get` in a field lower against concrete types. When
+        // absent (nothing needed specializing, or the recording was skipped) the
+        // freshly-parsed field expressions are used.
+        let use_mono = mono_fields.len()
+            == parts
+                .iter()
+                .filter(|p| matches!(p, FStringPart::Field { .. }))
+                .count();
+        let mut field_idx = 0usize;
         let mut acc: Option<Value> = None;
         for part in &parts {
             let piece = match part {
@@ -4839,7 +4879,13 @@ impl<'a> FnLower<'a> {
                     d
                 }
                 FStringPart::Field { expr, spec, .. } => {
-                    let (v, vt) = self.expr(expr)?;
+                    let field_expr = if use_mono {
+                        &mono_fields[field_idx]
+                    } else {
+                        expr
+                    };
+                    field_idx += 1;
+                    let (v, vt) = self.expr(field_expr)?;
                     match spec {
                         None => self.render_str(v, vt)?,
                         Some(fs) => self.format_value(v, vt, fs)?,
@@ -6272,6 +6318,7 @@ impl<'a> FnLower<'a> {
                             bytes: false,
                             fstring: false,
                             span: sp,
+                            fstring_fields: Vec::new(),
                         }),
                         span: sp,
                     }],
@@ -7614,9 +7661,10 @@ impl<'a> FnLower<'a> {
                 bytes,
                 fstring,
                 span,
+                fstring_fields,
             } => {
                 if *fstring {
-                    return self.lower_fstring(value, *raw, span.start);
+                    return self.lower_fstring(value, *raw, span.start, fstring_fields);
                 }
                 let data = if *raw {
                     value.clone().into_bytes()

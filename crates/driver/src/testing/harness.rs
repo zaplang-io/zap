@@ -425,6 +425,7 @@ fn str_lit(s: &str) -> Expr {
         bytes: false,
         fstring: false,
         span: SP,
+        fstring_fields: Vec::new(),
     }
 }
 
