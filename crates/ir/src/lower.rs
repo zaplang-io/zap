@@ -8138,7 +8138,17 @@ impl<'a> FnLower<'a> {
                         // `Print` renders it like any other string.
                         let s = self.struct_to_str(sid, v)?;
                         vals.push(s);
-                    } else if vt == Ty::Complex || vt == Ty::Bigint {
+                    } else if vt == Ty::Complex || vt == Ty::Bigint || vt.is_float() || vt == Ty::I1
+                    {
+                        // Floats and bools must print exactly as `str(x)` does
+                        // (I#493): route them through `render_str` — the same
+                        // lowering `str()` uses — so `print(27.5)` yields `27.5`
+                        // (not C `%f`'s `27.500000`) and `print(True)` yields
+                        // `True` (not the `-1` all-ones bitpattern from `%lld`).
+                        // Codegen's `Print` then renders the resulting ZapStr via
+                        // `zap_print_str`, making `print(x)` == `print(str(x))`.
+                        // `int`/`char`/`str`/`bytes` already print correctly and
+                        // stay on their existing paths.
                         vals.push(self.render_str(v, vt)?);
                     } else {
                         vals.push(v);

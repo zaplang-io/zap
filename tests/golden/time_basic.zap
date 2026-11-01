@@ -12,8 +12,8 @@ def main():
     print(time.millis(250))  # 250000000
     print(time.micros(7))  # 7000
     print(time.nanos(42))  # 42
-    print(time.to_seconds(time.seconds(2)))  # 2.000000
-    print(time.to_millis(time.millis(5)))  # 5.000000
+    print(time.to_seconds(time.seconds(2)))  # 2.0
+    print(time.to_millis(time.millis(5)))  # 5.0
 
     # Monotonic clock: sleeping advances it by at least the requested span.
     auto start = time.monotonic_ns()
