@@ -8527,12 +8527,12 @@ impl<'a> FnLower<'a> {
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
                 if vt == Ty::Ptr {
+                    // A malformed string raises a catchable `ValueError` (#456),
+                    // so this must be an unwinding `invoke` inside a `try` — a
+                    // plain `call` would let the exception escape past the
+                    // handler and terminate, like the index/divide faults.
                     let d = self.new_value(Ty::I64);
-                    self.emit(Inst::Call {
-                        dest: Some(d),
-                        func: "zap_str_parse_int".to_string(),
-                        args: vec![v],
-                    });
+                    self.throwing_call(Some(d), "zap_str_parse_int", vec![v]);
                     return Ok((d, Ty::I64));
                 }
                 return Ok((self.convert(v, vt, Ty::I64), Ty::I64));
