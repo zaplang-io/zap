@@ -1,0 +1,1 @@
+relocated reference locals survive calls, scopes, and cleanup
