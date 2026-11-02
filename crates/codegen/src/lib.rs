@@ -505,9 +505,10 @@ struct Cg<'a, 'ctx> {
 }
 
 /// A function's shadow-stack frame (ticket #48). Codegen reserves one root slot
-/// per GC-pointer-typed SSA value, links the frame onto the per-thread
-/// `zap_shadow_head` on entry, stores each pointer value into its slot at the
-/// end of its defining block, and unlinks on return. A GC safepoint (top of
+/// per GC-pointer-typed SSA value plus writable storage for reference locals.
+/// It links the frame onto the per-thread `zap_shadow_head` on entry, stores
+/// SSA pointers at their definitions, and unlinks on return. Reference-local
+/// stores and loads use their canonical root cells directly. A GC safepoint (top of
 /// every block) then finds every live pointer via the chain. Over-retention of
 /// dead-but-slotted values is safe for the non-moving collector.
 #[derive(Clone)]
@@ -518,7 +519,10 @@ struct GcFrame<'ctx> {
     frame_ty: inkwell::types::StructType<'ctx>,
     /// value id -> root slot index, or `-1` if the value is not a GC pointer.
     slot_of: Vec<i32>,
-    /// Number of root slots (the `[N x ptr]` array length).
+    /// GC-reference local storage -> canonical writable root slot. Rooting an
+    /// alloca's stack address does not let evacuation rewrite its contents.
+    local_slot_of: Vec<i32>,
+    /// Number of root slots (SSA values plus reference-local contents).
     n: u32,
 }
 
@@ -1508,6 +1512,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 n += 1;
             }
         }
+        let mut local_slot_of = vec![-1i32; f.value_types.len()];
+        for inst in f.blocks.iter().flat_map(|block| &block.insts) {
+            if let Inst::Alloca { dest, pointee } = inst {
+                if self.basic(*pointee).is_pointer_type() {
+                    local_slot_of[*dest as usize] = n as i32;
+                    n += 1;
+                }
+            }
+        }
         if n == 0 {
             return Ok(()); // nothing to root
         }
@@ -1551,6 +1564,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             frame_ptr: frame,
             frame_ty,
             slot_of,
+            local_slot_of,
             n,
         });
         // Parameters are rooted by the caller (translate_fn) from `vals`, not from
@@ -1559,6 +1573,38 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // slot whose POINTER lives in `vals`; that pointer — not the non-pointer
         // aggregate — is the root, and is also what load-at-use reloads (#120).
         Ok(())
+    }
+
+    /// Reference locals live IN the shadow frame, rather than in a separate
+    /// untraced stack alloca. Stores and collector relocation then update the
+    /// same pointer cell that a later ZIR Load reads (#583).
+    #[cfg(feature = "gc-immix")]
+    fn gc_local_slot(&self, vid: u32) -> Result<Option<PointerValue<'ctx>>, String> {
+        let Some(frame) = &self.gc_frame else {
+            return Ok(None);
+        };
+        let slot = frame.local_slot_of[vid as usize];
+        if slot < 0 {
+            return Ok(None);
+        }
+        let roots = self
+            .builder
+            .build_struct_gep(frame.frame_ty, frame.frame_ptr, 2, "gc.local.roots")
+            .map_err(|e| e.to_string())?;
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        let local = unsafe {
+            self.builder.build_in_bounds_gep(
+                p.array_type(frame.n),
+                roots,
+                &[
+                    self.ctx.i32_type().const_zero(),
+                    self.ctx.i32_type().const_int(slot as u64, false),
+                ],
+                "gc.local.slot",
+            )
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(Some(local))
     }
 
     /// Store SSA value `vid` into its root slot, if it has one. `val` must be a
@@ -2254,7 +2300,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 // Hoist the stack slot to the entry block (ticket #91) so a loop
                 // body that declares a local does not re-`alloca` it each
                 // iteration and overflow the stack on a long-running loop.
-                let p = self.entry_alloca(self.basic(*pointee), "slot")?;
+                #[cfg(feature = "gc-immix")]
+                let rooted = self.gc_local_slot(*dest)?;
+                #[cfg(not(feature = "gc-immix"))]
+                let rooted: Option<PointerValue<'ctx>> = None;
+                let p = match rooted {
+                    Some(slot) => slot,
+                    None => self.entry_alloca(self.basic(*pointee), "slot")?,
+                };
                 vals[*dest as usize] = Some(p.into());
             }
             Inst::Load { dest, ptr } => {
