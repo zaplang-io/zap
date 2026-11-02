@@ -16,6 +16,14 @@ use std::fmt;
 pub enum Elem {
     /// An integer/bool element, passed as `i64`.
     I64,
+    /// A floating-point (`f64`) element (I#569). Stored in the same uniform
+    /// 8-byte word as an `i64` element — the runtime reinterprets the bits — so
+    /// it reuses the list word storage via the `_f64` entry points
+    /// (`zap_list_push_f64` / `zap_list_get_f64`), which push/return a `double`.
+    /// Only a *list* element kind today: hashed/ordered element positions (dict
+    /// and set keys, heaps) do not support floats yet, so this never reaches the
+    /// key/ordered paths.
+    F64,
     /// A tier-1 enum discriminant, passed as `i64` but retaining enum identity.
     Enum(u32),
     /// A reference-typed element (`str`, nested collection), passed as a pointer
@@ -34,6 +42,7 @@ impl Elem {
     pub fn ty(self) -> Ty {
         match self {
             Elem::I64 => Ty::I64,
+            Elem::F64 => Ty::F64,
             Elem::Enum(id) => Ty::Enum(id),
             Elem::Ptr => Ty::Ptr,
             Elem::Struct(sid) => Ty::Struct(sid),
@@ -45,6 +54,7 @@ impl Elem {
     pub fn val_suffix(self) -> &'static str {
         match self {
             Elem::I64 | Elem::Enum(_) => "i64",
+            Elem::F64 => "f64",
             Elem::Ptr | Elem::Struct(_) => "ptr",
         }
     }
@@ -56,6 +66,10 @@ impl Elem {
             Elem::I64 | Elem::Enum(_) => "i64",
             Elem::Ptr => "str",
             Elem::Struct(_) => "fn",
+            // Floats are never a hashed *key* (dict/set keys reject floats), so
+            // this is unreachable in practice; give it a defined value rather
+            // than panicking should a future key path ask.
+            Elem::F64 => "f64",
         }
     }
 }

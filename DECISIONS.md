@@ -81,8 +81,9 @@ distinct from `list[T]`. Full N-D is the target, built incrementally (1-D → N-
 The supported Experimental subset is specified in SPEC §15 (I#476): flat
 literal construction, four dtypes, `+`/`-`/`*`, scalar broadcasting, `len`/`sum`,
 and contiguous views. Unsupported forms are diagnosed; unequal lengths raise
-`ValueError`. Native floats in direct general-collection slots remain unsupported;
-float fields of tuple/struct values and `array[f64]` remain supported.
+`ValueError`. `list[float]` is supported (I#569, D-0100); floats as dict/set
+keys or values, or heap/channel elements, remain unsupported, as do float fields
+of tuple/struct values and `array[f64]` (which remain supported).
 Element-wise operator overloading, broadcasting, NumPy-style slicing (slices are
 **views**, D-0030). SIMD via LLVM vector ops layered on `vec[T,N]`. See
 `design/0002-arrays.md`.
@@ -2151,8 +2152,9 @@ ordering and deterministic JSON/XML serialization (D-0011). ABI in
 - **No new runtime GC work.** `zap_list_copy` (for `sorted`) reuses the list
   descriptor's precise tracing; the sort touches no collector internals.
 - **Limits (clean follow-ups).** Element types without an ordering and no `key=`
-  are a compile error; `float` lists remain unsupported in collections generally;
-  an inline `lambda` key needs a function-typed context it does not get here, so
+  are a compile error; a `list[float]` (I#569) is not directly orderable and is
+  sorted via a `key=` projection; an inline `lambda` key needs a function-typed
+  context it does not get here, so
   `key=` wants a named function or a `fn(T)->R` binding in v1; a user-struct
   `__cmp__`/`Ord`-driven ordering is deferred.
 
@@ -2947,3 +2949,26 @@ backpressure, immediate/expired bounds and clearing, loopback backlog saturation
 TLS read/handshake/write cancellation, a verified resolved TLS connection, and
 stalled TLS handshake/write deadlines. Native behavior is gated by the full
 both-collector and ARM CI jobs, not frontend-only checks.
+
+## D-0100 — scalar `float` lowered as `f64`; `list[float]` supported (I#569)
+
+The scalar `float` type is lowered as a 64-bit IEEE double, the Python-facing
+name for `f64`/`float64` (they are exact aliases in every type position: a
+binding, a function parameter/return, an `array` dtype, and a `list` element).
+Before this, `float` resolved to no type and a `float`-typed binding failed with
+a backend error (ZAP6001), while any `list[float]` was rejected in the checker
+(ZAP4027). Scalar `float` reuses the existing numeric tower (D-0019/D-0020,
+I#19): arithmetic computes at `f64`, `/` is true division, and an `int` value
+widens into a `float` implicitly (`SIToFP`); narrowing still needs an explicit
+`int64(...)`.
+
+`list[float]` reuses the uniform 8-byte collection word: a `double` occupies one
+word, so the list stores it through `_f64` runtime entry points
+(`zap_list_push_f64` / `zap_list_get_f64` / `zap_list_set_f64`) that reinterpret
+the word bits (as the REPL float slot does, I#252) around the same storage — no
+new list object, no change to `len`/iteration/precise GC (float elements are not
+pointers). The list element kind gains an `Elem::F64` variant used only on the
+`list[T]` paths; floats as dict/set keys or values, heap or channel elements,
+and direct float ordering in `sort` (sort a `list[float]` via `key=`) stay
+unsupported, as does the `f32` list element (ticket #49). Verified by the
+`scalar_float` and `list_float` goldens under the full-codegen and ARM CI jobs.

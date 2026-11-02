@@ -37,8 +37,9 @@ N-D shapes, `zeros`/`arange`/`sqrt`, axis reductions, division/comparison kernel
 strided views, `f32`/`i32`, and list-variable/iterable constructors are future
 design work. The broader examples below describe that future design rather than
 an available surface. Unsupported forms receive semantic or lowering errors.
-Native floats remain unsupported in direct general-collection slots; float
-fields inside tuples/structs remain valid. Numeric float buffers use `array[f64]`.
+`list[float]` is supported (I#569); floats as dict/set keys or values and
+heap/channel elements remain unsupported. Float fields inside tuples/structs
+remain valid. Dense numeric float buffers use `array[f64]`.
 
 ## Proposal (future N-D design)
 

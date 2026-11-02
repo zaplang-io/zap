@@ -1372,7 +1372,9 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
         ast::Type::Named { name, args, .. } => match name.as_str() {
             "int64" | "i64" => Ok(Ty::I64),
             "int32" | "i32" => Ok(Ty::I32),
-            "float64" | "f64" => Ok(Ty::F64),
+            // `float` is the Python-facing name for the 64-bit IEEE double
+            // (I#569); `float64`/`f64` are the explicit-width spellings.
+            "float" | "float64" | "f64" => Ok(Ty::F64),
             "float32" | "f32" => Ok(Ty::F32),
             // `uint8`/`u8` is currently only an `array[T]` dtype (ticket #49),
             // not a general scalar type; it resolves to `i8` so `dtype_of`
@@ -1387,7 +1389,7 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "pyobject" => Ok(Ty::Py),
             "list" => {
                 let e = match args.first() {
-                    Some(a) => elem_of(a, env)?,
+                    Some(a) => list_elem_of(a, env)?,
                     None => Elem::I64,
                 };
                 Ok(Ty::List(e))
@@ -1488,6 +1490,15 @@ fn elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
     elem_kind(resolve_ty(t, env)?)
 }
 
+/// The element kind of a `list[T]` element type. Identical to [`elem_of`] except
+/// that an `f64` element is admitted (I#569): a list stores uniform 8-byte words
+/// and a `double` fits one, so `list[float]` reuses the word storage through the
+/// `_f64` runtime entry points. Only *lists* take this path — the hashed/ordered
+/// element positions (dict/set keys, heaps) still reject floats via [`elem_kind`].
+fn list_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
+    list_elem_kind(resolve_ty(t, env)?)
+}
+
 /// The element kind of a `heap[T]` element type (D-0057). A heap orders its
 /// elements, so — unlike a general collection — only the *comparable* element
 /// kinds are supported in this increment: integers/bools/chars (compared as
@@ -1535,7 +1546,7 @@ fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
 /// the dtype appears as a bare name in expression position.
 fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
     match name {
-        "float64" | "f64" => Ok(Dtype::F64),
+        "float" | "float64" | "f64" => Ok(Dtype::F64),
         "int64" | "i64" => Ok(Dtype::I64),
         "uint8" | "u8" => Ok(Dtype::Uint8),
         "bool" => Ok(Dtype::Bool),
@@ -1552,7 +1563,7 @@ fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
 fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
     match name {
         "int64" | "i64" | "int32" | "i32" | "bool" | "char" => Ok(Elem::I64),
-        "float64" | "f64" | "float32" | "f32" => Err(err(
+        "float" | "float64" | "f64" | "float32" | "f32" => Err(err(
             "channels of floating-point elements are not supported yet",
         )),
         // `str`, `bytes`, struct, and nested-collection elements are references.
@@ -1589,6 +1600,16 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
             "collections of floating-point elements are not supported yet",
         )),
         Ty::Void => Err(err("a collection element cannot be void")),
+    }
+}
+
+/// Like [`elem_kind`], but admits an `f64` *list* element (I#569) as [`Elem::F64`].
+/// `f32` list elements (ticket #49) and float elements of other collections stay
+/// unsupported, so this is used only on the `list[T]` element paths.
+fn list_elem_kind(t: Ty) -> Result<Elem, LowerError> {
+    match t {
+        Ty::F64 => Ok(Elem::F64),
+        other => elem_kind(other),
     }
 }
 
@@ -6932,7 +6953,7 @@ impl<'a> FnLower<'a> {
             s.declare(var, slot, ty);
             s.comp_guard(cond, |s| {
                 let (ev, et) = s.expr(elem_e)?;
-                let ek = elem_kind(et)?;
+                let ek = list_elem_kind(et)?;
                 kind.set(Some(ek));
                 let ev = s.coerce(ev, et, ek.ty());
                 let ev = s.box_if_value(ev, ek.ty());
@@ -10601,7 +10622,7 @@ impl<'a> FnLower<'a> {
             lowered.push(self.expr(e)?);
         }
         let elem = match lowered.first() {
-            Some(&(_, t)) => elem_kind(t)?,
+            Some(&(_, t)) => list_elem_kind(t)?,
             None => Elem::I64,
         };
         let list = self.new_value(Ty::List(elem));
@@ -10612,7 +10633,7 @@ impl<'a> FnLower<'a> {
         });
         let push = format!("zap_list_push_{}", elem.val_suffix());
         for (v, vt) in lowered {
-            if elem_kind(vt)? != elem {
+            if list_elem_kind(vt)? != elem {
                 return Err(err("list elements must all have the same representation"));
             }
             let v = self.coerce(v, vt, elem.ty());
@@ -11499,7 +11520,7 @@ impl<'a> FnLower<'a> {
                     return Err(err("append() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
-                if elem_kind(vt)? != elem {
+                if list_elem_kind(vt)? != elem {
                     return Err(err("append() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
@@ -11576,7 +11597,10 @@ impl<'a> FnLower<'a> {
                 Elem::I64 => Ok(0),
                 Elem::Enum(_) => Ok(0),
                 Elem::Ptr => Ok(1),
-                Elem::Struct(_) => Err(err(format!(
+                // Ordering `f64` elements directly is a clean follow-up (the
+                // runtime sort compares elements as `i64`/str words today); a
+                // `list[float]` is still sortable via a `key=` projection.
+                Elem::F64 | Elem::Struct(_) => Err(err(format!(
                     "{what} is not orderable; pass key= to sort by an orderable \
                      projection (an int or str)"
                 ))),

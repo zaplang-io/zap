@@ -820,10 +820,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_list_new", &[], Some(p.into()));
         self.declare_rt("zap_list_push_i64", &[p.into(), i.into()], None);
         self.declare_rt("zap_list_push_ptr", &[p.into(), p.into()], None);
+        // `list[float]` (I#569): a `double` element shares the uniform 8-byte
+        // word, so the runtime reinterprets the bits around the same storage.
+        self.declare_rt("zap_list_push_f64", &[p.into(), f64t.into()], None);
         self.declare_rt("zap_list_get_i64", &[p.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_list_get_ptr", &[p.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_list_get_f64", &[p.into(), i.into()], Some(f64t.into()));
         self.declare_rt("zap_list_set_i64", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_list_set_ptr", &[p.into(), i.into(), p.into()], None);
+        self.declare_rt("zap_list_set_f64", &[p.into(), i.into(), f64t.into()], None);
         self.declare_rt("zap_list_len", &[p.into()], Some(i.into()));
         // list slice `xs[lo:hi:step]` -> a NEW list (a copy, D-0030). Same bound
         // triple + present-flags as the str/bytes slice; element-type-agnostic.
