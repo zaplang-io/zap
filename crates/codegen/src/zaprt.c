@@ -6222,7 +6222,6 @@ static PollDesc *np_pd_alloc(int fd) {
     pd->fd = fd;
     pd->closing = 0;
     pd->rg = pd->wg = NULL;
-            pd->w_scope = NULL;
     pd->r_scope = pd->w_scope = NULL;
     pd->io_deadline_ns = 0;
     pd->r_ready = pd->w_ready = 0;
@@ -6370,14 +6369,14 @@ void zap_netpoll_close(void *pd_) {
     if (pd->rg) {
         Waiter *w = pd->rg;
         pd->rg = NULL;
-            pd->r_scope = NULL;
+        pd->r_scope = NULL;
         w->val = ZAP_POLL_CLOSED;
         coready(w);
     }
     if (pd->wg) {
         Waiter *w = pd->wg;
         pd->wg = NULL;
-            pd->w_scope = NULL;
+        pd->w_scope = NULL;
         w->val = ZAP_POLL_CLOSED;
         coready(w);
     }
@@ -13628,6 +13627,8 @@ void *zap_net_recv(void *c_, int64_t n) {
     if (n < 0) {
         n = 0;
     }
+    int initial = zap_io_status(pd, whole_deadline_ns);
+    if (initial) { zap_io_panic(initial, "net: recv failed"); return NULL; }
     char *buf = (char *)malloc((size_t)n + 1);
     if (!buf) {
         zap_net_panic("net: out of memory");
@@ -13706,6 +13707,8 @@ int64_t zap_net_send(void *c_, void *data_) {
     ZapSock *c = (ZapSock *)c_;
     zap_fd_t fd = c->fd;
     void *pd = c->pd;
+    int status = zap_io_status(pd, 0);
+    if (status) { zap_io_panic(status, "net: send failed"); return 0; }
     const ZapStr *data = (const ZapStr *)data_;
     size_t len = (size_t)(data->len < 0 ? 0 : data->len);
     char *scratch = (char *)malloc(len + 1);
@@ -14101,6 +14104,8 @@ int64_t zap_tls_send(void *t_, void *data_) {
     int fd = t->fd;
     void *pd = t->pd;
     SSL *ssl = t->ssl;
+    int status = zap_io_status(pd, 0);
+    if (status) { zap_io_panic(status, "net: send failed"); return 0; }
     const ZapStr *data = (const ZapStr *)data_;
     size_t len = (size_t)(data->len < 0 ? 0 : data->len);
     char *scratch = (char *)malloc(len + 1);
@@ -14144,6 +14149,8 @@ void *zap_tls_recv(void *t_, int64_t n) {
     if (n > (1 << 30)) {
         n = 1 << 30; /* SSL_read's count is an int; keep it positive */
     }
+    int initial = zap_io_status(pd, whole_deadline_ns);
+    if (initial) { zap_io_panic(initial, "net: recv failed"); return NULL; }
     char *buf = (char *)malloc((size_t)n + 1);
     if (!buf) {
         zap_net_panic("tls: out of memory");

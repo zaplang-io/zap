@@ -34,6 +34,7 @@ def peer(bytes listener, channel[int64] done):
 def main():
     Atomic[int64] cancelled = Atomic(0)
     Atomic[int64] cleaned = Atomic(0)
+    auto descriptors = 0
     for i in range(0, 32):
         auto listener = net.listen("127.0.0.1", 0)
         auto done = channel[int64]()
@@ -51,5 +52,11 @@ def main():
             raise ValueError("cancelled I/O did not clean up before scope exit")
         auto complete = <-done
         net.close_conn(socket)
+        if os.path_exists("/proc/self/fd"):
+            auto now = len(os.listdir("/proc/self/fd"))
+            if i == 0:
+                descriptors = now
+            elif now > descriptors + 1:
+                raise ValueError("cancelled reads leaked descriptors")
     print("cancelled TCP reads cleaned before scope exit")
     print("descriptor reuse: 32")
