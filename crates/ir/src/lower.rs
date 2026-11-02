@@ -1370,7 +1370,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
 fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
     match t {
         ast::Type::Named { name, args, .. } => match name.as_str() {
-            "int64" | "i64" => Ok(Ty::I64),
+            "int" | "int64" | "i64" => Ok(Ty::I64),
             "int32" | "i32" => Ok(Ty::I32),
             // `float` is the Python-facing name for the 64-bit IEEE double
             // (I#569); `float64`/`f64` are the explicit-width spellings.
@@ -1547,7 +1547,7 @@ fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
 fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
     match name {
         "float" | "float64" | "f64" => Ok(Dtype::F64),
-        "int64" | "i64" => Ok(Dtype::I64),
+        "int" | "int64" | "i64" => Ok(Dtype::I64),
         "uint8" | "u8" => Ok(Dtype::Uint8),
         "bool" => Ok(Dtype::Bool),
         other => Err(err(format!(
@@ -1562,7 +1562,7 @@ fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
 /// word; reference types (`str`, structs, collections) become a pointer word.
 fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
     match name {
-        "int64" | "i64" | "int32" | "i32" | "bool" | "char" => Ok(Elem::I64),
+        "int" | "int64" | "i64" | "int32" | "i32" | "bool" | "char" => Ok(Elem::I64),
         "float" | "float64" | "f64" | "float32" | "f32" => Err(err(
             "channels of floating-point elements are not supported yet",
         )),
