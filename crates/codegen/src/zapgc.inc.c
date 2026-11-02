@@ -292,9 +292,10 @@ __attribute__((constructor)) static void zap_gc_read_env(void) {
     }
 }
 
-/* main-thread shadow-stack head (the main OS thread is a mutator but not a G). */
-void *zap_main_shadow_head = NULL;
-/* Per-thread "currently active" shadow head, maintained by compiled code. */
+/* Per-thread "currently active" shadow head, maintained by compiled code. The
+ * flushed head of a non-M thread (chiefly the main thread) lives in that
+ * thread's ZapMutator node (`shadow_head`), not a single shared global — see
+ * zap_flush_shadow. */
 __thread void *zap_shadow_head = NULL;
 
 /* The address of this thread's `zap_shadow_head` slot, resolved on the CURRENT
@@ -373,6 +374,12 @@ typedef struct ZapMutator {
      * collector at stop-the-world (see zap_reset_alloc_bufs). */
     ZapBlock *block;
     ZapBlock *overflow;
+    /* Flushed shadow-stack head for a non-M OS thread that runs Zap (the main
+     * thread; precise GC, gc-immix). A worker/dedicated M keeps its live head in
+     * its running G (scanned via g_all), so its node head stays NULL. Per-node,
+     * not a single global, so concurrent cur_m==NULL helper threads cannot
+     * clobber the main thread's chain (see zap_flush_shadow / zap_mark_roots). */
+    void *shadow_head;
 } ZapMutator;
 
 static pthread_mutex_t zap_stw_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -399,9 +406,20 @@ static void zap_flush_shadow(void) {
         if (m->current) {
             m->current->shadow_head = zap_shadow_head;
         }
-    } else {
-        /* The main OS thread runs top-level Zap and is not a G. */
-        zap_main_shadow_head = zap_shadow_head;
+    } else if (zap_self) {
+        /* A non-M OS thread. The main OS thread runs top-level Zap (and is not a
+         * G), so its live head must be flushed for the collector. Save it into
+         * THIS thread's own mutator node — never a single shared global: several
+         * distinct cur_m==NULL threads reach this branch (the netpoller and the
+         * blocking-syscall helper threads, ticket #80 / LockOSThread), and they
+         * never push a shadow frame, so their head is NULL. A shared slot let any
+         * of them overwrite the main thread's live chain with their empty NULL
+         * head between the main thread's flush and the collector's read, dropping
+         * the main thread's roots and reclaiming still-live objects — e.g. a
+         * heap fixture held by `main` across a `scope:` join whose child
+         * coroutines perform network I/O (redis #50). Per-node storage keeps each
+         * thread's head independent; a helper thread's NULL head is then inert. */
+        zap_self->shadow_head = zap_shadow_head;
     }
 }
 
@@ -413,6 +431,7 @@ static void zap_mutator_register(void) {
     mu->state = ZAP_MUT_ACTIVE;
     mu->block = NULL;
     mu->overflow = NULL;
+    mu->shadow_head = NULL;
     pthread_mutex_lock(&zap_stw_mu);
     mu->next = zap_mutators;
     zap_mutators = mu;
@@ -1081,9 +1100,20 @@ static void zap_mark_roots(void) {
     }
     pthread_mutex_unlock(&zap_groots_mu);
 
-    /* Main-thread shadow chain (top-level Zap code runs on the main OS thread,
-     * which is not a G). Its head was flushed when it parked or blocked. */
-    zap_mark_shadow_chain(zap_main_shadow_head);
+    /* Non-M OS threads that run Zap — chiefly the main thread, which runs
+     * top-level code and is not a G. Each flushed its live head into its OWN
+     * mutator node (zap_flush_shadow) when it parked or blocked, so scan every
+     * registered node. A worker/dedicated M keeps its head in its running G
+     * (scanned via g_all below), and a cur_m==NULL helper thread that never ran
+     * Zap (netpoller / blocking-syscall helper) has a NULL head — both inert
+     * here. zap_stw_mu guards the list against a late zap_mutator_register (the
+     * only writer); no thread holds zap_stw_mu while awaiting zap_heap_mu, so
+     * taking it under the mark's zap_heap_mu cannot deadlock. */
+    pthread_mutex_lock(&zap_stw_mu);
+    for (ZapMutator *mu = zap_mutators; mu; mu = mu->next) {
+        zap_mark_shadow_chain(mu->shadow_head);
+    }
+    pthread_mutex_unlock(&zap_stw_mu);
 
     /* Every live coroutine: the G object itself (keeps its green stack buffer,
      * closure arg and owning scope alive via zap_desc_gobj) AND its saved shadow
