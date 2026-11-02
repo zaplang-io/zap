@@ -316,11 +316,15 @@ __attribute__((noinline)) void **zap_shadow_head_addr(void) {
 }
 
 /* A shadow-stack frame, emitted by codegen in each function that holds live GC
- * pointers. Layout MUST match the codegen emission in lib.rs. */
+ * pointers. Layout MUST match the codegen emission in lib.rs. The `roots` array
+ * holds `nroots` direct value / reference-local pointer slots, followed by
+ * `naggr` aggregate-root PAIRS — `(base, desc)` words for each by-value value
+ * struct / tuple spill held across a safepoint (#586). */
 typedef struct ZapShadowFrame {
     struct ZapShadowFrame *prev;
     int64_t nroots;
-    void *roots[]; /* nroots slots */
+    int64_t naggr;
+    void *roots[]; /* nroots slots, then naggr (base, desc) pairs */
 } ZapShadowFrame;
 
 /* ---- global roots (runtime static tables that hold GC pointers) ----------- */
@@ -1034,6 +1038,27 @@ static void zap_mark_shadow_chain(void *head) {
     for (ZapShadowFrame *f = (ZapShadowFrame *)head; f; f = f->prev) {
         for (int64_t i = 0; i < f->nroots; i++) {
             zap_process_slot(&f->roots[i]);
+        }
+        /* Aggregate roots (#586): each (base, desc) pair is a by-value value
+         * struct / tuple SPILL (the D-0051 param/ret spill) living on the stack.
+         * The collector never sweeps or relocates such a spill, but its interior
+         * GC-pointer fields are live roots that the direct slots above do not
+         * cover — the spill's own SSA pointer addresses the stack, which the
+         * marker ignores. Trace those fields IN PLACE through the struct's precise
+         * descriptor: mark each target, and rewrite the field if its target is
+         * evacuated. A base that is null (the value is not live on this path) or a
+         * genuine HEAP pointer (a heap-resident `Struct` instance, already rooted
+         * by its direct slot) is skipped. */
+        void **aggr = &f->roots[f->nroots];
+        for (int64_t j = 0; j < f->naggr; j++) {
+            void *base = aggr[2 * j];
+            const ZapTypeDesc *d = (const ZapTypeDesc *)aggr[2 * j + 1];
+            if (!base || !d || zap_is_heap_ptr(base)) {
+                continue;
+            }
+            for (int32_t k = 0; k < d->n_ptrs; k++) {
+                zap_process_slot((void **)((char *)base + d->ptr_offsets[k]));
+            }
         }
     }
 }
