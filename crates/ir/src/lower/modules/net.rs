@@ -23,6 +23,8 @@ fn lower(
     Ok(Some(match method {
         "listen" => call_ret(lowerer, "zap_net_listen", a, Ty::Ptr, true),
         "connect" => call_ret(lowerer, "zap_net_connect", a, Ty::Ptr, true),
+        "connect_ip_deadline" => call_ret(lowerer, "zap_net_connect_ip_deadline", a, Ty::Ptr, true),
+        "set_deadline_ns" => call_void(lowerer, "zap_net_set_deadline_ns", a, true),
         "accept" => call_ret(lowerer, "zap_net_accept", a, Ty::Ptr, true),
         "recv" => call_ret(lowerer, "zap_net_recv", a, Ty::Ptr, true),
         "send" => call_ret(lowerer, "zap_net_send", a, Ty::I64, true),

@@ -2905,3 +2905,45 @@ park primitive exactly as before (unbounded). With only the per-park timeout set
 the whole-op deadline is `0` and the effective deadline is exactly the per-park
 one — byte-for-byte today's behavior. `connect`/`accept`/`send` still pass `0/0`
 (no write/connect deadline — #559).
+
+## D-0099 — Cancellation-aware socket parks and absolute I/O deadlines (#558, #559)
+
+**Build on #574.** Preserve its per-park read timeout and per-read-operation
+budget. Add `net.set_deadline_ns(conn, absolute_monotonic_ns)` as a separate,
+persistent budget for BOTH directions and across multiple calls. Zero clears
+it; negative input is ValueError. Expired deadlines raise TimeoutError even
+when a nonblocking syscall could immediately succeed. Relative millisecond
+conversions saturate rather than overflowing. Set/clear before starting I/O;
+clearing a deadline does not revoke one already captured by a parked wait.
+The new setter requires an open netpoller-backed TCP/TLS connection.
+
+**No DNS timeout claim.** `net.connect_ip_deadline(ip, port, deadline_ns)` accepts
+only numeric IPv4/IPv6 addresses. `tls.connect_resolved(hostname, ip, port,
+deadline_ns)` uses the numeric address for TCP and the hostname for SNI and
+normal chain/hostname verification; one budget covers TCP plus handshake.
+Zero means unbounded, negative is invalid. DNS resolution remains a separate
+prerequisite; existing named connect remains synchronous and is not advertised
+as bounded while getaddrinfo is running. Cancellation is checked before/after
+resolution, with returned address lists freed before propagating it.
+
+**Wake without premature unwind.** PollDesc borrows each parked G's owning
+scope. Cancellation walks live descriptors under registry→descriptor lock
+order, removes matching waiters exactly once, clears their deadline/scope,
+and wakes them with a distinct cancellation status. Registration checks
+cancellation under the same descriptor lock, closing the lost-wakeup window.
+Readiness, timeout, close, and cancellation compete for one waiter slot. A
+resumed wait never dereferences the descriptor, which may already be recycled.
+The precise collector pins borrowed scope pointers through a root callback.
+
+Native callers receive a status, release scratch/partial socket/OpenSSL state,
+then raise Cancelled. Established handles remain caller-owned: put close in
+finally; a cancelled operation is not transactional and must not be replayed.
+The no-netpoller fallback checks cancellation through bounded poll intervals
+without abandoning workers or sockets. HTTP fill/send seams preserve status
+and release their own I/O buffers before propagation.
+
+Regressions cover sibling-triggered reads/writes, descriptor reuse, one-worker
+backpressure, immediate/expired bounds and clearing, loopback backlog saturation,
+TLS read/handshake/write cancellation, a verified resolved TLS connection, and
+stalled TLS handshake/write deadlines. Native behavior is gated by the full
+both-collector and ARM CI jobs, not frontend-only checks.

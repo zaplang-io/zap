@@ -36,6 +36,10 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "tls", method, args, 2, span);
             Ty::Bytes
         }
+        "connect_resolved" => {
+            expect_argc(checker, "tls", method, args, 4, span);
+            Ty::Bytes
+        }
         // tls.listen(host, port, cert_path, key_path) -> TLS listener handle
         // (server SSL_CTX from the cert+key PEM files on disk, bound to host:port).
         "listen" => {

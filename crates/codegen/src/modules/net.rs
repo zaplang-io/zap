@@ -15,6 +15,12 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     let p = cg.ctx.ptr_type(AddressSpace::default());
     cg.declare_rt("zap_net_listen", &[p.into(), i.into()], Some(p.into()));
     cg.declare_rt("zap_net_connect", &[p.into(), i.into()], Some(p.into()));
+    cg.declare_rt(
+        "zap_net_connect_ip_deadline",
+        &[p.into(), i.into(), i.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt("zap_net_set_deadline_ns", &[p.into(), i.into()], None);
     cg.declare_rt("zap_net_accept", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_net_recv", &[p.into(), i.into()], Some(p.into()));
     cg.declare_rt("zap_net_send", &[p.into(), p.into()], Some(i.into()));

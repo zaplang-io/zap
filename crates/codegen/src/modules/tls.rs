@@ -19,6 +19,11 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     let p = cg.ctx.ptr_type(AddressSpace::default());
     cg.declare_rt("zap_tls_connect", &[p.into(), i.into()], Some(p.into()));
     cg.declare_rt(
+        "zap_tls_connect_resolved",
+        &[p.into(), p.into(), i.into(), i.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
         "zap_tls_connect_insecure",
         &[p.into(), i.into()],
         Some(p.into()),

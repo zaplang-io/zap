@@ -5545,11 +5545,14 @@ static int scope_contains(Scope *ancestor, Scope *scope) {
     for (; scope; scope = scope->parent) if (scope == ancestor) return 1;
     return 0;
 }
+static void scope_cancel_io(Scope *sc);
+
 static void scope_request_cancel(Scope *sc) {
     zap_np_lock(&sc->mu);
     sc->cancelled = 1;
     pthread_cond_broadcast(&sc->cv);
     zap_np_unlock(&sc->mu);
+    scope_cancel_io(sc);
     zap_np_lock(&g_scope_wait_mu);
     size_t count = 0;
     for (ScopeWait *n = g_scope_waits; n; n = n->next)
@@ -5814,7 +5817,7 @@ void zap_chan_close(void *ch) {
  * ========================================================================== */
 
 enum { ZAP_POLL_READ = 1, ZAP_POLL_WRITE = 2 };
-enum { ZAP_POLL_OK = 0, ZAP_POLL_TIMEOUT = 1, ZAP_POLL_CLOSED = 2 };
+enum { ZAP_POLL_OK = 0, ZAP_POLL_TIMEOUT = 1, ZAP_POLL_CLOSED = 2, ZAP_POLL_CANCELLED = 3 };
 
 typedef struct PollDesc {
     int fd;
@@ -5822,6 +5825,11 @@ typedef struct PollDesc {
     pthread_mutex_t mu;          /* guards the waiter slots / latches / deadlines */
     Waiter *rg;                  /* parked reader waiter, or NULL                */
     Waiter *wg;                  /* parked writer waiter, or NULL                */
+    /* Borrowed owning scopes: live parked Gs root them. Cleared BEFORE waking,
+     * under mu, so cancellation never retains a waiter or a recycled pd. */
+    Scope *r_scope;
+    Scope *w_scope;
+    int64_t io_deadline_ns; /* persistent absolute deadline for both directions */
     int r_ready;                 /* readiness edge latched with no reader parked  */
     int w_ready;
     int64_t r_deadline;          /* CLOCK_MONOTONIC ns, or 0 = none              */
@@ -5958,6 +5966,7 @@ static void np_wake_dir_locked(PollDesc *pd, int is_read, int status) {
     if (*slot) {
         Waiter *w = *slot;
         *slot = NULL;
+        if (is_read) pd->r_scope = NULL; else pd->w_scope = NULL;
         *dl = 0;
         w->val = (uint64_t)status;
         coready(w); /* enqueue the parked G, or signal a native waiter's condvar */
@@ -6007,7 +6016,7 @@ static int np_compute_timeout(void) {
     if (best <= now) {
         return 0;
     }
-    int64_t ms = (best - now + 999999) / 1000000;
+    int64_t ms = 1 + (best - now - 1) / 1000000;
     if (ms > 3600000) {
         ms = 3600000;
     }
@@ -6023,6 +6032,7 @@ static void np_expire_deadlines(void) {
         if (pd->rg && pd->r_deadline && pd->r_deadline <= now) {
             Waiter *w = pd->rg;
             pd->rg = NULL;
+            pd->r_scope = NULL;
             pd->r_deadline = 0;
             w->val = ZAP_POLL_TIMEOUT;
             coready(w);
@@ -6030,6 +6040,7 @@ static void np_expire_deadlines(void) {
         if (pd->wg && pd->w_deadline && pd->w_deadline <= now) {
             Waiter *w = pd->wg;
             pd->wg = NULL;
+            pd->w_scope = NULL;
             pd->w_deadline = 0;
             w->val = ZAP_POLL_TIMEOUT;
             coready(w);
@@ -6211,6 +6222,9 @@ static PollDesc *np_pd_alloc(int fd) {
     pd->fd = fd;
     pd->closing = 0;
     pd->rg = pd->wg = NULL;
+            pd->w_scope = NULL;
+    pd->r_scope = pd->w_scope = NULL;
+    pd->io_deadline_ns = 0;
     pd->r_ready = pd->w_ready = 0;
     pd->r_deadline = pd->w_deadline = 0;
     pd->all_prev = pd->all_next = pd->free_link = NULL;
@@ -6265,37 +6279,46 @@ int64_t zap_netpoll_wait(void *pd_, int64_t mode, int64_t deadline_ns) {
     PollDesc *pd = (PollDesc *)pd_;
     int is_read = (mode == ZAP_POLL_READ);
     zap_np_lock(&pd->mu);
+    if (g_is_cancelled()) {
+        zap_np_unlock(&pd->mu);
+        return ZAP_POLL_CANCELLED;
+    }
     if (pd->closing) {
         zap_np_unlock(&pd->mu);
         return ZAP_POLL_CLOSED;
     }
-    int *ready = is_read ? &pd->r_ready : &pd->w_ready;
-    if (*ready) {
-        *ready = 0; /* consume a latched readiness edge without parking */
-        zap_np_unlock(&pd->mu);
-        return ZAP_POLL_OK;
-    }
+    if (pd->io_deadline_ns && (!deadline_ns || pd->io_deadline_ns < deadline_ns))
+        deadline_ns = pd->io_deadline_ns;
     if (deadline_ns && deadline_ns <= np_now_ns()) {
         zap_np_unlock(&pd->mu);
         return ZAP_POLL_TIMEOUT;
     }
+    int *ready = is_read ? &pd->r_ready : &pd->w_ready;
+    if (*ready) {
+        *ready = 0;
+        zap_np_unlock(&pd->mu);
+        return ZAP_POLL_OK;
+    }
     Waiter w = {0};
     w.val = ZAP_POLL_OK;
-    w.ok = 0;
-    w.closed = 0;
-    if (cur_m && cur_m->current) cur_m->current->park_reason = "io"; /* I#475 */
+    G *g = cur_m ? cur_m->current : NULL;
+    if (g) g->park_reason = "io";
     if (is_read) {
         pd->rg = &w;
+        pd->r_scope = g ? g->scope : NULL;
         pd->r_deadline = deadline_ns;
     } else {
         pd->wg = &w;
+        pd->w_scope = g ? g->scope : NULL;
         pd->w_deadline = deadline_ns;
     }
-    if (deadline_ns) {
-        np_backend_kick(); /* make the poller recompute its timeout */
-    }
-    copark(&pd->mu, &w); /* releases pd->mu; the poller wakes us */
-    return (int64_t)w.val;
+    /* Registration and the cancellation check share pd->mu with the canceller.
+     * A cancel before registration is observed above; one after it wakes w. */
+    if (deadline_ns) np_backend_kick();
+    copark(&pd->mu, &w);
+    /* Never touch pd after wake: close may already have recycled it. The caller
+     * receives a status and releases malloc/OpenSSL scratch BEFORE raising. */
+    return g_is_cancelled() ? ZAP_POLL_CANCELLED : (int64_t)w.val;
 }
 
 /* Force-wake the waiter parked on `pd` for `mode` with ZAP_POLL_OK; if none is
@@ -6313,6 +6336,7 @@ void zap_netpoll_wake(void *pd_, int64_t mode) {
         if (pd->rg) {
             Waiter *w = pd->rg;
             pd->rg = NULL;
+            pd->r_scope = NULL;
             pd->r_deadline = 0;
             w->val = ZAP_POLL_OK;
             coready(w);
@@ -6324,6 +6348,7 @@ void zap_netpoll_wake(void *pd_, int64_t mode) {
         if (pd->wg) {
             Waiter *w = pd->wg;
             pd->wg = NULL;
+            pd->w_scope = NULL;
             pd->w_deadline = 0;
             w->val = ZAP_POLL_OK;
             coready(w);
@@ -6345,12 +6370,14 @@ void zap_netpoll_close(void *pd_) {
     if (pd->rg) {
         Waiter *w = pd->rg;
         pd->rg = NULL;
+            pd->r_scope = NULL;
         w->val = ZAP_POLL_CLOSED;
         coready(w);
     }
     if (pd->wg) {
         Waiter *w = pd->wg;
         pd->wg = NULL;
+            pd->w_scope = NULL;
         w->val = ZAP_POLL_CLOSED;
         coready(w);
     }
@@ -6359,6 +6386,65 @@ void zap_netpoll_close(void *pd_) {
     pd->free_link = g_np_free; /* recycle; a woken waiter never touches pd again */
     g_np_free = pd;
     zap_np_unlock(&g_np_mu);
+}
+
+/* Cancel only the waiters owned by this scope tree. Registry -> descriptor
+ * order matches close and deadline scanning; no channel lock is held here. */
+static void scope_cancel_io(Scope *sc) {
+    zap_np_lock(&g_np_mu);
+    for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
+        zap_np_lock(&pd->mu);
+        if (pd->rg && pd->r_scope && scope_contains(sc, pd->r_scope)) {
+            Waiter *w = pd->rg;
+            pd->rg = NULL; pd->r_scope = NULL; pd->r_deadline = 0;
+            w->val = ZAP_POLL_CANCELLED;
+            coready(w);
+        }
+        if (pd->wg && pd->w_scope && scope_contains(sc, pd->w_scope)) {
+            Waiter *w = pd->wg;
+            pd->wg = NULL; pd->w_scope = NULL; pd->w_deadline = 0;
+            w->val = ZAP_POLL_CANCELLED;
+            coready(w);
+        }
+        zap_np_unlock(&pd->mu);
+    }
+    zap_np_unlock(&g_np_mu);
+}
+
+#ifdef ZAP_GC_IMMIX
+/* Borrowed scope addresses in malloc PollDescs must be pinned, not merely kept
+ * alive through the owning G's relocating slot. */
+static void zap_netpoll_mark_roots(void) {
+    zap_np_lock(&g_np_mu);
+    for (PollDesc *pd = g_np_all; pd; pd = pd->all_next) {
+        zap_np_lock(&pd->mu);
+        if (pd->r_scope) zap_gc_mark(pd->r_scope);
+        if (pd->w_scope) zap_gc_mark(pd->w_scope);
+        zap_np_unlock(&pd->mu);
+    }
+    zap_np_unlock(&g_np_mu);
+}
+#endif
+
+/* Saturating conversion used by all relative read budgets, not just new APIs. */
+static int64_t zap_deadline_after_ms(int64_t ms) {
+    if (ms <= 0) return 0;
+    int64_t now = np_now_ns();
+    return ms > (INT64_MAX - now) / 1000000LL ? INT64_MAX : now + ms * 1000000LL;
+}
+
+/* Cancellation/deadline check for nonblocking fast paths. Does not raise: the
+ * owning native operation must first free its scratch/partial connection. */
+static int zap_io_status(void *pd_, int64_t deadline_ns) {
+    if (g_is_cancelled()) return -3;
+    if (pd_) {
+        PollDesc *pd = (PollDesc *)pd_;
+        zap_np_lock(&pd->mu);
+        int64_t configured = pd->io_deadline_ns;
+        zap_np_unlock(&pd->mu);
+        if (configured && (!deadline_ns || configured < deadline_ns)) deadline_ns = configured;
+    }
+    return deadline_ns && np_now_ns() >= deadline_ns ? -2 : 0;
 }
 
 /* ---- integration self-test (ticket #80) ----------------------------------- *
@@ -10028,6 +10114,7 @@ __attribute__((constructor)) static void zap_gc_register_statics(void) {
     zap_gc_add_root((void **)&zap_current_exc);
     zap_gc_add_root_fn(zap_reflect_mark_roots);
     zap_gc_add_root_fn(zap_scope_wait_mark_roots);
+    zap_gc_add_root_fn(zap_netpoll_mark_roots);
     zap_gc_add_root_fn(zap_sig_mark_roots); /* ticket #77: notify subscribers    */
 }
 
@@ -13084,6 +13171,7 @@ void zap_once_end(void *op) {
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -13261,51 +13349,49 @@ static int zap_sock_park2(zap_fd_t fd, void *pd, int mode, int64_t timeout_ms,
                           int64_t whole_deadline_ns) {
     /* Per-park relative timeout -> a fresh absolute deadline; then take the nearer
      * of it and the whole-op deadline (0 = unbounded on either side). */
-    int64_t eff = (timeout_ms > 0) ? np_now_ns() + timeout_ms * 1000000LL : 0;
+    int64_t eff = (timeout_ms > 0) ? zap_deadline_after_ms(timeout_ms) : 0;
     if (whole_deadline_ns > 0 && (eff == 0 || whole_deadline_ns < eff)) {
         eff = whole_deadline_ns;
     }
     if (pd) {
         int64_t r = zap_netpoll_wait(pd, mode, eff);
-        if (r == ZAP_POLL_CLOSED) {
-            return -1;
-        }
+        if (r == ZAP_POLL_CANCELLED) return -3;
+        if (r == ZAP_POLL_CLOSED) return -1;
         return (r == ZAP_POLL_TIMEOUT) ? -2 : 0;
     }
-    /* poll() timeout is a relative int ms; -1 means block forever. Derive it from
-     * the effective absolute deadline (clamped at 0 if already elapsed). */
-    int poll_ms;
-    if (eff <= 0) {
-        poll_ms = -1;
-    } else {
-        int64_t rem = eff - np_now_ns();
-        poll_ms = (rem <= 0) ? 0 : (int)(rem / 1000000LL);
-    }
+    /* Defensive no-netpoller fallback: bounded polling lets cancellation be
+     * observed without abandoning a socket/worker. Recompute after EINTR. */
+    for (;;) {
+        int status = zap_io_status(NULL, eff);
+        if (status) return status;
+        int poll_ms = 10;
+        if (eff) {
+            int64_t remaining = eff - np_now_ns();
+            int64_t ms = remaining > 0 ? 1 + (remaining - 1) / 1000000LL : 0;
+            if (ms < poll_ms) poll_ms = (int)ms;
+        }
 #if defined(ZAP_PLATFORM_WINDOWS)
-    /* The netpoller is always available on Windows (IOCP), so this is only a
-     * defensive fallback. WSAPoll is the poll() analogue. */
-    WSAPOLLFD pfd;
-    pfd.fd = fd;
-    pfd.events = (SHORT)((mode == ZAP_POLL_READ) ? POLLRDNORM : POLLWRNORM);
-    pfd.revents = 0;
-    zap_enter_blocking();
-    int n = WSAPoll(&pfd, 1, poll_ms);
-    zap_leave_blocking();
-    return (n == 0 && poll_ms >= 0) ? -2 : 0;
+        WSAPOLLFD pfd;
+        pfd.fd = fd;
+        pfd.events = (SHORT)((mode == ZAP_POLL_READ) ? POLLRDNORM : POLLWRNORM);
+        pfd.revents = 0;
+        zap_enter_blocking();
+        int n = WSAPoll(&pfd, 1, poll_ms);
+        zap_leave_blocking();
 #else
-    struct pollfd pfd;
-    pfd.fd = fd;
-    pfd.events = (short)((mode == ZAP_POLL_READ) ? POLLIN : POLLOUT);
-    pfd.revents = 0;
-    zap_enter_blocking();
-    int n;
-    /* Retry on EINTR: a profiler SIGPROF sample (ticket #78) — or any async
-     * signal — interrupts poll(), which SA_RESTART does NOT auto-resume. */
-    while ((n = poll(&pfd, 1, poll_ms)) < 0 && errno == EINTR) {
-    }
-    zap_leave_blocking();
-    return (n == 0 && poll_ms >= 0) ? -2 : 0;
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = (short)((mode == ZAP_POLL_READ) ? POLLIN : POLLOUT);
+        pfd.revents = 0;
+        zap_enter_blocking();
+        int n = poll(&pfd, 1, poll_ms);
+        int saved = errno;
+        zap_leave_blocking();
+        if (n < 0 && saved == EINTR) continue;
 #endif
+        if (n < 0) return -1;
+        if (n > 0) return zap_io_status(NULL, eff);
+    }
 }
 
 /* Park bounded only by the per-park timeout (no whole-op deadline). The common
@@ -13323,6 +13409,16 @@ static void zap_net_timeout_panic(void) {
     zap_panic_typed(ZAP_EXC_TIMEOUT_ERROR, zap_str_new("net: read timed out", 19));
 }
 
+static void zap_io_panic(int status, const char *message) {
+    if (status == -3 || g_is_cancelled()) { zap_raise(cancelled_exc()); return; }
+    if (status == -2) {
+        const char *timeout = "net: I/O deadline exceeded";
+        zap_panic_typed(ZAP_EXC_TIMEOUT_ERROR, zap_str_new(timeout, (int64_t)strlen(timeout)));
+        return;
+    }
+    zap_net_panic(message);
+}
+
 /* ---- net.listen / connect / accept / recv / send / port / set_read_timeout /
  * close --------------------------------------------------------------------- */
 
@@ -13330,7 +13426,7 @@ static void zap_net_timeout_panic(void) {
  * AI_PASSIVE (bind side). getaddrinfo can block on real DNS, so it is bracketed
  * by enter/leave_blocking; numeric hosts (127.0.0.1, ::1) resolve without I/O.
  * On failure raises a Zap exception. Caller freeaddrinfo()s the result. */
-static struct addrinfo *zap_net_resolve(const ZapStr *host, int64_t port, int passive) {
+static struct addrinfo *zap_net_resolve_flags(const ZapStr *host, int64_t port, int passive, int numeric) {
     char *hz = zap_net_dupz(host);
     if (!hz) {
         zap_net_panic("net: out of memory");
@@ -13343,9 +13439,8 @@ static struct addrinfo *zap_net_resolve(const ZapStr *host, int64_t port, int pa
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
-    if (passive) {
-        hints.ai_flags = AI_PASSIVE;
-    }
+    if (passive) hints.ai_flags |= AI_PASSIVE;
+    if (numeric) hints.ai_flags |= AI_NUMERICHOST;
     const char *node = (host->len == 0 && passive) ? NULL : hz;
     struct addrinfo *res = NULL;
     zap_enter_blocking();
@@ -13358,7 +13453,16 @@ static struct addrinfo *zap_net_resolve(const ZapStr *host, int64_t port, int pa
         zap_net_panic(msg);
         return NULL;
     }
+    if (g_is_cancelled()) {
+        freeaddrinfo(res);
+        zap_raise(cancelled_exc());
+        return NULL;
+    }
     return res;
+}
+
+static struct addrinfo *zap_net_resolve(const ZapStr *host, int64_t port, int passive) {
+    return zap_net_resolve_flags(host, port, passive, 0);
 }
 
 /* net.listen(host, port) -> listener handle. Binds + listens; SO_REUSEADDR so a
@@ -13393,67 +13497,91 @@ void *zap_net_listen(void *host_, int64_t port) {
 /* net.connect(host, port) -> connection handle. Non-blocking connect: on
  * EINPROGRESS park for writability, then check SO_ERROR. Tries each resolved
  * address in turn. */
-void *zap_net_connect(void *host_, int64_t port) {
+static void *zap_net_connect_impl(void *host_, int64_t port, int64_t deadline_ns, int numeric) {
+    zap_check_cancel();
+    if (deadline_ns < 0 || (numeric && (port < 1 || port > 65535))) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("net: invalid connect deadline or port", sizeof("net: invalid connect deadline or port") - 1));
+        return NULL;
+    }
+    if (numeric) {
+        const ZapStr *host = host_;
+        char address[INET6_ADDRSTRLEN];
+        unsigned char binary[16];
+        if (host->len <= 0 || host->len >= (int64_t)sizeof(address)) {
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("net: bounded connect requires a numeric IP", sizeof("net: bounded connect requires a numeric IP") - 1));
+            return NULL;
+        }
+        memcpy(address, host->data, (size_t)host->len);
+        address[host->len] = '\0';
+        if (memchr(address, '\0', (size_t)host->len) ||
+            (inet_pton(AF_INET, address, binary) != 1 && inet_pton(AF_INET6, address, binary) != 1)) {
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("net: bounded connect requires a numeric IP", sizeof("net: bounded connect requires a numeric IP") - 1));
+            return NULL;
+        }
+    }
+    int outcome = zap_io_status(NULL, deadline_ns);
+    if (outcome) { zap_io_panic(outcome, "net: connect failed"); return NULL; }
     zap_net_startup();
-    struct addrinfo *res = zap_net_resolve((const ZapStr *)host_, port, 0);
+    struct addrinfo *res = zap_net_resolve_flags((const ZapStr *)host_, port, 0, numeric);
     zap_fd_t fd = ZAP_INVALID_FD;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        outcome = zap_io_status(NULL, deadline_ns);
+        if (outcome) break;
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (!ZAP_FD_VALID(fd)) {
-            continue;
-        }
+        if (!ZAP_FD_VALID(fd)) continue;
         zap_sock_make_nonblocking(fd);
         void *pd = zap_netpoll_open((int64_t)fd);
         int ok = 0;
         for (;;) {
+            outcome = zap_io_status(pd, deadline_ns);
+            if (outcome) break;
             int rc = connect(fd, ai->ai_addr, (socklen_t)ai->ai_addrlen);
-            if (rc == 0) {
-                ok = 1;
-                break;
-            }
+            if (rc == 0) { ok = 1; break; }
             int e = ZAP_SOCK_ERR();
-            if (ZAP_SOCK_EINTR(e)) {
-                continue;
-            }
+            if (ZAP_SOCK_EINTR(e)) continue;
             if (ZAP_SOCK_INPROGRESS(e) || ZAP_SOCK_ALREADY(e)) {
-                if (zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0) < 0) {
-                    break;
-                }
+                outcome = zap_sock_park2(fd, pd, ZAP_POLL_WRITE, 0, deadline_ns);
+                if (outcome < 0) break;
                 int soerr = 0;
                 socklen_t sl = sizeof soerr;
-                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&soerr, &sl) < 0 ||
-                    soerr != 0) {
-                    break;
-                }
-                ok = 1;
-                break;
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&soerr, &sl) < 0 || soerr != 0) break;
+                /* A stale/early writable latch is not proof of connection.
+                 * SO_ERROR may still be zero while SYN is pending. */
+                struct sockaddr_storage peer;
+                socklen_t peer_len = sizeof peer;
+                if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) != 0) continue;
+                ok = 1; break;
             }
-            if (ZAP_SOCK_ISCONN(e)) {
-                ok = 1;
-                break;
-            }
+            if (ZAP_SOCK_ISCONN(e)) ok = 1;
             break;
         }
         if (ok) {
+            outcome = zap_io_status(pd, deadline_ns);
+            if (outcome) ok = 0;
+        }
+        if (ok) {
             freeaddrinfo(res);
-            /* Reuse the descriptor opened above: wrap without re-registering. */
             ZapSock *s = (ZapSock *)zap_obj(&zap_desc_sock);
-            s->kind = ZAP_CONN_PLAIN; /* ATOMIC objects are not zeroed. */
-            s->fd = fd;
-            s->pd = pd;
-            s->read_timeout_ms = 0;  /* ATOMIC objects are not zeroed. */
-            s->read_deadline_ms = 0; /* ATOMIC objects are not zeroed. */
+            s->kind = ZAP_CONN_PLAIN; s->fd = fd; s->pd = pd;
+            s->read_timeout_ms = 0; s->read_deadline_ms = 0;
             return s;
         }
-        if (pd) {
-            zap_netpoll_close(pd);
-        }
+        if (pd) zap_netpoll_close(pd);
         zap_sock_close_fd(fd);
         fd = ZAP_INVALID_FD;
+        if (outcome == -2 || outcome == -3) break;
     }
     freeaddrinfo(res);
-    zap_net_panic("net: connect failed");
+    zap_io_panic(outcome, "net: connect failed");
     return NULL;
+}
+
+void *zap_net_connect(void *host_, int64_t port) {
+    return zap_net_connect_impl(host_, port, 0, 0);
+}
+
+void *zap_net_connect_ip_deadline(void *ip_, int64_t port, int64_t deadline_ns) {
+    return zap_net_connect_impl(ip_, port, deadline_ns, 1);
 }
 
 /* net.accept(listener) -> connection handle. Parks on readability until a peer
@@ -13463,6 +13591,7 @@ void *zap_net_accept(void *l_) {
     zap_fd_t lfd = l->fd;
     void *lpd = l->pd;
     for (;;) {
+        zap_check_cancel();
         zap_fd_t cfd = accept(lfd, NULL, NULL);
         if (ZAP_FD_VALID(cfd)) {
             return zap_sock_wrap(cfd);
@@ -13472,8 +13601,9 @@ void *zap_net_accept(void *l_) {
             continue;
         }
         if (ZAP_SOCK_WOULDBLOCK(e)) {
-            if (zap_sock_park(lfd, lpd, ZAP_POLL_READ, 0) < 0) {
-                zap_net_panic("net: accept on a closed listener");
+            int status = zap_sock_park(lfd, lpd, ZAP_POLL_READ, 0);
+            if (status < 0) {
+                zap_io_panic(status, "net: accept on a closed listener");
                 return NULL;
             }
             continue;
@@ -13494,7 +13624,7 @@ void *zap_net_recv(void *c_, int64_t n) {
     /* Whole-operation read deadline (I#567): one absolute deadline for this recv,
      * composed with the per-park timeout at each park. 0 = none (unchanged). */
     int64_t whole_deadline_ns =
-        (c->read_deadline_ms > 0) ? np_now_ns() + c->read_deadline_ms * 1000000LL : 0;
+        (c->read_deadline_ms > 0) ? zap_deadline_after_ms(c->read_deadline_ms) : 0;
     if (n < 0) {
         n = 0;
     }
@@ -13505,6 +13635,8 @@ void *zap_net_recv(void *c_, int64_t n) {
     }
     ssize_t got = 0;
     for (;;) {
+        int status = zap_io_status(pd, whole_deadline_ns);
+        if (status) { free(buf); zap_io_panic(status, "net: recv failed"); return NULL; }
         ssize_t r = (ssize_t)recv(fd, buf, (size_t)n, 0);
         if (r >= 0) {
             got = r;
@@ -13516,9 +13648,9 @@ void *zap_net_recv(void *c_, int64_t n) {
         }
         if (ZAP_SOCK_WOULDBLOCK(e)) {
             int p = zap_sock_park2(fd, pd, ZAP_POLL_READ, timeout_ms, whole_deadline_ns);
-            if (p == -2) {
+            if (p == -2 || p == -3) {
                 free(buf);
-                zap_net_timeout_panic();
+                zap_io_panic(p, "net: recv failed");
                 return NULL;
             }
             if (p < 0) {
@@ -13528,11 +13660,12 @@ void *zap_net_recv(void *c_, int64_t n) {
             continue;
         }
         free(buf);
-        zap_net_panic("net: recv failed");
+        zap_io_panic(-1, "net: recv failed");
         return NULL;
     }
     void *out = zap_str_new(buf, (int64_t)got);
     free(buf);
+    zap_check_cancel();
     return out;
 }
 
@@ -13542,20 +13675,24 @@ void *zap_net_recv(void *c_, int64_t n) {
  * -1 on a hard error. */
 static ssize_t zap_sock_send_all(zap_fd_t fd, void *pd, const char *data, size_t len) {
     size_t off = 0;
+    int initial = zap_io_status(pd, 0);
+    if (initial) return initial;
     while (off < len) {
+        int status = zap_io_status(pd, 0);
+        if (status) return status;
         ssize_t w = (ssize_t)send(fd, data + off, len - off, MSG_NOSIGNAL);
-        if (w >= 0) {
+        if (w > 0) {
             off += (size_t)w;
             continue;
         }
+        if (w == 0) return -1;
         int e = ZAP_SOCK_ERR();
         if (ZAP_SOCK_EINTR(e)) {
             continue;
         }
         if (ZAP_SOCK_WOULDBLOCK(e)) {
-            if (zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0) < 0) {
-                return -1;
-            }
+            int status = zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0);
+            if (status < 0) return status;
             continue;
         }
         return -1;
@@ -13582,7 +13719,7 @@ int64_t zap_net_send(void *c_, void *data_) {
     ssize_t w = zap_sock_send_all(fd, pd, scratch, len);
     free(scratch);
     if (w < 0) {
-        zap_net_panic("net: send failed");
+        zap_io_panic((int)w, "net: send failed");
         return 0;
     }
     return (int64_t)w;
@@ -13741,23 +13878,45 @@ static int64_t zap_conn_read_deadline_ms(void *c_) {
     return ((ZapSock *)c_)->read_deadline_ms;
 }
 
+/* Persistent absolute monotonic deadline shared by reads and writes. A zero
+ * value clears it. It does not start a new budget for each chunk or operation. */
+void zap_net_set_deadline_ns(void *c_, int64_t deadline_ns) {
+    if (deadline_ns < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("net: deadline must be non-negative", sizeof("net: deadline must be non-negative") - 1));
+        return;
+    }
+    void *pd_ = ((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS ? ((ZapTls *)c_)->pd : ((ZapSock *)c_)->pd;
+    if (!pd_) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("net: deadline requires an open netpoller socket", sizeof("net: deadline requires an open netpoller socket") - 1));
+        return;
+    }
+    PollDesc *pd = pd_;
+    zap_np_lock(&pd->mu);
+    pd->io_deadline_ns = deadline_ns;
+    if (deadline_ns) {
+        if (pd->rg && (!pd->r_deadline || deadline_ns < pd->r_deadline)) pd->r_deadline = deadline_ns;
+        if (pd->wg && (!pd->w_deadline || deadline_ns < pd->w_deadline)) pd->w_deadline = deadline_ns;
+    }
+    zap_np_unlock(&pd->mu);
+    np_backend_kick();
+}
+
 /* Classify a non-positive SSL_* return into an action:
  *    0 -> parked and now ready; retry the SSL_* call
  *   -1 -> the descriptor was closed under us (treat as EOF)
  *   -2 -> a real protocol / certificate-verification error (caller raises)
  *   -3 -> clean peer shutdown via close_notify (treat as EOF). */
-static int zap_tls_want(SSL *ssl, int ret, int fd, void *pd) {
+static int zap_tls_want2(SSL *ssl, int ret, int fd, void *pd, int64_t deadline_ns) {
     int e = SSL_get_error(ssl, ret);
-    switch (e) {
-    case SSL_ERROR_WANT_READ:
-        return zap_sock_park(fd, pd, ZAP_POLL_READ, 0);
-    case SSL_ERROR_WANT_WRITE:
-        return zap_sock_park(fd, pd, ZAP_POLL_WRITE, 0);
-    case SSL_ERROR_ZERO_RETURN:
-        return -3;
-    default:
-        return -2;
-    }
+    if (e == SSL_ERROR_ZERO_RETURN) return -3;
+    if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) return -2;
+    int p = zap_sock_park2(fd, pd, e == SSL_ERROR_WANT_READ ? ZAP_POLL_READ : ZAP_POLL_WRITE, 0, deadline_ns);
+    if (p == -3) return -4; /* cancellation */
+    if (p == -2) return -5; /* deadline */
+    return p;
+}
+static int zap_tls_want(SSL *ssl, int ret, int fd, void *pd) {
+    return zap_tls_want2(ssl, ret, fd, pd, 0);
 }
 
 /* Raise a Zap exception for a handshake failure, including the top OpenSSL error
@@ -13784,22 +13943,21 @@ static void zap_tls_handshake_panic(void) {
  * desc through the out-params. The caller owns the lifetime (the http transport
  * holds the raw session like the plaintext path holds fd/pd; the module wraps it
  * in a `ZapTls`). */
-static SSL *zap_tls_dial_raw(void *host_, int64_t port, int verify, SSL_CTX **out_ctx, int *out_fd,
-                             void **out_pd) {
-    char *hz = zap_net_dupz((const ZapStr *)host_); /* SNI + hostname check */
-    if (!hz) {
-        zap_net_panic("tls: out of memory");
+static SSL *zap_tls_dial_raw_impl(void *host_, void *ip_, int64_t port, int verify, int64_t deadline_ns, SSL_CTX **out_ctx, int *out_fd, void **out_pd) {
+    const ZapStr *hostname = host_;
+    char hz[256];
+    if (hostname->len <= 0 || hostname->len >= (int64_t)sizeof(hz) ||
+        memchr(hostname->data, '\0', (size_t)hostname->len)) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("tls: invalid hostname", sizeof("tls: invalid hostname") - 1));
         return NULL;
     }
-    /* TCP connect (raises on failure). Extract fd/pd immediately and never touch
-     * the ZapSock GC object again across the handshake parks (net discipline). */
-    ZapSock *sock = (ZapSock *)zap_net_connect(host_, port);
+    memcpy(hz, hostname->data, (size_t)hostname->len); hz[hostname->len] = '\0';
+    ZapSock *sock = ip_ ? zap_net_connect_impl(ip_, port, deadline_ns, 1) : zap_net_connect(host_, port);
     int fd = sock->fd;
     void *pd = sock->pd;
 
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx) {
-        free(hz);
         zap_sock_shutdown(fd, pd);
         zap_net_panic("tls: SSL_CTX_new failed");
         return NULL;
@@ -13814,7 +13972,6 @@ static SSL *zap_tls_dial_raw(void *host_, int64_t port, int verify, SSL_CTX **ou
     SSL *ssl = SSL_new(ctx);
     if (!ssl) {
         SSL_CTX_free(ctx);
-        free(hz);
         zap_sock_shutdown(fd, pd);
         zap_net_panic("tls: SSL_new failed");
         return NULL;
@@ -13827,13 +13984,22 @@ static SSL *zap_tls_dial_raw(void *host_, int64_t port, int verify, SSL_CTX **ou
     }
     SSL_set_connect_state(ssl);
     for (;;) {
+        int status = zap_io_status(pd, deadline_ns);
+        if (status) {
+            SSL_free(ssl); SSL_CTX_free(ctx); zap_sock_shutdown(fd, pd);
+            zap_io_panic(status, "tls: handshake failed"); return NULL;
+        }
         int r = SSL_connect(ssl);
         if (r == 1) {
             break;
         }
-        int w = zap_tls_want(ssl, r, fd, pd);
+        int w = zap_tls_want2(ssl, r, fd, pd, deadline_ns);
         if (w == 0) {
             continue; /* parked -> ready, retry */
+        }
+        if (w == -4 || w == -5) {
+            SSL_free(ssl); SSL_CTX_free(ctx); zap_sock_shutdown(fd, pd);
+            zap_io_panic(w == -4 ? -3 : -2, "tls: handshake failed"); return NULL;
         }
         /* -1 closed, -2 protocol/verification error, -3 early shutdown */
         if (w == -2) {
@@ -13849,22 +14015,23 @@ static SSL *zap_tls_dial_raw(void *host_, int64_t port, int verify, SSL_CTX **ou
             SSL_free(ssl);
             SSL_CTX_free(ctx);
             zap_sock_shutdown(fd, pd);
-            free(hz);
-            zap_net_panic(saved);
+                zap_io_panic(-1, saved);
             return NULL;
         }
         SSL_free(ssl);
         SSL_CTX_free(ctx);
         zap_sock_shutdown(fd, pd);
-        free(hz);
         zap_net_panic("tls: connection closed during handshake");
         return NULL;
     }
-    free(hz);
     *out_ctx = ctx;
     *out_fd = fd;
     *out_pd = pd;
     return ssl;
+}
+
+static SSL *zap_tls_dial_raw(void *host_, int64_t port, int verify, SSL_CTX **out_ctx, int *out_fd, void **out_pd) {
+    return zap_tls_dial_raw_impl(host_, NULL, port, verify, 0, out_ctx, out_fd, out_pd);
 }
 
 /* Shared body of tls.connect / tls.connect_insecure: dial and wrap in a GC
@@ -13887,6 +14054,17 @@ static void *zap_tls_dial(void *host_, int64_t port, int verify) {
 
 /* tls.connect(host, port) -> handle. Chain + hostname verification ON. */
 void *zap_tls_connect(void *host_, int64_t port) { return zap_tls_dial(host_, port, 1); }
+/* Verified bounded dial: DNS/SNI identity and already-resolved numeric IP are
+ * separate. The same absolute budget covers TCP connect and TLS handshake. */
+void *zap_tls_connect_resolved(void *host_, void *ip_, int64_t port, int64_t deadline_ns) {
+    SSL_CTX *ctx = NULL; int fd = -1; void *pd = NULL;
+    SSL *ssl = zap_tls_dial_raw_impl(host_, ip_, port, 1, deadline_ns, &ctx, &fd, &pd);
+    ZapTls *t = (ZapTls *)zap_obj(&zap_desc_tls);
+    t->kind = ZAP_CONN_TLS; t->fd = fd; t->pd = pd;
+    t->read_timeout_ms = 0; t->read_deadline_ms = 0; t->ssl = ssl; t->ctx = ctx;
+    return t;
+}
+
 /* tls.connect_insecure(host, port) -> handle. Verification OFF (explicit opt-in;
  * never the default). Documented as unsafe. */
 void *zap_tls_connect_insecure(void *host_, int64_t port) { return zap_tls_dial(host_, port, 0); }
@@ -13896,7 +14074,11 @@ void *zap_tls_connect_insecure(void *host_, int64_t port) { return zap_tls_dial(
  * -1 on error. Shared by tls.send and the https client transport. */
 static int zap_tls_write_all(SSL *ssl, int fd, void *pd, const char *data, size_t len) {
     size_t off = 0;
+    int initial = zap_io_status(pd, 0);
+    if (initial) return initial == -3 ? -4 : -5;
     while (off < len) {
+        int status = zap_io_status(pd, 0);
+        if (status) return status == -3 ? -4 : -5;
         size_t chunk = len - off;
         if (chunk > (1u << 20)) {
             chunk = 1u << 20; /* keep within SSL_write's int count */
@@ -13906,9 +14088,8 @@ static int zap_tls_write_all(SSL *ssl, int fd, void *pd, const char *data, size_
             off += (size_t)r;
             continue;
         }
-        if (zap_tls_want(ssl, r, fd, pd) != 0) {
-            return -1;
-        }
+        int action = zap_tls_want(ssl, r, fd, pd);
+        if (action != 0) return action;
     }
     return 0;
 }
@@ -13933,7 +14114,7 @@ int64_t zap_tls_send(void *t_, void *data_) {
     int rc = zap_tls_write_all(ssl, fd, pd, scratch, len);
     free(scratch);
     if (rc < 0) {
-        zap_net_panic("tls: send failed");
+        zap_io_panic(rc == -4 ? -3 : rc == -5 ? -2 : -1, "tls: send failed");
         return 0;
     }
     return (int64_t)len;
@@ -13956,7 +14137,7 @@ void *zap_tls_recv(void *t_, int64_t n) {
      * protocol error and turned into a catchable TimeoutError. */
     int64_t timeout_ms = t->read_timeout_ms;
     int64_t whole_deadline_ns =
-        (t->read_deadline_ms > 0) ? np_now_ns() + t->read_deadline_ms * 1000000LL : 0;
+        (t->read_deadline_ms > 0) ? zap_deadline_after_ms(t->read_deadline_ms) : 0;
     if (n <= 0) {
         return zap_str_new("", 0);
     }
@@ -13970,6 +14151,8 @@ void *zap_tls_recv(void *t_, int64_t n) {
     }
     ssize_t got = 0;
     for (;;) {
+        int status = zap_io_status(pd, whole_deadline_ns);
+        if (status) { free(buf); zap_io_panic(status, "tls: recv failed"); return NULL; }
         int r = SSL_read(ssl, buf, (int)n);
         if (r > 0) {
             got = r;
@@ -13979,9 +14162,9 @@ void *zap_tls_recv(void *t_, int64_t n) {
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
             int mode = (e == SSL_ERROR_WANT_WRITE) ? ZAP_POLL_WRITE : ZAP_POLL_READ;
             int p = zap_sock_park2(fd, pd, mode, timeout_ms, whole_deadline_ns);
-            if (p == -2) {
+            if (p == -2 || p == -3) {
                 free(buf);
-                zap_net_timeout_panic(); /* read deadline elapsed -> TimeoutError */
+                zap_io_panic(p, "tls: recv failed"); /* read deadline elapsed -> TimeoutError */
                 return NULL;
             }
             if (p < 0) {
@@ -13995,11 +14178,12 @@ void *zap_tls_recv(void *t_, int64_t n) {
             break;
         }
         free(buf);
-        zap_net_panic("tls: recv failed");
+        zap_io_panic(-1, "tls: recv failed");
         return NULL;
     }
     void *out = zap_str_new(buf, (int64_t)got);
     free(buf);
+    zap_check_cancel();
     return out;
 }
 
@@ -14165,8 +14349,9 @@ void *zap_tls_accept(void *l_) {
                 continue;
             }
             if (ZAP_SOCK_WOULDBLOCK(e)) {
-                if (zap_sock_park(lfd, lpd, ZAP_POLL_READ, 0) < 0) {
-                    zap_net_panic("tls: accept on a closed listener");
+                int status = zap_sock_park(lfd, lpd, ZAP_POLL_READ, 0);
+                if (status < 0) {
+                    zap_io_panic(status, "tls: accept on a closed listener");
                     return NULL;
                 }
                 continue;
@@ -14181,6 +14366,7 @@ void *zap_tls_accept(void *l_) {
         if (!ssl) {
             SSL_CTX_free(ctx); /* undo the up-ref for this failed conn */
             zap_sock_shutdown(cfd, cpd);
+            zap_check_cancel();
             continue; /* bad handshake — skip this peer, keep accepting */
         }
         ZapTls *t = (ZapTls *)zap_obj(&zap_desc_tls);
@@ -14404,6 +14590,8 @@ static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd, int64_t timeout_ms,
         return -1;
     }
     for (;;) {
+        int status = zap_io_status(pd, whole_deadline_ns);
+        if (status) return status;
         ssize_t r = recv(fd, b->buf + b->len, b->cap - b->len - 1, 0);
         if (r > 0) {
             b->len += (size_t)r;
@@ -14419,9 +14607,7 @@ static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd, int64_t timeout_ms,
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             int p = zap_sock_park2(fd, pd, ZAP_POLL_READ, timeout_ms, whole_deadline_ns);
-            if (p == -2) {
-                return -2; /* read deadline elapsed */
-            }
+            if (p == -2 || p == -3) return p;
             if (p < 0) {
                 return 0; /* closed: treat as EOF */
             }
@@ -14580,6 +14766,8 @@ static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd, int64
         avail = 1u << 20; /* SSL_read's count is an int; bound it */
     }
     for (;;) {
+        int status = zap_io_status(pd, whole_deadline_ns);
+        if (status) return status;
         int r = SSL_read(ssl, b->buf + b->len, (int)avail);
         if (r > 0) {
             b->len += (size_t)r;
@@ -14596,9 +14784,9 @@ static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd, int64
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
             int mode = (e == SSL_ERROR_WANT_WRITE) ? ZAP_POLL_WRITE : ZAP_POLL_READ;
             int p = zap_sock_park2(fd, pd, mode, timeout_ms, whole_deadline_ns);
-            if (p == -2) {
+            if (p == -2 || p == -3) {
                 b->buf[b->len] = '\0';
-                return -2; /* read deadline elapsed */
+                return p;
             }
             if (p < 0) {
                 b->buf[b->len] = '\0';
@@ -14614,9 +14802,11 @@ static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd, int64
 /* Send all `len` bytes over the connection. Returns 0 on success, -1 on error. */
 static int zap_httpconn_send_all(ZapHttpConn *c, const char *data, size_t len) {
     if (c->tls) {
-        return zap_tls_write_all(c->ssl, c->fd, c->pd, data, len);
+        int status = zap_tls_write_all(c->ssl, c->fd, c->pd, data, len);
+        return status == -4 ? -3 : status == -5 ? -2 : status < 0 ? -1 : 0;
     }
-    return zap_sock_send_all(c->fd, c->pd, data, len) < 0 ? -1 : 0;
+    ssize_t status = zap_sock_send_all(c->fd, c->pd, data, len);
+    return status < 0 ? (int)status : 0;
 }
 
 /* Read one chunk into `b`. Returns bytes read (0 = EOF), -1 on error. */
@@ -14675,10 +14865,12 @@ static ssize_t zap_http_srv_fill(void *c_, ZapDynBuf *b, int64_t whole_deadline_
 static int zap_http_srv_send_all(void *c_, const char *data, size_t len) {
     if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
         ZapTls *t = (ZapTls *)c_;
-        return zap_tls_write_all(t->ssl, t->fd, t->pd, data, len);
+        int status = zap_tls_write_all(t->ssl, t->fd, t->pd, data, len);
+        return status == -4 ? -3 : status == -5 ? -2 : status < 0 ? -1 : 0;
     }
     ZapSock *s = (ZapSock *)c_;
-    return zap_sock_send_all(s->fd, s->pd, data, len) < 0 ? -1 : 0;
+    ssize_t status = zap_sock_send_all(s->fd, s->pd, data, len);
+    return status < 0 ? (int)status : 0;
 }
 
 /* http.request(method, url, body) -> response handle. Opens a connection (plain
@@ -14870,7 +15062,7 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
     free(req);
     if (sent < 0) {
         zap_httpconn_close(&hc);
-        zap_net_panic("http: send failed");
+        zap_io_panic(sent, "http: send failed");
         return NULL;
     }
 
@@ -14883,6 +15075,7 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
         }
     }
     zap_httpconn_close(&hc);
+    if (g_is_cancelled()) { zap_dyn_free(&b); zap_raise(cancelled_exc()); return NULL; }
 
     size_t hlen = 0, body_off = b.len;
     long status = 0;
@@ -15020,16 +15213,16 @@ void *zap_http_read_request(void *c_) {
     size_t hlen = 0, body_off = 0;
     int have_headers = 0;
     int64_t rdl_ms = zap_conn_read_deadline_ms(c_);
-    int64_t whole_deadline_ns = (rdl_ms > 0) ? np_now_ns() + rdl_ms * 1000000LL : 0;
+    int64_t whole_deadline_ns = (rdl_ms > 0) ? zap_deadline_after_ms(rdl_ms) : 0;
     for (;;) {
         if (zap_http_split(&b, &hlen, &body_off) == 0) {
             have_headers = 1;
             break;
         }
         ssize_t r = zap_http_srv_fill(c_, &b, whole_deadline_ns);
-        if (r == -2) {
+        if (r == -2 || r == -3) {
             zap_dyn_free(&b);
-            zap_net_timeout_panic();
+            zap_io_panic((int)r, "http: read failed");
             return NULL;
         }
         if (r <= 0) {
@@ -15038,7 +15231,7 @@ void *zap_http_read_request(void *c_) {
     }
     if (!have_headers) {
         zap_dyn_free(&b);
-        zap_net_panic("http: incomplete request");
+        zap_io_panic(-1, "http: incomplete request");
         return NULL;
     }
 
@@ -15084,9 +15277,9 @@ void *zap_http_read_request(void *c_) {
     }
     while ((size_t)(b.len - body_off) < (size_t)clen) {
         ssize_t r = zap_http_srv_fill(c_, &b, whole_deadline_ns);
-        if (r == -2) {
+        if (r == -2 || r == -3) {
             zap_dyn_free(&b);
-            zap_net_timeout_panic();
+            zap_io_panic((int)r, "http: read failed");
             return NULL;
         }
         if (r <= 0) {
@@ -15104,6 +15297,7 @@ void *zap_http_read_request(void *c_) {
     void *bodyobj = zap_str_new(b.buf + body_off, (int64_t)bodylen);
     void *version = zap_str_new(b.buf + vstart, (int64_t)(vend - vstart));
     zap_dyn_free(&b);
+    zap_check_cancel();
 
     ZapHttpReq *req = (ZapHttpReq *)zap_obj(&zap_desc_httpreq);
     req->method = (const ZapStr *)method;
@@ -15236,7 +15430,7 @@ static void zap_http_respond_do(void *c_, int64_t status, void *body_, void *hea
     int w = zap_http_srv_send_all(c_, out, (size_t)hdr + blen);
     free(out);
     if (w < 0) {
-        zap_net_panic("http: respond failed");
+        zap_io_panic(w, "http: respond failed");
     }
 }
 
