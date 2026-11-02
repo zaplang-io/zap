@@ -176,3 +176,67 @@ fn immix_runs_finalizers_once_each() {
         "stdout={stdout:?} stderr={stderr:?}"
     );
 }
+
+/// #586 (residual after #583/#584): the heap-pointer (`str`) fields of a by-value
+/// `value struct` held across a collection must stay rooted. Such an aggregate
+/// lives in a stack *spill* slot (the D-0051 param/ret spill); its interior `str`
+/// pointers are covered by neither the direct SSA roots nor #584's reference-local
+/// roots, so before the fix the collector reclaimed them and a later field read
+/// dereferenced freed/overwritten memory (SIGSEGV in `zap_str_len`, or a spurious
+/// "reclaimed" mismatch once the freed block was reused).
+///
+/// The tight heap cap forces repeated collections AND block reuse, so a reclaimed
+/// field is overwritten and the read deterministically fails when unrooted. The
+/// program must instead run to completion — the collector traces the spill's
+/// `str` fields in place via the struct's precise descriptor.
+#[test]
+fn immix_keeps_value_struct_pointer_fields_across_gc() {
+    let src = r#"value struct Options:
+    str host
+    str username
+    str password
+    str database
+
+def make_options(int64 generation) -> Options:
+    return Options(
+        host="host-" + str(generation),
+        username="user-" + str(generation),
+        password="pw-" + str(generation),
+        database="db-" + str(generation),
+    )
+
+def churn():
+    for i in range(0, 20000):
+        auto garbage = [str(i), str(i + 1)]
+    gc.collect()
+
+def snapshot_options(Options opts, int64 generation):
+    if opts.host != "host-" + str(generation):
+        raise ValueError("host reclaimed: " + opts.host)
+    if opts.username != "user-" + str(generation):
+        raise ValueError("username reclaimed: " + opts.username)
+    if opts.password != "pw-" + str(generation):
+        raise ValueError("password reclaimed: " + opts.password)
+    if opts.database != "db-" + str(generation):
+        raise ValueError("database reclaimed: " + opts.database)
+
+def main():
+    auto config = make_options(0)
+    for round in range(0, 4):
+        churn()
+        snapshot_options(config, 0)
+    print("value-struct str fields survive collection")
+"#;
+    // 8 MiB cap: freed blocks are recycled for the next round's garbage, so a
+    // reclaimed `str` field is overwritten before it is read.
+    let (ok, stdout, stderr) = run_capped(src, 8 * 1024 * 1024);
+    assert!(
+        ok,
+        "value-struct pointer fields must survive collection; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout.trim_end(),
+        "value-struct str fields survive collection",
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+}

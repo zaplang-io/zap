@@ -511,10 +511,20 @@ struct Cg<'a, 'ctx> {
 /// stores and loads use their canonical root cells directly. A GC safepoint (top of
 /// every block) then finds every live pointer via the chain. Over-retention of
 /// dead-but-slotted values is safe for the non-moving collector.
+///
+/// A by-value `value struct` / tuple (D-0051) held across a safepoint lives in a
+/// stack *spill* slot whose interior reference fields neither of the above cover
+/// (the spill's SSA pointer addresses the stack, which the collector ignores, and
+/// its alloca has a *struct* pointee, so #584's reference-local rooting skips it).
+/// A trailing *aggregate-root* section therefore records `(base, desc)` pairs so
+/// the collector can trace such a spill's pointer fields in place via the struct's
+/// precise type descriptor — the same descriptor heap instances use (#586).
 #[derive(Clone)]
 #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
 struct GcFrame<'ctx> {
-    /// Alloca of `{ ptr prev; i64 nroots; [N x ptr] roots }` in the entry block.
+    /// Alloca of `{ ptr prev; i64 nroots; i64 naggr; [N x ptr] roots }` in the
+    /// entry block. The `roots` array holds `n_direct` value/reference-local root
+    /// slots followed by `n_aggr` `(base, desc)` aggregate-root pairs.
     frame_ptr: PointerValue<'ctx>,
     frame_ty: inkwell::types::StructType<'ctx>,
     /// value id -> root slot index, or `-1` if the value is not a GC pointer.
@@ -522,7 +532,16 @@ struct GcFrame<'ctx> {
     /// GC-reference local storage -> canonical writable root slot. Rooting an
     /// alloca's stack address does not let evacuation rewrite its contents.
     local_slot_of: Vec<i32>,
-    /// Number of root slots (SSA values plus reference-local contents).
+    /// value id -> aggregate-root pair index, or `-1`. Set for every by-value
+    /// `value struct` / tuple SSA value; the pair's `base` word holds the spill
+    /// pointer and its `desc` word the struct's type descriptor.
+    aggr_of: Vec<i32>,
+    /// Number of direct root slots (SSA values plus reference-local contents);
+    /// the aggregate-root pairs begin at `roots[n_direct]`.
+    n_direct: u32,
+    /// Number of `(base, desc)` aggregate-root pairs.
+    n_aggr: u32,
+    /// Total length of the `roots` array: `n_direct + 2 * n_aggr`.
     n: u32,
 }
 
@@ -1521,20 +1540,39 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 }
             }
         }
+        let n_direct = n;
+        // Aggregate roots (#586): every by-value `value struct` / tuple SSA value
+        // is physically a pointer to a stack spill whose interior reference fields
+        // the direct roots above never cover. Reserve a `(base, desc)` pair for
+        // each so the collector can trace that spill's pointer fields in place.
+        let mut aggr_of = vec![-1i32; f.value_types.len()];
+        let mut aggr_sids: Vec<u32> = Vec::new();
+        for (vid, ty) in f.value_types.iter().enumerate() {
+            if let Ty::Struct(sid) = ty {
+                if self.struct_inline[*sid as usize] {
+                    aggr_of[vid] = aggr_sids.len() as i32;
+                    aggr_sids.push(*sid);
+                }
+            }
+        }
+        let n_aggr = aggr_sids.len() as u32;
+        n = n_direct + 2 * n_aggr;
         if n == 0 {
             return Ok(()); // nothing to root
         }
         let p = self.ctx.ptr_type(AddressSpace::default());
         let i64t = self.ctx.i64_type();
         let roots_ty = p.array_type(n);
-        let frame_ty = self
-            .ctx
-            .struct_type(&[p.into(), i64t.into(), roots_ty.into()], false);
+        let frame_ty = self.ctx.struct_type(
+            &[p.into(), i64t.into(), i64t.into(), roots_ty.into()],
+            false,
+        );
         let b = self.builder;
         let frame = b
             .build_alloca(frame_ty, "gcframe")
             .map_err(|e| e.to_string())?;
-        // frame.prev = *head; frame.nroots = n; roots[*] = null; *head = &frame.
+        // frame.prev = *head; frame.nroots = n_direct; frame.naggr = n_aggr;
+        // roots[*] = null; store each aggregate pair's descriptor; *head = &frame.
         let head = self.gc_head();
         let prev = b
             .build_load(p, head, "gc.prev")
@@ -1546,12 +1584,19 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let nslot = b
             .build_struct_gep(frame_ty, frame, 1, "gc.nslot")
             .map_err(|e| e.to_string())?;
-        b.build_store(nslot, i64t.const_int(n as u64, false))
+        b.build_store(nslot, i64t.const_int(n_direct as u64, false))
+            .map_err(|e| e.to_string())?;
+        let naggr_slot = b
+            .build_struct_gep(frame_ty, frame, 2, "gc.naggrslot")
+            .map_err(|e| e.to_string())?;
+        b.build_store(naggr_slot, i64t.const_int(n_aggr as u64, false))
             .map_err(|e| e.to_string())?;
         let roots = b
-            .build_struct_gep(frame_ty, frame, 2, "gc.roots")
+            .build_struct_gep(frame_ty, frame, 3, "gc.roots")
             .map_err(|e| e.to_string())?;
-        // Zero the roots array in one memset.
+        // Zero the whole roots array (direct slots AND aggregate pairs) in one
+        // memset: every direct slot and every aggregate `base` starts null, so a
+        // safepoint reached before a value is defined sees no stale pointer.
         b.build_memset(
             roots,
             8,
@@ -1559,12 +1604,35 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             i64t.const_int((n as u64) * 8, false),
         )
         .map_err(|e| e.to_string())?;
+        // An aggregate pair's descriptor is constant for the function, so store it
+        // once here; its `base` is filled in at the spill's definition. The
+        // collector reads `desc` only when `base` is a non-null stack pointer.
+        for (j, sid) in aggr_sids.iter().enumerate() {
+            let desc_idx = n_direct + 2 * j as u32 + 1;
+            let elem = unsafe {
+                b.build_in_bounds_gep(
+                    roots_ty,
+                    roots,
+                    &[
+                        self.ctx.i32_type().const_zero(),
+                        self.ctx.i32_type().const_int(desc_idx as u64, false),
+                    ],
+                    "gc.aggr.desc",
+                )
+                .map_err(|e| e.to_string())?
+            };
+            b.build_store(elem, self.struct_descs[*sid as usize])
+                .map_err(|e| e.to_string())?;
+        }
         b.build_store(head, frame).map_err(|e| e.to_string())?;
         self.gc_frame = Some(GcFrame {
             frame_ptr: frame,
             frame_ty,
             slot_of,
             local_slot_of,
+            aggr_of,
+            n_direct,
+            n_aggr,
             n,
         });
         // Parameters are rooted by the caller (translate_fn) from `vals`, not from
@@ -1589,7 +1657,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         }
         let roots = self
             .builder
-            .build_struct_gep(frame.frame_ty, frame.frame_ptr, 2, "gc.local.roots")
+            .build_struct_gep(frame.frame_ty, frame.frame_ptr, 3, "gc.local.roots")
             .map_err(|e| e.to_string())?;
         let p = self.ctx.ptr_type(AddressSpace::default());
         let local = unsafe {
@@ -1609,34 +1677,54 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
 
     /// Store SSA value `vid` into its root slot, if it has one. `val` must be a
     /// pointer value. Called at the end of the value's defining block.
+    ///
+    /// For a by-value `value struct` / tuple value (`aggr_of >= 0`) the same
+    /// pointer is also written into its aggregate-root pair's `base` word, so the
+    /// collector can trace the spill's interior pointer fields in place (#586). A
+    /// heap-resident `Struct` value (e.g. a `StructNew` instance) is rooted by its
+    /// direct slot as usual; its `base` word is ignored by the collector because
+    /// the base is a heap pointer, not a stack spill.
     #[cfg(feature = "gc-immix")]
     fn gc_store_root(&self, vid: u32, val: BasicValueEnum<'ctx>) -> Result<(), String> {
         let Some(frame) = &self.gc_frame else {
             return Ok(());
         };
+        if !val.is_pointer_value() {
+            return Ok(());
+        }
         let slot = frame.slot_of[vid as usize];
-        if slot < 0 || !val.is_pointer_value() {
+        let aggr = frame.aggr_of[vid as usize];
+        if slot < 0 && aggr < 0 {
             return Ok(());
         }
         let b = self.builder;
-        let roots = b
-            .build_struct_gep(frame.frame_ty, frame.frame_ptr, 2, "gc.roots")
-            .map_err(|e| e.to_string())?;
         let p = self.ctx.ptr_type(AddressSpace::default());
-        let elem = unsafe {
-            b.build_in_bounds_gep(
-                p.array_type(frame.n),
-                roots,
-                &[
-                    self.ctx.i32_type().const_zero(),
-                    self.ctx.i32_type().const_int(slot as u64, false),
-                ],
-                "gc.slot",
-            )
-            .map_err(|e| e.to_string())?
-        };
-        b.build_store(elem, val.into_pointer_value())
+        let roots = b
+            .build_struct_gep(frame.frame_ty, frame.frame_ptr, 3, "gc.roots")
             .map_err(|e| e.to_string())?;
+        let store_at = |idx: u32| -> Result<(), String> {
+            let elem = unsafe {
+                b.build_in_bounds_gep(
+                    p.array_type(frame.n),
+                    roots,
+                    &[
+                        self.ctx.i32_type().const_zero(),
+                        self.ctx.i32_type().const_int(idx as u64, false),
+                    ],
+                    "gc.slot",
+                )
+                .map_err(|e| e.to_string())?
+            };
+            b.build_store(elem, val.into_pointer_value())
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        };
+        if slot >= 0 {
+            store_at(slot as u32)?;
+        }
+        if aggr >= 0 {
+            store_at(frame.n_direct + 2 * aggr as u32)?;
+        }
         Ok(())
     }
 
@@ -1677,7 +1765,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         let b = self.builder;
                         let p = self.ctx.ptr_type(AddressSpace::default());
                         if let Ok(roots) =
-                            b.build_struct_gep(frame.frame_ty, frame.frame_ptr, 2, "gc.roots")
+                            b.build_struct_gep(frame.frame_ty, frame.frame_ptr, 3, "gc.roots")
                         {
                             let elem = unsafe {
                                 b.build_in_bounds_gep(
