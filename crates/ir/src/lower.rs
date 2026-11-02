@@ -9271,14 +9271,25 @@ impl<'a> FnLower<'a> {
             let (v, _) = self.lower_lambda(params, body, idx)?;
             return Ok(v);
         }
-        // `None` bound to a reference-typed slot (D-0014): the null pointer. Mono
-        // has already rewritten `None` for an `Optional`-shaped enum target into
-        // `Optional.None`, so an `Expr::None` reaching here always targets a plain
-        // reference type (a struct instance, `str`, or a collection), whose null
-        // value IS the null pointer. Member access on it then throws (D-0007,
-        // EXC-4), enforced by the null-guard at the access site. Value structs
-        // are not nullable (D-0014), so `None` is rejected for them.
+        // `None` coerced to a reference-typed slot. Mono rewrites `None` into
+        // `Optional[T].None` wherever it threads an expected type (bindings,
+        // returns — Fork I/O), but *not* for call arguments (`rewrite_call` lowers
+        // each argument with no expected type) nor for an omitted parameter's
+        // defaulted `None`. So a bare `Expr::None` can still reach here against an
+        // `Optional[T]` target, and that target's `None` is NOT a raw null pointer:
+        // a scalar-payload `Optional` tags its discriminant, so a null would make
+        // `is_some()`/`is_none()` dereference nil at native runtime (#564).
+        // Construct the canonical value instead — `gen_opt_none` yields the tagged
+        // `None` for a scalar payload and the null pointer for a niche/pointer
+        // payload, so niche `Optional`s are unchanged.
         if matches!(e, Expr::None(_)) && target.is_ptr() {
+            if let Some(opt) = optional_layout(self.ctx, target) {
+                return Ok(gen_opt_none(self, &opt));
+            }
+            // A plain reference type (a struct instance, `str`, or a collection):
+            // its null value IS the null pointer. Member access on it then throws
+            // (D-0007, EXC-4), enforced by the null-guard at the access site. Value
+            // structs are not nullable (D-0014), so `None` is rejected for them.
             if let Ty::Struct(sid) = target {
                 if self.ctx.is_value_struct(sid) {
                     return Err(err(
