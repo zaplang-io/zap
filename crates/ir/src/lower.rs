@@ -10774,6 +10774,12 @@ impl<'a> FnLower<'a> {
         if let Some(opt_name) = name.strip_prefix("get$") {
             return self.lower_dict_get(recv, kk, vk, opt_name, args);
         }
+        // `dict.get(key, default) -> V` (ticket #570): monomorphization marked
+        // the two-arg form `get_default`. The result is a plain `V`, so (unlike
+        // the one-arg `Optional[V]` form) no `Optional$V` instance name is needed.
+        if name == "get_default" {
+            return self.lower_dict_get_default(recv, kk, vk, args);
+        }
         if !args.is_empty() {
             return Err(err(format!("dict.{name}() takes no arguments")));
         }
@@ -10909,6 +10915,91 @@ impl<'a> FnLower<'a> {
         self.position(join_bb);
         let out = self.load(slot, Ty::Struct(sid));
         Ok((out, Ty::Struct(sid)))
+    }
+
+    /// Lower `d.get(key, default) -> V` (ticket #570): the value when the key is
+    /// present, else `default`. Like the one-arg form it reuses the `#299`
+    /// membership probe (`zap_dict_contains_*`) to decide presence — never the
+    /// fetched word — so a legitimately-stored `0`/null value selects the stored
+    /// value, not the default. There is no `Optional` wrapper: both arms produce
+    /// a plain `V`, joined through a slot. The lookup stays single-sourced
+    /// (`zap_dict_get_*`); no new C runtime entry point is added.
+    fn lower_dict_get_default(
+        &mut self,
+        recv: Value,
+        kk: Elem,
+        vk: Elem,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        if args.len() != 2 {
+            return Err(err(format!(
+                "dict.get() takes one or two arguments (the key, and an optional \
+                 default), got {}",
+                args.len()
+            )));
+        }
+
+        // The key, coerced to the dict's key kind, plus the struct-key hash/eq
+        // function pointers (empty for scalar/string keys), shared by the
+        // presence probe and the value fetch.
+        let (kv, kt) = self.expr(&args[0].value)?;
+        let key = self.coerce(kv, kt, kk.ty());
+        let kfns = self.key_fn_args(kk)?;
+
+        // The default, coerced to the dict's value kind — the same `V` the fetch
+        // yields, so both arms agree on the slot's type.
+        let (dv, dt) = self.expr(&args[1].value)?;
+        let default = self.coerce(dv, dt, vk.ty());
+
+        // present = (contains(d, key) != 0)
+        let word = self.new_value(Ty::I64);
+        let mut cargs = vec![recv, key];
+        cargs.extend_from_slice(&kfns);
+        self.emit(Inst::Call {
+            dest: Some(word),
+            func: format!("zap_dict_contains_{}", kk.key_suffix()),
+            args: cargs,
+        });
+        let zero = self.iconst(Ty::I64, 0);
+        let present = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: present,
+            pred: CmpPred::Ne,
+            lhs: word,
+            rhs: zero,
+        });
+
+        let slot = self.alloca(vk.ty());
+        let some_bb = self.new_block();
+        let none_bb = self.new_block();
+        let join_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: present,
+            then_bb: some_bb,
+            else_bb: none_bb,
+        });
+
+        // present -> d[key]
+        self.position(some_bb);
+        let raw = self.new_value(vk.ty());
+        let mut gargs = vec![recv, key];
+        gargs.extend_from_slice(&kfns);
+        self.emit(Inst::Call {
+            dest: Some(raw),
+            func: format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
+            args: gargs,
+        });
+        self.store(slot, raw);
+        self.set_term(Term::Br(join_bb));
+
+        // absent -> default
+        self.position(none_bb);
+        self.store(slot, default);
+        self.set_term(Term::Br(join_bb));
+
+        self.position(join_bb);
+        let out = self.load(slot, vk.ty());
+        Ok((out, vk.ty()))
     }
 
     /// Lower `d.items()` to a `list[(K, V)]` (ticket #299): snapshot the keys,

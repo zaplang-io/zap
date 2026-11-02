@@ -4705,25 +4705,33 @@ impl Checker {
     /// and returns the value wrapped in `Some`, or `None` when the key is absent
     /// — a safe, non-aborting read (unlike `d[key]`, which raises on a miss).
     fn check_dict_method(&mut self, name: &str, args: &[Arg], k: &Ty, v: &Ty, span: Span) -> Ty {
-        // `get(key)` is the one dict method that takes an argument (the key),
-        // so it is handled before the shared no-argument check below. Its result
-        // is the prelude `Optional[V]`, spelled `Ty::Named("Optional")` exactly as
-        // every other `Optional[T]` annotation resolves (I#154) — so it matches,
-        // `is_none()`/`unwrap_or(...)`, and binding all type-check unchanged.
+        // `get` is the one dict method that takes arguments, so it is handled
+        // before the shared no-argument check below. Two forms (ticket #570):
+        //   `get(key)`          -> `Optional[V]` — a safe, non-aborting read
+        //                          (`Some(value)` present, `None` absent).
+        //   `get(key, default)` -> `V`           — the value when present, else
+        //                          `default` (a plain `V`, never `Optional[V]`).
+        // The one-arg result is the prelude `Optional[V]`, spelled
+        // `Ty::Named("Optional")` exactly as every other `Optional[T]`
+        // annotation resolves (I#154), so `match`, `is_none()`/`unwrap_or(...)`,
+        // and binding all type-check unchanged.
         if name == "get" {
-            if args.len() != 1 {
+            let n = args.len();
+            if n != 1 && n != 2 {
                 self.error(
                     ErrorCode::ZAP4025,
                     format!(
-                        "dict.get() takes exactly one argument (the key), got {}",
-                        args.len()
+                        "dict.get() takes one or two arguments (the key, and an \
+                         optional default), got {n}"
                     ),
                     span,
                 );
             }
-            for a in args {
+            for (i, a) in args.iter().enumerate() {
                 let at = self.infer(&a.value);
-                if args.len() == 1 && !assignable(&at, k) && !matches!(at, Ty::Unknown) {
+                // First argument is the key, checked against the dict's key type.
+                if i == 0 && (n == 1 || n == 2) && !assignable(&at, k) && !matches!(at, Ty::Unknown)
+                {
                     self.error(
                         ErrorCode::ZAP4025,
                         format!(
@@ -4734,6 +4742,24 @@ impl Checker {
                         span,
                     );
                 }
+                // Second argument is the default, unified against the value type
+                // `V` under the ordinary assignment rules — a `str` default for a
+                // `dict[str, int64]` is rejected just as an assignment would be.
+                if i == 1 && n == 2 && !assignable(&at, v) && !matches!(at, Ty::Unknown) {
+                    self.error(
+                        ErrorCode::ZAP4024,
+                        format!(
+                            "dict.get() default has type {}, but this dict has values \
+                             of type {}",
+                            at.display(),
+                            v.display()
+                        ),
+                        span,
+                    );
+                }
+            }
+            if n == 2 {
+                return v.clone();
             }
             return Ty::Named("Optional".to_string());
         }
@@ -6565,6 +6591,70 @@ def main():
     print(d.get("k").unwrap_or("x"))
     print(str(d.get("absent").is_none()))
 "#);
+    }
+
+    #[test]
+    fn dict_get_two_arg_default_is_the_value_type() {
+        // #570: `d.get(key, default)` returns a plain `V` (not `Optional[V]`):
+        // an `int64` default makes the result an `int64` usable directly in
+        // arithmetic, and a `str` default a `str` passed where a `str` is
+        // wanted. The default unifies with the value type under the ordinary
+        // rules, so a widening `int64` default for an `int64` dict is fine.
+        ok(r#"
+def main():
+    dict[str, int64] d = {"a": 1}
+    int64 n = d.get("b", 0)
+    print(n + 1)
+    dict[str, str] s = {"k": "v"}
+    str hit = s.get("k", "fallback")
+    print(hit)
+"#);
+    }
+
+    #[test]
+    fn dict_get_two_arg_default_type_mismatch_is_rejected() {
+        // #570: the default is unified against the value type `V` the same way an
+        // assignment is — a `str` default for a `dict[str, int64]` is rejected
+        // (ZAP4024, built-in argument type mismatch), just as `int64 x = "s"`
+        // would be.
+        assert!(errors(
+            "def main():\n    dict[str, int64] d = {\"a\": 1}\n    print(d.get(\"b\", \"wrong\"))\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP4024));
+    }
+
+    #[test]
+    fn dict_get_one_arg_still_returns_optional() {
+        // #570 must not regress the one-arg form: `d.get(key)` still yields an
+        // `Optional[V]`, so binding it to an annotated `Optional[int64]` and
+        // calling `unwrap_or` type-checks, while binding it to a bare `int64`
+        // (the two-arg result type) is a mismatch.
+        ok(r#"
+def main():
+    dict[str, int64] d = {"a": 1}
+    Optional[int64] o = d.get("a")
+    print(o.unwrap_or(-1))
+"#);
+        assert!(!errors(
+            "def main():\n    dict[str, int64] d = {\"a\": 1}\n    int64 x = d.get(\"a\")\n"
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn dict_get_wrong_arity_is_rejected() {
+        // #570: zero args, or three or more, is a `wrong number of arguments`
+        // error (ZAP4025) — only one or two are accepted.
+        for src in [
+            "def main():\n    dict[str, int64] d = {\"a\": 1}\n    print(d.get())\n",
+            "def main():\n    dict[str, int64] d = {\"a\": 1}\n    print(d.get(\"a\", 0, 9))\n",
+        ] {
+            assert!(
+                errors(src).iter().any(|e| e.code == ErrorCode::ZAP4025),
+                "{src}"
+            );
+        }
     }
 
     // --- interfaces (ticket #84, D-0016) ---

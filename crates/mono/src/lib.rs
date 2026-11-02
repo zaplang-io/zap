@@ -2128,6 +2128,29 @@ impl Mono<'_> {
             // the receiver's dict type, or (when the receiver's type is opaque to
             // this inferer) from the expected `Optional[..]` sink of the binding.
             if variant == "get" {
+                // Two-arg `get(key, default) -> V` (ticket #570): returns the
+                // stored value when present, else the default — a plain `V`, with
+                // no `Optional` wrapper. Lowering uses only the value element
+                // *kind* (which it has), so no `Optional$V` instance is needed;
+                // the symbol is marked `get_default` so lowering takes the 2-arg
+                // path. `V` comes from the receiver's dict type, falling back to
+                // the default argument's own type when the receiver is opaque.
+                if nargs.len() == 2 {
+                    if let Some(vty) =
+                        dict_value_ty(&bcty).or_else(|| cty_type(argpairs[1].1.clone()))
+                    {
+                        let node = Expr::Call {
+                            callee: Box::new(Expr::Attr {
+                                base: Box::new(bexpr),
+                                name: "get_default".to_string(),
+                                span: *aspan,
+                            }),
+                            args: nargs,
+                            span,
+                        };
+                        return Ok((node, CTy::Ty(vty)));
+                    }
+                }
                 if let Some(vty) = dict_value_ty(&bcty).or_else(|| optional_payload_ty(expected)) {
                     let opt_mangled = self.request("Optional", std::slice::from_ref(&vty));
                     let node = Expr::Call {

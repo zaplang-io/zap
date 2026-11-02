@@ -187,6 +187,12 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
   sees only the lossy element *kind*, so monomorphization — which alone knows the
   concrete `V` — encodes the `Optional$V` instance into the method symbol
   (`get$Optional$str`) for lowering to pick the right niche/tagged enum.
+  The two-arg `d.get(key, default) -> V` (#570) reuses the same
+  `zap_dict_contains_*` + `zap_dict_get_*` pair and adds no entry point either:
+  a present key yields the stored value, an absent one the (eagerly evaluated)
+  default, both a plain `V` with no `Optional` wrapper. It needs no `Optional$V`
+  instance — the value kind suffices — so monomorphization marks the symbol
+  `get_default` for lowering to take the select-value-or-default path.
 - `array[T]` (#24, #49, #476): `[ header | dtype | ndim | dims: *i64 |
   data: *T | off: i64 ]`. The current layout is 1-D (`ndim = 1`); it has no
   strides. Contiguous views share the buffer base and retain an element offset
