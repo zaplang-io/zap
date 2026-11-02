@@ -240,3 +240,102 @@ def main():
         "stdout={stdout:?} stderr={stderr:?}"
     );
 }
+
+/// Cross-thread root clobber (residual after #583/#584/#586, the redis #50
+/// blocker): a live HEAP object held only by the main thread's shadow chain must
+/// survive a collection that is triggered while the main thread is blocked inside
+/// the runtime (here a `scope:` join).
+///
+/// The main OS thread runs top-level Zap but is not a coroutine (no `G`), so when
+/// it parks it flushes its shadow-stack head into a slot the collector reads. The
+/// bug: that slot was a single shared global written by EVERY non-`M` thread
+/// (`cur_m == NULL`), not just the main thread. The per-`scope(timeout=...)`
+/// deadline helper threads — like the netpoller and other blocking-syscall
+/// helpers — run off any scheduler `M`, never push a shadow frame, and flush a
+/// NULL head. One of them overwriting the main thread's flushed chain between the
+/// flush and the collector's read dropped the main thread's roots, so a heap
+/// `Fixture` (and its nested heap `Options` with `str` fields) held by `main`
+/// across the join was reclaimed; the next field read hit freed/zeroed memory
+/// (SIGSEGV at a small/near-null offset, or a spurious "reclaimed" mismatch once
+/// the block was reused). The fix stores each thread's flushed head in its own
+/// mutator node so a helper thread's NULL head is inert.
+///
+/// The workers open `scope(timeout=...)` blocks (spawning the `cur_m == NULL`
+/// deadline threads) WHILE `main` is parked on the outer join, and churn under a
+/// tight cap to force a collection in that window — deterministically reclaiming
+/// the fixture when its root is clobbered. No network is needed: a timed scope
+/// alone reproduces the shared-slot overwrite that redis #50 hit via its socket
+/// I/O helper threads. The program must instead run to completion with every
+/// nested `str` field intact.
+#[test]
+fn immix_keeps_main_thread_roots_across_cross_thread_collection() {
+    let src = r#"struct Options:
+    str host
+    str username
+    str password
+    str database
+
+struct Fixture:
+    Options config
+    str prefix
+
+def make_fixture() -> Fixture:
+    auto opts = Options(
+        host="127.0.0.1",
+        username="user-name",
+        password="pass-word",
+        database="db-name",
+    )
+    return Fixture(config=opts, prefix="zap-redis-test:")
+
+def worker():
+    auto r = 0
+    while r < 6:
+        # Each timed scope spawns a deadline helper thread that runs off any
+        # scheduler M (cur_m == NULL) and flushes its empty shadow head while the
+        # main coroutine is blocked on the outer scope join below.
+        scope(timeout=30000):
+            auto k = 0
+            while k < 3000:
+                auto garbage = [str(k), str(k + 1), str(k + 2)]
+                k = k + 1
+        r = r + 1
+
+def pooling(Fixture f):
+    auto cfg = f.config
+    cfg.username = "pool-worker"
+    scope:
+        for i in range(0, 16):
+            spawn worker()
+
+def snapshot(Fixture f):
+    if f.config.host != "127.0.0.1":
+        raise ValueError("host reclaimed: " + f.config.host)
+    if f.config.password != "pass-word":
+        raise ValueError("password reclaimed: " + f.config.password)
+    if f.config.database != "db-name":
+        raise ValueError("database reclaimed: " + f.config.database)
+    if f.prefix != "zap-redis-test:":
+        raise ValueError("prefix reclaimed: " + f.prefix)
+
+def main():
+    auto f = make_fixture()
+    for round in range(0, 4):
+        pooling(f)
+        snapshot(f)
+    print("main-thread heap roots survive cross-thread collection")
+"#;
+    // 8 MiB cap: the workers churn far more than the cap between joins, forcing a
+    // collection while `main` is parked on the join and a helper thread has
+    // flushed its NULL head — reclaiming the unrooted fixture before the fix.
+    let (ok, stdout, stderr) = run_capped(src, 8 * 1024 * 1024);
+    assert!(
+        ok,
+        "main-thread heap roots must survive a cross-thread collection; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout.trim_end(),
+        "main-thread heap roots survive cross-thread collection",
+        "stdout={stdout:?} stderr={stderr:?}"
+    );
+}

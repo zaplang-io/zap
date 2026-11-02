@@ -366,7 +366,6 @@ void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes);
 void zap_gc_register_finalizer(void *payload, void (*fn)(void *obj, void *cd), void *cd);
 int64_t zap_gc_finalizer_selftest(void); /* internal __gc_finalizer_selftest hook */
 extern __thread void *zap_shadow_head;
-extern void *zap_main_shadow_head;
 static void zap_enter_blocking(void); /* fwd (defined in zapgc.inc.c)           */
 static void zap_leave_blocking(void);
 static void zap_mutator_register(void);
