@@ -1147,3 +1147,7 @@ operation scratch and partial connections are cleaned. A scope waits for its
 children's finally cleanup. Existing established connections/listeners remain
 caller-owned; close in finally. Cancellation/timeout does not imply that no
 bytes or side effects reached the peer, so do not automatically replay them.
+
+TLS socket writes, including OpenSSL alert/shutdown writes, suppress SIGPIPE per
+socket. Peer failures remain catchable transport errors without changing the
+application's process-wide signal dispositions.

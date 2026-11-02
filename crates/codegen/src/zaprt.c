@@ -13826,13 +13826,139 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
  * GC discipline mirrors the net section: the `ZapTls` handle is ATOMIC (fd is a
  * scalar; pd / SSL* / SSL_CTX* are non-GC infra), fd/pd/SSL* are pulled into C
  * locals before any park, payloads are copied to malloc scratch, and GC results
- * are built only after the final park. The `SSL_set_fd` BIO is BIO_NOCLOSE, so
+ * are built only after the final park. The socket BIO is BIO_NOCLOSE, so
  * the runtime owns the fd and closes it exactly once via `zap_sock_shutdown`.
  * ========================================================================== */
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
+
+/* OpenSSL's stock socket BIO calls write/send without MSG_NOSIGNAL. A peer
+ * reset can therefore terminate the process during SSL_read's alert write or
+ * best-effort SSL_shutdown, bypassing Zap's exception/resource cleanup. Keep
+ * suppression socket-local: Linux uses MSG_NOSIGNAL, Darwin SO_NOSIGPIPE, and
+ * Winsock has no SIGPIPE. Do not alter the application's signal disposition.
+ * This BIO never owns the fd; the runtime closes it after SSL_free. */
+static pthread_once_t g_tls_bio_once = PTHREAD_ONCE_INIT;
+static BIO_METHOD *g_tls_bio_method;
+
+static int zap_tls_bio_create(BIO *bio) {
+    BIO_set_init(bio, 0);
+    BIO_set_shutdown(bio, BIO_NOCLOSE);
+    BIO_set_data(bio, NULL);
+    return 1;
+}
+
+static int zap_tls_bio_destroy(BIO *bio) {
+    if (!bio) {
+        return 0;
+    }
+    BIO_set_init(bio, 0);
+    BIO_set_data(bio, NULL);
+    return 1;
+}
+
+static int zap_tls_bio_read(BIO *bio, char *data, int count) {
+    BIO_clear_retry_flags(bio);
+    if (!data || count <= 0 || !BIO_get_init(bio)) {
+        return 0;
+    }
+    zap_fd_t fd = (zap_fd_t)(intptr_t)BIO_get_data(bio);
+    for (;;) {
+        int n = (int)recv(fd, data, count, 0);
+        if (n >= 0) {
+            return n;
+        }
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
+            continue;
+        }
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
+            BIO_set_retry_read(bio);
+        }
+        return -1;
+    }
+}
+
+static int zap_tls_bio_write(BIO *bio, const char *data, int count) {
+    BIO_clear_retry_flags(bio);
+    if (!data || count <= 0 || !BIO_get_init(bio)) {
+        return 0;
+    }
+    zap_fd_t fd = (zap_fd_t)(intptr_t)BIO_get_data(bio);
+    for (;;) {
+        int n = (int)send(fd, data, count, MSG_NOSIGNAL);
+        if (n >= 0) {
+            return n;
+        }
+        int e = ZAP_SOCK_ERR();
+        if (ZAP_SOCK_EINTR(e)) {
+            continue;
+        }
+        if (ZAP_SOCK_WOULDBLOCK(e)) {
+            BIO_set_retry_write(bio);
+        }
+        return -1;
+    }
+}
+
+static long zap_tls_bio_ctrl(BIO *bio, int command, long value, void *out) {
+    (void)value;
+    switch (command) {
+    case BIO_CTRL_FLUSH:
+    case BIO_CTRL_SET_CLOSE:
+        return 1;
+    case BIO_CTRL_GET_CLOSE:
+        return BIO_NOCLOSE;
+    case BIO_C_GET_FD: {
+        int fd = BIO_get_init(bio) ? (int)(intptr_t)BIO_get_data(bio) : -1;
+        if (out) {
+            *(int *)out = fd;
+        }
+        return fd;
+    }
+    default:
+        return 0;
+    }
+}
+
+static void zap_tls_bio_init_once(void) {
+    BIO_METHOD *method = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "Zap nonblocking socket");
+    if (!method) {
+        return;
+    }
+    if (!BIO_meth_set_create(method, zap_tls_bio_create) ||
+        !BIO_meth_set_destroy(method, zap_tls_bio_destroy) ||
+        !BIO_meth_set_read(method, zap_tls_bio_read) ||
+        !BIO_meth_set_write(method, zap_tls_bio_write) ||
+        !BIO_meth_set_ctrl(method, zap_tls_bio_ctrl)) {
+        BIO_meth_free(method);
+        return;
+    }
+    g_tls_bio_method = method; /* immutable for process lifetime */
+}
+
+static int zap_tls_set_fd(SSL *ssl, int fd) {
+#if defined(ZAP_PLATFORM_POSIX) && defined(SO_NOSIGPIPE)
+    int enabled = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
+        return 0;
+    }
+#endif
+    pthread_once(&g_tls_bio_once, zap_tls_bio_init_once);
+    if (!g_tls_bio_method) {
+        return 0;
+    }
+    BIO *bio = BIO_new(g_tls_bio_method);
+    if (!bio) {
+        return 0;
+    }
+    BIO_set_data(bio, (void *)(intptr_t)fd);
+    BIO_set_init(bio, 1);
+    SSL_set_bio(ssl, bio, bio); /* SSL owns the BIO, never the socket */
+    return 1;
+}
 
 /* A TLS connection: an owned fd (+ netpoller desc) and its OpenSSL session. The
  * leading `kind` tag (ZAP_CONN_TLS) lets the HTTP server transport seam tell it
@@ -13979,7 +14105,13 @@ static SSL *zap_tls_dial_raw_impl(void *host_, void *ip_, int64_t port, int veri
         zap_net_panic("tls: SSL_new failed");
         return NULL;
     }
-    SSL_set_fd(ssl, fd);
+    if (!zap_tls_set_fd(ssl, fd)) {
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        zap_sock_shutdown(fd, pd);
+        zap_net_panic("tls: socket BIO initialization failed");
+        return NULL;
+    }
     (void)SSL_set_tlsext_host_name(ssl, hz); /* SNI */
     if (verify) {
         SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
@@ -14276,7 +14408,10 @@ static SSL *zap_tls_server_handshake(int cfd, void *cpd, SSL_CTX *ctx) {
     if (!ssl) {
         return NULL;
     }
-    SSL_set_fd(ssl, cfd);
+    if (!zap_tls_set_fd(ssl, cfd)) {
+        SSL_free(ssl);
+        return NULL;
+    }
     SSL_set_accept_state(ssl);
     for (;;) {
         int r = SSL_accept(ssl);
