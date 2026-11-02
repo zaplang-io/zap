@@ -539,9 +539,8 @@ struct GcFrame<'ctx> {
     /// Number of direct root slots (SSA values plus reference-local contents);
     /// the aggregate-root pairs begin at `roots[n_direct]`.
     n_direct: u32,
-    /// Number of `(base, desc)` aggregate-root pairs.
-    n_aggr: u32,
-    /// Total length of the `roots` array: `n_direct + 2 * n_aggr`.
+    /// Total length of the `roots` array: `n_direct + 2 * n_aggr` (the collector
+    /// reads the pair count from the frame's `naggr` word, not from here).
     n: u32,
 }
 
@@ -1608,7 +1607,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // once here; its `base` is filled in at the spill's definition. The
         // collector reads `desc` only when `base` is a non-null stack pointer.
         for (j, sid) in aggr_sids.iter().enumerate() {
-            let desc_idx = n_direct + 2 * j as u32 + 1;
+            let desc_idx = n_direct + 2 * (j as u32) + 1;
             let elem = unsafe {
                 b.build_in_bounds_gep(
                     roots_ty,
@@ -1632,7 +1631,6 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             local_slot_of,
             aggr_of,
             n_direct,
-            n_aggr,
             n,
         });
         // Parameters are rooted by the caller (translate_fn) from `vals`, not from
@@ -1723,7 +1721,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             store_at(slot as u32)?;
         }
         if aggr >= 0 {
-            store_at(frame.n_direct + 2 * aggr as u32)?;
+            store_at(frame.n_direct + 2 * (aggr as u32))?;
         }
         Ok(())
     }
