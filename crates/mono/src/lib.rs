@@ -2133,12 +2133,12 @@ impl Mono<'_> {
                 // no `Optional` wrapper. Lowering uses only the value element
                 // *kind* (which it has), so no `Optional$V` instance is needed;
                 // the symbol is marked `get_default` so lowering takes the 2-arg
-                // path. `V` comes from the receiver's dict type, falling back to
-                // the default argument's own type when the receiver is opaque.
+                // path. `V` is the receiver's dict value type — this fires *only*
+                // when the receiver is genuinely a `dict`, so an unrelated two-arg
+                // `get` (e.g. the `deque.get(d, i)` module function, or a user
+                // type's own `get`) is left untouched for normal dispatch.
                 if nargs.len() == 2 {
-                    if let Some(vty) =
-                        dict_value_ty(&bcty).or_else(|| cty_type(argpairs[1].1.clone()))
-                    {
+                    if let Some(vty) = dict_value_ty(&bcty) {
                         let node = Expr::Call {
                             callee: Box::new(Expr::Attr {
                                 base: Box::new(bexpr),
