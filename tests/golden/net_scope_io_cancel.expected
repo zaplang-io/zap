@@ -1,0 +1,2 @@
+cancelled TCP reads cleaned before scope exit
+descriptor reuse: 32

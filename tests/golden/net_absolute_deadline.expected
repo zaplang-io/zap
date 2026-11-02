@@ -1,0 +1,2 @@
+absolute read/write deadline validates, persists, and clears
+bounded connect rejects DNS and expired budgets

@@ -1123,3 +1123,27 @@ change), **I** Internal (no contract). Sections marked **S** are **frozen for
 | C-style bitfields on `value struct` | Locked (D-0068) | **E** |
 | `when target.*` conditional compilation | Shipped Phase 1 (D-0079) | **E** |
 | `**kwargs` arbitrary named args | Deferred (D-0038) | n/a |
+
+### Absolute socket deadlines and cancellation (#558, #559; D-0099)
+
+`net.set_deadline_ns(conn, deadline_ns)` installs an absolute CLOCK_MONOTONIC
+nanosecond bound shared by reads and writes over a TCP or TLS connection.
+Calculate it from `time.monotonic_ns()`. Zero clears it; negative values raise
+ValueError. Unlike `set_read_timeout` and `set_read_deadline` (relative
+milliseconds), this bound persists across calls and partial writes. The nearest
+configured bound wins; expiration raises TimeoutError, distinct from EOF.
+Configure before I/O; clearing does not revoke an already parked wait's bound.
+
+`net.connect_ip_deadline(ip, port, deadline_ns)` is a bounded numeric-address
+TCP dial. `tls.connect_resolved(hostname, ip, port, deadline_ns)` uses one budget
+for the numeric TCP dial and verified TLS handshake, retaining hostname/SNI and
+system trust verification. IPv4/IPv6 literals only on the address parameter;
+DNS resolution is a separate prerequisite and is not covered by these APIs.
+Existing named connects retain synchronous resolution. A zero dial deadline
+is unbounded, a negative deadline or invalid numeric IP/port is ValueError.
+
+Scoped cancellation wakes parked TCP/TLS I/O and raises Cancelled after native
+operation scratch and partial connections are cleaned. A scope waits for its
+children's finally cleanup. Existing established connections/listeners remain
+caller-owned; close in finally. Cancellation/timeout does not imply that no
+bytes or side effects reached the peer, so do not automatically replay them.

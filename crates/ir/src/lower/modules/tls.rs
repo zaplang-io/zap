@@ -25,6 +25,7 @@ fn lower(
     let a = lower_args(lowerer, args)?;
     Ok(Some(match method {
         "connect" => call_ret(lowerer, "zap_tls_connect", a, Ty::Ptr, true),
+        "connect_resolved" => call_ret(lowerer, "zap_tls_connect_resolved", a, Ty::Ptr, true),
         "connect_insecure" => call_ret(lowerer, "zap_tls_connect_insecure", a, Ty::Ptr, true),
         "listen" => call_ret(lowerer, "zap_tls_listen", a, Ty::Ptr, true),
         "accept" => call_ret(lowerer, "zap_tls_accept", a, Ty::Ptr, true),

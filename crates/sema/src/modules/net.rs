@@ -28,6 +28,14 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "net", method, args, 2, span);
             Ty::Bytes
         }
+        "connect_ip_deadline" => {
+            expect_argc(checker, "net", method, args, 3, span);
+            Ty::Bytes
+        }
+        "set_deadline_ns" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
         // net.accept(listener) -> connection handle
         "accept" => {
             expect_argc(checker, "net", method, args, 1, span);
