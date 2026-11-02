@@ -4,35 +4,28 @@
 # the whole-op deadline is threaded through the SAME seam as the per-park
 # deadline, so it fires over TLS too, not just plaintext.
 #
-# `main` is the server/reader: it binds a TLS listener, starts a DETACHED dribbler
-# coroutine (a daemon, so it never blocks program exit and is torn down when main
-# returns), accepts the conn, sets a GENEROUS per-park timeout (so the 50 ms
-# dribbles never trip it — proving the whole-op deadline, not the per-park one, is
-# what fires) and a SHORT whole-op deadline, then calls `http.read_request`. The
-# dribbler sends an incomplete request (bytes that never terminate the headers)
-# one at a time, forever. Only the whole-op deadline can cut the read off: it
-# fires, `http.read_request` raises a catchable `TimeoutError`, main prints the
-# marker and returns (the daemon dribbler is terminated at exit, so it never sends
-# into a closed conn — no broken pipe). If the whole-op deadline were broken the
-# read would never return (the dribbles keep the per-park clock alive) and the
-# program would HANG rather than silently passing. The marker — not any wall-clock
-# number — is what the golden asserts, so it does not race under either collector
-# or arch.
+# A server coroutine binds a TLS listener, accepts one conn, sets a VERY LARGE
+# per-park timeout and a SHORT whole-op deadline, then calls `http.read_request`.
+# The client dribbles an incomplete request (bytes that never terminate the
+# headers) one byte at a time, each far under the per-park timeout — so only the
+# whole-op deadline can cut the read off. It fires, `http.read_request` raises a
+# catchable `TimeoutError`, the server prints a deterministic marker.
+#
+# Two robustness choices make this pass under both collectors and arches without
+# racing the wall clock:
+#   * The per-park timeout is huge (120 s), so if the whole-op deadline were
+#     BROKEN the read would not merely fall back to a per-park timeout (which
+#     would wrongly still print the marker) — it would block past the harness
+#     timeout and the test would HANG, i.e. fail, rather than false-pass.
+#   * The server does NOT close the conn until the client has finished dribbling
+#     (a `done` handshake): unlike plaintext `net.send` (MSG_NOSIGNAL), a
+#     `tls.send` into a just-closed conn can raise SIGPIPE, so the client must
+#     never send after the close. The client dribbles a bounded run that is
+#     comfortably longer than the whole-op deadline, then rendezvouses on `done`.
+# The marker — not any wall-clock number — is what the golden asserts.
 
 
-def tls_dribbler(int64 port):
-    auto c = tls.connect_insecure("127.0.0.1", port)
-    # Dribble an incomplete request forever, one byte at a time, each well under
-    # the server's per-park timeout. Detached: terminated at program exit.
-    while True:
-        try:
-            tls.send(c, "x")
-        except Exception:
-            break
-        time.sleep_ns(time.millis(50))
-
-
-def tls_slow_server():
+def tls_slow_server(channel[int64] portch, channel[int64] done):
     auto cert = """-----BEGIN CERTIFICATE-----
 MIIDJzCCAg+gAwIBAgIUY0g00QCmIsdA4L4Ta31cDYVdzHwwDQYJKoZIhvcNAQEL
 BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEwMTAzNDgxMloYDzIxMjYx
@@ -88,18 +81,40 @@ x29GIzLvicHaw/U/LYviOHA/sPgO4DF0/uujyBS/nKaQTig/+fQaphz5ckL5i1mu
     fs.write_file(cert_path, cert)
     fs.write_file(key_path, key)
     auto l = tls.listen("127.0.0.1", 0, cert_path, key_path)
-    auto port = tls.port(l)
-    spawn detached tls_dribbler(port)
+    portch <- tls.port(l)
     auto c = tls.accept(l)
-    net.set_read_timeout(c, 10000)  # generous per-park: a 50 ms dribble never trips it
+    net.set_read_timeout(c, 120000)  # huge per-park: dribbles never trip it; a broken
+    # whole-op would hang past the harness, not false-pass
     net.set_read_deadline(c, 300)  # whole-op budget: bounds the entire request
     try:
         auto req = http.read_request(c)
         print("unexpected: read returned")
     except TimeoutError:
         print("tls-slowloris-fired")
-    print("done")
+    # Signal AFTER firing but BEFORE closing: the client is still dribbling into
+    # the (open) conn, and only stops once it receives this. So we never close
+    # under an in-flight tls.send (which could SIGPIPE).
+    done <- 1
+    tls.close_conn(c)
+    tls.close_listener(l)
 
 
 def main():
-    tls_slow_server()
+    auto portch = channel[int64]()
+    auto done = channel[int64]()
+    spawn tls_slow_server(portch, done)
+    auto port = <-portch
+    auto c = tls.connect_insecure("127.0.0.1", port)
+    # Dribble an incomplete request, one byte at a time well under the per-park
+    # timeout. Bounded, but comfortably longer than the whole-op deadline, and the
+    # server holds the conn open until we finish — so we never send into a closed
+    # conn (no broken pipe).
+    for i in range(0, 30):
+        try:
+            tls.send(c, "x")
+        except Exception:
+            break
+        time.sleep_ns(time.millis(50))
+    auto ack = <-done
+    tls.close_conn(c)
+    print("done")
