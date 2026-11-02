@@ -1366,9 +1366,10 @@ impl Checker {
     fn resolve_type(&self, t: &Type) -> Ty {
         match t {
             Type::Named { name, args, .. } => match name.as_str() {
-                "int64" | "i64" => Ty::Int64,
+                // `int` is the Python-facing name for the 64-bit signed integer
+                // (I#581); `float` is likewise the name for the 64-bit double.
+                "int" | "int64" | "i64" => Ty::Int64,
                 "int32" | "i32" => Ty::Int32,
-                // `float` is the Python-facing name for the 64-bit double (I#569).
                 "float" | "float64" | "f64" => Ty::Float64,
                 "float32" | "f32" => Ty::Float32,
                 "bool" => Ty::Bool,
@@ -1449,7 +1450,7 @@ impl Checker {
     fn chan_elem_from_expr(&self, e: &Expr) -> Ty {
         match e {
             Expr::Name(n, _) => match n.as_str() {
-                "int64" | "i64" => Ty::Int64,
+                "int" | "int64" | "i64" => Ty::Int64,
                 "int32" | "i32" => Ty::Int32,
                 "float" | "float64" | "f64" => Ty::Float64,
                 "float32" | "f32" => Ty::Float32,
@@ -3751,7 +3752,7 @@ impl Checker {
         // ordinary value names, so they are not inferred as such. Typed loosely.
         if let Expr::Index { base, index, .. } = callee {
             if matches!(base.as_ref(), Expr::Name(n, _) if n == "array") {
-                let valid_dtype = matches!(index.as_ref(), Expr::Name(n, _) if matches!(n.as_str(), "float" | "f64" | "float64" | "i64" | "int64" | "uint8" | "u8" | "bool"));
+                let valid_dtype = matches!(index.as_ref(), Expr::Name(n, _) if matches!(n.as_str(), "float" | "f64" | "float64" | "int" | "i64" | "int64" | "uint8" | "u8" | "bool"));
                 if !valid_dtype {
                     self.error(
                         ErrorCode::ZAP4028,
@@ -5343,6 +5344,24 @@ mod tests {
         ok("def f(list[f64] xs) -> float:\n    float t = 0.0\n    for x in xs:\n        t = t + x\n    return t\n");
         ok("def main():\n    auto xs = [f64(n) for n in [1, 2]]\n    print(len(xs))\n");
         ok("def main():\n    list[list[f64]] x = []\n    print(len(x))\n");
+    }
+
+    #[test]
+    fn int_scalar_type_checks() {
+        // `int` is an exact alias for `int64` (I#581): binding, params/return,
+        // `list[int]`, and `array[int]` all type-check...
+        ok("def main():\n    int x = 1\n    list[int] xs = [1, 2, 3]\n    print(x + len(xs))\n");
+        ok("def add(int a, int b) -> int:\n    return a + b\ndef main():\n    print(add(1, 2))\n");
+        ok("def main():\n    array[int] a = array[int]([1, 2, 3])\n    print(len(a))\n");
+        // ...and `int` is a *real* type, not `Unknown`: assigning a non-numeric
+        // value to it, or returning one from an `-> int` function, is rejected
+        // (this is the type-checking the alias restores).
+        assert!(errors("def main():\n    int x = \"hello\"\n")
+            .iter()
+            .any(|e| e.code == ErrorCode::ZAP4001));
+        assert!(errors("def f(int n) -> int:\n    return \"x\"\n")
+            .iter()
+            .any(|e| e.code == ErrorCode::ZAP4003));
     }
 
     #[test]
