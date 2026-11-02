@@ -418,11 +418,29 @@ impl Checker {
         let span = match ty {
             Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Func { span, .. } => *span,
         };
+        fn is_f64_name(n: &str) -> bool {
+            matches!(n, "f64" | "float64" | "float")
+        }
+        fn is_float_name(n: &str) -> bool {
+            is_f64_name(n) || matches!(n, "f32" | "float32")
+        }
         fn float_slots(ty: &Type) -> bool {
             match ty {
                 Type::Named { name, args, .. } => {
-                    let direct = matches!(name.as_str(), "list" | "dict" | "set" | "heap" | "channel")
-                        && args.iter().any(|a| matches!(a, Type::Named { name, .. } if matches!(name.as_str(), "f32" | "float32" | "f64" | "float64")));
+                    let direct = match name.as_str() {
+                        // `list[float]` / `list[f64]` is supported (I#569); an
+                        // `f32` list element is still deferred (ticket #49).
+                        "list" => args.iter().any(|a| {
+                            matches!(a, Type::Named { name, .. }
+                                if is_float_name(name) && !is_f64_name(name))
+                        }),
+                        // Floats as dict/set keys or values, or as heap/channel
+                        // elements, are not supported yet.
+                        "dict" | "set" | "heap" | "channel" => args
+                            .iter()
+                            .any(|a| matches!(a, Type::Named { name, .. } if is_float_name(name))),
+                        _ => false,
+                    };
                     direct || args.iter().any(float_slots)
                 }
                 Type::Tuple { elems, .. } => elems.iter().any(float_slots),
@@ -505,10 +523,13 @@ impl Checker {
 
     fn check_float_container_value(&mut self, ty: &Ty, span: Span) {
         fn unsupported(ty: &Ty) -> bool {
-            let float = |t: &Ty| matches!(t, Ty::Float32 | Ty::Float64 | Ty::UntypedFloat);
+            let any_float = |t: &Ty| matches!(t, Ty::Float32 | Ty::Float64 | Ty::UntypedFloat);
             match ty {
-                Ty::List(t) | Ty::Set(t) | Ty::Heap(t) | Ty::Chan(t) => float(t) || unsupported(t),
-                Ty::Dict(k, v) => float(k) || float(v) || unsupported(k) || unsupported(v),
+                // `list[float]` is supported (I#569); an `f32` list element
+                // (ticket #49) is still deferred.
+                Ty::List(t) => matches!(**t, Ty::Float32) || unsupported(t),
+                Ty::Set(t) | Ty::Heap(t) | Ty::Chan(t) => any_float(t) || unsupported(t),
+                Ty::Dict(k, v) => any_float(k) || any_float(v) || unsupported(k) || unsupported(v),
                 Ty::Tuple(ts) => ts.iter().any(unsupported),
                 _ => false,
             }
@@ -1347,7 +1368,8 @@ impl Checker {
             Type::Named { name, args, .. } => match name.as_str() {
                 "int64" | "i64" => Ty::Int64,
                 "int32" | "i32" => Ty::Int32,
-                "float64" | "f64" => Ty::Float64,
+                // `float` is the Python-facing name for the 64-bit double (I#569).
+                "float" | "float64" | "f64" => Ty::Float64,
                 "float32" | "f32" => Ty::Float32,
                 "bool" => Ty::Bool,
                 "str" => Ty::Str,
@@ -1429,7 +1451,7 @@ impl Checker {
             Expr::Name(n, _) => match n.as_str() {
                 "int64" | "i64" => Ty::Int64,
                 "int32" | "i32" => Ty::Int32,
-                "float64" | "f64" => Ty::Float64,
+                "float" | "float64" | "f64" => Ty::Float64,
                 "float32" | "f32" => Ty::Float32,
                 "bool" => Ty::Bool,
                 "str" => Ty::Str,
@@ -3729,7 +3751,7 @@ impl Checker {
         // ordinary value names, so they are not inferred as such. Typed loosely.
         if let Expr::Index { base, index, .. } = callee {
             if matches!(base.as_ref(), Expr::Name(n, _) if n == "array") {
-                let valid_dtype = matches!(index.as_ref(), Expr::Name(n, _) if matches!(n.as_str(), "f64" | "float64" | "i64" | "int64" | "uint8" | "u8" | "bool"));
+                let valid_dtype = matches!(index.as_ref(), Expr::Name(n, _) if matches!(n.as_str(), "float" | "f64" | "float64" | "i64" | "int64" | "uint8" | "u8" | "bool"));
                 if !valid_dtype {
                     self.error(
                         ErrorCode::ZAP4028,
@@ -5290,17 +5312,18 @@ mod tests {
 
     #[test]
     fn floating_collection_slots_are_diagnosed() {
+        // Floats as dict/set keys or values, or as heap/channel elements, are
+        // still unsupported, as is an `f32` list element (ticket #49). A *list*
+        // of `f64`/`float` is supported (I#569) — see the positive test below.
         for source in [
-            "auto x = [1.5]",
             "auto x = {1.5}",
             "auto x = {1.5: 1}",
             "auto x = {1: 1.5}",
-            "auto x = [f64(n) for n in [1, 2]]",
             "auto x = channel[f64]()",
             "auto x = heap[f64]()",
             "list[f32] x = []",
             "dict[str, f64] x = {}",
-            "list[list[f64]] x = []",
+            "set[float] x = {}",
         ] {
             let source = format!("def main():\n    {source}\n");
             assert!(
@@ -5308,9 +5331,18 @@ mod tests {
                 "{source}"
             );
         }
-        assert!(errors("def f(list[f64] xs):\n    pass\n")
-            .iter()
-            .any(|e| e.code == ErrorCode::ZAP4027));
+    }
+
+    #[test]
+    fn float_list_elements_typecheck() {
+        // `list[float]` / `list[f64]` is a first-class scalar-float list (I#569):
+        // bindings, params, a float-literal display, a list comprehension, and a
+        // nested `list[list[f64]]` all type-check.
+        ok("def main():\n    list[float] xs = [1.0, 2.0, 3.0]\n    print(len(xs))\n");
+        ok("def main():\n    auto xs = [1.5, 2.5]\n    print(len(xs))\n");
+        ok("def f(list[f64] xs) -> float:\n    float t = 0.0\n    for x in xs:\n        t = t + x\n    return t\n");
+        ok("def main():\n    auto xs = [f64(n) for n in [1, 2]]\n    print(len(xs))\n");
+        ok("def main():\n    list[list[f64]] x = []\n    print(len(x))\n");
     }
 
     #[test]

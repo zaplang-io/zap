@@ -1128,9 +1128,29 @@ void zap_list_push_ptr(void *l, void *v) {
     ((ZapList *)l)->elem_ptr = 1; /* precise GC: elements are pointers (#48) */
     zap_list_push((ZapList *)l, (int64_t)(intptr_t)v);
 }
+/* `list[float]` (I#569): a `double` element shares the uniform 8-byte word, so
+ * it is stored by reinterpreting its bits as the `int64_t` word (as the REPL
+ * float slot does, I#252). The elements are not GC pointers, so `elem_ptr` stays
+ * 0 and the collector never follows them. */
+void zap_list_push_f64(void *l, double v) {
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.d = v;
+    zap_list_push((ZapList *)l, u.i);
+}
 int64_t zap_list_get_i64(void *l, int64_t i) { return zap_list_at((ZapList *)l, i); }
 void *zap_list_get_ptr(void *l, int64_t i) {
     return (void *)(intptr_t)zap_list_at((ZapList *)l, i);
+}
+double zap_list_get_f64(void *l, int64_t i) {
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.i = zap_list_at((ZapList *)l, i);
+    return u.d;
 }
 void zap_list_set_i64(void *l, int64_t i, int64_t v) {
     int64_t k = zap_list_norm((ZapList *)l, i); /* normalize + bounds-check */
@@ -1140,6 +1160,15 @@ void zap_list_set_ptr(void *l, int64_t i, void *v) {
     ((ZapList *)l)->elem_ptr = 1;
     int64_t k = zap_list_norm((ZapList *)l, i); /* normalize + bounds-check */
     ((ZapList *)l)->data[k] = (int64_t)(intptr_t)v;
+}
+void zap_list_set_f64(void *l, int64_t i, double v) {
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.d = v;
+    int64_t k = zap_list_norm((ZapList *)l, i); /* normalize + bounds-check */
+    ((ZapList *)l)->data[k] = u.i;
 }
 int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 
