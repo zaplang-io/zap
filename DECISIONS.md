@@ -2860,3 +2860,48 @@ conn exactly as over a plaintext one.
 **Plaintext unchanged.** A plaintext `http.read_request`/`respond` takes the same
 `recv`/`send` path as before; the TLS fill with a `0` timeout (the client's HTTPS
 transport) is byte-for-byte identical to the prior behavior.
+## D-0098 — Raw `tls.recv` read deadline + whole-operation read deadline (I#566, I#567)
+**Status:** Locked — closes the two read-deadline gaps left open by D-0096/D-0097 on the `net`/`tls`/`http` read path (D-0056/D-0062).
+
+Two follow-ups to the read deadline, both on the read path, landed together
+because they share the park primitive and the #556 transport seam.
+
+**I#566 — raw `tls.recv` honors the per-conn deadline.** `tls.recv` parked via
+`zap_tls_want`, which hard-coded an unbounded wait, so `net.set_read_timeout` on a
+`tls.accept`/`tls.connect` conn was ignored on the *raw* TLS read surface (only
+the `http` server fill path honored it over TLS). The recv park now reads the
+handle's `read_timeout_ms` and bounds the wait, inlining the WANT_READ/WANT_WRITE
+handling (rather than routing through `zap_tls_want`, whose `-2` return already
+means "protocol error") so a timed-out park is told apart from a protocol error
+and turned into the same catchable `TimeoutError`. `tls.recv` already lowers as a
+throwing call (`invoke`), so it is caught by `try` exactly as plaintext
+`net.recv`. **Scope: read only** — no `tls.send` write deadline (that overlaps
+#559, deliberately out of scope).
+
+**I#567 — whole-operation read deadline.** The #485 timeout is **per-park**
+(SO_RCVTIMEO style, recomputed each park), so a slow-dribble peer that sends a
+byte just under the per-park timeout forever (a slowloris) keeps resetting the
+clock and the request never completes. A new **`net.set_read_deadline(conn, ms)`**
+records a whole-operation budget on the handle (`ms == 0` = none, default;
+negative = `ValueError` — mirrors `set_read_timeout`). At the start of a read
+(`recv`, or a whole `http.read_request` spanning headers + body) the budget is
+turned into **one** absolute monotonic deadline; each park then waits the
+**nearer** of the per-park deadline and this whole-op deadline, so the entire
+operation is bounded regardless of byte pacing. A separate API (not a flag on
+`set_read_timeout`) was chosen so the two deadlines **compose** rather than one
+overwriting the other: a server can set a modest per-park idle bound *and* a
+larger total-request bound at once.
+
+**Both transports, one surface.** The whole-op deadline is threaded through the
+same #556 server seam as the per-park one — `net.set_read_deadline` dispatches on
+the `ZapConnHdr` tag to store `read_deadline_ms` on either `ZapSock` or `ZapTls`,
+and `http.read_request` computes the single absolute deadline once and passes it
+down the fill seam — so it fires uniformly over plaintext **and** TLS. The same
+`TimeoutError` is reused for both the idle (per-park) and slowloris (whole-op)
+cases; both are read timeouts, so no new exception type was added.
+
+**Defaults unchanged.** With neither deadline set, every read passes `0/0` to the
+park primitive exactly as before (unbounded). With only the per-park timeout set,
+the whole-op deadline is `0` and the effective deadline is exactly the per-park
+one — byte-for-byte today's behavior. `connect`/`accept`/`send` still pass `0/0`
+(no write/connect deadline — #559).

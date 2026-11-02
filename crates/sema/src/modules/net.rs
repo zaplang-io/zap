@@ -55,6 +55,16 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "net", method, args, 2, span);
             Ty::Unit
         }
+        // net.set_read_deadline(conn, ms) -> unit. Bounds the WHOLE read operation
+        // (a `recv`, or an entire `http.read_request`) by `ms` regardless of byte
+        // pacing (0 = none, the default), so a slow-dribble peer that keeps
+        // resetting the per-park `set_read_timeout` clock is still cut off with a
+        // TimeoutError. Composes with `set_read_timeout`. Negative `ms` is a
+        // ValueError at runtime.
+        "set_read_deadline" => {
+            expect_argc(checker, "net", method, args, 2, span);
+            Ty::Unit
+        }
         // `close` is a reserved keyword (channel close); a socket close is spelled
         // `net.close_conn` / `net.close_listener` (both close any socket handle).
         "close_conn" | "close_listener" => {
