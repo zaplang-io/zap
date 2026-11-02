@@ -20,5 +20,6 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_net_send", &[p.into(), p.into()], Some(i.into()));
     cg.declare_rt("zap_net_port", &[p.into()], Some(i.into()));
     cg.declare_rt("zap_net_set_read_timeout", &[p.into(), i.into()], None);
+    cg.declare_rt("zap_net_set_read_deadline", &[p.into(), i.into()], None);
     cg.declare_rt("zap_net_close", &[p.into()], None);
 }

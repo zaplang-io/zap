@@ -13202,6 +13202,10 @@ typedef struct {
  * scope). Lets `net.set_read_timeout`, declared above the TLS section, reach the
  * TLS handle's own `read_timeout_ms` field. */
 static void zap_conn_set_read_timeout(void *c_, int64_t ms);
+/* The whole-operation read-deadline twins (I#567): store / read the per-handle
+ * total-request budget on either transport, dispatching on the same tag. */
+static void zap_conn_set_read_deadline(void *c_, int64_t ms);
+static int64_t zap_conn_read_deadline_ms(void *c_);
 
 /* ---- socket handle -------------------------------------------------------- *
  * A listener or connection. `pd` is the netpoller descriptor (plain malloc
@@ -13216,6 +13220,14 @@ typedef struct {
      * 0 = no timeout (park forever, the default). Consulted by `recv` and by
      * `http.read_request`'s recv loop, which bound each wait-for-readiness. */
     int64_t read_timeout_ms;
+    /* Whole-operation read budget in milliseconds set via `net.set_read_deadline`
+     * (I#567); 0 = none (the default). Unlike `read_timeout_ms` (recomputed each
+     * park), this is turned into ONE absolute deadline at the start of a read
+     * (`recv`, or a whole `http.read_request`) so it bounds the entire operation
+     * regardless of byte pacing — a slow-dribble peer can no longer keep resetting
+     * the per-park clock forever. The two compose: each park waits the nearer of
+     * the per-park timeout and this whole-op deadline. */
+    int64_t read_deadline_ms;
 } ZapSock;
 
 static const ZapTypeDesc zap_desc_sock = {(int64_t)sizeof(ZapSock), ZAP_TD_ATOMIC, 0, NULL};
@@ -13229,29 +13241,46 @@ static ZapSock *zap_sock_wrap(zap_fd_t fd) {
     s->kind = ZAP_CONN_PLAIN; /* ATOMIC objects are not zeroed; init explicitly. */
     s->fd = fd;
     s->pd = pd;
-    s->read_timeout_ms = 0; /* ATOMIC objects are not zeroed; init explicitly. */
+    s->read_timeout_ms = 0;  /* ATOMIC objects are not zeroed; init explicitly. */
+    s->read_deadline_ms = 0; /* ATOMIC objects are not zeroed; init explicitly. */
     return s;
 }
 
-/* Park until `fd` is ready for `mode` (ZAP_POLL_READ / ZAP_POLL_WRITE). With the
- * netpoller this frees the M; without it (pd == NULL) fall back to a blocking
- * poll() bracketed by enter/leave_blocking so the collector treats us as stopped.
- * `timeout_ms` bounds this single wait (0 = no timeout, the default); it is
- * recomputed into an absolute monotonic deadline per park (SO_RCVTIMEO-style),
- * so it caps each wait-for-readiness rather than a whole multi-read operation.
- * Returns 0 on readiness, -1 if the descriptor was closed under us, -2 on a
- * timeout. Writers (connect/accept/send) pass 0 and only test `< 0`. */
-static int zap_sock_park(zap_fd_t fd, void *pd, int mode, int64_t timeout_ms) {
+/* Park until `fd` is ready for `mode` (ZAP_POLL_READ / ZAP_POLL_WRITE), bounded by
+ * BOTH a per-park relative `timeout_ms` (SO_RCVTIMEO-style: recomputed into a
+ * fresh absolute deadline on each call — I#485) AND an absolute whole-operation
+ * `whole_deadline_ns` (monotonic ns, computed ONCE at the start of a read, 0 =
+ * none — I#567). The effective deadline is the NEARER of the two non-zero bounds;
+ * either firing is a timeout (both raise the same TimeoutError, so they need not
+ * be told apart). With the netpoller this frees the M; without it (pd == NULL)
+ * fall back to a blocking poll() bracketed by enter/leave_blocking so the
+ * collector treats us as stopped. Returns 0 on readiness, -1 if the descriptor
+ * was closed under us, -2 on a timeout. Writers (connect/accept/send) pass 0/0
+ * and only test `< 0`. */
+static int zap_sock_park2(zap_fd_t fd, void *pd, int mode, int64_t timeout_ms,
+                          int64_t whole_deadline_ns) {
+    /* Per-park relative timeout -> a fresh absolute deadline; then take the nearer
+     * of it and the whole-op deadline (0 = unbounded on either side). */
+    int64_t eff = (timeout_ms > 0) ? np_now_ns() + timeout_ms * 1000000LL : 0;
+    if (whole_deadline_ns > 0 && (eff == 0 || whole_deadline_ns < eff)) {
+        eff = whole_deadline_ns;
+    }
     if (pd) {
-        int64_t deadline_ns = (timeout_ms > 0) ? np_now_ns() + timeout_ms * 1000000LL : 0;
-        int64_t r = zap_netpoll_wait(pd, mode, deadline_ns);
+        int64_t r = zap_netpoll_wait(pd, mode, eff);
         if (r == ZAP_POLL_CLOSED) {
             return -1;
         }
         return (r == ZAP_POLL_TIMEOUT) ? -2 : 0;
     }
-    /* poll() timeout is a relative int ms; -1 means block forever. */
-    int poll_ms = (timeout_ms > 0) ? (int)timeout_ms : -1;
+    /* poll() timeout is a relative int ms; -1 means block forever. Derive it from
+     * the effective absolute deadline (clamped at 0 if already elapsed). */
+    int poll_ms;
+    if (eff <= 0) {
+        poll_ms = -1;
+    } else {
+        int64_t rem = eff - np_now_ns();
+        poll_ms = (rem <= 0) ? 0 : (int)(rem / 1000000LL);
+    }
 #if defined(ZAP_PLATFORM_WINDOWS)
     /* The netpoller is always available on Windows (IOCP), so this is only a
      * defensive fallback. WSAPoll is the poll() analogue. */
@@ -13277,6 +13306,13 @@ static int zap_sock_park(zap_fd_t fd, void *pd, int mode, int64_t timeout_ms) {
     zap_leave_blocking();
     return (n == 0 && poll_ms >= 0) ? -2 : 0;
 #endif
+}
+
+/* Park bounded only by the per-park timeout (no whole-op deadline). The common
+ * case: connect/accept/send pass 0 (unbounded), and the per-park read paths that
+ * do not layer a whole-op budget call through here unchanged. */
+static int zap_sock_park(zap_fd_t fd, void *pd, int mode, int64_t timeout_ms) {
+    return zap_sock_park2(fd, pd, mode, timeout_ms, 0);
 }
 
 /* Raise the catchable timeout exception (I#485): a socket read exceeded its
@@ -13405,7 +13441,8 @@ void *zap_net_connect(void *host_, int64_t port) {
             s->kind = ZAP_CONN_PLAIN; /* ATOMIC objects are not zeroed. */
             s->fd = fd;
             s->pd = pd;
-            s->read_timeout_ms = 0; /* ATOMIC objects are not zeroed. */
+            s->read_timeout_ms = 0;  /* ATOMIC objects are not zeroed. */
+            s->read_deadline_ms = 0; /* ATOMIC objects are not zeroed. */
             return s;
         }
         if (pd) {
@@ -13454,6 +13491,10 @@ void *zap_net_recv(void *c_, int64_t n) {
     zap_fd_t fd = c->fd;
     void *pd = c->pd;
     int64_t timeout_ms = c->read_timeout_ms;
+    /* Whole-operation read deadline (I#567): one absolute deadline for this recv,
+     * composed with the per-park timeout at each park. 0 = none (unchanged). */
+    int64_t whole_deadline_ns =
+        (c->read_deadline_ms > 0) ? np_now_ns() + c->read_deadline_ms * 1000000LL : 0;
     if (n < 0) {
         n = 0;
     }
@@ -13474,7 +13515,7 @@ void *zap_net_recv(void *c_, int64_t n) {
             continue;
         }
         if (ZAP_SOCK_WOULDBLOCK(e)) {
-            int p = zap_sock_park(fd, pd, ZAP_POLL_READ, timeout_ms);
+            int p = zap_sock_park2(fd, pd, ZAP_POLL_READ, timeout_ms, whole_deadline_ns);
             if (p == -2) {
                 free(buf);
                 zap_net_timeout_panic();
@@ -13604,6 +13645,24 @@ void zap_net_set_read_timeout(void *s_, int64_t ms) {
     zap_conn_set_read_timeout(s_, ms);
 }
 
+/* net.set_read_deadline(conn, ms) (I#567). Store a WHOLE-OPERATION read budget on
+ * the connection handle: a `recv` or a whole `http.read_request` (headers+body)
+ * that takes longer than `ms` in total raises a catchable TimeoutError, no matter
+ * how the bytes are paced — so a slow-dribble (slowloris) peer that keeps resetting
+ * the per-park `set_read_timeout` clock is still bounded. `ms == 0` restores the
+ * default (no whole-op deadline). A negative `ms` is a ValueError (mirrors
+ * `set_read_timeout`). The two compose: with both set, each park waits the nearer
+ * of the per-park timeout and the whole-op deadline. Dispatches on the transport
+ * tag so it applies over plaintext AND TLS (through the I#556 server seam). */
+void zap_net_set_read_deadline(void *s_, int64_t ms) {
+    if (ms < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("net: read deadline must be non-negative", 39));
+        return;
+    }
+    zap_conn_set_read_deadline(s_, ms);
+}
+
 /* ===========================================================================
  * tls (ticket #147, D-0062). A TLS *client* over the `net` TCP sockets, backed
  * by system OpenSSL (`-lssl -lcrypto`) and integrated with the netpoller (#80):
@@ -13643,7 +13702,8 @@ typedef struct {
     int kind; /* ZAP_CONN_TLS; shared leading tag with ZapSock (I#556). */
     int fd;
     void *pd;
-    int64_t read_timeout_ms; /* I#556: TLS read deadline (0 = none, the default). */
+    int64_t read_timeout_ms;  /* I#556: per-park TLS read deadline (0 = none). */
+    int64_t read_deadline_ms; /* I#567: whole-op TLS read budget (0 = none). */
     SSL *ssl;
     SSL_CTX *ctx;
 } ZapTls;
@@ -13661,6 +13721,24 @@ static void zap_conn_set_read_timeout(void *c_, int64_t ms) {
     } else {
         ((ZapSock *)c_)->read_timeout_ms = ms;
     }
+}
+
+/* Store / read the whole-operation read budget on either connection flavor
+ * (I#567), dispatching on the same transport tag. Backs `net.set_read_deadline`
+ * and lets `http.read_request` pull the budget for whichever transport it is. */
+static void zap_conn_set_read_deadline(void *c_, int64_t ms) {
+    if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
+        ((ZapTls *)c_)->read_deadline_ms = ms;
+    } else {
+        ((ZapSock *)c_)->read_deadline_ms = ms;
+    }
+}
+
+static int64_t zap_conn_read_deadline_ms(void *c_) {
+    if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
+        return ((ZapTls *)c_)->read_deadline_ms;
+    }
+    return ((ZapSock *)c_)->read_deadline_ms;
 }
 
 /* Classify a non-positive SSL_* return into an action:
@@ -13801,6 +13879,7 @@ static void *zap_tls_dial(void *host_, int64_t port, int verify) {
     t->fd = fd;
     t->pd = pd;
     t->read_timeout_ms = 0;  /* ATOMIC objects are not zeroed. */
+    t->read_deadline_ms = 0; /* ATOMIC objects are not zeroed. */
     t->ssl = ssl;
     t->ctx = ctx;
     return t;
@@ -13868,6 +13947,16 @@ void *zap_tls_recv(void *t_, int64_t n) {
     int fd = t->fd;
     void *pd = t->pd;
     SSL *ssl = t->ssl;
+    /* Honor the per-conn read deadline on the raw TLS read path (I#566): the
+     * per-park timeout (set_read_timeout) and the whole-op deadline
+     * (set_read_deadline, I#567) both bound the parks here, exactly as they do for
+     * plaintext `net.recv` and `http.read_request`. The WANT_* handling is inlined
+     * (rather than via `zap_tls_want`, which hardcodes an unbounded park and whose
+     * -2 return means a protocol error) so a timed-out park is told apart from a
+     * protocol error and turned into a catchable TimeoutError. */
+    int64_t timeout_ms = t->read_timeout_ms;
+    int64_t whole_deadline_ns =
+        (t->read_deadline_ms > 0) ? np_now_ns() + t->read_deadline_ms * 1000000LL : 0;
     if (n <= 0) {
         return zap_str_new("", 0);
     }
@@ -13886,12 +13975,23 @@ void *zap_tls_recv(void *t_, int64_t n) {
             got = r;
             break;
         }
-        int w = zap_tls_want(ssl, r, fd, pd);
-        if (w == 0) {
-            continue;
+        int e = SSL_get_error(ssl, r);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+            int mode = (e == SSL_ERROR_WANT_WRITE) ? ZAP_POLL_WRITE : ZAP_POLL_READ;
+            int p = zap_sock_park2(fd, pd, mode, timeout_ms, whole_deadline_ns);
+            if (p == -2) {
+                free(buf);
+                zap_net_timeout_panic(); /* read deadline elapsed -> TimeoutError */
+                return NULL;
+            }
+            if (p < 0) {
+                got = 0; /* closed under us -> EOF */
+                break;
+            }
+            continue; /* parked -> ready, retry SSL_read */
         }
-        if (w == -1 || w == -3) {
-            got = 0; /* closed / clean TLS shutdown -> EOF */
+        if (e == SSL_ERROR_ZERO_RETURN) {
+            got = 0; /* clean TLS shutdown -> EOF */
             break;
         }
         free(buf);
@@ -14087,7 +14187,8 @@ void *zap_tls_accept(void *l_) {
         t->kind = ZAP_CONN_TLS; /* ATOMIC objects are not zeroed; init explicitly. */
         t->fd = cfd;
         t->pd = cpd;
-        t->read_timeout_ms = 0; /* ATOMIC objects are not zeroed. */
+        t->read_timeout_ms = 0;  /* ATOMIC objects are not zeroed. */
+        t->read_deadline_ms = 0; /* ATOMIC objects are not zeroed. */
         t->ssl = ssl;
         t->ctx = ctx; /* up-ref'd above; close_conn's SSL_CTX_free balances it */
         return t;
@@ -14293,9 +14394,12 @@ static void zap_dyn_free(ZapDynBuf *b) {
 }
 
 /* Read one chunk from the socket into `b`. Returns bytes read (0 = EOF), -1 on
- * error, or -2 when a `timeout_ms > 0` read deadline elapses (I#485) — a sentinel
- * the caller turns into a catchable TimeoutError rather than a silent EOF. */
-static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd, int64_t timeout_ms) {
+ * error, or -2 when a read deadline elapses — a sentinel the caller turns into a
+ * catchable TimeoutError rather than a silent EOF. `timeout_ms` is the per-park
+ * deadline (I#485); `whole_deadline_ns` is the absolute whole-operation deadline
+ * (I#567, computed once by the caller, 0 = none) — each park waits the nearer. */
+static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd, int64_t timeout_ms,
+                            int64_t whole_deadline_ns) {
     if (zap_dyn_reserve(b, 4096) != 0) {
         return -1;
     }
@@ -14314,7 +14418,7 @@ static ssize_t zap_dyn_fill(ZapDynBuf *b, int fd, void *pd, int64_t timeout_ms) 
             continue;
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            int p = zap_sock_park(fd, pd, ZAP_POLL_READ, timeout_ms);
+            int p = zap_sock_park2(fd, pd, ZAP_POLL_READ, timeout_ms, whole_deadline_ns);
             if (p == -2) {
                 return -2; /* read deadline elapsed */
             }
@@ -14461,10 +14565,13 @@ typedef struct {
 /* Read one chunk over an established SSL into `b`. Returns bytes read (0 = clean
  * EOF / closed), -1 on error, or -2 when a `timeout_ms > 0` read deadline elapses
  * (I#485 over TLS, I#556) — the sentinel the caller turns into a catchable
- * TimeoutError. The TLS twin of `zap_dyn_fill`. `timeout_ms == 0` means park
- * forever (the client always passes 0, so its behavior is unchanged); the server
- * read path threads the connection's `net.set_read_timeout` deadline through. */
-static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd, int64_t timeout_ms) {
+ * TimeoutError. The TLS twin of `zap_dyn_fill`. `timeout_ms` is the per-park
+ * deadline (0 = park forever — the client always passes 0/0, so its behavior is
+ * unchanged); `whole_deadline_ns` is the absolute whole-operation deadline (I#567,
+ * computed once by the caller, 0 = none). The server read path threads the
+ * connection's `net.set_read_timeout` / `net.set_read_deadline` through. */
+static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd, int64_t timeout_ms,
+                                 int64_t whole_deadline_ns) {
     if (zap_dyn_reserve(b, 4096) != 0) {
         return -1;
     }
@@ -14480,14 +14587,15 @@ static ssize_t zap_http_tls_fill(ZapDynBuf *b, SSL *ssl, int fd, void *pd, int64
             return r;
         }
         /* Classify the non-positive return. WANT_READ/WANT_WRITE park (bounded by
-         * `timeout_ms`); a read-deadline timeout is the -2 sentinel; a closed fd
-         * or a clean close_notify is EOF; anything else is a hard error. This
-         * mirrors `zap_tls_want` but threads the deadline so the park can time
-         * out (that helper hardcodes an unbounded park). */
+         * the per-park timeout AND the whole-op deadline); a read-deadline timeout
+         * is the -2 sentinel; a closed fd or a clean close_notify is EOF; anything
+         * else is a hard error. This mirrors `zap_tls_want` but threads the
+         * deadlines so the park can time out (that helper hardcodes an unbounded
+         * park). */
         int e = SSL_get_error(ssl, r);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
             int mode = (e == SSL_ERROR_WANT_WRITE) ? ZAP_POLL_WRITE : ZAP_POLL_READ;
-            int p = zap_sock_park(fd, pd, mode, timeout_ms);
+            int p = zap_sock_park2(fd, pd, mode, timeout_ms, whole_deadline_ns);
             if (p == -2) {
                 b->buf[b->len] = '\0';
                 return -2; /* read deadline elapsed */
@@ -14514,9 +14622,10 @@ static int zap_httpconn_send_all(ZapHttpConn *c, const char *data, size_t len) {
 /* Read one chunk into `b`. Returns bytes read (0 = EOF), -1 on error. */
 static ssize_t zap_httpconn_fill(ZapHttpConn *c, ZapDynBuf *b) {
     if (c->tls) {
-        return zap_http_tls_fill(b, c->ssl, c->fd, c->pd, 0); /* client: no read-timeout surface */
+        /* client: no read-timeout/deadline surface (0/0 = unchanged) */
+        return zap_http_tls_fill(b, c->ssl, c->fd, c->pd, 0, 0);
     }
-    return zap_dyn_fill(b, c->fd, c->pd, 0); /* client has no read-timeout surface */
+    return zap_dyn_fill(b, c->fd, c->pd, 0, 0); /* client: no read-timeout/deadline surface */
 }
 
 /* Shut down and close the connection (the TLS session + context when present). */
@@ -14544,17 +14653,21 @@ static void zap_httpconn_close(ZapHttpConn *c) {
  * transports — plaintext through recv()/send() + the netpoller park, TLS through
  * SSL_read/SSL_write + the WANT_READ/WANT_WRITE park. The per-connection read
  * deadline (net.set_read_timeout, I#485) is read from whichever handle it is and
- * threaded into the fill, so a read timeout fires uniformly over TLS too. */
+ * threaded into the fill, so a read timeout fires uniformly over TLS too; the
+ * whole-operation deadline (net.set_read_deadline, I#567) is computed once by the
+ * caller and passed in, so it bounds a whole multi-chunk read over both. */
 
 /* Read one chunk from a server connection into `b`. Returns bytes read (0 = EOF),
- * -1 on error, -2 when the read deadline elapses (caller raises TimeoutError). */
-static ssize_t zap_http_srv_fill(void *c_, ZapDynBuf *b) {
+ * -1 on error, -2 when a read deadline elapses (caller raises TimeoutError).
+ * `whole_deadline_ns` is the absolute whole-op deadline (0 = none), fixed for the
+ * duration of one `http.read_request`; the per-park timeout is read per-handle. */
+static ssize_t zap_http_srv_fill(void *c_, ZapDynBuf *b, int64_t whole_deadline_ns) {
     if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
         ZapTls *t = (ZapTls *)c_;
-        return zap_http_tls_fill(b, t->ssl, t->fd, t->pd, t->read_timeout_ms);
+        return zap_http_tls_fill(b, t->ssl, t->fd, t->pd, t->read_timeout_ms, whole_deadline_ns);
     }
     ZapSock *s = (ZapSock *)c_;
-    return zap_dyn_fill(b, s->fd, s->pd, s->read_timeout_ms);
+    return zap_dyn_fill(b, s->fd, s->pd, s->read_timeout_ms, whole_deadline_ns);
 }
 
 /* Write all `len` bytes over a server connection. Returns 0 on success, -1 on
@@ -14898,17 +15011,22 @@ void *zap_http_url(void *host_, int64_t port, void *path_) {
  * Connection: close is handled the same way. Transport-agnostic (I#556): `c_` is
  * either a plaintext `net` conn or a TLS `tls.accept` conn, and every byte read
  * goes through the `zap_http_srv_fill` seam, so this single parser serves both.
- * The read deadline (I#485) is carried by the seam and fires over TLS too. */
+ * The read deadline (I#485) is carried by the seam and fires over TLS too. The
+ * whole-operation deadline (net.set_read_deadline, I#567) is computed ONCE here so
+ * it bounds the ENTIRE request (headers + body) regardless of byte pacing — a
+ * slow-dribble peer that keeps resetting the per-park clock is still cut off. */
 void *zap_http_read_request(void *c_) {
     ZapDynBuf b = {NULL, 0, 0};
     size_t hlen = 0, body_off = 0;
     int have_headers = 0;
+    int64_t rdl_ms = zap_conn_read_deadline_ms(c_);
+    int64_t whole_deadline_ns = (rdl_ms > 0) ? np_now_ns() + rdl_ms * 1000000LL : 0;
     for (;;) {
         if (zap_http_split(&b, &hlen, &body_off) == 0) {
             have_headers = 1;
             break;
         }
-        ssize_t r = zap_http_srv_fill(c_, &b);
+        ssize_t r = zap_http_srv_fill(c_, &b, whole_deadline_ns);
         if (r == -2) {
             zap_dyn_free(&b);
             zap_net_timeout_panic();
@@ -14965,7 +15083,7 @@ void *zap_http_read_request(void *c_) {
         clen = 0;
     }
     while ((size_t)(b.len - body_off) < (size_t)clen) {
-        ssize_t r = zap_http_srv_fill(c_, &b);
+        ssize_t r = zap_http_srv_fill(c_, &b, whole_deadline_ns);
         if (r == -2) {
             zap_dyn_free(&b);
             zap_net_timeout_panic();

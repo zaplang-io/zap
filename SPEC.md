@@ -625,10 +625,11 @@ finally:
   `BaseException`, so `except Exception` does not suppress cancellation.
   `ScopeTimeout` (raised to the caller when a `scope(timeout=…)` deadline expires)
   derives from `Exception` and so is catchable by `except Exception`. `TimeoutError`
-  (raised when a socket read exceeds the deadline set by `net.set_read_timeout`)
-  likewise derives from `Exception`, and is distinct from a clean EOF (an empty
-  `net.recv` result) so a server can tell an idle/read timeout apart from a peer
-  close. The remaining listed leaf types derive from `Exception`; `Exception`
+  (raised when a socket read exceeds the per-park deadline set by
+  `net.set_read_timeout` or the whole-operation budget set by
+  `net.set_read_deadline`) likewise derives from `Exception`, and is distinct from
+  a clean EOF (an empty `net.recv` result) so a server can tell an idle/read
+  timeout apart from a peer close. The remaining listed leaf types derive from `Exception`; `Exception`
   derives from `BaseException`.
 - `raise E(message)` constructs a typed built-in exception. Raising a string is
   shorthand for raising `Exception(message)`. A typed `except E` catches `E`
@@ -1012,9 +1013,14 @@ request off a connection into an opaque handle read back with
 `tls.accept` (both are the one opaque connection handle) — the request parser and
 response writer drive the connection through a transport seam, reading/writing
 over `SSL_read`/`SSL_write` for a TLS conn and `recv`/`send` for a plaintext one,
-so an HTTPS server terminates TLS through the same `http` surface (#556). The
-read deadline (`net.set_read_timeout`, above) applies uniformly, so a read
-timeout raises `TimeoutError` over a TLS conn as well. `http` is **Experimental**
+so an HTTPS server terminates TLS through the same `http` surface (#556). Both
+read deadlines apply uniformly over either transport: the per-park timeout
+(`net.set_read_timeout`) bounds each wait-for-readiness, and the whole-operation
+budget (`net.set_read_deadline`, #567) bounds an entire `http.read_request`
+(headers + body) regardless of byte pacing — so a slow-dribble (slowloris) client
+that keeps resetting the per-park clock is still cut off with a catchable
+`TimeoutError`. The two compose: with both set, each park waits the nearer of the
+per-park timeout and the whole-op deadline. `http` is **Experimental**
 (STABILITY.md §4.4).
 
 **`tls` client + server (#147, #488).** TLS over OpenSSL on the netpoller.
@@ -1032,8 +1038,10 @@ in `tls.accept` **raise**, exactly as `net.close_listener` unblocks `net.accept`
 (the graceful-shutdown contract). Both ends share `tls.send(conn, data) ->
 int64`, `tls.recv(conn, n) -> str` and `tls.close_conn(conn)` (`close` is the
 reserved channel-close token, so sockets spell it `close_conn` / `close_listener`,
-as in `net`). `http` routes `https://` through the client with verification on.
-`tls` is **Experimental** (STABILITY.md §4.4).
+as in `net`). A `tls.recv` honors the read deadlines set by `net.set_read_timeout`
+/ `net.set_read_deadline` on the conn, raising a catchable `TimeoutError` exactly
+as plaintext `net.recv` does (#566). `http` routes `https://` through the client
+with verification on. `tls` is **Experimental** (STABILITY.md §4.4).
 
 **`url` — `encoding/url` percent-encoding (#335).** RFC-3986 percent-encoding and
 decoding over raw UTF-8 bytes, plus the AWS-query canonicalization variant used
