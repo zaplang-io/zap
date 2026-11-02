@@ -2,21 +2,37 @@
 # slow-dribble (slowloris) request over TLS, through `http.read_request` (the
 # #556 transport seam). The TLS twin of `net_read_deadline_slowloris`: it proves
 # the whole-op deadline is threaded through the SAME seam as the per-park
-# deadline, so it fires over TLS too and not just plaintext.
+# deadline, so it fires over TLS too, not just plaintext.
 #
-# The server sets a GENEROUS per-park timeout (so the 50 ms dribbles never trip
-# it — proving the whole-op deadline, not the per-park one, is what fires) and a
-# SHORT whole-op deadline, then calls `http.read_request` over a `tls.accept`
-# conn. The client completes the TLS handshake, then dribbles an incomplete
-# request (bytes that never terminate the headers) one at a time over `tls.send`
-# and keeps dribbling until a send fails — which only happens once the server's
-# whole-op deadline has fired and it has closed the conn. If the whole-op
-# deadline were broken the exchange would HANG rather than silently pass. The
-# marker — not any wall-clock number — is what the golden asserts, so it does not
-# race under either collector or arch.
+# `main` is the server/reader: it binds a TLS listener, starts a DETACHED dribbler
+# coroutine (a daemon, so it never blocks program exit and is torn down when main
+# returns), accepts the conn, sets a GENEROUS per-park timeout (so the 50 ms
+# dribbles never trip it — proving the whole-op deadline, not the per-park one, is
+# what fires) and a SHORT whole-op deadline, then calls `http.read_request`. The
+# dribbler sends an incomplete request (bytes that never terminate the headers)
+# one at a time, forever. Only the whole-op deadline can cut the read off: it
+# fires, `http.read_request` raises a catchable `TimeoutError`, main prints the
+# marker and returns (the daemon dribbler is terminated at exit, so it never sends
+# into a closed conn — no broken pipe). If the whole-op deadline were broken the
+# read would never return (the dribbles keep the per-park clock alive) and the
+# program would HANG rather than silently passing. The marker — not any wall-clock
+# number — is what the golden asserts, so it does not race under either collector
+# or arch.
 
 
-def tls_slow_server(channel[int64] portch, channel[int64] done):
+def tls_dribbler(int64 port):
+    auto c = tls.connect_insecure("127.0.0.1", port)
+    # Dribble an incomplete request forever, one byte at a time, each well under
+    # the server's per-park timeout. Detached: terminated at program exit.
+    while True:
+        try:
+            tls.send(c, "x")
+        except Exception:
+            break
+        time.sleep_ns(time.millis(50))
+
+
+def tls_slow_server():
     auto cert = """-----BEGIN CERTIFICATE-----
 MIIDJzCCAg+gAwIBAgIUY0g00QCmIsdA4L4Ta31cDYVdzHwwDQYJKoZIhvcNAQEL
 BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEwMTAzNDgxMloYDzIxMjYx
@@ -72,7 +88,8 @@ x29GIzLvicHaw/U/LYviOHA/sPgO4DF0/uujyBS/nKaQTig/+fQaphz5ckL5i1mu
     fs.write_file(cert_path, cert)
     fs.write_file(key_path, key)
     auto l = tls.listen("127.0.0.1", 0, cert_path, key_path)
-    portch <- tls.port(l)
+    auto port = tls.port(l)
+    spawn detached tls_dribbler(port)
     auto c = tls.accept(l)
     net.set_read_timeout(c, 10000)  # generous per-park: a 50 ms dribble never trips it
     net.set_read_deadline(c, 300)  # whole-op budget: bounds the entire request
@@ -81,26 +98,8 @@ x29GIzLvicHaw/U/LYviOHA/sPgO4DF0/uujyBS/nKaQTig/+fQaphz5ckL5i1mu
         print("unexpected: read returned")
     except TimeoutError:
         print("tls-slowloris-fired")
-    tls.close_conn(c)
-    tls.close_listener(l)
-    done <- 1
+    print("done")
 
 
 def main():
-    auto portch = channel[int64]()
-    auto done = channel[int64]()
-    spawn tls_slow_server(portch, done)
-    auto port = <-portch
-    auto c = tls.connect_insecure("127.0.0.1", port)
-    # Dribble an incomplete request forever, one byte at a time under the per-park
-    # timeout; stop only when a send fails (the server closed after its whole-op
-    # deadline fired).
-    while True:
-        try:
-            tls.send(c, "x")
-        except Exception:
-            break
-        time.sleep_ns(time.millis(50))
-    auto ack = <-done
-    tls.close_conn(c)
-    print("done")
+    tls_slow_server()
