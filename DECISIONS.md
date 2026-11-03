@@ -2972,3 +2972,41 @@ pointers). The list element kind gains an `Elem::F64` variant used only on the
 and direct float ordering in `sort` (sort a `list[float]` via `key=`) stay
 unsupported, as does the `f32` list element (ticket #49). Verified by the
 `scalar_float` and `list_float` goldens under the full-codegen and ARM CI jobs.
+
+## D-0101 — built-in field decorators `@default` / `@validate` / `@range` (I#472)
+
+Completes the field-decorator group of the locked decorator set (D-0036,
+design/0004) that the decorator slice (I#16) left deferred. These are
+compile-time-first: they generate real, type-checked code with no runtime
+reflection cost, and `zap expand` shows it.
+
+- **`@default(expr)`** on a field supplies a construction-time default evaluated
+  **per instance** (consistent with per-call default evaluation, D-0038). It
+  reuses the omitted-field default-fill path added for literal defaults (#461),
+  so a mutable default is a fresh object each construction. A field may carry a
+  literal default (`T x = e`) *or* `@default(e)`, never both (ZAP5038).
+- **`@validate(max_len=n, min_len=n)`** constrains the byte length of a
+  `str`/`bytes` field; **`@range(min=v, max=v)`** constrains an integer/float
+  field's value. Both lower to a generated `{Struct}____validate__(self)` guard
+  — ordinary ZIR, so it is `zap expand`-visible and type-checked like any method
+  — that the constructor invokes after it fills every field. A failing
+  constraint raises a **catchable `ValueError`** (D-0007), the same mechanism as
+  the index/divide faults (#383); inside a `try` the constructor's validator
+  call is an `invoke`, so `except ValueError` catches a bad construction.
+- Diagnostics are stable and coded, with spans, in sema: `@default` shape/double
+  default (ZAP5038); `@range` non-numeric field / non-literal bound / inverted
+  bounds (ZAP5039); `@validate` unknown constraint / non-str field / bad length
+  literal (ZAP5040). Lowering trusts sema and only re-checks defensively.
+- The `range` keyword is accepted as a decorator name (`decorator_name` in the
+  parser) so `@range` parses; every other keyword stays reserved. GRAMMAR.ebnf
+  gains the `decorator_name` production.
+
+Verified by the `field_decorators` (end-to-end run, incl. caught `ValueError`)
+and `field_range_reject` (coded compile error) goldens under the full-codegen CI
+jobs, plus sema/ir unit tests on host.
+
+**Deferred to a follow-up (still clean "not implemented yet" errors, #472):**
+`@validate(matches=m/.../)` regex validation; and the function/variable group
+`@cache` (memoization), `@deprecated` (use-site diagnostic), and `@inject` (DI,
+cf. zap#312/fastzap#7). The locked spec surface and stability table are
+unchanged; this decision records the realization of part of it.

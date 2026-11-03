@@ -1481,11 +1481,11 @@ impl Checker {
             match item {
                 Item::Struct(s) => {
                     for d in &s.decorators {
-                        self.check_decorator(d, DecoTarget::Struct);
+                        self.check_decorator(d, DecoTarget::Struct, None);
                     }
                     for f in &s.fields {
                         for d in &f.decorators {
-                            self.check_decorator(d, DecoTarget::Field);
+                            self.check_decorator(d, DecoTarget::Field, Some(f));
                         }
                     }
                     for m in &s.methods {
@@ -1495,7 +1495,7 @@ impl Checker {
                 Item::Function(f) => self.check_fn_decorators(f),
                 Item::Enum(e) => {
                     for d in &e.decorators {
-                        self.check_decorator(d, DecoTarget::Enum);
+                        self.check_decorator(d, DecoTarget::Enum, None);
                     }
                 }
                 _ => {}
@@ -1505,18 +1505,21 @@ impl Checker {
 
     fn check_fn_decorators(&mut self, f: &Function) {
         for d in &f.decorators {
-            self.check_decorator(d, DecoTarget::Function);
+            self.check_decorator(d, DecoTarget::Function, None);
         }
         for p in &f.params {
             for d in &p.decorators {
-                self.check_decorator(d, DecoTarget::Param);
+                self.check_decorator(d, DecoTarget::Param, None);
             }
         }
     }
 
-    fn check_decorator(&mut self, d: &Decorator, target: DecoTarget) {
+    /// Validate one decorator application. `field` is the decorated field when
+    /// `target == Field`, so the field-level built-ins (`@default`/`@validate`/
+    /// `@range`, D-0101) can check the field's declared type and literal default.
+    fn check_decorator(&mut self, d: &Decorator, target: DecoTarget, field: Option<&Field>) {
         if BUILTIN_DECORATORS.contains(&d.name.as_str()) {
-            self.check_builtin_decorator(d, target);
+            self.check_builtin_decorator(d, target, field);
             return;
         }
         if let Some(fields) = self.annotations.get(&d.name).cloned() {
@@ -1564,7 +1567,12 @@ impl Checker {
         );
     }
 
-    fn check_builtin_decorator(&mut self, d: &Decorator, target: DecoTarget) {
+    fn check_builtin_decorator(
+        &mut self,
+        d: &Decorator,
+        target: DecoTarget,
+        field: Option<&Field>,
+    ) {
         let keywords = d.args.iter().filter(|a| a.name.is_some()).count();
         let positionals = d.args.len() - keywords;
         match d.name.as_str() {
@@ -1726,6 +1734,21 @@ impl Checker {
                         d.span,
                     );
                 }
+                // A field may carry a literal default (`T x = e`) or a
+                // `@default(e)` decorator, but not both — they would race to
+                // initialize the same slot (D-0101).
+                if let Some(f) = field {
+                    if f.default.is_some() {
+                        self.error(
+                            ErrorCode::ZAP5038,
+                            format!(
+                                "field '{}' has both a literal default and @default(...); keep one",
+                                f.name
+                            ),
+                            d.span,
+                        );
+                    }
+                }
             }
             "range" => {
                 self.require_target(d, target, DecoTarget::Field);
@@ -1736,6 +1759,8 @@ impl Checker {
                         d.span,
                     );
                 }
+                let mut min_lit: Option<f64> = None;
+                let mut max_lit: Option<f64> = None;
                 for a in &d.args {
                     if let Some(n) = &a.name {
                         if n != "min" && n != "max" {
@@ -1744,6 +1769,21 @@ impl Checker {
                                 format!("@range has no bound '{n}' (expected 'min' or 'max')"),
                                 d.span,
                             );
+                            continue;
+                        }
+                        match numeric_literal(&a.value) {
+                            Some(v) => {
+                                if n == "min" {
+                                    min_lit = Some(v);
+                                } else {
+                                    max_lit = Some(v);
+                                }
+                            }
+                            None => self.error(
+                                ErrorCode::ZAP5039,
+                                format!("@range {n} must be a numeric literal, e.g. @range({n}=0)"),
+                                d.span,
+                            ),
                         }
                     }
                 }
@@ -1754,6 +1794,30 @@ impl Checker {
                         d.span,
                     );
                 }
+                if let (Some(lo), Some(hi)) = (min_lit, max_lit) {
+                    if lo > hi {
+                        self.error(
+                            ErrorCode::ZAP5039,
+                            "@range(min, max) has min greater than max",
+                            d.span,
+                        );
+                    }
+                }
+                // `@range` constrains a numeric field (D-0101).
+                if let Some(f) = field {
+                    let ty = self.resolve_type(&f.ty);
+                    if !ty.is_numeric() && !matches!(ty, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP5039,
+                            format!(
+                                "@range applies to a numeric field, not '{}' (field '{}')",
+                                ty.display(),
+                                f.name
+                            ),
+                            d.span,
+                        );
+                    }
+                }
             }
             "validate" => {
                 self.require_target(d, target, DecoTarget::Field);
@@ -1763,6 +1827,55 @@ impl Checker {
                         "@validate(...) takes keyword constraints, e.g. @validate(max_len=50)",
                         d.span,
                     );
+                }
+                let mut has_len = false;
+                for a in &d.args {
+                    match a.name.as_deref() {
+                        Some("max_len") | Some("min_len") => {
+                            has_len = true;
+                            match numeric_literal(&a.value) {
+                                Some(v) if v >= 0.0 && v.fract() == 0.0 => {}
+                                _ => self.error(
+                                    ErrorCode::ZAP5040,
+                                    format!(
+                                        "@validate({}=...) needs a non-negative integer literal",
+                                        a.name.as_deref().unwrap_or("")
+                                    ),
+                                    d.span,
+                                ),
+                            }
+                        }
+                        // `matches=` (regex) is a documented follow-up (#472); it
+                        // parses and sema-checks nowhere yet, so reject it cleanly
+                        // rather than silently accepting an unimplemented option.
+                        Some(other) => self.error(
+                            ErrorCode::ZAP5040,
+                            format!(
+                                "@validate has no constraint '{other}' \
+                                 (supported: max_len, min_len)"
+                            ),
+                            d.span,
+                        ),
+                        None => {}
+                    }
+                }
+                // Length constraints apply to a string/bytes field (D-0101).
+                if has_len {
+                    if let Some(f) = field {
+                        let ty = self.resolve_type(&f.ty);
+                        if !matches!(ty, Ty::Str | Ty::Bytes | Ty::Unknown) {
+                            self.error(
+                                ErrorCode::ZAP5040,
+                                format!(
+                                    "@validate(max_len/min_len) applies to a str or bytes field, \
+                                     not '{}' (field '{}')",
+                                    ty.display(),
+                                    f.name
+                                ),
+                                d.span,
+                            );
+                        }
+                    }
                 }
             }
             "cache" => {
@@ -5295,6 +5408,27 @@ fn const_int_lit(e: &Expr) -> Option<i64> {
     }
 }
 
+/// A compile-time numeric literal (int or float), with an optional leading
+/// unary `+`/`-`, as an `f64`. Used to validate `@range`/`@validate` bounds
+/// (D-0101). `None` for any non-literal expression.
+fn numeric_literal(e: &Expr) -> Option<f64> {
+    match e {
+        Expr::Int(s, _) => parse_int_lit(s).map(|v| v as f64),
+        Expr::Float(s, _) => s.replace('_', "").parse::<f64>().ok(),
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+            ..
+        } => numeric_literal(expr).map(|v| -v),
+        Expr::Unary {
+            op: UnOp::Pos,
+            expr,
+            ..
+        } => numeric_literal(expr),
+        _ => None,
+    }
+}
+
 /// Parse an integer literal string (decimal/hex/octal/binary with `_`
 /// separators) to an `i64`; `None` if it does not parse.
 fn parse_int_lit(s: &str) -> Option<i64> {
@@ -6321,14 +6455,58 @@ def main():
     #[test]
     fn builtin_arg_shapes_checked() {
         // @cache takes no args; @default takes exactly one expr; @inject none.
-        // (`@range` is in the locked set but its name collides with the `range`
-        // keyword, so it cannot currently be written — see the PR notes.)
         assert_eq!(errors("@cache(1)\ndef f():\n    print(1)\n").len(), 1);
         assert_eq!(
             errors("struct S:\n    @default(1, 2)\n    int64 x\n").len(),
             1
         );
         assert_eq!(errors("struct S:\n    @inject(1)\n    int64 x\n").len(), 1);
+    }
+
+    #[test]
+    fn field_decorator_validation_checked() {
+        // `@default`/`@validate`/`@range` field decorators (D-0101) now parse and
+        // type-check on well-formed, suitably-typed fields.
+        ok(
+            "struct S:\n    @default(now())\n    int64 created\n    @validate(max_len=50)\n    \
+            str name\n    @range(min=0, max=150)\n    int64 age\n\ndef now() -> int64:\n    \
+            return 0\n\ndef main():\n    auto s = S(name=\"a\", age=1)\n    print(s.age)\n",
+        );
+        // `@range` on a non-numeric field.
+        assert!(
+            errors("struct S:\n    @range(min=0, max=5)\n    str name\n")
+                .iter()
+                .any(|e| e.code == ErrorCode::ZAP5039),
+            "@range on str should be ZAP5039"
+        );
+        // `@validate(max_len)` on a non-string field.
+        assert!(
+            errors("struct S:\n    @validate(max_len=5)\n    int64 n\n")
+                .iter()
+                .any(|e| e.code == ErrorCode::ZAP5040),
+            "@validate(max_len) on int should be ZAP5040"
+        );
+        // A field may not carry both a literal default and `@default(...)`.
+        assert!(
+            errors("struct S:\n    @default(0)\n    int64 n = 5\n")
+                .iter()
+                .any(|e| e.code == ErrorCode::ZAP5038),
+            "double default should be ZAP5038"
+        );
+        // Unknown `@validate` constraint (`matches` is a documented follow-up).
+        assert!(
+            errors("struct S:\n    @validate(matches=5)\n    str name\n")
+                .iter()
+                .any(|e| e.code == ErrorCode::ZAP5040),
+            "unknown @validate constraint should be ZAP5040"
+        );
+        // `@range(min, max)` with min greater than max.
+        assert!(
+            errors("struct S:\n    @range(min=10, max=0)\n    int64 n\n")
+                .iter()
+                .any(|e| e.code == ErrorCode::ZAP5039),
+            "inverted @range bounds should be ZAP5039"
+        );
     }
 
     #[test]
