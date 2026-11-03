@@ -47,6 +47,8 @@
 
 use core::fmt;
 
+pub mod render;
+
 /// A stable diagnostic identifier, rendered `ZAPnnnn`.
 ///
 /// The inner number is private: the only way to name a code is through a
