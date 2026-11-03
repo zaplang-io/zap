@@ -344,7 +344,8 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Regex (D-0010); decorators & annotations core (D-0036) + `@derive(Json)` | **S** |
 | Generics incl. bounds (D-0064) | **S** |
 | Coroutines/channels/`select`/`scope:`/`spawn detached` (D-0031/0044/0045); sync primitives + `Atomic[T]` (D-0032/0066); `Optional[T]` (D-0065) | **S** |
-| Numeric arrays / SIMD + dtype promotion (D-0011); `set` type; C-style bitfields (D-0068); Python interop; `@derive(Yaml)`/`@derive(Csv)` | **E** |
+| `set[T]` — literals `{1, 2, 3}`, comprehensions `{x for x in xs}`, `.add`/`in`/`len`/iteration, and the `set[T]()` / `set(iterable)` constructors (#608/#609, graduated per D16/D17) | **S** |
+| Numeric arrays / SIMD + dtype promotion (D-0011); C-style bitfields (D-0068); Python interop; `@derive(Yaml)`/`@derive(Csv)` | **E** |
 | `when target.*` compile-time conditional compilation (D-0079, I#139 Phase 1) | **E** |
 | Value/memory layout, enum/closure representation (§1.5) | **I** |
 
@@ -352,7 +353,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 
 | Surface | Tier |
 |---|---|
-| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`, `ord`/`chr`/`char`/`str`/`int` #284, `float`/`bool`/`format` #285, `bytes` type + `bytes(x)` #337) | **S** |
+| Built-ins (`print`/`len`/`range`/`assert`, scalar/container ctors, `heap[T]`, `set[T]()`/`set(iterable)` #609, `ord`/`chr`/`char`/`str`/`int` #284, `float`/`bool`/`format` #285, `bytes` type + `bytes(x)` #337) | **S** |
 | `io`, `fs`, `os`, `sys`, `process`, `math`, `random`, `time`, `datetime` (incl. `strftime` / 2-arg `format` custom formatting, #286; `strptime` parsing + SigV4/epoch/iso8601/rfc822 round-trips, #338) | **S** |
 | `collections` extras (`deque`, `bisect`, `oset`); `sync`; `json`; `logging`; `argparse` | **S** |
 | `signal`/`gc`/`runtime` — the **API** (`signal.notify`, `gc.collect/stats`, `runtime.coroutine_dump`) | **S** |

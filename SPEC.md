@@ -186,12 +186,23 @@ auto m  = dict[str, int64]({"a": 1, "b": 2})
 auto a  = array[f64]([1, 2, 3])          # dense numeric, SIMD (design/0002)
 auto h  = heap[int64]()                  # min-heap priority queue (D-0057; comparator optional)
 auto st = {1, 2, 3}                       # set[int64] — a brace set literal
+auto e  = set[int64]()                    # empty set[int64] (there is no empty-set literal)
+auto u  = set([1, 1, 2])                  # set[int64] {1, 2} — dedup from any iterable
+auto cs = set("aab")                      # set[char] of the unique codepoints
 ```
 
 A `{...}` brace display is a **set literal** (`{1, 2, 3}`) unless its first
 element is followed by `:`, which makes it a dict; **empty `{}` is the empty
 dict** (there is no empty-set literal — build one with a constructor such as
-`set[T]()`). `set` is Stable (D-0076).
+`set[T]()`). `set` is Stable (D-0076, graduated #608/#609).
+
+**Set constructors (D17, #609).** `set[T]()` builds an empty `set[T]`, parallel
+to `heap[T]()` / `channel[T]()`. `set(iterable)` builds a set of an iterable's
+**deduplicated** elements (its element type is the iterable's), mirroring
+Python's `set(xs)`; `set[T](iterable)` is the same with the element type stated
+explicitly. The operand may be any iterable — a list, another set, a `dict`
+(its keys), a `range`, or a `str` (its codepoints). `set()` with no argument is
+rejected: an empty set has no element type to infer, so write `set[T]()`.
 
 **Unpacking in displays (`*` / `**`, #598).** A `*expr` inside a list, set, or
 tuple display splices an iterable's elements in place, and a `**expr` inside a
@@ -1256,7 +1267,7 @@ change), **I** Internal (no contract). Sections marked **S** are **frozen for
 | Decorators & annotations core | Locked (D-0036, design/0004) | **S** |
 | do-while, match-case | Locked (D-0039, D-0040) | **S** |
 | Numeric arrays / SIMD | Locked design, promotion open | **E** |
-| `set` type | Shipped, surface open | **E** |
+| `set` type (literals, comprehensions, `set[T]()`/`set(iterable)` ctors) | Locked (#608/#609, D16/D17) | **S** |
 | C-style bitfields on `value struct` | Locked (D-0068) | **E** |
 | `when target.*` conditional compilation | Shipped Phase 1 (D-0079) | **E** |
 | `**kwargs` arbitrary named args | Deferred (D-0038) | n/a |
