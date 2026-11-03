@@ -52,4 +52,33 @@ def main():
     numbers.append([])
     numbers[0].append(1.5)
     assert numbers[0][0] == 1.5
+    # Indexed list/dict stores use the same literal context and type checks.
+    names[0] = {}
+    assert len(names[0]) == 0
+    groups[0] = []
+    groups[0].append("reset")
+    assert groups[0][0] == "reset"
+    trees[0]["branch"] = {}
+    assert len(trees[0]["branch"]) == 0
+    # Retain scalar numeric widening for indexed float stores.
+    numbers[0][0] = 2
+    assert numbers[0][0] == 2.0
+    dict[str, bool] item = {"ready": True}
+    for flag in [True, False]:
+        names.append({} if flag else item)
+        assert len(names[len(names) - 1]) == (0 if flag else 1)
+        names.append(item if flag else {})
+        assert len(names[len(names) - 1]) == (1 if flag else 0)
+        names[0] = {} if flag else item
+        assert len(names[0]) == (0 if flag else 1)
+        groups[0] = [] if flag else ["chosen"]
+        assert len(groups[0]) == (0 if flag else 1)
+        trees[0]["branch"] = item if flag else {}
+        assert len(trees[0]["branch"]) == (1 if flag else 0)
+        names.append(({} if flag else {}) if flag else {})
+        assert len(names[len(names) - 1]) == 0
+    # Chained indexed stores contextualize one shared RHS without copying it.
+    names[0] = names[1] = {}
+    names[0]["shared"] = True
+    assert names[1]["shared"]
     print("nested empty append: PASS")
