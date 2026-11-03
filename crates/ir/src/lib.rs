@@ -49,6 +49,52 @@ mod tests {
     }
 
     #[test]
+    fn lower_nested_collections_readback_dispatch() {
+        // #625: a nested generic collection must read back as its real element
+        // type, not a bare `str` pointer. Before the fix, `rows[i]` yielded a
+        // `Ptr` and `len(rows[i])` / `rows[i][j]` dispatched to the string entry
+        // points (`zap_str_len` / `zap_str_index`), silently miscompiling into
+        // wrong/empty values. Assert the collection entry points are emitted and
+        // no string op leaks in.
+        let module = lower_ok(include_str!("../../../tests/golden/nested_collections.zap"));
+        let text = format!("{module}");
+        // A nested read-back dispatches as a list/dict op, never a string op.
+        assert!(
+            !text.contains("zap_str_len") && !text.contains("zap_str_index"),
+            "a nested read-back leaked a string op:\n{text}"
+        );
+        // `make_grid` returns `list[list[int64]]`: inner lists push as pointers.
+        assert!(text.contains("call @zap_list_push_ptr"), "text:\n{text}");
+        // Reading an inner `int64` element goes through the typed list entry point.
+        assert!(text.contains("call @zap_list_get_i64"), "text:\n{text}");
+        // A `dict[str, list]` value reads back as a list (pointer value entry).
+        assert!(text.contains("call @zap_dict_get_str_ptr"), "text:\n{text}");
+        // A `list[dict[str, int64]]` element reads back as a dict with int values.
+        assert!(text.contains("call @zap_dict_get_str_i64"), "text:\n{text}");
+    }
+
+    #[test]
+    fn nested_collection_key_is_a_loud_error() {
+        // #625: a collection is unhashable, so using one as a dict key or a set
+        // element must fail loudly rather than silently hashing its pointer as a
+        // string. Both the literal and the annotated forms are rejected.
+        for op in [
+            "auto s = {[1, 2]}",
+            "auto d = {[1]: 9}",
+            "auto s = {{\"a\": 1}}",
+        ] {
+            let source = format!("def main():\n    {op}\n");
+            let (ast, parse, lex) = parse_str(&source);
+            assert!(parse.is_empty() && lex.is_empty(), "{op}: parse/lex");
+            let (_, errors) = lower_module(&ast);
+            assert!(
+                errors.iter().any(|e| e.message.contains("unhashable")),
+                "{op} should be a loud 'unhashable' error, got: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn lower_scope_timeout_fixture() {
         let module = lower_ok(include_str!("../../../tests/conformance/scope_timeout.zap"));
         assert!(format!("{module}").contains("zap_scope_timeout"));
