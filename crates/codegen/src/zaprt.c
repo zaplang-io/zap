@@ -435,16 +435,23 @@ typedef struct {
 } ZapStr;
 
 /* Typed Zap exception values (I#471). The thrown C++ object still carries one
- * pointer, but that pointer now identifies the Zap type and its message. */
+ * pointer, but that pointer now identifies the Zap type and its message.
+ * `cause` is the explicit `raise ... from <cause>` chain (#604, D-0103): NULL
+ * for an ordinary raise, else the causing exception object. It is traced by the
+ * precise descriptor so the chain stays live until the exception is reported. */
 typedef struct {
     uint64_t magic;
     int64_t type_id;
     void *message;
+    void *cause;
 } ZapException;
 #define ZAP_EXCEPTION_MAGIC UINT64_C(0x5a41504558434550)
-static const int32_t zap_exc_ptr_offsets[] = {(int32_t)offsetof(ZapException, message)};
+static const int32_t zap_exc_ptr_offsets[] = {
+    (int32_t)offsetof(ZapException, message),
+    (int32_t)offsetof(ZapException, cause),
+};
 static const ZapTypeDesc zap_desc_exception = {
-    (int64_t)sizeof(ZapException), ZAP_TD_PRECISE, 1, zap_exc_ptr_offsets};
+    (int64_t)sizeof(ZapException), ZAP_TD_PRECISE, 2, zap_exc_ptr_offsets};
 static void *zap_current_exc;
 
 enum {
@@ -478,12 +485,39 @@ void *zap_exception_new(int64_t type_id, void *message) {
     e->magic = ZAP_EXCEPTION_MAGIC;
     e->type_id = type_id;
     e->message = message;
+    e->cause = NULL;
     return e;
 }
 
 void *zap_exception_message(void *exc) {
     ZapException *e = (ZapException *)exc;
     return e && e->magic == ZAP_EXCEPTION_MAGIC ? e->message : NULL;
+}
+
+/* Record the explicit `raise ... from <cause>` chain (#604, D-0103). `cause`
+ * is another exception object; a null/untyped exc or cause is a no-op. */
+void zap_exception_set_cause(void *exc, void *cause) {
+    ZapException *e = (ZapException *)exc;
+    if (e && e->magic == ZAP_EXCEPTION_MAGIC) {
+        e->cause = cause;
+    }
+}
+
+/* The causing exception object set by `raise ... from`, or NULL. */
+void *zap_exception_cause(void *exc) {
+    ZapException *e = (ZapException *)exc;
+    return e && e->magic == ZAP_EXCEPTION_MAGIC ? e->cause : NULL;
+}
+
+void *zap_str_new(const char *data, int64_t len); /* defined below */
+
+/* The cause's message string, surfaced to Zap as `<caught>.cause` (#604).
+ * An empty string when there is no explicit cause, so Zap code can read and
+ * print it without a None check. */
+void *zap_exception_cause_message(void *exc) {
+    void *cause = zap_exception_cause(exc);
+    void *msg = cause ? zap_exception_message(cause) : NULL;
+    return msg ? msg : zap_str_new("", 0);
 }
 
 static int64_t zap_exception_parent(int64_t type_id) {
@@ -2402,6 +2436,34 @@ void zap_repl_slot_set_ptr(int64_t i, void *p) {
     }
 }
 
+/* One "Uncaught exception: <message>" line (the single-section render). */
+static void zap_report_exc_line(void *exc) {
+    ZapStr *msg = (ZapStr *)zap_exception_message(exc);
+    fputs("Uncaught exception: ", stderr);
+    if (msg != NULL && msg->len > 0) {
+        fwrite(msg->data, 1, (size_t)msg->len, stderr);
+    }
+    fputc('\n', stderr);
+}
+
+/* Render an exception and its explicit `raise ... from` cause chain (#604,
+ * D-0103). The cause's own section prints first (deepest cause at the top),
+ * each followed by the Python "direct cause" separator, so an uncaught chained
+ * exception reads cause-first like CPython. A plain (causeless) exception is
+ * exactly one line, unchanged from before. */
+static void zap_report_exc_chain(void *exc, int depth) {
+    void *cause = zap_exception_cause(exc);
+    /* `depth` caps a pathological `from` cycle (a reused caught object chained
+     * back onto itself) so the report cannot recurse without bound. */
+    if (cause != NULL && cause != exc && depth > 0) {
+        zap_report_exc_chain(cause, depth - 1);
+        fputs("The above exception was the direct cause of the following "
+              "exception:\n",
+              stderr);
+    }
+    zap_report_exc_line(exc);
+}
+
 void zap_uncaught(void *exc) {
     if (zap_repl_catch != NULL) {
         /* REPL mode: hand the message to the loop and unwind to zap_repl_call
@@ -2412,13 +2474,8 @@ void zap_uncaught(void *exc) {
         zap_eh_end_catch();
         longjmp(*zap_repl_catch, 1);
     }
-    ZapStr *msg = (ZapStr *)zap_exception_message(exc);
     zap_eh_end_catch();
-    fputs("Uncaught exception: ", stderr);
-    if (msg != NULL && msg->len > 0) {
-        fwrite(msg->data, 1, (size_t)msg->len, stderr);
-    }
-    fputc('\n', stderr);
+    zap_report_exc_chain(exc, 128);
     exit(1);
 }
 

@@ -627,9 +627,15 @@ impl<'a> Printer<'a> {
                 self.take_trailing(span.end);
                 self.last_end = span.end;
             }
-            Stmt::Raise { value, span } => {
+            Stmt::Raise { value, cause, span } => {
                 match value {
-                    Some(v) => self.emit_value("raise ", v, ""),
+                    Some(v) => {
+                        let suffix = match cause {
+                            Some(c) => format!(" from {}", pexpr(c, 0)),
+                            None => String::new(),
+                        };
+                        self.emit_value("raise ", v, &suffix);
+                    }
                     None => self.push_line("raise"),
                 }
                 self.take_trailing(span.end);

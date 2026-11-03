@@ -415,6 +415,10 @@ const CORPUS: &[Case] = &[
     case("try_stmt", Accept, "try:\n    return\nexcept E as e:\n    return\nfinally:\n    return\n"),
     case("with_stmt", Accept, "with open(p) as f, lock:\n    return\n"),        // D-0027/D-0069
     case("do_while_stmt", Reject, "do:\n    return\n"),                         // missing 'while'
+    // ---- raise, with explicit cause chaining (#604, D-0103) ----
+    case("simple_stmt", Accept, "def f():\n    raise ValueError(\"x\")\n"),
+    case("simple_stmt", Accept, "def f():\n    try:\n        raise ValueError(\"x\")\n    except Exception as e:\n        raise RuntimeError(\"y\") from e\n"),
+    case("decl", Accept, "def f():\n    int64 from = 1\n"),                     // `from` still an identifier
 
     // ---- pattern matching (D-0040) ----
     case("match_stmt", Accept, "match x:\n    case 1:\n        return\n    case _:\n        return\n"),

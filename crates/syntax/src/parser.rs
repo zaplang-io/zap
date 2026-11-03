@@ -2419,8 +2419,19 @@ impl Parser {
             } else {
                 Some(self.parse_expr())
             };
+            // `raise <exc> from <cause>` (#604, D-0103). `from` is a contextual
+            // word here (not a reserved keyword, like `pass`/`del`): it is the
+            // cause clause only when it follows a raised value.
+            let cause =
+                if value.is_some() && matches!(self.peek(), TokenKind::Ident(n) if n == "from") {
+                    self.bump();
+                    Some(self.parse_expr())
+                } else {
+                    None
+                };
             return Stmt::Raise {
                 value,
+                cause,
                 span: self.span_from(start),
             };
         }

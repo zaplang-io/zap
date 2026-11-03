@@ -261,7 +261,9 @@ void  zap_print_str(void* s);
 void  zap_panic(void* exc);         // raise / built-in faults; triggers unwinding
 void* zap_eh_begin_catch(void* ue); // landing-pad entry: recover the exc object
 void  zap_eh_end_catch(void);       // balance a begin_catch when leaving a handler
-void  zap_uncaught(void* exc);      // top-level handler: report + exit non-zero
+void  zap_uncaught(void* exc);      // top-level handler: report (chained) + exit non-zero
+void  zap_exception_set_cause(void* exc, void* cause); // raise ... from (#604)
+void* zap_exception_cause_message(void* exc);          // <caught>.cause message (or "")
 
 // Netpoller (#80, design/0005 "Blocking syscalls"): non-blocking I/O readiness
 // for the M:N scheduler. A coroutine that would block on a not-yet-ready fd
@@ -422,10 +424,16 @@ with a Zap **personality function**:
   exception's type descriptor; `finally` and `with` cleanup run via cleanup
   landing pads during unwind.
 - The **exception object** is a GC-managed heap object containing a stable type
-  id and a message pointer. Its precise descriptor traces the message; a
-  registered runtime root keeps the in-flight value live while it is boxed in
-  the C++ unwinder's allocation.
+  id, a message pointer, and a `cause` pointer (the explicit `raise ... from`
+  chain, NULL otherwise — #604, D-0103). Its precise descriptor traces both the
+  message and the cause; a registered runtime root keeps the in-flight value
+  live while it is boxed in the C++ unwinder's allocation.
+- `raise ... from <cause>` calls `zap_exception_set_cause(exc, cause)` before
+  unwinding; `zap_exception_cause_message(exc)` reads the cause's message string
+  (empty when none) for the Zap `<caught>.cause` attribute.
 - An uncaught exception unwinds to the top frame and aborts with a stack trace.
+  A chained exception renders cause-first in two sections joined by the line
+  `The above exception was the direct cause of the following exception:`.
 
 ### REPL JIT entry points (I#159, design/0025-repl.md)
 

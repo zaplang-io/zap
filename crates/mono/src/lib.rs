@@ -1233,9 +1233,13 @@ impl Mono<'_> {
                 };
                 Stmt::Return { value, span: *span }
             }
-            Stmt::Raise { value, span } => Stmt::Raise {
+            Stmt::Raise { value, cause, span } => Stmt::Raise {
                 value: match value {
                     Some(v) => Some(self.rw(v, env)?),
+                    None => None,
+                },
+                cause: match cause {
+                    Some(c) => Some(self.rw(c, env)?),
                     None => None,
                 },
                 span: *span,

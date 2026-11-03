@@ -203,7 +203,7 @@ simple_stmt   ::= decl
                 | subst_assign
                 | send_stmt                          (* channel send, D-0031 *)
                 | "return" [ expr { "," expr } ]     (* bare comma-list -> tuple return, D-0049 *)
-                | "raise" [ expr ]
+                | "raise" [ expr [ "from" expr ] ]   (* "from": explicit cause chain, #604 D-0103 *)
                 | "assert" expr [ "," expr ]          (* power-assert; message, D-0054 *)
                 | "spawn" [ "detached" ] call_expr   (* "detached": D-0044 *)
                 | "break"
@@ -217,6 +217,10 @@ simple_stmt   ::= decl
                      followed by a terminator); in any other position it is an
                      ordinary identifier. It is also the explicit spelling of an
                      empty struct/enum body (see struct_body, enum). *)
+                  (* "from" is likewise a contextual word, not a reserved
+                     keyword (#604 D-0103): it introduces the cause clause only
+                     directly after a raised value in a `raise`; everywhere else
+                     it is an ordinary identifier. *)
 
 decl          ::= [ "const" ] ( type | "auto" ) bind_target "=" expr ;  (* D-0003, D-0049 *)
 assign        ::= bind_target "=" { bind_target "=" } expr ;

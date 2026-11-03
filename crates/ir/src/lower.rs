@@ -6150,7 +6150,7 @@ impl<'a> FnLower<'a> {
                 }
                 Ok(())
             }
-            Stmt::Raise { value, .. } => self.lower_raise(value.as_ref()),
+            Stmt::Raise { value, cause, .. } => self.lower_raise(value.as_ref(), cause.as_ref()),
             Stmt::Assert {
                 cond,
                 msg,
@@ -6647,7 +6647,11 @@ impl<'a> FnLower<'a> {
     /// `raise EXPR` begins unwinding with a typed exception value. Raising a
     /// string uses the compatibility `zap_panic` entry, which wraps it in the
     /// base `Exception` type.
-    fn lower_raise(&mut self, value: Option<&Expr>) -> Result<(), LowerError> {
+    fn lower_raise(
+        &mut self,
+        value: Option<&Expr>,
+        cause: Option<&Expr>,
+    ) -> Result<(), LowerError> {
         let Some(e) = value else {
             return Err(err("bare 'raise' (re-raise) is not supported yet"));
         };
@@ -6667,11 +6671,7 @@ impl<'a> FnLower<'a> {
                 func: "zap_exception_new".to_string(),
                 args: vec![ty, msg],
             });
-            self.throwing_call(None, "zap_raise", vec![exc]);
-            if !self.terminated() {
-                self.set_term(Term::Unreachable);
-            }
-            return Ok(());
+            return self.finish_raise(exc, cause);
         }
         if let Expr::Call { callee, args, .. } = e {
             if let Expr::Name(name, _) = callee.as_ref() {
@@ -6695,11 +6695,7 @@ impl<'a> FnLower<'a> {
                         func: "zap_exception_new".to_string(),
                         args: vec![id, message],
                     });
-                    self.throwing_call(None, "zap_raise", vec![exc]);
-                    if !self.terminated() {
-                        self.set_term(Term::Unreachable);
-                    }
-                    return Ok(());
+                    return self.finish_raise(exc, cause);
                 }
             }
         }
@@ -6709,11 +6705,72 @@ impl<'a> FnLower<'a> {
                 "raise currently expects a str value (the exception message)",
             ));
         }
-        self.throwing_call(None, "zap_panic", vec![v]);
+        // `raise "message"` with no `from` keeps the legacy `zap_panic` shape
+        // (the runtime wraps the string in a base `Exception`). A `from <cause>`
+        // needs a concrete exception object to carry the cause slot, so build
+        // one explicitly and route it through the shared raise path.
+        if cause.is_none() {
+            self.throwing_call(None, "zap_panic", vec![v]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+            return Ok(());
+        }
+        let id = self.iconst(Ty::I64, 2); // ZAP_EXC_EXCEPTION
+        let exc = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(exc),
+            func: "zap_exception_new".to_string(),
+            args: vec![id, v],
+        });
+        self.finish_raise(exc, cause)
+    }
+
+    /// Attach the optional `from <cause>` chain to the exception object `exc`
+    /// (#604, D-0103), then begin unwinding with it. The cause is stored in the
+    /// exception's `cause` slot so the uncaught renderer can print the cause's
+    /// own section above the new one; it is also readable from Zap as
+    /// `<caught>.cause`.
+    fn finish_raise(&mut self, exc: Value, cause: Option<&Expr>) -> Result<(), LowerError> {
+        if let Some(c) = cause {
+            let cobj = self.lower_cause(c)?;
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_exception_set_cause".to_string(),
+                args: vec![exc, cobj],
+            });
+        }
+        self.throwing_call(None, "zap_raise", vec![exc]);
         if !self.terminated() {
             self.set_term(Term::Unreachable);
         }
         Ok(())
+    }
+
+    /// Evaluate a `from <cause>` operand to an exception object. When the cause
+    /// names a caught exception binding, its real in-flight exception object is
+    /// reused (preserving the cause's own type id and chain); otherwise the
+    /// operand must be a str message, which is wrapped in a base `Exception`.
+    fn lower_cause(&mut self, cause: &Expr) -> Result<Value, LowerError> {
+        if let Expr::Name(n, _) = cause {
+            if let Some((obj_slot, _)) = self.lookup(&exc_obj_key(n)) {
+                return Ok(self.load(obj_slot, Ty::Ptr));
+            }
+        }
+        let (cv, ct) = self.expr(cause)?;
+        if ct != Ty::Ptr {
+            return Err(err(
+                "raise ... from <cause>: the cause must be a caught exception or a str message",
+            ));
+        }
+        let id = self.iconst(Ty::I64, 2); // ZAP_EXC_EXCEPTION
+        let obj = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(obj),
+            func: "zap_exception_new".to_string(),
+            args: vec![id, cv],
+        });
+        Ok(obj)
     }
 
     /// `assert cond [, msg]` (D-0054). Always evaluated in v1: the condition is
@@ -7050,6 +7107,7 @@ impl<'a> FnLower<'a> {
                             span: sp,
                             fstring_fields: Vec::new(),
                         }),
+                        cause: None,
                         span: sp,
                     }],
                     span: sp,
@@ -7170,6 +7228,12 @@ impl<'a> FnLower<'a> {
                 let slot = self.alloca(Ty::Ptr);
                 self.store(slot, message);
                 self.declare(bind, slot, Ty::Ptr);
+                // Stash the exception *object* under a scoped, non-typable key so
+                // `e.cause` and `raise ... from e` can reach the real exception
+                // (its type id and chain), not just the message string (#604).
+                let obj_slot = self.alloca(Ty::Ptr);
+                self.store(obj_slot, exc);
+                self.declare(&exc_obj_key(bind), obj_slot, Ty::Ptr);
             }
             let handler_lp = self.new_block();
             self.landing_pads.push(handler_lp);
@@ -8719,6 +8783,21 @@ impl<'a> FnLower<'a> {
                 if let Expr::Name(tyname, _) = base.as_ref() {
                     if self.ctx.enums.contains_key(tyname) {
                         return self.lower_enum_member(tyname, name);
+                    }
+                    // `e.cause` on a caught exception binding (#604, D-0103):
+                    // read the explicit cause's message string off the stashed
+                    // exception object (an empty str when there is no cause).
+                    if name == "cause" {
+                        if let Some((obj_slot, _)) = self.lookup(&exc_obj_key(tyname)) {
+                            let obj = self.load(obj_slot, Ty::Ptr);
+                            let d = self.new_value(Ty::Ptr);
+                            self.emit(Inst::Call {
+                                dest: Some(d),
+                                func: "zap_exception_cause_message".to_string(),
+                                args: vec![obj],
+                            });
+                            return Ok((d, Ty::Ptr));
+                        }
                     }
                     // Built-in module constant `math.pi`-style access (ticket
                     // #98), intercepted before the base is lowered as a value
@@ -15044,6 +15123,15 @@ fn exception_type_id(ty: &ast::Type) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+/// Scope-key under which a caught exception's *object* (not its message string)
+/// is stashed alongside the ordinary `except ... as e` binding, so attribute
+/// access `e.cause` / a later `raise ... from e` can reach the real exception
+/// object (#604, D-0103). The embedded NUL keeps it from colliding with any
+/// user-typable identifier.
+fn exc_obj_key(name: &str) -> String {
+    format!("\u{0}exc\u{0}{name}")
 }
 
 /// Stable per-name ids for user exception types. They use a disjoint range from
