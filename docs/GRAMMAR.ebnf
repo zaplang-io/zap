@@ -322,7 +322,17 @@ pattern       ::= or_pattern ;
 or_pattern    ::= closed_pattern { "|" closed_pattern } ;
 closed_pattern ::= "_"
                 | literal
-                | IDENT                          (* capture *)
+                | IDENT                          (* capture: a bare, undotted name binds *)
+                | dotted_name                    (* bare value pattern: a qualified
+                                                    constant / payload-free variant,
+                                                    e.g. `Color.RED`, `Day.SAT`,
+                                                    `Shape.Unit`, `Optional.None`. A
+                                                    dotted name with no "(" matches by
+                                                    value (parser parse_closed_pattern ->
+                                                    Pattern with no args; golden
+                                                    enum_tier1.zap `case Day.SAT:`). A
+                                                    single undotted name is the capture
+                                                    above, not a value pattern. *)
                 | dotted_name "(" [ pat_arg { "," pat_arg } ] ")"
                 | "[" [ seq_pat { "," seq_pat } ] "]"
                 | "(" [ pattern { "," pattern } ] ")" ;
@@ -383,13 +393,25 @@ atom          ::= literal
                 | "<-" postfix                    (* channel receive, D-0031 *)
                 | "(" [ expr { "," expr } [ "," ] ] ")"  (* grouping / tuple; (e,) = 1-tuple, D-0049 *)
                 | list_display
-                | dict_display ;
+                | brace_display ;
 
 list_display  ::= "[" [ expr { "," expr } | comp_for ] "]" ;
-dict_display  ::= "{" [ dict_items | dict_comp ] "}" ;
-dict_items    ::= expr ":" expr { "," expr ":" expr } ;
-comp_for      ::= expr "for" target "in" expr [ "if" expr ] ;   (* D-0026 *)
+brace_display ::= "{" [ dict_items | dict_comp | set_items | comp_for ] "}" ;
+                  (* A "{...}" display is a dict or a set. Empty "{}" is the
+                     empty DICT (there is no empty-set literal; build one with
+                     a constructor, e.g. set[T]()). A first element followed by
+                     ":" makes it a dict (dict_items / dict_comp); otherwise it
+                     is a set — a set literal (set_items) or a set comprehension
+                     (comp_for, the same element-first clause used by
+                     list_display). Set literals `{1, 2, 3}` and set
+                     comprehensions `{x for x in xs}` ship today (parser
+                     parse_brace/parse_set_rest produce Expr::Set / Expr::SetComp;
+                     goldens set_int.zap, set_str.zap). `set` is Stable
+                     (D-0076; graduation #608). *)
+dict_items    ::= expr ":" expr { "," expr ":" expr } [ "," ] ;
 dict_comp     ::= expr ":" expr "for" target "in" expr [ "if" expr ] ;
+set_items     ::= expr { "," expr } [ "," ] ;
+comp_for      ::= expr "for" target "in" expr [ "if" expr ] ;   (* D-0026 *)
 
 (* ---------- Literals & regex ---------- *)
 
@@ -423,8 +445,14 @@ dotted_name   ::= IDENT { "." IDENT } ;
               present and "None" when absent (#498), like Python's f"{d.get(k)}".
               spec = [[fill]align][sign]["#"]["0"][width]["." precision][type]
               (Python format mini-language subset; see SPEC §9.3).
-   TYPE_KEYWORD  int32 int64 float32 float64 i32 i64 f32 f64 bool char str
-                 bytes bigint complex list dict set heap array
+   TYPE_KEYWORD  int int32 int64 float float32 float64 i32 i64 f32 f64 bool
+                 char str bytes bigint complex list dict set heap array
+                 Python-facing scalar synonyms: `int` is the name for the 64-bit
+                 signed integer (= int64/i64, I#581 / PR #582) and `float` the
+                 name for the 64-bit double (= float64/f64), just as Python's
+                 `int`/`float`. Both are resolved as type names by sema, not
+                 reserved by the lexer, so they are spelled as IDENT in
+                 `type_name` and usable anywhere a type keyword is (`int x = 0`).
    DELIM      a regex delimiter char after m/s (e.g. "/", "{", "!")
    Comments   "#" to end of line. Discarded by the parser, but recoverable as
               trivia for tooling (zap fmt/doc) via tokenize_with_trivia (#225).

@@ -110,8 +110,10 @@ const f64 PI = 3.14159
 | `bigint` | arbitrary-precision signed integer (D-0019) |
 | `complex` | pair of IEEE-754 `float64` components (D-0019) |
 
-Short aliases `i32`, `i64`, `f32`, `f64` are available. All integers are
-**signed** (D-0019).
+Short aliases `i32`, `i64`, `f32`, `f64` are available, and the Python-facing
+names `int` (a synonym for `int64`, I#581) and `float` (a synonym for
+`float64`) are accepted wherever a type is written — `int x = 0` is `int64 x = 0`
+— just as in Python. All integers are **signed** (D-0019).
 
 **Conversions (D-0020):** widening is implicit (`int32→int64`, `int→float`);
 narrowing that can lose data is explicit (`int32(x)`, `int64(y)`).
@@ -169,7 +171,13 @@ auto xs = list[int64]([1, 2, 3])
 auto m  = dict[str, int64]({"a": 1, "b": 2})
 auto a  = array[f64]([1, 2, 3])          # dense numeric, SIMD (design/0002)
 auto h  = heap[int64]()                  # min-heap priority queue (D-0057; comparator optional)
+auto st = {1, 2, 3}                       # set[int64] — a brace set literal
 ```
+
+A `{...}` brace display is a **set literal** (`{1, 2, 3}`) unless its first
+element is followed by `:`, which makes it a dict; **empty `{}` is the empty
+dict** (there is no empty-set literal — build one with a constructor such as
+`set[T]()`). `set` is Stable (D-0076).
 
 (Tuples are **value** aggregates, not reference types — see §4.8.)
 
@@ -363,7 +371,11 @@ while line != ""          # trailing while (no colon) closes the do block
 ```
 
 **match-case** — Python-style structural pattern matching (D-0040): literals,
-capture, wildcard `_`, or-patterns, guards, and sequence/tuple/struct patterns.
+capture, wildcard `_`, or-patterns, guards, sequence/tuple/struct patterns, and
+**qualified value patterns** — a bare dotted name with no parentheses
+(`case Color.RED:`, `case Day.SAT:`, `case Shape.Unit:`) matches a tier-1 enum
+constant or a payload-free variant by value (a single undotted name is a
+capture, not a value pattern).
 Matches on `enum` scrutinees are checked for exhaustiveness at compile time.
 Tuple patterns require matching arity; list patterns require matching length.
 One `*rest` may appear anywhere in either pattern: it captures the middle as a
@@ -491,6 +503,7 @@ sum_all(1, 2, 3)                     # 6
 auto squares = [x*x for x in range(10)]
 auto evens   = [x for x in xs if x % 2 == 0]
 auto lookup  = {k: v*2 for k, v in items}
+auto uniq    = {x % 3 for x in xs}        # set comprehension -> set[int64]
 
 auto head = xs[0:3]       # list slice -> a copy (D-0030)
 auto view = a[0:3]        # array slice -> a view (D-0030)
