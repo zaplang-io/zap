@@ -207,24 +207,6 @@ fn golden_jobs() -> usize {
         .unwrap_or(2)
 }
 
-/// A fresh, unique temp directory for one fixture's child process. `zap run`
-/// writes (and execs) its compiled binary at `$TMPDIR/zap-<entry-stem>` (see
-/// `default_out` in the driver); every project fixture's entry is `main.zap`,
-/// so without isolation concurrent runs would clobber the same `zap-main`
-/// binary (wrong stdout, or `Text file busy` when one process execs it while
-/// another is still writing it). Pointing each child's `TMPDIR`/`TMP`/`TEMP` at
-/// its own directory keeps those output paths disjoint. Best-effort created;
-/// the caller removes it after the run.
-#[cfg(feature = "codegen")]
-fn fixture_tmpdir() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("zap-golden-{}-{n}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
 /// Run `work` over `items` on a bounded pool of `golden_jobs()` worker threads,
 /// then assert the aggregated outcome. Workers pull fixtures off a shared index
 /// so the pool stays bounded (no thread-per-fixture fan-out); each fixture's
@@ -330,11 +312,10 @@ fn golden_programs_match() {
                 }
             }
         }
-        // Isolate this fixture's compiled-binary output path (see `fixture_tmpdir`).
-        let tmp = fixture_tmpdir();
-        cmd.env("TMPDIR", &tmp).env("TMP", &tmp).env("TEMP", &tmp);
+        // `zap run` now writes its throwaway binary to a per-invocation unique
+        // temp dir (driver #634), so concurrent fixtures no longer collide and
+        // need no TMPDIR isolation here.
         let output = run_with_timeout(cmd, per_test, &zap.display().to_string());
-        let _ = std::fs::remove_dir_all(&tmp);
 
         let got = String::from_utf8_lossy(&output.stdout);
         let got_err = String::from_utf8_lossy(&output.stderr);
@@ -399,12 +380,10 @@ fn golden_projects_match() {
                 }
             }
         }
-        // Isolate this fixture's compiled-binary output path (see `fixture_tmpdir`):
-        // every project entry is `main.zap`, so all would share `$TMPDIR/zap-main`.
-        let tmp = fixture_tmpdir();
-        cmd.env("TMPDIR", &tmp).env("TMP", &tmp).env("TEMP", &tmp);
+        // Every project entry is `main.zap`, which used to collide at a shared
+        // `$TMPDIR/zap-main`; the driver's per-invocation unique output dir
+        // (#634) removes that collision, so no TMPDIR isolation is needed here.
         let output = run_with_timeout(cmd, per_test, &main.display().to_string());
-        let _ = std::fs::remove_dir_all(&tmp);
 
         let got = String::from_utf8_lossy(&output.stdout);
         let got_err = String::from_utf8_lossy(&output.stderr);

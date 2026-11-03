@@ -237,6 +237,13 @@ pub fn compile_for(
 }
 
 /// Default output path for a compile when `-o` is not given.
+///
+/// For a plain `zap build` the binary lands at `./<stem>` in the working
+/// directory (deterministic, user-visible). For `zap run` the binary is a
+/// throwaway: it goes inside a *unique* temp directory ([`unique_run_dir`]) so
+/// two concurrent `zap run` invocations never resolve to the same path and
+/// clobber each other (#634). The caller ([`backend`]) creates that directory
+/// and removes it after the run.
 fn default_out(file: &str, run_after: bool) -> PathBuf {
     let stem = Path::new(file)
         .file_stem()
@@ -244,10 +251,29 @@ fn default_out(file: &str, run_after: bool) -> PathBuf {
         .unwrap_or("a")
         .to_string();
     if run_after {
-        env::temp_dir().join(format!("zap-{stem}"))
+        unique_run_dir().join(format!("zap-{stem}"))
     } else {
         PathBuf::from(stem)
     }
+}
+
+/// A fresh, process-unique temp directory path for one `zap run`'s throwaway
+/// binary, under the system temp dir. The name combines the process id with a
+/// process-global counter (and a nanosecond clock reading), so every call —
+/// across concurrent processes and repeated calls within one process, even for
+/// the same entry file — yields a distinct path. Keyed this way rather than on
+/// the entry stem alone, the old `$TMPDIR/zap-<stem>` collision (#634) cannot
+/// happen. This only computes the path; it does not create the directory.
+fn unique_run_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    env::temp_dir().join(format!("zap-run-{}-{nanos}-{seq}", std::process::id()))
 }
 
 #[cfg(feature = "codegen")]
@@ -260,25 +286,55 @@ fn backend(
 ) -> ExitCode {
     use std::process::Command;
 
-    let exe: PathBuf = match out {
-        Some(o) => PathBuf::from(o),
-        None => default_out(file, run_after),
+    // The binary path, plus the throwaway temp dir we own and must remove (only
+    // for `zap run` without an explicit `-o`; see [`default_out`]).
+    let (exe, temp_dir): (PathBuf, Option<PathBuf>) = match out {
+        Some(o) => (PathBuf::from(o), None),
+        None => {
+            let exe = default_out(file, run_after);
+            // For a run, `exe` lives in a fresh unique dir we created here; keep
+            // its parent so it can be cleaned up afterwards.
+            let temp_dir = if run_after {
+                exe.parent().map(Path::to_path_buf)
+            } else {
+                None
+            };
+            (exe, temp_dir)
+        }
+    };
+
+    if let Some(dir) = &temp_dir {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("zap: failed to create temp dir {}: {e}", dir.display());
+            return ExitCode::from(1);
+        }
+    }
+
+    // Best-effort removal of the throwaway dir on every exit path below.
+    let cleanup = || {
+        if let Some(dir) = &temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     };
 
     if let Err(e) = zapc_codegen::build_executable(module, &exe, portable) {
         eprintln!("{file}: codegen error: {e}");
+        cleanup();
         return ExitCode::from(1);
     }
 
     if run_after {
-        match Command::new(&exe).status() {
+        let code = match Command::new(&exe).status() {
             Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
             Err(e) => {
                 eprintln!("zap: failed to run {}: {e}", exe.display());
                 ExitCode::from(1)
             }
-        }
+        };
+        cleanup();
+        code
     } else {
+        cleanup();
         ExitCode::SUCCESS
     }
 }
@@ -401,5 +457,51 @@ mod render_tests {
             out,
             vec!["/no/such/file.zap: error[ZAP6001]: lowering failed"]
         );
+    }
+}
+
+#[cfg(test)]
+mod out_path_tests {
+    use super::default_out;
+    use std::path::Path;
+
+    /// `zap build` (no run) keeps the deterministic `./<stem>` path so the
+    /// built artifact is predictable and user-visible.
+    #[test]
+    fn build_output_is_the_bare_stem_in_the_cwd() {
+        assert_eq!(default_out("foo/bar/main.zap", false), Path::new("main"));
+    }
+
+    /// `zap run` output paths must never collide: two different entries, and —
+    /// crucially for concurrent runs of the same program — two calls for the
+    /// *same* entry, each resolve to a distinct throwaway path under the system
+    /// temp dir (#634).
+    #[test]
+    fn run_output_paths_are_unique_and_under_temp_dir() {
+        let a = default_out("alpha/main.zap", true);
+        let b = default_out("beta/main.zap", true);
+        let same1 = default_out("alpha/main.zap", true);
+        let same2 = default_out("alpha/main.zap", true);
+
+        // Different entries never share a path, and neither do repeated calls
+        // for one entry (the collision that bit concurrent `zap run`).
+        assert_ne!(a, b);
+        assert_ne!(same1, same2);
+        assert_ne!(a, same1);
+
+        // Each binary sits inside its own fresh dir under the system temp dir.
+        let temp = std::env::temp_dir();
+        for p in [&a, &b, &same1, &same2] {
+            let dir = p.parent().expect("run binary has a parent temp dir");
+            assert!(
+                dir.starts_with(&temp),
+                "{} should be under the system temp dir {}",
+                p.display(),
+                temp.display()
+            );
+            assert_ne!(dir, temp, "the binary must live in its own subdirectory");
+        }
+        // The per-run directories themselves are distinct.
+        assert_ne!(same1.parent(), same2.parent());
     }
 }
