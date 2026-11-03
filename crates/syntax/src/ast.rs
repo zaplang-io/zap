@@ -369,6 +369,18 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// Chained assignment `t0 = t1 = ... = value` (#594). The right-hand `value`
+    /// is evaluated exactly once and assigned to every target left to right
+    /// (Python semantics). `targets` holds the two-or-more lvalues; each is an
+    /// ordinary single-assignment target (a name, a subscript, or a field) and,
+    /// like a plain `Assign`, must already be a declared binding — chained
+    /// assignment never introduces a new binding (declarations stay type-first /
+    /// `auto`, D-0003).
+    AssignChain {
+        targets: Vec<Expr>,
+        value: Expr,
+        span: Span,
+    },
     /// An expression evaluated for effect.
     Expr(Expr),
     /// `if` / `elif` / `else`.
@@ -486,6 +498,15 @@ pub enum Stmt {
     /// statement-position word, not a reserved keyword, so it remains usable as
     /// an ordinary identifier in every other position.
     Pass(Span),
+    /// `del d[k]` / `del xs[i]` — element removal (#595). `target` is always an
+    /// [`Expr::Index`]: this statement is scoped to subscript targets (dict key
+    /// removal and list element removal) and never deletes a binding. Like
+    /// `pass`, `del` is a contextual statement-position word, not a reserved
+    /// keyword, so `del` stays usable as an ordinary identifier everywhere else.
+    Del {
+        target: Expr,
+        span: Span,
+    },
 }
 
 /// A destructuring bind target (D-0049), used by [`Stmt::LetTuple`] and

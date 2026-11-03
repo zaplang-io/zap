@@ -1234,6 +1234,13 @@ impl Walk {
                 self.expr(target);
                 self.expr(value);
             }
+            Stmt::AssignChain { targets, value, .. } => {
+                for target in targets {
+                    self.expr(target);
+                }
+                self.expr(value);
+            }
+            Stmt::Del { target, .. } => self.expr(target),
             Stmt::AugAssign { target, value, .. } => {
                 self.expr(target);
                 self.expr(value);

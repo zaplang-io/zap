@@ -875,6 +875,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), i.into(), i.into()],
             None,
         );
+        // list element removal `del xs[i]` (#595): normalize + bounds-check the
+        // index (same `IndexError` as a read) and shift the tail down one slot.
+        self.declare_rt("zap_list_del_at", &[p.into(), i.into()], None);
         // dict
         self.declare_rt("zap_dict_new", &[], Some(p.into()));
         self.declare_rt("zap_dict_len", &[p.into()], Some(i.into()));
@@ -940,6 +943,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             "zap_dict_get_fn_ptr",
             &[p.into(), p.into(), p.into(), p.into()],
             Some(p.into()),
+        );
+        // dict key removal `del d[k]` (#595): probe for the key and tombstone the
+        // slot (reusing the open-addressing probe of set/get). A missing key is a
+        // no-op, matching the current non-raising dict read (`KeyError` is #22).
+        // The `_fn` form carries the struct key's `__hash__`/`__eq__` pointers.
+        self.declare_rt("zap_dict_del_i64", &[p.into(), i.into()], None);
+        self.declare_rt("zap_dict_del_str", &[p.into(), p.into()], None);
+        self.declare_rt(
+            "zap_dict_del_fn",
+            &[p.into(), p.into(), p.into(), p.into()],
+            None,
         );
         // dict enumeration / membership / shallow copy (ticket #299). Keys and
         // values are snapshotted into a fresh list (word kind picked by codegen);

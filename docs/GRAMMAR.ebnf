@@ -200,6 +200,7 @@ simple_stmt   ::= decl
                 | "break"
                 | "continue"
                 | "pass"                             (* no-op statement, #591 *)
+                | del_stmt                           (* element removal, #595 *)
                 | expr ;                       (* ";" may join simple stmts *)
                   (* "pass" is a contextual statement-position word, not a
                      reserved keyword: it is a no-op statement (lowers to no IR)
@@ -209,9 +210,30 @@ simple_stmt   ::= decl
                      empty struct/enum body (see struct_body, enum). *)
 
 decl          ::= [ "const" ] ( type | "auto" ) bind_target "=" expr ;  (* D-0003, D-0049 *)
-assign        ::= bind_target "=" expr ;
+assign        ::= bind_target "=" { bind_target "=" } expr ;
+                  (* Chained assignment `a = b = c` (#594): the final `expr` is
+                     evaluated EXACTLY ONCE and assigned to every target, left to
+                     right (Python semantics). A chained target is an ordinary
+                     single-assignment lvalue (name, index, or attribute) and,
+                     like a plain assign, must already be a declared binding —
+                     chained assignment never introduces a binding (declarations
+                     stay type-first / `auto`, D-0003). The zero-repetition case
+                     is the ordinary single assignment. *)
 aug_assign    ::= target aug_op expr ;
 subst_assign  ::= target "~=" subst_regex ;    (* in-place substitution, D-0010 *)
+del_stmt      ::= "del" index_target ;
+                  (* Element removal `del d[k]` / `del xs[i]` (#595). Scoped to
+                     SUBSCRIPT targets: a dict entry removed by key, a list
+                     element removed by index — it reuses the collection's own
+                     storage operation, so a missing dict key is a no-op (as the
+                     non-raising dict read `d[k]` is; real KeyError is #22) and an
+                     out-of-range list index raises the same IndexError as a read.
+                     Deleting a binding (`del name`) is NOT supported. Like
+                     `pass`, `del` is a contextual statement-position word, not a
+                     reserved keyword: it is the removal statement only when
+                     immediately followed by another identifier, and stays an
+                     ordinary identifier everywhere else. *)
+index_target  ::= target ;                     (* must resolve to an `atom trailer+` ending in "[" expr "]" *)
 aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**="
                 | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
                   (* Operator overloading (D-0047) is semantic, not grammatical:

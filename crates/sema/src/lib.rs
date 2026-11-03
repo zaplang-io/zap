@@ -2346,6 +2346,57 @@ impl Checker {
                     self.infer(target);
                 }
             }
+            Stmt::AssignChain { targets, value, .. } => {
+                // Chained assignment `t0 = t1 = ... = value` (#594): the RHS is
+                // evaluated once and assigned to every target. Each target is
+                // checked with exactly the same rule as a single `Assign` — a
+                // name must already be a declared binding (chained assignment
+                // never declares), a subscript/field is checked by inference,
+                // and any other form is not a valid assignment target.
+                let vt = self.infer(value);
+                for target in targets {
+                    match target {
+                        Expr::Name(n, span) => match self.lookup(n) {
+                            Some(dt) => {
+                                if !self.coercible(&vt, &dt) {
+                                    self.error(
+                                        ErrorCode::ZAP4001,
+                                        format!(
+                                            "cannot assign value of type {} to {} of type {}",
+                                            vt.display(),
+                                            n,
+                                            dt.display()
+                                        ),
+                                        expr_span(value),
+                                    );
+                                }
+                            }
+                            None => self.error(
+                                ErrorCode::ZAP3002,
+                                format!("assignment to undeclared variable '{n}'"),
+                                *span,
+                            ),
+                        },
+                        Expr::Index { .. } | Expr::Attr { .. } => {
+                            self.infer(target);
+                        }
+                        other => self.error(
+                            ErrorCode::ZAP4001,
+                            "a chained-assignment target must be a name, a subscript, \
+                             or a field"
+                                .to_string(),
+                            expr_span(other),
+                        ),
+                    }
+                }
+            }
+            Stmt::Del { target, .. } => {
+                // `del d[k]` / `del xs[i]` (#595). The parser guarantees the
+                // target is a subscript; inferring it type-checks the base and
+                // the key/index exactly as the corresponding read `d[k]` would,
+                // which is also what the removal lowering reuses.
+                self.infer(target);
+            }
             Stmt::AugAssign {
                 target, op, value, ..
             } => {
@@ -5459,6 +5510,53 @@ mod tests {
     fn ok(src: &str) {
         let e = errors(src);
         assert!(e.is_empty(), "unexpected type errors: {e:?}");
+    }
+
+    #[test]
+    fn chained_assignment_type_checks(/* #594 */) {
+        // Names and subscript targets, with the one RHS assignable to each.
+        ok(r#"
+def main():
+    int64 a = 0
+    int64 b = 0
+    a = b = 5
+    list[int64] xs = [1, 2, 3]
+    dict[str, int64] d = {"k": 0}
+    xs[0] = d["k"] = 9
+"#);
+    }
+
+    #[test]
+    fn chained_assignment_to_undeclared_is_rejected(/* #594 */) {
+        // A chained target is never a declaration: an unknown name is ZAP3002,
+        // exactly as a single reassignment to an undeclared variable is.
+        let e = errors("def main():\n    int64 a = 0\n    a = zzz = 5\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP3002),
+            "expected ZAP3002, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn chained_assignment_type_mismatch_is_rejected(/* #594 */) {
+        // The single RHS must be assignable to every target; a str RHS against
+        // an int64 target is ZAP4001.
+        let e = errors("def main():\n    int64 a = 0\n    int64 b = 0\n    a = b = \"x\"\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4001),
+            "expected ZAP4001, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn del_element_type_checks(/* #595 */) {
+        ok(r#"
+def main():
+    list[int64] xs = [1, 2, 3]
+    dict[str, int64] d = {"a": 1}
+    del xs[0]
+    del d["a"]
+"#);
     }
 
     #[test]

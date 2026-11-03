@@ -273,6 +273,8 @@ fn resolve_in_stmt(stmt: &mut Stmt, target: &Target) {
         // Statements with no nested statement blocks.
         Stmt::Let { .. }
         | Stmt::Assign { .. }
+        | Stmt::AssignChain { .. }
+        | Stmt::Del { .. }
         | Stmt::AugAssign { .. }
         | Stmt::Expr(_)
         | Stmt::Return { .. }

@@ -1106,6 +1106,31 @@ impl Mono<'_> {
                     span: *span,
                 }
             }
+            Stmt::AssignChain {
+                targets,
+                value,
+                span,
+            } => {
+                // Each target drives the expected type of the one evaluated RHS;
+                // rewrite the value against the first target's type (the targets
+                // are mutually assignable or sema already erred) and rewrite the
+                // targets themselves.
+                let expected = targets.first().and_then(|t| cty_type(self.infer(t, env)));
+                let (value, _) = self.rewrite_expr(value, env, expected.as_ref())?;
+                let mut new_targets = Vec::with_capacity(targets.len());
+                for t in targets {
+                    new_targets.push(self.rw(t, env)?);
+                }
+                Stmt::AssignChain {
+                    targets: new_targets,
+                    value,
+                    span: *span,
+                }
+            }
+            Stmt::Del { target, span } => Stmt::Del {
+                target: self.rw(target, env)?,
+                span: *span,
+            },
             Stmt::AugAssign {
                 target,
                 op,

@@ -47,6 +47,13 @@ fn each_yield_in_stmt<'a>(st: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)) {
             each_yield_in_expr(target, visit);
             each_yield_in_expr(value, visit);
         }
+        Stmt::AssignChain { targets, value, .. } => {
+            for target in targets {
+                each_yield_in_expr(target, visit);
+            }
+            each_yield_in_expr(value, visit);
+        }
+        Stmt::Del { target, .. } => each_yield_in_expr(target, visit),
         Stmt::AugAssign { target, value, .. } => {
             each_yield_in_expr(target, visit);
             each_yield_in_expr(value, visit);

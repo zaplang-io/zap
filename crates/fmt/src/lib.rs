@@ -571,6 +571,28 @@ impl<'a> Printer<'a> {
                 self.take_trailing(span.end);
                 self.last_end = span.end;
             }
+            Stmt::AssignChain {
+                targets,
+                value,
+                span,
+            } => {
+                // `t0 = t1 = ... = value` (#594): render every target joined by
+                // ` = `, then the one shared right-hand side.
+                let mut prefix = String::new();
+                for target in targets {
+                    prefix.push_str(&render(target));
+                    prefix.push_str(" = ");
+                }
+                self.emit_value(&prefix, value, "");
+                self.take_trailing(span.end);
+                self.last_end = span.end;
+            }
+            Stmt::Del { target, span } => {
+                // `del d[k]` / `del xs[i]` (#595).
+                self.push_line(&format!("del {}", render(target)));
+                self.take_trailing(span.end);
+                self.last_end = span.end;
+            }
             Stmt::AssignTuple {
                 target,
                 value,
@@ -1032,6 +1054,8 @@ fn stmt_span(s: &Stmt) -> Span {
     match s {
         Stmt::Let { span, .. }
         | Stmt::Assign { span, .. }
+        | Stmt::AssignChain { span, .. }
+        | Stmt::Del { span, .. }
         | Stmt::AugAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }
