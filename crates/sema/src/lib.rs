@@ -3537,7 +3537,7 @@ impl Checker {
                 }
                 Ty::Bool
             }
-            In => Ty::Bool,
+            In | NotIn => Ty::Bool,
             And | Or => Ty::Bool,
             // Channel send `ch <- v` (ticket #25, D-0031): the left operand must
             // be a channel and the value must be assignable to its element type.

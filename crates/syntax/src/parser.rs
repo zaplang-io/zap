@@ -2883,11 +2883,12 @@ impl Parser {
                 continue;
             }
             // `not in` membership (#593): the two-token negated-membership
-            // operator, at the same precedence as `in` (30). It desugars to
-            // `not (lhs in rhs)` so it type-checks (operand rules of `in`,
-            // result `bool`) and lowers identically to the negation of `in`.
-            // `not` stays a prefix operator and `in` an infix operator in every
-            // other position.
+            // operator, at the same precedence as `in` (30). It type-checks
+            // (operand rules of `in`, result `bool`) and lowers identically to
+            // the negation of `in`. `not` stays a prefix operator and `in` an
+            // infix operator in every other position. Unlike `in`, it does not
+            // chain, so it is emitted as a lone `Binary` rather than joining an
+            // `Expr::Compare` run.
             if self.is_kw(Keyword::Not) && matches!(self.peek2(), TokenKind::Keyword(Keyword::In)) {
                 if 30 < min_bp {
                     break;
@@ -2895,15 +2896,10 @@ impl Parser {
                 self.bump(); // `not`
                 self.bump(); // `in`
                 let rhs = self.parse_bin(31);
-                let in_expr = Expr::Binary {
-                    op: BinOp::In,
+                lhs = Expr::Binary {
+                    op: BinOp::NotIn,
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
-                    span: self.span_from(start),
-                };
-                lhs = Expr::Unary {
-                    op: UnOp::Not,
-                    expr: Box::new(in_expr),
                     span: self.span_from(start),
                 };
                 continue;
@@ -2963,9 +2959,9 @@ impl Parser {
     /// Whether `op` is a comparison operator that participates in Python-style
     /// comparison chaining (`<`, `<=`, `>`, `>=`, `==`, `!=`, `in`). The regex
     /// binds (`=~`/`!~`), `Send`, and the bitwise/arithmetic operators do not
-    /// chain. `not in` (#593) is parsed as a standalone negated-membership
-    /// comparison that desugars to `not (lhs in rhs)` and does not chain; Zap
-    /// has no `is`/`is not` operators (see [`BinOp`]).
+    /// chain. `not in` (#593, [`BinOp::NotIn`]) is a standalone negated-
+    /// membership comparison that does not chain; Zap has no `is`/`is not`
+    /// operators (see [`BinOp`]).
     fn is_chain_cmp(op: BinOp) -> bool {
         matches!(
             op,
@@ -4180,9 +4176,8 @@ def demo(int64 n):
     }
 
     #[test]
-    fn not_in_desugars_to_negated_membership(/* #593 */) {
-        // `x not in xs` parses identically to `not (x in xs)`:
-        // `Unary(Not, Binary(In, x, xs))`.
+    fn not_in_parses_as_first_class_operator(/* #593 */) {
+        // `x not in xs` is a first-class `Binary` with `BinOp::NotIn`.
         let m = parse_ok("def main():\n    bool b = 5 not in xs\n");
         let Item::Function(f) = &m.items[0] else {
             panic!("fn");
@@ -4190,21 +4185,16 @@ def demo(int64 n):
         let Stmt::Let { value, .. } = &f.body.stmts[0] else {
             panic!("let");
         };
-        let Expr::Unary { op, expr, .. } = value else {
-            panic!("expected unary not, got {value:?}");
+        let Expr::Binary { op, .. } = value else {
+            panic!("expected a binary `not in`, got {value:?}");
         };
-        assert_eq!(*op, UnOp::Not);
-        let Expr::Binary { op, .. } = expr.as_ref() else {
-            panic!("expected inner `in` binary");
-        };
-        assert_eq!(*op, BinOp::In);
+        assert_eq!(*op, BinOp::NotIn);
     }
 
     #[test]
     fn not_in_mirrors_in_precedence(/* #593 */) {
         // `not in` binds at the same (comparison) precedence as `in`, below the
-        // arithmetic operators: `x + 1 not in xs` groups as `(x + 1) not in xs`,
-        // i.e. `not ((x + 1) in xs)`.
+        // arithmetic operators: `x + 1 not in xs` groups as `(x + 1) not in xs`.
         let m = parse_ok("def main():\n    bool b = x + 1 not in xs\n");
         let Item::Function(f) = &m.items[0] else {
             panic!("fn");
@@ -4212,14 +4202,11 @@ def demo(int64 n):
         let Stmt::Let { value, .. } = &f.body.stmts[0] else {
             panic!("let");
         };
-        let Expr::Unary { expr, .. } = value else {
-            panic!("unary");
+        let Expr::Binary { op, lhs, .. } = value else {
+            panic!("expected `not in` binary");
         };
-        let Expr::Binary { op, lhs, .. } = expr.as_ref() else {
-            panic!("inner in");
-        };
-        assert_eq!(*op, BinOp::In);
-        // The left operand of `in` is the whole `x + 1`, not just `1`.
+        assert_eq!(*op, BinOp::NotIn);
+        // The left operand is the whole `x + 1`, not just `1`.
         assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
     }
 

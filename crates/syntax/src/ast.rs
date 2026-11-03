@@ -766,6 +766,7 @@ pub enum BinOp {
     Gt,       // >
     Ge,       // >=
     In,       // in  (membership)
+    NotIn,    // not in  (negated membership, #593)
     Send,     // ch <- v  (channel send, D-0031)
 }
 
@@ -809,6 +810,7 @@ pub fn binop_str(op: BinOp) -> &'static str {
         Gt => ">",
         Ge => ">=",
         In => "in",
+        NotIn => "not in",
         Send => "<-",
     }
 }

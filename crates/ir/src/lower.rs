@@ -12869,6 +12869,22 @@ impl<'a> FnLower<'a> {
     ) -> Result<(Value, Ty), LowerError> {
         use AstBin::*;
 
+        // `not in` (#593): negated membership. Reuse the `in` lowering verbatim
+        // (the membership probe that dispatches on the right operand) and negate
+        // its boolean result, so `x not in xs` lowers identically to
+        // `not (x in xs)` — no separate membership path, no codegen surface.
+        if matches!(op, NotIn) {
+            let (b, bt) = self.binop(In, l, lt, r, rt)?;
+            let bi = self.truthy(b, bt);
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::Un {
+                dest: d,
+                op: UnOp::Not,
+                val: bi,
+            });
+            return Ok((d, Ty::I1));
+        }
+
         // Channel send `ch <- v` (ticket #25, D-0031): handled before the
         // generic reference-type guard below, since the channel operand is a
         // reference type. Blocks until the value can be delivered; the element
@@ -13565,6 +13581,7 @@ impl<'a> FnLower<'a> {
                 Ok((d, Ty::I1))
             }
             In => Err(err("'in' is not supported by codegen yet")),
+            NotIn => unreachable!("'not in' is rewritten to a negated 'in' in binop()"),
             // `Send` is intercepted at the top of `binop` (before the generic
             // reference-type guard), so it never reaches here.
             Send => unreachable!("channel send handled above"),

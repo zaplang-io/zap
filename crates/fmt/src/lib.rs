@@ -1156,14 +1156,12 @@ mod tests {
     }
 
     #[test]
-    fn not_in_normalizes_to_prefix_not() {
-        // #593: `not in` is parsed as `not (x in xs)` (it has no dedicated AST
-        // node), so the formatter renders it in the equivalent prefix-`not`
-        // form. The result is stable (idempotent) and semantically identical.
-        let formatted = format_source("def f():\n    bool b = x not in xs\n").unwrap();
-        assert_eq!(formatted, "def f():\n    bool b = not x in xs\n");
-        // Idempotent: formatting again is a fixpoint.
-        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    fn not_in_round_trips() {
+        // #593: `not in` is a first-class operator (`BinOp::NotIn`), so the
+        // formatter renders it back verbatim rather than rewriting it to a
+        // prefix `not`.
+        let source = "def f():\n    bool b = x not in xs\n";
+        assert_eq!(format_source(source).unwrap(), source);
     }
 
     #[test]

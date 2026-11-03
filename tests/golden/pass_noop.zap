@@ -5,8 +5,10 @@
 struct Empty:
     pass
 
+
 enum Nothing:
     pass
+
 
 def classify(int64 n) -> int64:
     if n > 0:
