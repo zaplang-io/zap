@@ -130,6 +130,44 @@ fn lower(
             });
             Ok(Some((d, Ty::Ptr)))
         }
+        // crypto.rsa_<hash>_sign(pem_key, data) -> bytes (#628): the raw PKCS#1
+        // v1.5 signature. Both args are str/bytes (Ptr), passed straight through.
+        "rsa_sha1_sign" | "rsa_sha256_sign" => {
+            if args.len() != 2 {
+                return Err(err("crypto.rsa_*_sign takes exactly two arguments"));
+            }
+            let func = if method == "rsa_sha1_sign" {
+                "zap_crypto_rsa_sha1_sign"
+            } else {
+                "zap_crypto_rsa_sha256_sign"
+            };
+            let (key, _) = lowerer.expr(&args[0].value)?;
+            let (data, _) = lowerer.expr(&args[1].value)?;
+            let d = lowerer.new_value(Ty::Ptr);
+            lowerer.emit(Inst::Call {
+                dest: Some(d),
+                func: func.to_string(),
+                args: vec![key, data],
+            });
+            Ok(Some((d, Ty::Ptr)))
+        }
+        // crypto.rsa_sha256_verify(pem_pubkey, data, sig) -> bool (#628). The
+        // runtime returns an i64 (0/1); the compare-to-zero yields the i1 `bool`.
+        "rsa_sha256_verify" => {
+            if args.len() != 3 {
+                return Err(err(
+                    "crypto.rsa_sha256_verify takes exactly three arguments",
+                ));
+            }
+            let (key, _) = lowerer.expr(&args[0].value)?;
+            let (data, _) = lowerer.expr(&args[1].value)?;
+            let (sig, _) = lowerer.expr(&args[2].value)?;
+            Ok(Some(super::support::call_bool(
+                lowerer,
+                "zap_crypto_rsa_sha256_verify",
+                vec![key, data, sig],
+            )))
+        }
         // crypto.random_bytes(n) / crypto.token_hex(n): count coerces to i64.
         "random_bytes" | "token_hex" => {
             if args.len() != 1 {

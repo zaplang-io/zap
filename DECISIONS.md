@@ -3010,3 +3010,41 @@ jobs, plus sema/ir unit tests on host.
 `@cache` (memoization), `@deprecated` (use-site diagnostic), and `@inject` (DI,
 cf. zap#312/fastzap#7). The locked spec surface and stability table are
 unchanged; this decision records the realization of part of it.
+
+## D-0102 — `crypto` RSA PKCS#1 v1.5 signing (I#628)
+
+The `crypto` module (D-0056) shipped hashing, HMAC and a CSPRNG but no RSA, so
+there was no way to load an RSA private key or produce an RSA signature. This
+blocked the AWS SDK's CloudFront signed-URL/cookie helper (zaplang-io/aws#25,
+#440), which signs a policy document with `RSA-SHA1(key-pair-private-key, …)`
+(not SigV4). Per the language-first policy the helper did not work around the
+gap — it takes the signature as an injected `fn(bytes) -> bytes` seam — and the
+primitive lands here instead.
+
+- **Surface.** `crypto.rsa_sha1_sign(pem_key, data) -> bytes` and
+  `crypto.rsa_sha256_sign(pem_key, data) -> bytes` return the RAW PKCS#1 v1.5
+  signature over the message digest (binary, not hex/base64); the caller applies
+  any base64 / CloudFront variant. `crypto.rsa_sha256_verify(pem_pubkey, data,
+  sig) -> bool` verifies a signature, giving a self-checking test oracle. Key
+  and data accept `str` or `bytes` (the shared `ZapStr` layout), via the module's
+  existing `expect_data` check; argument-count errors are the usual ZAP4025.
+- **PEM.** The private-key PEM may be PKCS#1 (`BEGIN RSA PRIVATE KEY`) or PKCS#8
+  (`BEGIN PRIVATE KEY`); `PEM_read_bio_PrivateKey` handles both transparently.
+  A malformed key or a signing failure raises a catchable `ValueError` (D-0007);
+  a bad verify key or a mismatched signature is a plain `false`, never a panic.
+- **Backend.** These are the only OpenSSL-backed entries in `crypto` — the
+  hashing/HMAC/CSPRNG section stays a self-contained FIPS/RFC reference
+  implementation, but RSA (bignum modexp + ASN.1 key parsing) would be a large,
+  security-sensitive reimplementation, and OpenSSL is already linked
+  (`-lssl -lcrypto`) for `tls` (D-0062). The runtime (`zaprt.c`, crypto-RSA
+  banner below the OpenSSL includes) uses `EVP_DigestSign`/`EVP_DigestVerify`
+  over `EVP_sha1()`/`EVP_sha256()`, so no new dependency. GC discipline mirrors
+  the hash one-shots: no safepoint runs across the EVP calls, the OpenSSL
+  objects are non-GC heap freed before return, and the GC `bytes` result is the
+  final allocation.
+
+Verified by the `crypto_rsa` golden (a fixed 2048-bit test key pair in both
+PKCS#1 and PKCS#8 PEM, asserting both encodings sign identically, pinning the
+deterministic RSA-SHA1 and RSA-SHA256 signature fingerprints, and checking
+verify accepts the genuine signature and rejects a tampered message) under the
+full-codegen CI jobs, plus the sema/ir unit suites on host.
