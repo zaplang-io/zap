@@ -1547,6 +1547,18 @@ impl Parser {
         self.expect(&TokenKind::Indent, "indented block");
         while !self.is(&TokenKind::Dedent) && !self.at_eof() {
             let before = self.pos;
+            // A bare `pass` is the explicit spelling of an empty struct body
+            // (#591), mirroring the empty-enum case; it declares no field.
+            if matches!(self.peek(), TokenKind::Ident(name) if name == "pass")
+                && matches!(
+                    self.peek2(),
+                    TokenKind::Newline | TokenKind::Dedent | TokenKind::Eof
+                )
+            {
+                self.bump();
+                self.expect(&TokenKind::Newline, "newline after 'pass'");
+                continue;
+            }
             let decos = self.parse_decorators();
             if self.is_kw(Keyword::Def) {
                 methods.push(self.parse_function(decos));
@@ -2318,6 +2330,21 @@ impl Parser {
 
     fn parse_simple_stmt(&mut self) -> Stmt {
         let start = self.peek_span().start;
+        // `pass` is a contextual no-op statement (#591), not a reserved keyword,
+        // so it stays usable as an identifier everywhere else. It is recognized
+        // only when it stands alone as a statement: the bare word `pass`
+        // immediately followed by a statement terminator. In any other position
+        // (`pass = x`, `pass(...)`, `pass.foo`, `f(pass)`) it falls through and
+        // parses as an ordinary identifier.
+        if matches!(self.peek(), TokenKind::Ident(n) if n == "pass")
+            && matches!(
+                self.peek2(),
+                TokenKind::Newline | TokenKind::Semicolon | TokenKind::Dedent | TokenKind::Eof
+            )
+        {
+            self.bump();
+            return Stmt::Pass(self.span_from(start));
+        }
         if self.eat_kw(Keyword::Return) {
             let value = if self.at_line_end() {
                 None
@@ -2855,6 +2882,32 @@ impl Parser {
                 lhs = self.parse_regex_rhs(lhs, negated, start);
                 continue;
             }
+            // `not in` membership (#593): the two-token negated-membership
+            // operator, at the same precedence as `in` (30). It desugars to
+            // `not (lhs in rhs)` so it type-checks (operand rules of `in`,
+            // result `bool`) and lowers identically to the negation of `in`.
+            // `not` stays a prefix operator and `in` an infix operator in every
+            // other position.
+            if self.is_kw(Keyword::Not) && matches!(self.peek2(), TokenKind::Keyword(Keyword::In)) {
+                if 30 < min_bp {
+                    break;
+                }
+                self.bump(); // `not`
+                self.bump(); // `in`
+                let rhs = self.parse_bin(31);
+                let in_expr = Expr::Binary {
+                    op: BinOp::In,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    span: self.span_from(start),
+                };
+                lhs = Expr::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(in_expr),
+                    span: self.span_from(start),
+                };
+                continue;
+            }
             let Some((bp, op)) = self.bin_bp() else {
                 break;
             };
@@ -2910,7 +2963,9 @@ impl Parser {
     /// Whether `op` is a comparison operator that participates in Python-style
     /// comparison chaining (`<`, `<=`, `>`, `>=`, `==`, `!=`, `in`). The regex
     /// binds (`=~`/`!~`), `Send`, and the bitwise/arithmetic operators do not
-    /// chain. Zap has no `is`/`is not`/`not in` operators (see [`BinOp`]).
+    /// chain. `not in` (#593) is parsed as a standalone negated-membership
+    /// comparison that desugars to `not (lhs in rhs)` and does not chain; Zap
+    /// has no `is`/`is not` operators (see [`BinOp`]).
     fn is_chain_cmp(op: BinOp) -> bool {
         matches!(
             op,
@@ -4031,6 +4086,148 @@ mod tests {
             panic!("enum");
         };
         assert!(e.variants.is_empty());
+    }
+
+    #[test]
+    fn pass_is_a_no_op_statement(/* #591 */) {
+        // `pass` is accepted anywhere a statement is expected and parses to a
+        // single `Stmt::Pass` — a function body, every branch of a compound
+        // statement, and `scope`.
+        let src = "\
+def demo(int64 n):
+    if n > 0:
+        pass
+    else:
+        pass
+    for i in range(n):
+        pass
+    while False:
+        pass
+    try:
+        pass
+    except ValueError as e:
+        pass
+    finally:
+        pass
+    scope:
+        pass
+";
+        let m = parse_ok(src);
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        // if / for / while / try / scope
+        let Stmt::If {
+            branches,
+            else_block,
+            ..
+        } = &f.body.stmts[0]
+        else {
+            panic!("if");
+        };
+        assert!(matches!(branches[0].1.stmts[0], Stmt::Pass(_)));
+        assert!(matches!(
+            else_block.as_ref().unwrap().stmts[0],
+            Stmt::Pass(_)
+        ));
+        let Stmt::For { body, .. } = &f.body.stmts[1] else {
+            panic!("for");
+        };
+        assert!(matches!(body.stmts[0], Stmt::Pass(_)));
+        let Stmt::While { body, .. } = &f.body.stmts[2] else {
+            panic!("while");
+        };
+        assert!(matches!(body.stmts[0], Stmt::Pass(_)));
+        let Stmt::Try {
+            body,
+            excepts,
+            finally,
+            ..
+        } = &f.body.stmts[3]
+        else {
+            panic!("try");
+        };
+        assert!(matches!(body.stmts[0], Stmt::Pass(_)));
+        assert!(matches!(excepts[0].body.stmts[0], Stmt::Pass(_)));
+        assert!(matches!(finally.as_ref().unwrap().stmts[0], Stmt::Pass(_)));
+        let Stmt::Scope { body, .. } = &f.body.stmts[4] else {
+            panic!("scope");
+        };
+        assert!(matches!(body.stmts[0], Stmt::Pass(_)));
+    }
+
+    #[test]
+    fn pass_declares_an_empty_struct(/* #591 */) {
+        let m = parse_ok("struct Empty:\n    pass\n");
+        let Item::Struct(s) = &m.items[0] else {
+            panic!("struct");
+        };
+        assert!(s.fields.is_empty());
+        assert!(s.methods.is_empty());
+    }
+
+    #[test]
+    fn pass_stays_an_identifier_outside_statement_position(/* #591 */) {
+        // `pass` is a contextual statement-position word, not a reserved
+        // keyword, so it remains usable as an ordinary identifier.
+        let m = parse_ok("def main():\n    int64 pass = 5\n    pass = pass + 1\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        assert!(matches!(&f.body.stmts[0], Stmt::Let { name, .. } if name == "pass"));
+        // `pass = pass + 1` is an assignment, not a no-op statement.
+        assert!(matches!(&f.body.stmts[1], Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn not_in_desugars_to_negated_membership(/* #593 */) {
+        // `x not in xs` parses identically to `not (x in xs)`:
+        // `Unary(Not, Binary(In, x, xs))`.
+        let m = parse_ok("def main():\n    bool b = 5 not in xs\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::Let { value, .. } = &f.body.stmts[0] else {
+            panic!("let");
+        };
+        let Expr::Unary { op, expr, .. } = value else {
+            panic!("expected unary not, got {value:?}");
+        };
+        assert_eq!(*op, UnOp::Not);
+        let Expr::Binary { op, .. } = expr.as_ref() else {
+            panic!("expected inner `in` binary");
+        };
+        assert_eq!(*op, BinOp::In);
+    }
+
+    #[test]
+    fn not_in_mirrors_in_precedence(/* #593 */) {
+        // `not in` binds at the same (comparison) precedence as `in`, below the
+        // arithmetic operators: `x + 1 not in xs` groups as `(x + 1) not in xs`,
+        // i.e. `not ((x + 1) in xs)`.
+        let m = parse_ok("def main():\n    bool b = x + 1 not in xs\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::Let { value, .. } = &f.body.stmts[0] else {
+            panic!("let");
+        };
+        let Expr::Unary { expr, .. } = value else {
+            panic!("unary");
+        };
+        let Expr::Binary { op, lhs, .. } = expr.as_ref() else {
+            panic!("inner in");
+        };
+        assert_eq!(*op, BinOp::In);
+        // The left operand of `in` is the whole `x + 1`, not just `1`.
+        assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
+    }
+
+    #[test]
+    fn unary_not_and_in_still_parse(/* #593 */) {
+        // The `not in` handling must not disturb the standalone prefix `not`
+        // nor the infix `in` operator.
+        parse_ok("def main():\n    bool a = not done\n    bool b = 3 in xs\n");
     }
 
     /// Collect every `(path, alias)` from the module's logical-name imports,

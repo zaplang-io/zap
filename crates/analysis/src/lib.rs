@@ -1332,7 +1332,7 @@ impl Walk {
                     self.block(eb);
                 }
             }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Pass(_) => {}
         }
     }
 

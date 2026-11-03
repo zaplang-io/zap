@@ -387,6 +387,17 @@ const CORPUS: &[Case] = &[
     case("list_display", Reject, "auto xs = [1, 2\n"),                          // unmatched '['
     case("trailer", Reject, "auto y = f(1\n"),                                  // unmatched '('
 
+    // ---- pass: no-op statement + empty-body spelling (#591) ----
+    case("simple_stmt", Accept, "def f():\n    pass\n"),                         // no-op statement
+    case("simple_stmt", Accept, "def f():\n    if a:\n        pass\n    else:\n        pass\n"),
+    case("struct_def", Accept, "struct Empty:\n    pass\n"),                     // empty struct body
+    case("enum_def", Accept, "enum Empty:\n    pass\n"),                         // empty enum body
+    case("decl", Accept, "def f():\n    int64 pass = 1\n"),                      // `pass` still an identifier
+
+    // ---- not in: negated membership (#593) ----
+    case("comp_op", Accept, "auto b = x not in xs\n"),
+    case("comp_op", Accept, "def f():\n    if x not in xs:\n        return\n"),
+
     // ---- statements: control flow ----
     case("if_stmt", Accept, "if a:\n    return\nelif b:\n    return\nelse:\n    return\n"),
     case("while_stmt", Accept, "while x:\n    return\n"),

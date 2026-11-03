@@ -2740,7 +2740,7 @@ impl Checker {
                 let vt = default_type(self.infer(value));
                 self.bind_target(target, &vt, false, *span);
             }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Pass(_) => {}
         }
     }
 

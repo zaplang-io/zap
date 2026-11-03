@@ -278,7 +278,7 @@ impl Rewriter<'_> {
                 self.assign_target(target, locals);
                 self.expr(value, locals);
             }
-            Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Pass(_) => {}
             Stmt::Cfg(_) => unreachable!("cfg resolved before linking"),
         }
     }
@@ -708,7 +708,7 @@ fn collect_stmt_bindings(st: &Stmt, s: &mut HashSet<String>) {
             collect_bindtarget(target, s);
             collect_expr_bindings(value, s);
         }
-        Stmt::Break(_) | Stmt::Continue(_) => {}
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Pass(_) => {}
         Stmt::Cfg(_) => {}
     }
 }

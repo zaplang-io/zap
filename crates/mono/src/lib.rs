@@ -1315,6 +1315,7 @@ impl Mono<'_> {
             },
             Stmt::Break(s) => Stmt::Break(*s),
             Stmt::Continue(s) => Stmt::Continue(*s),
+            Stmt::Pass(s) => Stmt::Pass(*s),
         })
     }
 

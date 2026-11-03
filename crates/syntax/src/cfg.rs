@@ -282,7 +282,8 @@ fn resolve_in_stmt(stmt: &mut Stmt, target: &Target) {
         | Stmt::LetTuple { .. }
         | Stmt::AssignTuple { .. }
         | Stmt::Break(_)
-        | Stmt::Continue(_) => {}
+        | Stmt::Continue(_)
+        | Stmt::Pass(_) => {}
     }
 }
 

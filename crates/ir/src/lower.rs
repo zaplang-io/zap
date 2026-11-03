@@ -5770,6 +5770,10 @@ impl<'a> FnLower<'a> {
                 }
                 Ok(())
             }
+            Stmt::Pass(_) => {
+                // `pass` is a no-op (#591): it lowers to no IR at all.
+                Ok(())
+            }
             Stmt::Break(_) => {
                 let (brk, base) = {
                     let f = self

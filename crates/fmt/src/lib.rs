@@ -406,7 +406,9 @@ impl<'a> Printer<'a> {
         members.extend(s.fields.iter().map(Member::Field));
         members.extend(s.methods.iter().map(Member::Method));
         members.sort_by_key(|m| m.start());
-        self.emit_members(&members, s.span.end, None);
+        // An empty struct body keeps its explicit `pass` spelling (#591),
+        // mirroring the empty-enum case — a block must not be rendered bodyless.
+        self.emit_members(&members, s.span.end, (members.is_empty()).then_some("pass"));
     }
 
     fn emit_enum(&mut self, e: &EnumDef) {
@@ -643,6 +645,11 @@ impl<'a> Printer<'a> {
             }
             Stmt::Continue(span) => {
                 self.push_line("continue");
+                self.take_trailing(span.end);
+                self.last_end = span.end;
+            }
+            Stmt::Pass(span) => {
+                self.push_line("pass");
                 self.take_trailing(span.end);
                 self.last_end = span.end;
             }
@@ -1042,7 +1049,7 @@ fn stmt_span(s: &Stmt) -> Span {
         | Stmt::AssignTuple { span, .. }
         | Stmt::Cfg(CfgStmtBlock { span, .. }) => *span,
         Stmt::Expr(e) => espan(e),
-        Stmt::Break(span) | Stmt::Continue(span) => *span,
+        Stmt::Break(span) | Stmt::Continue(span) | Stmt::Pass(span) => *span,
     }
 }
 
@@ -1131,6 +1138,32 @@ mod tests {
     fn empty_enum_keeps_its_pass_body() {
         let source = "enum Empty:\n    pass\n";
         assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
+    fn empty_struct_keeps_its_pass_body() {
+        // #591: an empty struct body keeps its `pass`; the block is never
+        // rendered bodyless.
+        let source = "struct Empty:\n    pass\n";
+        assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
+    fn pass_statement_round_trips() {
+        // #591: `pass` as a no-op statement renders back verbatim.
+        let source = "def f():\n    if a:\n        pass\n    else:\n        pass\n";
+        assert_eq!(format_source(source).unwrap(), source);
+    }
+
+    #[test]
+    fn not_in_normalizes_to_prefix_not() {
+        // #593: `not in` is parsed as `not (x in xs)` (it has no dedicated AST
+        // node), so the formatter renders it in the equivalent prefix-`not`
+        // form. The result is stable (idempotent) and semantically identical.
+        let formatted = format_source("def f():\n    bool b = x not in xs\n").unwrap();
+        assert_eq!(formatted, "def f():\n    bool b = not x in xs\n");
+        // Idempotent: formatting again is a fixpoint.
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
     }
 
     #[test]
