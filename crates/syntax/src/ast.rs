@@ -205,6 +205,10 @@ pub struct Param {
     pub default: Option<Expr>,
     /// `true` for a `TYPE... name` variadic (D-0038).
     pub variadic: bool,
+    /// `true` for a `V **name` keyword-collector parameter (#601): it collects
+    /// any extra keyword arguments into a `dict[str, V]`, where `V` is the
+    /// declared value type held in `ty`. At most one, always the last parameter.
+    pub kwargs: bool,
     /// `true` when this parameter follows the bare `*` separator and is therefore
     /// keyword-only (I#496): it may only be supplied by name at a call site.
     pub keyword_only: bool,
@@ -594,11 +598,24 @@ pub struct PatArg {
 // Expressions
 // ----------------------------------------------------------------------------
 
-/// A call argument; `name` is set for keyword arguments (D-0038).
+/// How a call argument is spread into the callee's parameters (#597).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgSpread {
+    /// An ordinary positional or keyword argument.
+    None,
+    /// `*expr` — unpack an iterable/list/tuple into positional arguments.
+    Iterable,
+    /// `**expr` — unpack a `dict[str, V]` into keyword arguments.
+    Mapping,
+}
+
+/// A call argument; `name` is set for keyword arguments (D-0038). A `*expr` /
+/// `**expr` spread argument (#597) carries `spread != None` and has no `name`.
 #[derive(Clone, Debug)]
 pub struct Arg {
     pub name: Option<String>,
     pub value: Expr,
+    pub spread: ArgSpread,
     pub span: Span,
 }
 

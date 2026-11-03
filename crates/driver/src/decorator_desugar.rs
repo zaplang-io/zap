@@ -62,7 +62,7 @@ use std::collections::{HashMap, HashSet};
 
 use zapc_diag::ErrorCode;
 use zapc_sema::TypeError;
-use zapc_syntax::ast::{Arg, Block, Expr, Function, Item, Module, Param, Stmt, Type};
+use zapc_syntax::ast::{Arg, ArgSpread, Block, Expr, Function, Item, Module, Param, Stmt, Type};
 use zapc_syntax::span::Span;
 
 /// One pending registration: the root receiver name whose binding we anchor the
@@ -139,6 +139,7 @@ pub fn desugar_registering_decorators(module: &mut Module) -> Vec<TypeError> {
             args.push(Arg {
                 name: None,
                 value: Expr::Name(registered_name.clone(), d.span),
+                spread: ArgSpread::None,
                 span: d.span,
             });
             let call = Expr::Call {
@@ -433,6 +434,7 @@ fn arg(value: Expr) -> Arg {
     Arg {
         name: None,
         value,
+        spread: ArgSpread::None,
         span,
     }
 }

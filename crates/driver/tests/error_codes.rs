@@ -78,6 +78,17 @@ fn semantic_codes() {
     );
     // An unknown decorator.
     assert_code("@notathing\ndef main():\n    pass\n", "ZAP5032");
+    // A `**` keyword-collector that is not the last parameter (#601).
+    assert_code(
+        "def f(int64 **kw, int64 a) -> int64:\n    return a\n\ndef main():\n    pass\n",
+        "ZAP5121",
+    );
+    // A `*`-spread of an unknown-length value into a non-variadic callee (#597).
+    assert_code(
+        "def f(int64 a, int64 b) -> int64:\n    return a + b\n\
+         def main():\n    auto xs = [1, 2]\n    auto y = f(*xs)\n",
+        "ZAP5122",
+    );
 }
 
 #[test]

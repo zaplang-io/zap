@@ -263,9 +263,14 @@ pub fn render_args(args: &[Arg]) -> String {
 }
 
 pub fn arg_str(a: &Arg) -> String {
-    match &a.name {
-        Some(n) => format!("{n}={}", pexpr(&a.value, P_LAMBDA)),
-        None => pexpr(&a.value, P_LAMBDA),
+    match a.spread {
+        // Spread arguments (#597): `*expr` / `**expr`, never named.
+        ArgSpread::Iterable => format!("*{}", pexpr(&a.value, P_LAMBDA)),
+        ArgSpread::Mapping => format!("**{}", pexpr(&a.value, P_LAMBDA)),
+        ArgSpread::None => match &a.name {
+            Some(n) => format!("{n}={}", pexpr(&a.value, P_LAMBDA)),
+            None => pexpr(&a.value, P_LAMBDA),
+        },
     }
 }
 
@@ -392,12 +397,20 @@ pub fn param_str(p: &Param) -> String {
     match &p.ty {
         None => format!("{decos}{}", p.name), // untyped `self`
         Some(ty) => {
-            let dots = if p.variadic { "..." } else { "" };
+            // A variadic is `TYPE... name`; a keyword-collector is `TYPE **name`
+            // (#601). The two markers are mutually exclusive.
+            let (lead, marker) = if p.variadic {
+                ("", "... ")
+            } else if p.kwargs {
+                (" ", "**")
+            } else {
+                ("", " ")
+            };
             let default = match &p.default {
                 Some(d) => format!(" = {}", pexpr(d, P_LAMBDA)),
                 None => String::new(),
             };
-            format!("{decos}{}{} {}{}", type_str(ty), dots, p.name, default)
+            format!("{decos}{}{lead}{marker}{}{}", type_str(ty), p.name, default)
         }
     }
 }
