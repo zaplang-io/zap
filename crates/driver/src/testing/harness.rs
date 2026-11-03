@@ -441,6 +441,7 @@ fn call(callee: &str, args: Vec<Expr>) -> Expr {
             .map(|value| Arg {
                 name: None,
                 value,
+                spread: ArgSpread::None,
                 span: SP,
             })
             .collect(),

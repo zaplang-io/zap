@@ -366,6 +366,9 @@ struct ParamInfo {
     /// a variadic parameter falls back to positional lowering (reorder/fill is
     /// not attempted), preserving existing behavior.
     variadic: bool,
+    /// `true` for a `V **name` keyword-collector parameter (#601): the caller
+    /// assembles a `dict[str, V]` of the extra keyword arguments to pass here.
+    kwargs: bool,
 }
 
 /// Where one assembled call argument comes from (I#298): an expression written
@@ -376,6 +379,15 @@ enum ArgSlot {
     Given(usize),
     /// Index of the parameter whose default fills this (omitted) argument.
     Default(usize),
+}
+
+/// A positional-argument source for an assembled (`*`/`**` or `**kwargs`) call
+/// (#597). Either a call-site expression, or a value already extracted from a
+/// `*tuple` spread (a tuple is statically sized, so its elements are pulled out
+/// with `FieldGet` and bound positionally like ordinary arguments).
+enum PosSrc<'e> {
+    Expr(&'e Expr),
+    Val(Value, Ty),
 }
 
 /// Per-parameter metadata for a struct/enum method's call sites (I#481),
@@ -392,6 +404,7 @@ fn method_param_info(m: &ast::Function) -> Vec<ParamInfo> {
             name: p.name.clone(),
             default: p.default.clone(),
             variadic: p.variadic,
+            kwargs: p.kwargs,
         })
         .collect()
 }
@@ -1007,6 +1020,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                             name: p.name.clone(),
                             default: p.default.clone(),
                             variadic: p.variadic,
+                            kwargs: p.kwargs,
                         })
                         .collect(),
                 );
@@ -1698,6 +1712,15 @@ fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
     if p.variadic {
         match elem_kind(base) {
             Ok(elem) => Ty::List(elem),
+            Err(_) => base,
+        }
+    } else if p.kwargs {
+        // A `V **name` keyword-collector is received as `dict[str, V]` (#601):
+        // str keys lower to pointer keys, the value is V's element kind. A value
+        // kind the dict runtime cannot hold degrades to the base type (rejected
+        // downstream, like a float variadic).
+        match elem_kind(base) {
+            Ok(vk) => Ty::Dict(Elem::Ptr, vk),
             Err(_) => base,
         }
     } else {
@@ -5014,6 +5037,261 @@ impl<'a> FnLower<'a> {
             }
         }
         self.copy_if_value(v, ty, src)
+    }
+
+    /// Lower a free-function call that carries `*`/`**` spread arguments (#597)
+    /// or targets a callee with a `V **name` keyword-collector (#601).
+    ///
+    /// The call's arguments are assembled into the callee's declaration order:
+    /// explicit positionals (and the elements of a statically-sized `*tuple`)
+    /// bind to the fixed parameters in order; any overflow plus a runtime-length
+    /// `*list`/`*set` spread are packed into the variadic `TYPE... name` list;
+    /// keyword arguments bind to their named parameter, and any left over — plus
+    /// the entries of a `**dict` spread — are collected into the `V **name`
+    /// dict. Sema (`check_user_call_spread`) has already validated the shapes;
+    /// the errors here are a defensive backstop.
+    fn lower_free_call_assembled(
+        &mut self,
+        fname: &str,
+        ptys: &[Ty],
+        ret: Ty,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let ctx = self.ctx;
+        let pinfo = ctx.call_params.get(fname).cloned().unwrap_or_default();
+        let n = pinfo.len();
+        let var_idx = pinfo.iter().position(|p| p.variadic);
+        let kw_idx = pinfo.iter().position(|p| p.kwargs);
+        // Fixed (positional-capacity) parameter indices, in order. The variadic
+        // and the collector, when present, are always last.
+        let fixed: Vec<usize> = (0..n)
+            .filter(|&i| !pinfo[i].variadic && !pinfo[i].kwargs)
+            .collect();
+
+        // Classify the call's arguments. A `*tuple` is expanded into values now
+        // (its arity is static); a `*list`/`*set` is kept as one evaluated value
+        // to feed the variadic. `**dict` and keyword args feed the collector.
+        let mut pos_srcs: Vec<PosSrc> = Vec::new();
+        let mut seq_spread: Option<(Value, Ty)> = None;
+        let mut kw_args: Vec<(&str, &Expr)> = Vec::new();
+        let mut map_spread: Option<&ast::Arg> = None;
+        for a in args {
+            match a.spread {
+                ast::ArgSpread::None => match &a.name {
+                    Some(nm) => kw_args.push((nm.as_str(), &a.value)),
+                    None => pos_srcs.push(PosSrc::Expr(&a.value)),
+                },
+                ast::ArgSpread::Iterable => {
+                    let (sv, sty) = self.expr(&a.value)?;
+                    let tuple_fields = match sty {
+                        Ty::Struct(sid) => ctx.tuples.borrow().fields(sid).map(|f| (sid, f)),
+                        _ => None,
+                    };
+                    if let Some((sid, fields)) = tuple_fields {
+                        for (k, fty) in fields.iter().enumerate() {
+                            let d = self.new_value(*fty);
+                            self.emit(Inst::FieldGet {
+                                dest: d,
+                                base: sv,
+                                sid,
+                                idx: k as u32,
+                            });
+                            pos_srcs.push(PosSrc::Val(d, *fty));
+                        }
+                    } else {
+                        seq_spread = Some((sv, sty));
+                    }
+                }
+                ast::ArgSpread::Mapping => map_spread = Some(a),
+            }
+        }
+
+        // Bind positionals to fixed parameters; keywords fill the rest.
+        let n_fixed_pos = pos_srcs.len().min(fixed.len());
+        let mut fixed_kw: Vec<Option<&Expr>> = vec![None; fixed.len()];
+        let mut kw_for_collector: Vec<(&str, &Expr)> = Vec::new();
+        for (nm, e) in &kw_args {
+            if let Some(fi) = fixed.iter().position(|&pi| pinfo[pi].name == *nm) {
+                if fi < n_fixed_pos || fixed_kw[fi].is_some() {
+                    return Err(err(format!(
+                        "'{fname}' got multiple values for parameter '{nm}'"
+                    )));
+                }
+                fixed_kw[fi] = Some(e);
+            } else {
+                kw_for_collector.push((nm, e));
+            }
+        }
+
+        // Assemble one value per parameter, in declaration order.
+        let mut argvals: Vec<Value> = Vec::with_capacity(n);
+        for pi in 0..n {
+            if Some(pi) == var_idx {
+                let overflow = &pos_srcs[n_fixed_pos..];
+                let v = self.build_variadic_list(ptys[pi], overflow, seq_spread)?;
+                argvals.push(v);
+            } else if Some(pi) == kw_idx {
+                let v = self.build_kwargs_dict(ptys[pi], &kw_for_collector, map_spread)?;
+                argvals.push(v);
+            } else {
+                let fi = fixed.iter().position(|&x| x == pi).unwrap();
+                let target = ptys[pi];
+                let v = if fi < n_fixed_pos {
+                    self.lower_pos_src(&pos_srcs[fi], target)?
+                } else if let Some(e) = fixed_kw[fi] {
+                    let v = self.expr_coerced(e, target, zapc_diag::ErrorCode::ZAP4021)?;
+                    self.copy_for_pass(v, target, e)
+                } else if let Some(def) = pinfo[pi].default.as_ref() {
+                    let v = self.expr_coerced(def, target, zapc_diag::ErrorCode::ZAP4021)?;
+                    self.copy_for_pass(v, target, def)
+                } else {
+                    return Err(err(format!(
+                        "missing argument for parameter '{}' of '{fname}'",
+                        pinfo[pi].name
+                    )));
+                };
+                argvals.push(v);
+            }
+        }
+
+        let dest = if ret == Ty::Void {
+            None
+        } else {
+            Some(self.new_value(ret))
+        };
+        self.throwing_call(dest, fname, argvals);
+        let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
+        Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }))
+    }
+
+    /// Lower one positional source (#597) coerced to the parameter type.
+    fn lower_pos_src(&mut self, src: &PosSrc, target: Ty) -> Result<Value, LowerError> {
+        match src {
+            PosSrc::Expr(e) => {
+                let v = self.expr_coerced(e, target, zapc_diag::ErrorCode::ZAP4021)?;
+                Ok(self.copy_for_pass(v, target, e))
+            }
+            PosSrc::Val(v, vt) => {
+                let v = self.coerce(*v, *vt, target);
+                Ok(self.box_if_value(v, target))
+            }
+        }
+    }
+
+    /// Build the variadic parameter's `list` (#597): push the overflow
+    /// positional sources, then extend from a runtime-length `*list`/`*set`.
+    fn build_variadic_list(
+        &mut self,
+        list_ty: Ty,
+        overflow: &[PosSrc],
+        seq: Option<(Value, Ty)>,
+    ) -> Result<Value, LowerError> {
+        let elem = match list_ty {
+            Ty::List(e) => e,
+            _ => Elem::I64,
+        };
+        let list = self.new_value(Ty::List(elem));
+        self.emit(Inst::Call {
+            dest: Some(list),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let push = format!("zap_list_push_{}", elem.val_suffix());
+        for src in overflow {
+            let v = match src {
+                PosSrc::Expr(e) => {
+                    let (v, vt) = self.expr(e)?;
+                    self.coerce(v, vt, elem.ty())
+                }
+                PosSrc::Val(v, vt) => self.coerce(*v, *vt, elem.ty()),
+            };
+            let v = self.box_if_value(v, elem.ty());
+            self.emit(Inst::Call {
+                dest: None,
+                func: push.clone(),
+                args: vec![list, v],
+            });
+        }
+        if let Some((sv, sty)) = seq {
+            let items = match sty {
+                Ty::List(_) => sv,
+                Ty::Set(se) => {
+                    let items = self.new_value(Ty::List(se));
+                    self.emit(Inst::Call {
+                        dest: Some(items),
+                        func: "zap_set_items".to_string(),
+                        args: vec![sv],
+                    });
+                    items
+                }
+                other => {
+                    return Err(err(format!(
+                        "cannot `*`-spread a value of type {other:?} into a variadic parameter"
+                    )))
+                }
+            };
+            let se = match sty {
+                Ty::List(e) | Ty::Set(e) => e,
+                _ => elem,
+            };
+            self.iterate_list(items, se, |s, v, vt| {
+                let v = s.coerce(v, vt, elem.ty());
+                let v = s.box_if_value(v, elem.ty());
+                s.emit(Inst::Call {
+                    dest: None,
+                    func: push.clone(),
+                    args: vec![list, v],
+                });
+                Ok(())
+            })?;
+        }
+        Ok(list)
+    }
+
+    /// Build the keyword-collector's `dict[str, V]` (#601): copy a `**dict`
+    /// spread if present, then set each remaining keyword argument.
+    fn build_kwargs_dict(
+        &mut self,
+        dict_ty: Ty,
+        kws: &[(&str, &Expr)],
+        map_spread: Option<&ast::Arg>,
+    ) -> Result<Value, LowerError> {
+        let vk = match dict_ty {
+            Ty::Dict(_, v) => v,
+            _ => Elem::Ptr,
+        };
+        let dict = self.new_value(Ty::Dict(Elem::Ptr, vk));
+        if let Some(a) = map_spread {
+            let (sv, _) = self.expr(&a.value)?;
+            self.emit(Inst::Call {
+                dest: Some(dict),
+                func: "zap_dict_copy".to_string(),
+                args: vec![sv],
+            });
+        } else {
+            self.emit(Inst::Call {
+                dest: Some(dict),
+                func: "zap_dict_new".to_string(),
+                args: vec![],
+            });
+        }
+        let setf = format!("zap_dict_set_str_{}", vk.val_suffix());
+        for (nm, e) in kws {
+            let key = self.new_value(Ty::Ptr);
+            self.emit(Inst::StrConst {
+                dest: key,
+                bytes: nm.as_bytes().to_vec(),
+            });
+            let (v, vt) = self.expr(e)?;
+            let v = self.coerce(v, vt, vk.ty());
+            let v = self.box_if_value(v, vk.ty());
+            self.emit(Inst::Call {
+                dest: None,
+                func: setf.clone(),
+                args: vec![dict, key, v],
+            });
+        }
+        Ok(dict)
     }
 
     /// Box a value struct for storage in a collection or another aggregate
@@ -9109,6 +9387,18 @@ impl<'a> FnLower<'a> {
                 // parameter metadata it holds can be borrowed across the
                 // `&mut self` lowering calls below.
                 let ctx = self.ctx;
+                // A call carrying `*`/`**` spreads (#597), or into a callee with
+                // a `V **name` keyword-collector (#601), is assembled by a
+                // dedicated path that forwards into the callee's variadic /
+                // collector parameters and builds the collector dict.
+                let has_spread = args.iter().any(|a| a.spread != ast::ArgSpread::None);
+                let callee_kwargs = ctx
+                    .call_params
+                    .get(fname)
+                    .is_some_and(|pi| pi.iter().any(|p| p.kwargs));
+                if has_spread || callee_kwargs {
+                    return self.lower_free_call_assembled(fname, &ptys, ret, args);
+                }
                 // Default arguments and out-of-order keyword arguments (D-0038,
                 // I#298): assemble the call's arguments into declaration order,
                 // filling omitted defaulted parameters, before lowering. A

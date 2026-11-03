@@ -92,8 +92,16 @@ param_list    ::= [ param { "," param } "," ] "*" param { "," param }
                      or have a default. *)
 param         ::= { "@" decorator_name [ "(" [ arg_list ] ")" ] }
                   ( "self"
-                  | type [ "..." ] IDENT [ "=" expr ] ) ;
-                  (* "type ... IDENT" is a variadic (D-0038);
+                  | type "..." IDENT
+                  | type "**" IDENT
+                  | type IDENT [ "=" expr ] ) ;
+                  (* "type ... IDENT" is a positional variadic (D-0038): it
+                     collects the extra positional arguments into a `list`.
+                     "type ** IDENT" is a keyword-collector (#601): it collects
+                     the extra keyword arguments into a `dict[str, type]` (the
+                     key is always `str`, the value type is the declared `type`).
+                     A collector is the last parameter, appears at most once, and
+                     carries neither a default nor the `...` marker.
                      "= expr" is a per-call default.
                      Inline "@name" decorators are parameter annotations
                      (I#458, D-0089): a declared annotation/decorator is
@@ -422,7 +430,16 @@ subscript     ::= expr
                 | [ expr ] ":" [ expr ] [ ":" [ expr ] ] ;  (* slice, D-0030 *)
 
 arg_list      ::= arg { "," arg } ;
-arg           ::= [ IDENT "=" ] expr ;            (* keyword arg, D-0038 *)
+arg           ::= [ IDENT "=" ] expr              (* keyword arg, D-0038 *)
+                | "*" expr                        (* iterable spread, #597 *)
+                | "**" expr ;                     (* mapping spread, #597 *)
+                  (* "*expr" unpacks a list/tuple into positional arguments and
+                     "**expr" unpacks a `dict[str, V]` into keyword arguments.
+                     Python argument order holds: positionals, then "*", then
+                     keywords, then "**". A statically-sized tuple expands into
+                     fixed parameters; a runtime-length "*list"/"*set" feeds a
+                     `type... name` variadic, and "**dict" feeds a `type ** name`
+                     collector. *)
 
 atom          ::= literal
                 | IDENT

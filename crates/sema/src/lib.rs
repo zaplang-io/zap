@@ -763,6 +763,7 @@ impl Checker {
                     ty,
                     has_default: false,
                     variadic: p.variadic,
+                    kwargs: p.kwargs,
                     keyword_only: p.keyword_only,
                 }
             })
@@ -1214,6 +1215,7 @@ impl Checker {
                     ty,
                     has_default: p.default.is_some(),
                     variadic: p.variadic,
+                    kwargs: p.kwargs,
                     keyword_only: p.keyword_only,
                 }
             })
@@ -1313,6 +1315,7 @@ impl Checker {
             ty,
             has_default: false,
             variadic: false,
+            kwargs: false,
             keyword_only: false,
         };
         let mut methods = HashMap::new();
@@ -1352,6 +1355,7 @@ impl Checker {
                     .unwrap_or(Ty::Unknown),
                 has_default: p.default.is_some(),
                 variadic: p.variadic,
+                kwargs: p.kwargs,
                 keyword_only: p.keyword_only,
             })
             .collect();
@@ -2061,6 +2065,55 @@ impl Checker {
         self.pop_scope();
     }
 
+    /// Validate the structural rules on a parameter list (#601): a `V **name`
+    /// keyword-collector must be the last parameter, may appear at most once,
+    /// and may not carry a default; any `TYPE... name` variadic must precede it.
+    /// (The parser already forbids a parameter being both variadic and kwargs.)
+    fn check_param_shape(&mut self, params: &[Param]) {
+        let mut seen_kwargs = false;
+        for (i, p) in params.iter().enumerate() {
+            if seen_kwargs {
+                // Anything after a `**` collector is misplaced; report it once
+                // against the collector having already been seen.
+                self.error(
+                    ErrorCode::ZAP5121,
+                    format!(
+                        "parameter '{}' follows the `**` keyword-collector, which \
+                         must be last",
+                        p.name
+                    ),
+                    p.span,
+                );
+            }
+            if p.kwargs {
+                if seen_kwargs {
+                    self.error(
+                        ErrorCode::ZAP5121,
+                        format!(
+                            "'{}' is a second `**` keyword-collector; at most one \
+                             is allowed",
+                            p.name
+                        ),
+                        p.span,
+                    );
+                }
+                seen_kwargs = true;
+                if p.default.is_some() {
+                    self.error(
+                        ErrorCode::ZAP5121,
+                        format!(
+                            "the `**` keyword-collector '{}' cannot carry a \
+                             default value",
+                            p.name
+                        ),
+                        p.span,
+                    );
+                }
+                let _ = i;
+            }
+        }
+    }
+
     fn check_function(&mut self, f: &Function, self_ty: Option<&str>) {
         for p in &f.params {
             if let Some(t) = &p.ty {
@@ -2070,6 +2123,7 @@ impl Checker {
         if let Some(t) = &f.ret {
             self.check_numeric_container_type(t);
         }
+        self.check_param_shape(&f.params);
         self.push_scope();
         let new_ret = f
             .ret
@@ -2167,6 +2221,10 @@ impl Checker {
             };
             let ty = if p.variadic {
                 Ty::List(Box::new(base))
+            } else if p.kwargs {
+                // A `V **name` collector is bound in the body as `dict[str, V]`
+                // (#601), mirroring how a variadic binds as `list[elem]`.
+                Ty::Dict(Box::new(Ty::Str), Box::new(base))
             } else {
                 base
             };
@@ -3823,6 +3881,27 @@ impl Checker {
     }
 
     fn check_call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Ty {
+        // Spread call arguments (`*expr` / `**expr`, #597) are supported in this
+        // version only for a call to a named free function (the variadic /
+        // `**kwargs` forwarding path). Any other callee — construction, a
+        // built-in, a method, a Python handle — rejects them with one clear
+        // error; the arguments are still inferred so later checks don't cascade.
+        if args.iter().any(|a| a.spread != ArgSpread::None) {
+            let is_free_fn = matches!(callee, Expr::Name(n, _) if self.sigs.contains_key(n));
+            if !is_free_fn {
+                self.error(
+                    ErrorCode::ZAP5122,
+                    "`*`/`**` spread arguments are supported only in a call to a named \
+                     function in this version (#597)"
+                        .to_string(),
+                    span,
+                );
+                for a in args {
+                    self.infer(&a.value);
+                }
+                return Ty::Unknown;
+            }
+        }
         // Qualified enum-variant construction: `Shape.Circle(r=2.0)` /
         // `Shape.Circle(2.0)` (D-0046), accepting named or positional args.
         if let Expr::Attr { base, name, .. } = callee {
@@ -4985,14 +5064,78 @@ impl Checker {
     }
 
     fn check_user_call(&mut self, sig: &FnSig, fname: &str, args: &[Arg], span: Span) -> Ty {
+        if args.iter().any(|a| a.spread != ArgSpread::None) {
+            self.check_user_call_spread(sig, fname, args, span)
+        } else {
+            self.check_user_call_plain(sig, fname, args, span)
+        }
+    }
+
+    /// Type-check a keyword argument `name=value` of type `at` against `sig`.
+    /// A keyword naming an ordinary parameter is checked against it; any other
+    /// keyword is collected by a `**kwargs` parameter (#601), checked against
+    /// its value type `V`; without such a parameter it is an unknown keyword.
+    fn check_keyword_arg(&mut self, sig: &FnSig, fname: &str, name: &str, at: &Ty, at_span: Span) {
+        // A keyword never binds the collector itself (`def f(V **kw)` then
+        // `f(kw=1)` puts `kw` into the dict, exactly like Python).
+        match sig.params.iter().find(|p| p.name == name && !p.kwargs) {
+            Some(p) => {
+                if !self.coercible(at, &p.ty) {
+                    self.error(
+                        ErrorCode::ZAP4022,
+                        format!(
+                            "keyword argument '{}' to '{}' has type {}, expected {}",
+                            name,
+                            fname,
+                            at.display(),
+                            p.ty.display()
+                        ),
+                        at_span,
+                    );
+                }
+            }
+            None => match sig.params.iter().find(|p| p.kwargs) {
+                Some(kw) => {
+                    if !self.coercible(at, &kw.ty) {
+                        self.error(
+                            ErrorCode::ZAP4022,
+                            format!(
+                                "keyword argument '{}' collected by '{}' has type {}, \
+                                 expected {} (the `**` collector's value type)",
+                                name,
+                                fname,
+                                at.display(),
+                                kw.ty.display()
+                            ),
+                            at_span,
+                        );
+                    }
+                }
+                None => self.error(
+                    ErrorCode::ZAP4023,
+                    format!("'{fname}' has no parameter named '{name}'"),
+                    at_span,
+                ),
+            },
+        }
+    }
+
+    fn check_user_call_plain(&mut self, sig: &FnSig, fname: &str, args: &[Arg], span: Span) -> Ty {
         let positional: Vec<&Arg> = args.iter().filter(|a| a.name.is_none()).collect();
         let keyword: Vec<&Arg> = args.iter().filter(|a| a.name.is_some()).collect();
-        let non_variadic = sig.params.iter().filter(|p| !p.variadic).count();
+        // A `TYPE... name` variadic and a `V **name` collector are not fixed
+        // positional parameters: they absorb any number of (extra) arguments, so
+        // neither counts toward the positional arity or the required minimum.
+        let non_variadic = sig
+            .params
+            .iter()
+            .filter(|p| !p.variadic && !p.kwargs)
+            .count();
         let has_var = sig.params.iter().any(|p| p.variadic);
         let required = sig
             .params
             .iter()
-            .filter(|p| !p.has_default && !p.variadic)
+            .filter(|p| !p.has_default && !p.variadic && !p.kwargs)
             .count();
 
         if !has_var && positional.len() > non_variadic {
@@ -5030,12 +5173,12 @@ impl Checker {
                     continue;
                 }
             }
-            let expected = if let Some(p) = sig.params.get(i) {
-                Some(p.ty.clone())
-            } else if has_var {
-                sig.params.iter().find(|p| p.variadic).map(|p| p.ty.clone())
-            } else {
-                None
+            // A plain positional never lands on the trailing `**` collector.
+            let expected = match sig.params.get(i) {
+                Some(p) if p.kwargs => None,
+                Some(p) => Some(p.ty.clone()),
+                None if has_var => sig.params.iter().find(|p| p.variadic).map(|p| p.ty.clone()),
+                None => None,
             };
             if let Some(pt) = expected {
                 if !self.coercible(&at, &pt) {
@@ -5057,25 +5200,282 @@ impl Checker {
         for a in &keyword {
             let name = a.name.clone().unwrap();
             let at = self.infer(&a.value);
-            match sig.params.iter().find(|p| p.name == name) {
-                Some(p) => {
-                    if !self.coercible(&at, &p.ty) {
+            self.check_keyword_arg(sig, fname, &name, &at, expr_span(&a.value));
+        }
+
+        sig.ret.clone()
+    }
+
+    /// Type-check a call that carries `*`/`**` spread arguments (#597). The
+    /// checks are deliberately conservative: the arity of a statically-unknown
+    /// length `*list` is not known at compile time, so arity errors are only
+    /// raised where they are decidable, and the spreads are validated against
+    /// the callee's variadic / `**kwargs` parameters.
+    fn check_user_call_spread(&mut self, sig: &FnSig, fname: &str, args: &[Arg], span: Span) -> Ty {
+        let has_var = sig.params.iter().any(|p| p.variadic);
+        let var_elem = sig.params.iter().find(|p| p.variadic).map(|p| p.ty.clone());
+        let has_kwargs = sig.params.iter().any(|p| p.kwargs);
+        let kwargs_vty = sig.params.iter().find(|p| p.kwargs).map(|p| p.ty.clone());
+        // Fixed (positional-capacity) parameters, excluding variadic / collector.
+        let fixed: Vec<&ParamInfo> = sig
+            .params
+            .iter()
+            .filter(|p| !p.variadic && !p.kwargs)
+            .collect();
+
+        // Validate argument ordering: plain positionals, then one `*`, then
+        // keywords, then one `**` (Python order). Ranks must not decrease.
+        let rank = |a: &Arg| -> u8 {
+            match a.spread {
+                ArgSpread::Iterable => 1,
+                ArgSpread::Mapping => 3,
+                ArgSpread::None if a.name.is_some() => 2,
+                ArgSpread::None => 0,
+            }
+        };
+        let mut last_rank = 0u8;
+        let mut iter_count = 0usize;
+        let mut map_count = 0usize;
+        for a in args {
+            let r = rank(a);
+            if r < last_rank {
+                self.error(
+                    ErrorCode::ZAP5122,
+                    format!(
+                        "misordered argument to '{fname}': arguments must appear as \
+                         positionals, then `*spread`, then keywords, then `**spread`"
+                    ),
+                    expr_span(&a.value),
+                );
+            }
+            last_rank = last_rank.max(r);
+            match a.spread {
+                ArgSpread::Iterable => iter_count += 1,
+                ArgSpread::Mapping => map_count += 1,
+                ArgSpread::None => {}
+            }
+        }
+        if iter_count > 1 {
+            self.error(
+                ErrorCode::ZAP5122,
+                format!(
+                    "'{fname}' call has more than one `*` spread (at most one in this version)"
+                ),
+                span,
+            );
+        }
+        if map_count > 1 {
+            self.error(
+                ErrorCode::ZAP5122,
+                format!(
+                    "'{fname}' call has more than one `**` spread (at most one in this version)"
+                ),
+                span,
+            );
+        }
+
+        // Explicit plain positionals bind to the fixed parameters in order, then
+        // to the variadic element type.
+        let mut pos_idx = 0usize;
+        for a in args
+            .iter()
+            .filter(|a| a.spread == ArgSpread::None && a.name.is_none())
+        {
+            let at = self.infer(&a.value);
+            let expected = if pos_idx < fixed.len() {
+                if fixed[pos_idx].keyword_only {
+                    self.error(
+                        ErrorCode::ZAP4029,
+                        format!(
+                            "parameter '{}' of '{}' is keyword-only and must be \
+                             passed by name ('{}=...')",
+                            fixed[pos_idx].name, fname, fixed[pos_idx].name
+                        ),
+                        expr_span(&a.value),
+                    );
+                    None
+                } else {
+                    Some(fixed[pos_idx].ty.clone())
+                }
+            } else {
+                var_elem.clone()
+            };
+            if let Some(pt) = expected {
+                if !self.coercible(&at, &pt) {
+                    self.error(
+                        ErrorCode::ZAP4021,
+                        format!(
+                            "argument {} to '{}' has type {}, expected {}",
+                            pos_idx + 1,
+                            fname,
+                            at.display(),
+                            pt.display()
+                        ),
+                        expr_span(&a.value),
+                    );
+                }
+            }
+            pos_idx += 1;
+        }
+
+        // The `*` spread.
+        if let Some(a) = args.iter().find(|a| a.spread == ArgSpread::Iterable) {
+            let t = self.infer(&a.value);
+            match &t {
+                Ty::Tuple(elems) => {
+                    // A statically-known tuple expands elementwise. Its elements
+                    // continue binding where the explicit positionals left off.
+                    for (k, et) in elems.iter().enumerate() {
+                        let slot = pos_idx + k;
+                        let expected = if slot < fixed.len() {
+                            Some(fixed[slot].ty.clone())
+                        } else {
+                            var_elem.clone()
+                        };
+                        if let Some(pt) = expected {
+                            if !self.coercible(et, &pt) {
+                                self.error(
+                                    ErrorCode::ZAP4021,
+                                    format!(
+                                        "spread tuple element {} to '{}' has type {}, expected {}",
+                                        k + 1,
+                                        fname,
+                                        et.display(),
+                                        pt.display()
+                                    ),
+                                    expr_span(&a.value),
+                                );
+                            }
+                        } else if !has_var {
+                            self.error(
+                                ErrorCode::ZAP5122,
+                                format!(
+                                    "spread tuple has more elements than '{fname}' has \
+                                     parameters and '{fname}' is not variadic"
+                                ),
+                                expr_span(&a.value),
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ty::List(elem) | Ty::Set(elem) => {
+                    if !has_var {
                         self.error(
-                            ErrorCode::ZAP4022,
+                            ErrorCode::ZAP5122,
                             format!(
-                                "keyword argument '{}' to '{}' has type {}, expected {}",
-                                name,
-                                fname,
-                                at.display(),
-                                p.ty.display()
+                                "cannot `*`-spread a value of unknown length into '{fname}', \
+                                 which has no `TYPE... name` variadic parameter"
                             ),
                             expr_span(&a.value),
                         );
+                    } else if let Some(ve) = &var_elem {
+                        if !self.coercible(elem, ve) {
+                            self.error(
+                                ErrorCode::ZAP4021,
+                                format!(
+                                    "`*`-spread of {} into '{}' variadic expects element type {}",
+                                    t.display(),
+                                    fname,
+                                    ve.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
                     }
                 }
-                None => self.error(
-                    ErrorCode::ZAP4023,
-                    format!("'{fname}' has no parameter named '{name}'"),
+                Ty::Range => {
+                    if !has_var {
+                        self.error(
+                            ErrorCode::ZAP5122,
+                            format!(
+                                "cannot `*`-spread a range into '{fname}', which has no \
+                                 `TYPE... name` variadic parameter"
+                            ),
+                            expr_span(&a.value),
+                        );
+                    } else if let Some(ve) = &var_elem {
+                        if !self.coercible(&Ty::Int64, ve) {
+                            self.error(
+                                ErrorCode::ZAP4021,
+                                format!(
+                                    "`*`-spread of a range into '{}' variadic expects element \
+                                     type {} (ranges yield int64)",
+                                    fname,
+                                    ve.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                }
+                Ty::Unknown => {}
+                other => self.error(
+                    ErrorCode::ZAP5122,
+                    format!(
+                        "`*` spread expects a list, tuple, or range, found {}",
+                        other.display()
+                    ),
+                    expr_span(&a.value),
+                ),
+            }
+        }
+
+        // Explicit keyword arguments.
+        for a in args
+            .iter()
+            .filter(|a| a.spread == ArgSpread::None && a.name.is_some())
+        {
+            let name = a.name.clone().unwrap();
+            let at = self.infer(&a.value);
+            self.check_keyword_arg(sig, fname, &name, &at, expr_span(&a.value));
+        }
+
+        // The `**` spread must be a `dict[str, V]` feeding a `**kwargs` collector.
+        if let Some(a) = args.iter().find(|a| a.spread == ArgSpread::Mapping) {
+            let t = self.infer(&a.value);
+            match &t {
+                Ty::Dict(k, v) => {
+                    if !matches!(**k, Ty::Str) {
+                        self.error(
+                            ErrorCode::ZAP5122,
+                            format!(
+                                "`**` spread expects a dict with str keys, found {}",
+                                t.display()
+                            ),
+                            expr_span(&a.value),
+                        );
+                    } else if !has_kwargs {
+                        self.error(
+                            ErrorCode::ZAP5122,
+                            format!(
+                                "cannot `**`-spread into '{fname}', which has no \
+                                 `V **name` keyword-collector parameter"
+                            ),
+                            expr_span(&a.value),
+                        );
+                    } else if let Some(vty) = &kwargs_vty {
+                        if !self.coercible(v, vty) {
+                            self.error(
+                                ErrorCode::ZAP4022,
+                                format!(
+                                    "`**`-spread of {} into '{}' collector expects value type {}",
+                                    t.display(),
+                                    fname,
+                                    vty.display()
+                                ),
+                                expr_span(&a.value),
+                            );
+                        }
+                    }
+                }
+                Ty::Unknown => {}
+                other => self.error(
+                    ErrorCode::ZAP5122,
+                    format!(
+                        "`**` spread expects a dict[str, V], found {}",
+                        other.display()
+                    ),
                     expr_span(&a.value),
                 ),
             }
@@ -5620,6 +6020,106 @@ def main():
         assert!(errors("def f(int n) -> int:\n    return \"x\"\n")
             .iter()
             .any(|e| e.code == ErrorCode::ZAP4003));
+    }
+
+    #[test]
+    fn kwargs_collector_param_and_extra_keywords() {
+        // A `V **name` collector accepts any extra keyword arguments whose value
+        // type coerces to V, and is bound in the body as `dict[str, V]`.
+        ok("def f(int64 base, int64 **counts) -> int64:\n\
+            \x20   auto t = base\n\
+            \x20   for k in counts.keys():\n\
+            \x20       t = t + counts[k]\n\
+            \x20   return t\n\
+            def main():\n    auto x = f(0, a=1, b=2)\n");
+
+        // An extra keyword whose value type does not coerce to V is rejected.
+        assert!(errors(
+            "def f(int64 **counts) -> int64:\n    return 0\n\
+             def main():\n    auto x = f(a=\"s\")\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP4022));
+
+        // Without a collector an unknown keyword is still ZAP4023.
+        assert!(errors(
+            "def f(int64 a) -> int64:\n    return a\n\
+             def main():\n    auto x = f(1, b=2)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP4023));
+    }
+
+    #[test]
+    fn kwargs_collector_param_shape_errors() {
+        // A collector must be the last parameter.
+        assert!(errors(
+            "def f(int64 **kw, int64 a) -> int64:\n    return a\n\
+             def main():\n    auto x = f(1)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP5121));
+
+        // At most one collector.
+        assert!(errors(
+            "def f(int64 **a, int64 **b) -> int64:\n    return 0\n\
+             def main():\n    auto x = f()\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP5121));
+
+        // A collector cannot carry a default.
+        assert!(errors(
+            "def f(int64 **kw = 0) -> int64:\n    return 0\n\
+             def main():\n    auto x = f()\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP5121));
+    }
+
+    #[test]
+    fn starred_call_arguments_checked() {
+        // `*list` forwards into a variadic; `**dict` forwards into a collector.
+        ok("def sum_all(int64... nums) -> int64:\n\
+            \x20   auto t = 0\n\
+            \x20   for n in nums:\n\
+            \x20       t = t + n\n\
+            \x20   return t\n\
+            def tally(int64 base, int64 **counts) -> int64:\n    return base\n\
+            def forward(int64... args, int64 **opts) -> int64:\n\
+            \x20   return sum_all(*args) + tally(0, **opts)\n\
+            def main():\n\
+            \x20   auto xs = [1, 2, 3]\n\
+            \x20   auto d = {\"x\": 1}\n\
+            \x20   auto a = sum_all(*xs)\n\
+            \x20   auto b = tally(0, **d)\n");
+
+        // A statically-sized tuple expands into fixed parameters.
+        ok("def dist(int64 x, int64 y) -> int64:\n    return x + y\n\
+            def main():\n    auto p = (3, 4)\n    auto d = dist(*p)\n");
+
+        // `*list` into a non-variadic callee is rejected (unknown length).
+        assert!(errors(
+            "def f(int64 a, int64 b) -> int64:\n    return a + b\n\
+             def main():\n    auto xs = [1, 2]\n    auto y = f(*xs)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP5122));
+
+        // `**dict` into a callee with no collector is rejected.
+        assert!(errors(
+            "def f(int64 a) -> int64:\n    return a\n\
+             def main():\n    auto d = {\"x\": 1}\n    auto y = f(1, **d)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP5122));
+
+        // Spreads are rejected on a non-free-function callee (a built-in here).
+        assert!(
+            errors("def main():\n    auto xs = [1, 2]\n    print(*xs)\n")
+                .iter()
+                .any(|e| e.code == ErrorCode::ZAP5122)
+        );
     }
 
     #[test]

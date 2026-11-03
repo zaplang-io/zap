@@ -1348,6 +1348,7 @@ impl Mono<'_> {
         Ok(Arg {
             name: a.name.clone(),
             value: self.rw(&a.value, env)?,
+            spread: a.spread,
             span: a.span,
         })
     }
@@ -2071,6 +2072,7 @@ impl Mono<'_> {
             nargs.push(Arg {
                 name: a.name.clone(),
                 value: v,
+                spread: a.spread,
                 span: a.span,
             });
         }

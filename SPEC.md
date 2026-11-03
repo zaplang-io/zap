@@ -539,7 +539,48 @@ def sum_all(int64... nums) -> int64:
 sum_all(1, 2, 3)                     # 6
 ```
 
-`**kwargs`-style arbitrary named arguments are deferred (D-0038).
+**Keyword-collector `**kwargs` (#601)** — a trailing `V **name` parameter
+collects any extra keyword arguments into a homogeneous `dict[str, V]`, where
+`V` is the declared value type (the key is always `str`). It is the mirror of
+the positional variadic: at most one, always the last parameter, and it carries
+neither a default nor the `...` marker. The body uses it as an ordinary dict:
+
+```python
+def tally(int64 base, int64 **counts) -> int64:
+    auto total = base
+    for k in counts.keys():
+        total = total + counts[k]
+    return total
+tally(0, a=1, b=2, c=3)              # 6  (a/b/c collected into counts)
+```
+
+Fully heterogeneous Python kwargs (mixed value types) remain out of scope for
+v1; model those through `pyobject`/interop.
+
+**Starred call arguments `f(*args, **kwargs)` (#597)** — at a call site, `*expr`
+unpacks an iterable into positional arguments and `**expr` unpacks a
+`dict[str, V]` into keyword arguments. Python argument order holds: positionals,
+then `*`, then keywords, then `**`.
+
+```python
+auto xs = [1, 2, 3]
+sum_all(*xs)                          # 6   (list spread into the variadic)
+sum_all(10, *xs)                      # 16  (fixed arg then spread)
+auto p = (3, 4)
+dist(*p)                              # tuple expands into fixed x, y
+auto d = {"a": 1, "b": 2}
+tally(0, **d)                         # dict spread into **counts
+
+def forward(int64... args, int64 **opts) -> int64:
+    return sum_all(*args) + tally(0, **opts)   # the forwarding idiom
+```
+
+Because Zap is statically typed with fixed arity, a statically-sized **tuple**
+expands elementwise into fixed parameters, but a runtime-length `*list`/`*set`
+can only feed a `TYPE... name` variadic, and `**dict` can only feed a
+`V **name` collector — spreading an unknown-length value into fixed parameters
+is rejected (ZAP5122). In this version spreads are supported in calls to named
+functions, with at most one `*` and one `**` per call.
 
 ## 8. Comprehensions & slicing (D-0026)
 

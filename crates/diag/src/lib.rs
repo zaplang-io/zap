@@ -554,6 +554,17 @@ define_codes! {
     ZAP5120 = 5120 : "equality without `__hash__`",
         "A type defines equality but no `__hash__`, yet is used as a dict/set \
          key; its hashing will not agree with its equality (D-0047).";
+    ZAP5121 = 5121 : "invalid parameter list shape",
+        "A `V **name` keyword-collector (#601) must be the last parameter and \
+         appear at most once; it cannot carry a default or be a variadic. A \
+         `TYPE... name` variadic must precede any keyword-collector.";
+    ZAP5122 = 5122 : "invalid spread argument",
+        "A `*expr` spread unpacks an iterable/list/tuple into positional \
+         arguments, and `**expr` unpacks a `dict[str, V]` into keyword \
+         arguments (#597). A `*`-spread of statically-unknown length can only \
+         feed a variadic `TYPE... name` parameter, and `**expr` can only feed a \
+         `V **name` keyword-collector; they must appear in Python order \
+         (positionals, then `*`, then keywords, then `**`).";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

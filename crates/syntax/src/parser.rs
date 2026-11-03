@@ -1476,12 +1476,18 @@ impl Parser {
                 name: "self".to_string(),
                 default: None,
                 variadic: false,
+                kwargs: false,
                 keyword_only: false,
                 span: self.span_from(start),
             };
         }
         let ty = Some(self.parse_type());
+        // A `TYPE... name` variadic (D-0038) collects extra *positional*
+        // arguments; a `TYPE **name` keyword-collector (#601) collects extra
+        // *keyword* arguments into a `dict[str, TYPE]`. The two markers are
+        // mutually exclusive on one parameter.
         let variadic = self.eat(&TokenKind::Ellipsis);
+        let kwargs = !variadic && self.eat(&TokenKind::StarStar);
         let name = self.ident("parameter name");
         let default = if self.eat(&TokenKind::Assign) {
             Some(self.parse_expr())
@@ -1494,6 +1500,7 @@ impl Parser {
             name,
             default,
             variadic,
+            kwargs,
             keyword_only: false,
             span: self.span_from(start),
         }
@@ -3210,8 +3217,21 @@ impl Parser {
         }
         loop {
             let astart = self.peek_span().start;
-            // keyword argument: IDENT '=' (but not '==')
-            let name = if matches!(self.peek(), TokenKind::Ident(_))
+            // Spread arguments (#597): `**expr` unpacks a `dict[str, V]` into
+            // keyword arguments; `*expr` unpacks an iterable/list/tuple into
+            // positional arguments. Checked before the keyword-argument form so a
+            // leading `*`/`**` is never mistaken for a bare expression.
+            let spread = if self.eat(&TokenKind::StarStar) {
+                ArgSpread::Mapping
+            } else if self.eat(&TokenKind::Star) {
+                ArgSpread::Iterable
+            } else {
+                ArgSpread::None
+            };
+            // keyword argument: IDENT '=' (but not '=='). A spread argument is
+            // never named.
+            let name = if spread == ArgSpread::None
+                && matches!(self.peek(), TokenKind::Ident(_))
                 && matches!(self.peek2(), TokenKind::Assign)
             {
                 let (n, _) = self.ident_opt().unwrap();
@@ -3224,6 +3244,7 @@ impl Parser {
             args.push(Arg {
                 name,
                 value,
+                spread,
                 span: self.span_from(astart),
             });
             if !self.eat(&TokenKind::Comma) {
@@ -4526,6 +4547,44 @@ def demo(int64 n):
         assert_eq!(f.params.len(), 3);
         assert!(f.params[1].default.is_some());
         assert!(f.params[2].variadic);
+    }
+
+    #[test]
+    fn kwargs_collector_param_parses() {
+        // `V **name` is a trailing keyword-collector parameter (#601): it is not
+        // variadic, it carries the `kwargs` flag, and its declared type is the
+        // dict value type `V`.
+        let m = parse_ok("def f(int64 a, str **opts) -> int64:\n    return a\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        assert_eq!(f.params.len(), 2);
+        assert!(!f.params[0].kwargs);
+        assert!(f.params[1].kwargs);
+        assert!(!f.params[1].variadic);
+        assert_eq!(f.params[1].name, "opts");
+    }
+
+    #[test]
+    fn starred_call_arguments_parse() {
+        // `*expr` / `**expr` spread arguments (#597) carry a spread kind and no
+        // name; ordinary and keyword arguments keep `ArgSpread::None`.
+        let m = parse_ok("def main():\n    f(a, *xs, k=1, **d)\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        let Stmt::Expr(Expr::Call { args, .. }) = &f.body.stmts[0] else {
+            panic!("expected a call expression statement");
+        };
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0].spread, ArgSpread::None);
+        assert!(args[0].name.is_none());
+        assert_eq!(args[1].spread, ArgSpread::Iterable);
+        assert!(args[1].name.is_none());
+        assert_eq!(args[2].spread, ArgSpread::None);
+        assert_eq!(args[2].name.as_deref(), Some("k"));
+        assert_eq!(args[3].spread, ArgSpread::Mapping);
+        assert!(args[3].name.is_none());
     }
 
     #[test]

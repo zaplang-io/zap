@@ -192,6 +192,7 @@ pub fn param(ty: Ty) -> ParamInfo {
         ty,
         has_default: false,
         variadic: false,
+        kwargs: false,
         keyword_only: false,
     }
 }
@@ -321,6 +322,10 @@ pub struct ParamInfo {
     pub ty: Ty,
     pub has_default: bool,
     pub variadic: bool,
+    /// `true` for a `V **name` keyword-collector parameter (#601): extra keyword
+    /// arguments are collected into a `dict[str, V]`. `ty` holds the value type
+    /// `V` (not the dict), mirroring how a variadic's `ty` holds its element type.
+    pub kwargs: bool,
     /// `true` when the parameter follows the bare `*` separator and is therefore
     /// keyword-only (I#496): it may only be supplied by name at a call site.
     pub keyword_only: bool,
