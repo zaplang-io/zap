@@ -218,7 +218,7 @@ pub fn binary_op_dunder(op: BinOp) -> Option<(&'static str, &'static str)> {
         Shl => ("__lshift__", "LShift"),
         Shr => ("__rshift__", "RShift"),
         // Equality/relational/membership/logical/send are not arithmetic dunders.
-        Eq | Ne | Lt | Le | Gt | Ge | And | Or | In | Send => return None,
+        Eq | Ne | Lt | Le | Gt | Ge | And | Or | In | NotIn | Send => return None,
     })
 }
 
@@ -242,7 +242,7 @@ pub fn inplace_op_dunder(op: BinOp) -> Option<&'static str> {
         BitXor => "__ixor__",
         Shl => "__ilshift__",
         Shr => "__irshift__",
-        Eq | Ne | Lt | Le | Gt | Ge | And | Or | In | Send => return None,
+        Eq | Ne | Lt | Le | Gt | Ge | And | Or | In | NotIn | Send => return None,
     })
 }
 
@@ -271,6 +271,7 @@ pub fn binop_symbol(op: BinOp) -> &'static str {
         Gt => ">",
         Ge => ">=",
         In => "in",
+        NotIn => "not in",
         Send => "<-",
     }
 }

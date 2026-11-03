@@ -315,6 +315,11 @@ destructuring. Not a reference type; no heap header unless boxed.
   floor division** (D-0024).
 - Comparison `== != < <= > >=`; `==` is built-in for scalars and strings —
   collections and user types **define their own equality** (D-0024).
+- Membership `in` / `not in` (D-0024, #593): `x in xs` tests whether `x` is a
+  member of `xs` (a collection element, a `dict` key, or a substring of a
+  `str`); the result is a strict `bool`. `x not in xs` is its negation —
+  identical operand rules and result — and means exactly `not (x in xs)`. `in`
+  participates in Python-style comparison chaining (below); `not in` does not.
 - Boolean `and`, `or`, `not`; **truthiness** is Python-style (empty/zero/`None`
   falsy) *and* strict `bool` is allowed (D-0022). `and`/`or` **short-circuit**
   left-to-right: the right operand is evaluated only when the left does not
@@ -360,6 +365,14 @@ while (v, ok) = it.__next__(); ok: ...`. A user type is iterable by defining
 a Python-style `__next__ -> T` raising `StopIteration` is also accepted for
 porting. Generators (`yield`), built-in collections, `str`, and channels all use
 this one protocol; comprehensions and `in`-fallback do too.
+
+**pass** (#591) is a no-op statement accepted anywhere a statement is expected —
+a function body, any branch of `if`/`elif`/`else`, `for`/`while` (and their
+`else`), `with`, `try`/`except`/`finally`, `scope`, and as the explicit spelling
+of an empty `struct`/`enum` body. It lowers to nothing. `pass` is a contextual
+statement-position word, not a reserved keyword (Appendix A): it is the no-op
+statement only when it stands alone as a statement, and remains usable as an
+ordinary identifier in every other position.
 
 **do-while** (bottom-tested; body runs once before the test, D-0039):
 

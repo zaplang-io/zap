@@ -27,7 +27,7 @@ fn binop_prec(op: BinOp) -> (u8, bool /* right-assoc */) {
         Or => (2, false),
         And => (3, false),
         Send => (P_SEND, false),
-        Eq | Ne | Lt | Le | Gt | Ge | In => (P_CMP, false),
+        Eq | Ne | Lt | Le | Gt | Ge | In | NotIn => (P_CMP, false),
         BitOr => (7, false),
         BitXor => (8, false),
         BitAnd => (9, false),
@@ -42,7 +42,7 @@ fn binop_prec(op: BinOp) -> (u8, bool /* right-assoc */) {
 /// participates in Python-style chaining (I#386).
 fn is_cmp_op(op: BinOp) -> bool {
     use BinOp::*;
-    matches!(op, Eq | Ne | Lt | Le | Gt | Ge | In)
+    matches!(op, Eq | Ne | Lt | Le | Gt | Ge | In | NotIn)
 }
 
 /// The precedence of an expression as a whole (how tightly it already binds).

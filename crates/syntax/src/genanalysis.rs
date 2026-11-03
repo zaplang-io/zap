@@ -143,7 +143,7 @@ fn each_yield_in_stmt<'a>(st: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)) {
                 each_yield_in_block(b, visit);
             }
         }
-        Stmt::Break(_) | Stmt::Continue(_) => {}
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Pass(_) => {}
     }
 }
 

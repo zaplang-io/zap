@@ -109,7 +109,10 @@ param         ::= { "@" decorator_name [ "(" [ arg_list ] ")" ] }
 (* ---------- Structs, interfaces, enums (D-0015, D-0016, D-0018) ---------- *)
 
 struct_def    ::= decorators [ "value" ] "struct" IDENT [ generics ] ":" NEWLINE
-                  INDENT { field | function } DEDENT ;
+                  INDENT { field | function | "pass" NEWLINE } DEDENT ;
+                  (* a bare `pass` is the explicit spelling of an empty struct
+                     body (#591), mirroring the empty-enum case; declares no
+                     field. *)
                   (* "value struct" = opt-in value type (D-0051); plain struct is
                      a reference type (D-0023). "value" is a contextual modifier.
                      Prelude generic structs use this same grammar: `Atomic[T]`
@@ -196,7 +199,14 @@ simple_stmt   ::= decl
                 | "spawn" [ "detached" ] call_expr   (* "detached": D-0044 *)
                 | "break"
                 | "continue"
+                | "pass"                             (* no-op statement, #591 *)
                 | expr ;                       (* ";" may join simple stmts *)
+                  (* "pass" is a contextual statement-position word, not a
+                     reserved keyword: it is a no-op statement (lowers to no IR)
+                     only when it stands alone as a statement (bare `pass`
+                     followed by a terminator); in any other position it is an
+                     ordinary identifier. It is also the explicit spelling of an
+                     empty struct/enum body (see struct_body, enum). *)
 
 decl          ::= [ "const" ] ( type | "auto" ) bind_target "=" expr ;  (* D-0003, D-0049 *)
 assign        ::= bind_target "=" expr ;
@@ -365,7 +375,11 @@ comparison    ::= bit_or { comp_op bit_or }
                      `(a < b) and (b < c) and ...` with each operand evaluated
                      exactly once, left to right, short-circuiting at the first
                      false link (I#386). Parenthesize to defeat chaining. *)
-comp_op       ::= "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" ;
+comp_op       ::= "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "not" "in" ;
+                  (* `not in` (#593) is the negated membership operator, at the
+                     same precedence as `in`. `x not in xs` parses and type-
+                     checks as, and lowers identically to, `not (x in xs)`
+                     (result `bool`). Unlike `in`, it does not chain. *)
 
 bit_or        ::= bit_xor { "|" bit_xor } ;
 bit_xor       ::= bit_and { "^" bit_and } ;

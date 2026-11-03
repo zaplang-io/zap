@@ -582,7 +582,7 @@ fn stmt_span(st: &Stmt) -> Span {
         | Stmt::Spawn { span, .. }
         | Stmt::AssignTuple { span, .. }
         | Stmt::Scope { span, .. } => *span,
-        Stmt::Break(s) | Stmt::Continue(s) => *s,
+        Stmt::Break(s) | Stmt::Continue(s) | Stmt::Pass(s) => *s,
         Stmt::Expr(e) => expr_span(e),
         Stmt::Cfg(b) => b.span,
     }

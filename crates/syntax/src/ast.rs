@@ -481,6 +481,11 @@ pub enum Stmt {
     },
     Break(Span),
     Continue(Span),
+    /// `pass` — a no-op statement (#591). Accepted anywhere a statement is
+    /// expected and lowered to nothing (no IR). `pass` is a contextual
+    /// statement-position word, not a reserved keyword, so it remains usable as
+    /// an ordinary identifier in every other position.
+    Pass(Span),
 }
 
 /// A destructuring bind target (D-0049), used by [`Stmt::LetTuple`] and
@@ -761,6 +766,7 @@ pub enum BinOp {
     Gt,       // >
     Ge,       // >=
     In,       // in  (membership)
+    NotIn,    // not in  (negated membership, #593)
     Send,     // ch <- v  (channel send, D-0031)
 }
 
@@ -804,6 +810,7 @@ pub fn binop_str(op: BinOp) -> &'static str {
         Gt => ">",
         Ge => ">=",
         In => "in",
+        NotIn => "not in",
         Send => "<-",
     }
 }
