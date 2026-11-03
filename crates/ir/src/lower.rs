@@ -6000,7 +6000,10 @@ impl<'a> FnLower<'a> {
                 // to right (Python order). Per-target `base`/`index` sub-
                 // expressions are still evaluated at each store, so a subscript
                 // target's own side effects happen in source order after the RHS.
-                let (v, vt) = self.expr(value)?;
+                let (v, vt) = match targets.iter().find_map(|t| self.assignment_target_ty(t)) {
+                    Some(ty) => self.expr_collection_context(value, ty)?,
+                    None => self.expr(value)?,
+                };
                 for target in targets {
                     self.store_computed(target, v, vt, value)?;
                 }
@@ -10088,10 +10091,53 @@ impl<'a> FnLower<'a> {
         Ok(lf.func)
     }
 
+    /// Collection literals take their element kinds from the destination when
+    /// known (#637). In particular, an empty `{}` must not default to
+    /// dict[int64, int64] when appended to list[dict[str, bool]]. Recurse through
+    /// nested literals, but leave named values alone: a real type mismatch must
+    /// still be rejected, never erased by relabelling its pointer.
+    fn expr_collection_context(&mut self, e: &Expr, target: Ty) -> Result<(Value, Ty), LowerError> {
+        match (e, target) {
+            (Expr::List(items, _), Ty::List(elem)) => {
+                self.lower_list_lit_expected(items, Some(elem))
+            }
+            (Expr::Dict(items, _), Ty::Dict(key, value)) => {
+                self.lower_dict_lit_expected(items, Some((key, value)))
+            }
+            (
+                Expr::IfElse {
+                    cond, then, els, ..
+                },
+                Ty::List(_) | Ty::Dict(..),
+            ) => {
+                let (cv, cty) = self.expr(cond)?;
+                let c = self.truthy(cv, cty);
+                let (a, at) = self.expr_collection_context(then, target)?;
+                let (b, bt) = self.expr_collection_context(els, target)?;
+                if at != target || bt != target {
+                    return Err(err(format!(
+                        "conditional collection branches must match expected `{}` (found `{}` and `{}`)",
+                        self.render_ty(&target), self.render_ty(&at), self.render_ty(&bt)
+                    )));
+                }
+                let d = self.new_value(target);
+                self.emit(Inst::Select {
+                    dest: d,
+                    cond: c,
+                    a,
+                    b,
+                });
+                Ok((d, target))
+            }
+            _ => self.expr(e),
+        }
+    }
+
     /// Lower an expression in a position whose expected ZIR type is `target`
     /// (I#163): a `lambda` is lowered against the expected function type (the
-    /// only way its parameter types are known). Everything else lowers normally
-    /// and is coerced.
+    /// only way its parameter types are known). Collection literals also inherit
+    /// their destination element kinds; other expressions lower normally and
+    /// are coerced.
     fn expr_coerced(
         &mut self,
         e: &Expr,
@@ -10136,7 +10182,7 @@ impl<'a> FnLower<'a> {
             self.emit(Inst::NullConst { dest: d });
             return Ok(d);
         }
-        let (v, vt) = self.expr(e)?;
+        let (v, vt) = self.expr_collection_context(e, target)?;
         // A function value coerced to a `fn(...)` slot (argument / assignment /
         // return) must have the *exact* structural signature of that slot
         // (I#465). First-class function values are monomorphic: the
@@ -11438,23 +11484,35 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_list_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
+        self.lower_list_lit_expected(elems, None)
+    }
+
+    fn lower_list_lit_expected(
+        &mut self,
+        elems: &[Expr],
+        expected: Option<Elem>,
+    ) -> Result<(Value, Ty), LowerError> {
         // Build a fresh list and append each element in source order. A `*expr`
         // splat (#598) iterates its operand and appends each spliced element in
-        // place. The element kind is fixed by the first appended element (an
-        // empty literal defaults to `i64`), and every later element must share
-        // that representation.
+        // place. Use the expected element kind when known, otherwise infer from
+        // the first appended element (an unconstrained empty literal defaults to
+        // `i64`). Every element must share that representation.
         let list = self.new_value(Ty::List(Elem::I64));
         self.emit(Inst::Call {
             dest: Some(list),
             func: "zap_list_new".to_string(),
             args: vec![],
         });
-        let elem: std::cell::Cell<Option<Elem>> = std::cell::Cell::new(None);
+        let elem: std::cell::Cell<Option<Elem>> = std::cell::Cell::new(expected);
         let push = |s: &mut FnLower<'a>, v: Value, t: Ty| -> Result<(), LowerError> {
             let ek = match elem.get() {
                 Some(e) => {
                     if list_elem_kind(t, &s.ctx.nested)? != e {
-                        return Err(err("list elements must all have the same representation"));
+                        return Err(err(format!(
+                            "list element expects `{}`, found `{}`",
+                            s.render_ty(&s.elem_ty(e)),
+                            s.render_ty(&t)
+                        )));
                     }
                     e
                 }
@@ -11476,10 +11534,18 @@ impl<'a> FnLower<'a> {
         for el in elems {
             match el {
                 Expr::Starred { value, .. } => {
-                    self.iterate(value, |s, v, t| push(s, v, t))?;
+                    if let (Some(kind), Expr::List(_, _)) = (elem.get(), value.as_ref()) {
+                        let (source, _) = self.expr_collection_context(value, Ty::List(kind))?;
+                        self.iterate_list(source, kind, |s, v, t| push(s, v, t))?;
+                    } else {
+                        self.iterate(value, |s, v, t| push(s, v, t))?;
+                    }
                 }
                 _ => {
-                    let (v, t) = self.expr(el)?;
+                    let (v, t) = match elem.get() {
+                        Some(kind) => self.expr_collection_context(el, self.elem_ty(kind))?,
+                        None => self.expr(el)?,
+                    };
                     push(self, v, t)?;
                 }
             }
@@ -11490,22 +11556,34 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_dict_lit(&mut self, items: &[DictItem]) -> Result<(Value, Ty), LowerError> {
+        self.lower_dict_lit_expected(items, None)
+    }
+
+    fn lower_dict_lit_expected(
+        &mut self,
+        items: &[DictItem],
+        expected: Option<(Elem, Elem)>,
+    ) -> Result<(Value, Ty), LowerError> {
         // Build a fresh dict and set each entry in source order. A `**expr` merge
         // (#598) copies another dict's entries in place, so a later entry — a
         // pair or a merge — overrides an earlier key (Python's last-wins
-        // semantics). The key/value kinds are fixed by the first entry.
+        // semantics). Use expected key/value kinds when available, otherwise
+        // infer them from the first entry.
         let dict = self.new_value(Ty::Dict(Elem::I64, Elem::I64));
         self.emit(Inst::Call {
             dest: Some(dict),
             func: "zap_dict_new".to_string(),
             args: vec![],
         });
-        let kinds: std::cell::Cell<Option<(Elem, Elem)>> = std::cell::Cell::new(None);
+        let kinds: std::cell::Cell<Option<(Elem, Elem)>> = std::cell::Cell::new(expected);
         for it in items {
             match it {
                 DictItem::Pair(k, v) => {
                     let (kv, kt) = self.expr(k)?;
-                    let (vv, vt) = self.expr(v)?;
+                    let (vv, vt) = match kinds.get() {
+                        Some((_, kind)) => self.expr_collection_context(v, self.elem_ty(kind))?,
+                        None => self.expr(v)?,
+                    };
                     let (kk, vk) = match kinds.get() {
                         Some((kk, vk)) => {
                             if elem_kind(kt, &self.ctx.nested)? != kk
@@ -11538,7 +11616,12 @@ impl<'a> FnLower<'a> {
                     });
                 }
                 DictItem::Spread(e) => {
-                    let (src, st) = self.expr(e)?;
+                    let (src, st) = match kinds.get() {
+                        Some((key, value)) => {
+                            self.expr_collection_context(e, Ty::Dict(key, value))?
+                        }
+                        None => self.expr(e)?,
+                    };
                     let Ty::Dict(skk, svk) = st else {
                         return Err(err("`**` in a dict display requires a dict"));
                     };
@@ -12605,6 +12688,46 @@ impl<'a> FnLower<'a> {
         Ok((d, out_ty))
     }
 
+    fn check_index_value(&self, actual: Ty, expected: Elem, list: bool) -> Result<(), LowerError> {
+        // Indexed float stores already widen integers via `coerce`.
+        if list && expected == Elem::F64 && actual.int_width().is_some() {
+            return Ok(());
+        }
+        let kind = if list {
+            list_elem_kind(actual, &self.ctx.nested)?
+        } else {
+            elem_kind(actual, &self.ctx.nested)?
+        };
+        if kind != expected {
+            return Err(err(format!(
+                "indexed assignment expects `{}`, found `{}`",
+                self.render_ty(&self.elem_ty(expected)),
+                self.render_ty(&actual)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Find an existing assignment destination's type without evaluating its
+    /// base or index. Chained assignment must still evaluate its RHS only once,
+    /// before any target's side effects, while contextualizing empty literals.
+    fn assignment_target_ty(&self, target: &Expr) -> Option<Ty> {
+        match target {
+            Expr::Name(name, _) => self.lookup(name).map(|(_, ty)| ty),
+            Expr::Attr { base, name, .. } => {
+                let Ty::Struct(sid) = self.assignment_target_ty(base)? else {
+                    return None;
+                };
+                self.ctx.field(sid, name).map(|(_, ty)| ty)
+            }
+            Expr::Index { base, .. } => match self.assignment_target_ty(base)? {
+                Ty::List(elem) | Ty::Dict(_, elem) => Some(self.elem_ty(elem)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn lower_index_set(
         &mut self,
         base: &Expr,
@@ -12616,7 +12739,8 @@ impl<'a> FnLower<'a> {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce(iv, it, Ty::I64);
-                let (v, vt) = self.expr(value)?;
+                let (v, vt) = self.expr_collection_context(value, self.elem_ty(elem))?;
+                self.check_index_value(vt, elem, true)?;
                 let v = self.coerce(v, vt, elem.ty());
                 let v = self.box_if_value(v, elem.ty());
                 self.emit(Inst::Call {
@@ -12630,7 +12754,8 @@ impl<'a> FnLower<'a> {
                 let (kv, kt) = self.expr(index)?;
                 let kv = self.coerce(kv, kt, kk.ty());
                 let kv = self.box_if_value(kv, kk.ty());
-                let (v, vt) = self.expr(value)?;
+                let (v, vt) = self.expr_collection_context(value, self.elem_ty(vk))?;
+                self.check_index_value(vt, vk, false)?;
                 let v = self.coerce(v, vt, vk.ty());
                 let v = self.box_if_value(v, vk.ty());
                 let kfns = self.key_fn_args(kk)?;
@@ -12741,6 +12866,7 @@ impl<'a> FnLower<'a> {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce(iv, it, Ty::I64);
+                self.check_index_value(vt, elem, true)?;
                 let v = self.coerce(v, vt, elem.ty());
                 let v = self.box_if_value(v, elem.ty());
                 self.emit(Inst::Call {
@@ -12754,6 +12880,7 @@ impl<'a> FnLower<'a> {
                 let (kv, kt) = self.expr(index)?;
                 let kv = self.coerce(kv, kt, kk.ty());
                 let kv = self.box_if_value(kv, kk.ty());
+                self.check_index_value(vt, vk, false)?;
                 let v = self.coerce(v, vt, vk.ty());
                 let v = self.box_if_value(v, vk.ty());
                 let kfns = self.key_fn_args(kk)?;
@@ -12847,7 +12974,7 @@ impl<'a> FnLower<'a> {
                 if args.len() != 1 {
                     return Err(err("append() takes exactly one argument"));
                 }
-                let (v, vt) = self.expr(&args[0].value)?;
+                let (v, vt) = self.expr_collection_context(&args[0].value, self.elem_ty(elem))?;
                 if list_elem_kind(vt, &self.ctx.nested)? != elem {
                     return Err(err("append() value has the wrong element type"));
                 }

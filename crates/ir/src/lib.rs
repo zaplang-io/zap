@@ -74,6 +74,72 @@ mod tests {
     }
 
     #[test]
+    fn nested_empty_literals_use_destination_types() {
+        lower_ok(include_str!(
+            "../../../tests/golden/nested_empty_append.zap"
+        ));
+    }
+
+    #[test]
+    fn nested_append_still_rejects_incompatible_values() {
+        for (declaration, value) in [
+            ("list[dict[str, bool]] values = []", "{1: False}"),
+            ("list[list[str]] values = []", "[1]"),
+            ("list[list[dict[str, bool]]] values = []", "[{1: True}]"),
+            ("list[dict[str, bool]] values = []", "wrong"),
+        ] {
+            let source = format!(
+                "def main():\n    dict[int64, bool] wrong = {{1: True}}\n    {declaration}\n    values.append({value})\n"
+            );
+            let (ast, parse, lex) = parse_str(&source);
+            assert!(parse.is_empty() && lex.is_empty());
+            let (_, errors) = lower_module(&ast);
+            assert!(!errors.is_empty(), "incompatible append accepted: {value}");
+        }
+    }
+
+    #[test]
+    fn nested_index_and_conditional_reject_incompatible_values() {
+        for operation in [
+            "names[0] = {1: 2}",
+            "names[0] = wrong",
+            "maps[\"x\"] = {1: 2}",
+            "maps[\"x\"] = wrong",
+            "names[0] = names[1] = wrong",
+            "names.append({} if True else wrong)",
+            "names.append(wrong if True else {})",
+            "names.append({} if True else {1: 2})",
+            "names.append({1: 2} if True else {})",
+            "names[0] = {} if True else wrong",
+            "maps[\"x\"] = wrong if True else {}",
+        ] {
+            let source = format!(
+                "def main():\n    list[dict[str, bool]] names = [{{}}, {{}}]\n    dict[str, dict[str, bool]] maps = {{}}\n    dict[int64, int64] wrong = {{1: 2}}\n    {operation}\n"
+            );
+            let (ast, parse, lex) = parse_str(&source);
+            assert!(parse.is_empty() && lex.is_empty(), "{operation}");
+            let (_, errors) = lower_module(&ast);
+            assert!(
+                !errors.is_empty(),
+                "incompatible store accepted: {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_element_mismatch_names_expected_and_actual_types() {
+        let (ast, parse, lex) = parse_str("def main():\n    list[float64] xs = [1, 2]\n");
+        assert!(parse.is_empty() && lex.is_empty());
+        let (_, errors) = lower_module(&ast);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("expects `f64`, found `i64`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn nested_collection_key_is_a_loud_error() {
         // #625: a collection is unhashable, so using one as a dict key or a set
         // element must fail loudly rather than silently hashing its pointer as a
