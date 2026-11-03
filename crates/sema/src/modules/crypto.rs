@@ -17,6 +17,13 @@
 //! The raw-bytes HMAC-SHA256 digest (for chaining, e.g. AWS SigV4, #153):
 //!   `crypto.hmac_sha256_raw(key, msg) -> bytes`
 //!
+//! RSA PKCS#1 v1.5 signing over a PEM-encoded private key (PKCS#1 or PKCS#8),
+//! returning the RAW signature bytes (for CloudFront signed URLs, #628):
+//!   `crypto.rsa_sha1_sign(pem_key, data) -> bytes`
+//!   `crypto.rsa_sha256_sign(pem_key, data) -> bytes`
+//! Verification against a PEM-encoded public key:
+//!   `crypto.rsa_sha256_verify(pem_pubkey, data, sig) -> bool`
+//!
 //! Secure random from the OS CSPRNG (getentropy / /dev/urandom):
 //!   `crypto.random_bytes(n) -> bytes` ; `crypto.token_hex(n) -> str`
 
@@ -142,6 +149,51 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                 expect_data(checker, method, &args[1]);
             }
             Some(Ty::Bytes)
+        }
+        // RSA PKCS#1 v1.5 signing: crypto.rsa_<hash>_sign(pem_key, data) -> bytes
+        // (the raw signature over the hash of `data`). The PEM private key may be
+        // PKCS#1 (`BEGIN RSA PRIVATE KEY`) or PKCS#8 (`BEGIN PRIVATE KEY`). The
+        // CloudFront base64 variant is applied by the caller, not here (#628).
+        "rsa_sha1_sign" | "rsa_sha256_sign" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(pem_key, data) takes 2 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+            }
+            Some(Ty::Bytes)
+        }
+        // crypto.rsa_sha256_verify(pem_pubkey, data, sig) -> bool: true iff `sig`
+        // is a valid RSA-SHA256 PKCS#1 v1.5 signature over `data` (#628).
+        "rsa_sha256_verify" => {
+            if args.len() != 3 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(pem_pubkey, data, sig) takes 3 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+                expect_data(checker, method, &args[2]);
+            }
+            Some(Ty::Bool)
         }
         // crypto.random_bytes(n) -> bytes: n cryptographically secure random bytes.
         "random_bytes" => {

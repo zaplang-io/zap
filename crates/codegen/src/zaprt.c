@@ -13913,8 +13913,98 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
  * ========================================================================== */
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
+
+/* ==========================================================================
+ * crypto: RSA PKCS#1 v1.5 signing (ticket #628, D-0102)
+ * --------------------------------------------------------------------------
+ * The only OpenSSL-backed entries in the `crypto` module — the hashing/HMAC/
+ * CSPRNG section above is deliberately self-contained, but RSA (bignum
+ * modular exponentiation + ASN.1 key parsing) would be a large, security-
+ * sensitive reimplementation, and OpenSSL is already linked (`-lssl -lcrypto`)
+ * for `tls`. They live here, below the OpenSSL includes, rather than in the
+ * reference-hash section.
+ *
+ * `zap_crypto_rsa_sha1_sign` / `..._sha256_sign` load a PEM private key
+ * (PKCS#1 `BEGIN RSA PRIVATE KEY` or PKCS#8 `BEGIN PRIVATE KEY`, both handled
+ * transparently by PEM_read_bio_PrivateKey) and return the RAW PKCS#1 v1.5
+ * signature over the message digest as a `bytes` value — callers base64 /
+ * CloudFront-encode as needed (CloudFront signed URLs, #628). A malformed key
+ * or a signing failure raises a catchable ValueError. No GC safepoint runs
+ * across the EVP calls, and the OpenSSL objects are non-GC heap freed before
+ * return; the GC `bytes` result is the last allocation, mirroring the hash
+ * one-shots. */
+static void *zap_crypto_rsa_sign(const EVP_MD *md, void *pem, void *data) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *d = (ZapStr *)data;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey = bio ? PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("crypto: could not parse RSA private key from PEM", 48));
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned char *sig = NULL;
+    size_t siglen = 0;
+    int ok = ctx && EVP_DigestSignInit(ctx, NULL, md, NULL, pkey) == 1 &&
+             EVP_DigestSign(ctx, NULL, &siglen, (const unsigned char *)d->data,
+                            (size_t)d->len) == 1 &&
+             (sig = (unsigned char *)malloc(siglen ? siglen : 1)) != NULL &&
+             EVP_DigestSign(ctx, sig, &siglen, (const unsigned char *)d->data,
+                            (size_t)d->len) == 1;
+    if (!ok) {
+        free(sig);
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("crypto: RSA signing failed", 26));
+    }
+    void *out = zap_str_new((const char *)sig, (int64_t)siglen);
+    free(sig);
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return out;
+}
+
+void *zap_crypto_rsa_sha1_sign(void *pem, void *data) {
+    return zap_crypto_rsa_sign(EVP_sha1(), pem, data);
+}
+void *zap_crypto_rsa_sha256_sign(void *pem, void *data) {
+    return zap_crypto_rsa_sign(EVP_sha256(), pem, data);
+}
+
+/* Verify an RSA-SHA256 PKCS#1 v1.5 signature against a PEM public key
+ * (`BEGIN PUBLIC KEY`). Returns 1 on a valid signature, 0 otherwise — a bad
+ * key or any verification failure is a plain `false`, never a panic (#628). */
+int64_t zap_crypto_rsa_sha256_verify(void *pem, void *data, void *sig) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *d = (ZapStr *)data;
+    ZapStr *s = (ZapStr *)sig;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey = bio ? PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        return 0;
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    int64_t ok = 0;
+    if (ctx && EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey) == 1) {
+        ok = EVP_DigestVerify(ctx, (const unsigned char *)s->data, (size_t)s->len,
+                              (const unsigned char *)d->data, (size_t)d->len) == 1
+                 ? 1
+                 : 0;
+    }
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return ok;
+}
 
 /* OpenSSL's stock socket BIO calls write/send without MSG_NOSIGNAL. A peer
  * reset can therefore terminate the process during SSL_read's alert write or
