@@ -3397,14 +3397,16 @@ impl Parser {
         if self.eat(&TokenKind::RParen) {
             return Expr::Tuple(Vec::new(), self.span_from(start));
         }
-        let first = self.parse_expr();
-        if self.is(&TokenKind::Comma) {
+        let first = self.parse_display_elem();
+        // A leading `*rest` forces a tuple display (#598): `(*rest)` cannot be a
+        // grouping parenthesis.
+        if self.is(&TokenKind::Comma) || matches!(first, Expr::Starred { .. }) {
             let mut elems = vec![first];
             while self.eat(&TokenKind::Comma) {
                 if self.is(&TokenKind::RParen) {
                     break;
                 }
-                elems.push(self.parse_expr());
+                elems.push(self.parse_display_elem());
             }
             self.expect(&TokenKind::RParen, "')'");
             Expr::Tuple(elems, self.span_from(start))
@@ -3419,15 +3421,15 @@ impl Parser {
         if self.eat(&TokenKind::RBracket) {
             return Expr::List(Vec::new(), self.span_from(start));
         }
-        let first = self.parse_expr();
-        if self.is_kw(Keyword::For) {
-            let (var, iter, cond) = self.parse_comp_clause();
+        let first = self.parse_display_elem();
+        // A comprehension needs a plain first element; `[*xs for ...]` is not a
+        // comprehension (#598/#599).
+        if self.is_kw(Keyword::For) && !matches!(first, Expr::Starred { .. }) {
+            let clauses = self.parse_comp_clauses();
             self.expect(&TokenKind::RBracket, "']'");
             return Expr::ListComp {
                 elem: Box::new(first),
-                var,
-                iter: Box::new(iter),
-                cond: cond.map(Box::new),
+                clauses,
                 span: self.span_from(start),
             };
         }
@@ -3436,10 +3438,26 @@ impl Parser {
             if self.is(&TokenKind::RBracket) {
                 break;
             }
-            elems.push(self.parse_expr());
+            elems.push(self.parse_display_elem());
         }
         self.expect(&TokenKind::RBracket, "']'");
         Expr::List(elems, self.span_from(start))
+    }
+
+    /// Parse one element of a list/set/tuple display, which may be a `*expr`
+    /// splat (#598) that splices an iterable's elements in place.
+    fn parse_display_elem(&mut self) -> Expr {
+        if self.is(&TokenKind::Star) {
+            let start = self.peek_span().start;
+            self.bump(); // '*'
+            let value = self.parse_expr();
+            Expr::Starred {
+                value: Box::new(value),
+                span: self.span_from(start),
+            }
+        } else {
+            self.parse_expr()
+        }
     }
 
     /// A brace literal: a **dict** when it has `key: value` pairs, a **set** when
@@ -3450,6 +3468,16 @@ impl Parser {
         if self.eat(&TokenKind::RBrace) {
             return Expr::Dict(Vec::new(), self.span_from(start));
         }
+        // `**expr` unambiguously begins a dict display: a merge entry (#598).
+        if self.is(&TokenKind::StarStar) {
+            let first = self.parse_dict_item();
+            return self.parse_dict_items_rest(start, first);
+        }
+        // `*expr` unambiguously begins a set display: a splat element (#598).
+        if self.is(&TokenKind::Star) {
+            let first = self.parse_display_elem();
+            return self.parse_set_rest(start, first);
+        }
         let first = self.parse_expr();
         // A `:` after the first element means this is a dict; anything else
         // (`,`, `}`, or a `for`) means a set.
@@ -3459,31 +3487,44 @@ impl Parser {
         self.parse_set_rest(start, first)
     }
 
+    /// Parse one dict display entry: `**expr` (a merge, #598) or `key: value`.
+    fn parse_dict_item(&mut self) -> DictItem {
+        if self.eat(&TokenKind::StarStar) {
+            DictItem::Spread(self.parse_expr())
+        } else {
+            let k = self.parse_expr();
+            self.expect(&TokenKind::Colon, "':'");
+            let v = self.parse_expr();
+            DictItem::Pair(k, v)
+        }
+    }
+
     /// Finish a dict literal (or dict comprehension) whose first key is `first`.
     fn parse_dict_rest(&mut self, start: u32, first_key: Expr) -> Expr {
         self.expect(&TokenKind::Colon, "':'");
         let first_val = self.parse_expr();
         if self.is_kw(Keyword::For) {
-            let (var, iter, cond) = self.parse_comp_clause();
+            let clauses = self.parse_comp_clauses();
             self.expect(&TokenKind::RBrace, "'}'");
             return Expr::DictComp {
                 key: Box::new(first_key),
                 value: Box::new(first_val),
-                var,
-                iter: Box::new(iter),
-                cond: cond.map(Box::new),
+                clauses,
                 span: self.span_from(start),
             };
         }
-        let mut items = vec![(first_key, first_val)];
+        self.parse_dict_items_rest(start, DictItem::Pair(first_key, first_val))
+    }
+
+    /// Finish a dict literal given its first entry; reads the remaining
+    /// comma-separated entries (`key: value` or `**expr`).
+    fn parse_dict_items_rest(&mut self, start: u32, first: DictItem) -> Expr {
+        let mut items = vec![first];
         while self.eat(&TokenKind::Comma) {
             if self.is(&TokenKind::RBrace) {
                 break;
             }
-            let k = self.parse_expr();
-            self.expect(&TokenKind::Colon, "':'");
-            let v = self.parse_expr();
-            items.push((k, v));
+            items.push(self.parse_dict_item());
         }
         self.expect(&TokenKind::RBrace, "'}'");
         Expr::Dict(items, self.span_from(start))
@@ -3491,14 +3532,14 @@ impl Parser {
 
     /// Finish a set literal (or set comprehension) whose first element is `first`.
     fn parse_set_rest(&mut self, start: u32, first: Expr) -> Expr {
-        if self.is_kw(Keyword::For) {
-            let (var, iter, cond) = self.parse_comp_clause();
+        // A comprehension needs a plain first element; `{*xs for ...}` is not a
+        // comprehension (#598/#599).
+        if self.is_kw(Keyword::For) && !matches!(first, Expr::Starred { .. }) {
+            let clauses = self.parse_comp_clauses();
             self.expect(&TokenKind::RBrace, "'}'");
             return Expr::SetComp {
                 elem: Box::new(first),
-                var,
-                iter: Box::new(iter),
-                cond: cond.map(Box::new),
+                clauses,
                 span: self.span_from(start),
             };
         }
@@ -3507,25 +3548,37 @@ impl Parser {
             if self.is(&TokenKind::RBrace) {
                 break;
             }
-            elems.push(self.parse_expr());
+            elems.push(self.parse_display_elem());
         }
         self.expect(&TokenKind::RBrace, "'}'");
         Expr::Set(elems, self.span_from(start))
     }
 
-    /// `for TARGET in ITER [if COND]` — the comprehension clause. The iterable
-    /// and filter are parsed without a trailing ternary (so `if` is the filter).
-    fn parse_comp_clause(&mut self) -> (String, Expr, Option<Expr>) {
-        self.expect_kw(Keyword::For, "'for'");
-        let var = self.ident("comprehension variable");
-        self.expect_kw(Keyword::In, "'in'");
-        let iter = self.parse_or_expr();
-        let cond = if self.eat_kw(Keyword::If) {
-            Some(self.parse_or_expr())
-        } else {
-            None
-        };
-        (var, iter, cond)
+    /// Parse the clause list of a comprehension: one or more `for TARGET in
+    /// ITER` clauses, each optionally followed by one or more `if COND` filters
+    /// (#599). The leading `for` must already be the next token. Iterables and
+    /// filters are parsed without a trailing ternary (so `if` reads as a filter,
+    /// not a conditional expression).
+    fn parse_comp_clauses(&mut self) -> Vec<CompClause> {
+        let mut clauses = Vec::new();
+        while self.is_kw(Keyword::For) {
+            let cstart = self.peek_span().start;
+            self.expect_kw(Keyword::For, "'for'");
+            let var = self.ident("comprehension variable");
+            self.expect_kw(Keyword::In, "'in'");
+            let iter = self.parse_or_expr();
+            let mut ifs = Vec::new();
+            while self.eat_kw(Keyword::If) {
+                ifs.push(self.parse_or_expr());
+            }
+            clauses.push(CompClause {
+                var,
+                iter: Box::new(iter),
+                ifs,
+                span: self.span_from(cstart),
+            });
+        }
+        clauses
     }
 
     // --- patterns (match-case) ---
@@ -3941,7 +3994,97 @@ mod tests {
         let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
             panic!();
         };
-        assert!(matches!(value, Expr::ListComp { cond: Some(_), .. }));
+        assert!(matches!(
+            value,
+            Expr::ListComp { clauses, .. } if clauses.len() == 1 && clauses[0].ifs.len() == 1
+        ));
+    }
+
+    #[test]
+    fn comprehension_multiple_for_and_if_clauses() {
+        // Two `for` clauses with a trailing filter (#599).
+        let m = parse_ok("xs = [x * y for x in a for y in b if x != y]\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        let Expr::ListComp { clauses, .. } = value else {
+            panic!("expected a list comprehension");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].var, "x");
+        assert!(clauses[0].ifs.is_empty());
+        assert_eq!(clauses[1].var, "y");
+        assert_eq!(clauses[1].ifs.len(), 1);
+
+        // A filter on the first clause, then a second `for`: the `if` attaches
+        // to the clause it follows.
+        let m = parse_ok("xs = [x for x in a if x > 0 for y in b]\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        let Expr::ListComp { clauses, .. } = value else {
+            panic!("expected a list comprehension");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].ifs.len(), 1);
+        assert!(clauses[1].ifs.is_empty());
+    }
+
+    #[test]
+    fn starred_display_elements_parse() {
+        // `*expr` in a list display (#598).
+        let m = parse_ok("xs = [1, *a, 2, *b]\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        let Expr::List(elems, _) = value else {
+            panic!("expected a list display");
+        };
+        assert_eq!(elems.len(), 4);
+        assert!(matches!(elems[1], Expr::Starred { .. }));
+        assert!(matches!(elems[3], Expr::Starred { .. }));
+
+        // `*expr` in a set display, and `(x, *rest)` in a tuple display.
+        let m = parse_ok("s = {*a, *b}\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(
+            matches!(value, Expr::Set(e, _) if e.len() == 2 && e.iter().all(|x| matches!(x, Expr::Starred { .. })))
+        );
+
+        let m = parse_ok("t = (x, *rest)\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(
+            matches!(value, Expr::Tuple(e, _) if e.len() == 2 && matches!(e[1], Expr::Starred { .. }))
+        );
+    }
+
+    #[test]
+    fn dict_display_double_star_merge_parses() {
+        // `**expr` merges in a dict display (#598), mixed with pairs.
+        let m = parse_ok("d = {\"a\": 1, **other, \"b\": 2}\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        let Expr::Dict(items, _) = value else {
+            panic!("expected a dict display");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], DictItem::Pair(..)));
+        assert!(matches!(items[1], DictItem::Spread(_)));
+        assert!(matches!(items[2], DictItem::Pair(..)));
+
+        // A brace starting with `**` is a dict, not a set.
+        let m = parse_ok("d = {**other}\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(
+            matches!(value, Expr::Dict(items, _) if items.len() == 1 && matches!(items[0], DictItem::Spread(_)))
+        );
     }
 
     #[test]

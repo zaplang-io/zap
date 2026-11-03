@@ -619,6 +619,30 @@ pub struct Arg {
     pub span: Span,
 }
 
+/// An entry in a dict display (#598). A `**expr` merge has no key, so it cannot
+/// be a [`Pair`](DictItem::Pair) and gets its own variant.
+#[derive(Clone, Debug)]
+pub enum DictItem {
+    /// `key: value`.
+    Pair(Expr, Expr),
+    /// `**expr` — merge another `dict[K, V]`'s entries, later entries winning
+    /// (#598).
+    Spread(Expr),
+}
+
+/// One `for TARGET in ITER` clause of a comprehension together with the `if`
+/// filters that immediately follow it (#599). Each filter constrains the
+/// clauses to its left: it is evaluated inside this clause's loop, before the
+/// next clause runs. A single-clause comprehension has one entry with at most
+/// one filter, matching the pre-#599 shape.
+#[derive(Clone, Debug)]
+pub struct CompClause {
+    pub var: String,
+    pub iter: Box<Expr>,
+    pub ifs: Vec<Expr>,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub enum Expr {
     // Literals (raw lexeme retained for numerics).
@@ -649,34 +673,39 @@ pub enum Expr {
 
     Tuple(Vec<Expr>, Span),
     List(Vec<Expr>, Span),
-    Dict(Vec<(Expr, Expr)>, Span),
+    Dict(Vec<DictItem>, Span),
     /// `{a, b, c}` — a set literal: braces with comma-separated elements and no
     /// `key: value` pairs (empty `{}` parses as an empty [`Expr::Dict`]).
     Set(Vec<Expr>, Span),
 
-    /// `[elem for var in iter if cond]`
-    ListComp {
-        elem: Box<Expr>,
-        var: String,
-        iter: Box<Expr>,
-        cond: Option<Box<Expr>>,
+    /// `*expr` spliced into a list/set/tuple display (#598): the operand's
+    /// elements are spread in place. Legal only as a direct element of a
+    /// list/set/tuple display; sema/lowering reject it elsewhere. Dict `**expr`
+    /// merges are carried by [`DictItem::Spread`] instead (no key to attach to).
+    Starred {
+        value: Box<Expr>,
         span: Span,
     },
-    /// `{key: value for var in iter if cond}`
+
+    /// `[elem for CLAUSES]` where `CLAUSES` is one or more `for` clauses with
+    /// interleaved `if` filters (#599). `clauses` is non-empty and its first
+    /// entry is the leading `for`.
+    ListComp {
+        elem: Box<Expr>,
+        clauses: Vec<CompClause>,
+        span: Span,
+    },
+    /// `{key: value for CLAUSES}` (#599).
     DictComp {
         key: Box<Expr>,
         value: Box<Expr>,
-        var: String,
-        iter: Box<Expr>,
-        cond: Option<Box<Expr>>,
+        clauses: Vec<CompClause>,
         span: Span,
     },
-    /// `{elem for var in iter if cond}`
+    /// `{elem for CLAUSES}` (#599).
     SetComp {
         elem: Box<Expr>,
-        var: String,
-        iter: Box<Expr>,
-        cond: Option<Box<Expr>>,
+        clauses: Vec<CompClause>,
         span: Span,
     },
 
@@ -887,10 +916,14 @@ pub fn render_expr(e: &Expr) -> String {
         }
         Expr::List(xs, _) => format!("[{}]", render_list(xs)),
         Expr::Set(xs, _) => format!("{{{}}}", render_list(xs)),
-        Expr::Dict(pairs, _) => {
-            let body = pairs
+        Expr::Starred { value, .. } => format!("*{}", render_expr(value)),
+        Expr::Dict(items, _) => {
+            let body = items
                 .iter()
-                .map(|(k, v)| format!("{}: {}", render_expr(k), render_expr(v)))
+                .map(|it| match it {
+                    DictItem::Pair(k, v) => format!("{}: {}", render_expr(k), render_expr(v)),
+                    DictItem::Spread(e) => format!("**{}", render_expr(e)),
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{{{body}}}")

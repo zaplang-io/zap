@@ -1343,6 +1343,18 @@ impl Walk {
         }
     }
 
+    /// Bind each comprehension clause's loop variable and walk its iterable and
+    /// `if` filters (#599).
+    fn comp_clauses(&mut self, clauses: &[CompClause]) {
+        for c in clauses {
+            self.expr(&c.iter);
+            self.bind(c.var.clone(), c.span, SymbolKind::Local);
+            for f in &c.ifs {
+                self.expr(f);
+            }
+        }
+    }
+
     fn expr(&mut self, e: &Expr) {
         match e {
             Expr::Name(n, span) => self.name_refs.push(NameRef {
@@ -1365,48 +1377,31 @@ impl Walk {
                     self.expr(x);
                 }
             }
-            Expr::Dict(pairs, _) => {
-                for (k, v) in pairs {
-                    self.expr(k);
-                    self.expr(v);
+            Expr::Starred { value, .. } => self.expr(value),
+            Expr::Dict(items, _) => {
+                for it in items {
+                    match it {
+                        DictItem::Pair(k, v) => {
+                            self.expr(k);
+                            self.expr(v);
+                        }
+                        DictItem::Spread(e) => self.expr(e),
+                    }
                 }
             }
-            Expr::ListComp {
-                elem,
-                var,
-                iter,
-                cond,
-                span,
-            }
-            | Expr::SetComp {
-                elem,
-                var,
-                iter,
-                cond,
-                span,
-            } => {
-                self.bind(var.clone(), *span, SymbolKind::Local);
+            Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+                self.comp_clauses(clauses);
                 self.expr(elem);
-                self.expr(iter);
-                if let Some(c) = cond {
-                    self.expr(c);
-                }
             }
             Expr::DictComp {
                 key,
                 value,
-                var,
-                iter,
-                cond,
-                span,
+                clauses,
+                ..
             } => {
-                self.bind(var.clone(), *span, SymbolKind::Local);
+                self.comp_clauses(clauses);
                 self.expr(key);
                 self.expr(value);
-                self.expr(iter);
-                if let Some(c) = cond {
-                    self.expr(c);
-                }
             }
             Expr::Unary { expr, .. } => self.expr(expr),
             Expr::Binary { lhs, rhs, .. } => {
@@ -1507,6 +1502,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::Dict(_, s)
         | Expr::Set(_, s) => *s,
         Expr::Str { span, .. }
+        | Expr::Starred { span, .. }
         | Expr::ListComp { span, .. }
         | Expr::DictComp { span, .. }
         | Expr::SetComp { span, .. }

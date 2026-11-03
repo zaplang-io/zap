@@ -91,41 +91,29 @@ pub fn render(e: &Expr) -> String {
         Expr::Tuple(xs, _) => render_tuple(xs),
         Expr::List(xs, _) => format!("[{}]", render_elems(xs)),
         Expr::Set(xs, _) => format!("{{{}}}", render_elems(xs)),
-        Expr::Dict(pairs, _) => {
-            if pairs.is_empty() {
+        Expr::Starred { value, .. } => format!("*{}", pexpr(value, P_LAMBDA)),
+        Expr::Dict(items, _) => {
+            if items.is_empty() {
                 "{}".to_string()
             } else {
-                format!("{{{}}}", render_pairs(pairs))
+                format!("{{{}}}", render_dict_items(items))
             }
         }
 
-        Expr::ListComp {
-            elem,
-            var,
-            iter,
-            cond,
-            ..
-        } => format!("[{}]", comp_body(&pexpr(elem, P_TERNARY), var, iter, cond)),
-        Expr::SetComp {
-            elem,
-            var,
-            iter,
-            cond,
-            ..
-        } => format!(
-            "{{{}}}",
-            comp_body(&pexpr(elem, P_TERNARY), var, iter, cond)
-        ),
+        Expr::ListComp { elem, clauses, .. } => {
+            format!("[{}]", comp_body(&pexpr(elem, P_TERNARY), clauses))
+        }
+        Expr::SetComp { elem, clauses, .. } => {
+            format!("{{{}}}", comp_body(&pexpr(elem, P_TERNARY), clauses))
+        }
         Expr::DictComp {
             key,
             value,
-            var,
-            iter,
-            cond,
+            clauses,
             ..
         } => {
             let head = format!("{}: {}", pexpr(key, P_TERNARY), pexpr(value, P_TERNARY));
-            format!("{{{}}}", comp_body(&head, var, iter, cond))
+            format!("{{{}}}", comp_body(&head, clauses))
         }
 
         Expr::Unary { op, expr, .. } => match op {
@@ -250,10 +238,13 @@ fn render_tuple(xs: &[Expr]) -> String {
     }
 }
 
-fn render_pairs(pairs: &[(Expr, Expr)]) -> String {
-    pairs
+fn render_dict_items(items: &[DictItem]) -> String {
+    items
         .iter()
-        .map(|(k, v)| format!("{}: {}", pexpr(k, P_LAMBDA), pexpr(v, P_LAMBDA)))
+        .map(|it| match it {
+            DictItem::Pair(k, v) => format!("{}: {}", pexpr(k, P_LAMBDA), pexpr(v, P_LAMBDA)),
+            DictItem::Spread(e) => format!("**{}", pexpr(e, P_LAMBDA)),
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -303,12 +294,15 @@ fn render_slice(
     }
 }
 
-fn comp_body(head: &str, var: &str, iter: &Expr, cond: &Option<Box<Expr>>) -> String {
-    let base = format!("{head} for {var} in {}", pexpr(iter, 2));
-    match cond {
-        Some(c) => format!("{base} if {}", pexpr(c, 2)),
-        None => base,
+fn comp_body(head: &str, clauses: &[CompClause]) -> String {
+    let mut out = head.to_string();
+    for c in clauses {
+        out.push_str(&format!(" for {} in {}", c.var, pexpr(&c.iter, 2)));
+        for f in &c.ifs {
+            out.push_str(&format!(" if {}", pexpr(f, 2)));
+        }
     }
+    out
 }
 
 /// Choose a regex delimiter that does not collide with the pattern text.

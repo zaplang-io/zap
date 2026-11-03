@@ -199,10 +199,11 @@ These read and behave as in Python and need no translation:
 
 - **f-strings** — `f"{x:.2f}"`, including the Python format mini-language and
   PEP 701 nesting (SPEC §9.3; #285/#498).
-- **Comprehensions** — list, dict, and set comprehensions, with multiple `for`
-  and `if` clauses on the roadmap (#599).
+- **Comprehensions** — list, dict, and set comprehensions, with any number of
+  `for` clauses and interleaved `if` filters (#599; SPEC §8).
 - **Displays** — list `[...]`, dict `{k: v}`, and set `{...}` literals (empty
-  `{}` is a dict; SPEC §4, §8).
+  `{}` is a dict; SPEC §4, §8), including `*`/`**` unpacking: `[1, *xs]`,
+  `{*a, *b}`, `(x, *rest)`, `{**a, "k": v}` (#598).
 - **`match` / `case`** — literals, captures, wildcard `_`, or-patterns, guards,
   sequence/tuple/struct patterns, and qualified value patterns such as
   `case Color.RED:` (SPEC §6; D-0040).

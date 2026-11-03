@@ -565,6 +565,12 @@ define_codes! {
          feed a variadic `TYPE... name` parameter, and `**expr` can only feed a \
          `V **name` keyword-collector; they must appear in Python order \
          (positionals, then `*`, then keywords, then `**`).";
+    ZAP5123 = 5123 : "invalid display unpacking",
+        "A `*expr` in a list/set/tuple display splices an iterable whose \
+         elements have the display's element type; a `**expr` in a dict display \
+         merges another `dict[K, V]` whose keys and values have the display's \
+         key/value types (#598). The operand's type must agree with the \
+         surrounding display.";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

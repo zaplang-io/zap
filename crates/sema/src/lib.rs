@@ -3152,80 +3152,81 @@ impl Checker {
                     Ty::Unknown
                 }
             }
+            Expr::Starred { value, span } => {
+                // A `*expr` is only meaningful as a direct element of a
+                // list/set/tuple display, which consume it themselves (#598).
+                // Reaching the generic dispatch means it appeared elsewhere.
+                self.infer(value);
+                self.error(
+                    ErrorCode::ZAP5123,
+                    "`*expr` may appear only as an element of a list, set, or \
+                     tuple display (#598)"
+                        .to_string(),
+                    *span,
+                );
+                Ty::Unknown
+            }
             Expr::Tuple(elems, _) => {
                 // A tuple literal's type is the (defaulted) element types in
-                // positional order (D-0049); `()` is the empty tuple.
-                Ty::Tuple(
-                    elems
-                        .iter()
-                        .map(|el| default_type(self.infer(el)))
-                        .collect(),
-                )
+                // positional order (D-0049); `()` is the empty tuple. A `*t`
+                // splat (#598) expands a tuple operand's element types in place;
+                // only a statically-sized tuple can be spliced into a tuple.
+                let mut tys = Vec::new();
+                for el in elems {
+                    match el {
+                        Expr::Starred { value, span } => {
+                            let t = self.infer(value);
+                            match t {
+                                Ty::Tuple(inner) => {
+                                    tys.extend(inner.into_iter().map(default_type));
+                                }
+                                Ty::Unknown => {}
+                                other => self.error(
+                                    ErrorCode::ZAP5123,
+                                    format!(
+                                        "`*` in a tuple display requires a tuple \
+                                         (statically sized), found '{}' (#598)",
+                                        other.display()
+                                    ),
+                                    *span,
+                                ),
+                            }
+                        }
+                        _ => tys.push(default_type(self.infer(el))),
+                    }
+                }
+                Ty::Tuple(tys)
             }
             Expr::List(elems, _) => {
-                let mut elem = Ty::Unknown;
-                for (i, el) in elems.iter().enumerate() {
-                    let t = self.infer(el);
-                    elem = if i == 0 { t } else { join(&elem, &t) };
-                }
+                let elem = self.infer_display_elems(elems);
                 let ty = Ty::List(Box::new(elem));
                 self.check_numeric_container_value(&ty, expr_span(e));
                 ty
             }
             Expr::Dict(items, span) => {
-                let mut kt = Ty::Unknown;
-                let mut vt = Ty::Unknown;
-                for (i, (k, v)) in items.iter().enumerate() {
-                    let k2 = self.infer(k);
-                    let v2 = self.infer(v);
-                    if i == 0 {
-                        kt = k2;
-                        vt = v2;
-                    } else {
-                        kt = join(&kt, &k2);
-                        vt = join(&vt, &v2);
-                    }
-                }
+                let (kt, vt) = self.infer_dict_items(items);
                 self.warn_struct_key(&kt, *span);
                 let ty = Ty::Dict(Box::new(kt), Box::new(vt));
                 self.check_numeric_container_value(&ty, *span);
                 ty
             }
-            Expr::ListComp {
-                elem,
-                var,
-                iter,
-                cond,
-                span,
-            } => {
-                let it = self.infer(iter);
-                let e_ty = self.iter_element(&it, *span);
+            Expr::ListComp { elem, clauses, .. } => {
                 self.push_scope();
-                self.declare(var, e_ty, *span);
-                if let Some(c) = cond {
-                    self.infer(c);
-                }
+                self.check_comp_clauses(clauses);
                 let et = self.infer(elem);
                 self.pop_scope();
                 let ty = Ty::List(Box::new(et));
-                self.check_numeric_container_value(&ty, *span);
+                self.check_numeric_container_value(&ty, expr_span(e));
                 ty
             }
             Expr::DictComp {
                 key,
                 value,
-                var,
-                iter,
-                cond,
+                clauses,
                 span,
             } => {
-                let it = self.infer(iter);
-                let e_ty = self.iter_element(&it, *span);
                 self.push_scope();
-                self.declare(var, e_ty, *span);
-                if let Some(c) = cond {
-                    self.infer(c);
-                }
+                self.check_comp_clauses(clauses);
                 let kt = self.infer(key);
                 let vt = self.infer(value);
                 self.pop_scope();
@@ -3234,11 +3235,7 @@ impl Checker {
                 ty
             }
             Expr::Set(elems, span) => {
-                let mut elem = Ty::Unknown;
-                for (i, el) in elems.iter().enumerate() {
-                    let t = self.infer(el);
-                    elem = if i == 0 { t } else { join(&elem, &t) };
-                }
+                let elem = self.infer_display_elems(elems);
                 self.warn_struct_key(&elem, *span);
                 let ty = Ty::Set(Box::new(elem));
                 self.check_numeric_container_value(&ty, *span);
@@ -3246,18 +3243,11 @@ impl Checker {
             }
             Expr::SetComp {
                 elem,
-                var,
-                iter,
-                cond,
+                clauses,
                 span,
             } => {
-                let it = self.infer(iter);
-                let e_ty = self.iter_element(&it, *span);
                 self.push_scope();
-                self.declare(var, e_ty, *span);
-                if let Some(c) = cond {
-                    self.infer(c);
-                }
+                self.check_comp_clauses(clauses);
                 let et = self.infer(elem);
                 self.pop_scope();
                 let ty = Ty::Set(Box::new(et));
@@ -3731,6 +3721,135 @@ impl Checker {
     /// The element type of `for`/comprehension iteration over `it`, emitting a
     /// compile error (D-0048) when `it` is not iterable. Returns [`Ty::Unknown`]
     /// on error so checking continues.
+    /// Infer the element type of a list/set display whose elements may include
+    /// `*expr` splats (#598). A splat contributes the spliced iterable's element
+    /// type; a plain element contributes its own type. Element types are joined,
+    /// and a splat whose element type cannot agree with the display's is a clear
+    /// error (type-first).
+    fn infer_display_elems(&mut self, elems: &[Expr]) -> Ty {
+        let mut elem = Ty::Unknown;
+        let mut first = true;
+        for el in elems {
+            let t = match el {
+                Expr::Starred { value, span } => {
+                    let it = self.infer(value);
+                    self.iter_element(&it, *span)
+                }
+                _ => self.infer(el),
+            };
+            if first {
+                elem = t;
+                first = false;
+            } else {
+                let joined = join(&elem, &t);
+                if matches!(joined, Ty::Unknown)
+                    && !matches!(elem, Ty::Unknown)
+                    && !matches!(t, Ty::Unknown)
+                    && matches!(el, Expr::Starred { .. })
+                {
+                    self.error(
+                        ErrorCode::ZAP5123,
+                        format!(
+                            "spliced elements have type '{}', which does not \
+                             match the display's element type '{}' (#598)",
+                            t.display(),
+                            elem.display()
+                        ),
+                        expr_span(el),
+                    );
+                }
+                elem = joined;
+            }
+        }
+        elem
+    }
+
+    /// Infer the key/value types of a dict display whose entries may include
+    /// `**expr` merges (#598). A merge contributes the spliced dict's key/value
+    /// types; a pair contributes its key/value types. A `**` operand that is not
+    /// a dict, or whose entry types disagree with the display's, is a clear
+    /// error (type-first).
+    fn infer_dict_items(&mut self, items: &[DictItem]) -> (Ty, Ty) {
+        let mut kt = Ty::Unknown;
+        let mut vt = Ty::Unknown;
+        let mut first = true;
+        for it in items {
+            let (k2, v2) = match it {
+                DictItem::Pair(k, v) => (self.infer(k), self.infer(v)),
+                DictItem::Spread(e) => {
+                    let t = self.infer(e);
+                    match &t {
+                        Ty::Dict(dk, dv) => ((**dk).clone(), (**dv).clone()),
+                        Ty::Unknown => (Ty::Unknown, Ty::Unknown),
+                        other => {
+                            self.error(
+                                ErrorCode::ZAP5123,
+                                format!(
+                                    "`**` in a dict display requires a dict, \
+                                     found '{}' (#598)",
+                                    other.display()
+                                ),
+                                expr_span(e),
+                            );
+                            (Ty::Unknown, Ty::Unknown)
+                        }
+                    }
+                }
+            };
+            if first {
+                kt = k2;
+                vt = v2;
+                first = false;
+            } else {
+                if matches!(it, DictItem::Spread(_)) {
+                    let jk = join(&kt, &k2);
+                    let jv = join(&vt, &v2);
+                    let bad = (matches!(jk, Ty::Unknown)
+                        && !matches!(kt, Ty::Unknown)
+                        && !matches!(k2, Ty::Unknown))
+                        || (matches!(jv, Ty::Unknown)
+                            && !matches!(vt, Ty::Unknown)
+                            && !matches!(v2, Ty::Unknown));
+                    if bad {
+                        self.error(
+                            ErrorCode::ZAP5123,
+                            format!(
+                                "merged entries have type 'dict[{}, {}]', which \
+                                 does not match the display's 'dict[{}, {}]' (#598)",
+                                k2.display(),
+                                v2.display(),
+                                kt.display(),
+                                vt.display()
+                            ),
+                            expr_span(match it {
+                                DictItem::Spread(e) => e,
+                                DictItem::Pair(k, _) => k,
+                            }),
+                        );
+                    }
+                }
+                kt = join(&kt, &k2);
+                vt = join(&vt, &v2);
+            }
+        }
+        (kt, vt)
+    }
+
+    /// Declare each comprehension clause's loop variable and infer its iterable
+    /// and `if` filters, left to right, in the current (shared) scope (#599).
+    /// Later clauses may refer to earlier clauses' variables. The caller pushes
+    /// and pops the surrounding scope.
+    fn check_comp_clauses(&mut self, clauses: &[CompClause]) {
+        for c in clauses {
+            let it = self.infer(&c.iter);
+            let e_ty = self.iter_element(&it, c.span);
+            self.declare(&c.var, e_ty, c.span);
+            for f in &c.ifs {
+                self.infer(f);
+            }
+        }
+    }
+
     fn iter_element(&mut self, it: &Ty, span: Span) -> Ty {
         match self.iterable_elem(it) {
             Some(e) => e,
@@ -5798,6 +5917,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::Dict(_, s)
         | Expr::Set(_, s) => *s,
         Expr::Str { span, .. }
+        | Expr::Starred { span, .. }
         | Expr::ListComp { span, .. }
         | Expr::DictComp { span, .. }
         | Expr::SetComp { span, .. }
@@ -6120,6 +6240,59 @@ def main():
                 .iter()
                 .any(|e| e.code == ErrorCode::ZAP5122)
         );
+    }
+
+    #[test]
+    fn display_unpacking_type_checks(/* #598 */) {
+        // `*` splices into list/set/tuple; `**` merges into a dict. Spliced
+        // element/entry types agree with the display.
+        ok(r#"
+def main():
+    list[int64] xs = [2, 3]
+    list[int64] ys = [1, *xs, 4, *xs]
+    set[int64] s = {*xs, 5, *[6, 7]}
+    auto tup = (10, 20)
+    auto t = (1, *tup, 2)
+    dict[str, int64] base = {"a": 1}
+    dict[str, int64] m = {"b": 2, **base, "c": 3}
+"#);
+    }
+
+    #[test]
+    fn display_unpacking_type_mismatch_rejected(/* #598 */) {
+        // A `*`-splat whose element type disagrees with the list element type.
+        let e = errors("def main():\n    list[str] ss = [\"a\"]\n    list[int64] xs = [1, *ss]\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5123),
+            "expected ZAP5123, got {e:?}"
+        );
+
+        // A `**`-merge whose operand is not a dict.
+        let e = errors("def main():\n    list[int64] xs = [1]\n    auto d = {\"a\": 1, **xs}\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5123),
+            "expected ZAP5123, got {e:?}"
+        );
+
+        // A `*`-splat into a tuple requires a tuple operand, not a list.
+        let e = errors("def main():\n    list[int64] xs = [1, 2]\n    auto t = (0, *xs)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5123),
+            "expected ZAP5123, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn multi_clause_comprehension_type_checks(/* #599 */) {
+        // Later clauses see earlier clauses' variables; filters reference them.
+        ok(r#"
+def main():
+    list[int64] xs = [1, 2, 3]
+    list[int64] ys = [1, 2, 3]
+    list[int64] prod = [x * y for x in xs for y in ys if x != y]
+    dict[int64, int64] grid = {x * 10 + y: x + y for x in range(2) for y in range(2)}
+    set[int64] cells = {x + y for x in xs for y in ys if x > 0 if y > 0}
+"#);
     }
 
     #[test]

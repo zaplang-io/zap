@@ -89,6 +89,11 @@ fn semantic_codes() {
          def main():\n    auto xs = [1, 2]\n    auto y = f(*xs)\n",
         "ZAP5122",
     );
+    // A `**`-merge of a non-dict operand in a dict display (#598).
+    assert_code(
+        "def main():\n    list[int64] xs = [1]\n    auto d = {\"a\": 1, **xs}\n",
+        "ZAP5123",
+    );
 }
 
 #[test]

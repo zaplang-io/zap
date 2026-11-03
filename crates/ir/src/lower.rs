@@ -11,7 +11,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use zapc_syntax::ast::{
-    self, BinOp as AstBin, BindTarget, Expr, PatArg, Pattern, Stmt, UnOp as AstUn,
+    self, BinOp as AstBin, BindTarget, CompClause, DictItem, Expr, PatArg, Pattern, Stmt,
+    UnOp as AstUn,
 };
 use zapc_syntax::fstring::{self, Align, FStringPart, FormatSpec};
 
@@ -7589,15 +7590,52 @@ impl<'a> FnLower<'a> {
         Ok(())
     }
 
-    /// `[elem for var in iter if cond]` (D-0048): build a fresh list, iterate the
-    /// source through the general protocol, and push `elem` for each element that
-    /// passes the optional filter.
+    /// Desugar a comprehension clause list into nested loops (#599). Each clause
+    /// iterates its source through the general protocol, binds its loop variable
+    /// in a fresh scope, and applies its `if` filters there (so each filter
+    /// constrains the clauses to its left) before recursing into the remaining
+    /// clauses; `emit` runs once at the innermost level per surviving tuple of
+    /// bindings. A single clause with one filter reproduces the pre-#599 shape
+    /// (one `iterate` wrapping one `comp_guard`).
+    fn lower_comp_clauses(
+        &mut self,
+        clauses: &[CompClause],
+        emit: &mut dyn FnMut(&mut FnLower<'a>) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        match clauses.split_first() {
+            None => emit(self),
+            Some((clause, rest)) => self.iterate(&clause.iter, |s, v, ty| {
+                s.push_scope();
+                let slot = s.alloca(ty);
+                s.store(slot, v);
+                s.declare(&clause.var, slot, ty);
+                s.guard_all(&clause.ifs, &mut |s| s.lower_comp_clauses(rest, emit))?;
+                s.pop_scope();
+                Ok(())
+            }),
+        }
+    }
+
+    /// Run `work` guarded by each of `conds` as nested `if` filters (#599): the
+    /// filters are evaluated outer-to-inner, so `work` runs only when all of
+    /// them hold. An empty `conds` runs `work` unconditionally.
+    fn guard_all(
+        &mut self,
+        conds: &[Expr],
+        work: &mut dyn FnMut(&mut FnLower<'a>) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        match conds.split_first() {
+            None => work(self),
+            Some((c, rest)) => self.comp_guard(Some(c), |s| s.guard_all(rest, work)),
+        }
+    }
+
+    /// `[elem for CLAUSES]` (D-0048, #599): build a fresh list, desugar the
+    /// clauses to nested loops, and push `elem` at the innermost level.
     fn lower_list_comp(
         &mut self,
         elem_e: &Expr,
-        var: &str,
-        iter: &Expr,
-        cond: Option<&Expr>,
+        clauses: &[CompClause],
     ) -> Result<(Value, Ty), LowerError> {
         let list = self.new_value(Ty::List(Elem::I64));
         self.emit(Inst::Call {
@@ -7606,40 +7644,31 @@ impl<'a> FnLower<'a> {
             args: vec![],
         });
         let kind = std::cell::Cell::new(None);
-        self.iterate(iter, |s, v, ty| {
-            s.push_scope();
-            let slot = s.alloca(ty);
-            s.store(slot, v);
-            s.declare(var, slot, ty);
-            s.comp_guard(cond, |s| {
-                let (ev, et) = s.expr(elem_e)?;
-                let ek = list_elem_kind(et)?;
-                kind.set(Some(ek));
-                let ev = s.coerce(ev, et, ek.ty());
-                let ev = s.box_if_value(ev, ek.ty());
-                s.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_list_push_{}", ek.val_suffix()),
-                    args: vec![list, ev],
-                });
-                Ok(())
-            })?;
-            s.pop_scope();
+        let mut emit = |s: &mut FnLower<'a>| -> Result<(), LowerError> {
+            let (ev, et) = s.expr(elem_e)?;
+            let ek = list_elem_kind(et)?;
+            kind.set(Some(ek));
+            let ev = s.coerce(ev, et, ek.ty());
+            let ev = s.box_if_value(ev, ek.ty());
+            s.emit(Inst::Call {
+                dest: None,
+                func: format!("zap_list_push_{}", ek.val_suffix()),
+                args: vec![list, ev],
+            });
             Ok(())
-        })?;
+        };
+        self.lower_comp_clauses(clauses, &mut emit)?;
         let elem = kind.get().unwrap_or(Elem::I64);
         self.func.value_types[list as usize] = Ty::List(elem);
         Ok((list, Ty::List(elem)))
     }
 
-    /// `{elem for var in iter if cond}` (D-0048): like [`lower_list_comp`] into a
-    /// fresh set.
+    /// `{elem for CLAUSES}` (D-0048, #599): like [`lower_list_comp`] into a fresh
+    /// set.
     fn lower_set_comp(
         &mut self,
         elem_e: &Expr,
-        var: &str,
-        iter: &Expr,
-        cond: Option<&Expr>,
+        clauses: &[CompClause],
     ) -> Result<(Value, Ty), LowerError> {
         let set = self.new_value(Ty::Set(Elem::I64));
         self.emit(Inst::Call {
@@ -7648,44 +7677,35 @@ impl<'a> FnLower<'a> {
             args: vec![],
         });
         let kind = std::cell::Cell::new(None);
-        self.iterate(iter, |s, v, ty| {
-            s.push_scope();
-            let slot = s.alloca(ty);
-            s.store(slot, v);
-            s.declare(var, slot, ty);
-            s.comp_guard(cond, |s| {
-                let (ev, et) = s.expr(elem_e)?;
-                let ek = elem_kind(et)?;
-                kind.set(Some(ek));
-                let ev = s.coerce(ev, et, ek.ty());
-                let ev = s.box_if_value(ev, ek.ty());
-                let kfns = s.key_fn_args(ek)?;
-                let mut args = vec![set, ev];
-                args.extend_from_slice(&kfns);
-                s.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_set_add_{}", ek.key_suffix()),
-                    args,
-                });
-                Ok(())
-            })?;
-            s.pop_scope();
+        let mut emit = |s: &mut FnLower<'a>| -> Result<(), LowerError> {
+            let (ev, et) = s.expr(elem_e)?;
+            let ek = elem_kind(et)?;
+            kind.set(Some(ek));
+            let ev = s.coerce(ev, et, ek.ty());
+            let ev = s.box_if_value(ev, ek.ty());
+            let kfns = s.key_fn_args(ek)?;
+            let mut args = vec![set, ev];
+            args.extend_from_slice(&kfns);
+            s.emit(Inst::Call {
+                dest: None,
+                func: format!("zap_set_add_{}", ek.key_suffix()),
+                args,
+            });
             Ok(())
-        })?;
+        };
+        self.lower_comp_clauses(clauses, &mut emit)?;
         let elem = kind.get().unwrap_or(Elem::I64);
         self.func.value_types[set as usize] = Ty::Set(elem);
         Ok((set, Ty::Set(elem)))
     }
 
-    /// `{key: value for var in iter if cond}` (D-0048): like [`lower_list_comp`]
-    /// into a fresh dict.
+    /// `{key: value for CLAUSES}` (D-0048, #599): like [`lower_list_comp`] into a
+    /// fresh dict.
     fn lower_dict_comp(
         &mut self,
         key_e: &Expr,
         val_e: &Expr,
-        var: &str,
-        iter: &Expr,
-        cond: Option<&Expr>,
+        clauses: &[CompClause],
     ) -> Result<(Value, Ty), LowerError> {
         let dict = self.new_value(Ty::Dict(Elem::I64, Elem::I64));
         self.emit(Inst::Call {
@@ -7694,34 +7714,27 @@ impl<'a> FnLower<'a> {
             args: vec![],
         });
         let kinds = std::cell::Cell::new(None);
-        self.iterate(iter, |s, v, ty| {
-            s.push_scope();
-            let slot = s.alloca(ty);
-            s.store(slot, v);
-            s.declare(var, slot, ty);
-            s.comp_guard(cond, |s| {
-                let (kv, kt) = s.expr(key_e)?;
-                let (vv, vt) = s.expr(val_e)?;
-                let kk = elem_kind(kt)?;
-                let vk = elem_kind(vt)?;
-                kinds.set(Some((kk, vk)));
-                let kv = s.coerce(kv, kt, kk.ty());
-                let vv = s.coerce(vv, vt, vk.ty());
-                let kv = s.box_if_value(kv, kk.ty());
-                let vv = s.box_if_value(vv, vk.ty());
-                let kfns = s.key_fn_args(kk)?;
-                let mut args = vec![dict, kv, vv];
-                args.extend_from_slice(&kfns);
-                s.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
-                    args,
-                });
-                Ok(())
-            })?;
-            s.pop_scope();
+        let mut emit = |s: &mut FnLower<'a>| -> Result<(), LowerError> {
+            let (kv, kt) = s.expr(key_e)?;
+            let (vv, vt) = s.expr(val_e)?;
+            let kk = elem_kind(kt)?;
+            let vk = elem_kind(vt)?;
+            kinds.set(Some((kk, vk)));
+            let kv = s.coerce(kv, kt, kk.ty());
+            let vv = s.coerce(vv, vt, vk.ty());
+            let kv = s.box_if_value(kv, kk.ty());
+            let vv = s.box_if_value(vv, vk.ty());
+            let kfns = s.key_fn_args(kk)?;
+            let mut args = vec![dict, kv, vv];
+            args.extend_from_slice(&kfns);
+            s.emit(Inst::Call {
+                dest: None,
+                func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                args,
+            });
             Ok(())
-        })?;
+        };
+        self.lower_comp_clauses(clauses, &mut emit)?;
         let (kk, vk) = kinds.get().unwrap_or((Elem::I64, Elem::I64));
         self.func.value_types[dict as usize] = Ty::Dict(kk, vk);
         Ok((dict, Ty::Dict(kk, vk)))
@@ -8558,28 +8571,20 @@ impl<'a> FnLower<'a> {
             Expr::Dict(items, _) => self.lower_dict_lit(items),
             Expr::Set(elems, _) => self.lower_set_lit(elems),
             Expr::Tuple(elems, _) => self.lower_tuple_lit(elems),
-            Expr::ListComp {
-                elem,
-                var,
-                iter,
-                cond,
-                ..
-            } => self.lower_list_comp(elem, var, iter, cond.as_deref()),
-            Expr::SetComp {
-                elem,
-                var,
-                iter,
-                cond,
-                ..
-            } => self.lower_set_comp(elem, var, iter, cond.as_deref()),
+            // A `*expr` is only meaningful as a direct element of a
+            // list/set/tuple display, which consume it themselves (#598); sema
+            // rejects it anywhere else, so reaching here is a lowering bug.
+            Expr::Starred { .. } => Err(err(
+                "`*expr` is only valid as an element of a list, set, or tuple display",
+            )),
+            Expr::ListComp { elem, clauses, .. } => self.lower_list_comp(elem, clauses),
+            Expr::SetComp { elem, clauses, .. } => self.lower_set_comp(elem, clauses),
             Expr::DictComp {
                 key,
                 value,
-                var,
-                iter,
-                cond,
+                clauses,
                 ..
-            } => self.lower_dict_comp(key, value, var, iter, cond.as_deref()),
+            } => self.lower_dict_comp(key, value, clauses),
             Expr::Index { base, index, .. } => self.lower_index_get(base, index),
             Expr::Slice {
                 base, lo, hi, step, ..
@@ -11295,114 +11300,218 @@ impl<'a> FnLower<'a> {
     }
 
     fn lower_list_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
-        // Evaluate elements left-to-right first; the first fixes the element
-        // kind (an empty literal defaults to `i64`).
-        let mut lowered = Vec::with_capacity(elems.len());
-        for e in elems {
-            lowered.push(self.expr(e)?);
-        }
-        let elem = match lowered.first() {
-            Some(&(_, t)) => list_elem_kind(t)?,
-            None => Elem::I64,
-        };
-        let list = self.new_value(Ty::List(elem));
+        // Build a fresh list and append each element in source order. A `*expr`
+        // splat (#598) iterates its operand and appends each spliced element in
+        // place. The element kind is fixed by the first appended element (an
+        // empty literal defaults to `i64`), and every later element must share
+        // that representation.
+        let list = self.new_value(Ty::List(Elem::I64));
         self.emit(Inst::Call {
             dest: Some(list),
             func: "zap_list_new".to_string(),
             args: vec![],
         });
-        let push = format!("zap_list_push_{}", elem.val_suffix());
-        for (v, vt) in lowered {
-            if list_elem_kind(vt)? != elem {
-                return Err(err("list elements must all have the same representation"));
-            }
-            let v = self.coerce(v, vt, elem.ty());
-            let v = self.box_if_value(v, elem.ty());
-            self.emit(Inst::Call {
+        let elem: std::cell::Cell<Option<Elem>> = std::cell::Cell::new(None);
+        let push = |s: &mut FnLower<'a>, v: Value, t: Ty| -> Result<(), LowerError> {
+            let ek = match elem.get() {
+                Some(e) => {
+                    if list_elem_kind(t)? != e {
+                        return Err(err("list elements must all have the same representation"));
+                    }
+                    e
+                }
+                None => {
+                    let e = list_elem_kind(t)?;
+                    elem.set(Some(e));
+                    e
+                }
+            };
+            let v = s.coerce(v, t, ek.ty());
+            let v = s.box_if_value(v, ek.ty());
+            s.emit(Inst::Call {
                 dest: None,
-                func: push.clone(),
+                func: format!("zap_list_push_{}", ek.val_suffix()),
                 args: vec![list, v],
             });
+            Ok(())
+        };
+        for el in elems {
+            match el {
+                Expr::Starred { value, .. } => {
+                    self.iterate(value, |s, v, t| push(s, v, t))?;
+                }
+                _ => {
+                    let (v, t) = self.expr(el)?;
+                    push(self, v, t)?;
+                }
+            }
         }
-        Ok((list, Ty::List(elem)))
+        let ek = elem.get().unwrap_or(Elem::I64);
+        self.func.value_types[list as usize] = Ty::List(ek);
+        Ok((list, Ty::List(ek)))
     }
 
-    fn lower_dict_lit(&mut self, items: &[(Expr, Expr)]) -> Result<(Value, Ty), LowerError> {
-        let mut lowered = Vec::with_capacity(items.len());
-        for (k, v) in items {
-            let kv = self.expr(k)?;
-            let vv = self.expr(v)?;
-            lowered.push((kv, vv));
-        }
-        let (kk, vk) = match lowered.first() {
-            Some(&((_, kt), (_, vt))) => (elem_kind(kt)?, elem_kind(vt)?),
-            None => (Elem::I64, Elem::I64),
-        };
-        let dict = self.new_value(Ty::Dict(kk, vk));
+    fn lower_dict_lit(&mut self, items: &[DictItem]) -> Result<(Value, Ty), LowerError> {
+        // Build a fresh dict and set each entry in source order. A `**expr` merge
+        // (#598) copies another dict's entries in place, so a later entry — a
+        // pair or a merge — overrides an earlier key (Python's last-wins
+        // semantics). The key/value kinds are fixed by the first entry.
+        let dict = self.new_value(Ty::Dict(Elem::I64, Elem::I64));
         self.emit(Inst::Call {
             dest: Some(dict),
             func: "zap_dict_new".to_string(),
             args: vec![],
         });
-        let set = format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix());
-        // Struct keys hash/compare through their own `__hash__`/`__eq__`, passed
-        // as function pointers to the `_fn` entry point (D-0047); empty otherwise.
-        let kfns = self.key_fn_args(kk)?;
-        for ((kv, kt), (vv, vt)) in lowered {
-            if elem_kind(kt)? != kk || elem_kind(vt)? != vk {
-                return Err(err(
-                    "dict keys/values must all have the same representation",
-                ));
+        let kinds: std::cell::Cell<Option<(Elem, Elem)>> = std::cell::Cell::new(None);
+        for it in items {
+            match it {
+                DictItem::Pair(k, v) => {
+                    let (kv, kt) = self.expr(k)?;
+                    let (vv, vt) = self.expr(v)?;
+                    let (kk, vk) = match kinds.get() {
+                        Some((kk, vk)) => {
+                            if elem_kind(kt)? != kk || elem_kind(vt)? != vk {
+                                return Err(err(
+                                    "dict keys/values must all have the same representation",
+                                ));
+                            }
+                            (kk, vk)
+                        }
+                        None => {
+                            let kk = elem_kind(kt)?;
+                            let vk = elem_kind(vt)?;
+                            kinds.set(Some((kk, vk)));
+                            (kk, vk)
+                        }
+                    };
+                    let kv = self.coerce(kv, kt, kk.ty());
+                    let vv = self.coerce(vv, vt, vk.ty());
+                    let kv = self.box_if_value(kv, kk.ty());
+                    let vv = self.box_if_value(vv, vk.ty());
+                    let kfns = self.key_fn_args(kk)?;
+                    let mut cargs = vec![dict, kv, vv];
+                    cargs.extend_from_slice(&kfns);
+                    self.emit(Inst::Call {
+                        dest: None,
+                        func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                        args: cargs,
+                    });
+                }
+                DictItem::Spread(e) => {
+                    let (src, st) = self.expr(e)?;
+                    let Ty::Dict(skk, svk) = st else {
+                        return Err(err("`**` in a dict display requires a dict"));
+                    };
+                    match kinds.get() {
+                        Some((kk, vk)) => {
+                            if skk != kk || svk != vk {
+                                return Err(err(
+                                    "dict keys/values must all have the same representation",
+                                ));
+                            }
+                        }
+                        None => kinds.set(Some((skk, svk))),
+                    }
+                    self.merge_dict_into(dict, src, skk, svk)?;
+                }
             }
-            let kv = self.coerce(kv, kt, kk.ty());
-            let vv = self.coerce(vv, vt, vk.ty());
-            let kv = self.box_if_value(kv, kk.ty());
-            let vv = self.box_if_value(vv, vk.ty());
-            let mut cargs = vec![dict, kv, vv];
-            cargs.extend_from_slice(&kfns);
-            self.emit(Inst::Call {
-                dest: None,
-                func: set.clone(),
-                args: cargs,
-            });
         }
+        let (kk, vk) = kinds.get().unwrap_or((Elem::I64, Elem::I64));
+        self.func.value_types[dict as usize] = Ty::Dict(kk, vk);
         Ok((dict, Ty::Dict(kk, vk)))
     }
 
+    /// Copy every entry of `src` (a `dict[kk, vk]`) into `dst` (#598): snapshot
+    /// `src`'s keys, then for each key set `dst[key] = src[key]`, so a key
+    /// already in `dst` is overwritten (last-wins merge semantics).
+    fn merge_dict_into(
+        &mut self,
+        dst: Value,
+        src: Value,
+        kk: Elem,
+        vk: Elem,
+    ) -> Result<(), LowerError> {
+        let keys = self.new_value(Ty::List(kk));
+        self.emit(Inst::Call {
+            dest: Some(keys),
+            func: format!("zap_dict_keys_{}", kk.val_suffix()),
+            args: vec![src],
+        });
+        let kfns = self.key_fn_args(kk)?;
+        let get_fn = format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix());
+        let set_fn = format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix());
+        self.iterate_list(keys, kk, |s, key, _| {
+            let val = s.new_value(vk.ty());
+            let mut gargs = vec![src, key];
+            gargs.extend_from_slice(&kfns);
+            s.emit(Inst::Call {
+                dest: Some(val),
+                func: get_fn.clone(),
+                args: gargs,
+            });
+            let mut sargs = vec![dst, key, val];
+            sargs.extend_from_slice(&kfns);
+            s.emit(Inst::Call {
+                dest: None,
+                func: set_fn.clone(),
+                args: sargs,
+            });
+            Ok(())
+        })
+    }
+
     fn lower_set_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {
-        // Elements are evaluated left-to-right; the first fixes the element kind
-        // (an empty literal is a dict, so a set literal always has >= 1 element).
-        let mut lowered = Vec::with_capacity(elems.len());
-        for e in elems {
-            lowered.push(self.expr(e)?);
-        }
-        let elem = match lowered.first() {
-            Some(&(_, t)) => elem_kind(t)?,
-            None => Elem::I64,
-        };
-        let set = self.new_value(Ty::Set(elem));
+        // Build a fresh set and add each element in source order; a `*expr` splat
+        // (#598) iterates its operand and adds each spliced element. The element
+        // kind is fixed by the first added element (an empty `{}` is a dict, so a
+        // set literal always has >= 1 element).
+        let set = self.new_value(Ty::Set(Elem::I64));
         self.emit(Inst::Call {
             dest: Some(set),
             func: "zap_set_new".to_string(),
             args: vec![],
         });
-        let add = format!("zap_set_add_{}", elem.key_suffix());
-        let kfns = self.key_fn_args(elem)?;
-        for (v, vt) in lowered {
-            if elem_kind(vt)? != elem {
-                return Err(err("set elements must all have the same representation"));
-            }
-            let v = self.coerce(v, vt, elem.ty());
-            let v = self.box_if_value(v, elem.ty());
+        let elem: std::cell::Cell<Option<Elem>> = std::cell::Cell::new(None);
+        let add = |s: &mut FnLower<'a>, v: Value, t: Ty| -> Result<(), LowerError> {
+            let ek = match elem.get() {
+                Some(e) => {
+                    if elem_kind(t)? != e {
+                        return Err(err("set elements must all have the same representation"));
+                    }
+                    e
+                }
+                None => {
+                    let e = elem_kind(t)?;
+                    elem.set(Some(e));
+                    e
+                }
+            };
+            let v = s.coerce(v, t, ek.ty());
+            let v = s.box_if_value(v, ek.ty());
+            let kfns = s.key_fn_args(ek)?;
             let mut cargs = vec![set, v];
             cargs.extend_from_slice(&kfns);
-            self.emit(Inst::Call {
+            s.emit(Inst::Call {
                 dest: None,
-                func: add.clone(),
+                func: format!("zap_set_add_{}", ek.key_suffix()),
                 args: cargs,
             });
+            Ok(())
+        };
+        for el in elems {
+            match el {
+                Expr::Starred { value, .. } => {
+                    self.iterate(value, |s, v, t| add(s, v, t))?;
+                }
+                _ => {
+                    let (v, t) = self.expr(el)?;
+                    add(self, v, t)?;
+                }
+            }
         }
-        Ok((set, Ty::Set(elem)))
+        let ek = elem.get().unwrap_or(Elem::I64);
+        self.func.value_types[set as usize] = Ty::Set(ek);
+        Ok((set, Ty::Set(ek)))
     }
 
     fn lower_set_method(
@@ -11914,9 +12023,39 @@ impl<'a> FnLower<'a> {
         let mut vals = Vec::with_capacity(elems.len());
         let mut tys = Vec::with_capacity(elems.len());
         for e in elems {
-            let (v, t) = self.expr(e)?;
-            vals.push(v);
-            tys.push(t);
+            match e {
+                // `*t` splices a statically-sized tuple's fields in place (#598);
+                // only a tuple can be spliced into a tuple, since the result's
+                // arity must stay statically known.
+                Expr::Starred { value, .. } => {
+                    let (tv, tt) = self.expr(value)?;
+                    let Ty::Struct(sid) = tt else {
+                        return Err(err("`*` in a tuple display requires a tuple"));
+                    };
+                    let fields = self
+                        .ctx
+                        .tuples
+                        .borrow()
+                        .fields(sid)
+                        .ok_or_else(|| err("`*` in a tuple display requires a tuple"))?;
+                    for (idx, fty) in fields.into_iter().enumerate() {
+                        let fv = self.new_value(fty);
+                        self.emit(Inst::FieldGet {
+                            dest: fv,
+                            base: tv,
+                            sid,
+                            idx: idx as u32,
+                        });
+                        vals.push(fv);
+                        tys.push(fty);
+                    }
+                }
+                _ => {
+                    let (v, t) = self.expr(e)?;
+                    vals.push(v);
+                    tys.push(t);
+                }
+            }
         }
         let sid = self.ctx.tuples.borrow_mut().intern(tys);
         let dest = self.new_value(Ty::Struct(sid));
@@ -14533,6 +14672,35 @@ fn free_names_of(params: &[String], body: &Expr) -> Vec<String> {
 /// Walk `e`, recording names that are free given the currently-`bound` set.
 /// A binder (nested lambda, comprehension loop var) extends `bound` only for the
 /// sub-expressions in its scope, then restores it.
+/// Collect free names across a comprehension clause list (#599), binding each
+/// clause's loop variable before the clauses to its right (its `iter` is
+/// evaluated with the earlier vars in scope). Returns the variables this call
+/// freshly bound, so the caller can unbind them after visiting the body.
+fn collect_free_names_comp_clauses(
+    clauses: &[CompClause],
+    bound: &mut HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> Vec<String> {
+    let mut fresh = Vec::new();
+    for c in clauses {
+        collect_free_names(&c.iter, bound, out, seen);
+        if bound.insert(c.var.clone()) {
+            fresh.push(c.var.clone());
+        }
+        for f in &c.ifs {
+            collect_free_names(f, bound, out, seen);
+        }
+    }
+    fresh
+}
+
+fn unbind_comp_clauses(fresh: &[String], bound: &mut HashSet<String>) {
+    for v in fresh {
+        bound.remove(v);
+    }
+}
+
 fn collect_free_names(
     e: &Expr,
     bound: &mut HashSet<String>,
@@ -14556,55 +14724,35 @@ fn collect_free_names(
                 collect_free_names(s, bound, out, seen);
             }
         }
+        Expr::Starred { value, .. } => collect_free_names(value, bound, out, seen),
         Expr::Dict(items, _) => {
-            for (k, v) in items {
-                collect_free_names(k, bound, out, seen);
-                collect_free_names(v, bound, out, seen);
+            for it in items {
+                match it {
+                    DictItem::Pair(k, v) => {
+                        collect_free_names(k, bound, out, seen);
+                        collect_free_names(v, bound, out, seen);
+                    }
+                    DictItem::Spread(e) => collect_free_names(e, bound, out, seen),
+                }
             }
         }
-        Expr::ListComp {
-            elem,
-            var,
-            iter,
-            cond,
-            ..
-        }
-        | Expr::SetComp {
-            elem,
-            var,
-            iter,
-            cond,
-            ..
-        } => {
-            // `iter` is evaluated in the outer scope; `elem`/`cond` see `var`.
-            collect_free_names(iter, bound, out, seen);
-            let fresh = bound.insert(var.clone());
+        Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+            // Each clause's `iter` sees the previous clauses' vars; `elem` and
+            // the filters see all of them (#599).
+            let fresh = collect_free_names_comp_clauses(clauses, bound, out, seen);
             collect_free_names(elem, bound, out, seen);
-            if let Some(c) = cond {
-                collect_free_names(c, bound, out, seen);
-            }
-            if fresh {
-                bound.remove(var);
-            }
+            unbind_comp_clauses(&fresh, bound);
         }
         Expr::DictComp {
             key,
             value,
-            var,
-            iter,
-            cond,
+            clauses,
             ..
         } => {
-            collect_free_names(iter, bound, out, seen);
-            let fresh = bound.insert(var.clone());
+            let fresh = collect_free_names_comp_clauses(clauses, bound, out, seen);
             collect_free_names(key, bound, out, seen);
             collect_free_names(value, bound, out, seen);
-            if let Some(c) = cond {
-                collect_free_names(c, bound, out, seen);
-            }
-            if fresh {
-                bound.remove(var);
-            }
+            unbind_comp_clauses(&fresh, bound);
         }
         Expr::Unary { expr, .. } | Expr::ChanRecv { chan: expr, .. } => {
             collect_free_names(expr, bound, out, seen);

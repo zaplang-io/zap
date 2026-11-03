@@ -269,3 +269,38 @@ fn del_statement_round_trips(/* #595 */) {
     check("def f():\n    del  xs[1]\n", "def f():\n    del xs[1]\n");
     check("def f():\n    del d['k']\n", "def f():\n    del d[\"k\"]\n");
 }
+
+#[test]
+fn display_unpacking_round_trips(/* #598 */) {
+    // Canonical spacing: `*`/`**` attach to their operand with no space, and
+    // ordinary comma/colon spacing applies around them.
+    check(
+        "def f():\n    xs=[1,*a ,2,*b]\n",
+        "def f():\n    xs = [1, *a, 2, *b]\n",
+    );
+    check(
+        "def f():\n    s={ *a,*b }\n",
+        "def f():\n    s = {*a, *b}\n",
+    );
+    check(
+        "def f():\n    t=(x,*rest)\n",
+        "def f():\n    t = (x, *rest)\n",
+    );
+    check(
+        "def f():\n    d={'a':1,** other,'b':2}\n",
+        "def f():\n    d = {\"a\": 1, **other, \"b\": 2}\n",
+    );
+}
+
+#[test]
+fn multi_clause_comprehension_round_trips(/* #599 */) {
+    // Each `for`/`if` clause is joined by a single space, in source order.
+    check(
+        "def f():\n    xs=[x*y for x in a for y in b if x!=y]\n",
+        "def f():\n    xs = [x * y for x in a for y in b if x != y]\n",
+    );
+    check(
+        "def f():\n    g={k:v for k in a if k>0 for v in b}\n",
+        "def f():\n    g = {k: v for k in a if k > 0 for v in b}\n",
+    );
+}

@@ -28,8 +28,8 @@
 use std::collections::{HashMap, HashSet};
 
 use zapc_syntax::ast::{
-    self, Arg, Block, EnumDef, Expr, Function, InterfaceDef, Item, MethodSig, Module, PatArg,
-    Pattern, Stmt, StructDef, Type, TypeParam,
+    self, Arg, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item, MethodSig,
+    Module, PatArg, Pattern, Stmt, StructDef, Type, TypeParam,
 };
 use zapc_syntax::span::Span;
 
@@ -1633,22 +1633,30 @@ impl Mono<'_> {
                 };
                 Ok((Expr::Set(out, *span), cty))
             }
-            Expr::Dict(pairs, span) => {
+            Expr::Dict(items, span) => {
                 // Mirror the list-literal case (I#170): infer the key/value types
                 // from the first pair (best-effort) so a `dict[K, V]` parameter
                 // can be inferred from a dict literal argument; an untyped key or
-                // value leaves the dict `Unknown`.
-                let mut np = Vec::with_capacity(pairs.len());
+                // value, or a leading `**expr` merge (#598), leaves the dict
+                // `Unknown`.
+                let mut np = Vec::with_capacity(items.len());
                 let mut kv: Option<(Type, Type)> = None;
-                for (i, (k, v)) in pairs.iter().enumerate() {
-                    let (kk, kcty) = self.rewrite_expr(k, env, None)?;
-                    let (vv, vcty) = self.rewrite_expr(v, env, None)?;
-                    if i == 0 {
-                        if let (CTy::Ty(kt), CTy::Ty(vt)) = (kcty, vcty) {
-                            kv = Some((kt, vt));
+                for (i, it) in items.iter().enumerate() {
+                    match it {
+                        DictItem::Pair(k, v) => {
+                            let (kk, kcty) = self.rewrite_expr(k, env, None)?;
+                            let (vv, vcty) = self.rewrite_expr(v, env, None)?;
+                            if i == 0 {
+                                if let (CTy::Ty(kt), CTy::Ty(vt)) = (kcty, vcty) {
+                                    kv = Some((kt, vt));
+                                }
+                            }
+                            np.push(DictItem::Pair(kk, vv));
+                        }
+                        DictItem::Spread(e) => {
+                            np.push(DictItem::Spread(self.rw(e, env)?));
                         }
                     }
-                    np.push((kk, vv));
                 }
                 let cty = match kv {
                     Some((kt, vt)) => CTy::Ty(Type::Named {
@@ -1660,6 +1668,13 @@ impl Mono<'_> {
                 };
                 Ok((Expr::Dict(np, *span), cty))
             }
+            Expr::Starred { value, span } => Ok((
+                Expr::Starred {
+                    value: Box::new(self.rw(value, env)?),
+                    span: *span,
+                },
+                CTy::Unknown,
+            )),
             Expr::Slice {
                 base,
                 lo,
@@ -1707,23 +1722,17 @@ impl Mono<'_> {
             // unknown. These are not generic-typed in the first vertical.
             Expr::ListComp {
                 elem,
-                var,
-                iter,
-                cond,
+                clauses,
                 span,
             } => {
-                let iter = Box::new(self.rw(iter, env)?);
                 env.push();
-                env.declare(var, CTy::Unknown);
+                let clauses = self.rw_comp_clauses(clauses, env)?;
                 let elem = Box::new(self.rw(elem, env)?);
-                let cond = self.rw_opt(cond, env)?;
                 env.pop();
                 Ok((
                     Expr::ListComp {
                         elem,
-                        var: var.clone(),
-                        iter,
-                        cond,
+                        clauses,
                         span: *span,
                     },
                     CTy::Unknown,
@@ -1731,23 +1740,17 @@ impl Mono<'_> {
             }
             Expr::SetComp {
                 elem,
-                var,
-                iter,
-                cond,
+                clauses,
                 span,
             } => {
-                let iter = Box::new(self.rw(iter, env)?);
                 env.push();
-                env.declare(var, CTy::Unknown);
+                let clauses = self.rw_comp_clauses(clauses, env)?;
                 let elem = Box::new(self.rw(elem, env)?);
-                let cond = self.rw_opt(cond, env)?;
                 env.pop();
                 Ok((
                     Expr::SetComp {
                         elem,
-                        var: var.clone(),
-                        iter,
-                        cond,
+                        clauses,
                         span: *span,
                     },
                     CTy::Unknown,
@@ -1756,25 +1759,19 @@ impl Mono<'_> {
             Expr::DictComp {
                 key,
                 value,
-                var,
-                iter,
-                cond,
+                clauses,
                 span,
             } => {
-                let iter = Box::new(self.rw(iter, env)?);
                 env.push();
-                env.declare(var, CTy::Unknown);
+                let clauses = self.rw_comp_clauses(clauses, env)?;
                 let key = Box::new(self.rw(key, env)?);
                 let value = Box::new(self.rw(value, env)?);
-                let cond = self.rw_opt(cond, env)?;
                 env.pop();
                 Ok((
                     Expr::DictComp {
                         key,
                         value,
-                        var: var.clone(),
-                        iter,
-                        cond,
+                        clauses,
                         span: *span,
                     },
                     CTy::Unknown,
@@ -1806,6 +1803,34 @@ impl Mono<'_> {
         let mut out = Vec::with_capacity(xs.len());
         for x in xs {
             out.push(self.rw(x, env)?);
+        }
+        Ok(out)
+    }
+
+    /// Rewrite a comprehension clause list (#599). Each clause's iterable is
+    /// rewritten with the previous clauses' variables in scope; its loop
+    /// variable is then declared (as `Unknown` — comprehensions are not
+    /// generic-typed in the first vertical) so later clauses and filters can
+    /// refer to it. The caller pushes and pops the surrounding scope.
+    fn rw_comp_clauses(
+        &mut self,
+        clauses: &[CompClause],
+        env: &mut Env,
+    ) -> Result<Vec<CompClause>, LowerError> {
+        let mut out = Vec::with_capacity(clauses.len());
+        for c in clauses {
+            let iter = Box::new(self.rw(&c.iter, env)?);
+            env.declare(&c.var, CTy::Unknown);
+            let mut ifs = Vec::with_capacity(c.ifs.len());
+            for f in &c.ifs {
+                ifs.push(self.rw(f, env)?);
+            }
+            out.push(CompClause {
+                var: c.var.clone(),
+                iter,
+                ifs,
+                span: c.span,
+            });
         }
         Ok(out)
     }
