@@ -276,6 +276,36 @@ struct StructCtx {
     /// vec is parallel to `fields[sid]`. Absent sid = no json field options on
     /// that struct; only `@derive(Json)` structs ever read it.
     json_field_opts: HashMap<u32, Vec<JsonFieldOpts>>,
+    /// Per-struct-id field validation constraints from `@validate(...)` /
+    /// `@range(...)` field decorators (D-0101), parallel to `fields[sid]`: for
+    /// field `i`, the checks run at construction time. An all-empty inner vec (or
+    /// an absent sid) means the struct has no generated validator. Sema has
+    /// already checked argument shapes and field-type suitability.
+    field_checks: HashMap<u32, Vec<Vec<FieldCheck>>>,
+}
+
+/// One construction-time field validation constraint (`@validate`/`@range`,
+/// D-0101). Sema validated the argument shapes; lowering realizes each as a
+/// guard in the generated `{Struct}____validate__` method that raises a
+/// catchable `ValueError` (D-0007) when violated.
+#[derive(Clone, Copy)]
+enum FieldCheck {
+    /// `@validate(max_len=n)` on a `str`/`bytes` field: byte length must be `<= n`.
+    MaxLen(i64),
+    /// `@validate(min_len=n)` on a `str`/`bytes` field: byte length must be `>= n`.
+    MinLen(i64),
+    /// `@range(min=v)` on a numeric field: the value must be `>= v`.
+    RangeMin(NumLit),
+    /// `@range(max=v)` on a numeric field: the value must be `<= v`.
+    RangeMax(NumLit),
+}
+
+/// A numeric bound literal for `@range` (D-0101), carried as both an integer and
+/// a float so the generated guard can emit a constant of the field's own type.
+#[derive(Clone, Copy)]
+struct NumLit {
+    int: i64,
+    float: f64,
 }
 
 /// The wire form of a `DateTime` field under `@derive(Json)` (ticket #346,
@@ -810,6 +840,9 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     let mut packed_layouts: HashMap<u32, PackedLayout> = HashMap::new();
     // Per-field `@json(...)` options (ticket #346, D-0086), keyed by struct id.
     let mut json_field_opts: HashMap<u32, Vec<JsonFieldOpts>> = HashMap::new();
+    // Per-field `@validate(...)` / `@range(...)` constraints (D-0101), keyed by
+    // struct id and parallel to `fields[sid]`.
+    let mut field_checks: HashMap<u32, Vec<Vec<FieldCheck>>> = HashMap::new();
     {
         let tyenv = TyEnv {
             ids: &ids,
@@ -822,14 +855,23 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             if let ast::Item::Struct(s) = item {
                 let sid = ids[&s.name];
                 let mut opts: Vec<JsonFieldOpts> = Vec::with_capacity(s.fields.len());
+                let mut checks: Vec<Vec<FieldCheck>> = Vec::with_capacity(s.fields.len());
                 for fld in &s.fields {
                     let ft = resolve_ty(&fld.ty, &tyenv).unwrap_or(Ty::Ptr);
                     fields[sid as usize].push((fld.name.clone(), ft));
-                    field_defaults[sid as usize].push(fld.default.clone());
+                    // `@default(expr)` (D-0101) supplies a per-instance
+                    // construction-time default, reusing the literal-default slot
+                    // (#461). Sema has rejected a field carrying both forms.
+                    let default = fld.default.clone().or_else(|| field_default_decorator(fld));
+                    field_defaults[sid as usize].push(default);
                     opts.push(parse_json_field_opts(fld));
+                    checks.push(collect_field_checks(fld, &mut errors));
                 }
                 if opts.iter().any(|o| o.timestamp.is_some()) {
                     json_field_opts.insert(sid, opts);
+                }
+                if checks.iter().any(|c| !c.is_empty()) {
+                    field_checks.insert(sid, checks);
                 }
                 if let Some(pl) = packed_layout_of(s) {
                     packed_layouts.insert(sid, pl);
@@ -944,6 +986,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         field_defaults,
         call_params: HashMap::new(),
         json_field_opts,
+        field_checks,
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -1059,6 +1102,15 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                 );
             }
         }
+    }
+    // Field-validator signatures (D-0101): a struct carrying `@validate`/`@range`
+    // field decorators gets a generated `{Struct}____validate__(self)` guard that
+    // `construct` invokes after it fills every field.
+    for &sid in ctx.field_checks.keys() {
+        sigs.insert(
+            format!("{}____validate__", ctx.names[sid as usize]),
+            (vec![Ty::Struct(sid)], Ty::Void),
+        );
     }
     // Open string-enum JSON codec signatures (ticket #346, D-0086): `to_json`
     // (self -> str), `from_json` (str -> Self), and the DOM bridge
@@ -1298,6 +1350,20 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                     if gen_names.insert(f.name.clone()) {
                         out.funcs.push(f);
                     }
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    // Field-validator methods (D-0101): one `{Struct}____validate__(self)` per
+    // struct that carries `@validate`/`@range` field decorators. Rendered in the
+    // ZIR dump, so `zap expand` shows the generated validation, and invoked from
+    // `construct` so every construction is checked.
+    for &sid in ctx.field_checks.keys() {
+        match gen_validate_method(sid, &sigs, &ctx) {
+            Ok(func) => {
+                if gen_names.insert(func.name.clone()) {
+                    out.funcs.push(func);
                 }
             }
             Err(e) => errors.push(e),
@@ -1988,12 +2054,15 @@ impl DecoratorPlan {
                     if !traits.is_empty() {
                         derived.push((sid, traits));
                     }
-                    // `@json(...)` field decorators are honored by the JSON codec
-                    // (ticket #346, collected into `StructCtx.json_field_opts`);
-                    // any other field decorator stays deferred.
+                    // Field decorators realized elsewhere: `@json(...)` by the
+                    // JSON codec (ticket #346, `StructCtx.json_field_opts`);
+                    // `@default`/`@validate`/`@range` at construction time
+                    // (D-0101, `StructCtx.field_defaults`/`field_checks`). Any
+                    // other field decorator stays deferred.
                     for fld in &s.fields {
                         for d in &fld.decorators {
-                            if d.name != "json" {
+                            if !matches!(d.name.as_str(), "json" | "default" | "validate" | "range")
+                            {
                                 errors.push(err(format!(
                                     "field decorators are not implemented yet (deferred): \
                                      '@{}' on field '{}'",
@@ -2158,6 +2227,129 @@ fn on_signal_number(d: &ast::Decorator, ctx: &StructCtx) -> Result<i64, LowerErr
     ))
 }
 
+/// The expression of a field's `@default(expr)` decorator (D-0101), if present.
+/// Sema has checked the single-positional shape and that the field carries no
+/// literal default too.
+fn field_default_decorator(fld: &ast::Field) -> Option<Expr> {
+    fld.decorators
+        .iter()
+        .find(|d| d.name == "default")
+        .and_then(|d| d.args.first())
+        .map(|a| a.value.clone())
+}
+
+/// Parse a numeric literal expression (int/float, optional unary `+`/`-`) into a
+/// [`NumLit`] carrying both an integer and a float form. Mirrors sema's
+/// `numeric_literal`; used for `@range` bounds (D-0101). Returns `None` for a
+/// non-literal (sema has already rejected those).
+fn num_lit(e: &Expr) -> Option<NumLit> {
+    match e {
+        Expr::Int(s, _) => {
+            let int = parse_int_literal(s)?;
+            Some(NumLit {
+                int,
+                float: int as f64,
+            })
+        }
+        Expr::Float(s, _) => {
+            let float = s.replace('_', "").parse::<f64>().ok()?;
+            Some(NumLit {
+                int: float as i64,
+                float,
+            })
+        }
+        Expr::Unary {
+            op: ast::UnOp::Neg,
+            expr,
+            ..
+        } => num_lit(expr).map(|v| NumLit {
+            int: -v.int,
+            float: -v.float,
+        }),
+        Expr::Unary {
+            op: ast::UnOp::Pos,
+            expr,
+            ..
+        } => num_lit(expr),
+        _ => None,
+    }
+}
+
+/// Parse an integer literal string (decimal/hex/octal/binary, `_` separators).
+fn parse_int_literal(s: &str) -> Option<i64> {
+    let t = s.replace('_', "");
+    let (radix, digits) = if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (16, r)
+    } else if let Some(r) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        (8, r)
+    } else if let Some(r) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        (2, r)
+    } else {
+        (10, t.as_str())
+    };
+    i64::from_str_radix(digits, radix).ok()
+}
+
+/// Collect the `@validate(...)` / `@range(...)` construction-time checks on one
+/// field (D-0101). Sema has validated the argument shapes and the field type, so
+/// a literal that fails to parse here is defensive (reported as a lowering
+/// error). `@default`/`@json` field decorators are handled elsewhere.
+fn collect_field_checks(fld: &ast::Field, errors: &mut Vec<LowerError>) -> Vec<FieldCheck> {
+    let mut checks = Vec::new();
+    for d in &fld.decorators {
+        match d.name.as_str() {
+            "validate" => {
+                for a in &d.args {
+                    let Some(name) = a.name.as_deref() else {
+                        continue;
+                    };
+                    match name {
+                        "max_len" | "min_len" => match num_lit(&a.value) {
+                            Some(v) if v.int >= 0 => {
+                                if name == "max_len" {
+                                    checks.push(FieldCheck::MaxLen(v.int));
+                                } else {
+                                    checks.push(FieldCheck::MinLen(v.int));
+                                }
+                            }
+                            _ => errors.push(err(format!(
+                                "@validate({name}=...) needs a non-negative integer literal \
+                                 on field '{}'",
+                                fld.name
+                            ))),
+                        },
+                        _ => {}
+                    }
+                }
+            }
+            "range" => {
+                for a in &d.args {
+                    let Some(name) = a.name.as_deref() else {
+                        continue;
+                    };
+                    let bound = match num_lit(&a.value) {
+                        Some(v) => v,
+                        None => {
+                            errors.push(err(format!(
+                                "@range {name} must be a numeric literal on field '{}'",
+                                fld.name
+                            )));
+                            continue;
+                        }
+                    };
+                    match name {
+                        "min" => checks.push(FieldCheck::RangeMin(bound)),
+                        "max" => checks.push(FieldCheck::RangeMax(bound)),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    checks
+}
+
 /// Validate an `@derive(Json)` enum (ticket #346, D-0086) and return its
 /// tagged-struct id. The enum must be an **open** string enum: it carries
 /// `@json(open)`, is a tier-3 tagged enum, every known variant is payload-free,
@@ -2245,6 +2437,171 @@ fn defer_fn_decorators(
             }
         }
     }
+}
+
+/// `@validate(...)` / `@range(...)` — a construction-time validator method
+/// `Struct____validate__(self)` (D-0101). `construct` invokes it after filling
+/// every field; each failing constraint raises a catchable `ValueError`
+/// (D-0007), matching the index/divide faults (#383). Generated as ordinary ZIR,
+/// so `zap expand` shows it and it is type-checked like any method.
+fn gen_validate_method(
+    sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let name = format!("{}____validate__", ctx.names[sid as usize]);
+    let mut b = FnLower::new(
+        name,
+        vec![Ty::Struct(sid)],
+        Ty::Void,
+        false,
+        true, // self_param: the receiver is by-reference, like a derived method
+        sigs,
+        ctx,
+    );
+    let fields = ctx.fields[sid as usize].clone();
+    let per_field = ctx
+        .field_checks
+        .get(&sid)
+        .cloned()
+        .unwrap_or_else(|| vec![Vec::new(); fields.len()]);
+    for (idx, checks) in per_field.iter().enumerate() {
+        if checks.is_empty() {
+            continue;
+        }
+        let (fname, fty) = fields[idx].clone();
+        for chk in checks {
+            gen_field_check(&mut b, sid, idx as u32, &fname, fty, *chk)?;
+        }
+    }
+    b.set_term(Term::Ret(None));
+    Ok(b.func)
+}
+
+/// Emit one field-validation guard (D-0101): load the field, compare against the
+/// bound, and on violation raise a catchable `ValueError` (tag 3), continuing on
+/// the success path.
+fn gen_field_check(
+    b: &mut FnLower,
+    sid: u32,
+    idx: u32,
+    fname: &str,
+    fty: Ty,
+    chk: FieldCheck,
+) -> Result<(), LowerError> {
+    // The predicate `fail` is true when the constraint is violated.
+    let (fail, msg) = match chk {
+        FieldCheck::MaxLen(n) | FieldCheck::MinLen(n) => {
+            if !matches!(fty, Ty::Ptr | Ty::Bytes) {
+                return Err(err(format!(
+                    "@validate(max_len/min_len) on field '{fname}' requires a str or bytes field"
+                )));
+            }
+            let fv = b.new_value(fty);
+            b.emit(Inst::FieldGet {
+                dest: fv,
+                base: 0,
+                sid,
+                idx,
+            });
+            let len = b.new_value(Ty::I64);
+            b.emit(Inst::Call {
+                dest: Some(len),
+                func: "zap_str_len".to_string(),
+                args: vec![fv],
+            });
+            let bound = b.iconst(Ty::I64, n);
+            let fail = b.new_value(Ty::I1);
+            let (pred, msg) = match chk {
+                FieldCheck::MaxLen(n) => (
+                    CmpPred::Gt,
+                    format!("field '{fname}' exceeds @validate(max_len={n})"),
+                ),
+                _ => (
+                    CmpPred::Lt,
+                    format!("field '{fname}' is shorter than @validate(min_len={n})"),
+                ),
+            };
+            b.emit(Inst::ICmp {
+                dest: fail,
+                pred,
+                lhs: len,
+                rhs: bound,
+            });
+            (fail, msg)
+        }
+        FieldCheck::RangeMin(v) | FieldCheck::RangeMax(v) => {
+            let fv = b.new_value(fty);
+            b.emit(Inst::FieldGet {
+                dest: fv,
+                base: 0,
+                sid,
+                idx,
+            });
+            let fail = b.new_value(Ty::I1);
+            let is_max = matches!(chk, FieldCheck::RangeMax(_));
+            // Render the bound as written: a float field shows the float form,
+            // an integer field the integer form.
+            let bound_str = if matches!(fty, Ty::F32 | Ty::F64) {
+                format!("{}", v.float)
+            } else {
+                format!("{}", v.int)
+            };
+            // Violation: value < min, or value > max.
+            let msg = if is_max {
+                format!("field '{fname}' is above @range(max={bound_str})")
+            } else {
+                format!("field '{fname}' is below @range(min={bound_str})")
+            };
+            match fty {
+                Ty::F32 | Ty::F64 => {
+                    let bound = b.fconst(fty, v.float);
+                    b.emit(Inst::FCmp {
+                        dest: fail,
+                        pred: if is_max { CmpPred::Gt } else { CmpPred::Lt },
+                        lhs: fv,
+                        rhs: bound,
+                    });
+                }
+                t if t.int_width().is_some() => {
+                    let bound = b.iconst(fty, v.int);
+                    b.emit(Inst::ICmp {
+                        dest: fail,
+                        pred: if is_max { CmpPred::Gt } else { CmpPred::Lt },
+                        lhs: fv,
+                        rhs: bound,
+                    });
+                }
+                other => {
+                    return Err(err(format!(
+                        "@range on field '{fname}' requires a numeric field, found {other}"
+                    )));
+                }
+            }
+            (fail, msg)
+        }
+    };
+    // `if fail: raise ValueError(msg)` — otherwise fall through to the next check.
+    let throw_bb = b.new_block();
+    let cont_bb = b.new_block();
+    b.set_term(Term::BrIf {
+        cond: fail,
+        then_bb: throw_bb,
+        else_bb: cont_bb,
+    });
+    b.position(throw_bb);
+    let m = b.new_value(Ty::Ptr);
+    b.emit(Inst::StrConst {
+        dest: m,
+        bytes: msg.into_bytes(),
+    });
+    let value_error = b.iconst(Ty::I64, 3); // ZAP_EXC_VALUE_ERROR (see zaprt.c)
+    b.throwing_call(None, "zap_panic_typed", vec![value_error, m]);
+    if !b.terminated() {
+        b.set_term(Term::Unreachable);
+    }
+    b.position(cont_bb);
+    Ok(())
 }
 
 /// `@derive(Eq)` — a structural-equality method `Struct____eq__(self, other) ->
@@ -9567,6 +9924,14 @@ impl<'a> FnLower<'a> {
                 idx: idx as u32,
                 val: v,
             });
+        }
+        // Run the generated field validators (`@validate`/`@range`, D-0101) once
+        // every field is initialized. The call may raise a `ValueError`
+        // (D-0007); routing it through `throwing_call` makes it an `invoke`
+        // inside a `try`, so construction errors are catchable at the site.
+        if self.ctx.field_checks.contains_key(&sid) {
+            let validator = format!("{}____validate__", self.ctx.names[sid as usize]);
+            self.throwing_call(None, &validator, vec![dest]);
         }
         Ok((dest, Ty::Struct(sid)))
     }

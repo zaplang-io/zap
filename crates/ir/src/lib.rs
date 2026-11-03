@@ -1111,13 +1111,40 @@ mod tests {
     #[test]
     fn deferred_builtins_error() {
         // Built-ins in the locked set but not yet generated report cleanly.
-        let src = "struct S:\n    @validate(max_len=9)\n    str x\n";
+        // `@cache`/`@deprecated`/`@inject` remain a follow-up slice (#472).
+        let src = "@cache\ndef f() -> int64:\n    return 1\n\ndef main():\n    print(f())\n";
         let (ast, _p, _l) = parse_str(src);
         let (_m, errs) = lower_module(&ast);
         assert!(
             !errs.is_empty(),
             "expected a deferred-feature error for:\n{src}"
         );
+    }
+
+    #[test]
+    fn field_validators_generate_check_method() {
+        // `@validate`/`@range` field decorators (D-0101) generate a
+        // `{Struct}____validate__` method and no error.
+        let src = "struct S:\n    @validate(max_len=9)\n    str x\n    @range(min=0, max=5)\n    \
+                   int64 n\n\ndef main():\n    auto s = S(x=\"hi\", n=1)\n    print(s.n)\n";
+        let (ast, _p, _l) = parse_str(src);
+        let (m, errs) = lower_module(&ast);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert!(
+            m.funcs.iter().any(|f| f.name == "S____validate__"),
+            "expected generated S____validate__"
+        );
+    }
+
+    #[test]
+    fn field_default_decorator_initializes_field() {
+        // `@default(expr)` (D-0101) supplies a construction-time default for a
+        // field the caller omits, reusing the literal-default machinery (#461).
+        let src = "struct S:\n    @default(7)\n    int64 n\n\ndef main():\n    \
+                   auto s = S()\n    print(s.n)\n";
+        let (ast, _p, _l) = parse_str(src);
+        let (_m, errs) = lower_module(&ast);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]

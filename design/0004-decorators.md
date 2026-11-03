@@ -202,6 +202,31 @@ the AST, which requires stable AST + codegen hooks and a hygiene model.
 Phase boundaries touched: the front-end (AST, a decorator-expansion pass before
 type-checking) and a reflection-metadata section in the runtime ABI.
 
+### Implementation status (D-0101, I#472)
+
+Shipped: `@derive(Eq, Ord, Json, Repr, Hash)` and the `@json(...)` field hooks
+(I#16/#346); function/parameter reflection metadata (I#457/#458); and the
+**field-decorator group**:
+
+- `@default(expr)` — a per-instance construction-time default for the field,
+  reusing the literal-default machinery (D-0038, #461). A field may carry a
+  literal default *or* `@default`, not both.
+- `@validate(max_len=n, min_len=n)` — byte-length bounds on a `str`/`bytes`
+  field.
+- `@range(min=v, max=v)` — numeric bounds on an integer/float field.
+
+`@validate`/`@range` generate a `{Struct}____validate__(self)` guard (ordinary,
+`zap expand`-visible ZIR) that the constructor runs after every field is set; a
+violation raises a catchable `ValueError` (D-0007). Invalid targets/arguments
+are stable, coded compile errors (ZAP5038/5039/5040). The `range` keyword is
+accepted as a decorator name so `@range` parses.
+
+Follow-up (deferred, not yet implemented): `@validate(matches=m/.../)` regex
+validation; the **function/variable group** `@cache` (memoization),
+`@deprecated` (use-site diagnostic), and `@inject` (DI, cf. zap#312/fastzap#7);
+and the user-defined `before`/`after`/`wrap` decorator bodies. These remain
+clean "not implemented yet (deferred)" lowering errors.
+
 ## Open issues
 
 - The **user-macro API**: what a decorator sees (typed AST? a structured view?)

@@ -1298,7 +1298,7 @@ impl Parser {
         while self.is(&TokenKind::At) {
             let start = self.peek_span().start;
             self.bump();
-            let name = self.dotted_name();
+            let name = self.decorator_name();
             let args = if self.eat(&TokenKind::LParen) {
                 self.parse_args()
             } else {
@@ -1316,6 +1316,26 @@ impl Parser {
 
     fn dotted_name(&mut self) -> String {
         let mut name = self.ident("name");
+        while self.is(&TokenKind::Dot) {
+            self.bump();
+            name.push('.');
+            name.push_str(&self.ident("name"));
+        }
+        name
+    }
+
+    /// A (possibly dotted) decorator name. Identical to [`Self::dotted_name`]
+    /// except the leading segment may be the `range` keyword: the built-in
+    /// `@range(...)` field decorator (D-0036) collides with the `range` keyword,
+    /// so it would otherwise fail to parse. Only this one keyword is accepted as
+    /// a decorator name; every other keyword stays reserved.
+    fn decorator_name(&mut self) -> String {
+        let mut name = if self.is_kw(Keyword::Range) {
+            self.bump();
+            "range".to_string()
+        } else {
+            self.ident("name")
+        };
         while self.is(&TokenKind::Dot) {
             self.bump();
             name.push('.');
@@ -1487,7 +1507,7 @@ impl Parser {
         while self.is(&TokenKind::At) {
             let start = self.peek_span().start;
             self.bump();
-            let name = self.dotted_name();
+            let name = self.decorator_name();
             let args = if self.eat(&TokenKind::LParen) {
                 self.parse_args()
             } else {

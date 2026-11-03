@@ -46,10 +46,19 @@ item          ::= function
 
 (* ---------- Decorators & annotations (D-0036) ---------- *)
 
-decorators    ::= { "@" dotted_name [ "(" [ arg_list ] ")" ] NEWLINE } ;
+decorators    ::= { "@" decorator_name [ "(" [ arg_list ] ")" ] NEWLINE } ;
                   (* Built-in decorators include `@on_signal(Signal.X)` (D-0058,
                      ticket #77): on a function, register it as a handler for
-                     signal X — no new syntax, it is a decorator with one arg. *)
+                     signal X — no new syntax, it is a decorator with one arg.
+                     Field decorators `@default(expr)`, `@validate(...)` and
+                     `@range(...)` generate construction-time code (D-0101). *)
+
+decorator_name ::= dotted_name | "range" ;
+                  (* `dotted_name`, except the leading segment may be the
+                     `range` keyword: the built-in `@range(...)` field decorator
+                     (D-0036/D-0101) would otherwise collide with the keyword.
+                     Only `range` is allowed; every other keyword stays
+                     reserved. *)
 
 (* ---------- Functions (D-0003, D-0038) ---------- *)
 
@@ -81,7 +90,7 @@ param_list    ::= [ param { "," param } "," ] "*" param { "," param }
                      The "*" appears at most once and must be followed by at
                      least one parameter; keyword-only parameters may be required
                      or have a default. *)
-param         ::= { "@" dotted_name [ "(" [ arg_list ] ")" ] }
+param         ::= { "@" decorator_name [ "(" [ arg_list ] ")" ] }
                   ( "self"
                   | type [ "..." ] IDENT [ "=" expr ] ) ;
                   (* "type ... IDENT" is a variadic (D-0038);
