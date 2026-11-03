@@ -12122,11 +12122,10 @@ impl<'a> FnLower<'a> {
             Ty::List(_) => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce(iv, it, Ty::I64);
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: "zap_list_del_at".to_string(),
-                    args: vec![bv, iv],
-                });
+                // An out-of-range index raises a catchable IndexError (#383), the
+                // same as a read `xs[i]`, so this must be an `invoke` inside a
+                // `try` for the handler to catch it.
+                self.throwing_call(None, "zap_list_del_at", vec![bv, iv]);
                 Ok(())
             }
             Ty::Dict(kk, _) => {
