@@ -113,6 +113,39 @@ impl FnSigInterner {
     }
 }
 
+/// Interner for **nested-collection element types** (#625). A collection stored
+/// inside another collection (`list[list[int64]]`, `dict[str, list[int64]]`, …)
+/// is physically a pointer, but lowering must recover its full element type for
+/// read-back dispatch (`rows[i]`, `len(rows[i])`, iteration): a bare pointer
+/// cannot say whether an element is a `str` or a nested `list[int64]`, which
+/// silently miscompiled the nested reads as string operations. Each distinct
+/// nested [`Ty`] interns to the `u32` carried by [`Elem::Nested`], deduplicated so
+/// structurally-equal nestings share an id (making the element-kind equality
+/// checks in collection literals compare correctly). The table lives only for the
+/// duration of lowering — codegen treats every collection uniformly as a traced
+/// pointer and never reads the id — so it is not materialized into the module.
+#[derive(Default)]
+struct NestedInterner {
+    tys: Vec<Ty>,
+    map: HashMap<Ty, u32>,
+}
+
+impl NestedInterner {
+    fn intern(&mut self, t: Ty) -> u32 {
+        if let Some(&id) = self.map.get(&t) {
+            return id;
+        }
+        let id = self.tys.len() as u32;
+        self.map.insert(t, id);
+        self.tys.push(t);
+        id
+    }
+
+    fn get(&self, id: u32) -> Ty {
+        self.tys[id as usize]
+    }
+}
+
 /// One data-carrying variant of a tier-3 enum (D-0046), resolved for lowering.
 #[derive(Clone, Debug)]
 struct VariantLow {
@@ -200,6 +233,10 @@ struct TyEnv<'a> {
     /// `fn(T, U) -> R` annotation resolves to `Ty::Func(idx)` where `idx` is the
     /// interned signature.
     fn_sigs: &'a RefCell<FnSigInterner>,
+    /// Interner for nested-collection element types (#625): a collection element
+    /// that is itself a collection resolves to `Elem::Nested(id)`, preserving its
+    /// full type for read-back dispatch.
+    nested: &'a RefCell<NestedInterner>,
 }
 
 /// Lower a type-checked module to ZIR.
@@ -238,6 +275,10 @@ struct StructCtx {
     /// Interned first-class function-value signatures (I#163), materialized into
     /// [`Module::fn_sigs`] after lowering.
     fn_sigs: RefCell<FnSigInterner>,
+    /// Interned nested-collection element types (#625). Lowering-only (not
+    /// materialized into the module); resolves an `Elem::Nested(id)` back to the
+    /// element's full [`Ty`] for read-back dispatch.
+    nested: RefCell<NestedInterner>,
     /// Closure records (I#163): compiler-generated lifted-lambda and
     /// bare-function-wrapper ZIR functions, collected while lowering bodies and
     /// appended to [`Module::funcs`] afterward.
@@ -536,6 +577,7 @@ impl StructCtx {
             ifaces: &self.ifaces,
             tuples: &self.tuples,
             fn_sigs: &self.fn_sigs,
+            nested: &self.nested,
         }
     }
 
@@ -719,6 +761,8 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
     let tuples = RefCell::new(TupleInterner::new(names.len() as u32));
     // First-class function-value signatures (I#163) interned during lowering.
     let fn_sigs = RefCell::new(FnSigInterner::default());
+    // Nested-collection element types (#625) interned during lowering.
+    let nested = RefCell::new(NestedInterner::default());
 
     // Build the enum registry. For tier-1 enums, compute member discriminants
     // (explicit, else previous + 1 from 0). For tier-3 enums, lay out the tagged
@@ -786,6 +830,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
                                     ifaces: &ifaces,
                                     tuples: &tuples,
                                     fn_sigs: &fn_sigs,
+                                    nested: &nested,
                                 },
                             )
                             .unwrap_or(Ty::Ptr);
@@ -864,6 +909,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             ifaces: &ifaces,
             tuples: &tuples,
             fn_sigs: &fn_sigs,
+            nested: &nested,
         };
         for item in &module.items {
             if let ast::Item::Struct(s) = item {
@@ -926,6 +972,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             ifaces: &ifaces,
             tuples: &tuples,
             fn_sigs: &fn_sigs,
+            nested: &nested,
         };
         for item in &module.items {
             if let ast::Item::Interface(i) = item {
@@ -991,6 +1038,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         fat_to_iid,
         generators: HashMap::new(),
         fn_sigs,
+        nested,
         generated: RefCell::new(Vec::new()),
         closure_env_sids: RefCell::new(Vec::new()),
         closure_counter: RefCell::new(0),
@@ -1568,7 +1616,7 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
 /// The runtime representation of a collection element/key/value given its
 /// source type.
 fn elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
-    elem_kind(resolve_ty(t, env)?)
+    elem_kind(resolve_ty(t, env)?, env.nested)
 }
 
 /// The element kind of a `list[T]` element type. Identical to [`elem_of`] except
@@ -1577,7 +1625,7 @@ fn elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
 /// `_f64` runtime entry points. Only *lists* take this path — the hashed/ordered
 /// element positions (dict/set keys, heaps) still reject floats via [`elem_kind`].
 fn list_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
-    list_elem_kind(resolve_ty(t, env)?)
+    list_elem_kind(resolve_ty(t, env)?, env.nested)
 }
 
 /// The element kind of a `heap[T]` element type (D-0057). A heap orders its
@@ -1656,24 +1704,21 @@ fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
 /// are uniform 8-byte words (RUNTIME-ABI §"Collection layout"): integers/bools
 /// go in as `i64`, reference types as pointers. Floats need a separate word
 /// path and are deferred.
-fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
+fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     match t {
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
         Ty::Enum(id) => Ok(Elem::Enum(id)),
         // A struct element carries its id so a struct *key* hashes/compares via
         // its own `__hash__`/`__eq__` (operator overloading, D-0047).
         Ty::Struct(sid) => Ok(Elem::Struct(sid)),
-        Ty::Ptr
-        | Ty::Bytes
-        | Ty::List(_)
-        | Ty::Dict(..)
-        | Ty::Set(_)
-        | Ty::Heap(_)
-        | Ty::Array(_)
-        | Ty::Chan(_)
-        | Ty::Match
-        | Ty::Func(_)
-        | Ty::Py => Ok(Elem::Ptr),
+        // A nested collection (#625) is physically a pointer, but its full type is
+        // interned so read-back (`rows[i]`, iteration) recovers the precise
+        // `list`/`dict`/`set`/... type instead of defaulting a bare pointer to
+        // `str`. Dedup makes structurally-equal nestings compare equal.
+        Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) => {
+            Ok(Elem::Nested(nested.borrow_mut().intern(t)))
+        }
+        Ty::Ptr | Ty::Bytes | Ty::Array(_) | Ty::Match | Ty::Func(_) | Ty::Py => Ok(Elem::Ptr),
         Ty::Bigint | Ty::Complex => Err(err(
             "collections of bigint or complex values are not supported yet",
         )),
@@ -1687,10 +1732,10 @@ fn elem_kind(t: Ty) -> Result<Elem, LowerError> {
 /// Like [`elem_kind`], but admits an `f64` *list* element (I#569) as [`Elem::F64`].
 /// `f32` list elements (ticket #49) and float elements of other collections stay
 /// unsupported, so this is used only on the `list[T]` element paths.
-fn list_elem_kind(t: Ty) -> Result<Elem, LowerError> {
+fn list_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     match t {
         Ty::F64 => Ok(Elem::F64),
-        other => elem_kind(other),
+        other => elem_kind(other, nested),
     }
 }
 
@@ -1711,7 +1756,7 @@ fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
     // A float/void element has no list representation yet, so such a variadic
     // degrades to its base type (already unsupported by the collection runtime).
     if p.variadic {
-        match elem_kind(base) {
+        match elem_kind(base, &ctx.nested) {
             Ok(elem) => Ty::List(elem),
             Err(_) => base,
         }
@@ -1720,7 +1765,7 @@ fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
         // str keys lower to pointer keys, the value is V's element kind. A value
         // kind the dict runtime cannot hold degrades to the base type (rejected
         // downstream, like a float variadic).
-        match elem_kind(base) {
+        match elem_kind(base, &ctx.nested) {
             Ok(vk) => Ty::Dict(Elem::Ptr, vk),
             Err(_) => base,
         }
@@ -7563,14 +7608,16 @@ impl<'a> FnLower<'a> {
         });
         self.position(body_bb);
         let i = self.load(idx, Ty::I64);
-        let e = self.new_value(elem.ty());
+        // A nested-collection element reads back as its real type (#625).
+        let ety = self.elem_ty(elem);
+        let e = self.new_value(ety);
         self.emit(Inst::Call {
             dest: Some(e),
             func: format!("zap_list_get_{}", elem.val_suffix()),
             args: vec![lst, i],
         });
         self.push_loop(incr_bb, end_bb);
-        body(self, e, elem.ty())?;
+        body(self, e, ety)?;
         self.loops.pop();
         self.ensure_br(incr_bb);
         self.position(incr_bb);
@@ -7646,7 +7693,7 @@ impl<'a> FnLower<'a> {
         let kind = std::cell::Cell::new(None);
         let mut emit = |s: &mut FnLower<'a>| -> Result<(), LowerError> {
             let (ev, et) = s.expr(elem_e)?;
-            let ek = list_elem_kind(et)?;
+            let ek = list_elem_kind(et, &s.ctx.nested)?;
             kind.set(Some(ek));
             let ev = s.coerce(ev, et, ek.ty());
             let ev = s.box_if_value(ev, ek.ty());
@@ -7679,7 +7726,7 @@ impl<'a> FnLower<'a> {
         let kind = std::cell::Cell::new(None);
         let mut emit = |s: &mut FnLower<'a>| -> Result<(), LowerError> {
             let (ev, et) = s.expr(elem_e)?;
-            let ek = elem_kind(et)?;
+            let ek = elem_kind(et, &s.ctx.nested)?;
             kind.set(Some(ek));
             let ev = s.coerce(ev, et, ek.ty());
             let ev = s.box_if_value(ev, ek.ty());
@@ -7717,8 +7764,8 @@ impl<'a> FnLower<'a> {
         let mut emit = |s: &mut FnLower<'a>| -> Result<(), LowerError> {
             let (kv, kt) = s.expr(key_e)?;
             let (vv, vt) = s.expr(val_e)?;
-            let kk = elem_kind(kt)?;
-            let vk = elem_kind(vt)?;
+            let kk = elem_kind(kt, &s.ctx.nested)?;
+            let vk = elem_kind(vt, &s.ctx.nested)?;
             kinds.set(Some((kk, vk)));
             let kv = s.coerce(kv, kt, kk.ty());
             let vv = s.coerce(vv, vt, vk.ty());
@@ -8033,10 +8080,13 @@ impl<'a> FnLower<'a> {
         let zero = self.iconst(Ty::I64, 0);
         self.store(idx, zero);
         let lst_slot = self.spill_invariant(lst, Ty::List(elem));
+        // A nested-collection element binds with its real type (#625) so the loop
+        // body dispatches on the true `list`/`dict`/... rather than a `str` pointer.
+        let ety = self.elem_ty(elem);
         let single_var = if let Expr::Name(n, _) = target {
             // The loop variable is live across a `yield` placed after its use in
             // the body, so hoist it too (a plain alloca outside a generator).
-            Some(self.decl_slot(n, elem.ty()))
+            Some(self.decl_slot(n, ety))
         } else {
             None
         };
@@ -8071,7 +8121,7 @@ impl<'a> FnLower<'a> {
 
         self.position(body_bb);
         let i = self.load(idx, Ty::I64);
-        let e = self.new_value(elem.ty());
+        let e = self.new_value(ety);
         let lst_b = self.reload_invariant(lst_slot, lst, Ty::List(elem));
         self.emit(Inst::Call {
             dest: Some(e),
@@ -8080,7 +8130,7 @@ impl<'a> FnLower<'a> {
         });
         match target {
             Expr::Name(_, _) => self.store(single_var.expect("name slot"), e),
-            Expr::Tuple(elems, _) => self.bind_tuple_loop_target(elems, e, elem.ty())?,
+            Expr::Tuple(elems, _) => self.bind_tuple_loop_target(elems, e, ety)?,
             _ => unreachable!("validated above"),
         }
         self.push_loop(incr_bb, end_bb);
@@ -8672,7 +8722,8 @@ impl<'a> FnLower<'a> {
                 let Ty::Chan(elem) = cty else {
                     return Err(err("the operand of '<-' (receive) must be a channel"));
                 };
-                let ety = elem.ty();
+                // A nested-collection channel element arrives as its real type (#625).
+                let ety = self.elem_ty(elem);
                 let d = self.new_value(ety);
                 self.throwing_call(
                     Some(d),
@@ -10733,13 +10784,14 @@ impl<'a> FnLower<'a> {
                         } else {
                             this.iconst(Ty::I64, index as i64)
                         };
-                        let value = this.new_value(elem.ty());
+                        let ety = this.elem_ty(elem);
+                        let value = this.new_value(ety);
                         this.emit(Inst::Call {
                             dest: Some(value),
                             func: format!("zap_list_get_{}", elem.val_suffix()),
                             args: vec![sv, idx],
                         });
-                        let (condition, _) = this.pattern_cond(value, elem.ty(), pattern)?;
+                        let (condition, _) = this.pattern_cond(value, ety, pattern)?;
                         let combined = this.new_value(Ty::I1);
                         this.emit(Inst::Bin {
                             dest: combined,
@@ -11048,13 +11100,14 @@ impl<'a> FnLower<'a> {
                         } else {
                             self.iconst(Ty::I64, i as i64)
                         };
-                        let item = self.new_value(elem.ty());
+                        let ety = self.elem_ty(elem);
+                        let item = self.new_value(ety);
                         self.emit(Inst::Call {
                             dest: Some(item),
                             func: format!("zap_list_get_{}", elem.val_suffix()),
                             args: vec![sv, idx],
                         });
-                        self.bind_pattern(item, elem.ty(), pattern)?;
+                        self.bind_pattern(item, ety, pattern)?;
                     }
                 }
                 Ok(())
@@ -11315,13 +11368,13 @@ impl<'a> FnLower<'a> {
         let push = |s: &mut FnLower<'a>, v: Value, t: Ty| -> Result<(), LowerError> {
             let ek = match elem.get() {
                 Some(e) => {
-                    if list_elem_kind(t)? != e {
+                    if list_elem_kind(t, &s.ctx.nested)? != e {
                         return Err(err("list elements must all have the same representation"));
                     }
                     e
                 }
                 None => {
-                    let e = list_elem_kind(t)?;
+                    let e = list_elem_kind(t, &s.ctx.nested)?;
                     elem.set(Some(e));
                     e
                 }
@@ -11370,7 +11423,9 @@ impl<'a> FnLower<'a> {
                     let (vv, vt) = self.expr(v)?;
                     let (kk, vk) = match kinds.get() {
                         Some((kk, vk)) => {
-                            if elem_kind(kt)? != kk || elem_kind(vt)? != vk {
+                            if elem_kind(kt, &self.ctx.nested)? != kk
+                                || elem_kind(vt, &self.ctx.nested)? != vk
+                            {
                                 return Err(err(
                                     "dict keys/values must all have the same representation",
                                 ));
@@ -11378,8 +11433,8 @@ impl<'a> FnLower<'a> {
                             (kk, vk)
                         }
                         None => {
-                            let kk = elem_kind(kt)?;
-                            let vk = elem_kind(vt)?;
+                            let kk = elem_kind(kt, &self.ctx.nested)?;
+                            let vk = elem_kind(vt, &self.ctx.nested)?;
                             kinds.set(Some((kk, vk)));
                             (kk, vk)
                         }
@@ -11475,13 +11530,13 @@ impl<'a> FnLower<'a> {
         let add = |s: &mut FnLower<'a>, v: Value, t: Ty| -> Result<(), LowerError> {
             let ek = match elem.get() {
                 Some(e) => {
-                    if elem_kind(t)? != e {
+                    if elem_kind(t, &s.ctx.nested)? != e {
                         return Err(err("set elements must all have the same representation"));
                     }
                     e
                 }
                 None => {
-                    let e = elem_kind(t)?;
+                    let e = elem_kind(t, &s.ctx.nested)?;
                     elem.set(Some(e));
                     e
                 }
@@ -11527,7 +11582,7 @@ impl<'a> FnLower<'a> {
                     return Err(err("add() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
-                if elem_kind(vt)? != elem {
+                if elem_kind(vt, &self.ctx.nested)? != elem {
                     return Err(err("add() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
@@ -11801,7 +11856,12 @@ impl<'a> FnLower<'a> {
         kk: Elem,
         vk: Elem,
     ) -> Result<(Value, Ty), LowerError> {
-        let tuple_sid = self.ctx.tuples.borrow_mut().intern(vec![kk.ty(), vk.ty()]);
+        // The tuple's field types are the key/value *full* types (#625) so a
+        // nested-collection value (`dict[str, list[int64]].items()`) binds `v` as
+        // its real `list`/`dict`/... rather than a `str` pointer.
+        let kty = self.elem_ty(kk);
+        let vty = self.elem_ty(vk);
+        let tuple_sid = self.ctx.tuples.borrow_mut().intern(vec![kty, vty]);
         let out_elem = Elem::Struct(tuple_sid);
         // keys snapshot, result list, and the struct-key function pointers.
         let keys = self.new_value(Ty::List(kk));
@@ -11849,13 +11909,13 @@ impl<'a> FnLower<'a> {
         });
         self.position(body_bb);
         let i = self.load(idx, Ty::I64);
-        let key = self.new_value(kk.ty());
+        let key = self.new_value(kty);
         self.emit(Inst::Call {
             dest: Some(key),
             func: format!("zap_list_get_{}", kk.val_suffix()),
             args: vec![keys, i],
         });
-        let val = self.new_value(vk.ty());
+        let val = self.new_value(vty);
         let mut gargs = vec![recv, key];
         gargs.extend_from_slice(&kfns);
         self.emit(Inst::Call {
@@ -11974,7 +12034,7 @@ impl<'a> FnLower<'a> {
                     return Err(err("push() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
-                if elem_kind(vt)? != elem {
+                if elem_kind(vt, &self.ctx.nested)? != elem {
                     return Err(err("push() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
@@ -12127,6 +12187,18 @@ impl<'a> FnLower<'a> {
         Ok((acc, Ty::I1))
     }
 
+    /// The full ZIR type a collection element of kind `e` flows as. Identical to
+    /// [`Elem::ty`] except for [`Elem::Nested`] (#625), whose precise
+    /// `list`/`dict`/`set`/... type is recovered from the lowering interner so a
+    /// nested-collection read-back (`rows[i]`, `d[k]`, iteration) dispatches as the
+    /// real collection rather than defaulting its bare pointer to `str`.
+    fn elem_ty(&self, e: Elem) -> Ty {
+        match e {
+            Elem::Nested(id) => self.ctx.nested.borrow().get(id),
+            other => other.ty(),
+        }
+    }
+
     fn lower_index_get(&mut self, base: &Expr, index: &Expr) -> Result<(Value, Ty), LowerError> {
         let (bv, bty) = self.expr(base)?;
         // Tuple element access `t[k]` (D-0049): `k` must be a compile-time
@@ -12156,7 +12228,10 @@ impl<'a> FnLower<'a> {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce(iv, it, Ty::I64);
-                let d = self.new_value(elem.ty());
+                // The element's full type (#625): a nested-collection element reads
+                // back as its real `list`/`dict`/... type, not a bare `str` pointer.
+                let ety = self.elem_ty(elem);
+                let d = self.new_value(ety);
                 // Out-of-range raises a catchable Zap exception (#383), so this
                 // must be an `invoke` inside a `try` for the handler to catch it.
                 self.throwing_call(
@@ -12164,13 +12239,16 @@ impl<'a> FnLower<'a> {
                     &format!("zap_list_get_{}", elem.val_suffix()),
                     vec![bv, iv],
                 );
-                Ok((d, elem.ty()))
+                Ok((d, ety))
             }
             Ty::Dict(kk, vk) => {
                 let (kv, kt) = self.expr(index)?;
                 let kv = self.coerce(kv, kt, kk.ty());
                 let kfns = self.key_fn_args(kk)?;
-                let d = self.new_value(vk.ty());
+                // The value's full type (#625): a nested-collection value reads back
+                // as its real `list`/`dict`/... type, not a bare `str` pointer.
+                let vty = self.elem_ty(vk);
+                let d = self.new_value(vty);
                 let mut cargs = vec![bv, kv];
                 cargs.extend_from_slice(&kfns);
                 self.emit(Inst::Call {
@@ -12178,7 +12256,7 @@ impl<'a> FnLower<'a> {
                     func: format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
                     args: cargs,
                 });
-                Ok((d, vk.ty()))
+                Ok((d, vty))
             }
             Ty::Array(d) => {
                 // One-dimensional access; reject multi-axis indices before coercion.
@@ -12590,7 +12668,7 @@ impl<'a> FnLower<'a> {
                     return Err(err("append() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
-                if list_elem_kind(vt)? != elem {
+                if list_elem_kind(vt, &self.ctx.nested)? != elem {
                     return Err(err("append() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
@@ -12670,7 +12748,10 @@ impl<'a> FnLower<'a> {
                 // Ordering `f64` elements directly is a clean follow-up (the
                 // runtime sort compares elements as `i64`/str words today); a
                 // `list[float]` is still sortable via a `key=` projection.
-                Elem::F64 | Elem::Struct(_) => Err(err(format!(
+                // A nested collection (#625) is not directly orderable (the
+                // runtime compares elements as `i64`/str words), like `f64` and
+                // structs; sort it via a `key=` projection.
+                Elem::F64 | Elem::Struct(_) | Elem::Nested(_) => Err(err(format!(
                     "{what} is not orderable; pass key= to sort by an orderable \
                      projection (an int or str)"
                 ))),
@@ -12686,7 +12767,10 @@ impl<'a> FnLower<'a> {
                     )));
                 };
                 let ret = self.ctx.fn_sigs.borrow().get(sig_idx).ret;
-                let kind = orderable_kind(elem_kind(ret)?, "the sort key's return value")?;
+                let kind = orderable_kind(
+                    elem_kind(ret, &self.ctx.nested)?,
+                    "the sort key's return value",
+                )?;
                 let keys = self.build_key_list(lst, elem, kv, sig_idx, ret)?;
                 (keys, self.iconst(Ty::I64, kind))
             }
@@ -12711,7 +12795,7 @@ impl<'a> FnLower<'a> {
         sig_idx: u32,
         ret: Ty,
     ) -> Result<Value, LowerError> {
-        let kkind = elem_kind(ret)?;
+        let kkind = elem_kind(ret, &self.ctx.nested)?;
         let keys = self.new_value(Ty::Ptr);
         self.emit(Inst::Call {
             dest: Some(keys),
@@ -13331,6 +13415,17 @@ impl<'a> FnLower<'a> {
     /// key without both dunders is a clean error (needs `@derive(Hash, Eq)` or
     /// hand-written methods).
     fn key_fn_args(&mut self, elem: Elem) -> Result<Vec<Value>, LowerError> {
+        // A nested collection (#625) is unhashable: a `list`/`dict`/`set` cannot be
+        // a dict key or a set element. Without this guard it would silently take
+        // the pointer-key (`str`) path and hash the collection's pointer as if it
+        // were a `ZapStr` — a silent miscompile. Fail loudly instead.
+        if let Elem::Nested(id) = elem {
+            let ty = self.ctx.nested.borrow().get(id);
+            return Err(err(format!(
+                "a {ty} is unhashable and cannot be used as a dict key or a set \
+                 element (collections have no stable hash)"
+            )));
+        }
         let Elem::Struct(sid) = elem else {
             return Ok(vec![]);
         };
@@ -13826,7 +13921,7 @@ impl<'a> FnLower<'a> {
             let Ty::Set(elem) = rt else {
                 return Err(err("'in' is only supported with a set on the right"));
             };
-            if elem_kind(lt)? != elem {
+            if elem_kind(lt, &self.ctx.nested)? != elem {
                 return Err(err("'in' element has the wrong type for this set"));
             }
             let l = self.coerce(l, lt, elem.ty());

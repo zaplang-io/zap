@@ -35,6 +35,19 @@ pub enum Elem {
     /// function-pointer runtime entry points (key suffix `fn`). The `u32` indexes
     /// [`Module::structs`].
     Struct(u32),
+    /// A **nested collection** element — a `list`/`dict`/`set`/`heap`/`channel`
+    /// stored inside another collection (#625). Physically a pointer word, exactly
+    /// like [`Elem::Ptr`], so it pushes/reads through the `_ptr` runtime entry
+    /// points and GC-traces as a pointer. The distinction exists purely so
+    /// *lowering* can recover the element's full ZIR type for read-back dispatch:
+    /// a flat `Ptr` loses whether the element is a `str` or a nested `list[int64]`,
+    /// which silently miscompiled `rows[i]`/`len(rows[i])` as string operations.
+    /// The `u32` indexes a lowering-only interner of the element's [`Ty`] (it is
+    /// never serialized into the module — codegen treats every collection uniformly
+    /// as a traced pointer, so it never dereferences the id). [`Elem::ty`] has no
+    /// interner, so it falls back to [`Ty::Ptr`]; the lowering resolves the real
+    /// nested type through its interner instead.
+    Nested(u32),
 }
 
 impl Elem {
@@ -46,6 +59,9 @@ impl Elem {
             Elem::Enum(id) => Ty::Enum(id),
             Elem::Ptr => Ty::Ptr,
             Elem::Struct(sid) => Ty::Struct(sid),
+            // A nested collection flows as a pointer when the interner is out of
+            // reach; lowering resolves the precise `list`/`dict`/... type itself.
+            Elem::Nested(_) => Ty::Ptr,
         }
     }
     /// The runtime-entry-point suffix for an element/value of this kind. Struct
@@ -55,7 +71,7 @@ impl Elem {
         match self {
             Elem::I64 | Elem::Enum(_) => "i64",
             Elem::F64 => "f64",
-            Elem::Ptr | Elem::Struct(_) => "ptr",
+            Elem::Ptr | Elem::Struct(_) | Elem::Nested(_) => "ptr",
         }
     }
     /// The runtime-entry-point suffix for a *key* of this kind. Pointer keys are
@@ -70,6 +86,10 @@ impl Elem {
             // this is unreachable in practice; give it a defined value rather
             // than panicking should a future key path ask.
             Elem::F64 => "f64",
+            // A nested collection is unhashable (lists/dicts/sets cannot be dict
+            // or set keys), so this is never reached; share the pointer-key path
+            // for a defined value rather than panicking.
+            Elem::Nested(_) => "str",
         }
     }
 }
