@@ -9,10 +9,12 @@
 //! → run)`. The codegen/link/run steps require the `llvm` feature (and an LLVM
 //! toolchain); without it the front-end still runs and reports errors.
 
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Module;
 use zapc_syntax::cfg::Target;
 
@@ -43,6 +45,79 @@ fn build_target(features: &[String]) -> Target {
     t
 }
 
+/// One diagnostic in the uniform shape the shared renderer consumes, so every
+/// front-end render site (`modlink`, decorator desugar, sema, lowering) prints
+/// through one path and stays consistent (#571). `span` is `None` for a
+/// diagnostic that carries no source location (e.g. a lowering error).
+struct Report {
+    file: String,
+    code: ErrorCode,
+    message: String,
+    span: Option<(u32, u32)>,
+}
+
+/// Lazily reads and caches source files so a [`Report`] can be rendered with a
+/// `file:line:column` location and a source snippet. Reading the file afresh at
+/// diagnostic time is safe: spans are byte offsets into the file as it was
+/// parsed, and the error path is cold. A file that cannot be read yields
+/// `None`, and rendering degrades to the location-free header.
+#[derive(Default)]
+struct SourceMap {
+    cache: HashMap<String, Option<String>>,
+}
+
+impl SourceMap {
+    fn source(&mut self, file: &str) -> Option<&str> {
+        self.cache
+            .entry(file.to_string())
+            .or_insert_with(|| std::fs::read_to_string(file).ok())
+            .as_deref()
+    }
+}
+
+/// De-duplicate the reports (order-preserving, keyed on file/code/span/message,
+/// so one cause reported twice prints once) and render each through the shared
+/// renderer. Returned lines are what [`report`] prints to stderr; split out so
+/// it is testable without capturing stderr.
+fn format_reports(reports: Vec<Report>) -> Vec<String> {
+    let reports = zapc_diag::render::dedup_preserving(reports, |r| {
+        (r.file.clone(), r.code, r.span, r.message.clone())
+    });
+    let mut sources = SourceMap::default();
+    reports
+        .into_iter()
+        .map(|r| {
+            let src = if r.span.is_some() {
+                sources.source(&r.file)
+            } else {
+                None
+            };
+            zapc_diag::render::render_diagnostic(src, &r.file, r.code, &r.message, r.span)
+        })
+        .collect()
+}
+
+/// Build [`Report`]s for a merged-program pass whose diagnostics carry a span
+/// but no file of their own (sema and decorator desugar). Their spans are byte
+/// offsets into the entry file, so they are attributed to `entry`.
+fn sema_reports(entry: &str, errs: Vec<zapc_sema::TypeError>) -> Vec<Report> {
+    errs.into_iter()
+        .map(|e| Report {
+            file: entry.to_string(),
+            code: e.code,
+            message: e.message,
+            span: Some((e.span.start, e.span.end)),
+        })
+        .collect()
+}
+
+/// Render and print a batch of diagnostics to stderr (see [`format_reports`]).
+fn report(reports: Vec<Report>) {
+    for line in format_reports(reports) {
+        eprintln!("{line}");
+    }
+}
+
 /// Run the whole-program front end: discover and link the local module import
 /// graph (I#283/D-0081) into one merged, qualified module, then type-check it.
 /// A single file with no local imports links to just itself, so the single-file
@@ -51,12 +126,17 @@ fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
     let mut module = match modlink::load_program(entry, target) {
         Ok(m) => m,
         Err(diags) => {
-            for d in &diags {
-                eprintln!(
-                    "{}: error[{}]: {} [{}..{}]",
-                    d.file, d.code, d.message, d.span.start, d.span.end
-                );
-            }
+            report(
+                diags
+                    .into_iter()
+                    .map(|d| Report {
+                        file: d.file,
+                        code: d.code,
+                        message: d.message,
+                        span: Some((d.span.start, d.span.end)),
+                    })
+                    .collect(),
+            );
             return Err(ExitCode::from(1));
         }
     };
@@ -68,22 +148,12 @@ fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
     // style errors before type-checking.
     let deco_diags = decorator_desugar::desugar_registering_decorators(&mut module);
     if !deco_diags.is_empty() {
-        for e in &deco_diags {
-            eprintln!(
-                "{entry}: error[{}]: {} [{}..{}]",
-                e.code, e.message, e.span.start, e.span.end
-            );
-        }
+        report(sema_reports(entry, deco_diags));
         return Err(ExitCode::from(1));
     }
     let errs = zapc_sema::check(&module);
     if !errs.is_empty() {
-        for e in &errs {
-            eprintln!(
-                "{entry}: error[{}]: {} [{}..{}]",
-                e.code, e.message, e.span.start, e.span.end
-            );
-        }
+        report(sema_reports(entry, errs));
         return Err(ExitCode::from(1));
     }
     Ok(module)
@@ -107,9 +177,18 @@ pub fn emit_ir_for(file: &str, features: &[String]) -> ExitCode {
     testing::strip_test_items(&mut module);
     let (zir, errs) = zapc_ir::lower_module(&module);
     if !errs.is_empty() {
-        for e in &errs {
-            eprintln!("{file}: error[{}]: {}", e.code, e.message);
-        }
+        // Lowering errors carry no span, so they render as the location-free
+        // header (unchanged), but still through the one shared path (#571).
+        report(
+            errs.into_iter()
+                .map(|e| Report {
+                    file: file.to_string(),
+                    code: e.code,
+                    message: e.message,
+                    span: None,
+                })
+                .collect(),
+        );
         return ExitCode::from(1);
     }
     print!("{zir}");
@@ -218,4 +297,109 @@ fn backend(
     eprintln!("{file}: front-end OK, but this build has no codegen");
     eprintln!("(rebuild with --features zapc/llvm, which requires an LLVM toolchain)");
     ExitCode::from(1)
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::{format_reports, Report};
+    use zapc_diag::ErrorCode;
+
+    /// A throwaway source file under the OS temp dir, removed on drop.
+    struct TmpFile {
+        path: std::path::PathBuf,
+    }
+
+    impl TmpFile {
+        fn new(src: &str) -> TmpFile {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("zap-diag-{}-{}.zap", std::process::id(), nonce));
+            std::fs::write(&path, src).unwrap();
+            TmpFile { path }
+        }
+
+        fn name(&self) -> String {
+            self.path.display().to_string()
+        }
+    }
+
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn renders_line_col_and_caret_from_the_source_file() {
+        let f = TmpFile::new("def main():\n    print(x)\n");
+        // `x` is byte 22..23 — line 2, column 11.
+        let out = format_reports(vec![Report {
+            file: f.name(),
+            code: ErrorCode::ZAP3001,
+            message: "unknown name `x`".into(),
+            span: Some((22, 23)),
+        }]);
+        assert_eq!(
+            out,
+            vec![format!(
+                "{}:2:11: error[ZAP3001]: unknown name `x`\n    print(x)\n          ^",
+                f.name()
+            )]
+        );
+    }
+
+    #[test]
+    fn duplicate_diagnostics_are_emitted_once() {
+        let f = TmpFile::new("def main():\n    print(x)\n");
+        let one = || Report {
+            file: f.name(),
+            code: ErrorCode::ZAP3001,
+            message: "unknown name `x`".into(),
+            span: Some((22, 23)),
+        };
+        // The same cause reported three times collapses to a single line.
+        let out = format_reports(vec![one(), one(), one()]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains(":2:11: error[ZAP3001]: unknown name `x`"));
+    }
+
+    #[test]
+    fn distinct_diagnostics_are_all_kept_in_order() {
+        let f = TmpFile::new("def main():\n    print(x)\n");
+        let out = format_reports(vec![
+            Report {
+                file: f.name(),
+                code: ErrorCode::ZAP3001,
+                message: "unknown name `x`".into(),
+                span: Some((22, 23)),
+            },
+            Report {
+                file: f.name(),
+                code: ErrorCode::ZAP3001,
+                message: "unknown name `y`".into(),
+                span: Some((22, 23)),
+            },
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(out[0].contains("unknown name `x`"));
+        assert!(out[1].contains("unknown name `y`"));
+    }
+
+    #[test]
+    fn missing_source_file_degrades_to_header_only() {
+        let out = format_reports(vec![Report {
+            file: "/no/such/file.zap".into(),
+            code: ErrorCode::ZAP6001,
+            message: "lowering failed".into(),
+            span: Some((0, 1)),
+        }]);
+        assert_eq!(
+            out,
+            vec!["/no/such/file.zap: error[ZAP6001]: lowering failed"]
+        );
+    }
 }
