@@ -5,6 +5,10 @@ def make() -> list[dict[str, bool]]:
 def count(dict[str, bool] value) -> int64:
     return len(value)
 
+def take(list[str] items, dict[str, bool] fields):
+    assert len(items) == 0
+    assert len(fields) == 0
+
 def main():
     list[bool] flags = []
     flags.append(False)
@@ -39,6 +43,11 @@ def main():
     returned[0]["returned"] = True
     assert returned[0]["returned"]
     assert count({}) == 0
+    take([*[]], {**{}})
+    matrix.append([*[{}]])
+    assert len(matrix[1][0]) == 0
+    trees.append({**{"branch": {}}})
+    assert len(trees[1]["branch"]) == 0
     list[list[float64]] numbers = []
     numbers.append([])
     numbers[0].append(1.5)

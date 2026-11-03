@@ -11502,7 +11502,12 @@ impl<'a> FnLower<'a> {
         for el in elems {
             match el {
                 Expr::Starred { value, .. } => {
-                    self.iterate(value, |s, v, t| push(s, v, t))?;
+                    if let (Some(kind), Expr::List(_, _)) = (elem.get(), value.as_ref()) {
+                        let (source, _) = self.expr_collection_context(value, Ty::List(kind))?;
+                        self.iterate_list(source, kind, |s, v, t| push(s, v, t))?;
+                    } else {
+                        self.iterate(value, |s, v, t| push(s, v, t))?;
+                    }
                 }
                 _ => {
                     let (v, t) = match elem.get() {
@@ -11579,7 +11584,12 @@ impl<'a> FnLower<'a> {
                     });
                 }
                 DictItem::Spread(e) => {
-                    let (src, st) = self.expr(e)?;
+                    let (src, st) = match kinds.get() {
+                        Some((key, value)) => {
+                            self.expr_collection_context(e, Ty::Dict(key, value))?
+                        }
+                        None => self.expr(e)?,
+                    };
                     let Ty::Dict(skk, svk) = st else {
                         return Err(err("`**` in a dict display requires a dict"));
                     };
