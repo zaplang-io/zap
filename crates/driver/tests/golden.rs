@@ -11,6 +11,13 @@
 //! The end-to-end run (`golden_programs_match`) requires the `llvm` feature
 //! (and an LLVM toolchain); run it in the dev container with
 //! `--features zapc/llvm`. The `fixtures_are_paired` check runs everywhere.
+//!
+//! The end-to-end runs compile+link+run independent fixtures concurrently on a
+//! bounded worker pool (see `run_goldens_parallel`). The pool width defaults to
+//! 2 and is tunable without recompiling via the `ZAP_GOLDEN_JOBS` env var; set
+//! it to `1` to restore fully serial execution. Per-fixture outcomes are
+//! collected and reported in sorted fixture order, so a failure prints the same
+//! regardless of scheduling.
 
 use std::path::PathBuf;
 
@@ -177,6 +184,85 @@ fn skipped_on_this_arch(zap: &std::path::Path) -> bool {
     })
 }
 
+/// Outcome of running a single golden fixture. `Skipped` covers an
+/// architecture-quarantined fixture (see `skipped_on_this_arch`); `Failed`
+/// carries the human-readable mismatch/exit/stderr message to surface.
+#[cfg(feature = "codegen")]
+enum Outcome {
+    Pass,
+    Skipped,
+    Failed(String),
+}
+
+/// Number of fixtures to run concurrently. Defaults to 2 (the conservative
+/// starting width for the concurrency/GC-sensitive suite); `ZAP_GOLDEN_JOBS=1`
+/// restores serial execution, and a higher value widens the pool without a
+/// recompile. A missing/garbage/zero value falls back to the default.
+#[cfg(feature = "codegen")]
+fn golden_jobs() -> usize {
+    std::env::var("ZAP_GOLDEN_JOBS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(2)
+}
+
+/// Run `work` over `items` on a bounded pool of `golden_jobs()` worker threads,
+/// then assert the aggregated outcome. Workers pull fixtures off a shared index
+/// so the pool stays bounded (no thread-per-fixture fan-out); each fixture's
+/// work is independent (spawn `zapc`, link, run, diff), so this parallelizes
+/// cleanly. Outcomes are collected and, after the pool drains, reported in the
+/// original (sorted) `items` order, so a failure prints identically regardless
+/// of scheduling and concurrent fixtures never interleave into unreadable
+/// output. A hang still panics loudly from inside `run_with_timeout`, failing
+/// the test fast rather than being silenced.
+#[cfg(feature = "codegen")]
+fn run_goldens_parallel<F>(items: Vec<PathBuf>, work: F)
+where
+    F: Fn(&std::path::Path) -> Outcome + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    if items.is_empty() {
+        return;
+    }
+    let jobs = golden_jobs().min(items.len());
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, Outcome)>> = Mutex::new(Vec::with_capacity(items.len()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            let (next, results, items, work) = (&next, &results, &items, &work);
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                let outcome = work(&items[i]);
+                results.lock().expect("results lock").push((i, outcome));
+            });
+        }
+    });
+
+    let mut results = results.into_inner().expect("results lock");
+    results.sort_by_key(|(i, _)| *i);
+
+    let mut failures = Vec::new();
+    for (i, outcome) in results {
+        match outcome {
+            Outcome::Pass | Outcome::Skipped => {}
+            Outcome::Failed(msg) => failures.push(format!("{}:\n{msg}", items[i].display())),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} golden fixture(s) failed:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
 /// Compile + run each fixture and compare stdout. Requires the `llvm` feature.
 #[cfg(feature = "codegen")]
 #[test]
@@ -188,17 +274,17 @@ fn golden_programs_match() {
     // this test fast rather than burning the job's budget.
     let per_test = std::time::Duration::from_secs(60);
     let bin = env!("CARGO_BIN_EXE_zapc");
-    for zap in zap_fixtures() {
+    run_goldens_parallel(zap_fixtures(), |zap| {
         // A fixture quarantined on this architecture (see `skipped_on_this_arch`)
         // is skipped loudly rather than run — e.g. the concurrent stress goldens
         // on aarch64, pending the parked #223 GC race.
-        if skipped_on_this_arch(&zap) {
+        if skipped_on_this_arch(zap) {
             eprintln!(
                 "golden: SKIP {} on arch {} — quarantined via .skip_arch sidecar (see #223)",
                 zap.display(),
                 std::env::consts::ARCH
             );
-            continue;
+            return Outcome::Skipped;
         }
         let expected = std::fs::read_to_string(zap.with_extension("expected"))
             .expect("expected output present");
@@ -210,7 +296,7 @@ fn golden_programs_match() {
         let expected_stderr = std::fs::read_to_string(zap.with_extension("stderr")).ok();
 
         let mut cmd = Command::new(bin);
-        cmd.arg("run").arg(&zap);
+        cmd.arg("run").arg(zap);
         // Optional `*.env` sidecar: `KEY=VALUE` lines set on the child's
         // environment. Used to make a scheduler knob load-bearing in a fixture —
         // e.g. `MAXPROCS=1` so the preemption golden forces all coroutines onto a
@@ -230,27 +316,29 @@ fn golden_programs_match() {
 
         let got = String::from_utf8_lossy(&output.stdout);
         let got_err = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            output.status.code(),
-            Some(expected_exit),
-            "exit code mismatch for {} (stderr:\n{got_err})",
-            zap.display()
-        );
-        assert_eq!(
-            got.trim_end(),
-            expected.trim_end(),
-            "stdout mismatch for {} (stderr:\n{got_err})",
-            zap.display()
-        );
+        if output.status.code() != Some(expected_exit) {
+            return Outcome::Failed(format!(
+                "exit code mismatch: got {:?}, want {expected_exit} (stderr:\n{got_err})",
+                output.status.code()
+            ));
+        }
+        if got.trim_end() != expected.trim_end() {
+            return Outcome::Failed(format!(
+                "stdout mismatch:\n--- got ---\n{}\n--- want ---\n{}\n(stderr:\n{got_err})",
+                got.trim_end(),
+                expected.trim_end()
+            ));
+        }
         if let Some(want_err) = expected_stderr {
             let want_err = want_err.trim_end();
-            assert!(
-                got_err.contains(want_err),
-                "stderr for {} should contain {want_err:?}, got:\n{got_err}",
-                zap.display()
-            );
+            if !got_err.contains(want_err) {
+                return Outcome::Failed(format!(
+                    "stderr should contain {want_err:?}, got:\n{got_err}"
+                ));
+            }
         }
-    }
+        Outcome::Pass
+    });
 }
 
 /// Compile + run each multi-file project fixture (I#283/D-0081) by its entry
@@ -261,7 +349,7 @@ fn golden_projects_match() {
     use std::process::Command;
     let per_test = std::time::Duration::from_secs(60);
     let bin = env!("CARGO_BIN_EXE_zapc");
-    for main in project_fixtures() {
+    run_goldens_parallel(project_fixtures(), |main| {
         let proj = main.parent().expect("project dir");
         let expected =
             std::fs::read_to_string(proj.join("expected")).expect("expected output present");
@@ -272,7 +360,7 @@ fn golden_projects_match() {
         let expected_stderr = std::fs::read_to_string(proj.join("stderr")).ok();
 
         let mut cmd = Command::new(bin);
-        cmd.arg("run").arg(&main);
+        cmd.arg("run").arg(main);
         // Optional `env` sidecar: `KEY=VALUE` lines set on the child's
         // environment, with `$PROJDIR` expanded to the project's absolute path.
         // Used by the cross-package fixture to point `ZAP_ZENV` at a prebuilt
@@ -293,25 +381,27 @@ fn golden_projects_match() {
 
         let got = String::from_utf8_lossy(&output.stdout);
         let got_err = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            output.status.code(),
-            Some(expected_exit),
-            "exit code mismatch for {} (stderr:\n{got_err})",
-            main.display()
-        );
-        assert_eq!(
-            got.trim_end(),
-            expected.trim_end(),
-            "stdout mismatch for {} (stderr:\n{got_err})",
-            main.display()
-        );
+        if output.status.code() != Some(expected_exit) {
+            return Outcome::Failed(format!(
+                "exit code mismatch: got {:?}, want {expected_exit} (stderr:\n{got_err})",
+                output.status.code()
+            ));
+        }
+        if got.trim_end() != expected.trim_end() {
+            return Outcome::Failed(format!(
+                "stdout mismatch:\n--- got ---\n{}\n--- want ---\n{}\n(stderr:\n{got_err})",
+                got.trim_end(),
+                expected.trim_end()
+            ));
+        }
         if let Some(want_err) = expected_stderr {
             let want_err = want_err.trim_end();
-            assert!(
-                got_err.contains(want_err),
-                "stderr for {} should contain {want_err:?}, got:\n{got_err}",
-                main.display()
-            );
+            if !got_err.contains(want_err) {
+                return Outcome::Failed(format!(
+                    "stderr should contain {want_err:?}, got:\n{got_err}"
+                ));
+            }
         }
-    }
+        Outcome::Pass
+    });
 }
