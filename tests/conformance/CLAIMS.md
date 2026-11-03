@@ -179,6 +179,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | ENUM-2 | §4.6 | tier-3 data-carrying variants destructured by `match`, exhaustive (D-0046) | TODO | — |
 | OPT-1 | §4.6 | prelude `Optional[T]` is the canonical optional type (D-0065) | TODO | — |
 | GEN-1 | §4.7 | built-in containers are generic (`list`/`dict`/`set`/`array`) | covered | collection_elements |
+| SET-1 | §4.6 | `set` is Stable; `set[T]()` builds an empty set and `set(iterable)`/`set[T](iterable)` build a deduplicated set from any iterable (#608/#609) | covered | set_constructors |
 
 ## Operators overloading, modules, concurrency, cleanup (§5, §11–§13)
 

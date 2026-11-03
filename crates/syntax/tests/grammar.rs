@@ -387,6 +387,9 @@ const CORPUS: &[Case] = &[
     case("comp_for", Accept, "auto xs = [x for x in ys]\n"),                    // comprehension
     case("dict_comp", Accept, "auto d = {k: v for k in ks}\n"),
     case("dict_items", Accept, "auto d = {1: 2, 3: 4}\n"),
+    case("set_items", Accept, "auto s = {1, 2, 3}\n"),                          // set literal (#608)
+    case("comp_for", Accept, "auto s = {x for x in xs}\n"),                     // set comprehension (#608)
+    case("trailer", Accept, "auto s = set[int64]()\n"),                         // empty-set constructor (#609)
     case("subscript", Accept, "auto s = xs[1:2:3]\n"),                          // slice, D-0030
     case("match_regex", Accept, "auto m = x =~ m/foo/\n"),                      // D-0010
     case("lambda", Reject, "auto f = lambda x x\n"),                            // missing ':'

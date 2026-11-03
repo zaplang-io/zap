@@ -7563,11 +7563,81 @@ impl<'a> FnLower<'a> {
                 });
                 self.iterate_list(items, elem, body)
             }
+            // A `str` (a pointer handle in ZIR) iterates its codepoints as
+            // `char`s (D-0025), walking the UTF-8 buffer once — so comprehensions
+            // and `set(...)`/`set[T](...)` accept a string operand.
+            Ty::Ptr => self.iterate_str(val, body),
             Ty::Struct(sid) => self.drive_iteration(val, sid, body),
             other => Err(err(format!(
                 "value of type {other:?} is not iterable (D-0048)"
             ))),
         }
+    }
+
+    /// Iterate a `str`'s codepoints, invoking `body` with each `char` (an `i32`
+    /// codepoint). The closure form of [`Self::lower_for_str`]: it walks the
+    /// UTF-8 buffer by byte cursor, re-reading the length each step. Used by the
+    /// general iteration protocol ([`Self::iterate`]) for comprehensions and the
+    /// `set` constructors over a string.
+    fn iterate_str(
+        &mut self,
+        s: Value,
+        mut body: impl FnMut(&mut FnLower<'a>, Value, Ty) -> Result<(), LowerError>,
+    ) -> Result<(), LowerError> {
+        self.push_scope();
+        let off = self.alloca(Ty::I64);
+        let zero = self.iconst(Ty::I64, 0);
+        self.store(off, zero);
+        let cond_bb = self.new_block();
+        let body_bb = self.new_block();
+        let incr_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(cond_bb));
+        self.position(cond_bb);
+        let cur = self.load(off, Ty::I64);
+        let nbytes = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(nbytes),
+            func: "zap_str_len".to_string(),
+            args: vec![s],
+        });
+        let c = self.new_value(Ty::I1);
+        self.emit(Inst::ICmp {
+            dest: c,
+            pred: CmpPred::Lt,
+            lhs: cur,
+            rhs: nbytes,
+        });
+        self.set_term(Term::BrIf {
+            cond: c,
+            then_bb: body_bb,
+            else_bb: end_bb,
+        });
+        self.position(body_bb);
+        let cur_off = self.load(off, Ty::I64);
+        let cp = self.new_value(Ty::I32);
+        self.emit(Inst::Call {
+            dest: Some(cp),
+            func: "zap_str_cp_at_byte".to_string(),
+            args: vec![s, cur_off],
+        });
+        self.push_loop(incr_bb, end_bb);
+        body(self, cp, Ty::I32)?;
+        self.loops.pop();
+        self.ensure_br(incr_bb);
+        self.position(incr_bb);
+        let cur2 = self.load(off, Ty::I64);
+        let next = self.new_value(Ty::I64);
+        self.emit(Inst::Call {
+            dest: Some(next),
+            func: "zap_str_adv_byte".to_string(),
+            args: vec![s, cur2],
+        });
+        self.store(off, next);
+        self.set_term(Term::Br(cond_bb));
+        self.position(end_bb);
+        self.pop_scope();
+        Ok(())
     }
 
     /// Iterate a `list[T]` value by index, re-reading the length each iteration.
@@ -8914,6 +8984,9 @@ impl<'a> FnLower<'a> {
             if is_name(base, "heap") {
                 return self.lower_heap_new(index, args);
             }
+            if is_name(base, "set") {
+                return self.lower_set_new(index, args);
+            }
         }
         if let Expr::Name(fname, _) = callee {
             if fname == "sum" {
@@ -9304,6 +9377,18 @@ impl<'a> FnLower<'a> {
                     }
                     _ => Err(err("bytes() expects a str or list[int64] argument")),
                 };
+            }
+            if fname == "set" {
+                // set(iterable): a fresh set of the iterable's deduplicated
+                // elements (D17, #609). The element kind is fixed by the first
+                // element added; `set()` with no argument is rejected (sema
+                // directs the user to `set[T]()`).
+                if args.len() != 1 || args[0].name.is_some() {
+                    return Err(err(
+                        "set(iterable) takes exactly one positional argument; use set[T]() for an empty set",
+                    ));
+                }
+                return self.lower_set_from_iterable(&args[0].value, None);
             }
             if fname == "int" {
                 // int(x): parse a `str` to an `int`, or convert a number to int.
@@ -11564,6 +11649,101 @@ impl<'a> FnLower<'a> {
                 }
             }
         }
+        let ek = elem.get().unwrap_or(Elem::I64);
+        self.func.value_types[set as usize] = Ty::Set(ek);
+        Ok((set, Ty::Set(ek)))
+    }
+
+    /// Lower `set[T]()` (empty) / `set[T](iterable)` (from an iterable), D17 #609.
+    /// The element kind `T` comes from the subscript type name; an empty call
+    /// builds a fresh `set[T]`, and a single positional iterable argument builds
+    /// `set[T]` of that iterable's deduplicated elements.
+    fn lower_set_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let Expr::Name(ename, espan) = elem_expr else {
+            return Err(err(
+                "set[...] expects an element type name, e.g. set[int64]",
+            ));
+        };
+        let named = ast::Type::Named {
+            name: ename.clone(),
+            args: Vec::new(),
+            span: *espan,
+        };
+        let ety = resolve_ty(&named, &self.ctx.tyenv())?;
+        let elem = elem_kind(ety, &self.ctx.nested)?;
+        // A nested collection is unhashable (#625): reject `set[list[..]]()` loudly
+        // rather than letting it hash a pointer as a string on a later `.add`.
+        if let Elem::Nested(id) = elem {
+            let ty = self.ctx.nested.borrow().get(id);
+            return Err(err(format!(
+                "a {ty} is unhashable and cannot be a set element (collections have no stable hash)"
+            )));
+        }
+        match args.len() {
+            0 => {
+                let set = self.new_value(Ty::Set(elem));
+                self.emit(Inst::Call {
+                    dest: Some(set),
+                    func: "zap_set_new".to_string(),
+                    args: vec![],
+                });
+                Ok((set, Ty::Set(elem)))
+            }
+            1 if args[0].name.is_none() => self.lower_set_from_iterable(&args[0].value, Some(elem)),
+            _ => Err(err(
+                "set[T](...) takes at most one positional iterable argument",
+            )),
+        }
+    }
+
+    /// Build a set from an iterable (D17 #609): `set(iterable)` and the
+    /// `set[T](iterable)` tail. Iterates the operand through the general protocol
+    /// and adds each element (dedup is the runtime's), mirroring `lower_set_lit`'s
+    /// add path. `declared` fixes the element kind for `set[T](..)`; `None`
+    /// (plain `set(..)`) lets the first element fix it, defaulting to `i64` for an
+    /// empty iterable.
+    fn lower_set_from_iterable(
+        &mut self,
+        iterable: &Expr,
+        declared: Option<Elem>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let set = self.new_value(Ty::Set(declared.unwrap_or(Elem::I64)));
+        self.emit(Inst::Call {
+            dest: Some(set),
+            func: "zap_set_new".to_string(),
+            args: vec![],
+        });
+        let elem: std::cell::Cell<Option<Elem>> = std::cell::Cell::new(declared);
+        self.iterate(iterable, |s, v, t| {
+            let ek = match elem.get() {
+                Some(e) => {
+                    if elem_kind(t, &s.ctx.nested)? != e {
+                        return Err(err("set elements must all have the same representation"));
+                    }
+                    e
+                }
+                None => {
+                    let e = elem_kind(t, &s.ctx.nested)?;
+                    elem.set(Some(e));
+                    e
+                }
+            };
+            let v = s.coerce(v, t, ek.ty());
+            let v = s.box_if_value(v, ek.ty());
+            let kfns = s.key_fn_args(ek)?;
+            let mut cargs = vec![set, v];
+            cargs.extend_from_slice(&kfns);
+            s.emit(Inst::Call {
+                dest: None,
+                func: format!("zap_set_add_{}", ek.key_suffix()),
+                args: cargs,
+            });
+            Ok(())
+        })?;
         let ek = elem.get().unwrap_or(Elem::I64);
         self.func.value_types[set as usize] = Ty::Set(ek);
         Ok((set, Ty::Set(ek)))

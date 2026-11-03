@@ -1,8 +1,9 @@
 (* ======================================================================
    Zap grammar (EBNF) — tracks SPEC.md v0.3 and DECISIONS D-0001..D-0076.
    The Stable 1.0 language surface (#206 / D-0076, docs/STABILITY.md §4.4) is
-   frozen; Experimental surfaces (arrays/SIMD, `set`, bitfields) are marked at
+   frozen; Experimental surfaces (arrays/SIMD, bitfields) are marked at
    their productions. Additions post-freeze are backward-compatible (MINOR).
+   (`set` graduated to Stable per #608/#609, D16/D17.)
 
    This file is load-bearing (I#396): `crates/syntax/tests/grammar.rs` lints it
    (every nonterminal defined, reachable from `module`, no dups, brackets

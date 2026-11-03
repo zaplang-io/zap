@@ -4227,6 +4227,32 @@ impl Checker {
                 }
                 return Ty::Heap(Box::new(elem));
             }
+            // Set construction `set[T]()` / `set[T](iterable)` (D17, #609). The
+            // element type `T` is the subscript; with no argument it builds an
+            // empty `set[T]`, and with one positional iterable it builds a
+            // `set[T]` of that iterable's (deduplicated) elements, mirroring
+            // Python's `set(xs)`.
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "set") {
+                let elem = self.chan_elem_from_expr(index);
+                match args.len() {
+                    0 => {}
+                    1 if args[0].name.is_none() => {
+                        let at = self.infer(&args[0].value);
+                        // Require an iterable operand (D-0048); the element type
+                        // is checked against `T` at lowering (element-rep match).
+                        self.iter_element(&at, expr_span(&args[0].value));
+                    }
+                    _ => self.error(
+                        ErrorCode::ZAP4025,
+                        "set[T](...) takes at most one positional iterable argument".to_string(),
+                        span,
+                    ),
+                }
+                self.warn_struct_key(&elem, span);
+                let ty = Ty::Set(Box::new(elem));
+                self.check_numeric_container_value(&ty, span);
+                return ty;
+            }
             // Call-site explicit type arguments on a generic callee (I#161,
             // Fork S): `f[T](...)`, `Type[T](...)`, or `recv.m[T](...)`. The
             // `index` here is type arguments, not a value subscript, so it is NOT
@@ -4452,6 +4478,34 @@ impl Checker {
                         }
                     }
                     return Ty::Bytes;
+                }
+                "set" => {
+                    // set(iterable): a new set of the iterable's deduplicated
+                    // elements (D17, #609), mirroring Python's `set(xs)`. The
+                    // element type is the iterable's. An empty set has no element
+                    // type to infer, so `set()` directs the user to `set[T]()`.
+                    if args.is_empty() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "set() needs an iterable; build an empty set with set[T]() (e.g. set[int64]())"
+                                .to_string(),
+                            span,
+                        );
+                        return Ty::Set(Box::new(Ty::Unknown));
+                    }
+                    if args.len() != 1 || args[0].name.is_some() {
+                        self.error(
+                            ErrorCode::ZAP4025,
+                            "set(iterable) takes exactly one positional argument".to_string(),
+                            span,
+                        );
+                    }
+                    let at = self.infer(&args[0].value);
+                    let elem = self.iter_element(&at, expr_span(&args[0].value));
+                    self.warn_struct_key(&elem, span);
+                    let ty = Ty::Set(Box::new(elem));
+                    self.check_numeric_container_value(&ty, span);
+                    return ty;
                 }
                 "int" => {
                     // int(x): parse a `str`, or convert a number, to an `int`.
@@ -8004,6 +8058,57 @@ def main():
             e.iter()
                 .any(|x| x.message.contains("only the keyword argument")),
             "expected a positional-argument error, got {e:?}"
+        );
+    }
+
+    // --- set constructors (D17, #609) ---
+
+    #[test]
+    fn set_empty_construction_type_checks() {
+        // `set[T]()` builds an empty `set[T]`, parallel to heap[T]()/channel[T]().
+        // The element type is tracked: `.add`, `in`, and `len` all check.
+        ok("def main():\n    \
+                auto s = set[int64]()\n    \
+                s.add(5)\n    \
+                print(5 in s)\n    \
+                int64 n = len(s)\n    \
+                print(n)\n");
+    }
+
+    #[test]
+    fn set_from_list_type_checks() {
+        // `set(iterable)` and `set[T](iterable)` build a set from any iterable.
+        ok("def main():\n    \
+                auto a = set([1, 1, 2, 3])\n    \
+                auto b = set[int64]([4, 4, 5])\n    \
+                print(len(a) + len(b))\n");
+    }
+
+    #[test]
+    fn set_from_string_type_checks() {
+        // Iterating a `str` yields chars, so `set(\"aab\")` is a set of codepoints.
+        ok("def main():\n    \
+                auto s = set(\"aab\")\n    \
+                print(len(s))\n");
+    }
+
+    #[test]
+    fn set_no_argument_errors() {
+        // `set()` has no element type to infer; sema points at `set[T]()`.
+        let e = errors("def main():\n    auto s = set()\n");
+        assert!(
+            e.iter().any(|x| x.message.contains("set[T]()")),
+            "expected a set() empty-construction error, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn set_from_noniterable_errors() {
+        // A non-iterable operand to `set(...)` is a D-0048 error.
+        let e = errors("def main():\n    auto s = set(5)\n");
+        assert!(
+            e.iter().any(|x| x.message.contains("not iterable")),
+            "expected a not-iterable error, got {e:?}"
         );
     }
 
