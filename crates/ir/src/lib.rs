@@ -74,6 +74,31 @@ mod tests {
     }
 
     #[test]
+    fn nested_empty_literals_use_destination_types() {
+        lower_ok(include_str!(
+            "../../../tests/golden/nested_empty_append.zap"
+        ));
+    }
+
+    #[test]
+    fn nested_append_still_rejects_incompatible_values() {
+        for (declaration, value) in [
+            ("list[dict[str, bool]] values = []", "{1: False}"),
+            ("list[list[str]] values = []", "[1]"),
+            ("list[list[dict[str, bool]]] values = []", "[{1: True}]"),
+            ("list[dict[str, bool]] values = []", "wrong"),
+        ] {
+            let source = format!(
+                "def main():\n    dict[int64, bool] wrong = {{1: True}}\n    {declaration}\n    values.append({value})\n"
+            );
+            let (ast, parse, lex) = parse_str(&source);
+            assert!(parse.is_empty() && lex.is_empty());
+            let (_, errors) = lower_module(&ast);
+            assert!(!errors.is_empty(), "incompatible append accepted: {value}");
+        }
+    }
+
+    #[test]
     fn nested_collection_key_is_a_loud_error() {
         // #625: a collection is unhashable, so using one as a dict key or a set
         // element must fail loudly rather than silently hashing its pointer as a
