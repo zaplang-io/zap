@@ -36,11 +36,7 @@ fn lower(
             .copied()
             .ok_or_else(|| err("JsonValue unavailable (built-in prelude missing)"))?;
         let d = lowerer.new_value(Ty::Struct(sid));
-        lowerer.emit(Inst::Call {
-            dest: Some(d),
-            func: "__json_loads".to_string(),
-            args: vec![s],
-        });
+        lowerer.throwing_call(Some(d), "__json_loads", vec![s]);
         return Ok(Some((d, Ty::Struct(sid))));
     }
     // json.scan(s) -> JsonScanner: a prelude struct holding the tokenizer cursor;
@@ -53,12 +49,9 @@ fn lower(
             .get("JsonScanner")
             .copied()
             .ok_or_else(|| err("JsonScanner unavailable (built-in prelude missing)"))?;
-        let cur = lowerer.new_value(Ty::Ptr);
-        lowerer.emit(Inst::Call {
-            dest: Some(cur),
-            func: "zap_json_lex_new".to_string(),
-            args: vec![s],
-        });
+        // Reuse the shared `_lex_new` cursor-construction lowering so the
+        // throwing contract (validate-or-raise) lives in exactly one place.
+        let (cur, _) = call_ret(lowerer, "zap_json_lex_new", vec![s], Ty::Ptr, true);
         let d = lowerer.new_value(Ty::Struct(sid));
         lowerer.emit(Inst::StructNew { dest: d, sid });
         lowerer.emit(Inst::FieldSet {
@@ -74,7 +67,7 @@ fn lower(
         // json.dumps(v) -> str: call the prelude serializer.
         "dumps" => call_ret(lowerer, "__json_dumps", a, Ty::Ptr, false),
         // Tokenizer cursor primitives.
-        "_lex_new" => call_ret(lowerer, "zap_json_lex_new", a, Ty::Ptr, false),
+        "_lex_new" => call_ret(lowerer, "zap_json_lex_new", a, Ty::Ptr, true),
         "_lex_next" => call_ret(lowerer, "zap_json_lex_next", a, Ty::I64, false),
         "_lex_int" => call_ret(lowerer, "zap_json_lex_int", a, Ty::I64, false),
         "_lex_float" => call_ret(lowerer, "zap_json_lex_float", a, Ty::F64, false),

@@ -410,10 +410,17 @@ def __json_value(bytes c, int64 k) -> JsonValue:
         return __json_object(c)
     return JsonValue.Null
 
+# The DOM builders assume `_lex_new` already validated a complete document
+# (zap_json_document_valid), so a well-formed array always closes with EndArray
+# and a well-formed object with EndObject. The explicit End (token 0) guard below
+# is defence-in-depth: without it a truncated array (e.g. `[1,`) would spin
+# forever re-reading End at EOF. It raises a catchable error instead.
 def __json_array(bytes c) -> JsonValue:
     list[JsonValue] xs = []
     auto k = json._lex_next(c)
     while k != 10:
+        if k == 0:
+            raise \"truncated JSON array: unexpected end of input\"
         xs.append(__json_value(c, k))
         k = json._lex_next(c)
         if k == 12:
