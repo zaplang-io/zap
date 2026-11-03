@@ -193,6 +193,28 @@ element is followed by `:`, which makes it a dict; **empty `{}` is the empty
 dict** (there is no empty-set literal — build one with a constructor such as
 `set[T]()`). `set` is Stable (D-0076).
 
+**Unpacking in displays (`*` / `**`, #598).** A `*expr` inside a list, set, or
+tuple display splices an iterable's elements in place, and a `**expr` inside a
+dict display merges another `dict[K, V]`'s entries:
+
+```python
+auto xs = [1, 2, 3]
+auto ys = [0, *xs, 4, *xs]       # [0, 1, 2, 3, 4, 1, 2, 3]
+auto s  = {*xs, 10}              # set[int64] {1, 2, 3, 10}
+auto t  = (0, *(1, 2), 9)        # (0, 1, 2, 9) — a tuple splat must be a tuple
+auto a  = {"x": 1}
+auto b  = {"y": 2, **a, "x": 9}  # {"y": 2, "x": 9} — later entries win
+```
+
+Multiple splats and ordinary elements may be mixed freely. The spliced
+operand's element type must match the display's element type, and a dict merge's
+key/value types must match the display's (type-first; ZAP5123 otherwise). A
+`*`-splat into a **tuple** display requires a statically-sized tuple operand, so
+the result tuple's arity stays known; a list/set splat accepts any iterable. A
+dict `**`-merge copies the operand's entries, so a key set by a later entry (a
+pair or a later merge) overrides an earlier one — Python's last-wins semantics.
+This reuses the spread machinery introduced for starred call arguments (#597).
+
 (Tuples are **value** aggregates, not reference types — see §4.8.)
 
 `None` (D-0014) is the null value for reference types; scalars are not nullable.
@@ -593,6 +615,22 @@ auto uniq    = {x % 3 for x in xs}        # set comprehension -> set[int64]
 auto head = xs[0:3]       # list slice -> a copy (D-0030)
 auto view = a[0:3]        # array slice -> a view (D-0030)
 ```
+
+A list, set, dict, or generator comprehension takes **any number of `for`
+clauses with interleaved `if` filters** (#599). Nested `for` clauses iterate in
+Python's left-to-right, outer-to-inner order, and each `if` filters the clauses
+to its left (it is evaluated inside the loop of the `for` it follows, before the
+next clause runs):
+
+```python
+auto prod  = [x*y for x in xs for y in ys if x != y]
+auto pairs = [(i, j) for i in range(3) for j in range(3) if i < j]
+auto grid  = {x: y for x in xs if x > 0 for y in ys}
+```
+
+A single `for` clause with an optional `if` keeps its earlier behavior
+unchanged; the general form desugars to nested loops with each filter at its
+clause's level.
 
 ## 9. Strings: operations, methods, interpolation
 

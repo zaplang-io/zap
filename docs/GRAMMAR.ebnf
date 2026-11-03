@@ -444,27 +444,36 @@ arg           ::= [ IDENT "=" ] expr              (* keyword arg, D-0038 *)
 atom          ::= literal
                 | IDENT
                 | "<-" postfix                    (* channel receive, D-0031 *)
-                | "(" [ expr { "," expr } [ "," ] ] ")"  (* grouping / tuple; (e,) = 1-tuple, D-0049 *)
+                | "(" [ star_elem { "," star_elem } [ "," ] ] ")"  (* grouping / tuple; (e,) = 1-tuple, D-0049 *)
                 | list_display
                 | brace_display ;
 
-list_display  ::= "[" [ expr { "," expr } | comp_for ] "]" ;
-brace_display ::= "{" [ dict_items | dict_comp | set_items | comp_for ] "}" ;
+star_elem     ::= expr | "*" expr ;   (* a display element, optionally spliced (#598) *)
+                  (* "*expr" splices an iterable's elements in place inside a
+                     list/set/tuple display: `[1, *xs, 2]`, `{*a, *b}`,
+                     `(x, *rest)`. In a tuple display the operand must be a
+                     statically-sized tuple (the result's arity stays known); in
+                     a list/set the operand is any iterable. *)
+
+list_display  ::= "[" [ star_elem { "," star_elem } [ "," ] | expr comp_clauses ] "]" ;
+brace_display ::= "{" [ dict_items | dict_comp | set_items | expr comp_clauses ] "}" ;
                   (* A "{...}" display is a dict or a set. Empty "{}" is the
                      empty DICT (there is no empty-set literal; build one with
                      a constructor, e.g. set[T]()). A first element followed by
-                     ":" makes it a dict (dict_items / dict_comp); otherwise it
-                     is a set — a set literal (set_items) or a set comprehension
-                     (comp_for, the same element-first clause used by
-                     list_display). Set literals `{1, 2, 3}` and set
-                     comprehensions `{x for x in xs}` ship today (parser
-                     parse_brace/parse_set_rest produce Expr::Set / Expr::SetComp;
-                     goldens set_int.zap, set_str.zap). `set` is Stable
-                     (D-0076; graduation #608). *)
-dict_items    ::= expr ":" expr { "," expr ":" expr } [ "," ] ;
-dict_comp     ::= expr ":" expr "for" target "in" expr [ "if" expr ] ;
-set_items     ::= expr { "," expr } [ "," ] ;
-comp_for      ::= expr "for" target "in" expr [ "if" expr ] ;   (* D-0026 *)
+                     ":" (or a leading "**") makes it a dict (dict_items /
+                     dict_comp); otherwise it is a set — a set literal (set_items)
+                     or a set comprehension (`expr comp_clauses`). Set literals
+                     `{1, 2, 3}` and set comprehensions `{x for x in xs}` ship
+                     today (parser parse_brace/parse_set_rest produce Expr::Set /
+                     Expr::SetComp; goldens set_int.zap, set_str.zap). `set` is
+                     Stable (D-0076; graduation #608). *)
+dict_items    ::= dict_item { "," dict_item } [ "," ] ;
+dict_item     ::= expr ":" expr | "**" expr ;   (* "**expr" merges another dict's entries, last-wins (#598) *)
+dict_comp     ::= expr ":" expr comp_clauses ;
+set_items     ::= star_elem { "," star_elem } [ "," ] ;
+comp_clauses  ::= comp_for { comp_for | comp_if } ;   (* one or more clauses (#599); the first is a "for" *)
+comp_for      ::= "for" target "in" expr ;   (* D-0026 *)
+comp_if       ::= "if" expr ;   (* filters the clauses to its left (#599) *)
 
 (* ---------- Literals & regex ---------- *)
 

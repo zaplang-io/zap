@@ -926,14 +926,26 @@ impl<'a> Printer<'a> {
             Expr::Tuple(xs, _) if keep(!xs.is_empty(), self) => {
                 self.break_seq(prefix, "(", xs, ")", suffix, sp.end)
             }
-            Expr::Dict(pairs, _) if keep(!pairs.is_empty(), self) => {
+            Expr::Dict(items, _) if keep(!items.is_empty(), self) => {
                 self.push_line(&format!("{prefix}{{"));
                 self.indent += 1;
-                for (i, (k, v)) in pairs.iter().enumerate() {
-                    self.flush_comments(espan(k).start, 0);
-                    self.emit_value(&format!("{}: ", pexpr(k, 0)), v, ",");
-                    let before = pairs.get(i + 1).map_or(sp.end, |(nk, _)| espan(nk).start);
-                    self.take_trailing_before(espan(v).end, before);
+                for (i, it) in items.iter().enumerate() {
+                    let (start, end) = match it {
+                        DictItem::Pair(k, v) => (espan(k).start, espan(v).end),
+                        DictItem::Spread(e) => (espan(e).start, espan(e).end),
+                    };
+                    self.flush_comments(start, 0);
+                    match it {
+                        DictItem::Pair(k, v) => {
+                            self.emit_value(&format!("{}: ", pexpr(k, 0)), v, ",")
+                        }
+                        DictItem::Spread(e) => self.emit_value("**", e, ","),
+                    }
+                    let before = items.get(i + 1).map_or(sp.end, |n| match n {
+                        DictItem::Pair(nk, _) => espan(nk).start,
+                        DictItem::Spread(ne) => espan(ne).start,
+                    });
+                    self.take_trailing_before(end, before);
                 }
                 self.flush_comments(sp.end, 0);
                 self.indent -= 1;
@@ -1089,6 +1101,7 @@ fn espan(e: &Expr) -> Span {
         | Expr::Tuple(_, s)
         | Expr::List(_, s)
         | Expr::Set(_, s)
+        | Expr::Starred { span: s, .. }
         | Expr::Dict(_, s) => *s,
         Expr::Str { span, .. }
         | Expr::ListComp { span, .. }

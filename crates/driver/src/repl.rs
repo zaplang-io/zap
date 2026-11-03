@@ -1072,6 +1072,7 @@ mod engine {
             | Expr::Dict(_, s)
             | Expr::Set(_, s) => *s,
             Expr::Str { span, .. }
+            | Expr::Starred { span, .. }
             | Expr::ListComp { span, .. }
             | Expr::DictComp { span, .. }
             | Expr::SetComp { span, .. }

@@ -599,6 +599,7 @@ fn expr_span(e: &Expr) -> Span {
         | List(_, span)
         | Dict(_, span)
         | Set(_, span)
+        | Starred { span, .. }
         | ListComp { span, .. }
         | DictComp { span, .. }
         | SetComp { span, .. }

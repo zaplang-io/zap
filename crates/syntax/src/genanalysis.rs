@@ -10,7 +10,7 @@
 //! enclosing function — a lambda is its own (single-expression) scope — so the
 //! walkers never descend into lambda bodies.
 
-use crate::ast::{Block, Expr, Function, Stmt};
+use crate::ast::{Block, CompClause, DictItem, Expr, Function, Stmt};
 
 /// The synthetic name of the compiler-generated **state struct** for a
 /// generator function `fn_name` (I#67). Prefixed with `$gen:` so it can never
@@ -154,6 +154,15 @@ fn each_yield_in_stmt<'a>(st: &'a Stmt, visit: &mut dyn FnMut(&'a Expr)) {
     }
 }
 
+fn each_yield_in_clauses<'a>(clauses: &'a [CompClause], visit: &mut dyn FnMut(&'a Expr)) {
+    for c in clauses {
+        each_yield_in_expr(&c.iter, visit);
+        for f in &c.ifs {
+            each_yield_in_expr(f, visit);
+        }
+    }
+}
+
 fn each_yield_in_expr<'a>(e: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
     match e {
         Expr::Yield { value, .. } => {
@@ -181,37 +190,31 @@ fn each_yield_in_expr<'a>(e: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
                 each_yield_in_expr(e, visit);
             }
         }
-        Expr::Dict(pairs, _) => {
-            for (k, v) in pairs {
-                each_yield_in_expr(k, visit);
-                each_yield_in_expr(v, visit);
+        Expr::Starred { value, .. } => each_yield_in_expr(value, visit),
+        Expr::Dict(items, _) => {
+            for it in items {
+                match it {
+                    DictItem::Pair(k, v) => {
+                        each_yield_in_expr(k, visit);
+                        each_yield_in_expr(v, visit);
+                    }
+                    DictItem::Spread(e) => each_yield_in_expr(e, visit),
+                }
             }
         }
-        Expr::ListComp {
-            elem, iter, cond, ..
-        }
-        | Expr::SetComp {
-            elem, iter, cond, ..
-        } => {
+        Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
             each_yield_in_expr(elem, visit);
-            each_yield_in_expr(iter, visit);
-            if let Some(c) = cond {
-                each_yield_in_expr(c, visit);
-            }
+            each_yield_in_clauses(clauses, visit);
         }
         Expr::DictComp {
             key,
             value,
-            iter,
-            cond,
+            clauses,
             ..
         } => {
             each_yield_in_expr(key, visit);
             each_yield_in_expr(value, visit);
-            each_yield_in_expr(iter, visit);
-            if let Some(c) = cond {
-                each_yield_in_expr(c, visit);
-            }
+            each_yield_in_clauses(clauses, visit);
         }
         Expr::Unary { expr, .. } => each_yield_in_expr(expr, visit),
         Expr::Binary { lhs, rhs, .. } => {

@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 
 use zapc_diag::ErrorCode;
 use zapc_syntax::ast::{
-    BindTarget, Block, EnumDef, Expr, Function, InterfaceDef, Item, Pattern, Stmt, StructDef, Type,
-    TypeParam,
+    BindTarget, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item, Pattern,
+    Stmt, StructDef, Type, TypeParam,
 };
 use zapc_syntax::span::Span;
 
@@ -373,37 +373,41 @@ impl Rewriter<'_> {
                     self.expr(x, locals);
                 }
             }
-            Expr::Dict(kvs, _) => {
-                for (k, v) in kvs {
-                    self.expr(k, locals);
-                    self.expr(v, locals);
+            Expr::Starred { value, .. } => self.expr(value, locals),
+            Expr::Dict(items, _) => {
+                for it in items {
+                    match it {
+                        DictItem::Pair(k, v) => {
+                            self.expr(k, locals);
+                            self.expr(v, locals);
+                        }
+                        DictItem::Spread(e) => self.expr(e, locals),
+                    }
                 }
             }
-            Expr::ListComp {
-                elem, iter, cond, ..
-            }
-            | Expr::SetComp {
-                elem, iter, cond, ..
-            } => {
+            Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+                for c in clauses {
+                    self.expr(&mut c.iter, locals);
+                    for f in &mut c.ifs {
+                        self.expr(f, locals);
+                    }
+                }
                 self.expr(elem, locals);
-                self.expr(iter, locals);
-                if let Some(c) = cond {
-                    self.expr(c, locals);
-                }
             }
             Expr::DictComp {
                 key,
                 value,
-                iter,
-                cond,
+                clauses,
                 ..
             } => {
+                for c in clauses {
+                    self.expr(&mut c.iter, locals);
+                    for f in &mut c.ifs {
+                        self.expr(f, locals);
+                    }
+                }
                 self.expr(key, locals);
                 self.expr(value, locals);
-                self.expr(iter, locals);
-                if let Some(c) = cond {
-                    self.expr(c, locals);
-                }
             }
             Expr::Lambda { body, .. } => self.expr(body, locals),
             Expr::RegexMatch { subject, .. } | Expr::RegexSubst { subject, .. } => {
@@ -784,6 +788,18 @@ fn collect_pattern_bindings(p: &Pattern, s: &mut HashSet<String>) {
     }
 }
 
+/// Collect the loop-variable bindings introduced by a comprehension clause list
+/// (#599), along with any bindings inside the iterables and `if` filters.
+fn collect_comp_clause_bindings(clauses: &[CompClause], s: &mut HashSet<String>) {
+    for c in clauses {
+        s.insert(c.var.clone());
+        collect_expr_bindings(&c.iter, s);
+        for f in &c.ifs {
+            collect_expr_bindings(f, s);
+        }
+    }
+}
+
 /// Bindings introduced *inside* an expression (lambda params, comprehension
 /// vars) — these shadow module symbols within the enclosing callable.
 fn collect_expr_bindings(e: &Expr, s: &mut HashSet<String>) {
@@ -794,42 +810,19 @@ fn collect_expr_bindings(e: &Expr, s: &mut HashSet<String>) {
             }
             collect_expr_bindings(body, s);
         }
-        Expr::ListComp {
-            elem,
-            var,
-            iter,
-            cond,
-            ..
-        }
-        | Expr::SetComp {
-            elem,
-            var,
-            iter,
-            cond,
-            ..
-        } => {
-            s.insert(var.clone());
+        Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+            collect_comp_clause_bindings(clauses, s);
             collect_expr_bindings(elem, s);
-            collect_expr_bindings(iter, s);
-            if let Some(c) = cond {
-                collect_expr_bindings(c, s);
-            }
         }
         Expr::DictComp {
             key,
             value,
-            var,
-            iter,
-            cond,
+            clauses,
             ..
         } => {
-            s.insert(var.clone());
+            collect_comp_clause_bindings(clauses, s);
             collect_expr_bindings(key, s);
             collect_expr_bindings(value, s);
-            collect_expr_bindings(iter, s);
-            if let Some(c) = cond {
-                collect_expr_bindings(c, s);
-            }
         }
         Expr::Call { callee, args, .. } => {
             collect_expr_bindings(callee, s);
@@ -866,10 +859,16 @@ fn collect_expr_bindings(e: &Expr, s: &mut HashSet<String>) {
                 collect_expr_bindings(x, s);
             }
         }
-        Expr::Dict(kvs, _) => {
-            for (k, v) in kvs {
-                collect_expr_bindings(k, s);
-                collect_expr_bindings(v, s);
+        Expr::Starred { value, .. } => collect_expr_bindings(value, s),
+        Expr::Dict(items, _) => {
+            for it in items {
+                match it {
+                    DictItem::Pair(k, v) => {
+                        collect_expr_bindings(k, s);
+                        collect_expr_bindings(v, s);
+                    }
+                    DictItem::Spread(e) => collect_expr_bindings(e, s),
+                }
             }
         }
         Expr::RegexMatch { subject, .. } | Expr::RegexSubst { subject, .. } => {

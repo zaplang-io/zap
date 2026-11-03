@@ -671,6 +671,7 @@ fn expr_start(e: &Expr) -> u32 {
         | Expr::Dict(_, s)
         | Expr::Set(_, s) => s.start,
         Expr::Str { span, .. }
+        | Expr::Starred { span, .. }
         | Expr::ListComp { span, .. }
         | Expr::DictComp { span, .. }
         | Expr::SetComp { span, .. }
