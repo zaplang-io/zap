@@ -250,3 +250,22 @@ fn when_target_os_predicate() {
         "when target.os == .linux:\n    def plat() -> str:\n        return \"linux\"\n",
     );
 }
+
+#[test]
+fn chained_assignment_round_trips(/* #594 */) {
+    // Canonical spacing: each target and the shared RHS joined by ` = `.
+    check("def f():\n    a=b=c=0\n", "def f():\n    a = b = c = 0\n");
+    // Subscript / field targets in a chain also round-trip.
+    check(
+        "def f():\n    xs[0]=d[\"k\"]=y=9\n",
+        "def f():\n    xs[0] = d[\"k\"] = y = 9\n",
+    );
+    // A single assignment is unchanged (not promoted to a chain).
+    check("def f():\n    a = 1\n", "def f():\n    a = 1\n");
+}
+
+#[test]
+fn del_statement_round_trips(/* #595 */) {
+    check("def f():\n    del  xs[1]\n", "def f():\n    del xs[1]\n");
+    check("def f():\n    del d['k']\n", "def f():\n    del d[\"k\"]\n");
+}

@@ -354,6 +354,12 @@ const CORPUS: &[Case] = &[
     case("decl", Reject, "auto x =\n"),                                         // missing initializer
     case("aug_assign", Accept, "def f():\n    x += 1\n"),
     case("subst_assign", Accept, "def f():\n    s ~= s/a/b/\n"),                // D-0010
+    case("assign", Accept, "def f():\n    a = b = c = 5\n"),                    // chained, #594
+    case("assign", Accept, "def f():\n    xs[0] = y = 9\n"),                    // chained w/ subscript, #594
+    case("del_stmt", Accept, "def f():\n    del xs[1]\n"),                      // element removal, #595
+    case("del_stmt", Accept, "def f():\n    del d[\"k\"]\n"),                   // #595
+    case("del_stmt", Reject, "def f():\n    del x\n"),                          // binding deletion out of scope
+    case("decl", Accept, "def f():\n    int64 del = 1\n"),                      // `del` still an identifier, #595
 
     // ---- tuple destructuring (D-0049) ----
     case("bind_target", Accept, "auto a, b = t\n"),

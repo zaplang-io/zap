@@ -188,6 +188,13 @@ impl Rewriter<'_> {
                 self.expr(target, locals);
                 self.expr(value, locals);
             }
+            Stmt::AssignChain { targets, value, .. } => {
+                for target in targets {
+                    self.expr(target, locals);
+                }
+                self.expr(value, locals);
+            }
+            Stmt::Del { target, .. } => self.expr(target, locals),
             Stmt::AugAssign { target, value, .. } => {
                 self.expr(target, locals);
                 self.expr(value, locals);
@@ -615,6 +622,16 @@ fn collect_stmt_bindings(st: &Stmt, s: &mut HashSet<String>) {
             collect_expr_bindings(target, s);
             collect_expr_bindings(value, s);
         }
+        Stmt::AssignChain { targets, value, .. } => {
+            for target in targets {
+                if let Expr::Name(n, _) = target {
+                    s.insert(n.clone());
+                }
+                collect_expr_bindings(target, s);
+            }
+            collect_expr_bindings(value, s);
+        }
+        Stmt::Del { target, .. } => collect_expr_bindings(target, s),
         Stmt::AugAssign { target, value, .. } => {
             collect_expr_bindings(target, s);
             collect_expr_bindings(value, s);

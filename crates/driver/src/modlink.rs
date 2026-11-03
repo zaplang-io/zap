@@ -568,6 +568,8 @@ fn stmt_span(st: &Stmt) -> Span {
         Stmt::Let { span, .. }
         | Stmt::LetTuple { span, .. }
         | Stmt::Assign { span, .. }
+        | Stmt::AssignChain { span, .. }
+        | Stmt::Del { span, .. }
         | Stmt::AugAssign { span, .. }
         | Stmt::If { span, .. }
         | Stmt::While { span, .. }

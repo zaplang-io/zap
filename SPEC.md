@@ -91,6 +91,20 @@ Reassignment uses no type and no `auto`:
 count = count + 1
 ```
 
+**Chained assignment** (#594) binds one value to several targets at once:
+
+```python
+a = b = c = 0        # c? no — the right-hand side is evaluated once and
+                     # assigned to a, then b, then c (left to right)
+xs[0] = y = compute()   # targets may be names, subscripts, or fields
+```
+
+The right-hand side is evaluated **exactly once** and assigned to every target
+in left-to-right order (Python semantics). Each target is an ordinary
+single-assignment lvalue and, exactly like a plain reassignment, must already be
+a declared binding — chained assignment never introduces a binding (that stays
+the type-first / `auto` declaration above).
+
 Bindings are **mutable by default** (D-0006); `const` makes one immutable:
 
 ```python
@@ -373,6 +387,23 @@ of an empty `struct`/`enum` body. It lowers to nothing. `pass` is a contextual
 statement-position word, not a reserved keyword (Appendix A): it is the no-op
 statement only when it stands alone as a statement, and remains usable as an
 ordinary identifier in every other position.
+
+**del** (#595) removes a **collection element** through a subscript target:
+
+```python
+del d[key]       # remove a dict entry by key
+del xs[i]        # remove a list element by index (negatives count from the end)
+```
+
+It is scoped to subscript targets and reuses the collection's own storage
+operation, so its behavior matches element *access*: a missing dict key is a
+no-op (matching the current non-raising dict read `d[k]`; a real `KeyError` is
+tracked under #22), while an out-of-range list index raises the same catchable
+`IndexError` as a read `xs[i]`. Deleting a binding (`del name`) is **not**
+supported. Like `pass`, `del` is a contextual statement-position word, not a
+reserved keyword (Appendix A): it is the removal statement only when immediately
+followed by another identifier (`del d…`), and stays an ordinary identifier
+everywhere else.
 
 **do-while** (bottom-tested; body runs once before the test, D-0039):
 
@@ -1117,7 +1148,8 @@ programmatically; `zap inspect <pid>` triggers them against a running process.
 `select`, `case`, `close`, `struct`, `interface`, `enum`, `annotation`,
 `decorator`, `import`, `python`, `m`, `s`
 (contextual, before a delimiter; `detached` is likewise contextual, only after
-`spawn`), and the type keywords (`int32`, `int64`,
+`spawn`; `pass` and `del` are also contextual statement-position words, not
+reserved — see §6), and the type keywords (`int32`, `int64`,
 `float32`, `float64`, `i32`, `i64`, `f32`, `f64`, `bool`, `char`, `str`,
 `bytes`, `bigint`, `complex`, `list`, `dict`, `set`, `heap`, `array`).
 

@@ -2345,6 +2345,34 @@ impl Parser {
             self.bump();
             return Stmt::Pass(self.span_from(start));
         }
+        // `del d[k]` / `del xs[i]` — element removal (#595). Like `pass`, `del`
+        // is a contextual statement-position word, not a reserved keyword, so it
+        // stays usable as an ordinary identifier everywhere else. It is taken as
+        // the `del` statement only when the bare word `del` is immediately
+        // followed by another identifier (`del d...`): that two-identifier start
+        // is never a valid expression, assignment (`del = x`), call (`del(x)`),
+        // index (`del[0]`) or attribute (`del.x`) on a binding named `del`, so
+        // those uses are left untouched. The target must be a subscript; a
+        // non-subscript target (binding deletion) is rejected below.
+        if matches!(self.peek(), TokenKind::Ident(n) if n == "del")
+            && matches!(self.peek2(), TokenKind::Ident(_))
+        {
+            self.bump();
+            let target = self.parse_expr();
+            if !matches!(target, Expr::Index { .. }) {
+                self.error_at(
+                    self.span_from(start),
+                    ErrorCode::ZAP2013,
+                    "`del` removes a collection element and requires a subscript \
+                     target (`del d[k]` or `del xs[i]`); deleting a binding is not \
+                     supported",
+                );
+            }
+            return Stmt::Del {
+                target,
+                span: self.span_from(start),
+            };
+        }
         if self.eat_kw(Keyword::Return) {
             let value = if self.at_line_end() {
                 None
@@ -2465,6 +2493,24 @@ impl Parser {
                 };
             }
             let value = self.parse_rhs();
+            // Chained assignment `t0 = t1 = ... = value` (#594). The first `=`
+            // has been consumed and `value` parsed; while another `=` follows,
+            // the value parsed so far is actually the next target and a further
+            // right-hand side is parsed. Python semantics: the final RHS is
+            // evaluated once and bound to every target left to right.
+            if self.eat(&TokenKind::Assign) {
+                let mut targets = vec![target, value];
+                let mut rhs = self.parse_rhs();
+                while self.eat(&TokenKind::Assign) {
+                    targets.push(rhs);
+                    rhs = self.parse_rhs();
+                }
+                return Stmt::AssignChain {
+                    targets,
+                    value: rhs,
+                    span: self.span_from(start),
+                };
+            }
             return Stmt::Assign {
                 target,
                 value,
@@ -4173,6 +4219,91 @@ def demo(int64 n):
         assert!(matches!(&f.body.stmts[0], Stmt::Let { name, .. } if name == "pass"));
         // `pass = pass + 1` is an assignment, not a no-op statement.
         assert!(matches!(&f.body.stmts[1], Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn chained_assignment_parses(/* #594 */) {
+        // `a = b = c = 5` -> a single `AssignChain` with the three targets in
+        // order and one shared right-hand side (evaluated once at lowering).
+        let m = parse_ok("def main():\n    a = b = c = 5\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::AssignChain { targets, value, .. } = &f.body.stmts[0] else {
+            panic!("expected AssignChain, got {:?}", f.body.stmts[0]);
+        };
+        assert_eq!(targets.len(), 3);
+        assert!(matches!(&targets[0], Expr::Name(n, _) if n == "a"));
+        assert!(matches!(&targets[1], Expr::Name(n, _) if n == "b"));
+        assert!(matches!(&targets[2], Expr::Name(n, _) if n == "c"));
+        assert!(matches!(value, Expr::Int(n, _) if n == "5"));
+    }
+
+    #[test]
+    fn chained_assignment_allows_subscript_targets(/* #594 */) {
+        let m = parse_ok("def main():\n    xs[0] = d[\"k\"] = y = 9\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::AssignChain { targets, .. } = &f.body.stmts[0] else {
+            panic!("expected AssignChain");
+        };
+        assert_eq!(targets.len(), 3);
+        assert!(matches!(&targets[0], Expr::Index { .. }));
+        assert!(matches!(&targets[1], Expr::Index { .. }));
+        assert!(matches!(&targets[2], Expr::Name(n, _) if n == "y"));
+    }
+
+    #[test]
+    fn single_assignment_is_not_a_chain(/* #594 */) {
+        // A lone `=` still parses to a plain `Assign`, not an `AssignChain`.
+        let m = parse_ok("def main():\n    a = 5\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        assert!(matches!(&f.body.stmts[0], Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn del_element_parses(/* #595 */) {
+        // `del d[k]` / `del xs[i]` parse to `Stmt::Del` holding the subscript.
+        let m = parse_ok("def main():\n    del xs[1]\n    del d[\"k\"]\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::Del { target, .. } = &f.body.stmts[0] else {
+            panic!("expected Del, got {:?}", f.body.stmts[0]);
+        };
+        assert!(matches!(target, Expr::Index { .. }));
+        assert!(
+            matches!(&f.body.stmts[1], Stmt::Del { target, .. } if matches!(target, Expr::Index { .. }))
+        );
+    }
+
+    #[test]
+    fn del_stays_an_identifier_outside_statement_position(/* #595 */) {
+        // `del` is a contextual statement-position word, not a reserved keyword:
+        // it stays usable as an ordinary identifier (binding, assignment, call,
+        // subscript base).
+        let m = parse_ok(
+            "def main():\n    int64 del = 5\n    del = del + 1\n    list[int64] xs = [1]\n    del[0] = xs\n",
+        );
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        assert!(matches!(&f.body.stmts[0], Stmt::Let { name, .. } if name == "del"));
+        assert!(matches!(&f.body.stmts[1], Stmt::Assign { .. }));
+    }
+
+    #[test]
+    fn del_on_a_non_subscript_target_is_rejected(/* #595 */) {
+        // Binding deletion (`del name`) is out of scope: the element form
+        // requires a subscript target.
+        let (_m, perrs, _lerrs) = parse_str("def main():\n    int64 x = 3\n    del x\n");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2013),
+            "expected ZAP2013 for non-subscript del target, got {perrs:?}"
+        );
     }
 
     #[test]

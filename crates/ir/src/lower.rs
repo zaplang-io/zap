@@ -5670,6 +5670,27 @@ impl<'a> FnLower<'a> {
                     ))
                 }
             }
+            Stmt::AssignChain { targets, value, .. } => {
+                // Chained assignment `t0 = t1 = ... = value` (#594). The RHS is
+                // evaluated EXACTLY ONCE and then stored into each target, left
+                // to right (Python order). Per-target `base`/`index` sub-
+                // expressions are still evaluated at each store, so a subscript
+                // target's own side effects happen in source order after the RHS.
+                let (v, vt) = self.expr(value)?;
+                for target in targets {
+                    self.store_computed(target, v, vt, value)?;
+                }
+                Ok(())
+            }
+            Stmt::Del { target, .. } => {
+                // `del d[k]` / `del xs[i]` (#595). The parser guarantees the
+                // target is a subscript; removal reuses the dict/list element
+                // operations (see `lower_index_del`).
+                let Expr::Index { base, index, .. } = target else {
+                    return Err(err("del requires a subscript target"));
+                };
+                self.lower_index_del(base, index)
+            }
             Stmt::AugAssign {
                 target, op, value, ..
             } => {
@@ -11963,6 +11984,167 @@ impl<'a> FnLower<'a> {
             }
             _ => Err(err(
                 "indexed assignment is only supported on list, dict, and array values",
+            )),
+        }
+    }
+
+    /// Store an already-evaluated value `(v, vt)` into an assignment `target`,
+    /// without re-evaluating the value (chained assignment, #594). `value_expr`
+    /// is the original right-hand side, used only for value-struct copy
+    /// diagnostics (`copy_if_value`). This mirrors the single-`Assign` lowering
+    /// above target-for-target, but reuses the one evaluated RHS so it is
+    /// computed exactly once across the whole chain.
+    fn store_computed(
+        &mut self,
+        target: &Expr,
+        v: Value,
+        vt: Ty,
+        value_expr: &Expr,
+    ) -> Result<(), LowerError> {
+        if let Expr::Name(n, _) = target {
+            let (ptr, ty) = self
+                .lookup(n)
+                .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
+            if let Ty::Func(t_idx) = ty {
+                self.check_fn_coercion(&vt, t_idx, zapc_diag::ErrorCode::ZAP4001)?;
+            }
+            let cv = self.coerce(v, vt, ty);
+            let cv = self.copy_if_value(cv, ty, value_expr);
+            self.store(ptr, cv);
+            Ok(())
+        } else if let Expr::Attr { base, name, .. } = target {
+            let (bv, bty) = self.expr(base)?;
+            let Ty::Struct(sid) = bty else {
+                return Err(err("field assignment on a non-struct value"));
+            };
+            let (idx, fty) = self
+                .ctx
+                .field(sid, name)
+                .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
+            let cv = self.coerce(v, vt, fty);
+            let cv = self.copy_if_value(cv, fty, value_expr);
+            self.emit(Inst::FieldSet {
+                base: bv,
+                sid,
+                idx,
+                val: cv,
+            });
+            Ok(())
+        } else if let Expr::Index { base, index, .. } = target {
+            self.store_index(base, index, v, vt)
+        } else {
+            Err(err(
+                "only variable, field, and index assignment are supported by codegen yet",
+            ))
+        }
+    }
+
+    /// Store an already-evaluated value `(v, vt)` at `base[index]` (chained
+    /// assignment, #594). Identical to the index arm of [`Self::lower_index_set`]
+    /// except the value word is supplied rather than re-evaluated.
+    fn store_index(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        v: Value,
+        vt: Ty,
+    ) -> Result<(), LowerError> {
+        let (bv, bty) = self.expr(base)?;
+        match bty {
+            Ty::List(elem) => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let v = self.coerce(v, vt, elem.ty());
+                let v = self.box_if_value(v, elem.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_list_set_{}", elem.val_suffix()),
+                    args: vec![bv, iv, v],
+                });
+                Ok(())
+            }
+            Ty::Dict(kk, vk) => {
+                let (kv, kt) = self.expr(index)?;
+                let kv = self.coerce(kv, kt, kk.ty());
+                let kv = self.box_if_value(kv, kk.ty());
+                let v = self.coerce(v, vt, vk.ty());
+                let v = self.box_if_value(v, vk.ty());
+                let kfns = self.key_fn_args(kk)?;
+                let mut cargs = vec![bv, kv, v];
+                cargs.extend_from_slice(&kfns);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    args: cargs,
+                });
+                Ok(())
+            }
+            Ty::Array(d) => {
+                let (iv, it) = self.expr(index)?;
+                if it.int_width().is_none() {
+                    return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
+                }
+                let iv = self.coerce(iv, it, Ty::I64);
+                if vt.int_width().is_none() && !vt.is_float() {
+                    return Err(err("array element assignment requires a numeric scalar"));
+                }
+                let v = self.coerce(v, vt, d.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_array_set_{}", d.suffix()),
+                    args: vec![bv, iv, v],
+                });
+                Ok(())
+            }
+            Ty::Struct(sid) => {
+                let (iv, it) = self.expr(index)?;
+                self.call_dunder(sid, "__setitem__", vec![(bv, bty), (iv, it), (v, vt)])?;
+                Ok(())
+            }
+            _ => Err(err(
+                "indexed assignment is only supported on list, dict, and array values",
+            )),
+        }
+    }
+
+    /// Lower `del base[index]` (#595): remove a dict entry by key or a list
+    /// element by index. The removal reuses the collection's own storage
+    /// operations through dedicated runtime entry points
+    /// (`zap_dict_del_*` / `zap_list_del_at`), which share the probe/normalize
+    /// code of the corresponding `set`/`get` so behavior matches element access:
+    ///   * a list index is normalized (negatives count from the end) and bounds-
+    ///     checked, raising the same `IndexError` as a read `xs[i]`;
+    ///   * a missing dict key is a no-op, matching the current non-raising dict
+    ///     read `d[k]` (a real `KeyError` is tracked under #22).
+    fn lower_index_del(&mut self, base: &Expr, index: &Expr) -> Result<(), LowerError> {
+        let (bv, bty) = self.expr(base)?;
+        match bty {
+            Ty::List(_) => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_list_del_at".to_string(),
+                    args: vec![bv, iv],
+                });
+                Ok(())
+            }
+            Ty::Dict(kk, _) => {
+                let (kv, kt) = self.expr(index)?;
+                let kv = self.coerce(kv, kt, kk.ty());
+                let kv = self.box_if_value(kv, kk.ty());
+                let kfns = self.key_fn_args(kk)?;
+                let mut cargs = vec![bv, kv];
+                cargs.extend_from_slice(&kfns);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_dict_del_{}", kk.key_suffix()),
+                    args: cargs,
+                });
+                Ok(())
+            }
+            _ => Err(err(
+                "del is only supported on dict and list subscripts (`del d[k]` / `del xs[i]`)",
             )),
         }
     }

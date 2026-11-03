@@ -1171,6 +1171,22 @@ void zap_list_set_f64(void *l, int64_t i, double v) {
 }
 int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 
+/* `del xs[i]` (#595): remove the element at index `i`, shifting the tail down
+ * one slot. The index is normalized (negatives count from the end) and bounds-
+ * checked by `zap_list_norm`, so an out-of-range `del` raises the same catchable
+ * `IndexError` as a read `xs[i]`. Element-type-agnostic: it moves uniform 8-byte
+ * words, so it serves every `list[T]` (the precise collector still sees only the
+ * live prefix because `len` shrinks and the vacated tail word is cleared). */
+void zap_list_del_at(void *lp, int64_t i) {
+    ZapList *l = (ZapList *)lp;
+    int64_t k = zap_list_norm(l, i); /* normalize + bounds-check (IndexError) */
+    for (int64_t j = k; j + 1 < l->len; j++) {
+        l->data[j] = l->data[j + 1];
+    }
+    l->len--;
+    l->data[l->len] = 0; /* don't pin the removed referent for the collector */
+}
+
 /* Shallow copy: a fresh list with the same element words (shared referents) and
  * the same `elem_ptr` kind, so the precise collector traces the copy correctly.
  * Used by `sorted()` (ticket #336) to leave its input untouched. */
@@ -1559,6 +1575,44 @@ void *zap_dict_get_fn_ptr(void *dp, void *k, void *hashfn, void *eqfn) {
     d->hashfn = hashfn;
     d->eqfn = eqfn;
     return (void *)(intptr_t)zap_dict_get(dp, (int64_t)(intptr_t)k, KEY_FN);
+}
+
+/* `del d[k]` (#595): remove the entry for `key` by tombstoning its slot, reusing
+ * the same open-addressing probe as `zap_dict_set`/`zap_dict_get`. SLOT_TOMB
+ * keeps later keys on the same probe chain reachable; the slot is reclaimed on
+ * the next resize. A missing key is a silent no-op, matching the current non-
+ * raising dict read `d[k]` (a real `KeyError` is tracked under #22). The vacated
+ * key/value words are cleared so the collector does not pin the removed
+ * referents. */
+static void zap_dict_del(void *dp, int64_t key, int keykind) {
+    ZapDict *d = (ZapDict *)dp;
+    if (d->cap == 0) {
+        return;
+    }
+    uint64_t h = zap_key_hash(key, keykind, d->hashfn);
+    int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
+    while (d->entries[j].state != SLOT_EMPTY) {
+        if (d->entries[j].state == SLOT_FULL &&
+            zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
+            d->entries[j].state = SLOT_TOMB;
+            d->entries[j].key = 0;
+            d->entries[j].val = 0;
+            d->len--;
+            return;
+        }
+        j = (j + 1) & (d->cap - 1);
+    }
+}
+
+void zap_dict_del_i64(void *d, int64_t k) { zap_dict_del(d, k, KEY_I64); }
+void zap_dict_del_str(void *d, void *k) {
+    zap_dict_del(d, (int64_t)(intptr_t)k, KEY_STR);
+}
+void zap_dict_del_fn(void *dp, void *k, void *hashfn, void *eqfn) {
+    ZapDict *d = (ZapDict *)dp;
+    d->hashfn = hashfn;
+    d->eqfn = eqfn;
+    zap_dict_del(dp, (int64_t)(intptr_t)k, KEY_FN);
 }
 
 /* --- dict enumeration / membership / copy (ticket #299) ---------------------
