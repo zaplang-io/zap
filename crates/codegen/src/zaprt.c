@@ -10426,8 +10426,149 @@ typedef struct {
 } ZapJsonLex;
 
 /* Open a cursor over a str/bytes source (a ZapStr*). */
+/* Validate a complete RFC 8259 document before exposing a cursor. The prelude
+ * builder relies on these grammar invariants; rejecting here also prevents its
+ * truncated-array EOF loop. No allocation or GC safepoint during validation.
+ * Duplicate object names retain the existing last-value-wins DOM policy. */
+typedef struct {
+    const unsigned char *data;
+    int64_t len;
+    int64_t pos;
+} ZapJsonCheck;
+
+static void zap_json_check_ws(ZapJsonCheck *s) {
+    while (s->pos < s->len) {
+        unsigned char c = s->data[s->pos];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+        s->pos++;
+    }
+}
+
+static int zap_json_hex4(const unsigned char *d, int64_t n, unsigned *out) {
+    if (n < 4) return 0;
+    unsigned v = 0;
+    for (int k = 0; k < 4; k++) {
+        unsigned c = d[k];
+        unsigned x;
+        if (c >= '0' && c <= '9') x = c - '0';
+        else if (c >= 'a' && c <= 'f') x = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') x = c - 'A' + 10;
+        else return 0;
+        v = (v << 4) | x;
+    }
+    *out = v;
+    return 1;
+}
+
+static int zap_json_check_string(ZapJsonCheck *s) {
+    if (s->pos >= s->len || s->data[s->pos++] != '"') return 0;
+    while (s->pos < s->len) {
+        unsigned c = s->data[s->pos++];
+        if (c == '"') return 1;
+        if (c < 0x20) return 0;
+        if (c != '\\') continue;
+        if (s->pos == s->len) return 0;
+        c = s->data[s->pos++];
+        if (c == '"' || c == '\\' || c == '/' || c == 'b' || c == 'f' ||
+            c == 'n' || c == 'r' || c == 't') continue;
+        if (c != 'u') return 0;
+        unsigned cp;
+        if (!zap_json_hex4(s->data + s->pos, s->len - s->pos, &cp)) return 0;
+        s->pos += 4;
+        if (cp >= 0xDC00 && cp <= 0xDFFF) return 0;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+            if (s->len - s->pos < 6 || s->data[s->pos] != '\\' ||
+                s->data[s->pos + 1] != 'u') return 0;
+            unsigned low;
+            if (!zap_json_hex4(s->data + s->pos + 2, s->len - s->pos - 2, &low) ||
+                low < 0xDC00 || low > 0xDFFF) return 0;
+            s->pos += 6;
+        }
+    }
+    return 0;
+}
+
+static int zap_json_check_value(ZapJsonCheck *s, int depth) {
+    zap_json_check_ws(s);
+    if (s->pos == s->len) return 0;
+    unsigned c = s->data[s->pos];
+    if (c == '"') return zap_json_check_string(s);
+    if (c == '{' || c == '[') {
+        if (depth == 128) return 0;
+        int object = c == '{';
+        unsigned close = object ? '}' : ']';
+        s->pos++;
+        zap_json_check_ws(s);
+        if (s->pos < s->len && s->data[s->pos] == close) {
+            s->pos++;
+            return 1;
+        }
+        for (;;) {
+            if (object) {
+                if (!zap_json_check_string(s)) return 0;
+                zap_json_check_ws(s);
+                if (s->pos == s->len || s->data[s->pos++] != ':') return 0;
+            }
+            if (!zap_json_check_value(s, depth + 1)) return 0;
+            zap_json_check_ws(s);
+            if (s->pos == s->len) return 0;
+            c = s->data[s->pos++];
+            if (c == close) return 1;
+            if (c != ',') return 0;
+            zap_json_check_ws(s);
+            /* No empty slot or trailing comma: next iteration requires value/key. */
+        }
+    }
+    const char *literal = NULL;
+    int64_t length = 0;
+    if (c == 'n') { literal = "null"; length = 4; }
+    if (c == 't') { literal = "true"; length = 4; }
+    if (c == 'f') { literal = "false"; length = 5; }
+    if (literal) {
+        if (s->len - s->pos < length ||
+            memcmp(s->data + s->pos, literal, (size_t)length) != 0) return 0;
+        s->pos += length;
+        return 1;
+    }
+    /* number = -? (0 | [1-9][0-9]*) (.[0-9]+)? ([eE][+-]?[0-9]+)? */
+    if (c == '-') s->pos++;
+    if (s->pos == s->len) return 0;
+    c = s->data[s->pos];
+    if (c == '0') s->pos++;
+    else {
+        if (c < '1' || c > '9') return 0;
+        do { s->pos++; }
+        while (s->pos < s->len && s->data[s->pos] >= '0' && s->data[s->pos] <= '9');
+    }
+    if (s->pos < s->len && s->data[s->pos] == '.') {
+        s->pos++;
+        int64_t start = s->pos;
+        while (s->pos < s->len && s->data[s->pos] >= '0' && s->data[s->pos] <= '9') s->pos++;
+        if (s->pos == start) return 0;
+    }
+    if (s->pos < s->len && (s->data[s->pos] == 'e' || s->data[s->pos] == 'E')) {
+        s->pos++;
+        if (s->pos < s->len && (s->data[s->pos] == '+' || s->data[s->pos] == '-')) s->pos++;
+        int64_t start = s->pos;
+        while (s->pos < s->len && s->data[s->pos] >= '0' && s->data[s->pos] <= '9') s->pos++;
+        if (s->pos == start) return 0;
+    }
+    return 1;
+}
+
+static int zap_json_document_valid(const unsigned char *d, int64_t n) {
+    ZapJsonCheck s = { d, n, 0 };
+    int64_t bad;
+    if (!zap_utf8_valid(d, n, &bad) || !zap_json_check_value(&s, 0)) return 0;
+    zap_json_check_ws(&s);
+    return s.pos == s.len;
+}
+
 void *zap_json_lex_new(void *s) {
     ZapStr *z = (ZapStr *)s;
+    if (!zap_json_document_valid((const unsigned char *)z->data, z->len)) {
+        zap_panic(zap_str_new("invalid JSON document or nesting exceeds 128", 44));
+    }
     ZapJsonLex *lx = (ZapJsonLex *)zap_buf((int64_t)sizeof(ZapJsonLex));
     lx->data = z->data;
     lx->len = z->len;
@@ -10600,16 +10741,16 @@ void *zap_json_lex_str(void *h) {
                         }
                     }
                     i += 4;
-                    if (cp < 0x80) {
-                        out[o++] = (char)cp;
-                    } else if (cp < 0x800) {
-                        out[o++] = (char)(0xC0 | (cp >> 6));
-                        out[o++] = (char)(0x80 | (cp & 0x3F));
-                    } else {
-                        out[o++] = (char)(0xE0 | (cp >> 12));
-                        out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                        out[o++] = (char)(0x80 | (cp & 0x3F));
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < n) {
+                        unsigned int low;
+                        if (s[i + 1] == '\\' && s[i + 2] == 'u' &&
+                            zap_json_hex4((const unsigned char *)s + i + 3, n - i - 3, &low) &&
+                            low >= 0xDC00 && low <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                            i += 6;
+                        }
                     }
+                    o += zap_utf8_encode((int32_t)cp, out + o);
                 }
                 break;
             }
