@@ -10702,8 +10702,10 @@ int64_t zap_json_lex_int(void *h) { return ((ZapJsonLex *)h)->ival; }
 double zap_json_lex_float(void *h) { return ((ZapJsonLex *)h)->fval; }
 
 /* Build a ZapStr from the current STR token, decoding escapes if present.
- * Escapes never expand (\uXXXX -> at most 3 UTF-8 bytes from 6 source bytes),
- * so the raw length is a safe output capacity. */
+ * Escapes never expand: a 6-byte `\uXXXX` decodes to at most 3 UTF-8 bytes, and
+ * a 12-byte surrogate pair `\uXXXX\uXXXX` decodes to a 4-byte astral scalar. So
+ * the decoded length never exceeds the escaped source length, and the raw token
+ * length is a safe output capacity. */
 void *zap_json_lex_str(void *h) {
     ZapJsonLex *lx = (ZapJsonLex *)h;
     const char *s = lx->sdata;
@@ -10749,6 +10751,15 @@ void *zap_json_lex_str(void *h) {
                             cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
                             i += 6;
                         }
+                    }
+                    if (cp >= 0xD800 && cp <= 0xDFFF) {
+                        /* A lone surrogate would encode as invalid WTF-8. The
+                         * pre-validator (zap_json_document_valid) pairs every high
+                         * surrogate and rejects lone surrogates, so this is
+                         * unreachable for a validated document; raise a catchable
+                         * error rather than emit malformed UTF-8 if the cursor is
+                         * ever reached without that guarantee. */
+                        zap_panic(zap_str_new("invalid JSON surrogate escape", 29));
                     }
                     o += zap_utf8_encode((int32_t)cp, out + o);
                 }

@@ -49,8 +49,9 @@ fn lower(
             .get("JsonScanner")
             .copied()
             .ok_or_else(|| err("JsonScanner unavailable (built-in prelude missing)"))?;
-        let cur = lowerer.new_value(Ty::Ptr);
-        lowerer.throwing_call(Some(cur), "zap_json_lex_new", vec![s]);
+        // Reuse the shared `_lex_new` cursor-construction lowering so the
+        // throwing contract (validate-or-raise) lives in exactly one place.
+        let (cur, _) = call_ret(lowerer, "zap_json_lex_new", vec![s], Ty::Ptr, true);
         let d = lowerer.new_value(Ty::Struct(sid));
         lowerer.emit(Inst::StructNew { dest: d, sid });
         lowerer.emit(Inst::FieldSet {
