@@ -191,6 +191,7 @@ fn each_yield_in_expr<'a>(e: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
             }
         }
         Expr::Starred { value, .. } => each_yield_in_expr(value, visit),
+        Expr::Named { value, .. } => each_yield_in_expr(value, visit),
         Expr::Dict(items, _) => {
             for it in items {
                 match it {

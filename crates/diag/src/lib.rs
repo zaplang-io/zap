@@ -288,6 +288,14 @@ define_codes! {
          (#602). It must follow at least one parameter — every parameter before \
          it is positional-only — may appear at most once, and must come before \
          the `*` keyword-only separator.";
+    ZAP2020 = 2020 : "`:=` is not a declaration",
+        "`:=` is the walrus assignment-expression (#600): it binds a name and \
+         evaluates to the value, and is only valid inside parentheses — as part \
+         of an `if`/`while` condition or a comprehension filter, e.g. \
+         `if (n := len(xs)) > 10:`. It is deliberately not a declaration \
+         shorthand (that would duplicate `auto` and clash with the walrus \
+         meaning); to introduce a binding use `auto name = expr` or a typed \
+         declaration (D-0003).";
 
     // ---- ZAP3xxx — name resolution / imports -------------------------------
     ZAP3001 = 3001 : "unknown name",

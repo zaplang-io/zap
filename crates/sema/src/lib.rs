@@ -286,6 +286,14 @@ struct Checker {
     /// `analysis` is `Some`; the type-checking `scopes` and every `lookup`
     /// against it are untouched.
     def_scopes: Vec<HashMap<String, (Span, bool)>>,
+    /// For each comprehension currently being checked (innermost last), the
+    /// length of `scopes` just before that comprehension pushed its own scope
+    /// (#600). A walrus binding inside a comprehension filter must land in the
+    /// scope containing the **outermost** enclosing comprehension — PEP 572 —
+    /// not the comprehension's own iteration scope, so `declare_walrus` targets
+    /// the frame at `comp_scopes[0] - 1`. Empty outside any comprehension, where
+    /// a walrus binds into the current innermost scope.
+    comp_scopes: Vec<usize>,
 }
 
 /// The resolver state retained in analysis mode (I#228), handed to
@@ -630,6 +638,7 @@ impl Checker {
             warnings: Vec::new(),
             analysis: None,
             def_scopes: Vec::new(),
+            comp_scopes: Vec::new(),
         }
     }
 
@@ -662,6 +671,42 @@ impl Checker {
         self.scopes.pop();
         if self.analysis.is_some() {
             self.def_scopes.pop();
+        }
+    }
+
+    /// Push the iteration scope of a comprehension, recording the enclosing
+    /// scope depth so a walrus target inside it binds in the containing scope
+    /// (#600). Paired with [`pop_comp_scope`].
+    fn push_comp_scope(&mut self) {
+        self.comp_scopes.push(self.scopes.len());
+        self.push_scope();
+    }
+
+    fn pop_comp_scope(&mut self) {
+        self.pop_scope();
+        self.comp_scopes.pop();
+    }
+
+    /// Declare a walrus target `name: ty` (#600). Outside any comprehension the
+    /// binding lands in the current innermost scope — which, for an `if`/`while`
+    /// condition, is already the enclosing block (the condition is checked
+    /// before the body's scope is pushed), so the name outlives the construct.
+    /// Inside one or more comprehensions it lands in the scope containing the
+    /// outermost comprehension (PEP 572), so it is visible both in the
+    /// comprehension body and after the comprehension.
+    fn declare_walrus(&mut self, name: &str, ty: Ty, def: Span) {
+        let idx = match self.comp_scopes.first() {
+            Some(&len) => len.saturating_sub(1),
+            None => self.scopes.len().saturating_sub(1),
+        };
+        if let Some(scope) = self.scopes.get_mut(idx) {
+            scope.insert(name.to_string(), ty.clone());
+        }
+        if let Some(facts) = &mut self.analysis {
+            facts.local_defs.push((def, ty, false));
+            if let Some(ds) = self.def_scopes.get_mut(idx) {
+                ds.insert(name.to_string(), (def, false));
+            }
         }
     }
 
@@ -3313,6 +3358,17 @@ impl Checker {
                     Ty::Unknown
                 }
             }
+            Expr::Named {
+                name, value, span, ..
+            } => {
+                // Walrus `(name := value)` (#600, epic #614 D8): infer the
+                // operand, bind `name` by inference (like `auto`) into the
+                // enclosing scope, and evaluate to the operand's type.
+                let vt = self.infer(value);
+                let t = default_type(vt);
+                self.declare_walrus(name, t.clone(), *span);
+                t
+            }
             Expr::Starred { value, span } => {
                 // A `*expr` is only meaningful as a direct element of a
                 // list/set/tuple display, which consume it themselves (#598).
@@ -3372,10 +3428,10 @@ impl Checker {
                 ty
             }
             Expr::ListComp { elem, clauses, .. } => {
-                self.push_scope();
+                self.push_comp_scope();
                 self.check_comp_clauses(clauses);
                 let et = self.infer(elem);
-                self.pop_scope();
+                self.pop_comp_scope();
                 let ty = Ty::List(Box::new(et));
                 self.check_numeric_container_value(&ty, expr_span(e));
                 ty
@@ -3386,11 +3442,11 @@ impl Checker {
                 clauses,
                 span,
             } => {
-                self.push_scope();
+                self.push_comp_scope();
                 self.check_comp_clauses(clauses);
                 let kt = self.infer(key);
                 let vt = self.infer(value);
-                self.pop_scope();
+                self.pop_comp_scope();
                 let ty = Ty::Dict(Box::new(kt), Box::new(vt));
                 self.check_numeric_container_value(&ty, *span);
                 ty
@@ -3407,10 +3463,10 @@ impl Checker {
                 clauses,
                 span,
             } => {
-                self.push_scope();
+                self.push_comp_scope();
                 self.check_comp_clauses(clauses);
                 let et = self.infer(elem);
-                self.pop_scope();
+                self.pop_comp_scope();
                 let ty = Ty::Set(Box::new(et));
                 self.check_numeric_container_value(&ty, *span);
                 ty
@@ -6170,7 +6226,8 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::RegexSubst { span, .. }
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
-        | Expr::IfElse { span, .. } => *span,
+        | Expr::IfElse { span, .. }
+        | Expr::Named { span, .. } => *span,
     }
 }
 
@@ -6651,6 +6708,76 @@ def main():
     dict[int64, int64] grid = {x * 10 + y: x + y for x in range(2) for y in range(2)}
     set[int64] cells = {x + y for x in xs for y in ys if x > 0 if y > 0}
 "#);
+    }
+
+    // ---- walrus assignment-expression (#600, epic #614 D8) ----------------
+
+    #[test]
+    fn walrus_binds_in_if_condition_and_is_visible_after() {
+        // `(n := len(xs))` binds `n` in the enclosing scope, so `n` is usable
+        // both inside the branch body and after the `if`.
+        ok(r#"
+def main():
+    list[int64] xs = [1, 2, 3]
+    if (n := len(xs)) > 2:
+        auto inside = n + 1
+    auto after = n + 1
+"#);
+    }
+
+    #[test]
+    fn walrus_binds_in_while_condition_and_is_visible_after() {
+        // `(line := read())` binds `line` once per iteration in the enclosing
+        // scope; the name survives the loop.
+        ok(r#"
+def read() -> str:
+    return ""
+def main():
+    while (line := read()) != "":
+        auto inside = line
+    auto after = line
+"#);
+    }
+
+    #[test]
+    fn walrus_binds_in_comprehension_filter_and_is_visible_after() {
+        // A walrus in a comprehension `if` filter binds in the scope containing
+        // the comprehension (PEP 572), so `y` is visible after it.
+        ok(r#"
+def f(int64 x) -> int64:
+    return x
+def main():
+    list[int64] xs = [1, 2, 3]
+    list[int64] kept = [y for x in xs if (y := f(x)) > 0]
+    auto after = y + 1
+"#);
+    }
+
+    #[test]
+    fn walrus_value_type_flows_to_the_binding() {
+        // The bound name takes the operand's (defaulted) type: binding a `str`
+        // walrus and then using it as an int is the usual operator mismatch, so
+        // the walrus is not silently typed as `Unknown`.
+        let e = errors(
+            "def read() -> str:\n    return \"\"\n\
+             def main():\n    if (line := read()) != \"\":\n        auto n = line + 1\n",
+        );
+        assert!(
+            !e.is_empty(),
+            "using the str-typed walrus binding as an int should error"
+        );
+    }
+
+    #[test]
+    fn bare_walrus_statement_is_a_parse_error_steering_to_auto() {
+        // `a := 10` as a bare statement is rejected before type-checking with
+        // ZAP2020 (#600 non-goal); the pipeline surfaces that parse error.
+        let (_terrs, perrs, lerrs) = check_str("def main():\n    a := 10\n");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2020),
+            "expected ZAP2020 steering to `auto`, got {perrs:?}"
+        );
     }
 
     #[test]

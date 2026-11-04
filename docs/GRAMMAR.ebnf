@@ -473,9 +473,24 @@ arg           ::= [ IDENT "=" ] expr              (* keyword arg, D-0038 *)
 atom          ::= literal
                 | IDENT
                 | "<-" postfix                    (* channel receive, D-0031 *)
+                | "(" named_expression ")"        (* walrus assignment-expr, #600 *)
                 | "(" [ star_elem { "," star_elem } [ "," ] ] ")"  (* grouping / tuple; (e,) = 1-tuple, D-0049 *)
                 | list_display
                 | brace_display ;
+
+named_expression ::= IDENT ":=" expr ;
+                  (* The walrus assignment-expression (#600, epic #614 D8): it
+                     evaluates `expr` exactly once, binds IDENT by inference
+                     (like `auto`) in the lexically ENCLOSING scope — so the name
+                     is usable after the construct — and itself evaluates to the
+                     value. It is legal ONLY in this parenthesized form, which is
+                     how it reaches `if`/`while` conditions and comprehension
+                     `if` filters (`if (n := len(xs)) > 10:`, `[y for x in xs if
+                     (y := f(x)) > 0]`). A walrus target inside a comprehension
+                     binds in the scope containing the outermost comprehension
+                     (PEP 572). `:=` is NOT a declaration shorthand: a bare
+                     statement `a := 10` is rejected (ZAP2020) in favour of
+                     `auto a = 10` (D-0003). *)
 
 star_elem     ::= expr | "*" expr ;   (* a display element, optionally spliced (#598) *)
                   (* "*expr" splices an iterable's elements in place inside a

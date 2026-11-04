@@ -830,6 +830,21 @@ pub enum Expr {
         els: Box<Expr>,
         span: Span,
     },
+
+    /// `(name := expr)` — a named (walrus) assignment-expression (#600, epic
+    /// #614 D8). It evaluates `value` exactly once, binds `name` by inference
+    /// (like `auto`) into the lexically **enclosing** scope — so the name is
+    /// usable after the `if`/`while`/comprehension in which the walrus appears,
+    /// matching Python's PEP 572 enclosing-scope rule — and itself evaluates to
+    /// the value. The parser only produces it inside a parenthesized position
+    /// (as part of a condition or a comprehension filter); a bare statement
+    /// `a := 10` is rejected in favour of `auto a = 10` (D-0003).
+    Named {
+        name: String,
+        name_span: Span,
+        value: Box<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -990,6 +1005,7 @@ pub fn render_expr(e: &Expr) -> String {
             format!("{}[{}]", render_expr(base), render_expr(index))
         }
         Expr::Attr { base, name, .. } => format!("{}.{name}", render_expr(base)),
+        Expr::Named { name, value, .. } => format!("({name} := {})", render_expr(value)),
         other => format!("{other:?}"),
     }
 }

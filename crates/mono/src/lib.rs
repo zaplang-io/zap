@@ -1820,6 +1820,25 @@ impl Mono<'_> {
                 },
                 CTy::Unknown,
             )),
+            // `(name := value)` — rewrite the operand (which may carry generic
+            // references); the walrus's type is the operand's (#600).
+            Expr::Named {
+                name,
+                name_span,
+                value,
+                span,
+            } => {
+                let (value_e, vcty) = self.rewrite_expr(value, env, expected)?;
+                Ok((
+                    Expr::Named {
+                        name: name.clone(),
+                        name_span: *name_span,
+                        value: Box::new(value_e),
+                        span: *span,
+                    },
+                    vcty,
+                ))
+            }
             Expr::Slice {
                 base,
                 lo,

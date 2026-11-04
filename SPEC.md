@@ -416,6 +416,29 @@ feature.
   operator; in-place `__iadd__`-family methods are reserved, implementation
   deferred. Iteration (`__iter__`) is specified separately.
 
+**Walrus assignment-expression `(name := expr)` (#600, epic #614 D8):** the one
+form that *binds and yields* in a single step. It evaluates `expr` exactly once,
+binds `name` by inference (like `auto`) in the **lexically enclosing** scope, and
+itself evaluates to that value — so the name is usable after the construct it
+appears in. This is the capability `auto` cannot express: a binding introduced
+where a statement cannot go. Zap permits the walrus only inside parentheses — as
+part of an `if`/`while` condition or a comprehension `if` filter:
+
+```python
+while (line := read()) != "":   # `line` re-bound each iteration, live afterward
+    use(line)
+if (n := len(xs)) > 10:         # `n` usable in the body and after the `if`
+    print(n)
+kept = [y for x in xs if (y := f(x)) > 0]   # `y` binds in the enclosing scope
+                                            # (PEP 572), live after the comp
+```
+
+A walrus target inside a comprehension binds in the scope containing the
+(outermost) comprehension, not in the comprehension's own iteration scope. `:=`
+is deliberately **not** a declaration shorthand: a bare statement `a := 10` is
+rejected — it would duplicate `auto a = 10` and fight the single declaration
+form (D-0003) — so introduce a binding with `auto` or a typed declaration.
+
 ## 6. Control flow
 
 ```python

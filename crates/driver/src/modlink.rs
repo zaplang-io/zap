@@ -618,7 +618,8 @@ fn expr_span(e: &Expr) -> Span {
         | RegexSubst { span, .. }
         | ChanRecv { span, .. }
         | Yield { span, .. }
-        | IfElse { span, .. } => *span,
+        | IfElse { span, .. }
+        | Named { span, .. } => *span,
     }
 }
 

@@ -38,6 +38,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `*` separator). `/` appears at most once and must precede any `*`; passing a
   positional-only parameter by name is `ZAP4034`, a misplaced `/` is `ZAP2019`.
   Enforced front-end only — no IR/codegen change (#602, D-0104, epic #614 D10).
+- Walrus assignment-expression `(name := expr)`: evaluates `expr` once, binds
+  `name` by inference in the lexically enclosing scope, and yields the value, so
+  the name outlives the construct — usable in `if`/`while` conditions and
+  comprehension `if` filters (`if (n := len(xs)) > 10:`, `[y for x in xs if
+  (y := f(x)) > 0]`; a comprehension target binds in the enclosing scope per PEP
+  572). It is parenthesized-only and deliberately not a declaration shorthand: a
+  bare `a := 10` statement is rejected (`ZAP2020`, steering to `auto a = 10`)
+  (#600, D-0106, epic #614 D8).
 
 - Array length mismatches raise `ValueError` before SIMD kernels run; the
   Experimental array contract records supported 1-D dtypes, construction,

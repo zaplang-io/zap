@@ -92,6 +92,9 @@ pub fn render(e: &Expr) -> String {
         Expr::List(xs, _) => format!("[{}]", render_elems(xs)),
         Expr::Set(xs, _) => format!("{{{}}}", render_elems(xs)),
         Expr::Starred { value, .. } => format!("*{}", pexpr(value, P_LAMBDA)),
+        // `(name := value)` — the walrus always renders with its own parentheses,
+        // since it is only legal in a parenthesized position (#600).
+        Expr::Named { name, value, .. } => format!("({name} := {})", pexpr(value, P_LAMBDA)),
         Expr::Dict(items, _) => {
             if items.is_empty() {
                 "{}".to_string()

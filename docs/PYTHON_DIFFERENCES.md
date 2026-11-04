@@ -185,6 +185,7 @@ Python models data with classes; Zap uses nominal `struct` / `enum` /
 | Regex match | `re.search(p, s)` | `s =~ m/p/` (and `s !~ m/p/`) | First-class `m/.../` literals and bind operators (D-0010). |
 | Regex substitute | `s = re.sub(p, r, s)` | `s ~= s/p/r/` | In-place substitution assignment (D-0010). |
 | Tuple return | `return a, b` | `return a, b` | Same spelling; first-class in Zap's type system (D-0049). |
+| Walrus `:=` | `while chunk := f():` or `(x := e)` | `while (chunk := f()):` — parentheses required | `(name := expr)` evaluates once, binds `name` in the enclosing scope (PEP 572, including comprehension filters), and yields the value. Zap accepts **only** the parenthesized form, and `:=` is never a bare declaration — `a := 10` is rejected (use `auto a = 10`) (#600, D-0106). |
 
 ### Statements
 

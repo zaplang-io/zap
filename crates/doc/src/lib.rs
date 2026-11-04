@@ -687,7 +687,8 @@ fn expr_start(e: &Expr) -> u32 {
         | Expr::RegexSubst { span, .. }
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
-        | Expr::IfElse { span, .. } => span.start,
+        | Expr::IfElse { span, .. }
+        | Expr::Named { span, .. } => span.start,
     }
 }
 

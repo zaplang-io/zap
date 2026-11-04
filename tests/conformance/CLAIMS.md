@@ -186,6 +186,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | Claim | Section | Statement | Status | Case |
 |---|---|---|---|---|
 | OP-3 | §5 | user types overload operators via dunder methods (D-0047) | TODO | — |
+| WAL-1 | §5 | the walrus `(name := expr)` evaluates `expr` once, binds `name` in the enclosing scope, and yields the value, in `if`/`while` conditions and comprehension filters (#600, D8) | covered | walrus |
 | WITH-1 | §11 | `with` closes the resource on block exit, even on exception (D-0027) | TODO | — |
 | CHAN-1 | §12 | channels: send/receive, comma-ok receive, `close` (D-0031) | TODO | — |
 | SCOPE-1 | §12 | `scope:` joins spawned coroutines; a child failure cancels siblings (D-0044) | covered | scope_cleanup |

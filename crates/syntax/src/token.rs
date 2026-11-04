@@ -83,6 +83,7 @@ pub enum TokenKind {
     Ge,           // >=
     Arrow,        // ->
     Colon,        // :
+    ColonEq,      // :=   (walrus assignment-expression, #600)
     Comma,        // ,
     Dot,          // .
     Ellipsis,     // ...  (variadic, D-0038)
