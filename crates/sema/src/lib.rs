@@ -2136,31 +2136,33 @@ impl Checker {
                 }
             }
             "cache" => {
-                // Reclassified/deferred (I#472, D-0109): `@cache` needs
-                // module-level persistent state, which is not yet a language
-                // feature (and an `args`-keyed memoize is not expressible via the
-                // user-level `wrap`). Rejected cleanly here rather than advertised
-                // and then rejected at lowering; the name stays reserved so this
+                // Deferred (I#472, D-0109): `@cache` needs module-level persistent
+                // state, not yet a language feature (tracked in I#658/I#661; an
+                // `args`-keyed memoize is not expressible via the user-level
+                // `wrap` either). Rejected cleanly here rather than advertised and
+                // then rejected at lowering; the name stays reserved so this
                 // dedicated message fires instead of "unknown decorator".
                 self.error(
                     ErrorCode::ZAP5055,
-                    "@cache is not available in this version: it needs module-level \
-                     persistent state, which is not yet a language feature (I#472, \
-                     D-0109); see STABILITY.md",
+                    "@cache is not available yet: it needs module-level persistent state, \
+                     a language feature tracked in I#658/I#661 (I#472, D-0109); \
+                     see STABILITY.md",
                     d.span,
                 );
             }
             "inject" => {
-                // Reclassified/deferred (I#472, D-0109): `@inject` is a
-                // DI-framework hook; core has no DI container/registry, and the
-                // concrete FastAPI-style `Depends(...)` need is met by the
-                // reflection-driven handler adapter (D-0089/D-0092, I#466), not a
-                // core decorator. Name reserved for the dedicated message.
+                // Declined for core (I#472, D-0109): `@inject` is a DI-framework
+                // hook; core has no DI container/registry, and the concrete
+                // FastAPI-style `Depends(...)` need is met at the framework level
+                // by the reflection-driven handler adapter (D-0089/D-0092, I#466).
+                // There is no planned core `@inject`; the name stays reserved only
+                // so this redirect-to-`Depends` message fires instead of "unknown
+                // decorator".
                 self.error(
                     ErrorCode::ZAP5055,
-                    "@inject is not available in this version: core has no DI container; \
-                     use reflection-driven `Depends(...)` adapters (D-0089/D-0092) \
-                     instead (I#472, D-0109); see STABILITY.md",
+                    "@inject is not a core decorator: dependency injection is provided by \
+                     reflection-driven `Depends(...)` adapters (D-0089/D-0092), not a core \
+                     decorator (I#472, D-0109); see STABILITY.md",
                     d.span,
                 );
             }
@@ -8062,10 +8064,10 @@ def main():
     }
 
     #[test]
-    fn inject_is_reclassified_deferred() {
-        // `@inject` is a DI-framework hook with no core v1 semantics (the
-        // concrete `Depends(...)` need is met by reflection adapters,
-        // D-0089/D-0092); rejected cleanly at sema with ZAP5055.
+    fn inject_is_declined_for_core() {
+        // `@inject` is declined for core (I#472, D-0109): dependency injection is
+        // provided by reflection-driven `Depends(...)` adapters (D-0089/D-0092),
+        // not a core decorator; rejected cleanly at sema with ZAP5055.
         let e = errors("struct S:\n    @inject\n    int64 x\n");
         assert_eq!(e.len(), 1, "expected one diagnostic, got {e:?}");
         assert_eq!(e[0].code, ErrorCode::ZAP5055);

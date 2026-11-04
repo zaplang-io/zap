@@ -118,10 +118,11 @@ compile time — no runtime reflection cost.
 Database db            # a DI/framework decorator fills it
 ```
 
-> **Status (D-0109):** `@inject` is **deferred** — dependency injection is
-> provided by reflection-driven `Depends(...)` adapters (D-0089/D-0092), not a
-> core variable decorator. The syntax above is illustrative of the long-term
-> model, not a v1 feature.
+> **Status (D-0109):** `@inject` is **declined for core** — dependency injection
+> is a framework concern, provided by reflection-driven `Depends(...)` adapters
+> (D-0089/D-0092), not a core variable decorator (an implicit container-filled
+> field is the "annotation magic" this design avoids). The syntax above is
+> illustrative only; there is no planned core `@inject`.
 
 ### Compile-time-first + runtime reflection
 
@@ -262,14 +263,16 @@ target is restricted to a function/method (ZAP5047); the message must be a
 single string literal (ZAP5042). With this the v1 built-in set is complete:
 `@derive(...)`, `@default`, `@validate`, `@range`, `@deprecated`.
 
-Reclassified/deferred **out of v1** (D-0109, I#472): `@cache` and `@inject`.
-`@cache` (memoization) needs persistent module-level state, which is still
-absent (and is exactly why an `args`-keyed `memoize` is not expressible via
-`wrap`); it is gated on first adding that language feature. `@inject` is a
-DI-framework hook with no core v1 semantics — the concrete FastAPI-style
-`Depends(...)` need is met by the reflection-driven handler adapter
-(D-0092/D-0089, cf. zap#312/fastzap#7), not a core decorator. Both names stay
-reserved and are rejected with a dedicated diagnostic (ZAP5055).
+Out of v1 (D-0109, I#472): `@cache` is **deferred** and `@inject` is **declined
+for core**. `@cache` (memoization) needs persistent module-level state, which is
+still absent (and is exactly why an `args`-keyed `memoize` is not expressible via
+`wrap`); it is gated on first adding that language feature (epic #661,
+prerequisite #658, built-in #666). `@inject` is a DI-framework hook: the concrete
+FastAPI-style `Depends(...)` need is met by the reflection-driven handler adapter
+(D-0092/D-0089, cf. zap#312/fastzap#7), and an implicit container-filled field is
+the annotation-magic this design avoids — so there is no planned core `@inject`.
+Both names stay reserved and are rejected with a dedicated diagnostic (ZAP5055);
+for `@inject` the diagnostic redirects to `Depends(...)`.
 
 Follow-up (deferred, not yet implemented): `@validate(matches=m/.../)` regex
 validation. Behavioral decorators on non-function targets are ZAP5050

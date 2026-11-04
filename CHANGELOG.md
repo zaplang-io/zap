@@ -174,13 +174,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
-- Built-in decorators `@cache` and `@inject` are **reclassified/deferred** out
-  of the v1 set (#472, D-0109). `@cache` needs module-level persistent state,
-  which is not yet a language feature; `@inject`'s dependency-injection need is
-  met by reflection-driven `Depends(...)` adapters (D-0089/D-0092), not a core
-  decorator. Both names stay reserved and are rejected with a dedicated
-  diagnostic (`ZAP5055`) instead of being advertised and then failing at
-  lowering.
+- Built-in decorators `@cache` and `@inject` are out of the v1 set (#472,
+  D-0109). **`@cache` is deferred** — it needs module-level persistent state,
+  not yet a language feature (tracked in #658/#661; the built-in in #666).
+  **`@inject` is declined for core** — dependency injection is a framework
+  concern, provided by reflection-driven `Depends(...)` adapters (D-0089/D-0092),
+  not a core decorator. Both names stay reserved and are rejected with a
+  dedicated diagnostic (`ZAP5055`) — for `@inject`, a redirect to `Depends(...)`
+  — instead of being advertised and then failing at lowering.
 
 ### Deprecated
 

@@ -3515,7 +3515,7 @@ pinning the `wrap` AST shape, `before`/`after`/stacking/arguments/exception and
 full-codegen CI jobs), and `zap fmt` round-trips of both decorator surfaces. See
 `design/0004-decorators.md`.
 
-## D-0109 — built-in decorators completion: `@deprecated` implemented; `@cache`/`@inject` reclassified/deferred (I#472)
+## D-0109 — built-in decorators completion: `@deprecated` implemented; `@cache` deferred, `@inject` declined for core (I#472)
 
 Closes the remaining built-in-decorator work of epic #469 / I#472, completing
 D-0036's locked set. Of the three function/variable-group built-ins the field
@@ -3562,23 +3562,29 @@ dedicated message fires rather than "unknown decorator". A future `@cache` is
 gated on first adding module-level persistent state as a language feature (filed
 as prerequisite language issue **#658**).
 
-**`@inject` — reclassified/deferred.** `@inject` is a DI-framework hook; core
-Zap has **no DI container/registry**, and the concrete FastAPI-style
+**`@inject` — declined for core (permanent).** `@inject` is a DI-framework hook;
+core Zap has **no DI container/registry**, and the concrete FastAPI-style
 `Depends(...)` per-parameter-injection need was already met **at the framework
 level** by the reflection-driven handler adapter (D-0092, I#466), composing
-signature reflection (D-0089). A core-language `@inject` has no additional,
-well-defined v1 semantics, so building one would be speculative. It is removed
-from the advertised v1 set, marked **Deferred** in STABILITY, and rejected
-cleanly at sema with ZAP5055 pointing at the reflection-driven `Depends(...)`
-mechanism.
+signature reflection (D-0089). An implicit field decorator that fills a value
+from a global container is exactly the "annotation magic / Spring problem" that
+the decorator design (D-0036) sets out to avoid. So `@inject` is **not deferred
+pending work — it is declined as a core decorator**: dependency injection is a
+framework concern, served by `Depends(...)`. The name stays reserved only as a
+**redirect**: applying `@inject` is rejected at sema with ZAP5055 pointing at the
+`Depends(...)` mechanism, rather than being silently an unknown decorator. (If
+whole-program compile-time DI is ever wanted, it returns as a new, explicitly
+designed feature — Dagger-style, its own epic — not by resurrecting this
+built-in.)
 
 **Net spec surface.** The advertised v1 built-in set becomes `@derive(...)`,
-`@default`, `@validate`, `@range`, `@deprecated`. `@cache` and `@inject` are
-documented as deferred with their prerequisites. `BUILTIN_DECORATORS` keeps all
-three names reserved (so applications get a dedicated diagnostic, not a typo
-error); `DEFERRED_BUILTINS` in lowering now holds only the field group
-(`default`/`validate`/`range`) for their non-field-target guard, and
-`@deprecated` lowers as a recognized no-op.
+`@default`, `@validate`, `@range`, `@deprecated`. `@cache` is **deferred** (its
+prerequisite, module-level persistent state, is tracked in I#658/I#661; `@cache`
+itself in I#666). `@inject` is **declined for core** (framework-provided via
+`Depends(...)`). `BUILTIN_DECORATORS` keeps all three names reserved (so
+applications get a dedicated diagnostic, not a typo error); `DEFERRED_BUILTINS`
+in lowering now holds only the field group (`default`/`validate`/`range`) for
+their non-field-target guard, and `@deprecated` lowers as a recognized no-op.
 
 Verified by sema unit tests (free-function and method call-site warning,
 message variant, one-warning-per-site, non-deprecated silence, stacking with a

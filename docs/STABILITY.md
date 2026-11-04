@@ -177,14 +177,15 @@ not supported — it may change in **any** release, including a PATCH:
 - **Experimental and Internal surfaces** (§4). Everything not on the Stable list
   produced by #206 is outside the promise, whether or not it happens to be
   reachable.
-- **Reclassified/deferred built-in decorators** — `@cache` and `@inject`
-  (I#472, D-0109) are **not** in the v1 built-in set. `@cache` is gated on a
-  future module-level-persistent-state language feature; `@inject`'s dependency
-  injection is provided by reflection-driven `Depends(...)` adapters
-  (D-0089/D-0092), not a core decorator. Both names are reserved and rejected
-  with `ZAP5055`; if either is added later it ships **Experimental** first (§4).
-  `@cache` is gated on prerequisite language issue #658 (module-level persistent
-  state).
+- **Built-in decorators not in the v1 set** — `@cache` and `@inject` (I#472,
+  D-0109). **`@cache` is deferred**: gated on the module-level-persistent-state
+  language feature (epic #661, prerequisite #658; the built-in itself #666); if
+  added later it ships **Experimental** first (§4). **`@inject` is declined for
+  core**: dependency injection is a framework concern, provided by
+  reflection-driven `Depends(...)` adapters (D-0089/D-0092), not a core
+  decorator — there is no planned core `@inject`. Both names stay reserved and
+  are rejected with `ZAP5055`; for `@inject` the diagnostic is a redirect to
+  `Depends(...)`.
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,

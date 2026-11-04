@@ -556,14 +556,15 @@ define_codes! {
         "A `wrap(call)` hook must end with `return inner`, returning the nested \
          function it defines (D-0036, #653). The hook either does not return, or \
          returns something other than the name of its nested `def`.";
-    ZAP5055 = 5055 : "built-in decorator not available in this version",
-        "A built-in decorator named by the spec is not available in this version \
-         and has been reclassified/deferred (I#472, D-0109). `@cache` needs \
-         module-level persistent state, which is not yet a language feature (an \
-         `args`-keyed memoize is also not expressible via the user-level `wrap`); \
-         `@inject` is a DI-framework hook whose concrete `Depends(...)` need is \
-         met by reflection-driven adapters (D-0089/D-0092, I#466), not a core \
-         decorator. See SPEC.md, STABILITY.md and DECISIONS.md (D-0109).";
+    ZAP5055 = 5055 : "built-in decorator not available in core",
+        "A built-in decorator named by the original spec is not available as a \
+         core decorator (I#472, D-0109). `@cache` is **deferred**: it needs \
+         module-level persistent state, not yet a language feature (tracked in \
+         I#658/I#661; an `args`-keyed memoize is also not expressible via the \
+         user-level `wrap`). `@inject` is **declined for core**: dependency \
+         injection is provided by reflection-driven `Depends(...)` adapters \
+         (D-0089/D-0092, I#466), not a core decorator. See SPEC.md, STABILITY.md \
+         and DECISIONS.md (D-0109).";
     ZAP5060 = 5060 : "generator tier-1 enum method not supported",
         "Generators on a tier-1 (unboxed-integer) enum method are not supported \
          yet — tier-1 enum methods do not lower at all yet, generator or not. \

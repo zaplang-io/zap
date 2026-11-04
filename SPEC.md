@@ -1158,12 +1158,14 @@ emits a non-fatal **use-site warning** (`ZAP5124`) at every call site of the
 decorated callable — the mechanism for retiring a Stable surface with notice
 (STABILITY.md §5). An optional message is appended (`@deprecated("use X")`).
 
-**Deferred (reclassified out of v1, I#472/D-0109):** `@cache` and `@inject`.
-`@cache` needs module-level persistent state, which is not yet a language
-feature (and is the "separate capability" the user-level `wrap` lacks, above);
-`@inject` is a DI-framework hook whose concrete `Depends(...)` need is met by
-reflection-driven handler adapters (D-0089/D-0092), not a core decorator. Both
-names stay reserved and are rejected with a dedicated diagnostic (`ZAP5055`).
+**Not in the v1 set (I#472/D-0109):** `@cache` is **deferred** — it needs
+module-level persistent state, not yet a language feature (and the "separate
+capability" the user-level `wrap` lacks, above); tracked in I#658/I#661 (the
+built-in itself in I#666). `@inject` is **declined for core** — dependency
+injection is a framework concern, served by reflection-driven `Depends(...)`
+adapters (D-0089/D-0092), not a core decorator; there is no planned core
+`@inject`. Both names stay reserved and are rejected with a dedicated diagnostic
+(`ZAP5055`) — for `@inject`, a redirect to `Depends(...)`.
 
 ## 17. Toolchain & CLI (D-0053)
 
