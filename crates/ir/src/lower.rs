@@ -11247,6 +11247,11 @@ impl<'a> FnLower<'a> {
                 }
                 Ok((acc.unwrap_or_else(|| self.bconst(false)), catch_all))
             }
+            Pattern::As { pattern, .. } => {
+                // `<pattern> as name` tests exactly the inner pattern; the
+                // binding is added in `bind_pattern` (D11, #603).
+                self.pattern_cond(sv, sty, pattern)
+            }
             Pattern::Struct {
                 path,
                 args,
@@ -11562,6 +11567,16 @@ impl<'a> FnLower<'a> {
     fn bind_pattern(&mut self, sv: Value, sty: Ty, pat: &Pattern) -> Result<(), LowerError> {
         match pat {
             Pattern::Capture { name, .. } => {
+                let slot = self.alloca(sty);
+                self.store(slot, sv);
+                self.declare(name, slot, sty);
+                Ok(())
+            }
+            Pattern::As { pattern, name, .. } => {
+                // Bind the inner pattern's own captures first, then bind `name`
+                // to the whole matched value — same slot/type as a bare capture
+                // of the scrutinee (D11, #603).
+                self.bind_pattern(sv, sty, pattern)?;
                 let slot = self.alloca(sty);
                 self.store(slot, sv);
                 self.declare(name, slot, sty);

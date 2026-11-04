@@ -44,6 +44,12 @@ fn syntax_codes() {
         "when target.arch == .sparc:\n    def f():\n        pass\n",
         "ZAP2016",
     );
+    // A malformed `as` pattern capture (#603, D11): `as` must be followed by a
+    // single plain binding name, never `_`.
+    assert_code(
+        "def main():\n    match 1:\n        case 1 as _:\n            pass\n",
+        "ZAP2021",
+    );
 }
 
 #[test]

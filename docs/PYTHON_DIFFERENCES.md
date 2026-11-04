@@ -212,8 +212,9 @@ These read and behave as in Python and need no translation:
   `{}` is a dict; SPEC §4, §8), including `*`/`**` unpacking: `[1, *xs]`,
   `{*a, *b}`, `(x, *rest)`, `{**a, "k": v}` (#598).
 - **`match` / `case`** — literals, captures, wildcard `_`, or-patterns, guards,
-  sequence/tuple/struct patterns, and qualified value patterns such as
-  `case Color.RED:` (SPEC §6; D-0040).
+  sequence/tuple/struct patterns, qualified value patterns such as
+  `case Color.RED:`, and `as` sub-pattern captures (`case <pattern> as name:`,
+  which binds the whole matched value; SPEC §6; D-0040/D-0111).
 - **Exceptions** — `try` / `except E as e` / `finally`, `raise`, `assert`
   (SPEC §10; D-0007/D-0029).
 - **Slicing** — `xs[lo:hi:step]` (SPEC §8; D-0030).
@@ -233,7 +234,6 @@ patterns and set displays are already shipped; `not in` (#593), chained
 assignment (#594), element `del` (#595), generator expressions (#596), starred
 call args (#597), `*`/`**` unpacking in displays (#598), multiple `for`/`if`
 in comprehensions (#599), walrus `:=` (#600), `**kwargs` (#601), positional-only
-`/` (#602), `as` sub-patterns (#603), `raise ... from` (#604), `except*` (#605),
-type aliases (#606), and anonymous union types (#607) bring the surface closer
-to Python; graduating `set` (#608) and set constructors (#609) round out set
-support. The deferred/planned items (#610–#613, #66/#30) are listed above.
+`/` (#602), `as` sub-patterns (#603), `raise ... from` (#604), type aliases
+(#606), and set graduation/constructors (#608/#609) are shipped; `except*`
+(#605) and anonymous union types (#607) bring the surface closer to Python. The deferred/planned items (#610–#613, #66/#30) are listed above.

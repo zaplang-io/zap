@@ -3654,3 +3654,45 @@ negative: ZAP4073 on every value type and the reference-vs-value mix, ZAP4074 on
 `is_identity` end-to-end golden (same-vs-distinct allocation, the `is`/`==`
 distinction via a struct with `__eq__`, tagged and niche `Optional[T]`, `is
 not`, `None is None`, and identity chains) under the full-codegen CI jobs.
+
+## D-0111 — `as` sub-pattern capture in `match` (`case P as name:`) (I#603)
+
+Part of the CPython grammar-parity pass (epic #614, decision D11). A `match`
+pattern gained an optional trailing **`as` capture**, the counterpart to
+Python's `case <pattern> as name:` (PEP 634 `as_pattern`). It matches the inner
+pattern and, on success, binds `name` to the *whole* matched value.
+
+- **Grammar.** `pattern ::= or_pattern [ "as" IDENT ]`. The `as` binds the
+  entire or-pattern, so `case 1 | 2 | 3 as n:` is `(1 | 2 | 3) as n`, not
+  `1 | 2 | (3 as n)`. The suffix is available at every sub-pattern position, so
+  nested captures parse (`case [x as a, y]:`). `as` is the same reserved keyword
+  already used by `import`/`with`/`except`, so this adds no new token.
+- **Binding is a wrapper, not new destructuring.** A new `Pattern::As { pattern,
+  name }` AST node wraps an existing pattern. The inner pattern still matches and
+  destructures exactly as before, so its own captures bind alongside the `as`
+  name: `case [x, y] as pair:` binds `pair`, `x`, and `y`; `case Point(x=0) as
+  origin:` binds `origin`. The capture reuses the ordinary match-binding
+  machinery — it is lowered as a bare capture of the scrutinee value, after the
+  inner pattern's own bindings.
+- **Type and scope.** `name` is typed as the scrutinee for that arm (not
+  `Unknown`), so `n` in `case 1 | 2 as n:` is usable in arithmetic and
+  `origin.x` resolves on the captured struct. The capture is in scope in the arm
+  body **and** in the arm's guard (`case [x, y] as pair if len(pair) == 2:`),
+  because both are checked/lowered in the scope the pattern populates.
+- **Refutability / exhaustiveness.** The `as` wrapper is transparent to coverage:
+  it covers exactly what its inner pattern covers and stays an irrefutable
+  catch-all iff the inner pattern is one (`_ as n`, `x as n`). It does not by
+  itself make a `match` exhaustive.
+- **Diagnostics.** `name` must be a single plain identifier. `as _` (not a
+  binding — drop the `as` to discard), a dotted target (`as a.b`), and any
+  non-identifier token after `as` are rejected at parse time with the dedicated
+  **ZAP2021** ("malformed `as` pattern capture").
+
+No divergence from CPython's `as_pattern` surface, so PYTHON_DIFFERENCES.md is
+unchanged. Verified by the `match_as_pattern` end-to-end golden (sequence +
+struct + or-pattern captures, a guard reading the capture) under the
+full-codegen CI jobs, plus parser unit tests (`as_pattern_capture_parses`,
+`nested_as_pattern_parses`, `as_pattern_rejects_bad_capture_name`), sema unit
+tests (`as_pattern_binds_capture_and_inner_names`,
+`as_capture_is_scrutinee_typed_and_visible_in_guard`), and a driver
+`error_codes` test (ZAP2021) on host. See docs/GRAMMAR.ebnf and SPEC.md.

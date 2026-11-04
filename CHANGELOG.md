@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`as` sub-pattern capture in `match`** — `case <pattern> as name:` (#603,
+  D-0111; CPython grammar-parity epic #614, D11). It matches the inner pattern
+  and binds `name` to the *whole* matched value, typed as the scrutinee for that
+  arm. The inner pattern still destructures, so nested captures bind alongside
+  the `as` name (`case [x, y] as pair:` binds `pair`, `x`, `y`;
+  `case Point(x=0) as origin:` binds `origin`), and the `as` wraps the entire
+  or-pattern (`case 1 | 2 | 3 as n:`). The capture is in scope in the arm body
+  and its guard (`case [x, y] as pair if len(pair) == 2:`). `name` must be a
+  single plain identifier — not `_`, not dotted — rejected otherwise with the
+  dedicated **`ZAP2021`**. Matches CPython's `as`-pattern surface.
 - Built-in **`@deprecated`** decorator (#472, D-0109, D-0036). A function or
   method marked `@deprecated` (optionally `@deprecated("use X")`) generates no
   code but raises a non-fatal **use-site warning** (`ZAP5124`) at every call

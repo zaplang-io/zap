@@ -549,6 +549,7 @@ impl Rewriter<'_> {
                     self.pattern(p, locals);
                 }
             }
+            Pattern::As { pattern, .. } => self.pattern(pattern, locals),
             Pattern::Wildcard(_) | Pattern::Capture { .. } | Pattern::Rest { .. } => {}
         }
     }
@@ -807,6 +808,10 @@ fn collect_pattern_bindings(p: &Pattern, s: &mut HashSet<String>) {
                     collect_pattern_bindings(&a.pattern, s);
                 }
             }
+        }
+        Pattern::As { pattern, name, .. } => {
+            collect_pattern_bindings(pattern, s);
+            s.insert(name.clone());
         }
     }
 }

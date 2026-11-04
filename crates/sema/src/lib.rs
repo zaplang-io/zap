@@ -6273,6 +6273,22 @@ impl Checker {
             Pattern::Struct { path, args, span } => {
                 self.check_qualified_pattern(path, args.as_deref(), *span, scrut)
             }
+            Pattern::As {
+                pattern,
+                name,
+                span,
+            } => {
+                // Match the inner pattern (declaring its own captures), then
+                // bind `name` to the whole matched value, typed as the
+                // scrutinee for this arm (D11, #603). The capture is in scope in
+                // the arm body and its guard because both are checked in the
+                // scope this populates. The `as` wrapper does not change which
+                // enum variants the arm covers, nor its catch-all status (`_ as
+                // n` / `x as n` stay irrefutable).
+                let (covered, catch_all) = self.check_pattern(pattern, scrut);
+                self.declare(name, scrut.clone(), *span);
+                (covered, catch_all)
+            }
         }
     }
 
@@ -6397,6 +6413,7 @@ fn pattern_is_irrefutable(pattern: &Pattern) -> bool {
     match pattern {
         Pattern::Wildcard(_) | Pattern::Capture { .. } => true,
         Pattern::Or(ps, _) => ps.iter().any(pattern_is_irrefutable),
+        Pattern::As { pattern, .. } => pattern_is_irrefutable(pattern),
         _ => false,
     }
 }
@@ -7207,6 +7224,50 @@ def main():
                 "{errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn as_pattern_binds_capture_and_inner_names(/* #603, D11 */) {
+        // `case [a, b] as pair:` binds `pair` (the whole matched value) AND the
+        // inner captures `a`, `b`. The `as` name is typed as the scrutinee for
+        // the arm and is in scope in the arm body.
+        ok(r#"
+def describe(list[int64] xs):
+    match xs:
+        case [a, b] as pair:
+            print(a, b, len(pair))
+        case _:
+            print("other")
+"#);
+        // `case Point(x=0) as origin:` binds `origin`, typed as the scrutinee
+        // struct, so its fields are accessible in the body.
+        ok(r#"
+struct Point:
+    int64 x
+    int64 y
+def at_origin(Point p):
+    match p:
+        case Point(x=0) as origin:
+            print(origin.x, origin.y)
+        case _:
+            print("elsewhere")
+"#);
+    }
+
+    #[test]
+    fn as_capture_is_scrutinee_typed_and_visible_in_guard(/* #603, D11 */) {
+        // Proof the `as` capture carries the scrutinee's type (not `Unknown`):
+        // `n` flows into `int64` arithmetic. And it is in scope in the guard,
+        // not only the body — `if n > 0` references the capture.
+        ok(r#"
+def classify(int64 v):
+    match v:
+        case 1 | 2 | 3 as n if n > 0:
+            int64 doubled = n + n
+            print(doubled)
+        case other as whole:
+            print(other, whole)
+"#);
     }
 
     #[test]

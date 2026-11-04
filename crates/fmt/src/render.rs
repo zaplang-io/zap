@@ -469,6 +469,7 @@ pub fn pattern_str(p: &Pattern) -> String {
             Some(n) => format!("*{n}"),
             None => "*".to_string(),
         },
+        Pattern::As { pattern, name, .. } => format!("{} as {name}", pattern_str(pattern)),
     }
 }
 

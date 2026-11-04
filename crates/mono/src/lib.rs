@@ -2774,6 +2774,24 @@ impl Mono<'_> {
                 }
                 Ok(Pattern::Or(np, *span))
             }
+            Pattern::As {
+                pattern,
+                name,
+                span,
+            } => {
+                // Rewrite the inner pattern (so any generic-enum captures get
+                // concrete field types), then declare the `as` capture with the
+                // scrutinee's concrete type (D11, #603).
+                let inner = self.rewrite_pattern(pattern, scty, env)?;
+                if let Some(t) = scty {
+                    env.declare(name, CTy::Ty(t.clone()));
+                }
+                Ok(Pattern::As {
+                    pattern: Box::new(inner),
+                    name: name.clone(),
+                    span: *span,
+                })
+            }
             other => Ok(other.clone()),
         }
     }

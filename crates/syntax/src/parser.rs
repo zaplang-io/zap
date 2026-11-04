@@ -3980,7 +3980,29 @@ impl Parser {
 
     // --- patterns (match-case) ---
 
+    /// A full pattern: an or-pattern with an optional `as name` capture suffix
+    /// (`pattern ::= or_pattern [ "as" IDENT ]`, D11/#603). The `as` binds the
+    /// whole matched value and wraps the entire or-pattern, so `1 | 2 as n`
+    /// parses as `(1 | 2) as n`.
     fn parse_pattern(&mut self) -> Pattern {
+        let start = self.peek_span().start;
+        let inner = self.parse_or_pattern();
+        if self.eat_kw(Keyword::As) {
+            let name = self.pattern_capture_name();
+            Pattern::As {
+                pattern: Box::new(inner),
+                name,
+                span: self.span_from(start),
+            }
+        } else {
+            inner
+        }
+    }
+
+    /// `closed_pattern ("|" closed_pattern)*` — the alternatives of an
+    /// or-pattern, without the trailing `as` capture (that is handled one level
+    /// up in [`parse_pattern`]).
+    fn parse_or_pattern(&mut self) -> Pattern {
         let first = self.parse_closed_pattern();
         if self.is(&TokenKind::Pipe) {
             let start = self.peek_span().start;
@@ -3991,6 +4013,41 @@ impl Parser {
             Pattern::Or(alts, self.span_from(start))
         } else {
             first
+        }
+    }
+
+    /// The binding name after `as` in a pattern. It must be a single plain
+    /// identifier: `_` (wildcard), a dotted/qualified name, or any other token
+    /// is rejected with [`ErrorCode::ZAP2021`] (D11/#603).
+    fn pattern_capture_name(&mut self) -> String {
+        match self.ident_opt() {
+            Some((name, _)) if name == "_" => {
+                self.error_here(
+                    ErrorCode::ZAP2021,
+                    "`as` capture name cannot be `_`; drop the `as` to discard the value",
+                );
+                "<error>".to_string()
+            }
+            Some((name, _)) => {
+                // A dotted name (`as a.b`) is not a binding target.
+                if self.is(&TokenKind::Dot) {
+                    self.error_here(
+                        ErrorCode::ZAP2021,
+                        "`as` capture must be a single plain name, not a dotted name",
+                    );
+                    while self.eat(&TokenKind::Dot) {
+                        self.ident_opt();
+                    }
+                }
+                name
+            }
+            None => {
+                self.error_here(
+                    ErrorCode::ZAP2021,
+                    "expected a binding name after `as` in the pattern",
+                );
+                "<error>".to_string()
+            }
         }
     }
 
@@ -5400,6 +5457,101 @@ def demo(int64 n):
         };
         assert_eq!(path, &["Color".to_string(), "RED".to_string()]);
         assert!(args.is_none());
+    }
+
+    #[test]
+    fn as_pattern_capture_parses() {
+        // `pattern ::= or_pattern [ "as" IDENT ]` (D11, #603): the `as` binds
+        // the whole matched value and wraps the entire or-pattern, so
+        // `1 | 2 | 3 as n` parses as `(1 | 2 | 3) as n`, and `[x, y] as pair`
+        // wraps the sequence (the inner captures are still present).
+        let src = "def f(int64 v, list[int64] xs):\n    match v:\n\
+                   \x20       case 1 | 2 | 3 as n:\n            a()\n\
+                   \x20       case other as rest:\n            b()\n    match xs:\n\
+                   \x20       case [x, y] as pair:\n            c()\n";
+        let m = parse_ok(src);
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        // First match: the `as` wraps an or-pattern.
+        let Stmt::Match { arms, .. } = &f.body.stmts[0] else {
+            panic!("match");
+        };
+        let Pattern::As { pattern, name, .. } = &arms[0].pattern else {
+            panic!("expected an `as` capture over the or-pattern");
+        };
+        assert_eq!(name, "n");
+        assert!(
+            matches!(pattern.as_ref(), Pattern::Or(alts, _) if alts.len() == 3),
+            "the `as` must wrap the full 3-alternative or-pattern"
+        );
+        // `other as rest`: a bare capture wrapped by `as` (both names bind).
+        let Pattern::As { pattern, name, .. } = &arms[1].pattern else {
+            panic!("expected an `as` capture over a bare capture");
+        };
+        assert_eq!(name, "rest");
+        assert!(matches!(pattern.as_ref(), Pattern::Capture { name, .. } if name == "other"));
+        // Second match: the `as` wraps a sequence pattern, inner captures kept.
+        let Stmt::Match { arms, .. } = &f.body.stmts[1] else {
+            panic!("second match");
+        };
+        let Pattern::As { pattern, name, .. } = &arms[0].pattern else {
+            panic!("expected an `as` capture over the sequence");
+        };
+        assert_eq!(name, "pair");
+        assert!(
+            matches!(pattern.as_ref(), Pattern::Sequence(ps, _) if ps.len() == 2),
+            "the `as` must wrap the 2-element sequence pattern"
+        );
+    }
+
+    #[test]
+    fn nested_as_pattern_parses() {
+        // The `as` suffix is available at every sub-pattern position, so a
+        // nested capture inside a sequence element parses (`[x as a, y]`).
+        let src = "def f(list[int64] xs):\n    match xs:\n\
+                   \x20       case [x as a, y]:\n            a()\n";
+        let m = parse_ok(src);
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        let Stmt::Match { arms, .. } = &f.body.stmts[0] else {
+            panic!("match");
+        };
+        let Pattern::Sequence(ps, _) = &arms[0].pattern else {
+            panic!("sequence");
+        };
+        let Pattern::As { pattern, name, .. } = &ps[0] else {
+            panic!("nested `as` in the first element");
+        };
+        assert_eq!(name, "a");
+        assert!(matches!(pattern.as_ref(), Pattern::Capture { name, .. } if name == "x"));
+        assert!(matches!(&ps[1], Pattern::Capture { name, .. } if name == "y"));
+    }
+
+    #[test]
+    fn as_pattern_rejects_bad_capture_name() {
+        // `as _` is not a binding (ZAP2021): use the pattern without `as`.
+        let (_m, perrs, _l) =
+            parse_str("def f(int64 v):\n    match v:\n        case 1 as _:\n            a()\n");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2021),
+            "expected ZAP2021 for `as _`, got {perrs:?}"
+        );
+        // `as` followed by a non-identifier (a literal) is also rejected.
+        let (_m, perrs, _l) =
+            parse_str("def f(int64 v):\n    match v:\n        case 1 as 2:\n            a()\n");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2021),
+            "expected ZAP2021 for `as <non-ident>`, got {perrs:?}"
+        );
+        // A dotted capture target `as a.b` is rejected.
+        let (_m, perrs, _l) =
+            parse_str("def f(int64 v):\n    match v:\n        case 1 as a.b:\n            a()\n");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2021),
+            "expected ZAP2021 for a dotted `as` target, got {perrs:?}"
+        );
     }
 
     #[test]
