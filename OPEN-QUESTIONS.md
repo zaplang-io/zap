@@ -89,10 +89,11 @@ _Last updated: 2026-10-22_
   (`reflect_has` / `reflect_names`, see `design/RUNTIME-ABI.md` §"Decorators &
   reflection", #16). The built-in set is now complete (I#472): `@derive(...)`,
   `@default`/`@validate`/`@range` (D-0101) and `@deprecated` (D-0109) are
-  implemented; `@cache` and `@inject` are reclassified/deferred (D-0109) —
-  `@cache` is gated on a future **module-level persistent state** language
-  feature (its only real blocker, #658), and `@inject`'s DI is met by reflection-driven
-  `Depends(...)` adapters (D-0089/D-0092), not a core decorator. Still open: the
+  implemented. `@cache` is **deferred** (D-0109), gated on the **module-level
+  persistent state** language feature (its only real blocker — epic #661,
+  prerequisite #658, built-in #666); `@inject` is **declined for core** (D-0109)
+  — DI is a framework concern met by reflection-driven `Depends(...)` adapters
+  (D-0089/D-0092), with no planned core `@inject`. Still open: the
   macro API (what a decorator sees/emits) and hygiene rules; `@validate(matches=…)`
   regex validation; richer reflection (field-level metadata, annotation argument
   values).
