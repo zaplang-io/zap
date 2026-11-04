@@ -177,16 +177,20 @@ not supported — it may change in **any** release, including a PATCH:
 - **Experimental and Internal surfaces** (§4). Everything not on the Stable list
   produced by #206 is outside the promise, whether or not it happens to be
   reachable.
-- **Built-in decorators not in the v1 set** — `@cache` and `@inject` (I#472,
-  D-0109). **`@cache` is deferred**: gated on the module-level-persistent-state
-  language feature (epic #661, prerequisite #658; the built-in itself #666); its
-  first phase — module-level `const` (#658, D-0112) — has landed, so `@cache` is
-  unblocked pending the mutable phase; if added later it ships **Experimental**
-  first (§4). **`@inject` is declined for core**: dependency injection is a
-  framework concern, provided by reflection-driven `Depends(...)` adapters
-  (D-0089/D-0092), not a core decorator — there is no planned core `@inject`.
-  Both names stay reserved and are rejected with `ZAP5055`; for `@inject` the
-  diagnostic is a redirect to `Depends(...)`.
+- **`@cache` built-in** (I#666, D-0115 — **Experimental**). Now that epic #661
+  landed module-level persistent state, `@cache` ships as the memoization
+  decorator: ordinary, `zap expand`-visible, type-checked Zap over a
+  `@shareable` module-level dict (no hidden store), keyed by the argument tuple,
+  unbounded for the process lifetime in v1 (a documented memory cost). It
+  supersedes the D-0109 `@cache` deferral. An un-memoizable signature (a
+  non-hashable, variadic, zero-parameter, generic, or no-return function, or a
+  method, or `@cache` arguments) is a stable `ZAP5056` error. Experimental:
+  surface (e.g. a future `maxsize`/LRU option) may still change pre-1.0.
+- **Built-in decorator not in the v1 set** — `@inject` (I#472, D-0109).
+  **`@inject` is declined for core**: dependency injection is a framework
+  concern, provided by reflection-driven `Depends(...)` adapters (D-0089/D-0092),
+  not a core decorator — there is no planned core `@inject`. The name stays
+  reserved and is rejected with `ZAP5055`, a redirect to `Depends(...)`.
 - **Module-level persistent state** (epic #661, D-0112) — **Experimental**. The
   module-level `const` form (#658 Phase 1) and the **mutable** form (#662 Phase
   2 — `T NAME = expr`, reassignable and mutable, a permanent GC root when

@@ -1250,9 +1250,9 @@ omitting `return inner` are stable errors (ZAP5052/ZAP5054). When the inlined
 body is not provably return-terminating (e.g. `retry`'s loop), an implicit
 `raise RuntimeError(...)` fall-through guard is appended so the wrapper
 type-checks. A `wrap` stacks with other decorators bottom-up like any wrapper.
-(An `args`-keyed `memoize`/`@cache` is not expressible by `wrap`: it needs
-persistent cross-call state, a separate capability — which is why `@cache` is
-deferred, see below.)
+(An `args`-keyed `memoize` is not expressible by `wrap` alone: it needs
+persistent cross-call state. The built-in **`@cache`** supplies exactly that,
+over a module-level dict — see below.)
 
 **Field decorators** — construction-time defaults (per-instance), validation,
 and derive-driven codegen (pydantic-style, zero runtime cost):
@@ -1269,8 +1269,9 @@ struct Signup:
 Multiple decorators stack bottom-up. `zap expand` shows the generated code.
 
 **Built-ins (v1):** `@derive(...)`, `@default`, `@validate`, `@range` (all
-compile-time code generation, D-0101), **`@deprecated`** (I#472, D-0109), and
-**`@shareable`** (I#664, D-0113). `@deprecated(msg?)` is a function/method
+compile-time code generation, D-0101), **`@deprecated`** (I#472, D-0109),
+**`@shareable`** (I#664, D-0113), and **`@cache`** (I#666, D-0115).
+`@deprecated(msg?)` is a function/method
 decorator that generates no code but emits a non-fatal **use-site warning**
 (`ZAP5124`) at every call site of the decorated callable — the mechanism for
 retiring a Stable surface with notice (STABILITY.md §5). An optional message is
@@ -1279,14 +1280,34 @@ appended (`@deprecated("use X")`). **`@shareable`** is a no-argument marker on a
 unverified claim); it generates no code, is reflectable via
 `reflect_has(T, "shareable")`, and drives the sharing lint (§12.1).
 
-**Not in the v1 set (I#472/D-0109):** `@cache` is **deferred** — it needs
-module-level persistent state, not yet a language feature (and the "separate
-capability" the user-level `wrap` lacks, above); tracked in I#658/I#661 (the
-built-in itself in I#666). `@inject` is **declined for core** — dependency
-injection is a framework concern, served by reflection-driven `Depends(...)`
-adapters (D-0089/D-0092), not a core decorator; there is no planned core
-`@inject`. Both names stay reserved and are rejected with a dedicated diagnostic
-(`ZAP5055`) — for `@inject`, a redirect to `Depends(...)`.
+**`@cache`** memoizes a free function by its argument tuple. It is expanded —
+before type-checking, and so `zap expand`-visible — into ordinary, type-checked
+Zap over a **module-level dict** (never a hidden compiler store, a hard rule):
+
+```python
+@cache
+def fib(int64 n) -> int64:
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+```
+
+generates a `@derive(Hash, Eq)` key-struct (the typed argument tuple, as a named
+struct), a `@shareable` store struct holding a `Mutex` handle and the memo
+`dict`, an immortal module global, and a wrapper that returns a cached hit or
+computes-and-stores a miss — so the body runs exactly once per distinct argument
+tuple. The miss result is computed *outside* the lock (so a recursive `@cache`
+function cannot self-deadlock, and recursion goes through the memoizing wrapper);
+the lock guards only the dict bookkeeping, matching `functools.lru_cache`. v1
+takes no arguments and is **unbounded for the process lifetime** — a documented
+memory cost, since the global is an immortal GC root (D-0115), not an eviction
+policy. Every parameter must be hashable and the function must return a value,
+or it is a stable error (`ZAP5056`); `@cache` is a free-function decorator in v1
+and stacks bottom-up with other decorators.
+
+**Not in the v1 set (I#472/D-0109):** `@inject` is **declined for core** —
+dependency injection is a framework concern, served by reflection-driven
+`Depends(...)` adapters (D-0089/D-0092), not a core decorator; there is no
+planned core `@inject`. It stays reserved and is rejected with a dedicated
+diagnostic (`ZAP5055`) that redirects to `Depends(...)`.
 
 ## 17. Toolchain & CLI (D-0053)
 
