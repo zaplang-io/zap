@@ -86,6 +86,18 @@ fn module_const_names(m: &Module) -> Vec<String> {
         .collect()
 }
 
+/// Collect every module-level binding name (const and mutable alike) from a
+/// merged module, in merged (import-topological + source) order (D-0112).
+fn module_binding_names(m: &Module) -> Vec<String> {
+    m.items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Stmt(Stmt::Let { name, .. }) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn single_file_no_imports_is_unchanged() {
     let p = Project::new("single");
@@ -192,18 +204,35 @@ fn top_level_statement_in_imported_module_is_rejected() {
 }
 
 #[test]
-fn top_level_binding_before_decorated_def_is_diagnosed_not_ice() {
-    // The exact ticket #459 repro: a module-level binding before a decorated
-    // `def`. This used to hit `unreachable!("entry statements handled via merge
-    // list")` in the rewrite. It must be a clean diagnostic, not a panic. A
-    // module-level mutable declaration-with-initializer (`auto app = App(0)`)
-    // is now the #658 Phase 2 surface, so it is reported as ZAP3018 (not the
-    // blanket executable-statement ZAP3016) — pointing the author at the planned
-    // mutable-global support.
+fn top_level_mutable_binding_before_def_links_not_ice() {
+    // The ticket #459 shape: a module-level binding before a `def`. This used to
+    // hit `unreachable!("entry statements handled via merge list")` in the
+    // rewrite. A module-level mutable declaration (`int64 counter = 0`) is now a
+    // persistent mutable global (D-0112, #662 Phase 2), so it links cleanly —
+    // the regression guard is that it neither panics nor is rejected.
     let p = Project::new("entrystmt_ice");
     p.write(
         "src/main.zap",
-        "auto app = App(0)\n@app.get(\"/x\")\ndef h() -> int64:\n    return 0\n",
+        "int64 counter = 0\n\ndef main() -> int64:\n    counter += 1\n    return counter\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+    assert!(
+        module_binding_names(&m).iter().any(|n| n == "counter"),
+        "the mutable global is a module member"
+    );
+}
+
+#[test]
+fn module_level_tuple_destructuring_is_rejected() {
+    // A module-level tuple-destructuring declaration (`int64 a, b = ...`) is NOT
+    // a single-name binding, so it is not admitted at module scope — each
+    // binding must be declared on its own line (ZAP3018, D-0112). This is the
+    // one declaration-with-initializer form still rejected after #662.
+    let p = Project::new("entry_tuple_decl");
+    p.write(
+        "src/main.zap",
+        "auto a, b = (1, 2)\n\ndef main() -> int64:\n    return a + b\n",
     );
     let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
     assert!(
@@ -223,17 +252,31 @@ fn top_level_executable_statement_in_entry_is_rejected() {
 }
 
 #[test]
-fn top_level_statement_between_defs_in_entry_is_rejected() {
-    // Interleaving places too: a declaration sandwiched between two `def`s. A
-    // module-level mutable `auto x = 2` is the #658 Phase 2 surface, so it is
-    // rejected as ZAP3018 (mutable-not-yet), wherever it sits.
+fn top_level_executable_statement_between_defs_in_entry_is_rejected() {
+    // Interleaving places too: a bare executable statement sandwiched between two
+    // `def`s is still rejected (ZAP3016) — it would never run. A module-level
+    // declaration (`auto x = 2`) IS now admitted here (D-0112, #662), so the
+    // rejected case uses a genuine executable statement.
     let p = Project::new("entrystmt_between");
     p.write(
         "src/main.zap",
-        "def a() -> int64:\n    return 1\nauto x = 2\ndef main() -> int64:\n    return a()\n",
+        "def a() -> int64:\n    return 1\nprint(1)\ndef main() -> int64:\n    return a()\n",
     );
     let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
-    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3018));
+    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3016));
+}
+
+#[test]
+fn module_mutable_binding_between_defs_in_entry_is_allowed() {
+    // A module-level mutable binding may sit anywhere among the top-level items
+    // (D-0112, #662) — it is a declaration, not an executable statement.
+    let p = Project::new("mutglobal_between");
+    p.write(
+        "src/main.zap",
+        "def a() -> int64:\n    return 1\nauto x = 2\ndef main() -> int64:\n    return a() + x\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(module_binding_names(&m).iter().any(|n| n == "x"));
 }
 
 #[test]
@@ -289,19 +332,57 @@ fn module_const_is_allowed_and_reachable_across_modules() {
 }
 
 #[test]
-fn module_mutable_binding_in_entry_is_rejected_with_phase2_code() {
-    // A module-level mutable declaration-with-initializer is the #658 Phase 2
-    // surface — rejected with ZAP3018 (not the blanket ZAP3016), pointing the
-    // author at the planned support.
+fn module_mutable_binding_in_entry_is_allowed() {
+    // A module-level mutable binding (D-0112, #662 Phase 2) is persistent
+    // mutable state, not a rejected top-level statement: the program links and
+    // the binding is a module member.
     let p = Project::new("entry_mutglobal");
     p.write(
         "src/main.zap",
-        "int64 counter = 0\n\ndef main() -> int64:\n    return counter\n",
+        "int64 counter = 0\n\ndef main() -> int64:\n    counter = counter + 1\n    return counter\n",
     );
-    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+    assert!(module_binding_names(&m).iter().any(|n| n == "counter"));
+}
+
+#[test]
+fn module_mutable_binding_is_allowed_and_reachable_across_modules() {
+    // A mutable global declared in an imported module is a module member, like a
+    // `const`: reachable as `alias.NAME`, mangled with the module prefix so it
+    // never collides with a same-named global in the importer, and ordered
+    // dependency-first for eager init (D-0112, #662).
+    let p = Project::new("mutglobal_xmod");
+    p.write(
+        "src/state.zap",
+        "int64 counter = 0\ndef tick() -> int64:\n    counter += 1\n    return counter\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import state\n\nint64 counter = 100\n\ndef main() -> int64:\n    return state.tick() + counter\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+    let names = module_binding_names(&m);
     assert!(
-        err.iter().any(|d| d.code == ErrorCode::ZAP3018),
-        "expected ZAP3018, got {err:?}"
+        names.iter().any(|n| n == "counter"),
+        "entry global kept its bare name, got {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n != "counter" && n.ends_with("counter")),
+        "imported global mangled with module prefix, got {names:?}"
+    );
+    // Import-topological order: the dependency's global initializes before the
+    // entry's (its slot is declared first in the merged item list).
+    let dep = names
+        .iter()
+        .position(|n| n != "counter" && n.ends_with("counter"));
+    let own = names.iter().position(|n| n == "counter");
+    assert!(
+        dep < own,
+        "dependency global must precede entry global: {names:?}"
     );
 }
 

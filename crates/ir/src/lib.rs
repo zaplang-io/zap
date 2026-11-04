@@ -2344,4 +2344,129 @@ def main():
         let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
         assert_eq!(count_calls(main, "__zap_init_globals"), 0);
     }
+
+    // ---- module-level mutable globals (D-0112, #662 Phase 2) --------------
+
+    fn global_addrs(f: &zapc_ir_core::Func) -> Vec<u32> {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::GlobalAddr { idx, .. } => Some(*idx),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count_stores(f: &zapc_ir_core::Func) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::Store { .. }))
+            .count()
+    }
+
+    #[test]
+    fn module_mutable_scalar_lowers_to_global_like_const() {
+        // A mutable module global is lowered identically to a `const` one: a
+        // single scalar slot, recorded by name, initialized by
+        // `@__zap_init_globals`, read via GlobalAddr + Load.
+        let m = lower_ok("int64 N = 7\ndef main() -> int64:\n    return N\n");
+        assert_eq!(m.globals.len(), 1);
+        assert_eq!(m.globals[0].name, "N");
+        assert_eq!(m.globals[0].ty, Ty::I64);
+        let init = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "__zap_init_globals")
+            .expect("init function emitted");
+        assert!(
+            global_addrs(init).contains(&0),
+            "init stores into global #0"
+        );
+        // A scalar slot is NOT registered as a GC root.
+        assert_eq!(count_calls(init, "zap_gc_add_root"), 0);
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(count_calls(main, "__zap_init_globals"), 1);
+        assert!(global_addrs(main).contains(&0), "main reads global #0");
+    }
+
+    #[test]
+    fn module_mutable_reassignment_stores_through_the_global_slot() {
+        // The Phase-2 write path: reassigning a mutable module global inside a
+        // function lowers to a `GlobalAddr` + `Store` into the slot (NOT an
+        // alloca). The `set` function has no locals, so its only store must
+        // target the global slot.
+        let m = lower_ok(
+            "int64 N = 0\ndef store_n():\n    N = 5\ndef main() -> int64:\n    store_n()\n    return N\n",
+        );
+        let store_n = m.funcs.iter().find(|f| f.name == "store_n").unwrap();
+        assert!(
+            global_addrs(store_n).contains(&0),
+            "reassignment addresses global #0"
+        );
+        assert_eq!(
+            count_stores(store_n),
+            1,
+            "reassignment stores exactly once, into the global slot"
+        );
+    }
+
+    #[test]
+    fn module_mutable_augassign_reads_and_writes_the_global_slot() {
+        // `N += 1` on a mutable global is a read-modify-write through the slot:
+        // one GlobalAddr, a Load from it, and a Store back into it.
+        let m = lower_ok("int64 N = 0\ndef bump():\n    N += 1\ndef main() -> int64:\n    bump()\n    return N\n");
+        let bump = m.funcs.iter().find(|f| f.name == "bump").unwrap();
+        assert!(global_addrs(bump).contains(&0));
+        assert_eq!(count_stores(bump), 1, "aug-assign stores back once");
+        assert!(
+            bump.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Load { .. })),
+            "aug-assign loads the current value"
+        );
+    }
+
+    #[test]
+    fn module_mutable_reference_type_is_rooted() {
+        // A pointer-typed mutable global is a permanent GC root, exactly like a
+        // reference `const`: `@__zap_init_globals` registers the slot once with
+        // `zap_gc_add_root`, so the Boehm collector keeps whatever heap object
+        // the slot currently holds (including after reassignment/growth) live.
+        let m = lower_ok(
+            "list[int64] XS = [1, 2, 3]\ndef grow():\n    XS.append(4)\ndef main() -> int64:\n    grow()\n    return len(XS)\n",
+        );
+        assert_eq!(m.globals.len(), 1);
+        assert!(matches!(m.globals[0].ty, Ty::List(_)));
+        let init = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "__zap_init_globals")
+            .unwrap();
+        assert_eq!(
+            count_calls(init, "zap_gc_add_root"),
+            1,
+            "a reference-typed mutable global slot must be rooted"
+        );
+    }
+
+    #[test]
+    fn module_mutable_and_const_coexist_in_declaration_order() {
+        // Const and mutable globals share one slot table, indexed in source
+        // order; a later mutable initializer may read an earlier const.
+        let m =
+            lower_ok("const int64 A = 10\nint64 B = A + 5\ndef main() -> int64:\n    return B\n");
+        assert_eq!(m.globals.len(), 2);
+        assert_eq!(m.globals[0].name, "A");
+        assert_eq!(m.globals[1].name, "B");
+        let init = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "__zap_init_globals")
+            .unwrap();
+        let addrs = global_addrs(init);
+        assert!(addrs.contains(&0) && addrs.contains(&1));
+    }
 }

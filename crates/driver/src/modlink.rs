@@ -359,18 +359,20 @@ impl<'t> Loader<'t> {
     /// error rather than a no-op, in the entry module (ZAP3016) and imported
     /// modules alike (ZAP3014, which also keeps them declaration-only).
     ///
-    /// Three constructs are admitted at module scope and skipped here:
+    /// These constructs are admitted at module scope and skipped here:
     ///   * a **module docstring** (D-0041): a bare, non-f-string string literal
     ///     carries no behaviour;
-    ///   * a **module-level `const` declaration** (`const T NAME = expr`,
-    ///     D-0112 / #658 Phase 1): persistent immutable state, initialized once
+    ///   * a **module-level single-name declaration** — `const T NAME = expr`
+    ///     (immutable, D-0112 / #658 Phase 1) or `T NAME = expr` (mutable,
+    ///     D-0112 / #662 Phase 2): persistent module state, initialized once
     ///     before `main`. Lowering turns it into a module global (see
     ///     `zapc_ir`), so — unlike a bare statement — it does lower to code.
+    ///     Constness only governs reassignment (sema, ZAP3017), not admission.
     ///
-    /// A module-level **mutable** declaration-with-initializer (`T NAME = expr`,
-    /// or any tuple-destructuring declaration) is a planned #658 Phase 2 surface
-    /// that is not available yet; it gets its own diagnostic (ZAP3018) pointing
-    /// at that phase rather than the blanket executable-statement code.
+    /// A module-level **tuple-destructuring** declaration (`T a, b = expr`, const
+    /// or not) is not supported: each binding must be declared on its own line.
+    /// It gets its own diagnostic (ZAP3018) rather than the blanket
+    /// executable-statement code.
     fn check_toplevel_statements(&mut self) {
         let mut found = Vec::new();
         for m in &self.modules {
@@ -379,21 +381,18 @@ impl<'t> Loader<'t> {
                     if is_doc_stmt(st) {
                         continue;
                     }
-                    // A module-level `const T NAME = expr` is persistent
-                    // immutable state (D-0112, #658 Phase 1) — allowed.
-                    if matches!(st, Stmt::Let { is_const: true, .. }) {
+                    // A single-name module-level declaration-with-initializer is
+                    // persistent module state (D-0112): `const T NAME = expr`
+                    // (immutable, #658 Phase 1) or `T NAME = expr` (mutable, #662
+                    // Phase 2). Both are admitted; constness only governs whether
+                    // the binding may later be reassigned (sema, ZAP3017).
+                    if matches!(st, Stmt::Let { .. }) {
                         continue;
                     }
-                    // A module-level mutable declaration-with-initializer (a
-                    // non-const `Let`, or any tuple-destructuring `LetTuple`,
-                    // const or not) is #658 Phase 2 — not available yet.
-                    let code = if matches!(
-                        st,
-                        Stmt::Let {
-                            is_const: false,
-                            ..
-                        } | Stmt::LetTuple { .. }
-                    ) {
+                    // A module-level tuple-destructuring declaration (`T a, b =
+                    // expr`, const or not) is not supported — each binding must be
+                    // declared on its own line (ZAP3018).
+                    let code = if matches!(st, Stmt::LetTuple { .. }) {
                         ErrorCode::ZAP3018
                     } else if m.is_entry {
                         ErrorCode::ZAP3016
@@ -406,22 +405,22 @@ impl<'t> Loader<'t> {
         }
         for (code, span, file) in found {
             let message = if code == ErrorCode::ZAP3018 {
-                "module-level mutable state is not supported yet (#658 Phase 2): \
-                 only a module-level `const` declaration (`const T NAME = expr`) \
-                 is available today — make it `const`, or move the mutable state \
-                 into a function"
+                "module-level tuple-destructuring declaration is not supported: \
+                 declare each binding on its own line (`T a = ...`) — only \
+                 single-name module-level declarations (`const T NAME = expr` or \
+                 `T NAME = expr`) are admitted at module scope"
                     .to_string()
             } else if code == ErrorCode::ZAP3016 {
                 "top-level executable statement: a compiled program runs from \
                  `def main()`, so this would never run — move it (and any \
                  `@receiver.method(...)` decorator on a `def`) into `def main()` \
-                 (a module-level `const` declaration is allowed)"
+                 (a module-level `const` or mutable declaration is allowed)"
                     .to_string()
             } else {
                 "top-level statements are not allowed in an imported module \
-                 (only declarations, a module-level `const`, and a leading \
-                 docstring); move executable code into a function the importer \
-                 calls"
+                 (only declarations, module-level `const`/mutable bindings, and a \
+                 leading docstring); move executable code into a function the \
+                 importer calls"
                     .to_string()
             };
             self.diag(code, message, span, &file);
@@ -480,8 +479,9 @@ impl<'t> Loader<'t> {
 
         // Emit modules in import-topological order — a module after every module
         // it imports (D-0081 graph is acyclic; cycles are already rejected). This
-        // makes the merged item list carry module-level `const` declarations
-        // (D-0112, #658) in their eager init order: a dependency's globals come
+        // makes the merged item list carry module-level declarations (const and
+        // mutable, D-0112, #658/#662) in their eager init order: a dependency's
+        // globals come
         // before a dependent's, and source order is preserved within a module.
         // Reordering is otherwise behaviour-neutral — every other top-level item
         // is a definition, not executed in order.
@@ -626,16 +626,12 @@ fn top_level_symbols(ast: &Module) -> HashSet<String> {
             Item::Interface(i) => {
                 s.insert(i.name.clone());
             }
-            // A module-level `const` binding (D-0112, #658 Phase 1) is a module
-            // member like any other top-level declaration: it is visible to the
-            // module's own code, mangled with the module prefix, and reachable
-            // across modules as `alias.NAME` (unless `_`-private). Non-const
-            // top-level statements never reach here (rejected before merge).
-            Item::Stmt(Stmt::Let {
-                is_const: true,
-                name,
-                ..
-            }) => {
+            // A module-level binding (D-0112) — `const` (#658) or mutable (#662)
+            // — is a module member like any other top-level declaration: it is
+            // visible to the module's own code, mangled with the module prefix,
+            // and reachable across modules as `alias.NAME` (unless `_`-private).
+            // Other top-level statements never reach here (rejected before merge).
+            Item::Stmt(Stmt::Let { name, .. }) => {
                 s.insert(name.clone());
             }
             _ => {}

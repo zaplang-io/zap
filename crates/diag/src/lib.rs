@@ -343,17 +343,18 @@ define_codes! {
          (D-0081/D-0021, ticket #459). Move it — and any registering decorator \
          such as `@app.get(...)` on a `def` — inside `def main()` (or another \
          function). A leading bare-string module docstring is still allowed. \
-         A module-level `const` declaration (`const T NAME = expr`) is allowed \
-         (D-0112, #658 Phase 1).";
+         A module-level declaration — `const T NAME = expr` (immutable, #658) or \
+         `T NAME = expr` (mutable, #662) — is allowed (D-0112).";
     ZAP3017 = 3017 : "assignment to a constant binding",
         "A `const` binding is immutable (D-0003): it cannot be reassigned, \
          augmented (`+=`), or otherwise rebound after its declaration. Declare \
          it without `const` if the binding must change.";
-    ZAP3018 = 3018 : "module-level mutable variable not yet supported",
-        "A module-level mutable binding (`T NAME = expr` at module scope) is not \
-         supported yet (D-0112, #658 Phase 2). Only module-level `const` \
-         declarations (`const T NAME = expr`) are available today; make it \
-         `const`, or move the mutable state into a function.";
+    ZAP3018 = 3018 : "module-level tuple-destructuring declaration not supported",
+        "A module-level declaration that destructures a tuple (`T a, b = expr`) \
+         is not supported (D-0112). Declare each binding on its own line \
+         (`T a = ...`). Only single-name module-level declarations are admitted \
+         at module scope: `const T NAME = expr` (immutable, #658) and \
+         `T NAME = expr` (mutable, #662).";
 
     // ---- ZAP4xxx — type checking -------------------------------------------
     ZAP4001 = 4001 : "type mismatch in assignment",

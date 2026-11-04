@@ -25,6 +25,24 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Module-level mutable globals** — persistent, reassignable state at module
+  scope (#662, D-0112; Phase 2 of the module-level-persistent-state epic #661,
+  building on the `const` form from #658). A `T NAME = expr` (or
+  `auto NAME = expr`) at module top level — scalars and reference/heap types
+  alike — is evaluated **once before `main`** in the same import-topological +
+  source order as `const`, is a module member reachable across modules as
+  `module.NAME`, and may then be **reassigned** (`=`, `+=`) and **mutated**
+  (container contents) from any function, persisting for the process lifetime.
+  There is no `global` keyword: a bare assignment to a name that resolves to a
+  module binding reassigns it in place (static lexical scoping, D-0021/D-0090).
+  A reference-typed mutable global is a **permanent GC root** (its data-segment
+  slot address is registered, so the collector keeps whatever heap object it
+  currently holds live — including after reassignment or growth — under both the
+  conservative Boehm and precise Immix collectors). Concurrency is the light
+  Go/Python model of #661 (unsynchronized, never implicitly locked); the static
+  sharing lint, the `@shareable` marker, and precise-Immix write barriers (#663)
+  are later work. A module-level tuple-destructuring declaration stays rejected
+  (**ZAP3018**); a `const` module binding stays immutable (**ZAP3017**).
 - **Module-level `const`** — persistent, immutable state at module scope (#658,
   D-0112; Phase 1 of the module-level-persistent-state epic #661). A
   `const T NAME = expr` (or `const auto NAME = expr`) at module top level, for

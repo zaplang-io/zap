@@ -48,25 +48,28 @@ item          ::= function
                 | decorator_def
                 | import
                 | cfg_item          (* `when target.*` conditional compilation (I#139) *)
-                | module_const      (* module-level persistent state (D-0112, #658) *)
+                | module_binding    (* module-level persistent state (D-0112, #658/#662) *)
                 | statement ;
                   (* The parser accepts a statement here for recovery and AST
                      compatibility, but module linking rejects executable
                      statements (ZAP3016 in the entry module, ZAP3014 in an
-                     imported module) and a module-level MUTABLE declaration
-                     (ZAP3018, reserved for #658 Phase 2). A bare module
-                     docstring is allowed, and a module-level `const`
-                     declaration is accepted (module_const); see SPEC §3.1 and
-                     D-0112/D-0090. *)
+                     imported module) and a module-level tuple-destructuring
+                     declaration (ZAP3018). A bare module docstring is allowed,
+                     and a single-name module-level binding is accepted
+                     (module_binding); see SPEC §3.1 and D-0112/D-0090. *)
 
-module_const  ::= "const" ( type | "auto" ) IDENT "=" expr NEWLINE ;
-                  (* module-level `const` (D-0112, #658 Phase 1): persistent,
-                     immutable state, evaluated once before `main` in
-                     import-topological + source order. Single-name only (a
-                     module-level tuple-destructuring or mutable declaration is
-                     not admitted in Phase 1). Parsed as the same `decl` node as
-                     a statement-level const; it is the module linker that admits
-                     the const form at module scope and rejects the rest. *)
+module_binding ::= [ "const" ] ( type | "auto" ) IDENT "=" expr NEWLINE ;
+                  (* module-level persistent state (D-0112): `const T NAME = expr`
+                     (immutable, #658 Phase 1) and `T NAME = expr` (mutable, #662
+                     Phase 2). Evaluated once before `main` in import-topological
+                     + source order; a mutable binding may then be reassigned and
+                     mutated from any function (the light concurrency model of
+                     epic #661 — no `global` keyword, a bare assignment to the
+                     name reassigns it). Single-name only: a module-level
+                     tuple-destructuring declaration is NOT admitted (ZAP3018).
+                     Parsed as the same `decl` node as a statement-level binding;
+                     it is the module linker that admits the single-name form at
+                     module scope and rejects the rest. *)
 
 (* ---------- Decorators & annotations (D-0036) ---------- *)
 
