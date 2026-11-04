@@ -38,6 +38,69 @@ mod tests {
     }
 
     #[test]
+    fn raw_crypto_results_support_inferred_bytes_operations() {
+        // #647: compile the reduced repro for every affected API. No runtime or
+        // randomness is involved; direct operations on auto locals lost bytes.
+        for expression in [
+            "crypto.digest(crypto.sha256_new())",
+            "crypto.hmac_sha256_raw(b\"key\", b\"message\")",
+            "crypto.random_bytes(4)",
+        ] {
+            lower_ok(&format!(
+                r#"def main():
+    auto result = {expression}
+    auto extended = result + b"x"
+    auto first = result[0]
+    auto sliced = result[1:]
+    auto same = result == b"independent bytes"
+"#
+            ));
+        }
+    }
+
+    #[test]
+    fn crypto_result_types_distinguish_buffers_text_and_handles() {
+        // Guard the boundary: opaque streaming contexts are not digest buffers,
+        // and the existing hex/string APIs must keep string operation dispatch.
+        let module = lower_ok(
+            r#"def main():
+    auto h = crypto.sha256_new()
+    auto digest = crypto.digest(h)
+    auto hex_digest = crypto.hexdigest(h)
+    auto raw_mac = crypto.hmac_sha256_raw(b"key", b"message")
+    auto hex_mac = crypto.hmac_sha256(b"key", b"message")
+    auto random = crypto.random_bytes(4)
+    auto token = crypto.token_hex(4)
+"#,
+        );
+        let main = module.funcs.iter().find(|f| f.name == "main").unwrap();
+        for (symbol, expected) in [
+            ("zap_crypto_new", Ty::Ptr),
+            ("zap_crypto_digest", Ty::Bytes),
+            ("zap_crypto_hexdigest", Ty::Ptr),
+            ("zap_crypto_hmac_sha256_raw", Ty::Bytes),
+            ("zap_crypto_hmac_sha256", Ty::Ptr),
+            ("zap_crypto_random_bytes", Ty::Bytes),
+            ("zap_crypto_token_hex", Ty::Ptr),
+        ] {
+            let result = main
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find_map(|i| match i {
+                    Inst::Call {
+                        dest: Some(d),
+                        func,
+                        ..
+                    } if func == symbol => Some(*d),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {symbol}"));
+            assert_eq!(main.value_ty(result), expected, "result type of {symbol}");
+        }
+    }
+
+    #[test]
     fn rsa_sign_results_support_inferred_bytes_operations() {
         // Compile-only: invalid PEM is never executed. This is the reduced
         // #644 regression; both APIs must support byte operations on auto locals.

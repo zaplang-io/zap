@@ -848,6 +848,14 @@ accurate.
   package manager D-0052, not bundled): `sqlite3`, `xml`, `email`, and future
   libraries.
 
+**Crypto binary results (#647).** Actual byte buffers from `crypto.digest`,
+`crypto.hmac_sha256_raw`, and `crypto.random_bytes` retain `Ty::Bytes` during IR
+lowering, matching their semantic types and enabling binary operations on
+inferred locals. Hex/text results retain string dispatch; streaming `_new`
+results remain opaque context handles. The shared `ZapStr*` runtime ABI is
+unchanged. `crypto_byte_results` covers known answers, binary operations,
+streaming finalization, and random-buffer boundaries.
+
 **Imports** are whole-module with flat names (`import datetime` → `datetime.now()`);
 Zap deliberately has **no `from X import Y`**. The **concurrency model**
 (coroutines/channels/`scope`/`sync`) **replaces** Python's

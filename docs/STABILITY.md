@@ -372,6 +372,11 @@ RSA verifier configuration failures have optional DEBUG diagnostics through
 `logging`; ordinary mismatches remain quiet. The fixed diagnostics exclude key,
 message, and signature contents, and do not change the boolean return contract.
 
+The experimental `crypto.digest`, `crypto.hmac_sha256_raw`, and
+`crypto.random_bytes` APIs preserve binary `bytes` typing through lowering
+(#647). This corrects operations on inferred locals without changing their
+stability tier, pointer ABI, text-returning counterparts, or opaque hash handles.
+
 The `http` client verbs `get`/`post`/`request` gained an **optional trailing
 `dict[str, str]` of request headers** (#280) and already expose response
 `status`/`header`/`body` accessors, and the server-side `http.respond` gained

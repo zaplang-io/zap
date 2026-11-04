@@ -223,6 +223,11 @@ The experimental `crypto.rsa_*` APIs accept ordinary RSA PEM keys and use
 PKCS#1 v1.5 padding. Other key families, including RSA-PSS-only keys, are
 rejected; see [D-0102](DECISIONS.md#d-0102--crypto-rsa-pkcs1-v15-signing-i628).
 
+`crypto.digest`, `crypto.hmac_sha256_raw`, and `crypto.random_bytes` return
+binary `bytes`, supporting indexing, slicing, concatenation, and equality on
+inferred variables. Streaming hash constructors return opaque handles for
+`crypto.update`/`digest`/`hexdigest`; hex APIs return text.
+
 Both RSA sign APIs return binary `bytes`, supporting indexing, slicing,
 concatenation, and equality on inferred signature variables.
 

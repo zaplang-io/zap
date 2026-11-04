@@ -17,6 +17,9 @@
    RSA verification DEBUG diagnostics use the existing logging configuration;
    shared RSA validation helpers do not affect call syntax.
 
+   Raw crypto buffer result typing (#647) uses the existing bytes type and
+   call grammar; there are no new syntax productions.
+
    Notation:
      ::=        definition
      |          alternation

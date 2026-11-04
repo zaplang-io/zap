@@ -53,6 +53,10 @@ separate work (#643); this correction does not complete asymmetric JWT support.
 The RSA implementation shares its key-family/padding policy between sign and
 verify, with optional DEBUG diagnostics for verifier configuration failures.
 
+Raw digest, HMAC, and random-buffer results now preserve binary `bytes` typing
+through IR lowering (#647). Known-answer and boundary tests cover both native
+collectors; this correction does not add an algorithm or change the runtime ABI.
+
 ## Phase 3 — Signature features (parallel tracks)
 
 Once the IR schema and runtime ABI are frozen, these run concurrently:

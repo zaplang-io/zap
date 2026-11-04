@@ -1,11 +1,11 @@
 //! `crypto` module — lowering facet (ticket #105, D-0056).
 //!
 //! Emits the backing `zap_crypto_*` runtime calls (implemented in `zaprt.c`).
-//! `str`/`bytes` values are already `Ty::Ptr` (a `ZapStr*`), so data/key/message
-//! arguments pass straight through; `_new`/`digest`/`hexdigest` results are also
-//! `Ty::Ptr` (a `bytes` handle or a `str`/`bytes` object). Count arguments
-//! (`random_bytes`/`token_hex`) coerce to `i64`. Sema has already type-checked
-//! these calls. RSA sign results retain `Ty::Bytes` for binary operations (#644).
+//! `str` and `bytes` share the `ZapStr*` ABI, but actual byte-buffer results
+//! retain `Ty::Bytes` for binary operations (#644, #647). Text results and opaque
+//! `_new` context handles remain `Ty::Ptr`; handles are not digest buffers.
+//! Count arguments (`random_bytes`/`token_hex`) coerce to `i64`. Sema has already
+//! type-checked these calls.
 
 use zapc_syntax::ast;
 
@@ -24,17 +24,21 @@ const ALGO_SHA512: i64 = 1;
 const ALGO_SHA1: i64 = 2;
 const ALGO_MD5: i64 = 3;
 
-/// Lower a one-argument call whose argument is a `str`/`bytes` value (a `Ptr`),
-/// emitting `func(arg)` with the given pointer result type.
-fn call_ptr1(lowerer: &mut FnLower, func: &str, arg: &ast::Arg) -> Result<(Value, Ty), LowerError> {
+/// Lower a one-argument call with an explicit text/bytes result type.
+fn call_result1(
+    lowerer: &mut FnLower,
+    func: &str,
+    arg: &ast::Arg,
+    result_ty: Ty,
+) -> Result<(Value, Ty), LowerError> {
     let (v, _) = lowerer.expr(&arg.value)?;
-    let d = lowerer.new_value(Ty::Ptr);
+    let d = lowerer.new_value(result_ty);
     lowerer.emit(Inst::Call {
         dest: Some(d),
         func: func.to_string(),
         args: vec![v],
     });
-    Ok((d, Ty::Ptr))
+    Ok((d, result_ty))
 }
 
 fn lower(
@@ -46,7 +50,7 @@ fn lower(
         if args.len() != 1 {
             return Err(err("crypto hash one-shot takes exactly one argument"));
         }
-        Ok(Some(call_ptr1(m, func, &args[0])?))
+        Ok(Some(call_result1(m, func, &args[0], Ty::Ptr)?))
     };
     match method {
         "sha256" => one_shot(lowerer, "zap_crypto_sha256"),
@@ -88,13 +92,23 @@ fn lower(
             if args.len() != 1 {
                 return Err(err("crypto.hexdigest takes exactly one argument"));
             }
-            Ok(Some(call_ptr1(lowerer, "zap_crypto_hexdigest", &args[0])?))
+            Ok(Some(call_result1(
+                lowerer,
+                "zap_crypto_hexdigest",
+                &args[0],
+                Ty::Ptr,
+            )?))
         }
         "digest" => {
             if args.len() != 1 {
                 return Err(err("crypto.digest takes exactly one argument"));
             }
-            Ok(Some(call_ptr1(lowerer, "zap_crypto_digest", &args[0])?))
+            Ok(Some(call_result1(
+                lowerer,
+                "zap_crypto_digest",
+                &args[0],
+                Ty::Bytes,
+            )?))
         }
         "hmac_sha256" | "hmac_sha512" => {
             if args.len() != 2 {
@@ -122,13 +136,13 @@ fn lower(
             }
             let (key, _) = lowerer.expr(&args[0].value)?;
             let (msg, _) = lowerer.expr(&args[1].value)?;
-            let d = lowerer.new_value(Ty::Ptr);
+            let d = lowerer.new_value(Ty::Bytes);
             lowerer.emit(Inst::Call {
                 dest: Some(d),
                 func: "zap_crypto_hmac_sha256_raw".to_string(),
                 args: vec![key, msg],
             });
-            Ok(Some((d, Ty::Ptr)))
+            Ok(Some((d, Ty::Bytes)))
         }
         // crypto.rsa_<hash>_sign(pem_key, data) -> bytes (#628): the raw PKCS#1
         // v1.5 signature. Keep the result Ty::Bytes for byte operations (#644);
@@ -181,13 +195,18 @@ fn lower(
             } else {
                 "zap_crypto_token_hex"
             };
-            let d = lowerer.new_value(Ty::Ptr);
+            let result_ty = if method == "random_bytes" {
+                Ty::Bytes
+            } else {
+                Ty::Ptr
+            };
+            let d = lowerer.new_value(result_ty);
             lowerer.emit(Inst::Call {
                 dest: Some(d),
                 func: func.to_string(),
                 args: vec![n],
             });
-            Ok(Some((d, Ty::Ptr)))
+            Ok(Some((d, result_ty)))
         }
         _ => Ok(None),
     }
