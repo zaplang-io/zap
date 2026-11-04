@@ -1314,6 +1314,16 @@ mod tests {
     }
 
     #[test]
+    fn is_and_is_not_round_trip() {
+        // #611/D18: `is` and the two-token `is not` render back verbatim, both
+        // as lone comparisons and chained with other comparison operators.
+        let source = "def f():\n    bool b = x is None\n    bool c = y is not None\n";
+        assert_eq!(format_source(source).unwrap(), source);
+        let chained = "def f():\n    bool b = a is b is c\n";
+        assert_eq!(format_source(chained).unwrap(), chained);
+    }
+
+    #[test]
     fn enum_conformance_fixture_is_canonically_formatted() {
         let source = include_str!("../../../tests/conformance/enum_tier1_iteration.zap");
         assert_eq!(format_source(source).unwrap(), source);

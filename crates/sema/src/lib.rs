@@ -3604,6 +3604,19 @@ impl Checker {
             Expr::Binary { op, lhs, rhs, span } => {
                 let l = self.infer(lhs);
                 let r = self.infer(rhs);
+                // `is` / `is not` (#611, D18) are not operator-overloadable and
+                // follow their own operand rules (reference identity, or a
+                // `None` check), so they are checked before the struct/built-in
+                // dispatch below.
+                if matches!(op, BinOp::Is | BinOp::IsNot) {
+                    return self.check_identity(
+                        &l,
+                        &r,
+                        matches!(lhs.as_ref(), Expr::None(_)),
+                        matches!(rhs.as_ref(), Expr::None(_)),
+                        *span,
+                    );
+                }
                 // Operator overloading on user structs (D-0047) takes precedence
                 // over the built-in-type rules.
                 if let Some(ty) = self.check_struct_binop(*op, &l, &r, *span) {
@@ -3626,7 +3639,23 @@ impl Checker {
                 for (i, (op, _)) in rest.iter().enumerate() {
                     let l = &tys[i];
                     let r = &tys[i + 1];
-                    if self.check_struct_binop(*op, l, r, *span).is_none() {
+                    // `is` / `is not` links (#611, D18) use the identity operand
+                    // rules; a literal `None` operand is recognized from the
+                    // expression so the None-check path applies in a chain too.
+                    if matches!(op, BinOp::Is | BinOp::IsNot) {
+                        let lhs_expr = if i == 0 {
+                            first.as_ref()
+                        } else {
+                            &rest[i - 1].1
+                        };
+                        self.check_identity(
+                            l,
+                            r,
+                            matches!(lhs_expr, Expr::None(_)),
+                            matches!(&rest[i].1, Expr::None(_)),
+                            *span,
+                        );
+                    } else if self.check_struct_binop(*op, l, r, *span).is_none() {
                         self.arith_result(*op, l, r, *span);
                     }
                 }
@@ -3951,6 +3980,10 @@ impl Checker {
                 Ty::Bool
             }
             In | NotIn => Ty::Bool,
+            // `is` / `is not` (#611, D18): the operand rules are enforced by
+            // `check_identity` (which has the operand expressions, so it can see
+            // a literal `None`); reaching here the result is simply `bool`.
+            Is | IsNot => Ty::Bool,
             And | Or => Ty::Bool,
             // Channel send `ch <- v` (ticket #25, D-0031): the left operand must
             // be a channel and the value must be assignable to its element type.
@@ -4278,6 +4311,98 @@ impl Checker {
             }
         }
         self.check_struct_binop(op, l, r, span)
+    }
+
+    /// Whether a type names the prelude `Optional[T]` enum (bare `Optional`
+    /// before monomorphization, or a mangled `Optional$…` instance). `Optional`
+    /// is tracked opaquely as a `Named` type, so this is a name test.
+    fn is_optional_ty(t: &Ty) -> bool {
+        matches!(t, Ty::Named(n) if n == "Optional" || n.starts_with("Optional$"))
+    }
+
+    /// Whether a value of type `t` can hold `None` — the operand rule for
+    /// `x is None` / `x is not None` (#611, D18). The two nullable categories
+    /// are a plain reference `struct` (D-0023; physically a pointer that may be
+    /// null) and `Optional[T]` (whose `None` is the empty variant).
+    /// `Unknown`/`Py` stay permissive. A value struct, an enum, and every
+    /// scalar / `str` / `bytes` / tuple can never be None.
+    fn is_nullable_ty(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Unknown | Ty::Py => true,
+            _ if Self::is_optional_ty(t) => true,
+            Ty::Named(n) => self.structs.get(n).is_some_and(|s| !s.is_value),
+            _ => false,
+        }
+    }
+
+    /// Whether a value of type `t` has *reference identity* — the operand rule
+    /// for `a is b` on two non-`None` operands (#611, D18). Reference types
+    /// carry a distinct heap allocation: a plain reference `struct`, the GC
+    /// collections (`list`/`dict`/`set`/`heap`), a `channel`, and `Optional[T]`
+    /// (a pointer or tagged box). `Unknown`/`Py` stay permissive. Value types
+    /// (scalars, `str`, `bytes`, `bool`, `char`, a `value struct`, an `enum`, a
+    /// tuple, `range`) have value semantics and no distinct identity.
+    fn is_identity_ty(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Unknown | Ty::Py => true,
+            Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) => true,
+            _ if Self::is_optional_ty(t) => true,
+            Ty::Named(n) => self.structs.get(n).is_some_and(|s| !s.is_value),
+            _ => false,
+        }
+    }
+
+    /// Type-check `a is b` / `a is not b` (#611, D18), always yielding `bool`.
+    /// `l_none`/`r_none` say whether that operand is a literal `None`, so the
+    /// None-check path applies even though `None` itself infers to `Unknown`.
+    ///
+    /// - `None is None`: trivially valid.
+    /// - `x is None` / `None is x`: the common null/empty check — the other
+    ///   operand must be nullable ([`is_nullable_ty`]), else [`ZAP4074`].
+    /// - `a is b` (both non-`None`): reference identity — both operands must be
+    ///   reference types ([`is_identity_ty`]), else [`ZAP4073`], which points at
+    ///   `==`. Two *different* reference types are permitted (the result is
+    ///   simply `false`), consistent with how `==` does not constrain operand
+    ///   types.
+    fn check_identity(&mut self, l: &Ty, r: &Ty, l_none: bool, r_none: bool, span: Span) -> Ty {
+        if l_none && r_none {
+            return Ty::Bool;
+        }
+        if l_none || r_none {
+            let other = if l_none { r } else { l };
+            if !self.is_nullable_ty(other) {
+                self.error(
+                    ErrorCode::ZAP4074,
+                    format!(
+                        "a value of type '{}' can never be None, so this `is` \
+                         test is always constant; use `==` to compare by value, \
+                         or a pattern match",
+                        other.display()
+                    ),
+                    span,
+                );
+            }
+            return Ty::Bool;
+        }
+        let offending = if !self.is_identity_ty(l) {
+            Some(l)
+        } else if !self.is_identity_ty(r) {
+            Some(r)
+        } else {
+            None
+        };
+        if let Some(t) = offending {
+            self.error(
+                ErrorCode::ZAP4073,
+                format!(
+                    "`is` / `is not` test reference identity, but '{}' is a value \
+                     type with no distinct identity; use `==` to compare by value",
+                    t.display()
+                ),
+                span,
+            );
+        }
+        Ty::Bool
     }
 
     /// Check a unary operator with a user-struct operand (D-0047).
@@ -9111,5 +9236,169 @@ def main():
             e.iter().any(|x| x.code == ErrorCode::ZAP4024),
             "expected ZAP4024 for hex.encode(int), got {e:?}"
         );
+    }
+
+    // ---- `is` / `is not` identity operators (#611, D18) -------------------
+
+    #[test]
+    fn is_none_on_optional_and_reference_struct_type_checks() {
+        // `x is None` / `x is not None` is the common case: valid on the two
+        // nullable categories — `Optional[T]` (empty variant) and a plain
+        // reference `struct` (null pointer, D-0023) — and yields `bool`, so it
+        // reads in a boolean context.
+        ok(r#"
+def main():
+    Optional[int64] a = Optional.Some(5)
+    Optional[int64] b = None
+    bool r0 = a is None
+    bool r1 = a is not None
+    bool r2 = b is None
+    if b is None:
+        print("none")
+"#);
+        ok(r#"
+struct Node:
+    int64 v
+def main():
+    Node n = Node(v=1)
+    Node m = None
+    bool r0 = n is None
+    bool r1 = m is not None
+"#);
+        // Niche-layout optional (pointer payload) is nullable too.
+        ok(r#"
+def main():
+    Optional[str] s = None
+    bool r = s is not None
+"#);
+        // `None is x` (None on the left) is equally valid.
+        ok(r#"
+def main():
+    Optional[int64] a = None
+    bool r = None is a
+"#);
+    }
+
+    #[test]
+    fn is_on_reference_types_type_checks() {
+        // `a is b` between two reference values is reference identity and yields
+        // `bool`: reference structs, and the GC collections `list`/`dict`/`set`.
+        ok(r#"
+struct Node:
+    int64 v
+def main():
+    Node a = Node(v=1)
+    Node b = a
+    bool same = a is b
+    bool diff = a is not b
+"#);
+        ok(r#"
+def main():
+    list[int64] xs = [1, 2]
+    list[int64] ys = xs
+    bool r = xs is ys
+    dict[str, int64] d = {}
+    dict[str, int64] e = d
+    bool r2 = d is not e
+    set[int64] s = {1}
+    set[int64] t = s
+    bool r3 = s is t
+"#);
+    }
+
+    #[test]
+    fn is_none_on_non_nullable_value_type_is_rejected() {
+        // A value that can never be None (scalars, `str`, `bytes`, `bool`,
+        // `char`, a tuple) makes `x is None` a constant — ZAP4074, directing to
+        // `==` / a pattern match.
+        for src in [
+            "def main():\n    int64 x = 1\n    bool r = x is None\n",
+            "def main():\n    float64 x = 1.0\n    bool r = x is not None\n",
+            "def main():\n    str s = \"x\"\n    bool r = s is None\n",
+            "def main():\n    bytes b = b\"x\"\n    bool r = b is None\n",
+            "def main():\n    bool t = True\n    bool r = t is None\n",
+            "def main():\n    auto p = (1, 2)\n    bool r = p is None\n",
+        ] {
+            let e = errors(src);
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4074),
+                "expected ZAP4074 (value can never be None) for {src:?}, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_on_value_types_is_rejected() {
+        // `a is b` on value types / scalars has no distinct identity — ZAP4073,
+        // directing to `==`. Covers numbers, `str`, `bytes`, `bool`, `char`, a
+        // `value struct`, an `enum`, and a tuple.
+        for src in [
+            "def main():\n    int64 a = 1\n    int64 b = 2\n    bool r = a is b\n",
+            "def main():\n    float64 a = 1.0\n    float64 b = 2.0\n    bool r = a is not b\n",
+            "def main():\n    str a = \"x\"\n    str b = \"y\"\n    bool r = a is b\n",
+            "def main():\n    bytes a = b\"x\"\n    bytes b = b\"y\"\n    bool r = a is b\n",
+            "def main():\n    bool a = True\n    bool b = False\n    bool r = a is b\n",
+            "def main():\n    char a = 'x'\n    char b = 'y'\n    bool r = a is b\n",
+            "value struct V:\n    int64 x\ndef main():\n    V a = V(x=1)\n    V b = V(x=1)\n    bool r = a is b\n",
+            "enum Color:\n    RED\n    BLUE\ndef main():\n    Color a = Color.RED\n    Color b = Color.BLUE\n    bool r = a is b\n",
+            "def main():\n    auto a = (1, 2)\n    auto b = (1, 2)\n    bool r = a is b\n",
+        ] {
+            let e = errors(src);
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP4073),
+                "expected ZAP4073 (`is` needs reference operands) for {src:?}, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_mixing_a_value_operand_with_a_reference_operand_is_rejected() {
+        // Only one operand needs to be a value type for ZAP4073 (one reference,
+        // one scalar): identity cannot be tested against a value.
+        let e = errors(
+            "struct Node:\n    int64 v\ndef main():\n    Node n = Node(v=1)\n    int64 x = 1\n    bool r = n is x\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4073),
+            "expected ZAP4073 for a reference-vs-value `is`, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn is_chains_like_other_comparisons() {
+        // `is`/`is not` chain (Python semantics): `a is b is c` desugars to
+        // `(a is b) and (b is c)` — each a reference-identity test — not the
+        // left-associative `(a is b) is c` (which would be `bool is c`, an
+        // error). That it type-checks proves the chain, not left-folding.
+        ok(r#"
+struct Node:
+    int64 v
+def main():
+    Node a = Node(v=1)
+    Node b = a
+    Node c = a
+    bool r = a is b is c
+"#);
+        // A chain mixing identity with `==` on a type that supports both.
+        ok(r#"
+def main():
+    int64 one = 1
+    Optional[int64] o = Optional.Some(1)
+    bool r = o is not None
+    # identity link chained with an equality link on ints
+    bool s = 1 == one == 1
+"#);
+    }
+
+    #[test]
+    fn is_on_unknown_or_dynamic_stays_permissive() {
+        // A `python` (dynamic) handle has no static identity constraint, so `is`
+        // against it is permitted (it lowers to a pointer compare).
+        ok(r#"
+import python "math" as m
+def main():
+    auto v = m.pi
+    bool r = v is None
+"#);
     }
 }

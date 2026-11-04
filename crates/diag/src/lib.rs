@@ -432,6 +432,20 @@ define_codes! {
         "A type does not define the dunder required for this operator.";
     ZAP4072 = 4072 : "`in` not supported",
         "A type does not define `__contains__`, so `in` cannot be used with it.";
+    ZAP4073 = 4073 : "`is` needs reference operands",
+        "`is` / `is not` test reference identity (same allocation), so both \
+         operands must be reference types — a plain `struct` (D-0023), a \
+         `list`/`dict`/`set`/`heap`, a `channel`, or `Optional[T]`. A value \
+         type or scalar (int, float, bool, char, `str`, `bytes`, a `value \
+         struct`, an `enum`, or a tuple) has value semantics and no distinct \
+         identity, so use `==` to compare it by value.";
+    ZAP4074 = 4074 : "value can never be None",
+        "`x is None` / `x is not None` is only meaningful for a nullable type — \
+         a plain reference `struct` (which may be a null pointer) or an \
+         `Optional[T]` (whose `None` is the empty variant). The operand here is \
+         a non-nullable value type that can never be None, so the test is \
+         always a constant; drop it, or use `==` / a pattern match if value \
+         comparison was intended.";
     ZAP4080 = 4080 : "no such method",
         "An interface or a type parameter's bound does not declare the method \
          being called.";

@@ -111,7 +111,6 @@ simply not shipped yet — and must not be read as "won't have":
 
 | Feature | Status | Tracking |
 |---|---|---|
-| `is` / `is not` identity operators | Planned (needs a value-type identity note) | #611 |
 | Template strings `t"..."` (PEP 750) | Planned, deferred | #612 |
 | `@` matrix-multiplication operator | Planned with full numeric-array support | #613 |
 | Classes + inheritance (full OO) | Deferred | #66 / #30 |
@@ -190,6 +189,7 @@ Python models data with classes; Zap uses nominal `struct` / `enum` /
 | Regex substitute | `s = re.sub(p, r, s)` | `s ~= s/p/r/` | In-place substitution assignment (D-0010). |
 | Tuple return | `return a, b` | `return a, b` | Same spelling; first-class in Zap's type system (D-0049). |
 | Walrus `:=` | `while chunk := f():` or `(x := e)` | `while (chunk := f()):` — parentheses required | `(name := expr)` evaluates once, binds `name` in the enclosing scope (PEP 572, including comprehension filters), and yields the value. Zap accepts **only** the parenthesized form, and `:=` is never a bare declaration — `a := 10` is rejected (use `auto a = 10`) (#600, D-0106). |
+| Identity `is` / `is not` | `a is b`, `x is None` (defined on every object) | `a is b`, `x is None` — **reference types only** | Same spelling and reference-identity meaning, and `x is None` / `is not None` is the idiomatic null/empty check. The divergence: CPython defines `is` on *every* object (so `3 is None`, `"a" is "a"` are valid, if footgun-prone), whereas Zap — which has value/reference semantics (D-0023), not universal object identity — makes `is` on a value type or scalar (`int`, `float`, `bool`, `char`, `str`, `bytes`, a `value struct`, an `enum`, a tuple) a **compile error** (ZAP4073; ZAP4074 for `is None` on a never-None value), directing the user to `==`. `is` / `is not` chain like other comparisons (#611, D-0110). |
 
 ### Statements
 

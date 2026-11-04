@@ -9011,6 +9011,18 @@ impl<'a> FnLower<'a> {
                 self.position(join_bb);
                 Ok((self.load(slot, Ty::I1), Ty::I1))
             }
+            // `x is None` / `x is not None` (#611, D18): the common null/empty
+            // check. The bare `None` operand has no standalone lowering, so this
+            // is intercepted here (where the other operand's type is known)
+            // rather than in `binop`, and emits the same empty-variant / null
+            // test as `.is_none()` and `match case Optional.None`.
+            Expr::Binary { op, lhs, rhs, .. }
+                if matches!(op, AstBin::Is | AstBin::IsNot)
+                    && (matches!(lhs.as_ref(), Expr::None(_))
+                        || matches!(rhs.as_ref(), Expr::None(_))) =>
+            {
+                self.lower_is_none(matches!(op, AstBin::IsNot), lhs, rhs)
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (l, lt) = self.expr(lhs)?;
                 let (r, rt) = self.expr(rhs)?;
@@ -14306,6 +14318,48 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Lower `x is None` / `x is not None` (#611, D18). Exactly one operand is a
+    /// literal `None` (the caller guarantees it); the other is lowered and
+    /// tested for emptiness. An `Optional[T]` reuses the niche/tagged
+    /// empty-variant check (`gen_opt_is_none`); a plain reference `struct` is
+    /// None exactly when its pointer is null. `None is None` folds to a
+    /// constant. `is not` negates the result.
+    fn lower_is_none(
+        &mut self,
+        is_not: bool,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Result<(Value, Ty), LowerError> {
+        let l_none = matches!(lhs, Expr::None(_));
+        let r_none = matches!(rhs, Expr::None(_));
+        if l_none && r_none {
+            // `None is None` is True; `None is not None` is False.
+            return Ok((self.bconst(!is_not), Ty::I1));
+        }
+        let other = if l_none { rhs } else { lhs };
+        let (v, t) = self.expr(other)?;
+        let is_none = if let Some(opt) = optional_layout(self.ctx, t) {
+            gen_opt_is_none(self, &opt, v)
+        } else {
+            // Reference struct (or other reference pointer): null is None. Sema
+            // (`is_nullable_ty`) has already rejected non-nullable operands.
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::IsNull { dest: d, val: v });
+            d
+        };
+        if is_not {
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::Un {
+                dest: d,
+                op: UnOp::Not,
+                val: is_none,
+            });
+            Ok((d, Ty::I1))
+        } else {
+            Ok((is_none, Ty::I1))
+        }
+    }
+
     fn binop(
         &mut self,
         op: AstBin,
@@ -14328,6 +14382,29 @@ impl<'a> FnLower<'a> {
                 dest: d,
                 op: UnOp::Not,
                 val: bi,
+            });
+            return Ok((d, Ty::I1));
+        }
+
+        // `is` / `is not` (#611, D18): reference identity (same allocation).
+        // Both operands are reference values — sema (`check_identity`) rejects
+        // value types, and a literal `None` operand is handled earlier in the
+        // `Expr::Binary` lowerer (it has the static types, so it emits the
+        // null/empty-variant check). Reaching here both sides are concrete
+        // reference pointers, so compare them directly; this is also the path a
+        // chained `a is b` link takes. Codegen's `ICmp` accepts pointer
+        // operands (it `ptrtoint`s them), so no element-kind dispatch is needed.
+        if matches!(op, Is | IsNot) {
+            let d = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: d,
+                pred: if matches!(op, Is) {
+                    CmpPred::Eq
+                } else {
+                    CmpPred::Ne
+                },
+                lhs: l,
+                rhs: r,
             });
             return Ok((d, Ty::I1));
         }
@@ -15032,6 +15109,8 @@ impl<'a> FnLower<'a> {
             // `Send` is intercepted at the top of `binop` (before the generic
             // reference-type guard), so it never reaches here.
             Send => unreachable!("channel send handled above"),
+            // `is` / `is not` (#611) are intercepted at the top of `binop`.
+            Is | IsNot => unreachable!("'is'/'is not' handled above"),
             Eq | Ne | Lt | Le | Gt | Ge => unreachable!(),
         }
     }

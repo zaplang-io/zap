@@ -34,6 +34,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `Eq`-without-`Hash` dict/set-key warning (D-0047) at the CLI for the first
   time. With this, the v1 built-in decorator set is complete: `@derive(...)`,
   `@default`, `@validate`, `@range`, `@deprecated`.
+- Identity operators `is` / `is not` (#611, D-0110, epic #614 D18). `a is b`
+  tests **reference identity** — same allocation — distinct from `==` (value /
+  `__eq__` equality): two distinct reference structs with equal fields are
+  `==`-equal but not `is`-equal. `x is None` / `x is not None` is the
+  empty-variant / null check, consistent with `== None` and `match case None`,
+  and works for both `Optional[T]` layouts and plain reference structs. `is`
+  reserves a new keyword (as in Python) and, like the other comparison
+  operators (and unlike `not in`), participates in Python-style comparison
+  chaining (`a is b == c`). Operands must be reference types (a plain `struct`,
+  a `list`/`dict`/`set`/`heap`, a `channel`, or `Optional[T]`); `is` on a value
+  type or scalar is a compile error (ZAP4073), as is `is None` on a never-None
+  value (ZAP4074), each pointing the user at `==` — Zap does not define `is` as
+  `==` on values (see `PYTHON_DIFFERENCES.md`).
 - Generator expressions: `(elem for CLAUSES)` is a lazy `Iterator`, not a
   materialized collection — it yields each element on demand (no intermediate
   list) and can be consumed once. It uses the comprehension clause grammar

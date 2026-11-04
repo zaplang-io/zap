@@ -3588,3 +3588,63 @@ wrapper), a diag render test (warning severity header), a driver `error_codes`
 test (ZAP5055 / ZAP5047), and the `builtin_deprecated` end-to-end golden (the
 program builds and runs; warnings on stderr) under the full-codegen CI jobs. See
 `design/0004-decorators.md`, SPEC.md and STABILITY.md §5.
+
+## D-0110 — `is` / `is not` reference-identity operators (I#611)
+
+Part of the CPython grammar-parity pass (epic #614, decision D18). Zap gains the
+identity operators `is` and `is not`, reserving `is` as a keyword (as in
+Python). They are added to `comp_op` at the same precedence as the other
+comparison operators and — like them, and unlike `not in` (D-0093/#593) — they
+**chain**: `a is b == c` is one Python-style chained comparison, desugaring to
+`(a is b) and (b == c)` with each operand evaluated once (I#386). The two-token
+`is not` is lexed as `is` followed by `not` and parsed as a single operator
+(`BinOp::IsNot`); `not` and `is` keep their ordinary meaning everywhere else.
+
+**Semantics — reference identity, not value equality.** `is` tests whether two
+operands are the *same allocation*, which is meaningful only for reference
+types. This is deliberately distinct from `==` (value equality / a struct's
+`__eq__`): two distinct reference-struct allocations with equal fields are
+`==`-equal but **not** `is`-equal.
+
+- **`x is None` / `x is not None`** — the common case, the empty-variant / null
+  check. It resolves to the same test as `.is_none()` and `match case
+  Optional.None`: an `Optional[T]` niche layout and a plain reference `struct`
+  use the null-pointer check (`IsNull`); a tagged `Optional[T]` uses the
+  discriminant check. The bare literal `None` has no standalone lowering, so the
+  check is emitted from the *other* operand's static type (either operand order
+  works); `None is None` folds to a constant. This gives reference structs a
+  clean null test that `== None` cannot express today (that requires `__eq__`).
+- **`a is b` on reference types** — same-allocation pointer identity: the two
+  reference pointers are compared directly (`ICmp`, `ptrtoint` in codegen).
+  Eligible operands are a plain reference `struct` (D-0023), the GC collections
+  `list`/`dict`/`set`/`heap`, a `channel`, and `Optional[T]`. `Unknown`/`Py`
+  stay permissive.
+
+**Value types are a compile error (the type-honest choice).** Scalars (`int`,
+`float`, `bool`, `char`, `complex`, `bigint`), `str`, `bytes`, a `value struct`,
+an `enum`, a tuple, and `range` have value semantics and no distinct identity,
+so `is` on them would be a silently-surprising alias for `==`. Rather than
+define `is` as `==` there, Zap **rejects** it:
+
+- **ZAP4073** (`` `is` needs reference operands ``) — `a is b` where either
+  operand is a value type. The message points the user at `==`.
+- **ZAP4074** (value can never be None) — `x is None` where `x` is a
+  non-nullable value type, so the test is always constant.
+
+This diverges from CPython, where `is` is defined on every object (e.g.
+`3 is None` is a valid `False`); see `PYTHON_DIFFERENCES.md`. The rationale is
+Zap's value/reference split (D-0023): where CPython has object identity for
+everything, Zap has it only for reference types, so an identity test on a value
+is a type error rather than a footgun. Mixed *reference* operand types (two
+different reference types) are permitted and well-typed (`bool`, always
+`False`), consistent with how `==` does not constrain operand types.
+
+Verified by parser unit tests (lone `is`, the two-token `is not`, identity
+chains, mixing with `==`, comparison-level precedence), sema unit tests
+(positive: `is None`/`is not None` on `Optional[T]` and reference structs,
+identity on structs/collections, chains, `Unknown`/`Py` permissiveness;
+negative: ZAP4073 on every value type and the reference-vs-value mix, ZAP4074 on
+`is None` over never-None values), a `zap fmt` round-trip, and the
+`is_identity` end-to-end golden (same-vs-distinct allocation, the `is`/`==`
+distinction via a struct with `__eq__`, tagged and niche `Optional[T]`, `is
+not`, `None is None`, and identity chains) under the full-codegen CI jobs.

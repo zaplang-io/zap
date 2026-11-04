@@ -3245,27 +3245,23 @@ impl Parser {
                 };
                 continue;
             }
-            let Some((bp, op)) = self.bin_bp() else {
-                break;
-            };
-            if bp < min_bp {
-                break;
-            }
             // Chained comparison (Python semantics, I#386): a run of two or more
-            // comparison operators at the same level — `a < b < c` — is NOT
-            // left-associative `(a < b) < c`; it desugars to `(a < b) and
-            // (b < c)` with each operand evaluated once. Collect the whole run
-            // here so the parser can emit a single [`Expr::Compare`]; a lone
-            // comparison falls through to the ordinary left-associative
-            // `Expr::Binary` below.
-            if Self::is_chain_cmp(op) {
-                self.bump();
+            // comparison operators at the same level — `a < b < c`, `x is b == c`
+            // — is NOT left-associative `(a < b) < c`; it desugars to `(a < b)
+            // and (b < c)` with each operand evaluated once. Collect the whole
+            // run here so the parser can emit a single [`Expr::Compare`]; a lone
+            // comparison becomes an ordinary left-associative `Expr::Binary`.
+            // The two-token `is`/`is not` identity operators (#611, D18) chain
+            // like the others; [`peek_chain_cmp`] reports how many tokens each
+            // consumes so `is not` is bumped as a unit.
+            if let Some((bp, op, ntok)) = self.peek_chain_cmp() {
+                if bp < min_bp {
+                    break;
+                }
+                self.bump_n(ntok);
                 let mut rest = vec![(op, self.parse_bin(bp + 1))];
-                while let Some((bp2, op2)) = self.bin_bp() {
-                    if !Self::is_chain_cmp(op2) {
-                        break;
-                    }
-                    self.bump();
+                while let Some((bp2, op2, ntok2)) = self.peek_chain_cmp() {
+                    self.bump_n(ntok2);
                     rest.push((op2, self.parse_bin(bp2 + 1)));
                 }
                 lhs = if rest.len() == 1 {
@@ -3285,6 +3281,12 @@ impl Parser {
                 };
                 continue;
             }
+            let Some((bp, op)) = self.bin_bp() else {
+                break;
+            };
+            if bp < min_bp {
+                break;
+            }
             self.bump();
             let rhs = self.parse_bin(bp + 1);
             lhs = Expr::Binary {
@@ -3297,17 +3299,47 @@ impl Parser {
         lhs
     }
 
-    /// Whether `op` is a comparison operator that participates in Python-style
-    /// comparison chaining (`<`, `<=`, `>`, `>=`, `==`, `!=`, `in`). The regex
-    /// binds (`=~`/`!~`), `Send`, and the bitwise/arithmetic operators do not
-    /// chain. `not in` (#593, [`BinOp::NotIn`]) is a standalone negated-
-    /// membership comparison that does not chain; Zap has no `is`/`is not`
-    /// operators (see [`BinOp`]).
+    /// Whether `op` is a single-token comparison operator that participates in
+    /// Python-style comparison chaining (`<`, `<=`, `>`, `>=`, `==`, `!=`,
+    /// `in`). The regex binds (`=~`/`!~`), `Send`, and the bitwise/arithmetic
+    /// operators do not chain. `not in` (#593, [`BinOp::NotIn`]) is a standalone
+    /// negated-membership comparison that does not chain. The identity
+    /// operators `is`/`is not` (#611, D18) DO chain, but are two-token forms
+    /// recognized by [`peek_chain_cmp`] rather than here.
     fn is_chain_cmp(op: BinOp) -> bool {
         matches!(
             op,
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::In
         )
+    }
+
+    /// Peek the next chaining comparison operator without consuming it,
+    /// returning `(binding power, op, token count)`. This unifies the
+    /// single-token comparison operators ([`is_chain_cmp`]) with the two-token
+    /// `is` / `is not` identity operators (#611, D18): `is not` reports a token
+    /// count of 2 so the caller bumps it as one operator. All comparison
+    /// operators share precedence 30, so `x is b == c` chains uniformly.
+    /// Returns `None` for `not in` (handled before this as a non-chaining
+    /// operator) and for every non-comparison operator.
+    fn peek_chain_cmp(&self) -> Option<(u8, BinOp, u8)> {
+        if self.is_kw(Keyword::Is) {
+            if matches!(self.peek2(), TokenKind::Keyword(Keyword::Not)) {
+                return Some((30, BinOp::IsNot, 2));
+            }
+            return Some((30, BinOp::Is, 1));
+        }
+        match self.bin_bp() {
+            Some((bp, op)) if Self::is_chain_cmp(op) => Some((bp, op, 1)),
+            _ => None,
+        }
+    }
+
+    /// Consume `n` tokens (used to bump a multi-token operator such as
+    /// `is not` as a unit).
+    fn bump_n(&mut self, n: u8) {
+        for _ in 0..n {
+            self.bump();
+        }
     }
 
     fn bin_bp(&self) -> Option<(u8, BinOp)> {
@@ -4364,6 +4396,96 @@ mod tests {
         };
         assert_eq!(*op, BinOp::Lt);
         assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Lt, .. }));
+    }
+
+    #[test]
+    fn is_operator_parses_as_binary() {
+        // `a is b` is a lone comparison -> `Expr::Binary` with `BinOp::Is`.
+        let m = parse_ok("x = a is b\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Binary { op, lhs, rhs, .. } = value else {
+            panic!("expected Binary, got {value:?}");
+        };
+        assert_eq!(*op, BinOp::Is);
+        assert!(matches!(lhs.as_ref(), Expr::Name(n, _) if n == "a"));
+        assert!(matches!(rhs.as_ref(), Expr::Name(n, _) if n == "b"));
+    }
+
+    #[test]
+    fn is_not_operator_parses_as_one_binary() {
+        // The two-token `is not` is a single `BinOp::IsNot`, not `is` applied to
+        // a `not`-prefixed operand. `x is not None` -> `IsNot(x, None)`.
+        let m = parse_ok("x = v is not None\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Binary { op, lhs, rhs, .. } = value else {
+            panic!("expected Binary, got {value:?}");
+        };
+        assert_eq!(*op, BinOp::IsNot);
+        assert!(matches!(lhs.as_ref(), Expr::Name(n, _) if n == "v"));
+        assert!(matches!(rhs.as_ref(), Expr::None(_)));
+    }
+
+    #[test]
+    fn is_chains_like_other_comparisons() {
+        // `a is b is c` is a Python-chained comparison (I#386), NOT the
+        // left-associative `(a is b) is c`: the parser emits a single `Compare`
+        // with two `Is` links.
+        let m = parse_ok("x = a is b is c\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Compare { first, rest, .. } = value else {
+            panic!("expected Compare, got {value:?}");
+        };
+        assert!(matches!(first.as_ref(), Expr::Name(n, _) if n == "a"));
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].0, BinOp::Is);
+        assert_eq!(rest[1].0, BinOp::Is);
+    }
+
+    #[test]
+    fn is_mixes_in_a_comparison_chain() {
+        // `is`/`is not` share the comparison precedence level, so they chain
+        // alongside `==` etc.: `a is b == c` and `x is not None == y` each build
+        // one `Compare` carrying the identity and equality links in order.
+        let m = parse_ok("r = a is b == c\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Compare { rest, .. } = value else {
+            panic!("expected Compare, got {value:?}");
+        };
+        let ops: Vec<BinOp> = rest.iter().map(|(op, _)| *op).collect();
+        assert_eq!(ops, vec![BinOp::Is, BinOp::Eq]);
+
+        let m = parse_ok("r = x is not None == y\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Compare { rest, .. } = value else {
+            panic!("expected Compare, got {value:?}");
+        };
+        let ops: Vec<BinOp> = rest.iter().map(|(op, _)| *op).collect();
+        assert_eq!(ops, vec![BinOp::IsNot, BinOp::Eq]);
+    }
+
+    #[test]
+    fn is_binds_at_comparison_precedence() {
+        // `is` sits at comparison precedence, below `+`: `a + b is c` parses as
+        // `(a + b) is c`, i.e. the left operand of `is` is the whole `a + b`.
+        let m = parse_ok("r = a + b is c\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("assign");
+        };
+        let Expr::Binary { op, lhs, .. } = value else {
+            panic!("expected Binary, got {value:?}");
+        };
+        assert_eq!(*op, BinOp::Is);
+        assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinOp::Add, .. }));
     }
 
     #[test]
