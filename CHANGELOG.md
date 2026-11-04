@@ -122,8 +122,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
-- _Pre-release bug fixes are folded into the initial release; post-1.0, defect
-  fixes that affect real code are called out here (STABILITY §3.2)._
+- Preserve `bytes` result types for `crypto.digest`, `crypto.hmac_sha256_raw`,
+  and `crypto.random_bytes` during IR lowering (#647), fixing binary indexing,
+  slicing, concatenation, and equality on inferred locals. Hex/text APIs and
+  opaque streaming handles retain their existing representation. Centralize
+  crypto result typing in one explicit table and share call emission, including
+  integer count coercion, RSA exception handling, and boolean normalization.
 
 ### Security
 

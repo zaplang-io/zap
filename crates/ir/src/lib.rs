@@ -38,6 +38,111 @@ mod tests {
     }
 
     #[test]
+    fn raw_crypto_results_support_inferred_bytes_operations() {
+        // #647: compile the reduced repro for every affected API. No runtime or
+        // randomness is involved; direct operations on auto locals lost bytes.
+        for expression in [
+            "crypto.digest(crypto.sha256_new())",
+            "crypto.hmac_sha256_raw(b\"key\", b\"message\")",
+            "crypto.random_bytes(4)",
+        ] {
+            lower_ok(&format!(
+                r#"def main():
+    auto result = {expression}
+    auto extended = result + b"x"
+    auto first = result[0]
+    auto sliced = result[1:]
+    auto same = result == b"independent bytes"
+"#
+            ));
+        }
+    }
+
+    #[test]
+    fn crypto_result_types_distinguish_buffers_text_and_handles() {
+        // Guard the boundary: opaque streaming contexts are not digest buffers,
+        // and the existing hex/string APIs must keep string operation dispatch.
+        let module = lower_ok(
+            r#"def main():
+    auto h = crypto.sha256_new()
+    crypto.update(h, b"message")
+    auto sha256 = crypto.sha256(b"message")
+    auto sha512 = crypto.sha512(b"message")
+    auto sha1 = crypto.sha1(b"message")
+    auto md5 = crypto.md5(b"message")
+    auto digest = crypto.digest(h)
+    auto hex_digest = crypto.hexdigest(h)
+    auto raw_mac = crypto.hmac_sha256_raw(b"key", b"message")
+    auto hex_mac = crypto.hmac_sha256(b"key", b"message")
+    auto hex_mac512 = crypto.hmac_sha512(b"key", b"message")
+    auto rsa1 = crypto.rsa_sha1_sign("invalid PEM", b"message")
+    auto rsa256 = crypto.rsa_sha256_sign("invalid PEM", b"message")
+    auto verified = crypto.rsa_sha256_verify("invalid PEM", b"message", b"sig")
+    assert not verified
+    int32 count32 = 4
+    int64 count64 = 4
+    auto random = crypto.random_bytes(count32)
+    auto token = crypto.token_hex(count64)
+"#,
+        );
+        let main = module.funcs.iter().find(|f| f.name == "main").unwrap();
+        for (symbol, expected) in [
+            ("zap_crypto_new", Ty::Ptr),
+            ("zap_crypto_sha256", Ty::Ptr),
+            ("zap_crypto_sha512", Ty::Ptr),
+            ("zap_crypto_sha1", Ty::Ptr),
+            ("zap_crypto_md5", Ty::Ptr),
+            ("zap_crypto_hmac_sha512", Ty::Ptr),
+            ("zap_crypto_rsa_sha1_sign", Ty::Bytes),
+            ("zap_crypto_rsa_sha256_sign", Ty::Bytes),
+            // Runtime verification returns int64; call_bool normalizes to i1.
+            ("zap_crypto_rsa_sha256_verify", Ty::I64),
+            ("zap_crypto_digest", Ty::Bytes),
+            ("zap_crypto_hexdigest", Ty::Ptr),
+            ("zap_crypto_hmac_sha256_raw", Ty::Bytes),
+            ("zap_crypto_hmac_sha256", Ty::Ptr),
+            ("zap_crypto_random_bytes", Ty::Bytes),
+            ("zap_crypto_token_hex", Ty::Ptr),
+        ] {
+            let result = main
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find_map(|i| match i {
+                    Inst::Call {
+                        dest: Some(d),
+                        func,
+                        ..
+                    }
+                    | Inst::Invoke {
+                        dest: Some(d),
+                        func,
+                        ..
+                    } if func == symbol => Some(*d),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing {symbol}"));
+            assert_eq!(main.value_ty(result), expected, "result type of {symbol}");
+        }
+        for inst in main.blocks.iter().flat_map(|b| &b.insts) {
+            if let Inst::Call { func, args, .. } = inst {
+                if matches!(
+                    func.as_str(),
+                    "zap_crypto_random_bytes" | "zap_crypto_token_hex"
+                ) {
+                    assert_eq!(main.value_ty(args[0]), Ty::I64, "count ABI for {func}");
+                }
+            }
+        }
+        assert!(
+            main.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(
+                i, Inst::Call { dest: None, func, .. } if func == "zap_crypto_update"
+            )),
+            "streaming update must remain void"
+        );
+    }
+
+    #[test]
     fn rsa_sign_results_support_inferred_bytes_operations() {
         // Compile-only: invalid PEM is never executed. This is the reduced
         // #644 regression; both APIs must support byte operations on auto locals.
