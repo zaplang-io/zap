@@ -605,4 +605,11 @@ def main():
         auto token = crypto.token_hex(count)
         assert len(token) == size * 2
         assert len(token + "!") == size * 2 + 1
+    # Shared call emission must preserve signed count coercion to the C ABI.
+    int32 count32 = 3
+    assert len(crypto.random_bytes(count32)) == 3
+    assert len(crypto.token_hex(count32)) == 6
+    int64 count64 = 4
+    assert len(crypto.random_bytes(count64)) == 4
+    assert len(crypto.token_hex(count64)) == 8
     print("Raw crypto bytes result operations: PASS")

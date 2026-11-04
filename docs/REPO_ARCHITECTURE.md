@@ -152,7 +152,9 @@ stream, and format with fixed DEBUG text; no cryptographic inputs are logged.
 
 The crypto lowering facet explicitly distinguishes real byte-buffer results
 (`digest`, `hmac_sha256_raw`, `random_bytes`: `Ty::Bytes`) from text and opaque
-streaming handles (`Ty::Ptr`), despite their shared pointer ABI (#647).
+streaming handles (`Ty::Ptr`), despite their shared pointer ABI (#647). A single
+runtime-symbol result table feeds shared call emission for all crypto methods;
+unknown entries fail lowering. Count coercion precedes the shared emitter.
 `tests/golden/crypto_byte_results.zap` checks binary operations and known answers.
 
 **Current modules** (file is `<name>.rs` in each facet above):

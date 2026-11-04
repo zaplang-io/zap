@@ -9,6 +9,7 @@
 
 use zapc_syntax::ast;
 
+use super::support::{call_bool, call_ret, call_void};
 use super::ModuleLower;
 use crate::ir::*;
 use crate::lower::{err, FnLower, LowerError};
@@ -24,21 +25,57 @@ const ALGO_SHA512: i64 = 1;
 const ALGO_SHA1: i64 = 2;
 const ALGO_MD5: i64 = 3;
 
-/// Lower a one-argument call with an explicit text/bytes result type.
+/// Central result classification for every crypto runtime entry point. Missing
+/// registrations fail lowering instead of silently defaulting a byte buffer to
+/// Ptr. Opaque hash handles deliberately differ from actual bytes buffers.
+fn result_type(func: &str) -> Result<Ty, LowerError> {
+    Ok(match func {
+        "zap_crypto_digest"
+        | "zap_crypto_hmac_sha256_raw"
+        | "zap_crypto_rsa_sha1_sign"
+        | "zap_crypto_rsa_sha256_sign"
+        | "zap_crypto_random_bytes" => Ty::Bytes,
+        "zap_crypto_sha256"
+        | "zap_crypto_sha512"
+        | "zap_crypto_sha1"
+        | "zap_crypto_md5"
+        | "zap_crypto_hexdigest"
+        | "zap_crypto_hmac_sha256"
+        | "zap_crypto_hmac_sha512"
+        | "zap_crypto_token_hex"
+        | "zap_crypto_new" => Ty::Ptr,
+        "zap_crypto_rsa_sha256_verify" => Ty::I1,
+        "zap_crypto_update" => Ty::Void,
+        _ => return Err(err("unknown crypto runtime symbol in result-type table")),
+    })
+}
+
+/// All crypto calls share result typing and emission, after the caller has
+/// lowered arguments (including count coercion). Keep RSA errors catchable;
+/// normalize the verifier's C int64 boolean and the update expression's void.
+fn call_crypto(
+    lowerer: &mut FnLower,
+    func: &str,
+    args: Vec<Value>,
+) -> Result<(Value, Ty), LowerError> {
+    let throwing = matches!(
+        func,
+        "zap_crypto_rsa_sha1_sign" | "zap_crypto_rsa_sha256_sign"
+    );
+    Ok(match result_type(func)? {
+        Ty::I1 => call_bool(lowerer, func, args),
+        Ty::Void => call_void(lowerer, func, args, throwing),
+        ty => call_ret(lowerer, func, args, ty, throwing),
+    })
+}
+
 fn call_result1(
     lowerer: &mut FnLower,
     func: &str,
     arg: &ast::Arg,
-    result_ty: Ty,
 ) -> Result<(Value, Ty), LowerError> {
     let (v, _) = lowerer.expr(&arg.value)?;
-    let d = lowerer.new_value(result_ty);
-    lowerer.emit(Inst::Call {
-        dest: Some(d),
-        func: func.to_string(),
-        args: vec![v],
-    });
-    Ok((d, result_ty))
+    call_crypto(lowerer, func, vec![v])
 }
 
 fn lower(
@@ -50,7 +87,7 @@ fn lower(
         if args.len() != 1 {
             return Err(err("crypto hash one-shot takes exactly one argument"));
         }
-        Ok(Some(call_result1(m, func, &args[0], Ty::Ptr)?))
+        Ok(Some(call_result1(m, func, &args[0])?))
     };
     match method {
         "sha256" => one_shot(lowerer, "zap_crypto_sha256"),
@@ -66,13 +103,7 @@ fn lower(
                 _ => ALGO_MD5,
             };
             let a = lowerer.iconst(Ty::I64, algo);
-            let d = lowerer.new_value(Ty::Ptr);
-            lowerer.emit(Inst::Call {
-                dest: Some(d),
-                func: "zap_crypto_new".to_string(),
-                args: vec![a],
-            });
-            Ok(Some((d, Ty::Ptr)))
+            Ok(Some(call_crypto(lowerer, "zap_crypto_new", vec![a])?))
         }
         // crypto.update(handle, data): mutate the handle in place (no result).
         "update" => {
@@ -81,12 +112,11 @@ fn lower(
             }
             let (h, _) = lowerer.expr(&args[0].value)?;
             let (data, _) = lowerer.expr(&args[1].value)?;
-            lowerer.emit(Inst::Call {
-                dest: None,
-                func: "zap_crypto_update".to_string(),
-                args: vec![h, data],
-            });
-            Ok(Some((lowerer.iconst(Ty::I32, 0), Ty::I32)))
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_crypto_update",
+                vec![h, data],
+            )?))
         }
         "hexdigest" => {
             if args.len() != 1 {
@@ -96,19 +126,13 @@ fn lower(
                 lowerer,
                 "zap_crypto_hexdigest",
                 &args[0],
-                Ty::Ptr,
             )?))
         }
         "digest" => {
             if args.len() != 1 {
                 return Err(err("crypto.digest takes exactly one argument"));
             }
-            Ok(Some(call_result1(
-                lowerer,
-                "zap_crypto_digest",
-                &args[0],
-                Ty::Bytes,
-            )?))
+            Ok(Some(call_result1(lowerer, "zap_crypto_digest", &args[0])?))
         }
         "hmac_sha256" | "hmac_sha512" => {
             if args.len() != 2 {
@@ -121,13 +145,7 @@ fn lower(
             };
             let (key, _) = lowerer.expr(&args[0].value)?;
             let (msg, _) = lowerer.expr(&args[1].value)?;
-            let d = lowerer.new_value(Ty::Ptr);
-            lowerer.emit(Inst::Call {
-                dest: Some(d),
-                func: func.to_string(),
-                args: vec![key, msg],
-            });
-            Ok(Some((d, Ty::Ptr)))
+            Ok(Some(call_crypto(lowerer, func, vec![key, msg])?))
         }
         // crypto.hmac_sha256_raw(key, msg) -> bytes: the raw 32-byte digest (#153).
         "hmac_sha256_raw" => {
@@ -136,13 +154,11 @@ fn lower(
             }
             let (key, _) = lowerer.expr(&args[0].value)?;
             let (msg, _) = lowerer.expr(&args[1].value)?;
-            let d = lowerer.new_value(Ty::Bytes);
-            lowerer.emit(Inst::Call {
-                dest: Some(d),
-                func: "zap_crypto_hmac_sha256_raw".to_string(),
-                args: vec![key, msg],
-            });
-            Ok(Some((d, Ty::Bytes)))
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_crypto_hmac_sha256_raw",
+                vec![key, msg],
+            )?))
         }
         // crypto.rsa_<hash>_sign(pem_key, data) -> bytes (#628): the raw PKCS#1
         // v1.5 signature. Keep the result Ty::Bytes for byte operations (#644);
@@ -158,11 +174,7 @@ fn lower(
             };
             let (key, _) = lowerer.expr(&args[0].value)?;
             let (data, _) = lowerer.expr(&args[1].value)?;
-            let d = lowerer.new_value(Ty::Bytes);
-            // Key parsing, family rejection and signing failures raise ValueError.
-            // Preserve the active try handler for every signing error (#642).
-            lowerer.throwing_call(Some(d), func, vec![key, data]);
-            Ok(Some((d, Ty::Bytes)))
+            Ok(Some(call_crypto(lowerer, func, vec![key, data])?))
         }
         // crypto.rsa_sha256_verify(pem_pubkey, data, sig) -> bool (#628). The
         // runtime returns an i64 (0/1); the compare-to-zero yields the i1 `bool`.
@@ -175,11 +187,11 @@ fn lower(
             let (key, _) = lowerer.expr(&args[0].value)?;
             let (data, _) = lowerer.expr(&args[1].value)?;
             let (sig, _) = lowerer.expr(&args[2].value)?;
-            Ok(Some(super::support::call_bool(
+            Ok(Some(call_crypto(
                 lowerer,
                 "zap_crypto_rsa_sha256_verify",
                 vec![key, data, sig],
-            )))
+            )?))
         }
         // crypto.random_bytes(n) / crypto.token_hex(n): count coerces to i64.
         "random_bytes" | "token_hex" => {
@@ -195,18 +207,7 @@ fn lower(
             } else {
                 "zap_crypto_token_hex"
             };
-            let result_ty = if method == "random_bytes" {
-                Ty::Bytes
-            } else {
-                Ty::Ptr
-            };
-            let d = lowerer.new_value(result_ty);
-            lowerer.emit(Inst::Call {
-                dest: Some(d),
-                func: func.to_string(),
-                args: vec![n],
-            });
-            Ok(Some((d, result_ty)))
+            Ok(Some(call_crypto(lowerer, func, vec![n])?))
         }
         _ => Ok(None),
     }
