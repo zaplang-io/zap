@@ -3562,6 +3562,13 @@ dedicated message fires rather than "unknown decorator". A future `@cache` is
 gated on first adding module-level persistent state as a language feature (filed
 as prerequisite language issue **#658**).
 
+> **Superseded for `@cache` by D-0115 (I#666).** Epic #661 added module-level
+> persistent state (`const` #658, mutable globals #662, precise-Immix roots
+> #663, the `@shareable` sharing surface #664), so `@cache` is now implementable
+> exactly as this decision required — real, `zap expand`-visible, type-checked
+> Zap over a module-level dict, no hidden store — and ships in D-0115. The
+> `@inject` decision below is unchanged.
+
 **`@inject` — declined for core (permanent).** `@inject` is a DI-framework hook;
 core Zap has **no DI container/registry**, and the concrete FastAPI-style
 `Depends(...)` per-parameter-injection need was already met **at the framework
@@ -4196,3 +4203,101 @@ tests cover `--race`/`-race` on run/build/ir/test, composition with other flags,
 off-by-default, and the `test --doc --race` rejection; `cargo build`/`test`,
 `cargo fmt --all`, and clippy are clean. No grammar/SPEC-legality change (CLI +
 runtime only). No core defects were uncovered.
+
+## D-0115 — `@cache` built-in: memoization as `zap expand`-visible Zap over module-level state (I#666, epic #661; supersedes the D-0109 `@cache` deferral)
+
+**Status:** Accepted. Closes the language work of epic #661 (module-level state)
+by delivering its motivating consumer, the built-in **`@cache`** decorator.
+Supersedes the `@cache` deferral in D-0109.
+
+**Context.** D-0109 deferred `@cache` because memoization needs module-level
+persistent state and that was not a language feature: a `zap expand`-visible,
+type-checked implementation was impossible, and a hidden codegen-level store
+would be a language-bypassing workaround (against the language-first policy).
+Epic #661 then added exactly that state — module `const` (#658/D-0112), mutable
+module globals (#662), precise-Immix static roots + write barrier (#663), and
+the `@shareable` marker + ZAP5125 sharing lint (#664/D-0113). `@cache` is now
+buildable honestly.
+
+**Decision.** `@cache` is a **free-function decorator** that memoizes by the
+decorated function's typed argument tuple. It is **generative** (D-0036):
+applied to `def f(...)->R`, it is expanded **before sema** (in the driver's
+behavioral-decorator pass, the same fold as user `before`/`after`/`wrap`, so it
+stacks bottom-up with them) into ordinary, type-checked, `zap expand`-visible
+Zap — **never a hidden compiler store** (a hard project rule):
+
+- `@derive(Hash, Eq) struct f$Key { <one field per parameter> }` — the typed
+  argument tuple, as a *named* struct. A named key-struct (with derived
+  structural hash/eq) is used rather than a raw tuple key, because a bare tuple
+  dict key currently ICEs (reported as **#680**, an independent core defect);
+  the named-struct dict-key path is fully supported. This is a design choice,
+  not a workaround for #680 — it does not touch the broken path.
+- `@shareable struct f$Cache { bytes lock; dict[f$Key, R] data }` — the store. A
+  bare mutable module dict would trip the #664 **ZAP5125** sharing lint; wrapping
+  it in a `@shareable` struct (guarded by a `Mutex`) is the sanctioned
+  shared-mutable form (D-0113).
+- `f$Cache f$cache = f$Cache(sync.mutex(), {})` — an eagerly-initialized module
+  global (#662).
+- a wrapper with `f`'s exact signature: build the key, lock, return a hit;
+  otherwise unlock, compute `f$orig(...)`, lock, insert, unlock, return.
+
+**Key (value-hashability).** The key is the argument tuple, and it must be
+**value-hashable**. In v1 every parameter must be an **integer, `bool`, or
+`str`** — the exact set the generated key-struct's `@derive(Hash, Eq)` hashes by
+*value* (`str` is a reference but is hashed/compared by content). A **reference
+type** — a user `struct`/`enum`, or a collection — is **rejected** (not keyed by
+identity), with the dedicated **ZAP5056** diagnostic. This is deliberate: a
+`struct`/`enum` key would otherwise be hashed by **identity**, so two
+equal-but-distinct arguments would never hit and the cache would *silently give
+no benefit while looking correct* — the exact footgun called out in review — and
+in fact `@derive(Hash, Eq)` cannot hash a nested struct field by value today, so
+an accepted reference key would surface a confusing error about the internal
+`<fn>$Key` struct instead. `float`/`bytes`/`char`/`complex`/`bigint`, a bare
+tuple, an optional, and a function value are likewise not v1 keys; so are a
+variadic/`**kwargs` collector, a zero-parameter/no-return/generic function, and
+any `@cache` argument — all **ZAP5056**, never an ICE. The check is an
+**allowlist** (only the value-hashable primitives pass), because a user
+struct/enum name is an arbitrary identifier that a denylist could not catch;
+value-hashable types not yet listed (e.g. a tier-1 `enum`) are a safe, clear
+false-negative, and widening the set — or adding structural struct/enum keys
+once `@derive(Hash)` hashes nested structs by value — is a future extension.
+
+**Eviction (v1).** **Unbounded for the process lifetime.** The global is an
+immortal GC root (#661/#663 note), so every entry stays reachable until the
+process exits — a deliberate, documented **memory cost**, not a leak. This is
+the simplest correct v1; a bounded/LRU variant (`@cache(maxsize=...)`) is a
+possible future extension and is why v1 rejects arguments rather than silently
+ignoring them.
+
+**Concurrency.** The store is shared across coroutines, so it is guarded by a
+`Mutex` (the `@shareable` assertion is honest because every access holds the
+lock). The miss result is computed **outside** the lock: holding it across the
+user call would deadlock a recursive `@cache` function (the recursive call
+re-enters the wrapper and re-takes the lock) and would serialize unrelated
+computations. The lock therefore guards only the dict bookkeeping — the same
+choice as CPython's `functools.lru_cache`. Consequence: under contention two
+coroutines may both miss and both compute a given key (the second insert wins);
+for a pure function this is a benign recompute, not a correctness bug. The
+single-coroutine goldens observe exactly-once computation.
+
+**GC.** Entries are reachable from the immortal global, so they live until the
+process exits (or an eviction policy removes them, if one is ever added).
+
+**Alternatives rejected.** (a) A hidden compiler-level memo table — violates the
+language-first / `zap expand`-visible rule (the whole reason D-0109 deferred).
+(b) A raw tuple key — ICEs today (#680) and, once fixed, is equivalent to the
+named key-struct; the key-struct additionally gives a stable name in
+`zap expand` and reuses the ordinary `@derive(Hash, Eq)` path. (c) A string key
+built from the arguments — lossy/ambiguous and a workaround for #680; rejected.
+
+**Tests.** Driver unit tests (store synthesis, one key field per parameter,
+bottom-up stacking with a behavioral decorator, every ZAP5056 rejection, method
+rejection, no-op when absent); runtime goldens (memoize-once observable effect
+count, distinct/order-sensitive argument entries, bottom-up stacking,
+unhashable-parameter compile-fail). Observability is by effect count, never
+timing or heap bytes.
+
+**Docs.** SPEC §16 (moved `@cache` into the v1 built-in set), STABILITY (moved
+out of the deferred set), PYTHON_DIFFERENCES (the `functools.cache` row),
+CHANGELOG, and this decision. Diagnostic **ZAP5056** added; **ZAP5055** keeps
+`@inject` only.

@@ -89,10 +89,11 @@ _Last updated: 2026-10-22_
   (`reflect_has` / `reflect_names`, see `design/RUNTIME-ABI.md` §"Decorators &
   reflection", #16). The built-in set is now complete (I#472): `@derive(...)`,
   `@default`/`@validate`/`@range` (D-0101) and `@deprecated` (D-0109) are
-  implemented. `@cache` is **deferred** (D-0109), gated on the **module-level
-  persistent state** language feature (its only real blocker — epic #661,
-  prerequisite #658, built-in #666); its Phase 1 (module-level `const`, #658,
-  D-0112) is implemented, so `@cache` is unblocked pending the mutable phase.
+  implemented, as is **`@cache`** (I#666, D-0115 — now that epic #661 landed
+  module-level persistent state): it memoizes by the argument tuple as
+  `zap expand`-visible Zap over a `@shareable` module-level dict, superseding the
+  D-0109 deferral. Its only remaining open edge is a bounded/LRU `maxsize`
+  option (v1 is unbounded for the process lifetime).
   `@inject` is **declined for core** (D-0109) — DI is a framework concern met by
   reflection-driven `Depends(...)` adapters (D-0089/D-0092), with no planned
   core `@inject`. Still open: the macro API (what a decorator sees/emits) and

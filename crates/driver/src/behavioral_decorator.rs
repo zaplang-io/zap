@@ -92,16 +92,75 @@
 //! decorated function's exact typed parameters. A `wrap` is mutually exclusive
 //! with `before`/`after`, and stacks with other decorators bottom-up like any
 //! wrapper.
+//!
+//! ## The built-in `@cache` decorator (#666, D-0115, epic #661)
+//!
+//! `@cache` is a *built-in* wrapper decorator — memoization by the decorated
+//! function's typed argument tuple — handled in this same pass (not a separate
+//! one) precisely so it stacks with user `before`/`after`/`wrap` decorators in
+//! correct bottom-up source order through the one shared fold. It generates
+//! ordinary, `zap expand`-visible, type-checked Zap over a **module-level dict**
+//! — never a hidden compiler store (a hard project rule). For
+//!
+//! ```text
+//! @cache
+//! def fib(int64 n) -> int64:
+//!     return n if n < 2 else fib(n - 1) + fib(n - 2)
+//! ```
+//!
+//! it synthesizes (with `$` names that no source identifier can collide with):
+//!
+//! ```text
+//! @derive(Hash, Eq)                 # the typed argument tuple, as a named struct
+//! struct fib$Key:
+//!     int64 n
+//!
+//! @shareable                        # guarded store → silences the #664 ZAP5125 lint
+//! struct fib$Cache:
+//!     bytes lock                    # a sync.mutex() handle
+//!     dict[fib$Key, int64] data
+//!
+//! fib$Cache fib$cache = fib$Cache(sync.mutex(), {})   # immortal module global
+//!
+//! def fib$orig(int64 n) -> int64: ...                 # the renamed body
+//!
+//! def fib(int64 n) -> int64:                          # the wrapper (exact signature)
+//!     auto $k = fib$Key(n)
+//!     sync.lock(fib$cache.lock)
+//!     if $k in fib$cache.data:
+//!         auto $hit = fib$cache.data[$k]
+//!         sync.unlock(fib$cache.lock)
+//!         return $hit
+//!     sync.unlock(fib$cache.lock)
+//!     auto $result = fib$orig(n)                       # computed OUTSIDE the lock
+//!     sync.lock(fib$cache.lock)
+//!     fib$cache.data[$k] = $result
+//!     sync.unlock(fib$cache.lock)
+//!     return $result
+//! ```
+//!
+//! The result is computed *outside* the lock so a recursive `@cache` function
+//! (`fib` calls `fib`, the wrapper) cannot self-deadlock, and the lock only
+//! guards the dict bookkeeping — the same shape as CPython's `functools.lru_cache`
+//! (lock around the table, not around the user call). A key-struct keyed dict
+//! (named, `@derive(Hash, Eq)`) is used rather than a raw tuple key, which is the
+//! fully-supported hashable path (a bare tuple key currently ICEs — #680). The
+//! store is unbounded for the process lifetime (the global is an immortal GC root,
+//! #661/#663): a documented memory cost, not an eviction policy (D-0115). A
+//! signature that cannot be a stable key — a non-hashable, variadic/`**kwargs`,
+//! zero-parameter, generic, or no-return function — is rejected with ZAP5056.
 
 use std::collections::HashMap;
 
 use zapc_diag::ErrorCode;
 use zapc_sema::TypeError;
 use zapc_syntax::ast::{
-    Arg, ArgSpread, Block, CompClause, DecoratorDef, DecoratorMember, DictItem, ExceptClause, Expr,
-    Function, Item, MatchArm, Module, Param, Stmt, WithItem,
+    Arg, ArgSpread, BinOp, Block, CompClause, Decorator, DecoratorDef, DecoratorMember, DictItem,
+    ExceptClause, Expr, Field, Function, Item, MatchArm, Module, Param, Stmt, StructDef, Type,
+    WithItem,
 };
 use zapc_syntax::span::Span;
+use zapc_syntax::SHAREABLE_MARKER;
 
 /// Expand every applied behavioral (`before`/`after`) decorator in `module` in
 /// place. A decorator is *behavioral* when its declaration has at least one
@@ -122,16 +181,37 @@ pub fn expand_behavioral_decorators(module: &mut Module) -> Vec<TypeError> {
 
     let mut diags: Vec<TypeError> = Vec::new();
 
-    if behavioral.is_empty() {
+    // The built-in `@cache` wrapper (#666) is handled by this same pass, so it
+    // must run whenever `@cache` appears anywhere — on a free function (to
+    // expand it) or on a method/parameter (to report the ZAP5056 misuse) — even
+    // with no user behavioral decorators at all.
+    let has_cache = module.items.iter().any(|it| match it {
+        Item::Function(f) => {
+            f.decorators.iter().any(is_cache_deco)
+                || f.params
+                    .iter()
+                    .any(|p| p.decorators.iter().any(is_cache_deco))
+        }
+        Item::Struct(s) => s
+            .methods
+            .iter()
+            .any(|m| m.decorators.iter().any(is_cache_deco)),
+        _ => false,
+    });
+    if behavioral.is_empty() && !has_cache {
         return diags;
     }
 
     // A behavioral decorator on anything but a free top-level function is not
     // supported in this slice (#651): report each such use precisely.
     report_unsupported_targets(module, &behavioral, &mut diags);
+    // `@cache` is likewise a free-function decorator in v1 (#666); a method or
+    // parameter application is reported here rather than reaching lowering.
+    report_unsupported_cache_targets(module, &mut diags);
 
     // Rewrite the top-level function list, expanding each free function that
-    // carries at least one behavioral decorator into its `$orig` + wrapper chain.
+    // carries at least one behavioral decorator — or the built-in `@cache` — into
+    // its `$orig` + wrapper chain (plus, for `@cache`, the generated store items).
     let mut new_items: Vec<Item> = Vec::with_capacity(module.items.len());
     for item in std::mem::take(&mut module.items) {
         let Item::Function(f) = item else {
@@ -140,7 +220,7 @@ pub fn expand_behavioral_decorators(module: &mut Module) -> Vec<TypeError> {
         };
         if f.decorators
             .iter()
-            .all(|d| !behavioral.contains_key(&d.name))
+            .all(|d| !behavioral.contains_key(&d.name) && !is_cache_deco(d))
         {
             new_items.push(Item::Function(f));
             continue;
@@ -150,6 +230,54 @@ pub fn expand_behavioral_decorators(module: &mut Module) -> Vec<TypeError> {
     module.items = new_items;
 
     diags
+}
+
+/// The built-in memoization decorator name (#666, D-0115).
+const CACHE_DECO: &str = "cache";
+
+/// Whether a decorator application is the built-in `@cache`.
+fn is_cache_deco(d: &Decorator) -> bool {
+    d.name == CACHE_DECO
+}
+
+/// Report `@cache` applied to a struct method or a parameter (ZAP5056): v1
+/// `@cache` decorates free top-level functions only. A struct/field/enum
+/// application is caught by sema's `require_target` instead (the function-only
+/// expansion below never consumes it, so it reaches sema).
+fn report_unsupported_cache_targets(module: &Module, diags: &mut Vec<TypeError>) {
+    for it in &module.items {
+        match it {
+            Item::Struct(s) => {
+                for m in &s.methods {
+                    for d in &m.decorators {
+                        if is_cache_deco(d) {
+                            diags.push(err(
+                                ErrorCode::ZAP5056,
+                                "@cache applies to a free function, not a method (#666); \
+                                 memoize method results by hand over a module-level dict"
+                                    .to_string(),
+                                d.span,
+                            ));
+                        }
+                    }
+                }
+            }
+            Item::Function(f) => {
+                for p in &f.params {
+                    for d in &p.decorators {
+                        if is_cache_deco(d) {
+                            diags.push(err(
+                                ErrorCode::ZAP5056,
+                                "@cache applies to a function, not a parameter (#666)".to_string(),
+                                d.span,
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Expand one free function carrying one or more behavioral decorators, pushing
@@ -164,15 +292,26 @@ fn expand_function(
 ) {
     let real_name = f.name.clone();
 
-    // Split decorators into the behavioral ones to apply (source order) and the
-    // metadata ones kept on the outermost wrapper.
-    let mut applied: Vec<&DecoratorDef> = Vec::new();
-    let mut applied_calls: Vec<Vec<Arg>> = Vec::new();
+    // Split decorators into the wrapper-generating ones to apply (source order:
+    // user `before`/`after`/`wrap`, and the built-in `@cache`) and the metadata
+    // ones kept on the outermost wrapper. Both kinds go through the one fold
+    // below so they stack in correct bottom-up order (#666 relies on this).
+    let mut applied: Vec<AppliedDeco> = Vec::new();
     let mut kept = Vec::new();
     for d in &f.decorators {
         if let Some(def) = behavioral.get(&d.name) {
-            applied.push(def);
-            applied_calls.push(d.args.clone());
+            applied.push(AppliedDeco::Behavioral(def, d.args.clone()));
+        } else if is_cache_deco(d) {
+            if !d.args.is_empty() {
+                diags.push(err(
+                    ErrorCode::ZAP5056,
+                    "@cache takes no arguments in v1: the cache is unbounded for the \
+                     process lifetime (#666, D-0115)"
+                        .to_string(),
+                    d.span,
+                ));
+            }
+            applied.push(AppliedDeco::Cache(d.span));
         } else {
             kept.push(d.clone());
         }
@@ -197,11 +336,10 @@ fn expand_function(
     };
     out.push(Item::Function(orig));
 
-    // Fold the behavioral decorators bottom-up: the innermost (last written) is
-    // nearest the declaration and wraps the original first.
+    // Fold the wrapper-generating decorators bottom-up: the innermost (last
+    // written) is nearest the declaration and wraps the original first.
     let mut inner_name = orig_name;
-    let last = applied.len().saturating_sub(1);
-    for (idx, (def, call_args)) in applied.iter().zip(applied_calls.iter()).enumerate().rev() {
+    for (idx, ad) in applied.iter().enumerate().rev() {
         let is_outer = idx == 0;
         let wrapper_name = if is_outer {
             real_name.clone()
@@ -213,20 +351,40 @@ fn expand_function(
         } else {
             Vec::new()
         };
-        let wrapper = build_wrapper(
-            &wrapper_name,
-            &real_name,
-            &inner_name,
-            &f,
-            def,
-            call_args,
-            decorators,
-            diags,
-        );
+        let wrapper = match ad {
+            AppliedDeco::Behavioral(def, call_args) => build_wrapper(
+                &wrapper_name,
+                &real_name,
+                &inner_name,
+                &f,
+                def,
+                call_args,
+                decorators,
+                diags,
+            ),
+            // The built-in `@cache` wrapper also pushes its generated store items
+            // (key-struct, `@shareable` cache-struct, module global) onto `out`.
+            AppliedDeco::Cache(span) => build_cache_wrapper(
+                &wrapper_name,
+                &inner_name,
+                &f,
+                *span,
+                decorators,
+                out,
+                diags,
+            ),
+        };
         out.push(Item::Function(wrapper));
         inner_name = wrapper_name;
-        let _ = last; // keep the binding readable; the fold drives naming.
     }
+}
+
+/// One applied wrapper-generating decorator, in source order: a user behavioral
+/// decorator (`before`/`after`/`wrap`) carrying its call arguments, or the
+/// built-in `@cache` (#666) carrying its application span.
+enum AppliedDeco<'a> {
+    Behavioral(&'a DecoratorDef, Vec<Arg>),
+    Cache(Span),
 }
 
 /// Build a single wrapper function named `wrapper_name` that applies `def`
@@ -664,6 +822,444 @@ fn forward_args(params: &[Param], sp: Span) -> Vec<Arg> {
             }
         })
         .collect()
+}
+
+/// The synthetic locals the `@cache` wrapper uses (unforgeable `$` names).
+const KEY_LOCAL: &str = "$k";
+const HIT_LOCAL: &str = "$hit";
+
+/// Build the `@cache` wrapper for `sig` (#666, D-0115) and push the generated
+/// store items — the `@derive(Hash, Eq)` key-struct, the `@shareable`
+/// cache-struct, and the module global — onto `out`. `wrapper_name` is the name
+/// this wrapper takes (the decorated function's own name when outermost);
+/// `inner_name` is the chained callable it memoizes. `deco_span` anchors any
+/// ZAP5056 rejection. On an un-memoizable signature it reports ZAP5056 and
+/// returns a plain forwarding wrapper (compilation aborts on the diagnostic, but
+/// the rest of the pass still sees a well-formed AST).
+fn build_cache_wrapper(
+    wrapper_name: &str,
+    inner_name: &str,
+    sig: &Function,
+    deco_span: Span,
+    decorators: Vec<Decorator>,
+    out: &mut Vec<Item>,
+    diags: &mut Vec<TypeError>,
+) -> Function {
+    let sp = sig.span;
+    // The receiver (if any) is not part of the key.
+    let params: Vec<&Param> = sig.params.iter().filter(|p| p.name != "self").collect();
+
+    // Validate the signature is memoizable; collect every problem as ZAP5056.
+    let mut bad = false;
+    if !sig.generics.is_empty() {
+        diags.push(err(
+            ErrorCode::ZAP5056,
+            "@cache does not support a generic function in v1 (#666): each \
+             instantiation would need its own store"
+                .to_string(),
+            deco_span,
+        ));
+        bad = true;
+    }
+    if sig.ret.is_none() {
+        diags.push(err(
+            ErrorCode::ZAP5056,
+            "@cache needs a function that returns a value to memoize (#666)".to_string(),
+            deco_span,
+        ));
+        bad = true;
+    }
+    if params.is_empty() {
+        diags.push(err(
+            ErrorCode::ZAP5056,
+            "@cache needs at least one parameter to key on (#666)".to_string(),
+            deco_span,
+        ));
+        bad = true;
+    }
+    for p in &params {
+        if p.variadic || p.kwargs {
+            diags.push(err(
+                ErrorCode::ZAP5056,
+                format!(
+                    "@cache cannot key on the variadic/**kwargs parameter '{}': a \
+                     collector is not a stable cache key (#666)",
+                    p.name
+                ),
+                deco_span,
+            ));
+            bad = true;
+        } else if let Some(ty) = &p.ty {
+            if !type_is_cache_key(ty) {
+                diags.push(err(
+                    ErrorCode::ZAP5056,
+                    format!(
+                        "@cache parameter '{}' of type `{}` cannot be a cache key in v1 \
+                         (#666): the key must be an integer, `bool`, or `str`. A reference \
+                         type (a `struct`/`enum`, or a collection) would be keyed by identity, \
+                         not value — two equal-but-distinct arguments would never hit, so the \
+                         cache would silently give no benefit — and `float`/`bytes` are not \
+                         value-hashable keys. Key on a scalar/str id instead, or memoize by \
+                         hand over a module-level dict",
+                        p.name,
+                        type_display(ty)
+                    ),
+                    deco_span,
+                ));
+                bad = true;
+            }
+        }
+    }
+    if bad {
+        return forwarding_wrapper(wrapper_name, inner_name, sig, decorators);
+    }
+
+    let ret_ty = sig.ret.clone().expect("return type checked present above");
+    let key_struct = format!("{wrapper_name}$Key");
+    let cache_struct = format!("{wrapper_name}$Cache");
+    let global = format!("{wrapper_name}$cache");
+
+    // @derive(Hash, Eq) struct <wrapper>$Key: <one field per key parameter>
+    let key_fields: Vec<Field> = params
+        .iter()
+        .map(|p| Field {
+            decorators: Vec::new(),
+            ty: p.ty.clone().expect("key params are typed"),
+            name: p.name.clone(),
+            bits: None,
+            default: None,
+            span: sp,
+        })
+        .collect();
+    out.push(Item::Struct(StructDef {
+        decorators: vec![Decorator {
+            name: "derive".to_string(),
+            args: vec![name_arg("Hash", sp), name_arg("Eq", sp)],
+            span: sp,
+        }],
+        name: key_struct.clone(),
+        generics: Vec::new(),
+        fields: key_fields,
+        methods: Vec::new(),
+        is_value: false,
+        span: sp,
+    }));
+
+    // @shareable struct <wrapper>$Cache: bytes lock; dict[<Key>, R] data
+    out.push(Item::Struct(StructDef {
+        decorators: vec![Decorator {
+            name: SHAREABLE_MARKER.to_string(),
+            args: Vec::new(),
+            span: sp,
+        }],
+        name: cache_struct.clone(),
+        generics: Vec::new(),
+        fields: vec![
+            Field {
+                decorators: Vec::new(),
+                ty: named_ty("bytes", sp),
+                name: "lock".to_string(),
+                bits: None,
+                default: None,
+                span: sp,
+            },
+            Field {
+                decorators: Vec::new(),
+                ty: dict_ty(&key_struct, ret_ty, sp),
+                name: "data".to_string(),
+                bits: None,
+                default: None,
+                span: sp,
+            },
+        ],
+        methods: Vec::new(),
+        is_value: false,
+        span: sp,
+    }));
+
+    // <Cache> <global> = <Cache>(sync.mutex(), {})   — an immortal module global.
+    out.push(Item::Stmt(Stmt::Let {
+        is_const: false,
+        ty: Some(named_ty(&cache_struct, sp)),
+        name: global.clone(),
+        value: Expr::Call {
+            callee: Box::new(name_expr(&cache_struct, sp)),
+            args: vec![
+                Arg {
+                    name: None,
+                    value: sync_call_expr("mutex", Vec::new(), sp),
+                    spread: ArgSpread::None,
+                    span: sp,
+                },
+                Arg {
+                    name: None,
+                    value: Expr::Dict(Vec::new(), sp),
+                    spread: ArgSpread::None,
+                    span: sp,
+                },
+            ],
+            span: sp,
+        },
+        span: sp,
+    }));
+
+    // --- the wrapper body ---
+    let lock_field = || attr_expr(&global, "lock", sp);
+    let data_field = || attr_expr(&global, "data", sp);
+    let mut stmts: Vec<Stmt> = Vec::new();
+
+    // auto $k = <Key>(p0, p1, ...)
+    stmts.push(Stmt::Let {
+        is_const: false,
+        ty: None,
+        name: KEY_LOCAL.to_string(),
+        value: Expr::Call {
+            callee: Box::new(name_expr(&key_struct, sp)),
+            args: params
+                .iter()
+                .map(|p| Arg {
+                    name: None,
+                    value: name_expr(&p.name, sp),
+                    spread: ArgSpread::None,
+                    span: sp,
+                })
+                .collect(),
+            span: sp,
+        },
+        span: sp,
+    });
+
+    // sync.lock(<global>.lock)
+    stmts.push(sync_stmt("lock", lock_field(), sp));
+
+    // if $k in <global>.data: { auto $hit = <global>.data[$k]; sync.unlock(...); return $hit }
+    let hit_block = Block {
+        stmts: vec![
+            Stmt::Let {
+                is_const: false,
+                ty: None,
+                name: HIT_LOCAL.to_string(),
+                value: Expr::Index {
+                    base: Box::new(data_field()),
+                    index: Box::new(name_expr(KEY_LOCAL, sp)),
+                    span: sp,
+                },
+                span: sp,
+            },
+            sync_stmt("unlock", lock_field(), sp),
+            Stmt::Return {
+                value: Some(name_expr(HIT_LOCAL, sp)),
+                span: sp,
+            },
+        ],
+        span: sp,
+    };
+    stmts.push(Stmt::If {
+        branches: vec![(
+            Expr::Compare {
+                first: Box::new(name_expr(KEY_LOCAL, sp)),
+                rest: vec![(BinOp::In, data_field())],
+                span: sp,
+            },
+            hit_block,
+        )],
+        else_block: None,
+        span: sp,
+    });
+
+    // sync.unlock(...)  — release before computing, so recursion cannot deadlock.
+    stmts.push(sync_stmt("unlock", lock_field(), sp));
+
+    // auto $result = inner(args)   — computed OUTSIDE the lock.
+    stmts.push(Stmt::Let {
+        is_const: false,
+        ty: sig.ret.clone(),
+        name: RESULT_LOCAL.to_string(),
+        value: Expr::Call {
+            callee: Box::new(name_expr(inner_name, sp)),
+            args: forward_args(&sig.params, sp),
+            span: sp,
+        },
+        span: sp,
+    });
+
+    // sync.lock(...); <global>.data[$k] = $result; sync.unlock(...)
+    stmts.push(sync_stmt("lock", lock_field(), sp));
+    stmts.push(Stmt::Assign {
+        target: Expr::Index {
+            base: Box::new(data_field()),
+            index: Box::new(name_expr(KEY_LOCAL, sp)),
+            span: sp,
+        },
+        value: name_expr(RESULT_LOCAL, sp),
+        span: sp,
+    });
+    stmts.push(sync_stmt("unlock", lock_field(), sp));
+
+    // return $result
+    stmts.push(Stmt::Return {
+        value: Some(name_expr(RESULT_LOCAL, sp)),
+        span: sp,
+    });
+
+    Function {
+        decorators,
+        name: wrapper_name.to_string(),
+        generics: Vec::new(),
+        params: sig.params.clone(),
+        ret: sig.ret.clone(),
+        body: Block { stmts, span: sp },
+        span: sp,
+    }
+}
+
+/// A plain wrapper that just forwards to `inner_name` — the fallback emitted when
+/// a `@cache` signature is rejected (ZAP5056), so the AST stays well-formed.
+fn forwarding_wrapper(
+    wrapper_name: &str,
+    inner_name: &str,
+    sig: &Function,
+    decorators: Vec<Decorator>,
+) -> Function {
+    let sp = sig.span;
+    let call = Expr::Call {
+        callee: Box::new(name_expr(inner_name, sp)),
+        args: forward_args(&sig.params, sp),
+        span: sp,
+    };
+    let stmts = if sig.ret.is_some() {
+        vec![Stmt::Return {
+            value: Some(call),
+            span: sp,
+        }]
+    } else {
+        vec![Stmt::Expr(call)]
+    };
+    Function {
+        decorators,
+        name: wrapper_name.to_string(),
+        generics: sig.generics.clone(),
+        params: sig.params.clone(),
+        ret: sig.ret.clone(),
+        body: Block { stmts, span: sp },
+        span: sp,
+    }
+}
+
+/// Whether a parameter type can serve as a `@cache` key in v1 — the
+/// **value-hashable** primitives the generated key-struct's `@derive(Hash, Eq)`
+/// actually supports as fields: integers, `bool`, and `str` (`str` is a
+/// reference but is hashed/compared by content). Everything else is rejected
+/// (ZAP5056) rather than left to produce a misleading result or a leaked-
+/// internal error:
+///
+/// - A **reference type** — a user `struct`/`enum`, or a collection — would be
+///   keyed by **identity**, not value, so two equal-but-distinct arguments would
+///   miss and the cache would silently give no benefit; and `@derive(Hash, Eq)`
+///   cannot even hash such a field by value today, so the generated key-struct
+///   would otherwise fail with an internal-looking error about `<fn>$Key`.
+/// - `float`/`bytes`/`char`/`complex`/`bigint`, a bare tuple, an optional, and a
+///   function value are likewise not value-hashable keys here.
+///
+/// An allowlist (not a denylist) is used deliberately: a user struct/enum name
+/// is an arbitrary identifier, so only an allowlist can reject reference keys
+/// reliably. A type that is value-hashable but not yet listed (e.g. an enum) is
+/// a safe, clear false-negative, not a silent miscompile.
+fn type_is_cache_key(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Named { name, args, .. }
+            if args.is_empty()
+                && matches!(
+                    name.as_str(),
+                    "int" | "int64" | "i64" | "int32" | "i32" | "bool" | "str"
+                )
+    )
+}
+
+/// A compact rendering of a parameter type for the ZAP5056 message.
+fn type_display(ty: &Type) -> String {
+    match ty {
+        Type::Named { name, args, .. } => {
+            if args.is_empty() {
+                name.clone()
+            } else {
+                let inner: Vec<String> = args.iter().map(type_display).collect();
+                format!("{name}[{}]", inner.join(", "))
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            let inner: Vec<String> = elems.iter().map(type_display).collect();
+            format!("({})", inner.join(", "))
+        }
+        Type::Func { .. } => "fn(...)".to_string(),
+    }
+}
+
+// --- small AST builders shared by the `@cache` expansion ---
+
+fn name_expr(n: &str, sp: Span) -> Expr {
+    Expr::Name(n.to_string(), sp)
+}
+
+fn attr_expr(base: &str, field: &str, sp: Span) -> Expr {
+    Expr::Attr {
+        base: Box::new(name_expr(base, sp)),
+        name: field.to_string(),
+        span: sp,
+    }
+}
+
+fn name_arg(n: &str, sp: Span) -> Arg {
+    Arg {
+        name: None,
+        value: name_expr(n, sp),
+        spread: ArgSpread::None,
+        span: sp,
+    }
+}
+
+fn named_ty(n: &str, sp: Span) -> Type {
+    Type::Named {
+        name: n.to_string(),
+        args: Vec::new(),
+        span: sp,
+    }
+}
+
+fn dict_ty(key: &str, val: Type, sp: Span) -> Type {
+    Type::Named {
+        name: "dict".to_string(),
+        args: vec![named_ty(key, sp), val],
+        span: sp,
+    }
+}
+
+/// `sync.<method>(<args>)` as an expression.
+fn sync_call_expr(method: &str, args: Vec<Arg>, sp: Span) -> Expr {
+    Expr::Call {
+        callee: Box::new(Expr::Attr {
+            base: Box::new(name_expr("sync", sp)),
+            name: method.to_string(),
+            span: sp,
+        }),
+        args,
+        span: sp,
+    }
+}
+
+/// `sync.<method>(<arg>)` as an expression statement.
+fn sync_stmt(method: &str, arg: Expr, sp: Span) -> Stmt {
+    Stmt::Expr(sync_call_expr(
+        method,
+        vec![Arg {
+            name: None,
+            value: arg,
+            spread: ArgSpread::None,
+            span: sp,
+        }],
+        sp,
+    ))
 }
 
 fn check_arity(m: &DecoratorMember, want: usize, diags: &mut Vec<TypeError>) {
@@ -1622,5 +2218,162 @@ mod tests {
         let f = func(&m, "f").expect("f stays");
         assert_eq!(f.decorators.len(), 1, "metadata decorator preserved");
         assert!(func(&m, "f$orig").is_none(), "no wrapper generated");
+    }
+
+    // ---- @cache (I#666, D-0115) -------------------------------------------
+
+    fn strukt<'a>(m: &'a Module, name: &str) -> Option<&'a StructDef> {
+        m.items.iter().find_map(|it| match it {
+            Item::Struct(s) if s.name == name => Some(s),
+            _ => None,
+        })
+    }
+
+    fn global_let<'a>(m: &'a Module, name: &str) -> Option<&'a Stmt> {
+        m.items.iter().find_map(|it| match it {
+            Item::Stmt(s @ Stmt::Let { name: n, .. }) if n == name => Some(s),
+            _ => None,
+        })
+    }
+
+    fn deco_names(decos: &[Decorator]) -> Vec<&str> {
+        decos.iter().map(|d| d.name.as_str()).collect()
+    }
+
+    #[test]
+    fn cache_generates_store_items_and_wrapper() {
+        let mut m = module(
+            "@cache\ndef fib(int64 n) -> int64:\n    return n\ndef main():\n    print(fib(1))\n",
+        );
+        let diags = expand_behavioral_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+
+        // Original renamed, body + signature intact, no decorators.
+        let orig = func(&m, "fib$orig").expect("renamed original");
+        assert_eq!(orig.params.len(), 1);
+        assert!(orig.decorators.is_empty());
+
+        // Key-struct: @derive(Hash, Eq), one field per key parameter.
+        let key = strukt(&m, "fib$Key").expect("key struct");
+        assert_eq!(deco_names(&key.decorators), vec!["derive"]);
+        assert_eq!(key.fields.len(), 1);
+        assert_eq!(key.fields[0].name, "n");
+        let derive_traits: Vec<&str> = key.decorators[0]
+            .args
+            .iter()
+            .filter_map(|a| match &a.value {
+                Expr::Name(t, _) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(derive_traits, vec!["Hash", "Eq"]);
+
+        // Cache-struct: @shareable, `lock` + `data` fields; `data` is a dict
+        // keyed by the key-struct.
+        let cache = strukt(&m, "fib$Cache").expect("cache struct");
+        assert_eq!(deco_names(&cache.decorators), vec![SHAREABLE_MARKER]);
+        assert_eq!(cache.fields.len(), 2);
+        assert_eq!(cache.fields[0].name, "lock");
+        assert_eq!(cache.fields[1].name, "data");
+        assert!(matches!(
+            &cache.fields[1].ty,
+            Type::Named { name, args, .. }
+                if name == "dict"
+                    && matches!(&args[0], Type::Named { name, .. } if name == "fib$Key")
+        ));
+
+        // Module global of the cache-struct type, initialized once.
+        assert!(global_let(&m, "fib$cache").is_some(), "cache global");
+
+        // Wrapper keeps the real name + signature; `@cache` is consumed.
+        let wrapper = func(&m, "fib").expect("wrapper");
+        assert!(wrapper.decorators.is_empty(), "@cache consumed");
+        assert_eq!(wrapper.params.len(), 1);
+        assert!(matches!(&wrapper.ret, Some(Type::Named { name, .. }) if name == "int64"));
+    }
+
+    #[test]
+    fn cache_multi_arg_key_struct_has_field_per_param() {
+        let mut m = module(
+            "@cache\ndef g(int64 a, str b) -> int64:\n    return a\ndef main():\n    print(g(1, \"x\"))\n",
+        );
+        let diags = expand_behavioral_decorators(&mut m);
+        assert!(diags.is_empty(), "{diags:?}");
+        let key = strukt(&m, "g$Key").expect("key struct");
+        let names: Vec<&str> = key.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn cache_stacks_bottom_up_with_behavioral() {
+        // `@logged` over `@cache`: Python `logged(cache(f))` — cache is innermost
+        // (wraps the original), logged is the outer wrapper keeping the name.
+        let mut m = module(&format!(
+            "{LOGGED}@logged\n@cache\ndef sq(int64 n) -> int64:\n    return n * n\ndef main():\n    print(sq(2))\n"
+        ));
+        let diags = expand_behavioral_decorators(&mut m);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(func(&m, "sq$orig").is_some(), "original");
+        // The inner (cache) wrapper is a non-outer position → `$deco1`, and its
+        // store items are named after it.
+        assert!(func(&m, "sq$deco1").is_some(), "cache wrapper (inner)");
+        assert!(strukt(&m, "sq$deco1$Key").is_some(), "cache key struct");
+        assert!(global_let(&m, "sq$deco1$cache").is_some(), "cache global");
+        let outer = func(&m, "sq").expect("outer wrapper");
+        assert!(outer.decorators.is_empty(), "both decorators consumed");
+    }
+
+    /// The single ZAP5056 code for every un-memoizable `@cache` signature.
+    fn cache_rejects(src: &str) -> Vec<TypeError> {
+        let mut m = module(src);
+        let diags = expand_behavioral_decorators(&mut m);
+        assert!(
+            diags.iter().all(|d| d.code == ErrorCode::ZAP5056),
+            "expected only ZAP5056, got {diags:?}"
+        );
+        assert!(!diags.is_empty(), "expected a rejection for {src:?}");
+        diags
+    }
+
+    #[test]
+    fn cache_rejects_unmemoizable_signatures() {
+        // Non-hashable (collection) parameter.
+        cache_rejects("@cache\ndef f(list[int64] xs) -> int64:\n    return 0\n");
+        // A reference struct would be keyed by identity, not value — rejected so
+        // the "silently no cache hits" footgun is a clean compile error, not a
+        // leaked-internal `$Key` error (#666 review).
+        cache_rejects("struct P:\n    int64 x\n@cache\ndef f(P p) -> int64:\n    return p.x\n");
+        // `float` is not a value-hashable key.
+        cache_rejects("@cache\ndef f(float64 x) -> int64:\n    return 0\n");
+        // `bytes` is not accepted as a key in v1.
+        cache_rejects("@cache\ndef f(bytes b) -> int64:\n    return 0\n");
+        // No return value to store.
+        cache_rejects("@cache\ndef f(int64 n):\n    print(n)\n");
+        // No parameter to key on.
+        cache_rejects("@cache\ndef f() -> int64:\n    return 0\n");
+        // Variadic collector is not a stable key.
+        cache_rejects("@cache\ndef f(int64... ns) -> int64:\n    return 0\n");
+        // Generic function would need a store per instantiation.
+        cache_rejects("@cache\ndef f[T](T x) -> int64:\n    return 0\n");
+        // `@cache` takes no arguments in v1.
+        cache_rejects("@cache(10)\ndef f(int64 n) -> int64:\n    return n\n");
+    }
+
+    #[test]
+    fn cache_on_method_is_rejected() {
+        let diags = cache_rejects(
+            "struct S:\n    int64 x\n    @cache\n    def m(self, int64 n) -> int64:\n        return n\n",
+        );
+        assert!(diags[0].message.contains("free function"));
+    }
+
+    #[test]
+    fn cache_without_any_application_is_untouched() {
+        // A file with no `@cache` and no behavioral decorator is left as-is.
+        let mut m = module("def f(int64 n) -> int64:\n    return n\n");
+        let before = m.items.len();
+        let diags = expand_behavioral_decorators(&mut m);
+        assert!(diags.is_empty());
+        assert_eq!(m.items.len(), before, "nothing generated");
     }
 }

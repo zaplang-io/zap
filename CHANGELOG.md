@@ -25,6 +25,29 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`@cache` built-in decorator — memoization over module-level state** (#666,
+  D-0115; closes the language work of epic #661, supersedes the D-0109 `@cache`
+  deferral). `@cache` on a free function memoizes it by the typed argument tuple,
+  generating **ordinary, `zap expand`-visible, type-checked Zap over a
+  module-level dict** — never a hidden compiler store. Expansion (before sema, in
+  the same pass as user `before`/`after`/`wrap`, so it stacks bottom-up)
+  synthesizes a `@derive(Hash, Eq)` key-struct (the argument tuple, as a named
+  struct — a bare tuple dict key ICEs, #680), a `@shareable` store struct holding
+  a `Mutex` and the memo `dict` (so the shared mutable store does not trip the
+  #664 ZAP5125 lint), an immortal module global, and a wrapper that returns a hit
+  or computes-and-stores a miss. The miss is computed **outside** the lock, so a
+  recursive `@cache` function cannot self-deadlock; the lock guards only the dict,
+  like `functools.lru_cache`. v1 is unbounded for the process lifetime (a
+  documented memory cost). The key must be **value-hashable** — an integer,
+  `bool`, or `str` in v1; a **reference type** (a `struct`/`enum` or a
+  collection) is a **compile error (ZAP5056)**, not silently keyed by identity
+  (which would miss on equal-but-distinct arguments and give no benefit). An
+  un-memoizable signature — a non-value-hashable parameter (reference,
+  `float`/`bytes`, tuple, …), a variadic/`**kwargs`, zero-parameter, generic, or
+  no-return function, a method, or any `@cache` argument — is a stable
+  **ZAP5056** error (never an ICE). The
+  sema `@cache` arm no longer rejects with ZAP5055 (that was the deferral); it now
+  only catches misapplication to a non-function target.
 - **Runtime data-race detector surface: `--race`** — the *dynamic* backstop for
   the light concurrency model (#665, D-0114; locked-design point 6 of epic #661,
   complementing the static sharing lint from #664). A new **`--race`** flag

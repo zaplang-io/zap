@@ -1877,9 +1877,11 @@ fn err(m: impl Into<String>) -> LowerError {
 //     no ZIR, so it is a recognized no-op here (see `DECORATED_NO_CODE`).
 // The field group `@default`/`@validate`/`@range` is realized at field targets
 // (D-0101); a *non-field* application of those names stays a clean "not
-// implemented yet" lowering error (`DEFERRED_BUILTINS`). `@cache`/`@inject` are
-// reclassified/deferred and rejected at sema (ZAP5055, D-0109), so they never
-// reach this pass. The user-defined compile-time macro API stays deferred
+// implemented yet" lowering error (`DEFERRED_BUILTINS`). `@cache` (I#666,
+// D-0115) is expanded *before* sema into ordinary Zap over a module-level dict
+// (crates/driver's behavioral-decorator pass), so it is consumed and never
+// reaches this pass; `@inject` stays reclassified/declined and rejected at sema
+// (ZAP5055, D-0109). The user-defined compile-time macro API stays deferred
 // (OPEN-QUESTIONS.md).
 // ----------------------------------------------------------------------------
 
@@ -1888,9 +1890,9 @@ fn err(m: impl Into<String>) -> LowerError {
 /// field targets (`@default`/`@validate`/`@range`, D-0101); any *other* target
 /// is reported here as a clean "not implemented yet" lowering error.
 ///
-/// `@cache`/`@inject` are no longer here: they are reclassified/deferred and
-/// rejected at sema (ZAP5055, I#472/D-0109), so they never reach lowering.
-/// `@deprecated` is likewise gone: it is implemented as a sema-only use-site
+/// `@cache`/`@inject` are not here: `@cache` (I#666/D-0115) is expanded to real
+/// Zap before sema (so it is gone by lowering); `@inject` stays rejected at sema
+/// (ZAP5055, I#472/D-0109). `@deprecated` is likewise gone: a sema-only use-site
 /// warning (ZAP5124) and generates no code, so lowering treats it as a no-op
 /// (see [`DECORATED_NO_CODE`]).
 const DEFERRED_BUILTINS: &[&str] = &["default", "validate", "range"];
