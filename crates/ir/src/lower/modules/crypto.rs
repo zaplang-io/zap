@@ -144,11 +144,9 @@ fn lower(
             let (key, _) = lowerer.expr(&args[0].value)?;
             let (data, _) = lowerer.expr(&args[1].value)?;
             let d = lowerer.new_value(Ty::Ptr);
-            lowerer.emit(Inst::Call {
-                dest: Some(d),
-                func: func.to_string(),
-                args: vec![key, data],
-            });
+            // Key parsing, family rejection and signing failures raise ValueError.
+            // Preserve the active try handler for every signing error (#642).
+            lowerer.throwing_call(Some(d), func, vec![key, data]);
             Ok(Some((d, Ty::Ptr)))
         }
         // crypto.rsa_sha256_verify(pem_pubkey, data, sig) -> bool (#628). The

@@ -3037,7 +3037,9 @@ primitive lands here instead.
   signing and verification explicitly select `RSA_PKCS1_PADDING`. Wrong-family
   private keys raise `ValueError`; wrong-family public keys return `false`.
   This prevents the generic EVP dispatch from silently selecting another
-  signature scheme. No key-size policy or additional algorithm is introduced.
+  signature scheme. Sign calls use throwing-call lowering so a local `try`
+  catches parsing, family, and signing errors. No key-size policy or additional
+  algorithm is introduced.
 - **Backend.** These are the only OpenSSL-backed entries in `crypto` — the
   hashing/HMAC/CSPRNG section stays a self-contained FIPS/RFC reference
   implementation, but RSA (bignum modexp + ASN.1 key parsing) would be a large,

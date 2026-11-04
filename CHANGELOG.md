@@ -131,5 +131,7 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   PKCS#1 v1.5 padding (#642). Previously generic EVP dispatch could sign with
   an EC/DSA key or verify a foreign-family signature. Wrong-family signing
   raises `ValueError`; verification returns `false`, including RSA-PSS keys.
+  Emit sign calls through the throwing-call path so local handlers catch
+  parsing, key-family, and signing errors.
 
 [Unreleased]: https://github.com/zaplang-io/zap/commits/main
