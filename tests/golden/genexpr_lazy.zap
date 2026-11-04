@@ -2,26 +2,26 @@
 # D4). A genexpr is LAZY — it yields on demand through the I#67 generator
 # machinery and builds no intermediate list.
 #
-# (1) Laziness proof: the generator `produced(n)` prints a marker `200 + i` as
-#     each item is produced. A genexpr over it, consumed by a `for` loop that
-#     breaks after 2 items, must produce ONLY those 2 — so markers 201 and 202
-#     print but 203, 204, 205 never do. The interleaving (marker, then the
-#     doubled value) shows items are pulled one at a time, not up front.
+# (1) Laziness proof: `tap(x)` prints a marker `200 + x` as each element is
+#     produced, then returns it. A genexpr over `range(5)`, consumed by a `for`
+#     loop that breaks after 2 elements, runs `tap` for ONLY those 2 — so markers
+#     200 and 201 print but 202, 203, 204 never do. The interleaving (marker,
+#     then the doubled value) shows elements are pulled one at a time, not up
+#     front. (The genexpr drives a plain `range`, not another generator — a
+#     genexpr nested inside a generator is the "nested generators" case I#67
+#     deferred.)
 # (2) `sum(x*x for x in range(5))` as the sole call argument sums 0+1+4+9+16=30
 #     with no intermediate list.
 # (3) A genexpr bound to a name is a standalone Iterator consumed once: filtering
 #     xs for y > 2 gives 3 and 4, summing to 7.
-def produced(int64 n):
-    auto i = 0
-    while i < n:
-        i = i + 1
-        print(200 + i)
-        yield i
+def tap(int64 x) -> int64:
+    print(200 + x)
+    return x
 
 def main():
-    # (1) lazy consumption with an early break over a side-effecting generator
+    # (1) lazy consumption with an early break over a side-effecting element
     auto count = 0
-    for v in (x * 2 for x in produced(5)):
+    for v in (tap(x) * 2 for x in range(5)):
         print(v)
         count = count + 1
         if count == 2:
