@@ -40,6 +40,19 @@ def valid(
     auto s1 = crypto.rsa_sha1_sign(private, message)
     auto s256 = crypto.rsa_sha256_sign(bytes(private), message)
     assert len(s1) == size and len(s256) == size
+    # #644: inferred signer results must support direct byte operations.
+    assert s1 == s1[:]
+    assert s256 == s256[:]
+    assert s1[:0] == b"" and s256[:0] == b""
+    assert s1[-1] == s1[size - 1] and s256[-1] == s256[size - 1]
+    assert s1[:8] + s1[8:] == s1
+    assert s256[:8] + s256[8:] == s256
+    assert s1 + bytes([0, 255]) == s1[:] + bytes([0, 255])
+    assert s256 + bytes([0, 255]) == s256[:] + bytes([0, 255])
+    assert s1 != s1[:-1] and s256 != s256[:-1]
+    assert not crypto.rsa_sha256_verify(public, message, s256[:-1])
+    assert not crypto.rsa_sha256_verify(public, message, s256 + b"x")
+    assert not crypto.rsa_sha256_verify(public, message, bytes([s256[0] ^ 1]) + s256[1:])
     assert crypto.sha256(s1) == sha1_hash
     assert crypto.sha256(s256) == sha256_hash
     assert crypto.sha256(crypto.rsa_sha1_sign(bytes(private), message)) == sha1_hash
@@ -525,6 +538,10 @@ EnLU/MsAJVuSdi0Tfruwv3A4O0fKcZ3N
             "1c2b82ff9c0b85887d6542ac800083acde4c5dc64348dc743386e07c953b2da3d5ad86e99cdcfa80e7cb16766e52c66ba9c3e9000ca7dff75b56f13dca2df7f486594362576a3a61a33a689b73573fcd6b6a18b40d2530f817d6a857050efe1b95c99808ffa2da028562834cf7f6952fa7ada18f4c6f411e1d93b4b1be78ca676e607bc39562109e78a8af9449730383ca9266ed82b4428e43852652662f0390c515ff9e7cc4519827f31bd37901a84bbcb6fa8ff3e8625f3c6f2c05b70d0b46a70f9b366a9b15ecd6ce55242cc67a8bc064de6beb470ec2573a454ead22c46c7d08a89c58af556cef9f10102265fc6cf629090357d17020aaea001b701a347eda07adaa7f4e76b03b74d003c2a2baefc2991ae17ee4ccec71d48c6bacf594ff9814fef51f47588f7e0ee24f4daae2123b5f980963ac929a0c32e8ef9f35247e11727f7920800d3a586a122ae6d2e6728b02ea698c40cbb9850341f1651bbb67a1e67d2d43ad8b9500602dae02bb61de20819010558f18c06f75a36f9e2ef8d3",
         ),
     )
+    assert crypto.rsa_sha1_sign(rsa2048, b"RSA binding regression") == hex.decode("7fe4fb36b1cb17f39dbbf2f0a90d1b8927645b56ef4728bbb64318511ab712f4a2bf2735a0071d07799d7e1e3c79cba28e817b4efc1670f9ba761fc6c5c199ea1ea57bdb2a1933ba616fe70c140627736e836d4e7c3cb3842bc39320a7cf3ce7f64e58642388a7522ac712dc25caaf55c3ba4856b32d87abc4cc67ac8c0b3b505b51368ff8712faeea818c6cc794946554088fea686e08c9f91e0e66806eb8f6ed13107253744f5423be284e7f716fa36c2323a7bc70d788ddbfa936a2cf5f183fa772569d949d480834c0c1e8ce2517d24424b89039b80654e607018bde6ce6b65fd6680e2194b665b273b7a79bb662a7d790a8ce2088aad629b14488af7bac")
+    assert crypto.rsa_sha256_sign(rsa2048, b"RSA binding regression") == hex.decode("5c42befa3cd508cdb2de15299928a28855616e83ffe406763eaeaea797e8e7d2ad40f3fed799c00bbbce1244b45d1960a2625ecbfcd0b442f3fdd0d7c012b6445d569dc36d6686a96428b2c517ac9de761e0da02cf0c475e23aa47fb7e8ec6a00427d75a7d53f478dec612d29fedbaf2209a1bc55455628d533cc4f38764aff346d13611a72ae1267dd6cb54107fdb417e9cc80cc64b0e8257744f18e16654f464df8f410b9f89b7ec88ad463befbd0f12947ad31864a583de49b6f470232b3f0c27c9c85500a1a9a851d995342d949b699d5f83031408881ee38d4bf4e95d0ec136e9fb7ac6f60f0e926e4ffe11b15931e16f1ab037370f07fb6cc223395fcb")
+    assert crypto.rsa_sha1_sign(rsa3072, b"RSA binding regression") == hex.decode("c5245ac40db637c282dc181dc484514e0e6a129c7f70fd574a932fcce69ea9279e33c6855a9916109dbd1a9ea3d39a0871f79f1d3306b9a82687ebeb74a612736d48d912127e020118ffb1bd7cffec9b0cc8a6a002fbeb2415bb930b450d5e2052811e26ef39ac90be88c2985e89f70135d46b307d77192b9bdf2705e6a9ed2713e4b7acd016078724534ad6a4dc9e43fc0305efbfa0994bb0e8858001c14efdd75bcf80d87082a30e07a1427a78ca6af10d55179a9d7f36f0c7a2c9257f19aeba9fbd05a2412aa7fb7390549521d061cd0631f5c29670bafa9a6319ce11745f4d00ad37ce18b850f674f8ec0de11504c97453c2a4d6b32e19afb8821767930b16d216b66958fee33b8aac5d381260674524f5ac5778c91c52cd6340a9b31df953d80b84e689fa4e4921b4f8e0e71b2069da912e5cf5dbf6aaf0f34b01438e90403f936262b2a5881136c6b0d3a54ead76fbfd6ebadb2e398c6f4b059ae651c6fdba64e7ef5637ff33cbc857951beff96ef45da37870fd144eb4ebdb833e576c")
+    assert crypto.rsa_sha256_sign(rsa3072, b"RSA binding regression") == hex.decode("1c2b82ff9c0b85887d6542ac800083acde4c5dc64348dc743386e07c953b2da3d5ad86e99cdcfa80e7cb16766e52c66ba9c3e9000ca7dff75b56f13dca2df7f486594362576a3a61a33a689b73573fcd6b6a18b40d2530f817d6a857050efe1b95c99808ffa2da028562834cf7f6952fa7ada18f4c6f411e1d93b4b1be78ca676e607bc39562109e78a8af9449730383ca9266ed82b4428e43852652662f0390c515ff9e7cc4519827f31bd37901a84bbcb6fa8ff3e8625f3c6f2c05b70d0b46a70f9b366a9b15ecd6ce55242cc67a8bc064de6beb470ec2573a454ead22c46c7d08a89c58af556cef9f10102265fc6cf629090357d17020aaea001b701a347eda07adaa7f4e76b03b74d003c2a2baefc2991ae17ee4ccec71d48c6bacf594ff9814fef51f47588f7e0ee24f4daae2123b5f980963ac929a0c32e8ef9f35247e11727f7920800d3a586a122ae6d2e6728b02ea698c40cbb9850341f1651bbb67a1e67d2d43ad8b9500602dae02bb61de20819010558f18c06f75a36f9e2ef8d3")
     auto valid_signature = crypto.rsa_sha256_sign(rsa2048, "RSA binding regression")
     assert not crypto.rsa_sha256_verify(other_public, "RSA binding regression", valid_signature)
     assert not crypto.rsa_sha256_verify(rsa2048, "RSA binding regression", valid_signature)

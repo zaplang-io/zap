@@ -3040,6 +3040,9 @@ primitive lands here instead.
   signature scheme. Sign calls use throwing-call lowering so a local `try`
   catches parsing, family, and signing errors. No key-size policy or additional
   algorithm is introduced.
+- **Result lowering (#644).** Both RSA sign APIs retain `Ty::Bytes` in ZIR,
+  matching sema. Inferred locals support binary indexing, slicing, concatenation
+  and equality. The runtime ABI remains the shared `ZapStr` pointer layout.
 - **Diagnostics.** Verification still returns `false` for malformed keys,
   foreign families, initialization failures, and mismatches. Configuration
   failures emit fixed, non-sensitive messages through `logging` at DEBUG;

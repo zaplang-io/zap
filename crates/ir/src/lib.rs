@@ -38,6 +38,23 @@ mod tests {
     }
 
     #[test]
+    fn rsa_sign_results_support_inferred_bytes_operations() {
+        // Compile-only: invalid PEM is never executed. This is the reduced
+        // #644 regression; both APIs must support byte operations on auto locals.
+        for algorithm in ["sha1", "sha256"] {
+            lower_ok(&format!(
+                r#"def main():
+    auto sig = crypto.rsa_{algorithm}_sign("invalid PEM", b"message")
+    auto extended = sig + b"x"
+    auto first = sig[0]
+    auto sliced = sig[1:]
+    auto same = sig == b"independent bytes"
+"#
+            ));
+        }
+    }
+
+    #[test]
     fn lower_array_collection_contract_fixtures() {
         let module = lower_ok(include_str!(
             "../../../tests/conformance/array_contract.zap"
