@@ -25,6 +25,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Concurrency-safety surface: `@shareable` + sharing lint** — the advisory
+  surface for the light concurrency model (#664, D-0113; locked-design points
+  4–5 of epic #661, building on the mutable globals from #662). `@shareable` is a
+  no-argument marker on a `struct` asserting — as a *trusted, unverified* claim —
+  that the type is safe under concurrent shared access; it is reflectable via
+  `reflect_has(T, "shareable")`, and the built-in `Atomic`/`Mutex`/`WaitGroup`/
+  `Once`/`Counter`/`Queue` types carry it implicitly under one uniform rule (no
+  hardcoded allowlist in the lint). The static **sharing lint** raises the
+  non-fatal warning **`ZAP5125`** at each read/write of a **mutable** module
+  global whose type is not `@shareable`; a `const` global never warns, and a
+  mutable global of a `@shareable` (or built-in shareable) type is silent. A
+  per-site **`# noqa`** (or `# noqa: ZAP5125`) comment suppresses one site. It is
+  advisory — the program stays legal — never a dialect. A new
+  **`--warnings-as-errors`** flag (alias **`-Werror`**) on `run`/`build`/`ir`
+  makes any surviving warning fatal for CI; off by default.
 - **Precise-Immix static roots + write barrier for module globals** (#663,
   D-0112; epic #661). Module-global pointer slots are now correct under the
   **precise Immix** collector, not only conservative Boehm. Every pointer slot is
@@ -54,8 +69,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   currently holds live — including after reassignment or growth — under both the
   conservative Boehm and precise Immix collectors). Concurrency is the light
   Go/Python model of #661 (unsynchronized, never implicitly locked); the static
-  sharing lint and the `@shareable` marker are later work (the precise-Immix
-  static roots and write barrier landed in #663, above). A module-level tuple-destructuring declaration stays rejected
+  sharing lint and the `@shareable` marker now ship (#664, above), and the
+  precise-Immix static roots and write barrier landed in #663 (above), while a
+  runtime `-race` detector is later work. A module-level tuple-destructuring
+  declaration stays rejected
   (**ZAP3018**); a `const` module binding stays immutable (**ZAP3017**).
 - **Module-level `const`** — persistent, immutable state at module scope (#658,
   D-0112; Phase 1 of the module-level-persistent-state epic #661). A

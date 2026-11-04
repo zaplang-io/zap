@@ -1125,6 +1125,51 @@ mod tests {
         assert!(text.contains("call @zap_reflect_names"), "text:\n{text}");
     }
 
+    #[test]
+    fn shareable_marker_is_reflectable_on_a_user_struct() {
+        // `@shareable` on a `struct` (#664, D-0113) reaches the runtime
+        // reflection registry like any user annotation, so
+        // `reflect_has("Reg", "shareable")` resolves against it.
+        let m = lower_ok(
+            "@shareable\nstruct Reg:\n    int64 n\n\ndef main():\n    print(reflect_has(\"Reg\", \"shareable\"))\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("strconst \"shareable\""),
+            "the @shareable marker must be registered, text:\n{text}"
+        );
+        assert!(text.contains("call @zap_reflect_register"), "text:\n{text}");
+        // The user-struct query goes through the runtime registry (not folded).
+        assert!(text.contains("call @zap_reflect_has"), "text:\n{text}");
+    }
+
+    #[test]
+    fn reflect_has_shareable_on_a_builtin_type_folds_to_true() {
+        // The built-in concurrency primitives carry `@shareable` implicitly and
+        // have no registry entry, so `reflect_has("Atomic", "shareable")` is
+        // folded to a compile-time `true` (#664, D-0113). The fold means NO
+        // runtime `zap_reflect_has` call and no `"Atomic"` registration — which
+        // keeps the `main` prologue of reflection-free programs unchanged.
+        let m = lower_ok("def main():\n    print(reflect_has(\"Atomic\", \"shareable\"))\n");
+        let text = format!("{m}");
+        assert!(
+            !text.contains("call @zap_reflect_has"),
+            "the built-in shareable query must be folded, not a runtime call, text:\n{text}"
+        );
+        assert!(
+            !text.contains("strconst \"Atomic\""),
+            "a folded built-in query must not register the type, text:\n{text}"
+        );
+        // A non-shareable query on the same literal type still goes to runtime
+        // (returns false there), proving only the `shareable` marker is folded.
+        let m = lower_ok("def main():\n    print(reflect_has(\"Atomic\", \"other\"))\n");
+        let text = format!("{m}");
+        assert!(
+            text.contains("call @zap_reflect_has"),
+            "a non-shareable built-in query must NOT be folded, text:\n{text}"
+        );
+    }
+
     // --- signature reflection (I#458, D-0089) ---
 
     #[test]

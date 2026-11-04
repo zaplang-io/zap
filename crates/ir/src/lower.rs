@@ -2209,7 +2209,12 @@ impl DecoratorPlan {
                                 "built-in decorator '@{}' is not implemented yet (deferred)",
                                 d.name
                             )));
-                        } else if meta_names.contains(&d.name) {
+                        } else if meta_names.contains(&d.name)
+                            || d.name == zapc_syntax::SHAREABLE_MARKER
+                        {
+                            // A user `annotation`/`decorator`, or the built-in
+                            // `@shareable` concurrency marker (#664, D-0113):
+                            // record it so `reflect_has(T, "<name>")` sees it.
                             reflect_meta.push((s.name.clone(), d.name.clone()));
                         }
                         // Unknown names are already rejected by sema.
@@ -6068,6 +6073,26 @@ impl<'a> FnLower<'a> {
         fname: &str,
         args: &[ast::Arg],
     ) -> Result<(Value, Ty), LowerError> {
+        // Built-in `@shareable` reflection (#664, D-0113): the concurrency
+        // primitives and concurrent collections carry the marker implicitly, so
+        // they have no runtime registry entry. When both arguments are string
+        // literals naming such a type and the `"shareable"` marker, fold the
+        // query to a compile-time `true`. This keeps `reflect_has(Atomic,
+        // "shareable")` answerable without changing the `main` prologue for
+        // programs that use no reflection (golden-stable). Any other query —
+        // including a user `@shareable` struct, which IS in the runtime registry
+        // — falls through to the normal runtime call below.
+        if fname == "reflect_has" && args.len() == 2 {
+            if let (ast::Expr::Str { value: ty, .. }, ast::Expr::Str { value: name, .. }) =
+                (&args[0].value, &args[1].value)
+            {
+                if name == zapc_syntax::SHAREABLE_MARKER
+                    && zapc_syntax::BUILTIN_SHAREABLE_TYPES.contains(&ty.as_str())
+                {
+                    return Ok((self.iconst(Ty::I1, 1), Ty::I1));
+                }
+            }
+        }
         let mut argvals = Vec::new();
         for a in args {
             let (v, vt) = self.expr(&a.value)?;

@@ -62,6 +62,21 @@ def tick():
     count += 1            # reassigns the module binding (static lexical scope)
 ```
 
+One consequence has no Python analogue: Python coroutines/threads serialize
+through the GIL, so a shared mutable global is at least atomic per bytecode.
+Zap's coroutines are **genuinely concurrent and unsynchronized** (the light
+model, #661), so a shared mutable global can race. Zap therefore ships an
+**advisory sharing lint** (`ZAP5125`, D-0113/#664): a read or write of a mutable
+module global whose type is not `@shareable` warns — the example above warns on
+`count += 1`. A `const` global never warns; mark a type `@shareable` (a trusted
+assertion, like asserting a type is `Sync` in Rust — but *unverified*), or use an
+`Atomic`/`Mutex`/concurrent collection, to silence it. Suppress one site with a
+`# noqa` comment (closest to flake8's `# noqa`, though here it is a *compiler*
+pragma, not a third-party linter's). A team can make the lint — and every other
+warning — fatal in CI with `zap build --warnings-as-errors` (off by default);
+unlike Python's `-W error`, this is a build-exit policy only and never changes
+what the language accepts.
+
 ### Annotated-assignment statements (`x: int = 0`)
 
 Zap has exactly **one** declaration form: type-first (`int64 x = 0`, or
@@ -185,6 +200,7 @@ Python models data with classes; Zap uses nominal `struct` / `enum` /
 | Behavioral decorator | `def deco(fn):` wrapping at runtime | `decorator traced:` with `before(ctx)` / `after(ctx, result)` hooks | **Compile-time** code generation, not a runtime rebind; the wrapper keeps the decorated function's exact signature (automatic `@wraps`), visible via `zap expand` (D-0108, #652). `ctx.name` is the only context field. |
 | General wrapper | `def deco(fn):` + `def inner(*args, **kwargs): return fn(*args, **kwargs)` | `decorator retry(int64 times):` + `def wrap(call):` + `def inner(*args): ... return inner` | **`*args` is a compile-time forwarding template, not a runtime varargs tuple** (D-0108, #653). It may appear only as `call(*args)`, which forwards the decorated function's exact typed parameters; it cannot be read, indexed, iterated, or re-packed, and `**kwargs` capture is not a thing. The generated wrapper has the decorated function's concrete signature (not `(*args, **kwargs)`), so there is no per-call argument boxing. Consequently an `args`-keyed `functools.lru_cache`-style `memoize` is **not** expressible via `wrap` (it needs `args` as a runtime key and persistent cross-call state). A `wrap` with a declared return type whose body may fall through gets an implicit `raise RuntimeError(...)` guard rather than Python's implicit `return None`. |
 | Deprecation | `warnings.warn(..., DeprecationWarning)` at runtime, or `@typing.deprecated` (3.13) | `@deprecated` / `@deprecated("use X")` on a `def`/method | **Compile-time use-site warning** (`ZAP5124`), emitted at every call site, not a runtime warning — the caller sees it while building, and it never fires at run time (D-0109, #472). |
+| Share-safety marker | no equivalent (GIL serializes; `typing` has no `Sync`) | `@shareable` on a `struct` | A no-argument **trusted, unverified** assertion that the type is safe under concurrent shared access (akin to Rust's `Sync`, but unchecked), reflectable via `reflect_has(T, "shareable")`; drives the sharing lint `ZAP5125` (D-0113, #664). |
 | Memoize / DI | `@functools.cache`, framework `@inject` | — | **Not in v1** (D-0109). `@cache` is **deferred**, awaiting module-level persistent state (tracked #658/#661/#666). `@inject` is **declined for core** — dependency injection is done with reflection-driven `Depends(...)` adapters (D-0089/D-0092), not a core decorator; there is no planned core `@inject`. Both names stay reserved and are rejected with `ZAP5055`. |
 
 ### Operators and expressions

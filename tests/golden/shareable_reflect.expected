@@ -1,0 +1,6 @@
+SafeBox shareable
+PlainBox not shareable
+Atomic shareable
+Mutex shareable
+Counter shareable
+SafeBox no nonexistent

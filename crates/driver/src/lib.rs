@@ -158,7 +158,11 @@ fn report_warnings(reports: Vec<Report>) {
 /// graph (I#283/D-0081) into one merged, qualified module, then type-check it.
 /// A single file with no local imports links to just itself, so the single-file
 /// path is unchanged. `when target.*` is resolved per file inside the loader.
-fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
+fn front_end_program(
+    entry: &str,
+    target: &Target,
+    warnings_as_errors: bool,
+) -> Result<Module, ExitCode> {
     let mut module = match modlink::load_program(entry, target) {
         Ok(m) => m,
         Err(diags) => {
@@ -196,12 +200,31 @@ fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
         return Err(ExitCode::from(1));
     }
     let (errs, warns) = zapc_sema::analyze(&module);
+    // Per-site suppression (#664, D-0113): drop warnings whose source line
+    // carries a `# noqa` pragma. The spans are byte offsets into the entry
+    // file's source (sema diagnostics are attributed to `entry`), so the entry
+    // source is the line reference. Shared with the in-process test path so the
+    // behavior is identical (`zapc_sema::apply_suppressions`).
+    let warns = match std::fs::read_to_string(entry) {
+        Ok(src) => zapc_sema::apply_suppressions(&src, warns),
+        Err(_) => warns,
+    };
     // Non-fatal warnings (e.g. a call to an `@deprecated` function, I#472/D-0109;
-    // the `Eq`-without-`Hash` dict/set-key warning, D-0047) are surfaced here but
-    // never fail the build. They print before the error batch so an error, if
-    // any, stays the last thing on stderr.
+    // the `Eq`-without-`Hash` dict/set-key warning, D-0047; the shared-mutable
+    // sharing lint, #664/D-0113) are surfaced here but never fail the build —
+    // unless `--warnings-as-errors` is set (off by default), a team CI knob that
+    // promotes any surviving warning to a build failure without changing what
+    // the language considers legal. They print before the error batch so an
+    // error, if any, stays the last thing on stderr.
     if !warns.is_empty() {
-        report_warnings(sema_reports(entry, warns));
+        report_warnings(sema_reports(entry, warns.clone()));
+        if warnings_as_errors {
+            eprintln!(
+                "zap: {} warning(s) treated as errors (--warnings-as-errors)",
+                warns.len()
+            );
+            return Err(ExitCode::from(1));
+        }
     }
     if !errs.is_empty() {
         report(sema_reports(entry, errs));
@@ -213,13 +236,14 @@ fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
 /// Front-end + AST→ZIR lowering. Host-safe (no LLVM needed). Used by both
 /// `zap ir` and the `zapc ir` subcommand.
 pub fn emit_ir(file: &str) -> ExitCode {
-    emit_ir_for(file, &[])
+    emit_ir_for(file, &[], false)
 }
 
 /// Like [`emit_ir`], but with compile-time `--target-feature`s for `when`
-/// evaluation (I#139).
-pub fn emit_ir_for(file: &str, features: &[String]) -> ExitCode {
-    let mut module = match front_end_program(file, &build_target(features)) {
+/// evaluation (I#139) and the `--warnings-as-errors` knob (#664, D-0113; off by
+/// default), which promotes any surviving warning to a fatal error.
+pub fn emit_ir_for(file: &str, features: &[String], warnings_as_errors: bool) -> ExitCode {
+    let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
         Ok(m) => m,
         Err(code) => return code,
     };
@@ -263,7 +287,7 @@ pub fn emit_expand(file: &str) -> ExitCode {
 /// `out` is the output path; when `None`, a default is chosen (a temp path for
 /// `run`, the file stem for `build`).
 pub fn compile(file: &str, out: Option<String>, run_after: bool) -> ExitCode {
-    compile_for(file, out, run_after, &[], false)
+    compile_for(file, out, run_after, &[], false, false)
 }
 
 /// Like [`compile`], but with compile-time `--target-feature`s for `when`
@@ -277,8 +301,9 @@ pub fn compile_for(
     run_after: bool,
     features: &[String],
     portable: bool,
+    warnings_as_errors: bool,
 ) -> ExitCode {
-    let mut module = match front_end_program(file, &build_target(features)) {
+    let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
         Ok(m) => m,
         Err(code) => return code,
     };
