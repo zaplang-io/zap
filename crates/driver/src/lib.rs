@@ -154,25 +154,6 @@ fn report_warnings(reports: Vec<Report>) {
     }
 }
 
-/// The runtime data-race detector (`--race`, #665, D-0114; epic #661) is the
-/// *dynamic* backstop for the light concurrency model: the static sharing lint
-/// (#664, ZAP5125) flags the obvious unsynchronized shared-global accesses at
-/// compile time, and `--race` is meant to catch the real ones at run time with
-/// a happens-before detector.
-///
-/// This v1 slice recognizes and plumbs the flag end-to-end (CLI → driver, on
-/// `run`/`build`/`ir`/`test`) and records the design decision; the
-/// happens-before / vector-clock detector engine and its access instrumentation
-/// are a tracked follow-up slice. Until that lands, the flag is accepted but
-/// inert, which this notice makes explicit rather than silently ignoring it.
-fn race_not_yet_wired_notice() {
-    eprintln!(
-        "zap: --race: the runtime data-race detector is accepted but not yet \
-         wired in (#665, D-0114); building without race instrumentation. The \
-         static sharing lint (ZAP5125, #664) still applies."
-    );
-}
-
 /// Run the whole-program front end: discover and link the local module import
 /// graph (I#283/D-0081) into one merged, qualified module, then type-check it.
 /// A single file with no local imports links to just itself, so the single-file
@@ -267,9 +248,6 @@ pub fn emit_ir_for(
     warnings_as_errors: bool,
     race: bool,
 ) -> ExitCode {
-    if race {
-        race_not_yet_wired_notice();
-    }
     let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
         Ok(m) => m,
         Err(code) => return code,
@@ -277,7 +255,9 @@ pub fn emit_ir_for(
     // `@test` functions are compiled only under `zap test`, never into a normal
     // build or diagnostic (D-0054).
     testing::strip_test_items(&mut module);
-    let (zir, errs) = zapc_ir::lower_module(&module);
+    // `--race` (#677, epic #665): emit the shared-access instrumentation hooks so
+    // `zap ir --race` shows them. Off → identical ZIR to today (golden-safe).
+    let (zir, errs) = zapc_ir::lower_module_opts(&module, race);
     if !errs.is_empty() {
         // Lowering errors carry no span, so they render as the location-free
         // header (unchanged), but still through the one shared path (#571).
@@ -331,16 +311,13 @@ pub fn compile_for(
     warnings_as_errors: bool,
     race: bool,
 ) -> ExitCode {
-    if race {
-        race_not_yet_wired_notice();
-    }
     let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
         Ok(m) => m,
         Err(code) => return code,
     };
     // `@test` functions are excluded from release binaries (D-0054).
     testing::strip_test_items(&mut module);
-    backend(&module, file, out, run_after, portable)
+    backend(&module, file, out, run_after, portable, race)
 }
 
 /// Default output path for a compile when `-o` is not given.
@@ -390,6 +367,7 @@ fn backend(
     out: Option<String>,
     run_after: bool,
     portable: bool,
+    race: bool,
 ) -> ExitCode {
     use std::process::Command;
 
@@ -424,7 +402,7 @@ fn backend(
         }
     };
 
-    if let Err(e) = zapc_codegen::build_executable(module, &exe, portable) {
+    if let Err(e) = zapc_codegen::build_executable(module, &exe, portable, race) {
         eprintln!("{file}: codegen error: {e}");
         cleanup();
         return ExitCode::from(1);
@@ -453,6 +431,7 @@ fn backend(
     _out: Option<String>,
     _run_after: bool,
     _portable: bool,
+    _race: bool,
 ) -> ExitCode {
     // Keep the default-output logic exercised so it does not warn as dead code
     // on the no-LLVM host build.

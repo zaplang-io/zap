@@ -140,7 +140,8 @@ impl ReplJit {
         self.gen += 1;
         let name = format!("zap_repl_{}", self.gen);
         let builder = self.ctx.create_builder();
-        let (module, _tm) = crate::build_llvm_module(self.ctx, &builder, ast, &name, true)?;
+        // The REPL JIT has no `--race` surface, so race instrumentation is off.
+        let (module, _tm) = crate::build_llvm_module(self.ctx, &builder, ast, &name, true, false)?;
         self.engine
             .add_module(&module)
             .map_err(|()| "failed to add the entry module to the JIT engine".to_string())?;
@@ -205,6 +206,8 @@ fn build_runtime_dylib() -> Result<(PathBuf, PathBuf), String> {
         .map_err(|e| format!("failed to write runtime: {e}"))?;
     std::fs::write(dir.join("zapgc.inc.c"), crate::RUNTIME_GC_C)
         .map_err(|e| format!("failed to write gc runtime: {e}"))?;
+    std::fs::write(dir.join("zaprace.inc.c"), crate::RUNTIME_RACE_C)
+        .map_err(|e| format!("failed to write race runtime: {e}"))?;
 
     let is_macos = triple.as_str().to_string_lossy().contains("darwin");
     let lib = dir.join(if is_macos {

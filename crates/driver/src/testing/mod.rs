@@ -45,18 +45,12 @@ mod run_impl {
 
     /// `zap test [file] [--json] [--watch] [--race]`.
     ///
-    /// `race` enables the runtime data-race detector (#665, D-0114; epic #661).
-    /// This v1 slice recognizes and plumbs the flag; the happens-before detector
-    /// engine is a tracked follow-up slice, so for now the flag is accepted but
-    /// inert and that is surfaced explicitly (never silently ignored).
+    /// `race` enables the runtime data-race detector (#665, D-0114; epic #661):
+    /// the test harness is built with the shared-access instrumentation (#677) so
+    /// a `@test` that drives racing coroutines is checked at run time. The hooks
+    /// are no-op stubs until the happens-before engine lands (#678), so `--race`
+    /// runs the suite identically for now.
     pub fn run(file: Option<String>, json: bool, watch: bool, race: bool) -> ExitCode {
-        if race {
-            eprintln!(
-                "zap test: --race: the runtime data-race detector is accepted but \
-                 not yet wired in (#665, D-0114); running tests without race \
-                 instrumentation."
-            );
-        }
         let files = discover::discover(file.as_deref());
         if files.is_empty() {
             eprintln!("zap test: no test files found (looked for *_test.zap and tests/)");
@@ -64,10 +58,10 @@ mod run_impl {
         }
 
         if watch {
-            return watch_loop(file.as_deref(), json);
+            return watch_loop(file.as_deref(), json, race);
         }
 
-        let results = run_all(&files);
+        let results = run_all(&files, race);
         emit(&results, json)
     }
 
@@ -91,22 +85,25 @@ mod run_impl {
         if files.is_empty() {
             return (report::format_json(&[]), true);
         }
-        let results = run_all(&files);
+        // The `zap mcp` tool surface has no `--race` flag, so run without it.
+        let results = run_all(&files, false);
         let ok = report::Summary::of(&results).ok();
         (report::format_json(&results), ok)
     }
 
-    /// Compile and run every file, returning the flattened results.
-    fn run_all(files: &[PathBuf]) -> Vec<TestResult> {
+    /// Compile and run every file, returning the flattened results. `race`
+    /// builds each harness with the data-race instrumentation (#677).
+    fn run_all(files: &[PathBuf], race: bool) -> Vec<TestResult> {
         let mut results = Vec::new();
         for f in files {
-            run_file(f, &mut results);
+            run_file(f, &mut results, race);
         }
         results
     }
 
-    /// Compile one file's harness and run it, appending its results.
-    fn run_file(path: &Path, results: &mut Vec<TestResult>) {
+    /// Compile one file's harness and run it, appending its results. `race`
+    /// builds the harness with the data-race instrumentation (#677).
+    fn run_file(path: &Path, results: &mut Vec<TestResult>, race: bool) {
         let display = path.display().to_string();
         let src = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -152,7 +149,7 @@ mod run_impl {
         let exe = temp_exe(path);
         // Test harnesses always use the full (non-portable) link: they run on the
         // build host, where CPython and the dynamic libs are present (I#287).
-        if let Err(e) = zapc_codegen::build_executable(&harness_module, &exe, false) {
+        if let Err(e) = zapc_codegen::build_executable(&harness_module, &exe, false, race) {
             results.push(file_error(&display, format!("codegen error: {e}")));
             return;
         }
@@ -236,12 +233,12 @@ mod run_impl {
     /// `--watch`: re-run on change. Watches every `.zap` under the current tree;
     /// a changed test file re-runs on its own, while a changed shared source
     /// re-runs everything (there is no dependency graph yet — flagged for #69).
-    fn watch_loop(explicit: Option<&str>, json: bool) -> ExitCode {
+    fn watch_loop(explicit: Option<&str>, json: bool, race: bool) -> ExitCode {
         eprintln!("zap test --watch: watching for changes (Ctrl-C to stop)");
         let mut snapshot = scan_mtimes();
         // Initial run.
         let files = discover::discover(explicit);
-        let _ = emit(&run_all(&files), json);
+        let _ = emit(&run_all(&files, race), json);
         loop {
             std::thread::sleep(Duration::from_millis(400));
             let current = scan_mtimes();
@@ -269,7 +266,7 @@ mod run_impl {
                 all
             };
             eprintln!("\nzap test --watch: change detected, re-running…");
-            let _ = emit(&run_all(&to_run), json);
+            let _ = emit(&run_all(&to_run, race), json);
         }
     }
 

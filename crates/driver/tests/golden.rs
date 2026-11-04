@@ -411,3 +411,116 @@ fn golden_projects_match() {
         Outcome::Pass
     });
 }
+
+// ---- `--race` instrumentation goldens (#677, epic #665, D-0114) -----------
+//
+// Slice 1 instruments every ZAP5125 shared-global access with a `__zap_race_*`
+// hook, whose runtime definition is a no-op STUB (the happens-before engine is
+// slice 2). So a `--race` build of the `tests/race/*.zap` fixtures must link
+// (the hook symbols resolve) and run exactly as a non-`--race` build: the stubs
+// add nothing observable. This golden proves that invariant end-to-end; the
+// detector's real verdicts become goldens when the engine lands (#678).
+
+/// `<repo>/tests/race` — the runtime-data-race fixtures (#665, D-0114).
+fn race_dir() -> PathBuf {
+    golden_dir()
+        .parent()
+        .expect("golden dir has a parent")
+        .join("race")
+}
+
+fn race_fixtures() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(race_dir()) {
+        for entry in rd {
+            let p = entry.expect("dir entry").path();
+            if p.extension().is_some_and(|e| e == "zap") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The four spec fixtures are present. Runs everywhere (no LLVM needed).
+#[test]
+fn race_fixtures_present() {
+    let names: Vec<String> = race_fixtures()
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    for want in [
+        "racy_counter.zap",
+        "clean_mutex.zap",
+        "clean_atomic.zap",
+        "clean_single.zap",
+    ] {
+        assert!(
+            names.iter().any(|n| n == want),
+            "missing race fixture {want}; found {names:?}"
+        );
+    }
+}
+
+/// A `--race` build of each fixture links and runs; with the slice-1 no-op
+/// stubs it behaves identically to a non-`--race` build. Requires the `llvm`
+/// feature (compile + link + run); runs in CI.
+#[cfg(feature = "codegen")]
+#[test]
+fn race_builds_run_identically_to_non_race() {
+    use std::process::Command;
+    let per_test = std::time::Duration::from_secs(60);
+    let bin = env!("CARGO_BIN_EXE_zapc");
+    run_goldens_parallel(race_fixtures(), |zap| {
+        let label = zap.display().to_string();
+        let name = zap
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        // Baseline: a plain `zap run` (no instrumentation).
+        let mut base = Command::new(bin);
+        base.arg("run").arg(zap);
+        let base_out = run_with_timeout(base, per_test, &format!("{label} (no --race)"));
+
+        // Instrumented: `zap run --race` — must link (the hook symbols resolve)
+        // and run. The stubs are inert, so the exit code matches the baseline
+        // (0 in slice 1, since nothing reports a race yet).
+        let mut race = Command::new(bin);
+        race.arg("run").arg("--race").arg(zap);
+        let race_out = run_with_timeout(race, per_test, &format!("{label} (--race)"));
+
+        if base_out.status.code() != Some(0) {
+            return Outcome::Failed(format!(
+                "non-race run of {name} should exit 0, got {:?} (stderr:\n{})",
+                base_out.status.code(),
+                String::from_utf8_lossy(&base_out.stderr)
+            ));
+        }
+        if race_out.status.code() != base_out.status.code() {
+            return Outcome::Failed(format!(
+                "--race run of {name} changed the exit code: got {:?}, want {:?} (stderr:\n{})",
+                race_out.status.code(),
+                base_out.status.code(),
+                String::from_utf8_lossy(&race_out.stderr)
+            ));
+        }
+        // The `clean_*` fixtures are deterministic, so their stdout must be
+        // byte-for-byte identical with and without `--race` (the no-op stubs
+        // change nothing). `racy_counter.zap` has a nondeterministic total
+        // (lost updates), so only its exit code is asserted above.
+        if name.starts_with("clean_") {
+            let base_so = String::from_utf8_lossy(&base_out.stdout);
+            let race_so = String::from_utf8_lossy(&race_out.stdout);
+            if base_so.trim_end() != race_so.trim_end() {
+                return Outcome::Failed(format!(
+                    "--race changed stdout of {name}:\n--- no --race ---\n{}\n--- --race ---\n{}",
+                    base_so.trim_end(),
+                    race_so.trim_end()
+                ));
+            }
+        }
+        Outcome::Pass
+    });
+}
