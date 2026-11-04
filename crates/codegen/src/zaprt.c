@@ -14123,6 +14123,7 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
@@ -14157,10 +14158,20 @@ static void *zap_crypto_rsa_sign(const EVP_MD *md, void *pem, void *data) {
         zap_panic_typed(ZAP_EXC_VALUE_ERROR,
                         zap_str_new("crypto: could not parse RSA private key from PEM", 48));
     }
+    /* EVP accepts many key families. The RSA-named API must not silently
+     * become ECDSA/DSA or RSA-PSS when handed another PEM key type (#642). */
+    if (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA) {
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("crypto: RSA private key required",
+                                    sizeof("crypto: RSA private key required") - 1));
+    }
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_PKEY_CTX *pctx = NULL;
     unsigned char *sig = NULL;
     size_t siglen = 0;
-    int ok = ctx && EVP_DigestSignInit(ctx, NULL, md, NULL, pkey) == 1 &&
+    int ok = ctx && EVP_DigestSignInit(ctx, &pctx, md, NULL, pkey) == 1 &&
+             EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) == 1 &&
              EVP_DigestSign(ctx, NULL, &siglen, (const unsigned char *)d->data,
                             (size_t)d->len) == 1 &&
              (sig = (unsigned char *)malloc(siglen ? siglen : 1)) != NULL &&
@@ -14199,12 +14210,15 @@ int64_t zap_crypto_rsa_sha256_verify(void *pem, void *data, void *sig) {
     if (bio) {
         BIO_free(bio);
     }
-    if (!pkey) {
+    if (!pkey || EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA) {
+        EVP_PKEY_free(pkey);
         return 0;
     }
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_PKEY_CTX *pctx = NULL;
     int64_t ok = 0;
-    if (ctx && EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey) == 1) {
+    if (ctx && EVP_DigestVerifyInit(ctx, &pctx, EVP_sha256(), NULL, pkey) == 1 &&
+        EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) == 1) {
         ok = EVP_DigestVerify(ctx, (const unsigned char *)s->data, (size_t)s->len,
                               (const unsigned char *)d->data, (size_t)d->len) == 1
                  ? 1

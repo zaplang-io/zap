@@ -127,7 +127,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Security
 
-- _Nothing yet. Security/soundness fixes are documented here and in
-  `SECURITY.md` (STABILITY §3.3)._
+- Bind RSA-named signing and verification to ordinary RSA keys and explicit
+  PKCS#1 v1.5 padding (#642). Previously generic EVP dispatch could sign with
+  an EC/DSA key or verify a foreign-family signature. Wrong-family signing
+  raises `ValueError`; verification returns `false`, including RSA-PSS keys.
 
 [Unreleased]: https://github.com/zaplang-io/zap/commits/main

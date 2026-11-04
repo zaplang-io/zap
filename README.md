@@ -219,6 +219,10 @@ that every feature is complete on every target. The authoritative per-feature
 status is in [`docs/STABILITY.md`](docs/STABILITY.md); documented behavior is in
 [`SPEC.md`](SPEC.md).
 
+The experimental `crypto.rsa_*` APIs accept ordinary RSA PEM keys and use
+PKCS#1 v1.5 padding. Other key families, including RSA-PSS-only keys, are
+rejected; see [D-0102](DECISIONS.md#d-0102--crypto-rsa-pkcs1-v15-signing-i628).
+
 ## License
 
 Licensed under either of
