@@ -13,8 +13,10 @@
 # argument threading (`x`), return threading (the happy path), the decorator
 # argument (`times=3` → three attempts), and exception propagation with a
 # re-raise on the final attempt. `*args` is a compile-time forwarding template,
-# so the inner body re-raises the bound exception (`raise e`) rather than a bare
-# `raise` (which the runtime does not support yet, ZAP6001).
+# so the inner body re-raises on the last attempt with `raise e` (a bare `raise`
+# is unsupported yet, ZAP6001). `except … as e` binds `e` to the exception's
+# message string, and `raise <str>` re-raises as a base `Exception` carrying
+# that message (D-0007) — so `main` catches `Exception`.
 
 decorator retry(int64 times):
     def wrap(call):
@@ -42,5 +44,5 @@ def main():
     print("ok result", always_ok(21))
     try:
         print(always_fail(5))
-    except ValueError as e:
+    except Exception as e:
         print("gave up", e)
