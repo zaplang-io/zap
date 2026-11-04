@@ -71,10 +71,18 @@ fn type_codes() {
 
 #[test]
 fn semantic_codes() {
-    // `@cache` takes no arguments.
+    // `@cache` is reclassified/deferred — not available in this version
+    // (needs module-level persistent state), rejected with ZAP5055 (I#472,
+    // D-0109), regardless of argument shape.
     assert_code(
         "@cache(1)\ndef f():\n    pass\n\ndef main():\n    pass\n",
-        "ZAP5041",
+        "ZAP5055",
+    );
+    // `@deprecated` on the wrong target (a struct) — it is a function/method
+    // decorator only (I#472, D-0109).
+    assert_code(
+        "@deprecated\nstruct S:\n    int64 x\n\ndef main():\n    pass\n",
+        "ZAP5047",
     );
     // An unknown decorator.
     assert_code("@notathing\ndef main():\n    pass\n", "ZAP5032");

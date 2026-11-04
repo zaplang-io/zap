@@ -257,6 +257,11 @@ struct Checker {
     annotations: HashMap<String, Vec<String>>,
     /// Declared `decorator` names (behavioral, D-0036).
     user_decorators: HashSet<String>,
+    /// Functions and methods carrying `@deprecated` (I#472, D-0109), mapping the
+    /// call key to the optional user message. A free function is keyed by its
+    /// bare name; a method by `"Type.method"`. Each call site resolving to one of
+    /// these raises the non-fatal ZAP5124 use-site warning.
+    deprecated: HashMap<String, Option<String>>,
     scopes: Vec<HashMap<String, Ty>>,
     /// Interface bounds on the type parameters of the declaration currently being
     /// checked (I#164): type-parameter name -> bound interface name. Set while
@@ -470,6 +475,20 @@ pub fn is_test_item(f: &zapc_syntax::ast::Function) -> bool {
         .any(|d| TEST_DECORATORS.contains(&d.name.as_str()))
 }
 
+/// If `decorators` carries `@deprecated` (I#472, D-0109), return its optional
+/// message: `Some(None)` for a bare `@deprecated`, `Some(Some(msg))` for
+/// `@deprecated("msg")`, and `None` when the function is not deprecated. A
+/// non-string-literal argument (already an ill-formed application, ZAP5042) is
+/// treated as "no message" so the warning still fires.
+fn deprecated_message(decorators: &[zapc_syntax::ast::Decorator]) -> Option<Option<String>> {
+    let d = decorators.iter().find(|d| d.name == "deprecated")?;
+    let msg = d.args.first().and_then(|a| match &a.value {
+        Expr::Str { value, .. } => Some(value.clone()),
+        _ => None,
+    });
+    Some(msg)
+}
+
 /// The traits `@derive(...)` can generate (D-0036). Only `Eq` and `Repr` are
 /// lowered to code in this increment; the rest are accepted here and reported as
 /// deferred by the lowering pass.
@@ -638,6 +657,7 @@ impl Checker {
             cyclic_aliases: HashSet::new(),
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
+            deprecated: HashMap::new(),
             scopes: Vec::new(),
             tyvar_bounds: HashMap::new(),
             ret_ty: Ty::Unit,
@@ -1432,9 +1452,26 @@ impl Checker {
 
     fn collect_sigs(&mut self, module: &Module) {
         for item in &module.items {
-            if let Item::Function(f) = item {
-                let sig = self.sig_of(f);
-                self.sigs.insert(f.name.clone(), sig);
+            match item {
+                Item::Function(f) => {
+                    let sig = self.sig_of(f);
+                    self.sigs.insert(f.name.clone(), sig);
+                    // `@deprecated` on a free function (I#472, D-0109): record
+                    // the optional message so every call site warns (ZAP5124).
+                    if let Some(msg) = deprecated_message(&f.decorators) {
+                        self.deprecated.insert(f.name.clone(), msg);
+                    }
+                }
+                Item::Struct(s) => {
+                    // `@deprecated` on a method, keyed `"Type.method"`.
+                    for m in &s.methods {
+                        if let Some(msg) = deprecated_message(&m.decorators) {
+                            self.deprecated
+                                .insert(format!("{}.{}", s.name, m.name), msg);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         self.register_generators(module);
@@ -2099,20 +2136,49 @@ impl Checker {
                 }
             }
             "cache" => {
-                self.require_target(d, target, DecoTarget::Function);
-                if !d.args.is_empty() {
-                    self.error(ErrorCode::ZAP5041, "@cache takes no arguments", d.span);
-                }
+                // Reclassified/deferred (I#472, D-0109): `@cache` needs
+                // module-level persistent state, which is not yet a language
+                // feature (and an `args`-keyed memoize is not expressible via the
+                // user-level `wrap`). Rejected cleanly here rather than advertised
+                // and then rejected at lowering; the name stays reserved so this
+                // dedicated message fires instead of "unknown decorator".
+                self.error(
+                    ErrorCode::ZAP5055,
+                    "@cache is not available in this version: it needs module-level \
+                     persistent state, which is not yet a language feature (I#472, \
+                     D-0109); see STABILITY.md",
+                    d.span,
+                );
             }
             "inject" => {
-                self.require_target(d, target, DecoTarget::Field);
-                if !d.args.is_empty() {
-                    self.error(ErrorCode::ZAP5041, "@inject takes no arguments", d.span);
-                }
+                // Reclassified/deferred (I#472, D-0109): `@inject` is a
+                // DI-framework hook; core has no DI container/registry, and the
+                // concrete FastAPI-style `Depends(...)` need is met by the
+                // reflection-driven handler adapter (D-0089/D-0092, I#466), not a
+                // core decorator. Name reserved for the dedicated message.
+                self.error(
+                    ErrorCode::ZAP5055,
+                    "@inject is not available in this version: core has no DI container; \
+                     use reflection-driven `Depends(...)` adapters (D-0089/D-0092) \
+                     instead (I#472, D-0109); see STABILITY.md",
+                    d.span,
+                );
             }
             "deprecated" => {
-                // Allowed on any target; optional single positional message.
-                let well_formed = d.args.len() <= 1 && keywords == 0;
+                // A function/method decorator (I#472, D-0109): every call site
+                // of the decorated callable gets the ZAP5124 use-site warning.
+                // Deprecating a type/field/parameter is deferred (no well-defined
+                // v1 use site), so the target is restricted to a function here.
+                self.require_target(d, target, DecoTarget::Function);
+                // Optional single positional message string.
+                // `map_or(true, …)` rather than `is_none_or` to stay within the
+                // crate's MSRV (`rust-version = 1.74`; `is_none_or` is 1.82+).
+                #[allow(clippy::unnecessary_map_or)]
+                let well_formed = d.args.len() <= 1
+                    && keywords == 0
+                    && d.args
+                        .first()
+                        .map_or(true, |a| matches!(&a.value, Expr::Str { .. }));
                 if !well_formed {
                     self.error(
                         ErrorCode::ZAP5042,
@@ -4228,6 +4294,20 @@ impl Checker {
     /// Warn when a struct that defines equality but not `__hash__` is used as a
     /// `dict`/`set` key — then `a == b ⟹ hash(a) == hash(b)` is not guaranteed
     /// (D-0047). `@derive(Hash)` or a hand-written `__hash__` silences it.
+    /// Emit the use-site deprecation warning (ZAP5124) if `key` names a
+    /// `@deprecated` function or method (I#472, D-0109). `key` is the free
+    /// function's bare name or a method's `"Type.method"`.
+    fn warn_deprecated_call(&mut self, key: &str, span: Span) {
+        if let Some(msg) = self.deprecated.get(key).cloned() {
+            let base = format!("call to deprecated '{key}'");
+            let full = match msg {
+                Some(m) if !m.is_empty() => format!("{base}: {m}"),
+                _ => base,
+            };
+            self.warn(ErrorCode::ZAP5124, full, span);
+        }
+    }
+
     fn warn_struct_key(&mut self, key: &Ty, span: Span) {
         let (has_eq, has_hash) = match self.struct_info(key) {
             Some(i) => (i.has("__eq__"), i.has("__hash__")),
@@ -5099,6 +5179,8 @@ impl Checker {
                 }
                 _ => {
                     if let Some(sig) = self.sigs.get(fname).cloned() {
+                        // `@deprecated` free function (I#472, D-0109): warn here.
+                        self.warn_deprecated_call(fname, span);
                         return self.check_user_call(&sig, fname, args, span);
                     }
                     // Tier-1 enum conversion `Color(x)` — the explicit int->enum
@@ -5253,6 +5335,12 @@ impl Checker {
                 .and_then(|i| i.methods.get(name))
                 .map(|sig| sig.ret.clone())
             {
+                // `@deprecated` method (I#472, D-0109): warn at the call site,
+                // keyed `"Type.method"`. The receiver type of a user struct is
+                // `Ty::Named(TypeName)` (see `struct_info`).
+                if let Ty::Named(owner) = &bt {
+                    self.warn_deprecated_call(&format!("{owner}.{name}"), *span);
+                }
                 for a in args {
                     self.infer(&a.value);
                 }
@@ -7824,13 +7912,165 @@ def main():
 
     #[test]
     fn builtin_arg_shapes_checked() {
-        // @cache takes no args; @default takes exactly one expr; @inject none.
-        assert_eq!(errors("@cache(1)\ndef f():\n    print(1)\n").len(), 1);
+        // @default takes exactly one expr.
         assert_eq!(
             errors("struct S:\n    @default(1, 2)\n    int64 x\n").len(),
             1
         );
-        assert_eq!(errors("struct S:\n    @inject(1)\n    int64 x\n").len(), 1);
+    }
+
+    // ---- @cache / @inject reclassified/deferred (I#472, D-0109) -----------
+
+    #[test]
+    fn cache_is_reclassified_deferred() {
+        // `@cache` needs module-level persistent state (not a language feature
+        // yet); it is rejected cleanly at sema with the dedicated ZAP5055
+        // message, regardless of argument shape, rather than advertised and then
+        // rejected at lowering.
+        let e = errors("@cache\ndef f() -> int64:\n    return 1\n");
+        assert_eq!(e.len(), 1, "expected one diagnostic, got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP5055);
+        // Still one clean diagnostic even with (otherwise-invalid) arguments.
+        let e = errors("@cache(1)\ndef f() -> int64:\n    return 1\n");
+        assert_eq!(e.len(), 1, "expected one diagnostic, got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP5055);
+    }
+
+    #[test]
+    fn inject_is_reclassified_deferred() {
+        // `@inject` is a DI-framework hook with no core v1 semantics (the
+        // concrete `Depends(...)` need is met by reflection adapters,
+        // D-0089/D-0092); rejected cleanly at sema with ZAP5055.
+        let e = errors("struct S:\n    @inject\n    int64 x\n");
+        assert_eq!(e.len(), 1, "expected one diagnostic, got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP5055);
+        let e = errors("struct S:\n    @inject(1)\n    int64 x\n");
+        assert_eq!(e.len(), 1, "expected one diagnostic, got {e:?}");
+        assert_eq!(e[0].code, ErrorCode::ZAP5055);
+    }
+
+    // ---- @deprecated use-site warning (I#472, D-0109) ---------------------
+
+    /// Convenience: the non-fatal warnings for `src` (no lex/parse errors).
+    fn warns(src: &str) -> Vec<TypeError> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        analyze(&module).1
+    }
+
+    #[test]
+    fn deprecated_fn_warns_at_call_site() {
+        // A bare `@deprecated` free function: every call site warns (ZAP5124),
+        // non-fatally (no errors).
+        let src = "@deprecated\ndef old() -> int64:\n    return 1\n\n\
+                   def main():\n    print(old())\n";
+        assert!(errors(src).is_empty(), "deprecation must be non-fatal");
+        let w = warns(src);
+        assert_eq!(w.len(), 1, "expected one deprecation warning, got {w:?}");
+        assert_eq!(w[0].code, ErrorCode::ZAP5124);
+        assert!(
+            w[0].message.contains("old"),
+            "message names the callee: {w:?}"
+        );
+    }
+
+    #[test]
+    fn deprecated_fn_message_is_included() {
+        let src = "@deprecated(\"use new_api\")\ndef old() -> int64:\n    return 1\n\n\
+                   def main():\n    print(old())\n";
+        let w = warns(src);
+        assert_eq!(w.len(), 1, "expected one warning, got {w:?}");
+        assert!(
+            w[0].message.contains("use new_api"),
+            "the user message must be appended: {w:?}"
+        );
+    }
+
+    #[test]
+    fn deprecated_fn_warns_once_per_call_site() {
+        // Two call sites → two warnings; a non-deprecated function → none.
+        let src = "@deprecated\ndef old() -> int64:\n    return 1\n\
+                   \ndef fresh() -> int64:\n    return 2\n\n\
+                   def main():\n    print(old())\n    print(old())\n    print(fresh())\n";
+        let w = warns(src);
+        assert_eq!(w.len(), 2, "one warning per call site, got {w:?}");
+        assert!(w.iter().all(|d| d.code == ErrorCode::ZAP5124));
+    }
+
+    #[test]
+    fn non_deprecated_call_does_not_warn() {
+        let src = "def fresh() -> int64:\n    return 1\n\n\
+                   def main():\n    print(fresh())\n";
+        assert!(warns(src).is_empty(), "no deprecation warning expected");
+    }
+
+    #[test]
+    fn deprecated_method_warns_at_call_site() {
+        // `@deprecated` on a method warns at the call site, keyed `Type.method`.
+        let src = "struct S:\n    int64 x\n\n    \
+                   @deprecated(\"use y()\")\n    def legacy(self) -> int64:\n        return self.x\n\n\
+                   def main():\n    auto s = S(x=1)\n    print(s.legacy())\n";
+        assert!(
+            errors(src).is_empty(),
+            "deprecation must be non-fatal: {:?}",
+            errors(src)
+        );
+        let w = warns(src);
+        assert_eq!(
+            w.len(),
+            1,
+            "expected one method-deprecation warning, got {w:?}"
+        );
+        assert_eq!(w[0].code, ErrorCode::ZAP5124);
+        assert!(w[0].message.contains("S.legacy") && w[0].message.contains("use y()"));
+    }
+
+    #[test]
+    fn deprecated_stacks_with_reflection_decorator() {
+        // `@deprecated` composes with a declared annotation on the same function
+        // (bottom-up): the reflection metadata still records, and the call still
+        // warns. No error.
+        let src = "annotation Audited:\n    pass\n\n\
+                   @Audited\n@deprecated\ndef old() -> int64:\n    return 1\n\n\
+                   def main():\n    print(old())\n    print(reflect_has(\"old\", \"Audited\"))\n";
+        assert!(
+            errors(src).is_empty(),
+            "unexpected errors: {:?}",
+            errors(src)
+        );
+        let w = warns(src);
+        assert_eq!(w.len(), 1, "expected one deprecation warning, got {w:?}");
+        assert_eq!(w[0].code, ErrorCode::ZAP5124);
+    }
+
+    #[test]
+    fn deprecated_wrong_target_rejected() {
+        // Restricted to a function/method target (type/field/parameter
+        // deprecation has no well-defined v1 use site): ZAP5047.
+        let e = errors("@deprecated\nstruct S:\n    int64 x\n");
+        assert!(
+            e.iter().any(|d| d.code == ErrorCode::ZAP5047),
+            "expected a wrong-target error, got {e:?}"
+        );
+        let e = errors("struct S:\n    @deprecated\n    int64 x\n");
+        assert!(
+            e.iter().any(|d| d.code == ErrorCode::ZAP5047),
+            "expected a wrong-target error on a field, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn deprecated_bad_message_arg_rejected() {
+        // A non-string / multi-arg / keyword message is ZAP5042.
+        assert!(errors("@deprecated(1)\ndef f() -> int64:\n    return 1\n")
+            .iter()
+            .any(|d| d.code == ErrorCode::ZAP5042));
+        assert!(
+            errors("@deprecated(\"a\", \"b\")\ndef f() -> int64:\n    return 1\n")
+                .iter()
+                .any(|d| d.code == ErrorCode::ZAP5042)
+        );
     }
 
     #[test]

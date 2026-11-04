@@ -118,12 +118,18 @@ compile time — no runtime reflection cost.
 Database db            # a DI/framework decorator fills it
 ```
 
+> **Status (D-0109):** `@inject` is **deferred** — dependency injection is
+> provided by reflection-driven `Depends(...)` adapters (D-0089/D-0092), not a
+> core variable decorator. The syntax above is illustrative of the long-term
+> model, not a v1 feature.
+
 ### Compile-time-first + runtime reflection
 
 - **Compile-time:** a decorator runs during compilation and may generate code
   (methods, validators, serializers) that is then type-checked like hand-written
-  code. Zero runtime overhead. This is how `@derive`, `@validate`, `@default`,
-  `@cache` work.
+  code. Zero runtime overhead. This is how `@derive`, `@validate`, `@default`
+  work. (`@cache` would also be compile-time-first, but is deferred — it needs
+  module-level persistent state, D-0109.)
 - **Runtime reflection:** annotations are *also* queryable at runtime, so
   dynamic frameworks (ORMs, DI containers, serializers chosen at runtime) can be
   written. Opt-in; pay only when used.
@@ -169,8 +175,10 @@ problem), and directly in service of the readability goal.
 ### Built-in set (v1)
 
 Ship a curated set covering ~80% of boilerplate:
-`@cache`, `@derive(Eq, Ord, Json, Repr, Hash)`, `@default(expr)`,
-`@validate(...)`, `@range(...)`, `@deprecated`, `@inject`.
+`@derive(Eq, Ord, Json, Repr, Hash)`, `@default(expr)`, `@validate(...)`,
+`@range(...)`, and `@deprecated`. (`@cache` and `@inject` were part of the
+original proposal but are reclassified/deferred out of v1 — see D-0109 and the
+status notes above.)
 
 ## Rationale
 
@@ -245,12 +253,27 @@ spelled `except Exception:` in real code (Python's base, D-0007), and the
 re-raise is the bound `raise e` form (bare `raise` is a separate runtime
 follow-up).
 
+Also shipped: **`@deprecated`** (D-0109, I#472). A function or method marked
+`@deprecated` (optionally `@deprecated("use X")`) generates no code but raises a
+non-fatal **use-site warning** (ZAP5124) at every call site — the mechanism
+STABILITY.md §5 names for retiring a Stable surface with notice. Sema warnings
+are now surfaced by the build pipeline at a `warning[ZAPnnnn]` severity. The
+target is restricted to a function/method (ZAP5047); the message must be a
+single string literal (ZAP5042). With this the v1 built-in set is complete:
+`@derive(...)`, `@default`, `@validate`, `@range`, `@deprecated`.
+
+Reclassified/deferred **out of v1** (D-0109, I#472): `@cache` and `@inject`.
+`@cache` (memoization) needs persistent module-level state, which is still
+absent (and is exactly why an `args`-keyed `memoize` is not expressible via
+`wrap`); it is gated on first adding that language feature. `@inject` is a
+DI-framework hook with no core v1 semantics — the concrete FastAPI-style
+`Depends(...)` need is met by the reflection-driven handler adapter
+(D-0092/D-0089, cf. zap#312/fastzap#7), not a core decorator. Both names stay
+reserved and are rejected with a dedicated diagnostic (ZAP5055).
+
 Follow-up (deferred, not yet implemented): `@validate(matches=m/.../)` regex
-validation; the **function/variable group** `@cache` (memoization — needs
-persistent module-level state, still absent, which is also why an `args`-keyed
-`memoize` is not expressible via `wrap`), `@deprecated` (use-site diagnostic),
-and `@inject` (DI, cf. zap#312/fastzap#7). Behavioral decorators on non-function
-targets are ZAP5050 (deferred).
+validation. Behavioral decorators on non-function targets are ZAP5050
+(deferred).
 
 ## Open issues
 
