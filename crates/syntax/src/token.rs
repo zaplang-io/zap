@@ -181,6 +181,10 @@ pub enum Keyword {
     And,
     Or,
     Not,
+    /// `is` — identity comparison (`a is b`, `x is None`), and the first token
+    /// of the two-token `is not` operator (#611, D18). A reserved keyword, as
+    /// in Python.
+    Is,
     // Built-in type names
     Int32,
     Int64,
@@ -252,6 +256,7 @@ impl Keyword {
             "and" => And,
             "or" => Or,
             "not" => Not,
+            "is" => Is,
             "int32" => Int32,
             "int64" => Int64,
             "float32" => Float32,
@@ -323,6 +328,7 @@ impl Keyword {
             And => "and",
             Or => "or",
             Not => "not",
+            Is => "is",
             Int32 => "int32",
             Int64 => "int64",
             Float32 => "float32",

@@ -397,6 +397,17 @@ feature.
   `str`); the result is a strict `bool`. `x not in xs` is its negation —
   identical operand rules and result — and means exactly `not (x in xs)`. `in`
   participates in Python-style comparison chaining (below); `not in` does not.
+- Identity `is` / `is not` (D-0109, #611): `a is b` tests **reference
+  identity** — whether both operands are the same allocation — and the result is
+  a strict `bool`. This is distinct from `==` (value / `__eq__` equality): two
+  distinct reference-struct allocations with equal fields are `==`-equal but not
+  `is`-equal. `x is None` / `x is not None` is the empty-variant / null check,
+  consistent with `== None` and `match case None`. Operands must be reference
+  types — a plain `struct` (D-0023), a `list`/`dict`/`set`/`heap`, a `channel`,
+  or `Optional[T]`; a value type or scalar is a **compile error** (ZAP4073, or
+  ZAP4074 for `is None` on a never-None value), which directs the user to `==`.
+  Unlike `not in`, `is` / `is not` **do** participate in comparison chaining
+  (below), so `a is b == c` is one chained comparison.
 - Boolean `and`, `or`, `not`; **truthiness** is Python-style (empty/zero/`None`
   falsy) *and* strict `bool` is allowed (D-0022). `and`/`or` **short-circuit**
   left-to-right: the right operand is evaluated only when the left does not
@@ -1381,7 +1392,7 @@ programmatically; `zap inspect <pid>` triggers them against a running process.
 
 `def`, `return`, `if`, `elif`, `else`, `while`, `do`, `for`, `in`, `range`,
 `match`, `when`, `break`, `continue`, `auto`,
-`const`, `True`, `False`, `None`, `and`, `or`, `not`, `raise`, `try`, `except`,
+`const`, `True`, `False`, `None`, `and`, `or`, `not`, `is`, `raise`, `try`, `except`,
 `finally`, `with`, `as`, `yield`, `lambda`, `assert`, `spawn`, `scope`, `channel`,
 `select`, `case`, `close`, `struct`, `interface`, `enum`, `annotation`,
 `decorator`, `import`, `python`, `m`, `s`

@@ -2331,13 +2331,32 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 lhs,
                 rhs,
             } => {
+                // `is` / `is not` (#611, D18) compare two reference pointers for
+                // same-allocation identity. LLVM `icmp` needs integer operands,
+                // so pointer operands are `ptrtoint`-ed to a word first; integer
+                // operands (every other `ICmp` site) pass through unchanged.
+                let lv = get(vals, *lhs);
+                let rv = get(vals, *rhs);
+                let (li, ri) = if lv.is_pointer_value() || rv.is_pointer_value() {
+                    let i64t = self.ctx.i64_type();
+                    let li = if lv.is_pointer_value() {
+                        b.build_ptr_to_int(lv.into_pointer_value(), i64t, "is.p2i")
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        lv.into_int_value()
+                    };
+                    let ri = if rv.is_pointer_value() {
+                        b.build_ptr_to_int(rv.into_pointer_value(), i64t, "is.p2i")
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        rv.into_int_value()
+                    };
+                    (li, ri)
+                } else {
+                    (lv.into_int_value(), rv.into_int_value())
+                };
                 let c = b
-                    .build_int_compare(
-                        int_pred(*pred),
-                        get(vals, *lhs).into_int_value(),
-                        get(vals, *rhs).into_int_value(),
-                        "icmp",
-                    )
+                    .build_int_compare(int_pred(*pred), li, ri, "icmp")
                     .map_err(|e| e.to_string())?;
                 vals[*dest as usize] = Some(c.into());
             }

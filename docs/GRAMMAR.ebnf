@@ -465,11 +465,23 @@ comparison    ::= bit_or { comp_op bit_or }
                      `(a < b) and (b < c) and ...` with each operand evaluated
                      exactly once, left to right, short-circuiting at the first
                      false link (I#386). Parenthesize to defeat chaining. *)
-comp_op       ::= "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "not" "in" ;
+comp_op       ::= "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "not" "in"
+                | "is" | "is" "not" ;
                   (* `not in` (#593) is the negated membership operator, at the
                      same precedence as `in`. `x not in xs` parses and type-
                      checks as, and lowers identically to, `not (x in xs)`
-                     (result `bool`). Unlike `in`, it does not chain. *)
+                     (result `bool`). Unlike `in`, it does not chain.
+
+                     `is` / `is not` (#611, D18) test *reference identity* (same
+                     allocation), at the same precedence as the other comparison
+                     operators, and — unlike `not in` — they DO chain (so
+                     `a is b == c` is one chained comparison). `x is None` /
+                     `x is not None` is the empty-variant / null check,
+                     consistent with `== None` and `match case None`. Operands
+                     must be reference types (a plain `struct`, D-0023; a
+                     `list`/`dict`/`set`/`heap`; a `channel`; `Optional[T]`); a
+                     value type or scalar is a compile error (ZAP4073, or
+                     ZAP4074 for `is None` on a never-None value) — use `==`. *)
 
 bit_or        ::= bit_xor { "|" bit_xor } ;
 bit_xor       ::= bit_and { "^" bit_and } ;
