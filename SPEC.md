@@ -153,7 +153,8 @@ binding is shared, **unsynchronized, and never implicitly locked**. `const` is
 the safe default; `Atomic[T]`/`Mutex`/concurrent collections are the tools for
 shared mutable state. This model is kept honest by an **advisory** surface —
 never a dialect — described in §12.1: the `@shareable` marker and the static
-sharing lint (ZAP5125).
+sharing lint (ZAP5125), with the runtime `--race` detector (D-0114, #665) as the
+dynamic backstop.
 
 Only a **single-name** module-level binding is admitted. A module-level
 tuple-destructuring declaration (`T a, b = expr`) is rejected (ZAP3018) — declare
@@ -1077,8 +1078,19 @@ def bump():
   surviving warning fatal, for CI. Off by default; it never changes what the
   language accepts.
 
-The lint is advisory; a data race is still a bug (§12 memory model), and a
-runtime `-race` detector is a planned backstop (#661).
+The lint is advisory; a data race is still a bug (§12 memory model). The
+*dynamic* backstop is the runtime **data-race detector**, `zap run/test --race`
+(alias `-race`): a test-time diagnostic (D-0114, #665) that catches real races
+the lint cannot see statically. It is a **Zap-native happens-before / vector-
+clock** detector (not LLVM/Clang ThreadSanitizer, which assumes pthreads and
+`malloc` rather than Zap's user-space coroutines and GC heap). It instruments
+exactly the ZAP5125 set — a mutable, non-`@shareable` module global — so an
+`Atomic`/`Mutex`/`@shareable`-guarded version is clean, and reports an
+unsynchronized racing access with a source location. It is off by default and
+**never** changes what the language accepts, only whether accesses are checked
+at run time. The detector is being delivered in slices: the flag surface and
+this specification ship now; the instrumentation and the happens-before engine
+are tracked follow-ups under #665 (see D-0114).
 
 ## 13. Modules, imports, visibility (D-0028, D-0052)
 
@@ -1285,7 +1297,10 @@ zap run <file> | zap run      # run a single file, or the project (zap.toml)
 zap build                     # build project -> native binary (target/)
 #   run/build/ir also accept --warnings-as-errors (alias -Werror): make surviving
 #   warnings fatal, for CI; off by default and never changes what compiles (D-0113)
-zap test [--watch] [--json]   # run tests; --watch re-runs (targeting changed paths); --json for agents
+#   run/build/ir/test also accept --race (alias -race): enable the runtime
+#   data-race detector (test-time diagnostic, off by default; D-0114, #665)
+zap test [--watch] [--json] [--race]   # run tests; --watch re-runs (targeting changed paths); --json for agents; --race under the detector
+zap test --doc [path]         # run docstring examples (doctests, #234) through the REPL engine
 zap test --doc [path]         # run docstring examples (doctests, #234) through the REPL engine
 zap fmt                       # canonical formatter (D-0037)
 zap doc [--format html|md|json] [--out <dir>] [--private]  # render API docs (I#232/233)

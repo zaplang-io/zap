@@ -43,8 +43,20 @@ mod run_impl {
     use std::process::{Command, ExitCode};
     use std::time::{Duration, SystemTime};
 
-    /// `zap test [file] [--json] [--watch]`.
-    pub fn run(file: Option<String>, json: bool, watch: bool) -> ExitCode {
+    /// `zap test [file] [--json] [--watch] [--race]`.
+    ///
+    /// `race` enables the runtime data-race detector (#665, D-0114; epic #661).
+    /// This v1 slice recognizes and plumbs the flag; the happens-before detector
+    /// engine is a tracked follow-up slice, so for now the flag is accepted but
+    /// inert and that is surfaced explicitly (never silently ignored).
+    pub fn run(file: Option<String>, json: bool, watch: bool, race: bool) -> ExitCode {
+        if race {
+            eprintln!(
+                "zap test: --race: the runtime data-race detector is accepted but \
+                 not yet wired in (#665, D-0114); running tests without race \
+                 instrumentation."
+            );
+        }
         let files = discover::discover(file.as_deref());
         if files.is_empty() {
             eprintln!("zap test: no test files found (looked for *_test.zap and tests/)");

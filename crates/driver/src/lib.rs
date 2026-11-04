@@ -154,6 +154,25 @@ fn report_warnings(reports: Vec<Report>) {
     }
 }
 
+/// The runtime data-race detector (`--race`, #665, D-0114; epic #661) is the
+/// *dynamic* backstop for the light concurrency model: the static sharing lint
+/// (#664, ZAP5125) flags the obvious unsynchronized shared-global accesses at
+/// compile time, and `--race` is meant to catch the real ones at run time with
+/// a happens-before detector.
+///
+/// This v1 slice recognizes and plumbs the flag end-to-end (CLI → driver, on
+/// `run`/`build`/`ir`/`test`) and records the design decision; the
+/// happens-before / vector-clock detector engine and its access instrumentation
+/// are a tracked follow-up slice. Until that lands, the flag is accepted but
+/// inert, which this notice makes explicit rather than silently ignoring it.
+fn race_not_yet_wired_notice() {
+    eprintln!(
+        "zap: --race: the runtime data-race detector is accepted but not yet \
+         wired in (#665, D-0114); building without race instrumentation. The \
+         static sharing lint (ZAP5125, #664) still applies."
+    );
+}
+
 /// Run the whole-program front end: discover and link the local module import
 /// graph (I#283/D-0081) into one merged, qualified module, then type-check it.
 /// A single file with no local imports links to just itself, so the single-file
@@ -236,13 +255,21 @@ fn front_end_program(
 /// Front-end + AST→ZIR lowering. Host-safe (no LLVM needed). Used by both
 /// `zap ir` and the `zapc ir` subcommand.
 pub fn emit_ir(file: &str) -> ExitCode {
-    emit_ir_for(file, &[], false)
+    emit_ir_for(file, &[], false, false)
 }
 
 /// Like [`emit_ir`], but with compile-time `--target-feature`s for `when`
 /// evaluation (I#139) and the `--warnings-as-errors` knob (#664, D-0113; off by
 /// default), which promotes any surviving warning to a fatal error.
-pub fn emit_ir_for(file: &str, features: &[String], warnings_as_errors: bool) -> ExitCode {
+pub fn emit_ir_for(
+    file: &str,
+    features: &[String],
+    warnings_as_errors: bool,
+    race: bool,
+) -> ExitCode {
+    if race {
+        race_not_yet_wired_notice();
+    }
     let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
         Ok(m) => m,
         Err(code) => return code,
@@ -287,7 +314,7 @@ pub fn emit_expand(file: &str) -> ExitCode {
 /// `out` is the output path; when `None`, a default is chosen (a temp path for
 /// `run`, the file stem for `build`).
 pub fn compile(file: &str, out: Option<String>, run_after: bool) -> ExitCode {
-    compile_for(file, out, run_after, &[], false, false)
+    compile_for(file, out, run_after, &[], false, false, false)
 }
 
 /// Like [`compile`], but with compile-time `--target-feature`s for `when`
@@ -302,7 +329,11 @@ pub fn compile_for(
     features: &[String],
     portable: bool,
     warnings_as_errors: bool,
+    race: bool,
 ) -> ExitCode {
+    if race {
+        race_not_yet_wired_notice();
+    }
     let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
         Ok(m) => m,
         Err(code) => return code,

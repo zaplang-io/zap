@@ -198,8 +198,9 @@ not supported — it may change in **any** release, including a PATCH:
   re-scans every root each cycle — reserved for a future generational/incremental
   mode). The **concurrency-safety surface** (#664, D-0113) is now implemented
   too: the **`@shareable`** marker and the static **sharing lint** (`ZAP5125`,
-  below). Still not in the language: the runtime `-race` detector (a #661
-  follow-up). A module-level tuple-destructuring declaration is rejected
+  below). The runtime data-race detector (`--race`, #665, D-0114) now has its
+  CLI surface and design decision, with the detector engine following in slices.
+  A module-level tuple-destructuring declaration is rejected
   (`ZAP3018`). The surface is expected to graduate to Stable, but is Experimental
   until then (§4).
 - **`@shareable` marker + sharing lint** (#664, D-0113) — **Experimental**. The
@@ -214,6 +215,17 @@ not supported — it may change in **any** release, including a PATCH:
   does not change what compiles. The marker name, the warning code, and the
   suppression and `--warnings-as-errors` mechanisms are expected to graduate to
   Stable; they are Experimental until the #206 audit.
+- **Runtime data-race detector `--race`** (#665, D-0114) — **Experimental**. The
+  `--race` flag (alias `-race`) on `run`/`build`/`ir`/`test` enables a test-time
+  runtime data-race detector for the light concurrency model (epic #661); it is
+  off by default and, like the sharing lint, is a diagnostic that never changes
+  what the language accepts. The design is settled (a Zap-native happens-before
+  detector, scoped to the ZAP5125 shared-global set); the feature is delivered in
+  slices, so this release ships the flag surface and the design decision with the
+  detector engine following. The flag name and its non-legality-changing,
+  off-by-default semantics are expected to graduate to Stable; they are
+  Experimental until then. The detector's report format is diagnostic output
+  (below) and is not itself a covered surface.
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,

@@ -3738,7 +3738,12 @@ deferred (tracked under #661).
    hardcoded allowlist). It is a trusted assertion with the runtime `-race`
    detector as the backstop, is queryable via reflection, and has a per-site
    `# noqa`-style suppression for one-offs.
-6. **Runtime `-race` detector (Phase 2).** Filed as a follow-up under #661.
+6. **Runtime `-race` detector (Phase 2).** The dynamic backstop for the light
+   model. Settled in **D-0114 (#665)**: a **Zap-native happens-before /
+   vector-clock** detector (not LLVM/Clang ThreadSanitizer), a test-time
+   diagnostic behind `zap run/test --race`, off by default and never
+   legality-changing. Sliced — see D-0114 for what v1 lands and what is
+   deferred.
 7. **GC.** Module-global slots are **permanent GC roots**. Under the
    conservative Boehm collector (today) the static data/BSS segment is scanned,
    so a `const` holding a heap pointer is a root with no registration. Under the
@@ -4050,3 +4055,144 @@ build succeeds by default, that `--warnings-as-errors`/`-Werror` makes it fatal,
 that a `const` global and a `# noqa`-suppressed site stay non-fatal even under
 `-Werror`. An end-to-end golden (`shareable_reflect`) checks runtime
 `reflect_has` for a marked struct, an unmarked struct and the built-ins.
+
+## D-0114 — Runtime data-race detector (`--race`): native happens-before, sliced (I#665, epic #661)
+
+This settles **locked-design point 6 of D-0112 (#661)** — the runtime `-race`
+detector, the *dynamic* backstop for the light concurrency model. The light
+model (D-0112) deliberately does **not** synchronize shared mutable module
+globals; D-0113 (#664) added the *static* sharing lint (ZAP5125) that flags the
+obvious unsynchronized accesses at compile time. `--race` is the *dynamic*
+complement: at test time it observes the actual interleavings a run exhibits and
+reports a true data race — two accesses to the same shared location, at least
+one a write, with no happens-before edge between them — with a source location.
+It is in the spirit of Go's `-race` and Clang/LLVM ThreadSanitizer (TSan).
+
+Like the lint, `--race` is a **diagnostic, never a dialect** (D-0112 point 4):
+off by default, enabled per-invocation on `zap run/test/build/ir --race` (alias
+`-race`), and it **never changes what the language accepts** — only whether
+accesses are instrumented and checked at run time.
+
+### Decision 1 — a Zap-native happens-before detector, NOT LLVM/Clang TSan
+
+The open question in #665 was whether to build on `-fsanitize=thread` (TSan) or a
+Zap-native vector-clock detector. **We build native.** TSan is rejected for this
+runtime, for reasons that are structural rather than incidental:
+
+- **TSan assumes pthreads; Zap concurrency is user-space coroutines.** The
+  scheduler (D-0, #47) is an M:P:G work-stealing runtime whose context switches
+  are `swapcontext` on GC-allocated green stacks (`switch_to_g` in `zaprt.c`).
+  To TSan, two coroutines time-sliced onto **one** OS thread are one thread, so
+  a race between them is invisible unless **every** switch is annotated with
+  `__tsan_switch_to_fiber` / `__tsan_create_fiber` / `__tsan_destroy_fiber`.
+  That is a deep, fragile coupling to TSan's fiber ABI at the hottest point of
+  the scheduler, and it has to be exactly right or the detector silently misses
+  races (worse than no detector).
+- **TSan assumes libc `malloc`; Zap objects live on the GC heap.** TSan tracks
+  shadow memory for `malloc`'d regions and intercepts the allocator. Zap values
+  are `GC_malloc`'d (conservative Boehm) or Immix-allocated (precise, D-0009),
+  not visible to TSan's interceptors, and TSan vs. a moving/scanning collector
+  (bdwgc's own stop-the-world, Immix evacuation) is a known-bad interaction —
+  two runtimes each wanting to stop threads and walk stacks.
+- **Whole-program rebuild + overhead profile.** TSan requires compiling the
+  program *and* the entire C runtime with `-fsanitize=thread`, a fixed shadow VM
+  mapping, large binaries, and a 5–15× slowdown — and after all that it would
+  still be blind to coroutine switches without the fiber annotations above.
+- **Go's own precedent points native.** Go did not simply pass `-race` to the C
+  compiler; it ported TSan's race *algorithm* into the Go runtime and has the
+  compiler emit explicit `raceread`/`racewrite`/`raceacquire`/`racerelease`
+  hooks tied to Go's scheduler and sync primitives. Zap is in exactly that
+  position, and already has the two things that make it tractable: the scheduler
+  funnels **every** context switch through `switch_to_g`, and (post #662/#663)
+  **every** shared-global access funnels through a single pair of lowering
+  helpers (`name_lvalue` read / `store_name` write).
+
+The native detector is a **vector-clock happens-before** engine (Lamport/
+Fidge–Mattern, the Go/TSan model): one logical clock per goroutine `G`; a
+per-synchronization-object clock; **release** on a "send"-side sync op and
+**acquire** on the matching "receive"-side op propagate clocks; each instrumented
+memory location keeps shadow state (last writer `G` + its clock, last readers);
+an access races iff it is not ordered after every conflicting prior access.
+
+### Decision 2 — instrumentation scope
+
+Instrument exactly what the light model calls "shared", widening later:
+
+- **v-first: module globals.** The only shared mutable state the model admits
+  today (D-0112). Scope is **exactly the ZAP5125 set** — a mutable, non-const,
+  non-`@shareable` module global (scalar *or* reference). A `const` global never
+  races; a `@shareable`-typed global (user `@shareable` struct or a built-in
+  `Atomic`/`Mutex`/`WaitGroup`/`Once`/… from `BUILTIN_SHAREABLE_TYPES`) is an
+  asserted-safe cell and is **not** instrumented — so an `Atomic`-guarded
+  counter is clean *by construction* (its accesses are atomic ops on a
+  shareable-typed cell), exactly mirroring the lint.
+- **later: shared heap objects** reachable across coroutines (object headers get
+  shadow state; the instrumented access points move from the global helpers to
+  field/element load/store). Out of scope until the global case is proven.
+
+**Happens-before edges** come from the sync primitives, which all already funnel
+through runtime C: coroutine **spawn** (parent→child), **channel** send/recv
+(D-0, #47), **`Mutex`** lock/unlock and **`WaitGroup`**/`Once` (#103), and
+**`Atomic`** ops (#176, each a release+acquire on its own cell). The engine
+serializes its own shadow-state updates under a single detector lock: a
+test-time diagnostic optimizes for **obvious correctness over speed**, which
+also sidesteps the hardest native-detector bug (racing on the detector's own
+metadata under real `MAXPROCS>1` parallelism).
+
+### Decision 3 — overhead budget
+
+`--race` is a **test-time** tool, never a production build mode. Budget: a
+single-digit-to-~10× slowdown on an instrumented run is acceptable (Go-class),
+because it runs under `zap test`/`zap run`, not in shipped binaries. A default
+(no-`--race`) build is **byte-identical** to today — no instrumentation is
+emitted and the `main` prologue is unchanged (golden-safe), the same discipline
+#664 used for the reflection fold.
+
+### Scope — this is sliced; #665 is recommended for promotion to its own epic
+
+Per #665 ("a larger, likely multi-slice effort — it may be promoted to its own
+epic once scoped") and the workspace rule that a multi-issue feature gets an
+Epic with trackable sub-issues, the full detector does **not** land as one
+reviewable PR: the vector-clock engine + happens-before hooks across the
+~17k-line scheduler-coupled runtime, validatable only in CI, is precisely the
+case that should be reviewed in focused pieces. The slicing is **recommended to
+the maintainer** (not unilaterally created).
+
+**v1 (this PR, I#665) — the design + the flag + the harness.** Lands:
+- this decision (D-0114);
+- the `--race` / `-race` flag plumbed end-to-end on `run`/`build`/`ir`/`test`
+  (off by default; help text; parse tests). Until the engine lands the flag is
+  **accepted but inert**, surfaced with an explicit one-line notice rather than
+  silently ignored, so default builds and all existing goldens are unaffected;
+- the racy-vs-clean fixture pair as the walled-garden spec for the detector
+  (`tests/race/`), with the expected report documented for the engine slice.
+
+**Deferred (recommended sub-issues under #665-as-epic):**
+1. **Access instrumentation.** Behind `--race`, emit `__zap_race_read` /
+   `__zap_race_write(slot, name, line, col)` calls at the ZAP5125 access sites
+   in lowering (`name_lvalue` / `store_name`), to no-op runtime stubs; ZIR unit
+   tests assert emitted/not-emitted == lint scope (host-testable).
+2. **Happens-before engine.** The per-`G` vector clock (field on `G`), per-sync
+   clocks, and the single-lock shadow-state check + report formatting + non-zero
+   exit, in a new `zaprace.inc.c`; HB hooks at spawn and `Mutex` lock/unlock
+   (enough for the #665 "Done when"); racy fixture → reported with location,
+   mutex-guarded → clean. CI-gated golden.
+3. **Breadth.** Channels/`WaitGroup`/`Once` HB edges; shared heap-object
+   instrumentation; richer multi-frame reports; `MAXPROCS>1` validation.
+
+### Done-when (v1, satisfied by this PR)
+
+The `--race` surface exists and is plumbed on every relevant subcommand, is off
+by default, never changes legality, and the design (native, scope, budget,
+slicing) is recorded; the racy/clean fixtures are checked in as the detector's
+walled garden. The *detection* behaviour (racy → reported with location;
+`Mutex`/`Atomic`-guarded → clean) is specified here and realized by deferred
+slices 1–2.
+
+### Verification (v1)
+
+Host-only (Docker/LLVM down locally; CI is the runtime gate): driver CLI parse
+tests cover `--race`/`-race` on run/build/ir/test, composition with other flags,
+off-by-default, and the `test --doc --race` rejection; `cargo build`/`test`,
+`cargo fmt --all`, and clippy are clean. No grammar/SPEC-legality change (CLI +
+runtime only). No core defects were uncovered.

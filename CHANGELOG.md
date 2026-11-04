@@ -25,6 +25,22 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Runtime data-race detector surface: `--race`** — the *dynamic* backstop for
+  the light concurrency model (#665, D-0114; locked-design point 6 of epic #661,
+  complementing the static sharing lint from #664). A new **`--race`** flag
+  (alias **`-race`**) on `run`/`build`/`ir`/`test` enables the runtime data-race
+  detector: a **test-time** diagnostic, off by default, that never changes what
+  the language accepts. D-0114 settles the design — a **Zap-native happens-before
+  / vector-clock** detector rather than LLVM/Clang ThreadSanitizer (which assumes
+  pthreads and `malloc`, not Zap's user-space coroutine scheduler and GC heap) —
+  and scopes it to the ZAP5125 set (a mutable, non-`@shareable` module global), so
+  an `Atomic`/`Mutex`/`@shareable`-guarded version is clean. The feature is being
+  delivered in slices: this release lands the design decision, the flag plumbed
+  end-to-end, and the racy-vs-clean fixture pair (`tests/race/`) as the detector's
+  walled-garden spec; until the engine lands the flag is accepted but inert and
+  says so explicitly, so default builds and existing goldens are unaffected. The
+  access instrumentation and the happens-before engine are tracked follow-ups
+  under #665.
 - **Concurrency-safety surface: `@shareable` + sharing lint** — the advisory
   surface for the light concurrency model (#664, D-0113; locked-design points
   4–5 of epic #661, building on the mutable globals from #662). `@shareable` is a
