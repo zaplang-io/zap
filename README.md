@@ -223,6 +223,10 @@ The experimental `crypto.rsa_*` APIs accept ordinary RSA PEM keys and use
 PKCS#1 v1.5 padding. Other key families, including RSA-PSS-only keys, are
 rejected; see [D-0102](DECISIONS.md#d-0102--crypto-rsa-pkcs1-v15-signing-i628).
 
+Verifier configuration failures emit fixed DEBUG messages through `logging`;
+its default WARNING threshold suppresses them. Ordinary signature mismatches
+remain quiet.
+
 ## License
 
 Licensed under either of

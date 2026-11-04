@@ -14,6 +14,9 @@
    RSA key-family/padding validation (#642, D-0102) is a stdlib runtime
    contract; it uses the existing call grammar and adds no productions.
 
+   RSA verification DEBUG diagnostics use the existing logging configuration;
+   shared RSA validation helpers do not affect call syntax.
+
    Notation:
      ::=        definition
      |          alternation

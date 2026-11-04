@@ -3040,6 +3040,12 @@ primitive lands here instead.
   signature scheme. Sign calls use throwing-call lowering so a local `try`
   catches parsing, family, and signing errors. No key-size policy or additional
   algorithm is introduced.
+- **Diagnostics.** Verification still returns `false` for malformed keys,
+  foreign families, initialization failures, and mismatches. Configuration
+  failures emit fixed, non-sensitive messages through `logging` at DEBUG;
+  valid signatures and ordinary mismatches emit none. The default WARNING
+  threshold suppresses these messages. Shared helpers enforce key family and
+  PKCS#1 v1.5 initialization for both signing and verification.
 - **Backend.** These are the only OpenSSL-backed entries in `crypto` — the
   hashing/HMAC/CSPRNG section stays a self-contained FIPS/RFC reference
   implementation, but RSA (bignum modexp + ASN.1 key parsing) would be a large,

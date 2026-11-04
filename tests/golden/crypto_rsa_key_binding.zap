@@ -63,6 +63,8 @@ def reject_damaged(str public, bytes signature):
     assert not crypto.rsa_sha256_verify(public, "RSA binding regression", bytes([signature[0] ^ 1]) + signature[1:])
 
 def main():
+    # All earlier rejection tests must remain silent at the default WARNING.
+    logging.set_stream(sys.stdout_fd())
     auto rsa2048 = """
 -----BEGIN PRIVATE KEY-----
 MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDKbtyBPk4EzhGV
@@ -552,4 +554,22 @@ EnLU/MsAJVuSdi0Tfruwv3A4O0fKcZ3N
         "RSA binding regression",
         valid_signature,
     )
+    # Debug diagnostics distinguish bad configuration from ordinary mismatch.
+    # Exact stdout also proves filtering and that no key/message/signature leaks.
+    logging.set_format("[%(levelname)s] %(message)s")
+    logging.set_level(logging.DEBUG)
+    assert crypto.rsa_sha256_verify(
+        rsa_public,
+        "RSA binding regression",
+        valid_signature,
+    )
+    assert not crypto.rsa_sha256_verify(rsa_public, "wrong message", valid_signature)
+    assert not crypto.rsa_sha256_verify(rsa_public, "RSA binding regression", b"bad signature")
+    assert not crypto.rsa_sha256_verify("not PEM", "secret message", valid_signature)
+    assert not crypto.rsa_sha256_verify(ec256_public, "secret message", valid_signature)
+    assert not crypto.rsa_sha256_verify(pss_public, "secret message", valid_signature)
+    assert not crypto.rsa_sha256_verify(der_public, "secret message", valid_signature)
+    logging.set_level(logging.ERROR)
+    assert not crypto.rsa_sha256_verify("not PEM", "secret message", valid_signature)
+    logging.set_level(logging.WARNING)
     print("RSA key-family and PKCS#1 v1.5 binding: PASS")

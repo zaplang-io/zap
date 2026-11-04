@@ -146,6 +146,10 @@ runtime checks ordinary-RSA key identity before EVP initialization and selects
 PKCS#1 v1.5 padding explicitly (#642, D-0102). Regression coverage lives in
 `tests/golden/crypto_rsa_key_binding.zap` alongside the original known answers.
 
+Shared RSA helpers centralize key-family checks and EVP padding initialization.
+Verifier configuration failures use the runtime's existing `logging` threshold,
+stream, and format with fixed DEBUG text; no cryptographic inputs are logged.
+
 **Current modules** (file is `<name>.rs` in each facet above):
 `argparse`, `bisect`, `concurrent`, `crypto`, `datetime`, `deque`, `fs`, `gc`,
 `gzip`, `http`, `io`, `json`, `logging`, `math`, `net`, `os`, `oset`, `process`,

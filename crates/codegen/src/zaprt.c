@@ -14146,6 +14146,34 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
  * across the EVP calls, and the OpenSSL objects are non-GC heap freed before
  * return; the GC `bytes` result is the last allocation, mirroring the hash
  * one-shots. */
+/* Shared RSA contract: keep key-family and padding policy identical for
+ * SHA-1/SHA-256 signing and SHA-256 verification (#642). RSA-PSS-only keys
+ * have their own base id and are deliberately excluded. */
+static int zap_crypto_is_rsa_key(EVP_PKEY *pkey) {
+    return pkey && EVP_PKEY_base_id(pkey) == EVP_PKEY_RSA;
+}
+
+static int zap_crypto_rsa_init(EVP_MD_CTX *ctx, EVP_PKEY *pkey,
+                              const EVP_MD *md, int signing) {
+    EVP_PKEY_CTX *pctx = NULL; /* owned by ctx */
+    if (!ctx || !zap_crypto_is_rsa_key(pkey)) {
+        return 0;
+    }
+    int ok = signing ? EVP_DigestSignInit(ctx, &pctx, md, NULL, pkey)
+                     : EVP_DigestVerifyInit(ctx, &pctx, md, NULL, pkey);
+    return ok == 1 && pctx &&
+           EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) == 1;
+}
+
+/* Diagnostics use the caller's logging threshold/stream/format, with no key,
+ * message, signature, or OpenSSL error details. The borrowed literal is consumed
+ * synchronously by logging; no GC allocation or new public API is needed. */
+static int64_t zap_crypto_rsa_verify_reject(const char *reason) {
+    ZapStr message = {(int64_t)strlen(reason), reason};
+    zap_logging_log(10, &message); /* DEBUG; default threshold is WARNING */
+    return 0;
+}
+
 static void *zap_crypto_rsa_sign(const EVP_MD *md, void *pem, void *data) {
     ZapStr *k = (ZapStr *)pem;
     ZapStr *d = (ZapStr *)data;
@@ -14160,18 +14188,16 @@ static void *zap_crypto_rsa_sign(const EVP_MD *md, void *pem, void *data) {
     }
     /* EVP accepts many key families. The RSA-named API must not silently
      * become ECDSA/DSA or RSA-PSS when handed another PEM key type (#642). */
-    if (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA) {
+    if (!zap_crypto_is_rsa_key(pkey)) {
         EVP_PKEY_free(pkey);
         zap_panic_typed(ZAP_EXC_VALUE_ERROR,
                         zap_str_new("crypto: RSA private key required",
                                     sizeof("crypto: RSA private key required") - 1));
     }
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_PKEY_CTX *pctx = NULL;
     unsigned char *sig = NULL;
     size_t siglen = 0;
-    int ok = ctx && EVP_DigestSignInit(ctx, &pctx, md, NULL, pkey) == 1 &&
-             EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) == 1 &&
+    int ok = zap_crypto_rsa_init(ctx, pkey, md, 1) &&
              EVP_DigestSign(ctx, NULL, &siglen, (const unsigned char *)d->data,
                             (size_t)d->len) == 1 &&
              (sig = (unsigned char *)malloc(siglen ? siglen : 1)) != NULL &&
@@ -14210,15 +14236,17 @@ int64_t zap_crypto_rsa_sha256_verify(void *pem, void *data, void *sig) {
     if (bio) {
         BIO_free(bio);
     }
-    if (!pkey || EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA) {
+    if (!pkey) {
+        return zap_crypto_rsa_verify_reject("crypto.rsa_sha256_verify: invalid public-key PEM");
+    }
+    if (!zap_crypto_is_rsa_key(pkey)) {
         EVP_PKEY_free(pkey);
-        return 0;
+        return zap_crypto_rsa_verify_reject("crypto.rsa_sha256_verify: ordinary RSA public key required");
     }
     EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_PKEY_CTX *pctx = NULL;
+    int initialized = zap_crypto_rsa_init(ctx, pkey, EVP_sha256(), 0);
     int64_t ok = 0;
-    if (ctx && EVP_DigestVerifyInit(ctx, &pctx, EVP_sha256(), NULL, pkey) == 1 &&
-        EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) == 1) {
+    if (initialized) {
         ok = EVP_DigestVerify(ctx, (const unsigned char *)s->data, (size_t)s->len,
                               (const unsigned char *)d->data, (size_t)d->len) == 1
                  ? 1
@@ -14226,6 +14254,9 @@ int64_t zap_crypto_rsa_sha256_verify(void *pem, void *data, void *sig) {
     }
     EVP_MD_CTX_free(ctx);
     EVP_PKEY_free(pkey);
+    if (!initialized) {
+        return zap_crypto_rsa_verify_reject("crypto.rsa_sha256_verify: PKCS#1 v1.5 initialization failed");
+    }
     return ok;
 }
 

@@ -1,1 +1,5 @@
+[DEBUG] crypto.rsa_sha256_verify: invalid public-key PEM
+[DEBUG] crypto.rsa_sha256_verify: ordinary RSA public key required
+[DEBUG] crypto.rsa_sha256_verify: ordinary RSA public key required
+[DEBUG] crypto.rsa_sha256_verify: invalid public-key PEM
 RSA key-family and PKCS#1 v1.5 binding: PASS

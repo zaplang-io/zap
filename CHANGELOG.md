@@ -134,4 +134,8 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   Emit sign calls through the throwing-call path so local handlers catch
   parsing, key-family, and signing errors.
 
+- Share RSA key-family/padding enforcement between signing and verification;
+  emit DEBUG diagnostics for verifier key/configuration errors through the
+  existing logging configuration, without including cryptographic inputs.
+
 [Unreleased]: https://github.com/zaplang-io/zap/commits/main
