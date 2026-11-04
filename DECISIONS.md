@@ -3048,3 +3048,37 @@ PKCS#1 and PKCS#8 PEM, asserting both encodings sign identically, pinning the
 deterministic RSA-SHA1 and RSA-SHA256 signature fingerprints, and checking
 verify accepts the genuine signature and rejects a tampered message) under the
 full-codegen CI jobs, plus the sema/ir unit suites on host.
+
+## D-0103 — `raise ... from ...` explicit cause chaining (I#604)
+
+Part of the CPython grammar-parity pass (epic #614, decision D12). `raise`
+gained an optional `from <cause>` clause for explicit exception chaining, the
+counterpart to Python's `raise E from cause`.
+
+- **Grammar.** `simple_stmt` grows `"raise" [ expr [ "from" expr ] ]`. `from`
+  is a *contextual* word (like `pass`/`del`), not a reserved keyword: it opens
+  the cause clause only directly after a raised value, and stays an ordinary
+  identifier everywhere else, so no existing program that used `from` as a name
+  breaks.
+- **Exception object.** `ZapException` gains a `cause` slot (NULL for an
+  ordinary raise), traced by the precise descriptor so the chain stays live
+  until the exception is reported. `raise X("m") from c` calls
+  `zap_exception_set_cause` before unwinding. When `c` is a caught exception its
+  real object is reused as the cause (preserving its type id and its own chain);
+  a `str` cause is wrapped in a base `Exception`.
+- **Inspection.** A caught handler stashes the in-flight exception *object*
+  beside the ordinary `except … as e` message-string binding, so `e.cause`
+  reads the cause's message (`zap_exception_cause_message`), an empty str when
+  there is no explicit cause. The message-string binding itself is unchanged, so
+  all existing `print(e)` handlers keep their behavior. This explicit cause is
+  distinct from any implicit during-handling context.
+- **Traceback.** An uncaught chained exception renders a two-section trace: the
+  cause's own `Uncaught exception: …` section first (deepest cause at the top),
+  then the separator `The above exception was the direct cause of the following
+  exception:`, then the raised exception's section. A plain (causeless) raise is
+  exactly one section, byte-for-byte as before.
+
+Verified by the `raise_from_cause` golden (chained uncaught two-section stderr
++ exit 1) under the full-codegen CI jobs, plus `raise_from_cause_type_checks`
+(sema), `lower_raise_from_sets_cause` and `lower_caught_exception_cause_is_readable`
+(ir) on host.

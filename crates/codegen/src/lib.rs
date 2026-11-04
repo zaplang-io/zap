@@ -805,6 +805,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[ptr.into(), i64t.into()],
             Some(i64t.into()),
         );
+        // Explicit `raise ... from <cause>` chaining (#604, D-0103): set the
+        // cause slot before raising, and read the cause's message for the Zap
+        // `<caught>.cause` attribute.
+        self.declare_rt("zap_exception_set_cause", &[ptr.into(), ptr.into()], None);
+        self.declare_rt(
+            "zap_exception_cause_message",
+            &[ptr.into()],
+            Some(ptr.into()),
+        );
         self.declare_rt("zap_eh_begin_catch", &[ptr.into()], Some(ptr.into()));
         self.declare_rt("zap_eh_end_catch", &[], None);
         self.declare_rt("zap_uncaught", &[ptr.into()], None);

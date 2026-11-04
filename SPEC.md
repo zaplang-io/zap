@@ -786,6 +786,16 @@ finally:
   (`raise MyError(message)`). User-defined exception types derive from
   `Exception`; they can be named in `except` clauses and retain their identity
   when propagated.
+- `raise E(message) from cause` chains an explicit cause (D-0103). The `cause`
+  is recorded on the raised exception; when `cause` is a caught exception it is
+  stored as that exception (keeping its type and any further cause), otherwise a
+  `str` cause is wrapped in `Exception`. In a handler, `e.cause` reads the
+  explicit cause's message (an empty str when there is none). An uncaught
+  chained exception renders a two-section traceback — the cause's own section,
+  the line `The above exception was the direct cause of the following
+  exception:`, then the new exception's section — matching CPython's explicit
+  (`raise ... from`) chain. `from` is a contextual word, not a reserved keyword,
+  so it remains usable as an ordinary identifier.
 
 ## 11. Resource cleanup (D-0027)
 

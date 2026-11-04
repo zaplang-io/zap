@@ -429,9 +429,12 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
-    /// `raise [expr]` (D-0007).
+    /// `raise [expr [ "from" cause ]]` (D-0007, D-0103). `cause` is the explicit
+    /// `from <cause>` chaining operand, recorded on the raised exception's
+    /// `cause` slot and rendered as a two-section traceback (#604, epic #614 D12).
     Raise {
         value: Option<Expr>,
+        cause: Option<Expr>,
         span: Span,
     },
     /// `assert cond [, msg]` with power-assert diagnostics (D-0054). Always

@@ -2681,7 +2681,7 @@ impl Checker {
                     }
                 }
             },
-            Stmt::Raise { value, .. } => {
+            Stmt::Raise { value, cause, .. } => {
                 // `raise StopIteration` (the iterator exhaustion signal, D-0048)
                 // names a compiler-known exception, not a user value, so it is
                 // not inferred (which would flag it as an unknown name).
@@ -2689,6 +2689,12 @@ impl Checker {
                     if !is_stop_iteration(e) {
                         self.infer(e);
                     }
+                }
+                // `raise <exc> from <cause>` (#604, D-0103): the cause is an
+                // ordinary expression (conventionally a caught exception, whose
+                // `.cause` is then inspectable); infer it for name resolution.
+                if let Some(c) = cause {
+                    self.infer(c);
                 }
             }
             Stmt::Assert { cond, msg, .. } => {
@@ -6120,6 +6126,29 @@ def main():
             e.iter().any(|x| x.code == ErrorCode::ZAP4001),
             "expected ZAP4001, got {e:?}"
         );
+    }
+
+    #[test]
+    fn raise_from_cause_type_checks(/* #604, D-0103 */) {
+        // `raise <exc> from <cause>` chaining: the raised exception and the
+        // caught cause both resolve, and the caught binding's `.cause` is
+        // inspectable (loosely typed, so it never errors).
+        ok(r#"
+def main():
+    try:
+        raise ValueError("first")
+    except Exception as e:
+        raise RuntimeError("second") from e
+
+def inspect():
+    try:
+        raise ValueError("boom")
+    except Exception as e:
+        try:
+            raise RuntimeError("wrap") from e
+        except RuntimeError as w:
+            print(w.cause)
+"#);
     }
 
     #[test]

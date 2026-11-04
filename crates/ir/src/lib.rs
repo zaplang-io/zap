@@ -781,6 +781,55 @@ mod tests {
     }
 
     #[test]
+    fn lower_raise_from_sets_cause() {
+        // #604 (D-0103): `raise E(...) from e` records the cause on the new
+        // exception via `zap_exception_set_cause` before it unwinds, reusing the
+        // caught exception's *object* (stashed beside the message binding) as the
+        // cause so its own type and chain survive.
+        let m = lower_ok(
+            "def main():\n    \
+                 try:\n        \
+                     raise ValueError(\"first\")\n    \
+                 except Exception as e:\n        \
+                     raise RuntimeError(\"second\") from e\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("call @zap_exception_set_cause"),
+            "`raise ... from e` must set the cause slot, text:\n{text}"
+        );
+
+        // A plain `raise` (no `from`) is unchanged: no cause slot is written.
+        let m = lower_ok(
+            "def main():\n    \
+                 raise RuntimeError(\"boom\")\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            !text.contains("zap_exception_set_cause"),
+            "a plain raise must not touch the cause slot, text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lower_caught_exception_cause_is_readable() {
+        // #604 (D-0103): `e.cause` on a caught exception binding reads the
+        // explicit cause's message off the stashed exception object.
+        let m = lower_ok(
+            "def main():\n    \
+                 try:\n        \
+                     raise ValueError(\"first\")\n    \
+                 except Exception as e:\n        \
+                     print(e.cause)\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("call @zap_exception_cause_message"),
+            "`e.cause` must read the cause message, text:\n{text}"
+        );
+    }
+
+    #[test]
     fn lower_arrays() {
         // Construction, element access, len, and sum lower to the array runtime
         // entry points; element-wise ops lower to the dedicated ArrayBinOp node.
