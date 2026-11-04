@@ -4469,21 +4469,25 @@ fn lower_fn(
     Ok(b.func)
 }
 
-/// Lower the module-level `const` declarations (D-0112, #658 Phase 1) into the
-/// synthetic `@__zap_init_globals` function, run once at the top of `main`.
+/// Lower the module-level declarations (D-0112) — `const T NAME = expr`
+/// (immutable, #658 Phase 1) and `T NAME = expr` (mutable, #662 Phase 2) — into
+/// the synthetic `@__zap_init_globals` function, run once at the top of `main`.
 ///
-/// Each `const T NAME = expr` (and `const auto NAME = expr`) at module scope
-/// becomes a module global slot: its initializer is lowered here — reusing the
-/// ordinary `let` lowering (coerce to the declared type, or infer for `auto`;
-/// value-struct copy) — and stored into the slot. The slot is registered in
-/// `ctx.globals` as it is created, so a later const's initializer, and every
-/// user function body lowered afterwards, resolve a reference to it (an earlier
-/// const, a forward reference fails as use-before-init). Items arrive in
-/// import-topological + source order (the module linker arranged that), which
-/// is the eager init order. A pointer-typed slot is registered as a permanent
-/// GC root (`zap_gc_add_root`) so the collector — conservative Boehm (a no-op
-/// there, the data segment is scanned) or precise Immix — keeps its referent
-/// live.
+/// Each single-name module-level binding becomes a module global slot: its
+/// initializer is lowered here — reusing the ordinary `let` lowering (coerce to
+/// the declared type, or infer for `auto`; value-struct copy) — and stored into
+/// the slot. The slot is registered in `ctx.globals` as it is created, so a
+/// later binding's initializer, and every user function body lowered afterwards,
+/// resolve a reference to it (an earlier binding; a forward reference fails as
+/// use-before-init). Const and mutable bindings lower identically here — the
+/// only difference is that a mutable one may later be reassigned, which lowers
+/// to a `GlobalAddr` + `Store` through the same slot (see `name_lvalue`). Items
+/// arrive in import-topological + source order (the module linker arranged
+/// that), which is the eager init order. A pointer-typed slot is registered as a
+/// permanent GC root (`zap_gc_add_root`) so the collector — conservative Boehm
+/// (a no-op there, the data segment is scanned) or precise Immix — keeps its
+/// referent live; for a mutable pointer global this covers whatever heap object
+/// the slot currently holds, so a reassigned/grown container stays reachable.
 fn lower_init_globals(
     module: &ast::Module,
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
@@ -4500,11 +4504,7 @@ fn lower_init_globals(
     );
     for item in &module.items {
         let ast::Item::Stmt(Stmt::Let {
-            is_const: true,
-            ty,
-            name,
-            value,
-            ..
+            ty, name, value, ..
         }) = item
         else {
             continue;
@@ -5118,6 +5118,27 @@ impl<'a> FnLower<'a> {
     }
     fn lookup(&self, name: &str) -> Option<(Value, Ty)> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    /// Resolve a name to a storable lvalue slot (pointer + type): a local's
+    /// `alloca` if one is in scope, else a module-level global's slot (D-0112).
+    /// For a global it emits a `GlobalAddr`, mirroring the read path in `expr`'s
+    /// `Expr::Name` global fallback; the returned pointer is stored into exactly
+    /// like a local slot, so a mutable module global (#662 Phase 2) is reassigned
+    /// through its data-segment slot — which the GC already scans as a root. A
+    /// `const` is also resolvable here, but sema has already rejected reassigning
+    /// one (ZAP3017), so a store only ever reaches a mutable binding. Returns
+    /// `None` for an unknown name (the caller reports it).
+    fn name_lvalue(&mut self, name: &str) -> Option<(Value, Ty)> {
+        if let Some(slot) = self.lookup(name) {
+            return Some(slot);
+        }
+        if let Some((idx, ty)) = self.ctx.global(name) {
+            let slot = self.new_value(Ty::Ptr);
+            self.emit(Inst::GlobalAddr { dest: slot, idx });
+            return Some((slot, ty));
+        }
+        None
     }
 
     /// The scope-stack index a fresh walrus binding (`name := expr`, #600) must
@@ -6160,8 +6181,10 @@ impl<'a> FnLower<'a> {
             Stmt::Assign { target, value, .. } => {
                 if let Expr::Name(n, _) = target {
                     let (v, vt) = self.expr(value)?;
+                    // A local slot, or a module-level mutable global's slot
+                    // (D-0112, #662) — stored into identically.
                     let (ptr, ty) = self
-                        .lookup(n)
+                        .name_lvalue(n)
                         .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
                     // Reassigning a `fn(...)`-typed binding is still a coercion
                     // into a function slot, so it must match structurally (I#465).
@@ -6231,8 +6254,10 @@ impl<'a> FnLower<'a> {
                 target, op, value, ..
             } => {
                 if let Expr::Name(n, _) = target {
+                    // A local, or a module-level mutable global (D-0112, #662):
+                    // read-modify-write through the same slot.
                     let (ptr, ty) = self
-                        .lookup(n)
+                        .name_lvalue(n)
                         .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
                     let cur = self.load(ptr, ty);
                     let (rhs, rt) = self.expr(value)?;
@@ -6526,8 +6551,9 @@ impl<'a> FnLower<'a> {
         }
         match e {
             Expr::Name(n, _) => {
+                // A local, or a module-level mutable global (D-0112, #662).
                 let (ptr, dt) = self
-                    .lookup(n)
+                    .name_lvalue(n)
                     .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
                 let v = self.coerce(val, ty, dt);
                 self.store(ptr, v);
@@ -13417,8 +13443,9 @@ impl<'a> FnLower<'a> {
         value_expr: &Expr,
     ) -> Result<(), LowerError> {
         if let Expr::Name(n, _) = target {
+            // A local, or a module-level mutable global (D-0112, #662).
             let (ptr, ty) = self
-                .lookup(n)
+                .name_lvalue(n)
                 .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
             if let Ty::Func(t_idx) = ty {
                 self.check_fn_coercion(&vt, t_idx, zapc_diag::ErrorCode::ZAP4001)?;

@@ -2375,17 +2375,21 @@ impl Checker {
                 self.declare(&name, Ty::Py, *span);
             }
         }
-        // Module-level `const` declarations (D-0112, #658 Phase 1). Declared up
+        // Module-level declarations (D-0112): `const T NAME = expr` (immutable,
+        // #658 Phase 1) and `T NAME = expr` (mutable, #662 Phase 2). Declared up
         // front — before any function body is checked — so a reference resolves
         // regardless of source order (eager, import-topological init; the linker
         // ordered the items, D-0081). Each initializer is type-checked here, in
-        // source order, so a later const may read an earlier one (and a forward
-        // reference to a not-yet-declared const is an unknown-name error, which
+        // source order, so a later binding may read an earlier one (and a forward
+        // reference to a not-yet-declared one is an unknown-name error, which
         // matches the use-before-init rule). Function signatures were already
-        // collected (`collect_sigs`), so an initializer may call a function.
+        // collected (`collect_sigs`), so an initializer may call a function. The
+        // only difference between the two forms is constness: a `const` is
+        // recorded immutable (reassignment → ZAP3017), a mutable binding stays
+        // reassignable from any function (the light concurrency model, #661).
         for item in &module.items {
             if let Item::Stmt(Stmt::Let {
-                is_const: true,
+                is_const,
                 ty,
                 name,
                 value,
@@ -2413,7 +2417,11 @@ impl Checker {
                         dt
                     }
                 };
-                self.declare_const(name, dt, *span);
+                if *is_const {
+                    self.declare_const(name, dt, *span);
+                } else {
+                    self.declare(name, dt, *span);
+                }
             }
         }
         for item in &module.items {
@@ -2436,10 +2444,10 @@ impl Checker {
                         self.check_function(m, Some(&e.name));
                     }
                 }
-                // Module-level `const`s were already declared and checked in the
-                // pre-pass above (D-0112); skip them here so the binding is not
-                // re-declared as mutable.
-                Item::Stmt(Stmt::Let { is_const: true, .. }) => {}
+                // Module-level bindings (const and mutable) were already declared
+                // and checked in the pre-pass above (D-0112); skip them here so
+                // the binding is not re-declared.
+                Item::Stmt(Stmt::Let { .. }) => {}
                 Item::Stmt(st) => self.check_stmt(st),
                 _ => {}
             }
@@ -6860,6 +6868,67 @@ def main():
         // nested block without error; the inner const is immutable, the outer
         // binding stays mutable after the block.
         ok("def main() -> int64:\n    int64 x = 1\n    if True:\n        const int64 x = 9\n    x = 5\n    return x\n");
+    }
+
+    // ---- module-level mutable globals (D-0112, #662 Phase 2) --------------
+
+    #[test]
+    fn module_mutable_scalar_is_reassignable_in_functions() {
+        // A mutable module global (no `const`) is persistent state that any
+        // function may read AND reassign — plain, chained, and augmented — with
+        // no ZAP3017 (that is a `const`-only rule). Declared up front, so a
+        // function declared before it still resolves it.
+        ok("int64 N = 0\ndef bump():\n    N = N + 1\ndef main() -> int64:\n    bump()\n    return N\n");
+        ok("def use() -> int64:\n    N = 5\n    return N\nint64 N = 0\ndef main() -> int64:\n    return use()\n");
+        ok("int64 N = 0\ndef main() -> int64:\n    N += 3\n    return N\n");
+    }
+
+    #[test]
+    fn module_mutable_reference_type_mutation_and_reassign() {
+        // A reference-typed mutable global can have its contents mutated and be
+        // wholly reassigned across functions.
+        ok("list[int64] LOG = []\ndef add(int64 x):\n    LOG.append(x)\ndef reset():\n    LOG = []\ndef main() -> int64:\n    add(1)\n    reset()\n    return len(LOG)\n");
+        ok("dict[str, int64] M = {}\ndef put(str k, int64 v):\n    M[k] = v\ndef main() -> int64:\n    put(\"a\", 1)\n    return M[\"a\"]\n");
+    }
+
+    #[test]
+    fn module_mutable_auto_infers_type() {
+        // `auto NAME = expr` (no `const`) infers the type and is mutable.
+        ok("auto counter = 0\ndef main() -> int64:\n    counter = counter + 1\n    return counter\n");
+    }
+
+    #[test]
+    fn module_mutable_type_mismatch_is_rejected() {
+        // The declared type must accept the initializer (ZAP4001), exactly as a
+        // module `const` or a local binding would.
+        let e = errors("int64 N = \"hi\"\ndef main() -> int64:\n    return 0\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4001),
+            "expected ZAP4001, got {e:?}"
+        );
+        // And a reassignment of the wrong type is rejected too.
+        let e = errors("int64 N = 0\ndef main() -> int64:\n    N = \"hi\"\n    return N\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4001),
+            "expected ZAP4001 on reassignment, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn module_mutable_initializer_may_reference_earlier_binding() {
+        // Source-order init: a mutable global's initializer may read an earlier
+        // module binding (const or mutable) and call a function.
+        ok("const int64 A = 10\nint64 B = A + 5\ndef main() -> int64:\n    return B\n");
+        ok("int64 A = 10\nint64 B = A + 5\ndef main() -> int64:\n    return B\n");
+        ok("def base() -> int64:\n    return 2\nint64 C = base() * 3\ndef main() -> int64:\n    return C\n");
+    }
+
+    #[test]
+    fn module_mutable_binding_may_be_shadowed_by_a_local_decl() {
+        // Declaring a local of the same name shadows the mutable global inside
+        // that function (an ordinary `auto`/typed declaration); a bare assignment
+        // would instead reassign the global. Both are legal.
+        ok("int64 x = 1\ndef f() -> int64:\n    auto x = 99\n    return x\ndef main() -> int64:\n    return f() + x\n");
     }
 
     #[test]

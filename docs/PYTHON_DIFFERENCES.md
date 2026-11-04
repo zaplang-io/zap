@@ -36,27 +36,30 @@ it" tracking issue.
 ### `global` / `nonlocal`
 
 Zap uses **static, lexical scoping** and does not allow executable statements at
-module scope. Module-level state is limited to **`const`** — persistent,
-immutable bindings (`const int64 LIMIT = 100`), initialized once before `main`
-(SPEC §3.1, D-0112, #658). There is still no mutable module-level state for a
-`global` rebind to target (a module-level mutable binding is rejected today,
-ZAP3018), and no enclosing-function cell for `nonlocal` to reach (SPEC §13;
-D-0021/D-0090). Mutable state is passed explicitly or held in a `struct`; a
-module exposes `const` bindings and definitions, not reassignable globals.
+module scope, but it **does** have module-level state — both immutable `const`
+and mutable bindings, initialized once before `main` (SPEC §3.1, D-0112, epic
+#661). What it has no need for is the `global` and `nonlocal` *keywords*. Because
+scoping is static and lexical, a bare assignment to a name that resolves to a
+module-level binding reassigns that binding in place — there is no Python-style
+"assignment inside a function implicitly creates a local" rule to opt out of, so
+no `global` declaration is needed. (To introduce a function-local that shadows a
+module binding, you *declare* it: `auto x = ...`.) There is likewise no
+enclosing-function cell for `nonlocal` to reach (SPEC §13; D-0021/D-0090):
+closures capture by value, and shared state is a module binding or an explicit
+object.
 
 ```python
-# Python
+# Python — `global` opts the function out of creating a local
 count = 0
 def tick():
     global count
     count += 1
 ```
 ```python
-# Zap — hold state in a value, pass it explicitly
-struct Counter:
-    int64 count = 0
-    def tick(self):
-        self.count += 1
+# Zap — a module-level mutable binding; no `global` keyword needed
+int64 count = 0
+def tick():
+    count += 1            # reassigns the module binding (static lexical scope)
 ```
 
 ### Annotated-assignment statements (`x: int = 0`)

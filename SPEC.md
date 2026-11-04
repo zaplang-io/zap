@@ -115,34 +115,50 @@ A `const` cannot be reassigned, augmented (`+=`), or otherwise rebound after its
 declaration; doing so is a compile error (ZAP3017). This holds for a `const`
 anywhere — a local, or a module-level one (below).
 
-### 3.1 Module-level `const` (D-0112, #658 Phase 1)
+### 3.1 Module-level persistent state (D-0112, epic #661)
 
-A `const` declaration may also appear at **module top level**, giving the module
-persistent, immutable state:
+A binding declaration may also appear at **module top level**, giving the module
+persistent state. Both the immutable `const` form (#658 Phase 1) and the
+**mutable** form (#662 Phase 2) are available:
 
 ```python
-const int64 LIMIT = 100
-const list[int64] DEFAULTS = [1, 2, 3]
+const int64 LIMIT = 100               # immutable (const)
 const dict[str, int64] WEIGHTS = {"a": 1, "b": 2}
-const auto PI = 3.14159            # `auto` infers the type from the initializer
+const auto PI = 3.14159               # `auto` infers the type from the initializer
+
+int64 counter = 0                     # mutable — reassignable and mutable
+list[int64] log = []
+auto total = 0                        # mutable with inferred type
 ```
 
-- **Scalars and reference/heap types** are both allowed (a reference-typed
-  module `const` is a permanent GC root).
-- It is **evaluated once, before `main`**, in import-topological order across
+- **Scalars and reference/heap types** are both allowed, for `const` and mutable
+  bindings alike (a reference-typed module binding is a permanent GC root).
+- Each is **evaluated once, before `main`**, in import-topological order across
   modules (a module's state initializes after every module it imports, reusing
   the acyclic module graph of D-0081) and in source order within a module. A
-  later `const`'s initializer may read an earlier `const` or call a function; a
-  reference to a not-yet-initialized `const` is an error.
-- It is a **module member**: reachable from another module as `module.NAME`
+  later binding's initializer may read an earlier module binding or call a
+  function; a reference to a not-yet-initialized one is an error.
+- Each is a **module member**: reachable from another module as `module.NAME`
   unless it is `_`-private (D-0028/D-0081).
+- A **mutable** module binding may be **reassigned** (`=`, `+=`) and **mutated**
+  (container contents) from any function; the value persists for the process
+  lifetime. There is **no `global` keyword** (unlike Python): a bare assignment
+  to a name that resolves to a module binding reassigns that binding in place
+  (Zap's static lexical scoping, D-0021/D-0090). To introduce a function-local
+  of the same name instead, declare it (`auto x = ...` / `T x = ...`). A `const`
+  module binding cannot be reassigned (ZAP3017).
 
-A module-level **mutable** binding (`T NAME = expr` at module scope) is reserved
-for a later phase of #658 and is rejected today (ZAP3018). Loose executable
-statements at module scope remain rejected (ZAP3014/ZAP3016); only a `const`
-declaration — and a leading module docstring — is admitted. The broader design
-(mutable module state, the concurrency-sharing lint, and the `@shareable`
-marker) is epic #661.
+Concurrency follows the light Go/Python model of epic #661: a mutable module
+binding is shared, **unsynchronized, and never implicitly locked**. `const` is
+the safe default; `Atomic[T]`/`Mutex`/concurrent collections are the tools for
+shared mutable state. (The static sharing lint and the `@shareable` marker are
+later phases of #661.)
+
+Only a **single-name** module-level binding is admitted. A module-level
+tuple-destructuring declaration (`T a, b = expr`) is rejected (ZAP3018) — declare
+each binding on its own line. Loose executable statements at module scope remain
+rejected (ZAP3014/ZAP3016); only module bindings — and a leading module
+docstring — are admitted.
 
 ## 4. Types
 

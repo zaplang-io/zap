@@ -99,16 +99,19 @@ _Last updated: 2026-10-22_
   hygiene rules; `@validate(matches=…)` regex validation; richer reflection
   (field-level metadata, annotation argument
   values).
-- 🟡 **Module-level persistent state** (epic #661, D-0112) — the model is locked
-  and Phase 1 (module-level `const`, #658) is implemented (eager import-topological
-  init; reference consts as GC roots; immutable). Still open (Phases 2–3): the
-  module-level **mutable** form (`T NAME = expr`, rejected today with ZAP3018);
-  the static concurrency-**sharing lint** (warnings over the #659 pipeline, never
-  a legality flag); the nominal **`@shareable`** marker (one uniform rule for
-  built-in `Atomic`/`Mutex`/concurrent types, reflection-queryable, per-site
-  `# noqa`); and the runtime **`-race`** detector. Under precise Immix (D-0009),
-  mutable pointer-slot stores will also need a write barrier + static root table
-  (Phase 1 already registers each pointer slot via `zap_gc_add_root`).
+- 🟡 **Module-level persistent state** (epic #661, D-0112) — the model is locked;
+  Phase 1 (module-level `const`, #658) and Phase 2 (module-level **mutable**
+  globals, `T NAME = expr`, #662) are implemented (eager import-topological init;
+  reference bindings as GC roots; reassignable/mutable; no `global` keyword).
+  Still open: the static concurrency-**sharing lint** (warnings over the #659
+  pipeline, never a legality flag); the nominal **`@shareable`** marker (one
+  uniform rule for built-in `Atomic`/`Mutex`/concurrent types,
+  reflection-queryable, per-site `# noqa`); and the runtime **`-race`** detector.
+  Under precise Immix (D-0009), mutable pointer-slot stores will also want a
+  write barrier + static root table for a future generational/concurrent
+  collector (**#663**) — today both collectors are correct because each
+  pointer-slot *address* is registered via `zap_gc_add_root` and re-scanned/
+  relocated-through on every stop-the-world collection.
 - ⚪ **C FFI** (D-0012) — deferred; generalizes interop to all languages.
 - ⚪ **Precise GC** (Immix-style) replacing Boehm (D-0009).
 - ⚪ **Arena / region allocation** (à la Go's `GOEXPERIMENT=arenas`) — deferred.

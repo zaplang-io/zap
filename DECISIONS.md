@@ -3697,7 +3697,7 @@ tests (`as_pattern_binds_capture_and_inner_names`,
 `as_capture_is_scrutinee_typed_and_visible_in_guard`), and a driver
 `error_codes` test (ZAP2021) on host. See docs/GRAMMAR.ebnf and SPEC.md.
 
-## D-0112 — Module-level persistent state; Phase 1: module-level `const` (epic #661, I#658)
+## D-0112 — Module-level persistent state: `const` (Phase 1, I#658) + mutable globals (Phase 2, I#662) (epic #661)
 
 Until now Zap had **no module-level persistent state**: a top-level executable
 statement or binding at module scope was rejected (ZAP3014 in an imported
@@ -3799,8 +3799,12 @@ records the slot.
 
 - **ZAP3017** (`assignment to a constant binding`) — reassigning a `const`
   (module-level or local), plain/augmented/chained/tuple-target.
-- **ZAP3018** (`module-level mutable variable not yet supported`) — a
-  module-level mutable declaration-with-initializer (#658 Phase 2).
+- **ZAP3018** (`module-level tuple-destructuring declaration not supported`) — a
+  module-level tuple-destructuring declaration (`T a, b = expr`). Single-name
+  module-level bindings — `const` (#658) and mutable (#662) — are admitted;
+  tuple destructuring at module scope is not (declare each on its own line).
+  (In #658 this code originally covered the not-yet-supported mutable form; #662
+  narrows it to the one declaration-with-initializer form still rejected.)
 
 ### Verification
 
@@ -3817,5 +3821,64 @@ order, and the ZAP3018 mutable-global rejection. IR tests assert the global
 slot, the `@__zap_init_globals` store, the GC-root call for reference types,
 source-order init, and that a program with no `const` emits no init function.
 End-to-end goldens (`module_const`, `module_const_eval_once`,
-`module_const_reassign`, `module_mutable_global`, and the
-`module_const_across_modules` project) run under the full-codegen CI jobs.
+`module_const_reassign`, and the `module_const_across_modules` project) run
+under the full-codegen CI jobs.
+
+### Phase 2 (I#662) — module-level mutable globals (what ships now)
+
+A **module-level mutable binding** is admitted at module top level, alongside the
+`const` form:
+
+```python
+int64 counter = 0
+list[int64] log = []
+auto total = 0              # `auto` infers the type; mutable
+```
+
+- It is the **same machinery** as the `const` form (#658), minus immutability:
+  the module linker admits any *single-name* module binding (const or mutable)
+  and keeps rejecting loose executable statements; sema declares it up front in
+  the module scope (mutable, so reassignable) and type-checks its initializer in
+  source order; lowering gives it a module global slot in `@__zap_init_globals`
+  (eager, import-topological + source order), roots a pointer-typed slot, and
+  reads it via `GlobalAddr` + `Load`. The **one addition** is the write path: a
+  reassignment or augmented/chained/tuple-leaf assignment to a name that resolves
+  to a module global lowers to `GlobalAddr` + `Store` through the slot (a new
+  `name_lvalue` helper resolves a name to a local alloca else the global slot;
+  sema has already rejected storing to a `const`, ZAP3017).
+- **No `global` keyword** (D-0021/D-0090): a bare assignment to a name that
+  resolves to a module binding reassigns it in place (static lexical scoping). A
+  function-local that shadows a module binding is introduced by *declaring* it
+  (`auto x = ...`). Mutating container contents (`xs.append(...)`, `d[k] = v`)
+  goes through the ordinary read path (the global's pointer) and needs no write
+  path at all.
+- **GC.** A reference-typed mutable global is a permanent GC root exactly as a
+  `const` one is: `@__zap_init_globals` registers the slot's **address** with
+  `zap_gc_add_root`. Because the collector re-scans each registered slot address
+  on every (stop-the-world) collection — and relocates through it under precise
+  Immix — reassigning the slot or growing the container it holds is correct under
+  **both** collectors today with no write barrier. The precise-Immix write
+  barriers that a future generational/concurrent collector would need are tracked
+  under **#663** and are explicitly out of scope here.
+- **Scope.** Only single-name bindings; a module-level tuple-destructuring
+  declaration stays rejected (ZAP3018). The concurrency-sharing lint and the
+  `@shareable` marker remain later #661 phases.
+
+**Verification (Phase 2).** Sema unit tests cover a mutable global's
+reassignability across functions (plain/chained/augmented), reference-type
+content mutation and whole reassignment, `auto` inference, the type-mismatch
+rejection on declaration *and* on reassignment (ZAP4001), an initializer reading
+an earlier module binding, and local-declaration shadowing. Module-linker tests
+cover a mutable global linking (entry and imported), cross-module access with
+prefix mangling and dependency-first order, mutable bindings placed between
+`def`s, and the ZAP3018 tuple-destructuring rejection (with the executable-
+statement ZAP3016 still firing for a bare statement). IR tests assert the global
+slot, that reassignment and `+=` store *through* the slot (`GlobalAddr` +
+`Store`, read-modify-write), the GC-root call for a reference-typed mutable
+global, and const/mutable coexistence in one slot table. End-to-end goldens
+(`module_mutable_global` — read/reassign/mutate/persist a scalar + list;
+`module_mutable_mutation` — dict contents + whole reassignment;
+`module_mutable_init_order`; `module_mutable_gc_root` — a growing global survives
+heavy garbage, asserting length+sum, never heap bytes; `module_tuple_decl_rejected`;
+and the `module_mutable_across_modules` project) run under the full-codegen CI
+jobs (both collectors).

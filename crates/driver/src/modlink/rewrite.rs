@@ -89,18 +89,13 @@ impl Rewriter<'_> {
             // merge (ZAP3016/ZAP3014/ZAP3018 in `check_toplevel_statements`,
             // ticket #459 / D-0112), so the statements that reach a successful
             // rewrite are a module docstring (a bare string literal) and a
-            // module-level `const` declaration (D-0112, #658 Phase 1). A const's
-            // binding name is a module member, so it is mangled with the module
-            // prefix (like any top-level decl) before its initializer's
-            // references are rewritten — keeping cross-module `alias.NAME`
-            // resolution and post-merge name uniqueness consistent.
+            // module-level declaration — `const` (D-0112, #658) or mutable
+            // (D-0112, #662). The binding name is a module member, so it is
+            // mangled with the module prefix (like any top-level decl) before its
+            // initializer's references are rewritten — keeping cross-module
+            // `alias.NAME` resolution and post-merge name uniqueness consistent.
             Item::Stmt(st) => {
-                if let Stmt::Let {
-                    is_const: true,
-                    name,
-                    ..
-                } = st
-                {
+                if let Stmt::Let { name, .. } = st {
                     self.rename_decl(name);
                 }
                 self.stmt(st, &HashSet::new(), &HashSet::new());
