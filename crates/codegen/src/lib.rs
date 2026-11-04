@@ -29,8 +29,8 @@ use inkwell::{
 };
 
 use zapc_ir::{
-    self as zir, lower_module, lower_module_opts, AtomicOrd, AtomicRmwOp, CastKind, CmpPred, Func,
-    Inst, Owner, Term, Ty,
+    self as zir, lower_module_opts, AtomicOrd, AtomicRmwOp, CastKind, CmpPred, Func, Inst, Owner,
+    Term, Ty,
 };
 use zapc_syntax::ast::Module as AstModule;
 
