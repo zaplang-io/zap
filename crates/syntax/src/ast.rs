@@ -372,10 +372,55 @@ pub struct DecoratorMember {
     pub name: String,
     /// Untyped macro-parameter names, in order (`ctx`; `ctx, result`; `call`).
     pub params: Vec<String>,
-    /// The hook body. `None` only for a member whose nested-`def` body this
-    /// slice does not yet parse (the `wrap` form, deferred to #653); expansion
-    /// then reports a stable "not implemented yet" diagnostic.
+    /// The hook body statements.
+    ///
+    /// - For a `before`/`after` hook: the hook body itself.
+    /// - For a `wrap(call)` hook (#653): the body of the nested
+    ///   `def inner(...)`; the inner signature and the `return inner` trailer
+    ///   are carried separately in [`DecoratorMember::wrap`].
+    ///
+    /// `None` only for a malformed member whose body failed to parse.
     pub body: Option<Block>,
+    /// Present only for a `wrap(call)` hook (#653): the nested
+    /// `def inner(...)` signature plus the `wrap`-body statements that follow
+    /// it (expected to be exactly `return inner`). The inner function's *body*
+    /// lives in [`DecoratorMember::body`].
+    pub wrap: Option<WrapForm>,
+    pub span: Span,
+}
+
+/// The structural shape of a `wrap(call)` decorator hook (D-0036, #653):
+///
+/// ```text
+/// def wrap(call):
+///     def inner(*args):        # inner_name = "inner", inner_params = [*args]
+///         ...                  # -> DecoratorMember::body
+///     return inner             # -> trailer
+/// ```
+///
+/// Validated during expansion: `inner_params` must be a single `*args`
+/// forwarding parameter and `trailer` must be exactly `return <inner_name>`.
+#[derive(Clone, Debug)]
+pub struct WrapForm {
+    /// The nested function's name, e.g. `inner`.
+    pub inner_name: String,
+    /// The nested function's parameters as written (the `*args` forwarder).
+    pub inner_params: Vec<WrapParam>,
+    /// The statements in the `wrap` body *after* the nested `def` — expected to
+    /// be exactly `return <inner_name>`.
+    pub trailer: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// A parameter of a `wrap` hook's nested `def inner(...)` (#653). These are
+/// untyped macro bindings (`*args`), not type-first Zap parameters.
+#[derive(Clone, Debug)]
+pub struct WrapParam {
+    pub name: String,
+    /// `true` for a `*name` positional forwarder.
+    pub variadic: bool,
+    /// `true` for a `**name` keyword forwarder.
+    pub kwargs: bool,
     pub span: Span,
 }
 

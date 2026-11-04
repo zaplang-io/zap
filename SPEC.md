@@ -1092,9 +1092,38 @@ def fetch(str url) -> str:
     ...
 ```
 
-The general `wrap(call)` form — a nested `def inner(...)` returning a
-replacement callable, e.g. `@retry(times=3)` — is tracked by #653; the
-`before`/`after` form is available now.
+The general **`wrap(call)`** form replaces the whole call. Its body is a nested
+`def inner(*args):` (confined to the decorator-body parser — not a general
+nested-`def`) followed by `return inner`; the inner body is inlined into the
+generated wrapper and `call(*args)` becomes a typed call of the original:
+
+```python
+decorator retry(int64 times):
+    def wrap(call):
+        def inner(*args):
+            for i in range(times):
+                try:
+                    return call(*args)
+                except Exception as e:
+                    if i == times - 1:
+                        raise e
+        return inner
+
+@retry(times=3)
+def fetch(str url) -> str:
+    ...
+```
+
+`*args` is a **compile-time forwarding template, not a runtime value**: it may
+only appear as `call(*args)`, which forwards the decorated function's exact
+typed parameters (so the wrapper keeps that exact signature). Reading/indexing
+`*args`, using `call` as a value, mixing `wrap` with `before`/`after`, or
+omitting `return inner` are stable errors (ZAP5052/ZAP5054). When the inlined
+body is not provably return-terminating (e.g. `retry`'s loop), an implicit
+`raise RuntimeError(...)` fall-through guard is appended so the wrapper
+type-checks. A `wrap` stacks with other decorators bottom-up like any wrapper.
+(An `args`-keyed `memoize`/`@cache` is not expressible by `wrap`: it needs
+persistent cross-call state, a separate capability.)
 
 **Field decorators** — construction-time defaults (per-instance), validation,
 and derive-driven codegen (pydantic-style, zero runtime cost):

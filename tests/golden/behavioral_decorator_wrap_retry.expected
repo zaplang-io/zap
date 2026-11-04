@@ -1,0 +1,9 @@
+compute 21
+ok result 42
+try 5
+retry attempt 0
+try 5
+retry attempt 1
+try 5
+retry attempt 2
+gave up boom

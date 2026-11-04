@@ -43,9 +43,22 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   that runs `before`, calls the original, runs `after` on the return value, and
   returns it. `ctx.name` is the decorated function's name; decorators stack
   bottom-up; decorator arguments (`@tag("x")`) wire into the generated code.
-  Ill-formed uses are stable diagnostics (ZAP5049–ZAP5053). The general
-  `wrap(call)` form is tracked by #653 (applying it reports ZAP5052 for now);
+  Ill-formed uses are stable diagnostics (ZAP5049–ZAP5053);
   behavioral decorators on non-function targets report ZAP5050.
+- User-defined **behavioral decorators**, general `wrap(call)` form (#653 of epic
+  #651, D-0108, D-0036). A `decorator` may declare a `wrap(call)` hook whose body
+  is a nested `def inner(*args): … return inner`; applying it generates — at
+  compile time, visible via `zap expand` — a wrapper with the decorated
+  function's **exact signature** in which the inner body is inlined and
+  `call(*args)` becomes a typed call of the renamed original forwarding the
+  decorated function's parameters. `*args` is a compile-time forwarding template,
+  **not** a runtime varargs value (so it may appear only as `call(*args)`;
+  reading it, using `call` as a value, mixing `wrap` with `before`/`after`, or
+  omitting `return inner` are ZAP5052/ZAP5054). A declared-return wrapper whose
+  body is not provably return-terminating (e.g. `retry`) gets an implicit
+  `raise RuntimeError(...)` fall-through guard. `wrap` stacks with other
+  decorators bottom-up. (An `args`-keyed `memoize`/`@cache` is not expressible by
+  `wrap`: it needs persistent cross-call state, a separate capability.)
 - Transparent type aliases: `type Name = <type>`, plus the generic form
   `type Name[T] = <type>` (#606, D-0105). An alias is not a new nominal type — it
   resolves to its target with the same identity, so an alias and the spelled-out

@@ -3351,7 +3351,7 @@ are **not** genexprs, sema positive tests (iterator binding, `sum`, `for`-header
 and a sema negative test (loop variable does not leak), and a fmt round-trip
 test on host.
 ## D-0108 — User-defined behavioral decorators: `before`/`after`/`wrap` engine (epic #651)
-**Status:** `before`/`after` convenience form **Locked + implemented** (#652); `wrap(call)` general form **Accepted (design)**, implemented separately (#653).
+**Status:** `before`/`after` convenience form **Locked + implemented** (#652); `wrap(call)` general form **Locked + implemented** (#653).
 
 Completes the "deferred user-macro piece" of D-0036: a `decorator` body may now
 declare behavioral hooks whose code is **generated around the decorated target
@@ -3407,6 +3407,70 @@ passed by name). The generated wrapper again carries the decorated function's
 exact signature, so the automatic-`@wraps` contract holds for the general form
 too.
 
+**The `wrap(call)` form, concretely (#653).** A `wrap` hook is
+`def wrap(call):` whose body is a single nested `def inner(...)` followed by
+`return inner`. The nested `def` is confined to the decorator-body parser — it
+is **not** a general nested-`def` language feature. Its body is inlined into the
+generated wrapper (there is no second real function and no closure), with:
+
+```python
+decorator retry(int64 times):
+    def wrap(call):
+        def inner(*args):
+            for i in range(times):
+                try:
+                    return call(*args)
+                except Exception as e:
+                    if i == times - 1:
+                        raise e
+        return inner
+
+@retry(times=3)
+def fetch(str url) -> str: ...
+```
+
+expanding to a wrapper with `fetch`'s exact signature in which the decorator
+argument is bound (`int64 times$arg = 3`), `call(*args)` becomes the forwarding
+call `fetch$orig(url)`, and a fall-through guard is appended (see below):
+
+```python
+def fetch(str url) -> str:
+    int64 times$arg = 3
+    for i in range(times$arg):
+        try:
+            return fetch$orig(url)
+        except Exception as e:
+            if i == times$arg - 1:
+                raise e
+    raise RuntimeError("decorator `@retry` wrapper for `fetch` returned no value")
+```
+
+Decided consequences of the typed-forwarding model:
+
+- **`*args` is a forwarding token, never a value.** `call(*args)` (or `call()`
+  for a no-arg forwarder) is the only legal use; reading, indexing, iterating,
+  or passing `args` around is ZAP5052, and so is using `call` other than as a
+  call. This is what lets the wrapper keep a concrete typed signature rather
+  than a runtime varargs list. A consequence is that the classic
+  `args`-keyed `memoize` (and the built-in `@cache`) is **not expressible by
+  `wrap`**, because it needs `args` as a runtime hashable value *and* persistent
+  cross-call state; persistent module-level state is a separate, still-absent
+  capability (the same gap that keeps `@cache` a deferred built-in). This is an
+  accepted limit, not a workaround target.
+- **Fall-through guard.** The generated wrapper obeys the same all-paths-return
+  rule as hand-written code. Where the inlined `inner` body cannot be *proven*
+  to return on every path (e.g. `retry`'s loop, whose last iteration always
+  returns or re-raises but which the type system cannot see), expansion appends
+  an implicit `raise RuntimeError(...)` so the wrapper type-checks and has
+  defined behavior if control ever reaches the end — rather than lowering to an
+  `unreachable` trap. A void wrapper, or one whose body provably terminates,
+  gets no guard.
+- **Mutual exclusion.** A decorator declares either `before`/`after` **or**
+  `wrap`, not both (a `wrap` owns the whole wrapper body); mixing is ZAP5052.
+- **Stacking** is uniform: a `wrap` wrapper chains into the next inner function
+  exactly like a `before`/`after` wrapper, so the two forms stack together
+  bottom-up.
+
 **Context.** `ctx` exposes exactly one field, `ctx.name` — the decorated
 function's name, substituted to a string literal. Any other use of `ctx` is a
 stable error (ZAP5053).
@@ -3425,19 +3489,28 @@ Only a decorator that declares hooks is expanded.
 
 **Diagnostics (stable).** ZAP5049 unknown hook (not `before`/`after`/`wrap`);
 ZAP5050 behavioral decorator on an unsupported target (only free functions in
-this slice); ZAP5051 hook wrong arity; ZAP5052 the `wrap` form not generated yet
-(#653); ZAP5053 invalid application (missing/extra decorator argument, `after`'s
-`result` on a void function, or `ctx` used other than `ctx.name`).
+this slice); ZAP5051 hook wrong arity; ZAP5052 unsupported `wrap` body shape
+(mixing `wrap` with `before`/`after`, an `inner` that is not a single `*args`
+forwarder, `call` used other than as `call(*args)`, or `*args` read as a value);
+ZAP5053 invalid application (missing/extra decorator argument, `after`'s
+`result` on a void function, or `ctx` used other than `ctx.name`); ZAP5054 a
+`wrap` hook that does not end with `return <inner>`.
 
 **Limits (accepted, follow-ups).** As with the registering desugar (D-0087), the
 expansion runs only on the compile path, so LSP/MCP `check_source` do not yet
 surface the behavioral diagnostics; and only free top-level functions are
-supported (methods/fields/structs/enums/params are ZAP5050). The general
-`wrap(call)` form is #653.
+supported (methods/fields/structs/enums/params are ZAP5050). `args`-keyed
+`memoize` / `@cache` await persistent module-level state (a separate gap). The
+canonical re-raise inside a `wrap` is the bound form `raise e`; the bare `raise`
+re-raise is a separate unimplemented runtime feature (ZAP6001), independent of
+this engine.
 
-Verified by driver unit tests (expansion shape, `ctx.name` substitution,
-bottom-up stacking, decorator arguments, deferred-`wrap`, unknown-hook,
-unsupported-target, declared-only untouched), `before`/`after`/stacking/
-arguments/exception-propagation goldens (end-to-end under the full-codegen CI
-jobs), and a `zap fmt` round-trip of the decorator surface. See
+Verified by driver unit tests (`before`/`after` and `wrap` expansion shape,
+`ctx.name` substitution, bottom-up stacking incl. `wrap`-under-`before`/`after`,
+decorator arguments, `wrap` forwarding + fall-through guard + void no-guard,
+`*args`/`call`-as-value rejection, missing-`return inner`, `wrap`+`before`
+mixing, unknown-hook, unsupported-target, declared-only untouched), parser tests
+pinning the `wrap` AST shape, `before`/`after`/stacking/arguments/exception and
+`wrap` retry/threading/stacking/void/negative goldens (end-to-end under the
+full-codegen CI jobs), and `zap fmt` round-trips of both decorator surfaces. See
 `design/0004-decorators.md`.

@@ -525,16 +525,23 @@ define_codes! {
     ZAP5051 = 5051 : "decorator hook has the wrong parameters",
         "`before` takes one parameter (`ctx`); `after` takes two (`ctx, \
          result`). The declared hook's parameter count does not match (D-0036).";
-    ZAP5052 = 5052 : "decorator form not implemented yet",
-        "The general `wrap(call)` behavioral-decorator form (a nested \
-         `def inner(...)` returning a replacement callable) is not generated yet \
-         — it is tracked as its own slice of epic #651 (#653). The \
-         `before`/`after` convenience form is available now.";
+    ZAP5052 = 5052 : "unsupported `wrap` decorator body shape",
+        "A `wrap(call)` hook must be exactly a nested `def inner(*args):` whose \
+         body forwards to the original via `call(*args)`, followed by \
+         `return inner` (D-0036, #653). The body as written is not this shape: \
+         a `wrap` hook may not also declare `before`/`after`, `inner` must take a \
+         single `*args` forwarder, `call` may be used only as `call(*args)`, and \
+         `*args` is a compile-time forwarding template — it is not a runtime \
+         value that can be read, indexed, or iterated.";
     ZAP5053 = 5053 : "invalid behavioral decorator application",
         "A behavioral decorator could not be expanded: its arguments do not match \
          the `decorator`'s parameters, an `after(ctx, result)` hook was applied to \
          a function that returns nothing, or a hook used `ctx` other than as \
          `ctx.name` (the only context field exposed, D-0036).";
+    ZAP5054 = 5054 : "`wrap` decorator does not return its inner callable",
+        "A `wrap(call)` hook must end with `return inner`, returning the nested \
+         function it defines (D-0036, #653). The hook either does not return, or \
+         returns something other than the name of its nested `def`.";
     ZAP5060 = 5060 : "generator tier-1 enum method not supported",
         "Generators on a tier-1 (unboxed-integer) enum method are not supported \
          yet — tier-1 enum methods do not lower at all yet, generator or not. \
