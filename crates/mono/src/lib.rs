@@ -1920,6 +1920,26 @@ impl Mono<'_> {
                     CTy::Unknown,
                 ))
             }
+            // Generator expression (#596): rewrite its nested exprs like a
+            // comprehension; it is not generic-typed in the first vertical.
+            Expr::GenExp {
+                elem,
+                clauses,
+                span,
+            } => {
+                env.push();
+                let clauses = self.rw_comp_clauses(clauses, env)?;
+                let elem = Box::new(self.rw(elem, env)?);
+                env.pop();
+                Ok((
+                    Expr::GenExp {
+                        elem,
+                        clauses,
+                        span: *span,
+                    },
+                    CTy::Unknown,
+                ))
+            }
             Expr::DictComp {
                 key,
                 value,

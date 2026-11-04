@@ -395,7 +395,9 @@ impl Rewriter<'_> {
                     }
                 }
             }
-            Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+            Expr::ListComp { elem, clauses, .. }
+            | Expr::SetComp { elem, clauses, .. }
+            | Expr::GenExp { elem, clauses, .. } => {
                 for c in clauses {
                     self.expr(&mut c.iter, locals);
                     for f in &mut c.ifs {
@@ -820,7 +822,9 @@ fn collect_expr_bindings(e: &Expr, s: &mut HashSet<String>) {
             }
             collect_expr_bindings(body, s);
         }
-        Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+        Expr::ListComp { elem, clauses, .. }
+        | Expr::SetComp { elem, clauses, .. }
+        | Expr::GenExp { elem, clauses, .. } => {
             collect_comp_clause_bindings(clauses, s);
             collect_expr_bindings(elem, s);
         }

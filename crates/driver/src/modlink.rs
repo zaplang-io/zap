@@ -606,6 +606,7 @@ fn expr_span(e: &Expr) -> Span {
         | ListComp { span, .. }
         | DictComp { span, .. }
         | SetComp { span, .. }
+        | GenExp { span, .. }
         | Unary { span, .. }
         | Binary { span, .. }
         | Compare { span, .. }

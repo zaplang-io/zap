@@ -461,10 +461,15 @@ call_expr     ::= postfix "(" [ arg_list ] ")" ;
 subscript     ::= expr
                 | [ expr ] ":" [ expr ] [ ":" [ expr ] ] ;  (* slice, D-0030 *)
 
-arg_list      ::= arg { "," arg } ;
+arg_list      ::= gen_exp                         (* bare generator expression as the SOLE argument, #596 *)
+                | arg { "," arg } ;
 arg           ::= [ IDENT "=" ] expr              (* keyword arg, D-0038 *)
                 | "*" expr                        (* iterable spread, #597 *)
                 | "**" expr ;                     (* mapping spread, #597 *)
+                  (* `gen_exp` here is the ONLY bare (unparenthesized) generator
+                     expression form: `sum(x for x in xs)`. It is allowed solely
+                     when it is the one and only argument; with any other argument
+                     a genexpr must be parenthesized — `f((x for x in xs), y)`. *)
                   (* "*expr" unpacks a list/tuple into positional arguments and
                      "**expr" unpacks a `dict[str, V]` into keyword arguments.
                      Python argument order holds: positionals, then "*", then
@@ -477,9 +482,22 @@ atom          ::= literal
                 | IDENT
                 | "<-" postfix                    (* channel receive, D-0031 *)
                 | "(" named_expression ")"        (* walrus assignment-expr, #600 *)
+                | "(" gen_exp ")"                 (* generator expression, #596 *)
                 | "(" [ star_elem { "," star_elem } [ "," ] ] ")"  (* grouping / tuple; (e,) = 1-tuple, D-0049 *)
                 | list_display
                 | brace_display ;
+
+gen_exp       ::= expr comp_clauses ;
+                  (* A bare GENERATOR EXPRESSION `(elem for CLAUSES)` (#596, epic
+                     #614 D4): same clause grammar as a comprehension (comp_clauses,
+                     #599) but LAZY — it evaluates to an `Iterator` (D-0048) that
+                     yields each `elem` on demand, building no intermediate
+                     collection, rather than a list/set/dict. Distinct from a
+                     grouping paren and a tuple (both of which have no `for`). The
+                     loop variables stay inside the generator (they do not leak to
+                     the enclosing scope); a walrus in a filter still binds the
+                     enclosing scope. As the sole argument of a call it may be
+                     written without its own parentheses (see `arg`). *)
 
 named_expression ::= IDENT ":=" expr ;
                   (* The walrus assignment-expression (#600, epic #614 D8): it

@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- Generator expressions: `(elem for CLAUSES)` is a lazy `Iterator`, not a
+  materialized collection — it yields each element on demand (no intermediate
+  list) and can be consumed once. It uses the comprehension clause grammar
+  (multi-`for`/`if`), its loop variables do not leak into the enclosing scope,
+  and as the sole argument of a call it needs no parentheses of its own
+  (`sum(x*x for x in range(5))`; `f((x for x in xs), y)` with other arguments).
+  It desugars to an anonymous generator function reusing the `yield` state
+  machine, so it integrates with `for`/`sum`/etc. through the one iteration
+  protocol. `sum(...)` now also accepts any iterable (generator, genexpr, list),
+  not only numeric arrays (#596, D-0107, epic #614 D4).
 - Transparent type aliases: `type Name = <type>`, plus the generic form
   `type Name[T] = <type>` (#606, D-0105). An alias is not a new nominal type — it
   resolves to its target with the same identity, so an alias and the spelled-out

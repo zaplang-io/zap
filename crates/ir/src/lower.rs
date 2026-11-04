@@ -296,6 +296,14 @@ struct StructCtx {
     /// source name -> generated wrapper name, so `f` taken as a value reuses one
     /// wrapper `f$fnval`.
     fnval_wrappers: RefCell<HashMap<String, String>>,
+    /// Generator-expression iterators (#596), keyed by their tuple-interned
+    /// state-struct id. Populated on demand while lowering a `(x for x in xs)`;
+    /// the iteration protocol hooks consult it so a genexpr value flows through
+    /// `for`/`sum`/etc. exactly like a generator's result.
+    genexpr_iters: RefCell<HashMap<u32, GenExprIter>>,
+    /// Hands out distinct names for compiler-generated generator-expression
+    /// functions (#596), so each `(x for x in xs)` gets a unique state struct.
+    genexpr_counter: RefCell<u32>,
     /// C-style bitfield packing (I#173, D-0068), keyed by struct id. A value
     /// struct whose fields all carry a bit width is laid out as one backing
     /// integer with shift/mask field accessors; absent for ordinary structs.
@@ -538,6 +546,25 @@ struct GeneratorInfo {
 /// Field index of generator var at position `p` (slot `0` is `$state`).
 fn gen_var_field(p: usize) -> u32 {
     (p + 1) as u32
+}
+
+/// A lowered bare generator expression `(x for x in xs)` (#596, epic #614 D4).
+/// Unlike a free generator (I#67), a genexpr's state struct is built on demand
+/// while lowering an expression — its captured free-variable types are only
+/// known in the enclosing scope — so it cannot be a named struct registered in
+/// the module pre-pass. Instead it is a tuple-interned, non-inline (heap) state
+/// struct, and this side table lets the D-0048 iteration hooks
+/// ([`FnLower::setup_iter`]/[`FnLower::next_form`]/[`FnLower::drive_iteration`])
+/// recognize that struct id as its own iterator and find its `__next__`. The
+/// state machine itself is emitted by the shared [`lower_generator_next`].
+#[derive(Clone)]
+struct GenExprIter {
+    /// The emitted comma-ok `__next__(self) -> (T, bool)` function's name.
+    next_fn: String,
+    /// The `(T, bool)` tuple layout id its `__next__` returns.
+    next_tuple_sid: u32,
+    /// Element type `T` (the type of the yielded expression).
+    elem: Ty,
 }
 
 /// Lowered interface metadata (D-0016). `fat_sid` is the synthetic inline
@@ -1040,6 +1067,8 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         fn_sigs,
         nested,
         generated: RefCell::new(Vec::new()),
+        genexpr_iters: RefCell::new(HashMap::new()),
+        genexpr_counter: RefCell::new(0),
         closure_env_sids: RefCell::new(Vec::new()),
         closure_counter: RefCell::new(0),
         captureless_env: RefCell::new(None),
@@ -7409,6 +7438,12 @@ impl<'a> FnLower<'a> {
     /// value is itself an iterator (it defines `__next__` but no `__iter__`), use
     /// it directly. Returns the iterator value and its struct id.
     fn setup_iter(&mut self, obj: Value, sid: u32) -> Result<(Value, u32), LowerError> {
+        // A generator expression's state struct (#596) is its own iterator (it
+        // has a `__next__` but no `__iter__`), and its sid is tuple-interned so
+        // it is not in `ctx.names`. Recognize it before the name lookup.
+        if self.ctx.genexpr_iters.borrow().contains_key(&sid) {
+            return Ok((obj, sid));
+        }
         let name = self.ctx.names[sid as usize].clone();
         let iter_m = format!("{}__{}", name, "__iter__");
         if let Some((_p, ret)) = self.sigs.get(&iter_m).cloned() {
@@ -7436,6 +7471,15 @@ impl<'a> FnLower<'a> {
     /// form `-> T`. Returns the element type and, for comma-ok, the `(T, bool)`
     /// tuple's struct id.
     fn next_form(&self, iter_sid: u32) -> Result<NextForm, LowerError> {
+        // Generator expressions (#596) carry their `__next__` signature in the
+        // side table rather than `sigs`/`ctx.names`; they are always the comma-ok
+        // form `-> (T, bool)`.
+        if let Some(gx) = self.ctx.genexpr_iters.borrow().get(&iter_sid) {
+            return Ok(NextForm::CommaOk {
+                tuple_sid: gx.next_tuple_sid,
+                elem: gx.elem,
+            });
+        }
         let name = &self.ctx.names[iter_sid as usize];
         let m = format!("{}__{}", name, "__next__");
         let (_p, ret) = self.sigs.get(&m).cloned().ok_or_else(|| {
@@ -7469,7 +7513,12 @@ impl<'a> FnLower<'a> {
     ) -> Result<(), LowerError> {
         self.push_scope();
         let (it, iter_sid) = self.setup_iter(obj, sid)?;
-        let next_m = format!("{}__{}", self.ctx.names[iter_sid as usize], "__next__");
+        // A genexpr iterator (#596) resolves its `__next__` through the side
+        // table, not the `ctx.names`-based mangling (its sid is tuple-interned).
+        let next_m = match self.ctx.genexpr_iters.borrow().get(&iter_sid) {
+            Some(gx) => gx.next_fn.clone(),
+            None => format!("{}__{}", self.ctx.names[iter_sid as usize], "__next__"),
+        };
         match self.next_form(iter_sid)? {
             NextForm::CommaOk { tuple_sid, elem } => {
                 let head = self.new_block();
@@ -7562,6 +7611,59 @@ impl<'a> FnLower<'a> {
         }
         self.pop_scope();
         Ok(())
+    }
+
+    /// `sum(iterable)` over anything that is not a numeric `array` (#596): a
+    /// lazy generator / generator expression (a `Ty::Struct` iterator) or a
+    /// `list`. Drains the iterable once through the D-0048 protocol, summing
+    /// into an accumulator of the element type — so a genexpr builds no
+    /// intermediate list. The already-lowered iterable value `v` (type `vt`) is
+    /// reused; `arg` is kept only for diagnostics.
+    fn lower_sum_iterable(
+        &mut self,
+        v: Value,
+        vt: Ty,
+        _arg: &Expr,
+    ) -> Result<(Value, Ty), LowerError> {
+        let elem_ty = match vt {
+            Ty::Struct(sid) => match self.next_form(sid)? {
+                NextForm::CommaOk { elem, .. } => elem,
+                NextForm::StopIter { elem } => elem,
+            },
+            Ty::List(e) => e.ty(),
+            other => {
+                return Err(err(format!(
+                    "sum() expects an array, list, or iterator value, found {other:?}"
+                )))
+            }
+        };
+        let acc = self.alloca(elem_ty);
+        let zero = if elem_ty.is_float() {
+            self.fconst(elem_ty, 0.0)
+        } else {
+            self.iconst(elem_ty, 0)
+        };
+        self.store(acc, zero);
+        let add = move |s: &mut FnLower<'a>, ev: Value, et: Ty| -> Result<(), LowerError> {
+            let cur = s.load(acc, elem_ty);
+            let ev = s.coerce(ev, et, elem_ty);
+            let next = s.new_value(elem_ty);
+            s.emit(Inst::Bin {
+                dest: next,
+                op: BinOp::Add,
+                lhs: cur,
+                rhs: ev,
+            });
+            s.store(acc, next);
+            Ok(())
+        };
+        match vt {
+            Ty::Struct(sid) => self.drive_iteration(v, sid, add)?,
+            Ty::List(e) => self.iterate_list(v, e, add)?,
+            _ => unreachable!("element type already classified above"),
+        }
+        let result = self.load(acc, elem_ty);
+        Ok((result, elem_ty))
     }
 
     /// Iterate any supported iterable `iter`, calling `body(self, value, ty)` for
@@ -7915,6 +8017,155 @@ impl<'a> FnLower<'a> {
         let elem = kind.get().unwrap_or(Elem::I64);
         self.func.value_types[set as usize] = Ty::Set(elem);
         Ok((set, Ty::Set(elem)))
+    }
+
+    /// `(elem for CLAUSES)` — a bare **generator expression** (#596, epic #614
+    /// D4). Unlike the comprehensions above it does not materialize a
+    /// collection: it evaluates to a lazy `Iterator` (D-0048) built from the
+    /// existing generator state-machine machinery (I#67).
+    ///
+    /// Because a genexpr captures its enclosing free variables — whose types are
+    /// only known here, while lowering the enclosing body — its state struct
+    /// cannot be a named struct registered in the module pre-pass. Instead the
+    /// genexpr is desugared on the fly into an anonymous generator function
+    /// whose parameters are exactly the captured free variables, which is then
+    /// fed through the shared [`discover_generator`]/[`lower_generator_next`]:
+    ///
+    /// ```text
+    /// def $genexpr$N(cap0, cap1, ...):
+    ///     for v0 in iter0:
+    ///         if filt0: ... for vk in iterk: ... yield elem
+    /// ```
+    ///
+    /// The result value is its state struct, constructed with the captured
+    /// values stored into the parameter fields and `$state == 0` — exactly like
+    /// a generator call. The struct id is tuple-interned (not named) and forced
+    /// non-inline/heap (GC-traced, like a closure environment); a side table
+    /// ([`StructCtx::genexpr_iters`]) lets the iteration hooks treat it as its
+    /// own iterator so `for`/`sum`/etc. consume it through the ordinary D-0048
+    /// protocol. The loop variables stay inside the generator (they never leak
+    /// to the enclosing scope), matching comprehensions and Python.
+    fn lower_genexpr(
+        &mut self,
+        elem_e: &Expr,
+        clauses: &[CompClause],
+    ) -> Result<(Value, Ty), LowerError> {
+        let dummy = zapc_syntax::span::Span::new(0, 0);
+        // 1. Free names of the genexpr, with the loop variables excluded.
+        let free = {
+            let mut bound: HashSet<String> = HashSet::new();
+            let mut out: Vec<String> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            let _fresh = collect_free_names_comp_clauses(clauses, &mut bound, &mut out, &mut seen);
+            collect_free_names(elem_e, &mut bound, &mut out, &mut seen);
+            out
+        };
+        // 2. Keep the free names bound in the enclosing scope; those are the
+        //    captured parameters. Names resolved elsewhere (top-level functions,
+        //    `range`, builtins) are left to resolve inside the generator body.
+        let mut cap_names: Vec<String> = Vec::new();
+        let mut cap_tys: Vec<Ty> = Vec::new();
+        let mut cap_slots: Vec<Value> = Vec::new();
+        for name in &free {
+            if let Some((slot, ty)) = self.lookup(name) {
+                cap_names.push(name.clone());
+                cap_tys.push(ty);
+                cap_slots.push(slot);
+            }
+        }
+        // 3. Synthesize the anonymous generator function.
+        let fname = {
+            let mut c = self.ctx.genexpr_counter.borrow_mut();
+            let n = *c;
+            *c += 1;
+            format!("$genexpr${n}")
+        };
+        let params: Vec<ast::Param> = cap_names
+            .iter()
+            .map(|n| ast::Param {
+                decorators: Vec::new(),
+                ty: None,
+                name: n.clone(),
+                default: None,
+                variadic: false,
+                kwargs: false,
+                keyword_only: false,
+                positional_only: false,
+                span: dummy,
+            })
+            .collect();
+        let yield_stmt = Stmt::Expr(Expr::Yield {
+            value: Some(Box::new(elem_e.clone())),
+            span: dummy,
+        });
+        let body = build_genexpr_body(clauses, yield_stmt, dummy);
+        let synth = ast::Function {
+            decorators: Vec::new(),
+            name: fname.clone(),
+            generics: Vec::new(),
+            params,
+            ret: None,
+            body,
+            span: dummy,
+        };
+        // 4. Discover body locals + element type through the shared generator
+        //    machinery, with a signature table that knows the captured params.
+        let mut local_sigs = self.sigs.clone();
+        local_sigs.insert(fname.clone(), (cap_tys.clone(), Ty::Void));
+        let (locals, elem_ty) = discover_generator(&synth, &fname, &local_sigs, self.ctx)?;
+        // 5. Build the state struct: `$state` + captured params + body locals.
+        let mut vars: Vec<(String, Ty)> = cap_names
+            .iter()
+            .cloned()
+            .zip(cap_tys.iter().cloned())
+            .collect();
+        let n_params = vars.len();
+        vars.extend(locals);
+        let mut layout = vec![Ty::I64];
+        layout.extend(vars.iter().map(|(_, t)| *t));
+        let sid = self.ctx.tuples.borrow_mut().push_layout(layout);
+        // Force the state struct to a non-inline reference (heap) struct — it
+        // outlives the constructing frame and is mutated in place across
+        // `__next__` calls, exactly like a generator state struct / closure env.
+        self.ctx.closure_env_sids.borrow_mut().push(sid);
+        let next_tuple_sid = self.ctx.tuples.borrow_mut().intern(vec![elem_ty, Ty::I1]);
+        let gi = GeneratorInfo {
+            name: fname.clone(),
+            sid,
+            elem: elem_ty,
+            next_tuple_sid,
+            vars,
+            n_params,
+        };
+        // 6. Emit the state machine `__next__`; register the iterator side entry.
+        let next_func = lower_generator_next(&synth, &gi, &local_sigs, self.ctx)?;
+        self.ctx.generated.borrow_mut().push(next_func);
+        let next_fn = format!(
+            "{}____next__",
+            zapc_syntax::genanalysis::gen_state_name(&fname)
+        );
+        self.ctx.genexpr_iters.borrow_mut().insert(
+            sid,
+            GenExprIter {
+                next_fn,
+                next_tuple_sid,
+                elem: elem_ty,
+            },
+        );
+        // 7. Construct the iterator, capturing the free-variable values into the
+        //    parameter fields (`$state` defaults to 0 from `StructNew`).
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        for (i, (slot, ty)) in cap_slots.iter().zip(cap_tys.iter()).enumerate() {
+            let v = self.load(*slot, *ty);
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: gen_var_field(i),
+                val: v,
+            });
+        }
+        Ok((dest, Ty::Struct(sid)))
     }
 
     /// `{key: value for CLAUSES}` (D-0048, #599): like [`lower_list_comp`] into a
@@ -8805,6 +9056,7 @@ impl<'a> FnLower<'a> {
             )),
             Expr::ListComp { elem, clauses, .. } => self.lower_list_comp(elem, clauses),
             Expr::SetComp { elem, clauses, .. } => self.lower_set_comp(elem, clauses),
+            Expr::GenExp { elem, clauses, .. } => self.lower_genexpr(elem, clauses),
             Expr::DictComp {
                 key,
                 value,
@@ -9149,16 +9401,23 @@ impl<'a> FnLower<'a> {
                     return Err(err("sum() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
-                let Ty::Array(d) = vt else {
-                    return Err(err("sum() expects an array[T] value"));
-                };
-                let dest = self.new_value(d.ty());
-                self.emit(Inst::Call {
-                    dest: Some(dest),
-                    func: format!("zap_array_sum_{}", d.suffix()),
-                    args: vec![v],
-                });
-                return Ok((dest, d.ty()));
+                // An `array[T]` sums through its dedicated runtime reduction.
+                if let Ty::Array(d) = vt {
+                    let dest = self.new_value(d.ty());
+                    self.emit(Inst::Call {
+                        dest: Some(dest),
+                        func: format!("zap_array_sum_{}", d.suffix()),
+                        args: vec![v],
+                    });
+                    return Ok((dest, d.ty()));
+                }
+                // Any other iterable — a lazy generator / generator expression
+                // (#596), or a `list` — is summed by draining it once through the
+                // D-0048 protocol, accumulating into a running total (so a
+                // genexpr builds no intermediate list). The accumulator type is
+                // the element type; `+` is specialized by codegen per operand
+                // type, so this handles both integer and float elements.
+                return self.lower_sum_iterable(v, vt, &args[0].value);
             }
             // `sorted(xs, key=..., reverse=...)` — a new sorted list, leaving the
             // input untouched (ticket #336). The list is positional; `key` /
@@ -15232,6 +15491,46 @@ fn free_names_of(params: &[String], body: &Expr) -> Vec<String> {
     out
 }
 
+/// Build the body of a generator expression's anonymous generator function
+/// (#596): the comprehension clause list `(elem for CLAUSES)` becomes nested
+/// `for`/`if` statements wrapping an innermost `yield`. Clauses nest outer to
+/// inner (left to right), and each clause's `if` filters nest inside its own
+/// loop, filtering the clauses to its left — matching comprehension semantics
+/// (#599).
+fn build_genexpr_body(
+    clauses: &[CompClause],
+    yield_stmt: Stmt,
+    span: zapc_syntax::span::Span,
+) -> ast::Block {
+    let mut body = ast::Block {
+        stmts: vec![yield_stmt],
+        span,
+    };
+    for c in clauses.iter().rev() {
+        // The `if` filters live inside this clause's loop (innermost last).
+        for cond in c.ifs.iter().rev() {
+            body = ast::Block {
+                stmts: vec![Stmt::If {
+                    branches: vec![(cond.clone(), body)],
+                    else_block: None,
+                    span,
+                }],
+                span,
+            };
+        }
+        body = ast::Block {
+            stmts: vec![Stmt::For {
+                target: Expr::Name(c.var.clone(), span),
+                iter: (*c.iter).clone(),
+                body,
+                span,
+            }],
+            span,
+        };
+    }
+    body
+}
+
 /// Walk `e`, recording names that are free given the currently-`bound` set.
 /// A binder (nested lambda, comprehension loop var) extends `bound` only for the
 /// sub-expressions in its scope, then restores it.
@@ -15305,9 +15604,12 @@ fn collect_free_names(
                 }
             }
         }
-        Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+        Expr::ListComp { elem, clauses, .. }
+        | Expr::SetComp { elem, clauses, .. }
+        | Expr::GenExp { elem, clauses, .. } => {
             // Each clause's `iter` sees the previous clauses' vars; `elem` and
-            // the filters see all of them (#599).
+            // the filters see all of them (#599). A genexpr (#596) captures its
+            // enclosing free variables the same way.
             let fresh = collect_free_names_comp_clauses(clauses, bound, out, seen);
             collect_free_names(elem, bound, out, seen);
             unbind_comp_clauses(&fresh, bound);

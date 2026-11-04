@@ -304,3 +304,23 @@ fn multi_clause_comprehension_round_trips(/* #599 */) {
         "def f():\n    g = {k: v for k in a if k > 0 for v in b}\n",
     );
 }
+
+#[test]
+fn generator_expression_round_trips(/* #596 */) {
+    // A bare genexpr keeps its parentheses and the comprehension clause spacing.
+    check(
+        "def f():\n    g=(x*x for x in a if x>0)\n",
+        "def f():\n    g = (x * x for x in a if x > 0)\n",
+    );
+    // Multiple clauses, same grammar as a comprehension.
+    check(
+        "def f():\n    g=(x*y for x in a for y in b if x!=y)\n",
+        "def f():\n    g = (x * y for x in a for y in b if x != y)\n",
+    );
+    // A genexpr as the sole call argument is re-emitted with parentheses from
+    // the call; formatting is idempotent.
+    check(
+        "def f():\n    t=sum(x*x for x in a)\n",
+        "def f():\n    t = sum((x * x for x in a))\n",
+    );
+}

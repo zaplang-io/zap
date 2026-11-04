@@ -3284,3 +3284,69 @@ full-codegen CI jobs, with an eval-count proof of once-per-iteration), a
 WAL-1), parser accept tests and a parser reject test (ZAP2020 → `auto`), sema
 positive tests (visible-after in all three positions, value-type flow) and a
 sema negative test, and a fmt round-trip test on host.
+
+## D-0107 — Generator expressions `(x for x in xs)` (I#596)
+**Status:** Locked — a bare generator expression is a lazy `Iterator`, never a materialized collection.
+
+Part of the CPython grammar-parity pass (epic #614, decision D4). A bare
+generator expression `(elem for CLAUSES)` uses the same clause grammar as a
+comprehension (D-0026, multi-clause #599) but is **lazy**: it evaluates to an
+`Iterator` (D-0048) that yields each `elem` on demand, so it builds no
+intermediate list and can be consumed once.
+
+```python
+auto g     = (x*x for x in xs if x > 0)   # a lazy Iterator, not a list
+auto total = sum(x*x for x in range(5))   # summed with no intermediate list
+for y in (f(x) for x in xs):              # iterated one element at a time
+    ...
+```
+
+**Surface.** The `atom` grammar gains `"(" expr comp_clauses ")"`, distinct from
+a grouping parenthesis and a tuple (neither has a `for`). As the **sole**
+argument of a call it needs no parentheses of its own (`sum(x for x in xs)`);
+with any other argument it must be parenthesized (`f((x for x in xs), y)`). The
+loop variables stay inside the generator — they do not leak into the enclosing
+scope, exactly like a comprehension — while a walrus (D-0106) in a filter still
+binds the enclosing scope.
+
+**Lowering — reuse the generator machinery (I#67).** A genexpr desugars to an
+anonymous generator function whose parameters are its captured free variables
+(the enclosing-scope names it references, their types taken from the enclosing
+scope at construction) and whose body is the clause list wrapping an innermost
+`yield elem`:
+
+```python
+def $genexpr$N(cap0, cap1, ...):
+    for v0 in iter0:
+        if filt0: ... for vk in iterk: ... yield elem
+```
+
+This function is fed through the same `discover_generator` /
+`lower_generator_next` that free generators use, so the genexpr's value is a
+generator **state struct** satisfying the `Iterator` protocol with no new
+runtime or GC support. Because the captured types are only known while lowering
+the enclosing body (not in the module pre-pass), the state struct is built on
+demand: it is a tuple-interned, non-inline (heap, GC-traced) struct rather than
+a named one, and a side table routes the D-0048 iteration hooks to it so it is
+its own iterator. Constructing it stores the captured values into the parameter
+fields with `$state == 0`, exactly like a generator call.
+
+**Deferred — nested generators.** A genexpr nested directly inside another
+(`(v for v in (w for w in xs))`) makes one generator drive a second across its
+own `yield`, which is the "nested generators" case I#67 deferred; it is not
+supported yet (iterate the inner genexpr through an intermediate `for` or a
+materialized collection). All other genexpr positions are supported.
+
+**`sum` over an iterator.** `sum(...)` now accepts any iterable — a lazy
+generator / generator expression or a `list` — draining it once through the
+D-0048 protocol into a running total (the numeric `array` fast path is
+unchanged), so `sum(x*x for x in range(5))` never materializes a list.
+
+Verified by a `genexpr_lazy` golden (laziness proven by a side-effecting
+generator consumed with an early `break`, plus `sum` over a genexpr, under the
+full-codegen CI jobs), a `tests/diff` CPython differential case, a
+`tests/conformance` case (claim COMP-4), parser accept tests (bare, multi-clause,
+sole-call-argument) and parser tests pinning that a grouping paren and a tuple
+are **not** genexprs, sema positive tests (iterator binding, `sum`, `for`-header)
+and a sema negative test (loop variable does not leak), and a fmt round-trip
+test on host.

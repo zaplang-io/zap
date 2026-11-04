@@ -318,6 +318,14 @@ pub struct AnalysisFacts {
     pub local_defs: Vec<(Span, Ty, bool)>,
 }
 
+/// The synthetic iterator type name for bare generator expressions (#596). Like
+/// a generator's `$gen:<name>` type it carries the two `Iterator` dunders
+/// (D-0048); unlike a generator every genexpr shares this one type because the
+/// element type stays permissive on the consuming side (see
+/// [`Checker::register_generators`]). Prefixed with `$` so it can never collide
+/// with a user type.
+const GENEXPR_ITER_TYPE: &str = "$genexpr";
+
 const BUILTINS: &[&str] = &[
     "print",
     "range",
@@ -1448,6 +1456,14 @@ impl Checker {
     /// permissive), and the precise element type is computed by lowering from
     /// the `yield` operand types for codegen (`crates/ir`).
     fn register_generators(&mut self, module: &Module) {
+        // The shared iterator type for bare generator expressions `(x for x in
+        // xs)` (#596, epic #614 D4). A genexpr is lazy — like a generator call
+        // its value satisfies the `Iterator` protocol (D-0048) — and, as with
+        // generators, the element type is left permissive (`Unknown`) on the
+        // consuming side; lowering computes the precise element type for
+        // codegen. One shared type suffices because the element type is not
+        // part of the consuming-side typing.
+        self.register_generator_iter_type(GENEXPR_ITER_TYPE);
         for item in &module.items {
             match item {
                 Item::Function(f) => {
@@ -3470,6 +3486,21 @@ impl Checker {
                 let ty = Ty::Set(Box::new(et));
                 self.check_numeric_container_value(&ty, *span);
                 ty
+            }
+            // `(elem for CLAUSES)` — a bare generator expression (#596, epic
+            // #614 D4): evaluates to a lazy `Iterator` rather than a materialized
+            // collection. The loop variables live only in the comprehension
+            // scope (they do not leak to the enclosing scope, matching
+            // comprehensions and Python), while a walrus in a filter still binds
+            // the enclosing scope. The element expression is type-checked for its
+            // own errors, but the result type is the shared permissive genexpr
+            // iterator type — the precise element type is computed by lowering.
+            Expr::GenExp { elem, clauses, .. } => {
+                self.push_comp_scope();
+                self.check_comp_clauses(clauses);
+                let _ = self.infer(elem);
+                self.pop_comp_scope();
+                Ty::Named(GENEXPR_ITER_TYPE.to_string())
             }
             Expr::Unary { op, expr, span } => {
                 let t = self.infer(expr);
@@ -6214,6 +6245,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::ListComp { span, .. }
         | Expr::DictComp { span, .. }
         | Expr::SetComp { span, .. }
+        | Expr::GenExp { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Compare { span, .. }
@@ -6708,6 +6740,57 @@ def main():
     dict[int64, int64] grid = {x * 10 + y: x + y for x in range(2) for y in range(2)}
     set[int64] cells = {x + y for x in xs for y in ys if x > 0 if y > 0}
 "#);
+    }
+
+    // ---- generator expressions (#596, epic #614 D4) -----------------------
+
+    #[test]
+    fn genexpr_is_a_lazy_iterator() {
+        // `auto g = (x for x in xs)` binds an Iterator consumable by `for`.
+        ok(r#"
+def main():
+    list[int64] xs = [1, 2, 3]
+    auto g = (x * x for x in xs if x > 0)
+    for v in g:
+        print(v)
+"#);
+    }
+
+    #[test]
+    fn genexpr_consumed_by_sum() {
+        // `sum(x*x for x in range(5))` — the headline acceptance (#596); a
+        // genexpr as the sole call argument needs no inner parentheses.
+        ok(r#"
+def main():
+    auto total = sum(x * x for x in range(5))
+    print(total)
+"#);
+    }
+
+    #[test]
+    fn genexpr_in_for_loop_header() {
+        // `for y in (f(x) for x in xs)` iterates the genexpr lazily.
+        ok(r#"
+def f(int64 x) -> int64:
+    return x + 1
+def main():
+    list[int64] xs = [1, 2, 3]
+    for y in (f(x) for x in xs):
+        print(y)
+"#);
+    }
+
+    #[test]
+    fn genexpr_loop_var_does_not_leak() {
+        // The loop variable lives only inside the genexpr (like a comprehension
+        // and Python); referencing it afterward is an undefined name.
+        let e = errors(
+            "def main():\n    list[int64] xs = [1, 2, 3]\n    auto g = (x for x in xs)\n    auto z = x\n",
+        );
+        assert!(
+            !e.is_empty(),
+            "the genexpr loop variable must not leak into the enclosing scope"
+        );
     }
 
     // ---- walrus assignment-expression (#600, epic #614 D8) ----------------

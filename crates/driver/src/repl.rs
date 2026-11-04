@@ -1081,6 +1081,7 @@ mod engine {
             | Expr::ListComp { span, .. }
             | Expr::DictComp { span, .. }
             | Expr::SetComp { span, .. }
+            | Expr::GenExp { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Compare { span, .. }

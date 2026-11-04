@@ -214,6 +214,10 @@ These read and behave as in Python and need no translation:
   (SPEC §10; D-0007/D-0029).
 - **Slicing** — `xs[lo:hi:step]` (SPEC §8; D-0030).
 - **Generators** — `def` + `yield` returning an iterator (SPEC §7; I#67/D-0048).
+- **Generator expressions** — `(x for x in xs if cond)` is a lazy iterator, not
+  a list; as a sole call argument it needs no inner parentheses
+  (`sum(x*x for x in range(5))`). Loop variables do not leak, matching Python
+  (SPEC §8.1; #596/D-0107).
 
 ---
 

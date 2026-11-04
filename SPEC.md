@@ -711,6 +711,32 @@ A single `for` clause with an optional `if` keeps its earlier behavior
 unchanged; the general form desugars to nested loops with each filter at its
 clause's level.
 
+### 8.1 Generator expressions (#596, D-0026)
+
+A **generator expression** `(elem for CLAUSES)` uses the same clause grammar as
+a comprehension but is written with parentheses and is **lazy**: it evaluates to
+an `Iterator` (§6.x, D-0048) that yields each `elem` on demand rather than
+building a collection, so it holds no intermediate list and can be consumed once.
+
+```python
+auto g     = (x*x for x in xs if x > 0)   # a lazy Iterator, not a list
+auto total = sum(x*x for x in range(5))   # summed without materializing a list
+for y in (f(x) for x in xs):              # iterated one element at a time
+    ...
+```
+
+A generator expression's loop variables live only inside the generator (they do
+not leak into the enclosing scope, exactly like a comprehension); a walrus in a
+filter still binds the enclosing scope. As the sole argument of a call it needs
+no parentheses of its own — `sum(x for x in xs)` — but with any other argument
+it must be parenthesized: `f((x for x in xs), y)`. It desugars to an anonymous
+generator function (`yield`-based, I#67) whose parameters are the captured free
+variables, so it reuses the one iteration protocol. A genexpr nested directly
+inside another genexpr (`(v for v in (w for w in xs))`) is the "nested
+generators" case I#67 deferred — one generator driving a second across its own
+`yield` — and is not supported yet; iterate the inner one through an
+intermediate `for` or a materialized collection instead.
+
 ## 9. Strings: operations, methods, interpolation
 
 ### 9.1 Operations (ticket #284, D-0025)

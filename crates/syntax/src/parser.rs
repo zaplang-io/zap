@@ -3358,6 +3358,32 @@ impl Parser {
                 None
             };
             let value = self.parse_expr();
+            // A bare generator expression as the SOLE call argument needs no
+            // parentheses of its own (#596): `sum(x for x in xs)`. The call's
+            // own parentheses bound it. It is only allowed as the one and only
+            // argument — with any other argument it must be written with
+            // explicit parentheses `f((x for x in xs), y)` — and never carries a
+            // name or spread.
+            if self.is_kw(Keyword::For)
+                && args.is_empty()
+                && spread == ArgSpread::None
+                && name.is_none()
+            {
+                let clauses = self.parse_comp_clauses();
+                let span = self.span_from(astart);
+                args.push(Arg {
+                    name: None,
+                    value: Expr::GenExp {
+                        elem: Box::new(value),
+                        clauses,
+                        span,
+                    },
+                    spread: ArgSpread::None,
+                    span,
+                });
+                self.expect(&TokenKind::RParen, "')'");
+                return args;
+            }
             args.push(Arg {
                 name,
                 value,
@@ -3525,6 +3551,19 @@ impl Parser {
             return named;
         }
         let first = self.parse_display_elem();
+        // `(elem for CLAUSES)` — a bare generator expression (#596). A `for`
+        // right after the first element (which must be plain, never a `*expr`
+        // splat) makes this a lazy genexpr rather than a grouping paren or a
+        // tuple. It shares the comprehension clause grammar (#599).
+        if self.is_kw(Keyword::For) && !matches!(first, Expr::Starred { .. }) {
+            let clauses = self.parse_comp_clauses();
+            self.expect(&TokenKind::RParen, "')'");
+            return Expr::GenExp {
+                elem: Box::new(first),
+                clauses,
+                span: self.span_from(start),
+            };
+        }
         // A leading `*rest` forces a tuple display (#598): `(*rest)` cannot be a
         // grouping parenthesis.
         if self.is(&TokenKind::Comma) || matches!(first, Expr::Starred { .. }) {
@@ -4183,6 +4222,86 @@ mod tests {
         assert_eq!(clauses.len(), 2);
         assert_eq!(clauses[0].ifs.len(), 1);
         assert!(clauses[1].ifs.is_empty());
+    }
+
+    #[test]
+    fn genexpr_parses() {
+        // A bare generator expression `(x for x in xs)` (#596) — distinct from a
+        // parenthesized group and a tuple.
+        let m = parse_ok("xs = (x * x for x in a)\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        let Expr::GenExp { elem, clauses, .. } = value else {
+            panic!("expected a generator expression, got {value:?}");
+        };
+        assert!(matches!(elem.as_ref(), Expr::Binary { .. }));
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].var, "x");
+        assert!(clauses[0].ifs.is_empty());
+    }
+
+    #[test]
+    fn genexpr_multi_clause_parses() {
+        // Multiple `for`/`if` clauses in a genexpr, same grammar as a
+        // comprehension (#596 pairs with #599).
+        let m = parse_ok("xs = (x for x in a if x > 0 for y in b)\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        let Expr::GenExp { clauses, .. } = value else {
+            panic!("expected a generator expression");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].var, "x");
+        assert_eq!(clauses[0].ifs.len(), 1);
+        assert_eq!(clauses[1].var, "y");
+        assert!(clauses[1].ifs.is_empty());
+    }
+
+    #[test]
+    fn paren_group_is_not_a_genexpr() {
+        // A parenthesized expression with no `for` stays a grouping paren.
+        let m = parse_ok("xs = (a + b)\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(
+            matches!(value, Expr::Binary { .. }),
+            "a plain parenthesized expression must not become a genexpr, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn paren_tuple_is_not_a_genexpr() {
+        // A comma-separated parenthesized list stays a tuple.
+        let m = parse_ok("xs = (a, b)\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        assert!(
+            matches!(value, Expr::Tuple(elems, _) if elems.len() == 2),
+            "a parenthesized tuple must not become a genexpr, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn genexpr_as_sole_call_argument_needs_no_parens() {
+        // `sum(x for x in a)` — the call's own parentheses bound the genexpr
+        // (#596). The single argument is itself a `GenExp`.
+        let m = parse_ok("xs = sum(x * x for x in a)\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!();
+        };
+        let Expr::Call { args, .. } = value else {
+            panic!("expected a call");
+        };
+        assert_eq!(args.len(), 1);
+        assert!(
+            matches!(&args[0].value, Expr::GenExp { clauses, .. } if clauses.len() == 1),
+            "the sole call argument must parse as a genexpr, got {:?}",
+            args[0].value
+        );
     }
 
     #[test]

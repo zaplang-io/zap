@@ -109,6 +109,9 @@ pub fn render(e: &Expr) -> String {
         Expr::SetComp { elem, clauses, .. } => {
             format!("{{{}}}", comp_body(&pexpr(elem, P_TERNARY), clauses))
         }
+        Expr::GenExp { elem, clauses, .. } => {
+            format!("({})", comp_body(&pexpr(elem, P_TERNARY), clauses))
+        }
         Expr::DictComp {
             key,
             value,
