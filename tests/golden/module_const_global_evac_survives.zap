@@ -8,7 +8,11 @@
 # A nested structure (a list of lists of strings) gives the moving collector
 # several reference edges to relocate. Contents/identity assertions only, never
 # heap-byte counts, so the Boehm and precise Immix legs agree.
-const list[list[str]] GROUPS = [["alpha", "beta"], ["gamma"], ["delta", "epsilon", "zeta"]]
+const list[list[str]] GROUPS = [
+    ["alpha", "beta"],
+    ["gamma"],
+    ["delta", "epsilon", "zeta"],
+]
 
 def churn():
     for i in range(0, 4000):
@@ -22,14 +26,14 @@ def main():
         rounds += 1
     # After 8 collections under churn the const's backing lists and every string
     # element must still read back with correct contents.
-    print(len(GROUPS))                 # 3
-    print(GROUPS[0][0])                # alpha
-    print(GROUPS[2][2])                # zeta
+    print(len(GROUPS))  # 3
+    print(GROUPS[0][0])  # alpha
+    print(GROUPS[2][2])  # zeta
     auto names = 0
     auto chars = 0
     for group in GROUPS:
         for name in group:
             names += 1
             chars += len(name)
-    print(names)                       # 2 + 1 + 3 = 6
-    print(chars)                       # alpha5 beta4 gamma5 delta5 epsilon7 zeta4 = 30
+    print(names)  # 2 + 1 + 3 = 6
+    print(chars)  # alpha5 beta4 gamma5 delta5 epsilon7 zeta4 = 30

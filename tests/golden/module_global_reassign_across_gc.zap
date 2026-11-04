@@ -26,12 +26,12 @@ def main():
     gc.collect()
     churn()
     gc.collect()
-    print(len(items))              # 3
+    print(len(items))  # 3
     auto widths = 0
     for s in items:
         widths += len(s)
-    print(widths)                  # 1 + 2 + 3 = 6
-    print(items[0] + items[2])     # a + ccc = accc
+    print(widths)  # 1 + 2 + 3 = 6
+    print(items[0] + items[2])  # a + ccc = accc
 
     # Second reassignment across more cycles: a longer list whose relocated
     # string elements must still read back correctly.
@@ -39,10 +39,10 @@ def main():
     gc.collect()
     churn()
     gc.collect()
-    print(len(items))              # 5
-    print(items[0])                # x
-    print(items[4])                # vvvvv
+    print(len(items))  # 5
+    print(items[0])  # x
+    print(items[4])  # vvvvv
     auto total = 0
     for s in items:
         total += len(s)
-    print(total)                   # 1 + 2 + 3 + 4 + 5 = 15
+    print(total)  # 1 + 2 + 3 + 4 + 5 = 15
