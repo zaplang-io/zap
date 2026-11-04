@@ -477,15 +477,46 @@ impl<'a> Printer<'a> {
         for m in &d.members {
             self.advance_to(m.span.start, 1);
             self.push_line(&format!("def {}({}):", m.name, m.params.join(", ")));
-            match &m.body {
-                Some(body) => {
+            match (&m.wrap, &m.body) {
+                // The general `wrap(call)` form (#653): the member body is a
+                // nested `def inner(...)` plus a `return inner` trailer.
+                (Some(w), Some(inner_body)) => {
+                    let inner_sig = w
+                        .inner_params
+                        .iter()
+                        .map(|p| {
+                            let star = if p.variadic {
+                                "*"
+                            } else if p.kwargs {
+                                "**"
+                            } else {
+                                ""
+                            };
+                            format!("{star}{}", p.name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.indent += 1;
+                    self.block_fresh = true;
+                    self.advance_to(w.span.start, 1);
+                    self.push_line(&format!("def {}({}):", w.inner_name, inner_sig));
+                    self.take_header_trailing(inner_body.span.start);
+                    self.emit_block(inner_body);
+                    for s in &w.trailer {
+                        self.advance_to(stmt_span(s).start, 1);
+                        self.render_stmt(s);
+                    }
+                    self.flush_dangling(w.span.end);
+                    self.indent -= 1;
+                    self.block_fresh = false;
+                }
+                (_, Some(body)) => {
                     self.take_header_trailing(body.span.start);
                     self.emit_block(body);
                 }
-                // A hook whose nested-`def` body is not yet parsed (the deferred
-                // `wrap` form, #653) has no statements to re-emit; keep the output
+                // A malformed member with no parsed body: keep the output
                 // syntactically valid. No such decorator reaches the fmt gate.
-                None => {
+                (_, None) => {
                     self.indent += 1;
                     self.push_line("pass");
                     self.indent -= 1;
@@ -1184,6 +1215,14 @@ mod tests {
         // byte-for-byte (#606), including the single-blank-line item gap.
         let src = "type Count = int64\n\ntype Pair[T] = (T, T)\n\n\
                    type Table = dict[str, int64]\n\ntype Pred = fn(int64) -> bool\n";
+        assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
+    fn wrap_decorator_form_round_trips() {
+        // The general `wrap(call)` form (#653): the nested `def inner(*args)`,
+        // its body, and the `return inner` trailer re-emit byte-for-byte.
+        let src = "decorator retry(int64 times):\n    def wrap(call):\n        def inner(*args):\n            for i in range(times):\n                try:\n                    return call(*args)\n                except Error:\n                    if i == times - 1:\n                        raise\n        return inner\n";
         assert_eq!(format_source(src).unwrap(), src);
     }
 

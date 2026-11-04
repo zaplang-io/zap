@@ -1,6 +1,6 @@
 //! User-defined **behavioral** decorator expansion — the `before`/`after`
 //! convenience form (D-0036, `design/0004-decorators.md`; epic #651, slice
-//! #652).
+//! #652) and the general `wrap(call)` form (slice #653).
 //!
 //! A `decorator` whose body declares `before(ctx)` and/or `after(ctx, result)`
 //! hooks generates code *around* a decorated free function. Like the
@@ -55,8 +55,43 @@
 //! decorator's own arguments (`decorator tag(str label)` applied as `@tag("x")`)
 //! are bound to synthetic locals the hook bodies reference.
 //!
-//! The general `wrap(call)` form is deferred to #653; applying a `wrap`
-//! decorator reports ZAP5052.
+//! ## The general `wrap(call)` form (#653)
+//!
+//! ```text
+//! decorator retry(int64 times):
+//!     def wrap(call):
+//!         def inner(*args):
+//!             for i in range(times):
+//!                 try:
+//!                     return call(*args)
+//!                 except Error:
+//!                     if i == times - 1: raise
+//!         return inner
+//!
+//! @retry(times=3)
+//! def fetch(str url) -> str: ...
+//! ```
+//!
+//! expands to a wrapper carrying `fetch`'s exact signature, with the `inner`
+//! body inlined and `call(*args)` rewritten to the typed forwarding call
+//! `fetch$orig(url)`:
+//!
+//! ```text
+//! def fetch(str url) -> str:
+//!     int64 times$arg = 3
+//!     for i in range(times$arg):
+//!         try:
+//!             return fetch$orig(url)
+//!         except Error:
+//!             if i == times$arg - 1: raise
+//!     raise RuntimeError("…")          # implicit fall-through guard
+//! ```
+//!
+//! `*args` is a **compile-time forwarding template**, not a runtime varargs
+//! value (D-0108): it exists only to spell `call(*args)`, which forwards the
+//! decorated function's exact typed parameters. A `wrap` is mutually exclusive
+//! with `before`/`after`, and stacks with other decorators bottom-up like any
+//! wrapper.
 
 use std::collections::HashMap;
 
@@ -225,6 +260,7 @@ fn build_wrapper(
     // Locate the hooks; validate their shape.
     let mut before: Option<&DecoratorMember> = None;
     let mut after: Option<&DecoratorMember> = None;
+    let mut wrap: Option<&DecoratorMember> = None;
     for m in &def.members {
         match m.name.as_str() {
             "before" => {
@@ -236,15 +272,7 @@ fn build_wrapper(
                 after = Some(m);
             }
             "wrap" => {
-                diags.push(err(
-                    ErrorCode::ZAP5052,
-                    format!(
-                        "the `wrap(call)` form of decorator `@{}` is not generated yet (#653); \
-                         the `before`/`after` form is available now",
-                        def.name
-                    ),
-                    m.span,
-                ));
+                wrap = Some(m);
             }
             other => {
                 diags.push(err(
@@ -260,6 +288,35 @@ fn build_wrapper(
         }
     }
 
+    // The general `wrap(call)` form (#653) owns the whole wrapper body: it
+    // forwards to the inner function itself, so it is mutually exclusive with
+    // the `before`/`after` convenience form.
+    if let Some(wrap) = wrap {
+        if before.is_some() || after.is_some() {
+            diags.push(err(
+                ErrorCode::ZAP5052,
+                format!(
+                    "decorator `@{}` declares a `wrap(call)` hook together with \
+                     `before`/`after`; a decorator uses one form or the other, not both",
+                    def.name
+                ),
+                wrap.span,
+            ));
+        }
+        build_wrap_body(
+            &mut stmts, wrap, def, real_name, inner_name, sig, &renames, diags,
+        );
+        return Function {
+            decorators,
+            name: wrapper_name.to_string(),
+            generics: sig.generics.clone(),
+            params: sig.params.clone(),
+            ret: sig.ret.clone(),
+            body: Block { stmts, span: sp },
+            span: sp,
+        };
+    }
+
     // `before`: run first, with `ctx.name` substituted and no `result` in scope.
     if let Some(m) = before {
         let ctx = m.params.first().cloned().unwrap_or_default();
@@ -269,6 +326,7 @@ fn build_wrapper(
             result_to: RESULT_LOCAL.to_string(),
             renames: &renames,
             fn_name: real_name,
+            wrap: None,
             diags,
         };
         if let Some(body) = &m.body {
@@ -317,6 +375,7 @@ fn build_wrapper(
             result_to: RESULT_LOCAL.to_string(),
             renames: &renames,
             fn_name: real_name,
+            wrap: None,
             diags,
         };
         if let Some(body) = &m.body {
@@ -346,6 +405,173 @@ fn build_wrapper(
 
 /// The synthetic local holding the wrapped call's return value.
 const RESULT_LOCAL: &str = "$result";
+
+/// Build the body of a `wrap(call)` wrapper (#653) by inlining the decorator's
+/// `inner` function into the wrapper (which carries the decorated function's
+/// exact signature). `call(*args)` is rewritten to a typed call of the chained
+/// inner function (`inner_name`) forwarding the decorated function's actual
+/// parameters. `stmts` already holds the decorator-argument bindings.
+///
+/// Decision (D-0036 / D-0108): a `wrap` is a **typed forwarding template**.
+/// `*args` is a compile-time forwarding token, never a runtime varargs value —
+/// so `call(*args)` forwards exactly the decorated function's typed parameters,
+/// and reading/indexing/iterating `*args` is rejected (ZAP5052). Where the
+/// inlined body cannot be proven to return on every path (e.g. `retry`'s loop,
+/// whose last iteration always returns or re-raises but which the type system
+/// cannot see through), an implicit fall-through guard raises `RuntimeError`,
+/// so the wrapper type-checks like hand-written code and has defined behavior if
+/// control ever reaches the end.
+#[allow(clippy::too_many_arguments)]
+fn build_wrap_body(
+    stmts: &mut Vec<Stmt>,
+    member: &DecoratorMember,
+    def: &DecoratorDef,
+    real_name: &str,
+    inner_name: &str,
+    sig: &Function,
+    renames: &HashMap<String, String>,
+    diags: &mut Vec<TypeError>,
+) {
+    let sp = sig.span;
+    let (Some(wrap), Some(inner_body)) = (&member.wrap, &member.body) else {
+        diags.push(err(
+            ErrorCode::ZAP5052,
+            format!("decorator `@{}`'s `wrap(call)` hook is malformed", def.name),
+            member.span,
+        ));
+        return;
+    };
+
+    // `wrap` must take exactly one macro parameter, `call`.
+    let call_name = match member.params.as_slice() {
+        [c] => c.clone(),
+        _ => {
+            diags.push(err(
+                ErrorCode::ZAP5052,
+                format!(
+                    "decorator `@{}`'s `wrap` hook must take exactly one parameter, `call`",
+                    def.name
+                ),
+                member.span,
+            ));
+            return;
+        }
+    };
+
+    // The nested `inner` must be `inner()` or a single `*args` forwarder.
+    let args_name = match wrap.inner_params.as_slice() {
+        [] => None,
+        [p] if p.variadic => Some(p.name.clone()),
+        _ => {
+            diags.push(err(
+                ErrorCode::ZAP5052,
+                format!(
+                    "decorator `@{}`'s nested `inner` must take a single `*args` forwarder \
+                     (or no parameters); keyword collectors and extra parameters are not supported",
+                    def.name
+                ),
+                wrap.span,
+            ));
+            return;
+        }
+    };
+
+    // The `wrap` body must end with exactly `return <inner>`.
+    let trailer_ok = matches!(
+        wrap.trailer.as_slice(),
+        [Stmt::Return { value: Some(Expr::Name(n, _)), .. }] if *n == wrap.inner_name
+    );
+    if !trailer_ok {
+        diags.push(err(
+            ErrorCode::ZAP5054,
+            format!(
+                "decorator `@{}`'s `wrap` hook must end with `return {}` \
+                 (returning the nested function it defines)",
+                def.name, wrap.inner_name
+            ),
+            wrap.span,
+        ));
+    }
+
+    // Inline the inner body, rewriting `call(*args)` into a forwarding call.
+    let wrap_ctx = WrapCtx {
+        call: call_name,
+        args: args_name,
+        target: inner_name.to_string(),
+        params: sig.params.clone(),
+    };
+    let mut rw = Rewriter {
+        ctx: String::new(),
+        result_from: None,
+        result_to: RESULT_LOCAL.to_string(),
+        renames,
+        fn_name: real_name,
+        wrap: Some(wrap_ctx),
+        diags,
+    };
+    let body_start = stmts.len();
+    for s in &inner_body.stmts {
+        stmts.push(rw.stmt(s.clone()));
+    }
+
+    // Fall-through guard (see the decision above): only emitted when the body is
+    // not provably terminating, so it is always appended to a live block.
+    if sig.ret.is_some() && !stmts_terminate(&stmts[body_start..]) {
+        stmts.push(fallthrough_guard(real_name, &def.name, sp));
+    }
+}
+
+/// `raise RuntimeError("…")` — the implicit fall-through guard of a `wrap`
+/// wrapper that declares a return type but whose body may not return (#653).
+fn fallthrough_guard(fn_name: &str, deco: &str, sp: Span) -> Stmt {
+    Stmt::Raise {
+        value: Some(Expr::Call {
+            callee: Box::new(Expr::Name("RuntimeError".to_string(), sp)),
+            args: vec![Arg {
+                name: None,
+                value: Expr::Str {
+                    value: format!("decorator `@{deco}` wrapper for `{fn_name}` returned no value"),
+                    raw: false,
+                    bytes: false,
+                    fstring: false,
+                    span: sp,
+                    fstring_fields: Vec::new(),
+                },
+                spread: ArgSpread::None,
+                span: sp,
+            }],
+            span: sp,
+        }),
+        cause: None,
+        span: sp,
+    }
+}
+
+/// Whether a statement sequence provably returns/raises on every path — a
+/// conservative check (any uncertainty returns `false`) used only to decide
+/// whether a `wrap` wrapper needs a fall-through guard.
+fn stmts_terminate(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(stmt_terminates)
+}
+
+fn block_terminates(b: &Block) -> bool {
+    stmts_terminate(&b.stmts)
+}
+
+fn stmt_terminates(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return { .. } | Stmt::Raise { .. } => true,
+        Stmt::If {
+            branches,
+            else_block: Some(eb),
+            ..
+        } => branches.iter().all(|(_, b)| block_terminates(b)) && block_terminates(eb),
+        Stmt::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|a| block_terminates(&a.body))
+        }
+        _ => false,
+    }
+}
 
 /// Bind a decorator's declared parameters to `<ty> <name>$arg = <value>` locals,
 /// matching supplied `@deco(...)` arguments positionally then by keyword, and
@@ -545,12 +771,51 @@ struct Rewriter<'a> {
     renames: &'a HashMap<String, String>,
     /// The decorated function's name, substituted for `ctx.name`.
     fn_name: &'a str,
+    /// `Some` only when rewriting a `wrap(call)` inner body (#653): rewrites
+    /// `call(*args)` into a typed forwarding call and rejects `call`/`*args`
+    /// used as runtime values.
+    wrap: Option<WrapCtx>,
     diags: &'a mut Vec<TypeError>,
+}
+
+/// Context for rewriting a `wrap(call)` inner body (#653).
+struct WrapCtx {
+    /// The `wrap(call)` parameter name — the callable being wrapped.
+    call: String,
+    /// The inner `*args` forwarder name, if any (`None` for `def inner()`).
+    args: Option<String>,
+    /// The chained inner function the forwarded call targets (`f$orig` or a
+    /// `f$decoN` wrapper).
+    target: String,
+    /// The decorated function's parameters, forwarded by a `call(*args)`.
+    params: Vec<Param>,
 }
 
 impl Rewriter<'_> {
     /// Map a bare identifier used as a *value* in a hook body.
     fn map_name(&mut self, n: String, span: Span) -> Expr {
+        if let Some(w) = &self.wrap {
+            if n == w.call {
+                self.diags.push(err(
+                    ErrorCode::ZAP5052,
+                    "a `wrap`'s `call` may be used only as `call(*args)`; it cannot be \
+                     passed around or stored as a value"
+                        .to_string(),
+                    span,
+                ));
+                return Expr::Name(n, span);
+            }
+            if w.args.as_deref() == Some(n.as_str()) {
+                self.diags.push(err(
+                    ErrorCode::ZAP5052,
+                    "`*args` is a compile-time forwarding template, not a runtime value: it \
+                     cannot be read, indexed, or iterated — only forwarded via `call(*args)`"
+                        .to_string(),
+                    span,
+                ));
+                return Expr::Name(n, span);
+            }
+        }
         if n == self.ctx {
             self.diags.push(err(
                 ErrorCode::ZAP5053,
@@ -567,6 +832,41 @@ impl Rewriter<'_> {
             return Expr::Name(local.clone(), span);
         }
         Expr::Name(n, span)
+    }
+
+    /// Rewrite a `call(...)` inside a `wrap` body into the forwarding call
+    /// `inner_target(<decorated params…>)`. The source invocation must be
+    /// `call(*args)` (or `call()` for a no-arg forwarder); anything else is
+    /// ZAP5052. The forwarded arguments always come from the decorated
+    /// function's signature, never from the written argument list.
+    fn rewrite_wrap_call(&mut self, args: Vec<Arg>, span: Span) -> Expr {
+        let (target, params, args_name) = {
+            let w = self.wrap.as_ref().expect("wrap context");
+            (w.target.clone(), w.params.clone(), w.args.clone())
+        };
+        let shape_ok = match args.as_slice() {
+            [] => true,
+            [a] => {
+                a.name.is_none()
+                    && matches!(a.spread, ArgSpread::Iterable)
+                    && matches!(&a.value, Expr::Name(n, _) if Some(n.as_str()) == args_name.as_deref())
+            }
+            _ => false,
+        };
+        if !shape_ok {
+            self.diags.push(err(
+                ErrorCode::ZAP5052,
+                "the wrapped `call` may be invoked only as `call(*args)` (or `call()`), \
+                 forwarding the decorated function's parameters unchanged"
+                    .to_string(),
+                span,
+            ));
+        }
+        Expr::Call {
+            callee: Box::new(Expr::Name(target, span)),
+            args: forward_args(&params, span),
+            span,
+        }
     }
 
     fn stmt(&mut self, s: Stmt) -> Stmt {
@@ -911,11 +1211,21 @@ impl Rewriter<'_> {
                 rest: rest.into_iter().map(|(op, e)| (op, self.expr(e))).collect(),
                 span,
             },
-            Expr::Call { callee, args, span } => Expr::Call {
-                callee: Box::new(self.expr(*callee)),
-                args: args.into_iter().map(|a| self.arg(a)).collect(),
-                span,
-            },
+            Expr::Call { callee, args, span } => {
+                // In a `wrap` body, `call(*args)` is the forwarding point: rewrite
+                // it to a typed call of the chained inner function with the
+                // decorated function's actual parameters.
+                if let (Some(w), Expr::Name(n, _)) = (&self.wrap, callee.as_ref()) {
+                    if *n == w.call {
+                        return self.rewrite_wrap_call(args, span);
+                    }
+                }
+                Expr::Call {
+                    callee: Box::new(self.expr(*callee)),
+                    args: args.into_iter().map(|a| self.arg(a)).collect(),
+                    span,
+                }
+            }
             Expr::Index { base, index, span } => Expr::Index {
                 base: Box::new(self.expr(*base)),
                 index: Box::new(self.expr(*index)),
@@ -1139,15 +1449,143 @@ mod tests {
     }
 
     #[test]
-    fn wrap_form_is_deferred() {
-        let src = "decorator retry(int64 times):\n    def wrap(call):\n        def inner():\n            return call()\n        return inner\n\
-                   @retry(times=3)\ndef f() -> int64:\n    return 0\n";
+    fn wrap_expands_to_forwarding_wrapper() {
+        // `retry` wraps `fetch`: the wrapper keeps `fetch`'s signature, binds the
+        // decorator arg, inlines `inner`, rewrites `call(*args)` to the typed
+        // forwarding call `fetch$orig(url)`, and appends a fall-through guard.
+        let src = "decorator retry(int64 times):\n    def wrap(call):\n        def inner(*args):\n            for i in range(times):\n                try:\n                    return call(*args)\n                except Error:\n                    if i == times - 1:\n                        raise\n        return inner\n\
+                   @retry(times=3)\ndef fetch(str url) -> str:\n    return url\n";
         let mut m = module(src);
         let diags = expand_behavioral_decorators(&mut m);
+        assert!(diags.is_empty(), "no diagnostics: {diags:?}");
+
+        // Original renamed, keeps its signature.
+        let orig = func(&m, "fetch$orig").expect("renamed original");
+        assert_eq!(orig.params.len(), 1);
+
+        // Wrapper keeps the real name + exact signature; decorator gone.
+        let w = func(&m, "fetch").expect("wrapper");
+        assert!(w.decorators.is_empty());
+        assert_eq!(w.params.len(), 1);
+        assert_eq!(w.params[0].name, "url");
+        assert!(
+            matches!(&w.ret, Some(zapc_syntax::ast::Type::Named { name, .. }) if name == "str")
+        );
+
+        // First stmt binds the decorator arg `int64 times$arg = 3`.
+        assert!(
+            matches!(&w.body.stmts[0], Stmt::Let { name, .. } if name == "times$arg"),
+            "arg bind: {:?}",
+            w.body.stmts[0]
+        );
+        // Then the inlined `for` loop, then the appended fall-through guard.
+        assert!(
+            matches!(&w.body.stmts[1], Stmt::For { .. }),
+            "for loop: {:?}",
+            w.body.stmts[1]
+        );
+        assert!(
+            matches!(w.body.stmts.last(), Some(Stmt::Raise { .. })),
+            "fall-through guard: {:?}",
+            w.body.stmts.last()
+        );
+
+        // `call(*args)` inside the loop became `fetch$orig(url)`.
+        let src_dump = format!("{:?}", w.body.stmts[1]);
+        assert!(
+            src_dump.contains("fetch$orig"),
+            "forwarding call targets the original: {src_dump}"
+        );
+        assert!(
+            !src_dump.contains("\"call\""),
+            "the `call` macro name is fully rewritten: {src_dump}"
+        );
+    }
+
+    #[test]
+    fn wrap_without_return_type_needs_no_guard() {
+        let src = "decorator around:\n    def wrap(call):\n        def inner(*args):\n            print(\"before\")\n            call(*args)\n            print(\"after\")\n        return inner\n\
+                   @around\ndef act(int64 x):\n    print(x)\n";
+        let mut m = module(src);
+        let diags = expand_behavioral_decorators(&mut m);
+        assert!(diags.is_empty(), "{diags:?}");
+        let w = func(&m, "act").expect("wrapper");
+        // Void function: no fall-through guard appended.
+        assert!(
+            !matches!(w.body.stmts.last(), Some(Stmt::Raise { .. })),
+            "no guard for a void wrapper: {:?}",
+            w.body.stmts
+        );
+        let dump = format!("{:?}", w.body.stmts);
+        assert!(dump.contains("act$orig"), "forwarding call present: {dump}");
+    }
+
+    #[test]
+    fn wrap_rejects_args_used_as_value() {
+        // `*args` is a forwarding template, not a value — reading it is ZAP5052.
+        let src = "decorator m:\n    def wrap(call):\n        def inner(*args):\n            print(args)\n            return call(*args)\n        return inner\n\
+                   @m\ndef f(int64 x) -> int64:\n    return x\n";
+        let mut md = module(src);
+        let diags = expand_behavioral_decorators(&mut md);
         assert!(
             diags.iter().any(|d| d.code == ErrorCode::ZAP5052),
-            "wrap should report ZAP5052: {diags:?}"
+            "args-as-value should report ZAP5052: {diags:?}"
         );
+    }
+
+    #[test]
+    fn wrap_rejects_call_as_value() {
+        let src = "decorator m:\n    def wrap(call):\n        def inner(*args):\n            auto c = call\n            return call(*args)\n        return inner\n\
+                   @m\ndef f(int64 x) -> int64:\n    return x\n";
+        let mut md = module(src);
+        let diags = expand_behavioral_decorators(&mut md);
+        assert!(
+            diags.iter().any(|d| d.code == ErrorCode::ZAP5052),
+            "call-as-value should report ZAP5052: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_requires_return_inner() {
+        let src = "decorator m:\n    def wrap(call):\n        def inner(*args):\n            return call(*args)\n        return 0\n\
+                   @m\ndef f(int64 x) -> int64:\n    return x\n";
+        let mut md = module(src);
+        let diags = expand_behavioral_decorators(&mut md);
+        assert!(
+            diags.iter().any(|d| d.code == ErrorCode::ZAP5054),
+            "missing `return inner` should report ZAP5054: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_rejects_mixing_with_before() {
+        let src = "decorator m:\n    def before(ctx):\n        print(ctx.name)\n    def wrap(call):\n        def inner(*args):\n            return call(*args)\n        return inner\n\
+                   @m\ndef f(int64 x) -> int64:\n    return x\n";
+        let mut md = module(src);
+        let diags = expand_behavioral_decorators(&mut md);
+        assert!(
+            diags.iter().any(|d| d.code == ErrorCode::ZAP5052),
+            "mixing wrap with before should report ZAP5052: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_stacks_over_before_after() {
+        // `@trace` (before/after) over `@retry` (wrap): the outer wrapper is the
+        // before/after form calling `f`, chained to `f$deco1` (the wrap), chained
+        // to `f$orig`.
+        let src = "decorator trace:\n    def before(ctx):\n        print(\"enter\")\n    def after(ctx, result):\n        print(\"exit\")\n\
+                   decorator retry(int64 times):\n    def wrap(call):\n        def inner(*args):\n            for i in range(times):\n                return call(*args)\n        return inner\n\
+                   @trace\n@retry(times=2)\ndef f(int64 x) -> int64:\n    return x\n";
+        let mut md = module(src);
+        let diags = expand_behavioral_decorators(&mut md);
+        assert!(diags.is_empty(), "{diags:?}");
+        assert!(func(&md, "f").is_some(), "outer wrapper");
+        assert!(func(&md, "f$deco1").is_some(), "middle wrap wrapper");
+        assert!(func(&md, "f$orig").is_some(), "renamed original");
+        // The middle (wrap) wrapper forwards to the original.
+        let mid = format!("{:?}", func(&md, "f$deco1").unwrap().body.stmts);
+        assert!(mid.contains("f$orig"), "wrap forwards to original: {mid}");
     }
 
     #[test]

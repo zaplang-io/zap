@@ -229,13 +229,28 @@ registering desugar D-0087), with the decorated function's exact signature
 preserved automatically, `ctx.name` substituted, bottom-up stacking, decorator
 arguments, and stable diagnostics (ZAP5049–ZAP5053). Visible via `zap expand`.
 
+Also shipped: the general user-defined **`wrap(call)`** behavioral form (D-0108,
+epic #651 / #653). A `decorator` declaring a `wrap(call)` hook — a nested
+`def inner(*args): … return inner` — generates a wrapper with the decorated
+function's exact signature in which the inner body is inlined and `call(*args)`
+becomes the typed forwarding call `<fn>$orig(<params>)`. **`*args` is a
+compile-time forwarding template, not a runtime varargs value** (the settled
+answer to the old open question): it may appear only as `call(*args)`; reading
+it, using `call` as a value, mixing `wrap` with `before`/`after`, or omitting
+`return inner` are ZAP5052/ZAP5054. A declared-return wrapper that is not
+provably return-terminating (e.g. `retry`) gets an implicit
+`raise RuntimeError(...)` fall-through guard. `wrap` stacks with other
+decorators bottom-up. The illustrative `except Error:` in the example above is
+spelled `except Exception:` in real code (Python's base, D-0007), and the
+re-raise is the bound `raise e` form (bare `raise` is a separate runtime
+follow-up).
+
 Follow-up (deferred, not yet implemented): `@validate(matches=m/.../)` regex
-validation; the **function/variable group** `@cache` (memoization),
-`@deprecated` (use-site diagnostic), and `@inject` (DI, cf. zap#312/fastzap#7);
-and the general user-defined **`wrap(call)`** behavioral form (the nested
-`def inner(...)` returning a replacement callable — #653; applying a `wrap`
-decorator is a clean ZAP5052 "not implemented yet" error for now). Behavioral
-decorators on non-function targets are ZAP5050 (deferred).
+validation; the **function/variable group** `@cache` (memoization — needs
+persistent module-level state, still absent, which is also why an `args`-keyed
+`memoize` is not expressible via `wrap`), `@deprecated` (use-site diagnostic),
+and `@inject` (DI, cf. zap#312/fastzap#7). Behavioral decorators on non-function
+targets are ZAP5050 (deferred).
 
 ## Open issues
 

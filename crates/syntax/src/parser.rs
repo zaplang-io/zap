@@ -1916,9 +1916,12 @@ impl Parser {
     /// `call`), not type-first Zap parameters, so they are read as plain names.
     ///
     /// A hook whose body is a nested `def` (the `wrap(call)` → `def inner(...)`
-    /// form) is parsed shape-only in this slice: the nested body is consumed
-    /// without being turned into statements and `body` is left `None`, so the
-    /// decorator-expansion pass can report a stable "deferred" diagnostic (#653).
+    /// form, #653) is parsed into its structural shape: the inner signature and
+    /// the trailing `return inner` are captured in [`DecoratorMember::wrap`] and
+    /// the inner function's body in [`DecoratorMember::body`]. This is confined
+    /// to the decorator-body parser — it is *not* a general nested-`def`
+    /// language feature. The shape (single `*args` forwarder, `return inner`
+    /// trailer) is validated during decorator expansion, not here.
     fn parse_decorator_member(&mut self) -> DecoratorMember {
         let start = self.peek_span().start;
         self.expect_kw(Keyword::Def, "'def'");
@@ -1943,13 +1946,16 @@ impl Parser {
         self.expect(&TokenKind::Colon, "':'");
         self.expect(&TokenKind::Newline, "newline");
         self.expect(&TokenKind::Indent, "indented block");
-        // A nested-`def` body is the `wrap(call)` form; defer it (#653).
+        // A nested-`def` body is the `wrap(call)` form (#653): parse the inner
+        // `def inner(...)` signature + body, then the `return inner` trailer.
         if self.is_kw(Keyword::Def) {
-            self.skip_balanced_block();
+            let (wrap, body) = self.parse_wrap_body();
+            self.expect(&TokenKind::Dedent, "end of block");
             return DecoratorMember {
                 name,
                 params,
-                body: None,
+                body: Some(body),
+                wrap: Some(wrap),
                 span: self.span_from(start),
             };
         }
@@ -1974,23 +1980,69 @@ impl Parser {
                 stmts,
                 span: self.span_from(body_start),
             }),
+            wrap: None,
             span: self.span_from(start),
         }
     }
 
-    /// Consume tokens up to and including the `Dedent` that closes the block
-    /// whose opening `Indent` the caller has already consumed. Nested
-    /// `Indent`/`Dedent` pairs are balanced. Used to skip a deferred hook body.
-    fn skip_balanced_block(&mut self) {
-        let mut depth = 1usize;
-        while depth > 0 && !self.at_eof() {
-            match self.peek() {
-                TokenKind::Indent => depth += 1,
-                TokenKind::Dedent => depth -= 1,
-                _ => {}
+    /// Parse the body of a `wrap(call)` hook (#653): a nested
+    /// `def inner(...):` with its own indented body, followed by the remaining
+    /// statements of the `wrap` body (expected to be `return inner`). The
+    /// opening `Indent` of the `wrap` body has already been consumed; the
+    /// closing `Dedent` is left for the caller. Returns the structural
+    /// [`WrapForm`] (inner signature + trailer) and the inner function's body.
+    fn parse_wrap_body(&mut self) -> (WrapForm, Block) {
+        let wrap_start = self.peek_span().start;
+        self.expect_kw(Keyword::Def, "'def'");
+        let inner_name = self.ident("nested `inner` function name");
+        self.expect(&TokenKind::LParen, "'('");
+        let mut inner_params = Vec::new();
+        if !self.is(&TokenKind::RParen) {
+            loop {
+                let p_start = self.peek_span().start;
+                let variadic = self.eat(&TokenKind::Star);
+                let kwargs = !variadic && self.eat(&TokenKind::StarStar);
+                let p_name = self.ident("`inner` parameter");
+                inner_params.push(WrapParam {
+                    name: p_name,
+                    variadic,
+                    kwargs,
+                    span: self.span_from(p_start),
+                });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                if self.is(&TokenKind::RParen) {
+                    break;
+                }
             }
-            self.bump();
         }
+        self.expect(&TokenKind::RParen, "')'");
+        let inner_body = self.parse_block();
+        // The statements following the nested `def` in the `wrap` body — the
+        // `return inner` trailer. Parsed as ordinary statements and validated
+        // during expansion.
+        let mut trailer = Vec::new();
+        while !self.is(&TokenKind::Dedent) && !self.at_eof() {
+            let before = self.pos;
+            self.parse_line(&mut trailer);
+            if self.pos == before {
+                self.error_here(
+                    ErrorCode::ZAP2008,
+                    "unexpected token in `wrap` body after `def inner(...)`",
+                );
+                self.bump();
+            }
+        }
+        (
+            WrapForm {
+                inner_name,
+                inner_params,
+                trailer,
+                span: self.span_from(wrap_start),
+            },
+            inner_body,
+        )
     }
 
     /// Parse an `import` statement. Returns one [`Import`] per imported module
@@ -4072,6 +4124,47 @@ mod tests {
     fn empty_module() {
         let m = parse_ok("");
         assert!(m.items.is_empty());
+    }
+
+    #[test]
+    fn wrap_decorator_member_parses_structure() {
+        // The `wrap(call)` form (#653): the member captures the `call` macro
+        // param, the nested `def inner(*args)` signature + body, and the
+        // `return inner` trailer.
+        let m = parse_ok(
+            "decorator retry(int64 times):\n    def wrap(call):\n        def inner(*args):\n            return call(*args)\n        return inner\n",
+        );
+        let Item::Decorator(d) = &m.items[0] else {
+            panic!("expected decorator");
+        };
+        assert_eq!(d.members.len(), 1);
+        let mem = &d.members[0];
+        assert_eq!(mem.name, "wrap");
+        assert_eq!(mem.params, vec!["call".to_string()]);
+        let w = mem.wrap.as_ref().expect("wrap form captured");
+        assert_eq!(w.inner_name, "inner");
+        assert_eq!(w.inner_params.len(), 1);
+        assert_eq!(w.inner_params[0].name, "args");
+        assert!(w.inner_params[0].variadic);
+        assert!(!w.inner_params[0].kwargs);
+        // The inner body (the `return call(*args)`) lives on `body`.
+        assert_eq!(mem.body.as_ref().expect("inner body").stmts.len(), 1);
+        // The trailer is exactly `return inner`.
+        assert_eq!(w.trailer.len(), 1);
+        assert!(matches!(
+            &w.trailer[0],
+            Stmt::Return { value: Some(Expr::Name(n, _)), .. } if n == "inner"
+        ));
+    }
+
+    #[test]
+    fn before_after_member_has_no_wrap_form() {
+        let m = parse_ok("decorator traced:\n    def before(ctx):\n        print(ctx.name)\n");
+        let Item::Decorator(d) = &m.items[0] else {
+            panic!("expected decorator");
+        };
+        assert!(d.members[0].wrap.is_none(), "before/after has no wrap form");
+        assert!(d.members[0].body.is_some());
     }
 
     #[test]

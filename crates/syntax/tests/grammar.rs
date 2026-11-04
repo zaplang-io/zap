@@ -354,11 +354,16 @@ const CORPUS: &[Case] = &[
         Accept,
         "decorator tag(str label):\n    def before(ctx):\n        print(label)\n",
     ),
-    // the wrap(call) nested-def form parses shape-only in this slice (#653)
+    // the wrap(call) nested-def form: inner signature + body + `return inner` (#653)
     case(
         "decorator_def",
         Accept,
         "decorator retry(int64 times):\n    def wrap(call):\n        def inner():\n            return call()\n        return inner\n",
+    ),
+    case(
+        "decorator_def",
+        Accept,
+        "decorator retry(int64 times):\n    def wrap(call):\n        def inner(*args):\n            for i in range(times):\n                return call(*args)\n        return inner\n",
     ),
     case(
         "decorator_def",

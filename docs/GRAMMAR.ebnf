@@ -196,14 +196,27 @@ decorator_def ::= "decorator" IDENT [ "(" [ param_list ] ")" ] ":" NEWLINE
                      generated around the decorated target (D-0036, epic #651).
                      The optional "(" param_list ")" is the decorator's own
                      arguments, e.g. `decorator retry(int64 times)`. *)
-decorator_hook ::= "def" IDENT "(" [ hook_params ] ")" block ;
+decorator_hook ::= "def" IDENT "(" [ hook_params ] ")" ( block | wrap_body ) ;
                   (* The recognized hooks are `before(ctx)`, `after(ctx, result)`
                      (the convenience form, #652) and `wrap(call)` (the general
                      form, #653). A hook's parameters are untyped macro bindings
                      — `ctx`, `result`, `call` — not type-first parameters, so
                      `hook_params` is a bare IDENT list. `ctx` exposes `ctx.name`
-                     (the decorated function's name). *)
+                     (the decorated function's name). A `block` body is the
+                     `before`/`after` form; a `wrap_body` is the general
+                     `wrap(call)` form. *)
 hook_params   ::= IDENT { "," IDENT } ;
+wrap_body     ::= ":" NEWLINE INDENT wrap_inner "return" IDENT NEWLINE DEDENT ;
+                  (* The `wrap(call)` body: a single nested `def inner(...)`
+                     followed by `return inner`. The nested `def` is confined to
+                     this position — it is NOT a general nested-function feature
+                     (#653). *)
+wrap_inner    ::= "def" IDENT "(" [ wrap_inner_params ] ")" block ;
+wrap_inner_params ::= wrap_inner_param { "," wrap_inner_param } ;
+wrap_inner_param  ::= [ "*" | "**" ] IDENT ;
+                  (* `*args` is a compile-time forwarding template: it may appear
+                     only as `call(*args)`, which forwards the decorated
+                     function's exact typed parameters (D-0108). *)
 
 (* ---------- Imports (D-0028, D-0012) ---------- *)
 
