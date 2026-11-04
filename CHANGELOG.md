@@ -25,7 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
-- Identity operators `is` / `is not` (#611, D-0109, epic #614 D18). `a is b`
+- Built-in **`@deprecated`** decorator (#472, D-0109, D-0036). A function or
+  method marked `@deprecated` (optionally `@deprecated("use X")`) generates no
+  code but raises a non-fatal **use-site warning** (`ZAP5124`) at every call
+  site — the mechanism for retiring a Stable surface with notice before removal
+  (STABILITY §5). Sema warnings are now surfaced by the build pipeline at a new
+  `warning[ZAPnnnn]` severity (non-fatal), which also surfaces the pre-existing
+  `Eq`-without-`Hash` dict/set-key warning (D-0047) at the CLI for the first
+  time. With this, the v1 built-in decorator set is complete: `@derive(...)`,
+  `@default`, `@validate`, `@range`, `@deprecated`.
+- Identity operators `is` / `is not` (#611, D-0110, epic #614 D18). `a is b`
   tests **reference identity** — same allocation — distinct from `==` (value /
   `__eq__` equality): two distinct reference structs with equal fields are
   `==`-equal but not `is`-equal. `x is None` / `x is not None` is the
@@ -165,7 +174,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
-- _Nothing yet relative to a released version._
+- Built-in decorators `@cache` and `@inject` are **reclassified/deferred** out
+  of the v1 set (#472, D-0109). `@cache` needs module-level persistent state,
+  which is not yet a language feature; `@inject`'s dependency-injection need is
+  met by reflection-driven `Depends(...)` adapters (D-0089/D-0092), not a core
+  decorator. Both names stay reserved and are rejected with a dedicated
+  diagnostic (`ZAP5055`) instead of being advertised and then failing at
+  lowering.
 
 ### Deprecated
 

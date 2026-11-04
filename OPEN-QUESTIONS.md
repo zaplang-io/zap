@@ -87,12 +87,15 @@ _Last updated: 2026-10-22_
   built-ins are locked (D-0036, `design/0004-decorators.md`); v1 lands
   `@derive(Eq, Repr)` and a string-keyed runtime-reflection surface
   (`reflect_has` / `reflect_names`, see `design/RUNTIME-ABI.md` §"Decorators &
-  reflection", #16). Still open: the macro API (what a decorator sees/emits) and
-  hygiene rules; the remaining built-ins (`@cache`, `@default`, `@validate`,
-  `@range`, `@deprecated`, `@inject`, `@derive(Ord/Json/Hash)`); field/parameter/
-  function decorators; richer reflection (field-level metadata, annotation
-  argument values). The `@range` name also collides with the `range` keyword and
-  needs a parser accommodation before it can be written.
+  reflection", #16). The built-in set is now complete (I#472): `@derive(...)`,
+  `@default`/`@validate`/`@range` (D-0101) and `@deprecated` (D-0109) are
+  implemented; `@cache` and `@inject` are reclassified/deferred (D-0109) —
+  `@cache` is gated on a future **module-level persistent state** language
+  feature (its only real blocker, #658), and `@inject`'s DI is met by reflection-driven
+  `Depends(...)` adapters (D-0089/D-0092), not a core decorator. Still open: the
+  macro API (what a decorator sees/emits) and hygiene rules; `@validate(matches=…)`
+  regex validation; richer reflection (field-level metadata, annotation argument
+  values).
 - ⚪ **C FFI** (D-0012) — deferred; generalizes interop to all languages.
 - ⚪ **Precise GC** (Immix-style) replacing Boehm (D-0009).
 - ⚪ **Arena / region allocation** (à la Go's `GOEXPERIMENT=arenas`) — deferred.

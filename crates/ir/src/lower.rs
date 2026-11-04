@@ -1814,28 +1814,41 @@ fn err(m: impl Into<String>) -> LowerError {
 // Decorators & annotations (ticket #16, D-0036)
 //
 // This is the item-level compile-time expansion of the built-in decorator set.
-// The design doc locks `@cache`, `@derive(Eq, Ord, Json, Repr, Hash)`,
-// `@default`, `@validate`, `@range`, `@deprecated`, and `@inject`, plus runtime
-// reflection over annotations. This increment implements:
+// The v1 set is `@derive(Eq, Ord, Json, Repr, Hash)`, `@default`, `@validate`,
+// `@range`, and `@deprecated`, plus runtime reflection over annotations. This
+// pass implements:
 //   * `@derive(Eq)` / `@derive(Repr)` — generate a structural-equality method
 //     and a debug-string method directly as ZIR (zero runtime cost).
 //   * runtime reflection — struct-level annotations/decorators are recorded in a
 //     registry at startup and queried with `reflect_has` / `reflect_names`.
-// Everything else in the locked set is validated by sema and reported here as a
-// clean "not implemented yet" lowering error (never silently ignored). The
-// user-defined compile-time macro API stays deferred (OPEN-QUESTIONS.md).
+//   * `@deprecated` — a sema-only use-site warning (ZAP5124, D-0109); it emits
+//     no ZIR, so it is a recognized no-op here (see `DECORATED_NO_CODE`).
+// The field group `@default`/`@validate`/`@range` is realized at field targets
+// (D-0101); a *non-field* application of those names stays a clean "not
+// implemented yet" lowering error (`DEFERRED_BUILTINS`). `@cache`/`@inject` are
+// reclassified/deferred and rejected at sema (ZAP5055, D-0109), so they never
+// reach this pass. The user-defined compile-time macro API stays deferred
+// (OPEN-QUESTIONS.md).
 // ----------------------------------------------------------------------------
 
-/// The built-in behavioral decorators whose code generation is deferred. Sema
-/// accepts them (they are part of the locked set); lowering reports them.
-const DEFERRED_BUILTINS: &[&str] = &[
-    "cache",
-    "default",
-    "validate",
-    "range",
-    "deprecated",
-    "inject",
-];
+/// The built-in field decorators whose non-field application is deferred. Sema
+/// accepts the names (they are part of the locked set) and realizes them at
+/// field targets (`@default`/`@validate`/`@range`, D-0101); any *other* target
+/// is reported here as a clean "not implemented yet" lowering error.
+///
+/// `@cache`/`@inject` are no longer here: they are reclassified/deferred and
+/// rejected at sema (ZAP5055, I#472/D-0109), so they never reach lowering.
+/// `@deprecated` is likewise gone: it is implemented as a sema-only use-site
+/// warning (ZAP5124) and generates no code, so lowering treats it as a no-op
+/// (see [`DECORATED_NO_CODE`]).
+const DEFERRED_BUILTINS: &[&str] = &["default", "validate", "range"];
+
+/// Built-in decorators that are fully handled before lowering and emit no ZIR,
+/// so the lowering decorator scan must silently ignore them rather than fall
+/// through to a "not implemented" error. `@deprecated` (I#472, D-0109) is a
+/// sema-only use-site warning; the decorated function/method body lowers
+/// unchanged.
+const DECORATED_NO_CODE: &[&str] = &["deprecated"];
 
 /// A trait requested via `@derive(...)`.
 #[derive(Clone, Copy, PartialEq)]
@@ -2202,6 +2215,10 @@ impl DecoratorPlan {
                             // decorator is queryable via reflect_has/reflect_names.
                             // Behavioral wrap/before/after codegen stays deferred.
                             reflect_meta.push((f.name.clone(), d.name.clone()));
+                        } else if DECORATED_NO_CODE.contains(&d.name.as_str()) {
+                            // `@deprecated` (I#472, D-0109): a sema-only use-site
+                            // warning; the function body lowers unchanged, so there
+                            // is nothing to generate here.
                         } else if DEFERRED_BUILTINS.contains(&d.name.as_str()) {
                             errors.push(err(format!(
                                 "built-in decorator '@{}' is not implemented yet (deferred)",
@@ -2516,10 +2533,17 @@ fn defer_fn_decorators(
     meta_names: &HashSet<String>,
     errors: &mut Vec<LowerError>,
 ) {
-    if !f.decorators.is_empty() {
+    // `@deprecated` on a method (I#472, D-0109) is a sema-only use-site warning
+    // and generates no code, so it lowers as a no-op; any other method decorator
+    // stays deferred.
+    if let Some(d) = f
+        .decorators
+        .iter()
+        .find(|d| !DECORATED_NO_CODE.contains(&d.name.as_str()))
+    {
         errors.push(err(format!(
             "function decorators are not implemented yet (deferred): '@{}' on '{}'",
-            f.decorators[0].name, f.name
+            d.name, f.name
         )));
     }
     for p in &f.params {

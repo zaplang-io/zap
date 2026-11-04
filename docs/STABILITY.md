@@ -177,6 +177,14 @@ not supported — it may change in **any** release, including a PATCH:
 - **Experimental and Internal surfaces** (§4). Everything not on the Stable list
   produced by #206 is outside the promise, whether or not it happens to be
   reachable.
+- **Reclassified/deferred built-in decorators** — `@cache` and `@inject`
+  (I#472, D-0109) are **not** in the v1 built-in set. `@cache` is gated on a
+  future module-level-persistent-state language feature; `@inject`'s dependency
+  injection is provided by reflection-driven `Depends(...)` adapters
+  (D-0089/D-0092), not a core decorator. Both names are reserved and rejected
+  with `ZAP5055`; if either is added later it ships **Experimental** first (§4).
+  `@cache` is gated on prerequisite language issue #658 (module-level persistent
+  state).
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,
@@ -341,7 +349,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Functions/lambdas/generators; default/keyword/variadic args; comprehensions/slicing | **S** |
 | First-class function values + closures (D-0067) | **S** |
 | Exceptions; `with` / context managers (D-0069); modules/imports/visibility (D-0028/D-0081, `design/0034-modules.md`) | **S** |
-| Regex (D-0010); decorators & annotations core (D-0036) + `@derive(Json)` | **S** |
+| Regex (D-0010); decorators & annotations core (D-0036) + `@derive(Json)`; built-in decorators `@default`/`@validate`/`@range` (D-0101) and `@deprecated` use-site warning (D-0109); behavioral `before`/`after`/`wrap` (D-0108) | **S** |
 | Generics incl. bounds (D-0064) | **S** |
 | Coroutines/channels/`select`/`scope:`/`spawn detached` (D-0031/0044/0045); sync primitives + `Atomic[T]` (D-0032/0066); `Optional[T]` (D-0065) | **S** |
 | `set[T]` — literals `{1, 2, 3}`, comprehensions `{x for x in xs}`, `.add`/`in`/`len`/iteration, and the `set[T]()` / `set(iterable)` constructors (#608/#609, graduated per D16/D17) | **S** |
@@ -429,8 +437,9 @@ A Stable surface is **never removed without warning**. The lifecycle is:
    behavior. The deprecation is recorded in the `CHANGELOG` and — for a
    language/stdlib surface — in `DECISIONS.md`, with the replacement and a
    migration note. The toolchain emits a **deprecation warning** at the point of
-   use (the planned `@deprecated` built-in, OPEN-QUESTIONS, is the mechanism for
-   library surfaces).
+   use: the **`@deprecated` built-in** (I#472, D-0109) marks a function or method
+   so every call site raises the non-fatal `ZAP5124` warning, with an optional
+   message (`@deprecated("use X")`).
 2. **Keep** the deprecated surface functional for the **remainder of the current
    MAJOR**. Because removing a Stable surface is breaking (§1.1), it can only be
    removed in the **next MAJOR**. Therefore:
