@@ -765,6 +765,7 @@ impl Checker {
                     variadic: p.variadic,
                     kwargs: p.kwargs,
                     keyword_only: p.keyword_only,
+                    positional_only: p.positional_only,
                 }
             })
             .collect();
@@ -1217,6 +1218,7 @@ impl Checker {
                     variadic: p.variadic,
                     kwargs: p.kwargs,
                     keyword_only: p.keyword_only,
+                    positional_only: p.positional_only,
                 }
             })
             .collect();
@@ -1317,6 +1319,7 @@ impl Checker {
             variadic: false,
             kwargs: false,
             keyword_only: false,
+            positional_only: false,
         };
         let mut methods = HashMap::new();
         methods.insert(
@@ -1357,6 +1360,7 @@ impl Checker {
                 variadic: p.variadic,
                 kwargs: p.kwargs,
                 keyword_only: p.keyword_only,
+                positional_only: p.positional_only,
             })
             .collect();
         let ret = f
@@ -5256,8 +5260,15 @@ impl Checker {
     /// its value type `V`; without such a parameter it is an unknown keyword.
     fn check_keyword_arg(&mut self, sig: &FnSig, fname: &str, name: &str, at: &Ty, at_span: Span) {
         // A keyword never binds the collector itself (`def f(V **kw)` then
-        // `f(kw=1)` puts `kw` into the dict, exactly like Python).
-        match sig.params.iter().find(|p| p.name == name && !p.kwargs) {
+        // `f(kw=1)` puts `kw` into the dict, exactly like Python). A parameter
+        // declared before the bare `/` separator is positional-only (#602) and
+        // likewise never binds by name: the keyword is collected by `**kw` if the
+        // callee has one, otherwise it is an error.
+        match sig
+            .params
+            .iter()
+            .find(|p| p.name == name && !p.kwargs && !p.positional_only)
+        {
             Some(p) => {
                 if !self.coercible(at, &p.ty) {
                     self.error(
@@ -5272,6 +5283,21 @@ impl Checker {
                         at_span,
                     );
                 }
+            }
+            None if sig
+                .params
+                .iter()
+                .any(|p| p.name == name && p.positional_only)
+                && !sig.params.iter().any(|p| p.kwargs) =>
+            {
+                self.error(
+                    ErrorCode::ZAP4034,
+                    format!(
+                        "parameter '{name}' of '{fname}' is positional-only and must \
+                         be passed positionally, not by name ('{name}=...')"
+                    ),
+                    at_span,
+                );
             }
             None => match sig.params.iter().find(|p| p.kwargs) {
                 Some(kw) => {
@@ -6408,6 +6434,37 @@ def main():
         // A required keyword-only parameter supplied by name is accepted.
         ok("def f(int64 a, *, int64 b) -> int64:\n    return a + b\n\
             def main():\n    auto x = f(1, b=2)\n");
+    }
+
+    #[test]
+    fn positional_only_params_enforced_at_call_site() {
+        // #602 positional-only `/` separator. Parameters before `/` must be passed
+        // positionally; parameters after it still accept positional or keyword.
+        ok(
+            "def f(int64 x, int64 y, /, int64 z) -> int64:\n    return x + y + z\n\
+             def main():\n    auto a = f(1, 2, 3)\n    auto b = f(1, 2, z=3)\n",
+        );
+
+        // Supplying a positional-only parameter by name is rejected (ZAP4034).
+        assert!(errors(
+            "def f(int64 x, int64 y, /, int64 z) -> int64:\n    return x + y + z\n\
+             def main():\n    auto a = f(x=1, y=2, z=3)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP4034));
+
+        // Only the first positional-only parameter named is enough to diagnose.
+        assert!(errors(
+            "def f(int64 x, int64 y, /, int64 z) -> int64:\n    return x + y + z\n\
+             def main():\n    auto a = f(1, y=2, z=3)\n"
+        )
+        .iter()
+        .any(|e| e.code == ErrorCode::ZAP4034));
+
+        // With a `**` collector, a positional-only name is collected rather than
+        // rejected (Python semantics): `x` lands in `kw`.
+        ok("def f(int64 x, /, int64 **kw) -> int64:\n    return x\n\
+            def main():\n    auto a = f(1, x=9)\n");
     }
 
     #[test]

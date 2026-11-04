@@ -3082,3 +3082,50 @@ Verified by the `raise_from_cause` golden (chained uncaught two-section stderr
 + exit 1) under the full-codegen CI jobs, plus `raise_from_cause_type_checks`
 (sema), `lower_raise_from_sets_cause` and `lower_caught_exception_cause_is_readable`
 (ir) on host.
+
+## D-0104 — Positional-only parameters via the bare `/` separator (I#602)
+**Status:** Locked — extends the parameter model (D-0038) with Python's `/` marker; the mirror of the keyword-only `*` separator (D-0095).
+
+Part of the CPython grammar-parity pass (epic #614, decision D10). A bare `/` in
+a parameter list makes every parameter **before** it **positional-only**: it may
+only be supplied positionally at a call site, never by name. This is exactly
+Python's `def f(a, b, /, c)` separator, adopted unchanged so signatures read the
+same across the two languages. The motivating use is FFI (I#542): C-mapped
+functions need positional-only parameters for ABI/signature mapping.
+
+```python
+def f(int64 x, int64 y, /, int64 z) -> int64:
+    return x + y + z
+f(1, 2, 3)                           # all positional
+f(1, 2, z=3)                         # z (after `/`) may be passed by name
+# f(x=1, y=2, z=3)                   # error: x/y are positional-only
+```
+
+**Surface.** The `/` is a **separator, not a parameter** — it carries no name,
+type or default and does not appear in the function's parameter list. It may
+appear **at most once**, **must follow at least one parameter** (a bare `/` with
+nothing before it has nothing to make positional-only, so it is a parse error,
+matching Python), and **must come before any `*`** keyword-only separator.
+Parameters before `/` become positional-only; parameters after it (and before
+any `*`) stay positional-or-keyword as before. The two separators compose:
+`def f(a, /, b, *, c)` is `a` positional-only, `b` positional-or-keyword, `c`
+keyword-only.
+
+**Enforcement is front-end.** The parser records a `positional_only` flag per
+parameter; sema enforces it at the call site. Supplying a positional-only
+parameter by name is `ZAP4034`; a misplaced, duplicated, or `*`-preceding `/` is
+`ZAP2019`. Matching Python, when the callee also has a `**` keyword-collector a
+positional-only name is collected into it rather than rejected. Because
+positional-only is purely a **call-site admissibility** rule and every argument
+is positional by the time it reaches lowering, **nothing in the IR, calling
+convention or codegen changes** — the restriction never reaches the backend.
+
+**Scope.** Enforcement targets free-function calls, where arity/keyword binding
+is already checked. User-method calls are still typed loosely (return type
+only), so positional-only — like keyword-only (D-0095) — is not yet enforced on
+methods.
+
+Verified by the `posonly_params` golden (working `/` call under the full-codegen
+CI jobs), plus `positional_only_params_enforced_at_call_site` (sema), parser
+accept/reject tests, the grammar-conformance corpus, and a fmt round-trip test
+on host.

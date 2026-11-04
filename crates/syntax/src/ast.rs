@@ -212,6 +212,10 @@ pub struct Param {
     /// `true` when this parameter follows the bare `*` separator and is therefore
     /// keyword-only (I#496): it may only be supplied by name at a call site.
     pub keyword_only: bool,
+    /// `true` when this parameter precedes the bare `/` separator and is therefore
+    /// positional-only (#602): it may only be supplied positionally at a call
+    /// site, never by name. Mirror of [`Param::keyword_only`].
+    pub positional_only: bool,
     pub span: Span,
 }
 

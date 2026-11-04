@@ -1418,7 +1418,48 @@ impl Parser {
         let mut keyword_only = false;
         let mut star_span: Option<Span> = None;
         let mut params_after_star = 0usize;
+        // A bare `/` separator makes every *preceding* parameter positional-only
+        // (#602, mirror of the `*` rule). It may appear at most once and must come
+        // before any `*`.
+        let mut positional_only_seen = false;
         loop {
+            if self.is(&TokenKind::Slash) {
+                let span = self.peek_span();
+                self.bump();
+                if positional_only_seen {
+                    self.error_at(
+                        span,
+                        ErrorCode::ZAP2019,
+                        "a `/` positional-only separator may appear at most once in a parameter list",
+                    );
+                } else if keyword_only {
+                    self.error_at(
+                        span,
+                        ErrorCode::ZAP2019,
+                        "a `/` positional-only separator must appear before the `*` keyword-only separator",
+                    );
+                } else if params.is_empty() {
+                    self.error_at(
+                        span,
+                        ErrorCode::ZAP2019,
+                        "a `/` positional-only separator must follow at least one parameter",
+                    );
+                } else {
+                    for p in &mut params {
+                        p.positional_only = true;
+                    }
+                }
+                positional_only_seen = true;
+                // The separator may end the list (`/)` or `/,)`) or be followed by
+                // `, <param>...`; those following params stay positional-or-keyword.
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                if self.is(&TokenKind::RParen) {
+                    break; // trailing comma after `/`
+                }
+                continue;
+            }
             if self.is(&TokenKind::Star) {
                 let span = self.peek_span();
                 self.bump();
@@ -1485,6 +1526,7 @@ impl Parser {
                 variadic: false,
                 kwargs: false,
                 keyword_only: false,
+                positional_only: false,
                 span: self.span_from(start),
             };
         }
@@ -1509,6 +1551,7 @@ impl Parser {
             variadic,
             kwargs,
             keyword_only: false,
+            positional_only: false,
             span: self.span_from(start),
         }
     }
@@ -4790,6 +4833,75 @@ def demo(int64 n):
         assert!(
             perrs.iter().any(|e| e.code == ErrorCode::ZAP2018),
             "expected ZAP2018, got {perrs:?}"
+        );
+    }
+
+    #[test]
+    fn positional_only_separator_flags_preceding_params() {
+        // `/` makes every preceding parameter positional-only (#602); params after
+        // it stay positional-or-keyword. The `/` is a separator, not a parameter,
+        // so it does not appear in `params`.
+        let m = parse_ok("def f(int64 x, int64 y, /, int64 z) -> int64:\n    return x\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        assert_eq!(f.params.len(), 3);
+        assert!(f.params[0].positional_only);
+        assert!(f.params[1].positional_only);
+        assert!(!f.params[2].positional_only);
+    }
+
+    #[test]
+    fn positional_only_and_keyword_only_separators_combine() {
+        // `/` before `*`: `x` positional-only, `z` positional-or-keyword, `w`
+        // keyword-only.
+        let m = parse_ok("def f(int64 x, /, int64 z, *, int64 w):\n    return\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        assert_eq!(f.params.len(), 3);
+        assert!(f.params[0].positional_only && !f.params[0].keyword_only);
+        assert!(!f.params[1].positional_only && !f.params[1].keyword_only);
+        assert!(!f.params[2].positional_only && f.params[2].keyword_only);
+    }
+
+    #[test]
+    fn trailing_positional_only_separator_is_allowed() {
+        // Every parameter positional-only: `def f(a, b, /)`.
+        let m = parse_ok("def f(int64 a, int64 b, /):\n    return\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!();
+        };
+        assert_eq!(f.params.len(), 2);
+        assert!(f.params[0].positional_only);
+        assert!(f.params[1].positional_only);
+    }
+
+    #[test]
+    fn bare_slash_with_no_leading_param_is_rejected() {
+        let (_m, perrs, lerrs) = parse_str("def f(/, int64 a):\n    return\n");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2019),
+            "expected ZAP2019, got {perrs:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_slash_is_rejected() {
+        let (_m, perrs, _l) = parse_str("def f(int64 a, /, int64 b, /, int64 c):\n    return\n");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2019),
+            "expected ZAP2019, got {perrs:?}"
+        );
+    }
+
+    #[test]
+    fn slash_after_star_is_rejected() {
+        let (_m, perrs, _l) = parse_str("def f(int64 a, *, int64 b, /, int64 c):\n    return\n");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2019),
+            "expected ZAP2019, got {perrs:?}"
         );
     }
 

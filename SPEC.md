@@ -561,6 +561,21 @@ open("a", create=True, mode=0)       # by name, in any order
 # open("a")                          # error: required keyword-only `mode` omitted
 ```
 
+**Positional-only parameters (D-0104, I#602)** — a bare `/` separator in the
+parameter list makes every parameter *before* it positional-only: it may only be
+supplied positionally at a call site, never by name (Python semantics; the mirror
+of the keyword-only `*`). The `/` appears at most once, must follow at least one
+parameter, and must come before any `*`. Parameters after `/` (and before any
+`*`) stay positional-or-keyword:
+
+```python
+def f(int64 x, int64 y, /, int64 z) -> int64:
+    return x + y + z
+f(1, 2, 3)                           # all positional
+f(1, 2, z=3)                         # z (after `/`) may be passed by name
+# f(x=1, y=2, z=3)                   # error: x/y are positional-only
+```
+
 **Variadics** — homogeneous, Java-style `TYPE... name`, received as a list:
 
 ```python

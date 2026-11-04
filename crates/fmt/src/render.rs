@@ -358,18 +358,23 @@ pub fn type_str(t: &Type) -> String {
     }
 }
 
-/// Render a parameter list into comma-joinable pieces, inserting a bare `*`
-/// keyword-only separator (I#496) before the first keyword-only parameter so the
-/// formatter round-trips `def f(a, *, b)`.
+/// Render a parameter list into comma-joinable pieces, inserting a bare `/`
+/// positional-only separator (#602) after the last positional-only parameter and
+/// a bare `*` keyword-only separator (I#496) before the first keyword-only
+/// parameter, so the formatter round-trips `def f(a, /, b, *, c)`.
 pub fn param_pieces(params: &[Param]) -> Vec<String> {
-    let mut out = Vec::with_capacity(params.len() + 1);
+    let mut out = Vec::with_capacity(params.len() + 2);
+    let last_pos_only = params.iter().rposition(|p| p.positional_only);
     let mut marked = false;
-    for p in params {
+    for (i, p) in params.iter().enumerate() {
         if p.keyword_only && !marked {
             out.push("*".to_string());
             marked = true;
         }
         out.push(param_str(p));
+        if Some(i) == last_pos_only {
+            out.push("/".to_string());
+        }
     }
     out
 }
