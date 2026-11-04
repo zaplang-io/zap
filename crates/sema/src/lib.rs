@@ -2359,19 +2359,16 @@ impl Checker {
                 }
             }
             "cache" => {
-                // Deferred (I#472, D-0109): `@cache` needs module-level persistent
-                // state, not yet a language feature (tracked in I#658/I#661; an
-                // `args`-keyed memoize is not expressible via the user-level
-                // `wrap` either). Rejected cleanly here rather than advertised and
-                // then rejected at lowering; the name stays reserved so this
-                // dedicated message fires instead of "unknown decorator".
-                self.error(
-                    ErrorCode::ZAP5055,
-                    "@cache is not available yet: it needs module-level persistent state, \
-                     a language feature tracked in I#658/I#661 (I#472, D-0109); \
-                     see STABILITY.md",
-                    d.span,
-                );
+                // `@cache` (I#666, D-0115, epic #661 — supersedes the D-0109
+                // deferral now that module-level state exists) is a free-function
+                // decorator expanded *before* sema into ordinary, `zap expand`-
+                // visible Zap over a module-level dict (crates/driver's
+                // behavioral-decorator pass). A correct application on a function
+                // is consumed by that pass and never reaches this arm, so all this
+                // does is catch a *misapplication* to a non-function target; the
+                // per-signature checks (hashable params, a return value, free
+                // function only) live in the expansion pass as ZAP5056.
+                self.require_target(d, target, DecoTarget::Function);
             }
             "inject" => {
                 // Declined for core (I#472, D-0109): `@inject` is a DI-framework
@@ -8842,21 +8839,24 @@ def main():
         );
     }
 
-    // ---- @cache / @inject reclassified/deferred (I#472, D-0109) -----------
+    // ---- @cache shipped (I#666, D-0115); @inject declined (I#472, D-0109) --
 
     #[test]
-    fn cache_is_reclassified_deferred() {
-        // `@cache` needs module-level persistent state (not a language feature
-        // yet); it is rejected cleanly at sema with the dedicated ZAP5055
-        // message, regardless of argument shape, rather than advertised and then
-        // rejected at lowering.
-        let e = errors("@cache\ndef f() -> int64:\n    return 1\n");
+    fn cache_accepted_on_function_rejected_off_function() {
+        // `@cache` (I#666, D-0115 — supersedes the D-0109 deferral now that
+        // module-level state exists) is a free-function decorator expanded into
+        // real Zap *before* sema. Sema itself raises nothing on a function (the
+        // expansion and the hashable-signature checks live in the driver pass as
+        // ZAP5056); a correct application never even reaches the cache arm,
+        // because the pass consumes it. Misapplied to a non-function target it is
+        // a clean require-target error (ZAP5047).
+        assert!(
+            errors("@cache\ndef f(int64 n) -> int64:\n    return n\n").is_empty(),
+            "@cache on a function should not be a sema error"
+        );
+        let e = errors("@cache\nstruct S:\n    int64 x\n");
         assert_eq!(e.len(), 1, "expected one diagnostic, got {e:?}");
-        assert_eq!(e[0].code, ErrorCode::ZAP5055);
-        // Still one clean diagnostic even with (otherwise-invalid) arguments.
-        let e = errors("@cache(1)\ndef f() -> int64:\n    return 1\n");
-        assert_eq!(e.len(), 1, "expected one diagnostic, got {e:?}");
-        assert_eq!(e[0].code, ErrorCode::ZAP5055);
+        assert_eq!(e[0].code, ErrorCode::ZAP5047);
     }
 
     #[test]

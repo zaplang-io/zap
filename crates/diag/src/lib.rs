@@ -576,13 +576,21 @@ define_codes! {
          returns something other than the name of its nested `def`.";
     ZAP5055 = 5055 : "built-in decorator not available in core",
         "A built-in decorator named by the original spec is not available as a \
-         core decorator (I#472, D-0109). `@cache` is **deferred**: it needs \
-         module-level persistent state, not yet a language feature (tracked in \
-         I#658/I#661; an `args`-keyed memoize is also not expressible via the \
-         user-level `wrap`). `@inject` is **declined for core**: dependency \
-         injection is provided by reflection-driven `Depends(...)` adapters \
-         (D-0089/D-0092, I#466), not a core decorator. See SPEC.md, STABILITY.md \
-         and DECISIONS.md (D-0109).";
+         core decorator (I#472, D-0109). `@inject` is **declined for core**: \
+         dependency injection is provided by reflection-driven `Depends(...)` \
+         adapters (D-0089/D-0092, I#466), not a core decorator. (`@cache` is no \
+         longer here: it shipped in #666/D-0115 now that module-level state \
+         exists, epic #661.) See SPEC.md, STABILITY.md and DECISIONS.md.";
+    ZAP5056 = 5056 : "@cache requires hashable, memoizable parameters",
+        "`@cache` (#666, D-0115) memoizes a function by its argument tuple, so \
+         every parameter type must be hashable (usable as a dict key) and the \
+         function must return a value to store. A parameter that is a collection \
+         (`list`/`dict`/`set`), a bare tuple type, a function value, or a \
+         variadic/`**kwargs` collector is not a stable cache key; a function that \
+         returns nothing, or takes no parameters, has nothing to key or store. \
+         `@cache` is also a free-function decorator in v1 (not a method). Give \
+         the function hashable parameters and a return type, or memoize by hand \
+         over a module-level dict.";
     ZAP5060 = 5060 : "generator tier-1 enum method not supported",
         "Generators on a tier-1 (unboxed-integer) enum method are not supported \
          yet — tier-1 enum methods do not lower at all yet, generator or not. \

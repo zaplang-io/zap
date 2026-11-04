@@ -1441,7 +1441,8 @@ mod tests {
         // A field decorator applied to a *non-field* target stays deferred at
         // lowering (sema's target check gates the normal path; this is the
         // belt-and-suspenders lowering guard). `@cache`/`@inject` no longer reach
-        // lowering at all — they are rejected at sema (ZAP5055, I#472/D-0109).
+        // lowering at all — `@cache` is expanded to real Zap before sema (I#666,
+        // D-0115); `@inject` stays rejected at sema (ZAP5055, I#472/D-0109).
         let src = "@validate(max_len=1)\ndef f() -> int64:\n    return 1\n\ndef main():\n    print(f())\n";
         let (ast, _p, _l) = parse_str(src);
         let (_m, errs) = lower_module(&ast);

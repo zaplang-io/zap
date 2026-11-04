@@ -77,12 +77,21 @@ fn type_codes() {
 
 #[test]
 fn semantic_codes() {
-    // `@cache` is reclassified/deferred — not available in this version
-    // (needs module-level persistent state), rejected with ZAP5055 (I#472,
-    // D-0109), regardless of argument shape.
+    // `@inject` stays reclassified/declined for core — dependency injection is
+    // the `Depends(...)` adapter, not a core decorator — rejected with ZAP5055
+    // (I#472, D-0109). (`@cache` is no longer here: it ships in I#666/D-0115,
+    // expanded before sema; its ZAP5056 signature checks run in the driver pass,
+    // which `check_source` does not, so they are covered by the expansion pass's
+    // own unit tests instead.)
     assert_code(
-        "@cache(1)\ndef f():\n    pass\n\ndef main():\n    pass\n",
+        "struct S:\n    @inject\n    int64 x\n\ndef main():\n    pass\n",
         "ZAP5055",
+    );
+    // `@cache` is a free-function decorator: misapplied to a struct it is a clean
+    // require-target error (ZAP5047), which sema — and so `check_source` — sees.
+    assert_code(
+        "@cache\nstruct S:\n    int64 x\n\ndef main():\n    pass\n",
+        "ZAP5047",
     );
     // `@deprecated` on the wrong target (a struct) — it is a function/method
     // decorator only (I#472, D-0109).
