@@ -3032,6 +3032,23 @@ primitive lands here instead.
   (`BEGIN PRIVATE KEY`); `PEM_read_bio_PrivateKey` handles both transparently.
   A malformed key or a signing failure raises a catchable `ValueError` (D-0007);
   a bad verify key or a mismatched signature is a plain `false`, never a panic.
+- **Algorithm binding (#642).** Only ordinary RSA keys (`EVP_PKEY_RSA`) are
+  accepted; EC, DSA, Edwards, X25519, and RSA-PSS-only keys are rejected. Both
+  signing and verification explicitly select `RSA_PKCS1_PADDING`. Wrong-family
+  private keys raise `ValueError`; wrong-family public keys return `false`.
+  This prevents the generic EVP dispatch from silently selecting another
+  signature scheme. Sign calls use throwing-call lowering so a local `try`
+  catches parsing, family, and signing errors. No key-size policy or additional
+  algorithm is introduced.
+- **Result lowering (#644).** Both RSA sign APIs retain `Ty::Bytes` in ZIR,
+  matching sema. Inferred locals support binary indexing, slicing, concatenation
+  and equality. The runtime ABI remains the shared `ZapStr` pointer layout.
+- **Diagnostics.** Verification still returns `false` for malformed keys,
+  foreign families, initialization failures, and mismatches. Configuration
+  failures emit fixed, non-sensitive messages through `logging` at DEBUG;
+  valid signatures and ordinary mismatches emit none. The default WARNING
+  threshold suppresses these messages. Shared helpers enforce key family and
+  PKCS#1 v1.5 initialization for both signing and verification.
 - **Backend.** These are the only OpenSSL-backed entries in `crypto` — the
   hashing/HMAC/CSPRNG section stays a self-contained FIPS/RFC reference
   implementation, but RSA (bignum modexp + ASN.1 key parsing) would be a large,
@@ -3047,7 +3064,12 @@ Verified by the `crypto_rsa` golden (a fixed 2048-bit test key pair in both
 PKCS#1 and PKCS#8 PEM, asserting both encodings sign identically, pinning the
 deterministic RSA-SHA1 and RSA-SHA256 signature fingerprints, and checking
 verify accepts the genuine signature and rejects a tampered message) under the
-full-codegen CI jobs, plus the sema/ir unit suites on host.
+full-codegen CI jobs, plus the sema/ir unit suites on host. The
+`crypto_rsa_key_binding` golden adds 2048/3072-bit known answers, empty/binary
+messages, foreign-family signatures, ordinary-RSA PSS signatures, malformed
+keys, damaged signatures, and repeated rejection followed by success (#642).
+Damage tests mutate actual SHA-256 signer results for each key/message case,
+as well as independent OpenSSL signatures, through the bytes test helper.
 
 ## D-0103 — `raise ... from ...` explicit cause chaining (I#604)
 

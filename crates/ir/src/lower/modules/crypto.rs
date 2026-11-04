@@ -5,7 +5,7 @@
 //! arguments pass straight through; `_new`/`digest`/`hexdigest` results are also
 //! `Ty::Ptr` (a `bytes` handle or a `str`/`bytes` object). Count arguments
 //! (`random_bytes`/`token_hex`) coerce to `i64`. Sema has already type-checked
-//! these calls.
+//! these calls. RSA sign results retain `Ty::Bytes` for binary operations (#644).
 
 use zapc_syntax::ast;
 
@@ -131,7 +131,8 @@ fn lower(
             Ok(Some((d, Ty::Ptr)))
         }
         // crypto.rsa_<hash>_sign(pem_key, data) -> bytes (#628): the raw PKCS#1
-        // v1.5 signature. Both args are str/bytes (Ptr), passed straight through.
+        // v1.5 signature. Keep the result Ty::Bytes for byte operations (#644);
+        // args retain their existing pointer ABI.
         "rsa_sha1_sign" | "rsa_sha256_sign" => {
             if args.len() != 2 {
                 return Err(err("crypto.rsa_*_sign takes exactly two arguments"));
@@ -143,13 +144,11 @@ fn lower(
             };
             let (key, _) = lowerer.expr(&args[0].value)?;
             let (data, _) = lowerer.expr(&args[1].value)?;
-            let d = lowerer.new_value(Ty::Ptr);
-            lowerer.emit(Inst::Call {
-                dest: Some(d),
-                func: func.to_string(),
-                args: vec![key, data],
-            });
-            Ok(Some((d, Ty::Ptr)))
+            let d = lowerer.new_value(Ty::Bytes);
+            // Key parsing, family rejection and signing failures raise ValueError.
+            // Preserve the active try handler for every signing error (#642).
+            lowerer.throwing_call(Some(d), func, vec![key, data]);
+            Ok(Some((d, Ty::Bytes)))
         }
         // crypto.rsa_sha256_verify(pem_pubkey, data, sig) -> bool (#628). The
         // runtime returns an i64 (0/1); the compare-to-zero yields the i1 `bool`.

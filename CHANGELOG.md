@@ -127,7 +127,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Security
 
-- _Nothing yet. Security/soundness fixes are documented here and in
-  `SECURITY.md` (STABILITY §3.3)._
+- Bind RSA-named signing and verification to ordinary RSA keys and explicit
+  PKCS#1 v1.5 padding (#642). Previously generic EVP dispatch could sign with
+  an EC/DSA key or verify a foreign-family signature. Wrong-family signing
+  raises `ValueError`; verification returns `false`, including RSA-PSS keys.
+  Emit sign calls through the throwing-call path so local handlers catch
+  parsing, key-family, and signing errors.
+
+- Preserve the RSA sign result as `bytes` during IR lowering (#644), fixing
+  byte operations on inferred signature locals without changing the runtime ABI.
+- Share RSA key-family/padding enforcement between signing and verification;
+  emit DEBUG diagnostics for verifier key/configuration errors through the
+  existing logging configuration, without including cryptographic inputs.
 
 [Unreleased]: https://github.com/zaplang-io/zap/commits/main

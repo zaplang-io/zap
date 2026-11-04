@@ -46,6 +46,13 @@ Compiler pipeline (mirrors Go): **lex/parse → type-check → typed IR →
   `before`/`after`/`wrap`, and `zap expand`; user macros staged. `design/0004`.
 - Modules, imports, enforced `_` visibility (D-0028).
 
+RSA signing/verification now enforce the ordinary-RSA, PKCS#1 v1.5 contract
+(#642, D-0102). Validated key metadata and P-256/Ed25519 primitives remain
+separate work (#643); this correction does not complete asymmetric JWT support.
+
+The RSA implementation shares its key-family/padding policy between sign and
+verify, with optional DEBUG diagnostics for verifier configuration failures.
+
 ## Phase 3 — Signature features (parallel tracks)
 
 Once the IR schema and runtime ABI are frozen, these run concurrently:
