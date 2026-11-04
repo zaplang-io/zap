@@ -731,7 +731,11 @@ filter still binds the enclosing scope. As the sole argument of a call it needs
 no parentheses of its own — `sum(x for x in xs)` — but with any other argument
 it must be parenthesized: `f((x for x in xs), y)`. It desugars to an anonymous
 generator function (`yield`-based, I#67) whose parameters are the captured free
-variables, so it reuses the one iteration protocol.
+variables, so it reuses the one iteration protocol. A genexpr nested directly
+inside another genexpr (`(v for v in (w for w in xs))`) is the "nested
+generators" case I#67 deferred — one generator driving a second across its own
+`yield` — and is not supported yet; iterate the inner one through an
+intermediate `for` or a materialized collection instead.
 
 ## 9. Strings: operations, methods, interpolation
 

@@ -22,7 +22,6 @@ def main():
     # (0,1),(0,2),(1,0),(1,2),(2,0),(2,1) -> sum of x+y = 1+2+1+3+2+3 = 12
     auto s2 = sum((x + y for x in range(3) for y in range(3) if x != y))
     print(s2)
-
-    # nested: a genexpr feeding another genexpr; squares of 1..3 -> 1+4+9 = 14
-    auto s3 = sum((v for v in (w * w for w in range(1, 4))))
-    print(s3)
+    # NOTE: a genexpr nested inside another genexpr (one generator driving a
+    # second across its own `yield`) is the "nested generators" case I#67
+    # explicitly deferred, so it is intentionally not exercised here.

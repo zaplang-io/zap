@@ -3331,6 +3331,12 @@ a named one, and a side table routes the D-0048 iteration hooks to it so it is
 its own iterator. Constructing it stores the captured values into the parameter
 fields with `$state == 0`, exactly like a generator call.
 
+**Deferred — nested generators.** A genexpr nested directly inside another
+(`(v for v in (w for w in xs))`) makes one generator drive a second across its
+own `yield`, which is the "nested generators" case I#67 deferred; it is not
+supported yet (iterate the inner genexpr through an intermediate `for` or a
+materialized collection). All other genexpr positions are supported.
+
 **`sum` over an iterator.** `sum(...)` now accepts any iterable — a lazy
 generator / generator expression or a `list` — draining it once through the
 D-0048 protocol into a running total (the numeric `array` fast path is
