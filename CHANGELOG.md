@@ -25,6 +25,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- Positional-only parameters via a bare `/` separator: parameters before `/`
+  may only be supplied positionally, never by name (the mirror of the keyword-only
+  `*` separator). `/` appears at most once and must precede any `*`; passing a
+  positional-only parameter by name is `ZAP4034`, a misplaced `/` is `ZAP2019`.
+  Enforced front-end only — no IR/codegen change (#602, D-0104, epic #614 D10).
+
 - Array length mismatches raise `ValueError` before SIMD kernels run; the
   Experimental array contract records supported 1-D dtypes, construction,
   arithmetic and contiguous views. Unsupported array constructors and native

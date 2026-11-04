@@ -334,6 +334,12 @@ const CORPUS: &[Case] = &[
     case("param_list", Accept, "def f(*, int64 b):\n    return\n"),             // kw-only only, I#496
     case("param_list", Reject, "def f(int64 a, *):\n    return\n"),             // bare '*' with nothing after
     case("param_list", Reject, "def f(int64 a, *, *, int64 b):\n    return\n"), // duplicate '*'
+    case("param_list", Accept, "def f(int64 a, int64 b, /, int64 c):\n    return\n"), // pos-only, #602
+    case("param_list", Accept, "def f(int64 a, /):\n    return\n"),             // trailing '/', #602
+    case("param_list", Accept, "def f(int64 a, /, int64 b, *, int64 c):\n    return\n"), // '/' before '*', #602
+    case("param_list", Reject, "def f(/, int64 a):\n    return\n"),             // bare '/' with nothing before
+    case("param_list", Reject, "def f(int64 a, /, int64 b, /):\n    return\n"), // duplicate '/'
+    case("param_list", Reject, "def f(int64 a, *, int64 b, /):\n    return\n"), // '/' after '*'
     case("decorators", Accept, "@cache\ndef f():\n    return\n"),               // D-0036
     case("decorators", Accept, "@retry(3)\ndef f():\n    return\n"),
     case("generics", Accept, "def id[T](T x) -> T:\n    return x\n"),           // D-0017

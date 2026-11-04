@@ -173,6 +173,7 @@ Python models data with classes; Zap uses nominal `struct` / `enum` /
 | Variadic positional | `def f(*args):` | `def f(int64... xs):` | Homogeneous, type-first (D-0038). |
 | Keyword-collector | `def f(**kwargs):` | `def f(int64 **opts):` | Homogeneous `dict[str, V]`, type-first (#601). |
 | Keyword-only marker | `def f(*, k):` | `def f(*, int64 k):` | Same `*` separator (I#496). |
+| Positional-only marker | `def f(a, /):` | `def f(int64 a, /):` | Same `/` separator; params before `/` can't be passed by name (#602). |
 | Starred call args | `f(*args, **kw)` | `f(*args, **kw)` | Same spelling; `*tuple` expands fixed params, `*list`/`**dict` forward into a variadic / collector (#597). |
 | User decorator | `def deco(fn): ...` + `@deco` | `decorator Deco(...): ...` + `@Deco` | Declared decorators and `annotation` types, reflectable (D-0036). |
 

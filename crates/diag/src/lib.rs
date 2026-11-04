@@ -283,6 +283,11 @@ define_codes! {
         "The bare `*` keyword-only separator in a parameter list is misplaced \
          (I#496). It must be followed by at least one parameter — every \
          parameter after it is keyword-only — and may appear at most once.";
+    ZAP2019 = 2019 : "misplaced positional-only marker",
+        "The bare `/` positional-only separator in a parameter list is misplaced \
+         (#602). It must follow at least one parameter — every parameter before \
+         it is positional-only — may appear at most once, and must come before \
+         the `*` keyword-only separator.";
 
     // ---- ZAP3xxx — name resolution / imports -------------------------------
     ZAP3001 = 3001 : "unknown name",
@@ -387,6 +392,9 @@ define_codes! {
         "The sent value's type does not match the channel's element type.";
     ZAP4033 = 4033 : "invalid channel capacity",
         "A channel's buffer capacity must be an integer.";
+    ZAP4034 = 4034 : "positional-only argument supplied by name",
+        "A parameter declared before the bare `/` separator is positional-only \
+         (#602) and must be passed positionally, not by name (`name=value`).";
     ZAP4040 = 4040 : "match operand must be a string",
         "The left operand of `=~` / `!~` must be a `str`.";
     ZAP4041 = 4041 : "substitution operand must be a string",

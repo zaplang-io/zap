@@ -1178,6 +1178,19 @@ mod tests {
     }
 
     #[test]
+    fn positional_only_separator_round_trips() {
+        // The bare `/` positional-only separator (#602) is rendered back verbatim,
+        // including when combined with the `*` keyword-only separator.
+        for source in [
+            "def f(int64 x, int64 y, /, int64 z) -> int64:\n    return x + y + z\n",
+            "def f(int64 a, /):\n    return a\n",
+            "def f(int64 x, /, int64 z, *, int64 w):\n    return x + z + w\n",
+        ] {
+            assert_eq!(format_source(source).unwrap(), source);
+        }
+    }
+
+    #[test]
     fn empty_enum_keeps_its_pass_body() {
         let source = "enum Empty:\n    pass\n";
         assert_eq!(format_source(source).unwrap(), source);

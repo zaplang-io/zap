@@ -83,14 +83,19 @@ type_args     ::= "[" type { "," type } "]" ;
                      value whose type declares that generic method), else a value
                      subscript (`__getitem__`, D-0047); sema/mono classifies it. *)
 
-param_list    ::= [ param { "," param } "," ] "*" param { "," param }
-                | param { "," param } ;
-                  (* The first alternative carries a bare "*" separator: every
-                     parameter after it is keyword-only (I#496, D-0095, Python
-                     semantics) and may only be supplied by name at a call site.
-                     The "*" appears at most once and must be followed by at
-                     least one parameter; keyword-only parameters may be required
-                     or have a default. *)
+param_list    ::= [ param { "," param } "/" "," ]
+                  [ param { "," param } "," ] [ "*" param { "," param } ]
+                | param { "," param } "/" ;
+                  (* Two optional bare separators order the parameters (Python
+                     semantics). A "/" positional-only separator (#602, D10) makes
+                     every parameter BEFORE it positional-only: suppliable only
+                     positionally at a call site, never by name. A "*" keyword-only
+                     separator (I#496, D-0095) makes every parameter AFTER it
+                     keyword-only: suppliable only by name. Each appears at most
+                     once; "/" must follow at least one parameter and precede any
+                     "*"; "*" must be followed by at least one parameter.
+                     Parameters between the two stay positional-or-keyword.
+                     Keyword-only parameters may be required or have a default. *)
 param         ::= { "@" decorator_name [ "(" [ arg_list ] ")" ] }
                   ( "self"
                   | type "..." IDENT
