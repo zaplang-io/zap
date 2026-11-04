@@ -1139,7 +1139,8 @@ fn espan(e: &Expr) -> Span {
         | Expr::RegexSubst { span, .. }
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
-        | Expr::IfElse { span, .. } => *span,
+        | Expr::IfElse { span, .. }
+        | Expr::Named { span, .. } => *span,
     }
 }
 

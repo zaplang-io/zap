@@ -690,7 +690,13 @@ impl<'a> Lexer<'a> {
             }
             b',' => TokenKind::Comma,
             b';' => TokenKind::Semicolon,
-            b':' => TokenKind::Colon,
+            b':' => {
+                if self.eat(b'=') {
+                    TokenKind::ColonEq
+                } else {
+                    TokenKind::Colon
+                }
+            }
             b'@' => TokenKind::At,
             b'~' => {
                 if self.eat(b'=') {

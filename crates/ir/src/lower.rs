@@ -4625,6 +4625,14 @@ struct FnLower<'a> {
     /// owned by the top scope ([`Owner::Scope`]); a `spawn` at the root is
     /// [`Owner::Root`] (D-0044, structured concurrency).
     scope_stack: Vec<Value>,
+    /// For each comprehension currently being lowered (innermost last), the
+    /// length of `scopes` just before that comprehension pushed its per-clause
+    /// scopes (#600). A walrus target inside a comprehension filter must bind in
+    /// the scope containing the outermost enclosing comprehension (PEP 572), not
+    /// in a per-clause scope that is popped before the comprehension's value is
+    /// returned, so [`walrus_frame`](FnLower::walrus_frame) targets
+    /// `comp_enclosing[0] - 1`. Empty outside any comprehension.
+    comp_enclosing: Vec<usize>,
     /// Counter handing out distinct flag names for `with expect_raises(...)`
     /// desugaring (D-0054), so nested `with`s do not collide.
     with_counter: u32,
@@ -4739,6 +4747,7 @@ impl<'a> FnLower<'a> {
             landing_pads: Vec::new(),
             used_lps: HashSet::new(),
             scope_stack: Vec::new(),
+            comp_enclosing: Vec::new(),
             with_counter: 0,
             gen_discover: None,
             gen_elems: Vec::new(),
@@ -4924,6 +4933,21 @@ impl<'a> FnLower<'a> {
     }
     fn lookup(&self, name: &str) -> Option<(Value, Ty)> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+
+    /// The scope-stack index a fresh walrus binding (`name := expr`, #600) must
+    /// be declared into so it outlives the construct it appears in. Outside any
+    /// comprehension this is the current innermost scope — which, for an
+    /// `if`/`while` condition, is already the enclosing block (conditions are
+    /// lowered before the body scope is pushed), so the binding survives. Inside
+    /// a comprehension it is the scope containing the outermost comprehension
+    /// (PEP 572): every per-clause scope is popped before the comprehension's
+    /// value is returned, so a walrus target must bind below them.
+    fn walrus_frame(&self) -> usize {
+        match self.comp_enclosing.first() {
+            Some(&len) => len.saturating_sub(1),
+            None => self.scopes.len().saturating_sub(1),
+        }
     }
 
     /// Allocate and declare the stack slot for a named local binding (`let`,
@@ -7841,7 +7865,12 @@ impl<'a> FnLower<'a> {
             });
             Ok(())
         };
-        self.lower_comp_clauses(clauses, &mut emit)?;
+        // Record the scope enclosing this comprehension so a walrus target in a
+        // filter binds there (#600), surviving the per-clause scopes.
+        self.comp_enclosing.push(self.scopes.len());
+        let comp_result = self.lower_comp_clauses(clauses, &mut emit);
+        self.comp_enclosing.pop();
+        comp_result?;
         let elem = kind.get().unwrap_or(Elem::I64);
         self.func.value_types[list as usize] = Ty::List(elem);
         Ok((list, Ty::List(elem)))
@@ -7877,7 +7906,12 @@ impl<'a> FnLower<'a> {
             });
             Ok(())
         };
-        self.lower_comp_clauses(clauses, &mut emit)?;
+        // Record the scope enclosing this comprehension so a walrus target in a
+        // filter binds there (#600), surviving the per-clause scopes.
+        self.comp_enclosing.push(self.scopes.len());
+        let comp_result = self.lower_comp_clauses(clauses, &mut emit);
+        self.comp_enclosing.pop();
+        comp_result?;
         let elem = kind.get().unwrap_or(Elem::I64);
         self.func.value_types[set as usize] = Ty::Set(elem);
         Ok((set, Ty::Set(elem)))
@@ -7918,7 +7952,12 @@ impl<'a> FnLower<'a> {
             });
             Ok(())
         };
-        self.lower_comp_clauses(clauses, &mut emit)?;
+        // Record the scope enclosing this comprehension so a walrus target in a
+        // filter binds there (#600), surviving the per-clause scopes.
+        self.comp_enclosing.push(self.scopes.len());
+        let comp_result = self.lower_comp_clauses(clauses, &mut emit);
+        self.comp_enclosing.pop();
+        comp_result?;
         let (kk, vk) = kinds.get().unwrap_or((Elem::I64, Elem::I64));
         self.func.value_types[dict as usize] = Ty::Dict(kk, vk);
         Ok((dict, Ty::Dict(kk, vk)))
@@ -8863,6 +8902,40 @@ impl<'a> FnLower<'a> {
                     b,
                 });
                 Ok((d, at))
+            }
+            // `(name := expr)` — walrus assignment-expression (#600, epic #614
+            // D8). Evaluate the operand once, bind `name` to it (by inference,
+            // like `auto`) in the scope that must outlive this construct, and
+            // evaluate to the operand's value. Each textual walrus is lowered
+            // exactly once (an `if`/`while` condition block and a comprehension
+            // loop body are each emitted once and re-executed at runtime), so a
+            // runtime loop reuses the one slot created here.
+            Expr::Named { name, value, .. } => {
+                let (v, t) = self.expr(value)?;
+                let frame = self.walrus_frame();
+                if let Some((slot, slot_ty)) = self.scopes[frame].get(name).copied() {
+                    // Already bound in the target frame (e.g. a repeated walrus
+                    // with the same name): reuse its slot.
+                    let v = self.coerce(v, t, slot_ty);
+                    self.store(slot, v);
+                    Ok((v, t))
+                } else if frame + 1 == self.scopes.len() {
+                    // Innermost scope (condition position): `decl_slot` keeps the
+                    // generator state-struct handling intact.
+                    let slot = self.decl_slot(name, t);
+                    self.store(slot, v);
+                    Ok((v, t))
+                } else {
+                    // A comprehension filter: bind in the scope enclosing the
+                    // comprehension so the name survives the per-clause scopes.
+                    // The alloca is hoisted to the entry block (ticket #91), so
+                    // the slot dominates both the comprehension body and reads
+                    // after it.
+                    let slot = self.alloca(t);
+                    self.scopes[frame].insert(name.to_string(), (slot, t));
+                    self.store(slot, v);
+                    Ok((v, t))
+                }
             }
             // Channel receive `<-ch` (ticket #25, D-0031): blocks until a value
             // is available, then yields it. The element kind carried by the
@@ -15215,6 +15288,12 @@ fn collect_free_names(
             }
         }
         Expr::Starred { value, .. } => collect_free_names(value, bound, out, seen),
+        // `(name := value)` binds `name` locally (#600): collect the operand's
+        // free names, then mark the target bound so later uses are not captured.
+        Expr::Named { name, value, .. } => {
+            collect_free_names(value, bound, out, seen);
+            bound.insert(name.clone());
+        }
         Expr::Dict(items, _) => {
             for it in items {
                 match it {

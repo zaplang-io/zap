@@ -2559,6 +2559,28 @@ impl Parser {
         }
         // assignment / aug-assignment / substitution / expression statement
         let target = self.parse_expr();
+        // A bare `a := expr` statement is rejected (#600 non-goal): `:=` is the
+        // walrus assignment-expression, valid only inside parentheses (as a
+        // condition or comprehension filter), never as a declaration shorthand.
+        // Steer to the declaration form and recover by consuming the RHS.
+        if self.is(&TokenKind::ColonEq) {
+            let name = match &target {
+                Expr::Name(n, _) => n.clone(),
+                _ => "name".to_string(),
+            };
+            self.error_at(
+                self.peek_span(),
+                ErrorCode::ZAP2020,
+                format!(
+                    "`:=` cannot declare a variable here; write `auto {name} = ...` \
+                     (the walrus `:=` is only valid in a parenthesized condition or \
+                     comprehension filter, e.g. `if (x := f()) > 0:`)"
+                ),
+            );
+            self.bump(); // ':='
+            let _ = self.parse_expr();
+            return Stmt::Expr(target);
+        }
         // Bare comma-list destructuring target (D-0049): `a, b = ...`,
         // `first, *rest = ...`. The first element was already parsed as an
         // expression; collect the rest as target elements (which may carry `*`).
@@ -3492,6 +3514,16 @@ impl Parser {
         if self.eat(&TokenKind::RParen) {
             return Expr::Tuple(Vec::new(), self.span_from(start));
         }
+        // `(name := expr)` — a named (walrus) assignment-expression (#600). The
+        // walrus is only legal in a parenthesized position, so it is recognized
+        // here at the head of a parenthesized group. The surrounding operators
+        // apply to the whole named expression (`(n := len(xs)) > 10` parses as
+        // `(n := len(xs))` then `> 10`, not `n := (len(xs) > 10)`).
+        if matches!(self.peek(), TokenKind::Ident(_)) && *self.peek2() == TokenKind::ColonEq {
+            let named = self.parse_named_expr();
+            self.expect(&TokenKind::RParen, "')'");
+            return named;
+        }
         let first = self.parse_display_elem();
         // A leading `*rest` forces a tuple display (#598): `(*rest)` cannot be a
         // grouping parenthesis.
@@ -3508,6 +3540,34 @@ impl Parser {
         } else {
             self.expect(&TokenKind::RParen, "')'");
             first
+        }
+    }
+
+    /// Parse a named (walrus) assignment-expression `name := expr` (#600). The
+    /// caller has already confirmed the `NAME :=` head (and consumes the
+    /// surrounding parentheses). `value` is a full expression; because the
+    /// walrus always lives inside parentheses, the closing `)` bounds it.
+    fn parse_named_expr(&mut self) -> Expr {
+        let start = self.peek_span().start;
+        let name_span = self.peek_span();
+        let name = match self.peek().clone() {
+            TokenKind::Ident(n) => {
+                self.bump();
+                n
+            }
+            _ => {
+                // Unreachable via the caller's guard, but recover defensively.
+                self.error_here(ErrorCode::ZAP2001, "expected a name before `:=`");
+                String::new()
+            }
+        };
+        self.expect(&TokenKind::ColonEq, "':='");
+        let value = self.parse_expr();
+        Expr::Named {
+            name,
+            name_span,
+            value: Box::new(value),
+            span: self.span_from(start),
         }
     }
 
@@ -4123,6 +4183,84 @@ mod tests {
         assert_eq!(clauses.len(), 2);
         assert_eq!(clauses[0].ifs.len(), 1);
         assert!(clauses[1].ifs.is_empty());
+    }
+
+    #[test]
+    fn named_expr_parses_in_condition_and_comprehension() {
+        // `while` condition: `(line := read()) != ""` is `Binary(Ne, Named, Str)`.
+        let m = parse_ok("def main():\n    while (line := read()) != \"\":\n        print(line)\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected function");
+        };
+        let Stmt::While { cond, .. } = &f.body.stmts[0] else {
+            panic!("expected while");
+        };
+        let Expr::Binary {
+            op: BinOp::Ne, lhs, ..
+        } = cond
+        else {
+            panic!("expected `!=` at the condition top");
+        };
+        let Expr::Named { name, value, .. } = lhs.as_ref() else {
+            panic!("expected a walrus on the left of `!=`");
+        };
+        assert_eq!(name, "line");
+        assert!(matches!(value.as_ref(), Expr::Call { .. }));
+
+        // `if` condition: `(n := len(xs)) > 10`.
+        let m = parse_ok("def main():\n    if (n := len(xs)) > 10:\n        print(n)\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected function");
+        };
+        let Stmt::If { branches, .. } = &f.body.stmts[0] else {
+            panic!("expected if");
+        };
+        let Expr::Binary {
+            op: BinOp::Gt, lhs, ..
+        } = &branches[0].0
+        else {
+            panic!("expected `>` at the condition top");
+        };
+        assert!(matches!(lhs.as_ref(), Expr::Named { name, .. } if name == "n"));
+
+        // Comprehension filter: `[y for x in xs if (y := f(x)) > 0]`.
+        let m = parse_ok("ys = [y for x in xs if (y := f(x)) > 0]\n");
+        let Item::Stmt(Stmt::Assign { value, .. }) = &m.items[0] else {
+            panic!("expected assignment");
+        };
+        let Expr::ListComp { clauses, .. } = value else {
+            panic!("expected a list comprehension");
+        };
+        assert_eq!(clauses[0].ifs.len(), 1);
+        let Expr::Binary { lhs, .. } = &clauses[0].ifs[0] else {
+            panic!("expected a comparison filter");
+        };
+        assert!(matches!(lhs.as_ref(), Expr::Named { name, .. } if name == "y"));
+
+        // A bare parenthesized named expression is a valid expression statement.
+        let m = parse_ok("def main():\n    (total := 0)\n");
+        let Item::Function(f) = &m.items[0] else {
+            panic!("expected function");
+        };
+        assert!(matches!(&f.body.stmts[0], Stmt::Expr(Expr::Named { .. })));
+    }
+
+    #[test]
+    fn bare_walrus_statement_is_rejected_steering_to_auto() {
+        // `a := 10` as a bare statement is not a declaration shorthand (#600
+        // non-goal); it is rejected with ZAP2020, which steers to `auto`.
+        let (_, perrs, lerrs) = parse_str("def main():\n    a := 10\n");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(
+            perrs.iter().any(|e| e.code == ErrorCode::ZAP2020),
+            "expected ZAP2020 (steer to `auto`), got {perrs:?}"
+        );
+        assert!(
+            perrs
+                .iter()
+                .any(|e| e.code == ErrorCode::ZAP2020 && e.message.contains("auto a =")),
+            "diagnostic should suggest `auto a = ...`, got {perrs:?}"
+        );
     }
 
     #[test]

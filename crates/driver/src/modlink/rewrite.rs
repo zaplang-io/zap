@@ -381,6 +381,9 @@ impl Rewriter<'_> {
                 }
             }
             Expr::Starred { value, .. } => self.expr(value, locals),
+            // `(name := value)` — rewrite the operand; the walrus target is a
+            // local binding (collected into `locals`), so it is never mangled.
+            Expr::Named { value, .. } => self.expr(value, locals),
             Expr::Dict(items, _) => {
                 for it in items {
                     match it {
@@ -867,6 +870,11 @@ fn collect_expr_bindings(e: &Expr, s: &mut HashSet<String>) {
             }
         }
         Expr::Starred { value, .. } => collect_expr_bindings(value, s),
+        // `(name := value)` introduces the local binding `name` (#600).
+        Expr::Named { name, value, .. } => {
+            s.insert(name.clone());
+            collect_expr_bindings(value, s);
+        }
         Expr::Dict(items, _) => {
             for it in items {
                 match it {

@@ -3229,3 +3229,58 @@ alias, exercised end-to-end under the full-codegen CI jobs), sema positive tests
 negative tests (`ZAP4090` for direct, indirect, and self cycles), mono tests
 (erasure + expansion + generic-struct monomorphization), parser accept/soft-
 keyword tests, and a fmt round-trip test on host.
+
+## D-0106 — Walrus assignment-expression `(name := expr)` (I#600)
+**Status:** Locked — adds a bind-and-yield expression; deliberately not a declaration shorthand.
+
+Part of the CPython grammar-parity pass (epic #614, decision D8). Zap gains the
+Python (PEP 572) walrus assignment-expression: `(name := expr)` evaluates `expr`
+exactly once, binds `name` by inference (like `auto`) in the lexically
+**enclosing** scope, and itself evaluates to the value. It is the one capability
+`auto` cannot express — a binding introduced in a position where a statement
+cannot go — so it unlocks the idioms `auto` could not:
+
+```python
+while (line := read()) != "":     # read() once per iteration; `line` live after
+    use(line)
+if (n := len(xs)) > 10:           # `n` usable in the body and after the `if`
+    print(n)
+kept = [y for x in xs if (y := f(x)) > 0]   # `y` binds in the enclosing scope
+```
+
+**Surface — parenthesized only.** `:=` is lexed as a new `ColonEq` token and the
+walrus is parsed **only** inside a parenthesized group, `"(" IDENT ":=" expr ")"`
+(grammar `named_expression`). That one form is what reaches every required
+position — an `if`/`while` condition and a comprehension `if` filter are all
+expression positions — and it sidesteps Python's surprising `:=` precedence
+(`(line := read()) != ""` binds `line` to the line, not to the comparison). The
+operand is a full expression, bounded by the closing `)`.
+
+**Not a declaration (the non-goal).** A bare statement `a := 10` is rejected at
+parse time with **ZAP2020**, whose message steers to `auto a = 10`. Making `:=`
+a general declaration shorthand would duplicate `auto` and fight the single
+type-first/`auto` declaration form (D-0003); the walrus is strictly the
+bind-and-yield expression, nothing more.
+
+**Scope — enclosing, not local.** In an `if`/`while` condition the binding lands
+in the current (enclosing) block scope, because the condition is checked and
+lowered before the body's own scope is entered, so the name outlives the
+construct with no special handling. In a comprehension the target binds in the
+scope containing the **outermost** comprehension (PEP 572), not in the
+comprehension's per-clause iteration scope: sema declares it below the
+comprehension scopes, and lowering allocates the slot in the enclosing frame
+(the alloca is hoisted to the entry block, #91, so it dominates both the
+comprehension body and later reads). The loop variable `x` stays local to the
+comprehension; only the walrus target leaks, matching Python.
+
+**Evaluated once.** Each textual walrus is lowered exactly once (an `if`/`while`
+condition block and a comprehension loop body are each emitted once and
+re-executed at runtime), so a loop reuses the single slot created for the name —
+`read()`/`f(x)` run once per evaluation, never twice.
+
+Verified by the `walrus` golden (all three positions end-to-end under the
+full-codegen CI jobs, with an eval-count proof of once-per-iteration), a
+`tests/diff` CPython differential case, a `tests/conformance` case (claim
+WAL-1), parser accept tests and a parser reject test (ZAP2020 → `auto`), sema
+positive tests (visible-after in all three positions, value-type flow) and a
+sema negative test, and a fmt round-trip test on host.

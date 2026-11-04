@@ -1398,6 +1398,17 @@ impl Walk {
                 }
             }
             Expr::Starred { value, .. } => self.expr(value),
+            // `(name := value)` — walk the operand, then bind the walrus target
+            // as a local at its own name span (#600).
+            Expr::Named {
+                name,
+                name_span,
+                value,
+                ..
+            } => {
+                self.expr(value);
+                self.bind(name.clone(), *name_span, SymbolKind::Local);
+            }
             Expr::Dict(items, _) => {
                 for it in items {
                     match it {
@@ -1538,6 +1549,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::RegexSubst { span, .. }
         | Expr::ChanRecv { span, .. }
         | Expr::Yield { span, .. }
-        | Expr::IfElse { span, .. } => *span,
+        | Expr::IfElse { span, .. }
+        | Expr::Named { span, .. } => *span,
     }
 }
