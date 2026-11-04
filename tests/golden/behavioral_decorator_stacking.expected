@@ -1,0 +1,6 @@
+outer before
+inner before
+compute body
+inner after 10
+outer after 10
+final 10

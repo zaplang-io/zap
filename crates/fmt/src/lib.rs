@@ -469,8 +469,37 @@ impl<'a> Printer<'a> {
             format!("({})", param_pieces(&d.params).join(", "))
         };
         self.push_line(&format!("decorator {}{params}:", d.name));
-        self.take_header_trailing(d.body.span.start);
-        self.emit_block(&d.body);
+        self.take_header_trailing(d.body_span.start);
+        // The body holds `before`/`after`/`wrap` member hooks (D-0036), or is
+        // empty for a declared-only (`pass`) metadata decorator.
+        self.indent += 1;
+        self.block_fresh = true;
+        for m in &d.members {
+            self.advance_to(m.span.start, 1);
+            self.push_line(&format!("def {}({}):", m.name, m.params.join(", ")));
+            match &m.body {
+                Some(body) => {
+                    self.take_header_trailing(body.span.start);
+                    self.emit_block(body);
+                }
+                // A hook whose nested-`def` body is not yet parsed (the deferred
+                // `wrap` form, #653) has no statements to re-emit; keep the output
+                // syntactically valid. No such decorator reaches the fmt gate.
+                None => {
+                    self.indent += 1;
+                    self.push_line("pass");
+                    self.indent -= 1;
+                    self.last_end = m.span.end;
+                }
+            }
+        }
+        if d.members.is_empty() {
+            self.push_line("pass");
+            self.last_end = d.body_span.end;
+        }
+        self.flush_dangling(d.body_span.end);
+        self.indent -= 1;
+        self.block_fresh = false;
     }
 
     /// Emit the members of a struct/enum/annotation body in source order.

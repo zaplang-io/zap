@@ -3350,3 +3350,94 @@ sole-call-argument) and parser tests pinning that a grouping paren and a tuple
 are **not** genexprs, sema positive tests (iterator binding, `sum`, `for`-header)
 and a sema negative test (loop variable does not leak), and a fmt round-trip
 test on host.
+## D-0108 — User-defined behavioral decorators: `before`/`after`/`wrap` engine (epic #651)
+**Status:** `before`/`after` convenience form **Locked + implemented** (#652); `wrap(call)` general form **Accepted (design)**, implemented separately (#653).
+
+Completes the "deferred user-macro piece" of D-0036: a `decorator` body may now
+declare behavioral hooks whose code is **generated around the decorated target
+at compile time** (not a runtime rebinding), rather than only attaching
+reflection metadata (D-0087) or registering via a dotted call.
+
+**Two forms.** A behavioral `decorator` declares either the convenience pair
+`before(ctx)` / `after(ctx, result)`, or the general `wrap(call)` returning a
+replacement callable:
+
+```python
+decorator traced:
+    def before(ctx):
+        print("enter", ctx.name)
+    def after(ctx, result):
+        print("exit", ctx.name, result)
+
+@traced
+def add(int64 a, int64 b) -> int64:
+    return a + b
+```
+
+**Expansion model (compile-time, before sema).** Like the registering-decorator
+desugar (D-0087), a whole-program AST pass runs **before type-checking**, so the
+generated code is checked and `zap expand`-visible like hand-written code. The
+`before`/`after` form renames the decorated function to `<name>$orig` and emits
+a wrapper carrying the **exact original signature** that runs `before`, calls
+`<name>$orig`, runs `after` on the captured return value, and returns it:
+
+```python
+def add$orig(int64 a, int64 b) -> int64: ...
+def add(int64 a, int64 b) -> int64:        # identical signature
+    print("enter", "add")                  # before; ctx.name -> literal
+    int64 $result = add$orig(a, b)          # arguments thread through
+    print("exit", "add", $result)          # after; result -> captured value
+    return $result
+```
+
+Synthetic `$`-suffixed names cannot collide with source identifiers (the lexer
+admits no `$`), the same device D-0087/D-0092 use.
+
+**Signature preservation ("`@wraps` is automatic").** Because the wrapper is
+emitted with the decorated function's own parameter list and return type,
+callers, overload resolution and tooling see an unchanged function — there is no
+hand-copying of name/doc and no runtime signature loss. This is the chosen
+answer to D-0036's open "how does `*args` `inner` interact with the static
+signature": **the `wrap(call)` `inner(*args)` is a typed forwarding template,
+not a runtime varargs value** (#653). `inner` is specialized to the decorated
+function's concrete signature; `call(*args)` expands to a typed call of
+`<name>$orig` passing exactly the decorated function's parameters (a variadic
+collector re-splats, a `**kwargs` collector re-maps, a keyword-only parameter is
+passed by name). The generated wrapper again carries the decorated function's
+exact signature, so the automatic-`@wraps` contract holds for the general form
+too.
+
+**Context.** `ctx` exposes exactly one field, `ctx.name` — the decorated
+function's name, substituted to a string literal. Any other use of `ctx` is a
+stable error (ZAP5053).
+
+**Stacking.** Decorators apply **bottom-up** (Python's `a(b(f))`): the chain is
+built `f -> f$deco1 -> f$orig`, so hooks fire `a.before`, `b.before`, body,
+`b.after`, `a.after`.
+
+**Arguments.** A decorator's own parameters (`decorator retry(int64 times)`) are
+bound, at the decoration site, to synthetic locals the hook bodies reference,
+matching supplied `@retry(times=3)` arguments positionally then by keyword.
+
+**Declared-only vs behavioral.** A `decorator` with a `pass` body stays a
+declared metadata-only decorator (reflectable, D-0087) and is left untouched.
+Only a decorator that declares hooks is expanded.
+
+**Diagnostics (stable).** ZAP5049 unknown hook (not `before`/`after`/`wrap`);
+ZAP5050 behavioral decorator on an unsupported target (only free functions in
+this slice); ZAP5051 hook wrong arity; ZAP5052 the `wrap` form not generated yet
+(#653); ZAP5053 invalid application (missing/extra decorator argument, `after`'s
+`result` on a void function, or `ctx` used other than `ctx.name`).
+
+**Limits (accepted, follow-ups).** As with the registering desugar (D-0087), the
+expansion runs only on the compile path, so LSP/MCP `check_source` do not yet
+surface the behavioral diagnostics; and only free top-level functions are
+supported (methods/fields/structs/enums/params are ZAP5050). The general
+`wrap(call)` form is #653.
+
+Verified by driver unit tests (expansion shape, `ctx.name` substitution,
+bottom-up stacking, decorator arguments, deferred-`wrap`, unknown-hook,
+unsupported-target, declared-only untouched), `before`/`after`/stacking/
+arguments/exception-propagation goldens (end-to-end under the full-codegen CI
+jobs), and a `zap fmt` round-trip of the decorator surface. See
+`design/0004-decorators.md`.

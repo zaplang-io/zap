@@ -1865,12 +1865,131 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let body = self.parse_block();
+        // The body is either `pass` (a declared-only metadata decorator, D-0087)
+        // or a sequence of `before`/`after`/`wrap` member hooks (D-0036). Unlike
+        // a struct body these hooks take untyped macro bindings, so they are not
+        // parsed as ordinary `def`s — see `parse_decorator_member`.
+        let body_start = self.peek_span().start;
+        self.expect(&TokenKind::Colon, "':'");
+        self.expect(&TokenKind::Newline, "newline");
+        self.expect(&TokenKind::Indent, "indented block");
+        let mut members = Vec::new();
+        while !self.is(&TokenKind::Dedent) && !self.at_eof() {
+            let before = self.pos;
+            // A bare `pass` is the explicit spelling of an empty (declared-only)
+            // decorator body, mirroring the empty-struct case (#591).
+            if matches!(self.peek(), TokenKind::Ident(n) if n == "pass")
+                && matches!(
+                    self.peek2(),
+                    TokenKind::Newline | TokenKind::Dedent | TokenKind::Eof
+                )
+            {
+                self.bump();
+                self.expect(&TokenKind::Newline, "newline after 'pass'");
+                continue;
+            }
+            if self.is_kw(Keyword::Def) {
+                members.push(self.parse_decorator_member());
+            } else {
+                self.error_here(
+                    ErrorCode::ZAP2008,
+                    "expected a `before`/`after`/`wrap` hook (a `def`) or `pass` in a decorator body",
+                );
+                self.bump();
+            }
+            if self.pos == before {
+                self.bump();
+            }
+        }
+        self.expect(&TokenKind::Dedent, "end of block");
         DecoratorDef {
             name,
             params,
-            body,
+            members,
+            body_span: self.span_from(body_start),
             span: self.span_from(start),
+        }
+    }
+
+    /// Parse one `before`/`after`/`wrap` member hook of a behavioral decorator.
+    /// The hook's parameters are untyped macro bindings (`ctx`, `result`,
+    /// `call`), not type-first Zap parameters, so they are read as plain names.
+    ///
+    /// A hook whose body is a nested `def` (the `wrap(call)` → `def inner(...)`
+    /// form) is parsed shape-only in this slice: the nested body is consumed
+    /// without being turned into statements and `body` is left `None`, so the
+    /// decorator-expansion pass can report a stable "deferred" diagnostic (#653).
+    fn parse_decorator_member(&mut self) -> DecoratorMember {
+        let start = self.peek_span().start;
+        self.expect_kw(Keyword::Def, "'def'");
+        let name = self.ident("decorator hook name");
+        self.expect(&TokenKind::LParen, "'('");
+        let mut params = Vec::new();
+        if !self.is(&TokenKind::RParen) {
+            loop {
+                // Tolerate `*name` / `**name` so a `wrap` inner-forwarding shape
+                // (`def inner(*args)`) still parses its parameter name.
+                let _ = self.eat(&TokenKind::Star) || self.eat(&TokenKind::StarStar);
+                params.push(self.ident("decorator hook parameter"));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                if self.is(&TokenKind::RParen) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::RParen, "')'");
+        self.expect(&TokenKind::Colon, "':'");
+        self.expect(&TokenKind::Newline, "newline");
+        self.expect(&TokenKind::Indent, "indented block");
+        // A nested-`def` body is the `wrap(call)` form; defer it (#653).
+        if self.is_kw(Keyword::Def) {
+            self.skip_balanced_block();
+            return DecoratorMember {
+                name,
+                params,
+                body: None,
+                span: self.span_from(start),
+            };
+        }
+        let body_start = self.peek_span().start;
+        let mut stmts = Vec::new();
+        while !self.is(&TokenKind::Dedent) && !self.at_eof() {
+            let before = self.pos;
+            self.parse_line(&mut stmts);
+            if self.pos == before {
+                self.error_here(
+                    ErrorCode::ZAP2008,
+                    "unexpected token in decorator hook body",
+                );
+                self.bump();
+            }
+        }
+        self.expect(&TokenKind::Dedent, "end of block");
+        DecoratorMember {
+            name,
+            params,
+            body: Some(Block {
+                stmts,
+                span: self.span_from(body_start),
+            }),
+            span: self.span_from(start),
+        }
+    }
+
+    /// Consume tokens up to and including the `Dedent` that closes the block
+    /// whose opening `Indent` the caller has already consumed. Nested
+    /// `Indent`/`Dedent` pairs are balanced. Used to skip a deferred hook body.
+    fn skip_balanced_block(&mut self) {
+        let mut depth = 1usize;
+        while depth > 0 && !self.at_eof() {
+            match self.peek() {
+                TokenKind::Indent => depth += 1,
+                TokenKind::Dedent => depth -= 1,
+                _ => {}
+            }
+            self.bump();
         }
     }
 

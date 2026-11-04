@@ -1073,13 +1073,28 @@ struct User:
 ```
 
 **Decorators** — behavioral / generative (`before`/`after` or general `wrap`;
-may take arguments):
+may take arguments). A `decorator` body declares hooks: the `before(ctx)` /
+`after(ctx, result)` convenience pair, or the general `wrap(call)`. `ctx`
+exposes `ctx.name` (the decorated function's name). Applying a behavioral
+decorator generates a wrapper **with the decorated function's exact signature
+preserved** (the "`@wraps` is automatic" contract) at compile time, visible via
+`zap expand` (D-0108, epic #651):
 
 ```python
-@retry(times=3)
+decorator traced:
+    def before(ctx):
+        print("enter", ctx.name)
+    def after(ctx, result):
+        print("exit", ctx.name, result)
+
+@traced
 def fetch(str url) -> str:
     ...
 ```
+
+The general `wrap(call)` form — a nested `def inner(...)` returning a
+replacement callable, e.g. `@retry(times=3)` — is tracked by #653; the
+`before`/`after` form is available now.
 
 **Field decorators** — construction-time defaults (per-instance), validation,
 and derive-driven codegen (pydantic-style, zero runtime cost):

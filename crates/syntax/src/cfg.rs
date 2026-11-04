@@ -206,7 +206,11 @@ fn resolve_in_enum(e: &mut EnumDef, target: &Target) {
 }
 
 fn resolve_in_decorator(d: &mut DecoratorDef, target: &Target) {
-    resolve_stmts(&mut d.body.stmts, target);
+    for m in &mut d.members {
+        if let Some(body) = &mut m.body {
+            resolve_stmts(&mut body.stmts, target);
+        }
+    }
 }
 
 /// Resolve cfg in a list of statements: expand each [`Stmt::Cfg`] in place and

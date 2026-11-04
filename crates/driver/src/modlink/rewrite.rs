@@ -79,7 +79,11 @@ impl Rewriter<'_> {
                         self.ty(t, &tl);
                     }
                 }
-                self.block(&mut d.body, &locals, &tl);
+                for m in &mut d.members {
+                    if let Some(body) = &mut m.body {
+                        self.block(body, &locals, &tl);
+                    }
+                }
             }
             // A top-level statement. Executable ones are rejected before the
             // merge (ZAP3016/ZAP3014 in `check_toplevel_statements`, ticket
@@ -600,7 +604,14 @@ fn decorator_bindings(d: &zapc_syntax::ast::DecoratorDef) -> HashSet<String> {
     for p in &d.params {
         s.insert(p.name.clone());
     }
-    collect_block_bindings(&d.body, &mut s);
+    for m in &d.members {
+        for p in &m.params {
+            s.insert(p.clone());
+        }
+        if let Some(body) = &m.body {
+            collect_block_bindings(body, &mut s);
+        }
+    }
     s
 }
 

@@ -1,0 +1,4 @@
+enter add
+body 2 3
+exit add 5
+result 5

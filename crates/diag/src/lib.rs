@@ -513,6 +513,28 @@ define_codes! {
          top-level function, each provider parameter must itself be \
          `Depends(...)` (request-derived dependencies are not injected in v1), \
          and the dependency graph must be acyclic.";
+    ZAP5049 = 5049 : "unknown decorator hook",
+        "A behavioral `decorator` body may declare only `before(ctx)`, \
+         `after(ctx, result)`, and/or `wrap(call)` hooks (D-0036). Any other \
+         `def` in the body is not a recognized hook.";
+    ZAP5050 = 5050 : "behavioral decorator on unsupported target",
+        "A behavioral (`before`/`after`/`wrap`) decorator generates code around a \
+         free `def`. Applying one to a struct, field, method, enum, or parameter \
+         is not supported yet (epic #651); use a built-in or a declared \
+         metadata-only decorator there.";
+    ZAP5051 = 5051 : "decorator hook has the wrong parameters",
+        "`before` takes one parameter (`ctx`); `after` takes two (`ctx, \
+         result`). The declared hook's parameter count does not match (D-0036).";
+    ZAP5052 = 5052 : "decorator form not implemented yet",
+        "The general `wrap(call)` behavioral-decorator form (a nested \
+         `def inner(...)` returning a replacement callable) is not generated yet \
+         — it is tracked as its own slice of epic #651 (#653). The \
+         `before`/`after` convenience form is available now.";
+    ZAP5053 = 5053 : "invalid behavioral decorator application",
+        "A behavioral decorator could not be expanded: its arguments do not match \
+         the `decorator`'s parameters, an `after(ctx, result)` hook was applied to \
+         a function that returns nothing, or a hook used `ctx` other than as \
+         `ctx.name` (the only context field exposed, D-0036).";
     ZAP5060 = 5060 : "generator tier-1 enum method not supported",
         "Generators on a tier-1 (unboxed-integer) enum method are not supported \
          yet — tier-1 enum methods do not lower at all yet, generator or not. \
