@@ -3514,3 +3514,77 @@ pinning the `wrap` AST shape, `before`/`after`/stacking/arguments/exception and
 `wrap` retry/threading/stacking/void/negative goldens (end-to-end under the
 full-codegen CI jobs), and `zap fmt` round-trips of both decorator surfaces. See
 `design/0004-decorators.md`.
+
+## D-0109 — built-in decorators completion: `@deprecated` implemented; `@cache`/`@inject` reclassified/deferred (I#472)
+
+Closes the remaining built-in-decorator work of epic #469 / I#472, completing
+D-0036's locked set. Of the three function/variable-group built-ins the field
+group (D-0101) left deferred, one is now implemented and two are
+reclassified/deferred out of the advertised v1 set, with clean coded
+diagnostics. The issue's "Done when" is satisfied per built-in: each is either
+implemented-with-coverage or reclassified in the spec + stability table.
+
+**`@deprecated(msg?)` — implemented (function/method decorator).** It generates
+no code; the decorated body lowers unchanged. Instead it emits a **non-fatal
+use-site warning (ZAP5124)** at **every call site** of the decorated function or
+method, carrying an optional message (`@deprecated("use X")`). This is exactly
+the mechanism STABILITY.md §5 already names for retiring a Stable surface with
+notice before a MAJOR removal.
+
+- Target is restricted to a function/method (sema `require_target`, ZAP5047);
+  deprecating a type/field/parameter has no well-defined v1 use site and is
+  deferred. The message must be a single positional string literal (ZAP5042).
+- Sema records `@deprecated` callables (free function by name, method by
+  `"Type.method"`) in `collect_sigs`, and `check_call` raises ZAP5124 at each
+  resolved call site — once per site, so N calls give N warnings.
+- **Warnings are now surfaced by the build pipeline.** `front_end_program`
+  previously called `zapc_sema::check` (errors only) and silently dropped all
+  warnings; it now calls `analyze` and prints warnings through the shared
+  renderer at a new `warning[ZAPnnnn]` severity (diag `render_diagnostic_sev`),
+  non-fatally (exit unchanged). This also surfaces, for the first time at the
+  CLI, the pre-existing `Eq`-without-`Hash` dict/set-key warning (D-0047).
+- `zap expand`: nothing to show (no generated code); `zap` build/run still
+  compiles and runs the program, warning on stderr.
+
+**`@cache` — reclassified/deferred.** Memoization by argument tuple needs
+**module-level persistent (static) state**, which is **not yet a language
+feature** (module-level executable statements are rejected, ZAP3014/ZAP3016; no
+globals/statics). A `zap expand`-visible, type-checked implementation is
+therefore impossible without that feature; a hidden codegen-level static store
+would be a language-bypassing workaround (against the language-first policy) and
+would not be inspectable type-checked Zap code. The SPEC already notes an
+`args`-keyed `@cache`/`memoize` is **not expressible** via the user-level `wrap`
+form either (it is precisely the "separate capability" `wrap` lacks). `@cache`
+is removed from the advertised v1 built-in set, marked **Deferred** in
+STABILITY, and rejected cleanly at sema with the dedicated **ZAP5055** ("built-in
+decorator not available in this version"); the name stays reserved so the
+dedicated message fires rather than "unknown decorator". A future `@cache` is
+gated on first adding module-level persistent state as a language feature (filed
+as prerequisite language issue **#658**).
+
+**`@inject` — reclassified/deferred.** `@inject` is a DI-framework hook; core
+Zap has **no DI container/registry**, and the concrete FastAPI-style
+`Depends(...)` per-parameter-injection need was already met **at the framework
+level** by the reflection-driven handler adapter (D-0092, I#466), composing
+signature reflection (D-0089). A core-language `@inject` has no additional,
+well-defined v1 semantics, so building one would be speculative. It is removed
+from the advertised v1 set, marked **Deferred** in STABILITY, and rejected
+cleanly at sema with ZAP5055 pointing at the reflection-driven `Depends(...)`
+mechanism.
+
+**Net spec surface.** The advertised v1 built-in set becomes `@derive(...)`,
+`@default`, `@validate`, `@range`, `@deprecated`. `@cache` and `@inject` are
+documented as deferred with their prerequisites. `BUILTIN_DECORATORS` keeps all
+three names reserved (so applications get a dedicated diagnostic, not a typo
+error); `DEFERRED_BUILTINS` in lowering now holds only the field group
+(`default`/`validate`/`range`) for their non-field-target guard, and
+`@deprecated` lowers as a recognized no-op.
+
+Verified by sema unit tests (free-function and method call-site warning,
+message variant, one-warning-per-site, non-deprecated silence, stacking with a
+reflection annotation, wrong-target and bad-message rejection, `@cache`/`@inject`
+ZAP5055 reclassification), an ir lowering test (`@deprecated` lowers with no
+wrapper), a diag render test (warning severity header), a driver `error_codes`
+test (ZAP5055 / ZAP5047), and the `builtin_deprecated` end-to-end golden (the
+program builds and runs; warnings on stderr) under the full-codegen CI jobs. See
+`design/0004-decorators.md`, SPEC.md and STABILITY.md §5.

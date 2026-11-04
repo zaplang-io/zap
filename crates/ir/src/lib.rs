@@ -1393,14 +1393,36 @@ mod tests {
 
     #[test]
     fn deferred_builtins_error() {
-        // Built-ins in the locked set but not yet generated report cleanly.
-        // `@cache`/`@deprecated`/`@inject` remain a follow-up slice (#472).
-        let src = "@cache\ndef f() -> int64:\n    return 1\n\ndef main():\n    print(f())\n";
+        // A field decorator applied to a *non-field* target stays deferred at
+        // lowering (sema's target check gates the normal path; this is the
+        // belt-and-suspenders lowering guard). `@cache`/`@inject` no longer reach
+        // lowering at all — they are rejected at sema (ZAP5055, I#472/D-0109).
+        let src = "@validate(max_len=1)\ndef f() -> int64:\n    return 1\n\ndef main():\n    print(f())\n";
         let (ast, _p, _l) = parse_str(src);
         let (_m, errs) = lower_module(&ast);
         assert!(
             !errs.is_empty(),
             "expected a deferred-feature error for:\n{src}"
+        );
+    }
+
+    #[test]
+    fn deprecated_lowers_as_noop() {
+        // `@deprecated` (I#472, D-0109) is a sema-only use-site warning; the
+        // decorated function/method body lowers unchanged, with no error and no
+        // generated wrapper.
+        let src = "@deprecated(\"use g\")\ndef f() -> int64:\n    return 1\n\n\
+                   struct S:\n    int64 x\n\n    \
+                   @deprecated\n    def legacy(self) -> int64:\n        return self.x\n\n\
+                   def main():\n    print(f())\n";
+        let (ast, _p, _l) = parse_str(src);
+        let (m, errs) = lower_module(&ast);
+        assert!(errs.is_empty(), "deprecated must lower cleanly: {errs:?}");
+        // The original function is present and unwrapped (no `f$orig`/`f$…`).
+        assert!(m.funcs.iter().any(|f| f.name == "f"));
+        assert!(
+            !m.funcs.iter().any(|f| f.name.contains('$')),
+            "no wrapper functions should be synthesized for @deprecated"
         );
     }
 

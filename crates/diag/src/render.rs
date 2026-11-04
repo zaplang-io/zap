@@ -109,9 +109,42 @@ pub fn render_diagnostic(
     message: &str,
     span: Option<(u32, u32)>,
 ) -> String {
+    render_diagnostic_sev(Severity::Error, src, file, code, message, span)
+}
+
+/// Diagnostic severity for the rendered header label (`error[...]` vs
+/// `warning[...]`). Severity is orthogonal to the code (a given `ZAPnnnn` may in
+/// principle be reported at either), so it is carried alongside the code rather
+/// than baked into it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+impl Severity {
+    fn label(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        }
+    }
+}
+
+/// Like [`render_diagnostic`] but with an explicit [`Severity`], so a non-fatal
+/// warning renders as `warning[CODE]` in the same three-line form (I#472).
+pub fn render_diagnostic_sev(
+    severity: Severity,
+    src: Option<&str>,
+    file: &str,
+    code: ErrorCode,
+    message: &str,
+    span: Option<(u32, u32)>,
+) -> String {
+    let sev = severity.label();
     let (src, (start, end)) = match (src, span) {
         (Some(src), Some(span)) => (src, span),
-        _ => return format!("{file}: error[{code}]: {message}"),
+        _ => return format!("{file}: {sev}[{code}]: {message}"),
     };
 
     let index = LineIndex::new(src);
@@ -119,7 +152,7 @@ pub fn render_diagnostic(
     let end = clamp_to_boundary(src, end.min(index.len)).max(start);
     let (line, col) = index.line_col(src, start);
 
-    let mut out = format!("{file}:{line}:{col}: error[{code}]: {message}");
+    let mut out = format!("{file}:{line}:{col}: {sev}[{code}]: {message}");
 
     // Underneath the header, echo the offending line and underline the span,
     // clipped to that line (a span that runs onto later lines underlines only
@@ -205,6 +238,25 @@ mod tests {
         // Underline just 'd' (byte 6..7) -> column 3, single caret.
         let got = render_diagnostic(Some(src), "f.zap", CODE, "oops", Some((6, 7)));
         assert_eq!(got, "f.zap:2:3: error[ZAP1006]: oops\ncαd\n  ^");
+    }
+
+    #[test]
+    fn warning_severity_labels_the_header() {
+        // A non-fatal diagnostic renders `warning[CODE]` in the same form (I#472).
+        let src = "ab\ncαd\n";
+        let got = render_diagnostic_sev(
+            Severity::Warning,
+            Some(src),
+            "f.zap",
+            CODE,
+            "oops",
+            Some((6, 7)),
+        );
+        assert_eq!(got, "f.zap:2:3: warning[ZAP1006]: oops\ncαd\n  ^");
+        // And degrades to the header-only form without a span.
+        let no_span =
+            render_diagnostic_sev(Severity::Warning, Some(src), "f.zap", CODE, "oops", None);
+        assert_eq!(no_span, "f.zap: warning[ZAP1006]: oops");
     }
 
     #[test]

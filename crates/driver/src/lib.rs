@@ -119,6 +119,41 @@ fn report(reports: Vec<Report>) {
     }
 }
 
+/// Like [`format_reports`] but renders each diagnostic at warning severity
+/// (`warning[ZAPnnnn]`), for the non-fatal sema warnings surfaced by the build
+/// pipeline (I#472/D-0109).
+fn format_warnings(reports: Vec<Report>) -> Vec<String> {
+    let reports = zapc_diag::render::dedup_preserving(reports, |r| {
+        (r.file.clone(), r.code, r.span, r.message.clone())
+    });
+    let mut sources = SourceMap::default();
+    reports
+        .into_iter()
+        .map(|r| {
+            let src = if r.span.is_some() {
+                sources.source(&r.file)
+            } else {
+                None
+            };
+            zapc_diag::render::render_diagnostic_sev(
+                zapc_diag::render::Severity::Warning,
+                src,
+                &r.file,
+                r.code,
+                &r.message,
+                r.span,
+            )
+        })
+        .collect()
+}
+
+/// Render and print a batch of warnings to stderr.
+fn report_warnings(reports: Vec<Report>) {
+    for line in format_warnings(reports) {
+        eprintln!("{line}");
+    }
+}
+
 /// Run the whole-program front end: discover and link the local module import
 /// graph (I#283/D-0081) into one merged, qualified module, then type-check it.
 /// A single file with no local imports links to just itself, so the single-file
@@ -160,7 +195,14 @@ fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
         report(sema_reports(entry, beh_diags));
         return Err(ExitCode::from(1));
     }
-    let errs = zapc_sema::check(&module);
+    let (errs, warns) = zapc_sema::analyze(&module);
+    // Non-fatal warnings (e.g. a call to an `@deprecated` function, I#472/D-0109;
+    // the `Eq`-without-`Hash` dict/set-key warning, D-0047) are surfaced here but
+    // never fail the build. They print before the error batch so an error, if
+    // any, stays the last thing on stderr.
+    if !warns.is_empty() {
+        report_warnings(sema_reports(entry, warns));
+    }
     if !errs.is_empty() {
         report(sema_reports(entry, errs));
         return Err(ExitCode::from(1));

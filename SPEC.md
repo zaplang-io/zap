@@ -1123,7 +1123,8 @@ body is not provably return-terminating (e.g. `retry`'s loop), an implicit
 `raise RuntimeError(...)` fall-through guard is appended so the wrapper
 type-checks. A `wrap` stacks with other decorators bottom-up like any wrapper.
 (An `args`-keyed `memoize`/`@cache` is not expressible by `wrap`: it needs
-persistent cross-call state, a separate capability.)
+persistent cross-call state, a separate capability — which is why `@cache` is
+deferred, see below.)
 
 **Field decorators** — construction-time defaults (per-instance), validation,
 and derive-driven codegen (pydantic-style, zero runtime cost):
@@ -1138,8 +1139,20 @@ struct Signup:
 ```
 
 Multiple decorators stack bottom-up. `zap expand` shows the generated code.
-Built-ins (v1): `@cache`, `@derive(...)`, `@default`, `@validate`, `@range`,
-`@deprecated`, `@inject`.
+
+**Built-ins (v1):** `@derive(...)`, `@default`, `@validate`, `@range` (all
+compile-time code generation, D-0101) and **`@deprecated`** (I#472, D-0109).
+`@deprecated(msg?)` is a function/method decorator that generates no code but
+emits a non-fatal **use-site warning** (`ZAP5124`) at every call site of the
+decorated callable — the mechanism for retiring a Stable surface with notice
+(STABILITY.md §5). An optional message is appended (`@deprecated("use X")`).
+
+**Deferred (reclassified out of v1, I#472/D-0109):** `@cache` and `@inject`.
+`@cache` needs module-level persistent state, which is not yet a language
+feature (and is the "separate capability" the user-level `wrap` lacks, above);
+`@inject` is a DI-framework hook whose concrete `Depends(...)` need is met by
+reflection-driven handler adapters (D-0089/D-0092), not a core decorator. Both
+names stay reserved and are rejected with a dedicated diagnostic (`ZAP5055`).
 
 ## 17. Toolchain & CLI (D-0053)
 
