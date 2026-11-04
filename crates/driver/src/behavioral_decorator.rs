@@ -890,12 +890,17 @@ fn build_cache_wrapper(
             ));
             bad = true;
         } else if let Some(ty) = &p.ty {
-            if !type_is_hashable_key(ty) {
+            if !type_is_cache_key(ty) {
                 diags.push(err(
                     ErrorCode::ZAP5056,
                     format!(
-                        "@cache parameter '{}' of type `{}` is not a hashable cache key \
-                         (#666): collections and bare tuples cannot be dict keys",
+                        "@cache parameter '{}' of type `{}` cannot be a cache key in v1 \
+                         (#666): the key must be an integer, `bool`, or `str`. A reference \
+                         type (a `struct`/`enum`, or a collection) would be keyed by identity, \
+                         not value — two equal-but-distinct arguments would never hit, so the \
+                         cache would silently give no benefit — and `float`/`bytes` are not \
+                         value-hashable keys. Key on a scalar/str id instead, or memoize by \
+                         hand over a module-level dict",
                         p.name,
                         type_display(ty)
                     ),
@@ -1141,16 +1146,35 @@ fn forwarding_wrapper(
     }
 }
 
-/// Whether a parameter type can serve as a dict key (hashable). A collection
-/// (`list`/`dict`/`set`), a bare tuple, or a function value cannot; everything
-/// else (scalars, `str`, `bytes`, enums, user structs) is accepted — a user
-/// struct without a hash surfaces as the usual `@derive(Hash)` requirement on
-/// the generated key-struct.
-fn type_is_hashable_key(ty: &Type) -> bool {
-    match ty {
-        Type::Named { name, .. } => !matches!(name.as_str(), "list" | "dict" | "set"),
-        Type::Tuple { .. } | Type::Func { .. } => false,
-    }
+/// Whether a parameter type can serve as a `@cache` key in v1 — the
+/// **value-hashable** primitives the generated key-struct's `@derive(Hash, Eq)`
+/// actually supports as fields: integers, `bool`, and `str` (`str` is a
+/// reference but is hashed/compared by content). Everything else is rejected
+/// (ZAP5056) rather than left to produce a misleading result or a leaked-
+/// internal error:
+///
+/// - A **reference type** — a user `struct`/`enum`, or a collection — would be
+///   keyed by **identity**, not value, so two equal-but-distinct arguments would
+///   miss and the cache would silently give no benefit; and `@derive(Hash, Eq)`
+///   cannot even hash such a field by value today, so the generated key-struct
+///   would otherwise fail with an internal-looking error about `<fn>$Key`.
+/// - `float`/`bytes`/`char`/`complex`/`bigint`, a bare tuple, an optional, and a
+///   function value are likewise not value-hashable keys here.
+///
+/// An allowlist (not a denylist) is used deliberately: a user struct/enum name
+/// is an arbitrary identifier, so only an allowlist can reject reference keys
+/// reliably. A type that is value-hashable but not yet listed (e.g. an enum) is
+/// a safe, clear false-negative, not a silent miscompile.
+fn type_is_cache_key(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Named { name, args, .. }
+            if args.is_empty()
+                && matches!(
+                    name.as_str(),
+                    "int" | "int64" | "i64" | "int32" | "i32" | "bool" | "str"
+                )
+    )
 }
 
 /// A compact rendering of a parameter type for the ZAP5056 message.
@@ -2315,6 +2339,14 @@ mod tests {
     fn cache_rejects_unmemoizable_signatures() {
         // Non-hashable (collection) parameter.
         cache_rejects("@cache\ndef f(list[int64] xs) -> int64:\n    return 0\n");
+        // A reference struct would be keyed by identity, not value — rejected so
+        // the "silently no cache hits" footgun is a clean compile error, not a
+        // leaked-internal `$Key` error (#666 review).
+        cache_rejects("struct P:\n    int64 x\n@cache\ndef f(P p) -> int64:\n    return p.x\n");
+        // `float` is not a value-hashable key.
+        cache_rejects("@cache\ndef f(float64 x) -> int64:\n    return 0\n");
+        // `bytes` is not accepted as a key in v1.
+        cache_rejects("@cache\ndef f(bytes b) -> int64:\n    return 0\n");
         // No return value to store.
         cache_rejects("@cache\ndef f(int64 n):\n    print(n)\n");
         // No parameter to key on.

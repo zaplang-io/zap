@@ -38,9 +38,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   or computes-and-stores a miss. The miss is computed **outside** the lock, so a
   recursive `@cache` function cannot self-deadlock; the lock guards only the dict,
   like `functools.lru_cache`. v1 is unbounded for the process lifetime (a
-  documented memory cost). An un-memoizable signature — a non-hashable,
-  variadic/`**kwargs`, zero-parameter, generic, or no-return function, a method,
-  or any `@cache` argument — is a stable **ZAP5056** error (never an ICE). The
+  documented memory cost). The key must be **value-hashable** — an integer,
+  `bool`, or `str` in v1; a **reference type** (a `struct`/`enum` or a
+  collection) is a **compile error (ZAP5056)**, not silently keyed by identity
+  (which would miss on equal-but-distinct arguments and give no benefit). An
+  un-memoizable signature — a non-value-hashable parameter (reference,
+  `float`/`bytes`, tuple, …), a variadic/`**kwargs`, zero-parameter, generic, or
+  no-return function, a method, or any `@cache` argument — is a stable
+  **ZAP5056** error (never an ICE). The
   sema `@cache` arm no longer rejects with ZAP5055 (that was the deferral); it now
   only catches misapplication to a non-function target.
 - **Runtime data-race detector surface: `--race`** — the *dynamic* backstop for

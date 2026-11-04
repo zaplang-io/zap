@@ -1299,9 +1299,12 @@ function cannot self-deadlock, and recursion goes through the memoizing wrapper)
 the lock guards only the dict bookkeeping, matching `functools.lru_cache`. v1
 takes no arguments and is **unbounded for the process lifetime** — a documented
 memory cost, since the global is an immortal GC root (D-0115), not an eviction
-policy. Every parameter must be hashable and the function must return a value,
-or it is a stable error (`ZAP5056`); `@cache` is a free-function decorator in v1
-and stacks bottom-up with other decorators.
+policy. The key must be **value-hashable**: in v1 every parameter is an integer,
+`bool`, or `str`. A **reference type** (a `struct`/`enum`, or a collection) is
+**rejected** (`ZAP5056`), not silently keyed by identity — identity keying would
+miss on equal-but-distinct arguments and give no benefit while looking correct.
+The function must also return a value, and `@cache` is a free-function decorator
+in v1; otherwise `ZAP5056`. It stacks bottom-up with other decorators.
 
 **Not in the v1 set (I#472/D-0109):** `@inject` is **declined for core** —
 dependency injection is a framework concern, served by reflection-driven

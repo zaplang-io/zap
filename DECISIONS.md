@@ -4241,11 +4241,26 @@ Zap — **never a hidden compiler store** (a hard project rule):
 - a wrapper with `f`'s exact signature: build the key, lock, return a hit;
   otherwise unlock, compute `f$orig(...)`, lock, insert, unlock, return.
 
-**Key (hashability).** The key is the argument tuple. Every parameter type must
-be hashable (usable as a dict key); a collection (`list`/`dict`/`set`), a bare
-tuple, a function value, or a variadic/`**kwargs` collector is rejected, as is a
-zero-parameter, no-return, or generic function and any `@cache` argument — all
-with the dedicated **ZAP5056** diagnostic, never an ICE.
+**Key (value-hashability).** The key is the argument tuple, and it must be
+**value-hashable**. In v1 every parameter must be an **integer, `bool`, or
+`str`** — the exact set the generated key-struct's `@derive(Hash, Eq)` hashes by
+*value* (`str` is a reference but is hashed/compared by content). A **reference
+type** — a user `struct`/`enum`, or a collection — is **rejected** (not keyed by
+identity), with the dedicated **ZAP5056** diagnostic. This is deliberate: a
+`struct`/`enum` key would otherwise be hashed by **identity**, so two
+equal-but-distinct arguments would never hit and the cache would *silently give
+no benefit while looking correct* — the exact footgun called out in review — and
+in fact `@derive(Hash, Eq)` cannot hash a nested struct field by value today, so
+an accepted reference key would surface a confusing error about the internal
+`<fn>$Key` struct instead. `float`/`bytes`/`char`/`complex`/`bigint`, a bare
+tuple, an optional, and a function value are likewise not v1 keys; so are a
+variadic/`**kwargs` collector, a zero-parameter/no-return/generic function, and
+any `@cache` argument — all **ZAP5056**, never an ICE. The check is an
+**allowlist** (only the value-hashable primitives pass), because a user
+struct/enum name is an arbitrary identifier that a denylist could not catch;
+value-hashable types not yet listed (e.g. a tier-1 `enum`) are a safe, clear
+false-negative, and widening the set — or adding structural struct/enum keys
+once `@derive(Hash)` hashes nested structs by value — is a future extension.
 
 **Eviction (v1).** **Unbounded for the process lifetime.** The global is an
 immortal GC root (#661/#663 note), so every entry stays reachable until the

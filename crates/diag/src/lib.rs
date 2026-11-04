@@ -581,16 +581,20 @@ define_codes! {
          adapters (D-0089/D-0092, I#466), not a core decorator. (`@cache` is no \
          longer here: it shipped in #666/D-0115 now that module-level state \
          exists, epic #661.) See SPEC.md, STABILITY.md and DECISIONS.md.";
-    ZAP5056 = 5056 : "@cache requires hashable, memoizable parameters",
+    ZAP5056 = 5056 : "@cache requires value-hashable, memoizable parameters",
         "`@cache` (#666, D-0115) memoizes a function by its argument tuple, so \
-         every parameter type must be hashable (usable as a dict key) and the \
-         function must return a value to store. A parameter that is a collection \
-         (`list`/`dict`/`set`), a bare tuple type, a function value, or a \
-         variadic/`**kwargs` collector is not a stable cache key; a function that \
-         returns nothing, or takes no parameters, has nothing to key or store. \
-         `@cache` is also a free-function decorator in v1 (not a method). Give \
-         the function hashable parameters and a return type, or memoize by hand \
-         over a module-level dict.";
+         every parameter must be a **value-hashable** key and the function must \
+         return a value to store. In v1 a key must be an **integer, `bool`, or \
+         `str`**. A reference type — a `struct`/`enum`, or a collection \
+         (`list`/`dict`/`set`) — is rejected: it would be keyed by identity, not \
+         value, so two equal-but-distinct arguments would never hit and the cache \
+         would silently give no benefit (and such a key cannot be hashed by value \
+         today). `float`/`bytes`/a bare tuple/an optional/a function value are \
+         likewise not value keys; a variadic/`**kwargs` collector is not a stable \
+         key; and a function that returns nothing, takes no parameters, or is \
+         generic has nothing to key or store. `@cache` is a free-function \
+         decorator in v1 (not a method). Key on a scalar/`str` id and return a \
+         value, or memoize by hand over a module-level dict.";
     ZAP5060 = 5060 : "generator tier-1 enum method not supported",
         "Generators on a tier-1 (unboxed-integer) enum method are not supported \
          yet — tier-1 enum methods do not lower at all yet, generator or not. \
