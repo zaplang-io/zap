@@ -3065,6 +3065,8 @@ full-codegen CI jobs, plus the sema/ir unit suites on host. The
 `crypto_rsa_key_binding` golden adds 2048/3072-bit known answers, empty/binary
 messages, foreign-family signatures, ordinary-RSA PSS signatures, malformed
 keys, damaged signatures, and repeated rejection followed by success (#642).
+Damage tests mutate actual SHA-256 signer results for each key/message case,
+as well as independent OpenSSL signatures, through the bytes test helper.
 
 ## D-0103 — `raise ... from ...` explicit cause chaining (I#604)
 

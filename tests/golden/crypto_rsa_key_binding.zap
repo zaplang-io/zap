@@ -53,14 +53,14 @@ def valid(
     for i in range(size):
         zeros.append(0)
     assert not crypto.rsa_sha256_verify(public, message, bytes(zeros))
+    reject_damaged(public, message, s256)
 
-# Mutations use an independent OpenSSL signature, keeping byte-operation
-# coverage separate from the sign-result lowering defect tracked in #644.
-def reject_damaged(str public, bytes signature):
-    assert crypto.rsa_sha256_verify(public, "RSA binding regression", signature)
-    assert not crypto.rsa_sha256_verify(public, "RSA binding regression", signature[:-1])
-    assert not crypto.rsa_sha256_verify(public, "RSA binding regression", signature + b"x")
-    assert not crypto.rsa_sha256_verify(public, "RSA binding regression", bytes([signature[0] ^ 1]) + signature[1:])
+# Mutate both actual signer output and independently generated OpenSSL signatures.
+def reject_damaged(str public, bytes message, bytes signature):
+    assert crypto.rsa_sha256_verify(public, message, signature)
+    assert not crypto.rsa_sha256_verify(public, message, signature[:-1])
+    assert not crypto.rsa_sha256_verify(public, message, signature + b"x")
+    assert not crypto.rsa_sha256_verify(public, message, bytes([signature[0] ^ 1]) + signature[1:])
 
 def main():
     # All earlier rejection tests must remain silent at the default WARNING.
@@ -513,12 +513,14 @@ EnLU/MsAJVuSdi0Tfruwv3A4O0fKcZ3N
     assert not crypto.rsa_sha256_verify(rsa_public, "RSA binding regression", hex.decode("a3549b5b79415ce9fd6058debc36d8d569ff2e3abd8a8268f14cb897ad659218f1a5f2e3a945eb19ddef2c722659062321eac297231f37c2425f7142f7f1c6a278e51e671947063e0656b6e3ae7544b7ed4f03e848ff62d597caeb69694bfd67f95a929d9924451314a8d6ea25ce02c9e5984d3cf169f64cbe15655ac653a694202385c0273e1864bd740ad7368cba3dae52e6caab85f8e20c3f712ec03bc733c6fbc1bd03ae0d9be99d67cb990db856973bff7ae6fb877ec48bda4350eca17e41b2f4a2a05e2f1bf4c799a0629b9c24b9635a27d0dacd7a10963bd9180efcc5aff8a759646f7cb1a8656343dd5c2fe7d25e483bc6dfcfb7111ef528b2820f61"))
     reject_damaged(
         rsa_public,
+        b"RSA binding regression",
         hex.decode(
             "5c42befa3cd508cdb2de15299928a28855616e83ffe406763eaeaea797e8e7d2ad40f3fed799c00bbbce1244b45d1960a2625ecbfcd0b442f3fdd0d7c012b6445d569dc36d6686a96428b2c517ac9de761e0da02cf0c475e23aa47fb7e8ec6a00427d75a7d53f478dec612d29fedbaf2209a1bc55455628d533cc4f38764aff346d13611a72ae1267dd6cb54107fdb417e9cc80cc64b0e8257744f18e16654f464df8f410b9f89b7ec88ad463befbd0f12947ad31864a583de49b6f470232b3f0c27c9c85500a1a9a851d995342d949b699d5f83031408881ee38d4bf4e95d0ec136e9fb7ac6f60f0e926e4ffe11b15931e16f1ab037370f07fb6cc223395fcb",
         ),
     )
     reject_damaged(
         rsa3072_public,
+        b"RSA binding regression",
         hex.decode(
             "1c2b82ff9c0b85887d6542ac800083acde4c5dc64348dc743386e07c953b2da3d5ad86e99cdcfa80e7cb16766e52c66ba9c3e9000ca7dff75b56f13dca2df7f486594362576a3a61a33a689b73573fcd6b6a18b40d2530f817d6a857050efe1b95c99808ffa2da028562834cf7f6952fa7ada18f4c6f411e1d93b4b1be78ca676e607bc39562109e78a8af9449730383ca9266ed82b4428e43852652662f0390c515ff9e7cc4519827f31bd37901a84bbcb6fa8ff3e8625f3c6f2c05b70d0b46a70f9b366a9b15ecd6ce55242cc67a8bc064de6beb470ec2573a454ead22c46c7d08a89c58af556cef9f10102265fc6cf629090357d17020aaea001b701a347eda07adaa7f4e76b03b74d003c2a2baefc2991ae17ee4ccec71d48c6bacf594ff9814fef51f47588f7e0ee24f4daae2123b5f980963ac929a0c32e8ef9f35247e11727f7920800d3a586a122ae6d2e6728b02ea698c40cbb9850341f1651bbb67a1e67d2d43ad8b9500602dae02bb61de20819010558f18c06f75a36f9e2ef8d3",
         ),
