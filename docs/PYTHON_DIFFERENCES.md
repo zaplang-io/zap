@@ -131,6 +131,7 @@ Zap → note*.
 | Inferred binding | `x = 0` | `auto x = 0` | `auto` infers the type; the binding is still statically typed. |
 | Constant | `X = 0` (by convention) | `const int64 X = 0` | `const` is enforced, not a naming convention. |
 | Function-value type | `Callable[[int], int]` | `fn(int64) -> int64` | First-class function types and closures (D-0067). |
+| Transparent type alias | `type Row = tuple[int, str]` | `type Row = (int64, str)` | Same PEP 695 `type X = …` spelling and the generic form `type Pair[T] = (T, T)` (D-0105); the tuple *type* is the parenthesized `(…)` form, and the alias is transparent (same identity, not nominal). Union aliases await anonymous unions (#607). |
 
 ### Imports and modules
 

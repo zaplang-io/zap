@@ -182,7 +182,8 @@ fn resolve_in_item(item: &mut Item, target: &Target) {
         // `Stmt::Cfg` itself — only its nested blocks can hold one.
         Item::Stmt(s) => resolve_in_stmt(s, target),
         // No bodies to descend into.
-        Item::Interface(_) | Item::Annotation(_) | Item::Import(_) => {}
+        // A type alias carries only a type expression, which has no cfg nodes.
+        Item::Interface(_) | Item::Annotation(_) | Item::Import(_) | Item::TypeAlias(_) => {}
         // Already expanded by `resolve_items`.
         Item::Cfg(_) => {}
     }

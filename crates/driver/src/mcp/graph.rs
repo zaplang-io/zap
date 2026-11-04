@@ -153,6 +153,20 @@ fn index_items(items: &[Item], file: &str, src: &str, out: &mut Vec<Symbol>) {
             Item::Struct(s) => out.push(struct_symbol(s, file, src)),
             Item::Enum(e) => out.push(enum_symbol(e, file, src)),
             Item::Interface(i) => out.push(interface_symbol(i, file, src)),
+            Item::TypeAlias(a) => out.push(Symbol {
+                kind: "type",
+                name: a.name.clone(),
+                signature: format!(
+                    "type {}{} = {}",
+                    a.name,
+                    render_generics(&a.generics),
+                    render_type(&a.target)
+                ),
+                file: file.to_string(),
+                line: span_to_line_col(src, a.span.start).0,
+                doc: None,
+                children: Vec::new(),
+            }),
             Item::Annotation(a) => out.push(Symbol {
                 kind: "annotation",
                 name: a.name.clone(),

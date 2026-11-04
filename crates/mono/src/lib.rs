@@ -82,6 +82,15 @@ struct Mono<'a> {
     interfaces: HashMap<String, &'a InterfaceDef>,
     /// Free-function return types, for inference of `f(...)` results.
     func_ret: HashMap<String, Option<Type>>,
+    /// Transparent type aliases (#606, D-0105): alias name -> (generic parameter
+    /// names, target type). An alias is expanded to its target — with the
+    /// parameters substituted — wherever a type is rewritten, so no alias head
+    /// survives into lowering/codegen. Expansion is purely structural; it emits
+    /// no declaration (an alias is not a nominal type).
+    aliases: HashMap<String, (Vec<String>, Type)>,
+    /// Alias names on a definition cycle (`type A = B; type B = A`). Left
+    /// unexpanded so expansion cannot loop; the cycle is reported by sema.
+    cyclic_aliases: HashSet<String>,
 
     /// Specialized declarations to emit, in request order, with their mangled
     /// names recorded in `requested` for dedup.
@@ -158,6 +167,68 @@ fn err(m: impl Into<String>) -> LowerError {
     LowerError {
         code: zapc_diag::ErrorCode::ZAP6001,
         message: m.into(),
+    }
+}
+
+/// Substitute type-parameter names with concrete argument types in a type
+/// expression (#606, transparent-alias expansion). A bare `Named` whose name is
+/// a key in `subst` becomes the mapped type; every other node is rebuilt with
+/// its children substituted.
+fn subst_type(t: &Type, subst: &HashMap<&str, &Type>) -> Type {
+    match t {
+        Type::Named { name, args, span } => {
+            if args.is_empty() {
+                if let Some(replacement) = subst.get(name.as_str()) {
+                    return (*replacement).clone();
+                }
+            }
+            Type::Named {
+                name: name.clone(),
+                args: args.iter().map(|a| subst_type(a, subst)).collect(),
+                span: *span,
+            }
+        }
+        Type::Tuple { elems, span } => Type::Tuple {
+            elems: elems.iter().map(|e| subst_type(e, subst)).collect(),
+            span: *span,
+        },
+        Type::Func { params, ret, span } => Type::Func {
+            params: params.iter().map(|p| subst_type(p, subst)).collect(),
+            ret: ret.as_ref().map(|r| Box::new(subst_type(r, subst))),
+            span: *span,
+        },
+    }
+}
+
+/// Collect the names of aliases referenced anywhere in `t` (#606 cycle
+/// detection); only names present in `aliases` are recorded.
+fn collect_alias_refs(
+    t: &Type,
+    aliases: &HashMap<String, (Vec<String>, Type)>,
+    out: &mut Vec<String>,
+) {
+    match t {
+        Type::Named { name, args, .. } => {
+            if aliases.contains_key(name) {
+                out.push(name.clone());
+            }
+            for a in args {
+                collect_alias_refs(a, aliases, out);
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            for e in elems {
+                collect_alias_refs(e, aliases, out);
+            }
+        }
+        Type::Func { params, ret, .. } => {
+            for p in params {
+                collect_alias_refs(p, aliases, out);
+            }
+            if let Some(r) = ret {
+                collect_alias_refs(r, aliases, out);
+            }
+        }
     }
 }
 
@@ -298,6 +369,8 @@ impl<'a> Mono<'a> {
             enums: HashMap::new(),
             interfaces: HashMap::new(),
             func_ret: HashMap::new(),
+            aliases: HashMap::new(),
+            cyclic_aliases: HashSet::new(),
             spec_structs: Vec::new(),
             spec_enums: Vec::new(),
             requested: HashSet::new(),
@@ -345,10 +418,63 @@ impl<'a> Mono<'a> {
                 Item::Interface(i) => {
                     m.interfaces.insert(i.name.clone(), i);
                 }
+                Item::TypeAlias(a) => {
+                    m.aliases.insert(
+                        a.name.clone(),
+                        (
+                            a.generics.iter().map(|p| p.name.clone()).collect(),
+                            a.target.clone(),
+                        ),
+                    );
+                }
                 _ => {}
             }
         }
+        m.compute_alias_cycles();
         m
+    }
+
+    /// Mark aliases that lie on a definition cycle (#606) so expansion never
+    /// loops. An alias is cyclic iff it can reach itself through alias
+    /// references in its (and other aliases') targets.
+    fn compute_alias_cycles(&mut self) {
+        let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, (_params, target)) in &self.aliases {
+            let mut refs = Vec::new();
+            collect_alias_refs(target, &self.aliases, &mut refs);
+            deps.insert(name.clone(), refs);
+        }
+        let names: Vec<String> = self.aliases.keys().cloned().collect();
+        for start in &names {
+            let mut stack = deps.get(start).cloned().unwrap_or_default();
+            let mut seen: HashSet<String> = HashSet::new();
+            while let Some(n) = stack.pop() {
+                if n == *start {
+                    self.cyclic_aliases.insert(start.clone());
+                    break;
+                }
+                if seen.insert(n.clone()) {
+                    if let Some(next) = deps.get(&n) {
+                        stack.extend(next.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+
+    /// One-step expansion of a (possibly generic) alias head: substitute the
+    /// alias's parameters with `args` in its target. `None` if `name` is not a
+    /// (non-cyclic) alias. The caller recurses to expand nested alias heads.
+    fn alias_target(&self, name: &str, args: &[Type]) -> Option<Type> {
+        if self.cyclic_aliases.contains(name) {
+            return None;
+        }
+        let (params, target) = self.aliases.get(name)?;
+        let mut subst: HashMap<&str, &Type> = HashMap::new();
+        for (p, a) in params.iter().zip(args.iter()) {
+            subst.insert(p.as_str(), a);
+        }
+        Some(subst_type(target, &subst))
     }
 
     fn run(mut self) -> Result<Module, LowerError> {
@@ -358,6 +484,9 @@ impl<'a> Mono<'a> {
         let src = std::mem::take(&mut self.src_items);
         for item in &src {
             match item {
+                // Transparent aliases (#606) are expanded in place at every type
+                // reference and emit no declaration of their own.
+                Item::TypeAlias(_) => {}
                 Item::Struct(s) if !s.generics.is_empty() => {}
                 Item::Enum(e) if !e.generics.is_empty() => {}
                 Item::Function(f) if !f.generics.is_empty() => {
@@ -493,9 +622,15 @@ impl Mono<'_> {
                         return concrete.clone();
                     }
                 }
+                let rargs: Vec<Type> = args.iter().map(|a| self.apply_subst(a)).collect();
+                // Expand a transparent alias to its target (#606), recursing so
+                // nested alias heads and any type parameters also resolve.
+                if let Some(expanded) = self.alias_target(name, &rargs) {
+                    return self.apply_subst(&expanded);
+                }
                 Type::Named {
                     name: name.clone(),
-                    args: args.iter().map(|a| self.apply_subst(a)).collect(),
+                    args: rargs,
                     span: *span,
                 }
             }
@@ -588,6 +723,12 @@ impl Mono<'_> {
                 // mangled zero-arg name, whose `mangle_type` equals the concrete
                 // form's, so the outer mangle key is stable either way.
                 let rargs: Vec<Type> = args.iter().map(|a| self.rename_type(a)).collect();
+                // A transparent alias is expanded before any generic-instance
+                // renaming (#606): the expansion may itself name a generic type,
+                // which then gets requested/mangled by recursing.
+                if let Some(expanded) = self.alias_target(name, &rargs) {
+                    return self.rename_type(&expanded);
+                }
                 if self.is_generic(name) && !args.is_empty() {
                     let mangled = self.request(name, &rargs);
                     Type::Named {
@@ -2733,6 +2874,50 @@ mod tests {
             Item::Struct(s) if s.name == name => Some(s),
             _ => None,
         })
+    }
+
+    // ---- transparent type aliases (#606, D-0105) --------------------------
+
+    #[test]
+    fn plain_type_alias_is_erased_and_expanded() {
+        // `Count = int64` used in a struct field becomes `int64`; the alias item
+        // itself emits no declaration.
+        let m =
+            mono_ok("type Count = int64\nstruct Row:\n    Count n\ndef main():\n    print(1)\n");
+        assert!(
+            !m.items.iter().any(|i| matches!(i, Item::TypeAlias(_))),
+            "a transparent alias must leave no declaration behind"
+        );
+        let s = struct_named(&m, "Row").expect("Row emitted");
+        assert_eq!(type_name(&s.fields[0].ty), "int64");
+    }
+
+    #[test]
+    fn generic_type_alias_expands_to_its_target() {
+        // `type Pair[T] = (T, T)` used as `Pair[int64]` expands to the concrete
+        // tuple `(int64, int64)`.
+        let m = mono_ok(
+            "type Pair[T] = (T, T)\nstruct Row:\n    Pair[int64] p\ndef main():\n    print(1)\n",
+        );
+        let s = struct_named(&m, "Row").expect("Row emitted");
+        assert_eq!(type_name(&s.fields[0].ty), "(int64, int64)");
+    }
+
+    #[test]
+    fn type_alias_to_generic_struct_participates_in_monomorphization() {
+        // `type Boxed = Box[int64]` expands to the generic instance, which mono
+        // then requests and mangles alongside the existing D-0017 generics: the
+        // field is typed `Box$int64` and that instance declaration is emitted.
+        let m = mono_ok(
+            "struct Box[T]:\n    T value\ntype Boxed = Box[int64]\n\
+             struct Row:\n    Boxed b\ndef main():\n    print(1)\n",
+        );
+        let s = struct_named(&m, "Row").expect("Row emitted");
+        assert_eq!(type_name(&s.fields[0].ty), "Box$int64");
+        assert!(
+            struct_named(&m, "Box$int64").is_some(),
+            "the alias's generic target instance must be emitted"
+        );
     }
 
     #[test]

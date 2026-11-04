@@ -379,6 +379,10 @@ const CORPUS: &[Case] = &[
     case("interface_def", Accept, "interface Shape:\n    def area(self) -> f64\n"),
     case("enum_def", Accept, "enum Color:\n    Red\n    Green\n"),
     case("enum_member", Accept, "enum Opt:\n    Some(int64 v)\n    None\n"),     // D-0046 + None variant
+    case("type_alias", Accept, "type Row = (int64, str)\n"),                     // transparent alias, #606
+    case("type_alias", Accept, "type Pair[T] = (T, T)\n"),                       // generic alias, #606
+    case("type_alias", Accept, "type Ids = list[int64]\n"),                      // collection target, #606
+    case("type_alias", Reject, "type Row =\n"),                                  // missing target type
     case("annotation_def", Accept, "annotation Meta:\n    int64 x\n"),
     case("struct_def", Reject, "struct P\n    int64 x\n"),                      // missing ':'
 

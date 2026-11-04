@@ -24,6 +24,12 @@ pub enum Item {
     Struct(StructDef),
     Interface(InterfaceDef),
     Enum(EnumDef),
+    /// A transparent type alias `type Name = <type>` (+ generic form
+    /// `type Name[T] = <type>`, #606 / D-0105). The alias is *not* a new nominal
+    /// type: it resolves to its target everywhere a type is resolved, with the
+    /// same identity (struct/enum already cover nominal types). `type` is a soft
+    /// keyword recognized only at item start.
+    TypeAlias(TypeAliasDef),
     Annotation(AnnotationDef),
     Decorator(DecoratorDef),
     Import(Import),
@@ -216,6 +222,23 @@ pub struct Param {
     /// positional-only (#602): it may only be supplied positionally at a call
     /// site, never by name. Mirror of [`Param::keyword_only`].
     pub positional_only: bool,
+    pub span: Span,
+}
+
+/// A transparent type alias (#606 / D-0105), e.g. `type Row = (int64, str)`
+/// or the generic form `type Pair[T] = (T, T)`. The alias introduces no new
+/// nominal identity: every reference to `name[args…]` resolves to `target` with
+/// the type parameters substituted, recursively, so an alias and its target are
+/// fully interchangeable. Generic aliases are expanded during monomorphization
+/// alongside the existing D-0017 generics.
+#[derive(Clone, Debug)]
+pub struct TypeAliasDef {
+    pub name: String,
+    /// Generic type parameters, e.g. the `[T]` in `type Pair[T] = (T, T)`.
+    /// Empty for a plain alias.
+    pub generics: Vec<TypeParam>,
+    /// The aliased (target) type the name expands to.
+    pub target: Type,
     pub span: Span,
 }
 

@@ -3129,3 +3129,70 @@ Verified by the `posonly_params` golden (working `/` call under the full-codegen
 CI jobs), plus `positional_only_params_enforced_at_call_site` (sema), parser
 accept/reject tests, the grammar-conformance corpus, and a fmt round-trip test
 on host.
+
+## D-0105 — Transparent type aliases `type X = …` (+ generic form) (I#606)
+**Status:** Locked — adds a transparent alias to the type grammar; fills the gap `struct`/`enum` (nominal) do not cover.
+
+Part of the CPython grammar-parity pass (epic #614, decision D14). Zap gains a
+PEP 695-style type alias: `type Name = <type>`, plus the generic form
+`type Name[T] = <type>`. The alias is **transparent** — it is *not* a new
+nominal type (struct/enum already cover nominal types). It resolves to its
+target everywhere a type is resolved, with the **same identity**, so the alias
+and the spelled-out type are fully interchangeable (assignable both ways, equal
+in signatures, equal as a collection element `list[Row]` / `dict[str, Row]`).
+
+```python
+type Count = int64
+type Row   = (int64, str)          # Zap's tuple type is the parenthesized form
+type Pair[T] = (T, T)              # generic alias (C++ `using`)
+type Boxed[T] = Box[T]             # alias to a user generic struct
+
+def double(Count n) -> Count:      # Count === int64
+    return n + n
+def mk() -> Pair[int64]:           # Pair[int64] === (int64, int64)
+    return (1, 2)
+```
+
+(The issue spells the first example `tuple[int64, str]`; that is shorthand —
+Zap's tuple **type** is the parenthesized `(int64, str)` form, `tuple_type` in
+the grammar. No `tuple[...]` type spelling is introduced here.)
+
+**Surface.** `type` is a **soft keyword**: it is not reserved today, so it is
+recognized as the alias introducer only at item start and only when immediately
+followed by an identifier (the alias name). `type ident ident` is not a valid
+statement, so an ordinary use of `type` as an identifier (`type = 5`,
+`type(x)`, `type.foo`) is never shadowed. The target is any `type`
+(named/primitive, tuple, function, collection), and a generic alias's target may
+reference its type parameters.
+
+**Resolution is transparent.** Sema expands an alias to its target — with the
+generic parameters substituted — wherever [`resolve_type`] runs, so an alias
+carries no identity of its own: returning a `str` from a `Count`-typed (`=
+int64`) function is the *same* `ZAP4003` as returning a `str` where `int64` is
+spelled out. Because the alias is not a nominal type, it is never added to the
+user-type set; it leaves no entry in the struct/enum registries.
+
+**Generic aliases ride monomorphization.** The ZIR monomorphization pass
+(D-0017/D-0064) expands every alias head structurally before generic renaming:
+`Pair[int64]` becomes the concrete tuple `(int64, int64)`, and an alias whose
+target names a user generic (`Boxed[int64]` → `Box[int64]`) is rewritten to that
+instance, which is then requested and mangled exactly as a direct `Box[int64]`
+would be. An alias therefore emits **no declaration of its own** — expansion is
+purely substitution — and nothing in lowering or codegen sees an alias name.
+
+**Cycles are rejected, not looped.** An alias that expands, directly or through
+other aliases, back to itself (`type A = B; type B = A`, or `type A = A`) is
+detected by a dependency-graph walk in sema and reported once as `ZAP4090`;
+resolving a cyclic alias yields `Unknown` instead of recursing. Monomorphization
+independently marks cyclic aliases and leaves them unexpanded so the back end
+cannot loop either. A nominal recursive type remains a `struct`/`enum`.
+
+**Out of scope.** Union aliases (`type J = A | B`) depend on anonymous union
+types (a separate decision, #607/#25) and are not part of this change.
+
+Verified by the `type_alias` golden (plain + generic tuple + generic-struct
+alias, exercised end-to-end under the full-codegen CI jobs), sema positive tests
+(transparent resolution, interchangeability, instantiation, alias chains), sema
+negative tests (`ZAP4090` for direct, indirect, and self cycles), mono tests
+(erasure + expansion + generic-struct monomorphization), parser accept/soft-
+keyword tests, and a fmt round-trip test on host.

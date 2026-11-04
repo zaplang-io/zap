@@ -538,6 +538,9 @@ fn top_level_symbols(ast: &Module) -> HashSet<String> {
             Item::Enum(e) => {
                 s.insert(e.name.clone());
             }
+            Item::TypeAlias(a) => {
+                s.insert(a.name.clone());
+            }
             Item::Interface(i) => {
                 s.insert(i.name.clone());
             }

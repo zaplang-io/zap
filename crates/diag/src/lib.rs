@@ -428,6 +428,11 @@ define_codes! {
         "An interface or a type parameter's bound does not declare the method \
          being called.";
 
+    ZAP4090 = 4090 : "cyclic type alias",
+        "A transparent type alias (`type X = …`) expands, directly or through \
+         other aliases, back to itself, so it has no underlying type. Break the \
+         cycle — a nominal recursive type is a `struct` or `enum` instead.";
+
     // ---- ZAP5xxx — declaration / semantic-rule validation ------------------
     ZAP5001 = 5001 : "recursive value struct",
         "A `value struct` cannot contain itself by value (that would need \

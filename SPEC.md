@@ -356,6 +356,36 @@ auto (q, r) = divmod(17, 5)
 Compared element-wise by `==`; `v, ok = <-ch` (D-0031) is this same
 destructuring. Not a reference type; no heap header unless boxed.
 
+### 4.9 Transparent type aliases (D-0105, #606)
+
+A **type alias** gives an existing type a second name. It is **transparent**: it
+introduces no new nominal type (use `struct`/`enum` for that), and resolves to
+its target everywhere a type is resolved, with the **same identity**. The alias
+and its target are therefore fully interchangeable.
+
+```python
+type Count = int64
+type Row    = (int64, str)         # the tuple type is the parenthesized form
+type Pair[T] = (T, T)              # generic alias
+type Boxed[T] = Box[T]             # alias to a user generic type
+
+def double(Count n) -> Count:      # Count IS int64
+    return n + n
+list[Row] rows = []                # Row IS (int64, str); usable as an element
+def mk() -> Pair[int64]:           # Pair[int64] IS (int64, int64)
+    return (1, 2)
+```
+
+`type` is a **soft keyword**: it is recognized as the alias introducer only at
+item start, immediately before an identifier, and stays an ordinary identifier
+everywhere else. A generic alias's target may reference its type parameters;
+generic aliases are expanded during monomorphization alongside user generics
+(§4.7), so `Pair[int64]` becomes `(int64, int64)` and `Boxed[int64]` becomes the
+`Box[int64]` instance. An alias that expands back to itself (`type A = B; type B
+= A`) is rejected with `ZAP4090` rather than looping. Union aliases
+(`type J = A | B`) depend on anonymous union types and are not part of this
+feature.
+
 ## 5. Operators & expressions
 
 - Arithmetic `+ - * / // % **`; **`/` is true division** (float), **`//` is
