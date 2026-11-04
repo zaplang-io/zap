@@ -39,8 +39,10 @@ pub enum Command {
         portable: bool,
         /// Make warnings fatal (#664, D-0113); off by default.
         warnings_as_errors: bool,
+        /// Enable the runtime data-race detector (#665, D-0114); off by default.
+        race: bool,
     },
-    /// `zap build [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors]` — build a
+    /// `zap build [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors] [--race]` — build a
     /// native binary into `target/`.
     Build {
         file: Option<String>,
@@ -52,14 +54,18 @@ pub enum Command {
         portable: bool,
         /// Make warnings fatal (#664, D-0113); off by default.
         warnings_as_errors: bool,
+        /// Enable the runtime data-race detector (#665, D-0114); off by default.
+        race: bool,
     },
-    /// `zap ir [file] [--target-feature f] [--warnings-as-errors]` — dump ZIR (diagnostic).
+    /// `zap ir [file] [--target-feature f] [--warnings-as-errors] [--race]` — dump ZIR (diagnostic).
     Ir {
         file: Option<String>,
         /// Compile-time CPU features for `when target.has(.f)` (I#139).
         features: Vec<String>,
         /// Make warnings fatal (#664, D-0113); off by default.
         warnings_as_errors: bool,
+        /// Enable the runtime data-race detector (#665, D-0114); off by default.
+        race: bool,
     },
     /// `zap expand [file]` — show decorator/`@derive`-generated code (D-0036).
     Expand { file: Option<String> },
@@ -101,6 +107,8 @@ pub enum Command {
         json: bool,
         watch: bool,
         doc: bool,
+        /// Enable the runtime data-race detector (#665, D-0114); off by default.
+        race: bool,
     },
     /// `zap mcp [--root <dir>]` — the agent MCP server (D-0055, issue #72).
     /// Serves over stdio. `root` is the codebase root for the code-graph and
@@ -219,6 +227,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 features,
                 portable,
                 warnings_as_errors,
+                race,
             } = parse_compile(rest)?;
             Ok(Command::Run {
                 file,
@@ -226,6 +235,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 features,
                 portable,
                 warnings_as_errors,
+                race,
             })
         }
         "build" => {
@@ -235,6 +245,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 features,
                 portable,
                 warnings_as_errors,
+                race,
             } = parse_compile(rest)?;
             Ok(Command::Build {
                 file,
@@ -242,6 +253,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 features,
                 portable,
                 warnings_as_errors,
+                race,
             })
         }
         "ir" => {
@@ -249,12 +261,14 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 file,
                 features,
                 warnings_as_errors,
+                race,
                 ..
             } = parse_compile(rest)?;
             Ok(Command::Ir {
                 file,
                 features,
                 warnings_as_errors,
+                race,
             })
         }
         "expand" => Ok(Command::Expand {
@@ -281,11 +295,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             let mut json = false;
             let mut watch = false;
             let mut doc = false;
+            let mut race = false;
             for a in rest {
                 match a.as_str() {
                     "--json" => json = true,
                     "--watch" => watch = true,
                     "--doc" => doc = true,
+                    // `--race` (alias `-race`): run the suite under the runtime
+                    // data-race detector (#665, D-0114, epic #661).
+                    "--race" | "-race" => race = true,
                     flag if flag.starts_with('-') => {
                         return Err(format!("unknown flag `{flag}`"));
                     }
@@ -300,11 +318,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             if doc && watch {
                 return Err("`zap test --doc` does not support `--watch` yet".to_string());
             }
+            if doc && race {
+                return Err("`zap test --doc` does not support `--race`".to_string());
+            }
             Ok(Command::Test {
                 file,
                 json,
                 watch,
                 doc,
+                race,
             })
         }
         "mcp" => parse_mcp(rest),
@@ -339,19 +361,33 @@ struct CompileArgs {
     /// fatal error (#664, D-0113). Off by default; a team CI knob that never
     /// changes what the language considers legal.
     warnings_as_errors: bool,
+    /// `--race`: enable the runtime data-race detector (#665, D-0114; epic
+    /// #661). Off by default; a test-time diagnostic that never changes what the
+    /// language considers legal. v1 recognizes and plumbs the flag; the
+    /// happens-before detector engine is a tracked follow-up slice.
+    race: bool,
 }
 
-/// Parse the `[-o <out>] [--target-feature f]... [--portable] [file]` form shared
-/// by `run`, `build`, and `ir`.
+/// Parse the `[-o <out>] [--target-feature f]... [--portable] [--race] [file]`
+/// form shared by `run`, `build`, and `ir`.
 fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
     let mut features: Vec<String> = Vec::new();
     let mut portable = false;
     let mut warnings_as_errors = false;
+    let mut race = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            // `--race` (alias `-race`): enable the runtime data-race detector
+            // (#665, D-0114, epic #661). Off by default; a test-time diagnostic
+            // for the light concurrency model (#661) that never changes what the
+            // language accepts, only whether accesses are instrumented.
+            "--race" | "-race" => {
+                race = true;
+                i += 1;
+            }
             // `--warnings-as-errors` (alias `-Werror`): make every surviving
             // warning fatal (#664, D-0113). Off by default; the language stays
             // the same, this only changes the build's exit policy.
@@ -403,6 +439,7 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
         features,
         portable,
         warnings_as_errors,
+        race,
     })
 }
 
@@ -1068,8 +1105,11 @@ pub fn execute(cmd: Command) -> ExitCode {
             features,
             portable,
             warnings_as_errors,
+            race,
         } => match resolve_entry(file) {
-            Ok(f) => crate::compile_for(&f, out, true, &features, portable, warnings_as_errors),
+            Ok(f) => {
+                crate::compile_for(&f, out, true, &features, portable, warnings_as_errors, race)
+            }
             Err(code) => code,
         },
         Command::Build {
@@ -1078,13 +1118,15 @@ pub fn execute(cmd: Command) -> ExitCode {
             features,
             portable,
             warnings_as_errors,
-        } => cmd_build(file, out, &features, portable, warnings_as_errors),
+            race,
+        } => cmd_build(file, out, &features, portable, warnings_as_errors, race),
         Command::Ir {
             file,
             features,
             warnings_as_errors,
+            race,
         } => match resolve_entry(file) {
-            Ok(f) => crate::emit_ir_for(&f, &features, warnings_as_errors),
+            Ok(f) => crate::emit_ir_for(&f, &features, warnings_as_errors, race),
             Err(code) => code,
         },
         Command::Expand { file } => match resolve_entry(file) {
@@ -1108,7 +1150,8 @@ pub fn execute(cmd: Command) -> ExitCode {
             json,
             watch,
             doc,
-        } => cmd_test(file, json, watch, doc),
+            race,
+        } => cmd_test(file, json, watch, doc, race),
         Command::Mcp { root } => crate::mcp::serve(root),
         Command::Repl => crate::repl::serve(),
         Command::Lsp => crate::lsp::serve(),
@@ -1160,6 +1203,7 @@ fn cmd_build(
     features: &[String],
     portable: bool,
     warnings_as_errors: bool,
+    race: bool,
 ) -> ExitCode {
     let entry = match resolve_entry(file) {
         Ok(f) => f,
@@ -1186,6 +1230,7 @@ fn cmd_build(
         features,
         portable,
         warnings_as_errors,
+        race,
     )
 }
 
@@ -1299,16 +1344,16 @@ fn main_template(project: &str) -> String {
 
 /// `zap test [file] [--json] [--watch]` — run the `@test` suite (D-0054).
 #[cfg(feature = "codegen")]
-fn cmd_test(file: Option<String>, json: bool, watch: bool, doc: bool) -> ExitCode {
+fn cmd_test(file: Option<String>, json: bool, watch: bool, doc: bool, race: bool) -> ExitCode {
     if doc {
         return crate::testing::doctest::run(file, json);
     }
-    crate::testing::run(file, json, watch)
+    crate::testing::run(file, json, watch, race)
 }
 
 /// Without a backend the runner cannot compile and execute tests.
 #[cfg(not(feature = "codegen"))]
-fn cmd_test(_file: Option<String>, _json: bool, _watch: bool, _doc: bool) -> ExitCode {
+fn cmd_test(_file: Option<String>, _json: bool, _watch: bool, _doc: bool, _race: bool) -> ExitCode {
     eprintln!("zap test: running tests needs codegen, which this build lacks");
     eprintln!("(rebuild with --features zapc/llvm, which requires an LLVM toolchain)");
     ExitCode::from(1)
@@ -1713,6 +1758,9 @@ compile & run:
        --warnings-as-errors   (run/build/ir; alias -Werror) make every surviving
                         warning fatal, for CI; off by default and never changes
                         what the language accepts (#664, D-0113)
+       --race           (run/build/ir/test; alias -race) enable the runtime
+                        data-race detector for the light concurrency model; a
+                        test-time diagnostic, off by default (#665, D-0114)
 
 project:
   new <name>            scaffold a new project directory (writes zap.toml)
@@ -1829,6 +1877,7 @@ mod tests {
                 features: vec![],
                 portable: false,
                 warnings_as_errors: false,
+                race: false,
             }
         );
         assert_eq!(
@@ -1839,6 +1888,7 @@ mod tests {
                 features: vec![],
                 portable: false,
                 warnings_as_errors: false,
+                race: false,
             }
         );
     }
@@ -1853,6 +1903,7 @@ mod tests {
                 features: vec![],
                 portable: false,
                 warnings_as_errors: false,
+                race: false,
             }
         );
     }
@@ -1867,6 +1918,7 @@ mod tests {
                 features: vec![],
                 portable: false,
                 warnings_as_errors: false,
+                race: false,
             }
         );
     }
@@ -1882,6 +1934,7 @@ mod tests {
                 features: vec![],
                 portable: true,
                 warnings_as_errors: false,
+                race: false,
             }
         );
         // Order-independent and composes with `-o`; also accepted by `run`.
@@ -1893,6 +1946,7 @@ mod tests {
                 features: vec![],
                 portable: true,
                 warnings_as_errors: false,
+                race: false,
             }
         );
         assert_eq!(
@@ -1903,6 +1957,7 @@ mod tests {
                 features: vec![],
                 portable: true,
                 warnings_as_errors: false,
+                race: false,
             }
         );
         // Absent by default.
@@ -1914,6 +1969,7 @@ mod tests {
                 features: vec![],
                 portable: false,
                 warnings_as_errors: false,
+                race: false,
             }
         );
     }
@@ -1931,6 +1987,7 @@ mod tests {
                 features: vec![],
                 portable: false,
                 warnings_as_errors: true,
+                race: false,
             }
         );
         assert_eq!(
@@ -1941,6 +1998,7 @@ mod tests {
                 features: vec![],
                 portable: false,
                 warnings_as_errors: true,
+                race: false,
             }
         );
         assert_eq!(
@@ -1949,6 +2007,7 @@ mod tests {
                 file: Some("a.zap".into()),
                 features: vec![],
                 warnings_as_errors: true,
+                race: false,
             }
         );
         // Composes with `--portable` and `-o`, order-independent.
@@ -1968,6 +2027,7 @@ mod tests {
                 features: vec![],
                 portable: true,
                 warnings_as_errors: true,
+                race: false,
             }
         );
         // Off by default.
@@ -1979,6 +2039,79 @@ mod tests {
                 features: vec![],
                 portable: false,
                 warnings_as_errors: false,
+                race: false,
+            }
+        );
+    }
+
+    #[test]
+    fn race_flag_is_parsed() {
+        // `--race` and its `-race` alias enable the runtime data-race detector on
+        // run/build/ir; off by default, composes with other flags, never changes
+        // what the language accepts (#665, D-0114, epic #661).
+        assert_eq!(
+            p(&["run", "a.zap", "--race"]).unwrap(),
+            Command::Run {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: false,
+                race: true,
+            }
+        );
+        assert_eq!(
+            p(&["build", "-race", "a.zap"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: false,
+                race: true,
+            }
+        );
+        assert_eq!(
+            p(&["ir", "a.zap", "--race"]).unwrap(),
+            Command::Ir {
+                file: Some("a.zap".into()),
+                features: vec![],
+                warnings_as_errors: false,
+                race: true,
+            }
+        );
+        // Composes with `--warnings-as-errors`, `--portable`, and `-o`,
+        // order-independent.
+        assert_eq!(
+            p(&[
+                "build",
+                "--race",
+                "--warnings-as-errors",
+                "--portable",
+                "-o",
+                "x",
+                "a.zap"
+            ])
+            .unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: Some("x".into()),
+                features: vec![],
+                portable: true,
+                warnings_as_errors: true,
+                race: true,
+            }
+        );
+        // Off by default.
+        assert_eq!(
+            p(&["run", "a.zap"]).unwrap(),
+            Command::Run {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: false,
+                race: false,
             }
         );
     }
@@ -2003,6 +2136,7 @@ mod tests {
                 features: vec!["sse4_2".into(), "avx2".into()],
                 portable: false,
                 warnings_as_errors: false,
+                race: false,
             }
         );
         assert!(p(&["run", "a.zap", "--target-feature"]).is_err());
@@ -2031,6 +2165,7 @@ mod tests {
                 file: Some("a.zap".into()),
                 features: vec![],
                 warnings_as_errors: false,
+                race: false,
             }
         );
         assert_eq!(
@@ -2060,7 +2195,8 @@ mod tests {
                 file: None,
                 json: false,
                 watch: false,
-                doc: false
+                doc: false,
+                race: false
             }
         );
         assert_eq!(
@@ -2069,7 +2205,8 @@ mod tests {
                 file: None,
                 json: false,
                 watch: true,
-                doc: false
+                doc: false,
+                race: false
             }
         );
         assert_eq!(
@@ -2078,7 +2215,8 @@ mod tests {
                 file: Some("math_test.zap".into()),
                 json: true,
                 watch: false,
-                doc: false
+                doc: false,
+                race: false
             }
         );
         assert_eq!(
@@ -2087,11 +2225,24 @@ mod tests {
                 file: Some("src".into()),
                 json: false,
                 watch: false,
-                doc: true
+                doc: true,
+                race: false
             }
         );
-        // Doctests don't support `--watch` yet.
+        // `--race` runs the suite under the data-race detector (#665, D-0114).
+        assert_eq!(
+            p(&["test", "--race"]).unwrap(),
+            Command::Test {
+                file: None,
+                json: false,
+                watch: false,
+                doc: false,
+                race: true
+            }
+        );
+        // Doctests don't support `--watch` or `--race` yet.
         assert!(p(&["test", "--doc", "--watch"]).is_err());
+        assert!(p(&["test", "--doc", "--race"]).is_err());
         assert!(p(&["test", "--nope"]).is_err());
     }
 
