@@ -397,7 +397,7 @@ feature.
   `str`); the result is a strict `bool`. `x not in xs` is its negation —
   identical operand rules and result — and means exactly `not (x in xs)`. `in`
   participates in Python-style comparison chaining (below); `not in` does not.
-- Identity `is` / `is not` (D-0109, #611): `a is b` tests **reference
+- Identity `is` / `is not` (D-0110, #611): `a is b` tests **reference
   identity** — whether both operands are the same allocation — and the result is
   a strict `bool`. This is distinct from `==` (value / `__eq__` equality): two
   distinct reference-struct allocations with equal fields are `==`-equal but not
