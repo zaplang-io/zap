@@ -340,11 +340,42 @@ pub struct AnnotationDef {
 }
 
 /// A behavioral decorator declaration (`before`/`after`/`wrap`, D-0036).
+///
+/// A decorator is either **declared-only** (an empty `pass` body — `members` is
+/// empty — which attaches reflection metadata, D-0087) or **behavioral** (it
+/// declares one or more `before`/`after`/`wrap` [`DecoratorMember`]s whose code
+/// the decorator-expansion pass generates around/for the decorated target).
 #[derive(Clone, Debug)]
 pub struct DecoratorDef {
     pub name: String,
+    /// The decorator's own arguments, e.g. the `int64 times` in
+    /// `decorator retry(int64 times)`. Ordinary type-first parameters.
     pub params: Vec<Param>,
-    pub body: Block,
+    /// `before`/`after`/`wrap` member hooks declared in the body, in source
+    /// order. Empty for a declared-only (`pass`) metadata decorator.
+    pub members: Vec<DecoratorMember>,
+    /// The span of the indented body (`:` through the end of the last body
+    /// line), used by the formatter for blank-line/trivia accounting.
+    pub body_span: Span,
+    pub span: Span,
+}
+
+/// A `before`/`after`/`wrap` member hook of a behavioral decorator (D-0036).
+///
+/// Unlike ordinary functions, a member's parameters (`ctx`, `result`, `call`)
+/// are **untyped macro bindings** substituted during decorator expansion, not
+/// type-first Zap parameters — so they are carried as plain names.
+#[derive(Clone, Debug)]
+pub struct DecoratorMember {
+    /// The hook name as written: `before`, `after`, `wrap`, or any other name
+    /// (an unknown member is a stable diagnostic during expansion).
+    pub name: String,
+    /// Untyped macro-parameter names, in order (`ctx`; `ctx, result`; `call`).
+    pub params: Vec<String>,
+    /// The hook body. `None` only for a member whose nested-`def` body this
+    /// slice does not yet parse (the `wrap` form, deferred to #653); expansion
+    /// then reports a stable "not implemented yet" diagnostic.
+    pub body: Option<Block>,
     pub span: Span,
 }
 

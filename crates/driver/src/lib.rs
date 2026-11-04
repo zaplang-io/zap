@@ -18,6 +18,7 @@ use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Module;
 use zapc_syntax::cfg::Target;
 
+mod behavioral_decorator;
 pub mod cli;
 mod decorator_desugar;
 mod modlink;
@@ -149,6 +150,14 @@ fn front_end_program(entry: &str, target: &Target) -> Result<Module, ExitCode> {
     let deco_diags = decorator_desugar::desugar_registering_decorators(&mut module);
     if !deco_diags.is_empty() {
         report(sema_reports(entry, deco_diags));
+        return Err(ExitCode::from(1));
+    }
+    // Expand user-defined behavioral decorators (`before`/`after`, D-0036; epic
+    // #651) into wrapper functions, before sema, so the generated code is
+    // type-checked and `zap expand`-visible like any other.
+    let beh_diags = behavioral_decorator::expand_behavioral_decorators(&mut module);
+    if !beh_diags.is_empty() {
+        report(sema_reports(entry, beh_diags));
         return Err(ExitCode::from(1));
     }
     let errs = zapc_sema::check(&module);

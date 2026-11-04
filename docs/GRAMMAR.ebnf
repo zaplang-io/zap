@@ -188,7 +188,22 @@ variant_field ::= type IDENT ;                               (* type-first, name
 annotation_def ::= "annotation" IDENT ":" NEWLINE
                   INDENT { field } DEDENT ;
 
-decorator_def ::= "decorator" IDENT [ "(" [ param_list ] ")" ] block ;
+decorator_def ::= "decorator" IDENT [ "(" [ param_list ] ")" ] ":" NEWLINE
+                  INDENT ( "pass" NEWLINE | { decorator_hook } ) DEDENT ;
+                  (* A `decorator` is either declared-only (a `pass` body, which
+                     attaches reflection metadata — D-0087) or behavioral: it
+                     declares `before`/`after`/`wrap` hooks whose code is
+                     generated around the decorated target (D-0036, epic #651).
+                     The optional "(" param_list ")" is the decorator's own
+                     arguments, e.g. `decorator retry(int64 times)`. *)
+decorator_hook ::= "def" IDENT "(" [ hook_params ] ")" block ;
+                  (* The recognized hooks are `before(ctx)`, `after(ctx, result)`
+                     (the convenience form, #652) and `wrap(call)` (the general
+                     form, #653). A hook's parameters are untyped macro bindings
+                     — `ctx`, `result`, `call` — not type-first parameters, so
+                     `hook_params` is a bare IDENT list. `ctx` exposes `ctx.name`
+                     (the decorated function's name). *)
+hook_params   ::= IDENT { "," IDENT } ;
 
 (* ---------- Imports (D-0028, D-0012) ---------- *)
 

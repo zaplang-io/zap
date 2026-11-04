@@ -1078,7 +1078,11 @@ impl Walk {
                     detail: None,
                     children: Vec::new(),
                 });
-                self.block(&d.body);
+                for m in &d.members {
+                    if let Some(body) = &m.body {
+                        self.block(body);
+                    }
+                }
             }
             Item::Import(im) => {
                 let (name, span) = match im {

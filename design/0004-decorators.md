@@ -221,11 +221,21 @@ violation raises a catchable `ValueError` (D-0007). Invalid targets/arguments
 are stable, coded compile errors (ZAP5038/5039/5040). The `range` keyword is
 accepted as a decorator name so `@range` parses.
 
+Also shipped: the **user-defined behavioral `before`/`after` form** (D-0108,
+epic #651 / #652). A `decorator` declaring `before(ctx)` and/or
+`after(ctx, result)` hooks now generates a wrapper around a decorated free
+function at compile time (a whole-program AST pass before sema, like the
+registering desugar D-0087), with the decorated function's exact signature
+preserved automatically, `ctx.name` substituted, bottom-up stacking, decorator
+arguments, and stable diagnostics (ZAP5049–ZAP5053). Visible via `zap expand`.
+
 Follow-up (deferred, not yet implemented): `@validate(matches=m/.../)` regex
 validation; the **function/variable group** `@cache` (memoization),
 `@deprecated` (use-site diagnostic), and `@inject` (DI, cf. zap#312/fastzap#7);
-and the user-defined `before`/`after`/`wrap` decorator bodies. These remain
-clean "not implemented yet (deferred)" lowering errors.
+and the general user-defined **`wrap(call)`** behavioral form (the nested
+`def inner(...)` returning a replacement callable — #653; applying a `wrap`
+decorator is a clean ZAP5052 "not implemented yet" error for now). Behavioral
+decorators on non-function targets are ZAP5050 (deferred).
 
 ## Open issues
 

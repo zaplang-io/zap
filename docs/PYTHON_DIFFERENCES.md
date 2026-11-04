@@ -177,6 +177,7 @@ Python models data with classes; Zap uses nominal `struct` / `enum` /
 | Positional-only marker | `def f(a, /):` | `def f(int64 a, /):` | Same `/` separator; params before `/` can't be passed by name (#602). |
 | Starred call args | `f(*args, **kw)` | `f(*args, **kw)` | Same spelling; `*tuple` expands fixed params, `*list`/`**dict` forward into a variadic / collector (#597). |
 | User decorator | `def deco(fn): ...` + `@deco` | `decorator Deco(...): ...` + `@Deco` | Declared decorators and `annotation` types, reflectable (D-0036). |
+| Behavioral decorator | `def deco(fn):` wrapping at runtime | `decorator traced:` with `before(ctx)` / `after(ctx, result)` hooks | **Compile-time** code generation, not a runtime rebind; the wrapper keeps the decorated function's exact signature (automatic `@wraps`), visible via `zap expand` (D-0108, #652). `ctx.name` is the only context field. The general `wrap(call)` form is #653. |
 
 ### Operators and expressions
 

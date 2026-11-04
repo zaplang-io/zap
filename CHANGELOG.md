@@ -35,6 +35,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   machine, so it integrates with `for`/`sum`/etc. through the one iteration
   protocol. `sum(...)` now also accepts any iterable (generator, genexpr, list),
   not only numeric arrays (#596, D-0107, epic #614 D4).
+- User-defined **behavioral decorators**, `before`/`after` form (#652 of epic
+  #651, D-0108, D-0036). A `decorator` may declare `before(ctx)` and/or
+  `after(ctx, result)` hooks; applying it to a free function generates — at
+  compile time, before type-checking, visible via `zap expand` — a wrapper with
+  the decorated function's **exact signature preserved** (automatic `@wraps`)
+  that runs `before`, calls the original, runs `after` on the return value, and
+  returns it. `ctx.name` is the decorated function's name; decorators stack
+  bottom-up; decorator arguments (`@tag("x")`) wire into the generated code.
+  Ill-formed uses are stable diagnostics (ZAP5049–ZAP5053). The general
+  `wrap(call)` form is tracked by #653 (applying it reports ZAP5052 for now);
+  behavioral decorators on non-function targets report ZAP5050.
 - Transparent type aliases: `type Name = <type>`, plus the generic form
   `type Name[T] = <type>` (#606, D-0105). An alias is not a new nominal type — it
   resolves to its target with the same identity, so an alias and the spelled-out

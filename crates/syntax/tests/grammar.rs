@@ -342,6 +342,29 @@ const CORPUS: &[Case] = &[
     case("param_list", Reject, "def f(int64 a, *, int64 b, /):\n    return\n"), // '/' after '*'
     case("decorators", Accept, "@cache\ndef f():\n    return\n"),               // D-0036
     case("decorators", Accept, "@retry(3)\ndef f():\n    return\n"),
+    case("decorator_def", Accept, "decorator audited:\n    pass\n"),            // declared-only (D-0087)
+    // behavioral before/after hooks (D-0108, #652)
+    case(
+        "decorator_def",
+        Accept,
+        "decorator traced:\n    def before(ctx):\n        print(ctx.name)\n    def after(ctx, result):\n        print(result)\n",
+    ),
+    case(
+        "decorator_def",
+        Accept,
+        "decorator tag(str label):\n    def before(ctx):\n        print(label)\n",
+    ),
+    // the wrap(call) nested-def form parses shape-only in this slice (#653)
+    case(
+        "decorator_def",
+        Accept,
+        "decorator retry(int64 times):\n    def wrap(call):\n        def inner():\n            return call()\n        return inner\n",
+    ),
+    case(
+        "decorator_def",
+        Reject,
+        "decorator bad:\n    int64 x\n",
+    ), // a field is not a hook/pass
     case("generics", Accept, "def id[T](T x) -> T:\n    return x\n"),           // D-0017
     case("type_param", Accept, "def f[T: Shape](T x):\n    return\n"),          // bound, I#164
     case("function", Reject, "def (int64 a):\n    return\n"),                   // missing name
