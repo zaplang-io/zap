@@ -738,6 +738,19 @@ pub enum Expr {
         clauses: Vec<CompClause>,
         span: Span,
     },
+    /// `(elem for CLAUSES)` — a bare **generator expression** (#596, epic #614
+    /// D4). Unlike a list/set/dict comprehension it does not materialize a
+    /// collection: it evaluates to a lazy `Iterator` (D-0048) that yields each
+    /// `elem` on demand, reusing the generator state-machine machinery (I#67).
+    /// `clauses` is non-empty and its first entry is the leading `for`, exactly
+    /// like a comprehension (#599). The surrounding parentheses are part of the
+    /// form — a genexpr is only produced in a parenthesized position, and is
+    /// distinct from a parenthesized expression `(expr)` and a tuple `(a, b)`.
+    GenExp {
+        elem: Box<Expr>,
+        clauses: Vec<CompClause>,
+        span: Span,
+    },
 
     Unary {
         op: UnOp,

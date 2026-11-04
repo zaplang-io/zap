@@ -1420,7 +1420,9 @@ impl Walk {
                     }
                 }
             }
-            Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+            Expr::ListComp { elem, clauses, .. }
+            | Expr::SetComp { elem, clauses, .. }
+            | Expr::GenExp { elem, clauses, .. } => {
                 self.comp_clauses(clauses);
                 self.expr(elem);
             }
@@ -1537,6 +1539,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::ListComp { span, .. }
         | Expr::DictComp { span, .. }
         | Expr::SetComp { span, .. }
+        | Expr::GenExp { span, .. }
         | Expr::Unary { span, .. }
         | Expr::Binary { span, .. }
         | Expr::Compare { span, .. }

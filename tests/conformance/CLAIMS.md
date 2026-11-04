@@ -140,6 +140,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | COMP-1 | §8 | list comprehension builds a list; `if` clause filters | covered | comprehensions |
 | COMP-2 | §8 | dict comprehension `{k: v for ...}` | TODO | — |
 | COMP-3 | §8 | comprehensions take multiple `for` clauses and interleaved `if` filters (#599) | covered | comprehension_multi_clause |
+| COMP-4 | §8 | a generator expression `(x for x in xs)` is a lazy iterator, not a list (#596) | covered | genexpr |
 | DSP-1 | §4 | `*expr` splices into a list/set/tuple display; `**expr` merges a dict, last-wins (#598) | covered | display_unpacking |
 
 ## Control flow (§6)

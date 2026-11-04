@@ -203,7 +203,9 @@ fn each_yield_in_expr<'a>(e: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
                 }
             }
         }
-        Expr::ListComp { elem, clauses, .. } | Expr::SetComp { elem, clauses, .. } => {
+        Expr::ListComp { elem, clauses, .. }
+        | Expr::SetComp { elem, clauses, .. }
+        | Expr::GenExp { elem, clauses, .. } => {
             each_yield_in_expr(elem, visit);
             each_yield_in_clauses(clauses, visit);
         }
