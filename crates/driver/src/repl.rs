@@ -805,6 +805,11 @@ mod engine {
                         src: decl_src(i.span, &[]),
                         displayable: None,
                     }),
+                    Item::TypeAlias(a) => new_decls.push(DeclInfo {
+                        name: a.name.clone(),
+                        src: decl_src(a.span, &[]),
+                        displayable: None,
+                    }),
                     Item::Annotation(a) => new_decls.push(DeclInfo {
                         name: a.name.clone(),
                         src: decl_src(a.span, &[]),

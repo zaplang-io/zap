@@ -1268,6 +1268,18 @@ impl Parser {
                 items.push(Item::Struct(self.parse_struct(decos, true)))
             }
             TokenKind::Keyword(Keyword::Enum) => items.push(Item::Enum(self.parse_enum(decos))),
+            // Transparent type alias `type Name = <type>` (#606, D-0105). `type`
+            // is a SOFT keyword: it is not reserved today, so it is treated as
+            // the alias introducer only at item start and only when immediately
+            // followed by an identifier (the alias name). `type ident ident` is
+            // not a valid statement, so this never shadows an existing use of
+            // `type` as a plain identifier (`type = 5`, `type(x)`, `type.foo`).
+            TokenKind::Ident(n) if n == "type" && matches!(self.peek2(), TokenKind::Ident(_)) => {
+                if !decos.is_empty() {
+                    self.error_here(ErrorCode::ZAP2003, "decorators must precede a declaration");
+                }
+                items.push(Item::TypeAlias(self.parse_type_alias()))
+            }
             TokenKind::Keyword(Keyword::Interface) => {
                 items.push(Item::Interface(self.parse_interface()))
             }
@@ -1577,6 +1589,28 @@ impl Parser {
             });
         }
         v
+    }
+
+    /// Parse a transparent type alias (#606, D-0105):
+    /// `type IDENT [ generics ] "=" type`. The leading `type` soft keyword has
+    /// already been confirmed (but not consumed) by the caller.
+    fn parse_type_alias(&mut self) -> TypeAliasDef {
+        let start = self.peek_span().start;
+        self.bump(); // consume the `type` soft keyword
+        let name = self.ident("type alias name");
+        let generics = self.parse_generics();
+        self.expect(&TokenKind::Assign, "'=' in type alias");
+        let target = self.parse_type();
+        // A type alias is a single-line declaration; terminate on the newline.
+        if !self.at_eof() {
+            self.expect(&TokenKind::Newline, "newline after type alias");
+        }
+        TypeAliasDef {
+            name,
+            generics,
+            target,
+            span: self.span_from(start),
+        }
     }
 
     fn parse_struct(&mut self, decorators: Vec<Decorator>, is_value: bool) -> StructDef {
@@ -4305,6 +4339,69 @@ mod tests {
             matches!(&f.generics[0].bound, Some(Type::Named { name, .. }) if name == "Ordered")
         );
         assert!(f.generics[1].bound.is_none());
+    }
+
+    #[test]
+    fn type_alias_plain_parses() {
+        // `type Name = <type>` (#606): a transparent alias item with no generics.
+        let m = parse_ok("type Row = (int64, str)\n");
+        let Item::TypeAlias(a) = &m.items[0] else {
+            panic!("expected a type alias, got {:?}", m.items[0]);
+        };
+        assert_eq!(a.name, "Row");
+        assert!(a.generics.is_empty());
+        assert!(matches!(&a.target, Type::Tuple { elems, .. } if elems.len() == 2));
+    }
+
+    #[test]
+    fn type_alias_generic_parses() {
+        // The generic form `type Name[T] = <type>` (#606) carries the type
+        // parameters, which the target may reference.
+        let m = parse_ok("type Pair[T] = (T, T)\n");
+        let Item::TypeAlias(a) = &m.items[0] else {
+            panic!("expected a type alias");
+        };
+        assert_eq!(a.name, "Pair");
+        assert_eq!(a.generics.len(), 1);
+        assert_eq!(a.generics[0].name, "T");
+        assert!(matches!(&a.target, Type::Tuple { elems, .. } if elems.len() == 2));
+    }
+
+    #[test]
+    fn type_alias_to_named_and_collection_parse() {
+        // The target may be a plain named type, or a built-in collection whose
+        // element is itself an alias-eligible named type.
+        let m =
+            parse_ok("type Id = int64\ntype Ids = list[int64]\ntype Table = dict[str, int64]\n");
+        assert_eq!(m.items.len(), 3);
+        for (i, name) in [(0, "Id"), (1, "Ids"), (2, "Table")] {
+            let Item::TypeAlias(a) = &m.items[i] else {
+                panic!("expected a type alias at {i}");
+            };
+            assert_eq!(a.name, name);
+        }
+    }
+
+    #[test]
+    fn type_alias_to_func_type_parses() {
+        // A function-value type (I#163) is a valid alias target.
+        let m = parse_ok("type Pred = fn(int64) -> bool\n");
+        let Item::TypeAlias(a) = &m.items[0] else {
+            panic!("expected a type alias");
+        };
+        assert!(matches!(&a.target, Type::Func { .. }));
+    }
+
+    #[test]
+    fn type_is_still_a_usable_identifier() {
+        // `type` is a SOFT keyword recognized only at item start when followed by
+        // an identifier; every other use stays a plain identifier (no alias).
+        let m = parse_ok("def f():\n    auto type = 3\n    print(type)\n    type = type + 1\n");
+        assert!(matches!(&m.items[0], Item::Function(_)));
+        assert!(
+            !m.items.iter().any(|it| matches!(it, Item::TypeAlias(_))),
+            "`type` as a local identifier must not parse as an alias"
+        );
     }
 
     #[test]

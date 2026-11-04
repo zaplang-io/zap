@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use zapc_diag::ErrorCode;
 use zapc_syntax::ast::{
     BindTarget, Block, CompClause, DictItem, EnumDef, Expr, Function, InterfaceDef, Item, Pattern,
-    Stmt, StructDef, Type, TypeParam,
+    Stmt, StructDef, Type, TypeAliasDef, TypeParam,
 };
 use zapc_syntax::span::Span;
 
@@ -58,6 +58,7 @@ impl Rewriter<'_> {
             Item::Function(f) => self.function(f, &HashSet::new()),
             Item::Struct(s) => self.struct_def(s),
             Item::Enum(e) => self.enum_def(e),
+            Item::TypeAlias(a) => self.type_alias(a),
             Item::Interface(i) => self.interface_def(i),
             // Annotation/decorator *declarations* are not mangled in Stage A, but
             // any statement/field exprs they carry still need reference rewriting.
@@ -145,6 +146,12 @@ impl Rewriter<'_> {
         for m in &mut e.methods {
             self.function(m, &tl);
         }
+    }
+
+    fn type_alias(&mut self, a: &mut TypeAliasDef) {
+        self.rename_decl(&mut a.name);
+        let tl = generics_set(&a.generics, &HashSet::new());
+        self.ty(&mut a.target, &tl);
     }
 
     fn interface_def(&mut self, i: &mut InterfaceDef) {

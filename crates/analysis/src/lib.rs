@@ -1025,6 +1025,26 @@ impl Walk {
                     children,
                 });
             }
+            // A transparent type alias (#606) is a user-defined type name; it
+            // shares the `Struct` symbol kind for editor features (symbols,
+            // go-to-def, hover) since it names a type.
+            Item::TypeAlias(a) => {
+                self.global_defs.insert(
+                    a.name.clone(),
+                    GlobalDef {
+                        span: a.span,
+                        kind: SymbolKind::Struct,
+                    },
+                );
+                self.symbols.push(DocumentSymbol {
+                    name: a.name.clone(),
+                    kind: SymbolKind::Struct,
+                    span: a.span,
+                    name_span: a.span,
+                    detail: None,
+                    children: Vec::new(),
+                });
+            }
             Item::Annotation(a) => {
                 self.global_defs.insert(
                     a.name.clone(),

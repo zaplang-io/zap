@@ -34,6 +34,7 @@ item          ::= function
                 | struct_def
                 | interface_def
                 | enum_def
+                | type_alias        (* transparent type alias (#606, D-0105) *)
                 | annotation_def
                 | decorator_def
                 | import
@@ -152,6 +153,18 @@ enum_def      ::= decorators "enum" IDENT [ generics ] ":" NEWLINE
                      variant makes the whole enum a tagged value (D-0018/D-0046).
                      `function` = methods on the enum (D-0046); [ generics ] is
                      reserved now, monomorphized when user generics land. *)
+type_alias    ::= "type" IDENT [ generics ] "=" type NEWLINE ;
+                  (* transparent type alias (#606, D-0105): `type Row = (int64,
+                     str)`, or the generic form `type Pair[T] = (T, T)`. The
+                     alias is NOT a new nominal type — it resolves to `type` with
+                     the same identity, substituting the generic parameters, so
+                     the alias and its target are interchangeable. Generic
+                     aliases are expanded during monomorphization alongside the
+                     D-0017 generics. `type` is a SOFT keyword: it is recognized
+                     as the alias introducer only at item start when immediately
+                     followed by an identifier, and stays a usable identifier
+                     everywhere else. *)
+
 enum_member   ::= variant_name [ "=" expr ] NEWLINE          (* tier-1 constant *)
                 | variant_name "(" variant_field { "," variant_field } ")" NEWLINE ;
                   (* tier-3 data-carrying variant; D-0046 *)

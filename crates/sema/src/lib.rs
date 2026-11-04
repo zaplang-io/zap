@@ -94,6 +94,68 @@ fn rest_inner(t: &BindTarget) -> &BindTarget {
     }
 }
 
+/// Substitute type-parameter names with concrete argument types in a type
+/// expression (#606, transparent-alias expansion). A bare `Named` whose name is
+/// a parameter in `subst` is replaced by the mapped type; every other node is
+/// rebuilt with its children substituted.
+fn subst_type(t: &Type, subst: &HashMap<&str, &Type>) -> Type {
+    match t {
+        Type::Named { name, args, span } => {
+            if args.is_empty() {
+                if let Some(replacement) = subst.get(name.as_str()) {
+                    return (*replacement).clone();
+                }
+            }
+            Type::Named {
+                name: name.clone(),
+                args: args.iter().map(|a| subst_type(a, subst)).collect(),
+                span: *span,
+            }
+        }
+        Type::Tuple { elems, span } => Type::Tuple {
+            elems: elems.iter().map(|e| subst_type(e, subst)).collect(),
+            span: *span,
+        },
+        Type::Func { params, ret, span } => Type::Func {
+            params: params.iter().map(|p| subst_type(p, subst)).collect(),
+            ret: ret.as_ref().map(|r| Box::new(subst_type(r, subst))),
+            span: *span,
+        },
+    }
+}
+
+/// Collect the names of the aliases referenced anywhere in `t` (#606 cycle
+/// detection). Only names present in `aliases` are recorded.
+fn collect_alias_refs(
+    t: &Type,
+    aliases: &HashMap<String, (Vec<String>, Type)>,
+    out: &mut Vec<String>,
+) {
+    match t {
+        Type::Named { name, args, .. } => {
+            if aliases.contains_key(name) {
+                out.push(name.clone());
+            }
+            for a in args {
+                collect_alias_refs(a, aliases, out);
+            }
+        }
+        Type::Tuple { elems, .. } => {
+            for e in elems {
+                collect_alias_refs(e, aliases, out);
+            }
+        }
+        Type::Func { params, ret, .. } => {
+            for p in params {
+                collect_alias_refs(p, aliases, out);
+            }
+            if let Some(r) = ret {
+                collect_alias_refs(r, aliases, out);
+            }
+        }
+    }
+}
+
 /// Type-check a module, returning any errors.
 pub fn check(module: &Module) -> Vec<TypeError> {
     analyze(module).0
@@ -180,6 +242,16 @@ struct Checker {
     /// Registered structural interfaces, keyed by name (D-0016). A struct is
     /// assignable to an interface type iff it structurally conforms.
     interfaces: HashMap<String, InterfaceInfo>,
+    /// Registered transparent type aliases (#606, D-0105), keyed by alias name:
+    /// the declared generic parameter names and the target type they expand to.
+    /// An alias is *not* a nominal type — [`Checker::resolve_type`] expands it to
+    /// its target (substituting the generic parameters) so the alias and its
+    /// target share one identity.
+    aliases: HashMap<String, (Vec<String>, Type)>,
+    /// Alias names that participate in a definition cycle (`type A = B; type B =
+    /// A`), computed in [`Checker::collect_types`]. Resolving one yields
+    /// `Ty::Unknown` instead of looping; the cycle itself is reported once.
+    cyclic_aliases: HashSet<String>,
     /// Declared `annotation` names -> their field names (D-0036). Used to
     /// validate `@Annotation(...)` applications (keyword args must name fields).
     annotations: HashMap<String, Vec<String>>,
@@ -546,6 +618,8 @@ impl Checker {
             enums: HashMap::new(),
             structs: HashMap::new(),
             interfaces: HashMap::new(),
+            aliases: HashMap::new(),
+            cyclic_aliases: HashSet::new(),
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
             scopes: Vec::new(),
@@ -655,6 +729,18 @@ impl Checker {
                 Item::Interface(i) => {
                     self.user_types.insert(i.name.clone());
                 }
+                Item::TypeAlias(a) => {
+                    // A transparent alias is not a nominal type, so it is not
+                    // added to `user_types`; it is expanded to its target in
+                    // `resolve_type`. Record its parameters and target here.
+                    self.aliases.insert(
+                        a.name.clone(),
+                        (
+                            a.generics.iter().map(|g| g.name.clone()).collect(),
+                            a.target.clone(),
+                        ),
+                    );
+                }
                 Item::Annotation(a) => {
                     self.user_types.insert(a.name.clone());
                     self.annotations.insert(
@@ -728,6 +814,56 @@ impl Checker {
                     self.interfaces.insert(i.name.clone(), info);
                 }
                 _ => {}
+            }
+        }
+        // Detect transparent-alias cycles (#606): an alias whose target expands,
+        // directly or via other aliases, back to itself. Such aliases are marked
+        // so `resolve_type` yields `Unknown` instead of looping, and each cycle
+        // is reported once with a clear diagnostic.
+        self.detect_alias_cycles(module);
+    }
+
+    /// Mark every alias that lies on a definition cycle and report it (#606,
+    /// ZAP4090). Uses an iterative colour DFS over the alias dependency graph
+    /// (edge `A -> B` whenever alias `B`'s name appears anywhere in alias `A`'s
+    /// target type). An alias is cyclic iff it can reach itself.
+    fn detect_alias_cycles(&mut self, module: &Module) {
+        // Reachability of alias names from each alias's target.
+        let mut deps: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, (_params, target)) in &self.aliases {
+            let mut referenced = Vec::new();
+            collect_alias_refs(target, &self.aliases, &mut referenced);
+            deps.insert(name.clone(), referenced);
+        }
+        // An alias is cyclic iff it is reachable from itself.
+        let names: Vec<String> = self.aliases.keys().cloned().collect();
+        for start in &names {
+            let mut stack = deps.get(start).cloned().unwrap_or_default();
+            let mut seen: HashSet<String> = HashSet::new();
+            while let Some(n) = stack.pop() {
+                if n == *start {
+                    self.cyclic_aliases.insert(start.clone());
+                    break;
+                }
+                if seen.insert(n.clone()) {
+                    if let Some(next) = deps.get(&n) {
+                        stack.extend(next.iter().cloned());
+                    }
+                }
+            }
+        }
+        // Report each cyclic alias once, at its declaration site.
+        if !self.cyclic_aliases.is_empty() {
+            for item in &module.items {
+                if let Item::TypeAlias(a) = item {
+                    if self.cyclic_aliases.contains(&a.name) {
+                        self.error(
+                            ErrorCode::ZAP4090,
+                            format!("type alias '{}' is defined in terms of itself", a.name),
+                            a.span,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1439,6 +1575,21 @@ impl Checker {
                     Ty::Chan(Box::new(el))
                 }
                 other => {
+                    // A transparent type alias (#606) resolves to its target
+                    // with the generic parameters substituted, recursively, so
+                    // the alias and its target share one identity. A cyclic alias
+                    // yields `Unknown` (the cycle is reported in `collect_types`).
+                    if let Some((params, target)) = self.aliases.get(other) {
+                        if self.cyclic_aliases.contains(other) {
+                            return Ty::Unknown;
+                        }
+                        let mut subst: HashMap<&str, &Type> = HashMap::new();
+                        for (p, a) in params.iter().zip(args.iter()) {
+                            subst.insert(p.as_str(), a);
+                        }
+                        let expanded = subst_type(target, &subst);
+                        return self.resolve_type(&expanded);
+                    }
                     if self.user_types.contains(other) {
                         Ty::Named(other.to_string())
                     } else {
@@ -6116,6 +6267,104 @@ mod tests {
     fn ok(src: &str) {
         let e = errors(src);
         assert!(e.is_empty(), "unexpected type errors: {e:?}");
+    }
+
+    // ---- transparent type aliases (#606, D-0105) --------------------------
+
+    #[test]
+    fn type_alias_is_transparent_to_its_target() {
+        // A plain alias resolves to its target everywhere: a `Count`-typed
+        // function body and a spelled-out `int64` one behave identically.
+        ok(r#"
+type Count = int64
+def total() -> Count:
+    return 42
+"#);
+        // Interchangeable: an alias names the same type as its target, so a
+        // value produced at one spelling flows into the other, and the alias is
+        // usable as a collection element (`list[Row]` / `dict[str, Row]`).
+        ok(r#"
+type Row = (int64, str)
+def make() -> Row:
+    return (1, "a")
+def first(Row r) -> int64:
+    return r[0]
+def main():
+    auto p = make()
+    auto n = first(p)
+    list[Row] rows = []
+    dict[str, Row] table = {}
+"#);
+    }
+
+    #[test]
+    fn type_alias_resolves_to_target_for_diagnostics() {
+        // Proof of transparent identity: returning a `str` from a `Count`-typed
+        // (`= int64`) function is the SAME return-type mismatch (ZAP4003) as
+        // returning a `str` where `int64` is spelled out — the alias carries no
+        // identity of its own.
+        let e = errors("type Count = int64\ndef f() -> Count:\n    return \"nope\"\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4003),
+            "alias must resolve to int64 for the mismatch, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn generic_type_alias_resolves_on_instantiation() {
+        // `type Boxed[T] = T` instantiated as `Boxed[int64]` resolves to `int64`,
+        // so returning a `str` is the int64 return-type mismatch (ZAP4003).
+        let e = errors("type Boxed[T] = T\ndef f() -> Boxed[int64]:\n    return \"nope\"\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4003),
+            "generic alias Boxed[int64] must resolve to int64, got {e:?}"
+        );
+        // And the matching return is accepted.
+        ok("type Pair[T] = (T, T)\ndef g() -> Pair[int64]:\n    return (1, 2)\n");
+    }
+
+    #[test]
+    fn type_alias_chain_resolves_through_aliases() {
+        // A non-cyclic alias chain resolves fully: `Meters -> Len -> int64`.
+        let e =
+            errors("type Len = int64\ntype Meters = Len\ndef f() -> Meters:\n    return \"x\"\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4003),
+            "alias chain must resolve to int64, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn cyclic_type_alias_is_rejected() {
+        // A two-step cycle is reported (ZAP4090) rather than looping.
+        let e = errors("type A = B\ntype B = A\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4090),
+            "expected ZAP4090 for the cycle, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn self_referential_type_alias_is_rejected() {
+        // The degenerate self-cycle `type A = A`, and an indirect cycle through a
+        // collection element, are both reported.
+        let e = errors("type A = A\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4090),
+            "expected ZAP4090 for `type A = A`, got {e:?}"
+        );
+        let e = errors("type A = list[B]\ntype B = (int64, A)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4090),
+            "expected ZAP4090 for the indirect cycle, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn type_is_a_usable_identifier_in_sema() {
+        // The soft keyword does not reserve `type`: an ordinary local named
+        // `type` type-checks with no alias involved.
+        ok("def main():\n    auto type = 3\n    print(type + 1)\n");
     }
 
     #[test]

@@ -322,6 +322,7 @@ impl<'a> Printer<'a> {
             Item::Struct(s) => self.emit_struct(s),
             Item::Interface(i) => self.emit_interface(i),
             Item::Enum(e) => self.emit_enum(e),
+            Item::TypeAlias(a) => self.emit_type_alias(a),
             Item::Annotation(a) => self.emit_annotation(a),
             Item::Decorator(d) => self.emit_decorator_def(d),
             Item::Import(imp) => {
@@ -409,6 +410,18 @@ impl<'a> Printer<'a> {
         // An empty struct body keeps its explicit `pass` spelling (#591),
         // mirroring the empty-enum case — a block must not be rendered bodyless.
         self.emit_members(&members, s.span.end, (members.is_empty()).then_some("pass"));
+    }
+
+    fn emit_type_alias(&mut self, a: &TypeAliasDef) {
+        self.push_line(&format!(
+            "type {}{} = {}",
+            a.name,
+            generics_str(&a.generics),
+            type_str(&a.target)
+        ));
+        // Record the end so the inter-item blank-line gap is measured from here,
+        // not from the previous construct (which would double the blank lines).
+        self.last_end = a.span.end;
     }
 
     fn emit_enum(&mut self, e: &EnumDef) {
@@ -1059,6 +1072,7 @@ fn item_start(item: &Item) -> u32 {
         Item::Function(f) => f.decorators.first().map_or(f.span.start, |d| d.span.start),
         Item::Struct(s) => s.decorators.first().map_or(s.span.start, |d| d.span.start),
         Item::Enum(e) => e.decorators.first().map_or(e.span.start, |d| d.span.start),
+        Item::TypeAlias(a) => a.span.start,
         Item::Interface(i) => i.span.start,
         Item::Annotation(a) => a.span.start,
         Item::Decorator(d) => d.span.start,
@@ -1132,6 +1146,15 @@ fn espan(e: &Expr) -> Span {
 #[cfg(test)]
 mod tests {
     use super::format_source;
+
+    #[test]
+    fn type_aliases_are_formatted_stably() {
+        // Plain, generic, chained, and function-target aliases round-trip
+        // byte-for-byte (#606), including the single-blank-line item gap.
+        let src = "type Count = int64\n\ntype Pair[T] = (T, T)\n\n\
+                   type Table = dict[str, int64]\n\ntype Pred = fn(int64) -> bool\n";
+        assert_eq!(format_source(src).unwrap(), src);
+    }
 
     #[test]
     fn array_collection_contract_fixtures_are_formatted() {

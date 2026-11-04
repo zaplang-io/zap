@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- Transparent type aliases: `type Name = <type>`, plus the generic form
+  `type Name[T] = <type>` (#606, D-0105). An alias is not a new nominal type — it
+  resolves to its target with the same identity, so an alias and the spelled-out
+  type are interchangeable in signatures and collections (`list[Row]`,
+  `dict[str, Row]`). Generic aliases are expanded during monomorphization
+  alongside the existing generics (`Pair[int64]` → `(int64, int64)`). `type` is a
+  soft keyword recognized only at item start, so it stays a usable identifier
+  elsewhere. A cyclic alias (`type A = B; type B = A`) is rejected (`ZAP4090`).
 - Positional-only parameters via a bare `/` separator: parameters before `/`
   may only be supplied positionally, never by name (the mirror of the keyword-only
   `*` separator). `/` appears at most once and must precede any `*`; passing a
