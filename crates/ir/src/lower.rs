@@ -332,6 +332,13 @@ struct StructCtx {
     /// an absent sid) means the struct has no generated validator. Sema has
     /// already checked argument shapes and field-type suitability.
     field_checks: HashMap<u32, Vec<Vec<FieldCheck>>>,
+    /// Module-level global slots (D-0112, #658 Phase 1), in declaration /
+    /// init order. Populated by the init pre-pass (`lower_init_globals`) before
+    /// any user function is lowered, so a reference to a module `const` resolves
+    /// to its slot ([`FnLower::expr`]'s `Expr::Name` global fallback). The index
+    /// into this vec is the `idx` carried by [`ir_core::Inst::GlobalAddr`] and
+    /// [`ir_core::Module::globals`].
+    globals: RefCell<Vec<GlobalVar>>,
 }
 
 /// One construction-time field validation constraint (`@validate`/`@range`,
@@ -616,6 +623,34 @@ impl StructCtx {
     /// Is `sid` a `value struct` (value type, D-0051)?
     fn is_value_struct(&self, sid: u32) -> bool {
         self.value_ids.contains(&sid)
+    }
+
+    /// Register a module-level global slot (D-0112, #658 Phase 1), returning its
+    /// index. Called by the init pre-pass in declaration order.
+    fn add_global(&self, name: &str, ty: Ty) -> u32 {
+        let mut g = self.globals.borrow_mut();
+        let idx = g.len() as u32;
+        g.push(GlobalVar {
+            name: name.to_string(),
+            ty,
+        });
+        idx
+    }
+
+    /// Resolve a module-level global binding to its `(slot index, type)`, if any.
+    /// A reference to a module `const` lowers to a [`Inst::GlobalAddr`] + load.
+    fn global(&self, name: &str) -> Option<(u32, Ty)> {
+        self.globals
+            .borrow()
+            .iter()
+            .position(|g| g.name == name)
+            .map(|i| (i as u32, self.globals.borrow()[i].ty))
+    }
+
+    /// Whether the program declares any module-level global (D-0112). `main`
+    /// calls `@__zap_init_globals` once at its top exactly when this is true.
+    fn has_globals(&self) -> bool {
+        !self.globals.borrow().is_empty()
     }
 
     /// Whether `sid` uses the physical inline / register / sret layout (D-0051):
@@ -1078,6 +1113,7 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         call_params: HashMap::new(),
         json_field_opts,
         field_checks,
+        globals: RefCell::new(Vec::new()),
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -1327,6 +1363,22 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
             packed: ctx.packed_layouts.get(&(sid as u32)).cloned(),
         });
     }
+    // Module-level `const` state (D-0112, #658 Phase 1): lower the const
+    // initializers into `@__zap_init_globals` BEFORE any user function, so the
+    // global slots are registered in `ctx.globals` and a reference to one
+    // resolves (see `FnLower::expr`'s `Expr::Name` global fallback). `main`
+    // calls `@__zap_init_globals` once at its top (see `lower_fn`). The module
+    // linker has already ordered the items import-topologically (D-0081), so the
+    // consts initialize in dependency-then-source order.
+    match lower_init_globals(module, &sigs, &ctx) {
+        Ok(func) => {
+            if ctx.has_globals() {
+                out.funcs.push(func);
+            }
+        }
+        Err(e) => errors.push(e),
+    }
+    out.globals = ctx.globals.borrow().clone();
     for item in &module.items {
         match item {
             // A generator is lowered to its state struct's `__iter__`/`__next__`
@@ -4376,6 +4428,14 @@ fn lower_fn(
     if wants_top_handler {
         let lp = b.new_block();
         b.landing_pads.push(lp);
+        // Module-level persistent state (D-0112, #658 Phase 1): initialize every
+        // module `const` exactly once, before the user body, by calling the
+        // synthetic `@__zap_init_globals`. Emitted under the landing pad so a
+        // raise inside an initializer unwinds to the top-level handler like any
+        // other. Only `main` carries this (a REPL entry does not re-init).
+        if is_main && b.ctx.has_globals() {
+            b.throwing_call(None, "__zap_init_globals", vec![]);
+        }
         for st in &f.body.stmts {
             b.stmt(st)?;
         }
@@ -4405,6 +4465,78 @@ fn lower_fn(
                 b.set_term(Term::Unreachable);
             }
         }
+    }
+    Ok(b.func)
+}
+
+/// Lower the module-level `const` declarations (D-0112, #658 Phase 1) into the
+/// synthetic `@__zap_init_globals` function, run once at the top of `main`.
+///
+/// Each `const T NAME = expr` (and `const auto NAME = expr`) at module scope
+/// becomes a module global slot: its initializer is lowered here — reusing the
+/// ordinary `let` lowering (coerce to the declared type, or infer for `auto`;
+/// value-struct copy) — and stored into the slot. The slot is registered in
+/// `ctx.globals` as it is created, so a later const's initializer, and every
+/// user function body lowered afterwards, resolve a reference to it (an earlier
+/// const, a forward reference fails as use-before-init). Items arrive in
+/// import-topological + source order (the module linker arranged that), which
+/// is the eager init order. A pointer-typed slot is registered as a permanent
+/// GC root (`zap_gc_add_root`) so the collector — conservative Boehm (a no-op
+/// there, the data segment is scanned) or precise Immix — keeps its referent
+/// live.
+fn lower_init_globals(
+    module: &ast::Module,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let mut b = FnLower::new(
+        "__zap_init_globals".to_string(),
+        vec![],
+        Ty::Void,
+        false,
+        false,
+        sigs,
+        ctx,
+    );
+    for item in &module.items {
+        let ast::Item::Stmt(Stmt::Let {
+            is_const: true,
+            ty,
+            name,
+            value,
+            ..
+        }) = item
+        else {
+            continue;
+        };
+        let (v, declared) = match ty {
+            Some(t) => {
+                let declared = resolve_ty(t, &ctx.tyenv())?;
+                (
+                    b.expr_coerced(value, declared, zapc_diag::ErrorCode::ZAP4001)?,
+                    declared,
+                )
+            }
+            None => b.expr(value)?,
+        };
+        // A value struct is copied on binding (D-0051), like any `let`.
+        let v = b.copy_if_value(v, declared, value);
+        let idx = ctx.add_global(name, declared);
+        let slot = b.new_value(Ty::Ptr);
+        b.emit(Inst::GlobalAddr { dest: slot, idx });
+        // Root a pointer slot before storing into it, so the referent survives a
+        // GC triggered by a later initializer's allocation.
+        if declared.is_ptr() {
+            b.emit(Inst::Call {
+                dest: None,
+                func: "zap_gc_add_root".to_string(),
+                args: vec![slot],
+            });
+        }
+        b.store(slot, v);
+    }
+    if !b.terminated() {
+        b.set_term(Term::Ret(None));
     }
     Ok(b.func)
 }
@@ -8882,6 +9014,15 @@ impl<'a> FnLower<'a> {
             Expr::Name(n, _) => {
                 if let Some((ptr, ty)) = self.lookup(n) {
                     return Ok((self.load(ptr, ty), ty));
+                }
+                // A module-level `const` (D-0112, #658 Phase 1): read its global
+                // slot — the slot address followed by a load, exactly as a local
+                // lowers to its `alloca` + load. The slot was registered by the
+                // init pre-pass before any body was lowered.
+                if let Some((idx, ty)) = self.ctx.global(n) {
+                    let slot = self.new_value(Ty::Ptr);
+                    self.emit(Inst::GlobalAddr { dest: slot, idx });
+                    return Ok((self.load(slot, ty), ty));
                 }
                 // A bare top-level function used as a **value** (I#163): `g(f)`,
                 // `[inc, dec]`, `return inc`. Wrap it as a first-class function

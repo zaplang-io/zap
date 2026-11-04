@@ -342,7 +342,18 @@ define_codes! {
          statements: an executable statement at module scope would never run \
          (D-0081/D-0021, ticket #459). Move it — and any registering decorator \
          such as `@app.get(...)` on a `def` — inside `def main()` (or another \
-         function). A leading bare-string module docstring is still allowed.";
+         function). A leading bare-string module docstring is still allowed. \
+         A module-level `const` declaration (`const T NAME = expr`) is allowed \
+         (D-0112, #658 Phase 1).";
+    ZAP3017 = 3017 : "assignment to a constant binding",
+        "A `const` binding is immutable (D-0003): it cannot be reassigned, \
+         augmented (`+=`), or otherwise rebound after its declaration. Declare \
+         it without `const` if the binding must change.";
+    ZAP3018 = 3018 : "module-level mutable variable not yet supported",
+        "A module-level mutable binding (`T NAME = expr` at module scope) is not \
+         supported yet (D-0112, #658 Phase 2). Only module-level `const` \
+         declarations (`const T NAME = expr`) are available today; make it \
+         `const`, or move the mutable state into a function.";
 
     // ---- ZAP4xxx — type checking -------------------------------------------
     ZAP4001 = 4001 : "type mismatch in assignment",

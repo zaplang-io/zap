@@ -91,12 +91,24 @@ _Last updated: 2026-10-22_
   `@default`/`@validate`/`@range` (D-0101) and `@deprecated` (D-0109) are
   implemented. `@cache` is **deferred** (D-0109), gated on the **module-level
   persistent state** language feature (its only real blocker — epic #661,
-  prerequisite #658, built-in #666); `@inject` is **declined for core** (D-0109)
-  — DI is a framework concern met by reflection-driven `Depends(...)` adapters
-  (D-0089/D-0092), with no planned core `@inject`. Still open: the
-  macro API (what a decorator sees/emits) and hygiene rules; `@validate(matches=…)`
-  regex validation; richer reflection (field-level metadata, annotation argument
+  prerequisite #658, built-in #666); its Phase 1 (module-level `const`, #658,
+  D-0112) is implemented, so `@cache` is unblocked pending the mutable phase.
+  `@inject` is **declined for core** (D-0109) — DI is a framework concern met by
+  reflection-driven `Depends(...)` adapters (D-0089/D-0092), with no planned
+  core `@inject`. Still open: the macro API (what a decorator sees/emits) and
+  hygiene rules; `@validate(matches=…)` regex validation; richer reflection
+  (field-level metadata, annotation argument
   values).
+- 🟡 **Module-level persistent state** (epic #661, D-0112) — the model is locked
+  and Phase 1 (module-level `const`, #658) is implemented (eager import-topological
+  init; reference consts as GC roots; immutable). Still open (Phases 2–3): the
+  module-level **mutable** form (`T NAME = expr`, rejected today with ZAP3018);
+  the static concurrency-**sharing lint** (warnings over the #659 pipeline, never
+  a legality flag); the nominal **`@shareable`** marker (one uniform rule for
+  built-in `Atomic`/`Mutex`/concurrent types, reflection-queryable, per-site
+  `# noqa`); and the runtime **`-race`** detector. Under precise Immix (D-0009),
+  mutable pointer-slot stores will also need a write barrier + static root table
+  (Phase 1 already registers each pointer slot via `zap_gc_add_root`).
 - ⚪ **C FFI** (D-0012) — deferred; generalizes interop to all languages.
 - ⚪ **Precise GC** (Immix-style) replacing Boehm (D-0009).
 - ⚪ **Arena / region allocation** (à la Go's `GOEXPERIMENT=arenas`) — deferred.

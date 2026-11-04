@@ -357,9 +357,20 @@ impl<'t> Loader<'t> {
     /// statement at module scope never lowers to code (the IR carries no
     /// top-level landing spot for one — it is silently dropped), so it is an
     /// error rather than a no-op, in the entry module (ZAP3016) and imported
-    /// modules alike (ZAP3014, which also keeps them declaration-only). The one
-    /// exception is a **module docstring** (D-0041): a bare, non-f-string string
-    /// literal carries no behaviour, so it is allowed at module scope.
+    /// modules alike (ZAP3014, which also keeps them declaration-only).
+    ///
+    /// Three constructs are admitted at module scope and skipped here:
+    ///   * a **module docstring** (D-0041): a bare, non-f-string string literal
+    ///     carries no behaviour;
+    ///   * a **module-level `const` declaration** (`const T NAME = expr`,
+    ///     D-0112 / #658 Phase 1): persistent immutable state, initialized once
+    ///     before `main`. Lowering turns it into a module global (see
+    ///     `zapc_ir`), so — unlike a bare statement — it does lower to code.
+    ///
+    /// A module-level **mutable** declaration-with-initializer (`T NAME = expr`,
+    /// or any tuple-destructuring declaration) is a planned #658 Phase 2 surface
+    /// that is not available yet; it gets its own diagnostic (ZAP3018) pointing
+    /// at that phase rather than the blanket executable-statement code.
     fn check_toplevel_statements(&mut self) {
         let mut found = Vec::new();
         for m in &self.modules {
@@ -368,7 +379,23 @@ impl<'t> Loader<'t> {
                     if is_doc_stmt(st) {
                         continue;
                     }
-                    let code = if m.is_entry {
+                    // A module-level `const T NAME = expr` is persistent
+                    // immutable state (D-0112, #658 Phase 1) — allowed.
+                    if matches!(st, Stmt::Let { is_const: true, .. }) {
+                        continue;
+                    }
+                    // A module-level mutable declaration-with-initializer (a
+                    // non-const `Let`, or any tuple-destructuring `LetTuple`,
+                    // const or not) is #658 Phase 2 — not available yet.
+                    let code = if matches!(
+                        st,
+                        Stmt::Let {
+                            is_const: false,
+                            ..
+                        } | Stmt::LetTuple { .. }
+                    ) {
+                        ErrorCode::ZAP3018
+                    } else if m.is_entry {
                         ErrorCode::ZAP3016
                     } else {
                         ErrorCode::ZAP3014
@@ -378,19 +405,65 @@ impl<'t> Loader<'t> {
             }
         }
         for (code, span, file) in found {
-            let message = if code == ErrorCode::ZAP3016 {
+            let message = if code == ErrorCode::ZAP3018 {
+                "module-level mutable state is not supported yet (#658 Phase 2): \
+                 only a module-level `const` declaration (`const T NAME = expr`) \
+                 is available today — make it `const`, or move the mutable state \
+                 into a function"
+                    .to_string()
+            } else if code == ErrorCode::ZAP3016 {
                 "top-level executable statement: a compiled program runs from \
                  `def main()`, so this would never run — move it (and any \
-                 `@receiver.method(...)` decorator on a `def`) into `def main()`"
+                 `@receiver.method(...)` decorator on a `def`) into `def main()` \
+                 (a module-level `const` declaration is allowed)"
                     .to_string()
             } else {
                 "top-level statements are not allowed in an imported module \
-                 (only declarations and a leading docstring); move executable \
-                 code into a function the importer calls"
+                 (only declarations, a module-level `const`, and a leading \
+                 docstring); move executable code into a function the importer \
+                 calls"
                     .to_string()
             };
             self.diag(code, message, span, &file);
         }
+    }
+
+    /// Import-topological module order for merging / eager global init (D-0112):
+    /// a post-order DFS from the entry over the resolved import edges, so a
+    /// module appears after every module it imports (its dependencies). The
+    /// graph is acyclic here (cycles are rejected before merge, ZAP3011). Any
+    /// module not reachable from the entry — there should be none, every loaded
+    /// module was discovered by following imports from the entry — is appended in
+    /// load order so nothing is dropped.
+    fn init_order(&self) -> Vec<usize> {
+        let n = self.modules.len();
+        let mut visited = vec![false; n];
+        let mut order = Vec::with_capacity(n);
+        // Iterative post-order DFS: push a node, then its unvisited targets;
+        // record the node once all its targets have been emitted.
+        let mut stack: Vec<(usize, bool)> = vec![(0, false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                order.push(node);
+                continue;
+            }
+            if visited[node] {
+                continue;
+            }
+            visited[node] = true;
+            stack.push((node, true));
+            for e in &self.edges[node] {
+                if !visited[e.target] {
+                    stack.push((e.target, false));
+                }
+            }
+        }
+        for (idx, done) in visited.iter().enumerate() {
+            if !done {
+                order.push(idx);
+            }
+        }
+        order
     }
 
     /// Qualify every module's symbols and references, then concatenate into one
@@ -405,9 +478,18 @@ impl<'t> Loader<'t> {
             })
             .collect();
 
+        // Emit modules in import-topological order — a module after every module
+        // it imports (D-0081 graph is acyclic; cycles are already rejected). This
+        // makes the merged item list carry module-level `const` declarations
+        // (D-0112, #658) in their eager init order: a dependency's globals come
+        // before a dependent's, and source order is preserved within a module.
+        // Reordering is otherwise behaviour-neutral — every other top-level item
+        // is a definition, not executed in order.
+        let order = self.init_order();
         let mut items: Vec<Item> = Vec::new();
         let mut rw_diags: Vec<ModDiag> = Vec::new();
-        for (idx, m) in self.modules.iter().enumerate() {
+        for idx in order {
+            let m = &self.modules[idx];
             let aliases: HashMap<String, &ModuleFacts> = self.edges[idx]
                 .iter()
                 .map(|e| (e.bound.clone(), &facts[e.target]))
@@ -543,6 +625,18 @@ fn top_level_symbols(ast: &Module) -> HashSet<String> {
             }
             Item::Interface(i) => {
                 s.insert(i.name.clone());
+            }
+            // A module-level `const` binding (D-0112, #658 Phase 1) is a module
+            // member like any other top-level declaration: it is visible to the
+            // module's own code, mangled with the module prefix, and reachable
+            // across modules as `alias.NAME` (unless `_`-private). Non-const
+            // top-level statements never reach here (rejected before merge).
+            Item::Stmt(Stmt::Let {
+                is_const: true,
+                name,
+                ..
+            }) => {
+                s.insert(name.clone());
             }
             _ => {}
         }

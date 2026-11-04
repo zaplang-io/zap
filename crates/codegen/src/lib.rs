@@ -427,6 +427,7 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | LandingPad { dest, .. }
         | ArrayBinOp { dest, .. }
         | FuncAddr { dest, .. }
+        | GlobalAddr { dest, .. }
         | ClosureMake { dest, .. }
         | IfaceMake { dest, .. }
         | AtomicLoad { dest, .. }
@@ -461,6 +462,13 @@ struct Cg<'a, 'ctx> {
     /// instance's pointer fields. Empty under the Boehm build.
     #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
     struct_descs: Vec<PointerValue<'ctx>>,
+    /// Module-level global slots (D-0112, #658 Phase 1), indexed by the `u32` in
+    /// [`zir::ir::Inst::GlobalAddr`] / [`zir::ir::Module::globals`]. Each is an
+    /// LLVM global variable (zero/null initialized) whose address a `GlobalAddr`
+    /// yields; a module `const` reads it with a following `Load`. The one-time
+    /// initializing stores (and, for pointer slots, `zap_gc_add_root`) are
+    /// emitted by `@__zap_init_globals`, called at the top of `main`.
+    globals: Vec<PointerValue<'ctx>>,
     /// The current function's shadow-stack frame (ticket #48, gc-immix). `None`
     /// under Boehm or for a function with no GC-pointer-typed values.
     #[cfg_attr(not(feature = "gc-immix"), allow(dead_code))]
@@ -561,6 +569,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             struct_inline: Vec::new(),
             struct_packed: Vec::new(),
             struct_descs: Vec::new(),
+            globals: Vec::new(),
             gc_frame: None,
             target_data: None,
             entry_block: None,
@@ -1328,6 +1337,32 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 let d = self.emit_struct_desc(sid as u32, &m.structs[sid]);
                 self.struct_descs.push(d);
             }
+        }
+
+        // Module-level global slots (D-0112, #658 Phase 1): one LLVM global per
+        // ZIR global, zero/null initialized, internal linkage (whole-program AOT
+        // module). A `GlobalAddr` yields the slot's address; `@__zap_init_globals`
+        // fills it once before `main`. A pointer slot in the data/BSS segment is
+        // scanned by the conservative Boehm collector as-is; under the precise
+        // Immix collector `@__zap_init_globals` also registers it via
+        // `zap_gc_add_root`, so the referent stays live either way.
+        if !m.globals.is_empty() {
+            // `void zap_gc_add_root(void **slot)` — registers a permanent root
+            // (a no-op macro under the conservative Boehm build; a real
+            // registration under precise Immix). `@__zap_init_globals` calls it
+            // for each pointer-typed global.
+            let ptr = self.ctx.ptr_type(AddressSpace::default());
+            self.declare_rt("zap_gc_add_root", &[ptr.into()], None);
+        }
+        for (i, g) in m.globals.iter().enumerate() {
+            let _ = &g.name;
+            let llty = self.basic(g.ty);
+            let gv = self
+                .module
+                .add_global(llty, None, &format!("zap_global_{i}"));
+            gv.set_initializer(&llty.const_zero());
+            gv.set_linkage(inkwell::module::Linkage::Internal);
+            self.globals.push(gv.as_pointer_value());
         }
 
         // Functions whose address is taken (`Inst::FuncAddr`) are handed to the
@@ -2926,6 +2961,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     .get(func)
                     .ok_or_else(|| format!("address of unknown function '{func}'"))?;
                 let p = fv.as_global_value().as_pointer_value();
+                vals[*dest as usize] = Some(p.into());
+            }
+            Inst::GlobalAddr { dest, idx } => {
+                // The address of a module-level global slot (D-0112, #658
+                // Phase 1): the LLVM global emitted in `translate`. A module
+                // `const` reads it with a following `Load`.
+                let p = *self
+                    .globals
+                    .get(*idx as usize)
+                    .ok_or_else(|| format!("address of unknown global #{idx}"))?;
                 vals[*dest as usize] = Some(p.into());
             }
             Inst::ClosureMake {
