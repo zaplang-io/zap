@@ -190,13 +190,16 @@ not supported — it may change in **any** release, including a PATCH:
 - **Module-level persistent state** (epic #661, D-0112) — **Experimental**. The
   module-level `const` form (#658 Phase 1) and the **mutable** form (#662 Phase
   2 — `T NAME = expr`, reassignable and mutable, a permanent GC root when
-  reference-typed) are implemented. Still not in the language: the concurrency-
-  sharing lint and the `@shareable` marker (later #661 phases), and the precise-
-  Immix write barriers for mutable pointer globals (#663 — a mutable reference
-  global is correct under both collectors today, since the root slot is scanned
-  and relocated through on every stop-the-world collection). A module-level
-  tuple-destructuring declaration is rejected (`ZAP3018`). The surface is
-  expected to graduate to Stable, but is Experimental until then (§4).
+  reference-typed) are implemented, and the **precise-Immix static roots and
+  write barrier** for pointer globals (#663) have landed: every pointer slot is
+  walked and relocated through by the precise collector's static root table, and
+  a reassignment of a mutable pointer global fires a `zap_gc_write_barrier` hook
+  on the slot (a linkable runtime no-op today — the stop-the-world collector
+  re-scans every root each cycle — reserved for a future generational/incremental
+  mode). Still not in the language: the concurrency-sharing lint and the
+  `@shareable` marker (later #661 phases). A module-level tuple-destructuring
+  declaration is rejected (`ZAP3018`). The surface is expected to graduate to
+  Stable, but is Experimental until then (§4).
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,
@@ -367,7 +370,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `set[T]` — literals `{1, 2, 3}`, comprehensions `{x for x in xs}`, `.add`/`in`/`len`/iteration, and the `set[T]()` / `set(iterable)` constructors (#608/#609, graduated per D16/D17) | **S** |
 | Numeric arrays / SIMD + dtype promotion (D-0011); C-style bitfields (D-0068); Python interop; `@derive(Yaml)`/`@derive(Csv)` | **E** |
 | `when target.*` compile-time conditional compilation (D-0079, I#139 Phase 1) | **E** |
-| Module-level persistent state — `const` (immutable, #658 Phase 1) and mutable (`T NAME = expr`, reassignable/mutable, GC root; #662 Phase 2) bindings at module scope, eager import-topological init (D-0112, epic #661). The sharing lint + `@shareable` (later phases) and precise-Immix write barriers (#663) are not yet in the language | **E** |
+| Module-level persistent state — `const` (immutable, #658 Phase 1) and mutable (`T NAME = expr`, reassignable/mutable, GC root; #662 Phase 2) bindings at module scope, eager import-topological init, precise-Immix static roots + write barrier for pointer globals (#663) (D-0112, epic #661). The sharing lint + `@shareable` (later phases) are not yet in the language | **E** |
 | Value/memory layout, enum/closure representation (§1.5) | **I** |
 
 **Standard library (per module; `crates/sema/src/modules/`, D-0056).**

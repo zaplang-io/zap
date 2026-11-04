@@ -339,3 +339,41 @@ def main():
         "stdout={stdout:?} stderr={stderr:?}"
     );
 }
+
+/// Module-global reassignment roots only the CURRENT value (#663, epic #661). A
+/// mutable module-level pointer global is reassigned to a fresh large list each
+/// round under a heap cap. The slot is a single permanent root that the
+/// collector reads move-aware every cycle (`zap_process_slot`), so once a round
+/// overwrites the slot the previous round's list is unreachable and reclaimed —
+/// the peak plateaus near one live list plus the GC threshold. If reassignment
+/// left the old target stale-rooted, every round's list would be retained and
+/// the accumulated garbage would blow the cap and abort. Completing within the
+/// cap is the deterministic, Immix-only signal that the write path keeps the
+/// root tracking the live value with no stale rooting. (Boehm scans the data
+/// segment conservatively and is exercised by the behavior-identical dual-leg
+/// goldens instead.)
+#[test]
+fn immix_module_global_reassignment_roots_only_current_value() {
+    // 30 rounds × a 60k-element `list[int64]` (~480 KiB of data each). All 30
+    // retained would be ~14 MiB, well past the 8 MiB cap; only the current one
+    // kept (plus the 4 MiB threshold) stays comfortably under it.
+    let src = "list[int64] g = [0]\n\
+               def main():\n    \
+                   for r in range(0, 30):\n        \
+                       list[int64] big = []\n        \
+                       for i in range(0, 60000):\n            \
+                           big.append(i)\n        \
+                       g = big\n    \
+                   print(len(g))\n";
+    let (ok, stdout, stderr) = run_capped(src, 8 * 1024 * 1024);
+    assert!(
+        ok,
+        "reassigning a module global must drop the prior value so it is reclaimed; \
+         stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout.trim_end(),
+        "60000",
+        "the global holds exactly the last-assigned list; stdout={stdout:?} stderr={stderr:?}"
+    );
+}

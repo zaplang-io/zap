@@ -3742,10 +3742,11 @@ deferred (tracked under #661).
 7. **GC.** Module-global slots are **permanent GC roots**. Under the
    conservative Boehm collector (today) the static data/BSS segment is scanned,
    so a `const` holding a heap pointer is a root with no registration. Under the
-   precise Immix collector (D-0009, later) each pointer slot is emitted into the
+   precise Immix collector (D-0009) each pointer slot is emitted into the
    static root table so the collector marks and relocates through it; Phase 1
    already registers every pointer-typed slot via `zap_gc_add_root` so **both
-   collectors are correct** with one code path.
+   collectors are correct** with one code path. **#663** completes the precise
+   side — the static root table and the write barrier below.
 8. **`@cache` (#666, supersedes the deferred D-0109 reclassification of #472).**
    Out of scope here; it is unblocked by this state mechanism and tracked
    separately.
@@ -3882,3 +3883,57 @@ global, and const/mutable coexistence in one slot table. End-to-end goldens
 heavy garbage, asserting length+sum, never heap bytes; `module_tuple_decl_rejected`;
 and the `module_mutable_across_modules` project) run under the full-codegen CI
 jobs (both collectors).
+
+### Precise-Immix static roots + write barrier (I#663)
+
+Point 7 above requires module-global pointer slots to be correct under the
+precise Immix collector (D-0009), not only conservative Boehm. #663 settles the
+precise-side rule in two parts:
+
+- **Static root table (no new code — a property we now rely on and test).** Every
+  pointer-typed module-global slot is registered with `zap_gc_add_root` by
+  `@__zap_init_globals` (Phase 1/2 already do this). Under Immix that call appends
+  the slot's **address** to the runtime's static root table (`zap_groots`); the
+  collector walks the table at each GC and processes every entry **move-aware**
+  (`zap_process_slot`): it marks the referent and, if the referent was evacuated,
+  rewrites the slot in place. So a structure held only via a module global is
+  never collected and is **never left with a stale pointer after evacuation** —
+  the slot is updated to the relocated address. Scalar/non-pointer globals get no
+  entry (nothing to trace). Boehm needs no table: it scans the data/BSS segment
+  conservatively, so `zap_gc_add_root` is an exported no-op there.
+- **Write barrier (the hook #663 adds).** Reassigning a **mutable** module-global
+  *pointer* (`NAME = expr`, plus augmented / chained / tuple-leaf) overwrites a
+  permanent-root slot, installing a new old→new edge out of an immortal root.
+  Each such store is followed by a `zap_gc_write_barrier(&slot)` call. An
+  immutable reference `const` needs the root-table entry but **no** barrier — it
+  is stored once at init and never reassigned (ZAP3017). The one-time initializer
+  store in `@__zap_init_globals` is likewise **unbarriered**: it runs before
+  `main`, so there is no prior value and nothing to remember (startup
+  consistency). A local pointer reassignment gets no barrier either (it is a
+  shadow-stack root, re-scanned precisely each GC, not a permanent root).
+
+  The barrier is a **post-write card-mark** shape (it takes the slot address, so
+  a collector can read the new referent). Today's Immix is stop-the-world
+  mark/evacuate and re-scans every static root on every collection, so there is
+  nothing to remember and the barrier is a **linkable runtime no-op** — real
+  functions, not macros, because codegen emits a `call zap_gc_write_barrier` at
+  each reassignment site (and it is an exported no-op under Boehm). It is the
+  single named record point a future **generational or incremental** Immix mode
+  fills in: such a mode does not re-scan every immortal root each minor cycle, so
+  the old→new edge must be remembered there. Keeping the call site and symbol in
+  place now makes that evolution a change to one runtime function, with no new
+  codegen or ABI. (See `docs/design/c-ffi.md` §2.3 for the matching FFI rule.)
+
+**Verification (#663).** IR tests assert that a mutable pointer-global
+reassignment emits exactly one `zap_gc_write_barrier` on the slot **after** the
+store, that an augmented reassignment of a pointer global fires it too, and that
+a scalar global, a *local* pointer reassignment, an immutable reference `const`,
+and the `@__zap_init_globals` init store all emit **none**. End-to-end goldens
+run under **both** collectors with contents/identity assertions only (never heap
+bytes): `module_global_reassign_across_gc` reassigns a `list[str]` global across
+forced collections under garbage pressure and reads the relocated elements back;
+`module_const_global_evac_survives` keeps a nested `const list[list[str]]` intact
+across eight collections. An Immix-only reclamation test
+(`immix_module_global_reassignment_roots_only_current_value`, under a heap cap)
+proves reassignment drops the prior value so it is reclaimed — the root tracks
+only the live slot contents, with no stale rooting.

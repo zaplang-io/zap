@@ -25,6 +25,20 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Precise-Immix static roots + write barrier for module globals** (#663,
+  D-0112; epic #661). Module-global pointer slots are now correct under the
+  **precise Immix** collector, not only conservative Boehm. Every pointer slot is
+  registered in the precise collector's static root table, which it walks at each
+  GC and processes **move-aware** — marking the referent and rewriting the slot
+  in place when the referent is evacuated — so a structure held only via a module
+  global is never collected and never left with a stale pointer after relocation.
+  Reassigning a **mutable** module-global pointer (`=`, `+=`, chained, tuple-leaf)
+  now emits a `zap_gc_write_barrier` on the slot; an immutable reference `const`
+  and the one-time initializer store emit none. The barrier is a linkable runtime
+  no-op today (the stop-the-world collector re-scans every root each cycle) and is
+  the reserved record point for a future generational/incremental mode. Boehm
+  behavior is unchanged (the barrier and root registration are exported no-ops;
+  the data segment is scanned conservatively).
 - **Module-level mutable globals** — persistent, reassignable state at module
   scope (#662, D-0112; Phase 2 of the module-level-persistent-state epic #661,
   building on the `const` form from #658). A `T NAME = expr` (or
@@ -40,8 +54,8 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   currently holds live — including after reassignment or growth — under both the
   conservative Boehm and precise Immix collectors). Concurrency is the light
   Go/Python model of #661 (unsynchronized, never implicitly locked); the static
-  sharing lint, the `@shareable` marker, and precise-Immix write barriers (#663)
-  are later work. A module-level tuple-destructuring declaration stays rejected
+  sharing lint and the `@shareable` marker are later work (the precise-Immix
+  static roots and write barrier landed in #663, above). A module-level tuple-destructuring declaration stays rejected
   (**ZAP3018**); a `const` module binding stays immutable (**ZAP3017**).
 - **Module-level `const`** — persistent, immutable state at module scope (#658,
   D-0112; Phase 1 of the module-level-persistent-state epic #661). A
