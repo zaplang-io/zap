@@ -2234,4 +2234,114 @@ def main():
             "storing a value struct in a list should box (copy) it"
         );
     }
+
+    // ---- module-level `const` globals (D-0112, #658 Phase 1) --------------
+
+    fn count_calls(f: &zapc_ir_core::Func, name: &str) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| {
+                matches!(i, Inst::Call { func, .. } | Inst::Invoke { func, .. } if func == name)
+            })
+            .count()
+    }
+
+    #[test]
+    fn module_const_scalar_lowers_to_global_and_init() {
+        let m = lower_ok("const int64 N = 7\ndef main() -> int64:\n    return N\n");
+        // One global slot, scalar type, recorded by name.
+        assert_eq!(m.globals.len(), 1);
+        assert_eq!(m.globals[0].name, "N");
+        assert_eq!(m.globals[0].ty, Ty::I64);
+        // `@__zap_init_globals` exists and stores into the slot via GlobalAddr.
+        let init = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "__zap_init_globals")
+            .expect("init function emitted");
+        let insts: Vec<&Inst> = init.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::GlobalAddr { idx: 0, .. })),
+            "init stores into global #0"
+        );
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Store { .. })),
+            "init has a store"
+        );
+        // A scalar slot is NOT registered as a GC root.
+        assert_eq!(count_calls(init, "zap_gc_add_root"), 0);
+        // `main` runs the initializer exactly once, before its body.
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(count_calls(main, "__zap_init_globals"), 1);
+        // The reference reads the slot (GlobalAddr + Load), not an alloca.
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::GlobalAddr { idx: 0, .. })),
+            "main reads global #0"
+        );
+    }
+
+    #[test]
+    fn module_const_reference_type_is_rooted() {
+        let m = lower_ok(
+            "const list[int64] XS = [1, 2, 3]\ndef main() -> int64:\n    return len(XS)\n",
+        );
+        assert_eq!(m.globals.len(), 1);
+        assert!(matches!(m.globals[0].ty, Ty::List(_)));
+        // A pointer-typed global is registered as a permanent GC root.
+        let init = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "__zap_init_globals")
+            .unwrap();
+        assert_eq!(
+            count_calls(init, "zap_gc_add_root"),
+            1,
+            "a reference-typed global slot must be rooted"
+        );
+    }
+
+    #[test]
+    fn module_consts_init_in_source_order() {
+        // Two globals, indexed in source order; the second's initializer reads
+        // the first (an earlier global resolves during init).
+        let m = lower_ok(
+            "const int64 A = 10\nconst int64 B = A + 5\ndef main() -> int64:\n    return B\n",
+        );
+        assert_eq!(m.globals.len(), 2);
+        assert_eq!(m.globals[0].name, "A");
+        assert_eq!(m.globals[1].name, "B");
+        let init = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "__zap_init_globals")
+            .unwrap();
+        // The init reads global #0 (A) while initializing global #1 (B).
+        let addrs: Vec<u32> = init
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::GlobalAddr { idx, .. } => Some(*idx),
+                _ => None,
+            })
+            .collect();
+        assert!(addrs.contains(&0) && addrs.contains(&1));
+    }
+
+    #[test]
+    fn no_globals_means_no_init_function() {
+        // A program with no module `const` emits neither a globals table nor an
+        // init function, and `main` does not call one.
+        let m = lower_ok("def main() -> int64:\n    return 0\n");
+        assert!(m.globals.is_empty());
+        assert!(m.funcs.iter().all(|f| f.name != "__zap_init_globals"));
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(count_calls(main, "__zap_init_globals"), 0);
+    }
 }

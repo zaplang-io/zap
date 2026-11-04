@@ -70,6 +70,22 @@ fn fn_names(m: &Module) -> Vec<String> {
         .collect()
 }
 
+/// Collect module-level `const` binding names from a merged module, in merged
+/// (import-topological + source) order (D-0112).
+fn module_const_names(m: &Module) -> Vec<String> {
+    m.items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Stmt(Stmt::Let {
+                is_const: true,
+                name,
+                ..
+            }) => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn single_file_no_imports_is_unchanged() {
     let p = Project::new("single");
@@ -179,9 +195,11 @@ fn top_level_statement_in_imported_module_is_rejected() {
 fn top_level_binding_before_decorated_def_is_diagnosed_not_ice() {
     // The exact ticket #459 repro: a module-level binding before a decorated
     // `def`. This used to hit `unreachable!("entry statements handled via merge
-    // list")` in the rewrite. It must now be a clean diagnostic (ZAP3016), not
-    // a panic: a compiled program runs from `def main()`, so the top-level
-    // `auto app = App(0)` would never run.
+    // list")` in the rewrite. It must be a clean diagnostic, not a panic. A
+    // module-level mutable declaration-with-initializer (`auto app = App(0)`)
+    // is now the #658 Phase 2 surface, so it is reported as ZAP3018 (not the
+    // blanket executable-statement ZAP3016) — pointing the author at the planned
+    // mutable-global support.
     let p = Project::new("entrystmt_ice");
     p.write(
         "src/main.zap",
@@ -189,8 +207,8 @@ fn top_level_binding_before_decorated_def_is_diagnosed_not_ice() {
     );
     let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
     assert!(
-        err.iter().any(|d| d.code == ErrorCode::ZAP3016),
-        "expected ZAP3016, got {err:?}"
+        err.iter().any(|d| d.code == ErrorCode::ZAP3018),
+        "expected ZAP3018, got {err:?}"
     );
 }
 
@@ -206,14 +224,102 @@ fn top_level_executable_statement_in_entry_is_rejected() {
 
 #[test]
 fn top_level_statement_between_defs_in_entry_is_rejected() {
-    // Interleaving places too: a statement sandwiched between two `def`s.
+    // Interleaving places too: a declaration sandwiched between two `def`s. A
+    // module-level mutable `auto x = 2` is the #658 Phase 2 surface, so it is
+    // rejected as ZAP3018 (mutable-not-yet), wherever it sits.
     let p = Project::new("entrystmt_between");
     p.write(
         "src/main.zap",
         "def a() -> int64:\n    return 1\nauto x = 2\ndef main() -> int64:\n    return a()\n",
     );
     let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
-    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3016));
+    assert!(err.iter().any(|d| d.code == ErrorCode::ZAP3018));
+}
+
+#[test]
+fn module_const_is_allowed_in_entry() {
+    // A module-level `const` (D-0112, #658 Phase 1) is persistent immutable
+    // state, not a rejected top-level statement: the program links.
+    let p = Project::new("entry_const");
+    p.write(
+        "src/main.zap",
+        "const int64 LIMIT = 100\n\ndef main() -> int64:\n    return LIMIT\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+}
+
+#[test]
+fn module_const_is_allowed_and_reachable_across_modules() {
+    // A `const` declared in an imported module is a module member: it is
+    // reachable as `alias.NAME` and mangled with the module prefix so it does
+    // not collide with a same-named const in the importer.
+    let p = Project::new("const_xmod");
+    p.write(
+        "src/conf.zap",
+        "const int64 LIMIT = 100\ndef cap() -> int64:\n    return LIMIT\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import conf\n\nconst int64 LIMIT = 5\n\ndef main() -> int64:\n    return conf.LIMIT + LIMIT\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).contains(&"main".to_string()));
+    // Both consts survive the merge under distinct (mangled) names: the entry's
+    // bare `LIMIT` and the dependency's prefixed one.
+    let consts = module_const_names(&m);
+    assert!(
+        consts.iter().any(|n| n == "LIMIT"),
+        "entry const kept its bare name, got {consts:?}"
+    );
+    assert!(
+        consts.iter().any(|n| n != "LIMIT" && n.ends_with("LIMIT")),
+        "imported const mangled with module prefix, got {consts:?}"
+    );
+    // Import-topological order: the dependency's const initializes before the
+    // entry's (its slot is declared first in the merged item list).
+    let dep = consts
+        .iter()
+        .position(|n| n != "LIMIT" && n.ends_with("LIMIT"));
+    let own = consts.iter().position(|n| n == "LIMIT");
+    assert!(
+        dep < own,
+        "dependency const must precede entry const: {consts:?}"
+    );
+}
+
+#[test]
+fn module_mutable_binding_in_entry_is_rejected_with_phase2_code() {
+    // A module-level mutable declaration-with-initializer is the #658 Phase 2
+    // surface — rejected with ZAP3018 (not the blanket ZAP3016), pointing the
+    // author at the planned support.
+    let p = Project::new("entry_mutglobal");
+    p.write(
+        "src/main.zap",
+        "int64 counter = 0\n\ndef main() -> int64:\n    return counter\n",
+    );
+    let err = load_program(&p.entry("src/main.zap"), &target()).unwrap_err();
+    assert!(
+        err.iter().any(|d| d.code == ErrorCode::ZAP3018),
+        "expected ZAP3018, got {err:?}"
+    );
+}
+
+#[test]
+fn module_const_is_allowed_in_imported_module() {
+    // A declaration-only imported module may carry a `const` (it is a
+    // declaration, not executable code).
+    let p = Project::new("imported_const");
+    p.write(
+        "src/a.zap",
+        "const int64 K = 3\ndef helper() -> int64:\n    return K\n",
+    );
+    p.write(
+        "src/main.zap",
+        "import a\n\ndef main() -> int64:\n    return a.helper()\n",
+    );
+    let m = load_program(&p.entry("src/main.zap"), &target()).expect("links");
+    assert!(fn_names(&m).iter().any(|n| n.contains("helper")));
 }
 
 #[test]

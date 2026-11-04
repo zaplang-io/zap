@@ -263,6 +263,15 @@ struct Checker {
     /// these raises the non-fatal ZAP5124 use-site warning.
     deprecated: HashMap<String, Option<String>>,
     scopes: Vec<HashMap<String, Ty>>,
+    /// Immutability flag per binding, parallel to `scopes` (D-0003): a frame's
+    /// set holds the names in the same `scopes` frame that were introduced by a
+    /// `const` declaration. Maintained alongside `scopes` in `push_scope` /
+    /// `pop_scope`; `declare_const` records a name here, every other `declare`
+    /// path leaves it absent (mutable). A reassignment to a name that is const in
+    /// its innermost binding frame is rejected (ZAP3017). Module-level `const`s
+    /// (D-0112, #658 Phase 1) live in the outermost frame, so a reassignment from
+    /// inside any function is caught too.
+    const_scopes: Vec<HashSet<String>>,
     /// Interface bounds on the type parameters of the declaration currently being
     /// checked (I#164): type-parameter name -> bound interface name. Set while
     /// checking a bounded generic body so that a method call on a value of a
@@ -659,6 +668,7 @@ impl Checker {
             user_decorators: HashSet::new(),
             deprecated: HashMap::new(),
             scopes: Vec::new(),
+            const_scopes: Vec::new(),
             tyvar_bounds: HashMap::new(),
             ret_ty: Ty::Unit,
             in_generator: false,
@@ -690,6 +700,7 @@ impl Checker {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.const_scopes.push(HashSet::new());
         if self.analysis.is_some() {
             self.def_scopes.push(HashMap::new());
         }
@@ -697,6 +708,7 @@ impl Checker {
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.const_scopes.pop();
         if self.analysis.is_some() {
             self.def_scopes.pop();
         }
@@ -762,6 +774,47 @@ impl Checker {
             if let Some(ds) = self.def_scopes.last_mut() {
                 ds.insert(name.to_string(), (def, is_param));
             }
+        }
+    }
+
+    /// Declare an immutable binding (`const`, D-0003): like [`declare`], but also
+    /// records the name as const in the innermost frame so a later reassignment
+    /// is rejected (ZAP3017). A fresh `const` shadowing a mutable binding in an
+    /// inner scope is fine — constness is per binding frame.
+    fn declare_const(&mut self, name: &str, ty: Ty, def: Span) {
+        self.declare(name, ty, def);
+        if let Some(frame) = self.const_scopes.last_mut() {
+            frame.insert(name.to_string());
+        }
+    }
+
+    /// Whether `name`'s innermost binding is a `const` (D-0003). Scans frames
+    /// from the top exactly like [`lookup`], so an inner mutable binding shadows
+    /// an outer `const` and vice versa; the first frame that binds the name
+    /// decides. Unbound names are not const (a plain assignment to an undeclared
+    /// name is a different diagnostic, ZAP3002).
+    fn is_const_binding(&self, name: &str) -> bool {
+        for (vars, consts) in self.scopes.iter().rev().zip(self.const_scopes.iter().rev()) {
+            if vars.contains_key(name) {
+                return consts.contains(name);
+            }
+        }
+        false
+    }
+
+    /// Reject reassigning a `const` binding (D-0003, ZAP3017). Returns `true`
+    /// when an error was raised, so the caller can skip the normal assignment
+    /// type-check (the binding is immutable regardless).
+    fn reject_const_reassign(&mut self, name: &str, span: Span) -> bool {
+        if self.is_const_binding(name) {
+            self.error(
+                ErrorCode::ZAP3017,
+                format!("cannot reassign '{name}': it is declared `const` (immutable)"),
+                span,
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -2322,6 +2375,47 @@ impl Checker {
                 self.declare(&name, Ty::Py, *span);
             }
         }
+        // Module-level `const` declarations (D-0112, #658 Phase 1). Declared up
+        // front — before any function body is checked — so a reference resolves
+        // regardless of source order (eager, import-topological init; the linker
+        // ordered the items, D-0081). Each initializer is type-checked here, in
+        // source order, so a later const may read an earlier one (and a forward
+        // reference to a not-yet-declared const is an unknown-name error, which
+        // matches the use-before-init rule). Function signatures were already
+        // collected (`collect_sigs`), so an initializer may call a function.
+        for item in &module.items {
+            if let Item::Stmt(Stmt::Let {
+                is_const: true,
+                ty,
+                name,
+                value,
+                span,
+            }) = item
+            {
+                let vt = self.infer(value);
+                let dt = match ty {
+                    None => default_type(vt),
+                    Some(t) => {
+                        self.check_numeric_container_type(t);
+                        let dt = self.resolve_type(t);
+                        if !self.coercible(&vt, &dt) {
+                            self.error(
+                                ErrorCode::ZAP4001,
+                                format!(
+                                    "cannot assign value of type {} to {} {}",
+                                    vt.display(),
+                                    dt.display(),
+                                    name
+                                ),
+                                expr_span(value),
+                            );
+                        }
+                        dt
+                    }
+                };
+                self.declare_const(name, dt, *span);
+            }
+        }
         for item in &module.items {
             match item {
                 Item::Function(f) => self.check_function(f, None),
@@ -2342,6 +2436,10 @@ impl Checker {
                         self.check_function(m, Some(&e.name));
                     }
                 }
+                // Module-level `const`s were already declared and checked in the
+                // pre-pass above (D-0112); skip them here so the binding is not
+                // re-declared as mutable.
+                Item::Stmt(Stmt::Let { is_const: true, .. }) => {}
                 Item::Stmt(st) => self.check_stmt(st),
                 _ => {}
             }
@@ -2632,15 +2730,15 @@ impl Checker {
                  (zapc_syntax::cfg::resolve_cfg)"
             ),
             Stmt::Let {
+                is_const,
                 ty,
                 name,
                 value,
                 span,
-                ..
             } => {
                 let vt = self.infer(value);
-                match ty {
-                    None => self.declare(name, default_type(vt), *span),
+                let dt = match ty {
+                    None => default_type(vt),
                     Some(t) => {
                         self.check_numeric_container_type(t);
                         let dt = self.resolve_type(t);
@@ -2656,13 +2754,24 @@ impl Checker {
                                 expr_span(value),
                             );
                         }
-                        self.declare(name, dt, *span);
+                        dt
                     }
+                };
+                // A `const` binding (D-0003) is immutable — record it so a later
+                // reassignment is rejected (ZAP3017).
+                if *is_const {
+                    self.declare_const(name, dt, *span);
+                } else {
+                    self.declare(name, dt, *span);
                 }
             }
             Stmt::Assign { target, value, .. } => {
                 let vt = self.infer(value);
                 if let Expr::Name(n, span) = target {
+                    // A `const` binding cannot be reassigned (D-0003, ZAP3017).
+                    if self.reject_const_reassign(n, *span) {
+                        return;
+                    }
                     match self.lookup(n) {
                         Some(dt) => {
                             if !self.coercible(&vt, &dt) {
@@ -2698,27 +2807,33 @@ impl Checker {
                 let vt = self.infer(value);
                 for target in targets {
                     match target {
-                        Expr::Name(n, span) => match self.lookup(n) {
-                            Some(dt) => {
-                                if !self.coercible(&vt, &dt) {
-                                    self.error(
-                                        ErrorCode::ZAP4001,
-                                        format!(
-                                            "cannot assign value of type {} to {} of type {}",
-                                            vt.display(),
-                                            n,
-                                            dt.display()
-                                        ),
-                                        expr_span(value),
-                                    );
-                                }
+                        Expr::Name(n, span) => {
+                            // A `const` target cannot be reassigned (D-0003).
+                            if self.reject_const_reassign(n, *span) {
+                                continue;
                             }
-                            None => self.error(
-                                ErrorCode::ZAP3002,
-                                format!("assignment to undeclared variable '{n}'"),
-                                *span,
-                            ),
-                        },
+                            match self.lookup(n) {
+                                Some(dt) => {
+                                    if !self.coercible(&vt, &dt) {
+                                        self.error(
+                                            ErrorCode::ZAP4001,
+                                            format!(
+                                                "cannot assign value of type {} to {} of type {}",
+                                                vt.display(),
+                                                n,
+                                                dt.display()
+                                            ),
+                                            expr_span(value),
+                                        );
+                                    }
+                                }
+                                None => self.error(
+                                    ErrorCode::ZAP3002,
+                                    format!("assignment to undeclared variable '{n}'"),
+                                    *span,
+                                ),
+                            }
+                        }
                         Expr::Index { .. } | Expr::Attr { .. } => {
                             self.infer(target);
                         }
@@ -2744,6 +2859,11 @@ impl Checker {
             } => {
                 let vt = self.infer(value);
                 if let Expr::Name(n, span) = target {
+                    // An augmented assignment rebinds the name, so a `const` is
+                    // just as illegal here as a plain reassignment (D-0003).
+                    if self.reject_const_reassign(n, *span) {
+                        return;
+                    }
                     match self.lookup(n) {
                         Some(tt) => {
                             // `t += v` on a user struct calls the in-place dunder
@@ -3151,7 +3271,9 @@ impl Checker {
             BindTarget::Elem(Expr::Name(n, nspan)) => {
                 if is_decl {
                     self.declare(n, ty.clone(), *nspan);
-                } else {
+                } else if !self.reject_const_reassign(n, *nspan) {
+                    // A `const` leaf cannot be a tuple-assignment target (D-0003);
+                    // otherwise it is an ordinary reassignment.
                     match self.lookup(n) {
                         Some(dt) => {
                             if !assignable(ty, &dt) {
@@ -6642,6 +6764,102 @@ def main():
         );
         // And the matching return is accepted.
         ok("type Pair[T] = (T, T)\ndef g() -> Pair[int64]:\n    return (1, 2)\n");
+    }
+
+    // ---- module-level `const` (D-0112, #658 Phase 1) ----------------------
+
+    #[test]
+    fn module_const_scalar_is_visible_in_functions() {
+        // A scalar module `const` resolves and types inside any function, and
+        // regardless of source order (declared up front in the pre-pass).
+        ok("const int64 N = 7\ndef main() -> int64:\n    return N\n");
+        // Function declared BEFORE the const still sees it.
+        ok("def use() -> int64:\n    return N\nconst int64 N = 7\ndef main() -> int64:\n    return use()\n");
+    }
+
+    #[test]
+    fn module_const_reference_type_is_visible_in_functions() {
+        // A reference-typed (heap) module `const` is usable across functions.
+        ok("const list[int64] XS = [1, 2, 3]\ndef total() -> int64:\n    auto s = 0\n    for x in XS:\n        s += x\n    return s\ndef main() -> int64:\n    return total()\n");
+        ok("const dict[str, int64] T = {\"a\": 1}\ndef get() -> int64:\n    return T[\"a\"]\ndef main() -> int64:\n    return get()\n");
+    }
+
+    #[test]
+    fn module_const_auto_infers_type() {
+        // `const auto` infers from the initializer, usable like any binding.
+        ok("const auto PI = 3.14\ndef main() -> f64:\n    return PI\n");
+        ok("const auto NAME = \"zap\"\ndef greet() -> str:\n    return NAME\ndef main() -> int64:\n    return 0\n");
+    }
+
+    #[test]
+    fn module_const_initializer_may_reference_earlier_const() {
+        // Source-order init: a later const reads an earlier one (and a
+        // const-returning function). This is the eager-init dependency chain.
+        ok("const int64 A = 10\nconst int64 B = A + 5\ndef main() -> int64:\n    return B\n");
+        ok("def base() -> int64:\n    return 2\nconst int64 C = base() * 3\ndef main() -> int64:\n    return C\n");
+    }
+
+    #[test]
+    fn module_const_type_mismatch_is_rejected() {
+        // The declared type must accept the initializer (ZAP4001), exactly as a
+        // local `const`/`let` of the same type would.
+        let e = errors("const int64 N = \"hi\"\ndef main() -> int64:\n    return 0\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4001),
+            "expected ZAP4001, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn module_const_reassignment_is_rejected() {
+        // A module `const` is immutable: reassigning it from inside a function
+        // is ZAP3017.
+        let e = errors("const int64 N = 1\ndef main() -> int64:\n    N = 2\n    return N\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP3017),
+            "expected ZAP3017, got {e:?}"
+        );
+        // Augmented assignment to a module `const` is equally rejected.
+        let e = errors("const int64 N = 1\ndef main() -> int64:\n    N += 2\n    return N\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP3017),
+            "expected ZAP3017 for `+=`, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn local_const_reassignment_is_rejected() {
+        // The same immutability holds for a `const` local (D-0003) — plain,
+        // augmented, and chained assignment all raise ZAP3017.
+        let e = errors("def main() -> int64:\n    const int64 x = 1\n    x = 2\n    return x\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP3017),
+            "expected ZAP3017, got {e:?}"
+        );
+        let e = errors("def main() -> int64:\n    const int64 x = 1\n    x += 2\n    return x\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP3017),
+            "expected ZAP3017 for `+=`, got {e:?}"
+        );
+        let e = errors(
+            "def main() -> int64:\n    const int64 x = 1\n    auto y = 0\n    y = x = 3\n    return x\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP3017),
+            "expected ZAP3017 for chained assignment, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn mutable_binding_reassignment_is_still_allowed() {
+        // Immutability is a `const`-only rule — a plain (mutable) binding is
+        // freely reassignable, and a `const` in an inner scope shadowing a
+        // mutable outer binding does not freeze the outer one.
+        ok("def main() -> int64:\n    int64 x = 1\n    x = 2\n    x += 3\n    return x\n");
+        // A fresh `const` may shadow a mutable binding of the same name in a
+        // nested block without error; the inner const is immutable, the outer
+        // binding stays mutable after the block.
+        ok("def main() -> int64:\n    int64 x = 1\n    if True:\n        const int64 x = 9\n    x = 5\n    return x\n");
     }
 
     #[test]

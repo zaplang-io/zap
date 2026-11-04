@@ -86,13 +86,25 @@ impl Rewriter<'_> {
                 }
             }
             // A top-level statement. Executable ones are rejected before the
-            // merge (ZAP3016/ZAP3014 in `check_toplevel_statements`, ticket
-            // #459), so the only statement that reaches a successful rewrite is
-            // a module docstring (a bare string literal). Rewrite it like any
-            // other statement — there are no references in a string literal, so
-            // this is effectively a no-op, but it keeps the arm total and panic-
-            // free for any statement the checker chooses to allow in future.
-            Item::Stmt(st) => self.stmt(st, &HashSet::new(), &HashSet::new()),
+            // merge (ZAP3016/ZAP3014/ZAP3018 in `check_toplevel_statements`,
+            // ticket #459 / D-0112), so the statements that reach a successful
+            // rewrite are a module docstring (a bare string literal) and a
+            // module-level `const` declaration (D-0112, #658 Phase 1). A const's
+            // binding name is a module member, so it is mangled with the module
+            // prefix (like any top-level decl) before its initializer's
+            // references are rewritten — keeping cross-module `alias.NAME`
+            // resolution and post-merge name uniqueness consistent.
+            Item::Stmt(st) => {
+                if let Stmt::Let {
+                    is_const: true,
+                    name,
+                    ..
+                } = st
+                {
+                    self.rename_decl(name);
+                }
+                self.stmt(st, &HashSet::new(), &HashSet::new());
+            }
             Item::Import(_) => {}
             Item::Cfg(_) => unreachable!("cfg resolved before linking"),
         }

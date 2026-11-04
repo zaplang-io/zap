@@ -587,6 +587,15 @@ pub enum Inst {
         dest: Value,
         func: String,
     },
+    /// The address of a module-level global slot (`dest : Ptr`), indexing
+    /// [`Module::globals`]. A module-level `const` (D-0112, #658 Phase 1) is a
+    /// global slot initialized once before `main` by `@__zap_init_globals`; a
+    /// reference to the binding lowers to this address followed by an
+    /// [`Inst::Load`], exactly as a stack local lowers to its `alloca` + load.
+    GlobalAddr {
+        dest: Value,
+        idx: u32,
+    },
     /// Build a **first-class function value** (I#163): a closure record whose
     /// code pointer is the top-level function `func` (a wrapper for a bare
     /// function, or a lifted lambda body — both take the env record as their
@@ -847,10 +856,29 @@ pub struct FnSig {
     pub ret: Ty,
 }
 
+/// A module-level global slot (D-0112, #658 Phase 1): a named, statically
+/// allocated binding initialized once before `main`. Phase 1 materializes only
+/// module-level `const` declarations; the slot is a permanent GC root (codegen
+/// emits `zap_gc_add_root` for a pointer-typed one, so both the conservative
+/// Boehm collector and the precise Immix collector keep its referent live).
+#[derive(Clone, Debug)]
+pub struct GlobalVar {
+    /// The (already module-qualified, D-0081) binding name.
+    pub name: String,
+    /// The slot's value type.
+    pub ty: Ty,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Module {
     pub structs: Vec<StructLayout>,
     pub funcs: Vec<Func>,
+    /// Module-level global slots (D-0112, #658 Phase 1), indexed by the `u32` in
+    /// [`Inst::GlobalAddr`]. Empty when the program declares no module-level
+    /// state. Initialized in this order (import-topological + source order) by
+    /// the synthetic `@__zap_init_globals` function, called once at the top of
+    /// `main`.
+    pub globals: Vec<GlobalVar>,
     /// Interned first-class function-value signatures (I#163), indexed by the
     /// `u32` in [`Ty::Func`]. Empty when the program has no function values.
     pub fn_sigs: Vec<FnSig>,
@@ -894,6 +922,9 @@ impl fmt::Display for Ty {
 
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, g) in self.globals.iter().enumerate() {
+            writeln!(f, "global @g{i}: {} ; {}", g.ty, g.name)?;
+        }
         for func in &self.funcs {
             let params: Vec<String> = func
                 .params
@@ -1022,6 +1053,7 @@ fn fmt_inst(i: &Inst) -> String {
             format!("spawn{own} @{func}({})", a.join(", "))
         }
         Inst::FuncAddr { dest, func } => format!("%{dest} = funcaddr @{func}"),
+        Inst::GlobalAddr { dest, idx } => format!("%{dest} = globaladdr @g{idx}"),
         Inst::ClosureMake {
             dest,
             func,

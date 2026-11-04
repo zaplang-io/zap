@@ -3696,3 +3696,126 @@ full-codegen CI jobs, plus parser unit tests (`as_pattern_capture_parses`,
 tests (`as_pattern_binds_capture_and_inner_names`,
 `as_capture_is_scrutinee_typed_and_visible_in_guard`), and a driver
 `error_codes` test (ZAP2021) on host. See docs/GRAMMAR.ebnf and SPEC.md.
+
+## D-0112 — Module-level persistent state; Phase 1: module-level `const` (epic #661, I#658)
+
+Until now Zap had **no module-level persistent state**: a top-level executable
+statement or binding at module scope was rejected (ZAP3014 in an imported
+module, ZAP3016 in the entry module) because a compiled program runs from `def
+main()` and a bare statement never lowered to code (D-0081/D-0021, #459). Epic
+**#661** adds module-level persistent state behind a small, Python/Go-flavoured
+model. This decision records the **full locked design** of #661; **Phase 1
+(I#658) — module-level `const` only — is implemented now**, and Phases 2–3 are
+deferred (tracked under #661).
+
+### The full locked design (#661)
+
+1. **Mechanism & scope.** Module-level state is introduced by ordinary
+   *declarations with an initializer* at module top level, Python-style and
+   positional: `const T NAME = expr` (immutable; Phase 1) and later
+   `T NAME = expr` (mutable; Phase 2). There is **no new storage keyword**, **no
+   struct-level statics**, and **no `init()` function**. Loose executable
+   statements at module scope stay rejected (the ZAP3014/ZAP3016 intent is
+   kept for anything that is not a declaration-with-initializer).
+2. **Initialization.** Module state is initialized **eagerly, once, before
+   `main`**, in **import-topological order** (reusing the acyclic module graph,
+   D-0081) with **source order within a module**. A cross-module initialization
+   cycle that would force use-before-init is a compile error — and is already
+   impossible, since import cycles are themselves rejected (ZAP3011), so a
+   `const` in module A reading a `const` in module B requires A→B with no B→A.
+3. **Concurrency model (Phase 2+).** A light Go/Python model: mutable globals are
+   permitted, **unsynchronized, and never implicitly locked** (no hidden
+   blocking). `const` is the safe default; `Atomic[T]`/`Mutex`/concurrent
+   collections are the recommended tools for shared mutable state.
+4. **Safety is a diagnostic, never a dialect (Phase 2).** Sharing safety is a
+   **static lint** (warnings, reusing the #659 warning pipeline), **not** a
+   legality-changing flag — there is no `--concurrency-safe` mode that changes
+   what compiles. Strictness is a project *warnings-as-errors* policy.
+5. **`@shareable` marker (Phase 2).** A nominal annotation a type author applies
+   to assert a type is safe to share across coroutines. The sharing lint
+   suppresses when a mutable global's type carries it; the built-in `Atomic`/
+   `Mutex`/concurrent types carry it too, under **one uniform rule** (no
+   hardcoded allowlist). It is a trusted assertion with the runtime `-race`
+   detector as the backstop, is queryable via reflection, and has a per-site
+   `# noqa`-style suppression for one-offs.
+6. **Runtime `-race` detector (Phase 2).** Filed as a follow-up under #661.
+7. **GC.** Module-global slots are **permanent GC roots**. Under the
+   conservative Boehm collector (today) the static data/BSS segment is scanned,
+   so a `const` holding a heap pointer is a root with no registration. Under the
+   precise Immix collector (D-0009, later) each pointer slot is emitted into the
+   static root table so the collector marks and relocates through it; Phase 1
+   already registers every pointer-typed slot via `zap_gc_add_root` so **both
+   collectors are correct** with one code path.
+8. **`@cache` (#666, supersedes the deferred D-0109 reclassification of #472).**
+   Out of scope here; it is unblocked by this state mechanism and tracked
+   separately.
+
+### Phase 1 (I#658) — what ships now
+
+A **module-level `const` declaration** is admitted at module top level:
+
+```python
+const int64 LIMIT = 100
+const list[int64] XS = [1, 2, 3]
+const dict[str, int64] TABLE = {"a": 1}
+const auto PI = 3.14            # `auto` infers from the initializer
+```
+
+- **Scalars and reference/heap types** are both allowed (a reference `const`
+  such as a `list`/`dict` is a GC root).
+- It is **evaluated once at program start**, before `main`, in
+  import-topological + source order. A later `const`'s initializer may read an
+  earlier `const` (or call a function); a forward reference to a not-yet-declared
+  `const` is an unknown-name error, matching the use-before-init rule.
+- It is **immutable**: reassignment (`=`, `+=`, chained, tuple-target) is a
+  compile error (ZAP3017). This closes a latent gap — `const` immutability is
+  now enforced for **local** `const`s too (D-0003), which was previously
+  unchecked.
+- It is a **module member**: visible to the module's own code, mangled with the
+  module prefix, and reachable across modules as `alias.NAME` unless `_`-private
+  (D-0028/D-0081).
+- A **module-level mutable** declaration (`T NAME = expr`, or any
+  tuple-destructuring declaration, at module scope) is the Phase 2 surface and
+  is rejected now with **ZAP3018** (pointing the author at #658 Phase 2), rather
+  than the blanket executable-statement ZAP3016.
+
+### Lowering (Phase 1)
+
+The module linker (D-0081) emits merged items in import-topological order, so a
+module `const` appears in init order. AST→ZIR lowering gives each module `const`
+a **global slot** (`ir_core::Module::globals`) and synthesizes
+`@__zap_init_globals`, a void function that evaluates each initializer in order
+and stores it into its slot (reusing the ordinary `let` lowering: declared-type
+coercion or `auto` inference, value-struct copy); a pointer-typed slot is
+registered with `zap_gc_add_root`. A reference to a `const` lowers to a
+`GlobalAddr` + `Load`, exactly as a stack local lowers to its `alloca` + load.
+`main` calls `@__zap_init_globals` once at its top, under the top-level landing
+pad, so an initializer that raises unwinds like any other code. Codegen emits
+one zero/null-initialized internal LLVM global per slot; under Boehm
+`zap_gc_add_root` is a real exported no-op (the symbol must link), under Immix it
+records the slot.
+
+### Diagnostics
+
+- **ZAP3017** (`assignment to a constant binding`) — reassigning a `const`
+  (module-level or local), plain/augmented/chained/tuple-target.
+- **ZAP3018** (`module-level mutable variable not yet supported`) — a
+  module-level mutable declaration-with-initializer (#658 Phase 2).
+
+### Verification
+
+Parser unit tests already cover the module-level `const` parse (it was always
+parseable). Sema unit tests cover module `const` visibility across functions
+(including a function declared *before* the `const`), scalar and reference
+types, `auto` inference, an initializer reading an earlier `const`, the
+type-mismatch rejection (ZAP4001), and reassignment rejection (ZAP3017) for both
+module and local `const`s (plain and augmented and chained), plus that mutable
+bindings stay freely reassignable and a `const` may shadow a mutable binding.
+Module-linker tests cover a module `const` linking in the entry and in an
+imported module, cross-module access with prefix mangling and dependency-first
+order, and the ZAP3018 mutable-global rejection. IR tests assert the global
+slot, the `@__zap_init_globals` store, the GC-root call for reference types,
+source-order init, and that a program with no `const` emits no init function.
+End-to-end goldens (`module_const`, `module_const_eval_once`,
+`module_const_reassign`, `module_mutable_global`, and the
+`module_const_across_modules` project) run under the full-codegen CI jobs.

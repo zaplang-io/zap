@@ -179,13 +179,20 @@ not supported — it may change in **any** release, including a PATCH:
   reachable.
 - **Built-in decorators not in the v1 set** — `@cache` and `@inject` (I#472,
   D-0109). **`@cache` is deferred**: gated on the module-level-persistent-state
-  language feature (epic #661, prerequisite #658; the built-in itself #666); if
-  added later it ships **Experimental** first (§4). **`@inject` is declined for
-  core**: dependency injection is a framework concern, provided by
-  reflection-driven `Depends(...)` adapters (D-0089/D-0092), not a core
-  decorator — there is no planned core `@inject`. Both names stay reserved and
-  are rejected with `ZAP5055`; for `@inject` the diagnostic is a redirect to
-  `Depends(...)`.
+  language feature (epic #661, prerequisite #658; the built-in itself #666); its
+  first phase — module-level `const` (#658, D-0112) — has landed, so `@cache` is
+  unblocked pending the mutable phase; if added later it ships **Experimental**
+  first (§4). **`@inject` is declined for core**: dependency injection is a
+  framework concern, provided by reflection-driven `Depends(...)` adapters
+  (D-0089/D-0092), not a core decorator — there is no planned core `@inject`.
+  Both names stay reserved and are rejected with `ZAP5055`; for `@inject` the
+  diagnostic is a redirect to `Depends(...)`.
+- **Module-level persistent state** (epic #661, D-0112) — **Experimental**. The
+  module-level `const` form (#658 Phase 1) is implemented; module-level mutable
+  state, the concurrency-sharing lint, and the `@shareable` marker (Phases 2–3)
+  are not yet in the language (a module-level mutable binding is rejected today
+  with `ZAP3018`). The `const` surface is expected to graduate to Stable, but is
+  Experimental until then (§4).
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,
@@ -356,6 +363,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `set[T]` — literals `{1, 2, 3}`, comprehensions `{x for x in xs}`, `.add`/`in`/`len`/iteration, and the `set[T]()` / `set(iterable)` constructors (#608/#609, graduated per D16/D17) | **S** |
 | Numeric arrays / SIMD + dtype promotion (D-0011); C-style bitfields (D-0068); Python interop; `@derive(Yaml)`/`@derive(Csv)` | **E** |
 | `when target.*` compile-time conditional compilation (D-0079, I#139 Phase 1) | **E** |
+| Module-level `const` — persistent immutable state at module scope, eager import-topological init (D-0112, #658 Phase 1 of epic #661). Module-level *mutable* state + the sharing lint + `@shareable` (Phases 2–3) are not yet in the language | **E** |
 | Value/memory layout, enum/closure representation (§1.5) | **I** |
 
 **Standard library (per module; `crates/sema/src/modules/`, D-0056).**

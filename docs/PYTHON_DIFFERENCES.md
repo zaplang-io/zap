@@ -36,10 +36,13 @@ it" tracking issue.
 ### `global` / `nonlocal`
 
 Zap uses **static, lexical scoping** and does not allow executable statements at
-module scope, so there is no mutable module-level state for a `global` rebind to
-target, and no enclosing-function cell for `nonlocal` to reach (SPEC §2, §13;
-D-0021/D-0090). State is passed explicitly or held in a `struct`; a module
-exposes `const` bindings and definitions, not reassignable globals.
+module scope. Module-level state is limited to **`const`** — persistent,
+immutable bindings (`const int64 LIMIT = 100`), initialized once before `main`
+(SPEC §3.1, D-0112, #658). There is still no mutable module-level state for a
+`global` rebind to target (a module-level mutable binding is rejected today,
+ZAP3018), and no enclosing-function cell for `nonlocal` to reach (SPEC §13;
+D-0021/D-0090). Mutable state is passed explicitly or held in a `struct`; a
+module exposes `const` bindings and definitions, not reassignable globals.
 
 ```python
 # Python

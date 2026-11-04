@@ -387,7 +387,14 @@ static inline void *zap_ptrbuf(int64_t n) { return zap_gc_alloc_atomic(n); }
 #define zap_leave_blocking() ((void)0)
 #define zap_mutator_register() ((void)0)
 #define zap_mutator_unregister() ((void)0)
-#define zap_gc_add_root(slot) ((void)(slot))
+/* Module-level global roots (D-0112, #658 Phase 1): a REAL exported no-op under
+ * Boehm, not a macro, because compiler-generated code (`@__zap_init_globals`)
+ * emits a `call zap_gc_add_root` for each pointer-typed module global and that
+ * symbol must resolve at link time. The conservative collector already scans the
+ * static data/BSS segment, so a module global is a root with no registration —
+ * hence the empty body. (Under precise Immix the real implementation in
+ * zapgc.inc.c records the slot so the collector marks and relocates through it.) */
+void zap_gc_add_root(void **slot) { (void)slot; }
 #define zap_gc_add_root_fn(fn) ((void)(fn))
 #define zap_gc_mark(p) ((void)(p))
 /* Boehm allocation routes to GC_MALLOC, whose internal allocator lock must not

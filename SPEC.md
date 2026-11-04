@@ -111,6 +111,39 @@ Bindings are **mutable by default** (D-0006); `const` makes one immutable:
 const f64 PI = 3.14159
 ```
 
+A `const` cannot be reassigned, augmented (`+=`), or otherwise rebound after its
+declaration; doing so is a compile error (ZAP3017). This holds for a `const`
+anywhere — a local, or a module-level one (below).
+
+### 3.1 Module-level `const` (D-0112, #658 Phase 1)
+
+A `const` declaration may also appear at **module top level**, giving the module
+persistent, immutable state:
+
+```python
+const int64 LIMIT = 100
+const list[int64] DEFAULTS = [1, 2, 3]
+const dict[str, int64] WEIGHTS = {"a": 1, "b": 2}
+const auto PI = 3.14159            # `auto` infers the type from the initializer
+```
+
+- **Scalars and reference/heap types** are both allowed (a reference-typed
+  module `const` is a permanent GC root).
+- It is **evaluated once, before `main`**, in import-topological order across
+  modules (a module's state initializes after every module it imports, reusing
+  the acyclic module graph of D-0081) and in source order within a module. A
+  later `const`'s initializer may read an earlier `const` or call a function; a
+  reference to a not-yet-initialized `const` is an error.
+- It is a **module member**: reachable from another module as `module.NAME`
+  unless it is `_`-private (D-0028/D-0081).
+
+A module-level **mutable** binding (`T NAME = expr` at module scope) is reserved
+for a later phase of #658 and is rejected today (ZAP3018). Loose executable
+statements at module scope remain rejected (ZAP3014/ZAP3016); only a `const`
+declaration — and a leading module docstring — is admitted. The broader design
+(mutable module state, the concurrency-sharing lint, and the `@shareable`
+marker) is epic #661.
+
 ## 4. Types
 
 ### 4.1 Scalars (value semantics — copied on assign/pass, D-0023)

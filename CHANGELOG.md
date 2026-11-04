@@ -25,6 +25,20 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Module-level `const`** — persistent, immutable state at module scope (#658,
+  D-0112; Phase 1 of the module-level-persistent-state epic #661). A
+  `const T NAME = expr` (or `const auto NAME = expr`) at module top level, for
+  scalars and reference/heap types (`const list[int64] XS = [...]`,
+  `const dict[str, int64] TABLE = {...}`), is evaluated **once before `main`** in
+  import-topological + source order (reusing the acyclic module graph, D-0081),
+  is a module member reachable across modules as `module.NAME`, and is a
+  permanent GC root when reference-typed. It is immutable: reassignment is a
+  compile error (**ZAP3017**) — which also closes a latent gap by enforcing
+  `const` immutability for **local** `const`s. A module-level *mutable* binding
+  is reserved for #658 Phase 2 and is rejected with a dedicated **ZAP3018**
+  (pointing at the planned support) rather than the blanket top-level-statement
+  error. The broader design — mutable module state, a static concurrency-sharing
+  lint, and the `@shareable` marker — is epic #661.
 - **`as` sub-pattern capture in `match`** — `case <pattern> as name:` (#603,
   D-0111; CPython grammar-parity epic #614, D11). It matches the inner pattern
   and binds `name` to the *whole* matched value, typed as the scrutinee for that
