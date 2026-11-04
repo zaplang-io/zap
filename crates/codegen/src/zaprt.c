@@ -355,6 +355,7 @@ void *zap_gc_alloc_var(const ZapTypeDesc *desc, int64_t size);
 void zap_safepoint(void);
 void zap_gc_add_root(void **slot);
 void zap_gc_add_root_fn(void (*fn)(void));
+void zap_gc_write_barrier(void **slot);
 void zap_gc_mark(void *payload);
 void zap_gc_collect(void);
 /* Defined in zapgc.inc.c (#included below) but called earlier in this file
@@ -396,6 +397,15 @@ static inline void *zap_ptrbuf(int64_t n) { return zap_gc_alloc_atomic(n); }
  * zapgc.inc.c records the slot so the collector marks and relocates through it.) */
 void zap_gc_add_root(void **slot) { (void)slot; }
 #define zap_gc_add_root_fn(fn) ((void)(fn))
+/* Module-global write barrier (D-0112, #663): reassigning a mutable module-level
+ * pointer global overwrites a permanent root slot. A REAL exported no-op under
+ * Boehm, not a macro, because codegen emits a `call zap_gc_write_barrier` at each
+ * reassignment site and the symbol must resolve at link time. The conservative
+ * collector is non-moving and finds roots by scanning the data segment, so it
+ * needs no remembered set — hence the empty body. (Under precise Immix the real
+ * implementation in zapgc.inc.c is the record point for a future generational /
+ * incremental cycle.) */
+void zap_gc_write_barrier(void **slot) { (void)slot; }
 #define zap_gc_mark(p) ((void)(p))
 /* Boehm allocation routes to GC_MALLOC, whose internal allocator lock must not
  * be held across an async preemption (ticket #172): a switched-in sibling

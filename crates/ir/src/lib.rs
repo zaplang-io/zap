@@ -2469,4 +2469,130 @@ def main():
         let addrs = global_addrs(init);
         assert!(addrs.contains(&0) && addrs.contains(&1));
     }
+
+    // --- #663: module-global write barrier (epic #661) ---------------------
+    //
+    // Reassigning a mutable module-level *pointer* global overwrites a permanent
+    // GC-root slot, so each such store is followed by a `zap_gc_write_barrier`
+    // call on the slot. A local, a scalar global, or an immutable `const`
+    // reference does NOT get the barrier, and neither does the one-time
+    // initializer store in `@__zap_init_globals`.
+
+    #[test]
+    fn module_mutable_pointer_reassign_emits_write_barrier() {
+        // `XS = [...]` on a reference-typed mutable global: one store into the
+        // slot, immediately followed by one barrier call on that slot.
+        let m = lower_ok(
+            "list[int64] XS = [1]\ndef put():\n    XS = [2, 3]\ndef main() -> int64:\n    put()\n    return len(XS)\n",
+        );
+        let put = m.funcs.iter().find(|f| f.name == "put").unwrap();
+        assert!(
+            global_addrs(put).contains(&0),
+            "reassignment addresses global #0"
+        );
+        assert_eq!(
+            count_calls(put, "zap_gc_write_barrier"),
+            1,
+            "a mutable pointer-global reassignment fires exactly one write barrier"
+        );
+        // The barrier records the slot AFTER it is written: the Store precedes
+        // the barrier Call in the same block.
+        let insts: Vec<&Inst> = put.blocks.iter().flat_map(|b| &b.insts).collect();
+        let store_at = insts.iter().position(|i| matches!(i, Inst::Store { .. }));
+        let barrier_at = insts
+            .iter()
+            .position(|i| matches!(i, Inst::Call { func, .. } if func == "zap_gc_write_barrier"));
+        assert!(
+            matches!((store_at, barrier_at), (Some(s), Some(b)) if s < b),
+            "the write barrier follows the store into the slot"
+        );
+    }
+
+    #[test]
+    fn module_mutable_pointer_augassign_emits_write_barrier() {
+        // `XS += [...]` is a read-modify-write that stores a (possibly new)
+        // pointer back into the root slot, so it too fires the barrier.
+        let m = lower_ok(
+            "str S = \"a\"\ndef grow():\n    S += \"b\"\ndef main() -> int64:\n    grow()\n    return len(S)\n",
+        );
+        let grow = m.funcs.iter().find(|f| f.name == "grow").unwrap();
+        assert_eq!(
+            count_calls(grow, "zap_gc_write_barrier"),
+            1,
+            "an augmented reassignment of a pointer global fires the write barrier"
+        );
+    }
+
+    #[test]
+    fn module_mutable_scalar_reassign_emits_no_write_barrier() {
+        // A scalar global holds no pointer, so reassigning it records no edge.
+        let m = lower_ok(
+            "int64 N = 0\ndef put():\n    N = 5\ndef main() -> int64:\n    put()\n    return N\n",
+        );
+        let put = m.funcs.iter().find(|f| f.name == "put").unwrap();
+        assert_eq!(
+            count_calls(put, "zap_gc_write_barrier"),
+            0,
+            "a scalar global reassignment emits no write barrier"
+        );
+    }
+
+    #[test]
+    fn local_pointer_reassign_emits_no_write_barrier() {
+        // A pointer-typed *local* is scanned precisely via the shadow stack and
+        // holds no permanent-root edge, so reassigning it emits no barrier. This
+        // proves the barrier gate is global-only, not type-only.
+        let m = lower_ok(
+            "def f() -> int64:\n    list[int64] xs = [1]\n    xs = [2, 3]\n    return len(xs)\ndef main() -> int64:\n    return f()\n",
+        );
+        let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(
+            count_calls(f, "zap_gc_write_barrier"),
+            0,
+            "a local pointer reassignment emits no write barrier"
+        );
+    }
+
+    #[test]
+    fn module_const_reference_emits_no_write_barrier() {
+        // An immutable reference `const` is stored once at init and never
+        // reassigned (ZAP3017), so no function and not even the initializer
+        // emits a write barrier for it (the init store is deliberately
+        // unbarriered — startup runs before any mutation).
+        let m = lower_ok(
+            "const list[int64] XS = [1, 2, 3]\ndef main() -> int64:\n    return len(XS)\n",
+        );
+        for f in &m.funcs {
+            assert_eq!(
+                count_calls(f, "zap_gc_write_barrier"),
+                0,
+                "a const reference global fires no write barrier (fn {})",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn init_globals_store_is_unbarriered() {
+        // Even for a mutable pointer global, the one-time initializer store in
+        // `@__zap_init_globals` is unbarriered: it runs before `main`, in the
+        // #658 topological + source order, and only reassignments from user code
+        // record an edge. (The slot is still rooted via `zap_gc_add_root`.)
+        let m = lower_ok("list[int64] XS = [1, 2, 3]\ndef main() -> int64:\n    return len(XS)\n");
+        let init = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "__zap_init_globals")
+            .unwrap();
+        assert_eq!(
+            count_calls(init, "zap_gc_add_root"),
+            1,
+            "the pointer slot is rooted at init"
+        );
+        assert_eq!(
+            count_calls(init, "zap_gc_write_barrier"),
+            0,
+            "the init-time store is unbarriered"
+        );
+    }
 }

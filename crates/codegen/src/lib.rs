@@ -1353,6 +1353,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             // for each pointer-typed global.
             let ptr = self.ctx.ptr_type(AddressSpace::default());
             self.declare_rt("zap_gc_add_root", &[ptr.into()], None);
+            // `void zap_gc_write_barrier(void **slot)` — a post-write barrier on
+            // a mutable module-global pointer slot (D-0112 #663). Reassigning a
+            // permanent-root slot installs a new old→new edge; a future
+            // generational/incremental Immix cycle records it here. A linkable
+            // runtime no-op today (stop-the-world Immix re-scans every root; the
+            // conservative Boehm build is an exported no-op). `@__zap_init_globals`
+            // never calls it — the one-time init store needs no barrier.
+            self.declare_rt("zap_gc_write_barrier", &[ptr.into()], None);
         }
         for (i, g) in m.globals.iter().enumerate() {
             let _ = &g.name;

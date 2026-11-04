@@ -353,6 +353,31 @@ void zap_gc_add_root(void **slot) {
     pthread_mutex_unlock(&zap_groots_mu);
 }
 
+/* Write barrier for a mutable module-level pointer global (D-0112, #663).
+ *
+ * `slot` is the address of a permanent-root slot in the static data segment that
+ * was just overwritten with a new GC pointer (a `T NAME = ...` reassignment, not
+ * the one-time initializer store, which is unbarriered — see
+ * `lower_init_globals`). Immutable `const` reference globals are never reassigned
+ * (ZAP3017), so this is only ever called for a mutable binding.
+ *
+ * The current collector is stop-the-world mark / opportunistically-evacuate
+ * (ticket #120): it re-scans EVERY registered global root (`zap_groots`, which
+ * already includes this slot via `zap_gc_add_root`) on every collection and
+ * rewrites it move-aware (`zap_process_slot`). So there is no remembered set to
+ * maintain and nothing for the barrier to do today — reassignment across a GC is
+ * already correct through the full root re-scan.
+ *
+ * It is a REAL runtime entry point, not a no-op macro, for two reasons: codegen
+ * emits a `call zap_gc_write_barrier` at each reassignment site, so the symbol
+ * must link; and it is the single, named record point a future generational or
+ * incremental Immix mode fills in — such a mode does NOT re-scan every immortal
+ * root each minor cycle, so the old→new edge this store creates out of the
+ * permanent root must be remembered here (e.g. appended to a remembered set the
+ * minor collector scans). Keeping the call site and symbol in place now means
+ * that evolution is a change to this function alone, with no new codegen or ABI. */
+void zap_gc_write_barrier(void **slot) { (void)slot; }
+
 /* ---- cooperative stop-the-world handshake --------------------------------- */
 /* Each OS thread that runs Zap code registers a mutator node. A thread is
  * ACTIVE while executing compiled Zap (it must poll zap_safepoint), or PARKED at

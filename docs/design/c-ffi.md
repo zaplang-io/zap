@@ -128,12 +128,17 @@ in a C register/frame.
 
 ### 2.3 Mutation / write-barrier rule
 
-Immix today is stop-the-world mark-sweep-evacuate, so there is no write barrier.
-But load-at-use and any *future* generational/incremental barrier assume Zap heap
-pointer slots are only written by Zap code. Therefore **C code must not store a
-Zap pointer into a Zap object's pointer field** except through a runtime helper
-that performs the (current or future) barrier. C may freely read Zap data and
-write into *C* or into Zap **atomic/leaf** buffers (no pointer slots).
+Immix today is stop-the-world mark-sweep-evacuate, so no write barrier does any
+work yet. One barrier hook already exists in the ABI: reassigning a **mutable
+module-level pointer global** (D-0112, #663) emits `zap_gc_write_barrier(&slot)`
+after the store — a linkable no-op today (the collector re-scans every static
+root each cycle), reserved for a future generational/incremental mode that would
+not. Load-at-use and any such future barrier assume Zap heap pointer slots are
+only written by Zap code. Therefore **C code must not store a Zap pointer into a
+Zap object's pointer field or into a Zap static root slot** except through a
+runtime helper that performs the (current or future) barrier. C may freely read
+Zap data and write into *C* or into Zap **atomic/leaf** buffers (no pointer
+slots).
 
 ### 2.4 Precedent already in tree
 

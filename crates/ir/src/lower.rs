@@ -5141,6 +5141,41 @@ impl<'a> FnLower<'a> {
         None
     }
 
+    /// Store `v` into the lvalue `slot` resolved for the assignment target
+    /// `name`, emitting the module-global write barrier (#663, epic #661) when
+    /// `name` reassigns a *mutable* module-level *pointer* global.
+    ///
+    /// A module-global pointer slot lives in the static data segment for the
+    /// process lifetime and is a permanent GC root (registered with
+    /// `zap_gc_add_root` by `@__zap_init_globals`). Overwriting it installs a new
+    /// old→new edge out of an immortal root. Under the precise Immix collector
+    /// (D-0009) a future generational/incremental mode needs that edge recorded
+    /// so a minor cycle that does not re-scan every static root stays correct; a
+    /// post-write barrier on the slot (`zap_gc_write_barrier(&slot)`) is the
+    /// record point. Today's stop-the-world collector re-scans all roots each
+    /// cycle, so the barrier is a linkable runtime no-op (and an exported no-op
+    /// under conservative Boehm) — the hook, not its payload, is what #663 lands.
+    ///
+    /// The barrier is emitted for pointer-typed *global* stores only:
+    /// - a local slot holds no permanent-root edge (it is scanned precisely via
+    ///   the shadow stack), so it needs none;
+    /// - a scalar global holds no pointer, so there is no edge to record;
+    /// - an immutable reference `const` is stored exactly once, at init, and is
+    ///   never reassigned (ZAP3017), so a reassignment store that reaches here is
+    ///   a mutable binding by construction — and the one-time init store in
+    ///   `lower_init_globals` deliberately does not route through here, keeping
+    ///   startup consistent (no barrier before the collector/root table is live).
+    fn store_name(&mut self, name: &str, slot: Value, ty: Ty, v: Value) {
+        self.store(slot, v);
+        if ty.is_ptr() && self.lookup(name).is_none() && self.ctx.global(name).is_some() {
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_gc_write_barrier".to_string(),
+                args: vec![slot],
+            });
+        }
+    }
+
     /// The scope-stack index a fresh walrus binding (`name := expr`, #600) must
     /// be declared into so it outlives the construct it appears in. Outside any
     /// comprehension this is the current innermost scope — which, for an
@@ -6194,7 +6229,7 @@ impl<'a> FnLower<'a> {
                     let v = self.coerce(v, vt, ty);
                     // Value structs copy on assignment (D-0051).
                     let v = self.copy_if_value(v, ty, value);
-                    self.store(ptr, v);
+                    self.store_name(n, ptr, ty, v);
                     Ok(())
                 } else if let Expr::Attr { base, name, .. } = target {
                     let (bv, bty) = self.expr(base)?;
@@ -6282,7 +6317,7 @@ impl<'a> FnLower<'a> {
                         _ => self.binop(*op, cur, ty, rhs, rt)?,
                     };
                     let res = self.coerce(res, rty, ty);
-                    self.store(ptr, res);
+                    self.store_name(n, ptr, ty, res);
                     Ok(())
                 } else {
                     Err(err(
@@ -6556,7 +6591,7 @@ impl<'a> FnLower<'a> {
                     .name_lvalue(n)
                     .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
                 let v = self.coerce(val, ty, dt);
-                self.store(ptr, v);
+                self.store_name(n, ptr, dt, v);
                 Ok(())
             }
             Expr::Attr { base, name, .. } => {
@@ -13452,7 +13487,7 @@ impl<'a> FnLower<'a> {
             }
             let cv = self.coerce(v, vt, ty);
             let cv = self.copy_if_value(cv, ty, value_expr);
-            self.store(ptr, cv);
+            self.store_name(n, ptr, ty, cv);
             Ok(())
         } else if let Expr::Attr { base, name, .. } = target {
             let (bv, bty) = self.expr(base)?;
