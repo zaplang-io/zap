@@ -196,10 +196,24 @@ not supported — it may change in **any** release, including a PATCH:
   a reassignment of a mutable pointer global fires a `zap_gc_write_barrier` hook
   on the slot (a linkable runtime no-op today — the stop-the-world collector
   re-scans every root each cycle — reserved for a future generational/incremental
-  mode). Still not in the language: the concurrency-sharing lint and the
-  `@shareable` marker (later #661 phases). A module-level tuple-destructuring
-  declaration is rejected (`ZAP3018`). The surface is expected to graduate to
-  Stable, but is Experimental until then (§4).
+  mode). The **concurrency-safety surface** (#664, D-0113) is now implemented
+  too: the **`@shareable`** marker and the static **sharing lint** (`ZAP5125`,
+  below). Still not in the language: the runtime `-race` detector (a #661
+  follow-up). A module-level tuple-destructuring declaration is rejected
+  (`ZAP3018`). The surface is expected to graduate to Stable, but is Experimental
+  until then (§4).
+- **`@shareable` marker + sharing lint** (#664, D-0113) — **Experimental**. The
+  no-argument `@shareable` marker on a `struct` is a *trusted, unverified*
+  assertion that the type is safe under concurrent shared access; it is
+  reflectable via `reflect_has(T, "shareable")`, and the built-in `Atomic` /
+  `Mutex` / `WaitGroup` / `Once` / `Counter` / `Queue` types carry it implicitly
+  under one uniform rule. The sharing lint raises the non-fatal **`ZAP5125`**
+  warning at a read/write of a mutable module global whose type is not
+  `@shareable` (a `const` global never warns), suppressible per-site with
+  `# noqa` / `# noqa: ZAP5125`. It is advisory — the program stays legal — and
+  does not change what compiles. The marker name, the warning code, and the
+  suppression and `--warnings-as-errors` mechanisms are expected to graduate to
+  Stable; they are Experimental until the #206 audit.
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,
@@ -364,13 +378,14 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Functions/lambdas/generators; default/keyword/variadic args; comprehensions/slicing | **S** |
 | First-class function values + closures (D-0067) | **S** |
 | Exceptions; `with` / context managers (D-0069); modules/imports/visibility (D-0028/D-0081, `design/0034-modules.md`) | **S** |
-| Regex (D-0010); decorators & annotations core (D-0036) + `@derive(Json)`; built-in decorators `@default`/`@validate`/`@range` (D-0101) and `@deprecated` use-site warning (D-0109); behavioral `before`/`after`/`wrap` (D-0108) | **S** |
+| Regex (D-0010); decorators & annotations core (D-0036) + `@derive(Json)`; built-in decorators `@default`/`@validate`/`@range` (D-0101), `@deprecated` use-site warning (D-0109) and `@shareable` marker (D-0113, **E**); behavioral `before`/`after`/`wrap` (D-0108) | **S** |
 | Generics incl. bounds (D-0064) | **S** |
 | Coroutines/channels/`select`/`scope:`/`spawn detached` (D-0031/0044/0045); sync primitives + `Atomic[T]` (D-0032/0066); `Optional[T]` (D-0065) | **S** |
 | `set[T]` — literals `{1, 2, 3}`, comprehensions `{x for x in xs}`, `.add`/`in`/`len`/iteration, and the `set[T]()` / `set(iterable)` constructors (#608/#609, graduated per D16/D17) | **S** |
 | Numeric arrays / SIMD + dtype promotion (D-0011); C-style bitfields (D-0068); Python interop; `@derive(Yaml)`/`@derive(Csv)` | **E** |
 | `when target.*` compile-time conditional compilation (D-0079, I#139 Phase 1) | **E** |
-| Module-level persistent state — `const` (immutable, #658 Phase 1) and mutable (`T NAME = expr`, reassignable/mutable, GC root; #662 Phase 2) bindings at module scope, eager import-topological init, precise-Immix static roots + write barrier for pointer globals (#663) (D-0112, epic #661). The sharing lint + `@shareable` (later phases) are not yet in the language | **E** |
+| Module-level persistent state — `const` (immutable, #658 Phase 1) and mutable (`T NAME = expr`, reassignable/mutable, GC root; #662 Phase 2) bindings at module scope, eager import-topological init, precise-Immix static roots + write barrier for pointer globals (#663) (D-0112, epic #661). The runtime `-race` detector is not yet in the language | **E** |
+| Concurrency-safety surface — the `@shareable` struct marker (reflectable) and the static sharing lint `ZAP5125` (a warning on shared mutable non-`@shareable` module globals), with `# noqa` per-site suppression and the `--warnings-as-errors` policy knob (D-0113, #664) | **E** |
 | Value/memory layout, enum/closure representation (§1.5) | **I** |
 
 **Standard library (per module; `crates/sema/src/modules/`, D-0056).**

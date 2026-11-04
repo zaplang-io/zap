@@ -3863,7 +3863,8 @@ auto total = 0              # `auto` infers the type; mutable
   under **#663** and are explicitly out of scope here.
 - **Scope.** Only single-name bindings; a module-level tuple-destructuring
   declaration stays rejected (ZAP3018). The concurrency-sharing lint and the
-  `@shareable` marker remain later #661 phases.
+  `@shareable` marker — locked-design points 4–5 above — **now ship in D-0113
+  (#664)**; the runtime `-race` detector (point 6) remains a later #661 phase.
 
 **Verification (Phase 2).** Sema unit tests cover a mutable global's
 reassignability across functions (plain/chained/augmented), reference-type
@@ -3937,3 +3938,115 @@ across eight collections. An Immix-only reclamation test
 (`immix_module_global_reassignment_roots_only_current_value`, under a heap cap)
 proves reassignment drops the prior value so it is reclaimed — the root tracks
 only the live slot contents, with no stale rooting.
+
+## D-0113 — Concurrency-safety surface: `@shareable` marker + static sharing lint (I#664, epic #661)
+
+This **implements locked-design points 4–5 of D-0112 (#661)**: the advisory
+concurrency-safety surface for the light model, shipped as a diagnostic — never
+a dialect. Module-level mutable globals (D-0112 Phase 2, #662) are legal and
+unsynchronized; this adds a way to *mark* a type safe to share and a way to
+*warn* about careless shared mutable state, without ever changing what the
+language accepts.
+
+### `@shareable` marker
+
+A nominal, metadata-only annotation (D-0036) a type author applies to a
+`struct`:
+
+```python
+@shareable
+struct Registry:
+    Mutex guard
+    dict[str, int64] entries
+```
+
+- It **asserts** — as a *trusted, unverified* claim — that the type is safe
+  under concurrent shared access. The compiler does **not** attempt to prove it;
+  there is no analysis of the struct's internals. The author owns the claim, and
+  the runtime `-race` detector (#661 point 6, a follow-up) is the backstop.
+- It takes **no arguments** and applies to a **`struct`** only: `@shareable` on a
+  function/field/enum is ZAP5047, and `@shareable(...)` with arguments is
+  ZAP5041.
+- It is **reflectable**: `reflect_has(T, "shareable")` is true for a marked
+  struct (recorded in the runtime reflection registry like any annotation) and
+  for the built-in shareable types below.
+
+### Built-in shareable types — one uniform rule, no allowlist in the lint
+
+The concurrency primitives and concurrent collections carry the marker
+**implicitly**: `Atomic` (prelude `Atomic[T]`, D-0066), `Mutex`/`WaitGroup`/
+`Once` (`sync.*`, D-0063), and `Counter`/`Queue` (`concurrent.*`, D-0078). The
+single shared list lives at `zapc_syntax::BUILTIN_SHAREABLE_TYPES`. The lint
+does **not** special-case these types: it seeds its *one* shareability predicate
+(`name_is_shareable`) with that list, so a user `@shareable` struct and a
+built-in primitive are decided by the same membership test. Shareability is
+decided on a type's **nominal base name**, so the generic spelling (`Atomic[int64]`,
+`Queue[str]`) is covered by its base. For reflection these built-ins have no
+registry entry, so `reflect_has("Atomic", "shareable")` (string-literal
+arguments) is **folded to a compile-time `true`** in lowering — which also keeps
+the `main` prologue of reflection-free programs byte-identical (golden-stable).
+
+### Sharing lint — ZAP5125 (a warning)
+
+A static analysis in sema emits **ZAP5125** (`shared mutable global is not
+@shareable`, the ZAP5xxx semantic band) at each **read or write** of a module
+global when, and only when:
+
+- the global is **mutable** (a `const` global can never race → **never warns**),
+  **and**
+- its type is **not `@shareable`** (a mutable global of a `@shareable` type, or
+  of a built-in `Atomic`/`Mutex`/concurrent type, is asserted safe → silent).
+
+The warning fires only for accesses **inside a function/method body**: the
+single-threaded, ordered module-init pre-pass is exempt (an initializer reading
+an earlier global is not a concurrent access). A name that resolves to a
+*shadowing local* is not a shared-state access and does not warn. An augmented
+assignment (`g += 1`) is one read-modify-write access → one warning. It reuses
+the existing `warning[ZAPnnnn]` pipeline (#659); it is **non-fatal** and does
+not change what compiles.
+
+### Suppression — a per-site `# noqa` pragma
+
+A trailing line comment suppresses the lint at one site, matching the Python
+convention the issue references:
+
+- `# noqa` — suppress every warning on that line.
+- `# noqa: ZAP5125[, ZAP5126, …]` — suppress only the listed codes.
+
+Suppression is **line-based** (keyed on the warning's start line) and
+**warning-only** — errors are never suppressible. It is a single pure,
+source-driven filter (`zapc_sema::apply_suppressions`) shared by the in-process
+test path and the `zap` driver, so a sema test observes exactly what a build
+produces. (A new, minimal mechanism: Zap had no prior suppression surface.)
+
+### Policy — `--warnings-as-errors` (`-Werror`), off by default
+
+A general build knob on `run`/`build`/`ir`: when set, any warning that survives
+suppression is promoted to a **fatal** error (non-zero exit), letting a team make
+the sharing lint — and every other warning — fatal in their own CI. It is **off
+by default** and **never changes what the language considers legal**: the same
+program compiles with or without it; only the build's exit policy differs.
+
+### Diagnostics
+
+- **ZAP5125** (`shared mutable global is not @shareable`) — a non-fatal warning
+  at a read/write of a mutable, non-`@shareable` module global.
+- **ZAP5047 / ZAP5041** — reused for a misapplied `@shareable` (wrong target /
+  arguments).
+
+### Verification
+
+Sema unit tests cover every fires/silent case: a bare mutable global's read,
+write and augmented-assign; reference-typed and `auto`-typed globals; a `const`
+global (silent); a `@shareable` user struct vs the same struct unmarked; every
+built-in shareable type; a shadowing local and plain locals (silent); the
+init-pre-pass exemption; the marker's wrong-target/argument rejections; and the
+`# noqa` suppression (bare, code-specific, unrelated-code, and per-line
+isolation), plus a standalone test of the `apply_suppressions` filter. IR tests
+assert a `@shareable` struct reaches the reflection registry and that
+`reflect_has("<builtin>", "shareable")` folds to a constant with no runtime call.
+Driver integration tests (host-safe, via `zap ir`) assert the lint warns but the
+build succeeds by default, that `--warnings-as-errors`/`-Werror` makes it fatal,
+that a `const` global and a `# noqa`-suppressed site stay non-fatal even under
+`-Werror`. An end-to-end golden (`shareable_reflect`) checks runtime
+`reflect_has` for a marked struct, an unmarked struct and the built-ins.

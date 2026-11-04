@@ -151,8 +151,9 @@ auto total = 0                        # mutable with inferred type
 Concurrency follows the light Go/Python model of epic #661: a mutable module
 binding is shared, **unsynchronized, and never implicitly locked**. `const` is
 the safe default; `Atomic[T]`/`Mutex`/concurrent collections are the tools for
-shared mutable state. (The static sharing lint and the `@shareable` marker are
-later phases of #661.)
+shared mutable state. This model is kept honest by an **advisory** surface —
+never a dialect — described in §12.1: the `@shareable` marker and the static
+sharing lint (ZAP5125).
 
 Only a **single-name** module-level binding is admitted. A module-level
 tuple-destructuring declaration (`T a, b = expr`) is rejected (ZAP3018) — declare
@@ -1038,6 +1039,47 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
 - **Memory model (D-0034):** data-race-free programs are sequentially
   consistent; data races are bugs.
 
+### 12.1 Concurrency-safety surface: `@shareable` + the sharing lint (D-0113, #664)
+
+Module-level mutable state (§3.1) is shared across coroutines **unsynchronized**.
+Zap keeps the light model honest with an **advisory** surface that is *never* a
+dialect: the same program compiles whether or not you heed it.
+
+```python
+@shareable                         # a trusted assertion: safe under sharing
+struct Registry:
+    Mutex guard
+    dict[str, int64] entries
+
+Registry reg = Registry(...)       # mutable global of a @shareable type — no warning
+
+int64 hits = 0                     # mutable global of a plain type
+def bump():
+    hits += 1                      # warning[ZAP5125]: shared mutable access
+    hits += 1  # noqa              # suppressed at this one site
+```
+
+- **`@shareable`** marks a `struct` as safe under concurrent shared access. It is
+  a **trusted, unverified** claim — the compiler does not prove it — takes no
+  arguments, and is reflectable: `reflect_has(T, "shareable")`.
+- **The built-in concurrency primitives carry it implicitly:** `Atomic`, `Mutex`,
+  `WaitGroup`, `Once`, and the `concurrent` collections `Counter`/`Queue`. The
+  lint applies **one uniform rule** to user and built-in types alike — there is
+  no separate hardcoded allowlist.
+- **The sharing lint (`ZAP5125`, a warning)** fires at each read or write of a
+  **mutable** module global whose type is **not `@shareable`**. A `const` global
+  **never** warns (it cannot race); a mutable global of a `@shareable` type is
+  silent. Accesses inside the single-threaded module-init pre-pass, and names
+  shadowed by a local, do not warn.
+- **Suppress one site** with a trailing `# noqa` (all codes on the line) or
+  `# noqa: ZAP5125` (specific codes). Line-based, warning-only.
+- **Policy:** `zap build/run/ir --warnings-as-errors` (alias `-Werror`) makes any
+  surviving warning fatal, for CI. Off by default; it never changes what the
+  language accepts.
+
+The lint is advisory; a data race is still a bug (§12 memory model), and a
+runtime `-race` detector is a planned backstop (#661).
+
 ## 13. Modules, imports, visibility (D-0028, D-0052)
 
 ```python
@@ -1215,11 +1257,15 @@ struct Signup:
 Multiple decorators stack bottom-up. `zap expand` shows the generated code.
 
 **Built-ins (v1):** `@derive(...)`, `@default`, `@validate`, `@range` (all
-compile-time code generation, D-0101) and **`@deprecated`** (I#472, D-0109).
-`@deprecated(msg?)` is a function/method decorator that generates no code but
-emits a non-fatal **use-site warning** (`ZAP5124`) at every call site of the
-decorated callable — the mechanism for retiring a Stable surface with notice
-(STABILITY.md §5). An optional message is appended (`@deprecated("use X")`).
+compile-time code generation, D-0101), **`@deprecated`** (I#472, D-0109), and
+**`@shareable`** (I#664, D-0113). `@deprecated(msg?)` is a function/method
+decorator that generates no code but emits a non-fatal **use-site warning**
+(`ZAP5124`) at every call site of the decorated callable — the mechanism for
+retiring a Stable surface with notice (STABILITY.md §5). An optional message is
+appended (`@deprecated("use X")`). **`@shareable`** is a no-argument marker on a
+`struct` asserting it is safe under concurrent shared access (a trusted,
+unverified claim); it generates no code, is reflectable via
+`reflect_has(T, "shareable")`, and drives the sharing lint (§12.1).
 
 **Not in the v1 set (I#472/D-0109):** `@cache` is **deferred** — it needs
 module-level persistent state, not yet a language feature (and the "separate
@@ -1237,6 +1283,8 @@ One user-facing tool, **`zap`** (the `zapc` compiler becomes internal):
 ```
 zap run <file> | zap run      # run a single file, or the project (zap.toml)
 zap build                     # build project -> native binary (target/)
+#   run/build/ir also accept --warnings-as-errors (alias -Werror): make surviving
+#   warnings fatal, for CI; off by default and never changes what compiles (D-0113)
 zap test [--watch] [--json]   # run tests; --watch re-runs (targeting changed paths); --json for agents
 zap test --doc [path]         # run docstring examples (doctests, #234) through the REPL engine
 zap fmt                       # canonical formatter (D-0037)

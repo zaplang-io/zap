@@ -28,7 +28,7 @@ pub enum DocFormat {
 /// A parsed `zap` invocation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `zap run [file] [-o out] [--target-feature f] [--portable]` — compile and
+    /// `zap run [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors]` — compile and
     /// run a file or the project.
     Run {
         file: Option<String>,
@@ -37,8 +37,10 @@ pub enum Command {
         features: Vec<String>,
         /// Portable static link profile (I#287).
         portable: bool,
+        /// Make warnings fatal (#664, D-0113); off by default.
+        warnings_as_errors: bool,
     },
-    /// `zap build [file] [-o out] [--target-feature f] [--portable]` — build a
+    /// `zap build [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors]` — build a
     /// native binary into `target/`.
     Build {
         file: Option<String>,
@@ -48,12 +50,16 @@ pub enum Command {
         /// Portable static link profile (I#287): a self-contained binary that
         /// runs on minimal / older-glibc distros such as Amazon Linux 2023.
         portable: bool,
+        /// Make warnings fatal (#664, D-0113); off by default.
+        warnings_as_errors: bool,
     },
-    /// `zap ir [file] [--target-feature f]` — dump ZIR (diagnostic).
+    /// `zap ir [file] [--target-feature f] [--warnings-as-errors]` — dump ZIR (diagnostic).
     Ir {
         file: Option<String>,
         /// Compile-time CPU features for `when target.has(.f)` (I#139).
         features: Vec<String>,
+        /// Make warnings fatal (#664, D-0113); off by default.
+        warnings_as_errors: bool,
     },
     /// `zap expand [file]` — show decorator/`@derive`-generated code (D-0036).
     Expand { file: Option<String> },
@@ -212,12 +218,14 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 out,
                 features,
                 portable,
+                warnings_as_errors,
             } = parse_compile(rest)?;
             Ok(Command::Run {
                 file,
                 out,
                 features,
                 portable,
+                warnings_as_errors,
             })
         }
         "build" => {
@@ -226,17 +234,28 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 out,
                 features,
                 portable,
+                warnings_as_errors,
             } = parse_compile(rest)?;
             Ok(Command::Build {
                 file,
                 out,
                 features,
                 portable,
+                warnings_as_errors,
             })
         }
         "ir" => {
-            let CompileArgs { file, features, .. } = parse_compile(rest)?;
-            Ok(Command::Ir { file, features })
+            let CompileArgs {
+                file,
+                features,
+                warnings_as_errors,
+                ..
+            } = parse_compile(rest)?;
+            Ok(Command::Ir {
+                file,
+                features,
+                warnings_as_errors,
+            })
         }
         "expand" => Ok(Command::Expand {
             file: first_positional(rest),
@@ -316,6 +335,10 @@ struct CompileArgs {
     features: Vec<String>,
     /// `--portable`: the self-contained static link profile (I#287).
     portable: bool,
+    /// `--warnings-as-errors` / `-Werror`: promote any surviving warning to a
+    /// fatal error (#664, D-0113). Off by default; a team CI knob that never
+    /// changes what the language considers legal.
+    warnings_as_errors: bool,
 }
 
 /// Parse the `[-o <out>] [--target-feature f]... [--portable] [file]` form shared
@@ -325,9 +348,17 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
     let mut out: Option<String> = None;
     let mut features: Vec<String> = Vec::new();
     let mut portable = false;
+    let mut warnings_as_errors = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            // `--warnings-as-errors` (alias `-Werror`): make every surviving
+            // warning fatal (#664, D-0113). Off by default; the language stays
+            // the same, this only changes the build's exit policy.
+            "--warnings-as-errors" | "-Werror" => {
+                warnings_as_errors = true;
+                i += 1;
+            }
             "-o" | "--out" => {
                 out = Some(
                     args.get(i + 1)
@@ -371,6 +402,7 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
         out,
         features,
         portable,
+        warnings_as_errors,
     })
 }
 
@@ -1035,8 +1067,9 @@ pub fn execute(cmd: Command) -> ExitCode {
             out,
             features,
             portable,
+            warnings_as_errors,
         } => match resolve_entry(file) {
-            Ok(f) => crate::compile_for(&f, out, true, &features, portable),
+            Ok(f) => crate::compile_for(&f, out, true, &features, portable, warnings_as_errors),
             Err(code) => code,
         },
         Command::Build {
@@ -1044,9 +1077,14 @@ pub fn execute(cmd: Command) -> ExitCode {
             out,
             features,
             portable,
-        } => cmd_build(file, out, &features, portable),
-        Command::Ir { file, features } => match resolve_entry(file) {
-            Ok(f) => crate::emit_ir_for(&f, &features),
+            warnings_as_errors,
+        } => cmd_build(file, out, &features, portable, warnings_as_errors),
+        Command::Ir {
+            file,
+            features,
+            warnings_as_errors,
+        } => match resolve_entry(file) {
+            Ok(f) => crate::emit_ir_for(&f, &features, warnings_as_errors),
             Err(code) => code,
         },
         Command::Expand { file } => match resolve_entry(file) {
@@ -1121,6 +1159,7 @@ fn cmd_build(
     out: Option<String>,
     features: &[String],
     portable: bool,
+    warnings_as_errors: bool,
 ) -> ExitCode {
     let entry = match resolve_entry(file) {
         Ok(f) => f,
@@ -1140,7 +1179,14 @@ fn cmd_build(
             format!("target/{stem}")
         }
     };
-    crate::compile_for(&entry, Some(out), false, features, portable)
+    crate::compile_for(
+        &entry,
+        Some(out),
+        false,
+        features,
+        portable,
+        warnings_as_errors,
+    )
 }
 
 /// Resolve the input for `run`/`build`/`ir`/`expand`.
@@ -1664,6 +1710,9 @@ compile & run:
        --portable       (run/build) self-contained static link; drops CPython
                         interop so the binary runs on minimal / older-glibc
                         distros such as Amazon Linux 2023 (I#287, experimental)
+       --warnings-as-errors   (run/build/ir; alias -Werror) make every surviving
+                        warning fatal, for CI; off by default and never changes
+                        what the language accepts (#664, D-0113)
 
 project:
   new <name>            scaffold a new project directory (writes zap.toml)
@@ -1779,6 +1828,7 @@ mod tests {
                 out: None,
                 features: vec![],
                 portable: false,
+                warnings_as_errors: false,
             }
         );
         assert_eq!(
@@ -1788,6 +1838,7 @@ mod tests {
                 out: Some("bin/a".into()),
                 features: vec![],
                 portable: false,
+                warnings_as_errors: false,
             }
         );
     }
@@ -1801,6 +1852,7 @@ mod tests {
                 out: None,
                 features: vec![],
                 portable: false,
+                warnings_as_errors: false,
             }
         );
     }
@@ -1814,6 +1866,7 @@ mod tests {
                 out: Some("x".into()),
                 features: vec![],
                 portable: false,
+                warnings_as_errors: false,
             }
         );
     }
@@ -1828,6 +1881,7 @@ mod tests {
                 out: None,
                 features: vec![],
                 portable: true,
+                warnings_as_errors: false,
             }
         );
         // Order-independent and composes with `-o`; also accepted by `run`.
@@ -1838,6 +1892,7 @@ mod tests {
                 out: Some("x".into()),
                 features: vec![],
                 portable: true,
+                warnings_as_errors: false,
             }
         );
         assert_eq!(
@@ -1847,6 +1902,7 @@ mod tests {
                 out: None,
                 features: vec![],
                 portable: true,
+                warnings_as_errors: false,
             }
         );
         // Absent by default.
@@ -1857,6 +1913,72 @@ mod tests {
                 out: None,
                 features: vec![],
                 portable: false,
+                warnings_as_errors: false,
+            }
+        );
+    }
+
+    #[test]
+    fn warnings_as_errors_flag_is_parsed() {
+        // `--warnings-as-errors` and its `-Werror` alias set the knob on
+        // run/build/ir; it is off by default and composes with other flags
+        // (#664, D-0113).
+        assert_eq!(
+            p(&["run", "a.zap", "--warnings-as-errors"]).unwrap(),
+            Command::Run {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: true,
+            }
+        );
+        assert_eq!(
+            p(&["build", "-Werror", "a.zap"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: true,
+            }
+        );
+        assert_eq!(
+            p(&["ir", "a.zap", "-Werror"]).unwrap(),
+            Command::Ir {
+                file: Some("a.zap".into()),
+                features: vec![],
+                warnings_as_errors: true,
+            }
+        );
+        // Composes with `--portable` and `-o`, order-independent.
+        assert_eq!(
+            p(&[
+                "build",
+                "--warnings-as-errors",
+                "--portable",
+                "-o",
+                "x",
+                "a.zap"
+            ])
+            .unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: Some("x".into()),
+                features: vec![],
+                portable: true,
+                warnings_as_errors: true,
+            }
+        );
+        // Off by default.
+        assert_eq!(
+            p(&["run", "a.zap"]).unwrap(),
+            Command::Run {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: false,
             }
         );
     }
@@ -1880,6 +2002,7 @@ mod tests {
                 out: None,
                 features: vec!["sse4_2".into(), "avx2".into()],
                 portable: false,
+                warnings_as_errors: false,
             }
         );
         assert!(p(&["run", "a.zap", "--target-feature"]).is_err());
@@ -1907,6 +2030,7 @@ mod tests {
             Command::Ir {
                 file: Some("a.zap".into()),
                 features: vec![],
+                warnings_as_errors: false,
             }
         );
         assert_eq!(

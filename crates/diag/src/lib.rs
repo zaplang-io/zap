@@ -667,6 +667,18 @@ define_codes! {
          This is a non-fatal warning emitted at the use site so a Stable surface \
          can be retired with notice before removal (STABILITY.md §5). An \
          optional message (`@deprecated(\"use X\")`) is appended when present.";
+    ZAP5125 = 5125 : "shared mutable global is not @shareable",
+        "A mutable module-level global (#662, D-0112) whose type is not marked \
+         `@shareable` is read or written. Under Zap's light concurrency model \
+         (#661/#664, D-0113) coroutines share module state with no implicit \
+         synchronization, so careless shared mutable access can race. This is a \
+         non-fatal advisory warning — the program stays legal — not a dialect \
+         switch. Silence it by marking the type `@shareable` (a trusted \
+         assertion), using a `@shareable` primitive such as `Atomic`/`Mutex` or \
+         a `concurrent` collection, declaring the global `const` (never warns), \
+         or suppressing the one site with a `# noqa` (optionally `# noqa: \
+         ZAP5125`) pragma. A team may make it fatal in CI with \
+         `--warnings-as-errors` (off by default).";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

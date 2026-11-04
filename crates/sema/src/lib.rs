@@ -14,6 +14,7 @@ use zapc_syntax::ast::*;
 use zapc_syntax::fstring::{self, FStringPart, FormatSpec};
 use zapc_syntax::genanalysis;
 use zapc_syntax::span::Span;
+use zapc_syntax::{BUILTIN_SHAREABLE_TYPES, SHAREABLE_MARKER};
 
 // The source-level type model (`Ty`, the `*Info` records, and the pure type
 // operations `assignable`/`join`/`num_join`/`default_type` and the dunder
@@ -226,10 +227,89 @@ pub fn check_str(
 }
 
 /// Convenience for tests: lex, parse, and type-check `src`, returning the
-/// non-fatal warnings.
+/// non-fatal warnings with per-site suppressions already applied (so a test
+/// exercises the whole user-visible warning surface, [`apply_suppressions`]
+/// included).
 pub fn warnings_str(src: &str) -> Vec<TypeError> {
     let (module, _perrs, _lerrs) = zapc_syntax::parser::parse_str(src);
-    analyze(&module).1
+    apply_suppressions(src, analyze(&module).1)
+}
+
+/// Drop any warning whose source line carries a suppression pragma (#664,
+/// D-0113). The pragma is a trailing line comment in one of two `# noqa`-style
+/// forms, matching the Python convention the issue references:
+///
+/// - `# noqa` — suppress *every* warning reported on that line.
+/// - `# noqa: ZAP5125[, ZAP5126, …]` — suppress only the listed codes.
+///
+/// Suppression is line-based and applies to the line of a warning's **start**
+/// offset, so one pragma silences every access written on that one physical
+/// line (and nothing on any other line). It is deliberately a warning-only
+/// filter: errors are never suppressible. The scan only inspects the comment
+/// tail after the first `#` on the line; a `#` inside a string literal earlier
+/// on the line can therefore shadow a real trailing comment, which is an
+/// accepted limitation of the lightweight line scan (documented in SPEC.md).
+///
+/// This is the single, pure, source-driven implementation shared by the
+/// in-process test path ([`warnings_str`]) and the `zap` driver, so the
+/// behavior a sema test observes is exactly the behavior a build produces.
+pub fn apply_suppressions(src: &str, warnings: Vec<TypeError>) -> Vec<TypeError> {
+    if warnings.is_empty() {
+        return warnings;
+    }
+    // Byte offset of the start of each line, so a span start maps to its line.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let line_of = |offset: usize| -> usize {
+        // The index of the greatest line-start <= offset (0-based line number).
+        match line_starts.binary_search(&offset) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+    };
+    let lines: Vec<&str> = src.lines().collect();
+
+    /// What a line's pragma suppresses: everything, or a specific code set.
+    enum Suppress {
+        All,
+        Codes(Vec<ErrorCode>),
+    }
+    // Parse the suppression (if any) carried by one source line.
+    fn parse_pragma(line: &str) -> Option<Suppress> {
+        // The comment tail: everything after the first `#`.
+        let hash = line.find('#')?;
+        let comment = &line[hash + 1..];
+        // Find the `noqa` token in the comment.
+        let idx = comment.find("noqa")?;
+        let rest = comment[idx + "noqa".len()..].trim_start();
+        if let Some(list) = rest.strip_prefix(':') {
+            let codes: Vec<ErrorCode> = list
+                .split(',')
+                .filter_map(|tok| ErrorCode::parse(tok.trim()))
+                .collect();
+            // `# noqa:` with no parseable code suppresses nothing (a typo should
+            // not silently swallow every warning on the line).
+            Some(Suppress::Codes(codes))
+        } else {
+            Some(Suppress::All)
+        }
+    }
+
+    warnings
+        .into_iter()
+        .filter(|w| {
+            let ln = line_of(w.span.start as usize);
+            match lines.get(ln).and_then(|l| parse_pragma(l)) {
+                Some(Suppress::All) => false,
+                Some(Suppress::Codes(codes)) => !codes.contains(&w.code),
+                None => true,
+            }
+        })
+        .collect()
 }
 
 struct Checker {
@@ -262,6 +342,19 @@ struct Checker {
     /// bare name; a method by `"Type.method"`. Each call site resolving to one of
     /// these raises the non-fatal ZAP5124 use-site warning.
     deprecated: HashMap<String, Option<String>>,
+    /// User structs marked `@shareable` (#664, D-0113), by type name. The
+    /// sharing lint (ZAP5125) treats a mutable module global of such a type as
+    /// safe. This is a *trusted assertion*, never verified. Built-in shareable
+    /// types ([`SHAREABLE_MARKER`]-bearing primitives) are not stored here; they
+    /// are recognized by [`Checker::name_is_shareable`] through the shared
+    /// [`BUILTIN_SHAREABLE_TYPES`] seed, so the lint runs one uniform rule.
+    shareable_types: HashSet<String>,
+    /// Names of mutable module-level globals whose type is NOT `@shareable`
+    /// (#664, D-0113). Each read or write of one of these — resolving to the
+    /// module frame, not a shadowing local — raises the ZAP5125 sharing-lint
+    /// warning. A `const` global is never recorded here (it can never race), nor
+    /// is a mutable global of a `@shareable` type.
+    share_lint_globals: HashSet<String>,
     scopes: Vec<HashMap<String, Ty>>,
     /// Immutability flag per binding, parallel to `scopes` (D-0003): a frame's
     /// set holds the names in the same `scopes` frame that were introduced by a
@@ -441,6 +534,10 @@ const BUILTIN_DECORATORS: &[&str] = &[
     "range",
     "deprecated",
     "inject",
+    // Concurrency-safety marker (#664, D-0113): `@shareable` on a `struct`
+    // asserts the type is safe under concurrent shared access (a trusted,
+    // unverified claim), reflectable via `reflect_has(T, "shareable")`.
+    SHAREABLE_MARKER,
     // JSON codec hooks (ticket #346, D-0086): `@json(timestamp="epoch"|"iso8601")`
     // on a `DateTime` field selects its wire form; `@json(open)` on an enum marks
     // it an open (forward-compatible) string enum. See `design/0010-json.md`.
@@ -667,6 +764,8 @@ impl Checker {
             annotations: HashMap::new(),
             user_decorators: HashSet::new(),
             deprecated: HashMap::new(),
+            shareable_types: HashSet::new(),
+            share_lint_globals: HashSet::new(),
             scopes: Vec::new(),
             const_scopes: Vec::new(),
             tyvar_bounds: HashMap::new(),
@@ -838,6 +937,72 @@ impl Checker {
         None
     }
 
+    // --- sharing lint (#664, D-0113) ---------------------------------------
+
+    /// Is a type named `name` `@shareable` (#664, D-0113)? The one uniform rule
+    /// the sharing lint consults: a user `struct` marked `@shareable`, or one of
+    /// the built-in concurrency primitives / concurrent collections that carry
+    /// the marker implicitly ([`BUILTIN_SHAREABLE_TYPES`]). No other allowlist.
+    fn name_is_shareable(&self, name: &str) -> bool {
+        self.shareable_types.contains(name) || BUILTIN_SHAREABLE_TYPES.contains(&name)
+    }
+
+    /// Is a module global's declared type `@shareable`? Decided on the type's
+    /// nominal base name, so a generic spelling (`Atomic[int64]`, `Queue[str]`)
+    /// is covered by its base. `ty` is the declared-type AST when the global
+    /// carried an explicit annotation; otherwise the inferred `resolved` type is
+    /// consulted (a user struct resolves to `Ty::Named`). Scalars and the
+    /// built-in containers (`list`/`dict`/`set`/…) are never shareable.
+    fn declared_type_is_shareable(&self, ty: Option<&Type>, resolved: &Ty) -> bool {
+        if let Some(Type::Named { name, .. }) = ty {
+            return self.name_is_shareable(name);
+        }
+        match resolved {
+            Ty::Named(n) => self.name_is_shareable(n),
+            _ => false,
+        }
+    }
+
+    /// Does a bare `name` resolve to the module-global frame (frame 0) — i.e. a
+    /// module-level binding not shadowed by a parameter or local? Scans frames
+    /// top-down exactly like [`lookup`]; the first frame that binds the name
+    /// decides, so a shadowing local correctly wins.
+    fn resolves_to_module_global(&self, name: &str) -> bool {
+        for (i, scope) in self.scopes.iter().enumerate().rev() {
+            if scope.contains_key(name) {
+                return i == 0;
+            }
+        }
+        false
+    }
+
+    /// Note one access (read or write) of `name` for the sharing lint (ZAP5125,
+    /// #664/D-0113). Warns iff `name` is a mutable module global of a
+    /// non-`@shareable` type (recorded in `share_lint_globals`), the access is
+    /// inside a function/method body (`scopes.len() > 1`, so the single-threaded
+    /// module-init pre-pass is exempt), and the name actually resolves to the
+    /// module frame rather than a shadowing local. Per-site suppression is
+    /// applied later, line-based, on the rendered warnings (see
+    /// [`apply_suppressions`]).
+    fn note_share_access(&mut self, name: &str, span: Span) {
+        if self.scopes.len() > 1
+            && self.share_lint_globals.contains(name)
+            && self.resolves_to_module_global(name)
+        {
+            self.warn(
+                ErrorCode::ZAP5125,
+                format!(
+                    "access to shared mutable global '{name}' of a non-@shareable type; \
+                     under the light concurrency model coroutines share it without \
+                     synchronization (#661/#664). Mark its type @shareable, use an \
+                     Atomic/Mutex or a concurrent collection, make it `const`, or \
+                     suppress this site with `# noqa`"
+                ),
+                span,
+            );
+        }
+    }
+
     // --- collection passes ---
 
     fn collect_types(&mut self, module: &Module) {
@@ -924,6 +1089,11 @@ impl Checker {
                     }
                     let info = self.struct_info_of(s);
                     self.structs.insert(s.name.clone(), info);
+                    // Record a `@shareable` assertion (#664, D-0113) for the
+                    // sharing lint and reflection. A trusted, unverified claim.
+                    if s.decorators.iter().any(|d| d.name == SHAREABLE_MARKER) {
+                        self.shareable_types.insert(s.name.clone());
+                    }
                 }
                 Item::Interface(i) => {
                     for m in &i.methods {
@@ -2242,6 +2412,19 @@ impl Checker {
                     );
                 }
             }
+            // Concurrency-safety marker (#664, D-0113). `@shareable` applies to a
+            // `struct` and takes no arguments; it is a metadata-only assertion
+            // recorded for the sharing lint and reflection.
+            SHAREABLE_MARKER => {
+                self.require_target(d, target, DecoTarget::Struct);
+                if !d.args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP5041,
+                        "@shareable takes no arguments".to_string(),
+                        d.span,
+                    );
+                }
+            }
             // --- test framework (D-0054, issue #73) ---
             "test" | "before" | "after" | "before_all" | "after_all" => {
                 self.require_target(d, target, DecoTarget::Function);
@@ -2420,6 +2603,15 @@ impl Checker {
                 if *is_const {
                     self.declare_const(name, dt, *span);
                 } else {
+                    // Sharing lint (#664, D-0113): a MUTABLE module global whose
+                    // type is not `@shareable` is careless shared state — every
+                    // later read/write of it warns (ZAP5125). A `const` global
+                    // can never race, and a `@shareable`-typed one is asserted
+                    // safe, so neither is recorded. Checked before `declare`
+                    // consumes `dt`.
+                    if !self.declared_type_is_shareable(ty.as_ref(), &dt) {
+                        self.share_lint_globals.insert(name.clone());
+                    }
                     self.declare(name, dt, *span);
                 }
             }
@@ -2780,6 +2972,8 @@ impl Checker {
                     if self.reject_const_reassign(n, *span) {
                         return;
                     }
+                    // Sharing lint: writing a shared mutable global (#664/D-0113).
+                    self.note_share_access(n, *span);
                     match self.lookup(n) {
                         Some(dt) => {
                             if !self.coercible(&vt, &dt) {
@@ -2820,6 +3014,9 @@ impl Checker {
                             if self.reject_const_reassign(n, *span) {
                                 continue;
                             }
+                            // Sharing lint: writing a shared mutable global
+                            // (#664/D-0113).
+                            self.note_share_access(n, *span);
                             match self.lookup(n) {
                                 Some(dt) => {
                                     if !self.coercible(&vt, &dt) {
@@ -2872,6 +3069,9 @@ impl Checker {
                     if self.reject_const_reassign(n, *span) {
                         return;
                     }
+                    // Sharing lint: an augmented assign is a read-modify-write of
+                    // a shared mutable global — one access site (#664/D-0113).
+                    self.note_share_access(n, *span);
                     match self.lookup(n) {
                         Some(tt) => {
                             // `t += v` on a user struct calls the in-place dunder
@@ -3564,6 +3764,8 @@ impl Checker {
                             }
                         }
                     }
+                    // Sharing lint: reading a shared mutable global (#664/D-0113).
+                    self.note_share_access(n, *span);
                     t
                 } else if self.sigs.contains_key(n) || BUILTINS.contains(&n.as_str()) {
                     Ty::Unknown // a function used as a value
@@ -6929,6 +7131,252 @@ def main():
         // that function (an ordinary `auto`/typed declaration); a bare assignment
         // would instead reassign the global. Both are legal.
         ok("int64 x = 1\ndef f() -> int64:\n    auto x = 99\n    return x\ndef main() -> int64:\n    return f() + x\n");
+    }
+
+    // ---- @shareable marker + sharing lint (ZAP5125, #664/D-0113) ----------
+
+    // A ZAP5125 count helper: how many sharing-lint warnings the source raises
+    // (raw, before any `# noqa` suppression).
+    fn share_warnings(src: &str) -> usize {
+        warns(src)
+            .iter()
+            .filter(|w| w.code == ErrorCode::ZAP5125)
+            .count()
+    }
+
+    #[test]
+    fn sharing_lint_fires_on_bare_mutable_global_read_and_write() {
+        // A mutable module global of a non-@shareable type (a plain scalar) is
+        // careless shared state: both a read and a write warn (ZAP5125). None of
+        // this is an error — the program is still legal.
+        // Write.
+        assert_eq!(
+            share_warnings(
+                "int64 counter = 0\ndef bump():\n    counter = 1\ndef main():\n    bump()\n"
+            ),
+            1,
+        );
+        // Read.
+        assert_eq!(
+            share_warnings(
+                "int64 counter = 0\ndef show():\n    print(counter)\ndef main():\n    show()\n"
+            ),
+            1,
+        );
+        // Augmented assign is a single read-modify-write access → one warning.
+        assert_eq!(
+            share_warnings(
+                "int64 counter = 0\ndef bump():\n    counter += 1\ndef main():\n    bump()\n"
+            ),
+            1,
+        );
+        // No type errors are produced by any of this.
+        ok("int64 counter = 0\ndef bump():\n    counter += 1\ndef main():\n    bump()\n");
+    }
+
+    #[test]
+    fn sharing_lint_fires_for_reference_and_inferred_globals() {
+        // A reference-typed mutable global (list/dict) is equally flagged — a
+        // read of it (here, iterating / indexing) is an access.
+        assert!(
+            share_warnings("list[int64] log = []\ndef add(int64 x):\n    log.append(x)\ndef main():\n    add(1)\n")
+                >= 1,
+        );
+        // An `auto`-typed mutable global infers a non-shareable scalar type, so
+        // it is flagged too.
+        assert_eq!(
+            share_warnings("auto n = 0\ndef bump():\n    n = n + 1\ndef main():\n    bump()\n"),
+            // one read (RHS `n`) + one write (target `n`).
+            2,
+        );
+    }
+
+    #[test]
+    fn sharing_lint_silent_for_const_global() {
+        // A `const` global can never race — it is immutable — so no ZAP5125,
+        // for either a scalar or a reference-typed const.
+        assert_eq!(
+            share_warnings("const int64 N = 7\ndef use() -> int64:\n    return N\ndef main():\n    print(use())\n"),
+            0,
+        );
+        assert_eq!(
+            share_warnings("const list[int64] XS = [1, 2, 3]\ndef total() -> int64:\n    auto s = 0\n    for x in XS:\n        s += x\n    return s\ndef main():\n    print(total())\n"),
+            0,
+        );
+    }
+
+    #[test]
+    fn sharing_lint_silent_for_shareable_user_struct_global() {
+        // A mutable global whose type is a user `struct` marked `@shareable` is
+        // an asserted-safe type → no warning on access.
+        let src = "@shareable\nstruct Registry:\n    int64 n\n\nRegistry R = Registry(0)\ndef touch():\n    auto r = R\ndef main():\n    touch()\n";
+        assert_eq!(share_warnings(src), 0);
+        // The same struct WITHOUT the marker DOES warn, proving the marker — not
+        // the struct-ness — is what silences it.
+        let unmarked = "struct Registry:\n    int64 n\n\nRegistry R = Registry(0)\ndef touch():\n    auto r = R\ndef main():\n    touch()\n";
+        assert_eq!(share_warnings(unmarked), 1);
+    }
+
+    #[test]
+    fn sharing_lint_silent_for_builtin_shareable_type_globals() {
+        // A global of a built-in concurrency primitive / concurrent collection
+        // carries the marker implicitly → no warning. Decided on the nominal
+        // base name, so the generic spelling is covered.
+        for ty in [
+            "Atomic[int64]",
+            "Mutex",
+            "Counter",
+            "Queue[int64]",
+            "WaitGroup",
+            "Once",
+        ] {
+            let src = format!(
+                "{ty} g = frob()\ndef frob() -> {ty}:\n    return g\ndef touch():\n    auto x = g\ndef main():\n    touch()\n"
+            );
+            // These types resolve loosely (Unknown) in sema, so the declared-type
+            // name is what proves shareability; the point is ZERO ZAP5125.
+            assert_eq!(
+                share_warnings(&src),
+                0,
+                "built-in shareable `{ty}` global must not warn",
+            );
+        }
+    }
+
+    #[test]
+    fn sharing_lint_silent_for_local_shadow_and_plain_locals() {
+        // A plain function local of the same name shadows the global, so an
+        // access of the local is NOT a shared-state access.
+        assert_eq!(
+            share_warnings("int64 x = 1\ndef f() -> int64:\n    auto x = 99\n    return x\ndef main():\n    print(f())\n"),
+            0,
+        );
+        // An ordinary local (no module global at all) never warns.
+        assert_eq!(
+            share_warnings("def main() -> int64:\n    int64 y = 0\n    y = y + 1\n    return y\n"),
+            0,
+        );
+    }
+
+    #[test]
+    fn sharing_lint_silent_during_module_init_prepass() {
+        // A global's initializer reading an earlier mutable global runs during
+        // single-threaded, ordered module init — not concurrently — so the
+        // read in the initializer itself is exempt (only accesses inside a
+        // function body are flagged). Here `B = A + 5` reads `A` at init: the
+        // only ZAP5125 is the later in-body read, not the initializer read.
+        assert_eq!(
+            share_warnings("int64 A = 10\nint64 B = A + 5\ndef use() -> int64:\n    return A\ndef main():\n    print(use())\n"),
+            1,
+        );
+    }
+
+    #[test]
+    fn shareable_marker_rejects_wrong_target_and_args() {
+        // `@shareable` applies to a struct only (ZAP5047) and takes no arguments
+        // (ZAP5041).
+        let e = errors("@shareable\ndef f():\n    print(1)\ndef main():\n    f()\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5047),
+            "expected ZAP5047 for @shareable on a function, got {e:?}"
+        );
+        let e = errors("@shareable(1)\nstruct S:\n    int64 n\ndef main():\n    print(0)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5041),
+            "expected ZAP5041 for @shareable with arguments, got {e:?}"
+        );
+        // A well-formed application is accepted.
+        ok("@shareable\nstruct S:\n    int64 n\ndef main():\n    print(0)\n");
+    }
+
+    #[test]
+    fn sharing_lint_suppressed_by_noqa_pragma_on_the_site() {
+        // `# noqa` on an access line silences exactly that line's warning.
+        // Without it, the write warns; with it, silent; a second un-pragma'd
+        // access on another line still warns.
+        let base = "int64 c = 0\ndef bump():\n    c = 1\ndef main():\n    bump()\n";
+        assert_eq!(
+            warnings_str(base)
+                .iter()
+                .filter(|w| w.code == ErrorCode::ZAP5125)
+                .count(),
+            1,
+        );
+        let suppressed = "int64 c = 0\ndef bump():\n    c = 1  # noqa\ndef main():\n    bump()\n";
+        assert_eq!(
+            warnings_str(suppressed)
+                .iter()
+                .filter(|w| w.code == ErrorCode::ZAP5125)
+                .count(),
+            0,
+        );
+        // Code-specific form targets exactly ZAP5125.
+        let coded =
+            "int64 c = 0\ndef bump():\n    c = 1  # noqa: ZAP5125\ndef main():\n    bump()\n";
+        assert_eq!(
+            warnings_str(coded)
+                .iter()
+                .filter(|w| w.code == ErrorCode::ZAP5125)
+                .count(),
+            0,
+        );
+        // A noqa for an UNRELATED code does not silence ZAP5125.
+        let other =
+            "int64 c = 0\ndef bump():\n    c = 1  # noqa: ZAP5124\ndef main():\n    bump()\n";
+        assert_eq!(
+            warnings_str(other)
+                .iter()
+                .filter(|w| w.code == ErrorCode::ZAP5125)
+                .count(),
+            1,
+        );
+        // Suppression is per-line: a pragma on one access line does not silence
+        // an access on a different line.
+        let two = "int64 c = 0\ndef read() -> int64:\n    return c  # noqa\ndef write():\n    c = 2\ndef main():\n    write()\n    print(read())\n";
+        assert_eq!(
+            warnings_str(two)
+                .iter()
+                .filter(|w| w.code == ErrorCode::ZAP5125)
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn apply_suppressions_is_a_standalone_line_filter() {
+        // The pure filter drops a warning whose line carries the pragma and keeps
+        // one whose line does not, independent of the checker.
+        let src = "a\nb  # noqa\nc\n";
+        let span = |line0: u32| -> Span {
+            // byte offset of the start of a 0-based line (each line is "x\n" or
+            // "x  # noqa\n"); compute from the source.
+            let mut off = 0u32;
+            for (i, l) in src.split_inclusive('\n').enumerate() {
+                if i as u32 == line0 {
+                    break;
+                }
+                off += l.len() as u32;
+            }
+            Span {
+                start: off,
+                end: off + 1,
+            }
+        };
+        let ws = vec![
+            TypeError {
+                code: ErrorCode::ZAP5125,
+                message: "w0".into(),
+                span: span(0),
+            },
+            TypeError {
+                code: ErrorCode::ZAP5125,
+                message: "w1".into(),
+                span: span(1),
+            },
+        ];
+        let kept = apply_suppressions(src, ws);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].message, "w0");
     }
 
     #[test]
