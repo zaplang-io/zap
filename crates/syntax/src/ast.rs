@@ -689,6 +689,16 @@ pub enum Pattern {
     },
     /// `*rest` inside a sequence pattern.
     Rest { name: Option<String>, span: Span },
+    /// `<pattern> as name` — matches the inner pattern and, on success, binds
+    /// `name` to the *whole* matched value (D11, #603). The capture is in scope
+    /// in the arm body and its guard; the inner pattern may itself destructure
+    /// (`case [x, y] as pair:` binds `pair`, `x`, and `y`). Mirrors CPython's
+    /// `as_pattern` wrapping a `closed_pattern`/`or_pattern`.
+    As {
+        pattern: Box<Pattern>,
+        name: String,
+        span: Span,
+    },
 }
 
 /// One argument of a struct/variant pattern (D-0040/D-0046). `name` is `Some`

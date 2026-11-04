@@ -296,6 +296,12 @@ define_codes! {
          shorthand (that would duplicate `auto` and clash with the walrus \
          meaning); to introduce a binding use `auto name = expr` or a typed \
          declaration (D-0003).";
+    ZAP2021 = 2021 : "malformed `as` pattern capture",
+        "In a `match` pattern, `as` must be followed by a single plain binding \
+         name — `case <pattern> as name:` (D11, #603). It binds the whole \
+         matched value to `name`, in scope in the arm body and its guard. The \
+         name cannot be `_` (use the pattern without `as` to discard), a \
+         dotted/qualified name, or any non-identifier token.";
 
     // ---- ZAP3xxx — name resolution / imports -------------------------------
     ZAP3001 = 3001 : "unknown name",

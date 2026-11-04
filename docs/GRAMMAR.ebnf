@@ -418,7 +418,18 @@ select_op     ::= IDENT "=" "<-" postfix               (* receive case, binds ID
 match_stmt    ::= "match" expr ":" NEWLINE INDENT { case_clause } DEDENT ;
 case_clause   ::= "case" pattern [ "if" expr ] block ;
 
-pattern       ::= or_pattern ;
+pattern       ::= or_pattern [ "as" IDENT ] ;    (* D11, #603: the "as" capture
+                                                    binds the WHOLE matched value
+                                                    to IDENT and wraps the entire
+                                                    or_pattern, so `1 | 2 as n`
+                                                    is `(1 | 2) as n`. The inner
+                                                    pattern still destructures
+                                                    (`[x, y] as pair` binds
+                                                    `pair`, `x`, `y`). IDENT must
+                                                    be a single plain name — not
+                                                    `_`, not dotted (ZAP2021).
+                                                    The capture is in scope in
+                                                    the arm body and its guard. *)
 or_pattern    ::= closed_pattern { "|" closed_pattern } ;
 closed_pattern ::= "_"
                 | literal

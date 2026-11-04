@@ -1242,6 +1242,14 @@ impl Walk {
                     self.bind_pattern(&a.pattern);
                 }
             }
+            Pattern::As {
+                pattern,
+                name,
+                span,
+            } => {
+                self.bind_pattern(pattern);
+                self.bind(name.clone(), *span, SymbolKind::Local);
+            }
             _ => {}
         }
     }

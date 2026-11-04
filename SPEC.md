@@ -525,6 +525,18 @@ patterns test fields recursively. Bindings belong to their arm; if its guard
 fails, matching continues with the next arm. A guarded or refutable payload
 pattern does not by itself cover its entire enum variant.
 
+A pattern may carry a trailing **`as` capture** — `case <pattern> as name:`
+(D11, #603). It matches the inner pattern and, on success, binds `name` to the
+*whole* matched value, typed as the scrutinee for that arm; the inner pattern
+still destructures, so nested captures bind alongside the `as` name
+(`case [x, y] as pair:` binds `pair`, `x`, and `y`; `case Point(x=0) as origin:`
+binds `origin`). The `as` binds the entire or-pattern, so `case 1 | 2 | 3 as n:`
+is `(1 | 2 | 3) as n`. The capture is in scope in the arm body and in the arm's
+guard (`case [x, y] as pair if len(pair) == 2:`). `name` must be a single plain
+identifier — never `_` (drop the `as` to discard the value) and never a dotted
+name (ZAP2021). An `as` capture does not change which enum variants its arm
+covers for exhaustiveness.
+
 ```python
 match command:
     case "quit":
@@ -533,6 +545,8 @@ match command:
         move(direction)
     case Point(x=0, y=y):
         on_axis(y)
+    case [x, y] as pair if len(pair) == 2:
+        both(pair, x, y)
     case n if n > 100:
         big(n)
     case _:
