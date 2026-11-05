@@ -194,6 +194,8 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | SCOPE-2 | §12 | `scope(timeout=<ms>)` cancels and drains children, preserves cleanup, raises `ScopeTimeout` to the caller, and composes orthogonally with the failure policy (a child failure outranks the timeout) | covered | scope_timeout |
 | SCOPE-3 | §12 | scope grace bounds an uncooperative drain after the deadline | covered | scope_timeout_grace |
 | SCOPE-4 | §12 | `ScopeTimeout` reports every coroutine still outstanding at the deadline, not a sample | covered | scope_timeout_pending |
+| SCOPE-5 | §12 | `spawn` supports named functions, user-struct method calls, and first-class function values, capturing receiver/arguments/closure eagerly in the parent; a `scope:` joins them all (D-0118) | covered | spawn_forms |
+| SCOPE-6 | §12 | the method and function-value `spawn` forms compose with `scope(timeout=…)`: on the deadline children are cancelled, their `finally` cleanup runs, and `ScopeTimeout` reports each by its identity (`Struct.method` / callee name) (D-0118) | covered | spawn_forms_timeout |
 | MOD-1 | §13 | names starting with `_` are private, enforced at compile time (D-0028) | TODO | — |
 | MOD-2 | §13 | whole-module import by short name; no `from X import Y` (D-0052) | TODO | — |
 

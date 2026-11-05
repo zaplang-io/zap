@@ -2748,9 +2748,8 @@ behavior. When *this* scope's own deadline cancelled its body, the caller sees
 `ScopeTimeout` rather than the raw `Cancelled`; a `Cancelled` injected by an
 *enclosing* scope, or a genuine error from the body, propagates unchanged.
 
-**Spawn-call forms** are unchanged by this decision: method/lambda/function-value
-capture and full keyword/default handling remain the honest implementation gap
-tracked by #475 (`ZAP5076`); this PR does not close #475.
+**Spawn-call forms** are unchanged by this decision; the method / function-value
+`spawn` forms are specified and implemented separately in **D-0118** (I#475).
 
 **Rationale.** One trigger unit (ms) with no sugar keeps the surface tiny and the
 lexer unperturbed; exceptions as the sole outcome channel keep failures
@@ -4734,3 +4733,77 @@ confirms the fix.
 **Docs.** CHANGELOG, STABILITY (§7 aarch64-Linux note updated to point at this
 fix pending confirmation), and this decision. Grammar/spec unchanged (runtime
 only).
+
+## D-0118 — Supported `spawn` callable forms: named function, user-struct method, first-class function value (I#475, epic #469)
+
+**Status:** Locked — closes the `spawn` callable-forms gap left open by D-0094
+(the `scope(timeout=…)` decision). Together they complete I#475.
+
+**Context.** The grammar and SPEC §12 always admitted `spawn server.handle(conn)`
+and closure spawns, but lowering accepted only `spawn named_fn(positional…)` and
+rejected everything else with `ZAP5076`. First-class function values and closures
+now exist (D-0067/I#163: a single-pointer GC closure record `{code_ptr, cap…}`),
+so the receiver/closure capture the intended forms need is mechanically available.
+
+**Decision.** `spawn <call>` accepts exactly three callable forms, all with
+**positional arguments only**:
+
+1. **Named top-level function** — `spawn worker(ch)`. The existing fast path:
+   a direct `Inst::Spawn` on the function symbol, no thunk.
+2. **User-struct method call** — `spawn server.handle(conn)`. Desugared to a named
+   `Inst::Spawn` on the mangled method (`Struct__method`) with the receiver
+   captured as argument 0. Only a concrete, statically-resolved struct method
+   qualifies; a built-in-container, string, Python, interface (dynamic dispatch),
+   atomic, or generator receiver is rejected (`ZAP5076`).
+3. **First-class function value** — `spawn f(x)`, where `f` is a variable, field,
+   or expression of `fn(...)->...` type (a bound lambda, a closure, or a
+   function value). Lowered through a generated, per-signature thunk
+   `$spawnthunk$<sig>(closure, args…)` whose body is one indirect
+   `CallClosure` on the captured closure record. The thunk is a plain top-level
+   function, so the existing named-spawn trampoline hosts it as the coroutine
+   body and its catch-all landing pad routes a child failure/cancellation to the
+   owning scope exactly as for a named spawn.
+
+**Capture and GC rooting.** The receiver, every argument, and the closure record
+are evaluated **eagerly in the spawning coroutine** (D-0034), before the child
+runs. A value-struct receiver/argument is deep-copied (`copy_for_pass`, D-0051)
+so it outlives the spawning frame; a reference struct, a closure record, and any
+pointer argument are GC pointers stored into the spawn environment and traced by
+its precise descriptor (D-0048). A closure captured its own free variables at its
+creation, so a later mutation of a captured local is not observed by the child.
+
+**Positional-only (v1 restriction).** `spawn` fills no defaults and accepts no
+keyword or spread arguments, for every form; the argument count must match the
+callee arity exactly. This mirrors the pre-existing named-function restriction
+and keeps capture unambiguous. Relaxing it (defaults / keywords in `spawn`) is a
+possible later increment, not a gap.
+
+**Rejected form.** A bare lambda *literal* operand (`spawn (lambda: ...)()`) is a
+compile error (`ZAP5076`): a lambda literal has no type without a function-typed
+context, which a spawn site does not supply (the same limit as a normal call
+position). The documented idiom is to bind it to a name first
+(`auto f = lambda: ...; spawn f()`). This is an intentional restriction, not an
+implementation gap — the capability is reachable through the function-value form.
+
+**Diagnostics.** sema has no first-class-function type (a lambda infers
+`Unknown`), so it classifies the callee structurally (and rejects the bare lambda
+literal, keyword/spread arguments, and a named-function arity mismatch with a
+span); IR lowering is the precise gate and emits the same `ZAP5076` for a form
+that slips through (a non-`fn` value, a non-struct-method receiver, a generator
+method, an arity mismatch). `Inst::Spawn` gains an optional display `name` so a
+`ScopeTimeout` pending report (D-0094) names a method as `Struct.method` and a
+function value by its source callee, never the internal `$spawnthunk$…` symbol.
+
+**Rationale.** Reusing the closure-record call ABI and the existing spawn
+trampoline keeps the change almost entirely in IR lowering (one generated thunk;
+no new runtime entry point, no new `Inst` beyond a display name), so cancellation,
+`finally`/`with` cleanup, failure propagation, and the timeout machinery compose
+with the new forms for free — they travel the same coroutine boundary as a named
+spawn.
+
+**Docs.** SPEC §12, `design/0005-concurrency.md`, CHANGELOG, and this decision.
+Conformance: `spawn_forms` (SCOPE-5: the three forms join and capture correctly)
+and `spawn_forms_timeout` (SCOPE-6: method + function-value spawns compose with
+`scope(timeout=…)` — cancellation, `finally` cleanup, and the named pending
+report). Grammar unchanged (grammar already admitted these calls; this is
+lowering/sema).

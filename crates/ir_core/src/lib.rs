@@ -570,6 +570,14 @@ pub enum Inst {
     Spawn {
         func: String,
         args: Vec<Value>,
+        /// A human-readable identity for this coroutine, reported by
+        /// `ScopeTimeout`'s pending set (D-0094/#475) in place of the possibly
+        /// synthetic `func`. `None` means "use `func`" — the common case for a
+        /// `spawn named_fn(...)`. A method spawn carries `Struct.method`; a
+        /// first-class-function-value spawn (lowered through a generated
+        /// `$spawnthunk$…`) carries the source callee's name so the report
+        /// names the user's coroutine, not the internal thunk.
+        name: Option<String>,
         /// Structured-concurrency ownership (D-0044, `design/0005`):
         /// - `Owner::Root` — a bare `spawn`, owned by the implicit root scope and
         ///   joined at program exit (`zap_spawn`);
@@ -1043,7 +1051,9 @@ fn fmt_inst(i: &Inst) -> String {
                 rhs_dtype.suffix(),
             )
         }
-        Inst::Spawn { func, args, owner } => {
+        Inst::Spawn {
+            func, args, owner, ..
+        } => {
             let a: Vec<String> = args.iter().map(|v| format!("%{v}")).collect();
             let own = match owner {
                 Owner::Root => String::new(),

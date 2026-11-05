@@ -303,6 +303,14 @@ struct StructCtx {
     /// source name -> generated wrapper name, so `f` taken as a value reuses one
     /// wrapper `f$fnval`.
     fnval_wrappers: RefCell<HashMap<String, String>>,
+    /// First-class-function-value `spawn` thunks (I#475), keyed by the interned
+    /// call signature: a generated `$spawnthunk$<sig>(closure, args…)` whose body
+    /// is a single indirect [`Inst::CallClosure`], reused across every
+    /// `spawn fval(…)` of that signature. The thunk is a normal top-level
+    /// function, so the existing named-function [`Inst::Spawn`] trampoline runs
+    /// it as the coroutine body (its catch-all pad routes a child failure to the
+    /// scope, exactly as for a named spawn).
+    spawn_thunks: RefCell<HashMap<u32, String>>,
     /// Generator-expression iterators (#596), keyed by their tuple-interned
     /// state-struct id. Populated on demand while lowering a `(x for x in xs)`;
     /// the iteration protocol hooks consult it so a genexpr value flows through
@@ -1189,6 +1197,7 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
         closure_counter: RefCell::new(0),
         captureless_env: RefCell::new(None),
         fnval_wrappers: RefCell::new(HashMap::new()),
+        spawn_thunks: RefCell::new(HashMap::new()),
         packed_layouts,
         field_defaults,
         call_params: HashMap::new(),
@@ -6956,49 +6965,45 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Lower `spawn f(args)` (ticket #25, D-0013). The operand must be a call;
-    /// its arguments are evaluated eagerly here, in the spawning coroutine (so
-    /// argument evaluation happens-before the child — D-0034), coerced to the
-    /// callee's parameter types, and handed to [`Inst::Spawn`], which codegen
-    /// turns into a GC-registered thread running `f`. Fire-and-forget: the spawn
-    /// yields no handle; the root scope joins all spawned threads at program exit
-    /// (`zap_rt_join_all`, emitted at `main`'s return). Only a direct call to a
-    /// named top-level function is supported in this increment; method-call and
-    /// lambda operands (`spawn s.handle(c)`, `spawn (lambda: ...)()`) are
-    /// rejected during semantic checking (I#475). Scoped ownership is supported.
+    /// Lower `spawn <call>` (ticket #25, D-0013; callable forms I#475). The
+    /// operand must be a call; its arguments (and, for a method, the receiver)
+    /// are evaluated eagerly here, in the spawning coroutine — so the capture
+    /// happens-before the child runs (D-0034) — coerced to the callee's
+    /// parameter types, copied for value-struct safety, and handed to
+    /// [`Inst::Spawn`], which codegen turns into a GC-registered coroutine.
+    /// Fire-and-forget: the spawn yields no handle; ownership is the innermost
+    /// `scope:` (or the root scope, or nothing for `detached` — D-0044).
+    ///
+    /// Three callable forms are supported, all with **positional arguments
+    /// only** (a deliberate v1 restriction, D-0118):
+    /// 1. a named top-level function — `spawn worker(ch)`;
+    /// 2. a concrete user-struct method — `spawn server.handle(conn)` — desugared
+    ///    to a named spawn of the mangled method with the receiver as argument 0;
+    /// 3. a first-class function value — `spawn f(x)` where `f` is a variable,
+    ///    field, or expression of `fn(...)->...` type (a bound lambda, closure,
+    ///    or function-value, I#163) — lowered through a generated per-signature
+    ///    thunk that performs the indirect [`Inst::CallClosure`].
+    ///
+    /// A *bare lambda literal* callee (`spawn (lambda: ...)()`) is rejected
+    /// (`ZAP5076`): a lambda has no type without a function-typed context, which
+    /// a spawn site does not supply (the same limit as a normal call position);
+    /// bind it to a name first. Keyword/`**`/`*` arguments, an arity mismatch, a
+    /// non-struct method receiver, and a non-callable operand are also rejected.
     fn lower_spawn(&mut self, call: &Expr, detached: bool) -> Result<(), LowerError> {
         let Expr::Call { callee, args, .. } = call else {
             return Err(err("spawn operand must be a call expression (D-0013)"));
         };
-        let Expr::Name(fname, _) = callee.as_ref() else {
-            return Err(err(
-                "spawn of a method or lambda call is not supported yet (only `spawn f(...)` to a named function)",
-            ));
-        };
-        let (ptys, _ret) = self
-            .sigs
-            .get(fname)
-            .cloned()
-            .ok_or_else(|| err(format!("spawn of unknown function '{fname}'")))?;
-        if self.lookup(fname).is_some()
-            || args.len() != ptys.len()
-            || args.iter().any(|a| a.name.is_some())
+        // Positional-only across every spawn form (D-0118): keyword and spread
+        // arguments are not captured by `spawn` in v1.
+        if args.iter().any(|a| a.name.is_some())
+            || args
+                .iter()
+                .any(|a| !matches!(a.spread, ast::ArgSpread::None))
         {
-            return Err(err("spawn requires a named top-level function with all arguments supplied positionally"));
-        }
-        let mut argvals = Vec::new();
-        for (i, a) in args.iter().enumerate() {
-            let (v, vt) = self.expr(&a.value)?;
-            let target = *ptys.get(i).unwrap_or(&vt);
-            let v = self.coerce(v, vt, target);
-            // A value struct captured by a coroutine is copied (D-0051) so it
-            // safely outlives the spawning frame. A non-inline value struct is
-            // deep-copied here (heap). An inline-eligible aggregate is copied by
-            // value into the GC-allocated spawn closure (codegen stores the
-            // aggregate, not a pointer), which outlives the frame just the same,
-            // so no explicit copy is emitted. See `copy_for_pass`.
-            let v = self.copy_for_pass(v, target, &a.value);
-            argvals.push(v);
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                "spawn arguments must all be supplied positionally (no keyword or spread arguments)",
+            ));
         }
         // Ownership (D-0044): `spawn detached` opts out of all scopes; otherwise
         // the innermost enclosing `scope:` owns it, falling back to the implicit
@@ -7010,12 +7015,244 @@ impl<'a> FnLower<'a> {
         } else {
             Owner::Root
         };
+
+        // Form 1 — a named top-level function (the fast path): emit a direct
+        // `Inst::Spawn` on the function symbol, no thunk. A name shadowed by a
+        // local falls through to the function-value form below.
+        if let Expr::Name(fname, _) = callee.as_ref() {
+            if self.lookup(fname).is_none() {
+                let (ptys, _ret) = self.sigs.get(fname).cloned().ok_or_else(|| {
+                    err_code(
+                        zapc_diag::ErrorCode::ZAP5076,
+                        format!("spawn of unknown function '{fname}'"),
+                    )
+                })?;
+                if args.len() != ptys.len() {
+                    return Err(err_code(
+                        zapc_diag::ErrorCode::ZAP5076,
+                        format!(
+                            "spawn of '{fname}' expects {} positional argument(s), found {}",
+                            ptys.len(),
+                            args.len()
+                        ),
+                    ));
+                }
+                let mut argvals = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    let (v, vt) = self.expr(&a.value)?;
+                    let target = *ptys.get(i).unwrap_or(&vt);
+                    let v = self.coerce(v, vt, target);
+                    // A value struct captured by a coroutine is copied (D-0051)
+                    // so it outlives the spawning frame; an inline-eligible
+                    // aggregate is stored by value into the GC closure (codegen),
+                    // so no explicit copy is emitted. See `copy_for_pass`.
+                    let v = self.copy_for_pass(v, target, &a.value);
+                    argvals.push(v);
+                }
+                self.emit(Inst::Spawn {
+                    func: fname.clone(),
+                    args: argvals,
+                    owner,
+                    name: None,
+                });
+                return Ok(());
+            }
+        }
+
+        // Form 2 — a concrete user-struct method call `recv.method(args)`.
+        if let Expr::Attr { base, name, .. } = callee.as_ref() {
+            return self.lower_spawn_method(base, name, args, owner);
+        }
+
+        // Form 3 — a first-class function value (bound lambda / closure /
+        // function-value expression).
+        self.lower_spawn_fnvalue(callee, args, owner)
+    }
+
+    /// Lower form 2 of `spawn` (I#475): a method call `recv.method(args)` on a
+    /// concrete user struct. The receiver is captured as argument 0 — copied for
+    /// value-struct safety exactly like any other captured argument, so a value
+    /// receiver outlives the spawning frame and a reference receiver is a shared
+    /// GC pointer the spawn env's precise descriptor traces. Only a plain,
+    /// statically-resolved struct method qualifies; a built-in-container, string,
+    /// Python, interface (dynamic dispatch), atomic, or generator receiver is
+    /// rejected with `ZAP5076`.
+    fn lower_spawn_method(
+        &mut self,
+        base: &Expr,
+        name: &str,
+        args: &[ast::Arg],
+        owner: Owner,
+    ) -> Result<(), LowerError> {
+        let (recv, bty) = self.expr(base)?;
+        let Ty::Struct(sid) = bty else {
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                "spawn of a method call is only supported on a user-struct receiver",
+            ));
+        };
+        if is_atomic_struct(self.ctx, sid) || self.ctx.iid_of_fat_sid(sid).is_some() {
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                "spawn of a method on an atomic or interface value is not supported",
+            ));
+        }
+        let mangled = format!("{}__{}", self.ctx.names[sid as usize], name);
+        if self.ctx.generators.contains_key(&mangled) {
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                format!("spawn of a generator method '{name}' is not supported"),
+            ));
+        }
+        let (ptys, _ret) = self.sigs.get(&mangled).cloned().ok_or_else(|| {
+            err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                format!(
+                    "spawn of unknown method '{name}' on struct '{}'",
+                    self.ctx.names[sid as usize]
+                ),
+            )
+        })?;
+        // `ptys[0]` is the implicit `self`; the explicit arguments fill the rest,
+        // positionally and in full (no defaults — spawn is positional-only).
+        if args.len() + 1 != ptys.len() {
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                format!(
+                    "spawn of '{}.{name}' expects {} positional argument(s), found {}",
+                    self.ctx.names[sid as usize],
+                    ptys.len().saturating_sub(1),
+                    args.len()
+                ),
+            ));
+        }
+        let self_ty = *ptys.first().unwrap_or(&bty);
+        let recv = self.copy_for_pass(recv, self_ty, base);
+        let mut argvals = Vec::with_capacity(args.len() + 1);
+        argvals.push(recv);
+        for (i, a) in args.iter().enumerate() {
+            let (v, vt) = self.expr(&a.value)?;
+            let target = *ptys.get(i + 1).unwrap_or(&vt);
+            let v = self.coerce(v, vt, target);
+            let v = self.copy_for_pass(v, target, &a.value);
+            argvals.push(v);
+        }
         self.emit(Inst::Spawn {
-            func: fname.clone(),
+            func: mangled,
             args: argvals,
             owner,
+            name: Some(format!("{}.{name}", self.ctx.names[sid as usize])),
         });
         Ok(())
+    }
+
+    /// Lower form 3 of `spawn` (I#475): a first-class function value callee
+    /// (`spawn f(x)` where `f : fn(...)->...`). The callee and arguments are
+    /// evaluated eagerly in the parent; the call is performed in the child
+    /// through a generated per-signature thunk `$spawnthunk$<sig>` that runs a
+    /// single [`Inst::CallClosure`]. The thunk is a plain top-level function, so
+    /// the existing named-spawn trampoline hosts it as the coroutine body and its
+    /// catch-all landing pad routes a child failure to the owning scope exactly
+    /// as for a named spawn. The closure record is the first captured value, a GC
+    /// pointer the spawn env's precise descriptor traces.
+    fn lower_spawn_fnvalue(
+        &mut self,
+        callee: &Expr,
+        args: &[ast::Arg],
+        owner: Owner,
+    ) -> Result<(), LowerError> {
+        if matches!(callee, Expr::Lambda { .. }) {
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                "spawn of a bare lambda literal is not supported; bind it to a name first \
+                 (e.g. `auto f = lambda: ...; spawn f()`)",
+            ));
+        }
+        let (cv, ct) = self.expr(callee)?;
+        let Ty::Func(sig_idx) = ct else {
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                "spawn requires a named function, a user-struct method call, or a \
+                 first-class function value",
+            ));
+        };
+        let sig = self.ctx.fn_sigs.borrow().get(sig_idx).clone();
+        if args.len() != sig.params.len() {
+            return Err(err_code(
+                zapc_diag::ErrorCode::ZAP5076,
+                format!(
+                    "spawn of this function value expects {} positional argument(s), found {}",
+                    sig.params.len(),
+                    args.len()
+                ),
+            ));
+        }
+        let mut argvals = Vec::with_capacity(args.len() + 1);
+        // The closure record is captured first (env field 0, a traced pointer).
+        argvals.push(cv);
+        for (i, a) in args.iter().enumerate() {
+            let target = sig.params[i];
+            let v = self.expr_coerced(&a.value, target, zapc_diag::ErrorCode::ZAP4021)?;
+            let v = self.copy_for_pass(v, target, &a.value);
+            argvals.push(v);
+        }
+        let thunk = self.spawn_thunk_for(sig_idx);
+        let display = match callee {
+            Expr::Name(n, _) => n.clone(),
+            _ => "<function value>".to_string(),
+        };
+        self.emit(Inst::Spawn {
+            func: thunk,
+            args: argvals,
+            owner,
+            name: Some(display),
+        });
+        Ok(())
+    }
+
+    /// Generate (once per interned signature) the `spawn` thunk
+    /// `$spawnthunk$<sig>(closure, args…)` whose body is a single indirect
+    /// [`Inst::CallClosure`] on the captured closure record, then `Ret` (the
+    /// result is discarded — `spawn` is fire-and-forget). The `CallClosure` has
+    /// no landing pad so a raise propagates out of the thunk to the coroutine's
+    /// trampoline, which records the failure on the owning scope (I#475). Returns
+    /// the thunk's symbol, reused across every `spawn` of that signature.
+    fn spawn_thunk_for(&self, sig_idx: u32) -> String {
+        if let Some(w) = self.ctx.spawn_thunks.borrow().get(&sig_idx) {
+            return w.clone();
+        }
+        let sig = self.ctx.fn_sigs.borrow().get(sig_idx).clone();
+        let wname = format!("$spawnthunk${sig_idx}");
+        let mut params_z = Vec::with_capacity(sig.params.len() + 1);
+        params_z.push(Ty::Func(sig_idx));
+        params_z.extend_from_slice(&sig.params);
+        let mut lf = FnLower::new(
+            wname.clone(),
+            params_z,
+            Ty::Void,
+            false,
+            false,
+            self.sigs,
+            self.ctx,
+        );
+        // ZIR value 0 is the closure record; values 1..=n are the call arguments.
+        let callee: Value = 0;
+        let argvals: Vec<Value> = (1..=sig.params.len() as u32).collect();
+        lf.emit(Inst::CallClosure {
+            dest: None,
+            callee,
+            args: argvals,
+            params: sig.params.clone(),
+            ret: sig.ret,
+            unwind: None,
+        });
+        lf.set_term(Term::Ret(None));
+        self.ctx.generated.borrow_mut().push(lf.func);
+        self.ctx
+            .spawn_thunks
+            .borrow_mut()
+            .insert(sig_idx, wname.clone());
+        wname
     }
 
     /// Lower a `scope:` block (D-0044/D-0045, structured concurrency): a lexical
