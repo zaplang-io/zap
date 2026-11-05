@@ -67,9 +67,23 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   the module-init pre-pass), calling runtime **no-op stubs** (`zaprace.inc.c`) for
   now. With `--race` **off**, lowering emits nothing and the output is
   byte-identical to before, so default builds and every golden are unaffected; a
-  `--race` build differs only by the inert calls. The happens-before / vector-clock
-  engine that makes the hooks report real races (and the remaining breadth) is the
-  tracked follow-up under #665 (#678).
+  `--race` build differs only by the inert calls. **Slice 2 (#678) now makes the
+  detector live:** a **Zap-native happens-before / vector-clock engine**
+  (`zaprace.inc.c`) replaces the stubs. Each coroutine carries a vector clock,
+  each `Mutex` a release/acquire clock, and each instrumented global shadow state
+  (per-coroutine write/read clocks); happens-before edges are taken from **spawn**
+  (parent → child) and **`Mutex` lock/unlock**, with `Atomic` clean by exemption.
+  A conflicting access (write–write or read–write) with no ordering edge is
+  reported — naming the global and both accesses' source spans — and the process
+  exits non-zero (66); the verdict is schedule-independent, so the report is a
+  stable golden. All engine state is serialized under one detector lock (obvious
+  correctness over speed; safe under `MAXPROCS>1`). `tests/race/` gains a
+  read/write and a write/write racy variant, and all six fixtures are CI-gated
+  goldens under both collectors (`racy_*` report a race on `counter`; `clean_*`
+  run clean and print their exact total). The remaining breadth — channel /
+  `WaitGroup` / `Once` edges, the main thread's own accesses, shared heap objects,
+  and `MAXPROCS>1` validation — is the tracked slice-3 follow-up under #665
+  (#679).
 - **Concurrency-safety surface: `@shareable` + sharing lint** — the advisory
   surface for the light concurrency model (#664, D-0113; locked-design points
   4–5 of epic #661, building on the mutable globals from #662). `@shareable` is a

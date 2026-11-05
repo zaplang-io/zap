@@ -1387,15 +1387,19 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // access (the ZAP5125 set) only under `--race`, so the externs are
         // declared ONLY when the ZIR actually contains such a call. A non-`--race`
         // build emits no race calls, so this adds nothing and the module stays
-        // byte-identical (golden-safe). No-op stubs in the runtime today (slice 1);
-        // the happens-before engine fills them in (#678).
+        // byte-identical (golden-safe).
+        // The happens-before engine (#678) adds two more generated-code entry
+        // points to slice 1's read/write hooks: `__zap_race_enable` (arm the
+        // detector) and `__zap_race_register_global` (record a slot's name for
+        // reporting), both emitted into `main` under `--race`. The spawn and
+        // `Mutex` release/acquire edges are wired entirely inside the runtime, so
+        // they need no LLVM declaration here. All race entry points carry the
+        // `__zap_race_` prefix, so a single prefix test gates the declarations.
         let needs_race = m.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    Inst::Call { func, .. }
-                        if func.as_str() == "__zap_race_read"
-                            || func.as_str() == "__zap_race_write"
+                    Inst::Call { func, .. } if func.as_str().starts_with("__zap_race_")
                 )
             })
         });
@@ -1410,6 +1414,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.declare_rt(
                 "__zap_race_write",
                 &[ptr.into(), i64t.into(), i64t.into(), i64t.into()],
+                None,
+            );
+            self.declare_rt("__zap_race_enable", &[], None);
+            self.declare_rt(
+                "__zap_race_register_global",
+                &[i64t.into(), ptr.into()],
                 None,
             );
         }

@@ -4483,6 +4483,14 @@ fn lower_fn(
     }
 
     if is_main {
+        // Runtime data-race detector bootstrap (`--race`, #678, epic #665,
+        // D-0114): arm the happens-before engine and register every module
+        // global's name for report resolution. Emitted first in the prologue and
+        // ONLY under `--race` (a non-`--race` build emits nothing here, so its
+        // `main` prologue is unchanged). See `emit_race_bootstrap`.
+        if b.ctx.race {
+            b.emit_race_bootstrap();
+        }
         // Reflection bootstrap (D-0036): populate the runtime metadata registry
         // once, at the top of `main`, so `reflect_has`/`reflect_names` queries
         // anywhere in the program see every annotated/decorated type. These are
@@ -6175,6 +6183,48 @@ impl<'a> FnLower<'a> {
                 dest: None,
                 func: "zap_reflect_register".to_string(),
                 args: vec![tv, nv],
+            });
+        }
+    }
+
+    /// Runtime data-race detector bootstrap (`--race`, #678, epic #665, D-0114).
+    /// Emitted once at the top of `main`, ONLY under `--race` (`ctx.race`): so a
+    /// non-`--race` build's `main` prologue is byte-identical to today, exactly
+    /// like the slice-1 access hooks (every call carries the `__zap_race_`
+    /// prefix, so the "race ZIR minus the race hooks == off ZIR" invariant
+    /// still holds). Two calls:
+    ///
+    /// - `__zap_race_enable()` arms the happens-before engine (its spawn /
+    ///   `Mutex` release-acquire hooks live in the runtime and are dormant until
+    ///   this runs — before any `spawn` in the user body).
+    /// - `__zap_race_register_global(slot_idx, name)` records each module
+    ///   global's name under its slot index, so a race report can resolve the
+    ///   `name_id` the access hooks pass (slice 1) back to a human name. Every
+    ///   global is registered (the id is its declaration index), not only the
+    ///   racy ones, so any id a hook passes resolves.
+    fn emit_race_bootstrap(&mut self) {
+        self.emit(Inst::Call {
+            dest: None,
+            func: "__zap_race_enable".to_string(),
+            args: vec![],
+        });
+        // Snapshot (idx, name) first so the `globals` borrow is released before
+        // `strconst`/`emit` (which do not touch it, but keep the borrow tight).
+        let names: Vec<(usize, String)> = self
+            .ctx
+            .globals
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (i, g.name.clone()))
+            .collect();
+        for (idx, name) in names {
+            let id = self.iconst(Ty::I64, idx as i64);
+            let nv = self.strconst(&name);
+            self.emit(Inst::Call {
+                dest: None,
+                func: "__zap_race_register_global".to_string(),
+                args: vec![id, nv],
             });
         }
     }

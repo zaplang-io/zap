@@ -1088,9 +1088,16 @@ exactly the ZAP5125 set — a mutable, non-`@shareable` module global — so an
 `Atomic`/`Mutex`/`@shareable`-guarded version is clean, and reports an
 unsynchronized racing access with a source location. It is off by default and
 **never** changes what the language accepts, only whether accesses are checked
-at run time. The detector is being delivered in slices: the flag surface and
-this specification ship now; the instrumentation and the happens-before engine
-are tracked follow-ups under #665 (see D-0114).
+at run time. The detector is now **live** (slices 1–2, #677/#678): under
+`--race` each coroutine carries a vector clock, each `Mutex` a release/acquire
+clock, and each instrumented global shadow state; happens-before edges are taken
+from **spawn** (parent → child) and **`Mutex` lock/unlock**, while `Atomic` is
+clean by exemption. A conflicting access with no ordering edge is reported —
+naming the global and the accesses' source spans — and the process exits
+non-zero. The report is diagnostic output (not a stabilized surface). Remaining
+breadth — channel / `WaitGroup` / `Once` edges, the main thread's own accesses,
+shared heap objects, and `MAXPROCS>1` validation — is a tracked follow-up under
+#665 (slice 3, #679; see D-0114).
 
 ## 13. Modules, imports, visibility (D-0028, D-0052)
 
