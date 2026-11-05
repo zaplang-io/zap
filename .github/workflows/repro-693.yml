@@ -1,0 +1,89 @@
+name: repro-693
+
+# REPRODUCTION-ONLY workflow for the gc-boehm concurrency defect #693 (root cause
+# of the #295 threading_counter flake). It runs the `#[ignore]`d stress probe
+# `repro_693_boehm_threading_counter_stress` under BOTH collectors: the probe
+# compiles threading_counter.zap once and loops its binary, so a correctly
+# synchronized atomic+join counter that ever prints anything but `80000` (or
+# crashes/hangs) proves the defect. Expectation: gc-immix GREEN, gc-boehm
+# intermittently RED.
+#
+# This is NOT a required check and is scoped to the reproduction branch only, so
+# it never gates other PRs. DO NOT MERGE this workflow (or the probe test) to
+# main — delete both once #693 is resolved.
+on:
+  push:
+    branches: [feature/flaky-threading-counter-295-9514e3]
+  workflow_dispatch:
+    inputs:
+      iters:
+        description: "Runs per collector"
+        default: "800"
+      maxprocs:
+        description: "MAXPROCS (worker-M parallelism)"
+        default: "4"
+
+concurrency:
+  group: repro-693-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repro:
+    name: repro-693 (${{ matrix.gc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        gc: [gc-immix, gc-boehm]
+    env:
+      LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
+      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
+      # How hard to stress. workflow_dispatch inputs override; push uses these.
+      ZAP_REPRO_ITERS: ${{ github.event.inputs.iters || '800' }}
+      ZAP_REPRO_MAXPROCS: ${{ github.event.inputs.maxprocs || '4' }}
+      # Provoke frequent Boehm stop-the-world even on this tiny heap, so the
+      # in-signal copreempt-vs-STW window (the #693 primary hypothesis) is hit.
+      # Harmlessly ignored by the precise gc-immix collector.
+      GC_FREE_SPACE_DIVISOR: "40"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same LLVM 18 toolchain as the `full` job in ci.yml.
+      - name: Install LLVM 18 and system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-18 \
+            llvm-18-dev \
+            libpolly-18-dev \
+            clang-18 \
+            libclang-18-dev \
+            libgc-dev \
+            libpcre2-dev \
+            python3-dev \
+            pkg-config \
+            zlib1g-dev \
+            libzstd-dev \
+            libffi-dev \
+            libedit-dev \
+            libxml2-dev \
+            libncurses-dev \
+            mold
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: repro693-${{ matrix.gc }}
+
+      # Run ONLY the ignored repro probe for this leg's collector.
+      - name: "Stress threading_counter (${{ matrix.gc }})"
+        run: |
+          cargo test --workspace --features zapc/${{ matrix.gc }} \
+            repro_693_boehm_threading_counter_stress \
+            -- --ignored --nocapture --test-threads=1

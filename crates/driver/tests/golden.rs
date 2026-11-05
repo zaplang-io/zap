@@ -712,3 +712,103 @@ fn race_detector_correct_under_parallelism() {
         check_race_fixture(bin, zap, Some("4"))
     });
 }
+
+// ---- #693 reproduction harness (NOT part of the normal gate) ---------------
+//
+// This is a REPRODUCTION probe for the gc-boehm concurrency defect filed as
+// #693 — the root cause of the #295 flake. It is `#[ignore]`d so a plain
+// `cargo test` NEVER runs it (the required `CI gate` is untouched); the
+// branch-scoped `repro-693.yml` workflow invokes it explicitly with `--ignored`
+// under BOTH collectors.
+//
+// `threading_counter.zap` is a correctly-synchronized atomic counter (8 joined
+// threads × 10000 `atomicrmw add` on one box) whose ONLY legal output is
+// `80000` under every interleaving (determinism proof in #693). So it is
+// compiled ONCE and its binary run in a tight loop: a single run that prints
+// anything but `80000`, exits non-zero, or hangs is a real runtime defect, not
+// a test-determinism problem. Expected outcome: GREEN under gc-immix,
+// intermittently RED under gc-boehm — which is exactly the evidence #693 needs.
+//
+// Knobs (set by the workflow): `ZAP_REPRO_ITERS` run count, `ZAP_REPRO_MAXPROCS`
+// → `MAXPROCS` (worker-M parallelism). The workflow also raises Boehm's
+// collection frequency via `GC_FREE_SPACE_DIVISOR` (inherited by the child) so
+// stop-the-world actually fires during the short threaded section — the window
+// the primary hypothesis (in-signal `copreempt` vs STW) needs.
+//
+// DO NOT MERGE this test to `main`: it is a throwaway probe. Delete it (and the
+// workflow) once #693 is resolved.
+#[cfg(feature = "codegen")]
+#[test]
+#[ignore = "repro harness for #693; run explicitly via repro-693.yml (--ignored)"]
+fn repro_693_boehm_threading_counter_stress() {
+    use std::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_zapc");
+    let zap = golden_dir().join("threading_counter.zap");
+
+    let iters: usize = std::env::var("ZAP_REPRO_ITERS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(500);
+    let maxprocs = std::env::var("ZAP_REPRO_MAXPROCS").unwrap_or_else(|_| "4".to_string());
+
+    // Compile ONCE: the defect is a per-process runtime race, so looping the
+    // same binary is the faithful, cheap reproduction (no recompile per run).
+    let dir = std::env::temp_dir().join(format!("zap-repro-693-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create repro temp dir");
+    let out = dir.join("threading_counter");
+    let build = Command::new(bin)
+        .arg("build")
+        .arg("--out")
+        .arg(&out)
+        .arg(&zap)
+        .output()
+        .expect("spawn zapc build");
+    assert!(
+        build.status.success(),
+        "zapc build of threading_counter.zap failed:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let per_run = std::time::Duration::from_secs(60);
+    let mut failures = Vec::new();
+    let mut ran = 0usize;
+    for i in 0..iters {
+        ran += 1;
+        let mut cmd = Command::new(&out);
+        // True OS-thread parallelism across worker Ms (the runtime reads
+        // `MAXPROCS`); the preempt-vs-STW race needs several Ms running at once.
+        cmd.env("MAXPROCS", &maxprocs);
+        // A hang panics from inside `run_with_timeout` with a clear message —
+        // that is itself conclusive evidence of the defect, so we let it.
+        let o = run_with_timeout(cmd, per_run, &format!("threading_counter repro #{i}"));
+        let got = String::from_utf8_lossy(&o.stdout);
+        let got = got.trim_end();
+        if o.status.code() != Some(0) || got != "80000" {
+            failures.push(format!(
+                "  iter {i}: exit={:?} stdout={:?} stderr={:?}",
+                o.status.code(),
+                got,
+                String::from_utf8_lossy(&o.stderr).trim_end()
+            ));
+            // Ten failing runs is already conclusive; stop burning CI minutes.
+            if failures.len() >= 10 {
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        failures.is_empty(),
+        "threading_counter.zap is NON-DETERMINISTIC (MAXPROCS={maxprocs}) — \
+         {} of {ran} run(s) did not print the unique legal result `80000` [#693]:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    eprintln!(
+        "repro #693: threading_counter.zap printed 80000 and exited 0 on all {ran} \
+         run(s) (MAXPROCS={maxprocs}) — no flake observed on THIS run"
+    );
+}
