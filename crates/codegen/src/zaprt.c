@@ -4626,6 +4626,18 @@ static void all_remove(G *g) {
 void zap_race_on_spawn(G *child);
 void zap_race_mutex_acquire(void *mu);
 void zap_race_mutex_release(void *mu);
+/* Slice-3 (#679) happens-before edges. `chan_xfer` is a rendezvous hand-off
+ * (sender `G` -> receiver `G`); `chan_buf_store`/`chan_buf_load` split a buffered
+ * hand-off across a ring-buffer slot address; the `wg_*`/`once_*` pairs carry the
+ * WaitGroup and Once completion edges keyed by the handle pointer. All inert
+ * until the engine is armed, so a non-`--race` build is unchanged. */
+void zap_race_chan_xfer(void *from_g, void *to_g);
+void zap_race_chan_buf_store(void *slot, void *from_g);
+void zap_race_chan_buf_load(void *slot, void *to_g);
+void zap_race_wg_release(void *wg);
+void zap_race_wg_acquire(void *wg);
+void zap_race_once_release(void *once);
+void zap_race_once_acquire(void *once);
 
 static G *galloc(void *fn, void *arg) {
     size_t ss = zap_stack_size();
@@ -5833,14 +5845,22 @@ static void chan_send_word(ZapChan *c, uint64_t v) {
         Waiter *r = q_pop(&c->recvq_head, &c->recvq_tail);
         r->val = v;
         r->ok = 1;
+        /* --race: rendezvous hand-off edge — this sender happens-before the
+         * receiver `r`. Publish BEFORE `coready(r)` so the edge is in place
+         * before `r` can resume on another M (#679). */
+        zap_race_chan_xfer(cur_m ? cur_m->current : NULL, r->g);
         coready(r);
         zap_np_unlock(&c->mu);
         return;
     }
     if (c->cap > 0 && c->count < c->cap) {
-        c->buf[c->tail] = v;
+        int64_t slot_i = c->tail;
+        c->buf[slot_i] = v;
         c->tail = (c->tail + 1) % c->cap;
         c->count++;
+        /* --race: buffered produce — stamp the slot with this sender's clock;
+         * the receiver that later drains the slot acquires it (#679). */
+        zap_race_chan_buf_store(&c->buf[slot_i], cur_m ? cur_m->current : NULL);
         zap_np_unlock(&c->mu);
         return;
     }
@@ -5862,14 +5882,22 @@ static uint64_t chan_recv_word(ZapChan *c, int *ok) {
     zap_np_lock(&c->mu);
     /* Buffered value available: take it, then let a waiting sender refill. */
     if (c->count > 0) {
-        uint64_t v = c->buf[c->head];
+        int64_t head_i = c->head;
+        uint64_t v = c->buf[head_i];
         c->head = (c->head + 1) % c->cap;
         c->count--;
+        /* --race: buffered consume — acquire the clock the producer stamped on
+         * this slot, ordering this receiver after that send (#679). */
+        zap_race_chan_buf_load(&c->buf[head_i], cur_m ? cur_m->current : NULL);
         Waiter *s = q_pop(&c->sendq_head, &c->sendq_tail);
         if (s) {
-            c->buf[c->tail] = s->val;
+            int64_t tail_i = c->tail;
+            c->buf[tail_i] = s->val;
             c->tail = (c->tail + 1) % c->cap;
             c->count++;
+            /* --race: the refilled slot now carries the parked sender's value;
+             * stamp it with THAT sender's clock for its eventual receiver. */
+            zap_race_chan_buf_store(&c->buf[tail_i], s->g);
             s->ok = 1;
             coready(s);
         }
@@ -5883,6 +5911,9 @@ static uint64_t chan_recv_word(ZapChan *c, int *ok) {
     if (c->sendq_head) {
         Waiter *s = q_pop(&c->sendq_head, &c->sendq_tail);
         uint64_t v = s->val;
+        /* --race: rendezvous hand-off edge — the parked sender happens-before
+         * this receiver (#679). */
+        zap_race_chan_xfer(s->g, cur_m ? cur_m->current : NULL);
         s->ok = 1;
         coready(s);
         zap_np_unlock(&c->mu);
@@ -13411,6 +13442,13 @@ void zap_waitgroup_add(void *wp, int64_t n) {
         zap_panic(zap_str_new("negative WaitGroup counter", 26));
         return;
     }
+    /* --race: a `done()` (decrement) is a release — publish the caller's clock
+     * into the group so every `wait()` that returns observes it. Done under
+     * `w->mu` and before any `coready` below, so the publish happens-before a
+     * woken waiter's acquire (#679). An incrementing `add` carries no edge. */
+    if (n < 0) {
+        zap_race_wg_release(wp);
+    }
     if (w->count == 0) {
         /* Release every waiter; each returns from its `copark`. */
         Waiter *x;
@@ -13428,12 +13466,18 @@ void zap_waitgroup_wait(void *wp) {
     zap_np_lock(&w->mu);
     if (w->count == 0) {
         zap_np_unlock(&w->mu);
+        /* --race: acquire the group's clock — the fast path still joins every
+         * `done()` that already brought the counter to 0 (#679). */
+        zap_race_wg_acquire(wp);
         return;
     }
     Waiter x;
     x.g = NULL;
     q_push(&w->wq_head, &w->wq_tail, &x);
     copark(&w->mu, &x); /* releases `w->mu`; woken when count hits 0 */
+    /* --race: woken (counter reached 0) — acquire the group's clock, ordering
+     * this waiter after every `done()` (#679). */
+    zap_race_wg_acquire(wp);
 }
 
 /* ---- Once: run an initializer exactly once across all coroutines -----------
@@ -13470,23 +13514,33 @@ int64_t zap_once_begin(void *op) {
     zap_np_lock(&o->mu);
     if (o->state == 2) {
         zap_np_unlock(&o->mu);
+        /* --race: a loser arriving after completion still observes the winner's
+         * initializer — acquire the Once clock (#679). */
+        zap_race_once_acquire(op);
         return 0; /* already completed */
     }
     if (o->state == 0) {
         o->state = 1;
         zap_np_unlock(&o->mu);
-        return 1; /* winner: caller runs init, then calls once_end */
+        return 1; /* winner: caller runs init, then calls once_end (no acquire) */
     }
     /* state == 1: a winner is running init; park until it completes. */
     Waiter w;
     w.g = NULL;
     q_push(&o->wq_head, &o->wq_tail, &w);
     copark(&o->mu, &w);
+    /* --race: woken by `once_end` — acquire the winner's clock so the
+     * initializer happens-before this return (#679). */
+    zap_race_once_acquire(op);
     return 0;
 }
 
 void zap_once_end(void *op) {
     ZapOnce *o = (ZapOnce *)op;
+    /* --race: release the winner's clock (its initializer ran before this) into
+     * the Once, published BEFORE waking any loser, so every loser's `once_begin`
+     * return is ordered after the initializer (#679). */
+    zap_race_once_release(op);
     zap_np_lock(&o->mu);
     o->state = 2;
     Waiter *x;

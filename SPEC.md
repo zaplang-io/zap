@@ -1088,16 +1088,28 @@ exactly the ZAP5125 set — a mutable, non-`@shareable` module global — so an
 `Atomic`/`Mutex`/`@shareable`-guarded version is clean, and reports an
 unsynchronized racing access with a source location. It is off by default and
 **never** changes what the language accepts, only whether accesses are checked
-at run time. The detector is now **live** (slices 1–2, #677/#678): under
-`--race` each coroutine carries a vector clock, each `Mutex` a release/acquire
-clock, and each instrumented global shadow state; happens-before edges are taken
-from **spawn** (parent → child) and **`Mutex` lock/unlock**, while `Atomic` is
-clean by exemption. A conflicting access with no ordering edge is reported —
-naming the global and the accesses' source spans — and the process exits
-non-zero. The report is diagnostic output (not a stabilized surface). Remaining
-breadth — channel / `WaitGroup` / `Once` edges, the main thread's own accesses,
-shared heap objects, and `MAXPROCS>1` validation — is a tracked follow-up under
-#665 (slice 3, #679; see D-0114).
+at run time. The detector is now **live** (slices 1–3, #677/#678/#679): under
+`--race` each coroutine carries a vector clock, each synchronization object a
+release/acquire clock, and each instrumented global shadow state. The
+happens-before edges now live are:
+
+- **spawn** — parent → child at creation;
+- **`Mutex`** — `unlock` (release) → `lock` (acquire);
+- **channels** — a send → the matching receive, for both an unbuffered/rendezvous
+  hand-off and a buffered one (through the ring-buffer slot);
+- **`WaitGroup`** — every `done()` → a `wait()` that returns;
+- **`Once`** — the winner's `once_end` → every other caller's `once_begin` return;
+- **`Atomic`** — clean by exemption (a `@shareable` cell is not instrumented).
+
+A conflicting access with no ordering edge is reported — naming the global, each
+access's coroutine and source span — and the process exits non-zero. The report
+is diagnostic output (not a stabilized surface). The detector is correct under
+`ZAP_MAXPROCS>1` (true parallelism; validated across the fixture set). Still
+tracked as follow-ups under #665: the **main/native thread's own accesses** are
+untracked (a genuine main-vs-coroutine race is missed; races between spawned
+coroutines are caught), **shared heap objects** beyond module globals are a
+split-out slice-4 phase (#684), and full **multi-frame stack traces** await the
+I#475 green-stack unwinder.
 
 ## 13. Modules, imports, visibility (D-0028, D-0052)
 

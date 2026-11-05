@@ -203,9 +203,10 @@ not supported — it may change in **any** release, including a PATCH:
   mode). The **concurrency-safety surface** (#664, D-0113) is now implemented
   too: the **`@shareable`** marker and the static **sharing lint** (`ZAP5125`,
   below). The runtime data-race detector (`--race`, #665, D-0114) now has its
-  CLI surface, design decision, and a live happens-before engine (slices 1–2,
-  #677/#678) that reports racing shared-global accesses; breadth (channels /
-  `WaitGroup` / `Once`, the main thread, shared heap objects) follows in slice 3.
+  CLI surface, design decision, and a live happens-before engine (slices 1–3,
+  #677/#678/#679) that reports racing shared-global accesses, with channel /
+  `WaitGroup` / `Once` edges and `MAXPROCS>1` validation; the main thread's own
+  accesses and shared heap objects remain tracked follow-ups.
   A module-level tuple-destructuring declaration is rejected
   (`ZAP3018`). The surface is expected to graduate to Stable, but is Experimental
   until then (§4).
@@ -227,15 +228,20 @@ not supported — it may change in **any** release, including a PATCH:
   off by default and, like the sharing lint, is a diagnostic that never changes
   what the language accepts. The design is settled (a Zap-native happens-before
   detector, scoped to the ZAP5125 shared-global set) and the engine is now
-  **live** (slices 1–2, #677/#678): a vector-clock happens-before engine wired at
-  spawn and `Mutex` lock/unlock reports a racing shared-global access with a
-  source location and exits non-zero, while `Atomic`/`Mutex`-guarded programs are
-  clean. Remaining breadth (channel/`WaitGroup`/`Once` edges, the main thread's
-  own accesses, shared heap objects, `MAXPROCS>1`) is a tracked slice-3 follow-up
-  (#679). The flag name and its non-legality-changing, off-by-default semantics
-  are expected to graduate to Stable; they are Experimental until then. The
-  detector's report format is diagnostic output (below) and is not itself a
-  covered surface — its exact wording, the byte-span locations, and the non-zero
+  **live** (slices 1–3, #677/#678/#679): a vector-clock happens-before engine
+  reports a racing shared-global access with a source location and exits
+  non-zero, while `Atomic`/`Mutex`/channel/`WaitGroup`/`Once`-synchronized
+  programs are clean. Happens-before edges live: spawn, `Mutex` lock/unlock,
+  channel send/receive (rendezvous + buffered), `WaitGroup` `done`→`wait`, and
+  `Once` `once_end`→waiter; the engine is validated under `ZAP_MAXPROCS>1`.
+  Remaining follow-ups: the **main/native thread's** own accesses are untracked
+  (a main-vs-coroutine race is missed; races between spawned coroutines are
+  caught), **shared heap objects** beyond module globals are a split-out slice-4
+  phase (#684, epic #665), and full multi-frame stack traces await the I#475 unwinder. The
+  flag name and its non-legality-changing, off-by-default semantics are expected
+  to graduate to Stable; they are Experimental until then. The detector's report
+  format is diagnostic output (below) and is not itself a covered surface — its
+  exact wording, the coroutine names, the byte-span locations, and the non-zero
   exit code (66) may change.
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
@@ -407,7 +413,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `set[T]` — literals `{1, 2, 3}`, comprehensions `{x for x in xs}`, `.add`/`in`/`len`/iteration, and the `set[T]()` / `set(iterable)` constructors (#608/#609, graduated per D16/D17) | **S** |
 | Numeric arrays / SIMD + dtype promotion (D-0011); C-style bitfields (D-0068); Python interop; `@derive(Yaml)`/`@derive(Csv)` | **E** |
 | `when target.*` compile-time conditional compilation (D-0079, I#139 Phase 1) | **E** |
-| Module-level persistent state — `const` (immutable, #658 Phase 1) and mutable (`T NAME = expr`, reassignable/mutable, GC root; #662 Phase 2) bindings at module scope, eager import-topological init, precise-Immix static roots + write barrier for pointer globals (#663) (D-0112, epic #661). The runtime `--race` detector is live for module globals (happens-before engine, spawn + `Mutex` edges; #677/#678) | **E** |
+| Module-level persistent state — `const` (immutable, #658 Phase 1) and mutable (`T NAME = expr`, reassignable/mutable, GC root; #662 Phase 2) bindings at module scope, eager import-topological init, precise-Immix static roots + write barrier for pointer globals (#663) (D-0112, epic #661). The runtime `--race` detector is live for module globals (happens-before engine; spawn + `Mutex` + channel + `WaitGroup` + `Once` edges, `MAXPROCS>1`-validated; #677/#678/#679) | **E** |
 | Concurrency-safety surface — the `@shareable` struct marker (reflectable) and the static sharing lint `ZAP5125` (a warning on shared mutable non-`@shareable` module globals), with `# noqa` per-site suppression and the `--warnings-as-errors` policy knob (D-0113, #664) | **E** |
 | Value/memory layout, enum/closure representation (§1.5) | **I** |
 
