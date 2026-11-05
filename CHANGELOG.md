@@ -92,11 +92,25 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `clean_waitgroup`, `clean_once`, and `racy_chan` (a soundness guard that a
   channel does not fabricate an edge between two coroutines racing on a global),
   plus a host-safe guard that `zapc ir --race` actually emits a hook (tripwire
-  for a dropped-flag regression). The **main/native thread's own accesses** stay
-  untracked (a main-vs-coroutine race is missed; races between spawned coroutines
-  are caught), **shared heap objects** beyond module globals are split out as a
-  slice-4 phase (#684) of #665, and full multi-frame stack traces await the I#475
-  green-stack unwinder.
+  for a dropped-flag regression). **Slice 4 (#684) now extends the detector to
+  shared heap objects:** behind `--race`, lowering emits the access hooks at
+  user-source **`struct` field** and **`list` element** load/store sites too, so a
+  race on a shared heap object — two coroutines mutating the same list element or
+  struct field with no synchronization — is reported with a source location and
+  exits non-zero, while a `Mutex`- or `concurrent`-collection-guarded version is
+  clean. Heap shadow state is keyed on the object's **stable header identity** (a
+  field/element index off the header pointer), not the relocatable element
+  address, so it survives precise-Immix evacuation (#120); a `zap_race_on_move`
+  evacuator hook is the general relocation path and keeps the design
+  collector-agnostic (Boehm never moves). The happens-before engine and single
+  lock are unchanged — this slice only widens *what* is instrumented. New
+  `tests/race/` fixtures (`racy_heap_list`, `racy_heap_struct`, `clean_heap_mutex`,
+  `clean_heap_concurrent`, and `clean_heap_evac` — a shadowed object kept live
+  across an evacuating GC) run under both collectors and `ZAP_MAXPROCS>1`. The
+  **main/native thread's own accesses** stay untracked (a main-vs-coroutine race
+  is missed; races between spawned coroutines are caught); **dict/set element** and
+  **interface/boxed-payload** heap coverage and full multi-frame stack traces (the
+  I#475 green-stack unwinder) remain follow-ups.
 - **Concurrency-safety surface: `@shareable` + sharing lint** — the advisory
   surface for the light concurrency model (#664, D-0113; locked-design points
   4–5 of epic #661, building on the mutable globals from #662). `@shareable` is a

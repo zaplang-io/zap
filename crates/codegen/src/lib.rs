@@ -1425,6 +1425,36 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 &[i64t.into(), ptr.into()],
                 None,
             );
+            // Slice 4 (#684): heap field/element access hooks,
+            // `void __zap_race_{read,write}_field(void *base, i64 sub,
+            // ZapStr *name, i64 line, i64 col)` — `base` is the stable heap
+            // object header, `sub` the field/element index, `name` a static
+            // descriptor string. Emitted by lowering at struct-field and
+            // list-element access sites under `--race` only, so (like the
+            // module-global hooks) these externs appear only when the ZIR
+            // contains such a call, keeping a non-`--race` build byte-identical.
+            self.declare_rt(
+                "__zap_race_read_field",
+                &[
+                    ptr.into(),
+                    i64t.into(),
+                    ptr.into(),
+                    i64t.into(),
+                    i64t.into(),
+                ],
+                None,
+            );
+            self.declare_rt(
+                "__zap_race_write_field",
+                &[
+                    ptr.into(),
+                    i64t.into(),
+                    ptr.into(),
+                    i64t.into(),
+                    i64t.into(),
+                ],
+                None,
+            );
         }
         for (i, g) in m.globals.iter().enumerate() {
             let _ = &g.name;

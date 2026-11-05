@@ -770,6 +770,12 @@ static void *zap_evac_copy(void *payload) {
     memcpy(new_hdr, old_hdr, osize);
     zap_evac_cursor += (uint32_t)step;
     void *np = (char *)new_hdr + ZAP_HEADER_BYTES;
+    /* --race (#684): let the data-race detector move any shadow state keyed in
+     * this object's payload to the copy before we install forwarding (which
+     * clobbers the old size word). Inert unless the detector is armed, and only
+     * the moving Immix backend ever reaches here. The payload size is `osize`
+     * minus the header. */
+    zap_race_on_move(payload, np, (int64_t)(osize - ZAP_HEADER_BYTES));
     ZAP_SET_FWD(payload, np); /* original is now a forwarding stub (dead) */
     zap_evac_moved++;
     return np;

@@ -5348,6 +5348,89 @@ impl<'a> FnLower<'a> {
         });
     }
 
+    /// Emit a heap data-race access hook for a **struct field** (`--race`, #684,
+    /// slice 4, epic #665, D-0114): a read (`write == false`) or write of field
+    /// `idx` (named `fname`) of struct `sid` reached through the object pointer
+    /// `base`. Emitted only under `--race`, never in the single-threaded module
+    /// -init pre-pass, and only for a REFERENCE struct — a value struct is inline
+    /// (stack / embedded) and cannot be shared by reference across coroutines, so
+    /// it never races and is skipped (also avoiding a shadow entry keyed on a
+    /// stack address). The conflict key the runtime forms is the pair
+    /// (`base` object header, field index), which is relocation-safe: the precise,
+    /// marked-in-place struct header is never moved by the Immix evacuator (#120).
+    /// The call is `__zap_race_{read,write}_field(base, idx, "Type.field", line,
+    /// col)`; every call carries the `__zap_race_` prefix, so the "race ZIR minus
+    /// the race hooks == off ZIR" byte-identity invariant still holds.
+    fn emit_race_field(
+        &mut self,
+        base: Value,
+        sid: u32,
+        idx: u32,
+        fname: &str,
+        write: bool,
+        span: Span,
+    ) {
+        if !self.ctx.race || self.func.name == INIT_GLOBALS_FN {
+            return;
+        }
+        if self.ctx.is_value_struct(sid) {
+            return; // inline value struct — not a shared heap object
+        }
+        if self.ctx.name_is_shareable(&self.ctx.names[sid as usize]) {
+            // A `@shareable` / built-in-shareable struct (`Atomic`, `Mutex`,
+            // `Counter`, `Queue`, …) is an asserted-safe shared type, so — exactly
+            // as for a `@shareable` module global (the ZAP5125 exemption) — its
+            // field accesses are NOT instrumented; an `Atomic`/`concurrent`-cell
+            // guarded version stays clean by construction (#664, D-0113).
+            return;
+        }
+        let label = format!("{}.{}", self.ctx.names[sid as usize], fname);
+        let name = self.strconst(&label);
+        let sub = self.iconst(Ty::I64, idx as i64);
+        let line = self.iconst(Ty::I64, span.start as i64);
+        let col = self.iconst(Ty::I64, span.end as i64);
+        let func = if write {
+            "__zap_race_write_field"
+        } else {
+            "__zap_race_read_field"
+        };
+        self.emit(Inst::Call {
+            dest: None,
+            func: func.to_string(),
+            args: vec![base, sub, name, line, col],
+        });
+    }
+
+    /// Emit a heap data-race access hook for a **container element** (`--race`,
+    /// #684, slice 4): a read/write of element `index` of the container reached
+    /// through `base`, described to the report by `label` (e.g. `list element`).
+    /// Emitted only under `--race` and never in the module-init pre-pass. The
+    /// conflict key is the pair (`base` container header, `index`) — keyed on the
+    /// stable header identity, so a relocation of the container's `zap_desc_atomic`
+    /// backing buffer (the only thing the evacuator moves) is transparent to the
+    /// shadow state. `index` is the element index value as already coerced to
+    /// `i64` at the call site (its raw, pre-normalization form — a negative index
+    /// and its wrapped positive are distinct keys, a documented v1 granularity
+    /// limit). Call shape mirrors [`Self::emit_race_field`].
+    fn emit_race_elem(&mut self, base: Value, index: Value, label: &str, write: bool, span: Span) {
+        if !self.ctx.race || self.func.name == INIT_GLOBALS_FN {
+            return;
+        }
+        let name = self.strconst(label);
+        let line = self.iconst(Ty::I64, span.start as i64);
+        let col = self.iconst(Ty::I64, span.end as i64);
+        let func = if write {
+            "__zap_race_write_field"
+        } else {
+            "__zap_race_read_field"
+        };
+        self.emit(Inst::Call {
+            dest: None,
+            func: func.to_string(),
+            args: vec![base, index, name, line, col],
+        });
+    }
+
     /// The scope-stack index a fresh walrus binding (`name := expr`, #600) must
     /// be declared into so it outlives the construct it appears in. Outside any
     /// comprehension this is the current innermost scope — which, for an
@@ -6465,7 +6548,7 @@ impl<'a> FnLower<'a> {
                     let v = self.copy_if_value(v, ty, value);
                     self.store_name(n, ptr, ty, v, *span);
                     Ok(())
-                } else if let Expr::Attr { base, name, .. } = target {
+                } else if let Expr::Attr { base, name, span } = target {
                     let (bv, bty) = self.expr(base)?;
                     let Ty::Struct(sid) = bty else {
                         return Err(err("field assignment on a non-struct value"));
@@ -6480,6 +6563,8 @@ impl<'a> FnLower<'a> {
                     // Storing a value struct into a field copies it (D-0051), so
                     // the field holds an independent instance.
                     let v = self.copy_if_value(v, fty, value);
+                    // --race (#684): a write of a shared heap struct field.
+                    self.emit_race_field(bv, sid, idx, name, true, *span);
                     self.emit(Inst::FieldSet {
                         base: bv,
                         sid,
@@ -6487,8 +6572,8 @@ impl<'a> FnLower<'a> {
                         val: v,
                     });
                     Ok(())
-                } else if let Expr::Index { base, index, .. } = target {
-                    self.lower_index_set(base, index, value)
+                } else if let Expr::Index { base, index, span } = target {
+                    self.lower_index_set(base, index, value, *span)
                 } else {
                     Err(err(
                         "only variable, field, and index assignment are supported by codegen yet",
@@ -9539,11 +9624,11 @@ impl<'a> FnLower<'a> {
                 clauses,
                 ..
             } => self.lower_dict_comp(key, value, clauses),
-            Expr::Index { base, index, .. } => self.lower_index_get(base, index),
+            Expr::Index { base, index, span } => self.lower_index_get(base, index, *span),
             Expr::Slice {
                 base, lo, hi, step, ..
             } => self.lower_slice(base, lo.as_deref(), hi.as_deref(), step.as_deref()),
-            Expr::Attr { base, name, .. } => {
+            Expr::Attr { base, name, span } => {
                 // Qualified enum member/variant access (`Color.RED`,
                 // `Shape.Unit`): the base is a *type* name, resolved before it
                 // would be (wrongly) evaluated as a value (D-0018/D-0046).
@@ -9606,6 +9691,8 @@ impl<'a> FnLower<'a> {
                 if !self.ctx.is_value_struct(sid) {
                     self.null_guard(bv, "member access on None");
                 }
+                // --race (#684): a read of a shared heap struct field.
+                self.emit_race_field(bv, sid, idx, name, false, *span);
                 let d = self.new_value(fty);
                 self.emit(Inst::FieldGet {
                     dest: d,
@@ -13364,7 +13451,12 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    fn lower_index_get(&mut self, base: &Expr, index: &Expr) -> Result<(Value, Ty), LowerError> {
+    fn lower_index_get(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        span: Span,
+    ) -> Result<(Value, Ty), LowerError> {
         let (bv, bty) = self.expr(base)?;
         // Tuple element access `t[k]` (D-0049): `k` must be a compile-time
         // constant (a tuple is heterogeneous), and the result is that field.
@@ -13393,6 +13485,9 @@ impl<'a> FnLower<'a> {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce(iv, it, Ty::I64);
+                // --race (#684): a read of a shared heap list element, keyed on
+                // (list header, index).
+                self.emit_race_elem(bv, iv, "list element", false, span);
                 // The element's full type (#625): a nested-collection element reads
                 // back as its real `list`/`dict`/... type, not a bare `str` pointer.
                 let ety = self.elem_ty(elem);
@@ -13635,6 +13730,7 @@ impl<'a> FnLower<'a> {
         base: &Expr,
         index: &Expr,
         value: &Expr,
+        span: Span,
     ) -> Result<(), LowerError> {
         let (bv, bty) = self.expr(base)?;
         match bty {
@@ -13645,6 +13741,9 @@ impl<'a> FnLower<'a> {
                 self.check_index_value(vt, elem, true)?;
                 let v = self.coerce(v, vt, elem.ty());
                 let v = self.box_if_value(v, elem.ty());
+                // --race (#684): a write of a shared heap list element, keyed on
+                // (list header, index).
+                self.emit_race_elem(bv, iv, "list element", true, span);
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_list_set_{}", elem.val_suffix()),
@@ -13727,7 +13826,7 @@ impl<'a> FnLower<'a> {
             let cv = self.copy_if_value(cv, ty, value_expr);
             self.store_name(n, ptr, ty, cv, *span);
             Ok(())
-        } else if let Expr::Attr { base, name, .. } = target {
+        } else if let Expr::Attr { base, name, span } = target {
             let (bv, bty) = self.expr(base)?;
             let Ty::Struct(sid) = bty else {
                 return Err(err("field assignment on a non-struct value"));
@@ -13738,6 +13837,8 @@ impl<'a> FnLower<'a> {
                 .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
             let cv = self.coerce(v, vt, fty);
             let cv = self.copy_if_value(cv, fty, value_expr);
+            // --race (#684): a write of a shared heap struct field (chained form).
+            self.emit_race_field(bv, sid, idx, name, true, *span);
             self.emit(Inst::FieldSet {
                 base: bv,
                 sid,
@@ -13745,8 +13846,8 @@ impl<'a> FnLower<'a> {
                 val: cv,
             });
             Ok(())
-        } else if let Expr::Index { base, index, .. } = target {
-            self.store_index(base, index, v, vt)
+        } else if let Expr::Index { base, index, span } = target {
+            self.store_index(base, index, v, vt, *span)
         } else {
             Err(err(
                 "only variable, field, and index assignment are supported by codegen yet",
@@ -13763,6 +13864,7 @@ impl<'a> FnLower<'a> {
         index: &Expr,
         v: Value,
         vt: Ty,
+        span: Span,
     ) -> Result<(), LowerError> {
         let (bv, bty) = self.expr(base)?;
         match bty {
@@ -13772,6 +13874,8 @@ impl<'a> FnLower<'a> {
                 self.check_index_value(vt, elem, true)?;
                 let v = self.coerce(v, vt, elem.ty());
                 let v = self.box_if_value(v, elem.ty());
+                // --race (#684): a write of a shared heap list element (chained).
+                self.emit_race_elem(bv, iv, "list element", true, span);
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_list_set_{}", elem.val_suffix()),

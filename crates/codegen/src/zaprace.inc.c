@@ -41,6 +41,20 @@
  *       name via `__zap_race_register_global`); `line`/`col` are the access
  *       site's source byte span (start/end — the names are the slice-1 ABI's,
  *       not true line/column: v1 reports the byte offsets as the location).
+ *   __zap_race_read_field / __zap_race_write_field(void *base, i64 sub,
+ *       ZapStr *name, i64 line, i64 col) (slice 4, #684): a HEAP field/element
+ *       access. `base` is the stable heap OBJECT HEADER pointer and `sub` the
+ *       field/element index — the conflict key is the pair (`base`, `sub`), which
+ *       is relocation-safe because the precise, marked-in-place header object is
+ *       never moved by the v1 evacuator (only its `zap_desc_atomic` backing
+ *       buffers are). `name` is a static string literal naming the location for
+ *       the report (`Point.x`, `list element`). `line`/`col` as above.
+ *   zap_race_on_move(void *old, void *new, i64 size): the shadow-table
+ *       relocation path, called by the Immix evacuator for every moved object so
+ *       a keyed heap location follows the object through the copy (the general
+ *       mechanism for when the movable set widens to header objects; a no-op
+ *       migration in v1). Collector-agnostic: Boehm never moves, so never calls
+ *       it.
  *   __zap_race_enable(void): arm the engine (emitted once at the top of a
  *       `--race` `main`, before any spawn). Dormant until then, so a default
  *       build's `zap_spawn`/`zap_mutex_*` edges are inert and behaviour is
@@ -144,11 +158,37 @@ static char **race_names = NULL;
 static int64_t race_names_len = 0;
 static int64_t race_names_cap = 0;
 
-/* Per-instrumented-slot shadow state, keyed by the slot address. A handful of
- * module globals today, so a flat array with linear lookup is plenty. */
+/* What a shadow entry's `slot` key refers to — selects the report wording and,
+ * for heap entries, where the display name comes from (#684, slice 4). */
+#define RACE_K_GLOBAL 0 /* `slot` is a module global's data-segment address      */
+#define RACE_K_HEAP 1   /* `slot` is a heap object header; `sub` is the sub-index */
+
+/* Per-instrumented-location shadow state. The conflict key is the pair
+ * (`slot`, `sub`):
+ *   - a module global (slice 1-3): `slot` = its stable data-segment address,
+ *     `sub` = 0 — one entry per global, exactly as before.
+ *   - a heap location (slice 4, #684): `slot` = the stable heap OBJECT HEADER
+ *     pointer (a `list`/`struct` header), `sub` = the field or element index.
+ *     Keying on the header's identity (not the raw field/element address) is
+ *     relocation-safe: precise-Immix evacuation (#120) moves only `zap_desc_atomic`
+ *     LEAF buffers (a container's backing buffer, string/array data), never the
+ *     precise, marked-in-place header object — so (header, index) is invariant
+ *     across a backing-buffer evacuation, side-stepping the "alias/lose state
+ *     across a GC" hazard with no object-header surgery. `zap_race_on_move`
+ *     (below) is the general relocation path should the movable set ever widen
+ *     to header objects. A flat array with linear lookup is plenty for a
+ *     test-time diagnostic. */
 typedef struct {
     const void *slot;
-    int64_t name_id;
+    int64_t sub;    /* sub-location within `slot` (field/element index); 0 for a global */
+    int kind;       /* RACE_K_GLOBAL | RACE_K_HEAP — report wording + name source       */
+    int64_t name_id; /* global: slot index -> `race_names`; heap: unused (-1)            */
+    /* Heap display name (e.g. "Point.x", "list element"): a static C-string the
+     * generated call passes (a codegen string literal, immortal and never
+     * GC-traced), retained by pointer+len — NOT NUL-terminated, printed `%.*s`.
+     * NULL for a global (its name resolves via `name_id`). */
+    const char *hname;
+    int64_t hname_len;
     RaceVC w; /* w[g] = epoch of coroutine g's last write to this slot  */
     RaceVC r; /* r[g] = epoch of coroutine g's last read of this slot   */
     int64_t last_wgid, last_wline, last_wcol; /* most recent writer (report) */
@@ -241,11 +281,16 @@ static RaceVC *race_cur_vc(G **out_g) {
     return race_vc_of_g(g);
 }
 
-/* Get-or-create the shadow state for `slot`. Caller holds race_mu. May realloc
- * `race_slots`; the returned pointer is valid until the next slot is added. */
-static RaceSlot *race_slot(const void *slot, int64_t name_id) {
+/* Get-or-create the shadow state for the location (`slot`, `sub`). Caller holds
+ * race_mu. May realloc `race_slots`; the returned pointer is valid until the
+ * next slot is added. `kind` / `name_id` / `hname` describe the location for the
+ * report and are recorded only on first creation (identical for every access to
+ * the same location). */
+static RaceSlot *race_slot(const void *slot, int64_t sub, int kind, int64_t name_id,
+                           const ZapStr *hname) {
     for (int64_t i = 0; i < race_slots_len; i++) {
-        if (race_slots[i].slot == slot) {
+        if (race_slots[i].slot == slot && race_slots[i].sub == sub &&
+            race_slots[i].kind == kind) {
             return &race_slots[i];
         }
     }
@@ -263,7 +308,13 @@ static RaceSlot *race_slot(const void *slot, int64_t name_id) {
     RaceSlot *s = &race_slots[race_slots_len++];
     memset(s, 0, sizeof(*s));
     s->slot = slot;
+    s->sub = sub;
+    s->kind = kind;
     s->name_id = name_id;
+    if (hname) {
+        s->hname = hname->data;
+        s->hname_len = hname->len < 0 ? 0 : hname->len;
+    }
     s->last_wgid = s->last_rgid = -1;
     return s;
 }
@@ -307,13 +358,22 @@ static const char *race_name_of(int64_t name_id) {
  * The report prints the global's NAME and the accesses' source byte spans only —
  * never a heap address, pointer, or timing value — so a golden can assert it
  * without flaking. */
-static void race_report_and_exit(const char *kind, int64_t name_id, int64_t gid, int64_t line,
+static void race_report_and_exit(const RaceSlot *s, const char *kind, int64_t gid, int64_t line,
                                  int64_t col, const char *cur_name, const char *prior_kind,
                                  int64_t pgid, int64_t pline, int64_t pcol, const char *prior_name) {
-    const char *gname = race_name_of(name_id);
     fflush(stdout);
     fprintf(stderr, "==================\n");
-    fprintf(stderr, "zap: data race detected on module global `%s` (--race, #665)\n", gname);
+    /* The report prints only the location's NAME (a module-global name, or a
+     * heap location's static descriptor like `Point.x` / `list element`) and the
+     * accesses' source byte spans — never a heap address, pointer, or timing
+     * value — so a golden can assert it without flaking. */
+    if (s->kind == RACE_K_HEAP) {
+        fprintf(stderr, "zap: data race detected on shared heap location `%.*s` (--race, #665)\n",
+                (int)s->hname_len, s->hname ? s->hname : "");
+    } else {
+        fprintf(stderr, "zap: data race detected on module global `%s` (--race, #665)\n",
+                race_name_of(s->name_id));
+    }
     /* Each racing access names the coroutine (dense id + spawn-target function,
      * when known) and the access-site source byte span. The coroutine function
      * is a deterministic, address-free identifier, so it enriches the report
@@ -398,7 +458,15 @@ void __zap_race_register_global(int64_t name_id, void *name_) {
     zap_np_unlock(&race_mu);
 }
 
-void __zap_race_read(void *slot, int64_t name_id, int64_t line, int64_t col) {
+/* The shared read/write access check for ONE instrumented location (`slot`,
+ * `sub`). `kind`/`name_id`/`hname` describe it for the report (recorded on the
+ * shadow entry's first creation). Every generated access hook — the global
+ * `__zap_race_{read,write}` (slice 1-3) and the heap `__zap_race_{read,write}_field`
+ * (slice 4, #684) — funnels through here, so both widths share one happens-before
+ * check and one single-lock discipline; only the conflict key (now a pair) and
+ * the report wording differ. Caller passes nothing locked; we take race_mu. */
+static void race_do_access(int write, const void *slot, int64_t sub, int kind, int64_t name_id,
+                           const ZapStr *hname, int64_t line, int64_t col) {
     /* An access hook is emitted ONLY under `--race`, so its mere presence means
      * the detector is live: self-arm (also arms the runtime-side spawn / Mutex
      * edges) rather than depend on `__zap_race_enable` having run first. */
@@ -411,53 +479,95 @@ void __zap_race_read(void *slot, int64_t name_id, int64_t line, int64_t col) {
         return;
     }
     int64_t gid = g->race_gid;
-    RaceSlot *s = race_slot(slot, name_id);
-    /* write->read: a write by another coroutine that this one has not observed. */
-    for (int64_t u = 0; u < s->w.len; u++) {
-        if (u != gid && s->w.v[u] > race_vc_get(cvc, u)) {
-            race_report_and_exit("read", name_id, gid, line, col, g->name, "write", s->last_wgid,
-                                  s->last_wline, s->last_wcol, s->last_wname);
+    RaceSlot *s = race_slot(slot, sub, kind, name_id, hname);
+    if (write) {
+        /* write->write: an unobserved write by another coroutine. */
+        for (int64_t u = 0; u < s->w.len; u++) {
+            if (u != gid && s->w.v[u] > race_vc_get(cvc, u)) {
+                race_report_and_exit(s, "write", gid, line, col, g->name, "write", s->last_wgid,
+                                     s->last_wline, s->last_wcol, s->last_wname);
+            }
         }
+        /* read->write: an unobserved read by another coroutine (a write that is
+         * not ordered after a concurrent reader still races). */
+        for (int64_t u = 0; u < s->r.len; u++) {
+            if (u != gid && s->r.v[u] > race_vc_get(cvc, u)) {
+                race_report_and_exit(s, "write", gid, line, col, g->name, "read", s->last_rgid,
+                                     s->last_rline, s->last_rcol, s->last_rname);
+            }
+        }
+        race_vc_set(&s->w, gid, race_vc_get(cvc, gid));
+        s->last_wgid = gid;
+        s->last_wline = line;
+        s->last_wcol = col;
+        s->last_wname = g->name;
+    } else {
+        /* write->read: a write by another coroutine that this one has not seen. */
+        for (int64_t u = 0; u < s->w.len; u++) {
+            if (u != gid && s->w.v[u] > race_vc_get(cvc, u)) {
+                race_report_and_exit(s, "read", gid, line, col, g->name, "write", s->last_wgid,
+                                     s->last_wline, s->last_wcol, s->last_wname);
+            }
+        }
+        race_vc_set(&s->r, gid, race_vc_get(cvc, gid));
+        s->last_rgid = gid;
+        s->last_rline = line;
+        s->last_rcol = col;
+        s->last_rname = g->name;
     }
-    race_vc_set(&s->r, gid, race_vc_get(cvc, gid));
-    s->last_rgid = gid;
-    s->last_rline = line;
-    s->last_rcol = col;
-    s->last_rname = g->name;
     zap_np_unlock(&race_mu);
 }
 
+/* Module-global access (slice 1-3): `slot` is the global's data-segment address,
+ * the whole-object conflict key (`sub` = 0); `name_id` resolves to its name. */
+void __zap_race_read(void *slot, int64_t name_id, int64_t line, int64_t col) {
+    race_do_access(0, slot, 0, RACE_K_GLOBAL, name_id, NULL, line, col);
+}
+
 void __zap_race_write(void *slot, int64_t name_id, int64_t line, int64_t col) {
-    race_enabled = 1; /* self-arm (see __zap_race_read) */
-    zap_np_lock(&race_mu);
-    G *g = NULL;
-    RaceVC *cvc = race_cur_vc(&g);
-    if (!cvc) {
-        zap_np_unlock(&race_mu); /* untracked context (main/native) */
+    race_do_access(1, slot, 0, RACE_K_GLOBAL, name_id, NULL, line, col);
+}
+
+/* Heap field/element access (slice 4, #684): `base` is the stable heap OBJECT
+ * HEADER pointer, `sub` the field or element index (the conflict key is the pair
+ * (`base`, `sub`), relocation-safe — see `RaceSlot`). `name` is a static string
+ * literal describing the location (e.g. `Point.x`, `list element`) for the
+ * report. Emitted by lowering ONLY under `--race`, at user-source struct-field
+ * and list-element load/store sites, so a non-`--race` build is byte-identical. */
+void __zap_race_read_field(void *base, int64_t sub, void *name, int64_t line, int64_t col) {
+    race_do_access(0, base, sub, RACE_K_HEAP, -1, (const ZapStr *)name, line, col);
+}
+
+void __zap_race_write_field(void *base, int64_t sub, void *name, int64_t line, int64_t col) {
+    race_do_access(1, base, sub, RACE_K_HEAP, -1, (const ZapStr *)name, line, col);
+}
+
+/* Relocation path for the shadow table (slice 4, #684). Called by the precise
+ * Immix evacuator (`zap_evac_copy`) for every object it moves, while the world is
+ * stopped at a safepoint and race_mu's owner (if any) is likewise parked. If a
+ * shadow entry's key `slot` lies inside the moved object's OLD payload range it
+ * is re-pointed to the new address at the same offset, so the (object, sub) key
+ * follows the object through the copy — keeping the table correct however the
+ * collector relocates memory, and collector-agnostic (Boehm never moves, so never
+ * calls this). In this slice the keyed bases are precise, marked-in-place header
+ * objects (and data-segment globals), which the v1 evacuator never moves, so no
+ * entry is ever in a moved range and this is a no-op migration today; it is the
+ * general mechanism that keeps keying correct should the movable set widen to
+ * header objects. `size` is the moved payload's byte length. */
+void zap_race_on_move(void *old_payload, void *new_payload, int64_t size) {
+    if (!race_enabled) {
         return;
     }
-    int64_t gid = g->race_gid;
-    RaceSlot *s = race_slot(slot, name_id);
-    /* write->write: an unobserved write by another coroutine. */
-    for (int64_t u = 0; u < s->w.len; u++) {
-        if (u != gid && s->w.v[u] > race_vc_get(cvc, u)) {
-            race_report_and_exit("write", name_id, gid, line, col, g->name, "write", s->last_wgid,
-                                  s->last_wline, s->last_wcol, s->last_wname);
+    uintptr_t lo = (uintptr_t)old_payload;
+    uintptr_t hi = lo + (uintptr_t)(size < 0 ? 0 : size);
+    intptr_t delta = (intptr_t)((uintptr_t)new_payload - lo);
+    zap_np_lock(&race_mu);
+    for (int64_t i = 0; i < race_slots_len; i++) {
+        uintptr_t k = (uintptr_t)race_slots[i].slot;
+        if (k >= lo && k < hi) {
+            race_slots[i].slot = (const void *)(k + (uintptr_t)delta);
         }
     }
-    /* read->write: an unobserved read by another coroutine (a write that is not
-     * ordered after a concurrent reader still races). */
-    for (int64_t u = 0; u < s->r.len; u++) {
-        if (u != gid && s->r.v[u] > race_vc_get(cvc, u)) {
-            race_report_and_exit("write", name_id, gid, line, col, g->name, "read", s->last_rgid,
-                                  s->last_rline, s->last_rcol, s->last_rname);
-        }
-    }
-    race_vc_set(&s->w, gid, race_vc_get(cvc, gid));
-    s->last_wgid = gid;
-    s->last_wline = line;
-    s->last_wcol = col;
-    s->last_wname = g->name;
     zap_np_unlock(&race_mu);
 }
 
