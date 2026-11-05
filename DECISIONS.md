@@ -4180,11 +4180,12 @@ the maintainer** (not unilaterally created).
    the ZAP5125 access sites in lowering (the `expr` global read / `store_name`
    write), to no-op runtime stubs; ZIR unit tests assert emitted/not-emitted ==
    lint scope (host-testable). See the slice-1 note below.
-2. **Happens-before engine.** The per-`G` vector clock (field on `G`), per-sync
-   clocks, and the single-lock shadow-state check + report formatting + non-zero
-   exit, in a new `zaprace.inc.c`; HB hooks at spawn and `Mutex` lock/unlock
-   (enough for the #665 "Done when"); racy fixture → reported with location,
-   mutex-guarded → clean. CI-gated golden.
+2. **Happens-before engine. ✅ Landed — I#678 (slice 2).** The per-`G` vector
+   clock (`G.race_gid` + a gid-indexed clock table), per-sync clocks, and the
+   single-lock shadow-state check + report formatting + non-zero exit, in
+   `zaprace.inc.c`; HB hooks at spawn and `Mutex` lock/unlock (enough for the
+   #665 "Done when"); racy fixtures → reported with location, mutex/atomic-guarded
+   → clean. CI-gated golden under both collectors. See the slice-2 note below.
 3. **Breadth.** Channels/`WaitGroup`/`Once` HB edges; shared heap-object
    instrumentation; richer multi-frame reports; `MAXPROCS>1` validation.
 
@@ -4244,6 +4245,61 @@ through lowering; the accepted-but-inert notice is removed.
   `tests/race/*.zap` links and runs identically to a non-`--race` run (the stubs
   are inert). Built-in-`@shareable` exclusion shares the `name_is_shareable` path
   and is covered end-to-end by the `clean_atomic.zap` golden.
+
+### Slice 2 landed — I#678 (happens-before engine + reporting)
+
+The slice-1 no-op stubs are replaced by a real **Zap-native happens-before /
+vector-clock** engine in `zaprace.inc.c`, so the #665 v1 "Done when" holds: a
+racy program is **reported with a source location** and exits non-zero, while a
+`Mutex`/`Atomic`-guarded version is clean.
+
+- **Engine.** Each coroutine `G` carries a vector clock, indexed by a dense
+  goroutine id (`G.race_gid`, assigned at spawn and grown as coroutines are
+  created). Each synchronization object (a `Mutex`) carries a clock for
+  release/acquire. Each instrumented slot keeps shadow state — a per-coroutine
+  **write** clock and **read** clock, plus the most recent writer/reader's source
+  span for the report. An access **races** iff it is not ordered-after every
+  conflicting prior access (write–write or read–write) under happens-before
+  (the DJIT+ full-vector-clock check).
+- **Happens-before edges (minimal v1 set).** **spawn** — the parent's clock is
+  copied into the child at creation (`zap_race_on_spawn`, from
+  `zap_spawn`/`zap_spawn_detached`); **`Mutex`** — `unlock` = release (publish
+  the holder's clock into the lock), `lock` = acquire (join the lock's clock into
+  the locker), hooked in `zap_mutex_lock`/`zap_mutex_unlock`; **`Atomic`** —
+  clean by exemption (a `@shareable` cell is not instrumented at all). Channel /
+  `WaitGroup` / `Once` edges, and tracking the **main/native thread's** own
+  accesses, are slice 3 (#679) — which is why the `WaitGroup`-joined `main` read
+  in the `clean_*` fixtures stays clean without a join edge: v1 tracks races
+  **between spawned coroutines**, and an access from an untracked context (no
+  `G`) is skipped.
+- **Single detector lock.** All engine state (every vector clock, slot shadow
+  state, the gid/name tables) is serialized under one `race_mu`, taken via the
+  preemption-guarded `zap_np_lock` so a signal-preempted holder cannot deadlock a
+  switched-in sibling on the same M. Obvious correctness over speed; safe under
+  `MAXPROCS>1`. The release/acquire **order** comes from the real `Mutex` and the
+  scheduler's direct handoff, not from `race_mu`.
+- **Reporting.** On the first racing access the engine prints a diagnostic
+  naming the global (resolved from `name_id` via `__zap_race_register_global`,
+  emitted per-global in `main` under `--race`) and both accesses' source byte
+  spans (the slice-1 `line`/`col` ABI — byte offsets, not true line/column),
+  then `_exit(66)` (Go's race-exit code). No heap address, pointer, or timing
+  value is printed, so the report is a stable golden. The verdict is
+  **schedule-independent** (it reflects the absence of an ordering edge, not a
+  particular interleaving). This is diagnostic output (STABILITY: not stabilized).
+- **Codegen.** Two more generated-code entry points join slice 1's read/write
+  hooks, emitted in `main` under `--race`: `__zap_race_enable()` (arm the engine
+  before any spawn) and `__zap_race_register_global(idx, name)`. All carry the
+  `__zap_race_` prefix, so the "race ZIR minus the race hooks == off ZIR"
+  invariant and the byte-identical non-`--race` build are preserved; the spawn
+  and `Mutex` edges are wired entirely in the runtime (no LLVM declaration).
+- **Tests.** The host-safe ir unit tests gain bootstrap coverage (enable +
+  per-global registration emitted in `main`, only under `--race`). The CI-gated
+  golden (`race_detector_reports_races_and_clears_clean_programs`,
+  `crates/driver/tests/golden.rs`, both collectors) now asserts the real
+  verdicts: `racy_counter` / `racy_read_write` / `racy_write_write` report a race
+  on `counter` (location-tolerant, no nondeterministic value) and exit non-zero;
+  `clean_mutex` (100000), `clean_atomic` (100000), `clean_single` (50000) run
+  clean and print their exact total.
 
 ## D-0115 — `@cache` built-in: memoization as `zap expand`-visible Zap over module-level state (I#666, epic #661; supersedes the D-0109 `@cache` deferral)
 

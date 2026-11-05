@@ -4156,6 +4156,13 @@ typedef struct G {
      * this G last parked on (set at each park site), reported while it is PARKED. */
     const char *name;
     const char *park_reason;
+    /* Runtime data-race detector (`--race`, #678, epic #665, D-0114). The
+     * coroutine's vector-clock index, assigned lazily the first time the engine
+     * sees this G (at `zap_race_on_spawn`); -1 until then and for every G in a
+     * non-`--race` run (the field is written once in `galloc`, read only by the
+     * engine under `race_mu`). The clock itself lives in the engine's gid-indexed
+     * table, not here, so a non-`--race` build never allocates one. */
+    int64_t race_gid;
 } G;
 
 typedef struct P {
@@ -4606,6 +4613,20 @@ static void all_remove(G *g) {
     zap_np_unlock(&g_all_mu);
 }
 
+/* Runtime data-race detector hooks called from the scheduler / sync primitives
+ * (`--race`, #678, epic #665, D-0114). The engine itself is defined in
+ * zaprace.inc.c (included near the end of this file); these forward declarations
+ * let the earlier `zap_spawn` / `zap_mutex_*` call sites reference it. Each is a
+ * no-op until the detector is armed (by `__zap_race_enable` /
+ * `__zap_race_register_global` / an access hook — all emitted only under
+ * `--race`), so a default build is behaviourally unchanged. `zap_race_on_spawn`
+ * records the
+ * parent->child happens-before edge; `zap_race_mutex_{acquire,release}` carry
+ * the lock acquire/release edges keyed by the mutex pointer. */
+void zap_race_on_spawn(G *child);
+void zap_race_mutex_acquire(void *mu);
+void zap_race_mutex_release(void *mu);
+
 static G *galloc(void *fn, void *arg) {
     size_t ss = zap_stack_size();
     G *g = NULL;
@@ -4630,6 +4651,7 @@ static G *galloc(void *fn, void *arg) {
     g->name = NULL;
     g->park_reason = NULL;
     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
+    g->race_gid = -1;      /* unassigned until the race engine first sees it */
     /* Cold end of a down-growing stack is its high address. */
     g->sb.mem_base = (char *)g->stack + g->stack_size;
     zap_ctx_make(&g->ctx, g->stack, g->stack_size, g_bootstrap);
@@ -5111,6 +5133,7 @@ void zap_spawn(void *fn_, void *arg) {
     zap_np_unlock(&g_live_mu);
     G *g = galloc(fn_, arg);
     g->in_live = 1; /* joined by the implicit root scope at program exit */
+    zap_race_on_spawn(g); /* --race: parent->child happens-before edge (#678) */
     sched_enqueue(g);
 }
 
@@ -5122,6 +5145,7 @@ void zap_spawn_detached(void *fn_, void *arg) {
     zap_sched_init(0);
     G *g = galloc(fn_, arg);
     /* in_live stays 0 and scope stays NULL: no join barrier owns it. */
+    zap_race_on_spawn(g); /* --race: parent->child happens-before edge (#678) */
     sched_enqueue(g);
 }
 
@@ -5393,6 +5417,7 @@ void zap_spawn_scoped(void *fn_, void *arg, void *scope_, const char *name) {
     G *g = galloc(fn_, arg);
     g->scope = sc; /* in_live stays 0: the scope, not the root join, owns it */
     g->name = name;
+    zap_race_on_spawn(g); /* --race: parent->child happens-before edge (#678) */
     sched_enqueue(g);
 }
 
@@ -13310,6 +13335,10 @@ void zap_mutex_lock(void *mp) {
     if (!m->locked) {
         m->locked = 1;
         zap_np_unlock(&m->mu);
+        /* --race: acquire edge — join the lock's published clock into this
+         * coroutine's vector clock (#678). The previous holder's `unlock`
+         * published under the real mutex, so the edge is ordered. */
+        zap_race_mutex_acquire(mp);
         return;
     }
     /* Contended: enqueue and park. On wake the lock has been handed to us
@@ -13318,6 +13347,8 @@ void zap_mutex_lock(void *mp) {
     w.g = NULL;
     q_push(&m->wq_head, &m->wq_tail, &w);
     copark(&m->mu, &w);
+    /* Woken with ownership (direct handoff): acquire the lock's clock now. */
+    zap_race_mutex_acquire(mp);
 }
 
 /* Try to acquire without blocking: 1 on success, 0 if already held. */
@@ -13335,6 +13366,11 @@ int64_t zap_mutex_trylock(void *mp) {
 
 void zap_mutex_unlock(void *mp) {
     ZapMutex *m = (ZapMutex *)mp;
+    /* --race: release edge — publish this coroutine's vector clock into the
+     * lock's clock BEFORE the direct handoff below, so the next locker's acquire
+     * sees it (#678). Runs before `coready`, so the publish happens-before the
+     * woken waiter's acquire. */
+    zap_race_mutex_release(mp);
     zap_np_lock(&m->mu);
     Waiter *nx = q_pop(&m->wq_head, &m->wq_tail);
     if (nx) {

@@ -2889,4 +2889,63 @@ def main():
         assert_eq!(count_calls(peek, "__zap_race_read"), 1);
         assert_eq!(count_calls(peek, "__zap_race_write"), 0);
     }
+
+    #[test]
+    fn race_main_bootstrap_enables_and_registers_every_global() {
+        // Slice 2 (#678): under `--race`, `main`'s prologue arms the engine once
+        // (`__zap_race_enable`) and registers EVERY module global's name under its
+        // slot index (`__zap_race_register_global`) so a report can resolve a
+        // `name_id` back to a name — racy globals and non-racy (`const`) ones
+        // alike (the id is the declaration index, which must stay total).
+        let src = "const int64 LIMIT = 10\nint64 counter = 0\n\
+                   def bump():\n    counter = counter + 1\n\
+                   def main():\n    bump()\n";
+        let m = lower_race(src);
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(
+            count_calls(main, "__zap_race_enable"),
+            1,
+            "main arms the detector exactly once"
+        );
+        assert_eq!(
+            count_calls(main, "__zap_race_register_global"),
+            2,
+            "both globals (const LIMIT + mutable counter) are registered by index"
+        );
+    }
+
+    #[test]
+    fn race_bootstrap_is_main_only_and_race_only() {
+        // The bootstrap is emitted ONLY in `main` and ONLY under `--race`: a
+        // non-main function never carries it, and a non-`--race` build emits none
+        // (so the `main` prologue is byte-identical to today — golden-safe).
+        let src = "int64 counter = 0\n\
+                   def bump():\n    counter = counter + 1\n\
+                   def main():\n    bump()\n";
+        // --race: present in main, absent elsewhere.
+        let on = lower_race(src);
+        let bump = on.funcs.iter().find(|f| f.name == "bump").unwrap();
+        assert_eq!(count_calls(bump, "__zap_race_enable"), 0);
+        assert_eq!(count_calls(bump, "__zap_race_register_global"), 0);
+        // off: no bootstrap at all.
+        let (ast, _, _) = parse_str(src);
+        let (off, _) = lower_module_opts(&ast, false);
+        assert_eq!(count_calls_module(&off, "__zap_race_enable"), 0);
+        assert_eq!(count_calls_module(&off, "__zap_race_register_global"), 0);
+    }
+
+    #[test]
+    fn race_bootstrap_absent_when_no_globals() {
+        // No module globals -> nothing to register. `__zap_race_enable` is still
+        // harmless to emit, but there are no globals, so register_global count is
+        // zero; a program with no shared globals has no racy accesses either.
+        let src = "def main():\n    print(1)\n";
+        let m = lower_race(src);
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(
+            count_calls(main, "__zap_race_register_global"),
+            0,
+            "no globals -> no name registrations"
+        );
+    }
 }

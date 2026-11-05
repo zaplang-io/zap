@@ -137,7 +137,10 @@ const RUNTIME_C: &str = include_str!("zaprt.c");
 const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
 /// The runtime data-race detector hooks (`--race`, #677, epic #665, D-0114),
 /// `#include`d unconditionally by `zaprt.c`. Written next to the runtime so the
-/// relative include resolves. Slice 1 no-op stubs; the engine fills them in (#678).
+/// relative include resolves. Slice 2 (#678) replaces the slice-1 no-op stubs
+/// with the happens-before / vector-clock engine. A `build.rs` declares this and
+/// the other embedded runtime files as `rerun-if-changed` inputs so a runtime
+/// edit always rebuilds this crate (CI's cache otherwise kept a stale runtime).
 const RUNTIME_RACE_C: &str = include_str!("zaprace.inc.c");
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
@@ -1387,15 +1390,19 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // access (the ZAP5125 set) only under `--race`, so the externs are
         // declared ONLY when the ZIR actually contains such a call. A non-`--race`
         // build emits no race calls, so this adds nothing and the module stays
-        // byte-identical (golden-safe). No-op stubs in the runtime today (slice 1);
-        // the happens-before engine fills them in (#678).
+        // byte-identical (golden-safe).
+        // The happens-before engine (#678) adds two more generated-code entry
+        // points to slice 1's read/write hooks: `__zap_race_enable` (arm the
+        // detector) and `__zap_race_register_global` (record a slot's name for
+        // reporting), both emitted into `main` under `--race`. The spawn and
+        // `Mutex` release/acquire edges are wired entirely inside the runtime, so
+        // they need no LLVM declaration here. All race entry points carry the
+        // `__zap_race_` prefix, so a single prefix test gates the declarations.
         let needs_race = m.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
             b.insts.iter().any(|i| {
                 matches!(
                     i,
-                    Inst::Call { func, .. }
-                        if func.as_str() == "__zap_race_read"
-                            || func.as_str() == "__zap_race_write"
+                    Inst::Call { func, .. } if func.as_str().starts_with("__zap_race_")
                 )
             })
         });
@@ -1410,6 +1417,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.declare_rt(
                 "__zap_race_write",
                 &[ptr.into(), i64t.into(), i64t.into(), i64t.into()],
+                None,
+            );
+            self.declare_rt("__zap_race_enable", &[], None);
+            self.declare_rt(
+                "__zap_race_register_global",
+                &[i64t.into(), ptr.into()],
                 None,
             );
         }
