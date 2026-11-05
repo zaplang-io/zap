@@ -371,6 +371,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **aarch64 multicore GC deadlock: the scheduler's stack-bottom update is now
+  lock-free** (#223, D-0117). The M:N scheduler retargets the conservative
+  collector's stack bottom on every context switch (`switch_to_g` →
+  `set_bottom`); it used to do so under the bdwgc **global allocator lock**,
+  which is also held inside `GC_MALLOC`. A coroutine descheduled while briefly
+  holding that lock could then never be resumed — resuming any coroutine demanded
+  the same lock — deadlocking the whole scheduler (confirmed by gdb on a 32-vCPU
+  Graviton box; masked on x86 and small CI runners). `set_bottom` now calls
+  `GC_set_stackbottom` directly (a single pointer store to this thread's own
+  stack cold-end), so the switch path takes no global GC lock and the scheduler
+  can always resume the lock-holder. Collector-agnostic: a no-op under gc-immix
+  (the shim/`GC_call_with_alloc_lock` were already no-ops). Note: this fixes the
+  gdb-confirmed lock-ordering deadlock; box-level confirmation on the high-core
+  Graviton host (#650) is pending, and the three `.skip_arch` aarch64 stress-golden
+  quarantines (PR #445) stay until that re-run passes.
 - **`dict.get` (and other receiver-type-driven specializations) on a
   module-level dict global** (#671, D-0112). Monomorphization now seeds
   explicitly-typed module-level globals (epic #661: `const` #658, mutable #662)
