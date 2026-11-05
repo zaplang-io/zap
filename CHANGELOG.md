@@ -25,6 +25,25 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`spawn` of methods and first-class function values** (#475, D-0118; epic
+  #469). `spawn` now accepts three callable forms, closing the gap where the
+  grammar and SPEC admitted method/closure spawns but lowering rejected them:
+  (1) a **named function** (`spawn worker(ch)`), (2) a **user-struct method
+  call** (`spawn server.handle(conn)` — the receiver is captured as the first
+  argument), and (3) a **first-class function value** (`spawn f(x)` where `f` is
+  a variable, field, or expression of `fn(...)->...` type: a bound lambda, a
+  closure, or a function value, lowered through a generated per-signature thunk
+  that performs the indirect call). The receiver, arguments, and closure are
+  captured **eagerly in the parent** (D-0034); a value-struct receiver/argument
+  is copied so it outlives the frame, and a reference/closure capture is a GC
+  pointer traced through the spawn environment. All forms are **positional-only**
+  (no keyword, spread, or default filling), and every new form composes with the
+  existing `scope:` join, cancellation, `finally`/`with` cleanup, failure
+  propagation, and `scope(timeout=…)` (D-0094) — a `ScopeTimeout` pending report
+  now names a method as `Struct.method` and a function value by its callee. A
+  bare lambda *literal* operand (`spawn (lambda: ...)()`) stays a compile error
+  (**ZAP5076**): bind it to a name first. Keyword/spread arguments, an arity
+  mismatch, and a non-callable or non-struct-method operand are also ZAP5076.
 - **Bare `raise` (re-raise) in an `except` handler** (#657, D-0116; Python
   parity D-0007). A bare `raise` — no operand — inside a handler now re-raises
   the exception currently being handled, **preserving its type and

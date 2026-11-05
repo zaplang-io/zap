@@ -1409,7 +1409,9 @@ mod tests {
             .iter()
             .flat_map(|b| &b.insts)
             .find_map(|i| match i {
-                Inst::Spawn { func, args, owner } => Some((func.clone(), args.len(), *owner)),
+                Inst::Spawn {
+                    func, args, owner, ..
+                } => Some((func.clone(), args.len(), *owner)),
                 _ => None,
             })
             .expect("a Spawn instruction");
@@ -1445,6 +1447,138 @@ mod tests {
         );
         assert_eq!(owners[1], Owner::Detached, "the detached spawn");
         assert_eq!(owners[2], Owner::Root, "the root-scoped spawn");
+    }
+
+    /// Collect the `Inst::Spawn` nodes of a function as `(func, nargs, name)`.
+    fn spawns_of(f: &zapc_ir_core::Func) -> Vec<(String, usize, Option<String>)> {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Spawn {
+                    func, args, name, ..
+                } => Some((func.clone(), args.len(), name.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn lower_errs(src: &str) -> Vec<LowerError> {
+        let (ast, perrs, lerrs) = parse_str(src);
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        lower_module(&ast).1
+    }
+
+    #[test]
+    fn spawn_of_method_lowers_to_named_method_spawn() {
+        // `spawn recv.method(args)` (I#475) desugars to a named `Inst::Spawn` on
+        // the mangled method symbol with the receiver captured as argument 0, and
+        // carries a readable `Struct.method` identity for `ScopeTimeout` reports.
+        let m = lower_ok(
+            "struct Worker:\n    int64 base\n    def run(self, int64 n):\n        print(self.base + n)\n\ndef main():\n    auto w = Worker(10)\n    scope:\n        spawn w.run(5)\n",
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let spawns = spawns_of(main);
+        assert_eq!(spawns.len(), 1, "one spawn");
+        assert_eq!(spawns[0].0, "Worker__run", "mangled method symbol");
+        assert_eq!(spawns[0].1, 2, "receiver + one captured argument");
+        assert_eq!(
+            spawns[0].2.as_deref(),
+            Some("Worker.run"),
+            "readable identity"
+        );
+        // The method is owned by the enclosing scope (D-0044).
+        let scoped = main.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(
+                i,
+                Inst::Spawn {
+                    owner: Owner::Scope(_),
+                    ..
+                }
+            )
+        });
+        assert!(scoped, "the method spawn is owned by the scope");
+    }
+
+    #[test]
+    fn spawn_of_function_value_generates_thunk() {
+        // `spawn f(x)` where `f : fn(..)->..` (I#475) lowers through a generated
+        // `$spawnthunk$<sig>` whose body is an indirect `CallClosure`; the spawn
+        // targets the thunk and reports the source callee name.
+        let m = lower_ok(
+            "def main():\n    fn(int64) -> int64 f = lambda x: x + 1\n    scope:\n        spawn f(3)\n",
+        );
+        let thunk = m
+            .funcs
+            .iter()
+            .find(|f| f.name.starts_with("$spawnthunk$"))
+            .expect("a generated spawn thunk");
+        assert!(
+            thunk
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::CallClosure { .. })),
+            "the thunk performs an indirect CallClosure"
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let spawns = spawns_of(main);
+        assert_eq!(spawns.len(), 1, "one spawn");
+        assert!(
+            spawns[0].0.starts_with("$spawnthunk$"),
+            "spawn targets the thunk, got {}",
+            spawns[0].0
+        );
+        assert_eq!(spawns[0].1, 2, "closure record + one captured argument");
+        assert_eq!(spawns[0].2.as_deref(), Some("f"), "reports the callee name");
+    }
+
+    #[test]
+    fn spawn_thunk_is_reused_across_same_signature() {
+        // Two `spawn`s of the same function-value signature share one thunk.
+        let m = lower_ok(
+            "def main():\n    fn(int64) -> int64 f = lambda x: x + 1\n    fn(int64) -> int64 g = lambda x: x * 2\n    scope:\n        spawn f(3)\n        spawn g(4)\n",
+        );
+        let thunks = m
+            .funcs
+            .iter()
+            .filter(|f| f.name.starts_with("$spawnthunk$"))
+            .count();
+        assert_eq!(
+            thunks, 1,
+            "one thunk for the shared fn(int64)->int64 signature"
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_bare_lambda_literal() {
+        // A bare lambda literal callee has no function-typed context at a spawn
+        // site (I#475): rejected with ZAP5076, bind it to a name first.
+        let errs = lower_errs("def main():\n    spawn (lambda: print(1))()\n");
+        assert!(
+            errs.iter().any(|e| e.code == zapc_diag::ErrorCode::ZAP5076),
+            "errs: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn spawn_rejects_keyword_and_arity() {
+        for src in [
+            // keyword argument
+            "def w(int64 a):\n    print(a)\ndef main():\n    spawn w(a=1)\n",
+            // too few positional arguments (no defaults in spawn)
+            "def w(int64 a):\n    print(a)\ndef main():\n    spawn w()\n",
+            // method arity mismatch
+            "struct W:\n    def run(self, int64 n):\n        print(n)\ndef main():\n    auto w = W()\n    spawn w.run()\n",
+        ] {
+            let errs = lower_errs(src);
+            assert!(
+                errs.iter()
+                    .any(|e| e.code == zapc_diag::ErrorCode::ZAP5076),
+                "expected ZAP5076 for:\n{src}\ngot: {errs:?}"
+            );
+        }
     }
 
     #[test]

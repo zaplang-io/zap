@@ -2953,7 +2953,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     self.array_binop(*op, *out, *lhs_dtype, *rhs_dtype, lv, rv, *scalar, fv)?;
                 vals[*dest as usize] = Some(res);
             }
-            Inst::Spawn { func, args, owner } => {
+            Inst::Spawn {
+                func,
+                args,
+                owner,
+                name,
+            } => {
                 // Launch a coroutine running `func(args...)` (ticket #25,
                 // D-0013). The evaluated arguments are copied into a
                 // GC-allocated closure whose layout is the callee's parameter
@@ -3035,9 +3040,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         let spawn = self.fns["zap_spawn_scoped"];
                         // A static C-string naming the spawn target, so a
                         // `ScopeTimeout` can report every outstanding coroutine by
-                        // name (D-0058 diagnostics / I#475).
+                        // name (D-0058 diagnostics / I#475). A method or
+                        // function-value spawn carries a readable `name` so the
+                        // report names the user's coroutine rather than the
+                        // mangled method symbol or the internal `$spawnthunk$…`.
+                        let display = name.as_deref().unwrap_or(func.as_str());
                         let name = b
-                            .build_global_string_ptr(func, "spawnname")
+                            .build_global_string_ptr(display, "spawnname")
                             .map_err(|e| e.to_string())?
                             .as_pointer_value();
                         b.build_call(

@@ -75,15 +75,24 @@ the spawning coroutine**, before the child starts, so argument evaluation cannot
 race with the parent continuing.
 
 ```python
-spawn worker(ch)             # launch; parent continues at once
-spawn server.handle(conn)    # intended: eagerly capture the receiver
-spawn (lambda: log(x))()     # intended: eagerly capture the closure
+spawn worker(ch)             # named function
+spawn server.handle(conn)    # user-struct method: receiver captured eagerly
+auto log_it = lambda: log(x)
+spawn log_it()               # first-class function value: closure captured eagerly
 ```
 
-Method/lambda/function-value capture and complete keyword/default handling are
-intended capabilities whose implementation is still tracked by #475. Current
-lowering handles named functions with all arguments supplied positionally; the
-existing semantic diagnostic identifies that implementation gap.
+Three callable forms are supported (D-0118): a named function, a user-struct
+method call (desugared to a named spawn of the mangled method with the receiver
+as argument 0), and a first-class function value of `fn(...)->...` type — a bound
+lambda, a closure, or a function value (lowered through a per-signature thunk that
+performs the indirect call). The receiver, arguments, and closure are captured
+eagerly in the parent; a value-struct receiver/argument is copied so it outlives
+the spawning frame, and a reference/closure capture is a GC pointer traced through
+the spawn environment. All forms are **positional-only** (no keyword, spread, or
+default filling). A bare lambda *literal* operand (`spawn (lambda: ...)()`) is
+rejected (`ZAP5076`): a lambda has no type without a function-typed context, so
+bind it to a name first. An arity mismatch, a keyword/spread argument, and a
+non-callable or non-struct-method operand are also `ZAP5076`.
 
 `spawn` is a statement and yields no handle (fire-and-forget).
 Coordination is explicit: results flow back over channels, and completion is

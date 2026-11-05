@@ -3406,20 +3406,48 @@ impl Checker {
                 self.pop_scope();
             }
             Stmt::Spawn { call, .. } => {
+                // Supported `spawn` callable forms (I#475, D-0118), all with
+                // positional arguments only. sema has no first-class-function
+                // type (a lambda infers `Unknown`), so it classifies the callee
+                // structurally and leaves the precise `fn(...)` / method check to
+                // IR lowering, which emits the same `ZAP5076` for a form that
+                // slips through (e.g. `spawn n()` where `n` is not callable).
                 let supported = match call {
-                    Expr::Call { callee, args, .. } => match callee.as_ref() {
-                        Expr::Name(name, _) if self.lookup(name).is_none() => {
-                            self.sigs.get(name).is_some_and(|sig| {
-                                args.len() == sig.params.len()
-                                    && args.iter().all(|a| a.name.is_none())
-                            })
-                        }
-                        _ => false,
-                    },
+                    Expr::Call { callee, args, .. } => {
+                        let positional = args
+                            .iter()
+                            .all(|a| a.name.is_none() && a.spread == ArgSpread::None);
+                        positional
+                            && match callee.as_ref() {
+                                // A bare lambda literal has no function-typed
+                                // context at a spawn site; bind it to a name first.
+                                Expr::Lambda { .. } => false,
+                                // A local name is a possible first-class function
+                                // value (IR confirms its type); an unshadowed
+                                // top-level function must supply every parameter
+                                // positionally.
+                                Expr::Name(name, _) => {
+                                    self.lookup(name).is_some()
+                                        || self
+                                            .sigs
+                                            .get(name)
+                                            .is_some_and(|sig| args.len() == sig.params.len())
+                                }
+                                // A method call, or any other callable expression:
+                                // IR lowering confirms the receiver/value.
+                                _ => true,
+                            }
+                    }
                     _ => false,
                 };
                 if !supported {
-                    self.error(ErrorCode::ZAP5076, "spawn requires a named top-level function with all arguments supplied positionally".to_string(), expr_span(call));
+                    self.error(
+                        ErrorCode::ZAP5076,
+                        "spawn requires a named function, a user-struct method call, or a \
+                         first-class function value, with all arguments supplied positionally"
+                            .to_string(),
+                        expr_span(call),
+                    );
                 }
                 self.infer(call);
             }
@@ -7918,21 +7946,48 @@ def main():
 
     #[test]
     fn unsupported_spawn_forms_fail_in_sema() {
+        // Forms the sema gate rejects with ZAP5076 (I#475, D-0118): a bare lambda
+        // literal callee, a keyword argument, an arity mismatch against a named
+        // function, and a non-call operand.
         for call in [
-            "g()",
-            "(lambda: print(1))()",
-            "worker(value=1)",
-            "worker()",
-            "worker",
+            "(lambda: print(1))()", // bare lambda literal — bind it first
+            "worker(value=1)",      // keyword argument — spawn is positional-only
+            "worker()",             // too few positional arguments (no defaults)
+            "worker",               // not a call
         ] {
             let source = format!("def worker(int64 value=1):\n    print(value)\ndef main():\n    auto g = lambda: print(1)\n    spawn {call}\n");
             assert!(
                 errors(&source).iter().any(|e| e.code == ErrorCode::ZAP5076),
-                "{call}"
+                "expected ZAP5076 for: {call}"
             );
         }
+    }
+
+    #[test]
+    fn supported_spawn_forms_pass_sema() {
+        // The callable forms I#475 adds: a first-class function value held in a
+        // local, and a user-struct method call. sema has no function type (the
+        // lambda infers `Unknown`), so it accepts these structurally and leaves
+        // the precise check to IR lowering.
+        let fnvalue = "def worker(int64 value):\n    print(value)\ndef main():\n    auto g = lambda: print(1)\n    spawn g()\n";
+        assert!(
+            !errors(fnvalue).iter().any(|e| e.code == ErrorCode::ZAP5076),
+            "a function-value spawn is accepted by sema: {:?}",
+            errors(fnvalue)
+        );
         let method = "struct Worker:\n    def run(self):\n        print(1)\ndef main():\n    auto w = Worker()\n    spawn w.run()\n";
-        assert!(errors(method).iter().any(|e| e.code == ErrorCode::ZAP5076));
+        assert!(
+            !errors(method).iter().any(|e| e.code == ErrorCode::ZAP5076),
+            "a method spawn is accepted by sema: {:?}",
+            errors(method)
+        );
+        // A named top-level function with the full positional argument list.
+        let named = "def worker(int64 a):\n    print(a)\ndef main():\n    spawn worker(5)\n";
+        assert!(
+            !errors(named).iter().any(|e| e.code == ErrorCode::ZAP5076),
+            "a named-function spawn is accepted: {:?}",
+            errors(named)
+        );
     }
 
     #[test]

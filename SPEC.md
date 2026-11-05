@@ -1046,13 +1046,17 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
   cooperative; CPU loops must `checkpoint()`. `spawn detached <call>` opts out of
   scope ownership (daemon; Go exit semantics). The children receive `Cancelled`,
   which is outside `Exception`.
-- **Spawn call forms:** named functions, method calls such as
-  `spawn server.handle(conn)`, and immediate lambda calls such as
-  `spawn (lambda: log(x))()` are intended. Arguments and receiver/closure capture
-  are eager in the parent. **Implementation gap (#475):** method/lambda/function
-  value capture and full keyword/default handling remain outstanding; current
-  lowering supports fully supplied positional named-function calls. The existing
-  diagnostic marks this gap and does not remove these capabilities from the design.
+- **Spawn call forms (D-0118):** `spawn` accepts three callable forms — a named
+  function (`spawn worker(ch)`), a user-struct method call
+  (`spawn server.handle(conn)`), and a first-class function value (`spawn f(x)`,
+  where `f` is a variable, field, or expression of `fn(...)->...` type — a bound
+  lambda, a closure, or a function value). Arguments and the receiver/closure are
+  captured **eagerly in the parent** (so capture cannot race the child, D-0034). All
+  forms take **positional arguments only** — no keyword, spread, or default
+  filling. A bare lambda *literal* operand (`spawn (lambda: log(x))()`) is a compile
+  error (`ZAP5076`): a lambda has no type without a function-typed context, so bind
+  it to a name first (`auto log_it = lambda: log(x); spawn log_it()`). Keyword/spread
+  arguments, an arity mismatch, and a non-callable operand are also `ZAP5076`.
 - **Memory model (D-0034):** data-race-free programs are sequentially
   consistent; data races are bugs.
 
