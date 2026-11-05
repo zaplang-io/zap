@@ -696,6 +696,18 @@ define_codes! {
     ZAP6001 = 6001 : "lowering error",
         "The front-end accepted the program but it could not be lowered to IR. \
          The message gives the specific reason.";
+    ZAP6002 = 6002 : "re-raise outside a handler",
+        "A bare `raise` (re-raise the active exception) appears where no \
+         exception is being handled. A bare `raise` is only meaningful \
+         lexically inside an `except` handler, where it re-raises the exception \
+         that handler caught (#657, D-0116, Python parity D-0007). Unlike \
+         Python — which defers this to a runtime `RuntimeError: No active \
+         exception to re-raise` — Zap tracks the active exception lexically and \
+         per function, so it can reject the impossible cases at compile time: a \
+         bare `raise` in a `try` body, in an `else`/`finally`, at top level, or \
+         in a function merely *called* from a handler. Name the exception to \
+         raise (`raise E(...)`), or move the bare `raise` into the `except` \
+         block that should re-raise.";
 
     // ---- ZAP6xxx — package registry (Experimental, D-0070 §4; I#236) -------
     // The registry client is a host-side (back-end-category) tool surface; its

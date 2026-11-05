@@ -1946,6 +1946,16 @@ fn err(m: impl Into<String>) -> LowerError {
     }
 }
 
+/// A lowering error carrying a specific diagnostic code (most lowering errors
+/// use the generic [`err`] / ZAP6001 umbrella; a few, like the bare-`raise`
+/// re-raise-outside-handler case, ZAP6002, have a dedicated code).
+fn err_code(code: zapc_diag::ErrorCode, m: impl Into<String>) -> LowerError {
+    LowerError {
+        code,
+        message: m.into(),
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Decorators & annotations (ticket #16, D-0036)
 //
@@ -4922,6 +4932,14 @@ struct FnLower<'a> {
     /// body emitted no throwing call cannot raise, so its handler (and the
     /// `landingpad` that LLVM requires an `invoke` predecessor for) is omitted.
     used_lps: HashSet<BlockId>,
+    /// Stack of in-flight exception objects, one per `except` handler body
+    /// currently being lowered (innermost last). A bare `raise` (re-raise,
+    /// #657) re-throws the top entry — the exception the dynamically-enclosing
+    /// handler caught — preserving its type and identity. The stack is lexical
+    /// and per function: a bare `raise` with an empty stack (outside any
+    /// handler, or in a function merely called from one) is rejected at compile
+    /// time with ZAP6002 (D-0116) rather than Python's runtime `RuntimeError`.
+    active_exc: Vec<Value>,
     /// Stack of active `scope:` handles (innermost last), each the `ptr` value
     /// returned by `zap_scope_enter`. A `spawn` lowered while this is non-empty is
     /// owned by the top scope ([`Owner::Scope`]); a `spawn` at the root is
@@ -5045,6 +5063,7 @@ impl<'a> FnLower<'a> {
             scopes: vec![HashMap::new()],
             loops: Vec::new(),
             cleanups: Vec::new(),
+            active_exc: Vec::new(),
             term_set: HashSet::new(),
             landing_pads: Vec::new(),
             used_lps: HashSet::new(),
@@ -7242,7 +7261,25 @@ impl<'a> FnLower<'a> {
         cause: Option<&Expr>,
     ) -> Result<(), LowerError> {
         let Some(e) = value else {
-            return Err(err("bare 'raise' (re-raise) is not supported yet"));
+            // Bare `raise` (#657, D-0116): re-raise the exception the
+            // dynamically-enclosing `except` handler is handling, re-throwing
+            // the *same* in-flight object so its type and identity are
+            // preserved (traceback fidelity rides on the I#475 green-stack
+            // unwinder and is a follow-up). A `from <cause>` is syntactically
+            // impossible without a value, so there is none to attach.
+            let Some(&exc) = self.active_exc.last() else {
+                return Err(err_code(
+                    zapc_diag::ErrorCode::ZAP6002,
+                    "bare 'raise' is only valid inside an 'except' handler, \
+                     where it re-raises the exception being handled; there is \
+                     no active exception to re-raise here",
+                ));
+            };
+            self.throwing_call(None, "zap_raise", vec![exc]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+            return Ok(());
         };
         // `raise StopIteration` / `raise StopIteration()` (the Python iterator
         // end-of-iteration signal, D-0048) lowers to a panic carrying a sentinel
@@ -7831,9 +7868,17 @@ impl<'a> FnLower<'a> {
                 self.cleanups.push(Cleanup::Finally(f.clone()));
             }
             self.cleanups.push(Cleanup::EndCatch);
+            // Make the caught exception the active one for the duration of this
+            // handler body, so a bare `raise` (re-raise, #657) re-throws it.
+            // Nested constructs lowered inline (an inner `try`/`finally`) keep
+            // this entry visible, matching Python's dynamic "currently handled
+            // exception"; a sibling `else`/`finally` is lowered outside this
+            // window, where the stack is already popped.
+            self.active_exc.push(exc);
             for st in &clause.body.stmts {
                 self.stmt(st)?;
             }
+            self.active_exc.pop();
             self.landing_pads.pop();
             let handler_throws = self.used_lps.contains(&handler_lp);
             self.cleanups.truncate(cleanup_depth);

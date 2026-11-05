@@ -766,6 +766,154 @@ mod tests {
     }
 
     #[test]
+    fn lower_bare_reraise() {
+        // #657: a bare `raise` (re-raise the active exception) inside an
+        // `except` handler lowers to a re-throw of the *same* in-flight
+        // exception object the landing pad caught — preserving its type and
+        // identity, not degrading to a fresh base `Exception`. Before the fix
+        // this was rejected at lowering with ZAP6001 "bare 'raise' (re-raise)
+        // is not supported yet".  (The try body must be able to raise, else the
+        // handler is dead and pruned before the bare `raise` is reached.)
+        let m = lower_ok(
+            "def f(int64 x) -> int64:\n    \
+                 try:\n        \
+                     raise ValueError(\"boom\")\n    \
+                 except Exception:\n        \
+                     raise\n    \
+                 return x\n",
+        );
+        let text = format!("{m}");
+        // The re-raise re-throws through the shared `zap_raise` unwinding entry
+        // (the same path a `raise <obj>` inside a handler uses). Inside the
+        // handler body it is an `invoke` (an active landing pad is present).
+        assert!(
+            text.contains("invoke @zap_raise"),
+            "bare re-raise must re-throw via zap_raise, text:\n{text}"
+        );
+        assert!(text.contains("landingpad"), "text:\n{text}");
+        // It must NOT fabricate a fresh exception object — it reuses the caught
+        // one — so no extra `zap_exception_new`/`zap_panic` is emitted for the
+        // re-raise itself.
+        assert!(
+            !text.contains("zap_panic"),
+            "bare re-raise must not wrap in a fresh base Exception, text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lower_bare_reraise_with_binding() {
+        // #657: `except E as e:` then a bare `raise` re-raises the same caught
+        // object; the binding is unaffected and both forms are available.
+        let m = lower_ok(
+            "def f(int64 x) -> int64:\n    \
+                 try:\n        \
+                     raise ValueError(\"boom\")\n    \
+                 except Exception as e:\n        \
+                     print(e)\n        \
+                     raise\n    \
+                 return x\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("invoke @zap_raise"),
+            "bare re-raise (with binding) must re-throw via zap_raise, text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lower_bare_reraise_nested_handlers() {
+        // #657: a bare `raise` re-raises the *innermost* active exception. Both
+        // handlers' try bodies can raise, so neither handler is pruned; each
+        // bare `raise` re-throws its own caught object.
+        let m = lower_ok(
+            "def f(int64 x) -> int64:\n    \
+                 try:\n        \
+                     try:\n            \
+                         raise ValueError(\"inner\")\n        \
+                     except ValueError:\n            \
+                         raise\n    \
+                 except Exception:\n        \
+                     raise\n    \
+                 return x\n",
+        );
+        let text = format!("{m}");
+        // Two live re-raise sites (inner + outer handler).
+        assert!(
+            text.matches("@zap_raise").count() >= 2,
+            "nested handlers should emit two re-raise sites, text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lower_bare_reraise_outside_handler_rejected() {
+        // #657 edge case: a bare `raise` not lexically inside any `except`
+        // handler has no active exception to re-raise. Zap rejects it at
+        // compile time with a dedicated diagnostic (ZAP6002) rather than
+        // deferring to a runtime `RuntimeError` as Python does — it is
+        // statically provable here. This must be a clean error, never an ICE.
+        let (ast, _p, _l) = parse_str("def main():\n    raise\n");
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            errs.iter().any(|e| e.code == zapc_diag::ErrorCode::ZAP6002),
+            "bare raise outside a handler must be ZAP6002, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn lower_bare_reraise_in_try_body_rejected() {
+        // #657 edge case: a bare `raise` in the *try* body (not a handler) is
+        // also outside any active exception — rejected at compile time.
+        let (ast, _p, _l) = parse_str(
+            "def main():\n    \
+                 try:\n        \
+                     raise\n    \
+                 except Exception:\n        \
+                     print(\"x\")\n",
+        );
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            errs.iter().any(|e| e.code == zapc_diag::ErrorCode::ZAP6002),
+            "bare raise in a try body must be ZAP6002, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn lower_bare_reraise_in_separate_fn_rejected() {
+        // #657 edge case: active-exception tracking is lexical and
+        // per-function. A separate function called *from* a handler does not
+        // inherit the caller's active exception, so a bare `raise` in its body
+        // is rejected at compile time — Zap does not implement Python's
+        // dynamic, cross-call-frame re-raise in v1 (documented deviation).
+        let (ast, _p, _l) = parse_str(
+            "def helper():\n    \
+                 raise\n\
+             def main():\n    \
+                 try:\n        \
+                     print(\"x\")\n    \
+                 except Exception:\n        \
+                     helper()\n",
+        );
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            errs.iter().any(|e| e.code == zapc_diag::ErrorCode::ZAP6002),
+            "bare raise in a separate fn must be ZAP6002, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn lower_bound_raise_still_works() {
+        // #657 guard: the bound forms (`raise E(...)`, `raise "msg"`,
+        // `raise E(...) from e`) are unchanged by the bare-raise work.
+        lower_ok(
+            "def main():\n    \
+                 try:\n        \
+                     raise ValueError(\"boom\")\n    \
+                 except Exception as e:\n        \
+                     raise RuntimeError(\"wrapped\") from e\n",
+        );
+    }
+
+    #[test]
     fn lower_builtin_fault_catchable() {
         // #383: a built-in fault (index-out-of-range) inside a `try` lowers the
         // indexing to an `invoke` whose unwind edge is the handler, so the fault

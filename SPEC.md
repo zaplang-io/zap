@@ -966,6 +966,22 @@ finally:
   exception:`, then the new exception's section — matching CPython's explicit
   (`raise ... from`) chain. `from` is a contextual word, not a reserved keyword,
   so it remains usable as an ordinary identifier.
+- A bare `raise` (no operand) inside an `except` handler re-raises the exception
+  currently being handled, preserving its type and identity — the canonical
+  Python re-raise (#657, D-0116). It re-throws the very object the handler
+  caught, so a `ValueError` re-raised from an `except Exception` handler is
+  still caught by an enclosing `except ValueError` (and `except E as e` then
+  bare `raise` re-raises that same `e`). The innermost active exception is
+  re-raised: a bare `raise` in a nested handler re-raises that nested handler's
+  exception. Unlike Python, which defers an out-of-context bare `raise` to a
+  runtime `RuntimeError: No active exception to re-raise`, Zap tracks the active
+  exception lexically and per function and rejects the impossible cases at
+  compile time (ZAP6002): a bare `raise` in a `try` body, in an `else`/`finally`
+  that is not handling an exception, at top level, or in a function merely
+  *called* from a handler (Zap does not implement Python's dynamic,
+  cross-call-frame re-raise in v1). Full traceback preservation across the
+  re-raise rides on the green-stack unwinder (I#475) and is a follow-up; type
+  and value/identity are preserved today.
 
 ## 11. Resource cleanup (D-0027)
 

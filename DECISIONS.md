@@ -4571,3 +4571,62 @@ timing or heap bytes.
 out of the deferred set), PYTHON_DIFFERENCES (the `functools.cache` row),
 CHANGELOG, and this decision. Diagnostic **ZAP5056** added; **ZAP5055** keeps
 `@inject` only.
+
+## D-0116 — Bare `raise` (re-raise) in an `except` handler (I#657, Python parity D-0007)
+
+**Status:** Accepted. Implements the canonical Python re-raise, closing a
+language-parity gap under the locked D-0007 exception model.
+
+**Context.** `raise EXPR` (and `raise EXPR from cause`, D-0103) already lowered,
+but a **bare `raise`** — re-raise the exception currently being handled — was
+rejected at AST→ZIR lowering with the generic `ZAP6001` umbrella ("bare 'raise'
+(re-raise) is not supported yet"). Bare `raise` is the idiomatic Python
+re-raise and appears in the locked `design/0004-decorators.md` `retry` example
+(`if i == times - 1: raise`); the gap surfaced while implementing the
+behavioral-decorator `wrap(call)` form (#653), whose shipped goldens worked
+around it with the bound `raise e` form. It is a general `raise`-statement
+lowering gap, independent of decorators.
+
+**Decision.** A bare `raise` inside an `except` handler re-raises the exception
+that handler caught, **preserving its type and value/identity**. It re-throws
+the *same* in-flight exception object the landing pad holds — through the shared
+`zap_raise` unwinding entry, the exact path a bound `raise <obj>` inside a
+handler uses — so no fresh base `Exception` is fabricated. This is strictly more
+faithful than the bound `raise e` workaround, which re-wraps the handler's
+message string in a base `Exception` and loses the original type.
+
+- **Innermost wins.** The lowerer tracks a per-function stack of the exception
+  objects for the handler bodies currently being lowered (pushed for the
+  duration of each `except` body, including constructs lowered inline within it
+  — an inner `try`/`finally`). A bare `raise` re-raises the top entry, i.e. the
+  innermost dynamically-enclosing handler's exception, matching Python's
+  "currently handled exception". A bare `raise` in an inner `finally` that runs
+  while an outer handler is active re-raises the outer handler's exception
+  (Python-correct).
+
+- **No active exception → compile error (ZAP6002), not a runtime error.** Python
+  defers an out-of-context bare `raise` to a runtime `RuntimeError: No active
+  exception to re-raise`. Zap's active-exception tracking is **lexical and per
+  function**, which makes the impossible cases statically provable, so Zap
+  rejects them at compile time with a dedicated diagnostic **ZAP6002**
+  ("re-raise outside a handler"): a bare `raise` in a `try` body, in an
+  `else`/`finally` not handling an exception, at top level, or in a function
+  merely *called* from a handler. This is a deliberate, safe deviation: it
+  cannot misfire (a bare `raise` that would reach a runtime error in Python is
+  simply caught earlier, with a clearer message), and it never ICEs or
+  miscompiles. The flip side is that Zap does **not** implement Python's
+  dynamic, cross-call-frame re-raise (a helper function bare-raising the
+  caller's in-flight exception) in v1; that would need a runtime
+  current-exception slot and is out of scope here.
+
+- **Traceback.** Type and value/identity are preserved now. Full traceback
+  fidelity across the re-raise rides on the green-stack unwinder (I#475) and is
+  a follow-up, consistent with the "(eventually) its traceback" note in #657.
+
+**Grammar.** Unchanged — `GRAMMAR.ebnf` already admits a bare `raise` (the
+operand after `raise` is optional); this was a lowering gap, not a syntax one.
+
+**Docs.** SPEC §10 (the re-raise form is now supported, with its semantics and
+the ZAP6002 cases), STABILITY (re-raise moved into the supported surface),
+CHANGELOG, and this decision. Diagnostic **ZAP6002** added; **ZAP6001** stays
+the generic lowering umbrella.
