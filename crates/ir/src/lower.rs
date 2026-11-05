@@ -5376,6 +5376,14 @@ impl<'a> FnLower<'a> {
         if self.ctx.is_value_struct(sid) {
             return; // inline value struct — not a shared heap object
         }
+        if self.ctx.name_is_shareable(&self.ctx.names[sid as usize]) {
+            // A `@shareable` / built-in-shareable struct (`Atomic`, `Mutex`,
+            // `Counter`, `Queue`, …) is an asserted-safe shared type, so — exactly
+            // as for a `@shareable` module global (the ZAP5125 exemption) — its
+            // field accesses are NOT instrumented; an `Atomic`/`concurrent`-cell
+            // guarded version stays clean by construction (#664, D-0113).
+            return;
+        }
         let label = format!("{}.{}", self.ctx.names[sid as usize], fname);
         let name = self.strconst(&label);
         let sub = self.iconst(Ty::I64, idx as i64);
