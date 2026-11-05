@@ -10278,6 +10278,12 @@ __attribute__((constructor)) static void zap_gc_register_statics(void) {
 #include "zapgc.inc.c"
 #endif
 
+/* Runtime data-race detector hooks (`--race`, #677, epic #665, D-0114). Slice 1
+ * no-op stubs, compiled unconditionally for both collectors (the detector is
+ * collector-independent). Only a `--race` build calls them; the symbols must
+ * link in that case. See zaprace.inc.c. */
+#include "zaprace.inc.c"
+
 /* ===========================================================================
  * stdlib: math + random (ticket #98, D-0056)
  * ---------------------------------------------------------------------------

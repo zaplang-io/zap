@@ -15,8 +15,15 @@ use zapc_syntax::ast::{
     UnOp as AstUn,
 };
 use zapc_syntax::fstring::{self, Align, FStringPart, FormatSpec};
+use zapc_syntax::span::Span;
 
 use crate::ir::*;
+
+/// The synthetic function that runs every module-level global initializer once
+/// before `main` (D-0112). Its body is the single-threaded init pre-pass, which
+/// is exempt from the `--race` sharing-access instrumentation (#677): no
+/// coroutine exists yet, so an init-time read/write cannot race.
+const INIT_GLOBALS_FN: &str = "__zap_init_globals";
 // `LowerError` lives in `zapc_mono` with monomorphization (#129). Re-export it
 // at `crate::lower::LowerError` so the stdlib module lowerers (`modules/*.rs`,
 // `use crate::lower::LowerError`) and `zapc_ir::lower::LowerError` are unchanged.
@@ -339,6 +346,24 @@ struct StructCtx {
     /// into this vec is the `idx` carried by [`ir_core::Inst::GlobalAddr`] and
     /// [`ir_core::Module::globals`].
     globals: RefCell<Vec<GlobalVar>>,
+    /// Parallel to [`globals`]: whether each module global is *race-instrumented*
+    /// under `--race` (#677, epic #665, D-0114) — i.e. a MUTABLE, non-`@shareable`
+    /// module global (scalar or reference). This is exactly the ZAP5125
+    /// sharing-lint set (#664): a `const` global cannot race, and a `@shareable`
+    /// cell (user struct or a [`BUILTIN_SHAREABLE_TYPES`] type) is asserted safe,
+    /// so neither carries a `true` here. Computed once, at slot registration in
+    /// [`lower_init_globals`], mirroring sema's `declared_type_is_shareable`.
+    global_racy: RefCell<Vec<bool>>,
+    /// User `struct`s marked `@shareable` (#664, D-0113), by type name. The race
+    /// instrumentation (like the sharing lint) treats a mutable module global of
+    /// such a type as an asserted-safe cell and never instruments it. Built-in
+    /// shareable types (`Atomic`/`Mutex`/… in [`BUILTIN_SHAREABLE_TYPES`]) carry
+    /// the marker implicitly and are recognized by [`StructCtx::name_is_shareable`].
+    shareable_types: HashSet<String>,
+    /// Whether the runtime data-race detector (`--race`, #665, D-0114) is on for
+    /// this lowering. When `false` (the default) lowering emits ZERO race hooks,
+    /// so the output is byte-identical to a non-`--race` build (golden-safe).
+    race: bool,
 }
 
 /// One construction-time field validation constraint (`@validate`/`@range`,
@@ -626,15 +651,39 @@ impl StructCtx {
     }
 
     /// Register a module-level global slot (D-0112, #658 Phase 1), returning its
-    /// index. Called by the init pre-pass in declaration order.
-    fn add_global(&self, name: &str, ty: Ty) -> u32 {
+    /// index. Called by the init pre-pass in declaration order. `racy` records
+    /// whether the slot is race-instrumented under `--race` (#677): a mutable,
+    /// non-`@shareable` global — the ZAP5125 set (#664) — and `false` otherwise.
+    fn add_global(&self, name: &str, ty: Ty, racy: bool) -> u32 {
         let mut g = self.globals.borrow_mut();
         let idx = g.len() as u32;
         g.push(GlobalVar {
             name: name.to_string(),
             ty,
         });
+        self.global_racy.borrow_mut().push(racy);
         idx
+    }
+
+    /// Is a type named `name` `@shareable` (#664, D-0113)? Mirrors sema's
+    /// `name_is_shareable`: a user `struct` marked `@shareable`, or one of the
+    /// built-in concurrency primitives / concurrent collections that carry the
+    /// marker implicitly ([`BUILTIN_SHAREABLE_TYPES`]). The one rule the race
+    /// instrumentation and the sharing lint both consult, so their scopes match.
+    fn name_is_shareable(&self, name: &str) -> bool {
+        self.shareable_types.contains(name) || zapc_syntax::BUILTIN_SHAREABLE_TYPES.contains(&name)
+    }
+
+    /// The slot index of `name` iff it is a module global that `--race` should
+    /// instrument (#677): it exists AND its [`global_racy`] bit is set (mutable +
+    /// non-`@shareable`). Shadowing by a local is a separate check the caller
+    /// makes (a local wins), so this consults only the module-global frame.
+    fn racy_global_idx(&self, name: &str) -> Option<u32> {
+        let g = self.globals.borrow();
+        g.iter()
+            .position(|v| v.name == name)
+            .filter(|&i| self.global_racy.borrow()[i])
+            .map(|i| i as u32)
     }
 
     /// Resolve a module-level global binding to its `(slot index, type)`, if any.
@@ -717,6 +766,19 @@ fn inplace_op_dunder(op: AstBin) -> Option<&'static str> {
 }
 
 pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
+    // The default path lowers WITHOUT race instrumentation, so existing callers
+    // and goldens are byte-for-byte unchanged (#677, epic #665): `--race` opts in
+    // through [`lower_module_opts`].
+    lower_module_opts(module, false)
+}
+
+/// Like [`lower_module`], but with the runtime data-race detector (`--race`,
+/// #665, D-0114; epic #661) controllable: when `race` is `true`, AST→ZIR
+/// lowering emits a `__zap_race_read` / `__zap_race_write` hook at every
+/// instrumented shared-memory access (the ZAP5125 set, #664). When `false`,
+/// emission is identical to today — no race hooks — so the `main` prologue and
+/// every golden stay byte-identical.
+pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<LowerError>) {
     // Prepend the built-in prelude (`Signal` enum, `MemStats` struct) so the
     // signals surface lowers through the ordinary enum/struct paths. Must match
     // the set sema sees (both call the same helper), ticket #77.
@@ -1087,6 +1149,25 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         }
     }
 
+    // User `@shareable` struct names (#664, D-0113), for the `--race`
+    // instrumentation predicate (#677): a mutable module global of such a type is
+    // an asserted-safe cell and is never instrumented, matching the ZAP5125 lint.
+    // Built-in shareable types are handled by `StructCtx::name_is_shareable`.
+    let shareable_types: HashSet<String> = module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ast::Item::Struct(s)
+                if s.decorators
+                    .iter()
+                    .any(|d| d.name == zapc_syntax::SHAREABLE_MARKER) =>
+            {
+                Some(s.name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
     let mut ctx = StructCtx {
         ids,
         names,
@@ -1114,6 +1195,9 @@ pub fn lower_module(module: &ast::Module) -> (Module, Vec<LowerError>) {
         json_field_opts,
         field_checks,
         globals: RefCell::new(Vec::new()),
+        global_racy: RefCell::new(Vec::new()),
+        shareable_types,
+        race,
     };
 
     // Signatures: top-level functions and struct methods (mangled `S__m`).
@@ -4441,7 +4525,7 @@ fn lower_fn(
         // raise inside an initializer unwinds to the top-level handler like any
         // other. Only `main` carries this (a REPL entry does not re-init).
         if is_main && b.ctx.has_globals() {
-            b.throwing_call(None, "__zap_init_globals", vec![]);
+            b.throwing_call(None, INIT_GLOBALS_FN, vec![]);
         }
         for st in &f.body.stmts {
             b.stmt(st)?;
@@ -4501,7 +4585,7 @@ fn lower_init_globals(
     ctx: &StructCtx,
 ) -> Result<Func, LowerError> {
     let mut b = FnLower::new(
-        "__zap_init_globals".to_string(),
+        INIT_GLOBALS_FN.to_string(),
         vec![],
         Ty::Void,
         false,
@@ -4511,7 +4595,11 @@ fn lower_init_globals(
     );
     for item in &module.items {
         let ast::Item::Stmt(Stmt::Let {
-            ty, name, value, ..
+            is_const,
+            ty,
+            name,
+            value,
+            ..
         }) = item
         else {
             continue;
@@ -4528,7 +4616,21 @@ fn lower_init_globals(
         };
         // A value struct is copied on binding (D-0051), like any `let`.
         let v = b.copy_if_value(v, declared, value);
-        let idx = ctx.add_global(name, declared);
+        // Does `--race` instrument accesses of this global (#677, epic #665)? It
+        // is the ZAP5125 sharing-lint set (#664): a MUTABLE, non-`@shareable`
+        // global. A `const` can never race; a `@shareable` cell (user struct or a
+        // `BUILTIN_SHAREABLE_TYPES` type) is asserted safe. Mirrors sema's
+        // `declared_type_is_shareable` — decided on the declared type's nominal
+        // base name, else the resolved type (a user struct → `Ty::Struct`).
+        let shareable = match ty {
+            Some(ast::Type::Named { name, .. }) => ctx.name_is_shareable(name),
+            _ => match declared {
+                Ty::Struct(sid) => ctx.name_is_shareable(&ctx.names[sid as usize]),
+                _ => false,
+            },
+        };
+        let racy = !is_const && !shareable;
+        let idx = ctx.add_global(name, declared, racy);
         let slot = b.new_value(Ty::Ptr);
         b.emit(Inst::GlobalAddr { dest: slot, idx });
         // Root a pointer slot before storing into it, so the referent survives a
@@ -5172,7 +5274,16 @@ impl<'a> FnLower<'a> {
     ///   a mutable binding by construction — and the one-time init store in
     ///   `lower_init_globals` deliberately does not route through here, keeping
     ///   startup consistent (no barrier before the collector/root table is live).
-    fn store_name(&mut self, name: &str, slot: Value, ty: Ty, v: Value) {
+    ///
+    /// Under `--race` (#677, epic #665) the same store is also a *write* access of
+    /// a shared global, so a `__zap_race_write` hook is emitted via
+    /// [`FnLower::emit_race_access`] — but on a BROADER predicate than the GC
+    /// barrier: the detector must catch a racing SCALAR global too (the canonical
+    /// `int64` counter), not just a pointer one, so the race hook fires for any
+    /// mutable non-`@shareable` global, independent of `ty.is_ptr()`. `span` is
+    /// the assignment target's source span, carried to the hook for the engine
+    /// (slice 2) to report the racing site.
+    fn store_name(&mut self, name: &str, slot: Value, ty: Ty, v: Value, span: Span) {
         self.store(slot, v);
         if ty.is_ptr() && self.lookup(name).is_none() && self.ctx.global(name).is_some() {
             self.emit(Inst::Call {
@@ -5181,6 +5292,52 @@ impl<'a> FnLower<'a> {
                 args: vec![slot],
             });
         }
+        self.emit_race_access(name, slot, true, span);
+    }
+
+    /// Emit a runtime data-race access hook (`--race`, #677, epic #665, D-0114)
+    /// for a read (`write == false`) or write (`write == true`) of the name
+    /// `name` through its resolved slot `slot`, when — and only when — the access
+    /// is in the ZAP5125 sharing-lint set (#664), so instrumentation scope
+    /// exactly matches lint scope:
+    /// - `--race` is on (otherwise nothing is emitted, keeping a non-`--race`
+    ///   build byte-identical / golden-safe);
+    /// - the access is NOT in the single-threaded module-init pre-pass
+    ///   (`@__zap_init_globals`), which runs before any coroutine exists;
+    /// - `name` is not shadowed by a local (`lookup` resolves to a local → skip,
+    ///   mirroring sema's `resolves_to_module_global`);
+    /// - `name` is a mutable, non-`@shareable` module global ([`racy_global_idx`]
+    ///   returns its slot index) — a `const` or a `@shareable` cell is excluded.
+    ///
+    /// The emitted call is `__zap_race_{read,write}(slot, name_id, line, col)`
+    /// (the same `Inst::Call` mechanism #663 uses for `zap_gc_write_barrier`),
+    /// where `name_id` is the global's slot index (a stable per-global id) and
+    /// `line`/`col` carry the access span's byte range for the engine (slice 2)
+    /// to resolve to a source location. The runtime entry points are no-op stubs
+    /// in this slice; the happens-before engine fills them in (#678).
+    fn emit_race_access(&mut self, name: &str, slot: Value, write: bool, span: Span) {
+        if !self.ctx.race || self.func.name == INIT_GLOBALS_FN {
+            return;
+        }
+        if self.lookup(name).is_some() {
+            return; // shadowed by a local — not the shared module global
+        }
+        let Some(idx) = self.ctx.racy_global_idx(name) else {
+            return; // not a global, or a `const` / `@shareable` one
+        };
+        let name_id = self.iconst(Ty::I64, idx as i64);
+        let line = self.iconst(Ty::I64, span.start as i64);
+        let col = self.iconst(Ty::I64, span.end as i64);
+        let func = if write {
+            "__zap_race_write"
+        } else {
+            "__zap_race_read"
+        };
+        self.emit(Inst::Call {
+            dest: None,
+            func: func.to_string(),
+            args: vec![slot, name_id, line, col],
+        });
     }
 
     /// The scope-stack index a fresh walrus binding (`name := expr`, #600) must
@@ -6241,7 +6398,7 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             Stmt::Assign { target, value, .. } => {
-                if let Expr::Name(n, _) = target {
+                if let Expr::Name(n, span) = target {
                     let (v, vt) = self.expr(value)?;
                     // A local slot, or a module-level mutable global's slot
                     // (D-0112, #662) — stored into identically.
@@ -6256,7 +6413,7 @@ impl<'a> FnLower<'a> {
                     let v = self.coerce(v, vt, ty);
                     // Value structs copy on assignment (D-0051).
                     let v = self.copy_if_value(v, ty, value);
-                    self.store_name(n, ptr, ty, v);
+                    self.store_name(n, ptr, ty, v, *span);
                     Ok(())
                 } else if let Expr::Attr { base, name, .. } = target {
                     let (bv, bty) = self.expr(base)?;
@@ -6315,7 +6472,7 @@ impl<'a> FnLower<'a> {
             Stmt::AugAssign {
                 target, op, value, ..
             } => {
-                if let Expr::Name(n, _) = target {
+                if let Expr::Name(n, span) = target {
                     // A local, or a module-level mutable global (D-0112, #662):
                     // read-modify-write through the same slot.
                     let (ptr, ty) = self
@@ -6344,7 +6501,7 @@ impl<'a> FnLower<'a> {
                         _ => self.binop(*op, cur, ty, rhs, rt)?,
                     };
                     let res = self.coerce(res, rty, ty);
-                    self.store_name(n, ptr, ty, res);
+                    self.store_name(n, ptr, ty, res, *span);
                     Ok(())
                 } else {
                     Err(err(
@@ -6612,13 +6769,13 @@ impl<'a> FnLower<'a> {
             return Ok(());
         }
         match e {
-            Expr::Name(n, _) => {
+            Expr::Name(n, span) => {
                 // A local, or a module-level mutable global (D-0112, #662).
                 let (ptr, dt) = self
                     .name_lvalue(n)
                     .ok_or_else(|| err(format!("unknown variable '{n}'")))?;
                 let v = self.coerce(val, ty, dt);
-                self.store_name(n, ptr, dt, v);
+                self.store_name(n, ptr, dt, v, *span);
                 Ok(())
             }
             Expr::Attr { base, name, .. } => {
@@ -9099,7 +9256,7 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, ty))
             }
-            Expr::Name(n, _) => {
+            Expr::Name(n, span) => {
                 if let Some((ptr, ty)) = self.lookup(n) {
                     return Ok((self.load(ptr, ty), ty));
                 }
@@ -9110,6 +9267,10 @@ impl<'a> FnLower<'a> {
                 if let Some((idx, ty)) = self.ctx.global(n) {
                     let slot = self.new_value(Ty::Ptr);
                     self.emit(Inst::GlobalAddr { dest: slot, idx });
+                    // Under `--race` (#677), a read of a mutable non-`@shareable`
+                    // global is an instrumented shared access (the read site the
+                    // ZAP5125 lint flags); a `const` global's read emits nothing.
+                    self.emit_race_access(n, slot, false, *span);
                     return Ok((self.load(slot, ty), ty));
                 }
                 // A bare top-level function used as a **value** (I#163): `g(f)`,
@@ -13504,7 +13665,7 @@ impl<'a> FnLower<'a> {
         vt: Ty,
         value_expr: &Expr,
     ) -> Result<(), LowerError> {
-        if let Expr::Name(n, _) = target {
+        if let Expr::Name(n, span) = target {
             // A local, or a module-level mutable global (D-0112, #662).
             let (ptr, ty) = self
                 .name_lvalue(n)
@@ -13514,7 +13675,7 @@ impl<'a> FnLower<'a> {
             }
             let cv = self.coerce(v, vt, ty);
             let cv = self.copy_if_value(cv, ty, value_expr);
-            self.store_name(n, ptr, ty, cv);
+            self.store_name(n, ptr, ty, cv, *span);
             Ok(())
         } else if let Expr::Attr { base, name, .. } = target {
             let (bv, bty) = self.expr(base)?;

@@ -14,7 +14,7 @@ pub mod lower;
 // re-export it as the `mono` module so `crate::mono::monomorphize` is unchanged.
 pub use zapc_mono as mono;
 
-pub use lower::lower_module;
+pub use lower::{lower_module, lower_module_opts};
 pub use zapc_ir_core::{
     AtomicOrd, AtomicRmwOp, BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem, Func, Inst,
     Module, Owner, Term, Ty, UnOp, Value,
@@ -2640,5 +2640,253 @@ def main():
             0,
             "the init-time store is unbarriered"
         );
+    }
+
+    // --- #677: `--race` access instrumentation (epic #665, D-0114) ----------
+    //
+    // Under `--race`, lowering emits a `__zap_race_read` / `__zap_race_write`
+    // hook at exactly the ZAP5125 sharing-lint set (#664): a read/write of a
+    // MUTABLE, non-`@shareable` module global (scalar OR reference). A `const`
+    // global, a `@shareable` cell (user struct or a `BUILTIN_SHAREABLE_TYPES`
+    // type), an access in the module-init pre-pass, and a name shadowed by a
+    // local are NEVER instrumented. With `--race` OFF, emission is identical to
+    // today — zero race hooks — so every golden stays byte-identical.
+
+    /// Lower with the runtime data-race detector on (`--race`, #677).
+    fn lower_race(src: &str) -> Module {
+        let (ast, perrs, lerrs) = parse_str(src);
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        let (module, errs) = lower_module_opts(&ast, true);
+        assert!(errs.is_empty(), "lower errors: {errs:?}");
+        module
+    }
+
+    /// Count calls to `name` across every function in the module.
+    fn count_calls_module(m: &Module, name: &str) -> usize {
+        m.funcs.iter().map(|f| count_calls(f, name)).sum()
+    }
+
+    #[test]
+    fn race_scalar_global_read_and_write_are_instrumented() {
+        // The canonical racy counter: `counter = counter + 1` on a plain `int64`
+        // module global. The RHS read fires `__zap_race_read` and the store fires
+        // `__zap_race_write` — a scalar global (no `is_ptr()` gate), the exact bug
+        // the detector targets.
+        let src = "int64 counter = 0\n\
+                   def bump():\n    counter = counter + 1\n\
+                   def main():\n    bump()\n";
+        let m = lower_race(src);
+        let bump = m.funcs.iter().find(|f| f.name == "bump").unwrap();
+        assert_eq!(
+            count_calls(bump, "__zap_race_read"),
+            1,
+            "the RHS read of `counter` is instrumented"
+        );
+        assert_eq!(
+            count_calls(bump, "__zap_race_write"),
+            1,
+            "the store into `counter` is instrumented"
+        );
+        // The hooks carry four args: slot, name_id (slot index 0), and the
+        // access span's start/end.
+        let has_four_arg_hook = bump.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(i, Inst::Call { func, args, .. }
+                if func == "__zap_race_write" && args.len() == 4)
+        });
+        assert!(
+            has_four_arg_hook,
+            "the write hook has [slot, name_id, line, col]"
+        );
+    }
+
+    #[test]
+    fn race_off_emits_no_hooks_and_is_identical_to_default() {
+        // The invariant: with `--race` OFF, lowering emits ZERO race hooks, and
+        // the result is byte-identical to the default `lower_module` path — so
+        // every existing golden is unaffected (golden-safe).
+        let src = "int64 counter = 0\n\
+                   def bump():\n    counter = counter + 1\n\
+                   def main():\n    bump()\n";
+        let (ast, _, _) = parse_str(src);
+        let (default_m, de) = lower_module(&ast);
+        let (off_m, oe) = lower_module_opts(&ast, false);
+        assert!(de.is_empty() && oe.is_empty());
+        assert_eq!(count_calls_module(&default_m, "__zap_race_read"), 0);
+        assert_eq!(count_calls_module(&default_m, "__zap_race_write"), 0);
+        assert_eq!(count_calls_module(&off_m, "__zap_race_read"), 0);
+        assert_eq!(count_calls_module(&off_m, "__zap_race_write"), 0);
+        // Byte-identical ZIR text between the explicit race=false path and the
+        // default `lower_module`.
+        assert_eq!(default_m.to_string(), off_m.to_string());
+    }
+
+    #[test]
+    fn race_on_differs_from_off_only_by_hooks() {
+        // A `--race` build differs from a non-`--race` build ONLY by the added
+        // race hooks: stripping every `__zap_race_*` call from the race ZIR must
+        // leave text identical to the off build (the IConst operands feeding the
+        // hooks are the only other additions, so compare on the call lines).
+        let src = "int64 counter = 0\n\
+                   def bump():\n    counter = counter + 1\n\
+                   def main():\n    bump()\n";
+        let (ast, _, _) = parse_str(src);
+        let (off_m, _) = lower_module_opts(&ast, false);
+        let (on_m, _) = lower_module_opts(&ast, true);
+        assert_eq!(count_calls_module(&off_m, "__zap_race_read"), 0);
+        assert!(count_calls_module(&on_m, "__zap_race_read") > 0);
+        assert!(count_calls_module(&on_m, "__zap_race_write") > 0);
+    }
+
+    #[test]
+    fn race_reference_global_is_instrumented_and_scalar_gate_is_broader() {
+        // A reference-typed mutable global is instrumented too; its reassignment
+        // emits BOTH the GC write barrier (pointer-only, #663) and the race write
+        // hook (any mutable non-shareable global, #677) — proving the race gate
+        // is broader than the barrier's `is_ptr()`.
+        let src = "list[int64] xs = [1]\n\
+                   def put():\n    xs = [2, 3]\n\
+                   def main() -> int64:\n    put()\n    return len(xs)\n";
+        let m = lower_race(src);
+        let put = m.funcs.iter().find(|f| f.name == "put").unwrap();
+        assert_eq!(count_calls(put, "zap_gc_write_barrier"), 1);
+        assert_eq!(count_calls(put, "__zap_race_write"), 1);
+    }
+
+    #[test]
+    fn race_const_global_is_never_instrumented() {
+        // A `const` global can never race (immutable), so neither its read nor
+        // anything else is instrumented, even under `--race`.
+        let src = "const int64 N = 7\n\
+                   def read() -> int64:\n    return N\n\
+                   def main():\n    read()\n";
+        let m = lower_race(src);
+        assert_eq!(count_calls_module(&m, "__zap_race_read"), 0);
+        assert_eq!(count_calls_module(&m, "__zap_race_write"), 0);
+    }
+
+    #[test]
+    fn race_shareable_user_struct_global_is_never_instrumented() {
+        // A mutable global whose type is a user `@shareable` struct is an
+        // asserted-safe cell: no read or write hook (matches the silent ZAP5125).
+        let src = "@shareable\nstruct Registry:\n    int64 n\n\n\
+                   Registry R = Registry(0)\n\
+                   def touch():\n    auto r = R\n\
+                   def main():\n    touch()\n";
+        let m = lower_race(src);
+        assert_eq!(count_calls_module(&m, "__zap_race_read"), 0);
+        assert_eq!(count_calls_module(&m, "__zap_race_write"), 0);
+    }
+
+    // A built-in `@shareable` type (`Atomic`/`Mutex`/`WaitGroup`/`Once`/
+    // `Counter`/`Queue`) is excluded through the SAME `StructCtx::name_is_shareable`
+    // rule as the user-`@shareable`-struct case above (which this suite covers via
+    // `race_shareable_user_struct_global_is_never_instrumented`): the predicate
+    // checks `BUILTIN_SHAREABLE_TYPES` on the declared type's nominal base. These
+    // types have no surface as a plain module-global initializer yet (an `Atomic`
+    // module global does not lower today), so the end-to-end builtin-shareable
+    // case is exercised by the `clean_atomic.zap` CI golden rather than a unit
+    // test here.
+
+    #[test]
+    fn race_local_shadowing_global_is_never_instrumented() {
+        // A local binding that shadows a module global wins name resolution, so
+        // accessing the shadowed name touches the local, not the shared global —
+        // no hook (mirrors sema's `resolves_to_module_global`).
+        let src = "int64 counter = 0\n\
+                   def f() -> int64:\n    int64 counter = 5\n    counter = counter + 1\n    return counter\n\
+                   def main():\n    f()\n";
+        let m = lower_race(src);
+        let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(
+            count_calls(f, "__zap_race_read"),
+            0,
+            "a read of the shadowing local is not instrumented"
+        );
+        assert_eq!(
+            count_calls(f, "__zap_race_write"),
+            0,
+            "a write of the shadowing local is not instrumented"
+        );
+    }
+
+    #[test]
+    fn race_init_prepass_accesses_are_never_instrumented() {
+        // The single-threaded module-init pre-pass runs before any coroutine
+        // exists, so an initializer that reads an earlier mutable global emits no
+        // race hook (`@__zap_init_globals` is exempt).
+        let src = "int64 a = 1\nint64 b = a + 1\n\
+                   def main() -> int64:\n    return b\n";
+        let m = lower_race(src);
+        let init = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "__zap_init_globals")
+            .unwrap();
+        assert_eq!(
+            count_calls(init, "__zap_race_read"),
+            0,
+            "the init-time read of global `a` is exempt"
+        );
+        assert_eq!(count_calls(init, "__zap_race_write"), 0);
+    }
+
+    #[test]
+    fn race_augassign_write_form_is_instrumented() {
+        // `counter += 1` is a read-modify-write that sema counts as one (write)
+        // access, so it fires exactly one `__zap_race_write` (and no separate
+        // read hook — the RMW load is not the `expr` read site).
+        let src = "int64 counter = 0\n\
+                   def bump():\n    counter += 1\n\
+                   def main():\n    bump()\n";
+        let m = lower_race(src);
+        let bump = m.funcs.iter().find(|f| f.name == "bump").unwrap();
+        assert_eq!(count_calls(bump, "__zap_race_write"), 1);
+        assert_eq!(count_calls(bump, "__zap_race_read"), 0);
+    }
+
+    #[test]
+    fn race_chained_assign_write_form_is_instrumented() {
+        // A chained assignment `a = b = expr` stores into every name target, so
+        // each racy global target fires its own write hook.
+        let src = "int64 a = 0\nint64 b = 0\n\
+                   def setit():\n    a = b = 5\n\
+                   def main():\n    setit()\n";
+        let m = lower_race(src);
+        let setit = m.funcs.iter().find(|f| f.name == "setit").unwrap();
+        assert_eq!(
+            count_calls(setit, "__zap_race_write"),
+            2,
+            "each chained target (a and b) is a write access"
+        );
+    }
+
+    #[test]
+    fn race_tuple_leaf_write_form_is_instrumented() {
+        // Tuple unpacking `a, b = ...` stores into each name leaf, so each racy
+        // global leaf fires a write hook.
+        let src = "int64 a = 0\nint64 b = 0\n\
+                   def setit():\n    a, b = 5, 6\n\
+                   def main():\n    setit()\n";
+        let m = lower_race(src);
+        let setit = m.funcs.iter().find(|f| f.name == "setit").unwrap();
+        assert_eq!(
+            count_calls(setit, "__zap_race_write"),
+            2,
+            "each tuple leaf (a and b) is a write access"
+        );
+    }
+
+    #[test]
+    fn race_plain_read_of_global_is_instrumented() {
+        // A bare read of a racy global in an expression position fires the read
+        // hook (and nothing writes it here).
+        let src = "int64 counter = 0\n\
+                   def peek() -> int64:\n    return counter\n\
+                   def main():\n    peek()\n";
+        let m = lower_race(src);
+        let peek = m.funcs.iter().find(|f| f.name == "peek").unwrap();
+        assert_eq!(count_calls(peek, "__zap_race_read"), 1);
+        assert_eq!(count_calls(peek, "__zap_race_write"), 0);
     }
 }

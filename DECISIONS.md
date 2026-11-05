@@ -4175,10 +4175,11 @@ the maintainer** (not unilaterally created).
   (`tests/race/`), with the expected report documented for the engine slice.
 
 **Deferred (recommended sub-issues under #665-as-epic):**
-1. **Access instrumentation.** Behind `--race`, emit `__zap_race_read` /
-   `__zap_race_write(slot, name, line, col)` calls at the ZAP5125 access sites
-   in lowering (`name_lvalue` / `store_name`), to no-op runtime stubs; ZIR unit
-   tests assert emitted/not-emitted == lint scope (host-testable).
+1. **Access instrumentation. ✅ Landed — I#677 (slice 1).** Behind `--race`,
+   emit `__zap_race_read` / `__zap_race_write(slot, name_id, line, col)` calls at
+   the ZAP5125 access sites in lowering (the `expr` global read / `store_name`
+   write), to no-op runtime stubs; ZIR unit tests assert emitted/not-emitted ==
+   lint scope (host-testable). See the slice-1 note below.
 2. **Happens-before engine.** The per-`G` vector clock (field on `G`), per-sync
    clocks, and the single-lock shadow-state check + report formatting + non-zero
    exit, in a new `zaprace.inc.c`; HB hooks at spawn and `Mutex` lock/unlock
@@ -4203,6 +4204,46 @@ tests cover `--race`/`-race` on run/build/ir/test, composition with other flags,
 off-by-default, and the `test --doc --race` rejection; `cargo build`/`test`,
 `cargo fmt --all`, and clippy are clean. No grammar/SPEC-legality change (CLI +
 runtime only). No core defects were uncovered.
+
+### Slice 1 landed — I#677 (access instrumentation)
+
+Behind `--race`, AST→ZIR lowering now emits a race access hook at exactly the
+ZAP5125 set, calling runtime functions that are **no-op stubs** for now (the
+happens-before engine is slice 2, #678). The flag, inert in v1, is now wired
+through lowering; the accepted-but-inert notice is removed.
+
+- **Emission predicate = lint scope.** A `__zap_race_read` is emitted at the
+  `expr` global-read site, and a `__zap_race_write` inside `store_name` (the four
+  name-target store sites: `=`, `+=`, chained, tuple-leaf), **iff** the name is a
+  **mutable, non-`@shareable` module global** (scalar *or* reference), is **not**
+  shadowed by a local, and the access is **not** in the single-threaded
+  module-init pre-pass (`@__zap_init_globals`). This mirrors sema's ZAP5125
+  predicate exactly (`share_lint_globals` ∧ `resolves_to_module_global` ∧
+  `scopes.len() > 1`), recorded per-global at slot registration as a `racy` bit
+  (`!const ∧ !shareable`). Crucially the gate is **broader than #663's write
+  barrier**: it fires for a scalar global too (the canonical `int64` counter
+  race), not only the pointer case `ty.is_ptr()` gates.
+- **ABI.** `__zap_race_{read,write}(void *slot, i64 name_id, i64 line, i64 col)`:
+  `slot` is the global's data-segment slot (the conflict location), `name_id` the
+  global's slot index (a stable id), and `line`/`col` the access span's byte
+  range for the engine to resolve to a source location. Emitted via the same
+  `Inst::Call` mechanism #663 uses for `zap_gc_write_barrier`; codegen declares
+  the externs next to it, **only** when the ZIR actually contains such a call.
+- **Runtime.** A new `zaprace.inc.c` (`#include`d unconditionally by `zaprt.c`)
+  defines both hooks as exported no-op stubs, collector-independent; slice 2
+  fills in the vector-clock engine there.
+- **Golden-safe invariant preserved.** With `--race` **off** lowering emits zero
+  hooks and codegen declares no externs, so the ZIR and the `main` prologue are
+  byte-identical to today (asserted by a unit test that compares the race-off ZIR
+  to the default `lower_module` output). A `--race` build differs only by the
+  added no-op calls.
+- **Tests.** Exhaustive host-safe ir unit tests (`crates/ir/src/lib.rs`) over
+  scalar/ref global, `const`, user `@shareable` struct, shadowing local,
+  init-prepass, and read vs each write form (plain/aug/chained/tuple); a
+  CI-gated golden (`crates/driver/tests/golden.rs`) that a `--race` build of each
+  `tests/race/*.zap` links and runs identically to a non-`--race` run (the stubs
+  are inert). Built-in-`@shareable` exclusion shares the `name_is_shareable` path
+  and is covered end-to-end by the `clean_atomic.zap` golden.
 
 ## D-0115 — `@cache` built-in: memoization as `zap expand`-visible Zap over module-level state (I#666, epic #661; supersedes the D-0109 `@cache` deferral)
 

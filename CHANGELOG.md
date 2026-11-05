@@ -58,12 +58,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   pthreads and `malloc`, not Zap's user-space coroutine scheduler and GC heap) —
   and scopes it to the ZAP5125 set (a mutable, non-`@shareable` module global), so
   an `Atomic`/`Mutex`/`@shareable`-guarded version is clean. The feature is being
-  delivered in slices: this release lands the design decision, the flag plumbed
+  delivered in slices: earlier work landed the design decision, the flag plumbed
   end-to-end, and the racy-vs-clean fixture pair (`tests/race/`) as the detector's
-  walled-garden spec; until the engine lands the flag is accepted but inert and
-  says so explicitly, so default builds and existing goldens are unaffected. The
-  access instrumentation and the happens-before engine are tracked follow-ups
-  under #665.
+  walled-garden spec. **Slice 1 (#677) now lands the access instrumentation:**
+  behind `--race`, AST→ZIR lowering emits a `__zap_race_read` / `__zap_race_write`
+  hook at exactly the ZAP5125 set (a mutable, non-`@shareable` module global —
+  scalar *or* reference; not a `const`, a `@shareable` cell, a shadowing local, or
+  the module-init pre-pass), calling runtime **no-op stubs** (`zaprace.inc.c`) for
+  now. With `--race` **off**, lowering emits nothing and the output is
+  byte-identical to before, so default builds and every golden are unaffected; a
+  `--race` build differs only by the inert calls. The happens-before / vector-clock
+  engine that makes the hooks report real races (and the remaining breadth) is the
+  tracked follow-up under #665 (#678).
 - **Concurrency-safety surface: `@shareable` + sharing lint** — the advisory
   surface for the light concurrency model (#664, D-0113; locked-design points
   4–5 of epic #661, building on the mutable globals from #662). `@shareable` is a

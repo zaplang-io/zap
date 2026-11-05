@@ -29,8 +29,8 @@ use inkwell::{
 };
 
 use zapc_ir::{
-    self as zir, lower_module, AtomicOrd, AtomicRmwOp, CastKind, CmpPred, Func, Inst, Owner, Term,
-    Ty,
+    self as zir, lower_module_opts, AtomicOrd, AtomicRmwOp, CastKind, CmpPred, Func, Inst, Owner,
+    Term, Ty,
 };
 use zapc_syntax::ast::Module as AstModule;
 
@@ -47,18 +47,25 @@ pub mod jit;
 
 /// A code-generation backend.
 pub trait Backend {
-    /// Compile a (type-checked) AST module to a native object file.
-    fn compile_object(&self, module: &AstModule, obj_path: &Path) -> Result<(), String>;
+    /// Compile a (type-checked) AST module to a native object file. `race`
+    /// enables the runtime data-race detector instrumentation (`--race`, #677).
+    fn compile_object(&self, module: &AstModule, obj_path: &Path, race: bool)
+        -> Result<(), String>;
 }
 
 /// The LLVM backend.
 pub struct LlvmBackend;
 
 impl Backend for LlvmBackend {
-    fn compile_object(&self, module: &AstModule, obj_path: &Path) -> Result<(), String> {
+    fn compile_object(
+        &self,
+        module: &AstModule,
+        obj_path: &Path,
+        race: bool,
+    ) -> Result<(), String> {
         let ctx = Context::create();
         let builder = ctx.create_builder();
-        let (llmod, tm) = build_llvm_module(&ctx, &builder, module, "zap", false)?;
+        let (llmod, tm) = build_llvm_module(&ctx, &builder, module, "zap", false, race)?;
         tm.write_to_file(&llmod, FileType::Object, obj_path)
             .map_err(|e| format!("failed to write object file: {}", e.to_string()))?;
         Ok(())
@@ -77,8 +84,9 @@ pub(crate) fn build_llvm_module<'ctx>(
     module: &AstModule,
     name: &str,
     jit: bool,
+    race: bool,
 ) -> Result<(LlvmModule<'ctx>, TargetMachine), String> {
-    let (zir_module, errs) = lower_module(module);
+    let (zir_module, errs) = lower_module_opts(module, race);
     if !errs.is_empty() {
         return Err(errs
             .iter()
@@ -127,6 +135,10 @@ const RUNTIME_C: &str = include_str!("zaprt.c");
 /// The precise Immix collector, `#include`d by `zaprt.c` under `ZAP_GC_IMMIX`
 /// (ticket #48). Written next to the runtime so the relative include resolves.
 const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
+/// The runtime data-race detector hooks (`--race`, #677, epic #665, D-0114),
+/// `#include`d unconditionally by `zaprt.c`. Written next to the runtime so the
+/// relative include resolves. Slice 1 no-op stubs; the engine fills them in (#678).
+const RUNTIME_RACE_C: &str = include_str!("zaprace.inc.c");
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
 /// unit so it links into the Windows program build AND compiles standalone in
@@ -160,12 +172,17 @@ const RUNTIME_NP_IOCP_H: &str = include_str!("zap_np_iocp.h");
 /// Linux 2023 (the AWS `provided.al2023` Lambda base), which a dynamically
 /// glibc-2.39-linked Ubuntu build cannot. `ZAP_PORTABLE=1` forces it on too, so
 /// a toolchain image / CI can default every build to portable without the flag.
-pub fn build_executable(module: &AstModule, out_path: &Path, portable: bool) -> Result<(), String> {
+pub fn build_executable(
+    module: &AstModule,
+    out_path: &Path,
+    portable: bool,
+    race: bool,
+) -> Result<(), String> {
     // `ZAP_PORTABLE` (any value) is an environment-level alias for `--portable`:
     // it lets a deployment image default all builds to the portable profile.
     let portable = portable || std::env::var_os("ZAP_PORTABLE").is_some();
     let obj_path = out_path.with_extension("o");
-    LlvmBackend.compile_object(module, &obj_path)?;
+    LlvmBackend.compile_object(module, &obj_path, race)?;
 
     // Write the runtime into a per-build temp dir and let cc compile + link it
     // in. The GC collector include is written alongside so `#include
@@ -176,6 +193,8 @@ pub fn build_executable(module: &AstModule, out_path: &Path, portable: bool) -> 
     std::fs::write(&rt_path, RUNTIME_C).map_err(|e| format!("failed to write runtime: {e}"))?;
     std::fs::write(build_dir.join("zapgc.inc.c"), RUNTIME_GC_C)
         .map_err(|e| format!("failed to write gc runtime: {e}"))?;
+    std::fs::write(build_dir.join("zaprace.inc.c"), RUNTIME_RACE_C)
+        .map_err(|e| format!("failed to write race runtime: {e}"))?;
 
     // Target-aware link step (ticket #199, platform epic #158 / Area A5). Today
     // codegen emits for the host triple only, so "Windows target" means "running
@@ -1361,6 +1380,38 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             // conservative Boehm build is an exported no-op). `@__zap_init_globals`
             // never calls it — the one-time init store needs no barrier.
             self.declare_rt("zap_gc_write_barrier", &[ptr.into()], None);
+        }
+        // Runtime data-race detector hooks (`--race`, #677, epic #665, D-0114):
+        // `void __zap_race_read/__zap_race_write(void *slot, i64 name_id, i64 line,
+        // i64 col)`. Lowering emits a call at every instrumented shared-global
+        // access (the ZAP5125 set) only under `--race`, so the externs are
+        // declared ONLY when the ZIR actually contains such a call. A non-`--race`
+        // build emits no race calls, so this adds nothing and the module stays
+        // byte-identical (golden-safe). No-op stubs in the runtime today (slice 1);
+        // the happens-before engine fills them in (#678).
+        let needs_race = m.funcs.iter().flat_map(|f| &f.blocks).any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::Call { func, .. }
+                        if func.as_str() == "__zap_race_read"
+                            || func.as_str() == "__zap_race_write"
+                )
+            })
+        });
+        if needs_race {
+            let ptr = self.ctx.ptr_type(AddressSpace::default());
+            let i64t = self.ctx.i64_type();
+            self.declare_rt(
+                "__zap_race_read",
+                &[ptr.into(), i64t.into(), i64t.into(), i64t.into()],
+                None,
+            );
+            self.declare_rt(
+                "__zap_race_write",
+                &[ptr.into(), i64t.into(), i64t.into(), i64t.into()],
+                None,
+            );
         }
         for (i, g) in m.globals.iter().enumerate() {
             let _ = &g.name;
