@@ -30,21 +30,31 @@ reference). An `Atomic`/`Mutex`/`@shareable`-guarded version is therefore clean.
 | `racy_counter.zap`     | plain `int64` module global | **none** | **RACE reported** (names `counter`, with location; non-zero exit) |
 | `racy_read_write.zap`  | plain `int64` module global | **none** (one coroutine writes, another reads) | **RACE reported** on `counter` (read/write race) |
 | `racy_write_write.zap` | plain `int64` module global | **none** (two coroutines write) | **RACE reported** on `counter` (write/write race) |
+| `racy_chan.zap`        | plain `int64` module global | **none** between the writers (each sends to `main` on a shared channel, unrelated to the race) | **RACE reported** on `counter` — a soundness guard that the channel edge does not fabricate a writer↔writer ordering |
 | `clean_mutex.zap`      | plain `int64` module global | shared `Mutex` | clean (lint still warns; detector precise → silent; prints `100000`) |
 | `clean_atomic.zap`     | `Atomic[int64]` cell        | atomic ops | clean (shareable type → not instrumented; prints `100000`) |
 | `clean_single.zap`     | plain `int64` module global | only one coroutine writes it | clean (no concurrent access — guards against false positives; prints `50000`) |
+| `clean_chan_rendezvous.zap` | plain `int64` module global | unbuffered **channel** send→recv (rendezvous) | clean (send happens-before recv orders the write before the read; prints `43`) |
+| `clean_chan_buffered.zap`   | plain `int64` module global | **channel** cap-8 buffered hand-off (ring reused ~125×) | clean (write precedes every send, read follows every recv; prints `1098`) |
+| `clean_waitgroup.zap`  | plain `int64` module global | **`WaitGroup`** `done`→`wait` (joiner is a coroutine) | clean (worker's write ordered before collector's read; prints `77`) |
+| `clean_once.zap`       | plain `int64` module global | **`Once`** `once_end`→`once_begin` | clean (single init write ordered before every reader; prints `246`) |
 
 `racy_counter.zap` + `clean_mutex.zap`/`clean_atomic.zap` together are the
 issue's **"Done when (v1)"** pair: the racy program is reported with a location,
 and a correctly `Mutex`/`Atomic`-guarded version is clean. The `racy_read_write`
 and `racy_write_write` variants widen the walled garden to both conflict kinds
 (a write concurrent with a read, and two concurrent writes), and
-`clean_single.zap` pins the no-false-positive guarantee.
+`clean_single.zap` pins the no-false-positive guarantee. The slice-3 `clean_*`
+fixtures each put **both** the synchronizing write and read in spawned
+coroutines, so each new happens-before edge is genuinely exercised (not masked by
+the still-untracked `main`); `racy_chan.zap` is the matching soundness guard that
+those edges stay precise and never hide a real race.
 
 The verdict is **schedule-independent**: a race is reported because there is no
 happens-before edge ordering the two accesses, not because a particular run
 happened to interleave them — so the report is a stable golden regardless of
-`MAXPROCS` or the collector.
+`MAXPROCS` or the collector. `race_detector_correct_under_parallelism` re-runs
+the whole suite under `ZAP_MAXPROCS=4` to pin that down.
 
 ## Status (delivery is sliced — see D-0114)
 
@@ -55,25 +65,34 @@ happened to interleave them — so the report is a stable golden regardless of
   `__zap_race_write` hook, calling runtime **no-op stubs** (`zaprace.inc.c`). The
   flag is no longer inert at the compiler level (the accepted-but-inert notice is
   gone).
-- **slice 2 — #678 (this slice):** the **happens-before / vector-clock engine**
-  replaces the stubs (`zaprace.inc.c`). Each coroutine carries a vector clock,
-  each `Mutex` a release/acquire clock, and each instrumented slot shadow state
-  (last write / read clocks). Happens-before edges are wired at **spawn**
-  (parent → child) and **`Mutex` lock/unlock** (acquire / release); `Atomic` is
-  clean by exemption (a `@shareable` cell is not instrumented). On a conflicting
-  access with no ordering edge the engine prints a report naming the global and
-  both accesses' source spans and exits non-zero (66). All six fixtures are now
-  CI-gated goldens (`race_detector_reports_races_and_clears_clean_programs` in
-  `crates/driver/tests/golden.rs`), run under both collectors: the three `racy_*`
-  fixtures assert a reported race on `counter`, the three `clean_*` a silent run
-  with the exact total. A single global detector lock serializes all engine
-  state (obvious correctness over speed; safe under `MAXPROCS>1`).
-- **deferred — slice 3 (tracked under #665 / #679):** breadth — channel /
-  `WaitGroup` / `Once` happens-before edges, tracking the main/native thread's
-  own accesses, shared heap-object instrumentation, richer multi-frame reports,
-  and `MAXPROCS>1` validation. (Because the main thread's accesses are not yet
-  tracked, the `WaitGroup`-joined `main` read in the `clean_*` fixtures stays
-  clean without a join edge.)
+- **slice 2 — #678:** the **happens-before / vector-clock engine** replaces the
+  stubs (`zaprace.inc.c`). Each coroutine carries a vector clock, each `Mutex` a
+  release/acquire clock, and each instrumented slot shadow state (last write /
+  read clocks). Happens-before edges wired at **spawn** (parent → child) and
+  **`Mutex` lock/unlock** (acquire / release); `Atomic` is clean by exemption. On
+  a conflicting access with no ordering edge the engine prints a report naming
+  the global and both accesses' source spans and exits non-zero (66). A single
+  global detector lock serializes all engine state (obvious correctness over
+  speed).
+- **slice 3 — #679 (this slice):** breadth + hardening. New happens-before edges,
+  all wired in the runtime (so a non-`--race` build stays byte-identical):
+  **channels** — a send → the matching receive, for both a rendezvous and a
+  buffered hand-off (keyed by the ring-buffer slot; the back-pressure edge is
+  omitted, the safe direction); **`WaitGroup`** — every `done()` → a `wait()`
+  that returns; **`Once`** — the winner's `once_end` → every other caller's
+  `once_begin` return. The single-lock engine is validated under
+  **`ZAP_MAXPROCS>1`** (true parallelism) across the whole suite
+  (`race_detector_correct_under_parallelism`), and the report now also names each
+  racing access's coroutine. `race_flag_is_honored_by_zapc_binary` is a host-safe
+  guard that `zapc ir --race` really emits a hook (a tripwire for the #678
+  dropped-flag silent no-op). **Still open** (tracked follow-ups): the
+  **main/native thread's** own accesses stay untracked — a genuine
+  main-vs-coroutine race is missed, and this is why the pre-slice-3
+  `WaitGroup`-joined `main` reads stay clean without a join edge; **shared
+  heap-object** instrumentation is split out as a **slice-4** phase of #665 (#684)
+  (shadow state on heap objects + field/element lowering is a materially larger,
+  GC-coupled change); and full **multi-frame stack traces** await the I#475
+  green-stack unwinder.
 
 Runtime goldens run only in CI (local Docker/LLVM are unavailable in this
 workspace), so the detector slices are validated there.

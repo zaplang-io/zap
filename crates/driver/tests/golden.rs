@@ -456,15 +456,70 @@ fn race_fixtures_present() {
         "racy_counter.zap",
         "racy_read_write.zap",
         "racy_write_write.zap",
+        "racy_chan.zap",
         "clean_mutex.zap",
         "clean_atomic.zap",
         "clean_single.zap",
+        "clean_chan_rendezvous.zap",
+        "clean_chan_buffered.zap",
+        "clean_waitgroup.zap",
+        "clean_once.zap",
     ] {
         assert!(
             names.iter().any(|n| n == want),
             "missing race fixture {want}; found {names:?}"
         );
     }
+}
+
+/// Flag-plumbing regression guard (#678/#679): the `zapc` binary MUST honor
+/// `--race` end-to-end. The #678 saga was a SILENT no-op — the thin `zapc` arg
+/// parser dropped `--race`, so instrumentation was never emitted and racy
+/// programs ran clean, yet every golden still "passed". This asserts, at the
+/// binary's own arg parser and WITHOUT LLVM (so it runs in the host gate, not
+/// only the codegen matrix), that `zapc ir --race` emits the `__zap_race_write`
+/// hook on a known-racy fixture and that a plain `zapc ir` emits none. A future
+/// regression that drops or mis-parses the flag fails loudly here rather than
+/// silently disabling the detector.
+#[test]
+fn race_flag_is_honored_by_zapc_binary() {
+    use std::process::Command;
+    // `zapc ir` is the front-end + lowering only (no LLVM, no linking, cannot
+    // hang), so a plain `.output()` is enough — no timeout harness, which keeps
+    // this guard host-runnable without the `codegen` feature.
+    let bin = env!("CARGO_BIN_EXE_zapc");
+    let fixture = race_dir().join("racy_counter.zap");
+
+    let with_out = Command::new(bin)
+        .arg("ir")
+        .arg("--race")
+        .arg(&fixture)
+        .output()
+        .expect("spawn zapc ir --race");
+    assert_eq!(
+        with_out.status.code(),
+        Some(0),
+        "`zapc ir --race` should succeed; stderr:\n{}",
+        String::from_utf8_lossy(&with_out.stderr)
+    );
+    let with_ir = String::from_utf8_lossy(&with_out.stdout);
+    assert!(
+        with_ir.contains("__zap_race_write"),
+        "`zapc ir --race` must emit a `__zap_race_write` hook on a racy fixture \
+         (flag dropped/mis-parsed? see #678); got IR:\n{with_ir}"
+    );
+
+    let without_out = Command::new(bin)
+        .arg("ir")
+        .arg(&fixture)
+        .output()
+        .expect("spawn zapc ir");
+    let without_ir = String::from_utf8_lossy(&without_out.stdout);
+    assert!(
+        !without_ir.contains("__zap_race_"),
+        "a plain `zapc ir` (no --race) must emit NO race hook (byte-identical-off \
+         invariant); got IR:\n{without_ir}"
+    );
 }
 
 /// The exact, deterministic total each `clean_*` fixture must print. These are
@@ -477,13 +532,18 @@ fn clean_expected_total(name: &str) -> Option<&'static str> {
         "clean_mutex.zap" => Some("100000"),
         "clean_atomic.zap" => Some("100000"),
         "clean_single.zap" => Some("50000"),
+        // Slice 3 (#679) breadth fixtures — channel / WaitGroup / Once edges.
+        "clean_chan_rendezvous.zap" => Some("43"),
+        "clean_chan_buffered.zap" => Some("1098"),
+        "clean_waitgroup.zap" => Some("77"),
+        "clean_once.zap" => Some("246"),
         _ => None,
     }
 }
 
-/// The happens-before engine's end-to-end verdicts (#678, slice 2). For each
-/// fixture: a plain `zap run` still exits 0 (the program is legal — the light
-/// model admits unsynchronized sharing), and `zap run --race` applies the
+/// Run one race fixture and judge the detector's end-to-end verdict (#678 engine,
+/// #679 breadth). A plain `zap run` still exits 0 (the program is legal — the
+/// light model admits unsynchronized sharing); `zap run --race` applies the
 /// detector:
 ///
 /// - `racy_*` — the detector REPORTS a data race on `counter` and exits
@@ -494,102 +554,135 @@ fn clean_expected_total(name: &str) -> Option<&'static str> {
 ///   never asserted (the run exits before it is printed, and it is a lost-update
 ///   nondeterministic value anyway).
 /// - `clean_*` — the detector stays SILENT: exit 0 and the exact expected total
-///   (`clean_expected_total`), identical to the non-`--race` baseline. The
-///   `WaitGroup`-joined `main` read of the global stays clean without a join
-///   edge because v1 tracks races between spawned coroutines, not the main
-///   thread's own accesses (slice 3, #679).
+///   (`clean_expected_total`), identical to the non-`--race` baseline.
+///
+/// `maxprocs`, when `Some`, is exported as `ZAP_MAXPROCS` to the compiled program
+/// (true OS-thread parallelism across the scheduler's Ms); `None` leaves the
+/// default. The verdict must be identical either way — the detector is
+/// schedule-independent, so parallelism never changes whether a program is
+/// reported racy or clean.
 ///
 /// Requires the `codegen` feature (compile + link + run); runs in CI under both
 /// collectors (the CI matrix builds the test binary with the precise Immix GC
 /// and with the conservative Boehm GC). Docker/LLVM is unavailable locally, so
 /// this leg is CI-only.
 #[cfg(feature = "codegen")]
-#[test]
-fn race_detector_reports_races_and_clears_clean_programs() {
+fn check_race_fixture(bin: &str, zap: &std::path::Path, maxprocs: Option<&str>) -> Outcome {
     use std::process::Command;
     let per_test = std::time::Duration::from_secs(60);
-    let bin = env!("CARGO_BIN_EXE_zapc");
-    run_goldens_parallel(race_fixtures(), |zap| {
-        let label = zap.display().to_string();
-        let name = zap
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    let label = zap.display().to_string();
+    let suffix = maxprocs
+        .map(|m| format!(" ZAP_MAXPROCS={m}"))
+        .unwrap_or_default();
+    let name = zap
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
 
-        // Baseline: a plain `zap run` (no instrumentation) — legal, exits 0.
-        let mut base = Command::new(bin);
-        base.arg("run").arg(zap);
-        let base_out = run_with_timeout(base, per_test, &format!("{label} (no --race)"));
-        if base_out.status.code() != Some(0) {
+    // Baseline: a plain `zap run` (no instrumentation) — legal, exits 0.
+    let mut base = Command::new(bin);
+    base.arg("run").arg(zap);
+    if let Some(m) = maxprocs {
+        base.env("ZAP_MAXPROCS", m);
+    }
+    let base_out = run_with_timeout(base, per_test, &format!("{label} (no --race{suffix})"));
+    if base_out.status.code() != Some(0) {
+        return Outcome::Failed(format!(
+            "non-race run of {name}{suffix} should exit 0, got {:?} (stderr:\n{})",
+            base_out.status.code(),
+            String::from_utf8_lossy(&base_out.stderr)
+        ));
+    }
+
+    // Instrumented: `zap run --race` — the detector's verdict.
+    let mut race = Command::new(bin);
+    race.arg("run").arg("--race").arg(zap);
+    if let Some(m) = maxprocs {
+        race.env("ZAP_MAXPROCS", m);
+    }
+    let race_out = run_with_timeout(race, per_test, &format!("{label} (--race{suffix})"));
+    let race_code = race_out.status.code();
+    let race_err = String::from_utf8_lossy(&race_out.stderr);
+    let race_out_s = String::from_utf8_lossy(&race_out.stdout);
+
+    if name.starts_with("racy_") {
+        // A race must be reported and the process must exit non-zero.
+        if race_code == Some(0) || race_code.is_none() {
             return Outcome::Failed(format!(
-                "non-race run of {name} should exit 0, got {:?} (stderr:\n{})",
-                base_out.status.code(),
-                String::from_utf8_lossy(&base_out.stderr)
+                "--race run of {name}{suffix} should REPORT a race and exit non-zero, got \
+                 {race_code:?}\n--- stderr ---\n{race_err}\n--- stdout ---\n{race_out_s}"
             ));
         }
-
-        // Instrumented: `zap run --race` — the detector's verdict.
-        let mut race = Command::new(bin);
-        race.arg("run").arg("--race").arg(zap);
-        let race_out = run_with_timeout(race, per_test, &format!("{label} (--race)"));
-        let race_code = race_out.status.code();
-        let race_err = String::from_utf8_lossy(&race_out.stderr);
-        let race_out_s = String::from_utf8_lossy(&race_out.stdout);
-
-        if name.starts_with("racy_") {
-            // A race must be reported and the process must exit non-zero.
-            if race_code == Some(0) || race_code.is_none() {
-                return Outcome::Failed(format!(
-                    "--race run of {name} should REPORT a race and exit non-zero, got {race_code:?}\
-                     \n--- stderr ---\n{race_err}\n--- stdout ---\n{race_out_s}"
-                ));
-            }
-            let lower = race_err.to_lowercase();
-            if !lower.contains("data race") || !lower.contains("counter") {
-                return Outcome::Failed(format!(
-                    "--race report of {name} must name a `data race` on `counter` \
-                     (location-tolerant); got stderr:\n{race_err}"
-                ));
-            }
-            return Outcome::Pass;
+        let lower = race_err.to_lowercase();
+        if !lower.contains("data race") || !lower.contains("counter") {
+            return Outcome::Failed(format!(
+                "--race report of {name}{suffix} must name a `data race` on `counter` \
+                 (location-tolerant); got stderr:\n{race_err}"
+            ));
         }
+        return Outcome::Pass;
+    }
 
-        if name.starts_with("clean_") {
-            // No race: exit 0 and the exact deterministic total.
-            if race_code != Some(0) {
-                return Outcome::Failed(format!(
-                    "--race run of clean fixture {name} must exit 0 (no false positive), \
-                     got {race_code:?}\n--- stderr ---\n{race_err}"
-                ));
-            }
-            // The deterministic total is the LAST line of stdout (clean_single
-            // also prints a line from its idle coroutine first), so assert the
-            // final line rather than the whole buffer.
-            let want = clean_expected_total(&name)
-                .expect("every clean_* fixture has a known total; add it to clean_expected_total");
-            let last = race_out_s.trim_end().lines().last().unwrap_or("");
-            if last != want {
-                return Outcome::Failed(format!(
-                    "--race run of {name} printed final line {last:?}, want {want:?}\n\
-                     --- full stdout ---\n{}\n--- stderr ---\n{race_err}",
-                    race_out_s.trim_end()
-                ));
-            }
-            // And identical to the no-`--race` baseline (deterministic program).
-            let base_so = String::from_utf8_lossy(&base_out.stdout);
-            if base_so.trim_end() != race_out_s.trim_end() {
-                return Outcome::Failed(format!(
-                    "--race changed stdout of {name}:\n--- no --race ---\n{}\n--- --race ---\n{}",
-                    base_so.trim_end(),
-                    race_out_s.trim_end()
-                ));
-            }
-            return Outcome::Pass;
+    if name.starts_with("clean_") {
+        // No race: exit 0 and the exact deterministic total.
+        if race_code != Some(0) {
+            return Outcome::Failed(format!(
+                "--race run of clean fixture {name}{suffix} must exit 0 (no false positive), \
+                 got {race_code:?}\n--- stderr ---\n{race_err}"
+            ));
         }
+        // The deterministic total is the LAST line of stdout (clean_single
+        // also prints a line from its idle coroutine first), so assert the
+        // final line rather than the whole buffer.
+        let want = clean_expected_total(&name)
+            .expect("every clean_* fixture has a known total; add it to clean_expected_total");
+        let last = race_out_s.trim_end().lines().last().unwrap_or("");
+        if last != want {
+            return Outcome::Failed(format!(
+                "--race run of {name}{suffix} printed final line {last:?}, want {want:?}\n\
+                 --- full stdout ---\n{}\n--- stderr ---\n{race_err}",
+                race_out_s.trim_end()
+            ));
+        }
+        // And identical to the no-`--race` baseline (deterministic program).
+        let base_so = String::from_utf8_lossy(&base_out.stdout);
+        if base_so.trim_end() != race_out_s.trim_end() {
+            return Outcome::Failed(format!(
+                "--race changed stdout of {name}{suffix}:\n--- no --race ---\n{}\n\
+                 --- --race ---\n{}",
+                base_so.trim_end(),
+                race_out_s.trim_end()
+            ));
+        }
+        return Outcome::Pass;
+    }
 
-        Outcome::Failed(format!(
-            "race fixture {name} is neither `racy_*` nor `clean_*`; name it so the \
-             detector golden knows the expected verdict"
-        ))
+    Outcome::Failed(format!(
+        "race fixture {name} is neither `racy_*` nor `clean_*`; name it so the \
+         detector golden knows the expected verdict"
+    ))
+}
+
+#[cfg(feature = "codegen")]
+#[test]
+fn race_detector_reports_races_and_clears_clean_programs() {
+    let bin = env!("CARGO_BIN_EXE_zapc");
+    run_goldens_parallel(race_fixtures(), |zap| check_race_fixture(bin, zap, None));
+}
+
+/// Hardening (#679): the same fixture set under `ZAP_MAXPROCS>1` — true OS-thread
+/// parallelism, so the scheduler runs coroutines on several Ms at once and the
+/// detector's single global `race_mu` is exercised under real contention. Every
+/// verdict must match the serial run (racy reported, clean silent with the same
+/// total): the single-lock engine is correct if and only if parallelism changes
+/// nothing. A regression here (a torn clock, a missed edge under contention)
+/// surfaces as a false positive on a clean fixture or a lost report on a racy
+/// one. CI-only (needs codegen); runs under both collectors via the matrix.
+#[cfg(feature = "codegen")]
+#[test]
+fn race_detector_correct_under_parallelism() {
+    let bin = env!("CARGO_BIN_EXE_zapc");
+    run_goldens_parallel(race_fixtures(), |zap| {
+        check_race_fixture(bin, zap, Some("4"))
     });
 }

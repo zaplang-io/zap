@@ -153,6 +153,12 @@ typedef struct {
     RaceVC r; /* r[g] = epoch of coroutine g's last read of this slot   */
     int64_t last_wgid, last_wline, last_wcol; /* most recent writer (report) */
     int64_t last_rgid, last_rline, last_rcol; /* most recent reader (report) */
+    /* Spawn-target name of the most recent writer/reader coroutine, for the
+     * report. `G.name` is a static C-string (a codegen global or runtime
+     * literal) valid for the process lifetime, so it is safe to retain without
+     * copying and never GC-traced. NULL for a coroutine with no recorded name. */
+    const char *last_wname;
+    const char *last_rname;
 } RaceSlot;
 
 static RaceSlot *race_slots = NULL;
@@ -191,29 +197,28 @@ static int64_t race_new_gid(void) {
     return id;
 }
 
-/* The currently-running coroutine's clock, or NULL when the running context is
- * the main/native thread (no `G`) or an as-yet-unregistered `G`. A NULL result
- * means "untracked": v1 tracks races BETWEEN spawned coroutines; the main
- * thread's own accesses are deferred to slice 3 (which is also why the clean
- * fixtures, whose `main` reads the global after a `WaitGroup` join, stay clean
- * without a join edge). Caller holds race_mu. */
-static RaceVC *race_cur_vc(G **out_g) {
-    M *m = cur_m;
-    G *g = m ? m->current : NULL;
-    if (out_g) {
-        *out_g = g;
-    }
+/* The clock for a specific coroutine `g`, or NULL for the main/native thread
+ * (no `G`), which stays untracked in this slice (so a clean fixture whose `main`
+ * reads a global after a `WaitGroup` join stays clean without a main-thread
+ * edge; a genuine main-vs-coroutine race is the documented v1/slice-3
+ * limitation). Factored out of `race_cur_vc` so the slice-3 happens-before edges
+ * (channel / `WaitGroup` / `Once`) can also reach a *parked* counterpart
+ * coroutine — a channel peer blocked in `copark`, a `wait()`er — that is not the
+ * one currently running. Assigns a dense gid (with a fresh own-component) the
+ * first time the engine sees `g`. Caller holds race_mu; MAY realloc `race_gvc`,
+ * so callers must re-take any `&race_gvc[...]` pointer AFTER this returns. */
+static RaceVC *race_vc_of_g(G *g) {
     if (!g) {
-        return NULL; /* main/native thread — untracked in v1 (slice 3, #679) */
+        return NULL; /* main/native thread — untracked (slice 3 keeps main out) */
     }
     if (g->race_gid < 0) {
         /* First time the engine sees this coroutine. `zap_race_on_spawn` assigns
          * the id (and the parent->child edge) when the spawn path is hooked; this
          * lazy init is the fallback for any spawn path not hooked, so a coroutine
-         * is tracked the moment it touches a shared global regardless of how it
-         * was created. A lazily-initialized clock has no inherited edges (fresh
-         * own component), which is conservative — it can only ever ADD ordering,
-         * never hide a race. */
+         * is tracked the moment it touches a shared global — or is reached by a
+         * slice-3 handoff edge — regardless of how it was created. A lazily
+         * initialized clock has no inherited edges (fresh own component), which is
+         * conservative: it can only ever ADD ordering, never hide a race. */
         int64_t id = race_new_gid();
         g->race_gid = id;
         race_vc_set(&race_gvc[id], id, 1);
@@ -222,6 +227,18 @@ static RaceVC *race_cur_vc(G **out_g) {
         return NULL; /* defensive: should never happen */
     }
     return &race_gvc[g->race_gid];
+}
+
+/* The currently-running coroutine's clock, or NULL when the running context is
+ * the main/native thread. A NULL result means "untracked". Caller holds
+ * race_mu. */
+static RaceVC *race_cur_vc(G **out_g) {
+    M *m = cur_m;
+    G *g = m ? m->current : NULL;
+    if (out_g) {
+        *out_g = g;
+    }
+    return race_vc_of_g(g);
 }
 
 /* Get-or-create the shadow state for `slot`. Caller holds race_mu. May realloc
@@ -291,17 +308,33 @@ static const char *race_name_of(int64_t name_id) {
  * never a heap address, pointer, or timing value — so a golden can assert it
  * without flaking. */
 static void race_report_and_exit(const char *kind, int64_t name_id, int64_t gid, int64_t line,
-                                 int64_t col, const char *prior_kind, int64_t pgid, int64_t pline,
-                                 int64_t pcol) {
+                                 int64_t col, const char *cur_name, const char *prior_kind,
+                                 int64_t pgid, int64_t pline, int64_t pcol, const char *prior_name) {
     const char *gname = race_name_of(name_id);
     fflush(stdout);
     fprintf(stderr, "==================\n");
     fprintf(stderr, "zap: data race detected on module global `%s` (--race, #665)\n", gname);
-    fprintf(stderr, "  %s by coroutine %lld at source bytes %lld..%lld\n", kind, (long long)gid,
-            (long long)line, (long long)col);
+    /* Each racing access names the coroutine (dense id + spawn-target function,
+     * when known) and the access-site source byte span. The coroutine function
+     * is a deterministic, address-free identifier, so it enriches the report
+     * without flaking a golden. Full per-access multi-frame stack traces need the
+     * green-stack unwinder that I#475 tracks as a follow-up and are deferred with
+     * it (see tests/race/README.md). */
+    if (cur_name) {
+        fprintf(stderr, "  %s by coroutine %lld (`%s`) at source bytes %lld..%lld\n", kind,
+                (long long)gid, cur_name, (long long)line, (long long)col);
+    } else {
+        fprintf(stderr, "  %s by coroutine %lld at source bytes %lld..%lld\n", kind, (long long)gid,
+                (long long)line, (long long)col);
+    }
     if (pgid >= 0) {
-        fprintf(stderr, "  previous %s by coroutine %lld at source bytes %lld..%lld\n", prior_kind,
-                (long long)pgid, (long long)pline, (long long)pcol);
+        if (prior_name) {
+            fprintf(stderr, "  previous %s by coroutine %lld (`%s`) at source bytes %lld..%lld\n",
+                    prior_kind, (long long)pgid, prior_name, (long long)pline, (long long)pcol);
+        } else {
+            fprintf(stderr, "  previous %s by coroutine %lld at source bytes %lld..%lld\n",
+                    prior_kind, (long long)pgid, (long long)pline, (long long)pcol);
+        }
     }
     fprintf(stderr, "  no happens-before edge orders these accesses\n");
     fprintf(stderr, "==================\n");
@@ -382,14 +415,15 @@ void __zap_race_read(void *slot, int64_t name_id, int64_t line, int64_t col) {
     /* write->read: a write by another coroutine that this one has not observed. */
     for (int64_t u = 0; u < s->w.len; u++) {
         if (u != gid && s->w.v[u] > race_vc_get(cvc, u)) {
-            race_report_and_exit("read", name_id, gid, line, col, "write", s->last_wgid,
-                                  s->last_wline, s->last_wcol);
+            race_report_and_exit("read", name_id, gid, line, col, g->name, "write", s->last_wgid,
+                                  s->last_wline, s->last_wcol, s->last_wname);
         }
     }
     race_vc_set(&s->r, gid, race_vc_get(cvc, gid));
     s->last_rgid = gid;
     s->last_rline = line;
     s->last_rcol = col;
+    s->last_rname = g->name;
     zap_np_unlock(&race_mu);
 }
 
@@ -407,22 +441,23 @@ void __zap_race_write(void *slot, int64_t name_id, int64_t line, int64_t col) {
     /* write->write: an unobserved write by another coroutine. */
     for (int64_t u = 0; u < s->w.len; u++) {
         if (u != gid && s->w.v[u] > race_vc_get(cvc, u)) {
-            race_report_and_exit("write", name_id, gid, line, col, "write", s->last_wgid,
-                                  s->last_wline, s->last_wcol);
+            race_report_and_exit("write", name_id, gid, line, col, g->name, "write", s->last_wgid,
+                                  s->last_wline, s->last_wcol, s->last_wname);
         }
     }
     /* read->write: an unobserved read by another coroutine (a write that is not
      * ordered after a concurrent reader still races). */
     for (int64_t u = 0; u < s->r.len; u++) {
         if (u != gid && s->r.v[u] > race_vc_get(cvc, u)) {
-            race_report_and_exit("write", name_id, gid, line, col, "read", s->last_rgid,
-                                  s->last_rline, s->last_rcol);
+            race_report_and_exit("write", name_id, gid, line, col, g->name, "read", s->last_rgid,
+                                  s->last_rline, s->last_rcol, s->last_rname);
         }
     }
     race_vc_set(&s->w, gid, race_vc_get(cvc, gid));
     s->last_wgid = gid;
     s->last_wline = line;
     s->last_wcol = col;
+    s->last_wname = g->name;
     zap_np_unlock(&race_mu);
 }
 
@@ -478,5 +513,149 @@ void zap_race_mutex_release(void *mu) {
          * epoch (standard release-increment; keeps critical sections distinct). */
         race_vc_set(cvc, g->race_gid, race_vc_get(cvc, g->race_gid) + 1);
     }
+    zap_np_unlock(&race_mu);
+}
+
+/* ---- slice 3 (#679): channel / WaitGroup / Once happens-before edges ------
+ *
+ * These widen the engine from the slice-2 minimum (spawn + `Mutex`) to the rest
+ * of the light model's synchronization. Like the `Mutex` edges they are
+ * RUNTIME-ONLY: the scheduler and the `sync.*` primitives call them directly
+ * (codegen emits nothing new), so a build without `--race` is byte-identical and
+ * these hooks are inert until an access hook / `__zap_race_register_global`
+ * arms the engine. All engine state stays under the single `race_mu`; the real
+ * happens-before ORDER comes from the primitive's own lock (the channel mutex,
+ * the `WaitGroup`/`Once` mutex) publishing before it wakes a waiter, exactly as
+ * the `Mutex` release/acquire pair does. */
+
+/* Generic release/acquire against a per-sync-object clock keyed by `key`, using
+ * the CURRENT coroutine's clock. `release_into` publishes (the object's clock
+ * learns everything the caller knows); `acquire_from` observes (the caller
+ * learns everything the object published). No release-increment: unlike a
+ * `Mutex`'s repeated critical sections, a `WaitGroup`/`Once` completion is a
+ * one-shot edge, so a plain join is exactly the guarantee. Caller holds
+ * race_mu. */
+static void race_release_into(const void *key) {
+    G *g = NULL;
+    RaceVC *cvc = race_cur_vc(&g);
+    if (cvc) {
+        RaceVC *sc = race_sync_vc(key);
+        race_vc_join(sc, cvc);
+    }
+}
+static void race_acquire_from(const void *key) {
+    G *g = NULL;
+    RaceVC *cvc = race_cur_vc(&g);
+    if (cvc) {
+        RaceVC *sc = race_sync_vc(key);
+        race_vc_join(cvc, sc);
+    }
+}
+
+/* Channel rendezvous (unbuffered, or the direct sender<->waiting-receiver
+ * hand-off a buffered channel also takes): the value carries a happens-before
+ * edge from the sending coroutine to the receiving one. `from_g`/`to_g` are the
+ * two `G`s identified at the hand-off (one is running, the other parked in
+ * `copark`); the receiver's clock learns everything the sender knew. A
+ * main/native-thread peer (`G*` NULL) is untracked and simply skipped. Both gids
+ * are assigned BEFORE either `&race_gvc[...]` is taken, because `race_vc_of_g`
+ * may realloc `race_gvc`. */
+void zap_race_chan_xfer(void *from_g, void *to_g) {
+    if (!race_enabled) {
+        return;
+    }
+    zap_np_lock(&race_mu);
+    G *fg = (G *)from_g;
+    G *tg = (G *)to_g;
+    (void)race_vc_of_g(fg); /* assign gids first (may realloc race_gvc) */
+    (void)race_vc_of_g(tg);
+    if (fg && tg && fg->race_gid >= 0 && tg->race_gid >= 0 && fg->race_gid < race_ngids &&
+        tg->race_gid < race_ngids && fg->race_gid != tg->race_gid) {
+        race_vc_join(&race_gvc[tg->race_gid], &race_gvc[fg->race_gid]);
+    }
+    zap_np_unlock(&race_mu);
+}
+
+/* Buffered hand-off. A value sits in a ring-buffer slot between its send and the
+ * matching receive, so the edge is split in two, keyed by the physical slot
+ * address (one live value per slot at a time; FIFO order means the k-th value
+ * sent is the k-th received):
+ *   - `buf_store` publishes the producer's clock into the slot (OVERWRITE, not
+ *     join, so the slot carries exactly this value's producer — a later reuse of
+ *     the same physical slot by a different value does NOT fabricate an edge from
+ *     the previous receiver, which would be unsound). `from_g` is the producer:
+ *     the running sender on a plain buffered send, or the parked sender whose
+ *     value a receiver pulls forward on a buffer refill.
+ *   - `buf_load` joins the slot's clock into the consuming coroutine.
+ * This establishes send-of-value-k -> receive-of-value-k. The weaker
+ * back-pressure edge (receive-k -> send-of-k+capacity) is deliberately NOT
+ * modeled: omitting a real edge can only make the detector MORE eager to report
+ * (never hide a race), which is the safe direction for a test-time tool. */
+void zap_race_chan_buf_store(void *slot, void *from_g) {
+    if (!race_enabled) {
+        return;
+    }
+    zap_np_lock(&race_mu);
+    RaceVC *fv = race_vc_of_g((G *)from_g);
+    if (fv) {
+        RaceVC *cell = race_sync_vc(slot);
+        race_vc_copy(cell, fv);
+    }
+    zap_np_unlock(&race_mu);
+}
+void zap_race_chan_buf_load(void *slot, void *to_g) {
+    if (!race_enabled) {
+        return;
+    }
+    zap_np_lock(&race_mu);
+    RaceVC *tv = race_vc_of_g((G *)to_g);
+    if (tv) {
+        RaceVC *cell = race_sync_vc(slot);
+        race_vc_join(tv, cell);
+    }
+    zap_np_unlock(&race_mu);
+}
+
+/* WaitGroup: every `done()` (the decrement, `add` with n < 0) publishes the
+ * caller's clock into the group's clock; every `wait()` that returns observes
+ * it. So all the `done()`s happen-before a `wait()` returns — the D-0032 /
+ * design-0005 WaitGroup guarantee. `add(+n)` does NOT publish (an incrementing
+ * `add` is not part of the join edge), keeping the edge precise. */
+void zap_race_wg_release(void *wg) {
+    if (!race_enabled) {
+        return;
+    }
+    zap_np_lock(&race_mu);
+    race_release_into(wg);
+    zap_np_unlock(&race_mu);
+}
+void zap_race_wg_acquire(void *wg) {
+    if (!race_enabled) {
+        return;
+    }
+    zap_np_lock(&race_mu);
+    race_acquire_from(wg);
+    zap_np_unlock(&race_mu);
+}
+
+/* Once: the winner's `once_end` publishes its clock (its initializer ran before
+ * it); every loser's `once_begin` that returns 0 — whether it parked until
+ * completion or arrived after — observes it. So the initializer happens-before
+ * every `once_begin` return past it. The winning `once_begin` (returns 1) needs
+ * no edge: it runs the initializer itself. */
+void zap_race_once_release(void *once) {
+    if (!race_enabled) {
+        return;
+    }
+    zap_np_lock(&race_mu);
+    race_release_into(once);
+    zap_np_unlock(&race_mu);
+}
+void zap_race_once_acquire(void *once) {
+    if (!race_enabled) {
+        return;
+    }
+    zap_np_lock(&race_mu);
+    race_acquire_from(once);
     zap_np_unlock(&race_mu);
 }

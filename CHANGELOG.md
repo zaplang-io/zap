@@ -80,10 +80,23 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   correctness over speed; safe under `MAXPROCS>1`). `tests/race/` gains a
   read/write and a write/write racy variant, and all six fixtures are CI-gated
   goldens under both collectors (`racy_*` report a race on `counter`; `clean_*`
-  run clean and print their exact total). The remaining breadth — channel /
-  `WaitGroup` / `Once` edges, the main thread's own accesses, shared heap objects,
-  and `MAXPROCS>1` validation — is the tracked slice-3 follow-up under #665
-  (#679).
+  run clean and print their exact total). **Slice 3 (#679) now widens the
+  detector:** happens-before edges are added for **channels** (a send → the
+  matching receive, for both an unbuffered/rendezvous and a buffered hand-off),
+  **`WaitGroup`** (every `done()` → a `wait()` that returns), and **`Once`** (the
+  winner's `once_end` → every other caller's `once_begin` return) — all wired in
+  the runtime, so a non-`--race` build stays byte-identical. The single-lock
+  engine is validated under **`ZAP_MAXPROCS>1`** (true parallelism) across the
+  whole fixture set (a second CI golden), and the race report now also names each
+  racing access's **coroutine function**. `tests/race/` gains `clean_chan_*`,
+  `clean_waitgroup`, `clean_once`, and `racy_chan` (a soundness guard that a
+  channel does not fabricate an edge between two coroutines racing on a global),
+  plus a host-safe guard that `zapc ir --race` actually emits a hook (tripwire
+  for a dropped-flag regression). The **main/native thread's own accesses** stay
+  untracked (a main-vs-coroutine race is missed; races between spawned coroutines
+  are caught), **shared heap objects** beyond module globals are split out as a
+  slice-4 phase (#684) of #665, and full multi-frame stack traces await the I#475
+  green-stack unwinder.
 - **Concurrency-safety surface: `@shareable` + sharing lint** — the advisory
   surface for the light concurrency model (#664, D-0113; locked-design points
   4–5 of epic #661, building on the mutable globals from #662). `@shareable` is a

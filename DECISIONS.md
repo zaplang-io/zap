@@ -4186,8 +4186,16 @@ the maintainer** (not unilaterally created).
    `zaprace.inc.c`; HB hooks at spawn and `Mutex` lock/unlock (enough for the
    #665 "Done when"); racy fixtures → reported with location, mutex/atomic-guarded
    → clean. CI-gated golden under both collectors. See the slice-2 note below.
-3. **Breadth.** Channels/`WaitGroup`/`Once` HB edges; shared heap-object
-   instrumentation; richer multi-frame reports; `MAXPROCS>1` validation.
+3. **Breadth. ✅ Landed (edges + hardening) — I#679 (slice 3).** Channel
+   (rendezvous + buffered), `WaitGroup` (`done`→`wait`) and `Once`
+   (`once_end`→every waiter) HB edges, all wired in the runtime; `MAXPROCS>1`
+   validation of the single-lock engine across the whole fixture set; a
+   deterministic report enrichment (each racing access also names its coroutine
+   function). **Shared heap-object instrumentation is split out** into its own
+   slice-4 issue (#684; shadow state on heap objects + field/element lowering is a
+   materially larger, GC-coupled change — "the big one" this issue flagged); see
+   the slice-3 note below. Full multi-frame green-stack traces depend on the
+   I#475 green-stack unwinder and are deferred with it.
 
 ### Done-when (v1, satisfied by this PR)
 
@@ -4300,6 +4308,79 @@ racy program is **reported with a source location** and exits non-zero, while a
   on `counter` (location-tolerant, no nondeterministic value) and exit non-zero;
   `clean_mutex` (100000), `clean_atomic` (100000), `clean_single` (50000) run
   clean and print their exact total.
+
+### Slice 3 landed — I#679 (detector breadth: channel / WaitGroup / Once edges, hardening)
+
+Widens the slice-2 engine from the minimal spawn + `Mutex` edge set to the rest
+of the light model's synchronization, plus hardening. All new edges are wired
+**entirely in the runtime** (the scheduler and `sync.*` primitives call the
+engine directly), so codegen emits nothing new and a non-`--race` build stays
+byte-identical; the hooks are inert until an access hook / register-global arms
+the engine, exactly like the slice-2 spawn/`Mutex` edges.
+
+- **Channels (scheduler, #47).** A send happens-before the matching receive.
+  - *Rendezvous* (unbuffered, or the direct sender↔waiting-receiver hand-off a
+    buffered channel also takes) transfers the sender coroutine's clock into the
+    receiver's at the hand-off (`zap_race_chan_xfer`).
+  - *Buffered* splits the edge across the physical ring-buffer slot: the producer
+    stamps the slot with its clock (`zap_race_chan_buf_store`, an **overwrite** so
+    a later reuse of the same slot fabricates no edge), the consumer joins it on
+    drain (`zap_race_chan_buf_load`). This models send-of-value-k → receive-of-k.
+    The weaker back-pressure edge (receive-k → send-of-k+capacity) is deliberately
+    **not** modeled: omitting a real edge only makes the detector more eager to
+    report, never hides a race — the safe direction for a test-time tool. (The
+    async-signal `chan_offer_word` delivery path is **not** hooked: taking
+    `race_mu` in a signal context is unsafe, and signal-delivered values are out
+    of scope.)
+- **`WaitGroup` (#103).** Every `done()` (the decrement) publishes the caller's
+  clock into the group (`zap_race_wg_release`); every `wait()` that returns
+  observes it (`zap_race_wg_acquire`, on both the fast path and the woken path).
+  So all `done()`s happen-before a `wait()` returns. An incrementing `add(+n)`
+  carries no edge.
+- **`Once` (#103).** The winner's `once_end` publishes its clock
+  (`zap_race_once_release`, before any loser is woken); every loser's
+  `once_begin` that returns 0 — whether it parked until completion or arrived
+  after — observes it (`zap_race_once_acquire`). So the initializer happens-before
+  every `once_begin` return past it. The winning caller needs no edge (it ran the
+  initializer itself).
+- **Parked-coroutine reach.** The slice-2 lazy-gid logic is factored into
+  `race_vc_of_g(G*)` so a hand-off edge can reach a *parked* counterpart (a
+  channel peer blocked in `copark`, a `wait()`er) that is not the running
+  coroutine. The **main/native thread stays untracked** (no `G`): this slice does
+  not add main-thread tracking, so a genuine main-vs-coroutine race remains the
+  documented v1 limitation, and the pre-slice-3 `clean_*` fixtures (whose `main`
+  reads after a join) stay clean for the same reason. The new `clean_*` fixtures
+  therefore put **both** the synchronizing write and read in spawned coroutines,
+  so each new edge is genuinely exercised rather than masked by an untracked
+  `main`.
+- **Hardening — `MAXPROCS>1`.** The single global `race_mu` is validated under
+  true OS-thread parallelism across the whole fixture set (a second golden runs
+  every fixture with `ZAP_MAXPROCS=4`). The verdict is schedule-independent, so a
+  parallel run must match the serial one exactly; the single lock is left as is
+  (correct and simplest — only a perf trade-off, acceptable for a test-time
+  tool).
+- **Hardening — reports.** The report now also names each racing access's
+  coroutine function (`G.name`, a deterministic address-free identifier) beside
+  its id and byte span. Full per-access **multi-frame stack traces** need the
+  green-stack unwinder tracked by I#475 and are deferred with it.
+- **Shared heap objects — SPLIT OUT.** Extending instrumentation beyond module
+  globals to heap objects (shadow state on object headers + instrumenting
+  field/element load/store in lowering) is a materially larger, GC-coupled change
+  — shadow keyed by heap address interacts with Immix evacuation (#120), and the
+  lowering touches many sites. Per this issue's own guidance ("the big one … may
+  itself be sub-sliced"), it is filed as its own **slice-4** issue of epic #665 (#684)
+  (one-issue-one-PR), where the "a shared-heap race is reported with a location"
+  done-when belongs. Nothing here works around its absence.
+- **Tests.** New `tests/race/` fixtures: `clean_chan_rendezvous` (43),
+  `clean_chan_buffered` (1098, cap-8 ring reused ~125×), `clean_waitgroup` (77,
+  a coroutine joiner), `clean_once` (246, guarded init read by two coroutines),
+  and `racy_chan` — a **soundness guard** that a channel present in a program does
+  not fabricate an edge between two coroutines that race on a global (the race
+  must still be reported). A second CI golden
+  (`race_detector_correct_under_parallelism`) runs the whole suite under
+  `ZAP_MAXPROCS=4`. A host-safe guard (`race_flag_is_honored_by_zapc_binary`)
+  asserts `zapc ir --race` emits a `__zap_race_write` hook and a plain `zapc ir`
+  emits none — a loud regression tripwire for the #678 dropped-flag silent no-op.
 
 ## D-0115 — `@cache` built-in: memoization as `zap expand`-visible Zap over module-level state (I#666, epic #661; supersedes the D-0109 `@cache` deferral)
 
