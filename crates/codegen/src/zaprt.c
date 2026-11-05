@@ -4626,6 +4626,12 @@ static void all_remove(G *g) {
 void zap_race_on_spawn(G *child);
 void zap_race_mutex_acquire(void *mu);
 void zap_race_mutex_release(void *mu);
+/* Shadow-table relocation hook (slice 4, #684): the precise Immix evacuator
+ * (`zap_evac_copy` in zapgc.inc.c, #included BEFORE zaprace.inc.c) calls this for
+ * every object it moves so a heap location's shadow follows the object through
+ * the copy. A no-op until the detector is armed, and never called by the
+ * non-moving Boehm backend. */
+void zap_race_on_move(void *old_payload, void *new_payload, int64_t size);
 /* Slice-3 (#679) happens-before edges. `chan_xfer` is a rendezvous hand-off
  * (sender `G` -> receiver `G`); `chan_buf_store`/`chan_buf_load` split a buffered
  * hand-off across a ring-buffer slot address; the `wg_*`/`once_*` pairs carry the

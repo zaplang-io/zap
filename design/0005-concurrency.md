@@ -363,7 +363,17 @@ A program whose conflicting accesses are all ordered by synchronization is
 **sequentially consistent** interleaving of its coroutines.
 A *data race* — two accesses to the same non-atomic location, at least one a
 write, not ordered by happens-before — is a **bug**; v1 gives it no defined
-meaning, and a race-detector tool (open issue) is the intended way to find them.
+meaning. The **`--race` detector** (D-0114, #665 — a Zap-native happens-before /
+vector-clock engine, off by default) is the way to find them at run time. Its
+coverage now spans both diagnosable location kinds: **module globals** (the
+ZAP5125 set — slices 1–3, #677/#678/#679) and **shared heap objects** — a
+`struct` field or a `list` element raced by two coroutines (slice 4, #684). Heap
+shadow state is keyed on the object's stable header identity plus a field/element
+index, so it survives precise-Immix evacuation (#120) — the detector stays
+collector-agnostic and correct across a moving GC. A `Mutex`-guarded or
+`concurrent`-collection-guarded shared heap mutation is clean. (dict/set element
+and interface/boxed-payload coverage, and full multi-frame stack traces via the
+I#475 green-stack unwinder, remain follow-ups.)
 
 Synchronization establishes **happens-before** edges:
 

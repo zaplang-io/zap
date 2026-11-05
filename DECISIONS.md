@@ -4196,6 +4196,17 @@ the maintainer** (not unilaterally created).
    materially larger, GC-coupled change — "the big one" this issue flagged); see
    the slice-3 note below. Full multi-frame green-stack traces depend on the
    I#475 green-stack unwinder and are deferred with it.
+4. **Shared heap objects. ✅ Landed — I#684 (slice 4).** Extends instrumentation
+   from the ZAP5125 module-global set to **shared heap objects**: user-source
+   struct-field and list-element load/store now emit the access hooks under
+   `--race`. Shadow state is keyed on the **stable object-header identity +
+   sub-index** (not the raw, relocatable field/element address), making it
+   survive precise-Immix evacuation (#120) by construction, with a
+   `zap_race_on_move` evacuator hook as the general relocation path; the slice-3
+   happens-before engine and single lock are unchanged. A shared-heap race
+   (list element or struct field) is now reported with a location and exits
+   non-zero; a `Mutex`/`concurrent`-collection-guarded one stays clean. See the
+   slice-4 note below.
 
 ### Done-when (v1, satisfied by this PR)
 
@@ -4381,6 +4392,87 @@ the engine, exactly like the slice-2 spawn/`Mutex` edges.
   `ZAP_MAXPROCS=4`. A host-safe guard (`race_flag_is_honored_by_zapc_binary`)
   asserts `zapc ir --race` emits a `__zap_race_write` hook and a plain `zapc ir`
   emits none — a loud regression tripwire for the #678 dropped-flag silent no-op.
+
+### Slice 4 landed — I#684 (shared heap-object instrumentation)
+
+Widens *what* is instrumented from the ZAP5125 module-global set to **shared heap
+objects**, without touching the slice-3 happens-before model. The hard part was
+not the lowering but keeping shadow state correct across a **moving GC**: the
+slice-2/3 engine keys shadow by a stable data-segment slot address, but a heap
+location's address is **not** stable — precise-Immix evacuation (#120) relocates
+objects, so an address-keyed shadow map would alias or lose state across a GC.
+
+- **Shadow key = stable object identity, not raw address.** The `RaceSlot`
+  conflict key becomes the pair **(`slot`, `sub`)**. For a heap access `slot` is
+  the **object header** pointer and `sub` the field/element index; for a module
+  global it stays the data-segment address with `sub = 0` (unchanged). Keying on
+  the header's identity is relocation-safe **by construction**: the v1 evacuator
+  moves only `zap_desc_atomic` **leaf buffers** (a container's backing buffer,
+  string / numeric-array data) — never the precise, marked-in-place header
+  object (user structs get a `ZAP_TD_PRECISE` descriptor; a `list`/`dict`/`set`
+  header has a pointer child, so it too is marked in place). So a `list`'s
+  backing buffer can be evacuated freely and `(list header, index)` is invariant
+  across the move — side-stepping the alias/loss hazard with **no object-header
+  surgery**.
+- **Why not a per-object header shadow word.** The alternative the issue floats —
+  a shadow word on the object header that the evacuator copies — was **rejected**:
+  the 16-byte object header is fully occupied (`desc|mark` in word 0, payload
+  `size` / forwarding-target in word 1), so adding a word is a core-GC **layout**
+  change (header size, 16-byte payload alignment, the Boehm layout, the
+  allocator, and line-marking). That is core-collector work beyond a tooling
+  slice; per the AGENTS.md golden rule we do **not** hand-roll header surgery the
+  GC is unaware of. Stable-identity keying needs none.
+- **Relocation path (`zap_race_on_move`), collector-agnostic.** As the general
+  mechanism (and the issue's requested "evacuator updates the side table on the
+  copy path"), the precise-Immix evacuator (`zap_evac_copy`) calls
+  `zap_race_on_move(old, new, size)` for **every** object it moves, before it
+  installs forwarding; the engine re-keys any shadow entry whose base lies in the
+  moved payload range by the move delta. Because the keyed bases are precise
+  headers / data-segment globals that v1 never moves, no entry is ever in a moved
+  range today, so it is a **no-op migration** in v1 — but it keeps the table
+  correct should the movable set ever widen to header objects, and it means the
+  detector *participates in every evacuation* while shadowed objects are live.
+  Boehm never moves, so never calls it: one definition, both collectors.
+- **Hook ABI (additive, off-path byte-identical).** New
+  `__zap_race_read_field` / `__zap_race_write_field(void *base, i64 sub,
+  ZapStr *name, i64 line, i64 col)`; `name` is a static string literal naming the
+  location (`Point.x`, `list element`) for the report. The module-global
+  `__zap_race_{read,write}` 4-arg hooks are unchanged, so the existing global
+  goldens' report text ("module global `…`") is untouched; heap reports read
+  "shared heap location `…`". Every new call still carries the `__zap_race_`
+  prefix, so the "race ZIR minus the race hooks == off ZIR" byte-identity
+  invariant holds and a non-`--race` build is unchanged.
+- **Instrumentation scope decision — INSTRUMENT-ALL, list + struct.** Lowering
+  emits the heap hooks at every **user-source** reference-struct field and
+  list-element load/store under `--race` (a *value* struct is inline/stack —
+  unshareable by reference — and is skipped; compiler-generated struct methods
+  like `__eq__`/display are not user accesses and are not instrumented). We chose
+  **instrument-all** over cross-coroutine escape analysis because `--race` is an
+  off-by-default, test-time diagnostic with a Go-class slowdown budget: soundness
+  over speed, and escape analysis is a separate, larger effort that risks **false
+  negatives** (missed races), which is worse than slow. An object only one
+  coroutine touches simply never conflicts (single-coroutine shadow) → no false
+  positive. **dict/set element** (key-based identity + rehash moving entries),
+  **numeric-array element**, and **interface/boxed payloads** are a recorded
+  **follow-up** (their stable key is the hash key, not a slot index — a distinct
+  design question), out of scope here; the Done-when surface (list element +
+  struct field) is covered.
+- **Granularity caveat.** A list element is keyed by its raw (pre-normalization)
+  index, so `xs[-1]` and `xs[len-1]` are distinct shadow keys for the one element
+  — a documented v1 limit (it can only *miss* a race via one odd mixed-index
+  pattern, never fabricate one).
+- **Tests.** New `tests/race/` fixtures: `racy_heap_list` and `racy_heap_struct`
+  (a shared list element / struct field raced by two coroutines → **reported**
+  with a location, non-zero exit), `clean_heap_mutex` (same list element behind a
+  shared `Mutex` → clean, 100000), `clean_heap_concurrent` (a shared
+  `concurrent.Counter`, a `@shareable` type → exempt from instrumentation → clean,
+  100000), and `clean_heap_evac` — the **relocation fixture**: a `Mutex`-guarded
+  shared list mutated while garbage churn + `gc.collect()` drive evacuation out
+  from under the running coroutines, so a shadowed object is live across a moving
+  GC; clean and deterministic (40000) under both collectors. All run under the
+  existing dual-collector and `ZAP_MAXPROCS=4` goldens. A shared-heap race being
+  reported with a location is the slice-3 "Done when" line that was deferred to
+  here. No core defects were uncovered.
 
 ## D-0115 — `@cache` built-in: memoization as `zap expand`-visible Zap over module-level state (I#666, epic #661; supersedes the D-0109 `@cache` deferral)
 

@@ -203,10 +203,11 @@ not supported — it may change in **any** release, including a PATCH:
   mode). The **concurrency-safety surface** (#664, D-0113) is now implemented
   too: the **`@shareable`** marker and the static **sharing lint** (`ZAP5125`,
   below). The runtime data-race detector (`--race`, #665, D-0114) now has its
-  CLI surface, design decision, and a live happens-before engine (slices 1–3,
-  #677/#678/#679) that reports racing shared-global accesses, with channel /
-  `WaitGroup` / `Once` edges and `MAXPROCS>1` validation; the main thread's own
-  accesses and shared heap objects remain tracked follow-ups.
+  CLI surface, design decision, and a live happens-before engine (slices 1–4,
+  #677/#678/#679/#684) that reports racing shared-global **and shared heap-object**
+  accesses (a `struct` field or `list` element), with channel / `WaitGroup` /
+  `Once` edges and `MAXPROCS>1` validation; the main thread's own accesses and
+  dict/set-element coverage remain tracked follow-ups.
   A module-level tuple-destructuring declaration is rejected
   (`ZAP3018`). The surface is expected to graduate to Stable, but is Experimental
   until then (§4).
@@ -228,16 +229,19 @@ not supported — it may change in **any** release, including a PATCH:
   off by default and, like the sharing lint, is a diagnostic that never changes
   what the language accepts. The design is settled (a Zap-native happens-before
   detector, scoped to the ZAP5125 shared-global set) and the engine is now
-  **live** (slices 1–3, #677/#678/#679): a vector-clock happens-before engine
-  reports a racing shared-global access with a source location and exits
-  non-zero, while `Atomic`/`Mutex`/channel/`WaitGroup`/`Once`-synchronized
-  programs are clean. Happens-before edges live: spawn, `Mutex` lock/unlock,
-  channel send/receive (rendezvous + buffered), `WaitGroup` `done`→`wait`, and
-  `Once` `once_end`→waiter; the engine is validated under `ZAP_MAXPROCS>1`.
-  Remaining follow-ups: the **main/native thread's** own accesses are untracked
-  (a main-vs-coroutine race is missed; races between spawned coroutines are
-  caught), **shared heap objects** beyond module globals are a split-out slice-4
-  phase (#684, epic #665), and full multi-frame stack traces await the I#475 unwinder. The
+  **live** (slices 1–4, #677/#678/#679/#684): a vector-clock happens-before engine
+  reports a racing shared-global **or shared heap-object** access with a source
+  location and exits non-zero, while `Atomic`/`Mutex`/channel/`WaitGroup`/`Once`-
+  and `concurrent`-collection-synchronized programs are clean. Happens-before
+  edges live: spawn, `Mutex` lock/unlock, channel send/receive (rendezvous +
+  buffered), `WaitGroup` `done`→`wait`, and `Once` `once_end`→waiter; the engine
+  is validated under `ZAP_MAXPROCS>1`. Heap coverage (slice 4) spans `struct`
+  fields and `list` elements, with shadow state keyed on the object's stable
+  header identity so it survives precise-Immix evacuation. Remaining follow-ups:
+  the **main/native thread's** own accesses are untracked (a main-vs-coroutine
+  race is missed; races between spawned coroutines are caught), **dict/set
+  element** and **interface/boxed-payload** heap coverage, and full multi-frame
+  stack traces await the I#475 unwinder. The
   flag name and its non-legality-changing, off-by-default semantics are expected
   to graduate to Stable; they are Experimental until then. The detector's report
   format is diagnostic output (below) and is not itself a covered surface — its

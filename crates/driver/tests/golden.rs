@@ -464,6 +464,11 @@ fn race_fixtures_present() {
         "clean_chan_buffered.zap",
         "clean_waitgroup.zap",
         "clean_once.zap",
+        "racy_heap_list.zap",
+        "racy_heap_struct.zap",
+        "clean_heap_mutex.zap",
+        "clean_heap_concurrent.zap",
+        "clean_heap_evac.zap",
     ] {
         assert!(
             names.iter().any(|n| n == want),
@@ -537,7 +542,24 @@ fn clean_expected_total(name: &str) -> Option<&'static str> {
         "clean_chan_buffered.zap" => Some("1098"),
         "clean_waitgroup.zap" => Some("77"),
         "clean_once.zap" => Some("246"),
+        // Slice 4 (#684) shared-heap fixtures.
+        "clean_heap_mutex.zap" => Some("100000"),
+        "clean_heap_concurrent.zap" => Some("100000"),
+        "clean_heap_evac.zap" => Some("40000"),
         _ => None,
+    }
+}
+
+/// The substring a `racy_*` fixture's `--race` report must contain — the KIND of
+/// location it races on (a module global names `counter`; a slice-4 shared heap
+/// object is reported as a `shared heap location`, i.e. `heap`) — so each fixture
+/// stays pinned to its own location while tolerating the exact source span.
+#[cfg(feature = "codegen")]
+fn racy_expected_token(name: &str) -> &'static str {
+    if name.starts_with("racy_heap") {
+        "heap"
+    } else {
+        "counter"
     }
 }
 
@@ -614,10 +636,14 @@ fn check_race_fixture(bin: &str, zap: &std::path::Path, maxprocs: Option<&str>) 
             ));
         }
         let lower = race_err.to_lowercase();
-        if !lower.contains("data race") || !lower.contains("counter") {
+        // Each racy fixture pins the KIND of location it must name (a module
+        // global -> `counter`; a shared heap object -> `heap`), while staying
+        // location-tolerant about the exact source span.
+        let token = racy_expected_token(&name);
+        if !lower.contains("data race") || !lower.contains(token) {
             return Outcome::Failed(format!(
-                "--race report of {name}{suffix} must name a `data race` on `counter` \
-                 (location-tolerant); got stderr:\n{race_err}"
+                "--race report of {name}{suffix} must name a `data race` mentioning \
+                 `{token}` (location-tolerant); got stderr:\n{race_err}"
             ));
         }
         return Outcome::Pass;
