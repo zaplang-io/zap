@@ -82,6 +82,19 @@ struct Mono<'a> {
     interfaces: HashMap<String, &'a InterfaceDef>,
     /// Free-function return types, for inference of `f(...)` results.
     func_ret: HashMap<String, Option<Type>>,
+    /// Module-level global bindings (epic #661 / D-0112): a top-level
+    /// `TYPE name = expr` (`const` or mutable) contributes its declared type
+    /// here. These are seeded into every function body's type environment (as an
+    /// outermost scope, so locals and params still shadow them) so that a method
+    /// call whose receiver is a bare module-global `Expr::Name` resolves the
+    /// receiver's concrete type exactly as it does for a local — which is what
+    /// drives receiver-type specialization (e.g. `dict.get`, generic methods).
+    /// Without this, a global's receiver is opaque and the specialization is
+    /// silently skipped (issue #671). Only globals with an explicit type
+    /// annotation are recorded; an `auto` global's type is inferred by sema but
+    /// not re-derived here, so it is left out (and falls back to the prior
+    /// opaque-receiver behavior).
+    globals: HashMap<String, Type>,
     /// Transparent type aliases (#606, D-0105): alias name -> (generic parameter
     /// names, target type). An alias is expanded to its target — with the
     /// parameters substituted — wherever a type is rewritten, so no alias head
@@ -369,6 +382,7 @@ impl<'a> Mono<'a> {
             enums: HashMap::new(),
             interfaces: HashMap::new(),
             func_ret: HashMap::new(),
+            globals: HashMap::new(),
             aliases: HashMap::new(),
             cyclic_aliases: HashSet::new(),
             spec_structs: Vec::new(),
@@ -431,6 +445,25 @@ impl<'a> Mono<'a> {
             }
         }
         m.compute_alias_cycles();
+        // Record module-level global bindings (epic #661 / D-0112) with their
+        // declared type (alias-expanded). A global is a single-name top-level
+        // `Stmt::Let`, `const` or mutable; tuple-destructuring at module scope is
+        // rejected earlier (ZAP3018). Only explicitly-typed globals are recorded
+        // (see the `globals` field doc). Collected first, then inserted, to keep
+        // the immutable `apply_subst` borrow off the mutated map.
+        let global_tys: Vec<(String, Type)> = module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Stmt(Stmt::Let {
+                    ty: Some(t), name, ..
+                }) => Some((name.clone(), m.apply_subst(t))),
+                _ => None,
+            })
+            .collect();
+        for (name, ty) in global_tys {
+            m.globals.insert(name, ty);
+        }
         m
     }
 
@@ -1050,6 +1083,15 @@ impl Mono<'_> {
         self.cur_ret = f.ret.as_ref().map(|t| self.apply_subst(t));
 
         let mut env = Env::default();
+        // Outermost scope: module-level globals (epic #661 / D-0112). Seeding
+        // them here — below the function's own scope — lets a receiver that is a
+        // bare module-global name resolve its declared type for receiver-type
+        // specialization (issue #671), while a local or parameter of the same
+        // name still shadows the global (inner scopes are searched first).
+        env.push();
+        for (name, ty) in &self.globals {
+            env.declare(name, CTy::Ty(ty.clone()));
+        }
         env.push();
         if let Some(st) = &self_ty {
             env.declare("self", CTy::Ty(st.clone()));
@@ -1070,6 +1112,7 @@ impl Mono<'_> {
         }
         let ret = f.ret.as_ref().map(|t| self.rewrite_type(t));
         let body = self.rewrite_block(&f.body, &mut env)?;
+        env.pop();
         env.pop();
 
         self.cur_ret = saved_ret;
@@ -3096,6 +3139,210 @@ mod tests {
         assert!(
             msg.contains("method 'show' has a mismatched signature"),
             "signature mismatch is reported, got: {msg}"
+        );
+    }
+
+    // ---- module-global receiver-type resolution (issue #671) --------------
+    //
+    // Receiver-type-driven specialization (the built-in `dict.get` rewrite, and
+    // generic-method dispatch) keys off the *concrete type* of the receiver.
+    // Mono learns a local's/parameter's type from the function's type
+    // environment; a module-level global (epic #661 / D-0112) was absent from
+    // that environment, so a global receiver read back as opaque and the rewrite
+    // was silently skipped — the bare `get` then reached lowering and was
+    // rejected (ZAP6001). Feeding module globals into the environment makes a
+    // global receiver resolve exactly as a local does. These tests pin the
+    // rewrite at the mono boundary (the specialized symbol must appear, the bare
+    // `get` must not); the golden suite covers the end-to-end runtime behavior.
+
+    /// Every method-call symbol `recv.NAME(...)` that appears anywhere in the
+    /// emitted module, in traversal order. Used to assert which specialized
+    /// `dict.get` variant mono chose (`get_default`, `get$Optional$V`) and that
+    /// no unspecialized bare `get` survived.
+    fn method_call_syms(m: &Module) -> Vec<String> {
+        fn walk_expr(e: &Expr, out: &mut Vec<String>) {
+            if let Expr::Call { callee, args, .. } = e {
+                if let Expr::Attr { base, name, .. } = callee.as_ref() {
+                    out.push(name.clone());
+                    walk_expr(base, out);
+                } else {
+                    walk_expr(callee, out);
+                }
+                for a in args {
+                    walk_expr(&a.value, out);
+                }
+                return;
+            }
+            // Recurse into the expression forms that can nest a call relevant to
+            // these fixtures (binary arithmetic such as `t.get(k, 0) + 1`, an
+            // index base/index, an attribute base, and a parenthesized/awaited
+            // child). The fixtures are small and deliberate, so this need not be
+            // exhaustive over every `Expr` variant.
+            match e {
+                Expr::Binary { lhs, rhs, .. } => {
+                    walk_expr(lhs, out);
+                    walk_expr(rhs, out);
+                }
+                Expr::Attr { base, .. } => walk_expr(base, out),
+                Expr::Index { base, index, .. } => {
+                    walk_expr(base, out);
+                    walk_expr(index, out);
+                }
+                _ => {}
+            }
+        }
+        fn walk_block(b: &Block, out: &mut Vec<String>) {
+            for st in &b.stmts {
+                match st {
+                    Stmt::Let { value, .. } => walk_expr(value, out),
+                    Stmt::Assign { target, value, .. } => {
+                        walk_expr(target, out);
+                        walk_expr(value, out);
+                    }
+                    Stmt::AugAssign { target, value, .. } => {
+                        walk_expr(target, out);
+                        walk_expr(value, out);
+                    }
+                    Stmt::Expr(e) => walk_expr(e, out),
+                    Stmt::If {
+                        branches,
+                        else_block,
+                        ..
+                    } => {
+                        for (c, body) in branches {
+                            walk_expr(c, out);
+                            walk_block(body, out);
+                        }
+                        if let Some(eb) = else_block {
+                            walk_block(eb, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for item in &m.items {
+            if let Item::Function(f) = item {
+                walk_block(&f.body, &mut out);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn module_global_dict_get_two_arg_specializes_to_get_default() {
+        // The issue's smallest repro: a two-arg `get` on a *mutable* module-
+        // global dict must rewrite to `get_default` (the plain-`V` form), just
+        // as it does on a local — not fall through as a bare `get`.
+        let m = mono_ok(
+            "dict[str, int64] t = {}\n\
+             def main():\n    t[\"a\"] = t.get(\"a\", 0) + 1\n    print(t[\"a\"])\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get_default"),
+            "two-arg get on a module global must specialize to get_default: {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|s| s == "get"),
+            "no unspecialized bare `get` may survive to lowering: {syms:?}"
+        );
+    }
+
+    /// Minimal stand-in for the prelude `Optional[T]` so the isolated mono unit
+    /// tests can exercise the one-arg `get` rewrite (which requests an
+    /// `Optional[V]` instance); the real compiler supplies this via the prelude.
+    const OPTIONAL: &str = "enum Optional[T]:\n    Some(T value)\n    None\n";
+
+    #[test]
+    fn module_global_dict_get_one_arg_specializes_to_optional_instance() {
+        // One-arg `get` on a module-global dict must encode the concrete
+        // `Optional[V]` instance into the symbol (`get$Optional$int64`).
+        let m = mono_ok(&format!(
+            "{OPTIONAL}dict[str, int64] t = {{}}\n\
+             def main():\n    Optional[int64] v = t.get(\"a\")\n    print(1)\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get$Optional$int64"),
+            "one-arg get on a module global must carry the Optional$int64 instance: {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|s| s == "get"),
+            "no unspecialized bare `get` may survive to lowering: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn const_module_global_dict_get_specializes_like_mutable() {
+        // A `const` module-global dict (#658) resolves its receiver type for
+        // specialization exactly as a mutable one (#662) does.
+        let m = mono_ok(
+            "const dict[str, int64] t = {\"a\": 5}\n\
+             def main():\n    print(t.get(\"a\", 0))\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get_default") && !syms.iter().any(|s| s == "get"),
+            "const module-global dict.get must specialize: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn local_dict_get_specialization_is_undisturbed() {
+        // Regression guard: feeding globals into the environment must not change
+        // the local path — the identical body on a local dict still specializes.
+        let m = mono_ok(
+            "def main():\n    dict[str, int64] t = {}\n\
+             \x20   t[\"a\"] = t.get(\"a\", 0) + 1\n    print(t[\"a\"])\n",
+        );
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get_default") && !syms.iter().any(|s| s == "get"),
+            "local dict.get must still specialize: {syms:?}"
+        );
+    }
+
+    #[test]
+    fn module_global_and_local_pick_the_same_specialization() {
+        // The whole point of the fix: a global receiver yields the *same* rewrite
+        // as the equivalent local, so behavior is identical. Both the global and
+        // local one-arg forms must select `get$Optional$int64`.
+        let global = method_call_syms(&mono_ok(&format!(
+            "{OPTIONAL}dict[str, int64] t = {{}}\n\
+             def main():\n    Optional[int64] v = t.get(\"a\")\n    print(1)\n"
+        )));
+        let local = method_call_syms(&mono_ok(&format!(
+            "{OPTIONAL}def main():\n    dict[str, int64] t = {{}}\n\
+             \x20   Optional[int64] v = t.get(\"a\")\n    print(1)\n"
+        )));
+        assert!(
+            global.iter().any(|s| s == "get$Optional$int64")
+                && local.iter().any(|s| s == "get$Optional$int64"),
+            "global and local must pick the same get$Optional$int64 rewrite: global={global:?} local={local:?}"
+        );
+    }
+
+    #[test]
+    fn a_local_shadows_a_module_global_in_receiver_resolution() {
+        // A local declaration of the same name shadows the global (D-0112): the
+        // receiver type — and hence the specialization — must come from the
+        // local (`dict[str, str]` -> `Optional$str`), never the global
+        // (`dict[str, int64]`). Inner environment scopes are searched first.
+        let m = mono_ok(&format!(
+            "{OPTIONAL}dict[str, int64] t = {{}}\n\
+             def main():\n    dict[str, str] t = {{}}\n\
+             \x20   Optional[str] v = t.get(\"a\")\n    print(1)\n"
+        ));
+        let syms = method_call_syms(&m);
+        assert!(
+            syms.iter().any(|s| s == "get$Optional$str"),
+            "the shadowing local dict[str,str] must drive the rewrite: {syms:?}"
+        );
+        assert!(
+            !syms.iter().any(|s| s == "get$Optional$int64"),
+            "the global's type must not leak past the shadowing local: {syms:?}"
         );
     }
 

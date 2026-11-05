@@ -371,6 +371,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **`dict.get` (and other receiver-type-driven specializations) on a
+  module-level dict global** (#671, D-0112). Monomorphization now seeds
+  explicitly-typed module-level globals (epic #661: `const` #658, mutable #662)
+  into each function body's type environment, so a method call whose receiver is
+  a bare module-global name resolves the receiver's concrete type exactly as it
+  does for a local. Previously `t.get(k)` / `t.get(k, default)` on a module-global
+  dict fell through IR lowering as a bare `get` and was rejected with the generic
+  `ZAP6001` umbrella (`dict.get() takes no arguments`), while the identical call
+  on a *local* dict worked. The fix is general — any receiver-type-driven
+  specialization (`dict.get`'s `Optional[V]`/`get_default` rewrites, generic-method
+  dispatch) now fires on a module global — and a shadowing local of the same name
+  still takes precedence (static lexical scoping). `auto`-typed module globals,
+  whose type mono does not re-derive, keep the prior opaque-receiver behavior.
 - Preserve `bytes` result types for `crypto.digest`, `crypto.hmac_sha256_raw`,
   and `crypto.random_bytes` during IR lowering (#647), fixing binary indexing,
   slicing, concatenation, and equality on inferred locals. Hex/text APIs and

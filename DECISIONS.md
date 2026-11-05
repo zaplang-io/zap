@@ -3897,6 +3897,45 @@ heavy garbage, asserting length+sum, never heap bytes; `module_tuple_decl_reject
 and the `module_mutable_across_modules` project) run under the full-codegen CI
 jobs (both collectors).
 
+### Module-global receiver-type resolution in monomorphization (I#671)
+
+A method call whose *specialization* is chosen by the receiver's concrete type
+— the built-in `dict.get` rewrite (`get(k) -> Optional[V]` #281, `get(k, d) -> V`
+#570) and generic-method dispatch (I#161) — only fires when the monomorphizer
+knows the receiver's type. Mono learns a local's or parameter's type from the
+function's type environment, but a **module-level global** (Phase 1/2 above) was
+never seeded into that environment, so a global receiver read back as opaque and
+the rewrite was silently skipped: the bare `get` then reached lowering and was
+rejected with the generic `ZAP6001` umbrella (`dict.get() takes no arguments`).
+The identical call on a *local* dict worked, so the gap was invisible until a
+module-global dict used `.get` (surfaced by #662's `module_mutable_mutation`
+golden, which was routed around the gap at the time).
+
+The fix is general, not a `dict.get` special case: mono records every
+explicitly-typed module-global binding (`crates/mono` `Mono::globals`) with its
+declared, alias-expanded type, and seeds those bindings into **each function
+body's type environment as an outermost scope** — below the function's own
+scope, so a local or parameter of the same name still shadows the global
+(static lexical scoping, D-0112). A bare `Expr::Name` that resolves to a module
+global therefore infers its declared type, and **every** receiver-type-driven
+specialization fires on a global exactly as it does on a local (identical
+rewritten symbols, hence identical runtime behavior). An `auto` module global
+(type inferred by sema, not re-derived by mono) is left out and keeps the prior
+opaque-receiver behavior; this is a narrower residual, not a correctness change.
+Two *unrelated* module-global gaps surfaced while probing siblings and are
+**not** this root cause (a global of a user generic type is not instantiated, and
+a non-generic user-struct global mishandles its global-slot cell under method
+dispatch); they are filed separately and are untouched here.
+
+**Verification (#671).** Mono unit tests pin the rewrite at the mono boundary for
+both `get` forms on a module global, under `const` and mutable, confirm the local
+path is undisturbed, confirm a global and the equivalent local pick the *same*
+specialized symbol, and confirm a shadowing local's type wins over the global's.
+End-to-end goldens `module_const_dict_get` and `module_mutable_dict_get` (the
+latter is the issue's verbatim repro, `t[k] = t.get(k, 0) + 1`, plus a
+read/write tally and an `Optional` read) exercise both value and key kinds across
+functions under the full-codegen CI jobs.
+
 ### Precise-Immix static roots + write barrier (I#663)
 
 Point 7 above requires module-global pointer slots to be correct under the
