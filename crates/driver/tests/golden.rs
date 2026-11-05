@@ -721,20 +721,26 @@ fn race_detector_correct_under_parallelism() {
 // branch-scoped `repro-693.yml` workflow invokes it explicitly with `--ignored`
 // under BOTH collectors.
 //
-// `threading_counter.zap` is a correctly-synchronized atomic counter (8 joined
-// threads × 10000 `atomicrmw add` on one box) whose ONLY legal output is
-// `80000` under every interleaving (determinism proof in #693). So it is run in
-// a tight loop (each iteration a full `zap run`, the golden harness's own
-// path): a single run that prints anything but `80000`, exits non-zero, or
-// hangs is a real runtime defect, not a test-determinism problem. Expected
-// outcome: GREEN under gc-immix, intermittently RED under gc-boehm — which is
-// exactly the evidence #693 needs.
+// The probe is an IN-PROCESS stress version of `threading_counter.zap`: one
+// compiled program runs `ROUNDS` rounds of "spawn 8 threads × 10000 `atomicrmw
+// add` on one persistent Atomic, join all". A correctly-synchronized atomic
+// counter has a single legal final total — `ROUNDS * 80000` — under every
+// interleaving (determinism proof in #693), so any other total, a non-zero
+// exit, or a hang is a real runtime defect, not a test-determinism problem.
 //
-// Knobs (set by the workflow): `ZAP_REPRO_ITERS` run count, `ZAP_REPRO_MAXPROCS`
-// → `MAXPROCS` (worker-M parallelism). The workflow also raises Boehm's
-// collection frequency via `GC_FREE_SPACE_DIVISOR` (inherited by the child) so
-// stop-the-world actually fires during the short threaded section — the window
-// the primary hypothesis (in-signal `copreempt` vs STW) needs.
+// Why in-process rounds rather than looping `zap run`: the race window is only
+// the few milliseconds of threaded execution, so re-launching the whole
+// compiler per exposure spends almost all the time compiling. One long-lived
+// process doing thousands of rounds instead gives orders of magnitude more
+// thread create/join churn AND far more Boehm collections (STW events) per CI
+// minute — the conditions the primary hypothesis (in-signal `copreempt` vs STW)
+// needs. Outcome sought: GREEN under gc-immix, RED under gc-boehm.
+//
+// Knobs (set by the workflow): `ZAP_REPRO_ITERS` = rounds, `ZAP_REPRO_PROCS` =
+// how many fresh processes to run (process churn on top of in-process rounds),
+// `ZAP_REPRO_MAXPROCS` → `MAXPROCS` (worker-M parallelism). The workflow also
+// raises Boehm's collection frequency via `GC_FREE_SPACE_DIVISOR` (inherited by
+// the child) so STW fires often during the threaded sections.
 //
 // DO NOT MERGE this test to `main`: it is a throwaway probe. Delete it (and the
 // workflow) once #693 is resolved.
@@ -745,60 +751,92 @@ fn repro_693_boehm_threading_counter_stress() {
     use std::process::Command;
 
     let bin = env!("CARGO_BIN_EXE_zapc");
-    let zap = golden_dir().join("threading_counter.zap");
 
-    let iters: usize = std::env::var("ZAP_REPRO_ITERS")
+    let rounds: u64 = std::env::var("ZAP_REPRO_ITERS")
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(250);
+        .unwrap_or(1000);
+    let procs: usize = std::env::var("ZAP_REPRO_PROCS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(5);
     let maxprocs = std::env::var("ZAP_REPRO_MAXPROCS").unwrap_or_else(|_| "4".to_string());
 
-    // Each iteration is a full `zap run` of the fixture — the SAME compile+link+
-    // run path the golden harness uses (known-good under both collectors), so
-    // this probe cannot fail for a harness reason (e.g. a build-output-path
-    // quirk); it fails only if the program itself misbehaves. The compile is
-    // repeated per run, which is why `iters` is modest by default and dialed up
-    // from the workflow; every run is still an independent exercise of the
-    // runtime race (fresh process, fresh threads, fresh collections).
-    let per_run = std::time::Duration::from_secs(60);
+    // The unique legal final total: 8 threads × 10000 adds × `rounds` rounds.
+    let expected = (rounds * 8 * 10_000).to_string();
+
+    // Generate the in-process stress program. It mirrors `threading_counter.zap`
+    // EXACTLY (same worker, same 8-thread spawn/join body) but lifts the body
+    // into `one_round(a)` called `rounds` times, so each round gets a fresh local
+    // `ts` list — the proven golden pattern, not an in-loop redeclaration or an
+    // empty-list reassignment. `a` is created once and shared by every round's
+    // threads (an atomic box reached through the shadow-stack roots), so the
+    // final `a.load()` after all joins must be ROUNDS*80000. The per-round
+    // allocation (Thread objects, closures, lists) drives frequent Boehm
+    // collections concurrent with the threaded sections.
+    let src = format!(
+        "def worker(Atomic[int64] a, int64 iters):\n\
+         \x20   for i in range(0, iters):\n\
+         \x20       a.add(1)\n\
+         \n\
+         def one_round(Atomic[int64] a):\n\
+         \x20   list[Thread] ts = []\n\
+         \x20   for k in range(0, 8):\n\
+         \x20       ts.append(threading.Thread(target=lambda: worker(a, 10000)))\n\
+         \x20   for t in ts:\n\
+         \x20       t.start()\n\
+         \x20   for t in ts:\n\
+         \x20       t.join()\n\
+         \n\
+         def main() -> int64:\n\
+         \x20   Atomic[int64] a = Atomic(0)\n\
+         \x20   for r in range(0, {rounds}):\n\
+         \x20       one_round(a)\n\
+         \x20   print(a.load())\n\
+         \x20   return 0\n"
+    );
+    let dir = std::env::temp_dir().join(format!("zap-repro-693-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create repro temp dir");
+    let zap = dir.join("threading_counter_stress.zap");
+    std::fs::write(&zap, &src).expect("write repro source");
+
+    // A long run (thousands of rounds) still finishes in seconds, but give it
+    // generous headroom; a timeout here means a hang, which is itself the defect.
+    let per_run = std::time::Duration::from_secs(300);
     let mut failures = Vec::new();
     let mut ran = 0usize;
-    for i in 0..iters {
+    for i in 0..procs {
         ran += 1;
         let mut cmd = Command::new(bin);
         cmd.arg("run").arg(&zap);
         // True OS-thread parallelism across worker Ms (the runtime reads
         // `MAXPROCS`); the preempt-vs-STW race needs several Ms running at once.
         cmd.env("MAXPROCS", &maxprocs);
-        // A hang panics from inside `run_with_timeout` with a clear message —
-        // that is itself conclusive evidence of the defect, so we let it.
-        let o = run_with_timeout(cmd, per_run, &format!("threading_counter repro #{i}"));
+        let o = run_with_timeout(cmd, per_run, &format!("threading_counter stress proc #{i}"));
         let got = String::from_utf8_lossy(&o.stdout);
         let got = got.trim_end();
-        if o.status.code() != Some(0) || got != "80000" {
+        if o.status.code() != Some(0) || got != expected {
             failures.push(format!(
-                "  iter {i}: exit={:?} stdout={:?} stderr={:?}",
+                "  proc {i}: exit={:?} stdout={:?} (want {expected:?}) stderr={:?}",
                 o.status.code(),
                 got,
                 String::from_utf8_lossy(&o.stderr).trim_end()
             ));
-            // Ten failing runs is already conclusive; stop burning CI minutes.
-            if failures.len() >= 10 {
-                break;
-            }
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
         failures.is_empty(),
-        "threading_counter.zap is NON-DETERMINISTIC (MAXPROCS={maxprocs}) — \
-         {} of {ran} run(s) did not print the unique legal result `80000` [#693]:\n{}",
+        "threading_counter stress is NON-DETERMINISTIC (rounds={rounds}, MAXPROCS={maxprocs}) — \
+         {} of {ran} process(es) did not print the unique legal total `{expected}` [#693]:\n{}",
         failures.len(),
         failures.join("\n")
     );
     eprintln!(
-        "repro #693: threading_counter.zap printed 80000 and exited 0 on all {ran} \
-         run(s) (MAXPROCS={maxprocs}) — no flake observed on THIS run"
+        "repro #693: {ran} process(es) × {rounds} rounds each all printed {expected} and \
+         exited 0 (MAXPROCS={maxprocs}) — no flake observed on THIS run"
     );
 }
