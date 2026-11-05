@@ -25,6 +25,25 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Bare `raise` (re-raise) in an `except` handler** (#657, D-0116; Python
+  parity D-0007). A bare `raise` — no operand — inside a handler now re-raises
+  the exception currently being handled, **preserving its type and
+  value/identity** (it re-throws the very object the handler caught, through the
+  same `zap_raise` unwinding entry a bound `raise <obj>` uses, so a re-raised
+  `ValueError` is still caught by an enclosing `except ValueError`). The
+  innermost active exception is re-raised, so a bare `raise` in a nested handler
+  re-raises that nested handler's exception. Previously this was rejected at
+  lowering with the generic `ZAP6001` umbrella. Where there is **no active
+  exception** — a bare `raise` in a `try` body, an `else`/`finally` not handling
+  an exception, at top level, or in a function merely *called* from a handler —
+  Zap rejects it at **compile time** with a dedicated diagnostic **ZAP6002**
+  rather than deferring to Python's runtime `RuntimeError`; Zap tracks the
+  active exception lexically and per function, so these cases are statically
+  provable and it does not implement Python's dynamic, cross-call-frame re-raise
+  in v1. Full traceback fidelity across the re-raise rides on the green-stack
+  unwinder (I#475) and is a follow-up; type and value are preserved today. The
+  grammar was unchanged (it already admitted a bare `raise`); this was a
+  lowering gap.
 - **`@cache` built-in decorator — memoization over module-level state** (#666,
   D-0115; closes the language work of epic #661, supersedes the D-0109 `@cache`
   deferral). `@cache` on a free function memoizes it by the typed argument tuple,
