@@ -533,6 +533,28 @@ impl<'a> Mono<'a> {
                     self.cur_self = None;
                     out.push(Item::Function(self.rewrite_fn(f, None)?))
                 }
+                // A module-level global binding (epic #661 / D-0112) is a
+                // top-level `Stmt::Let`. Like a local `Stmt::Let` inside a
+                // function body, its declared type must be rewritten — which
+                // *requests* a user-generic instance (`Box[int64]` → `Box$int64`,
+                // #690) — and its initializer expression monomorphized (so a
+                // generic constructor `Box(7)` resolves to that instance). Before
+                // #690 these items passed through unchanged, so a generic-typed
+                // global was never instantiated and never resolved at lowering.
+                // Rewritten with cleared ambient substitution (a global is never
+                // under a type-parameter scope) and a fresh env seeded with the
+                // module globals (so one global's initializer may name another),
+                // mirroring `rewrite_fn_inner`.
+                Item::Stmt(st) => {
+                    self.cur_subst.clear();
+                    self.cur_self = None;
+                    let mut env = Env::default();
+                    env.push();
+                    for (name, ty) in &self.globals {
+                        env.declare(name, CTy::Ty(ty.clone()));
+                    }
+                    out.push(Item::Stmt(self.rewrite_stmt(st, &mut env)?));
+                }
                 other => out.push(other.clone()),
             }
         }
@@ -3367,5 +3389,108 @@ mod tests {
             names.iter().any(|n| n == "countSet$int64"),
             "set literal infers T=int64: {names:?}"
         );
+    }
+
+    // ---- user-generic-type module globals (#690, epic #661 / D-0112) ------
+
+    /// The declared type of a module-level global `name` (its explicit
+    /// annotation), rendered via [`type_name`]. Panics if there is no such
+    /// single-name global.
+    fn global_ty(m: &Module, name: &str) -> String {
+        m.items
+            .iter()
+            .find_map(|i| match i {
+                Item::Stmt(Stmt::Let {
+                    name: n,
+                    ty: Some(t),
+                    ..
+                }) if n == name => Some(type_name(t)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no single-name global '{name}'"))
+    }
+
+    const BOX: &str = "struct Box[T]:\n    T item\n";
+
+    #[test]
+    fn module_level_generic_global_is_monomorphized() {
+        // #690: a module-level global of a user generic type must have its
+        // declared type requested as an instance and its initializer rewritten,
+        // exactly as a local `Stmt::Let` does. Before the fix the top-level
+        // `Item::Stmt` passed through unchanged, so `Box$int64` was never emitted
+        // and the global stayed typed `Box` (unknown to codegen).
+        let m = mono_ok(&format!(
+            "{BOX}Box[int64] g = Box(7)\ndef main():\n    print(g.item)\n"
+        ));
+        assert_eq!(
+            global_ty(&m, "g"),
+            "Box$int64",
+            "the global's declared type must be rewritten to the concrete instance"
+        );
+        assert!(
+            struct_named(&m, "Box$int64").is_some(),
+            "the requested Box[int64] instance must be emitted"
+        );
+        // The generic template itself must not leak through as a concrete decl.
+        assert!(
+            struct_named(&m, "Box").is_none_or(|s| s.generics.is_empty()),
+            "no generic `Box` template should remain as a concrete declaration"
+        );
+    }
+
+    #[test]
+    fn module_generic_global_and_local_pick_the_same_instance() {
+        // Parity with the #671 global/local principle: a generic global and the
+        // equivalent local select the identical specialization.
+        let global = global_ty(
+            &mono_ok(&format!(
+                "{BOX}Box[int64] g = Box(7)\ndef main():\n    print(g.item)\n"
+            )),
+            "g",
+        );
+        let local = mono_ok(&format!(
+            "{BOX}def main():\n    Box[int64] g = Box(7)\n    print(g.item)\n"
+        ));
+        assert_eq!(global, "Box$int64");
+        assert!(
+            struct_named(&local, "Box$int64").is_some(),
+            "the local must request the same Box$int64 instance"
+        );
+    }
+
+    #[test]
+    fn const_generic_global_is_monomorphized_like_mutable() {
+        // A `const` generic global is instantiated exactly like a mutable one.
+        let m = mono_ok(&format!(
+            "{BOX}const Box[int64] g = Box(7)\ndef main():\n    print(g.item)\n"
+        ));
+        assert_eq!(global_ty(&m, "g"), "Box$int64");
+        assert!(struct_named(&m, "Box$int64").is_some());
+    }
+
+    #[test]
+    fn two_generic_globals_emit_distinct_instances() {
+        // Two different instantiations held as separate globals each resolve to
+        // their own instance (`Box$int64` and `Box$str`).
+        let m = mono_ok(&format!(
+            "{BOX}Box[int64] gi = Box(7)\nBox[str] gs = Box(\"hi\")\n\
+             def main():\n    print(gi.item)\n    print(gs.item)\n"
+        ));
+        assert_eq!(global_ty(&m, "gi"), "Box$int64");
+        assert_eq!(global_ty(&m, "gs"), "Box$str");
+        assert!(struct_named(&m, "Box$int64").is_some(), "Box$int64 emitted");
+        assert!(struct_named(&m, "Box$str").is_some(), "Box$str emitted");
+    }
+
+    #[test]
+    fn generic_global_with_method_requests_the_instance() {
+        // A method call on a generic global drives the same instantiation; the
+        // instance's declaration (carrying the method) must be emitted.
+        let m = mono_ok(
+            "struct Box[T]:\n    T item\n    def peek(self) -> T:\n        return self.item\n\
+             Box[int64] g = Box(7)\ndef main():\n    print(g.peek())\n",
+        );
+        assert_eq!(global_ty(&m, "g"), "Box$int64");
+        assert!(struct_named(&m, "Box$int64").is_some());
     }
 }

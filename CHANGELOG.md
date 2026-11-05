@@ -384,6 +384,29 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   dispatch) now fires on a module global — and a shadowing local of the same name
   still takes precedence (static lexical scoping). `auto`-typed module globals,
   whose type mono does not re-derive, keep the prior opaque-receiver behavior.
+- **Module-level globals of a user *generic* type** (#690, epic #661 / D-0112).
+  Monomorphization now rewrites module-level global bindings (`Item::Stmt`) the
+  same way it already rewrites a local `Stmt::Let`: it requests the global's
+  declared generic type as a concrete instance (`Box[int64]` → `Box$int64`) and
+  monomorphizes its initializer. Previously a top-level `Box[int64] g = Box(7)`
+  passed through mono unchanged, so the instance was never emitted and lowering
+  failed with `type 'Box' is not supported by codegen yet` / `unknown variable
+  'g'`, while the identical binding as a *local* worked. Const and mutable
+  generic globals, distinct instantiations as separate globals, and method calls
+  on them all resolve now.
+- **Member access on a user struct whose name collides with a prelude type**
+  (#689, epic #661). A user type named after a prelude type (e.g. `Counter`,
+  which the `concurrent` prelude also defines) is still shadowed by the user's,
+  but a prelude *helper function* that references the shadowed type — the
+  concrete `__concurrent_counter`, whose body builds `Counter(_cell=Atomic(…))` —
+  was injected regardless and bound its `._cell` access to the user's unrelated
+  struct, failing at lowering with `no field '_cell' on struct` (for both a
+  field read and a method call, and for a *local* as well as a module global).
+  `with_prelude` now drops a prelude helper that mentions a user-shadowed prelude
+  type, so such member access resolves against the user's struct. Programs with
+  no such collision are byte-for-byte unchanged, and `concurrent.Counter(…)`
+  itself still lowers when the user does not redefine `Counter`. (Non-colliding
+  struct-typed module globals were never affected.)
 - Preserve `bytes` result types for `crypto.digest`, `crypto.hmac_sha256_raw`,
   and `crypto.random_bytes` during IR lowering (#647), fixing binary indexing,
   slicing, concatenation, and equality on inferred locals. Hex/text APIs and
