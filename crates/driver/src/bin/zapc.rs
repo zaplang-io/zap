@@ -39,16 +39,26 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parse `[-o <out>] <file>` and compile.
+/// Parse `[-o <out>] [--race] <file>` and compile.
 fn compile_args(args: &[String], run_after: bool) -> ExitCode {
     let mut file: Option<String> = None;
     let mut out: Option<String> = None;
+    // `--race` (alias `-race`): enable the runtime data-race detector (#665,
+    // D-0114). The thin `zapc` bin must thread this through exactly like the
+    // user-facing `zap` CLI, or `zapc run --race` would silently compile WITHOUT
+    // instrumentation (the detector's goldens drive `zapc`, so a dropped flag
+    // makes a racy program run clean — #678).
+    let mut race = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-o" => {
                 out = args.get(i + 1).cloned();
                 i += 2;
+            }
+            "--race" | "-race" => {
+                race = true;
+                i += 1;
             }
             f => {
                 file = Some(f.to_string());
@@ -60,14 +70,16 @@ fn compile_args(args: &[String], run_after: bool) -> ExitCode {
         eprintln!("zapc: no input file");
         return ExitCode::from(2);
     };
-    zapc::compile(&file, out, run_after)
+    zapc::compile_for(&file, out, run_after, &[], false, false, race)
 }
 
-/// Parse the first positional argument as the file and dump ZIR.
+/// Parse the first positional argument as the file and dump ZIR. `--race`
+/// (alias `-race`) shows the data-race instrumentation hooks (#665, D-0114).
 fn ir_args(args: &[String]) -> ExitCode {
     let Some(file) = args.iter().find(|a| !a.starts_with('-')).cloned() else {
         eprintln!("zapc: no input file");
         return ExitCode::from(2);
     };
-    zapc::emit_ir(&file)
+    let race = args.iter().any(|a| a == "--race" || a == "-race");
+    zapc::emit_ir_for(&file, &[], false, race)
 }
