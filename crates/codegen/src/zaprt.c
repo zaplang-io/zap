@@ -4617,8 +4617,10 @@ static void all_remove(G *g) {
  * (`--race`, #678, epic #665, D-0114). The engine itself is defined in
  * zaprace.inc.c (included near the end of this file); these forward declarations
  * let the earlier `zap_spawn` / `zap_mutex_*` call sites reference it. Each is a
- * no-op until `__zap_race_enable()` runs (only a `--race` `main` arms it), so a
- * default build is behaviourally unchanged. `zap_race_on_spawn` records the
+ * no-op until the detector is armed (by `__zap_race_enable` /
+ * `__zap_race_register_global` / an access hook — all emitted only under
+ * `--race`), so a default build is behaviourally unchanged. `zap_race_on_spawn`
+ * records the
  * parent->child happens-before edge; `zap_race_mutex_{acquire,release}` carry
  * the lock acquire/release edges keyed by the mutex pointer. */
 void zap_race_on_spawn(G *child);
@@ -5415,6 +5417,7 @@ void zap_spawn_scoped(void *fn_, void *arg, void *scope_, const char *name) {
     G *g = galloc(fn_, arg);
     g->scope = sc; /* in_live stays 0: the scope, not the root join, owns it */
     g->name = name;
+    zap_race_on_spawn(g); /* --race: parent->child happens-before edge (#678) */
     sched_enqueue(g);
 }
 

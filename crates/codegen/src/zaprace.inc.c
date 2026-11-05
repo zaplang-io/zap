@@ -203,8 +203,23 @@ static RaceVC *race_cur_vc(G **out_g) {
     if (out_g) {
         *out_g = g;
     }
-    if (!g || g->race_gid < 0 || g->race_gid >= race_ngids) {
-        return NULL;
+    if (!g) {
+        return NULL; /* main/native thread — untracked in v1 (slice 3, #679) */
+    }
+    if (g->race_gid < 0) {
+        /* First time the engine sees this coroutine. `zap_race_on_spawn` assigns
+         * the id (and the parent->child edge) when the spawn path is hooked; this
+         * lazy init is the fallback for any spawn path not hooked, so a coroutine
+         * is tracked the moment it touches a shared global regardless of how it
+         * was created. A lazily-initialized clock has no inherited edges (fresh
+         * own component), which is conservative — it can only ever ADD ordering,
+         * never hide a race. */
+        int64_t id = race_new_gid();
+        g->race_gid = id;
+        race_vc_set(&race_gvc[id], id, 1);
+    }
+    if (g->race_gid >= race_ngids) {
+        return NULL; /* defensive: should never happen */
     }
     return &race_gvc[g->race_gid];
 }
@@ -299,12 +314,20 @@ static void race_report_and_exit(const char *kind, int64_t name_id, int64_t gid,
 void __zap_race_enable(void) {
     /* Arm the engine. Runs on the main thread at the top of a `--race` `main`,
      * before any `spawn`, so a plain store is safely published to the worker
-     * threads the first spawn creates. Idempotent. */
+     * threads the first spawn creates. Idempotent, and belt-and-suspenders: the
+     * access hooks and `__zap_race_register_global` also self-arm, so the engine
+     * is live even if this call is reordered or elided — `race_enabled` only
+     * gates the runtime-side (always-linked) spawn / Mutex hooks, keeping a
+     * non-`--race` build (which emits none of these calls) inert. */
     race_enabled = 1;
 }
 
 void __zap_race_register_global(int64_t name_id, void *name_) {
     const ZapStr *s = (const ZapStr *)name_;
+    /* Emitted per-global in a `--race` `main` prologue, before any spawn or
+     * Mutex op — so arming here guarantees the runtime-side spawn / Mutex edges
+     * are live in time, independent of `__zap_race_enable`. */
+    race_enabled = 1;
     zap_np_lock(&race_mu);
     if (name_id >= race_names_cap) {
         int64_t ncap = race_names_cap ? race_names_cap * 2 : 8;
@@ -343,9 +366,10 @@ void __zap_race_register_global(int64_t name_id, void *name_) {
 }
 
 void __zap_race_read(void *slot, int64_t name_id, int64_t line, int64_t col) {
-    if (!race_enabled) {
-        return;
-    }
+    /* An access hook is emitted ONLY under `--race`, so its mere presence means
+     * the detector is live: self-arm (also arms the runtime-side spawn / Mutex
+     * edges) rather than depend on `__zap_race_enable` having run first. */
+    race_enabled = 1;
     zap_np_lock(&race_mu);
     G *g = NULL;
     RaceVC *cvc = race_cur_vc(&g);
@@ -370,9 +394,7 @@ void __zap_race_read(void *slot, int64_t name_id, int64_t line, int64_t col) {
 }
 
 void __zap_race_write(void *slot, int64_t name_id, int64_t line, int64_t col) {
-    if (!race_enabled) {
-        return;
-    }
+    race_enabled = 1; /* self-arm (see __zap_race_read) */
     zap_np_lock(&race_mu);
     G *g = NULL;
     RaceVC *cvc = race_cur_vc(&g);

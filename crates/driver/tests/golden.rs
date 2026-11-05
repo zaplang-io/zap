@@ -562,11 +562,16 @@ fn race_detector_reports_races_and_clears_clean_programs() {
                      got {race_code:?}\n--- stderr ---\n{race_err}"
                 ));
             }
+            // The deterministic total is the LAST line of stdout (clean_single
+            // also prints a line from its idle coroutine first), so assert the
+            // final line rather than the whole buffer.
             let want = clean_expected_total(&name)
                 .expect("every clean_* fixture has a known total; add it to clean_expected_total");
-            if race_out_s.trim_end() != want {
+            let last = race_out_s.trim_end().lines().last().unwrap_or("");
+            if last != want {
                 return Outcome::Failed(format!(
-                    "--race run of {name} printed {:?}, want {want:?}\n--- stderr ---\n{race_err}",
+                    "--race run of {name} printed final line {last:?}, want {want:?}\n\
+                     --- full stdout ---\n{}\n--- stderr ---\n{race_err}",
                     race_out_s.trim_end()
                 ));
             }
