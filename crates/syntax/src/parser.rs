@@ -993,6 +993,23 @@ fn references_optional_get(module: &Module) -> bool {
     format!("{module:?}").contains("name: \"get\"")
 }
 
+/// Does this prelude item mention any of the given (user-shadowed) prelude type
+/// names? Used by [`with_prelude`] to drop a prelude helper function whose body
+/// or signature names a prelude type the user has redefined (#689): the prelude's
+/// own definition of that type is dropped in favor of the user's, so a helper
+/// like `__concurrent_counter` (which builds `Counter(_cell=…)`) would otherwise
+/// bind to the user's unrelated `Counter` and fail at lowering. The scan is over
+/// the item's derived `Debug` with quoted needles, matching the style of
+/// [`references_prelude`]; an empty `names` set never matches, so a program with
+/// no such collision keeps the full prelude unchanged.
+fn item_mentions_any(item: &crate::ast::Item, names: &std::collections::HashSet<String>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let dbg = format!("{item:?}");
+    names.iter().any(|n| dbg.contains(&format!("\"{n}\"")))
+}
+
 /// Return `module` augmented with the built-in [`prelude_items`] when it uses the
 /// signals surface (see [`references_prelude`]); otherwise return a plain clone.
 /// A prelude item is skipped if the user already declares a type of that name, so
@@ -1019,7 +1036,22 @@ pub fn with_prelude(module: &Module) -> Module {
     }
     let user_names: std::collections::HashSet<&str> =
         module.items.iter().filter_map(item_type_name).collect();
-    let mut items: Vec<crate::ast::Item> = prelude_items()
+    let prelude = prelude_items();
+    // Prelude *type* names the user has redefined (#689). A user type of the same
+    // name shadows the prelude's (handled by the `Some(n)` arm below), but a
+    // prelude helper *function* that references the shadowed type — e.g.
+    // `__concurrent_counter`, whose body builds `Counter(_cell=Atomic(start))` —
+    // has no type name of its own, so it was injected unconditionally and then
+    // bound its `._cell` field access to the user's unrelated `Counter`, failing
+    // at lowering with `no field '_cell' on struct`. Collect the shadowed names
+    // so those dependent helpers are dropped alongside the type.
+    let shadowed: std::collections::HashSet<String> = prelude
+        .iter()
+        .filter_map(item_type_name)
+        .filter(|n| user_names.contains(n))
+        .map(|n| n.to_string())
+        .collect();
+    let mut items: Vec<crate::ast::Item> = prelude
         .into_iter()
         .filter(|it| {
             // In the `Optional`-only path, inject nothing but the `Optional[T]`
@@ -1029,7 +1061,11 @@ pub fn with_prelude(module: &Module) -> Module {
             }
             match item_type_name(it) {
                 Some(n) => !user_names.contains(n),
-                None => true,
+                // A prelude helper with no type name of its own (a free
+                // function) is kept unless it mentions a user-shadowed prelude
+                // type (#689); `shadowed` empty → every program without such a
+                // collision is byte-for-byte unchanged.
+                None => !item_mentions_any(it, &shadowed),
             }
         })
         .collect();
@@ -5933,6 +5969,66 @@ def demo(int64 n):
         assert!(
             names.iter().any(|n| n == "DateTime"),
             "the full prelude should ride along when a needle fires: {names:?}"
+        );
+    }
+
+    /// Names of the top-level functions `with_prelude` leaves in the module.
+    fn fn_names(m: &Module) -> Vec<String> {
+        m.items
+            .iter()
+            .filter_map(|it| match it {
+                crate::ast::Item::Function(f) => Some(f.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn user_struct_shadowing_counter_drops_dependent_prelude_helper() {
+        // #689: a user type named `Counter` fires the `"Counter"` needle, pulling
+        // in the `concurrent` prelude. The prelude `struct Counter` is shadowed
+        // out by the user's (the `Some(n)` filter arm), but the concrete helper
+        // `__concurrent_counter` — which builds `Counter(_cell=Atomic(start))` —
+        // would otherwise survive and bind `._cell` to the user's unrelated
+        // `Counter`, failing at lowering (`no field '_cell' on struct`). It must
+        // be dropped alongside the shadowed type.
+        let m = with_prelude(&parse_ok(
+            "struct Counter:\n    int64 n\ndef main():\n    Counter c = Counter(5)\n    print(c.n)\n",
+        ));
+        let fns = fn_names(&m);
+        assert!(
+            !fns.iter().any(|n| n == "__concurrent_counter"),
+            "the helper that references the shadowed prelude Counter must be dropped: {fns:?}"
+        );
+        // Exactly one `Counter` type remains — the user's (field `n`, not `_cell`).
+        let counters: Vec<_> = m
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                crate::ast::Item::Struct(s) if s.name == "Counter" => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counters.len(), 1, "only the user's Counter should remain");
+        assert_eq!(counters[0].fields[0].name, "n");
+    }
+
+    #[test]
+    fn concurrent_helper_kept_without_a_user_collision() {
+        // Without a user `Counter`, the concrete `__concurrent_counter` helper
+        // (and the prelude `Counter` struct) must still be injected so that
+        // `concurrent.Counter(...)` lowers — the drop in #689 is scoped strictly
+        // to a shadowing collision.
+        let m = with_prelude(&parse_ok(
+            "import concurrent\ndef main():\n    auto c = concurrent.Counter(5)\n    print(c.get())\n",
+        ));
+        assert!(
+            fn_names(&m).iter().any(|n| n == "__concurrent_counter"),
+            "the helper must be present when the user does not shadow Counter"
+        );
+        assert!(
+            type_names(&m).iter().any(|n| n == "Counter"),
+            "the prelude Counter struct must be present without a collision"
         );
     }
 }

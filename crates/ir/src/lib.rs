@@ -2790,6 +2790,88 @@ def main():
         );
     }
 
+    // --- #689 / #690: user-defined-type module globals (epic #661) ----------
+    //
+    // These lower end-to-end (through `with_prelude` + monomorphization), so they
+    // are the regression wall around the two sibling fixes: a user *struct*
+    // global's member access must resolve against the struct (#689), and a user
+    // *generic* global must be monomorphized to a concrete instance before
+    // lowering (#690). Non-colliding struct globals already worked; the #689
+    // failure was specifically a user type named `Counter` colliding with the
+    // `concurrent` prelude helper, so that exact repro is pinned here.
+
+    #[test]
+    fn user_struct_module_global_lowers_field_and_method() {
+        // A plain user-struct global supports both a field read and a method
+        // call, for const and mutable, with a fieldget against the struct (never
+        // a cell wrapper).
+        for decl in ["Pt p = Pt(5)", "const Pt p = Pt(5)"] {
+            let m = lower_ok(&format!(
+                "struct Pt:\n    int64 x\n    def get(self) -> int64:\n        return self.x\n\
+                 {decl}\ndef main() -> int64:\n    return p.x + p.get()\n"
+            ));
+            assert_eq!(m.globals.len(), 1, "one global slot ({decl})");
+            assert!(
+                matches!(m.globals[0].ty, Ty::Struct(_)),
+                "the struct global's slot is typed as the struct ({decl})"
+            );
+        }
+    }
+
+    #[test]
+    fn struct_global_name_colliding_with_prelude_counter_lowers() {
+        // #689 exact repro: a user `struct Counter` fires the `"Counter"` prelude
+        // needle, but the dependent `__concurrent_counter` helper is dropped
+        // (parser::with_prelude), so `c.n` / `c.get()` resolve against the user's
+        // Counter instead of failing with `no field '_cell' on struct`.
+        lower_ok(
+            "struct Counter:\n    int64 n\n    def get(self) -> int64:\n        return self.n\n\
+             Counter c = Counter(5)\ndef main() -> int64:\n    return c.n + c.get()\n",
+        );
+        // And as a local, which failed identically before the fix.
+        lower_ok(
+            "struct Counter:\n    int64 n\n\
+             def main() -> int64:\n    Counter c = Counter(5)\n    return c.n\n",
+        );
+    }
+
+    #[test]
+    fn nested_and_mutated_struct_globals_lower() {
+        // A struct holding a struct (nested field access) and mutation of a
+        // mutable struct global's field then a read both lower.
+        lower_ok(
+            "struct Inner:\n    int64 v\nstruct Outer:\n    Inner inner\n\
+             Outer o = Outer(Inner(5))\ndef main() -> int64:\n    return o.inner.v\n",
+        );
+        lower_ok(
+            "struct Pt:\n    int64 x\nPt p = Pt(5)\n\
+             def main() -> int64:\n    p.x = 9\n    return p.x\n",
+        );
+    }
+
+    #[test]
+    fn user_generic_module_global_lowers() {
+        // #690: a user generic-type global is monomorphized before lowering, so
+        // its slot is a concrete struct instance and `g.item` / `g.peek()`
+        // resolve. Const and mutable; plus two distinct instantiations.
+        for decl in ["Box[int64] g = Box(7)", "const Box[int64] g = Box(7)"] {
+            let m = lower_ok(&format!(
+                "struct Box[T]:\n    T item\n    def peek(self) -> T:\n        return self.item\n\
+                 {decl}\ndef main() -> int64:\n    return g.item + g.peek()\n"
+            ));
+            assert!(
+                matches!(m.globals[0].ty, Ty::Struct(_)),
+                "the generic global's slot is a concrete struct instance ({decl})"
+            );
+        }
+        // Two instantiations as separate globals each resolve to their own slot.
+        let m = lower_ok(
+            "struct Box[T]:\n    T item\nBox[int64] gi = Box(7)\nBox[str] gs = Box(\"hi\")\n\
+             def main() -> int64:\n    print(gs.item)\n    return gi.item\n",
+        );
+        assert_eq!(m.globals.len(), 2, "two distinct global slots");
+    }
+
     // --- #677: `--race` access instrumentation (epic #665, D-0114) ----------
     //
     // Under `--race`, lowering emits a `__zap_race_read` / `__zap_race_write`
