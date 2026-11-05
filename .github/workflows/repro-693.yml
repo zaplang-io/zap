@@ -17,8 +17,8 @@ on:
   workflow_dispatch:
     inputs:
       iters:
-        description: "Runs per collector"
-        default: "800"
+        description: "Runs per collector (each is a full zap run)"
+        default: "250"
       maxprocs:
         description: "MAXPROCS (worker-M parallelism)"
         default: "4"
@@ -40,7 +40,7 @@ jobs:
       LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
       # How hard to stress. workflow_dispatch inputs override; push uses these.
-      ZAP_REPRO_ITERS: ${{ github.event.inputs.iters || '800' }}
+      ZAP_REPRO_ITERS: ${{ github.event.inputs.iters || '250' }}
       ZAP_REPRO_MAXPROCS: ${{ github.event.inputs.maxprocs || '4' }}
       # Provoke frequent Boehm stop-the-world even on this tiny heap, so the
       # in-signal copreempt-vs-STW window (the #693 primary hypothesis) is hit.

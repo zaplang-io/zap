@@ -723,11 +723,12 @@ fn race_detector_correct_under_parallelism() {
 //
 // `threading_counter.zap` is a correctly-synchronized atomic counter (8 joined
 // threads × 10000 `atomicrmw add` on one box) whose ONLY legal output is
-// `80000` under every interleaving (determinism proof in #693). So it is
-// compiled ONCE and its binary run in a tight loop: a single run that prints
-// anything but `80000`, exits non-zero, or hangs is a real runtime defect, not
-// a test-determinism problem. Expected outcome: GREEN under gc-immix,
-// intermittently RED under gc-boehm — which is exactly the evidence #693 needs.
+// `80000` under every interleaving (determinism proof in #693). So it is run in
+// a tight loop (each iteration a full `zap run`, the golden harness's own
+// path): a single run that prints anything but `80000`, exits non-zero, or
+// hangs is a real runtime defect, not a test-determinism problem. Expected
+// outcome: GREEN under gc-immix, intermittently RED under gc-boehm — which is
+// exactly the evidence #693 needs.
 //
 // Knobs (set by the workflow): `ZAP_REPRO_ITERS` run count, `ZAP_REPRO_MAXPROCS`
 // → `MAXPROCS` (worker-M parallelism). The workflow also raises Boehm's
@@ -750,33 +751,23 @@ fn repro_693_boehm_threading_counter_stress() {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(500);
+        .unwrap_or(250);
     let maxprocs = std::env::var("ZAP_REPRO_MAXPROCS").unwrap_or_else(|_| "4".to_string());
 
-    // Compile ONCE: the defect is a per-process runtime race, so looping the
-    // same binary is the faithful, cheap reproduction (no recompile per run).
-    let dir = std::env::temp_dir().join(format!("zap-repro-693-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create repro temp dir");
-    let out = dir.join("threading_counter");
-    let build = Command::new(bin)
-        .arg("build")
-        .arg("--out")
-        .arg(&out)
-        .arg(&zap)
-        .output()
-        .expect("spawn zapc build");
-    assert!(
-        build.status.success(),
-        "zapc build of threading_counter.zap failed:\n{}",
-        String::from_utf8_lossy(&build.stderr)
-    );
-
+    // Each iteration is a full `zap run` of the fixture — the SAME compile+link+
+    // run path the golden harness uses (known-good under both collectors), so
+    // this probe cannot fail for a harness reason (e.g. a build-output-path
+    // quirk); it fails only if the program itself misbehaves. The compile is
+    // repeated per run, which is why `iters` is modest by default and dialed up
+    // from the workflow; every run is still an independent exercise of the
+    // runtime race (fresh process, fresh threads, fresh collections).
     let per_run = std::time::Duration::from_secs(60);
     let mut failures = Vec::new();
     let mut ran = 0usize;
     for i in 0..iters {
         ran += 1;
-        let mut cmd = Command::new(&out);
+        let mut cmd = Command::new(bin);
+        cmd.arg("run").arg(&zap);
         // True OS-thread parallelism across worker Ms (the runtime reads
         // `MAXPROCS`); the preempt-vs-STW race needs several Ms running at once.
         cmd.env("MAXPROCS", &maxprocs);
@@ -798,7 +789,6 @@ fn repro_693_boehm_threading_counter_stress() {
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
         failures.is_empty(),
