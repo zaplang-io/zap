@@ -4804,6 +4804,7 @@ spawn.
 **Docs.** SPEC §12, `design/0005-concurrency.md`, CHANGELOG, and this decision.
 Conformance: `spawn_forms` (SCOPE-5: the three forms join and capture correctly)
 and `spawn_forms_timeout` (SCOPE-6: method + function-value spawns compose with
-`scope(timeout=…)` — cancellation, `finally` cleanup, and the named pending
-report). Grammar unchanged (grammar already admitted these calls; this is
-lowering/sema).
+`scope(timeout=…)` — the deadline cancels them and the named pending report lists
+each by identity; `finally`/`with` cleanup under cancellation is covered
+form-independently by `scope_timeout`/`scope_cleanup`). Grammar unchanged (grammar
+already admitted these calls; this is lowering/sema).
