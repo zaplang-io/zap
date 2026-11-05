@@ -365,6 +365,7 @@ void __zap_race_register_global(int64_t name_id, void *name_) {
     zap_np_unlock(&race_mu);
 }
 
+static int64_t race_dbg_n = 0;
 void __zap_race_read(void *slot, int64_t name_id, int64_t line, int64_t col) {
     /* An access hook is emitted ONLY under `--race`, so its mere presence means
      * the detector is live: self-arm (also arms the runtime-side spawn / Mutex
@@ -373,6 +374,12 @@ void __zap_race_read(void *slot, int64_t name_id, int64_t line, int64_t col) {
     zap_np_lock(&race_mu);
     G *g = NULL;
     RaceVC *cvc = race_cur_vc(&g);
+    if (race_dbg_n < 12) {
+        race_dbg_n++;
+        fprintf(stderr, "ZAPRACEDBG2 read: cur_m=%p g=%p gid=%lld cvc=%p ngids=%lld\n",
+                (void *)cur_m, (void *)g, (long long)(g ? g->race_gid : -999), (void *)cvc,
+                (long long)race_ngids);
+    }
     if (!cvc) {
         zap_np_unlock(&race_mu); /* untracked context (main/native) */
         return;

@@ -137,7 +137,10 @@ const RUNTIME_C: &str = include_str!("zaprt.c");
 const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
 /// The runtime data-race detector hooks (`--race`, #677, epic #665, D-0114),
 /// `#include`d unconditionally by `zaprt.c`. Written next to the runtime so the
-/// relative include resolves. Slice 1 no-op stubs; the engine fills them in (#678).
+/// relative include resolves. Slice 2 (#678) replaces the slice-1 no-op stubs
+/// with the happens-before / vector-clock engine. A `build.rs` declares this and
+/// the other embedded runtime files as `rerun-if-changed` inputs so a runtime
+/// edit always rebuilds this crate (CI's cache otherwise kept a stale runtime).
 const RUNTIME_RACE_C: &str = include_str!("zaprace.inc.c");
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
