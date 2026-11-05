@@ -20,8 +20,8 @@ on:
         description: "Rounds per process (in-process spawn/join churn)"
         default: "1000"
       procs:
-        description: "Fresh processes to run per collector"
-        default: "5"
+        description: "Processes run CONCURRENTLY per collector (CPU oversubscription)"
+        default: "8"
       maxprocs:
         description: "MAXPROCS (worker-M parallelism)"
         default: "4"
@@ -44,7 +44,7 @@ jobs:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
       # How hard to stress. workflow_dispatch inputs override; push uses these.
       ZAP_REPRO_ITERS: ${{ github.event.inputs.iters || '1000' }}
-      ZAP_REPRO_PROCS: ${{ github.event.inputs.procs || '5' }}
+      ZAP_REPRO_PROCS: ${{ github.event.inputs.procs || '8' }}
       ZAP_REPRO_MAXPROCS: ${{ github.event.inputs.maxprocs || '4' }}
       # Provoke frequent Boehm stop-the-world even on this tiny heap, so the
       # in-signal copreempt-vs-STW window (the #693 primary hypothesis) is hit.

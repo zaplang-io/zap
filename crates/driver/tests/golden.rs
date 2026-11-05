@@ -736,11 +736,12 @@ fn race_detector_correct_under_parallelism() {
 // minute — the conditions the primary hypothesis (in-signal `copreempt` vs STW)
 // needs. Outcome sought: GREEN under gc-immix, RED under gc-boehm.
 //
-// Knobs (set by the workflow): `ZAP_REPRO_ITERS` = rounds, `ZAP_REPRO_PROCS` =
-// how many fresh processes to run (process churn on top of in-process rounds),
-// `ZAP_REPRO_MAXPROCS` → `MAXPROCS` (worker-M parallelism). The workflow also
-// raises Boehm's collection frequency via `GC_FREE_SPACE_DIVISOR` (inherited by
-// the child) so STW fires often during the threaded sections.
+// Knobs (set by the workflow): `ZAP_REPRO_ITERS` = rounds per process,
+// `ZAP_REPRO_PROCS` = how many processes to run CONCURRENTLY (CPU
+// oversubscription, mimicking the parallel golden runner the flake surfaced
+// under), `ZAP_REPRO_MAXPROCS` → `MAXPROCS` (worker-M parallelism). The workflow
+// also raises Boehm's collection frequency via `GC_FREE_SPACE_DIVISOR`
+// (inherited by the child) so STW fires often during the threaded sections.
 //
 // DO NOT MERGE this test to `main`: it is a throwaway probe. Delete it (and the
 // workflow) once #693 is resolved.
@@ -761,7 +762,7 @@ fn repro_693_boehm_threading_counter_stress() {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(5);
+        .unwrap_or(8);
     let maxprocs = std::env::var("ZAP_REPRO_MAXPROCS").unwrap_or_else(|_| "4".to_string());
 
     // The unique legal final total: 8 threads × 10000 adds × `rounds` rounds.
@@ -802,30 +803,47 @@ fn repro_693_boehm_threading_counter_stress() {
     let zap = dir.join("threading_counter_stress.zap");
     std::fs::write(&zap, &src).expect("write repro source");
 
-    // A long run (thousands of rounds) still finishes in seconds, but give it
-    // generous headroom; a timeout here means a hang, which is itself the defect.
+    // Run the `procs` processes CONCURRENTLY, not one after another. The #295
+    // flake surfaced under the parallel golden runner (several heavy fixtures at
+    // once), so CPU OVERSUBSCRIPTION is a likely ingredient: with more runnable
+    // threads than cores, a worker M is starved long enough for the preemption
+    // monitor to fire SIGURG mid-collection, and Boehm STW timing shifts — the
+    // window the in-signal `copreempt` path (the #693 primary hypothesis) needs.
+    // Each process additionally oversubscribes on its own (MAXPROCS worker Ms +
+    // 8 dedicated threads per round). A long run still finishes in seconds, but
+    // the timeout is generous; a timeout here means a hang, itself the defect.
     let per_run = std::time::Duration::from_secs(300);
-    let mut failures = Vec::new();
-    let mut ran = 0usize;
-    for i in 0..procs {
-        ran += 1;
-        let mut cmd = Command::new(bin);
-        cmd.arg("run").arg(&zap);
-        // True OS-thread parallelism across worker Ms (the runtime reads
-        // `MAXPROCS`); the preempt-vs-STW race needs several Ms running at once.
-        cmd.env("MAXPROCS", &maxprocs);
-        let o = run_with_timeout(cmd, per_run, &format!("threading_counter stress proc #{i}"));
-        let got = String::from_utf8_lossy(&o.stdout);
-        let got = got.trim_end();
-        if o.status.code() != Some(0) || got != expected {
-            failures.push(format!(
-                "  proc {i}: exit={:?} stdout={:?} (want {expected:?}) stderr={:?}",
-                o.status.code(),
-                got,
-                String::from_utf8_lossy(&o.stderr).trim_end()
-            ));
-        }
-    }
+    let ran = procs;
+    let failures: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..procs)
+            .map(|i| {
+                let (bin, zap, maxprocs, expected) = (bin, &zap, &maxprocs, &expected);
+                scope.spawn(move || {
+                    let mut cmd = Command::new(bin);
+                    cmd.arg("run").arg(zap);
+                    cmd.env("MAXPROCS", maxprocs);
+                    let o =
+                        run_with_timeout(cmd, per_run, &format!("threading_counter stress #{i}"));
+                    let got = String::from_utf8_lossy(&o.stdout);
+                    let got = got.trim_end();
+                    if o.status.code() != Some(0) || got != *expected {
+                        Some(format!(
+                            "  proc {i}: exit={:?} stdout={:?} (want {expected:?}) stderr={:?}",
+                            o.status.code(),
+                            got,
+                            String::from_utf8_lossy(&o.stderr).trim_end()
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("stress worker thread panicked"))
+            .collect()
+    });
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
