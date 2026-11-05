@@ -581,7 +581,7 @@ The ratified 1.0 matrix (#206, D-0076; `design/0016-platform-1.0.md`):
 | **Windows x86-64** | **tier-1 (Stable)** | A-track #195–199; CI-gated. |
 | **macOS x86-64** | **tier-2 (Supported — not yet CI-gated)** | Implemented (PR#259) but parked pending a macOS CI runner; **not** under the §3 promise until the runner lands and PR#259 merges, then graduates at a MINOR. |
 | **macOS arm64** | **experimental** | Known issue #260 (JIT exception-unwinding gap; AOT fine, JIT/REPL affected). |
-| **aarch64-Linux** | **experimental** | Known issue #223 (multicore Immix GC use-after-free, parked). |
+| **aarch64-Linux** | **experimental** | Known issue #223 (multicore GC). The gdb-confirmed scheduler/allocator lock-ordering deadlock is fixed (D-0117); a separately characterised multicore use-after-free may remain, and box-level confirmation on the high-core Graviton host (#650) is pending. Stays experimental until that re-run passes. |
 | **WASM** | **post-1.0** | Fast-follow (epic #158); not a 1.0 target. |
 
 - **Adding** a platform/architecture, or **graduating** a tier-2 platform to

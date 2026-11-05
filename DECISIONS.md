@@ -4669,3 +4669,68 @@ operand after `raise` is optional); this was a lowering gap, not a syntax one.
 the ZAP6002 cases), STABILITY (re-raise moved into the supported surface),
 CHANGELOG, and this decision. Diagnostic **ZAP6002** added; **ZAP6001** stays
 the generic lowering umbrella.
+
+## D-0117 — The scheduler's GC stack-bottom update is lock-free (I#223)
+
+**Status:** Accepted. A runtime fix for the aarch64 multicore GC deadlock; it
+changes the lock discipline of the M:N scheduler's context-switch path.
+
+**Context.** The conservative (gc-boehm) collector scans each OS thread's stack
+from its current SP to a cold-end "stack bottom". Because a coroutine runs on a
+GC-managed *green* stack, the scheduler must retarget that bottom on every
+context switch (`switch_to_g` → `set_bottom` → `GC_set_stackbottom`), so the
+collector scans the green stack the coroutine actually runs on rather than a
+wild range spanning the green and native stacks. `set_bottom` wrapped
+`GC_set_stackbottom` in `GC_call_with_alloc_lock` "as bdwgc advises", i.e. it
+took the **global allocator lock on every switch**.
+
+That created a lock-ordering inversion with the allocator (I#223). The bdwgc
+allocator lock is also held, briefly, inside `GC_MALLOC`/`GC_generic_malloc_many`.
+A coroutine can be left descheduled while momentarily holding it; resuming *any*
+coroutine then went through `switch_to_g` → `set_bottom`, which demanded the same
+lock. The only thread that could release the lock could be rescheduled only
+through the path that first required it ⇒ an unbreakable deadlock. It was
+confirmed by two gdb `thread apply all bt` captures on a 32-vCPU Graviton box
+(2026-11-05): worker coroutines blocked in `GC_generic_malloc_many`, one M
+blocked in `set_bottom` from `switch_to_g`, no collection in flight, `main`
+parked in `chan_recv`. x86's stronger memory ordering and the small hosted arm
+CI runner mask it; the fixtures reproduce it only on a high-core aarch64 box.
+
+**Decision.** `set_bottom` updates the GC stack bottom **without the allocator
+lock**: it calls `GC_set_stackbottom(m->gc_handle, sb)` directly. The hot switch
+path no longer takes any global GC lock, which breaks the inversion — the
+scheduler can always resume whatever coroutine holds the allocator lock, which
+then releases it, so progress is guaranteed.
+
+This is safe because:
+
+- With a cached, non-NULL thread handle, `GC_set_stackbottom` reduces to a single
+  aligned pointer store to the thread's stack cold-end (the thread-table lookup —
+  the only part that needs the lock — is skipped). The store is atomic/tear-free
+  on every supported arch.
+- It runs on the M's **own** thread while that thread is active. Boehm's
+  stop-the-world suspends threads at instruction boundaries, never mid-store, so
+  a concurrent collection observes either the old or the new bottom — and **both
+  are valid**: a running coroutine's register roots are captured by the STW
+  register snapshot, and its stack roots live on the green stack, which is itself
+  a `GC_MALLOC` object kept reachable through its `G` (registered in `g_all`) and
+  so conservatively scanned as heap regardless of which bottom the collector read.
+  No root is missed in the window.
+
+**Collector-agnostic.** Under gc-immix `GC_set_stackbottom` is an inert shim and
+`GC_call_with_alloc_lock` is already a no-op, so the switch path was never a
+lock there; this is a no-op for immix and removes the inversion for boehm. The
+`no_preempt` guard around allocation is retained as defense in depth.
+
+**Scope / confirmation.** This addresses the gdb-confirmed lock-ordering
+deadlock. It is **not** claimed to resolve the separately characterised aarch64
+multicore use-after-free also tracked under #223/#431 (reclamation /
+root-visibility), which is a distinct facet. Definitive confirmation that the
+deadlock is gone is a re-run of the `zap-stress` goldens under load on the
+high-core Graviton box (#650); it cannot be reproduced on x86 or the laptop. The
+three `.skip_arch` aarch64 quarantines (PR #445) stay in place until that re-run
+confirms the fix.
+
+**Docs.** CHANGELOG, STABILITY (§7 aarch64-Linux note updated to point at this
+fix pending confirmation), and this decision. Grammar/spec unchanged (runtime
+only).

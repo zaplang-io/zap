@@ -4301,25 +4301,41 @@ static void zap_np_unlock(pthread_mutex_t *mu) {
 }
 
 /* ---- GC stack-bottom tracking across switches ----------------------------- */
-/* Point the current M thread's conservatively-scanned stack at `sb`. Wrapped in
- * the GC alloc lock (as bdwgc advises) so a concurrent collection never reads a
- * half-updated bottom. The brief window between this and the swapcontext that
- * moves SP is the same one bdwgc fiber runtimes accept; green stacks are also
- * scanned as heap, so no root is ever missed. */
-struct sb_arg {
-    void *handle;
-    struct GC_stack_base *sb;
-};
-static void *set_bottom_locked(void *p) {
-    struct sb_arg *a = (struct sb_arg *)p;
-    GC_set_stackbottom(a->handle, a->sb);
-    return NULL;
-}
+/* Point the current M thread's conservatively-scanned stack at `sb`, so the
+ * Boehm collector scans [SP, sb->mem_base] — the green stack a coroutine runs
+ * on, or the M's native scheduler stack between coroutines — rather than a wild
+ * range spanning two unrelated stacks.
+ *
+ * This runs on the scheduler's HOT switch path (`switch_to_g`, on every context
+ * switch) and MUST NOT take the bdwgc global allocator lock (#223). The lock is
+ * acquired inside GC_MALLOC / GC_generic_malloc_many; a coroutine can be left
+ * descheduled while momentarily holding it. If resuming any coroutine also
+ * required that lock — as it did when this wrapped GC_call_with_alloc_lock — the
+ * only thread able to release the lock could be rescheduled only through a path
+ * that first demands it: an unbreakable lock-ordering inversion between the
+ * scheduler and the allocator. On a high-core aarch64 box it deadlocks the whole
+ * scheduler within seconds (gc-boehm, two gdb captures, 2026-11-05: workers
+ * blocked in GC_generic_malloc_many, one M blocked in set_bottom from
+ * switch_to_g, no collection in flight); x86's stronger ordering and the small
+ * hosted arm runner mask it. Making the switch path lock-free breaks the cycle:
+ * the scheduler can always resume the lock-holder, which then releases the lock,
+ * so no coroutine stays stuck.
+ *
+ * Doing this without the lock is safe here. With a cached, non-NULL thread handle
+ * `GC_set_stackbottom` performs a single aligned pointer store to this thread's
+ * stack cold-end — the thread-table lookup, the only part that would need the
+ * lock, is skipped — which is atomic and tear-free on every supported arch. It
+ * runs on the M's OWN thread while that thread is active (STW stops threads at
+ * instruction boundaries, never mid-store), so a concurrent collection observes
+ * either the old or the new bottom, and BOTH are valid: a running coroutine's
+ * register roots are captured by Boehm's stop-the-world register snapshot, and
+ * its stack roots live on the green stack, which is itself a GC_MALLOC object
+ * kept reachable through its `G` (registered in `g_all`) and so conservatively
+ * scanned as heap no matter which bottom the collector read — no root is ever
+ * missed in the window. Under gc-immix GC_set_stackbottom is an inert shim, so
+ * this is a no-op there. */
 static void set_bottom(M *m, struct GC_stack_base *sb) {
-    struct sb_arg a; /* per-call, on the caller's stack: no cross-M race */
-    a.handle = m->gc_handle;
-    a.sb = sb;
-    GC_call_with_alloc_lock(set_bottom_locked, &a);
+    GC_set_stackbottom(m->gc_handle, sb);
 }
 
 /* ---- run queues ----------------------------------------------------------- */
