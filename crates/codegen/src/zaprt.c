@@ -4217,9 +4217,21 @@ typedef struct M {
      * across a monitor interval (same coroutine still running) and sets
      * `preempt`, which the coroutine observes at its next safepoint (precise GC)
      * or via the async signal (Boehm). `dedicated` marks a LockOSThread worker
-     * that runs a single pinned coroutine and never steals / is never flagged. */
-    volatile uint64_t schedtick;
-    volatile int preempt;
+     * that runs a single pinned coroutine and never steals / is never flagged.
+     *
+     * Both are genuine cross-thread signals with no mutex ordering either side
+     * (#213, D-0121): the owning M writes `schedtick`/clears `preempt`, while a
+     * separate monitor thread reads `schedtick` and the SIGURG handler (another
+     * thread's async context) sets `preempt`. Plain `volatile` orders nothing
+     * across threads, so both are accessed ONLY via `__atomic_*` with RELAXED
+     * ordering. Relaxed is provably enough: neither carries a data payload —
+     * `schedtick` is a monotone liveness counter (a stale read defers one
+     * fairness interval), `preempt` is an advisory "please yield" latch whose
+     * GC-root safety is independent of its memory order (D-0117). `preempt` must
+     * be atomic (not just volatile) because it is written from an async signal
+     * handler; `__atomic` on an aligned int is async-signal-safe and lock-free. */
+    uint64_t schedtick;
+    int preempt;
     int dedicated;
     int ded_joinable;           /* 1 => counted in g_ded_live (LockOSThread #172);
                                  * 0 => threading-compat pin (#175), awaited via
@@ -4272,7 +4284,15 @@ static G *g_global_tail = NULL;
 
 static pthread_mutex_t g_idle_mu = PTHREAD_MUTEX_INITIALIZER; /* idle-M parking */
 static pthread_cond_t g_idle_cv = PTHREAD_COND_INITIALIZER;
-static volatile int g_shutdown = 0;
+/* One-shot exit latch (#213, D-0121). The scheduler reads it under `g_idle_mu`
+ * (paired with the broadcast at shutdown, so parked worker Ms are fully ordered);
+ * the preemption monitor also polls it WITHOUT any lock. `volatile` gives that
+ * unlocked poll no well-defined cross-thread load, so the flag is accessed via
+ * `__atomic_*` with RELAXED ordering. Relaxed suffices: it carries no payload
+ * (a pure "time to exit" trigger), and real liveness/ordering come from the
+ * `g_idle_cv` broadcast + 1 ms timed re-poll on the scheduler side and the
+ * monitor thread join on the shutdown side. */
+static int g_shutdown = 0;
 
 static pthread_mutex_t g_live_mu = PTHREAD_MUTEX_INITIALIZER; /* live-G count   */
 static pthread_cond_t g_live_cv = PTHREAD_COND_INITIALIZER;
@@ -4492,7 +4512,7 @@ static G *sched_find_runnable(M *m) {
         /* Nothing to run: park this M until work arrives or we shut down. A
          * short timed wait re-polls, closing any enqueue/signal lost-wakeup. */
         zap_np_lock(&g_idle_mu);
-        if (g_shutdown) {
+        if (__atomic_load_n(&g_shutdown, __ATOMIC_RELAXED)) {
             zap_np_unlock(&g_idle_mu);
             return NULL;
         }
@@ -4522,8 +4542,8 @@ static void switch_to_g(M *m, G *g) {
     /* Preemption monitor (#172): a fresh scheduling tick + a clean preempt flag.
      * The monitor samples `schedtick`; an unchanged tick across an interval means
      * the same coroutine monopolized this M and earns a preemption request. */
-    m->schedtick++;
-    m->preempt = 0;
+    __atomic_fetch_add(&m->schedtick, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->preempt, 0, __ATOMIC_RELAXED);
     set_bottom(m, &g->sb);
 #ifdef ZAP_GC_IMMIX
     /* Restore this coroutine's shadow-stack head into the per-thread cell the
@@ -4890,7 +4910,9 @@ static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
     if (m->current->locked_m) {
         return; /* a pinned coroutine owns its M — never fairness-preempt it */
     }
-    m->preempt = 1; /* observed at the next safepoint (precise GC) */
+    /* observed at the next safepoint (precise GC); relaxed atomic — advisory
+     * latch, no payload, and async-signal-safe (#213, D-0121) */
+    __atomic_store_n(&m->preempt, 1, __ATOMIC_RELAXED);
 #ifndef ZAP_GC_IMMIX
     /* Conservative GC: switch at the interrupted point directly — but ONLY when
      * we actually interrupted the coroutine running on its green stack. The
@@ -4925,7 +4947,7 @@ static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
         char *hi = lo + g->stack_size;
         if (sp >= lo && sp < hi && g->no_preempt == 0 &&
             !__atomic_load_n(&g_boehm_in_stw, __ATOMIC_SEQ_CST)) {
-            m->preempt = 0;
+            __atomic_store_n(&m->preempt, 0, __ATOMIC_RELAXED);
             copreempt();
         }
     }
@@ -4957,17 +4979,20 @@ static void *zap_monitor_main(void *arg) {
         ts.tv_nsec = ZAP_PREEMPT_SLICE_NS;
         nanosleep(&ts, NULL);
 #endif
-        if (g_shutdown) {
+        if (__atomic_load_n(&g_shutdown, __ATOMIC_RELAXED)) {
             break;
         }
         for (int i = 0; i < g_nm; i++) {
             M *m = &g_ms[i];
-            /* Read without a lock: a benign race. `current` is only tested for
-             * non-NULL (the handler re-checks on the worker thread), and a
-             * 64-bit `schedtick` read is atomic on the supported arch. */
-            uint64_t tick = m->schedtick;
+            /* Read without a lock: `current` is only tested for non-NULL (the
+             * handler re-checks on the worker thread), and `schedtick` is read
+             * via a RELAXED atomic — a well-defined cross-thread load with no
+             * ordering dependence, correct on weak-memory arches too (#213,
+             * D-0121), not the prior plain `volatile` that relied on the access
+             * happening to be atomic on the supported arch. */
+            uint64_t tick = __atomic_load_n(&m->schedtick, __ATOMIC_RELAXED);
             if (m->current && tick == last[i]) {
-                m->preempt = 1;
+                __atomic_store_n(&m->preempt, 1, __ATOMIC_RELAXED);
 #if defined(ZAP_PLATFORM_WINDOWS)
                 /* No SIGURG: hijack the worker directly. Snapshot the green-stack
                  * range of the coroutine we believe is running; zap_win_preempt_try
@@ -5287,7 +5312,7 @@ void zap_rt_join_all(void) {
     }
     zap_np_unlock(&g_ded_mu);
     zap_np_lock(&g_idle_mu);
-    g_shutdown = 1;
+    __atomic_store_n(&g_shutdown, 1, __ATOMIC_RELAXED);
     pthread_cond_broadcast(&g_idle_cv);
     zap_np_unlock(&g_idle_mu);
     /* Stop the preemption monitor (it polls g_shutdown every slice). */
@@ -6156,7 +6181,13 @@ static PollDesc *g_np_free = NULL;  /* recycled descriptors                     
 
 static pthread_once_t g_np_once = PTHREAD_ONCE_INIT;
 static volatile int g_np_started = 0;
-static volatile int g_np_shutdown = 0;
+/* Poller-thread exit latch (#213, D-0121). The shutdown thread sets it then
+ * kicks the poller off its wait and joins; the poller reads it after each wait.
+ * Accessed via RELAXED `__atomic_*` (not plain `volatile`) for a well-defined
+ * cross-thread load. Relaxed is enough: no payload travels with it, and
+ * liveness comes from the kick plus the poller's bounded re-poll, not from this
+ * flag's ordering. */
+static int g_np_shutdown = 0;
 static pthread_t g_np_thread;
 
 static int64_t np_now_ns(void) {
@@ -6358,7 +6389,7 @@ static void *np_poller_main(void *arg) {
     for (;;) {
         int timeout = np_compute_timeout();
         int n = epoll_wait(g_np_epfd, evs, 64, timeout);
-        if (g_np_shutdown) {
+        if (__atomic_load_n(&g_np_shutdown, __ATOMIC_RELAXED)) {
             break;
         }
         if (n < 0) {
@@ -6429,7 +6460,7 @@ static void *np_poller_main(void *arg) {
         np_iocp_arm_needed();
         int timeout = np_compute_timeout();
         int n = zap_iocp_wait(readies, 64, timeout);
-        if (g_np_shutdown) {
+        if (__atomic_load_n(&g_np_shutdown, __ATOMIC_RELAXED)) {
             break;
         }
         if (n < 0) {
@@ -6494,7 +6525,7 @@ static void netpoll_shutdown(void) {
     if (!g_np_started) {
         return;
     }
-    g_np_shutdown = 1;
+    __atomic_store_n(&g_np_shutdown, 1, __ATOMIC_RELAXED);
     np_backend_kick();
     GC_pthread_join(g_np_thread, NULL);
     g_np_started = 0;
@@ -6959,9 +6990,20 @@ static int g_sig_pipe[2] = {-1, -1}; /* [0]=read (netpoller), [1]=write (handler
 static void *g_sig_pd = NULL;        /* PollDesc for the read end                */
 static pthread_t g_sig_thread;
 static volatile int g_sig_active = 0;    /* subsystem started                    */
-static volatile int g_sig_shutdown = 0;  /* signal thread asked to stop          */
+static int g_sig_shutdown = 0;  /* signal thread asked to stop (#213, D-0121):
+                                 * exit latch read by the signal thread after each
+                                 * netpoller wait and set by the shutdown path,
+                                 * which then wakes + joins it. RELAXED __atomic,
+                                 * not plain volatile — no payload; the wake plus
+                                 * re-poll give liveness.                         */
 static pthread_once_t g_sig_once = PTHREAD_ONCE_INIT;
-static volatile sig_atomic_t g_sig_delivered = 0; /* async handler run count (test sync) */
+/* Async-handler run count, polled by zap_raise_signal for FIFO test sync (#213,
+ * D-0121). Bumped inside a real async signal handler and read on another thread,
+ * so it is accessed via RELAXED `__atomic_*` — a monotone counter with no
+ * payload; `__atomic` on an aligned sig_atomic_t stays async-signal-safe and
+ * lock-free. Not plain `volatile`, which would give the cross-thread poll no
+ * well-defined load on weak-memory arches. */
+static sig_atomic_t g_sig_delivered = 0;
 
 /* Drain barrier for deterministic tests (__signal_drain): a sentinel byte (0,
  * never a real signal number) travels the self-pipe behind any pending edges;
@@ -7178,7 +7220,8 @@ static void zap_sig_handler(int signo) {
     unsigned char b = (unsigned char)signo;
     ssize_t r = write(g_sig_pipe[1], &b, 1);
     (void)r;
-    g_sig_delivered++; /* async-signal-safe (sig_atomic_t): test sync counter */
+    /* async-signal-safe relaxed atomic bump (sig_atomic_t): test sync counter */
+    __atomic_fetch_add(&g_sig_delivered, 1, __ATOMIC_RELAXED);
     errno = saved;
 }
 
@@ -7199,7 +7242,7 @@ static void *zap_sig_thread_main(void *arg) {
     unsigned char buf[64];
     for (;;) {
         int64_t r = zap_netpoll_wait(g_sig_pd, ZAP_POLL_READ, 0);
-        if (g_sig_shutdown) {
+        if (__atomic_load_n(&g_sig_shutdown, __ATOMIC_RELAXED)) {
             break;
         }
         if (r == ZAP_POLL_CLOSED) {
@@ -7420,13 +7463,13 @@ static void zap_signal_shutdown(void) {
 #if defined(ZAP_PLATFORM_WINDOWS)
     /* No reader thread or self-pipe to tear down on Windows: just remove the
      * console control handler. Dispatch is synchronous on the handler's thread. */
-    g_sig_shutdown = 1;
+    __atomic_store_n(&g_sig_shutdown, 1, __ATOMIC_RELAXED);
     zap_win_console_uninstall();
     zap_win_console_deliver = NULL;
     g_sig_active = 0;
     return;
 #else
-    g_sig_shutdown = 1;
+    __atomic_store_n(&g_sig_shutdown, 1, __ATOMIC_RELAXED);
     /* Wake the signal thread off its netpoller park so it observes g_sig_shutdown
      * and exits. zap_netpoll_wake now LATCHES when the thread is momentarily
      * between waits (not parked), so this wake is race-free — a plain self-pipe
@@ -7813,12 +7856,15 @@ void zap_signal_raise(int64_t signo) {
         kill(getpid(), s); /* fault: the crash handler runs + re-raises (no return) */
         return;
     }
-    sig_atomic_t before = g_sig_delivered;
+    sig_atomic_t before = __atomic_load_n(&g_sig_delivered, __ATOMIC_RELAXED);
     kill(getpid(), s);
     /* Spin until the async handler has written this edge to the self-pipe, so a
      * following __signal_drain sees it first in FIFO order. Bounded so a dropped
      * signal cannot hang a test. */
-    for (int i = 0; i < 2000000 && g_sig_delivered == before; i++) {
+    for (int i = 0;
+         i < 2000000 &&
+         __atomic_load_n(&g_sig_delivered, __ATOMIC_RELAXED) == before;
+         i++) {
         sched_yield();
     }
 #endif

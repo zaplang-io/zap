@@ -538,8 +538,12 @@ void zap_safepoint(void) {
      * for the GC below instead, which also frees its M. */
     {
         M *m = cur_m;
-        if (m && m->preempt && m->current && !zap_gc_wanted && !zap_collecting) {
-            m->preempt = 0;
+        /* `preempt` is a cross-thread advisory flag set by the monitor/SIGURG
+         * handler; read and cleared here via RELAXED atomics (#213, D-0121),
+         * never plain `volatile`. */
+        if (m && __atomic_load_n(&m->preempt, __ATOMIC_RELAXED) && m->current &&
+            !zap_gc_wanted && !zap_collecting) {
+            __atomic_store_n(&m->preempt, 0, __ATOMIC_RELAXED);
             copreempt();
         }
     }

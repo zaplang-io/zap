@@ -4947,3 +4947,82 @@ overlap under both collectors with a deterministic, order-independent total; it
 cannot deterministically *trigger* the race but widens the net and documents the
 intent. Relates to #213 (the broader volatile-as-sync audit — this settles the
 STW flag) and #295 (the flake tracker).
+
+## D-0121 — Cross-thread runtime flags use `__atomic` with an explicit ordering, not plain `volatile` (I#213)
+
+**Status:** Locked — a runtime synchronization decision (`crates/codegen/src/zaprt.c`
+and the `zapgc.inc.c` safepoint it shares a translation unit with). Weak-memory
+correctness hardening; no language or observable-behavior change. Completes the
+`volatile`-as-synchronization audit that #213 opened and that D-0120 began for the
+single `g_boehm_in_stw` STW guard.
+
+**Context.** The M:N runtime signals several conditions across threads with flag
+variables that were declared `volatile`. `volatile` constrains only the compiler
+(no fold, no reorder relative to other volatiles); it provides **no atomicity or
+cross-thread ordering** at the hardware level. On x86_64 the strong TSO memory
+model hides this, but AArch64's weaker model does not — a plain `volatile` load on
+one thread has no well-defined relationship to a `volatile` store on another, and
+nothing forces atomicity of the access. The aarch64 CI job (I#204) passing was
+therefore not evidence the pattern is sound. No failure was ever traced to one of
+these flags, but relying on TSO is a latent portability hazard, so #213 asked for
+a deliberate pass converting the genuine cross-thread signals to `__atomic_*`.
+
+**Decision.** For each `volatile`-as-synchronization flag, decide per field
+whether it is a genuine cross-thread signal with no mutex ordering on both sides.
+If so, access it **only** through `__atomic_*` builtins with an explicitly chosen
+(and documented-in-place) memory order, never plain `volatile`. If a mutex,
+`pthread_once`, or another happens-before already orders both sides, leave it
+unchanged rather than churn it. `g_boehm_in_stw` is excluded — D-0120 already
+converted it (seq-cst, because it must order the STW bracket against the handler's
+observation).
+
+*Converted — all `__ATOMIC_RELAXED`*, because each is a pure control signal that
+carries **no data payload**, so no acquire/release edge is needed; RELAXED still
+gives a well-defined, atomic, coherent cross-thread access (what `volatile`
+lacked), and the real liveness/ordering comes from the mechanisms noted:
+
+| Flag | Writer / reader | Why RELAXED is enough |
+|------|-----------------|------------------------|
+| `M.schedtick` | owning M bumps; monitor thread reads | monotone liveness counter; a stale read defers one fairness interval |
+| `M.preempt` | SIGURG handler + monitor set; M + safepoint clear | advisory "please yield" latch; GC-root safety is independent of its order (D-0117); must be atomic (not just volatile) as it is written from an async signal handler |
+| `g_shutdown` | shutdown sets (under `g_idle_mu` + broadcast); scheduler reads under the mutex, monitor polls unlocked | one-shot exit latch, no payload; the broadcast + timed re-poll and the monitor join give liveness/ordering — the atomic just makes the monitor's unlocked poll well-defined |
+| `g_np_shutdown` | shutdown sets then kicks + joins; poller reads after each wait | exit latch; kick + bounded re-poll give liveness |
+| `g_sig_shutdown` | shutdown sets then wakes + joins; signal thread reads after each wait | exit latch; wake + re-poll give liveness |
+| `g_sig_delivered` | async signal handler bumps; `zap_raise_signal` spins reading it | monotone test-sync counter, no payload; `__atomic` on an aligned `sig_atomic_t` is async-signal-safe and lock-free |
+
+`__atomic` loads/stores on an aligned `int` / `uint64_t` / `sig_atomic_t` are
+lock-free on every supported arch (x86_64, aarch64), so the two flags touched from
+async signal handlers (`M.preempt`, `g_sig_delivered`) stay **async-signal-safe** —
+matching the existing `__atomic_fetch_add` on profiler counters and the D-0120 STW
+guard.
+
+*Left as plain `volatile` (documented in place), because each is already fully
+ordered:*
+
+- `Waiter.done` — written by the waker and read by the parked native waiter, both
+  **under the channel mutex** (`coready` holds it to set + signal; `copark` holds
+  it across the `pthread_cond_wait` loop). The mutex is the happens-before edge;
+  the `volatile` is redundant but benign.
+- `ded_runnable` / `ded_stop` — read and written **only under `ded_mu`** (the
+  dedicated-M loop and `sched_enqueue`). `ded_stop` currently has no writer at all
+  (dormant teardown path); when one is added it will be under `ded_mu` too.
+- `g_np_started` / `g_sig_active` — the subsystem-started latches are written
+  inside their `pthread_once` init (which establishes happens-before to every
+  later reader) and otherwise only at post-join shutdown; no concurrent
+  unsynchronized write/read pair exists.
+- `g_np_t_byte` / `g_np_t_status` — netpoller self-test scratch, ordered by the
+  buffered-channel send/recv that brackets the two test coroutines.
+- `in_hijack` (Windows `LONG`) — a Windows-only monitor-side hijack guard
+  manipulated through the Win32 interlocked preempt primitive, not a POSIX/aarch64
+  concern.
+
+**Verification honesty.** The C runtime cannot be built on the maintainer's
+authoring host (no LLVM-18/libgc; Docker unusable), so clippy and the runtime
+tests were not run locally — **CI is the sole gate**, as for D-0117/D-0119/D-0120.
+A standalone host `cc -Wall -Wextra` snippet confirmed every `__atomic` pattern
+compiles and is lock-free for `int`/`uint64_t`/`sig_atomic_t`. This is a
+correctness/portability hardening with no behavior change and no reproduced
+failure to point at; the aarch64 stress goldens re-enabled in the same change
+(#698, see CHANGELOG) exercise the preempt/netpoller paths this touches on real
+aarch64 CI. Relates to D-0120 (the STW-guard flag), D-0117 (the root-safety
+invariant `M.preempt`'s RELAXED order leans on), and the platform epic #158.
