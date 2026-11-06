@@ -347,6 +347,29 @@ static void zap_profile_env_init(void);       /* parse ZAP_PROFILE* at main top 
 static void zap_profile_env_maybe_start(void);/* auto-start once g_ms exists      */
 static void zap_profile_teardown(void);       /* final free (all workers joined) */
 
+/* Out-of-memory policy (D-0119, #697). A NULL result from the allocator means
+ * heap exhaustion, and generated code stores into an allocation result WITHOUT a
+ * null check — so an unchecked NULL becomes a wild nil-deref SIGSEGV at address 0
+ * instead of a diagnosable error. This one collector-agnostic helper is the
+ * single clean exit for every exhaustion path: it prints `zap: out of memory`
+ * (an optional `detail` names the failing path) and aborts. `abort()` is the
+ * established runtime-fatal convention in this file (see the list-sort, bytes and
+ * container paths); it raises SIGABRT for a nonzero exit and leaves a core for
+ * triage. OOM is process-fatal, not a catchable Zap exception: the mutator holds
+ * unrooted temporaries at the raising allocation site, so unwinding through
+ * zap_panic would be unsafe. Under Boehm the wrappers below call it when
+ * GC_MALLOC / GC_MALLOC_ATOMIC return NULL (bdwgc's default GC_oom_fn returns 0);
+ * under Immix zapgc.inc.c routes its map failures and the ZAP_GC_HEAP_LIMIT cap
+ * through it so both collectors fail identically. */
+__attribute__((noreturn)) static void zap_oom(const char *detail) {
+    if (detail && *detail) {
+        fprintf(stderr, "zap: out of memory (%s)\n", detail);
+    } else {
+        fprintf(stderr, "zap: out of memory\n");
+    }
+    abort();
+}
+
 #ifdef ZAP_GC_IMMIX
 /* Precise collector entry points (defined in zapgc.inc.c, #included below). */
 void *zap_gc_alloc(const ZapTypeDesc *desc);
@@ -412,28 +435,37 @@ void zap_gc_write_barrier(void **slot) { (void)slot; }
  * coroutine on the same M calling GC_MALLOC would deadlock on that lock. So each
  * allocation is a no-preempt window — the one runtime lock a tight, yield-free
  * compute loop actually touches. */
+/* Every Boehm allocation checks the result: on heap exhaustion GC_MALLOC /
+ * GC_MALLOC_ATOMIC return NULL (bdwgc's default GC_oom_fn returns 0), and codegen
+ * stores into the returned pointer unchecked (#697), so an unchecked NULL faults
+ * as a nil-deref SIGSEGV at address 0. Routing NULL through zap_oom turns that
+ * wild fault into a clean `zap: out of memory` abort. */
 static inline void *zap_alloc_desc(const ZapTypeDesc *d) {
     zap_np_enter();
     void *p = GC_MALLOC((size_t)d->size);
     zap_np_leave();
+    if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_obj(const ZapTypeDesc *d) {
     zap_np_enter();
     void *p = GC_MALLOC((size_t)d->size);
     zap_np_leave();
+    if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_buf(int64_t n) {
     zap_np_enter();
     void *p = GC_MALLOC_ATOMIC((size_t)n);
     zap_np_leave();
+    if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_ptrbuf(int64_t n) {
     zap_np_enter();
     void *p = GC_MALLOC((size_t)n);
     zap_np_leave();
+    if (!p) zap_oom(NULL);
     return p;
 }
 #define ZAP_INFRA_ALLOC(n) GC_MALLOC(n)
@@ -586,7 +618,9 @@ void *zap_alloc(int64_t size) {
      * net rather than a hot path. */
     return zap_gc_alloc_atomic(size);
 #else
-    return GC_MALLOC((size_t)size);
+    void *p = GC_MALLOC((size_t)size);
+    if (!p) zap_oom(NULL); /* unchecked NULL would nil-deref in generated code (#697) */
+    return p;
 #endif
 }
 
@@ -4800,7 +4834,7 @@ static pthread_mutex_t g_preempt_stw_mu = PTHREAD_MUTEX_INITIALIZER;
 
 #ifndef ZAP_GC_IMMIX
 /* Boehm stop-the-world guard (ticket #172; ordering hardened for #693/#213,
- * D-0119). Boehm's STW suspends threads with a signal and expects a suspended
+ * D-0120). Boehm's STW suspends threads with a signal and expects a suspended
  * thread to stay put; an async-preemption switch fired on a thread Boehm is
  * stopping would move it out from under the collector. `GC_set_on_collection_event`
  * brackets STW: the flag is set BEFORE any thread is suspended (PRE_STOP_WORLD) and
@@ -4872,7 +4906,7 @@ static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
      * between seeing "no STW" and committing to the swap) is the few instructions
      * before `copreempt`, and the read is correctly ordered against the release
      * store in `zap_boehm_gc_event` (so a weak-memory arch cannot see a stale 0
-     * after STW began — #693/#213, D-0119). If STW nonetheless begins inside that
+     * after STW began — #693/#213, D-0120). If STW nonetheless begins inside that
      * residual window, the swap is still GC-root-safe: the registers live at the
      * suspend are captured by bdwgc's STW register snapshot, and the coroutine's
      * stack is its green stack — a GC_MALLOC object reachable through its `G` in
@@ -16849,7 +16883,7 @@ static void zap_prof_handler(int sig, siginfo_t *info, void *uc) {
     if (__atomic_load_n(&g_boehm_in_stw, __ATOMIC_SEQ_CST)) {
         return; /* Boehm is stopping the world; stay out of its way (seq-cst
                  * acquire, paired with the release store in zap_boehm_gc_event —
-                 * #693/#213, D-0119) */
+                 * #693/#213, D-0120) */
     }
 #endif
     /* In a runtime critical section (holds a lock / mid-allocation): bucket the

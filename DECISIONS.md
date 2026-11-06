@@ -4809,7 +4809,64 @@ each by identity; `finally`/`with` cleanup under cancellation is covered
 form-independently by `scope_timeout`/`scope_cleanup`). Grammar unchanged (grammar
 already admitted these calls; this is lowering/sema).
 
-## D-0119 — gc-boehm async-preempt STW guard is a seq-cst atomic, not plain `volatile` (I#693, I#213)
+## D-0119 — A NULL allocator result is out-of-memory: the runtime aborts cleanly, never hands NULL to generated code (I#697)
+
+**Status:** Accepted. A runtime robustness fix; it defines what the allocator
+does on heap exhaustion. Collector-agnostic, no surface-language change.
+
+**Context.** Generated code stores into an allocation result **without a null
+check** — the allocation site is `call zap_alloc…` immediately followed by a
+store through the returned pointer. Under gc-boehm, `GC_MALLOC` /
+`GC_MALLOC_ATOMIC` return `NULL` on heap exhaustion (bdwgc's default `GC_oom_fn`
+returns `0`), and the wrappers (`zap_alloc`, `zap_alloc_desc`, `zap_obj`,
+`zap_buf`, `zap_ptrbuf`) returned that `NULL` unchecked. The result was a wild
+nil-deref **SIGSEGV at address 0** instead of a diagnosable error. This was
+pinned down from a native core on a 32-vCPU Graviton box (#650): the
+`concurrent_queue_mpsc_coro_stress` golden, run under the stress harness's
+artificial `GC_FREE_SPACE_DIVISOR=40` tight-heap knob, faulted at
+`Queue$int64__push` on `str x9,[x0]` with `x0 = 0` — `x0` being the return of a
+`zap_alloc(8)` a few instructions earlier (the inner `Some(v)` Optional box) with
+no intervening write. The **same binary without the divisor knob is 200/200
+clean** at the same core count: genuine heap exhaustion under a deliberately tiny
+heap, not a GC correctness race. (Distinct from the #223 deadlock, D-0117.)
+
+The precise (gc-immix) allocator already `abort()`ed on OS map failure and on the
+`ZAP_GC_HEAP_LIMIT` cap, but with several ad-hoc messages and no uniform
+"allocation returned NULL" guard.
+
+**Decision.** A `NULL` allocator result means out of memory, and the runtime
+**prints a clean `zap: out of memory` to stderr and `abort()`s** (nonzero exit,
+core left for triage) rather than returning `NULL` to generated code. One
+collector-agnostic helper, `zap_oom(detail)`, is the single exit for every
+exhaustion path:
+
+- **Boehm:** each wrapper checks the `GC_MALLOC`/`GC_MALLOC_ATOMIC` result and
+  calls `zap_oom(NULL)` on `NULL`.
+- **Immix:** the block-map and large-object-map failures, the `ZAP_GC_HEAP_LIMIT`
+  mapped-memory and live-set caps, and a defensive guard on the
+  `zap_gc_alloc_sized` result all route through `zap_oom`, so both collectors
+  fail identically.
+
+**Why abort, not a catchable exception.** OOM is process-fatal here. At the
+raising allocation site the mutator holds unrooted temporaries, so unwinding
+through `zap_panic` (the `raise`/exception path) would itself need to allocate
+and traverse unsafe state. `abort()` is already this runtime's convention for
+non-recoverable faults (the list-sort, bytes, deque, and container paths). A
+future catchable `MemoryError` is a possible increment, not a gap.
+
+**Scope.** Robustness only. It converts a wild nil-deref SIGSEGV into a clean,
+diagnosable abort; it does **not** address any underlying GC-state race, and it
+is independent of the #223 deadlock fix (D-0117).
+
+**Docs.** CHANGELOG (Fixed), STABILITY (§7 runtime-fault note), and this decision.
+Test: `crates/driver/tests/gc.rs::immix_oom_aborts_cleanly_not_segfault` forces
+OOM deterministically via `ZAP_GC_HEAP_LIMIT` (an unbounded live set) and asserts
+a clean `out of memory` message with a nonzero exit, not a SIGSEGV. The boehm
+`GC_MALLOC`-NULL path shares the same `zap_oom` guard (bdwgc exhaustion is not
+deterministically reproducible in a unit test). Grammar/spec unchanged (runtime
+only).
+
+## D-0120 — gc-boehm async-preempt STW guard is a seq-cst atomic, not plain `volatile` (I#693, I#213)
 
 **Status:** Locked — a runtime synchronization decision for the conservative
 (gc-boehm) collector's interaction with async fairness preemption (ticket #172).

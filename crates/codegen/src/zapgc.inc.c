@@ -1398,8 +1398,7 @@ void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes) {
 static ZapBlock *zap_map_block(void) {
     void *mem = NULL;
     if (zap_os_aligned_alloc(&mem, ZAP_BLOCK, ZAP_BLOCK) != 0 || !mem) {
-        fprintf(stderr, "zap: out of memory (block map)\n");
-        abort();
+        zap_oom("block map"); /* collector-agnostic clean OOM abort (D-0119, #697) */
     }
     ZapBlock *b = (ZapBlock *)mem;
     b->kind = ZAP_BK_SMALL;
@@ -1439,8 +1438,7 @@ static void zap_account_refill(ZapBlock *b) {
      * here (runtime C holds unrooted temporaries), but aborting is always safe.
      * Used only by the GC reclamation tests; the cap is unset in normal runs. */
     if (zap_heap_limit && zap_total_mapped > zap_heap_limit) {
-        fprintf(stderr, "zap: mapped heap exceeds ZAP_GC_HEAP_LIMIT %zu\n", zap_heap_limit);
-        abort();
+        zap_oom("mapped heap exceeds ZAP_GC_HEAP_LIMIT"); /* D-0119, #697 */
     }
 }
 
@@ -1552,8 +1550,7 @@ static void *zap_alloc_los(size_t osize) {
     size_t total = ((osize + ZAP_RESERVED_BYTES + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
     void *mem = NULL;
     if (zap_os_aligned_alloc(&mem, ZAP_BLOCK, total) != 0 || !mem) {
-        fprintf(stderr, "zap: out of memory (LOS map)\n");
-        abort();
+        zap_oom("large-object map"); /* collector-agnostic clean OOM abort (D-0119, #697) */
     }
     pthread_mutex_lock(&zap_heap_mu);
     ZapBlock *b = (ZapBlock *)mem;
@@ -1570,8 +1567,7 @@ static void *zap_alloc_los(size_t osize) {
     }
     if (zap_heap_limit && zap_total_mapped > zap_heap_limit) {
         pthread_mutex_unlock(&zap_heap_mu);
-        fprintf(stderr, "zap: mapped heap exceeds ZAP_GC_HEAP_LIMIT %zu\n", zap_heap_limit);
-        abort();
+        zap_oom("mapped heap exceeds ZAP_GC_HEAP_LIMIT"); /* D-0119, #697 */
     }
     pthread_mutex_unlock(&zap_heap_mu);
     /* Object header placed right after the block metadata; a block-aligned
@@ -1599,6 +1595,10 @@ static void *zap_gc_alloc_sized(const ZapTypeDesc *desc, size_t payload_size) {
     } else {
         hdr = zap_bump_mutator(osize); /* small/medium: lock-free per-P buffer */
     }
+    /* The bump and LOS paths map more memory (or abort via zap_oom) rather than
+     * returning NULL, so this guard is defense in depth: no allocation result is
+     * ever handed to generated code unchecked (D-0119, #697). */
+    if (!hdr) zap_oom(NULL);
     void *payload = (char *)hdr + ZAP_HEADER_BYTES;
     ZAP_HDR(payload) = (uintptr_t)desc; /* mark bit 0 clear */
     ZAP_OSIZE(payload) = payload_size;
@@ -1675,9 +1675,7 @@ static void zap_mark_sweep(void) {
      * cap after a full collection means genuinely too much live data (or a
      * collector bug that retains garbage). Used by the GC reclamation tests. */
     if (zap_heap_limit && zap_live_estimate > zap_heap_limit) {
-        fprintf(stderr, "zap: live heap %zu exceeds ZAP_GC_HEAP_LIMIT %zu\n",
-                zap_live_estimate, zap_heap_limit);
-        abort();
+        zap_oom("live heap exceeds ZAP_GC_HEAP_LIMIT"); /* D-0119, #697 */
     }
     /* Grow the threshold toward ~2x the live set to amortize collection cost,
      * but never beyond the hard cap so the cap still forces timely collections. */

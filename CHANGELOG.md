@@ -390,8 +390,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Out-of-memory is now a clean abort, not a nil-deref crash** (#697, D-0119).
+  Generated code stores into an allocation result without a null check, so on
+  heap exhaustion — where gc-boehm's `GC_MALLOC` returns `NULL` (bdwgc's default
+  OOM handler returns `0`) — the runtime handed `NULL` to that store and faulted
+  as a wild SIGSEGV at address 0 (pinned from a Graviton core, #650: a
+  `zap_alloc(8)` returned `NULL` under the stress harness's artificial tight-heap
+  knob and was dereferenced unchecked). The allocator wrappers now treat a `NULL`
+  result as out of memory and print `zap: out of memory` then `abort()` with a
+  nonzero exit. Collector-agnostic: one shared `zap_oom` helper is the single exit
+  for both the boehm `GC_MALLOC`-NULL path and the immix map-failure /
+  `ZAP_GC_HEAP_LIMIT`-cap paths, which it unifies. Robustness only — it makes an
+  OOM diagnosable; it does not change any GC-state behavior and is independent of
+  the #223 deadlock fix.
 - **gc-boehm async-preempt vs stop-the-world: the `g_boehm_in_stw` guard is now
-  a correctly-ordered atomic** (#693, D-0119; folds in #213 for this flag). Under
+  a correctly-ordered atomic** (#693, D-0120; folds in #213 for this flag). Under
   the conservative collector the SIGURG fairness-preemption handler performs an
   in-signal coroutine switch (`copreempt`) gated by `g_boehm_in_stw`, which
   brackets bdwgc's stop-the-world. The flag was a plain `volatile sig_atomic_t`,
