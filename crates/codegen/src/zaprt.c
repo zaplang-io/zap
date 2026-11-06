@@ -14470,8 +14470,13 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
  * are built only after the final park. The socket BIO is BIO_NOCLOSE, so
  * the runtime owns the fd and closes it exactly once via `zap_sock_shutdown`.
  * ========================================================================== */
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/obj_mac.h>
+#include <openssl/objects.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
@@ -14608,6 +14613,526 @@ int64_t zap_crypto_rsa_sha256_verify(void *pem, void *data, void *sig) {
         return zap_crypto_rsa_verify_reject("crypto.rsa_sha256_verify: PKCS#1 v1.5 initialization failed");
     }
     return ok;
+}
+
+/* ==========================================================================
+ * crypto: validated asymmetric-key metadata/import + P-256 ECDSA + Ed25519
+ * (ticket #643, D-0126)
+ * --------------------------------------------------------------------------
+ * A validated, OpenSSL-backed surface over three key families (RSA, P-256 EC,
+ * Ed25519) for the JWT library (zaplang-io/jwt). Everything here is PEM- or
+ * raw-component-based and exposes NO raw OpenSSL state:
+ *   - key_info getters introspect a supported PEM key (kind/bits/curve/private);
+ *     `key_kind` is the validating gate and raises a catchable ValueError on an
+ *     unparseable, unsupported, or encrypted key.
+ *   - `*_public_key_pem` build a validated SubjectPublicKeyInfo PEM from JWK
+ *     integer/octet components (RSA n/e, P-256 x/y, Ed25519 x).
+ *   - ES256 (`p256_sha256_*`) uses the JOSE fixed-width 64-byte r||s encoding
+ *     exclusively (DER is never surfaced; it is converted internally through
+ *     ECDSA_SIG for OpenSSL). Ed25519 (`ed25519_*`) is pure Ed25519 over the
+ *     original message (RFC 8032) — no implicit SHA-256, no Ed25519ph.
+ * Algorithm/key-family/role binding is strict: signing loads only a PRIVATE key
+ * of the exact family (a public PEM fails the private read -> ValueError); a
+ * verifier loads only a PUBLIC key of the exact family and returns `false` on any
+ * mismatch; a wrong curve, wrong family, or wrong signature length can never
+ * silently select another primitive. Key loading NEVER prompts on stdin: a
+ * zero-returning passphrase callback makes encrypted keys fail deterministically.
+ * Signing raises a catchable ValueError on failure; verification is always a
+ * plain boolean (bad key / bad signature -> `false`), mirroring the RSA surface.
+ * OpenSSL objects are non-GC heap freed before return; the GC `bytes` result is
+ * the last allocation, as in the hash one-shots. The APIs compile on the unified
+ * post-1.1.0 OpenSSL API and LibreSSL (some calls are deprecated-but-present on
+ * OpenSSL 3.x; the build does not use -Werror). */
+
+/* Upper bounds on imported RSA components, to keep imports bounded (#643). A
+ * 1024-byte modulus is an 8192-bit key — larger than any JWK RS256 deployment —
+ * and a public exponent needs only a few bytes (65537 is 3). */
+#define ZAP_CRYPTO_RSA_N_MAX 1024
+#define ZAP_CRYPTO_RSA_E_MAX 16
+/* P-256 affine coordinates and Ed25519 public keys are exactly 32 bytes; ES256
+ * and Ed25519 signatures are exactly 64 bytes (RFC 7518 §3.4 / RFC 8032). */
+#define ZAP_CRYPTO_P256_COORD_LEN 32
+#define ZAP_CRYPTO_ED25519_KEY_LEN 32
+#define ZAP_CRYPTO_JOSE_SIG_LEN 64
+
+/* Never supply a passphrase: encrypted PEM keys fail deterministically instead
+ * of OpenSSL's default of prompting on the controlling terminal (#643). */
+static int zap_crypto_no_pw(char *buf, int size, int rwflag, void *u) {
+    (void)buf;
+    (void)size;
+    (void)rwflag;
+    (void)u;
+    return 0;
+}
+
+/* A GC `str` from a NUL-terminated C literal, length measured with strlen so the
+ * error-message literals below never carry a miscounted length. */
+static void *zap_crypto_cstr(const char *s) {
+    return zap_str_new(s, (int64_t)strlen(s));
+}
+
+/* Load a PEM key, trying a private key first and then a public key, over
+ * independent read-only memory BIOs (a read-only mem BIO is consumed by the
+ * first read). `*is_private` is set to 1/0 on success. Returns NULL if neither
+ * parse succeeds (including encrypted keys, via the zero-returning callback). */
+static EVP_PKEY *zap_crypto_pem_to_pkey(ZapStr *pem, int *is_private) {
+    BIO *b1 = BIO_new_mem_buf(pem->data, (int)pem->len);
+    EVP_PKEY *pkey =
+        b1 ? PEM_read_bio_PrivateKey(b1, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (b1) {
+        BIO_free(b1);
+    }
+    if (pkey) {
+        if (is_private) {
+            *is_private = 1;
+        }
+        return pkey;
+    }
+    BIO *b2 = BIO_new_mem_buf(pem->data, (int)pem->len);
+    pkey = b2 ? PEM_read_bio_PUBKEY(b2, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (b2) {
+        BIO_free(b2);
+    }
+    if (pkey && is_private) {
+        *is_private = 0;
+    }
+    return pkey;
+}
+
+/* Copy a memory BIO's whole contents into a fresh GC `bytes`/`str` value. */
+static void *zap_crypto_bio_to_bytes(BIO *bio) {
+    BUF_MEM *bptr = NULL;
+    BIO_get_mem_ptr(bio, &bptr);
+    if (!bptr || !bptr->data) {
+        return zap_crypto_cstr("");
+    }
+    return zap_str_new(bptr->data, (int64_t)bptr->length);
+}
+
+/* The P-256 (prime256v1) group NID of an EC `pkey`, or NID_undef for a non-EC
+ * key. Uses the legacy `EVP_PKEY_get0_EC_KEY` accessor (present on OpenSSL
+ * 1.1+/3.x and LibreSSL). */
+static int zap_crypto_ec_curve_nid(EVP_PKEY *pkey) {
+    if (!pkey || EVP_PKEY_base_id(pkey) != EVP_PKEY_EC) {
+        return NID_undef;
+    }
+    const EC_KEY *ec = EVP_PKEY_get0_EC_KEY(pkey);
+    if (!ec) {
+        return NID_undef;
+    }
+    const EC_GROUP *grp = EC_KEY_get0_group(ec);
+    return grp ? EC_GROUP_get_curve_name(grp) : NID_undef;
+}
+
+/* crypto.key_info getters (#643). `key_kind` validates and is the gate. */
+void *zap_crypto_key_kind(void *pem) {
+    int is_priv = 0;
+    EVP_PKEY *pkey = zap_crypto_pem_to_pkey((ZapStr *)pem, &is_priv);
+    if (!pkey) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.key_info: could not parse a supported "
+                        "public/private key from PEM (encrypted keys are "
+                        "rejected)"));
+    }
+    const char *kind = NULL;
+    switch (EVP_PKEY_base_id(pkey)) {
+    case EVP_PKEY_RSA:
+        kind = "RSA";
+        break;
+    case EVP_PKEY_EC:
+        kind = "EC";
+        break;
+    case EVP_PKEY_ED25519:
+        kind = "Ed25519";
+        break;
+    default:
+        break;
+    }
+    EVP_PKEY_free(pkey);
+    if (!kind) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.key_info: unsupported key type (expected RSA, "
+                        "EC, or Ed25519)"));
+    }
+    return zap_str_new(kind, (int64_t)strlen(kind));
+}
+
+int64_t zap_crypto_key_bits(void *pem) {
+    int is_priv = 0;
+    EVP_PKEY *pkey = zap_crypto_pem_to_pkey((ZapStr *)pem, &is_priv);
+    if (!pkey) {
+        return 0;
+    }
+    int bits = EVP_PKEY_bits(pkey);
+    EVP_PKEY_free(pkey);
+    return (int64_t)(bits > 0 ? bits : 0);
+}
+
+void *zap_crypto_key_curve(void *pem) {
+    int is_priv = 0;
+    EVP_PKEY *pkey = zap_crypto_pem_to_pkey((ZapStr *)pem, &is_priv);
+    const char *curve = "";
+    if (pkey) {
+        switch (zap_crypto_ec_curve_nid(pkey)) {
+        case NID_X9_62_prime256v1:
+            curve = "P-256";
+            break;
+        case NID_secp384r1:
+            curve = "P-384";
+            break;
+        case NID_secp521r1:
+            curve = "P-521";
+            break;
+        case NID_undef:
+            curve = "";
+            break;
+        default: {
+            const char *sn = OBJ_nid2sn(zap_crypto_ec_curve_nid(pkey));
+            curve = sn ? sn : "";
+            break;
+        }
+        }
+    }
+    void *out = zap_str_new(curve, (int64_t)strlen(curve));
+    if (pkey) {
+        EVP_PKEY_free(pkey);
+    }
+    return out;
+}
+
+int64_t zap_crypto_key_is_private(void *pem) {
+    int is_priv = 0;
+    EVP_PKEY *pkey = zap_crypto_pem_to_pkey((ZapStr *)pem, &is_priv);
+    if (pkey) {
+        EVP_PKEY_free(pkey);
+    }
+    return is_priv ? 1 : 0;
+}
+
+/* Serialize a built public-key EVP_PKEY as SubjectPublicKeyInfo PEM bytes, then
+ * free it. Raises ValueError (via `reason`) if serialization fails. */
+static void *zap_crypto_pkey_to_pub_pem(EVP_PKEY *pkey, const char *reason) {
+    BIO *bio = BIO_new(BIO_s_mem());
+    int ok = bio && PEM_write_bio_PUBKEY(bio, pkey) == 1;
+    void *out = ok ? zap_crypto_bio_to_bytes(bio) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    EVP_PKEY_free(pkey);
+    if (!ok) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new(reason, (int64_t)strlen(reason)));
+    }
+    return out;
+}
+
+void *zap_crypto_rsa_public_key_pem(void *n_bytes, void *e_bytes) {
+    ZapStr *n = (ZapStr *)n_bytes;
+    ZapStr *e = (ZapStr *)e_bytes;
+    if (n->len <= 0 || e->len <= 0 || n->len > ZAP_CRYPTO_RSA_N_MAX ||
+        e->len > ZAP_CRYPTO_RSA_E_MAX) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.rsa_public_key_pem: n/e out of bounds"));
+    }
+    BIGNUM *bn = BN_bin2bn((const unsigned char *)n->data, (int)n->len, NULL);
+    BIGNUM *be = BN_bin2bn((const unsigned char *)e->data, (int)e->len, NULL);
+    /* BN_bin2bn reads an unsigned big-endian integer, so both are >= 0. A usable
+     * RSA public key needs an odd modulus (product of odd primes) and an odd
+     * exponent >= 3 (an even e is not invertible mod lambda(n)). */
+    int valid = bn && be && !BN_is_zero(bn) && !BN_is_zero(be) &&
+                BN_is_odd(bn) && BN_is_odd(be) && BN_cmp(be, BN_value_one()) > 0;
+    if (!valid) {
+        BN_free(bn);
+        BN_free(be);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.rsa_public_key_pem: invalid RSA "
+                                    "public parameters (n must be odd, e must "
+                                    "be an odd integer > 1)"));
+    }
+    RSA *rsa = RSA_new();
+    EVP_PKEY *pkey = EVP_PKEY_new();
+    /* RSA_set0_key takes ownership of bn/be on success; d is NULL for a public
+     * key. EVP_PKEY_assign_RSA takes ownership of rsa on success. */
+    if (!rsa || !pkey || RSA_set0_key(rsa, bn, be, NULL) != 1) {
+        BN_free(bn);
+        BN_free(be);
+        RSA_free(rsa);
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.rsa_public_key_pem: key assembly failed"));
+    }
+    if (EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        RSA_free(rsa);
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.rsa_public_key_pem: key assembly failed"));
+    }
+    return zap_crypto_pkey_to_pub_pem(
+        pkey, "crypto.rsa_public_key_pem: PEM serialization failed");
+}
+
+void *zap_crypto_p256_public_key_pem(void *x_bytes, void *y_bytes) {
+    ZapStr *x = (ZapStr *)x_bytes;
+    ZapStr *y = (ZapStr *)y_bytes;
+    if (x->len != ZAP_CRYPTO_P256_COORD_LEN ||
+        y->len != ZAP_CRYPTO_P256_COORD_LEN) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.p256_public_key_pem: each "
+                                    "coordinate must be exactly 32 bytes"));
+    }
+    EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    BIGNUM *bx = BN_bin2bn((const unsigned char *)x->data, (int)x->len, NULL);
+    BIGNUM *by = BN_bin2bn((const unsigned char *)y->data, (int)y->len, NULL);
+    /* set_public_key_affine_coordinates rejects a point not on the curve; the
+     * follow-up EC_KEY_check_key rejects the point at infinity and bad order. */
+    int on_curve = ec && bx && by &&
+                   EC_KEY_set_public_key_affine_coordinates(ec, bx, by) == 1 &&
+                   EC_KEY_check_key(ec) == 1;
+    BN_free(bx);
+    BN_free(by);
+    if (!on_curve) {
+        EC_KEY_free(ec);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.p256_public_key_pem: (x, y) is not "
+                                    "a valid point on P-256"));
+    }
+    EVP_PKEY *pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+        EC_KEY_free(ec);
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.p256_public_key_pem: key assembly failed"));
+    }
+    return zap_crypto_pkey_to_pub_pem(
+        pkey, "crypto.p256_public_key_pem: PEM serialization failed");
+}
+
+void *zap_crypto_ed25519_public_key_pem(void *x_bytes) {
+    ZapStr *x = (ZapStr *)x_bytes;
+    if (x->len != ZAP_CRYPTO_ED25519_KEY_LEN) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.ed25519_public_key_pem: public key "
+                                    "must be exactly 32 bytes"));
+    }
+    EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(
+        EVP_PKEY_ED25519, NULL, (const unsigned char *)x->data, (size_t)x->len);
+    if (!pkey) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.ed25519_public_key_pem: invalid Ed25519 public "
+                        "key"));
+    }
+    return zap_crypto_pkey_to_pub_pem(
+        pkey, "crypto.ed25519_public_key_pem: PEM serialization failed");
+}
+
+/* ES256 signing (#643): load a P-256 private key, sign SHA-256 of the message,
+ * and return the signature as JOSE fixed-width 64-byte r||s. Raises ValueError
+ * on a non-private key, a non-P-256 key, or a signing failure. */
+void *zap_crypto_p256_sha256_sign(void *pem, void *msg) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *m = (ZapStr *)msg;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey =
+        bio ? PEM_read_bio_PrivateKey(bio, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.p256_sha256_sign: could not parse a "
+                                    "P-256 private key from PEM"));
+    }
+    if (zap_crypto_ec_curve_nid(pkey) != NID_X9_62_prime256v1) {
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.p256_sha256_sign: a P-256 (prime256v1) private "
+                        "key is required"));
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned char *der = NULL;
+    size_t derlen = 0;
+    int ok =
+        ctx &&
+        EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, pkey) == 1 &&
+        EVP_DigestSign(ctx, NULL, &derlen, (const unsigned char *)m->data,
+                       (size_t)m->len) == 1 &&
+        (der = (unsigned char *)malloc(derlen ? derlen : 1)) != NULL &&
+        EVP_DigestSign(ctx, der, &derlen, (const unsigned char *)m->data,
+                       (size_t)m->len) == 1;
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    /* Convert the DER ECDSA-Sig-Value to JOSE fixed-width 64-byte r||s. */
+    unsigned char jose[ZAP_CRYPTO_JOSE_SIG_LEN];
+    const unsigned char *dp = der;
+    ECDSA_SIG *sig = ok ? d2i_ECDSA_SIG(NULL, &dp, (long)derlen) : NULL;
+    if (sig) {
+        const BIGNUM *r = NULL;
+        const BIGNUM *s = NULL;
+        ECDSA_SIG_get0(sig, &r, &s);
+        if (BN_bn2binpad(r, jose, 32) != 32 ||
+            BN_bn2binpad(s, jose + 32, 32) != 32) {
+            ok = 0;
+        }
+        ECDSA_SIG_free(sig);
+    } else {
+        ok = 0;
+    }
+    free(der);
+    if (!ok) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.p256_sha256_sign: ECDSA signing failed"));
+    }
+    return zap_str_new((const char *)jose, ZAP_CRYPTO_JOSE_SIG_LEN);
+}
+
+int64_t zap_crypto_p256_sha256_verify(void *pem, void *msg, void *sig) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *m = (ZapStr *)msg;
+    ZapStr *s = (ZapStr *)sig;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey =
+        bio ? PEM_read_bio_PUBKEY(bio, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        return zap_crypto_rsa_verify_reject(
+            "crypto.p256_sha256_verify: invalid public-key PEM");
+    }
+    if (zap_crypto_ec_curve_nid(pkey) != NID_X9_62_prime256v1) {
+        EVP_PKEY_free(pkey);
+        return zap_crypto_rsa_verify_reject(
+            "crypto.p256_sha256_verify: a P-256 public key is required");
+    }
+    if (s->len != ZAP_CRYPTO_JOSE_SIG_LEN) {
+        EVP_PKEY_free(pkey);
+        return zap_crypto_rsa_verify_reject(
+            "crypto.p256_sha256_verify: signature must be 64 bytes (JOSE r||s)");
+    }
+    /* Rebuild the DER ECDSA-Sig-Value from the JOSE r||s halves. */
+    ECDSA_SIG *es = ECDSA_SIG_new();
+    BIGNUM *r = BN_bin2bn((const unsigned char *)s->data, 32, NULL);
+    BIGNUM *sv = BN_bin2bn((const unsigned char *)s->data + 32, 32, NULL);
+    unsigned char *der = NULL;
+    int derlen = 0;
+    int built = es && r && sv && ECDSA_SIG_set0(es, r, sv) == 1;
+    if (built) {
+        derlen = i2d_ECDSA_SIG(es, &der); /* allocates der */
+    } else {
+        BN_free(r);
+        BN_free(sv);
+    }
+    int64_t ok = 0;
+    if (built && derlen > 0) {
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        ok = (ctx &&
+              EVP_DigestVerifyInit(ctx, NULL, EVP_sha256(), NULL, pkey) == 1 &&
+              EVP_DigestVerify(ctx, der, (size_t)derlen,
+                               (const unsigned char *)m->data,
+                               (size_t)m->len) == 1)
+                 ? 1
+                 : 0;
+        EVP_MD_CTX_free(ctx);
+    }
+    OPENSSL_free(der);
+    ECDSA_SIG_free(es); /* frees r/sv once set0 took ownership */
+    EVP_PKEY_free(pkey);
+    if (!ok) {
+        return zap_crypto_rsa_verify_reject(
+            "crypto.p256_sha256_verify: signature did not verify");
+    }
+    return 1;
+}
+
+/* Pure Ed25519 signing (#643, RFC 8032): one-shot EVP_DigestSign with no digest
+ * over the original message. Returns the 64-byte signature. */
+void *zap_crypto_ed25519_sign(void *pem, void *msg) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *m = (ZapStr *)msg;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey =
+        bio ? PEM_read_bio_PrivateKey(bio, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.ed25519_sign: could not parse an "
+                                    "Ed25519 private key from PEM"));
+    }
+    if (EVP_PKEY_base_id(pkey) != EVP_PKEY_ED25519) {
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.ed25519_sign: an Ed25519 private key is required"));
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned char sig[ZAP_CRYPTO_JOSE_SIG_LEN];
+    size_t siglen = sizeof(sig);
+    int ok = ctx &&
+             EVP_DigestSignInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
+             EVP_DigestSign(ctx, sig, &siglen, (const unsigned char *)m->data,
+                            (size_t)m->len) == 1 &&
+             siglen == ZAP_CRYPTO_JOSE_SIG_LEN;
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    if (!ok) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.ed25519_sign: Ed25519 signing failed"));
+    }
+    return zap_str_new((const char *)sig, ZAP_CRYPTO_JOSE_SIG_LEN);
+}
+
+int64_t zap_crypto_ed25519_verify(void *pem, void *msg, void *sig) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *m = (ZapStr *)msg;
+    ZapStr *s = (ZapStr *)sig;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey =
+        bio ? PEM_read_bio_PUBKEY(bio, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        return zap_crypto_rsa_verify_reject(
+            "crypto.ed25519_verify: invalid public-key PEM");
+    }
+    if (EVP_PKEY_base_id(pkey) != EVP_PKEY_ED25519) {
+        EVP_PKEY_free(pkey);
+        return zap_crypto_rsa_verify_reject(
+            "crypto.ed25519_verify: an Ed25519 public key is required");
+    }
+    if (s->len != ZAP_CRYPTO_JOSE_SIG_LEN) {
+        EVP_PKEY_free(pkey);
+        return zap_crypto_rsa_verify_reject(
+            "crypto.ed25519_verify: signature must be exactly 64 bytes");
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    int64_t ok = (ctx &&
+                  EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
+                  EVP_DigestVerify(ctx, (const unsigned char *)s->data,
+                                   (size_t)s->len,
+                                   (const unsigned char *)m->data,
+                                   (size_t)m->len) == 1)
+                     ? 1
+                     : 0;
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    if (!ok) {
+        return zap_crypto_rsa_verify_reject(
+            "crypto.ed25519_verify: signature did not verify");
+    }
+    return 1;
 }
 
 /* OpenSSL's stock socket BIO calls write/send without MSG_NOSIGNAL. A peer

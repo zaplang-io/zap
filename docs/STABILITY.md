@@ -450,6 +450,19 @@ The experimental `crypto.digest`, `crypto.hmac_sha256_raw`, and
 (#647). This corrects operations on inferred locals without changing their
 stability tier, pointer ABI, text-returning counterparts, or opaque hash handles.
 
+The experimental asymmetric-key surface (#643, D-0126) adds `crypto.key_info`
+(returning the built-in `KeyInfo` value struct `kind`/`bits`/`curve`/
+`is_private`), validated public-key import from JWK components
+(`rsa_public_key_pem`, `p256_public_key_pem`, `ed25519_public_key_pem`), ES256
+(`p256_sha256_sign`/`verify`) and pure Ed25519 (`ed25519_sign`/`verify`). ES256
+signatures are the **JOSE fixed-width 64-byte `r||s`** form only; DER is never
+exposed. Signing requires a private key of the exact family (a public key or
+wrong family/curve raises `ValueError`); verification is a plain boolean that
+returns `false` on any family/curve/length mismatch or tamper, never a panic;
+encrypted keys are rejected deterministically without prompting. The surface is
+**Experimental** like the rest of `crypto`; the JWK JSON/base64url layer lives in
+the non-core JWT library.
+
 The `http` client verbs `get`/`post`/`request` gained an **optional trailing
 `dict[str, str]` of request headers** (#280) and already expose response
 `status`/`header`/`body` accessors, and the server-side `http.respond` gained

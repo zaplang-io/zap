@@ -123,6 +123,8 @@ pub fn parse_expr_fragment(src: &str, base: u32) -> (Expr, Vec<ParseError>) {
 /// (uncatchable). `MemStats` mirrors `gc.stats()`; `DateTime` is the civil-time
 /// value `datetime.*` produces (its methods live on the module, so the struct
 /// itself stays method-free and emits no code when a program never uses it).
+/// `KeyInfo` is the validated asymmetric-key metadata `crypto.key_info()`
+/// returns (#643, D-0126) — likewise method-free and zero-code when unused.
 /// `JsonValue` is the dynamic JSON DOM sum type (D-0059, I#100/I#131): a
 /// data-carrying enum (D-0046) with `Int(int64)`/`Float(float64)` kept distinct,
 /// and recursive `Array(list[JsonValue])` / `Object(dict[str, JsonValue])`
@@ -157,6 +159,12 @@ value struct DateTime:
     int64 hour
     int64 minute
     int64 second
+
+value struct KeyInfo:
+    str kind
+    int64 bits
+    str curve
+    bool is_private
 
 enum Optional[T]:
     Some(T value)
@@ -937,6 +945,11 @@ fn references_prelude(module: &Module) -> bool {
         "\"DateTime\"",
         "\"time\"",
         "\"datetime\"",
+        // The validated asymmetric-key metadata `crypto.key_info()` returns
+        // (#643, D-0126): the `KeyInfo` value struct ships in the prelude,
+        // injected for any program that names the method or the struct.
+        "\"KeyInfo\"",
+        "\"key_info\"",
         "\"JsonValue\"",
         "\"json\"",
         "\"Json\"",

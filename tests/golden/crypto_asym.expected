@@ -1,0 +1,13 @@
+RSA 2048 [] False
+EC 256 [P-256] False
+Ed25519 256 [] False
+EC 256 [P-256] True
+64
+True
+True
+False
+False
+fc7d45b3f3dc9deead7c6a8f59354898129353f0fed04e3af81918ef2c5a8b74
+True
+True
+False

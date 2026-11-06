@@ -34,6 +34,11 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_hmac_sha256_raw"
         | "zap_crypto_rsa_sha1_sign"
         | "zap_crypto_rsa_sha256_sign"
+        | "zap_crypto_rsa_public_key_pem"
+        | "zap_crypto_p256_public_key_pem"
+        | "zap_crypto_ed25519_public_key_pem"
+        | "zap_crypto_p256_sha256_sign"
+        | "zap_crypto_ed25519_sign"
         | "zap_crypto_random_bytes" => Ty::Bytes,
         "zap_crypto_sha256"
         | "zap_crypto_sha512"
@@ -43,8 +48,13 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_hmac_sha256"
         | "zap_crypto_hmac_sha512"
         | "zap_crypto_token_hex"
+        | "zap_crypto_key_kind"
+        | "zap_crypto_key_curve"
         | "zap_crypto_new" => Ty::Ptr,
-        "zap_crypto_rsa_sha256_verify" => Ty::I1,
+        "zap_crypto_rsa_sha256_verify"
+        | "zap_crypto_p256_sha256_verify"
+        | "zap_crypto_ed25519_verify" => Ty::I1,
+        "zap_crypto_key_bits" | "zap_crypto_key_is_private" => Ty::I64,
         "zap_crypto_update" => Ty::Void,
         _ => return Err(err("unknown crypto runtime symbol in result-type table")),
     })
@@ -60,7 +70,17 @@ fn call_crypto(
 ) -> Result<(Value, Ty), LowerError> {
     let throwing = matches!(
         func,
-        "zap_crypto_rsa_sha1_sign" | "zap_crypto_rsa_sha256_sign"
+        "zap_crypto_rsa_sha1_sign"
+            | "zap_crypto_rsa_sha256_sign"
+            | "zap_crypto_rsa_public_key_pem"
+            | "zap_crypto_p256_public_key_pem"
+            | "zap_crypto_ed25519_public_key_pem"
+            | "zap_crypto_p256_sha256_sign"
+            | "zap_crypto_ed25519_sign"
+            | "zap_crypto_key_kind"
+            | "zap_crypto_key_bits"
+            | "zap_crypto_key_curve"
+            | "zap_crypto_key_is_private"
     );
     Ok(match result_type(func)? {
         Ty::I1 => call_bool(lowerer, func, args),
@@ -76,6 +96,72 @@ fn call_result1(
 ) -> Result<(Value, Ty), LowerError> {
     let (v, _) = lowerer.expr(&arg.value)?;
     call_crypto(lowerer, func, vec![v])
+}
+
+/// Build a `KeyInfo` value struct (#643, D-0126) from the validated-key getters,
+/// in the prelude field order `kind, bits, curve, is_private`. The `kind` getter
+/// is the validating gate: it is emitted first and is throwing, so an
+/// unparseable / unsupported / encrypted PEM raises a catchable `ValueError`
+/// before any other field is read. The remaining getters run only once the key
+/// has validated, so they never panic for a supported key.
+fn lower_key_info(lowerer: &mut FnLower, arg: &ast::Arg) -> Result<(Value, Ty), LowerError> {
+    let sid = *lowerer
+        .ctx
+        .ids
+        .get("KeyInfo")
+        .ok_or_else(|| err("KeyInfo struct unavailable (built-in prelude missing)"))?;
+    let (pem, _) = lowerer.expr(&arg.value)?;
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+
+    // Field 0: kind (str) — the validating gate, throwing.
+    let kind = lowerer.new_value(Ty::Ptr);
+    lowerer.throwing_call(Some(kind), "zap_crypto_key_kind", vec![pem]);
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 0,
+        val: kind,
+    });
+
+    // Field 1: bits (int64).
+    let bits = lowerer.new_value(Ty::I64);
+    lowerer.emit(Inst::Call {
+        dest: Some(bits),
+        func: "zap_crypto_key_bits".to_string(),
+        args: vec![pem],
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 1,
+        val: bits,
+    });
+
+    // Field 2: curve (str).
+    let curve = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::Call {
+        dest: Some(curve),
+        func: "zap_crypto_key_curve".to_string(),
+        args: vec![pem],
+    });
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 2,
+        val: curve,
+    });
+
+    // Field 3: is_private (bool) — normalize the C int64 0/1 to an i1.
+    let (is_private, _) = call_bool(lowerer, "zap_crypto_key_is_private", vec![pem]);
+    lowerer.emit(Inst::FieldSet {
+        base: dest,
+        sid,
+        idx: 3,
+        val: is_private,
+    });
+
+    Ok((dest, Ty::Struct(sid)))
 }
 
 fn lower(
@@ -192,6 +278,75 @@ fn lower(
                 "zap_crypto_rsa_sha256_verify",
                 vec![key, data, sig],
             )?))
+        }
+        // crypto.key_info(pem) -> KeyInfo (#643): build the metadata value struct.
+        "key_info" => {
+            if args.len() != 1 {
+                return Err(err("crypto.key_info takes exactly one argument"));
+            }
+            Ok(Some(lower_key_info(lowerer, &args[0])?))
+        }
+        // crypto.{rsa,p256}_public_key_pem(a, b) -> bytes (#643): validated public
+        // key import from JWK integer/octet components.
+        "rsa_public_key_pem" | "p256_public_key_pem" => {
+            if args.len() != 2 {
+                return Err(err("crypto.*_public_key_pem takes exactly two arguments"));
+            }
+            let func = if method == "rsa_public_key_pem" {
+                "zap_crypto_rsa_public_key_pem"
+            } else {
+                "zap_crypto_p256_public_key_pem"
+            };
+            let (a, _) = lowerer.expr(&args[0].value)?;
+            let (b, _) = lowerer.expr(&args[1].value)?;
+            Ok(Some(call_crypto(lowerer, func, vec![a, b])?))
+        }
+        // crypto.ed25519_public_key_pem(x_bytes) -> bytes (#643).
+        "ed25519_public_key_pem" => {
+            if args.len() != 1 {
+                return Err(err(
+                    "crypto.ed25519_public_key_pem takes exactly one argument",
+                ));
+            }
+            Ok(Some(call_result1(
+                lowerer,
+                "zap_crypto_ed25519_public_key_pem",
+                &args[0],
+            )?))
+        }
+        // crypto.p256_sha256_sign / ed25519_sign(private_pem, msg) -> bytes (#643).
+        "p256_sha256_sign" | "ed25519_sign" => {
+            if args.len() != 2 {
+                return Err(err(
+                    "crypto.{p256_sha256,ed25519}_sign takes exactly two arguments",
+                ));
+            }
+            let func = if method == "p256_sha256_sign" {
+                "zap_crypto_p256_sha256_sign"
+            } else {
+                "zap_crypto_ed25519_sign"
+            };
+            let (key, _) = lowerer.expr(&args[0].value)?;
+            let (msg, _) = lowerer.expr(&args[1].value)?;
+            Ok(Some(call_crypto(lowerer, func, vec![key, msg])?))
+        }
+        // crypto.p256_sha256_verify / ed25519_verify(public_pem, msg, sig) -> bool
+        // (#643). The runtime returns i64 (0/1); call_crypto normalizes to i1.
+        "p256_sha256_verify" | "ed25519_verify" => {
+            if args.len() != 3 {
+                return Err(err(
+                    "crypto.{p256_sha256,ed25519}_verify takes exactly three arguments",
+                ));
+            }
+            let func = if method == "p256_sha256_verify" {
+                "zap_crypto_p256_sha256_verify"
+            } else {
+                "zap_crypto_ed25519_verify"
+            };
+            let (key, _) = lowerer.expr(&args[0].value)?;
+            let (msg, _) = lowerer.expr(&args[1].value)?;
+            let (sig, _) = lowerer.expr(&args[2].value)?;
+            Ok(Some(call_crypto(lowerer, func, vec![key, msg, sig])?))
         }
         // crypto.random_bytes(n) / crypto.token_hex(n): count coerces to i64.
         "random_bytes" | "token_hex" => {

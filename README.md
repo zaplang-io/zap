@@ -223,6 +223,16 @@ The experimental `crypto.rsa_*` APIs accept ordinary RSA PEM keys and use
 PKCS#1 v1.5 padding. Other key families, including RSA-PSS-only keys, are
 rejected; see [D-0102](DECISIONS.md#d-0102--crypto-rsa-pkcs1-v15-signing-i628).
 
+The experimental asymmetric-key surface adds validated key metadata/import and
+P-256 ECDSA (ES256) and Ed25519 signing: `crypto.key_info(pem)` (returns a
+`KeyInfo` with `kind`/`bits`/`curve`/`is_private`), `crypto.rsa_public_key_pem` /
+`p256_public_key_pem` / `ed25519_public_key_pem` (import from JWK components),
+`crypto.p256_sha256_sign`/`verify` and `crypto.ed25519_sign`/`verify`. ES256
+signatures are the JOSE fixed-width 64-byte `r||s` form; Ed25519 is pure
+Ed25519 over the message. A public key cannot sign, a wrong curve/family/length
+is rejected, and verification is a plain boolean. See
+[D-0126](DECISIONS.md#d-0126--stdlib-crypto-validated-asymmetric-key-metadataimport--p-256-ecdsa-es256-and-ed25519-signverify-i643).
+
 `crypto.digest`, `crypto.hmac_sha256_raw`, and `crypto.random_bytes` return
 binary `bytes`, supporting indexing, slicing, concatenation, and equality on
 inferred variables. Streaming hash constructors return opaque handles for

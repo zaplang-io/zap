@@ -5299,3 +5299,78 @@ behaviour are unchanged except the rendering fix. Sema already distinguished
 `char` from `int32` (e.g. it rejects `char + int` and `list[int64] = [s[0]]`), so
 this change makes the IR agree with sema rather than inventing any new
 user-visible semantics. No grammar change (GRAMMAR.ebnf untouched).
+
+## D-0126 — stdlib `crypto`: validated asymmetric-key metadata/import + P-256 ECDSA (ES256) and Ed25519 sign/verify (I#643)
+
+**Decision.** Extend the `crypto` module (hashing/HMAC/CSPRNG from #105/D-0056;
+RSA PKCS#1 v1.5 from #628/D-0102) with a validated asymmetric-key surface for the
+JWT library (zaplang-io/jwt). The supported interface is **free functions over
+PEM / raw JWK components**, matching the module's existing shape — no opaque
+handle, no raw OpenSSL state exposed:
+
+- `crypto.key_info(pem) -> KeyInfo` — a new built-in **prelude value struct**
+  `KeyInfo { str kind; int64 bits; str curve; bool is_private }`. `kind` is
+  `"RSA"` / `"EC"` / `"Ed25519"`; `bits` is the RSA modulus size (so an RS256
+  consumer can enforce ≥ 2048, RFC 7518 §3.3) or 256 for P-256 / Ed25519;
+  `curve` is `"P-256"` for an EC key (`""` otherwise); `is_private` is whether
+  the PEM is a private key. It validates and is the gate: an unparseable,
+  unsupported (e.g. RSA-PSS, whose base id is not `EVP_PKEY_RSA`), or encrypted
+  key raises a catchable `ValueError`. `KeyInfo` is built from four native
+  getters exactly as `gc.stats()` builds `MemStats` (D-0058) and emits no code
+  when unused; the prelude is injected on the `"key_info"` / `"KeyInfo"` needle.
+- `crypto.rsa_public_key_pem(n, e)` / `p256_public_key_pem(x, y)` /
+  `ed25519_public_key_pem(x)` -> SubjectPublicKeyInfo PEM `bytes`. RSA `n`/`e`
+  are validated as usable public params (`n` odd and positive, `e` an odd
+  integer > 1, components bounded); P-256 `x`/`y` must be exactly 32 bytes and
+  lie on the curve (`EC_KEY_set_public_key_affine_coordinates` + `EC_KEY_check_key`
+  reject off-curve / infinity); Ed25519 `x` must be exactly 32 bytes.
+- `crypto.p256_sha256_sign(private_pem, msg) -> bytes` /
+  `p256_sha256_verify(public_pem, msg, sig) -> bool` — ES256.
+- `crypto.ed25519_sign(private_pem, msg) -> bytes` /
+  `ed25519_verify(public_pem, msg, sig) -> bool` — pure Ed25519.
+
+**ES256 signature encoding.** The **only** exposed ES256 representation is the
+**JOSE fixed-width 64-byte `r || s`** form (RFC 7518 §3.4): each of `r` and `s`
+is the 32-byte big-endian coordinate. DER `ECDSA-Sig-Value` is **never**
+surfaced; it is converted internally through OpenSSL's `ECDSA_SIG` (`BN_bn2binpad`
+on sign, `ECDSA_SIG_set0` + `i2d` on verify). A DER-encoded signature handed to
+the verifier has length ≠ 64 and is therefore rejected (`false`), so the
+JOSE-vs-DER distinction is unambiguous and needs no separate public conversion
+substrate.
+
+**Ed25519.** Pure Ed25519 over the **original message** (RFC 8032), via a
+one-shot `EVP_DigestSign` with no digest — never Ed25519ph and never an implicit
+SHA-256. Public keys are exactly 32 bytes; signatures exactly 64 bytes.
+
+**Binding.** Algorithm / key-family / role binding is strict. Signing loads only
+a **private** key of the exact family (a public PEM fails the private read →
+`ValueError`); verification loads only a **public** key of the exact family and
+returns `false` on any family / curve / length mismatch — never a panic, never a
+silent reinterpretation as another primitive. Key loading never prompts on
+stdin: a zero-returning passphrase callback makes encrypted keys fail
+deterministically.
+
+**Why.** The JWT library cannot enforce RS256 key sizes, separate private/public
+roles, validate EC curves/points, or import public JWKs without a supported
+native path; doing ASN.1/key-inspection or curve arithmetic in the library would
+bypass the golden rule. OpenSSL already backs `tls` and the RSA signer, so the
+bignum/ASN.1/curve work reuses it rather than reimplementing security-sensitive
+primitives. Free functions (not an opaque handle) keep the surface identical to
+the rest of `crypto`; JOSE-only ES256 is the fully-specified JOSE form (RFC 9864)
+and the simplest unambiguous contract. JWK JSON/base64url policy stays in the
+non-core library; only native key construction and cryptographic validation live
+in stdlib.
+
+**What it touches.** `crates/syntax` (the `KeyInfo` prelude struct + injection
+needles), `crates/sema/src/modules/crypto.rs` (type/arity checks; `key_info`
+returns `Named("KeyInfo")`), `crates/ir/src/lower/modules/crypto.rs` (result
+typing, throwing classification, the `KeyInfo` struct build), the codegen
+runtime-symbol declarations, and the OpenSSL-backed C in `crates/codegen/src/zaprt.c`.
+Native `EVP_PKEY` objects are freed before return (no leaks); the GC `bytes`
+result is the last allocation, mirroring the hash one-shots. No grammar change
+(GRAMMAR.ebnf untouched). The separate RSA-wrapper key-family bug (#642) is out
+of scope and untouched. Goldens (`crypto_asym`, `crypto_asym_binding`) cover
+bidirectional OpenSSL/RFC known-answer interop, valid-vs-below-minimum RSA size
+distinction, and the exhaustive negative matrix (wrong family/role/curve,
+malformed/truncated encodings, invalid points/lengths, JOSE-vs-DER mistakes,
+tampering).

@@ -26,6 +26,29 @@
 //!
 //! Secure random from the OS CSPRNG (getentropy / /dev/urandom):
 //!   `crypto.random_bytes(n) -> bytes` ; `crypto.token_hex(n) -> str`
+//!
+//! Validated asymmetric keys — metadata, JWK-component import, and P-256 ECDSA
+//! (ES256) / Ed25519 sign+verify (#643, D-0126). All free functions over PEM /
+//! raw components; no raw OpenSSL state is exposed:
+//!   `crypto.key_info(pem) -> KeyInfo` — the built-in `KeyInfo` value struct
+//!     `{ str kind; int64 bits; str curve; bool is_private }`. `kind` is
+//!     `"RSA"`/`"EC"`/`"Ed25519"`; `bits` is the RSA modulus size (or 256 for
+//!     P-256/Ed25519); `curve` is `"P-256"` for EC (else `""`). Raises
+//!     `ValueError` on an unparseable / unsupported / encrypted key.
+//!   `crypto.rsa_public_key_pem(n, e) -> bytes`,
+//!   `crypto.p256_public_key_pem(x, y) -> bytes`,
+//!   `crypto.ed25519_public_key_pem(x) -> bytes` — validated SubjectPublicKeyInfo
+//!     PEM from JWK integer/octet components (P-256 coords are 32 bytes and must
+//!     lie on the curve; Ed25519 keys are 32 bytes).
+//!   `crypto.p256_sha256_sign(private_pem, msg) -> bytes` /
+//!   `crypto.p256_sha256_verify(public_pem, msg, sig) -> bool` — ES256; the
+//!     signature is the JOSE fixed-width 64-byte `r||s` (DER is never exposed).
+//!   `crypto.ed25519_sign(private_pem, msg) -> bytes` /
+//!   `crypto.ed25519_verify(public_pem, msg, sig) -> bool` — pure Ed25519 over
+//!     the original message (RFC 8032); 64-byte signatures.
+//! Signing requires a private key of the exact family (a public key / wrong
+//! family / wrong curve raises `ValueError`); verification returns `false` on any
+//! mismatch or tamper, never a panic.
 
 use zapc_diag::ErrorCode;
 use zapc_syntax::ast::Arg;
@@ -181,6 +204,116 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                     ErrorCode::ZAP4025,
                     format!(
                         "crypto.{method}(pem_pubkey, data, sig) takes 3 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+                expect_data(checker, method, &args[2]);
+            }
+            Some(Ty::Bool)
+        }
+        // crypto.key_info(pem) -> KeyInfo (#643, D-0126): validated metadata for a
+        // supported PEM/DER asymmetric key. Raises ValueError on an unparseable,
+        // unsupported, or encrypted key.
+        "key_info" => {
+            if args.len() != 1 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.key_info(pem) takes 1 argument, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+            }
+            Some(Ty::Named("KeyInfo".to_string()))
+        }
+        // crypto.rsa_public_key_pem(n_bytes, e_bytes) -> bytes (#643): build a
+        // validated SPKI PEM public key from the RSA JWK integer components.
+        // crypto.p256_public_key_pem(x_bytes, y_bytes) -> bytes: P-256 affine
+        // coordinates (32 bytes each), validated to lie on the curve.
+        "rsa_public_key_pem" | "p256_public_key_pem" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(a, b) takes 2 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+            }
+            Some(Ty::Bytes)
+        }
+        // crypto.ed25519_public_key_pem(x_bytes) -> bytes (#643): build a
+        // validated SPKI PEM public key from the 32-byte Ed25519 public key.
+        "ed25519_public_key_pem" => {
+            if args.len() != 1 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(x_bytes) takes 1 argument, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+            }
+            Some(Ty::Bytes)
+        }
+        // crypto.p256_sha256_sign(private_pem, msg) -> bytes (#643, ES256): the
+        // 64-byte JOSE r||s signature. crypto.ed25519_sign(private_pem, msg) ->
+        // bytes: the 64-byte pure-Ed25519 signature over the original message.
+        "p256_sha256_sign" | "ed25519_sign" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(private_pem, msg) takes 2 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+            }
+            Some(Ty::Bytes)
+        }
+        // crypto.p256_sha256_verify(public_pem, msg, sig) -> bool (#643): true iff
+        // `sig` is a valid 64-byte JOSE ES256 signature. crypto.ed25519_verify
+        // (public_pem, msg, sig) -> bool: pure-Ed25519 verification. A bad key or
+        // any verification failure is a plain `false`, never a panic.
+        "p256_sha256_verify" | "ed25519_verify" => {
+            if args.len() != 3 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(public_pem, msg, sig) takes 3 arguments, found {}",
                         args.len()
                     ),
                     span,

@@ -25,6 +25,23 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Validated asymmetric-key metadata/import + P-256 ECDSA (ES256) and Ed25519
+  sign/verify in `crypto`** (#643, D-0126; builds on #105/D-0056, #628/D-0102).
+  A supported, OpenSSL-backed asymmetric-key surface of free functions —
+  `crypto.key_info(pem)` (returns a `KeyInfo` value struct: `kind`, `bits`,
+  `curve`, `is_private`, with RSA modulus bits so RS256 consumers can enforce
+  ≥ 2048), `crypto.rsa_public_key_pem`/`p256_public_key_pem`/
+  `ed25519_public_key_pem` (validated public-key import from JWK components),
+  `crypto.p256_sha256_sign`/`p256_sha256_verify` (ES256; **JOSE fixed-width
+  64-byte `r||s`** signatures — DER is never exposed), and
+  `crypto.ed25519_sign`/`ed25519_verify` (**pure Ed25519** over the original
+  message, RFC 8032). Algorithm/key-family/role binding is strict: a public key
+  cannot sign, a wrong curve/family/length is rejected rather than silently
+  reinterpreted, encrypted keys fail deterministically without prompting, signing
+  raises catchable `ValueError`, and verification is always a plain boolean. The
+  JWK JSON/base64url policy stays in the non-core JWT library; only native key
+  construction and cryptographic validation live in stdlib. Unblocks
+  zaplang-io/jwt.
 - **General value-rendering (repr/Display) protocol for user types** (#274,
   D-0124; follow-up to #252/#159, extends D-0047/D-0046/D-0018/D-0049). A user
   type with no `__str__`/`__repr__`/`@derive(Repr)` now gets an **automatic
