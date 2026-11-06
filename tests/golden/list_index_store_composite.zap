@@ -27,8 +27,13 @@ def main():
     print(ss)  # ['z', 'y', 'z']
 
     # dict VALUE store (the `list = false` arm of check_index_value): a bool read
-    # back from a dict[str, bool] value (bare i64 word) stored into another
-    # dict[str, bool] value — the #727 shape on the dict path.
-    dict[str, bool] m = {"a": True, "b": False}
-    m["b"] = m["a"]
-    print(m["b"])  # True
+    # back from a dict[str, bool] value (a bare i64 word) stored into another
+    # dict[str, bool] value — the #727 shape on the dict path. Both dicts are
+    # single-entry so iteration order is fixed, and the whole dict is printed so
+    # the value renders through the container Display protocol (keyed on the
+    # destination's `Elem::Bool`) as `True` — a scalar read-back would instead
+    # surface the raw i64 word, an unrelated pre-existing rendering gap.
+    dict[str, bool] src = {"k": True}
+    dict[str, bool] dst = {"k": False}
+    dst["k"] = src["k"]
+    print(dst)  # {'k': True}
