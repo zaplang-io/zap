@@ -14,8 +14,17 @@ use std::fmt;
 /// typed runtime entry point (e.g. `zap_list_push_i64` vs `zap_list_push_ptr`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Elem {
-    /// An integer/bool element, passed as `i64`.
+    /// An integer element, passed as `i64`.
     I64,
+    /// A `bool` element (#274, D-0124). Physically the same `i64` word as
+    /// [`Elem::I64`] (val/key suffix `i64`, read-back type `i64` — so codegen,
+    /// GC, hashing, and read-back are byte-identical to an integer element), but
+    /// it retains `bool` identity so the Display protocol can render a `bool`
+    /// collection element as `True`/`False` (via `zap_bool_to_str`) rather than
+    /// the integer `1`/`0`. `bool` is `Ty::I1`, distinct from every integer, so
+    /// this is unambiguous — unlike `char`, which shares `Ty::I32` with `int32`
+    /// and therefore still renders as its codepoint integer in a collection.
+    Bool,
     /// A floating-point (`f64`) element (I#569). Stored in the same uniform
     /// 8-byte word as an `i64` element — the runtime reinterprets the bits — so
     /// it reuses the list word storage via the `_f64` entry points
@@ -54,7 +63,10 @@ impl Elem {
     /// The ZIR type a value of this element kind flows as.
     pub fn ty(self) -> Ty {
         match self {
-            Elem::I64 => Ty::I64,
+            // `Bool` reads back as the `i64` word it is stored as (its `bool`
+            // identity is used only by the renderer, which special-cases the
+            // `Elem`), so read-back width is unchanged from an integer element.
+            Elem::I64 | Elem::Bool => Ty::I64,
             Elem::F64 => Ty::F64,
             Elem::Enum(id) => Ty::Enum(id),
             Elem::Ptr => Ty::Ptr,
@@ -69,7 +81,7 @@ impl Elem {
     /// hashing), so they share the `ptr` path.
     pub fn val_suffix(self) -> &'static str {
         match self {
-            Elem::I64 | Elem::Enum(_) => "i64",
+            Elem::I64 | Elem::Bool | Elem::Enum(_) => "i64",
             Elem::F64 => "f64",
             Elem::Ptr | Elem::Struct(_) | Elem::Nested(_) => "ptr",
         }
@@ -79,7 +91,7 @@ impl Elem {
     /// which takes the type's `__hash__`/`__eq__` as function pointers.
     pub fn key_suffix(self) -> &'static str {
         match self {
-            Elem::I64 | Elem::Enum(_) => "i64",
+            Elem::I64 | Elem::Bool | Elem::Enum(_) => "i64",
             Elem::Ptr => "str",
             Elem::Struct(_) => "fn",
             // Floats are never a hashed *key* (dict/set keys reject floats), so

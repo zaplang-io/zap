@@ -167,7 +167,7 @@ fn float32_binding_persists_across_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// I#252: user-type auto-print (minimal; the general repr protocol is a follow-up)
+// I#252 / #274: user-type auto-print via the general Display protocol (D-0124)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -180,13 +180,15 @@ fn struct_with_derived_repr_renders() {
 }
 
 #[test]
-fn struct_without_renderer_prints_type_placeholder() {
-    // A user value with no `__str__`/`__repr__`/`@derive(Repr)` falls back to a
-    // `<TypeName>` placeholder instead of a confusing compile error.
+fn struct_without_renderer_auto_renders_field_wise() {
+    // A user value with no `__str__`/`__repr__`/`@derive(Repr)` now auto-prints
+    // through the general Display protocol's default field-wise form (#274,
+    // D-0124) — `Bare(n=7)` — instead of the old `<Bare>` placeholder.
     let script = "struct Bare:\n    int64 n\n\nBare(7)\n";
     let (stdout, stderr, code) = repl(script);
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert!(stdout.contains("<Bare>"), "stdout: {stdout:?}");
+    assert!(stdout.contains("Bare(n=7)"), "stdout: {stdout:?}");
+    assert!(!stdout.contains("<Bare>"), "stdout: {stdout:?}");
 }
 
 // ---------------------------------------------------------------------------

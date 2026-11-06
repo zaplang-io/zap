@@ -25,6 +25,47 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **General value-rendering (repr/Display) protocol for user types** (#274,
+  D-0124; follow-up to #252/#159, extends D-0047/D-0046/D-0018/D-0049). A user
+  type with no `__str__`/`__repr__`/`@derive(Repr)` now gets an **automatic
+  default field-wise rendering** `TypeName(field=value, …)` instead of a compile
+  error, and the **same renderer backs `print()`, `str()`, f-strings, the REPL,
+  and doctests** — closing the old asymmetry where only `print` could render a
+  struct while `str(x)`/`f"{x}"` rejected it. The renderer **recurses through
+  every field/element**: integers, `bool` (`True`/`False` — fixing the old
+  `-1`-bitpattern bug in `@derive(Repr)`'s bool path), `float`,
+  `str`/`char`/`bytes`, `complex`/`bigint`, `Optional[T]`, **nested structs**,
+  **tier-1 enums** (as the qualified variant name `EnumName.VARIANT`), **tuples**
+  (Python `(v0, v1)` form, one-element tuples keeping the trailing comma
+  `(v0,)`), and **`list`/`dict`/`set`** in Python shapes — `[v0, v1]`,
+  `{k: v}`, `{v0, v1}`, with the Python-exact empty forms `[]`, `{}`, and
+  `set()`. The protocol follows Python's **`str`/`repr` distinction**: a bare
+  string at the top level of `print`/`str` is **unquoted** (`hello`), while a
+  string nested as a struct field or container/tuple element is **quoted**
+  (`'a'`), with `bytes` as `b'…'`. A nested user-type field renders by **calling**
+  that type's renderer, so a recursive type graph terminates at compile time (one
+  synthesized renderer per layout); containers reuse the existing
+  list-iteration + typed dict/set entry points. `@derive(Repr)` now recurses
+  through all field types (dropping its old int/bool/str-only limit), and an
+  explicit `__str__` (preferred) or `__repr__` still overrides the default.
+  Lowering over existing string helpers plus two small added runtime helpers
+  (`zap_str_repr`/`zap_bytes_repr`) — **no** GC/evacuator/scheduler/object-header
+  change.
+  - **Behaviour change:** `@derive(Repr)` previously rendered a `str` field
+    **unquoted** (`Point(tag=a)`) and supported only int/bool/str fields; it now
+    renders a `str` field **quoted** (`Point(tag='a')`, Python repr) and recurses
+    through every field type. Any code depending on the old unquoted form sees
+    the quoted form.
+  - **Known v1 limitations:** a `char` *collection element* renders as its
+    codepoint integer (`list[char]` → `[97, 98]`) because `char` and `int32` are
+    the same IR type (`Ty::I32`); a `char` *struct field*/*tuple element* renders
+    correctly (`'c'`). (**`bool` collection elements DO render `True`/`False`** —
+    `bool` is `Ty::I1`, distinct, so its element kind keeps bool identity.) The
+    default renderer has no cycle guard (like a hand-written recursive
+    `__repr__`); non-printable non-ASCII in a quoted string is not escaped. Still
+    deferred to #274 follow-ups (a clean coded error, never an ICE): tier-3
+    data-carrying enums (`Shape.Circle(r=2.0)`) and interface-value rendering; no
+    object-identity (`<T @ 0x…>`) form is introduced.
 - **Tuples are hashable — usable as dict keys and set elements** (#680, D-0122;
   refines D-0049/D-0047). A tuple of hashable elements is now a valid dict key
   and set element with **structural** hash/equality (CPython parity):

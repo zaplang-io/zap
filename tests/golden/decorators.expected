@@ -1,5 +1,5 @@
-User(id=1, name=alice)
-User(id=2, name=bob)
+User(id=1, name='alice')
+User(id=2, name='bob')
 a == b
 a != c
 User is annotated @Table

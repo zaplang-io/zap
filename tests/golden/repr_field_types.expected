@@ -1,0 +1,2 @@
+Mixed(f=1.5, b=True, s='hi', c=Color.GREEN, pair=(7, 'z'))
+Mixed(f=1.5, b=True, s='hi', c=Color.GREEN, pair=(7, 'z'))

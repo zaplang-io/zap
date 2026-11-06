@@ -11101,6 +11101,108 @@ void *zap_json_escape(void *sp) {
     return zap_str_new(out, o);
 }
 
+/* Python-style `repr` of a string (#274, D-0124). Single-quoted by default;
+ * double-quoted only when the string contains a single quote but no double quote
+ * (CPython's quote-selection rule). The active quote and backslash are escaped,
+ * `\n`/`\r`/`\t` use their short forms, other C0 controls and DEL use `\xNN`, and
+ * bytes >= 0x80 (UTF-8 continuation/lead bytes) pass through so printable Unicode
+ * shows as itself. Used when a string appears as a struct field, container
+ * element, or tuple element (where Python shows repr), NOT at the top level of
+ * print()/str(). (Documented v1 simplification vs. CPython: non-printable
+ * non-ASCII codepoints are not escaped — the bytes pass through.) */
+void *zap_str_repr(void *sp) {
+    ZapStr *s = (ZapStr *)sp;
+    int64_t n = s->len;
+    const char *in = s->data;
+    int has_single = 0, has_double = 0;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '\'') has_single = 1;
+        else if (c == '"') has_double = 1;
+    }
+    char q = (has_single && !has_double) ? '"' : '\'';
+    /* worst case per byte: \xNN (4); plus the two surrounding quotes. */
+    char *out = (char *)zap_buf(n * 4 + 2);
+    int64_t o = 0;
+    static const char hex[] = "0123456789abcdef";
+    out[o++] = q;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == (unsigned char)q || c == '\\') {
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c == '\n') {
+            out[o++] = '\\';
+            out[o++] = 'n';
+        } else if (c == '\r') {
+            out[o++] = '\\';
+            out[o++] = 'r';
+        } else if (c == '\t') {
+            out[o++] = '\\';
+            out[o++] = 't';
+        } else if (c < 0x20 || c == 0x7f) {
+            out[o++] = '\\';
+            out[o++] = 'x';
+            out[o++] = hex[(c >> 4) & 0xF];
+            out[o++] = hex[c & 0xF];
+        } else {
+            out[o++] = (char)c;
+        }
+    }
+    out[o++] = q;
+    return zap_str_new(out, o);
+}
+
+/* Python-style `repr` of a bytes value (#274, D-0124): the `b'…'` form. Same
+ * quote-selection as a string; printable ASCII (0x20..0x7e) passes through
+ * except the active quote and backslash; `\t`/`\n`/`\r` use short escapes; every
+ * other byte (including all >= 0x80) uses `\xNN` — matching CPython's `bytes`
+ * repr, which never passes high bytes through. `bytes` shares the `ZapStr`
+ * {len,data} layout. */
+void *zap_bytes_repr(void *bp) {
+    ZapStr *s = (ZapStr *)bp;
+    int64_t n = s->len;
+    const char *in = s->data;
+    int has_single = 0, has_double = 0;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '\'') has_single = 1;
+        else if (c == '"') has_double = 1;
+    }
+    char q = (has_single && !has_double) ? '"' : '\'';
+    /* worst case per byte: \xNN (4); plus the `b` prefix and two quotes. */
+    char *out = (char *)zap_buf(n * 4 + 3);
+    int64_t o = 0;
+    static const char hex[] = "0123456789abcdef";
+    out[o++] = 'b';
+    out[o++] = q;
+    for (int64_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == (unsigned char)q || c == '\\') {
+            out[o++] = '\\';
+            out[o++] = (char)c;
+        } else if (c == '\t') {
+            out[o++] = '\\';
+            out[o++] = 't';
+        } else if (c == '\n') {
+            out[o++] = '\\';
+            out[o++] = 'n';
+        } else if (c == '\r') {
+            out[o++] = '\\';
+            out[o++] = 'r';
+        } else if (c >= 0x20 && c <= 0x7e) {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '\\';
+            out[o++] = 'x';
+            out[o++] = hex[(c >> 4) & 0xF];
+            out[o++] = hex[c & 0xF];
+        }
+    }
+    out[o++] = q;
+    return zap_str_new(out, o);
+}
+
 /* Concatenate every ZapStr* element of a list into one string. */
 void *zap_json_join(void *lp) {
     ZapList *l = (ZapList *)lp;
