@@ -533,6 +533,28 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Indexed store of a `bool`/`char`/`int` collection element rejected with a
+  self-contradictory "expects `i64`, found `i64`"** (#727; regression from #708,
+  widened by #712). `int`, `bool` (`Elem::Bool`) and `char` (`Elem::Char`)
+  collection elements are one physical cell — an `i64` word, the `i64` setter
+  suffix, an `i64` read-back — distinct `Elem` kinds only so the Display protocol
+  can render them as a decimal, `True`/`False`, or `'a'`. A value read back from
+  such a collection therefore carries the bare `i64` read-back type, so
+  `want[i] = flags[j]` (and the issue's `objects[depth] = True` /
+  `want_key[depth - 1] = objects[depth - 1]`) stored an `i64`-word value into a
+  `list[bool]`/`list[char]` element. `check_index_value` compared exact `Elem`
+  identity, so `Elem::I64` (the stored value) ≠ `Elem::Bool`/`Elem::Char` (the
+  destination) was rejected — and since both render `i64`, the message named the
+  same type on both sides. Before #708 added the `Elem::Bool` render tag these
+  elements were all `Elem::I64`, so the store was accepted; the store path still
+  coerces the word to the destination cell and emits the `i64` setter regardless,
+  so this was purely a bogus front-end rejection. The check now treats the
+  integer-word family (`i64`/`bool`/`char`) as mutually store-compatible while
+  keeping exact identity for every other kind (`Elem::Enum`, `Elem::Ptr`,
+  `Elem::Struct`, `Elem::F64`, nested collections — a genuine type mismatch such
+  as a `str` into a `list[int]` or one enum into another still errors). Covered
+  by the `list_index_store_int_word` / `list_index_store_composite` goldens and a
+  `tests/diff` CPython case.
 - **gc-boehm multicore hang + queue-node use-after-free: the fairness monitor no
   longer preempts a worker during a stop-the-world** (#710, D-0128; follow-up to
   #223). The #172 monitor sent its `SIGURG` fairness-preempt signal to a worker M
