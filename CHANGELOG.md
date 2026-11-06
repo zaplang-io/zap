@@ -371,6 +371,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **The three aarch64 concurrency stress goldens run on every arch again**
+  (#698, D-0121). `immix_evac_coro_stress`, `concurrent_queue_mpsc_coro_stress`
+  and `concurrent_queue_mpsc_thread_stress` were quarantined on aarch64 via
+  `.skip_arch` sidecars (PR #445) solely because they intermittently **hung** on
+  the parked #223 scheduler deadlock. That deadlock is fixed (PR #694, D-0117),
+  so the sidecars are deleted and the goldens are no longer skipped on aarch64.
+  CI runs each once through the normal harness with **no** `GC_FREE_SPACE_DIVISOR`
+  pressure knob, at which point all three are clean; the divisor-only OOM that
+  `concurrent_queue_mpsc_coro_stress` could hit is now a clean abort, not a
+  SIGSEGV (#697/#699, D-0119), and CI never sets that knob. No other test was
+  weakened, quarantined, or skipped.
 - Built-in decorators `@cache` and `@inject` are out of the v1 set (#472,
   D-0109). **`@cache` is deferred** — it needs module-level persistent state,
   not yet a language feature (tracked in #658/#661; the built-in in #666).
@@ -390,6 +401,30 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Weak-memory audit: cross-thread runtime flags are now `__atomic`, not plain
+  `volatile`** (#213, D-0121). A plain `volatile` guarantees nothing across
+  threads — x86's TSO hides this, but AArch64's weaker model does not — so the
+  runtime's genuine cross-thread signal flags, those read and written by
+  different threads with no mutex ordering either side, were converted to
+  `__atomic_*` with a documented ordering (building on D-0120, which already did
+  this for the one STW guard). Converted, all **RELAXED** because each is a pure
+  signal with no data payload: the preemption monitor's `M.schedtick` (monotone
+  liveness counter) and `M.preempt` (advisory "please yield" latch, also set from
+  the SIGURG handler — `__atomic` on an aligned int stays async-signal-safe and
+  lock-free), the one-shot exit latches `g_shutdown`, `g_np_shutdown` and
+  `g_sig_shutdown` (their real liveness/ordering already comes from the paired
+  broadcast/kick + join, not the flag), and the `g_sig_delivered` async-handler
+  test-sync counter. GC-root safety of a preemption is independent of these
+  flags' ordering (D-0117), so RELAXED is provably sufficient throughout.
+  Deliberately **left as-is** (each documented in place): `Waiter.done` and the
+  dedicated-M `ded_runnable`/`ded_stop` flags are fully ordered by their channel
+  / `ded_mu` mutex on both sides; `g_np_started` and `g_sig_active` are ordered
+  by `pthread_once` init and only mutated at init / post-join shutdown; the
+  netpoller self-test's `g_np_t_byte`/`g_np_t_status` are ordered by the channel
+  send/recv that frames them; the Windows-only `in_hijack` uses the Win32
+  interlocked hijack primitive. No known failure was traced to these — this is a
+  weak-memory correctness hardening with no behavior change, verified green by CI
+  (the C runtime cannot be built on the authoring host).
 - **Out-of-memory is now a clean abort, not a nil-deref crash** (#697, D-0119).
   Generated code stores into an allocation result without a null check, so on
   heap exhaustion — where gc-boehm's `GC_MALLOC` returns `NULL` (bdwgc's default
@@ -443,8 +478,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   can always resume the lock-holder. Collector-agnostic: a no-op under gc-immix
   (the shim/`GC_call_with_alloc_lock` were already no-ops). Note: this fixes the
   gdb-confirmed lock-ordering deadlock; box-level confirmation on the high-core
-  Graviton host (#650) is pending, and the three `.skip_arch` aarch64 stress-golden
-  quarantines (PR #445) stay until that re-run passes.
+  Graviton host (#650) is pending. The three `.skip_arch` aarch64 stress-golden
+  quarantines it introduced (PR #445) have since been removed (#698, D-0121) now
+  that the deadlock is fixed.
 - **`dict.get` (and other receiver-type-driven specializations) on a
   module-level dict global** (#671, D-0112). Monomorphization now seeds
   explicitly-typed module-level globals (epic #661: `const` #658, mutable #662)

@@ -164,11 +164,13 @@ fn run_with_timeout(
 /// fixture whose sidecar names the architecture this test binary runs on is
 /// SKIPPED by the end-to-end runner below, with a loud notice. Used to
 /// quarantine a golden that hits a known, tracked, architecture-specific bug so
-/// CI stays deterministically green while the ticket stays open — currently the
-/// concurrent stress goldens on aarch64, which intermittently hang on the parked
-/// GC reclamation race #223 (collector-agnostic: fails under Boehm too). Delete
-/// the sidecar when #223 is fixed, or once continuous aarch64 infra re-enables
-/// these, to restore coverage.
+/// CI stays deterministically green while the ticket stays open. No fixture is
+/// quarantined at present: the three concurrent stress goldens that were skipped
+/// on aarch64 for the parked #223 GC deadlock (immix_evac_coro_stress,
+/// concurrent_queue_mpsc_coro_stress, concurrent_queue_mpsc_thread_stress) run on
+/// every arch again now that #223 is fixed (PR #694, D-0117). Add a sidecar only
+/// to quarantine a fresh arch-specific failure against an open ticket, and delete
+/// it as soon as that ticket is fixed.
 #[cfg(feature = "codegen")]
 fn skipped_on_this_arch(zap: &std::path::Path) -> bool {
     let Ok(contents) = std::fs::read_to_string(zap.with_extension("skip_arch")) else {
