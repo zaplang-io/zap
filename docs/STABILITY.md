@@ -432,7 +432,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `signal`/`gc`/`runtime` — the **API** (`signal.notify`, `gc.collect/stats`, `runtime.coroutine_dump`) | **S** |
 | `signal`/`gc`/`runtime` — the dump/stats **output format** | **I** |
 | `crypto`, `base64`, `hex`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`; `threading` (migration-only) | **E** |
-| `concurrent` — lock-free `Counter` + MPSC `Queue[T]` (D-0078); reference-payload `Queue[T]` is further gated on aarch64 by I#223 | **E** |
+| `concurrent` — lock-free `Counter` + MPSC `Queue[T]` (D-0078); the multicore `Queue[T]` hang/UAF under gc-boehm (I#710, a #223 follow-up) is fixed (D-0128), pending the Graviton re-run that clears #223 | **E** |
 | `url` — `encoding/url` percent-encode/decode + AWS SigV4 query canonicalization (#335): `quote`/`quote_path`/`unquote`/`unquote_plus`, `encode_query`/`canonical_query` | **E** |
 
 The experimental RSA surface is specifically ordinary RSA with PKCS#1 v1.5
@@ -595,7 +595,7 @@ The ratified 1.0 matrix (#206, D-0076; `design/0016-platform-1.0.md`):
 | **Windows x86-64** | **tier-1 (Stable)** | A-track #195–199; CI-gated. |
 | **macOS x86-64** | **tier-2 (Supported — not yet CI-gated)** | Implemented (PR#259) but parked pending a macOS CI runner; **not** under the §3 promise until the runner lands and PR#259 merges, then graduates at a MINOR. |
 | **macOS arm64** | **experimental** | Known issue #260 (JIT exception-unwinding gap; AOT fine, JIT/REPL affected). |
-| **aarch64-Linux** | **experimental** | Known issue #223 (multicore GC). The gdb-confirmed scheduler/allocator lock-ordering deadlock is fixed (D-0117); a separately characterised multicore use-after-free may remain, and box-level confirmation on the high-core Graviton host (#650) is pending. Stays experimental until that re-run passes. |
+| **aarch64-Linux** | **experimental** | Known issue #223 (multicore GC). Three faults are now fixed: the scheduler/allocator lock-ordering deadlock (D-0117), and the gc-boehm high-core-count hang + queue-node use-after-free, root-caused to the fairness monitor preempting a worker during stop-the-world and fixed by gating the preempt signal on `g_boehm_in_stw` (#710, D-0128; reproduces on x86_64 too, so not arch-specific). Box-level confirmation at scale on the high-core Graviton host (#650) is still pending. Stays experimental until that re-run passes. |
 | **WASM** | **post-1.0** | Fast-follow (epic #158); not a 1.0 target. |
 
 - **Adding** a platform/architecture, or **graduating** a tier-2 platform to

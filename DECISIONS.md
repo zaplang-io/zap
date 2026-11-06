@@ -5441,3 +5441,77 @@ This beats both always-copy (G1-young, over-applies copying) and never-move
 first-class OOM safety valve — under memory pressure the collector degrades
 full evac → partial evac → **mark-only** (no to-space needed) rather than failing,
 so reclamation always makes progress and defragmentation stays best-effort.
+
+## D-0128 — The fairness-preemption monitor must not signal a worker during a gc-boehm stop-the-world (I#710, follow-up to I#223)
+
+**Status:** Locked — a runtime synchronization decision for the conservative
+(gc-boehm) collector's interaction with async fairness preemption (ticket #172).
+Closes a real, reproduced multicore hang + use-after-free; no language or
+observable-behavior change. Supersedes the "benign residual window" reasoning of
+D-0120 with evidence.
+
+**Context.** Under gc-boehm the #172 fairness monitor (`zap_monitor_main`,
+`crates/codegen/src/zaprt.c`) runs on its own thread and, every ~10 ms, sends
+`SIGURG` to any worker M that has not rescheduled; the handler
+(`zap_preempt_handler`) performs an *in-signal* coroutine context switch
+(`copreempt`) on the interrupted worker. bdwgc stops the world with its own
+thread-suspend signal and must suspend every mutator cleanly. The monitor sent
+`SIGURG` **unconditionally** — including at workers that the collector was in the
+middle of suspending.
+
+D-0120 added `g_boehm_in_stw` and made the *handler* decline to `copreempt` while
+a collection is in progress, but declared the residual check→act window (the
+handler observes "not stopping", then STW begins before its swap) **GC-root-safe
+and benign**. I#710 proves that conclusion wrong at scale: on real 32-vCPU boxes
+(aarch64 **and** x86_64), the three concurrency stress goldens
+(`concurrent_queue_mpsc_coro_stress`, `concurrent_queue_mpsc_thread_stress`,
+`immix_evac_coro_stress`) fail under gc-boehm at `MAXPROCS≈32-64`,
+`GC_FREE_SPACE_DIVISOR=3` — as a **hang** (`main` spinning in
+`GC_generic_malloc_many` with every worker parked in bdwgc's suspend handler) and
+as a **queue-node use-after-free** surfacing on the consumer as
+`called unwrap on an Optional.None value`. Disabling parallel marking
+(`GC_MARKERS=1`) does not help; neutering the `SIGURG` send entirely makes the
+coro stress run 800+ iters clean where it otherwise hangs/crashes by ~iter 100.
+So the trigger is the monitor firing into a live collection, not the queue, the
+scheduler, the allocator lock (#694), or parallel marking.
+
+**Decision.** The monitor **gates the preempt signal on the STW flag**: under
+gc-boehm (`#ifndef ZAP_GC_IMMIX`) it sends `SIGURG` only when
+`__atomic_load_n(&g_boehm_in_stw, __ATOMIC_SEQ_CST)` is 0. Preemption is otherwise
+unchanged, so a long-running coroutine is still preempted for fairness — just
+never while a collection is suspending the world. This closes the hazard **at the
+source** (the thread that initiates the stray signal), collapsing the exposure
+from "any `SIGURG` across the whole STW duration" to the sub-microsecond window
+between the monitor's gate-load and PRE_STOP_WORLD; the handler's own seq-cst
+`g_boehm_in_stw` re-check (D-0120) still declines `copreempt` inside that residue,
+so no in-signal stack-swap can overlap a collection. immix has no signal-based STW
+(`GC_call_with_alloc_lock`/suspend are compile-time no-ops there), so its branch is
+untouched and the default collector is unaffected.
+
+**Why the monitor, not a bigger redesign.** The alternatives — making gc-boehm
+preemption request-only (flag + yield at the next cooperative point) or adding a
+lock-free handshake so the collector waits out an in-flight handler — are larger
+and, for the handshake, unsound: `copreempt` swaps to the scheduler and never
+returns to clear a per-M "in handler" flag, so a collector that waited on it would
+deadlock. The monitor gate is the minimal change that removes the demonstrated
+trigger while preserving the #172 guarantee; if a residual ever surfaces, the
+escalation (request-only boehm preemption, accepting a fairness cost only for
+pathological no-alloc/no-park loops under the non-default collector) is recorded
+here as the fallback.
+
+**Verification honesty.** Causation is box-confirmed on a 32-vCPU x86 box
+(preemption-off ⇒ 800+ clean vs. hang/crash at ~iter 100 with it on); the arm
+box reproduced the identical hang signature. The C runtime cannot be built on the
+maintainer's authoring host (no LLVM-18/libgc; Docker unusable), so **the gated
+build's 0-failure must be confirmed on a many-core box with preemption ENABLED**
+(`stress.sh boehm`/`immix` and the three goldens at `MAXPROCS=32`,
+`GC_FREE_SPACE_DIVISOR=3`) before this is considered verified against the live
+race — the same acceptance posture as D-0117/D-0120. The three aarch64
+`.skip_arch` sidecars are removed in this change on the strength of the x86
+causation proof; a Graviton re-run is the maintainer's final sign-off. A new
+walled-garden golden `concurrent_queue_gc_preempt_stress` (producers pushing while
+forcing explicit `gc.collect()` STWs, deterministic order-independent total)
+documents the intent and runs on x86 + hosted arm CI, though few-core CI cannot
+deterministically trigger the race. Relates to #223 (the parent race), #694
+(D-0117, the lock-free switch path), #700 (D-0120, the handler-side guard this
+completes), #701 (D-0121), and #295.
