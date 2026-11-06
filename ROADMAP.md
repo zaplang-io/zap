@@ -80,7 +80,10 @@ Once the IR schema and runtime ABI are frozen, these run concurrently:
 
 ## Phase 5 — Hardening & tooling
 
-- Precise GC (Immix-style) replacing Boehm.
+- Precise GC (Immix-style) replacing Boehm. GC north star — concurrent +
+  generational "Immix++" with FFI pinning — is `D-0127` /
+  [`docs/design/gc-immixpp.md`](docs/design/gc-immixpp.md) (epic #714; Phase-2
+  concurrent evacuation deferred to #713).
 - N-D array completeness + optimized SIMD kernels.
 - Formatter, LSP, package tooling.
 - C FFI (`extern "C"`) — generalizes interop to all languages, incl. Go via

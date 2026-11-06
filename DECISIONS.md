@@ -5374,3 +5374,70 @@ bidirectional OpenSSL/RFC known-answer interop, valid-vs-below-minimum RSA size
 distinction, and the exhaustive negative matrix (wrong family/role/curve,
 malformed/truncated encodings, invalid points/lengths, JOSE-vs-DER mistakes,
 tampering).
+
+## D-0127 — GC north star: "Immix++" (concurrent + generational Immix with FFI pinning) (epic #714)
+
+**Status:** Locked
+
+Sets the long-term direction for Zap's garbage collector. Design depth lives in
+[`docs/design/gc-immixpp.md`](docs/design/gc-immixpp.md); this entry records the
+locked decisions. Tracked by epic #714; the hard concurrent-evacuation piece is
+deferred to #713. No code change is implied by this entry — it fixes direction.
+
+**Locked decisions:**
+
+1. **Immix is the one production collector.** `gc-immix` (precise, moving,
+   region-based) stays the single production collector and the default. It
+   evolves along a concurrency roadmap and gains a generational layer; it is
+   never swapped out for another collector.
+
+2. **Collector choice is always explicit; no implicit switching.** `--gc=boehm`
+   is a documented opt-in only. The runtime never auto-swaps to Boehm (or any
+   other collector) because a program uses FFI or anything else. (Consistent with
+   the "one obvious way" principle; cf. the #610 close.)
+
+3. **Latency via phased concurrent Immix (keep compaction, add concurrency).**
+   The lesson imported from Go is *concurrency*, not non-movement.
+   - **Phase 1 — concurrent/incremental marking** (SATB write barrier; safepoints
+     and precise stack maps already exist). Marking is the long pole of the pause,
+     so this captures most of the latency win; evacuation stays STW. Realistic
+     near-term target (≈ G1 on Immix's substrate).
+   - **Phase 2 — concurrent evacuation** (read/load barrier; ≈ Shenandoah/ZGC) is
+     **deferred to #713**, pursued only if Phase-1 evacuation pauses still bite.
+     Person-decade-class; design toward it, don't promise it.
+
+4. **Generational via Sticky Immix (non-copying).** Add generational behaviour
+   with sticky mark bits: **promotion = the mark/age bit staying set (no copy,
+   object never moves)**; reclaim-in-place at line/block granularity. Minor-cycle
+   cost scales with the young set, capturing the copying-nursery cost profile
+   *without* copying — keeping Immix's reclaim-in-place edge over G1. The
+   remembered-set write barrier (old→young) is designed together with the Phase-1
+   SATB mark barrier (§8): pay the barrier mechanism once, serve both.
+
+5. **FFI non-moving need = pinning + a non-moving arena, not a collector swap.**
+   Objects C holds must not move while held. Solve by generalizing the existing
+   #120 pin pass into a scoped user/FFI pin API plus a non-moving FFI arena
+   (coordinate #539 FFI-11 / #553). **Invariant preserved in every phase: a
+   pinned object is never evacuated** (the Phase-2 load barrier does not help C,
+   which never executes it). FFI and the concurrency roadmap are independent
+   tracks meeting only at this pin invariant; FFI ships on today's STW collector,
+   not gated on Phase 2 and vice versa.
+
+6. **Boehm = CI correctness-oracle + bring-up/FFI fallback, never a production
+   peer.** Keep it in CI as an independent differential oracle (it characterized
+   #223 as collector-agnostic) and as a portable fallback during new-arch/OS
+   bring-up. **Explicit `--gc=boehm` only, never implicit.** **Sunset condition:**
+   once Immix pinning + the FFI arena prove out and precise rooting is solid on
+   all target arches, demote Boehm to dev/CI-only or retire it (its live
+   maintenance cost, e.g. the #710 livelock, is what the sunset retires). Stop
+   spending design budget making it a latency/throughput peer.
+
+**Design principle (why Immix — the §6 rule).** Copying-vs-mark-region is decided
+**per block by occupancy**: *opportunistic evacuation* copies only the sparse,
+low-survival blocks (where copying's O(survivors) pays and defragmentation is
+worth it) and marks-in-place the dense blocks (where copying would be wasted).
+This beats both always-copy (G1-young, over-applies copying) and never-move
+(CMS/Go, fragments). Crucially, **evacuation is never mandatory**: it is a
+first-class OOM safety valve — under memory pressure the collector degrades
+full evac → partial evac → **mark-only** (no to-space needed) rather than failing,
+so reclamation always makes progress and defragmentation stays best-effort.
