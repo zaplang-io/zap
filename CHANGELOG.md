@@ -515,6 +515,29 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **gc-boehm multicore hang + queue-node use-after-free: the fairness monitor no
+  longer preempts a worker during a stop-the-world** (#710, D-0128; follow-up to
+  #223). The #172 monitor sent its `SIGURG` fairness-preempt signal to a worker M
+  unconditionally, including while bdwgc was mid-stop-the-world. Under gc-boehm at
+  high core count (`MAXPROCS≈32-64`, `GC_FREE_SPACE_DIVISOR=3`, on **both** aarch64
+  and x86_64) that raced the collector's suspend/ack handshake — a **hang** with
+  `main` spinning in `GC_generic_malloc_many` while every worker sat in bdwgc's
+  suspend handler — and, via the handler's in-signal `copreempt` stack-swap landing
+  as a collection began, moved a mutator out from under the mark, reclaiming a live
+  `concurrent.Queue` node (a **use-after-free** surfacing on the consumer as
+  `called unwrap on an Optional.None value`). The monitor now gates the signal on
+  the seq-cst `g_boehm_in_stw` flag, so preemption still fires for fairness but
+  never into a live collection; the handler's existing #700/D-0120 re-check closes
+  the sub-microsecond residue. Default gc-immix has no signal-based stop-the-world
+  and is unaffected. The three aarch64 `.skip_arch` stress goldens
+  (`concurrent_queue_mpsc_coro_stress`, `concurrent_queue_mpsc_thread_stress`,
+  `immix_evac_coro_stress`), re-quarantined in #711 after #698 proved premature,
+  run on every arch again; a new walled-garden golden
+  `concurrent_queue_gc_preempt_stress` exercises the preempt-vs-STW overlap under
+  both collectors. Root cause was box-confirmed on a 32-vCPU x86 host (disabling
+  the signal ran the coro stress 800+ iters clean vs. failing by ~iter 100);
+  final 0-failure confirmation of the gated build at scale is a many-core re-run
+  (the maintainer's Graviton acceptance step), the same posture as D-0117/D-0120.
 - **Weak-memory audit: cross-thread runtime flags are now `__atomic`, not plain
   `volatile`** (#213, D-0121). A plain `volatile` guarantees nothing across
   threads — x86's TSO hides this, but AArch64's weaker model does not — so the

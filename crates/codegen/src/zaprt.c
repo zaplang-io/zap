@@ -5009,8 +5009,28 @@ static void *zap_monitor_main(void *arg) {
                                         &m->in_hijack);
                     pthread_mutex_unlock(&g_preempt_stw_mu);
                 }
-#else
+#elif defined(ZAP_GC_IMMIX)
                 pthread_kill(m->thread, SIGURG);
+#else
+                /* gc-boehm (#710, D-0128): never deliver the async-preempt
+                 * signal while a bdwgc stop-the-world is in progress. The monitor
+                 * runs on its own thread; a SIGURG landing on a worker that the
+                 * collector is mid-suspending races bdwgc's STW suspend/ack
+                 * handshake (observed hang: `main` spinning in GC_generic_malloc_many
+                 * with every worker parked in bdwgc's suspend handler), and the
+                 * handler's copreempt stack-swap can move a mutator out from under
+                 * the collector during mark (the MPSC queue-node use-after-free:
+                 * `unwrap on an Optional.None value`). The in-handler guard added
+                 * for #693/#213 (D-0120) re-reads `g_boehm_in_stw` before copreempt,
+                 * but the monitor itself did not, so it kept firing INTO a running
+                 * collection — this gate closes that at the source. immix has no
+                 * signal-based STW, so its branch above is unchanged. Causation was
+                 * proven on a 32-vCPU x86 box: neutering this signal ran the coro
+                 * stress 800+ iters clean vs. hang/crash at ~iter 100 with it on
+                 * (MAXPROCS=64, GC_FREE_SPACE_DIVISOR=3). */
+                if (!__atomic_load_n(&g_boehm_in_stw, __ATOMIC_SEQ_CST)) {
+                    pthread_kill(m->thread, SIGURG);
+                }
 #endif
             }
             last[i] = tick;

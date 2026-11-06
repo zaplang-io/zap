@@ -709,13 +709,15 @@ struct QNode[T]:
 # Python-faithful lie (D-0078). Construct with new_queue[T]().
 #
 # The queue allocates a GC-managed node per element whatever the payload type, so
-# node liveness rides the collector's root scan. On aarch64-Linux it therefore
-# inherits the open I#223 race (a collector-agnostic reclamation/root-visibility
-# bug that reclaims a still-live node under true multicore; it fails under the
-# non-moving Boehm collector too, not just under moving evacuation) and is NOT
-# trustworthy on that platform until I#223 is fixed — this holds for BOTH
-# non-pointer (int64/handle) and reference payloads (D-0078 §4.5/§4.6, amended
-# 2026-10-30). Only the node-free concurrent.Counter is exempt.
+# node liveness rides the collector's root scan. The multicore hang + queue-node
+# use-after-free seen at high core count under gc-boehm (I#710, a #223 follow-up)
+# was root-caused NOT to this algorithm but to the #172 fairness monitor sending
+# its preempt signal to a worker during a bdwgc stop-the-world; it is fixed by
+# gating that signal on the STW flag (D-0128). The defect reproduced on x86_64 as
+# well as aarch64, so it was never arch- or queue-specific. Box confirmation of
+# the fix at scale on the Graviton host (#650) is the remaining acceptance step
+# before aarch64-Linux leaves experimental; the node-free concurrent.Counter was
+# never affected.
 struct Queue[T]:
     Atomic[QNode[T]] _head   # consumer end: the stub / last-consumed node
     Atomic[QNode[T]] _tail   # producer end: the most recently pushed node
