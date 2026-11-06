@@ -311,16 +311,18 @@ struct StructCtx {
     /// it as the coroutine body (its catch-all pad routes a child failure to the
     /// scope, exactly as for a named spawn).
     spawn_thunks: RefCell<HashMap<u32, String>>,
-    /// Synthesized tuple key functions (#680), keyed by the tuple's interned
-    /// struct id: the `(__hash__, __eq__)` symbol names of the structural
-    /// hash/equality functions generated on demand the first time a tuple is used
-    /// as a dict key or set element. Tuples already lower as value-struct
-    /// aggregates and value-struct keys already route through the fn-key path, so
-    /// a tuple key is just an anonymous `@derive(Hash, Eq)` struct: its hash folds
-    /// the per-element hashes with `zap_hash_combine` and its eq ANDs the per-element
-    /// comparisons, element-for-element over the interned layout. Generated once
-    /// per tuple id and reused, exactly like [`Self::spawn_thunks`].
-    tuple_keyfns: RefCell<HashMap<u32, (String, String)>>,
+    /// Synthesized structural key functions (#680 tuples, D-0049; #704
+    /// `Optional[T]`, D-0122), keyed by the value's interned struct id: the
+    /// `(__hash__, __eq__)` symbol names of the structural hash/equality
+    /// functions generated on demand the first time that type is used as a dict
+    /// key or set element. Tuples and `Optional[T]` already lower as value
+    /// aggregates whose keys route through the fn-key path, so each is just an
+    /// anonymous `@derive(Hash, Eq)`: a tuple's hash folds the per-element hashes
+    /// with `zap_hash_combine` and its eq ANDs the per-element comparisons; an
+    /// Optional hashes a fixed sentinel for `None` and delegates to `T` for
+    /// `Some`. Generated once per struct id and reused (tuple and Optional ids are
+    /// distinct, so one map serves both), exactly like [`Self::spawn_thunks`].
+    synth_keyfns: RefCell<HashMap<u32, (String, String)>>,
     /// Generator-expression iterators (#596), keyed by their tuple-interned
     /// state-struct id. Populated on demand while lowering a `(x for x in xs)`;
     /// the iteration protocol hooks consult it so a genexpr value flows through
@@ -1208,7 +1210,7 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
         captureless_env: RefCell::new(None),
         fnval_wrappers: RefCell::new(HashMap::new()),
         spawn_thunks: RefCell::new(HashMap::new()),
-        tuple_keyfns: RefCell::new(HashMap::new()),
+        synth_keyfns: RefCell::new(HashMap::new()),
         packed_layouts,
         field_defaults,
         call_params: HashMap::new(),
@@ -1798,6 +1800,82 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
     }
 }
 
+/// Convert a type written in *expression* position into the [`ast::Type`] the
+/// resolver expects (#703). A collection **constructor** is parsed as a call of
+/// a subscript expression, so its element/key type arrives as an [`Expr`], not
+/// an [`ast::Type`]: `set[(int64, int64)]()` carries `(int64, int64)` as an
+/// `Expr::Tuple`, `set[list[int64]]()` carries `list[int64]` as an
+/// `Expr::Index`, and `set[int64]()` carries `int64` as an `Expr::Name`. The
+/// collection *literal* and the `dict[K, V]` / `set[T]` type-*annotation* forms
+/// already accept composite element types through [`resolve_ty`]; this bridges
+/// the constructor forms to that same path so they are consistent (previously
+/// only a bare name was accepted, rejecting a tuple with `ZAP6001 "expects an
+/// element type name"`). Only shapes that denote a type are accepted:
+///   * a bare name `int64`            → `Named { int64 }`
+///   * a tuple `(int64, str)`         → `Tuple { [int64, str] }`
+///   * a generic `list[int64]` / `dict[int64, str]` → `Named { list, [int64] }`
+///
+/// A monomorphized generic (e.g. `Optional[int64]` → `Optional$int64`) already
+/// arrives as an `Expr::Name` and keeps flowing through the name branch.
+fn expr_to_type(e: &Expr) -> Result<ast::Type, LowerError> {
+    match e {
+        Expr::Name(name, span) => Ok(ast::Type::Named {
+            name: name.clone(),
+            args: Vec::new(),
+            span: *span,
+        }),
+        Expr::Tuple(elems, span) => {
+            let elems = elems
+                .iter()
+                .map(expr_to_type)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ast::Type::Tuple { elems, span: *span })
+        }
+        Expr::Index { base, index, span } => {
+            let Expr::Name(name, _) = base.as_ref() else {
+                return Err(err(
+                    "not a valid element type: a generic type's base must be a name, \
+                     e.g. list[int64]",
+                ));
+            };
+            // `list[int64]` has a single type argument; `dict[int64, str]`'s two
+            // arguments arrive as a tuple in the subscript.
+            let args = match index.as_ref() {
+                Expr::Tuple(items, _) => items
+                    .iter()
+                    .map(expr_to_type)
+                    .collect::<Result<Vec<_>, _>>()?,
+                other => vec![expr_to_type(other)?],
+            };
+            Ok(ast::Type::Named {
+                name: name.clone(),
+                args,
+                span: *span,
+            })
+        }
+        _ => Err(err(
+            "not a valid collection element type (expected a type such as int64, \
+             (int64, str), or list[int64])",
+        )),
+    }
+}
+
+/// How one element/payload of a structural key is hashed and compared — the
+/// shared classification behind a tuple's per-field key handling (#680, D-0049)
+/// and an `Optional[T]`'s payload handling (#704, D-0122). See
+/// [`FnLower::elem_key_plan`].
+enum ElemKey {
+    /// Integer-word element (int/bool/char/enum): hash via `zap_i64_hash`,
+    /// compare with `ICmp Eq`.
+    Int,
+    /// Reference byte-buffer element (`str`/`bytes`): hash via `zap_str_hash`,
+    /// compare with `zap_str_eq`.
+    Str,
+    /// A nested hashable aggregate (tuple, `Optional[T]`, or a `@derive(Hash,
+    /// Eq)` struct): call its `(__hash__, __eq__)` by symbol name.
+    Struct(String, String),
+}
+
 /// The runtime representation of a collection element/key/value given its
 /// source type.
 fn elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
@@ -1823,18 +1901,6 @@ fn heap_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
         Ty::Enum(id) => Ok(Elem::Enum(id)),
         Ty::Ptr => Ok(Elem::Ptr),
-        other => Err(err(format!(
-            "heap[{other}] is not supported yet (only integer and str elements)"
-        ))),
-    }
-}
-
-/// The heap element kind named by a construction subscript like `heap[int64]`,
-/// where the element type appears as a bare name in expression position.
-fn heap_elem_from_name(name: &str) -> Result<Elem, LowerError> {
-    match name {
-        "int64" | "i64" | "int32" | "i32" | "bool" | "char" => Ok(Elem::I64),
-        "str" => Ok(Elem::Ptr),
         other => Err(err(format!(
             "heap[{other}] is not supported yet (only integer and str elements)"
         ))),
@@ -9841,6 +9907,29 @@ impl<'a> FnLower<'a> {
             {
                 self.lower_is_none(matches!(op, AstBin::IsNot), lhs, rhs)
             }
+            // A bare `None` membership test (`None in d`, `None in s`): evaluate
+            // the container first to learn its key/element type, then lower the
+            // (side-effect-free) `None` against it so it becomes the tagged
+            // Optional `None` rather than hitting the unsupported-expression path
+            // (#704). Mirrors the `d[None]` subscript threading above.
+            Expr::Binary { op, lhs, rhs, .. }
+                if matches!(op, AstBin::In | AstBin::NotIn)
+                    && matches!(lhs.as_ref(), Expr::None(_)) =>
+            {
+                let (r, rt) = self.expr(rhs)?;
+                let expected = match rt {
+                    Ty::Dict(kk, _) => kk.ty(),
+                    Ty::Set(ek) => ek.ty(),
+                    _ => {
+                        return Err(err(
+                            "'in' with a `None` left operand requires a dict or set on \
+                             the right",
+                        ))
+                    }
+                };
+                let l = self.expr_coerced(lhs, expected, zapc_diag::ErrorCode::ZAP4021)?;
+                self.binop(*op, l, expected, r, rt)
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (l, lt) = self.expr(lhs)?;
                 let (r, rt) = self.expr(rhs)?;
@@ -12738,12 +12827,27 @@ impl<'a> FnLower<'a> {
         elem_expr: &Expr,
         args: &[ast::Arg],
     ) -> Result<(Value, Ty), LowerError> {
-        let Expr::Name(ename, _) = elem_expr else {
-            return Err(err(
-                "channel[...] expects an element type name, e.g. channel[int64]",
-            ));
+        // A channel stores its elements as uniform 8-byte words (D-0031), so a
+        // bare scalar/reference name classifies directly. A **tuple** element is
+        // a value aggregate: delivering one across the channel ABI needs
+        // boxing/unboxing this slice does not implement (unlike a set/dict key,
+        // which hashes a tuple through its key functions), so it is rejected
+        // cleanly here with a specific message rather than the generic
+        // "expects an element type name" (#703; tuple channels are a follow-up).
+        let elem = match elem_expr {
+            Expr::Name(ename, _) => chan_elem_from_name(ename)?,
+            Expr::Tuple(..) => {
+                return Err(err(
+                    "channels of tuple elements are not supported yet (a tuple is a \
+                     value aggregate; channel elements are uniform words)",
+                ))
+            }
+            _ => {
+                return Err(err(
+                    "channel[...] expects an element type name, e.g. channel[int64]",
+                ))
+            }
         };
-        let elem = chan_elem_from_name(ename)?;
         let cap = match args.len() {
             0 => self.iconst(Ty::I64, 0),
             1 => {
@@ -13028,17 +13132,14 @@ impl<'a> FnLower<'a> {
         elem_expr: &Expr,
         args: &[ast::Arg],
     ) -> Result<(Value, Ty), LowerError> {
-        let Expr::Name(ename, espan) = elem_expr else {
-            return Err(err(
-                "set[...] expects an element type name, e.g. set[int64]",
-            ));
-        };
-        let named = ast::Type::Named {
-            name: ename.clone(),
-            args: Vec::new(),
-            span: *espan,
-        };
-        let ety = resolve_ty(&named, &self.ctx.tyenv())?;
+        // The element type may be any valid type expression, not just a bare
+        // name (#703): `set[(int64, int64)]()` and `set[list[int64]]()` are now
+        // accepted, consistent with the set literal `{(1, 2)}` and the
+        // `dict[(..), ..]` key forms (D-0122). A tuple element routes through the
+        // same per-type `__hash__`/`__eq__` key path as the literal; an
+        // unhashable element (a nested collection, a float) is still rejected
+        // cleanly below / in `key_fn_args`, never with an ICE.
+        let ety = resolve_ty(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
         let elem = elem_kind(ety, &self.ctx.nested)?;
         // A nested collection is unhashable (#625): reject `set[list[..]]()` loudly
         // rather than letting it hash a pointer as a string on a later `.add`.
@@ -13126,11 +13227,18 @@ impl<'a> FnLower<'a> {
                 if args.len() != 1 {
                     return Err(err("add() takes exactly one argument"));
                 }
-                let (v, vt) = self.expr(&args[0].value)?;
-                if elem_kind(vt, &self.ctx.nested)? != elem {
-                    return Err(err("add() value has the wrong element type"));
-                }
-                let v = self.coerce(v, vt, elem.ty());
+                // A bare `None` element needs the set's element type as context so
+                // it lowers to the tagged Optional `None` (`set[Optional[T]]`,
+                // #704); every other element keeps the explicit element-type check.
+                let v = if matches!(&args[0].value, Expr::None(_)) {
+                    self.expr_coerced(&args[0].value, elem.ty(), zapc_diag::ErrorCode::ZAP4021)?
+                } else {
+                    let (v, vt) = self.expr(&args[0].value)?;
+                    if elem_kind(vt, &self.ctx.nested)? != elem {
+                        return Err(err("add() value has the wrong element type"));
+                    }
+                    self.coerce(v, vt, elem.ty())
+                };
                 let v = self.box_if_value(v, elem.ty());
                 let kfns = self.key_fn_args(elem)?;
                 let mut cargs = vec![recv, v];
@@ -13514,12 +13622,14 @@ impl<'a> FnLower<'a> {
         elem_expr: &Expr,
         args: &[ast::Arg],
     ) -> Result<(Value, Ty), LowerError> {
-        let Expr::Name(ename, _) = elem_expr else {
-            return Err(err(
-                "heap[...] expects an element type name, e.g. heap[int64]",
-            ));
-        };
-        let elem = heap_elem_from_name(ename)?;
+        // Accept any valid type expression and classify it exactly like the
+        // `heap[T]` type annotation (#703): `heap_elem_of` admits only the
+        // *ordered* element kinds (integers/bools/chars and `str`), so a tuple —
+        // which has no defined ordering — is rejected cleanly here, the same way
+        // the annotation rejects it, rather than with the misleading "expects an
+        // element type name". (Ordered tuple/struct heap elements are a separate
+        // follow-up.)
+        let elem = heap_elem_of(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
         let mut dir = 0i64; // 0 = min-heap (default), 1 = max-heap
         for a in args {
             match a.name.as_deref() {
@@ -13795,8 +13905,12 @@ impl<'a> FnLower<'a> {
                 Ok((d, ety))
             }
             Ty::Dict(kk, vk) => {
-                let (kv, kt) = self.expr(index)?;
-                let kv = self.coerce(kv, kt, kk.ty());
+                // Key type as expected context, so a bare `None` index
+                // (`d[None]` on a `dict[Optional[T], _]`) lowers to the tagged
+                // Optional `None` instead of the unsupported-expression path (#704).
+                // A read passes the key transiently, so (like the pre-#704 path) it
+                // is not heap-boxed — only an insert persists the key.
+                let kv = self.expr_coerced(index, kk.ty(), zapc_diag::ErrorCode::ZAP4001)?;
                 let kfns = self.key_fn_args(kk)?;
                 // The value's full type (#625): a nested-collection value reads back
                 // as its real `list`/`dict`/... type, not a bare `str` pointer.
@@ -14045,8 +14159,11 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             Ty::Dict(kk, vk) => {
-                let (kv, kt) = self.expr(index)?;
-                let kv = self.coerce(kv, kt, kk.ty());
+                // Lower the key with the dict's key type as expected context, so
+                // a bare `None` key (`d[None] = v` on a `dict[Optional[T], _]`)
+                // lowers to the tagged Optional `None` rather than hitting the
+                // generic unsupported-expression path (#704).
+                let kv = self.expr_coerced(index, kk.ty(), zapc_diag::ErrorCode::ZAP4001)?;
                 let kv = self.box_if_value(kv, kk.ty());
                 let (v, vt) = self.expr_collection_context(value, self.elem_ty(vk))?;
                 self.check_index_value(vt, vk, false)?;
@@ -15044,6 +15161,13 @@ impl<'a> FnLower<'a> {
         // function-pointer key path as a named `@derive(Hash, Eq)` struct.
         let (hashn, eqn) = if self.ctx.tuples.borrow().is_tuple(sid) {
             self.tuple_key_fns(sid)?
+        } else if optional_layout(self.ctx, Ty::Struct(sid)).is_some() {
+            // An `Optional[T]` key (#704): `None` and a present value are both
+            // hashable (CPython parity). Optional lowers as a tagged/niche enum
+            // value, so — like a tuple — synthesize its structural
+            // `__hash__`/`__eq__` and route it through the fn-key path. A
+            // sentinel hash for `None`, delegation to `T` for `Some`.
+            self.optional_key_fns(sid)?
         } else {
             let name = self.ctx.names[sid as usize].clone();
             let hashn = format!("{name}__{}", "__hash__");
@@ -15093,7 +15217,7 @@ impl<'a> FnLower<'a> {
     /// no signature registration (they are only ever called indirectly by the
     /// collection runtime). Reused across every key use of the same tuple layout.
     fn tuple_key_fns(&mut self, sid: u32) -> Result<(String, String), LowerError> {
-        if let Some(pair) = self.ctx.tuple_keyfns.borrow().get(&sid) {
+        if let Some(pair) = self.ctx.synth_keyfns.borrow().get(&sid) {
             return Ok(pair.clone());
         }
         let fields = self
@@ -15106,49 +15230,10 @@ impl<'a> FnLower<'a> {
         // element fails cleanly before any function is emitted. For a nested
         // aggregate element this recurses to generate that element's key
         // functions; for a named struct it requires derived/defined dunders.
-        enum ElemKey {
-            /// Integer-word element (bool/char/int/enum): hash via `zap_i64_hash`,
-            /// compare with `ICmp Eq`.
-            Int,
-            /// Reference byte-buffer element (`str`/`bytes`): hash via
-            /// `zap_str_hash`, compare with `zap_str_eq`.
-            Str,
-            /// A nested hashable struct / tuple: call its `(__hash__, __eq__)`.
-            Struct(String, String),
-        }
-        let mut plan: Vec<ElemKey> = Vec::with_capacity(fields.len());
-        for fty in &fields {
-            let key = match *fty {
-                Ty::Ptr | Ty::Bytes => ElemKey::Str,
-                t if t.int_width().is_some() => ElemKey::Int,
-                Ty::Struct(csid) => {
-                    if self.ctx.tuples.borrow().is_tuple(csid) {
-                        let (ch, ce) = self.tuple_key_fns(csid)?;
-                        ElemKey::Struct(ch, ce)
-                    } else {
-                        let name = self.ctx.names[csid as usize].clone();
-                        let ch = format!("{name}____hash__");
-                        let ce = format!("{name}____eq__");
-                        if !self.sigs.contains_key(&ch) || !self.sigs.contains_key(&ce) {
-                            return Err(err(format!(
-                                "a tuple with a '{name}' element cannot be a dict key or \
-                                 set element: '{name}' needs '__hash__' and '__eq__' \
-                                 (use @derive(Hash, Eq) or define them; D-0047, D-0049)"
-                            )));
-                        }
-                        ElemKey::Struct(ch, ce)
-                    }
-                }
-                other => {
-                    return Err(err(format!(
-                        "a tuple with a '{other}' element is not hashable and cannot be a \
-                         dict key or set element (only integers, bools, char, enums, str, \
-                         bytes, and tuples/structs of those; D-0049)"
-                    )));
-                }
-            };
-            plan.push(key);
-        }
+        let plan: Vec<ElemKey> = fields
+            .iter()
+            .map(|fty| self.elem_key_plan(*fty))
+            .collect::<Result<_, _>>()?;
 
         let hashn = format!("$tuple${sid}$hash");
         let eqn = format!("$tuple${sid}$eq");
@@ -15295,7 +15380,244 @@ impl<'a> FnLower<'a> {
         }
 
         let pair = (hashn, eqn);
-        self.ctx.tuple_keyfns.borrow_mut().insert(sid, pair.clone());
+        self.ctx.synth_keyfns.borrow_mut().insert(sid, pair.clone());
+        Ok(pair)
+    }
+
+    /// Classify one element/payload type for the structural key path — shared by
+    /// a tuple's per-field handling (#680, D-0049) and an `Optional[T]`'s payload
+    /// (#704, D-0122). An unhashable element yields a clean coded diagnostic,
+    /// never an ICE; an aggregate element (a nested tuple, an `Optional[T]`, or a
+    /// `@derive(Hash, Eq)` struct) resolves to its own `(__hash__, __eq__)`,
+    /// recursing to synthesize them on demand.
+    fn elem_key_plan(&mut self, fty: Ty) -> Result<ElemKey, LowerError> {
+        Ok(match fty {
+            Ty::Ptr | Ty::Bytes => ElemKey::Str,
+            t if t.int_width().is_some() => ElemKey::Int,
+            Ty::Struct(csid) => {
+                if self.ctx.tuples.borrow().is_tuple(csid) {
+                    let (ch, ce) = self.tuple_key_fns(csid)?;
+                    ElemKey::Struct(ch, ce)
+                } else if optional_layout(self.ctx, Ty::Struct(csid)).is_some() {
+                    let (ch, ce) = self.optional_key_fns(csid)?;
+                    ElemKey::Struct(ch, ce)
+                } else {
+                    let name = self.ctx.names[csid as usize].clone();
+                    let ch = format!("{name}____hash__");
+                    let ce = format!("{name}____eq__");
+                    if !self.sigs.contains_key(&ch) || !self.sigs.contains_key(&ce) {
+                        return Err(err(format!(
+                            "a '{name}' element needs '__hash__' and '__eq__' to be part of \
+                             a dict key or set element (use @derive(Hash, Eq) or define \
+                             them; D-0047, D-0049)"
+                        )));
+                    }
+                    ElemKey::Struct(ch, ce)
+                }
+            }
+            other => {
+                return Err(err(format!(
+                    "a '{other}' element is not hashable and cannot be a dict key or set \
+                     element (only integers, bools, char, enums, str, bytes, and \
+                     tuples/Optionals/structs of those; D-0049, D-0122)"
+                )))
+            }
+        })
+    }
+
+    /// Synthesize (once per `Optional[T]` instance id, #704 / D-0122) the
+    /// structural `__hash__` and `__eq__` for an `Optional[T]` used as a dict key
+    /// or set element, returning their symbol names. CPython parity: `None` and a
+    /// present value are both hashable, so — like a tuple — the Optional routes
+    /// through the function-pointer key path (D-0047). `__hash__(o) -> i64`
+    /// returns a fixed sentinel for `None` and delegates to `T`'s hashing for
+    /// `Some(x)`; `__eq__(a, b) -> i1` is true iff both are `None`, or both are
+    /// `Some` with equal payloads — so `None` never compares equal to any present
+    /// value (a hash collision between the sentinel and a payload hash is
+    /// therefore harmless). An unhashable `T` (e.g. `Optional[float]`) is rejected
+    /// with the same clean coded diagnostic as elsewhere, never an ICE. The
+    /// generated functions append to [`StructCtx::generated`] and are referenced
+    /// by `Inst::FuncAddr`, needing no signature registration (they are only ever
+    /// called indirectly by the collection runtime). Reused across every key use
+    /// of the same Optional instance, and the tagged/niche layout is handled by
+    /// the shared `gen_opt_*` constructors (#564, D-0064).
+    fn optional_key_fns(&mut self, sid: u32) -> Result<(String, String), LowerError> {
+        if let Some(pair) = self.ctx.synth_keyfns.borrow().get(&sid) {
+            return Ok(pair.clone());
+        }
+        let opt = optional_layout(self.ctx, Ty::Struct(sid))
+            .expect("optional_key_fns called on a non-Optional struct id");
+        // Classify the payload first, so an unhashable `T` fails cleanly before
+        // any function is emitted. A `Some` payload that is itself a tuple or
+        // Optional recurses to synthesize that layout's own key functions.
+        let plan = self.elem_key_plan(opt.payload_ty)?;
+
+        let hashn = format!("$opt${sid}$hash");
+        let eqn = format!("$opt${sid}$eq");
+        // A fixed, arbitrary nonzero hash for `None` (ASCII "none"). It need not
+        // avoid payload hashes: `__eq__` keeps `None` distinct from every present
+        // value, so a bucket collision only chains.
+        const NONE_HASH: i64 = 0x6E6F_6E65;
+
+        // __hash__(opt) -> i64: sentinel for `None`, delegate to `T` for `Some`.
+        {
+            let mut b = FnLower::new(
+                hashn.clone(),
+                vec![Ty::Struct(sid)],
+                Ty::I64,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            let fv: Value = 0; // the Optional parameter
+            let slot = b.alloca(Ty::I64);
+            let is_none = gen_opt_is_none(&mut b, &opt, fv);
+            let none_bb = b.new_block();
+            let some_bb = b.new_block();
+            let end_bb = b.new_block();
+            b.set_term(Term::BrIf {
+                cond: is_none,
+                then_bb: none_bb,
+                else_bb: some_bb,
+            });
+            b.position(none_bb);
+            let sentinel = b.iconst(Ty::I64, NONE_HASH);
+            b.store(slot, sentinel);
+            b.set_term(Term::Br(end_bb));
+            b.position(some_bb);
+            let payload = gen_opt_payload(&mut b, &opt, fv);
+            let h = match &plan {
+                ElemKey::Str => {
+                    let d = b.new_value(Ty::I64);
+                    b.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_str_hash".to_string(),
+                        args: vec![payload],
+                    });
+                    d
+                }
+                ElemKey::Int => {
+                    let i = b.coerce(payload, opt.payload_ty, Ty::I64);
+                    let d = b.new_value(Ty::I64);
+                    b.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_i64_hash".to_string(),
+                        args: vec![i],
+                    });
+                    d
+                }
+                ElemKey::Struct(ch, _) => {
+                    let d = b.new_value(Ty::I64);
+                    b.emit(Inst::Call {
+                        dest: Some(d),
+                        func: ch.clone(),
+                        args: vec![payload],
+                    });
+                    d
+                }
+            };
+            b.store(slot, h);
+            b.set_term(Term::Br(end_bb));
+            b.position(end_bb);
+            let acc = b.load(slot, Ty::I64);
+            b.set_term(Term::Ret(Some(acc)));
+            self.ctx.generated.borrow_mut().push(b.func);
+        }
+
+        // __eq__(a, b) -> i1: both None -> true; one None -> false; both Some ->
+        // compare payloads. The IR has no phi, so the result merges through a slot.
+        {
+            let mut b = FnLower::new(
+                eqn.clone(),
+                vec![Ty::Struct(sid), Ty::Struct(sid)],
+                Ty::I1,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            let a: Value = 0;
+            let c: Value = 1;
+            let slot = b.alloca(Ty::I1);
+            let a_none = gen_opt_is_none(&mut b, &opt, a);
+            let b_none = gen_opt_is_none(&mut b, &opt, c);
+            let a_none_bb = b.new_block();
+            let a_some_bb = b.new_block();
+            let end_bb = b.new_block();
+            b.set_term(Term::BrIf {
+                cond: a_none,
+                then_bb: a_none_bb,
+                else_bb: a_some_bb,
+            });
+            // a is None: equal iff b is also None.
+            b.position(a_none_bb);
+            b.store(slot, b_none);
+            b.set_term(Term::Br(end_bb));
+            // a is Some: equal iff b is Some and the payloads compare equal.
+            b.position(a_some_bb);
+            let b_none_bb = b.new_block();
+            let both_some_bb = b.new_block();
+            b.set_term(Term::BrIf {
+                cond: b_none,
+                then_bb: b_none_bb,
+                else_bb: both_some_bb,
+            });
+            b.position(b_none_bb);
+            let f = b.bconst(false);
+            b.store(slot, f);
+            b.set_term(Term::Br(end_bb));
+            b.position(both_some_bb);
+            let pa = gen_opt_payload(&mut b, &opt, a);
+            let pc = gen_opt_payload(&mut b, &opt, c);
+            let bit = match &plan {
+                ElemKey::Str => {
+                    let word = b.new_value(Ty::I64);
+                    b.emit(Inst::Call {
+                        dest: Some(word),
+                        func: "zap_str_eq".to_string(),
+                        args: vec![pa, pc],
+                    });
+                    let zero = b.iconst(Ty::I64, 0);
+                    let bit = b.new_value(Ty::I1);
+                    b.emit(Inst::ICmp {
+                        dest: bit,
+                        pred: CmpPred::Ne,
+                        lhs: word,
+                        rhs: zero,
+                    });
+                    bit
+                }
+                ElemKey::Int => {
+                    let bit = b.new_value(Ty::I1);
+                    b.emit(Inst::ICmp {
+                        dest: bit,
+                        pred: CmpPred::Eq,
+                        lhs: pa,
+                        rhs: pc,
+                    });
+                    bit
+                }
+                ElemKey::Struct(_, ce) => {
+                    let bit = b.new_value(Ty::I1);
+                    b.emit(Inst::Call {
+                        dest: Some(bit),
+                        func: ce.clone(),
+                        args: vec![pa, pc],
+                    });
+                    bit
+                }
+            };
+            b.store(slot, bit);
+            b.set_term(Term::Br(end_bb));
+            b.position(end_bb);
+            let r = b.load(slot, Ty::I1);
+            b.set_term(Term::Ret(Some(r)));
+            self.ctx.generated.borrow_mut().push(b.func);
+        }
+
+        let pair = (hashn, eqn);
+        self.ctx.synth_keyfns.borrow_mut().insert(sid, pair.clone());
         Ok(pair)
     }
 
