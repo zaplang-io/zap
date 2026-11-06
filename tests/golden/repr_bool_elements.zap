@@ -10,8 +10,11 @@ def main():
     print(flags)  # [True, False, True]
     set[bool] on = {True}
     print(on)  # {True}
-    dict[str, bool] d = {"a": True, "b": False}
-    print(d)  # {'a': True, 'b': False}
+    # A single-entry dict keeps the golden independent of Zap's dict iteration
+    # order (hash order, not insertion order), while still exercising a bool
+    # dict value rendering as True/False.
+    dict[str, bool] d = {"on": True}
+    print(d)  # {'on': True}
     print(str(flags))  # [True, False, True]  str() matches
     # A plain int list is unaffected (renders integers).
     list[int64] ns = [1, 0]
