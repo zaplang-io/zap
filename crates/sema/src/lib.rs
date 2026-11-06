@@ -6976,6 +6976,48 @@ mod tests {
         assert!(e.is_empty(), "unexpected type errors: {e:?}");
     }
 
+    // ---- crypto asymmetric-key surface (#643, D-0126) ---------------------
+
+    #[test]
+    fn crypto_asym_surface_type_checks() {
+        // key_info returns the KeyInfo value struct; its fields carry the right
+        // types; imports/sign return bytes and verify returns bool.
+        ok(r#"def main():
+    auto rsa_pub = crypto.rsa_public_key_pem(b"n", b"e")
+    auto ec_pub = crypto.p256_public_key_pem(b"x", b"y")
+    auto ed_pub = crypto.ed25519_public_key_pem(b"x")
+    auto info = crypto.key_info(rsa_pub)
+    str kind = info.kind
+    int64 bits = info.bits
+    str curve = info.curve
+    bool priv = info.is_private
+    bytes es = crypto.p256_sha256_sign("pem", "msg")
+    bool ok1 = crypto.p256_sha256_verify(ec_pub, "msg", es)
+    bytes ed = crypto.ed25519_sign("pem", b"msg")
+    bool ok2 = crypto.ed25519_verify(ed_pub, b"msg", ed)
+    assert ok1 and ok2
+"#);
+    }
+
+    #[test]
+    fn crypto_asym_arity_is_checked() {
+        // Wrong argument counts are rejected (ZAP4025), one per entry point.
+        for bad in [
+            "crypto.key_info(\"a\", \"b\")",
+            "crypto.rsa_public_key_pem(b\"n\")",
+            "crypto.p256_public_key_pem(b\"x\")",
+            "crypto.ed25519_public_key_pem(b\"x\", b\"y\")",
+            "crypto.p256_sha256_sign(\"pem\")",
+            "crypto.ed25519_sign(\"pem\")",
+            "crypto.p256_sha256_verify(\"pem\", \"msg\")",
+            "crypto.ed25519_verify(\"pem\", \"msg\")",
+        ] {
+            let src = format!("def main():\n    auto x = {bad}\n");
+            let e = errors(&src);
+            assert!(!e.is_empty(), "expected an arity error for `{bad}`");
+        }
+    }
+
     // ---- transparent type aliases (#606, D-0105) --------------------------
 
     #[test]

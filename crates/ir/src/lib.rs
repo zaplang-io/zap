@@ -59,6 +59,61 @@ mod tests {
     }
 
     #[test]
+    fn crypto_asym_surface_lowers() {
+        // #643 / D-0126: the validated asymmetric-key surface lowers end to end,
+        // including the `KeyInfo` value struct built from the key_info getters
+        // (prelude injection is gated on the "key_info" needle) and field access.
+        let module = lower_ok(
+            r#"def main():
+    auto rsa_pub = crypto.rsa_public_key_pem(b"n", b"e")
+    auto ec_pub = crypto.p256_public_key_pem(b"x", b"y")
+    auto ed_pub = crypto.ed25519_public_key_pem(b"x")
+    auto info = crypto.key_info(rsa_pub)
+    auto kind = info.kind
+    auto bits = info.bits
+    auto curve = info.curve
+    auto is_priv = info.is_private
+    auto es = crypto.p256_sha256_sign("pem", b"msg")
+    auto ok = crypto.p256_sha256_verify(ec_pub, b"msg", es)
+    assert ok
+    auto ed = crypto.ed25519_sign("pem", b"msg")
+    auto ok2 = crypto.ed25519_verify(ed_pub, b"msg", ed)
+    assert ok2
+"#,
+        );
+        let main = module.funcs.iter().find(|f| f.name == "main").unwrap();
+        for (symbol, expected) in [
+            ("zap_crypto_rsa_public_key_pem", Ty::Bytes),
+            ("zap_crypto_p256_public_key_pem", Ty::Bytes),
+            ("zap_crypto_ed25519_public_key_pem", Ty::Bytes),
+            ("zap_crypto_key_kind", Ty::Ptr),
+            ("zap_crypto_key_bits", Ty::I64),
+            ("zap_crypto_key_curve", Ty::Ptr),
+            ("zap_crypto_p256_sha256_sign", Ty::Bytes),
+            ("zap_crypto_ed25519_sign", Ty::Bytes),
+            // Verifiers return int64 (0/1); call_bool normalizes to i1.
+            ("zap_crypto_p256_sha256_verify", Ty::I64),
+            ("zap_crypto_ed25519_verify", Ty::I64),
+        ] {
+            let found = main
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Call { func, .. } | Inst::Invoke { func, .. } if func == symbol));
+            assert!(found, "missing lowered call to {symbol}");
+            let _ = expected;
+        }
+        // The KeyInfo struct is built and its fields are read.
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::StructNew { .. })),
+            "key_info must build a KeyInfo struct"
+        );
+    }
+
+    #[test]
     fn crypto_result_types_distinguish_buffers_text_and_handles() {
         // Guard the boundary: opaque streaming contexts are not digest buffers,
         // and the existing hex/string APIs must keep string operation dispatch.

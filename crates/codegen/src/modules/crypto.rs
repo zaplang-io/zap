@@ -66,6 +66,52 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), p.into(), p.into()],
         Some(i.into()),
     );
+    // Asymmetric key metadata / import + P-256 ECDSA + Ed25519 (#643, D-0126),
+    // OpenSSL-backed. key_info getters: kind/curve -> ZapStr*, bits/is_private ->
+    // i64; all over a PEM key (kind is the validating gate, raising ValueError).
+    cg.declare_rt("zap_crypto_key_kind", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_crypto_key_bits", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_crypto_key_curve", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_crypto_key_is_private", &[p.into()], Some(i.into()));
+    // Validated public-key import from JWK components -> SPKI PEM bytes.
+    cg.declare_rt(
+        "zap_crypto_rsa_public_key_pem",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_p256_public_key_pem",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_ed25519_public_key_pem",
+        &[p.into()],
+        Some(p.into()),
+    );
+    // ES256 (P-256 / SHA-256), JOSE 64-byte r||s: (private_pem, msg) -> bytes.
+    cg.declare_rt(
+        "zap_crypto_p256_sha256_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    // (public_pem, msg, sig) -> i64 (0/1).
+    cg.declare_rt(
+        "zap_crypto_p256_sha256_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
+    // Pure Ed25519: (private_pem, msg) -> bytes; (public_pem, msg, sig) -> i64.
+    cg.declare_rt(
+        "zap_crypto_ed25519_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_ed25519_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
     // Secure random / secrets.
     cg.declare_rt("zap_crypto_random_bytes", &[i.into()], Some(p.into()));
     cg.declare_rt("zap_crypto_token_hex", &[i.into()], Some(p.into()));
