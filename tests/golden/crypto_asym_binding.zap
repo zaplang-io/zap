@@ -15,7 +15,7 @@
 # Fixed disposable test keys generated with OpenSSL 3.5.0. The embedded P-256
 # external signature's DER form (71 bytes) exercises the JOSE-vs-DER mistake.
 
-def sign_p256_rejects(str pem):
+def sign_p256_rejects(bytes pem):
     auto rejected = False
     try:
         crypto.p256_sha256_sign(pem, "m")
@@ -23,7 +23,7 @@ def sign_p256_rejects(str pem):
         rejected = True
     assert rejected
 
-def sign_ed_rejects(str pem):
+def sign_ed_rejects(bytes pem):
     auto rejected = False
     try:
         crypto.ed25519_sign(pem, "m")
@@ -97,9 +97,9 @@ HVd7xtQxbkpRlCqD5ktGAN3azmAdnXlZcfk8IonIs9SOs4MidIpfGEQ=
     sign_p256_rejects(ec_pub)
     sign_ed_rejects(ed_pub)
     # --- family / curve binding at signing ---
-    sign_p256_rejects(ed_priv)  # Ed25519 key offered for ES256
-    sign_p256_rejects(p384_priv)  # wrong EC curve (P-384) offered for ES256
-    sign_ed_rejects(p256_priv)  # P-256 key offered for Ed25519
+    sign_p256_rejects(bytes(ed_priv))  # Ed25519 key offered for ES256
+    sign_p256_rejects(bytes(p384_priv))  # wrong EC curve (P-384) offered for ES256
+    sign_ed_rejects(bytes(p256_priv))  # P-256 key offered for Ed25519
 
     # --- key_info gate ---
     key_info_rejects("not a pem")
