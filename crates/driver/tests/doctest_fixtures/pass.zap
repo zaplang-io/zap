@@ -67,6 +67,23 @@ def checked() -> bool:
     return True
 
 
+def tier3_enum_render() -> int64:
+    """A tier-3 data-carrying enum renders structurally in a doctest too, with
+    the same `Enum.Variant(field=value, …)` form print/str/f-string use (#706).
+
+    ```zap
+    enum Shape:
+        Circle(f64 r)
+        Unit
+    print(Shape.Circle(r=2.0))
+    print(Shape.Unit)
+    # => Shape.Circle(r=2.0)
+    # => Shape.Unit
+    ```
+    """
+    return 0
+
+
 def undocumented_example() -> int64:
     "Prose only — no fenced block, so this item contributes no doctest."
     return 0

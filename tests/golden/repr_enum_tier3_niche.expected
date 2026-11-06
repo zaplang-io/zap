@@ -1,0 +1,4 @@
+MaybeBox.Has(b=Box(v=9))
+MaybeBox.Nope
+MaybeBox.Has(b=Box(v=-1))
+m=MaybeBox.Nope

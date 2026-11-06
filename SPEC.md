@@ -966,6 +966,11 @@ renders identically in both positions.
   quoted (`Point(name='ada')`).
 - A **tier-1 enum** renders its qualified canonical variant name,
   `EnumName.VARIANT`.
+- A **tier-3 data-carrying enum** (D-0046) renders structurally:
+  `EnumName.Variant(field=value, …)` for a data-carrying variant (fields always
+  labelled, each rendered quoted-when-string: `Shape.Circle(r=2.0)`) and
+  `EnumName.Variant` for a payload-free variant (`Shape.Unit`). A recursive enum
+  (`Expr.Add(l=…, r=…)`) renders recursively.
 - A **tuple** renders the Python form `(v0, v1, …)` (a one-element tuple keeps
   its trailing comma, `(v0,)`).
 - A **`list`/`dict`/`set`** renders the Python form `[v0, v1]` / `{k0: v0, …}` /
@@ -990,11 +995,13 @@ print([1, 2, 3])               # [1, 2, 3]
 print(["a", "b"])              # ['a', 'b']        (elements quoted)
 print({"k": 1})                # {'k': 1}
 print("a")                     # a                 (bare string unquoted)
+print(Shape.Circle(r=2.0))     # Shape.Circle(r=2.0)   (tier-3 enum, #706)
+print(Shape.Unit)              # Shape.Unit            (payload-free variant)
 ```
 
-**Deferred (a clean compile error, never silent, each a #274 follow-up):**
-tier-3 data-carrying enums (`Shape.Circle(r=2.0)`) and interface-value rendering.
-No object-identity/address form (`<TypeName @ 0x…>`) is provided.
+**Deferred (a clean compile error, never silent, a #274 follow-up):**
+interface-value rendering (#707). No object-identity/address form
+(`<TypeName @ 0x…>`) is provided.
 
 **Known limitations (v1).** A `char` **collection element** renders as its
 codepoint integer (`list[char]` → `[97, 98]`), because `char` and `int32` are the

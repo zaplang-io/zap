@@ -1,0 +1,4 @@
+Expr.Add(l=Expr.Lit(v=1), r=Expr.Lit(v=2))
+Expr.Add(l=Expr.Add(l=Expr.Lit(v=1), r=Expr.Lit(v=2)), r=Expr.Lit(v=3))
+Expr.Neg(e=Expr.Neg(e=Expr.Lit(v=5)))
+e=Expr.Lit(v=42)

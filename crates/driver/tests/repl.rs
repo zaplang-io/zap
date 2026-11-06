@@ -191,6 +191,28 @@ fn struct_without_renderer_auto_renders_field_wise() {
     assert!(!stdout.contains("<Bare>"), "stdout: {stdout:?}");
 }
 
+#[test]
+fn tier3_enum_value_auto_renders_structurally() {
+    // A tier-3 data-carrying enum value auto-prints its structural form
+    // `Enum.Variant(field=value, …)` through the Display protocol (#706,
+    // D-0124) — a data-carrying variant with its fields, a payload-free variant
+    // bare — instead of the old `<Shape>` placeholder.
+    let script = "enum Shape:\n    Circle(f64 r)\n    Unit\n\nShape.Circle(r=2.0)\n";
+    let (stdout, stderr, code) = repl(script);
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert!(stdout.contains("Shape.Circle(r=2.0)"), "stdout: {stdout:?}");
+    assert!(!stdout.contains("<Shape>"), "stdout: {stdout:?}");
+}
+
+#[test]
+fn tier3_enum_payload_free_variant_auto_renders() {
+    // A payload-free variant of a tier-3 enum renders without parentheses.
+    let script = "enum Shape:\n    Circle(f64 r)\n    Unit\n\nShape.Unit\n";
+    let (stdout, stderr, code) = repl(script);
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert!(stdout.contains("Shape.Unit"), "stdout: {stdout:?}");
+}
+
 // ---------------------------------------------------------------------------
 // I#252: line editing degrades cleanly under piped (non-interactive) stdin
 // ---------------------------------------------------------------------------
