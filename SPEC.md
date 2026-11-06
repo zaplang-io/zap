@@ -304,6 +304,10 @@ opt-in **value type** — copied, laid out inline, no heap header — for hot
 aggregates (D-0051); a plain `struct` stays a reference type. Full OO (classes +
 inheritance) is deferred.
 
+A struct with no `__str__`/`__repr__`/`@derive(Repr)` renders through the Display
+protocol's default field-wise form `TypeName(field=value, …)` in `print`, `str`,
+f-strings, and the REPL (§9.4, D-0124).
+
 ### 4.5 Interfaces (D-0016)
 
 Interfaces are **structural** and satisfied **implicitly**, but conformance is
@@ -335,6 +339,7 @@ enum Color:
 
 auto c = Color.GREEN
 print(c.name)         # "GREEN"
+print(c)              # Color.GREEN   (Display protocol, §9.4 / D-0124)
 ```
 
 An explicit value may be reused as an alias. The first declaration for a value
@@ -924,12 +929,80 @@ print(f"%{255:02X}")            # %FF   (byte -> percent-encoding, SigV4)
 | `.precision` | float decimal places, or a string truncation length (codepoints) |
 | `type` | int `b`/`o`/`x`/`X`/`d`, float `e`/`E`/`f`/`F`/`g`/`G`, string `s` |
 
-v1 limitations (documented): the `!r`/`!a` conversions (only `!s` is accepted)
-and user-type rendering need the Display protocol (#274); a field cannot contain
-a string delimited by the same quote as the f-string (use the other quote);
-nested `{...}` inside a spec, and non-ASCII `fill` characters, are not supported;
-`format`'s spec must be a string literal. A malformed field is `ZAP2017`; an
-invalid spec is `ZAP4026`.
+A **user type or container** renders through the Display protocol (§9.4): a
+struct, tier-1 enum, tuple, or `list`/`dict`/`set` with no spec renders in an
+f-string field exactly as `str(expr)` and `print(expr)` do.
+
+v1 limitations (documented): the `!r`/`!a` conversions are not accepted (only
+`!s`; Zap draws no `repr`/`str` quoting distinction — §9.4); a field cannot
+contain a string delimited by the same quote as the f-string (use the other
+quote); nested `{...}` inside a spec, and non-ASCII `fill` characters, are not
+supported; `format`'s spec must be a string literal. A malformed field is
+`ZAP2017`; an invalid spec is `ZAP4026`.
+
+### 9.4 Value rendering (the Display protocol, #274/D-0124)
+
+Every value renders to text through **one** protocol, shared by `print(x)`,
+`str(x)`, f-string fields, the REPL, and doctests — so all four produce
+byte-identical text for the same value. Built-in scalars render as expected
+(numbers, `True`/`False`, `Optional[T]` as its payload or `None`).
+
+**The `str`/`repr` distinction.** As in Python, a leaf `str`/`char`/`bytes`
+renders differently at the top level vs. nested:
+
+- Top level of `print`/`str`/an f-string field: a string renders **unquoted**
+  (`hello`).
+- Nested as a struct field, container element, or tuple element: a string
+  renders **quoted** (`'a'`), `bytes` as `b'…'`, a `char` as `'c'`.
+
+Every other value type (numbers, `bool`, enums, structs, tuples, containers)
+renders identically in both positions.
+
+**User types and containers:**
+
+- A **struct** with no renderer gets the **default field-wise form**
+  `TypeName(field=value, …)` — no opt-in required; fields render recursively
+  (nested structs, tuples, enums, containers, `Optional`, scalars), strings
+  quoted (`Point(name='ada')`).
+- A **tier-1 enum** renders its qualified canonical variant name,
+  `EnumName.VARIANT`.
+- A **tuple** renders the Python form `(v0, v1, …)` (a one-element tuple keeps
+  its trailing comma, `(v0,)`).
+- A **`list`/`dict`/`set`** renders the Python form `[v0, v1]` / `{k0: v0, …}` /
+  `{v0, v1}`, with elements/keys/values quoted-when-string; the **empty forms**
+  are Python-exact: `[]`, `{}` (empty dict), and `set()` (an empty set is never
+  `{}`). Containers nest and carry structs/tuples/enums.
+- **Overrides:** a hand-written `__str__` (preferred) or `__repr__`, or
+  `@derive(Repr)`, overrides the default (D-0047); `@derive(Repr)` recurses
+  through all field types and, like the default, now renders a `str` field
+  **quoted**.
+
+```python
+struct Point:
+    int64 x
+    int64 y
+
+auto p = Point(x=1, y=2)
+print(p)                       # Point(x=1, y=2)
+print(str(p))                  # Point(x=1, y=2)   (identical)
+print(f"pt={p}")               # pt=Point(x=1, y=2)
+print([1, 2, 3])               # [1, 2, 3]
+print(["a", "b"])              # ['a', 'b']        (elements quoted)
+print({"k": 1})                # {'k': 1}
+print("a")                     # a                 (bare string unquoted)
+```
+
+**Deferred (a clean compile error, never silent, each a #274 follow-up):**
+tier-3 data-carrying enums (`Shape.Circle(r=2.0)`) and interface-value rendering.
+No object-identity/address form (`<TypeName @ 0x…>`) is provided.
+
+**Known limitations (v1).** A `bool`/`char` **collection element** renders as its
+integer form (`list[bool]` → `[1, 0]`), because a collection stores all small
+integers as one element kind; a `bool`/`char` **struct field** or **tuple
+element** renders correctly. The renderer recurses with **no cycle guard**, so a
+cyclic object graph would recurse without bound — as a hand-written recursive
+`__repr__` would (CPython guards only built-in containers). A quoted string's
+escaping is ASCII-focused: non-printable non-ASCII codepoints are not escaped.
 
 ## 10. Errors & exceptions (D-0007, D-0029)
 

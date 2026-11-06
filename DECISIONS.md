@@ -5147,3 +5147,109 @@ scope here.
 flagged, finishing the CPython-parity story for composite and optional keys with
 no runtime cost beyond the derive machinery already shared by tuples and value
 structs.
+
+## D-0124 — General value-rendering (repr/Display) protocol for user types, shared with `print()` (I#274)
+**Status:** Locked — resolves issue #274; follow-up to I#252 (REPL v1) and I#159;
+extends D-0047 (struct dunders), D-0046/D-0018 (enums), and D-0049 (tuples)
+Every value renders to text through **one** protocol, shared by `print()`,
+`str()`, f-strings, the REPL, and doctests. A user type that defines **no**
+`__str__`/`__repr__` and no `@derive(Repr)` now gets an **automatic default
+field-wise rendering** `TypeName(field=value, …)` — the `@derive(Repr)` shape —
+instead of a compile error (the old `struct_to_str` "defines neither '__str__'
+nor '__repr__'" error) or the REPL's `<TypeName>` placeholder.
+
+- **One renderer, two modes (`str` vs `repr`).** The protocol follows Python's
+  `str`/`repr` distinction, which affects ONLY leaf `str`/`char`/`bytes` values:
+  at the **top level** of `print(x)`/`str(x)`/an f-string field a bare string is
+  **unquoted** (`hello`), while **nested** inside a struct field, container
+  element, or tuple element the same string is **quoted** repr-style (`'a'`),
+  `bytes` render as `b'…'`, and a `char` as `'c'`. Numbers, `bool`, `float`,
+  `None`, enums, structs, tuples, and containers render identically in both modes.
+  The quote selection and escaping use Python's rules (single quotes unless the
+  string holds a `'` and no `"`; `\`, the active quote, `
+`/``/`	`, and C0
+  controls / DEL escaped) via the runtime helpers `zap_str_repr` / `zap_bytes_repr`.
+- **Struct default form.** A struct renders `TypeName(f0=v0, f1=v1, …)`, fields in
+  `repr` mode (so a `str` field shows `name='a'`). The shape is identical whether
+  a type opts in via `@derive(Repr)` or takes the default — both share one body
+  generator. **Behaviour change:** `@derive(Repr)` previously rendered a `str`
+  field *unquoted* (`Point(tag=a)`) and only supported int/bool/str fields; it now
+  quotes strings (`Point(tag='a')`) and recurses through every field type.
+- **Recurses through every field/element via the one renderer.** Integers, `bool`
+  (`True`/`False` — fixing the old `-1`-bitpattern bug in `@derive(Repr)`'s bool
+  path), `float` (`%g`-style), `str`/`char`/`bytes`, `complex`/`bigint`,
+  `Optional[T]` (payload when `Some`, `None` when absent — D-0064/#498), **nested
+  structs**, **tier-1 enums** (qualified canonical variant name `EnumName.VARIANT`,
+  reusing the `.name` chain, D-0018), **tuples** (Python `(v0, v1)` form; a
+  one-element tuple keeps its trailing comma `(v0,)`, D-0049 — **not** the internal
+  `(tuple)(f0=…)` struct form), and **`list`/`dict`/`set`** (below). A nested
+  user-type field renders by **calling** that type's own renderer, so a
+  mutually/recursively referenced type graph terminates at **compile** time: the
+  compiler synthesizes exactly one renderer function per struct/tuple/container
+  layout (memoized), and a field of the same type is a plain call, not inline
+  expansion.
+- **Native container rendering (Python shapes).** `list` → `[v0, v1]`, `dict` →
+  `{k0: v0, k1: v1}`, `set` → `{v0, v1}`, with **Python-exact empty forms** `[]`,
+  `{}` (empty dict), and `set()` (an empty set is `set()`, never `{}`). Each
+  element/key/value renders in `repr` mode (so string elements are quoted:
+  `['a', 'b']`, `{'k': 'v'}`), and containers nest and carry structs/tuples/enums
+  recursively. The renderer is a synthesized per-container-type ZIR function that
+  reuses the tested list-iteration (`iterate_list`), `zap_set_items`, and the typed
+  `zap_dict_keys_*` / `zap_dict_get_*` entry points — no bespoke runtime walk.
+- **The asymmetry #274 fixes.** Before this, only `print()` reached the struct
+  renderer; `str(x)` and `f"{x}"` rejected a user type outright even when it had a
+  `__str__`/`__repr__`. The single renderer (`FnLower::render_value`, with the
+  `render_str`/`render_repr` entry points) now backs all of them, so `print(x)`,
+  `str(x)`, and `f"{x}"` are consistent.
+- **Explicit overrides win.** Resolution order: `__str__` (preferred) → `__repr__`
+  (hand-written or `@derive(Repr)`) → the compiler default. An override applies
+  everywhere the protocol is used.
+- **Mechanism — not a workaround.** Lowering over the existing string runtime
+  helpers (`zap_str_concat`, the per-scalar `*_to_str`, `iterate_list`) plus two
+  small added string helpers (`zap_str_repr`, `zap_bytes_repr`, legitimate
+  rendering primitives). The synthesized renderers are ordinary ZIR functions
+  appended to the module, like the tuple/`Optional` key functions (D-0122/D-0123).
+  **No** change to the GC / Immix evacuator / scheduler / object header.
+
+**Out of scope (clean coded compile error — `ZAP4024` at sema for a bare value,
+`ZAP6001` at lowering for such a field — never an ICE; each a #274 follow-up):**
+- **Tier-3 data-carrying enums** (`Shape.Circle(r=2.0)`): structural variant
+  rendering needs a tag-dispatch renderer and is deferred; `match` on the value or
+  define `__str__`. (A tier-3 enum's tagged struct is detected and rejected, never
+  rendered field-wise over its synthetic `$tag`/payload slots.) Tracked as a
+  follow-up issue.
+- **Interface values:** rendering needs dynamic dispatch to the concrete type's
+  renderer (a vtable slot); deferred. Bind to a concrete type or define `__str__`.
+  Tracked (with the cycle guard) as a follow-up issue.
+- **Object identity / address form** (`<TypeName @ 0x…>`): explicitly **not**
+  built — it would require an object-identity/address intrinsic that does not
+  exist, so the structural field-wise form is used for everything.
+
+**Known v1 limitations (documented).**
+- **`bool`/`char` container *elements* render as their integer form.** A
+  collection stores elements as uniform words and classifies `i1`/`i8`/`i16`/`i32`/
+  `i64` all as the `i64` element kind (`Elem`), so `list[bool]` loses bool-ness and
+  renders `[1, 0]` rather than `[True, False]`, and `list[char]` renders codepoint
+  integers. A `bool`/`char` *struct field* or *tuple element* (which keep their
+  precise type) renders correctly (`True`/`'c'`); only collection elements are
+  affected. Full parity needs an `Elem` representation change (its own work).
+- **Cycle handling: no guard.** The renderer recurses structurally with **no**
+  cycle guard, so a cyclic object graph would recurse without bound — exactly like
+  a hand-written recursive `__repr__`, and unlike CPython's `reprlib` guard (which
+  covers only built-in containers). A `seen`-set guard would need object identity
+  (out of scope, above). In practice v1 cannot be fed a cycle through the supported
+  surface: a self-referential `Optional[Self]` struct field does not lower yet (a
+  pre-existing codegen limitation), and mutable collection back-edges would require
+  rebinding a container into itself. Revisit if/when object identity lands.
+- **String `repr` escaping is ASCII-focused.** Non-printable non-ASCII codepoints
+  are not escaped (the UTF-8 bytes pass through) — a documented simplification vs.
+  CPython's `\xNN`/`\uXXXX` for non-printables; printable ASCII and Unicode match.
+
+**Rationale:** making every value printable with a sensible default — identical in
+`print`, `str`, f-strings, the REPL, and doctests, with the Python `str`/`repr`
+quoting distinction and Python container shapes — is a Python-staple ergonomic and
+the language-first answer to #274. It costs nothing at runtime beyond the string
+concatenation a hand-written `__repr__` would do, reuses the `@derive(Repr)` shape,
+and keeps the opt-in dunders as the override path. Tier-3 enums, interface values,
+and a cycle guard are separable and tracked as follow-ups rather than rushed into
+one user-facing semantics change.

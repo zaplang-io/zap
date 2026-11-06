@@ -323,6 +323,29 @@ struct StructCtx {
     /// `Some`. Generated once per struct id and reused (tuple and Optional ids are
     /// distinct, so one map serves both), exactly like [`Self::spawn_thunks`].
     synth_keyfns: RefCell<HashMap<u32, (String, String)>>,
+    /// Synthesized default value-rendering functions (#274, D-0124), keyed by the
+    /// struct id: the symbol name of the `{sid}$repr(self) -> str` function that
+    /// renders a user type with no hand-written `__str__`/`__repr__` and no
+    /// `@derive(Repr)` in the default field-wise form `TypeName(field=value, …)`,
+    /// recursing through every field via the shared value renderer
+    /// ([`FnLower::render_str`]). Generated on demand the first time such a type is
+    /// rendered (by `print`/`str`/f-string/REPL) and reused; a nested user-type
+    /// field renders by *calling* that field type's own repr function, so a
+    /// mutually recursive type graph terminates at compile time (one function per
+    /// struct) and only an actual runtime object cycle recurses without bound —
+    /// the documented D-0124 limitation, matching a hand-written recursive
+    /// `__repr__`. Tuples (anonymous `(tuple)` layouts) reuse the same map, keyed
+    /// by their interned id, rendering the Python `(v0, v1)` form instead.
+    synth_reprfns: RefCell<HashMap<u32, String>>,
+    /// Synthesized native container (`list`/`dict`/`set`) rendering functions
+    /// (#274, D-0124), keyed by the container's ZIR type signature (`{ty:?}`): the
+    /// symbol name of a `$crepr$N(c) -> str` function that renders the container
+    /// in Python form (`[v0, v1]`, `{k0: v0}`, `{v0, v1}`; empty `[]`/`{}`/`set()`)
+    /// with each element/key/value rendered in `repr` mode via the shared value
+    /// renderer. Generated on demand and reused per container type; a container
+    /// type cannot contain itself, so nested containers resolve to distinct
+    /// functions and synthesis terminates.
+    synth_container_reprfns: RefCell<HashMap<String, String>>,
     /// Generator-expression iterators (#596), keyed by their tuple-interned
     /// state-struct id. Populated on demand while lowering a `(x for x in xs)`;
     /// the iteration protocol hooks consult it so a genexpr value flows through
@@ -1211,6 +1234,8 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
         fnval_wrappers: RefCell::new(HashMap::new()),
         spawn_thunks: RefCell::new(HashMap::new()),
         synth_keyfns: RefCell::new(HashMap::new()),
+        synth_reprfns: RefCell::new(HashMap::new()),
+        synth_container_reprfns: RefCell::new(HashMap::new()),
         packed_layouts,
         field_defaults,
         call_params: HashMap::new(),
@@ -3062,8 +3087,33 @@ fn gen_field_eq(b: &mut FnLower, a: Value, c: Value, fty: Ty) -> Result<Value, L
     Ok(bit)
 }
 
+/// The Python `str`/`repr` distinction for the Display protocol (#274, D-0124).
+/// It affects ONLY leaf string/char/bytes values: a bare string at the top level
+/// of `print`/`str` renders unquoted (`Str`), while the same string nested inside
+/// a struct field, container element, or tuple element renders Python-quoted
+/// (`Repr`, `'a'`). Every other value type renders identically in both modes.
+#[derive(Clone, Copy, PartialEq)]
+enum RenderMode {
+    /// Top-level `str(x)` / `print(x)` / f-string field: bare strings unquoted.
+    Str,
+    /// Nested (field / element): Python `repr` — strings quoted, `bytes` `b'…'`.
+    Repr,
+}
+
 /// `@derive(Repr)` — a debug-string method `Struct____repr__(self) -> str` (the
-/// `__repr__` dunder, D-0047) producing `Name(f0=v0, f1=v1, ...)`.
+/// `__repr__` dunder, D-0047) producing the default field-wise form
+/// `Name(f0=v0, f1=v1, ...)`.
+///
+/// Since #274 (D-0124) this shares one body generator with the *default* value
+/// renderer synthesized for a type that defines no `__str__`/`__repr__`: every
+/// field renders through [`FnLower::render_str`], the single value-rendering
+/// protocol, so a field of ANY type works — integers, `bool` (`True`/`False`,
+/// not the old `-1` bitpattern), `float`, `str`, `char`, `bytes`, `Optional`,
+/// **nested user structs** (rendered by *calling* that type's own renderer, so a
+/// recursive type graph terminates at compile time), tuples, and tier-1 enums.
+/// The only field types still rejected are the ones the shared renderer defers
+/// (a bare `list`/`dict`/`set`, a tier-3 data-carrying enum, or an interface
+/// value) — a clean coded error, never an ICE.
 fn gen_repr_method(
     sid: u32,
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
@@ -3072,15 +3122,28 @@ fn gen_repr_method(
     let sname = ctx.names[sid as usize].clone();
     let name = format!("{sname}__{}", "__repr__");
     let mut b = FnLower::new(name, vec![Ty::Struct(sid)], Ty::Ptr, false, true, sigs, ctx);
+    gen_struct_repr_body(&mut b, sid)?;
+    Ok(b.func)
+}
+
+/// Emit, into the already-constructed renderer function `b` (whose first value is
+/// the `self` struct), the default field-wise rendering of a *named* struct
+/// `sid`: `Name(field0=<v0>, field1=<v1>, …)` (#274, D-0124). Each field value is
+/// rendered through [`FnLower::render_str`] — the one value-rendering protocol —
+/// so the output is identical whether a type opts in via `@derive(Repr)` or gets
+/// the compiler-synthesized default. Shared by [`gen_repr_method`] and
+/// [`FnLower::struct_repr_fn`]'s on-demand default synthesis.
+fn gen_struct_repr_body(b: &mut FnLower, sid: u32) -> Result<(), LowerError> {
+    let sname = b.ctx.names[sid as usize].clone();
     let mut acc = b.strconst(&format!("{sname}("));
-    let fields = ctx.fields[sid as usize].clone();
+    let fields = b.ctx.fields[sid as usize].clone();
     for (idx, (fname, fty)) in fields.iter().enumerate() {
         if idx > 0 {
             let sep = b.strconst(", ");
-            acc = gen_concat(&mut b, acc, sep);
+            acc = gen_concat(b, acc, sep);
         }
         let label = b.strconst(&format!("{fname}="));
-        acc = gen_concat(&mut b, acc, label);
+        acc = gen_concat(b, acc, label);
         let fv = b.new_value(*fty);
         b.emit(Inst::FieldGet {
             dest: fv,
@@ -3088,31 +3151,98 @@ fn gen_repr_method(
             sid,
             idx: idx as u32,
         });
-        let vstr = match *fty {
-            Ty::Ptr => fv,
-            t if t.int_width().is_some() => {
-                let i64v = b.coerce(fv, t, Ty::I64);
-                let s = b.new_value(Ty::Ptr);
-                b.emit(Inst::Call {
-                    dest: Some(s),
-                    func: "zap_i64_to_str".to_string(),
-                    args: vec![i64v],
-                });
-                s
-            }
-            other => {
-                return Err(err(format!(
-                    "@derive(Repr) does not support field type {other} yet \
-                     (only integers, bools, and str)"
-                )));
-            }
-        };
-        acc = gen_concat(&mut b, acc, vstr);
+        // A field is a NESTED position: render in `repr` mode, so a `str` field
+        // shows quoted (`name='a'`), matching Python (#274, D-0124).
+        let vstr = b.render_repr(fv, *fty)?;
+        acc = gen_concat(b, acc, vstr);
     }
     let close = b.strconst(")");
-    acc = gen_concat(&mut b, acc, close);
+    acc = gen_concat(b, acc, close);
     b.set_term(Term::Ret(Some(acc)));
-    Ok(b.func)
+    Ok(())
+}
+
+/// Emit, into the renderer function `b`, the default rendering of a tuple
+/// (`(tuple)` anonymous layout, #274/D-0124) in the Python form `(v0, v1, …)` —
+/// NOT the `TypeName(field=value)` struct form, since a tuple has positional
+/// elements and no field names. A one-element tuple keeps the trailing comma
+/// (`(v0,)`), matching CPython and Zap's tuple literal syntax (D-0049). Each
+/// element renders through [`FnLower::render_str`], so tuples nest and carry
+/// structs/enums/scalars uniformly.
+fn gen_tuple_repr_body(b: &mut FnLower, sid: u32) -> Result<(), LowerError> {
+    let fields = b
+        .ctx
+        .tuples
+        .borrow()
+        .fields(sid)
+        .expect("gen_tuple_repr_body called on a non-tuple struct id");
+    let mut acc = b.strconst("(");
+    let arity = fields.len();
+    for (idx, fty) in fields.iter().enumerate() {
+        if idx > 0 {
+            let sep = b.strconst(", ");
+            acc = gen_concat(b, acc, sep);
+        }
+        let fv = b.new_value(*fty);
+        b.emit(Inst::FieldGet {
+            dest: fv,
+            base: 0,
+            sid,
+            idx: idx as u32,
+        });
+        // Tuple elements are nested positions: render in `repr` mode (quoted
+        // strings), matching Python's `(1, 'a')` (#274, D-0124).
+        let vstr = b.render_repr(fv, *fty)?;
+        acc = gen_concat(b, acc, vstr);
+    }
+    // A single-element tuple renders `(v0,)` (D-0049 / CPython), disambiguating it
+    // from a parenthesized expression.
+    let close = if arity == 1 {
+        b.strconst(",)")
+    } else {
+        b.strconst(")")
+    };
+    acc = gen_concat(b, acc, close);
+    b.set_term(Term::Ret(Some(acc)));
+    Ok(())
+}
+
+/// Emit the comma-separator step of a container renderer (#274, D-0124): on the
+/// first element (the `first` i64 flag is non-zero) clear the flag and emit
+/// nothing; on every later element append `", "` to the accumulator at `acc`.
+/// Leaves `b` positioned at the join block so the caller appends the element
+/// next.
+fn gen_seq_sep(b: &mut FnLower, acc: Value, first: Value) {
+    let fv = b.load(first, Ty::I64);
+    let zero = b.iconst(Ty::I64, 0);
+    let is_first = b.new_value(Ty::I1);
+    b.emit(Inst::ICmp {
+        dest: is_first,
+        pred: CmpPred::Ne,
+        lhs: fv,
+        rhs: zero,
+    });
+    let first_bb = b.new_block();
+    let sep_bb = b.new_block();
+    let after_bb = b.new_block();
+    b.set_term(Term::BrIf {
+        cond: is_first,
+        then_bb: first_bb,
+        else_bb: sep_bb,
+    });
+    // First element: just lower the flag, no separator.
+    b.position(first_bb);
+    let z = b.iconst(Ty::I64, 0);
+    b.store(first, z);
+    b.set_term(Term::Br(after_bb));
+    // Later element: append ", ".
+    b.position(sep_bb);
+    let a = b.load(acc, Ty::Ptr);
+    let sep = b.strconst(", ");
+    let a2 = gen_concat(b, a, sep);
+    b.store(acc, a2);
+    b.set_term(Term::Br(after_bb));
+    b.position(after_bb);
 }
 
 /// `zap_str_concat(a, b)` as a ZIR call returning the new string.
@@ -6036,23 +6166,53 @@ impl<'a> FnLower<'a> {
     /// Render a scalar/char/bool/str value to a `str` (the `str(x)` path).
     /// f-string fields with no format spec share this exact lowering, so
     /// `str(42)` and `f"{42}"` produce byte-identical output.
+    /// Top-level string rendering (`str(x)` / `print(x)` / an f-string field):
+    /// the `str`-mode form of the general Display protocol (#274, D-0124), where
+    /// a bare string/char/bytes value renders WITHOUT quotes. Equivalent to
+    /// `render_value(v, vt, RenderMode::Str)`.
     fn render_str(&mut self, v: Value, vt: Ty) -> Result<Value, LowerError> {
-        // `char` (an `i32`) renders its one-codepoint string; a plain `i64`
-        // renders decimal. int32/char share the `i32` representation, so an
-        // int32 renders as a character here too (format it as decimal via
-        // `str(int64(x))`); a full fix needs `char` threaded through the IR.
-        // `str(bytes)`: decode the UTF-8 bytes, raising a catchable exception on
-        // invalid UTF-8 (I#337). It can raise, so it routes through
-        // `throwing_call` (an `invoke` to the nearest handler / top-level).
+        self.render_value(v, vt, RenderMode::Str)
+    }
+
+    /// Nested string rendering (a struct field, container element, or tuple
+    /// element): the `repr`-mode form of the Display protocol (#274, D-0124),
+    /// where a string renders Python-quoted (`'a'`), `bytes` as `b'…'`, and a
+    /// `char` as its quoted one-character form — exactly as Python shows a value
+    /// *inside* a container/`repr`. Every other type renders identically to
+    /// `str` mode.
+    fn render_repr(&mut self, v: Value, vt: Ty) -> Result<Value, LowerError> {
+        self.render_value(v, vt, RenderMode::Repr)
+    }
+
+    /// The single value-rendering protocol (#274, D-0124). `mode` selects the
+    /// Python `str`/`repr` distinction, which affects ONLY leaf string/char/bytes
+    /// values: in `Str` mode a bare string renders unquoted (top-level
+    /// `print`/`str`), in `Repr` mode it renders quoted (`'a'`), as Python shows
+    /// a value nested inside a container or struct. Aggregates (structs, tuples,
+    /// containers) always render their children in `Repr` mode regardless of how
+    /// the aggregate itself was reached; `Optional` propagates the ambient mode to
+    /// its payload.
+    fn render_value(&mut self, v: Value, vt: Ty, mode: RenderMode) -> Result<Value, LowerError> {
+        // `bytes`: `str` mode decodes the UTF-8 bytes (I#337, may raise on invalid
+        // UTF-8, so it routes through `throwing_call`); `repr` mode renders the
+        // Python `b'…'` byte-string form (no decode, never raises).
         if matches!(vt, Ty::Bytes) {
             let d = self.new_value(Ty::Ptr);
-            self.throwing_call(Some(d), "zap_bytes_to_str", vec![v]);
+            match mode {
+                RenderMode::Str => self.throwing_call(Some(d), "zap_bytes_to_str", vec![v]),
+                RenderMode::Repr => self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_bytes_repr".to_string(),
+                    args: vec![v],
+                }),
+            }
             return Ok(d);
         }
         // `Optional[T]` renders its payload when `Some`, and the literal
         // `"None"` when `None` (#498, matching Python's `f"{d.get(k)}"`). The
-        // payload is rendered recursively, so a non-renderable payload falls
-        // through to the error below.
+        // payload is rendered recursively in the SAME mode, so a nested
+        // `Optional[str]` element quotes its payload; a non-renderable payload
+        // falls through to the error below.
         if let Some(opt) = optional_layout(self.ctx, vt) {
             let slot = self.alloca(Ty::Ptr);
             let is_none = gen_opt_is_none(self, &opt, v);
@@ -6070,14 +6230,20 @@ impl<'a> FnLower<'a> {
             self.set_term(Term::Br(join_bb));
             self.position(some_bb);
             let payload = gen_opt_payload(self, &opt, v);
-            let some_str = self.render_str(payload, opt.payload_ty)?;
+            let some_str = self.render_value(payload, opt.payload_ty, mode)?;
             self.store(slot, some_str);
             self.set_term(Term::Br(join_bb));
             self.position(join_bb);
             return Ok(self.load(slot, Ty::Ptr));
         }
         let (func, arg) = match vt {
-            Ty::Ptr => return Ok(v),
+            // A bare `str`: unquoted in `str` mode (passthrough), Python-quoted in
+            // `repr` mode (`'a'`, with the real quote-selection + escaping done by
+            // the runtime helper).
+            Ty::Ptr => match mode {
+                RenderMode::Str => return Ok(v),
+                RenderMode::Repr => ("zap_str_repr", v),
+            },
             Ty::Bigint => {
                 let d = self.new_value(Ty::Ptr);
                 self.emit(Inst::Call {
@@ -6096,7 +6262,61 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok(d);
             }
-            Ty::I32 => ("zap_char_to_str", v),
+            // A user struct (#274, D-0124): render via its `__str__`/`__repr__` /
+            // `@derive(Repr)` / the compiler default. This is what makes
+            // `str(point)` / `f"{point}"` work, not just `print(point)` — closing
+            // the pre-#274 asymmetry where only `print` reached the struct path.
+            // `Optional[T]` (also a `Ty::Struct`) was already handled above; a
+            // tuple, tier-3 enum, or interface value routes through here too and
+            // is dispatched / cleanly rejected by `struct_to_str`. The struct's
+            // renderer always quotes its own fields, so the ambient `mode` does
+            // not matter here.
+            Ty::Struct(sid) => return self.struct_to_str(sid, v),
+            // A tier-1 enum (D-0018): the qualified canonical variant name,
+            // `EnumName.VARIANT`, reusing the `.name` discriminant→name chain. An
+            // unknown discriminant raises, exactly as `.name` does.
+            Ty::Enum(id) => {
+                let ename = self
+                    .ctx
+                    .enums
+                    .values()
+                    .find(|e| !e.is_sum && e.enum_id == id)
+                    .map(|e| e.enum_name.clone())
+                    .ok_or_else(|| err("enum identity is not registered"))?;
+                let prefix = self.strconst(&format!("{ename}."));
+                let (vname, _) = self.lower_enum_name(v, id)?;
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_concat".to_string(),
+                    args: vec![prefix, vname],
+                });
+                return Ok(d);
+            }
+            // Native container rendering (#274, D-0124): `[v0, v1]`, `{k: v}`,
+            // `{v0, v1}` with Python-exact empty forms `[]`, `{}`, `set()`.
+            // Elements/keys/values render in `repr` mode (so string elements are
+            // quoted), via a synthesized per-container-type renderer.
+            Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) => {
+                let f = self.container_repr_fn(vt)?;
+                let d = self.new_value(Ty::Ptr);
+                self.throwing_call(Some(d), &f, vec![v]);
+                return Ok(d);
+            }
+            // A `char` (an `i32`): `str` mode renders its one-codepoint string;
+            // `repr` mode renders that string Python-quoted (`'c'`).
+            Ty::I32 => match mode {
+                RenderMode::Str => ("zap_char_to_str", v),
+                RenderMode::Repr => {
+                    let s = self.new_value(Ty::Ptr);
+                    self.emit(Inst::Call {
+                        dest: Some(s),
+                        func: "zap_char_to_str".to_string(),
+                        args: vec![v],
+                    });
+                    ("zap_str_repr", s)
+                }
+            },
             Ty::I1 => ("zap_bool_to_str", self.coerce(v, vt, Ty::I64)),
             Ty::I8 | Ty::I16 | Ty::I64 => ("zap_i64_to_str", self.coerce(v, vt, Ty::I64)),
             Ty::F32 | Ty::F64 => ("zap_f64_to_str", self.as_f64(v, vt)),
@@ -10420,23 +10640,30 @@ impl<'a> FnLower<'a> {
                             args: vec![v],
                         });
                         vals.push(s);
-                    } else if let Ty::Struct(sid) = vt {
-                        // A struct prints through its `__str__`/`__repr__`
-                        // (D-0047): marshal to a string first so codegen's
-                        // `Print` renders it like any other string.
-                        let s = self.struct_to_str(sid, v)?;
-                        vals.push(s);
-                    } else if vt == Ty::Complex || vt == Ty::Bigint || vt.is_float() || vt == Ty::I1
+                    } else if matches!(
+                        vt,
+                        Ty::Struct(_) | Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_)
+                    ) || vt == Ty::Complex
+                        || vt == Ty::Bigint
+                        || vt.is_float()
+                        || vt == Ty::I1
+                        || matches!(vt, Ty::Enum(_))
                     {
-                        // Floats and bools must print exactly as `str(x)` does
-                        // (I#493): route them through `render_str` — the same
-                        // lowering `str()` uses — so `print(27.5)` yields `27.5`
-                        // (not C `%f`'s `27.500000`) and `print(True)` yields
-                        // `True` (not the `-1` all-ones bitpattern from `%lld`).
-                        // Codegen's `Print` then renders the resulting ZapStr via
-                        // `zap_print_str`, making `print(x)` == `print(str(x))`.
-                        // `int`/`char`/`str`/`bytes` already print correctly and
-                        // stay on their existing paths.
+                        // Everything with a non-trivial Display form routes through
+                        // `render_str` — the one value renderer `str()` uses — so
+                        // `print(x) == print(str(x))`:
+                        //   * a struct / tuple / `Optional` (`Ty::Struct`) renders
+                        //     via `__str__`/`__repr__`/`@derive(Repr)` or the
+                        //     default `TypeName(field=value, …)` (#274, D-0124);
+                        //   * a `list`/`dict`/`set` renders its Python form
+                        //     `[…]`/`{…: …}`/`{…}` (#274, D-0124);
+                        //   * a tier-1 enum renders `EnumName.VARIANT`;
+                        //   * a float prints `%g`-style (not C `%f`'s `27.500000`)
+                        //     and a bool `True`/`False` (not the `-1` bitpattern) —
+                        //     the I#493 fix.
+                        // `int`/`char`/`str`/`bytes` already print correctly
+                        // natively (and a bare top-level string stays UNQUOTED),
+                        // so they stay on the raw path below.
                         vals.push(self.render_str(v, vt)?);
                     } else {
                         vals.push(v);
@@ -15621,22 +15848,314 @@ impl<'a> FnLower<'a> {
         Ok(pair)
     }
 
-    /// Render a struct value to a string via its `__str__` (preferred) or
-    /// `__repr__` dunder (D-0047), for `print` / string contexts.
+    /// Render a struct value to a string, for `print` / `str` / f-string / REPL
+    /// contexts (D-0047; the general rendering protocol #274, D-0124). Resolves
+    /// the type's renderer with [`Self::struct_repr_fn`] — an explicit `__str__`
+    /// (preferred) or `__repr__`, else `@derive(Repr)`, else the compiler's
+    /// default field-wise form `TypeName(field=value, …)` — and invokes it. The
+    /// call is `throwing` because a user-defined `__str__`/`__repr__` (or a
+    /// `bytes` field in the default render) may raise.
     fn struct_to_str(&mut self, sid: u32, v: Value) -> Result<Value, LowerError> {
+        let f = self.struct_repr_fn(sid)?;
+        let d = self.new_value(Ty::Ptr);
+        self.throwing_call(Some(d), &f, vec![v]);
+        Ok(d)
+    }
+
+    /// Resolve the symbol name of the function that renders a value of struct id
+    /// `sid` to a string, synthesizing the compiler default on demand (#274,
+    /// D-0124). Resolution order (first match wins), so an explicit override
+    /// always beats the default:
+    ///
+    /// 1. a tuple layout → the Python `(v0, v1, …)` renderer (synthesized once);
+    /// 2. a hand-written `__str__`;
+    /// 3. a hand-written or `@derive(Repr)` `__repr__`;
+    /// 4. otherwise the compiler-synthesized default `TypeName(field=value, …)`
+    ///    renderer (synthesized once, memoized in [`StructCtx::synth_reprfns`]).
+    ///
+    /// A tier-3 data-carrying enum's tagged struct and an interface value's fat
+    /// struct have no field-wise default and are rejected with a clean coded
+    /// error pointing at the #274 follow-up — never an ICE or a nonsense render
+    /// over synthetic `$tag`/`$data` slots.
+    fn struct_repr_fn(&mut self, sid: u32) -> Result<String, LowerError> {
+        // Tuples have no `ctx.names` entry (their ids sit past `names.len()`), so
+        // they MUST be handled before any `names[sid]` lookup — the same ordering
+        // the tuple key-fn path relies on (#680).
+        if self.ctx.tuples.borrow().is_tuple(sid) {
+            if let Some(name) = self.ctx.synth_reprfns.borrow().get(&sid) {
+                return Ok(name.clone());
+            }
+            let name = format!("$tuple${sid}$repr");
+            // Memoize BEFORE emitting the body so a (hypothetically) self-referring
+            // layout terminates; tuples cannot actually nest themselves, but this
+            // keeps the invariant uniform with the struct path below.
+            self.ctx
+                .synth_reprfns
+                .borrow_mut()
+                .insert(sid, name.clone());
+            let mut b = FnLower::new(
+                name.clone(),
+                vec![Ty::Struct(sid)],
+                Ty::Ptr,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            if let Err(e) = gen_tuple_repr_body(&mut b, sid) {
+                // Body generation failed (e.g. an unrenderable element type):
+                // drop the memo so the half-built name never resolves to a missing
+                // function if errors are collected rather than fatal.
+                self.ctx.synth_reprfns.borrow_mut().remove(&sid);
+                return Err(e);
+            }
+            self.ctx.generated.borrow_mut().push(b.func);
+            return Ok(name);
+        }
+        // An interface value's synthetic `{data, itable}` fat struct: rendering it
+        // needs dynamic dispatch to the concrete type's renderer (a vtable slot) —
+        // deferred to the #274 follow-up.
+        if self.ctx.fat_to_iid.contains_key(&sid) {
+            return Err(err(format!(
+                "cannot yet render an interface value ('{}'): the general \
+                 rendering protocol does not dynamically dispatch to the concrete \
+                 type's renderer yet (#274 follow-up); bind it to a concrete type \
+                 or define '__str__' (D-0124)",
+                self.ctx.names[sid as usize]
+            )));
+        }
+        // A tier-3 data-carrying enum (D-0046) lowers as a tagged struct; a
+        // field-wise render over its `$tag`/payload slots would be meaningless.
+        // Structural variant rendering (`Enum.Variant(payload…)`) is the #274
+        // follow-up; until then a clean error (not an ICE).
+        if self
+            .ctx
+            .enums
+            .values()
+            .any(|e| e.is_sum && e.sid == Some(sid))
+        {
+            let ename = self
+                .ctx
+                .enums
+                .values()
+                .find(|e| e.is_sum && e.sid == Some(sid))
+                .map(|e| e.enum_name.clone())
+                .unwrap_or_else(|| self.ctx.names[sid as usize].clone());
+            return Err(err(format!(
+                "cannot yet render a value of the data-carrying enum '{ename}': \
+                 structural variant rendering ('{ename}.Variant(…)') is a #274 \
+                 follow-up; 'match' on it or define '__str__' (D-0124)"
+            )));
+        }
+        // An explicit `__str__` (preferred) or `__repr__` / `@derive(Repr)` wins
+        // over the default.
         for dunder in ["__str__", "__repr__"] {
             let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
             if self.sigs.contains_key(&mangled) {
-                let d = self.new_value(Ty::Ptr);
-                self.throwing_call(Some(d), &mangled, vec![v]);
-                return Ok(d);
+                return Ok(mangled);
             }
         }
-        Err(err(format!(
-            "cannot print a '{}' value: it defines neither '__str__' nor \
-             '__repr__' (define one or use @derive(Repr); D-0047)",
-            self.ctx.names[sid as usize]
-        )))
+        // The compiler-synthesized default field-wise renderer.
+        if let Some(name) = self.ctx.synth_reprfns.borrow().get(&sid) {
+            return Ok(name.clone());
+        }
+        let name = format!("{}$repr$default", self.ctx.names[sid as usize]);
+        // Memoize BEFORE emitting the body: a field whose type is this same struct
+        // (directly or through a mutual cycle) resolves to this name as a plain
+        // call, so compile-time synthesis terminates (one function per struct).
+        self.ctx
+            .synth_reprfns
+            .borrow_mut()
+            .insert(sid, name.clone());
+        let mut b = FnLower::new(
+            name.clone(),
+            vec![Ty::Struct(sid)],
+            Ty::Ptr,
+            false,
+            true,
+            self.sigs,
+            self.ctx,
+        );
+        if let Err(e) = gen_struct_repr_body(&mut b, sid) {
+            // Drop the memo on failure (e.g. an unrenderable field type), so a
+            // collected-error build never calls a half-built, never-emitted fn.
+            self.ctx.synth_reprfns.borrow_mut().remove(&sid);
+            return Err(e);
+        }
+        self.ctx.generated.borrow_mut().push(b.func);
+        Ok(name)
+    }
+
+    /// Resolve the symbol name of the function that renders a `list`/`dict`/`set`
+    /// value of ZIR type `vt` to its Python string form (#274, D-0124),
+    /// synthesizing it on demand (memoized per container type):
+    /// `[v0, v1]` / `{k0: v0, k1: v1}` / `{v0, v1}`, with the Python-exact empty
+    /// forms `[]`, `{}`, and `set()`. Every element/key/value renders in `repr`
+    /// mode (so string elements are quoted), through the shared value renderer —
+    /// so containers nest (`[[1], [2]]`, `{'k': [1, 2]}`) and carry structs,
+    /// tuples, enums, and `Optional` uniformly. The renderer reuses the tested
+    /// list-iteration (`iterate_list`) and dict key/value entry points, so it is
+    /// not a bespoke runtime path.
+    fn container_repr_fn(&mut self, vt: Ty) -> Result<String, LowerError> {
+        let key = format!("{vt:?}");
+        if let Some(name) = self.ctx.synth_container_reprfns.borrow().get(&key) {
+            return Ok(name.clone());
+        }
+        let name = format!("$crepr${}", self.ctx.synth_container_reprfns.borrow().len());
+        let mut b = FnLower::new(
+            name.clone(),
+            vec![vt],
+            Ty::Ptr,
+            false,
+            true,
+            self.sigs,
+            self.ctx,
+        );
+        // The container is the single `self` parameter: value 0.
+        let c: Value = 0;
+        match &vt {
+            Ty::List(elem) => {
+                let elem = *elem;
+                let acc = b.alloca(Ty::Ptr);
+                let first = b.alloca(Ty::I64);
+                let open = b.strconst("[");
+                b.store(acc, open);
+                let one = b.iconst(Ty::I64, 1);
+                b.store(first, one);
+                b.iterate_list(c, elem, |s, e, ety| {
+                    gen_seq_sep(s, acc, first);
+                    let es = s.render_repr(e, ety)?;
+                    let a = s.load(acc, Ty::Ptr);
+                    let a2 = gen_concat(s, a, es);
+                    s.store(acc, a2);
+                    Ok(())
+                })?;
+                let a = b.load(acc, Ty::Ptr);
+                let close = b.strconst("]");
+                let a2 = gen_concat(&mut b, a, close);
+                b.set_term(Term::Ret(Some(a2)));
+            }
+            Ty::Set(elem) => {
+                let elem = *elem;
+                // `zap_set_items` snapshots the set's elements as a `list[elem]`
+                // in stable iteration order (#608/#609), reused by the list loop.
+                let items = b.new_value(Ty::List(elem));
+                b.emit(Inst::Call {
+                    dest: Some(items),
+                    func: "zap_set_items".to_string(),
+                    args: vec![c],
+                });
+                let len = b.new_value(Ty::I64);
+                b.emit(Inst::Call {
+                    dest: Some(len),
+                    func: "zap_list_len".to_string(),
+                    args: vec![items],
+                });
+                let zero = b.iconst(Ty::I64, 0);
+                let is_empty = b.new_value(Ty::I1);
+                b.emit(Inst::ICmp {
+                    dest: is_empty,
+                    pred: CmpPred::Eq,
+                    lhs: len,
+                    rhs: zero,
+                });
+                let result = b.alloca(Ty::Ptr);
+                let empty_bb = b.new_block();
+                let nonempty_bb = b.new_block();
+                let done_bb = b.new_block();
+                b.set_term(Term::BrIf {
+                    cond: is_empty,
+                    then_bb: empty_bb,
+                    else_bb: nonempty_bb,
+                });
+                // Python renders the empty set as `set()`, NOT `{}` (which is an
+                // empty dict).
+                b.position(empty_bb);
+                let empty_str = b.strconst("set()");
+                b.store(result, empty_str);
+                b.set_term(Term::Br(done_bb));
+                b.position(nonempty_bb);
+                let acc = b.alloca(Ty::Ptr);
+                let first = b.alloca(Ty::I64);
+                let open = b.strconst("{");
+                b.store(acc, open);
+                let one = b.iconst(Ty::I64, 1);
+                b.store(first, one);
+                b.iterate_list(items, elem, |s, e, ety| {
+                    gen_seq_sep(s, acc, first);
+                    let es = s.render_repr(e, ety)?;
+                    let a = s.load(acc, Ty::Ptr);
+                    let a2 = gen_concat(s, a, es);
+                    s.store(acc, a2);
+                    Ok(())
+                })?;
+                let a = b.load(acc, Ty::Ptr);
+                let close = b.strconst("}");
+                let a2 = gen_concat(&mut b, a, close);
+                b.store(result, a2);
+                b.set_term(Term::Br(done_bb));
+                b.position(done_bb);
+                let out = b.load(result, Ty::Ptr);
+                b.set_term(Term::Ret(Some(out)));
+            }
+            Ty::Dict(kk, vk) => {
+                let (kk, vk) = (*kk, *vk);
+                let acc = b.alloca(Ty::Ptr);
+                let first = b.alloca(Ty::I64);
+                let open = b.strconst("{");
+                b.store(acc, open);
+                let one = b.iconst(Ty::I64, 1);
+                b.store(first, one);
+                // Snapshot keys (stable order), then fetch each value with the
+                // typed dict getter — the same entry points the dict literal /
+                // merge paths use; a struct key supplies its `__hash__`/`__eq__`
+                // via `key_fn_args`.
+                let keys = b.new_value(Ty::List(kk));
+                b.emit(Inst::Call {
+                    dest: Some(keys),
+                    func: format!("zap_dict_keys_{}", kk.val_suffix()),
+                    args: vec![c],
+                });
+                let kfns = b.key_fn_args(kk)?;
+                let get_fn = format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix());
+                let vty = b.elem_ty(vk);
+                b.iterate_list(keys, kk, |s, key, kty| {
+                    gen_seq_sep(s, acc, first);
+                    // key repr
+                    let ks = s.render_repr(key, kty)?;
+                    let a = s.load(acc, Ty::Ptr);
+                    let a2 = gen_concat(s, a, ks);
+                    let colon = s.strconst(": ");
+                    let a3 = gen_concat(s, a2, colon);
+                    s.store(acc, a3);
+                    // value: look it up by key, then repr it
+                    let val = s.new_value(vty);
+                    let mut gargs = vec![c, key];
+                    gargs.extend_from_slice(&kfns);
+                    s.emit(Inst::Call {
+                        dest: Some(val),
+                        func: get_fn.clone(),
+                        args: gargs,
+                    });
+                    let vs = s.render_repr(val, vty)?;
+                    let a4 = s.load(acc, Ty::Ptr);
+                    let a5 = gen_concat(s, a4, vs);
+                    s.store(acc, a5);
+                    Ok(())
+                })?;
+                let a = b.load(acc, Ty::Ptr);
+                let close = b.strconst("}");
+                let a2 = gen_concat(&mut b, a, close);
+                b.set_term(Term::Ret(Some(a2)));
+            }
+            _ => return Err(err("container_repr_fn called on a non-container type")),
+        }
+        self.ctx.generated.borrow_mut().push(b.func);
+        self.ctx
+            .synth_container_reprfns
+            .borrow_mut()
+            .insert(key, name.clone());
+        Ok(name)
     }
 
     /// Desugar a binary operator whose left operand is a user struct to the

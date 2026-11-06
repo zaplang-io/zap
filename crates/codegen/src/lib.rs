@@ -749,6 +749,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             );
             self.declare_rt("zap_bytes_from_list", &[p.into()], Some(p.into()));
             self.declare_rt("zap_bytes_to_str", &[p.into()], Some(p.into()));
+            // Display-protocol repr helpers (#274, D-0124): Python-quoted string
+            // / `b'…'` bytes forms for nested (field / element) rendering.
+            self.declare_rt("zap_str_repr", &[p.into()], Some(p.into()));
+            self.declare_rt("zap_bytes_repr", &[p.into()], Some(p.into()));
             self.declare_rt("zap_chr", &[i.into()], Some(c.into()));
             self.declare_rt("zap_char_to_str", &[c.into()], Some(p.into()));
             self.declare_rt("zap_str_parse_int", &[p.into()], Some(i.into()));

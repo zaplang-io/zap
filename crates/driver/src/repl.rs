@@ -399,9 +399,13 @@ mod engine {
         /// is type-checked and callable afterwards; a redefinition replaces the
         /// entry (newest wins) while keeping its position.
         decls: HashMap<String, String>,
-        /// User types (struct/enum) that carry a value renderer (`__str__`,
-        /// `__repr__`, or `@derive(Repr)`), so a bare instance auto-prints
-        /// through `print(...)` rather than the `<TypeName>` placeholder (I#252).
+        /// User types whose bare instance auto-prints through `print(...)` rather
+        /// than the `<TypeName>` placeholder (I#252). Since the general Display
+        /// protocol landed (#274, D-0124) this is every plain struct and tier-1
+        /// enum (they render by default), plus any type with an explicit
+        /// `__str__`/`__repr__`/`@derive(Repr)`. Only a tier-3 data-carrying enum
+        /// or an interface with no explicit renderer still falls back to the
+        /// placeholder (their default render is the #274 follow-up).
         displayable: std::collections::HashSet<String>,
         /// Binding names in insertion order (drives the prelude order).
         order: Vec<String>,
@@ -728,9 +732,11 @@ mod engine {
         }
 
         /// How a trailing expression of type `ty` should be auto-printed. A user
-        /// type (struct/enum) renders through `print(...)` only when it carries a
-        /// value renderer; otherwise it falls back to a `<TypeName>` placeholder
-        /// (I#252). A general `repr`/Display protocol is a separate ticket.
+        /// type renders through `print(...)` when it is `displayable` — since the
+        /// general Display protocol (#274, D-0124) that is every plain struct and
+        /// tier-1 enum, plus anything with an explicit renderer; a tier-3
+        /// data-carrying enum or interface with no renderer still falls back to
+        /// the `<TypeName>` placeholder (I#252) until the #274 follow-up.
         fn auto_print_for(&self, ty: &Ty, new_decls: &[DeclInfo]) -> AutoPrint {
             match ty {
                 Ty::Unit | Ty::Unknown => AutoPrint::None,
@@ -790,16 +796,31 @@ mod engine {
                         src: decl_src(f.span, &f.decorators),
                         displayable: None,
                     }),
+                    // A plain struct always renders now (#274, D-0124): the general
+                    // Display protocol gives it the default field-wise form when
+                    // it defines no `__str__`/`__repr__`/`@derive(Repr)`, so a bare
+                    // instance auto-prints as `TypeName(field=value, …)` rather
+                    // than the `<TypeName>` placeholder. (A struct whose field is a
+                    // still-deferred type — a bare list/dict/set — errors at
+                    // lowering like `print` of it anywhere; a narrow edge.)
                     Item::Struct(s) => new_decls.push(DeclInfo {
                         name: s.name.clone(),
                         src: decl_src(s.span, &s.decorators),
-                        displayable: Some(has_renderer(&s.decorators, &s.methods)),
+                        displayable: Some(true),
                     }),
-                    Item::Enum(e) => new_decls.push(DeclInfo {
-                        name: e.name.clone(),
-                        src: decl_src(e.span, &e.decorators),
-                        displayable: Some(has_renderer(&e.decorators, &e.methods)),
-                    }),
+                    // A tier-1 enum renders its qualified variant name
+                    // `EnumName.VARIANT` (#274, D-0124), so it auto-prints too. A
+                    // tier-3 data-carrying enum (any variant with payload fields)
+                    // has no default render yet (the #274 follow-up), so it stays
+                    // on the placeholder unless it defines an explicit renderer.
+                    Item::Enum(e) => {
+                        let is_tier1 = e.variants.iter().all(|v| v.fields.is_empty());
+                        new_decls.push(DeclInfo {
+                            name: e.name.clone(),
+                            src: decl_src(e.span, &e.decorators),
+                            displayable: Some(is_tier1 || has_renderer(&e.decorators, &e.methods)),
+                        })
+                    }
                     Item::Interface(i) => new_decls.push(DeclInfo {
                         name: i.name.clone(),
                         src: decl_src(i.span, &[]),

@@ -3694,10 +3694,14 @@ impl Checker {
     }
 
     /// A value is renderable to text (via `str()` / an f-string field) when it
-    /// is a scalar, char, bool or string, or an `Optional[T]` of one (rendered
-    /// as its payload when present, `None` when absent — #498, matching
-    /// Python's `f"{d.get(k)}"`). General user-type rendering is the Display
-    /// protocol (#274), out of scope here.
+    /// is a scalar, char, bool or string; an `Optional[T]` (rendered as its
+    /// payload when present, `None` when absent — #498, matching Python's
+    /// `f"{d.get(k)}"`); or — since the general Display protocol landed (#274,
+    /// D-0124) — a **user struct/enum** (`Named`), a **tuple**, or a
+    /// **`list`/`dict`/`set`**, which the lowerer renders via
+    /// `__str__`/`__repr__`/`@derive(Repr)`, the default field-wise form, or the
+    /// Python container form. The lowerer still cleanly rejects the few deferred
+    /// cases (a tier-3 data-carrying enum or interface value with no renderer).
     fn check_renderable(&mut self, ty: &Ty, span: Span) {
         // `Optional[T]` is the prelude generic enum (I#154); sema tracks it
         // opaquely as `Named("Optional")` without its payload type, so the
@@ -3707,12 +3711,25 @@ impl Checker {
                 return;
             }
         }
-        if !matches!(ty, Ty::Str | Ty::Char | Ty::Bool | Ty::Unknown | Ty::Py) && !ty.is_numeric() {
+        if !matches!(
+            ty,
+            Ty::Str
+                | Ty::Char
+                | Ty::Bool
+                | Ty::Unknown
+                | Ty::Py
+                | Ty::Named(_)
+                | Ty::Tuple(_)
+                | Ty::List(_)
+                | Ty::Dict(_, _)
+                | Ty::Set(_)
+        ) && !ty.is_numeric()
+        {
             self.error(
                 ErrorCode::ZAP4024,
                 format!(
-                    "cannot render {} in an f-string: only str, char, int, float, complex \
-                     and bool are supported (user types need the Display protocol, #274)",
+                    "cannot render {} in an f-string: scalars, char, bool, str, and \
+                     user struct/enum/tuple and list/dict/set values are supported",
                     ty.display()
                 ),
                 span,
@@ -5246,18 +5263,30 @@ impl Checker {
                     for a in args {
                         let at = self.infer(&a.value);
                         // `str(bytes)` decodes UTF-8 (I#337); invalid UTF-8 faults
-                        // at runtime.
+                        // at runtime. A user struct/enum (`Named`), a tuple, and a
+                        // `list`/`dict`/`set` all render through the general
+                        // Display protocol (#274, D-0124): the lowerer picks
+                        // `__str__`/`__repr__`/`@derive(Repr)` or the default
+                        // field-wise / container form, and cleanly rejects the few
+                        // still-deferred cases (tier-3 enum, interface value).
                         if !matches!(
                             at,
-                            Ty::Str | Ty::Bytes | Ty::Char | Ty::Bool | Ty::Unknown | Ty::Py
+                            Ty::Str
+                                | Ty::Bytes
+                                | Ty::Char
+                                | Ty::Bool
+                                | Ty::Unknown
+                                | Ty::Py
+                                | Ty::Named(_)
+                                | Ty::Tuple(_)
+                                | Ty::List(_)
+                                | Ty::Dict(_, _)
+                                | Ty::Set(_)
                         ) && !at.is_numeric()
                         {
                             self.error(
                                 ErrorCode::ZAP4024,
-                                format!(
-                                    "str() expects a str, bytes, char, int, float, or bool, found {}",
-                                    at.display()
-                                ),
+                                format!("str() cannot render {}", at.display()),
                                 expr_span(&a.value),
                             );
                         }
@@ -9342,6 +9371,73 @@ def main():
     dict[str, str] d = {"k": "v"}
     print(f"{d.get("k")}")
     print(f"{d["k"]}")
+"#);
+    }
+
+    #[test]
+    fn user_struct_renders_in_str_and_fstring() {
+        // #274 (D-0124): the general Display protocol lets a user struct render
+        // via str()/f-string (the lowerer supplies the default field-wise form
+        // when no `__str__`/`__repr__`/`@derive(Repr)` is present). Before #274
+        // sema rejected str(struct) / f"{struct}" outright (ZAP4024).
+        ok(r#"
+struct Point:
+    int64 x
+    int64 y
+def main():
+    auto p = Point(x=1, y=2)
+    print(p)
+    print(str(p))
+    print(f"pt={p}")
+"#);
+    }
+
+    #[test]
+    fn tier1_enum_renders_in_str_and_fstring() {
+        // #274 (D-0124): a tier-1 enum renders its qualified variant name through
+        // the protocol, so str()/f-string/print accept it.
+        ok(r#"
+enum Color:
+    RED
+    GREEN
+def main():
+    print(Color.RED)
+    print(str(Color.GREEN))
+    print(f"c={Color.RED}")
+"#);
+    }
+
+    #[test]
+    fn tuple_renders_in_str_and_fstring() {
+        // #274 (D-0124): a tuple renders the Python (v0, v1) form; str()/f-string
+        // accept it, including a tuple of renderable user values.
+        ok(r#"
+struct Point:
+    int64 x
+    int64 y
+def main():
+    auto t = (1, "a")
+    print(t)
+    print(str(t))
+    print(f"{t}")
+    print((Point(x=1, y=2), 3))
+"#);
+    }
+
+    #[test]
+    fn containers_render_in_str_and_fstring() {
+        // #274 (D-0124): native list/dict/set rendering — str() and f-strings of a
+        // bare container now type-check (the lowerer emits the Python form).
+        ok(r#"
+def main():
+    list[int64] xs = [1, 2]
+    print(str(xs))
+    dict[str, int64] d = {"a": 1}
+    print(f"{d}")
+    set[int64] s = {1, 2}
+    print(str(s))
+    list[str] ss = ["a"]
+    print(ss)
 "#);
     }
 

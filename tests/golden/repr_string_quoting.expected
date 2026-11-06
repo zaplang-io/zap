@@ -1,0 +1,5 @@
+Rec(name='ada', blob=b'hi')
+ada
+ada
+['ada']
+Rec(name='ada', blob=b'hi')
