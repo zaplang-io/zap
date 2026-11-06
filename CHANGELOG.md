@@ -390,6 +390,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Out-of-memory is now a clean abort, not a nil-deref crash** (#697, D-0119).
+  Generated code stores into an allocation result without a null check, so on
+  heap exhaustion — where gc-boehm's `GC_MALLOC` returns `NULL` (bdwgc's default
+  OOM handler returns `0`) — the runtime handed `NULL` to that store and faulted
+  as a wild SIGSEGV at address 0 (pinned from a Graviton core, #650: a
+  `zap_alloc(8)` returned `NULL` under the stress harness's artificial tight-heap
+  knob and was dereferenced unchecked). The allocator wrappers now treat a `NULL`
+  result as out of memory and print `zap: out of memory` then `abort()` with a
+  nonzero exit. Collector-agnostic: one shared `zap_oom` helper is the single exit
+  for both the boehm `GC_MALLOC`-NULL path and the immix map-failure /
+  `ZAP_GC_HEAP_LIMIT`-cap paths, which it unifies. Robustness only — it makes an
+  OOM diagnosable; it does not change any GC-state behavior and is independent of
+  the #223 deadlock fix.
 - **aarch64 multicore GC deadlock: the scheduler's stack-bottom update is now
   lock-free** (#223, D-0117). The M:N scheduler retargets the conservative
   collector's stack bottom on every context switch (`switch_to_g` →

@@ -347,6 +347,29 @@ static void zap_profile_env_init(void);       /* parse ZAP_PROFILE* at main top 
 static void zap_profile_env_maybe_start(void);/* auto-start once g_ms exists      */
 static void zap_profile_teardown(void);       /* final free (all workers joined) */
 
+/* Out-of-memory policy (D-0119, #697). A NULL result from the allocator means
+ * heap exhaustion, and generated code stores into an allocation result WITHOUT a
+ * null check — so an unchecked NULL becomes a wild nil-deref SIGSEGV at address 0
+ * instead of a diagnosable error. This one collector-agnostic helper is the
+ * single clean exit for every exhaustion path: it prints `zap: out of memory`
+ * (an optional `detail` names the failing path) and aborts. `abort()` is the
+ * established runtime-fatal convention in this file (see the list-sort, bytes and
+ * container paths); it raises SIGABRT for a nonzero exit and leaves a core for
+ * triage. OOM is process-fatal, not a catchable Zap exception: the mutator holds
+ * unrooted temporaries at the raising allocation site, so unwinding through
+ * zap_panic would be unsafe. Under Boehm the wrappers below call it when
+ * GC_MALLOC / GC_MALLOC_ATOMIC return NULL (bdwgc's default GC_oom_fn returns 0);
+ * under Immix zapgc.inc.c routes its map failures and the ZAP_GC_HEAP_LIMIT cap
+ * through it so both collectors fail identically. */
+__attribute__((noreturn)) static void zap_oom(const char *detail) {
+    if (detail && *detail) {
+        fprintf(stderr, "zap: out of memory (%s)\n", detail);
+    } else {
+        fprintf(stderr, "zap: out of memory\n");
+    }
+    abort();
+}
+
 #ifdef ZAP_GC_IMMIX
 /* Precise collector entry points (defined in zapgc.inc.c, #included below). */
 void *zap_gc_alloc(const ZapTypeDesc *desc);
@@ -412,28 +435,37 @@ void zap_gc_write_barrier(void **slot) { (void)slot; }
  * coroutine on the same M calling GC_MALLOC would deadlock on that lock. So each
  * allocation is a no-preempt window — the one runtime lock a tight, yield-free
  * compute loop actually touches. */
+/* Every Boehm allocation checks the result: on heap exhaustion GC_MALLOC /
+ * GC_MALLOC_ATOMIC return NULL (bdwgc's default GC_oom_fn returns 0), and codegen
+ * stores into the returned pointer unchecked (#697), so an unchecked NULL faults
+ * as a nil-deref SIGSEGV at address 0. Routing NULL through zap_oom turns that
+ * wild fault into a clean `zap: out of memory` abort. */
 static inline void *zap_alloc_desc(const ZapTypeDesc *d) {
     zap_np_enter();
     void *p = GC_MALLOC((size_t)d->size);
     zap_np_leave();
+    if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_obj(const ZapTypeDesc *d) {
     zap_np_enter();
     void *p = GC_MALLOC((size_t)d->size);
     zap_np_leave();
+    if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_buf(int64_t n) {
     zap_np_enter();
     void *p = GC_MALLOC_ATOMIC((size_t)n);
     zap_np_leave();
+    if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_ptrbuf(int64_t n) {
     zap_np_enter();
     void *p = GC_MALLOC((size_t)n);
     zap_np_leave();
+    if (!p) zap_oom(NULL);
     return p;
 }
 #define ZAP_INFRA_ALLOC(n) GC_MALLOC(n)
@@ -586,7 +618,9 @@ void *zap_alloc(int64_t size) {
      * net rather than a hot path. */
     return zap_gc_alloc_atomic(size);
 #else
-    return GC_MALLOC((size_t)size);
+    void *p = GC_MALLOC((size_t)size);
+    if (!p) zap_oom(NULL); /* unchecked NULL would nil-deref in generated code (#697) */
+    return p;
 #endif
 }
 
