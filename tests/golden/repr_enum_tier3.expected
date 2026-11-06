@@ -1,0 +1,6 @@
+Shape.Circle(r=2.0)
+Shape.Rect(w=3.0, h=4.0)
+Shape.Unit
+Shape.Circle(r=2.0)
+s=Shape.Rect(w=1.0, h=2.0)
+[Shape.Unit]

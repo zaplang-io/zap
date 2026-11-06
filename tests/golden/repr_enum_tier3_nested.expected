@@ -1,0 +1,5 @@
+Node.Leaf(name='hi', tag='z')
+Node.Flag(on=True, n=3)
+Node.Pair(p=Point(x=1, y=2), t=(7, 'ok'))
+Node.Empty
+Node.Leaf(name='q', tag='a')

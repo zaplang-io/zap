@@ -401,11 +401,12 @@ mod engine {
         decls: HashMap<String, String>,
         /// User types whose bare instance auto-prints through `print(...)` rather
         /// than the `<TypeName>` placeholder (I#252). Since the general Display
-        /// protocol landed (#274, D-0124) this is every plain struct and tier-1
-        /// enum (they render by default), plus any type with an explicit
-        /// `__str__`/`__repr__`/`@derive(Repr)`. Only a tier-3 data-carrying enum
-        /// or an interface with no explicit renderer still falls back to the
-        /// placeholder (their default render is the #274 follow-up).
+        /// protocol landed (#274, D-0124) this is every plain struct and every
+        /// enum — tier-1 (`EnumName.VARIANT`) and, since #706, tier-3 data-carrying
+        /// (`EnumName.Variant(field=value, …)`) — plus any type with an explicit
+        /// `__str__`/`__repr__`/`@derive(Repr)`. Only an interface value with no
+        /// explicit renderer still falls back to the placeholder (the #707
+        /// follow-up).
         displayable: std::collections::HashSet<String>,
         /// Binding names in insertion order (drives the prelude order).
         order: Vec<String>,
@@ -734,9 +735,10 @@ mod engine {
         /// How a trailing expression of type `ty` should be auto-printed. A user
         /// type renders through `print(...)` when it is `displayable` — since the
         /// general Display protocol (#274, D-0124) that is every plain struct and
-        /// tier-1 enum, plus anything with an explicit renderer; a tier-3
-        /// data-carrying enum or interface with no renderer still falls back to
-        /// the `<TypeName>` placeholder (I#252) until the #274 follow-up.
+        /// every enum (tier-1, and tier-3 data-carrying since #706), plus anything
+        /// with an explicit renderer; only an interface value with no renderer
+        /// still falls back to the `<TypeName>` placeholder (I#252) until the #707
+        /// follow-up.
         fn auto_print_for(&self, ty: &Ty, new_decls: &[DeclInfo]) -> AutoPrint {
             match ty {
                 Ty::Unit | Ty::Unknown => AutoPrint::None,
@@ -809,18 +811,15 @@ mod engine {
                         displayable: Some(true),
                     }),
                     // A tier-1 enum renders its qualified variant name
-                    // `EnumName.VARIANT` (#274, D-0124), so it auto-prints too. A
-                    // tier-3 data-carrying enum (any variant with payload fields)
-                    // has no default render yet (the #274 follow-up), so it stays
-                    // on the placeholder unless it defines an explicit renderer.
-                    Item::Enum(e) => {
-                        let is_tier1 = e.variants.iter().all(|v| v.fields.is_empty());
-                        new_decls.push(DeclInfo {
-                            name: e.name.clone(),
-                            src: decl_src(e.span, &e.decorators),
-                            displayable: Some(is_tier1 || has_renderer(&e.decorators, &e.methods)),
-                        })
-                    }
+                    // `EnumName.VARIANT`, and a tier-3 data-carrying enum renders
+                    // its structural form `EnumName.Variant(field=value, …)`
+                    // (#274/D-0124; tier-3 added in #706) — so every enum has a
+                    // default render now and auto-prints.
+                    Item::Enum(e) => new_decls.push(DeclInfo {
+                        name: e.name.clone(),
+                        src: decl_src(e.span, &e.decorators),
+                        displayable: Some(true),
+                    }),
                     Item::Interface(i) => new_decls.push(DeclInfo {
                         name: i.name.clone(),
                         src: decl_src(i.span, &[]),
@@ -894,23 +893,6 @@ mod engine {
         /// For a struct/enum, whether it carries a value renderer (`Some(bool)`);
         /// `None` for declarations that are never auto-printed.
         displayable: Option<bool>,
-    }
-
-    /// True if a struct/enum carries a value renderer: a `__str__`/`__repr__`
-    /// method, or a `@derive(Repr)` that synthesizes one (D-0047).
-    fn has_renderer(decorators: &[ast::Decorator], methods: &[ast::Function]) -> bool {
-        if methods
-            .iter()
-            .any(|m| m.name == "__str__" || m.name == "__repr__")
-        {
-            return true;
-        }
-        decorators.iter().any(|d| {
-            d.name == "derive"
-                && d.args
-                    .iter()
-                    .any(|a| matches!(&a.value, Expr::Name(n, _) if n == "Repr"))
-        })
     }
 
     struct LetInfo {

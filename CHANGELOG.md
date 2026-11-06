@@ -25,6 +25,23 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Display protocol renders tier-3 data-carrying enums structurally** (#706,
+  D-0124 extended to D-0046; follow-up to #274). A tier-3 enum value with no
+  hand-written `__str__`/`__repr__` now renders through the same one protocol as
+  everything else — consistently across `print()`, `str()`, f-strings, the REPL,
+  and doctests — instead of the old clean `ZAP6001` deferral error. A
+  data-carrying variant renders `EnumName.Variant(field=value, …)` with every
+  payload field labelled and rendered in `repr` mode (so a nested `str`/`char`/
+  `bytes` payload quotes: `Shape.Circle(r=2.0)`, `Node.Leaf(name='hi', tag='z')`),
+  and a payload-free variant renders `EnumName.Variant` with no parentheses
+  (`Shape.Unit`). A **recursive** enum (`enum Expr: Add(Expr l, Expr r)`) renders
+  recursively through its pointer child. **Mechanism:** one tag-dispatch renderer
+  synthesized per enum (memoized) — the tier-3 analogue of the struct default
+  renderer, switching on the enum's `i32` tag like the tier-1 `.name` chain — so
+  no new runtime support, no GC/scheduler/object-header change. Niche
+  `Optional`-shaped enums render via a null test (the `Optional` payload-vs-`None`
+  path is unchanged); an explicit `__str__`/`__repr__` still overrides. Only
+  interface-value rendering (#707) remains deferred.
 - **Validated asymmetric-key metadata/import + P-256 ECDSA (ES256) and Ed25519
   sign/verify in `crypto`** (#643, D-0126; builds on #105/D-0056, #628/D-0102).
   A supported, OpenSSL-backed asymmetric-key surface of free functions —
@@ -78,10 +95,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
     position** — scalar, struct field, tuple element, and collection element /
     dict key / dict value — since #709 made `char` a distinct IR type.) The
     default renderer has no cycle guard (like a hand-written recursive
-    `__repr__`); non-printable non-ASCII in a quoted string is not escaped. Still
-    deferred to #274 follow-ups (a clean coded error, never an ICE): tier-3
-    data-carrying enums (`Shape.Circle(r=2.0)`) and interface-value rendering; no
-    object-identity (`<T @ 0x…>`) form is introduced.
+    `__repr__`); non-printable non-ASCII in a quoted string is not escaped.
+    (Tier-3 data-carrying enums, originally deferred here, now render — see the
+    #706 entry above.) Still deferred to a #274 follow-up (a clean coded error,
+    never an ICE): interface-value rendering (#707); no object-identity
+    (`<T @ 0x…>`) form is introduced.
 - **`char` is a distinct IR type — fixes `char`/`int32` render conflation**
   (#709, D-0125; completes D-0124). `char` previously shared the IR type
   `Ty::I32` with `int32`, so the value layer could not tell them apart: a `char`

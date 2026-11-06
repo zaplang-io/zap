@@ -5211,16 +5211,16 @@ nor '__repr__'" error) or the REPL's `<TypeName>` placeholder.
   appended to the module, like the tuple/`Optional` key functions (D-0122/D-0123).
   **No** change to the GC / Immix evacuator / scheduler / object header.
 
+**Tier-3 data-carrying enums — RESOLVED by #706 (addendum below).** Originally
+deferred (a clean `ZAP6001` at lowering); a tier-3 enum value now renders
+structurally through this same protocol. See the **#706 addendum** at the end of
+this entry.
+
 **Out of scope (clean coded compile error — `ZAP4024` at sema for a bare value,
-`ZAP6001` at lowering for such a field — never an ICE; each a #274 follow-up):**
-- **Tier-3 data-carrying enums** (`Shape.Circle(r=2.0)`): structural variant
-  rendering needs a tag-dispatch renderer and is deferred; `match` on the value or
-  define `__str__`. (A tier-3 enum's tagged struct is detected and rejected, never
-  rendered field-wise over its synthetic `$tag`/payload slots.) Tracked as a
-  follow-up issue.
+`ZAP6001` at lowering for such a field — never an ICE; a #274 follow-up):**
 - **Interface values:** rendering needs dynamic dispatch to the concrete type's
   renderer (a vtable slot); deferred. Bind to a concrete type or define `__str__`.
-  Tracked (with the cycle guard) as a follow-up issue.
+  Tracked (with the cycle guard) as follow-up issue #707.
 - **Object identity / address form** (`<TypeName @ 0x…>`): explicitly **not**
   built — it would require an object-identity/address intrinsic that does not
   exist, so the structural field-wise form is used for everything.
@@ -5250,9 +5250,33 @@ nor '__repr__'" error) or the REPL's `<TypeName>` placeholder.
 quoting distinction and Python container shapes — is a Python-staple ergonomic and
 the language-first answer to #274. It costs nothing at runtime beyond the string
 concatenation a hand-written `__repr__` would do, reuses the `@derive(Repr)` shape,
-and keeps the opt-in dunders as the override path. Tier-3 enums, interface values,
-and a cycle guard are separable and tracked as follow-ups rather than rushed into
-one user-facing semantics change.
+and keeps the opt-in dunders as the override path. Tier-3 enums (now shipped,
+#706 below), interface values, and a cycle guard were separable and tracked as
+follow-ups rather than rushed into one user-facing semantics change.
+
+**#706 addendum — tier-3 data-carrying enums render structurally (D-0046).**
+A tier-3 data-carrying enum value now renders through this same protocol, so
+`print`/`str`/f-strings/the REPL/doctests show a structural form instead of the
+old `ZAP6001` deferral error:
+- `EnumName.Variant(field=value, …)` for a data-carrying variant — fields always
+  labelled (`Shape.Circle(r=2.0)`, `Shape.Rect(w=3.0, h=4.0)`), each rendered in
+  `repr` mode (so a nested `str`/`char`/`bytes` payload quotes) — and
+  `EnumName.Variant` (no parentheses) for a payload-free variant (`Shape.Unit`).
+- **Mechanism:** one tag-dispatch renderer synthesized per enum (memoized), the
+  tier-3 analogue of the struct default renderer — it switches on the enum's `i32`
+  tag (mirroring the tier-1 `.name` discriminant→name chain) and, per variant,
+  emits the variant name plus each payload field through the shared value renderer.
+  A recursive enum (`enum Expr: Add(Expr l, Expr r)`) renders recursively by
+  *calling* the same memoized renderer through its pointer child, terminating at
+  compile time — no bespoke runtime walk, no new runtime support.
+- **Niche `Optional`-shaped enums** (I#154, D-0064 #4) have no physical tag; they
+  render via a null test (reusing the tested niche reinterpret). An `Optional`
+  value itself is still intercepted earlier (rendered as its payload / `None`), so
+  that path is unchanged; a *user* niche enum not named `Optional` renders
+  `Enum.Variant(field=value)` / `Enum.Empty` the same way.
+- **Explicit overrides still win:** a hand-written `__str__`/`__repr__` on the enum
+  is resolved before the synthesized renderer, exactly as for a struct.
+- Only interface-value rendering (and the cycle guard) remains deferred (#707).
 
 ## D-0125 — `char` is a distinct IR type (`Ty::Char`), fixing the `char`/`int32` render conflation (I#709)
 

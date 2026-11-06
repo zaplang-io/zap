@@ -3125,10 +3125,11 @@ enum RenderMode {
 /// protocol, so a field of ANY type works — integers, `bool` (`True`/`False`,
 /// not the old `-1` bitpattern), `float`, `str`, `char`, `bytes`, `Optional`,
 /// **nested user structs** (rendered by *calling* that type's own renderer, so a
-/// recursive type graph terminates at compile time), tuples, and tier-1 enums.
-/// The only field types still rejected are the ones the shared renderer defers
-/// (a bare `list`/`dict`/`set`, a tier-3 data-carrying enum, or an interface
-/// value) — a clean coded error, never an ICE.
+/// recursive type graph terminates at compile time), tuples, tier-1 enums,
+/// `list`/`dict`/`set`, and — since #706 — tier-3 data-carrying enums (rendered
+/// `Enum.Variant(field=value, …)`). The only field type still rejected is the one
+/// the shared renderer defers (an interface value, the #707 follow-up) — a clean
+/// coded error, never an ICE.
 fn gen_repr_method(
     sid: u32,
     sigs: &HashMap<String, (Vec<Ty>, Ty)>,
@@ -3174,6 +3175,146 @@ fn gen_struct_repr_body(b: &mut FnLower, sid: u32) -> Result<(), LowerError> {
     let close = b.strconst(")");
     acc = gen_concat(b, acc, close);
     b.set_term(Term::Ret(Some(acc)));
+    Ok(())
+}
+
+/// Emit, into the already-constructed renderer function `b` (whose first value is
+/// the tier-3 enum `self`), the structural rendering of a data-carrying enum
+/// (#706, the Display protocol #274/D-0124 extended to tier-3 enums, D-0046):
+/// `EnumName.Variant(field=<v>, …)` for a data-carrying variant and
+/// `EnumName.Variant` for a payload-free one. Each payload field renders through
+/// [`FnLower::render_repr`] — the one value-rendering protocol, in `repr` mode so
+/// a nested `str`/`char`/`bytes` payload quotes — so a recursive enum
+/// (`enum Expr: Add(Expr l, Expr r)`) renders recursively by *calling* this same
+/// memoized renderer through the pointer child, terminating at compile time.
+///
+/// Two layouts (D-0064 #4):
+/// - the general tagged struct `{ $tag:i32, payload… }` — switch on the tag,
+///   mirroring the tier-1 `.name` discriminant→name chain but building the
+///   structural form per variant;
+/// - a niche `Optional`-shaped enum — no physical tag, the value IS the single
+///   payload pointer (null == the payload-free variant). Rendered by the null
+///   test, reusing the tested niche reinterpret ([`gen_opt_is_none`] /
+///   [`gen_opt_payload`]). The `Optional`-named ones are intercepted earlier by
+///   [`optional_layout`] in [`FnLower::render_value`]; this keeps a *user* niche
+///   enum (not named `Optional`) correct too, rather than reading a bogus tag out
+///   of a pointer.
+fn gen_enum_repr_body(b: &mut FnLower, sid: u32) -> Result<(), LowerError> {
+    let info = b
+        .ctx
+        .enums
+        .values()
+        .find(|e| e.is_sum && e.sid == Some(sid))
+        .cloned()
+        .ok_or_else(|| err("tier-3 enum identity is not registered for rendering"))?;
+    let ename = info.enum_name.clone();
+
+    // Niche `Optional`-shaped layout: no tag slot; the `self` value (value 0) IS
+    // the payload pointer, null for the payload-free variant.
+    if let Some(n) = &info.niche {
+        let opt = OptionalLayout {
+            sid,
+            payload_ty: n.payload,
+            niche: true,
+            some_tag: 0,
+            none_tag: 0,
+            payload_idx: 0,
+        };
+        // The single `Some`-like variant's payload field name (for `field=value`).
+        let some_field = info
+            .variant(&n.some_variant)
+            .and_then(|v| v.fields.first())
+            .map(|(fname, _, _)| fname.clone())
+            .unwrap_or_default();
+        let slot = b.alloca(Ty::Ptr);
+        let is_none = gen_opt_is_none(b, &opt, 0);
+        let none_bb = b.new_block();
+        let some_bb = b.new_block();
+        let join_bb = b.new_block();
+        b.set_term(Term::BrIf {
+            cond: is_none,
+            then_bb: none_bb,
+            else_bb: some_bb,
+        });
+        b.position(none_bb);
+        let none_str = b.strconst(&format!("{ename}.{}", n.none_variant));
+        b.store(slot, none_str);
+        b.set_term(Term::Br(join_bb));
+        b.position(some_bb);
+        let payload = gen_opt_payload(b, &opt, 0);
+        let pstr = b.render_repr(payload, n.payload)?;
+        let head = b.strconst(&format!("{ename}.{}({some_field}=", n.some_variant));
+        let acc = gen_concat(b, head, pstr);
+        let close = b.strconst(")");
+        let acc = gen_concat(b, acc, close);
+        b.store(slot, acc);
+        b.set_term(Term::Br(join_bb));
+        b.position(join_bb);
+        let r = b.load(slot, Ty::Ptr);
+        b.set_term(Term::Ret(Some(r)));
+        return Ok(());
+    }
+
+    // General tagged layout: a discriminant→structural-render chain. Field 0 of
+    // the tagged struct is the `i32` tag.
+    let result_slot = b.alloca(Ty::Ptr);
+    let merge = b.new_block();
+    let mut check = b.cur;
+    for v in &info.variants {
+        b.position(check);
+        let tag = b.field_get(0, sid, 0, Ty::I32);
+        let expected = b.iconst(Ty::I32, v.tag);
+        let matches = b.new_value(Ty::I1);
+        b.emit(Inst::ICmp {
+            dest: matches,
+            pred: CmpPred::Eq,
+            lhs: tag,
+            rhs: expected,
+        });
+        let found = b.new_block();
+        let next = b.new_block();
+        b.set_term(Term::BrIf {
+            cond: matches,
+            then_bb: found,
+            else_bb: next,
+        });
+        b.position(found);
+        let mut acc = b.strconst(&format!("{ename}.{}", v.name));
+        if !v.fields.is_empty() {
+            let open = b.strconst("(");
+            acc = gen_concat(b, acc, open);
+            for (i, (fname, idx, fty)) in v.fields.iter().enumerate() {
+                if i > 0 {
+                    let sep = b.strconst(", ");
+                    acc = gen_concat(b, acc, sep);
+                }
+                let label = b.strconst(&format!("{fname}="));
+                acc = gen_concat(b, acc, label);
+                let fv = b.field_get(0, sid, *idx, *fty);
+                // A payload field is a NESTED position: render in `repr` mode so a
+                // `str`/`char`/`bytes` payload quotes, matching Python (#274).
+                let vstr = b.render_repr(fv, *fty)?;
+                acc = gen_concat(b, acc, vstr);
+            }
+            let close = b.strconst(")");
+            acc = gen_concat(b, acc, close);
+        }
+        b.store(result_slot, acc);
+        b.ensure_br(merge);
+        check = next;
+    }
+    // Fall-through: an out-of-range tag is unreachable for a well-formed value,
+    // but panic defensively (mirroring the tier-1 `.name` chain's fall-through)
+    // rather than returning an uninitialized slot.
+    b.position(check);
+    let message = b.strconst(&format!("invalid tag for enum {ename}"));
+    b.throwing_call(None, "zap_panic", vec![message]);
+    if !b.terminated() {
+        b.set_term(Term::Unreachable);
+    }
+    b.position(merge);
+    let r = b.load(result_slot, Ty::Ptr);
+    b.set_term(Term::Ret(Some(r)));
     Ok(())
 }
 
@@ -15929,13 +16070,14 @@ impl<'a> FnLower<'a> {
     /// 1. a tuple layout → the Python `(v0, v1, …)` renderer (synthesized once);
     /// 2. a hand-written `__str__`;
     /// 3. a hand-written or `@derive(Repr)` `__repr__`;
-    /// 4. otherwise the compiler-synthesized default `TypeName(field=value, …)`
+    /// 4. a tier-3 data-carrying enum (D-0046) → the tag-dispatch structural
+    ///    renderer `Enum.Variant(field=value, …)` (#706, synthesized once);
+    /// 5. otherwise the compiler-synthesized default `TypeName(field=value, …)`
     ///    renderer (synthesized once, memoized in [`StructCtx::synth_reprfns`]).
     ///
-    /// A tier-3 data-carrying enum's tagged struct and an interface value's fat
-    /// struct have no field-wise default and are rejected with a clean coded
-    /// error pointing at the #274 follow-up — never an ICE or a nonsense render
-    /// over synthetic `$tag`/`$data` slots.
+    /// Only an interface value's fat struct still has no default and is rejected
+    /// with a clean coded error pointing at the #707 follow-up — never an ICE or a
+    /// nonsense render over synthetic `$data`/`$itable` slots.
     fn struct_repr_fn(&mut self, sid: u32) -> Result<String, LowerError> {
         // Tuples have no `ctx.names` entry (their ids sit past `names.len()`), so
         // they MUST be handled before any `names[sid]` lookup — the same ordering
@@ -15983,36 +16125,59 @@ impl<'a> FnLower<'a> {
                 self.ctx.names[sid as usize]
             )));
         }
-        // A tier-3 data-carrying enum (D-0046) lowers as a tagged struct; a
-        // field-wise render over its `$tag`/payload slots would be meaningless.
-        // Structural variant rendering (`Enum.Variant(payload…)`) is the #274
-        // follow-up; until then a clean error (not an ICE).
+        // An explicit `__str__` (preferred) or `__repr__` / `@derive(Repr)` wins
+        // over the default — for a tier-3 enum too (its methods mangle to the
+        // same `{Name}__{dunder}`), so this is tested BEFORE the enum's default
+        // structural renderer below.
+        for dunder in ["__str__", "__repr__"] {
+            let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
+            if self.sigs.contains_key(&mangled) {
+                return Ok(mangled);
+            }
+        }
+        // A tier-3 data-carrying enum (D-0046) lowers as a tagged struct
+        // `{ $tag:i32, payload… }` (or a niche `Optional`-shaped pointer).
+        // Render it structurally — `Enum.Variant(field=value, …)` for a
+        // data-carrying variant, `Enum.Variant` for a payload-free one — via a
+        // per-enum tag-dispatch renderer synthesized on demand (#706, D-0124
+        // extended to D-0046), mirroring the default-struct synthesis below but
+        // keyed on the tag like the tier-1 `.name` chain.
         if self
             .ctx
             .enums
             .values()
             .any(|e| e.is_sum && e.sid == Some(sid))
         {
-            let ename = self
-                .ctx
-                .enums
-                .values()
-                .find(|e| e.is_sum && e.sid == Some(sid))
-                .map(|e| e.enum_name.clone())
-                .unwrap_or_else(|| self.ctx.names[sid as usize].clone());
-            return Err(err(format!(
-                "cannot yet render a value of the data-carrying enum '{ename}': \
-                 structural variant rendering ('{ename}.Variant(…)') is a #274 \
-                 follow-up; 'match' on it or define '__str__' (D-0124)"
-            )));
-        }
-        // An explicit `__str__` (preferred) or `__repr__` / `@derive(Repr)` wins
-        // over the default.
-        for dunder in ["__str__", "__repr__"] {
-            let mangled = format!("{}__{}", self.ctx.names[sid as usize], dunder);
-            if self.sigs.contains_key(&mangled) {
-                return Ok(mangled);
+            if let Some(name) = self.ctx.synth_reprfns.borrow().get(&sid) {
+                return Ok(name.clone());
             }
+            let name = format!("{}$repr$enum", self.ctx.names[sid as usize]);
+            // Memoize BEFORE emitting the body so a recursive variant field whose
+            // type is this same enum (`enum Expr: Add(Expr l, Expr r)`) resolves to
+            // this name as a plain call — compile-time synthesis terminates (one
+            // function per enum).
+            self.ctx
+                .synth_reprfns
+                .borrow_mut()
+                .insert(sid, name.clone());
+            let mut b = FnLower::new(
+                name.clone(),
+                vec![Ty::Struct(sid)],
+                Ty::Ptr,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            if let Err(e) = gen_enum_repr_body(&mut b, sid) {
+                // Drop the memo on failure (e.g. an unrenderable payload type), so
+                // a collected-error build never calls a half-built, never-emitted
+                // function.
+                self.ctx.synth_reprfns.borrow_mut().remove(&sid);
+                return Err(e);
+            }
+            self.ctx.generated.borrow_mut().push(b.func);
+            return Ok(name);
         }
         // The compiler-synthesized default field-wise renderer.
         if let Some(name) = self.ctx.synth_reprfns.borrow().get(&sid) {

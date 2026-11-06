@@ -3700,8 +3700,8 @@ impl Checker {
     /// D-0124) — a **user struct/enum** (`Named`), a **tuple**, or a
     /// **`list`/`dict`/`set`**, which the lowerer renders via
     /// `__str__`/`__repr__`/`@derive(Repr)`, the default field-wise form, or the
-    /// Python container form. The lowerer still cleanly rejects the few deferred
-    /// cases (a tier-3 data-carrying enum or interface value with no renderer).
+    /// Python container form. The lowerer still cleanly rejects the one deferred
+    /// case (an interface value with no renderer, the #707 follow-up).
     fn check_renderable(&mut self, ty: &Ty, span: Span) {
         // `Optional[T]` is the prelude generic enum (I#154); sema tracks it
         // opaquely as `Named("Optional")` without its payload type, so the
@@ -9446,6 +9446,22 @@ def main():
     print(Color.RED)
     print(str(Color.GREEN))
     print(f"c={Color.RED}")
+"#);
+    }
+
+    #[test]
+    fn tier3_enum_renders_in_str_and_fstring() {
+        // #706 (D-0124 extended to D-0046): a tier-3 data-carrying enum renders
+        // its structural form through the protocol, so str()/f-string/print
+        // accept it (the lowerer synthesizes the tag-dispatch renderer).
+        ok(r#"
+enum Shape:
+    Circle(f64 r)
+    Unit
+def main():
+    print(Shape.Circle(r=2.0))
+    print(str(Shape.Unit))
+    print(f"s={Shape.Circle(r=1.0)}")
 "#);
     }
 
