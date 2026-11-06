@@ -4865,3 +4865,85 @@ a clean `out of memory` message with a nonzero exit, not a SIGSEGV. The boehm
 `GC_MALLOC`-NULL path shares the same `zap_oom` guard (bdwgc exhaustion is not
 deterministically reproducible in a unit test). Grammar/spec unchanged (runtime
 only).
+
+## D-0120 — gc-boehm async-preempt STW guard is a seq-cst atomic, not plain `volatile` (I#693, I#213)
+
+**Status:** Locked — a runtime synchronization decision for the conservative
+(gc-boehm) collector's interaction with async fairness preemption (ticket #172).
+Hardens a real latent hazard; folds in #213 for this one flag. Does not change
+the language or any observable behavior.
+
+**Context.** Under gc-boehm the SIGURG fairness-preemption handler
+(`zap_preempt_handler`, `crates/codegen/src/zaprt.c`) performs an *in-signal*
+coroutine context switch (`copreempt`) on the interrupted worker. bdwgc stops the
+world with its own thread-suspend signal and expects a thread it is stopping to
+stay put. To keep the handler from switching a thread out from under the collector
+mid-collection, `GC_set_on_collection_event` brackets STW and a flag
+`g_boehm_in_stw` is set at `GC_EVENT_PRE_STOP_WORLD` (before any thread is
+suspended) and cleared at `GC_EVENT_POST_START_WORLD` (after all resume); the
+handler reads the flag and declines to switch while it is set. The SIGPROF CPU
+sampler reads the same flag to stay out of a collection.
+
+The flag was a plain `volatile sig_atomic_t`. `volatile` guarantees nothing about
+cross-thread ordering: on a weak-memory architecture (aarch64 — exactly #213's
+concern) the collector's store and the handler's load on another thread have no
+happens-before edge, so the handler can observe a **stale 0 after STW has already
+begun** and proceed into `copreempt`. This is the memory-ordering half of the
+`g_boehm_in_stw` TOCTOU raised in #693 (the suspected, never-confirmed root cause
+of the #295 `threading_counter` Boehm flake).
+
+**Decision.** `g_boehm_in_stw` is accessed **only** through `__atomic` builtins
+with **seq-cst** ordering — a release-ordered store at the STW bracket paired with
+acquire-ordered loads in the preempt handler and the SIGPROF sampler — never plain
+`volatile`. Concretely:
+
+1. `zap_boehm_gc_event` does `__atomic_store_n(&g_boehm_in_stw, 1/0,
+   __ATOMIC_SEQ_CST)`. Because PRE_STOP_WORLD runs (and this store completes)
+   *before* bdwgc suspends any thread, any handler load that is ordered after it
+   is guaranteed to observe 1.
+2. `zap_preempt_handler` reads the guard **last** — after the cheap
+   SP-in-green-range and `no_preempt == 0` checks — via
+   `__atomic_load_n(..., __ATOMIC_SEQ_CST)`, so the check→act window is the few
+   instructions before the swap, and the read is correctly ordered against (1).
+3. The SIGPROF sampler's guard read uses the same acquire load.
+
+These are lock-free atomic loads/stores on all supported arches (x86_64,
+aarch64), so they remain **async-signal-safe** — matching the existing
+`__atomic_fetch_add` on profiler counters in the same handlers. The access
+pattern is the #213-recommended conversion applied to this specific flag.
+
+**What this does and does not close.** It closes the *ordering* half: a handler
+can no longer see a stale "not stopping" after STW is announced. It does **not**
+turn the flag into a mutual-exclusion lock — a residual check→act window remains
+(STW may begin after the handler's load but before its swap finishes). That
+residual is left deliberately as a benign fairness window, because a `copreempt`
+swap that races STW is **GC-root-safe regardless**, by the same invariant that
+makes the lock-free switch-path stack-bottom update safe (D-0117): the registers
+live at the suspend are captured by bdwgc's stop-the-world register snapshot, and
+the switched-away coroutine's stack is its green stack — a `GC_MALLOC` object
+reachable through its `G` in `g_all` and so conservatively scanned as heap no
+matter which stack bottom the collector read. No root is missed.
+
+**Why POSIX does not mirror Windows' mutex.** On Windows the preempt path is a
+monitor-side `SuspendThread` hijack (no in-thread signal handler), so the STW
+bracket additionally holds `g_preempt_stw_mu` and the monitor holds it across a
+hijack — real serialization against bdwgc's `SuspendThread`-based STW (ticket #197
+Q5). POSIX cannot replicate that here: `pthread_mutex_lock` is **not
+async-signal-safe**, and a lock acquired in the SIGURG handler and meant to be
+held across `copreempt`'s stack swap — which resumes on a *different* coroutine —
+could never be released on this logical flow. The atomic guard plus the D-0117
+root-safety invariant is the POSIX-appropriate equivalent.
+
+**Verification honesty.** The #693/#295 symptom (`threading_counter` flaking under
+Boehm) was never reproduced: x86 gc-boehm stayed clean at 64k iterations, and
+after D-0117 the fixture passes 2000× on aarch64 Boehm. This change therefore
+lands as the hardening of a **real latent ordering hazard**, not a
+verified-fixed live race; definitive confirmation that the window is gone would
+require an x86 gc-boehm preemption-under-load loop (CI or a box), which cannot be
+run on the maintainer's Mac (no LLVM-18/libgc; Docker unusable). A new
+walled-garden golden `gc_preempt_stw_stress` (MAXPROCS=2, tight-CPU spinners being
+async-preempted while allocators force frequent `gc.collect()` STWs) exercises the
+overlap under both collectors with a deterministic, order-independent total; it
+cannot deterministically *trigger* the race but widens the net and documents the
+intent. Relates to #213 (the broader volatile-as-sync audit — this settles the
+STW flag) and #295 (the flake tracker).
