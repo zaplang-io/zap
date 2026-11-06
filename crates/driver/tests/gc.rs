@@ -38,6 +38,87 @@ fn run_capped(src: &str, limit: u64) -> (bool, String, String) {
     )
 }
 
+/// Compile and run `src` with an Immix heap cap and return the full
+/// `std::process::Output` (status included), so a test can inspect the exit
+/// signal, not just success/stdout/stderr.
+fn run_capped_output(src: &str, limit: u64) -> std::process::Output {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(2_000_000);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("zapgc-test-{}-{}", std::process::id(), seq));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("prog{}_{}.zap", std::process::id(), seq));
+    std::fs::write(&path, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_zapc"))
+        .arg("run")
+        .arg(&path)
+        .env("ZAP_GC_HEAP_LIMIT", limit.to_string())
+        .output()
+        .expect("run zapc");
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// OOM policy (D-0118, #697): a program whose LIVE set grows past the heap cap
+/// must abort with a clean `zap: out of memory` on stderr and a nonzero exit —
+/// NOT a nil-deref SIGSEGV. Before the fix an exhausted allocator returned NULL
+/// and generated code stored into it unchecked, faulting at address 0; the fix
+/// routes every exhaustion path through `zap_oom`, which prints the message and
+/// aborts. This is the deterministic Immix leg (the cap is Immix-only); the Boehm
+/// leg — NULL from `GC_MALLOC` when bdwgc's default `GC_oom_fn` returns 0 — shares
+/// the same `zap_oom` guard and is described in the PR (bdwgc exhaustion is not
+/// deterministically reproducible in a unit test, unlike the explicit cap).
+///
+/// The list grows without bound, so once the retained elements plus their backing
+/// buffer exceed the cap the next collection finds the live set over the limit and
+/// `zap_oom` fires; the 100M loop bound is only a safety ceiling — the abort lands
+/// after a few MiB of live data, long before it is reached.
+#[test]
+fn immix_oom_aborts_cleanly_not_segfault() {
+    let src = "def main():\n    \
+                   list[int64] xs = []\n    \
+                   for i in range(0, 100000000):\n        \
+                       xs.append(i)\n    \
+                   print(len(xs))\n";
+    // 8 MiB cap: an ever-growing live list cannot be reclaimed, so it crosses the
+    // cap and aborts — deterministic regardless of timing or core count.
+    let out = run_capped_output(src, 8 * 1024 * 1024);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an unbounded live set under the cap must not complete; stdout={stdout:?} stderr={stderr:?}"
+    );
+    // The clean OOM message is the crux: a wild SIGSEGV prints nothing of ours, so
+    // its presence proves the allocator aborted deliberately rather than handing
+    // NULL to a generated store (#697).
+    assert!(
+        stderr.contains("out of memory"),
+        "expected a clean 'out of memory' abort, not a crash; stdout={stdout:?} stderr={stderr:?}"
+    );
+    // The program never reaches its own output.
+    assert!(
+        !stdout.contains("100000000"),
+        "the program must abort before printing; stdout={stdout:?} stderr={stderr:?}"
+    );
+    // Extra assurance on Unix: the process died by SIGABRT (6, from abort()), never
+    // SIGSEGV (11) — the exact wild nil-deref #697 converts into a clean abort.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = out.status.signal() {
+            assert_ne!(
+                sig, 11,
+                "OOM must not be a SIGSEGV; stdout={stdout:?} stderr={stderr:?}"
+            );
+            assert_eq!(
+                sig, 6,
+                "OOM should abort via SIGABRT; got signal {sig}; stdout={stdout:?} stderr={stderr:?}"
+            );
+        }
+    }
+}
+
 /// Reclamation: a program that allocates far more total garbage than the heap
 /// cap, but keeps only a tiny live set, must complete within the cap — which is
 /// only possible if the collector reclaims the unreachable objects and reuses
