@@ -390,6 +390,33 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **gc-boehm async-preempt vs stop-the-world: the `g_boehm_in_stw` guard is now
+  a correctly-ordered atomic** (#693, D-0119; folds in #213 for this flag). Under
+  the conservative collector the SIGURG fairness-preemption handler performs an
+  in-signal coroutine switch (`copreempt`) gated by `g_boehm_in_stw`, which
+  brackets bdwgc's stop-the-world. The flag was a plain `volatile sig_atomic_t`,
+  which carries **no cross-thread ordering**: on a weak-memory arch (aarch64) the
+  collector's "STW starting" store and the handler's load have no happens-before,
+  so the handler could read a **stale 0 after STW had already begun** and switch a
+  thread out from under the collector — the memory-ordering half of a latent
+  TOCTOU. The flag is now accessed only via `__atomic` seq-cst: a release-ordered
+  store around the STW bracket (`zap_boehm_gc_event`) paired with acquire loads in
+  the preempt handler and the SIGPROF sampler, so once stop-the-world is announced
+  no later handler can observe it unset. The handler also reads the guard **last**,
+  after its cheap SP/`no_preempt` checks, minimizing the check→act window. The
+  residual window (STW begins after the handler's load but before its swap
+  completes) is left as a benign fairness race, not a correctness lock: a switch
+  that races STW is GC-root-safe by the same invariant that makes the lock-free
+  switch-path bottom update safe (D-0117) — registers are captured by bdwgc's STW
+  register snapshot and the green stack is scanned as heap via its `G`. POSIX
+  deliberately does **not** mirror Windows' `g_preempt_stw_mu` across the swap
+  (`pthread_mutex_lock` is not async-signal-safe). This hardens a real latent
+  ordering hazard; note the originally-reported #295 flake (`threading_counter`
+  under Boehm) was **never confirmed to reproduce** and now passes 2000× on
+  aarch64 after D-0117, so definitive confirmation needs an x86 gc-boehm loop
+  under load (CI/a box), not a local run. New walled-garden golden
+  `gc_preempt_stw_stress` exercises the preempt-during-STW overlap under both
+  collectors.
 - **aarch64 multicore GC deadlock: the scheduler's stack-bottom update is now
   lock-free** (#223, D-0117). The M:N scheduler retargets the conservative
   collector's stack bottom on every context switch (`switch_to_g` →

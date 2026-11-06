@@ -4799,25 +4799,40 @@ static pthread_mutex_t g_preempt_stw_mu = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 #ifndef ZAP_GC_IMMIX
-/* Boehm stop-the-world guard (ticket #172). Boehm's STW suspends threads with a
- * signal and expects a suspended thread to stay put; an async-preemption switch
- * fired on a thread Boehm is stopping would move it out from under the collector.
- * `GC_set_on_collection_event` brackets STW: the flag is set BEFORE any thread is
- * suspended (PRE_STOP_WORLD) and cleared only after all resume (POST_START_WORLD),
- * so the preempt handler, which re-reads it, never switches during a collection.
+/* Boehm stop-the-world guard (ticket #172; ordering hardened for #693/#213,
+ * D-0119). Boehm's STW suspends threads with a signal and expects a suspended
+ * thread to stay put; an async-preemption switch fired on a thread Boehm is
+ * stopping would move it out from under the collector. `GC_set_on_collection_event`
+ * brackets STW: the flag is set BEFORE any thread is suspended (PRE_STOP_WORLD) and
+ * cleared only after all resume (POST_START_WORLD), so a signal handler that
+ * re-reads it stays out of a collection.
+ *
+ * The flag is accessed ONLY through `__atomic` with seq-cst ordering (never plain
+ * `volatile`, which the prior form used). `volatile` orders nothing across threads:
+ * on a weak-memory arch (aarch64, #213) the collector's store here and a worker's
+ * load in the preempt/prof handler have no happens-before, so the handler could
+ * observe a stale 0 after STW had already begun and switch a thread out from under
+ * the collector — the memory-ordering half of the #693 TOCTOU. The release store
+ * below, paired with the acquire loads in `zap_preempt_handler` / the SIGPROF
+ * sampler, closes that half: once PRE_STOP_WORLD returns (before any suspend), a
+ * later handler load is guaranteed to see 1. The check->act residual (STW begins
+ * AFTER a handler's load but BEFORE its swap finishes) is left as a benign
+ * fairness window, not a correctness lock — see the handler for why that residual
+ * is GC-root-safe (D-0117 invariant) and why POSIX needs no Windows-style mutex.
+ *
  * On Windows the preempt path is a monitor-side thread hijack (no in-thread signal
  * handler to re-read a flag), so the bracket ALSO acquires/releases
  * `g_preempt_stw_mu` — the monitor holds that same mutex across a hijack, which is
  * the real serialization against bdwgc's SuspendThread-based STW (Q5). */
-static volatile sig_atomic_t g_boehm_in_stw = 0;
+static sig_atomic_t g_boehm_in_stw = 0; /* read/written only via __atomic seq-cst */
 static void zap_boehm_gc_event(GC_EventType e) {
     if (e == GC_EVENT_PRE_STOP_WORLD) {
 #if defined(ZAP_PLATFORM_WINDOWS)
         pthread_mutex_lock(&g_preempt_stw_mu);
 #endif
-        g_boehm_in_stw = 1;
+        __atomic_store_n(&g_boehm_in_stw, 1, __ATOMIC_SEQ_CST);
     } else if (e == GC_EVENT_POST_START_WORLD) {
-        g_boehm_in_stw = 0;
+        __atomic_store_n(&g_boehm_in_stw, 0, __ATOMIC_SEQ_CST);
 #if defined(ZAP_PLATFORM_WINDOWS)
         pthread_mutex_unlock(&g_preempt_stw_mu);
 #endif
@@ -4850,14 +4865,32 @@ static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
      * in, or is just back from a swap): switching there would clobber the
      * coroutine's saved context. Detect by testing the interrupted stack pointer
      * against the green-stack range. Also require no runtime lock / allocation to
-     * be held (no_preempt); otherwise defer and let the monitor re-signal. */
-    if (!g_boehm_in_stw) {
+     * be held (no_preempt); otherwise defer and let the monitor re-signal.
+     *
+     * The STW guard (`g_boehm_in_stw`) is read LAST — after the cheap SP/no_preempt
+     * checks — via a seq-cst acquire load, so the check->act window (the span
+     * between seeing "no STW" and committing to the swap) is the few instructions
+     * before `copreempt`, and the read is correctly ordered against the release
+     * store in `zap_boehm_gc_event` (so a weak-memory arch cannot see a stale 0
+     * after STW began — #693/#213, D-0119). If STW nonetheless begins inside that
+     * residual window, the swap is still GC-root-safe: the registers live at the
+     * suspend are captured by bdwgc's STW register snapshot, and the coroutine's
+     * stack is its green stack — a GC_MALLOC object reachable through its `G` in
+     * g_all and so conservatively scanned as heap no matter which stack bottom the
+     * collector read (the same invariant that makes the lock-free switch-path
+     * bottom update safe, D-0117). The flag is thus a fairness belt-and-suspenders,
+     * not a correctness lock. POSIX deliberately does NOT mirror Windows'
+     * `g_preempt_stw_mu` here: `pthread_mutex_lock` is not async-signal-safe, and a
+     * lock held across a stack swap that resumes on a different coroutine could
+     * never be released on this flow. */
+    {
         G *g = m->current;
         char probe;
         char *sp = &probe;
         char *lo = (char *)g->stack;
         char *hi = lo + g->stack_size;
-        if (sp >= lo && sp < hi && g->no_preempt == 0) {
+        if (sp >= lo && sp < hi && g->no_preempt == 0 &&
+            !__atomic_load_n(&g_boehm_in_stw, __ATOMIC_SEQ_CST)) {
             m->preempt = 0;
             copreempt();
         }
@@ -16813,8 +16846,10 @@ static void zap_prof_handler(int sig, siginfo_t *info, void *uc) {
         return;
     }
 #else
-    if (g_boehm_in_stw) {
-        return; /* Boehm is stopping the world; stay out of its way */
+    if (__atomic_load_n(&g_boehm_in_stw, __ATOMIC_SEQ_CST)) {
+        return; /* Boehm is stopping the world; stay out of its way (seq-cst
+                 * acquire, paired with the release store in zap_boehm_gc_event —
+                 * #693/#213, D-0119) */
     }
 #endif
     /* In a runtime critical section (holds a lock / mid-allocation): bucket the
