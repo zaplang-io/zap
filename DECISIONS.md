@@ -5226,16 +5226,13 @@ nor '__repr__'" error) or the REPL's `<TypeName>` placeholder.
   exist, so the structural field-wise form is used for everything.
 
 **Known v1 limitations (documented).**
-- **`char` container *elements* render as their codepoint integer.** `char` and
-  `int32` both lower to `Ty::I32` in the IR (the `char` type is not threaded
-  through lowering — a pre-existing limitation `render_str` already notes), so a
-  collection cannot tell a `char` element from an `int32` one and renders it as
-  its integer (`list[char]` → `[97, 98]`, not `['a', 'b']`). A `char` *struct
-  field* or *tuple element* keeps its precise type and renders correctly (`'c'`).
-  Full parity needs `char` made distinct in the IR (its own work). **`bool`
-  elements are NOT affected**: `bool` is `Ty::I1`, distinct from every integer,
-  so the element kind keeps its identity (`Elem::Bool`) and a `bool` collection
-  element renders `True`/`False` (`list[bool]` → `[True, False]`).
+- ~~**`char` container *elements* render as their codepoint integer.**~~
+  **RESOLVED by #709 / D-0125:** `char` is now a distinct IR type (`Ty::Char`),
+  so a collection tells a `char` element from an `int32` one and renders it
+  Python-style (`list[char]` → `['a', 'b']`). The symmetric `int32`-scalar /
+  field rendering-as-a-char bug is fixed at the same time (an `int32` renders as
+  a decimal everywhere). `bool` elements were never affected (`bool` is `Ty::I1`,
+  distinct; `Elem::Bool` keeps its identity, `list[bool]` → `[True, False]`).
 - **Cycle handling: no guard.** The renderer recurses structurally with **no**
   cycle guard, so a cyclic object graph would recurse without bound — exactly like
   a hand-written recursive `__repr__`, and unlike CPython's `reprlib` guard (which
@@ -5256,3 +5253,49 @@ concatenation a hand-written `__repr__` would do, reuses the `@derive(Repr)` sha
 and keeps the opt-in dunders as the override path. Tier-3 enums, interface values,
 and a cycle guard are separable and tracked as follow-ups rather than rushed into
 one user-facing semantics change.
+
+## D-0125 — `char` is a distinct IR type (`Ty::Char`), fixing the `char`/`int32` render conflation (I#709)
+
+**Decision.** Introduce `Ty::Char` as a distinct ZIR type for the Zap `char`,
+instead of lowering `char` to `Ty::I32` (which it had shared with `int32`). The
+distinction is purely at the IR **identity** level: `char` is still physically an
+`i32` codepoint, and every behavioural path treats it exactly like `int32` —
+`int_width()` is `Some(32)`, codegen maps it to the LLVM `i32` type, and
+arithmetic, comparison, coercion, hashing, GC, and the collection word layout are
+byte-identical. The *only* thing the distinct type buys is that the value layer
+can tell a `char` apart from an `int32`, which the Display protocol (D-0124) needs.
+
+**Why.** D-0124 shipped with a documented limitation: because `char` and `int32`
+were the same IR type, the renderer could not distinguish them, so (1) a `char`
+in a collection rendered as its decimal codepoint (`list[char]` → `[97, 98]`
+instead of `['a', 'b']`) and (2) — symmetrically — an `int32` *scalar* or
+*struct field* rendered as a *character* (because `render_value(Ty::I32)` mapped
+to the char form). A contained element-tag fix (as used for `bool`, whose
+`Ty::I1` is already distinct) cannot fix this: value/inference paths
+(`[c for c in s]`, `[s[0], s[1]]`) see only the element type, and a blanket
+`Ty::I32` → char mapping would wrongly flip `list[int32]`. The only consistent
+fix is a distinct type threaded through lowering.
+
+**What it touches.** `resolve_ty` maps `char` → `Ty::Char`; the `char` sources
+(`s[i]`, `chr()`/`char()`, string iteration) yield `Ty::Char`; `elem_kind` maps
+`Ty::Char` → a new `Elem::Char` (a char-tagged `i64` word — same suffixes,
+read-back word, hashing, and GC as `Elem::I64`, distinguished only for
+rendering, exactly mirroring `Elem::Bool`); `render_value` renders `Ty::Char`
+Python-style and `Ty::I32` as a decimal; `render_elem_repr` renders an
+`Elem::Char` element as a quoted char; and `print(char)` now routes through the
+value renderer (so `print(s[0])` shows `H`, not `72`). Every match that treated
+`char` as an integer because it was `Ty::I32` (truthiness, `heap[char]`, atomic
+add/sub, module-call argument coercion) explicitly admits `Ty::Char` so
+behaviour is preserved. There is still **no `char` literal** — `char` values
+arise only from the runtime sources above.
+
+**Result.** A `char` renders `'a'` in every position (scalar, struct field,
+tuple element, list/set element, dict key **and** value); an `int32` renders as a
+decimal everywhere. **Invariants held (regression-tested):** a `char` dict key /
+set element hashes and compares byte-identically (the D-0122 `_i64` key path —
+`char_dict_key_roundtrip.zap` round-trips keys built by iteration and probed via
+`char()`/`chr()`/`s[i]`); `char` arithmetic/comparison/coercion and all `int32`
+behaviour are unchanged except the rendering fix. Sema already distinguished
+`char` from `int32` (e.g. it rejects `char + int` and `list[int64] = [s[0]]`), so
+this change makes the IR agree with sema rather than inventing any new
+user-visible semantics. No grammar change (GRAMMAR.ebnf untouched).

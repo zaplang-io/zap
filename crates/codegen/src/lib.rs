@@ -2099,7 +2099,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Ty::I1 => self.ctx.bool_type().into(),
             Ty::I8 => self.ctx.i8_type().into(),
             Ty::I16 => self.ctx.i16_type().into(),
-            Ty::I32 => self.ctx.i32_type().into(),
+            // `char` is physically an `i32` codepoint (#709).
+            Ty::I32 | Ty::Char => self.ctx.i32_type().into(),
             Ty::I64 => self.ctx.i64_type().into(),
             Ty::Enum(_) => self.ctx.i64_type().into(),
             Ty::F32 => self.ctx.f32_type().into(),
@@ -2279,7 +2280,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             Ty::I1 => self.ctx.bool_type(),
             Ty::I8 => self.ctx.i8_type(),
             Ty::I16 => self.ctx.i16_type(),
-            Ty::I32 => self.ctx.i32_type(),
+            Ty::I32 | Ty::Char => self.ctx.i32_type(),
             _ => self.ctx.i64_type(),
         }
     }
@@ -2301,7 +2302,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         match elem {
             Ty::I1 | Ty::I8 => self.ctx.i8_type(),
             Ty::I16 => self.ctx.i16_type(),
-            Ty::I32 => self.ctx.i32_type(),
+            Ty::I32 | Ty::Char => self.ctx.i32_type(),
             Ty::I64 => self.ctx.i64_type(),
             // A reference payload (struct/list/str/...) is a machine-word pointer.
             _ => self.ctx.i64_type(),

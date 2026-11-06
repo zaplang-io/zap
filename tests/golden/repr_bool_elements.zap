@@ -2,9 +2,9 @@
 # A collection stores bool as the i64 element word, but the IR keeps its bool
 # identity (Elem::Bool, since bool is Ty::I1, distinct from every integer), so
 # the Display protocol renders a bool list/set element and dict value as
-# True/False rather than the 1/0 integer form. (A `char` element still renders
-# as its codepoint integer: char shares Ty::I32 with int32 in the IR — a
-# documented pre-existing limitation, tracked separately.)
+# True/False rather than the 1/0 integer form. (A `char` element renders
+# Python-style too, via the sibling Elem::Char since #709; see
+# char_collections.zap.)
 def main():
     list[bool] flags = [True, False, True]
     print(flags)  # [True, False, True]

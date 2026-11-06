@@ -22,7 +22,9 @@ pub(super) fn lower_args(
     for a in args {
         let (v, vt) = lowerer.expr(&a.value)?;
         let v = match vt {
-            Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => lowerer.coerce(v, vt, Ty::I64),
+            Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::Char | Ty::I64 => {
+                lowerer.coerce(v, vt, Ty::I64)
+            }
             _ => v,
         };
         out.push(v);

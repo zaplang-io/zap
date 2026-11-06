@@ -56,16 +56,33 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
     renders a `str` field **quoted** (`Point(tag='a')`, Python repr) and recurses
     through every field type. Any code depending on the old unquoted form sees
     the quoted form.
-  - **Known v1 limitations:** a `char` *collection element* renders as its
-    codepoint integer (`list[char]` → `[97, 98]`) because `char` and `int32` are
-    the same IR type (`Ty::I32`); a `char` *struct field*/*tuple element* renders
-    correctly (`'c'`). (**`bool` collection elements DO render `True`/`False`** —
-    `bool` is `Ty::I1`, distinct, so its element kind keeps bool identity.) The
+  - **Known v1 limitations:** (**`bool` collection elements render
+    `True`/`False`**, and **`char` renders Python-style `'a'` in every
+    position** — scalar, struct field, tuple element, and collection element /
+    dict key / dict value — since #709 made `char` a distinct IR type.) The
     default renderer has no cycle guard (like a hand-written recursive
     `__repr__`); non-printable non-ASCII in a quoted string is not escaped. Still
     deferred to #274 follow-ups (a clean coded error, never an ICE): tier-3
     data-carrying enums (`Shape.Circle(r=2.0)`) and interface-value rendering; no
     object-identity (`<T @ 0x…>`) form is introduced.
+- **`char` is a distinct IR type — fixes `char`/`int32` render conflation**
+  (#709, D-0125; completes D-0124). `char` previously shared the IR type
+  `Ty::I32` with `int32`, so the value layer could not tell them apart: a `char`
+  in a collection rendered as its decimal codepoint (`list[char]` → `[97, 98]`),
+  and — symmetrically — an `int32` *scalar* or *struct field* rendered as a
+  *character* through `str()`/f-strings. `char` is now its own IR type
+  (`Ty::Char`), physically the same `i32` codepoint with byte-identical
+  arithmetic / comparison / coercion / hashing / codegen / GC, distinguished
+  only so the Display protocol renders it correctly: a `char` renders
+  Python-style (`'a'`) in **every** position — scalar, struct field, tuple
+  element, list/set element, and dict key **and** value — while an `int32`
+  renders as a **decimal** everywhere. `char` arises from `s[i]`, `chr()` /
+  `char()`, and string iteration (there is no `char` literal). `print(c)` of a
+  `char` now shows the character (e.g. `print(s[0])` → `H`) rather than its
+  codepoint. **Invariants held:** `char` as a dict key / set element hashes and
+  compares byte-identically (the D-0122 key path, `_i64` entry points); `char`
+  arithmetic/comparison/coercion and all `int32` behaviour are unchanged except
+  the rendering fix.
 - **Tuples are hashable — usable as dict keys and set elements** (#680, D-0122;
   refines D-0049/D-0047). A tuple of hashable elements is now a valid dict key
   and set element with **structural** hash/equality (CPython parity):
