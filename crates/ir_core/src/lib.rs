@@ -22,9 +22,17 @@ pub enum Elem {
     /// it retains `bool` identity so the Display protocol can render a `bool`
     /// collection element as `True`/`False` (via `zap_bool_to_str`) rather than
     /// the integer `1`/`0`. `bool` is `Ty::I1`, distinct from every integer, so
-    /// this is unambiguous — unlike `char`, which shares `Ty::I32` with `int32`
-    /// and therefore still renders as its codepoint integer in a collection.
+    /// this is unambiguous.
     Bool,
+    /// A `char` element (ticket #709). Physically the same `i64` word as
+    /// [`Elem::I64`] (val/key suffix `i64`, read-back type `i64` — so codegen,
+    /// GC, hashing, and read-back are byte-identical to an integer element), but
+    /// it retains `char` identity so the Display protocol renders a `char`
+    /// collection element / dict key / dict value Python-style (`'a'`, via
+    /// `zap_char_to_str`) rather than its decimal codepoint. `char` is the
+    /// distinct [`Ty::Char`], so this is unambiguous — an `int32` element stays
+    /// [`Elem::I64`] and renders as a decimal.
+    Char,
     /// A floating-point (`f64`) element (I#569). Stored in the same uniform
     /// 8-byte word as an `i64` element — the runtime reinterprets the bits — so
     /// it reuses the list word storage via the `_f64` entry points
@@ -66,7 +74,7 @@ impl Elem {
             // `Bool` reads back as the `i64` word it is stored as (its `bool`
             // identity is used only by the renderer, which special-cases the
             // `Elem`), so read-back width is unchanged from an integer element.
-            Elem::I64 | Elem::Bool => Ty::I64,
+            Elem::I64 | Elem::Bool | Elem::Char => Ty::I64,
             Elem::F64 => Ty::F64,
             Elem::Enum(id) => Ty::Enum(id),
             Elem::Ptr => Ty::Ptr,
@@ -81,7 +89,7 @@ impl Elem {
     /// hashing), so they share the `ptr` path.
     pub fn val_suffix(self) -> &'static str {
         match self {
-            Elem::I64 | Elem::Bool | Elem::Enum(_) => "i64",
+            Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => "i64",
             Elem::F64 => "f64",
             Elem::Ptr | Elem::Struct(_) | Elem::Nested(_) => "ptr",
         }
@@ -91,7 +99,7 @@ impl Elem {
     /// which takes the type's `__hash__`/`__eq__` as function pointers.
     pub fn key_suffix(self) -> &'static str {
         match self {
-            Elem::I64 | Elem::Bool | Elem::Enum(_) => "i64",
+            Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => "i64",
             Elem::Ptr => "str",
             Elem::Struct(_) => "fn",
             // Floats are never a hashed *key* (dict/set keys reject floats), so
@@ -233,6 +241,17 @@ pub enum Ty {
     I16,
     I32,
     I64,
+    /// A Unicode scalar `char` (ticket #709). Physically an `i32` codepoint —
+    /// codegen maps it to the LLVM `i32` type and every arithmetic / comparison /
+    /// coercion / hash path treats it exactly like [`Ty::I32`] (same
+    /// [`int_width`](Ty::int_width), same word). It is a *distinct* IR type only
+    /// so the value layer can tell a `char` apart from an `int32`: that is what
+    /// lets the Display protocol render a `char` Python-style (`'a'`, via
+    /// `zap_char_to_str`) while an `int32` renders as its decimal value, in every
+    /// position (scalar, struct field, tuple/collection element). `char` arises
+    /// only from `s[i]`, `chr()`/`char()`, and string iteration — there is no
+    /// `char` literal.
+    Char,
     /// A tier-1 enum value carried as its `i64` discriminant. The id preserves
     /// the source enum identity through lowering without changing its ABI.
     Enum(u32),
@@ -304,7 +323,10 @@ impl Ty {
             Ty::I1 => Some(1),
             Ty::I8 => Some(8),
             Ty::I16 => Some(16),
-            Ty::I32 => Some(32),
+            // `char` is a 32-bit codepoint: same width as `int32`, so every
+            // width-driven path (arithmetic, comparison, coercion) treats it
+            // identically (#709).
+            Ty::I32 | Ty::Char => Some(32),
             Ty::I64 | Ty::Enum(_) => Some(64),
             _ => None,
         }
@@ -325,6 +347,7 @@ impl Ty {
                 | Ty::I8
                 | Ty::I16
                 | Ty::I32
+                | Ty::Char
                 | Ty::I64
                 | Ty::Enum(_)
                 | Ty::F32
@@ -916,6 +939,7 @@ impl fmt::Display for Ty {
             Ty::I8 => "i8",
             Ty::I16 => "i16",
             Ty::I32 => "i32",
+            Ty::Char => "char",
             Ty::I64 => "i64",
             Ty::Enum(id) => return write!(f, "enum#{id}"),
             Ty::F32 => "f32",

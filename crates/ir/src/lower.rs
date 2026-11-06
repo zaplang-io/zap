@@ -1722,7 +1722,10 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             // recognizes it in a type-annotation `array[uint8]`.
             "uint8" | "u8" => Ok(Ty::I8),
             "bool" => Ok(Ty::I1),
-            "char" => Ok(Ty::I32),
+            // `char` is a distinct IR type (#709): physically an `i32` codepoint,
+            // but kept apart from `int32` so the value layer can render it
+            // Python-style.
+            "char" => Ok(Ty::Char),
             "str" => Ok(Ty::Ptr),
             "bytes" => Ok(Ty::Bytes),
             "bigint" => Ok(Ty::Bigint),
@@ -1923,7 +1926,10 @@ fn list_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
 /// (ordered via a comparator / `__cmp__`) and floats are a clean follow-up.
 fn heap_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
     match resolve_ty(t, env)? {
-        Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
+        // `char` is ordered/compared as its `i64` codepoint word, exactly like an
+        // integer heap element (#709); it was accepted here as `Ty::I32` before
+        // the IR split, so keep it accepted.
+        Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::Char | Ty::I64 => Ok(Elem::I64),
         Ty::Enum(id) => Ok(Elem::Enum(id)),
         Ty::Ptr => Ok(Elem::Ptr),
         other => Err(err(format!(
@@ -1982,13 +1988,15 @@ fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
 /// path and are deferred.
 fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     match t {
-        // `bool` (`Ty::I1`) keeps its own element kind so the Display protocol
-        // renders a `bool` collection element as `True`/`False` (#274, D-0124);
-        // it is otherwise identical to an `i64` element (same word, suffix, and
-        // read-back type). `char`/`int32` both lower to `Ty::I32` (indistinct in
-        // the IR), so a `char` collection element still renders as its codepoint
-        // integer — fixing that needs `char` threaded through the IR (separate).
+        // `bool` (`Ty::I1`) and `char` (`Ty::Char`) each keep their own element
+        // kind so the Display protocol renders a `bool` element as `True`/`False`
+        // and a `char` element Python-style (`'a'`) (#274/#709); both are
+        // otherwise identical to an `i64` element (same word, suffix, and
+        // read-back word). An `int32` element stays `Elem::I64` and renders as a
+        // decimal — the `char`/`int32` IR types are now distinct, so this is
+        // unambiguous.
         Ty::I1 => Ok(Elem::Bool),
+        Ty::Char => Ok(Elem::Char),
         Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
         Ty::Enum(id) => Ok(Elem::Enum(id)),
         // A struct element carries its id so a struct *key* hashes/compares via
@@ -3224,8 +3232,11 @@ fn gen_tuple_repr_body(b: &mut FnLower, sid: u32) -> Result<(), LowerError> {
 /// element (`Elem::Bool`) is rendered `True`/`False` directly from its `i64`
 /// word via `zap_bool_to_str` — the `Elem::Bool` tag is the only thing that
 /// distinguishes it from an integer element, which `render_repr` (keyed on the
-/// read-back `Ty`, `i64` for a bool) could not. Every other element kind renders
-/// through the shared `render_repr`.
+/// read-back `Ty`, `i64` for a bool) could not. A `char` element (`Elem::Char`)
+/// is likewise distinguished only by its tag: its `i64` word is truncated back
+/// to the `i32` codepoint (`Ty::Char`) and rendered Python-style (`'a'`) through
+/// the shared `render_repr`, rather than as its decimal codepoint (#709). Every
+/// other element kind renders through the shared `render_repr`.
 fn render_elem_repr(b: &mut FnLower, e: Value, elem: Elem) -> Result<Value, LowerError> {
     if elem == Elem::Bool {
         let d = b.new_value(Ty::Ptr);
@@ -3235,6 +3246,12 @@ fn render_elem_repr(b: &mut FnLower, e: Value, elem: Elem) -> Result<Value, Lowe
             args: vec![e],
         });
         return Ok(d);
+    }
+    if elem == Elem::Char {
+        // The element word is an `i64`; narrow it to the `i32` codepoint so the
+        // `Ty::Char` renderer emits the Python-quoted one-char string.
+        let c = b.coerce(e, Elem::Char.ty(), Ty::Char);
+        return b.render_repr(c, Ty::Char);
     }
     let ty = b.elem_ty(elem);
     b.render_repr(e, ty)
@@ -6331,9 +6348,12 @@ impl<'a> FnLower<'a> {
                 self.throwing_call(Some(d), &f, vec![v]);
                 return Ok(d);
             }
-            // A `char` (an `i32`): `str` mode renders its one-codepoint string;
-            // `repr` mode renders that string Python-quoted (`'c'`).
-            Ty::I32 => match mode {
+            // A `char` (#709): `str` mode renders its one-codepoint string;
+            // `repr` mode renders that string Python-quoted (`'c'`). An `int32`
+            // is NOT a char — it renders as a decimal through the integer arm
+            // below (fixing the pre-#709 conflation where an `int32` scalar /
+            // field rendered as a character).
+            Ty::Char => match mode {
                 RenderMode::Str => ("zap_char_to_str", v),
                 RenderMode::Repr => {
                     let s = self.new_value(Ty::Ptr);
@@ -6346,7 +6366,7 @@ impl<'a> FnLower<'a> {
                 }
             },
             Ty::I1 => ("zap_bool_to_str", self.coerce(v, vt, Ty::I64)),
-            Ty::I8 | Ty::I16 | Ty::I64 => ("zap_i64_to_str", self.coerce(v, vt, Ty::I64)),
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => ("zap_i64_to_str", self.coerce(v, vt, Ty::I64)),
             Ty::F32 | Ty::F64 => ("zap_f64_to_str", self.as_f64(v, vt)),
             _ => return Err(err("cannot render this value as a string")),
         };
@@ -6364,7 +6384,7 @@ impl<'a> FnLower<'a> {
     fn value_to_bool(&mut self, v: Value, vt: Ty) -> Result<Value, LowerError> {
         match vt {
             Ty::I1 => Ok(v),
-            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => {
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::Char | Ty::I64 => {
                 let z = self.iconst(vt, 0);
                 let d = self.new_value(Ty::I1);
                 self.emit(Inst::ICmp {
@@ -8951,14 +8971,15 @@ impl<'a> FnLower<'a> {
         });
         self.position(body_bb);
         let cur_off = self.load(off, Ty::I64);
-        let cp = self.new_value(Ty::I32);
+        // A codepoint read from a string is a `char` (#709), physically an i32.
+        let cp = self.new_value(Ty::Char);
         self.emit(Inst::Call {
             dest: Some(cp),
             func: "zap_str_cp_at_byte".to_string(),
             args: vec![s, cur_off],
         });
         self.push_loop(incr_bb, end_bb);
-        body(self, cp, Ty::I32)?;
+        body(self, cp, Ty::Char)?;
         self.loops.pop();
         self.ensure_br(incr_bb);
         self.position(incr_bb);
@@ -9806,7 +9827,8 @@ impl<'a> FnLower<'a> {
         });
         let nbytes_slot = self.spill_invariant(nbytes, Ty::I64);
         let s_slot = self.spill_invariant(s, Ty::Ptr);
-        let var = self.decl_slot(&name, Ty::I32);
+        // Iterating a string binds each codepoint as a `char` (#709).
+        let var = self.decl_slot(&name, Ty::Char);
 
         let cond_bb = self.new_block();
         let body_bb = self.new_block();
@@ -9833,7 +9855,7 @@ impl<'a> FnLower<'a> {
         self.position(body_bb);
         let cur_off = self.load(off, Ty::I64);
         let s_b = self.reload_invariant(s_slot, s, Ty::Ptr);
-        let cp = self.new_value(Ty::I32);
+        let cp = self.new_value(Ty::Char);
         self.emit(Inst::Call {
             dest: Some(cp),
             func: "zap_str_cp_at_byte".to_string(),
@@ -10675,6 +10697,7 @@ impl<'a> FnLower<'a> {
                         || vt == Ty::Bigint
                         || vt.is_float()
                         || vt == Ty::I1
+                        || vt == Ty::Char
                         || matches!(vt, Ty::Enum(_))
                     {
                         // Everything with a non-trivial Display form routes through
@@ -10688,10 +10711,14 @@ impl<'a> FnLower<'a> {
                         //   * a tier-1 enum renders `EnumName.VARIANT`;
                         //   * a float prints `%g`-style (not C `%f`'s `27.500000`)
                         //     and a bool `True`/`False` (not the `-1` bitpattern) —
-                        //     the I#493 fix.
-                        // `int`/`char`/`str`/`bytes` already print correctly
-                        // natively (and a bare top-level string stays UNQUOTED),
-                        // so they stay on the raw path below.
+                        //     the I#493 fix;
+                        //   * a `char` renders its one-codepoint string (e.g.
+                        //     `print(s[0])` -> `H`, not the decimal codepoint),
+                        //     Python-style, now that `char` is a distinct IR type
+                        //     (#709).
+                        // `int`/`str`/`bytes` already print correctly natively
+                        // (and a bare top-level string stays UNQUOTED), so they
+                        // stay on the raw path below.
                         vals.push(self.render_str(v, vt)?);
                     } else {
                         vals.push(v);
@@ -10905,13 +10932,13 @@ impl<'a> FnLower<'a> {
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
                 let v = self.coerce(v, vt, Ty::I64);
-                let d = self.new_value(Ty::I32);
+                let d = self.new_value(Ty::Char);
                 self.emit(Inst::Call {
                     dest: Some(d),
                     func: "zap_chr".to_string(),
                     args: vec![v],
                 });
-                return Ok((d, Ty::I32));
+                return Ok((d, Ty::Char));
             }
             if fname == "bigint" {
                 if args.len() != 1 {
@@ -14215,15 +14242,16 @@ impl<'a> FnLower<'a> {
                 Ok((d, Ty::I64))
             }
             // `str` lowers to `Ptr`; `s[i]` yields the codepoint at codepoint
-            // index `i` as a `char` (an `i32`), Python semantics (D-0025).
+            // index `i` as a `char` (a distinct IR type over i32, #709), Python
+            // semantics (D-0025).
             Ty::Ptr => {
                 let (iv, it) = self.expr(index)?;
                 let iv = self.coerce(iv, it, Ty::I64);
-                let d = self.new_value(Ty::I32);
+                let d = self.new_value(Ty::Char);
                 // Out-of-range raises a catchable Zap exception (#383); use an
                 // `invoke` inside a `try` so the handler catches it.
                 self.throwing_call(Some(d), "zap_str_index", vec![bv, iv]);
-                Ok((d, Ty::I32))
+                Ok((d, Ty::Char))
             }
             _ => Err(err(
                 "indexing is only supported on str, list, dict, and array values",
@@ -14721,7 +14749,8 @@ impl<'a> FnLower<'a> {
         };
         let orderable_kind = |k: Elem, what: &str| -> Result<i64, LowerError> {
             match k {
-                Elem::I64 | Elem::Bool => Ok(0),
+                // `char` orders as its `i64` codepoint word, like an int (#709).
+                Elem::I64 | Elem::Bool | Elem::Char => Ok(0),
                 Elem::Enum(_) => Ok(0),
                 Elem::Ptr => Ok(1),
                 // Ordering `f64` elements directly is a clean follow-up (the
@@ -14952,7 +14981,9 @@ impl<'a> FnLower<'a> {
                 Ok((dest, elem))
             }
             "add" | "sub" => {
-                if !matches!(elem, Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64) {
+                // `char` is an integer-width cell (#709); it was accepted here as
+                // `Ty::I32` before the IR split, so keep it accepted.
+                if !matches!(elem, Ty::I8 | Ty::I16 | Ty::I32 | Ty::Char | Ty::I64) {
                     return Err(err(format!(
                         "{name}() is only available on an integer Atomic (not bool or a reference)"
                     )));
