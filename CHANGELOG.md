@@ -56,15 +56,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
     renders a `str` field **quoted** (`Point(tag='a')`, Python repr) and recurses
     through every field type. Any code depending on the old unquoted form sees
     the quoted form.
-  - **Known v1 limitations:** a `bool`/`char` *collection element* renders as its
-    integer form (`list[bool]` → `[1, 0]`) because a collection classifies all
-    small integers as one `i64` element kind — a `bool`/`char` *struct field* or
-    *tuple element* renders correctly; the default renderer has no cycle guard
-    (like a hand-written recursive `__repr__`); non-printable non-ASCII in a
-    quoted string is not escaped. Still deferred to #274 follow-ups (a clean coded
-    error, never an ICE): tier-3 data-carrying enums (`Shape.Circle(r=2.0)`) and
-    interface-value rendering; no object-identity (`<T @ 0x…>`) form is
-    introduced.
+  - **Known v1 limitations:** a `char` *collection element* renders as its
+    codepoint integer (`list[char]` → `[97, 98]`) because `char` and `int32` are
+    the same IR type (`Ty::I32`); a `char` *struct field*/*tuple element* renders
+    correctly (`'c'`). (**`bool` collection elements DO render `True`/`False`** —
+    `bool` is `Ty::I1`, distinct, so its element kind keeps bool identity.) The
+    default renderer has no cycle guard (like a hand-written recursive
+    `__repr__`); non-printable non-ASCII in a quoted string is not escaped. Still
+    deferred to #274 follow-ups (a clean coded error, never an ICE): tier-3
+    data-carrying enums (`Shape.Circle(r=2.0)`) and interface-value rendering; no
+    object-identity (`<T @ 0x…>`) form is introduced.
 - **Tuples are hashable — usable as dict keys and set elements** (#680, D-0122;
   refines D-0049/D-0047). A tuple of hashable elements is now a valid dict key
   and set element with **structural** hash/equality (CPython parity):

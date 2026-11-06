@@ -1982,7 +1982,14 @@ fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
 /// path and are deferred.
 fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     match t {
-        Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
+        // `bool` (`Ty::I1`) keeps its own element kind so the Display protocol
+        // renders a `bool` collection element as `True`/`False` (#274, D-0124);
+        // it is otherwise identical to an `i64` element (same word, suffix, and
+        // read-back type). `char`/`int32` both lower to `Ty::I32` (indistinct in
+        // the IR), so a `char` collection element still renders as its codepoint
+        // integer — fixing that needs `char` threaded through the IR (separate).
+        Ty::I1 => Ok(Elem::Bool),
+        Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => Ok(Elem::I64),
         Ty::Enum(id) => Ok(Elem::Enum(id)),
         // A struct element carries its id so a struct *key* hashes/compares via
         // its own `__hash__`/`__eq__` (operator overloading, D-0047).
@@ -3212,6 +3219,27 @@ fn gen_tuple_repr_body(b: &mut FnLower, sid: u32) -> Result<(), LowerError> {
 /// nothing; on every later element append `", "` to the accumulator at `acc`.
 /// Leaves `b` positioned at the join block so the caller appends the element
 /// next.
+/// Render one collection element/key/value `e` (already fetched) of element kind
+/// `elem` in `repr` mode for a container renderer (#274, D-0124). A `bool`
+/// element (`Elem::Bool`) is rendered `True`/`False` directly from its `i64`
+/// word via `zap_bool_to_str` — the `Elem::Bool` tag is the only thing that
+/// distinguishes it from an integer element, which `render_repr` (keyed on the
+/// read-back `Ty`, `i64` for a bool) could not. Every other element kind renders
+/// through the shared `render_repr`.
+fn render_elem_repr(b: &mut FnLower, e: Value, elem: Elem) -> Result<Value, LowerError> {
+    if elem == Elem::Bool {
+        let d = b.new_value(Ty::Ptr);
+        b.emit(Inst::Call {
+            dest: Some(d),
+            func: "zap_bool_to_str".to_string(),
+            args: vec![e],
+        });
+        return Ok(d);
+    }
+    let ty = b.elem_ty(elem);
+    b.render_repr(e, ty)
+}
+
 fn gen_seq_sep(b: &mut FnLower, acc: Value, first: Value) {
     let fv = b.load(first, Ty::I64);
     let zero = b.iconst(Ty::I64, 0);
@@ -14693,7 +14721,7 @@ impl<'a> FnLower<'a> {
         };
         let orderable_kind = |k: Elem, what: &str| -> Result<i64, LowerError> {
             match k {
-                Elem::I64 => Ok(0),
+                Elem::I64 | Elem::Bool => Ok(0),
                 Elem::Enum(_) => Ok(0),
                 Elem::Ptr => Ok(1),
                 // Ordering `f64` elements directly is a clean follow-up (the
@@ -16022,9 +16050,9 @@ impl<'a> FnLower<'a> {
                 b.store(acc, open);
                 let one = b.iconst(Ty::I64, 1);
                 b.store(first, one);
-                b.iterate_list(c, elem, |s, e, ety| {
+                b.iterate_list(c, elem, |s, e, _ety| {
                     gen_seq_sep(s, acc, first);
-                    let es = s.render_repr(e, ety)?;
+                    let es = render_elem_repr(s, e, elem)?;
                     let a = s.load(acc, Ty::Ptr);
                     let a2 = gen_concat(s, a, es);
                     s.store(acc, a2);
@@ -16081,9 +16109,9 @@ impl<'a> FnLower<'a> {
                 b.store(acc, open);
                 let one = b.iconst(Ty::I64, 1);
                 b.store(first, one);
-                b.iterate_list(items, elem, |s, e, ety| {
+                b.iterate_list(items, elem, |s, e, _ety| {
                     gen_seq_sep(s, acc, first);
-                    let es = s.render_repr(e, ety)?;
+                    let es = render_elem_repr(s, e, elem)?;
                     let a = s.load(acc, Ty::Ptr);
                     let a2 = gen_concat(s, a, es);
                     s.store(acc, a2);
@@ -16119,10 +16147,10 @@ impl<'a> FnLower<'a> {
                 let kfns = b.key_fn_args(kk)?;
                 let get_fn = format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix());
                 let vty = b.elem_ty(vk);
-                b.iterate_list(keys, kk, |s, key, kty| {
+                b.iterate_list(keys, kk, |s, key, _kty| {
                     gen_seq_sep(s, acc, first);
                     // key repr
-                    let ks = s.render_repr(key, kty)?;
+                    let ks = render_elem_repr(s, key, kk)?;
                     let a = s.load(acc, Ty::Ptr);
                     let a2 = gen_concat(s, a, ks);
                     let colon = s.strconst(": ");
@@ -16137,7 +16165,7 @@ impl<'a> FnLower<'a> {
                         func: get_fn.clone(),
                         args: gargs,
                     });
-                    let vs = s.render_repr(val, vty)?;
+                    let vs = render_elem_repr(s, val, vk)?;
                     let a4 = s.load(acc, Ty::Ptr);
                     let a5 = gen_concat(s, a4, vs);
                     s.store(acc, a5);

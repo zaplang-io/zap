@@ -5226,13 +5226,16 @@ nor '__repr__'" error) or the REPL's `<TypeName>` placeholder.
   exist, so the structural field-wise form is used for everything.
 
 **Known v1 limitations (documented).**
-- **`bool`/`char` container *elements* render as their integer form.** A
-  collection stores elements as uniform words and classifies `i1`/`i8`/`i16`/`i32`/
-  `i64` all as the `i64` element kind (`Elem`), so `list[bool]` loses bool-ness and
-  renders `[1, 0]` rather than `[True, False]`, and `list[char]` renders codepoint
-  integers. A `bool`/`char` *struct field* or *tuple element* (which keep their
-  precise type) renders correctly (`True`/`'c'`); only collection elements are
-  affected. Full parity needs an `Elem` representation change (its own work).
+- **`char` container *elements* render as their codepoint integer.** `char` and
+  `int32` both lower to `Ty::I32` in the IR (the `char` type is not threaded
+  through lowering — a pre-existing limitation `render_str` already notes), so a
+  collection cannot tell a `char` element from an `int32` one and renders it as
+  its integer (`list[char]` → `[97, 98]`, not `['a', 'b']`). A `char` *struct
+  field* or *tuple element* keeps its precise type and renders correctly (`'c'`).
+  Full parity needs `char` made distinct in the IR (its own work). **`bool`
+  elements are NOT affected**: `bool` is `Ty::I1`, distinct from every integer,
+  so the element kind keeps its identity (`Elem::Bool`) and a `bool` collection
+  element renders `True`/`False` (`list[bool]` → `[True, False]`).
 - **Cycle handling: no guard.** The renderer recurses structurally with **no**
   cycle guard, so a cyclic object graph would recurse without bound — exactly like
   a hand-written recursive `__repr__`, and unlike CPython's `reprlib` guard (which

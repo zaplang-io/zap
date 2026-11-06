@@ -996,10 +996,11 @@ print("a")                     # a                 (bare string unquoted)
 tier-3 data-carrying enums (`Shape.Circle(r=2.0)`) and interface-value rendering.
 No object-identity/address form (`<TypeName @ 0x…>`) is provided.
 
-**Known limitations (v1).** A `bool`/`char` **collection element** renders as its
-integer form (`list[bool]` → `[1, 0]`), because a collection stores all small
-integers as one element kind; a `bool`/`char` **struct field** or **tuple
-element** renders correctly. The renderer recurses with **no cycle guard**, so a
+**Known limitations (v1).** A `char` **collection element** renders as its
+codepoint integer (`list[char]` → `[97, 98]`), because `char` and `int32` are the
+same IR type; a `char` **struct field** or **tuple element** renders correctly
+(`'c'`). (A `bool` collection element *does* render `True`/`False`.) The renderer
+recurses with **no cycle guard**, so a
 cyclic object graph would recurse without bound — as a hand-written recursive
 `__repr__` would (CPython guards only built-in containers). A quoted string's
 escaping is ASCII-focused: non-printable non-ASCII codepoints are not escaped.
