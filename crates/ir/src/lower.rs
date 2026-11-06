@@ -2030,6 +2030,28 @@ fn list_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, Lower
     }
 }
 
+/// The integer-word element family: `i64`, `bool` (`Elem::Bool`), and `char`
+/// (`Elem::Char`) elements all occupy one physical cell — an `i64` word, the
+/// `i64` val/key suffix, and an `i64` read-back type (`Elem::ty()`). They are
+/// distinct `Elem` kinds only so the Display protocol can render them
+/// differently (a decimal, `True`/`False`, or `'a'`) (#274/#709); they are
+/// interchangeable for storage.
+///
+/// An indexed store coerces its value word to the destination `elem.ty()` and
+/// emits the `i64`-suffixed setter regardless of which of these the value and
+/// destination are, so a value whose kind is any of these may be stored into a
+/// destination whose kind is any of these — e.g. `want[i] = flags[j]`, where the
+/// `list[bool]` element `flags[j]` reads back as a bare `i64` word yet the
+/// destination `want` is also a `list[bool]`. Requiring exact `Elem` identity in
+/// [`FnLower::check_index_value`] wrongly rejected that with the
+/// self-contradictory "indexed assignment expects `i64`, found `i64`" (the #727
+/// regression, introduced by #708's `Elem::Bool` tag and widened to `char` by
+/// #712's `Elem::Char`). `Elem::Enum` shares the `i64` suffix but is NOT in this
+/// family — an enum store keeps its own identity check.
+fn is_int_word_elem(e: Elem) -> bool {
+    matches!(e, Elem::I64 | Elem::Bool | Elem::Char)
+}
+
 fn param_ty(p: &ast::Param, self_sid: Option<u32>, ctx: &StructCtx) -> Ty {
     if p.name == "self" {
         if let Some(sid) = self_sid {
@@ -14526,7 +14548,10 @@ impl<'a> FnLower<'a> {
         } else {
             elem_kind(actual, &self.ctx.nested)?
         };
-        if kind != expected {
+        // `i64`/`bool`/`char` elements are one physical cell, distinct only for
+        // rendering (#727 regression); a value of any of them stores into a
+        // destination of any of them. All other kinds keep exact identity.
+        if kind != expected && !(is_int_word_elem(kind) && is_int_word_elem(expected)) {
             return Err(err(format!(
                 "indexed assignment expects `{}`, found `{}`",
                 self.render_ty(&self.elem_ty(expected)),
