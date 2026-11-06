@@ -1923,6 +1923,144 @@ mod tests {
         assert!(text.contains("funcaddr @V____eq__"), "text:\n{text}");
     }
 
+    // --- tuples as dict keys / set elements (#680, D-0049) ---
+
+    /// Count the generated tuple key functions in a module (`$tuple$<sid>$hash`).
+    fn tuple_hash_fn_count(m: &Module) -> usize {
+        m.funcs
+            .iter()
+            .filter(|f| f.name.starts_with("$tuple$") && f.name.ends_with("$hash"))
+            .count()
+    }
+
+    #[test]
+    fn tuple_dict_key_lowers_without_ice() {
+        // Regression for the #680 ICE: `{(1, 2): 7}` used to panic at
+        // `key_fn_args` (`self.ctx.names[sid]` out of bounds, a tuple sid has no
+        // name entry). It must now lower cleanly: the tuple routes through the
+        // function-pointer dict-key path with a synthesized structural
+        // `__hash__`/`__eq__` folded with `zap_hash_combine` over `zap_i64_hash`.
+        let m = lower_ok("def main():\n    auto d = {(1, 2): 7}\n    print(d[(1, 2)])\n");
+        let text = format!("{m}");
+        assert!(text.contains("@zap_dict_set_fn_i64"), "text:\n{text}");
+        assert!(text.contains("@zap_dict_get_fn_i64"), "text:\n{text}");
+        assert!(text.contains("funcaddr @$tuple$"), "text:\n{text}");
+        assert_eq!(tuple_hash_fn_count(&m), 1, "one synthesized tuple hash fn");
+        // The synthesized hash folds integer-word element hashes.
+        assert!(text.contains("@zap_i64_hash"), "text:\n{text}");
+        assert!(text.contains("@zap_hash_combine"), "text:\n{text}");
+    }
+
+    #[test]
+    fn tuple_dict_key_typed_insert_lookup_lowers() {
+        // The explicitly-typed dict form from the #680 repro: insert, `in`, and
+        // index-read over a `dict[(int64, str), int64]` all route through the
+        // tuple key path; the str element hashes/compares via the str runtime.
+        let m = lower_ok(
+            "def main():\n    dict[(int64, str), int64] d = {}\n    auto k = (3, \"x\")\n\
+             \n    d[k] = 7\n    if k in d:\n        print(d[k])\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_dict_set_fn_i64"), "text:\n{text}");
+        assert!(text.contains("funcaddr @$tuple$"), "text:\n{text}");
+        // A str element is hashed/compared by value.
+        assert!(text.contains("@zap_str_hash"), "text:\n{text}");
+        assert!(text.contains("@zap_str_eq"), "text:\n{text}");
+    }
+
+    #[test]
+    fn tuple_set_element_uses_fn_entry_points() {
+        // A tuple set element routes to the `_fn` set entry points with the
+        // synthesized key functions, exactly like a `@derive(Hash, Eq)` struct.
+        let m = lower_ok("def main():\n    auto s = {(1, 2)}\n    print((1, 2) in s)\n");
+        let text = format!("{m}");
+        assert!(text.contains("@zap_set_add_fn"), "text:\n{text}");
+        assert!(text.contains("funcaddr @$tuple$"), "text:\n{text}");
+        assert_eq!(tuple_hash_fn_count(&m), 1, "one synthesized tuple hash fn");
+    }
+
+    #[test]
+    fn nested_tuple_key_generates_recursive_key_fns() {
+        // A nested tuple key `((1, 2), 3)` synthesizes a hash/eq for BOTH the
+        // outer `((int,int), int)` and the inner `(int, int)` layouts; the outer
+        // hash/eq call the inner's by symbol.
+        let m = lower_ok("def main():\n    auto d = {((1, 2), 3): 7}\n    print(d[((1, 2), 3)])\n");
+        let text = format!("{m}");
+        assert_eq!(
+            tuple_hash_fn_count(&m),
+            2,
+            "outer + inner tuple hash fns; text:\n{text}"
+        );
+        // The outer eq delegates to the inner tuple's eq (a call, not an inline
+        // ICmp) for the aggregate element.
+        assert!(
+            m.funcs
+                .iter()
+                .filter(|f| f.name.starts_with("$tuple$") && f.name.ends_with("$eq"))
+                .count()
+                == 2,
+            "outer + inner tuple eq fns; text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn same_tuple_layout_reuses_one_key_fn_pair() {
+        // Two dict keys of the same `(int64, int64)` layout share ONE synthesized
+        // hash/eq pair (keyed by the interned tuple id), not one per use site.
+        let m = lower_ok(
+            "def main():\n    auto d = {(1, 2): 7}\n    d[(3, 4)] = 8\n    \
+             print(d[(1, 2)])\n    print(d[(3, 4)])\n",
+        );
+        assert_eq!(
+            tuple_hash_fn_count(&m),
+            1,
+            "the shared layout yields exactly one hash fn"
+        );
+    }
+
+    #[test]
+    fn tuple_key_with_unhashable_element_is_clean_error_not_ice() {
+        // A tuple is hashable only when all elements are (CPython parity). A
+        // float, a nested collection, or a struct lacking `__hash__`/`__eq__`
+        // element is rejected with a clean `LowerError` — NEVER an ICE.
+        for (src, needle) in [
+            (
+                "def main():\n    auto d = {(1, 1.5): 7}\n",
+                "'f64' element is not hashable",
+            ),
+            (
+                "def main():\n    auto d = {(1, [2, 3]): 7}\n",
+                "is not hashable",
+            ),
+            (
+                "struct P:\n    int64 x\n\ndef main():\n    auto p = P(x=1)\n    auto d = {(1, p): 7}\n",
+                "needs '__hash__' and '__eq__'",
+            ),
+        ] {
+            let errs = lower_errs(src);
+            assert!(!errs.is_empty(), "expected a clean error for:\n{src}");
+            assert!(
+                errs.iter().any(|e| e.message.contains(needle)),
+                "error for {src:?} should mention {needle:?}, got: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_key_with_hashable_struct_element_lowers() {
+        // A tuple whose struct element DOES derive Hash/Eq is hashable: the
+        // synthesized tuple hash/eq delegate to the struct's own dunders.
+        let m = lower_ok(
+            "@derive(Eq, Hash)\nstruct P:\n    int64 x\n\n\
+             def main():\n    auto p = P(x=1)\n    auto d = {(1, p): 7}\n    print(d[(1, p)])\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("funcaddr @$tuple$"), "text:\n{text}");
+        // The tuple hash/eq call the struct's own derived dunders on that element.
+        assert!(text.contains("@P____hash__"), "text:\n{text}");
+        assert!(text.contains("@P____eq__"), "text:\n{text}");
+    }
+
     #[test]
     fn operator_without_dunder_lowers_to_clean_error() {
         // The ir crate runs without sema; a missing dunder is a clean error.
