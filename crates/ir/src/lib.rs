@@ -2061,6 +2061,255 @@ mod tests {
         assert!(text.contains("@P____eq__"), "text:\n{text}");
     }
 
+    // --- typed empty collection constructors with composite element types
+    //     (#703): `set[(..)]()` / `channel[(..)]()` / `heap[(..)]()` ---
+
+    #[test]
+    fn set_ctor_accepts_tuple_element_type() {
+        // #703: `set[(int64, int64)]()` used to reject with ZAP6001 "expects an
+        // element type name", even though the set literal `{(1, 2)}` and
+        // `dict[(..), ..]` keys accept tuples (D-0122). The typed empty
+        // constructor now accepts any valid element type expression; a tuple
+        // element routes through the synthesized key-fn path on `.add` / `in`,
+        // exactly like the literal.
+        let m = lower_ok(
+            "def main():\n    set[(int64, int64)] s = set[(int64, int64)]()\n    \
+             s.add((1, 2))\n    print((1, 2) in s)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_set_new"), "text:\n{text}");
+        assert!(text.contains("@zap_set_add_fn"), "text:\n{text}");
+        assert!(text.contains("@zap_set_contains_fn"), "text:\n{text}");
+        assert!(text.contains("funcaddr @$tuple$"), "text:\n{text}");
+    }
+
+    #[test]
+    fn set_ctor_accepts_nested_tuple_element_type() {
+        // A nested-tuple element type is accepted and generates recursive key
+        // functions for both the outer and inner tuple layouts.
+        let m = lower_ok(
+            "def main():\n    auto s = set[((int64, int64), int64)]()\n    \
+             s.add(((1, 2), 3))\n    print(((1, 2), 3) in s)\n",
+        );
+        assert_eq!(
+            tuple_hash_fn_count(&m),
+            2,
+            "outer + inner tuple hash fns; text:\n{m}"
+        );
+    }
+
+    #[test]
+    fn set_ctor_bare_name_element_still_lowers() {
+        // Regression: the pre-#703 bare-name element path is unchanged.
+        let m =
+            lower_ok("def main():\n    auto s = set[int64]()\n    s.add(7)\n    print(7 in s)\n");
+        let text = format!("{m}");
+        assert!(text.contains("@zap_set_new"), "text:\n{text}");
+        assert!(text.contains("@zap_set_add_i64"), "text:\n{text}");
+    }
+
+    #[test]
+    fn set_ctor_nested_collection_element_is_clean_error() {
+        // A nested collection has no stable hash, so `set[list[int64]]()` is
+        // rejected cleanly (never an ICE) — the constructor now parses the
+        // composite element type and reaches the same unhashable guard as the
+        // literal / annotation forms, instead of "expects an element type name".
+        let errs = lower_errs("def main():\n    auto s = set[list[int64]]()\n");
+        assert!(!errs.is_empty(), "set[list[..]]() should be a clean error");
+        assert!(
+            errs.iter().any(|e| e.message.contains("unhashable")),
+            "expected an unhashable-element diagnostic, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn heap_ctor_tuple_element_is_clean_error_not_ice() {
+        // A heap orders its elements; a tuple has no ordering, so the constructor
+        // rejects a tuple element cleanly — the same diagnostic as the `heap[(..)]`
+        // annotation, never an ICE and never "expects an element type name".
+        let errs = lower_errs("def main():\n    auto h = heap[(int64, int64)]()\n");
+        assert!(!errs.is_empty(), "heap[(..)]() should be a clean error");
+        assert!(
+            errs.iter().any(|e| e.message.contains("not supported yet")),
+            "expected a heap-unsupported diagnostic, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn channel_ctor_tuple_element_is_clean_error_not_ice() {
+        // A channel stores uniform words; a tuple is a value aggregate whose
+        // delivery across the channel ABI is unimplemented, so the constructor
+        // rejects it cleanly (never an ICE) with a specific message.
+        let errs = lower_errs("def main():\n    auto c = channel[(int64, int64)]()\n");
+        assert!(!errs.is_empty(), "channel[(..)]() should be a clean error");
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("tuple elements are not supported")),
+            "expected a channel-tuple diagnostic, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn channel_ctor_bare_name_element_still_lowers() {
+        // Regression: a scalar/str channel element is unchanged.
+        let m = lower_ok("def main():\n    auto c = channel[str]()\n    print(0)\n");
+        assert!(format!("{m}").contains("@zap_chan_new"), "text:\n{m}");
+    }
+
+    // --- Optional[T] as a dict key / set element (#704, D-0122) ---
+
+    /// Count the generated Optional key functions in a module (`$opt$<sid>$hash`).
+    fn opt_hash_fn_count(m: &Module) -> usize {
+        m.funcs
+            .iter()
+            .filter(|f| f.name.starts_with("$opt$") && f.name.ends_with("$hash"))
+            .count()
+    }
+
+    #[test]
+    fn optional_dict_key_lowers_via_synthesized_key_fns() {
+        // #704: `Optional[int64]` as a dict key used to reject (ZAP6001). It now
+        // routes through the fn-key path with a synthesized structural
+        // `__hash__`/`__eq__`: `None` hashes to a sentinel, `Some(v)` delegates to
+        // the payload's `zap_i64_hash`. Exercises insert, a `None` literal key,
+        // index-read, and `in`.
+        let m = lower_ok(
+            "def main():\n    dict[Optional[int64], str] d = {}\n    \
+             Optional[int64] k = Optional.Some(5)\n    d[k] = \"five\"\n    \
+             d[None] = \"none\"\n    print(d[k])\n    print(d[None])\n    \
+             print(k in d)\n    print(None in d)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_dict_set_fn_ptr"), "text:\n{text}");
+        assert!(text.contains("@zap_dict_get_fn_ptr"), "text:\n{text}");
+        assert!(text.contains("@zap_dict_contains_fn"), "text:\n{text}");
+        assert!(text.contains("funcaddr @$opt$"), "text:\n{text}");
+        assert_eq!(opt_hash_fn_count(&m), 1, "one synthesized Optional hash fn");
+        // The Some branch delegates to the payload's integer hash.
+        assert!(text.contains("@zap_i64_hash"), "text:\n{text}");
+    }
+
+    #[test]
+    fn optional_set_element_lowers() {
+        // An `Optional[int64]` set element routes to the `_fn` set entry points
+        // with the synthesized key functions, including a bare `None` element.
+        let m = lower_ok(
+            "def main():\n    set[Optional[int64]] s = set[Optional[int64]]()\n    \
+             Optional[int64] k = Optional.Some(5)\n    s.add(k)\n    s.add(None)\n    \
+             print(k in s)\n    print(None in s)\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_set_add_fn"), "text:\n{text}");
+        assert!(text.contains("@zap_set_contains_fn"), "text:\n{text}");
+        assert!(text.contains("funcaddr @$opt$"), "text:\n{text}");
+        assert_eq!(opt_hash_fn_count(&m), 1, "one synthesized Optional hash fn");
+    }
+
+    #[test]
+    fn optional_none_literal_in_key_position_lowers_not_phase1() {
+        // A bare `None` in dict-subscript / membership position must lower against
+        // the Optional key type (not hit the Phase-1 unsupported-expression path).
+        // Each of these used to fail; now they lower cleanly.
+        for src in [
+            "def main():\n    dict[Optional[int64], str] d = {}\n    d[None] = \"x\"\n",
+            "def main():\n    dict[Optional[int64], str] d = {}\n    print(None in d)\n",
+            "def main():\n    set[Optional[int64]] s = set[Optional[int64]]()\n    s.add(None)\n",
+            "def main():\n    set[Optional[int64]] s = set[Optional[int64]]()\n    print(None in s)\n",
+        ] {
+            let errs = lower_errs(src);
+            assert!(errs.is_empty(), "expected clean lowering for:\n{src}\ngot: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn optional_niche_key_hashes_via_isnull() {
+        // A niche-layout Optional (pointer payload, e.g. `Optional[str]`) hashes
+        // its `None` via a null test rather than a discriminant tag.
+        let m = lower_ok(
+            "def main():\n    dict[Optional[str], int64] d = {}\n    \
+             Optional[str] k = Optional.Some(\"hi\")\n    d[k] = 1\n    d[None] = 2\n    \
+             print(d[k])\n    print(d[None])\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("funcaddr @$opt$"), "text:\n{text}");
+        assert!(
+            text.contains("@zap_str_hash"),
+            "a str payload hashes by bytes:\n{text}"
+        );
+        // The synthesized Optional hash fn tests None with `isnull` (niche layout).
+        let hashfn: String = {
+            let t = &text;
+            let start = t.find("func @$opt$").expect("an $opt$ fn");
+            let end = t[start..]
+                .find("\n}\n")
+                .map(|e| start + e)
+                .unwrap_or(t.len());
+            t[start..end].to_string()
+        };
+        assert!(
+            hashfn.contains("isnull"),
+            "niche None test uses isnull:\n{hashfn}"
+        );
+    }
+
+    #[test]
+    fn optional_nested_tuple_payload_key_lowers() {
+        // `Optional[(int64, int64)]` — a Some payload that is itself a tuple —
+        // synthesizes BOTH the Optional key fns and the inner tuple's key fns.
+        let m = lower_ok(
+            "def main():\n    dict[Optional[(int64, int64)], str] d = {}\n    \
+             Optional[(int64, int64)] k = Optional.Some((1, 2))\n    d[k] = \"x\"\n    \
+             d[None] = \"y\"\n    print(d[k])\n    print(d[None])\n",
+        );
+        let text = format!("{m}");
+        assert_eq!(
+            opt_hash_fn_count(&m),
+            1,
+            "one Optional hash fn; text:\n{text}"
+        );
+        assert_eq!(
+            tuple_hash_fn_count(&m),
+            1,
+            "the Some payload's tuple hash fn; text:\n{text}"
+        );
+        assert!(text.contains("funcaddr @$opt$"), "text:\n{text}");
+    }
+
+    #[test]
+    fn optional_unhashable_payload_is_clean_error_not_ice() {
+        // `Optional[float]` as a key is rejected cleanly (floats are unhashable),
+        // never an ICE — the same coded diagnostic as any other unhashable key.
+        let errs = lower_errs(
+            "def main():\n    dict[Optional[float], int64] d = {}\n    \
+             Optional[float] k = Optional.Some(1.5)\n    d[k] = 1\n",
+        );
+        assert!(
+            !errs.is_empty(),
+            "Optional[float] key should be a clean error"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("'f64' element is not hashable")),
+            "expected an unhashable-payload diagnostic, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn optional_key_layout_reuses_one_key_fn_pair() {
+        // Two keys of the same `Optional[int64]` layout share ONE synthesized
+        // hash/eq pair (keyed by the interned instance id), not one per use site.
+        let m = lower_ok(
+            "def main():\n    dict[Optional[int64], str] d = {}\n    \
+             Optional[int64] a = Optional.Some(1)\n    Optional[int64] b = Optional.Some(2)\n    \
+             d[a] = \"a\"\n    d[b] = \"b\"\n    print(d[a])\n    print(d[b])\n",
+        );
+        assert_eq!(
+            opt_hash_fn_count(&m),
+            1,
+            "the shared layout yields one hash fn"
+        );
+    }
+
     #[test]
     fn operator_without_dunder_lowers_to_clean_error() {
         // The ir crate runs without sema; a missing dunder is a clean error.

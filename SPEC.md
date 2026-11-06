@@ -412,7 +412,19 @@ dict key or a set element — `{(1, 2): 7}`, `dict[(int64, str), int64]`, the se
 literal `{(1, 2)}`, and nested tuples — with structural hash/equality over its
 elements (CPython parity). A tuple containing an unhashable element (a `float`, a
 nested `list`/`dict`/`set`, or a struct lacking `__hash__`/`__eq__`) is rejected
-at compile time (`ZAP6001`), never an internal compiler error.
+at compile time (`ZAP6001`), never an internal compiler error. The typed empty
+**collection constructor** takes the same composite element/key types as the
+literal and annotation forms (D-0123): `set[(int64, int64)]()` is accepted, as is
+any valid element type expression; a `heap[(..)]()` of an unordered tuple and a
+`channel[(..)]()` of a value aggregate remain clean coded rejects.
+
+An **`Optional[T]`** (for hashable `T`) is also hashable and usable as a dict key
+or set element (D-0123, CPython parity): `None` and a present value are both
+hashable, `None` compares equal only to another `None`, and a present value
+delegates to `T`'s hash/equality — `dict[Optional[int64], str]` with both a value
+key and a `None` key works, and a bare `None` literal is accepted in key position
+(`d[None]`, `None in d`). An `Optional` of an unhashable `T` (e.g.
+`Optional[float]`) is rejected at compile time (`ZAP6001`), never an ICE.
 
 ### 4.9 Transparent type aliases (D-0105, #606)
 

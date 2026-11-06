@@ -40,9 +40,30 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `__hash__`/`__eq__`) is rejected at compile time with a stable coded diagnostic
   (**ZAP6001**), never an internal compiler error. Previously every one of these
   forms **panicked the compiler** (ICE in `key_fn_args`, a tuple's interned
-  struct id having no name entry). The typed empty set constructor
-  `set[(int64, int64)]()` and `Optional[T]` keys remain pre-existing clean
-  rejections (ZAP6001), unrelated to the tuple-hash mechanism.
+  struct id having no name entry). (The typed empty set constructor
+  `set[(int64, int64)]()` and `Optional[T]` keys — flagged here as follow-ups —
+  are now closed by D-0123, below.)
+- **Composite-element collection constructors, and `Optional[T]` as a dict key /
+  set element** (#703, #704, D-0123; closes the two D-0122 follow-ups). Two
+  completeness items, fixed together — both sema/lowering, reusing the key-fn
+  path, with **no** GC/Immix/object-header/C-runtime change and no grammar
+  change. (A) The typed empty **collection constructors** `set[T]()` /
+  `channel[T]()` / `heap[T]()` now accept any valid element type expression, not
+  just a bare name: `set[(int64, int64)]()` (and nested-tuple / `(int64, str)`
+  elements) work, consistent with the literal `{(1, 2)}` and `dict[(..), ..]`
+  keys; `set[list[int64]]()` is still the clean unhashable reject, and
+  `heap[(..)]()` / `channel[(..)]()` remain clean rejects (a heap is ordered, a
+  channel stores uniform words) rather than the old misleading "expects an
+  element type name". (B) **`Optional[T]`** (for hashable `T`) is now hashable
+  and usable as a dict key / set element with **structural** hash/equality
+  (CPython parity): `dict[Optional[int64], str]` with both a value key and a
+  `None` key works — including the bare `None` literal in key position
+  (`d[None]`, `None in d`, `s.add(None)`) — `None` hashing to a sentinel and
+  comparing equal only to another `None`, a present value delegating to `T`.
+  Tagged and niche Optional layouts and nested payloads (`Optional[(int, int)]`)
+  are handled; an `Optional` of an unhashable `T` (e.g. `Optional[float]`) is a
+  clean `ZAP6001` reject, never an ICE. Previously an Optional key rejected with
+  `ZAP6001 "Phase 1 slice"`.
 - **`spawn` of methods and first-class function values** (#475, D-0118; epic
   #469). `spawn` now accepts three callable forms, closing the gap where the
   grammar and SPEC admitted method/closure spawns but lowering rejected them:

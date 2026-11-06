@@ -5061,13 +5061,14 @@ set literal `{(1, 2)}` panicked the compiler (ICE) in `key_fn_args` — a tuple'
 interned struct id has no `names[]` entry, so the named-struct key path indexed
 out of bounds. Fixed in `crates/ir/src/lower.rs` (`FnLower::tuple_key_fns`).
 
-**Known follow-ups (out of scope, still clean rejects — never ICE):** the
-**typed empty set constructor** `set[(int64, int64)]()` is still rejected
-(`ZAP6001` "expects an element type name") because `set[T]()` / `channel[T]()` /
-`heap[T]()` constructors accept only a bare type *name*, not a tuple type
-subscript; the set **literal** `{(1, 2)}` is fixed here. And `Optional[T]` as a
-key remains a general unimplemented key-op (`ZAP6001` "Phase 1 slice"). Both are
-pre-existing clean diagnostics unrelated to the tuple-hash mechanism.
+**Known follow-ups (now resolved in D-0123):** the **typed empty set
+constructor** `set[(int64, int64)]()` was still rejected (`ZAP6001` "expects an
+element type name") because `set[T]()` / `channel[T]()` / `heap[T]()`
+constructors accepted only a bare type *name*, not a tuple type subscript (the
+set **literal** `{(1, 2)}` was fixed here); and `Optional[T]` as a key was a
+general unimplemented key-op (`ZAP6001` "Phase 1 slice"). Both were pre-existing
+clean diagnostics unrelated to the tuple-hash mechanism, and both are closed by
+**D-0123** (#703, #704).
 
 **Rationale:** multi-value keys are a Python staple (coordinates, composite
 dict keys, memoization argument tuples); supporting them structurally is the
@@ -5075,3 +5076,74 @@ language-first answer and costs nothing at runtime beyond the derive machinery
 tuples already share with value structs. The `@cache` built-in (#666) keys on a
 synthesized named `@derive(Hash, Eq)` key-struct, not a raw tuple, so it is
 unaffected and carries no dependency either way.
+
+## D-0123 — Composite-element collection constructors, and `Optional[T]` as a dict key / set element (I#703, I#704)
+**Status:** Locked — resolves issues #703 and #704; closes the two follow-ups
+noted in D-0122, and extends D-0122 / D-0047 (the `__hash__`/`__eq__` key
+protocol) and D-0064/D-0065 (the `Optional[T]` layout).
+
+Two closely-related completeness items surfaced by the D-0122 (#680) tuple-key
+work, fixed together in one PR. **No** change to the GC / Immix evacuator /
+object header / C runtime; both are sema/lowering, reusing the existing key-fn
+path. `GRAMMAR.ebnf` is **unchanged** — a collection-constructor subscript was
+always `subscript ::= expr` (so a tuple `(int64, int64)` and a generic
+`list[int64]` already parse); the old restriction lived only in lowering.
+
+**Part A — typed empty collection constructors accept any element type
+expression (#703).** `set[T]()` / `channel[T]()` / `heap[T]()` previously read
+the element type as a bare *name*, rejecting a tuple (or any composite) with
+`ZAP6001 "expects an element type name"` — inconsistent with the set literal
+`{(1, 2)}` and `dict[(..), ..]` keys, which already accept tuples (D-0122). The
+constructor element type is now resolved from the same type grammar
+(`expr_to_type` → `resolve_ty`), so it accepts a tuple, a generic application,
+or a bare name uniformly:
+
+- `set[(int64, int64)]()` and `set[((int64, int64), int64)]()` are accepted; a
+  tuple element routes through the synthesized structural key path on `.add` /
+  `in`, exactly like the literal.
+- An unhashable set element (a nested collection, e.g. `set[list[int64]]()`) is
+  still rejected cleanly (`ZAP6001` "unhashable"), now via the same guard as the
+  literal/annotation forms rather than the misleading "expects a name".
+- `heap[(..)]()` stays a clean reject (a heap is ordered; a tuple has no
+  ordering — the same diagnostic the `heap[(..)]` annotation already gives;
+  ordered tuple/struct heap elements are a separate follow-up).
+- `channel[(..)]()` stays a clean reject (a channel stores uniform words; a
+  tuple is a value aggregate whose delivery across the channel ABI is not
+  implemented — unlike a set/dict key, which hashes a tuple through its key
+  functions; tuple channels are a follow-up).
+
+**Part B — `Optional[T]` (for hashable `T`) is hashable: usable as a dict key /
+set element (#704, CPython parity).** `None` and a present value are both
+hashable (`{None: 1, 5: 2}` in Python), so an Optional key routes through the
+function-pointer key path like a tuple:
+
+- **Mechanism — not a workaround.** `Optional[T]` already lowers as a
+  tagged/niche enum value (D-0064); the compiler **synthesizes** a structural
+  `__hash__(o) -> i64` and `__eq__(a, b) -> bool` over that layout (generated
+  once per Optional instance and reused, the same machinery as tuple keys),
+  using the shared `gen_opt_*` constructors for the tagged *and* niche layouts.
+  `__hash__` returns a fixed sentinel for `None` and delegates to `T`'s hash for
+  `Some(x)`; `__eq__` is true iff both are `None`, or both are `Some` with equal
+  payloads — so `None` is never equal to any present value (a hash collision
+  between the sentinel and a payload hash is therefore harmless).
+- A bare **`None` literal** is accepted in key position — `d[None] = v`,
+  `d[None]`, `None in d`, `s.add(None)`, `None in s` — by threading the
+  container's key/element type into that position so the literal lowers to the
+  canonical Optional `None` (extends the #564 `None`-coercion chokepoint) instead
+  of the generic unsupported-expression path.
+- **Hashable `T`** is anything already hashable (integers/bool/char/enum, `str`,
+  `bytes`, and — recursively — tuples / `Optional` / hashable structs). An
+  unhashable `T` (e.g. `Optional[float]`) is rejected at compile time with the
+  same clean coded diagnostic as any other unhashable key (`ZAP6001`), **never**
+  an ICE — mirroring CPython's `TypeError: unhashable type`.
+
+Note the implicit `int → Optional[int]` (`Some`-wrapping) coercion for a plain
+binding/return (`Optional[int64] k = 5`) is a **separate** design question and is
+**not** part of this decision: the idiom is the explicit `Optional.Some(5)`
+(D-0064), which this decision uses throughout. Only key *operations* are in
+scope here.
+
+**Rationale:** both items close the "key/element type" gaps D-0122 explicitly
+flagged, finishing the CPython-parity story for composite and optional keys with
+no runtime cost beyond the derive machinery already shared by tuples and value
+structs.
