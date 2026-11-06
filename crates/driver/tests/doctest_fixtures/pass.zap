@@ -84,6 +84,26 @@ def tier3_enum_render() -> int64:
     return 0
 
 
+def iface_value_render() -> int64:
+    """An interface value renders by dynamic dispatch to the concrete type's
+    renderer in a doctest too (#707, D-0124) — the same `Circle(r=2.0)` form
+    print/str/f-string use on the concrete value.
+
+    ```zap
+    interface Shape:
+        def area(self) -> f64
+    struct Circle:
+        f64 r
+        def area(self) -> f64:
+            return self.r
+    Shape s = Circle(r=2.0)
+    print(s)
+    # => Circle(r=2.0)
+    ```
+    """
+    return 0
+
+
 def undocumented_example() -> int64:
     "Prose only — no fenced block, so this item contributes no doctest."
     return 0

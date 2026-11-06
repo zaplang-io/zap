@@ -403,10 +403,10 @@ mod engine {
         /// than the `<TypeName>` placeholder (I#252). Since the general Display
         /// protocol landed (#274, D-0124) this is every plain struct and every
         /// enum — tier-1 (`EnumName.VARIANT`) and, since #706, tier-3 data-carrying
-        /// (`EnumName.Variant(field=value, …)`) — plus any type with an explicit
-        /// `__str__`/`__repr__`/`@derive(Repr)`. Only an interface value with no
-        /// explicit renderer still falls back to the placeholder (the #707
-        /// follow-up).
+        /// (`EnumName.Variant(field=value, …)`) — every interface value (rendered
+        /// by dynamic dispatch to its concrete type's renderer, #707), plus any
+        /// type with an explicit `__str__`/`__repr__`/`@derive(Repr)`. No user type
+        /// falls back to the placeholder any more.
         displayable: std::collections::HashSet<String>,
         /// Binding names in insertion order (drives the prelude order).
         order: Vec<String>,
@@ -734,11 +734,11 @@ mod engine {
 
         /// How a trailing expression of type `ty` should be auto-printed. A user
         /// type renders through `print(...)` when it is `displayable` — since the
-        /// general Display protocol (#274, D-0124) that is every plain struct and
-        /// every enum (tier-1, and tier-3 data-carrying since #706), plus anything
-        /// with an explicit renderer; only an interface value with no renderer
-        /// still falls back to the `<TypeName>` placeholder (I#252) until the #707
-        /// follow-up.
+        /// general Display protocol (#274, D-0124) that is every plain struct,
+        /// every enum (tier-1, and tier-3 data-carrying since #706), every
+        /// interface value (which renders by dynamic dispatch to its concrete
+        /// type's renderer, #707), plus anything with an explicit renderer. No
+        /// user type falls back to the `<TypeName>` placeholder (I#252) any more.
         fn auto_print_for(&self, ty: &Ty, new_decls: &[DeclInfo]) -> AutoPrint {
             match ty {
                 Ty::Unit | Ty::Unknown => AutoPrint::None,
@@ -820,10 +820,15 @@ mod engine {
                         src: decl_src(e.span, &e.decorators),
                         displayable: Some(true),
                     }),
+                    // An interface value renders by dynamic dispatch to the
+                    // concrete type's renderer through the itable renderer slot
+                    // (#707, D-0124), so a bare interface-typed binding auto-prints
+                    // as the concrete value would (`Circle(r=2.0)`) rather than the
+                    // `<TypeName>` placeholder.
                     Item::Interface(i) => new_decls.push(DeclInfo {
                         name: i.name.clone(),
                         src: decl_src(i.span, &[]),
-                        displayable: None,
+                        displayable: Some(true),
                     }),
                     Item::TypeAlias(a) => new_decls.push(DeclInfo {
                         name: a.name.clone(),

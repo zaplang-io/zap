@@ -42,6 +42,11 @@ fn passing_examples_report_pass_and_exit_zero() {
     assert!(stdout.contains("pass.greet #1"), "stdout: {stdout}");
     assert!(stdout.contains("pass.checked #1"), "stdout: {stdout}");
     assert!(stdout.contains("pass.checked #2"), "stdout: {stdout}");
+    // #707: an interface value renders through a doctest too.
+    assert!(
+        stdout.contains("pass.iface_value_render #1"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]

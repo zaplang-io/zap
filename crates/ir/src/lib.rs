@@ -3754,4 +3754,212 @@ def main():
             "no globals -> no name registrations"
         );
     }
+
+    // ---- #707 / D-0124: interface-value rendering -------------------------
+
+    /// True iff `f` emits a render dispatch over an interface value (either the
+    /// plain `IfaceRender` or, inside a landing-pad scope, `IfaceRenderInvoke`).
+    fn emits_iface_render(f: &Func) -> bool {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::IfaceRender { .. } | Inst::IfaceRenderInvoke { .. }))
+    }
+
+    #[test]
+    fn interface_value_render_dispatches_to_concrete_renderer() {
+        // `print(s)` where `Shape s = Circle(...)` renders via dynamic dispatch
+        // (an IfaceRender over the fat pointer), NOT the static struct_to_str
+        // path — the concrete type is erased. The concrete type's renderer is
+        // synthesized and recorded so codegen can place it in the itable's
+        // renderer slot (#707, D-0124). This replaces the pre-#707 ZAP6001
+        // deferral: lowering must now succeed.
+        let m = lower_ok(
+            r#"interface Shape:
+    def area(self) -> f64
+
+struct Circle:
+    f64 r
+
+    def area(self) -> f64:
+        return self.r
+
+def main():
+    Shape s = Circle(r=2.0)
+    print(s)
+"#,
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            emits_iface_render(main),
+            "print(interface value) must lower to an IfaceRender dispatch, not a \
+             static renderer call or a ZAP6001 deferral"
+        );
+        // The concrete type Circle (struct#0) has a recorded renderer, and that
+        // symbol names a real synthesized function.
+        let sym = m
+            .iface_renderers
+            .get(&0)
+            .expect("Circle's renderer is recorded for the itable renderer slot");
+        assert_eq!(sym, "Circle$repr$default");
+        assert!(
+            m.funcs.iter().any(|f| &f.name == sym),
+            "the recorded renderer '{sym}' must be an emitted function"
+        );
+    }
+
+    #[test]
+    fn interface_value_render_prefers_explicit_dunder() {
+        // An explicit `__str__` on the concrete type still overrides when the
+        // value is rendered through an interface: the renderer slot resolves the
+        // same way a direct render does. The recorded renderer is the dunder, and
+        // NO compiler-default field-wise renderer is synthesized for that type.
+        let m = lower_ok(
+            r#"interface Shape:
+    def area(self) -> f64
+
+struct Circle:
+    f64 r
+
+    def area(self) -> f64:
+        return self.r
+
+    def __str__(self) -> str:
+        return "a circle"
+
+def main():
+    Shape s = Circle(r=2.0)
+    print(s)
+"#,
+        );
+        let sym = m.iface_renderers.get(&0).expect("recorded renderer");
+        assert_eq!(sym, "Circle____str__", "the __str__ override wins");
+        assert!(
+            !m.funcs.iter().any(|f| f.name == "Circle$repr$default"),
+            "no default renderer is synthesized when __str__ overrides"
+        );
+    }
+
+    #[test]
+    fn interface_value_render_reaches_tier3_enum_field_renderer() {
+        // The renderer reached through the interface recurses into every field
+        // type via the one Display protocol — including a tier-3 data-carrying
+        // enum field, which routes to #706's structural tag-dispatch renderer
+        // (`{Enum}$repr$enum`). This is the key integration: #706's renderer is
+        // exercised THROUGH the type-erased interface value.
+        let m = lower_ok(
+            r#"interface Describable:
+    def tag(self) -> str
+
+enum Shape:
+    Dot
+    Box(int w, int h)
+
+struct Widget:
+    str name
+    Shape s
+
+    def tag(self) -> str:
+        return self.name
+
+def main():
+    Describable d = Widget(name="w", s=Shape.Box(w=3, h=4))
+    print(d)
+"#,
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            emits_iface_render(main),
+            "interface value renders via dispatch"
+        );
+        // The struct's default renderer exists and calls the tier-3 enum's
+        // structural renderer for its enum field.
+        let widget = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "Widget$repr$default")
+            .expect("Widget renderer synthesized");
+        assert!(
+            widget
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Call { func, .. } if func == "Shape$repr$enum")),
+            "the interface value's renderer must reach #706's tier-3 enum renderer \
+             for the enum field"
+        );
+    }
+
+    #[test]
+    fn interface_value_render_is_dynamic_across_implementors() {
+        // Two concrete types behind the same interface each get their own
+        // recorded renderer, so the render dispatch is dynamic (like method
+        // dispatch), not resolved to one static symbol.
+        let m = lower_ok(
+            r#"interface Shape:
+    def area(self) -> f64
+
+struct Circle:
+    f64 r
+
+    def area(self) -> f64:
+        return self.r
+
+struct Square:
+    f64 side
+
+    def area(self) -> f64:
+        return self.side
+
+def main():
+    Shape a = Circle(r=2.0)
+    print(a)
+    Shape b = Square(side=3.0)
+    print(b)
+"#,
+        );
+        // struct#0 = Circle, struct#1 = Square; each has a distinct renderer.
+        assert_eq!(
+            m.iface_renderers.get(&0).map(String::as_str),
+            Some("Circle$repr$default")
+        );
+        assert_eq!(
+            m.iface_renderers.get(&1).map(String::as_str),
+            Some("Square$repr$default")
+        );
+    }
+
+    #[test]
+    fn interface_value_render_in_try_uses_invoke_form() {
+        // Inside a `try`, the render dispatch must take the exception-edge form
+        // (`IfaceRenderInvoke`) so a renderer that raises (a user `__str__`, a
+        // `bytes` field decode) transfers to the landing pad, mirroring
+        // IfaceInvoke vs IfaceCall.
+        let m = lower_ok(
+            r#"interface Shape:
+    def area(self) -> f64
+
+struct Circle:
+    f64 r
+
+    def area(self) -> f64:
+        return self.r
+
+def main():
+    Shape s = Circle(r=2.0)
+    try:
+        print(s)
+    except Exception:
+        print("caught")
+"#,
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::IfaceRenderInvoke { .. })),
+            "a render inside a try must use the invoke form"
+        );
+    }
 }

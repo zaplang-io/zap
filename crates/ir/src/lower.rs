@@ -346,6 +346,17 @@ struct StructCtx {
     /// type cannot contain itself, so nested containers resolve to distinct
     /// functions and synthesis terminates.
     synth_container_reprfns: RefCell<HashMap<String, String>>,
+    /// Display-protocol renderer per concrete type used behind an interface
+    /// (#707, D-0124), keyed by `concrete_sid`: the symbol of the function that
+    /// renders a value of that type to a `str`. Populated at each concrete->
+    /// interface coercion (where [`Inst::IfaceMake`] is emitted) by synthesizing
+    /// the concrete type's renderer via [`FnLower::struct_repr_fn`] — the same
+    /// resolution a direct render uses (`__str__`/`__repr__`/`@derive(Repr)`, the
+    /// tier-3-enum structural form, or the default field-wise form). Drained into
+    /// [`zir::ir::Module::iface_renderers`] so codegen can append the renderer as
+    /// the itable's renderer slot, letting [`Inst::IfaceRender`] dispatch to the
+    /// concrete type's renderer through a type-erased interface value.
+    iface_renderers: RefCell<HashMap<u32, String>>,
     /// Generator-expression iterators (#596), keyed by their tuple-interned
     /// state-struct id. Populated on demand while lowering a `(x for x in xs)`;
     /// the iteration protocol hooks consult it so a genexpr value flows through
@@ -1236,6 +1247,7 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
         synth_keyfns: RefCell::new(HashMap::new()),
         synth_reprfns: RefCell::new(HashMap::new()),
         synth_container_reprfns: RefCell::new(HashMap::new()),
+        iface_renderers: RefCell::new(HashMap::new()),
         packed_layouts,
         field_defaults,
         call_params: HashMap::new(),
@@ -1704,6 +1716,11 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
 
     // Materialize the interned first-class function-value signatures (I#163).
     out.fn_sigs = std::mem::take(&mut ctx.fn_sigs.borrow_mut().sigs);
+
+    // Hand codegen the per-concrete-type Display renderers recorded at each
+    // concrete->interface coercion (#707, D-0124), so it can place each one in the
+    // renderer slot of that type's itable for `Inst::IfaceRender` dispatch.
+    out.iface_renderers = std::mem::take(&mut ctx.iface_renderers.borrow_mut());
 
     (out, errors)
 }
@@ -6475,11 +6492,19 @@ impl<'a> FnLower<'a> {
             // `str(point)` / `f"{point}"` work, not just `print(point)` — closing
             // the pre-#274 asymmetry where only `print` reached the struct path.
             // `Optional[T]` (also a `Ty::Struct`) was already handled above; a
-            // tuple, tier-3 enum, or interface value routes through here too and
-            // is dispatched / cleanly rejected by `struct_to_str`. The struct's
+            // tuple or tier-3 enum routes through `struct_to_str`. An interface
+            // value (its synthetic `{data, itable}` fat struct) renders by
+            // **dynamic dispatch** to the concrete type's renderer through the
+            // itable's renderer slot (#707, D-0124), since its concrete type is
+            // erased — not through the static `struct_to_str`. The struct's
             // renderer always quotes its own fields, so the ambient `mode` does
             // not matter here.
-            Ty::Struct(sid) => return self.struct_to_str(sid, v),
+            Ty::Struct(sid) => {
+                if let Some(iid) = self.ctx.iid_of_fat_sid(sid) {
+                    return self.render_iface_value(v, iid);
+                }
+                return self.struct_to_str(sid, v);
+            }
             // A tier-1 enum (D-0018): the qualified canonical variant name,
             // `EnumName.VARIANT`, reusing the `.name` discriminant→name chain. An
             // unknown discriminant raises, exactly as `.name` does.
@@ -16087,6 +16112,32 @@ impl<'a> FnLower<'a> {
         Ok(d)
     }
 
+    /// Render an **interface value** `v` of interface `iid` (#707, D-0124). The
+    /// concrete type behind the fat pointer is erased at this site, so rendering
+    /// cannot resolve a static renderer symbol the way [`Self::struct_to_str`]
+    /// does; it emits an [`Inst::IfaceRender`] that dynamically dispatches through
+    /// the itable's renderer slot to the concrete type's own renderer (recorded in
+    /// [`StructCtx::iface_renderers`] at each concrete->interface coercion). The
+    /// renderer may raise (a user `__str__`, or a `bytes` field decode), so it
+    /// routes through the active landing pad exactly like [`Self::throwing_call`]:
+    /// the [`Inst::IfaceRenderInvoke`] form inside a `try`, the plain
+    /// [`Inst::IfaceRender`] otherwise. Always yields a `str`.
+    fn render_iface_value(&mut self, iface: Value, iid: u32) -> Result<Value, LowerError> {
+        let dest = self.new_value(Ty::Ptr);
+        if let Some(&lp) = self.landing_pads.last() {
+            self.used_lps.insert(lp);
+            self.emit(Inst::IfaceRenderInvoke {
+                dest,
+                iface,
+                iid,
+                unwind: lp,
+            });
+        } else {
+            self.emit(Inst::IfaceRender { dest, iface, iid });
+        }
+        Ok(dest)
+    }
+
     /// Resolve the symbol name of the function that renders a value of struct id
     /// `sid` to a string, synthesizing the compiler default on demand (#274,
     /// D-0124). Resolution order (first match wins), so an explicit override
@@ -16138,15 +16189,20 @@ impl<'a> FnLower<'a> {
             self.ctx.generated.borrow_mut().push(b.func);
             return Ok(name);
         }
-        // An interface value's synthetic `{data, itable}` fat struct: rendering it
-        // needs dynamic dispatch to the concrete type's renderer (a vtable slot) —
-        // deferred to the #274 follow-up.
+        // An interface value's synthetic `{data, itable}` fat struct has no static
+        // renderer: its concrete type is erased, so it renders by **dynamic
+        // dispatch** through the itable's renderer slot (#707, D-0124), which
+        // [`FnLower::render_value`] emits as an [`Inst::IfaceRender`] *before*
+        // reaching `struct_to_str`/here. Reaching this branch therefore means a fat
+        // struct was handed to the static-renderer path directly — not a render
+        // site — so it stays a clean coded error (never an ICE or a nonsense render
+        // over the synthetic `$data`/`$itable` slots) rather than a reachable
+        // user-facing limitation.
         if self.ctx.fat_to_iid.contains_key(&sid) {
             return Err(err(format!(
-                "cannot yet render an interface value ('{}'): the general \
-                 rendering protocol does not dynamically dispatch to the concrete \
-                 type's renderer yet (#274 follow-up); bind it to a concrete type \
-                 or define '__str__' (D-0124)",
+                "internal: interface value ('{}') reached the static renderer path; \
+                 an interface value renders via dynamic dispatch (Inst::IfaceRender), \
+                 not a static renderer symbol (#707, D-0124)",
                 self.ctx.names[sid as usize]
             )));
         }
@@ -17476,6 +17532,23 @@ impl<'a> FnLower<'a> {
                             iid,
                             concrete_sid: from_sid,
                         });
+                        // Synthesize and record the concrete type's Display
+                        // renderer (#707, D-0124) so codegen can place it in the
+                        // renderer slot of this `(concrete, iid)` itable — letting
+                        // `print`/`str`/f-string on the resulting interface value
+                        // dynamically dispatch to the concrete type's renderer
+                        // (`Circle(r=2.0)`, a tier-3 enum's structural form, …).
+                        // Synthesis is memoized, so repeated coercions of the same
+                        // concrete type are free. A renderer that cannot be built
+                        // (an unrenderable field type — not reachable for the field
+                        // types D-0124 supports) simply records nothing, leaving a
+                        // null renderer slot rather than failing construction, so an
+                        // interface used only for method dispatch is never regressed.
+                        if !self.ctx.iface_renderers.borrow().contains_key(&from_sid) {
+                            if let Ok(sym) = self.struct_repr_fn(from_sid) {
+                                self.ctx.iface_renderers.borrow_mut().insert(from_sid, sym);
+                            }
+                        }
                         return dest;
                     }
                 }

@@ -3699,9 +3699,10 @@ impl Checker {
     /// `f"{d.get(k)}"`); or — since the general Display protocol landed (#274,
     /// D-0124) — a **user struct/enum** (`Named`), a **tuple**, or a
     /// **`list`/`dict`/`set`**, which the lowerer renders via
-    /// `__str__`/`__repr__`/`@derive(Repr)`, the default field-wise form, or the
-    /// Python container form. The lowerer still cleanly rejects the one deferred
-    /// case (an interface value with no renderer, the #707 follow-up).
+    /// `__str__`/`__repr__`/`@derive(Repr)`, the tier-3-enum structural form
+    /// (#706), or the default field-wise / Python container form. An interface
+    /// value (also `Named`) renders by dynamic dispatch to its concrete type's
+    /// renderer (#707).
     fn check_renderable(&mut self, ty: &Ty, span: Span) {
         // `Optional[T]` is the prelude generic enum (I#154); sema tracks it
         // opaquely as `Named("Optional")` without its payload type, so the
@@ -5266,9 +5267,11 @@ impl Checker {
                         // at runtime. A user struct/enum (`Named`), a tuple, and a
                         // `list`/`dict`/`set` all render through the general
                         // Display protocol (#274, D-0124): the lowerer picks
-                        // `__str__`/`__repr__`/`@derive(Repr)` or the default
-                        // field-wise / container form, and cleanly rejects the few
-                        // still-deferred cases (tier-3 enum, interface value).
+                        // `__str__`/`__repr__`/`@derive(Repr)`, the tier-3-enum
+                        // structural form (#706), or the default field-wise /
+                        // container form. An interface value (also `Named`) renders
+                        // by dynamic dispatch to its concrete type's renderer
+                        // (#707).
                         if !matches!(
                             at,
                             Ty::Str
@@ -9479,6 +9482,27 @@ def main():
     print(str(t))
     print(f"{t}")
     print((Point(x=1, y=2), 3))
+"#);
+    }
+
+    #[test]
+    fn interface_value_renders_in_str_and_fstring() {
+        // #707 (D-0124): an interface value is `Ty::Named(iface)`, so it already
+        // type-checks for print/str/f-string here; the lowerer renders it by
+        // dynamic dispatch to the concrete type's renderer (an `IfaceRender`),
+        // rather than the pre-#707 ZAP6001 deferral.
+        ok(r#"
+interface Shape:
+    def area(self) -> f64
+struct Circle:
+    f64 r
+    def area(self) -> f64:
+        return self.r
+def main():
+    Shape s = Circle(r=2.0)
+    print(s)
+    print(str(s))
+    print(f"[{s}]")
 "#);
     }
 

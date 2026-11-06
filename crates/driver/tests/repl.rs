@@ -213,6 +213,18 @@ fn tier3_enum_payload_free_variant_auto_renders() {
     assert!(stdout.contains("Shape.Unit"), "stdout: {stdout:?}");
 }
 
+#[test]
+fn interface_value_auto_renders_concrete_type() {
+    // A bare interface-typed binding auto-prints by dynamic dispatch to the
+    // concrete type's renderer (#707, D-0124): `Shape s = Circle(r=2.0)` renders
+    // `Circle(r=2.0)`, not the old `<Shape>` placeholder.
+    let script = "interface Shape:\n    def area(self) -> f64\n\nstruct Circle:\n    f64 r\n\n    def area(self) -> f64:\n        return self.r\n\nShape s = Circle(r=2.0)\ns\n";
+    let (stdout, stderr, code) = repl(script);
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert!(stdout.contains("Circle(r=2.0)"), "stdout: {stdout:?}");
+    assert!(!stdout.contains("<Shape>"), "stdout: {stdout:?}");
+}
+
 // ---------------------------------------------------------------------------
 // I#252: line editing degrades cleanly under piped (non-interactive) stdin
 // ---------------------------------------------------------------------------

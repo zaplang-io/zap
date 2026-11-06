@@ -454,7 +454,9 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | IfaceMake { dest, .. }
         | AtomicLoad { dest, .. }
         | AtomicRmw { dest, .. }
-        | AtomicCas { dest, .. } => Some(*dest),
+        | AtomicCas { dest, .. }
+        | IfaceRender { dest, .. }
+        | IfaceRenderInvoke { dest, .. } => Some(*dest),
         Call { dest, .. }
         | Invoke { dest, .. }
         | CallClosure { dest, .. }
@@ -510,8 +512,15 @@ struct Cg<'a, 'ctx> {
     /// Carries each interface's method slots (names + signatures) for building
     /// itables and dynamic-dispatch call types.
     interfaces: Vec<zir::ir::InterfaceLayout>,
+    /// Display-protocol renderer per concrete type used behind an interface
+    /// (#707, D-0124), cloned from the ZIR module: `concrete_sid` -> the symbol of
+    /// its renderer function. Appended as the itable's *renderer slot* (past the
+    /// method slots) so an `Inst::IfaceRender` dispatches to the concrete type's
+    /// renderer through a type-erased interface value.
+    iface_renderers: std::collections::HashMap<u32, String>,
     /// Cache of interface dispatch tables: `(concrete_sid, iid)` -> the static
-    /// `[N x ptr]` itable global, built once per implementing pair.
+    /// `[N+1 x ptr]` itable global (N method slots + one renderer slot, #707),
+    /// built once per implementing pair.
     itables: std::cell::RefCell<std::collections::HashMap<(u32, u32), PointerValue<'ctx>>>,
     /// The C++ exception personality routine's symbol name (ticket #197, Area A3,
     /// design/0019). The runtime's `landingpad`s name it and the backend lowers
@@ -597,6 +606,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             entry_block: None,
             struct_names: Vec::new(),
             interfaces: Vec::new(),
+            iface_renderers: std::collections::HashMap::new(),
             itables: std::cell::RefCell::new(std::collections::HashMap::new()),
             // Pick the exception personality by target (ticket #197, A3). Codegen
             // emits for the host triple only, so "windows" here means the Zap
@@ -1354,6 +1364,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // Interface metadata (D-0016) for fat-pointer construction and dynamic
         // dispatch (`Inst::IfaceMake` / `IfaceCall` / `IfaceInvoke`).
         self.interfaces = m.interfaces.clone();
+        // Per-concrete-type Display renderers for interface-value rendering
+        // (#707, D-0124): `Inst::IfaceRender` dispatches through the itable's
+        // renderer slot, which `itable_global` fills from this map.
+        self.iface_renderers = m.iface_renderers.clone();
 
         // Emit a GC type descriptor per struct (ticket #48): kind PRECISE with
         // the byte offsets of the pointer fields, computed from the struct's
@@ -3304,14 +3318,58 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     }
                 }
             }
+            Inst::IfaceRender { dest, iface, iid } => {
+                // Render an interface value (#707, D-0124): load the renderer slot
+                // from the itable and call the concrete type's renderer with `data`
+                // as `self`, yielding a `str`.
+                let (callee, fnty, selfp) = self.iface_render_dispatch(get(vals, *iface), *iid)?;
+                let md: Vec<BasicMetadataValueEnum> = vec![selfp.into()];
+                let cs = b
+                    .build_indirect_call(fnty, callee, &md, "ifacerender")
+                    .map_err(|e| e.to_string())?;
+                if let Some(v) = cs.try_as_basic_value().left() {
+                    vals[*dest as usize] = Some(v);
+                }
+            }
+            Inst::IfaceRenderInvoke {
+                dest,
+                iface,
+                iid,
+                unwind,
+            } => {
+                // The exception-edge form of `IfaceRender`: the concrete renderer
+                // may raise (a user `__str__`, a `bytes` field decode), so dispatch
+                // through an `invoke` to the active landing pad.
+                let (callee, fnty, selfp) = self.iface_render_dispatch(get(vals, *iface), *iid)?;
+                let cont = self.ctx.append_basic_block(fv, "ifacerenderinvoke.cont");
+                let cs = b
+                    .build_indirect_invoke(
+                        fnty,
+                        callee,
+                        &[selfp],
+                        cont,
+                        blocks[*unwind as usize],
+                        "ifacerenderinvoke",
+                    )
+                    .map_err(|e| e.to_string())?;
+                b.position_at_end(cont);
+                if let Some(v) = cs.try_as_basic_value().left() {
+                    vals[*dest as usize] = Some(v);
+                }
+            }
         }
         Ok(())
     }
 
     /// The static interface dispatch table for the `(concrete_sid, iid)` pair
-    /// (D-0016): a constant `[N x ptr]` global whose slot *k* is the address of
-    /// the implementor's `Struct__<method_k>`, in interface declaration order.
-    /// Built once per pair and cached.
+    /// (D-0016, extended by #707): a constant `[N+1 x ptr]` global whose slot *k*
+    /// (`k < N`) is the address of the implementor's `Struct__<method_k>` in
+    /// interface declaration order, and whose final slot *N* is the concrete
+    /// type's **Display renderer** (#707, D-0124) — the function
+    /// `self.iface_renderers[concrete_sid]` that `Inst::IfaceRender` dispatches to
+    /// when a type-erased interface value is rendered. A concrete type with no
+    /// recorded renderer (not reachable for the field types D-0124 supports) gets
+    /// a null renderer slot. Built once per pair and cached.
     fn itable_global(&self, concrete_sid: u32, iid: u32) -> Result<PointerValue<'ctx>, String> {
         if let Some(g) = self.itables.borrow().get(&(concrete_sid, iid)) {
             return Ok(*g);
@@ -3319,7 +3377,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let iface = &self.interfaces[iid as usize];
         let concrete = &self.struct_names[concrete_sid as usize];
         let p = self.ctx.ptr_type(AddressSpace::default());
-        let mut slots: Vec<PointerValue<'ctx>> = Vec::with_capacity(iface.methods.len());
+        let mut slots: Vec<PointerValue<'ctx>> = Vec::with_capacity(iface.methods.len() + 1);
         for m in &iface.methods {
             let mangled = format!("{concrete}__{}", m.name);
             let fv = *self.fns.get(&mangled).ok_or_else(|| {
@@ -3330,6 +3388,20 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             })?;
             slots.push(fv.as_global_value().as_pointer_value());
         }
+        // Renderer slot (#707, D-0124): the concrete type's Display renderer, or a
+        // null pointer when none was synthesized (an unrenderable concrete type —
+        // not reachable through the field types D-0124 supports; a render of such
+        // an interface value would be the documented gap, never a miscompile of
+        // method dispatch).
+        let renderer = match self.iface_renderers.get(&concrete_sid) {
+            Some(sym) => self
+                .fns
+                .get(sym)
+                .map(|fv| fv.as_global_value().as_pointer_value())
+                .unwrap_or_else(|| p.const_null()),
+            None => p.const_null(),
+        };
+        slots.push(renderer);
         let arr = p.const_array(&slots);
         let g = self.module.add_global(
             arr.get_type(),
@@ -3383,8 +3455,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             .build_load(p, itable_slot, "iface.vtbl")
             .map_err(|e| e.to_string())?
             .into_pointer_value();
-        // Load slot `method` of the itable (`[N x ptr]`).
-        let arr_ty = p.array_type(iface.methods.len() as u32);
+        // Load slot `method` of the itable (`[N+1 x ptr]`: N method slots + the
+        // #707 renderer slot).
+        let arr_ty = p.array_type(iface.methods.len() as u32 + 1);
         let fn_slot = unsafe {
             b.build_in_bounds_gep(
                 arr_ty,
@@ -3425,6 +3498,70 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             argvals.push(v);
         }
         Ok((callee, fnty, argvals))
+    }
+
+    /// Resolve the Display-protocol render dispatch through an interface value
+    /// (#707, D-0124): load the **renderer slot** — the slot past the `N` method
+    /// slots — from the fat pointer's itable and its `data` word (the `self`
+    /// receiver). Returns `(callee_ptr, fn_type, self)` ready for an indirect
+    /// call/invoke; the renderer's LLVM type is `(ptr self) -> ptr`, matching the
+    /// synthesized per-type renderer function (whose `self` is a reference-struct
+    /// pointer, exactly as a dispatched method's `self` is). The counterpart of
+    /// [`Self::iface_dispatch`] for the type-erased render path.
+    fn iface_render_dispatch(
+        &self,
+        iface_val: BasicValueEnum<'ctx>,
+        iid: u32,
+    ) -> Result<
+        (
+            PointerValue<'ctx>,
+            inkwell::types::FunctionType<'ctx>,
+            BasicValueEnum<'ctx>,
+        ),
+        String,
+    > {
+        let b = self.builder;
+        let p = self.ctx.ptr_type(AddressSpace::default());
+        let iface = &self.interfaces[iid as usize];
+        let fat_ty = self.structs[iface.fat_sid as usize];
+        let base = iface_val.into_pointer_value();
+        // Load `data` (field 0) and `itable` (field 1) from the fat pointer.
+        let data_slot = b
+            .build_struct_gep(fat_ty, base, 0, "iface.data")
+            .map_err(|e| e.to_string())?;
+        let data = b
+            .build_load(p, data_slot, "iface.self")
+            .map_err(|e| e.to_string())?;
+        let itable_slot = b
+            .build_struct_gep(fat_ty, base, 1, "iface.itable")
+            .map_err(|e| e.to_string())?;
+        let itable = b
+            .build_load(p, itable_slot, "iface.vtbl")
+            .map_err(|e| e.to_string())?
+            .into_pointer_value();
+        // The renderer slot is the last slot of the `[N+1 x ptr]` itable, index N.
+        let arr_ty = p.array_type(iface.methods.len() as u32 + 1);
+        let fn_slot = unsafe {
+            b.build_in_bounds_gep(
+                arr_ty,
+                itable,
+                &[
+                    self.ctx.i32_type().const_zero(),
+                    self.ctx
+                        .i32_type()
+                        .const_int(iface.methods.len() as u64, false),
+                ],
+                "iface.render.slot",
+            )
+            .map_err(|e| e.to_string())?
+        };
+        let callee = b
+            .build_load(p, fn_slot, "iface.render.fn")
+            .map_err(|e| e.to_string())?
+            .into_pointer_value();
+        // The renderer's type is `(ptr self) -> ptr str`.
+        let fnty = p.fn_type(&[p.into()], false);
+        Ok((callee, fnty, data))
     }
 
     /// Build (once per target function) the spawn trampoline `ptr @__zap_thunk_F(ptr env)`
