@@ -311,6 +311,16 @@ struct StructCtx {
     /// it as the coroutine body (its catch-all pad routes a child failure to the
     /// scope, exactly as for a named spawn).
     spawn_thunks: RefCell<HashMap<u32, String>>,
+    /// Synthesized tuple key functions (#680), keyed by the tuple's interned
+    /// struct id: the `(__hash__, __eq__)` symbol names of the structural
+    /// hash/equality functions generated on demand the first time a tuple is used
+    /// as a dict key or set element. Tuples already lower as value-struct
+    /// aggregates and value-struct keys already route through the fn-key path, so
+    /// a tuple key is just an anonymous `@derive(Hash, Eq)` struct: its hash folds
+    /// the per-element hashes with `zap_hash_combine` and its eq ANDs the per-element
+    /// comparisons, element-for-element over the interned layout. Generated once
+    /// per tuple id and reused, exactly like [`Self::spawn_thunks`].
+    tuple_keyfns: RefCell<HashMap<u32, (String, String)>>,
     /// Generator-expression iterators (#596), keyed by their tuple-interned
     /// state-struct id. Populated on demand while lowering a `(x for x in xs)`;
     /// the iteration protocol hooks consult it so a genexpr value flows through
@@ -1198,6 +1208,7 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
         captureless_env: RefCell::new(None),
         fnval_wrappers: RefCell::new(HashMap::new()),
         spawn_thunks: RefCell::new(HashMap::new()),
+        tuple_keyfns: RefCell::new(HashMap::new()),
         packed_layouts,
         field_defaults,
         call_params: HashMap::new(),
@@ -15025,21 +15036,32 @@ impl<'a> FnLower<'a> {
         let Elem::Struct(sid) = elem else {
             return Ok(vec![]);
         };
-        let name = self.ctx.names[sid as usize].clone();
-        let hashn = format!("{name}__{}", "__hash__");
-        let eqn = format!("{name}__{}", "__eq__");
-        if !self.sigs.contains_key(&hashn) {
-            return Err(err(format!(
-                "type '{name}' needs '__hash__' to be a dict/set key \
-                 (use @derive(Hash) or define it; D-0047)"
-            )));
-        }
-        if !self.sigs.contains_key(&eqn) {
-            return Err(err(format!(
-                "type '{name}' needs '__eq__' to be a dict/set key \
-                 (use @derive(Eq) or define it; D-0047)"
-            )));
-        }
+        // A tuple key (#680, D-0049): tuples intern as struct ids at or past
+        // `TupleInterner.base` (= `names.len()`), so they have no `ctx.names`
+        // entry — indexing `names[sid]` here was the ICE. A tuple is hashable
+        // exactly when all its elements are (CPython parity), so synthesize its
+        // structural `__hash__`/`__eq__` on demand and route it through the same
+        // function-pointer key path as a named `@derive(Hash, Eq)` struct.
+        let (hashn, eqn) = if self.ctx.tuples.borrow().is_tuple(sid) {
+            self.tuple_key_fns(sid)?
+        } else {
+            let name = self.ctx.names[sid as usize].clone();
+            let hashn = format!("{name}__{}", "__hash__");
+            let eqn = format!("{name}__{}", "__eq__");
+            if !self.sigs.contains_key(&hashn) {
+                return Err(err(format!(
+                    "type '{name}' needs '__hash__' to be a dict/set key \
+                     (use @derive(Hash) or define it; D-0047)"
+                )));
+            }
+            if !self.sigs.contains_key(&eqn) {
+                return Err(err(format!(
+                    "type '{name}' needs '__eq__' to be a dict/set key \
+                     (use @derive(Eq) or define it; D-0047)"
+                )));
+            }
+            (hashn, eqn)
+        };
         let hv = self.new_value(Ty::Ptr);
         self.emit(Inst::FuncAddr {
             dest: hv,
@@ -15051,6 +15073,230 @@ impl<'a> FnLower<'a> {
             func: eqn,
         });
         Ok(vec![hv, ev])
+    }
+
+    /// Synthesize (once per tuple id, #680 / D-0049) the structural `__hash__`
+    /// and `__eq__` for a tuple used as a dict key or set element, returning
+    /// their symbol names. A tuple is an anonymous value-struct aggregate, so this
+    /// mirrors `@derive(Hash, Eq)` over the interned element layout. The
+    /// `__hash__(t) -> i64` seeds `0` and folds each element's hash in with
+    /// `zap_hash_combine` — `zap_i64_hash` for integer/bool/char/enum words,
+    /// `zap_str_hash` for `str`/`bytes`, and the element's own `__hash__` for a
+    /// nested tuple or hashable struct — while `__eq__(a, b) -> i1` ANDs the
+    /// per-element comparisons element-for-element.
+    ///
+    /// A tuple is hashable exactly when every element is (CPython parity); an
+    /// unhashable element (float, a nested collection, or a struct lacking
+    /// `__hash__`/`__eq__`) is rejected with a clean coded diagnostic — never an
+    /// ICE. The generated functions are appended to [`StructCtx::generated`] and
+    /// referenced by `Inst::FuncAddr`, like the named-struct key path; they need
+    /// no signature registration (they are only ever called indirectly by the
+    /// collection runtime). Reused across every key use of the same tuple layout.
+    fn tuple_key_fns(&mut self, sid: u32) -> Result<(String, String), LowerError> {
+        if let Some(pair) = self.ctx.tuple_keyfns.borrow().get(&sid) {
+            return Ok(pair.clone());
+        }
+        let fields = self
+            .ctx
+            .tuples
+            .borrow()
+            .fields(sid)
+            .expect("tuple_key_fns called on a non-tuple struct id");
+        // Resolve each element's per-element key handling first, so an unhashable
+        // element fails cleanly before any function is emitted. For a nested
+        // aggregate element this recurses to generate that element's key
+        // functions; for a named struct it requires derived/defined dunders.
+        enum ElemKey {
+            /// Integer-word element (bool/char/int/enum): hash via `zap_i64_hash`,
+            /// compare with `ICmp Eq`.
+            Int,
+            /// Reference byte-buffer element (`str`/`bytes`): hash via
+            /// `zap_str_hash`, compare with `zap_str_eq`.
+            Str,
+            /// A nested hashable struct / tuple: call its `(__hash__, __eq__)`.
+            Struct(String, String),
+        }
+        let mut plan: Vec<ElemKey> = Vec::with_capacity(fields.len());
+        for fty in &fields {
+            let key = match *fty {
+                Ty::Ptr | Ty::Bytes => ElemKey::Str,
+                t if t.int_width().is_some() => ElemKey::Int,
+                Ty::Struct(csid) => {
+                    if self.ctx.tuples.borrow().is_tuple(csid) {
+                        let (ch, ce) = self.tuple_key_fns(csid)?;
+                        ElemKey::Struct(ch, ce)
+                    } else {
+                        let name = self.ctx.names[csid as usize].clone();
+                        let ch = format!("{name}____hash__");
+                        let ce = format!("{name}____eq__");
+                        if !self.sigs.contains_key(&ch) || !self.sigs.contains_key(&ce) {
+                            return Err(err(format!(
+                                "a tuple with a '{name}' element cannot be a dict key or \
+                                 set element: '{name}' needs '__hash__' and '__eq__' \
+                                 (use @derive(Hash, Eq) or define them; D-0047, D-0049)"
+                            )));
+                        }
+                        ElemKey::Struct(ch, ce)
+                    }
+                }
+                other => {
+                    return Err(err(format!(
+                        "a tuple with a '{other}' element is not hashable and cannot be a \
+                         dict key or set element (only integers, bools, char, enums, str, \
+                         bytes, and tuples/structs of those; D-0049)"
+                    )));
+                }
+            };
+            plan.push(key);
+        }
+
+        let hashn = format!("$tuple${sid}$hash");
+        let eqn = format!("$tuple${sid}$eq");
+
+        // __hash__(tuple) -> i64: fold per-element hashes, like gen_hash_method.
+        {
+            let mut b = FnLower::new(
+                hashn.clone(),
+                vec![Ty::Struct(sid)],
+                Ty::I64,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            let mut acc = b.iconst(Ty::I64, 0);
+            for (idx, (fty, key)) in fields.iter().zip(&plan).enumerate() {
+                let fv = b.new_value(*fty);
+                b.emit(Inst::FieldGet {
+                    dest: fv,
+                    base: 0,
+                    sid,
+                    idx: idx as u32,
+                });
+                let h = match key {
+                    ElemKey::Str => {
+                        let d = b.new_value(Ty::I64);
+                        b.emit(Inst::Call {
+                            dest: Some(d),
+                            func: "zap_str_hash".to_string(),
+                            args: vec![fv],
+                        });
+                        d
+                    }
+                    ElemKey::Int => {
+                        let i = b.coerce(fv, *fty, Ty::I64);
+                        let d = b.new_value(Ty::I64);
+                        b.emit(Inst::Call {
+                            dest: Some(d),
+                            func: "zap_i64_hash".to_string(),
+                            args: vec![i],
+                        });
+                        d
+                    }
+                    ElemKey::Struct(ch, _) => {
+                        let d = b.new_value(Ty::I64);
+                        b.emit(Inst::Call {
+                            dest: Some(d),
+                            func: ch.clone(),
+                            args: vec![fv],
+                        });
+                        d
+                    }
+                };
+                let next = b.new_value(Ty::I64);
+                b.emit(Inst::Call {
+                    dest: Some(next),
+                    func: "zap_hash_combine".to_string(),
+                    args: vec![acc, h],
+                });
+                acc = next;
+            }
+            b.set_term(Term::Ret(Some(acc)));
+            self.ctx.generated.borrow_mut().push(b.func);
+        }
+
+        // __eq__(a, b) -> i1: AND the per-element comparisons, like gen_eq_method.
+        {
+            let mut b = FnLower::new(
+                eqn.clone(),
+                vec![Ty::Struct(sid), Ty::Struct(sid)],
+                Ty::I1,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            let mut acc = b.iconst(Ty::I1, 1);
+            for (idx, (fty, key)) in fields.iter().zip(&plan).enumerate() {
+                let idx = idx as u32;
+                let a = b.new_value(*fty);
+                b.emit(Inst::FieldGet {
+                    dest: a,
+                    base: 0,
+                    sid,
+                    idx,
+                });
+                let c = b.new_value(*fty);
+                b.emit(Inst::FieldGet {
+                    dest: c,
+                    base: 1,
+                    sid,
+                    idx,
+                });
+                let bit = match key {
+                    ElemKey::Str => {
+                        let word = b.new_value(Ty::I64);
+                        b.emit(Inst::Call {
+                            dest: Some(word),
+                            func: "zap_str_eq".to_string(),
+                            args: vec![a, c],
+                        });
+                        let zero = b.iconst(Ty::I64, 0);
+                        let bit = b.new_value(Ty::I1);
+                        b.emit(Inst::ICmp {
+                            dest: bit,
+                            pred: CmpPred::Ne,
+                            lhs: word,
+                            rhs: zero,
+                        });
+                        bit
+                    }
+                    ElemKey::Int => {
+                        let bit = b.new_value(Ty::I1);
+                        b.emit(Inst::ICmp {
+                            dest: bit,
+                            pred: CmpPred::Eq,
+                            lhs: a,
+                            rhs: c,
+                        });
+                        bit
+                    }
+                    ElemKey::Struct(_, ce) => {
+                        let bit = b.new_value(Ty::I1);
+                        b.emit(Inst::Call {
+                            dest: Some(bit),
+                            func: ce.clone(),
+                            args: vec![a, c],
+                        });
+                        bit
+                    }
+                };
+                let next = b.new_value(Ty::I1);
+                b.emit(Inst::Bin {
+                    dest: next,
+                    op: BinOp::And,
+                    lhs: acc,
+                    rhs: bit,
+                });
+                acc = next;
+            }
+            b.set_term(Term::Ret(Some(acc)));
+            self.ctx.generated.borrow_mut().push(b.func);
+        }
+
+        let pair = (hashn, eqn);
+        self.ctx.tuple_keyfns.borrow_mut().insert(sid, pair.clone());
+        Ok(pair)
     }
 
     /// Render a struct value to a string via its `__str__` (preferred) or

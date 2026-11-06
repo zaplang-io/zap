@@ -5026,3 +5026,52 @@ failure to point at; the aarch64 stress goldens re-enabled in the same change
 (#698, see CHANGELOG) exercise the preempt/netpoller paths this touches on real
 aarch64 CI. Relates to D-0120 (the STW-guard flag), D-0117 (the root-safety
 invariant `M.preempt`'s RELAXED order leans on), and the platform epic #158.
+
+## D-0122 — Tuples are hashable: usable as dict keys and set elements (I#680)
+**Status:** Locked — resolves issue #680; refines D-0049 (tuple semantics) and
+D-0047 (the `__hash__`/`__eq__` dict/set key protocol)
+A **tuple of hashable elements is itself hashable** and may be used as a dict key
+or a set element, with **structural** hashing and equality over its elements —
+CPython parity (`hash((1, 2))` is defined; `d[(1, 2)]` works). This is a pure
+semantics decision: no new syntax (tuple types `(int64, str)` and literals
+`(1, 2)` already exist per D-0049), so `GRAMMAR.ebnf` is unchanged.
+
+- **Mechanism — not a workaround.** A tuple already lowers as an anonymous
+  value-struct aggregate (D-0049), and value-struct keys already route through
+  the function-pointer key path with a per-type `__hash__`/`__eq__` (D-0047). A
+  tuple key reuses that path: the compiler **synthesizes** a structural
+  `__hash__(t) -> i64` (seed `0`, each element's hash folded in with
+  `zap_hash_combine`) and `__eq__(a, b) -> bool` (per-element `and`) over the
+  interned element layout — exactly what `@derive(Hash, Eq)` emits for a named
+  struct — generated once per tuple layout and reused. **No** change to the GC /
+  Immix evacuator / object header / C runtime.
+- **Hashable elements:** integers (all widths), `bool`, `char`, tier-1 `enum`
+  (hashed as the integer word), `str`, `bytes` (hashed/compared by value), and —
+  recursively — **nested tuples** and structs that are themselves hashable
+  (`@derive(Hash, Eq)` or hand-defined dunders). A tuple is hashable exactly when
+  every element is.
+- **Unhashable elements** — a `float`, a nested collection (`list`/`dict`/`set`,
+  which have no stable hash, D-0025-style), or a struct lacking `__hash__`/`__eq__`
+  — make the tuple **unhashable**: the use is rejected at compile time with a
+  stable coded diagnostic (`ZAP6001`), **never** an internal compiler error. This
+  mirrors CPython raising `TypeError: unhashable type` at hash time.
+
+**Before:** `{(1, 2): 7}`, `dict[(int64, str), int64]` key operations, and the
+set literal `{(1, 2)}` panicked the compiler (ICE) in `key_fn_args` — a tuple's
+interned struct id has no `names[]` entry, so the named-struct key path indexed
+out of bounds. Fixed in `crates/ir/src/lower.rs` (`FnLower::tuple_key_fns`).
+
+**Known follow-ups (out of scope, still clean rejects — never ICE):** the
+**typed empty set constructor** `set[(int64, int64)]()` is still rejected
+(`ZAP6001` "expects an element type name") because `set[T]()` / `channel[T]()` /
+`heap[T]()` constructors accept only a bare type *name*, not a tuple type
+subscript; the set **literal** `{(1, 2)}` is fixed here. And `Optional[T]` as a
+key remains a general unimplemented key-op (`ZAP6001` "Phase 1 slice"). Both are
+pre-existing clean diagnostics unrelated to the tuple-hash mechanism.
+
+**Rationale:** multi-value keys are a Python staple (coordinates, composite
+dict keys, memoization argument tuples); supporting them structurally is the
+language-first answer and costs nothing at runtime beyond the derive machinery
+tuples already share with value structs. The `@cache` built-in (#666) keys on a
+synthesized named `@derive(Hash, Eq)` key-struct, not a raw tuple, so it is
+unaffected and carries no dependency either way.

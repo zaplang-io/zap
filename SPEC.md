@@ -407,6 +407,13 @@ auto (q, r) = divmod(17, 5)
 Compared element-wise by `==`; `v, ok = <-ch` (D-0031) is this same
 destructuring. Not a reference type; no heap header unless boxed.
 
+A tuple of hashable elements is itself **hashable** (D-0122): it may be used as a
+dict key or a set element — `{(1, 2): 7}`, `dict[(int64, str), int64]`, the set
+literal `{(1, 2)}`, and nested tuples — with structural hash/equality over its
+elements (CPython parity). A tuple containing an unhashable element (a `float`, a
+nested `list`/`dict`/`set`, or a struct lacking `__hash__`/`__eq__`) is rejected
+at compile time (`ZAP6001`), never an internal compiler error.
+
 ### 4.9 Transparent type aliases (D-0105, #606)
 
 A **type alias** gives an existing type a second name. It is **transparent**: it

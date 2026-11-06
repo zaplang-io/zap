@@ -404,7 +404,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | Lexical structure/literals; declarations + `const`; scalars + conversions | **S** |
 | `str`/`bytes` + interpolation; codepoint indexing/slicing/iteration + comparison + methods (`upper`/`lower`/`strip`/`split`/`join`/`find`/`index`/`replace`/`startswith`/`endswith`/`contains`/`encode`) + `ord`/`chr`/`char`/`str`/`int` (#284; additive to the Stable `str` type, ASCII-only case folding in v1) | **S** |
 | f-string codegen + the format mini-language (`{expr}`, `{expr:spec}`, D-0026) + the `str`/`int`/`float`/`bool`/`format` conversion builtins (#285/#282; additive; `!r`/`!a` conversions and user-type rendering deferred to the Display protocol #274) | **S** |
-| `list`/`dict`/tuples + value/reference semantics | **S** |
+| `list`/`dict`/tuples + value/reference semantics; tuples are hashable, so a tuple of hashable elements is a valid dict key / set element with structural hash/eq (#680, D-0122) | **S** |
 | Structs + methods + `value struct`; interfaces; enums tier-1 **and** tier-3 sum types (D-0046) | **S** |
 | Operators + overloading + `@derive(Eq, Ord, Hash, Repr)` (in-place `__iadd__`-family **not-yet**) | **S** |
 | Control flow (incl. `do`/`while`, `match`); iteration protocol (D-0048) | **S** |

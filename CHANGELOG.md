@@ -25,6 +25,24 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Tuples are hashable — usable as dict keys and set elements** (#680, D-0122;
+  refines D-0049/D-0047). A tuple of hashable elements is now a valid dict key
+  and set element with **structural** hash/equality (CPython parity):
+  `{(1, 2): 7}`, `dict[(int64, str), int64]` key operations, and the set literal
+  `{(1, 2)}` all work, including **nested tuples** `((1, 2), 3)` and tuples of
+  `str`/`bytes`/`bool`/`char`/`enum`/hashable-struct elements. A tuple already
+  lowers as an anonymous value-struct aggregate and value-struct keys already use
+  the function-pointer key path, so the compiler **synthesizes** the tuple's
+  structural `__hash__`/`__eq__` over its element layout (the same machinery
+  `@derive(Hash, Eq)` uses), generated once per layout and reused — **no** GC,
+  Immix, object-header, or C-runtime change. A tuple with an **unhashable**
+  element (a `float`, a nested `list`/`dict`/`set`, or a struct lacking
+  `__hash__`/`__eq__`) is rejected at compile time with a stable coded diagnostic
+  (**ZAP6001**), never an internal compiler error. Previously every one of these
+  forms **panicked the compiler** (ICE in `key_fn_args`, a tuple's interned
+  struct id having no name entry). The typed empty set constructor
+  `set[(int64, int64)]()` and `Optional[T]` keys remain pre-existing clean
+  rejections (ZAP6001), unrelated to the tuple-hash mechanism.
 - **`spawn` of methods and first-class function values** (#475, D-0118; epic
   #469). `spawn` now accepts three callable forms, closing the gap where the
   grammar and SPEC admitted method/closure spawns but lowering rejected them:
