@@ -1,0 +1,8 @@
+# Quarantined on aarch64: still fails on the gc-boehm GC race at high core count
+# (#710, a #223 follow-up) — an alloc-lock-inversion livelock + queue-node UAF,
+# gc-boehm-specific, reproducible at MAXPROCS=32 on real aarch64 AND x86_64; the
+# few-core hosted runners do not trip it, so main looks green while it is broken
+# at scale. Re-quarantined after #698's re-enable proved premature (4-box fleet,
+# gdb-confirmed). Default gc-immix is unaffected. Still runs on x86_64, so
+# coverage there is unchanged. Remove this file when #710 is fixed.
+aarch64
