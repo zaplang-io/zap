@@ -706,6 +706,32 @@ pub enum Inst {
         args: Vec<Value>,
         unwind: BlockId,
     },
+    /// **Render an interface value** through the Display protocol (#707, D-0124):
+    /// load the *renderer* slot — the slot past the method slots — from `iface`'s
+    /// itable and call it with the fat pointer's `data` as `self`, returning the
+    /// rendered `str`. The renderer is the concrete type's own renderer (an
+    /// explicit `__str__`/`__repr__`, else the compiler default field-wise /
+    /// tier-3-enum structural form), which the lowerer synthesizes and records in
+    /// [`Module::iface_renderers`] so codegen can place it in the itable. This is
+    /// the dynamic-dispatch counterpart to [`FnLower::struct_to_str`] for a value
+    /// whose concrete type is erased behind an interface. `dest : str` always (a
+    /// renderer always produces a string). The plain form; the exception-edge
+    /// form is [`Inst::IfaceRenderInvoke`] (the renderer may raise, e.g. a
+    /// user `__str__` or a `bytes` field decode).
+    IfaceRender {
+        dest: Value,
+        iface: Value,
+        iid: u32,
+    },
+    /// Like [`Inst::IfaceRender`] but on the exception edge (inside a `try`): the
+    /// concrete type's renderer may raise, and transfers to the landing-pad block
+    /// `unwind`, mirroring [`Inst::IfaceInvoke`] vs [`Inst::IfaceCall`].
+    IfaceRenderInvoke {
+        dest: Value,
+        iface: Value,
+        iid: u32,
+        unwind: BlockId,
+    },
     /// Atomic load of the cell field `idx` of the `Atomic[T]` box `base`
     /// (`Atomic[T]`, I#176). `dest` is the loaded value, typed `elem` (the cell's
     /// lowered type `T`). Codegen GEPs field `idx` of struct `sid` — the cell sits
@@ -928,6 +954,17 @@ pub struct Module {
     /// Structural interfaces (D-0016); indexed by interface id (`iid`). Empty
     /// when the program declares no interfaces.
     pub interfaces: Vec<InterfaceLayout>,
+    /// Display-protocol renderer per concrete type that is used behind an
+    /// interface (#707, D-0124): concrete struct id (`concrete_sid` of an
+    /// [`Inst::IfaceMake`]) -> the symbol of the function that renders a value of
+    /// that type to a `str`. The lowerer synthesizes the renderer at the
+    /// concrete->interface coercion and records it here; codegen appends it as the
+    /// *renderer slot* (past the method slots) of that type's `(concrete, iid)`
+    /// itable, so an [`Inst::IfaceRender`] dynamically dispatches to it. A concrete
+    /// type with no entry (its renderer could not be synthesized) gets a null
+    /// renderer slot — not reachable for the field types D-0124 supports. Empty
+    /// when no interface value is ever constructed.
+    pub iface_renderers: std::collections::HashMap<u32, String>,
 }
 
 // --- textual form (for `zapc ir` and tests) ---
@@ -1168,6 +1205,17 @@ fn fmt_inst(i: &Inst) -> String {
                 Some(d) => format!("%{d} = {call}"),
                 None => call,
             }
+        }
+        Inst::IfaceRender { dest, iface, iid } => {
+            format!("%{dest} = ifacerender iface#{iid} %{iface}")
+        }
+        Inst::IfaceRenderInvoke {
+            dest,
+            iface,
+            iid,
+            unwind,
+        } => {
+            format!("%{dest} = ifacerenderinvoke iface#{iid} %{iface} unwind block{unwind}")
         }
         Inst::AtomicLoad {
             dest,

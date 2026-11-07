@@ -25,6 +25,28 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Display protocol renders interface values** (#707, D-0124; follow-up to
+  #274/#706). An interface value — a `{data, itable}` fat pointer whose concrete
+  type is erased — now renders through the same one protocol as everything else,
+  consistently across `print()`, `str()`, f-strings, the REPL, and doctests,
+  instead of the old clean `ZAP6001` deferral: `print(s)` where
+  `Shape s = Circle(r=2.0)` renders `Circle(r=2.0)`. **Mechanism:** each
+  per-interface dispatch table (itable) gains one **renderer slot** past its
+  method slots, holding the concrete type's renderer (the same one a direct render
+  resolves — an explicit `__str__`/`__repr__`/`@derive(Repr)`, the tier-3-enum
+  structural renderer, or the default field-wise form); a new `IfaceRender`
+  instruction loads that slot and dispatches to it with `data` as `self`, exactly
+  as interface *method* calls dispatch (D-0016) — no bespoke runtime path, no
+  object-header change. The dispatch is dynamic (two concrete types behind one
+  interface variable each render as themselves) and recurses into every field type
+  — so a tier-1 enum, a **tier-3 data-carrying enum (through #706's renderer)**, a
+  tuple, a quoted `str`, and container fields of a struct behind an interface all
+  render exactly as on a concrete value; an explicit `__str__`/`__repr__` on the
+  concrete type still wins. Only structs sit behind an interface today (interface
+  conformance is structural over structs), so enums are rendered through the
+  interface as struct fields. The recursive **cycle guard** (the other half of
+  #707) remains deferred: a cyclic object graph is still not constructible through
+  the supported surface, so there is nothing yet to guard.
 - **Display protocol renders tier-3 data-carrying enums structurally** (#706,
   D-0124 extended to D-0046; follow-up to #274). A tier-3 enum value with no
   hand-written `__str__`/`__repr__` now renders through the same one protocol as
@@ -40,8 +62,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   renderer, switching on the enum's `i32` tag like the tier-1 `.name` chain — so
   no new runtime support, no GC/scheduler/object-header change. Niche
   `Optional`-shaped enums render via a null test (the `Optional` payload-vs-`None`
-  path is unchanged); an explicit `__str__`/`__repr__` still overrides. Only
-  interface-value rendering (#707) remains deferred.
+  path is unchanged); an explicit `__str__`/`__repr__` still overrides.
+  Interface-value rendering was the remaining Display gap and shipped in #707
+  (above); only the recursive cycle guard stays deferred.
 - **Validated asymmetric-key metadata/import + P-256 ECDSA (ES256) and Ed25519
   sign/verify in `crypto`** (#643, D-0126; builds on #105/D-0056, #628/D-0102).
   A supported, OpenSSL-backed asymmetric-key surface of free functions —
@@ -97,9 +120,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
     default renderer has no cycle guard (like a hand-written recursive
     `__repr__`); non-printable non-ASCII in a quoted string is not escaped.
     (Tier-3 data-carrying enums, originally deferred here, now render — see the
-    #706 entry above.) Still deferred to a #274 follow-up (a clean coded error,
-    never an ICE): interface-value rendering (#707); no object-identity
-    (`<T @ 0x…>`) form is introduced.
+    #706 entry above; interface values now render too — see the #707 entry above.)
+    Still deferred to a #274 follow-up: the recursive cycle guard (#707), latent
+    until a cycle is constructible. No object-identity (`<T @ 0x…>`) form is
+    introduced.
 - **`char` is a distinct IR type — fixes `char`/`int32` render conflation**
   (#709, D-0125; completes D-0124). `char` previously shared the IR type
   `Ty::I32` with `int32`, so the value layer could not tell them apart: a `char`

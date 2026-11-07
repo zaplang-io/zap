@@ -1,0 +1,6 @@
+Circle(r=2.0)
+Circle(r=2.0)
+[Circle(r=2.0)]
+Square(side=3.0)
+Circle(r=1.0)
+Square(side=4.0)

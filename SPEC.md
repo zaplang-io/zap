@@ -997,20 +997,29 @@ print({"k": 1})                # {'k': 1}
 print("a")                     # a                 (bare string unquoted)
 print(Shape.Circle(r=2.0))     # Shape.Circle(r=2.0)   (tier-3 enum, #706)
 print(Shape.Unit)              # Shape.Unit            (payload-free variant)
+
+Drawable d = Point(x=1, y=2)   # a concrete struct behind an interface
+print(d)                       # Point(x=1, y=2)       (interface value, #707)
 ```
 
-**Deferred (a clean compile error, never silent, a #274 follow-up):**
-interface-value rendering (#707). No object-identity/address form
-(`<TypeName @ 0x…>`) is provided.
+An **interface value** renders as its concrete type would (#707): the render
+dynamically dispatches through the interface's itable to the concrete type's
+renderer, exactly as an interface method call dispatches (D-0016). Only structs
+sit behind an interface today (interface conformance is structural over structs),
+so the tier-1/tier-3 enum, tuple, and container renderers are reached through the
+interface as the concrete struct's fields.
 
-**Known limitations (v1).** A `char` **collection element** renders as its
-codepoint integer (`list[char]` → `[97, 98]`), because `char` and `int32` are the
-same IR type; a `char` **struct field** or **tuple element** renders correctly
-(`'c'`). (A `bool` collection element *does* render `True`/`False`.) The renderer
-recurses with **no cycle guard**, so a
+**Deferred (never silent, a #274 follow-up):** the recursive **cycle guard** — the
+default renderer recurses with **no cycle guard** (see limitations). No
+object-identity/address form (`<TypeName @ 0x…>`) is provided.
+
+**Known limitations (v1).** The renderer recurses with **no cycle guard**, so a
 cyclic object graph would recurse without bound — as a hand-written recursive
-`__repr__` would (CPython guards only built-in containers). A quoted string's
-escaping is ASCII-focused: non-printable non-ASCII codepoints are not escaped.
+`__repr__` would (CPython guards only built-in containers). A cycle is not yet
+constructible through the supported surface (a self-referential `Optional[Self]`
+field does not lower; container back-edges need rebinding a container into
+itself), so the guard stays latent. A quoted string's escaping is ASCII-focused:
+non-printable non-ASCII codepoints are not escaped.
 
 ## 10. Errors & exceptions (D-0007, D-0029)
 

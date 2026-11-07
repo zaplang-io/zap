@@ -213,6 +213,25 @@ fn tier3_enum_payload_free_variant_auto_renders() {
     assert!(stdout.contains("Shape.Unit"), "stdout: {stdout:?}");
 }
 
+#[test]
+fn interface_value_renders_concrete_type() {
+    // An interface value renders by dynamic dispatch to the concrete type's
+    // renderer in the REPL (#707, D-0124): a `Shape` holding a `Circle` renders
+    // `Circle(r=2.0)`. The interface value lives inside a persisted function
+    // `demo()` and is printed there, mirroring the passing
+    // `define_an_interface_and_struct_use_next_line` test — this keeps it off the
+    // REPL's cross-entry binding-persistence path (a fat-pointer value does not
+    // round-trip through a runtime slot across entries, which is orthogonal to
+    // rendering). Entries are blank-line separated; no blank line inside a block.
+    let script = "interface Shape:\n    def area(self) -> f64\n\n\
+                  struct Circle:\n    f64 r\n    def area(self) -> f64:\n        return self.r\n\n\
+                  def demo() -> int64:\n    Shape s = Circle(r=2.0)\n    print(s)\n    return 0\n\n\
+                  demo()\n";
+    let (stdout, stderr, code) = repl(script);
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert!(stdout.contains("Circle(r=2.0)"), "stdout: {stdout:?}");
+}
+
 // ---------------------------------------------------------------------------
 // I#252: line editing degrades cleanly under piped (non-interactive) stdin
 // ---------------------------------------------------------------------------

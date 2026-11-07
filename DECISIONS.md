@@ -5216,11 +5216,14 @@ deferred (a clean `ZAP6001` at lowering); a tier-3 enum value now renders
 structurally through this same protocol. See the **#706 addendum** at the end of
 this entry.
 
+**Interface values — RESOLVED by #707 (addendum below).** Originally deferred (a
+clean `ZAP6001` at lowering, since rendering needs dynamic dispatch to the
+concrete type's renderer); an interface value now renders through this same
+protocol via an itable renderer slot. See the **#707 addendum** at the end of
+this entry.
+
 **Out of scope (clean coded compile error — `ZAP4024` at sema for a bare value,
 `ZAP6001` at lowering for such a field — never an ICE; a #274 follow-up):**
-- **Interface values:** rendering needs dynamic dispatch to the concrete type's
-  renderer (a vtable slot); deferred. Bind to a concrete type or define `__str__`.
-  Tracked (with the cycle guard) as follow-up issue #707.
 - **Object identity / address form** (`<TypeName @ 0x…>`): explicitly **not**
   built — it would require an object-identity/address intrinsic that does not
   exist, so the structural field-wise form is used for everything.
@@ -5233,14 +5236,17 @@ this entry.
   field rendering-as-a-char bug is fixed at the same time (an `int32` renders as
   a decimal everywhere). `bool` elements were never affected (`bool` is `Ty::I1`,
   distinct; `Elem::Bool` keeps its identity, `list[bool]` → `[True, False]`).
-- **Cycle handling: no guard.** The renderer recurses structurally with **no**
-  cycle guard, so a cyclic object graph would recurse without bound — exactly like
-  a hand-written recursive `__repr__`, and unlike CPython's `reprlib` guard (which
-  covers only built-in containers). A `seen`-set guard would need object identity
-  (out of scope, above). In practice v1 cannot be fed a cycle through the supported
-  surface: a self-referential `Optional[Self]` struct field does not lower yet (a
-  pre-existing codegen limitation), and mutable collection back-edges would require
-  rebinding a container into itself. Revisit if/when object identity lands.
+- **Cycle handling: no guard (still deferred, the remaining half of #707).** The
+  renderer recurses structurally with **no** cycle guard, so a cyclic object graph
+  would recurse without bound — exactly like a hand-written recursive `__repr__`,
+  and unlike CPython's `reprlib` guard (which covers only built-in containers). A
+  `seen`-set guard needs an object-identity key usable to recognize an
+  already-visited object. Although `is`-identity shipped (#611 / PR #660), a cycle
+  still cannot be fed through the supported surface: a self-referential
+  `Optional[Self]` struct field does not lower yet (a pre-existing codegen
+  limitation), and mutable collection back-edges would require rebinding a
+  container into itself. So the guard remains latent and deferred — close it when a
+  cycle first becomes constructible. Tracked as the still-open half of #707.
 - **String `repr` escaping is ASCII-focused.** Non-printable non-ASCII codepoints
   are not escaped (the UTF-8 bytes pass through) — a documented simplification vs.
   CPython's `\xNN`/`\uXXXX` for non-printables; printable ASCII and Unicode match.
@@ -5276,7 +5282,43 @@ old `ZAP6001` deferral error:
   `Enum.Variant(field=value)` / `Enum.Empty` the same way.
 - **Explicit overrides still win:** a hand-written `__str__`/`__repr__` on the enum
   is resolved before the synthesized renderer, exactly as for a struct.
-- Only interface-value rendering (and the cycle guard) remains deferred (#707).
+- After #707 (addendum below), only the **cycle guard** remains deferred.
+
+**#707 addendum — interface values render by dynamic dispatch (the itable renderer
+slot).** An interface value is a `{data, itable}` fat pointer (D-0016) whose
+concrete type is erased, so it cannot resolve a static renderer symbol the way a
+concrete `print(point)` does. It now renders through this same protocol, replacing
+the old `ZAP6001` deferral: `print(s)` where `Shape s = Circle(r=2.0)` renders
+`Circle(r=2.0)`, consistent across `print`/`str`/f-strings/the REPL/doctests.
+- **Mechanism:** each per-interface dispatch table (itable) gains one extra slot
+  past its `N` method slots — the **renderer slot** — holding the *concrete*
+  type's renderer (the same one a direct render resolves: an explicit
+  `__str__`/`__repr__`/`@derive(Repr)`, the tier-3-enum structural renderer, or the
+  default field-wise form). The lowerer synthesizes and records that renderer at
+  each concrete→interface coercion (where the fat pointer is built); codegen places
+  it in the `(concrete, iid)` itable. Rendering an interface value emits a new
+  `Inst::IfaceRender` (its exception-edge form `IfaceRenderInvoke`, since a
+  renderer may raise) that loads the renderer slot and calls it with `data` as
+  `self` — the exact dynamic-dispatch shape interface *method* calls use (D-0016),
+  reusing the existing itable machinery rather than a bespoke path.
+- **Dynamic, and it recurses:** two concrete types behind one interface variable
+  each dispatch to their own renderer; and because the concrete type's renderer
+  renders its fields through the one protocol, a struct behind an interface renders
+  its tier-1 enum, **tier-3 enum (through #706's renderer)**, tuple, quoted `str`,
+  and container fields exactly as a concrete value would.
+- **Explicit overrides still win** through the interface: the renderer slot holds
+  the concrete type's `__str__`/`__repr__` when it defines one.
+- **Scope — only structs sit behind an interface today.** Interface conformance
+  (D-0016) is structural over **structs** only: a tier-1 or tier-3 enum does not
+  conform to an interface even when it has the methods (and a tier-1 enum is an
+  unboxed integer, so it could not be the fat pointer's `data`). So #707 renders
+  the concrete *structs* that can sit behind an interface; the tier-1/tier-3 enum
+  renderers are exercised through the interface as struct *fields*. Whether enums
+  should conform to interfaces is a separate D-0016 design question, tracked on its
+  own issue — not part of this Display follow-up.
+- **Still deferred:** the recursive **cycle guard** (needs a constructible cycle,
+  which the supported surface still cannot produce; see the limitation above) — the
+  remaining open half of #707.
 
 ## D-0125 — `char` is a distinct IR type (`Ty::Char`), fixing the `char`/`int32` render conflation (I#709)
 
