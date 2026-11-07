@@ -1045,7 +1045,8 @@ finally:
 - Built-in exception types are `BaseException`, `Exception`, `ValueError`,
   `TypeError`, `LookupError`, `IndexError`, `KeyError`, `ArithmeticError`,
   `ZeroDivisionError`, `RuntimeError`, `StopIteration`, `Cancelled`,
-  `ScopeTimeout`, `ExceptionGroup`, and `TimeoutError`. `IndexError` and `KeyError`
+  `ScopeTimeout`, `ExceptionGroup`, `TimeoutError`, and `AssertionError`.
+  `IndexError` and `KeyError`
   derive from `LookupError`; `ZeroDivisionError` derives from `ArithmeticError`; those
   intermediate types derive from `Exception`. `Cancelled` derives directly from
   `BaseException`, so `except Exception` does not suppress cancellation.
