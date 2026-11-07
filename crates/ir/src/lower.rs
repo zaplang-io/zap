@@ -10586,7 +10586,44 @@ impl<'a> FnLower<'a> {
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (l, lt) = self.expr(lhs)?;
                 let (r, rt) = self.expr(rhs)?;
-                self.binop(*op, l, lt, r, rt)
+                // Fast path (#374): skip the runtime guard when the right
+                // operand is a safe literal constant — a nonzero divisor for
+                // `/` (always float/true division), or a shift count in 0..63.
+                // These lower to the plain inline op; everything else goes
+                // through `binop`, which routes the guarded forms (zap_fdiv /
+                // zap_ishl / zap_ishr) so a bad value raises a catchable fault.
+                match op {
+                    AstBin::Div if Self::is_nonzero_numeric_literal(rhs) => {
+                        let lf = self.as_f64(l, lt);
+                        let rf = self.as_f64(r, rt);
+                        let d = self.new_value(Ty::F64);
+                        self.emit(Inst::Bin {
+                            dest: d,
+                            op: BinOp::Div,
+                            lhs: lf,
+                            rhs: rf,
+                        });
+                        Ok((d, Ty::F64))
+                    }
+                    AstBin::Shl | AstBin::Shr if Self::is_safe_shift_literal(rhs) => {
+                        let li = self.coerce(l, lt, Ty::I64);
+                        let ri = self.coerce(r, rt, Ty::I64);
+                        let d = self.new_value(Ty::I64);
+                        let irop = if matches!(op, AstBin::Shl) {
+                            BinOp::Shl
+                        } else {
+                            BinOp::Shr
+                        };
+                        self.emit(Inst::Bin {
+                            dest: d,
+                            op: irop,
+                            lhs: li,
+                            rhs: ri,
+                        });
+                        Ok((d, Ty::I64))
+                    }
+                    _ => self.binop(*op, l, lt, r, rt),
+                }
             }
             // Chained comparison `x0 op1 x1 op2 x2 ...` with Python semantics
             // (I#386): equivalent to `(x0 op1 x1) and (x1 op2 x2) and ...` where
@@ -16808,6 +16845,31 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// True when `e` is a numeric literal that is definitely nonzero, so a
+    /// `/` by it needs no divide-by-zero guard (#374). Conservative: grouped
+    /// (`1_000`), hex, or other forms that don't parse here fall through to the
+    /// guarded path rather than being wrongly treated as safe.
+    fn is_nonzero_numeric_literal(e: &Expr) -> bool {
+        match e {
+            Expr::Int(s, _) => s.parse::<i128>().map(|n| n != 0).unwrap_or(false),
+            Expr::Float(s, _) => s.parse::<f64>().map(|f| f != 0.0).unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    /// True when `e` is an integer literal shift count in `0..=63`, so the shift
+    /// needs no range/sign guard (#374). Anything else — negative, `>= 64`,
+    /// non-literal, or a form that doesn't parse here — takes the guarded path.
+    fn is_safe_shift_literal(e: &Expr) -> bool {
+        match e {
+            Expr::Int(s, _) => s
+                .parse::<i64>()
+                .map(|n| (0..64).contains(&n))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
     fn binop(
         &mut self,
         op: AstBin,
@@ -17509,21 +17571,19 @@ impl<'a> FnLower<'a> {
                 let lf = self.as_f64(l, lt);
                 let rf = self.as_f64(r, rt);
                 let d = self.new_value(Ty::F64);
-                self.emit(Inst::Bin {
-                    dest: d,
-                    op: BinOp::Div,
-                    lhs: lf,
-                    rhs: rf,
-                });
+                // True division by zero raises a catchable ZeroDivisionError
+                // (#374). The `Expr::Binary` lowerer emits a plain inline `fdiv`
+                // when the divisor is a known-nonzero literal, so reaching here
+                // means the divisor is not a safe constant — guard it through
+                // the throwing helper (an `invoke` under a handler).
+                self.throwing_call(Some(d), "zap_fdiv", vec![lf, rf]);
                 Ok((d, Ty::F64))
             }
-            BitAnd | BitOr | BitXor | Shl | Shr => {
+            BitAnd | BitOr | BitXor => {
                 let irop = match op {
                     BitAnd => BinOp::And,
                     BitOr => BinOp::Or,
                     BitXor => BinOp::Xor,
-                    Shl => BinOp::Shl,
-                    Shr => BinOp::Shr,
                     _ => unreachable!(),
                 };
                 let li = self.coerce(l, lt, Ty::I64);
@@ -17535,6 +17595,23 @@ impl<'a> FnLower<'a> {
                     lhs: li,
                     rhs: ri,
                 });
+                Ok((d, Ty::I64))
+            }
+            Shl | Shr => {
+                // A shift count that is negative (-> ValueError, CPython) or
+                // >= 64 (-> defined "shifted out", not LLVM poison) is validated
+                // by a runtime helper (#374/#740). A negative count can raise, so
+                // this is a throwing_call. The `Expr::Binary` lowerer emits a
+                // plain inline shift when the count is a literal in 0..63.
+                let li = self.coerce(l, lt, Ty::I64);
+                let ri = self.coerce(r, rt, Ty::I64);
+                let d = self.new_value(Ty::I64);
+                let helper = if matches!(op, Shl) {
+                    "zap_ishl"
+                } else {
+                    "zap_ishr"
+                };
+                self.throwing_call(Some(d), helper, vec![li, ri]);
                 Ok((d, Ty::I64))
             }
             And | Or => {

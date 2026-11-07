@@ -1147,6 +1147,47 @@ int64_t zap_imod(int64_t a, int64_t b) {
     return r;
 }
 
+/* True (float) division. Division by zero raises a catchable ZeroDivisionError
+ * (CPython parity, #374/#743) instead of yielding IEEE inf/nan. The lowering
+ * emits a plain inline `fdiv` when the divisor is a known-nonzero literal, so
+ * this helper is called only when the divisor is not a safe constant. */
+double zap_fdiv(double a, double b) {
+    if (b == 0.0) {
+        zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("float division by zero", 22));
+    }
+    return a / b;
+}
+
+/* Left shift with a validated count (#374/#740). A negative count raises a
+ * catchable ValueError (CPython). Zap's int is a wrapping int64, so a count >=
+ * 64 shifts every bit out and is defined as 0 rather than being LLVM poison.
+ * The lowering emits a plain inline shift when the count is a literal in 0..63,
+ * so this helper is called only for a non-constant / out-of-range count. The
+ * in-range shift is done on the unsigned bit-pattern to avoid signed-shift UB. */
+int64_t zap_ishl(int64_t a, int64_t count) {
+    if (count < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("negative shift count", 20));
+    }
+    if (count >= 64) {
+        return 0;
+    }
+    return (int64_t)((uint64_t)a << (uint64_t)count);
+}
+
+/* Arithmetic right shift with a validated count (#374/#740). A negative count
+ * raises a catchable ValueError (CPython). A count >= 64 saturates to the sign
+ * bit (0 for a non-negative value, -1 for a negative one) — the limit of an
+ * arithmetic shift under wrapping int64. */
+int64_t zap_ishr(int64_t a, int64_t count) {
+    if (count < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("negative shift count", 20));
+    }
+    if (count >= 64) {
+        return a < 0 ? -1 : 0;
+    }
+    return a >> count;
+}
+
 int64_t zap_str_len(void *s) { return ((ZapStr *)s)->len; }
 
 /* ---------------------------------------------------------------------------
