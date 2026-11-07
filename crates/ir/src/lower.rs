@@ -10944,6 +10944,14 @@ impl<'a> FnLower<'a> {
                 // arms and the join even though it is created inside the then-arm.
                 let (cv, cty) = self.expr(cond)?;
                 let c = self.truthy(cv, cty);
+                // The pre-branch block dominates both arms and the join, so the
+                // merge slot's `alloca` must live here — not inside the then-arm,
+                // where it would not dominate the else-arm's store (an SSA
+                // violation). The result type is only known after lowering the
+                // then-arm, so the slot is created once that type is in hand and
+                // its alloca is appended to this dominating block (cf. the
+                // or-pattern binding merge).
+                let pre_bb = self.cur;
                 let then_bb = self.new_block();
                 let else_bb = self.new_block();
                 let join_bb = self.new_block();
@@ -10954,7 +10962,11 @@ impl<'a> FnLower<'a> {
                 });
                 self.position(then_bb);
                 let (a, at) = self.expr(then)?;
-                let slot = self.alloca(at);
+                let slot = self.new_value(Ty::Ptr);
+                self.func.blocks[pre_bb as usize].insts.push(Inst::Alloca {
+                    dest: slot,
+                    pointee: at,
+                });
                 self.store(slot, a);
                 self.ensure_br(join_bb);
                 self.position(else_bb);

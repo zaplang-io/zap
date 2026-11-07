@@ -280,6 +280,17 @@ mod tests {
             text.contains("br_if"),
             "ternary must lower to a conditional branch:\n{text}"
         );
+        // The merge slot's `alloca` must dominate both arms — i.e. sit in the
+        // pre-branch block, before the `br_if` — not inside the then-arm (which
+        // would not dominate the else-arm's store, a miscompile). Pin it by
+        // position: the first `alloca` precedes the first `br_if`.
+        let main = &text[text.find("func @main").expect("main")..];
+        let alloca_at = main.find("alloca").expect("ternary merge slot alloca");
+        let brif_at = main.find("br_if").expect("ternary br_if");
+        assert!(
+            alloca_at < brif_at,
+            "ternary merge slot must be allocated before the branch:\n{main}"
+        );
     }
 
     #[test]
