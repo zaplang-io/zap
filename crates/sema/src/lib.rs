@@ -4025,6 +4025,34 @@ impl Checker {
                         *span,
                     );
                 }
+                // `x == None` / `x != None` (#374/B3): per SPEC §5 this is
+                // consistent with `x is None` — a null/empty check on the other
+                // operand. A never-None value type is rejected the same way
+                // `is None` rejects it (ZAP4074), rather than passing sema and
+                // then failing in lowering.
+                if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    let l_none = matches!(lhs.as_ref(), Expr::None(_));
+                    let r_none = matches!(rhs.as_ref(), Expr::None(_));
+                    if l_none || r_none {
+                        if l_none && r_none {
+                            return Ty::Bool;
+                        }
+                        let other = if l_none { &r } else { &l };
+                        if !self.is_nullable_ty(other) {
+                            self.error(
+                                ErrorCode::ZAP4074,
+                                format!(
+                                    "a value of type '{}' can never be None, so \
+                                     `== None` / `!= None` is always constant; \
+                                     compare by value or use a pattern match",
+                                    other.display()
+                                ),
+                                *span,
+                            );
+                        }
+                        return Ty::Bool;
+                    }
+                }
                 // Operator overloading on user structs (D-0047) takes precedence
                 // over the built-in-type rules.
                 if let Some(ty) = self.check_struct_binop(*op, &l, &r, *span) {

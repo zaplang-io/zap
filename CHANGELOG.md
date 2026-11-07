@@ -34,7 +34,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   // -1` and `% -1` are defined wrapping-int64 results instead of a process
   abort (#742); float `/` by zero raises `ZeroDivisionError` instead of IEEE
   `inf`; and a negative shift count raises `ValueError` while a count `>= 64` is
-  a defined "shifted out" value instead of LLVM poison (#740).
+  a defined "shifted out" value instead of LLVM poison (#740). `str`/`print`/
+  f-string/JSON render a float as its shortest round-trip decimal (CPython
+  `repr`) instead of 6-significant-digit `%g` (B1). `x == None` / `x != None` are
+  consistent with `is None` instead of failing in lowering (B3). `len(str)` is
+  the Unicode codepoint count, consistent with codepoint indexing/slicing/
+  iteration, rather than the UTF-8 byte length (B6, D-0025).
 - **`except*` exception-group handling** (#605, D-0129; epic #614 D13). A `try`
   may now use `except* <type> [as NAME]` clauses to split an aggregate
   `ExceptionGroup` — the one a `scope:` raises on two or more concurrent child
