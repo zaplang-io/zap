@@ -262,6 +262,58 @@ mod tests {
     }
 
     #[test]
+    fn lower_aug_assign_subscript_and_field() {
+        // #750: augmented assignment to a subscript or field target lowers to a
+        // read-modify-write of that one slot, with the base/index evaluated once
+        // (it used to bail with "only simple variable aug-assignment"). `lower_ok`
+        // asserts there are no lower errors; the text assertions pin the shape.
+        let module = lower_ok(concat!(
+            "def idx() -> int64:\n",
+            "    print(\"idx\")\n",
+            "    return 0\n",
+            "\n",
+            "struct Counter:\n",
+            "    int64 n\n",
+            "\n",
+            "def main():\n",
+            "    list[int64] xs = [10, 20]\n",
+            "    xs[idx()] += 5\n",
+            "    dict[str, int64] d = {\"a\": 1}\n",
+            "    d[\"a\"] *= 2\n",
+            "    Counter c = Counter(0)\n",
+            "    c.n -= 1\n",
+        ));
+        let text = format!("{module}");
+        // The list element is read (throwing, like `xs[i]`) and written back.
+        assert!(text.contains("@zap_list_get_i64"), "no list read:\n{text}");
+        assert!(
+            text.contains("call @zap_list_set_i64"),
+            "no list write-back:\n{text}"
+        );
+        // The side-effecting index `idx()` is evaluated exactly once — count
+        // call sites only (`invoke`/`call`), not the `func @idx()` definition.
+        let idx_calls = text.matches("invoke @idx()").count() + text.matches("call @idx()").count();
+        assert_eq!(
+            idx_calls, 1,
+            "idx() must be evaluated exactly once:\n{text}"
+        );
+        // The dict value is read and written back through the typed entry points.
+        assert!(
+            text.contains("@zap_dict_get_str_i64"),
+            "no dict read:\n{text}"
+        );
+        assert!(
+            text.contains("call @zap_dict_set_str_i64"),
+            "no dict write-back:\n{text}"
+        );
+        // The struct field is a FieldGet/FieldSet read-modify-write.
+        assert!(
+            text.contains("fieldget") && text.contains("fieldset"),
+            "no field read-modify-write:\n{text}"
+        );
+    }
+
+    #[test]
     fn nested_append_still_rejects_incompatible_values() {
         for (declaration, value) in [
             ("list[dict[str, bool]] values = []", "{1: False}"),

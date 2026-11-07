@@ -39,7 +39,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `repr`) instead of 6-significant-digit `%g` (B1). `x == None` / `x != None` are
   consistent with `is None` instead of failing in lowering (B3). `len(str)` is
   the Unicode codepoint count, consistent with codepoint indexing/slicing/
-  iteration, rather than the UTF-8 byte length (B6, D-0025).
+  iteration, rather than the UTF-8 byte length (B6, D-0025). Augmented
+  assignment to a subscript or field target (`xs[i] += v`, `d[k] += v`,
+  `obj.f += v`) now compiles to an evaluate-once read-modify-write of that one
+  slot — the base and a side-effecting index are evaluated exactly once, like
+  CPython — instead of a `codegen error: only simple variable aug-assignment is
+  supported` (#750).
 - **`except*` exception-group handling** (#605, D-0129; epic #614 D13). A `try`
   may now use `except* <type> [as NAME]` clauses to split an aggregate
   `ExceptionGroup` — the one a `scope:` raises on two or more concurrent child
