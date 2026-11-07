@@ -262,6 +262,41 @@ mod tests {
     }
 
     #[test]
+    fn lower_range_step_is_sign_aware() {
+        // #759: a 3-arg range tests the step sign at the loop condition (a
+        // `select` between `<` and `>`) and raises ValueError on a zero step,
+        // instead of the old unconditional `cur < stop`.
+        let dyn_mod = lower_ok(concat!(
+            "def main():\n",
+            "    auto s = 0\n",
+            "    auto k = -1\n",
+            "    for i in range(5, 0, k):\n",
+            "        s = s + i\n",
+        ));
+        let dyn_text = format!("{dyn_mod}");
+        assert!(
+            dyn_text.contains("select"),
+            "3-arg range needs a sign-aware select:\n{dyn_text}"
+        );
+        assert!(
+            dyn_text.contains("@zap_panic_typed"),
+            "3-arg range needs a zero-step guard:\n{dyn_text}"
+        );
+        // A 2-arg range keeps the simple ascending test — no step guard/select.
+        let simple = lower_ok(concat!(
+            "def main():\n",
+            "    auto s = 0\n",
+            "    for i in range(0, 5):\n",
+            "        s = s + i\n",
+        ));
+        let simple_text = format!("{simple}");
+        assert!(
+            !simple_text.contains("@zap_panic_typed"),
+            "2-arg range must not emit a step guard:\n{simple_text}"
+        );
+    }
+
+    #[test]
     fn lower_float_mod_uses_floored_helper() {
         // #751: float `%` lowers to the floored `zap_ffmod` runtime helper — a
         // throwing call (since `% 0.0` raises a catchable ZeroDivisionError) —

@@ -9230,12 +9230,46 @@ impl<'a> FnLower<'a> {
                     let (v, t) = self.expr(&a.value)?;
                     vs.push(self.coerce(v, t, Ty::I64));
                 }
-                let (start, stop, step) = match vs.len() {
-                    1 => (self.iconst(Ty::I64, 0), vs[0], self.iconst(Ty::I64, 1)),
-                    2 => (vs[0], vs[1], self.iconst(Ty::I64, 1)),
-                    3 => (vs[0], vs[1], vs[2]),
+                let (start, stop, step, dynamic) = match vs.len() {
+                    1 => (
+                        self.iconst(Ty::I64, 0),
+                        vs[0],
+                        self.iconst(Ty::I64, 1),
+                        false,
+                    ),
+                    2 => (vs[0], vs[1], self.iconst(Ty::I64, 1), false),
+                    3 => (vs[0], vs[1], vs[2], true),
                     n => return Err(err(format!("range() takes 1-3 arguments, got {n}"))),
                 };
+                // A 3-arg range has a runtime step (#374/#759): a zero step is a
+                // catchable `ValueError` (CPython), and the loop must count DOWN
+                // when the step is negative. The 1-/2-arg forms always have a
+                // literal step of 1, so they keep the simple ascending test.
+                if dynamic {
+                    let zero = self.iconst(Ty::I64, 0);
+                    let is_zero = self.new_value(Ty::I1);
+                    self.emit(Inst::ICmp {
+                        dest: is_zero,
+                        pred: CmpPred::Eq,
+                        lhs: step,
+                        rhs: zero,
+                    });
+                    let raise_bb = self.new_block();
+                    let ok_bb = self.new_block();
+                    self.set_term(Term::BrIf {
+                        cond: is_zero,
+                        then_bb: raise_bb,
+                        else_bb: ok_bb,
+                    });
+                    self.position(raise_bb);
+                    let msg = self.strconst("range() arg 3 must not be zero");
+                    let verr = self.iconst(Ty::I64, 3); // ZAP_EXC_VALUE_ERROR (zaprt.c)
+                    self.throwing_call(None, "zap_panic_typed", vec![verr, msg]);
+                    if !self.terminated() {
+                        self.set_term(Term::Unreachable);
+                    }
+                    self.position(ok_bb);
+                }
                 self.push_scope();
                 let var = self.alloca(Ty::I64);
                 self.store(var, start);
@@ -9247,12 +9281,45 @@ impl<'a> FnLower<'a> {
                 self.position(cond_bb);
                 let cur = self.load(var, Ty::I64);
                 let c = self.new_value(Ty::I1);
-                self.emit(Inst::ICmp {
-                    dest: c,
-                    pred: CmpPred::Lt,
-                    lhs: cur,
-                    rhs: stop,
-                });
+                if dynamic {
+                    // Count up while `cur < stop` for a positive step, down while
+                    // `cur > stop` for a negative one: `c = (step > 0) ? lt : gt`.
+                    let zero = self.iconst(Ty::I64, 0);
+                    let lt = self.new_value(Ty::I1);
+                    self.emit(Inst::ICmp {
+                        dest: lt,
+                        pred: CmpPred::Lt,
+                        lhs: cur,
+                        rhs: stop,
+                    });
+                    let gt = self.new_value(Ty::I1);
+                    self.emit(Inst::ICmp {
+                        dest: gt,
+                        pred: CmpPred::Gt,
+                        lhs: cur,
+                        rhs: stop,
+                    });
+                    let pos = self.new_value(Ty::I1);
+                    self.emit(Inst::ICmp {
+                        dest: pos,
+                        pred: CmpPred::Gt,
+                        lhs: step,
+                        rhs: zero,
+                    });
+                    self.emit(Inst::Select {
+                        dest: c,
+                        cond: pos,
+                        a: lt,
+                        b: gt,
+                    });
+                } else {
+                    self.emit(Inst::ICmp {
+                        dest: c,
+                        pred: CmpPred::Lt,
+                        lhs: cur,
+                        rhs: stop,
+                    });
+                }
                 self.set_term(Term::BrIf {
                     cond: c,
                     then_bb: body_bb,
@@ -9797,7 +9864,7 @@ impl<'a> FnLower<'a> {
         iter: &Expr,
         body: &ast::Block,
     ) -> Result<(), LowerError> {
-        let (start, stop, step) = match iter {
+        let (start, stop, step, dynamic) = match iter {
             Expr::Call { callee, args, .. } if is_name(callee, "range") => {
                 let mut vs = Vec::new();
                 for a in args {
@@ -9805,9 +9872,14 @@ impl<'a> FnLower<'a> {
                     vs.push(self.coerce(v, t, Ty::I64));
                 }
                 match vs.len() {
-                    1 => (self.iconst(Ty::I64, 0), vs[0], self.iconst(Ty::I64, 1)),
-                    2 => (vs[0], vs[1], self.iconst(Ty::I64, 1)),
-                    3 => (vs[0], vs[1], vs[2]),
+                    1 => (
+                        self.iconst(Ty::I64, 0),
+                        vs[0],
+                        self.iconst(Ty::I64, 1),
+                        false,
+                    ),
+                    2 => (vs[0], vs[1], self.iconst(Ty::I64, 1), false),
+                    3 => (vs[0], vs[1], vs[2], true),
                     n => return Err(err(format!("range() takes 1-3 arguments, got {n}"))),
                 }
             }
@@ -9874,6 +9946,35 @@ impl<'a> FnLower<'a> {
             }
         };
 
+        // A 3-arg range has a runtime step (#374/#759): a zero step is a
+        // catchable `ValueError` (CPython), raised before the loop runs rather
+        // than looping forever. The 1-/2-arg forms always step by a literal 1.
+        if dynamic {
+            let zero = self.iconst(Ty::I64, 0);
+            let is_zero = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: is_zero,
+                pred: CmpPred::Eq,
+                lhs: step,
+                rhs: zero,
+            });
+            let raise_bb = self.new_block();
+            let ok_bb = self.new_block();
+            self.set_term(Term::BrIf {
+                cond: is_zero,
+                then_bb: raise_bb,
+                else_bb: ok_bb,
+            });
+            self.position(raise_bb);
+            let msg = self.strconst("range() arg 3 must not be zero");
+            let verr = self.iconst(Ty::I64, 3); // ZAP_EXC_VALUE_ERROR (zaprt.c)
+            self.throwing_call(None, "zap_panic_typed", vec![verr, msg]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+            self.position(ok_bb);
+        }
+
         self.push_scope();
         // The loop variable *is* the induction counter here; hoist it so it
         // survives a `yield` in the body, and spill the `stop`/`step` bounds —
@@ -9895,12 +9996,46 @@ impl<'a> FnLower<'a> {
         let cur = self.load(var, Ty::I64);
         let stop_c = self.reload_invariant(stop_slot, stop, Ty::I64);
         let c = self.new_value(Ty::I1);
-        self.emit(Inst::ICmp {
-            dest: c,
-            pred: CmpPred::Lt,
-            lhs: cur,
-            rhs: stop_c,
-        });
+        if dynamic {
+            // Count up while `cur < stop` for a positive step, down while
+            // `cur > stop` for a negative one: `c = (step > 0) ? lt : gt`.
+            let step_c = self.reload_invariant(step_slot, step, Ty::I64);
+            let zero = self.iconst(Ty::I64, 0);
+            let lt = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: lt,
+                pred: CmpPred::Lt,
+                lhs: cur,
+                rhs: stop_c,
+            });
+            let gt = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: gt,
+                pred: CmpPred::Gt,
+                lhs: cur,
+                rhs: stop_c,
+            });
+            let pos = self.new_value(Ty::I1);
+            self.emit(Inst::ICmp {
+                dest: pos,
+                pred: CmpPred::Gt,
+                lhs: step_c,
+                rhs: zero,
+            });
+            self.emit(Inst::Select {
+                dest: c,
+                cond: pos,
+                a: lt,
+                b: gt,
+            });
+        } else {
+            self.emit(Inst::ICmp {
+                dest: c,
+                pred: CmpPred::Lt,
+                lhs: cur,
+                rhs: stop_c,
+            });
+        }
         self.set_term(Term::BrIf {
             cond: c,
             then_bb: body_bb,
