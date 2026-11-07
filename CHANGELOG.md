@@ -51,7 +51,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   three-argument `range(a, b, step)` now honors the sign of the step — a negative
   step counts down (`range(5, 0, -1)` is `5,4,3,2,1`) — and a zero step raises a
   catchable `ValueError` instead of looping forever; the loop condition used to
-  be an unconditional `cur < stop` (#759).
+  be an unconditional `cur < stop` (#759). The conditional expression `a if cond
+  else b` now evaluates **only the chosen branch** — it lowers to a real branch
+  rather than an eager `select` of both operands — so the non-taken branch's side
+  effects and faults never happen (`xs[0] if xs else default` returns the default
+  on an empty list instead of raising) (#776).
 - **`except*` exception-group handling** (#605, D-0129; epic #614 D13). A `try`
   may now use `except* <type> [as NAME]` clauses to split an aggregate
   `ExceptionGroup` — the one a `scope:` raises on two or more concurrent child

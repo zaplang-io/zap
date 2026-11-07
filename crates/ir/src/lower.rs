@@ -10935,18 +10935,47 @@ impl<'a> FnLower<'a> {
             Expr::IfElse {
                 cond, then, els, ..
             } => {
+                // `a if cond else b` evaluates ONLY the chosen branch (#776): a
+                // real branch on the condition, not an eager `Select` of both
+                // operands (which would run the non-taken branch's side effects
+                // and faults). The two paths merge through a stack slot, like the
+                // `and`/`or` short-circuit above (the IR has no phi). The slot's
+                // alloca is hoisted to the entry block (#91), so it dominates both
+                // arms and the join even though it is created inside the then-arm.
                 let (cv, cty) = self.expr(cond)?;
                 let c = self.truthy(cv, cty);
-                let (a, at) = self.expr(then)?;
-                let (b, _bt) = self.expr(els)?;
-                let d = self.new_value(at);
-                self.emit(Inst::Select {
-                    dest: d,
+                // The pre-branch block dominates both arms and the join, so the
+                // merge slot's `alloca` must live here — not inside the then-arm,
+                // where it would not dominate the else-arm's store (an SSA
+                // violation). The result type is only known after lowering the
+                // then-arm, so the slot is created once that type is in hand and
+                // its alloca is appended to this dominating block (cf. the
+                // or-pattern binding merge).
+                let pre_bb = self.cur;
+                let then_bb = self.new_block();
+                let else_bb = self.new_block();
+                let join_bb = self.new_block();
+                self.set_term(Term::BrIf {
                     cond: c,
-                    a,
-                    b,
+                    then_bb,
+                    else_bb,
                 });
-                Ok((d, at))
+                self.position(then_bb);
+                let (a, at) = self.expr(then)?;
+                let slot = self.new_value(Ty::Ptr);
+                self.func.blocks[pre_bb as usize].insts.push(Inst::Alloca {
+                    dest: slot,
+                    pointee: at,
+                });
+                self.store(slot, a);
+                self.ensure_br(join_bb);
+                self.position(else_bb);
+                let (b, bt) = self.expr(els)?;
+                let b = self.coerce(b, bt, at);
+                self.store(slot, b);
+                self.ensure_br(join_bb);
+                self.position(join_bb);
+                Ok((self.load(slot, at), at))
             }
             // `(name := expr)` — walrus assignment-expression (#600, epic #614
             // D8). Evaluate the operand once, bind `name` to it (by inference,
@@ -12324,24 +12353,44 @@ impl<'a> FnLower<'a> {
                 },
                 Ty::List(_) | Ty::Dict(..),
             ) => {
+                // A conditional whose value is a list/dict: evaluate ONLY the
+                // chosen branch (#776), merging through a slot of the known
+                // `target` type (not an eager `Select` of both branches).
                 let (cv, cty) = self.expr(cond)?;
                 let c = self.truthy(cv, cty);
+                let slot = self.alloca(target);
+                let then_bb = self.new_block();
+                let else_bb = self.new_block();
+                let join_bb = self.new_block();
+                self.set_term(Term::BrIf {
+                    cond: c,
+                    then_bb,
+                    else_bb,
+                });
+                self.position(then_bb);
                 let (a, at) = self.expr_collection_context(then, target)?;
-                let (b, bt) = self.expr_collection_context(els, target)?;
-                if at != target || bt != target {
+                if at != target {
                     return Err(err(format!(
-                        "conditional collection branches must match expected `{}` (found `{}` and `{}`)",
-                        self.render_ty(&target), self.render_ty(&at), self.render_ty(&bt)
+                        "conditional collection branch must match expected `{}` (found `{}`)",
+                        self.render_ty(&target),
+                        self.render_ty(&at)
                     )));
                 }
-                let d = self.new_value(target);
-                self.emit(Inst::Select {
-                    dest: d,
-                    cond: c,
-                    a,
-                    b,
-                });
-                Ok((d, target))
+                self.store(slot, a);
+                self.ensure_br(join_bb);
+                self.position(else_bb);
+                let (b, bt) = self.expr_collection_context(els, target)?;
+                if bt != target {
+                    return Err(err(format!(
+                        "conditional collection branch must match expected `{}` (found `{}`)",
+                        self.render_ty(&target),
+                        self.render_ty(&bt)
+                    )));
+                }
+                self.store(slot, b);
+                self.ensure_br(join_bb);
+                self.position(join_bb);
+                Ok((self.load(slot, target), target))
             }
             _ => self.expr(e),
         }
