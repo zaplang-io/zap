@@ -652,6 +652,7 @@ dotted_name   ::= IDENT { "." IDENT } ;
               spec = [[fill]align][sign]["#"]["0"][width]["." precision][type]
               (Python format mini-language subset; see SPEC §9.3).
    TYPE_KEYWORD  int int32 int64 float float32 float64 i32 i64 f32 f64 bool
+                 uint8 uint16 uint32 uint64 u8 u16 u32 u64 usize
                  char str bytes bigint complex list dict set heap array
                  Python-facing scalar synonyms: `int` is the name for the 64-bit
                  signed integer (= int64/i64, I#581 / PR #582) and `float` the
@@ -659,6 +660,13 @@ dotted_name   ::= IDENT { "." IDENT } ;
                  `int`/`float`. Both are resolved as type names by sema, not
                  reserved by the lexer, so they are spelled as IDENT in
                  `type_name` and usable anywhere a type keyword is (`int x = 0`).
+                 Unsigned integers (#552, D-0019 amendment): `uint8`/`uint16`/
+                 `uint32`/`uint64` with short `uN` spellings, plus pointer-width
+                 `usize` (no short form). These ARE reserved type keywords. They
+                 are the deliberate C-interop / array-dtype surface; there is no
+                 implicit signed<->unsigned conversion and no unsigned literal
+                 suffix — `uintN(x)`/`usize(x)` conversions produce them. `size_t`
+                 is only the C mapping target of `usize`, never a Zap alias.
    DELIM      a regex delimiter char after m/s (e.g. "/", "{", "!")
    Comments   "#" to end of line. Discarded by the parser, but recoverable as
               trivia for tooling (zap fmt/doc) via tokenize_with_trivia (#225).

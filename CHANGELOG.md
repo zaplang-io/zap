@@ -25,6 +25,24 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Unsigned integer types** (#552, D-0019 amendment). `uint8`/`uint16`/
+  `uint32`/`uint64` (with short `u8`/`u16`/`u32`/`u64` spellings) and the
+  pointer-width `usize` are now first-class scalar types — the prerequisite for
+  the C FFI epic (#539, `@repr(c)` #542/#544), whose ABIs are saturated with
+  `unsigned`/`size_t`, and for `uint8` array data. Overflow wraps (two's
+  complement, matching C); they print as unsigned decimal (a `uint64` above
+  `INT64_MAX` shows its true magnitude). There is **no implicit conversion
+  between signed and unsigned** — a mixed arithmetic/comparison/bitwise
+  operation is the new `ZAP4015` error; convert one side explicitly (`uint64(x)`
+  / `int64(x)`). Implicit widening is allowed only up the fixed-width unsigned
+  tower (`uint8`→`uint64`); `usize` converts only explicitly (its width is
+  platform-dependent). `>>` on an unsigned value is a logical shift; `//`/`%`
+  are unsigned `udiv`/`urem`; `/` is true (float) division as for signed. There
+  is no unsigned literal suffix — `uintN(x)`/`usize(x)` conversions produce them,
+  wrapping on out-of-range input (`uint8(-1) == 255`). `usize` is the canonical
+  pointer-width name; `size_t` is only the C mapping target at the FFI boundary,
+  never a Zap alias (D-0019 locks "no type aliases"). **Reserves the new type
+  keywords** `uint8`/`uint16`/`uint32`/`uint64`/`u8`/`u16`/`u32`/`u64`/`usize`.
 - **Language correctness hardening** (epic #374, from CPython differential
   testing). Faults that were silently wrong, uncatchable, or undefined are now
   defined and catchable: `assert` raises a catchable `AssertionError` (so

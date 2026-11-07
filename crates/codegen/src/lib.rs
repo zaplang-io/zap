@@ -1140,6 +1140,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_ffmod", &[f.into(), f.into()], Some(f.into()));
         self.declare_rt("zap_ishl", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_ishr", &[i.into(), i.into()], Some(i.into()));
+        // Unsigned `//`, `%`, `**`, and logical `>>` (#552). Same i64-word ABI
+        // (operands/result are reinterpreted as uint64 inside), so a divide/
+        // modulo by zero raises the same catchable ZeroDivisionError and a
+        // negative `>>` count the same ValueError. `<<` reuses `zap_ishl` (the
+        // bit result is sign-independent).
+        self.declare_rt("zap_udiv", &[i.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_umod", &[i.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_upow", &[i.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_ushr", &[i.into(), i.into()], Some(i.into()));
 
         // Complex scalars are immutable GC objects with a pointer ABI. The
         // runtime owns construction/arithmetic so both AOT and the REPL JIT use
@@ -1190,6 +1199,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // the `zap_reflect_*` entry points back the runtime-reflection surface
         // (metadata registered at startup, queried by `reflect_has`/`reflect_names`).
         self.declare_rt("zap_i64_to_str", &[i.into()], Some(p.into()));
+        // Unsigned decimal rendering (#552): prints a 64-bit *unsigned* word, so
+        // a `uint64` above `INT64_MAX` shows its true magnitude and no value
+        // carries a phantom minus sign. Narrower unsigned values are zero-extended
+        // into the `i64` word by lowering before the call.
+        self.declare_rt("zap_u64_to_str", &[i.into()], Some(p.into()));
         self.declare_rt("zap_str_eq", &[p.into(), p.into()], Some(i.into()));
         // Power-assert value rendering (ticket #73, D-0054).
         self.declare_rt("zap_f64_to_str", &[f.into()], Some(p.into()));
@@ -2128,11 +2142,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     fn basic(&self, t: Ty) -> BasicTypeEnum<'ctx> {
         match t {
             Ty::I1 => self.ctx.bool_type().into(),
-            Ty::I8 => self.ctx.i8_type().into(),
-            Ty::I16 => self.ctx.i16_type().into(),
+            // Unsigned integers share the sign-agnostic LLVM integer type of the
+            // same width as their signed counterparts (#552); signedness lives in
+            // the ops (udiv/urem/lshr, unsigned icmp, zext/uitofp), not the type.
+            Ty::I8 | Ty::U8 => self.ctx.i8_type().into(),
+            Ty::I16 | Ty::U16 => self.ctx.i16_type().into(),
             // `char` is physically an `i32` codepoint (#709).
-            Ty::I32 | Ty::Char => self.ctx.i32_type().into(),
-            Ty::I64 => self.ctx.i64_type().into(),
+            Ty::I32 | Ty::Char | Ty::U32 => self.ctx.i32_type().into(),
+            Ty::I64 | Ty::U64 => self.ctx.i64_type().into(),
             Ty::Enum(_) => self.ctx.i64_type().into(),
             Ty::F32 => self.ctx.f32_type().into(),
             Ty::F64 => self.ctx.f64_type().into(),
@@ -2309,9 +2326,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     fn int_ty(&self, t: Ty) -> IntType<'ctx> {
         match t {
             Ty::I1 => self.ctx.bool_type(),
-            Ty::I8 => self.ctx.i8_type(),
-            Ty::I16 => self.ctx.i16_type(),
-            Ty::I32 | Ty::Char => self.ctx.i32_type(),
+            Ty::I8 | Ty::U8 => self.ctx.i8_type(),
+            Ty::I16 | Ty::U16 => self.ctx.i16_type(),
+            Ty::I32 | Ty::Char | Ty::U32 => self.ctx.i32_type(),
             _ => self.ctx.i64_type(),
         }
     }
@@ -2481,17 +2498,32 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 } else {
                     let (li, ri) = (l.into_int_value(), r.into_int_value());
                     use zir::BinOp::*;
+                    // Select signed vs unsigned integer ops from the result type
+                    // (#552). Add/Sub/Mul and the bitwise And/Or/Xor/Shl are
+                    // sign-agnostic (two's complement); only Div/Rem and the
+                    // right shift differ: unsigned uses `udiv`/`urem` and a
+                    // logical shift (`lshr`), signed uses `sdiv`/`srem`/`ashr`.
+                    let unsigned = ty.is_unsigned();
                     match op {
                         Add => b.build_int_add(li, ri, "add"),
                         Sub => b.build_int_sub(li, ri, "sub"),
                         Mul => b.build_int_mul(li, ri, "mul"),
+                        Div if unsigned => b.build_int_unsigned_div(li, ri, "udiv"),
                         Div => b.build_int_signed_div(li, ri, "sdiv"),
+                        Rem if unsigned => b.build_int_unsigned_rem(li, ri, "urem"),
                         Rem => b.build_int_signed_rem(li, ri, "srem"),
                         And => b.build_and(li, ri, "and"),
                         Or => b.build_or(li, ri, "or"),
                         Xor => b.build_xor(li, ri, "xor"),
                         Shl => b.build_left_shift(li, ri, "shl"),
-                        Shr => b.build_right_shift(li, ri, true, "ashr"),
+                        // `false` => logical right shift (`lshr`) for unsigned;
+                        // `true` => arithmetic (`ashr`) for signed.
+                        Shr => b.build_right_shift(
+                            li,
+                            ri,
+                            !unsigned,
+                            if unsigned { "lshr" } else { "ashr" },
+                        ),
                     }
                     .map_err(|e| e.to_string())?
                     .into()
@@ -2528,8 +2560,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 } else {
                     (lv.into_int_value(), rv.into_int_value())
                 };
+                // Pick the unsigned ordering predicate (ULT/ULE/UGT/UGE) when the
+                // operands are an unsigned integer type (#552); EQ/NE are the
+                // same for both. Signedness comes from the operand type, not the
+                // `i1` result. The `is`/`is not` pointer path only uses EQ/NE.
+                let unsigned = f.value_ty(*lhs).is_unsigned() || f.value_ty(*rhs).is_unsigned();
                 let c = b
-                    .build_int_compare(int_pred(*pred), li, ri, "icmp")
+                    .build_int_compare(int_pred(*pred, unsigned), li, ri, "icmp")
                     .map_err(|e| e.to_string())?;
                 vals[*dest as usize] = Some(c.into());
             }
@@ -2578,6 +2615,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         .build_int_s_extend(v.into_int_value(), self.int_ty(to), "sext")
                         .map_err(|e| e.to_string())?
                         .into(),
+                    // Zero-extend an unsigned source so its value is preserved
+                    // (#552): `uint8(200)` widened stays `200`, not `-56` worth
+                    // of sign bits.
+                    CastKind::ZExt => b
+                        .build_int_z_extend(v.into_int_value(), self.int_ty(to), "zext")
+                        .map_err(|e| e.to_string())?
+                        .into(),
                     CastKind::Trunc => b
                         .build_int_truncate(v.into_int_value(), self.int_ty(to), "trunc")
                         .map_err(|e| e.to_string())?
@@ -2586,8 +2630,27 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         .build_signed_int_to_float(v.into_int_value(), self.float_ty(to), "sitofp")
                         .map_err(|e| e.to_string())?
                         .into(),
+                    // Unsigned int -> float (#552): `uitofp`, so a `uint64` above
+                    // `INT64_MAX` converts to its true magnitude.
+                    CastKind::UIToFP => b
+                        .build_unsigned_int_to_float(
+                            v.into_int_value(),
+                            self.float_ty(to),
+                            "uitofp",
+                        )
+                        .map_err(|e| e.to_string())?
+                        .into(),
                     CastKind::FPToSI => b
                         .build_float_to_signed_int(v.into_float_value(), self.int_ty(to), "fptosi")
+                        .map_err(|e| e.to_string())?
+                        .into(),
+                    // Float -> unsigned int (#552): `fptoui`.
+                    CastKind::FPToUI => b
+                        .build_float_to_unsigned_int(
+                            v.into_float_value(),
+                            self.int_ty(to),
+                            "fptoui",
+                        )
                         .map_err(|e| e.to_string())?
                         .into(),
                     CastKind::FPExt | CastKind::FPTrunc => b
@@ -4219,10 +4282,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     }
 }
 
-fn int_pred(p: CmpPred) -> IntPredicate {
+fn int_pred(p: CmpPred, unsigned: bool) -> IntPredicate {
     match p {
         CmpPred::Eq => IntPredicate::EQ,
         CmpPred::Ne => IntPredicate::NE,
+        // Unsigned operands use the unsigned ordering predicates so a `uint64`
+        // above `INT64_MAX` compares as the larger value, not as negative (#552).
+        CmpPred::Lt if unsigned => IntPredicate::ULT,
+        CmpPred::Le if unsigned => IntPredicate::ULE,
+        CmpPred::Gt if unsigned => IntPredicate::UGT,
+        CmpPred::Ge if unsigned => IntPredicate::UGE,
         CmpPred::Lt => IntPredicate::SLT,
         CmpPred::Le => IntPredicate::SLE,
         CmpPred::Gt => IntPredicate::SGT,

@@ -4129,4 +4129,148 @@ def main():
             "a render inside a try must use the invoke form"
         );
     }
+
+    // --- #552: unsigned integers select the unsigned ZIR ops -----------------
+    //
+    // These lock the op-selection *before* codegen (where LLVM finally emits
+    // udiv/urem/lshr/zext/uitofp/fptoui): a wrong choice here would be a silent
+    // miscompile, so the walled garden asserts on the lowered ZIR directly. The
+    // LLVM text itself is pinned by the `unsigned_ints` golden under CI.
+
+    /// Does `main` contain a `call`/`invoke` to runtime symbol `sym`?
+    fn calls(m: &Module, sym: &str) -> bool {
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        main.blocks.iter().flat_map(|b| &b.insts).any(
+            |i| matches!(i, Inst::Call { func, .. } | Inst::Invoke { func, .. } if func == sym),
+        )
+    }
+
+    /// Does `main` contain a `Cast` of the given kind?
+    fn has_cast(m: &Module, kind: CastKind) -> bool {
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        main.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Cast { kind: k, .. } if *k == kind))
+    }
+
+    fn lower_main(body: &str) -> Module {
+        lower_ok(&format!("def main():\n{body}"))
+    }
+
+    #[test]
+    fn unsigned_floordiv_mod_use_unsigned_helpers() {
+        // `//` and `%` on unsigned operands pick the unsigned runtime helpers
+        // (plain udiv/urem, no floored-sign correction), distinct from the
+        // signed `zap_ifloordiv`/`zap_imod`.
+        let m = lower_main(
+            "    uint64 a = 10\n    uint64 b = 3\n    print(a // b)\n    print(a % b)\n",
+        );
+        assert!(calls(&m, "zap_udiv"), "unsigned // must call zap_udiv");
+        assert!(calls(&m, "zap_umod"), "unsigned % must call zap_umod");
+        assert!(
+            !calls(&m, "zap_ifloordiv"),
+            "must not use the signed floordiv"
+        );
+        assert!(!calls(&m, "zap_imod"), "must not use the signed modulo");
+
+        // The signed tower is unchanged (contrast).
+        let s =
+            lower_main("    int64 a = 10\n    int64 b = 3\n    print(a // b)\n    print(a % b)\n");
+        assert!(calls(&s, "zap_ifloordiv"));
+        assert!(calls(&s, "zap_imod"));
+        assert!(!calls(&s, "zap_udiv"));
+        assert!(!calls(&s, "zap_umod"));
+    }
+
+    #[test]
+    fn unsigned_right_shift_is_logical() {
+        // `>>` on an unsigned value is a logical shift (`zap_ushr`), on a signed
+        // value an arithmetic one (`zap_ishr`). The count here is a variable so
+        // the guarded (non-constant) helper path is exercised.
+        let m = lower_main("    uint32 a = 4000000000\n    uint32 n = 1\n    print(a >> n)\n");
+        assert!(calls(&m, "zap_ushr"), "unsigned >> must be a logical shift");
+        assert!(!calls(&m, "zap_ishr"));
+        let s = lower_main("    int32 a = 16\n    int32 n = 1\n    print(a >> n)\n");
+        assert!(calls(&s, "zap_ishr"));
+        assert!(!calls(&s, "zap_ushr"));
+    }
+
+    #[test]
+    fn unsigned_pow_uses_unsigned_helper() {
+        let m = lower_main("    uint64 a = 2\n    uint64 b = 10\n    print(a ** b)\n");
+        assert!(calls(&m, "zap_upow"));
+        assert!(!calls(&m, "zap_ipow"));
+    }
+
+    #[test]
+    fn unsigned_values_render_unsigned_decimal() {
+        // print/str on every unsigned width routes through the unsigned
+        // formatter, so a value above INT64_MAX prints its true magnitude and no
+        // value carries a phantom sign.
+        for ty in ["uint8", "uint16", "uint32", "uint64", "usize"] {
+            let m = lower_main(&format!("    {ty} x = 7\n    print(x)\n"));
+            assert!(
+                calls(&m, "zap_u64_to_str"),
+                "{ty} must render via zap_u64_to_str"
+            );
+            assert!(
+                !calls(&m, "zap_i64_to_str"),
+                "{ty} must not render as signed"
+            );
+        }
+        // `str()` of a signed int still renders via the signed formatter
+        // (contrast); `str()` of an unsigned one via the unsigned formatter.
+        let s = lower_main("    int64 x = 7\n    auto t = str(x)\n    print(t)\n");
+        assert!(calls(&s, "zap_i64_to_str"));
+        assert!(!calls(&s, "zap_u64_to_str"));
+        let u = lower_main("    uint64 x = 7\n    auto t = str(x)\n    print(t)\n");
+        assert!(calls(&u, "zap_u64_to_str"));
+        assert!(!calls(&u, "zap_i64_to_str"));
+    }
+
+    #[test]
+    fn unsigned_widening_zero_extends() {
+        // Implicit widening up the unsigned tower zero-extends (ZExt), never
+        // sign-extends — `uint8(200)` as a `uint64` stays 200.
+        let m = lower_main("    uint8 b = 200\n    uint64 w = b\n    print(w)\n");
+        assert!(
+            has_cast(&m, CastKind::ZExt),
+            "unsigned widening must zero-extend"
+        );
+        assert!(
+            !has_cast(&m, CastKind::SExt),
+            "unsigned widening must not sign-extend"
+        );
+    }
+
+    #[test]
+    fn unsigned_explicit_conversions_pick_unsigned_casts() {
+        // float(uint) / uint(float) use the unsigned float<->int casts.
+        let to_f = lower_main("    uint64 u = 9\n    print(float(u))\n");
+        assert!(
+            has_cast(&to_f, CastKind::UIToFP),
+            "uint -> float must be uitofp"
+        );
+        let to_u = lower_main("    float f = 9.0\n    uint32 u = uint32(f)\n    print(u)\n");
+        assert!(
+            has_cast(&to_u, CastKind::FPToUI),
+            "float -> uint must be fptoui"
+        );
+        // Narrowing between unsigned widths truncates.
+        let narrow = lower_main("    uint64 w = 300\n    uint8 b = uint8(w)\n    print(b)\n");
+        assert!(
+            has_cast(&narrow, CastKind::Trunc),
+            "uint64 -> uint8 must truncate"
+        );
+    }
+
+    #[test]
+    fn usize_lowers_like_uint64() {
+        // `usize` is pointer-width: it lowers to the same `u64` codegen path, so
+        // its arithmetic/printing use the unsigned helpers.
+        let m = lower_main("    usize n = 5\n    usize m = 2\n    print(n // m)\n");
+        assert!(calls(&m, "zap_udiv"));
+        assert!(calls(&m, "zap_u64_to_str"));
+    }
 }

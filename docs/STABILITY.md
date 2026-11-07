@@ -186,6 +186,18 @@ not supported — it may change in **any** release, including a PATCH:
   non-hashable, variadic, zero-parameter, generic, or no-return function, or a
   method, or `@cache` arguments) is a stable `ZAP5056` error. Experimental:
   surface (e.g. a future `maxsize`/LRU option) may still change pre-1.0.
+- **Unsigned integer types** (#552, D-0019 amendment) — **Experimental**.
+  `uint8`/`uint16`/`uint32`/`uint64` (short `uN` spellings) and pointer-width
+  `usize` are first-class scalar types, reintroduced for the C FFI epic (#539)
+  and array dtypes. Overflow wraps; there is no implicit signed↔unsigned
+  conversion (a mixed operation is the stable `ZAP4015` error); implicit widening
+  is allowed only up the fixed-width unsigned tower; `usize` converts only
+  explicitly. `size_t` is not a Zap type — only the C mapping target of `usize`
+  at the FFI boundary (`@repr(c)`, #542), so **adding unsigned type keywords
+  reserves `uint8`/`uint16`/`uint32`/`uint64`/`u8`/`u16`/`u32`/`u64`/`usize`**
+  (they were previously ordinary identifiers; pre-1.0 this needs no deprecation
+  window, §2). Expected to graduate to Stable with the numeric tower; the exact
+  conversion/overflow surface may still change pre-1.0.
 - **Built-in decorator not in the v1 set** — `@inject` (I#472, D-0109).
   **`@inject` is declined for core**: dependency injection is a framework
   concern, provided by reflection-driven `Depends(...)` adapters (D-0089/D-0092),
