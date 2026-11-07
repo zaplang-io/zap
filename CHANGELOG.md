@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Language correctness hardening** (epic #374, from CPython differential
+  testing). Faults that were silently wrong, uncatchable, or undefined are now
+  defined and catchable: `assert` raises a catchable `AssertionError` (so
+  `except AssertionError` resolves); `float(s)` on a malformed string raises a
+  catchable `ValueError` like `int(s)` (#741); integer `**` with a negative
+  exponent raises `ValueError` instead of silently flooring to `0`; `INT64_MIN
+  // -1` and `% -1` are defined wrapping-int64 results instead of a process
+  abort (#742); float `/` by zero raises `ZeroDivisionError` instead of IEEE
+  `inf`; and a negative shift count raises `ValueError` while a count `>= 64` is
+  a defined "shifted out" value instead of LLVM poison (#740).
 - **`except*` exception-group handling** (#605, D-0129; epic #614 D13). A `try`
   may now use `except* <type> [as NAME]` clauses to split an aggregate
   `ExceptionGroup` — the one a `scope:` raises on two or more concurrent child

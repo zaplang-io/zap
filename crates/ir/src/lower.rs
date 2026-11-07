@@ -8238,7 +8238,10 @@ impl<'a> FnLower<'a> {
             acc = gen_concat(self, acc, rpfx);
             acc = gen_concat(self, acc, rs);
         }
-        self.throwing_call(None, "zap_panic", vec![acc]);
+        // `assert` raises a catchable AssertionError (#374/B7), so `except
+        // AssertionError` resolves and the power-assert text is its message.
+        let assertion_error = self.iconst(Ty::I64, 16); // ZAP_EXC_ASSERTION_ERROR (zaprt.c)
+        self.throwing_call(None, "zap_panic_typed", vec![assertion_error, acc]);
         if !self.terminated() {
             self.set_term(Term::Unreachable);
         }
@@ -18091,6 +18094,7 @@ fn exception_type_id_name(name: &str) -> Option<i64> {
         "ExceptionGroup" => 13,
         "ScopeTimeout" => 14,
         "TimeoutError" => 15,
+        "AssertionError" => 16,
         _ => return None,
     })
 }

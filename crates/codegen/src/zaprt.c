@@ -534,6 +534,10 @@ enum {
      * tell an idle/read timeout apart from a peer close. An ordinary catchable
      * exception under `Exception`. */
     ZAP_EXC_TIMEOUT_ERROR = 15,
+    /* Raised by a failed `assert` (#374/B7, D-0054). An ordinary catchable
+     * exception under `Exception`, so `except AssertionError` (and `except
+     * Exception`) catches it; the power-assert diagnostic is its message. */
+    ZAP_EXC_ASSERTION_ERROR = 16,
 };
 
 void *zap_exception_new(int64_t type_id, void *message) {
@@ -584,6 +588,7 @@ static int64_t zap_exception_parent(int64_t type_id) {
     case ZAP_EXC_ARITHMETIC_ERROR: case ZAP_EXC_RUNTIME_ERROR:
     case ZAP_EXC_STOP_ITERATION: case ZAP_EXC_EXCEPTION_GROUP:
     case ZAP_EXC_SCOPE_TIMEOUT: case ZAP_EXC_TIMEOUT_ERROR:
+    case ZAP_EXC_ASSERTION_ERROR:
         return ZAP_EXC_EXCEPTION;
     case ZAP_EXC_INDEX_ERROR: case ZAP_EXC_KEY_ERROR: return ZAP_EXC_LOOKUP_ERROR;
     case ZAP_EXC_ZERO_DIVISION_ERROR: return ZAP_EXC_ARITHMETIC_ERROR;
@@ -3855,6 +3860,7 @@ static int64_t zap_py_exception_type_id(const char *name) {
     if (strcmp(name, "ExceptionGroup") == 0) return ZAP_EXC_EXCEPTION_GROUP;
     if (strcmp(name, "ScopeTimeout") == 0) return ZAP_EXC_SCOPE_TIMEOUT;
     if (strcmp(name, "TimeoutError") == 0) return ZAP_EXC_TIMEOUT_ERROR;
+    if (strcmp(name, "AssertionError") == 0) return ZAP_EXC_ASSERTION_ERROR;
     if (strcmp(name, "BaseException") == 0) return ZAP_EXC_BASE;
     return ZAP_EXC_EXCEPTION;
 }
