@@ -173,6 +173,40 @@ format) also adds an entry under `[Unreleased]` in
 (PATCH/MINOR/MAJOR) per [`docs/STABILITY.md`](docs/STABILITY.md). How a release
 is cut and how the version bumps is [`docs/RELEASING.md`](docs/RELEASING.md).
 
+## Where documentation lives
+
+Not all writing belongs in the repository. We split documentation by whether it
+is *normative and lasting* or *point-in-time*.
+
+**Stays in the repo (changed via pull requests).** Normative, spec-level,
+tooling-read, and version-coupled docs live in git and evolve with the code:
+[`SPEC.md`](SPEC.md), [`DECISIONS.md`](DECISIONS.md),
+[`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf), [`docs/STABILITY.md`](docs/STABILITY.md),
+`tests/conformance/CLAIMS.md`, [`CHANGELOG.md`](CHANGELOG.md),
+[`README.md`](README.md), [`ROADMAP.md`](ROADMAP.md),
+[`docs/REPO_ARCHITECTURE.md`](docs/REPO_ARCHITECTURE.md), and the contributor
+guides. As a rule of thumb, anything CI or the tests read stays here — for
+example `CLAIMS.md` is cross-checked by the conformance harness, so it cannot
+live anywhere else.
+
+**Goes to [GitHub Discussions](https://github.com/zaplang-io/zap/discussions)
+(not the repo).** Point-in-time, non-normative material belongs in Discussions:
+proposals and RFC-style design debates, snapshot analyses and comparisons, and
+triage write-ups. Pick a category:
+
+- **Ideas** — proposals and RFCs.
+- **General** — analyses and triage write-ups.
+- **Q&A** — answerable design questions.
+- **Announcements** — releases.
+- **Show and tell** — demos.
+
+**When a Discussion settles a decision**, record the outcome in
+[`DECISIONS.md`](DECISIONS.md) as a `D-NNNN` entry and link back to the
+Discussion so the rationale and debate stay discoverable.
+
+This policy applies to *new* documentation going forward; existing in-repo docs
+are not being migrated.
+
 ## Conventions
 
 - **Issue and PR references.** Zap's issues and PRs share one number space on
