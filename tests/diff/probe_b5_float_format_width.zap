@@ -1,4 +1,4 @@
-# diff: match
+# diff: diverge BUG #739: wide float format spec truncates in a fixed buffer — CONFIRMED by PR #738 CI, core defect B5
 # PROBE (epic #374, suspected bug B5): `zap_fmt_flt` formats into a fixed 96-byte
 # buffer, so a wide fixed-point spec is suspected to be silently truncated
 # (snprintf bounds the write, so it is wrong text, not a memory fault). The

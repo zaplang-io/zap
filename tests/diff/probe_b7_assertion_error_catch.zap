@@ -1,4 +1,4 @@
-# diff: match
+# diff: diverge #743: no AssertionError type (except AssertionError -> ZAP3001) — CONFIRMED by PR #738 CI, decision pending (B7)
 # PROBE (epic #374, suspected bug B7): there is no `AssertionError` in the
 # compiler, stdlib, or SPEC §10, so it is unclear what `assert` raises and
 # whether `except AssertionError` resolves at all. CPython raises AssertionError,

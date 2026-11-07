@@ -1,4 +1,4 @@
-# diff: match
+# diff: diverge #743: float / 0.0 yields inf instead of ZeroDivisionError — CONFIRMED by PR #738 CI, decision pending
 # PROBE (epic #374, §10 "other"): true (float) division by zero. CPython raises
 # a catchable `ZeroDivisionError`, so the handler runs and prints `caught`. If
 # Zap follows IEEE and yields `inf` instead, the guarded `print` runs and

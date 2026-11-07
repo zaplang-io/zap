@@ -1,4 +1,4 @@
-# diff: match
+# diff: diverge BUG #740: unmasked shift, count >= 64 is poison/garbage — CONFIRMED by PR #738 CI, core defect B4
 # PROBE (epic #374, suspected bug B4): `<<`/`>>` are suspected to lower to raw
 # LLVM shifts with the count unmasked, so a count >= 64 is poison (undefined).
 # Zap's default int is a wrapping int64 (D-0019), so `1 << 64` cannot equal

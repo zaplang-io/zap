@@ -1,4 +1,4 @@
-# diff: match
+# diff: diverge BUG #741: float(s) on malformed input aborts uncatchably — CONFIRMED by PR #738 CI, core defect B9
 # PROBE (epic #374, suspected bug B9): SPEC §9 says `float(s)` "faults" on a
 # malformed string, whereas `int(s)` raises a catchable `ValueError` (#456).
 # CPython raises a catchable `ValueError` for both, so the handler runs and

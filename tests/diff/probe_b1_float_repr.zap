@@ -1,4 +1,4 @@
-# diff: match
+# diff: diverge BUG #739: float str/print/JSON render via %g (6 sig digits) — CONFIRMED by PR #738 CI, core defect B1
 # PROBE (epic #374, suspected bug B1): `str(float)`/bare `print(float)` are
 # suspected to render via C `%g` (6 significant digits) instead of CPython's
 # shortest round-trip repr. If so, this case FAILS and the MATCH-FAILED report

@@ -1,4 +1,4 @@
-# diff: match
+# diff: diverge #743: dict mutation during iteration is not detected (no RuntimeError) — CONFIRMED by PR #738 CI, decision pending
 # PROBE (epic #374, §10 "other"): deleting a key while iterating a dict. CPython
 # detects the size change and raises a catchable `RuntimeError`, so the handler
 # runs and prints `caught` (observation is order-independent: any mutation trips

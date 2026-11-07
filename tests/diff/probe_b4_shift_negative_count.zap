@@ -1,4 +1,4 @@
-# diff: match
+# diff: diverge BUG #740: negative shift count returns 0 instead of raising ValueError — CONFIRMED by PR #738 CI, core defect B4
 # PROBE (epic #374, suspected bug B4): a negative shift count. CPython raises a
 # catchable `ValueError("negative shift count")`, so the handler runs and prints
 # `caught`. If Zap instead returns poison/garbage (unmasked shift) the guarded
