@@ -47,7 +47,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   supported` (#750). Float `%` is now floored (it takes the sign of the divisor,
   consistent with floored float `//` and integer `%`) instead of C's truncated
   `fmod`/`frem`, so mixed-sign float modulo matches CPython (`5.5 % -2` is
-  `-0.5`) and `x % 0.0` raises a catchable `ZeroDivisionError` (#751).
+  `-0.5`) and `x % 0.0` raises a catchable `ZeroDivisionError` (#751). A
+  three-argument `range(a, b, step)` now honors the sign of the step — a negative
+  step counts down (`range(5, 0, -1)` is `5,4,3,2,1`) — and a zero step raises a
+  catchable `ValueError` instead of looping forever; the loop condition used to
+  be an unconditional `cur < stop` (#759).
 - **`except*` exception-group handling** (#605, D-0129; epic #614 D13). A `try`
   may now use `except* <type> [as NAME]` clauses to split an aggregate
   `ExceptionGroup` — the one a `scope:` raises on two or more concurrent child
