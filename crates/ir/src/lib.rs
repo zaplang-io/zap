@@ -262,6 +262,27 @@ mod tests {
     }
 
     #[test]
+    fn lower_ternary_branches_not_eager_select() {
+        // #776: `a if c else b` lowers to a real conditional branch (`br_if`),
+        // with each arm in its own block, so only the chosen arm runs — it is no
+        // longer an eager `select` that evaluates both operands up front. `main`
+        // here has no other control flow, so the `br_if` is the ternary's.
+        let m = lower_ok(concat!(
+            "def pick(int64 x) -> int64:\n",
+            "    return x\n",
+            "\n",
+            "def main():\n",
+            "    auto c = True\n",
+            "    print(pick(1) if c else pick(2))\n",
+        ));
+        let text = format!("{m}");
+        assert!(
+            text.contains("br_if"),
+            "ternary must lower to a conditional branch:\n{text}"
+        );
+    }
+
+    #[test]
     fn lower_range_step_is_sign_aware() {
         // #759: a 3-arg range tests the step sign at the loop condition (a
         // `select` between `<` and `>`) and raises ValueError on a zero step,

@@ -154,7 +154,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | CTRL-3 | §6 | `for i in range(a, b)` iterates the half-open `[a, b)` | covered | control_flow |
 | CTRL-4 | §6 | `for x in coll` iterates a collection's elements | TODO | — |
 | CTRL-5 | §6 | `range(a, b, step)` honors a negative step (counts down); step 0 raises `ValueError` (#759) | covered | numeric_range_step |
-| CTRL-6 | §6 | the conditional expression `a if c else b` evaluates only the chosen branch (impl gap #776) | TODO | — |
+| CTRL-6 | §6 | the conditional expression `a if c else b` evaluates only the chosen branch (#776) | covered | control_flow_ternary |
 | ITER-1 | §6 | iteration protocol: `__iter__` + comma-ok `__next__` (D-0048) | TODO | — |
 | DOWHILE-1 | §6 | `do` runs its body once before the `while` test (D-0039) | TODO | — |
 | MATCH-1 | §6 | `match`/`case` structural patterns; enum exhaustiveness (D-0040) | covered | match_structural |
