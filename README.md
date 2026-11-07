@@ -19,6 +19,7 @@ metaprogramming system for keeping business logic free of boilerplate.
 - [`docs/STABILITY.md`](docs/STABILITY.md) — versioning & stability policy (the 1.0 contract).
 - [`CHANGELOG.md`](CHANGELOG.md) — notable changes, per [Keep a Changelog](https://keepachangelog.com/) (pre-1.0 / editorial 0.x).
 - [`docs/RELEASING.md`](docs/RELEASING.md) — the release process: tag convention and how the version bumps.
+- [`docs/OFFICIAL_PACKAGE_GUIDELINES.md`](docs/OFFICIAL_PACKAGE_GUIDELINES.md) — best practices for the official non-core packages (`jwt`, `jsonschema`, `redis`, `templates`, …).
 - [`ROADMAP.md`](ROADMAP.md) — the original phased build plan; use the issue tracker and stability policy for current project status.
 - [`OPEN-QUESTIONS.md`](OPEN-QUESTIONS.md) — the tracked backlog.
 - [`docs/GRAMMAR.ebnf`](docs/GRAMMAR.ebnf) — the grammar.

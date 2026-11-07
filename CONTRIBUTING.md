@@ -34,6 +34,7 @@ There is no CLA and no separate sign-off step.
 | `tests/golden/` | Golden end-to-end programs: `name.zap` + `name.expected` (+ optional `.exit`/`.stderr`/`.env`) |
 | `tests/conformance/` | Spec-conformance goldens (I#376): each case cites the `SPEC.md` claim it pins; `CLAIMS.md` is the claim index |
 | [`docs/DIVERGENCE_CHECKLIST.md`](docs/DIVERGENCE_CHECKLIST.md) | Python-divergence checklist, required for every language PR / `D-00xx` |
+| [`docs/OFFICIAL_PACKAGE_GUIDELINES.md`](docs/OFFICIAL_PACKAGE_GUIDELINES.md) | Best practices for official non-core packages (security, limits, testing, docs, release) |
 
 ## Getting set up
 
