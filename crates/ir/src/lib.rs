@@ -262,6 +262,23 @@ mod tests {
     }
 
     #[test]
+    fn lower_float_mod_uses_floored_helper() {
+        // #751: float `%` lowers to the floored `zap_ffmod` runtime helper — a
+        // throwing call (since `% 0.0` raises a catchable ZeroDivisionError) —
+        // not a bare `frem`, so mixed-sign float modulo matches CPython.
+        let module = lower_ok(concat!(
+            "def main():\n",
+            "    f64 x = 5.5\n",
+            "    print(str(x % -2.0))\n",
+        ));
+        let text = format!("{module}");
+        assert!(
+            text.contains("@zap_ffmod"),
+            "float % must call zap_ffmod:\n{text}"
+        );
+    }
+
+    #[test]
     fn lower_aug_assign_subscript_and_field() {
         // #750: augmented assignment to a subscript or field target lowers to a
         // read-modify-write of that one slot, with the base/index evaluated once

@@ -1163,6 +1163,30 @@ double zap_fdiv(double a, double b) {
     return a / b;
 }
 
+/* Floored float modulo (Python semantics, #374/#751): the result takes the sign
+ * of the divisor, consistent with floored float `//` (`zap_ffloordiv`), so the
+ * identity `a == (a // b) * b + (a % b)` holds for floats as it does for ints
+ * (`zap_imod`). C `fmod` truncates toward zero (sign of the dividend), so correct
+ * the remainder when it is non-zero and the operand signs differ; when it is
+ * zero, give the zero the sign of the divisor (CPython's `float_rem`). Modulo by
+ * zero is a catchable ZeroDivisionError (EXC-3, D-0007), like float division by
+ * zero. (nan/inf operands fall through `fmod` unchanged — the sign comparison is
+ * false for a nan remainder, so it is returned as-is.) */
+double zap_ffmod(double a, double b) {
+    if (b == 0.0) {
+        zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("float modulo", 12));
+    }
+    double r = fmod(a, b);
+    if (r != 0.0) {
+        if ((b < 0.0) != (r < 0.0)) {
+            r += b;
+        }
+    } else {
+        r = copysign(0.0, b);
+    }
+    return r;
+}
+
 /* Left shift with a validated count (#374/#740). A negative count raises a
  * catchable ValueError (CPython). Zap's int is a wrapping int64, so a count >=
  * 64 shifts every bit out and is defined as 0 rather than being LLVM poison.

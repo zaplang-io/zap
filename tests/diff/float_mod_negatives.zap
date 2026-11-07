@@ -1,15 +1,15 @@
-# diff: diverge BUG #751: float `%` uses truncated frem, not floored modulo
-# Intent (CPython parity, epic #374 walled garden): float `%` should take the
-# sign of the divisor (floored modulo), consistent with floored float `//`, so
-# `a == (a // b) * b + (a % b)` holds. CPython prints -0.5, 0.5, 2.0 below.
-#
-# Zap currently lowers float `%` to raw LLVM `frem` (C fmod — truncated toward
-# zero, sign of the dividend), so it prints 1.5, -1.5, -1.0 instead. The integer
-# `%` path was already corrected (zap_imod, D-0024) but the float path was not.
-# Pinned as a documented divergence; when #751 lands, the harness flags this as
-# DIVERGENCE-GONE — promote it back to `# diff: match` then. (Same-sign operands
-# already agree; see the matching cases in float_floor_div.zap.)
+# diff: match
+# Float `%` is floored — it takes the sign of the divisor, consistent with
+# floored float `//` — matching CPython (#374, fixed by #751). Mixed-sign
+# operands now agree (they used to use C's truncated `frem`): `5.5 % -2` is -0.5,
+# `-5.5 % 2` is 0.5. A zero remainder takes the sign of the divisor, so
+# `5.0 % -5.0` is -0.0. Same-sign operands are unchanged. Rendered via str().
 def main():
     print(str(5.5 % -2))
     print(str(-5.5 % 2))
     print(str(-7.0 % 3.0))
+    print(str(7.5 % -2))
+    print(str(-4.0 % 2.0))
+    print(str(5.0 % -5.0))
+    print(str(7.5 % 2))
+    print(str(-7.5 % -2))

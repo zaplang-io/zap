@@ -44,7 +44,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `obj.f += v`) now compiles to an evaluate-once read-modify-write of that one
   slot — the base and a side-effecting index are evaluated exactly once, like
   CPython — instead of a `codegen error: only simple variable aug-assignment is
-  supported` (#750).
+  supported` (#750). Float `%` is now floored (it takes the sign of the divisor,
+  consistent with floored float `//` and integer `%`) instead of C's truncated
+  `fmod`/`frem`, so mixed-sign float modulo matches CPython (`5.5 % -2` is
+  `-0.5`) and `x % 0.0` raises a catchable `ZeroDivisionError` (#751).
 - **`except*` exception-group handling** (#605, D-0129; epic #614 D13). A `try`
   may now use `except* <type> [as NAME]` clauses to split an aggregate
   `ExceptionGroup` — the one a `scope:` raises on two or more concurrent child
