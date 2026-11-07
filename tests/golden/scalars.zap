@@ -29,7 +29,7 @@ def main():
     print(int64(2.9))  # 2         (float -> int, truncates toward zero)
 
     print(2 ** 10)  # 1024      (integer power)
-    print(2.0 ** 0.5)  # 1.41421  (float power, sqrt 2)
+    print(2.0 ** 0.5)  # 1.4142135623730951  (float power, sqrt 2)
 
     print(7 // 2)  # 3
     print(-7 // 2)  # -4        (toward -inf; C truncation gives -3)

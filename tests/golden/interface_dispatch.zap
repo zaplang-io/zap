@@ -39,9 +39,9 @@ def main():
     Shape a = Circle(r=2.0)
     Shape b = Square(side=3.0)
     print(a.name())  # circle
-    print(a.area())  # 12.5664  (pi * 2 * 2)
+    print(a.area())  # 12.566370614359172  (pi * 2 * 2)
     print(b.name())  # square
     print(b.area())  # 9.0   (3 * 3)
     # Dispatch through an interface-typed parameter.
-    print(describe(a))  # circle / 12.5664
+    print(describe(a))  # circle / 12.566370614359172
     print(describe(b))  # square / 9.0

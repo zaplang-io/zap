@@ -2620,36 +2620,120 @@ void *zap_i64_to_str(int64_t v) {
     return zap_str_new(tmp, (int64_t)n);
 }
 
-/* Render a double the way CPython's `str(float)` does for the common case:
- * `%g`/`%G` for a compact body, but with a trailing `.0` restored on an
- * integral finite value so a float stays visibly a float (`3.0` -> "3.0", not
- * "3"; I#384). Non-integral values and `inf`/`nan` are left exactly as `%g`
- * prints them. `out` must have room for at least 32 bytes; returns the length
- * written. */
+/* Render a double the way CPython's `str(float)`/`repr(float)` does (I#374/B1):
+ * the **shortest** decimal that round-trips back to the same double, formatted
+ * with CPython's fixed-vs-exponent rule — exponent notation when the decimal
+ * point would fall at or before position -4 or after position 16, fixed
+ * otherwise — and a trailing `.0` on an integer-valued fixed result so a float
+ * stays visibly a float (`3.0` -> "3.0"). `inf`/`-inf`/`nan` render as CPython
+ * does. Replaces the previous `%g` (6 significant digits), which silently lost
+ * precision (`str(1/3)` was "0.333333"). `out` needs room for ~32 bytes;
+ * returns the length written.
+ *
+ * The shortest significant-digit count is found by the standard printf
+ * round-trip: the smallest precision whose `%e` rendering parses back to the
+ * original double. glibc's correctly-rounded `%e`/`strtod` make this agree with
+ * CPython's dtoa for IEEE-754 doubles. */
 static int zap_f64_fmt_g(double v, int upper, char *out, size_t outsz) {
-    int n = snprintf(out, outsz, upper ? "%G" : "%g", v);
-    if (n < 0) {
-        return 0;
+    char echar = upper ? 'E' : 'e';
+    if (isnan(v)) {
+        return snprintf(out, outsz, "%s", upper ? "NAN" : "nan");
     }
-    if ((size_t)n >= outsz) {
-        return n; /* truncated; leave as-is */
+    if (isinf(v)) {
+        const char *s = (v < 0) ? (upper ? "-INF" : "-inf") : (upper ? "INF" : "inf");
+        return snprintf(out, outsz, "%s", s);
     }
-    /* Integral iff the whole rendering is an optional leading '-' then digits:
-     * no '.', no exponent, and not "inf"/"nan". */
-    int integral = (n > 0);
-    for (int i = 0; i < n; i++) {
-        char c = out[i];
-        if (!((c >= '0' && c <= '9') || (i == 0 && c == '-'))) {
-            integral = 0;
+    int negative = signbit(v);
+    double mag = negative ? -v : v;
+
+    /* Smallest precision (0..16 fractional digits = 1..17 significant) whose
+     * %e rendering round-trips. 17 significant digits always suffice. */
+    char sci[40];
+    int k = 0;
+    for (k = 0; k <= 16; k++) {
+        snprintf(sci, sizeof(sci), "%.*e", k, mag);
+        if (strtod(sci, NULL) == mag) {
             break;
         }
     }
-    if (integral && (size_t)n + 3 <= outsz) {
-        out[n++] = '.';
-        out[n++] = '0';
-        out[n] = '\0';
+    if (k > 16) {
+        k = 16;
+        snprintf(sci, sizeof(sci), "%.*e", k, mag);
     }
-    return n;
+
+    /* Parse "d[.ddd]e±XX": significant digits + base-10 exponent of the lead. */
+    char digits[20];
+    int nd = 0;
+    const char *p = sci;
+    digits[nd++] = *p++;
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            digits[nd++] = *p++;
+        }
+    }
+    int E = 0;
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        E = (int)strtol(p, NULL, 10);
+    }
+    while (nd > 1 && digits[nd - 1] == '0') {
+        nd--; /* defensive: a minimal-k %e has no droppable trailing zero */
+    }
+    int decpt = E + 1; /* count of significant digits before the decimal point */
+
+    char tmp[48];
+    int o = 0;
+    if (negative) {
+        tmp[o++] = '-';
+    }
+    if (decpt <= -4 || decpt > 16) {
+        /* Exponential: d[.ddd]e±XX, exponent sign always shown, >= 2 digits. */
+        tmp[o++] = digits[0];
+        if (nd > 1) {
+            tmp[o++] = '.';
+            for (int i = 1; i < nd; i++) {
+                tmp[o++] = digits[i];
+            }
+        }
+        tmp[o++] = echar;
+        int e = decpt - 1;
+        tmp[o++] = (e < 0) ? '-' : '+';
+        int ea = (e < 0) ? -e : e;
+        char ebuf[8];
+        int en = snprintf(ebuf, sizeof(ebuf), "%02d", ea);
+        for (int i = 0; i < en; i++) {
+            tmp[o++] = ebuf[i];
+        }
+    } else if (decpt <= 0) {
+        tmp[o++] = '0';
+        tmp[o++] = '.';
+        for (int i = 0; i < -decpt; i++) {
+            tmp[o++] = '0';
+        }
+        for (int i = 0; i < nd; i++) {
+            tmp[o++] = digits[i];
+        }
+    } else if (decpt >= nd) {
+        for (int i = 0; i < nd; i++) {
+            tmp[o++] = digits[i];
+        }
+        for (int i = 0; i < decpt - nd; i++) {
+            tmp[o++] = '0';
+        }
+        tmp[o++] = '.';
+        tmp[o++] = '0';
+    } else {
+        for (int i = 0; i < decpt; i++) {
+            tmp[o++] = digits[i];
+        }
+        tmp[o++] = '.';
+        for (int i = decpt; i < nd; i++) {
+            tmp[o++] = digits[i];
+        }
+    }
+    tmp[o] = '\0';
+    return snprintf(out, outsz, "%s", tmp);
 }
 
 /* Decimal string for a double (`str(float)`, print, default f-string interp,
