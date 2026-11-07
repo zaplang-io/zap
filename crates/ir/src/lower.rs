@@ -6652,7 +6652,7 @@ impl<'a> FnLower<'a> {
                     let data = if raw {
                         t.clone().into_bytes()
                     } else {
-                        unescape(t)
+                        unescape(t, false)?
                     };
                     let d = self.new_value(Ty::Ptr);
                     self.emit(Inst::StrConst {
@@ -10525,13 +10525,12 @@ impl<'a> FnLower<'a> {
                 let data = if *raw {
                     value.clone().into_bytes()
                 } else {
-                    unescape(value)
+                    unescape(value, *bytes)?
                 };
                 // `b"..."` and `"..."` share the `ZapStr` object; only the static
-                // type differs so byte-wise ops route correctly (I#337). The
-                // literal's bytes are the UTF-8 encoding of the escaped text —
-                // `unescape` has no `\xNN` form, so arbitrary non-UTF-8 bytes use
-                // `bytes([...])`.
+                // type differs so byte-wise ops route correctly (I#337). `unescape`
+                // decodes `\xHH` as a raw byte for a bytes literal and as a
+                // codepoint (UTF-8) for a str (#781).
                 let ty = if *bytes { Ty::Bytes } else { Ty::Ptr };
                 let d = self.new_value(ty);
                 self.emit(Inst::StrConst {
@@ -18734,8 +18733,39 @@ fn regex_flag_bits(flags: &str) -> i64 {
     bits
 }
 
-/// Process the common escape sequences in a (non-raw) string literal.
-fn unescape(s: &str) -> Vec<u8> {
+/// Take exactly `n` hex digits from `chars`, returning their value, or `None`
+/// if fewer than `n` hex digits are available (a malformed `\x`/`\u`/`\U`).
+fn take_hex(chars: &mut std::str::Chars<'_>, n: usize) -> Option<u32> {
+    let mut v: u32 = 0;
+    for _ in 0..n {
+        v = v * 16 + chars.next()?.to_digit(16)?;
+    }
+    Some(v)
+}
+
+/// Encode a Unicode codepoint as UTF-8 into `out`, erroring on a surrogate or an
+/// out-of-range value (CPython raises at compile time; Zap `str` is UTF-8 and
+/// cannot hold a lone surrogate).
+fn push_codepoint(out: &mut Vec<u8>, cp: u32) -> Result<(), LowerError> {
+    let ch = char::from_u32(cp).ok_or_else(|| {
+        err(format!(
+            "invalid Unicode escape: U+{cp:04X} is not a valid codepoint \
+             (surrogates and values above U+10FFFF are not allowed)"
+        ))
+    })?;
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+    Ok(())
+}
+
+/// Process the escape sequences in a (non-raw) string or bytes literal (#374,
+/// #751/#781). Besides the simple escapes, `\xHH` (two hex digits), `\uHHHH`,
+/// and `\UHHHHHHHH` are decoded. In a `str` these denote a Unicode codepoint
+/// (UTF-8 encoded); in a `bytes` literal `\xHH` is the raw byte and `\u`/`\U`
+/// are not special (the backslash is kept, as in CPython). A malformed hex
+/// escape is a compile error. (`\N{NAME}` named escapes are not yet supported;
+/// they pass through unchanged.)
+fn unescape(s: &str, is_bytes: bool) -> Result<Vec<u8>, LowerError> {
     let mut out = Vec::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -18752,6 +18782,28 @@ fn unescape(s: &str) -> Vec<u8> {
             Some('\\') => out.push(b'\\'),
             Some('\'') => out.push(b'\''),
             Some('"') => out.push(b'"'),
+            // `\xHH`: a raw byte in a bytes literal, the codepoint U+00HH in a str.
+            Some('x') => {
+                let v = take_hex(&mut chars, 2)
+                    .ok_or_else(|| err("invalid \\x escape: expected two hex digits"))?;
+                if is_bytes {
+                    out.push(v as u8);
+                } else {
+                    push_codepoint(&mut out, v)?;
+                }
+            }
+            // `\uHHHH` / `\UHHHHHHHH`: a Unicode codepoint (str only). In a bytes
+            // literal these are not escapes, so the backslash is kept.
+            Some('u') if !is_bytes => {
+                let cp = take_hex(&mut chars, 4)
+                    .ok_or_else(|| err("invalid \\u escape: expected four hex digits"))?;
+                push_codepoint(&mut out, cp)?;
+            }
+            Some('U') if !is_bytes => {
+                let cp = take_hex(&mut chars, 8)
+                    .ok_or_else(|| err("invalid \\U escape: expected eight hex digits"))?;
+                push_codepoint(&mut out, cp)?;
+            }
             Some(other) => {
                 out.push(b'\\');
                 let mut buf = [0u8; 4];
@@ -18760,7 +18812,7 @@ fn unescape(s: &str) -> Vec<u8> {
             None => out.push(b'\\'),
         }
     }
-    out
+    Ok(out)
 }
 
 /// Compute a value struct's C-style bitfield packing (I#173, D-0068), or `None`

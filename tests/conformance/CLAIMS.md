@@ -65,7 +65,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | STR-4 | §9.2 | string methods: upper/lower/strip/split/join/find/replace | TODO | — |
 | STR-5 | §9.3 | f-string interpolation renders fields via `str()`/`format` | TODO | — |
 | STR-6 | §9.3 | `format(x, spec)` honors the format mini-language | TODO | — |
-| STRLIT-1 | §9 | string escapes `\x`/`\u`/`\U`/`\N{}` decode to the codepoint (impl gap #781) | TODO | — |
+| STRLIT-1 | §9 | string escapes `\x`/`\u`/`\U` decode to the codepoint (`\xHH` is a raw byte in `bytes`); `\N{}` is a separate unimplemented form (#781) | covered | string_hex_escapes |
 | BYTES-1 | §4.2 | `bytes` is byte-based; `b[i]` is an int64 in `0..=255` | TODO | — |
 | BYTES-2 | §4.2 | `str(bytes)` decodes UTF-8, raising on invalid | TODO | — |
 

@@ -262,6 +262,28 @@ mod tests {
     }
 
     #[test]
+    fn lower_string_hex_unicode_escapes() {
+        // #781: `\x`/`\u`/`\U` decode to the codepoint's UTF-8 in a str literal.
+        let m = lower_ok(concat!(
+            "def main():\n",
+            "    print(\"\\x41\")\n",
+            "    print(\"caf\\u00e9\")\n",
+            "    print(\"\\U0001F600\")\n",
+        ));
+        let t = format!("{m}");
+        assert!(t.contains("strconst \"A\""), "\\x41 -> A:\n{t}");
+        assert!(t.contains("strconst \"café\""), "\\u00e9 -> café:\n{t}");
+        assert!(t.contains('😀'), "\\U0001F600 -> emoji:\n{t}");
+        // A malformed hex escape is a compile (lower) error, not silent.
+        let (ast, _p, _l) = parse_str("def main():\n    print(\"\\x1\")\n");
+        let (_m, errs) = lower_module(&ast);
+        assert!(
+            !errs.is_empty(),
+            "a malformed \\x escape must be a compile error"
+        );
+    }
+
+    #[test]
     fn lower_ternary_branches_not_eager_select() {
         // #776: `a if c else b` lowers to a real conditional branch (`br_if`),
         // with each arm in its own block, so only the chosen arm runs — it is no
