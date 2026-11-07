@@ -220,6 +220,7 @@ Python models data with classes; Zap uses nominal `struct` / `enum` /
 |---|---|---|---|
 | Bottom-tested loop | *(none — `while True` + `break`)* | `do: ... while cond` | Body runs once before the test (D-0039). |
 | Conditional compilation | *(none — runtime checks)* | `when target.os == .linux:` | Compile-time target selection; dead arms are parsed but not checked/lowered (D-0079). |
+| dict / set iteration under mutation | `for k in d: del d[k]` → `RuntimeError` | `for k in d: del d[k]` → runs over a key snapshot, no error | `for ... in <dict>`/`<set>` iterates a snapshot of the keys taken at loop entry (hash order, D-0056), so inserting or deleting during the loop never raises — it simply does not change what the current pass sees. Deliberate, memory-safe divergence from CPython's "changed size during iteration" `RuntimeError` (epic #374; D-0130). |
 
 ---
 

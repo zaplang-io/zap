@@ -5645,3 +5645,24 @@ nested `try`/`except*`). The C runtime cannot be built on the maintainer's
 authoring host (no LLVM-18; Docker unusable), so the codegen + golden layer is
 gated on **CI** (the host leg covers parser/sema/lowering/fmt). Part of the
 CPython grammar-parity pass (epic #614, decision D13).
+
+## D-0130 — dict/set iteration is over a key snapshot (no mutation-during-iteration error)
+
+`for k in d` (and set iteration) iterates a **snapshot** of the container's keys
+taken at loop entry (`zap_dict_keys`), in hash order (D-0056). Inserting or
+deleting keys during the loop is therefore safe and never raises — it simply does
+not change what the current pass sees (the snapshot still yields every key that
+was present at entry). This diverges from CPython, which raises
+`RuntimeError("dictionary changed size during iteration")`.
+
+**Why.** Snapshot iteration is memory-safe and predictable, avoids
+iterator-invalidation faults entirely, and fits Zap's stance that built-in faults
+are catchable and behavior is defined rather than UB (D-0007). A live iterator
+with a modcount guard would add per-step cost and a new failure mode for no
+semantic gain over the snapshot. The cost is that a program relying on CPython's
+guard to catch an accidental concurrent mutation will not see that error in Zap.
+
+Confirmed and pinned by the epic #374 CPython differential probe
+`tests/diff/probe_other_dict_mutate_iter.zap` (kept as `# diff: diverge`) and the
+golden `tests/golden/dict_mutate_during_iter.zap`. Resolves the dict-mutation
+item of the #374 decision batch (#743). (Decided 2026-11-07.)
