@@ -234,6 +234,13 @@ Ed25519 over the message. A public key cannot sign, a wrong curve/family/length
 is rejected, and verification is a plain boolean. See
 [D-0126](DECISIONS.md#d-0126--stdlib-crypto-validated-asymmetric-key-metadataimport--p-256-ecdsa-es256-and-ed25519-signverify-i643).
 
+`crypto.constant_time_eq(a, b)` compares two byte sequences (`str` or `bytes`)
+in time independent of their byte *contents* — for equal-length inputs it never
+reveals through timing how many leading bytes matched. It is backed by OpenSSL
+`CRYPTO_memcmp`. A length difference returns `false` and is observable; no branch
+is taken on byte contents. Intended for HMAC/MAC verification; see
+[D-0131](DECISIONS.md#d-0131--stdlib-crypto-constant-time-byte-comparison-cryptoconstant_time_eq-i729).
+
 `crypto.digest`, `crypto.hmac_sha256_raw`, and `crypto.random_bytes` return
 binary `bytes`, supporting indexing, slicing, concatenation, and equality on
 inferred variables. Streaming hash constructors return opaque handles for

@@ -17,6 +17,10 @@
 //! The raw-bytes HMAC-SHA256 digest (for chaining, e.g. AWS SigV4, #153):
 //!   `crypto.hmac_sha256_raw(key, msg) -> bytes`
 //!
+//! Constant-time byte comparison (#729, D-0131) — timing independent of the
+//! byte *contents* for equal-length inputs; a length difference is observable:
+//!   `crypto.constant_time_eq(a, b) -> bool`
+//!
 //! RSA PKCS#1 v1.5 signing over a PEM-encoded private key (PKCS#1 or PKCS#8),
 //! returning the RAW signature bytes (for CloudFront signed URLs, #628):
 //!   `crypto.rsa_sha1_sign(pem_key, data) -> bytes`
@@ -172,6 +176,30 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                 expect_data(checker, method, &args[1]);
             }
             Some(Ty::Bytes)
+        }
+        // crypto.constant_time_eq(a, b) -> bool (#729, D-0131): true iff the two
+        // byte sequences are equal, compared in time independent of their byte
+        // contents (OpenSSL CRYPTO_memcmp) for equal-length inputs. A length
+        // difference returns false and is observable; no branch is taken on byte
+        // contents. Both args are str|bytes; empty inputs are valid.
+        "constant_time_eq" => {
+            if args.len() != 2 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(a, b) takes 2 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+            }
+            Some(Ty::Bool)
         }
         // RSA PKCS#1 v1.5 signing: crypto.rsa_<hash>_sign(pem_key, data) -> bytes
         // (the raw signature over the hash of `data`). The PEM private key may be

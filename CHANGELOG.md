@@ -116,6 +116,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   JWK JSON/base64url policy stays in the non-core JWT library; only native key
   construction and cryptographic validation live in stdlib. Unblocks
   zaplang-io/jwt.
+- **Constant-time byte comparison in `crypto`** (#729, D-0131; builds on
+  #105/D-0056). `crypto.constant_time_eq(a, b) -> bool` reports whether two byte
+  sequences (`str` or `bytes`; empty inputs valid) are equal, comparing them in
+  time **independent of their byte contents** via OpenSSL `CRYPTO_memcmp`.
+  Guarantee: for equal-length inputs the timing does not reveal how many leading
+  bytes matched; a length difference returns `false` and the length is
+  observable, but no branch is taken on byte contents (the digest length is a
+  public constant in the MAC-comparison use case). This gives HMAC/MAC
+  verification a vetted constant-time compare instead of a hand-rolled
+  XOR-accumulate loop whose timing the compiler/CPU could undermine, unblocking a
+  documented constant-time HMAC comparison in the non-core JWT library
+  (zaplang-io/jwt#11).
 - **General value-rendering (repr/Display) protocol for user types** (#274,
   D-0124; follow-up to #252/#159, extends D-0047/D-0046/D-0018/D-0049). A user
   type with no `__str__`/`__repr__`/`@derive(Repr)` now gets an **automatic

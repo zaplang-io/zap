@@ -14766,6 +14766,7 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
  * the runtime owns the fd and closes it exactly once via `zap_sock_shutdown`.
  * ========================================================================== */
 #include <openssl/bn.h>
+#include <openssl/crypto.h> /* CRYPTO_memcmp: constant-time compare (#729)     */
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/err.h>
@@ -14776,6 +14777,43 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
+
+/* ==========================================================================
+ * crypto: constant-time byte comparison (ticket #729, D-0131)
+ * --------------------------------------------------------------------------
+ * `crypto.constant_time_eq(a, b)` returns 1 iff the two byte sequences are
+ * equal, comparing them in time independent of their byte *contents*, so a
+ * verifier cannot learn through timing how many leading bytes matched (the
+ * classic MAC-comparison side channel the downstream JWT library needs, #729).
+ *
+ * Backed by OpenSSL's `CRYPTO_memcmp`, which is written to compare every byte
+ * with no early-out and no data-dependent branch (unlike libc `memcmp`, which
+ * the compiler/CPU may short-circuit). OpenSSL is already linked (`-lssl
+ * -lcrypto`) for `tls`/RSA, so this needs no new dependency and lives here with
+ * the other OpenSSL-backed crypto entries rather than in the self-contained
+ * reference-hash section above.
+ *
+ * Guarantee (see D-0131): for EQUAL-LENGTH inputs the running time is
+ * independent of the byte contents. A LENGTH DIFFERENCE is reported as a
+ * mismatch (return 0) and the length itself is observable — in the HMAC use
+ * case the digest length is a public constant, so this leaks nothing secret.
+ * Crucially there is NO branch on byte *contents*: the only early return is on
+ * the (non-secret) length. `str` and `bytes` share the `ZapStr*` ABI; empty
+ * inputs are valid (two empty inputs are equal). No GC safepoint runs across
+ * the call and no allocation is performed. */
+int64_t zap_crypto_constant_time_eq(void *a, void *b) {
+    const ZapStr *x = (const ZapStr *)a;
+    const ZapStr *y = (const ZapStr *)b;
+    if (x->len != y->len) {
+        /* Length is not secret (it is public in the MAC-comparison use case);
+         * this is the only early-out and it never inspects byte contents. */
+        return 0;
+    }
+    /* CRYPTO_memcmp compares all `len` bytes with data-independent timing and
+     * returns 0 iff they are equal. With len == 0 it inspects no bytes and
+     * returns 0, so two empty inputs compare equal. */
+    return CRYPTO_memcmp(x->data, y->data, (size_t)x->len) == 0 ? 1 : 0;
+}
 
 /* ==========================================================================
  * crypto: RSA PKCS#1 v1.5 signing (ticket #628, D-0102)

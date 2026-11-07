@@ -10,6 +10,8 @@
 //!     -> bytes`
 //!   - `zap_crypto_hmac_sha256/512(key, msg) -> str` (hex)
 //!   - `zap_crypto_hmac_sha256_raw(key, msg) -> bytes` (raw digest, #153)
+//!   - `zap_crypto_constant_time_eq(a, b) -> i64` (0/1), OpenSSL CRYPTO_memcmp
+//!     (#729) — content-independent timing for equal-length inputs
 //!   - `zap_crypto_rsa_sha1_sign/sha256_sign(pem_key, data) -> bytes` (raw PKCS#1
 //!     v1.5 signature, #628) and `zap_crypto_rsa_sha256_verify(pem_pubkey, data,
 //!     sig) -> i64` (0/1) — the only OpenSSL-backed crypto entries
@@ -48,6 +50,14 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         "zap_crypto_hmac_sha256_raw",
         &[p.into(), p.into()],
         Some(p.into()),
+    );
+    // Constant-time byte comparison (#729, D-0131): (a, b) -> i64 (0/1). Backed
+    // by OpenSSL CRYPTO_memcmp; timing is independent of byte contents for
+    // equal-length inputs. A length difference returns 0 and is observable.
+    cg.declare_rt(
+        "zap_crypto_constant_time_eq",
+        &[p.into(), p.into()],
+        Some(i.into()),
     );
     // RSA PKCS#1 v1.5 signing (OpenSSL-backed, #628): (pem_key, data) -> bytes.
     cg.declare_rt(
