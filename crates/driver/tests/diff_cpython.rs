@@ -787,9 +787,10 @@ pub mod gen {
         /// One `print(...)` statement drawn from the safe kinds. The grammar is
         /// deliberately restricted to constructs Zap and CPython agree on *and*
         /// Zap codegen fully supports today: integer `+`/`-`/`*` with unary
-        /// minus, boolean logic over boolean operands, comparisons (single and
-        /// Python-chained, I#386), string concat/len, ternaries, and a
-        /// comprehension count. It avoids every known divergence/gap — int64
+        /// minus and floored `//`/`%` (nonzero literal divisor), boolean logic
+        /// over boolean operands, comparisons (single and Python-chained, I#386),
+        /// string concat/len/case-methods, ternaries, and a comprehension count.
+        /// It avoids every known divergence/gap — int64
         /// overflow, true division's float repr, non-bool `and`/`or` values,
         /// dict iteration order, and the unsupported list
         /// slice/`in`/negative-index — so a failure here is a genuine,
@@ -824,15 +825,18 @@ pub mod gen {
         }
 
         /// Fully-parenthesized integer expression; leaves are 0..=9 with an
-        /// explicit unary-minus node. Only `+`/`-`/`*` — true division (`/`) is
-        /// excluded for its float repr (a documented divergence point, see
-        /// division.zap). Bounded depth
+        /// explicit unary-minus node. Covers `+`/`-`/`*` plus floored `//` and
+        /// `%` (whose right operand is a literal `1..=9`, so the divisor is never
+        /// zero); floored division and modulo match CPython for every sign of the
+        /// left operand (see floor_div_negatives.zap / mod_negatives.zap). True
+        /// division (`/`) stays excluded — it yields a float. `**` stays excluded
+        /// too — it overflows int64 fast (a documented divergence). Bounded depth
         /// keeps results well inside int64, so the two engines must agree.
         fn int_expr(&mut self, depth: u32) -> String {
             if depth == 0 || self.below(3) == 0 {
                 return self.below(10).to_string();
             }
-            match self.below(4) {
+            match self.below(6) {
                 0 => format!(
                     "({} + {})",
                     self.int_expr(depth - 1),
@@ -848,6 +852,11 @@ pub mod gen {
                     self.int_expr(depth - 1),
                     self.int_expr(depth - 1)
                 ),
+                // Floored `//` / `%` with a guaranteed-nonzero literal divisor
+                // (1..=9). The left operand may be any (possibly negative)
+                // sub-expression; floored semantics agree with CPython there.
+                3 => format!("({} // {})", self.int_expr(depth - 1), 1 + self.below(9)),
+                4 => format!("({} % {})", self.int_expr(depth - 1), 1 + self.below(9)),
                 _ => format!("(-{})", self.int_expr(depth - 1)),
             }
         }
@@ -900,16 +909,24 @@ pub mod gen {
         }
 
         /// Fully-parenthesized string expression over a small literal pool.
+        /// Covers `+` concatenation and the `.upper()` / `.lower()` case methods.
+        /// The pool is ASCII, so case mapping matches CPython exactly (the
+        /// ASCII-only divergence of `.upper()` on non-ASCII is not exercised
+        /// here); both methods pass through `zap_to_python` unchanged.
         fn str_expr(&mut self, depth: u32) -> String {
             if depth == 0 || self.below(3) == 0 {
                 let pool = ["", "a", "bc", "Zap", "xy", "123"];
                 return format!("\"{}\"", pool[self.below(pool.len() as u64) as usize]);
             }
-            format!(
-                "({} + {})",
-                self.str_expr(depth - 1),
-                self.str_expr(depth - 1)
-            )
+            match self.below(4) {
+                0 | 1 => format!(
+                    "({} + {})",
+                    self.str_expr(depth - 1),
+                    self.str_expr(depth - 1)
+                ),
+                2 => format!("({}).upper()", self.str_expr(depth - 1)),
+                _ => format!("({}).lower()", self.str_expr(depth - 1)),
+            }
         }
     }
 }

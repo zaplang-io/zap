@@ -51,6 +51,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | NUM-5 | §5 | `**` is exponentiation | TODO | — |
 | NUM-6 | §5 | bitwise and/or/xor/not/shift operators on signed integers | TODO | — |
 | NUM-7 | §4.1 | widening implicit, narrowing explicit (D-0020) | TODO | — |
+| NUM-8 | §5 | float `%` takes the sign of the divisor (floored), consistent with int `%` (impl gap #751) | TODO | — |
 | BIG-1 | §4.1 | bigint arithmetic and comparisons retain arbitrary precision; conversions are explicit and range-checked | covered | bigint_arithmetic |
 | CPLX-1 | §4.1 | imaginary literals, complex arithmetic, equality, and rendering use the documented complex value model | covered | complex_arithmetic |
 
@@ -64,6 +65,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | STR-4 | §9.2 | string methods: upper/lower/strip/split/join/find/replace | TODO | — |
 | STR-5 | §9.3 | f-string interpolation renders fields via `str()`/`format` | TODO | — |
 | STR-6 | §9.3 | `format(x, spec)` honors the format mini-language | TODO | — |
+| STRLIT-1 | §9 | string escapes `\x`/`\u`/`\U`/`\N{}` decode to the codepoint (impl gap #781) | TODO | — |
 | BYTES-1 | §4.2 | `bytes` is byte-based; `b[i]` is an int64 in `0..=255` | TODO | — |
 | BYTES-2 | §4.2 | `str(bytes)` decodes UTF-8, raising on invalid | TODO | — |
 
@@ -151,6 +153,8 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | CTRL-2 | §6 | `while` loops while its condition is truthy | covered | control_flow |
 | CTRL-3 | §6 | `for i in range(a, b)` iterates the half-open `[a, b)` | covered | control_flow |
 | CTRL-4 | §6 | `for x in coll` iterates a collection's elements | TODO | — |
+| CTRL-5 | §6 | `range(a, b, step)` honors a negative step (counts down); step 0 raises `ValueError` (impl gap #759) | TODO | — |
+| CTRL-6 | §6 | the conditional expression `a if c else b` evaluates only the chosen branch (impl gap #776) | TODO | — |
 | ITER-1 | §6 | iteration protocol: `__iter__` + comma-ok `__next__` (D-0048) | TODO | — |
 | DOWHILE-1 | §6 | `do` runs its body once before the `while` test (D-0039) | TODO | — |
 | MATCH-1 | §6 | `match`/`case` structural patterns; enum exhaustiveness (D-0040) | covered | match_structural |
@@ -162,6 +166,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 |---|---|---|---|---|
 | DECL-1 | §3 | the two decl forms are `TYPE name = v` and `auto name = v` | TODO | — |
 | DECL-2 | §3 | reassignment uses no type and no `auto` | TODO | — |
+| AUGSUB-1 | §3 | augmented assignment to a subscript or field target (`xs[i] += v`, `o.f += v`) (impl gap #750) | TODO | — |
 | DECL-3 | §3 | bindings are mutable by default; `const` is immutable (D-0006) | TODO | — |
 | SCAL-1 | §4.1 | scalars have value semantics (copied on assign/pass, D-0023) | TODO | — |
 | REF-1 | §4.3 | list/dict/struct instances are passed by reference (D-0023) | TODO | — |
