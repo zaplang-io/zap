@@ -1236,7 +1236,10 @@ mod tests {
         assert!(text.contains("SIToFP"), "text:\n{text}"); // int -> float
         assert!(text.contains("FPExt"), "text:\n{text}"); // float32 -> float64
                                                           // Power and floor-division lower to runtime helpers.
-        assert!(text.contains("call @zap_ipow"), "text:\n{text}");
+        // Integer `**` can raise a catchable ValueError on a negative exponent
+        // (#374/B2), so in `main` (implicit top-level handler) it is an
+        // `invoke`, like `zap_ifloordiv` below.
+        assert!(text.contains("invoke @zap_ipow"), "text:\n{text}");
         assert!(text.contains("call @zap_powf"), "text:\n{text}");
         // Integer `//` is a catchable divide-by-zero fault (EXC-3), so in `main`
         // (which has the implicit top-level handler) it is an `invoke`; the float
@@ -1248,8 +1251,10 @@ mod tests {
     #[test]
     fn pow_lowers_by_operand_kind() {
         // All-integer `**` -> zap_ipow; any float operand -> zap_powf.
+        // The integer helper can raise (negative exponent, #374/B2), so in
+        // `main` it lowers as an `invoke`.
         let m = lower_ok("def main():\n    print(2 ** 10)\n");
-        assert!(format!("{m}").contains("call @zap_ipow"));
+        assert!(format!("{m}").contains("invoke @zap_ipow"));
         let m = lower_ok("def main():\n    print(2.0 ** 3.0)\n");
         assert!(format!("{m}").contains("call @zap_powf"));
     }

@@ -11456,12 +11456,13 @@ impl<'a> FnLower<'a> {
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
                 if vt == Ty::Ptr {
+                    // A malformed string raises a catchable `ValueError`
+                    // (zap_str_parse_float -> zap_panic, #741), so this must be
+                    // an unwinding `invoke` inside a `try` — a plain `call`
+                    // would let the exception escape past the handler and
+                    // terminate, exactly like int() above (#456).
                     let d = self.new_value(Ty::F64);
-                    self.emit(Inst::Call {
-                        dest: Some(d),
-                        func: "zap_str_parse_float".to_string(),
-                        args: vec![v],
-                    });
+                    self.throwing_call(Some(d), "zap_str_parse_float", vec![v]);
                     return Ok((d, Ty::F64));
                 }
                 return Ok((self.as_f64(v, vt), Ty::F64));
@@ -17478,8 +17479,10 @@ impl<'a> FnLower<'a> {
                 // `**` over the numeric tower (D-0019). A floating-point base or
                 // exponent goes through libm `pow` (f64); the all-integer case
                 // uses a binary-exponentiation runtime helper and keeps an
-                // integer result per the static type (a negative exponent yields
-                // the floor of the true power — 0 for |base| > 1).
+                // integer result per the static type. A negative exponent has no
+                // integer result, so `zap_ipow` raises a catchable `ValueError`
+                // (#374/B2) rather than silently flooring to 0; use a float base
+                // (`2.0 ** -1`) for a real negative power.
                 if is_float {
                     let lf = self.as_f64(l, lt);
                     let rf = self.as_f64(r, rt);
@@ -17494,11 +17497,11 @@ impl<'a> FnLower<'a> {
                     let li = self.coerce(l, lt, Ty::I64);
                     let ri = self.coerce(r, rt, Ty::I64);
                     let d = self.new_value(Ty::I64);
-                    self.emit(Inst::Call {
-                        dest: Some(d),
-                        func: "zap_ipow".to_string(),
-                        args: vec![li, ri],
-                    });
+                    // A negative exponent raises a catchable `ValueError`
+                    // (zap_ipow -> zap_panic, #374/B2), so this must be an
+                    // unwinding `invoke` that reaches the `try` landing pad,
+                    // like int()/float() parse and the div/mod faults.
+                    self.throwing_call(Some(d), "zap_ipow", vec![li, ri]);
                     Ok((d, Ty::I64))
                 }
             }
