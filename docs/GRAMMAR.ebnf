@@ -367,8 +367,20 @@ for_stmt      ::= "for" target "in" expr block ;
                      (yield), built-ins, str and channels use the same protocol. *)
 
 try_stmt      ::= "try" block
-                  { "except" [ type [ "as" IDENT ] ] block }
-                  [ "finally" block ] ;         (* D-0007, D-0029 *)
+                  ( { "except" [ type [ "as" IDENT ] ] block }
+                  | { "except" "*" type [ "as" IDENT ] block } )
+                  [ "finally" block ] ;         (* D-0007, D-0029; except* #605/D-0129 *)
+                  (* A `try` is all-`except` or all-`except*` — the two forms
+                     cannot be mixed (ZAP3001). An `except*` clause (group
+                     handling, #605) requires a type (no bare catch-all): it
+                     peels the sub-exceptions of the in-flight `ExceptionGroup`
+                     matching `type` into a sub-group, binds `as IDENT` to that
+                     group (always a group, even for one match), and runs its
+                     handler; EVERY matching clause runs, and the unmatched
+                     remainder auto-re-raises after the last clause (bare for a
+                     single survivor, a group for two or more). A bare exception
+                     is matched as a one-element group. `eg.exceptions` yields the
+                     sub-exception messages as a `list[str]`. *)
 
 with_stmt     ::= "with" with_item { "," with_item } block ;  (* D-0027, D-0069 *)
 with_item     ::= expr [ "as" IDENT ] ;

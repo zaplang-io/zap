@@ -299,6 +299,7 @@ fn run_body(
             ty: expected_type,
             binding: Some("__zt_e".to_string()),
             body: block(handler),
+            is_star: false,
             span: SP,
         }],
         finally: if finally.is_empty() {

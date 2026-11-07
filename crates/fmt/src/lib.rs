@@ -909,6 +909,12 @@ impl<'a> Printer<'a> {
         for ex in excepts {
             self.advance_to(ex.span.start, 1);
             let mut head = "except".to_string();
+            // `except*` group-handling clause (#605, D-0129): the `*` binds to
+            // the keyword with no space (Python canonical form), then a space
+            // before the type.
+            if ex.is_star {
+                head.push('*');
+            }
             if let Some(t) = &ex.ty {
                 head.push(' ');
                 head.push_str(&type_str(t));
@@ -1224,6 +1230,20 @@ mod tests {
         // its body, and the `return inner` trailer re-emit byte-for-byte.
         let src = "decorator retry(int64 times):\n    def wrap(call):\n        def inner(*args):\n            for i in range(times):\n                try:\n                    return call(*args)\n                except Error:\n                    if i == times - 1:\n                        raise\n        return inner\n";
         assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
+    fn except_star_round_trips() {
+        // `except*` group-handling clauses (#605, D-0129): the `*` re-emits
+        // attached to the keyword (`except* E`, Python canonical), with the type,
+        // `as` binding, and multiple clauses all byte-for-byte stable.
+        let src = "def main():\n    try:\n        raise ValueError(\"x\")\n    except* TimeoutError as t:\n        print(t)\n    except* ValueError as v:\n        print(v)\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        // The spaced input form `except *E` canonicalizes to `except* E`.
+        let spaced = "def main():\n    try:\n        pass\n    except *ValueError:\n        pass\n";
+        let canonical =
+            "def main():\n    try:\n        pass\n    except* ValueError:\n        pass\n";
+        assert_eq!(format_source(spaced).unwrap(), canonical);
     }
 
     #[test]

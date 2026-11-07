@@ -2581,6 +2581,12 @@ impl Parser {
         while self.is_kw(Keyword::Except) {
             let estart = self.peek_span().start;
             self.bump();
+            // `except*` (#605, D-0129): a group-handling clause. The `*` binds
+            // tightly to `except` (Python spelling), with or without surrounding
+            // whitespace (`except* E`, `except *E`). The all-`except` /
+            // all-`except*` rule and the "a type is required" rule are enforced
+            // in sema, not here, so the parser stays permissive.
+            let is_star = self.eat(&TokenKind::Star);
             let ty = if self.is(&TokenKind::Colon) {
                 None
             } else {
@@ -2596,6 +2602,7 @@ impl Parser {
                 ty,
                 binding,
                 body: eb,
+                is_star,
                 span: self.span_from(estart),
             });
         }
@@ -5217,6 +5224,45 @@ def demo(int64 n):
             panic!("scope");
         };
         assert!(matches!(body.stmts[0], Stmt::Pass(_)));
+    }
+
+    #[test]
+    fn parses_except_star_clauses() {
+        // `except*` (#605, D-0129): the `*` sets `is_star`, the type and `as`
+        // binding parse as usual, and plain `except` stays `is_star == false`.
+        // Both spacings (`except* E` and `except *E`) are accepted.
+        let src = "\
+def main():
+    try:
+        pass
+    except* TimeoutError as t:
+        pass
+    except *ValueError as v:
+        pass
+";
+        let m = parse_ok(src);
+        let Item::Function(f) = &m.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::Try { excepts, .. } = &f.body.stmts[0] else {
+            panic!("try");
+        };
+        assert_eq!(excepts.len(), 2);
+        assert!(excepts[0].is_star);
+        assert_eq!(excepts[0].binding.as_deref(), Some("t"));
+        assert!(excepts[1].is_star);
+        assert_eq!(excepts[1].binding.as_deref(), Some("v"));
+
+        // A plain `except` clause is not starred.
+        let plain =
+            parse_ok("def main():\n    try:\n        pass\n    except ValueError:\n        pass\n");
+        let Item::Function(pf) = &plain.items[0] else {
+            panic!("fn");
+        };
+        let Stmt::Try { excepts, .. } = &pf.body.stmts[0] else {
+            panic!("try");
+        };
+        assert!(!excepts[0].is_star);
     }
 
     #[test]

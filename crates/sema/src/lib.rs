@@ -3322,6 +3322,25 @@ impl Checker {
                 ..
             } => {
                 self.check_block(body);
+                // A `try` is all-`except` or all-`except*` — the two forms
+                // cannot be mixed (#605, D-0129). The first clause sets the mode;
+                // any clause disagreeing with it is rejected once, at its own
+                // span, so the diagnostic points at the offending clause.
+                let any_star = excepts.iter().any(|ex| ex.is_star);
+                let all_star = excepts.iter().all(|ex| ex.is_star);
+                if any_star && !all_star {
+                    for ex in excepts.iter() {
+                        if ex.is_star != excepts[0].is_star {
+                            self.error(
+                                ErrorCode::ZAP3001,
+                                "a 'try' cannot mix 'except' and 'except*' clauses: use one \
+                                 form for all handlers (#605)"
+                                    .to_string(),
+                                ex.span,
+                            );
+                        }
+                    }
+                }
                 for (i, ex) in excepts.iter().enumerate() {
                     match &ex.ty {
                         Some(Type::Named { name, args, .. })
@@ -3338,7 +3357,17 @@ impl Checker {
                             ex.span,
                         ),
                         None => {
-                            if i + 1 < excepts.len() {
+                            // `except*` always peels a typed sub-group, so a
+                            // bare catch-all `except*:` is meaningless (#605).
+                            if ex.is_star {
+                                self.error(
+                                    ErrorCode::ZAP3001,
+                                    "'except*' requires an exception type; a bare catch-all \
+                                     'except*:' is not allowed (#605)"
+                                        .to_string(),
+                                    ex.span,
+                                );
+                            } else if i + 1 < excepts.len() {
                                 self.error(
                                     ErrorCode::ZAP3001,
                                     "a catch-all except clause must be last".to_string(),
@@ -10430,6 +10459,122 @@ import python "math" as m
 def main():
     auto v = m.pi
     bool r = v is None
+"#);
+    }
+
+    // ---- `except*` exception-group handling (#605, D-0129) ----------------
+
+    #[test]
+    fn except_star_type_checks() {
+        // A single `except*` clause, multiple `except*` clauses, `as` binding,
+        // and `.exceptions` iteration on the bound group all type-check.
+        ok(r#"
+def main():
+    try:
+        raise ValueError("bad")
+    except* ValueError as eg:
+        for m in eg.exceptions:
+            print(m)
+"#);
+        ok(r#"
+def main():
+    try:
+        raise TimeoutError("t")
+    except* TimeoutError as t:
+        print(t)
+    except* ValueError as v:
+        print(v)
+"#);
+        // `except*` with no binding is fine (the group is handled, not inspected).
+        ok(r#"
+def main():
+    try:
+        raise ValueError("bad")
+    except* ValueError:
+        print("handled")
+"#);
+        // A user-defined exception type is a valid `except*` target.
+        ok(r#"
+struct MyError:
+    str msg
+def main():
+    try:
+        raise MyError("x")
+    except* MyError as eg:
+        print(eg)
+"#);
+        // Nested `try`/`except*`.
+        ok(r#"
+def main():
+    try:
+        try:
+            raise ValueError("inner")
+        except* ValueError as inner:
+            print(inner)
+    except* TimeoutError as outer:
+        print(outer)
+"#);
+    }
+
+    #[test]
+    fn except_star_cannot_mix_with_plain_except() {
+        // A `try` is all-`except` or all-`except*` — never a mix (#605, D-0129).
+        // The offending clause is flagged with ZAP3001, in either order.
+        for src in [
+            "def main():\n    try:\n        raise ValueError(\"x\")\n    except ValueError:\n        print(1)\n    except* TimeoutError:\n        print(2)\n",
+            "def main():\n    try:\n        raise ValueError(\"x\")\n    except* TimeoutError:\n        print(1)\n    except ValueError:\n        print(2)\n",
+        ] {
+            let e = errors(src);
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP3001
+                    && x.message.contains("cannot mix")),
+                "expected ZAP3001 'cannot mix' for {src:?}, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_except_star_is_rejected() {
+        // `except*` must name a type; a bare catch-all `except*:` is meaningless
+        // (it would peel no particular sub-group) and is rejected (ZAP3001).
+        let e = errors(
+            "def main():\n    try:\n        raise ValueError(\"x\")\n    except*:\n        print(1)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP3001
+                && x.message.contains("'except*' requires an exception type")),
+            "expected ZAP3001 'requires an exception type' for bare except*, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn except_star_unknown_type_is_rejected() {
+        // An `except*` naming an unknown type is rejected exactly like `except`.
+        let e = errors(
+            "def main():\n    try:\n        raise ValueError(\"x\")\n    except* NoSuchError:\n        print(1)\n",
+        );
+        assert!(
+            e.iter()
+                .any(|x| x.code == ErrorCode::ZAP3001
+                    && x.message.contains("unknown exception type")),
+            "expected ZAP3001 'unknown exception type' for except* NoSuchError, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn all_except_star_clauses_are_accepted() {
+        // Three `except*` clauses (all-star, the valid form) produce no mixing
+        // error — the mixing check fires only when the forms actually differ.
+        ok(r#"
+def main():
+    try:
+        raise ValueError("x")
+    except* ValueError:
+        print(1)
+    except* TimeoutError:
+        print(2)
+    except* KeyError:
+        print(3)
 "#);
     }
 }

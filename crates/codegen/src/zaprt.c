@@ -493,14 +493,21 @@ typedef struct {
     int64_t type_id;
     void *message;
     void *cause;
+    /* `children` carries the real sub-exception objects of an `ExceptionGroup`
+     * (#605, D-0129): a `ZapList` of exception-object pointers, or NULL for a
+     * non-group exception. It is what `except* E as eg` splits by type and what
+     * `eg.exceptions` iterates. Traced precisely (the list in turn traces its
+     * elements), so the whole group stays live while it is in flight. */
+    void *children;
 } ZapException;
 #define ZAP_EXCEPTION_MAGIC UINT64_C(0x5a41504558434550)
 static const int32_t zap_exc_ptr_offsets[] = {
     (int32_t)offsetof(ZapException, message),
     (int32_t)offsetof(ZapException, cause),
+    (int32_t)offsetof(ZapException, children),
 };
 static const ZapTypeDesc zap_desc_exception = {
-    (int64_t)sizeof(ZapException), ZAP_TD_PRECISE, 2, zap_exc_ptr_offsets};
+    (int64_t)sizeof(ZapException), ZAP_TD_PRECISE, 3, zap_exc_ptr_offsets};
 static void *zap_current_exc;
 
 enum {
@@ -535,6 +542,7 @@ void *zap_exception_new(int64_t type_id, void *message) {
     e->type_id = type_id;
     e->message = message;
     e->cause = NULL;
+    e->children = NULL;
     return e;
 }
 
@@ -5633,6 +5641,115 @@ static void *make_exception_group(void **excs, int64_t n) {
     return zap_str_new(buf, off);
 }
 
+/* ---- ExceptionGroup split / inspect for `except*` (#605, D-0129) ----------- *
+ * An ExceptionGroup carries its real sub-exception objects in `children` (a
+ * ZapList of exception pointers). `except*` peels matching sub-exceptions out of
+ * a mutable working set into typed sub-groups, re-raising the remainder;
+ * `eg.exceptions` iterates the sub-exception messages. Children are kept in a
+ * stable (sorted-by-message) order so the rendered message, `.exceptions`, and
+ * the goldens are deterministic regardless of coroutine scheduling. */
+
+/* Build an ExceptionGroup carrying `list_` (a ZapList of exception objects). The
+ * children are sorted in place to match `make_exception_group`'s rendering. */
+void *zap_eg_new(void *list_) {
+    ZapList *l = (ZapList *)list_;
+    if (l->len > 1) {
+        qsort(l->data, (size_t)l->len, sizeof(int64_t), exc_cmp);
+    }
+    void *msg = make_exception_group((void **)l->data, l->len);
+    ZapException *e = (ZapException *)zap_exception_new(ZAP_EXC_EXCEPTION_GROUP, msg);
+    e->children = l;
+    l->elem_ptr = 1; /* precise GC: the children words are exception pointers */
+    return e;
+}
+
+/* Build an ExceptionGroup from a C array of `n` exception objects (the scope
+ * join path, D-0045): copy them into a ZapList, then wrap as a carrying group. */
+static void *build_exception_group(void **excs, int64_t n) {
+    ZapList *l = (ZapList *)zap_list_new();
+    for (int64_t i = 0; i < n; i++) {
+        zap_list_push_ptr(l, excs[i]);
+    }
+    return zap_eg_new(l);
+}
+
+/* The working "remaining" set for `except*`: a fresh ZapList of the still-
+ * unhandled sub-exceptions. A group contributes a shallow copy of its children
+ * (so the original group is never mutated); a bare exception contributes itself
+ * as a one-element list, so a single failure matches `except* E` (D-0129). */
+void *zap_eg_remaining(void *exc) {
+    ZapList *out = (ZapList *)zap_list_new();
+    ZapException *e = (ZapException *)exc;
+    if (e && e->magic == ZAP_EXCEPTION_MAGIC && e->type_id == ZAP_EXC_EXCEPTION_GROUP
+        && e->children) {
+        ZapList *ch = (ZapList *)e->children;
+        for (int64_t i = 0; i < ch->len; i++) {
+            zap_list_push_ptr(out, (void *)(intptr_t)ch->data[i]);
+        }
+    } else {
+        zap_list_push_ptr(out, exc);
+    }
+    return out;
+}
+
+/* Peel every remaining sub-exception matching `type_id` into a fresh sub-group,
+ * removing them from `remaining_` (compacted in place). Returns the sub-group
+ * (always an ExceptionGroup, even for a single match), or NULL when nothing
+ * matched — then the clause's handler is skipped (#605, D-0129). */
+void *zap_eg_split(void *remaining_, int64_t type_id) {
+    ZapList *rem = (ZapList *)remaining_;
+    ZapList *matched = (ZapList *)zap_list_new();
+    int64_t w = 0;
+    for (int64_t r = 0; r < rem->len; r++) {
+        void *child = (void *)(intptr_t)rem->data[r];
+        if (zap_exception_is_a(child, type_id)) {
+            zap_list_push_ptr(matched, child);
+        } else {
+            rem->data[w++] = rem->data[r];
+        }
+    }
+    rem->len = w;
+    if (matched->len == 0) {
+        return NULL;
+    }
+    return zap_eg_new(matched);
+}
+
+/* After all `except*` clauses: decide what the unmatched remainder re-raises.
+ * Nothing left -> NULL (no re-raise); one survivor -> that exception bare (so a
+ * plain enclosing `except E` catches it, keeping Zap's bare-for-single rule);
+ * two or more -> a fresh ExceptionGroup of the remainder (#605, D-0129). */
+void *zap_eg_finalize_remainder(void *remaining_) {
+    ZapList *rem = (ZapList *)remaining_;
+    if (rem->len == 0) {
+        return NULL;
+    }
+    if (rem->len == 1) {
+        return (void *)(intptr_t)rem->data[0];
+    }
+    return zap_eg_new(rem);
+}
+
+/* `eg.exceptions` (#605): the sub-exception message strings of an exception, as
+ * a `list[str]` for manual inspection / iteration. A group yields one entry per
+ * child in its stable order; a bare exception yields a one-element list of its
+ * own message, so inspection is uniform whether or not a group was caught. */
+void *zap_exception_exceptions(void *exc) {
+    ZapList *out = (ZapList *)zap_list_new();
+    ZapException *e = (ZapException *)exc;
+    if (e && e->magic == ZAP_EXCEPTION_MAGIC && e->type_id == ZAP_EXC_EXCEPTION_GROUP
+        && e->children) {
+        ZapList *ch = (ZapList *)e->children;
+        for (int64_t i = 0; i < ch->len; i++) {
+            void *child = (void *)(intptr_t)ch->data[i];
+            zap_list_push_ptr(out, zap_exception_message(child));
+        }
+    } else {
+        zap_list_push_ptr(out, zap_exception_message(exc));
+    }
+    return out;
+}
+
 /* Normal-exit join (D-0044 rule 2/3): await the owned coroutines, then re-raise
  * their failure — the single exception, or an `ExceptionGroup` when several
  * failed concurrently (D-0045). No failure => returns normally. */
@@ -5656,8 +5773,7 @@ void zap_scope_exit(void *scope_) {
     if (sc->nexc == 1) {
         zap_raise(sc->excs[0]);
     }
-    zap_raise(zap_exception_new(ZAP_EXC_EXCEPTION_GROUP,
-                                make_exception_group(sc->excs, sc->nexc)));
+    zap_raise(build_exception_group(sc->excs, sc->nexc));
 }
 
 /* Early-exit/failure join (D-0044 rule 4): the parent block is leaving with its
@@ -5690,8 +5806,7 @@ void *zap_scope_exit_cancel_exc(void *scope_, void *pending) {
     if (pending_is_cancel && sc->nexc > 0) {
         if (sc->timed_out) scope_discard_timeout_msg(sc); /* child failure outranks */
         if (sc->nexc == 1) return sc->excs[0];
-        return zap_exception_new(ZAP_EXC_EXCEPTION_GROUP,
-                                 make_exception_group(sc->excs, sc->nexc));
+        return build_exception_group(sc->excs, sc->nexc);
     }
     if (pending_is_cancel && sc->timed_out) {
         return scope_timeout_exc(sc);

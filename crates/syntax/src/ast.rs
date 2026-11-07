@@ -647,6 +647,12 @@ pub struct ExceptClause {
     pub ty: Option<Type>,
     pub binding: Option<String>,
     pub body: Block,
+    /// `except*` group-handling clause (#605, D-0129). When `true`, this clause
+    /// peels the sub-exceptions matching [`ty`](ExceptClause::ty) out of the
+    /// in-flight `ExceptionGroup` into a sub-group, binds `binding` to that
+    /// group, and the unmatched remainder auto-re-raises after all clauses. A
+    /// single `try` is all-`except` or all-`except*` (mixing is ZAP3001).
+    pub is_star: bool,
     pub span: Span,
 }
 

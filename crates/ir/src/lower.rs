@@ -8480,6 +8480,7 @@ impl<'a> FnLower<'a> {
                     stmts: vec![set_flag],
                     span: sp,
                 },
+                is_star: false,
                 span: sp,
             }],
             finally: None,
@@ -8581,6 +8582,17 @@ impl<'a> FnLower<'a> {
         self.position(lp);
         let exc = self.new_value(Ty::Ptr);
         self.emit(Inst::LandingPad { dest: exc });
+
+        // `except*` group handling (#605, D-0129) takes a distinct path: every
+        // matching clause runs (unlike plain `except`, where only the first
+        // match runs), each peeling its sub-exceptions out of the in-flight
+        // group, and the unmatched remainder auto-re-raises after all clauses.
+        // sema has already enforced that the clauses are all-`except*` (so this
+        // branch covers every clause) and that each carries a type.
+        if excepts.first().is_some_and(|c| c.is_star) {
+            return self.lower_try_star(exc, excepts, finally, after);
+        }
+
         let mut has_catch_all = false;
         for clause in excepts {
             let matched = self.new_block();
@@ -8697,6 +8709,189 @@ impl<'a> FnLower<'a> {
                 self.set_term(Term::Unreachable);
             }
         }
+
+        self.position(after);
+        Ok(())
+    }
+
+    /// Lower the `except*` clauses of a `try` (#605, D-0129). The landing pad has
+    /// already run `begin_catch`, binding the in-flight exception object to
+    /// `exc`. Unlike plain `except` (first-match-only), **every** `except*`
+    /// clause whose type matches some sub-exception runs: each peels its matches
+    /// out of a shared mutable "remaining" working set into a sub-group, binds
+    /// its `as NAME` to that group, and runs its handler; control then falls to
+    /// the *next* clause (not out of the `try`). After the last clause, whatever
+    /// is left in `remaining` auto-re-raises — the single remaining exception
+    /// bare (so a plain enclosing `except E` catches it, keeping Zap's
+    /// bare-for-single rule), or an `ExceptionGroup` when two or more remain.
+    ///
+    /// The one `begin_catch` is balanced by exactly one `end_catch` on the way
+    /// out, on both the re-raise and the clean-exit edge (and by the per-clause
+    /// `Cleanup::EndCatch` on any early `return`/`break`/`raise` inside a
+    /// handler). A handler that itself raises replaces the in-flight exception
+    /// and abandons the remainder, mirroring the plain-`except` handler-throw
+    /// path (its landing pad closes both catches, runs `finally`, and re-raises).
+    fn lower_try_star(
+        &mut self,
+        exc: Value,
+        excepts: &[ast::ExceptClause],
+        finally: Option<&ast::Block>,
+        after: BlockId,
+    ) -> Result<(), LowerError> {
+        // The mutable working set of still-unhandled sub-exceptions: the group's
+        // children, or a fresh one-element list `[exc]` for a bare exception (so
+        // a single failure matches `except* E`, treating it as a one-element
+        // group — D-0129). Defined in the landing pad, which dominates every
+        // clause block, so the value flows to each `split` below.
+        let remaining = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(remaining),
+            func: "zap_eg_remaining".to_string(),
+            args: vec![exc],
+        });
+
+        for clause in excepts {
+            // sema guarantees an `except*` clause names a built-in or user
+            // exception type; recover its runtime type id for the split.
+            let Some(type_id) = clause.ty.as_ref().and_then(exception_type_id) else {
+                return Err(err(
+                    "'except*' requires a named exception type (#605)".to_string()
+                ));
+            };
+            // Peel every remaining sub-exception matching this clause's type into
+            // a fresh sub-group (always a group, even for a single match), and
+            // remove them from `remaining`. A null result means nothing matched,
+            // so this clause's handler is skipped.
+            let id = self.iconst(Ty::I64, type_id);
+            let matched = self.new_value(Ty::Ptr);
+            self.emit(Inst::Call {
+                dest: Some(matched),
+                func: "zap_eg_split".to_string(),
+                args: vec![remaining, id],
+            });
+            let no_match = self.new_value(Ty::I1);
+            self.emit(Inst::IsNull {
+                dest: no_match,
+                val: matched,
+            });
+            let body_bb = self.new_block();
+            let next_bb = self.new_block();
+            self.set_term(Term::BrIf {
+                cond: no_match,
+                then_bb: next_bb,
+                else_bb: body_bb,
+            });
+
+            self.position(body_bb);
+            self.push_scope();
+            if let Some(bind) = &clause.binding {
+                // `except* E as eg` binds `eg` to the sub-GROUP. Its value is the
+                // group's rendered message string (like `except E as e`); the
+                // group object is stashed under the non-typable key so
+                // `eg.exceptions` can iterate the real sub-exceptions (#605),
+                // exactly as `e.cause` reaches the stashed object (#604).
+                let message = self.new_value(Ty::Ptr);
+                self.emit(Inst::Call {
+                    dest: Some(message),
+                    func: "zap_exception_message".to_string(),
+                    args: vec![matched],
+                });
+                let slot = self.alloca(Ty::Ptr);
+                self.store(slot, message);
+                self.declare(bind, slot, Ty::Ptr);
+                let obj_slot = self.alloca(Ty::Ptr);
+                self.store(obj_slot, matched);
+                self.declare(&exc_obj_key(bind), obj_slot, Ty::Ptr);
+            }
+            // A raise inside the handler unwinds to `handler_lp`. Register
+            // `finally` (if any) then `end_catch` as cleanups so an early
+            // `return`/`break`/`continue` runs `end_catch` first, then `finally`
+            // — the single `begin_catch` is closed exactly once on every exit.
+            let handler_lp = self.new_block();
+            self.landing_pads.push(handler_lp);
+            let cleanup_depth = self.cleanups.len();
+            if let Some(f) = finally {
+                self.cleanups.push(Cleanup::Finally(f.clone()));
+            }
+            self.cleanups.push(Cleanup::EndCatch);
+            // The matched sub-group is the active exception for the handler, so a
+            // bare `raise` (#657) re-throws it.
+            self.active_exc.push(matched);
+            for st in &clause.body.stmts {
+                self.stmt(st)?;
+            }
+            self.active_exc.pop();
+            self.landing_pads.pop();
+            let handler_throws = self.used_lps.contains(&handler_lp);
+            self.cleanups.truncate(cleanup_depth);
+            self.pop_scope();
+            // Normal completion falls through to the NEXT clause's split (not out
+            // of the `try`): another `except*` clause may still match.
+            self.ensure_br(next_bb);
+            if handler_throws {
+                // A new exception raised by the handler replaces the caught group
+                // and abandons the remainder. Close the handler's catch and the
+                // outer `try` catch, run `finally`, then re-raise.
+                self.position(handler_lp);
+                let replacement = self.new_value(Ty::Ptr);
+                self.emit(Inst::LandingPad { dest: replacement });
+                self.emit_end_catch();
+                self.emit_end_catch();
+                if let Some(f) = finally {
+                    self.lower_block(f)?;
+                }
+                if !self.terminated() {
+                    self.throwing_call(None, "zap_raise", vec![replacement]);
+                    if !self.terminated() {
+                        self.set_term(Term::Unreachable);
+                    }
+                }
+            }
+            self.position(next_bb);
+        }
+
+        // After all clauses: re-raise whatever is still unhandled. `finalize`
+        // returns null (nothing left), the single remaining exception (re-raised
+        // bare), or a fresh `ExceptionGroup` of the two-or-more remainder.
+        let rem = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(rem),
+            func: "zap_eg_finalize_remainder".to_string(),
+            args: vec![remaining],
+        });
+        let nothing_left = self.new_value(Ty::I1);
+        self.emit(Inst::IsNull {
+            dest: nothing_left,
+            val: rem,
+        });
+        let reraise_bb = self.new_block();
+        let done_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: nothing_left,
+            then_bb: done_bb,
+            else_bb: reraise_bb,
+        });
+
+        // Unhandled remainder: close the catch, run `finally`, re-raise.
+        self.position(reraise_bb);
+        self.emit_end_catch();
+        if let Some(f) = finally {
+            self.lower_block(f)?;
+        }
+        if !self.terminated() {
+            self.throwing_call(None, "zap_raise", vec![rem]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+        }
+
+        // Clean exit: close the catch, run `finally`, continue past the `try`.
+        self.position(done_bb);
+        self.emit_end_catch();
+        if let Some(f) = finally {
+            self.lower_block(f)?;
+        }
+        self.ensure_br(after);
 
         self.position(after);
         Ok(())
@@ -10489,6 +10684,24 @@ impl<'a> FnLower<'a> {
                                 args: vec![obj],
                             });
                             return Ok((d, Ty::Ptr));
+                        }
+                    }
+                    // `eg.exceptions` on a caught exception binding (#605, D-0129):
+                    // the sub-exception message strings of an `ExceptionGroup`, as
+                    // a `list[str]` for manual inspection / iteration. A bare
+                    // (non-group) exception yields a one-element list of its own
+                    // message, so inspection is uniform. Resolved off the stashed
+                    // exception object, exactly like `.cause`.
+                    if name == "exceptions" {
+                        if let Some((obj_slot, _)) = self.lookup(&exc_obj_key(tyname)) {
+                            let obj = self.load(obj_slot, Ty::Ptr);
+                            let d = self.new_value(Ty::List(Elem::Ptr));
+                            self.emit(Inst::Call {
+                                dest: Some(d),
+                                func: "zap_exception_exceptions".to_string(),
+                                args: vec![obj],
+                            });
+                            return Ok((d, Ty::List(Elem::Ptr)));
                         }
                     }
                     // Built-in module constant `math.pi`-style access (ticket

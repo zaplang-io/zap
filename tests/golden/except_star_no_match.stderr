@@ -1,0 +1,3 @@
+ExceptionGroup (2 sub-exceptions):
+  - bad-value
+  - t-out
