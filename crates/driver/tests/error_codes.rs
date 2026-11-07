@@ -135,6 +135,16 @@ fn eq_none_on_value_type_is_rejected() {
 }
 
 #[test]
+fn augmented_assign_to_const_is_rejected() {
+    // A `const` binding cannot be reassigned, including via an augmented
+    // assignment (D-0003; #374 walled garden, operators).
+    assert_code(
+        "def main():\n    const int64 c = 5\n    c += 1\n",
+        "ZAP3017",
+    );
+}
+
+#[test]
 fn json_payload_carries_the_code() {
     // The structured surface agents consume must expose the code as a field.
     let r = check_source("def main():\n    x = 1 +\n");
