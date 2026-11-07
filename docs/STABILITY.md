@@ -463,6 +463,15 @@ encrypted keys are rejected deterministically without prompting. The surface is
 **Experimental** like the rest of `crypto`; the JWK JSON/base64url layer lives in
 the non-core JWT library.
 
+`crypto.constant_time_eq(a, b) -> bool` (#729, D-0131) compares two `str`/`bytes`
+sequences in time **independent of their byte contents**, backed by OpenSSL
+`CRYPTO_memcmp`. For equal-length inputs the timing does not reveal how many
+leading bytes matched; a length difference returns `false` and the length is
+observable, but no branch is taken on byte contents. It does not hide the input
+lengths, and the guarantee covers the comparison itself, not surrounding
+marshalling. **Experimental** like the rest of `crypto`; intended for HMAC/MAC
+verification in the non-core JWT library.
+
 The `http` client verbs `get`/`post`/`request` gained an **optional trailing
 `dict[str, str]` of request headers** (#280) and already expose response
 `status`/`header`/`body` accessors, and the server-side `http.respond` gained

@@ -134,6 +134,8 @@ mod tests {
     auto rsa256 = crypto.rsa_sha256_sign("invalid PEM", b"message")
     auto verified = crypto.rsa_sha256_verify("invalid PEM", b"message", b"sig")
     assert not verified
+    auto ct_eq = crypto.constant_time_eq(b"message", b"message")
+    assert ct_eq
     int32 count32 = 4
     int64 count64 = 4
     auto random = crypto.random_bytes(count32)
@@ -152,6 +154,8 @@ mod tests {
             ("zap_crypto_rsa_sha256_sign", Ty::Bytes),
             // Runtime verification returns int64; call_bool normalizes to i1.
             ("zap_crypto_rsa_sha256_verify", Ty::I64),
+            // Constant-time compare returns int64 (0/1); call_bool normalizes.
+            ("zap_crypto_constant_time_eq", Ty::I64),
             ("zap_crypto_digest", Ty::Bytes),
             ("zap_crypto_hexdigest", Ty::Ptr),
             ("zap_crypto_hmac_sha256_raw", Ty::Bytes),

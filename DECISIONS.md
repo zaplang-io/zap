@@ -5666,3 +5666,49 @@ Confirmed and pinned by the epic #374 CPython differential probe
 `tests/diff/probe_other_dict_mutate_iter.zap` (kept as `# diff: diverge`) and the
 golden `tests/golden/dict_mutate_during_iter.zap`. Resolves the dict-mutation
 item of the #374 decision batch (#743). (Decided 2026-11-07.)
+
+## D-0131 — stdlib `crypto`: constant-time byte comparison (`crypto.constant_time_eq`, I#729)
+
+`crypto.constant_time_eq(a, b) -> bool` returns whether two byte sequences are
+equal, comparing them in time **independent of their byte contents**. Both
+arguments accept `str` or `bytes` (they share the `ZapStr*` byte-data ABI);
+empty inputs are valid and two empty inputs are equal. It is backed by OpenSSL's
+`CRYPTO_memcmp` (already linked `-lssl -lcrypto` for `tls`/RSA, D-0102/D-0126),
+which compares every byte with no early-out and no data-dependent branch — unlike
+libc `memcmp`, which the compiler or CPU may short-circuit on the first differing
+byte.
+
+**Guarantee (precise).** For **equal-length** inputs the running time is
+independent of the byte *contents*: a caller cannot learn through timing how many
+leading bytes matched. A **length difference** is reported as a mismatch
+(`false`) and the length itself is **observable** — the implementation's only
+early return is on the (non-secret) length, and it **never branches on byte
+contents**. In the target use case — comparing a computed HMAC/MAC against a
+presented one — the digest length is a public constant, so the length channel
+leaks nothing secret. What is explicitly **not** guaranteed: hiding the input
+lengths, and any timing property for the surrounding allocation/marshalling
+rather than the comparison itself. NUL bytes are ordinary content, never
+terminators; a trailing NUL changes the length and so makes inputs unequal.
+
+**Why.** HMAC (symmetric) signature verification must compare the computed MAC
+against the presented signature without leaking, through timing, how many leading
+bytes matched. In pure Zap a library can only write an XOR-accumulate loop, which
+the compiler/CPU may still optimize or short-circuit; there is no language- or
+stdlib-level guarantee of data-independent timing. `zaplang-io/jwt` shipped
+exactly such a loop with an explicit "no constant-time guarantee" note; this
+primitive lets it offer and document a genuine constant-time HMAC comparison
+(unblocks zaplang-io/jwt#11 item 8). A vetted primitive (`CRYPTO_memcmp`) is
+preferred over a hand-rolled loop so the guarantee does not rest on compiler
+behavior. Asymmetric paths (RS256/ES256/EdDSA) verify inside OpenSSL and are
+unaffected.
+
+Registered in sema (`crates/sema/src/modules/crypto.rs`, two `str|bytes` args →
+`bool`), lowered through `zap_crypto_constant_time_eq` (i64 0/1, normalized to
+`i1` by `call_bool`; non-throwing — a length mismatch is `false`, never a panic),
+and implemented in `crates/codegen/src/zaprt.c` alongside the other OpenSSL-backed
+crypto entries. Pinned by the golden `tests/golden/crypto_constant_time_eq.zap`,
+which exhaustively fixes the equality semantics (equal, same-length first/middle/
+last-byte differences, length differences and prefixes, empty and single-byte
+inputs, `str`/`bytes` equivalence, high bytes, embedded NULs, and a realistic
+HMAC-digest comparison). **Experimental**, like the rest of `crypto`.
+(Decided 2026-11-07.)

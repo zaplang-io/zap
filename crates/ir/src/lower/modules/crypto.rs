@@ -53,7 +53,8 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_new" => Ty::Ptr,
         "zap_crypto_rsa_sha256_verify"
         | "zap_crypto_p256_sha256_verify"
-        | "zap_crypto_ed25519_verify" => Ty::I1,
+        | "zap_crypto_ed25519_verify"
+        | "zap_crypto_constant_time_eq" => Ty::I1,
         "zap_crypto_key_bits" | "zap_crypto_key_is_private" => Ty::I64,
         "zap_crypto_update" => Ty::Void,
         _ => return Err(err("unknown crypto runtime symbol in result-type table")),
@@ -244,6 +245,21 @@ fn lower(
                 lowerer,
                 "zap_crypto_hmac_sha256_raw",
                 vec![key, msg],
+            )?))
+        }
+        // crypto.constant_time_eq(a, b) -> bool (#729, D-0131). The runtime
+        // returns i64 (0/1); call_crypto normalizes to i1. Not throwing — a
+        // length mismatch returns false, never a panic.
+        "constant_time_eq" => {
+            if args.len() != 2 {
+                return Err(err("crypto.constant_time_eq takes exactly two arguments"));
+            }
+            let (a, _) = lowerer.expr(&args[0].value)?;
+            let (b, _) = lowerer.expr(&args[1].value)?;
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_crypto_constant_time_eq",
+                vec![a, b],
             )?))
         }
         // crypto.rsa_<hash>_sign(pem_key, data) -> bytes (#628): the raw PKCS#1
