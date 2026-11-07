@@ -1477,6 +1477,7 @@ impl Mono<'_> {
                         ty: ec.ty.as_ref().map(|t| self.rewrite_type(t)),
                         binding: ec.binding.clone(),
                         body: self.rewrite_block(&ec.body, env)?,
+                        is_star: ec.is_star,
                         span: ec.span,
                     });
                 }

@@ -859,6 +859,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[ptr.into()],
             Some(ptr.into()),
         );
+        // `except*` ExceptionGroup split / inspect (#605, D-0129). The group
+        // carries its real sub-exceptions; `remaining` yields a mutable working
+        // set, `split` peels the matches of a type into a sub-group (or null),
+        // `finalize_remainder` decides the auto-re-raise, and `exceptions` gives
+        // the `list[str]` of sub-exception messages for `eg.exceptions`.
+        self.declare_rt("zap_eg_remaining", &[ptr.into()], Some(ptr.into()));
+        self.declare_rt("zap_eg_split", &[ptr.into(), i64t.into()], Some(ptr.into()));
+        self.declare_rt("zap_eg_finalize_remainder", &[ptr.into()], Some(ptr.into()));
+        self.declare_rt("zap_exception_exceptions", &[ptr.into()], Some(ptr.into()));
         self.declare_rt("zap_eh_begin_catch", &[ptr.into()], Some(ptr.into()));
         self.declare_rt("zap_eh_end_catch", &[], None);
         self.declare_rt("zap_uncaught", &[ptr.into()], None);

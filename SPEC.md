@@ -1092,6 +1092,47 @@ finally:
   re-raise rides on the green-stack unwinder (I#475) and is a follow-up; type
   and value/identity are preserved today.
 
+### 10.1 `except*` — exception-group handling (D-0129, #605)
+
+A `scope:` that collects two or more concurrent child failures re-raises them as
+an aggregate `ExceptionGroup` (§12, D-0045). `except*` handles such a group
+declaratively — the Python 3.11 construct, with Zap's bare-for-single rule:
+
+```python
+try:
+    scope:
+        spawn fetch(a)          # raises TimeoutError
+        spawn parse(b)          # raises ValueError
+except* TimeoutError as timeouts:
+    for m in timeouts.exceptions:   # eg is always a GROUP; iterate its messages
+        log_retry(m)
+except* ValueError as values:
+    report(values)
+```
+
+- A `try` is **all-`except` or all-`except*`** — the two forms cannot be mixed
+  (`ZAP3001`). An `except*` clause **requires a type**; a bare catch-all
+  `except*:` is rejected (`ZAP3001`).
+- Each `except*` clause peels the sub-exceptions of the in-flight group matching
+  its type (subclasses included) into a **sub-`ExceptionGroup`**, binds `as NAME`
+  to that group (always a group, even for a single match), and runs its handler.
+  Unlike plain `except` (first-match-only), **every** `except*` clause whose type
+  matches some sub-exception runs, in source order.
+- A **bare** (non-group) exception is matched as a **one-element group**, so a
+  single failure caught by `except* E` behaves uniformly — `try/except E` (single
+  failure) and `except*` (fan-out) coexist.
+- After the last clause the **unmatched remainder auto-re-raises**: nothing when
+  all sub-exceptions were handled, the single survivor **bare** (so a plain
+  enclosing `except E` still catches it, keeping bare-for-single), or a fresh
+  `ExceptionGroup` when two or more remain.
+- The `ExceptionGroup` type is retained: `except ExceptionGroup as eg` still
+  catches a whole group, and `eg.exceptions` yields the sub-exception messages as
+  a `list[str]` for manual inspection (iteration). Sub-exceptions are kept in a
+  stable, sorted-by-message order, so group rendering and `.exceptions` agree
+  regardless of coroutine scheduling.
+- A handler that itself raises replaces the in-flight group and abandons the
+  remainder (mirroring plain `except`); `finally` still runs.
+
 ## 11. Resource cleanup (D-0027)
 
 Context managers and `try/finally` (no Go-style `defer`):
@@ -1138,7 +1179,7 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
 - **Cancellation (D-0033; surface D-0044):** structured concurrency — a `scope:`
   block owns the coroutines spawned inside it and joins them at the dedent; a
   child failure cancels siblings and re-raises (an aggregate `ExceptionGroup` if
-  several fail, D-0045). `scope(timeout=<ms>, on_error=OnError.Cancel|Wait)`
+  several fail, D-0045), which `except*` can split by type (§10.1, D-0129). `scope(timeout=<ms>, on_error=OnError.Cancel|Wait)`
   adds a deadline and selects the failure policy (D-0094). The `timeout` value is a
   **nonnegative integer number of milliseconds** — no unit suffix and no `Duration`
   type (`_` digit separators are allowed, e.g. `timeout=30_000`); a negative value

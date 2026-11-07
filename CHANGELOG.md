@@ -25,6 +25,25 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`except*` exception-group handling** (#605, D-0129; epic #614 D13). A `try`
+  may now use `except* <type> [as NAME]` clauses to split an aggregate
+  `ExceptionGroup` — the one a `scope:` raises on two or more concurrent child
+  failures (D-0045) — by type. Each `except*` clause peels the sub-exceptions
+  matching its type into a sub-group, binds `NAME` to that **group** (always a
+  group, even for a single match), and runs its handler; **every** matching
+  clause runs (unlike plain `except`, first-match-only), and the unmatched
+  remainder auto-re-raises after the last clause — the single survivor **bare**
+  (so a plain enclosing `except E` still catches it, honoring Zap's
+  bare-for-single rule, D-0045), a fresh `ExceptionGroup` when two or more remain.
+  A **bare** exception is matched as a one-element group, so `try/except E` and
+  `except*` coexist. A `try` is all-`except` or all-`except*` (mixing is
+  `ZAP3001`); `except*` requires a type (a bare catch-all `except*:` is
+  `ZAP3001`). The `ExceptionGroup` type is retained — `except ExceptionGroup as
+  eg` still catches a whole group — and now **carries its real sub-exception
+  objects**, so `eg.exceptions` yields the sub-exception messages as a `list[str]`
+  for inspection/iteration (sub-exceptions are kept in a stable sorted order, so
+  rendering and `.exceptions` agree regardless of scheduling). `zap fmt`
+  normalizes the clause to `except* E`.
 - **Display protocol renders interface values** (#707, D-0124; follow-up to
   #274/#706). An interface value — a `{data, itable}` fat pointer whose concrete
   type is erased — now renders through the same one protocol as everything else,

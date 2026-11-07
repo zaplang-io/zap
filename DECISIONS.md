@@ -5581,3 +5581,67 @@ documents the intent and runs on x86 + hosted arm CI, though few-core CI cannot
 deterministically trigger the race. Relates to #223 (the parent race), #694
 (D-0117, the lock-free switch path), #700 (D-0120, the handler-side guard this
 completes), #701 (D-0121), and #295.
+
+## D-0129 — `except*` exception-group handling: split a group by type, bare-for-single remainder (I#605, epic #614 D13)
+
+Zap already **raises** an aggregate `ExceptionGroup` when a `scope:` collects two
+or more concurrent child failures (D-0045, SPEC §12). It could not **handle** one
+declaratively — the only recourse was `except ExceptionGroup as eg` for the whole
+group, with no way to route sub-exceptions by type. #605 adds Python 3.11's
+`except*`, adapted to Zap's bare-for-single raising rule.
+
+**Decision.**
+
+- **Grammar.** `try_stmt` gains `except* <type> [as NAME]` clauses. A `try` is
+  **all-`except` or all-`except*`** — mixing is rejected (`ZAP3001`). An
+  `except*` clause **requires a type**; a bare catch-all `except*:` is rejected
+  (`ZAP3001`). The `*` binds to the keyword (`except* E`, canonical) with or
+  without surrounding whitespace on input; `zap fmt` normalizes to `except* E`.
+- **Semantics.** Each `except*` clause peels the in-flight group's sub-exceptions
+  matching its type (subclasses included) into a fresh sub-`ExceptionGroup`, binds
+  `NAME` to that **group** (always a group, even for a single match), and runs its
+  handler. **Every** matching clause runs, in source order (unlike plain `except`,
+  first-match-only). A **bare** (non-group) exception is matched as a one-element
+  group, so `try/except E` (single failure) and `except*` (fan-out) coexist. After
+  the last clause the **unmatched remainder auto-re-raises**: nothing when empty,
+  the single survivor **bare** (so a plain enclosing `except E` still catches it,
+  honoring bare-for-single), or a fresh `ExceptionGroup` when two or more remain. A
+  handler that itself raises replaces the group and abandons the remainder (as
+  plain `except` does); `finally` still runs.
+- **Representation.** The `ExceptionGroup` type is retained and now **carries its
+  real sub-exception objects** — `ZapException` gains a `children` field (a
+  `ZapList` of exception pointers, traced precisely), which `except*` splits by
+  type and `eg.exceptions` iterates. Previously the group carried only a rendered
+  message string; the children are required to partition by type id. Children are
+  kept sorted by message (the existing render order), so the message,
+  `.exceptions`, and goldens are deterministic regardless of scheduling.
+  `eg.exceptions` surfaces the sub-exception messages as a `list[str]` for manual
+  inspection, resolved off the stashed exception object exactly like `.cause`
+  (#604/D-0103).
+
+**Lowering.** The landing pad runs `begin_catch` once, binding the exception. A
+runtime `zap_eg_remaining` yields a mutable working set (the group's children, or
+`[exc]` for a bare exception); each clause calls `zap_eg_split` (peel matches into
+a sub-group, compact the remainder in place, null when nothing matched) and runs
+its handler, falling through to the **next** clause's split (not out of the
+`try`). After the last clause `zap_eg_finalize_remainder` decides the re-raise
+(null / single-bare / group). The one `begin_catch` is balanced by exactly one
+`end_catch` on both the clean-exit and re-raise edges, and by a per-clause
+`Cleanup::EndCatch` (ordered before `finally`) on any early `return`/`break`/
+`raise` inside a handler — mirroring the single-`except` handler-throw path.
+
+**Why bare-for-single remainder (vs. Python's always-a-group).** Python always
+re-raises the remainder as an `ExceptionGroup`. Zap's scope raises bare-for-single
+/ group-for-many (D-0045), and a single surviving sub-exception re-raised bare is
+what lets a plain enclosing `except E` catch it — keeping the two handling styles
+interoperable. Only a two-or-more remainder stays a group.
+
+**Testing / verification.** sema positive + negative unit tests (mixing →
+`ZAP3001`, bare `except*:` → `ZAP3001`, unknown type, all-star accepted), parser
+and `zap fmt` round-trip tests, and five end-to-end goldens (routing with
+`.exceptions` iteration, partial match + bare remainder caught by an outer plain
+`except`, single-bare one-element group, no-match whole-group propagation,
+nested `try`/`except*`). The C runtime cannot be built on the maintainer's
+authoring host (no LLVM-18; Docker unusable), so the codegen + golden layer is
+gated on **CI** (the host leg covers parser/sema/lowering/fmt). Part of the
+CPython grammar-parity pass (epic #614, decision D13).

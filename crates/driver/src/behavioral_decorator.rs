@@ -1585,6 +1585,7 @@ impl Rewriter<'_> {
                         ty: e.ty,
                         binding: e.binding,
                         body: self.block(e.body),
+                        is_star: e.is_star,
                         span: e.span,
                     })
                     .collect(),

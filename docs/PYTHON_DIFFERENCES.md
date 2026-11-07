@@ -239,15 +239,22 @@ These read and behave as in Python and need no translation:
   `case Color.RED:`, and `as` sub-pattern captures (`case <pattern> as name:`,
   which binds the whole matched value; SPEC §6; D-0040/D-0111).
 - **Exceptions** — `try` / `except E as e` / `finally`, `raise` (incl. bare
-  `raise` re-raise and `raise ... from`), `assert` (SPEC §10;
-  D-0007/D-0029/D-0116). A bare `raise` re-raises the handler's active exception
-  with its type/identity preserved. **Divergence:** an out-of-context bare
-  `raise` (no active exception — in a `try` body, a non-handling
-  `else`/`finally`, at top level, or in a function merely *called* from a
-  handler) is a **compile-time error (ZAP6002)**, not Python's runtime
+  `raise` re-raise and `raise ... from`), `except*` group handling, `assert`
+  (SPEC §10; D-0007/D-0029/D-0116/D-0129). A bare `raise` re-raises the handler's
+  active exception with its type/identity preserved. **Divergence:** an
+  out-of-context bare `raise` (no active exception — in a `try` body, a
+  non-handling `else`/`finally`, at top level, or in a function merely *called*
+  from a handler) is a **compile-time error (ZAP6002)**, not Python's runtime
   `RuntimeError: No active exception to re-raise`; Zap tracks the active
   exception lexically and so does not implement Python's dynamic,
   cross-call-frame re-raise (#657, D-0116).
+- **`except*`** (SPEC §10.1; #605/D-0129) matches Python 3.11 group handling —
+  all-`except`-or-all-`except*`, every matching clause runs, each binds a
+  sub-`ExceptionGroup`. **Divergence:** the auto-re-raised remainder follows
+  Zap's bare-for-single rule (D-0045) — a lone surviving sub-exception re-raises
+  **bare** (so a plain enclosing `except E` catches it), where Python always
+  re-wraps it in an `ExceptionGroup`; two or more remaining still re-raise as a
+  group.
 - **Slicing** — `xs[lo:hi:step]` (SPEC §8; D-0030).
 - **Generators** — `def` + `yield` returning an iterator (SPEC §7; I#67/D-0048).
 - **Generator expressions** — `(x for x in xs if cond)` is a lazy iterator, not
@@ -266,6 +273,6 @@ assignment (#594), element `del` (#595), generator expressions (#596), starred
 call args (#597), `*`/`**` unpacking in displays (#598), multiple `for`/`if`
 in comprehensions (#599), walrus `:=` (#600), `**kwargs` (#601), positional-only
 `/` (#602), `as` sub-patterns (#603), `raise ... from` (#604), bare `raise`
-re-raise (#657), type aliases
-(#606), and set graduation/constructors (#608/#609) are shipped; `except*`
-(#605) and anonymous union types (#607) bring the surface closer to Python. The deferred/planned items (#610–#613, #66/#30) are listed above.
+re-raise (#657), `except*` group handling (#605), type aliases
+(#606), and set graduation/constructors (#608/#609) are shipped; anonymous union
+types (#607) brings the surface closer to Python. The deferred/planned items (#610–#613, #66/#30) are listed above.
