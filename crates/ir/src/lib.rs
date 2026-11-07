@@ -1236,9 +1236,9 @@ mod tests {
         assert!(text.contains("SIToFP"), "text:\n{text}"); // int -> float
         assert!(text.contains("FPExt"), "text:\n{text}"); // float32 -> float64
                                                           // Power and floor-division lower to runtime helpers.
-        // Integer `**` can raise a catchable ValueError on a negative exponent
-        // (#374/B2), so in `main` (implicit top-level handler) it is an
-        // `invoke`, like `zap_ifloordiv` below.
+                                                          // Integer `**` can raise a catchable ValueError on a negative exponent
+                                                          // (#374/B2), so in `main` (implicit top-level handler) it is an
+                                                          // `invoke`, like `zap_ifloordiv` below.
         assert!(text.contains("invoke @zap_ipow"), "text:\n{text}");
         assert!(text.contains("call @zap_powf"), "text:\n{text}");
         // Integer `//` is a catchable divide-by-zero fault (EXC-3), so in `main`
