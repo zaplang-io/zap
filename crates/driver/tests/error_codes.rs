@@ -145,6 +145,40 @@ fn augmented_assign_to_const_is_rejected() {
 }
 
 #[test]
+fn str_method_limits_are_rejected() {
+    // The str method surface is deliberately a strict subset of CPython's
+    // (#284, #374 walled garden). These cases pin the limitations as intent:
+    // a program that relies on an unsupported form fails at compile time with a
+    // stable code, rather than silently mis-behaving.
+    //
+    // strip()/lstrip()/rstrip() take NO chars argument.
+    assert_code("def main():\n    print(\"xxhi\".strip(\"x\"))\n", "ZAP4025");
+    // split() takes exactly one separator — no maxsplit, no no-arg whitespace
+    // split.
+    assert_code(
+        "def main():\n    auto p = \"a b c\".split(\" \", 1)\n",
+        "ZAP4025",
+    );
+    assert_code("def main():\n    auto p = \"a b\".split()\n", "ZAP4025");
+    // replace() takes exactly (old, new) — no count.
+    assert_code(
+        "def main():\n    print(\"aaa\".replace(\"a\", \"b\", 1))\n",
+        "ZAP4025",
+    );
+    // Absent methods are a clean ZAP4080 "str has no method", not a crash.
+    assert_code("def main():\n    print(\"aaa\".count(\"a\"))\n", "ZAP4080");
+    assert_code("def main():\n    print(\"ab cd\".title())\n", "ZAP4080");
+    assert_code("def main():\n    print(\"abc\".rfind(\"b\"))\n", "ZAP4080");
+}
+
+#[test]
+fn str_times_int_is_rejected() {
+    // `str * int` repetition is a FEATURE-GAP (not in SPEC §8 yet, #374): it is
+    // rejected at compile time rather than silently supported.
+    assert_code("def main():\n    print(\"ab\" * 3)\n", "ZAP4012");
+}
+
+#[test]
 fn json_payload_carries_the_code() {
     // The structured surface agents consume must expose the code as a field.
     let r = check_source("def main():\n    x = 1 +\n");
