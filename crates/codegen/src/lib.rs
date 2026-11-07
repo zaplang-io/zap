@@ -1137,6 +1137,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // defined "shifted out". Lowering calls these only for the non-constant
         // case (a safe literal operand stays a plain inline op).
         self.declare_rt("zap_fdiv", &[f.into(), f.into()], Some(f.into()));
+        self.declare_rt("zap_ffmod", &[f.into(), f.into()], Some(f.into()));
         self.declare_rt("zap_ishl", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_ishr", &[i.into(), i.into()], Some(i.into()));
 

@@ -17651,19 +17651,18 @@ impl<'a> FnLower<'a> {
             Mod => {
                 // Modulo (D-0024) takes the sign of the divisor (Python
                 // floored modulo), consistent with floored `//` so that
-                // `a == (a // b) * b + (a % b)` holds. Floats use LLVM `frem`
-                // directly; integers go through a runtime helper that corrects
-                // C's truncated remainder, mirroring `zap_ifloordiv`.
+                // `a == (a // b) * b + (a % b)` holds. Both floats and integers
+                // go through a runtime helper that corrects C's truncated
+                // remainder (`fmod`/`%`), mirroring `zap_ffloordiv`/`zap_ifloordiv`
+                // (#374/#751). Modulo by zero is a catchable ZeroDivisionError
+                // (EXC-3, D-0007), so the call is a `throwing_call` (an `invoke`
+                // inside a `try`) rather than a plain `call` that could not reach
+                // the landing pad.
                 if is_float {
                     let lf = self.as_f64(l, lt);
                     let rf = self.as_f64(r, rt);
                     let d = self.new_value(Ty::F64);
-                    self.emit(Inst::Bin {
-                        dest: d,
-                        op: BinOp::Rem,
-                        lhs: lf,
-                        rhs: rf,
-                    });
+                    self.throwing_call(Some(d), "zap_ffmod", vec![lf, rf]);
                     Ok((d, Ty::F64))
                 } else {
                     let li = self.coerce(l, lt, Ty::I64);
