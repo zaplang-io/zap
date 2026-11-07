@@ -1062,13 +1062,13 @@ void zap_print_str(void *s) {
  * base == -1. Overflow wraps (two's complement, D-0019). */
 int64_t zap_ipow(int64_t base, int64_t exp) {
     if (exp < 0) {
-        if (base == 1) {
-            return 1;
-        }
-        if (base == -1) {
-            return (exp & 1) ? -1 : 1;
-        }
-        return 0;
+        /* Integer `**` with a negative exponent has no integer result (the
+         * true value is fractional). Rather than silently floor to 0, raise a
+         * catchable ValueError; use a float base (`2.0 ** -1`) for a real
+         * power. Type-honest: `int ** int` stays `int` (epic #374, B2;
+         * decision tracked in #743). */
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+            zap_str_new("negative exponent not supported for integer **; use a float base", 64));
     }
     int64_t result = 1;
     int64_t b = base;
@@ -1104,6 +1104,13 @@ int64_t zap_ifloordiv(int64_t a, int64_t b) {
     if (b == 0) {
         zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("integer division or modulo by zero", 34));
     }
+    if (a == INT64_MIN && b == -1) {
+        /* The true quotient (+2^63) is unrepresentable in int64 and the
+         * hardware `idiv` traps (SIGFPE) on this case. Wrap to INT64_MIN,
+         * consistent with Zap's wrapping int64 (D-0019), instead of aborting
+         * the process (epic #374, issue #742). */
+        return INT64_MIN;
+    }
     int64_t q = a / b;
     int64_t r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) {
@@ -1127,11 +1134,58 @@ int64_t zap_imod(int64_t a, int64_t b) {
     if (b == 0) {
         zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("integer division or modulo by zero", 34));
     }
+    if (b == -1) {
+        /* `a % -1 == 0` for every `a`; special-cased so that INT64_MIN % -1
+         * does not trap the hardware `idiv` (SIGFPE). Wrapping int64 (D-0019,
+         * epic #374, issue #742). */
+        return 0;
+    }
     int64_t r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) {
         r += b;
     }
     return r;
+}
+
+/* True (float) division. Division by zero raises a catchable ZeroDivisionError
+ * (CPython parity, #374/#743) instead of yielding IEEE inf/nan. The lowering
+ * emits a plain inline `fdiv` when the divisor is a known-nonzero literal, so
+ * this helper is called only when the divisor is not a safe constant. */
+double zap_fdiv(double a, double b) {
+    if (b == 0.0) {
+        zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("float division by zero", 22));
+    }
+    return a / b;
+}
+
+/* Left shift with a validated count (#374/#740). A negative count raises a
+ * catchable ValueError (CPython). Zap's int is a wrapping int64, so a count >=
+ * 64 shifts every bit out and is defined as 0 rather than being LLVM poison.
+ * The lowering emits a plain inline shift when the count is a literal in 0..63,
+ * so this helper is called only for a non-constant / out-of-range count. The
+ * in-range shift is done on the unsigned bit-pattern to avoid signed-shift UB. */
+int64_t zap_ishl(int64_t a, int64_t count) {
+    if (count < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("negative shift count", 20));
+    }
+    if (count >= 64) {
+        return 0;
+    }
+    return (int64_t)((uint64_t)a << (uint64_t)count);
+}
+
+/* Arithmetic right shift with a validated count (#374/#740). A negative count
+ * raises a catchable ValueError (CPython). A count >= 64 saturates to the sign
+ * bit (0 for a non-negative value, -1 for a negative one) — the limit of an
+ * arithmetic shift under wrapping int64. */
+int64_t zap_ishr(int64_t a, int64_t count) {
+    if (count < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("negative shift count", 20));
+    }
+    if (count >= 64) {
+        return a < 0 ? -1 : 0;
+    }
+    return a >> count;
 }
 
 int64_t zap_str_len(void *s) { return ((ZapStr *)s)->len; }
@@ -2894,8 +2948,9 @@ int64_t zap_str_parse_int(void *sp) {
 }
 
 /* float(s): parse a float, Python-style (surrounding ASCII whitespace allowed,
- * a C float literal otherwise). Faults on a malformed string, matching int()'s
- * strictness. Distinct from the lenient `zap_str_to_f64` the CSV codec uses. */
+ * a C float literal otherwise). Raises a catchable ValueError on a malformed
+ * string, matching int()'s strictness and CPython (epic #374, issue #741).
+ * Distinct from the lenient `zap_str_to_f64` the CSV codec uses. */
 double zap_str_parse_float(void *sp) {
     const ZapStr *s = (const ZapStr *)sp;
     char stackbuf[64];
@@ -2926,8 +2981,8 @@ double zap_str_parse_float(void *sp) {
         free(heap);
     }
     if (bad) {
-        fprintf(stderr, "zap: float() cannot parse a float from this string\n");
-        abort();
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+            zap_str_new("could not convert string to float", 33));
     }
     return v;
 }

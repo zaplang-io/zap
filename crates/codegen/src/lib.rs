@@ -1132,6 +1132,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_ifloordiv", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_ffloordiv", &[f.into(), f.into()], Some(f.into()));
         self.declare_rt("zap_imod", &[i.into(), i.into()], Some(i.into()));
+        // Guarded float division and shifts (#374): divide-by-zero ->
+        // ZeroDivisionError, negative/out-of-range shift count -> ValueError /
+        // defined "shifted out". Lowering calls these only for the non-constant
+        // case (a safe literal operand stays a plain inline op).
+        self.declare_rt("zap_fdiv", &[f.into(), f.into()], Some(f.into()));
+        self.declare_rt("zap_ishl", &[i.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_ishr", &[i.into(), i.into()], Some(i.into()));
 
         // Complex scalars are immutable GC objects with a pointer ABI. The
         // runtime owns construction/arithmetic so both AOT and the REPL JIT use
