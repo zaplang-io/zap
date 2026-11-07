@@ -10551,17 +10551,20 @@ impl<'a> FnLower<'a> {
                 self.position(join_bb);
                 Ok((self.load(slot, Ty::I1), Ty::I1))
             }
-            // `x is None` / `x is not None` (#611, D18): the common null/empty
-            // check. The bare `None` operand has no standalone lowering, so this
-            // is intercepted here (where the other operand's type is known)
-            // rather than in `binop`, and emits the same empty-variant / null
-            // test as `.is_none()` and `match case Optional.None`.
+            // `x is None` / `x is not None` (#611, D18) and `x == None` /
+            // `x != None` (#374/B3, SPEC §5: consistent with `is None`): the
+            // common null/empty check. The bare `None` operand has no standalone
+            // lowering, so this is intercepted here (where the other operand's
+            // type is known) rather than in `binop`, and emits the same
+            // empty-variant / null test as `.is_none()` and
+            // `match case Optional.None`. Sema has already rejected a never-None
+            // value operand for both forms, so the other side is nullable here.
             Expr::Binary { op, lhs, rhs, .. }
-                if matches!(op, AstBin::Is | AstBin::IsNot)
+                if matches!(op, AstBin::Is | AstBin::IsNot | AstBin::Eq | AstBin::Ne)
                     && (matches!(lhs.as_ref(), Expr::None(_))
                         || matches!(rhs.as_ref(), Expr::None(_))) =>
             {
-                self.lower_is_none(matches!(op, AstBin::IsNot), lhs, rhs)
+                self.lower_is_none(matches!(op, AstBin::IsNot | AstBin::Ne), lhs, rhs)
             }
             // A bare `None` membership test (`None in d`, `None in s`): evaluate
             // the container first to learn its key/element type, then lower the
@@ -11331,15 +11334,12 @@ impl<'a> FnLower<'a> {
                     Ty::Set(_) => "zap_set_len",
                     Ty::Heap(_) => "zap_heap_len",
                     Ty::Array(_) => "zap_array_len",
-                    // `str` and `bytes` both lower to `Ptr`. `len` is the byte
-                    // length here: it is correct for `bytes` (indexed by byte),
-                    // and for ASCII `str` it equals the codepoint count. Making
-                    // `len(str)` codepoint-based (D-0025) requires telling `str`
-                    // and `bytes` apart in the IR, where they share `Ptr` — a
-                    // load-bearing change deferred for maintainer ratification
-                    // (ticket #284). Indexing/slicing/iteration are already
-                    // codepoint-based, so this only differs for non-ASCII `str`.
-                    Ty::Ptr => "zap_str_len",
+                    // `len(str)` is the Unicode **codepoint** count (D-0025,
+                    // #284/#374/B6), consistent with codepoint indexing/slicing/
+                    // iteration — so `len("héllo") == 5`, not the byte length.
+                    // `str` is the sema-level `Ty::Ptr` here; `bytes` is the
+                    // distinct `Ty::Bytes` arm below and stays a byte count.
+                    Ty::Ptr => "zap_str_len_cp",
                     // `bytes`: byte count (I#337). `zap_str_len` returns the
                     // ZapStr length, which is the byte count for a `bytes`.
                     Ty::Bytes => "zap_str_len",

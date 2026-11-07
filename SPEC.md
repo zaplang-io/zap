@@ -202,8 +202,9 @@ formatting, such as `(1+2j)`.
 
 ### 4.2 Strings & bytes (D-0025)
 
-`str` is **immutable, UTF-8**. Indexing and slicing are **codepoint-based**
-(Python semantics), with an ASCII fast path; iteration yields `char`.
+`str` is **immutable, UTF-8**. Indexing, slicing and `len` are
+**codepoint-based** (Python semantics), with an ASCII fast path; iteration
+yields `char`, and `len(s)` is the Unicode codepoint count — not the byte length.
 
 `bytes` is an **immutable byte sequence** (ticket #337), a distinct type from
 `str`. It shares `str`'s length-prefixed, GC-managed buffer but its operations
@@ -841,8 +842,9 @@ intermediate `for` or a materialized collection instead.
 
 ### 9.1 Operations (ticket #284, D-0025)
 
-`str` indexing, slicing and iteration are **by Unicode codepoint**; `s[i]`
-yields a `char`, a slice yields a `str`, and iteration yields `char`. Comparison
+`str` indexing, slicing, iteration and `len` are **by Unicode codepoint**;
+`s[i]` yields a `char`, a slice yields a `str`, iteration yields `char`, and
+`len(s)` is the codepoint count (so `len("héllo") == 5`, #374/B6). Comparison
 is content-based (`==`/`!=`) and lexicographic by codepoint (`< <= > >=`, which
 for UTF-8 equals byte order). `+` concatenates; `in` tests for a substring.
 

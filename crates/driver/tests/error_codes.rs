@@ -120,6 +120,21 @@ fn semantic_codes() {
 }
 
 #[test]
+fn eq_none_on_value_type_is_rejected() {
+    // `== None` / `!= None` is consistent with `is None` (SPEC §5, #374/B3): a
+    // never-None value type can never be None, so this is a ZAP4074 error rather
+    // than a silent sema pass that then fails in lowering.
+    assert_code(
+        "def main():\n    int64 n = 5\n    print(n == None)\n",
+        "ZAP4074",
+    );
+    assert_code(
+        "def main():\n    int64 n = 5\n    print(n != None)\n",
+        "ZAP4074",
+    );
+}
+
+#[test]
 fn json_payload_carries_the_code() {
     // The structured surface agents consume must expose the code as a field.
     let r = check_source("def main():\n    x = 1 +\n");

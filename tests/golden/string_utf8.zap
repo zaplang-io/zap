@@ -1,8 +1,7 @@
-# ticket #284: UTF-8 codepoint semantics (D-0025). Indexing, slicing and
-# iteration are by Unicode codepoint, not byte; `str(char)` re-encodes to UTF-8.
-# `len` is the byte length here (it matches the codepoint count only for ASCII;
-# a codepoint-based `len(str)` is deferred — see #284), so the codepoint count
-# is shown via iteration.
+# ticket #284: UTF-8 codepoint semantics (D-0025). Indexing, slicing, iteration
+# and `len` are all by Unicode codepoint, not byte; `str(char)` re-encodes to
+# UTF-8. `len("héllo €")` is 7 codepoints (not the 10-byte length); the
+# subsequent iteration count confirms it (#374/B6).
 def main():
     auto s = "héllo €"
     print(len(s))
