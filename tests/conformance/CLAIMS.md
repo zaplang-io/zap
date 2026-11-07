@@ -166,7 +166,7 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 |---|---|---|---|---|
 | DECL-1 | §3 | the two decl forms are `TYPE name = v` and `auto name = v` | TODO | — |
 | DECL-2 | §3 | reassignment uses no type and no `auto` | TODO | — |
-| AUGSUB-1 | §3 | augmented assignment to a subscript or field target (`xs[i] += v`, `o.f += v`) (impl gap #750) | TODO | — |
+| AUGSUB-1 | §3 | augmented assignment to a subscript or field target (`xs[i] += v`, `o.f += v`), evaluated once (#750) | covered | aug_assign_target |
 | DECL-3 | §3 | bindings are mutable by default; `const` is immutable (D-0006) | TODO | — |
 | SCAL-1 | §4.1 | scalars have value semantics (copied on assign/pass, D-0023) | TODO | — |
 | REF-1 | §4.3 | list/dict/struct instances are passed by reference (D-0023) | TODO | — |

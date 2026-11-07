@@ -7185,23 +7185,22 @@ impl<'a> FnLower<'a> {
                     // identity (D-0023), so the in-place mutation is the intended
                     // visible effect; the store-back is a no-op rebind for them and
                     // keeps the value-struct / scalar paths correct.
-                    let (res, rty) = match (ty, inplace_op_dunder(*op)) {
-                        (Ty::Struct(sid), Some(dunder))
-                            if self.sigs.contains_key(&format!(
-                                "{}__{}",
-                                self.ctx.names[sid as usize], dunder
-                            )) =>
-                        {
-                            self.call_dunder(sid, dunder, vec![(cur, ty), (rhs, rt)])?
-                        }
-                        _ => self.binop(*op, cur, ty, rhs, rt)?,
-                    };
+                    let (res, rty) = self.aug_combine(*op, cur, ty, rhs, rt)?;
                     let res = self.coerce(res, rty, ty);
                     self.store_name(n, ptr, ty, res, *span);
                     Ok(())
+                } else if let Expr::Index { base, index, span } = target {
+                    // `xs[i] OP= v` / `d[k] OP= v` (#750): the base and index are
+                    // evaluated exactly once, then it is a read-modify-write of
+                    // that one element.
+                    self.lower_aug_index(base, index, *op, value, *span)
+                } else if let Expr::Attr { base, name, span } = target {
+                    // `obj.f OP= v` (#750): evaluate the base once, then
+                    // read-modify-write the field.
+                    self.lower_aug_field(base, name, *op, value, *span)
                 } else {
                     Err(err(
-                        "only simple variable aug-assignment is supported by codegen yet",
+                        "augmented assignment target must be a name, subscript, or field",
                     ))
                 }
             }
@@ -14937,6 +14936,171 @@ impl<'a> FnLower<'a> {
                 "indexed assignment is only supported on list, dict, and array values",
             )),
         }
+    }
+
+    /// Combine the current l-value `(cur, ty)` with `(rhs, rt)` for an augmented
+    /// assignment (`+=`, `-=`, …). A user struct that defines the matching
+    /// in-place dunder (`__iadd__`, …) mutates in place and returns itself
+    /// (D-0047); otherwise the result derives from the binary operator. Shared
+    /// by the name, subscript, and field aug-assignment paths (#750).
+    fn aug_combine(
+        &mut self,
+        op: AstBin,
+        cur: Value,
+        ty: Ty,
+        rhs: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        match (ty, inplace_op_dunder(op)) {
+            (Ty::Struct(sid), Some(dunder))
+                if self
+                    .sigs
+                    .contains_key(&format!("{}__{}", self.ctx.names[sid as usize], dunder)) =>
+            {
+                self.call_dunder(sid, dunder, vec![(cur, ty), (rhs, rt)])
+            }
+            _ => self.binop(op, cur, ty, rhs, rt),
+        }
+    }
+
+    /// Read-modify-write one subscript element for `base[index] OP= value`
+    /// (#750). `base` and `index` are each evaluated **exactly once**, then the
+    /// element is read (with the same fault semantics as a plain `base[index]`
+    /// read), combined with the RHS, and written back to the same slot.
+    fn lower_aug_index(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        op: AstBin,
+        value: &Expr,
+        span: Span,
+    ) -> Result<(), LowerError> {
+        let (bv, bty) = self.expr(base)?;
+        match bty {
+            Ty::List(elem) => {
+                let (iv, it) = self.expr(index)?;
+                let iv = self.coerce(iv, it, Ty::I64);
+                let ety = self.elem_ty(elem);
+                // Read the current element — out-of-range raises, exactly like a
+                // bare `xs[i]` read, so this is a `throwing_call`.
+                self.emit_race_elem(bv, iv, "list element", false, span);
+                let cur = self.new_value(ety);
+                self.throwing_call(
+                    Some(cur),
+                    &format!("zap_list_get_{}", elem.val_suffix()),
+                    vec![bv, iv],
+                );
+                let (rhs, rt) = self.expr(value)?;
+                let (res, rty) = self.aug_combine(op, cur, ety, rhs, rt)?;
+                self.check_index_value(rty, elem, true)?;
+                let res = self.coerce(res, rty, elem.ty());
+                let res = self.box_if_value(res, elem.ty());
+                self.emit_race_elem(bv, iv, "list element", true, span);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_list_set_{}", elem.val_suffix()),
+                    args: vec![bv, iv, res],
+                });
+                Ok(())
+            }
+            Ty::Dict(kk, vk) => {
+                // The key is evaluated once: transiently for the read, boxed for
+                // the write-back.
+                let kv = self.expr_coerced(index, kk.ty(), zapc_diag::ErrorCode::ZAP4001)?;
+                let vty = self.elem_ty(vk);
+                let kfns = self.key_fn_args(kk)?;
+                let cur = self.new_value(vty);
+                let mut gargs = vec![bv, kv];
+                gargs.extend_from_slice(&kfns);
+                self.emit(Inst::Call {
+                    dest: Some(cur),
+                    func: format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    args: gargs,
+                });
+                let (rhs, rt) = self.expr(value)?;
+                let (res, rty) = self.aug_combine(op, cur, vty, rhs, rt)?;
+                self.check_index_value(rty, vk, false)?;
+                let res = self.coerce(res, rty, vk.ty());
+                let res = self.box_if_value(res, vk.ty());
+                let kvb = self.box_if_value(kv, kk.ty());
+                let mut sargs = vec![bv, kvb, res];
+                sargs.extend_from_slice(&kfns);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    args: sargs,
+                });
+                Ok(())
+            }
+            Ty::Array(d) => {
+                let (iv, it) = self.expr(index)?;
+                if it.int_width().is_none() {
+                    return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
+                }
+                let iv = self.coerce(iv, it, Ty::I64);
+                let cur = self.new_value(d.ty());
+                self.emit(Inst::Call {
+                    dest: Some(cur),
+                    func: format!("zap_array_get_{}", d.suffix()),
+                    args: vec![bv, iv],
+                });
+                let (rhs, rt) = self.expr(value)?;
+                let (res, rty) = self.aug_combine(op, cur, d.ty(), rhs, rt)?;
+                if rty.int_width().is_none() && !rty.is_float() {
+                    return Err(err("array element assignment requires a numeric scalar"));
+                }
+                let res = self.coerce(res, rty, d.ty());
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_array_set_{}", d.suffix()),
+                    args: vec![bv, iv, res],
+                });
+                Ok(())
+            }
+            _ => Err(err(
+                "augmented assignment to a subscript is only supported on list, dict, and array values",
+            )),
+        }
+    }
+
+    /// Read-modify-write a struct field for `base.name OP= value` (#750). `base`
+    /// is evaluated **exactly once**.
+    fn lower_aug_field(
+        &mut self,
+        base: &Expr,
+        name: &str,
+        op: AstBin,
+        value: &Expr,
+        span: Span,
+    ) -> Result<(), LowerError> {
+        let (bv, bty) = self.expr(base)?;
+        let Ty::Struct(sid) = bty else {
+            return Err(err("field augmented assignment on a non-struct value"));
+        };
+        let (idx, fty) = self
+            .ctx
+            .field(sid, name)
+            .ok_or_else(|| err(format!("no field '{name}' on struct")))?;
+        self.emit_race_field(bv, sid, idx, name, false, span);
+        let cur = self.new_value(fty);
+        self.emit(Inst::FieldGet {
+            dest: cur,
+            base: bv,
+            sid,
+            idx,
+        });
+        let (rhs, rt) = self.expr(value)?;
+        let (res, rty) = self.aug_combine(op, cur, fty, rhs, rt)?;
+        let res = self.coerce(res, rty, fty);
+        let res = self.copy_if_value(res, fty, value);
+        self.emit_race_field(bv, sid, idx, name, true, span);
+        self.emit(Inst::FieldSet {
+            base: bv,
+            sid,
+            idx,
+            val: res,
+        });
+        Ok(())
     }
 
     /// Store an already-evaluated value `(v, vt)` into an assignment `target`,
