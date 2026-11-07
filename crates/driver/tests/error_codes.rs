@@ -145,6 +145,44 @@ fn augmented_assign_to_const_is_rejected() {
 }
 
 #[test]
+fn call_argument_matrix_is_rejected() {
+    // The compile-time argument-checking matrix (#374 walled garden, §B-6).
+    // Each mistake is caught at compile time with a stable code, so a call that
+    // does not match its callee's signature never reaches codegen.
+    //
+    // Too many / too few positional arguments (arity) -> ZAP4020.
+    assert_code(
+        "def f(int64 a) -> int64:\n    return a\n\ndef main():\n    print(f(1, 2))\n",
+        "ZAP4020",
+    );
+    assert_code(
+        "def f(int64 a, int64 b) -> int64:\n    return a\n\ndef main():\n    print(f(1))\n",
+        "ZAP4020",
+    );
+    // An unexpected keyword argument -> ZAP4023.
+    assert_code(
+        "def f(int64 a) -> int64:\n    return a\n\ndef main():\n    print(f(z=1))\n",
+        "ZAP4023",
+    );
+    // A keyword-only parameter (after a bare `*`) supplied positionally ->
+    // ZAP4029; omitting the required keyword-only param -> ZAP4020 (I#496, D-0095).
+    assert_code(
+        "def f(str h, *, int64 m) -> int64:\n    return m\n\ndef main():\n    print(f(\"a\", 80))\n",
+        "ZAP4029",
+    );
+    assert_code(
+        "def f(str h, *, int64 m) -> int64:\n    return m\n\ndef main():\n    print(f(\"a\"))\n",
+        "ZAP4020",
+    );
+    // A positional-only parameter (before a `/`) supplied by name -> ZAP4034
+    // (#602, D10).
+    assert_code(
+        "def f(int64 a, /) -> int64:\n    return a\n\ndef main():\n    print(f(a=1))\n",
+        "ZAP4034",
+    );
+}
+
+#[test]
 fn str_method_limits_are_rejected() {
     // The str method surface is deliberately a strict subset of CPython's
     // (#284, #374 walled garden). These cases pin the limitations as intent:
