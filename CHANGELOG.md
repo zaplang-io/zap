@@ -55,7 +55,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   else b` now evaluates **only the chosen branch** — it lowers to a real branch
   rather than an eager `select` of both operands — so the non-taken branch's side
   effects and faults never happen (`xs[0] if xs else default` returns the default
-  on an empty list instead of raising) (#776).
+  on an empty list instead of raising) (#776). String literals now decode the
+  hex and Unicode escapes `\xHH`, `\uHHHH`, and `\UHHHHHHHH` (previously kept
+  verbatim with the backslash) — in a `str` they denote a Unicode codepoint
+  (UTF-8), in a `bytes` literal `\xHH` is the raw byte; a surrogate or
+  out-of-range codepoint, or a malformed hex escape, is a compile error (#781).
 - **`except*` exception-group handling** (#605, D-0129; epic #614 D13). A `try`
   may now use `except* <type> [as NAME]` clauses to split an aggregate
   `ExceptionGroup` — the one a `scope:` raises on two or more concurrent child
