@@ -3120,16 +3120,29 @@ void *zap_fmt_flt(double v, int64_t ftype, int64_t sign, int64_t width, int64_t 
         neg = 1;
         mag = -v;
     }
-    char body[96];
+    /* A wide fixed-point/exponent spec (a large magnitude or a big precision)
+     * can exceed any fixed buffer, so size dynamically off snprintf's return
+     * value rather than silently truncating the text (#374/B5). The default
+     * %g rendering is always short and stays on the stack. */
+    char stackbody[128];
+    char *body = stackbody;
+    char *heapbody = NULL;
     if (prec < 0 && (t == 'g' || t == 'G')) {
         /* Default float rendering: match str(float) — compact %g with a
          * trailing `.0` restored on integral values (I#384). */
-        zap_f64_fmt_g(mag, t == 'G', body, sizeof(body));
+        zap_f64_fmt_g(mag, t == 'G', stackbody, sizeof(stackbody));
     } else {
         int p = (prec >= 0) ? (int)prec : 6;
         char spec[12];
         snprintf(spec, sizeof(spec), "%%.%d%c", p, t);
-        snprintf(body, sizeof(body), spec, mag);
+        int need = snprintf(stackbody, sizeof(stackbody), spec, mag);
+        if (need >= (int)sizeof(stackbody)) {
+            heapbody = (char *)malloc((size_t)need + 1);
+            if (heapbody) {
+                snprintf(heapbody, (size_t)need + 1, spec, mag);
+                body = heapbody;
+            }
+        }
     }
     int64_t bl = (int64_t)strlen(body);
     char head[2];
@@ -3150,7 +3163,9 @@ void *zap_fmt_flt(double v, int64_t ftype, int64_t sign, int64_t width, int64_t 
     if (al == 0) {
         al = '>';
     }
-    return zap_fmt_pad(head, hl, body, bl, width, fc, al);
+    void *result = zap_fmt_pad(head, hl, body, bl, width, fc, al);
+    free(heapbody);
+    return result;
 }
 
 void *zap_fmt_str(void *sp, int64_t width, int64_t prec, int64_t fill, int64_t align) {
