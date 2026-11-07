@@ -755,9 +755,20 @@ mod tests {
     }
 
     /// A unique temp directory to act as a server root.
+    ///
+    /// Unique per call: a process-wide atomic counter plus the pid, so parallel
+    /// tests never collide on a coarse-resolution clock (#735). Several tests in
+    /// this module write a conventions file into their root while two assert its
+    /// absence; two tests sharing a directory would leak one's `zap_mcp.md` into
+    /// the other's root and flake the absent-file assertions. Mirrors the same
+    /// fix already in `conventions.rs::tmpdir()`.
     fn tmproot() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
-            "zap-mcp-conv-{}",
+            "zap-mcp-conv-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
