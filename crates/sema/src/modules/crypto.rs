@@ -30,6 +30,9 @@
 //!
 //! Secure random from the OS CSPRNG (getentropy / /dev/urandom):
 //!   `crypto.random_bytes(n) -> bytes` ; `crypto.token_hex(n) -> str`
+//!   `crypto.randbelow(n) -> int` (unbiased `[0, n)`) ;
+//!   `crypto.choice(seq: list[T]) -> T` (element-generic uniform pick; an empty
+//!     list raises `ValueError`)
 //!
 //! Validated asymmetric keys — metadata, JWK-component import, and P-256 ECDSA
 //! (ES256) / Ed25519 sign+verify (#643, D-0126). All free functions over PEM /
@@ -558,6 +561,14 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             }
             Some(Ty::Int64)
         }
+        // crypto.choice(seq) -> a uniformly random element of the list (#767),
+        // drawn from the OS CSPRNG (mirrors Python secrets.choice, and the
+        // surface of random.choice). Element-generic: yields the list's element
+        // type `T`. An empty list raises a catchable ValueError at runtime.
+        "choice" => {
+            let ty = require_list(checker, "choice", args, span);
+            Some(ty)
+        }
         // crypto.random_bytes(n) -> bytes: n cryptographically secure random bytes.
         "random_bytes" => {
             expect_argc(checker, "crypto", "random_bytes", args, 1, span);
@@ -569,5 +580,37 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             Some(Ty::Str)
         }
         _ => None,
+    }
+}
+
+/// Require a single `list[T]` argument, returning its element type `T` (or
+/// `Unknown` on error). Backs `crypto.choice`, which yields `T` (an element
+/// drawn with the CSPRNG). Mirrors the `random.choice` checker.
+fn require_list(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Ty {
+    if args.len() != 1 {
+        checker.error(
+            ErrorCode::ZAP4025,
+            format!(
+                "crypto.{method}(seq) takes 1 argument, found {}",
+                args.len()
+            ),
+            span,
+        );
+        for a in args {
+            checker.infer(&a.value);
+        }
+        return Ty::Unknown;
+    }
+    match checker.infer(&args[0].value) {
+        Ty::List(elem) => *elem,
+        Ty::Unknown => Ty::Unknown,
+        other => {
+            checker.error(
+                ErrorCode::ZAP4024,
+                format!("crypto.{method} expects a list, found {}", other.display()),
+                expr_span(&args[0].value),
+            );
+            Ty::Unknown
+        }
     }
 }

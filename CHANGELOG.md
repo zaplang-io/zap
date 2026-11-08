@@ -204,9 +204,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
     `hmac_update` / `hmac_hexdigest` / `hmac_digest` — the incremental
     counterpart to the one-shot HMACs, over the self-contained HMAC core
     (pointer-free handle, non-destructive finalize).
-  - **`crypto.randbelow(n) -> int`** (#767): unbiased uniform `[0, n)` from the
-    CSPRNG (rejection-sampled), mirroring `secrets.randbelow`. `crypto.choice`
-    is deferred (D-0133).
+  - **`crypto.randbelow(n) -> int`** and **`crypto.choice(seq) -> T`** (#767):
+    unbiased uniform `[0, n)` from the CSPRNG (rejection-sampled), and an
+    element-generic uniform pick from a `list[T]`, mirroring `secrets.randbelow`
+    / `secrets.choice`. `choice` reuses `random.choice`'s element-type and typed
+    element-getter path; an empty list raises a catchable `ValueError`.
   - **SHA-3 and BLAKE2** (#770): `crypto.sha3_256`/`sha3_512`/`blake2b`/
     `blake2s`, one-shot. These come from OpenSSL `EVP_Digest` (so they depend on
     OpenSSL, unlike the self-contained SHA-1/2 + MD5 core); one-shot only for now.

@@ -145,6 +145,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_crypto_token_urlsafe", &[i.into()], Some(p.into()));
     // randbelow(n) -> int: unbiased [0, n) (#767).
     cg.declare_rt("zap_crypto_randbelow", &[i.into()], Some(i.into()));
+    // crypto.choice (#767): random valid index into a list (ptr) -> i64. The
+    // typed element getter (zap_list_get_*) is declared centrally.
+    cg.declare_rt("zap_crypto_list_index", &[p.into()], Some(i.into()));
     // Streaming HMAC (#766): new(hash_name, key) -> handle; update(h, data);
     // hexdigest(h) -> str; digest(h) -> bytes.
     cg.declare_rt("zap_crypto_hmac_new", &[p.into(), p.into()], Some(p.into()));

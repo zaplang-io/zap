@@ -10161,6 +10161,23 @@ int64_t zap_crypto_randbelow(int64_t n) {
     }
 }
 
+/* A uniformly random valid index into a non-empty list, drawn from the OS
+ * CSPRNG (backs crypto.choice, ticket #767). Reuses zap_crypto_randbelow's
+ * unbiased rejection sampling. Unlike random.choice's zap_random_list_index,
+ * which aborts on an empty sequence, this raises a catchable ValueError so a
+ * caller can guard an empty list with try/except (mirrors Python
+ * secrets.choice raising IndexError on an empty sequence). */
+int64_t zap_crypto_list_index(void *l) {
+    ZapList *list = (ZapList *)l;
+    if (list->len <= 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("crypto.choice from an empty sequence",
+                                    sizeof("crypto.choice from an empty sequence") - 1));
+    }
+    /* list->len > 0, so randbelow never raises here; it only draws the index. */
+    return zap_crypto_randbelow(list->len);
+}
+
 /* ===========================================================================
  * bytes + base64 + hex (ticket #337). `bytes` reuses the ZapStr length-prefixed
  * byte buffer; these entry points give it byte-wise indexing/slicing/decoding,
