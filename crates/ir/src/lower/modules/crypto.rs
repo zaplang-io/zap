@@ -44,6 +44,18 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_ed25519_sign"
         | "zap_crypto_pbkdf2_hmac"
         | "zap_crypto_hkdf"
+        | "zap_crypto_hmac_digest"
+        | "zap_crypto_rsa_sha384_sign"
+        | "zap_crypto_rsa_sha512_sign"
+        | "zap_crypto_rsa_pss_sha256_sign"
+        | "zap_crypto_rsa_pss_sha384_sign"
+        | "zap_crypto_rsa_pss_sha512_sign"
+        | "zap_crypto_p384_public_key_pem"
+        | "zap_crypto_p521_public_key_pem"
+        | "zap_crypto_p384_sha384_sign"
+        | "zap_crypto_p521_sha512_sign"
+        | "zap_hex_decode"
+        | "zap_base64_decode"
         | "zap_crypto_random_bytes" => Ty::Bytes,
         "zap_crypto_sha256"
         | "zap_crypto_sha512"
@@ -51,20 +63,35 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_md5"
         | "zap_crypto_sha384"
         | "zap_crypto_sha224"
+        | "zap_crypto_sha3_256"
+        | "zap_crypto_sha3_512"
+        | "zap_crypto_blake2b"
+        | "zap_crypto_blake2s"
         | "zap_crypto_hexdigest"
         | "zap_crypto_hmac_sha256"
         | "zap_crypto_hmac_sha512"
+        | "zap_crypto_hmac_new"
+        | "zap_crypto_hmac_hexdigest"
         | "zap_crypto_token_hex"
         | "zap_crypto_token_urlsafe"
         | "zap_crypto_key_kind"
         | "zap_crypto_key_curve"
+        | "zap_hex_encode"
+        | "zap_base64_encode"
         | "zap_crypto_new" => Ty::Ptr,
         "zap_crypto_rsa_sha256_verify"
+        | "zap_crypto_rsa_sha384_verify"
+        | "zap_crypto_rsa_sha512_verify"
+        | "zap_crypto_rsa_pss_sha256_verify"
+        | "zap_crypto_rsa_pss_sha384_verify"
+        | "zap_crypto_rsa_pss_sha512_verify"
         | "zap_crypto_p256_sha256_verify"
+        | "zap_crypto_p384_sha384_verify"
+        | "zap_crypto_p521_sha512_verify"
         | "zap_crypto_ed25519_verify"
         | "zap_crypto_constant_time_eq" => Ty::I1,
-        "zap_crypto_key_bits" | "zap_crypto_key_is_private" => Ty::I64,
-        "zap_crypto_update" => Ty::Void,
+        "zap_crypto_key_bits" | "zap_crypto_key_is_private" | "zap_crypto_randbelow" => Ty::I64,
+        "zap_crypto_update" | "zap_crypto_hmac_update" => Ty::Void,
         _ => return Err(err("unknown crypto runtime symbol in result-type table")),
     })
 }
@@ -93,6 +120,19 @@ fn call_crypto(
             | "zap_crypto_pbkdf2_hmac"
             | "zap_crypto_hkdf"
             | "zap_crypto_token_urlsafe"
+            | "zap_crypto_hmac_new"
+            | "zap_crypto_randbelow"
+            | "zap_crypto_rsa_sha384_sign"
+            | "zap_crypto_rsa_sha512_sign"
+            | "zap_crypto_rsa_pss_sha256_sign"
+            | "zap_crypto_rsa_pss_sha384_sign"
+            | "zap_crypto_rsa_pss_sha512_sign"
+            | "zap_crypto_p384_public_key_pem"
+            | "zap_crypto_p521_public_key_pem"
+            | "zap_crypto_p384_sha384_sign"
+            | "zap_crypto_p521_sha512_sign"
+            | "zap_hex_decode"
+            | "zap_base64_decode"
     );
     Ok(match result_type(func)? {
         Ty::I1 => call_bool(lowerer, func, args),
@@ -186,6 +226,17 @@ fn lower(
             return Err(err("crypto hash one-shot takes exactly one argument"));
         }
         Ok(Some(call_result1(m, func, &args[0])?))
+    };
+    // Lower exactly `n` reference (str/bytes/handle) arguments and call `func`.
+    let refs = |m: &mut FnLower, func: &str, n: usize| -> Result<Option<(Value, Ty)>, LowerError> {
+        if args.len() != n {
+            return Err(err("crypto call has the wrong number of arguments"));
+        }
+        let mut vals = Vec::with_capacity(n);
+        for a in args {
+            vals.push(m.expr(&a.value)?.0);
+        }
+        Ok(Some(call_crypto(m, func, vals)?))
     };
     match method {
         "sha256" => one_shot(lowerer, "zap_crypto_sha256"),
@@ -458,6 +509,78 @@ fn lower(
                 vec![n],
             )?))
         }
+        // SHA-3 / BLAKE2 one-shot hex (#770), OpenSSL-backed.
+        "sha3_256" => one_shot(lowerer, "zap_crypto_sha3_256"),
+        "sha3_512" => one_shot(lowerer, "zap_crypto_sha3_512"),
+        "blake2b" => one_shot(lowerer, "zap_crypto_blake2b"),
+        "blake2s" => one_shot(lowerer, "zap_crypto_blake2s"),
+        // Encoding helpers (#771): thin aliases over the existing hex/base64
+        // runtime. hex/b64url_encode never throw; unhex/b64url_decode raise a
+        // catchable error on malformed input.
+        "hex" => one_shot(lowerer, "zap_hex_encode"),
+        "unhex" => one_shot(lowerer, "zap_hex_decode"),
+        // b64url_encode(data) -> zap_base64_encode(data, urlsafe=1, pad=0).
+        "b64url_encode" => {
+            if args.len() != 1 {
+                return Err(err("crypto.b64url_encode takes exactly one argument"));
+            }
+            let (data, _) = lowerer.expr(&args[0].value)?;
+            let urlsafe = lowerer.iconst(Ty::I64, 1);
+            let pad = lowerer.iconst(Ty::I64, 0);
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_base64_encode",
+                vec![data, urlsafe, pad],
+            )?))
+        }
+        // b64url_decode(s) -> zap_base64_decode(s, urlsafe=1).
+        "b64url_decode" => {
+            if args.len() != 1 {
+                return Err(err("crypto.b64url_decode takes exactly one argument"));
+            }
+            let (data, _) = lowerer.expr(&args[0].value)?;
+            let urlsafe = lowerer.iconst(Ty::I64, 1);
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_base64_decode",
+                vec![data, urlsafe],
+            )?))
+        }
+        // Streaming HMAC (#766): hmac_new(hash_name, key) -> handle; update(h,
+        // data); hexdigest/digest(h). Mirrors the streaming-hash handle surface.
+        "hmac_new" => refs(lowerer, "zap_crypto_hmac_new", 2),
+        "hmac_update" => refs(lowerer, "zap_crypto_hmac_update", 2),
+        "hmac_hexdigest" => refs(lowerer, "zap_crypto_hmac_hexdigest", 1),
+        "hmac_digest" => refs(lowerer, "zap_crypto_hmac_digest", 1),
+        // crypto.randbelow(n) -> int (#767): count coerces to i64; the runtime
+        // raises on n <= 0.
+        "randbelow" => {
+            if args.len() != 1 {
+                return Err(err("crypto.randbelow takes exactly one argument"));
+            }
+            let (v, vt) = lowerer.expr(&args[0].value)?;
+            let n = lowerer.coerce(v, vt, Ty::I64);
+            Ok(Some(call_crypto(lowerer, "zap_crypto_randbelow", vec![n])?))
+        }
+        // RSA PKCS#1 v1.5 SHA-384/512 and RSA-PSS (PS256/384/512) sign/verify
+        // (#768). Sign takes (pem, data) -> bytes; verify (pem, data, sig) -> bool.
+        "rsa_sha384_sign" => refs(lowerer, "zap_crypto_rsa_sha384_sign", 2),
+        "rsa_sha512_sign" => refs(lowerer, "zap_crypto_rsa_sha512_sign", 2),
+        "rsa_sha384_verify" => refs(lowerer, "zap_crypto_rsa_sha384_verify", 3),
+        "rsa_sha512_verify" => refs(lowerer, "zap_crypto_rsa_sha512_verify", 3),
+        "rsa_pss_sha256_sign" => refs(lowerer, "zap_crypto_rsa_pss_sha256_sign", 2),
+        "rsa_pss_sha384_sign" => refs(lowerer, "zap_crypto_rsa_pss_sha384_sign", 2),
+        "rsa_pss_sha512_sign" => refs(lowerer, "zap_crypto_rsa_pss_sha512_sign", 2),
+        "rsa_pss_sha256_verify" => refs(lowerer, "zap_crypto_rsa_pss_sha256_verify", 3),
+        "rsa_pss_sha384_verify" => refs(lowerer, "zap_crypto_rsa_pss_sha384_verify", 3),
+        "rsa_pss_sha512_verify" => refs(lowerer, "zap_crypto_rsa_pss_sha512_verify", 3),
+        // Additional JOSE ECDSA curves P-384 (ES384) / P-521 (ES512) (#769).
+        "p384_public_key_pem" => refs(lowerer, "zap_crypto_p384_public_key_pem", 2),
+        "p521_public_key_pem" => refs(lowerer, "zap_crypto_p521_public_key_pem", 2),
+        "p384_sha384_sign" => refs(lowerer, "zap_crypto_p384_sha384_sign", 2),
+        "p384_sha384_verify" => refs(lowerer, "zap_crypto_p384_sha384_verify", 3),
+        "p521_sha512_sign" => refs(lowerer, "zap_crypto_p521_sha512_sign", 2),
+        "p521_sha512_verify" => refs(lowerer, "zap_crypto_p521_sha512_verify", 3),
         // crypto.random_bytes(n) / crypto.token_hex(n): count coerces to i64.
         "random_bytes" | "token_hex" => {
             if args.len() != 1 {

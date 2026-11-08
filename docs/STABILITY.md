@@ -497,6 +497,21 @@ hash core (one-shot and streaming, truncated SHA-512/SHA-256). `password`/`salt`
 `iterations`, negative `dklen`, out-of-range `length`, or negative `nbytes` raise
 catchable `ValueError`. **Experimental** like the rest of `crypto`.
 
+The experimental `crypto` follow-up families (#766–#771, D-0133) add: streaming
+HMAC (`hmac_new`/`hmac_update`/`hmac_hexdigest`/`hmac_digest`, over the
+self-contained HMAC core, non-destructive finalize); `crypto.randbelow(n) -> int`
+(unbiased `[0, n)`; `crypto.choice` is deferred); the OpenSSL-backed
+`sha3_256`/`sha3_512`/`blake2b`/`blake2s` one-shot hashes (these specific hashes
+depend on OpenSSL, unlike the self-contained SHA-1/2 + MD5 core; streaming is
+deferred); RSA-PSS `rsa_pss_sha256`/`384`/`512_sign`/`_verify` and PKCS#1 v1.5
+`rsa_sha384`/`512_sign`/`_verify`; the JOSE ECDSA curves P-384 (ES384, 96-byte
+`r||s`) and P-521 (ES512, 132-byte) with `p384_public_key_pem`/`p521_public_key_pem`
+import; and the `crypto.hex`/`unhex`/`b64url_encode`/`b64url_decode` encoders
+(thin aliases over the `hex`/`base64` modules). Key-family/curve binding and
+`str`/`bytes` interchange match the existing RSA/EC entries; unknown hash names
+and bad arguments raise catchable `ValueError`. **Experimental** like the rest of
+`crypto`.
+
 The `http` client verbs `get`/`post`/`request` gained an **optional trailing
 `dict[str, str]` of request headers** (#280) and already expose response
 `status`/`header`/`body` accessors, and the server-side `http.respond` gained

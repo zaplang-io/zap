@@ -254,6 +254,17 @@ family (one-shot and streaming), alongside the existing `sha256`/`sha512`/`sha1`
 `md5`. See
 [D-0132](DECISIONS.md#d-0132--stdlib-crypto-key-derivation-pbkdf2hkdf-url-safe-tokens-and-the-rest-of-sha-2-i762i765).
 
+The experimental `crypto` families (#766–#771) add: streaming HMAC
+(`crypto.hmac_new`/`hmac_update`/`hmac_hexdigest`/`hmac_digest`);
+`crypto.randbelow(n)` (unbiased `[0, n)`, like `secrets.randbelow`); the OpenSSL-
+backed `crypto.sha3_256`/`sha3_512`/`blake2b`/`blake2s` (one-shot); RSA-PSS
+(`crypto.rsa_pss_sha256`/`384`/`512_sign`/`_verify`) and PKCS#1 v1.5 RS384/RS512
+(`crypto.rsa_sha384`/`512_sign`/`_verify`); the JOSE ECDSA curves P-384/ES384 and
+P-521/ES512 (`crypto.p384_sha384_*`, `crypto.p521_sha512_*`, with
+`crypto.p384_public_key_pem`/`p521_public_key_pem`); and the general encoders
+`crypto.hex`/`unhex` and `crypto.b64url_encode`/`b64url_decode`. See
+[D-0133](DECISIONS.md#d-0133--stdlib-crypto-streaming-hmac-randbelow-sha-3blake2-rsa-pss--rs384512-ecdsa-p-384p-521-and-hexbase64url-helpers-i766i771).
+
 `crypto.digest`, `crypto.hmac_sha256_raw`, and `crypto.random_bytes` return
 binary `bytes`, supporting indexing, slicing, concatenation, and equality on
 inferred variables. Streaming hash constructors return opaque handles for
