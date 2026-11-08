@@ -21,7 +21,7 @@ def main():
         float x = <-ch
         total = total + x
         i = i + 1
-    print(total)   # 10.5 + 20.25 + 30.0 + 40.25 = 101.0
+    print(total)  # 10.5 + 20.25 + 30.0 + 40.25 = 101.0
 
     # A buffered channel: fill, close, then drain the producer total.
     auto buf = channel[float64](3)
@@ -34,4 +34,4 @@ def main():
     while j < 3:
         sum = sum + <-buf
         j = j + 1
-    print(sum)     # 1.5 + 2.5 + 3.25 = 7.25
+    print(sum)  # 1.5 + 2.5 + 3.25 = 7.25
