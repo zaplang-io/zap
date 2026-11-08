@@ -399,6 +399,13 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
+          # Use the runner image's preinstalled MSYS2 instead of downloading a
+          # fresh base distribution: that fetch intermittently 504s from the
+          # upstream mirror and flakes these Windows jobs (A2/A3/A4/runtime).
+          # suppress-deprecation-warnings silences setup-msys2's MINGW64
+          # deprecation notice; the UCRT64 migration is tracked separately.
+          release: false
+          suppress-deprecation-warnings: msystem-mingw64
           update: false
           install: >-
             mingw-w64-x86_64-gcc
@@ -465,6 +472,13 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
+          # Use the runner image's preinstalled MSYS2 instead of downloading a
+          # fresh base distribution: that fetch intermittently 504s from the
+          # upstream mirror and flakes these Windows jobs (A2/A3/A4/runtime).
+          # suppress-deprecation-warnings silences setup-msys2's MINGW64
+          # deprecation notice; the UCRT64 migration is tracked separately.
+          release: false
+          suppress-deprecation-warnings: msystem-mingw64
           update: false
           install: >-
             mingw-w64-x86_64-gcc
@@ -517,6 +531,13 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
+          # Use the runner image's preinstalled MSYS2 instead of downloading a
+          # fresh base distribution: that fetch intermittently 504s from the
+          # upstream mirror and flakes these Windows jobs (A2/A3/A4/runtime).
+          # suppress-deprecation-warnings silences setup-msys2's MINGW64
+          # deprecation notice; the UCRT64 migration is tracked separately.
+          release: false
+          suppress-deprecation-warnings: msystem-mingw64
           update: false
           install: >-
             mingw-w64-x86_64-gcc
@@ -576,6 +597,13 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
+          # Use the runner image's preinstalled MSYS2 instead of downloading a
+          # fresh base distribution: that fetch intermittently 504s from the
+          # upstream mirror and flakes these Windows jobs (A2/A3/A4/runtime).
+          # suppress-deprecation-warnings silences setup-msys2's MINGW64
+          # deprecation notice; the UCRT64 migration is tracked separately.
+          release: false
+          suppress-deprecation-warnings: msystem-mingw64
           update: false
           install: >-
             mingw-w64-x86_64-gcc

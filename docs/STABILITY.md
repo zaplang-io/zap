@@ -500,7 +500,8 @@ catchable `ValueError`. **Experimental** like the rest of `crypto`.
 The experimental `crypto` follow-up families (#766–#771, D-0133) add: streaming
 HMAC (`hmac_new`/`hmac_update`/`hmac_hexdigest`/`hmac_digest`, over the
 self-contained HMAC core, non-destructive finalize); `crypto.randbelow(n) -> int`
-(unbiased `[0, n)`; `crypto.choice` is deferred); the OpenSSL-backed
+(unbiased `[0, n)`) and `crypto.choice(seq: list[T]) -> T` (element-generic
+uniform pick; empty list raises a catchable `ValueError`); the OpenSSL-backed
 `sha3_256`/`sha3_512`/`blake2b`/`blake2s` one-shot hashes (these specific hashes
 depend on OpenSSL, unlike the self-contained SHA-1/2 + MD5 core; streaming is
 deferred); RSA-PSS `rsa_pss_sha256`/`384`/`512_sign`/`_verify` and PKCS#1 v1.5

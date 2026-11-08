@@ -256,7 +256,9 @@ family (one-shot and streaming), alongside the existing `sha256`/`sha512`/`sha1`
 
 The experimental `crypto` families (#766–#771) add: streaming HMAC
 (`crypto.hmac_new`/`hmac_update`/`hmac_hexdigest`/`hmac_digest`);
-`crypto.randbelow(n)` (unbiased `[0, n)`, like `secrets.randbelow`); the OpenSSL-
+`crypto.randbelow(n)` (unbiased `[0, n)`, like `secrets.randbelow`) and
+`crypto.choice(seq)` (element-generic uniform pick from a `list[T]`, like
+`secrets.choice`; empty list raises `ValueError`); the OpenSSL-
 backed `crypto.sha3_256`/`sha3_512`/`blake2b`/`blake2s` (one-shot); RSA-PSS
 (`crypto.rsa_pss_sha256`/`384`/`512_sign`/`_verify`) and PKCS#1 v1.5 RS384/RS512
 (`crypto.rsa_sha384`/`512_sign`/`_verify`); the JOSE ECDSA curves P-384/ES384 and

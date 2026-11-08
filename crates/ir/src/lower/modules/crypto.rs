@@ -562,6 +562,30 @@ fn lower(
             let n = lowerer.coerce(v, vt, Ty::I64);
             Ok(Some(call_crypto(lowerer, "zap_crypto_randbelow", vec![n])?))
         }
+        // crypto.choice(seq) -> a uniformly random element (#767), CSPRNG-backed.
+        // zap_crypto_list_index draws the index (raising a catchable ValueError
+        // on an empty list — unlike random.choice, which aborts); the list's
+        // typed element getter then reads it, mirroring how `l[i]` and
+        // random.choice lower.
+        "choice" => {
+            if args.len() != 1 {
+                return Err(err("crypto.choice takes exactly one argument"));
+            }
+            let (lst, lty) = lowerer.expr(&args[0].value)?;
+            let elem = match lty {
+                Ty::List(elem) => elem,
+                _ => return Err(err("crypto.choice expects a list")),
+            };
+            let idx = lowerer.new_value(Ty::I64);
+            lowerer.throwing_call(Some(idx), "zap_crypto_list_index", vec![lst]);
+            let d = lowerer.new_value(elem.ty());
+            lowerer.emit(Inst::Call {
+                dest: Some(d),
+                func: format!("zap_list_get_{}", elem.val_suffix()),
+                args: vec![lst, idx],
+            });
+            Ok(Some((d, elem.ty())))
+        }
         // RSA PKCS#1 v1.5 SHA-384/512 and RSA-PSS (PS256/384/512) sign/verify
         // (#768). Sign takes (pem, data) -> bytes; verify (pem, data, sig) -> bool.
         "rsa_sha384_sign" => refs(lowerer, "zap_crypto_rsa_sha384_sign", 2),

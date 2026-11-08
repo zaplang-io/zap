@@ -5885,13 +5885,22 @@ precise collector traces and frees it with no leak. Supports the SHA family the
 hash core implements (`sha1`/`sha224`/`sha256`/`sha384`/`sha512`); an unknown
 name raises `ValueError`.
 
-**`crypto.randbelow(n) -> int` (#767).** A uniformly random integer in `[0, n)`
-from the OS CSPRNG, rejection-sampled to avoid modulo bias (mirrors Python
-`secrets.randbelow`); `n <= 0` raises `ValueError`. **`crypto.choice` is
-deferred** — a generic `choice(list[T]) -> T` needs the element type threaded
-through the module checker and list-runtime access from the crypto lowerer, more
-machinery than the primitive warrants with no consumer; #767's own text permits
-shipping `randbelow` alone, and `randbelow(len(seq))` covers the use today.
+**`crypto.randbelow(n) -> int` and `crypto.choice(seq) -> T` (#767).**
+`randbelow` is a uniformly random integer in `[0, n)` from the OS CSPRNG,
+rejection-sampled to avoid modulo bias (mirrors Python `secrets.randbelow`);
+`n <= 0` raises `ValueError`. `choice(seq: list[T]) -> T` returns a uniformly
+random element of a list, element-generic over `T` (mirrors `secrets.choice`).
+**Decision:** `choice` reuses the exact mechanism already proven by
+`random.choice` — sema returns the list's element type `T`, and the lowerer draws
+a CSPRNG index (`zap_crypto_list_index`, which reuses `randbelow`'s unbiased
+sampling) and then reads it with the list's typed element getter
+(`zap_list_get_*`), the same lowering as `l[i]` — so no new generic machinery is
+introduced. It differs from `random.choice` in one way: an empty list raises a
+**catchable** `ValueError` rather than aborting, matching `secrets.choice`
+raising on an empty sequence and keeping the whole `crypto` surface non-fatal on
+bad input. Like `random.choice`, the argument must be a concrete `list[T]` (not
+an arbitrary iterable, set, deque, or `range` — a general sequence protocol is a
+separate, future concern).
 
 **SHA-3 and BLAKE2 (#770).** `crypto.sha3_256`/`sha3_512`/`blake2b`/`blake2s`,
 one-shot hex. **Decision (the issue's open question):** these come from OpenSSL
@@ -5938,10 +5947,12 @@ Across both KDF-family decisions (D-0132, D-0133) the KDFs/HMAC accept the SHA
 family by name and reject unknown names and bad arguments with catchable
 `ValueError`; `str` and `bytes` are interchangeable. Pinned by the goldens
 `crypto_hmac_stream.zap`, `crypto_randbelow.zap`, `crypto_hash_families.zap`,
-`crypto_rsa_pss.zap`, `crypto_ecdsa_curves.zap`, and `crypto_encoding.zap` (NIST
-SHA-3 / reference BLAKE2 KATs; RFC 4231 HMAC via the streaming path; RS384/RS512
-fingerprints and OpenSSL-produced PSS/ECDSA signatures verified for interop;
-JOSE signature widths; role/family/curve binding; encoding round-trips and
-malformed-input rejection). The out-of-scope decisions (#772 AEAD, #773 X.509/TLS,
-#774 PK-encryption/DH, #775 scrypt/Argon2) and `crypto.choice` remain tracked on
-epic #761. **Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)
+`crypto_rsa_pss.zap`, `crypto_ecdsa_curves.zap`, `crypto_encoding.zap`, and
+`crypto_choice.zap` (NIST SHA-3 / reference BLAKE2 KATs; RFC 4231 HMAC via the
+streaming path; RS384/RS512 fingerprints and OpenSSL-produced PSS/ECDSA
+signatures verified for interop; JOSE signature widths; role/family/curve
+binding; encoding round-trips and malformed-input rejection; `choice` membership,
+single-element determinism, full-coverage over many draws, element-generic str
+lists, and the empty-list raise). The out-of-scope decisions (#772 AEAD, #773
+X.509/TLS, #774 PK-encryption/DH, #775 scrypt/Argon2) remain tracked on epic
+#761. **Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)

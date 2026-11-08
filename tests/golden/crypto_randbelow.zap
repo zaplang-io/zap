@@ -5,7 +5,8 @@
 # Python secrets.randbelow). Random output cannot be pinned to an exact value,
 # so this fixture asserts the contract: the range bound, randbelow(1) == 0, a
 # no-modulo-bias coverage smoke check (every bucket of a small n is hit across
-# many draws), and that n <= 0 raises. (crypto.choice is deferred — see D-0133.)
+# many draws), and that n <= 0 raises. (crypto.choice, which builds on this, has
+# its own fixture crypto_choice.zap.)
 
 def main():
     # randbelow(1) is always 0.
