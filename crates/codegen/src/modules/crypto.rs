@@ -102,6 +102,31 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into()],
         Some(p.into()),
     );
+    // Private-key PEM builders from private JWK components (#778): PKCS#8 PEM.
+    cg.declare_rt(
+        "zap_crypto_rsa_private_key_pem",
+        &[
+            p.into(),
+            p.into(),
+            p.into(),
+            p.into(),
+            p.into(),
+            p.into(),
+            p.into(),
+            p.into(),
+        ],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_p256_private_key_pem",
+        &[p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_ed25519_private_key_pem",
+        &[p.into()],
+        Some(p.into()),
+    );
     // ES256 (P-256 / SHA-256), JOSE 64-byte r||s: (private_pem, msg) -> bytes.
     cg.declare_rt(
         "zap_crypto_p256_sha256_sign",

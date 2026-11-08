@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`crypto` private-key PEM builders** (#778, D-0136): `rsa_private_key_pem(n,
+  e, d, p, q, dp, dq, qi)`, `p256_private_key_pem(d)`, and
+  `ed25519_private_key_pem(d)` build an unencrypted PKCS#8 `BEGIN PRIVATE KEY`
+  PEM from private JWK components — the symmetric counterpart to the public-key
+  builders (#643). OpenSSL does all ASN.1/validation (RSA via `RSA_check_key`;
+  P-256 derives the public point and runs `EC_KEY_check_key`; Ed25519 from the
+  32-byte seed); malformed/inconsistent components raise a catchable
+  `ValueError`. Unblocks private-JWK signing in the `jwt` library.
 - **`crypto` AEAD symmetric encryption** (#772, D-0135): `aes256gcm_encrypt`/
   `aes256gcm_decrypt` and `chacha20poly1305_encrypt`/`chacha20poly1305_decrypt`
   — `(key, nonce, data, aad="") -> bytes`, over OpenSSL EVP, mirroring Python's

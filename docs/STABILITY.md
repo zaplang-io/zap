@@ -475,6 +475,15 @@ encrypted keys are rejected deterministically without prompting. The surface is
 **Experimental** like the rest of `crypto`; the JWK JSON/base64url layer lives in
 the non-core JWT library.
 
+Private-key PEM builders (#778, D-0136) complete the symmetry with the public
+builders: `crypto.rsa_private_key_pem(n, e, d, p, q, dp, dq, qi)`,
+`crypto.p256_private_key_pem(d)`, and `crypto.ed25519_private_key_pem(d)` emit an
+unencrypted PKCS#8 `BEGIN PRIVATE KEY` PEM from private JWK components, with
+OpenSSL doing all ASN.1 and validation (RSA via `RSA_check_key`; P-256 derives
+`d·G` and runs `EC_KEY_check_key`; Ed25519 from the 32-byte seed). Malformed or
+inconsistent components raise a catchable `ValueError`. **Experimental** like the
+rest of `crypto`.
+
 `crypto.constant_time_eq(a, b) -> bool` (#729, D-0131) compares two `str`/`bytes`
 sequences in time **independent of their byte contents**, backed by OpenSSL
 `CRYPTO_memcmp`. For equal-length inputs the timing does not reveal how many
