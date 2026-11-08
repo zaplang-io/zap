@@ -9176,6 +9176,11 @@ void *zap_process_result_stderr(void *r) { return ((ZapProc *)r)->err; }
 #define ZAP_CRY_SHA512 1
 #define ZAP_CRY_SHA1 2
 #define ZAP_CRY_MD5 3
+/* SHA-384 / SHA-224 (ticket #765): truncated SHA-512 / SHA-256 with distinct IVs
+ * (FIPS 180-4 §5.3.3/§5.3.2). They reuse the SHA-512 / SHA-256 block machinery
+ * verbatim — only the initial hash value and the output length differ. */
+#define ZAP_CRY_SHA384 4
+#define ZAP_CRY_SHA224 5
 
 #define ZAP_ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 #define ZAP_ROL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
@@ -9625,6 +9630,37 @@ static void zap_md5_final(zap_md5 *c, uint8_t *out) {
     }
 }
 
+/* ---- SHA-384 / SHA-224 initial hash values (FIPS 180-4) ----
+ * SHA-384 runs the SHA-512 compression function from a different IV and emits
+ * the leading 48 of the 64 output bytes; SHA-224 runs the SHA-256 compression
+ * function from a different IV and emits the leading 28 of the 32 output bytes.
+ * Only the IV and the output length change, so update/block/final are shared. */
+static void zap_sha384_init(zap_sha512 *c) {
+    c->h[0] = 0xcbbb9d5dc1059ed8ULL;
+    c->h[1] = 0x629a292a367cd507ULL;
+    c->h[2] = 0x9159015a3070dd17ULL;
+    c->h[3] = 0x152fecd8f70e5939ULL;
+    c->h[4] = 0x67332667ffc00b31ULL;
+    c->h[5] = 0x8eb44a8768581511ULL;
+    c->h[6] = 0xdb0c2e0d64f98fa7ULL;
+    c->h[7] = 0x47b5481dbefa4fa4ULL;
+    c->len = 0;
+    c->n = 0;
+}
+
+static void zap_sha224_init(zap_sha256 *c) {
+    c->h[0] = 0xc1059ed8;
+    c->h[1] = 0x367cd507;
+    c->h[2] = 0x3070dd17;
+    c->h[3] = 0xf70e5939;
+    c->h[4] = 0xffc00b31;
+    c->h[5] = 0x68581511;
+    c->h[6] = 0x64f98fa7;
+    c->h[7] = 0xbefa4fa4;
+    c->len = 0;
+    c->n = 0;
+}
+
 /* ---- Unified, algorithm-tagged hash context ---- */
 typedef struct {
     int32_t algo;
@@ -9646,13 +9682,17 @@ static size_t zap_crypto_digest_len(int algo) {
         return 20;
     case ZAP_CRY_MD5:
         return 16;
+    case ZAP_CRY_SHA384:
+        return 48;
+    case ZAP_CRY_SHA224:
+        return 28;
     default:
         return 0;
     }
 }
 
 static size_t zap_crypto_block_len(int algo) {
-    return algo == ZAP_CRY_SHA512 ? 128 : 64;
+    return (algo == ZAP_CRY_SHA512 || algo == ZAP_CRY_SHA384) ? 128 : 64;
 }
 
 static void zap_hash_ctx_init(zap_hash_ctx *c, int algo) {
@@ -9667,6 +9707,14 @@ static void zap_hash_ctx_init(zap_hash_ctx *c, int algo) {
     case ZAP_CRY_SHA1:
         zap_sha1_init(&c->u.s1);
         break;
+    case ZAP_CRY_SHA384:
+        /* SHA-512 machinery, SHA-384 IV. */
+        zap_sha384_init(&c->u.s512);
+        break;
+    case ZAP_CRY_SHA224:
+        /* SHA-256 machinery, SHA-224 IV. */
+        zap_sha224_init(&c->u.s256);
+        break;
     default:
         zap_md5_init(&c->u.m5);
         break;
@@ -9676,9 +9724,11 @@ static void zap_hash_ctx_init(zap_hash_ctx *c, int algo) {
 static void zap_hash_ctx_update(zap_hash_ctx *c, const uint8_t *d, size_t n) {
     switch (c->algo) {
     case ZAP_CRY_SHA256:
+    case ZAP_CRY_SHA224:
         zap_sha256_update(&c->u.s256, d, n);
         break;
     case ZAP_CRY_SHA512:
+    case ZAP_CRY_SHA384:
         zap_sha512_update(&c->u.s512, d, n);
         break;
     case ZAP_CRY_SHA1:
@@ -9690,14 +9740,19 @@ static void zap_hash_ctx_update(zap_hash_ctx *c, const uint8_t *d, size_t n) {
     }
 }
 
-/* Finalize a COPY so the caller's context stays usable (non-destructive). */
+/* Finalize a COPY so the caller's context stays usable (non-destructive). The
+ * SHA-384 / SHA-224 cases run the full SHA-512 / SHA-256 finalization into the
+ * 64-byte scratch buffer; the caller takes only zap_crypto_digest_len() leading
+ * bytes (48 / 28), which is exactly the FIPS 180-4 truncation. */
 static void zap_hash_ctx_final(const zap_hash_ctx *c, uint8_t *out) {
     zap_hash_ctx t = *c;
     switch (t.algo) {
     case ZAP_CRY_SHA256:
+    case ZAP_CRY_SHA224:
         zap_sha256_final(&t.u.s256, out);
         break;
     case ZAP_CRY_SHA512:
+    case ZAP_CRY_SHA384:
         zap_sha512_final(&t.u.s512, out);
         break;
     case ZAP_CRY_SHA1:
@@ -9752,6 +9807,12 @@ void *zap_crypto_sha1(void *data) {
 }
 void *zap_crypto_md5(void *data) {
     return zap_crypto_oneshot_hex(ZAP_CRY_MD5, data);
+}
+void *zap_crypto_sha384(void *data) {
+    return zap_crypto_oneshot_hex(ZAP_CRY_SHA384, data);
+}
+void *zap_crypto_sha224(void *data) {
+    return zap_crypto_oneshot_hex(ZAP_CRY_SHA224, data);
 }
 
 /* Streaming: a `bytes` handle wrapping a heap-allocated, pointer-free context. */
@@ -9909,6 +9970,59 @@ void *zap_crypto_token_hex(int64_t n) {
     if (n > 0)
         zap_crypto_fill_random(rnd, (size_t)n);
     return zap_crypto_hex_str(rnd, (size_t)n);
+}
+
+/* crypto.token_urlsafe(nbytes) -> str (ticket #764): `nbytes` bytes from the OS
+ * CSPRNG, base64url-encoded with NO padding (mirrors Python secrets.token_urlsafe).
+ * A negative `nbytes` raises a catchable ValueError; `nbytes == 0` yields "".
+ * The URL-safe base64 is encoded inline (the general base64url helper #771 is a
+ * separate nice-to-have) over the `-_` alphabet; output length is the unpadded
+ * ceil(nbytes*4/3). The random bytes live in a transient stack buffer that never
+ * escapes; only the encoded string is a GC object, built last. */
+void *zap_crypto_token_urlsafe(int64_t nbytes) {
+    static const char B64URL[64] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    if (nbytes < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("crypto.token_urlsafe: nbytes must be non-negative",
+                                    sizeof("crypto.token_urlsafe: nbytes must be non-negative") - 1));
+    }
+    size_t n = (size_t)nbytes;
+    uint8_t *rnd = (uint8_t *)malloc(n ? n : 1);
+    if (!rnd) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("crypto.token_urlsafe: out of memory", 36));
+    }
+    if (n)
+        zap_crypto_fill_random(rnd, n);
+    /* Unpadded base64url length: the ceil of n*4/3 (full groups of 3 -> 4 chars,
+     * a 1-byte tail -> 2 chars, a 2-byte tail -> 3 chars). */
+    int64_t outlen = (int64_t)((n / 3) * 4 + ((n % 3) ? (n % 3) + 1 : 0));
+    char *out = (char *)zap_buf(outlen > 0 ? outlen : 1);
+    int64_t o = 0;
+    size_t i = 0;
+    while (i + 3 <= n) {
+        uint32_t v = ((uint32_t)rnd[i] << 16) | ((uint32_t)rnd[i + 1] << 8) |
+                     (uint32_t)rnd[i + 2];
+        out[o++] = B64URL[(v >> 18) & 0x3F];
+        out[o++] = B64URL[(v >> 12) & 0x3F];
+        out[o++] = B64URL[(v >> 6) & 0x3F];
+        out[o++] = B64URL[v & 0x3F];
+        i += 3;
+    }
+    size_t rem = n - i;
+    if (rem == 1) {
+        uint32_t v = (uint32_t)rnd[i] << 16;
+        out[o++] = B64URL[(v >> 18) & 0x3F];
+        out[o++] = B64URL[(v >> 12) & 0x3F];
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)rnd[i] << 16) | ((uint32_t)rnd[i + 1] << 8);
+        out[o++] = B64URL[(v >> 18) & 0x3F];
+        out[o++] = B64URL[(v >> 12) & 0x3F];
+        out[o++] = B64URL[(v >> 6) & 0x3F];
+    }
+    free(rnd);
+    return zap_str_adopt(out, o);
 }
 
 /* ===========================================================================
@@ -14870,6 +14984,7 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
 #include <openssl/ecdsa.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h> /* PBKDF2 / HKDF key derivation (#762, #763)           */
 #include <openssl/obj_mac.h>
 #include <openssl/objects.h>
 #include <openssl/pem.h>
@@ -14912,6 +15027,142 @@ int64_t zap_crypto_constant_time_eq(void *a, void *b) {
      * returns 0 iff they are equal. With len == 0 it inspects no bytes and
      * returns 0, so two empty inputs compare equal. */
     return CRYPTO_memcmp(x->data, y->data, (size_t)x->len) == 0 ? 1 : 0;
+}
+
+/* ==========================================================================
+ * crypto: key derivation functions — PBKDF2-HMAC (#762) and HKDF (#763, D-0132)
+ * --------------------------------------------------------------------------
+ * Both ride OpenSSL (already linked). PBKDF2 (PKCS5_PBKDF2_HMAC) is the only
+ * sound password-storage primitive in the stdlib; HKDF (RFC 5869, via the
+ * EVP_PKEY_HKDF derive interface) turns one high-entropy secret into one or
+ * more sub-keys. Both accept the SHA family by name — "sha1", "sha224",
+ * "sha256", "sha384", "sha512" — matching the hashes the module already
+ * exposes; an unknown name raises a catchable ValueError. `password`/`salt`/
+ * `ikm`/`info` are str|bytes (ZapStr ABI); the derived key is a fresh `bytes`
+ * value built last, after the OpenSSL objects are freed. No GC safepoint runs
+ * across the derive calls. */
+
+/* Map a Zap hash name to an OpenSSL digest, or NULL if unsupported. Deliberately
+ * excludes md5 (never appropriate for a KDF). */
+static const EVP_MD *zap_crypto_kdf_md(const ZapStr *name) {
+    size_t n = (size_t)name->len;
+    const char *s = name->data;
+    if (n == 6 && memcmp(s, "sha256", 6) == 0)
+        return EVP_sha256();
+    if (n == 6 && memcmp(s, "sha512", 6) == 0)
+        return EVP_sha512();
+    if (n == 6 && memcmp(s, "sha384", 6) == 0)
+        return EVP_sha384();
+    if (n == 6 && memcmp(s, "sha224", 6) == 0)
+        return EVP_sha224();
+    if (n == 4 && memcmp(s, "sha1", 4) == 0)
+        return EVP_sha1();
+    return NULL;
+}
+
+__attribute__((noreturn)) static void zap_crypto_kdf_raise(const char *msg) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(msg, (int64_t)strlen(msg)));
+    abort(); /* unreachable: zap_panic_typed unwinds */
+}
+
+/* crypto.pbkdf2_hmac(hash_name, password, salt, iterations, dklen) -> bytes.
+ * Mirrors Python hashlib.pbkdf2_hmac. `dklen == 0` means the backing hash's
+ * native digest length. `iterations <= 0`, `dklen < 0`, or an unknown hash name
+ * raise ValueError. */
+void *zap_crypto_pbkdf2_hmac(void *hash_name, void *password, void *salt,
+                             int64_t iterations, int64_t dklen) {
+    const EVP_MD *md = zap_crypto_kdf_md((const ZapStr *)hash_name);
+    if (!md) {
+        zap_crypto_kdf_raise(
+            "crypto.pbkdf2_hmac: unsupported hash_name (use sha1/sha224/sha256/sha384/sha512)");
+    }
+    if (iterations <= 0) {
+        zap_crypto_kdf_raise("crypto.pbkdf2_hmac: iterations must be positive");
+    }
+    if (dklen < 0) {
+        zap_crypto_kdf_raise("crypto.pbkdf2_hmac: dklen must be non-negative");
+    }
+    size_t keylen = (size_t)dklen;
+    if (keylen == 0) {
+        int dl = EVP_MD_get_size(md);
+        keylen = dl > 0 ? (size_t)dl : 0;
+    }
+    const ZapStr *p = (const ZapStr *)password;
+    const ZapStr *s = (const ZapStr *)salt;
+    uint8_t *out = (uint8_t *)malloc(keylen ? keylen : 1);
+    if (!out) {
+        zap_crypto_kdf_raise("crypto.pbkdf2_hmac: out of memory");
+    }
+    int ok = PKCS5_PBKDF2_HMAC(p->data, (int)p->len,
+                               (const unsigned char *)s->data, (int)s->len,
+                               (int)iterations, md, (int)keylen, out) == 1;
+    if (!ok) {
+        free(out);
+        zap_crypto_kdf_raise("crypto.pbkdf2_hmac: derivation failed");
+    }
+    void *result = zap_str_new((const char *)out, (int64_t)keylen);
+    free(out);
+    return result;
+}
+
+/* crypto.hkdf(hash_name, ikm, length, salt, info) -> bytes. RFC 5869
+ * extract-and-expand. `length` must be in 1..=255*HashLen (else ValueError). An
+ * empty `salt` is replaced with the RFC-mandated HashLen zero string explicitly,
+ * so the result is identical across OpenSSL versions regardless of their
+ * no-salt default. An unknown hash name raises ValueError. */
+void *zap_crypto_hkdf(void *hash_name, void *ikm, int64_t length, void *salt,
+                      void *info) {
+    const EVP_MD *md = zap_crypto_kdf_md((const ZapStr *)hash_name);
+    if (!md) {
+        zap_crypto_kdf_raise(
+            "crypto.hkdf: unsupported hash_name (use sha1/sha224/sha256/sha384/sha512)");
+    }
+    int dl = EVP_MD_get_size(md);
+    size_t hashlen = dl > 0 ? (size_t)dl : 0;
+    if (length <= 0) {
+        zap_crypto_kdf_raise("crypto.hkdf: length must be positive");
+    }
+    if (hashlen == 0 || (size_t)length > 255u * hashlen) {
+        zap_crypto_kdf_raise("crypto.hkdf: length too large (max 255*HashLen)");
+    }
+    const ZapStr *k = (const ZapStr *)ikm;
+    const ZapStr *s = (const ZapStr *)salt;
+    const ZapStr *inf = (const ZapStr *)info;
+
+    /* RFC 5869 §2.2: an unset/empty salt is HashLen zero bytes. */
+    uint8_t zero_salt[64];
+    const unsigned char *salt_ptr = (const unsigned char *)s->data;
+    size_t salt_len = (size_t)s->len;
+    if (salt_len == 0) {
+        memset(zero_salt, 0, hashlen);
+        salt_ptr = zero_salt;
+        salt_len = hashlen;
+    }
+
+    size_t outlen = (size_t)length;
+    uint8_t *out = (uint8_t *)malloc(outlen ? outlen : 1);
+    if (!out) {
+        zap_crypto_kdf_raise("crypto.hkdf: out of memory");
+    }
+    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    int ok = pctx && EVP_PKEY_derive_init(pctx) == 1 &&
+             EVP_PKEY_CTX_set_hkdf_md(pctx, md) == 1 &&
+             EVP_PKEY_CTX_set1_hkdf_salt(pctx, salt_ptr, (int)salt_len) == 1 &&
+             EVP_PKEY_CTX_set1_hkdf_key(pctx, (const unsigned char *)k->data,
+                                        (int)k->len) == 1 &&
+             EVP_PKEY_CTX_add1_hkdf_info(pctx, (const unsigned char *)inf->data,
+                                         (int)inf->len) == 1 &&
+             EVP_PKEY_derive(pctx, out, &outlen) == 1 && outlen == (size_t)length;
+    if (pctx) {
+        EVP_PKEY_CTX_free(pctx);
+    }
+    if (!ok) {
+        free(out);
+        zap_crypto_kdf_raise("crypto.hkdf: derivation failed");
+    }
+    void *result = zap_str_new((const char *)out, (int64_t)length);
+    free(out);
+    return result;
 }
 
 /* ==========================================================================

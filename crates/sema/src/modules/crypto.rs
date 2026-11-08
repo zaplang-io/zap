@@ -82,10 +82,24 @@ fn expect_data(checker: &mut Checker, func: &str, arg: &Arg) {
     }
 }
 
+/// An integer-valued argument (counts: iterations / dklen / length / nbytes).
+/// Infers the argument so it is still type-checked, and lowering coerces to i64.
+fn expect_int(checker: &mut Checker, func: &str, arg: &Arg) {
+    let t = checker.infer(&arg.value);
+    if !matches!(t, Ty::Int32 | Ty::Int64 | Ty::UntypedInt | Ty::Unknown) {
+        checker.error(
+            ErrorCode::ZAP4024,
+            format!("{func}() expects an int argument, found {}", t.display()),
+            expr_span(&arg.value),
+        );
+    }
+}
+
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     match method {
         // One-shot hashing: crypto.<algo>(data: str|bytes) -> str (hex digest).
-        "sha256" | "sha512" | "sha1" | "md5" => {
+        // sha384/sha224 (#765) complete the SHA-2 family (truncated SHA-512/256).
+        "sha256" | "sha512" | "sha1" | "md5" | "sha384" | "sha224" => {
             if args.len() != 1 {
                 checker.error(
                     ErrorCode::ZAP4025,
@@ -101,7 +115,7 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             Some(Ty::Str)
         }
         // Streaming: crypto.<algo>_new() -> bytes (an opaque context handle).
-        "sha256_new" | "sha512_new" | "sha1_new" | "md5_new" => {
+        "sha256_new" | "sha512_new" | "sha1_new" | "md5_new" | "sha384_new" | "sha224_new" => {
             expect_argc(checker, "crypto", method, args, 0, span);
             Some(Ty::Bytes)
         }
@@ -355,6 +369,88 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
                 expect_data(checker, method, &args[2]);
             }
             Some(Ty::Bool)
+        }
+        // crypto.pbkdf2_hmac(hash_name, password, salt, iterations, dklen=0)
+        // -> bytes (#762): PBKDF2-HMAC password-based key derivation, matching
+        // Python hashlib.pbkdf2_hmac. `dklen` is optional (0 ⇒ native digest
+        // length). hash_name is a str; password/salt are str|bytes; iterations
+        // and dklen are ints. The runtime raises ValueError on bad arguments or
+        // an unknown hash_name.
+        "pbkdf2_hmac" => {
+            if args.len() != 4 && args.len() != 5 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(hash_name, password, salt, iterations, dklen=0) takes 4 or 5 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+                expect_data(checker, method, &args[2]);
+                expect_int(checker, method, &args[3]);
+                if let Some(dklen) = args.get(4) {
+                    expect_int(checker, method, dklen);
+                }
+            }
+            Some(Ty::Bytes)
+        }
+        // crypto.hkdf(hash_name, ikm, length, salt="", info="") -> bytes (#763,
+        // RFC 5869 extract-and-expand). hash_name is a str; ikm/salt/info are
+        // str|bytes (salt and info optional); length is an int. The runtime
+        // raises ValueError on length <= 0, length > 255*HashLen, or an unknown
+        // hash_name.
+        "hkdf" => {
+            if !(3..=5).contains(&args.len()) {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(hash_name, ikm, length, salt=\"\", info=\"\") takes 3 to 5 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+                expect_int(checker, method, &args[2]);
+                if let Some(salt) = args.get(3) {
+                    expect_data(checker, method, salt);
+                }
+                if let Some(info) = args.get(4) {
+                    expect_data(checker, method, info);
+                }
+            }
+            Some(Ty::Bytes)
+        }
+        // crypto.token_urlsafe(nbytes) -> str (#764): nbytes of CSPRNG randomness,
+        // base64url-encoded without padding (mirrors Python secrets.token_urlsafe).
+        // The runtime raises ValueError on a negative nbytes.
+        "token_urlsafe" => {
+            if args.len() != 1 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.token_urlsafe(nbytes) takes 1 argument, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_int(checker, method, &args[0]);
+            }
+            Some(Ty::Str)
         }
         // crypto.random_bytes(n) -> bytes: n cryptographically secure random bytes.
         "random_bytes" => {

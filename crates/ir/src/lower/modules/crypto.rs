@@ -24,6 +24,9 @@ const ALGO_SHA256: i64 = 0;
 const ALGO_SHA512: i64 = 1;
 const ALGO_SHA1: i64 = 2;
 const ALGO_MD5: i64 = 3;
+/// SHA-384 / SHA-224 (#765): truncated SHA-512 / SHA-256 streaming handles.
+const ALGO_SHA384: i64 = 4;
+const ALGO_SHA224: i64 = 5;
 
 /// Central result classification for every crypto runtime entry point. Missing
 /// registrations fail lowering instead of silently defaulting a byte buffer to
@@ -39,15 +42,20 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_ed25519_public_key_pem"
         | "zap_crypto_p256_sha256_sign"
         | "zap_crypto_ed25519_sign"
+        | "zap_crypto_pbkdf2_hmac"
+        | "zap_crypto_hkdf"
         | "zap_crypto_random_bytes" => Ty::Bytes,
         "zap_crypto_sha256"
         | "zap_crypto_sha512"
         | "zap_crypto_sha1"
         | "zap_crypto_md5"
+        | "zap_crypto_sha384"
+        | "zap_crypto_sha224"
         | "zap_crypto_hexdigest"
         | "zap_crypto_hmac_sha256"
         | "zap_crypto_hmac_sha512"
         | "zap_crypto_token_hex"
+        | "zap_crypto_token_urlsafe"
         | "zap_crypto_key_kind"
         | "zap_crypto_key_curve"
         | "zap_crypto_new" => Ty::Ptr,
@@ -82,6 +90,9 @@ fn call_crypto(
             | "zap_crypto_key_bits"
             | "zap_crypto_key_curve"
             | "zap_crypto_key_is_private"
+            | "zap_crypto_pbkdf2_hmac"
+            | "zap_crypto_hkdf"
+            | "zap_crypto_token_urlsafe"
     );
     Ok(match result_type(func)? {
         Ty::I1 => call_bool(lowerer, func, args),
@@ -181,12 +192,17 @@ fn lower(
         "sha512" => one_shot(lowerer, "zap_crypto_sha512"),
         "sha1" => one_shot(lowerer, "zap_crypto_sha1"),
         "md5" => one_shot(lowerer, "zap_crypto_md5"),
+        // SHA-384 / SHA-224 one-shot hex (#765): same shape as sha256/sha512.
+        "sha384" => one_shot(lowerer, "zap_crypto_sha384"),
+        "sha224" => one_shot(lowerer, "zap_crypto_sha224"),
         // crypto.<algo>_new() -> bytes handle: zap_crypto_new(algo).
-        "sha256_new" | "sha512_new" | "sha1_new" | "md5_new" => {
+        "sha256_new" | "sha512_new" | "sha1_new" | "md5_new" | "sha384_new" | "sha224_new" => {
             let algo = match method {
                 "sha256_new" => ALGO_SHA256,
                 "sha512_new" => ALGO_SHA512,
                 "sha1_new" => ALGO_SHA1,
+                "sha384_new" => ALGO_SHA384,
+                "sha224_new" => ALGO_SHA224,
                 _ => ALGO_MD5,
             };
             let a = lowerer.iconst(Ty::I64, algo);
@@ -363,6 +379,84 @@ fn lower(
             let (msg, _) = lowerer.expr(&args[1].value)?;
             let (sig, _) = lowerer.expr(&args[2].value)?;
             Ok(Some(call_crypto(lowerer, func, vec![key, msg, sig])?))
+        }
+        // crypto.pbkdf2_hmac(hash_name, password, salt, iterations, dklen=0)
+        // -> bytes (#762). `iterations`/`dklen` coerce to i64; an omitted
+        // `dklen` becomes 0 (the hash's native digest length). The runtime
+        // raises a catchable ValueError on bad arguments or an unknown hash.
+        "pbkdf2_hmac" => {
+            if args.len() != 4 && args.len() != 5 {
+                return Err(err(
+                    "crypto.pbkdf2_hmac takes 4 or 5 arguments (hash_name, password, salt, iterations, dklen=0)",
+                ));
+            }
+            let (name, _) = lowerer.expr(&args[0].value)?;
+            let (password, _) = lowerer.expr(&args[1].value)?;
+            let (salt, _) = lowerer.expr(&args[2].value)?;
+            let (iter_v, iter_t) = lowerer.expr(&args[3].value)?;
+            let iterations = lowerer.coerce(iter_v, iter_t, Ty::I64);
+            let dklen = if args.len() == 5 {
+                let (dk_v, dk_t) = lowerer.expr(&args[4].value)?;
+                lowerer.coerce(dk_v, dk_t, Ty::I64)
+            } else {
+                lowerer.iconst(Ty::I64, 0)
+            };
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_crypto_pbkdf2_hmac",
+                vec![name, password, salt, iterations, dklen],
+            )?))
+        }
+        // crypto.hkdf(hash_name, ikm, length, salt="", info="") -> bytes (#763,
+        // RFC 5869). `length` coerces to i64; omitted `salt`/`info` default to the
+        // empty string. The runtime raises ValueError on bad length / unknown hash.
+        "hkdf" => {
+            if !(3..=5).contains(&args.len()) {
+                return Err(err(
+                    "crypto.hkdf takes 3 to 5 arguments (hash_name, ikm, length, salt=\"\", info=\"\")",
+                ));
+            }
+            let (name, _) = lowerer.expr(&args[0].value)?;
+            let (ikm, _) = lowerer.expr(&args[1].value)?;
+            let (len_v, len_t) = lowerer.expr(&args[2].value)?;
+            let length = lowerer.coerce(len_v, len_t, Ty::I64);
+            let empty_str = |m: &mut FnLower| -> Value {
+                let d = m.new_value(Ty::Ptr);
+                m.emit(Inst::StrConst {
+                    dest: d,
+                    bytes: Vec::new(),
+                });
+                d
+            };
+            let salt = if args.len() >= 4 {
+                lowerer.expr(&args[3].value)?.0
+            } else {
+                empty_str(lowerer)
+            };
+            let info = if args.len() == 5 {
+                lowerer.expr(&args[4].value)?.0
+            } else {
+                empty_str(lowerer)
+            };
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_crypto_hkdf",
+                vec![name, ikm, length, salt, info],
+            )?))
+        }
+        // crypto.token_urlsafe(nbytes) -> str (#764): count coerces to i64; a
+        // negative count raises a catchable ValueError in the runtime.
+        "token_urlsafe" => {
+            if args.len() != 1 {
+                return Err(err("crypto.token_urlsafe takes exactly one argument"));
+            }
+            let (v, vt) = lowerer.expr(&args[0].value)?;
+            let n = lowerer.coerce(v, vt, Ty::I64);
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_crypto_token_urlsafe",
+                vec![n],
+            )?))
         }
         // crypto.random_bytes(n) / crypto.token_hex(n): count coerces to i64.
         "random_bytes" | "token_hex" => {
