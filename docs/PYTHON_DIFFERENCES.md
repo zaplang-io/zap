@@ -18,8 +18,10 @@ meant to end up. It has two parts:
   capabilities Zap keeps but writes with different syntax.
 
 A short **[deferred, not omitted](#deferred-not-omitted)** note separates the
-two, and a closing **[largely the same](#largely-the-same)** section lists what
-needs no translation.
+two, a **[largely the same](#largely-the-same)** section lists what needs no
+translation, and a short **[standard-library behavior
+differences](#standard-library-behavior-differences)** section notes where a
+stdlib function deviates from its closest CPython equivalent.
 
 References of the form `#NNN` are tracking issues in
 [`zaplang-io/zap`](https://github.com/zaplang-io/zap); `D-00NN` are design
@@ -262,6 +264,39 @@ These read and behave as in Python and need no translation:
   a list; as a sole call argument it needs no inner parentheses
   (`sum(x*x for x in range(5))`). Loop variables do not leak, matching Python
   (SPEC §8.1; #596/D-0107).
+
+---
+
+## Standard-library behavior differences
+
+Beyond the language itself, a few standard-library functions deviate from their
+closest CPython equivalent. This section is new and deliberately partial — a
+fuller stdlib-parity triage is planned, which may move or prune smaller entries.
+
+### `crypto.b64url_encode` / `crypto.b64url_decode` (#771, D-0133)
+
+Zap's URL-safe base64 helpers follow the **JOSE/JWT convention** (unpadded),
+which differs from Python's `base64.urlsafe_b64encode` / `urlsafe_b64decode`:
+
+- **Encode emits no `=` padding.** Python's `base64.urlsafe_b64encode` always
+  pads; the unpadded form in Python comes from `secrets.token_urlsafe` or a
+  manual `.rstrip(b"=")`.
+- **Decode accepts input with *or* without padding.** Python's
+  `base64.urlsafe_b64decode` requires correct padding and raises on a missing
+  pad; Zap's is lenient.
+
+This matches `crypto.token_urlsafe` (and Python's `secrets.token_urlsafe`), which
+is likewise unpadded. The padded, standard variants remain available through the
+`base64` module (whose `urlsafe` / `pad` options reproduce Python's
+`base64.urlsafe_b64*` exactly); `crypto.b64url_*` is the unpadded convenience for
+callers holding a digest or key as `bytes`.
+
+**Faithful (no divergence):** `crypto.hex` / `crypto.unhex` match Python's
+lowercase `bytes.hex()` / `binascii.hexlify` and the strict `bytes.fromhex`
+decode (odd length or non-hex → `ValueError`); `crypto.token_hex` and
+`crypto.token_urlsafe` match `secrets.token_hex` / `secrets.token_urlsafe`. All
+of these live under the Zap-only `crypto` namespace (Python has no `crypto`
+module), so they are additive surface, not behavioral changes.
 
 ---
 
