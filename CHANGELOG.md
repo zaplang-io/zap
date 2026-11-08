@@ -170,6 +170,32 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   XOR-accumulate loop whose timing the compiler/CPU could undermine, unblocking a
   documented constant-time HMAC comparison in the non-core JWT library
   (zaplang-io/jwt#11).
+- **`crypto` essentials: KDFs, URL-safe tokens, and the rest of SHA-2** (#762,
+  #763, #764, #765; epic #761, D-0132; builds on #105/D-0056). Four primitives
+  that close the most-cited gaps from the crypto gap review (Discussion #758):
+  - `crypto.pbkdf2_hmac(hash_name, password, salt, iterations, dklen=0) -> bytes`
+    — PBKDF2-HMAC password-based key derivation, matching Python
+    `hashlib.pbkdf2_hmac` (the first sound password-storage primitive in the
+    stdlib; OpenSSL `PKCS5_PBKDF2_HMAC`). `dklen == 0` is the hash's native
+    digest length.
+  - `crypto.hkdf(hash_name, ikm, length, salt="", info="") -> bytes` — RFC 5869
+    extract-and-expand (JOSE ECDH-ES, signed/encrypted cookies, key splitting;
+    OpenSSL HKDF). An empty `salt` is the RFC-mandated HashLen zero string;
+    `length` is capped at `255*HashLen`.
+  - `crypto.token_urlsafe(nbytes) -> str` — URL-safe random token (sessions,
+    CSRF, reset links, API keys), CSPRNG bytes base64url-encoded **without
+    padding**, mirroring Python `secrets.token_urlsafe`.
+  - `crypto.sha384`/`crypto.sha224` (one-shot **and** streaming `_new`/`update`/
+    `hexdigest`/`digest`) complete the SHA-2 family, extending the self-contained
+    FIPS 180-4 hash core in `zaprt.c` (SHA-384 is truncated SHA-512, SHA-224
+    truncated SHA-256; no new dependency). Unblocks the JOSE ES384/RS384/PS384
+    family in the non-core JWT library.
+  The KDFs accept the SHA family by name (`sha1`/`sha224`/`sha256`/`sha384`/
+  `sha512`); `password`/`salt`/`ikm`/`info` accept `str` or `bytes`; an unknown
+  hash name, `iterations <= 0`, a negative `dklen`, an out-of-range `length`, or
+  a negative `nbytes` raise catchable `ValueError`. Goldens pin RFC 6070
+  (PBKDF2-HMAC-SHA1), RFC 5869 Appendix A (HKDF), FIPS/NIST SHA-384/224 KATs, and
+  the token shape/alphabet contract. **Experimental** like the rest of `crypto`.
 - **General value-rendering (repr/Display) protocol for user types** (#274,
   D-0124; follow-up to #252/#159, extends D-0047/D-0046/D-0018/D-0049). A user
   type with no `__str__`/`__repr__`/`@derive(Repr)` now gets an **automatic

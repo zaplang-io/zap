@@ -484,6 +484,19 @@ lengths, and the guarantee covers the comparison itself, not surrounding
 marshalling. **Experimental** like the rest of `crypto`; intended for HMAC/MAC
 verification in the non-core JWT library.
 
+The experimental key-derivation and token surface (#762–#765, D-0132) adds
+`crypto.pbkdf2_hmac(hash_name, password, salt, iterations, dklen=0)` (OpenSSL
+`PKCS5_PBKDF2_HMAC`; `dklen == 0` ⇒ native digest length) and
+`crypto.hkdf(hash_name, ikm, length, salt="", info="")` (RFC 5869, OpenSSL HKDF;
+empty salt ⇒ HashLen zeros, `length` ≤ `255*HashLen`), both returning binary
+`bytes` over the SHA family (`sha1`/`sha224`/`sha256`/`sha384`/`sha512`);
+`crypto.token_urlsafe(nbytes)` returns an unpadded base64url string from the OS
+CSPRNG; and `crypto.sha384`/`crypto.sha224` complete the self-contained SHA-2
+hash core (one-shot and streaming, truncated SHA-512/SHA-256). `password`/`salt`/
+`ikm`/`info` accept `str` or `bytes`; an unknown hash name, non-positive
+`iterations`, negative `dklen`, out-of-range `length`, or negative `nbytes` raise
+catchable `ValueError`. **Experimental** like the rest of `crypto`.
+
 The `http` client verbs `get`/`post`/`request` gained an **optional trailing
 `dict[str, str]` of request headers** (#280) and already expose response
 `status`/`header`/`body` accessors, and the server-side `http.respond` gained

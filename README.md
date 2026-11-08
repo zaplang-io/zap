@@ -241,6 +241,19 @@ reveals through timing how many leading bytes matched. It is backed by OpenSSL
 is taken on byte contents. Intended for HMAC/MAC verification; see
 [D-0131](DECISIONS.md#d-0131--stdlib-crypto-constant-time-byte-comparison-cryptoconstant_time_eq-i729).
 
+`crypto.pbkdf2_hmac(hash_name, password, salt, iterations, dklen=0)` (PBKDF2-HMAC
+password-based key derivation, matching Python `hashlib.pbkdf2_hmac`) and
+`crypto.hkdf(hash_name, ikm, length, salt="", info="")` (RFC 5869
+extract-and-expand) derive keys over the SHA family (`sha1`/`sha224`/`sha256`/
+`sha384`/`sha512`); `password`/`salt`/`ikm`/`info` accept `str` or `bytes`, and
+bad arguments (unknown hash, non-positive iterations, negative `dklen`,
+out-of-range `length`) raise `ValueError`. `crypto.token_urlsafe(nbytes)` returns
+a URL-safe random token (base64url, no padding), mirroring Python
+`secrets.token_urlsafe`. `crypto.sha384`/`crypto.sha224` complete the SHA-2
+family (one-shot and streaming), alongside the existing `sha256`/`sha512`/`sha1`/
+`md5`. See
+[D-0132](DECISIONS.md#d-0132--stdlib-crypto-key-derivation-pbkdf2hkdf-url-safe-tokens-and-the-rest-of-sha-2-i762i765).
+
 `crypto.digest`, `crypto.hmac_sha256_raw`, and `crypto.random_bytes` return
 binary `bytes`, supporting indexing, slicing, concatenation, and equality on
 inferred variables. Streaming hash constructors return opaque handles for

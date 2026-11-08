@@ -5786,3 +5786,81 @@ last-byte differences, length differences and prefixes, empty and single-byte
 inputs, `str`/`bytes` equivalence, high bytes, embedded NULs, and a realistic
 HMAC-digest comparison). **Experimental**, like the rest of `crypto`.
 (Decided 2026-11-07.)
+
+## D-0132 — stdlib `crypto`: key derivation (PBKDF2/HKDF), URL-safe tokens, and the rest of SHA-2 (I#762–I#765)
+
+Four primitives that close the most-cited gaps from the crypto stdlib gap review
+(Discussion #758, epic #761), each spanning the usual four facets — sema
+(`crates/sema/src/modules/crypto.rs`), IR lowering
+(`crates/ir/src/lower/modules/crypto.rs`), codegen declarations
+(`crates/codegen/src/modules/crypto.rs`) and the C shim
+(`crates/codegen/src/zaprt.c`) — with a golden per primitive. Batched into one
+PR (maintainer decision: small, closely-related stdlib additions, one CI run).
+
+**`crypto.pbkdf2_hmac(hash_name, password, salt, iterations, dklen=0) -> bytes`**
+(I#762). PBKDF2-HMAC password-based key derivation, matching the argument order
+and defaulting of Python's `hashlib.pbkdf2_hmac`. This is the first sound
+password-storage primitive in the stdlib — before it, an auth/login library had
+to hand-roll a KDF (forbidden by the core-library golden rule) or store something
+insecure. Backed by OpenSSL `PKCS5_PBKDF2_HMAC` (already linked for `tls`/RSA, no
+new dependency). `dklen == 0` means the backing hash's native digest length; a
+smaller `dklen` truncates and a larger one is the standard block-expanded output.
+
+**`crypto.hkdf(hash_name, ikm, length, salt="", info="") -> bytes`** (I#763).
+RFC 5869 extract-and-expand — the standard way to turn one high-entropy secret
+into one or more sub-keys (JOSE ECDH-ES, signed/encrypted-cookie schemes, key
+splitting). Backed by OpenSSL's `EVP_PKEY_HKDF` derive interface. `length` must
+be in `1..=255*HashLen` (else `ValueError`). An empty `salt` is replaced
+explicitly with the RFC-mandated HashLen zero string so the output is identical
+across OpenSSL versions regardless of their no-salt default; `info` defaults to
+empty. The argument order (`length` before the optional `salt`/`info`) follows
+I#763 so the common two-argument call `hkdf(hash, ikm, length)` reads naturally;
+Python has no HKDF, so there is no stdlib shape to mirror.
+
+**`crypto.token_urlsafe(nbytes) -> str`** (I#764). The single most common
+web-security primitive (session IDs, CSRF tokens, reset/verification links, API
+keys): `nbytes` bytes from the OS CSPRNG (the existing `zap_crypto_fill_random`
+path: getentropy → /dev/urandom → BCrypt), base64url-encoded **without padding**,
+mirroring Python `secrets.token_urlsafe`. The URL-safe base64 is encoded inline
+in the shim over the `-_` alphabet (the general `bytes`↔base64url helper, #771,
+is a separate nice-to-have and is not a blocker). The returned string is ~1.3×
+`nbytes`; `nbytes == 0` is `""`.
+
+**`crypto.sha384` / `crypto.sha224`** (I#765), one-shot (hex) **and** streaming
+(`sha384_new`/`sha224_new` + `update`/`hexdigest`/`digest`), mirroring the
+existing `sha256`/`sha512` surface exactly. These complete the SHA-2 family and
+extend the **self-contained** FIPS 180-4 hash core in `zaprt.c` (not OpenSSL,
+consistent with the existing hashes): SHA-384 runs the SHA-512 compression
+function from a different IV and truncates to 48 bytes, SHA-224 runs SHA-256 from
+a different IV and truncates to 28 bytes, so only new algorithm tags
+(`ZAP_CRY_SHA384`/`ZAP_CRY_SHA224`), IV initializers and digest-length/block-size
+entries are added — the block/update/finalize machinery is shared. `sha384`
+unblocks the JOSE ES384/RS384/PS384 algorithm family in the non-core JWT library.
+
+**Decisions.** The KDFs accept the SHA family by name — `sha1`, `sha224`,
+`sha256`, `sha384`, `sha512` — matching the hashes the module already exposes;
+`md5` is deliberately excluded (never appropriate for a KDF). An unknown
+`hash_name` raises a catchable `ValueError`. `password`/`salt`/`ikm`/`info`
+accept both `str` and `bytes` (the shared `ZapStr*` byte-data ABI), like the
+existing HMAC functions. Bad numeric arguments raise `ValueError`:
+`iterations <= 0` and negative `dklen` for PBKDF2, `length <= 0` or
+`length > 255*HashLen` for HKDF, and negative `nbytes` for `token_urlsafe`. The
+KDFs are **throwing** (lowered as `Invoke` inside a `try`); the derived key is a
+fresh `bytes`/`str` value built last, after the OpenSSL objects are freed, so no
+GC safepoint runs across the derive calls.
+
+Pinned by the goldens `tests/golden/crypto_sha2_extra.zap` (FIPS/NIST SHA-384/224
+KATs for `""`, `"abc"`, the 896-bit two-block message, plus streaming ==
+one-shot across a chunk boundary, non-destructive finalize, and `str`/`bytes`
+equivalence), `crypto_pbkdf2.zap` (RFC 6070 PBKDF2-HMAC-SHA1 cases 1/2/3/5/6 —
+the 16 777 216-iteration case 4 omitted on time grounds — plus SHA-256/SHA-512
+vectors from CPython, native vs explicit `dklen`, truncation/expansion, and the
+error cases), `crypto_hkdf.zap` (all of RFC 5869 Appendix A A.1–A.7 plus a
+SHA-512 vector, empty-vs-non-empty salt, and the length bounds), and
+`crypto_token_urlsafe.zap` (unpadded base64url length for several `nbytes`, a
+URL-safe alphabet with no padding, a clean round-trip through
+`base64.urlsafe_decode`, distinctness, and the negative-`nbytes` error). The
+nice-to-have follow-ups (#766 streaming HMAC, #767 `randbelow`/`choice`, #768
+RSA-PSS, #769 extra ECDSA curves, #770 SHA-3/BLAKE2, #771 hex/base64url helpers)
+and the out-of-scope decisions (#772–#775) remain tracked on epic #761.
+**Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)

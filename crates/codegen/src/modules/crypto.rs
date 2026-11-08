@@ -29,6 +29,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_crypto_sha512", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_crypto_sha1", &[p.into()], Some(p.into()));
     cg.declare_rt("zap_crypto_md5", &[p.into()], Some(p.into()));
+    // SHA-384 / SHA-224 one-shot hex (#765): truncated SHA-512 / SHA-256.
+    cg.declare_rt("zap_crypto_sha384", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_crypto_sha224", &[p.into()], Some(p.into()));
     // Streaming context handle.
     cg.declare_rt("zap_crypto_new", &[i.into()], Some(p.into()));
     cg.declare_rt("zap_crypto_update", &[p.into(), p.into()], None);
@@ -122,7 +125,22 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), p.into(), p.into()],
         Some(i.into()),
     );
+    // Key derivation functions (#762, #763, D-0132), OpenSSL-backed.
+    // pbkdf2_hmac(hash_name, password, salt, iterations, dklen) -> bytes.
+    cg.declare_rt(
+        "zap_crypto_pbkdf2_hmac",
+        &[p.into(), p.into(), p.into(), i.into(), i.into()],
+        Some(p.into()),
+    );
+    // hkdf(hash_name, ikm, length, salt, info) -> bytes (RFC 5869).
+    cg.declare_rt(
+        "zap_crypto_hkdf",
+        &[p.into(), p.into(), i.into(), p.into(), p.into()],
+        Some(p.into()),
+    );
     // Secure random / secrets.
     cg.declare_rt("zap_crypto_random_bytes", &[i.into()], Some(p.into()));
     cg.declare_rt("zap_crypto_token_hex", &[i.into()], Some(p.into()));
+    // token_urlsafe(nbytes) -> str: base64url, unpadded (#764).
+    cg.declare_rt("zap_crypto_token_urlsafe", &[i.into()], Some(p.into()));
 }
