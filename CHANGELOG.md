@@ -196,6 +196,34 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   a negative `nbytes` raise catchable `ValueError`. Goldens pin RFC 6070
   (PBKDF2-HMAC-SHA1), RFC 5869 Appendix A (HKDF), FIPS/NIST SHA-384/224 KATs, and
   the token shape/alphabet contract. **Experimental** like the rest of `crypto`.
+- **`crypto` families: streaming HMAC, `randbelow`, SHA-3/BLAKE2, RSA-PSS,
+  extra ECDSA curves, and hex/base64url helpers** (#766–#771; epic #761,
+  D-0133; follows D-0132). The nice-to-have follow-ups that round the
+  demand-shaped `crypto` surface into deliberate families:
+  - **Streaming HMAC** (#766): `crypto.hmac_new(hash_name, key)` /
+    `hmac_update` / `hmac_hexdigest` / `hmac_digest` — the incremental
+    counterpart to the one-shot HMACs, over the self-contained HMAC core
+    (pointer-free handle, non-destructive finalize).
+  - **`crypto.randbelow(n) -> int`** (#767): unbiased uniform `[0, n)` from the
+    CSPRNG (rejection-sampled), mirroring `secrets.randbelow`. `crypto.choice`
+    is deferred (D-0133).
+  - **SHA-3 and BLAKE2** (#770): `crypto.sha3_256`/`sha3_512`/`blake2b`/
+    `blake2s`, one-shot. These come from OpenSSL `EVP_Digest` (so they depend on
+    OpenSSL, unlike the self-contained SHA-1/2 + MD5 core); one-shot only for now.
+  - **RSA-PSS + larger PKCS#1 v1.5** (#768): `crypto.rsa_pss_sha256/384/512_sign`
+    /`_verify` (JOSE PS256/384/512; salt = digest length) and
+    `crypto.rsa_sha384/512_sign`/`_verify` (RS384/RS512).
+  - **ECDSA P-384 / P-521** (#769): `crypto.p384_sha384_sign`/`_verify` (ES384,
+    96-byte JOSE `r||s`), `crypto.p521_sha512_sign`/`_verify` (ES512, 132-byte),
+    and `crypto.p384_public_key_pem`/`p521_public_key_pem`.
+  - **Encoding helpers** (#771): `crypto.hex`/`unhex` and `crypto.b64url_encode`
+    /`b64url_decode` (unpadded URL-safe) — thin `crypto`-namespace aliases over
+    the existing `hex`/`base64` runtime, no new C.
+  `str`/`bytes` are interchangeable throughout; unknown hash names and bad
+  arguments raise catchable `ValueError`. Goldens pin NIST SHA-3 / BLAKE2 KATs,
+  RFC 4231 HMAC via the streaming path, RS384/512 fingerprints and
+  OpenSSL-produced PSS/ECDSA signatures verified for interop, JOSE widths, and
+  the encoding round-trips. **Experimental** like the rest of `crypto`.
 - **General value-rendering (repr/Display) protocol for user types** (#274,
   D-0124; follow-up to #252/#159, extends D-0047/D-0046/D-0018/D-0049). A user
   type with no `__str__`/`__repr__`/`@derive(Repr)` now gets an **automatic

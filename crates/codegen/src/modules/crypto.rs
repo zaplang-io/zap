@@ -143,4 +143,100 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_crypto_token_hex", &[i.into()], Some(p.into()));
     // token_urlsafe(nbytes) -> str: base64url, unpadded (#764).
     cg.declare_rt("zap_crypto_token_urlsafe", &[i.into()], Some(p.into()));
+    // randbelow(n) -> int: unbiased [0, n) (#767).
+    cg.declare_rt("zap_crypto_randbelow", &[i.into()], Some(i.into()));
+    // Streaming HMAC (#766): new(hash_name, key) -> handle; update(h, data);
+    // hexdigest(h) -> str; digest(h) -> bytes.
+    cg.declare_rt("zap_crypto_hmac_new", &[p.into(), p.into()], Some(p.into()));
+    cg.declare_rt("zap_crypto_hmac_update", &[p.into(), p.into()], None);
+    cg.declare_rt("zap_crypto_hmac_hexdigest", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_crypto_hmac_digest", &[p.into()], Some(p.into()));
+    // SHA-3 / BLAKE2 one-shot hex (#770), OpenSSL-backed: data -> hex str.
+    cg.declare_rt("zap_crypto_sha3_256", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_crypto_sha3_512", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_crypto_blake2b", &[p.into()], Some(p.into()));
+    cg.declare_rt("zap_crypto_blake2s", &[p.into()], Some(p.into()));
+    // RSA PKCS#1 v1.5 SHA-384/512 and RSA-PSS (PS256/384/512) (#768). Sign:
+    // (pem, data) -> bytes. Verify: (pem, data, sig) -> i64 (0/1).
+    cg.declare_rt(
+        "zap_crypto_rsa_sha384_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_sha512_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_sha384_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_sha512_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_pss_sha256_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_pss_sha384_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_pss_sha512_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_pss_sha256_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_pss_sha384_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_rsa_pss_sha512_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
+    // Additional JOSE ECDSA curves P-384 (ES384) / P-521 (ES512) (#769).
+    cg.declare_rt(
+        "zap_crypto_p384_public_key_pem",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_p521_public_key_pem",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_p384_sha384_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_p384_sha384_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_p521_sha512_sign",
+        &[p.into(), p.into()],
+        Some(p.into()),
+    );
+    cg.declare_rt(
+        "zap_crypto_p521_sha512_verify",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
 }

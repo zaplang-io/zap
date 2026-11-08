@@ -10025,6 +10025,142 @@ void *zap_crypto_token_urlsafe(int64_t nbytes) {
     return zap_str_adopt(out, o);
 }
 
+/* ---- Streaming HMAC (ticket #766) ----
+ * Incremental HMAC over the self-contained hash core, mirroring the streaming
+ * hash handle (`zap_crypto_new`): the handle is a `bytes` value whose buffer is
+ * a pointer-free `zap_hmac_ctx`, so the precise collector traces and frees it.
+ * The inner hash context is kept fed with `ipad || data-so-far`; finalize copies
+ * it (non-destructive) and applies the outer `opad` pass. Supports the SHA family
+ * the hash core implements (sha1/sha224/sha256/sha384/sha512); an unknown name
+ * raises a catchable ValueError (md5 is excluded, as for the KDFs). */
+typedef struct {
+    int32_t algo;
+    size_t blk;            /* block length for this algo */
+    zap_hash_ctx inner;    /* initialized with ipad, then fed input */
+    uint8_t opad[128];     /* key ^ 0x5c, block-padded */
+} zap_hmac_ctx;
+
+/* Map a hash name to a self-contained hash-core algo tag, or -1 if unsupported. */
+static int zap_crypto_hash_algo_by_name(const ZapStr *name) {
+    size_t n = (size_t)name->len;
+    const char *s = name->data;
+    if (n == 6 && memcmp(s, "sha256", 6) == 0)
+        return ZAP_CRY_SHA256;
+    if (n == 6 && memcmp(s, "sha512", 6) == 0)
+        return ZAP_CRY_SHA512;
+    if (n == 6 && memcmp(s, "sha384", 6) == 0)
+        return ZAP_CRY_SHA384;
+    if (n == 6 && memcmp(s, "sha224", 6) == 0)
+        return ZAP_CRY_SHA224;
+    if (n == 4 && memcmp(s, "sha1", 4) == 0)
+        return ZAP_CRY_SHA1;
+    return -1;
+}
+
+static zap_hmac_ctx *zap_crypto_hmac_handle_ctx(void *h) {
+    return (zap_hmac_ctx *)(uintptr_t)((ZapStr *)h)->data;
+}
+
+void *zap_crypto_hmac_new(void *hash_name, void *key) {
+    int algo = zap_crypto_hash_algo_by_name((const ZapStr *)hash_name);
+    if (algo < 0) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_str_new("crypto.hmac_new: unsupported hash_name (use "
+                        "sha1/sha224/sha256/sha384/sha512)",
+                        sizeof("crypto.hmac_new: unsupported hash_name (use "
+                               "sha1/sha224/sha256/sha384/sha512)") -
+                            1));
+    }
+    const ZapStr *k = (const ZapStr *)key;
+    ZapStr *h = (ZapStr *)zap_obj(&zap_desc_strobj);
+    zap_hmac_ctx *c = (zap_hmac_ctx *)zap_buf((int64_t)sizeof(zap_hmac_ctx));
+    c->algo = algo;
+    size_t blk = zap_crypto_block_len(algo);
+    c->blk = blk;
+    /* Derive the block-sized key K0 (RFC 2104): hash it down if longer. */
+    uint8_t k0[128];
+    memset(k0, 0, sizeof(k0));
+    if ((size_t)k->len > blk) {
+        zap_hash_ctx hc;
+        zap_hash_ctx_init(&hc, algo);
+        zap_hash_ctx_update(&hc, (const uint8_t *)k->data, (size_t)k->len);
+        zap_hash_ctx_final(&hc, k0);
+    } else {
+        memcpy(k0, k->data, (size_t)k->len);
+    }
+    uint8_t ipad[128];
+    for (size_t i = 0; i < blk; i++) {
+        ipad[i] = (uint8_t)(k0[i] ^ 0x36);
+        c->opad[i] = (uint8_t)(k0[i] ^ 0x5c);
+    }
+    zap_hash_ctx_init(&c->inner, algo);
+    zap_hash_ctx_update(&c->inner, ipad, blk);
+    h->len = (int64_t)sizeof(zap_hmac_ctx);
+    h->data = (const char *)c;
+    return h;
+}
+
+void zap_crypto_hmac_update(void *handle, void *data) {
+    zap_hmac_ctx *c = zap_crypto_hmac_handle_ctx(handle);
+    const ZapStr *d = (const ZapStr *)data;
+    zap_hash_ctx_update(&c->inner, (const uint8_t *)d->data, (size_t)d->len);
+}
+
+/* Finalize a COPY of the inner context, then run the outer opad pass, so the
+ * handle stays usable (non-destructive, matching the hash streaming handle). */
+static void zap_crypto_hmac_finalize(const zap_hmac_ctx *c, uint8_t *out) {
+    size_t dlen = zap_crypto_digest_len(c->algo);
+    uint8_t inner[64];
+    zap_hash_ctx_final(&c->inner, inner);
+    zap_hash_ctx oc;
+    zap_hash_ctx_init(&oc, c->algo);
+    zap_hash_ctx_update(&oc, c->opad, c->blk);
+    zap_hash_ctx_update(&oc, inner, dlen);
+    zap_hash_ctx_final(&oc, out);
+}
+
+void *zap_crypto_hmac_hexdigest(void *handle) {
+    zap_hmac_ctx *c = zap_crypto_hmac_handle_ctx(handle);
+    uint8_t out[64];
+    zap_crypto_hmac_finalize(c, out);
+    return zap_crypto_hex_str(out, zap_crypto_digest_len(c->algo));
+}
+
+void *zap_crypto_hmac_digest(void *handle) {
+    zap_hmac_ctx *c = zap_crypto_hmac_handle_ctx(handle);
+    uint8_t out[64];
+    size_t n = zap_crypto_digest_len(c->algo);
+    zap_crypto_hmac_finalize(c, out);
+    return zap_str_new((const char *)out, (int64_t)n);
+}
+
+/* crypto.randbelow(n) -> int (ticket #767): a uniformly random integer in
+ * [0, n), drawn from the OS CSPRNG with rejection sampling to avoid modulo
+ * bias. `n <= 0` raises a catchable ValueError (mirrors Python
+ * secrets.randbelow, which rejects non-positive n). */
+int64_t zap_crypto_randbelow(int64_t n) {
+    if (n <= 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("crypto.randbelow: n must be positive",
+                                    sizeof("crypto.randbelow: n must be positive") - 1));
+    }
+    uint64_t un = (uint64_t)n;
+    if (un == 1) {
+        return 0;
+    }
+    /* Largest multiple of `un` that fits in a uint64; reject draws at or above
+     * it so the kept range is an exact whole number of `un`-sized buckets. */
+    uint64_t limit = (UINT64_MAX / un) * un;
+    for (;;) {
+        uint64_t r = 0;
+        zap_crypto_fill_random((uint8_t *)&r, sizeof(r));
+        if (r < limit) {
+            return (int64_t)(r % un);
+        }
+    }
+}
+
 /* ===========================================================================
  * bytes + base64 + hex (ticket #337). `bytes` reuses the ZapStr length-prefixed
  * byte buffer; these entry points give it byte-wise indexing/slicing/decoding,
@@ -15816,6 +15952,363 @@ int64_t zap_crypto_ed25519_verify(void *pem, void *msg, void *sig) {
             "crypto.ed25519_verify: signature did not verify");
     }
     return 1;
+}
+
+/* ==========================================================================
+ * crypto: SHA-3 and BLAKE2 hash families (ticket #770, D-0133)
+ * --------------------------------------------------------------------------
+ * Unlike the SHA-1/2 + MD5 core above (self-contained FIPS/RFC C), SHA-3 and
+ * BLAKE2 are taken from OpenSSL's `EVP_Digest` (both present in OpenSSL
+ * 1.1.1+/3.x, already linked) rather than hand-porting Keccak / BLAKE2 — a
+ * deliberate trade recorded in D-0133. One-shot only in this cut: the streaming
+ * handle model stores a pointer-free context inline in a GC buffer, which an
+ * opaque `EVP_MD_CTX*` cannot do without a finalizer, and there is no consumer
+ * for streaming SHA-3/BLAKE2 yet. BLAKE2b defaults to 512-bit and BLAKE2s to
+ * 256-bit output, matching Python hashlib.blake2b/blake2s defaults. */
+static void *zap_crypto_evp_oneshot_hex(const EVP_MD *md, void *data) {
+    const ZapStr *d = (const ZapStr *)data;
+    unsigned char out[EVP_MAX_MD_SIZE];
+    unsigned int outlen = 0;
+    if (EVP_Digest((const unsigned char *)d->data, (size_t)d->len, out, &outlen,
+                   md, NULL) != 1) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto: hash computation failed"));
+    }
+    return zap_crypto_hex_str(out, (size_t)outlen);
+}
+void *zap_crypto_sha3_256(void *data) {
+    return zap_crypto_evp_oneshot_hex(EVP_sha3_256(), data);
+}
+void *zap_crypto_sha3_512(void *data) {
+    return zap_crypto_evp_oneshot_hex(EVP_sha3_512(), data);
+}
+void *zap_crypto_blake2b(void *data) {
+    return zap_crypto_evp_oneshot_hex(EVP_blake2b512(), data);
+}
+void *zap_crypto_blake2s(void *data) {
+    return zap_crypto_evp_oneshot_hex(EVP_blake2s256(), data);
+}
+
+/* ==========================================================================
+ * crypto: RSA-PSS (PS256/384/512) and RSA PKCS#1 v1.5 SHA-384/512 (ticket
+ * #768, D-0133)
+ * --------------------------------------------------------------------------
+ * Broadens RSA signing beyond PKCS#1 v1.5/SHA-256 (#628/D-0102). PSS is the
+ * JOSE-recommended scheme; RS384/RS512 need the larger SHA-2 digests (#765).
+ * Shared contract with the existing RSA entries: the key must be an ordinary
+ * RSA key (RSA-PSS-only keys have their own base id and are excluded); signing
+ * raises a catchable ValueError on failure; verification returns a plain
+ * boolean, false on any mismatch/tamper, never a panic. For PSS the salt length
+ * is the digest length and MGF1 uses the same hash (the JOSE convention). */
+static void *zap_crypto_rsa_sign_ex(const EVP_MD *md, int padding, void *pem,
+                                    void *data, const char *fname) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *d = (ZapStr *)data;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey =
+        bio ? PEM_read_bio_PrivateKey(bio, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "%s: could not parse RSA private key from PEM",
+                 fname);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(msg));
+    }
+    if (!zap_crypto_is_rsa_key(pkey)) {
+        EVP_PKEY_free(pkey);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%s: RSA private key required", fname);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(msg));
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_PKEY_CTX *pctx = NULL;
+    unsigned char *sig = NULL;
+    size_t siglen = 0;
+    int ok = ctx && EVP_DigestSignInit(ctx, &pctx, md, NULL, pkey) == 1 && pctx &&
+             EVP_PKEY_CTX_set_rsa_padding(pctx, padding) == 1;
+    if (ok && padding == RSA_PKCS1_PSS_PADDING) {
+        ok = EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) == 1 &&
+             EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md) == 1;
+    }
+    ok = ok &&
+         EVP_DigestSign(ctx, NULL, &siglen, (const unsigned char *)d->data,
+                        (size_t)d->len) == 1 &&
+         (sig = (unsigned char *)malloc(siglen ? siglen : 1)) != NULL &&
+         EVP_DigestSign(ctx, sig, &siglen, (const unsigned char *)d->data,
+                        (size_t)d->len) == 1;
+    if (!ok) {
+        free(sig);
+        EVP_MD_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        char msg[48];
+        snprintf(msg, sizeof(msg), "%s: signing failed", fname);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(msg));
+    }
+    void *out = zap_str_new((const char *)sig, (int64_t)siglen);
+    free(sig);
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return out;
+}
+
+static int64_t zap_crypto_rsa_verify_ex(const EVP_MD *md, int padding, void *pem,
+                                        void *data, void *sig,
+                                        const char *reason) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *d = (ZapStr *)data;
+    ZapStr *s = (ZapStr *)sig;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey =
+        bio ? PEM_read_bio_PUBKEY(bio, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        return zap_crypto_rsa_verify_reject(reason);
+    }
+    if (!zap_crypto_is_rsa_key(pkey)) {
+        EVP_PKEY_free(pkey);
+        return zap_crypto_rsa_verify_reject(reason);
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_PKEY_CTX *pctx = NULL;
+    int init = ctx && EVP_DigestVerifyInit(ctx, &pctx, md, NULL, pkey) == 1 &&
+               pctx && EVP_PKEY_CTX_set_rsa_padding(pctx, padding) == 1;
+    if (init && padding == RSA_PKCS1_PSS_PADDING) {
+        init = EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) == 1 &&
+               EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md) == 1;
+    }
+    int64_t ok = 0;
+    if (init) {
+        ok = EVP_DigestVerify(ctx, (const unsigned char *)s->data, (size_t)s->len,
+                              (const unsigned char *)d->data, (size_t)d->len) == 1
+                 ? 1
+                 : 0;
+    }
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    return ok ? 1 : zap_crypto_rsa_verify_reject(reason);
+}
+
+void *zap_crypto_rsa_sha384_sign(void *pem, void *data) {
+    return zap_crypto_rsa_sign_ex(EVP_sha384(), RSA_PKCS1_PADDING, pem, data,
+                                  "crypto.rsa_sha384_sign");
+}
+void *zap_crypto_rsa_sha512_sign(void *pem, void *data) {
+    return zap_crypto_rsa_sign_ex(EVP_sha512(), RSA_PKCS1_PADDING, pem, data,
+                                  "crypto.rsa_sha512_sign");
+}
+int64_t zap_crypto_rsa_sha384_verify(void *pem, void *data, void *sig) {
+    return zap_crypto_rsa_verify_ex(EVP_sha384(), RSA_PKCS1_PADDING, pem, data,
+                                    sig, "crypto.rsa_sha384_verify failed");
+}
+int64_t zap_crypto_rsa_sha512_verify(void *pem, void *data, void *sig) {
+    return zap_crypto_rsa_verify_ex(EVP_sha512(), RSA_PKCS1_PADDING, pem, data,
+                                    sig, "crypto.rsa_sha512_verify failed");
+}
+void *zap_crypto_rsa_pss_sha256_sign(void *pem, void *data) {
+    return zap_crypto_rsa_sign_ex(EVP_sha256(), RSA_PKCS1_PSS_PADDING, pem, data,
+                                  "crypto.rsa_pss_sha256_sign");
+}
+void *zap_crypto_rsa_pss_sha384_sign(void *pem, void *data) {
+    return zap_crypto_rsa_sign_ex(EVP_sha384(), RSA_PKCS1_PSS_PADDING, pem, data,
+                                  "crypto.rsa_pss_sha384_sign");
+}
+void *zap_crypto_rsa_pss_sha512_sign(void *pem, void *data) {
+    return zap_crypto_rsa_sign_ex(EVP_sha512(), RSA_PKCS1_PSS_PADDING, pem, data,
+                                  "crypto.rsa_pss_sha512_sign");
+}
+int64_t zap_crypto_rsa_pss_sha256_verify(void *pem, void *data, void *sig) {
+    return zap_crypto_rsa_verify_ex(EVP_sha256(), RSA_PKCS1_PSS_PADDING, pem, data,
+                                    sig, "crypto.rsa_pss_sha256_verify failed");
+}
+int64_t zap_crypto_rsa_pss_sha384_verify(void *pem, void *data, void *sig) {
+    return zap_crypto_rsa_verify_ex(EVP_sha384(), RSA_PKCS1_PSS_PADDING, pem, data,
+                                    sig, "crypto.rsa_pss_sha384_verify failed");
+}
+int64_t zap_crypto_rsa_pss_sha512_verify(void *pem, void *data, void *sig) {
+    return zap_crypto_rsa_verify_ex(EVP_sha512(), RSA_PKCS1_PSS_PADDING, pem, data,
+                                    sig, "crypto.rsa_pss_sha512_verify failed");
+}
+
+/* ==========================================================================
+ * crypto: additional JOSE ECDSA curves P-384 (ES384) and P-521 (ES512)
+ * (ticket #769, D-0133)
+ * --------------------------------------------------------------------------
+ * Same validated path and DER<->JOSE fixed-width r||s conversion as the P-256
+ * code (#643); the only parameters are the curve NID, the coordinate byte width
+ * (P-384: 48, P-521: 66 — note 521 bits rounds up to 66 bytes), and the digest.
+ * DER is never surfaced. Import validates the point is on the curve. */
+static void *zap_crypto_ec_public_key_pem(int nid, size_t coord, void *x_bytes,
+                                          void *y_bytes, const char *fname) {
+    ZapStr *x = (ZapStr *)x_bytes;
+    ZapStr *y = (ZapStr *)y_bytes;
+    if ((size_t)x->len != coord || (size_t)y->len != coord) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "%s: each coordinate must be exactly %zu bytes",
+                 fname, coord);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(msg));
+    }
+    EC_KEY *ec = EC_KEY_new_by_curve_name(nid);
+    BIGNUM *bx = BN_bin2bn((const unsigned char *)x->data, (int)x->len, NULL);
+    BIGNUM *by = BN_bin2bn((const unsigned char *)y->data, (int)y->len, NULL);
+    int on_curve = ec && bx && by &&
+                   EC_KEY_set_public_key_affine_coordinates(ec, bx, by) == 1 &&
+                   EC_KEY_check_key(ec) == 1;
+    BN_free(bx);
+    BN_free(by);
+    if (!on_curve) {
+        EC_KEY_free(ec);
+        char msg[80];
+        snprintf(msg, sizeof(msg), "%s: (x, y) is not a valid point on the curve",
+                 fname);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(msg));
+    }
+    EVP_PKEY *pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+        EC_KEY_free(ec);
+        EVP_PKEY_free(pkey);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%s: key assembly failed", fname);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(msg));
+    }
+    return zap_crypto_pkey_to_pub_pem(pkey, fname);
+}
+
+static void *zap_crypto_ecdsa_sign_jose(int nid, size_t coord, const EVP_MD *md,
+                                        void *pem, void *msg, const char *fname) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *m = (ZapStr *)msg;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey =
+        bio ? PEM_read_bio_PrivateKey(bio, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        char e[80];
+        snprintf(e, sizeof(e), "%s: could not parse an EC private key from PEM",
+                 fname);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(e));
+    }
+    if (zap_crypto_ec_curve_nid(pkey) != nid) {
+        EVP_PKEY_free(pkey);
+        char e[80];
+        snprintf(e, sizeof(e), "%s: a private key on the matching curve is required",
+                 fname);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(e));
+    }
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned char *der = NULL;
+    size_t derlen = 0;
+    int ok = ctx && EVP_DigestSignInit(ctx, NULL, md, NULL, pkey) == 1 &&
+             EVP_DigestSign(ctx, NULL, &derlen, (const unsigned char *)m->data,
+                            (size_t)m->len) == 1 &&
+             (der = (unsigned char *)malloc(derlen ? derlen : 1)) != NULL &&
+             EVP_DigestSign(ctx, der, &derlen, (const unsigned char *)m->data,
+                            (size_t)m->len) == 1;
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    unsigned char jose[132]; /* 2 * 66 (P-521) upper bound */
+    const unsigned char *dp = der;
+    ECDSA_SIG *es = ok ? d2i_ECDSA_SIG(NULL, &dp, (long)derlen) : NULL;
+    if (es) {
+        const BIGNUM *r = NULL;
+        const BIGNUM *s = NULL;
+        ECDSA_SIG_get0(es, &r, &s);
+        if (BN_bn2binpad(r, jose, (int)coord) != (int)coord ||
+            BN_bn2binpad(s, jose + coord, (int)coord) != (int)coord) {
+            ok = 0;
+        }
+        ECDSA_SIG_free(es);
+    } else {
+        ok = 0;
+    }
+    free(der);
+    if (!ok) {
+        char e[64];
+        snprintf(e, sizeof(e), "%s: ECDSA signing failed", fname);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_crypto_cstr(e));
+    }
+    return zap_str_new((const char *)jose, (int64_t)(2 * coord));
+}
+
+static int64_t zap_crypto_ecdsa_verify_jose(int nid, size_t coord,
+                                            const EVP_MD *md, void *pem, void *msg,
+                                            void *sig, const char *reason) {
+    ZapStr *k = (ZapStr *)pem;
+    ZapStr *m = (ZapStr *)msg;
+    ZapStr *s = (ZapStr *)sig;
+    BIO *bio = BIO_new_mem_buf(k->data, (int)k->len);
+    EVP_PKEY *pkey =
+        bio ? PEM_read_bio_PUBKEY(bio, NULL, zap_crypto_no_pw, NULL) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    if (!pkey) {
+        return zap_crypto_rsa_verify_reject(reason);
+    }
+    if (zap_crypto_ec_curve_nid(pkey) != nid) {
+        EVP_PKEY_free(pkey);
+        return zap_crypto_rsa_verify_reject(reason);
+    }
+    if ((size_t)s->len != 2 * coord) {
+        EVP_PKEY_free(pkey);
+        return zap_crypto_rsa_verify_reject(reason);
+    }
+    ECDSA_SIG *es = ECDSA_SIG_new();
+    BIGNUM *r = BN_bin2bn((const unsigned char *)s->data, (int)coord, NULL);
+    BIGNUM *sv = BN_bin2bn((const unsigned char *)s->data + coord, (int)coord, NULL);
+    unsigned char *der = NULL;
+    int derlen = 0;
+    int built = es && r && sv && ECDSA_SIG_set0(es, r, sv) == 1;
+    if (built) {
+        derlen = i2d_ECDSA_SIG(es, &der);
+    } else {
+        BN_free(r);
+        BN_free(sv);
+    }
+    int64_t ok = 0;
+    if (built && derlen > 0) {
+        EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+        ok = (ctx && EVP_DigestVerifyInit(ctx, NULL, md, NULL, pkey) == 1 &&
+              EVP_DigestVerify(ctx, der, (size_t)derlen,
+                               (const unsigned char *)m->data, (size_t)m->len) == 1)
+                 ? 1
+                 : 0;
+        EVP_MD_CTX_free(ctx);
+    }
+    OPENSSL_free(der);
+    ECDSA_SIG_free(es);
+    EVP_PKEY_free(pkey);
+    return ok ? 1 : zap_crypto_rsa_verify_reject(reason);
+}
+
+void *zap_crypto_p384_public_key_pem(void *x_bytes, void *y_bytes) {
+    return zap_crypto_ec_public_key_pem(NID_secp384r1, 48, x_bytes, y_bytes,
+                                        "crypto.p384_public_key_pem");
+}
+void *zap_crypto_p521_public_key_pem(void *x_bytes, void *y_bytes) {
+    return zap_crypto_ec_public_key_pem(NID_secp521r1, 66, x_bytes, y_bytes,
+                                        "crypto.p521_public_key_pem");
+}
+void *zap_crypto_p384_sha384_sign(void *pem, void *msg) {
+    return zap_crypto_ecdsa_sign_jose(NID_secp384r1, 48, EVP_sha384(), pem, msg,
+                                      "crypto.p384_sha384_sign");
+}
+int64_t zap_crypto_p384_sha384_verify(void *pem, void *msg, void *sig) {
+    return zap_crypto_ecdsa_verify_jose(NID_secp384r1, 48, EVP_sha384(), pem, msg,
+                                        sig, "crypto.p384_sha384_verify failed");
+}
+void *zap_crypto_p521_sha512_sign(void *pem, void *msg) {
+    return zap_crypto_ecdsa_sign_jose(NID_secp521r1, 66, EVP_sha512(), pem, msg,
+                                      "crypto.p521_sha512_sign");
+}
+int64_t zap_crypto_p521_sha512_verify(void *pem, void *msg, void *sig) {
+    return zap_crypto_ecdsa_verify_jose(NID_secp521r1, 66, EVP_sha512(), pem, msg,
+                                        sig, "crypto.p521_sha512_verify failed");
 }
 
 /* OpenSSL's stock socket BIO calls write/send without MSG_NOSIGNAL. A peer

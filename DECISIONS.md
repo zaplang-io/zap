@@ -5864,3 +5864,84 @@ nice-to-have follow-ups (#766 streaming HMAC, #767 `randbelow`/`choice`, #768
 RSA-PSS, #769 extra ECDSA curves, #770 SHA-3/BLAKE2, #771 hex/base64url helpers)
 and the out-of-scope decisions (#772–#775) remain tracked on epic #761.
 **Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)
+
+## D-0133 — stdlib `crypto`: streaming HMAC, `randbelow`, SHA-3/BLAKE2, RSA-PSS + RS384/512, ECDSA P-384/P-521, and hex/base64url helpers (I#766–I#771)
+
+The six **nice-to-have** follow-ups of the crypto gap-review epic #761
+(Discussion #758), batched into one PR (maintainer decision). Each spans the
+usual facets — sema, IR lowering, codegen declarations, `zaprt.c` — with a
+golden; the encoding helpers add no C. These round out the demand-shaped
+`crypto` surface into deliberate families; the essential four shipped in D-0132.
+
+**Streaming HMAC (#766).** `crypto.hmac_new(hash_name, key) -> bytes` (an opaque
+handle), `crypto.hmac_update(h, data)`, `crypto.hmac_hexdigest(h) -> str`,
+`crypto.hmac_digest(h) -> bytes` — the incremental counterpart to the one-shot
+`hmac_sha256`/`hmac_sha512`, mirroring the streaming-hash handle exactly
+(non-destructive finalize; a handle may be digested more than once and keeps
+accepting updates). Implemented over the existing self-contained HMAC core: the
+handle is a pointer-free `zap_hmac_ctx` living inline in a GC `bytes` buffer
+(kept fed with `ipad || data`, with the `opad` retained for finalize), so the
+precise collector traces and frees it with no leak. Supports the SHA family the
+hash core implements (`sha1`/`sha224`/`sha256`/`sha384`/`sha512`); an unknown
+name raises `ValueError`.
+
+**`crypto.randbelow(n) -> int` (#767).** A uniformly random integer in `[0, n)`
+from the OS CSPRNG, rejection-sampled to avoid modulo bias (mirrors Python
+`secrets.randbelow`); `n <= 0` raises `ValueError`. **`crypto.choice` is
+deferred** — a generic `choice(list[T]) -> T` needs the element type threaded
+through the module checker and list-runtime access from the crypto lowerer, more
+machinery than the primitive warrants with no consumer; #767's own text permits
+shipping `randbelow` alone, and `randbelow(len(seq))` covers the use today.
+
+**SHA-3 and BLAKE2 (#770).** `crypto.sha3_256`/`sha3_512`/`blake2b`/`blake2s`,
+one-shot hex. **Decision (the issue's open question):** these come from OpenSSL
+`EVP_Digest` rather than a hand-ported Keccak/BLAKE2, so — unlike the
+self-contained SHA-1/2 + MD5 core — these specific hashes depend on OpenSSL
+(already linked). **One-shot only** in this cut: the streaming handle model
+stores a pointer-free context inline in a GC buffer, which an opaque
+`EVP_MD_CTX*` cannot do without a finalizer, and no consumer needs streaming
+SHA-3/BLAKE2 yet; streaming is deferred rather than introducing a leaking or
+finalizer-bearing handle. BLAKE2b defaults to 512-bit and BLAKE2s to 256-bit,
+matching Python `hashlib` defaults.
+
+**RSA-PSS and larger PKCS#1 v1.5 (#768).** `crypto.rsa_pss_sha256_sign`/`_verify`
+(+ `_sha384_`/`_sha512_`) for RSASSA-PSS, and `crypto.rsa_sha384_sign`/`_verify`
++ `rsa_sha512_*` for PKCS#1 v1.5 RS384/RS512. OpenSSL `EVP_DigestSign`/`Verify`
+with `EVP_PKEY_CTX_set_rsa_padding`; for PSS the salt length is the digest length
+(`RSA_PSS_SALTLEN_DIGEST`) and MGF1 uses the same hash (the JOSE convention).
+Same contract as the existing RSA entries (#642): an ordinary RSA key is required
+(RSA-PSS-only keys stay excluded), signing raises `ValueError` on failure,
+verification is a plain boolean. PSS signatures over one message differ (random
+salt) yet all verify; RS384/RS512 are deterministic.
+
+**Additional JOSE ECDSA curves (#769).** `crypto.p384_sha384_sign`/`_verify`
+(ES384, JOSE 96-byte `r||s`), `crypto.p521_sha512_sign`/`_verify` (ES512, 132
+bytes — P-521's 521-bit coordinates round up to 66 bytes each), and
+`crypto.p384_public_key_pem`/`p521_public_key_pem` (validated JWK x/y import).
+The same validated path and DER↔JOSE fixed-width conversion as P-256 (#643),
+generalized over (curve NID, coordinate width, digest); DER is never surfaced;
+`key_info` already reported these curves. Wrong-curve keys raise on sign and
+verify `false`; off-curve / wrong-length coordinates are rejected on import.
+
+**Encoding helpers (#771).** `crypto.hex(data) -> str` (lowercase, like Python
+`bytes.hex()`), `crypto.unhex(s) -> bytes`, `crypto.b64url_encode(data) -> str`
+(unpadded, URL-safe `-_`), `crypto.b64url_decode(s) -> bytes` (padding optional).
+**Decision on placement:** the language already has `hex` and `base64` modules
+with exactly this functionality, so these are thin `crypto`-namespace aliases
+that lower to the existing `zap_hex_encode`/`zap_hex_decode`/`zap_base64_encode`
+(urlsafe, no padding)/`zap_base64_decode` runtime — **no new C** — surfacing them
+where a caller holding a digest as `bytes` expects them (the gap flagged by the
+raw-HMAC work #153). `unhex`/`b64url_decode` raise a catchable error on malformed
+input; `hex`/`b64url_encode` never throw.
+
+Across both KDF-family decisions (D-0132, D-0133) the KDFs/HMAC accept the SHA
+family by name and reject unknown names and bad arguments with catchable
+`ValueError`; `str` and `bytes` are interchangeable. Pinned by the goldens
+`crypto_hmac_stream.zap`, `crypto_randbelow.zap`, `crypto_hash_families.zap`,
+`crypto_rsa_pss.zap`, `crypto_ecdsa_curves.zap`, and `crypto_encoding.zap` (NIST
+SHA-3 / reference BLAKE2 KATs; RFC 4231 HMAC via the streaming path; RS384/RS512
+fingerprints and OpenSSL-produced PSS/ECDSA signatures verified for interop;
+JOSE signature widths; role/family/curve binding; encoding round-trips and
+malformed-input rejection). The out-of-scope decisions (#772 AEAD, #773 X.509/TLS,
+#774 PK-encryption/DH, #775 scrypt/Argon2) and `crypto.choice` remain tracked on
+epic #761. **Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)
