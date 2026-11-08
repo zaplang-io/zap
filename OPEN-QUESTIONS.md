@@ -38,8 +38,13 @@ _Last updated: 2026-10-22_
   with explicit `self`; no extension methods; the `impl Interface for Struct`
   block is the only outside-the-body form. (Opt-in `value struct` value types
   added by D-0051; full OO deferred.)
-- ⚪ **Unsigned integers.** Deferred (D-0019); likely reintroduced only for C
-  interop and array dtypes (e.g. `uint8` for image data).
+- ✅ **Unsigned integers** — RESOLVED (D-0019 amendment, #552): reintroduced as
+  first-class scalar types `uint8`/`uint16`/`uint32`/`uint64` (+ short `uN`
+  spellings) and pointer-width `usize`, for the C FFI epic (#539) and array
+  dtypes. Wraparound overflow, no implicit signed↔unsigned conversion
+  (mixed-sign is `ZAP4015`), `usize` canonical with `size_t` only the C mapping
+  target (no alias), unsigned decimal printing. See D-0019 for the four locked
+  decisions.
 - ⚪ **`char` details** — grapheme-cluster handling, char/codepoint API surface.
 - ⚪ **const / compile-time evaluation** — how far `const` folds at compile time.
 

@@ -1217,6 +1217,56 @@ int64_t zap_ishr(int64_t a, int64_t count) {
     return a >> count;
 }
 
+/* Unsigned integer helpers (#552). The i64-word operands carry unsigned values
+ * (lowering promotes unsigned arithmetic to a 64-bit width and wraps modulo
+ * 2^64), so each reinterprets its words as `uint64_t`. Divide/modulo by zero is
+ * the same catchable ZeroDivisionError as the signed path; there is no INT64_MIN
+ * overflow case for unsigned division. `//` is a plain truncating `udiv` (floor
+ * == truncation when both operands are non-negative) and `%` a plain `urem`. */
+int64_t zap_udiv(int64_t a, int64_t b) {
+    uint64_t ua = (uint64_t)a, ub = (uint64_t)b;
+    if (ub == 0) {
+        zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("integer division or modulo by zero", 34));
+    }
+    return (int64_t)(ua / ub);
+}
+int64_t zap_umod(int64_t a, int64_t b) {
+    uint64_t ua = (uint64_t)a, ub = (uint64_t)b;
+    if (ub == 0) {
+        zap_panic_typed(ZAP_EXC_ZERO_DIVISION_ERROR, zap_str_new("integer division or modulo by zero", 34));
+    }
+    return (int64_t)(ua % ub);
+}
+/* Unsigned power by binary exponentiation, wrapping modulo 2^64 (#552). The
+ * exponent is unsigned, so there is no negative-exponent case (unlike
+ * `zap_ipow`); it cannot raise. */
+int64_t zap_upow(int64_t base, int64_t exp) {
+    uint64_t result = 1, b = (uint64_t)base, e = (uint64_t)exp;
+    while (e != 0) {
+        if (e & 1u) {
+            result *= b;
+        }
+        e >>= 1;
+        if (e != 0) {
+            b *= b;
+        }
+    }
+    return (int64_t)result;
+}
+/* Logical right shift with a validated count (#552), the unsigned counterpart of
+ * `zap_ishr`: zero-fills from the left. A negative count raises a catchable
+ * ValueError; a count >= 64 shifts every bit out and is defined as 0 (not LLVM
+ * poison), consistent with `zap_ishl`. */
+int64_t zap_ushr(int64_t a, int64_t count) {
+    if (count < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("negative shift count", 20));
+    }
+    if (count >= 64) {
+        return 0;
+    }
+    return (int64_t)((uint64_t)a >> (uint64_t)count);
+}
+
 int64_t zap_str_len(void *s) { return ((ZapStr *)s)->len; }
 
 /* ---------------------------------------------------------------------------
@@ -2641,6 +2691,17 @@ void zap_uncaught(void *exc) {
 void *zap_i64_to_str(int64_t v) {
     char tmp[24];
     int n = snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
+    return zap_str_new(tmp, (int64_t)n);
+}
+
+/* Unsigned decimal string (#552). The argument word carries an unsigned value
+ * (narrower unsigned types are zero-extended into the i64 word by lowering), so
+ * it is reinterpreted as `uint64_t` and printed with `%llu`: no phantom sign,
+ * and a value above INT64_MAX (e.g. 2^64-1 = 18446744073709551615) prints its
+ * true magnitude rather than a negative number. 20 digits + NUL fits in 24. */
+void *zap_u64_to_str(int64_t v) {
+    char tmp[24];
+    int n = snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)(uint64_t)v);
     return zap_str_new(tmp, (int64_t)n);
 }
 

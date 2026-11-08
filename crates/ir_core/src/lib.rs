@@ -241,6 +241,19 @@ pub enum Ty {
     I16,
     I32,
     I64,
+    /// Unsigned fixed-width integers (#552, D-0019 amendment). Physically the
+    /// same LLVM `i8`/`i16`/`i32`/`i64` as the signed widths — LLVM integers are
+    /// sign-agnostic — but kept as distinct ZIR types so lowering and codegen can
+    /// select the *unsigned* operations: `udiv`/`urem`, the unsigned `icmp`
+    /// predicates, a logical (not arithmetic) right shift, zero-extension on
+    /// widening, and unsigned decimal printing. Arithmetic wraps modulo 2^width
+    /// (two's complement), matching C. The source `usize` lowers to [`Ty::U64`]
+    /// (pointer width on the supported 64-bit targets); it is not a separate ZIR
+    /// type because it is byte-identical to `uint64` in codegen.
+    U8,
+    U16,
+    U32,
+    U64,
     /// A Unicode scalar `char` (ticket #709). Physically an `i32` codepoint —
     /// codegen maps it to the LLVM `i32` type and every arithmetic / comparison /
     /// coercion / hash path treats it exactly like [`Ty::I32`] (same
@@ -321,15 +334,23 @@ impl Ty {
     pub fn int_width(self) -> Option<u32> {
         match self {
             Ty::I1 => Some(1),
-            Ty::I8 => Some(8),
-            Ty::I16 => Some(16),
+            Ty::I8 | Ty::U8 => Some(8),
+            Ty::I16 | Ty::U16 => Some(16),
             // `char` is a 32-bit codepoint: same width as `int32`, so every
             // width-driven path (arithmetic, comparison, coercion) treats it
             // identically (#709).
-            Ty::I32 | Ty::Char => Some(32),
-            Ty::I64 | Ty::Enum(_) => Some(64),
+            Ty::I32 | Ty::Char | Ty::U32 => Some(32),
+            Ty::I64 | Ty::Enum(_) | Ty::U64 => Some(64),
             _ => None,
         }
+    }
+
+    /// Whether this ZIR type is an **unsigned** integer (#552). Drives op
+    /// selection in lowering/codegen: unsigned `div`/`rem`, the unsigned `icmp`
+    /// predicates, a logical right shift, zero-extension on widening, and
+    /// unsigned decimal printing.
+    pub fn is_unsigned(self) -> bool {
+        matches!(self, Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64)
     }
 
     /// Whether this ZIR type is a **GC-managed heap pointer** in the physical
@@ -349,6 +370,10 @@ impl Ty {
                 | Ty::I32
                 | Ty::Char
                 | Ty::I64
+                | Ty::U8
+                | Ty::U16
+                | Ty::U32
+                | Ty::U64
                 | Ty::Enum(_)
                 | Ty::F32
                 | Ty::F64
@@ -379,16 +404,18 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
-    Div, // sdiv for ints, fdiv for floats (chosen by result type)
-    Rem,
+    Div, // sdiv/udiv for ints, fdiv for floats (signed/unsigned by result type, #552)
+    Rem, // srem/urem (signed/unsigned chosen by result type, #552)
     And,
     Or,
     Xor,
     Shl,
-    Shr, // arithmetic (signed) right shift
+    Shr, // arithmetic (signed, ashr) or logical (unsigned, lshr) right shift, by result type (#552)
 }
 
-/// Comparison predicate (signed for ints, ordered for floats).
+/// Comparison predicate. Codegen picks the signed or unsigned integer `icmp`
+/// predicate from the *operand* type (#552) and the ordered predicate for
+/// floats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpPred {
     Eq,
@@ -409,9 +436,18 @@ pub enum UnOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CastKind {
     SExt,
+    /// Zero-extend a narrower *unsigned* integer to a wider one (#552). The
+    /// unsigned counterpart of [`CastKind::SExt`]: codegen emits `zext`, so
+    /// `uint8(200)` widened to `uint64` stays `200`, not a sign-extended value.
+    ZExt,
     Trunc,
     SIToFP,
+    /// Convert an *unsigned* integer to a float (#552): codegen emits `uitofp`
+    /// so a `uint64` above `INT64_MAX` converts to the correct magnitude.
+    UIToFP,
     FPToSI,
+    /// Convert a float to an *unsigned* integer (#552): codegen emits `fptoui`.
+    FPToUI,
     FPExt,
     FPTrunc,
 }
@@ -978,6 +1014,10 @@ impl fmt::Display for Ty {
             Ty::I32 => "i32",
             Ty::Char => "char",
             Ty::I64 => "i64",
+            Ty::U8 => "u8",
+            Ty::U16 => "u16",
+            Ty::U32 => "u32",
+            Ty::U64 => "u64",
             Ty::Enum(id) => return write!(f, "enum#{id}"),
             Ty::F32 => "f32",
             Ty::F64 => "f64",

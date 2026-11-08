@@ -169,6 +169,8 @@ docstring — are admitted.
 | Type | Notes |
 |---|---|
 | `int64` (default int), `int32` | **signed**; overflow **wraps** (D-0005, D-0019) |
+| `uint8`, `uint16`, `uint32`, `uint64` | **unsigned**; overflow **wraps** (#552) |
+| `usize` | pointer-width **unsigned** (64-bit on supported targets, #552) |
 | `float64`/`f64`, `float32`/`f32` | IEEE floating point |
 | `bool` | `True` / `False` |
 | `char` | a Unicode scalar (codepoint) |
@@ -178,10 +180,29 @@ docstring — are admitted.
 Short aliases `i32`, `i64`, `f32`, `f64` are available, and the Python-facing
 names `int` (a synonym for `int64`, I#581) and `float` (a synonym for
 `float64`) are accepted wherever a type is written — `int x = 0` is `int64 x = 0`
-— just as in Python. All integers are **signed** (D-0019).
+— just as in Python. Signed integers default to `int64`.
 
-**Conversions (D-0020):** widening is implicit (`int32→int64`, `int→float`);
-narrowing that can lose data is explicit (`int32(x)`, `int64(y)`).
+**Unsigned integers (#552, D-0019 amendment).** `uint8`/`uint16`/`uint32`/
+`uint64` (short spellings `u8`/`u16`/`u32`/`u64`) and the pointer-width `usize`
+are the deliberate systems/C-interop surface (Python has no unsigned ints).
+Overflow wraps (two's complement), they print as unsigned decimal (`uint64`
+values above `INT64_MAX` print their true magnitude), and `>>` is a logical
+shift. There is **no implicit conversion between signed and unsigned** — a mixed
+operation is a compile error (`ZAP4015`) — so convert one side explicitly first.
+Implicit widening is allowed only up the fixed-width unsigned tower
+(`uint8`→`uint64`); `usize` converts only explicitly (its width is
+platform-dependent). There is no unsigned literal suffix: `uintN(x)` / `usize(x)`
+produce unsigned values. `usize` is the canonical pointer-width name; `size_t`
+is only the C mapping target at the FFI boundary (`@repr(c)`, #542), never a Zap
+alias. Unsigned arithmetic promotes to `uint64` and wraps at 2^64 — a narrower
+result needs an explicit `uintN(...)` cast, exactly as `int32` arithmetic
+promotes to `int64`.
+
+**Conversions (D-0020):** widening is implicit (`int32→int64`, `int→float`,
+`uint8→uint64`); narrowing that can lose data is explicit (`int32(x)`,
+`int64(y)`, `uint8(x)`); every signed↔unsigned crossing is explicit. An
+out-of-range or negative value wraps under a C reinterpret/truncate cast
+(`uint8(-1) == 255`, `int64(uint64(-1)) == -1`).
 
 **`bigint`.** Integer literals outside the signed `int64` range have type
 `bigint`; smaller integer literals default to `int64`. `bigint(x)` converts an

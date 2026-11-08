@@ -17,6 +17,25 @@ use zapc_syntax::ast::BinOp;
 pub enum Ty {
     Int64,
     Int32,
+    /// Unsigned fixed-width integers (#552, D-0019 amendment). Reintroduced for
+    /// C FFI (#539) and array dtypes. They are a distinct, non-interchangeable
+    /// family: there is **no implicit conversion** between signed and unsigned
+    /// (mixing them in arithmetic/comparison is a compile error, ZAP4015), and
+    /// narrowing always requires an explicit `uintN(...)` / `intN(...)` cast
+    /// (D-0020). Implicit *widening* is allowed only up the unsigned tower
+    /// (`uint8`→`uint16`→`uint32`→`uint64`). Overflow wraps (two's-complement
+    /// modular arithmetic), matching C.
+    Uint8,
+    Uint16,
+    Uint32,
+    Uint64,
+    /// Pointer-width unsigned integer (`usize`, 64-bit on the supported
+    /// x86_64/aarch64 targets). The single canonical name for a size/count at
+    /// the C boundary; `size_t` is only the C *mapping target* (future #542
+    /// `@repr(c)`), never a Zap-level alias (D-0019 locks "no type aliases").
+    /// `usize` takes part in no implicit conversion — every `usize` conversion
+    /// is explicit — because its width is platform-dependent.
+    Usize,
     Float64,
     Float32,
     Bool,
@@ -71,6 +90,11 @@ impl Ty {
             self,
             Ty::Int64
                 | Ty::Int32
+                | Ty::Uint8
+                | Ty::Uint16
+                | Ty::Uint32
+                | Ty::Uint64
+                | Ty::Usize
                 | Ty::Float64
                 | Ty::Float32
                 | Ty::Bigint
@@ -81,13 +105,59 @@ impl Ty {
     }
 
     pub fn is_int(&self) -> bool {
-        matches!(self, Ty::Int64 | Ty::Int32 | Ty::Bigint | Ty::UntypedInt)
+        matches!(
+            self,
+            Ty::Int64
+                | Ty::Int32
+                | Ty::Uint8
+                | Ty::Uint16
+                | Ty::Uint32
+                | Ty::Uint64
+                | Ty::Usize
+                | Ty::Bigint
+                | Ty::UntypedInt
+        )
+    }
+
+    /// An unsigned fixed-width integer or `usize` (#552). `UntypedInt` is not
+    /// unsigned — a bare literal is sign-agnostic until it takes a concrete type.
+    pub fn is_unsigned(&self) -> bool {
+        matches!(
+            self,
+            Ty::Uint8 | Ty::Uint16 | Ty::Uint32 | Ty::Uint64 | Ty::Usize
+        )
+    }
+
+    /// A concrete *signed* machine integer (`int32`/`int64`). Excludes `bigint`,
+    /// the untyped literal, and every unsigned type. Used to detect mixed-sign
+    /// arithmetic (#552).
+    pub fn is_signed_int(&self) -> bool {
+        matches!(self, Ty::Int64 | Ty::Int32)
+    }
+
+    /// Bit width of a fixed-width unsigned type, for implicit-widening checks
+    /// (#552). `usize` reports 64 (its width on supported targets) but is kept
+    /// out of implicit widening by [`assignable`].
+    pub fn uint_width(&self) -> Option<u32> {
+        Some(match self {
+            Ty::Uint8 => 8,
+            Ty::Uint16 => 16,
+            Ty::Uint32 => 32,
+            Ty::Uint64 => 64,
+            Ty::Usize => 64,
+            _ => return None,
+        })
     }
 
     pub fn display(&self) -> String {
         match self {
             Ty::Int64 => "int64".into(),
             Ty::Int32 => "int32".into(),
+            Ty::Uint8 => "uint8".into(),
+            Ty::Uint16 => "uint16".into(),
+            Ty::Uint32 => "uint32".into(),
+            Ty::Uint64 => "uint64".into(),
+            Ty::Usize => "usize".into(),
             Ty::Float64 => "float64".into(),
             Ty::Float32 => "float32".into(),
             Ty::Bool => "bool".into(),
@@ -150,6 +220,20 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
             | Ty::UntypedFloat,
         ) => true,
         (Ty::UntypedFloat, Ty::Float32 | Ty::Float64 | Ty::Complex) => true,
+        // An untyped integer literal fits any unsigned target too (#552), so
+        // `uint8 x = 5` and `usize n = 0` work without a cast. A *negative*
+        // literal into an unsigned target is caught at the checker (it has the
+        // literal's value/sign); here the literal is already sign-agnostic.
+        (Ty::UntypedInt, t) if t.is_unsigned() => true,
+        // Implicit widening *within* the unsigned tower only
+        // (`uint8`→`uint16`→`uint32`→`uint64`): always value-preserving
+        // (zero-extend). `usize` is deliberately excluded — its width is
+        // platform-dependent, so every `usize` conversion is explicit (#552).
+        (from, to)
+            if from.is_unsigned() && to.is_unsigned() && *from != Ty::Usize && *to != Ty::Usize =>
+        {
+            from.uint_width() <= to.uint_width()
+        }
         // Concrete widening.
         (Ty::Int32, Ty::Int64) => true,
         (Ty::Int32 | Ty::Int64, Ty::Float64 | Ty::Float32) => true,
@@ -296,12 +380,23 @@ pub fn default_type(t: Ty) -> Ty {
 /// The result type of a numeric binary operation (promotion). Untyped operands
 /// are made concrete first, so arithmetic always yields a concrete type.
 pub fn num_join(l: &Ty, r: &Ty) -> Ty {
+    // Unsigned arithmetic promotes to `uint64` and wraps modulo 2^64, exactly
+    // mirroring the signed tower's promotion to `int64` (D-0019): a narrower
+    // unsigned result requires an explicit `uintN(...)` cast. Mixing signed and
+    // unsigned operands is rejected by the checker (ZAP4015) *before* this runs,
+    // so a surviving unsigned operand pairs only with another unsigned or an
+    // untyped-int literal. The flag is read from the *original* types, before
+    // `default_type` turns an `UntypedInt` into `Int64`, so `uint8 + 5` joins to
+    // `uint64`, not `int64`.
+    let unsigned = l.is_unsigned() || r.is_unsigned();
     let l = default_type(l.clone());
     let r = default_type(r.clone());
     if matches!(l, Ty::Complex) || matches!(r, Ty::Complex) {
         Ty::Complex
     } else if matches!(l, Ty::Float64 | Ty::Float32) || matches!(r, Ty::Float64 | Ty::Float32) {
         Ty::Float64
+    } else if unsigned {
+        Ty::Uint64
     } else if matches!(l, Ty::Bigint) || matches!(r, Ty::Bigint) {
         Ty::Bigint
     } else {
@@ -406,5 +501,55 @@ pub struct InterfaceInfo {
 impl InterfaceInfo {
     pub fn method(&self, name: &str) -> Option<&FnSig> {
         self.methods.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_classification() {
+        for t in [Ty::Uint8, Ty::Uint16, Ty::Uint32, Ty::Uint64, Ty::Usize] {
+            assert!(t.is_unsigned(), "{t:?} should be unsigned");
+            assert!(t.is_int(), "{t:?} should be an int");
+            assert!(t.is_numeric(), "{t:?} should be numeric");
+            assert!(!t.is_signed_int(), "{t:?} is not a signed int");
+        }
+        assert!(Ty::Int64.is_signed_int() && !Ty::Int64.is_unsigned());
+        // An untyped literal is sign-agnostic, not unsigned.
+        assert!(!Ty::UntypedInt.is_unsigned());
+    }
+
+    #[test]
+    fn unsigned_assignability() {
+        // Widening up the fixed-width unsigned tower is implicit.
+        assert!(assignable(&Ty::Uint8, &Ty::Uint16));
+        assert!(assignable(&Ty::Uint8, &Ty::Uint64));
+        assert!(assignable(&Ty::Uint32, &Ty::Uint64));
+        // Narrowing and sign crossings are not.
+        assert!(!assignable(&Ty::Uint64, &Ty::Uint8));
+        assert!(!assignable(&Ty::Int64, &Ty::Uint64));
+        assert!(!assignable(&Ty::Uint64, &Ty::Int64));
+        assert!(!assignable(&Ty::Int32, &Ty::Uint32));
+        // `usize` is isolated from implicit conversion in both directions.
+        assert!(!assignable(&Ty::Uint64, &Ty::Usize));
+        assert!(!assignable(&Ty::Usize, &Ty::Uint64));
+        assert!(!assignable(&Ty::Uint8, &Ty::Usize));
+        // An untyped literal still fits any unsigned type.
+        assert!(assignable(&Ty::UntypedInt, &Ty::Uint8));
+        assert!(assignable(&Ty::UntypedInt, &Ty::Usize));
+    }
+
+    #[test]
+    fn unsigned_num_join_promotes_to_uint64() {
+        // Any unsigned operand (incl. with an untyped literal) promotes to u64,
+        // wrapping at 2^64 — mirroring the signed tower's promotion to i64.
+        assert_eq!(num_join(&Ty::Uint8, &Ty::Uint8), Ty::Uint64);
+        assert_eq!(num_join(&Ty::Uint32, &Ty::Uint64), Ty::Uint64);
+        assert_eq!(num_join(&Ty::Uint8, &Ty::UntypedInt), Ty::Uint64);
+        assert_eq!(num_join(&Ty::UntypedInt, &Ty::Usize), Ty::Uint64);
+        // All-signed arithmetic is unchanged.
+        assert_eq!(num_join(&Ty::Int32, &Ty::Int64), Ty::Int64);
     }
 }

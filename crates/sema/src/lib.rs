@@ -1585,6 +1585,12 @@ impl Checker {
                 match name.as_str() {
                     "int64" | "i64" => return Some((64, true, 1)),
                     "int32" | "i32" => return Some((32, true, 1)),
+                    // Unsigned fixed-width integers are natural C-style
+                    // bitfields (#552): unsigned storage, exact bit width.
+                    "uint64" | "u64" | "usize" => return Some((64, false, 1)),
+                    "uint32" | "u32" => return Some((32, false, 1)),
+                    "uint16" | "u16" => return Some((16, false, 1)),
+                    "uint8" | "u8" => return Some((8, false, 1)),
                     "bool" => return Some((1, false, 1)),
                     other => {
                         // A tier-1 (unboxed-integer) enum is a legal bitfield; a
@@ -1837,6 +1843,12 @@ impl Checker {
                 // (I#581); `float` is likewise the name for the 64-bit double.
                 "int" | "int64" | "i64" => Ty::Int64,
                 "int32" | "i32" => Ty::Int32,
+                // Unsigned fixed-width integers + pointer-width `usize` (#552).
+                "uint8" | "u8" => Ty::Uint8,
+                "uint16" | "u16" => Ty::Uint16,
+                "uint32" | "u32" => Ty::Uint32,
+                "uint64" | "u64" => Ty::Uint64,
+                "usize" => Ty::Usize,
                 "float" | "float64" | "f64" => Ty::Float64,
                 "float32" | "f32" => Ty::Float32,
                 "bool" => Ty::Bool,
@@ -4313,6 +4325,56 @@ impl Checker {
         use BinOp::*;
         let numeric = (l.is_numeric() || matches!(l, Ty::Unknown))
             && (r.is_numeric() || matches!(r, Ty::Unknown));
+        // Reject mixing a concrete unsigned operand with a concrete *signed*
+        // (or other-signed: bigint/float/complex) operand in one numeric,
+        // comparison, or bitwise operation (#552, D-0019). Zap does no implicit
+        // signed<->unsigned conversion. An untyped-int literal or `Unknown`
+        // partners either sign (the literal adapts), and two unsigned operands
+        // are fine. `is`/`is not`/`in`/`and`/`or`/`<-` are not sign-sensitive.
+        if matches!(
+            op,
+            Add | Sub
+                | Mul
+                | Pow
+                | Div
+                | FloorDiv
+                | Mod
+                | BitAnd
+                | BitOr
+                | BitXor
+                | Shl
+                | Shr
+                | Eq
+                | Ne
+                | Lt
+                | Le
+                | Gt
+                | Ge
+        ) {
+            let mix = |a: &Ty, b: &Ty| {
+                a.is_unsigned()
+                    && b.is_numeric()
+                    && !b.is_unsigned()
+                    && !matches!(b, Ty::UntypedInt | Ty::Unknown)
+            };
+            if mix(l, r) || mix(r, l) {
+                self.error(
+                    ErrorCode::ZAP4015,
+                    format!(
+                        "cannot apply '{}' to a signed and an unsigned operand ({} and {}); \
+                         convert one side explicitly (e.g. uint64(x) or int64(x))",
+                        binop_symbol(op),
+                        l.display(),
+                        r.display()
+                    ),
+                    span,
+                );
+                return match op {
+                    Eq | Ne | Lt | Le | Gt | Ge => Ty::Bool,
+                    _ => Ty::Unknown,
+                };
+            }
+        }
         match op {
             Add => {
                 if l.is_numeric() && r.is_numeric() {
@@ -4390,7 +4452,15 @@ impl Checker {
                 if ((l.is_int() && !matches!(l, Ty::Bigint)) || matches!(l, Ty::Unknown))
                     && ((r.is_int() && !matches!(r, Ty::Bigint)) || matches!(r, Ty::Unknown))
                 {
-                    Ty::Int64
+                    // Preserve unsignedness so `>>` lowers to a *logical* shift
+                    // and the result keeps its unsigned type (#552); a bitwise op
+                    // on any unsigned operand promotes to `uint64` just as the
+                    // signed path promotes to `int64`.
+                    if l.is_unsigned() || r.is_unsigned() {
+                        Ty::Uint64
+                    } else {
+                        Ty::Int64
+                    }
                 } else {
                     self.error(
                         ErrorCode::ZAP4014,
@@ -5601,12 +5671,21 @@ impl Checker {
                     }
                     return Ty::Complex;
                 }
-                "int32" | "int64" | "float32" | "float64" | "i32" | "i64" | "f32" | "f64" => {
+                "int32" | "int64" | "float32" | "float64" | "i32" | "i64" | "f32" | "f64"
+                | "uint8" | "uint16" | "uint32" | "uint64" | "u8" | "u16" | "u32" | "u64"
+                | "usize" => {
                     // Explicit numeric conversion (D-0020): the way to narrow or
-                    // cross the int/float boundary that implicit widening refuses.
+                    // cross the int/float *or* the signed<->unsigned boundary that
+                    // implicit coercion refuses (#552). Out-of-range / negative
+                    // inputs wrap (C cast semantics, documented in D-0019).
                     let to = match fname.as_str() {
                         "int32" | "i32" => Ty::Int32,
                         "int64" | "i64" => Ty::Int64,
+                        "uint8" | "u8" => Ty::Uint8,
+                        "uint16" | "u16" => Ty::Uint16,
+                        "uint32" | "u32" => Ty::Uint32,
+                        "uint64" | "u64" => Ty::Uint64,
+                        "usize" => Ty::Usize,
                         "float32" | "f32" => Ty::Float32,
                         _ => Ty::Float64,
                     };
@@ -10606,5 +10685,89 @@ def main():
     except* KeyError:
         print(3)
 "#);
+    }
+
+    // ---- #552: unsigned integer types -------------------------------------
+
+    fn has_code(src: &str, code: ErrorCode) -> bool {
+        errors(src).iter().any(|e| e.code == code)
+    }
+
+    #[test]
+    fn unsigned_types_are_resolvable_and_constructible() {
+        // Every width + `usize` is a usable scalar type (binding, literal init,
+        // param, return), and the conversion functions type-check both ways.
+        ok("def main():\n    uint8 a = 0\n    uint16 b = 1\n    uint32 c = 2\n    uint64 d = 3\n    usize e = 4\n    print(a)\n    print(e)\n");
+        ok("def widen(uint32 x) -> uint64:\n    return uint64(x)\ndef main():\n    print(widen(uint32(5)))\n");
+        // Signed <-> unsigned crossing is possible, but only *explicitly*.
+        ok("def main():\n    int64 s = -1\n    uint64 u = uint64(s)\n    int64 back = int64(u)\n    print(u)\n    print(back)\n");
+        // Short spellings resolve identically.
+        ok("def main():\n    u8 a = 1\n    u16 b = 2\n    u32 c = 3\n    u64 d = 4\n    print(a)\n");
+    }
+
+    #[test]
+    fn unsigned_tower_widens_implicitly_but_usize_does_not() {
+        // uint8 -> uint16 -> uint32 -> uint64 widen implicitly (value-preserving
+        // zero-extend), like int32 -> int64.
+        ok("def main():\n    uint8 a = 1\n    uint32 c = a\n    uint64 d = c\n    print(d)\n");
+        // Narrowing down the tower still needs an explicit cast (D-0020).
+        assert!(has_code(
+            "def main():\n    uint64 d = 5\n    uint8 a = d\n    print(a)\n",
+            ErrorCode::ZAP4001,
+        ));
+        // `usize` takes part in NO implicit conversion (platform-dependent
+        // width): neither to nor from `uint64`, both directions need a cast.
+        assert!(has_code(
+            "def main():\n    uint64 d = 5\n    usize n = d\n    print(n)\n",
+            ErrorCode::ZAP4001,
+        ));
+        assert!(has_code(
+            "def main():\n    usize n = 5\n    uint64 d = n\n    print(d)\n",
+            ErrorCode::ZAP4001,
+        ));
+    }
+
+    #[test]
+    fn mixed_signed_unsigned_arithmetic_is_rejected() {
+        // Every arithmetic / comparison / bitwise operator rejects a concrete
+        // signed + concrete unsigned pairing with ZAP4015 (#552, D-0019). No
+        // implicit signed<->unsigned conversion.
+        for expr in [
+            "s + u", "s - u", "s * u", "s // u", "s % u", "s / u", "s ** u", "u + s", "s & u",
+            "s | u", "s ^ u", "s << u", "u >> s", "s == u", "s < u", "s >= u",
+        ] {
+            let src = format!(
+                "def main():\n    int64 s = 1\n    uint64 u = 2\n    auto r = {expr}\n    print(1)\n"
+            );
+            assert!(
+                has_code(&src, ErrorCode::ZAP4015),
+                "expected ZAP4015 for `{expr}`, got {:?}",
+                errors(&src)
+            );
+        }
+    }
+
+    #[test]
+    fn same_sign_and_literal_arithmetic_is_allowed() {
+        // Two unsigned operands, or an unsigned operand with an untyped literal,
+        // are fine — the literal adapts; no ZAP4015.
+        ok("def main():\n    uint64 a = 10\n    uint64 b = 3\n    auto q = a // b\n    auto m = a % b\n    auto s = a + b\n    auto c = a < b\n    print(q)\n    print(m)\n    print(s)\n    print(c)\n");
+        ok("def main():\n    uint8 x = 5\n    auto y = x + 1\n    auto z = x * 2\n    auto w = x << 1\n    print(y)\n    print(z)\n    print(w)\n");
+        // The all-signed tower is unaffected.
+        ok("def main():\n    int64 s = 1\n    int32 t = 2\n    auto r = s + t\n    print(r)\n");
+    }
+
+    #[test]
+    fn unsigned_division_is_true_division_to_float() {
+        // `/` is true division everywhere (D-0024): unsigned `/` yields float.
+        ok("def main():\n    uint64 a = 7\n    uint64 b = 2\n    float r = a / b\n    print(r)\n");
+    }
+
+    #[test]
+    fn unsigned_values_are_printable_and_usable_as_uint8_array_dtype() {
+        ok("def main():\n    uint32 x = 4000000000\n    print(x)\n    auto s = str(x)\n    print(s)\n");
+        // `array[uint8]` (image data) still type-checks — the dtype path is
+        // unchanged by the new scalar `uint8` (#49/#552).
+        ok("def main():\n    array[uint8] buf = array[uint8]([1, 2, 3])\n    print(buf[0])\n");
     }
 }

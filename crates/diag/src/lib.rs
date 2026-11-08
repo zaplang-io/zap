@@ -381,6 +381,11 @@ define_codes! {
     ZAP4014 = 4014 : "bitwise operator needs integers",
         "Bitwise operators (`&`, `|`, `^`, `<<`, `>>`) require integer \
          operands.";
+    ZAP4015 = 4015 : "mixed signed and unsigned operands",
+        "A signed and an unsigned integer were combined in one arithmetic, \
+         comparison, or bitwise operation. Zap performs no implicit \
+         signed<->unsigned conversion (#552, D-0019): convert one side \
+         explicitly first, e.g. `uint64(x)` or `int64(x)`.";
     ZAP4020 = 4020 : "wrong number of arguments",
         "A call passed too few or too many arguments for the callee's arity.";
     ZAP4021 = 4021 : "argument type mismatch",

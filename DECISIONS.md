@@ -154,20 +154,84 @@ has no members and iterates zero times.
 are now locked in **D-0046** (the `match` statement itself was locked earlier in
 D-0040).
 
-## D-0019 — Numeric types: all signed; bigint, complex, tuples
-**Status:** Locked; bigint and complex are implemented for native codegen
-All integer types are **signed** for v1 (`int32`, `int64`; default `int64`).
-Unsigned deferred (interop + array dtypes only — see OPEN-QUESTIONS). Provide
-**`bigint`** (arbitrary-precision signed integer) and **`complex`** (pair of
-IEEE-754 doubles, with imaginary-suffix literals and complex arithmetic).
-Provide **tuples**. **No type aliases** (they hurt cross-project readability).
+## D-0019 — Numeric types: signed tower + unsigned ints; bigint, complex, tuples
+**Status:** Locked; bigint and complex implemented for native codegen; unsigned
+integers reintroduced and implemented by #552 (the clause below amends the
+original "all integers signed" wording).
+The signed tower is `int32`, `int64` (default `int64`), plus **`bigint`**
+(arbitrary-precision signed integer) and **`complex`** (pair of IEEE-754
+doubles, with imaginary-suffix literals and complex arithmetic). Provide
+**tuples**. **No type aliases** (they hurt cross-project readability).
+
+### Amendment (#552) — unsigned integer types
+The original decision deferred unsigned integers to "interop + array dtypes
+only". #552 reintroduces them as **first-class scalar types**, because the C FFI
+epic (#539, `@repr(c)` #542, #544) and array dtypes (`uint8` image data) need
+real unsigned semantics, not casts-and-prayers. This amends — does not revoke —
+the signed-tower default: ordinary Zap code stays signed; unsigned types are the
+deliberate systems/interop surface (Python has no unsigned ints, so they are not
+reached by accident).
+
+Surface (minimal, purpose-driven):
+
+- **Widths:** `uint8`, `uint16`, `uint32`, `uint64`, each with a short `uN`
+  spelling (`u8`/`u16`/`u32`/`u64`) mirroring `int32`/`i32`. All are reserved
+  type keywords.
+- **`usize`** is the single canonical **pointer-width** unsigned type (64-bit on
+  the supported x86_64/aarch64 targets). It is the name used for a size/count at
+  the C boundary. **`size_t` is NOT a Zap type or alias** — it is only the C
+  *mapping target* that `@repr(c)` (future #542) will map Zap `usize` onto.
+  Introducing a `size_t` alias of `usize` would violate the "no type aliases"
+  clause above, so it is deliberately excluded. *(Flagged for maintainer.)*
+
+Four semantic decisions (defaults chosen for C-interop consistency; **flagged
+for the maintainer to confirm/lock**):
+
+1. **Overflow = wraparound.** Unsigned arithmetic is two's-complement modular
+   (wraps, never traps), matching C and Zap's existing signed arithmetic (which
+   already wraps — plain LLVM `add`/`mul`, no `nsw`). Zero overhead; the natural
+   choice for the FFI driver. A checked/trapping opt-in is a possible follow-up,
+   not the default.
+2. **Mixed signed/unsigned is rejected (explicit conversion required).** There
+   is **no implicit** signed↔unsigned coercion; combining a concrete signed and
+   a concrete unsigned operand in one arithmetic / comparison / bitwise
+   operation is a compile error (`ZAP4015`). Convert one side first (`uint64(x)`
+   / `int64(x)`). An untyped integer literal still adapts to an unsigned context
+   (`uint8 x = 5`, `x + 1`). Implicit *widening* is allowed only up the
+   fixed-width unsigned tower (`uint8`→`uint16`→`uint32`→`uint64`,
+   zero-extend); `usize` takes part in **no** implicit conversion (its width is
+   platform-dependent), so every `usize` conversion is explicit.
+3. **`size_t` at the FFI boundary only; `usize` canonical** (see above).
+4. **Printing & out-of-range conversions.** Unsigned values print as unsigned
+   decimal — no phantom sign, and a `uint64` above `INT64_MAX` prints its true
+   magnitude (`18446744073709551615`); `repr == str`. Conversions use C cast
+   semantics: `uintN(x)` zero-extends / truncates / reinterprets modulo 2^N
+   (`uint8(-1) == 255`, `uint8(300) == 44`), float→unsigned is `fptoui`, and a
+   same-width reinterpret (`int64(u)` / `uint64(i)`) keeps the bit pattern (so
+   `int64(uint64(-1)) == -1`). There is **no literal suffix** — conversions are
+   the only way to produce an unsigned value, keeping the surface Python-readable.
+
+Arithmetic promotes to `uint64` and wraps modulo 2^64, exactly mirroring the
+signed tower's promotion to `int64`: a narrower unsigned result comes from an
+explicit `uintN(...)` cast (so `uint8(200) + uint8(100)` is `300` at `uint64`
+width, and `uint8(uint8(200) + uint8(100))` is `44`). `/` is true division
+(float result) for unsigned as for signed; `//` and `%` are a plain `udiv`/`urem`
+(floor == truncation for non-negative operands). Collection/channel *elements* of
+an unsigned type stay unsupported for now (dense bytes have `array[uint8]`); the
+scalar surface is what the FFI epic needs. Implemented across lexer, sema
+(`ZAP4015`), ZIR lowering (unsigned op selection), codegen (`udiv`/`urem`,
+unsigned `icmp`, `lshr`, `zext`/`uitofp`/`fptoui`) and the runtime
+(`zap_u64_to_str`, `zap_udiv`/`zap_umod`/`zap_upow`/`zap_ushr`).
 
 ## D-0020 — Numeric conversions: implicit widening, explicit narrowing
 **Status:** Locked
 Widening conversions are **implicit** (`int32→int64`, `int→float`). Narrowing
 conversions that can lose data (`int64→int32`, `float→int`) require an
 **explicit** conversion (e.g. `int32(x)`). **Rationale:** silent narrowing is a
-classic bug source.
+classic bug source. The unsigned tower (#552, D-0019 amendment) follows the same
+rule — implicit widening up `uint8`→`uint64`, explicit for narrowing — and
+additionally treats any **signed↔unsigned crossing** as explicit-only (a mixed
+operation is `ZAP4015`); `usize` converts only explicitly in both directions.
 
 ## D-0021 — Execution model: `def main()` entry point
 **Status:** Locked; original top-level execution wording superseded by D-0090

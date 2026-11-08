@@ -1734,10 +1734,15 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             // (I#569); `float64`/`f64` are the explicit-width spellings.
             "float" | "float64" | "f64" => Ok(Ty::F64),
             "float32" | "f32" => Ok(Ty::F32),
-            // `uint8`/`u8` is currently only an `array[T]` dtype (ticket #49),
-            // not a general scalar type; it resolves to `i8` so `dtype_of`
-            // recognizes it in a type-annotation `array[uint8]`.
-            "uint8" | "u8" => Ok(Ty::I8),
+            // Unsigned scalar integers (#552, D-0019 amendment). `usize` is
+            // pointer-width — 64-bit on the supported targets — so it lowers to
+            // `u64`; it stays a distinct *source* type (sema `Ty::Usize`) only so
+            // diagnostics and the C mapping (`size_t`) can tell them apart.
+            "uint8" | "u8" => Ok(Ty::U8),
+            "uint16" | "u16" => Ok(Ty::U16),
+            "uint32" | "u32" => Ok(Ty::U32),
+            "uint64" | "u64" => Ok(Ty::U64),
+            "usize" => Ok(Ty::U64),
             "bool" => Ok(Ty::I1),
             // `char` is a distinct IR type (#709): physically an `i32` codepoint,
             // but kept apart from `int32` so the value layer can render it
@@ -1962,7 +1967,10 @@ fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
     match resolve_ty(t, env)? {
         Ty::F64 => Ok(Dtype::F64),
         Ty::I64 => Ok(Dtype::I64),
-        Ty::I8 => Ok(Dtype::Uint8),
+        // `array[uint8]` is the dense byte-buffer dtype (image data, #49/#552);
+        // `uint8` now resolves to the scalar `Ty::U8`, so map it to the uint8
+        // dtype here. Wider unsigned array dtypes are a documented follow-up.
+        Ty::U8 => Ok(Dtype::Uint8),
         Ty::I1 => Ok(Dtype::Bool),
         other => Err(err(format!(
             "array[{other}] is not supported yet (only array[f64], array[i64], array[uint8], array[bool])"
@@ -2032,6 +2040,15 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         )),
         Ty::F32 | Ty::F64 => Err(err(
             "collections of floating-point elements are not supported yet",
+        )),
+        // Scalar unsigned integers (#552) are supported as values, parameters,
+        // returns, and C-style bitfields, but a collection/channel *element* of
+        // an unsigned type is a clean follow-up: the uniform element word is
+        // read back and rendered as a signed `i64`, so storing an unsigned there
+        // would mis-render `uint64` values above `INT64_MAX`. Dense unsigned byte
+        // data has `array[uint8]`.
+        Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => Err(err(
+            "collections of unsigned-integer elements are not supported yet (use array[uint8] for dense byte data)",
         )),
         Ty::Void => Err(err("a collection element cannot be void")),
     }
@@ -6555,6 +6572,10 @@ impl<'a> FnLower<'a> {
             },
             Ty::I1 => ("zap_bool_to_str", self.coerce(v, vt, Ty::I64)),
             Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 => ("zap_i64_to_str", self.coerce(v, vt, Ty::I64)),
+            // Unsigned integers render as *unsigned* decimal (no phantom sign;
+            // a `uint64` above `INT64_MAX` prints its true magnitude). The value
+            // is zero-extended to a 64-bit word first (#552). repr == str.
+            Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => ("zap_u64_to_str", self.coerce(v, vt, Ty::U64)),
             Ty::F32 | Ty::F64 => ("zap_f64_to_str", self.as_f64(v, vt)),
             _ => return Err(err("cannot render this value as a string")),
         };
@@ -6572,7 +6593,17 @@ impl<'a> FnLower<'a> {
     fn value_to_bool(&mut self, v: Value, vt: Ty) -> Result<Value, LowerError> {
         match vt {
             Ty::I1 => Ok(v),
-            Ty::I8 | Ty::I16 | Ty::I32 | Ty::Char | Ty::I64 => {
+            // Unsigned integers are falsey at zero exactly like signed ones; the
+            // `!= 0` test is sign-agnostic (#552).
+            Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::Char
+            | Ty::I64
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64 => {
                 let z = self.iconst(vt, 0);
                 let d = self.new_value(Ty::I1);
                 self.emit(Inst::ICmp {
@@ -10745,9 +10776,18 @@ impl<'a> FnLower<'a> {
                         Ok((d, Ty::F64))
                     }
                     AstBin::Shl | AstBin::Shr if Self::is_safe_shift_literal(rhs) => {
-                        let li = self.coerce(l, lt, Ty::I64);
-                        let ri = self.coerce(r, rt, Ty::I64);
-                        let d = self.new_value(Ty::I64);
+                        // Preserve unsignedness so `>>` on an unsigned value
+                        // lowers to a *logical* shift (codegen keys `lshr` vs
+                        // `ashr` off the result type, #552). A mixed signed/
+                        // unsigned shift was already rejected by sema (ZAP4015).
+                        let int_ty = if lt.is_unsigned() || rt.is_unsigned() {
+                            Ty::U64
+                        } else {
+                            Ty::I64
+                        };
+                        let li = self.coerce(l, lt, int_ty);
+                        let ri = self.coerce(r, rt, int_ty);
+                        let d = self.new_value(int_ty);
                         let irop = if matches!(op, AstBin::Shl) {
                             BinOp::Shl
                         } else {
@@ -10759,7 +10799,7 @@ impl<'a> FnLower<'a> {
                             lhs: li,
                             rhs: ri,
                         });
-                        Ok((d, Ty::I64))
+                        Ok((d, int_ty))
                     }
                     _ => self.binop(*op, l, lt, r, rt),
                 }
@@ -11304,6 +11344,7 @@ impl<'a> FnLower<'a> {
                         || vt.is_float()
                         || vt == Ty::I1
                         || vt == Ty::Char
+                        || vt.is_unsigned()
                         || matches!(vt, Ty::Enum(_))
                     {
                         // Everything with a non-trivial Display form routes through
@@ -17758,6 +17799,15 @@ impl<'a> FnLower<'a> {
         }
 
         let is_float = lt.is_float() || rt.is_float();
+        // Unsigned integer arithmetic/comparison promotes to `uint64` and wraps
+        // modulo 2^64 (#552), mirroring the signed tower's promotion to `int64`;
+        // a narrower unsigned result comes from an explicit `uintN(...)` cast.
+        // `int_ty` is the integer width both operands are widened to, and its
+        // signedness is what codegen reads to pick `udiv`/`urem`/`lshr`/unsigned
+        // `icmp`. A mixed signed/unsigned pairing was rejected by sema (ZAP4015),
+        // so at most one sign is in play here.
+        let unsigned = lt.is_unsigned() || rt.is_unsigned();
+        let int_ty = if unsigned { Ty::U64 } else { Ty::I64 };
 
         if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
             let pred = match op {
@@ -17780,11 +17830,12 @@ impl<'a> FnLower<'a> {
                     rhs: rf,
                 });
             } else {
-                // Integer comparisons are done at i64 so mixed-width operands
-                // (e.g. `int32 < int64`, or a literal against an int32) share a
-                // type (D-0019 all-signed tower).
-                let li = self.coerce(l, lt, Ty::I64);
-                let ri = self.coerce(r, rt, Ty::I64);
+                // Integer comparisons are done at a common 64-bit width so
+                // mixed-width operands (e.g. `int32 < int64`, `uint8 < uint32`,
+                // or a literal against an int32) share a type. Codegen reads the
+                // operand type's sign to choose signed vs unsigned `icmp` (#552).
+                let li = self.coerce(l, lt, int_ty);
+                let ri = self.coerce(r, rt, int_ty);
                 self.emit(Inst::ICmp {
                     dest: d,
                     pred,
@@ -17817,18 +17868,21 @@ impl<'a> FnLower<'a> {
                     });
                     Ok((d, Ty::F64))
                 } else {
-                    // Integer arithmetic computes at i64 (operands widened), so
-                    // `int32`/untyped-literal operands share a width (D-0019).
-                    let li = self.coerce(l, lt, Ty::I64);
-                    let ri = self.coerce(r, rt, Ty::I64);
-                    let d = self.new_value(Ty::I64);
+                    // Integer arithmetic computes at a 64-bit width (operands
+                    // widened), so `int32`/`uint8`/untyped-literal operands share
+                    // a width. Add/Sub/Mul are bit-identical for signed and
+                    // unsigned; `int_ty` carries the sign onward so a later
+                    // narrowing cast or render picks the right behaviour (#552).
+                    let li = self.coerce(l, lt, int_ty);
+                    let ri = self.coerce(r, rt, int_ty);
+                    let d = self.new_value(int_ty);
                     self.emit(Inst::Bin {
                         dest: d,
                         op: irop,
                         lhs: li,
                         rhs: ri,
                     });
-                    Ok((d, Ty::I64))
+                    Ok((d, int_ty))
                 }
             }
             Mod => {
@@ -17848,15 +17902,19 @@ impl<'a> FnLower<'a> {
                     self.throwing_call(Some(d), "zap_ffmod", vec![lf, rf]);
                     Ok((d, Ty::F64))
                 } else {
-                    let li = self.coerce(l, lt, Ty::I64);
-                    let ri = self.coerce(r, rt, Ty::I64);
-                    let d = self.new_value(Ty::I64);
+                    let li = self.coerce(l, lt, int_ty);
+                    let ri = self.coerce(r, rt, int_ty);
+                    let d = self.new_value(int_ty);
                     // Modulo by zero is a catchable built-in fault (EXC-3,
-                    // D-0007): `zap_imod` raises through `zap_panic`, so this is
+                    // D-0007): the helper raises through `zap_panic`, so this is
                     // a `throwing_call` (an `invoke` inside a `try`) rather than
-                    // a plain `call`, which could not reach the landing pad.
-                    self.throwing_call(Some(d), "zap_imod", vec![li, ri]);
-                    Ok((d, Ty::I64))
+                    // a plain `call`, which could not reach the landing pad. The
+                    // unsigned path uses `urem` (no floored-sign correction —
+                    // both operands are non-negative), the signed path the
+                    // floored `zap_imod` (#552).
+                    let helper = if unsigned { "zap_umod" } else { "zap_imod" };
+                    self.throwing_call(Some(d), helper, vec![li, ri]);
+                    Ok((d, int_ty))
                 }
             }
             FloorDiv => {
@@ -17875,15 +17933,22 @@ impl<'a> FnLower<'a> {
                     });
                     Ok((d, Ty::F64))
                 } else {
-                    let li = self.coerce(l, lt, Ty::I64);
-                    let ri = self.coerce(r, rt, Ty::I64);
-                    let d = self.new_value(Ty::I64);
+                    let li = self.coerce(l, lt, int_ty);
+                    let ri = self.coerce(r, rt, int_ty);
+                    let d = self.new_value(int_ty);
                     // Divide by zero is a catchable built-in fault (EXC-3,
-                    // D-0007): `zap_ifloordiv` raises through `zap_panic`, so
-                    // this is a `throwing_call` (an `invoke` inside a `try`)
-                    // rather than a plain `call` that could not reach the pad.
-                    self.throwing_call(Some(d), "zap_ifloordiv", vec![li, ri]);
-                    Ok((d, Ty::I64))
+                    // D-0007): the helper raises through `zap_panic`, so this is
+                    // a `throwing_call` (an `invoke` inside a `try`) rather than
+                    // a plain `call` that could not reach the pad. Unsigned `//`
+                    // is a plain `udiv` (floor == truncation for non-negative
+                    // operands); signed `//` floors toward -inf (#552).
+                    let helper = if unsigned {
+                        "zap_udiv"
+                    } else {
+                        "zap_ifloordiv"
+                    };
+                    self.throwing_call(Some(d), helper, vec![li, ri]);
+                    Ok((d, int_ty))
                 }
             }
             Pow => {
@@ -17905,15 +17970,18 @@ impl<'a> FnLower<'a> {
                     });
                     Ok((d, Ty::F64))
                 } else {
-                    let li = self.coerce(l, lt, Ty::I64);
-                    let ri = self.coerce(r, rt, Ty::I64);
-                    let d = self.new_value(Ty::I64);
+                    let li = self.coerce(l, lt, int_ty);
+                    let ri = self.coerce(r, rt, int_ty);
+                    let d = self.new_value(int_ty);
                     // A negative exponent raises a catchable `ValueError`
                     // (zap_ipow -> zap_panic, #374/B2), so this must be an
                     // unwinding `invoke` that reaches the `try` landing pad,
-                    // like int()/float() parse and the div/mod faults.
-                    self.throwing_call(Some(d), "zap_ipow", vec![li, ri]);
-                    Ok((d, Ty::I64))
+                    // like int()/float() parse and the div/mod faults. The
+                    // unsigned exponent is never negative, so `zap_upow` cannot
+                    // raise; it wraps modulo 2^64 like the signed path (#552).
+                    let helper = if unsigned { "zap_upow" } else { "zap_ipow" };
+                    self.throwing_call(Some(d), helper, vec![li, ri]);
+                    Ok((d, int_ty))
                 }
             }
             Div => {
@@ -17935,16 +18003,16 @@ impl<'a> FnLower<'a> {
                     BitXor => BinOp::Xor,
                     _ => unreachable!(),
                 };
-                let li = self.coerce(l, lt, Ty::I64);
-                let ri = self.coerce(r, rt, Ty::I64);
-                let d = self.new_value(Ty::I64);
+                let li = self.coerce(l, lt, int_ty);
+                let ri = self.coerce(r, rt, int_ty);
+                let d = self.new_value(int_ty);
                 self.emit(Inst::Bin {
                     dest: d,
                     op: irop,
                     lhs: li,
                     rhs: ri,
                 });
-                Ok((d, Ty::I64))
+                Ok((d, int_ty))
             }
             Shl | Shr => {
                 // A shift count that is negative (-> ValueError, CPython) or
@@ -17952,16 +18020,22 @@ impl<'a> FnLower<'a> {
                 // by a runtime helper (#374/#740). A negative count can raise, so
                 // this is a throwing_call. The `Expr::Binary` lowerer emits a
                 // plain inline shift when the count is a literal in 0..63.
-                let li = self.coerce(l, lt, Ty::I64);
-                let ri = self.coerce(r, rt, Ty::I64);
-                let d = self.new_value(Ty::I64);
+                let li = self.coerce(l, lt, int_ty);
+                let ri = self.coerce(r, rt, int_ty);
+                let d = self.new_value(int_ty);
+                // Left shift is bit-identical for both signs (`zap_ishl`); right
+                // shift differs — unsigned uses a *logical* shift (`zap_ushr`,
+                // zero-fill), signed an arithmetic one (`zap_ishr`, sign-fill)
+                // (#552). Both validate the count (negative -> ValueError).
                 let helper = if matches!(op, Shl) {
                     "zap_ishl"
+                } else if unsigned {
+                    "zap_ushr"
                 } else {
                     "zap_ishr"
                 };
                 self.throwing_call(Some(d), helper, vec![li, ri]);
-                Ok((d, Ty::I64))
+                Ok((d, int_ty))
             }
             And | Or => {
                 let lb = self.truthy(l, lt);
@@ -18204,8 +18278,17 @@ impl<'a> FnLower<'a> {
                 return v;
             }
             let d = self.new_value(to);
+            // Widen by zero-extension when the *source* is unsigned (#552), by
+            // sign-extension otherwise; narrowing is a plain truncation for
+            // both. (Implicit widening only ever pairs same-sign types — sema's
+            // `assignable` forbids a sign crossing — so the source's sign is the
+            // right one to key on.)
             let kind = if tw > fw {
-                CastKind::SExt
+                if from.is_unsigned() {
+                    CastKind::ZExt
+                } else {
+                    CastKind::SExt
+                }
             } else {
                 CastKind::Trunc
             };
@@ -18218,9 +18301,17 @@ impl<'a> FnLower<'a> {
         }
         if from.int_width().is_some() && to.is_float() {
             let d = self.new_value(to);
+            // `uitofp` for an unsigned source so a `uint64` above `INT64_MAX`
+            // converts to the right magnitude (reached by `/` on unsigned
+            // operands, which promotes to `f64`); `sitofp` otherwise (#552).
+            let kind = if from.is_unsigned() {
+                CastKind::UIToFP
+            } else {
+                CastKind::SIToFP
+            };
             self.emit(Inst::Cast {
                 dest: d,
-                kind: CastKind::SIToFP,
+                kind,
                 val: v,
             });
             return d;
@@ -18271,15 +18362,38 @@ impl<'a> FnLower<'a> {
         let kind = match (from, to) {
             (f, t) if f.int_width().is_some() && t.int_width().is_some() => {
                 if f.int_width() == t.int_width() {
+                    // Same physical width, possibly a sign reinterpret
+                    // (`int64(u)` / `uint64(i)`): the bit pattern is unchanged,
+                    // so no cast instruction is needed — the dest type already
+                    // carries the new signedness (#552). This is how an
+                    // out-of-range round-trip wraps (`int64(uint64 > INT64_MAX)`
+                    // is negative), matching a C reinterpret cast.
                     return v;
                 }
+                // Widen by zero-extension from an unsigned source (`uint64(small_u)`),
+                // by sign-extension from a signed source; narrowing truncates
+                // for both (C cast / modular-wrap semantics, #552).
                 if t.int_width().unwrap() > f.int_width().unwrap() {
-                    CastKind::SExt
+                    if f.is_unsigned() {
+                        CastKind::ZExt
+                    } else {
+                        CastKind::SExt
+                    }
                 } else {
                     CastKind::Trunc
                 }
             }
-            (f, t) if f.int_width().is_some() && t.is_float() => CastKind::SIToFP,
+            (f, t) if f.int_width().is_some() && t.is_float() => {
+                if f.is_unsigned() {
+                    CastKind::UIToFP
+                } else {
+                    CastKind::SIToFP
+                }
+            }
+            // Float -> int: `fptoui` into an unsigned target, `fptosi` into a
+            // signed one (#552). Out-of-range float -> int is C-undefined; Zap
+            // documents it as implementation-defined saturation/wrap.
+            (f, t) if f.is_float() && t.is_unsigned() => CastKind::FPToUI,
             (f, t) if f.is_float() && t.int_width().is_some() => CastKind::FPToSI,
             (f, t) if f.is_float() && t.is_float() => {
                 if t == Ty::F64 {
@@ -18710,6 +18824,12 @@ fn numeric_conv_ty(name: &str) -> Option<Ty> {
     match name {
         "int32" | "i32" => Some(Ty::I32),
         "int64" | "i64" => Some(Ty::I64),
+        // Unsigned conversions (#552). `usize` is pointer-width → `u64`.
+        "uint8" | "u8" => Some(Ty::U8),
+        "uint16" | "u16" => Some(Ty::U16),
+        "uint32" | "u32" => Some(Ty::U32),
+        "uint64" | "u64" => Some(Ty::U64),
+        "usize" => Some(Ty::U64),
         "float32" | "f32" => Some(Ty::F32),
         "float64" | "f64" => Some(Ty::F64),
         _ => None,

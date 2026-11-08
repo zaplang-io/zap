@@ -194,6 +194,20 @@ pub enum Keyword {
     I64,
     F32,
     F64,
+    // Unsigned integer type names (#552, D-0019 amendment). Reintroduced for C
+    // FFI (#539) and array dtypes: C ABIs are saturated with `unsigned`/`size_t`.
+    // Each has a `uintN` and a short `uN` spelling, mirroring `int32`/`i32`;
+    // `usize` is the single pointer-width name (no short form, no `size_t`
+    // alias — D-0019 locks "no type aliases").
+    Uint8,
+    Uint16,
+    Uint32,
+    Uint64,
+    U8,
+    U16,
+    U32,
+    U64,
+    Usize,
     Bool,
     Char,
     Str,
@@ -265,6 +279,15 @@ impl Keyword {
             "i64" => I64,
             "f32" => F32,
             "f64" => F64,
+            "uint8" => Uint8,
+            "uint16" => Uint16,
+            "uint32" => Uint32,
+            "uint64" => Uint64,
+            "u8" => U8,
+            "u16" => U16,
+            "u32" => U32,
+            "u64" => U64,
+            "usize" => Usize,
             "bool" => Bool,
             "char" => Char,
             "str" => Str,
@@ -337,6 +360,15 @@ impl Keyword {
             I64 => "i64",
             F32 => "f32",
             F64 => "f64",
+            Uint8 => "uint8",
+            Uint16 => "uint16",
+            Uint32 => "uint32",
+            Uint64 => "uint64",
+            U8 => "u8",
+            U16 => "u16",
+            U32 => "u32",
+            U64 => "u64",
+            Usize => "usize",
             Bool => "bool",
             Char => "char",
             Str => "str",
@@ -364,6 +396,15 @@ impl Keyword {
                 | I64
                 | F32
                 | F64
+                | Uint8
+                | Uint16
+                | Uint32
+                | Uint64
+                | U8
+                | U16
+                | U32
+                | U64
+                | Usize
                 | Bool
                 | Char
                 | Str
