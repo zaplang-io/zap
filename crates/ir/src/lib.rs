@@ -4273,4 +4273,67 @@ def main():
         assert!(calls(&m, "zap_udiv"));
         assert!(calls(&m, "zap_u64_to_str"));
     }
+
+    // --- #552 follow-up: subscript indices auto-promote to the i64 index word.
+    //
+    // The index position widens every integer type to the 64-bit index word: a
+    // signed index sign-extends (so `[-1]` is from-the-end), an unsigned index
+    // zero-extends (always a non-negative offset — a high byte like 200 is never
+    // read as a negative index). These lock the extension *kind* on the index,
+    // which codegen then emits as sext/zext.
+
+    #[test]
+    fn unsigned_subscript_index_zero_extends() {
+        // A `uint16`/`uint8`/`uint32` list index zero-extends to i64 (the only
+        // SExt-vs-ZExt-distinguishing cast in the function is the index widen;
+        // the binding `uint16 c = 1` is a Trunc, not an extend).
+        for ty in ["uint8", "uint16", "uint32"] {
+            let m = lower_main(&format!(
+                "    list[int64] xs = [10, 20, 30]\n    {ty} c = 1\n    print(xs[c])\n"
+            ));
+            assert!(
+                has_cast(&m, CastKind::ZExt),
+                "{ty} index must zero-extend to the i64 index word"
+            );
+            assert!(
+                !has_cast(&m, CastKind::SExt),
+                "{ty} index must not sign-extend"
+            );
+            assert!(
+                calls(&m, "zap_list_get_i64"),
+                "the list get is still emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_subscript_index_sign_extends() {
+        // An `int32` index sign-extends, so a negative index keeps its from-the-
+        // end meaning once normalized by the runtime.
+        let m =
+            lower_main("    list[int64] xs = [10, 20, 30]\n    int32 a = 1\n    print(xs[a])\n");
+        assert!(
+            has_cast(&m, CastKind::SExt),
+            "int32 index must sign-extend to the i64 index word"
+        );
+    }
+
+    #[test]
+    fn unsigned_index_store_and_array_index_lower() {
+        // The *store* path promotes the index the same way, and `array[uint8]`
+        // indexing by an unsigned value lowers end to end (get + set).
+        lower_ok(
+            "def main():\n    list[int64] xs = [1, 2, 3]\n    uint16 c = 2\n    xs[c] = 9\n    print(xs[c])\n",
+        );
+        let a = lower_main(
+            "    array[uint8] buf = array[uint8]([5, 6, 7])\n    uint16 i = 2\n    int32 j = 1\n    buf[j] = 200\n    print(buf[i])\n",
+        );
+        assert!(calls(&a, "zap_array_get_u8"), "array get is emitted");
+        assert!(calls(&a, "zap_array_set_u8"), "array set is emitted");
+        // The unsigned array index still zero-extends.
+        assert!(
+            has_cast(&a, CastKind::ZExt),
+            "unsigned array index zero-extends"
+        );
+    }
 }
