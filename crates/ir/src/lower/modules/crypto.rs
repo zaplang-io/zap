@@ -44,6 +44,7 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_ed25519_sign"
         | "zap_crypto_pbkdf2_hmac"
         | "zap_crypto_hkdf"
+        | "zap_crypto_scrypt"
         | "zap_crypto_hmac_digest"
         | "zap_crypto_rsa_sha384_sign"
         | "zap_crypto_rsa_sha512_sign"
@@ -119,6 +120,7 @@ fn call_crypto(
             | "zap_crypto_key_is_private"
             | "zap_crypto_pbkdf2_hmac"
             | "zap_crypto_hkdf"
+            | "zap_crypto_scrypt"
             | "zap_crypto_token_urlsafe"
             | "zap_crypto_hmac_new"
             | "zap_crypto_randbelow"
@@ -456,6 +458,35 @@ fn lower(
                 lowerer,
                 "zap_crypto_pbkdf2_hmac",
                 vec![name, password, salt, iterations, dklen],
+            )?))
+        }
+        // crypto.scrypt(password, salt, n, r, p, dklen=64) -> bytes (#775,
+        // D-0134). n/r/p coerce to i64; an omitted dklen becomes 64 (Python's
+        // default). The runtime raises a catchable ValueError on bad parameters.
+        "scrypt" => {
+            if args.len() != 5 && args.len() != 6 {
+                return Err(err(
+                    "crypto.scrypt takes 5 or 6 arguments (password, salt, n, r, p, dklen=64)",
+                ));
+            }
+            let (password, _) = lowerer.expr(&args[0].value)?;
+            let (salt, _) = lowerer.expr(&args[1].value)?;
+            let (n_v, n_t) = lowerer.expr(&args[2].value)?;
+            let n = lowerer.coerce(n_v, n_t, Ty::I64);
+            let (r_v, r_t) = lowerer.expr(&args[3].value)?;
+            let r = lowerer.coerce(r_v, r_t, Ty::I64);
+            let (p_v, p_t) = lowerer.expr(&args[4].value)?;
+            let p = lowerer.coerce(p_v, p_t, Ty::I64);
+            let dklen = if args.len() == 6 {
+                let (dk_v, dk_t) = lowerer.expr(&args[5].value)?;
+                lowerer.coerce(dk_v, dk_t, Ty::I64)
+            } else {
+                lowerer.iconst(Ty::I64, 64)
+            };
+            Ok(Some(call_crypto(
+                lowerer,
+                "zap_crypto_scrypt",
+                vec![password, salt, n, r, p, dklen],
             )?))
         }
         // crypto.hkdf(hash_name, ikm, length, salt="", info="") -> bytes (#763,
