@@ -15318,6 +15318,47 @@ void *zap_crypto_hkdf(void *hash_name, void *ikm, int64_t length, void *salt,
     return result;
 }
 
+/* crypto.scrypt(password, salt, n, r, p, dklen) -> bytes (ticket #775, D-0134).
+ * OpenSSL EVP_PBE_scrypt, mirroring Python hashlib.scrypt. `n` must be a power
+ * of two greater than 1; `r`, `p`, and `dklen` must be positive. maxmem is left
+ * at OpenSSL's default (~32 MiB), which covers the common parameter ranges; a
+ * bad parameter, an over-budget cost, or a derivation failure raises a catchable
+ * ValueError. */
+void *zap_crypto_scrypt(void *password, void *salt, int64_t n, int64_t r,
+                        int64_t p, int64_t dklen) {
+    if (n <= 1 || (n & (n - 1)) != 0) {
+        zap_crypto_kdf_raise("crypto.scrypt: n must be a power of two greater than 1");
+    }
+    if (r <= 0) {
+        zap_crypto_kdf_raise("crypto.scrypt: r must be positive");
+    }
+    if (p <= 0) {
+        zap_crypto_kdf_raise("crypto.scrypt: p must be positive");
+    }
+    if (dklen <= 0) {
+        zap_crypto_kdf_raise("crypto.scrypt: dklen must be positive");
+    }
+    const ZapStr *pw = (const ZapStr *)password;
+    const ZapStr *s = (const ZapStr *)salt;
+    size_t keylen = (size_t)dklen;
+    uint8_t *out = (uint8_t *)malloc(keylen);
+    if (!out) {
+        zap_crypto_kdf_raise("crypto.scrypt: out of memory");
+    }
+    int ok = EVP_PBE_scrypt(pw->data, (size_t)pw->len,
+                            (const unsigned char *)s->data, (size_t)s->len,
+                            (uint64_t)n, (uint64_t)r, (uint64_t)p,
+                            0 /* maxmem: OpenSSL default */,
+                            out, keylen) == 1;
+    if (!ok) {
+        free(out);
+        zap_crypto_kdf_raise("crypto.scrypt: derivation failed (parameters too large?)");
+    }
+    void *result = zap_str_new((const char *)out, (int64_t)keylen);
+    free(out);
+    return result;
+}
+
 /* ==========================================================================
  * crypto: RSA PKCS#1 v1.5 signing (ticket #628, D-0102)
  * --------------------------------------------------------------------------

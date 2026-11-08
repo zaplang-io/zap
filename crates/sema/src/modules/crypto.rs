@@ -425,6 +425,37 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             }
             Some(Ty::Bytes)
         }
+        // crypto.scrypt(password, salt, n, r, p, dklen=64) -> bytes (#775,
+        // D-0134): scrypt password-based KDF (RFC 7914), mirroring Python
+        // hashlib.scrypt. password/salt are str|bytes; n/r/p/dklen are ints
+        // (dklen optional, defaults to 64). The runtime raises ValueError on a
+        // bad parameter (n not a power of two > 1, non-positive r/p/dklen) or a
+        // derivation failure.
+        "scrypt" => {
+            if args.len() != 5 && args.len() != 6 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(password, salt, n, r, p, dklen=64) takes 5 or 6 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+                expect_int(checker, method, &args[2]);
+                expect_int(checker, method, &args[3]);
+                expect_int(checker, method, &args[4]);
+                if let Some(dklen) = args.get(5) {
+                    expect_int(checker, method, dklen);
+                }
+            }
+            Some(Ty::Bytes)
+        }
         // crypto.hkdf(hash_name, ikm, length, salt="", info="") -> bytes (#763,
         // RFC 5869 extract-and-expand). hash_name is a str; ikm/salt/info are
         // str|bytes (salt and info optional); length is an int. The runtime

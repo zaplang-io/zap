@@ -497,6 +497,15 @@ hash core (one-shot and streaming, truncated SHA-512/SHA-256). `password`/`salt`
 `iterations`, negative `dklen`, out-of-range `length`, or negative `nbytes` raise
 catchable `ValueError`. **Experimental** like the rest of `crypto`.
 
+`crypto.scrypt(password, salt, n, r, p, dklen=64)` (#775, D-0134; OpenSSL
+`EVP_PBE_scrypt`, matching Python `hashlib.scrypt`) adds the memory-hard password
+KDF, returning binary `bytes`. `n` must be a power of two greater than 1 and
+`r`/`p`/`dklen` positive; a bad parameter or derivation failure raises a catchable
+`ValueError`. Its gap-review siblings are decided (D-0134): **Argon2** deferred
+(not in OpenSSL's stable API across target versions), symmetric **AEAD** (#772)
+accepted for a later cut, and **X.509/TLS** (#773) + **public-key encryption / raw
+ECDH** (#774) kept out of `crypto`. **Experimental** like the rest of `crypto`.
+
 The experimental `crypto` follow-up families (#766–#771, D-0133) add: streaming
 HMAC (`hmac_new`/`hmac_update`/`hmac_hexdigest`/`hmac_digest`, over the
 self-contained HMAC core, non-destructive finalize); `crypto.randbelow(n) -> int`

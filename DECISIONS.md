@@ -5956,3 +5956,45 @@ single-element determinism, full-coverage over many draws, element-generic str
 lists, and the empty-list raise). The out-of-scope decisions (#772 AEAD, #773
 X.509/TLS, #774 PK-encryption/DH, #775 scrypt/Argon2) remain tracked on epic
 #761. **Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)
+
+## D-0134 — stdlib `crypto`: dispositions for the remaining gap-review items (I#772–I#775)
+
+Epic #761's gap review (Discussion #758) flagged four items as explicit in/out
+decisions rather than silent omissions. All four are now decided.
+
+**`scrypt` — accepted (I#775).** `crypto.scrypt(password, salt, n, r, p, dklen=64)
+-> bytes`, OpenSSL `EVP_PBE_scrypt`, mirroring Python `hashlib.scrypt` (positional
+rather than keyword-only args; `dklen` defaults to 64). `n` must be a power of two
+greater than 1, `r`/`p`/`dklen` must be positive, and OpenSSL's memory limit is
+its default (≈32 MiB, so e.g. `n=16384, r=8, p=1` is fine); a bad parameter or a
+derivation failure raises a catchable `ValueError`. `pbkdf2_hmac` (#762) having
+landed was the stated prerequisite. Pinned by `crypto_scrypt.zap` with the RFC
+7914 §12 KATs. **Argon2 — deferred:** it is not in OpenSSL's stable API across the
+versions we target and would pull a new dependency, so it waits on its own
+dependency decision; revisit only with a concrete driver.
+
+**AEAD symmetric encryption — accepted, implementation to follow (I#772).**
+`crypto.aes256gcm_encrypt`/`_decrypt` and `crypto.chacha20poly1305_encrypt`/
+`_decrypt` over OpenSSL `EVP_*` (`EVP_aes_256_gcm` / `EVP_chacha20_poly1305`).
+**Decision:** accept now rather than defer — AEAD is the universal building block
+the first encryption-shaped consumer (JWE, signed/encrypted session cookies,
+secrets-at-rest, AWS SSE-C) will need, OpenSSL is already linked, and pre-shipping
+it removes the precise "gap discovered mid-feature" failure this epic exists to
+correct. #772 stays open as the `M` implementation tracker (NIST GCM + RFC 8439
+KAT goldens); not scheduled in this change.
+
+**X.509 / TLS — out of `crypto` (I#773).** Certificate parsing, chain validation
+and TLS context configuration stay owned by the `net`/`https`/TLS surface, where
+OpenSSL `SSL_*` is already reached directly in the runtime — mirroring Python's
+`ssl`-vs-`hashlib` split. A future parsing-only need (read a cert's subject/expiry
+without a handshake) files against the net/TLS area, not `crypto`.
+
+**Public-key encryption + raw key agreement — out of `crypto` (I#774).**
+RSA-OAEP/PKCS#1 encryption, ECIES, and raw ECDH/DH stay out. `crypto` exposes
+asymmetric **sign/verify** (JOSE/JWT, CloudFront drivers); there is no driver for
+public-key *encryption*. The one realistic future need — ECDH-ES for JWE — is
+better served by a **scoped** ECDH primitive plus the existing `hkdf` (#763),
+added only inside a concrete JWE/ECDH-ES effort (which would also activate the
+AEAD above).
+
+**Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)

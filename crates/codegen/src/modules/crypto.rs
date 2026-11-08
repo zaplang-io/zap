@@ -138,6 +138,12 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), p.into(), i.into(), p.into(), p.into()],
         Some(p.into()),
     );
+    // scrypt(password, salt, n, r, p, dklen) -> bytes (RFC 7914, #775).
+    cg.declare_rt(
+        "zap_crypto_scrypt",
+        &[p.into(), p.into(), i.into(), i.into(), i.into(), i.into()],
+        Some(p.into()),
+    );
     // Secure random / secrets.
     cg.declare_rt("zap_crypto_random_bytes", &[i.into()], Some(p.into()));
     cg.declare_rt("zap_crypto_token_hex", &[i.into()], Some(p.into()));

@@ -247,7 +247,11 @@ password-based key derivation, matching Python `hashlib.pbkdf2_hmac`) and
 extract-and-expand) derive keys over the SHA family (`sha1`/`sha224`/`sha256`/
 `sha384`/`sha512`); `password`/`salt`/`ikm`/`info` accept `str` or `bytes`, and
 bad arguments (unknown hash, non-positive iterations, negative `dklen`,
-out-of-range `length`) raise `ValueError`. `crypto.token_urlsafe(nbytes)` returns
+out-of-range `length`) raise `ValueError`.
+`crypto.scrypt(password, salt, n, r, p, dklen=64)` (scrypt, RFC 7914, matching
+Python `hashlib.scrypt`) is the memory-hard password KDF; `n` must be a power of
+two greater than 1 and `r`/`p`/`dklen` positive (bad parameters raise
+`ValueError`). `crypto.token_urlsafe(nbytes)` returns
 a URL-safe random token (base64url, no padding), mirroring Python
 `secrets.token_urlsafe`. `crypto.sha384`/`crypto.sha224` complete the SHA-2
 family (one-shot and streaming), alongside the existing `sha256`/`sha512`/`sha1`/

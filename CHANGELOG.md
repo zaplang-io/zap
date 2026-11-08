@@ -25,6 +25,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`crypto.scrypt`** (#775, D-0134): `crypto.scrypt(password, salt, n, r, p,
+  dklen=64) -> bytes`, the scrypt password-based KDF (OpenSSL `EVP_PBE_scrypt`),
+  mirroring Python `hashlib.scrypt`. `n` must be a power of two greater than 1
+  and `r`/`p`/`dklen` positive; a bad parameter or a derivation failure raises a
+  catchable `ValueError`. Pinned by the RFC 7914 §12 KATs. Closes the epic #761
+  gap review (D-0134): **Argon2** stays deferred (not in OpenSSL's stable API
+  across target versions, would add a dependency); symmetric **AEAD** (#772) is
+  accepted for a later `M`; **X.509/TLS** (#773) and **public-key encryption /
+  raw ECDH** (#774) stay out of `crypto`.
 - **Unsigned integer types** (#552, D-0019 amendment). `uint8`/`uint16`/
   `uint32`/`uint64` (with short `u8`/`u16`/`u32`/`u64` spellings) and the
   pointer-width `usize` are now first-class scalar types — the prerequisite for
