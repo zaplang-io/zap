@@ -506,6 +506,17 @@ KDF, returning binary `bytes`. `n` must be a power of two greater than 1 and
 accepted for a later cut, and **X.509/TLS** (#773) + **public-key encryption / raw
 ECDH** (#774) kept out of `crypto`. **Experimental** like the rest of `crypto`.
 
+`crypto` AEAD symmetric encryption (#772, D-0135) adds
+`aes256gcm_encrypt`/`decrypt` and `chacha20poly1305_encrypt`/`decrypt`
+(`(key, nonce, data, aad="") -> bytes`, OpenSSL `EVP_aes_256_gcm` /
+`EVP_chacha20_poly1305`, mirroring Python's `cryptography`
+`AESGCM`/`ChaCha20Poly1305`): 32-byte key, 12-byte nonce, 16-byte tag appended
+(`ciphertext || tag`). Decrypt authenticates before returning — a bad length or
+any tamper (ciphertext/tag/AAD/nonce/key) raises a catchable `ValueError`, never
+unauthenticated plaintext. Nonce uniqueness per `(key, nonce)` is the caller's
+responsibility (`crypto.random_bytes(12)`). **Experimental** like the rest of
+`crypto`.
+
 The experimental `crypto` follow-up families (#766–#771, D-0133) add: streaming
 HMAC (`hmac_new`/`hmac_update`/`hmac_hexdigest`/`hmac_digest`, over the
 self-contained HMAC core, non-destructive finalize); `crypto.randbelow(n) -> int`
