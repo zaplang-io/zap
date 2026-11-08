@@ -228,6 +228,9 @@ The experimental asymmetric-key surface adds validated key metadata/import and
 P-256 ECDSA (ES256) and Ed25519 signing: `crypto.key_info(pem)` (returns a
 `KeyInfo` with `kind`/`bits`/`curve`/`is_private`), `crypto.rsa_public_key_pem` /
 `p256_public_key_pem` / `ed25519_public_key_pem` (import from JWK components),
+the matching private-key builders `crypto.rsa_private_key_pem(n, e, d, p, q, dp,
+dq, qi)` / `p256_private_key_pem(d)` / `ed25519_private_key_pem(d)` (PKCS#8 PEM
+from a private JWK, OpenSSL-validated; #778),
 `crypto.p256_sha256_sign`/`verify` and `crypto.ed25519_sign`/`verify`. ES256
 signatures are the JOSE fixed-width 64-byte `r||s` form; Ed25519 is pure
 Ed25519 over the message. A public key cannot sign, a wrong curve/family/length

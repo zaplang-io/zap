@@ -57,6 +57,9 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_rsa_pss_sha512_sign"
         | "zap_crypto_p384_public_key_pem"
         | "zap_crypto_p521_public_key_pem"
+        | "zap_crypto_rsa_private_key_pem"
+        | "zap_crypto_p256_private_key_pem"
+        | "zap_crypto_ed25519_private_key_pem"
         | "zap_crypto_p384_sha384_sign"
         | "zap_crypto_p521_sha512_sign"
         | "zap_hex_decode"
@@ -141,6 +144,9 @@ fn call_crypto(
             | "zap_crypto_p521_public_key_pem"
             | "zap_crypto_p384_sha384_sign"
             | "zap_crypto_p521_sha512_sign"
+            | "zap_crypto_rsa_private_key_pem"
+            | "zap_crypto_p256_private_key_pem"
+            | "zap_crypto_ed25519_private_key_pem"
             | "zap_hex_decode"
             | "zap_base64_decode"
     );
@@ -681,6 +687,10 @@ fn lower(
         "p384_sha384_verify" => refs(lowerer, "zap_crypto_p384_sha384_verify", 3),
         "p521_sha512_sign" => refs(lowerer, "zap_crypto_p521_sha512_sign", 2),
         "p521_sha512_verify" => refs(lowerer, "zap_crypto_p521_sha512_verify", 3),
+        // Private-key PEM builders from private JWK components (#778, D-0136).
+        "rsa_private_key_pem" => refs(lowerer, "zap_crypto_rsa_private_key_pem", 8),
+        "p256_private_key_pem" => refs(lowerer, "zap_crypto_p256_private_key_pem", 1),
+        "ed25519_private_key_pem" => refs(lowerer, "zap_crypto_ed25519_private_key_pem", 1),
         // crypto.random_bytes(n) / crypto.token_hex(n): count coerces to i64.
         "random_bytes" | "token_hex" => {
             if args.len() != 1 {

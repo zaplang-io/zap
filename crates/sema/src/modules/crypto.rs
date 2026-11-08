@@ -349,6 +349,49 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             }
             Some(Ty::Bytes)
         }
+        // crypto.rsa_private_key_pem(n, e, d, p, q, dp, dq, qi) -> bytes (#778,
+        // D-0136): build a validated PKCS#8 PEM private key from the RSA CRT JWK
+        // components. All eight are str|bytes big-endian integers; OpenSSL's
+        // RSA_check_key rejects an inconsistent set with a catchable ValueError.
+        "rsa_private_key_pem" => {
+            if args.len() != 8 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(n, e, d, p, q, dp, dq, qi) takes 8 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                for a in args {
+                    expect_data(checker, method, a);
+                }
+            }
+            Some(Ty::Bytes)
+        }
+        // crypto.p256_private_key_pem(d) / crypto.ed25519_private_key_pem(d)
+        // -> bytes (#778, D-0136): PKCS#8 PEM private key from the 32-byte P-256
+        // scalar / Ed25519 seed. The runtime derives the public key and validates
+        // (out-of-range / invalid → catchable ValueError).
+        "p256_private_key_pem" | "ed25519_private_key_pem" => {
+            if args.len() != 1 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!("crypto.{method}(d) takes 1 argument, found {}", args.len()),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+            }
+            Some(Ty::Bytes)
+        }
         // crypto.p256_sha256_sign(private_pem, msg) -> bytes (#643, ES256): the
         // 64-byte JOSE r||s signature. crypto.ed25519_sign(private_pem, msg) ->
         // bytes: the 64-byte pure-Ed25519 signature over the original message.

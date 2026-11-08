@@ -6033,3 +6033,30 @@ is out of scope here. Pinned by `crypto_aead.zap`: the NIST AES-256-GCM
 zero-key/nonce tag vector, the RFC 8439 §2.8.2 ChaCha20-Poly1305 vector,
 round-trips with/without AAD, and the authentication-failure + length-validation
 paths. **Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)
+
+## D-0136 — stdlib `crypto`: private-key PEM builders from private JWK components (I#778)
+
+The symmetric counterpart to the public-key PEM builders (#643, D-0126): import a
+**private** JWK and emit an unencrypted PKCS#8 `BEGIN PRIVATE KEY` PEM, so a
+downstream library can do private-JWK *signing* without hand-rolling ASN.1/DER
+(forbidden by D-0126 — all key construction goes through OpenSSL).
+
+```
+crypto.rsa_private_key_pem(n, e, d, p, q, dp, dq, qi) -> bytes
+crypto.p256_private_key_pem(d) -> bytes        # 32-byte scalar; public point derived
+crypto.ed25519_private_key_pem(d) -> bytes     # 32-byte seed
+```
+
+**Shape & validation.** All components are `str`/`bytes` big-endian octets, as the
+public builders already take `n`/`e` and `x`/`y`. OpenSSL does every check: RSA is
+assembled from the full CRT set and run through `RSA_check_key` (`p·q == n`,
+`e·d ≡ 1`, and the CRT exponents/coefficient), so an inconsistent set raises
+`ValueError`; P-256 takes just the scalar `d`, validates `1 ≤ d < n`, derives the
+public point `d·G` and runs `EC_KEY_check_key`; Ed25519 takes the 32-byte seed via
+`EVP_PKEY_new_raw_private_key`. A malformed/out-of-range component raises a
+catchable `ValueError`, mirroring the public builders. Output is PKCS#8 via
+`PEM_write_bio_PrivateKey`. Unblocks private-JWK signing in the `jwt` library
+(zaplang-io/jwt#11 item 9), the same stdlib-first pattern as #729→#757. Pinned by
+`crypto_private_key_pem.zap` (build → `key_info` → sign/verify round-trip against
+the public PEM, plus malformed-component rejection). **Experimental**, like the
+rest of `crypto`. (Decided 2026-11-08.)

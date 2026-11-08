@@ -15944,6 +15944,158 @@ void *zap_crypto_ed25519_public_key_pem(void *x_bytes) {
         pkey, "crypto.ed25519_public_key_pem: PEM serialization failed");
 }
 
+/* Private-key PEM builders from private JWK components (ticket #778, D-0136):
+ * the symmetric counterparts to the *_public_key_pem builders above. Each
+ * assembles an EVP_PKEY from raw components, lets OpenSSL validate it, and emits
+ * an unencrypted PKCS#8 `BEGIN PRIVATE KEY` PEM. All ASN.1/DER stays in OpenSSL
+ * (D-0126). Malformed/inconsistent components raise a catchable ValueError. */
+
+/* Serialize a built private-key EVP_PKEY as PKCS#8 PEM bytes, then free it. */
+static void *zap_crypto_pkey_to_priv_pem(EVP_PKEY *pkey, const char *reason) {
+    BIO *bio = BIO_new(BIO_s_mem());
+    int ok =
+        bio && PEM_write_bio_PrivateKey(bio, pkey, NULL, NULL, 0, NULL, NULL) == 1;
+    void *out = ok ? zap_crypto_bio_to_bytes(bio) : NULL;
+    if (bio) {
+        BIO_free(bio);
+    }
+    EVP_PKEY_free(pkey);
+    if (!ok) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new(reason, (int64_t)strlen(reason)));
+    }
+    return out;
+}
+
+void *zap_crypto_rsa_private_key_pem(void *n_b, void *e_b, void *d_b, void *p_b,
+                                     void *q_b, void *dp_b, void *dq_b,
+                                     void *qi_b) {
+    ZapStr *parts[8] = {(ZapStr *)n_b,  (ZapStr *)e_b,  (ZapStr *)d_b,
+                        (ZapStr *)p_b,  (ZapStr *)q_b,  (ZapStr *)dp_b,
+                        (ZapStr *)dq_b, (ZapStr *)qi_b};
+    for (int i = 0; i < 8; i++) {
+        if (parts[i]->len <= 0 || parts[i]->len > ZAP_CRYPTO_RSA_N_MAX) {
+            zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                            zap_crypto_cstr("crypto.rsa_private_key_pem: a "
+                                            "component is empty or too large"));
+        }
+    }
+    BIGNUM *bn[8];
+    int built = 1;
+    for (int i = 0; i < 8; i++) {
+        bn[i] = BN_bin2bn((const unsigned char *)parts[i]->data,
+                          (int)parts[i]->len, NULL);
+        if (!bn[i]) {
+            built = 0;
+        }
+    }
+    RSA *rsa = built ? RSA_new() : NULL;
+    EVP_PKEY *pkey = rsa ? EVP_PKEY_new() : NULL;
+    /* set0_* take ownership of their BIGNUMs only on success; track transfers so
+     * cleanup frees exactly the untransferred ones (RSA_free frees the rest). */
+    int owned_key = 0, owned_fac = 0, owned_crt = 0;
+    if (rsa && pkey) {
+        owned_key = RSA_set0_key(rsa, bn[0], bn[1], bn[2]) == 1;
+        if (owned_key) {
+            owned_fac = RSA_set0_factors(rsa, bn[3], bn[4]) == 1;
+        }
+        if (owned_fac) {
+            owned_crt = RSA_set0_crt_params(rsa, bn[5], bn[6], bn[7]) == 1;
+        }
+    }
+    /* RSA_check_key verifies p*q == n, e*d ≡ 1, and the CRT exponents/coeff. */
+    int ok = owned_crt && RSA_check_key(rsa) == 1;
+    if (!ok) {
+        if (!owned_key) {
+            for (int i = 0; i < 8; i++) {
+                BN_free(bn[i]);
+            }
+        } else if (!owned_fac) {
+            for (int i = 3; i < 8; i++) {
+                BN_free(bn[i]);
+            }
+        } else if (!owned_crt) {
+            for (int i = 5; i < 8; i++) {
+                BN_free(bn[i]);
+            }
+        }
+        RSA_free(rsa);
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.rsa_private_key_pem: inconsistent "
+                                        "or invalid RSA private components"));
+    }
+    if (EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        RSA_free(rsa);
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.rsa_private_key_pem: key assembly failed"));
+    }
+    return zap_crypto_pkey_to_priv_pem(
+        pkey, "crypto.rsa_private_key_pem: PEM serialization failed");
+}
+
+void *zap_crypto_p256_private_key_pem(void *d_bytes) {
+    ZapStr *d = (ZapStr *)d_bytes;
+    if (d->len != ZAP_CRYPTO_P256_COORD_LEN) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.p256_private_key_pem: scalar d "
+                                        "must be exactly 32 bytes"));
+    }
+    EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    BIGNUM *bd = BN_bin2bn((const unsigned char *)d->data, (int)d->len, NULL);
+    const EC_GROUP *grp = ec ? EC_KEY_get0_group(ec) : NULL;
+    BIGNUM *order = BN_new();
+    BN_CTX *ctx = BN_CTX_new();
+    EC_POINT *pub = grp ? EC_POINT_new(grp) : NULL;
+    /* d must lie in [1, n-1]; derive the public point pub = d*G and let
+     * EC_KEY_check_key confirm the pair is consistent and on the curve. */
+    int ok = ec && bd && grp && order && ctx && pub &&
+             EC_GROUP_get_order(grp, order, ctx) == 1 && !BN_is_zero(bd) &&
+             BN_cmp(bd, order) < 0 && EC_KEY_set_private_key(ec, bd) == 1 &&
+             EC_POINT_mul(grp, pub, bd, NULL, NULL, ctx) == 1 &&
+             EC_KEY_set_public_key(ec, pub) == 1 && EC_KEY_check_key(ec) == 1;
+    BN_free(bd);
+    BN_free(order);
+    BN_CTX_free(ctx);
+    EC_POINT_free(pub);
+    if (!ok) {
+        EC_KEY_free(ec);
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.p256_private_key_pem: invalid "
+                                        "P-256 private scalar"));
+    }
+    EVP_PKEY *pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_EC_KEY(pkey, ec) != 1) {
+        EC_KEY_free(ec);
+        EVP_PKEY_free(pkey);
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.p256_private_key_pem: key assembly failed"));
+    }
+    return zap_crypto_pkey_to_priv_pem(
+        pkey, "crypto.p256_private_key_pem: PEM serialization failed");
+}
+
+void *zap_crypto_ed25519_private_key_pem(void *d_bytes) {
+    ZapStr *d = (ZapStr *)d_bytes;
+    if (d->len != ZAP_CRYPTO_ED25519_KEY_LEN) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_crypto_cstr("crypto.ed25519_private_key_pem: seed "
+                                        "must be exactly 32 bytes"));
+    }
+    EVP_PKEY *pkey = EVP_PKEY_new_raw_private_key(
+        EVP_PKEY_ED25519, NULL, (const unsigned char *)d->data, (size_t)d->len);
+    if (!pkey) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_crypto_cstr("crypto.ed25519_private_key_pem: invalid Ed25519 seed"));
+    }
+    return zap_crypto_pkey_to_priv_pem(
+        pkey, "crypto.ed25519_private_key_pem: PEM serialization failed");
+}
+
 /* ES256 signing (#643): load a P-256 private key, sign SHA-256 of the message,
  * and return the signature as JOSE fixed-width 64-byte r||s. Raises ValueError
  * on a non-private key, a non-P-256 key, or a signing failure. */
