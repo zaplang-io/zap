@@ -253,7 +253,14 @@ Python `hashlib.scrypt`) is the memory-hard password KDF; `n` must be a power of
 two greater than 1 and `r`/`p`/`dklen` positive (bad parameters raise
 `ValueError`). `crypto.token_urlsafe(nbytes)` returns
 a URL-safe random token (base64url, no padding), mirroring Python
-`secrets.token_urlsafe`. `crypto.sha384`/`crypto.sha224` complete the SHA-2
+`secrets.token_urlsafe`.
+AEAD symmetric encryption is available as `crypto.aes256gcm_encrypt`/`_decrypt`
+and `crypto.chacha20poly1305_encrypt`/`_decrypt` (`(key, nonce, data, aad="")`,
+mirroring Python's `cryptography` `AESGCM`/`ChaCha20Poly1305`): a 32-byte key and
+12-byte nonce, with the 16-byte tag appended (`ciphertext || tag`). Decrypt
+verifies the tag and raises `ValueError` on any tamper — it never returns
+unauthenticated plaintext; the caller must not reuse a `(key, nonce)` pair (use
+`crypto.random_bytes(12)`). `crypto.sha384`/`crypto.sha224` complete the SHA-2
 family (one-shot and streaming), alongside the existing `sha256`/`sha512`/`sha1`/
 `md5`. See
 [D-0132](DECISIONS.md#d-0132--stdlib-crypto-key-derivation-pbkdf2hkdf-url-safe-tokens-and-the-rest-of-sha-2-i762i765).

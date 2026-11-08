@@ -5998,3 +5998,38 @@ added only inside a concrete JWE/ECDH-ES effort (which would also activate the
 AEAD above).
 
 **Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)
+
+## D-0135 — stdlib `crypto`: AEAD symmetric encryption (AES-256-GCM, ChaCha20-Poly1305, I#772)
+
+Implements the AEAD surface accepted in D-0134. Four free functions over OpenSSL
+EVP, mirroring the shape of Python's `cryptography` `AESGCM`/`ChaCha20Poly1305`:
+
+```
+crypto.aes256gcm_encrypt(key, nonce, plaintext, aad="") -> bytes    # ciphertext || tag
+crypto.aes256gcm_decrypt(key, nonce, ciphertext, aad="") -> bytes   # raises on tag mismatch
+crypto.chacha20poly1305_encrypt(key, nonce, plaintext, aad="") -> bytes
+crypto.chacha20poly1305_decrypt(key, nonce, ciphertext, aad="") -> bytes
+```
+
+**Shape decisions.** The **key is 32 bytes** (AES-256 / ChaCha20 are both
+256-bit) and the **nonce is 12 bytes** (96-bit — the GCM standard IV and the
+RFC 8439 IETF ChaCha20-Poly1305 nonce); a wrong length raises `ValueError`. The
+**16-byte tag is appended to the ciphertext** (`output = ciphertext || tag`),
+matching the `cryptography` convention, so a caller passes the whole blob back to
+decrypt. `aad` is optional (defaults to empty). `key`/`nonce`/`plaintext`/`aad`
+accept `str` or `bytes`; results are binary `bytes`.
+
+**Authenticated-decryption contract.** Decrypt verifies the tag *before*
+returning: a ciphertext shorter than the tag, or any tampering of
+ciphertext/tag/AAD/nonce or a wrong key, raises a catchable `ValueError` — it
+**never returns unauthenticated plaintext**. Backed by OpenSSL
+`EVP_aes_256_gcm` / `EVP_chacha20_poly1305` with `EVP_CTRL_AEAD_SET_IVLEN` /
+`GET_TAG` / `SET_TAG` (already-linked `-lssl -lcrypto`, D-0102/D-0126).
+
+**Nonce management is the caller's responsibility** (as in `cryptography`): a
+`(key, nonce)` pair must never repeat for GCM/Poly1305. A random 12-byte nonce
+from `crypto.random_bytes(12)` is the intended idiom; a nonce-management helper
+is out of scope here. Pinned by `crypto_aead.zap`: the NIST AES-256-GCM
+zero-key/nonce tag vector, the RFC 8439 §2.8.2 ChaCha20-Poly1305 vector,
+round-trips with/without AAD, and the authentication-failure + length-validation
+paths. **Experimental**, like the rest of `crypto`. (Decided 2026-11-08.)

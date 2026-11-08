@@ -25,6 +25,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`crypto` AEAD symmetric encryption** (#772, D-0135): `aes256gcm_encrypt`/
+  `aes256gcm_decrypt` and `chacha20poly1305_encrypt`/`chacha20poly1305_decrypt`
+  — `(key, nonce, data, aad="") -> bytes`, over OpenSSL EVP, mirroring Python's
+  `cryptography` `AESGCM`/`ChaCha20Poly1305`. Key is 32 bytes, nonce 12, and the
+  16-byte tag is appended (`ciphertext || tag`). Decrypt verifies the tag and
+  raises a catchable `ValueError` on any tamper/length error — it never returns
+  unauthenticated plaintext. Nonce uniqueness is the caller's responsibility
+  (use `crypto.random_bytes(12)`). Pinned by the NIST GCM and RFC 8439 §2.8.2
+  KATs.
 - **`crypto.scrypt`** (#775, D-0134): `crypto.scrypt(password, salt, n, r, p,
   dklen=64) -> bytes`, the scrypt password-based KDF (OpenSSL `EVP_PBE_scrypt`),
   mirroring Python `hashlib.scrypt`. `n` must be a power of two greater than 1

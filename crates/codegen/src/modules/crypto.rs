@@ -144,6 +144,19 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), p.into(), i.into(), i.into(), i.into(), i.into()],
         Some(p.into()),
     );
+    // AEAD (#772): <alg>_encrypt/_decrypt(key, nonce, data, aad) -> bytes.
+    for sym in [
+        "zap_crypto_aes256gcm_encrypt",
+        "zap_crypto_aes256gcm_decrypt",
+        "zap_crypto_chacha20poly1305_encrypt",
+        "zap_crypto_chacha20poly1305_decrypt",
+    ] {
+        cg.declare_rt(
+            sym,
+            &[p.into(), p.into(), p.into(), p.into()],
+            Some(p.into()),
+        );
+    }
     // Secure random / secrets.
     cg.declare_rt("zap_crypto_random_bytes", &[i.into()], Some(p.into()));
     cg.declare_rt("zap_crypto_token_hex", &[i.into()], Some(p.into()));

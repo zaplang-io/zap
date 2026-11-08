@@ -15359,6 +15359,141 @@ void *zap_crypto_scrypt(void *password, void *salt, int64_t n, int64_t r,
     return result;
 }
 
+/* AEAD symmetric encryption (ticket #772, D-0135): AES-256-GCM and
+ * ChaCha20-Poly1305 over OpenSSL EVP, mirroring the shape of Python's
+ * `cryptography` AESGCM/ChaCha20Poly1305. The 256-bit key and 96-bit (12-byte)
+ * nonce are fixed-width; the 16-byte authentication tag is appended to the
+ * ciphertext (output = ciphertext || tag). A bad key/nonce length raises
+ * ValueError; on decrypt, a ciphertext shorter than the tag, or any
+ * authentication failure (tampered ciphertext/AAD/nonce/key), raises a catchable
+ * ValueError rather than returning unauthenticated plaintext. */
+#define ZAP_AEAD_TAG_LEN 16
+#define ZAP_AEAD_KEY_LEN 32
+#define ZAP_AEAD_NONCE_LEN 12
+
+static void *zap_crypto_aead_seal(const EVP_CIPHER *cipher, void *key, void *nonce,
+                                  void *plaintext, void *aad) {
+    const ZapStr *k = (const ZapStr *)key;
+    const ZapStr *nn = (const ZapStr *)nonce;
+    const ZapStr *pt = (const ZapStr *)plaintext;
+    const ZapStr *ad = (const ZapStr *)aad;
+    if (k->len != ZAP_AEAD_KEY_LEN) {
+        zap_crypto_kdf_raise("crypto AEAD: key must be 32 bytes");
+    }
+    if (nn->len != ZAP_AEAD_NONCE_LEN) {
+        zap_crypto_kdf_raise("crypto AEAD: nonce must be 12 bytes");
+    }
+    size_t ptlen = (size_t)pt->len;
+    uint8_t *out = (uint8_t *)malloc(ptlen + ZAP_AEAD_TAG_LEN);
+    if (!out) {
+        zap_crypto_kdf_raise("crypto AEAD: out of memory");
+    }
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int outl = 0, tmpl = 0;
+    int ok = ctx != NULL &&
+             EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, ZAP_AEAD_NONCE_LEN,
+                                 NULL) == 1 &&
+             EVP_EncryptInit_ex(ctx, NULL, NULL, (const unsigned char *)k->data,
+                                (const unsigned char *)nn->data) == 1;
+    if (ok && ad->len > 0) {
+        ok = EVP_EncryptUpdate(ctx, NULL, &outl, (const unsigned char *)ad->data,
+                               (int)ad->len) == 1;
+    }
+    if (ok && ptlen > 0) {
+        ok = EVP_EncryptUpdate(ctx, out, &outl, (const unsigned char *)pt->data,
+                               (int)ptlen) == 1;
+    }
+    if (ok) {
+        /* GCM / Poly1305 are stream ciphers: Final emits no extra bytes. */
+        ok = EVP_EncryptFinal_ex(ctx, out + ptlen, &tmpl) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, ZAP_AEAD_TAG_LEN,
+                                 out + ptlen) == 1;
+    }
+    if (ctx) {
+        EVP_CIPHER_CTX_free(ctx);
+    }
+    if (!ok) {
+        free(out);
+        zap_crypto_kdf_raise("crypto AEAD: encryption failed");
+    }
+    void *result = zap_str_new((const char *)out, (int64_t)(ptlen + ZAP_AEAD_TAG_LEN));
+    free(out);
+    return result;
+}
+
+static void *zap_crypto_aead_open(const EVP_CIPHER *cipher, void *key, void *nonce,
+                                  void *ciphertext, void *aad) {
+    const ZapStr *k = (const ZapStr *)key;
+    const ZapStr *nn = (const ZapStr *)nonce;
+    const ZapStr *ct = (const ZapStr *)ciphertext;
+    const ZapStr *ad = (const ZapStr *)aad;
+    if (k->len != ZAP_AEAD_KEY_LEN) {
+        zap_crypto_kdf_raise("crypto AEAD: key must be 32 bytes");
+    }
+    if (nn->len != ZAP_AEAD_NONCE_LEN) {
+        zap_crypto_kdf_raise("crypto AEAD: nonce must be 12 bytes");
+    }
+    if (ct->len < ZAP_AEAD_TAG_LEN) {
+        zap_crypto_kdf_raise("crypto AEAD: ciphertext too short (missing tag)");
+    }
+    size_t ctlen = (size_t)ct->len - ZAP_AEAD_TAG_LEN;
+    const unsigned char *tag = (const unsigned char *)ct->data + ctlen;
+    uint8_t *out = (uint8_t *)malloc(ctlen ? ctlen : 1);
+    if (!out) {
+        zap_crypto_kdf_raise("crypto AEAD: out of memory");
+    }
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    int outl = 0, tmpl = 0;
+    int ok = ctx != NULL &&
+             EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, ZAP_AEAD_NONCE_LEN,
+                                 NULL) == 1 &&
+             EVP_DecryptInit_ex(ctx, NULL, NULL, (const unsigned char *)k->data,
+                                (const unsigned char *)nn->data) == 1;
+    if (ok && ad->len > 0) {
+        ok = EVP_DecryptUpdate(ctx, NULL, &outl, (const unsigned char *)ad->data,
+                               (int)ad->len) == 1;
+    }
+    if (ok && ctlen > 0) {
+        ok = EVP_DecryptUpdate(ctx, out, &outl, (const unsigned char *)ct->data,
+                               (int)ctlen) == 1;
+    }
+    if (ok) {
+        ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, ZAP_AEAD_TAG_LEN,
+                                 (void *)tag) == 1;
+    }
+    /* The tag is verified here; a mismatch makes Final return 0. */
+    int authed = ok && EVP_DecryptFinal_ex(ctx, out + ctlen, &tmpl) == 1;
+    if (ctx) {
+        EVP_CIPHER_CTX_free(ctx);
+    }
+    if (!ok) {
+        free(out);
+        zap_crypto_kdf_raise("crypto AEAD: decryption setup failed");
+    }
+    if (!authed) {
+        free(out);
+        zap_crypto_kdf_raise("crypto AEAD: authentication failed (tag mismatch)");
+    }
+    void *result = zap_str_new((const char *)out, (int64_t)ctlen);
+    free(out);
+    return result;
+}
+
+void *zap_crypto_aes256gcm_encrypt(void *key, void *nonce, void *pt, void *aad) {
+    return zap_crypto_aead_seal(EVP_aes_256_gcm(), key, nonce, pt, aad);
+}
+void *zap_crypto_aes256gcm_decrypt(void *key, void *nonce, void *ct, void *aad) {
+    return zap_crypto_aead_open(EVP_aes_256_gcm(), key, nonce, ct, aad);
+}
+void *zap_crypto_chacha20poly1305_encrypt(void *key, void *nonce, void *pt, void *aad) {
+    return zap_crypto_aead_seal(EVP_chacha20_poly1305(), key, nonce, pt, aad);
+}
+void *zap_crypto_chacha20poly1305_decrypt(void *key, void *nonce, void *ct, void *aad) {
+    return zap_crypto_aead_open(EVP_chacha20_poly1305(), key, nonce, ct, aad);
+}
+
 /* ==========================================================================
  * crypto: RSA PKCS#1 v1.5 signing (ticket #628, D-0102)
  * --------------------------------------------------------------------------

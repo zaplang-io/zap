@@ -456,6 +456,38 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             }
             Some(Ty::Bytes)
         }
+        // AEAD symmetric encryption (#772, D-0135): AES-256-GCM and
+        // ChaCha20-Poly1305. crypto.<alg>_encrypt(key, nonce, plaintext, aad="")
+        // -> bytes (ciphertext||tag); crypto.<alg>_decrypt(key, nonce,
+        // ciphertext, aad="") -> bytes (raises ValueError on a bad key/nonce
+        // length or an authentication failure). Key is 32 bytes, nonce 12, tag
+        // 16; all data args are str|bytes, aad optional.
+        "aes256gcm_encrypt"
+        | "aes256gcm_decrypt"
+        | "chacha20poly1305_encrypt"
+        | "chacha20poly1305_decrypt" => {
+            if args.len() != 3 && args.len() != 4 {
+                checker.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "crypto.{method}(key, nonce, data, aad=\"\") takes 3 or 4 arguments, found {}",
+                        args.len()
+                    ),
+                    span,
+                );
+                for a in args {
+                    checker.infer(&a.value);
+                }
+            } else {
+                expect_data(checker, method, &args[0]);
+                expect_data(checker, method, &args[1]);
+                expect_data(checker, method, &args[2]);
+                if let Some(aad) = args.get(3) {
+                    expect_data(checker, method, aad);
+                }
+            }
+            Some(Ty::Bytes)
+        }
         // crypto.hkdf(hash_name, ikm, length, salt="", info="") -> bytes (#763,
         // RFC 5869 extract-and-expand). hash_name is a str; ikm/salt/info are
         // str|bytes (salt and info optional); length is an int. The runtime

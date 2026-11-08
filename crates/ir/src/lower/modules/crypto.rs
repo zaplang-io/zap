@@ -45,6 +45,10 @@ fn result_type(func: &str) -> Result<Ty, LowerError> {
         | "zap_crypto_pbkdf2_hmac"
         | "zap_crypto_hkdf"
         | "zap_crypto_scrypt"
+        | "zap_crypto_aes256gcm_encrypt"
+        | "zap_crypto_aes256gcm_decrypt"
+        | "zap_crypto_chacha20poly1305_encrypt"
+        | "zap_crypto_chacha20poly1305_decrypt"
         | "zap_crypto_hmac_digest"
         | "zap_crypto_rsa_sha384_sign"
         | "zap_crypto_rsa_sha512_sign"
@@ -121,6 +125,10 @@ fn call_crypto(
             | "zap_crypto_pbkdf2_hmac"
             | "zap_crypto_hkdf"
             | "zap_crypto_scrypt"
+            | "zap_crypto_aes256gcm_encrypt"
+            | "zap_crypto_aes256gcm_decrypt"
+            | "zap_crypto_chacha20poly1305_encrypt"
+            | "zap_crypto_chacha20poly1305_decrypt"
             | "zap_crypto_token_urlsafe"
             | "zap_crypto_hmac_new"
             | "zap_crypto_randbelow"
@@ -487,6 +495,43 @@ fn lower(
                 lowerer,
                 "zap_crypto_scrypt",
                 vec![password, salt, n, r, p, dklen],
+            )?))
+        }
+        // AEAD (#772, D-0135): <alg>_encrypt/_decrypt(key, nonce, data, aad="").
+        // An omitted `aad` defaults to the empty string; the runtime validates
+        // key/nonce lengths and (on decrypt) the authentication tag.
+        "aes256gcm_encrypt"
+        | "aes256gcm_decrypt"
+        | "chacha20poly1305_encrypt"
+        | "chacha20poly1305_decrypt" => {
+            if args.len() != 3 && args.len() != 4 {
+                return Err(err(
+                    "crypto AEAD takes 3 or 4 arguments (key, nonce, data, aad=\"\")",
+                ));
+            }
+            let (key, _) = lowerer.expr(&args[0].value)?;
+            let (nonce, _) = lowerer.expr(&args[1].value)?;
+            let (data, _) = lowerer.expr(&args[2].value)?;
+            let aad = if args.len() == 4 {
+                lowerer.expr(&args[3].value)?.0
+            } else {
+                let d = lowerer.new_value(Ty::Ptr);
+                lowerer.emit(Inst::StrConst {
+                    dest: d,
+                    bytes: Vec::new(),
+                });
+                d
+            };
+            let func = match method {
+                "aes256gcm_encrypt" => "zap_crypto_aes256gcm_encrypt",
+                "aes256gcm_decrypt" => "zap_crypto_aes256gcm_decrypt",
+                "chacha20poly1305_encrypt" => "zap_crypto_chacha20poly1305_encrypt",
+                _ => "zap_crypto_chacha20poly1305_decrypt",
+            };
+            Ok(Some(call_crypto(
+                lowerer,
+                func,
+                vec![key, nonce, data, aad],
             )?))
         }
         // crypto.hkdf(hash_name, ikm, length, salt="", info="") -> bytes (#763,
