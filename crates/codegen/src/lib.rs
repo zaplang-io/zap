@@ -1007,6 +1007,39 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), p.into(), p.into()],
             Some(p.into()),
         );
+        // dict with `float64` VALUES (#800): the value shares the uniform word via
+        // a bit reinterpret, so these push/return a `double`. One pair per key
+        // kind (i64 / str / struct-`fn`); a float *key* is a separate follow-up.
+        self.declare_rt(
+            "zap_dict_set_i64_f64",
+            &[p.into(), i.into(), f64t.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_set_str_f64",
+            &[p.into(), p.into(), f64t.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_set_fn_f64",
+            &[p.into(), p.into(), f64t.into(), p.into(), p.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_get_i64_f64",
+            &[p.into(), i.into()],
+            Some(f64t.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_str_f64",
+            &[p.into(), p.into()],
+            Some(f64t.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_fn_f64",
+            &[p.into(), p.into(), p.into(), p.into()],
+            Some(f64t.into()),
+        );
         // dict key removal `del d[k]` (#595): probe for the key and tombstone the
         // slot (reusing the open-addressing probe of set/get). A missing key is a
         // no-op, matching the current non-raising dict read (`KeyError` is #22).
@@ -1025,6 +1058,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_dict_keys_ptr", &[p.into()], Some(p.into()));
         self.declare_rt("zap_dict_values_i64", &[p.into()], Some(p.into()));
         self.declare_rt("zap_dict_values_ptr", &[p.into()], Some(p.into()));
+        // `.values()` of a `dict[K, float64]` (#800) -> a `list[float64]`.
+        self.declare_rt("zap_dict_values_f64", &[p.into()], Some(p.into()));
         self.declare_rt(
             "zap_dict_contains_i64",
             &[p.into(), i.into()],
@@ -1084,6 +1119,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_heap_pop_ptr", &[p.into()], Some(p.into()));
         self.declare_rt("zap_heap_peek_i64", &[p.into()], Some(i.into()));
         self.declare_rt("zap_heap_peek_ptr", &[p.into()], Some(p.into()));
+        // `heap[float64]` (#800): float elements ordered by a total-order
+        // comparator (NaN greatest); push/pop/peek carry a reinterpreted `double`.
+        self.declare_rt("zap_heap_push_f64", &[p.into(), f64t.into()], None);
+        self.declare_rt("zap_heap_pop_f64", &[p.into()], Some(f64t.into()));
+        self.declare_rt("zap_heap_peek_f64", &[p.into()], Some(f64t.into()));
         self.declare_rt("zap_heap_items", &[p.into()], Some(p.into()));
         // Struct-key hashing helpers (operator overloading, D-0047).
         self.declare_rt("zap_str_cmp", &[p.into(), p.into()], Some(i.into()));
@@ -1352,6 +1392,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_chan_send_ptr", &[p.into(), p.into()], None);
         self.declare_rt("zap_chan_recv_i64", &[p.into()], Some(i.into()));
         self.declare_rt("zap_chan_recv_ptr", &[p.into()], Some(p.into()));
+        // `channel[float64]` (#800): the element travels as a reinterpreted
+        // `double` word.
+        self.declare_rt("zap_chan_send_f64", &[p.into(), f64t.into()], None);
+        self.declare_rt("zap_chan_recv_f64", &[p.into()], Some(f64t.into()));
         self.declare_rt("zap_chan_close", &[p.into()], None);
 
         // Precise GC (ticket #48): allocation that carries a type descriptor, a

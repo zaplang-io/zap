@@ -1772,8 +1772,11 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                     Some(a) => elem_of(a, env)?,
                     None => Elem::I64,
                 };
+                // The dict *value* is a value position, so a `float`/`f64` value
+                // is admitted (#800); the *key* above keeps `elem_of`, which still
+                // rejects a float key (Phase 2, pending the hash ruling).
                 let v = match args.get(1) {
-                    Some(a) => elem_of(a, env)?,
+                    Some(a) => value_elem_of(a, env)?,
                     None => Elem::I64,
                 };
                 Ok(Ty::Dict(k, v))
@@ -1795,9 +1798,11 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
             "channel" => {
                 // A channel's element uses the same uniform-word representation
                 // as a collection element (ticket #25, D-0031): the element kind
-                // picks the typed send/recv runtime entry point.
+                // picks the typed send/recv runtime entry point. A channel element
+                // is a value position (just a stored word), so a `float`/`f64`
+                // element is admitted (#800).
                 let e = match args.first() {
-                    Some(a) => elem_of(a, env)?,
+                    Some(a) => value_elem_of(a, env)?,
                     None => Elem::I64,
                 };
                 Ok(Ty::Chan(e))
@@ -1941,6 +1946,14 @@ fn list_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
     list_elem_kind(resolve_ty(t, env)?, env.nested)
 }
 
+/// The element kind of a *value*-position element type — a dict **value** or a
+/// **channel** element — that admits an `f64` element (#800). Mirrors
+/// [`list_elem_of`]; a float dict *key*, set member, or heap element is a
+/// key/ordered position and still rejects floats.
+fn value_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
+    value_elem_kind(resolve_ty(t, env)?, env.nested)
+}
+
 /// The element kind of a `heap[T]` element type (D-0057). A heap orders its
 /// elements, so — unlike a general collection — only the *comparable* element
 /// kinds are supported in this increment: integers/bools/chars (compared as
@@ -1952,10 +1965,14 @@ fn heap_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
         // integer heap element (#709); it was accepted here as `Ty::I32` before
         // the IR split, so keep it accepted.
         Ty::I1 | Ty::I8 | Ty::I16 | Ty::I32 | Ty::Char | Ty::I64 => Ok(Elem::I64),
+        // A `heap[float64]` orders its elements by IEEE value through a dedicated
+        // `f64` heap kind (#800); NaN sorts as greatest under a documented total
+        // order, so the heap invariant holds. `f32` heaps stay deferred (#49).
+        Ty::F64 => Ok(Elem::F64),
         Ty::Enum(id) => Ok(Elem::Enum(id)),
         Ty::Ptr => Ok(Elem::Ptr),
         other => Err(err(format!(
-            "heap[{other}] is not supported yet (only integer and str elements)"
+            "heap[{other}] is not supported yet (only integer, float, and str elements)"
         ))),
     }
 }
@@ -1999,8 +2016,11 @@ fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
 fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
     match name {
         "int" | "int64" | "i64" | "int32" | "i32" | "bool" | "char" => Ok(Elem::I64),
-        "float" | "float64" | "f64" | "float32" | "f32" => Err(err(
-            "channels of floating-point elements are not supported yet",
+        // A `channel[float64]` carries its element as a reinterpreted `f64` word
+        // (#800); an `f32` channel element stays deferred (ticket #49).
+        "float" | "float64" | "f64" => Ok(Elem::F64),
+        "float32" | "f32" => Err(err(
+            "channels of 32-bit float elements are not supported yet (ticket #49)",
         )),
         // `str`, `bytes`, struct, and nested-collection elements are references.
         _ => Ok(Elem::Ptr),
@@ -2054,14 +2074,25 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
     }
 }
 
-/// Like [`elem_kind`], but admits an `f64` *list* element (I#569) as [`Elem::F64`].
-/// `f32` list elements (ticket #49) and float elements of other collections stay
-/// unsupported, so this is used only on the `list[T]` element paths.
-fn list_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
+/// Like [`elem_kind`], but admits an `f64` element as [`Elem::F64`] in a *value*
+/// position — one that stores a uniform 8-byte word and needs neither hashing nor
+/// ordering: a list element (I#569), a dict **value**, or a **channel** element
+/// (#800). `f32` (ticket #49) and every other float kind fall through to
+/// [`elem_kind`] and stay unsupported. This is never reached for a dict/set *key*
+/// or a `heap` element (which must hash or order) — those keep going through
+/// [`elem_kind`]/[`heap_elem_of`], so a float key/member is still rejected pending
+/// the hash ruling (#800 Phase 2).
+fn value_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     match t {
         Ty::F64 => Ok(Elem::F64),
         other => elem_kind(other, nested),
     }
+}
+
+/// The element kind of a `list[T]` element type (I#569): a *value* position, so a
+/// `float`/`f64` element is admitted. An alias of [`value_elem_kind`].
+fn list_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
+    value_elem_kind(t, nested)
 }
 
 /// The integer-word element family: `i64`, `bool` (`Elem::Bool`), and `char`
@@ -9834,7 +9865,7 @@ impl<'a> FnLower<'a> {
             let (kv, kt) = s.expr(key_e)?;
             let (vv, vt) = s.expr(val_e)?;
             let kk = elem_kind(kt, &s.ctx.nested)?;
-            let vk = elem_kind(vt, &s.ctx.nested)?;
+            let vk = value_elem_kind(vt, &s.ctx.nested)?;
             kinds.set(Some((kk, vk)));
             let kv = s.coerce(kv, kt, kk.ty());
             let vv = s.coerce(vv, vt, vk.ty());
@@ -13920,7 +13951,7 @@ impl<'a> FnLower<'a> {
                     let (kk, vk) = match kinds.get() {
                         Some((kk, vk)) => {
                             if elem_kind(kt, &self.ctx.nested)? != kk
-                                || elem_kind(vt, &self.ctx.nested)? != vk
+                                || value_elem_kind(vt, &self.ctx.nested)? != vk
                             {
                                 return Err(err(
                                     "dict keys/values must all have the same representation",
@@ -13930,7 +13961,10 @@ impl<'a> FnLower<'a> {
                         }
                         None => {
                             let kk = elem_kind(kt, &self.ctx.nested)?;
-                            let vk = elem_kind(vt, &self.ctx.nested)?;
+                            // The value is a value position (#800): a `float`/`f64`
+                            // dict value is admitted; the key above keeps
+                            // `elem_kind`, so a float *key* is still rejected.
+                            let vk = value_elem_kind(vt, &self.ctx.nested)?;
                             kinds.set(Some((kk, vk)));
                             (kk, vk)
                         }
@@ -14608,7 +14642,17 @@ impl<'a> FnLower<'a> {
                 }
             }
         }
-        let kind = self.iconst(Ty::I64, if elem == Elem::I64 { 0 } else { 1 });
+        // 0 = i64 word (integers/bools/chars), 1 = str (pointer bytes), 2 = f64
+        // (IEEE value via a total-order comparator, #800). Preserve the prior
+        // mapping for every non-float element kind.
+        let kind = self.iconst(
+            Ty::I64,
+            match elem {
+                Elem::I64 => 0,
+                Elem::F64 => 2,
+                _ => 1,
+            },
+        );
         let d = self.iconst(Ty::I64, dir);
         let h = self.new_value(Ty::Heap(elem));
         self.emit(Inst::Call {
@@ -14636,7 +14680,9 @@ impl<'a> FnLower<'a> {
                     return Err(err("push() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
-                if elem_kind(vt, &self.ctx.nested)? != elem {
+                // `heap[float64]` admits an `f64` element (#800), so classify the
+                // pushed value with `value_elem_kind` too.
+                if value_elem_kind(vt, &self.ctx.nested)? != elem {
                     return Err(err("push() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
@@ -15041,12 +15087,17 @@ impl<'a> FnLower<'a> {
     }
 
     fn check_index_value(&self, actual: Ty, expected: Elem, list: bool) -> Result<(), LowerError> {
-        // Indexed float stores already widen integers via `coerce`.
-        if list && expected == Elem::F64 && actual.int_width().is_some() {
+        // Indexed float stores already widen integers via `coerce` — a list
+        // element (I#569) or a dict value (#800), both value positions whose
+        // expected kind is `Elem::F64`.
+        if expected == Elem::F64 && actual.int_width().is_some() {
             return Ok(());
         }
-        let kind = if list {
-            list_elem_kind(actual, &self.ctx.nested)?
+        // A value position (a list element, or — `expected == F64` — a dict
+        // value) admits an `f64` element through `value_elem_kind`; a dict/set
+        // *key* keeps `elem_kind`, which still rejects floats (#800 Phase 2).
+        let kind = if list || expected == Elem::F64 {
+            value_elem_kind(actual, &self.ctx.nested)?
         } else {
             elem_kind(actual, &self.ctx.nested)?
         };
@@ -19061,5 +19112,96 @@ fn parse_int_lit_opt(s: &str) -> Option<i64> {
         i64::from_str_radix(bn, 2).ok()
     } else {
         clean.parse::<i64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod float_collection_tests {
+    //! Lowering coverage for `float64` as a collection element/key (#800).
+    //! These run on the host (no LLVM): they exercise AST→ZIR lowering directly,
+    //! independent of the sema gate, so the element-storage paths are a walled
+    //! garden. Phase 1 (dict VALUES, channel, heap) must lower cleanly; the
+    //! deferred key/member shapes (float dict KEY, set member) and `f32` must
+    //! still raise a lowering error.
+    use super::lower_module;
+
+    fn lower_errs(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty(), "parse errors in test source: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors in test source: {lerrs:?}");
+        let (_m, errs) = lower_module(&module);
+        errs.into_iter().map(|e| format!("{e:?}")).collect()
+    }
+
+    fn lowers_ok(src: &str) {
+        let errs = lower_errs(src);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+    }
+
+    fn lower_fails(src: &str) {
+        let errs = lower_errs(src);
+        assert!(!errs.is_empty(), "expected a lowering error for\n{src}");
+    }
+
+    #[test]
+    fn float_dict_values_lower() {
+        // dict[K, float64] value — every key kind, construct/set/get/values.
+        lowers_ok(
+            "def main():\n    dict[str, float64] d = {}\n    d[\"a\"] = 1.5\n    \
+             float x = d[\"a\"]\n    print(x)\n",
+        );
+        lowers_ok(
+            "def main():\n    dict[int64, float64] d = {1: 1.5, 2: 2.5}\n    \
+             float x = d[1]\n    print(x)\n",
+        );
+        lowers_ok("def main():\n    auto d = {\"a\": 1.5, \"b\": 2.5}\n    print(len(d))\n");
+        lowers_ok(
+            "def main():\n    dict[str, float64] d = {\"a\": 1.5}\n    \
+             list[float64] vs = d.values()\n    print(len(vs))\n",
+        );
+    }
+
+    #[test]
+    fn float_channel_elements_lower() {
+        // channel[float64] — annotation + construction, send, receive.
+        lowers_ok(
+            "def main():\n    channel[float64] c = channel[float64](1)\n    \
+             c <- 3.5\n    float x = <-c\n    print(x)\n",
+        );
+    }
+
+    #[test]
+    fn float_heap_elements_lower() {
+        // heap[float64] — min and max direction, push/pop/peek.
+        lowers_ok(
+            "def main():\n    heap[float64] h = heap[float64]()\n    h.push(3.5)\n    \
+             h.push(1.5)\n    float x = h.pop()\n    print(x)\n",
+        );
+        lowers_ok(
+            "def main():\n    auto h = heap[float64](cmp=\"max\")\n    h.push(1.5)\n    \
+             float x = h.peek()\n    print(x)\n",
+        );
+    }
+
+    #[test]
+    fn float_keys_and_members_still_fail_to_lower() {
+        // Deferred until the hash/eq ruling (#800 Phase 2): a float dict KEY and a
+        // float set MEMBER have no hashing path, so lowering rejects them. (Sema
+        // catches these first with ZAP4027 in a full compile; this is the
+        // defense-in-depth lowering gate.)
+        lower_fails("def main():\n    dict[float64, str] d = {}\n");
+        lower_fails("def main():\n    set[float64] s = {}\n");
+    }
+
+    #[test]
+    fn f32_collection_elements_still_fail_to_lower() {
+        // `f32` collection elements stay deferred (ticket #49) in every container.
+        lower_fails("def main():\n    list[f32] xs = []\n");
+        lower_fails("def main():\n    dict[str, f32] d = {}\n");
+        lower_fails("def main():\n    heap[f32] h = heap[f32]()\n");
+        lower_fails("def main():\n    channel[f32] c = channel[f32]()\n");
     }
 }

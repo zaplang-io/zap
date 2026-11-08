@@ -1411,6 +1411,28 @@ void zap_list_set_f64(void *l, int64_t i, double v) {
 }
 int64_t zap_list_len(void *l) { return ((ZapList *)l)->len; }
 
+/* Reinterpret a `double` as the uniform 8-byte collection word and back (#800).
+ * A float dict value, channel element, or heap element shares the same storage
+ * word as an `i64` element (as `list[float]` does, I#569); these helpers carry
+ * the bits across without changing the value, and the elements are not GC
+ * pointers so the collector never follows them. */
+static int64_t zap_f64_bits(double v) {
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.d = v;
+    return u.i;
+}
+static double zap_f64_from_bits(int64_t w) {
+    union {
+        int64_t i;
+        double d;
+    } u;
+    u.i = w;
+    return u.d;
+}
+
 /* `del xs[i]` (#595): remove the element at index `i`, shifting the tail down
  * one slot. The index is normalized (negatives count from the end) and bounds-
  * checked by `zap_list_norm`, so an out-of-range `del` raises the same catchable
@@ -1817,6 +1839,39 @@ void *zap_dict_get_fn_ptr(void *dp, void *k, void *hashfn, void *eqfn) {
     return (void *)(intptr_t)zap_dict_get(dp, (int64_t)(intptr_t)k, KEY_FN);
 }
 
+/* `dict[K, float64]` — a float VALUE (#800). The value shares the uniform 8-byte
+ * word via a bit reinterpret (like `list[float]`, I#569); it is not a GC pointer,
+ * so `val_ptr` stays 0 and the collector never follows it. Hashing/equality are
+ * unaffected — only the *key* is hashed, and a float key is a separate follow-up.
+ * One setter/getter per key kind (`i64`/`str`/`fn`); a missing key reads back as
+ * `0.0` (the null word reinterpreted), matching the non-raising `i64` read. */
+void zap_dict_set_i64_f64(void *d, int64_t k, double v) {
+    zap_dict_set(d, k, KEY_I64, zap_f64_bits(v));
+}
+void zap_dict_set_str_f64(void *d, void *k, double v) {
+    ((ZapDict *)d)->key_ptr = 1;
+    zap_dict_set(d, (int64_t)(intptr_t)k, KEY_STR, zap_f64_bits(v));
+}
+void zap_dict_set_fn_f64(void *dp, void *k, double v, void *hashfn, void *eqfn) {
+    ZapDict *d = (ZapDict *)dp;
+    d->key_ptr = 1;
+    d->hashfn = hashfn;
+    d->eqfn = eqfn;
+    zap_dict_set(dp, (int64_t)(intptr_t)k, KEY_FN, zap_f64_bits(v));
+}
+double zap_dict_get_i64_f64(void *d, int64_t k) {
+    return zap_f64_from_bits(zap_dict_get(d, k, KEY_I64));
+}
+double zap_dict_get_str_f64(void *d, void *k) {
+    return zap_f64_from_bits(zap_dict_get(d, (int64_t)(intptr_t)k, KEY_STR));
+}
+double zap_dict_get_fn_f64(void *dp, void *k, void *hashfn, void *eqfn) {
+    ZapDict *d = (ZapDict *)dp;
+    d->hashfn = hashfn;
+    d->eqfn = eqfn;
+    return zap_f64_from_bits(zap_dict_get(dp, (int64_t)(intptr_t)k, KEY_FN));
+}
+
 /* `del d[k]` (#595): remove the entry for `key` by tombstoning its slot, reusing
  * the same open-addressing probe as `zap_dict_set`/`zap_dict_get`. SLOT_TOMB
  * keeps later keys on the same probe chain reachable; the slot is reclaimed on
@@ -1919,6 +1974,19 @@ void *zap_dict_values_ptr(void *dp) {
     for (int64_t i = 0; i < d->cap; i++) {
         if (d->entries[i].state == SLOT_FULL) {
             zap_list_push_ptr(out, (void *)(intptr_t)d->entries[i].val);
+        }
+    }
+    return out;
+}
+/* `.values()` of a `dict[K, float64]` (#800): snapshot the float value words into
+ * a fresh `list[float64]` via the typed float push, so the list's element tag is
+ * `f64` and read-back reinterprets each word as a `double`. */
+void *zap_dict_values_f64(void *dp) {
+    ZapDict *d = (ZapDict *)dp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->entries[i].state == SLOT_FULL) {
+            zap_list_push_f64(out, zap_f64_from_bits(d->entries[i].val));
         }
     }
     return out;
@@ -2102,8 +2170,31 @@ void *zap_set_items(void *sp) {
  * Deferred (clean follow-ups): user-struct elements ordered through a comparator
  * / `__cmp__` function pointer, float elements, and `cmp=` taking an arbitrary
  * comparator function (the surface is a direction selector for now). */
-enum { HEAP_ELEM_I64 = 0, HEAP_ELEM_STR = 1 };
+enum { HEAP_ELEM_I64 = 0, HEAP_ELEM_STR = 1, HEAP_ELEM_F64 = 2 };
 enum { HEAP_MIN = 0, HEAP_MAX = 1 };
+
+/* Total order over `double` for ordered float collections (#800). IEEE `<`/`>`
+ * leaves NaN unordered (every comparison false), which would break a heap's
+ * invariant, so NaN is defined to sort as the GREATEST value (after +inf): in a
+ * min-heap it drains last, in a max-heap first. `-0.0` and `+0.0` compare equal
+ * (as `==` already gives), so they tie. Returns -1 / 0 / +1. */
+static int64_t zap_f64_total_cmp(double a, double b) {
+    if (a < b) {
+        return -1;
+    }
+    if (a > b) {
+        return 1;
+    }
+    if (a == b) {
+        return 0; /* includes -0.0 == +0.0 */
+    }
+    /* At least one operand is NaN. */
+    int an = isnan(a), bn = isnan(b);
+    if (an && bn) {
+        return 0;
+    }
+    return an ? 1 : -1; /* NaN is greatest */
+}
 
 typedef struct {
     int64_t len;
@@ -2120,6 +2211,10 @@ static int64_t zap_heap_cmp(const ZapHeap *h, int64_t a, int64_t b) {
     int64_t c;
     if (h->kind == HEAP_ELEM_STR) {
         c = zap_str_cmp((void *)(intptr_t)a, (void *)(intptr_t)b);
+    } else if (h->kind == HEAP_ELEM_F64) {
+        /* Float elements are stored as reinterpreted words (#800); order them by
+         * IEEE value under the NaN-greatest total order. */
+        c = zap_f64_total_cmp(zap_f64_from_bits(a), zap_f64_from_bits(b));
     } else {
         c = (a < b) ? -1 : (a > b ? 1 : 0);
     }
@@ -2239,6 +2334,24 @@ void *zap_heap_peek_ptr(void *hp) {
     ZapHeap *h = (ZapHeap *)hp;
     zap_heap_require(h, "peek");
     return (void *)(intptr_t)h->data[0];
+}
+
+/* `heap[float64]` (#800): the element word is a reinterpreted `double`, ordered
+ * by `zap_f64_total_cmp` (NaN greatest). Storage and GC are identical to an
+ * `i64` heap — only the comparator differs — so these wrap the word entry points
+ * around the bit reinterpret. */
+void zap_heap_push_f64(void *h, double v) {
+    zap_heap_push_word((ZapHeap *)h, zap_f64_bits(v));
+}
+double zap_heap_pop_f64(void *hp) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "pop");
+    return zap_f64_from_bits(zap_heap_pop_word(h));
+}
+double zap_heap_peek_f64(void *hp) {
+    ZapHeap *h = (ZapHeap *)hp;
+    zap_heap_require(h, "peek");
+    return zap_f64_from_bits(h->data[0]);
 }
 
 /* Snapshot the elements into a fresh list in priority (root-first) order,
@@ -6465,6 +6578,16 @@ void *zap_chan_recv_ptr(void *ch) {
     ((ZapChan *)ch)->elem_ptr = 1;
     int ok;
     return (void *)(uintptr_t)chan_recv_word((ZapChan *)ch, &ok);
+}
+/* `channel[float64]` (#800): the element travels as a reinterpreted `double`
+ * word. It is not a GC pointer, so `elem_ptr` stays 0 and the collector never
+ * follows a buffered/in-flight float element. */
+void zap_chan_send_f64(void *ch, double v) {
+    chan_send_word((ZapChan *)ch, (uint64_t)zap_f64_bits(v));
+}
+double zap_chan_recv_f64(void *ch) {
+    int ok;
+    return zap_f64_from_bits((int64_t)chan_recv_word((ZapChan *)ch, &ok));
 }
 
 void zap_chan_close(void *ch) {

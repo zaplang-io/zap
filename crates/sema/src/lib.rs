@@ -639,21 +639,41 @@ impl Checker {
         fn is_float_name(n: &str) -> bool {
             is_f64_name(n) || matches!(n, "f32" | "float32")
         }
+        // A direct `f64`/`float` float arg in this position.
+        fn direct_f64(a: &Type) -> bool {
+            matches!(a, Type::Named { name, .. } if is_f64_name(name))
+        }
+        // A direct float arg of *any* width (`f64`/`float`/`f32`/`float32`).
+        fn direct_float(a: &Type) -> bool {
+            matches!(a, Type::Named { name, .. } if is_float_name(name))
+        }
         fn float_slots(ty: &Type) -> bool {
             match ty {
                 Type::Named { name, args, .. } => {
                     let direct = match name.as_str() {
-                        // `list[float]` / `list[f64]` is supported (I#569); an
-                        // `f32` list element is still deferred (ticket #49).
-                        "list" => args.iter().any(|a| {
-                            matches!(a, Type::Named { name, .. }
-                                if is_float_name(name) && !is_f64_name(name))
-                        }),
-                        // Floats as dict/set keys or values, or as heap/channel
-                        // elements, are not supported yet.
-                        "dict" | "set" | "heap" | "channel" => args
-                            .iter()
-                            .any(|a| matches!(a, Type::Named { name, .. } if is_float_name(name))),
+                        // `list`/`heap`/`channel`: a value or ordered-by-value
+                        // element position that admits `f64`/`float` (I#569 for
+                        // lists, #800 for heap/channel). An `f32` element is still
+                        // deferred (ticket #49), so reject a float that is not
+                        // `f64`.
+                        "list" | "heap" | "channel" => {
+                            args.iter().any(|a| direct_float(a) && !direct_f64(a))
+                        }
+                        // `dict`: the VALUE (second arg) admits `f64`/`float`
+                        // (#800); the KEY (first arg) does not yet — a float key
+                        // needs the hash/eq ruling (#800 Phase 2). `f32` stays
+                        // deferred in both positions (ticket #49). So reject any
+                        // float key, but only a non-`f64` float value.
+                        "dict" => {
+                            let key_float = args.first().is_some_and(direct_float);
+                            let value_f32 = args
+                                .get(1)
+                                .is_some_and(|a| direct_float(a) && !direct_f64(a));
+                            key_float || value_f32
+                        }
+                        // `set`: a member is a hashed key, so a float member (f64
+                        // needs the Phase 2 ruling, f32 is #49) is not supported.
+                        "set" => args.iter().any(direct_float),
                         _ => false,
                     };
                     direct || args.iter().any(float_slots)
@@ -740,11 +760,21 @@ impl Checker {
         fn unsupported(ty: &Ty) -> bool {
             let any_float = |t: &Ty| matches!(t, Ty::Float32 | Ty::Float64 | Ty::UntypedFloat);
             match ty {
-                // `list[float]` is supported (I#569); an `f32` list element
-                // (ticket #49) is still deferred.
-                Ty::List(t) => matches!(**t, Ty::Float32) || unsupported(t),
-                Ty::Set(t) | Ty::Heap(t) | Ty::Chan(t) => any_float(t) || unsupported(t),
-                Ty::Dict(k, v) => any_float(k) || any_float(v) || unsupported(k) || unsupported(v),
+                // `list`/`heap`/`channel`: a value or ordered-by-value element
+                // position that admits `f64` (I#569 for lists, #800 for
+                // heap/channel). An `f32` element (ticket #49) is still deferred.
+                Ty::List(t) | Ty::Heap(t) | Ty::Chan(t) => {
+                    matches!(**t, Ty::Float32) || unsupported(t)
+                }
+                // `set`: a hashed member — a float member (f64 needs the Phase 2
+                // ruling, f32 is #49) is not supported yet.
+                Ty::Set(t) => any_float(t) || unsupported(t),
+                // `dict`: the VALUE admits `f64` (#800) and rejects only `f32`
+                // (#49); the KEY rejects any float (a float key needs the Phase 2
+                // hash/eq ruling).
+                Ty::Dict(k, v) => {
+                    any_float(k) || matches!(**v, Ty::Float32) || unsupported(k) || unsupported(v)
+                }
                 Ty::Tuple(ts) => ts.iter().any(unsupported),
                 _ => false,
             }
@@ -7742,23 +7772,88 @@ def main():
 
     #[test]
     fn floating_collection_slots_are_diagnosed() {
-        // Floats as dict/set keys or values, or as heap/channel elements, are
-        // still unsupported, as is an `f32` list element (ticket #49). A *list*
-        // of `f64`/`float` is supported (I#569) — see the positive test below.
+        // Still unsupported after #800 Phase 1, each raising ZAP4027:
+        //   * a float dict KEY and a float set MEMBER (hashed positions) — they
+        //     need the NaN/`-0.0` hash/eq ruling (#800 Phase 2);
+        //   * an `f32` element of ANY container (ticket #49), including the
+        //     now-admitted `f64` value positions (dict value, heap, channel).
+        // Float *value* positions (`dict[_, f64]`, `heap[f64]`, `channel[f64]`)
+        // and `list[f64]` are now accepted — see `float_value_collections_ok`.
         for source in [
+            // float dict KEY / set MEMBER (f64) — Phase 2, hashing.
             "auto x = {1.5}",
             "auto x = {1.5: 1}",
-            "auto x = {1: 1.5}",
-            "auto x = channel[f64]()",
-            "auto x = heap[f64]()",
-            "list[f32] x = []",
-            "dict[str, f64] x = {}",
             "set[float] x = {}",
+            "set[f64] x = set()",
+            "dict[f64, str] x = {}",
+            "dict[float64, int64] x = {}",
+            // `f32` element — deferred everywhere (#49).
+            "list[f32] x = []",
+            "dict[str, f32] x = {}",
+            "dict[f32, str] x = {}",
+            "set[f32] x = set()",
+            "heap[f32] x = heap[f32]()",
+            "channel[f32] x = channel[f32]()",
         ] {
             let source = format!("def main():\n    {source}\n");
             assert!(
                 errors(&source).iter().any(|e| e.code == ErrorCode::ZAP4027),
-                "{source}"
+                "expected ZAP4027 for: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn float_value_collections_ok() {
+        // #800 Phase 1: `float64` is a first-class *value* in a dict value, a
+        // heap element, and a channel element (no hashing needed). Annotation and
+        // `auto`-inferred forms, every key kind, and read-back all type-check.
+        for source in [
+            // dict VALUES — str/int keys, annotated and inferred.
+            "dict[str, float64] d = {}\n    d[\"a\"] = 1.5\n    print(d[\"a\"])",
+            "dict[str, f64] d = {\"a\": 1.5}\n    print(len(d))",
+            "dict[int64, float64] d = {1: 1.5, 2: 2.5}\n    print(d[1])",
+            "auto d = {1: 1.5}\n    print(len(d))",
+            "auto d = {\"a\": 1.5, \"b\": 2.5}\n    print(len(d))",
+            "dict[str, float64] d = {\"a\": 1.5}\n    list[float64] vs = d.values()\n    print(len(vs))",
+            // heap ELEMENTS — min and max.
+            "heap[float64] h = heap[float64]()\n    h.push(1.5)\n    print(h.pop())",
+            "auto h = heap[f64](cmp=\"max\")\n    h.push(2.5)\n    print(h.peek())",
+            // channel ELEMENTS — annotation + construction, send/recv.
+            "channel[float64] c = channel[float64](1)\n    c <- 3.5\n    float x = <-c\n    print(x)",
+            "auto c = channel[f64](2)\n    c <- 1.5",
+            // nested: a list of float values is still fine (I#569).
+            "list[float64] xs = [1.0, 2.0]\n    print(len(xs))",
+        ] {
+            let source = format!("def main():\n    {source}\n");
+            assert!(
+                errors(&source).is_empty(),
+                "unexpected type errors for: {source}\n{:?}",
+                errors(&source)
+            );
+        }
+    }
+
+    #[test]
+    fn bigint_complex_collection_elements_still_rejected() {
+        // #800 lifts the *float* collection guard (ZAP4027) for value positions,
+        // but the sibling bigint/complex guard (ZAP4024) is unrelated and
+        // unchanged: bigint/complex remain unsupported as any collection
+        // element/key, in every container.
+        for source in [
+            "list[bigint] x = []",
+            "dict[str, bigint] x = {}",
+            "dict[bigint, str] x = {}",
+            "set[bigint] x = set()",
+            "heap[bigint] x = heap[bigint]()",
+            "list[complex] x = []",
+            "dict[str, complex] x = {}",
+            "channel[complex] x = channel[complex]()",
+        ] {
+            let source = format!("def main():\n    {source}\n");
+            assert!(
+                errors(&source).iter().any(|e| e.code == ErrorCode::ZAP4024),
+                "expected ZAP4024 for: {source}"
             );
         }
     }
