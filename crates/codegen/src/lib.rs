@@ -1149,6 +1149,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_umod", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_upow", &[i.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_ushr", &[i.into(), i.into()], Some(i.into()));
+        // An unsigned subscript index clamps `> INT64_MAX` to `INT64_MAX` so an
+        // overflowing `uint64`/`usize` raises IndexError instead of wrapping
+        // from the end (#552).
+        self.declare_rt("zap_uindex", &[i.into()], Some(i.into()));
 
         // Complex scalars are immutable GC objects with a pointer ABI. The
         // runtime owns construction/arithmetic so both AOT and the REPL JIT use

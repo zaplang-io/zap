@@ -1266,6 +1266,20 @@ int64_t zap_ushr(int64_t a, int64_t count) {
     }
     return (int64_t)((uint64_t)a >> (uint64_t)count);
 }
+/* Clamp an unsigned subscript index to the signed index word (#552). An
+ * unsigned index zero-extends, so it is non-negative by construction: a small
+ * width (`uint8`/`uint16`/`uint32`) always fits in `[0, 2^32)` and reaches a
+ * collection's bounds check unchanged. Only a `uint64`/`usize` can exceed
+ * `INT64_MAX`; such a value would reinterpret to a negative `int64` and be
+ * mistaken for a from-the-end index (`xs[-1]`). No real collection has `2^63`
+ * elements, so any such value is out of range: clamp it to `INT64_MAX`, which
+ * is `>=` every possible length, so the collection's own bounds check raises
+ * `IndexError` instead of silently wrapping from the end. This helper never
+ * raises; the raise happens in the normal bounds check downstream. */
+int64_t zap_uindex(int64_t i) {
+    uint64_t u = (uint64_t)i;
+    return u > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)u;
+}
 
 int64_t zap_str_len(void *s) { return ((ZapStr *)s)->len; }
 

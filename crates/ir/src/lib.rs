@@ -4336,4 +4336,54 @@ def main():
             "unsigned array index zero-extends"
         );
     }
+
+    #[test]
+    fn wide_unsigned_index_is_guarded_against_from_end_wrap() {
+        // A `uint64`/`usize` index can exceed INT64_MAX and reinterpret to a
+        // negative i64 with the same bits as a signed negative index. It must
+        // NOT be read as a from-the-end index, so lowering routes it through
+        // `zap_uindex`, which clamps overflow out of range (the bounds check
+        // then raises IndexError instead of silently wrapping from the end).
+        for ty in ["uint64", "usize"] {
+            let m = lower_main(&format!(
+                "    list[int64] xs = [10, 20, 30]\n    {ty} c = 1\n    print(xs[c])\n"
+            ));
+            assert!(
+                calls(&m, "zap_uindex"),
+                "{ty} index must be guarded by zap_uindex"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_unsigned_and_signed_indices_are_not_guarded() {
+        // `uint8`/`uint16`/`uint32` zero-extend into `[0, 2^32)` and are always
+        // non-negative, so they are safe unguarded; a signed index legitimately
+        // counts from the end. None of these is routed through `zap_uindex`.
+        for ty in ["uint8", "uint16", "uint32", "int32", "int64"] {
+            let m = lower_main(&format!(
+                "    list[int64] xs = [10, 20, 30]\n    {ty} c = 1\n    print(xs[c])\n"
+            ));
+            assert!(
+                !calls(&m, "zap_uindex"),
+                "{ty} index must not be guarded (already safe / from-the-end is intended)"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_unsigned_index_guarded_on_store_del_and_array() {
+        // The guard covers every element subscript, not just reads: list store,
+        // list `del`, and `array[uint8]` get/set.
+        let set = lower_main(
+            "    list[int64] xs = [1, 2, 3]\n    uint64 c = 0\n    xs[c] = 9\n    print(xs[c])\n",
+        );
+        assert!(calls(&set, "zap_uindex"), "list store index is guarded");
+        let del = lower_main("    list[int64] xs = [1, 2, 3]\n    usize c = 0\n    del xs[c]\n");
+        assert!(calls(&del, "zap_uindex"), "list del index is guarded");
+        let arr = lower_main(
+            "    array[uint8] buf = array[uint8]([5, 6, 7])\n    uint64 i = 0\n    buf[i] = 9\n    print(buf[i])\n",
+        );
+        assert!(calls(&arr, "zap_uindex"), "array index is guarded");
+    }
 }

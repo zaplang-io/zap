@@ -43,6 +43,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   pointer-width name; `size_t` is only the C mapping target at the FFI boundary,
   never a Zap alias (D-0019 locks "no type aliases"). **Reserves the new type
   keywords** `uint8`/`uint16`/`uint32`/`uint64`/`u8`/`u16`/`u32`/`u64`/`usize`.
+  An unsigned subscript index zero-extends and is never read as a from-the-end
+  index: a small width is a plain offset, and a `uint64`/`usize` above
+  `INT64_MAX` (e.g. `uintN(-1)`) raises a catchable `IndexError` rather than
+  silently wrapping to `xs[-1]`, even though its bits match a signed `-1`.
 - **Language correctness hardening** (epic #374, from CPython differential
   testing). Faults that were silently wrong, uncatchable, or undefined are now
   defined and catchable: `assert` raises a catchable `AssertionError` (so
