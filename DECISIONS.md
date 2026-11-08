@@ -210,6 +210,15 @@ for the maintainer to confirm/lock**):
    same-width reinterpret (`int64(u)` / `uint64(i)`) keeps the bit pattern (so
    `int64(uint64(-1)) == -1`). There is **no literal suffix** — conversions are
    the only way to produce an unsigned value, keeping the surface Python-readable.
+5. **Unsigned subscript indices never count from the end.** A signed index
+   sign-extends, so a negative value is a from-the-end index (`xs[-1]`, D-0025).
+   An unsigned index zero-extends, so it is non-negative by construction and is
+   **never** read as from-the-end — even a `uint64`/`usize` above `INT64_MAX`,
+   whose bits are identical to a signed negative index. Such an overflow exceeds
+   any possible length, so it raises a catchable `IndexError`, not a silent
+   wrap. (`uint8`/`uint16`/`uint32` fit in `[0, 2^32)` and are inherently safe;
+   only the 64-bit widths are guarded, via the runtime `zap_uindex` clamp.) This
+   keeps `uintN(-1)` and other high unsigned values honest at the subscript.
 
 Arithmetic promotes to `uint64` and wraps modulo 2^64, exactly mirroring the
 signed tower's promotion to `int64`: a narrower unsigned result comes from an
@@ -219,9 +228,10 @@ width, and `uint8(uint8(200) + uint8(100))` is `44`). `/` is true division
 (floor == truncation for non-negative operands). Collection/channel *elements* of
 an unsigned type stay unsupported for now (dense bytes have `array[uint8]`); the
 scalar surface is what the FFI epic needs. Implemented across lexer, sema
-(`ZAP4015`), ZIR lowering (unsigned op selection), codegen (`udiv`/`urem`,
-unsigned `icmp`, `lshr`, `zext`/`uitofp`/`fptoui`) and the runtime
-(`zap_u64_to_str`, `zap_udiv`/`zap_umod`/`zap_upow`/`zap_ushr`).
+(`ZAP4015`), ZIR lowering (unsigned op selection; the `zap_uindex` subscript
+guard), codegen (`udiv`/`urem`, unsigned `icmp`, `lshr`, `zext`/`uitofp`/
+`fptoui`) and the runtime (`zap_u64_to_str`, `zap_udiv`/`zap_umod`/`zap_upow`/
+`zap_ushr`, `zap_uindex`).
 
 ## D-0020 — Numeric conversions: implicit widening, explicit narrowing
 **Status:** Locked

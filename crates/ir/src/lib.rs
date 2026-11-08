@@ -4273,4 +4273,117 @@ def main():
         assert!(calls(&m, "zap_udiv"));
         assert!(calls(&m, "zap_u64_to_str"));
     }
+
+    // --- #552 follow-up: subscript indices auto-promote to the i64 index word.
+    //
+    // The index position widens every integer type to the 64-bit index word: a
+    // signed index sign-extends (so `[-1]` is from-the-end), an unsigned index
+    // zero-extends (always a non-negative offset — a high byte like 200 is never
+    // read as a negative index). These lock the extension *kind* on the index,
+    // which codegen then emits as sext/zext.
+
+    #[test]
+    fn unsigned_subscript_index_zero_extends() {
+        // A `uint16`/`uint8`/`uint32` list index zero-extends to i64 (the only
+        // SExt-vs-ZExt-distinguishing cast in the function is the index widen;
+        // the binding `uint16 c = 1` is a Trunc, not an extend).
+        for ty in ["uint8", "uint16", "uint32"] {
+            let m = lower_main(&format!(
+                "    list[int64] xs = [10, 20, 30]\n    {ty} c = 1\n    print(xs[c])\n"
+            ));
+            assert!(
+                has_cast(&m, CastKind::ZExt),
+                "{ty} index must zero-extend to the i64 index word"
+            );
+            assert!(
+                !has_cast(&m, CastKind::SExt),
+                "{ty} index must not sign-extend"
+            );
+            assert!(
+                calls(&m, "zap_list_get_i64"),
+                "the list get is still emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_subscript_index_sign_extends() {
+        // An `int32` index sign-extends, so a negative index keeps its from-the-
+        // end meaning once normalized by the runtime.
+        let m =
+            lower_main("    list[int64] xs = [10, 20, 30]\n    int32 a = 1\n    print(xs[a])\n");
+        assert!(
+            has_cast(&m, CastKind::SExt),
+            "int32 index must sign-extend to the i64 index word"
+        );
+    }
+
+    #[test]
+    fn unsigned_index_store_and_array_index_lower() {
+        // The *store* path promotes the index the same way, and `array[uint8]`
+        // indexing by an unsigned value lowers end to end (get + set).
+        lower_ok(
+            "def main():\n    list[int64] xs = [1, 2, 3]\n    uint16 c = 2\n    xs[c] = 9\n    print(xs[c])\n",
+        );
+        let a = lower_main(
+            "    array[uint8] buf = array[uint8]([5, 6, 7])\n    uint16 i = 2\n    int32 j = 1\n    buf[j] = 200\n    print(buf[i])\n",
+        );
+        assert!(calls(&a, "zap_array_get_u8"), "array get is emitted");
+        assert!(calls(&a, "zap_array_set_u8"), "array set is emitted");
+        // The unsigned array index still zero-extends.
+        assert!(
+            has_cast(&a, CastKind::ZExt),
+            "unsigned array index zero-extends"
+        );
+    }
+
+    #[test]
+    fn wide_unsigned_index_is_guarded_against_from_end_wrap() {
+        // A `uint64`/`usize` index can exceed INT64_MAX and reinterpret to a
+        // negative i64 with the same bits as a signed negative index. It must
+        // NOT be read as a from-the-end index, so lowering routes it through
+        // `zap_uindex`, which clamps overflow out of range (the bounds check
+        // then raises IndexError instead of silently wrapping from the end).
+        for ty in ["uint64", "usize"] {
+            let m = lower_main(&format!(
+                "    list[int64] xs = [10, 20, 30]\n    {ty} c = 1\n    print(xs[c])\n"
+            ));
+            assert!(
+                calls(&m, "zap_uindex"),
+                "{ty} index must be guarded by zap_uindex"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_unsigned_and_signed_indices_are_not_guarded() {
+        // `uint8`/`uint16`/`uint32` zero-extend into `[0, 2^32)` and are always
+        // non-negative, so they are safe unguarded; a signed index legitimately
+        // counts from the end. None of these is routed through `zap_uindex`.
+        for ty in ["uint8", "uint16", "uint32", "int32", "int64"] {
+            let m = lower_main(&format!(
+                "    list[int64] xs = [10, 20, 30]\n    {ty} c = 1\n    print(xs[c])\n"
+            ));
+            assert!(
+                !calls(&m, "zap_uindex"),
+                "{ty} index must not be guarded (already safe / from-the-end is intended)"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_unsigned_index_guarded_on_store_del_and_array() {
+        // The guard covers every element subscript, not just reads: list store,
+        // list `del`, and `array[uint8]` get/set.
+        let set = lower_main(
+            "    list[int64] xs = [1, 2, 3]\n    uint64 c = 0\n    xs[c] = 9\n    print(xs[c])\n",
+        );
+        assert!(calls(&set, "zap_uindex"), "list store index is guarded");
+        let del = lower_main("    list[int64] xs = [1, 2, 3]\n    usize c = 0\n    del xs[c]\n");
+        assert!(calls(&del, "zap_uindex"), "list del index is guarded");
+        let arr = lower_main(
+            "    array[uint8] buf = array[uint8]([5, 6, 7])\n    uint64 i = 0\n    buf[i] = 9\n    print(buf[i])\n",
+        );
+        assert!(calls(&arr, "zap_uindex"), "array index is guarded");
+    }
 }

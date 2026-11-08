@@ -14834,7 +14834,7 @@ impl<'a> FnLower<'a> {
         match bty {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 // --race (#684): a read of a shared heap list element, keyed on
                 // (list header, index).
                 self.emit_race_elem(bv, iv, "list element", false, span);
@@ -14878,7 +14878,7 @@ impl<'a> FnLower<'a> {
                 if it.int_width().is_none() {
                     return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
                 }
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 let dest = self.new_value(d.ty());
                 self.emit(Inst::Call {
                     dest: Some(dest),
@@ -14897,7 +14897,7 @@ impl<'a> FnLower<'a> {
             // out-of-range faults. Distinct from `str`'s codepoint indexing.
             Ty::Bytes => {
                 let (iv, it) = self.expr(index)?;
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 let d = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
                     dest: Some(d),
@@ -14911,7 +14911,7 @@ impl<'a> FnLower<'a> {
             // semantics (D-0025).
             Ty::Ptr => {
                 let (iv, it) = self.expr(index)?;
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 let d = self.new_value(Ty::Char);
                 // Out-of-range raises a catchable Zap exception (#383); use an
                 // `invoke` inside a `try` so the handler catches it.
@@ -15083,6 +15083,37 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Lower a user-supplied subscript index to the 64-bit index word, with
+    /// signedness-correct normalization of the from-the-end convention (#552).
+    ///
+    /// A signed index sign-extends, so a negative value counts from the end
+    /// (`xs[-1]`). An unsigned index zero-extends, so it is non-negative by
+    /// construction and must never be read as from-the-end: `uint8`/`uint16`/
+    /// `uint32` always fit in `[0, 2^32)` and are already safe, but a
+    /// `uint64`/`usize` above `INT64_MAX` would reinterpret to a negative
+    /// `int64` and be mistaken for a from-the-end offset. Those overflow values
+    /// are routed through `zap_uindex`, which clamps them past any possible
+    /// length so the collection's own bounds check raises `IndexError` instead
+    /// of silently returning an element from the end.
+    ///
+    /// Used by every element subscript (list/array/bytes/str get, set,
+    /// augmented assignment, and `del`). Slice bounds keep plain `i64`
+    /// coercion: a negative slice bound is a legitimate, clamped from-the-end
+    /// bound, not an error.
+    fn coerce_index(&mut self, iv: Value, it: Ty) -> Value {
+        let iv = self.coerce(iv, it, Ty::I64);
+        if it.is_unsigned() && it.int_width() == Some(64) {
+            let d = self.new_value(Ty::I64);
+            self.emit(Inst::Call {
+                dest: Some(d),
+                func: "zap_uindex".to_string(),
+                args: vec![iv],
+            });
+            return d;
+        }
+        iv
+    }
+
     fn lower_index_set(
         &mut self,
         base: &Expr,
@@ -15094,7 +15125,7 @@ impl<'a> FnLower<'a> {
         match bty {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 let (v, vt) = self.expr_collection_context(value, self.elem_ty(elem))?;
                 self.check_index_value(vt, elem, true)?;
                 let v = self.coerce(v, vt, elem.ty());
@@ -15135,7 +15166,7 @@ impl<'a> FnLower<'a> {
                 if it.int_width().is_none() {
                     return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
                 }
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 let (v, vt) = self.expr(value)?;
                 if vt.int_width().is_none() && !vt.is_float() {
                     return Err(err("array element assignment requires a numeric scalar"));
@@ -15203,7 +15234,7 @@ impl<'a> FnLower<'a> {
         match bty {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 let ety = self.elem_ty(elem);
                 // Read the current element — out-of-range raises, exactly like a
                 // bare `xs[i]` read, so this is a `throwing_call`.
@@ -15261,7 +15292,7 @@ impl<'a> FnLower<'a> {
                 if it.int_width().is_none() {
                     return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
                 }
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 let cur = self.new_value(d.ty());
                 self.emit(Inst::Call {
                     dest: Some(cur),
@@ -15396,7 +15427,7 @@ impl<'a> FnLower<'a> {
         match bty {
             Ty::List(elem) => {
                 let (iv, it) = self.expr(index)?;
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 self.check_index_value(vt, elem, true)?;
                 let v = self.coerce(v, vt, elem.ty());
                 let v = self.box_if_value(v, elem.ty());
@@ -15431,7 +15462,7 @@ impl<'a> FnLower<'a> {
                 if it.int_width().is_none() {
                     return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
                 }
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 if vt.int_width().is_none() && !vt.is_float() {
                     return Err(err("array element assignment requires a numeric scalar"));
                 }
@@ -15468,7 +15499,7 @@ impl<'a> FnLower<'a> {
         match bty {
             Ty::List(_) => {
                 let (iv, it) = self.expr(index)?;
-                let iv = self.coerce(iv, it, Ty::I64);
+                let iv = self.coerce_index(iv, it);
                 // An out-of-range index raises a catchable IndexError (#383), the
                 // same as a read `xs[i]`, so this must be an `invoke` inside a
                 // `try` for the handler to catch it.
