@@ -81,9 +81,11 @@ distinct from `list[T]`. Full N-D is the target, built incrementally (1-D → N-
 The supported Experimental subset is specified in SPEC §15 (I#476): flat
 literal construction, four dtypes, `+`/`-`/`*`, scalar broadcasting, `len`/`sum`,
 and contiguous views. Unsupported forms are diagnosed; unequal lengths raise
-`ValueError`. `list[float]` is supported (I#569, D-0100); floats as dict/set
-keys or values, or heap/channel elements, remain unsupported, as do float fields
-of tuple/struct values and `array[f64]` (which remain supported).
+`ValueError`. `list[float]` is supported (I#569, D-0100); float dict **values**,
+`heap`, and `channel` elements are supported (I#800 Phase 1, D-0137); float dict
+**keys** and `set` members remain unsupported pending a `NaN`/`-0.0` hash ruling
+(I#800 Phase 2), as do float fields of tuple/struct values; `array[f64]` remains
+supported.
 Element-wise operator overloading, broadcasting, NumPy-style slicing (slices are
 **views**, D-0030). SIMD via LLVM vector ops layered on `vec[T,N]`. See
 `design/0002-arrays.md`.
@@ -3056,6 +3058,9 @@ pointers). The list element kind gains an `Elem::F64` variant used only on the
 and direct float ordering in `sort` (sort a `list[float]` via `key=`) stay
 unsupported, as does the `f32` list element (ticket #49). Verified by the
 `scalar_float` and `list_float` goldens under the full-codegen and ARM CI jobs.
+(Later extended by I#800 / D-0137: `Elem::F64` is now also admitted as a dict
+**value** and as a `heap`/`channel` element; dict **keys** and `set` members
+still reject floats pending the Phase 2 hash ruling.)
 
 ## D-0101 — built-in field decorators `@default` / `@validate` / `@range` (I#472)
 
@@ -6060,3 +6065,55 @@ catchable `ValueError`, mirroring the public builders. Output is PKCS#8 via
 `crypto_private_key_pem.zap` (build → `key_info` → sign/verify round-trip against
 the public PEM, plus malformed-component rejection). **Experimental**, like the
 rest of `crypto`. (Decided 2026-11-08.)
+
+## D-0137 — `float64` as a collection VALUE: dict values, heap & channel elements (I#800, Phase 1)
+
+`float64`/`float` is now a first-class *value* in a dict value, a heap element,
+and a channel element — the value positions that need no hashing. This extends
+`list[float]` (I#569, D-0100) to the remaining containers whose element is only
+*stored* (dict value, channel) or *ordered by value* (heap), lifting the `ZAP4027`
+guard for those shapes:
+
+```
+dict[str, float64]   d = {}      # float VALUE — OK
+dict[int64, float64] t = {1: 1.5}
+heap[float64]        h = heap[float64]()      # cmp="min"/"max"
+channel[float64]     c = channel[float64](n)
+```
+
+Like `list[float]`, every float element reuses the **uniform 8-byte collection
+word** by reinterpreting the `double`'s bits (`zap_f64_bits`/`zap_f64_from_bits`);
+floats are not GC pointers, so the dict `val_ptr` / channel `elem_ptr` stay `0`
+and precise GC never follows them. New typed runtime entry points carry the
+`double`: `zap_dict_{set,get}_{i64,str,fn}_f64` + `zap_dict_values_f64`;
+`zap_heap_{push,pop,peek}_f64`; `zap_chan_{send,recv}_f64`. The element kind
+`Elem::F64` is admitted in these value positions through `value_elem_kind` in
+lowering; dict **keys** and set **members** still go through `elem_kind` and keep
+rejecting floats.
+
+**Heap ordering of floats.** A `heap[float64]` orders by IEEE value under a
+documented **total order** (`zap_f64_total_cmp`): `-0.0` and `+0.0` tie, and
+**every `NaN` sorts as greater than all non-`NaN` values** (so in a min-heap a
+`NaN` drains last, in a max-heap first). Defining NaN's position is required —
+IEEE `<`/`>` leave it unordered, which would break the heap invariant — so this
+is a conscious ruling, not an accident of the comparator.
+
+**Still unsupported (deliberately):**
+
+- **Float dict KEYS and set MEMBERS** (`dict[float64, _]`, `set[float64]`) need a
+  hashing + equality ruling on `NaN` (`!= itself`) and the `-0.0 == 0.0` pair.
+  Because Zap floats are value words with no object identity, Python's
+  identity-based `NaN` dict behaviour cannot be reproduced, so the ruling is a
+  genuine design choice staged as **I#800 Phase 2** (keep raising `ZAP4027` until
+  then). The recommended ruling — canonicalise `-0.0 → +0.0` and all `NaN` bit
+  patterns to one canonical `NaN`, then hash/compare by the canonical 64 bits —
+  will be recorded here when the maintainer decides.
+- **`f32`/`float32` collection elements** anywhere remain deferred (ticket #49).
+- **bigint / complex** collection elements remain rejected by the sibling guard
+  (`ZAP4024`), unrelated to this change.
+
+Verified by the `dict_float_value`, `heap_float`, and `channel_float` goldens
+(full-codegen + ARM CI), host sema coverage (`float_value_collections_ok`,
+`floating_collection_slots_are_diagnosed`, `bigint_complex_collection_elements_still_rejected`),
+and host lowering coverage (`crates/ir` `float_collection_tests`). (Decided
+2026-11-08.)

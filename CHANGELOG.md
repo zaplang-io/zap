@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`float64` collection values** (#800 Phase 1, D-0137): `float`/`float64` is now
+  a first-class element in the collection *value* positions that need no hashing —
+  a **dict value** (`dict[str, float64]`, `dict[int64, float64]`), a **heap**
+  element (`heap[float64]`, min/max), and a **channel** element
+  (`channel[float64]`) — extending `list[float]` (#569) to the remaining
+  containers. Each float reuses the uniform 8-byte collection word via a bit
+  reinterpret and is not GC-traced. A `heap[float64]` orders by a documented total
+  order where `NaN` sorts greatest. Float dict **keys** and **set** members remain
+  rejected (`ZAP4027`) pending the `NaN`/`-0.0` hash ruling (#800 Phase 2); `f32`
+  collection elements stay deferred (#49).
 - **`crypto` private-key PEM builders** (#778, D-0136): `rsa_private_key_pem(n,
   e, d, p, q, dp, dq, qi)`, `p256_private_key_pem(d)`, and
   `ed25519_private_key_pem(d)` build an unencrypted PKCS#8 `BEGIN PRIVATE KEY`
