@@ -1166,6 +1166,115 @@ impl Checker {
         // is reported once with a clear diagnostic.
         self.detect_alias_cycles(module);
         self.check_interface_refinements(module);
+        self.auto_derive_value_aggregates();
+    }
+
+    /// Register the auto-derived `Equatable`+`Hashable` pair on every qualifying
+    /// `value struct` (D-0139/#808), now that all structs/enums are collected. A
+    /// value struct auto-derives iff it declares NEITHER `__eq__` nor `__hash__`
+    /// (hand-written or `@derive`d — either one is an all-or-nothing override) and
+    /// every field is hashable ([`Self::ty_auto_hashable`]). Registering the pair
+    /// in `StructInfo` is what makes `==`/`!=`, the `Hashable` bound, and dict/set
+    /// key use resolve in sema; the field-wise method *bodies* are generated in
+    /// lowering (`crates/ir`), and the two sides share the same hashability rule.
+    /// `Comparable`/`Ord` stays explicit (ordering is a choice), and reference
+    /// structs never auto-derive (identity is their Python default, D-0023).
+    fn auto_derive_value_aggregates(&mut self) {
+        let mut to_inject: Vec<String> = Vec::new();
+        for (name, info) in &self.structs {
+            if !info.is_value
+                || info.methods.contains_key("__eq__")
+                || info.methods.contains_key("__hash__")
+            {
+                continue;
+            }
+            let fields = info.fields.clone();
+            let mut visited = HashSet::new();
+            if fields
+                .iter()
+                .all(|t| self.ty_auto_hashable(t, &mut visited))
+            {
+                to_inject.push(name.clone());
+            }
+        }
+        for name in to_inject {
+            let named = Ty::Named(name.clone());
+            if let Some(info) = self.structs.get_mut(&name) {
+                info.methods.insert(
+                    "__eq__".into(),
+                    FnSig {
+                        params: vec![param(named.clone()), param(named.clone())],
+                        ret: Ty::Bool,
+                    },
+                );
+                info.methods.insert(
+                    "__hash__".into(),
+                    FnSig {
+                        params: vec![param(named.clone())],
+                        ret: Ty::Int64,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Is `t` hashable as a field of an auto-derived value aggregate
+    /// (D-0139/#808)? The sema mirror of the lowering predicate
+    /// (`crates/ir` `field_type_hashable`): scalars (incl. float, #803),
+    /// `str`/`bytes`/`char`, a tier-1 enum, and a tuple or `value struct` all of
+    /// whose fields/elements are hashable; a struct declaring both `__eq__` and
+    /// `__hash__` (hand or `@derive`) is hashable, a partial override is not, and
+    /// a reference struct without the pair, a tier-3 enum, and every mutable
+    /// collection (`list`/`dict`/`set`/`heap`/`channel`) are not. Cycle-safe.
+    fn ty_auto_hashable(&self, t: &Ty, visited: &mut HashSet<String>) -> bool {
+        match t {
+            Ty::Int64
+            | Ty::Int32
+            | Ty::Uint8
+            | Ty::Uint16
+            | Ty::Uint32
+            | Ty::Uint64
+            | Ty::Usize
+            | Ty::Bool
+            | Ty::Char
+            | Ty::Str
+            | Ty::Bytes
+            | Ty::Float64
+            | Ty::Float32
+            | Ty::UntypedInt
+            | Ty::UntypedFloat => true,
+            Ty::Tuple(elems) => elems.iter().all(|e| self.ty_auto_hashable(e, visited)),
+            Ty::Named(n) => {
+                if let Some(e) = self.enums.get(n) {
+                    // Tier-1 enums hash as their backing int; tier-3 (sum) enums
+                    // are a value aggregate deferred to #809.
+                    return !e.is_sum;
+                }
+                if !visited.insert(n.clone()) {
+                    return true; // cycle guard (value structs cannot truly cycle)
+                }
+                let r = match self.structs.get(n) {
+                    Some(info) => {
+                        let has_eq = info.methods.contains_key("__eq__");
+                        let has_hash = info.methods.contains_key("__hash__");
+                        if has_eq && has_hash {
+                            true
+                        } else if info.is_value && !has_eq && !has_hash {
+                            info.fields
+                                .clone()
+                                .iter()
+                                .all(|f| self.ty_auto_hashable(f, visited))
+                        } else {
+                            false
+                        }
+                    }
+                    None => false,
+                };
+                visited.remove(n);
+                r
+            }
+            _ => false,
+        }
     }
 
     /// Validate `interface X: Y` refinement (D-0139/#806) at each definition
@@ -1619,9 +1728,11 @@ impl Checker {
                 .entry("to_yaml".into())
                 .or_insert_with(|| unary(Ty::Str));
         }
+        let fields = s.fields.iter().map(|f| self.resolve_type(&f.ty)).collect();
         StructInfo {
             methods,
             is_value: s.is_value,
+            fields,
         }
     }
 
@@ -2084,6 +2195,7 @@ impl Checker {
             StructInfo {
                 methods,
                 is_value: false,
+                fields: Vec::new(),
             },
         );
     }
@@ -10711,6 +10823,58 @@ def main():
         // be used as a dict key (Eq + Hash).
         ok("@derive(Eq, Hash)\nvalue struct Key:\n    int64 a\n    int64 b\n\
             def main():\n    auto k = Key(a=1, b=2)\n    auto d = {k: 10}\n    if k == k:\n        print(1)\n");
+    }
+
+    #[test]
+    fn value_struct_auto_derives_key_without_derive() {
+        // D-0139/#808: a `value struct` of all-hashable fields is usable as a dict
+        // key and set member with NO `@derive` (auto-Equatable + auto-Hashable),
+        // and does not trip the Eq-without-Hash warning (it has neither a
+        // hand-written `__eq__` nor `__hash__`). Sema models struct fields loosely,
+        // so the real auto-derivation is in lowering (`crates/ir`); here we pin
+        // that sema accepts the key/member use with no error or warning.
+        let src = "value struct P:\n    int64 x\n    str name\n\n\
+             def main():\n    dict[P, int64] d = {}\n    d[P(x=1, name=\"a\")] = 10\n    \
+             set[P] s = set[P]()\n    s.add(P(x=2, name=\"b\"))\n    print(len(d) + len(s))\n";
+        let errs = errors(src);
+        let warns = warnings_str(src);
+        assert!(
+            errs.is_empty(),
+            "no-derive value struct key should type-check: {errs:?}"
+        );
+        assert!(
+            !warns.iter().any(|w| w.message.contains("__hash__")),
+            "a value struct with neither hand __eq__ nor __hash__ must not warn: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn value_struct_auto_equality_without_derive() {
+        // D-0139/#808: `==`/`!=` resolve on a no-`@derive` value struct via the
+        // auto-synthesized `__eq__` (auto-Equatable). A nested value-struct field
+        // composes. A reference struct still needs an explicit `@derive(Eq)`.
+        ok("value struct Inner:\n    int64 a\n\n\
+            value struct P:\n    Inner i\n    int64 b\n\n\
+            def main():\n    if P(i=Inner(a=1), b=2) == P(i=Inner(a=1), b=2):\n        print(1)\n");
+        // A `value struct` with a non-hashable field does NOT auto-derive, so `==`
+        // on it is still rejected (names the operator interface).
+        let m = msgs(
+            "value struct Bag:\n    list[int64] xs\n\n\
+             def main():\n    if Bag(xs=[1]) == Bag(xs=[2]):\n        print(1)\n",
+        );
+        assert!(
+            m.contains("__eq__") && m.contains("=="),
+            "a list-field value struct must not auto-derive ==, got:\n{m}"
+        );
+        // A reference struct never auto-derives equality.
+        let r = msgs(
+            "struct R:\n    int64 x\n\n\
+             def main():\n    if R(x=1) == R(x=1):\n        print(1)\n",
+        );
+        assert!(
+            r.contains("__eq__"),
+            "reference struct must not auto-derive ==, got:\n{r}"
+        );
     }
 
     #[test]

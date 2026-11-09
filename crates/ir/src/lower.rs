@@ -1926,6 +1926,14 @@ enum ElemKey {
     /// Reference byte-buffer element (`str`/`bytes`): hash via `zap_str_hash`,
     /// compare with `zap_str_eq`.
     Str,
+    /// A `float`/`float64` (or `float32`) element (D-0139/#808): hash via the
+    /// #803 canonical key word (`zap_f64_value_key_word` — `-0.0` canonicalized,
+    /// `NaN` rejected at runtime) then `zap_i64_hash`, compare with `FCmp Eq`
+    /// (so `-0.0 == 0.0` and `NaN != NaN`). The carried `Ty` is the field width
+    /// (`F32` widens to `F64` before hashing). This makes a float a hashable
+    /// element of a value aggregate / tuple key, inheriting bare-float-key
+    /// semantics (#800/#803).
+    Float(Ty),
     /// A nested hashable aggregate (tuple, `Optional[T]`, or a `@derive(Hash,
     /// Eq)` struct): call its `(__hash__, __eq__)` by symbol name.
     Struct(String, String),
@@ -2454,6 +2462,95 @@ struct DecoratorPlan {
     json_enums: Vec<u32>,
 }
 
+/// Whether struct `sid` *declares* (hand-writes or `@derive`s) `__eq__` and
+/// `__hash__` — returned as `(has_eq, has_hash)`. Used to decide hashability of a
+/// struct-typed field (D-0139/#808): a struct that declares both is hashable
+/// outright; a `value struct` that declares NEITHER may still auto-derive the
+/// pair (if all its fields are hashable); one that declares exactly one took over
+/// the pair all-or-nothing and gets no synthesized counterpart, so it is not
+/// hashable. A tuple interner id has no AST entry → `(false, false)`.
+fn struct_decls_eq_hash(ctx: &StructCtx, module: &ast::Module, sid: u32) -> (bool, bool) {
+    let Some(name) = ctx.names.get(sid as usize) else {
+        return (false, false);
+    };
+    let Some(s) = module.items.iter().find_map(|it| match it {
+        ast::Item::Struct(s) if &s.name == name => Some(s),
+        _ => None,
+    }) else {
+        return (false, false);
+    };
+    let has_method = |m: &str| s.methods.iter().any(|f| f.name == m);
+    let derives = |t: &str| {
+        s.decorators.iter().any(|d| {
+            d.name == "derive"
+                && d.args
+                    .iter()
+                    .any(|a| matches!(&a.value, ast::Expr::Name(n, _) if n == t))
+        })
+    };
+    (
+        has_method("__eq__") || derives("Eq"),
+        has_method("__hash__") || derives("Hash"),
+    )
+}
+
+/// Is `fty` hashable as a field / element of an auto-derived value aggregate
+/// (D-0139/#808)? Mirrors [`FnLower::elem_key_plan`]'s acceptance set without
+/// synthesizing anything: integers / bool / char / enum, `str` / `bytes`, and —
+/// new in #808 — `float`/`float64`/`float32` (inheriting #803 key semantics); a
+/// tuple or an `Optional[T]` is hashable iff all its elements/payload are. A named
+/// struct is hashable iff it declares both `__eq__` and `__hash__`, or — for a
+/// `value struct` that declares neither — all its fields are hashable (so it will
+/// itself auto-derive); a partial override (exactly one of the pair) is NOT
+/// hashable, matching the all-or-nothing rule. Mutable collections
+/// (`list`/`dict`/`set`/`heap`/`channel`) are never hashable. Cycle-safe via
+/// `visited` (value structs cannot actually cycle — a separate hard error — so
+/// breaking a cycle optimistically is sound).
+fn field_type_hashable(
+    ctx: &StructCtx,
+    module: &ast::Module,
+    fty: Ty,
+    visited: &mut HashSet<u32>,
+) -> bool {
+    match fty {
+        Ty::Ptr | Ty::Bytes => true,
+        Ty::F32 | Ty::F64 => true,
+        t if t.int_width().is_some() => true,
+        Ty::Struct(sid) => {
+            if !visited.insert(sid) {
+                return true; // cycle (already in-progress) — broken optimistically
+            }
+            let is_tuple = ctx.tuples.borrow().is_tuple(sid);
+            let tuple_fields = ctx.tuples.borrow().fields(sid);
+            let ok = if is_tuple {
+                tuple_fields
+                    .map(|fs| {
+                        fs.iter()
+                            .all(|f| field_type_hashable(ctx, module, *f, visited))
+                    })
+                    .unwrap_or(false)
+            } else if let Some(opt) = optional_layout(ctx, Ty::Struct(sid)) {
+                field_type_hashable(ctx, module, opt.payload_ty, visited)
+            } else {
+                let (has_eq, has_hash) = struct_decls_eq_hash(ctx, module, sid);
+                if has_eq && has_hash {
+                    true
+                } else if ctx.is_value_struct(sid) && !has_eq && !has_hash {
+                    ctx.fields[sid as usize]
+                        .clone()
+                        .iter()
+                        .all(|(_, f)| field_type_hashable(ctx, module, *f, visited))
+                } else {
+                    false
+                }
+            };
+            visited.remove(&sid);
+            ok
+        }
+        _ => false,
+    }
+}
+
 impl DecoratorPlan {
     fn collect(
         module: &ast::Module,
@@ -2531,6 +2628,36 @@ impl DecoratorPlan {
                             reflect_meta.push((s.name.clone(), d.name.clone()));
                         }
                         // Unknown names are already rejected by sema.
+                    }
+                    // Auto-derive Equatable + Hashable for a `value struct`
+                    // (D-0139/#808): a value struct is copied-on-insert and has no
+                    // identity (D-0023/D-0051), so by-value equality is its only
+                    // coherent meaning. The pair is synthesized iff EVERY field is
+                    // hashable (conditional synthesis, Swift-style) and the user
+                    // has not taken over either half — a hand-written or explicitly
+                    // derived `__eq__`/`__hash__` (`Eq`/`Hash`) suppresses BOTH, so
+                    // the override stays all-or-nothing and the Eq-without-Hash
+                    // guard (sema ZAP5120) still applies. A non-hashable field
+                    // (e.g. a `list`) simply leaves the aggregate non-Hashable —
+                    // surfaced at key use (never here), matching Python's
+                    // unhashable-tuple-with-a-list. `Comparable`/`Ord` stays
+                    // explicit (ordering is a choice), as do reference structs.
+                    if s.is_value {
+                        let user_eq = s.methods.iter().any(|m| m.name == "__eq__")
+                            || traits.contains(&DerivedTrait::Eq);
+                        let user_hash = s.methods.iter().any(|m| m.name == "__hash__")
+                            || traits.contains(&DerivedTrait::Hash);
+                        if !user_eq && !user_hash {
+                            let mut visited = HashSet::new();
+                            let all_hashable = ctx.fields[sid as usize]
+                                .clone()
+                                .iter()
+                                .all(|(_, f)| field_type_hashable(ctx, module, *f, &mut visited));
+                            if all_hashable {
+                                traits.push(DerivedTrait::Eq);
+                                traits.push(DerivedTrait::Hash);
+                            }
+                        }
                     }
                     if !traits.is_empty() {
                         derived.push((sid, traits));
@@ -3133,7 +3260,12 @@ fn gen_eq_method(
             sid,
             idx,
         });
-        let bit = gen_field_eq(&mut b, a, c, *fty)?;
+        // Classify + compare the field through the shared structural-key plan
+        // (D-0139/#808), so a derived `__eq__` supports float and nested
+        // aggregate fields (and rejects an unhashable field with the same clean
+        // message), matching the tuple/Optional key paths.
+        let key = b.elem_key_plan(*fty)?;
+        let bit = b.emit_elem_eq(a, c, &key);
         let next = b.new_value(Ty::I1);
         b.emit(Inst::Bin {
             dest: next,
@@ -3145,52 +3277,6 @@ fn gen_eq_method(
     }
     b.set_term(Term::Ret(Some(acc)));
     Ok(b.func)
-}
-
-/// Compare one field of a derived `eq`, returning an `i1`.
-fn gen_field_eq(b: &mut FnLower, a: Value, c: Value, fty: Ty) -> Result<Value, LowerError> {
-    let bit = b.new_value(Ty::I1);
-    match fty {
-        Ty::Ptr => {
-            // Strings: content equality via the runtime (returns 1/0 as i64).
-            let word = b.new_value(Ty::I64);
-            b.emit(Inst::Call {
-                dest: Some(word),
-                func: "zap_str_eq".to_string(),
-                args: vec![a, c],
-            });
-            let zero = b.iconst(Ty::I64, 0);
-            b.emit(Inst::ICmp {
-                dest: bit,
-                pred: CmpPred::Ne,
-                lhs: word,
-                rhs: zero,
-            });
-        }
-        Ty::F32 | Ty::F64 => {
-            b.emit(Inst::FCmp {
-                dest: bit,
-                pred: CmpPred::Eq,
-                lhs: a,
-                rhs: c,
-            });
-        }
-        t if t.int_width().is_some() => {
-            b.emit(Inst::ICmp {
-                dest: bit,
-                pred: CmpPred::Eq,
-                lhs: a,
-                rhs: c,
-            });
-        }
-        other => {
-            return Err(err(format!(
-                "@derive(Eq) does not support field type {other} yet \
-                 (only scalars and str)"
-            )));
-        }
-    }
-    Ok(bit)
 }
 
 /// The Python `str`/`repr` distinction for the Display protocol (#274, D-0124).
@@ -4912,33 +4998,13 @@ fn gen_hash_method(
             sid,
             idx: idx as u32,
         });
-        let h = match *fty {
-            Ty::Ptr => {
-                let d = b.new_value(Ty::I64);
-                b.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_str_hash".to_string(),
-                    args: vec![fv],
-                });
-                d
-            }
-            t if t.int_width().is_some() => {
-                let i = b.coerce(fv, t, Ty::I64);
-                let d = b.new_value(Ty::I64);
-                b.emit(Inst::Call {
-                    dest: Some(d),
-                    func: "zap_i64_hash".to_string(),
-                    args: vec![i],
-                });
-                d
-            }
-            other => {
-                return Err(err(format!(
-                    "@derive(Hash) does not support field type {other} yet \
-                     (only integers, bools, and str)"
-                )));
-            }
-        };
+        // Classify + hash the field through the shared structural-key plan
+        // (D-0139/#808): a derived `__hash__` now supports float fields (with the
+        // #803 canonical-key / reject-NaN semantics) and nested aggregate fields,
+        // and rejects an unhashable field with the same clean message as a tuple
+        // key — the same fold used by the tuple/Optional key paths.
+        let key = b.elem_key_plan(*fty)?;
+        let h = b.emit_elem_hash(fv, *fty, &key);
         let next = b.new_value(Ty::I64);
         b.emit(Inst::Call {
             dest: Some(next),
@@ -16403,6 +16469,26 @@ impl<'a> FnLower<'a> {
             let hashn = format!("{name}__{}", "__hash__");
             let eqn = format!("{name}__{}", "__eq__");
             if !self.sigs.contains_key(&hashn) {
+                // A `value struct` without `__hash__` did not auto-derive
+                // (D-0139/#808) because some field is not hashable; name that
+                // field so the diagnostic points at the real cause, not a generic
+                // "add @derive". (A reference struct keeps the plain message —
+                // identity is its default and value-equality is an opt-in.)
+                if self.ctx.is_value_struct(sid) {
+                    let flds = self.ctx.fields[sid as usize].clone();
+                    if let Some((fname, fty)) = flds
+                        .iter()
+                        .find(|(_, fty)| self.elem_key_plan(*fty).is_err())
+                    {
+                        return Err(err(format!(
+                            "value struct '{name}' is not hashable, so it cannot be a dict key \
+                             or set element: field '{fname}' of type '{fty}' is not hashable \
+                             (D-0139/#808). A value struct auto-derives Eq/Hash only when every \
+                             field is hashable — a mutable collection (list/dict/set) or a \
+                             reference struct without '__hash__' is not."
+                        )));
+                    }
+                }
                 return Err(err(format!(
                     "type '{name}' needs '__hash__' to be a dict/set key \
                      (use @derive(Hash) or define it; D-0047)"
@@ -16446,6 +16532,121 @@ impl<'a> FnLower<'a> {
     /// referenced by `Inst::FuncAddr`, like the named-struct key path; they need
     /// no signature registration (they are only ever called indirectly by the
     /// collection runtime). Reused across every key use of the same tuple layout.
+    /// Emit the hash of one field/element given its [`ElemKey`] plan, returning an
+    /// `i64`. Shared by the tuple key path, the `Optional` key path, and the
+    /// `@derive`/auto-derived struct `__hash__` (D-0139/#808), so every structural
+    /// hash folds its fields the same way. `fty` is the field's own type (needed to
+    /// widen an integer / `f32` before hashing).
+    fn emit_elem_hash(&mut self, fv: Value, fty: Ty, key: &ElemKey) -> Value {
+        match key {
+            ElemKey::Str => {
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_str_hash".to_string(),
+                    args: vec![fv],
+                });
+                d
+            }
+            ElemKey::Int => {
+                let i = self.coerce(fv, fty, Ty::I64);
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_i64_hash".to_string(),
+                    args: vec![i],
+                });
+                d
+            }
+            ElemKey::Float(w) => {
+                // Widen `f32` to the `double` the key-word helper takes, then
+                // canonicalize `-0.0` / reject `NaN` (#803) and hash the word.
+                let f = if *w == Ty::F32 {
+                    self.coerce(fv, Ty::F32, Ty::F64)
+                } else {
+                    fv
+                };
+                let word = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(word),
+                    func: "zap_f64_value_key_word".to_string(),
+                    args: vec![f],
+                });
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_i64_hash".to_string(),
+                    args: vec![word],
+                });
+                d
+            }
+            ElemKey::Struct(ch, _) => {
+                let d = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: ch.clone(),
+                    args: vec![fv],
+                });
+                d
+            }
+        }
+    }
+
+    /// Emit the equality of one field/element pair given its [`ElemKey`] plan,
+    /// returning an `i1`. The float arm uses `FCmp Eq` (so `-0.0 == 0.0` and
+    /// `NaN != NaN`), consistent with the canonical hash. Shared by the same three
+    /// structural paths as [`Self::emit_elem_hash`].
+    fn emit_elem_eq(&mut self, a: Value, c: Value, key: &ElemKey) -> Value {
+        match key {
+            ElemKey::Str => {
+                let word = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(word),
+                    func: "zap_str_eq".to_string(),
+                    args: vec![a, c],
+                });
+                let zero = self.iconst(Ty::I64, 0);
+                let bit = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: bit,
+                    pred: CmpPred::Ne,
+                    lhs: word,
+                    rhs: zero,
+                });
+                bit
+            }
+            ElemKey::Int => {
+                let bit = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest: bit,
+                    pred: CmpPred::Eq,
+                    lhs: a,
+                    rhs: c,
+                });
+                bit
+            }
+            ElemKey::Float(_) => {
+                let bit = self.new_value(Ty::I1);
+                self.emit(Inst::FCmp {
+                    dest: bit,
+                    pred: CmpPred::Eq,
+                    lhs: a,
+                    rhs: c,
+                });
+                bit
+            }
+            ElemKey::Struct(_, ce) => {
+                let bit = self.new_value(Ty::I1);
+                self.emit(Inst::Call {
+                    dest: Some(bit),
+                    func: ce.clone(),
+                    args: vec![a, c],
+                });
+                bit
+            }
+        }
+    }
+
     fn tuple_key_fns(&mut self, sid: u32) -> Result<(String, String), LowerError> {
         if let Some(pair) = self.ctx.synth_keyfns.borrow().get(&sid) {
             return Ok(pair.clone());
@@ -16488,36 +16689,7 @@ impl<'a> FnLower<'a> {
                     sid,
                     idx: idx as u32,
                 });
-                let h = match key {
-                    ElemKey::Str => {
-                        let d = b.new_value(Ty::I64);
-                        b.emit(Inst::Call {
-                            dest: Some(d),
-                            func: "zap_str_hash".to_string(),
-                            args: vec![fv],
-                        });
-                        d
-                    }
-                    ElemKey::Int => {
-                        let i = b.coerce(fv, *fty, Ty::I64);
-                        let d = b.new_value(Ty::I64);
-                        b.emit(Inst::Call {
-                            dest: Some(d),
-                            func: "zap_i64_hash".to_string(),
-                            args: vec![i],
-                        });
-                        d
-                    }
-                    ElemKey::Struct(ch, _) => {
-                        let d = b.new_value(Ty::I64);
-                        b.emit(Inst::Call {
-                            dest: Some(d),
-                            func: ch.clone(),
-                            args: vec![fv],
-                        });
-                        d
-                    }
-                };
+                let h = b.emit_elem_hash(fv, *fty, key);
                 let next = b.new_value(Ty::I64);
                 b.emit(Inst::Call {
                     dest: Some(next),
@@ -16558,44 +16730,7 @@ impl<'a> FnLower<'a> {
                     sid,
                     idx,
                 });
-                let bit = match key {
-                    ElemKey::Str => {
-                        let word = b.new_value(Ty::I64);
-                        b.emit(Inst::Call {
-                            dest: Some(word),
-                            func: "zap_str_eq".to_string(),
-                            args: vec![a, c],
-                        });
-                        let zero = b.iconst(Ty::I64, 0);
-                        let bit = b.new_value(Ty::I1);
-                        b.emit(Inst::ICmp {
-                            dest: bit,
-                            pred: CmpPred::Ne,
-                            lhs: word,
-                            rhs: zero,
-                        });
-                        bit
-                    }
-                    ElemKey::Int => {
-                        let bit = b.new_value(Ty::I1);
-                        b.emit(Inst::ICmp {
-                            dest: bit,
-                            pred: CmpPred::Eq,
-                            lhs: a,
-                            rhs: c,
-                        });
-                        bit
-                    }
-                    ElemKey::Struct(_, ce) => {
-                        let bit = b.new_value(Ty::I1);
-                        b.emit(Inst::Call {
-                            dest: Some(bit),
-                            func: ce.clone(),
-                            args: vec![a, c],
-                        });
-                        bit
-                    }
-                };
+                let bit = b.emit_elem_eq(a, c, key);
                 let next = b.new_value(Ty::I1);
                 b.emit(Inst::Bin {
                     dest: next,
@@ -16624,6 +16759,7 @@ impl<'a> FnLower<'a> {
         Ok(match fty {
             Ty::Ptr | Ty::Bytes => ElemKey::Str,
             t if t.int_width().is_some() => ElemKey::Int,
+            Ty::F32 | Ty::F64 => ElemKey::Float(fty),
             Ty::Struct(csid) => {
                 if self.ctx.tuples.borrow().is_tuple(csid) {
                     let (ch, ce) = self.tuple_key_fns(csid)?;
@@ -16717,36 +16853,7 @@ impl<'a> FnLower<'a> {
             b.set_term(Term::Br(end_bb));
             b.position(some_bb);
             let payload = gen_opt_payload(&mut b, &opt, fv);
-            let h = match &plan {
-                ElemKey::Str => {
-                    let d = b.new_value(Ty::I64);
-                    b.emit(Inst::Call {
-                        dest: Some(d),
-                        func: "zap_str_hash".to_string(),
-                        args: vec![payload],
-                    });
-                    d
-                }
-                ElemKey::Int => {
-                    let i = b.coerce(payload, opt.payload_ty, Ty::I64);
-                    let d = b.new_value(Ty::I64);
-                    b.emit(Inst::Call {
-                        dest: Some(d),
-                        func: "zap_i64_hash".to_string(),
-                        args: vec![i],
-                    });
-                    d
-                }
-                ElemKey::Struct(ch, _) => {
-                    let d = b.new_value(Ty::I64);
-                    b.emit(Inst::Call {
-                        dest: Some(d),
-                        func: ch.clone(),
-                        args: vec![payload],
-                    });
-                    d
-                }
-            };
+            let h = b.emit_elem_hash(payload, opt.payload_ty, &plan);
             b.store(slot, h);
             b.set_term(Term::Br(end_bb));
             b.position(end_bb);
@@ -16800,44 +16907,7 @@ impl<'a> FnLower<'a> {
             b.position(both_some_bb);
             let pa = gen_opt_payload(&mut b, &opt, a);
             let pc = gen_opt_payload(&mut b, &opt, c);
-            let bit = match &plan {
-                ElemKey::Str => {
-                    let word = b.new_value(Ty::I64);
-                    b.emit(Inst::Call {
-                        dest: Some(word),
-                        func: "zap_str_eq".to_string(),
-                        args: vec![pa, pc],
-                    });
-                    let zero = b.iconst(Ty::I64, 0);
-                    let bit = b.new_value(Ty::I1);
-                    b.emit(Inst::ICmp {
-                        dest: bit,
-                        pred: CmpPred::Ne,
-                        lhs: word,
-                        rhs: zero,
-                    });
-                    bit
-                }
-                ElemKey::Int => {
-                    let bit = b.new_value(Ty::I1);
-                    b.emit(Inst::ICmp {
-                        dest: bit,
-                        pred: CmpPred::Eq,
-                        lhs: pa,
-                        rhs: pc,
-                    });
-                    bit
-                }
-                ElemKey::Struct(_, ce) => {
-                    let bit = b.new_value(Ty::I1);
-                    b.emit(Inst::Call {
-                        dest: Some(bit),
-                        func: ce.clone(),
-                        args: vec![pa, pc],
-                    });
-                    bit
-                }
-            };
+            let bit = b.emit_elem_eq(pa, pc, &plan);
             b.store(slot, bit);
             b.set_term(Term::Br(end_bb));
             b.position(end_bb);

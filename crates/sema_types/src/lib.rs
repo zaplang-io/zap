@@ -487,6 +487,11 @@ pub struct StructInfo {
     /// assign/pass/return, no shared identity), laid out inline. A plain
     /// `struct` is a reference type (D-0023) with `is_value == false`.
     pub is_value: bool,
+    /// Resolved field types in declaration order (D-0139/#808). Used to decide
+    /// whether a `value struct` auto-derives `Equatable`+`Hashable` (it does iff
+    /// every field is itself hashable). Empty is a legitimate value (a fieldless
+    /// struct).
+    pub fields: Vec<Ty>,
 }
 
 impl StructInfo {
