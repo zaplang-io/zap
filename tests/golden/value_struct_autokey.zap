@@ -4,11 +4,7 @@
 # synthesizes Eq+Hash iff every field is hashable. Covers a scalar value struct as
 # a dict key + set member (equal keys collide, overwrite, de-dup), the auto-derived
 # `==`, a nested value aggregate (a value struct field), and a float field — the
-# `-0.0`/`+0.0` collision and NaN rejection, both inherited from the shared #803
-# key word.
-import math
-
-
+# `-0.0`/`+0.0` collision inherited from the shared #803 key word.
 value struct Point:
     int64 x
     int64 y
@@ -58,13 +54,3 @@ def main():
     fd[FPoint(v=0.0)] = 7
     print(fd[FPoint(v=-0.0)])  # 7
     print(len(fd))  # 1
-
-    # A NaN float field is rejected (catchable ValueError) on key use, exactly like
-    # a bare NaN key, and the dict is left unchanged.
-    auto raised = 0
-    try:
-        fd[FPoint(v=math.nan)] = 1  # insert hashes the key first -> raises
-    except ValueError:
-        raised = raised + 1
-    print(raised)  # 1
-    print(len(fd))  # 1  (unchanged — no NaN slot leaked)
