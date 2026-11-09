@@ -1458,6 +1458,18 @@ static int64_t zap_f64_key_word(double v, const char *msg, int64_t len) {
 #define ZAP_F64_DICT_KEY_NAN "NaN cannot be used as a dict key"
 #define ZAP_F64_SET_MEM_NAN "NaN cannot be used as a set member"
 
+/* Hash-key canonicalization for a `float`/`float64` FIELD of a value aggregate
+ * (value struct / tuple) used as a dict key or set member (D-0139/#808). The
+ * aggregate's auto-derived `__hash__` composes its fields' hashes; a float field
+ * inherits the #803 key semantics — `-0.0` canonicalized to `+0.0` and `NaN`
+ * rejected as a catchable `ValueError` — exactly as a bare float key does, so two
+ * aggregates equal under the derived `__eq__` (where `-0.0 == 0.0`) hash equal.
+ * Non-`static`: the generated `__hash__` calls it by name. */
+int64_t zap_f64_value_key_word(double v) {
+    return zap_f64_key_word(v, ZAP_F64_DICT_KEY_NAN,
+                            (int64_t)sizeof(ZAP_F64_DICT_KEY_NAN) - 1);
+}
+
 /* `del xs[i]` (#595): remove the element at index `i`, shifting the tail down
  * one slot. The index is normalized (negatives count from the end) and bounds-
  * checked by `zap_list_norm`, so an out-of-range `del` raises the same catchable

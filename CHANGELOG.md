@@ -25,6 +25,23 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Value structs and tuples auto-derive `Equatable` + `Hashable`** (#808, epic
+  #812, D-0139). A `value struct` (and a tuple) now auto-derives equality and
+  hashing with **no `@derive`**, so it is usable as a `dict` key / `set` member and
+  with `==`/`!=` out of the box — because a value struct is copied-on-insert and
+  has no identity (D-0023/D-0051), by-value equality is its only coherent meaning.
+  Synthesis is **conditional**: the pair is derived iff **every field is itself
+  hashable** (recursively through nested value structs, tuples, and
+  `Optional`s); a non-hashable field (e.g. a `list`) simply leaves the aggregate
+  non-hashable, reported at key use with a message **naming the offending field**,
+  never silently. Float fields inherit the #803 key semantics (`-0.0`
+  canonicalized, `NaN` rejected at runtime). Override is **all-or-nothing**:
+  hand-writing or `@derive`-ing either `__eq__` or `__hash__` suppresses the
+  synthesized pair (and the existing Eq-without-Hash guard still applies).
+  `Comparable`/`Ord` stays explicit, and reference structs keep identity equality
+  unless they opt in. As a side effect a **float is now a hashable element** of a
+  tuple or `Optional` key too (`dict[(int64, float64), V]`, `Optional[float64]`
+  keys), consistent with bare `float64` keys (#800/#803).
 - **Interface refinement `interface X: Y`** (#806, epic #812, D-0139). An
   interface may now **refine** one or more supertypes — `interface Hashable:
   Equatable`, `interface C: A, B` — written between the body `:` and the header

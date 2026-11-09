@@ -2145,6 +2145,150 @@ mod tests {
         assert!(text.contains("funcaddr @V____eq__"), "text:\n{text}");
     }
 
+    // --- auto-derive Eq/Hash for value aggregates (D-0139/#808) ---
+
+    #[test]
+    fn value_struct_auto_derives_eq_hash_as_dict_key() {
+        // No `@derive`: a value struct of all-hashable fields auto-derives Eq+Hash
+        // and is usable as a dict key, generating `Point____hash__`/`____eq__` and
+        // routing through the function-pointer key path.
+        let m = lower_ok(
+            "value struct Point:\n    int64 x\n    int64 y\n\n\
+             def main():\n    auto d = {Point(x=1, y=2): 10}\n    print(len(d))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("funcaddr @Point____hash__"), "text:\n{text}");
+        assert!(text.contains("funcaddr @Point____eq__"), "text:\n{text}");
+        assert!(
+            m.funcs.iter().any(|f| f.name == "Point____hash__"),
+            "expected an auto-derived __hash__"
+        );
+    }
+
+    #[test]
+    fn value_struct_auto_derives_as_set_member() {
+        // The set-member position likewise accepts an auto-derived value struct.
+        let m = lower_ok(
+            "value struct P:\n    int64 x\n\n\
+             def main():\n    auto s = {P(x=1), P(x=2)}\n    print(len(s))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_set_add_fn"), "text:\n{text}");
+        assert!(text.contains("funcaddr @P____hash__"), "text:\n{text}");
+    }
+
+    #[test]
+    fn value_struct_str_field_auto_derives() {
+        // A `str` field is hashable, so a value struct mixing int + str still
+        // auto-derives and keys a dict.
+        let m = lower_ok(
+            "value struct Name:\n    str first\n    int64 id\n\n\
+             def main():\n    auto d = {Name(first=\"a\", id=1): 7}\n    print(len(d))\n",
+        );
+        assert!(
+            m.funcs.iter().any(|f| f.name == "Name____hash__"),
+            "expected auto-derived __hash__ for a str+int value struct"
+        );
+    }
+
+    #[test]
+    fn value_struct_float_field_auto_derives_via_key_word() {
+        // A float field auto-derives and hashes through the #803 canonical key
+        // word (`-0.0` canonicalized, `NaN` rejected at runtime), so the generated
+        // `__hash__` calls `zap_f64_value_key_word`.
+        let m = lower_ok(
+            "value struct Pt:\n    float64 x\n    float64 y\n\n\
+             def main():\n    auto d = {Pt(x=1.5, y=2.5): 1}\n    print(len(d))\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("@zap_f64_value_key_word"),
+            "float field hash must canonicalize via zap_f64_value_key_word; text:\n{text}"
+        );
+        assert!(text.contains("funcaddr @Pt____hash__"), "text:\n{text}");
+    }
+
+    #[test]
+    fn value_struct_nested_value_struct_field_auto_derives() {
+        // A value aggregate of value aggregates: the outer `__hash__`/`__eq__`
+        // delegate to the inner type's generated dunders (both auto-derived).
+        let m = lower_ok(
+            "value struct Inner:\n    int64 a\n\n\
+             value struct Outer:\n    Inner i\n    int64 b\n\n\
+             def main():\n    auto d = {Outer(i=Inner(a=1), b=2): 9}\n    print(len(d))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("funcaddr @Outer____hash__"), "text:\n{text}");
+        assert!(
+            m.funcs.iter().any(|f| f.name == "Inner____hash__"),
+            "the nested value struct must also auto-derive __hash__"
+        );
+        assert!(
+            text.contains("@Inner____hash__"),
+            "Outer's hash must delegate to Inner's; text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn value_struct_with_list_field_not_used_as_key_is_ok() {
+        // A value struct with a non-hashable (list) field is perfectly fine to
+        // define and use — it simply does not auto-derive Hash. Only *key use*
+        // would be an error.
+        lower_ok(
+            "value struct Bag:\n    list[int64] items\n\n\
+             def main():\n    auto b = Bag(items=[1, 2])\n    print(len(b.items))\n",
+        );
+    }
+
+    #[test]
+    fn value_struct_with_list_field_as_key_names_the_field() {
+        // Using such a value struct as a dict key is a clean error that names the
+        // offending field and its type (D-0139/#808), not a generic "add
+        // @derive".
+        let errs = lower_errs(
+            "value struct Bag:\n    list[int64] items\n\n\
+             def main():\n    auto d = {Bag(items=[1]): 1}\n",
+        );
+        assert!(!errs.is_empty(), "list-field value struct key should error");
+        assert!(
+            errs.iter().any(|e| e.message.contains("field 'items'")
+                && e.message.contains("not hashable")
+                && e.message.contains("Bag")),
+            "error should name field 'items' of value struct 'Bag', got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn hand_written_eq_suppresses_auto_hash_pair() {
+        // Override is all-or-nothing: a hand-written `__eq__` suppresses the
+        // auto-`__hash__` too, so the value struct is NOT hashable and key use
+        // reports the missing `__hash__` (the sema Eq-without-Hash warning is
+        // exercised in the sema crate).
+        let errs = lower_errs(
+            "value struct P:\n    int64 x\n\
+             \x20   def __eq__(self, P other) -> bool:\n        return self.x == other.x\n\n\
+             def main():\n    auto d = {P(x=1): 1}\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("needs '__hash__'")),
+            "a hand-written __eq__ must suppress auto-__hash__, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn reference_struct_does_not_auto_derive() {
+        // Only VALUE structs auto-derive; a reference struct (identity default,
+        // D-0023) still requires an explicit `@derive`/definition to be a key.
+        let errs = lower_errs(
+            "struct R:\n    int64 x\n\n\
+             def main():\n    auto d = {R(x=1): 1}\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("needs '__hash__'")),
+            "a reference struct must not auto-derive, got: {errs:?}"
+        );
+    }
+
     // --- tuples as dict keys / set elements (#680, D-0049) ---
 
     /// Count the generated tuple key functions in a module (`$tuple$<sid>$hash`).
@@ -2246,10 +2390,6 @@ mod tests {
         // float, a nested collection, or a struct lacking `__hash__`/`__eq__`
         // element is rejected with a clean `LowerError` — NEVER an ICE.
         for (src, needle) in [
-            (
-                "def main():\n    auto d = {(1, 1.5): 7}\n",
-                "'f64' element is not hashable",
-            ),
             (
                 "def main():\n    auto d = {(1, [2, 3]): 7}\n",
                 "is not hashable",
@@ -2499,19 +2639,20 @@ mod tests {
 
     #[test]
     fn optional_unhashable_payload_is_clean_error_not_ice() {
-        // `Optional[float]` as a key is rejected cleanly (floats are unhashable),
-        // never an ICE — the same coded diagnostic as any other unhashable key.
+        // `Optional[list[int64]]` as a key is rejected cleanly (a `list` payload is
+        // unhashable), never an ICE — the same coded diagnostic as any other
+        // unhashable key. (A float payload is now hashable — D-0139/#808 — so the
+        // unhashable example is a mutable collection.)
         let errs = lower_errs(
-            "def main():\n    dict[Optional[float], int64] d = {}\n    \
-             Optional[float] k = Optional.Some(1.5)\n    d[k] = 1\n",
+            "def main():\n    dict[Optional[list[int64]], int64] d = {}\n    \
+             Optional[list[int64]] k = Optional.Some([1, 2])\n    d[k] = 1\n",
         );
         assert!(
             !errs.is_empty(),
-            "Optional[float] key should be a clean error"
+            "Optional[list] key should be a clean error"
         );
         assert!(
-            errs.iter()
-                .any(|e| e.message.contains("'f64' element is not hashable")),
+            errs.iter().any(|e| e.message.contains("is not hashable")),
             "expected an unhashable-payload diagnostic, got: {errs:?}"
         );
     }
