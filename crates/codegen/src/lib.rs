@@ -1040,6 +1040,40 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), p.into(), p.into()],
             Some(f64t.into()),
         );
+        // dict with `float64` KEYS (#803): the key travels as a `double`, which
+        // the runtime canonicalizes (`-0.0 -> +0.0`) and NaN-rejects before
+        // storing it as an i64 word (D-0138). One setter/getter per value kind
+        // (i64 / ptr / f64).
+        self.declare_rt(
+            "zap_dict_set_f64_i64",
+            &[p.into(), f64t.into(), i.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_set_f64_ptr",
+            &[p.into(), f64t.into(), p.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_set_f64_f64",
+            &[p.into(), f64t.into(), f64t.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_dict_get_f64_i64",
+            &[p.into(), f64t.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_f64_ptr",
+            &[p.into(), f64t.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_dict_get_f64_f64",
+            &[p.into(), f64t.into()],
+            Some(f64t.into()),
+        );
         // dict key removal `del d[k]` (#595): probe for the key and tombstone the
         // slot (reusing the open-addressing probe of set/get). A missing key is a
         // no-op, matching the current non-raising dict read (`KeyError` is #22).
@@ -1051,11 +1085,16 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), p.into(), p.into()],
             None,
         );
+        // `del d[k]` for a float-keyed dict (#803): the key is canonicalized and
+        // NaN-rejected before the probe.
+        self.declare_rt("zap_dict_del_f64", &[p.into(), f64t.into()], None);
         // dict enumeration / membership / shallow copy (ticket #299). Keys and
         // values are snapshotted into a fresh list (word kind picked by codegen);
         // `contains` probes for a live key; `copy` shares referenced objects.
         self.declare_rt("zap_dict_keys_i64", &[p.into()], Some(p.into()));
         self.declare_rt("zap_dict_keys_ptr", &[p.into()], Some(p.into()));
+        // `.keys()` of a `dict[float64, V]` (#803) -> a `list[float64]`.
+        self.declare_rt("zap_dict_keys_f64", &[p.into()], Some(p.into()));
         self.declare_rt("zap_dict_values_i64", &[p.into()], Some(p.into()));
         self.declare_rt("zap_dict_values_ptr", &[p.into()], Some(p.into()));
         // `.values()` of a `dict[K, float64]` (#800) -> a `list[float64]`.
@@ -1075,12 +1114,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), p.into(), p.into()],
             Some(i.into()),
         );
+        // `k in d` for a float-keyed dict (#803): key canonicalized + NaN-rejected.
+        self.declare_rt(
+            "zap_dict_contains_f64",
+            &[p.into(), f64t.into()],
+            Some(i.into()),
+        );
         self.declare_rt("zap_dict_copy", &[p.into()], Some(p.into()));
         // set
         self.declare_rt("zap_set_new", &[], Some(p.into()));
         self.declare_rt("zap_set_len", &[p.into()], Some(i.into()));
         self.declare_rt("zap_set_add_i64", &[p.into(), i.into()], None);
         self.declare_rt("zap_set_add_str", &[p.into(), p.into()], None);
+        // `set[float64]` member (#803): the member travels as a `double`, which the
+        // runtime canonicalizes (`-0.0 -> +0.0`) and NaN-rejects (D-0138).
+        self.declare_rt("zap_set_add_f64", &[p.into(), f64t.into()], None);
         self.declare_rt(
             "zap_set_contains_i64",
             &[p.into(), i.into()],
@@ -1089,6 +1137,11 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt(
             "zap_set_contains_str",
             &[p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_set_contains_f64",
+            &[p.into(), f64t.into()],
             Some(i.into()),
         );
         // set with struct elements (operator overloading, D-0047): the element is

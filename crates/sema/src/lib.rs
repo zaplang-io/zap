@@ -651,29 +651,17 @@ impl Checker {
             match ty {
                 Type::Named { name, args, .. } => {
                     let direct = match name.as_str() {
-                        // `list`/`heap`/`channel`: a value or ordered-by-value
-                        // element position that admits `f64`/`float` (I#569 for
-                        // lists, #800 for heap/channel). An `f32` element is still
-                        // deferred (ticket #49), so reject a float that is not
-                        // `f64`.
-                        "list" | "heap" | "channel" => {
+                        // Every built-in collection now admits an `f64`/`float`
+                        // element in every position: value positions (list element
+                        // I#569, dict VALUE / heap / channel #800 Phase 1) and the
+                        // hashed/ordered positions (dict KEY, set MEMBER #800
+                        // Phase 2 / #803, canonicalised `-0.0` and NaN rejected at
+                        // runtime — D-0138). An `f32`/`float32` element stays
+                        // deferred everywhere (ticket #49), so reject only a float
+                        // that is not `f64`.
+                        "list" | "heap" | "channel" | "dict" | "set" => {
                             args.iter().any(|a| direct_float(a) && !direct_f64(a))
                         }
-                        // `dict`: the VALUE (second arg) admits `f64`/`float`
-                        // (#800); the KEY (first arg) does not yet — a float key
-                        // needs the hash/eq ruling (#800 Phase 2). `f32` stays
-                        // deferred in both positions (ticket #49). So reject any
-                        // float key, but only a non-`f64` float value.
-                        "dict" => {
-                            let key_float = args.first().is_some_and(direct_float);
-                            let value_f32 = args
-                                .get(1)
-                                .is_some_and(|a| direct_float(a) && !direct_f64(a));
-                            key_float || value_f32
-                        }
-                        // `set`: a member is a hashed key, so a float member (f64
-                        // needs the Phase 2 ruling, f32 is #49) is not supported.
-                        "set" => args.iter().any(direct_float),
                         _ => false,
                     };
                     direct || args.iter().any(float_slots)
@@ -758,22 +746,22 @@ impl Checker {
 
     fn check_float_container_value(&mut self, ty: &Ty, span: Span) {
         fn unsupported(ty: &Ty) -> bool {
-            let any_float = |t: &Ty| matches!(t, Ty::Float32 | Ty::Float64 | Ty::UntypedFloat);
             match ty {
-                // `list`/`heap`/`channel`: a value or ordered-by-value element
-                // position that admits `f64` (I#569 for lists, #800 for
-                // heap/channel). An `f32` element (ticket #49) is still deferred.
-                Ty::List(t) | Ty::Heap(t) | Ty::Chan(t) => {
+                // Every built-in collection admits an `f64` element in every
+                // position — value positions (list I#569, dict VALUE / heap /
+                // channel #800 Phase 1) and the hashed/ordered positions (dict
+                // KEY, set MEMBER #800 Phase 2 / #803, with `-0.0` canonicalised
+                // and NaN rejected at runtime — D-0138). Only an `f32`/`float32`
+                // element (`Ty::Float32`) stays deferred everywhere (ticket #49);
+                // an inferred `UntypedFloat` defaults to `f64`, so it is admitted.
+                Ty::List(t) | Ty::Heap(t) | Ty::Chan(t) | Ty::Set(t) => {
                     matches!(**t, Ty::Float32) || unsupported(t)
                 }
-                // `set`: a hashed member — a float member (f64 needs the Phase 2
-                // ruling, f32 is #49) is not supported yet.
-                Ty::Set(t) => any_float(t) || unsupported(t),
-                // `dict`: the VALUE admits `f64` (#800) and rejects only `f32`
-                // (#49); the KEY rejects any float (a float key needs the Phase 2
-                // hash/eq ruling).
                 Ty::Dict(k, v) => {
-                    any_float(k) || matches!(**v, Ty::Float32) || unsupported(k) || unsupported(v)
+                    matches!(**k, Ty::Float32)
+                        || matches!(**v, Ty::Float32)
+                        || unsupported(k)
+                        || unsupported(v)
                 }
                 Ty::Tuple(ts) => ts.iter().any(unsupported),
                 _ => false,
@@ -7772,28 +7760,25 @@ def main():
 
     #[test]
     fn floating_collection_slots_are_diagnosed() {
-        // Still unsupported after #800 Phase 1, each raising ZAP4027:
-        //   * a float dict KEY and a float set MEMBER (hashed positions) — they
-        //     need the NaN/`-0.0` hash/eq ruling (#800 Phase 2);
-        //   * an `f32` element of ANY container (ticket #49), including the
-        //     now-admitted `f64` value positions (dict value, heap, channel).
-        // Float *value* positions (`dict[_, f64]`, `heap[f64]`, `channel[f64]`)
-        // and `list[f64]` are now accepted — see `float_value_collections_ok`.
+        // After #800 Phase 2 (#803) the only float element still unsupported is
+        // an `f32`/`float32` element (ticket #49) — in EVERY container and every
+        // position, value or hashed/ordered. Each still raises ZAP4027. Every
+        // `f64` position (list element, dict key/value, set member, heap, channel)
+        // is now accepted — see `float_value_collections_ok` /
+        // `float_key_member_collections_ok`.
         for source in [
-            // float dict KEY / set MEMBER (f64) — Phase 2, hashing.
-            "auto x = {1.5}",
-            "auto x = {1.5: 1}",
-            "set[float] x = {}",
-            "set[f64] x = set()",
-            "dict[f64, str] x = {}",
-            "dict[float64, int64] x = {}",
-            // `f32` element — deferred everywhere (#49).
+            // `f32` element — deferred everywhere (#49), key and value positions.
             "list[f32] x = []",
             "dict[str, f32] x = {}",
             "dict[f32, str] x = {}",
+            "dict[f32, f32] x = {}",
             "set[f32] x = set()",
+            "set[float32] x = set()",
             "heap[f32] x = heap[f32]()",
             "channel[f32] x = channel[f32]()",
+            // `f32` nested inside an otherwise-admitted container.
+            "list[dict[f32, str]] x = []",
+            "dict[str, set[f32]] x = {}",
         ] {
             let source = format!("def main():\n    {source}\n");
             assert!(
@@ -7824,6 +7809,39 @@ def main():
             "auto c = channel[f64](2)\n    c <- 1.5",
             // nested: a list of float values is still fine (I#569).
             "list[float64] xs = [1.0, 2.0]\n    print(len(xs))",
+        ] {
+            let source = format!("def main():\n    {source}\n");
+            assert!(
+                errors(&source).is_empty(),
+                "unexpected type errors for: {source}\n{:?}",
+                errors(&source)
+            );
+        }
+    }
+
+    #[test]
+    fn float_key_member_collections_ok() {
+        // #800 Phase 2 (#803): `float64`/`float` is a first-class dict KEY and set
+        // MEMBER. Annotated and `auto`-inferred forms, construction, insert,
+        // read-back, membership, `.keys()`, `del`, and an `f64`-keyed `f64`-valued
+        // dict all type-check. (The `-0.0`/NaN semantics are a runtime concern —
+        // D-0138 — exercised by the goldens; sema only lifts the ZAP4027 guard.)
+        for source in [
+            // dict KEYS — annotated, every float spelling, with reads and del.
+            "dict[float64, str] d = {}\n    d[1.5] = \"a\"\n    print(d[1.5])",
+            "dict[f64, int64] d = {1.5: 1, 2.5: 2}\n    print(d[2.5])",
+            "dict[float, int64] d = {}\n    d[0.0] = 7\n    print(1.5 in d)\n    del d[0.0]",
+            // dict with BOTH a float key and a float value.
+            "dict[float64, float64] d = {1.5: 2.5}\n    print(d[1.5])",
+            // `.keys()` of a float-keyed dict yields a list[float64].
+            "dict[float64, str] d = {1.5: \"a\"}\n    list[float64] ks = d.keys()\n    print(len(ks))",
+            // set MEMBERS — annotated and inferred, add + membership + iterate.
+            "set[float64] s = set[float64]()\n    s.add(1.5)\n    print(1.5 in s)",
+            "set[f64] s = set[f64]()\n    s.add(0.0)\n    print(len(s))",
+            "set[float] s = {1.5, 2.5}\n    for x in s:\n        print(x)",
+            // inferred float-key dict / float set literals.
+            "auto d = {1.5: 1}\n    print(len(d))",
+            "auto s = {1.5, 2.5}\n    print(len(s))",
         ] {
             let source = format!("def main():\n    {source}\n");
             assert!(

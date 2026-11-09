@@ -35,11 +35,14 @@ pub enum Elem {
     Char,
     /// A floating-point (`f64`) element (I#569). Stored in the same uniform
     /// 8-byte word as an `i64` element — the runtime reinterprets the bits — so
-    /// it reuses the list word storage via the `_f64` entry points
-    /// (`zap_list_push_f64` / `zap_list_get_f64`), which push/return a `double`.
-    /// Only a *list* element kind today: hashed/ordered element positions (dict
-    /// and set keys, heaps) do not support floats yet, so this never reaches the
-    /// key/ordered paths.
+    /// it reuses the word storage via the `_f64` entry points
+    /// (`zap_list_push_f64` / `zap_list_get_f64`, `zap_dict_*_f64`), which
+    /// push/return a `double`. Admitted in every collection position: list
+    /// elements (I#569), dict VALUES / heap / channel (#800 Phase 1), and the
+    /// hashed dict KEY / set MEMBER positions (#800 Phase 2 / #803). In a hashed
+    /// position the runtime canonicalises `-0.0 → +0.0` and rejects NaN with a
+    /// catchable `ValueError`, then hashes/compares the canonical bits as a plain
+    /// `i64` word (D-0138).
     F64,
     /// A tier-1 enum discriminant, passed as `i64` but retaining enum identity.
     Enum(u32),
@@ -102,9 +105,9 @@ impl Elem {
             Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => "i64",
             Elem::Ptr => "str",
             Elem::Struct(_) => "fn",
-            // Floats are never a hashed *key* (dict/set keys reject floats), so
-            // this is unreachable in practice; give it a defined value rather
-            // than panicking should a future key path ask.
+            // A float dict KEY / set MEMBER (#803) routes to the `_f64` key entry
+            // points (`zap_dict_set_f64_*`, `zap_set_add_f64`, …), which take the
+            // key as a `double`, canonicalise `-0.0`, and reject NaN (D-0138).
             Elem::F64 => "f64",
             // A nested collection is unhashable (lists/dicts/sets cannot be dict
             // or set keys), so this is never reached; share the pointer-key path

@@ -2029,8 +2029,13 @@ fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
 
 /// Classify a ZIR type into the element word kind collections store. Elements
 /// are uniform 8-byte words (RUNTIME-ABI §"Collection layout"): integers/bools
-/// go in as `i64`, reference types as pointers. Floats need a separate word
-/// path and are deferred.
+/// go in as `i64`, reference types as pointers, and an `f64` as the reinterpreted
+/// `double` word ([`Elem::F64`]). `f64` is admitted in *every* collection position
+/// — value positions (list element I#569, dict VALUE / heap / channel #800
+/// Phase 1) and the hashed/ordered positions (dict KEY, set MEMBER #800 Phase 2 /
+/// #803): after `-0.0` canonicalisation and NaN rejection a float key hashes and
+/// compares as a plain `i64` word (D-0138). Only an `f32` element (ticket #49) and
+/// bigint/complex (`ZAP4024`) stay unsupported.
 fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     match t {
         // `bool` (`Ty::I1`) and `char` (`Ty::Char`) each keep their own element
@@ -2058,8 +2063,13 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         Ty::Bigint | Ty::Complex => Err(err(
             "collections of bigint or complex values are not supported yet",
         )),
-        Ty::F32 | Ty::F64 => Err(err(
-            "collections of floating-point elements are not supported yet",
+        // An `f64` element shares the uniform 8-byte word (a bit reinterpret, like
+        // `list[float]`); in a hashed/ordered position (#803) the key is
+        // canonicalised and NaN-rejected by the runtime. An `f32` element stays
+        // deferred (ticket #49).
+        Ty::F64 => Ok(Elem::F64),
+        Ty::F32 => Err(err(
+            "collections of 32-bit float (`f32`) elements are not supported yet (ticket #49)",
         )),
         // Scalar unsigned integers (#552) are supported as values, parameters,
         // returns, and C-style bitfields, but a collection/channel *element* of
@@ -2074,19 +2084,13 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
     }
 }
 
-/// Like [`elem_kind`], but admits an `f64` element as [`Elem::F64`] in a *value*
-/// position — one that stores a uniform 8-byte word and needs neither hashing nor
-/// ordering: a list element (I#569), a dict **value**, or a **channel** element
-/// (#800). `f32` (ticket #49) and every other float kind fall through to
-/// [`elem_kind`] and stay unsupported. This is never reached for a dict/set *key*
-/// or a `heap` element (which must hash or order) — those keep going through
-/// [`elem_kind`]/[`heap_elem_of`], so a float key/member is still rejected pending
-/// the hash ruling (#800 Phase 2).
+/// The element kind of a *value*-position element type — a list element (I#569),
+/// a dict **value**, or a **channel** element (#800). Now that [`elem_kind`]
+/// itself admits an `f64` in every position (#803), this is an alias of
+/// [`elem_kind`]; it is kept as a named value-position call site for the Phase 1
+/// code paths, and so the intent at those sites stays legible.
 fn value_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
-    match t {
-        Ty::F64 => Ok(Elem::F64),
-        other => elem_kind(other, nested),
-    }
+    elem_kind(t, nested)
 }
 
 /// The element kind of a `list[T]` element type (I#569): a *value* position, so a
@@ -5573,6 +5577,23 @@ impl<'a> FnLower<'a> {
     /// otherwise a plain [`Inst::Call`] (the exception, if any, unwinds through
     /// this frame to a caller's handler or to the top-level). The caller sets the
     /// terminator (e.g. `Unreachable` after `zap_panic`).
+    /// Emit a dict/set runtime call that may raise on a **NaN float key/member**
+    /// (#803, D-0138). A float dict KEY or set MEMBER operation (insert, lookup,
+    /// `in`, `del`) canonicalizes and NaN-rejects in the runtime, so when the key
+    /// kind is [`Elem::F64`] it may throw a catchable `ValueError` and must lower
+    /// through [`throwing_call`] — an `invoke` to the active landing pad inside a
+    /// `try`, a plain `call` otherwise. Every other key/member kind cannot raise
+    /// here, so it stays an ordinary non-throwing `call`. (Key *read-back* —
+    /// `zap_dict_keys_f64` — and float *values* never carry a NaN, so they are not
+    /// routed here.)
+    fn key_rt_call(&mut self, dest: Option<Value>, func: String, args: Vec<Value>, key: Elem) {
+        if key == Elem::F64 {
+            self.throwing_call(dest, &func, args);
+        } else {
+            self.emit(Inst::Call { dest, func, args });
+        }
+    }
+
     fn throwing_call(&mut self, dest: Option<Value>, func: &str, args: Vec<Value>) {
         if let Some(&lp) = self.landing_pads.last() {
             self.used_lps.insert(lp);
@@ -9679,11 +9700,7 @@ impl<'a> FnLower<'a> {
             let kfns = s.key_fn_args(ek)?;
             let mut args = vec![set, ev];
             args.extend_from_slice(&kfns);
-            s.emit(Inst::Call {
-                dest: None,
-                func: format!("zap_set_add_{}", ek.key_suffix()),
-                args,
-            });
+            s.key_rt_call(None, format!("zap_set_add_{}", ek.key_suffix()), args, ek);
             Ok(())
         };
         // Record the scope enclosing this comprehension so a walrus target in a
@@ -9874,11 +9891,12 @@ impl<'a> FnLower<'a> {
             let kfns = s.key_fn_args(kk)?;
             let mut args = vec![dict, kv, vv];
             args.extend_from_slice(&kfns);
-            s.emit(Inst::Call {
-                dest: None,
-                func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+            s.key_rt_call(
+                None,
+                format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
                 args,
-            });
+                kk,
+            );
             Ok(())
         };
         // Record the scope enclosing this comprehension so a walrus target in a
@@ -13976,11 +13994,12 @@ impl<'a> FnLower<'a> {
                     let kfns = self.key_fn_args(kk)?;
                     let mut cargs = vec![dict, kv, vv];
                     cargs.extend_from_slice(&kfns);
-                    self.emit(Inst::Call {
-                        dest: None,
-                        func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
-                        args: cargs,
-                    });
+                    self.key_rt_call(
+                        None,
+                        format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                        cargs,
+                        kk,
+                    );
                 }
                 DictItem::Spread(e) => {
                     let (src, st) = match kinds.get() {
@@ -14081,11 +14100,7 @@ impl<'a> FnLower<'a> {
             let kfns = s.key_fn_args(ek)?;
             let mut cargs = vec![set, v];
             cargs.extend_from_slice(&kfns);
-            s.emit(Inst::Call {
-                dest: None,
-                func: format!("zap_set_add_{}", ek.key_suffix()),
-                args: cargs,
-            });
+            s.key_rt_call(None, format!("zap_set_add_{}", ek.key_suffix()), cargs, ek);
             Ok(())
         };
         for el in elems {
@@ -14184,11 +14199,7 @@ impl<'a> FnLower<'a> {
             let kfns = s.key_fn_args(ek)?;
             let mut cargs = vec![set, v];
             cargs.extend_from_slice(&kfns);
-            s.emit(Inst::Call {
-                dest: None,
-                func: format!("zap_set_add_{}", ek.key_suffix()),
-                args: cargs,
-            });
+            s.key_rt_call(None, format!("zap_set_add_{}", ek.key_suffix()), cargs, ek);
             Ok(())
         })?;
         let ek = elem.get().unwrap_or(Elem::I64);
@@ -14224,11 +14235,12 @@ impl<'a> FnLower<'a> {
                 let kfns = self.key_fn_args(elem)?;
                 let mut cargs = vec![recv, v];
                 cargs.extend_from_slice(&kfns);
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_set_add_{}", elem.key_suffix()),
-                    args: cargs,
-                });
+                self.key_rt_call(
+                    None,
+                    format!("zap_set_add_{}", elem.key_suffix()),
+                    cargs,
+                    elem,
+                );
                 Ok((self.iconst(Ty::I32, 0), Ty::I32))
             }
             other => Err(err(format!("set has no method '{other}' (supported: add)"))),
@@ -14341,15 +14353,18 @@ impl<'a> FnLower<'a> {
         let key = self.coerce(kv, kt, kk.ty());
         let kfns = self.key_fn_args(kk)?;
 
-        // present = (contains(d, key) != 0)
+        // present = (contains(d, key) != 0). A float key canonicalizes + NaN-rejects
+        // in the runtime (#803), so this probe may raise; the value fetch below is
+        // reached only for a present (hence non-NaN) key, so it cannot.
         let word = self.new_value(Ty::I64);
         let mut cargs = vec![recv, key];
         cargs.extend_from_slice(&kfns);
-        self.emit(Inst::Call {
-            dest: Some(word),
-            func: format!("zap_dict_contains_{}", kk.key_suffix()),
-            args: cargs,
-        });
+        self.key_rt_call(
+            Some(word),
+            format!("zap_dict_contains_{}", kk.key_suffix()),
+            cargs,
+            kk,
+        );
         let zero = self.iconst(Ty::I64, 0);
         let present = self.new_value(Ty::I1);
         self.emit(Inst::ICmp {
@@ -14429,15 +14444,18 @@ impl<'a> FnLower<'a> {
         let (dv, dt) = self.expr(&args[1].value)?;
         let default = self.coerce(dv, dt, vk.ty());
 
-        // present = (contains(d, key) != 0)
+        // present = (contains(d, key) != 0). A float key canonicalizes + NaN-rejects
+        // in the runtime (#803), so this probe may raise; the value fetch below is
+        // reached only for a present (hence non-NaN) key, so it cannot.
         let word = self.new_value(Ty::I64);
         let mut cargs = vec![recv, key];
         cargs.extend_from_slice(&kfns);
-        self.emit(Inst::Call {
-            dest: Some(word),
-            func: format!("zap_dict_contains_{}", kk.key_suffix()),
-            args: cargs,
-        });
+        self.key_rt_call(
+            Some(word),
+            format!("zap_dict_contains_{}", kk.key_suffix()),
+            cargs,
+            kk,
+        );
         let zero = self.iconst(Ty::I64, 0);
         let present = self.new_value(Ty::I1);
         self.emit(Inst::ICmp {
@@ -14911,11 +14929,14 @@ impl<'a> FnLower<'a> {
                 let d = self.new_value(vty);
                 let mut cargs = vec![bv, kv];
                 cargs.extend_from_slice(&kfns);
-                self.emit(Inst::Call {
-                    dest: Some(d),
-                    func: format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
-                    args: cargs,
-                });
+                // A float key canonicalizes + NaN-rejects in the runtime (#803), so
+                // `d[k]` may raise a catchable ValueError on a NaN key.
+                self.key_rt_call(
+                    Some(d),
+                    format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    cargs,
+                    kk,
+                );
                 Ok((d, vty))
             }
             Ty::Array(d) => {
@@ -15205,11 +15226,14 @@ impl<'a> FnLower<'a> {
                 let kfns = self.key_fn_args(kk)?;
                 let mut cargs = vec![bv, kv, v];
                 cargs.extend_from_slice(&kfns);
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
-                    args: cargs,
-                });
+                // A float key canonicalizes + NaN-rejects in the runtime (#803), so
+                // `d[k] = v` may raise a catchable ValueError on a NaN key.
+                self.key_rt_call(
+                    None,
+                    format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    cargs,
+                    kk,
+                );
                 Ok(())
             }
             Ty::Array(d) => {
@@ -15318,11 +15342,15 @@ impl<'a> FnLower<'a> {
                 let cur = self.new_value(vty);
                 let mut gargs = vec![bv, kv];
                 gargs.extend_from_slice(&kfns);
-                self.emit(Inst::Call {
-                    dest: Some(cur),
-                    func: format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
-                    args: gargs,
-                });
+                // A float key canonicalizes + NaN-rejects in the runtime (#803), so
+                // this read may raise on a NaN key; the write-back below reuses the
+                // same (now non-NaN) key and cannot.
+                self.key_rt_call(
+                    Some(cur),
+                    format!("zap_dict_get_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    gargs,
+                    kk,
+                );
                 let (rhs, rt) = self.expr(value)?;
                 let (res, rty) = self.aug_combine(op, cur, vty, rhs, rt)?;
                 self.check_index_value(rty, vk, false)?;
@@ -15501,11 +15529,14 @@ impl<'a> FnLower<'a> {
                 let kfns = self.key_fn_args(kk)?;
                 let mut cargs = vec![bv, kv, v];
                 cargs.extend_from_slice(&kfns);
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
-                    args: cargs,
-                });
+                // A float key canonicalizes + NaN-rejects in the runtime (#803), so
+                // `d[k] = v` may raise a catchable ValueError on a NaN key.
+                self.key_rt_call(
+                    None,
+                    format!("zap_dict_set_{}_{}", kk.key_suffix(), vk.val_suffix()),
+                    cargs,
+                    kk,
+                );
                 Ok(())
             }
             Ty::Array(d) => {
@@ -15564,11 +15595,9 @@ impl<'a> FnLower<'a> {
                 let kfns = self.key_fn_args(kk)?;
                 let mut cargs = vec![bv, kv];
                 cargs.extend_from_slice(&kfns);
-                self.emit(Inst::Call {
-                    dest: None,
-                    func: format!("zap_dict_del_{}", kk.key_suffix()),
-                    args: cargs,
-                });
+                // A float key canonicalizes + NaN-rejects in the runtime (#803), so
+                // `del d[k]` may raise a catchable ValueError on a NaN key.
+                self.key_rt_call(None, format!("zap_dict_del_{}", kk.key_suffix()), cargs, kk);
                 Ok(())
             }
             _ => Err(err(
@@ -17615,11 +17644,14 @@ impl<'a> FnLower<'a> {
                 let word = self.new_value(Ty::I64);
                 let mut cargs = vec![r, l];
                 cargs.extend_from_slice(&kfns);
-                self.emit(Inst::Call {
-                    dest: Some(word),
-                    func: format!("zap_dict_contains_{}", kk.key_suffix()),
-                    args: cargs,
-                });
+                // A float key canonicalizes + NaN-rejects in the runtime (#803), so
+                // `k in d` may raise a catchable ValueError on a NaN key.
+                self.key_rt_call(
+                    Some(word),
+                    format!("zap_dict_contains_{}", kk.key_suffix()),
+                    cargs,
+                    kk,
+                );
                 let zero = self.iconst(Ty::I64, 0);
                 let d = self.new_value(Ty::I1);
                 self.emit(Inst::ICmp {
@@ -17731,11 +17763,14 @@ impl<'a> FnLower<'a> {
             let word = self.new_value(Ty::I64);
             let mut cargs = vec![r, l];
             cargs.extend_from_slice(&kfns);
-            self.emit(Inst::Call {
-                dest: Some(word),
-                func: format!("zap_set_contains_{}", elem.key_suffix()),
-                args: cargs,
-            });
+            // A float member canonicalizes + NaN-rejects in the runtime (#803), so
+            // `x in s` may raise a catchable ValueError on a NaN member.
+            self.key_rt_call(
+                Some(word),
+                format!("zap_set_contains_{}", elem.key_suffix()),
+                cargs,
+                elem,
+            );
             let zero = self.iconst(Ty::I64, 0);
             let d = self.new_value(Ty::I1);
             self.emit(Inst::ICmp {
@@ -19117,13 +19152,14 @@ fn parse_int_lit_opt(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod float_collection_tests {
-    //! Lowering coverage for `float64` as a collection element/key (#800).
+    //! Lowering coverage for `float64` as a collection element/key (#800, #803).
     //! These run on the host (no LLVM): they exercise AST→ZIR lowering directly,
     //! independent of the sema gate, so the element-storage paths are a walled
-    //! garden. Phase 1 (dict VALUES, channel, heap) must lower cleanly; the
-    //! deferred key/member shapes (float dict KEY, set member) and `f32` must
-    //! still raise a lowering error.
+    //! garden. Phase 1 (dict VALUES, channel, heap) and Phase 2 (dict KEYS, set
+    //! MEMBERS) must all lower cleanly; only an `f32` element must still raise a
+    //! lowering error.
     use super::lower_module;
+    use zapc_ir_core::Inst;
 
     fn lower_errs(src: &str) -> Vec<String> {
         let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
@@ -19131,6 +19167,26 @@ mod float_collection_tests {
         assert!(lerrs.is_empty(), "lex errors in test source: {lerrs:?}");
         let (_m, errs) = lower_module(&module);
         errs.into_iter().map(|e| format!("{e:?}")).collect()
+    }
+
+    /// The names of every `Inst::Invoke` (an unwinding call to a landing pad)
+    /// emitted anywhere in a lowered program — used to prove a float key/member
+    /// operation inside a `try` is catchable.
+    fn invoke_funcs(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty(), "parse errors in test source: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors in test source: {lerrs:?}");
+        let (m, errs) = lower_module(&module);
+        assert!(errs.is_empty(), "unexpected lowering errors: {errs:?}");
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Invoke { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn lowers_ok(src: &str) {
@@ -19187,13 +19243,87 @@ mod float_collection_tests {
     }
 
     #[test]
-    fn float_keys_and_members_still_fail_to_lower() {
-        // Deferred until the hash/eq ruling (#800 Phase 2): a float dict KEY and a
-        // float set MEMBER have no hashing path, so lowering rejects them. (Sema
-        // catches these first with ZAP4027 in a full compile; this is the
-        // defense-in-depth lowering gate.)
-        lower_fails("def main():\n    dict[float64, str] d = {}\n");
-        lower_fails("def main():\n    set[float64] s = {}\n");
+    fn float_keys_and_members_lower() {
+        // #800 Phase 2 (#803): a float dict KEY and a float set MEMBER lower to
+        // the `_f64` key entry points (canonicalise `-0.0`, reject NaN — D-0138).
+        // Construct, insert, read-back, membership, `.keys()`, `del`, and an
+        // f64-keyed f64-valued dict all lower cleanly.
+        lowers_ok(
+            "def main():\n    dict[float64, str] d = {}\n    d[1.5] = \"a\"\n    \
+             str x = d[1.5]\n    print(x)\n",
+        );
+        lowers_ok(
+            "def main():\n    dict[float64, int64] d = {1.5: 1, 2.5: 2}\n    \
+             print(1.5 in d)\n    del d[1.5]\n",
+        );
+        lowers_ok(
+            "def main():\n    dict[float64, float64] d = {1.5: 2.5}\n    \
+             float x = d[1.5]\n    print(x)\n",
+        );
+        lowers_ok(
+            "def main():\n    dict[float64, str] d = {1.5: \"a\"}\n    \
+             list[float64] ks = d.keys()\n    print(len(ks))\n",
+        );
+        lowers_ok(
+            "def main():\n    set[float64] s = set[float64]()\n    s.add(1.5)\n    \
+             print(1.5 in s)\n",
+        );
+        lowers_ok("def main():\n    auto s = {1.5, 2.5}\n    print(len(s))\n");
+        lowers_ok("def main():\n    auto d = {1.5: 1}\n    print(len(d))\n");
+    }
+
+    #[test]
+    fn float_key_ops_in_try_lower_to_invoke() {
+        // A float key/member op raises a *catchable* ValueError on a NaN key
+        // (D-0138), so inside a `try` it MUST lower to an `Inst::Invoke` wired to a
+        // landing pad — a plain `call` would unwind straight past the handler and
+        // `terminate`. This is the regression guard for that wiring (the host
+        // analogue of the `dict_float_key`/`set_float_member` goldens): each op,
+        // wrapped in a `try`, appears among the program's invokes.
+        let cases = [
+            // insert, lookup, membership, delete on a float-keyed dict.
+            (
+                "d[1.5] = 5",
+                "zap_dict_set_f64_i64",
+                "dict[float64, int64] d = {}",
+            ),
+            (
+                "int64 x = d[1.5]",
+                "zap_dict_get_f64_i64",
+                "dict[float64, int64] d = {1.5: 1}",
+            ),
+            (
+                "bool b = 1.5 in d",
+                "zap_dict_contains_f64",
+                "dict[float64, int64] d = {}",
+            ),
+            (
+                "del d[1.5]",
+                "zap_dict_del_f64",
+                "dict[float64, int64] d = {1.5: 1}",
+            ),
+            // add and membership on a float set.
+            (
+                "s.add(1.5)",
+                "zap_set_add_f64",
+                "set[float64] s = set[float64]()",
+            ),
+            (
+                "bool b = 1.5 in s",
+                "zap_set_contains_f64",
+                "set[float64] s = set[float64]()",
+            ),
+        ];
+        for (op, want, setup) in cases {
+            let src = format!(
+                "def main():\n    {setup}\n    try:\n        {op}\n    except ValueError:\n        print(\"caught\")\n"
+            );
+            let invokes = invoke_funcs(&src);
+            assert!(
+                invokes.iter().any(|f| f == want),
+                "expected `{want}` to lower to an Invoke inside the try for:\n{src}\ngot invokes: {invokes:?}"
+            );
+        }
     }
 
     #[test]

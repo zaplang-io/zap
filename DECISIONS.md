@@ -6117,3 +6117,60 @@ Verified by the `dict_float_value`, `heap_float`, and `channel_float` goldens
 `floating_collection_slots_are_diagnosed`, `bigint_complex_collection_elements_still_rejected`),
 and host lowering coverage (`crates/ir` `float_collection_tests`). (Decided
 2026-11-08.)
+
+## D-0138 — `float64` as a dict KEY and set MEMBER: reject-NaN semantics (I#803, I#800 Phase 2)
+
+`float64`/`float` is now a first-class **dict key** and **`set` member**,
+completing I#800 — the hashed positions D-0137 deferred pending a ruling on `NaN`
+and `-0.0`:
+
+```
+dict[float64, str] prices = {}   # float KEY — OK
+set[float64]       seen   = set()
+```
+
+**Equality / hashing ruling (reject-NaN).**
+
+- **Finite floats:** a float key/member is canonicalised **`-0.0 → +0.0`** before
+  it is stored, hashed, or compared, so `0.0` and `-0.0` collide to a single
+  key/member (Python `==` parity). After canonicalisation a float's IEEE bits are
+  hashed and compared as a plain `i64` word (`KEY_I64`): with `-0.0` collapsed and
+  `NaN` excluded, float equality **is** bit-equality, so the existing integer-key
+  hash/probe machinery is reused unchanged — no new keykind, no per-element
+  comparator.
+- **`NaN`:** **rejected at runtime** on *any* use as a dict key or set member —
+  insert, lookup (`d[k]`), membership (`in`), and `del d[k]` each raise a
+  **catchable `ValueError`** (`zap_panic_typed(ZAP_EXC_VALUE_ERROR, …)`, the same
+  mechanism as float division-by-zero and negative shift counts), with the message
+  `"NaN cannot be used as a dict key"` / `"NaN cannot be used as a set member"`.
+  There is **no** silent `NaN` slot and it is **not** a process abort.
+
+**Rationale.** Python's `nan != nan` dict behaviour relies on *object identity* —
+a `nan` inserted under one object is findable only via that same object. Zap
+floats are value words with no identity, so replicating it would leak an
+unreachable, unremovable entry on every `nan` insert. Rejecting `NaN` keeps the
+hashed positions total and well-defined. Under the longer-term capability/bounds
+framing (Discussion I#801) this is simply the `Hashable`/`Equatable` semantics of
+`float64`.
+
+**Mechanism.** The canonicalise-and-reject step is a single runtime helper
+(`zap_f64_key_word`) shared by every float key/member entry point:
+`zap_dict_{set,get}_f64_{i64,ptr,f64}`, `zap_dict_{del,contains,keys}_f64`, and
+`zap_set_{add,contains}_f64`. The key travels as a `double` and the stored word is
+its canonical bits; `key_ptr`/`elem_ptr` stay `0` (a float is not a GC pointer).
+Lowering now classifies a `Ty::F64` key/member as `Elem::F64` directly in
+`elem_kind` (its `val_suffix`/`key_suffix` are already `f64`), so with D-0137's
+value positions `float64` is admitted in **every** collection position; only
+`f32`/`float32` (ticket #49) and bigint/complex (`ZAP4024`) stay rejected.
+
+**Sets have no element removal** today (`set` supports construct / `add` / `in` /
+iterate / `len`), so the `NaN`-on-delete rule is exercised through the dict `del`
+path; it applies to a future `set.discard`/`set.remove` by construction (same
+helper).
+
+Verified by the `dict_float_key` and `set_float_member` goldens (construct,
+insert, read-back, update, `del`, `-0.0`/`0.0` collision, `NaN` rejection caught
+via `try/except ValueError`, iteration), host sema coverage
+(`float_key_member_collections_ok`, the trimmed `floating_collection_slots_are_diagnosed`
+f32-only negatives, `bigint_complex_collection_elements_still_rejected`), and host
+lowering coverage (`crates/ir` `float_collection_tests`). (Decided 2026-11-09.)

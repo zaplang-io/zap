@@ -216,7 +216,7 @@ non-ASCII fill (SPEC §9.3, ZAP2017/ZAP4026); mixing positional after keyword;
 | bool | `test_bool` | C `bool_strict_value`; G `scalars`; D `boolean_flow` | **Divergent**: `bool` is a distinct type, not an `int` (D-0022 strict bool) | THIN / N/A-divergent | `True + 1`, `True == 1`, `sum([True, True])`, `~True`, `True & False`, `str(True)`, `bool & int` — assert Zap's *chosen* behavior (compile error vs value); `int(True)`, `bool("")`, `bool(0.0)`, `bool(nan)` ⇒ `True` |
 | Mixed-type coercion / widening ladder | `test_binop`, `test_numeric_tower` | NUM-7 **TODO**; G `int32_decimal`, `scalar_int` | Zap: implicit widening only, narrowing explicit (D-0020) | MISSING | `int32 + int64`, `int32` overflow wrap, `int + float`, `float32` vs `float64` rounding, `char` arithmetic, comparison across widths, narrowing without cast ⇒ compile error |
 | Numeric conversions to text | `test_format` | STR-1 covered, STR-6 TODO | — | THIN | see §5.2 |
-| Hash/equality across numeric types (`hash(1)==hash(1.0)`) | `test_hash`, `test_dict` | — | N/A (static key types; float keys rejected — G `optional_float_key_reject`) | N/A-divergent | pin: `dict[int64,…]` lookup with a float key ⇒ compile error |
+| Hash/equality across numeric types (`hash(1)==hash(1.0)`) | `test_hash`, `test_dict` | G `dict_float_key`, `set_float_member` (#803) | N/A (static key types; a `float64` key/member is its own type — `-0.0`/`+0.0` collide, `NaN` raises a catchable `ValueError`, D-0138) | N/A-divergent | an `int64` key and a `float64` key are distinct key *types* (no cross-type `1 == 1.0` lookup); `dict[int64,…]` indexed by a float still mismatches the key type |
 
 ---
 

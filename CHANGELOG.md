@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`float64` dict keys and set members** (#803 / #800 Phase 2, D-0138): `float`/
+  `float64` is now a first-class **dict key** (`dict[float64, V]`) and **`set`
+  member** (`set[float64]`), completing #800. A float key/member is canonicalised
+  `-0.0 → +0.0` (so `0.0` and `-0.0` collide to one slot — Python `==` parity) and
+  then hashed/compared as its IEEE bits; `NaN` is **rejected at runtime** on every
+  key operation — insert, lookup, `in`, and `del` each raise a **catchable
+  `ValueError`** (`"NaN cannot be used as a dict key"` / `"... as a set member"`),
+  never a silent slot or an abort. With #800 Phase 1 this makes `float64` usable
+  in every collection position; only `f32` collection elements stay deferred (#49)
+  and bigint/complex stay rejected (`ZAP4024`).
 - **`float64` collection values** (#800 Phase 1, D-0137): `float`/`float64` is now
   a first-class element in the collection *value* positions that need no hashing —
   a **dict value** (`dict[str, float64]`, `dict[int64, float64]`), a **heap**
@@ -32,9 +42,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   (`channel[float64]`) — extending `list[float]` (#569) to the remaining
   containers. Each float reuses the uniform 8-byte collection word via a bit
   reinterpret and is not GC-traced. A `heap[float64]` orders by a documented total
-  order where `NaN` sorts greatest. Float dict **keys** and **set** members remain
-  rejected (`ZAP4027`) pending the `NaN`/`-0.0` hash ruling (#800 Phase 2); `f32`
-  collection elements stay deferred (#49).
+  order where `NaN` sorts greatest. (Float dict **keys** and **set** members
+  followed in #800 Phase 2 — see above; `f32` collection elements stay deferred,
+  #49.)
 - **`crypto` private-key PEM builders** (#778, D-0136): `rsa_private_key_pem(n,
   e, d, p, q, dp, dq, qi)`, `p256_private_key_pem(d)`, and
   `ed25519_private_key_pem(d)` build an unencrypted PKCS#8 `BEGIN PRIVATE KEY`
