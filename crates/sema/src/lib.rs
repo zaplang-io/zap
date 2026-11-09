@@ -1026,6 +1026,11 @@ impl Checker {
     // --- collection passes ---
 
     fn collect_types(&mut self, module: &Module) {
+        // The compiler-known capability interfaces (D-0139/#806) exist before any
+        // user item, so a `[K: Hashable]` bound or a conformance check resolves
+        // even in a module that never declares them. A user interface of the same
+        // name (declared below) overwrites, keeping the names in the user's hands.
+        self.register_builtin_capabilities();
         // First register every type name so field/payload types (which may
         // reference a type declared later, or the enum itself — a recursive
         // variant, D-0046) resolve in the second pass.
@@ -1137,6 +1142,99 @@ impl Checker {
         // so `resolve_type` yields `Unknown` instead of looping, and each cycle
         // is reported once with a clear diagnostic.
         self.detect_alias_cycles(module);
+        self.check_interface_refinements(module);
+    }
+
+    /// Validate `interface X: Y` refinement (D-0139/#806) at each definition
+    /// site, now that every interface name is registered:
+    ///   * each supertype must name an **interface** (ZAP4081);
+    ///   * a supertype may not be listed **twice** (ZAP4083);
+    ///   * refinement must be **acyclic** — no interface may refine, directly or
+    ///     transitively, back to itself (ZAP4082).
+    ///
+    /// The built-in capability interfaces are well-formed by construction, so only
+    /// user `interface` items are checked here.
+    fn check_interface_refinements(&mut self, module: &Module) {
+        // Diagnostics are collected first (immutable borrows of `self`), then
+        // emitted, so the interfaces map is not borrowed while `self.error` runs.
+        let mut diags: Vec<(ErrorCode, String, Span)> = Vec::new();
+        for item in &module.items {
+            let Item::Interface(i) = item else { continue };
+            // Non-interface / unknown supertype, and duplicate supertype. A
+            // supertype `type` that is not a plain `Named` (a tuple or fn type)
+            // is likewise not an interface.
+            let mut seen: HashSet<String> = HashSet::new();
+            for sup in &i.supertypes {
+                let (name, span) = match sup {
+                    Type::Named { name, span, .. } => (name.clone(), *span),
+                    Type::Tuple { span, .. } | Type::Func { span, .. } => {
+                        diags.push((
+                            ErrorCode::ZAP4081,
+                            format!("interface '{}' cannot refine a non-interface type", i.name),
+                            *span,
+                        ));
+                        continue;
+                    }
+                };
+                if !seen.insert(name.clone()) {
+                    diags.push((
+                        ErrorCode::ZAP4083,
+                        format!(
+                            "interface '{}' lists supertype '{name}' more than once",
+                            i.name
+                        ),
+                        span,
+                    ));
+                    continue;
+                }
+                if !self.is_interface(&name) {
+                    diags.push((
+                        ErrorCode::ZAP4081,
+                        format!(
+                            "interface '{}' cannot refine '{name}': '{name}' is not an \
+                             interface",
+                            i.name
+                        ),
+                        span,
+                    ));
+                }
+            }
+            // Cyclic refinement: can `i` reach itself through the supertype graph?
+            if self.refinement_reaches(&i.name, &i.name) {
+                diags.push((
+                    ErrorCode::ZAP4082,
+                    format!("interface '{}' refines itself (cyclic refinement)", i.name),
+                    i.span,
+                ));
+            }
+        }
+        for (code, msg, span) in diags {
+            self.error(code, msg, span);
+        }
+    }
+
+    /// Does interface `from` reach `target` by following refined supertypes one or
+    /// more edges (D-0139/#806)? Used to detect cyclic refinement; cycle-safe via
+    /// a visited set so the walk itself cannot loop.
+    fn refinement_reaches(&self, from: &str, target: &str) -> bool {
+        let mut visited = HashSet::new();
+        let mut stack: Vec<String> = self
+            .interfaces
+            .get(from)
+            .map(|i| i.supertypes.clone())
+            .unwrap_or_default();
+        while let Some(cur) = stack.pop() {
+            if cur == target {
+                return true;
+            }
+            if !visited.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(iface) = self.interfaces.get(&cur) {
+                stack.extend(iface.supertypes.iter().cloned());
+            }
+        }
+        false
     }
 
     /// Mark every alias that lies on a definition cycle and report it (#606,
@@ -1184,6 +1282,54 @@ impl Checker {
         }
     }
 
+    /// Register the compiler-known **capability interfaces** (D-0139/#806):
+    /// `Equatable`, `Hashable`, and `Comparable`, the adjectival vocabulary a
+    /// built-in collection's element requirement is a bound on. `Hashable` and
+    /// `Comparable` each **refine** `Equatable`: the `Hashable` contract is
+    /// defined relative to equality (`a == b ⟹ hash(a) == hash(b)`), and a
+    /// `Comparable` type is `Equatable` for free (`__cmp__ == 0` yields equality).
+    /// The self-referential dunders leave their `other` parameter untyped so a
+    /// conforming type's own concrete `other` matches (see [`sigs_match`]). These
+    /// are *definitions only* here; wiring them into the container element guards
+    /// is a later epic phase (#807).
+    fn register_builtin_capabilities(&mut self) {
+        let iface = |name: &str,
+                     method: Option<(&str, FnSig)>,
+                     supertypes: &[&str]|
+         -> (String, InterfaceInfo) {
+            (
+                name.to_string(),
+                InterfaceInfo {
+                    methods: method
+                        .into_iter()
+                        .map(|(n, s)| (n.to_string(), s))
+                        .collect(),
+                    supertypes: supertypes.iter().map(|s| s.to_string()).collect(),
+                },
+            )
+        };
+        let eq_sig = FnSig {
+            params: vec![param(Ty::Named("Equatable".into())), param(Ty::Unknown)],
+            ret: Ty::Bool,
+        };
+        let hash_sig = FnSig {
+            params: vec![param(Ty::Named("Hashable".into()))],
+            ret: Ty::Int64,
+        };
+        let cmp_sig = FnSig {
+            params: vec![param(Ty::Named("Comparable".into())), param(Ty::Unknown)],
+            ret: Ty::Int64,
+        };
+        for (name, info) in [
+            iface("Equatable", Some(("__eq__", eq_sig)), &[]),
+            iface("Hashable", Some(("__hash__", hash_sig)), &["Equatable"]),
+            iface("Comparable", Some(("__cmp__", cmp_sig)), &["Equatable"]),
+        ] {
+            self.user_types.insert(name.clone());
+            self.interfaces.insert(name, info);
+        }
+    }
+
     /// Build an interface's [`InterfaceInfo`] (D-0016): resolve each declared
     /// method signature, in declaration order. `self` is typed as the interface
     /// itself; the remaining parameter and return types are resolved normally.
@@ -1193,7 +1339,22 @@ impl Checker {
             .iter()
             .map(|m| (m.name.clone(), self.sig_of_method_sig(m, &i.name)))
             .collect();
-        InterfaceInfo { methods }
+        // Refined supertypes (D-0139/#806): record each named supertype. Only a
+        // plain `Named` type can name an interface; anything else is validated and
+        // reported in `check_interface_refinements`, so here it is recorded by the
+        // name it writes (or ignored when it has none).
+        let supertypes = i
+            .supertypes
+            .iter()
+            .filter_map(|t| match t {
+                Type::Named { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        InterfaceInfo {
+            methods,
+            supertypes,
+        }
     }
 
     /// Resolve an interface [`MethodSig`] to a [`FnSig`] (its `self` typed as the
@@ -1254,6 +1415,23 @@ impl Checker {
         }
     }
 
+    /// A parenthetical explaining *why* a struct→interface coercion failed, for
+    /// appending to a type-mismatch diagnostic. Empty unless `to` is an interface
+    /// and `from` a struct that does not conform; otherwise it lists the concrete
+    /// reasons, which name the refined supertype when the missing method comes
+    /// from one (D-0139/#806), e.g. "missing method '__eq__' (required by
+    /// supertype 'Equatable')".
+    fn conformance_detail(&self, from: &Ty, to: &Ty) -> String {
+        if let (Ty::Named(s), Ty::Named(i)) = (from, to) {
+            if self.is_interface(i) {
+                if let Err(reasons) = self.conforms(s, i) {
+                    return format!(" ({s} does not satisfy '{i}': {})", reasons.join("; "));
+                }
+            }
+        }
+        String::new()
+    }
+
     /// Check that struct `sname` structurally conforms to interface `iname`
     /// (D-0016): every interface method is present with a matching signature
     /// (parameter types excluding `self`, and return type). On failure, returns
@@ -1261,19 +1439,28 @@ impl Checker {
     /// precise diagnostic. A non-struct `sname` (e.g. not yet registered) simply
     /// fails to conform.
     fn conforms(&self, sname: &str, iname: &str) -> Result<(), Vec<String>> {
-        let Some(iface) = self.interfaces.get(iname) else {
+        if !self.interfaces.contains_key(iname) {
             return Err(vec![format!("'{iname}' is not an interface")]);
-        };
+        }
         let Some(st) = self.structs.get(sname) else {
             return Err(vec![format!("'{sname}' is not a struct")]);
         };
+        // Refinement (D-0139/#806): conformance to `iname` requires every method
+        // of `iname` *and* of all its transitive supertypes. A method missing
+        // because of a supertype names that supertype in the diagnostic, so
+        // "satisfies `Hashable` but not `Equatable`" points at `Equatable`.
         let mut reasons = Vec::new();
-        for (mname, isig) in &iface.methods {
-            match st.methods.get(mname) {
-                None => reasons.push(format!("missing method '{mname}'")),
+        for (mname, isig, origin) in self.required_methods(iname) {
+            let from = if origin == iname {
+                String::new()
+            } else {
+                format!(" (required by supertype '{origin}')")
+            };
+            match st.methods.get(&mname) {
+                None => reasons.push(format!("missing method '{mname}'{from}")),
                 Some(msig) => {
-                    if !sigs_match(msig, isig) {
-                        reasons.push(format!("method '{mname}' has a mismatched signature"));
+                    if !sigs_match(msig, &isig) {
+                        reasons.push(format!("method '{mname}' has a mismatched signature{from}"));
                     }
                 }
             }
@@ -1283,6 +1470,56 @@ impl Checker {
         } else {
             Err(reasons)
         }
+    }
+
+    /// Every method required to conform to interface `iname`, flattened over
+    /// `iname`'s own declarations and all its transitive refined supertypes
+    /// (D-0139/#806), each paired with the interface that *introduced* the
+    /// requirement (for diagnostics). Cycle-safe via a visited set, so a
+    /// (malformed) cyclic refinement cannot loop here — the cycle is reported
+    /// separately at the definition site (ZAP4082).
+    fn required_methods(&self, iname: &str) -> Vec<(String, FnSig, String)> {
+        let mut out = Vec::new();
+        let mut visited = HashSet::new();
+        let mut stack = vec![iname.to_string()];
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur.clone()) {
+                continue;
+            }
+            if let Some(iface) = self.interfaces.get(&cur) {
+                for (mname, sig) in &iface.methods {
+                    out.push((mname.clone(), sig.clone(), cur.clone()));
+                }
+                for sup in &iface.supertypes {
+                    stack.push(sup.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve method `mname` on interface `iname`, searching `iname` and then its
+    /// transitive refined supertypes (D-0139/#806). This is what makes a supertype
+    /// method callable on a value of a bounded type parameter `[T: iname]`.
+    /// Cycle-safe via a visited set.
+    fn iface_method(&self, iname: &str, mname: &str) -> Option<FnSig> {
+        let mut visited = HashSet::new();
+        let mut stack = vec![iname.to_string()];
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur.clone()) {
+                continue;
+            }
+            let Some(iface) = self.interfaces.get(&cur) else {
+                continue;
+            };
+            if let Some(sig) = iface.method(mname) {
+                return Some(sig.clone());
+            }
+            for sup in &iface.supertypes {
+                stack.push(sup.clone());
+            }
+        }
+        None
     }
 
     /// Build a struct's [`StructInfo`] (operator overloading, D-0047): resolve
@@ -2618,10 +2855,11 @@ impl Checker {
                             self.error(
                                 ErrorCode::ZAP4001,
                                 format!(
-                                    "cannot assign value of type {} to {} {}",
+                                    "cannot assign value of type {} to {} {}{}",
                                     vt.display(),
                                     dt.display(),
-                                    name
+                                    name,
+                                    self.conformance_detail(&vt, &dt),
                                 ),
                                 expr_span(value),
                             );
@@ -2975,10 +3213,11 @@ impl Checker {
                             self.error(
                                 ErrorCode::ZAP4001,
                                 format!(
-                                    "cannot assign value of type {} to {} {}",
+                                    "cannot assign value of type {} to {} {}{}",
                                     vt.display(),
                                     dt.display(),
-                                    name
+                                    name,
+                                    self.conformance_detail(&vt, &dt),
                                 ),
                                 expr_span(value),
                             );
@@ -5950,8 +6189,10 @@ impl Checker {
                         self.tyvar_bounds.get(&tn).cloned()
                     };
                     if let Some(iname) = iface_name {
-                        let iface = &self.interfaces[&iname];
-                        let ret = match iface.method(name) {
+                        // Resolve against the bound/interface *and its refined
+                        // supertypes* (D-0139/#806): a supertype method is
+                        // callable on a value of a bounded type parameter.
+                        let ret = match self.iface_method(&iname, name) {
                             Some(sig) => sig.ret.clone(),
                             None => {
                                 let what = if is_iface {
@@ -9955,6 +10196,251 @@ def main():
         // (no bound to resolve against) and is not rejected here. This keeps the
         // unconstrained generic behavior (slices 1-4) unchanged.
         ok("def identity[T](T x) -> T:\n    return x\n\ndef main():\n    print(identity(1))\n");
+    }
+
+    // --- interface refinement `interface X: Y` (D-0139/#806) ---
+    //
+    // The self-referential capability dunders (`__eq__(self, other)` etc.) are
+    // compiler-provided (the built-in `Equatable`/`Hashable`/`Comparable`), since
+    // Zap is type-first and an interface method cannot leave `other` untyped. The
+    // *general* refinement mechanism is exercised with ordinary self-only-method
+    // user interfaces (`A`/`B`/`C`), and the capability interfaces are exercised
+    // through their built-in definitions + `@derive`.
+
+    #[test]
+    fn interface_refines_single_supertype_parses() {
+        // `interface C: A` parses and type-checks; a struct providing both A's and
+        // C's methods conforms to the refined interface at a coercion site.
+        ok("interface A:\n    def a(self) -> int64\n\n\
+            interface C: A\n    def c(self) -> int64\n\n\
+            struct S:\n    int64 v\n\
+            \x20   def a(self) -> int64:\n        return 1\n\
+            \x20   def c(self) -> int64:\n        return 3\n\n\
+            def main():\n    C x = S(v=0)\n    print(x.a() + x.c())\n");
+    }
+
+    #[test]
+    fn interface_refines_multiple_supertypes() {
+        // An interface may refine more than one supertype at once; a type must
+        // satisfy every listed supertype (and the interface's own methods).
+        ok("interface A:\n    def a(self) -> int64\n\n\
+            interface B:\n    def b(self) -> int64\n\n\
+            interface C: A, B\n    def c(self) -> int64\n\n\
+            struct S:\n    int64 v\n\
+            \x20   def a(self) -> int64:\n        return 1\n\
+            \x20   def b(self) -> int64:\n        return 2\n\
+            \x20   def c(self) -> int64:\n        return 3\n\n\
+            def main():\n    C x = S(v=0)\n    print(x.a() + x.b() + x.c())\n");
+    }
+
+    #[test]
+    fn interface_refinement_is_transitive() {
+        // A, B: A, C: B — conforming to C requires A's, B's, and C's methods. A
+        // type with the full transitive set conforms.
+        ok("interface A:\n    def a(self) -> int64\n\n\
+            interface B: A\n    def b(self) -> int64\n\n\
+            interface C: B\n    def c(self) -> int64\n\n\
+            struct S:\n    int64 v\n\
+            \x20   def a(self) -> int64:\n        return 1\n\
+            \x20   def b(self) -> int64:\n        return 2\n\
+            \x20   def c(self) -> int64:\n        return 3\n\n\
+            def main():\n    C x = S(v=0)\n    print(x.a())\n");
+    }
+
+    #[test]
+    fn missing_direct_supertype_method_names_the_supertype() {
+        // Conforming to C (C: A) but missing A's method fails, and the diagnostic
+        // names A as the supertype that introduced the requirement.
+        let m = msgs(
+            "interface A:\n    def a(self) -> int64\n\n\
+             interface C: A\n    def c(self) -> int64\n\n\
+             struct S:\n    int64 v\n\
+             \x20   def c(self) -> int64:\n        return 3\n\n\
+             def main():\n    C x = S(v=0)\n",
+        );
+        assert!(
+            m.contains("missing method 'a'") && m.contains("supertype 'A'"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn transitive_missing_grandparent_method_names_it() {
+        // Conforming to C (C: B, B: A) but missing A's (grandparent) method fails,
+        // naming A — the transitive requirement is enforced and attributed.
+        let m = msgs(
+            "interface A:\n    def a(self) -> int64\n\n\
+             interface B: A\n    def b(self) -> int64\n\n\
+             interface C: B\n    def c(self) -> int64\n\n\
+             struct S:\n    int64 v\n\
+             \x20   def b(self) -> int64:\n        return 2\n\
+             \x20   def c(self) -> int64:\n        return 3\n\n\
+             def main():\n    C x = S(v=0)\n",
+        );
+        assert!(
+            m.contains("missing method 'a'") && m.contains("supertype 'A'"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn bound_supertype_method_callable_on_tyvar() {
+        // Inside a `[T: C]` body (C: A) both `c` (the bound's own method) and `a`
+        // (inherited from the refined supertype A) are callable on a value of T —
+        // refinement propagates the supertype's methods onto the bound.
+        ok("interface A:\n    def a(self) -> int64\n\n\
+            interface C: A\n    def c(self) -> int64\n\n\
+            def use[T: C](T x) -> int64:\n    return x.a() + x.c()\n\n\
+            def main():\n    print(1)\n");
+    }
+
+    #[test]
+    fn method_outside_bound_and_its_supertypes_is_rejected() {
+        // A method neither the bound nor any refined supertype declares is still
+        // rejected at definition (refinement widens the callable set to the
+        // transitive closure, no further).
+        let m = msgs(
+            "interface A:\n    def a(self) -> int64\n\n\
+             interface C: A\n    def c(self) -> int64\n\n\
+             def bad[T: C](T x) -> int64:\n    return x.nope()\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(
+            m.contains("bound 'C'") && m.contains("no method 'nope'"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn builtin_hashable_refines_equatable_on_bound() {
+        // `Equatable`/`Hashable`/`Comparable` are compiler-known even when the
+        // module never declares them: a `[K: Hashable]` bound resolves, and the
+        // refined `__eq__` (from Equatable) is callable alongside `__hash__`.
+        ok("def key_of[K: Hashable](K k) -> int64:\n\
+            \x20   if k.__eq__(k):\n        return k.__hash__()\n    return 0\n\n\
+            def main():\n    print(1)\n");
+    }
+
+    #[test]
+    fn builtin_comparable_refines_equatable_on_bound() {
+        // `Comparable` likewise refines `Equatable`: `__cmp__` and `__eq__` both
+        // resolve on a `[T: Comparable]` bound.
+        ok("def order[T: Comparable](T a, T b) -> int64:\n\
+            \x20   if a.__eq__(b):\n        return 0\n    return a.__cmp__(b)\n\n\
+            def main():\n    print(1)\n");
+    }
+
+    #[test]
+    fn derived_type_satisfies_refined_builtin_bound() {
+        // A struct whose dunders come from `@derive(Eq, Hash)` (D-0047) satisfies
+        // the refined built-in `Hashable` contract: `@derive(Eq)` provides the
+        // supertype's `__eq__`, `@derive(Hash)` the `__hash__`.
+        ok("@derive(Eq, Hash)\nstruct Key:\n    int64 x\n\n\
+            def main():\n    Hashable h = Key(x=1)\n    print(h.__hash__())\n");
+    }
+
+    #[test]
+    fn derived_eq_only_fails_the_refined_builtin_bound() {
+        // `@derive(Eq)` alone provides `__eq__` (Equatable) but NOT `__hash__`:
+        // conformance to the refined `Hashable` is rejected, naming the missing
+        // own-method — the derive path is checked like a hand-written one.
+        let m = msgs(
+            "@derive(Eq)\nstruct Key:\n    int64 x\n\n\
+             def main():\n    Hashable h = Key(x=1)\n",
+        );
+        assert!(
+            m.contains("missing method '__hash__'") && m.contains("Hashable"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn struct_with_hash_but_not_eq_fails_hashable_naming_equatable() {
+        // The keystone acceptance case: a struct providing Hashable's own method
+        // (`__hash__`) but NOT its refined supertype Equatable (`__eq__`) is
+        // rejected, and the message names the missing supertype (D-0139/#806).
+        let m = msgs(
+            "struct Half:\n    int64 x\n\
+             \x20   def __hash__(self) -> int64:\n        return self.x\n\n\
+             def main():\n    Hashable h = Half(x=1)\n",
+        );
+        assert!(
+            m.contains("missing method '__eq__'")
+                && m.contains("supertype 'Equatable'")
+                && m.contains("Hashable"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn refining_a_non_interface_is_rejected() {
+        // A supertype must name an interface; refining a struct is ZAP4081 and
+        // names the offending type.
+        let m = msgs(
+            "struct NotIface:\n    int64 x\n\n\
+             interface Bad: NotIface\n    def m(self) -> int64\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(m.contains("is not an interface"), "got:\n{m}");
+    }
+
+    #[test]
+    fn refining_an_unknown_type_is_rejected() {
+        // An unknown supertype name is likewise not an interface (ZAP4081).
+        let m = msgs(
+            "interface Bad: DoesNotExist\n    def m(self) -> int64\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(
+            m.contains("DoesNotExist") && m.contains("not an interface"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn cyclic_refinement_is_rejected() {
+        // Mutually-refining interfaces (A: B, B: A) form a cycle — each is
+        // reported (ZAP4082).
+        let m = msgs(
+            "interface A: B\n    def a(self) -> int64\n\n\
+             interface B: A\n    def b(self) -> int64\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(m.contains("refines itself"), "got:\n{m}");
+    }
+
+    #[test]
+    fn self_refinement_is_rejected() {
+        // An interface that lists itself as a supertype is a (degenerate) cycle.
+        let m = msgs(
+            "interface A: A\n    def a(self) -> int64\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(m.contains("refines itself"), "got:\n{m}");
+    }
+
+    #[test]
+    fn duplicate_supertype_is_rejected() {
+        // Listing the same supertype twice is ZAP4083.
+        let m = msgs(
+            "interface A:\n    def a(self) -> int64\n\n\
+             interface B: A, A\n    def b(self) -> int64\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(
+            m.contains("more than once") && m.contains("'A'"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn plain_interface_without_refinement_is_unchanged() {
+        // A non-refining interface behaves exactly as before: conformance checks
+        // only its own methods, no supertype machinery engaged.
+        ok("interface Shape:\n    def area(self) -> f64\n\n\
+            struct Circle:\n    f64 r\n\
+            \x20   def area(self) -> f64:\n        return self.r\n\n\
+            def main():\n    Shape s = Circle(r=1.0)\n    print(s.area())\n");
     }
 
     // --- tuples (ticket #54, D-0049) ---

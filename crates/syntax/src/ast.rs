@@ -279,6 +279,12 @@ pub struct Field {
 pub struct InterfaceDef {
     pub name: String,
     pub generics: Vec<TypeParam>,
+    /// Refined supertypes (D-0139/#806): the `Equatable` in
+    /// `interface Hashable: Equatable`. Each names an interface this interface
+    /// refines; a type conforming to this interface must conform to every
+    /// supertype transitively, and a `[T: this]` bound carries the supertype
+    /// requirements. Empty for a plain, non-refining interface.
+    pub supertypes: Vec<Type>,
     pub methods: Vec<MethodSig>,
     pub span: Span,
 }

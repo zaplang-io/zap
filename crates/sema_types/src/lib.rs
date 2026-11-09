@@ -258,13 +258,21 @@ pub fn assignable(from: &Ty, to: &Ty) -> bool {
 /// requires (`want`) for structural conformance (D-0016)? The receiver (`self`,
 /// parameter 0) is ignored — it is the differing concrete/interface type — so
 /// the match compares the remaining parameter types pairwise and the return
-/// type. Comparison is by exact type identity (no widening): an interface method
-/// is satisfied by a method with the very same signature.
+/// type. Comparison is by exact type identity (no widening) with one exception:
+/// an *untyped* interface parameter (`Ty::Unknown`) imposes no constraint and so
+/// matches any concrete parameter type. This is what lets the self-referential
+/// capability dunders conform — `Equatable`'s `__eq__(self, other)` leaves `other`
+/// untyped, and a conforming struct supplies `__eq__(self, other: Self)` whose
+/// `other` is its own concrete type (D-0139/#806). An untyped parameter on either
+/// side therefore matches; a declared type on both must be identical.
 pub fn sigs_match(have: &FnSig, want: &FnSig) -> bool {
     let hp = &have.params.get(1..).unwrap_or(&[]);
     let wp = &want.params.get(1..).unwrap_or(&[]);
     hp.len() == wp.len()
-        && hp.iter().zip(wp.iter()).all(|(a, b)| a.ty == b.ty)
+        && hp
+            .iter()
+            .zip(wp.iter())
+            .all(|(a, b)| a.ty == b.ty || a.ty == Ty::Unknown || b.ty == Ty::Unknown)
         && have.ret == want.ret
 }
 
@@ -496,6 +504,11 @@ pub struct InterfaceInfo {
     /// Interface method name -> signature (`self` is the first parameter, typed
     /// as the interface itself), in declaration order.
     pub methods: Vec<(String, FnSig)>,
+    /// Refined supertype interface names (D-0139/#806): the `Equatable` in
+    /// `interface Hashable: Equatable`. A type conforming to this interface must
+    /// conform to every supertype transitively, and a `[T: this]` bound carries
+    /// the supertype method requirements. Empty for a plain interface.
+    pub supertypes: Vec<String>,
 }
 
 impl InterfaceInfo {

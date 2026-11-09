@@ -25,6 +25,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Interface refinement `interface X: Y`** (#806, epic #812, D-0139). An
+  interface may now **refine** one or more supertypes — `interface Hashable:
+  Equatable`, `interface C: A, B` — written between the body `:` and the header
+  newline. A type conforming to a refined interface must conform to every
+  supertype transitively, and a generic bound `[T: Hashable]` makes the
+  supertypes' methods (here `Equatable`'s `__eq__`) callable on `T` alongside the
+  interface's own. The compiler-known **capability interfaces** `Equatable`,
+  `Hashable`, and `Comparable` are defined with `Hashable: Equatable` and
+  `Comparable: Equatable` (definitions only — they are not yet wired into the
+  collection element guards, a later epic phase). Conformance failures name the
+  missing supertype (so "satisfies `Hashable` but not `Equatable`" points at
+  `Equatable`); refining a non-interface (`ZAP4081`), a refinement cycle
+  (`ZAP4082`), and a duplicate supertype (`ZAP4083`) are rejected at the
+  definition site. No change to existing single-bound behaviour for non-refined
+  interfaces.
 - **Capability/bounds model for collection elements — design locked** (#805, epic
   #812, D-0139; RFC #801). Records the authoritative decision (no behavior change
   yet) that a collection's element requirement — `dict`/`set` key = `Hashable`,

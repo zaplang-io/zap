@@ -173,8 +173,20 @@ field         ::= decorators type IDENT [ ":" INT ] [ "=" expr ] NEWLINE ;
                      pointer/reference, so the precise GC never sees packed bits.
                      1 <= INT <= type width; widths of one struct sum to <= 64. *)
 
-interface_def ::= "interface" IDENT [ generics ] ":" NEWLINE
+interface_def ::= "interface" IDENT [ generics ] ":" [ supertype_list ] NEWLINE
                   INDENT { method_sig } DEDENT ;
+supertype_list ::= type { "," type } ;
+                  (* Interface refinement (D-0139/I#806): `interface Hashable:
+                     Equatable` refines `Equatable`. Each `type` names an
+                     interface this one refines; a conforming type must conform to
+                     every supertype transitively, and a `[T: this]` bound carries
+                     the supertype method requirements. The leading `:` already
+                     introduces the body block, so the supertype list is whatever
+                     types sit between that `:` and the header NEWLINE — an
+                     immediate NEWLINE (`interface Equatable:`) means none. This is
+                     unambiguous because the body is INDENT-delimited, not
+                     `:`-delimited. The compiler-known capability interfaces are
+                     `Equatable` and its refinements `Hashable` / `Comparable`. *)
 method_sig    ::= "def" IDENT "(" [ param_list ] ")" [ "->" type ] NEWLINE ;
 
 enum_def      ::= decorators "enum" IDENT [ generics ] ":" NEWLINE
