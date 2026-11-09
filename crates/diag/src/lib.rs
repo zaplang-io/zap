@@ -406,9 +406,12 @@ define_codes! {
          strings; the `!r`/`!a` conversions require the Display protocol (#274).";
     ZAP4025 = 4025 : "wrong number of arguments to built-in",
         "A built-in was called with the wrong number of arguments.";
-    ZAP4027 = 4027 : "unsupported floating-point collection",
-        "Floating-point values are not supported as direct list, dict, set, heap, \
-         or channel elements. Use array[f64] for dense numeric data.";
+    ZAP4027 = 4027 : "collection element not yet representable",
+        "This element type satisfies its container's capability bound but the \
+         backend cannot lay out a collection slot for it yet (a representation \
+         gap, not a type-law failure, D-0139/#807). `f32`/`float32` is the \
+         remaining case — only `f64` is supported as a collection element so far; \
+         use `array[f32]` for dense `f32` data.";
     ZAP4028 = 4028 : "unsupported array construction",
         "Experimental arrays require one flat list literal and a supported dtype: \
          f64, i64, uint8, or bool (including their documented aliases).";
