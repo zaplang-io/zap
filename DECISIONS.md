@@ -6174,3 +6174,151 @@ via `try/except ValueError`, iteration), host sema coverage
 (`float_key_member_collections_ok`, the trimmed `floating_collection_slots_are_diagnosed`
 f32-only negatives, `bigint_complex_collection_elements_still_rejected`), and host
 lowering coverage (`crates/ir` `float_collection_tests`). (Decided 2026-11-09.)
+
+## D-0139 — Capability/bounds model for collection-element typing: adjectival capabilities, interface refinement, conditional auto-derivation (RFC #801, epic #812)
+
+**Status:** Locked — master record for RFC [#801]; implemented across epic #812
+(this entry is its foundation, issue #805). Rationale and the full round-by-round
+discussion live on Discussion #801; the normative model is here.
+
+### The model: existing interfaces as container bounds, not a new type system
+
+What a built-in collection requires of its element — a `dict` key must hash and
+compare, a `heap` element must order, a `set` member must hash — is expressed as a
+**bound on compiler-known structural interfaces**, reusing the D-0047 machinery
+(`__eq__` / `__cmp__` / `__hash__`, structural and compile-time-checked per
+D-0016) that already doubles as a generic bound (D-0017/D-0064, `def sum[T: Add]`).
+
+This is a **unification, not a new type system.** It replaces the separate,
+hand-maintained enumerated element-type guards (`check_numeric_container_type` /
+`check_float_container_value`, `ZAP4024`/`ZAP4027` in `crates/sema/src/lib.rs`)
+with the one interface-as-bound mechanism the user-struct half already uses. The
+user-facing surface added by the whole epic is exactly **one** new primitive:
+interface refinement (`interface X: Y`, issue #806); everything else is wiring the
+existing checker to the existing interfaces.
+
+### Capability vocabulary — the adjectival family
+
+The capability (bound) names are the **adjectival `-able` family**, matching
+Python's `collections.abc.Hashable` and reading as English in a bound
+(`[K: Hashable]`):
+
+| Capability   | Contract (D-0047 dunder)         | Refines      |
+|--------------|----------------------------------|--------------|
+| `Equatable`  | `__eq__(self, other) -> bool`    | —            |
+| `Hashable`   | `__hash__(self) -> int`          | `Equatable`  |
+| `Comparable` | `__cmp__(self, other) -> int`    | `Equatable`  |
+
+- **`Comparable` is the single total-order name.** The RFC's first draft listed
+  both "Orderable" and "Comparable"; they collapse to **`Comparable`**. "Orderable"
+  is retired — do not use it in new docs, comments, diagnostics, or code.
+- **`Hashable` and `Comparable` both refine `Equatable`** (the mechanism is #806):
+  - `Hashable: Equatable` because the Hashable *contract* is defined relative to
+    equality — the `a == b ⟹ hash(a) == hash(b)` invariant (D-0047) is meaningless
+    without `Equatable`. No sound consumer needs hash-without-equality *at the
+    bound level*; hash-only use (bloom filters, hash-sharding, sketches) takes a
+    hash *function*, not the `Hashable` bound.
+  - `Comparable: Equatable` is free — in Zap a single `__cmp__` yields equality at
+    `__cmp__ == 0`, so a `Comparable` type is `Equatable` with zero extra code.
+- Because refinement carries the supertype, a **single bound suffices** for every
+  collection shape: `dict`/`set` key = `Hashable` (which pulls in `Equatable`),
+  `heap` element = `Comparable` (which pulls in `Equatable`). Zap therefore needs
+  **neither bound conjunction (`T: A + B`) nor union (`T: A | B`)** for these
+  cases; both stay out (conjunction remains the deferred follow-up it already was;
+  `|` would be disjunction — the wrong operation and separately unwanted).
+
+### `Storable` is compiler-internal, not a user-facing capability
+
+"Can the runtime hold a slot of `T` (a slot representation + a GC trace map)" is
+**representation readiness**, not a semantic capability a type *provides*, and it is
+**never exposed to the programmer.** No user-writable type can fail it for a
+permanent reason — value structs and scalars are stored **inline** (so a
+"Referenceable" rename would be wrong), and function values are genuine
+first-class values (D-0067), not "a verb" needing a special capability. The only
+things not yet storable in a collection are **built-in scalars whose slot is not
+yet lowered** — `f32`/`float32`, `bigint`, `complex` — and those are an honest
+**"not-yet-lowered" diagnostic (a representation gap), not a type law.** The stale
+`ZAP4027`/`#49` wording that framed `f32`-in-container as a type rule is corrected
+when the guards are converted (issue #807); the `#800`/`#803` `float64` rulings
+(D-0137/D-0138) are the `Hashable`/`Equatable` semantics of `float64` under this
+framing and are preserved.
+
+### Auto-derivation of `Equatable` + `Hashable` for value aggregates
+
+- **Value structs (D-0051) and tuples (D-0049) auto-derive `Equatable` *and*
+  `Hashable`, conditionally and overridably** (Swift-style conditional synthesis):
+  a value aggregate is `Equatable`+`Hashable` **iff every field/element is.** A
+  non-conforming field (e.g. a mutable `list`) simply makes the aggregate
+  non-`Hashable`, producing an **actionable error at the point of use, never a
+  silent slot** — self-protecting against the mutable-key footgun, exactly as
+  Python makes a tuple-containing-a-list unhashable.
+  - Float fields inherit the #803 reject-`NaN` / canonicalize-`-0.0` semantics for
+    free.
+  - **Override is all-or-nothing:** hand-writing `__eq__` *or* `__hash__`
+    suppresses synthesis of the whole pair; the existing Eq-without-Hash guard
+    (D-0047) keeps the two consistent.
+- **`Comparable` stays explicit** (`@derive`, lexicographic by declaration order):
+  a total order is a *choice*, not inherent — Swift and Rust likewise do not
+  auto-synthesize it. Auto-`Comparable` is reserved for types with a *canonical*
+  total order (tier-1 enums, below).
+- **Reference structs (D-0023) stay explicit** for all of these: identity is their
+  Python default, and value-equality is a conscious opt-in.
+- This **changes pre-1.0 behavior**: value-struct keys today require an explicit
+  `@derive`. The explicit form stays valid (now redundant). Implemented in #808.
+
+### Enums
+
+- **Tier-1 enum** (all bare constants, unboxed int, D-0018): `Equatable` and
+  `Hashable` are **intrinsic** (backing-value identity, non-overridable; repeated
+  values are aliases per D-0018). `Comparable` is **auto by backing int**, and
+  **overridable** via `__cmp__` — an override may reorder members but must stay a
+  strict total order over distinct members (no ties, or it would break intrinsic
+  equality). This is the canonical-total-order case that earns auto-`Comparable`.
+- **Tier-3 enum** (data-carrying, tagged value aggregate, D-0018/D-0046): same rule
+  as a value struct — `Equatable`/`Hashable` auto-conditional on the payload
+  fields; `Comparable` explicit (tag-then-fields). Implemented in #809.
+- **Decoupled from #731.** Enum-as-container-element needs only that the compiler
+  *knows* these capabilities intrinsically — **not** interface *conformance*.
+  Enum→interface *value* (#731) is a separate Full-OO feature the capability model
+  does not depend on.
+
+### `Repr` is a separate category (display protocol), automatic + total + overridable
+
+`Repr`/`Display` (D-0124) is **not** a membership capability and keeps its noun
+name. Every type gets an **automatic, total, overridable** `__repr__` (Java
+`toString` model): the default is a **structural field-form, never an address**
+(the precise GC moves objects), and `__str__` falls back to `__repr__`. This
+retires the old `str(struct)` rejection. `Repr` is independent of refinement and
+of #806 — it can land any time after this record (issue #810).
+
+### Scope wall and cost
+
+- **Container-element typing only.** The framework does **not** extend to
+  primitive/operator semantics. There is **no `Numeric` meta-capability**;
+  `NaN`/`-0.0` treatment stays inside `float64`'s concrete implementation, never
+  "owned" by a capability. The existing D-0047 operator bounds (`def f[T: Add]`)
+  predate this and are unaffected.
+- **Zero runtime cost:** every capability check is compile-time only (monomorphized
+  static dispatch, D-0064). Operation-inherent costs (the `NaN` guard, `-0.0`
+  canonicalization) exist regardless of how they are framed.
+
+### Relationship to D-0047 `@derive` tokens
+
+D-0047's `@derive(Eq, Ord, Hash, Repr)` generators are the *derivation* surface;
+`Equatable`/`Hashable`/`Comparable` are the *bound/capability* surface, and
+`Ord` is the derive-token spelling of the `Comparable` order. The two surfaces
+describe the same underlying structural interfaces; aligning the derive-token
+spellings with the adjectival family (if at all) is a pre-1.0 ergonomic follow-up
+tracked with the user-facing-surface work (#811), **not** part of this record —
+`@derive(Eq, Ord, Hash, Repr)` stays valid throughout the epic.
+
+### Epic #812 sequencing
+
+`#805 (this record) → #806 (interface refinement — keystone) → { #807 guard
+conversion, #808 → #809 auto-derive + enums, #810 Repr } → #811 user-facing
+containers + diagnostics`, run serially (sema-heavy; parallel work would churn
+CI). Nothing past #806 begins until it lands; #810 (Repr) is independent of #806.
+
+(Decided 2026-11-09. Refs: Discussion #801 (RFC + three resolved-positions
+rounds), D-0047, D-0016, D-0017/D-0064, D-0051, D-0049, D-0018/D-0046, D-0124,
+D-0137/D-0138.)

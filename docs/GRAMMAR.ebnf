@@ -99,7 +99,12 @@ type_param    ::= IDENT [ ":" type ] ;
                      each concrete instantiation must structurally satisfy the
                      bound, and the body may call the bound's methods on T (static
                      dispatch). A single bound per parameter is supported;
-                     multiple bounds (`T: A + B`) are a deferred follow-up. *)
+                     multiple bounds (`T: A + B`) are a deferred follow-up. The
+                     compiler-known capability interfaces usable as element/key
+                     bounds are `Equatable`/`Hashable`/`Comparable` (D-0139);
+                     `Hashable` and `Comparable` refine `Equatable`, so a single
+                     bound carries its supertypes — no `+`/`|` needed. Refinement
+                     syntax `interface X: Y` lands with #806. *)
 type_args     ::= "[" type { "," type } "]" ;
                   (* call-site / construction type arguments (I#154 Fork S;
                      generic functions/methods I#161): `Box[str](...)`,
