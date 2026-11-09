@@ -438,10 +438,25 @@ impl<'a> Printer<'a> {
     }
 
     fn emit_interface(&mut self, i: &InterfaceDef) {
+        // Refined supertypes (D-0139/#806) render after the `:`:
+        // `interface Hashable: Equatable`, `interface X: A, B`.
+        let supers = if i.supertypes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " {}",
+                i.supertypes
+                    .iter()
+                    .map(type_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         self.push_line(&format!(
-            "interface {}{}:",
+            "interface {}{}:{}",
             i.name,
-            generics_str(&i.generics)
+            generics_str(&i.generics),
+            supers
         ));
         self.indent += 1;
         self.block_fresh = true;

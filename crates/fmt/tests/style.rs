@@ -23,6 +23,24 @@ fn indentation_is_four_spaces() {
 }
 
 #[test]
+fn interface_refinement_round_trips() {
+    // `interface X: Y` supertype lists survive formatting unchanged and are a
+    // fixed point (D-0139/#806): single, multiple, and none.
+    check(
+        "interface Hashable: Equatable\n    def hash(self) -> int64\n",
+        "interface Hashable: Equatable\n    def hash(self) -> int64\n",
+    );
+    check(
+        "interface C:  A,B\n    def c(self) -> int64\n",
+        "interface C: A, B\n    def c(self) -> int64\n",
+    );
+    check(
+        "interface Equatable:\n    def eq(self) -> bool\n",
+        "interface Equatable:\n    def eq(self) -> bool\n",
+    );
+}
+
+#[test]
 fn operator_and_comma_spacing() {
     check("x=1+2*3\n", "x = 1 + 2 * 3\n");
     check("f(a ,b,  c)\n", "f(a, b, c)\n");

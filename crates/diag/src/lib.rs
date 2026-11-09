@@ -472,6 +472,16 @@ define_codes! {
     ZAP4080 = 4080 : "no such method",
         "An interface or a type parameter's bound does not declare the method \
          being called.";
+    ZAP4081 = 4081 : "interface refines a non-interface",
+        "An `interface X: Y` refinement names a supertype `Y` that is not an \
+         interface (D-0139/#806). An interface may only refine another interface.";
+    ZAP4082 = 4082 : "cyclic interface refinement",
+        "An interface refines, directly or through other interfaces, back to \
+         itself (D-0139/#806). Refinement must be a strict hierarchy — break the \
+         cycle.";
+    ZAP4083 = 4083 : "duplicate interface supertype",
+        "An `interface X: …` refinement lists the same supertype more than once \
+         (D-0139/#806). Name each refined interface at most once.";
 
     ZAP4090 = 4090 : "cyclic type alias",
         "A transparent type alias (`type X = …`) expands, directly or through \

@@ -1857,6 +1857,19 @@ impl Parser {
         let name = self.ident("interface name");
         let generics = self.parse_generics();
         self.expect(&TokenKind::Colon, "':'");
+        // Optional refined-supertype list (D-0139/#806):
+        // `interface Hashable: Equatable` or `interface X: A, B`. The `:` already
+        // introduces the body block, so the supertype list is whatever types sit
+        // between that `:` and the end-of-header NEWLINE; an immediate NEWLINE
+        // (`interface Equatable:`) means no supertypes. This is unambiguous because
+        // the body is INDENT-delimited, not `:`-delimited.
+        let mut supertypes = Vec::new();
+        if !self.is(&TokenKind::Newline) {
+            supertypes.push(self.parse_type());
+            while self.eat(&TokenKind::Comma) {
+                supertypes.push(self.parse_type());
+            }
+        }
         self.expect(&TokenKind::Newline, "newline");
         self.expect(&TokenKind::Indent, "indented block");
         let mut methods = Vec::new();
@@ -1888,6 +1901,7 @@ impl Parser {
         InterfaceDef {
             name,
             generics,
+            supertypes,
             methods,
             span: self.span_from(start),
         }
@@ -4271,6 +4285,74 @@ mod tests {
     fn empty_module() {
         let m = parse_ok("");
         assert!(m.items.is_empty());
+    }
+
+    fn interface_of(m: &Module) -> &InterfaceDef {
+        m.items
+            .iter()
+            .find_map(|i| match i {
+                Item::Interface(x) => Some(x),
+                _ => None,
+            })
+            .expect("an interface item")
+    }
+
+    fn supertype_names(i: &InterfaceDef) -> Vec<String> {
+        i.supertypes
+            .iter()
+            .map(|t| match t {
+                Type::Named { name, .. } => name.clone(),
+                _ => "<non-named>".to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interface_without_supertypes_parses_empty_list() {
+        // A plain interface (the original form) carries no supertypes.
+        let m = parse_ok("interface Equatable:\n    def eq(self) -> bool\n");
+        let i = interface_of(&m);
+        assert!(i.supertypes.is_empty());
+        assert_eq!(i.methods.len(), 1);
+    }
+
+    #[test]
+    fn interface_with_single_supertype_parses() {
+        // `interface Hashable: Equatable` records one supertype and still parses
+        // its method block (D-0139/#806).
+        let m = parse_ok("interface Hashable: Equatable\n    def hash(self) -> int64\n");
+        let i = interface_of(&m);
+        assert_eq!(supertype_names(i), vec!["Equatable".to_string()]);
+        assert_eq!(i.methods.len(), 1);
+        assert_eq!(i.methods[0].name, "hash");
+    }
+
+    #[test]
+    fn interface_with_multiple_supertypes_parses() {
+        // A comma-separated supertype list is recorded in order.
+        let m = parse_ok("interface C: A, B\n    def c(self) -> int64\n");
+        let i = interface_of(&m);
+        assert_eq!(supertype_names(i), vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn interface_with_supertype_and_empty_body_parses() {
+        // Refinement composes with a body that is only `pass`-free but present;
+        // the header `:` + supertype + NEWLINE + INDENT block round-trips.
+        let m = parse_ok(
+            "interface A:\n    def a(self) -> int64\n\ninterface B: A\n    def b(self) -> int64\n",
+        );
+        // The second interface is the refining one.
+        let b = m
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Interface(x) => Some(x),
+                _ => None,
+            })
+            .find(|x| x.name == "B")
+            .expect("interface B");
+        assert_eq!(supertype_names(b), vec!["A".to_string()]);
     }
 
     #[test]

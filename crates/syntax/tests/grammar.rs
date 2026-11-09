@@ -405,6 +405,9 @@ const CORPUS: &[Case] = &[
     case("struct_def", Accept, "value struct V:\n    int64 a\n"),
     case("field", Accept, "value struct Flags:\n    int64 a: 3\n    int64 b: 5\n"), // bitfields I#173
     case("interface_def", Accept, "interface Shape:\n    def area(self) -> f64\n"),
+    // Interface refinement `interface X: Y` (D-0139/#806): single, multiple.
+    case("interface_def", Accept, "interface Hashable: Equatable\n    def hash(self) -> int64\n"),
+    case("supertype_list", Accept, "interface C: A, B\n    def c(self) -> int64\n"),
     case("enum_def", Accept, "enum Color:\n    Red\n    Green\n"),
     case("enum_member", Accept, "enum Opt:\n    Some(int64 v)\n    None\n"),     // D-0046 + None variant
     case("type_alias", Accept, "type Row = (int64, str)\n"),                     // transparent alias, #606
