@@ -34,8 +34,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   hashable** (recursively through nested value structs, tuples, and
   `Optional`s); a non-hashable field (e.g. a `list`) simply leaves the aggregate
   non-hashable, reported at key use with a message **naming the offending field**,
-  never silently. Float fields inherit the #803 key semantics (`-0.0`
-  canonicalized, `NaN` rejected at runtime). Override is **all-or-nothing**:
+  never silently. A `float`/`float64` field canonicalizes `-0.0` → `+0.0` so a
+  value struct keyed on it collides those like a bare float key (#803). Override
+  is **all-or-nothing**:
   hand-writing or `@derive`-ing either `__eq__` or `__hash__` suppresses the
   synthesized pair (and the existing Eq-without-Hash guard still applies).
   `Comparable`/`Ord` stays explicit, and reference structs keep identity equality
