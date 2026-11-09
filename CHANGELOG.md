@@ -746,6 +746,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **Collection element checks are capability/representation-driven** (#807, epic
+  #812, D-0139). The hand-maintained per-container element guards fold into the
+  capability model: a container's element/key/value position carries a semantic
+  bound (`dict`/`set` key = `Hashable`, `heap` element = `Comparable`,
+  `list`/`array`/`channel` + `dict` value = none), and every type admitted today
+  satisfies it (`f64` included), so what actually gates admission is
+  representation readiness. `f32`/`float32` as a collection element is now
+  diagnosed as an honest **representation-readiness gap** — *"'f32'/'float32' is
+  not supported as a collection element yet (only 'f64' is); use 'array[f32]' for
+  dense f32 data"* (`ZAP4027`, retired from its old "floating-point collection
+  elements are unsupported" enumerated-float wording) — rather than a type law;
+  `bigint`/`complex` stay rejected unchanged (`ZAP4024`). No behaviour change for
+  any currently-accepted shape (all #800/#803 `f64` cases still type-check); the
+  enumerated float arms are gone in favour of the uniform bound/representation
+  walk.
 - **The three aarch64 concurrency stress goldens run on every arch again**
   (#698, D-0121). `immix_evac_coro_stress`, `concurrent_queue_mpsc_coro_stress`
   and `concurrent_queue_mpsc_thread_stress` were quarantined on aarch64 via

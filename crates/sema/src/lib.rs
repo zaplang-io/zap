@@ -625,56 +625,77 @@ impl DecoTarget {
     }
 }
 
+/// A built-in scalar name the backend cannot yet lay out as a collection slot —
+/// an honest *representation-readiness* gap under the capability model
+/// (D-0139/#807), not a type-law failure. `f64` is **not** one of these: it is a
+/// first-class collection element in every position (#800/#803).
+fn is_f32_name(n: &str) -> bool {
+    matches!(n, "f32" | "float32")
+}
+/// Built-in collections whose element slot is where the `f32` representation gap
+/// bites. `array` is deliberately absent — a dense numeric `array` carries its
+/// own dtype slots (incl. `f32`), so it is not gated here.
+fn is_f32_gap_container(n: &str) -> bool {
+    matches!(n, "list" | "heap" | "channel" | "dict" | "set")
+}
+/// The honest diagnostic text for the remaining collection-element
+/// representation gaps (D-0139/#807): `f32`/`float32`, and `bigint`/`complex`.
+const F32_COLLECTION_MSG: &str =
+    "'f32'/'float32' is not supported as a collection element yet (only 'f64' is); \
+     use 'array[f32]' for dense f32 data";
+const BIGINT_COMPLEX_COLLECTION_MSG: &str =
+    "bigint and complex values are not supported as collection elements yet";
+
 impl Checker {
-    /// Bigint and complex values are scalar ABI values, but collection element
-    /// storage does not support them yet. Reject these shapes during checking
-    /// instead of allowing lowering to fail later.
+    /// Representation-readiness gate for the element/key/value *positions* of the
+    /// built-in collections (capability model, D-0139/#807). Each position
+    /// carries a semantic capability bound —
+    ///
+    /// | container | element / key bound |
+    /// |---|---|
+    /// | `list[T]` / `array[T]` / `channel[T]`, and `dict` VALUE | none |
+    /// | `dict[K, _]` key, `set[T]` | `Hashable` (⊃ `Equatable`) |
+    /// | `heap[T]` | `Comparable` (⊃ `Equatable`) |
+    ///
+    /// — but every type admitted here already satisfies its position's bound
+    /// (`f64` included, #800/#803), so what actually gates admission is whether
+    /// the backend can lay out a slot for the element yet. The built-in scalars
+    /// whose slot is not yet lowered are an honest representation gap, not a
+    /// type-law failure: `f32`/`float32` (`ZAP4027`) and `bigint`/`complex`
+    /// (`ZAP4024`). This is the syntactic (`Type`) gate run during collection;
+    /// [`Self::check_float_container_value`] / [`Self::check_numeric_container_value`]
+    /// are the resolved-type (`Ty`) gate run on expressions.
     fn check_numeric_container_type(&mut self, ty: &Type) {
         let span = match ty {
             Type::Named { span, .. } | Type::Tuple { span, .. } | Type::Func { span, .. } => *span,
         };
-        fn is_f64_name(n: &str) -> bool {
-            matches!(n, "f64" | "float64" | "float")
+        // An `f32`/`float32` slot is a representation gap iff some collection node
+        // gated for it holds `f32`/`float32` as a *direct* type argument — e.g.
+        // `dict[f32, _]`, `set[f32]`, `list[list[f32]]` (the inner `list`). It is
+        // reached only through gap containers, never through a tuple or an
+        // unrelated generic (those are a separate representation question), which
+        // preserves the pre-capability behaviour exactly while dropping the old
+        // per-container-name match arms.
+        fn is_f32_arg(a: &Type) -> bool {
+            matches!(a, Type::Named { name, .. } if is_f32_name(name))
         }
-        fn is_float_name(n: &str) -> bool {
-            is_f64_name(n) || matches!(n, "f32" | "float32")
-        }
-        // A direct `f64`/`float` float arg in this position.
-        fn direct_f64(a: &Type) -> bool {
-            matches!(a, Type::Named { name, .. } if is_f64_name(name))
-        }
-        // A direct float arg of *any* width (`f64`/`float`/`f32`/`float32`).
-        fn direct_float(a: &Type) -> bool {
-            matches!(a, Type::Named { name, .. } if is_float_name(name))
-        }
-        fn float_slots(ty: &Type) -> bool {
+        fn f32_slot(ty: &Type) -> bool {
             match ty {
                 Type::Named { name, args, .. } => {
-                    let direct = match name.as_str() {
-                        // Every built-in collection now admits an `f64`/`float`
-                        // element in every position: value positions (list element
-                        // I#569, dict VALUE / heap / channel #800 Phase 1) and the
-                        // hashed/ordered positions (dict KEY, set MEMBER #800
-                        // Phase 2 / #803, canonicalised `-0.0` and NaN rejected at
-                        // runtime — D-0138). An `f32`/`float32` element stays
-                        // deferred everywhere (ticket #49), so reject only a float
-                        // that is not `f64`.
-                        "list" | "heap" | "channel" | "dict" | "set" => {
-                            args.iter().any(|a| direct_float(a) && !direct_f64(a))
-                        }
-                        _ => false,
-                    };
-                    direct || args.iter().any(float_slots)
+                    (is_f32_gap_container(name) && args.iter().any(is_f32_arg))
+                        || args.iter().any(f32_slot)
                 }
-                Type::Tuple { elems, .. } => elems.iter().any(float_slots),
+                Type::Tuple { elems, .. } => elems.iter().any(f32_slot),
                 Type::Func { params, ret, .. } => {
-                    params.iter().any(float_slots) || ret.as_deref().is_some_and(float_slots)
+                    params.iter().any(f32_slot) || ret.as_deref().is_some_and(f32_slot)
                 }
             }
         }
-        if float_slots(ty) {
-            self.error(ErrorCode::ZAP4027, "floating-point collection elements are unsupported; use array[f64] for dense numeric data".to_string(), span);
+        if f32_slot(ty) {
+            self.error(ErrorCode::ZAP4027, F32_COLLECTION_MSG.to_string(), span);
         }
+        // `bigint`/`complex` have no collection slot in any container (`array`
+        // included). Once inside a container, the gap applies at any depth.
         fn contains_numeric(ty: &Type, in_container: bool) -> bool {
             match ty {
                 Type::Named { name, args, .. } => {
@@ -710,13 +731,14 @@ impl Checker {
             };
             self.error(
                 ErrorCode::ZAP4024,
-                "bigint and complex values are not supported as collection elements yet"
-                    .to_string(),
+                BIGINT_COMPLEX_COLLECTION_MSG.to_string(),
                 span,
             );
         }
     }
 
+    /// Resolved-type (`Ty`) sibling of the `bigint`/`complex` representation gate
+    /// (D-0139/#807): `bigint`/`complex` have no collection slot in any container.
     fn check_numeric_container_value(&mut self, ty: &Ty, span: Span) {
         fn contains_numeric(ty: &Ty, in_container: bool) -> bool {
             match ty {
@@ -737,23 +759,24 @@ impl Checker {
         if contains_numeric(ty, false) {
             self.error(
                 ErrorCode::ZAP4024,
-                "bigint and complex values are not supported as collection elements yet"
-                    .to_string(),
+                BIGINT_COMPLEX_COLLECTION_MSG.to_string(),
                 span,
             );
         }
     }
 
+    /// Resolved-type (`Ty`) sibling of the `f32` representation gate
+    /// (D-0139/#807). Every built-in collection admits an `f64` element in every
+    /// position — value positions (list I#569, dict VALUE / heap / channel #800
+    /// Phase 1) and the hashed/ordered positions that need `Hashable`/`Comparable`
+    /// (dict KEY, set MEMBER, heap — #800 Phase 2 / #803, `f64` satisfying them
+    /// intrinsically with `-0.0` canonicalised and NaN rejected at runtime,
+    /// D-0138). Only an `f32`/`float32` element (`Ty::Float32`) is still a
+    /// representation gap; an inferred `UntypedFloat` defaults to `f64`, so it is
+    /// admitted.
     fn check_float_container_value(&mut self, ty: &Ty, span: Span) {
         fn unsupported(ty: &Ty) -> bool {
             match ty {
-                // Every built-in collection admits an `f64` element in every
-                // position — value positions (list I#569, dict VALUE / heap /
-                // channel #800 Phase 1) and the hashed/ordered positions (dict
-                // KEY, set MEMBER #800 Phase 2 / #803, with `-0.0` canonicalised
-                // and NaN rejected at runtime — D-0138). Only an `f32`/`float32`
-                // element (`Ty::Float32`) stays deferred everywhere (ticket #49);
-                // an inferred `UntypedFloat` defaults to `f64`, so it is admitted.
                 Ty::List(t) | Ty::Heap(t) | Ty::Chan(t) | Ty::Set(t) => {
                     matches!(**t, Ty::Float32) || unsupported(t)
                 }
@@ -768,7 +791,7 @@ impl Checker {
             }
         }
         if unsupported(ty) {
-            self.error(ErrorCode::ZAP4027, "floating-point collection elements are unsupported; use array[f64] for dense numeric data".to_string(), span);
+            self.error(ErrorCode::ZAP4027, F32_COLLECTION_MSG.to_string(), span);
         }
     }
 
@@ -8001,14 +8024,16 @@ def main():
 
     #[test]
     fn floating_collection_slots_are_diagnosed() {
-        // After #800 Phase 2 (#803) the only float element still unsupported is
-        // an `f32`/`float32` element (ticket #49) — in EVERY container and every
-        // position, value or hashed/ordered. Each still raises ZAP4027. Every
-        // `f64` position (list element, dict key/value, set member, heap, channel)
-        // is now accepted — see `float_value_collections_ok` /
+        // Under the capability model (D-0139/#807) the only float element still
+        // unsupported is `f32`/`float32` — a REPRESENTATION-readiness gap (the
+        // backend has no `f32` collection slot yet), not a type-law failure — in
+        // every container and every position, value or hashed/ordered. Each still
+        // raises ZAP4027, now with f32-specific representation-gap wording (NOT the
+        // old "floating-point collection elements are unsupported"). Every `f64`
+        // position is accepted — see `float_value_collections_ok` /
         // `float_key_member_collections_ok`.
         for source in [
-            // `f32` element — deferred everywhere (#49), key and value positions.
+            // `f32` element — a representation gap everywhere, key and value.
             "list[f32] x = []",
             "dict[str, f32] x = {}",
             "dict[f32, str] x = {}",
@@ -8022,11 +8047,51 @@ def main():
             "dict[str, set[f32]] x = {}",
         ] {
             let source = format!("def main():\n    {source}\n");
+            let es = errors(&source);
+            let f32_err = es.iter().find(|e| e.code == ErrorCode::ZAP4027);
+            assert!(f32_err.is_some(), "expected ZAP4027 for: {source}");
+            // Representation-gap wording, f32-specific (f64 IS supported now).
+            let m = &f32_err.unwrap().message;
             assert!(
-                errors(&source).iter().any(|e| e.code == ErrorCode::ZAP4027),
-                "expected ZAP4027 for: {source}"
+                m.contains("f32") && m.contains("collection element"),
+                "expected f32-specific representation-gap wording, got: {m}"
+            );
+            assert!(
+                !m.contains("floating-point collection elements are unsupported"),
+                "the old enumerated-float wording must be retired, got: {m}"
             );
         }
+    }
+
+    #[test]
+    fn array_f32_is_not_diagnosed_by_the_collection_float_guard() {
+        // The asymmetry the capability refactor preserves: `array` is deliberately
+        // absent from the `f32` collection-slot gate, so `array[f32]` does NOT
+        // raise ZAP4027. (It is still rejected — a dense `array` only supports the
+        // f64/i64/uint8/bool dtypes today — but by the array-dtype guard ZAP4028,
+        // which avoids double-diagnosing the same type.)
+        let es = errors("def main():\n    array[f32] a = array[f32]([1.0, 2.0])\n");
+        assert!(
+            !es.iter().any(|e| e.code == ErrorCode::ZAP4027),
+            "array[f32] must not trip the collection float guard (ZAP4027): {es:?}"
+        );
+        assert!(
+            es.iter().any(|e| e.code == ErrorCode::ZAP4028),
+            "array[f32] is still rejected, by the array-dtype guard (ZAP4028): {es:?}"
+        );
+    }
+
+    #[test]
+    fn value_struct_with_derive_eq_hash_is_a_valid_key_via_the_bound() {
+        // Ties #807 to the refinement machinery (#806): a `value struct` deriving
+        // (Eq, Hash) satisfies the `Hashable` bound a dict key / set member needs,
+        // so it type-checks in both positions. (Pins existing behaviour — the
+        // capability reframe must keep it passing.)
+        ok(
+            "@derive(Eq, Hash)\nvalue struct P:\n    int64 x\n    int64 y\n\n\
+            def main():\n    dict[P, str] d = {}\n    d[P(x=1, y=2)] = \"a\"\n    \
+            set[P] s = set[P]()\n    s.add(P(x=3, y=4))\n    print(len(d) + len(s))\n",
+        );
     }
 
     #[test]
