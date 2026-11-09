@@ -2029,8 +2029,13 @@ fn chan_elem_from_name(name: &str) -> Result<Elem, LowerError> {
 
 /// Classify a ZIR type into the element word kind collections store. Elements
 /// are uniform 8-byte words (RUNTIME-ABI §"Collection layout"): integers/bools
-/// go in as `i64`, reference types as pointers. Floats need a separate word
-/// path and are deferred.
+/// go in as `i64`, reference types as pointers, and an `f64` as the reinterpreted
+/// `double` word ([`Elem::F64`]). `f64` is admitted in *every* collection position
+/// — value positions (list element I#569, dict VALUE / heap / channel #800
+/// Phase 1) and the hashed/ordered positions (dict KEY, set MEMBER #800 Phase 2 /
+/// #803): after `-0.0` canonicalisation and NaN rejection a float key hashes and
+/// compares as a plain `i64` word (D-0138). Only an `f32` element (ticket #49) and
+/// bigint/complex (`ZAP4024`) stay unsupported.
 fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
     match t {
         // `bool` (`Ty::I1`) and `char` (`Ty::Char`) each keep their own element
@@ -2058,8 +2063,13 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         Ty::Bigint | Ty::Complex => Err(err(
             "collections of bigint or complex values are not supported yet",
         )),
-        Ty::F32 | Ty::F64 => Err(err(
-            "collections of floating-point elements are not supported yet",
+        // An `f64` element shares the uniform 8-byte word (a bit reinterpret, like
+        // `list[float]`); in a hashed/ordered position (#803) the key is
+        // canonicalised and NaN-rejected by the runtime. An `f32` element stays
+        // deferred (ticket #49).
+        Ty::F64 => Ok(Elem::F64),
+        Ty::F32 => Err(err(
+            "collections of 32-bit float (`f32`) elements are not supported yet (ticket #49)",
         )),
         // Scalar unsigned integers (#552) are supported as values, parameters,
         // returns, and C-style bitfields, but a collection/channel *element* of
@@ -2074,19 +2084,13 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
     }
 }
 
-/// Like [`elem_kind`], but admits an `f64` element as [`Elem::F64`] in a *value*
-/// position — one that stores a uniform 8-byte word and needs neither hashing nor
-/// ordering: a list element (I#569), a dict **value**, or a **channel** element
-/// (#800). `f32` (ticket #49) and every other float kind fall through to
-/// [`elem_kind`] and stay unsupported. This is never reached for a dict/set *key*
-/// or a `heap` element (which must hash or order) — those keep going through
-/// [`elem_kind`]/[`heap_elem_of`], so a float key/member is still rejected pending
-/// the hash ruling (#800 Phase 2).
+/// The element kind of a *value*-position element type — a list element (I#569),
+/// a dict **value**, or a **channel** element (#800). Now that [`elem_kind`]
+/// itself admits an `f64` in every position (#803), this is an alias of
+/// [`elem_kind`]; it is kept as a named value-position call site for the Phase 1
+/// code paths, and so the intent at those sites stays legible.
 fn value_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
-    match t {
-        Ty::F64 => Ok(Elem::F64),
-        other => elem_kind(other, nested),
-    }
+    elem_kind(t, nested)
 }
 
 /// The element kind of a `list[T]` element type (I#569): a *value* position, so a
@@ -19117,12 +19121,12 @@ fn parse_int_lit_opt(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod float_collection_tests {
-    //! Lowering coverage for `float64` as a collection element/key (#800).
+    //! Lowering coverage for `float64` as a collection element/key (#800, #803).
     //! These run on the host (no LLVM): they exercise AST→ZIR lowering directly,
     //! independent of the sema gate, so the element-storage paths are a walled
-    //! garden. Phase 1 (dict VALUES, channel, heap) must lower cleanly; the
-    //! deferred key/member shapes (float dict KEY, set member) and `f32` must
-    //! still raise a lowering error.
+    //! garden. Phase 1 (dict VALUES, channel, heap) and Phase 2 (dict KEYS, set
+    //! MEMBERS) must all lower cleanly; only an `f32` element must still raise a
+    //! lowering error.
     use super::lower_module;
 
     fn lower_errs(src: &str) -> Vec<String> {
@@ -19187,13 +19191,33 @@ mod float_collection_tests {
     }
 
     #[test]
-    fn float_keys_and_members_still_fail_to_lower() {
-        // Deferred until the hash/eq ruling (#800 Phase 2): a float dict KEY and a
-        // float set MEMBER have no hashing path, so lowering rejects them. (Sema
-        // catches these first with ZAP4027 in a full compile; this is the
-        // defense-in-depth lowering gate.)
-        lower_fails("def main():\n    dict[float64, str] d = {}\n");
-        lower_fails("def main():\n    set[float64] s = {}\n");
+    fn float_keys_and_members_lower() {
+        // #800 Phase 2 (#803): a float dict KEY and a float set MEMBER lower to
+        // the `_f64` key entry points (canonicalise `-0.0`, reject NaN — D-0138).
+        // Construct, insert, read-back, membership, `.keys()`, `del`, and an
+        // f64-keyed f64-valued dict all lower cleanly.
+        lowers_ok(
+            "def main():\n    dict[float64, str] d = {}\n    d[1.5] = \"a\"\n    \
+             str x = d[1.5]\n    print(x)\n",
+        );
+        lowers_ok(
+            "def main():\n    dict[float64, int64] d = {1.5: 1, 2.5: 2}\n    \
+             print(1.5 in d)\n    del d[1.5]\n",
+        );
+        lowers_ok(
+            "def main():\n    dict[float64, float64] d = {1.5: 2.5}\n    \
+             float x = d[1.5]\n    print(x)\n",
+        );
+        lowers_ok(
+            "def main():\n    dict[float64, str] d = {1.5: \"a\"}\n    \
+             list[float64] ks = d.keys()\n    print(len(ks))\n",
+        );
+        lowers_ok(
+            "def main():\n    set[float64] s = set[float64]()\n    s.add(1.5)\n    \
+             print(1.5 in s)\n",
+        );
+        lowers_ok("def main():\n    auto s = {1.5, 2.5}\n    print(len(s))\n");
+        lowers_ok("def main():\n    auto d = {1.5: 1}\n    print(len(d))\n");
     }
 
     #[test]

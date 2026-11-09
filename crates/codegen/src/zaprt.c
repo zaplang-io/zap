@@ -1433,6 +1433,31 @@ static double zap_f64_from_bits(int64_t w) {
     return u.d;
 }
 
+/* Canonicalize a `float64` dict KEY / set MEMBER and reject NaN (#803, D-0138).
+ * Zap floats are value words with no object identity, so Python's identity-based
+ * `nan`-as-key behaviour cannot be reproduced; any NaN used as a key/member
+ * therefore raises a CATCHABLE `ValueError` (via `zap_panic_typed`, the same
+ * mechanism as float division-by-zero), never a silent slot or a process abort.
+ * A finite key is canonicalized `-0.0 -> +0.0` so `0.0` and `-0.0` collide to one
+ * slot (Python `==` parity). The returned word is the canonical IEEE bits, which
+ * the dict/set then store, hash, and compare as a plain `i64` word (KEY_I64):
+ * after canonicalization and NaN rejection, float equality IS bit equality, so no
+ * new keykind or per-element comparator is needed. `msg`/`len` name the position
+ * ("...dict key" / "...set member") for the raised exception. */
+static int64_t zap_f64_key_word(double v, const char *msg, int64_t len) {
+    if (isnan(v)) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(msg, len));
+    }
+    if (v == 0.0) {
+        v = 0.0; /* collapse -0.0 to +0.0 (both compare == 0.0) */
+    }
+    return zap_f64_bits(v);
+}
+
+/* Fixed messages for the two NaN-rejection positions (#803). */
+#define ZAP_F64_DICT_KEY_NAN "NaN cannot be used as a dict key"
+#define ZAP_F64_SET_MEM_NAN "NaN cannot be used as a set member"
+
 /* `del xs[i]` (#595): remove the element at index `i`, shifting the tail down
  * one slot. The index is normalized (negatives count from the end) and bounds-
  * checked by `zap_list_norm`, so an out-of-range `del` raises the same catchable
@@ -1872,6 +1897,35 @@ double zap_dict_get_fn_f64(void *dp, void *k, void *hashfn, void *eqfn) {
     return zap_f64_from_bits(zap_dict_get(dp, (int64_t)(intptr_t)k, KEY_FN));
 }
 
+/* `dict[float64, V]` — a float KEY (#803, D-0138). The key word is the canonical
+ * IEEE bits of `k` (`-0.0 -> +0.0`, NaN rejected with a catchable ValueError) via
+ * `zap_f64_key_word`, then stored/hashed/compared as a plain i64 word (KEY_I64) —
+ * so `0.0` and `-0.0` collide and float equality is bit equality. The key is not
+ * a GC pointer, so `key_ptr` stays 0. One setter/getter per value kind
+ * (i64 / ptr / f64); a missing key reads back as the null word (0 / NULL / 0.0),
+ * matching the non-raising `i64`/`str`-keyed read. */
+#define ZAP_DICT_F64_KEY(k) \
+    zap_f64_key_word((k), ZAP_F64_DICT_KEY_NAN, (int64_t)sizeof(ZAP_F64_DICT_KEY_NAN) - 1)
+void zap_dict_set_f64_i64(void *d, double k, int64_t v) {
+    zap_dict_set(d, ZAP_DICT_F64_KEY(k), KEY_I64, v);
+}
+void zap_dict_set_f64_ptr(void *d, double k, void *v) {
+    ((ZapDict *)d)->val_ptr = 1;
+    zap_dict_set(d, ZAP_DICT_F64_KEY(k), KEY_I64, (int64_t)(intptr_t)v);
+}
+void zap_dict_set_f64_f64(void *d, double k, double v) {
+    zap_dict_set(d, ZAP_DICT_F64_KEY(k), KEY_I64, zap_f64_bits(v));
+}
+int64_t zap_dict_get_f64_i64(void *d, double k) {
+    return zap_dict_get(d, ZAP_DICT_F64_KEY(k), KEY_I64);
+}
+void *zap_dict_get_f64_ptr(void *d, double k) {
+    return (void *)(intptr_t)zap_dict_get(d, ZAP_DICT_F64_KEY(k), KEY_I64);
+}
+double zap_dict_get_f64_f64(void *d, double k) {
+    return zap_f64_from_bits(zap_dict_get(d, ZAP_DICT_F64_KEY(k), KEY_I64));
+}
+
 /* `del d[k]` (#595): remove the entry for `key` by tombstoning its slot, reusing
  * the same open-addressing probe as `zap_dict_set`/`zap_dict_get`. SLOT_TOMB
  * keeps later keys on the same probe chain reachable; the slot is reclaimed on
@@ -1908,6 +1962,12 @@ void zap_dict_del_fn(void *dp, void *k, void *hashfn, void *eqfn) {
     d->hashfn = hashfn;
     d->eqfn = eqfn;
     zap_dict_del(dp, (int64_t)(intptr_t)k, KEY_FN);
+}
+/* `del d[k]` for a float-keyed dict (#803): canonicalize + NaN-reject the key,
+ * then tombstone its i64-word slot. A missing key is a no-op (like the other key
+ * kinds); a NaN key raises before the probe. */
+void zap_dict_del_f64(void *d, double k) {
+    zap_dict_del(d, ZAP_DICT_F64_KEY(k), KEY_I64);
 }
 
 /* --- dict enumeration / membership / copy (ticket #299) ---------------------
@@ -1958,6 +2018,19 @@ void *zap_dict_keys_ptr(void *dp) {
     }
     return out;
 }
+/* `.keys()` / `for k in d` of a `dict[float64, V]` (#803): each key word is the
+ * canonical IEEE bits, so reinterpret it as a `double` into a fresh `list[float64]`
+ * (typed push sets the `f64` element tag so read-back yields a `double`). */
+void *zap_dict_keys_f64(void *dp) {
+    ZapDict *d = (ZapDict *)dp;
+    void *out = zap_list_new();
+    for (int64_t i = 0; i < d->cap; i++) {
+        if (d->entries[i].state == SLOT_FULL) {
+            zap_list_push_f64(out, zap_f64_from_bits(d->entries[i].key));
+        }
+    }
+    return out;
+}
 void *zap_dict_values_i64(void *dp) {
     ZapDict *d = (ZapDict *)dp;
     void *out = zap_list_new();
@@ -2002,6 +2075,11 @@ int64_t zap_dict_contains_fn(void *dp, void *k, void *hashfn, void *eqfn) {
     d->hashfn = hashfn;
     d->eqfn = eqfn;
     return zap_dict_has(dp, (int64_t)(intptr_t)k, KEY_FN);
+}
+/* `k in d` for a float-keyed dict (#803): canonicalize + NaN-reject, then probe
+ * the i64-word slot. A NaN key raises (catchable) rather than reporting absence. */
+int64_t zap_dict_contains_f64(void *d, double k) {
+    return zap_dict_has(d, ZAP_DICT_F64_KEY(k), KEY_I64);
 }
 
 /* Shallow copy: a fresh dict with the same entries. Key and value words are
@@ -2140,6 +2218,22 @@ int64_t zap_set_contains_i64(void *s, int64_t v) {
 }
 int64_t zap_set_contains_str(void *s, void *v) {
     return zap_set_contains(s, (int64_t)(intptr_t)v, KEY_STR);
+}
+/* `set[float64]` — a float MEMBER (#803, D-0138). The member word is the
+ * canonical IEEE bits of `v` (`-0.0 -> +0.0`, NaN rejected with a catchable
+ * ValueError) via `zap_f64_key_word`, then stored/hashed/compared as a plain i64
+ * word (KEY_I64), so `0.0` and `-0.0` collapse to one member. A member is not a
+ * GC pointer, so `elem_ptr` stays 0 and `zap_set_items` snapshots the float words
+ * verbatim (read back as `double` via the `f64` list element tag at the iteration
+ * site). `set` has no element-removal entry point today, so the NaN-on-delete
+ * rule is carried by the dict `del` path (D-0138). */
+#define ZAP_SET_F64_MEM(v) \
+    zap_f64_key_word((v), ZAP_F64_SET_MEM_NAN, (int64_t)sizeof(ZAP_F64_SET_MEM_NAN) - 1)
+void zap_set_add_f64(void *s, double v) {
+    zap_set_add(s, ZAP_SET_F64_MEM(v), KEY_I64);
+}
+int64_t zap_set_contains_f64(void *s, double v) {
+    return zap_set_contains(s, ZAP_SET_F64_MEM(v), KEY_I64);
 }
 
 /* Snapshot the live elements into a fresh list (element words copied verbatim),
