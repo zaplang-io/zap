@@ -25,6 +25,20 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Capability/bounds model for collection elements — design locked** (#805, epic
+  #812, D-0139; RFC #801). Records the authoritative decision (no behavior change
+  yet) that a collection's element requirement — `dict`/`set` key = `Hashable`,
+  `heap` element = `Comparable`, every member storing = `Equatable` — is a **bound
+  on the existing D-0047 structural interfaces**, retiring the separate enumerated
+  `ZAP4024`/`ZAP4027` element guards in later phases. Fixes the capability
+  vocabulary as the adjectival family **`Equatable` / `Hashable` / `Comparable`**
+  (with `Hashable` and `Comparable` refining `Equatable`), settling `Comparable`
+  as the single total-order name (retiring "Orderable"); rules `Storable`
+  compiler-internal (so `f32`/`bigint`/`complex` stay honest "not-yet-lowered"
+  gaps, not type laws); locks conditional auto-derivation of `Equatable`+`Hashable`
+  for value structs and tuples (explicit for reference structs and `Comparable`);
+  and keeps the scope wall at container-element typing (no `Numeric`). Implementing
+  PRs follow in the epic (#806 interface refinement first).
 - **`float64` dict keys and set members** (#803 / #800 Phase 2, D-0138): `float`/
   `float64` is now a first-class **dict key** (`dict[float64, V]`) and **`set`
   member** (`set[float64]`), completing #800. A float key/member is canonicalised

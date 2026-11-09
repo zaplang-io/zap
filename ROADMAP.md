@@ -69,6 +69,11 @@ Once the IR schema and runtime ABI are frozen, these run concurrently:
   `D-0008`, `D-0031`–`D-0034`.
 - **Generics track** — user-defined generics via monomorphization, building on
   the already-generic built-in containers. `D-0017`.
+- **Capability/bounds track** — unify collection-element typing onto the existing
+  structural-interface bounds: adjectival capabilities `Equatable`/`Hashable`/
+  `Comparable` (with `Hashable`/`Comparable` refining `Equatable`), conditional
+  auto-derivation for value aggregates, and interface refinement `interface X: Y`
+  as the one new primitive. `D-0139` (RFC #801, epic #812).
 - **Later language features** — data-carrying enums + `match`, default/keyword
   args, `set` type, decorators/annotations (see `OPEN-QUESTIONS.md`).
 
