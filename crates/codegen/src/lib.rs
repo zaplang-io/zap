@@ -1183,6 +1183,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_str_hash", &[p.into()], Some(i.into()));
         self.declare_rt("zap_i64_hash", &[i.into()], Some(i.into()));
         self.declare_rt("zap_hash_combine", &[i.into(), i.into()], Some(i.into()));
+        // Float field of a value aggregate used as a key (D-0139/#808): canonicalize
+        // `-0.0`, reject `NaN`, return the canonical IEEE bits (#803 semantics).
+        self.declare_rt("zap_f64_value_key_word", &[f64t.into()], Some(i.into()));
 
         // Numeric-array entry points (ticket #24, see design/0002-arrays.md and
         // design/RUNTIME-ABI.md §"Collection layout"). Construction, element
