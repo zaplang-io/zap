@@ -24,19 +24,19 @@ def first_sides(list[Shape] shapes) -> int:
 def main():
     # Single conformer as a list element.
     list[Shape] xs = [Tri()]
-    print(xs[0].sides())        # 3
-    print(first_sides(xs))      # 3
+    print(xs[0].sides())  # 3
+    print(first_sides(xs))  # 3
 
     # Single conformer as a dict VALUE; the key stays an exact `int`.
     dict[int, Shape] d = {1: Tri()}
-    print(d[1].sides())         # 3
+    print(d[1].sides())  # 3
 
     # Distinct conformer values in one dict (values widen to Unknown, then are
     # admitted by real conformance).
     dict[int, Shape] e = {1: Tri(), 2: Quad()}
-    print(e[1].sides())         # 3
-    print(e[2].sides())         # 4
+    print(e[1].sides())  # 3
+    print(e[2].sides())  # 4
 
     # Nested list of interface: the descent recurses to the innermost element.
     list[list[Shape]] nested = [[Tri()]]
-    print(nested[0][0].sides()) # 3
+    print(nested[0][0].sides())  # 3

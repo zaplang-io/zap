@@ -26,12 +26,12 @@ enum Color:
 def main():
     # Tier-3 enum conformer as a single list element.
     list[Ranked] xs = [Expr.Lit(v=5)]
-    print(xs[0].rank())          # 1
+    print(xs[0].rank())  # 1
 
     # Tier-1 enum conformer as a single list element.
     list[Ranked] ys = [Color.Green]
-    print(ys[0].rank())          # 7
+    print(ys[0].rank())  # 7
 
     # Tier-1 enum conformer as a dict value.
     dict[int, Ranked] d = {1: Color.Red}
-    print(d[1].rank())           # 7
+    print(d[1].rank())  # 7

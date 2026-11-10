@@ -23,5 +23,5 @@ def make() -> list[Ranked]:
 
 def main():
     list[Ranked] xs = make()
-    print(xs[0].rank())   # 9  (own method)
-    print(xs[0].name())   # 42 (inherited supertype method)
+    print(xs[0].rank())  # 9  (own method)
+    print(xs[0].name())  # 42 (inherited supertype method)
