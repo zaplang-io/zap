@@ -58,6 +58,73 @@ mod tests {
         }
     }
 
+    // ---- explicit capability dunders on intrinsic bound parameters (I#820) ----
+    //
+    // A capability dunder called by name (`k.__cmp__(x)`, `k.__eq__(x)`,
+    // `k.__hash__()`) on a value of a type parameter bounded on a capability now
+    // lowers when that parameter is monomorphized to an intrinsic type — it emits
+    // the same primitive the operator surface uses, rather than hitting the old
+    // "method call on a non-struct value" error.
+
+    #[test]
+    fn capability_dunders_lower_on_scalar_bound_free_function() {
+        // The #820 repro: a bounded free function calling the dunder on a value of
+        // T, instantiated with int64. Previously ZAP6001.
+        lower_ok(
+            "def order[T: Comparable](T a, T b) -> int64:\n    return a.__cmp__(b)\n\
+             def eq[T: Equatable](T a, T b) -> bool:\n    return a.__eq__(b)\n\
+             def h[T: Hashable](T a) -> int64:\n    return a.__hash__()\n\
+             def main():\n    print(order(1, 2))\n    print(eq(1, 1))\n    print(h(7))\n",
+        );
+    }
+
+    #[test]
+    fn capability_dunders_lower_for_every_intrinsic_instance() {
+        // int / char / bool / tier-1 enum / float / bytes all carry the three
+        // capability dunders intrinsically; each instantiation lowers.
+        let prelude = "enum Color:\n    Red\n    Green\n\
+             def cmp3[T: Comparable](T a, T b) -> int64:\n    return a.__cmp__(b)\n\
+             def same[T: Equatable](T a, T b) -> bool:\n    return a.__eq__(b)\n\
+             def hv[T: Hashable](T a) -> int64:\n    return a.__hash__()\n";
+        for (ty, a, b) in [
+            ("int64", "1", "2"),
+            ("bool", "True", "False"),
+            ("float64", "1.5", "2.5"),
+            ("Color", "Color.Red", "Color.Green"),
+        ] {
+            // Explicit type argument (I#161). __cmp__ (Comparable) +
+            // __eq__/__hash__ (via Hashable ⊃ Equatable).
+            lower_ok(&format!(
+                "{prelude}def main():\n    print(cmp3[{ty}]({a}, {b}))\n\
+                 \x20   print(same[{ty}]({a}, {a}))\n    print(hv[{ty}]({a}))\n"
+            ));
+        }
+        // char arises from indexing; bytes/str are reference byte buffers. `str`
+        // is `Ty::Ptr` and must route to the capability path (not the string-method
+        // path) for the three dunders — all three lower via zap_str_cmp/eq/hash.
+        lower_ok(
+            "def cmp3[T: Comparable](T a, T b) -> int64:\n    return a.__cmp__(b)\n\
+             def same[T: Equatable](T a, T b) -> bool:\n    return a.__eq__(b)\n\
+             def hv[T: Hashable](T a) -> int64:\n    return a.__hash__()\n\
+             def main():\n    str s = \"ab\"\n    print(same[char](s[0], s[1]))\n\
+             \x20   print(same[bytes](b\"x\", b\"y\"))\n    print(hv[bytes](b\"x\"))\n\
+             \x20   print(cmp3[str](\"p\", \"q\"))\n    print(same[str](\"p\", \"q\"))\n\
+             \x20   print(hv[str](\"p\"))\n",
+        );
+    }
+
+    #[test]
+    fn capability_dunder_on_bound_field_in_user_container_lowers() {
+        // The user-container case (#811 body use): a method calls the dunder on a
+        // field typed as the bounded parameter, monomorphized to a scalar.
+        lower_ok(
+            "value struct BST[K: Comparable, V]:\n    K key\n    V val\n\
+             \x20   def cmp_key(self, K other) -> int64:\n        return self.key.__cmp__(other)\n\
+             def main():\n    BST[int64, str] b = BST[int64, str](key=1, val=\"a\")\n\
+             \x20   print(b.cmp_key(2))\n",
+        );
+    }
+
     #[test]
     fn crypto_asym_surface_lowers() {
         // #643 / D-0126: the validated asymmetric-key surface lowers end to end,

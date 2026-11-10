@@ -6317,12 +6317,17 @@ containers:
   function body check (static dispatch after monomorphization; a method's own
   type parameter of the same name shadows the enclosing one). Calling a method the
   bound does not provide is rejected at definition.
-- **Known follow-up (not a blocker).** Calling a capability dunder *explicitly*
-  (`k.__cmp__(x)`) on a parameter whose instance is a **scalar** does not lower yet
-  (the intrinsic op has no method symbol to dispatch to); this is a pre-existing
-  I#164 limitation shared by bounded free functions, not specific to user
-  containers. The idiomatic operator surface (`<`, `==`) lowers correctly for every
-  instance, so it does not block the epic.
+- **Explicit dunder calls on intrinsic instances (I#820, resolved).** Calling a
+  capability dunder *by name* (`k.__cmp__(x)`, `k.__eq__(x)`, `k.__hash__()`) on a
+  value of a bounded type parameter lowers for **every** type the capability
+  admits, not only user types that carry the method symbol: when the parameter is
+  monomorphized to a scalar / `char` / tier-1 enum / `float` / `str` / `bytes`, the
+  dunder lowers to the same primitive the operator surface (`<`, `==`) and the
+  dict/set key path already emit (three-way `zap_str_cmp` / integer compare /
+  `FCmp`; `zap_i64_hash` / `zap_str_hash` / the `#803` float key word). So the
+  method and operator surfaces agree for every type a capability admits. (This
+  closed a pre-existing I#164 limitation that also affected bounded free
+  functions.)
 
 ### Scope wall and cost
 
