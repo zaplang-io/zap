@@ -348,6 +348,26 @@ Shape s = Circle(r=2.0)   # OK: Circle structurally satisfies Shape
 print(s.area())
 ```
 
+Conformance is by method set over **any type**, not structs only (#731): an
+`enum` — tier-1 or tier-3 — that declares every method an interface requires
+conforms and is usable as an interface value, dispatching dynamically. A tier-3
+enum boxes its tagged-struct pointer; a tier-1 enum boxes its scalar tag into a
+small heap cell. Methods are also callable directly on a tier-1 enum value.
+
+```python
+interface Node:
+    def rank(self) -> int
+
+enum Expr:                 # tier-3 (data-carrying)
+    Lit(int v)
+    Add(int l, int r)
+    def rank(self) -> int:
+        return 1
+
+Node n = Expr.Add(l=1, r=2)   # OK: the enum satisfies Node
+print(n.rank())
+```
+
 ### 4.6 Enums (D-0018 tier 1, D-0046 tier 3)
 
 **Tier 1** — named-constant enums: a distinct type, optional explicit values,

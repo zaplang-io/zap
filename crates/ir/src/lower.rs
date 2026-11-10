@@ -903,6 +903,22 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
                     }
                 }
             }
+            // A tier-1 (unboxed-integer) enum that carries methods gets a small
+            // box struct `{Enum}$box = { $tag:i64 }` reserved up front (#731,
+            // D-0016). An unboxed enum has no pointer identity, so to put it behind
+            // an interface's `{data, itable}` fat pointer its scalar tag is stored
+            // in this heap cell and that cell's pointer becomes `data`; the
+            // interface's itable slots point at per-method thunks `{Enum}$box__m`
+            // that reload the tag and tail-call the real `{Enum}__m(self: i64)`.
+            // Reserved only when the enum has at least one method (nothing to
+            // dispatch otherwise), so a plain tier-1 enum costs nothing.
+            ast::Item::Enum(e)
+                if !e.variants.iter().any(|v| !v.fields.is_empty()) && !e.methods.is_empty() =>
+            {
+                let box_name = format!("{}$box", e.name);
+                ids.insert(box_name.clone(), names.len() as u32);
+                names.push(box_name);
+            }
             // A generator (a free `def` with `yield`, I#67) gets a synthetic
             // state-struct id reserved up front — its layout is filled after the
             // function signatures are known (its live locals need type inference).
@@ -1128,6 +1144,20 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
                 }
             }
         }
+        // Fill in each tier-1 enum box layout (#731): a single `i64` tag slot. The
+        // box is a reference struct (not in `value_ids`), so `StructNew` heap-
+        // allocates it and GC traces it as a pointer-free leaf. Its field type is
+        // `i64` to match the enum's unboxed backing integer (`Ty::Enum` lowers to
+        // `i64`).
+        for item in &module.items {
+            if let ast::Item::Enum(e) = item {
+                let is_tier1 = !e.variants.iter().any(|v| !v.fields.is_empty());
+                if is_tier1 && !e.methods.is_empty() {
+                    let box_sid = ids[&format!("{}$box", e.name)];
+                    fields[box_sid as usize].push(("$tag".to_string(), Ty::I64));
+                }
+            }
+        }
         // Lay out each interface's synthetic fat-pointer struct as
         // `{ ptr data, ptr itable }` (D-0016, design/0006 §2.4).
         for &fat_sid in ifaces.values() {
@@ -1327,7 +1357,8 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
             // Tier-3 enum methods (D-0046; used by generic `Optional[T]` etc.,
             // I#154). A tier-3 enum lowers to a tagged struct, so `self` is that
             // struct and a method call dispatches through the ordinary
-            // struct-method path. Tier-1 enum methods are not lowered yet.
+            // struct-method path. Tier-1 enum methods (#731) take `self` as the
+            // unboxed backing integer (`Ty::Enum`); see the `else` branch.
             ast::Item::Enum(e) => {
                 if let Some(sid) = ctx.enums.get(&e.name).and_then(|i| i.sid) {
                     for m in &e.methods {
@@ -1352,6 +1383,42 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
                         // Method default/keyword argument metadata (I#481), as
                         // for struct methods above — `self` dropped.
                         call_params.insert(mangled.clone(), method_param_info(m));
+                        sigs.insert(mangled, (params, ret));
+                    }
+                } else if !e.methods.is_empty() {
+                    // Tier-1 (unboxed-integer) enum methods (#731). `self` is the
+                    // backing integer `Ty::Enum(enum_id)` (a value, by-value). Two
+                    // symbols per method: the real `{Enum}__m(self: enum, ...)`
+                    // (also the target of a direct `value.m()` call), and — when the
+                    // enum has a box (it carries methods) — a thunk
+                    // `{Enum}$box__m(self: box_ptr, ...)` placed in interface
+                    // itables, which reloads the tag and tail-calls the real method.
+                    let enum_id = ctx.enums[&e.name].enum_id;
+                    let box_sid = ctx.ids.get(&format!("{}$box", e.name)).copied();
+                    for m in &e.methods {
+                        let mangled = format!("{}__{}", e.name, m.name);
+                        let ret = m
+                            .ret
+                            .as_ref()
+                            .map(|t| resolve_ty(t, &ctx.tyenv()).unwrap_or(Ty::Void))
+                            .unwrap_or(Ty::Void);
+                        let params: Vec<Ty> = m
+                            .params
+                            .iter()
+                            .map(|p| {
+                                if p.name == "self" {
+                                    Ty::Enum(enum_id)
+                                } else {
+                                    param_ty(p, None, &ctx)
+                                }
+                            })
+                            .collect();
+                        call_params.insert(mangled.clone(), method_param_info(m));
+                        if let Some(bsid) = box_sid {
+                            let mut tparams = vec![Ty::Struct(bsid)];
+                            tparams.extend_from_slice(&params[1..]);
+                            sigs.insert(format!("{}$box__{}", e.name, m.name), (tparams, ret));
+                        }
                         sigs.insert(mangled, (params, ret));
                     }
                 }
@@ -1601,6 +1668,29 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
                         match lower_fn(m, name, Some(sid), &sigs, &ctx, &[], &[], &[]) {
                             Ok(func) => out.funcs.push(func),
                             Err(e) => errors.push(e),
+                        }
+                    }
+                } else if !e.methods.is_empty() {
+                    // Tier-1 (unboxed-integer) enum methods (#731). The real method
+                    // body lowers like a free function whose `self` is the backing
+                    // integer (`Ty::Enum`, supplied by the registered sig, so
+                    // `self_sid` is `None` — `self` is by value, not a struct
+                    // receiver). Alongside it, emit the itable thunk
+                    // `{Enum}$box__m` that reloads the tag from the heap box and
+                    // tail-calls the real method, so dynamic dispatch through an
+                    // interface value reaches the same code a direct call does.
+                    let box_sid = ctx.ids.get(&format!("{}$box", e.name)).copied();
+                    for m in &e.methods {
+                        let name = format!("{}__{}", e.name, m.name);
+                        match lower_fn(m, name, None, &sigs, &ctx, &[], &[], &[]) {
+                            Ok(func) => out.funcs.push(func),
+                            Err(e) => errors.push(e),
+                        }
+                        if let Some(bsid) = box_sid {
+                            match build_tier1_box_thunk(&e.name, &m.name, bsid, &sigs, &ctx) {
+                                Ok(func) => out.funcs.push(func),
+                                Err(e) => errors.push(e),
+                            }
                         }
                     }
                 }
@@ -5134,6 +5224,62 @@ fn lower_fn(
             }
         }
     }
+    Ok(b.func)
+}
+
+/// Synthesize a tier-1 enum interface-dispatch **thunk** `{Enum}$box__{method}`
+/// (#731, D-0016). A tier-1 (unboxed-integer) enum has no pointer identity, so to
+/// put it behind an interface's `{data, itable}` fat pointer its scalar tag is
+/// stored in a heap box `{Enum}$box = { $tag:i64 }` whose pointer becomes `data`.
+/// Interface dispatch always passes `data` as a pointer `self` and calls the
+/// itable slot, but the real method `{Enum}__{method}` takes `self` by value as
+/// the backing integer. This thunk bridges the two: it receives the box pointer,
+/// reloads the `i64` tag, and tail-calls the real method, returning its result.
+/// It is the symbol placed in the `(box_sid, iface)` itable slot, so a dynamic
+/// call reaches exactly the code a direct `value.method()` call does.
+fn build_tier1_box_thunk(
+    enum_name: &str,
+    method_name: &str,
+    box_sid: u32,
+    sigs: &HashMap<String, (Vec<Ty>, Ty)>,
+    ctx: &StructCtx,
+) -> Result<Func, LowerError> {
+    let thunk_name = format!("{enum_name}$box__{method_name}");
+    let real_name = format!("{enum_name}__{method_name}");
+    let (tparams, ret) = sigs
+        .get(&thunk_name)
+        .cloned()
+        .ok_or_else(|| err(format!("internal: missing thunk sig for '{thunk_name}'")))?;
+    let enum_id = ctx
+        .enums
+        .get(enum_name)
+        .map(|e| e.enum_id)
+        .ok_or_else(|| err(format!("internal: enum '{enum_name}' not registered")))?;
+    let mut b = FnLower::new(thunk_name, tparams.clone(), ret, false, true, sigs, ctx);
+    // Reload the backing tag from box field 0 (`self` is value 0, the box ptr).
+    let tag = b.new_value(Ty::Enum(enum_id));
+    b.emit(Inst::FieldGet {
+        dest: tag,
+        base: 0,
+        sid: box_sid,
+        idx: 0,
+    });
+    // Forward the tag as `self` plus every trailing parameter (values 1..N).
+    let mut args = vec![tag];
+    for i in 1..tparams.len() as Value {
+        args.push(i);
+    }
+    let dest = if ret == Ty::Void {
+        None
+    } else {
+        Some(b.new_value(ret))
+    };
+    b.emit(Inst::Call {
+        dest,
+        func: real_name,
+        args,
+    });
+    b.set_term(Term::Ret(dest));
     Ok(b.func)
 }
 
@@ -12137,6 +12283,22 @@ impl<'a> FnLower<'a> {
             if bty == Ty::Ptr {
                 return self.lower_str_method(recv, name, args);
             }
+            // Tier-1 (unboxed-integer) enum method call (#731): the receiver is a
+            // backing integer, not a struct, so the generic struct path below
+            // would reject it. Dispatch directly to the real `{Enum}__{method}`
+            // (self by value) — the heap box and itable thunk exist only for the
+            // interface-value path (`coerce`).
+            if let Ty::Enum(id) = bty {
+                let ename = self
+                    .ctx
+                    .enums
+                    .values()
+                    .find(|e| !e.is_sum && e.enum_id == id)
+                    .map(|e| e.enum_name.clone())
+                    .ok_or_else(|| err("method call on an unregistered enum value"))?;
+                let mangled = format!("{ename}__{name}");
+                return self.call_resolved_method(recv, name, mangled, args);
+            }
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
             };
@@ -12153,78 +12315,7 @@ impl<'a> FnLower<'a> {
                 return self.lower_iface_call(recv, iid, name, args);
             }
             let mangled = format!("{}__{}", self.ctx.names[sid as usize], name);
-            // A generator method call `obj.gen(args)` (I#429) constructs the
-            // compiler-generated state struct — capturing the receiver in `self`'s
-            // field and the arguments in the remaining parameter fields, starting
-            // at `$state == 0` — rather than calling a function; the body was
-            // compiled into the state struct's `__next__` (like a free generator,
-            // I#67).
-            if let Some(gi) = self.ctx.generators.get(&mangled).cloned() {
-                return self.construct_generator_method(&gi, recv, args);
-            }
-            let (ptys, ret) = self
-                .sigs
-                .get(&mangled)
-                .cloned()
-                .ok_or_else(|| err(format!("no method '{name}' on that struct")))?;
-            // `self` is passed by reference (a value-type mutating method acts
-            // on the receiver variable, Swift-style); the remaining arguments
-            // are copied when they are value structs (D-0051). An inline-eligible
-            // argument is copied by the register/sret ABI, so no explicit copy is
-            // emitted for it (see `copy_for_pass`).
-            let mut argvals = vec![recv]; // self
-                                          // Default arguments and out-of-order keyword arguments on methods
-                                          // (I#481, parity with free functions I#298): assemble the explicit
-                                          // arguments into declaration order, filling omitted defaulted
-                                          // parameters, before lowering. The recorded `call_params` drop the
-                                          // implicit `self`, so a plan slot `i` corresponds to parameter type
-                                          // `ptys[i + 1]`. A variadic method (or one with no recorded metadata,
-                                          // e.g. a derived method) keeps the positional lowering path.
-            let ctx = self.ctx;
-            let plan = match ctx.call_params.get(&mangled) {
-                Some(pinfo) if !pinfo.iter().any(|p| p.variadic) => {
-                    Some((pinfo, plan_call_args(&mangled, pinfo, args)?))
-                }
-                _ => None,
-            };
-            if let Some((pinfo, plan)) = plan {
-                for (i, slot) in plan.iter().enumerate() {
-                    // Either an expression written at the call site or the
-                    // omitted parameter's default (lowered fresh here, so it is
-                    // recomputed per call — D-0038).
-                    let e: &Expr = match slot {
-                        ArgSlot::Given(j) => &args[*j].value,
-                        ArgSlot::Default(p) => pinfo[*p].default.as_ref().unwrap(),
-                    };
-                    let v = match ptys.get(i + 1) {
-                        Some(&target) => {
-                            let v = self.expr_coerced(e, target, zapc_diag::ErrorCode::ZAP4021)?;
-                            self.copy_for_pass(v, target, e)
-                        }
-                        None => {
-                            let (v, vt) = self.expr(e)?;
-                            self.copy_for_pass(v, vt, e)
-                        }
-                    };
-                    argvals.push(v);
-                }
-            } else {
-                for (i, a) in args.iter().enumerate() {
-                    let (v, vt) = self.expr(&a.value)?;
-                    let target = *ptys.get(i + 1).unwrap_or(&vt);
-                    let v = self.coerce(v, vt, target);
-                    let v = self.copy_for_pass(v, target, &a.value);
-                    argvals.push(v);
-                }
-            }
-            let dest = if ret == Ty::Void {
-                None
-            } else {
-                Some(self.new_value(ret))
-            };
-            self.throwing_call(dest, &mangled, argvals);
-            let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
-            Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }))
+            self.call_resolved_method(recv, name, mangled, args)
         } else {
             // A function value produced by an arbitrary expression (I#163),
             // e.g. `(get_fn())(x)` or a list element `fns[i](x)`: evaluate the
@@ -12237,6 +12328,94 @@ impl<'a> FnLower<'a> {
                 "only direct function calls are supported by codegen yet",
             ))
         }
+    }
+
+    /// Lower a direct method call to a resolved (statically known) target
+    /// `mangled`, with `recv` already lowered as `self`. Shared by the struct
+    /// method path and the tier-1 enum method path (#731): a generator method
+    /// (I#429) constructs its state struct instead, and otherwise the explicit
+    /// arguments are assembled into declaration order — filling omitted defaults
+    /// and placing out-of-order keyword arguments (I#481) — then the call is
+    /// emitted (an `invoke` inside a `try`, else a plain `call`). `name` is used
+    /// only for the "no such method" diagnostic.
+    fn call_resolved_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        mangled: String,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        // A generator method call `obj.gen(args)` (I#429) constructs the
+        // compiler-generated state struct rather than calling a function; its body
+        // was compiled into the state struct's `__next__` (like a free generator,
+        // I#67). Tier-1 enum method generators are rejected in sema, so this only
+        // fires for structs / tier-3 enums.
+        if let Some(gi) = self.ctx.generators.get(&mangled).cloned() {
+            return self.construct_generator_method(&gi, recv, args);
+        }
+        let (ptys, ret) = self
+            .sigs
+            .get(&mangled)
+            .cloned()
+            .ok_or_else(|| err(format!("no method '{name}' on that value")))?;
+        // `self` is passed first (by reference for a struct receiver, by value for
+        // a tier-1 enum's backing integer); the remaining arguments are copied
+        // when they are value structs (D-0051). An inline-eligible argument is
+        // copied by the register/sret ABI, so no explicit copy is emitted for it
+        // (see `copy_for_pass`).
+        let mut argvals = vec![recv]; // self
+                                      // Default arguments and out-of-order keyword arguments on methods
+                                      // (I#481, parity with free functions I#298): assemble the explicit
+                                      // arguments into declaration order, filling omitted defaulted
+                                      // parameters, before lowering. The recorded `call_params` drop the
+                                      // implicit `self`, so a plan slot `i` corresponds to parameter type
+                                      // `ptys[i + 1]`. A variadic method (or one with no recorded metadata,
+                                      // e.g. a derived method) keeps the positional lowering path.
+        let ctx = self.ctx;
+        let plan = match ctx.call_params.get(&mangled) {
+            Some(pinfo) if !pinfo.iter().any(|p| p.variadic) => {
+                Some((pinfo, plan_call_args(&mangled, pinfo, args)?))
+            }
+            _ => None,
+        };
+        if let Some((pinfo, plan)) = plan {
+            for (i, slot) in plan.iter().enumerate() {
+                // Either an expression written at the call site or the
+                // omitted parameter's default (lowered fresh here, so it is
+                // recomputed per call — D-0038).
+                let e: &Expr = match slot {
+                    ArgSlot::Given(j) => &args[*j].value,
+                    ArgSlot::Default(p) => pinfo[*p].default.as_ref().unwrap(),
+                };
+                let v = match ptys.get(i + 1) {
+                    Some(&target) => {
+                        let v = self.expr_coerced(e, target, zapc_diag::ErrorCode::ZAP4021)?;
+                        self.copy_for_pass(v, target, e)
+                    }
+                    None => {
+                        let (v, vt) = self.expr(e)?;
+                        self.copy_for_pass(v, vt, e)
+                    }
+                };
+                argvals.push(v);
+            }
+        } else {
+            for (i, a) in args.iter().enumerate() {
+                let (v, vt) = self.expr(&a.value)?;
+                let target = *ptys.get(i + 1).unwrap_or(&vt);
+                let v = self.coerce(v, vt, target);
+                let v = self.copy_for_pass(v, target, &a.value);
+                argvals.push(v);
+            }
+        }
+        let dest = if ret == Ty::Void {
+            None
+        } else {
+            Some(self.new_value(ret))
+        };
+        self.throwing_call(dest, &mangled, argvals);
+        let rv = dest.unwrap_or_else(|| self.iconst(Ty::I32, 0));
+        Ok((rv, if ret == Ty::Void { Ty::I32 } else { ret }))
     }
 
     /// Lower an **indirect call** through a first-class function value (I#163):
@@ -17532,6 +17711,51 @@ impl<'a> FnLower<'a> {
         Ok(name)
     }
 
+    /// Synthesize the Display renderer for a tier-1 enum's interface box
+    /// `{Enum}$box` (#731, D-0124/D-0016). The box erases the enum to a bare
+    /// `{ $tag:i64 }` heap cell, so the generic struct renderer would print
+    /// `Color$box($tag=1)` — wrong. This renderer instead reloads the tag and
+    /// renders it as the enum member (`Color.Green`), reusing the exact tier-1
+    /// enum render path (`render_value` on `Ty::Enum`) that a bare enum value
+    /// uses. Placed in the itable's renderer slot so `print`/`str`/f-string on an
+    /// interface value backed by a tier-1 enum renders correctly (ties off #707).
+    /// Memoized per box id in `synth_reprfns`, like the other synthesized reprs.
+    fn tier1_box_repr_fn(&mut self, box_sid: u32, enum_id: u32) -> Result<String, LowerError> {
+        if let Some(name) = self.ctx.synth_reprfns.borrow().get(&box_sid) {
+            return Ok(name.clone());
+        }
+        let name = format!("{}$repr", self.ctx.names[box_sid as usize]);
+        self.ctx
+            .synth_reprfns
+            .borrow_mut()
+            .insert(box_sid, name.clone());
+        let mut b = FnLower::new(
+            name.clone(),
+            vec![Ty::Struct(box_sid)],
+            Ty::Ptr,
+            false,
+            true,
+            self.sigs,
+            self.ctx,
+        );
+        let tag = b.new_value(Ty::Enum(enum_id));
+        b.emit(Inst::FieldGet {
+            dest: tag,
+            base: 0,
+            sid: box_sid,
+            idx: 0,
+        });
+        match b.render_value(tag, Ty::Enum(enum_id), RenderMode::Repr) {
+            Ok(s) => b.set_term(Term::Ret(Some(s))),
+            Err(e) => {
+                self.ctx.synth_reprfns.borrow_mut().remove(&box_sid);
+                return Err(e);
+            }
+        }
+        self.ctx.generated.borrow_mut().push(b.func);
+        Ok(name)
+    }
+
     /// Resolve the symbol name of the function that renders a `list`/`dict`/`set`
     /// value of ZIR type `vt` to its Python string form (#274, D-0124),
     /// synthesizing it on demand (memoized per container type):
@@ -18868,6 +19092,55 @@ impl<'a> FnLower<'a> {
                         if !self.ctx.iface_renderers.borrow().contains_key(&from_sid) {
                             if let Ok(sym) = self.struct_repr_fn(from_sid) {
                                 self.ctx.iface_renderers.borrow_mut().insert(from_sid, sym);
+                            }
+                        }
+                        return dest;
+                    }
+                } else if let Ty::Enum(eid) = from {
+                    // Tier-1 (unboxed-integer) enum -> interface value (#731,
+                    // D-0016). A tier-1 enum has no pointer identity, so box its
+                    // scalar tag into a fresh heap cell `{Enum}$box = { $tag:i64 }`
+                    // and use that pointer as the fat pointer's `data`. Each
+                    // widening boxes afresh — so the box's `is`-identity is unique
+                    // per conversion, NOT shared across widenings of the same tag
+                    // (documented under the D-0016 extension); use `==` for value
+                    // equality. The box is an immutable, pointer-free leaf: GC
+                    // traces it trivially and rooting is transitive through the fat
+                    // pointer (as for value-struct boxing, I#75). Dispatch goes
+                    // through the itable's per-method thunks `{Enum}$box__m`.
+                    let ename = self
+                        .ctx
+                        .enums
+                        .values()
+                        .find(|e| !e.is_sum && e.enum_id == eid)
+                        .map(|e| e.enum_name.clone());
+                    if let Some(box_sid) =
+                        ename.and_then(|n| self.ctx.ids.get(&format!("{n}$box")).copied())
+                    {
+                        let boxv = self.new_value(Ty::Struct(box_sid));
+                        self.emit(Inst::StructNew {
+                            dest: boxv,
+                            sid: box_sid,
+                        });
+                        self.emit(Inst::FieldSet {
+                            base: boxv,
+                            sid: box_sid,
+                            idx: 0,
+                            val: v,
+                        });
+                        let dest = self.new_value(to);
+                        self.emit(Inst::IfaceMake {
+                            dest,
+                            data: boxv,
+                            iid,
+                            concrete_sid: box_sid,
+                        });
+                        // #707 renderer slot: a per-box renderer that reloads the
+                        // tag and renders the enum member (`Color.Green`), so
+                        // `print`/`str`/f-string on the interface value works.
+                        if !self.ctx.iface_renderers.borrow().contains_key(&box_sid) {
+                            if let Ok(sym) = self.tier1_box_repr_fn(box_sid, eid) {
+                                self.ctx.iface_renderers.borrow_mut().insert(box_sid, sym);
                             }
                         }
                         return dest;
