@@ -42,13 +42,13 @@ value struct Bag[E: Hashable]:
 def main():
     # Comparable bound, scalar key: `<` lowers to an integer compare.
     Pair[int64, str] p = Pair[int64, str](key=5, val="five")
-    print(p.get())    # five
+    print(p.get())  # five
     print(p.less(9))  # True
     print(p.less(1))  # False
 
     # Comparable bound, value-struct key deriving Ord.
     Pair[Key, str] pk = Pair[Key, str](key=Key(id=2), val="k2")
-    print(pk.get())   # k2
+    print(pk.get())  # k2
 
     # Hashable bound, scalar element: `==` lowers to a string compare.
     Bag[str] b = Bag[str](first="x")
