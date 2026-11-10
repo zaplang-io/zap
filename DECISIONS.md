@@ -182,12 +182,28 @@ needing no new happens-before edge (D-0141). Cross-refs: D-0016, D-0046, D-0047,
 D-0051, D-0124 (#707 rendering), D-0110 (#611 `is`), D-0140/D-0141; tickets
 #429/#449 (enum methods), #707 (interface-value rendering), #731.
 
-**Not changed by #731 (pre-existing interface limitations, shared by all concrete
-types — structs and enums alike, so not enum-specific):** storing a concrete value
-into an *interface-typed collection element* (`list[Iface]`/`dict` value) and
-*dynamically dispatching a refined-supertype method* on an interface value are
-separate interface-support follow-ups (I#84 / D-0139), reported, not worked
-around.
+**Interface-typed collection elements (#829, I#84, resolved).** A concrete
+conformer stored into an *interface-typed collection element* (`list[Iface]`, a
+`dict` value) is widened into the `{data, itable}` fat pointer (as for a binding)
+and the fat pointer is then **heap-boxed**: a uniform one-word collection cell
+cannot hold a two-word stack-inline fat pointer without dangling, so the cell
+holds a stable pointer to a heap copy of the pair. The copy is GC-safe — its
+`data` word is a heap pointer the tracer follows and its `itable` word is a
+static global the precise tracer skips as a non-heap pointer. (A struct *field*
+of interface type needs no box: it is laid out inline-in-aggregate.) This holds
+uniformly for struct conformers and both enum tiers. The *sema* admission of such
+an element (element-wise interface conformance inside a collection type) is
+tracked separately in #831; the lowering above already handles it.
+
+**Refined-supertype dispatch on an interface value (#830, D-0139, resolved).** An
+interface's dispatch table (itable slot order) is its own methods first
+(declaration order), then every method inherited from its transitive refined
+supertypes, in supertype declaration order, each method name once. A method call
+on an interface value resolves its dynamic slot by searching this same list, so
+an inherited supertype method (`Named.name` called on a `Ranked` value) dispatches
+to the slot the itable laid out for it. The order is a property of the interface,
+not the concrete type, so it is stable across all conformers (struct, tier-3, and
+tier-1 enum alike).
 
 ## D-0017 — Generics: yes, monomorphized, staged
 **Status:** Locked (design) / staged implementation

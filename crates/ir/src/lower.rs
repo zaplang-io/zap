@@ -655,12 +655,21 @@ struct GenExprIter {
 
 /// Lowered interface metadata (D-0016). `fat_sid` is the synthetic inline
 /// `{ptr data, ptr itable}` struct layout; `methods` is the dispatch-table slot
-/// order (interface declaration order).
+/// order — the interface's own methods (declaration order) followed by every
+/// method inherited from its transitive refined supertypes (#830, D-0139). A
+/// conforming type's itable is built slot-by-slot from this list by name, and a
+/// method call resolves its dynamic slot index by searching it, so a
+/// supertype-inherited method (e.g. `Named.name` on a `Ranked` value) dispatches
+/// to the same slot the itable laid out for it.
 #[derive(Clone)]
 struct InterfaceLow {
     name: String,
     fat_sid: u32,
     methods: Vec<IfaceMethodLow>,
+    /// Names of the refined supertypes this interface declares (D-0139/#806):
+    /// the `Named` in `interface Ranked: Named`. Used once, in the post-build
+    /// expansion pass, to fold each supertype's methods into `methods`.
+    supertypes: Vec<String>,
 }
 
 /// One interface method slot (D-0016): its name (used to resolve a call and to
@@ -1214,12 +1223,88 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
                         }
                     })
                     .collect();
+                // Refined supertypes (D-0139/#806): record each named supertype
+                // so the post-build pass can fold its methods into this
+                // interface's dispatch-table (#830). A supertype is always a
+                // plain interface name; anything else is rejected by sema.
+                let supertypes = i
+                    .supertypes
+                    .iter()
+                    .filter_map(|t| match t {
+                        ast::Type::Named { name, .. } => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect();
                 interfaces.push(InterfaceLow {
                     name: i.name.clone(),
                     fat_sid,
                     methods,
+                    supertypes,
                 });
             }
+        }
+    }
+
+    // Fold each interface's transitive refined-supertype methods into its
+    // dispatch-table (#830, D-0139). The slot order is the interface's own
+    // methods first (declaration order), then each supertype's *effective*
+    // methods (its own plus its supertypes', recursively) in supertype
+    // declaration order, skipping any method name already present — so an
+    // interface that re-declares a supertype method keeps its own slot and an
+    // inherited method appears exactly once. This single list is the source of
+    // truth for both the itable layout (codegen builds slot k from
+    // `interfaces[iid].methods[k]` by name -> `Concrete__name`) and dynamic
+    // dispatch (`lower_iface_call` resolves a method's index by searching it),
+    // so the two always agree. Cycle-safe via a visited set; a malformed cyclic
+    // refinement is reported separately by sema (ZAP4082).
+    {
+        let by_name: HashMap<String, usize> = interfaces
+            .iter()
+            .enumerate()
+            .map(|(idx, i)| (i.name.clone(), idx))
+            .collect();
+        // Depth-first effective-method list for interface `idx`, appending to
+        // `out` and tracking seen method names in `seen`.
+        fn collect_effective(
+            idx: usize,
+            interfaces: &[InterfaceLow],
+            by_name: &HashMap<String, usize>,
+            visited: &mut HashSet<usize>,
+            seen: &mut HashSet<String>,
+            out: &mut Vec<IfaceMethodLow>,
+        ) {
+            if !visited.insert(idx) {
+                return;
+            }
+            for m in &interfaces[idx].methods {
+                if seen.insert(m.name.clone()) {
+                    out.push(m.clone());
+                }
+            }
+            for sup in &interfaces[idx].supertypes {
+                if let Some(&sidx) = by_name.get(sup) {
+                    collect_effective(sidx, interfaces, by_name, visited, seen, out);
+                }
+            }
+        }
+        let expanded: Vec<Vec<IfaceMethodLow>> = (0..interfaces.len())
+            .map(|idx| {
+                let mut out = Vec::new();
+                let mut visited = HashSet::new();
+                let mut seen = HashSet::new();
+                collect_effective(
+                    idx,
+                    &interfaces,
+                    &by_name,
+                    &mut visited,
+                    &mut seen,
+                    &mut out,
+                );
+                out
+            })
+            .collect();
+        for (iface, methods) in interfaces.iter_mut().zip(expanded) {
+            iface.methods = methods;
         }
     }
     // Python imports (ticket #27, D-0012): map each imported module's in-scope
@@ -6615,6 +6700,52 @@ impl<'a> FnLower<'a> {
             }
         }
         v
+    }
+
+    /// The interface fat-pointer struct id when `elem` is an interface-typed
+    /// collection element, else `None`. An interface element flows as a
+    /// `Ty::Struct(fat_sid)` word (`Elem::Struct(fat_sid)`), distinguished from
+    /// an ordinary struct element by having a registered interface id.
+    fn iface_elem(&self, elem: Elem) -> Option<u32> {
+        match elem.ty() {
+            Ty::Struct(sid) => self.ctx.iid_of_fat_sid(sid).map(|_| sid),
+            _ => None,
+        }
+    }
+
+    /// Box a value for storage in a collection element word (I#84/#829). Like
+    /// [`box_if_value`], a value struct is copied to the heap (D-0051); in
+    /// addition, an **interface value** — physically a two-word `{data, itable}`
+    /// fat pointer built on a stack alloca — is copied into a heap cell so the
+    /// element word is a stable, GC-traced pointer to the pair instead of a
+    /// dangling stack address once the building frame returns. (A struct *field*
+    /// of interface type is laid out inline-in-aggregate and so needs no box;
+    /// only a uniform one-word collection cell does.) The heap cell is a
+    /// pointer-free-leaf-safe copy: its `data` word is a heap pointer the tracer
+    /// follows, and its `itable` word is a static global the precise tracer
+    /// skips as a non-heap pointer. Read-back reconstitutes the same
+    /// `Ty::Struct(fat_sid)` the dispatch (`IfaceCall`) and render paths expect.
+    fn box_elem_for_store(&mut self, v: Value, ty: Ty) -> Value {
+        if let Ty::Struct(sid) = ty {
+            if self.ctx.iid_of_fat_sid(sid).is_some() {
+                return self.copy_value_struct(v, sid);
+            }
+        }
+        self.box_if_value(v, ty)
+    }
+
+    /// Does a value of type `vt` satisfy an interface-typed collection element of
+    /// kind `want` by structural conformance (#829)? True when `want` is an
+    /// interface element and `vt` is a concrete conformer source — a plain struct
+    /// (reference or value, or a tier-3 enum's tagged struct) or a tier-1 enum —
+    /// that is not itself an interface fat pointer (interface -> interface
+    /// widening is a separate, unsupported conversion). Sema has already verified
+    /// that `vt` actually conforms; this only recognizes the *shape* of a
+    /// coercible source so [`coerce`] can box it via `Inst::IfaceMake`.
+    fn conforms_to_iface_elem(&self, vt: Ty, want: Elem, actual: Elem) -> bool {
+        self.iface_elem(want).is_some()
+            && self.iface_elem(actual).is_none()
+            && matches!(vt, Ty::Struct(_) | Ty::Enum(_))
     }
 
     /// A field-wise copy of value struct `sid` at `src` into a fresh instance.
@@ -14152,7 +14283,13 @@ impl<'a> FnLower<'a> {
         let push = |s: &mut FnLower<'a>, v: Value, t: Ty| -> Result<(), LowerError> {
             let ek = match elem.get() {
                 Some(e) => {
-                    if list_elem_kind(t, &s.ctx.nested)? != e {
+                    let actual = list_elem_kind(t, &s.ctx.nested)?;
+                    // A concrete value whose representation differs from the
+                    // declared element is accepted only when the element is an
+                    // interface and the value structurally conforms (#829):
+                    // `coerce` boxes it into the `{data, itable}` fat pointer
+                    // below. Any other mismatch is still a representation error.
+                    if actual != e && !s.conforms_to_iface_elem(t, e, actual) {
                         return Err(err(format!(
                             "list element expects `{}`, found `{}`",
                             s.render_ty(&s.elem_ty(e)),
@@ -14168,7 +14305,7 @@ impl<'a> FnLower<'a> {
                 }
             };
             let v = s.coerce(v, t, ek.ty());
-            let v = s.box_if_value(v, ek.ty());
+            let v = s.box_elem_for_store(v, ek.ty());
             s.emit(Inst::Call {
                 dest: None,
                 func: format!("zap_list_push_{}", ek.val_suffix()),
@@ -14231,8 +14368,14 @@ impl<'a> FnLower<'a> {
                     };
                     let (kk, vk) = match kinds.get() {
                         Some((kk, vk)) => {
+                            // A dict VALUE may be a concrete conformer of an
+                            // interface-typed value position (#829): it is boxed
+                            // into the fat pointer below. Keys cannot be interface
+                            // typed (an interface value is unhashable), so the key
+                            // still requires an exact representation match.
+                            let va = value_elem_kind(vt, &self.ctx.nested)?;
                             if elem_kind(kt, &self.ctx.nested)? != kk
-                                || value_elem_kind(vt, &self.ctx.nested)? != vk
+                                || (va != vk && !self.conforms_to_iface_elem(vt, vk, va))
                             {
                                 return Err(err(
                                     "dict keys/values must all have the same representation",
@@ -14253,7 +14396,7 @@ impl<'a> FnLower<'a> {
                     let kv = self.coerce(kv, kt, kk.ty());
                     let vv = self.coerce(vv, vt, vk.ty());
                     let kv = self.box_if_value(kv, kk.ty());
-                    let vv = self.box_if_value(vv, vk.ty());
+                    let vv = self.box_elem_for_store(vv, vk.ty());
                     let kfns = self.key_fn_args(kk)?;
                     let mut cargs = vec![dict, kv, vv];
                     cargs.extend_from_slice(&kfns);
@@ -15888,11 +16031,15 @@ impl<'a> FnLower<'a> {
                     return Err(err("append() takes exactly one argument"));
                 }
                 let (v, vt) = self.expr_collection_context(&args[0].value, self.elem_ty(elem))?;
-                if list_elem_kind(vt, &self.ctx.nested)? != elem {
+                let actual = list_elem_kind(vt, &self.ctx.nested)?;
+                // A concrete conformer appended to a `list[Iface]` is boxed into
+                // the interface fat pointer (#829); any other representation
+                // mismatch is rejected.
+                if actual != elem && !self.conforms_to_iface_elem(vt, elem, actual) {
                     return Err(err("append() value has the wrong element type"));
                 }
                 let v = self.coerce(v, vt, elem.ty());
-                let v = self.box_if_value(v, elem.ty());
+                let v = self.box_elem_for_store(v, elem.ty());
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_list_push_{}", elem.val_suffix()),
