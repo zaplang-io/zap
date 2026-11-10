@@ -863,6 +863,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **`heap[T]` of a tier-1 enum aborted at runtime on the first `push`** (#818;
+  surfaced by #809, epic #812, D-0139). A tier-1 (constant) enum element is an
+  `i64` discriminant, but `heap` construction classified it into the `str`/pointer
+  comparator kind (only `Elem::I64` selected the integer comparator; `Elem::Enum`
+  fell through to the `str` arm), so the first `push` routed the enum word into
+  `zap_str_cmp` and crashed — `dict[Color, V]` and `set[Color]` were unaffected.
+  `heap[Color]` now selects the `i64`-word comparator and orders by backing value;
+  push/pop/peek (min and max) run correctly. This realizes the capability-model
+  promise that a tier-1 enum is `Comparable` and `heap[Color]` works out of the box
+  (D-0018 / D-0057).
 - **Explicit capability-dunder call on a scalar-bound generic parameter aborted at
   lowering** (#820; surfaced by #811, epic #812, D-0139). Calling a capability
   dunder by name — `k.__cmp__(x)`, `k.__eq__(x)`, `k.__hash__()` — on a value of a

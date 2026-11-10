@@ -14744,13 +14744,19 @@ impl<'a> FnLower<'a> {
                 }
             }
         }
-        // 0 = i64 word (integers/bools/chars), 1 = str (pointer bytes), 2 = f64
-        // (IEEE value via a total-order comparator, #800). Preserve the prior
-        // mapping for every non-float element kind.
+        // 0 = i64 word (integers/bools/chars, and a tier-1 enum carried as its
+        // backing `i64` discriminant), 1 = str (pointer bytes), 2 = f64 (IEEE value
+        // via a total-order comparator, #800). A tier-1 enum element MUST select
+        // the `i64` comparator, not the pointer/`str` one: it is an `i64` word
+        // (`Elem::Enum.val_suffix() == "i64"`, so `push`/`pop`/`peek` already route
+        // to `zap_heap_push_i64` &c.) and ordering it by backing value is D-0018 /
+        // D-0057. Before, `Elem::Enum` fell into the `_` arm and picked `str`, so
+        // `zap_heap_new` built a pointer-comparator heap and the first `push`
+        // reached `zap_str_cmp` on the enum word and aborted (I#818).
         let kind = self.iconst(
             Ty::I64,
             match elem {
-                Elem::I64 => 0,
+                Elem::I64 | Elem::Enum(_) => 0,
                 Elem::F64 => 2,
                 _ => 1,
             },

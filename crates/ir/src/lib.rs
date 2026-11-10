@@ -1026,6 +1026,51 @@ mod tests {
     }
 
     #[test]
+    fn heap_of_tier1_enum_selects_the_i64_comparator_not_str() {
+        // I#818: a `heap[Color]` (tier-1 enum) is an `i64`-word heap — the enum is
+        // its backing discriminant — so `zap_heap_new(kind, dir)` must pass
+        // kind == 0 (i64), NOT kind == 1 (str/pointer). The bug was `Elem::Enum`
+        // falling into the str arm, so the first `push` routed the enum word into
+        // `zap_str_cmp` and aborted. Assert the kind constant feeding the
+        // construction is 0; also confirm push/pop use the i64 entry points (their
+        // `val_suffix` was already `i64`, so only the comparator kind was wrong).
+        let m = lower_ok(
+            "enum Color:\n    Red\n    Green\n    Blue\n\
+             def main():\n    heap[Color] h = heap[Color]()\n    \
+             h.push(Color.Green)\n    h.push(Color.Red)\n    print(h.pop() == Color.Red)\n",
+        );
+        let main = m.funcs.iter().find(|f| f.is_main).expect("main emitted");
+        // Trace each value to the constant it was defined with, then read the
+        // first argument (kind) of the `zap_heap_new` call.
+        let mut consts: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+        let mut kind_arg: Option<u32> = None;
+        for b in &main.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::IConst { dest, val } => {
+                        consts.insert(*dest, *val);
+                    }
+                    Inst::Call { func, args, .. } if func == "zap_heap_new" => {
+                        kind_arg = args.first().copied();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let kind = consts
+            .get(&kind_arg.expect("zap_heap_new was emitted"))
+            .copied();
+        assert_eq!(
+            kind,
+            Some(0),
+            "heap[tier-1 enum] must select the i64-word comparator (kind 0), not str (1)"
+        );
+        let text = format!("{m}");
+        assert!(text.contains("call @zap_heap_push_i64"), "text:\n{text}");
+        assert!(text.contains("call @zap_heap_pop_i64"), "text:\n{text}");
+    }
+
+    #[test]
     fn lower_exceptions() {
         // raise + try/except/finally lower to invoke/landingpad exception edges
         // and the runtime unwinding entry points (#22).
