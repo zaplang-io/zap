@@ -50,7 +50,10 @@ def main():
     except ValueError as e:
         print("failure wins", e)
     try:
-        scope(timeout=1000):
+        # grace= gives the channel-parked child a drain window so its `with`/
+        # `finally` cleanup runs before the deadline's sever backstop (#825: a
+        # bare `scope(timeout=T)` severs immediately, with no cooperative window).
+        scope(timeout=1000, grace=5000):
             scope:
                 spawn receiver(ready, ch)
                 auto started = <-ready

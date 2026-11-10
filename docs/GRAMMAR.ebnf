@@ -419,8 +419,12 @@ scope_stmt    ::= "scope" [ "(" [ arg_list ] ")" ] block ;
                      scope cancels its tree and raises `ScopeTimeout` to the caller;
                      0 cancels immediately, a negative value raises ValueError.
                      cancel_on=[Signal.X, ...] — a listed signal cancels the scope
-                     tree (D-0058, ticket #77); grace=<ms> — a hard-exit deadline
-                     (milliseconds) from the first cancel_on signal or timeout.
+                     tree (D-0058, ticket #77); grace=<ms> — for a timeout, the
+                     cooperative-drain window after which a non-draining child is
+                     SEVERED (detached + leaked) and `ScopeTimeout` is raised with
+                     the process alive (bare timeout = implicit grace 0; never
+                     `_exit`, never hang; #825/D-0142); for cancel_on, the hard-exit
+                     deadline from the first such signal (signal shutdown only).
                      timeout/on_error/cancel_on are orthogonal. No new syntax: these
                      are ordinary keyword args / a list literal / an int expression.
                      Owns every `spawn` lexically inside; joins/cancels at the dedent,

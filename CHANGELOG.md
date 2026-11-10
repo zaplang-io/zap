@@ -863,6 +863,25 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **`scope(timeout=…)` force-exited the whole process (with `grace`) or hung
+  forever (without) when a child would not drain** (#825, D-0142; cross-refs
+  D-0094/D-0045/D-0044 and the memory model D-0141/#826). A deadline whose child
+  never reached a cancellation point — a tight compute loop with no safepoint, or a
+  blocking FFI/syscall — never delivered the `ScopeTimeout` the contract promises:
+  with `grace=<ms>` the runtime reused the signal-shutdown hard-exit timer and
+  `_exit(1)`'d the entire process (one faulty endpoint taking down every concurrent
+  healthy request); with no `grace` the join blocked indefinitely. The two
+  conflated timer semantics are now split. A per-scope `timeout` deadline cancels
+  cooperatively and then **severs** a still-live child — detaches it to leaked
+  `spawn detached` accounting (never force-unwound or freed, mid-FFI-safe), surfaces
+  it on stderr and in the `coroutine_dump`, and raises a catchable `ScopeTimeout` to
+  the caller — so the process keeps running. A bare `scope(timeout=T)` uses an
+  implicit grace of 0 (sever immediately); `grace=G` only widens the cooperative
+  drain window before the sever. Hard process `_exit` is now reserved for
+  signal-driven shutdown (`scope(cancel_on=…, grace=…)`), whose backstop is
+  unchanged. A severed orphan has no happens-before join edge to the caller, so
+  reading its partial state is a bounded data race caught by `--race` (D-0141).
+
 - **`heap[T]` of a tier-1 enum aborted at runtime on the first `push`** (#818;
   surfaced by #809, epic #812, D-0139). A tier-1 (constant) enum element is an
   `i64` discriminant, but `heap` construction classified it into the `str`/pointer

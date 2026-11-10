@@ -29,7 +29,11 @@ def main():
     # A bare top-level function taken as a first-class value (I#163).
     fn(channel[int64], channel[int64]) -> int64 w = waiter
     try:
-        scope(timeout=1000):
+        # grace= lets both channel-parked children drain cooperatively (raising
+        # Cancelled at `<-ch`, so neither reaches its post-receive `print`) rather
+        # than being severed by the #825 immediate-sever backstop a bare timeout
+        # now applies. The pending report is captured at the deadline regardless.
+        scope(timeout=1000, grace=5000):
             spawn s.serve(ready, ch)  # method
             spawn w(ready, ch)  # function value
             auto a = <-ready
