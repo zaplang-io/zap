@@ -1214,11 +1214,19 @@ spawn detached metrics_flusher()  # daemon: opts out of all scopes (D-0044)
   the complete set of coroutines still outstanding at the deadline (each by name and
   what it was parked on). A recorded child failure takes precedence over the
   timeout. `timeout`, `on_error`, and `cancel_on` are orthogonal: none caps or
-  references another. `grace` is an optional integer-millisecond drain limit
-  measured from deadline/signal cancellation, after which the runtime forces process
-  exit. Completion before the deadline disarms the timer. Cancellation remains
-  cooperative; CPU loops must `checkpoint()`. `spawn detached <call>` opts out of
-  scope ownership (daemon; Go exit semantics). The children receive `Cancelled`,
+  references another. On a `timeout` deadline, `grace` is an optional
+  integer-millisecond **cooperative-drain window** after which a child that still
+  has not drained is **severed** — detached and leaked like `spawn detached` (never
+  force-unwound or freed), surfaced to stderr / the coroutine dump — and the scope
+  raises `ScopeTimeout` with the process still alive (#825, D-0142). A bare
+  `scope(timeout=T)` with no `grace` severs immediately (implicit grace 0); the
+  deadline join never hangs and never force-exits the process. Process hard exit is
+  reserved for the `cancel_on` signal-shutdown path (`grace` there is the
+  hard-exit deadline, measured from the first such signal). A severed orphan has no
+  happens-before join edge to the caller, so reading its partial state is a bounded
+  race (D-0141). Completion before the deadline disarms the timer. Cancellation
+  remains cooperative; CPU loops must `checkpoint()`. `spawn detached <call>` opts
+  out of scope ownership (daemon; Go exit semantics). The children receive `Cancelled`,
   which is outside `Exception`.
 - **Spawn call forms (D-0118):** `spawn` accepts three callable forms — a named
   function (`spawn worker(ch)`), a user-struct method call

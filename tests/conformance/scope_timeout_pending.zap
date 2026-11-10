@@ -16,7 +16,12 @@ def main():
     auto ready = channel[int64]()
     auto ch = channel[int64]()
     try:
-        scope(timeout=1000):
+        # grace= lets the channel-parked children drain cooperatively (raising
+        # Cancelled at `<-ch`, so neither reaches its post-receive `print`) rather
+        # than being severed by the #825 immediate-sever backstop a bare timeout
+        # now applies. The pending report is captured at the deadline regardless,
+        # so the asserted message is unchanged.
+        scope(timeout=1000, grace=5000):
             spawn alpha(ready, ch)
             spawn beta(ready, ch)
             auto first = <-ready

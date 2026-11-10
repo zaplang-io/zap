@@ -2817,8 +2817,13 @@ and cannot carry per-scope identity, so the pending report is `ScopeTimeout`-onl
   its disposition **process-wide**, so **applications own shutdown; libraries should
   not grab signals**. Generalizing `cancel_on` to channel/token triggers is deferred
   (`zaplang-io/zap#492`).
-- `grace = <ms>` is the existing hard-exit backstop for an uncooperative drain,
-  reusing the signal grace timer.
+- `grace = <ms>` bounds an uncooperative drain after the deadline. **Superseded in
+  part by D-0142 (#825):** on a `timeout` deadline `grace` is a cooperative-drain
+  window after which a still-live child is **severed and leaked** (never a process
+  `_exit`); a bare `scope(timeout=T)` with no `grace` uses an implicit grace of 0
+  (sever immediately). The hard-exit (`_exit`) backstop is retained **only** for
+  signal-driven shutdown (`scope(cancel_on=…, grace=…)`), where the process is
+  terminating anyway. See D-0142.
 
 **Precedence (reporting only).** A recorded child failure outranks a block-level
 `ScopeTimeout`/`Cancelled`: it decides *which* exception surfaces, not the trigger
@@ -5253,7 +5258,8 @@ nor '__repr__'" error) or the REPL's `<TypeName>` placeholder.
   `None`, enums, structs, tuples, and containers render identically in both modes.
   The quote selection and escaping use Python's rules (single quotes unless the
   string holds a `'` and no `"`; `\`, the active quote, `
-`/``/`	`, and C0
+`/`
+`/`	`, and C0
   controls / DEL escaped) via the runtime helpers `zap_str_repr` / `zap_bytes_repr`.
 - **Struct default form.** A struct renders `TypeName(f0=v0, f1=v1, …)`, fields in
   `repr` mode (so a `str` field shows `name='a'`). The shape is identical whether
@@ -6672,3 +6678,72 @@ over memory models that leave racy programs wholly undefined.
 D-0045, D-0066, D-0094, D-0112, D-0114, D-0140; zaplang-io/zap#825; prompted by a
 GIL / Python-free-threading design discussion. SC-only atomics and the scope-join
 edge (joined vs severed) are the new settlements.)
+
+## D-0142 — Scope-timeout deadlines SEVER a non-draining child; `_exit` is signal-only (#825)
+**Status:** Locked — fixes a core-runtime defect in the deadline half of D-0094;
+refines D-0094's `grace` and the D-0044 cancellation model. Cross-refs D-0044,
+D-0045, D-0094, and the memory-model decision D-0141 (`docs/MEMORY_MODEL.md`,
+`zaplang-io/zap#826`), which depends on this *severed-not-exited* behavior.
+
+**The defect.** D-0094 says a `timeout` deadline cancels cooperatively and then
+raises `ScopeTimeout`. It implicitly assumed children *drain* after the
+cooperative cancel (`Cancelled` injected at a channel op / `checkpoint()`). A child
+that never reaches a cancellation point — a tight compute loop with no safepoint,
+or a blocking FFI/syscall — never drains, and the runtime did the wrong thing:
+
+- with `grace=<ms>`, it reused the **signal-shutdown hard-exit timer** and
+  `_exit(1)`'d the **whole process**; and
+- with no `grace`, the join **hung forever**.
+
+For a long-running server this is catastrophic: one endpoint whose child ignores
+cancellation (`_exit`) kills every concurrent healthy request, or (hang) ties up
+the handler forever. Neither matches D-0094's contract that *every* failure
+surfaces as a catchable exception.
+
+**Ruling — sever and leak, never force-exit, never hang.** On a non-shutdown
+`scope(timeout=T[, grace=G])` deadline the scope tree is cancelled cooperatively as
+before (running `finally`/`with`). If a child has **not** drained by the grace
+deadline it is **severed**: detached from its scope and reparented to nobody —
+exactly `spawn detached` accounting (Go goroutine semantics: abandoned at process
+exit, not counted in the program-exit join). A severed child is a **leaked orphan**
+that runs to its own completion; it is surfaced to observability (a stderr leak
+diagnostic and a `severed (leaked)` label in the `coroutine_dump`). The runtime
+**never force-unwinds or frees** a severed coroutine — doing so mid-FFI / mid-lock
+is unsafe (the reason Java deprecated `Thread.stop`) — and a severed orphan's later
+uncaught exception (including the `Cancelled` it may still observe) is **dropped**,
+never re-aborting the process. The scope then raises `ScopeTimeout` to the caller
+with the pending set (D-0094), the handler catches it (e.g. returns 504), and the
+process keeps serving.
+
+**No-grace default.** A bare `scope(timeout=T)` with no `grace=` is **always
+enforceable**: it uses an **implicit grace of 0** — cancel cooperatively at T, then
+sever immediately whatever has not drained, then raise `ScopeTimeout`. `grace=G`
+only widens the cooperative-drain window **before** the sever. The hang-forever
+path is removed entirely. Consequence: a bare timeout gives **no** cooperative
+drain window, so a child that has not finished unwinding at T may be severed before
+its `finally`/`with` run — pass `grace=` when cleanup must be allowed to complete.
+
+**`_exit` is reserved for signal-driven shutdown.** Process-level hard exit stays
+only on the `scope(cancel_on=[SIG…], grace=G)` path (`zap_grace_timer`), where the
+process is terminating in response to a shutdown signal anyway; that backstop is
+unchanged. The per-scope timeout path uses a separate drain-then-sever timer
+(`zap_scope_sever_timer`) that never `_exit`s. This split — two timer semantics
+that had been conflated into one hard-exit timer — is the root-cause fix.
+
+**Memory-model consequence (D-0141).** A severed child has **no happens-before
+join edge** to the caller's continuation: it is detached, joined only at program
+exit, so the scope dedent that raises `ScopeTimeout` does **not** synchronize with
+the orphan. A caller that catches `ScopeTimeout` must therefore **not read the
+orphan's partial state** — doing so is a data race (bounded, not UB; caught by
+`--race`). `docs/MEMORY_MODEL.md` (D-0141, #826) records this and depends on this
+decision landing severed-not-exited.
+
+**Precedence unchanged.** A recorded child failure still outranks a block-level
+`ScopeTimeout` (D-0045/D-0094): severing changes only *how* a non-draining child is
+disposed, not which exception the caller sees.
+
+**Rationale.** You cannot safely stop a thread that will not cooperate, so the only
+sound options are *wait* (hang — rejected) or *detach and leak* (bounded, observable
+— chosen). Reporting the timeout as a catchable exception while leaking the orphan
+keeps the single-outcome-channel contract (D-0094) and turns a whole-process kill
+into a per-request error.

@@ -4676,6 +4676,17 @@ typedef struct G {
      * this G last parked on (set at each park site), reported while it is PARKED. */
     const char *name;
     const char *park_reason;
+    /* Severed orphan (#825). Set to 1 when a `scope(timeout=...)` deadline
+     * detached this still-live coroutine from its scope (it did not drain within
+     * the grace window) — it is reparented to nobody (Go `spawn detached`
+     * accounting: scope cleared, `in_live` stays 0) and leaked until it finishes
+     * on its own. The runtime never force-unwinds or frees a severed coroutine
+     * (unsafe mid-FFI / mid-lock — the reason Java deprecated Thread.stop), so a
+     * severed orphan's later uncaught exception is DROPPED rather than aborting
+     * the process (`zap_g_uncaught`): the whole point of severing is that the
+     * caller caught `ScopeTimeout` and the program keeps running. A plain
+     * detached coroutine (severed == 0) keeps the Go abort-on-uncaught rule. */
+    int severed;
     /* Runtime data-race detector (`--race`, #678, epic #665, D-0114). The
      * coroutine's vector-clock index, assigned lazily the first time the engine
      * sees this G (at `zap_race_on_spawn`); -1 until then and for every G in a
@@ -5053,8 +5064,15 @@ static void switch_to_g(M *m, G *g) {
     } else if (g->state == G_DEAD) {
         /* Capture ownership before gfree clears it, then signal the right join
          * barrier: a scoped G releases its `scope:` (ticket #50); a root G
-         * releases the program-exit join; a detached G is joined by nobody. */
-        struct Scope *sc = g->scope;
+         * releases the program-exit join; a detached G is joined by nobody.
+         *
+         * #825: atomically CLAIM the scope's live-count decrement by swapping
+         * `g->scope` to NULL. A concurrent `scope_sever_live` (a timed-out
+         * deadline severing a non-draining sibling) claims the same way, so
+         * whichever runs first owns the single `scope_gdone` and the other sees
+         * NULL and skips it — the owned count is never decremented twice. */
+        struct Scope *sc =
+            __atomic_exchange_n(&g->scope, (struct Scope *)NULL, __ATOMIC_ACQ_REL);
         int in_live = g->in_live;
         gfree(g);
         if (sc) {
@@ -5224,6 +5242,7 @@ static G *galloc(void *fn, void *arg) {
     g->in_live = 0;
     g->name = NULL;
     g->park_reason = NULL;
+    g->severed = 0; /* #825: not a timed-out orphan until a deadline severs it */
     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
     g->race_gid = -1;      /* unassigned until the race engine first sees it */
     /* Cold end of a down-growing stack is its high address. */
@@ -5239,6 +5258,7 @@ static void gfree(G *g) {
     g->arg = NULL;
     g->scope = NULL; /* drop the scope reference so a reused G starts clean */
     g->in_live = 0;
+    g->severed = 0; /* #825: a reused G is not a severed orphan */
     /* Keep the stack buffer for reuse (size-classed free list, one class). */
     zap_np_lock(&g_free_mu);
     g->link = g_free_head;
@@ -6304,6 +6324,17 @@ void *zap_scope_exit_cancel_exc(void *scope_, void *pending) {
 void zap_g_uncaught(void *exc) {
     M *m = cur_m;
     G *g = m ? m->current : NULL;
+    /* #825: a severed orphan (a non-draining child detached by a `scope(timeout=)`
+     * deadline) is joined by nobody and its result is discarded. Dropping its
+     * uncaught exception — above all the `Cancelled` it may still observe, or any
+     * genuine error — is deliberate: re-aborting the process here is exactly the
+     * whole-process kill this fix removes (the caller already caught `ScopeTimeout`
+     * and the program is meant to keep running). A plain `spawn detached`
+     * coroutine (severed == 0) keeps the Go abort-on-uncaught rule below. */
+    if (g && g->severed) {
+        zap_eh_end_catch();
+        return;
+    }
     if (g && g->scope) {
         Scope *sc = g->scope;
         if (exc == (void *)cancelled_exc()) {
@@ -7755,7 +7786,10 @@ static void zap_coroutine_dump_to(FILE *f) {
         if (!g) {
             continue;
         }
-        const char *own = g->scope ? "scoped" : (g->in_live ? "root" : "detached");
+        const char *own = g->severed ? "severed (leaked)"
+                          : g->scope  ? "scoped"
+                          : g->in_live ? "root"
+                                       : "detached";
         const char *nm = g->name ? g->name : "<anonymous>";
         if (g->state == G_PARKED && g->park_reason) {
             fprintf(f, "  coroutine %lld %s [%s on %s, %s]\n", (long long)i, nm,
@@ -8189,10 +8223,16 @@ void zap_signal_on(int64_t signo, void *fn) {
 }
 
 /* ---- public ABI: scope(cancel_on=mask, grace=ms) -------------------------- */
-/* Grace hard-exit timer: a plain (non-GC) detached thread. It references only
- * the malloc'd ScopeSigSub (refcounted), never the GC Scope, so it is immune to
- * the Scope being collected after the block exits. If the scope has not left its
- * block (completed) when the grace period elapses, force process exit. */
+/* Grace HARD-EXIT timer (#825: SIGNAL-driven shutdown ONLY). Reserved for
+ * `scope(cancel_on=[SIG...], grace=G)` via `zap_sig_dispatch`, where the process
+ * is terminating anyway in response to a shutdown signal — forcing exit is the
+ * legitimate backstop there. A per-scope `scope(timeout=...)` deadline must NOT
+ * reach this path: it severs the non-draining child and keeps the process alive
+ * (`zap_scope_sever_timer` below), so one faulty endpoint never takes the server
+ * down. A plain (non-GC) detached thread referencing only the malloc'd,
+ * refcounted ScopeSigSub (never the GC Scope), so it is immune to the Scope being
+ * collected after the block exits. If the scope has not left its block
+ * (completed) when the grace period elapses, force process exit. */
 static void *zap_grace_timer(void *arg) {
     ScopeSigSub *ss = (ScopeSigSub *)arg;
     int64_t ms = ss->grace_ms;
@@ -8221,6 +8261,129 @@ static void zap_grace_arm(ScopeSigSub *ss) {
     ss->refcnt++;
     pthread_t t;
     if (pthread_create(&t, NULL, zap_grace_timer, ss) != 0) {
+        ss->refcnt--; /* could not arm: drop the extra ref */
+        return;
+    }
+    pthread_detach(t);
+}
+
+/* #825: SEVER every coroutine still live in `sc`'s tree that did not drain within
+ * the deadline's (grace) window. Severing detaches the coroutine to Go `spawn
+ * detached` accounting — it is CLAIMED away from its owning scope (so that scope's
+ * join can complete and raise `ScopeTimeout`), marked a leaked orphan
+ * (`g->severed`), and left to finish on its own. It is NEVER force-unwound or
+ * freed (unsafe mid-FFI / mid-lock — the reason Java deprecated Thread.stop) and
+ * NEVER `_exit`s the process. `g->scope` is claimed with an atomic CAS (owner ->
+ * NULL): the coroutine's own death path claims the same way, so whichever runs
+ * first owns the single owned-count decrement and the other is skipped. Each
+ * severed orphan is surfaced to stderr as a leak diagnostic (observability). */
+static void scope_sever_live(Scope *sc, int64_t deadline_ms) {
+    struct sev_row {
+        Scope *owner;
+        const char *name;
+        const char *park;
+    };
+    struct sev_row *rows = NULL;
+    size_t nrows = 0, cap = 0;
+    zap_np_lock(&g_all_mu);
+    for (int64_t i = 0; i < g_all_len; i++) {
+        G *g = g_all[i];
+        if (!g || g->state == G_DEAD) {
+            continue;
+        }
+        Scope *owner = __atomic_load_n(&g->scope, __ATOMIC_ACQUIRE);
+        if (!owner || !scope_contains(sc, owner)) {
+            continue;
+        }
+        /* Mark the orphan before clearing its scope, so a severed coroutine that
+         * later reaches `zap_g_uncaught` (with scope already NULL) is recognized
+         * and its exception dropped rather than aborting the process. */
+        g->severed = 1;
+        Scope *expected = owner;
+        if (!__atomic_compare_exchange_n(&g->scope, &expected, (Scope *)NULL,
+                                         /*weak=*/0, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            /* The coroutine finished first and its death path already claimed the
+             * scope (and decremented the owned count); leave it to that path. */
+            continue;
+        }
+        if (nrows == cap) {
+            cap = cap ? cap * 2 : 8;
+            rows = (struct sev_row *)realloc(rows, cap * sizeof(*rows));
+            if (!rows) {
+                abort();
+            }
+        }
+        rows[nrows].owner = owner;
+        rows[nrows].name = g->name ? g->name : "<anonymous>";
+        rows[nrows].park = (g->state == G_PARKED && g->park_reason)
+                               ? g->park_reason
+                               : gstate_name(g->state);
+        nrows++;
+    }
+    zap_np_unlock(&g_all_mu);
+    /* Release each severed child's owned-count reference and surface the leak.
+     * Done outside g_all_mu so waking a parked joiner cannot invert a lock
+     * order; the deadline-thread lock order (g_sig_mu -> ... -> sc->mu) holds. */
+    for (size_t i = 0; i < nrows; i++) {
+        fprintf(stderr,
+                "zap: scope timed out after %lld ms; severed non-draining "
+                "coroutine '%s' [%s] (leaked; process continues)\n",
+                (long long)deadline_ms, rows[i].name, rows[i].park);
+        scope_gdone(rows[i].owner);
+    }
+    if (nrows > 0) {
+        fflush(stderr);
+    }
+    free(rows);
+}
+
+/* #825: the per-scope `scope(timeout=T[, grace=G])` drain-then-sever backstop —
+ * the TIMEOUT counterpart of the signal `zap_grace_timer`, but it NEVER `_exit`s.
+ * After the grace window (G ms; G == 0 for a bare `scope(timeout=T)` => the
+ * maintainer-ruled implicit grace=0, i.e. sever immediately), if the scope has not
+ * left its block, sever whatever is still running so the join completes and
+ * `ScopeTimeout` reaches the caller. Like the grace timer it is a plain detached
+ * thread holding only the refcounted ScopeSigSub; it touches the GC Scope only
+ * while `completed` is still 0 (checked under g_sig_mu), during which the scope's
+ * own frame keeps it rooted. Holding g_sig_mu across the sever keeps the block
+ * from disarming (and the Scope from being collected) mid-walk. */
+static void *zap_scope_sever_timer(void *arg) {
+    ScopeSigSub *ss = (ScopeSigSub *)arg;
+    /* Register as a GC mutator: `scope_sever_live` reads and rewrites fields of
+     * live GC objects (the Scope and each owned G), so under Immix evacuation the
+     * collector must not move them out from under this thread. Same discipline as
+     * `zap_scope_deadline_main`. The sever itself performs no GC allocation. */
+    zap_mutator_register();
+    int64_t ms = ss->grace_ms;
+    if (ms > 0) {
+        struct timespec ts;
+        ts.tv_sec = ms / 1000;
+        ts.tv_nsec = (ms % 1000) * 1000000L;
+        struct timespec rem;
+        zap_enter_blocking(); /* GC-safe while sleeping out the grace window */
+        while (nanosleep(&ts, &rem) != 0 && errno == EINTR) {
+            ts = rem;
+        }
+        zap_leave_blocking();
+    }
+    zap_np_lock(&g_sig_mu);
+    if (!ss->completed) {
+        scope_sever_live(ss->scope, ss->timeout_ms);
+    }
+    if (--ss->refcnt == 0) {
+        free(ss);
+    }
+    zap_np_unlock(&g_sig_mu);
+    zap_mutator_unregister();
+    return NULL;
+}
+
+/* Caller holds g_sig_mu. Arm the timeout sever backstop for this deadline. */
+static void zap_scope_sever_arm(ScopeSigSub *ss) {
+    ss->refcnt++;
+    pthread_t t;
+    if (pthread_create(&t, NULL, zap_scope_sever_timer, ss) != 0) {
         ss->refcnt--; /* could not arm: drop the extra ref */
         return;
     }
@@ -8337,7 +8500,11 @@ static void *zap_scope_deadline_main(void *arg) {
     zap_np_lock(&g_sig_mu);
     if (!ss->completed) {
         scope_fire_timeout(ss->scope, ss->timeout_ms);
-        if (ss->grace_ms > 0) zap_grace_arm(ss);
+        /* #825: a per-scope timeout NEVER hard-exits. Arm the drain-then-sever
+         * backstop (grace=0 => sever immediately) instead of the signal-shutdown
+         * `_exit` grace timer, so a non-draining child is severed-and-leaked and
+         * the scope raises `ScopeTimeout` to its caller with the process alive. */
+        zap_scope_sever_arm(ss);
     }
     if (--ss->refcnt == 0) free(ss);
     zap_np_unlock(&g_sig_mu);
@@ -8349,7 +8516,11 @@ static void *zap_scope_deadline_main(void *arg) {
  * integer milliseconds. `timeout=0` cancels immediately; a negative duration is a
  * `ValueError`. At expiry the tree is cancelled (running `finally`/`with`) and the
  * scope then raises `ScopeTimeout` to its caller. Orthogonal to `on_error` and
- * `cancel_on`; `grace` reuses the signal hard-exit drain timer. */
+ * `cancel_on`. A child that does not drain within `grace` ms (grace=0 for a bare
+ * `scope(timeout=T)`: the implicit-grace=0 ruling, #825) is SEVERED-and-leaked,
+ * never force-exited and never hung — `grace` only widens the cooperative drain
+ * window before the sever. Hard process exit (`_exit`) is reserved for
+ * signal-driven shutdown (`scope(cancel_on=...)`). */
 void zap_scope_timeout(void *scope_, int64_t duration_ms, int64_t grace_ms) {
     if (duration_ms < 0) {
         zap_panic_typed(ZAP_EXC_VALUE_ERROR,
@@ -8363,7 +8534,7 @@ void zap_scope_timeout(void *scope_, int64_t duration_ms, int64_t grace_ms) {
     ss->next = g_scope_deadlines; g_scope_deadlines = ss;
     if (ss->timeout_ms == 0) {
         scope_fire_timeout(ss->scope, 0);
-        if (ss->grace_ms > 0) zap_grace_arm(ss);
+        zap_scope_sever_arm(ss); /* #825: sever-and-leak, never `_exit` */
         ss->refcnt--; /* no deadline thread for immediate cancellation */
         zap_np_unlock(&g_sig_mu);
         return;

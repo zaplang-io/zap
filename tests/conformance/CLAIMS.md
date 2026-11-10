@@ -197,10 +197,13 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | CHAN-1 | §12 | channels: send/receive, comma-ok receive, `close` (D-0031) | TODO | — |
 | SCOPE-1 | §12 | `scope:` joins spawned coroutines; a child failure cancels siblings (D-0044) | covered | scope_cleanup |
 | SCOPE-2 | §12 | `scope(timeout=<ms>)` cancels and drains children, preserves cleanup, raises `ScopeTimeout` to the caller, and composes orthogonally with the failure policy (a child failure outranks the timeout) | covered | scope_timeout |
-| SCOPE-3 | §12 | scope grace bounds an uncooperative drain after the deadline | covered | scope_timeout_grace |
+| SCOPE-3 | §12 | scope grace bounds an uncooperative drain after the deadline, then severs the non-draining child (detach + leak) and raises a catchable `ScopeTimeout` — the process is never force-exited (#825) | covered | scope_timeout_grace |
 | SCOPE-4 | §12 | `ScopeTimeout` reports every coroutine still outstanding at the deadline, not a sample | covered | scope_timeout_pending |
 | SCOPE-5 | §12 | `spawn` supports named functions, user-struct method calls, and first-class function values, capturing receiver/arguments/closure eagerly in the parent; a `scope:` joins them all (D-0118) | covered | spawn_forms |
 | SCOPE-6 | §12 | the method and function-value `spawn` forms compose with `scope(timeout=…)`: on the deadline the children are cancelled and `ScopeTimeout` reports each by its identity — a method as `Struct.method`, a function value by its callee name (D-0118) | covered | spawn_forms_timeout |
+| SCOPE-7 | §12 | a `scope(timeout=T, grace=G)` whose children never reach a cancellation point SEVERS them at the grace deadline (detach + leak, like `spawn detached`; never force-unwound/freed) and raises a catchable `ScopeTimeout` — the process stays alive and never `_exit`s (#825, D-0142) | covered | scope_timeout_sever |
+| SCOPE-8 | §12 | a bare `scope(timeout=T)` with no `grace=` is always enforceable: at T it severs a non-draining child immediately (implicit grace=0) and raises `ScopeTimeout`; it never hangs the join and never `_exit`s (#825, D-0142) | covered | scope_timeout_nograce |
+| SCOPE-9 | §12 | one endpoint whose child ignores cancellation times out (severed orphan, returns an error) while a concurrent healthy endpoint runs to completion — one faulty request never takes the process down (#825, D-0142) | covered | scope_timeout_server |
 | MOD-1 | §13 | names starting with `_` are private, enforced at compile time (D-0028) | TODO | — |
 | MOD-2 | §13 | whole-module import by short name; no `from X import Y` (D-0052) | TODO | — |
 
