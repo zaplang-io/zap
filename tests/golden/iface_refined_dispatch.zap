@@ -30,10 +30,10 @@ def describe(Ranked r) -> int:
 
 def main():
     Ranked r = Color()
-    print(r.rank())        # 9   (own)
-    print(r.name())        # 1   (inherited from Named)
+    print(r.rank())  # 9   (own)
+    print(r.name())  # 1   (inherited from Named)
     r = Grade()
-    print(r.rank())        # 8   (dispatch follows the new concrete value)
-    print(r.name())        # 2
+    print(r.rank())  # 8   (dispatch follows the new concrete value)
+    print(r.name())  # 2
     print(describe(Color()))  # 19
     print(describe(Grade()))  # 28
