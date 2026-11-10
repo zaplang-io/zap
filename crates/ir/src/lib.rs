@@ -2289,6 +2289,83 @@ mod tests {
         );
     }
 
+    // --- enum capabilities (D-0139/#809) ---
+
+    #[test]
+    fn tier1_enum_dict_key_hashes_as_int_word() {
+        // A tier-1 (constant) enum is int-backed, so a `dict[Color, V]` key hashes
+        // via the integer-word key path with no synthesized key function.
+        lower_ok(
+            "enum Color:\n    Red\n    Green\n    Blue\n\n\
+             def main():\n    dict[Color, int64] d = {}\n    d[Color.Red] = 1\n    \
+             print(d[Color.Red])\n",
+        );
+    }
+
+    #[test]
+    fn tier1_enum_set_and_heap_work() {
+        // Set membership and a `heap[Color]` (ordered by backing int) also work
+        // out of the box for a tier-1 enum.
+        lower_ok(
+            "enum Color:\n    Red\n    Green\n\n\
+             def main():\n    set[Color] s = set[Color]()\n    s.add(Color.Red)\n    \
+             print(Color.Red in s)\n    heap[Color] h = heap[Color]()\n    \
+             h.push(Color.Green)\n    print(h.peek() == Color.Green)\n",
+        );
+    }
+
+    #[test]
+    fn tier3_enum_dict_key_synthesizes_tagged_key_fns() {
+        // A tier-3 (data-carrying) enum keys a dict by synthesizing a structural
+        // `$enum$<sid>$hash`/`$eq` that switches on the tag and folds the active
+        // variant's payload — routed through the function-pointer key path.
+        let m = lower_ok(
+            "enum Tag:\n    A(int64 x)\n    B(str y)\n\n\
+             def main():\n    dict[Tag, int64] d = {}\n    d[Tag.A(x=1)] = 10\n    \
+             d[Tag.B(y=\"hi\")] = 20\n    print(d[Tag.A(x=1)] + d[Tag.B(y=\"hi\")])\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            m.funcs
+                .iter()
+                .any(|f| f.name.starts_with("$enum$") && f.name.ends_with("$hash")),
+            "expected a synthesized tier-3 enum hash fn"
+        );
+        assert!(
+            text.contains("$hash") && text.contains("$eq"),
+            "tier-3 enum key must route through its synthesized hash/eq; text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn tier3_enum_float_payload_key_uses_key_word() {
+        // A float payload field inherits the #803 canonical key word.
+        let m = lower_ok(
+            "enum Num:\n    I(int64 n)\n    F(float64 v)\n\n\
+             def main():\n    dict[Num, int64] d = {}\n    d[Num.F(v=1.5)] = 1\n    \
+             print(d[Num.F(v=1.5)])\n",
+        );
+        let text = format!("{m}");
+        assert!(
+            text.contains("@zap_f64_value_key_word"),
+            "a float payload must hash through zap_f64_value_key_word; text:\n{text}"
+        );
+    }
+
+    #[test]
+    fn tier3_enum_with_nonhashable_payload_as_key_is_clean_error() {
+        // A payload field that is not hashable (a `list`) makes the enum key a
+        // clean coded error, never an ICE.
+        let errs = lower_errs(
+            "enum Bad:\n    Items(list[int64] xs)\n    Empty\n\n\
+             def main():\n    auto d = {Bad.Items(xs=[1]): 1}\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("not hashable")),
+            "a list-payload tier-3 enum key should be a clean error, got: {errs:?}"
+        );
+    }
+
     // --- tuples as dict keys / set elements (#680, D-0049) ---
 
     /// Count the generated tuple key functions in a module (`$tuple$<sid>$hash`).

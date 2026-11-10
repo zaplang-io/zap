@@ -711,6 +711,13 @@ define_codes! {
          or suppressing the one site with a `# noqa` (optionally `# noqa: \
          ZAP5125`) pragma. A team may make it fatal in CI with \
          `--warnings-as-errors` (off by default).";
+    ZAP5126 = 5126 : "intrinsic enum capability cannot be overridden",
+        "A tier-1 (constant) enum's equality and hashing are INTRINSIC — a member \
+         equals another iff they share the same backing value (repeated values \
+         are aliases, D-0018) — so `__eq__`/`__hash__` cannot be hand-written on \
+         it (D-0139/#809). Ordering may be customized with `__cmp__` (it affects \
+         only sort/heap order, never equality), but it must stay a strict total \
+         order over distinct members.";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

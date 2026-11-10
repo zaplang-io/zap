@@ -3027,6 +3027,30 @@ impl Checker {
                     }
                 }
                 Item::Enum(e) => {
+                    // A tier-1 (constant) enum's `Equatable`/`Hashable` are
+                    // INTRINSIC and non-overridable (D-0139/#809): equality is
+                    // backing-value identity (D-0018), so a hand-written
+                    // `__eq__`/`__hash__` — which could try to merge two distinct
+                    // members — is rejected. `__cmp__` stays allowed (ordering is
+                    // a choice; it never changes equality). Tier-3 (data-carrying)
+                    // enums are value aggregates and may override, like structs.
+                    let is_tier1 = !e.variants.iter().any(|v| !v.fields.is_empty());
+                    if is_tier1 {
+                        for m in &e.methods {
+                            if m.name == "__eq__" || m.name == "__hash__" {
+                                self.error(
+                                    ErrorCode::ZAP5126,
+                                    format!(
+                                        "tier-1 enum '{}' cannot define '{}': equality and \
+                                         hashing are intrinsic (by backing value, D-0018); use \
+                                         '__cmp__' to customize ordering only (D-0139/#809)",
+                                        e.name, m.name
+                                    ),
+                                    m.span,
+                                );
+                            }
+                        }
+                    }
                     // Methods on an enum (D-0046) — checked at definition like
                     // struct methods, with `self` typed as the enum. For a
                     // generic enum (`Optional[T]`, I#154) the type parameters are
@@ -10875,6 +10899,44 @@ def main():
             r.contains("__eq__"),
             "reference struct must not auto-derive ==, got:\n{r}"
         );
+    }
+
+    #[test]
+    fn tier1_enum_intrinsic_eq_hash_cannot_be_overridden() {
+        // D-0139/#809: a tier-1 enum's equality/hashing are intrinsic (by backing
+        // value, D-0018), so a hand-written `__eq__`/`__hash__` is rejected
+        // (ZAP5126) — you cannot merge two distinct members via custom equality.
+        let eq = msgs(
+            "enum Color:\n    Red\n    Green\n\
+             \x20   def __eq__(self, Color other) -> bool:\n        return True\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(
+            eq.contains("intrinsic") && eq.contains("Color"),
+            "tier-1 __eq__ override must be rejected, got:\n{eq}"
+        );
+        let hash = msgs(
+            "enum Color:\n    Red\n    Green\n\
+             \x20   def __hash__(self) -> int64:\n        return 0\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(
+            hash.contains("intrinsic"),
+            "tier-1 __hash__ override must be rejected, got:\n{hash}"
+        );
+        // `__cmp__` (ordering) stays allowed on a tier-1 enum.
+        ok("enum Color:\n    Red\n    Green\n\
+            \x20   def __cmp__(self, Color other) -> int64:\n        return 0\n\n\
+            def main():\n    print(1)\n");
+    }
+
+    #[test]
+    fn tier3_enum_may_override_eq() {
+        // A tier-3 (data-carrying) enum is a value aggregate, not intrinsic-Eq, so
+        // a hand-written `__eq__` is allowed (no ZAP5126).
+        ok("enum Tag:\n    A(int64 x)\n    B\n\
+            \x20   def __eq__(self, Tag other) -> bool:\n        return True\n\n\
+            def main():\n    print(1)\n");
     }
 
     #[test]
