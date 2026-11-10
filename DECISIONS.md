@@ -3816,6 +3816,11 @@ deferred (tracked under #661).
    **static lint** (warnings, reusing the #659 warning pipeline), **not** a
    legality-changing flag — there is no `--concurrency-safe` mode that changes
    what compiles. Strictness is a project *warnings-as-errors* policy.
+   **Amended by D-0140:** this holds for every safety diagnostic except the one
+   unconditionally-shared surface — a mutable non-`@shareable` **module global**
+   is a hard error (`ZAP3019`, with an `@unshared` escape). That is a fixed
+   legality rule, not a flag/dialect, so the "no mode forks the language" half of
+   this point is preserved; see D-0140 Decision 4.
 5. **`@shareable` marker (Phase 2).** A nominal annotation a type author applies
    to assert a type is safe to share across coroutines. The sharing lint
    suppresses when a mutable global's type carries it; the built-in `Atomic`/
@@ -6360,3 +6365,161 @@ CI). Nothing past #806 begins until it lands; #810 (Repr) is independent of #806
 (Decided 2026-11-09. Refs: Discussion #801 (RFC + three resolved-positions
 rounds), D-0047, D-0016, D-0017/D-0064, D-0051, D-0049, D-0018/D-0046, D-0124,
 D-0137/D-0138.)
+
+## D-0140 — Shared-mutation safety: no-UB guarantee via always-on guards; no CAS-by-default; `--race` stays opt-in; mutable globals must be shareable
+**Status:** Locked
+
+The light concurrency model (D-0112) admits unsynchronized shared mutable state;
+D-0113 (`@shareable` + the `ZAP5125` lint) is its *static* diagnostic and D-0114
+(`--race`) its *dynamic* one. This entry settles the question those two left
+open: **what is Zap's memory-safety contract for built-in collections under
+concurrent access, and how is it delivered** — without a GIL, and for code
+ported from Python that unconsciously relied on GIL-implied atomicity (a shared
+`list.append`/`dict` write that CPython serialized for free).
+
+The framing that drove the decision: the GIL was never really a design choice —
+it is the bill for CPython's non-atomic reference counting and a refcount-
+exposing C ABI, and over 30 years it silently became an *unwritten correctness
+contract* that both C-extension authors and pure-Python authors depend on
+without it being in any spec. Zap must not recreate that trap in mirror image:
+an implementation artifact that provides an undocumented guarantee becomes a
+de-facto spec you can never remove.
+
+### Decision 1 — Keep the collection tiers; **no CAS-by-default**
+
+Built-in `list`/`dict`/`set` stay **sequential and single-thread-optimal**;
+lock-free/CAS structures stay **opt-in** (`concurrent.Counter`/`Queue`, the
+`@shareable`-carrying types). Making every built-in a CAS structure by default
+was rejected as the worst of three worlds:
+
+- **Permanent single-thread tax.** ~99% of (especially Python-ported) code is
+  single-threaded; a CAS append is a barrier'd retry loop even for one coroutine.
+  That is precisely CPython free-threading's single-thread regression — baked in,
+  and unlike CPython's, not removable by a build flag. It directly undercuts
+  Zap's reason to be AOT-compiled.
+- **It silently degrades sequential semantics.** Lock-free collections cannot
+  cheaply promise exact `len`, coherent/ordered iteration, or Python's
+  insertion-order `dict` — so it would weaken the guarantees *all* code relies on
+  to serve the concurrent minority.
+- **It does not even fix the target bug.** `counts[k] = counts.get(k, 0) + 1` is
+  still a lost-update race under a *perfect* concurrent dict (two linearization
+  points), exactly as it was never safe under the GIL. Maximum cost, residual
+  incorrectness.
+
+### Decision 2 — The no-UB guarantee rides on cheap **always-on guards**, in every build
+
+Zap is a GC'd, memory-safe runtime (Java/Go family, not C). It therefore makes a
+crisp, **shippable, release-build-inclusive** promise:
+
+> **A data race in Zap can never corrupt memory or produce an out-of-thin-air
+> value.** Structural-mutation races fail fast with an explicit error in every
+> build; all other races are logic bugs, caught by `--race` at test time.
+
+Two mechanisms, split by where the danger actually is:
+
+- **Scalars and pointers — safe for free.** On the supported targets (x86-64,
+  aarch64) an aligned machine-word load/store is atomic in hardware, so a raced
+  read of an `int64`/pointer global yields a **stale** value, never garbage
+  (the Java-memory-model guarantee). No instrumentation; no cost.
+- **Multi-word structural mutation — a cheap always-on guard.** Growing a `list`
+  updates `{ptr, len, cap}` non-atomically; a concurrent `append` can tear that
+  into a use-after-free on the old backing array (a genuine segfault, strictly
+  worse than a logical race). A **best-effort "writer-active" flag** on the
+  corrupting mutators (list grow, dict rehash) — one non-atomic branch, the Go
+  `map` concurrent-write-throw technique — turns that corruption into a clean
+  `fatal: concurrent list modification`. It is a *guard* (deterministic, always
+  on, ships in release), **not** a detector; a missed best-effort read is
+  acceptable because the mechanism's job is to prevent corruption, not to prove
+  race-freedom.
+
+This is distinct from, and complementary to, D-0114: the guard is the always-on
+memory-safety floor; `--race` is the opt-in test-time tool that finds the
+*logical* races the guard does not (e.g. the lost-update above). D-0113's
+`@shareable`/`ZAP5125` lint remains the free compile-time static catch.
+
+### Decision 3 — `--race` stays **opt-in**, never the default (reaffirms D-0114)
+
+`--race` is a **compile-time toggle with a runtime bill**: it changes codegen to
+emit instrumentation hooks, but the cost (Go-class 5–10× slowdown + memory
+overhead, D-0114) lands on every memory access of the *running* binary. It is
+also **probabilistic** — it reports only the races that actually interleave on
+an observed run. Both facts rule it out as a default:
+
+- a default-on run would ship (or dev-loop) the 5–10× bill, defeating AOT;
+- default-on without interleaving coverage is **false comfort** — green would
+  read as "race-free" while races sleep.
+
+So `--race` stays per-invocation opt-in (`zap run/test/build/ir --race`), **off
+by default**, and is **recommended in CI**. A **randomized/chaos scheduler** mode
+under test — seeded preemption to explore distinct interleavings per run — is the
+high-leverage way to make an opt-in `--race` a real signal; the scheduler hook
+already exists (preemption, #183). It is recorded here as a **tracked follow-up,
+not a commitment**.
+
+### Decision 4 — Mutable module globals must be `@shareable`, with an `@unshared` escape
+
+A **mutable module-level global whose type is not `@shareable`** is a **hard
+error** (a new code, `ZAP3019`). This is the one construct whose sharing hazard
+is *unconditional* — a module global is definitionally reachable from every
+function body, including every coroutine, regardless of how the program runs —
+so it earns a legality rule where a warning suffices everywhere else.
+
+- **Scope line (why only globals).** The error fires on the **declaration site**,
+  not each access (no whole-program analysis, LSP-friendly). It applies **only to
+  mutable module globals**: `const` globals are always fine (they cannot race),
+  and locals / fields / parameters / heap objects shared by passing stay under
+  the `ZAP5125` *warning* (D-0113), because their sharing is *conditional* on
+  whether the value actually escapes — a hard error there would reject correct
+  single-threaded code. So: hard error only where sharing is a static certainty,
+  warning where it is a possibility.
+- **The `@unshared` escape.** A binding-level marker that asserts "this global is
+  not shared across coroutines," downgrading it to the `ZAP5125`-warning regime
+  (or clean) so a single-threaded program keeps the Python shape without forcing
+  an `Atomic`/`Mutex` wrapper:
+  ```python
+  @unshared
+  int64 count = 0        # asserted single-coroutine; `count += 1` compiles
+  ```
+  It is a **trusted, unverified** assertion (like `@shareable`), with `--race`
+  as the backstop. Note the asymmetry: `@shareable` attaches to a **type** (a
+  `struct`, asserting a capability), `@unshared` attaches to a **binding**
+  (asserting this global's usage) — complements at different levels, not twins.
+- **Reconciliation with D-0112 point 4.** Point 4 bundled two promises: (i)
+  safety diagnostics never change legality, and (ii) no mode/flag forks the
+  language. This breaks **(i)** for this one construct but fully preserves
+  **(ii)** — there is no `--concurrency-safe` switch; the same source compiles
+  identically for every user and every flag. It is a *fixed* rule about what a
+  well-formed program is, not a dialect. **D-0112 point 4 is amended
+  accordingly** (annotated there).
+- **Relationship to the CAS plan.** Once the `concurrent.*` CAS structures land,
+  they (carrying `@shareable`) plus `Atomic`/`Mutex` are the sanctioned types for
+  a mutable global; `@unshared` covers the genuinely single-threaded case. The
+  rule enforces at the one place a library author can otherwise ship a
+  shared-state footgun that every consumer inherits.
+
+### Positioning among precedents
+
+C/C++ (races are UB → corruption) is rejected. Rust (`Send`/`Sync`, compile-time,
+zero-cost) is the gold standard but needs an aliasing type system Zap does not
+have. Zap lands in the **Java/Go** band — a memory-safe runtime where a race is
+bounded (stale value / fatal guard), never UB — with Go's split of cheap
+always-on guards + opt-in `--race`, and Java's "no out-of-thin-air" scalar
+guarantee from word atomicity.
+
+### Follow-ups (tracked separately, not implemented here)
+
+1. **Always-on writer-guard** on `list`/`dict` structural mutators + the
+   documented word-atomicity guarantee — a tracked issue (the guard is a
+   decision to implement; it is not yet in the runtime).
+1a. **The `ZAP3019` global rule + `@unshared` marker** (Decision 4) — parser,
+   sema diagnostic, and reflection, a tracked issue; the error should suggest
+   `Atomic`/`Mutex`/a `@shareable` type or `@unshared`.
+2. **A normative memory-model document** (D-0034 is still "DRF-SC, formal spec
+   later"): the exact happens-before edge set, the rule that everything else
+   sharing mutable state is a race, and the sanctioned fix per pattern. The open
+   sub-question is whether **`scope:` join** is a child→parent happens-before edge
+   (D-0114 lists spawn/channel/Mutex/WaitGroup/Once/Atomic, not join explicitly);
+   a candidate for a GitHub Discussion RFC.
+
+(Decided 2026-11-10. Refs: D-0008, D-0034, D-0066, D-0112 (point 4 amended here),
+D-0113, D-0114; prompted by a GIL / Python-free-threading design discussion.)
