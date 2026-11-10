@@ -6919,15 +6919,23 @@ three times per call), each call re-reading thread-local state inside the runtim
 **Decision.** The precise-GC (gc-immix) calling convention changes in two ways;
 Boehm, which emits no safepoints, is unaffected.
 
-1. **Skip the shadow frame for provably-GC-free functions.** A function that holds
-   no GC-pointer SSA value, no pointer-typed `alloca`, and no by-value aggregate
-   root gets **no** shadow-stack frame (no link/unlink, no `zap_shadow_head_addr`
-   push/pop). The test is **conservative**: the frame is skipped only when no
-   managed reference can appear on **any** path; anything that could hold, create,
-   or pass a GC reference keeps the frame. A wrong skip would miss a root, so "when
-   in doubt, keep the frame" is the rule. (This generalizes the pre-existing
-   zero-root early return into the stated convention, and is covered by an IR
-   regression test asserting a GC-using function still links a frame.)
+1. **Skip the shadow frame for provably-GC-free functions.** A function with no
+   managed reference on any path — no heap-pointer SSA value, no reference-local
+   (an `alloca` whose slot *holds* a GC pointer), and no by-value aggregate root —
+   gets **no** shadow-stack frame (no link/unlink, no `zap_shadow_head_addr`
+   push/pop). Key enabler: an `alloca`'s dest is a **stack address**, not a heap
+   reference, so it is no longer given a root slot (the collector never relocates a
+   stack pointer, and any GC pointer the slot holds is tracked through the
+   reference-local cell). Before this, a scalar local or parameter spilled to an
+   `alloca` — e.g. `fib`'s `int64 n`, lowered to `alloca i64` — made the
+   `Ptr`-typed alloca dest a spurious root and forced a frame onto otherwise
+   GC-free code; that is exactly the "even an integer-only function sets up a GC
+   tracking frame" the review (#568) reported. The test is **conservative**: the
+   frame is skipped only when no managed reference can appear on **any** path;
+   anything that could hold, create, or pass a GC reference keeps the frame. A
+   wrong skip would miss a root, so "when in doubt, keep the frame" is the rule
+   (covered by an IR regression test asserting a GC-using function still links a
+   frame).
 
 2. **Safepoints are INLINED flag-check polls at function entry and loop headers,
    not a call at every block.** A poll is now:

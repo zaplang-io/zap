@@ -2000,10 +2000,30 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     #[cfg(feature = "gc-immix")]
     fn gc_setup_frame(&mut self, f: &zir::Func) -> Result<(), String> {
         self.gc_frame = None;
+        // An `Alloca`'s dest is a STACK-slot address, never a heap reference: the
+        // collector never relocates it, and any GC pointer the slot *holds* is
+        // tracked through the reference-local cell below (`local_slot_of`), whose
+        // contents the collector traces. So an alloca dest needs no DIRECT root
+        // slot. Rooting it anyway (it is `Ptr`-typed) was harmless — the collector
+        // validates each root against the heap block registry and ignores a stack
+        // pointer — but it forced a shadow frame onto functions whose only pointer
+        // values are scalar-local addresses, e.g. `fib`, whose `int64` parameter
+        // lowers to an `alloca i64`. Excluding alloca dests is what lets a provably
+        // GC-free function skip the frame entirely (#568, D-0144): with no direct
+        // root, no reference-local cell, and no aggregate, `n == 0` below and the
+        // frame is elided. Reload is unaffected — an alloca address is stable, so
+        // reading it from a root slot or straight from the register is the same
+        // pointer.
+        let mut is_alloca_dest = vec![false; f.value_types.len()];
+        for inst in f.blocks.iter().flat_map(|block| &block.insts) {
+            if let Inst::Alloca { dest, .. } = inst {
+                is_alloca_dest[*dest as usize] = true;
+            }
+        }
         let mut slot_of = vec![-1i32; f.value_types.len()];
         let mut n: u32 = 0;
         for (vid, ty) in f.value_types.iter().enumerate() {
-            if ty.is_ptr() {
+            if ty.is_ptr() && !is_alloca_dest[vid] {
                 slot_of[vid] = n as i32;
                 n += 1;
             }
