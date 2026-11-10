@@ -5402,6 +5402,21 @@ static void zap_boehm_gc_event(GC_EventType e) {
 static void cosched(void);   /* fwd (cooperative yield, defined below)          */
 void zap_sched_init(int64_t n_threads); /* fwd (defined below)                  */
 
+/* Global "some M has a pending fairness preemption" flag (#568, D-0144). The
+ * monitor recomputes it once per tick as the OR of every M's `preempt` latch
+ * (it is the sole writer, so there is no clear/set race). Compiled code's inlined
+ * safepoint poll loads it alongside the GC flags: a tight, call-free loop reads
+ * `zap_preempt_any` on its back-edge and takes the `zap_safepoint` slow path when
+ * set, where the precise per-M `m->preempt` check (which needs the thread-local
+ * `cur_m`, unsafe to read from migratable inlined code) runs and yields. A stale
+ * 1 only costs an extra slow-path call that finds nothing and returns; the
+ * monitor clears it within one ~10 ms tick of the last preempt being consumed, so
+ * the window is bounded and the preemption granularity is unchanged. Exported so
+ * codegen can load it; only the Immix inline poll reads it (Boehm preempts via a
+ * direct signal switch and never reads the flag), but it is defined on both
+ * builds because the monitor is shared. */
+volatile int zap_preempt_any = 0;
+
 #if defined(ZAP_PLATFORM_POSIX)
 /* SIGURG handler: the preemption point. Installed process-wide; only acts on a
  * worker thread that is currently running a (non-pinned) coroutine. */
@@ -5488,6 +5503,10 @@ static void *zap_monitor_main(void *arg) {
         if (__atomic_load_n(&g_shutdown, __ATOMIC_RELAXED)) {
             break;
         }
+        /* OR of every M's preempt latch this tick, published to the exported
+         * `zap_preempt_any` after the scan so compiled code's inline poll sees a
+         * pending preemption and clears it once all are consumed (#568, D-0144). */
+        int preempt_any = 0;
         for (int i = 0; i < g_nm; i++) {
             M *m = &g_ms[i];
             /* Read without a lock: `current` is only tested for non-NULL (the
@@ -5540,7 +5559,13 @@ static void *zap_monitor_main(void *arg) {
 #endif
             }
             last[i] = tick;
+            preempt_any |= __atomic_load_n(&m->preempt, __ATOMIC_RELAXED);
         }
+        /* Single-writer publish: no other thread stores `zap_preempt_any`, so a
+         * just-flagged M (set above in this same scan) is included, and the flag
+         * drops to 0 only on a tick where every latch reads 0 — i.e. nothing is
+         * genuinely pending (#568). */
+        __atomic_store_n(&zap_preempt_any, preempt_any, __ATOMIC_RELAXED);
     }
     free(last);
     return NULL;
@@ -17448,7 +17473,7 @@ void *zap_tls_connect_resolved(void *host_, void *ip_, int64_t port, int64_t dea
  * never the default). Documented as unsafe. */
 void *zap_tls_connect_insecure(void *host_, int64_t port) { return zap_tls_dial(host_, port, 0); }
 
-/* ---- TLS client contexts (ticket #560, D-0143) ---------------------------- *
+/* ---- TLS client contexts (ticket #560, D-0144) ---------------------------- *
  * A per-connection, isolated TLS client configuration mirroring Python's
  * `ssl.SSLContext`. Each context owns its OWN `SSL_CTX` (and thus its own
  * `X509_STORE` of trust anchors), so two contexts loading different private CAs

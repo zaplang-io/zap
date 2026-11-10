@@ -547,9 +547,10 @@ struct Cg<'a, 'ctx> {
 /// per GC-pointer-typed SSA value plus writable storage for reference locals.
 /// It links the frame onto the per-thread `zap_shadow_head` on entry, stores
 /// SSA pointers at their definitions, and unlinks on return. Reference-local
-/// stores and loads use their canonical root cells directly. A GC safepoint (top of
-/// every block) then finds every live pointer via the chain. Over-retention of
-/// dead-but-slotted values is safe for the non-moving collector.
+/// stores and loads use their canonical root cells directly. A GC safepoint (at
+/// function entry and loop headers, #568/D-0144) then finds every live pointer via
+/// the chain. Over-retention of dead-but-slotted values is safe for the
+/// non-moving collector.
 ///
 /// A by-value `value struct` / tuple (D-0051) held across a safepoint lives in a
 /// stack *spill* slot whose interior reference fields neither of the above cover
@@ -1474,6 +1475,22 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             // MCJIT cannot emit a dynamic-TLS access to the dlopen'd runtime's
             // `__thread` global). See `gc_head`.
             self.declare_rt("zap_shadow_head_addr", &[], Some(p.into()));
+            // Inline safepoint poll (#568, D-0144). The hot path no longer calls
+            // the non-inlinable `zap_safepoint` on every block; it loads these
+            // three exported runtime flags and branches to the out-of-line slow
+            // path only when one is set (see `gc_safepoint`). They are PLAIN (not
+            // thread-local) globals, so both the AOT backend and the REPL JIT
+            // (MCJIT) resolve them as ordinary external symbols — unlike the
+            // `__thread zap_shadow_head`, which needs the `*_addr` helper.
+            //   * `zap_gc_wanted` / `zap_collecting` — the GC flags the slow path
+            //     already checks; a collection is due / in progress.
+            //   * `zap_preempt_any` — set by the monitor when any M has a pending
+            //     fairness preemption, so a tight call-free loop still yields.
+            let i32t = self.ctx.i32_type();
+            for name in ["zap_gc_wanted", "zap_collecting", "zap_preempt_any"] {
+                let g = self.module.add_global(i32t, None, name);
+                g.set_linkage(inkwell::module::Linkage::External);
+            }
         }
 
         // Build LLVM struct types (fields are scalars or pointers, so no
@@ -1785,16 +1802,164 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         unreachable!("emit_struct_desc is only called under the gc-immix build")
     }
 
-    /// Emit a GC safepoint poll (`zap_safepoint()`), the only place a collection
-    /// can run. Called at the top of every basic block (FORK 4a: covers function
-    /// entry and loop back-edges). No-op under Boehm.
+    /// Emit a GC/preemption safepoint poll — the only place a collection can run
+    /// and the landing point for async preemption (#568, D-0144).
+    ///
+    /// The previous emission (FORK 4a) placed an unconditional, non-inlinable
+    /// `call zap_safepoint` at the top of *every* basic block. An external
+    /// language review (#568) measured that this dominates even GC-free
+    /// integer-only functions: recursive `fib` paid three such calls per call,
+    /// each re-reading thread-local state inside the runtime. The poll is now an
+    /// INLINED flag check — load the three exported runtime flags and branch to
+    /// the out-of-line `zap_safepoint` slow path only when one is set:
+    ///
+    /// ```text
+    ///   %w = load volatile i32, ptr @zap_gc_wanted
+    ///   %c = load volatile i32, ptr @zap_collecting
+    ///   %p = load volatile i32, ptr @zap_preempt_any
+    ///   %need = icmp ne (%w | %c | %p), 0        ; hinted false
+    ///   br %need, label %sp.slow, label %sp.cont
+    /// sp.slow:                                    ; cold
+    ///   call void @zap_safepoint()
+    ///   br label %sp.cont
+    /// sp.cont:
+    /// ```
+    ///
+    /// The loads are `volatile` so LICM cannot hoist them out of a loop — a
+    /// back-edge poll must re-read the flags every iteration. The slow path keeps
+    /// the exact semantics of the old call: it re-checks precisely, drives the
+    /// collection or the preemption yield, and parks. Splitting the current block
+    /// in two is why this takes `fv`: it appends the `sp.slow`/`sp.cont` blocks
+    /// and leaves the builder positioned at `sp.cont`, so the caller's remaining
+    /// instructions land after the poll. No-op under Boehm (never emitted).
     #[cfg(feature = "gc-immix")]
-    fn gc_safepoint(&self) -> Result<(), String> {
-        let sp = self.fns["zap_safepoint"];
-        self.builder
-            .build_call(sp, &[], "")
+    fn gc_safepoint(&self, fv: FunctionValue<'ctx>) -> Result<(), String> {
+        let b = self.builder;
+        let i32t = self.ctx.i32_type();
+        let load_flag = |name: &str| -> Result<inkwell::values::IntValue<'ctx>, String> {
+            let g = self
+                .module
+                .get_global(name)
+                .ok_or_else(|| format!("safepoint poll flag `{name}` not declared"))?;
+            let v = b
+                .build_load(i32t, g.as_pointer_value(), name)
+                .map_err(|e| e.to_string())?;
+            v.as_instruction_value()
+                .expect("load is an instruction")
+                .set_volatile(true)
+                .map_err(|_| "set volatile on poll load".to_string())?;
+            Ok(v.into_int_value())
+        };
+        let w = load_flag("zap_gc_wanted")?;
+        let c = load_flag("zap_collecting")?;
+        let p = load_flag("zap_preempt_any")?;
+        let wc = b.build_or(w, c, "sp.or0").map_err(|e| e.to_string())?;
+        let any = b.build_or(wc, p, "sp.any").map_err(|e| e.to_string())?;
+        let need = b
+            .build_int_compare(IntPredicate::NE, any, i32t.const_zero(), "sp.need")
             .map_err(|e| e.to_string())?;
+        // Hint "no safepoint" as the common case so the backend lays the call out
+        // cold (predicted not-taken), keeping the hot path a load + branch.
+        let need = self.expect_false(need)?;
+        let slow = self.ctx.append_basic_block(fv, "sp.slow");
+        let cont = self.ctx.append_basic_block(fv, "sp.cont");
+        b.build_conditional_branch(need, slow, cont)
+            .map_err(|e| e.to_string())?;
+        b.position_at_end(slow);
+        let sp = self.fns["zap_safepoint"];
+        b.build_call(sp, &[], "").map_err(|e| e.to_string())?;
+        b.build_unconditional_branch(cont)
+            .map_err(|e| e.to_string())?;
+        b.position_at_end(cont);
         Ok(())
+    }
+
+    /// Wrap `cond` in `@llvm.expect.i1(cond, false)` so the backend treats the
+    /// taken branch as unlikely. Returns `cond` unchanged if the intrinsic is
+    /// unavailable (keeps codegen correct, only loses the layout hint).
+    #[cfg(feature = "gc-immix")]
+    fn expect_false(
+        &self,
+        cond: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, String> {
+        let Some(expect) = inkwell::intrinsics::Intrinsic::find("llvm.expect") else {
+            return Ok(cond);
+        };
+        let i1 = self.ctx.bool_type();
+        let Some(decl) = expect.get_declaration(self.module, &[i1.into()]) else {
+            return Ok(cond);
+        };
+        let hinted = self
+            .builder
+            .build_call(decl, &[cond.into(), i1.const_zero().into()], "sp.expect")
+            .map_err(|e| e.to_string())?;
+        Ok(hinted
+            .try_as_basic_value()
+            .left()
+            .expect("llvm.expect returns i1")
+            .into_int_value())
+    }
+
+    /// The basic blocks that must emit a safepoint poll (#568, gc-immix): the
+    /// function entry (so every call chain polls — recursion has no loop
+    /// back-edge of its own) plus every loop header, found as the target of a DFS
+    /// back-edge. Every cycle in the CFG contains at least one DFS back-edge whose
+    /// target is on the cycle, so placing a poll at each such target guarantees a
+    /// poll at least once per iteration of every loop — including irreducible
+    /// control flow — which preserves cooperative stop-the-world liveness and
+    /// preemption for call-free loops. Straight-line blocks that are neither the
+    /// entry nor a loop header no longer poll (the old FORK-4a emission polled
+    /// every block), which is the redundancy #568 removes.
+    #[cfg(feature = "gc-immix")]
+    fn safepoint_blocks(f: &Func) -> Vec<bool> {
+        let n = f.blocks.len();
+        let mut is_sp = vec![false; n];
+        if n == 0 {
+            return is_sp;
+        }
+        is_sp[0] = true;
+        let succs = |i: usize| -> Vec<usize> {
+            match &f.blocks[i].term {
+                Term::Br(t) => vec![*t as usize],
+                Term::BrIf {
+                    then_bb, else_bb, ..
+                } => vec![*then_bb as usize, *else_bb as usize],
+                Term::Ret(_) | Term::Unreachable => Vec::new(),
+            }
+        };
+        // Iterative DFS (0 = white, 1 = gray/on-stack, 2 = black). A successor
+        // edge to a gray node is a back-edge; its target is a loop header. Visit
+        // from every node so disconnected/unreachable blocks are classified too.
+        let mut color = vec![0u8; n];
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        for start in 0..n {
+            if color[start] != 0 {
+                continue;
+            }
+            color[start] = 1;
+            stack.push((start, 0));
+            while let Some(&(node, idx)) = stack.last() {
+                let ss = succs(node);
+                if idx < ss.len() {
+                    stack.last_mut().unwrap().1 += 1;
+                    let w = ss[idx];
+                    if w < n {
+                        match color[w] {
+                            0 => {
+                                color[w] = 1;
+                                stack.push((w, 0));
+                            }
+                            1 => is_sp[w] = true,
+                            _ => {}
+                        }
+                    }
+                } else {
+                    color[node] = 2;
+                    stack.pop();
+                }
+            }
+        }
+        is_sp
     }
 
     /// Address of the per-thread `zap_shadow_head` TLS slot, always obtained by
@@ -2208,16 +2373,23 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             }
         }
 
+        // A GC safepoint poll at the function entry and every loop header (#568,
+        // D-0144): the only places a collection runs and the preemption landing
+        // points. The old FORK-4a emission polled the top of *every* block; the
+        // inlined flag-check poll (see `gc_safepoint`) plus this reduced placement
+        // removes the per-call overhead #568 measured while preserving STW/
+        // preemption liveness (every call chain polls at a callee entry; every
+        // loop iteration passes through its header).
+        #[cfg(feature = "gc-immix")]
+        let sp_blocks = Self::safepoint_blocks(f);
         for (bi, b) in f.blocks.iter().enumerate() {
             self.builder.position_at_end(blocks[bi]);
-            // A GC safepoint at the top of every block (FORK 4a: covers function
-            // entry and loop back-edges) — the only place a collection runs. A
-            // landing-pad block starts with the mandatory `landingpad`
+            // A landing-pad block starts with the mandatory `landingpad`
             // instruction, so its safepoint + head-restore are emitted in the
             // LandingPad handler instead.
             #[cfg(feature = "gc-immix")]
-            if !block_starts_with_landing_pad(b) {
-                self.gc_safepoint()?;
+            if sp_blocks[bi] && !block_starts_with_landing_pad(b) {
+                self.gc_safepoint(fv)?;
             }
             for inst in &b.insts {
                 self.inst(f, inst, &mut vals, fv, &blocks)?;
@@ -3132,7 +3304,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 #[cfg(feature = "gc-immix")]
                 {
                     self.gc_restore_head()?;
-                    self.gc_safepoint()?;
+                    self.gc_safepoint(fv)?;
                 }
                 let begin = self.fns["zap_eh_begin_catch"];
                 let cs = b
@@ -4552,6 +4724,112 @@ mod tests {
         assert!(
             ir.contains("fmul <4 x double>"),
             "expected a vectorized fmul for scalar broadcast:\n{ir}"
+        );
+    }
+
+    // ---- #568 (D-0144): GC-frame skip + inlined safepoint poll -------------
+    //
+    // These assert the *shape* of the emitted IR (deterministic, machine- and
+    // timing-independent — the issue asks to prefer an IR assertion over a
+    // wall-clock one). The wall-clock trend lives in the perf-bench harness
+    // (`crates/driver/tests/perf.rs`); the runtime safety/liveness lives in the
+    // GC-stress + preemption tests (`crates/driver/tests/gc.rs`).
+
+    /// Slice one function's `define … { … }` out of a whole-module IR dump so a
+    /// count/contains assertion is scoped to that function and not its callers.
+    #[cfg(feature = "gc-immix")]
+    fn one_fn_ir(ir: &str, name: &str) -> String {
+        let needle = format!("@{name}(");
+        let at = ir
+            .find(&needle)
+            .unwrap_or_else(|| panic!("fn `{name}` not found in IR:\n{ir}"));
+        let start = ir[..at].rfind("\ndefine ").map(|i| i + 1).unwrap_or(0);
+        let end = ir[start..]
+            .find("\n}")
+            .map(|i| start + i + 2)
+            .unwrap_or(ir.len());
+        ir[start..end].to_string()
+    }
+
+    // A provably GC-free integer function holds no managed references on any
+    // path, so #568 skips its shadow-stack frame entirely: no `gcframe` alloca
+    // and no `zap_shadow_head_addr` push/pop. `fib` has three basic blocks but no
+    // loop, so it emits exactly ONE safepoint poll (function entry) — the old
+    // FORK-4a emission put a non-inlinable `call zap_safepoint` at the top of
+    // every block (the "3× safepoint per call" #568 measured). The poll is now an
+    // inlined flag check that loads `@zap_gc_wanted` and branches to the cold
+    // slow path, so the hot path carries no call and no thread-local read.
+    #[cfg(feature = "gc-immix")]
+    #[test]
+    fn gc_free_fn_skips_frame_and_inlines_safepoint() {
+        let ir = llvm_ir(
+            "def fib(int64 n) -> int64:\n    if n < 2:\n        return n\n    \
+             return fib(n - 1) + fib(n - 2)\n\
+             def main():\n    print(fib(10))\n",
+        );
+        let fib = one_fn_ir(&ir, "fib");
+        assert!(
+            !fib.contains("gcframe") && !fib.contains("zap_shadow_head_addr"),
+            "a GC-free function must emit no shadow frame:\n{fib}"
+        );
+        assert!(
+            fib.contains("@zap_gc_wanted"),
+            "the safepoint must be an inlined flag check:\n{fib}"
+        );
+        let polls = fib.matches("call void @zap_safepoint()").count();
+        assert_eq!(
+            polls, 1,
+            "a loopless GC-free function emits exactly one (entry) safepoint, not one per block; got {polls}:\n{fib}"
+        );
+    }
+
+    // A GC-free loop keeps its back-edge safepoint (STW + preemption liveness for
+    // a tight, call-free loop — see `gc.rs`): entry poll + loop-header poll, and
+    // still no frame. This is the safepoint #568 must NOT drop.
+    #[cfg(feature = "gc-immix")]
+    #[test]
+    fn gc_free_loop_keeps_backedge_safepoint() {
+        let ir = llvm_ir(
+            "def spin(int64 n) -> int64:\n    int64 i = 0\n    while i < n:\n        i = i + 1\n    \
+             return i\n\
+             def main():\n    print(spin(5))\n",
+        );
+        let spin = one_fn_ir(&ir, "spin");
+        assert!(
+            !spin.contains("zap_shadow_head_addr"),
+            "a GC-free loop needs no shadow frame:\n{spin}"
+        );
+        assert!(
+            spin.contains("@zap_gc_wanted"),
+            "the loop poll must be the inlined flag check:\n{spin}"
+        );
+        let polls = spin.matches("call void @zap_safepoint()").count();
+        assert!(
+            polls >= 2,
+            "a loop must keep an entry poll and a back-edge (loop-header) poll; got {polls}:\n{spin}"
+        );
+    }
+
+    // Regression guard for the other direction: a function that holds a managed
+    // reference (a `list`) MUST still emit its shadow frame — roots stay tracked.
+    // The skip is conservative; it never drops a frame a collection could need.
+    #[cfg(feature = "gc-immix")]
+    #[test]
+    fn gc_using_fn_keeps_frame() {
+        let ir = llvm_ir(
+            "def build(int64 n) -> int64:\n    list[int64] xs = []\n    xs.append(n)\n    \
+             return len(xs)\n\
+             def main():\n    print(build(3))\n",
+        );
+        let build = one_fn_ir(&ir, "build");
+        assert!(
+            build.contains("zap_shadow_head_addr"),
+            "a function holding a GC reference must still link a shadow frame:\n{build}"
+        );
+        // And the poll is still the inlined flag check, not the old bare call.
+        assert!(
+            build.contains("@zap_gc_wanted"),
+            "a GC-using function still uses the inlined safepoint poll:\n{build}"
         );
     }
 }
