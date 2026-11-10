@@ -4736,6 +4736,444 @@ def main():
         );
     }
 
+    // --- #829: concrete values into interface-typed collection elements ------
+    //
+    // A `list[Iface]` / `dict[K, Iface]` element is a one-word cell, so a
+    // concrete conformer is coerced into the `{data, itable}` fat pointer
+    // (`IfaceMake`) and that fat pointer is heap-boxed (a `StructNew` of the
+    // interface's synthetic fat struct) so the stored word is a stable pointer
+    // rather than a dangling stack address (I#84 follow-up). These lock the
+    // lowered ZIR; the end-to-end dispatch is pinned by the CI goldens.
+
+    /// The synthetic fat-pointer struct id of the interface named `name`.
+    fn fat_sid_of(m: &Module, name: &str) -> u32 {
+        m.interfaces
+            .iter()
+            .find(|i| i.name == name)
+            .expect("interface registered")
+            .fat_sid
+    }
+
+    fn struct_sid_of(m: &Module, name: &str) -> u32 {
+        m.structs
+            .iter()
+            .position(|s| s.name == name)
+            .unwrap_or_else(|| panic!("struct '{name}' lowered")) as u32
+    }
+
+    #[test]
+    fn list_iface_literal_boxes_each_concrete_conformer() {
+        // The issue repro: `list[Shape] xs = [Tri(), Quad()]` was ZAP6001 at
+        // lowering. Now every concrete element is widened into the fat pointer and
+        // heap-boxed for storage, and read-back dispatches dynamically.
+        let m = lower_ok(
+            r#"interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+struct Quad:
+    def sides(self) -> int:
+        return 4
+
+def main():
+    list[Shape] shapes = [Tri(), Quad()]
+    for s in shapes:
+        print(s.sides())
+"#,
+        );
+        let fat = fat_sid_of(&m, "Shape");
+        let tri = struct_sid_of(&m, "Tri");
+        let quad = struct_sid_of(&m, "Quad");
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        // Both concrete types are boxed into the fat pointer at the element store.
+        for c in [tri, quad] {
+            assert!(
+                insts_of(main).any(
+                    |i| matches!(i, Inst::IfaceMake { concrete_sid, .. } if *concrete_sid == c)
+                ),
+                "concrete element {c} is widened into the interface fat pointer"
+            );
+        }
+        // The fat pointer is heap-boxed (a StructNew of the interface fat struct)
+        // once per element, so the list cell is a stable heap pointer, not a
+        // dangling stack alloca.
+        let boxes = insts_of(main)
+            .filter(|i| matches!(i, Inst::StructNew { sid, .. } if *sid == fat))
+            .count();
+        assert_eq!(boxes, 2, "each interface element is heap-boxed for storage");
+        // Read-back dispatches through the itable.
+        assert!(
+            insts_of(main).any(|i| matches!(i, Inst::IfaceCall { .. } | Inst::IfaceInvoke { .. })),
+            "iterating the list dispatches dynamically on each element"
+        );
+    }
+
+    #[test]
+    fn append_concrete_to_list_iface_element_boxes() {
+        // `xs.append(Tri())` into a `list[Shape]` (incl. the empty-then-append
+        // form) widens and heap-boxes, exactly like the literal path.
+        let m = lower_ok(
+            r#"interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    list[Shape] shapes = []
+    shapes.append(Tri())
+    print(shapes[0].sides())
+"#,
+        );
+        let fat = fat_sid_of(&m, "Shape");
+        let tri = struct_sid_of(&m, "Tri");
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            insts_of(main)
+                .any(|i| matches!(i, Inst::IfaceMake { concrete_sid, .. } if *concrete_sid == tri)),
+            "the appended concrete value is widened into the fat pointer"
+        );
+        assert!(
+            insts_of(main).any(|i| matches!(i, Inst::StructNew { sid, .. } if *sid == fat)),
+            "the appended interface value is heap-boxed for storage"
+        );
+    }
+
+    #[test]
+    fn dict_iface_value_element_boxes() {
+        // A `dict[K, Iface]` VALUE accepts a concrete conformer and boxes it; the
+        // key position is unaffected (interface values are unhashable, so keys
+        // stay concrete).
+        let m = lower_ok(
+            r#"interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    dict[int, Shape] by_id = {1: Tri()}
+    print(by_id[1].sides())
+"#,
+        );
+        let fat = fat_sid_of(&m, "Shape");
+        let tri = struct_sid_of(&m, "Tri");
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            insts_of(main)
+                .any(|i| matches!(i, Inst::IfaceMake { concrete_sid, .. } if *concrete_sid == tri)),
+            "the dict value is widened into the interface fat pointer"
+        );
+        assert!(
+            insts_of(main).any(|i| matches!(i, Inst::StructNew { sid, .. } if *sid == fat)),
+            "the dict interface value is heap-boxed for storage"
+        );
+    }
+
+    #[test]
+    fn list_iface_element_accepts_both_enum_tiers() {
+        // The #731 tie-in: both enum tiers conform as interface collection
+        // elements. A tier-3 enum boxes its tagged-struct pointer; a tier-1 enum
+        // boxes its scalar into `{Enum}$box` first, then both are heap-boxed into
+        // the fat pointer for storage.
+        let m = lower_ok(
+            r#"interface Ranked:
+    def rank(self) -> int
+
+enum Tri3:
+    Lit(int v)
+    Add(int l, int r)
+
+    def rank(self) -> int:
+        return 1
+
+enum Tri1:
+    Red
+    Green
+
+    def rank(self) -> int:
+        return 2
+
+def main():
+    list[Ranked] a = [Tri3.Lit(v=5)]
+    a.append(Tri1.Green)
+    for r in a:
+        print(r.rank())
+"#,
+        );
+        let fat = fat_sid_of(&m, "Ranked");
+        let tri3 = struct_sid_of(&m, "Tri3"); // tier-3 tagged struct
+        let box_sid = struct_sid_of(&m, "Tri1$box"); // tier-1 scalar box
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            insts_of(main).any(
+                |i| matches!(i, Inst::IfaceMake { concrete_sid, .. } if *concrete_sid == tri3)
+            ),
+            "tier-3 enum element is boxed by its tagged-struct id"
+        );
+        assert!(
+            insts_of(main).any(
+                |i| matches!(i, Inst::IfaceMake { concrete_sid, .. } if *concrete_sid == box_sid)
+            ),
+            "tier-1 enum element is boxed by its scalar-box id"
+        );
+        let boxes = insts_of(main)
+            .filter(|i| matches!(i, Inst::StructNew { sid, .. } if *sid == fat))
+            .count();
+        assert_eq!(boxes, 2, "both enum elements are heap-boxed for storage");
+    }
+
+    #[test]
+    fn nested_list_of_list_iface_elements_lower() {
+        // `list[list[Shape]]`: the inner `list[Shape]` boxes its concrete element
+        // into the fat pointer; the outer list stores the inner-list pointer as a
+        // nested element. The whole thing lowers (was ZAP6001).
+        let m = lower_ok(
+            r#"interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    list[list[Shape]] grid = [[Tri()]]
+    print(grid[0][0].sides())
+"#,
+        );
+        let tri = struct_sid_of(&m, "Tri");
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            insts_of(main)
+                .any(|i| matches!(i, Inst::IfaceMake { concrete_sid, .. } if *concrete_sid == tri)),
+            "the inner-list concrete element is boxed into the fat pointer"
+        );
+    }
+
+    // --- #830: refined-supertype method dispatch on an interface value -------
+    //
+    // An interface's dispatch-table carries its own methods first, then its
+    // transitive refined-supertype methods, in a stable order. Both the itable
+    // layout (codegen) and dynamic dispatch (`lower_iface_call`) read this one
+    // list, so an inherited method call resolves to the slot the itable laid out.
+
+    #[test]
+    fn refined_interface_dispatch_table_folds_in_supertype_methods() {
+        // `interface Ranked: Named`. Before #830, calling the inherited `name()`
+        // on a `Ranked` value was ZAP6001 ("interface 'Ranked' has no method
+        // 'name'"). Now `Ranked`'s effective method list is [rank, name] (own
+        // first, then inherited), both calls lower, and each dispatches on its
+        // own stable slot index.
+        let m = lower_ok(
+            r#"interface Named:
+    def name(self) -> int
+
+interface Ranked: Named
+    def rank(self) -> int
+
+struct Color:
+    def name(self) -> int:
+        return 0
+    def rank(self) -> int:
+        return 9
+
+def main():
+    Ranked r = Color()
+    print(r.rank())
+    print(r.name())
+"#,
+        );
+        let ranked = m
+            .interfaces
+            .iter()
+            .find(|i| i.name == "Ranked")
+            .expect("Ranked registered");
+        let names: Vec<&str> = ranked.methods.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["rank", "name"],
+            "effective slots: own methods first, then inherited supertype methods"
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let mut slots: Vec<u32> = insts_of(main)
+            .filter_map(|i| match i {
+                Inst::IfaceCall { method, .. } | Inst::IfaceInvoke { method, .. } => Some(*method),
+                _ => None,
+            })
+            .collect();
+        slots.sort_unstable();
+        assert_eq!(
+            slots,
+            vec![0, 1],
+            "`rank` dispatches on slot 0 (own), `name` on slot 1 (inherited)"
+        );
+    }
+
+    #[test]
+    fn multilevel_refinement_folds_every_level() {
+        // A: B: C — a `C`-typed value can call a method introduced at every level,
+        // and C's dispatch table carries all three in a stable order (own first,
+        // then up the refinement chain).
+        let m = lower_ok(
+            r#"interface A:
+    def a(self) -> int
+
+interface B: A
+    def b(self) -> int
+
+interface C: B
+    def c(self) -> int
+
+struct S:
+    def a(self) -> int:
+        return 1
+    def b(self) -> int:
+        return 2
+    def c(self) -> int:
+        return 3
+
+def main():
+    C x = S()
+    print(x.a())
+    print(x.b())
+    print(x.c())
+"#,
+        );
+        let c = m.interfaces.iter().find(|i| i.name == "C").unwrap();
+        let names: Vec<&str> = c.methods.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["c", "b", "a"],
+            "own, then transitive supertypes"
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let mut slots: Vec<u32> = insts_of(main)
+            .filter_map(|i| match i {
+                Inst::IfaceCall { method, .. } | Inst::IfaceInvoke { method, .. } => Some(*method),
+                _ => None,
+            })
+            .collect();
+        slots.sort_unstable();
+        assert_eq!(
+            slots,
+            vec![0, 1, 2],
+            "three distinct, stable dispatch slots"
+        );
+    }
+
+    #[test]
+    fn refined_interface_dispatch_slots_are_stable_across_conformers() {
+        // The itable slot order is a property of the interface, not the concrete
+        // type, so a second conformer dispatches the inherited method on the same
+        // slot — the stored word is uniform across implementors.
+        let m = lower_ok(
+            r#"interface Named:
+    def name(self) -> int
+
+interface Ranked: Named
+    def rank(self) -> int
+
+struct Color:
+    def name(self) -> int:
+        return 0
+    def rank(self) -> int:
+        return 1
+
+struct Grade:
+    def name(self) -> int:
+        return 2
+    def rank(self) -> int:
+        return 3
+
+def main():
+    list[Ranked] rs = [Color(), Grade()]
+    for r in rs:
+        print(r.name())
+"#,
+        );
+        let ranked = m.interfaces.iter().find(|i| i.name == "Ranked").unwrap();
+        // `name` is at the same slot regardless of which conformer is stored.
+        let name_slot = ranked
+            .methods
+            .iter()
+            .position(|x| x.name == "name")
+            .expect("inherited method is a slot");
+        assert_eq!(
+            name_slot, 1,
+            "inherited `name` is slot 1 for every conformer"
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            insts_of(main).any(|i| matches!(
+                i,
+                Inst::IfaceCall { method, .. } | Inst::IfaceInvoke { method, .. }
+                    if *method == name_slot as u32
+            )),
+            "the inherited method dispatches on its stable slot"
+        );
+    }
+
+    #[test]
+    fn refined_interface_works_for_both_enum_tiers() {
+        // Supertype slots must work for struct AND enum conformers (#731 tie-in):
+        // a tier-3 and a tier-1 enum each conform to `Ranked: Named` and can call
+        // the inherited `name()`.
+        let m = lower_ok(
+            r#"interface Named:
+    def name(self) -> int
+
+interface Ranked: Named
+    def rank(self) -> int
+
+enum Three:
+    Lit(int v)
+
+    def name(self) -> int:
+        return 0
+    def rank(self) -> int:
+        return 1
+
+enum One:
+    Red
+    Green
+
+    def name(self) -> int:
+        return 2
+    def rank(self) -> int:
+        return 3
+
+def main():
+    Ranked a = Three.Lit(v=5)
+    Ranked b = One.Green
+    print(a.name())
+    print(b.name())
+"#,
+        );
+        // Both enum conformers produce the inherited-method itable symbol: the
+        // tier-3 tagged-struct method and the tier-1 box thunk.
+        assert!(
+            m.funcs.iter().any(|f| f.name == "Three__name"),
+            "tier-3 enum's inherited method is lowered as an itable slot target"
+        );
+        assert!(
+            m.funcs.iter().any(|f| f.name == "One$box__name"),
+            "tier-1 enum's inherited method has a box thunk for the itable slot"
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let name_calls = insts_of(main)
+            .filter(|i| matches!(
+                i,
+                Inst::IfaceCall { method, .. } | Inst::IfaceInvoke { method, .. } if *method == 1
+            ))
+            .count();
+        assert_eq!(name_calls, 2, "both enum values dispatch inherited `name`");
+    }
+
     // --- #552: unsigned integers select the unsigned ZIR ops -----------------
     //
     // These lock the op-selection *before* codegen (where LLVM finally emits

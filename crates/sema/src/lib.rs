@@ -7595,6 +7595,74 @@ mod tests {
         assert!(e.is_empty(), "unexpected type errors: {e:?}");
     }
 
+    #[test]
+    fn iface_list_element_literal_is_accepted() {
+        // #829: a heterogeneous list of conformers (distinct types) typed as
+        // `list[Iface]` is admitted — the user-facing heterogeneous-collection
+        // need. (Lowering boxes each element into the fat pointer; see the ir
+        // crate's walled-garden tests.)
+        ok("interface Shape:\n    def sides(self) -> int64\n\n\
+            struct Tri:\n    def sides(self) -> int64:\n        return 3\n\n\
+            struct Quad:\n    def sides(self) -> int64:\n        return 4\n\n\
+            def main():\n    list[Shape] xs = [Tri(), Quad()]\n    print(xs[0].sides())\n");
+    }
+
+    #[test]
+    fn append_conformer_to_iface_list_is_accepted() {
+        // #829: appending a concrete conformer to a `list[Iface]` type-checks.
+        ok(
+            "interface Shape:\n    def sides(self) -> int64\n\n\
+            struct Tri:\n    def sides(self) -> int64:\n        return 3\n\n\
+            def main():\n    list[Shape] xs = []\n    xs.append(Tri())\n    print(xs[0].sides())\n",
+        );
+    }
+
+    #[test]
+    fn non_conforming_list_element_is_rejected() {
+        // #829 negative: a value that does NOT provide the interface's methods is
+        // rejected when the list is typed as `list[Iface]` — the conformance
+        // guard is not bypassed by the element-boxing path.
+        let m = msgs(
+            "interface Shape:\n    def sides(self) -> int64\n\n\
+             struct Bad:\n    def nope(self) -> int64:\n        return 0\n\n\
+             def main():\n    list[Shape] xs = [Bad(), Bad()]\n",
+        );
+        assert!(
+            m.contains("Shape") && m.contains("Bad"),
+            "a non-conforming element is rejected, naming the types; got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn refined_interface_binding_accepts_conformer_with_inherited_methods() {
+        // #830: a struct providing BOTH the refined interface's own method and its
+        // inherited supertype method conforms and is usable as an interface value;
+        // the inherited method call type-checks (its return type resolves through
+        // the supertype).
+        ok("interface Named:\n    def name(self) -> int64\n\n\
+            interface Ranked: Named\n    def rank(self) -> int64\n\n\
+            struct Color:\n    def name(self) -> int64:\n        return 0\n\
+            \x20   def rank(self) -> int64:\n        return 9\n\n\
+            def main():\n    Ranked r = Color()\n    print(r.rank())\n    print(r.name())\n");
+    }
+
+    #[test]
+    fn refined_interface_binding_missing_inherited_method_is_rejected() {
+        // #830 negative: a type missing the INHERITED supertype method does not
+        // conform to the refined interface, and the diagnostic names the missing
+        // method and the supertype that introduced it (D-0139).
+        let m = msgs(
+            "interface Named:\n    def name(self) -> int64\n\n\
+             interface Ranked: Named\n    def rank(self) -> int64\n\n\
+             struct OnlyRank:\n    def rank(self) -> int64:\n        return 9\n\n\
+             def main():\n    Ranked r = OnlyRank()\n",
+        );
+        assert!(
+            m.contains("missing method 'name'") && m.contains("supertype 'Named'"),
+            "missing inherited method names the supertype; got:\n{m}"
+        );
+    }
+
     // ---- crypto asymmetric-key surface (#643, D-0126) ---------------------
 
     #[test]

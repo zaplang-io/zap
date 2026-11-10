@@ -880,6 +880,38 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Concrete values could not be stored into an interface-typed collection
+  element** (#829, I#84 follow-up, D-0016). A `list[Iface]` element / `dict[K,
+  Iface]` value is a single uniform word, so storing a conformer there raised
+  `error[ZAP6001]` at IR lowering — the element path checked representation
+  equality against the interface's fat-struct instead of coercing the value into
+  the `{data, itable}` fat pointer, and the stack-inline fat pointer would dangle
+  once stored. The list-literal, `append`, and `dict`-value element paths now
+  route a conformer through the same `IfaceMake` boxing used for bindings,
+  parameters, returns, and fields, and then **heap-box** the fat pointer so the
+  stored word is a stable, precisely-traced pointer (its `data` word is followed,
+  its static-global `itable` word skipped as a non-heap pointer). This works for
+  struct conformers and for **both enum tiers** (#731): a tier-3 enum boxes its
+  tagged-struct pointer, a tier-1 enum its scalar-tag cell. Reading an element
+  back dispatches dynamically through the itable. (The *sema* side still rejects
+  a single-element `list[Iface]` or a `dict[K, Iface]` value whose inferred
+  element type is a concrete conformer rather than `Unknown`; that element-wise
+  collection covariance is tracked separately in #831, and this lowering already
+  handles it once admitted.)
+- **A refined-supertype method could not be dispatched on an interface value**
+  (#830, D-0139/#806). With `interface Ranked: Named`, calling the inherited
+  `name()` on a `Ranked`-typed value raised `error[ZAP6001]: interface 'Ranked'
+  has no method 'name'` at lowering, even though conformance across the refinement
+  is accepted — `lower_iface_call` searched only the bound interface's own method
+  list. An interface's dispatch table now folds in its **transitive refined
+  supertype** methods: own methods first (declaration order), then each
+  supertype's effective methods in declaration order, each name once. This single
+  list is the source of truth for both the itable layout (codegen builds slot *k*
+  from it by name → `Concrete__name`) and dynamic dispatch (the call resolves its
+  slot by searching it), so an inherited method lands on the slot the itable laid
+  out, and the slot order is stable across conformers. Works for struct, tier-3,
+  and tier-1 enum conformers (the tier-1 box emits a thunk per enum method, so the
+  inherited slot resolves too).
 - **`scope(timeout=…)` force-exited the whole process (with `grace`) or hung
   forever (without) when a child would not drain** (#825, D-0142; cross-refs
   D-0094/D-0045/D-0044 and the memory model D-0141/#826). A deadline whose child
