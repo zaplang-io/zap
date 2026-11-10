@@ -15,21 +15,30 @@ def write_pem(str data) -> str:
     return path
 
 
-# One-shot TLS server: writes cert+key to disk, listens on an ephemeral port
-# (published over `portch`), accepts one SUCCESSFUL connection, echoes the one
-# record it reads and closes. A client whose handshake fails is skipped by
-# `tls.accept` (so a rejected probe leaves the server waiting), and a server that
-# never gets a good client simply stays parked until the program exits.
-def one_shot_server(channel[int64] portch, str cert, str key):
+# Write a cert+key to disk and open a TLS listener on an ephemeral port; the
+# listener handle is returned to `main`, which owns its lifetime (so it can shut
+# the server down with `tls.close_listener` once the probes are done — the #488
+# graceful-shutdown contract). Created in `main`, not the serve coroutine, so no
+# coroutine is ever left parked in `tls.accept` after the program's work is done.
+def listen_server(str cert, str key) -> bytes:
     auto cert_path = write_pem(cert)
     auto key_path = write_pem(key)
-    auto l = tls.listen("127.0.0.1", 0, cert_path, key_path)
-    portch <- tls.port(l)
-    auto c = tls.accept(l)
-    auto msg = tls.recv(c, 1024)
-    tls.send(c, msg)
-    tls.close_conn(c)
-    tls.close_listener(l)
+    return tls.listen("127.0.0.1", 0, cert_path, key_path)
+
+
+# Echo-serve a listener until it is closed. `tls.accept` skips peers whose
+# handshake fails (a rejected probe), so the loop keeps serving; closing the
+# listener from `main` wakes the parked accept with a raise, which ends the loop
+# and lets the coroutine (and the program) exit cleanly.
+def serve(bytes l):
+    try:
+        while True:
+            auto c = tls.accept(l)
+            auto msg = tls.recv(c, 1024)
+            tls.send(c, msg)
+            tls.close_conn(c)
+    except Exception as e:
+        pass
 
 
 # Probe a server with a client context: "ok:<echo>" on success, "reject" if the
@@ -71,11 +80,7 @@ VyeCXxjGNuU1dLn4GflYhts/FYlJ6D0u7doSWzJtNzsHqnxOaaWJ
     auto ctx = tls.SSLContext()
     tls.load_verify_locations(ctx, ca_a, "")
 
-    auto pg = channel[int64]()
-    auto pn = channel[int64]()
-    auto pe = channel[int64]()
-    spawn one_shot_server(
-        pg,
+    auto srv_good = listen_server(
         """-----BEGIN CERTIFICATE-----
 MIIDUzCCAjugAwIBAgIUa0q+zPpioN0ciijbbbjGeRb0JI8wDQYJKoZIhvcNAQEL
 BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYTAgFw0yNjExMTAxMTI5MDdaGA8y
@@ -127,8 +132,7 @@ DZq6tXnu87bDiWQBxd1JjD7yEQu1ddnSS8LR79PLQiQbbBESebMT90DKT9dupLRV
 -----END PRIVATE KEY-----
 """,
     )
-    spawn one_shot_server(
-        pn,
+    auto srv_bad = listen_server(
         """-----BEGIN CERTIFICATE-----
 MIIDVTCCAj2gAwIBAgIUa0q+zPpioN0ciijbbbjGeRb0JJEwDQYJKoZIhvcNAQEL
 BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYTAgFw0yNjExMTAxMTI5MDdaGA8y
@@ -180,8 +184,7 @@ T5aDl6N3kv2chqdfI1vp3EHcE/824I7xPSi7gf6s1v8RYBx0EFf+0YUxcJ6yRpfN
 -----END PRIVATE KEY-----
 """,
     )
-    spawn one_shot_server(
-        pe,
+    auto srv_exp = listen_server(
         """-----BEGIN CERTIFICATE-----
 MIIDUTCCAjmgAwIBAgIUa0q+zPpioN0ciijbbbjGeRb0JJIwDQYJKoZIhvcNAQEL
 BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYTAeFw0yMDAxMDEwMDAwMDBaFw0y
@@ -233,7 +236,14 @@ WFzi8TqnCLGfVj94AdmROHqP
 -----END PRIVATE KEY-----
 """,
     )
+    spawn serve(srv_good)
+    spawn serve(srv_bad)
+    spawn serve(srv_exp)
 
-    print("good:    " + probe(ctx, <-pg))
-    print("badname: " + probe(ctx, <-pn))
-    print("expired: " + probe(ctx, <-pe))
+    print("good:    " + probe(ctx, tls.port(srv_good)))
+    print("badname: " + probe(ctx, tls.port(srv_bad)))
+    print("expired: " + probe(ctx, tls.port(srv_exp)))
+
+    tls.close_listener(srv_good)
+    tls.close_listener(srv_bad)
+    tls.close_listener(srv_exp)

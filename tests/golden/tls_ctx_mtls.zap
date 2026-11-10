@@ -17,21 +17,30 @@ def write_pem(str data) -> str:
     return path
 
 
-# One-shot TLS server: writes cert+key to disk, listens on an ephemeral port
-# (published over `portch`), accepts one SUCCESSFUL connection, echoes the one
-# record it reads and closes. A client whose handshake fails is skipped by
-# `tls.accept` (so a rejected probe leaves the server waiting), and a server that
-# never gets a good client simply stays parked until the program exits.
-def one_shot_server(channel[int64] portch, str cert, str key):
+# Write a cert+key to disk and open a TLS listener on an ephemeral port; the
+# listener handle is returned to `main`, which owns its lifetime (so it can shut
+# the server down with `tls.close_listener` once the probes are done — the #488
+# graceful-shutdown contract). Created in `main`, not the serve coroutine, so no
+# coroutine is ever left parked in `tls.accept` after the program's work is done.
+def listen_server(str cert, str key) -> bytes:
     auto cert_path = write_pem(cert)
     auto key_path = write_pem(key)
-    auto l = tls.listen("127.0.0.1", 0, cert_path, key_path)
-    portch <- tls.port(l)
-    auto c = tls.accept(l)
-    auto msg = tls.recv(c, 1024)
-    tls.send(c, msg)
-    tls.close_conn(c)
-    tls.close_listener(l)
+    return tls.listen("127.0.0.1", 0, cert_path, key_path)
+
+
+# Echo-serve a listener until it is closed. `tls.accept` skips peers whose
+# handshake fails (a rejected probe), so the loop keeps serving; closing the
+# listener from `main` wakes the parked accept with a raise, which ends the loop
+# and lets the coroutine (and the program) exit cleanly.
+def serve(bytes l):
+    try:
+        while True:
+            auto c = tls.accept(l)
+            auto msg = tls.recv(c, 1024)
+            tls.send(c, msg)
+            tls.close_conn(c)
+    except Exception as e:
+        pass
 
 
 # Probe a server with a client context: "ok:<echo>" on success, "reject" if the

@@ -7,9 +7,9 @@
 # another (each owns its own SSL_CTX / X509_STORE; no process-global
 # SSL_CERT_FILE/SSL_CERT_DIR mutation).
 #
-# Probe order drives each one-shot server's single `tls.accept`: the REJECT probe
-# to a server arrives first (its handshake fails client-side and `tls.accept`
-# skips it), then the matching VALID probe completes the accept and is echoed.
+# Both servers run concurrently throughout; `tls.accept` skips a probe whose
+# handshake the client aborts (a cross-CA reject), so each server still echoes the
+# probe from its own CA. `main` shuts both listeners at the end.
 
 
 def write_pem(str data) -> str:
@@ -19,21 +19,30 @@ def write_pem(str data) -> str:
     return path
 
 
-# One-shot TLS server: writes cert+key to disk, listens on an ephemeral port
-# (published over `portch`), accepts one SUCCESSFUL connection, echoes the one
-# record it reads and closes. A client whose handshake fails is skipped by
-# `tls.accept` (so a rejected probe leaves the server waiting), and a server that
-# never gets a good client simply stays parked until the program exits.
-def one_shot_server(channel[int64] portch, str cert, str key):
+# Write a cert+key to disk and open a TLS listener on an ephemeral port; the
+# listener handle is returned to `main`, which owns its lifetime (so it can shut
+# the server down with `tls.close_listener` once the probes are done — the #488
+# graceful-shutdown contract). Created in `main`, not the serve coroutine, so no
+# coroutine is ever left parked in `tls.accept` after the program's work is done.
+def listen_server(str cert, str key) -> bytes:
     auto cert_path = write_pem(cert)
     auto key_path = write_pem(key)
-    auto l = tls.listen("127.0.0.1", 0, cert_path, key_path)
-    portch <- tls.port(l)
-    auto c = tls.accept(l)
-    auto msg = tls.recv(c, 1024)
-    tls.send(c, msg)
-    tls.close_conn(c)
-    tls.close_listener(l)
+    return tls.listen("127.0.0.1", 0, cert_path, key_path)
+
+
+# Echo-serve a listener until it is closed. `tls.accept` skips peers whose
+# handshake fails (a rejected probe), so the loop keeps serving; closing the
+# listener from `main` wakes the parked accept with a raise, which ends the loop
+# and lets the coroutine (and the program) exit cleanly.
+def serve(bytes l):
+    try:
+        while True:
+            auto c = tls.accept(l)
+            auto msg = tls.recv(c, 1024)
+            tls.send(c, msg)
+            tls.close_conn(c)
+    except Exception as e:
+        pass
 
 
 # Probe a server with a client context: "ok:<echo>" on success, "reject" if the
@@ -101,10 +110,7 @@ z2BU5Zt8h8eftvxdA4oCQre4inxJnD3M5KW50qHzKsq4DuVCs/WL
     auto ctx_b = tls.SSLContext()
     tls.load_verify_locations(ctx_b, ca_b, "")
 
-    auto pa = channel[int64]()
-    auto pb = channel[int64]()
-    spawn one_shot_server(
-        pa,
+    auto srv_a = listen_server(
         """-----BEGIN CERTIFICATE-----
 MIIDUzCCAjugAwIBAgIUa0q+zPpioN0ciijbbbjGeRb0JI8wDQYJKoZIhvcNAQEL
 BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYTAgFw0yNjExMTAxMTI5MDdaGA8y
@@ -156,8 +162,7 @@ DZq6tXnu87bDiWQBxd1JjD7yEQu1ddnSS8LR79PLQiQbbBESebMT90DKT9dupLRV
 -----END PRIVATE KEY-----
 """,
     )
-    spawn one_shot_server(
-        pb,
+    auto srv_b = listen_server(
         """-----BEGIN CERTIFICATE-----
 MIIDUzCCAjugAwIBAgIUe0msv6u7i8RYK3r0m558+wQOv0owDQYJKoZIhvcNAQEL
 BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYjAgFw0yNjExMTAxMTI5MDdaGA8y
@@ -209,11 +214,16 @@ ot8JGYRdyOhe79AfMs/SK4WN
 -----END PRIVATE KEY-----
 """,
     )
-    auto port_a = <-pa
-    auto port_b = <-pb
+    spawn serve(srv_a)
+    spawn serve(srv_b)
+    auto port_a = tls.port(srv_a)
+    auto port_b = tls.port(srv_b)
 
-    # Reject probes first (wrong CA for each server), then the valid probes.
+    # Cross-CA probes are rejected; same-CA probes are echoed.
     print("ctxB->srvA: " + probe(ctx_b, port_a))
     print("ctxA->srvB: " + probe(ctx_a, port_b))
     print("ctxA->srvA: " + probe(ctx_a, port_a))
     print("ctxB->srvB: " + probe(ctx_b, port_b))
+
+    tls.close_listener(srv_a)
+    tls.close_listener(srv_b)

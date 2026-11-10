@@ -6,8 +6,8 @@
 #   * `tls.create_default_context()` preloads the system roots (AUGMENT): a
 #     private CA loaded on top is trusted IN ADDITION to the system roots (the
 #     system-root half is covered by the default-trust regression goldens).
-# Server A is signed by CA A; server B by CA B. Each probe uses its own one-shot
-# server so accept bookkeeping stays trivial.
+# Server A is signed by CA A; server B by CA B. Two concurrent servers; `main`
+# shuts both listeners at the end.
 
 
 def write_pem(str data) -> str:
@@ -17,21 +17,30 @@ def write_pem(str data) -> str:
     return path
 
 
-# One-shot TLS server: writes cert+key to disk, listens on an ephemeral port
-# (published over `portch`), accepts one SUCCESSFUL connection, echoes the one
-# record it reads and closes. A client whose handshake fails is skipped by
-# `tls.accept` (so a rejected probe leaves the server waiting), and a server that
-# never gets a good client simply stays parked until the program exits.
-def one_shot_server(channel[int64] portch, str cert, str key):
+# Write a cert+key to disk and open a TLS listener on an ephemeral port; the
+# listener handle is returned to `main`, which owns its lifetime (so it can shut
+# the server down with `tls.close_listener` once the probes are done — the #488
+# graceful-shutdown contract). Created in `main`, not the serve coroutine, so no
+# coroutine is ever left parked in `tls.accept` after the program's work is done.
+def listen_server(str cert, str key) -> bytes:
     auto cert_path = write_pem(cert)
     auto key_path = write_pem(key)
-    auto l = tls.listen("127.0.0.1", 0, cert_path, key_path)
-    portch <- tls.port(l)
-    auto c = tls.accept(l)
-    auto msg = tls.recv(c, 1024)
-    tls.send(c, msg)
-    tls.close_conn(c)
-    tls.close_listener(l)
+    return tls.listen("127.0.0.1", 0, cert_path, key_path)
+
+
+# Echo-serve a listener until it is closed. `tls.accept` skips peers whose
+# handshake fails (a rejected probe), so the loop keeps serving; closing the
+# listener from `main` wakes the parked accept with a raise, which ends the loop
+# and lets the coroutine (and the program) exit cleanly.
+def serve(bytes l):
+    try:
+        while True:
+            auto c = tls.accept(l)
+            auto msg = tls.recv(c, 1024)
+            tls.send(c, msg)
+            tls.close_conn(c)
+    except Exception as e:
+        pass
 
 
 # Probe a server with a client context: "ok:<echo>" on success, "reject" if the
@@ -80,12 +89,7 @@ VyeCXxjGNuU1dLn4GflYhts/FYlJ6D0u7doSWzJtNzsHqnxOaaWJ
     auto dflt = tls.create_default_context()
     tls.load_verify_locations(dflt, ca_a, "")
 
-    auto p1 = channel[int64]()
-    auto p2 = channel[int64]()
-    auto p3 = channel[int64]()
-    auto p4 = channel[int64]()
-    spawn one_shot_server(
-        p1,
+    auto srv_a = listen_server(
         """-----BEGIN CERTIFICATE-----
 MIIDUzCCAjugAwIBAgIUa0q+zPpioN0ciijbbbjGeRb0JI8wDQYJKoZIhvcNAQEL
 BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYTAgFw0yNjExMTAxMTI5MDdaGA8y
@@ -137,8 +141,7 @@ DZq6tXnu87bDiWQBxd1JjD7yEQu1ddnSS8LR79PLQiQbbBESebMT90DKT9dupLRV
 -----END PRIVATE KEY-----
 """,
     )
-    spawn one_shot_server(
-        p2,
+    auto srv_b = listen_server(
         """-----BEGIN CERTIFICATE-----
 MIIDUzCCAjugAwIBAgIUe0msv6u7i8RYK3r0m558+wQOv0owDQYJKoZIhvcNAQEL
 BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYjAgFw0yNjExMTAxMTI5MDdaGA8y
@@ -190,114 +193,15 @@ ot8JGYRdyOhe79AfMs/SK4WN
 -----END PRIVATE KEY-----
 """,
     )
-    spawn one_shot_server(
-        p3,
-        """-----BEGIN CERTIFICATE-----
-MIIDUzCCAjugAwIBAgIUa0q+zPpioN0ciijbbbjGeRb0JI8wDQYJKoZIhvcNAQEL
-BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYTAgFw0yNjExMTAxMTI5MDdaGA8y
-MTI2MTAxNzExMjkwN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG
-9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnoXjYR/iCPdAt/yuEemPW6OkbWlDVIqsKkYn
-6NsrQ7pMWoW6PAy6NkjTdr/nldwDJxaGEir2hQD33I8AFRq84fdwcXaa7R7B2GXK
-oPKyYL7/E8/btSiF0CQ1I4IoeO9bdrdd/Gk1s5CIlr/tAVI0dRw0qYlX9cflPF6F
-pVnL94AvlwzuhXtloglsPClLsTtZR/9BPM2dvb8CcubWi5TLnuoSezhcf2iyWz5I
-ohcF8dL8f4pstwmhjba/pGKaKLpLFiLG+otjJ0tKJEM/LoJYjTHexiqAJsSKD1fi
-RJTDZp3Ft98A3PiYKO+Zzs//em5v2w/YWT03+mbyp4joT8HNRQIDAQABo4GWMIGT
-MBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAJBgNVHRMEAjAAMAsGA1UdDwQE
-AwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwHQYDVR0OBBYEFMGL
-3lJkoIr4X2oX5d3RpbVeSVhAMB8GA1UdIwQYMBaAFG162bSashGy1C92qQQbZanD
-NhSwMA0GCSqGSIb3DQEBCwUAA4IBAQA4px70gZrWX+e+R69lfn5x+qGkYOesJW+d
-OfsGPOa+x6Ol6wo7ozT95JYKF3OP4nl/zmyTarMQwGZueRilCfIUYj/7R+o5FxOf
-aTWNTVuyE6aZFmfkxHSxMQ+TicSZnPOnP6jLA304HoXuQ0Ha84PhGUy2LYugNis/
-cIAVqxLGSB5Lu3Hpj4bh8hG7jA98dmzbHmvAxJ3VG4L1peNI5r9eK4L19dgj7rD3
-U26fLCJmH34gVMQve/ydJ6DBj0kkThzKVSmK/dlK0ICNR/h8iNUSOLR+CP+FHoRq
-23Wa8CopaWZqqCuR47JIQDxMYfDyoCSdoDuDJuT7pukcT/n9fqXK
------END CERTIFICATE-----
-""",
-        """-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCeheNhH+II90C3
-/K4R6Y9bo6RtaUNUiqwqRifo2ytDukxahbo8DLo2SNN2v+eV3AMnFoYSKvaFAPfc
-jwAVGrzh93BxdprtHsHYZcqg8rJgvv8Tz9u1KIXQJDUjgih471t2t138aTWzkIiW
-v+0BUjR1HDSpiVf1x+U8XoWlWcv3gC+XDO6Fe2WiCWw8KUuxO1lH/0E8zZ29vwJy
-5taLlMue6hJ7OFx/aLJbPkiiFwXx0vx/imy3CaGNtr+kYpoouksWIsb6i2MnS0ok
-Qz8ugliNMd7GKoAmxIoPV+JElMNmncW33wDc+Jgo75nOz/96bm/bD9hZPTf6ZvKn
-iOhPwc1FAgMBAAECggEAHKbT7GHUG60+1hJWTvgBOH25EipwqDbhO8nO3FRCu1zQ
-gJsDiGd/f6DFkcTJQYmQy0+Tn3SC9pKwef2htO7OfWQY/3UBtwJ0ZF2vlEwRaBGV
-bnoG+rUOjIqCzT5w/Ly8chZd5ymH8oLY4TBi0LaQMyuMLCleC9cbrH/kFXkHt927
-RMgKBgxVIe6uLw4rX76soajgww+iokHR3/6U4eQqFocNqeA/8DW6vUS73qKHKg56
-10E3Z4mgz7goN4VEx+gh52HOG+iLtbNQU7E7D6SDn33mqxuxW352yzTxeRIro5bE
-0hwb4SRcezgjjAGJKI/6SMWZMA2iZJAQQKk7fk1DMQKBgQDOP0n1mGBtxSAwjN3a
-j2ORDB8sr42ZBrotNJElU7Ay7NMpVwspQEuXfz1I9ct7HH57d7TpXDfrDaZiUoVt
-tXThwbSSEOWxpdufU8ynQdEHK5YXXocVPVPSV85Q9xuCxjMXpyACv7SZ7ovwX7E1
-zyqym2eoVB4hfq4GuPgXLR3M1QKBgQDEw2jw2ipeSDVEZm1vDGncUKezmfn0EK7N
-rChBb6Efxw42kARhCbTrdtgL3BIaE3pRBnMaykx9HkEA+R1LofXd9XfUY4I/QO8/
-d5lFGAHHeCY7pR3mMZcuTGrm0NV7kV8PXY0mbRhjXCDlgcqRR/RQG5205JgAwOdH
-LE5jlUl2sQKBgD7KJcoPScwhZ1tgh2oynS1bc2I3T/R2h9ebWVTz1YCreN3tEgjM
-+jZ1FkNQEVK5qggMuZcR7DQzQ6RLWzO7OopAXqjZXBRpWiN3b6a78tcr/dW/gYCF
-2y7+bGFZ2ZZGoOdiiexMUL9MUG4ts9Wd7HHTvgsRENtBpdmGFoF3ysrBAoGADccV
-GRBduR5bRH/bl9QJsZigNY5Jl1J3uwUcCID1ilEY6K8q71SLq5U1yZbOWa8VeIj4
-FF8n/fbZXGUVLQ+ZNMKUcnXJT/6PAiWwwMrOjRYXr0N/lXfRezd0oNbsq+tg+aV2
-VcN72rE/yHJPKd8c92MHpvv+vMbFKxGqJ4TzkPECgYEAsJLFsbIUGb0EMBf24COG
-Mc4LvtqWilvlggx3Nc3QF3esv6xf9gpJDWz2D2DfPo7AkAVxHSpsCoERyB91diAx
-DZq6tXnu87bDiWQBxd1JjD7yEQu1ddnSS8LR79PLQiQbbBESebMT90DKT9dupLRV
-99b+ciJ2L40lIm5OeyyG5LI=
------END PRIVATE KEY-----
-""",
-    )
-    spawn one_shot_server(
-        p4,
-        """-----BEGIN CERTIFICATE-----
-MIIDUzCCAjugAwIBAgIUa0q+zPpioN0ciijbbbjGeRb0JI8wDQYJKoZIhvcNAQEL
-BQAwGDEWMBQGA1UEAwwNWmFwIFRlc3QgQ0EgYTAgFw0yNjExMTAxMTI5MDdaGA8y
-MTI2MTAxNzExMjkwN1owFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG
-9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnoXjYR/iCPdAt/yuEemPW6OkbWlDVIqsKkYn
-6NsrQ7pMWoW6PAy6NkjTdr/nldwDJxaGEir2hQD33I8AFRq84fdwcXaa7R7B2GXK
-oPKyYL7/E8/btSiF0CQ1I4IoeO9bdrdd/Gk1s5CIlr/tAVI0dRw0qYlX9cflPF6F
-pVnL94AvlwzuhXtloglsPClLsTtZR/9BPM2dvb8CcubWi5TLnuoSezhcf2iyWz5I
-ohcF8dL8f4pstwmhjba/pGKaKLpLFiLG+otjJ0tKJEM/LoJYjTHexiqAJsSKD1fi
-RJTDZp3Ft98A3PiYKO+Zzs//em5v2w/YWT03+mbyp4joT8HNRQIDAQABo4GWMIGT
-MBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAJBgNVHRMEAjAAMAsGA1UdDwQE
-AwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwHQYDVR0OBBYEFMGL
-3lJkoIr4X2oX5d3RpbVeSVhAMB8GA1UdIwQYMBaAFG162bSashGy1C92qQQbZanD
-NhSwMA0GCSqGSIb3DQEBCwUAA4IBAQA4px70gZrWX+e+R69lfn5x+qGkYOesJW+d
-OfsGPOa+x6Ol6wo7ozT95JYKF3OP4nl/zmyTarMQwGZueRilCfIUYj/7R+o5FxOf
-aTWNTVuyE6aZFmfkxHSxMQ+TicSZnPOnP6jLA304HoXuQ0Ha84PhGUy2LYugNis/
-cIAVqxLGSB5Lu3Hpj4bh8hG7jA98dmzbHmvAxJ3VG4L1peNI5r9eK4L19dgj7rD3
-U26fLCJmH34gVMQve/ydJ6DBj0kkThzKVSmK/dlK0ICNR/h8iNUSOLR+CP+FHoRq
-23Wa8CopaWZqqCuR47JIQDxMYfDyoCSdoDuDJuT7pukcT/n9fqXK
------END CERTIFICATE-----
-""",
-        """-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCeheNhH+II90C3
-/K4R6Y9bo6RtaUNUiqwqRifo2ytDukxahbo8DLo2SNN2v+eV3AMnFoYSKvaFAPfc
-jwAVGrzh93BxdprtHsHYZcqg8rJgvv8Tz9u1KIXQJDUjgih471t2t138aTWzkIiW
-v+0BUjR1HDSpiVf1x+U8XoWlWcv3gC+XDO6Fe2WiCWw8KUuxO1lH/0E8zZ29vwJy
-5taLlMue6hJ7OFx/aLJbPkiiFwXx0vx/imy3CaGNtr+kYpoouksWIsb6i2MnS0ok
-Qz8ugliNMd7GKoAmxIoPV+JElMNmncW33wDc+Jgo75nOz/96bm/bD9hZPTf6ZvKn
-iOhPwc1FAgMBAAECggEAHKbT7GHUG60+1hJWTvgBOH25EipwqDbhO8nO3FRCu1zQ
-gJsDiGd/f6DFkcTJQYmQy0+Tn3SC9pKwef2htO7OfWQY/3UBtwJ0ZF2vlEwRaBGV
-bnoG+rUOjIqCzT5w/Ly8chZd5ymH8oLY4TBi0LaQMyuMLCleC9cbrH/kFXkHt927
-RMgKBgxVIe6uLw4rX76soajgww+iokHR3/6U4eQqFocNqeA/8DW6vUS73qKHKg56
-10E3Z4mgz7goN4VEx+gh52HOG+iLtbNQU7E7D6SDn33mqxuxW352yzTxeRIro5bE
-0hwb4SRcezgjjAGJKI/6SMWZMA2iZJAQQKk7fk1DMQKBgQDOP0n1mGBtxSAwjN3a
-j2ORDB8sr42ZBrotNJElU7Ay7NMpVwspQEuXfz1I9ct7HH57d7TpXDfrDaZiUoVt
-tXThwbSSEOWxpdufU8ynQdEHK5YXXocVPVPSV85Q9xuCxjMXpyACv7SZ7ovwX7E1
-zyqym2eoVB4hfq4GuPgXLR3M1QKBgQDEw2jw2ipeSDVEZm1vDGncUKezmfn0EK7N
-rChBb6Efxw42kARhCbTrdtgL3BIaE3pRBnMaykx9HkEA+R1LofXd9XfUY4I/QO8/
-d5lFGAHHeCY7pR3mMZcuTGrm0NV7kV8PXY0mbRhjXCDlgcqRR/RQG5205JgAwOdH
-LE5jlUl2sQKBgD7KJcoPScwhZ1tgh2oynS1bc2I3T/R2h9ebWVTz1YCreN3tEgjM
-+jZ1FkNQEVK5qggMuZcR7DQzQ6RLWzO7OopAXqjZXBRpWiN3b6a78tcr/dW/gYCF
-2y7+bGFZ2ZZGoOdiiexMUL9MUG4ts9Wd7HHTvgsRENtBpdmGFoF3ysrBAoGADccV
-GRBduR5bRH/bl9QJsZigNY5Jl1J3uwUcCID1ilEY6K8q71SLq5U1yZbOWa8VeIj4
-FF8n/fbZXGUVLQ+ZNMKUcnXJT/6PAiWwwMrOjRYXr0N/lXfRezd0oNbsq+tg+aV2
-VcN72rE/yHJPKd8c92MHpvv+vMbFKxGqJ4TzkPECgYEAsJLFsbIUGb0EMBf24COG
-Mc4LvtqWilvlggx3Nc3QF3esv6xf9gpJDWz2D2DfPo7AkAVxHSpsCoERyB91diAx
-DZq6tXnu87bDiWQBxd1JjD7yEQu1ddnSS8LR79PLQiQbbBESebMT90DKT9dupLRV
-99b+ciJ2L40lIm5OeyyG5LI=
------END PRIVATE KEY-----
-""",
-    )
+    spawn serve(srv_a)
+    spawn serve(srv_b)
+    auto pa = tls.port(srv_a)
+    auto pb = tls.port(srv_b)
 
-    print("bare+caA  -> srvA: " + probe(bare, <-p1))
-    print("bare+caA  -> srvB: " + probe(bare, <-p2))
-    print("bareEmpty -> srvA: " + probe(empty, <-p3))
-    print("default+caA -> srvA: " + probe(dflt, <-p4))
+    print("bare+caA  -> srvA: " + probe(bare, pa))
+    print("bare+caA  -> srvB: " + probe(bare, pb))
+    print("bareEmpty -> srvA: " + probe(empty, pa))
+    print("default+caA -> srvA: " + probe(dflt, pa))
+
+    tls.close_listener(srv_a)
+    tls.close_listener(srv_b)
