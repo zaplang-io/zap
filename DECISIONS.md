@@ -6664,8 +6664,9 @@ over memory models that leave racy programs wholly undefined.
    **zaplang-io/zap#825**: today `scope(timeout=, grace=)` `_exit(1)`s the process
    and a no-`grace` timeout hangs the join; the fix is sever-and-`ScopeTimeout`,
    with process exit reserved for signal-driven shutdown.
-4. Place the normative prose in **SPEC §(concurrency)** as well, linking here, so
-   programmers find it outside the decision log.
+4. The reader-facing normative prose now lives in **`docs/MEMORY_MODEL.md`**
+   (added with this decision); still link it from **SPEC §(concurrency)** so
+   programmers reach it from the spec.
 
 (Decided 2026-11-10. Refs: D-0008, D-0031, D-0033/D-0044, D-0034 (specified here),
 D-0045, D-0066, D-0094, D-0112, D-0114, D-0140; zaplang-io/zap#825; prompted by a
