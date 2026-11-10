@@ -372,6 +372,14 @@ struct Checker {
     /// dispatch after monomorphization), and calling a method the bound does not
     /// provide is rejected at definition (check-at-definition, Fork M1).
     tyvar_bounds: HashMap<String, String>,
+    /// Interface bounds on the type parameters of the *enclosing* type whose
+    /// methods are currently being checked (I#811): e.g. the `K: Comparable` of
+    /// `struct BST[K: Comparable, V]` while checking `BST`'s methods. These are
+    /// merged into [`Self::tyvar_bounds`] by [`Self::check_function`] so a method
+    /// body may call the bound's methods (`__cmp__`/`__hash__`) on a parameter
+    /// typed as the enclosing type parameter — the user-container counterpart of
+    /// the bounded-free-function body check. Empty for free functions.
+    enclosing_type_bounds: Vec<(String, String)>,
     ret_ty: Ty,
     /// `true` while checking the body of a generator function (a free `def`
     /// whose body contains `yield`, I#67/D-0026). Gates `yield`/`return`
@@ -812,6 +820,7 @@ impl Checker {
             scopes: Vec::new(),
             const_scopes: Vec::new(),
             tyvar_bounds: HashMap::new(),
+            enclosing_type_bounds: Vec::new(),
             ret_ty: Ty::Unit,
             in_generator: false,
             errors: Vec::new(),
@@ -3022,9 +3031,11 @@ impl Checker {
             match item {
                 Item::Function(f) => self.check_function(f, None),
                 Item::Struct(s) => {
+                    self.enclosing_type_bounds = self.type_param_bounds(&s.generics);
                     for m in &s.methods {
                         self.check_function(m, Some(&s.name));
                     }
+                    self.enclosing_type_bounds = Vec::new();
                 }
                 Item::Enum(e) => {
                     // A tier-1 (constant) enum's `Equatable`/`Hashable` are
@@ -3058,9 +3069,11 @@ impl Checker {
                     // body may use only universal operations (bind/pass/return/
                     // match), which is the unconstrained check-at-definition rule
                     // (Fork B/M1). Enum-method *lowering* lands in the ir slice.
+                    self.enclosing_type_bounds = self.type_param_bounds(&e.generics);
                     for m in &e.methods {
                         self.check_function(m, Some(&e.name));
                     }
+                    self.enclosing_type_bounds = Vec::new();
                 }
                 // Module-level bindings (const and mutable) were already declared
                 // and checked in the pre-pass above (D-0112); skip them here so
@@ -3122,6 +3135,21 @@ impl Checker {
         }
     }
 
+    /// The `(type-parameter name, bound interface name)` pairs of a declaration's
+    /// type parameters whose bound names a known interface (I#811). Used to seed
+    /// [`Self::enclosing_type_bounds`] for a generic type's method bodies.
+    fn type_param_bounds(&self, generics: &[TypeParam]) -> Vec<(String, String)> {
+        generics
+            .iter()
+            .filter_map(|tp| match &tp.bound {
+                Some(Type::Named { name: iface, .. }) if self.interfaces.contains_key(iface) => {
+                    Some((tp.name.clone(), iface.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn check_function(&mut self, f: &Function, self_ty: Option<&str>) {
         for p in &f.params {
             if let Some(t) = &p.ty {
@@ -3147,7 +3175,18 @@ impl Checker {
         // provide is rejected here, at definition (check-at-definition, Fork M1).
         // Unbounded type parameters are left opaque (`Unknown`) as before.
         let saved_bounds = std::mem::take(&mut self.tyvar_bounds);
+        // Bounds on the *enclosing* type's parameters (I#811): a method of
+        // `struct BST[K: Comparable, V]` may call `Comparable`'s methods on a
+        // parameter typed `K`. A method's own type parameter shadows an enclosing
+        // one of the same name (inserted after, below).
+        for (name, iface) in &self.enclosing_type_bounds {
+            self.tyvar_bounds.insert(name.clone(), iface.clone());
+        }
         for tp in &f.generics {
+            // A method's own type parameter is a fresh variable that shadows an
+            // enclosing one of the same name: drop any inherited bound first, then
+            // apply this parameter's own (an unbounded own parameter stays opaque).
+            self.tyvar_bounds.remove(&tp.name);
             if let Some(Type::Named { name: iface, .. }) = &tp.bound {
                 if self.interfaces.contains_key(iface) {
                     self.tyvar_bounds.insert(tp.name.clone(), iface.clone());
@@ -10571,6 +10610,70 @@ def main():
                 && m.contains("Hashable"),
             "got:\n{m}"
         );
+    }
+
+    // ---- capability bounds on user generic containers (D-0139/I#811) ------
+    //
+    // A user generic container declares a capability bound exactly as a built-in
+    // one does. Inside a method body, the bound's methods (and those of its
+    // refined supertypes) resolve on a value of the enclosing type parameter —
+    // the user-container counterpart of the bounded-free-function body check.
+
+    #[test]
+    fn enclosing_comparable_bound_method_resolves_in_body() {
+        // A method of `struct Sorter[K: Comparable]` may call `__cmp__` (and, by
+        // refinement, `__eq__`) on a parameter typed `K`.
+        ok("value struct Sorter[K: Comparable]:\n    K pivot\n\
+            \x20   def before(self, K a, K b) -> int64:\n        return a.__cmp__(b)\n\
+            \x20   def same(self, K a, K b) -> bool:\n        return a.__eq__(b)\n\n\
+            def main():\n    print(1)\n");
+    }
+
+    #[test]
+    fn enclosing_hashable_bound_method_resolves_in_body() {
+        // A method of `struct HMap[K: Hashable, V]` may call `__hash__` (and, by
+        // refinement, `__eq__`) on a value of `K`.
+        ok("value struct HMap[K: Hashable, V]:\n    K k\n    V v\n\
+            \x20   def slot(self, K key) -> int64:\n        return key.__hash__()\n\n\
+            def main():\n    print(1)\n");
+    }
+
+    #[test]
+    fn enclosing_bound_does_not_leak_a_method_outside_the_capability() {
+        // The bound limits the callable set at definition: a method neither the
+        // capability nor its supertypes declare is rejected, naming the bound.
+        let m = msgs(
+            "value struct Sorter[K: Comparable]:\n    K pivot\n\
+             \x20   def bad(self, K a) -> int64:\n        return a.nope()\n\n\
+             def main():\n    print(1)\n",
+        );
+        assert!(
+            m.contains("type parameter 'K'")
+                && m.contains("bound 'Comparable'")
+                && m.contains("no method 'nope'"),
+            "got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn enclosing_unbounded_type_parameter_stays_opaque() {
+        // Without a bound the enclosing type parameter is opaque in method bodies,
+        // exactly as for an unbounded free-function parameter (no regression).
+        ok("value struct Box[T]:\n    T item\n\
+            \x20   def get(self, T x) -> T:\n        return x\n\n\
+            def main():\n    print(1)\n");
+    }
+
+    #[test]
+    fn method_own_generic_shadows_enclosing_bound() {
+        // A method's own type parameter of the same name as an enclosing one is a
+        // fresh, unbounded variable that shadows the enclosing one: the body
+        // becomes opaque over it. A call the enclosing `Comparable` bound would
+        // reject (`nope`) is therefore loosely accepted here — proof the inherited
+        // bound was dropped rather than leaking onto the shadowing parameter.
+        ok("value struct Sorter[K: Comparable]:\n    K pivot\n\
+            \x20   def opaque[K](self, K a) -> int64:\n        a.nope()\n        return 0\n\n\
+            def main():\n    print(1)\n");
     }
 
     #[test]

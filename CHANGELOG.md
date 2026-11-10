@@ -25,6 +25,27 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **User-defined generic containers with capability bounds — closes the capability
+  epic** (#811, epic #812, D-0139). A user generic type may bound a type parameter
+  on a capability exactly as the built-ins do — `struct BST[K: Comparable, V]`,
+  `struct HMap[K: Hashable, V]` — reusing the existing `[T: Iface]` bound syntax
+  (no new surface). The bound is enforced **at instantiation** by the same
+  intrinsic rule a built-in element position uses, so a user container admits
+  exactly the element types a built-in one does: scalars / `str` / `bytes` /
+  `float` / tier-1 enums satisfy all three capabilities; a `value struct` or tier-3
+  enum satisfies `Equatable`/`Hashable` by auto-derive (#808/#809) or a declared
+  dunder set, and `Comparable` only with an explicit `__cmp__` / `@derive(Ord)`; a
+  reference struct never auto-derives; mutable collections and `bigint`/`complex`
+  satisfy none. A non-satisfying argument is a **capability-named** compile error
+  that states the blocking reason — for a value aggregate, the offending field
+  (`field 'items' of type 'list[int64]' …`) — never symptom-level wording. Inside a
+  bounded generic type's method body, the capability's methods (and its refined
+  supertypes') resolve on a value of the bounded type parameter (static dispatch;
+  a method's own same-named parameter shadows the enclosing one), and a call the
+  bound does not provide is rejected at definition. *Known limitation:* calling a
+  capability dunder **explicitly** (`k.__cmp__(x)`) on a parameter whose instance
+  is a scalar does not lower yet (a pre-existing I#164 gap shared by bounded free
+  functions); the operator surface (`<`, `==`) lowers for every instance.
 - **Automatic, total, overridable `__repr__` — confirmed for the capability model**
   (#810, epic #812, D-0139). The capability model locked that `Repr` is automatic,
   total, and overridable (a separate display category, not a membership
