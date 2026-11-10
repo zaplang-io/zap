@@ -25,6 +25,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Automatic, total, overridable `__repr__` — confirmed for the capability model**
+  (#810, epic #812, D-0139). The capability model locked that `Repr` is automatic,
+  total, and overridable (a separate display category, not a membership
+  capability); this is already realized by the general Display protocol
+  (#274/D-0124, #707): every struct / value struct / tuple / enum (tier-1 name,
+  tier-3 `Variant(field=…)`) has a default **structural field-form** render —
+  `TypeName(field=value, …)`, **never an address** — shared across `print()`,
+  `str()`, f-strings, the REPL, and doctests with no `@derive`, and `__str__`
+  falls back to `__repr__` (hand-writing either overrides). The former
+  `str(struct)` / f-string rejection is already retired — `check_renderable`
+  admits user struct/enum/tuple and `list`/`dict`/`set` values. This entry records
+  that the D-0139 `Repr` item is satisfied and adds a plain-`value struct`
+  default-repr golden to close the explicit coverage gap. *Known limitation:* a
+  recursive **reference** struct that forms an actual cycle at runtime has no
+  repr recursion guard yet (would recurse); a follow-up.
 - **Enums work as dict keys / set members** (#809, epic #812, D-0139). A **tier-1**
   (constant) enum is int-backed, so `dict[Color, V]`, `set[Color]`, and
   `heap[Color]` (ordered by backing value) work with no annotation; its equality
