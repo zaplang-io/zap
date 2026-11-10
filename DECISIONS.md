@@ -191,9 +191,25 @@ holds a stable pointer to a heap copy of the pair. The copy is GC-safe — its
 `data` word is a heap pointer the tracer follows and its `itable` word is a
 static global the precise tracer skips as a non-heap pointer. (A struct *field*
 of interface type needs no box: it is laid out inline-in-aggregate.) This holds
-uniformly for struct conformers and both enum tiers. The *sema* admission of such
-an element (element-wise interface conformance inside a collection type) is
-tracked separately in #831; the lowering above already handles it.
+uniformly for struct conformers and both enum tiers.
+
+*Sema admission (#831, resolved).* Type-checking admits the same
+`struct`/`enum → interface` coercion **element-wise at collection VALUE
+positions** — a `list`/`array` element and a `dict` **value** — exactly where
+`assignable` already permits collection covariance (the scalar
+`list[int32] → list[int64]` rule), using the identical structural `conforms`
+check (including transitive refined supertypes, D-0139). It is not an interface
+special case: the covariance recursion routes through the same
+coercion-checking path, so an element widens by any rule already allowed, and it
+nests (`list[list[Iface]]`). **Keys stay exact.** A `dict` key and a `set`
+member are hash positions and an interface value is unhashable, so a conformer
+there is still rejected; only value positions gain the coercion. Channels are
+invariant (no element covariance), so they are unaffected. A heterogeneous
+collection *literal* whose distinct element types the checker joins to
+`Unknown` (`[Tri(), Quad()]`) is re-verified element-by-element against the
+declared interface, so it is admitted by real conformance while a literal
+holding a non-conformer (`[Bad(), Other()]`) is a clean `ZAP4001` at the binding
+instead of a later lowering failure.
 
 **Refined-supertype dispatch on an interface value (#830, D-0139, resolved).** An
 interface's dispatch table (itable slot order) is its own methods first

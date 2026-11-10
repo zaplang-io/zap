@@ -880,6 +880,26 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Sema rejected a conformer at an interface-typed collection element**
+  (#831, D-0016). Type-checking admitted the `struct`/`enum → interface`
+  coercion only at the top level, so `list[Shape] xs = [Tri()]` and
+  `dict[int, Shape] d = {1: Tri()}` failed with `error[ZAP4001]` at the binding —
+  a single conformer keeps its concrete element type (`list[Tri]`), which
+  `coercible`/`assignable` did not lift into `list[Shape]`. Only a *heterogeneous*
+  literal happened to type-check, because its distinct element types joined to
+  `Unknown`. Element-wise interface coercion is now admitted at collection VALUE
+  positions — a `list`/`array` element and a `dict` **value** — wherever
+  collection covariance already applies, by the same structural conformance check
+  (including transitive refined supertypes, D-0139) used at the top level, and it
+  nests (`list[list[Shape]]`). The matching IR boxing (#829/#832) was already in
+  place, so admitted literals, bindings, assignments, and returns now work
+  end-to-end. **Keys stay exact**: a `dict` key and a `set` member are hash
+  positions and an interface value is unhashable, so a conformer there is still
+  rejected. The fix also closes a latent hazard: a literal of two distinct
+  **non-conformers** (`[Bad(), Other()]`) previously joined to `Unknown`, slipped
+  sema, and crashed lowering (`'Bad__sides' not implemented`); its elements are
+  now verified against the declared interface, so it is a clean `ZAP4001` at the
+  binding.
 - **Concrete values could not be stored into an interface-typed collection
   element** (#829, I#84 follow-up, D-0016). A `list[Iface]` element / `dict[K,
   Iface]` value is a single uniform word, so storing a conformer there raised
@@ -893,11 +913,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   its static-global `itable` word skipped as a non-heap pointer). This works for
   struct conformers and for **both enum tiers** (#731): a tier-3 enum boxes its
   tagged-struct pointer, a tier-1 enum its scalar-tag cell. Reading an element
-  back dispatches dynamically through the itable. (The *sema* side still rejects
-  a single-element `list[Iface]` or a `dict[K, Iface]` value whose inferred
-  element type is a concrete conformer rather than `Unknown`; that element-wise
-  collection covariance is tracked separately in #831, and this lowering already
-  handles it once admitted.)
+  back dispatches dynamically through the itable. (The *sema* admission of such
+  an element — element-wise interface coercion at collection value positions — is
+  the companion fix #831, above.)
 - **A refined-supertype method could not be dispatched on an interface value**
   (#830, D-0139/#806). With `interface Ranked: Named`, calling the inherited
   `name()` on a `Ranked`-typed value raised `error[ZAP6001]: interface 'Ranked'
