@@ -459,6 +459,12 @@ pub struct EnumInfo {
     /// open string-enum codec. Gates recognition of the `Enum.from_json(s)`
     /// associated decode function, mirroring the struct codec.
     pub derives_json: bool,
+    /// Source method name -> signature (`self` is the first parameter, typed as
+    /// the enum). Enums can carry methods (D-0046, #429/#449); this records their
+    /// resolved signatures so an enum can be checked for structural interface
+    /// conformance exactly like a struct (D-0016 extension, #731). Empty for an
+    /// enum with no methods.
+    pub methods: HashMap<String, FnSig>,
 }
 
 #[derive(Clone)]

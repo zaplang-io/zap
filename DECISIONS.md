@@ -137,6 +137,58 @@ runtime; compile-time checking eliminates them. (Supersedes the earlier
 `impl Interface for Struct` declaration may be offered for clearer error
 locations.
 
+### Amendment (#731) — enums conform to interfaces, both tiers
+**Status:** Locked (maintainer ruling).
+Structural conformance applies to **any type with the method set**, not structs
+only. Originally conformance was checked against the struct method table alone,
+so an `enum` that declared every method an interface required still failed
+(`error[ZAP4001]`, surfaced by #707). The rule is now uniform and Go/Rust-like:
+**any `struct` or `enum` whose method set matches the interface conforms**, and
+either is usable as an interface value. This covers **both enum tiers** (D-0018
+tier-1, D-0046 tier-3) and composes with interface refinement (D-0139/#806): an
+enum must provide the interface's own methods *and* every refined supertype's.
+
+Representation (the interface value stays the `{data, itable}` fat pointer of
+D-0016 / design/0006 §2.4; only the `data` word's provenance differs):
+
+- **Tier-3 (data-carrying)** enums lower to a tagged struct (D-0046), so a tier-3
+  enum conforms and boxes *exactly like a struct*: its existing tagged-struct
+  pointer is the `data` word and its methods (`{Enum}__{m}`, D-0047/#429) are the
+  itable slots. No new mechanism.
+- **Tier-1 (unboxed-integer)** enums have no pointer identity, so conforming one
+  requires **boxing the scalar tag** into a small heap cell
+  `{Enum}$box = { $tag:i64 }`; that cell's pointer is the `data` word. Dispatch
+  goes through per-method **thunks** `{Enum}$box__{m}` placed in the itable: each
+  reloads the tag and tail-calls the real `{Enum}__{m}(self)` (whose `self` is the
+  backing integer, by value). Lowering tier-1 enum methods at all is new here —
+  previously any tier-1 enum method call was unlowered (`ZAP6001`); a direct
+  `value.method()` call now works too, not only dispatch behind an interface.
+
+**`is`-identity.** `is`/`is not` on an interface value is a *compile error* at the
+surface (ZAP4073, D-0110 — an interface value is a fat-pointer value type with no
+distinct identity; use `==`). Under the hood, **each widening of a tier-1 enum
+boxes afresh**, so two widenings of the same member never share a box and carry no
+preserved identity — matching the surface rule that there is no observable `is`
+identity to rely on. A tier-3 enum behind an interface keeps its instance pointer,
+like any reference value. Use `==` for value equality.
+
+**GC / memory model (D-0009, D-0140/D-0141).** The tier-1 box is a normal GC
+object (`zap_alloc_typed` with the box's struct descriptor): a **pointer-free
+leaf**, so the precise collector traces it trivially, and it is rooted
+transitively through the fat pointer exactly as a value-struct box is (I#75/D-0051).
+Its single tag field is written once at construction and never mutated, so it adds
+**no shared mutable state** — consistent with the tier-1 no-UB model (D-0140) and
+needing no new happens-before edge (D-0141). Cross-refs: D-0016, D-0046, D-0047,
+D-0051, D-0124 (#707 rendering), D-0110 (#611 `is`), D-0140/D-0141; tickets
+#429/#449 (enum methods), #707 (interface-value rendering), #731.
+
+**Not changed by #731 (pre-existing interface limitations, shared by all concrete
+types — structs and enums alike, so not enum-specific):** storing a concrete value
+into an *interface-typed collection element* (`list[Iface]`/`dict` value) and
+*dynamically dispatching a refined-supertype method* on an interface value are
+separate interface-support follow-ups (I#84 / D-0139), reported, not worked
+around.
+
 ## D-0017 — Generics: yes, monomorphized, staged
 **Status:** Locked (design) / staged implementation
 User-defined generics (`def map[T, U](...)`, generic structs) via

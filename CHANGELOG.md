@@ -25,6 +25,23 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Enums conform to interfaces structurally — both tiers** (#731, D-0016
+  extension). Interface conformance now covers **any type with the matching method
+  set**, not structs only: an `enum` that declares every method an interface
+  requires is usable as an interface value (binding, parameter, return,
+  interface-typed field), and interface methods dispatch on it dynamically. A
+  **tier-3** (data-carrying) enum boxes its tagged-struct pointer into the
+  `{data, itable}` fat pointer and dispatches like a struct; a **tier-1**
+  (unboxed-integer) enum boxes its scalar tag into a small heap cell and dispatches
+  through per-method thunks. As a consequence, **methods on a tier-1 enum now lower
+  and are callable directly** (`Color.Green.rank()`), which previously raised
+  `error[ZAP6001]`. The tier-1 box is an immutable, pointer-free, precisely-traced
+  GC leaf, rooted through the fat pointer; each widening boxes afresh, and `is` on
+  an interface value remains a compile error (value type, D-0110). Mixed
+  polymorphism over a struct and both enum tiers through one call site, and Display
+  rendering of an enum behind an interface (ties off #707), are supported. (A
+  heterogeneous interface-typed *collection* and refined-supertype dispatch remain
+  separate, pre-existing interface limitations that affect structs equally.)
 - **User-defined generic containers with capability bounds — closes the capability
   epic** (#811, epic #812, D-0139). A user generic type may bound a type parameter
   on a capability exactly as the built-ins do — `struct BST[K: Comparable, V]`,

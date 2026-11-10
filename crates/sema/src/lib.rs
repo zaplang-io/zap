@@ -1131,12 +1131,20 @@ impl Checker {
                                 .iter()
                                 .any(|a| matches!(&a.value, Expr::Name(t, _) if t == "Json"))
                     });
+                    // Enum method signatures (D-0046, #429/#449), resolved exactly
+                    // like a struct's (`self` typed as the enum) so the enum can be
+                    // checked for structural interface conformance (D-0016/#731).
+                    let mut methods: HashMap<String, FnSig> = HashMap::new();
+                    for m in &e.methods {
+                        methods.insert(m.name.clone(), self.sig_of_method(m, &e.name));
+                    }
                     self.enums.insert(
                         e.name.clone(),
                         EnumInfo {
                             is_sum,
                             variants,
                             derives_json,
+                            methods,
                         },
                     );
                 }
@@ -1545,12 +1553,14 @@ impl Checker {
             return true;
         }
         match (from, to) {
-            // A struct value used where an interface is expected: structural
-            // conformance (the concrete -> interface fat-pointer conversion,
-            // D-0016). A `value struct` conforms too — on conversion it is boxed
-            // (copied to the heap) so the fat pointer's `data` word holds a
-            // stable, GC-traced pointer (I#75 Part 1, D-0051); the boxing is
-            // emitted in lowering.
+            // A struct OR enum value used where an interface is expected:
+            // structural conformance (the concrete -> interface fat-pointer
+            // conversion, D-0016). A `value struct` conforms too — on conversion
+            // it is boxed (copied to the heap) so the fat pointer's `data` word
+            // holds a stable, GC-traced pointer (I#75 Part 1, D-0051). An enum
+            // conforms likewise (#731): a tier-3 enum boxes its tagged-struct
+            // pointer, a tier-1 enum boxes its scalar tag into a heap cell. All
+            // boxing is emitted in lowering.
             (Ty::Named(s), Ty::Named(i)) if self.is_interface(i) => self.conforms(s, i).is_ok(),
             _ => false,
         }
@@ -1583,8 +1593,19 @@ impl Checker {
         if !self.interfaces.contains_key(iname) {
             return Err(vec![format!("'{iname}' is not an interface")]);
         }
-        let Some(st) = self.structs.get(sname) else {
-            return Err(vec![format!("'{sname}' is not a struct")]);
+        // A struct OR an enum conforms by structural method set (D-0016 extended
+        // to enums, #731): both enum tiers are eligible — a tier-3 (data-carrying)
+        // enum lowers to a tagged struct and boxes that pointer into the interface
+        // fat pointer; a tier-1 (unboxed-integer) enum boxes its scalar tag into a
+        // small heap cell (see `crates/ir`). Either way conformance here is "has
+        // every required method with a matching signature", read off the type's
+        // registered method table.
+        let methods = if let Some(st) = self.structs.get(sname) {
+            &st.methods
+        } else if let Some(en) = self.enums.get(sname) {
+            &en.methods
+        } else {
+            return Err(vec![format!("'{sname}' is not a struct or enum")]);
         };
         // Refinement (D-0139/#806): conformance to `iname` requires every method
         // of `iname` *and* of all its transitive supertypes. A method missing
@@ -1597,7 +1618,7 @@ impl Checker {
             } else {
                 format!(" (required by supertype '{origin}')")
             };
-            match st.methods.get(&mname) {
+            match methods.get(&mname) {
                 None => reasons.push(format!("missing method '{mname}'{from}")),
                 Some(msig) => {
                     if !sigs_match(msig, &isig) {
@@ -8804,6 +8825,225 @@ def main():
         assert!(parse.is_empty() && lex.is_empty());
         let errors = check(&module);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    // ---- enums conform to interfaces structurally (#731, D-0016) -----------
+
+    #[test]
+    fn tier3_enum_conforms_to_interface() {
+        // The issue repro: a tier-3 (data-carrying) enum with the interface's
+        // method set is assignable to an interface binding and parameter.
+        ok(r#"
+interface Node:
+    def rank(self) -> int
+
+enum Expr:
+    Lit(int v)
+    Add(int l, int r)
+
+    def rank(self) -> int:
+        return 1
+
+def rank_of(Node n) -> int:
+    return n.rank()
+
+def main():
+    Node n = Expr.Add(l=1, r=2)
+    print(n.rank())
+    print(rank_of(Expr.Lit(v=5)))
+"#);
+    }
+
+    #[test]
+    fn tier1_enum_conforms_to_interface() {
+        // A tier-1 (unboxed-integer) enum with the method set conforms too — the
+        // scalar is boxed in lowering; conformance here is purely structural.
+        ok(r#"
+interface Ranked:
+    def rank(self) -> int
+
+enum Color:
+    Red
+    Green
+    Blue
+
+    def rank(self) -> int:
+        return 7
+
+def rank_of(Ranked r) -> int:
+    return r.rank()
+
+def main():
+    Ranked r = Color.Green
+    print(r.rank())
+    print(rank_of(Color.Red))
+"#);
+    }
+
+    #[test]
+    fn struct_and_both_enum_tiers_conform_to_one_interface() {
+        // Uniformity: a reference struct, a tier-1 enum, and a tier-3 enum all
+        // conform to the same interface and are each assignable to it.
+        ok(r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+enum Poly:
+    Quad
+    Pent
+
+    def sides(self) -> int:
+        return 4
+
+enum Spur:
+    Star(int points)
+
+    def sides(self) -> int:
+        return 5
+
+def main():
+    Shape a = Tri()
+    Shape b = Poly.Quad
+    Shape c = Spur.Star(points=5)
+    print(a.sides())
+    print(b.sides())
+    print(c.sides())
+"#);
+    }
+
+    #[test]
+    fn enum_missing_an_interface_method_does_not_conform() {
+        // A tier-3 enum lacking a required method is rejected (ZAP4001), and the
+        // diagnostic names the missing method.
+        let e = errors(
+            r#"
+interface Node:
+    def rank(self) -> int
+    def depth(self) -> int
+
+enum Expr:
+    Lit(int v)
+
+    def rank(self) -> int:
+        return 1
+
+def main():
+    Node n = Expr.Lit(v=1)
+    print(n.rank())
+"#,
+        );
+        assert!(
+            e.iter()
+                .any(|d| d.message.contains("missing method 'depth'")
+                    && d.message.contains("Expr does not satisfy 'Node'")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn tier1_enum_missing_an_interface_method_does_not_conform() {
+        // Same for a tier-1 enum — no pointer/box path masks a missing method.
+        let e = errors(
+            r#"
+interface Ranked:
+    def rank(self) -> int
+
+enum Color:
+    Red
+    Green
+
+def main():
+    Ranked r = Color.Red
+    print(r.rank())
+"#,
+        );
+        assert!(
+            e.iter()
+                .any(|d| d.message.contains("missing method 'rank'")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn enum_with_mismatched_method_signature_does_not_conform() {
+        // The method exists but with the wrong return type: not conforming.
+        let e = errors(
+            r#"
+interface Node:
+    def rank(self) -> int
+
+enum Expr:
+    Lit(int v)
+
+    def rank(self) -> str:
+        return "x"
+
+def main():
+    Node n = Expr.Lit(v=1)
+    print(n.rank())
+"#,
+        );
+        assert!(
+            e.iter().any(|d| d.message.contains("mismatched signature")),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn enum_conforms_to_refined_interface() {
+        // Refinement (D-0139/#806): an enum conforms to `Ranked: Named` only when
+        // it has BOTH the own and the inherited supertype method.
+        ok(r#"
+interface Named:
+    def name(self) -> int
+
+interface Ranked: Named
+    def rank(self) -> int
+
+enum Color:
+    Red
+    Green
+
+    def name(self) -> int:
+        return 0
+
+    def rank(self) -> int:
+        return 9
+
+def main():
+    Ranked r = Color.Green
+    print(r.rank())
+"#);
+        // Missing the supertype method -> rejected, naming the supertype.
+        let e = errors(
+            r#"
+interface Named:
+    def name(self) -> int
+
+interface Ranked: Named
+    def rank(self) -> int
+
+enum Color:
+    Red
+    Green
+
+    def rank(self) -> int:
+        return 9
+
+def main():
+    Ranked r = Color.Green
+    print(r.rank())
+"#,
+        );
+        assert!(
+            e.iter().any(|d| d.message.contains("missing method 'name'")
+                && d.message.contains("supertype 'Named'")),
+            "{e:?}"
+        );
     }
 
     #[test]

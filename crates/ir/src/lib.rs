@@ -4460,6 +4460,282 @@ def main():
         );
     }
 
+    // --- #731: enums conform to interfaces structurally, both tiers ----------
+    //
+    // These lock the lowering shape before codegen (no host LLVM): a tier-3 enum
+    // boxes its tagged-struct pointer like a struct, and a tier-1 enum boxes its
+    // scalar tag into a heap cell `{Enum}$box` dispatched through per-method
+    // thunks `{Enum}$box__m`. End-to-end execution is pinned by the goldens
+    // (enum_iface_*) under CI.
+
+    fn insts_of(f: &Func) -> impl Iterator<Item = &Inst> {
+        f.blocks.iter().flat_map(|b| &b.insts)
+    }
+
+    #[test]
+    fn tier3_enum_widens_to_interface_like_a_struct() {
+        // The issue repro. A tier-3 enum's method (`Expr__rank`) is a real
+        // function (self = the tagged struct), the widening emits an IfaceMake
+        // whose concrete_sid is the enum's tagged-struct id, and the method call
+        // dispatches through the itable (IfaceCall/IfaceInvoke).
+        let m = lower_ok(
+            r#"interface Node:
+    def rank(self) -> int
+
+enum Expr:
+    Lit(int v)
+    Add(int l, int r)
+
+    def rank(self) -> int:
+        return 1
+
+def main():
+    Node n = Expr.Add(l=1, r=2)
+    print(n.rank())
+"#,
+        );
+        let expr_sid = m
+            .structs
+            .iter()
+            .position(|s| s.name == "Expr")
+            .expect("tier-3 enum lowers to a tagged struct named after the enum")
+            as u32;
+        // `Expr__rank` is the real method, on the tagged-struct receiver.
+        let rank = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "Expr__rank")
+            .expect("tier-3 enum method is lowered");
+        assert_eq!(rank.params.first(), Some(&Ty::Struct(expr_sid)));
+        // There is NO tier-1 box for a tier-3 enum.
+        assert!(
+            !m.structs.iter().any(|s| s.name == "Expr$box"),
+            "a tier-3 enum needs no scalar box"
+        );
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            insts_of(main).any(
+                |i| matches!(i, Inst::IfaceMake { concrete_sid, .. } if *concrete_sid == expr_sid)
+            ),
+            "the tier-3 enum is boxed into the fat pointer by its tagged-struct id"
+        );
+        assert!(
+            insts_of(main).any(|i| matches!(i, Inst::IfaceCall { .. } | Inst::IfaceInvoke { .. })),
+            "the interface method call dispatches through the itable"
+        );
+    }
+
+    #[test]
+    fn tier1_enum_method_lowers_and_dispatches_directly() {
+        // Before #731 a method call on a tier-1 enum was ZAP6001. Now the real
+        // method `Color__rank` exists with `self` typed as the backing integer
+        // (`Ty::Enum`), and a direct `value.rank()` call resolves to it.
+        let m = lower_ok(
+            r#"enum Color:
+    Red
+    Green
+    Blue
+
+    def rank(self) -> int:
+        return 7
+
+def main():
+    print(Color.Green.rank())
+"#,
+        );
+        let rank = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "Color__rank")
+            .expect("tier-1 enum method is lowered (was ZAP6001 before #731)");
+        assert!(
+            matches!(rank.params.first(), Some(Ty::Enum(_))),
+            "a tier-1 enum method takes self as the backing integer, got {:?}",
+            rank.params.first()
+        );
+        assert!(
+            calls(&m, "Color__rank"),
+            "a direct tier-1 enum method call dispatches to the real method"
+        );
+    }
+
+    #[test]
+    fn tier1_enum_widens_to_interface_by_boxing_the_scalar() {
+        // A tier-1 enum behind an interface: a box struct `{Enum}$box = { i64 }`
+        // is laid out, the widening emits StructNew + FieldSet(tag) + IfaceMake
+        // with the box id, and a per-method thunk `{Enum}$box__m` is emitted.
+        let m = lower_ok(
+            r#"interface Ranked:
+    def rank(self) -> int
+
+enum Color:
+    Red
+    Green
+    Blue
+
+    def rank(self) -> int:
+        return 7
+
+def main():
+    Ranked r = Color.Green
+    print(r.rank())
+"#,
+        );
+        let box_sid = m
+            .structs
+            .iter()
+            .position(|s| s.name == "Color$box")
+            .expect("a tier-1 enum with methods gets a box struct") as u32;
+        // The box carries exactly one 64-bit tag field and is a reference struct.
+        let box_layout = &m.structs[box_sid as usize];
+        assert_eq!(box_layout.fields, vec![Ty::I64], "box is a single i64 tag");
+        assert!(
+            !box_layout.is_value,
+            "the box is heap-allocated (reference)"
+        );
+        // The itable thunk exists, taking the box pointer as self.
+        let thunk = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "Color$box__rank")
+            .expect("tier-1 interface thunk is emitted");
+        assert_eq!(thunk.params.first(), Some(&Ty::Struct(box_sid)));
+        // main boxes the scalar: StructNew(box) -> FieldSet(tag) -> IfaceMake.
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            insts_of(main).any(|i| matches!(i, Inst::StructNew { sid, .. } if *sid == box_sid)),
+            "the tier-1 enum's tag is boxed into a fresh heap cell"
+        );
+        assert!(
+            insts_of(main)
+                .any(|i| matches!(i, Inst::FieldSet { sid, idx: 0, .. } if *sid == box_sid)),
+            "the scalar tag is stored into the box"
+        );
+        assert!(
+            insts_of(main).any(
+                |i| matches!(i, Inst::IfaceMake { concrete_sid, .. } if *concrete_sid == box_sid)
+            ),
+            "the box pointer is the fat pointer's data word"
+        );
+    }
+
+    #[test]
+    fn tier1_box_thunk_reloads_tag_and_calls_the_real_method() {
+        // The thunk bridges the pointer-self ABI of interface dispatch to the
+        // value-self ABI of the real method: load the tag from box field 0, then
+        // call `{Enum}__m`.
+        let m = lower_ok(
+            r#"interface Ranked:
+    def rank(self) -> int
+
+enum Color:
+    Red
+    Green
+
+    def rank(self) -> int:
+        return 7
+
+def main():
+    Ranked r = Color.Green
+    print(r.rank())
+"#,
+        );
+        let box_sid = m
+            .structs
+            .iter()
+            .position(|s| s.name == "Color$box")
+            .unwrap() as u32;
+        let thunk = m
+            .funcs
+            .iter()
+            .find(|f| f.name == "Color$box__rank")
+            .unwrap();
+        assert!(
+            insts_of(thunk).any(
+                |i| matches!(i, Inst::FieldGet { base: 0, sid, idx: 0, .. } if *sid == box_sid)
+            ),
+            "the thunk reloads the tag from box field 0"
+        );
+        assert!(
+            insts_of(thunk).any(|i| matches!(i, Inst::Call { func, .. } if func == "Color__rank")),
+            "the thunk tail-calls the real method"
+        );
+    }
+
+    #[test]
+    fn each_tier1_widening_boxes_a_fresh_cell() {
+        // `is`-identity semantics (D-0016 extension): every widening of a tier-1
+        // enum to an interface value allocates a FRESH box — identity is not
+        // shared across widenings. Two widenings -> two distinct StructNew(box).
+        // (`is` on an interface value is itself rejected at the surface as a value
+        // type, ZAP4073, so this fresh-box property is the observable semantics.)
+        let m = lower_ok(
+            r#"interface Ranked:
+    def rank(self) -> int
+
+enum Color:
+    Red
+    Green
+
+    def rank(self) -> int:
+        return 7
+
+def main():
+    Ranked a = Color.Red
+    Ranked b = Color.Red
+    print(a.rank())
+    print(b.rank())
+"#,
+        );
+        let box_sid = m
+            .structs
+            .iter()
+            .position(|s| s.name == "Color$box")
+            .unwrap() as u32;
+        let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        let boxes = insts_of(main)
+            .filter(|i| matches!(i, Inst::StructNew { sid, .. } if *sid == box_sid))
+            .count();
+        assert_eq!(boxes, 2, "each widening boxes afresh (no shared identity)");
+    }
+
+    #[test]
+    fn tier1_interface_render_slot_reaches_the_enum_renderer() {
+        // #707 tie-in: a tier-1 enum behind an interface records a box renderer
+        // `{Enum}$box$repr` in the renderer slot, and rendering the interface
+        // value emits an IfaceRender dispatch (not a struct_to_str of the box).
+        let m = lower_ok(
+            r#"interface Node:
+    def rank(self) -> int
+
+enum Leaf:
+    A
+    B
+
+    def rank(self) -> int:
+        return 0
+
+def main():
+    Node a = Leaf.B
+    print(a)
+"#,
+        );
+        let box_sid = m.structs.iter().position(|s| s.name == "Leaf$box").unwrap() as u32;
+        let sym = m
+            .iface_renderers
+            .get(&box_sid)
+            .expect("the box has a recorded renderer for the itable slot");
+        assert_eq!(sym, "Leaf$box$repr");
+        assert!(
+            m.funcs.iter().any(|f| &f.name == sym),
+            "the box renderer is an emitted function"
+        );
+        assert!(
+            emits_iface_render(m.funcs.iter().find(|f| f.name == "main").unwrap()),
+            "rendering the interface value dispatches dynamically"
+        );
+    }
+
     // --- #552: unsigned integers select the unsigned ZIR ops -----------------
     //
     // These lock the op-selection *before* codegen (where LLVM finally emits
