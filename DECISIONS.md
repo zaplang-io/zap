@@ -349,7 +349,9 @@ children, so no coroutine is leaked and cancellation propagates automatically
 **Status:** Locked (principle)
 Data-race-free programs behave **sequentially consistently**; synchronization is
 established by channel ops and sync primitives. **Data races are bugs**, ideally
-caught by a race-detector tool (Go/Java/C++11/Rust family). Formal spec later.
+caught by a race-detector tool (Go/Java/C++11/Rust family). **Specified in
+D-0141** (the happens-before edge set, `scope:`-join, SC-only atomics, and the
+bounded-race guarantee); this principle stands.
 
 ## D-0035 — Package/dependency manager: Cargo/Go-modules style
 **Status:** Locked (direction) — concrete design in D-0052
@@ -6523,3 +6525,149 @@ guarantee from word atomicity.
 
 (Decided 2026-11-10. Refs: D-0008, D-0034, D-0066, D-0112 (point 4 amended here),
 D-0113, D-0114; prompted by a GIL / Python-free-threading design discussion.)
+
+## D-0141 — Memory model: happens-before edge set, DRF-SC, bounded races, SC-only atomics
+**Status:** Locked
+
+D-0034 fixed the *principle* (DRF-SC, "formal spec later"); since then the
+happens-before edge set accreted inside the `--race` detector (D-0114 + its
+slice-3 breadth, I#679) and the racy-case guarantee was settled in D-0140. This
+entry **consolidates those into one normative statement** and settles the two
+points that were still implicit — the `scope:`-join edge and the ordering of
+`Atomic` operations — so the model is readable in one place rather than
+reverse-engineered from the detector. It supersedes D-0034's "formal spec later"
+placeholder (D-0034's DRF-SC principle stands; this is its specification).
+
+### 1. Happens-before edges (the complete set)
+
+A Zap program's execution is ordered by **happens-before**, the transitive
+closure of:
+
+- **Program order** within a single coroutine.
+- **Spawn:** a `spawn`/`spawn detached` happens-before the first statement of the
+  spawned coroutine (parent → child).
+- **Scope join:** a **joined** child's execution happens-before the continuation
+  of the `scope:` that owns it, at the dedent (child → parent) — where "joined"
+  means it ran to completion, or was cooperatively cancelled and **drained**
+  (`on_error=Cancel`, deadline, or exception unwind). A child that never drains is
+  **detached, not joined** — see §2 — and gains no such edge. A `spawn detached`
+  coroutine is likewise owned by the implicit **root scope** and joins (gains the
+  edge) only at program exit.
+- **Channel:** a send happens-before the matching receive (D-0031, #47).
+- **Mutex / RWMutex:** an `unlock` happens-before the next `lock` that acquires it.
+- **WaitGroup:** a `done` happens-before the `wait` it releases.
+- **Once:** the initializer happens-before every call that observes it complete.
+- **Atomic:** every `Atomic` operation participates in a single total order; an
+  `Atomic` write happens-before every `Atomic` read that observes its value
+  (§3).
+- **Module init:** module-level `const`/global initialization happens-before
+  `main`, in import-topological + source order (D-0112 point 2).
+
+This is the exact edge set the `--race` detector enforces (D-0114), now stated as
+the language guarantee rather than an implementation detail.
+
+### 2. `scope:` join — cooperative cancel, and the sever rule
+
+Cancellation is **cooperative** (D-0044): a `Cancelled` exception is injected at
+cancellation points (suspend points / explicit `checkpoint()`), and the child
+unwinds through ordinary `finally`/`with` cleanup. So a child cancelled at a
+deadline or by a sibling failure runs to its next checkpoint, then unwinds — and
+the join covers **all** of its writes, cleanup included. The edge is about
+**visibility, not completeness**: the parent observes, consistently and un-torn,
+whatever the child wrote before it stopped; the child's state may be **partial**
+(interrupted mid-work), and the program owns whether that partial state is
+*meaningful*. This matches trio/Kotlin/Swift nurseries.
+
+**The sever rule (uncooperative child).** A child that never reaches a
+cancellation point — a tight compute loop with no safepoint-delivered cancel, or
+a blocking FFI/syscall — cannot be joined and must not be force-killed (freeing a
+coroutine mid-instruction, especially mid-FFI or holding a lock, is the unsafe
+move Java deprecated `Thread.stop` for). The model's answer is **sever, not
+exit**: at the grace deadline the scope **detaches** the stuck child — reparenting
+it to the root scope exactly like `spawn detached` (it becomes an orphan that
+leaks until it finishes, surfaced to observability) — and raises `ScopeTimeout`
+to the caller per D-0094. The severed child therefore has **no join edge** to the
+caller's continuation; a caller that reads its partial state after `ScopeTimeout`
+is racing (bounded by D-0140, caught by `--race`). The idiomatic race-free
+pattern is **collect-by-return** (each child returns a value the scope gathers,
+read after a clean join), never shared mutation across siblings.
+
+**Process exit is reserved for signal-driven shutdown only** —
+`scope(cancel_on=[SIG…], grace=…)`, where the process is terminating anyway. A
+per-request `scope(timeout=…)` in a long-running server must never escalate to
+process exit: one faulty endpoint must not kill in-flight healthy requests.
+
+> **Runtime divergence (tracked, zaplang-io/zap#825).** The current runtime does
+> **not** yet implement the sever rule: `scope(timeout=, grace=)` reuses the
+> signal hard-exit timer and `_exit(1)`s the whole process when a child does not
+> drain within grace (`zap_grace_timer`), and a no-`grace` scope-timeout hangs the
+> join indefinitely (`scope_join`). Both violate D-0094's "exception is the single
+> outcome channel." This decision records the **intended** semantics; #825 tracks
+> aligning the runtime (sever + `ScopeTimeout`; process exit only on signal
+> shutdown).
+
+### 3. `Atomic[T]` is sequentially consistent — SC-only, no ordering parameter
+
+`Atomic` operations (`load`, `store`, `fetch_add`, `compare_exchange`, …) are
+**sequentially consistent**: they take **no memory-ordering argument**, and there
+is no `Relaxed`/`Acquire`/`Release`/`AcqRel` surface. The model is Go
+(`sync/atomic`, SC since Go 1.19) and Java `volatile`, **not** C++/Rust's ordering
+menu.
+
+Rationale:
+- **Guarded + Python-readable.** `Relaxed` is the most error-prone construct in
+  systems concurrency (reorderings, out-of-thin-air) and is unreadable to the
+  Python-dev audience. One mental model — "atomics form a single global order" —
+  is the whole point.
+- **The menu buys almost nothing on Zap's targets.** On aarch64, acquire/release
+  compile to the *same* `ldar`/`stlr` as SC (ARMv8 RCsc), so only `Relaxed`
+  (plain `ldr`/`str`) is cheaper — and that gap is the barrier on hot counters,
+  which structured concurrency usually routes around (per-coroutine accumulate,
+  combine at the scope join). On x86-64 SC costs at most one store→load fence on
+  atomic *stores*; loads and RMW are free.
+- **It keeps this spec to one sentence** (§1's Atomic edge). The menu would force
+  formalizing relaxed semantics — a research-grade burden (C++'s OOTA problem is
+  still open).
+- **It matches the shipped detector** (D-0114 models each `Atomic` op as
+  release+acquire on its cell).
+
+**Deferred, not rejected:** if a real benchmark ever shows an SC atomic is a
+measured bottleneck on aarch64, weaker orderings may be added behind a
+**separate, explicitly-expert surface** (a distinct method/type), never as a
+default-visible argument on `Atomic[T]`, and gated on that measurement. Lock-free
+`concurrent.*` collection *internals* that want weaker orderings live in the C
+runtime (`zaprt.c`), which may use any orderings and expose only the SC-safe API.
+
+### 4. Guarantee for racy programs (from D-0140)
+
+A **data-race-free** program is **sequentially consistent** (D-0034). A program
+*with* a data race is **not** undefined — unlike C/C++. Per D-0140 a race is
+**bounded**: scalars/pointers are word-atomic (a raced read is stale, never
+garbage), structural mutation of a built-in collection fails fast with a `fatal:`
+guard rather than corrupting, and no execution fabricates an out-of-thin-air
+value. A race is a **logic bug** (caught by `--race`), never a memory-safety or
+UB hole. This is the Java/Go-family guarantee, stated — a deliberate improvement
+over memory models that leave racy programs wholly undefined.
+
+### Implementation follow-ups (tracked separately, not changed here)
+
+1. **Confirm `scope:`'s join funnels through the instrumented WaitGroup
+   done/wait hooks** (D-0114 slice 3), so the detector actually observes the §1
+   scope-join edge; if `scope:` uses a distinct join primitive, add a scope-join
+   hook. Today the detector names spawn/channel/Mutex/WaitGroup/Once/Atomic, not
+   `scope:` explicitly.
+2. **Main/native-thread tracking** — still a documented detector limitation
+   (#679): accesses from the untracked root context are skipped, so a
+   root-scope-join → `main` edge is not yet exercised. Fold into #684 or its own
+   slice.
+3. **Align the scope-timeout runtime with the §2 sever rule** — tracked in
+   **zaplang-io/zap#825**: today `scope(timeout=, grace=)` `_exit(1)`s the process
+   and a no-`grace` timeout hangs the join; the fix is sever-and-`ScopeTimeout`,
+   with process exit reserved for signal-driven shutdown.
+4. Place the normative prose in **SPEC §(concurrency)** as well, linking here, so
+   programmers find it outside the decision log.
+
+(Decided 2026-11-10. Refs: D-0008, D-0031, D-0033/D-0044, D-0034 (specified here),
+D-0045, D-0066, D-0094, D-0112, D-0114, D-0140; zaplang-io/zap#825; prompted by a
+GIL / Python-free-threading design discussion. SC-only atomics and the scope-join
+edge (joined vs severed) are the new settlements.)
