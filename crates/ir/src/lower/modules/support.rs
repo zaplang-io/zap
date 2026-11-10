@@ -32,6 +32,18 @@ pub(super) fn lower_args(
     Ok(out)
 }
 
+/// Build an empty `str` constant value, used to pad an omitted optional string
+/// argument so a fixed-arity runtime symbol always receives its full word list
+/// (e.g. the optional `capath`/`keyfile` of the `tls` context loaders, #560).
+pub(super) fn empty_str(lowerer: &mut FnLower) -> Value {
+    let d = lowerer.new_value(Ty::Ptr);
+    lowerer.emit(Inst::StrConst {
+        dest: d,
+        bytes: Vec::new(),
+    });
+    d
+}
+
 /// Emit a value-returning runtime call (`throwing` when it may raise).
 pub(super) fn call_ret(
     lowerer: &mut FnLower,

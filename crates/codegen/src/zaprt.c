@@ -17293,8 +17293,21 @@ static void zap_tls_handshake_panic(void) {
  * success returns the SSL session and writes the owning SSL_CTX, fd and poller
  * desc through the out-params. The caller owns the lifetime (the http transport
  * holds the raw session like the plaintext path holds fd/pd; the module wraps it
- * in a `ZapTls`). */
-static SSL *zap_tls_dial_raw_impl(void *host_, void *ip_, int64_t port, int verify, int64_t deadline_ns, SSL_CTX **out_ctx, int *out_fd, void **out_pd) {
+ * in a `ZapTls`).
+ *
+ * When `ext_ctx` is non-NULL the caller supplies an already-configured client
+ * `SSL_CTX` (a `tls` client context, #560) that it merely borrows (it is one of
+ * the context handle's references, NOT pre-up-ref'd). This function does NOT
+ * create or mutate that context: once the TCP socket is up it takes exactly one
+ * SSL_CTX_up_ref for the connection, `SSL_new`s from it, and on EVERY failure
+ * path from that point frees that one ref via the same SSL_CTX_free the
+ * own-context path uses — so the caller's context survives for reuse with no
+ * leak, and a raise from the TCP connect (before the up-ref) touches no ref at
+ * all. The hostname identity check still applies at the SSL level (`verify`
+ * controls `SSL_set1_host`), never mutating the shared context. When `ext_ctx`
+ * is NULL the legacy behavior holds: a fresh per-dial SSL_CTX is created and
+ * configured for system-root (or no) verify. */
+static SSL *zap_tls_dial_raw_impl(void *host_, void *ip_, int64_t port, int verify, int64_t deadline_ns, SSL_CTX *ext_ctx, SSL_CTX **out_ctx, int *out_fd, void **out_pd) {
     const ZapStr *hostname = host_;
     char hz[256];
     if (hostname->len <= 0 || hostname->len >= (int64_t)sizeof(hz) ||
@@ -17303,22 +17316,31 @@ static SSL *zap_tls_dial_raw_impl(void *host_, void *ip_, int64_t port, int veri
         return NULL;
     }
     memcpy(hz, hostname->data, (size_t)hostname->len); hz[hostname->len] = '\0';
+    /* The TCP connect can raise; do it BEFORE taking any ctx ref so an ext_ctx
+     * ref is never leaked by an unwinding connect failure. */
     ZapSock *sock = ip_ ? zap_net_connect_impl(ip_, port, deadline_ns, 1) : zap_net_connect(host_, port);
     int fd = sock->fd;
     void *pd = sock->pd;
 
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) {
-        zap_sock_shutdown(fd, pd);
-        zap_net_panic("tls: SSL_CTX_new failed");
-        return NULL;
-    }
-    (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    if (verify) {
-        SSL_CTX_set_default_verify_paths(ctx); /* system trust store */
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX *ctx;
+    if (ext_ctx) {
+        SSL_CTX_up_ref(ext_ctx); /* the connection's own ref; freed on failure below
+                                    or handed to the ZapTls on success. */
+        ctx = ext_ctx;           /* already configured (verify mode + trust roots). */
     } else {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+        ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) {
+            zap_sock_shutdown(fd, pd);
+            zap_net_panic("tls: SSL_CTX_new failed");
+            return NULL;
+        }
+        (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+        if (verify) {
+            SSL_CTX_set_default_verify_paths(ctx); /* system trust store */
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+        } else {
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+        }
     }
     SSL *ssl = SSL_new(ctx);
     if (!ssl) {
@@ -17388,7 +17410,7 @@ static SSL *zap_tls_dial_raw_impl(void *host_, void *ip_, int64_t port, int veri
 }
 
 static SSL *zap_tls_dial_raw(void *host_, int64_t port, int verify, SSL_CTX **out_ctx, int *out_fd, void **out_pd) {
-    return zap_tls_dial_raw_impl(host_, NULL, port, verify, 0, out_ctx, out_fd, out_pd);
+    return zap_tls_dial_raw_impl(host_, NULL, port, verify, 0, NULL, out_ctx, out_fd, out_pd);
 }
 
 /* Shared body of tls.connect / tls.connect_insecure: dial and wrap in a GC
@@ -17415,7 +17437,7 @@ void *zap_tls_connect(void *host_, int64_t port) { return zap_tls_dial(host_, po
  * separate. The same absolute budget covers TCP connect and TLS handshake. */
 void *zap_tls_connect_resolved(void *host_, void *ip_, int64_t port, int64_t deadline_ns) {
     SSL_CTX *ctx = NULL; int fd = -1; void *pd = NULL;
-    SSL *ssl = zap_tls_dial_raw_impl(host_, ip_, port, 1, deadline_ns, &ctx, &fd, &pd);
+    SSL *ssl = zap_tls_dial_raw_impl(host_, ip_, port, 1, deadline_ns, NULL, &ctx, &fd, &pd);
     ZapTls *t = (ZapTls *)zap_obj(&zap_desc_tls);
     t->kind = ZAP_CONN_TLS; t->fd = fd; t->pd = pd;
     t->read_timeout_ms = 0; t->read_deadline_ms = 0; t->ssl = ssl; t->ctx = ctx;
@@ -17425,6 +17447,226 @@ void *zap_tls_connect_resolved(void *host_, void *ip_, int64_t port, int64_t dea
 /* tls.connect_insecure(host, port) -> handle. Verification OFF (explicit opt-in;
  * never the default). Documented as unsafe. */
 void *zap_tls_connect_insecure(void *host_, int64_t port) { return zap_tls_dial(host_, port, 0); }
+
+/* ---- TLS client contexts (ticket #560, D-0143) ---------------------------- *
+ * A per-connection, isolated TLS client configuration mirroring Python's
+ * `ssl.SSLContext`. Each context owns its OWN `SSL_CTX` (and thus its own
+ * `X509_STORE` of trust anchors), so two contexts loading different private CAs
+ * never share trust — no process-global `SSL_CERT_FILE`/`SSL_CERT_DIR` mutation,
+ * so concurrent dials with different CAs cannot bleed into one another.
+ *
+ *   tls.create_default_context()  (≈ ssl.create_default_context()) — PRELOADS the
+ *       system trust store; verify + hostname checking ON. The "augment" path:
+ *       load_verify_locations ADDS a private CA on top of the system roots.
+ *   tls.SSLContext()              (≈ ssl.SSLContext(PROTOCOL_TLS_CLIENT)) — starts
+ *       with an EMPTY trust store (trusts ONLY what is later loaded); verify +
+ *       hostname checking still ON. The "replace" path.
+ *   tls.load_verify_locations(ctx, cafile, capath) — ADDITIVELY add CA trust from
+ *       a PEM bundle file and/or a hashed-cert directory (like Python; either may
+ *       be "" to mean "omitted", but at least one must be given).
+ *   tls.load_cert_chain(ctx, certfile, keyfile) — a client certificate(-chain)
+ *       and its private key (mutual TLS). `keyfile` "" means the key is in
+ *       `certfile` (Python's keyfile-defaults-to-certfile behavior).
+ *   tls.connect(host, port, ctx) — dial host:port using the context (SNI +
+ *       hostname identity against `host`), taking a ref on the context's SSL_CTX
+ *       for the connection (released by tls.close_conn). The 2-arg
+ *       tls.connect(host, port) is unchanged (fresh system-roots context).
+ *
+ * Hostname verification is applied per-connection (SSL_set1_host against `host`
+ * in the dial path), so a context is reusable across many hosts and never has a
+ * host baked into it. The SSL_CTX is reference counted exactly as the server
+ * listener's is: the context handle holds one ref (released by a GC finalizer,
+ * matching Python's no-explicit-close contexts) and each connection takes its
+ * own, so a conn safely outlives the context. */
+typedef struct {
+    SSL_CTX *ctx;
+} ZapTlsCtx;
+
+/* ATOMIC: the sole field is a non-GC OpenSSL pointer. A finalizer releases the
+ * context's own SSL_CTX ref when the handle becomes unreachable. */
+static const ZapTypeDesc zap_desc_tls_ctx = {(int64_t)sizeof(ZapTlsCtx), ZAP_TD_ATOMIC, 0, NULL};
+
+/* GC finalizer: drop the context's own ref (connections hold their own). */
+static void zap_tls_ctx_finalize(void *obj, void *cd) {
+    (void)cd;
+    ZapTlsCtx *c = (ZapTlsCtx *)obj;
+    if (c->ctx) {
+        SSL_CTX_free(c->ctx);
+        c->ctx = NULL;
+    }
+}
+
+/* Build a client SSL_CTX floored at TLS 1.2 with peer verification on. When
+ * `load_system`, the system trust store is preloaded (the default-context path);
+ * otherwise the trust store starts empty (the bare-context path). Returns NULL
+ * on OpenSSL failure, with the error queue populated for the caller's raise. */
+static SSL_CTX *zap_tls_new_client_ctx(int load_system) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        return NULL;
+    }
+    (void)SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (load_system && SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    return ctx;
+}
+
+/* Wrap a freshly built client SSL_CTX in a GC handle with a finalizer. */
+static void *zap_tls_wrap_ctx(SSL_CTX *ctx) {
+    ZapTlsCtx *c = (ZapTlsCtx *)zap_obj(&zap_desc_tls_ctx);
+    c->ctx = ctx; /* ATOMIC objects are not zeroed; init explicitly. */
+    zap_gc_register_finalizer(c, zap_tls_ctx_finalize, NULL);
+    return c;
+}
+
+/* tls.create_default_context() -> ctx. System roots preloaded; verify + hostname
+ * on (the "augment" base — load_verify_locations adds private CAs on top). */
+void *zap_tls_create_default_context(void) {
+    SSL_CTX *ctx = zap_tls_new_client_ctx(1);
+    if (!ctx) {
+        zap_net_panic("tls: create_default_context: SSL_CTX init failed");
+        return NULL;
+    }
+    return zap_tls_wrap_ctx(ctx);
+}
+
+/* tls.SSLContext() -> ctx. Empty trust store (trusts only what is loaded); verify
+ * + hostname still on (the "replace" base). */
+void *zap_tls_ssl_context(void) {
+    SSL_CTX *ctx = zap_tls_new_client_ctx(0);
+    if (!ctx) {
+        zap_net_panic("tls: SSLContext: SSL_CTX init failed");
+        return NULL;
+    }
+    return zap_tls_wrap_ctx(ctx);
+}
+
+/* Raise a tls error carrying the top OpenSSL error-queue string, prefixed with
+ * `what`. Used by the context loaders so a bad PEM / mismatched key is a clear,
+ * catchable failure rather than a silent misconfiguration. */
+static void zap_tls_ssl_panic(const char *what) {
+    char msg[384];
+    unsigned long e = ERR_get_error();
+    if (e) {
+        char b[256];
+        ERR_error_string_n(e, b, sizeof b);
+        snprintf(msg, sizeof msg, "%s: %s", what, b);
+    } else {
+        snprintf(msg, sizeof msg, "%s", what);
+    }
+    zap_net_panic(msg);
+}
+
+/* tls.load_verify_locations(ctx, cafile, capath). Additively add CA trust to the
+ * context's store from a PEM bundle file and/or a hashed-cert directory. Either
+ * argument may be "" (omitted), but at least one must be given. A nonexistent or
+ * malformed path raises (with the OpenSSL reason) and leaves the context's prior
+ * trust untouched. */
+void zap_tls_load_verify_locations(void *ctx_, void *cafile_, void *capath_) {
+    ZapTlsCtx *c = (ZapTlsCtx *)ctx_;
+    const ZapStr *caf = (const ZapStr *)cafile_;
+    const ZapStr *cap = (const ZapStr *)capath_;
+    int have_file = caf && caf->len > 0;
+    int have_path = cap && cap->len > 0;
+    if (!have_file && !have_path) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("tls: load_verify_locations requires cafile or capath",
+                                    sizeof("tls: load_verify_locations requires cafile or capath") - 1));
+        return;
+    }
+    char *cafile = have_file ? zap_net_dupz(caf) : NULL;
+    char *capath = have_path ? zap_net_dupz(cap) : NULL;
+    if ((have_file && !cafile) || (have_path && !capath)) {
+        free(cafile);
+        free(capath);
+        zap_net_panic("tls: out of memory");
+        return;
+    }
+    int ok = SSL_CTX_load_verify_locations(c->ctx, cafile, capath) == 1;
+    free(cafile);
+    free(capath);
+    if (!ok) {
+        zap_tls_ssl_panic("tls: load_verify_locations failed");
+    }
+}
+
+/* tls.load_cert_chain(ctx, certfile, keyfile). Load a client certificate(-chain)
+ * and its private key (mutual TLS). `keyfile` "" means the key is in `certfile`.
+ * A bad cert path, bad key path, or a key that does not match the certificate
+ * each raise a clear, catchable error. */
+void zap_tls_load_cert_chain(void *ctx_, void *certfile_, void *keyfile_) {
+    ZapTlsCtx *c = (ZapTlsCtx *)ctx_;
+    const ZapStr *cf = (const ZapStr *)certfile_;
+    const ZapStr *kf = (const ZapStr *)keyfile_;
+    if (!cf || cf->len <= 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("tls: load_cert_chain requires a certfile",
+                                    sizeof("tls: load_cert_chain requires a certfile") - 1));
+        return;
+    }
+    char *certfile = zap_net_dupz(cf);
+    char *keyfile = (kf && kf->len > 0) ? zap_net_dupz(kf) : NULL;
+    if (!certfile || ((kf && kf->len > 0) && !keyfile)) {
+        free(certfile);
+        free(keyfile);
+        zap_net_panic("tls: out of memory");
+        return;
+    }
+    const char *key_path = keyfile ? keyfile : certfile; /* Python: key defaults to cert. */
+    if (SSL_CTX_use_certificate_chain_file(c->ctx, certfile) != 1) {
+        free(certfile);
+        free(keyfile);
+        zap_tls_ssl_panic("tls: load_cert_chain: certificate load failed");
+        return;
+    }
+    if (SSL_CTX_use_PrivateKey_file(c->ctx, key_path, SSL_FILETYPE_PEM) != 1) {
+        free(certfile);
+        free(keyfile);
+        zap_tls_ssl_panic("tls: load_cert_chain: private key load failed");
+        return;
+    }
+    if (SSL_CTX_check_private_key(c->ctx) != 1) {
+        free(certfile);
+        free(keyfile);
+        zap_tls_ssl_panic("tls: load_cert_chain: key does not match certificate");
+        return;
+    }
+    free(certfile);
+    free(keyfile);
+}
+
+/* tls.connect(host, port, ctx) -> handle. Dial host:port and run the TLS
+ * handshake over the supplied client context (SNI + hostname identity against
+ * `host`, the context's trust roots + any client cert). The connection takes its
+ * own ref on the context's SSL_CTX (balanced by tls.close_conn), so it outlives
+ * the context. On any failure the borrowed ref is released and the socket torn
+ * down inside the shared dial path. */
+void *zap_tls_connect_ctx(void *ctx_, void *host_, int64_t port) {
+    ZapTlsCtx *c = (ZapTlsCtx *)ctx_;
+    if (!c->ctx) {
+        zap_net_panic("tls: connect: context is not initialized");
+        return NULL;
+    }
+    SSL_CTX *ectx = NULL;
+    int fd = -1;
+    void *pd = NULL;
+    /* verify=1 => SSL_set1_host(host) is applied; the context carries the trust
+     * roots and verify mode. The dial takes exactly one up_ref on c->ctx after
+     * the socket is up and frees it on any failure. */
+    SSL *ssl = zap_tls_dial_raw_impl(host_, NULL, port, 1, 0, c->ctx, &ectx, &fd, &pd);
+    ZapTls *t = (ZapTls *)zap_obj(&zap_desc_tls);
+    t->kind = ZAP_CONN_TLS; /* ATOMIC objects are not zeroed; init explicitly. */
+    t->fd = fd;
+    t->pd = pd;
+    t->read_timeout_ms = 0;
+    t->read_deadline_ms = 0;
+    t->ssl = ssl;
+    t->ctx = ectx; /* the connection's own up-ref; close_conn's SSL_CTX_free balances it. */
+    return t;
+}
 
 /* Write all `len` bytes of `data` over `ssl`, parking on WANT_*. `data` is
  * caller-owned (GC-free) scratch that survives the parks. Returns 0 on success,
@@ -17906,6 +18148,128 @@ int64_t zap_tls_test_server(void) {
     s->pd = lpd;
     s->ctx = ctx;
     zap_spawn(zap_tls_test_serve, s);
+    return port;
+}
+
+/* ---- internal mutual-TLS test server (test scaffold, ticket #560) --------- *
+ * Behind `tls._test_mtls_server(cert_path, key_path, client_ca_path)`. A client
+ * certificate is REQUIRED and verified against `client_ca_path`
+ * (SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT), so a client that presents
+ * no certificate or one not signed by that CA fails the handshake. This exists
+ * ONLY so the golden suite can exercise the public CLIENT context's
+ * `load_cert_chain` (mutual TLS) end to end against a real client-auth-requiring
+ * server with no outbound network — it is NOT stable public API, and #560 adds
+ * no public TLS *server* client-auth surface (that is the client half only). The
+ * coroutine loops past failed handshakes (so the rejected probes never kill it)
+ * and serves exactly ONE successful connection — one echoed record — then tears
+ * down, like `_test_server`. */
+typedef struct {
+    int fd;
+    void *pd;
+    SSL_CTX *ctx;
+} ZapTlsMtlsSrv;
+
+/* Server coroutine: accept, server-handshake (client cert required+verified);
+ * skip any peer whose handshake fails, echo one record for the first that
+ * succeeds, then clean up. Never aborts the process. */
+static void *zap_tls_test_serve_mtls(void *arg) {
+    ZapTlsMtlsSrv *s = (ZapTlsMtlsSrv *)arg;
+    int lfd = s->fd;
+    void *lpd = s->pd;
+    SSL_CTX *ctx = s->ctx;
+    for (;;) {
+        int cfd = (int)accept(lfd, NULL, NULL);
+        if (cfd < 0) {
+            int e = ZAP_SOCK_ERR();
+            if (ZAP_SOCK_EINTR(e)) {
+                continue;
+            }
+            if (ZAP_SOCK_WOULDBLOCK(e)) {
+                if (zap_sock_park(lfd, lpd, ZAP_POLL_READ, 0) < 0) {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        zap_sock_make_nonblocking(cfd);
+        void *cpd = zap_netpoll_open((int64_t)cfd);
+        SSL *ssl = zap_tls_server_handshake(cfd, cpd, ctx); /* shared with tls.accept */
+        if (!ssl) {
+            zap_sock_shutdown(cfd, cpd);
+            zap_check_cancel();
+            continue; /* rejected client (no/invalid cert) — keep serving */
+        }
+        char rb[4096];
+        for (;;) {
+            int r = SSL_read(ssl, rb, (int)sizeof rb);
+            if (r > 0) {
+                (void)zap_tls_write_all(ssl, cfd, cpd, rb, (size_t)r);
+                break; /* echo one record, done */
+            }
+            if (zap_tls_want(ssl, r, cfd, cpd) != 0) {
+                break;
+            }
+        }
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        zap_sock_shutdown(cfd, cpd);
+        break; /* served one successful connection */
+    }
+    SSL_CTX_free(ctx);
+    zap_sock_shutdown(lfd, lpd);
+    free(s);
+    return NULL;
+}
+
+/* tls._test_mtls_server(cert_path, key_path, client_ca_path) -> int64 port. */
+int64_t zap_tls_test_mtls_server(void *cert_, void *key_, void *client_ca_) {
+    char *cert = zap_net_dupz((const ZapStr *)cert_);
+    char *key = zap_net_dupz((const ZapStr *)key_);
+    char *cca = zap_net_dupz((const ZapStr *)client_ca_);
+    if (!cert || !key || !cca) {
+        free(cert);
+        free(key);
+        free(cca);
+        zap_net_panic("tls: out of memory");
+        return 0;
+    }
+    SSL_CTX *ctx = zap_tls_make_server_ctx(cert, key);
+    if (ctx) {
+        /* Require + verify the client certificate against the given CA bundle. */
+        if (SSL_CTX_load_verify_locations(ctx, cca, NULL) != 1) {
+            SSL_CTX_free(ctx);
+            ctx = NULL;
+        } else {
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+        }
+    }
+    free(cert);
+    free(key);
+    free(cca);
+    if (!ctx) {
+        zap_tls_ssl_panic("tls: _test_mtls_server: context setup failed");
+        return 0;
+    }
+    ZapStr loop;
+    loop.len = 9;
+    loop.data = "127.0.0.1";
+    void *l_v = zap_net_listen(&loop, 0); /* raises on failure */
+    ZapSock *l = (ZapSock *)l_v;
+    int lfd = l->fd;
+    void *lpd = l->pd;
+    int64_t port = zap_net_port(l_v);
+    ZapTlsMtlsSrv *s = (ZapTlsMtlsSrv *)malloc(sizeof(ZapTlsMtlsSrv));
+    if (!s) {
+        SSL_CTX_free(ctx);
+        zap_sock_shutdown(lfd, lpd);
+        zap_net_panic("tls: out of memory");
+        return 0;
+    }
+    s->fd = lfd;
+    s->pd = lpd;
+    s->ctx = ctx;
+    zap_spawn(zap_tls_test_serve_mtls, s);
     return port;
 }
 

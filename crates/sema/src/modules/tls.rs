@@ -18,23 +18,87 @@
 //! parked `accept` raise, as `net.close_listener` does for `net.accept`.
 //! `_test_server` is an internal test scaffold (a self-signed loopback echo
 //! server) for the golden suite, not stable API.
+//!
+//! TLS **client contexts** (#560, D-0143) mirror Python's `ssl` module for
+//! per-connection trust configuration: `create_default_context()` (system roots
+//! preloaded) and `SSLContext()` (empty trust store) build an opaque context
+//! handle (also `bytes`), `load_verify_locations(ctx, cafile[, capath])` adds CA
+//! trust additively and `load_cert_chain(ctx, certfile[, keyfile])` adds a client
+//! cert/key for mutual TLS, and `connect(host, port, ctx)` (the optional trailing
+//! context argument) dials with that context. Each context owns its own
+//! `SSL_CTX`, so concurrent dials with different private CAs never share trust.
 
 use zapc_syntax::ast::Arg;
 use zapc_syntax::span::Span;
+
+use zapc_diag::ErrorCode;
 
 use super::{expect_argc, ModuleCheck};
 use crate::{Checker, Ty};
 
 pub(super) const MODULE: ModuleCheck = ModuleCheck { name: "tls", check };
 
+/// Accept any argument count in `lo..=hi`, erroring with ZAP4025 otherwise, and
+/// still infer every argument so later diagnostics fire. Mirrors `expect_argc`
+/// for the `tls` surface methods that have an optional trailing argument.
+fn expect_argc_range(
+    checker: &mut Checker,
+    method: &str,
+    args: &[Arg],
+    lo: usize,
+    hi: usize,
+    span: Span,
+) {
+    if args.len() < lo || args.len() > hi {
+        checker.error(
+            ErrorCode::ZAP4025,
+            format!(
+                "tls.{method}() takes {lo} to {hi} argument(s), found {}",
+                args.len()
+            ),
+            span,
+        );
+    }
+    for a in args {
+        checker.infer(&a.value);
+    }
+}
+
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     Some(match method {
         // tls.connect(host, port) -> TLS connection handle (chain + hostname
         // verification against the system trust store ON).
+        // tls.connect(host, port, ctx) -> same, using a TLS client context
+        // (#560): the context's trust roots + optional client cert, SNI/hostname
+        // still checked against `host`.
+        "connect" => {
+            expect_argc_range(checker, method, args, 2, 3, span);
+            Ty::Bytes
+        }
         // tls.connect_insecure(host, port) -> same, verification OFF (opt-in).
-        "connect" | "connect_insecure" => {
+        "connect_insecure" => {
             expect_argc(checker, "tls", method, args, 2, span);
             Ty::Bytes
+        }
+        // tls.create_default_context() -> client context with the system trust
+        // store preloaded (verify + hostname on) — the "augment" base (#560).
+        // tls.SSLContext() -> client context with an EMPTY trust store (trusts
+        // only what is loaded; verify + hostname still on) — the "replace" base.
+        "create_default_context" | "SSLContext" => {
+            expect_argc(checker, "tls", method, args, 0, span);
+            Ty::Bytes
+        }
+        // tls.load_verify_locations(ctx, cafile[, capath]) -> adds CA trust to the
+        // context (additive, like Python). capath is optional ("" = omitted).
+        "load_verify_locations" => {
+            expect_argc_range(checker, method, args, 2, 3, span);
+            Ty::Unit
+        }
+        // tls.load_cert_chain(ctx, certfile[, keyfile]) -> client cert + key for
+        // mutual TLS. keyfile is optional ("" / omitted = key is in certfile).
+        "load_cert_chain" => {
+            expect_argc_range(checker, method, args, 2, 3, span);
+            Ty::Unit
         }
         "connect_resolved" => {
             expect_argc(checker, "tls", method, args, 4, span);
@@ -77,6 +141,13 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         // self-signed TLS echo server and return its ephemeral port.
         "_test_server" => {
             expect_argc(checker, "tls", method, args, 0, span);
+            Ty::Int64
+        }
+        // Internal mutual-TLS test scaffold (#560): a client-auth-requiring echo
+        // server used by the golden suite to drive the public client context's
+        // `load_cert_chain`; not stable API.
+        "_test_mtls_server" => {
+            expect_argc(checker, "tls", method, args, 3, span);
             Ty::Int64
         }
         _ => return None,

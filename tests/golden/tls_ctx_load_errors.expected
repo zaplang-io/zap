@@ -1,0 +1,5 @@
+bad-ca-path: reject
+bad-cert-path: reject
+bad-key-path: reject
+mismatched-pair: reject
+no-ca-args: reject

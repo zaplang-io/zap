@@ -1,0 +1,4 @@
+bare+caA  -> srvA: ok:ping
+bare+caA  -> srvB: reject
+bareEmpty -> srvA: reject
+default+caA -> srvA: ok:ping

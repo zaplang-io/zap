@@ -1,0 +1,4 @@
+ctxB->srvA: reject
+ctxA->srvB: reject
+ctxA->srvA: ok:ping
+ctxB->srvB: ok:ping

@@ -6831,3 +6831,77 @@ sound options are *wait* (hang — rejected) or *detach and leak* (bounded, obse
 — chosen). Reporting the timeout as a catchable exception while leaking the orphan
 keeps the single-outcome-channel contract (D-0094) and turns a whole-process kill
 into a per-request error.
+
+## D-0143 — `tls`: per-connection client contexts (trust roots + client certs), mirroring Python `ssl` (#560)
+**Status:** Locked — resolves issue #560, un-defers the "client certificates
+(mTLS); custom CA-bundle configuration" that [[D-0062]] left deferred and
+[[D-0093]] restated. Surfaced by the private-CA / mutual-TLS needs of
+zaplang-io/redis#8. No grammar change (all generic module calls); same unified
+post-1.1.0 OpenSSL backend and netpoller discipline as D-0062/D-0093 — this is a
+**client configuration surface + per-connection trust isolation**, not new crypto.
+This decision adds **no public TLS *server* client-auth surface** (that is the
+client half only); the mTLS golden drives an internal, non-stable test scaffold.
+
+Before this, the only trust knobs were process-wide `SSL_CERT_FILE`/`SSL_CERT_DIR`,
+which cannot isolate concurrent dials and cannot carry a client certificate. The
+API **mirrors Python's `ssl` module context model** (the maintainer ruling), which
+also settles replace-vs-augment by letting the caller pick via the constructor.
+
+- **Surface (`tls`).**
+  - `create_default_context()` → an opaque client **context** handle (`bytes`, a
+    new ATOMIC `ZapTlsCtx` wrapping its own `SSL_CTX`). Analogue of
+    `ssl.create_default_context()`: **preloads the system trust store**, verify +
+    hostname checking ON. The **augment** base.
+  - `SSLContext()` → a client context whose trust store starts **empty** (trusts
+    only what is later loaded), verify + hostname checking still ON. Analogue of
+    `ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)`. The **replace** base.
+  - `load_verify_locations(ctx, cafile[, capath])` → **additively** add CA trust
+    from a PEM bundle file and/or a hashed-cert directory (`SSL_CTX_load_verify_locations`,
+    additive exactly like Python). Either argument may be `""` (omitted); at least
+    one must be given, else `ValueError`.
+  - `load_cert_chain(ctx, certfile[, keyfile])` → a client certificate(-chain) and
+    private key for **mutual TLS** (`SSL_CTX_use_certificate_chain_file` +
+    `use_PrivateKey_file` + `check_private_key`). `keyfile` omitted/`""` means the
+    key is in `certfile` (Python's keyfile-defaults-to-certfile).
+  - `connect(host, port, ctx)` → dial `host:port` using the context (an **optional
+    trailing `ctx` argument** on the existing `connect`); SNI + hostname identity
+    are still checked against `host`, so a context is reusable across hosts and
+    never has a host baked in. The 2-argument `connect(host, port)` is **unchanged**
+    (a fresh system-roots verified context) and `connect_insecure` is untouched.
+- **Per-connection isolation (the headline property).** Each context owns its own
+  `SSL_CTX` and therefore its own `X509_STORE`. Two contexts loading different
+  private CAs **cannot bleed trust**, and nothing mutates the process-global
+  `SSL_CERT_FILE`/`SSL_CERT_DIR`, so concurrent dials with different CAs are safe.
+- **Lifetime.** The context's `SSL_CTX` is **reference-counted** exactly as the
+  server listener's (D-0093): the context handle holds one ref, released by a GC
+  **finalizer** (contexts have no explicit close, matching Python); each
+  `connect(…, ctx)` takes its own ref (after the TCP socket is up, so a connect
+  failure leaks nothing) that `close_conn` releases — a conn safely outlives the
+  context. On **any** failed setup or handshake, the SSL, the borrowed `SSL_CTX`
+  ref and the socket are all released; a bad cert/key path or a mismatched pair
+  raises a clear, catchable error rather than crashing.
+- **Replace vs augment, chosen by constructor.** `SSLContext()` + a private CA
+  trusts **only** that CA (a server whose anchor was not loaded is rejected);
+  `create_default_context()` + a private CA trusts **both** the system roots and
+  the added CA. This is the replace/augment question resolved by which constructor
+  the caller uses, per the ruling.
+- **Python-fidelity adaptations (recorded, not divergences).** Zap module calls
+  carry no `PROTOCOL_*` enum and expose no raw client socket, so: `SSLContext()`
+  is implicitly a client context (there is no protocol argument), and passing a
+  context to a dial is an **optional `connect(host, port, ctx)` argument** rather
+  than Python's `ctx.wrap_socket(sock, server_hostname=…)` — Zap's `connect`
+  already fuses the TCP connect and the TLS wrap. Names (`create_default_context`,
+  `SSLContext`, `load_verify_locations`, `load_cert_chain`) match `ssl` verbatim.
+  Encrypted-private-key passwords (`load_cert_chain(..., password=)`) and `cadata`
+  remain deferred.
+- **Same OpenSSL API / CI** as D-0062/D-0093 (`TLS_client_method`,
+  `SSL_CTX_set_min_proto_version` floor TLS 1.2, `SSL_VERIFY_PEER`,
+  `SSL_set1_host`), no version `#ifdef`. Exhaustive hermetic goldens (offline CA
+  fixtures, no outbound network) cover: two concurrent private-CA servers with no
+  trust bleeding; mTLS accept-valid / reject-absent / reject-wrong; invalid
+  CA/cert/key paths and a mismatched key pair; replace-vs-augment; and
+  hostname-mismatch / expired-cert rejection through a context.
+
+**Still deferred (from D-0062, unchanged):** ALPN / HTTP/2; session resumption /
+0-RTT; OCSP stapling; TLS protocol/cipher policy knobs; encrypted-key passwords;
+a public TLS *server* client-auth (mTLS-server) surface.
