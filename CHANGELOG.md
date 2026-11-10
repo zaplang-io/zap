@@ -25,6 +25,24 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Enums work as dict keys / set members** (#809, epic #812, D-0139). A **tier-1**
+  (constant) enum is int-backed, so `dict[Color, V]`, `set[Color]`, and
+  `heap[Color]` (ordered by backing value) work with no annotation; its equality
+  and hashing are **intrinsic** (by backing value, D-0018) and **non-overridable**
+  — a hand-written `__eq__`/`__hash__` on a tier-1 enum is a compile error
+  (`ZAP5126`), since you cannot merge two distinct members (`__cmp__` stays allowed
+  for ordering). A **tier-3** (data-carrying) enum is a tagged value aggregate that
+  **auto-derives** `Equatable`+`Hashable` iff every payload field is hashable
+  (recursively; float payloads inherit the #803 key semantics), synthesized on
+  demand like a tuple key; a non-hashable payload (e.g. a `list`) makes it a clean
+  "not hashable" error at key use, not an ICE. Not gated on #731 (enum→interface
+  value). *Follow-ups:* `heap[tier-1 enum]` lowers but aborts at runtime — a
+  pre-existing defect in the integer-heap element comparator (the push reaches
+  `zap_str_cmp`), surfaced by this work and left for a separate fix — so the
+  `heap[Color]` bullet and custom-`__cmp__` heap reordering are deferred; `heap`
+  of a tier-3 enum (needing explicit `Comparable`) and a `NaN` tier-3
+  float-payload key (the indirect-hash exception-unwinding edge from #808) also
+  remain open. Enum dict keys / set members — the headline — are complete.
 - **Value structs and tuples auto-derive `Equatable` + `Hashable`** (#808, epic
   #812, D-0139). A `value struct` (and a tuple) now auto-derives equality and
   hashing with **no `@derive`**, so it is usable as a `dict` key / `set` member and

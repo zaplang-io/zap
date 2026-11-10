@@ -16464,6 +16464,17 @@ impl<'a> FnLower<'a> {
             // `__hash__`/`__eq__` and route it through the fn-key path. A
             // sentinel hash for `None`, delegation to `T` for `Some`.
             self.optional_key_fns(sid)?
+        } else if self
+            .ctx
+            .enums
+            .values()
+            .any(|e| e.is_sum && e.sid == Some(sid))
+        {
+            // A tier-3 (data-carrying) enum key (D-0139/#809): a tagged value
+            // aggregate, hashable iff every payload field is — synthesize its
+            // structural `__hash__`/`__eq__` on demand (tag switch + per-variant
+            // payload fold) and route it through the fn-key path, like a tuple.
+            self.enum_key_fns(sid)?
         } else {
             let name = self.ctx.names[sid as usize].clone();
             let hashn = format!("{name}__{}", "__hash__");
@@ -16767,6 +16778,18 @@ impl<'a> FnLower<'a> {
                 } else if optional_layout(self.ctx, Ty::Struct(csid)).is_some() {
                     let (ch, ce) = self.optional_key_fns(csid)?;
                     ElemKey::Struct(ch, ce)
+                } else if self
+                    .ctx
+                    .enums
+                    .values()
+                    .any(|e| e.is_sum && e.sid == Some(csid))
+                {
+                    // A tier-3 (data-carrying) enum key (D-0139/#809): a tagged
+                    // value aggregate, hashable iff every payload field is —
+                    // synthesized on demand like a tuple/Optional, routed through
+                    // the function-pointer key path.
+                    let (ch, ce) = self.enum_key_fns(csid)?;
+                    ElemKey::Struct(ch, ce)
                 } else {
                     let name = self.ctx.names[csid as usize].clone();
                     let ch = format!("{name}____hash__");
@@ -16912,6 +16935,305 @@ impl<'a> FnLower<'a> {
             b.set_term(Term::Br(end_bb));
             b.position(end_bb);
             let r = b.load(slot, Ty::I1);
+            b.set_term(Term::Ret(Some(r)));
+            self.ctx.generated.borrow_mut().push(b.func);
+        }
+
+        let pair = (hashn, eqn);
+        self.ctx.synth_keyfns.borrow_mut().insert(sid, pair.clone());
+        Ok(pair)
+    }
+
+    /// Synthesize (once per tier-3 enum tagged-struct id, D-0139/#809) the
+    /// structural `__hash__`/`__eq__` for a data-carrying enum used as a dict key
+    /// or set element, returning their symbol names. A tier-3 enum is a tagged
+    /// value aggregate (D-0046), so — like a tuple/`Optional` — it is hashable iff
+    /// every payload field is, and routes through the function-pointer key path.
+    /// `__hash__` folds `hash(tag)` with the active variant's payload-field hashes
+    /// (switch on the `i32` tag at field 0, mirroring the tier-3 repr chain);
+    /// `__eq__` is false on differing tags and otherwise ANDs the active variant's
+    /// per-field comparisons. An unhashable payload (e.g. a `list` field) is a
+    /// clean coded error via [`Self::elem_key_plan`], never an ICE. A niche
+    /// `Optional`-shaped enum has no tag slot and is handled exactly like
+    /// [`Self::optional_key_fns`] (null == the payload-free variant).
+    fn enum_key_fns(&mut self, sid: u32) -> Result<(String, String), LowerError> {
+        if let Some(pair) = self.ctx.synth_keyfns.borrow().get(&sid) {
+            return Ok(pair.clone());
+        }
+        let info = self
+            .ctx
+            .enums
+            .values()
+            .find(|e| e.is_sum && e.sid == Some(sid))
+            .cloned()
+            .ok_or_else(|| err("enum_key_fns called on a non-tier-3-enum struct id"))?;
+        let ename = info.enum_name.clone();
+        let hashn = format!("$enum${sid}$hash");
+        let eqn = format!("$enum${sid}$eq");
+
+        // Niche `Optional`-shaped layout: no tag slot; `self` IS the payload
+        // pointer, null for the payload-free variant. Identical treatment to an
+        // `Optional[T]` key.
+        if let Some(n) = &info.niche {
+            let opt = OptionalLayout {
+                sid,
+                payload_ty: n.payload,
+                niche: true,
+                some_tag: 0,
+                none_tag: 0,
+                payload_idx: 0,
+            };
+            let plan = self.elem_key_plan(opt.payload_ty)?;
+            const NONE_HASH: i64 = 0x6E6F_6E65;
+            {
+                let mut b = FnLower::new(
+                    hashn.clone(),
+                    vec![Ty::Struct(sid)],
+                    Ty::I64,
+                    false,
+                    true,
+                    self.sigs,
+                    self.ctx,
+                );
+                let slot = b.alloca(Ty::I64);
+                let is_none = gen_opt_is_none(&mut b, &opt, 0);
+                let none_bb = b.new_block();
+                let some_bb = b.new_block();
+                let end_bb = b.new_block();
+                b.set_term(Term::BrIf {
+                    cond: is_none,
+                    then_bb: none_bb,
+                    else_bb: some_bb,
+                });
+                b.position(none_bb);
+                let sentinel = b.iconst(Ty::I64, NONE_HASH);
+                b.store(slot, sentinel);
+                b.set_term(Term::Br(end_bb));
+                b.position(some_bb);
+                let payload = gen_opt_payload(&mut b, &opt, 0);
+                let h = b.emit_elem_hash(payload, opt.payload_ty, &plan);
+                b.store(slot, h);
+                b.set_term(Term::Br(end_bb));
+                b.position(end_bb);
+                let acc = b.load(slot, Ty::I64);
+                b.set_term(Term::Ret(Some(acc)));
+                self.ctx.generated.borrow_mut().push(b.func);
+            }
+            {
+                let mut b = FnLower::new(
+                    eqn.clone(),
+                    vec![Ty::Struct(sid), Ty::Struct(sid)],
+                    Ty::I1,
+                    false,
+                    true,
+                    self.sigs,
+                    self.ctx,
+                );
+                let slot = b.alloca(Ty::I1);
+                let a_none = gen_opt_is_none(&mut b, &opt, 0);
+                let b_none = gen_opt_is_none(&mut b, &opt, 1);
+                let a_none_bb = b.new_block();
+                let a_some_bb = b.new_block();
+                let end_bb = b.new_block();
+                b.set_term(Term::BrIf {
+                    cond: a_none,
+                    then_bb: a_none_bb,
+                    else_bb: a_some_bb,
+                });
+                b.position(a_none_bb);
+                b.store(slot, b_none);
+                b.set_term(Term::Br(end_bb));
+                b.position(a_some_bb);
+                let b_none_bb = b.new_block();
+                let both_some_bb = b.new_block();
+                b.set_term(Term::BrIf {
+                    cond: b_none,
+                    then_bb: b_none_bb,
+                    else_bb: both_some_bb,
+                });
+                b.position(b_none_bb);
+                let f = b.bconst(false);
+                b.store(slot, f);
+                b.set_term(Term::Br(end_bb));
+                b.position(both_some_bb);
+                let pa = gen_opt_payload(&mut b, &opt, 0);
+                let pc = gen_opt_payload(&mut b, &opt, 1);
+                let bit = b.emit_elem_eq(pa, pc, &plan);
+                b.store(slot, bit);
+                b.set_term(Term::Br(end_bb));
+                b.position(end_bb);
+                let r = b.load(slot, Ty::I1);
+                b.set_term(Term::Ret(Some(r)));
+                self.ctx.generated.borrow_mut().push(b.func);
+            }
+            let pair = (hashn, eqn);
+            self.ctx.synth_keyfns.borrow_mut().insert(sid, pair.clone());
+            return Ok(pair);
+        }
+
+        // General tagged layout: field 0 is the `i32` tag. Pre-classify every
+        // payload field first (fail-fast + synthesize nested key fns) so an
+        // unhashable payload is reported before any function is emitted.
+        let variants = info.variants.clone();
+        let mut plans: Vec<Vec<ElemKey>> = Vec::with_capacity(variants.len());
+        for v in &variants {
+            let mut ps = Vec::with_capacity(v.fields.len());
+            for (_n, _idx, fty) in &v.fields {
+                ps.push(self.elem_key_plan(*fty)?);
+            }
+            plans.push(ps);
+        }
+
+        // __hash__(self) -> i64: fold hash(tag) with the active variant's payload.
+        {
+            let mut b = FnLower::new(
+                hashn.clone(),
+                vec![Ty::Struct(sid)],
+                Ty::I64,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            let result = b.alloca(Ty::I64);
+            let merge = b.new_block();
+            let mut check = b.cur;
+            for (vi, v) in variants.iter().enumerate() {
+                b.position(check);
+                let tag = b.field_get(0, sid, 0, Ty::I32);
+                let expected = b.iconst(Ty::I32, v.tag);
+                let matches = b.new_value(Ty::I1);
+                b.emit(Inst::ICmp {
+                    dest: matches,
+                    pred: CmpPred::Eq,
+                    lhs: tag,
+                    rhs: expected,
+                });
+                let found = b.new_block();
+                let next = b.new_block();
+                b.set_term(Term::BrIf {
+                    cond: matches,
+                    then_bb: found,
+                    else_bb: next,
+                });
+                b.position(found);
+                // Seed with the hash of the tag so two variants with identical
+                // payloads still hash differently.
+                let tagv = b.field_get(0, sid, 0, Ty::I32);
+                let tag64 = b.coerce(tagv, Ty::I32, Ty::I64);
+                let mut acc = b.new_value(Ty::I64);
+                b.emit(Inst::Call {
+                    dest: Some(acc),
+                    func: "zap_i64_hash".to_string(),
+                    args: vec![tag64],
+                });
+                for ((_n, idx, fty), key) in v.fields.iter().zip(&plans[vi]) {
+                    let fv = b.field_get(0, sid, *idx, *fty);
+                    let h = b.emit_elem_hash(fv, *fty, key);
+                    let nxt = b.new_value(Ty::I64);
+                    b.emit(Inst::Call {
+                        dest: Some(nxt),
+                        func: "zap_hash_combine".to_string(),
+                        args: vec![acc, h],
+                    });
+                    acc = nxt;
+                }
+                b.store(result, acc);
+                b.ensure_br(merge);
+                check = next;
+            }
+            b.position(check);
+            let message = b.strconst(&format!("invalid tag for enum {ename}"));
+            b.throwing_call(None, "zap_panic", vec![message]);
+            if !b.terminated() {
+                b.set_term(Term::Unreachable);
+            }
+            b.position(merge);
+            let r = b.load(result, Ty::I64);
+            b.set_term(Term::Ret(Some(r)));
+            self.ctx.generated.borrow_mut().push(b.func);
+        }
+
+        // __eq__(a, b) -> i1: differing tags -> false; else AND the active
+        // variant's per-field comparisons.
+        {
+            let mut b = FnLower::new(
+                eqn.clone(),
+                vec![Ty::Struct(sid), Ty::Struct(sid)],
+                Ty::I1,
+                false,
+                true,
+                self.sigs,
+                self.ctx,
+            );
+            let result = b.alloca(Ty::I1);
+            let merge = b.new_block();
+            let ta = b.field_get(0, sid, 0, Ty::I32);
+            let tb = b.field_get(1, sid, 0, Ty::I32);
+            let tags_eq = b.new_value(Ty::I1);
+            b.emit(Inst::ICmp {
+                dest: tags_eq,
+                pred: CmpPred::Eq,
+                lhs: ta,
+                rhs: tb,
+            });
+            let same_bb = b.new_block();
+            let diff_bb = b.new_block();
+            b.set_term(Term::BrIf {
+                cond: tags_eq,
+                then_bb: same_bb,
+                else_bb: diff_bb,
+            });
+            b.position(diff_bb);
+            let f = b.bconst(false);
+            b.store(result, f);
+            b.ensure_br(merge);
+            b.position(same_bb);
+            let mut check = b.cur;
+            for (vi, v) in variants.iter().enumerate() {
+                b.position(check);
+                let tag = b.field_get(0, sid, 0, Ty::I32);
+                let expected = b.iconst(Ty::I32, v.tag);
+                let matches = b.new_value(Ty::I1);
+                b.emit(Inst::ICmp {
+                    dest: matches,
+                    pred: CmpPred::Eq,
+                    lhs: tag,
+                    rhs: expected,
+                });
+                let found = b.new_block();
+                let next = b.new_block();
+                b.set_term(Term::BrIf {
+                    cond: matches,
+                    then_bb: found,
+                    else_bb: next,
+                });
+                b.position(found);
+                let mut acc = b.bconst(true);
+                for ((_n, idx, fty), key) in v.fields.iter().zip(&plans[vi]) {
+                    let fa = b.field_get(0, sid, *idx, *fty);
+                    let fb = b.field_get(1, sid, *idx, *fty);
+                    let bit = b.emit_elem_eq(fa, fb, key);
+                    let nxt = b.new_value(Ty::I1);
+                    b.emit(Inst::Bin {
+                        dest: nxt,
+                        op: BinOp::And,
+                        lhs: acc,
+                        rhs: bit,
+                    });
+                    acc = nxt;
+                }
+                b.store(result, acc);
+                b.ensure_br(merge);
+                check = next;
+            }
+            // Tags equal but matched no variant: unreachable for a valid value.
+            b.position(check);
+            let f2 = b.bconst(false);
+            b.store(result, f2);
+            b.ensure_br(merge);
+            b.position(merge);
+            let r = b.load(result, Ty::I1);
             b.set_term(Term::Ret(Some(r)));
             self.ctx.generated.borrow_mut().push(b.func);
         }
