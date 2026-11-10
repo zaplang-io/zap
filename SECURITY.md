@@ -52,9 +52,12 @@ different from a typical application. In scope:
   - **`tls`** and the `https://` path of `http` — the client verifies the
     certificate chain *and* hostname by default (OpenSSL, system trust store);
     `tls.connect_insecure` is a deliberate, loud opt-out and is not itself a
-    vulnerability. A server-side TLS surface is **deferred** and not yet public
-    API; the internal `tls._test_server` is a test scaffold, not a supported
-    server.
+    vulnerability. A per-connection client context (#560) may carry private trust
+    roots and a client certificate for mutual TLS, each context fully isolated in
+    its own trust store (no process-global trust mutation) with chain + hostname
+    verification still on; mis-isolated trust or a verification bypass there would
+    be in scope. The internal `tls._test_server` / `tls._test_mtls_server` are test
+    scaffolds, not a supported server.
   - **`crypto`** — hashing, HMAC, and secure random. The reference
     implementations of SHA-1 and MD5 are provided for interoperability and are
     **not** recommended for security-sensitive use; that is documentation, not a

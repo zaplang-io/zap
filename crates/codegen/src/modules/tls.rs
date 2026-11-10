@@ -28,6 +28,24 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
         &[p.into(), i.into()],
         Some(p.into()),
     );
+    // TLS client contexts (#560, D-0143): ssl-style per-connection trust config.
+    cg.declare_rt("zap_tls_create_default_context", &[], Some(p.into()));
+    cg.declare_rt("zap_tls_ssl_context", &[], Some(p.into()));
+    cg.declare_rt(
+        "zap_tls_load_verify_locations",
+        &[p.into(), p.into(), p.into()],
+        None,
+    );
+    cg.declare_rt(
+        "zap_tls_load_cert_chain",
+        &[p.into(), p.into(), p.into()],
+        None,
+    );
+    cg.declare_rt(
+        "zap_tls_connect_ctx",
+        &[p.into(), p.into(), i.into()],
+        Some(p.into()),
+    );
     cg.declare_rt(
         "zap_tls_listen",
         &[p.into(), i.into(), p.into(), p.into()],
@@ -40,4 +58,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_tls_close", &[p.into()], None);
     cg.declare_rt("zap_tls_close_listener", &[p.into()], None);
     cg.declare_rt("zap_tls_test_server", &[], Some(i.into()));
+    cg.declare_rt(
+        "zap_tls_test_mtls_server",
+        &[p.into(), p.into(), p.into()],
+        Some(i.into()),
+    );
 }

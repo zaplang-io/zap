@@ -1739,7 +1739,19 @@ per-park timeout and the whole-op deadline. `http` is **Experimental**
 *Client (#147):* `tls.connect(host, port)` verifies the certificate chain
 against the system trust store **and** the hostname (on by default);
 `tls.connect_insecure(host, port)` is the loudly-named opt-out (never the
-default). *Server (#488):* `tls.listen(host, port, cert_path, key_path)` loads a
+default). *Client contexts (#560):* for private CAs or mutual TLS, a per-connection
+client context — mirroring Python's `ssl` module — carries its own trust roots and
+an optional client certificate, fully isolated from other connections (its own
+`SSL_CTX`, no process-global `SSL_CERT_FILE`/`SSL_CERT_DIR` mutation).
+`tls.create_default_context()` preloads the system trust store (verify + hostname
+on; the *augment* base), while `tls.SSLContext()` starts with an **empty** trust
+store (trusts only what is loaded; the *replace* base). `tls.load_verify_locations(ctx,
+cafile[, capath])` **additively** adds CA trust and `tls.load_cert_chain(ctx,
+certfile[, keyfile])` adds a client certificate(-chain) + private key for mutual
+TLS. Dial with a context via the optional trailing argument `tls.connect(host,
+port, ctx)` — SNI and the hostname identity are still checked against `host`, so a
+context is reusable across hosts. Bad CA/cert/key paths or a mismatched key pair
+raise a catchable error with full resource cleanup. *Server (#488):* `tls.listen(host, port, cert_path, key_path)` loads a
 certificate(-chain) and private key from **PEM files on disk** into a server
 context and binds host:port (port `0` → OS-assigned ephemeral, read back with
 `tls.port(listener) -> int64`); `tls.accept(listener)` accepts a socket, runs the

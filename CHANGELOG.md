@@ -25,6 +25,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`tls` per-connection client contexts — private trust roots + client
+  certificates (mutual TLS)** (#560, D-0143). An `ssl`-style client context,
+  mirroring Python's `ssl` module: `tls.create_default_context()` preloads the
+  system trust store (verify + hostname on — the *augment* base), `tls.SSLContext()`
+  starts with an empty trust store (trusts only what is loaded — the *replace*
+  base), `tls.load_verify_locations(ctx, cafile[, capath])` **additively** adds CA
+  trust, and `tls.load_cert_chain(ctx, certfile[, keyfile])` configures a client
+  certificate + key for mutual TLS. Dial with a context via the new optional
+  trailing argument `tls.connect(host, port, ctx)`; the 2-argument
+  `tls.connect(host, port)` is unchanged (system roots, verified). **Each context
+  owns its own `SSL_CTX`/trust store**, so concurrent dials with different private
+  CAs cannot bleed trust and nothing mutates the process-global
+  `SSL_CERT_FILE`/`SSL_CERT_DIR`; SNI + hostname identity are still checked against
+  `host`. Bad CA/cert/key paths and mismatched key pairs raise clear, catchable
+  errors with full resource cleanup. `tls` stays **Experimental**.
 - **Enums conform to interfaces structurally — both tiers** (#731, D-0016
   extension). Interface conformance now covers **any type with the matching method
   set**, not structs only: an `enum` that declares every method an interface
