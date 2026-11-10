@@ -6291,6 +6291,39 @@ name. Every type gets an **automatic, total, overridable** `__repr__` (Java
 retires the old `str(struct)` rejection. `Repr` is independent of refinement and
 of #806 — it can land any time after this record (issue #810).
 
+### User-defined generic containers (issue #811, closes the epic)
+
+The capability vocabulary is usable as a **bound on a user generic container's
+type parameter**, exactly as on the built-ins — `struct BST[K: Comparable, V]`,
+`struct HMap[K: Hashable, V]` — with no new surface (it reuses the D-0017/D-0064
+`[T: Iface]` bound syntax). This makes the model uniform across built-in and user
+containers:
+
+- **Checked at instantiation.** A concrete type argument satisfies a capability
+  bound by the *same intrinsic rule* a built-in element position uses: scalars,
+  `str`/`bytes`, `float` and tier-1 enums satisfy all three; a `value struct` /
+  tier-3 enum satisfies `Equatable`/`Hashable` by its auto-derive (#808/#809) or a
+  declared dunder set, and `Comparable` only with an explicit `__cmp__` /
+  `@derive(Ord)` (ordering is never auto); a reference struct never auto-derives;
+  mutable collections (`list`/`dict`/`set`/`heap`/`channel`) and `bigint`/`complex`
+  satisfy none. A non-satisfying argument is a compile error that **names the
+  capability and the blocking reason** — for a value aggregate, the offending
+  field — never symptom-level wording. Enforced in monomorphization (one re-derived
+  rule for built-in and user containers alike), the same place the I#164 interface
+  bounds are checked.
+- **Body may use the bound.** Inside a method of a bounded generic type, the
+  capability's methods (and its refined supertypes') resolve on a value of the
+  bounded type parameter — the user-container counterpart of the bounded-free-
+  function body check (static dispatch after monomorphization; a method's own
+  type parameter of the same name shadows the enclosing one). Calling a method the
+  bound does not provide is rejected at definition.
+- **Known follow-up (not a blocker).** Calling a capability dunder *explicitly*
+  (`k.__cmp__(x)`) on a parameter whose instance is a **scalar** does not lower yet
+  (the intrinsic op has no method symbol to dispatch to); this is a pre-existing
+  I#164 limitation shared by bounded free functions, not specific to user
+  containers. The idiomatic operator surface (`<`, `==`) lowers correctly for every
+  instance, so it does not block the epic.
+
 ### Scope wall and cost
 
 - **Container-element typing only.** The framework does **not** extend to

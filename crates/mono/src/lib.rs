@@ -323,6 +323,70 @@ fn method_sig_matches(have: &Function, want: &MethodSig) -> bool {
         && opt_type_eq(have.ret.as_ref(), want.ret.as_ref())
 }
 
+/// A compiler-known **capability interface** (D-0139): the adjectival vocabulary
+/// (`Equatable`/`Hashable`/`Comparable`) a container's element/key/value position
+/// is bounded on. Unlike a user `interface`, a capability is satisfied
+/// *intrinsically* by the shape of a concrete type — a scalar has a total order
+/// and a hash; a tier-1 `enum` hashes/orders by its backing value; a `value
+/// struct` auto-derives equality and hashing from its fields (#808); a tier-3
+/// `enum` is a tagged value aggregate hashable iff its payloads are (#809) —
+/// rather than by a user-written method set. A capability bound on a user generic
+/// container (`struct BST[K: Comparable, V]`, I#811) is therefore checked
+/// structurally against the concrete argument here, exactly as a built-in
+/// collection's element position is (#807/#808/#809), which is what makes the
+/// capability model uniform across built-in and user containers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Capability {
+    Equatable,
+    Hashable,
+    Comparable,
+}
+
+impl Capability {
+    fn name(self) -> &'static str {
+        match self {
+            Capability::Equatable => "Equatable",
+            Capability::Hashable => "Hashable",
+            Capability::Comparable => "Comparable",
+        }
+    }
+
+    /// Resolve an interface name to the capability it denotes, if any. The three
+    /// capability interfaces are compiler-known and never appear as AST
+    /// `interface` items, so a bound that names one is routed to the intrinsic
+    /// check instead of the structural (method-set) one.
+    fn from_iface(iface: &str) -> Option<Capability> {
+        match iface {
+            "Equatable" => Some(Capability::Equatable),
+            "Hashable" => Some(Capability::Hashable),
+            "Comparable" => Some(Capability::Comparable),
+            _ => None,
+        }
+    }
+}
+
+/// Does `@derive(...)` on `decorators` list the trait `want` (e.g. `Eq`, `Hash`,
+/// `Ord`)? Mirrors the sema reader in `struct_info_of`.
+fn derives_trait(decorators: &[ast::Decorator], want: &str) -> bool {
+    decorators.iter().any(|d| {
+        d.name == "derive"
+            && d.args
+                .iter()
+                .any(|a| matches!(&a.value, Expr::Name(n, _) if n == want))
+    })
+}
+
+/// Does a type with these `methods` / `decorators` provide `dunder` either by a
+/// hand-written method or by the `@derive(derive_trait)` that generates it?
+fn provides_dunder(
+    methods: &[Function],
+    decorators: &[ast::Decorator],
+    dunder: &str,
+    derive_trait: &str,
+) -> bool {
+    methods.iter().any(|m| m.name == dunder) || derives_trait(decorators, derive_trait)
+}
+
 /// Structural equality of two optional types, treating `None` (no annotation /
 /// no return) as the unit type so an absent return matches an absent return.
 fn opt_type_eq(a: Option<&Type>, b: Option<&Type>) -> bool {
@@ -870,43 +934,357 @@ impl Mono<'_> {
         Ok(())
     }
 
-    /// Does the concrete type `arg` structurally conform to interface `iface`
-    /// (D-0016/I#84, re-derived at the AST level for monomorphization, I#164)?
-    /// Every interface method must be present on the concrete type with a
-    /// matching signature (parameter types excluding `self`, and return type).
-    /// Returns the human-readable reasons on failure. Only user structs and enums
-    /// carry methods; a primitive or built-in argument cannot satisfy a non-empty
-    /// interface bound (operator-dunder interfaces as bounds on primitives are a
-    /// documented follow-up).
+    /// Does the concrete type `arg` satisfy the bound named `iface`
+    /// (I#164/I#811)? Two kinds of bound are enforced here:
+    ///
+    ///   * A **capability interface** (`Equatable`/`Hashable`/`Comparable`,
+    ///     D-0139) is satisfied *intrinsically* by the shape of `arg`, exactly as
+    ///     a built-in container's element position is — a scalar, `str`/`bytes`,
+    ///     `float`, tier-1 `enum`, auto-derived `value struct`, hashable tier-3
+    ///     `enum`, and so on. This is what lets a user `struct BST[K: Comparable,
+    ///     V]` accept `int`/`str`/enum/value-struct keys and reject the rest with
+    ///     a capability-named reason (I#811).
+    ///   * A **user `interface`** is satisfied structurally (D-0016/I#84): every
+    ///     method of the interface *and of each refined supertype* (D-0139/#806)
+    ///     must be present on the concrete type with a matching signature. Only
+    ///     user structs and enums carry methods, so a primitive cannot satisfy a
+    ///     user method-bearing interface; a refined *capability* supertype is
+    ///     still checked intrinsically.
+    ///
+    /// Returns the human-readable reasons on failure (each a clause the
+    /// [`Self::check_bounds`] caller joins after "does not satisfy the bound").
     fn satisfies_bound(&self, arg: &Type, iface: &str) -> Result<(), Vec<String>> {
-        let Some(idef) = self.interfaces.get(iface) else {
+        if let Some(cap) = Capability::from_iface(iface) {
+            let mut visited = HashSet::new();
+            return self.type_has_capability(arg, cap, &mut visited);
+        }
+        if !self.interfaces.contains_key(iface) {
             return Err(vec![format!("'{iface}' is not an interface")]);
-        };
-        let Type::Named { name: tyname, .. } = arg else {
-            return Err(vec![format!(
-                "'{}' is not a struct or enum and cannot implement interface methods",
-                type_name(arg)
-            )]);
-        };
-        let methods: &[Function] = if let Some(s) = self.structs.get(tyname.as_str()) {
-            &s.methods
-        } else if let Some(e) = self.enums.get(tyname.as_str()) {
-            &e.methods
-        } else {
-            return Err(vec![format!(
-                "'{tyname}' is not a struct or enum and cannot implement interface methods"
-            )]);
-        };
+        }
         let mut reasons = Vec::new();
-        for im in &idef.methods {
-            match methods.iter().find(|m| m.name == im.name) {
-                None => reasons.push(format!("missing method '{}'", im.name)),
-                Some(cm) if !method_sig_matches(cm, im) => {
-                    reasons.push(format!("method '{}' has a mismatched signature", im.name));
+        // The interface itself plus every refined supertype, transitively
+        // (D-0139/#806): a `[T: C]` bound where `interface C: A` requires A's
+        // methods too, and a refined *capability* supertype is satisfied
+        // intrinsically rather than by method lookup.
+        for origin in self.iface_closure(iface) {
+            let attr = if origin == iface {
+                String::new()
+            } else {
+                format!(" (required by supertype '{origin}')")
+            };
+            if let Some(cap) = Capability::from_iface(&origin) {
+                let mut visited = HashSet::new();
+                if let Err(rs) = self.type_has_capability(arg, cap, &mut visited) {
+                    reasons.extend(rs.into_iter().map(|r| format!("{r}{attr}")));
                 }
-                Some(_) => {}
+                continue;
+            }
+            let Some(idef) = self.interfaces.get(origin.as_str()) else {
+                continue;
+            };
+            let methods: Option<&[Function]> = match arg {
+                Type::Named { name, .. } => {
+                    if let Some(s) = self.structs.get(name.as_str()) {
+                        Some(&s.methods)
+                    } else {
+                        self.enums.get(name.as_str()).map(|e| e.methods.as_slice())
+                    }
+                }
+                _ => None,
+            };
+            let Some(methods) = methods else {
+                reasons.push(format!(
+                    "'{}' is not a struct or enum and cannot implement interface methods{attr}",
+                    type_name(arg)
+                ));
+                continue;
+            };
+            for im in &idef.methods {
+                match methods.iter().find(|m| m.name == im.name) {
+                    None => reasons.push(format!("missing method '{}'{attr}", im.name)),
+                    Some(cm) if !method_sig_matches(cm, im) => reasons.push(format!(
+                        "method '{}' has a mismatched signature{attr}",
+                        im.name
+                    )),
+                    Some(_) => {}
+                }
             }
         }
+        if reasons.is_empty() {
+            Ok(())
+        } else {
+            Err(reasons)
+        }
+    }
+
+    /// An interface name followed by its transitively refined supertype names, in
+    /// a stable breadth-first order with duplicates removed (D-0139/#806).
+    /// Capability supertypes (which have no AST `interface` item) are included by
+    /// name so [`Self::satisfies_bound`] can route them to the intrinsic check.
+    fn iface_closure(&self, iface: &str) -> Vec<String> {
+        let mut out = vec![iface.to_string()];
+        let mut i = 0;
+        while i < out.len() {
+            let cur = out[i].clone();
+            i += 1;
+            if let Some(idef) = self.interfaces.get(cur.as_str()) {
+                for sup in &idef.supertypes {
+                    if let Type::Named { name, .. } = sup {
+                        if !out.iter().any(|n| n == name) {
+                            out.push(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Does the concrete type `arg` satisfy the capability `cap` intrinsically
+    /// (D-0139, I#811)? The rule set mirrors the element/key capability model the
+    /// built-in containers already enforce (#807/#808/#809) so a user generic
+    /// container admits exactly the element types a built-in one does. `visited`
+    /// guards the (value-aggregate) recursion against cycles. On failure the
+    /// returned clauses name the capability and the blocking reason — for a value
+    /// aggregate, the field that is not conforming.
+    fn type_has_capability(
+        &self,
+        arg: &Type,
+        cap: Capability,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), Vec<String>> {
+        match arg {
+            Type::Func { .. } => Err(vec![format!(
+                "a function type does not implement '{}'",
+                cap.name()
+            )]),
+            Type::Tuple { elems, .. } => {
+                // A tuple is `Equatable`/`Hashable` iff every element is (CPython
+                // parity, #680). It has no derived *ordering* yet, so a tuple does
+                // not satisfy `Comparable`.
+                if cap == Capability::Comparable {
+                    return Err(vec![
+                        "a tuple has no derived ordering, so it does not implement \
+                         'Comparable' (a Comparable bound needs a scalar, a tier-1 enum, \
+                         or a type providing '__cmp__' / '@derive(Ord)')"
+                            .to_string(),
+                    ]);
+                }
+                for e in elems {
+                    if let Err(rs) = self.type_has_capability(e, cap, visited) {
+                        return Err(rs
+                            .into_iter()
+                            .map(|r| format!("tuple element of type '{}': {r}", type_name(e)))
+                            .collect());
+                    }
+                }
+                Ok(())
+            }
+            Type::Named { name, args, .. } => self.named_has_capability(name, args, cap, visited),
+        }
+    }
+
+    /// The [`Self::type_has_capability`] arm for a named type (scalar, built-in
+    /// container, `Optional[T]`, or a user struct/enum).
+    fn named_has_capability(
+        &self,
+        name: &str,
+        args: &[Type],
+        cap: Capability,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), Vec<String>> {
+        // `Optional[T]` (#704): `None` and a present value are both hashable and
+        // equatable iff `T` is; there is no derived ordering yet (as for tuples).
+        if name == "Optional" && args.len() == 1 {
+            if cap == Capability::Comparable {
+                return Err(vec![
+                    "'Optional' has no derived ordering, so it does not implement 'Comparable'"
+                        .to_string(),
+                ]);
+            }
+            return self
+                .type_has_capability(&args[0], cap, visited)
+                .map_err(|rs| {
+                    rs.into_iter()
+                        .map(|r| format!("Optional payload: {r}"))
+                        .collect()
+                });
+        }
+        match canon_prim(name) {
+            // Scalars have equality, a hash, and a total order intrinsically
+            // (`float`: `-0.0` canonicalized, `NaN` handled per #803).
+            "int64" | "int32" | "uint8" | "uint16" | "uint32" | "uint64" | "usize" | "bool"
+            | "char" | "str" | "bytes" | "float64" | "float32" => Ok(()),
+            // Representation gaps: no stable hash/order slot yet (the built-in
+            // collections reject these too, ZAP4024).
+            "bigint" | "complex" | "pyobject" => Err(vec![format!(
+                "'{}' does not implement '{}' (no representation for it as a hashed/ordered \
+                 element yet)",
+                canon_prim(name),
+                cap.name()
+            )]),
+            // Mutable collections have no stable identity, hash, or order.
+            "list" | "dict" | "set" | "heap" | "channel" | "array" => Err(vec![format!(
+                "a mutable collection ('{name}') does not implement '{}' (it has no stable hash \
+                 or ordering)",
+                cap.name()
+            )]),
+            other => {
+                if let Some(e) = self.enums.get(other) {
+                    self.enum_has_capability(other, e, cap, visited)
+                } else if let Some(s) = self.structs.get(other) {
+                    self.struct_has_capability(other, s, cap, visited)
+                } else {
+                    Err(vec![format!(
+                        "'{other}' is not known to implement '{}'",
+                        cap.name()
+                    )])
+                }
+            }
+        }
+    }
+
+    /// Capability satisfaction for a user `enum` (D-0139/#809). A **tier-1**
+    /// (constant) enum hashes/orders/equals by its backing integer intrinsically.
+    /// A **tier-3** (data-carrying) enum is a tagged value aggregate: it is
+    /// `Equatable`/`Hashable` iff it declares the matching dunder(s) (hand-written
+    /// or `@derive`d) or — absent any such declaration — every payload field has
+    /// the capability; ordering (`Comparable`) is never auto and requires an
+    /// explicit `__cmp__` / `@derive(Ord)`.
+    fn enum_has_capability(
+        &self,
+        name: &str,
+        e: &EnumDef,
+        cap: Capability,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), Vec<String>> {
+        let is_tier3 = e.variants.iter().any(|v| !v.fields.is_empty());
+        if !is_tier3 {
+            return Ok(()); // tier-1: intrinsic Eq/Hash/Comparable (D-0018/#809)
+        }
+        if cap == Capability::Comparable {
+            return if provides_dunder(&e.methods, &e.decorators, "__cmp__", "Ord") {
+                Ok(())
+            } else {
+                Err(vec![format!(
+                    "tier-3 enum '{name}' does not implement 'Comparable': it has no '__cmp__' \
+                     method and does not '@derive(Ord)' (ordering is never auto-derived)"
+                )])
+            };
+        }
+        let has_eq = provides_dunder(&e.methods, &e.decorators, "__eq__", "Eq");
+        let has_hash = provides_dunder(&e.methods, &e.decorators, "__hash__", "Hash");
+        self.aggregate_eq_hash(
+            &format!("tier-3 enum '{name}'"),
+            cap,
+            has_eq,
+            has_hash,
+            e.variants
+                .iter()
+                .flat_map(|v| v.fields.iter().map(|f| (f.name.as_str(), &f.ty))),
+            visited,
+        )
+    }
+
+    /// Capability satisfaction for a user `struct` (D-0139/#808). A struct that
+    /// declares the matching dunder(s) (hand-written or `@derive`d) satisfies the
+    /// capability. Otherwise a **value struct** auto-derives `Equatable`/`Hashable`
+    /// iff every field has the capability; a **reference struct** never
+    /// auto-derives (identity is its default, D-0023). Ordering requires an
+    /// explicit `__cmp__` / `@derive(Ord)` for both.
+    fn struct_has_capability(
+        &self,
+        name: &str,
+        s: &StructDef,
+        cap: Capability,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), Vec<String>> {
+        let kind = if s.is_value { "value struct" } else { "struct" };
+        if cap == Capability::Comparable {
+            return if provides_dunder(&s.methods, &s.decorators, "__cmp__", "Ord") {
+                Ok(())
+            } else {
+                Err(vec![format!(
+                    "{kind} '{name}' does not implement 'Comparable': it has no '__cmp__' method \
+                     and does not '@derive(Ord)' (ordering is never auto-derived — it is a choice)"
+                )])
+            };
+        }
+        let has_eq = provides_dunder(&s.methods, &s.decorators, "__eq__", "Eq");
+        let has_hash = provides_dunder(&s.methods, &s.decorators, "__hash__", "Hash");
+        if !s.is_value {
+            // A reference struct satisfies Eq/Hash only by declaring the dunder(s)
+            // itself — no auto-derive (D-0023).
+            let ok = match cap {
+                Capability::Equatable => has_eq,
+                Capability::Hashable => has_eq && has_hash,
+                Capability::Comparable => unreachable!(),
+            };
+            return if ok {
+                Ok(())
+            } else {
+                Err(vec![format!(
+                    "{kind} '{name}' does not implement '{}': a reference struct does not \
+                     auto-derive it — add the dunder(s) or '@derive(...)' (identity is the \
+                     default, D-0023)",
+                    cap.name()
+                )])
+            };
+        }
+        self.aggregate_eq_hash(
+            &format!("{kind} '{name}'"),
+            cap,
+            has_eq,
+            has_hash,
+            s.fields.iter().map(|f| (f.name.as_str(), &f.ty)),
+            visited,
+        )
+    }
+
+    /// Shared `Equatable`/`Hashable` rule for a value aggregate (a `value struct`
+    /// or a tier-3 `enum`, D-0139/#808/#809): a declared matching dunder set wins;
+    /// otherwise, with neither `__eq__` nor `__hash__` declared, the aggregate
+    /// auto-derives the capability iff every field/payload has it. A *partial*
+    /// override (exactly one of `__eq__`/`__hash__`) blocks auto-derive and does
+    /// not satisfy `Hashable`. `visited` guards against reference cycles.
+    fn aggregate_eq_hash<'f>(
+        &self,
+        who: &str,
+        cap: Capability,
+        has_eq: bool,
+        has_hash: bool,
+        fields: impl Iterator<Item = (&'f str, &'f Type)>,
+        visited: &mut HashSet<String>,
+    ) -> Result<(), Vec<String>> {
+        // A declared dunder set is authoritative.
+        match cap {
+            Capability::Equatable if has_eq => return Ok(()),
+            Capability::Hashable if has_eq && has_hash => return Ok(()),
+            _ => {}
+        }
+        // A partial override opts out of auto-derive.
+        if has_eq || has_hash {
+            return Err(vec![format!(
+                "{who} does not implement '{}': it declares one of '__eq__'/'__hash__' but not \
+                 both, which opts out of auto-derive (declare both, or neither)",
+                cap.name()
+            )]);
+        }
+        if !visited.insert(who.to_string()) {
+            return Ok(()); // cycle guard (value aggregates cannot truly cycle)
+        }
+        let mut reasons = Vec::new();
+        for (fname, fty) in fields {
+            if let Err(rs) = self.type_has_capability(fty, cap, visited) {
+                let detail = rs.into_iter().next().unwrap_or_default();
+                reasons.push(format!(
+                    "{who} does not implement '{}': field '{fname}' of type '{}' does not ({detail})",
+                    cap.name(),
+                    type_name(fty)
+                ));
+            }
+        }
+        visited.remove(who);
         if reasons.is_empty() {
             Ok(())
         } else {
@@ -3162,6 +3540,223 @@ mod tests {
         assert!(
             msg.contains("method 'show' has a mismatched signature"),
             "signature mismatch is reported, got: {msg}"
+        );
+    }
+
+    // ---- capability bounds on user generic containers (D-0139/I#811) ------
+    //
+    // A capability interface (`Equatable`/`Hashable`/`Comparable`) is satisfied
+    // intrinsically by the shape of the concrete argument, so a user generic
+    // container admits exactly the element types a built-in container does.
+
+    const BST: &str = "value struct BST[K: Comparable, V]:\n    K key\n    V val\n\
+         \x20   def get(self) -> V:\n        return self.val\n";
+    const HMAP: &str = "value struct HMap[K: Hashable, V]:\n    K k\n    V v\n\
+         \x20   def get(self) -> V:\n        return self.v\n";
+
+    #[test]
+    fn comparable_bound_accepts_scalar_keys() {
+        // Every scalar (ints, str, char, float, bool) is intrinsically
+        // Comparable. A field of the instance type requests the instantiation, so
+        // the bound is checked without needing a method body.
+        for key in ["int64", "str", "char", "float64", "bool", "uint32", "bytes"] {
+            let prog =
+                format!("{BST}struct _Use:\n    BST[{key}, int64] b\ndef main():\n    print(0)\n");
+            assert!(
+                monomorphize(&parse_str(&prog).0).is_ok(),
+                "scalar key '{key}' must satisfy the Comparable bound"
+            );
+        }
+    }
+
+    #[test]
+    fn comparable_bound_accepts_tier1_enum_key() {
+        let prog = format!(
+            "enum Color:\n    Red\n    Green\n{BST}struct _Use:\n    BST[Color, int64] b\n\
+             def main():\n    print(0)\n"
+        );
+        assert!(
+            monomorphize(&parse_str(&prog).0).is_ok(),
+            "a tier-1 enum is intrinsically Comparable"
+        );
+    }
+
+    #[test]
+    fn comparable_bound_accepts_value_struct_deriving_ord() {
+        let prog = format!(
+            "@derive(Eq, Ord)\nvalue struct P:\n    int64 x\n{BST}struct _Use:\n    BST[P, int64] b\n\
+             def main():\n    print(0)\n"
+        );
+        assert!(
+            monomorphize(&parse_str(&prog).0).is_ok(),
+            "a value struct with @derive(Ord) satisfies Comparable"
+        );
+    }
+
+    #[test]
+    fn comparable_bound_rejects_non_comparable_struct_naming_capability() {
+        // The keystone acceptance case: a struct with no ordering is rejected at
+        // instantiation, and the message names the capability + why.
+        let msg = mono_err(&format!(
+            "struct Widget:\n    int64 w\n{BST}struct _Use:\n    BST[Widget, int64] b\n\
+             def main():\n    print(0)\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Comparable'")
+                && msg.contains("type parameter 'K'")
+                && msg.contains("of type 'BST'")
+                && msg.contains("no '__cmp__'")
+                && msg.contains("@derive(Ord)"),
+            "capability-named rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn comparable_bound_rejects_value_struct_without_ord() {
+        // A plain value struct auto-derives Eq/Hash but never ordering: it does
+        // not satisfy Comparable (ordering is a choice).
+        let msg = mono_err(&format!(
+            "value struct Plain:\n    int64 x\n{BST}struct _Use:\n    BST[Plain, int64] b\n\
+             def main():\n    print(0)\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Comparable'")
+                && msg.contains("ordering is never auto-derived"),
+            "value struct without Ord is not Comparable, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn hashable_bound_accepts_value_struct_auto_and_derived() {
+        for decl in [
+            "value struct P:\n    int64 x\n    int64 y\n", // auto-derive (#808)
+            "@derive(Eq, Hash)\nvalue struct P:\n    int64 x\n",
+            "@derive(Eq, Hash)\nstruct P:\n    int64 x\n", // reference struct with the pair
+        ] {
+            let prog = format!(
+                "{decl}{HMAP}struct _Use:\n    HMap[P, str] h\ndef main():\n    print(0)\n"
+            );
+            assert!(
+                monomorphize(&parse_str(&prog).0).is_ok(),
+                "P must satisfy Hashable for:\n{decl}"
+            );
+        }
+    }
+
+    #[test]
+    fn hashable_bound_refinement_carries_equatable() {
+        // `Hashable` refines `Equatable` (#806): a type satisfying Hashable is
+        // usable where Equatable is required too. A `value struct P` auto-derives
+        // both, so it satisfies an `Equatable` bound.
+        let prog = "value struct P:\n    int64 x\nvalue struct EqBox[K: Equatable]:\n    K k\n\
+             struct _Use:\n    EqBox[P] e\ndef main():\n    print(0)\n";
+        assert!(
+            monomorphize(&parse_str(prog).0).is_ok(),
+            "a Hashable (auto-derived) value struct is Equatable"
+        );
+    }
+
+    #[test]
+    fn hashable_bound_rejects_reference_struct_with_only_eq() {
+        // A partial set (`@derive(Eq)` only) does not satisfy Hashable: a
+        // reference struct needs both dunders.
+        let msg = mono_err(&format!(
+            "@derive(Eq)\nstruct RK:\n    int64 x\n{HMAP}struct _Use:\n    HMap[RK, str] h\n\
+             def main():\n    print(0)\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Hashable'")
+                && msg.contains("does not auto-derive"),
+            "reference struct with only Eq is not Hashable, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn hashable_bound_names_the_blocking_field_of_a_value_aggregate() {
+        // A value struct whose field is a mutable collection does not auto-derive
+        // Hashable; the diagnostic names the blocking field and its type.
+        let msg = mono_err(&format!(
+            "value struct Bad:\n    list[int64] items\n{HMAP}struct _Use:\n    HMap[Bad, str] h\n\
+             def main():\n    print(0)\n"
+        ));
+        assert!(
+            msg.contains("does not satisfy the bound 'Hashable'")
+                && msg.contains("field 'items'")
+                && msg.contains("list[int64]")
+                && msg.contains("mutable collection"),
+            "blocking field named, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn hashable_bound_accepts_tier3_enum_with_hashable_payloads() {
+        // Uniform with built-in dict/set keys (#809): a data-carrying enum whose
+        // payloads are all hashable auto-satisfies Hashable.
+        let prog = format!(
+            "enum Shape:\n    Circle(int64 r)\n    Rect(int64 w, int64 h)\n{HMAP}\
+             struct _Use:\n    HMap[Shape, str] h\ndef main():\n    print(0)\n"
+        );
+        assert!(
+            monomorphize(&parse_str(&prog).0).is_ok(),
+            "a tier-3 enum with hashable payloads satisfies Hashable"
+        );
+    }
+
+    #[test]
+    fn hashable_bound_rejects_list_and_bigint_keys() {
+        for (key, needle) in [
+            ("list[int64]", "mutable collection"),
+            ("bigint", "no representation"),
+        ] {
+            let msg = mono_err(&format!(
+                "{HMAP}struct _Use:\n    HMap[{key}, str] h\ndef main():\n    print(0)\n"
+            ));
+            assert!(
+                msg.contains("does not satisfy the bound 'Hashable'") && msg.contains(needle),
+                "key '{key}' rejected with '{needle}', got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_user_container_of_user_container_instantiates() {
+        // A user container whose value is another user container instance: both
+        // bounds are enforced and both instances are emitted.
+        let prog = format!(
+            "{HMAP}struct _Use:\n    HMap[int64, HMap[str, int64]] outer\ndef main():\n    print(0)\n"
+        );
+        let m = monomorphize(&parse_str(&prog).0).expect("nested instantiation succeeds");
+        assert!(
+            m.items
+                .iter()
+                .any(|i| matches!(i, Item::Struct(s) if s.name.starts_with("HMap$"))),
+            "a specialized HMap instance is emitted"
+        );
+    }
+
+    #[test]
+    fn user_interface_refining_capability_flattens_requirement() {
+        // A user `interface Keyish: Hashable` used as a bound carries the
+        // capability requirement: a value struct satisfying Hashable *and* the
+        // interface's own method conforms; one missing `__hash__` (reference
+        // struct, only its own method) is rejected, naming the supertype.
+        let base = "interface Keyish: Hashable\n    def tag(self) -> int64\n\
+             value struct Good:\n    int64 x\n    def tag(self) -> int64:\n        return self.x\n\
+             value struct Box[K: Keyish]:\n    K k\n";
+        let ok = format!("{base}struct _Use:\n    Box[Good] b\ndef main():\n    print(0)\n");
+        assert!(
+            monomorphize(&parse_str(&ok).0).is_ok(),
+            "a value struct that is Hashable and has tag() conforms to Keyish"
+        );
+        let bad = "interface Keyish: Hashable\n    def tag(self) -> int64\n\
+             struct Ref:\n    int64 x\n    def tag(self) -> int64:\n        return self.x\n\
+             value struct Box[K: Keyish]:\n    K k\n";
+        let msg = mono_err(&format!(
+            "{bad}struct _Use:\n    Box[Ref] b\ndef main():\n    print(0)\n"
+        ));
+        assert!(
+            msg.contains("'Hashable'") && msg.contains("supertype 'Hashable'"),
+            "the refined capability supertype requirement is attributed, got: {msg}"
         );
     }
 
