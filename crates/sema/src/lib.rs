@@ -1562,6 +1562,24 @@ impl Checker {
             // pointer, a tier-1 enum boxes its scalar tag into a heap cell. All
             // boxing is emitted in lowering.
             (Ty::Named(s), Ty::Named(i)) if self.is_interface(i) => self.conforms(s, i).is_ok(),
+            // Element-wise interface coercion at collection VALUE positions
+            // (#831, a D-0016 clarification): admit a concrete conformer where an
+            // interface element is expected — a `list`/`array` element or a
+            // `dict` **value** — exactly where `assignable` already permits
+            // collection covariance (the scalar `list[int32] -> list[int64]`
+            // rule), lifting the same `struct/enum -> interface` conversion one
+            // level in. This is not an interface special case: the recursion
+            // routes through `coercible`, so an element widens by any rule
+            // `assignable`/`coercible` already allows (and nests —
+            // `list[list[Shape]]`). The matching IR boxing is in place (#829/#832:
+            // `box_elem_for_store`), so an admitted literal/binding lowers
+            // end-to-end. KEYS STAY EXACT: a `dict` key (and a `set` member,
+            // which has no arm here) is a hash position and an interface value is
+            // unhashable, so the key uses `assignable` — a conformer key is still
+            // rejected. Channels are invariant (`assignable` has no channel arm),
+            // so they are untouched too.
+            (Ty::List(a), Ty::List(b)) => self.coercible(a, b),
+            (Ty::Dict(ak, av), Ty::Dict(bk, bv)) => assignable(ak, bk) && self.coercible(av, bv),
             _ => false,
         }
     }
@@ -1573,14 +1591,131 @@ impl Checker {
     /// from one (D-0139/#806), e.g. "missing method '__eq__' (required by
     /// supertype 'Equatable')".
     fn conformance_detail(&self, from: &Ty, to: &Ty) -> String {
-        if let (Ty::Named(s), Ty::Named(i)) = (from, to) {
-            if self.is_interface(i) {
+        match (from, to) {
+            (Ty::Named(s), Ty::Named(i)) if self.is_interface(i) => {
                 if let Err(reasons) = self.conforms(s, i) {
                     return format!(" ({s} does not satisfy '{i}': {})", reasons.join("; "));
                 }
+                String::new()
             }
+            // Descend collection VALUE positions (#831) so a rejected
+            // `list[Bad] -> list[Shape]` / `dict[K, Bad] -> dict[K, Shape]`
+            // still explains *why* the element does not conform. Keys are not a
+            // conformance position, so they are not descended.
+            (Ty::List(a), Ty::List(b)) => self.conformance_detail(a, b),
+            (Ty::Dict(_, a), Ty::Dict(_, b)) => self.conformance_detail(a, b),
+            _ => String::new(),
         }
-        String::new()
+    }
+
+    /// Does a collection literal's inferred type `vt` carry `Ty::Unknown` at a
+    /// VALUE position where the declared type `dt` expects an interface (#831)?
+    ///
+    /// `infer_display_elems` / `infer_dict_items` `join` a literal of *distinct*
+    /// element types to `Ty::Unknown` (e.g. `[Tri(), Quad()]` → `list[Unknown]`,
+    /// `[Bad(), Other()]` → `list[Unknown]`). `coercible` then lets `Unknown`
+    /// flow into any element, so BOTH a heterogeneous literal of genuine
+    /// conformers and one holding a non-conformer slip the top-level check even
+    /// though only the former should be admitted — and a slipped non-conformer
+    /// later crashes lowering (`'Bad__sides' not implemented`). This predicate
+    /// (pure; no re-inference) flags that slip so the caller re-verifies the
+    /// literal's element *expressions*. It descends collection value positions
+    /// (nested `list[list[Shape]]`), matching `coercible`; keys are never a
+    /// conformance position and are not descended.
+    fn collection_literal_needs_elem_recheck(&self, vt: &Ty, dt: &Ty) -> bool {
+        match (vt, dt) {
+            (Ty::List(ve), Ty::List(de)) => {
+                (matches!(**ve, Ty::Unknown) && self.ty_mentions_interface(de))
+                    || self.collection_literal_needs_elem_recheck(ve, de)
+            }
+            (Ty::Dict(_, vv), Ty::Dict(_, dv)) => {
+                (matches!(**vv, Ty::Unknown) && self.ty_mentions_interface(dv))
+                    || self.collection_literal_needs_elem_recheck(vv, dv)
+            }
+            _ => false,
+        }
+    }
+
+    /// Does `t`, or a VALUE position nested inside it, name an interface (#831)?
+    /// Used to decide whether an `Unknown`-widened literal element could hide a
+    /// (non-)conformer that must be re-verified against a declared interface.
+    fn ty_mentions_interface(&self, t: &Ty) -> bool {
+        match t {
+            Ty::Named(n) => self.is_interface(n),
+            Ty::List(e) => self.ty_mentions_interface(e),
+            Ty::Dict(_, v) => self.ty_mentions_interface(v),
+            _ => false,
+        }
+    }
+
+    /// Re-verify each VALUE-position element *expression* of a collection
+    /// display literal against the declared element type `dt` (#831), used when
+    /// [`collection_literal_needs_elem_recheck`] reports that the literal's
+    /// inferred element widened to `Ty::Unknown` against a declared interface.
+    /// A non-conforming element is a clean `ZAP4001` at its own span (so
+    /// `[Bad(), Other()]` is rejected here instead of crashing lowering), while a
+    /// heterogeneous literal of genuine conformers (`[Tri(), Quad()]`) passes by
+    /// real conformance. Nested displays descend; `dict` keys and `set` members
+    /// are hash positions, never descended (an interface value is unhashable).
+    fn verify_collection_literal_conformance(&mut self, value: &Expr, dt: &Ty) {
+        match (value, dt) {
+            (Expr::List(elems, _), Ty::List(de)) => {
+                for el in elems {
+                    // A `*expr` splat contributes its already-checked element
+                    // type via iteration, not a value expression to re-check.
+                    if let Expr::Starred { .. } = el {
+                        continue;
+                    }
+                    self.verify_elem_expr_conformance(el, de);
+                }
+            }
+            (Expr::Dict(items, _), Ty::Dict(_, dv)) => {
+                for it in items {
+                    if let DictItem::Pair(_, v) = it {
+                        self.verify_elem_expr_conformance(v, dv);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Verify one VALUE-position element expression `el` against the declared
+    /// element type `elem_ty` (#831). A nested display descends; a leaf whose
+    /// declared type is an interface must structurally conform (else `ZAP4001`);
+    /// any other declared type is left to the ordinary checker.
+    fn verify_elem_expr_conformance(&mut self, el: &Expr, elem_ty: &Ty) {
+        match (el, elem_ty) {
+            (Expr::List(_, _), Ty::List(_)) | (Expr::Dict(_, _), Ty::Dict(_, _)) => {
+                self.verify_collection_literal_conformance(el, elem_ty);
+            }
+            (_, Ty::Named(iname)) if self.is_interface(iname) => {
+                let et = self.infer(el);
+                if !self.coercible(&et, elem_ty) {
+                    self.error(
+                        ErrorCode::ZAP4001,
+                        format!(
+                            "collection element of type {} does not conform to interface '{}'{}",
+                            et.display(),
+                            iname,
+                            self.conformance_detail(&et, elem_ty),
+                        ),
+                        expr_span(el),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Check that collection *display literal* `value` (inferred type `vt`),
+    /// assigned where `dt` is expected, does not slip a non-conformer through
+    /// the `Ty::Unknown`-widening of a heterogeneous literal (#831). A no-op
+    /// unless the slip applies; see [`collection_literal_needs_elem_recheck`].
+    fn check_collection_literal_elems(&mut self, value: &Expr, vt: &Ty, dt: &Ty) {
+        if self.collection_literal_needs_elem_recheck(vt, dt) {
+            self.verify_collection_literal_conformance(value, dt);
+        }
     }
 
     /// Check that struct `sname` structurally conforms to interface `iname`
@@ -3029,6 +3164,7 @@ impl Checker {
                                 expr_span(value),
                             );
                         }
+                        self.check_collection_literal_elems(value, &vt, &dt);
                         dt
                     }
                 };
@@ -3441,6 +3577,7 @@ impl Checker {
                                 expr_span(value),
                             );
                         }
+                        self.check_collection_literal_elems(value, &vt, &dt);
                         dt
                     }
                 };
@@ -3475,6 +3612,7 @@ impl Checker {
                                     expr_span(value),
                                 );
                             }
+                            self.check_collection_literal_elems(value, &vt, &dt);
                         }
                         None => self.error(
                             ErrorCode::ZAP3002,
@@ -3518,6 +3656,7 @@ impl Checker {
                                             expr_span(value),
                                         );
                                     }
+                                    self.check_collection_literal_elems(value, &vt, &dt);
                                 }
                                 None => self.error(
                                     ErrorCode::ZAP3002,
@@ -3766,6 +3905,7 @@ impl Checker {
                             expr_span(e),
                         );
                     }
+                    self.check_collection_literal_elems(e, &vt, &ret);
                 }
                 None => {
                     if !matches!(self.ret_ty, Ty::Unit | Ty::Unknown) {
@@ -7661,6 +7801,386 @@ mod tests {
             m.contains("missing method 'name'") && m.contains("supertype 'Named'"),
             "missing inherited method names the supertype; got:\n{m}"
         );
+    }
+
+    // ---- #831: interface conformers at collection VALUE positions ---------
+    //
+    // `coercible`/`assignable` only lifted a TOP-LEVEL `struct/enum -> interface`
+    // conversion (D-0016). These exercise the clarification that the same
+    // conversion is admitted one level in, at collection value positions (list
+    // element, dict value) — wherever `assignable` already permits collection
+    // covariance — while keys stay exact, and the heterogeneous-`Unknown`
+    // literal slip is closed (a non-conformer is a clean ZAP4001, not a codegen
+    // crash). IR boxing is the #829/#832 counterpart; see the ir crate tests.
+
+    #[test]
+    fn single_conformer_list_element_is_accepted() {
+        // The core repro: a SINGLE conformer keeps its concrete element type
+        // (`list[Tri]`, not widened to Unknown), so it exercises the `coercible`
+        // descent — not the old Unknown bypass that only a heterogeneous literal
+        // triggered. The element dispatches as an interface value.
+        ok(r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    list[Shape] xs = [Tri()]
+    print(xs[0].sides())
+"#);
+    }
+
+    #[test]
+    fn single_conformer_dict_value_is_accepted() {
+        // The dict VALUE position admits a conformer (`dict[int, Tri]` ->
+        // `dict[int, Shape]`); the key type is exact (`int`).
+        ok(r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    dict[int, Shape] d = {1: Tri()}
+    print(d[1].sides())
+"#);
+    }
+
+    #[test]
+    fn tier3_enum_conformer_list_element_is_accepted() {
+        // A tier-3 (data-carrying) enum conformer as a `list[Iface]` element
+        // (ties to #731/#828: enums conform structurally).
+        ok(r#"
+interface Node:
+    def rank(self) -> int
+
+enum Expr:
+    Lit(int v)
+    Add(int l, int r)
+
+    def rank(self) -> int:
+        return 1
+
+def main():
+    list[Node] xs = [Expr.Lit(v=5)]
+    print(xs[0].rank())
+"#);
+    }
+
+    #[test]
+    fn tier1_enum_conformer_list_element_is_accepted() {
+        // A tier-1 (unboxed-integer) enum conformer as a `list[Iface]` element;
+        // lowering boxes the scalar tag into the fat pointer (#731/#829).
+        ok(r#"
+interface Ranked:
+    def rank(self) -> int
+
+enum Color:
+    Red
+    Green
+    Blue
+
+    def rank(self) -> int:
+        return 7
+
+def main():
+    list[Ranked] xs = [Color.Green]
+    print(xs[0].rank())
+"#);
+    }
+
+    #[test]
+    fn refined_supertype_list_element_is_accepted() {
+        // #831 + D-0139/#806: the declared element is a REFINED interface, and a
+        // type conforming through the transitive supertype is admitted as an
+        // element; both the own and the inherited method dispatch.
+        ok(r#"
+interface Named:
+    def name(self) -> int
+
+interface Ranked: Named
+    def rank(self) -> int
+
+struct Color:
+    def name(self) -> int:
+        return 0
+    def rank(self) -> int:
+        return 9
+
+def main():
+    list[Ranked] xs = [Color()]
+    print(xs[0].name())
+    print(xs[0].rank())
+"#);
+    }
+
+    #[test]
+    fn nested_list_of_iface_is_accepted() {
+        // The descent recurses: `list[list[Shape]]` admits a conformer at the
+        // innermost value position.
+        ok(r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    list[list[Shape]] xs = [[Tri()]]
+    print(xs[0][0].sides())
+"#);
+    }
+
+    #[test]
+    fn heterogeneous_conformer_dict_values_are_accepted() {
+        // Distinct conformer VALUES widen to `dict[int, Unknown]`; the re-check
+        // admits them by real conformance (not the Unknown bypass).
+        ok(r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+struct Quad:
+    def sides(self) -> int:
+        return 4
+
+def main():
+    dict[int, Shape] d = {1: Tri(), 2: Quad()}
+    print(d[1].sides())
+"#);
+    }
+
+    #[test]
+    fn iface_list_returned_single_conformer_is_accepted() {
+        // The descent applies at the RETURN position too.
+        ok(r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def make() -> list[Shape]:
+    return [Tri()]
+
+def main():
+    print(make()[0].sides())
+"#);
+    }
+
+    #[test]
+    fn single_non_conformer_list_element_is_rejected() {
+        // A single non-conformer keeps its concrete type (`list[Bad]`) and is
+        // rejected with the conformance reason descended into the element.
+        let m = msgs(
+            r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Bad:
+    def nope(self) -> int:
+        return 0
+
+def main():
+    list[Shape] xs = [Bad()]
+"#,
+        );
+        assert!(
+            m.contains("Bad") && m.contains("Shape") && m.contains("does not satisfy"),
+            "single non-conformer rejected with reason; got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn heterogeneous_non_conformers_list_is_rejected_cleanly() {
+        // THE secondary hazard (#831): `[Bad(), Other()]` joins to
+        // `list[Unknown]`, which used to slip sema and then crash lowering
+        // (`'Bad__sides' not implemented`). It must now be a clean ZAP4001 at the
+        // binding — a sema error, never a codegen crash.
+        let m = msgs(
+            r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Bad:
+    def nope(self) -> int:
+        return 0
+
+struct Other:
+    def meh(self) -> int:
+        return 1
+
+def main():
+    list[Shape] xs = [Bad(), Other()]
+"#,
+        );
+        assert!(
+            m.contains("does not conform") && m.contains("Shape"),
+            "heterogeneous non-conformers rejected naming the interface; got:\n{m}"
+        );
+        assert!(
+            !m.contains("not implemented"),
+            "must be a sema error, not a codegen crash; got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn mixed_conformer_and_non_conformer_list_is_rejected() {
+        // `[Tri(), Bad()]` -> `list[Unknown]`: the re-check admits `Tri` and
+        // rejects only `Bad`, so a genuine conformer is never flagged.
+        let m = msgs(
+            r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+struct Bad:
+    def nope(self) -> int:
+        return 0
+
+def main():
+    list[Shape] xs = [Tri(), Bad()]
+"#,
+        );
+        assert!(
+            m.contains("Bad") && m.contains("does not conform"),
+            "the non-conforming element is rejected; got:\n{m}"
+        );
+        assert!(
+            !m.contains("type Tri does not conform"),
+            "the genuine conformer must NOT be flagged; got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn dict_value_non_conformer_is_rejected() {
+        let m = msgs(
+            r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Bad:
+    def nope(self) -> int:
+        return 0
+
+def main():
+    dict[int, Shape] d = {1: Bad()}
+"#,
+        );
+        assert!(
+            m.contains("Shape") && m.contains("Bad"),
+            "a non-conforming dict value is rejected; got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn heterogeneous_non_conformer_dict_values_are_rejected_cleanly() {
+        // The dict-value analogue of the hazard: `{1: Bad(), 2: Other()}` widens
+        // to `dict[int, Unknown]` and must be rejected, not slipped.
+        let m = msgs(
+            r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Bad:
+    def nope(self) -> int:
+        return 0
+
+struct Other:
+    def meh(self) -> int:
+        return 1
+
+def main():
+    dict[int, Shape] d = {1: Bad(), 2: Other()}
+"#,
+        );
+        assert!(
+            m.contains("does not conform") && m.contains("Shape"),
+            "heterogeneous non-conformer dict values rejected; got:\n{m}"
+        );
+        assert!(
+            !m.contains("not implemented"),
+            "must be a sema error, not a codegen crash; got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn iface_dict_key_conformer_is_rejected_keys_stay_exact() {
+        // VALUE positions gain conformance, but KEYS stay exact: an interface
+        // value is unhashable, so a conformer at a `dict` KEY is still rejected.
+        let m = msgs(
+            r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    dict[Shape, int] d = {Tri(): 1}
+"#,
+        );
+        assert!(
+            !m.is_empty(),
+            "a conformer at a dict key is rejected (keys stay exact); got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn iface_set_member_conformer_is_rejected_members_stay_exact() {
+        // A `set` member is a hash position too, so a conformer set member is
+        // still rejected (consistent with dict keys, per the maintainer ruling).
+        let m = msgs(
+            r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    set[Shape] s = {Tri()}
+"#,
+        );
+        assert!(
+            !m.is_empty(),
+            "a conformer at a set member is rejected (members stay exact); got:\n{m}"
+        );
+    }
+
+    #[test]
+    fn empty_list_into_iface_list_is_accepted() {
+        // An empty literal infers `list[Unknown]` with no element expressions;
+        // the re-check loops zero times, so it stays accepted (then `append`
+        // supplies the conformers).
+        ok(r#"
+interface Shape:
+    def sides(self) -> int
+
+struct Tri:
+    def sides(self) -> int:
+        return 3
+
+def main():
+    list[Shape] xs = []
+    xs.append(Tri())
+    print(xs[0].sides())
+"#);
     }
 
     // ---- crypto asymmetric-key surface (#643, D-0126) ---------------------
