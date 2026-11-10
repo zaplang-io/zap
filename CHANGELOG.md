@@ -36,10 +36,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   (recursively; float payloads inherit the #803 key semantics), synthesized on
   demand like a tuple key; a non-hashable payload (e.g. a `list`) makes it a clean
   "not hashable" error at key use, not an ICE. Not gated on #731 (enum→interface
-  value). *Follow-ups:* a custom tier-1 `__cmp__` does not yet reroute `heap`/sort
-  order (heaps still order tier-1 enums by backing int); `heap` of a tier-3 enum
-  (needing explicit `Comparable`) and a `NaN` tier-3 float-payload key (the
-  indirect-hash exception-unwinding edge from #808) remain open.
+  value). *Follow-ups:* `heap[tier-1 enum]` lowers but aborts at runtime — a
+  pre-existing defect in the integer-heap element comparator (the push reaches
+  `zap_str_cmp`), surfaced by this work and left for a separate fix — so the
+  `heap[Color]` bullet and custom-`__cmp__` heap reordering are deferred; `heap`
+  of a tier-3 enum (needing explicit `Comparable`) and a `NaN` tier-3
+  float-payload key (the indirect-hash exception-unwinding edge from #808) also
+  remain open. Enum dict keys / set members — the headline — are complete.
 - **Value structs and tuples auto-derive `Equatable` + `Hashable`** (#808, epic
   #812, D-0139). A `value struct` (and a tuple) now auto-derives equality and
   hashing with **no `@derive`**, so it is usable as a `dict` key / `set` member and
