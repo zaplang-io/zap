@@ -12113,6 +12113,24 @@ impl<'a> FnLower<'a> {
                 let callable = self.lower_py_getattr(recv, name);
                 return self.lower_py_call(callable, args);
             }
+            // A capability dunder (`__cmp__`/`__eq__`/`__hash__`, D-0139) called by
+            // name on a value of an INTRINSIC type lowers to the same primitive op
+            // the operator surface (`<`, `==`, dict-key hashing) already emits, so
+            // the method and operator surfaces agree for every type a capability
+            // admits (I#820). This is reached when a generic bound parameter
+            // `[K: Comparable]` / `[K: Hashable]` is monomorphized to a scalar /
+            // `str` / `bytes` / `float` / tier-1 enum and the body names the dunder
+            // — such a value carries no method symbol to dispatch to, so without
+            // this it fell through to the string-method path (which does not define
+            // these) or the non-struct error below. Checked before the `str`
+            // dispatch so a `str` (`Ty::Ptr`) receiver routes here too; these three
+            // names are not string methods, so no `str` call is intercepted.
+            if matches!(name.as_str(), "__cmp__" | "__eq__" | "__hash__")
+                && (bty.int_width().is_some()
+                    || matches!(bty, Ty::F32 | Ty::F64 | Ty::Ptr | Ty::Bytes))
+            {
+                return self.lower_intrinsic_capability_dunder(recv, bty, name, args);
+            }
             // `str` methods (ticket #284): `str` lowers to `Ptr`, so a method
             // call on a `Ptr` receiver is a string method (sema has already
             // rejected any other `Ptr`-typed method receiver).
@@ -16655,6 +16673,78 @@ impl<'a> FnLower<'a> {
                 });
                 bit
             }
+        }
+    }
+
+    /// Lower an explicit capability-dunder call (`recv.__cmp__(x)` /
+    /// `recv.__eq__(x)` / `recv.__hash__()`, D-0139) on a value `recv` of an
+    /// intrinsic type `bty` (a scalar word — ints, `bool`, `char`, a tier-1 enum —
+    /// `bytes`, or a `float`). It emits the SAME primitive the operator surface and
+    /// the dict/set key path already use (via [`Self::elem_key_plan`] /
+    /// [`Self::emit_elem_hash`] / [`Self::emit_elem_eq`] / [`gen_field_cmp`]), so
+    /// the method and operator surfaces agree for every type a capability admits
+    /// (I#820). Reached from the method-call path when a bounded generic parameter
+    /// `[K: Comparable]`/`[K: Hashable]` is monomorphized to such a type and the
+    /// body names the dunder; a scalar has no method symbol to dispatch to, which
+    /// is why the plain struct-method path cannot handle it. `__cmp__` returns the
+    /// `i64` three-way (−1/0/+1), `__eq__` a `bool`, `__hash__` an `i64` — matching
+    /// the dunders' D-0047 signatures.
+    fn lower_intrinsic_capability_dunder(
+        &mut self,
+        recv: Value,
+        bty: Ty,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        // The receiver's key classification: `Int` (ints/bool/char/tier-1 enum),
+        // `Str` (`bytes`), or `Float`. A `Struct` plan cannot arise here (the
+        // caller gates on intrinsic `bty`), so anything else is a bug.
+        let key = self.elem_key_plan(bty)?;
+        match name {
+            "__hash__" => {
+                if !args.is_empty() {
+                    return Err(err("__hash__() takes no arguments (D-0047)"));
+                }
+                let h = self.emit_elem_hash(recv, bty, &key);
+                Ok((h, Ty::I64))
+            }
+            "__eq__" | "__cmp__" => {
+                if args.len() != 1 {
+                    return Err(err(format!(
+                        "{name}(self, other) takes exactly one argument (D-0047)"
+                    )));
+                }
+                // The argument is the `other` operand; it has the same intrinsic
+                // type as the receiver, so coerce it to `bty` and compare.
+                let (av, at) = self.expr(&args[0].value)?;
+                let other = self.coerce(av, at, bty);
+                if name == "__eq__" {
+                    let bit = self.emit_elem_eq(recv, other, &key);
+                    Ok((bit, Ty::I1))
+                } else {
+                    let c = match &key {
+                        // `bytes`/`str`: lexicographic byte compare, the same
+                        // `gen_field_cmp` routes a `Ptr` field through.
+                        ElemKey::Str => {
+                            let d = self.new_value(Ty::I64);
+                            self.emit(Inst::Call {
+                                dest: Some(d),
+                                func: "zap_str_cmp".to_string(),
+                                args: vec![recv, other],
+                            });
+                            d
+                        }
+                        // Ints/bool/char/tier-1 enum and floats: the shared
+                        // three-way compare (coerces integer widths to i64; floats
+                        // via `FCmp`).
+                        _ => gen_field_cmp(self, recv, other, bty)?,
+                    };
+                    Ok((c, Ty::I64))
+                }
+            }
+            other => Err(err(format!(
+                "'{other}' is not a capability method on an intrinsic value"
+            ))),
         }
     }
 

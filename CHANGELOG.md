@@ -863,6 +863,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **Explicit capability-dunder call on a scalar-bound generic parameter aborted at
+  lowering** (#820; surfaced by #811, epic #812, D-0139). Calling a capability
+  dunder by name — `k.__cmp__(x)`, `k.__eq__(x)`, `k.__hash__()` — on a value of a
+  type parameter bounded on `Comparable`/`Equatable`/`Hashable` failed with
+  `ZAP6001: method call on a non-struct value` whenever the parameter was
+  monomorphized to a scalar / `char` / tier-1 enum / `float` / `str` / `bytes`
+  (a pre-existing I#164 gap that also affected bounded free functions — only user
+  types carrying the actual method symbol lowered). The dunder now lowers to the
+  same primitive the operator surface (`<`, `==`) and the dict/set key path already
+  emit (three-way `zap_str_cmp` / integer compare / `FCmp`; `zap_i64_hash` /
+  `zap_str_hash` / the #803 float key word), so the method and operator surfaces
+  agree for every type a capability admits. The idiomatic operator form was
+  unaffected and continues to work.
 - **Indexed store of a `bool`/`char`/`int` collection element rejected with a
   self-contradictory "expects `i64`, found `i64`"** (#727; regression from #708,
   widened by #712). `int`, `bool` (`Elem::Bool`) and `char` (`Elem::Char`)
