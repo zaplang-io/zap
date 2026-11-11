@@ -7083,3 +7083,20 @@ constant with no per-use `zap_str_new`. The existing `dict`, `dict_float_key`,
 change. `crates/driver/tests/perf.rs` gains `dict_int` and `fstring_only` next to
 `dict_string` so each CI run reports the #837 within-run split (lenient floors
 only — never an exact time, per the GC-golden determinism rule).
+
+## D-0146 — No user-facing `inline` keyword: inlining is the optimizer's job (#837, #841, #842)
+
+**Status:** Locked. Zap exposes **no `inline` keyword, attribute, or pragma**, and will not add one. Whether a call is inlined is decided entirely by the toolchain, never by source-level annotation. This keeps the language surface free of a performance knob that is hard to use well, bit-rots against a changing cost model, and leaks implementation concerns into programs.
+
+**How inlining is actually delivered** (three layers, none of them a language feature):
+
+1. **LLVM `-O2`** inlines Zap-level `def`s within a compiled module today, under LLVM's own cost model. This already works and needs nothing from the language.
+2. **LTO of the runtime (#841).** The C runtime (`zaprt.c`) is compiled to a separate object, so at the program's optimize step its functions (`zap_dict_get`, `zap_str_concat`, `zap_i64_to_str`, …) are opaque external symbols the inliner cannot see — the out-of-line calls measured in #837. Shipping the runtime as LLVM bitcode and linking under LTO lets LLVM inline those hot paths across the program↔runtime boundary. This is the first, broadest lever.
+3. **Codegen open-coding (#842).** For the hottest operations (dict `get`/`set`, string `concat`, int→string) codegen emits the fast path directly as IR, with a runtime call only on the slow path — Go's `map`-access approach. This is the tightest form of inlining and is purely compiler-internal.
+
+**Consequences.**
+- `@inline`/`@noinline`-style source annotations are rejected (not reserved as future surface); the escape hatch for hand-tuned performance is the low-level/intrinsics track (#139), not an inline hint.
+- Correctness carve-out: a few runtime functions are deliberately `noinline` for semantics, not performance — notably `zap_shadow_head_addr` (must not be folded into a cached thread-pointer base; coroutine migration, I#223 / D-0144). LTO (#841) must preserve those attributes.
+- No grammar change (this decision adds no syntax, so `docs/GRAMMAR.ebnf` is unchanged); the point is precisely the absence of surface.
+
+**Context.** Arose from the Zap-vs-Go `dict_string` investigation (#837): the remaining gap to Go is partly that Go's compiler open-codes/inlines its runtime, which Zap can match via (2)+(3) above with no language change. Sequencing: #841 (LTO) first, then #842 (open-code) after the bucketed dict layout (#840).
