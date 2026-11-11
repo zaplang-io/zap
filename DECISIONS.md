@@ -7256,8 +7256,15 @@ toolchain, not annotations.**
    boundary. Everything stays on **LLVM 18**
    (the inkwell program IR and the `clang-18`/`llvm-link` runtime bitcode must
    match — no version skew). The single merged module is a deterministic,
-   closed-world inline; ThinLTO (to bound link time on large programs) is a
-   follow-up refinement.
+   closed-world inline; ThinLTO (to bound per-program optimize time on large
+   programs) is a follow-up refinement. **The runtime bitcode is cached** —
+   compiled + stripped once per (runtime source, collector, portable, clang,
+   triple) and reused across every build (published by atomic rename under
+   `$ZAP_LTO_CACHE`) — because it does not depend on the program; otherwise the
+   whole runtime was recompiled at `-O2` and the whole merged module re-stripped
+   for every program, which made an LTO golden/test run (hundreds of programs)
+   crawl. The program bitcode is stripped up front too, so the merged module
+   needs no per-build strip.
 
 3. **Codegen open-coding of the hottest ops is the next lever (#842),** sequenced
    AFTER this issue and the dict-layout change (#840): once the structure lands,

@@ -890,7 +890,10 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   `llvm-link`**, strips the per-function target/FP attributes that would block
   cross-function inlining, and optimizes that module with `opt -O2` before `clang`
   codegens + links it — so LLVM's cross-module inliner pulls those fast paths into
-  the generated hot loops (everything stays on LLVM 18, no version skew). The hot
+  the generated hot loops (everything stays on LLVM 18, no version skew). The
+  runtime bitcode is **cached** (compiled once per source/collector/clang/triple
+  and reused across builds) so an LTO build does not recompile the whole runtime
+  per program. The hot
   runtime ops are **split into a small `always_inline` fast path + a `noinline`
   slow path** (e.g. `zap_dict_get` inlines a first-probe identity check and
   tail-calls the out-of-line probe) so there is something small enough for the
