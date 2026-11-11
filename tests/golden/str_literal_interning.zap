@@ -23,6 +23,6 @@ def main():
     # The same literal reused many times stays one object.
     bool allsame = True
     for i in range(0, 1000):
-        if not ("intern_me" is a1):
+        if not "intern_me" is a1:
             allsame = False
     print(allsame)  # True

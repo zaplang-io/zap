@@ -20,7 +20,7 @@ def main():
 
     print("wör" in s)  # True
     print("zzz" in s)  # False
-    print(("hé" + "llo") == "héllo")  # True
+    print("hé" + "llo" == "héllo")  # True
 
     # Empty string: valid, zero length, compares equal to the empty literal.
     auto e = ""
