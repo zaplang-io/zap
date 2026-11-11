@@ -4,16 +4,23 @@
 //! linked against the program object, so at the program's optimize step the hot
 //! runtime fast paths (`zap_dict_get_str_i64`, …) are opaque external symbols the
 //! inliner never sees — every `d[k]` pays an out-of-line call (#837, #568). The
-//! `ZAP_LTO` build flag (D-0147) instead emits the program as LLVM bitcode and
-//! links it with the runtime under `clang -O2 -flto`, so LLVM's cross-module
-//! inliner pulls those fast paths into the generated hot loops.
+//! `ZAP_LTO` build flag (D-0147) instead emits the program as LLVM bitcode,
+//! merges it with the runtime bitcode (`llvm-link`), optimizes the whole with
+//! `opt -O2`, and lets LLVM's cross-module inliner pull the runtime fast paths
+//! into the generated hot loops. The dict get is split into a small
+//! `always_inline` fast path (first-probe identity hit) and a `noinline` slow
+//! path precisely so the fast path is small enough to cross that boundary while
+//! the bulky probe/resize logic stays out of line (see `zap_dict_get` in
+//! `zaprt.c`); `zap_dict_get_str_i64` is the thin typed wrapper the fast path
+//! folds into.
 //!
 //! This test is the DETERMINISTIC guard for that lever (the wall-clock trend is
 //! `perf.rs`): it builds a hot `dict[str,int64]` read/update loop with and
 //! without `ZAP_LTO`, disassembles the final binaries, and asserts that
 //!   1. the baseline binary really CALLS `zap_dict_get_str_i64` out of line
 //!      (otherwise the probe proves nothing), and
-//!   2. the LTO binary has NO out-of-line call to it (it was inlined), while
+//!   2. the LTO binary has NO out-of-line call to it (the fast path inlined into
+//!      the hot loop; the `noinline` slow path may still be called), while
 //!   3. the LTO binary STILL calls `zap_shadow_head_addr` — that helper carries
 //!      `__attribute__((noinline))` and must not be folded into a cached
 //!      thread-pointer base even under whole-program LTO, or a migrated

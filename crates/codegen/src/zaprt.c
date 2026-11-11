@@ -1962,12 +1962,20 @@ static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
 
 /* Missing-key get returns 0 (null word) for this increment; membership and a
  * real KeyError wait for the exception runtime (ticket #22). */
-static int64_t zap_dict_get(void *dp, int64_t key, int keykind) {
+/* Dict get is split into a small inlinable FAST path and an out-of-line SLOW
+ * path (#841, D-0147). The fast path handles the common case — the key is found
+ * at the FIRST probe by word/pointer IDENTITY — in a few instructions, and
+ * tail-calls the slow path for everything else (value comparison, probing,
+ * tombstones, misses, and user-struct keys). `always_inline` lets the fast path
+ * fold into the typed `zap_dict_get_*` wrappers, so under the LTO build LLVM's
+ * cross-module inliner pulls it into the generated hot loop; the slow path is
+ * `noinline` so it never bloats that inlinable fast path (a monolithic get is
+ * far over the inline threshold and would be left out of line, defeating the
+ * point — the measurement in #841). This also helps the ordinary object-link
+ * build: the wrapper now carries the fast check inline. */
+__attribute__((noinline)) static int64_t zap_dict_get_slow(void *dp, int64_t key,
+                                                            int keykind, uint64_t h) {
     ZapDict *d = (ZapDict *)dp;
-    if (d->cap == 0) {
-        return 0;
-    }
-    uint64_t h = zap_key_hash(key, keykind, d->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
     while (d->entries[j].state != SLOT_EMPTY) {
         /* Hash-word prefilter (#837) before the full key compare. */
@@ -1978,6 +1986,30 @@ static int64_t zap_dict_get(void *dp, int64_t key, int keykind) {
         j = (j + 1) & (d->cap - 1);
     }
     return 0;
+}
+
+__attribute__((always_inline)) static inline int64_t zap_dict_get(void *dp, int64_t key,
+                                                                  int keykind) {
+    ZapDict *d = (ZapDict *)dp;
+    if (d->cap == 0) {
+        return 0;
+    }
+    uint64_t h = zap_key_hash(key, keykind, d->hashfn);
+    int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
+    const ZapEntry *e = &d->entries[j];
+    /* Fast path: first probe hits by IDENTITY. For int keys the key word IS the
+     * value, so identity == equality. For string keys, identical ZapStr pointers
+     * (interned literals, D-0145, or any same-object key) are value-equal, so a
+     * repeated `d["k"]` short-circuits with no byte compare. Pointer identity is
+     * only ever a SUFFICIENT condition for equality here; anything it does not
+     * settle — a different object, a hash-word match needing a real compare, a
+     * probe past the first slot, a tombstone, or a miss — falls through to the
+     * slow path's full `zap_key_eq`. User-struct keys (KEY_FN) always take the
+     * slow path so a custom `__eq__` is always consulted. */
+    if (keykind != KEY_FN && e->state == SLOT_FULL && e->hash == h && e->key == key) {
+        return e->val;
+    }
+    return zap_dict_get_slow(dp, key, keykind, h);
 }
 
 int64_t zap_dict_len(void *d) { return ((ZapDict *)d)->len; }

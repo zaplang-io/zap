@@ -867,13 +867,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   external symbols the inliner never saw — every `d[k]` paid an out-of-line call
   (#837, #568). A new **`ZAP_LTO` build flag** instead emits the program as LLVM
   bitcode, compiles the runtime to bitcode, **merges the two into one module with
-  `llvm-link`**, and optimizes/codegens that module with `clang -O2`, so LLVM's
-  cross-module inliner pulls those fast paths into the generated hot loops
-  (everything stays on LLVM 18, no version skew). This also records the language
-  decision that **Zap has no `inline` keyword**: inlining is purely the
-  optimizer's job (`-O2` on `def`s, this LTO runtime boundary, and codegen
-  open-coding later), never a source annotation. The flag is **off by default**
-  (the non-LTO object-link path and its output are byte-for-byte unchanged); a
+  `llvm-link`**, strips the per-function target/FP attributes that would block
+  cross-function inlining, and optimizes that module with `opt -O2` before `clang`
+  codegens + links it — so LLVM's cross-module inliner pulls those fast paths into
+  the generated hot loops (everything stays on LLVM 18, no version skew). The hot
+  runtime ops are **split into a small `always_inline` fast path + a `noinline`
+  slow path** (e.g. `zap_dict_get` inlines a first-probe identity check and
+  tail-calls the out-of-line probe) so there is something small enough for the
+  cost model to inline into a loop; this also speeds the ordinary object-link
+  build. Records the language decision that **Zap has no `inline` keyword**:
+  inlining is purely the optimizer's job (`-O2` on `def`s, this LTO runtime
+  boundary, and codegen open-coding #842 later), never a source annotation. The
+  flag is **off by default** (unset ⇒ the unchanged object-link build); a
   toolchain image / CI opts in with `ZAP_LTO=1` (`ZAP_LTO_CC=clang-18`).
   Correctness is preserved under whole-program LTO: `zap_shadow_head_addr` keeps
   `noinline` (coroutine-migration GC safety, I#223/#568) and the GC-frame +

@@ -7187,10 +7187,29 @@ toolchain, not annotations.**
    the compiler emits the fast path for the very hottest ops directly, so even the
    call-site disappears. Same principle — the toolchain, not the source.
 
+**Runtime fast/slow split (so LTO has something small to inline).** Crossing the
+boundary is necessary but not sufficient: LLVM's cost model will not inline a
+*monolithic* runtime function (e.g. the ~300-byte dict probe) into a hot loop
+even once the modules are merged. So the hot runtime ops are structured as a
+small `always_inline` **fast path** + a `noinline` **slow path**: `zap_dict_get`
+now inlines a first-probe IDENTITY check (word identity for int keys; pointer
+identity for interned / same-object string keys — exactly the repeated `d["k"]`
+case, D-0145) and tail-calls the out-of-line `zap_dict_get_slow` for value
+comparison, probing, tombstones, misses and user-struct (`__eq__`) keys.
+Identity is only ever a *sufficient* condition for equality, so the fast path
+never returns a wrong answer. The fast path folds into the typed `zap_dict_get_*`
+wrappers, which the LTO cross-module inliner then pulls into generated code; the
+slow path stays a call. This also speeds the ordinary object-link build (the
+wrapper carries the fast check inline), so the runtime source is no longer
+byte-for-byte identical to pre-#841 — only the LTO *flag's* default-off
+no-op-ness is (see Gate / default).
+
 **Gate / default.** LTO is behind the `ZAP_LTO` environment build flag, read in
 `build_executable` exactly like `ZAP_PORTABLE` (no new parameter threaded through
-every caller, so the non-LTO object-link path and the binary it produces are
-**byte-for-byte unchanged** when unset). The default is **OFF**: the LTO link is
+every caller). When unset, the build takes the **unchanged object-link path** —
+compile the program to an object, compile the runtime, link — so turning the
+flag off is a true no-op on the build *mechanism* (the runtime fast/slow split
+above is a plain source change that applies to every build). The default is **OFF**: the LTO link is
 slower and, unlike the long-exercised object-link path, is newly introduced, so a
 toolchain image / CI opts in with `ZAP_LTO=1` (and `ZAP_LTO_CC=clang-18`) rather
 than it defaulting on before it has soaked. Flipping the default on for release
