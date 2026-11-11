@@ -7037,7 +7037,7 @@ scope; the string-ABI change (2) is the invasive one and is recorded here).
    descriptor becomes **ATOMIC** (the inline bytes carry no pointers, so the
    collector never scans them; evacuation copies the whole object by its stored
    object size, and the moving collector may relocate a string since all
-   references to it are rewritten — `is` identity is preserved). Every `s->data`
+   references to it are rewritten — relocation-transparent). Every `s->data`
    read site is unchanged (the flexible array decays to `char *`, recomputed from
    `s` on each access, so it stays correct after a relocation); only the
    construction sites (one `zap_str_alloc` + copy, replacing header+buffer) and
@@ -7057,9 +7057,11 @@ scope; the string-ABI change (2) is the invasive one and is recorded here).
    the one-object layout), reused at every use instead of re-allocating via
    `zap_str_new`. The static-data pointer is non-heap, so the moving collector
    leaves it untouched, and concat/format always allocate a fresh result so they
-   never mutate or free the shared constant. Same bytes ⇒ same object, giving
-   CPython-like `is` identity for string literals (value equality `==` is
-   unchanged; dict/set keying is by value, so collection behaviour is unaffected).
+   never mutate or free the shared constant. Interning is **transparent**: `str`
+   is a value type with no observable identity — `is` on `str` is a compile error
+   (ZAP4073, #611) — so same bytes sharing one object changes nothing
+   semantically. Value `==` and dict/set keying are by value, unaffected. This is
+   a pure allocation optimization.
 
 **Scope note.** The f-string lowering still builds each value-bearing piece with
 its own render (`zap_i64_to_str`) and a pairwise `zap_str_concat`; with (2) each
@@ -7072,9 +7074,9 @@ general N-way join helps only f-strings with ≥4 pieces (it adds a carrier for 
 **Tests.** New goldens `dict_string_keys_stress` (string-keyed dict forced across
 many resizes; cross-construction key equality), `str_one_object_layout`
 (construction, codepoint len/index/slice/iteration, concat, `in`, equality, empty,
-multibyte, `bytes` byte-length, f-strings), and `str_literal_interning` (`is`
-identity of interned literals vs runtime-built strings; concat non-destructive on
-the constant). A structural codegen IR test asserts a literal is one interned
+multibyte, `bytes` byte-length, f-strings), and `str_literal_interning` (interning
+is transparent — value `==` holds and concat/format are non-destructive on the
+shared constant across many reuses). A structural codegen IR test asserts a literal is one interned
 constant with no per-use `zap_str_new`. The existing `dict`, `dict_float_key`,
 `tuple_dict_key`, `char_dict_key_roundtrip`, `crypto_streaming`,
 `crypto_hmac_stream` and string/JSON goldens are the regression net for the layout

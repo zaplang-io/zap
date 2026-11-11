@@ -137,14 +137,15 @@ allocation, not a header plus a separate data buffer:
 - The string type descriptor is **ATOMIC** (the inline bytes hold no pointers, so
   the collector never scans them); the whole object is copied by its stored object
   size on evacuation, and the moving collector may relocate a string because every
-  reference to it is rewritten (`is` identity preserved). `s->data` is recomputed
+  reference to it is rewritten (relocation-transparent). `s->data` is recomputed
   from the object pointer on each access, so it stays valid after a relocation.
 - **Strings own their bytes:** a slice/concat/substring copies into a fresh
   one-object string (it does not alias the parent's buffer), which is always safe
   because strings are immutable.
 - **Literals are interned:** each distinct string literal is one never-freed
   constant-global `ZapStr` with this same layout, reused at every use (no per-use
-  allocation); same bytes ⇒ same object (CPython-like `is` identity for literals).
+  allocation). This is transparent — `str` is a value type with no observable
+  identity (`is` on `str` is a compile error), so it is a pure allocation win.
 - `bytes` shares the `ZapStr` representation (relabelled, no copy at the `str`↔
   `bytes` boundary); mutability per the strings design.
 

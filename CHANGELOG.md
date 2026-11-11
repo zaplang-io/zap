@@ -862,11 +862,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   header and bytes are contiguous (a flexible array member) rather than a header
   plus a separate char buffer — halving both the allocation count and the live-set
   tracing cost (the string ABI change; the string descriptor is now ATOMIC and the
-  collector may relocate a string, `is` identity preserved); and (3) **string
+  collector may relocate a string, relocation-transparent); and (3) **string
   literals are interned** — each distinct literal lowers to one never-freed
   constant-global `ZapStr` reused at every use instead of re-allocating per use, so
-  the constant prefix of an f-string key costs no allocations (same bytes ⇒ same
-  object, CPython-like `is` identity for literals; `==` and dict/set keying are
+  the constant prefix of an f-string key costs no allocations. Interning is
+  transparent (`str` is a value type with no observable identity — `is` on `str`
+  is a compile error — so `==` and dict/set keying, which are by value, are
   unchanged). Codepoint semantics, immutability, `bytes`↔`str`, JSON, equality and
   hashing are all preserved. `crates/driver/tests/perf.rs` now reports the
   `dict_string` / `dict_int` / `fstring_only` within-run split each CI run.

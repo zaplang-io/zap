@@ -525,9 +525,10 @@ struct Cg<'a, 'ctx> {
     /// Interned string-literal constants (#837, D-0145): distinct literal bytes ->
     /// a never-freed constant-global `ZapStr` `{ i64 len, [N x i8] bytes }` built
     /// once and reused at every `Inst::StrConst` use, instead of re-allocating a
-    /// fresh heap string via `zap_str_new` at each use site. Same bytes => same
-    /// object (CPython-like interning of string literals; the static-data pointer
-    /// is non-heap so the moving collector leaves it untouched).
+    /// fresh heap string via `zap_str_new` at each use site. Interning is
+    /// transparent — `str` is a value type with no observable identity (`is` on
+    /// `str` is a compile error), so this is a pure allocation optimization; the
+    /// static-data pointer is non-heap so the moving collector leaves it untouched.
     str_consts: std::cell::RefCell<std::collections::HashMap<Vec<u8>, PointerValue<'ctx>>>,
     /// The C++ exception personality routine's symbol name (ticket #197, Area A3,
     /// design/0019). The runtime's `landingpad`s name it and the backend lowers
@@ -3075,11 +3076,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 // matching the runtime's one-object layout (len @0, bytes @8). The
                 // literal is no longer re-allocated via `zap_str_new` at each use,
                 // so a constant prefix like the `"k"` of `f"k{i}"` costs zero heap
-                // allocations per iteration. Same bytes => same object (interned,
-                // CPython-like `is` identity for string literals); the static-data
-                // pointer is non-heap, so the moving collector leaves it alone and
-                // concat/format (which always allocate a fresh result) never mutate
-                // or free it.
+                // allocations per iteration. Interning is transparent — `str` is a
+                // value type with no observable identity (`is` on `str` is a compile
+                // error), so same bytes sharing one object changes nothing
+                // semantically; the static-data pointer is non-heap, so the moving
+                // collector leaves it alone and concat/format (which always allocate
+                // a fresh result) never mutate or free it.
                 let ptr = {
                     let mut cache = self.str_consts.borrow_mut();
                     if let Some(p) = cache.get(bytes.as_slice()) {

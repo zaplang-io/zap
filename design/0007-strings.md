@@ -75,8 +75,10 @@ below (header, ASCII flag) without changing the happy path that already works.
 > they do not share the parent's buffer (strings still own their bytes, which is
 > safe because strings are immutable); and (b) **string literals are interned** as
 > constant-global one-object `ZapStr`s (realizing "literals point at constant
-> data" as a whole constant object, reused per use, giving CPython-like `is`
-> identity). The `flags`/`is_ascii` word was never added; codepoint operations
+> data" as a whole constant object, reused per use). Interning is transparent —
+> `str` is a value type with no observable identity (`is` on `str` is a compile
+> error), so it is a pure allocation win. The `flags`/`is_ascii` word was never
+> added; codepoint operations
 > compute over the inline UTF-8 directly. The string type descriptor is ATOMIC
 > (inline bytes hold no pointers). See `design/RUNTIME-ABI.md` for the normative
 > layout.

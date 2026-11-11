@@ -1,28 +1,32 @@
-# Golden fixture (#837, D-0145): string-literal interning. Each distinct literal
-# lowers to ONE never-freed constant-global `ZapStr`, so two uses of the same
-# literal are the SAME object (CPython-like `is` identity), while a string built
-# at runtime (concat / f-string with a field) is a distinct heap object that is
-# `==`-equal but not `is`-equal. Interning must also be non-destructive: concat
-# reads the constant and allocates a fresh result, never mutating or freeing the
-# shared literal, so the literal is intact after being used in a concat.
+# Golden fixture (#837, D-0145): string-literal interning is TRANSPARENT. Each
+# distinct literal lowers to one never-freed constant-global `ZapStr` reused at
+# every use, but `str` is a value type with no observable identity (`is` on `str`
+# is a compile error, ZAP4073 / #611), so interning changes nothing semantically:
+# value `==` holds, and — the real risk this guards — concat/format read the
+# shared constant and allocate a fresh result, so they never mutate or free it.
 def main():
     auto a1 = "intern_me"
     auto a2 = "intern_me"
-    print(a1 is a2)  # True   (same interned literal object)
+    print(a1 == a2)  # True   (two uses of the same literal are value-equal)
 
+    # A string built at runtime equals the literal by value.
     auto built = "intern" + "_me"
-    print(a1 == built)  # True   (value equality)
-    print(a1 is built)  # False  (built is a fresh heap string)
+    print(a1 == built)  # True
 
-    # Using the literal in a concat does not corrupt or free it.
+    # Concatenation must NOT mutate or free the shared interned constant.
     auto combo = a1 + "!"
     print(combo)  # intern_me!
     print(a1)  # intern_me   (unchanged)
     print(len(a1))  # 9
 
-    # The same literal reused many times stays one object.
-    bool allsame = True
+    # Reuse the same literal in many concats; the constant stays intact each time
+    # (the concat's prefix is still the literal, and the literal itself is intact).
+    bool ok = True
     for i in range(0, 1000):
-        if not "intern_me" is a1:
-            allsame = False
-    print(allsame)  # True
+        auto t = "intern_me" + str(i)
+        if t[0:9] != "intern_me":
+            ok = False
+        if "intern_me" != a1:
+            ok = False
+    print(ok)  # True
+    print(a1)  # intern_me   (still intact after 1000 concats)
