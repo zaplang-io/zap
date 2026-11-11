@@ -227,8 +227,8 @@ not supported — it may change in **any** release, including a PATCH:
   no-argument `@shareable` marker on a `struct` is a *trusted, unverified*
   assertion that the type is safe under concurrent shared access; it is
   reflectable via `reflect_has(T, "shareable")`, and the built-in `Atomic` /
-  `Mutex` / `WaitGroup` / `Once` / `Counter` / `Queue` types carry it implicitly
-  under one uniform rule. The sharing lint raises the non-fatal **`ZAP5125`**
+  `Mutex` / `WaitGroup` / `Once` / `Counter` / `Queue` / `AtomicArray` types carry
+  it implicitly under one uniform rule. The sharing lint raises the non-fatal **`ZAP5125`**
   warning at a read/write of a mutable module global whose type is not
   `@shareable` (a `const` global never warns), suppressible per-site with
   `# noqa` / `# noqa: ZAP5125`. It is advisory — the program stays legal — and
@@ -445,6 +445,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `signal`/`gc`/`runtime` — the dump/stats **output format** | **I** |
 | `crypto`, `base64`, `hex`, `net`, `http`, `tls`, `zlib`, `gzip`, `yaml`; `threading` (migration-only) | **E** |
 | `concurrent` — lock-free `Counter` + MPSC `Queue[T]` (D-0078); the multicore `Queue[T]` hang/UAF under gc-boehm (I#710, a #223 follow-up) is fixed (D-0128), pending the Graviton re-run that clears #223 | **E** |
+| `AtomicArray[T]` — fixed-capacity array of seq_cst CAS-able slots (`load`/`store`/`compare_and_swap`/`len`), reference slots traced + forwarded by the moving collector (#844, D-0146); v1 elements are a reference type or `int64`; node-liveness on aarch64-Linux tracked by #223/#650 | **E** |
 | `url` — `encoding/url` percent-encode/decode + AWS SigV4 query canonicalization (#335): `quote`/`quote_path`/`unquote`/`unquote_plus`, `encode_query`/`canonical_query` | **E** |
 
 The experimental RSA surface is specifically ordinary RSA with PKCS#1 v1.5

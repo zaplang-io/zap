@@ -1982,6 +1982,17 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                 };
                 Ok(Ty::Chan(e))
             }
+            "AtomicArray" => {
+                // AtomicArray[T] (#844): a reference element lowers to a pointer
+                // slot, `int64` to a word slot. The element kind picks the typed
+                // runtime entry point (`zap_atomicarray_*_ptr` vs `_i64`), the same
+                // split channels use.
+                let e = match args.first() {
+                    Some(a) => value_elem_of(a, env)?,
+                    None => Elem::Ptr,
+                };
+                Ok(Ty::AtomicArray(e))
+            }
             other => {
                 // A tier-1 enum is its unboxed backing integer; a tier-3 enum is
                 // its tagged struct; a struct is its layout (D-0018/D-0046).
@@ -2239,7 +2250,7 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         // interned so read-back (`rows[i]`, iteration) recovers the precise
         // `list`/`dict`/`set`/... type instead of defaulting a bare pointer to
         // `str`. Dedup makes structurally-equal nestings compare equal.
-        Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) => {
+        Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) | Ty::AtomicArray(_) => {
             Ok(Elem::Nested(nested.borrow_mut().intern(t)))
         }
         Ty::Ptr | Ty::Bytes | Ty::Array(_) | Ty::Match | Ty::Func(_) | Ty::Py => Ok(Elem::Ptr),
@@ -11647,6 +11658,9 @@ impl<'a> FnLower<'a> {
             if is_name(base, "set") {
                 return self.lower_set_new(index, args);
             }
+            if is_name(base, "AtomicArray") {
+                return self.lower_atomicarray_new(index, args);
+            }
         }
         if let Expr::Name(fname, _) = callee {
             if fname == "sum" {
@@ -12380,6 +12394,9 @@ impl<'a> FnLower<'a> {
             }
             if let Ty::Heap(elem) = bty {
                 return self.lower_heap_method(recv, elem, name, args);
+            }
+            if let Ty::AtomicArray(elem) = bty {
+                return self.lower_atomicarray_method(recv, elem, name, args);
             }
             if bty == Ty::Match {
                 return self.lower_match_method(recv, name, args);
@@ -14257,6 +14274,134 @@ impl<'a> FnLower<'a> {
             args: vec![cap],
         });
         Ok((ch, Ty::Chan(elem)))
+    }
+
+    /// Lower `AtomicArray[T](cap)` construction (#844): allocate a fixed-capacity
+    /// runtime atomic array, passing the capacity and whether the element is a
+    /// reference (so the collector traces the slots). The element kind `T` is
+    /// carried in [`Ty::AtomicArray`] so later load/store/cas pick the typed
+    /// entry point.
+    fn lower_atomicarray_new(
+        &mut self,
+        elem_expr: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let elem = value_elem_of(&expr_to_type(elem_expr)?, &self.ctx.tyenv())?;
+        let cap = match args.len() {
+            1 => {
+                let (v, vt) = self.expr(&args[0].value)?;
+                self.coerce(v, vt, Ty::I64)
+            }
+            _ => {
+                return Err(err(
+                    "AtomicArray[T](cap) takes exactly one argument (the capacity)",
+                ))
+            }
+        };
+        // A word element is `int64` only (bool/char/float/… are not supported in
+        // v1 — rejected by sema); every other admitted element is a reference.
+        let elem_is_ptr = !matches!(elem, Elem::I64);
+        let flag = self.iconst(Ty::I64, i64::from(elem_is_ptr));
+        let a = self.new_value(Ty::AtomicArray(elem));
+        self.emit(Inst::Call {
+            dest: Some(a),
+            func: "zap_atomicarray_new".to_string(),
+            args: vec![cap, flag],
+        });
+        Ok((a, Ty::AtomicArray(elem)))
+    }
+
+    /// Lower an `AtomicArray[T]` method (#844) to its seq_cst runtime entry
+    /// point. Reference elements use the `_ptr` entry points (value is a pointer
+    /// word, no cast needed); `int64` elements use the `_i64` ones.
+    fn lower_atomicarray_method(
+        &mut self,
+        recv: Value,
+        elem: Elem,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let is_ptr = !matches!(elem, Elem::I64);
+        let suffix = if is_ptr { "ptr" } else { "i64" };
+        let ety = elem.ty();
+        // The index argument, coerced to i64.
+        let index = |s: &mut Self, a: &ast::Arg| -> Result<Value, LowerError> {
+            let (v, vt) = s.expr(&a.value)?;
+            Ok(s.coerce(v, vt, Ty::I64))
+        };
+        match name {
+            "len" => {
+                if !args.is_empty() {
+                    return Err(err("AtomicArray.len() takes no arguments"));
+                }
+                let dest = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_atomicarray_len".to_string(),
+                    args: vec![recv],
+                });
+                Ok((dest, Ty::I64))
+            }
+            "load" => {
+                if args.len() != 1 {
+                    return Err(err("AtomicArray.load(i) takes exactly one argument"));
+                }
+                let i = index(self, &args[0])?;
+                let dest = self.new_value(ety);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: format!("zap_atomicarray_load_{suffix}"),
+                    args: vec![recv, i],
+                });
+                Ok((dest, ety))
+            }
+            "store" => {
+                if args.len() != 2 {
+                    return Err(err("AtomicArray.store(i, v) takes exactly two arguments"));
+                }
+                let i = index(self, &args[0])?;
+                let (val, vt) = self.expr(&args[1].value)?;
+                let val = self.coerce(val, vt, ety);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: format!("zap_atomicarray_store_{suffix}"),
+                    args: vec![recv, i, val],
+                });
+                Ok((self.iconst(Ty::I32, 0), Ty::I32))
+            }
+            "compare_and_swap" => {
+                if args.len() != 3 {
+                    return Err(err(
+                        "AtomicArray.compare_and_swap(i, old, new) takes exactly three arguments",
+                    ));
+                }
+                let i = index(self, &args[0])?;
+                let (old, ot) = self.expr(&args[1].value)?;
+                let old = self.coerce(old, ot, ety);
+                let (new, nt) = self.expr(&args[2].value)?;
+                let new = self.coerce(new, nt, ety);
+                let word = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(word),
+                    func: format!("zap_atomicarray_cas_{suffix}"),
+                    args: vec![recv, i, old, new],
+                });
+                // The runtime returns 0/1; surface it as a `bool` (`i1`).
+                let zero = self.iconst(Ty::I64, 0);
+                let dest = self.new_value(Ty::I1);
+                self.emit(Inst::ICmp {
+                    dest,
+                    pred: CmpPred::Ne,
+                    lhs: word,
+                    rhs: zero,
+                });
+                Ok((dest, Ty::I1))
+            }
+            other => Err(err(format!(
+                "AtomicArray has no method '{other}' (supported: load, store, \
+                 compare_and_swap, len)"
+            ))),
+        }
     }
 
     fn lower_list_lit(&mut self, elems: &[Expr]) -> Result<(Value, Ty), LowerError> {

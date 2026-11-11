@@ -37,6 +37,46 @@ mod tests {
         module
     }
 
+    // --- AtomicArray[T] (#844) -------------------------------------------------
+
+    #[test]
+    fn atomicarray_int64_lowers_to_word_entry_points() {
+        // A word (int64) element: new(cap, elem_is_ptr) + the `_i64` entry points,
+        // and compare_and_swap's i64 result is turned into a bool via `icmp ne 0`.
+        let m = lower_ok(
+            "def main():\n    \
+             AtomicArray[int64] a = AtomicArray[int64](4)\n    \
+             a.store(0, 7)\n    \
+             auto v = a.load(0)\n    \
+             auto swapped = a.compare_and_swap(0, 7, 8)\n    \
+             auto n = a.len()\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_atomicarray_new"), "text:\n{text}");
+        assert!(text.contains("@zap_atomicarray_store_i64"), "text:\n{text}");
+        assert!(text.contains("@zap_atomicarray_load_i64"), "text:\n{text}");
+        assert!(text.contains("@zap_atomicarray_cas_i64"), "text:\n{text}");
+        assert!(text.contains("@zap_atomicarray_len"), "text:\n{text}");
+    }
+
+    #[test]
+    fn atomicarray_reference_lowers_to_ptr_entry_points() {
+        // A reference element uses the `_ptr` entry points, passing/returning the
+        // pointer word with no int cast.
+        let m = lower_ok(
+            "struct Node:\n    int64 v\n\n\
+             def main():\n    \
+             AtomicArray[Node] a = AtomicArray[Node](2)\n    \
+             a.store(0, Node(v=1))\n    \
+             auto x = a.load(0)\n    \
+             auto swapped = a.compare_and_swap(0, x, Node(v=2))\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("@zap_atomicarray_store_ptr"), "text:\n{text}");
+        assert!(text.contains("@zap_atomicarray_load_ptr"), "text:\n{text}");
+        assert!(text.contains("@zap_atomicarray_cas_ptr"), "text:\n{text}");
+    }
+
     #[test]
     fn raw_crypto_results_support_inferred_bytes_operations() {
         // #647: compile the reduced repro for every affected API. No runtime or
