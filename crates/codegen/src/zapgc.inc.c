@@ -410,8 +410,14 @@ typedef struct ZapMutator {
 static pthread_mutex_t zap_stw_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t zap_stw_cv = PTHREAD_COND_INITIALIZER;
 static ZapMutator *zap_mutators = NULL;
-static volatile int zap_gc_wanted = 0;      /* a collection is due (set by alloc)  */
-static volatile int zap_collecting = 0;     /* collection in progress             */
+/* Exported (not `static`) since #568 (D-0144): compiled code's INLINED safepoint
+ * poll loads these two flags directly (a `load volatile i32 @zap_gc_wanted` plus
+ * the same for `@zap_collecting`), branching to the out-of-line `zap_safepoint`
+ * slow path only when one is set — instead of an unconditional non-inlinable call
+ * at the top of every block. Their meaning and every set/clear site below are
+ * unchanged; only the linkage widened so the symbol is loadable from codegen. */
+volatile int zap_gc_wanted = 0;             /* a collection is due (set by alloc)  */
+volatile int zap_collecting = 0;            /* collection in progress             */
 static __thread ZapMutator *zap_self = NULL;
 
 static void zap_collect_now(void); /* fwd: drive one full collection (caller is

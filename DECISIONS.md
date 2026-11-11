@@ -6905,3 +6905,92 @@ also settles replace-vs-augment by letting the caller pick via the constructor.
 **Still deferred (from D-0062, unchanged):** ALPN / HTTP/2; session resumption /
 0-RTT; OCSP stapling; TLS protocol/cipher policy knobs; encrypted-key passwords;
 a public TLS *server* client-auth (mTLS-server) surface.
+## D-0144 — GC-free functions skip the shadow frame; safepoints are inlined back-edge/entry polls (#568)
+
+**Problem.** An external language review (#568) measured that the default calling
+convention paid a structural GC/preemption tax even in code that touches no
+managed references: recursive `fib(38)` ran ~1.70 s (C 0.16 s), and a dict+string
+workload only ~1.3× faster than Python. Inspecting the generated machine code, the
+cause was not a missing optimizer flag (`-O2` changed nothing) but the emission
+itself — **every** call set up a GC tracking frame, and a non-inlinable
+`zap_safepoint` call sat at the **top of every basic block** (so `fib` paid it
+three times per call), each call re-reading thread-local state inside the runtime.
+
+**Decision.** The precise-GC (gc-immix) calling convention changes in two ways;
+Boehm, which emits no safepoints, is unaffected.
+
+1. **Skip the shadow frame for provably-GC-free functions.** A function with no
+   managed reference on any path — no heap-pointer SSA value, no reference-local
+   (an `alloca` whose slot *holds* a GC pointer), and no by-value aggregate root —
+   gets **no** shadow-stack frame (no link/unlink, no `zap_shadow_head_addr`
+   push/pop). Key enabler: an `alloca`'s dest is a **stack address**, not a heap
+   reference, so it is no longer given a root slot (the collector never relocates a
+   stack pointer, and any GC pointer the slot holds is tracked through the
+   reference-local cell). Before this, a scalar local or parameter spilled to an
+   `alloca` — e.g. `fib`'s `int64 n`, lowered to `alloca i64` — made the
+   `Ptr`-typed alloca dest a spurious root and forced a frame onto otherwise
+   GC-free code; that is exactly the "even an integer-only function sets up a GC
+   tracking frame" the review (#568) reported. The test is **conservative**: the
+   frame is skipped only when no managed reference can appear on **any** path;
+   anything that could hold, create, or pass a GC reference keeps the frame. A
+   wrong skip would miss a root, so "when in doubt, keep the frame" is the rule
+   (covered by an IR regression test asserting a GC-using function still links a
+   frame).
+
+2. **Safepoints are INLINED flag-check polls at function entry and loop headers,
+   not a call at every block.** A poll is now:
+
+   ```
+   if (zap_gc_wanted | zap_collecting | zap_preempt_any) zap_safepoint();
+   ```
+
+   emitted inline as three `volatile` loads of exported runtime flags, an OR, and a
+   branch (hinted unlikely) to the out-of-line `zap_safepoint` slow path — whose
+   semantics are unchanged. The `volatile` loads cannot be hoisted out of a loop,
+   so a back-edge poll re-reads every iteration. Polls are emitted **only** at the
+   function entry and at every loop header (the target of a DFS back-edge), not at
+   the top of every block. This is sufficient for cooperative stop-the-world and
+   async preemption: every call chain polls at a callee's entry (so deep recursion
+   still polls), and every CFG cycle contains a back-edge target that polls once
+   per iteration (so a tight, call-free loop still reaches a safepoint). The
+   per-call frame setup and the redundant per-block safepoint calls — the measured
+   overhead — are gone from GC-free code, while root tracking, STW liveness, and
+   preemption are preserved.
+
+**`zap_preempt_any`.** Async preemption previously relied on `zap_safepoint`
+reading the per-M `m->preempt` latch via the thread-local `cur_m`. Inlined code
+cannot read `cur_m` safely (a coroutine may have migrated OS threads, and a cached
+TLS base would point at the wrong M — the I#223 hazard that already forces
+`zap_shadow_head_addr` to be a call). So the fairness monitor publishes a single
+exported global `zap_preempt_any`, recomputed once per ~10 ms tick as the OR of
+every M's `preempt` latch (the monitor is its sole writer, so there is no race).
+The inline poll loads it; the slow path still does the precise per-M check and
+yields. A stale `1` only costs an extra slow-path call that finds nothing; the flag
+clears within one tick of the last preemption being consumed, so preemption
+granularity is unchanged.
+
+**TLS lookups on the hot path.** The review's "2 non-inlined thread-local lookups
+per call" are the `zap_shadow_head_addr` push/pop of the shadow frame. For GC-free
+functions these disappear with the frame (point 1). For functions that **do** hold
+GC references the push/pop stay a non-inlinable call **on purpose**: it re-resolves
+the thread pointer on the current M so a coroutine that migrated at a safepoint
+pushes/pops the correct M's slot (I#223). This is not changed; it is load-bearing
+for correctness under migration, and GC-free code — the review's complaint — no
+longer pays it at all.
+
+**Benchmarks.** A standing perf-bench harness (`crates/driver/tests/perf.rs`) runs
+`fib`, a tight GC-free loop, a leaf-call loop, and the dict+string workload under
+CI, checks each result, and records wall-clock as a TREND (appended to the GitHub
+Actions run summary), asserting only lenient machine-independent floors — never an
+exact time (the GC-golden determinism rule, extended to perf). The deterministic
+win/regression guards are the codegen IR tests (no frame + one entry poll for a
+GC-free function; frame retained for a GC-using one). This harness is also the
+baseline for the GC Immix++ epic (#714), whose barrier (#716) and pacer/telemetry
+(#721) work adds mutator-side cost that needs this harness to measure.
+
+**Safety.** Covered by the existing preemption / GC-stop-the-world stress goldens
+(`preemption.zap`, `gc_preempt_stw_stress.zap`,
+`concurrent_queue_gc_preempt_stress.zap` — a tight GC-free loop must still yield at
+its back-edge safepoint under both collectors) plus a new test that runs a
+frame-skipped recursive function under concurrent forced collections and asserts
+the unique correct result with no hang.

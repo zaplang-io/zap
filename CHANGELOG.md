@@ -26,7 +26,7 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 ### Added
 
 - **`tls` per-connection client contexts — private trust roots + client
-  certificates (mutual TLS)** (#560, D-0143). An `ssl`-style client context,
+  certificates (mutual TLS)** (#560, D-0144). An `ssl`-style client context,
   mirroring Python's `ssl` module: `tls.create_default_context()` preloads the
   system trust store (verify + hostname on — the *augment* base), `tls.SSLContext()`
   starts with an empty trust store (trusts only what is loaded — the *replace*
@@ -850,6 +850,28 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **Calling-convention / GC overhead removed from GC-free code** (#568, D-0144).
+  An external language review found the default calling convention taxed even
+  integer-only code: every call set up a GC shadow frame and a non-inlinable
+  `zap_safepoint` ran at the top of **every** basic block (three times per `fib`
+  call), so GC-free `fib(38)` ran ~1.70 s vs C's 0.16 s. Under the precise
+  collector (gc-immix) codegen now (1) **skips the shadow frame entirely for
+  provably-GC-free functions** — conservatively: a frame is kept whenever a
+  managed reference could appear on any path, so roots are never dropped — and (2)
+  emits the GC/preemption safepoint as an **inlined flag check** (`volatile` loads
+  of `zap_gc_wanted | zap_collecting | zap_preempt_any`, branching to the
+  out-of-line `zap_safepoint` only when set) placed **only at function entry and
+  loop headers**, not at every block. The hot path of a GC-free call now carries
+  no frame, no safepoint call, and no thread-local read, while stop-the-world
+  liveness and async preemption are preserved (every call chain polls at a
+  callee's entry; every loop polls on its back-edge). A new monitor-maintained
+  global `zap_preempt_any` lets the inlined poll observe a pending fairness
+  preemption without an unsafe `cur_m` read. Functions that hold GC references are
+  unchanged (frame + root tracking retained); Boehm is unaffected. A standing
+  perf-bench harness (`crates/driver/tests/perf.rs`: `fib`, a tight GC-free loop,
+  a leaf-call loop, and a dict+string workload) now runs under CI, gating on
+  correctness and lenient machine-independent floors and recording wall-clock as a
+  trend in the run summary — the baseline for the GC Immix++ epic (#714).
 - **Collection element checks are capability/representation-driven** (#807, epic
   #812, D-0139). The hand-maintained per-container element guards fold into the
   capability model: a container's element/key/value position carries a semantic

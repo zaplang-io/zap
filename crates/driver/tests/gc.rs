@@ -458,3 +458,71 @@ fn immix_module_global_reassignment_roots_only_current_value() {
         "the global holds exactly the last-assigned list; stdout={stdout:?} stderr={stderr:?}"
     );
 }
+
+/// #568 (D-0144): a function whose shadow frame is SKIPPED because it is provably
+/// GC-free must stay correct — and must not deadlock the collector — when a
+/// collection fires while it is on the stack.
+///
+/// `fib` holds no managed reference on any path, so codegen emits no shadow frame
+/// and (being loopless) a single entry safepoint poll. Here one coroutine calls
+/// the frame-skipped `fib` in a hot loop while a sibling churns the heap under a
+/// cap and forces `gc.collect()`, so stop-the-world repeatedly overlaps the
+/// frame-skipped frames deep in recursion. Two properties are proven at once:
+///   * LIVENESS — the compute coroutine still reaches a safepoint (its entry /
+///     back-edge polls), so STW does not hang waiting for it to park; a dropped
+///     poll would hang and trip the harness timeout.
+///   * SAFETY — a frame-skipped function holds no root, so a collection (and, for
+///     the moving collector, relocation) during it cannot miss a root or hand
+///     back a stale pointer. The printed total is the unique correct value under
+///     every collection interleaving — no timing or heap-byte assertion.
+#[test]
+fn immix_frame_skipped_fn_safe_across_collections() {
+    let src = "\
+def fib(int64 n) -> int64:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def churn(channel[int64] ch):
+    list[int64] keep = []
+    for i in range(0, 60000):
+        auto garbage = [i, i + 1, i + 2]
+        if i % 1000 == 0:
+            gc.collect()
+        if i % 5000 == 0:
+            keep.append(i)
+    auto acc = 0
+    for v in keep:
+        acc = acc + v
+    ch <- acc
+
+def compute(channel[int64] ch):
+    auto total = 0
+    for i in range(0, 300):
+        total = total + fib(20)
+    ch <- total
+
+def main():
+    auto a = channel[int64]()
+    auto b = channel[int64]()
+    spawn churn(a)
+    spawn compute(b)
+    auto ca = <-a
+    auto cb = <-b
+    print(cb)
+";
+    let (ok, stdout, stderr) = run_capped(src, 16 * 1024 * 1024);
+    assert!(
+        ok,
+        "a frame-skipped GC-free function under concurrent stop-the-world must \
+         complete without hanging or crashing; stdout={stdout:?} stderr={stderr:?}"
+    );
+    // fib(20) = 6765; 300 * 6765 = 2029500 — the unique correct result, invariant
+    // to how many collections overlap the frame-skipped recursion.
+    assert_eq!(
+        stdout.trim_end(),
+        "2029500",
+        "frame-skipped recursion must compute the correct result across \
+         collections; stdout={stdout:?} stderr={stderr:?}"
+    );
+}
