@@ -55,14 +55,31 @@ Its runtime (`crates/codegen/src/zaprt.c`) uses a two-word, `malloc`-based
 object with **no GC** and **no type-descriptor header** yet:
 
 ```c
-typedef struct { int64_t len; const char *data; } ZapStr;
-void *zap_str_new(const char *data, int64_t len);   // copies `len` bytes
+// Shipped layout (#837, D-0145): ONE object — the UTF-8 bytes are a flexible
+// array member contiguous with the header, not a separate `data` buffer.
+typedef struct { int64_t len; char data[]; } ZapStr;
+void *zap_str_new(const char *data, int64_t len);   // one contiguous alloc + copy
 void *zap_str_concat(void *a, void *b);
 void  zap_print_str(void *s);                        // fwrite(data, 1, len)
 ```
 
 This document describes how that minimal object **evolves** into the full model
 below (header, ASCII flag) without changing the happy path that already works.
+
+> **Realized layout (#837, D-0145).** The shipped object evolved to a
+> **one-object** form — the byte payload is a flexible array member contiguous
+> with the header, so a string is a single GC allocation (header + bytes), *not*
+> the header-plus-separate-`data`-pointer sketch in the next sections. This halves
+> string allocation count and live-set tracing. Two consequences differ from the
+> sketch below: (a) **slices/substrings copy** into a fresh one-object string —
+> they do not share the parent's buffer (strings still own their bytes, which is
+> safe because strings are immutable); and (b) **string literals are interned** as
+> constant-global one-object `ZapStr`s (realizing "literals point at constant
+> data" as a whole constant object, reused per use, giving CPython-like `is`
+> identity). The `flags`/`is_ascii` word was never added; codepoint operations
+> compute over the inline UTF-8 directly. The string type descriptor is ATOMIC
+> (inline bytes hold no pointers). See `design/RUNTIME-ABI.md` for the normative
+> layout.
 
 ## Proposal
 

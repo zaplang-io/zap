@@ -814,7 +814,13 @@ static void *zap_evac_mark(void *payload) {
         return payload;
     }
     void *final = payload;
-    if (zap_evac_active && d == &zap_desc_atomic) {
+    /* Evacuate pointer-free leaves that carry no external identity or finalizer:
+     * the generic atomic buffer, and the one-object string (#837, D-0145) — its
+     * inline bytes carry no pointers and all references to it are rewritten by the
+     * trace, so relocating it preserves `is` identity and keeps string-heavy heaps
+     * compactable. (pyobj is ATOMIC-kind but pinned: it has a finalizer keyed on
+     * its address, so it is deliberately excluded.) */
+    if (zap_evac_active && (d == &zap_desc_atomic || d == &zap_desc_strobj)) {
         ZapBlock *b = zap_block_of(payload);
         if (b->kind == ZAP_BK_SMALL && b->evac_src) {
             void *np = zap_evac_copy(payload);

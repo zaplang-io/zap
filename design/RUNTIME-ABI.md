@@ -123,18 +123,30 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
 
 ### String & bytes layout (coordinate with #16 / design/0007-strings)
 
-`str` is immutable UTF-8:
+`str` is immutable UTF-8. **One object (#837, D-0145):** the byte payload is a
+flexible array member contiguous with the header, so a string is a single GC
+allocation, not a header plus a separate data buffer:
 
 ```
-[ header(8) | len_bytes: i64 | flags: i32 (bit0 = is_ascii) | _pad | data: *const u8 ]
+[ header(8) | len_bytes: i64 | data: u8[len_bytes] (inline, not NUL-terminated) ]
 ```
 
-- `is_ascii` enables the O(1) codepoint-indexing fast path; otherwise indexing
-  is O(n) over UTF-8.
-- **Slices are views:** a slice shares the parent's `data` buffer (adjusted
-  `data`/`len`) and keeps the parent alive via the GC. Because strings are
-  immutable this is always safe.
-- `bytes` is similar; mutability per the strings design.
+- `len_bytes` is authoritative; the bytes are not NUL-terminated. Codepoint
+  `len`/index/slice/iteration are by Unicode codepoint (D-0025), computed over the
+  inline UTF-8 payload.
+- The string type descriptor is **ATOMIC** (the inline bytes hold no pointers, so
+  the collector never scans them); the whole object is copied by its stored object
+  size on evacuation, and the moving collector may relocate a string because every
+  reference to it is rewritten (`is` identity preserved). `s->data` is recomputed
+  from the object pointer on each access, so it stays valid after a relocation.
+- **Strings own their bytes:** a slice/concat/substring copies into a fresh
+  one-object string (it does not alias the parent's buffer), which is always safe
+  because strings are immutable.
+- **Literals are interned:** each distinct string literal is one never-freed
+  constant-global `ZapStr` with this same layout, reused at every use (no per-use
+  allocation); same bytes ⇒ same object (CPython-like `is` identity for literals).
+- `bytes` shares the `ZapStr` representation (relabelled, no copy at the `str`↔
+  `bytes` boundary); mutability per the strings design.
 
 ### Collection layout (coordinate with #21)
 
@@ -164,8 +176,11 @@ offset 8:  itable (*ITable)  — the dispatch table for this (struct, interface)
   follow-up). Element types without an ordering and no `key=` are a compile
   error.
 - `dict[K,V]`: an open-addressing hash table — `[ header | len | cap | entries:
-  *Entry ]`, `Entry = { hash, key, value }`. Hashing/equality come from the key
-  type (string/bytes/scalars built-in). A **user-struct key** (operator
+  *Entry ]`, `Entry = { state, key, value, hash }`. The 64-bit key `hash` is
+  cached in each full slot (#837, D-0145): `get`/`set`/`del` gate the key compare
+  on a hash-word match first, and `resize` rehashes from the stored hash rather
+  than recomputing it for every live key on each grow. Hashing/equality come from
+  the key type (string/bytes/scalars built-in). A **user-struct key** (operator
   overloading, #52 / D-0047) is hashed/compared by the type's own
   `__hash__`/`__eq__`: the dict/set carries those two function pointers (set on
   first insert) and the typed entry points gain an `_fn` key variant

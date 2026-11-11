@@ -33,10 +33,12 @@
 #include <stdio.h>
 #include <string.h>
 
-/* The two-word string object (RUNTIME-ABI.md): { len, data }. */
+/* The one-object string (RUNTIME-ABI.md, #837/D-0145): header + inline byte
+ * payload as a flexible array member, matching the runtime layout so `z->data`
+ * reads the contiguous bytes. */
 typedef struct {
     int64_t len;
-    const char *data;
+    char data[];
 } ZapStr;
 
 /* Public runtime ABI (subset) — defined in zaprt.c. */
