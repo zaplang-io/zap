@@ -7130,3 +7130,90 @@ of named `Atomic` fields + an index `match` (a workaround simulating the missing
 primitive, barred by the language-first rule). Building the concurrent map on a
 lock around a plain `dict` (the sharded/hybrid design) was declined upstream in
 favour of a fully lock-free map, which requires this primitive.
+
+## D-0147 — no `inline` keyword; inlining is the toolchain's job (LLVM -O2 + LTO runtime boundary + codegen open-coding) (#841)
+
+**Problem.** The C runtime (`zaprt.c`) is compiled to its OWN object file and
+linked against the program object. The program is emitted and optimized as its own
+LLVM module first, so the hot runtime fast paths — `zap_dict_get_str_i64` /
+`zap_dict_set_*`, `zap_str_concat`, `zap_i64_to_str`, … — are opaque **external
+declarations** at the program's optimize step and can never be inlined. Every
+`d[k]` pays an out-of-line call (the costs measured in #837; the "`-O2` changed
+nothing for the runtime calls" observation in #568/D-0144). This is the single
+broadest performance lever left in the gap-to-Go set (#837/#839/#840/#841/#842):
+it benefits every runtime call, not just dict/string.
+
+**Decision — the language surface stays clean; performance comes from the
+toolchain, not annotations.**
+
+1. **Zap exposes NO `inline` keyword and no user-facing inlining pragma.**
+   Inlining is entirely the optimizer's job. LLVM `-O2` already inlines Zap-level
+   `def`s; there is no programmer-visible knob and there will not be one. A
+   language that lets the author annotate `inline` ties the surface to one
+   backend's heuristics and ages badly; keeping it out means the only contract is
+   observable behaviour, and the toolchain is free to inline more (or less) over
+   time with no source change.
+
+2. **LTO extends the optimizer's reach across the program↔runtime boundary
+   (this issue).** Under the `ZAP_LTO` build flag the program is emitted as **LLVM
+   bitcode** (`Module::write_bitcode_to_path`, inkwell `llvm18-0`), the runtime is
+   compiled to bitcode (`clang-18 -O2 -emit-llvm -c`), the two are **merged into a
+   single module with `llvm-link`**, that module is optimized with **`opt -O2`**
+   (which unambiguously runs the inliner over the whole module — `clang -O2` on a
+   bitcode input codegens it but does not reliably re-run the IR optimizer), and
+   `clang` codegens + links the result. Merging explicitly — rather than passing
+   a `.bc` plus `-flto` and
+   relying on the linker's LTO plugin — is what actually produces the
+   cross-module inline: with one module the inliner sees both sides, and it needs
+   no gold/lld plugin (an early `clang -flto program.bc zaprt.c` attempt did NOT
+   inline — clang codegen'd the program bitcode on its own and `-O2` merely
+   unrolled the hot loop, leaving the runtime calls out of line, which the
+   `tests/lto.rs` disassembly assertion caught). One more step is required: clang
+   stamps `target-cpu`/`target-features` on every runtime function while the
+   inkwell program module carries none, and LLVM's inliner refuses to inline a
+   callee whose features are not a subset of the caller's — so even after the
+   merge the thin wrappers would not inline. The merged module therefore has
+   those attributes **stripped from every function** (in-process via inkwell)
+   before `clang -O2`, leaving it uniformly attribute-free so it codegens at the
+   triple's default baseline (no feature lost) and the inliner crosses the
+   boundary. Everything stays on **LLVM 18**
+   (the inkwell program IR and the `clang-18`/`llvm-link` runtime bitcode must
+   match — no version skew). The single merged module is a deterministic,
+   closed-world inline; ThinLTO (to bound link time on large programs) is a
+   follow-up refinement.
+
+3. **Codegen open-coding of the hottest ops is the next lever (#842),** sequenced
+   AFTER this issue and the dict-layout change (#840): once the structure lands,
+   the compiler emits the fast path for the very hottest ops directly, so even the
+   call-site disappears. Same principle — the toolchain, not the source.
+
+**Gate / default.** LTO is behind the `ZAP_LTO` environment build flag, read in
+`build_executable` exactly like `ZAP_PORTABLE` (no new parameter threaded through
+every caller, so the non-LTO object-link path and the binary it produces are
+**byte-for-byte unchanged** when unset). The default is **OFF**: the LTO link is
+slower and, unlike the long-exercised object-link path, is newly introduced, so a
+toolchain image / CI opts in with `ZAP_LTO=1` (and `ZAP_LTO_CC=clang-18`) rather
+than it defaulting on before it has soaked. Flipping the default on for release
+builds is a one-line follow-up once CI has carried it.
+
+**Correctness (preserved under whole-program LTO).**
+- `zap_shadow_head_addr` keeps `__attribute__((noinline))` and must stay an
+  out-of-line call even under LTO: it resolves the per-thread `zap_shadow_head`
+  TLS slot on the CURRENT thread, and folding it into a cached thread-pointer base
+  would make a migrated coroutine push/pop the wrong thread's shadow stack and
+  free live objects (I#223 / #568). LTO honours the `noinline` function attribute;
+  a test asserts it.
+- The GC-frame + safepoint discipline (D-0144) is unchanged: the shadow-frame
+  alloca escapes via `*zap_shadow_head = &frame`, so `-O2` cannot promote it away,
+  and inlining a runtime call that contains a safepoint preserves the safepoint.
+
+**Tests.** `crates/driver/tests/lto.rs` is the deterministic guard: it builds a
+hot `dict[str,int64]` read/update loop with and without `ZAP_LTO`, disassembles
+both binaries, and asserts the baseline calls `zap_dict_get_str_i64` out of line,
+the LTO binary has **no** such call (inlined), and the LTO binary **still** calls
+`zap_shadow_head_addr` (noinline honoured) — arch-agnostic across the x86-64 and
+aarch64 legs. `crates/driver/tests/perf.rs` gains an LTO-vs-non-LTO trend for
+`dict_int`/`dict_string` (speedup reported; only a lenient no-regression floor
+asserted, per the GC-golden determinism rule). CI re-runs the golden end-to-end
+(including the `--race` fixtures) and GC-stress suites with `ZAP_LTO=1` on both
+collectors, so the whole corpus stays green under the LTO build.

@@ -860,6 +860,29 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **Runtime fast paths can inline into generated code via LTO** (#841, D-0147).
+  The C runtime was compiled to its own object and linked against the program
+  object, so at the program's optimize step the hot runtime helpers
+  (`zap_dict_get_str_i64`, `zap_str_concat`, `zap_i64_to_str`, …) were opaque
+  external symbols the inliner never saw — every `d[k]` paid an out-of-line call
+  (#837, #568). A new **`ZAP_LTO` build flag** instead emits the program as LLVM
+  bitcode, compiles the runtime to bitcode, **merges the two into one module with
+  `llvm-link`**, and optimizes/codegens that module with `clang -O2`, so LLVM's
+  cross-module inliner pulls those fast paths into the generated hot loops
+  (everything stays on LLVM 18, no version skew). This also records the language
+  decision that **Zap has no `inline` keyword**: inlining is purely the
+  optimizer's job (`-O2` on `def`s, this LTO runtime boundary, and codegen
+  open-coding later), never a source annotation. The flag is **off by default**
+  (the non-LTO object-link path and its output are byte-for-byte unchanged); a
+  toolchain image / CI opts in with `ZAP_LTO=1` (`ZAP_LTO_CC=clang-18`).
+  Correctness is preserved under whole-program LTO: `zap_shadow_head_addr` keeps
+  `noinline` (coroutine-migration GC safety, I#223/#568) and the GC-frame +
+  safepoint discipline (D-0144) is unchanged. `crates/driver/tests/lto.rs`
+  asserts the hot `d[k]` fast path inlines while the `noinline` helper stays a
+  call; CI re-runs the golden (incl. `--race`) and GC-stress suites under
+  `ZAP_LTO=1` on both collectors. The cheapest, broadest lever of the gap-to-Go
+  set (#837/#839/#840/#841/#842); codegen open-coding (#842) sequences after this
+  and the dict-layout change (#840).
 - **String-keyed `dict` and string allocation made ~2× faster** (#837, D-0145).
   After #568/#835 fixed `fib`/loops, a string-keyed `dict` (build + look up 200k
   `str → int`, keys `f"k{i}"`) was the one microbenchmark still ~2× slower than

@@ -287,8 +287,29 @@ jobs:
 
       # Test THIS leg's collector only (the golden end-to-end path plus the
       # GC-specific reclamation tests for this collector).
+      #
+      # The normal run also exercises the LTO build END TO END: `tests/lto.rs`
+      # (the disassembly inlining assertion) and `perf.rs`'s LTO trend each build
+      # their probes with `ZAP_LTO=1` on the child, so the LTO link + the runtime
+      # fast-path inlining are validated here without a separate rebuild.
       - name: "Test (${{ matrix.gc }})"
         run: cargo test --workspace --features zapc/${{ matrix.gc }}
+
+      # Re-run the golden end-to-end + GC-stress suites with the LTO build flag
+      # ON (I#841, D-0147), so the full program corpus (including the `--race`
+      # fixtures driven by the golden harness) stays green when every program is
+      # linked under `clang -O2 -flto` — on BOTH collectors (golden on each leg;
+      # the GC-stress suite is gc-immix-gated). Reuses the test binaries built
+      # above (same feature set), so the only added cost is the LTO link time per
+      # program; `clang-18` is already installed above. The deterministic
+      # inlining/noinline guard itself is `tests/lto.rs` in the step above.
+      - name: "Test under LTO (${{ matrix.gc }})"
+        env:
+          ZAP_LTO: 1
+          ZAP_LTO_CC: clang-18
+          ZAP_LLVM_LINK: /usr/lib/llvm-18/bin/llvm-link
+          ZAP_OPT: /usr/lib/llvm-18/bin/opt
+        run: cargo test --workspace --features zapc/${{ matrix.gc }} --test golden --test gc
 
   # ARM-Linux (aarch64) validation (ticket #204, platform epic #158 / C2). The
   # same codegen + golden end-to-end suite as `full`, run natively on a GitHub-
