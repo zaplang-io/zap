@@ -7908,6 +7908,20 @@ mod tests {
     // --- AtomicArray[T] (#844) -------------------------------------------------
 
     #[test]
+    fn concurrent_map_surface_type_checks() {
+        // The full ConcurrentMap[K, V] surface monomorphized at K=str, V=int64
+        // (the element types come from the annotation, as with `new_queue`).
+        ok("def main():\n    \
+            ConcurrentMap[str, int64] m = new_concurrent_map()\n    \
+            m.put(\"a\", 1)\n    \
+            auto v, ok = m.get(\"a\")\n    \
+            auto c = m.contains(\"a\")\n    \
+            auto d = m.delete(\"a\")\n    \
+            auto n = m.length()\n    \
+            auto g = m.get_or(\"b\", 9)\n");
+    }
+
+    #[test]
     fn atomicarray_int64_surface_type_checks() {
         // The full word-element surface: len()->int64, store(i,v), load(i)->int64,
         // compare_and_swap(i,old,new)->bool. All clean.

@@ -40,6 +40,24 @@ mod tests {
     // --- AtomicArray[T] (#844) -------------------------------------------------
 
     #[test]
+    fn concurrent_map_monomorphizes_and_lowers() {
+        // Using ConcurrentMap[str, int64] forces its generic split-order methods
+        // to monomorphize and lower end-to-end; the bucket directory lowers to the
+        // AtomicArray runtime entry points (#184 built on #844).
+        let m = lower_ok(
+            "def main():\n    \
+             ConcurrentMap[str, int64] m = new_concurrent_map()\n    \
+             m.put(\"k\", 1)\n    \
+             auto v, ok = m.get(\"k\")\n    \
+             auto removed = m.delete(\"k\")\n    \
+             auto n = m.length()\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("zap_atomicarray_new"), "text:\n{text}");
+        assert!(text.contains("zap_atomicarray_load_ptr"), "text:\n{text}");
+    }
+
+    #[test]
     fn atomicarray_int64_lowers_to_word_entry_points() {
         // A word (int64) element: new(cap, elem_is_ptr) + the `_i64` entry points,
         // and compare_and_swap's i64 result is turned into a bool via `icmp ne 0`.
