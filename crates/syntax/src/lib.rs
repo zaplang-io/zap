@@ -50,4 +50,6 @@ pub const BUILTIN_SHAREABLE_TYPES: &[&str] = &[
     "Queue",
     "AtomicArray",
     "ConcurrentMap",
+    "ConcurrentSet",
+    "ConcurrentStack",
 ];

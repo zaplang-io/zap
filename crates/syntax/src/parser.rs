@@ -970,6 +970,71 @@ def new_concurrent_map[K: Hashable, V]() -> ConcurrentMap[K, V]:
     bk.store(0, s0)
     return ConcurrentMap(buckets=bk, size=Atomic[int64](2), count=Atomic[int64](0))
 
+# ---------------------------------------------------------------------------
+# ConcurrentSet[K] — lock-free, resizable concurrent set (#184, D-0148). A thin
+# membership wrapper over ConcurrentMap[K, bool]: the stored value is unused
+# (membership is the key's presence), so every lock-free / resizable / GC-safety
+# property of the map (D-0147) carries over unchanged. @shareable (D-0113).
+struct ConcurrentSet[K: Hashable]:
+    ConcurrentMap[K, bool] _m
+
+    # Add `key` to the set (idempotent).
+    def add(self, K key):
+        self._m.put(key, True)
+
+    def contains(self, K key) -> bool:
+        return self._m.contains(key)
+
+    # Remove `key`; returns True iff it was present.
+    def remove(self, K key) -> bool:
+        return self._m.delete(key)
+
+    # Approximate number of members (racy by construction, like the map).
+    def length(self) -> int64:
+        return self._m.length()
+
+def new_concurrent_set[K: Hashable]() -> ConcurrentSet[K]:
+    ConcurrentMap[K, bool] m = new_concurrent_map()
+    return ConcurrentSet(_m=m)
+
+# ---------------------------------------------------------------------------
+# ConcurrentStack[T] — a lock-free Treiber stack (#184, D-0148). One atomic head
+# pointer; push and pop are each a single-CAS retry loop. Reclamation leans on
+# the tracing moving GC (D-0078 §4.3): a popped node is collected once
+# unreachable, CAS is pointer-identity, and ABA is moot (a node any party still
+# references is never reclaimed, so its address is never reused under a stale
+# CAS). `pop` is comma-ok, like the Queue. @shareable (D-0113).
+struct CStackNode[T]:
+    Optional[T] value
+    Atomic[CStackNode[T]] next
+
+struct ConcurrentStack[T]:
+    Atomic[CStackNode[T]] _head
+
+    # push(v): LIFO insert. Safe from any number of coroutines/threads.
+    def push(self, T v):
+        while True:
+            auto head = self._head.load()
+            CStackNode[T] n = CStackNode(value=Optional.Some(v), next=Atomic[CStackNode[T]](head))
+            if self._head.compare_and_swap(head, n):
+                return
+
+    # pop() -> (Optional[T], bool): remove and return the top, comma-ok. Returns
+    # (None, False) when the stack is observably empty.
+    def pop(self) -> (Optional[T], bool):
+        while True:
+            auto head = self._head.load()
+            if head is None:
+                Optional[T] none = None
+                return (none, False)
+            auto nxt = head.next.load()
+            if self._head.compare_and_swap(head, nxt):
+                return (head.value, True)
+
+def new_concurrent_stack[T]() -> ConcurrentStack[T]:
+    CStackNode[T] nil = None
+    return ConcurrentStack(_head=Atomic[CStackNode[T]](nil))
+
 # xml (I#351, D-0085) — Experimental core XML DOM for the AWS rest-xml / query
 # protocols. `XmlElement`/`XmlAttr` are compiler-known reference structs (like
 # `JsonValue`); the tree build + serialize walk live in these prelude functions,
@@ -1203,6 +1268,13 @@ fn references_prelude(module: &Module) -> bool {
         "\"ConcurrentMap\"",
         "\"MNode\"",
         "\"new_concurrent_map\"",
+        // ConcurrentSet[K] + the Treiber ConcurrentStack[T] (#184, D-0148),
+        // injected for any program that names one of them.
+        "\"ConcurrentSet\"",
+        "\"new_concurrent_set\"",
+        "\"ConcurrentStack\"",
+        "\"CStackNode\"",
+        "\"new_concurrent_stack\"",
         // The `xml` core DOM (I#351, D-0085): `XmlElement`/`XmlAttr` and the
         // `__xml_*` build/serialize helpers ship in the prelude, injected for any
         // program that names the module or one of these types.

@@ -7908,6 +7908,21 @@ mod tests {
     // --- AtomicArray[T] (#844) -------------------------------------------------
 
     #[test]
+    fn concurrent_set_and_stack_type_check() {
+        // ConcurrentSet[K] (wrapping the map) and the Treiber ConcurrentStack[T],
+        // monomorphized; element types come from the annotations.
+        ok("def main():\n    \
+            ConcurrentSet[int64] s = new_concurrent_set()\n    \
+            s.add(1)\n    \
+            auto c = s.contains(1)\n    \
+            auto r = s.remove(1)\n    \
+            auto n = s.length()\n    \
+            ConcurrentStack[int64] st = new_concurrent_stack()\n    \
+            st.push(5)\n    \
+            auto v, ok = st.pop()\n");
+    }
+
+    #[test]
     fn concurrent_map_surface_type_checks() {
         // The full ConcurrentMap[K, V] surface monomorphized at K=str, V=int64
         // (the element types come from the annotation, as with `new_queue`).
