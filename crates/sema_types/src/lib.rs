@@ -66,6 +66,11 @@ pub enum Ty {
     /// A typed channel `channel[T]` (ticket #25, D-0031): a first-class reference
     /// value over which `T` values are sent (`ch <- v`) and received (`<-ch`).
     Chan(Box<Ty>),
+    /// A concurrent `AtomicArray[T]` (#844, D-01xx): a fixed-capacity array of
+    /// atomically CAS-able reference/word slots — the pointer-array primitive the
+    /// field-based `Atomic[T]` (D-0066) cannot express. A GC-managed reference
+    /// type; `@shareable` so it may back a mutable module global (D-0113).
+    AtomicArray(Box<Ty>),
     /// A user-defined type (struct/enum), treated opaquely for now.
     Named(String),
     /// A regex match object (result of `subject =~ m/.../`, D-0010). Truthy on
@@ -188,6 +193,7 @@ impl Ty {
                 }
             }
             Ty::Chan(t) => format!("channel[{}]", t.display()),
+            Ty::AtomicArray(t) => format!("AtomicArray[{}]", t.display()),
             Ty::Named(n) => n.clone(),
             Ty::Match => "Match".into(),
             Ty::Py => "py".into(),

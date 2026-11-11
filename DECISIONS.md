@@ -7084,7 +7084,54 @@ change. `crates/driver/tests/perf.rs` gains `dict_int` and `fstring_only` next t
 `dict_string` so each CI run reports the #837 within-run split (lenient floors
 only — never an exact time, per the GC-golden determinism rule).
 
-## D-0146 — No user-facing `inline` keyword: inlining is the optimizer's job (#837, #841, #842)
+## D-0146 — `AtomicArray[T]`: atomically CAS-able indexed pointer slots (#844)
+
+**Status:** Accepted. **Tier:** Experimental (D-0076). **Depends on:** D-0066
+(`Atomic[T]`), D-0008/D-0009 (precise moving Immix), D-0078 §4.4 (the
+no-packed-pointers invariant), D-0113 (`@shareable`).
+
+**Context.** `Atomic[T]` (D-0066) provides compare-and-swap only on a single
+struct *field*. A lock-free structure whose shape is an *array* of CAS-able
+pointer slots — chiefly the O(1) bucket directory of the split-ordered concurrent
+map (#184) — cannot be expressed on top of it: a `list[T]` element is a
+non-addressable value word (runtime `zap_set_items`, reallocated on growth) and
+there is no fixed inline array of `Atomic` cells (see #844 for the analysis).
+
+**Decision.** Add a built-in generic reference type `AtomicArray[T]` (a runtime
+object in the `channel[T]`/`list[T]` class, `Ty::AtomicArray`), constructed
+`AtomicArray[T](cap)` and offering seq_cst `load(i) -> T`, `store(i, v)`,
+`compare_and_swap(i, old, new) -> bool`, and `len() -> int64`. All operations are
+sequentially consistent (`__atomic_*`), matching `Atomic[T]`. CAS is
+**pointer-identity**, like every `concurrent.*` structure.
+
+**GC safety (the load-bearing point).** The slot buffer is allocated with the
+pointer-scanned allocator (`zap_ptrbuf`: `GC_MALLOC` under conservative Boehm,
+precisely traced under moving Immix) and the `ZAP_TD_ATOMICARRAY` descriptor
+marks and *forwards* every non-null slot during the stop-the-world trace, exactly
+like a `list[T]` of references. So reclamation leans entirely on the tracing
+collector — no hazard pointers, epochs, or new barrier — which is sound because
+evacuation is stop-the-world (no CAS races a relocation) and the mutator observes
+moves load-at-use (D-0078 §4.2–4.3). The binding invariant (D-0078 §4.4) holds:
+a stored pointer always lives in a genuine reference slot, never a packed integer
+(reference elements use the `_ptr` runtime entry points; the collector never sees
+a tagged word).
+
+**Scope (v1).** Element types are a reference type or `int64` (the map needs
+reference slots; a counter/index needs `int64`). `bool`/`char`/`int32`/float/
+enum/value-struct/tuple elements are a follow-up. No growth (fixed capacity); a
+growable or typed-nested-element surface is additive. `@shareable` (D-0113), so
+`AtomicArray[T]` may back a mutable module global. aarch64-Linux inherits the
+node-liveness caveat tracked by #223/#650 like the other node-allocating
+concurrent structures.
+
+**Alternatives rejected.** Extending `list[T]` with per-element atomics (mixes
+atomic and non-atomic access on a reallocating buffer — unsafe); a fixed fan-out
+of named `Atomic` fields + an index `match` (a workaround simulating the missing
+primitive, barred by the language-first rule). Building the concurrent map on a
+lock around a plain `dict` (the sharded/hybrid design) was declined upstream in
+favour of a fully lock-free map, which requires this primitive.
+
+## D-0147 — No user-facing `inline` keyword: inlining is the optimizer's job (#837, #841, #842)
 
 **Status:** Locked. Zap exposes **no `inline` keyword, attribute, or pragma**, and will not add one. Whether a call is inlined is decided entirely by the toolchain, never by source-level annotation. This keeps the language surface free of a performance knob that is hard to use well, bit-rots against a changing cost model, and leaks implementation concerns into programs.
 

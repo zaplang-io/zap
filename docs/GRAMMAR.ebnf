@@ -539,7 +539,8 @@ comp_op       ::= "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "not" "in"
                      `x is not None` is the empty-variant / null check,
                      consistent with `== None` and `match case None`. Operands
                      must be reference types (a plain `struct`, D-0023; a
-                     `list`/`dict`/`set`/`heap`; a `channel`; `Optional[T]`); a
+                     `list`/`dict`/`set`/`heap`; a `channel`; an `AtomicArray`;
+                     `Optional[T]`); a
                      value type or scalar is a compile error (ZAP4073, or
                      ZAP4074 for `is None` on a never-None value) — use `==`. *)
 

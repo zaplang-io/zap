@@ -298,6 +298,12 @@ pub enum Ty {
     /// vs `zap_chan_send_ptr`), exactly like [`Ty::List`]. Maps to `ptr` in
     /// codegen.
     Chan(Elem),
+    /// A pointer to a runtime `AtomicArray[T]` object (#844): a fixed-capacity
+    /// array of atomically CAS-able 8-byte word slots. The element kind selects
+    /// how a stored word is interpreted (a reference is ptrtoint/inttoptr'd at the
+    /// lowering boundary, like the field-based [`Inst::AtomicCas`]) and whether the
+    /// collector traces the slots. Maps to `ptr` in codegen, like [`Ty::Chan`].
+    AtomicArray(Elem),
     /// A pointer to an immutable `bytes` object (ticket #337): physically the
     /// same `ZapStr {len, data}` length-prefixed byte buffer as `str`, so it maps
     /// to `ptr` in codegen and coerces to/from `Ptr` as a no-op bitcast. Kept
@@ -1038,6 +1044,7 @@ impl fmt::Display for Ty {
             Ty::Heap(e) => return write!(f, "heap[{}]", e.val_suffix()),
             Ty::Array(d) => return write!(f, "array[{}]", d.suffix()),
             Ty::Chan(e) => return write!(f, "chan[{}]", e.val_suffix()),
+            Ty::AtomicArray(e) => return write!(f, "AtomicArray[{}]", e.val_suffix()),
             Ty::Func(idx) => return write!(f, "fn#{idx}"),
         };
         f.write_str(s)
