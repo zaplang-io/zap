@@ -1447,7 +1447,8 @@ int64_t zap_atomicarray_cas_i64(void *ap, int64_t i, int64_t expected,
     ZapAtomicArray *a = (ZapAtomicArray *)ap;
     zap_atomicarray_bounds(a, i);
     int64_t exp = expected;
-    return __atomic_compare_exchange_n(&a->slots[i], &exp, desired, false,
+    /* `weak` = 0 (strong CAS); the runtime C has no <stdbool.h>, so a plain 0. */
+    return __atomic_compare_exchange_n(&a->slots[i], &exp, desired, 0,
                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
                ? 1
                : 0;

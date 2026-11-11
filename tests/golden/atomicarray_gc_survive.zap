@@ -25,12 +25,12 @@ def main():
     a.store(2, Node(v=30))  # slot 1 stays empty (null) — must not be scanned as a ptr
     churn(200000)
     gc.collect()
-    print(a.load(0).v)                               # 10  (survived via the slot only)
-    print(a.load(2).v)                               # 30
+    print(a.load(0).v)  # 10  (survived via the slot only)
+    print(a.load(2).v)  # 30
     auto keep = a.load(0)
     Node n99 = Node(v=99)
-    print(b2i(a.compare_and_swap(0, keep, n99)))     # 1   (identity match -> swapped)
+    print(b2i(a.compare_and_swap(0, keep, n99)))  # 1   (identity match -> swapped)
     churn(200000)
     gc.collect()
-    print(a.load(0).v)                               # 99  (new value survived)
-    print(a.load(2).v)                               # 30  (untouched, survived twice)
+    print(a.load(0).v)  # 99  (new value survived)
+    print(a.load(2).v)  # 30  (untouched, survived twice)
