@@ -176,18 +176,22 @@ fn disasm(bin: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Count the out-of-line CALL/branch references to `sym` in objdump output,
-/// EXCLUDING the function's own definition label. objdump renders a definition
-/// as a line ending `<sym>:` (address + `<name>:`) and a call/branch target as
-/// `… <sym>` or `… <sym@plt>` (no trailing colon). We therefore count lines that
-/// mention the symbol but are not a definition label — arch-agnostic across the
-/// x86-64 (`callq`) and aarch64 (`bl`) legs, and robust to the out-of-line copy
-/// being retained (e.g. kept live by `-rdynamic`) while all call sites inline.
+/// Count the out-of-line CALL/branch references TO `sym` in objdump output. A
+/// real call/branch to the function targets `<sym>` (or `<sym@plt>`); objdump
+/// renders the function's DEFINITION as `<sym>:` (trailing colon) and an
+/// INTERNAL jump within the function's own body as `<sym+0xNN>` (an offset into
+/// it). We must count only the first kind: the retained out-of-line copy of an
+/// otherwise-inlined wrapper (kept live by `-rdynamic`) still contains internal
+/// `<sym+0xNN>` branches, and counting those would wrongly report the wrapper as
+/// "not inlined". So match the symbol followed immediately by `>` or `@`, never
+/// `+`, and skip the definition label line. Arch-agnostic across the x86-64
+/// (`callq`) and aarch64 (`bl`) legs.
 fn call_refs(disasm: &str, sym: &str) -> usize {
-    let needle = format!("<{sym}");
+    let exact = format!("<{sym}>"); // e.g. `call … <zap_dict_get_str_i64>`
+    let plt = format!("<{sym}@"); // e.g. `… <zap_dict_get_str_i64@plt>`
     disasm
         .lines()
-        .filter(|l| l.contains(&needle) && !l.trim_end().ends_with(':'))
+        .filter(|l| !l.trim_end().ends_with(':') && (l.contains(&exact) || l.contains(&plt)))
         .count()
 }
 
