@@ -40,6 +40,24 @@ mod tests {
     // --- AtomicArray[T] (#844) -------------------------------------------------
 
     #[test]
+    fn concurrent_set_and_stack_lower() {
+        // ConcurrentSet[int64] wraps the map (-> AtomicArray bucket directory);
+        // the Treiber ConcurrentStack[str] uses a single atomic head CAS. Both
+        // must monomorphize and lower end-to-end.
+        let m = lower_ok(
+            "def main():\n    \
+             ConcurrentSet[int64] s = new_concurrent_set()\n    \
+             s.add(1)\n    \
+             auto c = s.contains(1)\n    \
+             ConcurrentStack[str] st = new_concurrent_stack()\n    \
+             st.push(\"x\")\n    \
+             auto v, ok = st.pop()\n",
+        );
+        let text = format!("{m}");
+        assert!(text.contains("zap_atomicarray_new"), "text:\n{text}");
+    }
+
+    #[test]
     fn concurrent_map_monomorphizes_and_lowers() {
         // Using ConcurrentMap[str, int64] forces its generic split-order methods
         // to monomorphize and lower end-to-end; the bucket directory lowers to the
