@@ -25,6 +25,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`ConcurrentSet[K]` and `ConcurrentStack[T]` — lock-free concurrent set +
+  stack** (#184, D-0148). `ConcurrentSet[K: Hashable]` (`new_concurrent_set`;
+  `add`/`contains`/`remove`/`length`) is a membership wrapper over
+  `ConcurrentMap`, inheriting its lock-free/resizable/GC-safe properties.
+  `ConcurrentStack[T]` (`new_concurrent_stack`; `push`, comma-ok `pop`) is a
+  lock-free Treiber stack — one atomic head, single-CAS push/pop, lean-on-GC
+  reclamation. Both `@shareable` (D-0113), Experimental (D-0076), pure Zap.
 - **`ConcurrentMap[K, V]` — a lock-free, resizable hash map** (#184, D-0147).
   A split-ordered hash table (Shalev & Shavit) built on `AtomicArray[T]`
   (D-0146): one lock-free linked list of entries sorted by bit-reversed hash,
