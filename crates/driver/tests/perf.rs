@@ -367,6 +367,15 @@ fn perf_lto_dict_inlining_trend() {
              build must stay functionally identical (correctness gate)"
         );
 
+        // REPORT ONLY — never a pass/fail gate. These timings are whole-`zapc
+        // run` wall-clocks (compile + run), and the LTO compile (llvm-link +
+        // `opt -O2` + clang) is much slower than the object-link compile, so for
+        // these short benchmarks the build time dominates the runtime and a
+        // compile-vs-run wall-clock comparison says nothing about the inlining
+        // win. The deterministic proof that the dict fast path inlines is
+        // `tests/lto.rs` (a disassembly assertion); this table is only a trend
+        // line in the CI summary, held to the GC-golden rule that CI never gates
+        // on wall-clock. The correctness checks above remain the real gate.
         let base_s = base_dur.as_secs_f64();
         let lto_s = lto_dur.as_secs_f64();
         let speedup = base_s / lto_s.max(1e-9);
@@ -377,19 +386,6 @@ fn perf_lto_dict_inlining_trend() {
             lto_s * 1e3,
             speedup,
         ));
-
-        // Lenient, machine-independent floor: inlining the runtime fast paths
-        // must never make the SAME workload catastrophically slower. We expect a
-        // speedup (or parity); allow generous headroom (up to 3× slower + a fixed
-        // slack) before failing, so only a structurally broken LTO build — one
-        // that pessimizes the hot loop — trips it, never CI noise. The exact
-        // speedup is reported for trend, not asserted.
-        assert!(
-            lto_s < base_s * 3.0 + 0.5,
-            "LTO `{name}` ran {lto_s:.3}s vs non-LTO {base_s:.3}s — a structural \
-             regression (the LTO build should match or beat the object-link build \
-             on the hot runtime path, not run multiples slower)"
-        );
     }
 
     eprintln!("\n{report}");
