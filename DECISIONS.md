@@ -7182,7 +7182,33 @@ invariant, deferring physical reclamation. In-place value update via
 `Atomic[Optional[V]]` (only single-word for reference `V`; rejected so `V` stays
 unconstrained).
 
-## D-0148 — no `inline` keyword; inlining is the toolchain's job (LLVM -O2 + LTO runtime boundary + codegen open-coding) (#841)
+## D-0148 — `ConcurrentSet[K]` and the Treiber `ConcurrentStack[T]` (#184)
+
+**Status:** Accepted. **Tier:** Experimental (D-0076). **Depends on:** D-0147
+(`ConcurrentMap`), D-0146 (`AtomicArray`), D-0066 (`Atomic`), D-0078 (lean-on-GC).
+
+Rounds out the #184 concurrent-collections surface with two small additive
+prelude types, both `@shareable` (D-0113), pure Zap, no runtime-C:
+
+- **`ConcurrentSet[K: Hashable]`** — a membership wrapper over
+  `ConcurrentMap[K, bool]` (`new_concurrent_set[K]()`; `add`/`contains`/`remove`/
+  `length`). Every lock-free, resizable, and GC-safety property of the map
+  (D-0147) carries over unchanged; the stored `bool` is unused. A dedicated
+  value-free split-order set is a possible later memory optimization.
+- **`ConcurrentStack[T]`** — a lock-free **Treiber stack** (`new_concurrent_
+  stack[T]()`; `push`, comma-ok `pop`). One `Atomic[CStackNode[T]]` head; push
+  and pop are each a single-CAS retry loop. Reclamation leans on the tracing
+  moving GC (D-0078 §4.3): a popped node is collected once unreachable, CAS is
+  pointer-identity, and ABA is moot (a still-referenced node is never reclaimed,
+  so its address is not reused under a stale CAS).
+
+**Not done here:** a concurrent **priority queue / heap** — a lock-free heap is a
+fundamentally different structure (skip-list or array-based) sharing none of this
+machinery, and gets its own design ticket if demanded. Deletion/reclamation
+limits inherited from D-0147 apply to the set; the stack has none (pop unlinks).
+aarch64-Linux inherits the node-liveness caveat (#223/#650).
+
+## D-0149 — no `inline` keyword; inlining is the toolchain's job (LLVM -O2 + LTO runtime boundary + codegen open-coding) (#841)
 
 **Problem.** The C runtime (`zaprt.c`) is compiled to its OWN object file and
 linked against the program object. The program is emitted and optimized as its own

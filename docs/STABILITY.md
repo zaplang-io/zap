@@ -228,7 +228,7 @@ not supported — it may change in **any** release, including a PATCH:
   assertion that the type is safe under concurrent shared access; it is
   reflectable via `reflect_has(T, "shareable")`, and the built-in `Atomic` /
   `Mutex` / `WaitGroup` / `Once` / `Counter` / `Queue` / `AtomicArray` /
-  `ConcurrentMap` types carry
+  `ConcurrentMap` / `ConcurrentSet` / `ConcurrentStack` types carry
   it implicitly under one uniform rule. The sharing lint raises the non-fatal **`ZAP5125`**
   warning at a read/write of a mutable module global whose type is not
   `@shareable` (a `const` global never warns), suppressible per-site with
@@ -448,6 +448,7 @@ matching per-section tier; this table is the cross-surface source of truth.
 | `concurrent` — lock-free `Counter` + MPSC `Queue[T]` (D-0078); the multicore `Queue[T]` hang/UAF under gc-boehm (I#710, a #223 follow-up) is fixed (D-0128), pending the Graviton re-run that clears #223 | **E** |
 | `AtomicArray[T]` — fixed-capacity array of seq_cst CAS-able slots (`load`/`store`/`compare_and_swap`/`len`), reference slots traced + forwarded by the moving collector (#844, D-0146); v1 elements are a reference type or `int64`; node-liveness on aarch64-Linux tracked by #223/#650 | **E** |
 | `ConcurrentMap[K, V]` — lock-free, resizable split-ordered hash map on `AtomicArray` (#184, D-0147): `put`/`get`/`delete`/`contains`/`get_or`/`length`, `new_concurrent_map[K, V]()`; lazy lock-free resize; v1 defers physical reclamation of shadowed/tombstoned nodes and caps bucket count, `length()` approximate, no snapshot iteration; aarch64-Linux node-liveness tracked by #223/#650 | **E** |
+| `ConcurrentSet[K]` (membership wrapper over `ConcurrentMap`: `add`/`contains`/`remove`/`length`, `new_concurrent_set[K]()`) and the lock-free Treiber `ConcurrentStack[T]` (`push`/comma-ok `pop`, `new_concurrent_stack[T]()`) (#184, D-0148); same lean-on-GC model; set inherits the map's v1 limits, stack has none; aarch64-Linux node-liveness tracked by #223/#650 | **E** |
 | `url` — `encoding/url` percent-encode/decode + AWS SigV4 query canonicalization (#335): `quote`/`quote_path`/`unquote`/`unquote_plus`, `encode_query`/`canonical_query` | **E** |
 
 The experimental RSA surface is specifically ordinary RSA with PKCS#1 v1.5

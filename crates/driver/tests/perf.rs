@@ -38,7 +38,7 @@ fn run_timed(name: &str, src: &str) -> (String, Duration) {
 }
 
 /// Like [`run_timed`], but when `lto` is `Some((clang, llvm_link))` the compile
-/// runs under the `ZAP_LTO` build flag (I#841, D-0148) with those tools, so the
+/// runs under the `ZAP_LTO` build flag (I#841, D-0149) with those tools, so the
 /// runtime fast paths are inlined into the program. Used by the LTO trend test
 /// to compare the same workload with and without runtime inlining.
 fn run_timed_opts(name: &str, src: &str, lto: Option<(&str, &str, &str)>) -> (String, Duration) {
@@ -321,7 +321,7 @@ fn bench_src(name: &str) -> (&'static str, &'static str) {
     (b.src, b.expect)
 }
 
-/// LTO runtime-inlining TREND (I#841, D-0148). Runs the dict workloads with and
+/// LTO runtime-inlining TREND (I#841, D-0149). Runs the dict workloads with and
 /// without the `ZAP_LTO` build flag and records the speedup from inlining the
 /// runtime fast paths into the hot `d[k]` loop. Like the rest of this harness it
 /// asserts correctness and only a LENIENT, machine-independent relation — never

@@ -1751,7 +1751,7 @@ static uint64_t zap_hash_str(const ZapStr *s) {
     return h;
 }
 
-/* `noinline` (#841, D-0148): keeping the key hash out of line keeps the dict
+/* `noinline` (#841, D-0149): keeping the key hash out of line keeps the dict
  * fast path (zap_dict_get) tiny — otherwise the string-key FNV loop folds into
  * the inlinable fast path and puffs the typed wrapper back over LLVM's inline
  * threshold, so the LTO cross-module inliner declines to pull it into a hot loop
@@ -1971,7 +1971,7 @@ static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
 /* Missing-key get returns 0 (null word) for this increment; membership and a
  * real KeyError wait for the exception runtime (ticket #22). */
 /* Dict get is split into a small inlinable FAST path and an out-of-line SLOW
- * path (#841, D-0148). The fast path handles the common case — the key is found
+ * path (#841, D-0149). The fast path handles the common case — the key is found
  * at the FIRST probe by word/pointer IDENTITY — in a few instructions, and
  * tail-calls the slow path for everything else (value comparison, probing,
  * tombstones, misses, and user-struct keys). `always_inline` lets the fast path
