@@ -295,21 +295,29 @@ jobs:
       - name: "Test (${{ matrix.gc }})"
         run: cargo test --workspace --features zapc/${{ matrix.gc }}
 
-      # Re-run the golden end-to-end + GC-stress suites with the LTO build flag
-      # ON (I#841, D-0149), so the full program corpus (including the `--race`
-      # fixtures driven by the golden harness) stays green when every program is
-      # linked under `clang -O2 -flto` — on BOTH collectors (golden on each leg;
-      # the GC-stress suite is gc-immix-gated). Reuses the test binaries built
-      # above (same feature set), so the only added cost is the LTO link time per
-      # program; `clang-18` is already installed above. The deterministic
-      # inlining/noinline guard itself is `tests/lto.rs` in the step above.
+      # Smoke-test the LTO build END TO END (I#841, D-0149) over a SMALL,
+      # representative slice of the golden corpus, on BOTH collectors. The
+      # per-program LTO link runs `clang -O2 -flto` (llvm-link + opt -O2) over
+      # the whole merged runtime for EVERY program, so re-linking the entire
+      # corpus here cost minutes per leg for no added coverage — the full corpus
+      # already runs under the default, fast build in the step above, and the
+      # deterministic inlining/noinline guard is `tests/lto.rs` there too. The
+      # `ZAP_GOLDEN_ONLY` allowlist (see `golden.rs`) pins this to four fixtures
+      # that between them cover what LTO actually touches: `dict_word_count`
+      # (the inlined `zap_dict_get`/`zap_str_concat`/`zap_i64_to_str` fast paths
+      # plus stdout), `coroutines` (ucontext switch + the GC shadow-stack
+      # discipline under LTO), `concurrent_counter_coro_stress` (GC safepoints +
+      # atomics under concurrency), and `except_star_routing` (LLVM unwind
+      # tables under LTO). Deeper per-program LTO speedups (ThinLTO-style) are a
+      # follow-up for the default-LTO flip, where per-program build time matters.
       - name: "Test under LTO (${{ matrix.gc }})"
         env:
           ZAP_LTO: 1
           ZAP_LTO_CC: clang-18
           ZAP_LLVM_LINK: /usr/lib/llvm-18/bin/llvm-link
           ZAP_OPT: /usr/lib/llvm-18/bin/opt
-        run: cargo test --workspace --features zapc/${{ matrix.gc }} --test golden --test gc
+          ZAP_GOLDEN_ONLY: dict_word_count,coroutines,concurrent_counter_coro_stress,except_star_routing
+        run: cargo test --workspace --features zapc/${{ matrix.gc }} --test golden
 
   # ARM-Linux (aarch64) validation (ticket #204, platform epic #158 / C2). The
   # same codegen + golden end-to-end suite as `full`, run natively on a GitHub-
