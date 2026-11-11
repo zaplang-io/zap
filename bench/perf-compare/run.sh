@@ -9,7 +9,12 @@
 # gating.
 #
 # Usage: ZAPC=./target/release/zapc REPS=5 bench/perf-compare/run.sh
-set -euo pipefail
+#
+# Deliberately NOT `set -e`: a bench or build that fails should be reported in
+# the table and flip the exit code at the end, not abort the whole run silently
+# (and `read`-ing a newline-less line returns non-zero, which `set -e` would
+# mistake for a failure).
+set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ZAPC="${ZAPC:-./target/release/zapc}"
@@ -32,21 +37,29 @@ declare -A LABEL=(
 
 now_ns() { date +%s%N; }
 
-# Run "$@" REPS times; print "min_ms<TAB>stdout-of-last-run".
+# Run "$@" REPS times. Sets globals TIMEIT_MS (min ms) and TIMEIT_OUT (output of
+# the last run); returns the last run's exit status. No process substitution /
+# `read`, so no set-e / trailing-newline hazards.
+TIMEIT_MS=0
+TIMEIT_OUT=""
 timeit() {
-  local best="" out="" t0 t1 ms
-  for _ in $(seq 1 "$REPS"); do
+  local best="" out="" t0 t1 ms st=0
+  local i
+  for i in $(seq 1 "$REPS"); do
     t0=$(now_ns)
     out="$("$@")"
+    st=$?
     t1=$(now_ns)
     ms=$(( (t1 - t0) / 1000000 ))
     if [ -z "$best" ] || [ "$ms" -lt "$best" ]; then best="$ms"; fi
   done
-  printf '%s\t%s' "$best" "$out"
+  TIMEIT_MS="$best"
+  TIMEIT_OUT="$out"
+  return "$st"
 }
 
-# faster-by ratio "b / a" to 1 decimal (how many times faster `a` is than `b`).
-ratio() { awk -v a="$1" -v b="$2" 'BEGIN{ if (a<1) a=1; printf "%.1f", b/a }'; }
+# "b / a" to 1 decimal: how many times faster `a` (Zap) is than `b`.
+ratio() { awk -v a="$1" -v b="$2" 'BEGIN{ if (a+0 < 1) a=1; printf "%.1f", (b+0)/(a+0) }'; }
 
 fail=0
 rows=""
@@ -54,22 +67,37 @@ echo "Zap:    $("$ZAPC" --version 2>/dev/null || echo '(zapc)')"
 echo "Go:     $(go version)"
 echo "Python: $(python3 --version)"
 echo "Best of $REPS runs; times in ms (lower is better)."
+echo "(zapc build warnings — e.g. OpenSSL 3.0 deprecations in the runtime — are"
+echo " captured to a log and are not failures.)"
 echo
 
 printf '%-14s %10s %10s %10s %14s %12s\n' bench zap_ms go_ms python_ms "zap_vs_python" "zap_vs_go"
 for name in "${BENCHES[@]}"; do
   exp="${EXPECT[$name]}"
 
-  "$ZAPC" build -o "$OUT/$name.zap.bin" "$HERE/$name.zap" >/dev/null
-  go build -o "$OUT/$name.go.bin" "$HERE/$name.go"
+  if ! "$ZAPC" build -o "$OUT/$name.zap.bin" "$HERE/$name.zap" >"$OUT/$name.zapbuild.log" 2>&1; then
+    echo "!! zapc build FAILED for $name:" >&2
+    tail -n 25 "$OUT/$name.zapbuild.log" >&2
+    fail=1
+    continue
+  fi
+  if ! go build -o "$OUT/$name.go.bin" "$HERE/$name.go" >"$OUT/$name.gobuild.log" 2>&1; then
+    echo "!! go build FAILED for $name:" >&2
+    cat "$OUT/$name.gobuild.log" >&2
+    fail=1
+    continue
+  fi
 
-  IFS=$'\t' read -r zms zout < <(timeit "$OUT/$name.zap.bin")
-  IFS=$'\t' read -r gms gout < <(timeit "$OUT/$name.go.bin")
-  IFS=$'\t' read -r pms pout < <(timeit python3 "$HERE/$name.py")
+  timeit "$OUT/$name.zap.bin"; zst=$?; zms="$TIMEIT_MS"; zout="$TIMEIT_OUT"
+  timeit "$OUT/$name.go.bin";  gst=$?; gms="$TIMEIT_MS"; gout="$TIMEIT_OUT"
+  timeit python3 "$HERE/$name.py"; pst=$?; pms="$TIMEIT_MS"; pout="$TIMEIT_OUT"
 
-  for pair in "zap=$zout" "go=$gout" "python=$pout"; do
-    lang="${pair%%=*}"; got="${pair#*=}"
-    if [ "$got" != "$exp" ]; then
+  for entry in "zap:$zst:$zout" "go:$gst:$gout" "python:$pst:$pout"; do
+    lang="${entry%%:*}"; rest="${entry#*:}"; st="${rest%%:*}"; got="${rest#*:}"
+    if [ "$st" -ne 0 ]; then
+      echo "!! $name/$lang exited with status $st" >&2
+      fail=1
+    elif [ "$got" != "$exp" ]; then
       echo "!! MISMATCH $name/$lang: got '$got', expected '$exp'" >&2
       fail=1
     fi
@@ -95,10 +123,14 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo "| benchmark | Zap (ms) | Go (ms) | Python (ms) | Zap vs Python | Zap vs Go |"
     echo "|---|---:|---:|---:|---:|---:|"
     printf '%s' "$rows"
+    if [ "$fail" -ne 0 ]; then
+      echo
+      echo "> ⚠️ one or more programs failed to build / run / match — see the job log."
+    fi
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 
 if [ "$fail" -ne 0 ]; then
-  echo "one or more programs produced the wrong result — timings are not trustworthy" >&2
+  echo "one or more programs failed — timings above may be incomplete" >&2
   exit 1
 fi
