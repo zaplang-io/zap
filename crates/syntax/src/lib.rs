@@ -41,5 +41,12 @@ pub const SHAREABLE_MARKER: &str = "shareable";
 /// Shareability is decided on a type's nominal base name, so a generic spelling
 /// such as `Atomic[int64]` or `Queue[str]` is covered by its base (`Atomic`,
 /// `Queue`).
-pub const BUILTIN_SHAREABLE_TYPES: &[&str] =
-    &["Atomic", "Mutex", "WaitGroup", "Once", "Counter", "Queue"];
+pub const BUILTIN_SHAREABLE_TYPES: &[&str] = &[
+    "Atomic",
+    "Mutex",
+    "WaitGroup",
+    "Once",
+    "Counter",
+    "Queue",
+    "AtomicArray",
+];

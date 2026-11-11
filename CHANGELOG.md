@@ -25,6 +25,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`AtomicArray[T]` — a fixed-capacity array of atomically CAS-able slots**
+  (#844, D-0146). The pointer-array primitive the field-based `Atomic[T]`
+  (D-0066) could not express: `AtomicArray[T](cap)` allocates `cap` seq_cst
+  slots, with `load(i)`, `store(i, v)`, `compare_and_swap(i, old, new) -> bool`,
+  and `len()`. Reference elements are genuine traced GC slots — marked and
+  forwarded by the moving Immix collector exactly like a `list[T]` of pointers
+  (D-0078 §4.4: a stored pointer always lives in a real reference slot, never a
+  packed integer), so no hazard/epoch machinery is needed. `@shareable`
+  (D-0113), Experimental (D-0076). v1 element types: a reference type or
+  `int64`. Unblocks the lock-free concurrent map (#184). CAS is pointer-identity.
 - **`tls` per-connection client contexts — private trust roots + client
   certificates (mutual TLS)** (#560, D-0144). An `ssl`-style client context,
   mirroring Python's `ssl` module: `tls.create_default_context()` preloads the

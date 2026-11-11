@@ -307,7 +307,8 @@ enum {
     ZAP_TD_ARRAY = 7,
     ZAP_TD_GSTACK = 8,
     ZAP_TD_MATCH = 9,  /* ZapMatch (regex): groups/names buffers of ZapStr*     */
-    ZAP_TD_SCOPE = 10  /* Scope: excs buffer of ZapStr* pending failures        */
+    ZAP_TD_SCOPE = 10, /* Scope: excs buffer of ZapStr* pending failures        */
+    ZAP_TD_ATOMICARRAY = 11 /* ZapAtomicArray: slots buffer of CAS-able words   */
 };
 
 /* Runtime-internal container descriptors (defined at the bottom of this file). */
@@ -326,6 +327,7 @@ extern const ZapTypeDesc zap_desc_pyobj;
 extern const ZapTypeDesc zap_desc_gobj;    /* scheduler G (precise)             */
 extern const ZapTypeDesc zap_desc_ptrs;    /* a generic array-of-pointers buffer */
 extern const ZapTypeDesc zap_desc_sigsub;  /* SigSub: {next, chan} (ticket #77)  */
+extern const ZapTypeDesc zap_desc_atomicarray; /* AtomicArray[T] (#844)           */
 
 /* Preemption guard (ticket #172): mark a window in which the current coroutine
  * must not be async-preempted (it is inside a runtime critical section that
@@ -1365,6 +1367,104 @@ void *zap_list_new(void) {
     l->cap = 0;
     l->data = NULL;
     return l;
+}
+
+/* AtomicArray[T] (#844, D-01xx): a fixed-capacity array of atomically CAS-able
+ * machine-word slots, the pointer-array primitive the field-based `Atomic[T]`
+ * (D-0066) could not provide. Each slot is one 8-byte word; `load`/`store`/`cas`
+ * are seq_cst (`__atomic_*`), matching `Atomic[T]`. `elem_ptr` records whether
+ * the slots hold GC references (set from the monomorphized element type), so the
+ * collector traces + forwards each slot exactly like a `list[T]` of pointers
+ * (ZAP_TD_ATOMICARRAY trace in zapgc.inc.c). The `slots` buffer is allocated with
+ * `zap_ptrbuf` (pointer-scanned under conservative Boehm, precisely traced under
+ * moving Immix) so stored references stay alive under BOTH collectors — the
+ * correctness invariant from D-0078 §4.4 (every stored pointer in a genuine
+ * reference slot, never a packed integer). Capacity is fixed at construction;
+ * there is no growth, so a slot address is stable across the lifetime (only the
+ * buffer itself may be relocated at STW, between atomic ops, which reload it). */
+typedef struct {
+    int64_t cap;      /* number of slots (fixed)                               */
+    int64_t *slots;   /* `cap` word slots; CAS-able; may hold GC pointers      */
+    uint8_t elem_ptr; /* 1 iff slots hold GC references (traced + forwarded)   */
+} ZapAtomicArray;
+
+void *zap_atomicarray_new(int64_t cap, int64_t elem_is_ptr) {
+    if (cap < 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("AtomicArray capacity must be >= 0", 33));
+    }
+    ZapAtomicArray *a = (ZapAtomicArray *)zap_obj(&zap_desc_atomicarray);
+    a->cap = cap;
+    a->elem_ptr = elem_is_ptr ? 1 : 0;
+    /* zero-init: unused slots read as 0 / None. `zap_ptrbuf` (GC_MALLOC_ATOMIC
+     * under Immix) does not guarantee zeroed memory, so memset explicitly. */
+    int64_t *slots = (int64_t *)zap_ptrbuf(cap * (int64_t)sizeof(int64_t));
+    if (cap > 0) {
+        memset(slots, 0, (size_t)cap * sizeof(int64_t));
+    }
+    a->slots = slots;
+    return a;
+}
+
+int64_t zap_atomicarray_len(void *ap) { return ((ZapAtomicArray *)ap)->cap; }
+
+/* Out-of-range access raises a catchable Zap exception (#383), like list
+ * indexing. The index is reported as written. */
+static void zap_atomicarray_bounds(ZapAtomicArray *a, int64_t i) {
+    if (i < 0 || i >= a->cap) {
+        char msg[96];
+        int n = snprintf(msg, sizeof(msg),
+                         "AtomicArray index %lld out of range (len %lld)",
+                         (long long)i, (long long)a->cap);
+        zap_panic_typed(ZAP_EXC_INDEX_ERROR,
+                        zap_str_new(msg, n < 0 ? 0 : (int64_t)n));
+    }
+}
+
+/* Core i64-word ops. The reference (`_ptr`) entry points below are thin bitwise
+ * wrappers (a GC pointer is one machine word), kept as separate symbols so
+ * lowering can pass/return a `ptr` value with no ptr<->int cast at the IR
+ * boundary — the same typed-entry-point split channel send/recv uses
+ * (`zap_chan_send_i64` vs `_ptr`). */
+int64_t zap_atomicarray_load_i64(void *ap, int64_t i) {
+    ZapAtomicArray *a = (ZapAtomicArray *)ap;
+    zap_atomicarray_bounds(a, i);
+    return __atomic_load_n(&a->slots[i], __ATOMIC_SEQ_CST);
+}
+
+void zap_atomicarray_store_i64(void *ap, int64_t i, int64_t word) {
+    ZapAtomicArray *a = (ZapAtomicArray *)ap;
+    zap_atomicarray_bounds(a, i);
+    __atomic_store_n(&a->slots[i], word, __ATOMIC_SEQ_CST);
+}
+
+/* seq_cst compare-and-swap: store `desired` iff slot i currently equals
+ * `expected`; return 1 on success, 0 otherwise. `__atomic_compare_exchange_n`
+ * writes the observed value back into its expected arg on failure, so a local
+ * copy is used to leave the caller's value untouched. */
+int64_t zap_atomicarray_cas_i64(void *ap, int64_t i, int64_t expected,
+                                int64_t desired) {
+    ZapAtomicArray *a = (ZapAtomicArray *)ap;
+    zap_atomicarray_bounds(a, i);
+    int64_t exp = expected;
+    return __atomic_compare_exchange_n(&a->slots[i], &exp, desired, false,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+               ? 1
+               : 0;
+}
+
+void *zap_atomicarray_load_ptr(void *ap, int64_t i) {
+    return (void *)(intptr_t)zap_atomicarray_load_i64(ap, i);
+}
+
+void zap_atomicarray_store_ptr(void *ap, int64_t i, void *v) {
+    zap_atomicarray_store_i64(ap, i, (int64_t)(intptr_t)v);
+}
+
+int64_t zap_atomicarray_cas_ptr(void *ap, int64_t i, void *expected,
+                                void *desired) {
+    return zap_atomicarray_cas_i64(ap, i, (int64_t)(intptr_t)expected,
+                                   (int64_t)(intptr_t)desired);
 }
 
 static void zap_list_grow(ZapList *l) {
@@ -11557,6 +11657,8 @@ const ZapTypeDesc zap_desc_chan = {(int64_t)sizeof(ZapChan), ZAP_TD_CHAN, 0, NUL
 const ZapTypeDesc zap_desc_array = {(int64_t)sizeof(ZapArray), ZAP_TD_ARRAY, 0, NULL};
 const ZapTypeDesc zap_desc_matchobj = {(int64_t)sizeof(ZapMatch), ZAP_TD_MATCH, 0, NULL};
 const ZapTypeDesc zap_desc_scope = {(int64_t)sizeof(Scope), ZAP_TD_SCOPE, 0, NULL};
+const ZapTypeDesc zap_desc_atomicarray =
+    {(int64_t)sizeof(ZapAtomicArray), ZAP_TD_ATOMICARRAY, 0, NULL};
 /* ZapPy wraps a borrowed CPython reference, not a GC pointer, so it is a leaf. */
 const ZapTypeDesc zap_desc_pyobj = {(int64_t)sizeof(ZapPy), ZAP_TD_ATOMIC, 0, NULL};
 /* One-object string (#837, D-0145): header + inline byte payload. ATOMIC — the

@@ -977,6 +977,25 @@ static void zap_trace_children(void *payload) {
         }
         return;
     }
+    case ZAP_TD_ATOMICARRAY: {
+        /* AtomicArray[T] (#844): forward the slots buffer itself, then — when the
+         * slots hold references — mark + forward every non-null slot, exactly like
+         * a `list[T]` of pointers (ZAP_TD_LIST). Evacuation is stop-the-world, so
+         * no mutator CAS is in flight while these slots are rewritten (D-0078). */
+        ZapAtomicArray *a = (ZapAtomicArray *)payload;
+        if (a->slots) {
+            zap_process_slot((void **)&a->slots);
+            if (a->elem_ptr) {
+                int64_t *slots = a->slots;
+                for (int64_t i = 0; i < a->cap; i++) {
+                    if (slots[i]) {
+                        zap_process_slot((void **)&slots[i]);
+                    }
+                }
+            }
+        }
+        return;
+    }
     case ZAP_TD_MATCH: {
         ZapMatch *mm = (ZapMatch *)payload;
         if (mm->groups) {

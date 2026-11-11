@@ -2464,6 +2464,13 @@ impl Checker {
                         .unwrap_or(Ty::Unknown);
                     Ty::Chan(Box::new(el))
                 }
+                "AtomicArray" => {
+                    let el = args
+                        .first()
+                        .map(|a| self.resolve_type(a))
+                        .unwrap_or(Ty::Unknown);
+                    Ty::AtomicArray(Box::new(el))
+                }
                 other => {
                     // A transparent type alias (#606) resolves to its target
                     // with the generic parameters substituted, recursively, so
@@ -5468,6 +5475,7 @@ impl Checker {
         match t {
             Ty::Unknown | Ty::Py => true,
             Ty::List(_) | Ty::Dict(_, _) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) => true,
+            Ty::AtomicArray(_) => true,
             _ if Self::is_optional_ty(t) => true,
             Ty::Named(n) => self.structs.get(n).is_some_and(|s| !s.is_value),
             _ => false,
@@ -5757,6 +5765,55 @@ impl Checker {
                     }
                 }
                 return Ty::Chan(Box::new(elem));
+            }
+            // AtomicArray construction `AtomicArray[T](cap)` (#844). The element
+            // type `T` is the subscript; the sole argument is the fixed capacity
+            // (a non-negative integer). All slots start None/0.
+            if matches!(base.as_ref(), Expr::Name(n, _) if n == "AtomicArray") {
+                let elem = self.chan_elem_from_expr(index);
+                // v1 supports exactly reference elements (a pointer slot) and
+                // `int64` (a word slot) — the map needs reference slots, a counter
+                // needs int64. A value struct, float, bool/char, enum, int32,
+                // bigint/complex, or tuple is not a pointer-width slot and is
+                // rejected here. (`is_identity_ty` admits user *reference* structs,
+                // the built-in collections, `Optional`, and `Py`.)
+                let elem_ok =
+                    matches!(elem, Ty::Int64 | Ty::Str | Ty::Bytes) || self.is_identity_ty(&elem);
+                if !elem_ok {
+                    self.error(
+                        ErrorCode::ZAP4028,
+                        format!(
+                            "AtomicArray[T] supports reference types or int64, not {} \
+                             (Experimental; other element kinds are a follow-up)",
+                            elem.display()
+                        ),
+                        span,
+                    );
+                }
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "AtomicArray[T](cap) takes exactly one argument (the \
+                             capacity), got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                } else {
+                    let at = self.infer(&args[0].value);
+                    if !at.is_int() && !matches!(at, Ty::Unknown) {
+                        self.error(
+                            ErrorCode::ZAP4033,
+                            format!(
+                                "AtomicArray capacity must be an integer, found {}",
+                                at.display()
+                            ),
+                            expr_span(&args[0].value),
+                        );
+                    }
+                }
+                return Ty::AtomicArray(Box::new(elem));
             }
             // Heap construction `heap[T]()` / `heap[T](cmp="max")` (D-0057). The
             // element type `T` is the subscript; the only accepted argument is the
@@ -6590,6 +6647,12 @@ impl Checker {
                 let (k, v) = (k.clone(), v.clone());
                 return self.check_dict_method(name, args, &k, &v, *span);
             }
+            // AtomicArray[T] methods (#844): load(i)->T, store(i,v), len()->int64,
+            // compare_and_swap(i,old,new)->bool — all seq_cst, typed precisely.
+            if let Ty::AtomicArray(elem) = &bt {
+                let elem = (**elem).clone();
+                return self.check_atomicarray_method(name, args, &elem, *span);
+            }
             // A method call on a user struct `recv.method(args)` is typed by the
             // method's declared return type (D-0009). The struct's method table
             // already carries the resolved signature, with `self`/`Self` bound to
@@ -6728,6 +6791,113 @@ impl Checker {
     /// take no arguments; `get(key) -> Optional[V]` (ticket #281) takes the key
     /// and returns the value wrapped in `Some`, or `None` when the key is absent
     /// — a safe, non-aborting read (unlike `d[key]`, which raises on a miss).
+    /// Type an `AtomicArray[T]` method (#844). All ops are seq_cst. The index is
+    /// an integer; stored/compared values are assignable to the element type `T`.
+    ///   `len() -> int64`
+    ///   `load(i) -> T`                       (raw slot; None/0 when unset)
+    ///   `store(i, v)`                        (-> unit)
+    ///   `compare_and_swap(i, old, new) -> bool`
+    fn check_atomicarray_method(&mut self, name: &str, args: &[Arg], elem: &Ty, span: Span) -> Ty {
+        // Shared helper: the first argument is the index, which must be an integer.
+        let check_index = |s: &mut Self, a: &Arg| {
+            let at = s.infer(&a.value);
+            if !at.is_int() && !matches!(at, Ty::Unknown) {
+                s.error(
+                    ErrorCode::ZAP4025,
+                    format!(
+                        "AtomicArray index must be an integer, found {}",
+                        at.display()
+                    ),
+                    expr_span(&a.value),
+                );
+            }
+        };
+        // Shared helper: a value argument must be assignable to the element type.
+        let check_val = |s: &mut Self, a: &Arg| {
+            let vt = s.infer(&a.value);
+            if !assignable(&vt, elem) && !matches!(vt, Ty::Unknown) {
+                s.error(
+                    ErrorCode::ZAP4024,
+                    format!(
+                        "AtomicArray[{}] value has type {}",
+                        elem.display(),
+                        vt.display()
+                    ),
+                    expr_span(&a.value),
+                );
+            }
+        };
+        match name {
+            "len" => {
+                if !args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        "AtomicArray.len() takes no arguments".to_string(),
+                        span,
+                    );
+                }
+                Ty::Int64
+            }
+            "load" => {
+                if args.len() != 1 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!("AtomicArray.load(i) takes one argument, got {}", args.len()),
+                        span,
+                    );
+                } else {
+                    check_index(self, &args[0]);
+                }
+                elem.clone()
+            }
+            "store" => {
+                if args.len() != 2 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "AtomicArray.store(i, v) takes two arguments, got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                } else {
+                    check_index(self, &args[0]);
+                    check_val(self, &args[1]);
+                }
+                Ty::Unit
+            }
+            "compare_and_swap" => {
+                if args.len() != 3 {
+                    self.error(
+                        ErrorCode::ZAP4025,
+                        format!(
+                            "AtomicArray.compare_and_swap(i, old, new) takes three \
+                             arguments, got {}",
+                            args.len()
+                        ),
+                        span,
+                    );
+                } else {
+                    check_index(self, &args[0]);
+                    check_val(self, &args[1]);
+                    check_val(self, &args[2]);
+                }
+                Ty::Bool
+            }
+            other => {
+                self.error(
+                    ErrorCode::ZAP4080,
+                    format!(
+                        "AtomicArray has no method '{other}' (supported: load, store, \
+                         compare_and_swap, len)"
+                    ),
+                    span,
+                );
+                Ty::Unknown
+            }
+        }
+    }
+
     fn check_dict_method(&mut self, name: &str, args: &[Arg], k: &Ty, v: &Ty, span: Span) -> Ty {
         // `get` is the one dict method that takes arguments, so it is handled
         // before the shared no-argument check below. Two forms (ticket #570):
@@ -7733,6 +7903,80 @@ mod tests {
     fn ok(src: &str) {
         let e = errors(src);
         assert!(e.is_empty(), "unexpected type errors: {e:?}");
+    }
+
+    // --- AtomicArray[T] (#844) -------------------------------------------------
+
+    #[test]
+    fn atomicarray_int64_surface_type_checks() {
+        // The full word-element surface: len()->int64, store(i,v), load(i)->int64,
+        // compare_and_swap(i,old,new)->bool. All clean.
+        ok("def main():\n    \
+            AtomicArray[int64] a = AtomicArray[int64](8)\n    \
+            auto n = a.len()\n    \
+            a.store(0, 5)\n    \
+            auto v = a.load(0)\n    \
+            auto swapped = a.compare_and_swap(0, 5, 6)\n");
+    }
+
+    #[test]
+    fn atomicarray_reference_element_load_is_typed_as_element() {
+        // A reference element: load() returns the element type, so a field access
+        // on the result type-checks (it would not if load returned Unknown/ptr).
+        ok("struct Node:\n    int64 v\n\
+            def main():\n    \
+            AtomicArray[Node] a = AtomicArray[Node](2)\n    \
+            a.store(0, Node(v=1))\n    \
+            auto x = a.load(0)\n    \
+            print(x.v)\n");
+    }
+
+    #[test]
+    fn atomicarray_rejects_unsupported_element() {
+        // v1 supports reference elements or int64; a float element is rejected.
+        let e = errors("def main():\n    AtomicArray[float64] a = AtomicArray[float64](4)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4028),
+            "float element must be rejected (ZAP4028), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn atomicarray_load_arity_is_checked() {
+        let e = errors(
+            "def main():\n    \
+            AtomicArray[int64] a = AtomicArray[int64](4)\n    \
+            auto v = a.load()\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4025),
+            "load() with no index must error (ZAP4025), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn atomicarray_unknown_method_is_rejected() {
+        let e = errors(
+            "def main():\n    \
+            AtomicArray[int64] a = AtomicArray[int64](4)\n    \
+            a.frobnicate(0)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4080),
+            "unknown method must error (ZAP4080), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn atomicarray_capacity_must_be_integer() {
+        let e = errors(
+            "def main():\n    \
+            AtomicArray[int64] a = AtomicArray[int64](\"nope\")\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP4033),
+            "non-integer capacity must error (ZAP4033), got {e:?}"
+        );
     }
 
     #[test]

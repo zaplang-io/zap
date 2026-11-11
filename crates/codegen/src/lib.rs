@@ -1458,6 +1458,41 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_chan_send_ptr", &[p.into(), p.into()], None);
         self.declare_rt("zap_chan_recv_i64", &[p.into()], Some(i.into()));
         self.declare_rt("zap_chan_recv_ptr", &[p.into()], Some(p.into()));
+        // AtomicArray[T] (#844): a fixed-capacity array of seq_cst CAS-able word
+        // slots. `_new(cap, elem_is_ptr)`; reference elements use the `_ptr`
+        // entry points, `int64` elements the `_i64` ones (typed like channels).
+        self.declare_rt("zap_atomicarray_new", &[i.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_atomicarray_len", &[p.into()], Some(i.into()));
+        self.declare_rt(
+            "zap_atomicarray_load_i64",
+            &[p.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_atomicarray_load_ptr",
+            &[p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_atomicarray_store_i64",
+            &[p.into(), i.into(), i.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_atomicarray_store_ptr",
+            &[p.into(), i.into(), p.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_atomicarray_cas_i64",
+            &[p.into(), i.into(), i.into(), i.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_atomicarray_cas_ptr",
+            &[p.into(), i.into(), p.into(), p.into()],
+            Some(i.into()),
+        );
         // `channel[float64]` (#800): the element travels as a reinterpreted
         // `double` word.
         self.declare_rt("zap_chan_send_f64", &[p.into(), f64t.into()], None);
@@ -2467,6 +2502,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Heap(_)
             | Ty::Array(_)
             | Ty::Chan(_)
+            | Ty::AtomicArray(_)
             | Ty::Bytes
             | Ty::Match
             | Ty::Func(_)
