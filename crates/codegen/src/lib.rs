@@ -522,6 +522,14 @@ struct Cg<'a, 'ctx> {
     /// `[N+1 x ptr]` itable global (N method slots + one renderer slot, #707),
     /// built once per implementing pair.
     itables: std::cell::RefCell<std::collections::HashMap<(u32, u32), PointerValue<'ctx>>>,
+    /// Interned string-literal constants (#837, D-0145): distinct literal bytes ->
+    /// a never-freed constant-global `ZapStr` `{ i64 len, [N x i8] bytes }` built
+    /// once and reused at every `Inst::StrConst` use, instead of re-allocating a
+    /// fresh heap string via `zap_str_new` at each use site. Interning is
+    /// transparent — `str` is a value type with no observable identity (`is` on
+    /// `str` is a compile error), so this is a pure allocation optimization; the
+    /// static-data pointer is non-heap so the moving collector leaves it untouched.
+    str_consts: std::cell::RefCell<std::collections::HashMap<Vec<u8>, PointerValue<'ctx>>>,
     /// The C++ exception personality routine's symbol name (ticket #197, Area A3,
     /// design/0019). The runtime's `landingpad`s name it and the backend lowers
     /// unwind info against it. The *name* is the only Itanium/DWARF-specific piece
@@ -609,6 +617,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             interfaces: Vec::new(),
             iface_renderers: std::collections::HashMap::new(),
             itables: std::cell::RefCell::new(std::collections::HashMap::new()),
+            str_consts: std::cell::RefCell::new(std::collections::HashMap::new()),
             // Pick the exception personality by target (ticket #197, A3). Codegen
             // emits for the host triple only, so "windows" here means the Zap
             // compiler is running on a Windows (MinGW-w64) host — exactly when the
@@ -3062,22 +3071,40 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 self.printf_lit("\n")?;
             }
             Inst::StrConst { dest, bytes } => {
-                let i8t = self.ctx.i8_type();
-                let arr_vals: Vec<_> = bytes
-                    .iter()
-                    .map(|byte| i8t.const_int(*byte as u64, false))
-                    .collect();
-                let arr = i8t.const_array(&arr_vals);
-                let global = self.module.add_global(arr.get_type(), None, "str");
-                global.set_initializer(&arr);
-                global.set_constant(true);
-                let data_ptr = global.as_pointer_value();
-                let len = self.ctx.i64_type().const_int(bytes.len() as u64, false);
-                let str_new = self.fns["zap_str_new"];
-                let cs = b
-                    .build_call(str_new, &[data_ptr.into(), len.into()], "strnew")
-                    .map_err(|e| e.to_string())?;
-                vals[*dest as usize] = cs.try_as_basic_value().left();
+                // Intern each distinct string literal as ONE never-freed constant
+                // global `ZapStr` `{ i64 len, [N x i8] bytes }` (#837, D-0145),
+                // matching the runtime's one-object layout (len @0, bytes @8). The
+                // literal is no longer re-allocated via `zap_str_new` at each use,
+                // so a constant prefix like the `"k"` of `f"k{i}"` costs zero heap
+                // allocations per iteration. Interning is transparent — `str` is a
+                // value type with no observable identity (`is` on `str` is a compile
+                // error), so same bytes sharing one object changes nothing
+                // semantically; the static-data pointer is non-heap, so the moving
+                // collector leaves it alone and concat/format (which always allocate
+                // a fresh result) never mutate or free it.
+                let ptr = {
+                    let mut cache = self.str_consts.borrow_mut();
+                    if let Some(p) = cache.get(bytes.as_slice()) {
+                        *p
+                    } else {
+                        let i8t = self.ctx.i8_type();
+                        let arr_vals: Vec<_> = bytes
+                            .iter()
+                            .map(|byte| i8t.const_int(*byte as u64, false))
+                            .collect();
+                        let arr = i8t.const_array(&arr_vals);
+                        let len = self.ctx.i64_type().const_int(bytes.len() as u64, false);
+                        let init = self.ctx.const_struct(&[len.into(), arr.into()], false);
+                        let global = self.module.add_global(init.get_type(), None, "str.const");
+                        global.set_initializer(&init);
+                        global.set_constant(true);
+                        global.set_linkage(inkwell::module::Linkage::Internal);
+                        let p = global.as_pointer_value();
+                        cache.insert(bytes.clone(), p);
+                        p
+                    }
+                };
+                vals[*dest as usize] = Some(BasicValueEnum::PointerValue(ptr));
             }
             Inst::StructNew { dest, sid } => {
                 let st = self.structs[*sid as usize];
@@ -4668,6 +4695,33 @@ mod tests {
         assert!(
             ir.contains("mul <4 x i64>"),
             "expected a vectorized mul in IR:\n{ir}"
+        );
+    }
+
+    // #837 / D-0145: a string literal lowers to ONE interned constant-global
+    // `ZapStr` reused at every use, NOT a fresh `zap_str_new` heap allocation per
+    // use. Structural (IR-text) guard — machine-independent, unlike a timing floor.
+    #[test]
+    fn string_literal_is_interned_constant() {
+        let ir = llvm_ir(
+            "def main():\n    auto a = \"hello\"\n    auto b = \"hello\"\n    print(a)\n    print(b)\n",
+        );
+        // The literal's bytes live in a constant byte array...
+        assert!(
+            ir.contains("c\"hello\""),
+            "string literal should be a constant byte array:\n{ir}"
+        );
+        // ...deduplicated to a single constant across both identical uses...
+        assert_eq!(
+            ir.matches("c\"hello\"").count(),
+            1,
+            "two uses of the same literal must share ONE interned constant:\n{ir}"
+        );
+        // ...and never re-allocated per use (the old per-use `zap_str_new` call,
+        // whose result was named `%strnew`, is gone).
+        assert!(
+            !ir.contains("strnew"),
+            "an interned literal must not be re-allocated via zap_str_new:\n{ir}"
         );
     }
 

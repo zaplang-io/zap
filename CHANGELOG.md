@@ -850,6 +850,27 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **String-keyed `dict` and string allocation made ~2× faster** (#837, D-0145).
+  After #568/#835 fixed `fib`/loops, a string-keyed `dict` (build + look up 200k
+  `str → int`, keys `f"k{i}"`) was the one microbenchmark still ~2× slower than
+  CPython. Three ranked changes close the gap, none touching the hash table
+  itself (int-keyed dict already beats CPython): (1) **each dict entry now caches
+  its key's 64-bit hash**, so `get`/`set`/`del` gate the `memcmp`/`__eq__` on a
+  cheap hash-word match and `resize` rehashes from the stored hash instead of
+  recomputing FNV for every live key on each of ~18 grows (helps string, tuple
+  and `@derive(Hash)` struct keys too); (2) **a `str` is now a single GC object** —
+  header and bytes are contiguous (a flexible array member) rather than a header
+  plus a separate char buffer — halving both the allocation count and the live-set
+  tracing cost (the string ABI change; the string descriptor is now ATOMIC and the
+  collector may relocate a string, relocation-transparent); and (3) **string
+  literals are interned** — each distinct literal lowers to one never-freed
+  constant-global `ZapStr` reused at every use instead of re-allocating per use, so
+  the constant prefix of an f-string key costs no allocations. Interning is
+  transparent (`str` is a value type with no observable identity — `is` on `str`
+  is a compile error — so `==` and dict/set keying, which are by value, are
+  unchanged). Codepoint semantics, immutability, `bytes`↔`str`, JSON, equality and
+  hashing are all preserved. `crates/driver/tests/perf.rs` now reports the
+  `dict_string` / `dict_int` / `fstring_only` within-run split each CI run.
 - **Calling-convention / GC overhead removed from GC-free code** (#568, D-0144).
   An external language review found the default calling convention taxed even
   integer-only code: every call set up a GC shadow frame and a non-inlinable

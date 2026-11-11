@@ -478,10 +478,67 @@ static inline void zap_gc_register_finalizer(void *payload,
 }
 #endif
 
+/* One-object string layout (#837, D-0145). The byte payload is a flexible array
+ * member CONTIGUOUS with the header, so a string is a SINGLE GC object (header +
+ * bytes), not a header plus a separate char buffer — halving both the allocation
+ * count and the live-set tracing cost for string-heavy workloads (e.g. a dict of
+ * 200k string keys). The bytes are NOT NUL-terminated; `len` is authoritative.
+ *
+ * `data` is a flexible array, so `s->data` still reads as a `char *` at every one
+ * of the ~300 access sites, and because that address is recomputed from `s` on
+ * each access it stays correct after a moving-GC relocation. The string
+ * descriptor is therefore ATOMIC (no traced pointer field): the inline bytes are
+ * never scanned as pointers, and evacuation copies the whole object by its stored
+ * object size. Strings remain immutable and always own their bytes (slice/concat
+ * copy), so one contiguous buffer never aliases another object. */
 typedef struct {
     int64_t len;
-    const char *data;
+    char data[];
 } ZapStr;
+
+/* Allocate a single-object string with room for `len` payload bytes (#837). The
+ * caller sets the bytes via `s->data`; `->len` is pre-set. Backend-uniform: the
+ * precise collector uses the variable-size entry with the (atomic) string
+ * descriptor, so the object's stored size spans the inline bytes; Boehm uses an
+ * atomic (pointer-free) block of the same total size. Allocation never collects
+ * mid-call (it only flags a pending GC), so the returned raw pointer is stable
+ * for the remainder of the calling runtime function. */
+extern const ZapTypeDesc zap_desc_strobj;
+static ZapStr *zap_str_alloc(int64_t len) {
+    if (len < 0) {
+        len = 0;
+    }
+    int64_t total = (int64_t)sizeof(ZapStr) + len;
+#ifdef ZAP_GC_IMMIX
+    ZapStr *s = (ZapStr *)zap_gc_alloc_var(&zap_desc_strobj, total);
+#else
+    zap_np_enter();
+    ZapStr *s = (ZapStr *)GC_MALLOC_ATOMIC((size_t)total);
+    zap_np_leave();
+    if (!s) {
+        zap_oom(NULL);
+    }
+#endif
+    s->len = len;
+    return s;
+}
+
+/* A stack-allocated, non-GC string with the one-object layout (#837), for a short
+ * COMPILE-TIME-sized borrowed C string passed to a `ZapStr *`-consuming call
+ * without touching the GC heap. Kept off the heap so no moving-GC relocation can
+ * happen while a transport routine holds the pointer across a blocking park
+ * (where a heap string's C pointer would be unrooted). `ident` becomes a
+ * `ZapStr *`; `n` MUST be a compile-time constant (fixed-size inline buffer,
+ * 8-byte aligned via the leading int64 length). */
+#define ZAP_STACK_STR(ident, cstr, n)                                          \
+    struct {                                                                   \
+        int64_t len;                                                           \
+        char data[(n) > 0 ? (n) : 1];                                          \
+    } ident##_buf_;                                                            \
+    ident##_buf_.len = (int64_t)(n);                                           \
+    if ((n) > 0)                                                               \
+        memcpy(ident##_buf_.data, (cstr), (size_t)(n));                        \
+    ZapStr *ident = (ZapStr *)&ident##_buf_
 
 /* Typed Zap exception values (I#471). The thrown C++ object still carries one
  * pointer, but that pointer now identifies the Zap type and its message.
@@ -668,13 +725,13 @@ int64_t zap_gc_count(void) { return (int64_t)GC_get_gc_no(); }
 void *zap_alloc_typed(const ZapTypeDesc *desc) { return zap_alloc_desc(desc); }
 
 void *zap_str_new(const char *data, int64_t len) {
-    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
-    char *buf = (char *)zap_buf((size_t)len);
-    if (len > 0) {
-        memcpy(buf, data, (size_t)len);
+    if (len < 0) {
+        len = 0;
     }
-    s->len = len;
-    s->data = buf;
+    ZapStr *s = zap_str_alloc(len);
+    if (len > 0) {
+        memcpy(s->data, data, (size_t)len);
+    }
     return s;
 }
 
@@ -1042,12 +1099,10 @@ void *zap_str_concat(void *a, void *b) {
     ZapStr *x = (ZapStr *)a;
     ZapStr *y = (ZapStr *)b;
     int64_t n = x->len + y->len;
-    char *buf = (char *)zap_buf((size_t)n);
-    memcpy(buf, x->data, (size_t)x->len);
-    memcpy(buf + x->len, y->data, (size_t)y->len);
-    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
-    s->len = n;
-    s->data = buf;
+    /* Allocation never collects mid-call, so x/y stay put while we copy (#837). */
+    ZapStr *s = zap_str_alloc(n);
+    memcpy(s->data, x->data, (size_t)x->len);
+    memcpy(s->data + x->len, y->data, (size_t)y->len);
     return s;
 }
 
@@ -1552,8 +1607,10 @@ typedef _Bool (*ZapEqFn)(void *a, void *b);
 
 typedef struct {
     uint8_t state;
-    int64_t key; /* key word: int64, or ZapStr/struct pointer bits */
-    int64_t val; /* value word */
+    int64_t key;   /* key word: int64, or ZapStr/struct pointer bits */
+    int64_t val;   /* value word */
+    uint64_t hash; /* cached key hash (#837): avoids re-FNV on probe/resize.    */
+                   /* Valid only while state == SLOT_FULL.                       */
 } ZapEntry;
 
 typedef struct {
@@ -1746,7 +1803,9 @@ void zap_list_sort_by(void *dstp, void *keysp, int64_t cmp_kind, int64_t reverse
     free(out);
 }
 
-static void zap_dict_resize(ZapDict *d, int keykind) {
+/* Rehash from each entry's cached hash (#837) — no keykind needed, since the
+ * stored hash word is already correct regardless of key kind. */
+static void zap_dict_resize(ZapDict *d) {
     int64_t ncap = d->cap < 8 ? 8 : d->cap * 2;
     ZapEntry *ne = (ZapEntry *)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapEntry));
     for (int64_t i = 0; i < ncap; i++) {
@@ -1756,7 +1815,9 @@ static void zap_dict_resize(ZapDict *d, int keykind) {
         if (d->entries[i].state != SLOT_FULL) {
             continue;
         }
-        uint64_t h = zap_key_hash(d->entries[i].key, keykind, d->hashfn);
+        /* Rehash from the cached hash (#837): the key bytes are unchanged, so the
+         * stored hash word is still correct — no FNV byte-loop / __hash__ call. */
+        uint64_t h = d->entries[i].hash;
         int64_t j = (int64_t)(h & (uint64_t)(ncap - 1));
         while (ne[j].state == SLOT_FULL) {
             j = (j + 1) & (ncap - 1);
@@ -1770,13 +1831,15 @@ static void zap_dict_resize(ZapDict *d, int keykind) {
 static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
     ZapDict *d = (ZapDict *)dp;
     if (d->cap == 0 || (d->len + 1) * 4 >= d->cap * 3) { /* load factor 0.75 */
-        zap_dict_resize(d, keykind);
+        zap_dict_resize(d);
     }
     uint64_t h = zap_key_hash(key, keykind, d->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
     int64_t tomb = -1;
     while (d->entries[j].state != SLOT_EMPTY) {
-        if (d->entries[j].state == SLOT_FULL &&
+        /* Gate the (possibly expensive) key compare on a cheap hash-word match
+         * first (#837): a mismatch skips memcmp / __eq__ entirely. */
+        if (d->entries[j].state == SLOT_FULL && d->entries[j].hash == h &&
             zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
             d->entries[j].val = val; /* overwrite existing key */
             return;
@@ -1792,6 +1855,7 @@ static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
     d->entries[j].state = SLOT_FULL;
     d->entries[j].key = key;
     d->entries[j].val = val;
+    d->entries[j].hash = h;
     d->len++;
 }
 
@@ -1805,7 +1869,8 @@ static int64_t zap_dict_get(void *dp, int64_t key, int keykind) {
     uint64_t h = zap_key_hash(key, keykind, d->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
     while (d->entries[j].state != SLOT_EMPTY) {
-        if (d->entries[j].state == SLOT_FULL &&
+        /* Hash-word prefilter (#837) before the full key compare. */
+        if (d->entries[j].state == SLOT_FULL && d->entries[j].hash == h &&
             zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
             return d->entries[j].val;
         }
@@ -1953,7 +2018,7 @@ static void zap_dict_del(void *dp, int64_t key, int keykind) {
     uint64_t h = zap_key_hash(key, keykind, d->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
     while (d->entries[j].state != SLOT_EMPTY) {
-        if (d->entries[j].state == SLOT_FULL &&
+        if (d->entries[j].state == SLOT_FULL && d->entries[j].hash == h &&
             zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
             d->entries[j].state = SLOT_TOMB;
             d->entries[j].key = 0;
@@ -2001,7 +2066,7 @@ static int zap_dict_has(void *dp, int64_t key, int keykind) {
     uint64_t h = zap_key_hash(key, keykind, d->hashfn);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
     while (d->entries[j].state != SLOT_EMPTY) {
-        if (d->entries[j].state == SLOT_FULL &&
+        if (d->entries[j].state == SLOT_FULL && d->entries[j].hash == h &&
             zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
             return 1;
         }
@@ -3153,12 +3218,12 @@ static int zap_utf8_encode(int32_t cp, char *out) {
     return 4;
 }
 
-/* Wrap an already-owned GC buffer in a `str` object without copying. */
-static void *zap_str_adopt(char *buf, int64_t len) {
-    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
-    s->len = len;
-    s->data = buf;
-    return s;
+/* Build a `str`/`bytes` object from `len` scratch bytes. With the one-object
+ * layout (#837) a string owns its bytes inline, so the scratch buffer is copied
+ * in (it was a short-lived GC/stack buffer the caller no longer needs); the name
+ * is kept for the ~14 builder call sites that produced bytes into a temporary. */
+static void *zap_str_adopt(const char *buf, int64_t len) {
+    return zap_str_new(buf, len);
 }
 
 static int zap_is_ascii_ws(unsigned char c) {
@@ -10192,22 +10257,21 @@ static void zap_hash_ctx_final(const zap_hash_ctx *c, uint8_t *out) {
 /* Build a lowercase-hex ZapStr from `n` raw bytes. */
 static void *zap_crypto_hex_str(const uint8_t *d, size_t n) {
     static const char HEX[] = "0123456789abcdef";
-    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
     int64_t outlen = (int64_t)(n * 2);
-    char *buf = (char *)zap_buf(outlen > 0 ? outlen : 1);
+    ZapStr *s = zap_str_alloc(outlen);
     for (size_t i = 0; i < n; i++) {
-        buf[2 * i] = HEX[d[i] >> 4];
-        buf[2 * i + 1] = HEX[d[i] & 0x0f];
+        s->data[2 * i] = HEX[d[i] >> 4];
+        s->data[2 * i + 1] = HEX[d[i] & 0x0f];
     }
-    s->len = outlen;
-    s->data = buf;
     return s;
 }
 
-/* The hash context behind a streaming handle (a `bytes` ZapStr whose data
- * buffer is the context). */
+/* The hash context behind a streaming handle (#837: a `bytes` ZapStr whose inline
+ * byte payload IS the pointer-free context). Re-read on each call, so a moving GC
+ * relocation of the handle is observed (no allocation happens between calls to a
+ * streaming op, so the raw pointer is stable within each call). */
 static zap_hash_ctx *zap_crypto_handle_ctx(void *h) {
-    return (zap_hash_ctx *)(uintptr_t)((ZapStr *)h)->data;
+    return (zap_hash_ctx *)(void *)((ZapStr *)h)->data;
 }
 
 static void *zap_crypto_oneshot_hex(int algo, void *data) {
@@ -10240,13 +10304,12 @@ void *zap_crypto_sha224(void *data) {
     return zap_crypto_oneshot_hex(ZAP_CRY_SHA224, data);
 }
 
-/* Streaming: a `bytes` handle wrapping a heap-allocated, pointer-free context. */
+/* Streaming: a `bytes` handle whose inline payload IS the pointer-free context
+ * (#837 one-object layout; `->data` is 8-byte aligned, which suffices for the
+ * uint64-based hash state). */
 void *zap_crypto_new(int64_t algo) {
-    ZapStr *h = (ZapStr *)zap_obj(&zap_desc_strobj);
-    zap_hash_ctx *c = (zap_hash_ctx *)zap_buf((int64_t)sizeof(zap_hash_ctx));
-    zap_hash_ctx_init(c, (int)algo);
-    h->len = (int64_t)sizeof(zap_hash_ctx);
-    h->data = (const char *)c;
+    ZapStr *h = zap_str_alloc((int64_t)sizeof(zap_hash_ctx));
+    zap_hash_ctx_init((zap_hash_ctx *)(void *)h->data, (int)algo);
     return h;
 }
 
@@ -10379,12 +10442,9 @@ static void zap_crypto_fill_random(uint8_t *buf, size_t n) {
 void *zap_crypto_random_bytes(int64_t n) {
     if (n < 0)
         n = 0;
-    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
-    uint8_t *buf = (uint8_t *)zap_buf(n > 0 ? n : 1);
+    ZapStr *s = zap_str_alloc(n);
     if (n > 0)
-        zap_crypto_fill_random(buf, (size_t)n);
-    s->len = n;
-    s->data = (const char *)buf;
+        zap_crypto_fill_random((uint8_t *)s->data, (size_t)n);
     return s;
 }
 
@@ -10483,7 +10543,7 @@ static int zap_crypto_hash_algo_by_name(const ZapStr *name) {
 }
 
 static zap_hmac_ctx *zap_crypto_hmac_handle_ctx(void *h) {
-    return (zap_hmac_ctx *)(uintptr_t)((ZapStr *)h)->data;
+    return (zap_hmac_ctx *)(void *)((ZapStr *)h)->data;
 }
 
 void *zap_crypto_hmac_new(void *hash_name, void *key) {
@@ -10498,8 +10558,10 @@ void *zap_crypto_hmac_new(void *hash_name, void *key) {
                             1));
     }
     const ZapStr *k = (const ZapStr *)key;
-    ZapStr *h = (ZapStr *)zap_obj(&zap_desc_strobj);
-    zap_hmac_ctx *c = (zap_hmac_ctx *)zap_buf((int64_t)sizeof(zap_hmac_ctx));
+    /* One-object handle (#837): the pointer-free HMAC ctx lives inline in the
+     * `bytes` payload. No allocation happens below, so `k` stays put. */
+    ZapStr *h = zap_str_alloc((int64_t)sizeof(zap_hmac_ctx));
+    zap_hmac_ctx *c = (zap_hmac_ctx *)(void *)h->data;
     c->algo = algo;
     size_t blk = zap_crypto_block_len(algo);
     c->blk = blk;
@@ -10521,8 +10583,6 @@ void *zap_crypto_hmac_new(void *hash_name, void *key) {
     }
     zap_hash_ctx_init(&c->inner, algo);
     zap_hash_ctx_update(&c->inner, ipad, blk);
-    h->len = (int64_t)sizeof(zap_hmac_ctx);
-    h->data = (const char *)c;
     return h;
 }
 
@@ -11476,7 +11536,6 @@ done:
  * closures; these cover the built-in runtime objects. See design/0008-precise-gc.
  * ========================================================================== */
 
-static const int32_t zap_off_strobj[] = {(int32_t)offsetof(ZapStr, data)};
 static const int32_t zap_off_gobj[] = {
     (int32_t)offsetof(G, stack),
     (int32_t)offsetof(G, arg),
@@ -11500,8 +11559,12 @@ const ZapTypeDesc zap_desc_matchobj = {(int64_t)sizeof(ZapMatch), ZAP_TD_MATCH, 
 const ZapTypeDesc zap_desc_scope = {(int64_t)sizeof(Scope), ZAP_TD_SCOPE, 0, NULL};
 /* ZapPy wraps a borrowed CPython reference, not a GC pointer, so it is a leaf. */
 const ZapTypeDesc zap_desc_pyobj = {(int64_t)sizeof(ZapPy), ZAP_TD_ATOMIC, 0, NULL};
-const ZapTypeDesc zap_desc_strobj = {(int64_t)sizeof(ZapStr), ZAP_TD_PRECISE, 1,
-                                     zap_off_strobj};
+/* One-object string (#837, D-0145): header + inline byte payload. ATOMIC — the
+ * inline bytes carry no pointers, so the collector never scans them and copies
+ * the whole object by its stored object size on evacuation. `.size` is the
+ * header only (the real size is per-object, via zap_gc_alloc_var). */
+const ZapTypeDesc zap_desc_strobj = {(int64_t)sizeof(ZapStr), ZAP_TD_ATOMIC, 0,
+                                     NULL};
 const ZapTypeDesc zap_desc_gobj = {(int64_t)sizeof(G), ZAP_TD_PRECISE, 3, zap_off_gobj};
 const ZapTypeDesc zap_desc_sigsub = {(int64_t)sizeof(SigSub), ZAP_TD_PRECISE, 2,
                                      zap_off_sigsub};
@@ -14489,13 +14552,10 @@ static void *zap_z_fault(const char *msg) {
 /* Copy `len` scratch bytes into a fresh GC `bytes` object (a `ZapStr` whose
  * atomic data buffer is traced through the string descriptor). */
 static void *zap_z_finish_bytes(const unsigned char *buf, size_t len) {
-    char *out = (char *)zap_buf(len > 0 ? (int64_t)len : 1);
+    ZapStr *s = zap_str_alloc((int64_t)len);
     if (len > 0) {
-        memcpy(out, buf, len);
+        memcpy(s->data, buf, len);
     }
-    ZapStr *s = (ZapStr *)zap_obj(&zap_desc_strobj);
-    s->len = (int64_t)len;
-    s->data = out;
     return s;
 }
 
@@ -15961,8 +16021,10 @@ static int zap_crypto_rsa_init(EVP_MD_CTX *ctx, EVP_PKEY *pkey,
  * message, signature, or OpenSSL error details. The borrowed literal is consumed
  * synchronously by logging; no GC allocation or new public API is needed. */
 static int64_t zap_crypto_rsa_verify_reject(const char *reason) {
-    ZapStr message = {(int64_t)strlen(reason), reason};
-    zap_logging_log(10, &message); /* DEBUG; default threshold is WARNING */
+    /* Consumed synchronously by logging (no park, no safepoint between the alloc
+     * and the read), so a one-object GC string (#837) is safe here. */
+    void *message = zap_str_new(reason, (int64_t)strlen(reason));
+    zap_logging_log(10, message); /* DEBUG; default threshold is WARNING */
     return 0;
 }
 
@@ -18154,10 +18216,8 @@ int64_t zap_tls_test_server(void) {
         zap_net_panic("tls: test server certificate generation failed");
         return 0;
     }
-    ZapStr loop;
-    loop.len = 9;
-    loop.data = "127.0.0.1";
-    void *l_v = zap_net_listen(&loop, 0); /* raises on failure */
+    ZAP_STACK_STR(loop, "127.0.0.1", 9);
+    void *l_v = zap_net_listen(loop, 0); /* raises on failure */
     ZapSock *l = (ZapSock *)l_v;
     int lfd = l->fd;
     void *lpd = l->pd;
@@ -18276,10 +18336,8 @@ int64_t zap_tls_test_mtls_server(void *cert_, void *key_, void *client_ca_) {
         zap_tls_ssl_panic("tls: _test_mtls_server: context setup failed");
         return 0;
     }
-    ZapStr loop;
-    loop.len = 9;
-    loop.data = "127.0.0.1";
-    void *l_v = zap_net_listen(&loop, 0); /* raises on failure */
+    ZAP_STACK_STR(loop, "127.0.0.1", 9);
+    void *l_v = zap_net_listen(loop, 0); /* raises on failure */
     ZapSock *l = (ZapSock *)l_v;
     int lfd = l->fd;
     void *lpd = l->pd;
@@ -18719,24 +18777,25 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
 
     /* Dial the transport: plaintext via net, or TLS via tls (verification on).
      * Both take a ZapStr* host; the raw transport (fd/pd, and the OpenSSL session
-     * for TLS) is held in C locals so nothing GC is carried across the parks. */
-    ZapStr hostz;
-    hostz.len = (int64_t)strlen(host);
-    hostz.data = host;
+     * for TLS) is held in C locals so nothing GC is carried across the parks.
+     * `hostz` is a one-object string (#837) consumed synchronously by the dial
+     * (the host bytes are copied into addrinfo / the SNI name before the first
+     * park), and `host` is freed right after — so it never lives across a park. */
+    ZapStr *hostz = (ZapStr *)zap_str_new(host, (int64_t)strlen(host));
     ZapHttpConn hc;
     memset(&hc, 0, sizeof hc);
     if (is_tls) {
         SSL_CTX *tctx = NULL;
         int tfd = -1;
         void *tpd = NULL;
-        SSL *ssl = zap_tls_dial_raw(&hostz, port, 1, &tctx, &tfd, &tpd); /* raises on failure */
+        SSL *ssl = zap_tls_dial_raw(hostz, port, 1, &tctx, &tfd, &tpd); /* raises on failure */
         hc.tls = 1;
         hc.ssl = ssl;
         hc.ctx = tctx;
         hc.fd = tfd;
         hc.pd = tpd;
     } else {
-        ZapSock *conn = (ZapSock *)zap_net_connect(&hostz, port); /* raises on failure */
+        ZapSock *conn = (ZapSock *)zap_net_connect(hostz, port); /* raises on failure */
         hc.fd = conn->fd;
         hc.pd = conn->pd;
     }
@@ -18877,37 +18936,25 @@ void *zap_http_request_h(void *method_, void *url_, void *body_, void *headers_)
 }
 
 void *zap_http_get(void *url_) {
-    ZapStr g;
-    g.len = 3;
-    g.data = "GET";
-    ZapStr empty;
-    empty.len = 0;
-    empty.data = "";
-    return zap_http_do(&g, url_, &empty, NULL);
+    ZAP_STACK_STR(g, "GET", 3);
+    ZAP_STACK_STR(empty, "", 0);
+    return zap_http_do(g, url_, empty, NULL);
 }
 
 void *zap_http_get_h(void *url_, void *headers_) {
-    ZapStr g;
-    g.len = 3;
-    g.data = "GET";
-    ZapStr empty;
-    empty.len = 0;
-    empty.data = "";
-    return zap_http_do(&g, url_, &empty, headers_);
+    ZAP_STACK_STR(g, "GET", 3);
+    ZAP_STACK_STR(empty, "", 0);
+    return zap_http_do(g, url_, empty, headers_);
 }
 
 void *zap_http_post(void *url_, void *body_) {
-    ZapStr p;
-    p.len = 4;
-    p.data = "POST";
-    return zap_http_do(&p, url_, body_, NULL);
+    ZAP_STACK_STR(p, "POST", 4);
+    return zap_http_do(p, url_, body_, NULL);
 }
 
 void *zap_http_post_h(void *url_, void *body_, void *headers_) {
-    ZapStr p;
-    p.len = 4;
-    p.data = "POST";
-    return zap_http_do(&p, url_, body_, headers_);
+    ZAP_STACK_STR(p, "POST", 4);
+    return zap_http_do(p, url_, body_, headers_);
 }
 
 int64_t zap_http_status(void *resp_) { return ((ZapHttpResp *)resp_)->status; }

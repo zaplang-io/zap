@@ -6994,3 +6994,92 @@ baseline for the GC Immix++ epic (#714), whose barrier (#716) and pacer/telemetr
 its back-edge safepoint under both collectors) plus a new test that runs a
 frame-skipped recursive function under concurrent forced collections and asserts
 the unique correct result with no hang.
+
+## D-0145 — one-object strings, cached dict-key hashes, interned string literals (#837)
+
+**Problem.** Following #568/#835 (D-0144), which fixed `fib`/loops, a string-keyed
+`dict` workload (build + look up 200k `str → int`, keys `f"k{i}"`) was the one
+microbenchmark still ~2× slower than CPython. The within-run split
+(`dict_string ≈ dict_int + fstring_only + remainder`) located the cost in three
+places, none of them the hash table itself (int-keyed dict already beats CPython):
+
+1. **The dict entry did not cache the key hash.** `zap_dict_get`/`set` re-ran the
+   key hash on every operation, and `zap_dict_resize` recomputed the FNV hash of
+   **every** live key on each of ~18 power-of-two grows, plus a `memcmp` on every
+   probe.
+2. **Every `ZapStr` was TWO GC objects** — a header plus a separately allocated
+   char buffer — so 200k live string keys kept ~400k objects live (all traced on
+   every collection), and every constructed string was two allocations.
+3. **String literals re-allocated on every use.** `Inst::StrConst` emitted a fresh
+   `zap_str_new` at each use site even though the bytes are a compile-time
+   constant, so the `"k"` prefix of `f"k{i}"` paid two allocations on each of
+   400k iterations.
+
+**Decision.** Three independent, ranked changes (the maintainer chose the full
+scope; the string-ABI change (2) is the invasive one and is recorded here).
+
+1. **Cache the 64-bit key hash in `ZapEntry`.** Each full slot stores the hash of
+   its key alongside `{state, key, val}`. `set`/`get`/`del`/`has` compute the hash
+   once and gate the (possibly expensive) `memcmp` / `__eq__` on a cheap
+   hash-word match first; `resize` rehashes from the stored hash and never
+   recomputes FNV / `__hash__`. The cached word is derived only from the key
+   bytes, so it is correct for every key kind — int, string, tuple (#702/#680),
+   `@derive(Hash)` struct (D-0047), and float (NaN rejected / `-0.0`→`+0.0`
+   canonicalized *before* the key word is formed, so those semantics (#803) are
+   untouched). The entry layout is a runtime-internal concern (codegen never
+   mirrors it).
+
+2. **One-object string layout — header + bytes contiguous (flexible array
+   member).** `ZapStr` is now `{ int64_t len; char data[]; }`: the byte payload is
+   allocated **with** the header as a single GC object (via `zap_gc_alloc_var`
+   under Immix; one atomic block under Boehm), halving both the allocation count
+   and the live-set tracing cost for string-heavy heaps. The string type
+   descriptor becomes **ATOMIC** (the inline bytes carry no pointers, so the
+   collector never scans them; evacuation copies the whole object by its stored
+   object size, and the moving collector may relocate a string since all
+   references to it are rewritten — relocation-transparent). Every `s->data`
+   read site is unchanged (the flexible array decays to `char *`, recomputed from
+   `s` on each access, so it stays correct after a relocation); only the
+   construction sites (one `zap_str_alloc` + copy, replacing header+buffer) and
+   the descriptor change. Strings remain immutable and always own their bytes
+   (slice/concat/f-strings copy), so one contiguous buffer never aliases another
+   object; codepoint `len`/index/slice/iteration (D-0025), equality, hashing,
+   `bytes`↔`str`, and JSON are all preserved. The streaming crypto hash/HMAC
+   handles, which reused a `ZapStr`'s `data` to hold a pointer-free context, now
+   store that context INLINE in the one-object payload. A few non-GC borrowed
+   string *views* on the C stack (transport hostnames, HTTP verbs) that had
+   pointed `data` at external bytes become stack objects with the one-object
+   layout (`ZAP_STACK_STR`), kept off the GC heap so no relocation occurs while a
+   transport routine holds the pointer across a blocking park.
+
+3. **Intern string literals.** `Inst::StrConst` lowers each distinct literal to
+   ONE never-freed constant-global `ZapStr` `{ i64 len, [N x i8] bytes }` (matching
+   the one-object layout), reused at every use instead of re-allocating via
+   `zap_str_new`. The static-data pointer is non-heap, so the moving collector
+   leaves it untouched, and concat/format always allocate a fresh result so they
+   never mutate or free the shared constant. Interning is **transparent**: `str`
+   is a value type with no observable identity — `is` on `str` is a compile error
+   (ZAP4073, #611) — so same bytes sharing one object changes nothing
+   semantically. Value `==` and dict/set keying are by value, unaffected. This is
+   a pure allocation optimization.
+
+**Scope note.** The f-string lowering still builds each value-bearing piece with
+its own render (`zap_i64_to_str`) and a pairwise `zap_str_concat`; with (2) each
+such piece is now a single allocation and with (3) the literal pieces cost none, so
+`f"k{i}"` drops from six allocations per iteration to two. Fusing the remaining
+render+concat into a single sized format buffer is a self-contained follow-up: the
+general N-way join helps only f-strings with ≥4 pieces (it adds a carrier for the
+2-piece benchmark), and the fused formatter is a separate optimisation.
+
+**Tests.** New goldens `dict_string_keys_stress` (string-keyed dict forced across
+many resizes; cross-construction key equality), `str_one_object_layout`
+(construction, codepoint len/index/slice/iteration, concat, `in`, equality, empty,
+multibyte, `bytes` byte-length, f-strings), and `str_literal_interning` (interning
+is transparent — value `==` holds and concat/format are non-destructive on the
+shared constant across many reuses). A structural codegen IR test asserts a literal is one interned
+constant with no per-use `zap_str_new`. The existing `dict`, `dict_float_key`,
+`tuple_dict_key`, `char_dict_key_roundtrip`, `crypto_streaming`,
+`crypto_hmac_stream` and string/JSON goldens are the regression net for the layout
+change. `crates/driver/tests/perf.rs` gains `dict_int` and `fstring_only` next to
+`dict_string` so each CI run reports the #837 within-run split (lenient floors
+only — never an exact time, per the GC-golden determinism rule).
