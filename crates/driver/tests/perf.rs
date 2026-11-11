@@ -135,8 +135,8 @@ fn benches() -> Vec<Bench> {
             floor_per_sec: 100_000.0,
         },
         // GC-HEAVY mixed workload (the review's dict+string case): 100k string
-        // keys inserted then looked up. Exercises the frame/root path that is
-        // intentionally UNCHANGED, so it is a regression guard on the other side.
+        // keys inserted then looked up. Exercises the cached-key-hash probe/resize
+        // path (#837 lever 1) and the one-object string keys (lever 2).
         // sum of lookups = 0+1+...+99999 = 4999950000.
         Bench {
             name: "dict_string",
@@ -148,6 +148,39 @@ fn benches() -> Vec<Bench> {
             expect: "4999950000",
             work: 200_000, // 100k inserts + 100k lookups
             unit: "ops",
+            floor_per_sec: 1_000.0,
+        },
+        // The dict-core cost in isolation (#837 split): the SAME 100k insert +
+        // lookup workload with INT keys — no string objects, so no key-hash,
+        // byte-compare or string-tracing overhead. Reported next to `dict_string`
+        // so each CI run shows the string-key remainder (`dict_string -
+        // fstring_only - dict_int`) the issue reads, not absolute ms.
+        Bench {
+            name: "dict_int",
+            src: "def main():\n    dict[int64, int64] d = {}\n    int64 i = 0\n    \
+                  while i < 100000:\n        d[i] = i\n        i = i + 1\n    \
+                  int64 s = 0\n    i = 0\n    \
+                  while i < 100000:\n        s = s + d[i]\n        i = i + 1\n    \
+                  print(s)\n",
+            expect: "4999950000",
+            work: 200_000,
+            unit: "ops",
+            floor_per_sec: 1_000.0,
+        },
+        // The string-CONSTRUCTION cost in isolation (#837 split): build 100k
+        // `f"k{i}"` and sum their codepoint lengths, no dict. Exercises literal
+        // interning (lever 3: the `"k"` prefix is now a shared constant, not a
+        // per-iteration allocation) and the one-object layout (lever 2: each
+        // formatted piece is one allocation, not two). sum of len(f"k{i}") for
+        // i in 0..100000 = 100000*1 + (10*1+90*2+900*3+9000*4+90000*5) = 588890.
+        Bench {
+            name: "fstring_only",
+            src: "def main():\n    int64 s = 0\n    int64 i = 0\n    \
+                  while i < 100000:\n        s = s + len(f\"k{i}\")\n        i = i + 1\n    \
+                  print(s)\n",
+            expect: "588890",
+            work: 100_000,
+            unit: "strings",
             floor_per_sec: 1_000.0,
         },
     ]
