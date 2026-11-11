@@ -756,6 +756,220 @@ def new_queue[T]() -> Queue[T]:
     QNode[T] stub = QNode(value=eval, next=Atomic(elink))
     return Queue(_head=Atomic(stub), _tail=Atomic(stub))
 
+# ---------------------------------------------------------------------------
+# ConcurrentMap[K, V] — lock-free, resizable hash map (#184, D-0147).
+#
+# A split-ordered hash table (Shalev & Shavit): one lock-free singly linked list
+# of all entries, kept sorted by the BIT-REVERSED hash (split order), plus a
+# bucket directory (an `AtomicArray` of sentinel-node pointers, #844) giving
+# O(1) entry into the list. Resize is lazy and lock-free: a bucket's sentinel is
+# created on first use by splitting its parent bucket; growing `size` adds new
+# sentinels without ever moving an entry — the entire point of split order.
+#
+# Concurrency is entirely via seq_cst atomics (`Atomic[T]`/`AtomicArray[T]`,
+# D-0066/D-0146): the only mutable field on a node is its `next` link (a
+# single-word `Atomic` reference), CAS-updated. Values are IMMUTABLE per node —
+# `set` and `delete` publish a new node at the front of the key's split-order
+# group (an update/tombstone shadows the older node), so no multi-word atomic is
+# needed and `V` is unconstrained. Reclamation leans on the tracing moving GC
+# (D-0078 §4.3): an unlinked/shadowed node is collected once unreachable; CAS is
+# pointer-identity and ABA is moot (a referenced node is never reclaimed).
+#
+# v1 (Experimental, D-0076) scope / limits, documented:
+#   * K: Hashable (dict-key capability: __hash__ + __eq__). V: any type.
+#   * Fixed maximum bucket count (`_CMAP_MAXB`); `size` doubles lazily up to it.
+#   * Shadowed (updated) and tombstoned (deleted) nodes are not physically
+#     reclaimed until the whole map is unreachable — an update-/delete-heavy
+#     workload grows the backing list. Physical unlink is a follow-up.
+#   * `len()` is an approximate live-entry count (racy by construction).
+#   * No consistent snapshot: iteration is intentionally not offered (a lock-free
+#     map has none), matching the Queue's honest surface (D-0078).
+# aarch64-Linux inherits the node-liveness caveat (#223/#650) like every other
+# node-allocating concurrent structure.
+
+# Low 32 bits of `x`, bit-reversed — the core of the split-order key.
+def _cmap_reverse32(int64 x) -> int64:
+    int64 r = 0
+    int64 v = x & 4294967295
+    int64 i = 0
+    while i < 32:
+        r = (r << 1) | (v & 1)
+        v = v >> 1
+        i = i + 1
+    return r
+
+# Regular (data) split-order key: odd, so a data node sorts AFTER the sentinel of
+# its bucket. Setting bit 31 before reversing makes the reversed bit 0 a 1.
+def _cmap_regular(int64 h) -> int64:
+    return _cmap_reverse32((h & 4294967295) | 2147483648)
+
+# Dummy (sentinel) split-order key for bucket `b`: even.
+def _cmap_dummy(int64 b) -> int64:
+    return _cmap_reverse32(b)
+
+# A node in the split-order list. A sentinel marks a bucket's entry point
+# (`sentinel=True`, `key`/`val` = None); a data node carries `key=Some(k)` and
+# an immutable `val` (`Some(v)` live, `None` tombstone). `next` is the only
+# mutable field — a single-word atomic reference (null == end of list).
+struct MNode[K, V]:
+    int64 sokey
+    Optional[K] key
+    Optional[V] val
+    Atomic[MNode[K, V]] next
+    bool sentinel
+
+struct ConcurrentMap[K: Hashable, V]:
+    AtomicArray[MNode[K, V]] buckets
+    Atomic[int64] size
+    Atomic[int64] count
+
+    # The last node with sokey < `so` and the first with sokey >= `so`, starting
+    # from `start`. The list is insert-only (no physical unlink), so no
+    # marker-helping is needed here.
+    def _search(self, MNode[K, V] start, int64 so) -> (MNode[K, V], MNode[K, V]):
+        auto prev = start
+        auto cur = start.next.load()
+        while cur is not None and cur.sokey < so:
+            prev = cur
+            cur = cur.next.load()
+        return (prev, cur)
+
+    # Parent of bucket `b` (b with its most-significant set bit cleared); only
+    # called for b > 0 (bucket 0's sentinel is created eagerly at construction).
+    def _parent(self, int64 b) -> int64:
+        int64 bit = 1
+        while (bit << 1) <= b:
+            bit = bit << 1
+        return b - bit
+
+    # The sentinel node for bucket `b`, created lazily on first use.
+    def _get_bucket(self, int64 b) -> MNode[K, V]:
+        auto s = self.buckets.load(b)
+        if s is None:
+            return self._init_bucket(b)
+        return s
+
+    def _init_bucket(self, int64 b) -> MNode[K, V]:
+        int64 parent = self._parent(b)
+        auto psent = self._get_bucket(parent)
+        int64 so = _cmap_dummy(b)
+        Optional[K] nk = None
+        Optional[V] nv = None
+        MNode[K, V] nil = None
+        while True:
+            auto prev, cur = self._search(psent, so)
+            if cur is not None and cur.sokey == so:
+                self.buckets.store(b, cur)
+                return cur
+            MNode[K, V] sent = MNode(sokey=so, key=nk, val=nv, next=Atomic[MNode[K, V]](cur), sentinel=True)
+            if prev.next.compare_and_swap(cur, sent):
+                self.buckets.store(b, sent)
+                return sent
+        return nil
+
+    def _maybe_grow(self, int64 cnt, int64 sz):
+        if sz >= 65536:
+            return
+        if cnt > sz * 4:
+            self.size.compare_and_swap(sz, sz + sz)
+
+    # Insert or update `key` -> `v`. A new node is published at the front of the
+    # key's split-order group, shadowing any older node for the same key.
+    def put(self, K key, V v):
+        int64 h = key.__hash__()
+        int64 so = _cmap_regular(h)
+        Optional[K] sk = Optional.Some(key)
+        Optional[V] sv = Optional.Some(v)
+        while True:
+            int64 sz = self.size.load()
+            int64 b = h & (sz - 1)
+            auto sent = self._get_bucket(b)
+            auto prev, cur = self._search(sent, so)
+            bool existed_live = False
+            auto scan = cur
+            while scan is not None and scan.sokey == so:
+                if (not scan.sentinel) and scan.key.unwrap() == key:
+                    existed_live = scan.val.is_some()
+                    break
+                scan = scan.next.load()
+            MNode[K, V] nn = MNode(sokey=so, key=sk, val=sv, next=Atomic[MNode[K, V]](cur), sentinel=False)
+            if prev.next.compare_and_swap(cur, nn):
+                if not existed_live:
+                    auto c = self.count.add(1)
+                    self._maybe_grow(c, sz)
+                return
+
+    # get(key) -> (Optional[V], bool), comma-ok like a channel receive. The
+    # newest node for a key sorts first, so the first match wins.
+    def get(self, K key) -> (Optional[V], bool):
+        int64 h = key.__hash__()
+        int64 so = _cmap_regular(h)
+        int64 sz = self.size.load()
+        int64 b = h & (sz - 1)
+        auto sent = self._get_bucket(b)
+        auto node = sent.next.load()
+        while node is not None and node.sokey < so:
+            node = node.next.load()
+        Optional[V] none = None
+        while node is not None and node.sokey == so:
+            if (not node.sentinel) and node.key.unwrap() == key:
+                if node.val.is_some():
+                    return (node.val, True)
+                return (none, False)
+            node = node.next.load()
+        return (none, False)
+
+    def contains(self, K key) -> bool:
+        auto r, ok = self.get(key)
+        return ok
+
+    def get_or(self, K key, V default) -> V:
+        auto r, ok = self.get(key)
+        if ok:
+            return r.unwrap()
+        return default
+
+    # Remove `key`; returns True iff it was present and live. Publishes a
+    # tombstone node that shadows the live node.
+    def delete(self, K key) -> bool:
+        int64 h = key.__hash__()
+        int64 so = _cmap_regular(h)
+        Optional[K] sk = Optional.Some(key)
+        Optional[V] nv = None
+        while True:
+            int64 sz = self.size.load()
+            int64 b = h & (sz - 1)
+            auto sent = self._get_bucket(b)
+            auto prev, cur = self._search(sent, so)
+            bool live = False
+            auto scan = cur
+            while scan is not None and scan.sokey == so:
+                if (not scan.sentinel) and scan.key.unwrap() == key:
+                    live = scan.val.is_some()
+                    break
+                scan = scan.next.load()
+            if not live:
+                return False
+            MNode[K, V] tomb = MNode(sokey=so, key=sk, val=nv, next=Atomic[MNode[K, V]](cur), sentinel=False)
+            if prev.next.compare_and_swap(cur, tomb):
+                self.count.sub(1)
+                return True
+
+    # Approximate number of live entries (racy by construction).
+    def length(self) -> int64:
+        return self.count.load()
+
+# Build an empty ConcurrentMap[K, V]. Bucket 0's sentinel (the list head) is
+# created eagerly so lazy bucket init always has a parent to split.
+def new_concurrent_map[K: Hashable, V]() -> ConcurrentMap[K, V]:
+    AtomicArray[MNode[K, V]] bk = AtomicArray[MNode[K, V]](65536)
+    Optional[K] nk = None
+    Optional[V] nv = None
+    MNode[K, V] nil = None
+    MNode[K, V] s0 = MNode(sokey=0, key=nk, val=nv, next=Atomic[MNode[K, V]](nil), sentinel=True)
+    bk.store(0, s0)
+    return ConcurrentMap(buckets=bk, size=Atomic[int64](2), count=Atomic[int64](0))
+
 # xml (I#351, D-0085) — Experimental core XML DOM for the AWS rest-xml / query
 # protocols. `XmlElement`/`XmlAttr` are compiler-known reference structs (like
 # `JsonValue`); the tree build + serialize walk live in these prelude functions,
@@ -983,6 +1197,12 @@ fn references_prelude(module: &Module) -> bool {
         "\"Queue\"",
         "\"QNode\"",
         "\"new_queue\"",
+        // The lock-free, resizable `ConcurrentMap[K, V]` (#184, D-0147): its
+        // `MNode[K, V]` node and `new_concurrent_map` constructor ship in the
+        // prelude, injected for any program that names one of them.
+        "\"ConcurrentMap\"",
+        "\"MNode\"",
+        "\"new_concurrent_map\"",
         // The `xml` core DOM (I#351, D-0085): `XmlElement`/`XmlAttr` and the
         // `__xml_*` build/serialize helpers ship in the prelude, injected for any
         // program that names the module or one of these types.

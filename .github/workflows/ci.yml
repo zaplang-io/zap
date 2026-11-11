@@ -296,7 +296,7 @@ jobs:
         run: cargo test --workspace --features zapc/${{ matrix.gc }}
 
       # Re-run the golden end-to-end + GC-stress suites with the LTO build flag
-      # ON (I#841, D-0147), so the full program corpus (including the `--race`
+      # ON (I#841, D-0148), so the full program corpus (including the `--race`
       # fixtures driven by the golden harness) stays green when every program is
       # linked under `clang -O2 -flto` — on BOTH collectors (golden on each leg;
       # the GC-stress suite is gc-immix-gated). Reuses the test binaries built

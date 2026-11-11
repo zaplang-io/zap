@@ -7131,7 +7131,58 @@ primitive, barred by the language-first rule). Building the concurrent map on a
 lock around a plain `dict` (the sharded/hybrid design) was declined upstream in
 favour of a fully lock-free map, which requires this primitive.
 
-## D-0147 — no `inline` keyword; inlining is the toolchain's job (LLVM -O2 + LTO runtime boundary + codegen open-coding) (#841)
+## D-0147 — `ConcurrentMap[K, V]`: a lock-free, resizable hash map (#184)
+
+**Status:** Accepted. **Tier:** Experimental (D-0076). **Depends on:** D-0146
+(`AtomicArray[T]`), D-0066 (`Atomic[T]`), D-0078 (concurrent module + the
+no-packed-pointers GC-safety invariant), D-0008/D-0009 (precise moving Immix).
+
+**Context.** D-0078 shipped a lock-free `Counter` + MPSC `Queue` and deferred the
+map. The map is the remaining headline surface; the maintainer chose a **fully
+lock-free, resizable** map (not a sharded-mutex hybrid), which D-0146 unblocked by
+providing the atomically CAS-able pointer array its bucket directory needs.
+
+**Decision.** Add a prelude generic reference type `ConcurrentMap[K: Hashable, V]`
+(mirroring the bare prelude `Queue[T]`), constructed `new_concurrent_map[K, V]()`,
+with `put`, `get(k) -> (Optional[V], bool)` (comma-ok), `delete(k) -> bool`,
+`contains(k) -> bool`, `get_or(k, default) -> V`, and an approximate `length()`.
+`@shareable` (D-0113). No new syntax; concurrency is in the type name.
+
+**Algorithm.** A **split-ordered hash table** (Shalev & Shavit): one lock-free
+singly linked list of all entries, kept sorted by the **bit-reversed hash**, plus
+a bucket directory — an `AtomicArray[MNode[K,V]]` of sentinel-node pointers
+(D-0146) — giving O(1) entry into the list. Resize is **lazy and lock-free**: a
+bucket's sentinel is created on first use by splitting its parent bucket, and
+growing `size` (doubled on load) adds sentinels without ever moving an entry. The
+only mutable per-node field is its `next` link (a single-word `Atomic` reference,
+CAS-updated); keys and values are **immutable per node**, so `put`/`delete`
+publish a new node at the front of the key's split-order group — an update or
+tombstone shadows the older node — and no multi-word atomic is needed, leaving `V`
+unconstrained.
+
+**GC safety.** Reclamation leans entirely on the tracing moving collector
+(D-0078 §4.3): shadowed/unlinked nodes are collected once unreachable; CAS is
+pointer-identity and ABA is moot (a referenced node is never reclaimed). Every
+stored pointer lives in a genuine reference slot (node links and the `AtomicArray`
+slots) — never a packed integer (D-0078 §4.4).
+
+**v1 scope / limits (documented).** Fixed maximum bucket count (`size` doubles
+lazily up to it); shadowed (updated) and tombstoned (deleted) nodes are **not
+physically reclaimed** until the whole map is unreachable (an update-/delete-heavy
+workload grows the backing list — physical unlink is a follow-up); `length()` is
+approximate (racy by construction); no consistent-snapshot iteration (a lock-free
+map has none, matching the Queue's honest surface). aarch64-Linux inherits the
+node-liveness caveat (#223/#650) like every node-allocating concurrent structure.
+
+**Alternatives rejected.** A sharded `Mutex`+`dict` (simpler, full `dict` surface,
+but lock-based — declined in favour of fully lock-free). Harris/Michael
+marked-pointer physical deletion (the mark bit is a tagged pointer, barred by
+D-0078 §4.4); tombstone + shadowing achieves lock-free delete within the
+invariant, deferring physical reclamation. In-place value update via
+`Atomic[Optional[V]]` (only single-word for reference `V`; rejected so `V` stays
+unconstrained).
+
+## D-0148 — no `inline` keyword; inlining is the toolchain's job (LLVM -O2 + LTO runtime boundary + codegen open-coding) (#841)
 
 **Problem.** The C runtime (`zaprt.c`) is compiled to its OWN object file and
 linked against the program object. The program is emitted and optimized as its own

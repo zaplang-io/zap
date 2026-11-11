@@ -25,6 +25,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`ConcurrentMap[K, V]` — a lock-free, resizable hash map** (#184, D-0147).
+  A split-ordered hash table (Shalev & Shavit) built on `AtomicArray[T]`
+  (D-0146): one lock-free linked list of entries sorted by bit-reversed hash,
+  plus a bucket directory for O(1) entry; resize is lazy and lock-free (a
+  bucket's sentinel is split from its parent on first use — no entry ever
+  moves). Surface: `new_concurrent_map[K, V]()`, `put`, `get(k) -> (Optional[V],
+  bool)`, `delete(k) -> bool`, `contains`, `get_or`, approximate `length()`.
+  `K: Hashable`, `V` unconstrained (node values are immutable; updates/deletes
+  shadow via a new node). `@shareable` (D-0113), Experimental (D-0076). Leans on
+  the tracing moving GC (no hazard/epoch; D-0078 §4.3–4.4). v1 limits: fixed max
+  bucket count; shadowed/tombstoned nodes not physically reclaimed until the map
+  is unreachable; `length()` approximate; no snapshot iteration. Completes the
+  concurrent-collections surface opened by #184.
 - **`AtomicArray[T]` — a fixed-capacity array of atomically CAS-able slots**
   (#844, D-0146). The pointer-array primitive the field-based `Atomic[T]`
   (D-0066) could not express: `AtomicArray[T](cap)` allocates `cap` seq_cst
@@ -860,7 +873,7 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
-- **Runtime fast paths can inline into generated code via LTO** (#841, D-0147).
+- **Runtime fast paths can inline into generated code via LTO** (#841, D-0148).
   The C runtime was compiled to its own object and linked against the program
   object, so at the program's optimize step the hot runtime helpers
   (`zap_dict_get_str_i64`, `zap_str_concat`, `zap_i64_to_str`, …) were opaque

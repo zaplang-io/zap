@@ -74,7 +74,7 @@ impl Backend for LlvmBackend {
 
 impl LlvmBackend {
     /// Emit a (type-checked) AST module as an LLVM **bitcode** file for the LTO
-    /// link path (I#841, D-0147). Unlike [`Backend::compile_object`], which runs
+    /// link path (I#841, D-0148). Unlike [`Backend::compile_object`], which runs
     /// the target backend to native code, this writes the program as LLVM IR
     /// bitcode so it can be merged with the runtime bitcode (`llvm-link`) and
     /// optimized together (`clang -O2`) — inlining across the program↔runtime
@@ -107,7 +107,7 @@ impl LlvmBackend {
 
 /// Strip the per-function `target-cpu` / `target-features` / `tune-cpu` string
 /// attributes from every function in the bitcode module at `path`, rewriting it
-/// in place (I#841, D-0147).
+/// in place (I#841, D-0148).
 ///
 /// WHY. clang stamps these attributes on every C-runtime function (e.g.
 /// `target-features="+sse2,…"`), but the inkwell-emitted program module carries
@@ -276,7 +276,7 @@ const RUNTIME_NP_IOCP_H: &str = include_str!("zap_np_iocp.h");
 /// Build flags read from the environment (so a toolchain image / CI can set a
 /// default without threading a parameter through every caller):
 ///   * `ZAP_PORTABLE` — the self-contained static link profile (above).
-///   * `ZAP_LTO` — LTO the C runtime into the program (I#841, D-0147): emit the
+///   * `ZAP_LTO` — LTO the C runtime into the program (I#841, D-0148): emit the
 ///     program as LLVM bitcode, compile the runtime to bitcode, merge the two
 ///     with `llvm-link`, and optimize/codegen the merged module with `clang -O2`
 ///     so LLVM inlines the hot runtime fast paths into generated code. OFF by
@@ -298,7 +298,7 @@ pub fn build_executable(
     // `ZAP_PORTABLE` (any value) is an environment-level alias for `--portable`:
     // it lets a deployment image default all builds to the portable profile.
     let portable = portable || std::env::var_os("ZAP_PORTABLE").is_some();
-    // LTO the C runtime into the program (I#841, D-0147). Gated behind the
+    // LTO the C runtime into the program (I#841, D-0148). Gated behind the
     // `ZAP_LTO` env build flag — OFF by default, so the normal object-link path
     // below (and the binary it produces) is byte-for-byte unchanged. When set,
     // the program is emitted as LLVM bitcode, the runtime is compiled to LLVM
@@ -310,7 +310,7 @@ pub fn build_executable(
     // …) into the generated hot loops: with a merged module the inliner sees
     // both sides and needs no gold/lld plugin. The language exposes no `inline`
     // keyword — inlining is purely the optimizer's job, and this flag extends
-    // its reach across the program↔runtime boundary (D-0147). A toolchain image
+    // its reach across the program↔runtime boundary (D-0148). A toolchain image
     // / CI can default every build to LTO by exporting `ZAP_LTO=1` (the same
     // env-alias pattern as `ZAP_PORTABLE`). The default is kept conservative
     // (off) because the merge+`-O2` is slower than the object link and, unlike

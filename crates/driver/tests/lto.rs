@@ -1,10 +1,10 @@
-//! LTO runtime-inlining assertions (I#841, D-0147).
+//! LTO runtime-inlining assertions (I#841, D-0148).
 //!
 //! WHY THIS EXISTS. The C runtime is normally compiled as its OWN object and
 //! linked against the program object, so at the program's optimize step the hot
 //! runtime fast paths (`zap_dict_get_str_i64`, …) are opaque external symbols the
 //! inliner never sees — every `d[k]` pays an out-of-line call (#837, #568). The
-//! `ZAP_LTO` build flag (D-0147) instead emits the program as LLVM bitcode,
+//! `ZAP_LTO` build flag (D-0148) instead emits the program as LLVM bitcode,
 //! merges it with the runtime bitcode (`llvm-link`), optimizes the whole with
 //! `opt -O2`, and lets LLVM's cross-module inliner pull the runtime fast paths
 //! into the generated hot loops. The dict get is split into a small
