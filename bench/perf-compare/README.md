@@ -19,6 +19,12 @@ result (the harness checks the output, so a miscompile can't flatter a timing):
 | `fib` | `fib(32)`, naive recursion — call-heavy, GC-free | `2178309` |
 | `loop_sum` | sum `0..30_000_000` — tight integer loop, GC-free | `449999985000000` |
 | `dict_string` | build + look up 200k string→int entries — GC-heavy | `19999900000` |
+| `dict_int` | same workload with **int keys** — isolates the dict cost | `19999900000` |
+| `fstring_only` | build 400k `f"k{i}"` and sum their `len` — isolates the string-construction cost | `2577780` |
+
+`dict_string ≈ fstring_only + dict_int` splits the string-key workload into its
+two halves, so the table shows whether the cost is the dictionary or the
+per-key string construction.
 
 ## Running
 

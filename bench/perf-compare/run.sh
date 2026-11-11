@@ -23,16 +23,20 @@ OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 # benchmark -> expected stdout (so a miscompile can't flatter the timing).
-BENCHES=(fib loop_sum dict_string)
+BENCHES=(fib loop_sum dict_string dict_int fstring_only)
 declare -A EXPECT=(
   [fib]=2178309                    # fib(32)
   [loop_sum]=449999985000000       # sum(0..30_000_000)
   [dict_string]=19999900000        # sum of 200k string-keyed lookups
+  [dict_int]=19999900000           # same workload, INT keys (isolates the dict)
+  [fstring_only]=2577780           # 400k f"k{i}" built, summed by len (isolates strings)
 )
 declare -A LABEL=(
   [fib]="fib(32) — recursive, call-heavy, GC-free"
   [loop_sum]="loop sum 30M — tight integer loop, GC-free"
   [dict_string]="dict+string 200k — build + lookup, GC-heavy"
+  [dict_int]="dict+int 200k — same ops, INT keys (dict cost only)"
+  [fstring_only]="f-string ×400k — build + len, no dict (string cost only)"
 )
 
 now_ns() { date +%s%N; }
