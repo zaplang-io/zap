@@ -7637,3 +7637,79 @@ OpenSSL-backed crypto (`crypto.blake2b`), `tls.connect`, and `http.get` each lin
 and run; blake2b exercises the OpenSSL-on path). ELF assertions skip on non-Linux
 / without `readelf`; a missing `-dev` package skips that case. No `GRAMMAR.ebnf`
 change — the gate is invisible to syntax and to observable semantics.
+
+## D-0155 — coalesce the three safepoint-poll flags into one word (#860)
+
+**Context.** The inlined back-edge safepoint poll (D-0143/D-0144, #568) loads
+three separate exported `volatile int` globals every iteration —
+`zap_gc_wanted`, `zap_collecting` (zapgc.inc.c) and `zap_preempt_any` (zaprt.c) —
+ORs them, and branches to the out-of-line `zap_safepoint` slow path when any is
+set. On `bench/perf-compare/loop_sum.zap` (30M iterations) that is **90M loads**
+of three globals that are almost always zero. Once D-0152 (#857) register-promotes
+the loop locals, these three poll loads are the visible remaining per-iteration
+cost of a tight loop — carved out of #857 as "Secondary" and tracked as #860.
+
+**Decision.** Pack the three advisory flags into three **bit lanes of one**
+`volatile uint32_t zap_safepoint_flags` (zaprt.c), so the poll is a **single**
+`load volatile i32` + `icmp ne i32 %f, 0` + hinted branch (`Cg::gc_safepoint`),
+down from three loads + two ORs + compare. The load stays `volatile` (so D-0152's
+`-O2` middle-end still cannot hoist it out of the loop) and the opaque
+`zap_safepoint` slow path is unchanged. **Nothing about when a safepoint is taken
+changes** — same entry + loop-header placement (D-0144 `safepoint_blocks`), same
+frequency, same latency. Only the flag *encoding* changes, so a coalesced-word
+false positive (any lane set) is the same harmless extra slow-path visit as
+before: the slow path still does the precise per-M preempt check and the GC
+handshake under `zap_stw_mu`.
+
+```
+ZAP_SP_GC_WANTED  0x1   /* a collection is due (set by alloc)        */
+ZAP_SP_COLLECTING 0x2   /* a collection is in progress               */
+ZAP_SP_PREEMPT    0x4   /* some M has a pending fairness preemption   */
+```
+
+**Concurrent writers (why this is the substance of the change).** The three
+lanes have three independent writers: the allocator sets GC_WANTED
+(`zap_account_refill`, large-object alloc); the collector sets COLLECTING and
+clears GC_WANTED at collection start and clears COLLECTING at the end
+(`zap_collect_now`); the fairness monitor republishes PREEMPT every ~10 ms tick
+as the OR of every M's `preempt` latch. With one shared word a plain store would
+read-modify-write the whole word and clobber another writer's lane, so set/clear
+are **atomic bit RMW** — `__atomic_fetch_or` / `__atomic_fetch_and`, `RELAXED`
+(these are advisory flags whose slow path re-checks the precise per-M /
+per-collection state under the STW mutex; `m->preempt` is itself a RELAXED latch,
+D-0121). The monitor's PREEMPT publish becomes a conditional lane set/clear via
+the same atomics. Reads use `zap_sp_test(mask)` — a RELAXED atomic load of the
+word masked to the lane(s), a single aligned 32-bit load, the same cost as the
+old per-flag read; `zap_sp_test(A | B)` tests "any of A, B", so a combined
+`zap_gc_wanted || zap_collecting` check is one masked load.
+
+**Read-site sweep.** Every runtime read of the old flags was rewritten to a
+lane test (`zap_safepoint` fast path and collector STW spin loops in zapgc.inc.c;
+the profiler-signal guard in zaprt.c), and the two old `volatile int` definitions
+were removed — a single missed read site still testing an old separate global
+would be a silent missed-collection / missed-preempt bug, so the sweep is
+complete (grep of both runtime files shows no remaining `zap_gc_wanted` /
+`zap_collecting` / `zap_preempt_any` outside historical comments). Codegen now
+declares and loads the single `@zap_safepoint_flags` symbol instead of three.
+
+**Build split.** The word is defined in zaprt.c (not zapgc.inc.c) and on BOTH
+builds, because the shared fairness monitor publishes the PREEMPT lane under Boehm
+too; under Boehm the GC lanes are unused and compiled code never reads the word
+(Boehm preempts via a direct signal switch, not the inline poll).
+
+**Verification.** `crates/codegen/src/lib.rs`:
+`safepoint_poll_is_a_single_coalesced_load` asserts a single-poll function emits
+exactly ONE `load volatile i32` of `@zap_safepoint_flags` and none of the three
+old symbols; `gc_free_loop_keeps_backedge_safepoint` additionally asserts the
+volatile-load count equals the poll count (one load per poll).
+`crates/driver/tests/safepoint_coalesce.rs` (objdump, toolchain-gated like
+`lto.rs`) confirms it survives to machine code: the hot loop references
+`zap_safepoint_flags` (one load per `zap_safepoint` slow-path call) and the final
+binary references none of the three old symbols. The GC / `--race` / preemption
+goldens (`gc.rs`, `preemption.zap`, `gc_preempt_stw_stress.zap`,
+`concurrent_queue_gc_preempt_stress.zap`) stay green — correctness unchanged. The
+`perf.rs` `tight_loop` wall-clock is a trend signal (no exact-time assertion,
+per the GC-golden determinism rule); the measured per-iteration win shows only
+once D-0152 register-promotes the loop, but the change is correct and mergeable
+independently. No `GRAMMAR.ebnf` change — invisible to syntax and observable
+semantics.
