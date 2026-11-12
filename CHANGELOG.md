@@ -25,6 +25,20 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **OpenSSL / PCRE2 / zlib are linked only when the program reaches them**
+  (#853, D-0154). The sibling of the libpython gate below: a compiled binary
+  used to eagerly hard-link PCRE2 (`libpcre2-8`), zlib (`libz`) and OpenSSL
+  (`libssl`/`libcrypto`) as `NEEDED` even when it used no regex, compression, or
+  crypto/TLS/https, paying their loader cost at every start and refusing to run
+  without them. The compiler now scans the lowered program for each backend's
+  runtime seam and links its library only when reached; otherwise that backend's
+  runtime code is compiled out (`-DZAP_NO_PCRE2` / `-DZAP_NO_ZLIB` /
+  `-DZAP_NO_OPENSSL`). So regex pulls only libpcre2, zlib only libz, and
+  TLS/http/OpenSSL-crypto only libssl+libcrypto — while the self-contained
+  `crypto.sha*`/`md5`/`hmac_*`/CSPRNG hashes (pure C) pull no OpenSSL. Combined
+  with the libpython gate, a plain `def main(): print(0)` now carries **no**
+  optional-library `NEEDED` entry at all. The explicit `--portable` profile and
+  the stdlib behavior are unchanged.
 - **libpython is linked only when the program `import python`s** (#852, D-0153).
   A compiled binary used to hard-link `libpython3.12` as a `NEEDED` dynamic
   dependency even when it never `import python`ed, so `ld.so` mmap'd and

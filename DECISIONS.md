@@ -7576,3 +7576,64 @@ Exception`, exit 0). The ELF assertions skip on non-Linux / without `readelf`;
 CI's Linux leg exercises them. No `GRAMMAR.ebnf` change — the link gate is
 invisible to syntax and to the observable semantics of any program (a non-Python
 program never referenced libpython; a Python program links it exactly as before).
+
+## D-0154 — link OpenSSL/PCRE2/zlib only when the program reaches them (#853)
+
+**Context.** The sibling of D-0153. Beyond libpython, every compiled binary also
+eagerly hard-linked the optional C backends used by parts of the stdlib —
+**PCRE2** (`libpcre2-8`, regex), **zlib** (`libz`, `zlib`/`gzip`), and **OpenSSL**
+(`libssl`/`libcrypto`, the `tls` module, the OpenSSL-backed `crypto` primitives,
+and the http `https://` client) — even when the program used none of them.
+`readelf -d` of `def main(): print(0)` listed all of them `NEEDED`, so `ld.so`
+mapped and relocated each at every process start, and the binary refused to run
+without them present (startup-floor / footprint / portability cost in #853).
+
+**Decision.** Drive the optional-backend `NEEDED` set from the program, exactly
+as D-0153 does for CPython. `build_executable` lowers the program and scans every
+`Call`/`Invoke`/`FuncAddr` for each backend's runtime **seam symbols**
+(`program_backend_use`); a backend's library is linked only when its seam is
+reached, otherwise that backend's `zaprt.c` code is compiled out behind
+`-DZAP_NO_PCRE2` / `-DZAP_NO_ZLIB` / `-DZAP_NO_OPENSSL` and references no symbol
+of it. The scan is the exact symbol the generated code references, so there are
+no false negatives — a reached backend is always linked.
+
+**Seam mapping (precise, erring toward over-linking never a miss).**
+- `libpcre2-8` ⟺ `zap_regex_*`. zlib-independent.
+- `libz`       ⟺ `zap_zlib_*` / `zap_gzip_*`. The net/http runtime does not use
+  zlib, so http does not drag it in.
+- `libssl` + `libcrypto` ⟺ `zap_tls_*`, `zap_http_*`, or an OpenSSL-backed
+  `zap_crypto_*`. The http client embeds its `https://` path inline (the URL is a
+  runtime string, so https cannot be ruled out at compile time), so ANY http use
+  is treated as needing OpenSSL — conservative but sound. The self-contained
+  `zap_crypto_sha*` / `md5` / streaming-hash / `hmac_*` / CSPRNG family is pure C
+  (verified: no OpenSSL symbol is referenced below the OpenSSL region in
+  `zaprt.c`) and is EXCLUDED, so a program that only hashes links no OpenSSL.
+
+**No stubs (unlike D-0153).** CPython needed catchable-error stubs because the
+explicit `--portable` profile can drop libpython while a program still `import
+python`s. Here a program that reaches no backend seam references none of the
+gated symbols, so the compiled-out functions are simply absent — no stub needed.
+The regex/zlib entry points DO keep a tiny catchable-error `#else` stub (so the
+seam still links if ever reached under the gate); OpenSSL, whose TLS path is
+threaded through the shared `net` read/write via a `ZAP_CONN_TLS` tag, instead
+guards only those TLS branches (the plaintext path stays) and compiles the TLS
+transport + crypto block + http client out wholesale.
+
+**Scope / interaction.** Independent of and composed with D-0153 (a `print(0)`
+now links none of libpython/libpcre2/libz/libssl/libcrypto). The explicit
+`--portable` / `ZAP_PORTABLE` profile is unchanged and still statically links
+whatever the program reaches. The REPL JIT keeps linking everything (it builds
+incrementally and cannot know the final program). As a side benefit on the
+default (non-LTO) path the whole runtime is recompiled per build, so compiling
+the backend code — chiefly the heavy OpenSSL headers — out of a non-using build
+also trims that compile.
+
+**Verification.** `crates/driver/tests/link_optional_libs.rs` (walled garden, via
+`readelf -d`): a no-backend program links none of the five optional libs and
+runs; regex links only libpcre2, zlib only libz (no cross-contamination); the
+self-contained `crypto.sha256` links no OpenSSL (exclusion-set guard); and
+OpenSSL-backed crypto (`crypto.blake2b`), `tls.connect`, and `http.get` each link
+`libssl`/`libcrypto`. Validated on the LLVM-18 box (empty/sha256/regex/zlib build
+and run; blake2b exercises the OpenSSL-on path). ELF assertions skip on non-Linux
+/ without `readelf`; a missing `-dev` package skips that case. No `GRAMMAR.ebnf`
+change — the gate is invisible to syntax and to observable semantics.

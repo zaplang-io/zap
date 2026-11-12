@@ -259,16 +259,25 @@ static struct tm *zap_win_gmtime_r(const time_t *t, struct tm *out) {
 
 /* PCRE2, 8-bit code units (ticket #23, D-0010). Must be defined before the
  * header so the `pcre2_*` names resolve to the 8-bit API. Linked with
- * `-lpcre2-8` (see build_executable). */
+ * `-lpcre2-8` (see build_executable). Gated OFF with `-DZAP_NO_PCRE2` (#853)
+ * when the program never reaches the regex seam: the `zap_regex_*` entry points
+ * below become catchable-error stubs and no libpcre2 is linked, so this header
+ * must not be required in that build. */
+#if !defined(ZAP_NO_PCRE2)
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
+#endif
 
 /* System zlib (ticket #106, D-0060): DEFLATE with the zlib (RFC 1950, Adler-32)
  * and gzip (RFC 1952, ISO CRC32) wrappers, plus the crc32/adler32 checksums.
  * Linked with `-lz` (see build_executable); the dev container / CI provide
  * `zlib1g-dev` and it ships on macOS. The zlib/gzip section lives at the bottom
- * of this file. */
+ * of this file. Gated OFF with `-DZAP_NO_ZLIB` (#853) when the program never
+ * reaches the zlib/gzip seam: those entry points become catchable-error stubs
+ * and no libz is linked. */
+#if !defined(ZAP_NO_ZLIB)
 #include <zlib.h>
+#endif
 
 /* ===========================================================================
  * GC abstraction (ticket #48). The runtime and codegen allocate through a
@@ -4283,6 +4292,7 @@ typedef struct {
  * so pointer truthiness (`if match:`, `!~`) routes through this. */
 int64_t zap_ptr_nonnull(void *p) { return p != NULL ? 1 : 0; }
 
+#if !defined(ZAP_NO_PCRE2)
 static uint32_t zap_regex_compile_opts(int64_t flags) {
     uint32_t o = 0;
     if (flags & ZAP_RE_CASELESS) o |= PCRE2_CASELESS;
@@ -4438,6 +4448,41 @@ void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_
     }
     return zap_str_new((const char *)buf, (int64_t)outlen);
 }
+#else /* ZAP_NO_PCRE2 — regex backend (PCRE2) gated off (#853): the program's
+       * import graph never reaches a `zap_regex_*` seam, so libpcre2 is not
+       * linked and <pcre2.h> is not included. The entry points still lower and
+       * link, but each raises a catchable Zap exception if somehow reached —
+       * the same shape as the portable CPython stubs (D-0153). */
+static void *zap_regex_unavailable(void) {
+    const char *m = "regex is unavailable in this build "
+                    "(the program's import graph reaches no regex use; see #853)";
+    zap_panic(zap_str_new(m, (int64_t)strlen(m)));
+    return NULL;
+}
+void *zap_regex_match(void *subject_, void *pattern_, int64_t flags) {
+    (void)subject_;
+    (void)pattern_;
+    (void)flags;
+    return zap_regex_unavailable();
+}
+void *zap_regex_group(void *m_, int64_t idx) {
+    (void)m_;
+    (void)idx;
+    return zap_regex_unavailable();
+}
+void *zap_regex_group_name(void *m_, void *name_) {
+    (void)m_;
+    (void)name_;
+    return zap_regex_unavailable();
+}
+void *zap_regex_subst(void *subject_, void *pattern_, void *replacement_, int64_t flags) {
+    (void)subject_;
+    (void)pattern_;
+    (void)replacement_;
+    (void)flags;
+    return zap_regex_unavailable();
+}
+#endif /* ZAP_NO_PCRE2 */
 
 /* ---------------------------------------------------------------------------
  * Python interop (ticket #27, D-0012, design/0003-python-interop.md): embed
@@ -14728,6 +14773,7 @@ void *zap_yaml_indent(void *sp, void *padp) {
  * 32-bit `avail_in`); larger payloads are out of v1 scope.
  * ======================================================================== */
 
+#if !defined(ZAP_NO_ZLIB)
 /* One inflate/deflate output step works on at most this many bytes, so zlib's
  * 32-bit `avail_out` never overflows regardless of total output size. */
 #define ZAP_Z_CHUNK ((uInt)(1u << 16))
@@ -14882,6 +14928,46 @@ int64_t zap_zlib_adler32(void *data) {
     a = adler32(a, (const Bytef *)s->data, (uInt)s->len);
     return (int64_t)(uint32_t)a;
 }
+#else /* ZAP_NO_ZLIB — zlib/gzip backend gated off (#853): the program's import
+       * graph never reaches a `zap_zlib_*`/`zap_gzip_*` seam, so libz is not
+       * linked and <zlib.h> is not included. The entry points still lower and
+       * link, but each raises a catchable Zap exception if somehow reached —
+       * the same shape as the portable CPython stubs (D-0153). */
+static void *zap_z_unavailable(void) {
+    const char *m = "zlib/gzip compression is unavailable in this build "
+                    "(the program's import graph reaches no compression use; see #853)";
+    zap_panic(zap_str_new(m, (int64_t)strlen(m)));
+    return NULL; /* unreachable: zap_panic does not return */
+}
+void *zap_zlib_compress(void *data, int64_t level) {
+    (void)data;
+    (void)level;
+    return zap_z_unavailable();
+}
+void *zap_zlib_decompress(void *data) {
+    (void)data;
+    return zap_z_unavailable();
+}
+void *zap_gzip_compress(void *data, int64_t level) {
+    (void)data;
+    (void)level;
+    return zap_z_unavailable();
+}
+void *zap_gzip_decompress(void *data) {
+    (void)data;
+    return zap_z_unavailable();
+}
+int64_t zap_zlib_crc32(void *data) {
+    (void)data;
+    zap_z_unavailable();
+    return 0;
+}
+int64_t zap_zlib_adler32(void *data) {
+    (void)data;
+    zap_z_unavailable();
+    return 0;
+}
+#endif /* ZAP_NO_ZLIB */
 
 /* ===========================================================================
  * sync — coroutine synchronization primitives (ticket #103, D-0032)
@@ -15805,6 +15891,18 @@ void zap_net_set_read_deadline(void *s_, int64_t ms) {
  * are built only after the final park. The socket BIO is BIO_NOCLOSE, so
  * the runtime owns the fd and closes it exactly once via `zap_sock_shutdown`.
  * ========================================================================== */
+/* OpenSSL backs `tls`, the OpenSSL-based `crypto` primitives, and the http
+ * `https://` client. #853 links `-lssl -lcrypto` and compiles this whole region
+ * — the headers + OpenSSL-backed crypto block + the TLS transport setup here,
+ * and (in a second guard below, past the shared connection helpers) the TLS
+ * client/server + the http client/server — ONLY when the program reaches a
+ * TLS/crypto/http seam. A program that reaches none is built `-DZAP_NO_OPENSSL`
+ * and this is compiled out, referencing no OpenSSL symbol, so no libssl/libcrypto
+ * links. Unlike CPython there are NO stubs: the gated entry points are simply
+ * absent, because such a program never calls them (the self-contained
+ * SHA/MD5/HMAC/CSPRNG `zap_crypto_*` live above this region and stay compiled).
+ * See `program_backend_use` in crates/codegen/src/lib.rs. */
+#if !defined(ZAP_NO_OPENSSL)
 #include <openssl/bn.h>
 #include <openssl/crypto.h> /* CRYPTO_memcmp: constant-time compare (#729)     */
 #include <openssl/ec.h>
@@ -17475,33 +17573,42 @@ typedef struct {
 /* ATOMIC: fd is a scalar; pd/ssl/ctx are non-GC heap (netpoller + OpenSSL), so
  * nothing is traced. Freed explicitly by `tls.close_conn` (the net contract). */
 static const ZapTypeDesc zap_desc_tls = {(int64_t)sizeof(ZapTls), ZAP_TD_ATOMIC, 0, NULL};
+#endif /* !ZAP_NO_OPENSSL — end crypto + TLS-setup region (#853); the shared
+        * connection helpers below serve BOTH transports and so stay compiled,
+        * with only their TLS branches guarded. */
 
 /* Store a read deadline on either flavor of connection handle, dispatching on the
  * transport tag (I#556). Backs `net.set_read_timeout`, which is declared above
  * the TLS section but must reach `ZapTls.read_timeout_ms` for a TLS conn. */
 static void zap_conn_set_read_timeout(void *c_, int64_t ms) {
+#if !defined(ZAP_NO_OPENSSL)
     if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
         ((ZapTls *)c_)->read_timeout_ms = ms;
-    } else {
-        ((ZapSock *)c_)->read_timeout_ms = ms;
+        return;
     }
+#endif
+    ((ZapSock *)c_)->read_timeout_ms = ms;
 }
 
 /* Store / read the whole-operation read budget on either connection flavor
  * (I#567), dispatching on the same transport tag. Backs `net.set_read_deadline`
  * and lets `http.read_request` pull the budget for whichever transport it is. */
 static void zap_conn_set_read_deadline(void *c_, int64_t ms) {
+#if !defined(ZAP_NO_OPENSSL)
     if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
         ((ZapTls *)c_)->read_deadline_ms = ms;
-    } else {
-        ((ZapSock *)c_)->read_deadline_ms = ms;
+        return;
     }
+#endif
+    ((ZapSock *)c_)->read_deadline_ms = ms;
 }
 
 static int64_t zap_conn_read_deadline_ms(void *c_) {
+#if !defined(ZAP_NO_OPENSSL)
     if (((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS) {
         return ((ZapTls *)c_)->read_deadline_ms;
     }
+#endif
     return ((ZapSock *)c_)->read_deadline_ms;
 }
 
@@ -17512,7 +17619,11 @@ void zap_net_set_deadline_ns(void *c_, int64_t deadline_ns) {
         zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("net: deadline must be non-negative", sizeof("net: deadline must be non-negative") - 1));
         return;
     }
+#if !defined(ZAP_NO_OPENSSL)
     void *pd_ = ((ZapConnHdr *)c_)->kind == ZAP_CONN_TLS ? ((ZapTls *)c_)->pd : ((ZapSock *)c_)->pd;
+#else
+    void *pd_ = ((ZapSock *)c_)->pd;
+#endif
     if (!pd_) {
         zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new("net: deadline requires an open netpoller socket", sizeof("net: deadline requires an open netpoller socket") - 1));
         return;
@@ -17528,6 +17639,12 @@ void zap_net_set_deadline_ns(void *c_, int64_t deadline_ns) {
     np_backend_kick();
 }
 
+/* OpenSSL TLS transport + the http client/server (#853): compiled only when the
+ * program reaches a TLS/crypto/http seam (the shared connection helpers above
+ * stay compiled for the plaintext path; everything from here is OpenSSL-only or
+ * http, and http embeds the inline `https://` path — see `program_backend_use`).
+ * When `-DZAP_NO_OPENSSL`, all of this is absent and no OpenSSL symbol is left. */
+#if !defined(ZAP_NO_OPENSSL)
 /* Classify a non-positive SSL_* return into an action:
  *    0 -> parked and now ready; retry the SSL_* call
  *   -1 -> the descriptor was closed under us (treat as EOF)
@@ -19435,6 +19552,7 @@ void zap_http_respond(void *c_, int64_t status, void *body_) {
 void zap_http_respond_h(void *c_, int64_t status, void *body_, void *headers_) {
     zap_http_respond_do(c_, status, body_, headers_);
 }
+#endif /* !ZAP_NO_OPENSSL — end TLS transport + http client/server (#853) */
 
 /* ===========================================================================
  * threading — Python-`threading`-shaped OS-thread compatibility (ticket #175)

@@ -265,6 +265,9 @@ fn lto_runtime_bitcode(
     rt_path: &Path,
     triple: &str,
     no_cpython: bool,
+    no_regex: bool,
+    no_zlib: bool,
+    no_openssl: bool,
 ) -> Result<std::path::PathBuf, String> {
     use std::hash::{Hash, Hasher};
 
@@ -293,12 +296,15 @@ fn lto_runtime_bitcode(
     triple.hash(&mut h);
     immix.hash(&mut h);
     no_cpython.hash(&mut h);
+    no_regex.hash(&mut h);
+    no_zlib.hash(&mut h);
+    no_openssl.hash(&mut h);
     py_cflags.hash(&mut h);
     extra.hash(&mut h);
     // Bump when the runtime compile flags below change (e.g. adding
-    // -fexceptions, or #852 keying the CPython drop on `no_cpython` rather than
-    // `portable`) so a stale pre-change cache entry is never reused.
-    "rt-bc-flags-v3-cpython-gate".hash(&mut h);
+    // -fexceptions, #852 keying the CPython drop on `no_cpython`, or #853 adding
+    // the PCRE2/zlib gates) so a stale pre-change cache entry is never reused.
+    "rt-bc-flags-v5-openssl-gate".hash(&mut h);
     // Different clang builds emit different bitcode — fold the version in.
     if let Ok(out) = Command::new(cc).arg("--version").output() {
         out.stdout.hash(&mut h);
@@ -346,6 +352,18 @@ fn lto_runtime_bitcode(
         rc.arg("-DZAP_NO_CPYTHON");
     } else {
         rc.args(&py_cflags);
+    }
+    // Optional-backend compile gates (#853): stub the regex / zlib entry points
+    // in the cached runtime bitcode so a program that never reaches them links
+    // no pcre2 / zlib (matching the `-l` omission at the link step).
+    if no_regex {
+        rc.arg("-DZAP_NO_PCRE2");
+    }
+    if no_zlib {
+        rc.arg("-DZAP_NO_ZLIB");
+    }
+    if no_openssl {
+        rc.arg("-DZAP_NO_OPENSSL");
     }
     for a in extra.split_whitespace() {
         rc.arg(a);
@@ -491,6 +509,105 @@ pub(crate) fn program_uses_cpython(module: &AstModule) -> bool {
         .any(|it| matches!(it, Item::Import(Import::Python { .. })))
 }
 
+/// The optional C backends a program's import graph reaches (#853), detected
+/// the same way as [`program_uses_cpython`] (#852) but over the *lowered*
+/// program: a backend's heavy system library (`libpcre2-8` for regex, `libz`
+/// for zlib/gzip) is a `NEEDED` dynamic dependency worth paying for only when
+/// the program actually calls one of that backend's runtime seam functions.
+/// Every other program mapped and relocated them at process start — and refused
+/// to run without them present — for nothing (#853).
+///
+/// Soundness: the predicates test the EXACT symbol the generated code
+/// references (`Inst::Call`/`Invoke`/`FuncAddr`'s `func`), so there are no false
+/// negatives — a reached backend is always detected and so never wrongly stubbed
+/// (which would turn a real call into a runtime error). The regex/zlib seams are
+/// distinct prefixes with no non-backend members, so a prefix test is exact. (A
+/// prefix that could over-match — e.g. `zap_crypto_*`, whose SHA/HMAC/CSPRNG are
+/// self-contained and do NOT use OpenSSL — is handled where that backend is
+/// added, erring toward over-linking, never toward a miss.)
+#[derive(Clone, Copy, Default)]
+pub(crate) struct BackendUse {
+    /// Regex via PCRE2 (`-lpcre2-8`): the program calls a `zap_regex_*` seam.
+    pub regex: bool,
+    /// zlib/gzip DEFLATE (`-lz`): the program calls a `zap_zlib_*`/`zap_gzip_*`
+    /// seam. Independent of `http` — the net/http runtime does not use zlib.
+    pub zlib: bool,
+    /// OpenSSL (`-lssl -lcrypto`): the program calls a `zap_tls_*` (TLS), a
+    /// `zap_http_*` (the http client embeds the OpenSSL `https://` path inline,
+    /// so any http use is treated as needing OpenSSL — conservative but sound),
+    /// or an OpenSSL-backed `zap_crypto_*` seam. The plain `zap_crypto_sha*`/
+    /// `md5`/`hmac_*`/CSPRNG family is pure C (verified: no OpenSSL symbol is
+    /// referenced below the OpenSSL region in `zaprt.c`), so it is EXCLUDED — a
+    /// program that only hashes links no libssl. Over-matching a future
+    /// self-contained `zap_crypto_*` would only over-link (never a miss).
+    pub openssl: bool,
+}
+
+/// `zap_crypto_*` seams that are implemented in pure C (SHA-2 family, SHA-1,
+/// MD5, the streaming-hash handle API, HMAC, and the CSPRNG helpers) and so do
+/// NOT pull OpenSSL — the exclusion set for the OpenSSL predicate (#853). Kept
+/// in sync with the un-gated `zap_crypto_*` definitions in `zaprt.c` (those
+/// below the `#if !defined(ZAP_NO_OPENSSL)` crypto region). Being conservative
+/// here (treating an unknown `zap_crypto_*` as OpenSSL-backed) only over-links;
+/// a missed OpenSSL seam would instead break a real call, so the default — not
+/// listed here ⇒ needs OpenSSL — is the safe one.
+const SELF_CONTAINED_CRYPTO: &[&str] = &[
+    "zap_crypto_sha256",
+    "zap_crypto_sha512",
+    "zap_crypto_sha384",
+    "zap_crypto_sha224",
+    "zap_crypto_sha1",
+    "zap_crypto_md5",
+    "zap_crypto_new",
+    "zap_crypto_update",
+    "zap_crypto_digest",
+    "zap_crypto_hexdigest",
+    "zap_crypto_list_index",
+    "zap_crypto_hmac_sha256",
+    "zap_crypto_hmac_sha512",
+    "zap_crypto_hmac_sha256_raw",
+    "zap_crypto_hmac_new",
+    "zap_crypto_hmac_update",
+    "zap_crypto_hmac_digest",
+    "zap_crypto_hmac_hexdigest",
+    "zap_crypto_random_bytes",
+    "zap_crypto_token_hex",
+    "zap_crypto_token_urlsafe",
+    "zap_crypto_randbelow",
+];
+
+/// Scan the lowered program for the optional-backend seam symbols it references
+/// (#853). Lowers the module once for the scan; the backend lowers again for
+/// codegen, but lowering is deterministic, so both see the same symbol set.
+pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse {
+    let (zir, _errs) = lower_module_opts(module, race);
+    let mut u = BackendUse::default();
+    for f in &zir.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let callee = match inst {
+                    Inst::Call { func, .. }
+                    | Inst::Invoke { func, .. }
+                    | Inst::FuncAddr { func, .. } => func.as_str(),
+                    _ => continue,
+                };
+                if callee.starts_with("zap_regex_") {
+                    u.regex = true;
+                } else if callee.starts_with("zap_zlib_") || callee.starts_with("zap_gzip_") {
+                    u.zlib = true;
+                } else if callee.starts_with("zap_tls_")
+                    || callee.starts_with("zap_http_")
+                    || (callee.starts_with("zap_crypto_")
+                        && !SELF_CONTAINED_CRYPTO.contains(&callee))
+                {
+                    u.openssl = true;
+                }
+            }
+        }
+    }
+    u
+}
+
 /// Build a native executable. With `portable`, use the portable link profile
 /// (I#287): statically link (`-static`) and drop CPython embedding
 /// (`-DZAP_NO_CPYTHON`, no `pkg-config python3-embed`) so the binary is
@@ -616,6 +733,26 @@ pub fn build_executable(
     let link_cpython = needs_cpython && !portable && !is_windows;
     let no_cpython = !link_cpython;
 
+    // Optional-backend link gate (#853), the same idea as the CPython gate but
+    // for the stdlib's optional C backends: link `libpcre2-8` only when the
+    // program reaches the regex seam, and `libz` only when it reaches the
+    // zlib/gzip seam. When a backend is unused the runtime compiles its entry
+    // points as catchable-error stubs (`-DZAP_NO_PCRE2` / `-DZAP_NO_ZLIB`, like
+    // `-DZAP_NO_CPYTHON`) so it references no pcre2/zlib symbol and the matching
+    // `-l` can be dropped — no `NEEDED` entry, no loader cost, and the program
+    // builds on a host without that `-dev` package. Applies on every profile
+    // (incl. portable, which still benefits from a smaller static link).
+    // OpenSSL (`-lssl -lcrypto`) is gated the same way: linked only when the
+    // program reaches a TLS / crypto / http seam, else the OpenSSL code in
+    // `zaprt.c` (crypto block, TLS transport, and the https branches inside the
+    // http client) is `#if !defined(ZAP_NO_OPENSSL)`-compiled out. No stubs are
+    // needed, unlike CPython: a program that reaches no OpenSSL seam references
+    // none of those symbols, so the compiled-out functions are simply absent.
+    let backends = program_backend_use(module, race);
+    let no_regex = !backends.regex;
+    let no_zlib = !backends.zlib;
+    let no_openssl = !backends.openssl;
+
     // Linker driver. On the default path, `cc` (the MinGW-w64 `gcc`/`cc` on a
     // Windows host provides the `x86_64-pc-windows-gnu` target); override with
     // `$ZAP_CC` (e.g. a cross driver `x86_64-w64-mingw32-gcc`). Added for the
@@ -649,6 +786,9 @@ pub fn build_executable(
             &rt_path,
             triple.as_str().to_string_lossy().as_ref(),
             no_cpython,
+            no_regex,
+            no_zlib,
+            no_openssl,
         ) {
             Ok(path) => path,
             Err(e) => {
@@ -772,6 +912,22 @@ pub fn build_executable(
     cmd.arg("-DZAP_GC_IMMIX");
     #[cfg(not(feature = "gc-immix"))]
     cmd.arg("-lgc");
+    // Optional-backend compile gates (#853). When the program never reaches a
+    // backend, compile its runtime entry points as catchable-error stubs so the
+    // runtime references no pcre2/zlib symbol and the matching `-l` below can be
+    // dropped. These reach the non-LTO in-line `zaprt.c` compile (this `cmd`
+    // compiles `rt_path`); under LTO the same gates are baked into the cached
+    // runtime bitcode by `lto_runtime_bitcode`. A `-D` is harmless (ignored)
+    // when the backend IS used and the flag is absent. Added on every profile.
+    if no_regex {
+        cmd.arg("-DZAP_NO_PCRE2");
+    }
+    if no_zlib {
+        cmd.arg("-DZAP_NO_ZLIB");
+    }
+    if no_openssl {
+        cmd.arg("-DZAP_NO_OPENSSL");
+    }
     // Libraries common to the POSIX (`cc` + system libs) and Windows (MinGW-w64)
     // link lines — the dev container / CI provide the `-dev` packages on Linux,
     // and the MinGW-w64 `mingw-w64-x86_64-{pcre2,zlib,openssl}` packages provide
@@ -779,20 +935,32 @@ pub fn build_executable(
     cmd.arg("-lstdc++")
         // `-lm` provides libm `pow`/`floor`, used by the scalar `**` and `//`
         // runtime helpers (ticket #19).
-        .arg("-lm")
-        // `-lpcre2-8` provides the 8-bit PCRE2 API the regex runtime wraps
-        // (ticket #23); the dev container / CI provide `libpcre2-dev`.
-        .arg("-lpcre2-8")
-        // `-lz` provides the system zlib backing the `zlib`/`gzip` compression
-        // modules (ticket #106); the dev container / CI provide `zlib1g-dev`
-        // and it ships on macOS.
-        .arg("-lz")
-        // `-lssl -lcrypto` provide the system OpenSSL/LibreSSL backing the `tls`
-        // module and the `http` `https://` client (ticket #147, D-0062); the dev
-        // container / CI provide `libssl-dev` (OpenSSL 3.x on Ubuntu 24.04) and
-        // LibreSSL ships on macOS. `-lssl` depends on `-lcrypto`, so that order.
-        .arg("-lssl")
-        .arg("-lcrypto")
+        .arg("-lm");
+    // `-lpcre2-8` provides the 8-bit PCRE2 API the regex runtime wraps (ticket
+    // #23); the dev container / CI provide `libpcre2-dev`. Linked only when the
+    // program reaches the regex seam (#853); otherwise the runtime's regex entry
+    // points are `-DZAP_NO_PCRE2` stubs that reference no pcre2 symbol.
+    if !no_regex {
+        cmd.arg("-lpcre2-8");
+    }
+    // `-lz` provides the system zlib backing the `zlib`/`gzip` compression
+    // modules (ticket #106); the dev container / CI provide `zlib1g-dev` and it
+    // ships on macOS. Linked only when the program reaches the zlib/gzip seam
+    // (#853); otherwise those entry points are `-DZAP_NO_ZLIB` stubs.
+    if !no_zlib {
+        cmd.arg("-lz");
+    }
+    // `-lssl -lcrypto` provide the system OpenSSL/LibreSSL backing the `tls`
+    // module, the OpenSSL-backed `crypto` primitives, and the `http` `https://`
+    // client (ticket #147, D-0062); the dev container / CI provide `libssl-dev`
+    // (OpenSSL 3.x on Ubuntu 24.04) and LibreSSL ships on macOS. Linked only when
+    // the program reaches a TLS/crypto/http seam (#853); otherwise that code is
+    // `-DZAP_NO_OPENSSL`-compiled out and references no OpenSSL symbol. `-lssl`
+    // depends on `-lcrypto`, so that order.
+    if !no_openssl {
+        cmd.arg("-lssl").arg("-lcrypto");
+    }
+    cmd
         // `-lpthread` backs the coroutine runtime (ticket #25): each `spawn`
         // starts a GC-registered pthread, and channels block on pthread
         // mutex/condvars. `libgc` must be thread-aware (the runtime defines
