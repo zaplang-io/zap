@@ -8,6 +8,7 @@
 // re-export it as the `ir` module so `zapc_ir::ir::*` and the in-crate
 // `crate::ir::*` paths are unchanged.
 pub use zapc_ir_core as ir;
+pub mod escape;
 pub mod lower;
 // Monomorphization (turn user generics into concrete declarations before
 // lowering, I#154, D-0017/D-0064) lives in the `zapc_mono` leaf (#129);
@@ -3415,13 +3416,16 @@ def main():
 
     // --- value structs (#65, D-0051) ---
 
-    /// Count `StructNew` instructions in a function (each is one aggregate
-    /// allocation / copy).
+    /// Count struct constructions in a function (each is one aggregate
+    /// allocation / copy). Counts both the heap `StructNew` and the
+    /// stack-promoted `StackStruct` (escape analysis, #839) so these
+    /// copy-vs-no-copy / construction-count checks are independent of whether a
+    /// given construction happens to be stack-allocated.
     fn structnews(f: &Func) -> usize {
         f.blocks
             .iter()
             .flat_map(|b| &b.insts)
-            .filter(|i| matches!(i, Inst::StructNew { .. }))
+            .filter(|i| matches!(i, Inst::StructNew { .. } | Inst::StackStruct { .. }))
             .count()
     }
 
@@ -3512,6 +3516,175 @@ def main():
             1,
             "reference-struct assignment must not copy"
         );
+    }
+
+    // --- Escape analysis (#839, discussion #849) --------------------------
+    // These run the full pass (via `lower_ok` -> `lower_module` -> the escape
+    // pass inside `lower_module_opts`) and assert on the ZIR it produces, both
+    // the promotion direction and the conservative heap-retention direction.
+
+    fn has_stack_struct(f: &Func) -> bool {
+        insts_of(f).any(|i| matches!(i, Inst::StackStruct { .. }))
+    }
+    fn has_heap_struct(f: &Func) -> bool {
+        insts_of(f).any(|i| matches!(i, Inst::StructNew { .. }))
+    }
+    fn stack_strbuilds(f: &Func) -> usize {
+        insts_of(f)
+            .filter(|i| matches!(i, Inst::StrBuild { stack: true, .. }))
+            .count()
+    }
+    fn heap_strbuilds(f: &Func) -> usize {
+        insts_of(f)
+            .filter(|i| matches!(i, Inst::StrBuild { stack: false, .. }))
+            .count()
+    }
+    fn main_of(m: &Module) -> &Func {
+        m.funcs.iter().find(|f| f.name == "main").unwrap()
+    }
+
+    #[test]
+    fn escape_promotes_transient_fstring_dict_lookup_key() {
+        // The evidenced #839 win: a transient `f"k{i}"` used only to probe a dict
+        // (a non-retaining `zap_dict_get`) never escapes, so its `StrBuild` is
+        // stack-allocated.
+        let m = lower_ok(
+            "def main():\n    dict[str, int64] d = {}\n    d[\"k0\"] = 7\n    int64 i = 0\n    \
+             int64 s = 0\n    while i < 10:\n        s = s + d[f\"k{i}\"]\n        i = i + 1\n    print(s)\n",
+        );
+        assert_eq!(
+            stack_strbuilds(main_of(&m)),
+            1,
+            "the transient lookup key f\"k{{i}}\" must be stack-allocated"
+        );
+    }
+
+    #[test]
+    fn escape_promotes_transient_fstring_in_len() {
+        // `fstring_only` shape: `len(f"k{i}")` — the string is consumed by a pure
+        // reader and discarded, so it is promoted.
+        let m = lower_ok(
+            "def main():\n    int64 s = 0\n    int64 i = 0\n    \
+             while i < 10:\n        s = s + len(f\"k{i}\")\n        i = i + 1\n    print(s)\n",
+        );
+        assert_eq!(stack_strbuilds(main_of(&m)), 1);
+        assert_eq!(heap_strbuilds(main_of(&m)), 0);
+    }
+
+    #[test]
+    fn escape_keeps_fstring_dict_insert_key_on_heap() {
+        // A key *inserted* into a dict (`zap_dict_set`, retaining) escapes — it is
+        // stored in the dict and outlives the call — so its `StrBuild` stays heap.
+        let m = lower_ok(
+            "def main():\n    dict[str, int64] d = {}\n    int64 i = 0\n    \
+             while i < 10:\n        d[f\"k{i}\"] = i\n        i = i + 1\n    print(len(d))\n",
+        );
+        assert_eq!(
+            heap_strbuilds(main_of(&m)),
+            1,
+            "an inserted (retained) key must stay heap-allocated"
+        );
+        assert_eq!(stack_strbuilds(main_of(&m)), 0);
+    }
+
+    #[test]
+    fn escape_keeps_returned_fstring_on_heap() {
+        // A returned string escapes its function -> heap.
+        let m = lower_ok(
+            "def f(int64 i) -> str:\n    return f\"k{i}\"\ndef main():\n    print(f(3))\n",
+        );
+        let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(heap_strbuilds(f), 1);
+        assert_eq!(stack_strbuilds(f), 0);
+    }
+
+    #[test]
+    fn escape_promotes_nonescaping_reference_struct() {
+        // A leaf (all-scalar) reference struct built and used only locally does
+        // not escape -> stack-allocated.
+        let m = lower_ok(&format!(
+            "{PT}\ndef main():\n    auto p = Pt(x=1.0, y=2.0)\n    print(p.x + p.y)\n"
+        ));
+        assert!(
+            has_stack_struct(main_of(&m)),
+            "a non-escaping leaf reference struct should be stack-allocated"
+        );
+        assert!(
+            !has_heap_struct(main_of(&m)),
+            "...and not also heap-allocated"
+        );
+    }
+
+    #[test]
+    fn escape_keeps_returned_reference_struct_on_heap() {
+        // Returning the struct escapes it -> stays a heap StructNew.
+        let m = lower_ok(&format!(
+            "{PT}\ndef make() -> Pt:\n    return Pt(x=1.0, y=2.0)\ndef main():\n    auto p = make()\n    print(p.x)\n"
+        ));
+        let make = m.funcs.iter().find(|f| f.name == "make").unwrap();
+        assert!(
+            has_heap_struct(make),
+            "a returned reference struct must stay heap-allocated"
+        );
+        assert!(!has_stack_struct(make));
+    }
+
+    #[test]
+    fn escape_keeps_struct_stored_in_list_on_heap() {
+        // Appending the struct into a list retains it -> escapes -> heap.
+        let m = lower_ok(&format!(
+            "{PT}\ndef main():\n    list[Pt] xs = []\n    xs.append(Pt(x=1.0, y=2.0))\n    print(len(xs))\n"
+        ));
+        assert!(
+            has_heap_struct(main_of(&m)),
+            "a struct stored into a collection must stay heap-allocated"
+        );
+    }
+
+    #[test]
+    fn escape_does_not_promote_value_struct() {
+        // A `value struct` is a by-value aggregate, explicitly out of v1 scope —
+        // never rewritten to a StackStruct regardless of escape.
+        let m = lower_ok(&format!(
+            "{VEC2}\ndef main():\n    auto v = Vec2(x=1.0, y=2.0)\n    print(v.len2())\n"
+        ));
+        assert!(
+            !has_stack_struct(main_of(&m)),
+            "value structs are out of v1 escape-promotion scope"
+        );
+    }
+
+    #[test]
+    fn escape_respects_struct_size_cap() {
+        // A leaf reference struct larger than MAX_STACK_ALLOC (256 B) stays heap
+        // even when non-escaping. Build a struct of N `int64` fields (8 B each)
+        // well over the cap, with default values so the constructor is argument-
+        // free (field defaults, #461).
+        let n = 40usize; // 40 * 8 = 320 B > 256
+        let mut fields = String::new();
+        for i in 0..n {
+            // Avoid field names like `f32`/`f64` that collide with type keywords.
+            fields.push_str(&format!("    int64 v{i} = 0\n"));
+        }
+        let m = lower_ok(&format!(
+            "struct Big:\n{fields}def main():\n    auto b = Big()\n    print(b.v0)\n"
+        ));
+        assert!(
+            has_heap_struct(main_of(&m)),
+            "an oversized struct must stay heap-allocated"
+        );
+        assert!(!has_stack_struct(main_of(&m)));
+    }
+
+    #[test]
+    fn escape_promotes_small_nonescaping_struct_under_cap() {
+        // Sanity companion to the cap test: the same shape within the cap (a few
+        // scalar fields) *is* promoted when non-escaping.
+        let m = lower_ok(
+            "struct Small:\n    int64 a = 0\n    int64 b = 0\ndef main():\n    auto s = Small()\n    print(s.a + s.b)\n",
+        );
+        assert!(has_stack_struct(main_of(&m)));
+        assert!(!has_heap_struct(main_of(&m)));
     }
 
     #[test]

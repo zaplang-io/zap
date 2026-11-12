@@ -1108,6 +1108,51 @@ void *zap_str_concat(void *a, void *b) {
     return s;
 }
 
+/* Single-pass join of `n` strings into one heap `ZapStr` (#839; folds in the
+ * #837 lever-3(b) f-string join: one allocation for the whole fold, not one per
+ * pairwise concat). Allocation never collects mid-call, so the `parts` pointers
+ * stay put while we copy. `n == 0` yields the empty string. */
+void *zap_str_join(ZapStr **parts, int64_t n) {
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        total += parts[i]->len;
+    }
+    ZapStr *s = zap_str_alloc(total);
+    char *dst = s->data;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t l = parts[i]->len;
+        memcpy(dst, parts[i]->data, (size_t)l);
+        dst += l;
+    }
+    return s;
+}
+
+/* Escape-analysis fast path (#839): build the joined string into a caller-
+ * provided inline stack buffer `buf` of `cap` payload bytes (the one-object
+ * `ZapStr {int64 len; char data[]}` layout, #838) when the summed length fits,
+ * returning `buf` itself — no GC heap allocation. When it does not fit, spill to
+ * a normal heap `zap_str_join`. Pointer-free/atomic and never relocated, exactly
+ * like the `ZAP_STACK_STR` borrowed-string helper above; safe because the result
+ * is proven not to escape its creating function. */
+void *zap_str_join_into(void *buf, int64_t cap, ZapStr **parts, int64_t n) {
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        total += parts[i]->len;
+    }
+    if (total > cap) {
+        return zap_str_join(parts, n);
+    }
+    ZapStr *s = (ZapStr *)buf;
+    s->len = total;
+    char *dst = s->data;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t l = parts[i]->len;
+        memcpy(dst, parts[i]->data, (size_t)l);
+        dst += l;
+    }
+    return s;
+}
+
 void zap_print_str(void *s) {
     ZapStr *z = (ZapStr *)s;
     fwrite(z->data, 1, (size_t)z->len, stdout);
