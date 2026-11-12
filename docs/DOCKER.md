@@ -13,6 +13,14 @@ It is the containerized companion to the from-source release artifacts
 ([I#208](https://github.com/zaplang-io/zap/issues/208)) and tracks the same
 version scheme as [`docs/RELEASING.md`](RELEASING.md) (I#207).
 
+> **Not to be confused with the CI toolchain image.** This page is about the
+> slim **runtime** image (`ghcr.io/zaplang-io/zap`): just `zap` + a C link
+> toolchain, for running programs. The *build* environment Zap's own Linux CI
+> runs **inside** — the fat LLVM 18 + Rust + C-dep image
+> `ghcr.io/zaplang-io/zap-ci` — is a separate thing, documented in
+> [`CI_DOCKER_IMAGES/README.md`](../CI_DOCKER_IMAGES/README.md)
+> ([#854](https://github.com/zaplang-io/zap/issues/854)).
+
 ## Pull it
 
 ```bash
