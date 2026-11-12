@@ -176,12 +176,20 @@ allocation, not a header plus a separate data buffer:
   function or a `fn(T)->R` binding is required for `key=` in v1 (clean
   follow-up). Element types without an ordering and no `key=` are a compile
   error.
-- `dict[K,V]`: an open-addressing hash table — `[ header | len | cap | entries:
-  *Entry ]`, `Entry = { state, key, value, hash }`. The 64-bit key `hash` is
-  cached in each full slot (#837, D-0145): `get`/`set`/`del` gate the key compare
-  on a hash-word match first, and `resize` rehashes from the stored hash rather
-  than recomputing it for every live key on each grow. Hashing/equality come from
-  the key type (string/bytes/scalars built-in). A **user-struct key** (operator
+- `dict[K,V]`: an open-addressing hash table with linear probing. The slot array
+  is **one buffer in struct-of-arrays form** (#840, D-0156) — `[ header | len |
+  cap | buf ]` where `buf` is a single `zap_ptrbuf` carved into four parallel
+  regions `tags[cap] (1B) | keys[cap] (8B) | vals[cap] (8B) | hashes[cap] (8B)`
+  (25 bytes/slot). Each slot's `tag` is the top 8 bits of its hash, biased out of
+  two reserved sentinels (`0` empty, `1` tombstone) so a real key's tag is always
+  `>= 2` and never aliases a sentinel. A probe scans the dense 1-byte `tags`
+  stream (64 slots per cache line); only a tag match touches a key/val/hash. On a
+  tag hit an **int** key compares its word directly (equality needs no hash gate,
+  so the int path never reads the `hashes` region); a **string/struct** key gates
+  the (expensive) `memcmp` / `__eq__` on the full cached 64-bit hash (#837, D-0145).
+  `resize` rehashes from each live slot's stored hash (no FNV / `__hash__`
+  recompute) and drops tombstones. Hashing/equality come from the key type
+  (string/bytes/scalars built-in). A **user-struct key** (operator
   overloading, #52 / D-0047) is hashed/compared by the type's own
   `__hash__`/`__eq__`: the dict/set carries those two function pointers (set on
   first insert) and the typed entry points gain an `_fn` key variant

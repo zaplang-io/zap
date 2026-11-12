@@ -25,6 +25,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`dict` / `set` use a cache-local struct-of-arrays table with per-slot hash
+  tags** (#840, D-0156). The old flat `ZapEntry[]` (32 bytes/slot) dragged a whole
+  entry into cache for every probed slot, leaving `dict_int` ~0.7× Go's map on
+  table mechanics alone (#837/#858). The slot array is now one buffer carved into
+  parallel `tags | keys | vals | hashes` regions, so a probe scans only a dense
+  1-byte tag stream (64 slots/cache line) and touches a key/val/hash only on a tag
+  match. Int keys compare their word directly (no hash read); string/struct keys
+  keep the full-hash gate before `memcmp`/`__eq__` (#837). A prototype of the
+  alternative full-bucketed (Go `hmap`) layout was slower, so SoA was chosen on
+  the numbers. Observable semantics are unchanged — insertion/iteration order
+  (still unspecified), overwrite, `del`/tombstone reuse, `len`, growth thresholds,
+  `@derive(Hash)`/`@derive(Eq)` struct keys (D-0047) and float-key NaN reject
+  (D-0138) — a pure runtime change (`zaprt.c` + the GC trace); all dict/set
+  goldens stay green, with new collision / tombstone-churn / resize / edge stress
+  fixtures added.
 - **The per-iteration safepoint poll is one load, not three** (#860, D-0155).
   The inlined back-edge safepoint poll (D-0144) loaded three separate `volatile`
   globals every loop iteration (`zap_gc_wanted`, `zap_collecting`,

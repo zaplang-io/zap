@@ -1756,34 +1756,67 @@ void *zap_list_slice(void *lp, int64_t lo, int64_t hi, int64_t step, int64_t has
  * function pointers. `__hash__(self) -> i64` and `__eq__(a, b) -> bool` match the
  * ZIR-generated signatures (an LLVM `i1` return maps to C `_Bool`). */
 enum { KEY_I64 = 0, KEY_STR = 1, KEY_FN = 2 };
-enum { SLOT_EMPTY = 0, SLOT_FULL = 1, SLOT_TOMB = 2 };
 
 typedef int64_t (*ZapHashFn)(void *self);
 typedef _Bool (*ZapEqFn)(void *a, void *b);
 
-typedef struct {
-    uint8_t state;
-    int64_t key;   /* key word: int64, or ZapStr/struct pointer bits */
-    int64_t val;   /* value word */
-    uint64_t hash; /* cached key hash (#837): avoids re-FNV on probe/resize.    */
-                   /* Valid only while state == SLOT_FULL.                       */
-} ZapEntry;
+/* Bucketed / SoA table layout (#840, D-0156). The old flat `ZapEntry[]` dragged
+ * a whole 32-byte entry (state + key + val + cached hash) into cache for every
+ * probed slot. The table now stores a single `zap_ptrbuf` buffer carved into
+ * four parallel regions — a dense one-byte TAG stream, then keys, then values,
+ * then cached hashes — so a probe scans only the 1-byte tag stream (64 slots per
+ * cache line, SIMD-friendly) and touches a key/val/hash word only on a tag hit.
+ *
+ * The tag is the top 8 bits of the hash, biased out of the two reserved sentinel
+ * values so a real key's tag can never alias EMPTY/TOMB: a mismatching tag
+ * rejects a slot with one byte compare, and a tag MATCH always falls through to
+ * the definitive compare (the full cached hash gates the str/struct key compare;
+ * an int key compares its word directly — equality there needs no hash gate, so
+ * the int fast path never reads the `hashes` region at all, #840). */
+enum { ZAP_TAG_EMPTY = 0, ZAP_TAG_TOMB = 1 }; /* reserved sentinels; real tag >= 2 */
+
+/* Top-8 hash bits, biased into [2,255] so a real tag never equals a sentinel. */
+static inline uint8_t zap_tag(uint64_t h) {
+    uint8_t t = (uint8_t)(h >> 56);
+    return t < 2 ? (uint8_t)(t + 2) : t;
+}
 
 typedef struct {
     int64_t len;
     int64_t cap; /* number of slots; always a power of two or 0 */
-    ZapEntry *entries;
+    /* ONE buffer: tags[cap] (1B) | keys[cap] (8B) | vals[cap] (8B) | hashes[cap]
+     * (8B) = 25*cap bytes. `cap` is a power of two, so every 8-byte region is
+     * naturally aligned. NULL while cap == 0. */
+    void *buf;
     void *hashfn; /* struct keys only (KEY_FN): the type's __hash__ / __eq__ */
     void *eqfn;
     uint8_t key_ptr; /* keys are GC pointers (str/struct) */
     uint8_t val_ptr; /* values are GC pointers */
 } ZapDict;
 
+/* SoA region accessors. Each RE-READS `d->buf` and `d->cap`, so if a KEY_FN
+ * `__hash__`/`__eq__` callback relocated the buffer under a moving collector the
+ * next access picks up the new address — the same discipline the flat layout got
+ * from re-reading `d->entries[j]` each iteration. The callback-free int/str
+ * paths have no intervening store, so the optimiser hoists these loads. */
+static inline uint8_t *zap_d_tags(const ZapDict *d) { return (uint8_t *)d->buf; }
+static inline int64_t *zap_d_keys(const ZapDict *d) {
+    return (int64_t *)((char *)d->buf + d->cap);
+}
+static inline int64_t *zap_d_vals(const ZapDict *d) {
+    return (int64_t *)((char *)d->buf + d->cap * 9);
+}
+static inline uint64_t *zap_d_hashes(const ZapDict *d) {
+    return (uint64_t *)((char *)d->buf + d->cap * 17);
+}
+/* Bytes backing a `cap`-slot table (tags + keys + vals + hashes). */
+static inline int64_t zap_d_bytes(int64_t cap) { return cap * 25; }
+
 void *zap_dict_new(void) {
     ZapDict *d = (ZapDict *)zap_obj(&zap_desc_dict);
     d->len = 0;
     d->cap = 0;
-    d->entries = NULL;
+    d->buf = NULL;
     d->hashfn = NULL;
     d->eqfn = NULL;
     return d;
@@ -1971,24 +2004,38 @@ void zap_list_sort_by(void *dstp, void *keysp, int64_t cmp_kind, int64_t reverse
  * stored hash word is already correct regardless of key kind. */
 static void zap_dict_resize(ZapDict *d) {
     int64_t ncap = d->cap < 8 ? 8 : d->cap * 2;
-    ZapEntry *ne = (ZapEntry *)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapEntry));
-    for (int64_t i = 0; i < ncap; i++) {
-        ne[i].state = SLOT_EMPTY;
-    }
-    for (int64_t i = 0; i < d->cap; i++) {
-        if (d->entries[i].state != SLOT_FULL) {
-            continue;
+    void *nbuf = zap_ptrbuf(zap_d_bytes(ncap));
+    uint8_t *ntags = (uint8_t *)nbuf;
+    int64_t *nkeys = (int64_t *)((char *)nbuf + ncap);
+    int64_t *nvals = (int64_t *)((char *)nbuf + ncap * 9);
+    uint64_t *nhashes = (uint64_t *)((char *)nbuf + ncap * 17);
+    memset(ntags, ZAP_TAG_EMPTY, (size_t)ncap);
+    if (d->cap) {
+        /* `zap_ptrbuf` never collects mid-call and resize makes no other call, so
+         * the old and new raw buffers stay put for the whole rehash. */
+        uint8_t *otags = zap_d_tags(d);
+        int64_t *okeys = zap_d_keys(d);
+        int64_t *ovals = zap_d_vals(d);
+        uint64_t *ohashes = zap_d_hashes(d);
+        for (int64_t i = 0; i < d->cap; i++) {
+            if (otags[i] < 2) { /* ZAP_TAG_EMPTY or ZAP_TAG_TOMB: drop (reclaims tombstones) */
+                continue;
+            }
+            /* Rehash from the cached hash (#837): the key bytes are unchanged, so
+             * the stored hash word is still correct — no FNV loop / __hash__ call,
+             * and tombstones are not carried over. */
+            uint64_t h = ohashes[i];
+            int64_t j = (int64_t)(h & (uint64_t)(ncap - 1));
+            while (ntags[j] != ZAP_TAG_EMPTY) {
+                j = (j + 1) & (ncap - 1);
+            }
+            ntags[j] = otags[i];
+            nkeys[j] = okeys[i];
+            nvals[j] = ovals[i];
+            nhashes[j] = h;
         }
-        /* Rehash from the cached hash (#837): the key bytes are unchanged, so the
-         * stored hash word is still correct — no FNV byte-loop / __hash__ call. */
-        uint64_t h = d->entries[i].hash;
-        int64_t j = (int64_t)(h & (uint64_t)(ncap - 1));
-        while (ne[j].state == SLOT_FULL) {
-            j = (j + 1) & (ncap - 1);
-        }
-        ne[j] = d->entries[i];
     }
-    d->entries = ne;
+    d->buf = nbuf;
     d->cap = ncap;
 }
 
@@ -1997,18 +2044,32 @@ static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
     if (d->cap == 0 || (d->len + 1) * 4 >= d->cap * 3) { /* load factor 0.75 */
         zap_dict_resize(d);
     }
+    /* Compute the hash (KEY_FN runs the user `__hash__`, which may relocate the
+     * buffer) BEFORE taking the region bases. */
     uint64_t h = zap_key_hash(key, keykind, d->hashfn);
+    uint8_t t = zap_tag(h);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
     int64_t tomb = -1;
-    while (d->entries[j].state != SLOT_EMPTY) {
-        /* Gate the (possibly expensive) key compare on a cheap hash-word match
-         * first (#837): a mismatch skips memcmp / __eq__ entirely. */
-        if (d->entries[j].state == SLOT_FULL && d->entries[j].hash == h &&
-            zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
-            d->entries[j].val = val; /* overwrite existing key */
-            return;
-        }
-        if (d->entries[j].state == SLOT_TOMB && tomb < 0) {
+    uint8_t *tags = zap_d_tags(d);
+    while (tags[j] != ZAP_TAG_EMPTY) {
+        /* Reject on the 1-byte tag first; only a tag hit touches a key/hash. An
+         * int key compares its word directly (no hash gate needed); a str/struct
+         * key gates the (expensive) memcmp / __eq__ on the full cached hash (#837,
+         * #840). Re-derive the bases each use so a KEY_FN compare that relocated
+         * the buffer is picked up (the int/str path has no such call). */
+        if (tags[j] == t) {
+            if (keykind == KEY_I64) {
+                if (zap_d_keys(d)[j] == key) {
+                    zap_d_vals(d)[j] = val; /* overwrite existing key */
+                    return;
+                }
+            } else if (zap_d_hashes(d)[j] == h &&
+                       zap_key_eq(zap_d_keys(d)[j], key, keykind, d->eqfn)) {
+                zap_d_vals(d)[j] = val; /* overwrite existing key */
+                return;
+            }
+            tags = zap_d_tags(d); /* a KEY_FN __eq__ may have moved the buffer */
+        } else if (tags[j] == ZAP_TAG_TOMB && tomb < 0) {
             tomb = j;
         }
         j = (j + 1) & (d->cap - 1);
@@ -2016,10 +2077,10 @@ static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
     if (tomb >= 0) {
         j = tomb;
     }
-    d->entries[j].state = SLOT_FULL;
-    d->entries[j].key = key;
-    d->entries[j].val = val;
-    d->entries[j].hash = h;
+    zap_d_tags(d)[j] = t;
+    zap_d_keys(d)[j] = key;
+    zap_d_vals(d)[j] = val;
+    zap_d_hashes(d)[j] = h;
     d->len++;
 }
 
@@ -2039,12 +2100,22 @@ static void zap_dict_set(void *dp, int64_t key, int keykind, int64_t val) {
 __attribute__((noinline)) static int64_t zap_dict_get_slow(void *dp, int64_t key,
                                                             int keykind, uint64_t h) {
     ZapDict *d = (ZapDict *)dp;
+    uint8_t t = zap_tag(h);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
-    while (d->entries[j].state != SLOT_EMPTY) {
-        /* Hash-word prefilter (#837) before the full key compare. */
-        if (d->entries[j].state == SLOT_FULL && d->entries[j].hash == h &&
-            zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
-            return d->entries[j].val;
+    uint8_t *tags = zap_d_tags(d);
+    while (tags[j] != ZAP_TAG_EMPTY) {
+        /* 1-byte tag reject; a tag hit compares an int key word directly, or
+         * gates a str/struct key's compare on the full cached hash (#837, #840). */
+        if (tags[j] == t) {
+            if (keykind == KEY_I64) {
+                if (zap_d_keys(d)[j] == key) {
+                    return zap_d_vals(d)[j];
+                }
+            } else if (zap_d_hashes(d)[j] == h &&
+                       zap_key_eq(zap_d_keys(d)[j], key, keykind, d->eqfn)) {
+                return zap_d_vals(d)[j];
+            }
+            tags = zap_d_tags(d); /* a KEY_FN __eq__ may have moved the buffer */
         }
         j = (j + 1) & (d->cap - 1);
     }
@@ -2058,19 +2129,19 @@ __attribute__((always_inline)) static inline int64_t zap_dict_get(void *dp, int6
         return 0;
     }
     uint64_t h = zap_key_hash(key, keykind, d->hashfn);
+    uint8_t t = zap_tag(h);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
-    const ZapEntry *e = &d->entries[j];
-    /* Fast path: first probe hits by IDENTITY. For int keys the key word IS the
-     * value, so identity == equality. For string keys, identical ZapStr pointers
-     * (interned literals, D-0145, or any same-object key) are value-equal, so a
-     * repeated `d["k"]` short-circuits with no byte compare. Pointer identity is
-     * only ever a SUFFICIENT condition for equality here; anything it does not
-     * settle — a different object, a hash-word match needing a real compare, a
-     * probe past the first slot, a tombstone, or a miss — falls through to the
-     * slow path's full `zap_key_eq`. User-struct keys (KEY_FN) always take the
-     * slow path so a custom `__eq__` is always consulted. */
-    if (keykind != KEY_FN && e->state == SLOT_FULL && e->hash == h && e->key == key) {
-        return e->val;
+    /* Fast path: first probe, tag hit, key found by IDENTITY. For int keys the
+     * key word IS the value, so identity == equality (and no hash gate is
+     * needed). For string keys, identical ZapStr pointers (interned literals,
+     * D-0145, or any same-object key) are value-equal, so a repeated `d["k"]`
+     * short-circuits with no byte compare. Identity is only ever a SUFFICIENT
+     * condition here; anything it does not settle — a different object needing a
+     * real compare, a probe past the first slot, a tombstone, or a miss — falls
+     * through to the slow path's full `zap_key_eq`. User-struct keys (KEY_FN)
+     * always take the slow path so a custom `__eq__` is always consulted. */
+    if (keykind != KEY_FN && zap_d_tags(d)[j] == t && zap_d_keys(d)[j] == key) {
+        return zap_d_vals(d)[j];
     }
     return zap_dict_get_slow(dp, key, keykind, h);
 }
@@ -2200,8 +2271,8 @@ double zap_dict_get_f64_f64(void *d, double k) {
 }
 
 /* `del d[k]` (#595): remove the entry for `key` by tombstoning its slot, reusing
- * the same open-addressing probe as `zap_dict_set`/`zap_dict_get`. SLOT_TOMB
- * keeps later keys on the same probe chain reachable; the slot is reclaimed on
+ * the same open-addressing probe as `zap_dict_set`/`zap_dict_get`. A ZAP_TAG_TOMB
+ * tag keeps later keys on the same probe chain reachable; the slot is reclaimed on
  * the next resize. A missing key is a silent no-op, matching the current non-
  * raising dict read `d[k]` (a real `KeyError` is tracked under #22). The vacated
  * key/value words are cleared so the collector does not pin the removed
@@ -2212,15 +2283,23 @@ static void zap_dict_del(void *dp, int64_t key, int keykind) {
         return;
     }
     uint64_t h = zap_key_hash(key, keykind, d->hashfn);
+    uint8_t t = zap_tag(h);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
-    while (d->entries[j].state != SLOT_EMPTY) {
-        if (d->entries[j].state == SLOT_FULL && d->entries[j].hash == h &&
-            zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
-            d->entries[j].state = SLOT_TOMB;
-            d->entries[j].key = 0;
-            d->entries[j].val = 0;
+    uint8_t *tags = zap_d_tags(d);
+    while (tags[j] != ZAP_TAG_EMPTY) {
+        if (tags[j] == t &&
+            (keykind == KEY_I64
+                 ? (zap_d_keys(d)[j] == key)
+                 : (zap_d_hashes(d)[j] == h &&
+                    zap_key_eq(zap_d_keys(d)[j], key, keykind, d->eqfn)))) {
+            zap_d_tags(d)[j] = ZAP_TAG_TOMB; /* keeps the probe chain reachable */
+            zap_d_keys(d)[j] = 0;            /* clear referents so GC can reclaim */
+            zap_d_vals(d)[j] = 0;
             d->len--;
             return;
+        }
+        if (tags[j] == t) {
+            tags = zap_d_tags(d); /* a KEY_FN __eq__ may have moved the buffer */
         }
         j = (j + 1) & (d->cap - 1);
     }
@@ -2260,23 +2339,38 @@ static int zap_dict_has(void *dp, int64_t key, int keykind) {
         return 0;
     }
     uint64_t h = zap_key_hash(key, keykind, d->hashfn);
+    uint8_t t = zap_tag(h);
     int64_t j = (int64_t)(h & (uint64_t)(d->cap - 1));
-    while (d->entries[j].state != SLOT_EMPTY) {
-        if (d->entries[j].state == SLOT_FULL && d->entries[j].hash == h &&
-            zap_key_eq(d->entries[j].key, key, keykind, d->eqfn)) {
-            return 1;
+    uint8_t *tags = zap_d_tags(d);
+    while (tags[j] != ZAP_TAG_EMPTY) {
+        if (tags[j] == t) {
+            if (keykind == KEY_I64) {
+                if (zap_d_keys(d)[j] == key) {
+                    return 1;
+                }
+            } else if (zap_d_hashes(d)[j] == h &&
+                       zap_key_eq(zap_d_keys(d)[j], key, keykind, d->eqfn)) {
+                return 1;
+            }
+            tags = zap_d_tags(d); /* a KEY_FN __eq__ may have moved the buffer */
         }
         j = (j + 1) & (d->cap - 1);
     }
     return 0;
 }
 
+/* Enumeration snapshots. `zap_list_push_*` allocates, but allocation never
+ * relocates the dict buffer (Immix only flags a wanted collection mid-alloc;
+ * Boehm is non-moving), so the region bases are cached once. A full slot is
+ * `tag >= 2` (ZAP_TAG_EMPTY / ZAP_TAG_TOMB are the two reserved low values). */
 void *zap_dict_keys_i64(void *dp) {
     ZapDict *d = (ZapDict *)dp;
     void *out = zap_list_new();
+    uint8_t *tags = zap_d_tags(d);
+    int64_t *keys = zap_d_keys(d);
     for (int64_t i = 0; i < d->cap; i++) {
-        if (d->entries[i].state == SLOT_FULL) {
-            zap_list_push_i64(out, d->entries[i].key);
+        if (tags[i] >= 2) {
+            zap_list_push_i64(out, keys[i]);
         }
     }
     return out;
@@ -2284,9 +2378,11 @@ void *zap_dict_keys_i64(void *dp) {
 void *zap_dict_keys_ptr(void *dp) {
     ZapDict *d = (ZapDict *)dp;
     void *out = zap_list_new();
+    uint8_t *tags = zap_d_tags(d);
+    int64_t *keys = zap_d_keys(d);
     for (int64_t i = 0; i < d->cap; i++) {
-        if (d->entries[i].state == SLOT_FULL) {
-            zap_list_push_ptr(out, (void *)(intptr_t)d->entries[i].key);
+        if (tags[i] >= 2) {
+            zap_list_push_ptr(out, (void *)(intptr_t)keys[i]);
         }
     }
     return out;
@@ -2297,9 +2393,11 @@ void *zap_dict_keys_ptr(void *dp) {
 void *zap_dict_keys_f64(void *dp) {
     ZapDict *d = (ZapDict *)dp;
     void *out = zap_list_new();
+    uint8_t *tags = zap_d_tags(d);
+    int64_t *keys = zap_d_keys(d);
     for (int64_t i = 0; i < d->cap; i++) {
-        if (d->entries[i].state == SLOT_FULL) {
-            zap_list_push_f64(out, zap_f64_from_bits(d->entries[i].key));
+        if (tags[i] >= 2) {
+            zap_list_push_f64(out, zap_f64_from_bits(keys[i]));
         }
     }
     return out;
@@ -2307,9 +2405,11 @@ void *zap_dict_keys_f64(void *dp) {
 void *zap_dict_values_i64(void *dp) {
     ZapDict *d = (ZapDict *)dp;
     void *out = zap_list_new();
+    uint8_t *tags = zap_d_tags(d);
+    int64_t *vals = zap_d_vals(d);
     for (int64_t i = 0; i < d->cap; i++) {
-        if (d->entries[i].state == SLOT_FULL) {
-            zap_list_push_i64(out, d->entries[i].val);
+        if (tags[i] >= 2) {
+            zap_list_push_i64(out, vals[i]);
         }
     }
     return out;
@@ -2317,9 +2417,11 @@ void *zap_dict_values_i64(void *dp) {
 void *zap_dict_values_ptr(void *dp) {
     ZapDict *d = (ZapDict *)dp;
     void *out = zap_list_new();
+    uint8_t *tags = zap_d_tags(d);
+    int64_t *vals = zap_d_vals(d);
     for (int64_t i = 0; i < d->cap; i++) {
-        if (d->entries[i].state == SLOT_FULL) {
-            zap_list_push_ptr(out, (void *)(intptr_t)d->entries[i].val);
+        if (tags[i] >= 2) {
+            zap_list_push_ptr(out, (void *)(intptr_t)vals[i]);
         }
     }
     return out;
@@ -2330,9 +2432,11 @@ void *zap_dict_values_ptr(void *dp) {
 void *zap_dict_values_f64(void *dp) {
     ZapDict *d = (ZapDict *)dp;
     void *out = zap_list_new();
+    uint8_t *tags = zap_d_tags(d);
+    int64_t *vals = zap_d_vals(d);
     for (int64_t i = 0; i < d->cap; i++) {
-        if (d->entries[i].state == SLOT_FULL) {
-            zap_list_push_f64(out, zap_f64_from_bits(d->entries[i].val));
+        if (tags[i] >= 2) {
+            zap_list_push_f64(out, zap_f64_from_bits(vals[i]));
         }
     }
     return out;
@@ -2369,12 +2473,13 @@ void *zap_dict_copy(void *sp) {
     if (s->cap == 0) {
         return d;
     }
-    ZapEntry *ne =
-        (ZapEntry *)zap_ptrbuf(s->cap * (int64_t)sizeof(ZapEntry));
-    for (int64_t i = 0; i < s->cap; i++) {
-        ne[i] = s->entries[i];
-    }
-    d->entries = ne;
+    /* One contiguous buffer: copy all four regions verbatim in a single memcpy
+     * (slot layout and slot indices are preserved, so no rehash is needed). No
+     * allocation/callback runs between the alloc and the copy, so both raw
+     * buffers stay put. */
+    void *nbuf = zap_ptrbuf(zap_d_bytes(s->cap));
+    memcpy(nbuf, s->buf, (size_t)zap_d_bytes(s->cap));
+    d->buf = nbuf;
     d->cap = s->cap;
     d->len = s->len;
     return d;
@@ -2383,68 +2488,97 @@ void *zap_dict_copy(void *sp) {
 /* set[T]: a dict without values — open-addressing hash table of element words.
  * Shares the key hashing/equality above (RUNTIME-ABI: "dict and set can share
  * hashing"). Elements are uniform 8-byte words, like dict keys; the element
- * kind (int64 vs str) is passed per call and is stable for a given set. */
-typedef struct {
-    uint8_t state;
-    int64_t key; /* element word (int64, or ZapStr* bits) */
-} ZapSetEntry;
-
+ * kind (int64 vs str) is passed per call and is stable for a given set.
+ *
+ * Same SoA table as the dict (#840, D-0156), minus the values region: one buffer
+ * carved into tags[cap] (1B) | keys[cap] (8B) | hashes[cap] (8B) = 17*cap bytes.
+ * A probe scans the dense tag stream; a tag hit compares an int element directly
+ * or gates the str/struct compare on the cached hash (which also lets resize
+ * rehash without an FNV/__hash__ recompute — a small gain over the pre-#840 set,
+ * which had no cached hash). */
 typedef struct {
     int64_t len;
     int64_t cap; /* number of slots; always a power of two or 0 */
-    ZapSetEntry *entries;
+    void *buf;   /* tags[cap] | keys[cap] | hashes[cap]; NULL while cap == 0 */
     void *hashfn; /* struct elements only (KEY_FN): the type's __hash__/__eq__ */
     void *eqfn;
     uint8_t elem_ptr; /* elements are GC pointers (str/struct) */
 } ZapSet;
 
+static inline uint8_t *zap_s_tags(const ZapSet *s) { return (uint8_t *)s->buf; }
+static inline int64_t *zap_s_keys(const ZapSet *s) {
+    return (int64_t *)((char *)s->buf + s->cap);
+}
+static inline uint64_t *zap_s_hashes(const ZapSet *s) {
+    return (uint64_t *)((char *)s->buf + s->cap * 9);
+}
+static inline int64_t zap_s_bytes(int64_t cap) { return cap * 17; }
+
 void *zap_set_new(void) {
     ZapSet *s = (ZapSet *)zap_obj(&zap_desc_set);
     s->len = 0;
     s->cap = 0;
-    s->entries = NULL;
+    s->buf = NULL;
     s->hashfn = NULL;
     s->eqfn = NULL;
     return s;
 }
 
-static void zap_set_resize(ZapSet *s, int keykind) {
+static void zap_set_resize(ZapSet *s) {
     int64_t ncap = s->cap < 8 ? 8 : s->cap * 2;
-    ZapSetEntry *ne = (ZapSetEntry *)zap_ptrbuf((int64_t)ncap * (int64_t)sizeof(ZapSetEntry));
-    for (int64_t i = 0; i < ncap; i++) {
-        ne[i].state = SLOT_EMPTY;
-    }
-    for (int64_t i = 0; i < s->cap; i++) {
-        if (s->entries[i].state != SLOT_FULL) {
-            continue;
+    void *nbuf = zap_ptrbuf(zap_s_bytes(ncap));
+    uint8_t *ntags = (uint8_t *)nbuf;
+    int64_t *nkeys = (int64_t *)((char *)nbuf + ncap);
+    uint64_t *nhashes = (uint64_t *)((char *)nbuf + ncap * 9);
+    memset(ntags, ZAP_TAG_EMPTY, (size_t)ncap);
+    if (s->cap) {
+        uint8_t *otags = zap_s_tags(s);
+        int64_t *okeys = zap_s_keys(s);
+        uint64_t *ohashes = zap_s_hashes(s);
+        for (int64_t i = 0; i < s->cap; i++) {
+            if (otags[i] < 2) {
+                continue; /* empty or tomb (set has no delete today, but be safe) */
+            }
+            uint64_t h = ohashes[i];
+            int64_t j = (int64_t)(h & (uint64_t)(ncap - 1));
+            while (ntags[j] != ZAP_TAG_EMPTY) {
+                j = (j + 1) & (ncap - 1);
+            }
+            ntags[j] = otags[i];
+            nkeys[j] = okeys[i];
+            nhashes[j] = h;
         }
-        uint64_t h = zap_key_hash(s->entries[i].key, keykind, s->hashfn);
-        int64_t j = (int64_t)(h & (uint64_t)(ncap - 1));
-        while (ne[j].state == SLOT_FULL) {
-            j = (j + 1) & (ncap - 1);
-        }
-        ne[j] = s->entries[i];
     }
-    s->entries = ne;
+    s->buf = nbuf;
     s->cap = ncap;
 }
 
 static void zap_set_add(void *sp, int64_t key, int keykind) {
     ZapSet *s = (ZapSet *)sp;
     if (s->cap == 0 || (s->len + 1) * 4 >= s->cap * 3) { /* load factor 0.75 */
-        zap_set_resize(s, keykind);
+        zap_set_resize(s);
     }
     uint64_t h = zap_key_hash(key, keykind, s->hashfn);
+    uint8_t t = zap_tag(h);
     int64_t j = (int64_t)(h & (uint64_t)(s->cap - 1));
-    while (s->entries[j].state != SLOT_EMPTY) {
-        if (s->entries[j].state == SLOT_FULL &&
-            zap_key_eq(s->entries[j].key, key, keykind, s->eqfn)) {
-            return; /* already present */
+    uint8_t *tags = zap_s_tags(s);
+    while (tags[j] != ZAP_TAG_EMPTY) {
+        if (tags[j] == t) {
+            if (keykind == KEY_I64) {
+                if (zap_s_keys(s)[j] == key) {
+                    return; /* already present */
+                }
+            } else if (zap_s_hashes(s)[j] == h &&
+                       zap_key_eq(zap_s_keys(s)[j], key, keykind, s->eqfn)) {
+                return; /* already present */
+            }
+            tags = zap_s_tags(s); /* a KEY_FN __eq__ may have moved the buffer */
         }
         j = (j + 1) & (s->cap - 1);
     }
-    s->entries[j].state = SLOT_FULL;
-    s->entries[j].key = key;
+    zap_s_tags(s)[j] = t;
+    zap_s_keys(s)[j] = key;
+    zap_s_hashes(s)[j] = h;
     s->len++;
 }
 
@@ -2454,11 +2588,20 @@ static int64_t zap_set_contains(void *sp, int64_t key, int keykind) {
         return 0;
     }
     uint64_t h = zap_key_hash(key, keykind, s->hashfn);
+    uint8_t t = zap_tag(h);
     int64_t j = (int64_t)(h & (uint64_t)(s->cap - 1));
-    while (s->entries[j].state != SLOT_EMPTY) {
-        if (s->entries[j].state == SLOT_FULL &&
-            zap_key_eq(s->entries[j].key, key, keykind, s->eqfn)) {
-            return 1;
+    uint8_t *tags = zap_s_tags(s);
+    while (tags[j] != ZAP_TAG_EMPTY) {
+        if (tags[j] == t) {
+            if (keykind == KEY_I64) {
+                if (zap_s_keys(s)[j] == key) {
+                    return 1;
+                }
+            } else if (zap_s_hashes(s)[j] == h &&
+                       zap_key_eq(zap_s_keys(s)[j], key, keykind, s->eqfn)) {
+                return 1;
+            }
+            tags = zap_s_tags(s); /* a KEY_FN __eq__ may have moved the buffer */
         }
         j = (j + 1) & (s->cap - 1);
     }
@@ -2514,9 +2657,11 @@ int64_t zap_set_contains_f64(void *s, double v) {
 void *zap_set_items(void *sp) {
     ZapSet *s = (ZapSet *)sp;
     ZapList *out = (ZapList *)zap_list_new();
+    uint8_t *tags = zap_s_tags(s);
+    int64_t *keys = zap_s_keys(s);
     for (int64_t i = 0; i < s->cap; i++) {
-        if (s->entries[i].state == SLOT_FULL) {
-            zap_list_push(out, s->entries[i].key);
+        if (tags[i] >= 2) { /* full slot (ZAP_TAG_EMPTY / ZAP_TAG_TOMB are < 2) */
+            zap_list_push(out, keys[i]);
         }
     }
     return out;
@@ -12484,9 +12629,11 @@ void *zap_json_lex_str(void *h) {
 void *zap_dict_keys(void *dp) {
     ZapDict *d = (ZapDict *)dp;
     void *out = zap_list_new();
+    uint8_t *tags = zap_d_tags(d);
+    int64_t *keys = zap_d_keys(d);
     for (int64_t i = 0; i < d->cap; i++) {
-        if (d->entries[i].state == SLOT_FULL) {
-            zap_list_push_ptr(out, (void *)(intptr_t)d->entries[i].key);
+        if (tags[i] >= 2) { /* full slot */
+            zap_list_push_ptr(out, (void *)(intptr_t)keys[i]);
         }
     }
     return out;
@@ -19159,12 +19306,11 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
     int caller_content_type = 0;
     if (hdrs) {
         for (int64_t e = 0; e < hdrs->cap; e++) {
-            const ZapEntry *ent = &hdrs->entries[e];
-            if (ent->state != SLOT_FULL) {
+            if (zap_d_tags(hdrs)[e] < 2) { /* skip empty / tombstone slots (#840) */
                 continue;
             }
-            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
-            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            const ZapStr *name = (const ZapStr *)(intptr_t)zap_d_keys(hdrs)[e];
+            const ZapStr *val = (const ZapStr *)(intptr_t)zap_d_vals(hdrs)[e];
             if (zap_http_hdr_managed(name)) {
                 continue;
             }
@@ -19198,12 +19344,11 @@ void *zap_http_do(void *method_, void *url_, void *body_, void *headers_) {
     /* Caller-supplied headers, copied out of the GC dict into the buffer. */
     if (hdrs) {
         for (int64_t e = 0; e < hdrs->cap; e++) {
-            const ZapEntry *ent = &hdrs->entries[e];
-            if (ent->state != SLOT_FULL) {
+            if (zap_d_tags(hdrs)[e] < 2) { /* skip empty / tombstone slots (#840) */
                 continue;
             }
-            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
-            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            const ZapStr *name = (const ZapStr *)(intptr_t)zap_d_keys(hdrs)[e];
+            const ZapStr *val = (const ZapStr *)(intptr_t)zap_d_vals(hdrs)[e];
             if (zap_http_hdr_managed(name)) {
                 continue;
             }
@@ -19524,12 +19669,11 @@ static void zap_http_respond_do(void *c_, int64_t status, void *body_, void *hea
     int caller_content_type = 0;
     if (hdrs) {
         for (int64_t e = 0; e < hdrs->cap; e++) {
-            const ZapEntry *ent = &hdrs->entries[e];
-            if (ent->state != SLOT_FULL) {
+            if (zap_d_tags(hdrs)[e] < 2) { /* skip empty / tombstone slots (#840) */
                 continue;
             }
-            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
-            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            const ZapStr *name = (const ZapStr *)(intptr_t)zap_d_keys(hdrs)[e];
+            const ZapStr *val = (const ZapStr *)(intptr_t)zap_d_vals(hdrs)[e];
             if (zap_http_resp_hdr_managed(name)) {
                 continue;
             }
@@ -19557,12 +19701,11 @@ static void zap_http_respond_do(void *c_, int64_t status, void *body_, void *hea
     /* Caller-supplied headers, copied out of the GC dict into the buffer. */
     if (hdrs) {
         for (int64_t e = 0; e < hdrs->cap; e++) {
-            const ZapEntry *ent = &hdrs->entries[e];
-            if (ent->state != SLOT_FULL) {
+            if (zap_d_tags(hdrs)[e] < 2) { /* skip empty / tombstone slots (#840) */
                 continue;
             }
-            const ZapStr *name = (const ZapStr *)(intptr_t)ent->key;
-            const ZapStr *val = (const ZapStr *)(intptr_t)ent->val;
+            const ZapStr *name = (const ZapStr *)(intptr_t)zap_d_keys(hdrs)[e];
+            const ZapStr *val = (const ZapStr *)(intptr_t)zap_d_vals(hdrs)[e];
             if (zap_http_resp_hdr_managed(name)) {
                 continue;
             }
