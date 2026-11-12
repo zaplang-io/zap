@@ -264,15 +264,20 @@ fn lto_runtime_bitcode(
     cc: &str,
     rt_path: &Path,
     triple: &str,
-    portable: bool,
+    no_cpython: bool,
 ) -> Result<std::path::PathBuf, String> {
     use std::hash::{Hash, Hasher};
 
     let immix = cfg!(feature = "gc-immix");
     // Only the `--cflags` of CPython embedding (the `-I...`) reach a `-c`
     // compile; compute them once so they feed both the cache key and the
-    // compile. (Portable drops CPython entirely via -DZAP_NO_CPYTHON.)
-    let py_cflags: Vec<String> = if portable {
+    // compile. CPython is dropped (`-DZAP_NO_CPYTHON`, below) for the portable
+    // profile (I#287), on Windows v1 (I#198), AND for any program whose import
+    // graph never reaches `import python` (#852) — in all of which the runtime
+    // compiles its `zap_py_*` entry points as catchable-error stubs and links no
+    // libpython. When dropped we do not even probe `pkg-config`, so a non-Python
+    // program builds on a host without `python3-dev`.
+    let py_cflags: Vec<String> = if no_cpython {
         Vec::new()
     } else {
         python_embed_flags()?
@@ -287,12 +292,13 @@ fn lto_runtime_bitcode(
     cc.hash(&mut h);
     triple.hash(&mut h);
     immix.hash(&mut h);
-    portable.hash(&mut h);
+    no_cpython.hash(&mut h);
     py_cflags.hash(&mut h);
     extra.hash(&mut h);
     // Bump when the runtime compile flags below change (e.g. adding
-    // -fexceptions) so a stale pre-change cache entry is never reused.
-    "rt-bc-flags-v2-fexceptions".hash(&mut h);
+    // -fexceptions, or #852 keying the CPython drop on `no_cpython` rather than
+    // `portable`) so a stale pre-change cache entry is never reused.
+    "rt-bc-flags-v3-cpython-gate".hash(&mut h);
     // Different clang builds emit different bitcode — fold the version in.
     if let Ok(out) = Command::new(cc).arg("--version").output() {
         out.stdout.hash(&mut h);
@@ -336,7 +342,7 @@ fn lto_runtime_bitcode(
     if immix {
         rc.arg("-DZAP_GC_IMMIX");
     }
-    if portable {
+    if no_cpython {
         rc.arg("-DZAP_NO_CPYTHON");
     } else {
         rc.args(&py_cflags);
@@ -469,6 +475,22 @@ const RUNTIME_WIN_A3_C: &str = include_str!("zap_win_a3.c");
 const RUNTIME_NP_IOCP_C: &str = include_str!("zap_np_iocp.c");
 const RUNTIME_NP_IOCP_H: &str = include_str!("zap_np_iocp.h");
 
+/// Whether the (already module-linked, D-0081) program reaches `import python`
+/// anywhere in its import graph (#852). `modlink` drops Zap `import <name>`
+/// statements when merging but KEEPS every `import python` item so sema can bind
+/// its aliases (see `modlink.rs`), so a single scan of the merged module's items
+/// is the whole-program answer: every source module's `import python` is present
+/// here. When this is false the program references no `zap_py_*`/libpython symbol
+/// (the CPython C-API calls are lowered only for a bound `import python` alias,
+/// see `crates/ir/src/lower.rs`), so libpython can be dropped from the link.
+pub(crate) fn program_uses_cpython(module: &AstModule) -> bool {
+    use zapc_syntax::ast::{Import, Item};
+    module
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Import(Import::Python { .. })))
+}
+
 /// Build a native executable. With `portable`, use the portable link profile
 /// (I#287): statically link (`-static`) and drop CPython embedding
 /// (`-DZAP_NO_CPYTHON`, no `pkg-config python3-embed`) so the binary is
@@ -578,6 +600,22 @@ pub fn build_executable(
     let triple = TargetMachine::get_default_triple();
     let is_windows = triple.as_str().to_string_lossy().contains("windows");
 
+    // CPython link gate (#852). Embedding CPython — and so emitting the
+    // `libpython` `NEEDED` dynamic dependency and its `pkg-config` cflags/libs —
+    // is worthwhile ONLY for a program that actually `import python`s. Every
+    // other program linked libpython for nothing, paying its loader mmap/reloc at
+    // every process start and refusing to run without a matching libpython
+    // present (the startup-floor / portability cost in the issue). So link
+    // CPython only when the import graph reaches `import python` AND neither the
+    // portable profile (I#287) nor Windows v1 (I#198) has already opted out — in
+    // which case the runtime's `import python` entry points compile as the
+    // existing catchable-error stubs (`-DZAP_NO_CPYTHON`) and no libpython links.
+    // The explicit `--portable`/`ZAP_PORTABLE` override is unchanged: it still
+    // forces the no-CPython path regardless of the import graph.
+    let needs_cpython = program_uses_cpython(module);
+    let link_cpython = needs_cpython && !portable && !is_windows;
+    let no_cpython = !link_cpython;
+
     // Linker driver. On the default path, `cc` (the MinGW-w64 `gcc`/`cc` on a
     // Windows host provides the `x86_64-pc-windows-gnu` target); override with
     // `$ZAP_CC` (e.g. a cross driver `x86_64-w64-mingw32-gcc`). Added for the
@@ -610,7 +648,7 @@ pub fn build_executable(
             &cc,
             &rt_path,
             triple.as_str().to_string_lossy().as_ref(),
-            portable,
+            no_cpython,
         ) {
             Ok(path) => path,
             Err(e) => {
@@ -861,12 +899,27 @@ pub fn build_executable(
         if !prune {
             cmd.arg("-rdynamic");
         }
-        // CPython embedding flags (ticket #27, D-0012): the `-I...` cflags let
-        // `zaprt.c` find `<Python.h>`, and the libs link libpython. Discovered
-        // with `pkg-config` (the dev container / CI provide `python3-dev` +
-        // `pkg-config`) so the exact libpython version and path are not
-        // hardcoded.
-        cmd.args(python_embed_flags()?);
+        if link_cpython {
+            // CPython embedding flags (ticket #27, D-0012): the `-I...` cflags let
+            // `zaprt.c` find `<Python.h>`, and the libs link libpython. Discovered
+            // with `pkg-config` (the dev container / CI provide `python3-dev` +
+            // `pkg-config`) so the exact libpython version and path are not
+            // hardcoded. Added only when the import graph reaches `import python`
+            // (#852); see the `link_cpython` gate above.
+            cmd.args(python_embed_flags()?);
+        } else {
+            // The program never `import python`s (#852): compile the runtime's
+            // `import python` entry points as catchable-error stubs — the same
+            // `-DZAP_NO_CPYTHON` path the portable profile (I#287) and Windows v1
+            // (I#198) take — and link NO libpython, so a plain `print(0)` carries
+            // no `libpython` `NEEDED` and pays none of its loader cost. (On the
+            // non-LTO path this flag reaches the in-line `zaprt.c` compile below;
+            // under LTO the runtime bitcode was already built `-DZAP_NO_CPYTHON`
+            // via `no_cpython`, so here it only keeps the define consistent.) We
+            // also skip the `pkg-config python3-embed` probe entirely, so a
+            // non-Python program builds on a host without `python3-dev`.
+            cmd.arg("-DZAP_NO_CPYTHON");
+        }
     }
     // Debug hook: extra cc flags from $ZAP_CC_EXTRA (e.g. "-g -fsanitize=address")
     // for diagnosing runtime/GC issues. Unset in normal builds and CI.

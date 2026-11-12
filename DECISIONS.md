@@ -7523,3 +7523,56 @@ still keeps its shadow frame and root stores under `-O2`. Wall-clock trend in
 `crates/driver/tests/perf.rs` (`tight_loop`/`fib`); the full GC / `--race` /
 preemption golden suites gate the invariants. No `GRAMMAR.ebnf` change — the opt
 pipeline is invisible to syntax and to observable semantics.
+
+## D-0153 — link libpython only when the program `import python`s (#852)
+
+**Context.** Every compiled Zap binary hard-linked `libpython3.12` as a
+`NEEDED` dynamic dependency — even a trivial `def main(): print(0)` that never
+`import python`s. `readelf -d` on the empty program listed `libpython3.12.so.1.0`
+among its NEEDED libs, so `ld.so` had to locate, `mmap` and relocate libpython
+(several MB) at **every** process start. A `strace -f -c` showed the Zap-vs-Go
+startup gap (~5 ms vs ~3 ms) dominated by userspace loader work (the `.so`
+mmap/reloc), not syscalls, and libpython is the heaviest of those objects. It
+also meant a program with nothing to do with CPython refused to start without a
+matching libpython present — at odds with the portable / AL2023 story (I#287,
+#287). CPython embedding backs the `import python` interop (D-0012, #27); its
+`zap_py_*` C-API calls are lowered **only** for a bound `import python` alias
+(`crates/ir/src/lower.rs`), so a program without that import references no
+libpython symbol — the NEEDED entry was pure dead weight.
+
+**Decision.** Make the CPython link **conditional on the import graph**. The
+front end module-links the whole local import graph into one module before
+codegen (D-0081), and `modlink` keeps every `import python` item (it drops only
+Zap `import <name>`), so a single scan of the merged module answers whether the
+*whole program* reaches `import python` (`program_uses_cpython`). `build_executable`
+embeds CPython — emitting the `libpython` NEEDED and the `pkg-config
+python3-embed` cflags/libs — **only** when that scan is true (and neither the
+portable profile nor Windows has already opted out). Otherwise it takes the
+exact same `-DZAP_NO_CPYTHON` path the `--portable` profile (I#287/D-0082) and
+Windows v1 (I#198) already use: the runtime's `import python` entry points
+compile as catchable-error stubs (`zap_py_unavailable` → `zap_panic`, an ordinary
+catchable `Exception`) and no libpython links. A non-Python program also no
+longer probes `pkg-config` at all, so it builds on a host without `python3-dev`.
+
+**Reused, not new.** This adds no new link profile — it auto-selects the existing
+stub path for non-Python programs. The explicit `--portable` / `ZAP_PORTABLE`
+override is unchanged and still forces the no-CPython path regardless of the
+import graph; the portable/al2023 story (I#287) is untouched. The REPL JIT
+(`jit.rs`) still embeds CPython unconditionally: it builds incrementally and
+cannot know the final import graph ahead of time, and interactive startup cost is
+not the concern here.
+
+**Scope.** libpython only. The sibling defect that OpenSSL/PCRE2/zlib are also
+eagerly linked (#853) is separate and deliberately out of scope — those stay on
+the common link line.
+
+**Verification.** `crates/driver/tests/link_cpython.rs` (walled garden, via
+`readelf -d`): (a) a program that does NOT `import python` has **no** `libpython`
+NEEDED entry and still runs; (b) a program that DOES `import python` still links
+libpython (the `python_interop` golden covers that it still runs under the full
+CI build with `python3-dev`); (c) the `--portable` stub path still raises a
+**catchable** exception when `import python` is used (caught by `except
+Exception`, exit 0). The ELF assertions skip on non-Linux / without `readelf`;
+CI's Linux leg exercises them. No `GRAMMAR.ebnf` change — the link gate is
+invisible to syntax and to the observable semantics of any program (a non-Python
+program never referenced libpython; a Python program links it exactly as before).

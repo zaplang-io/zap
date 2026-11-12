@@ -25,6 +25,20 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **libpython is linked only when the program `import python`s** (#852, D-0153).
+  A compiled binary used to hard-link `libpython3.12` as a `NEEDED` dynamic
+  dependency even when it never `import python`ed, so `ld.so` mmap'd and
+  relocated several MB of libpython at every process start (the dominant term in
+  the Zap-vs-Go startup-floor gap) and the binary refused to run without a
+  matching libpython present. The compiler now scans the module-linked import
+  graph and embeds CPython — emitting the `libpython` link and its `pkg-config
+  python3-embed` flags — only when `import python` is reachable; every other
+  program takes the existing `-DZAP_NO_CPYTHON` catchable-error-stub path (the
+  same one `--portable` and Windows use) and links no libpython, so a plain
+  `print(0)` carries no `libpython` `NEEDED` entry and also builds on a host
+  without `python3-dev`. The explicit `--portable` / `ZAP_PORTABLE` override and
+  the `import python` interop are both unchanged. (OpenSSL/PCRE2/zlib are a
+  separate eager-link issue, #853, not addressed here.)
 - **Escape analysis — stack-allocate non-escaping leaf values** (#839, D-0151).
   A conservative ZIR pass lowers a `StructNew` or transient f-string whose value
   provably does not escape its function, and which is leaf / pointer-free /
