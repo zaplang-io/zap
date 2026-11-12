@@ -7309,6 +7309,17 @@ builds is a one-line follow-up once CI has carried it.
 - The GC-frame + safepoint discipline (D-0144) is unchanged: the shadow-frame
   alloca escapes via `*zap_shadow_head = &frame`, so `-O2` cannot promote it away,
   and inlining a runtime call that contains a safepoint preserves the safepoint.
+- The runtime bitcode is compiled with **`-fexceptions`** so clang does not
+  blanket-mark its C functions `nounwind`. `zaprt.c` reaches `__cxa_throw`
+  (`zap_raise`, `zap_scope_exit`, the `except*` group machinery), so those
+  functions genuinely participate in Itanium unwinding. Without the flag, every
+  C function is `nounwind`; once merged with the program, `opt -O2` trusts that
+  attribute, rewrites the program's `invoke`s to the runtime into plain `call`s,
+  deletes the landing pads, and any caught Zap exception unwinds past every
+  handler to `std::terminate`. This is an **LTO-only** hazard — the object-link
+  path never merges the two modules or re-runs the optimizer — so the flag is
+  added only to the LTO runtime-bitcode compile (`lto_runtime_bitcode`), leaving
+  the default build byte-for-byte unchanged.
 
 **Tests.** `crates/driver/tests/lto.rs` is the deterministic guard: it builds a
 hot `dict[str,int64]` read/update loop with and without `ZAP_LTO`, disassembles
@@ -7317,6 +7328,12 @@ the LTO binary has **no** such call (inlined), and the LTO binary **still** call
 `zap_shadow_head_addr` (noinline honoured) — arch-agnostic across the x86-64 and
 aarch64 legs. `crates/driver/tests/perf.rs` gains an LTO-vs-non-LTO trend for
 `dict_int`/`dict_string` (speedup reported; only a lenient no-regression floor
-asserted, per the GC-golden determinism rule). CI re-runs the golden end-to-end
-(including the `--race` fixtures) and GC-stress suites with `ZAP_LTO=1` on both
-collectors, so the whole corpus stays green under the LTO build.
+asserted, per the GC-golden determinism rule). CI re-runs a small, representative
+golden slice under `ZAP_LTO=1` on both collectors — `dict_word_count` (the
+inlined fast paths), `coroutines` (ucontext switch + GC shadow stack),
+`concurrent_counter_coro_stress` (GC safepoints under concurrency) and
+`except_star_routing` (exception unwinding across a `scope`/`spawn` boundary) —
+via the `ZAP_GOLDEN_ONLY` allowlist in `golden.rs`. The full corpus runs under
+the default object-link build: re-linking every program under `opt -O2` added
+minutes per leg for no extra coverage, and the slice above exercises the
+LTO-specific surface (inlining, GC/safepoints, exception unwinding).

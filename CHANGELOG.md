@@ -904,11 +904,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   flag is **off by default** (unset ⇒ the unchanged object-link build); a
   toolchain image / CI opts in with `ZAP_LTO=1` (`ZAP_LTO_CC=clang-18`).
   Correctness is preserved under whole-program LTO: `zap_shadow_head_addr` keeps
-  `noinline` (coroutine-migration GC safety, I#223/#568) and the GC-frame +
-  safepoint discipline (D-0144) is unchanged. `crates/driver/tests/lto.rs`
-  asserts the hot `d[k]` fast path inlines while the `noinline` helper stays a
-  call; CI re-runs the golden (incl. `--race`) and GC-stress suites under
-  `ZAP_LTO=1` on both collectors. The cheapest, broadest lever of the gap-to-Go
+  `noinline` (coroutine-migration GC safety, I#223/#568), the GC-frame +
+  safepoint discipline (D-0144) is unchanged, and the runtime bitcode is
+  compiled with **`-fexceptions`** so its throwing functions (`zap_raise`,
+  `zap_scope_exit`, the `except*` group machinery) are not blanket-marked
+  `nounwind` — without it, `opt -O2` over the merged module trusts that
+  attribute, rewrites the program's `invoke`s to the runtime into plain `call`s,
+  deletes the landing pads, and any caught Zap exception unwinds past every
+  handler to `std::terminate` (an LTO-only miscompile; the object-link path
+  never merges the modules). `crates/driver/tests/lto.rs` asserts the hot `d[k]`
+  fast path inlines while the `noinline` helper stays a call; CI re-runs a small
+  representative golden slice (dict / coroutine / concurrency / `except*`) under
+  `ZAP_LTO=1` on both collectors, while the full corpus runs under the default
+  object-link build. The cheapest, broadest lever of the gap-to-Go
   set (#837/#839/#840/#841/#842); codegen open-coding (#842) sequences after this
   and the dict-layout change (#840).
 - **String-keyed `dict` and string allocation made ~2× faster** (#837, D-0145).

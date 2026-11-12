@@ -215,6 +215,9 @@ fn lto_runtime_bitcode(
     portable.hash(&mut h);
     py_cflags.hash(&mut h);
     extra.hash(&mut h);
+    // Bump when the runtime compile flags below change (e.g. adding
+    // -fexceptions) so a stale pre-change cache entry is never reused.
+    "rt-bc-flags-v2-fexceptions".hash(&mut h);
     // Different clang builds emit different bitcode — fold the version in.
     if let Ok(out) = Command::new(cc).arg("--version").output() {
         out.stdout.hash(&mut h);
@@ -239,6 +242,17 @@ fn lto_runtime_bitcode(
     let tmp = cache_dir.join(format!("zaprt-{key}.{}.{nanos}.tmp", std::process::id()));
     let mut rc = Command::new(cc);
     rc.arg("-O2")
+        // Compile the runtime with C++/Itanium exceptions ENABLED. zaprt.c
+        // reaches `__cxa_throw` (zap_raise, zap_scope_exit, the except* group
+        // machinery, …), so its functions genuinely participate in unwinding.
+        // Without -fexceptions clang blanket-marks every C function `nounwind`;
+        // once this bitcode is merged with the program (LTO path only), `opt
+        // -O2` trusts that `nounwind`, rewrites the program's `invoke`s to the
+        // runtime into plain `call`s and deletes the landing pads — so a thrown
+        // Zap exception unwinds past every handler straight to std::terminate
+        // (I#841). The non-LTO object link never merges the two modules or
+        // re-runs the optimizer, so it is unaffected and stays as-is.
+        .arg("-fexceptions")
         .arg("-emit-llvm")
         .arg("-c")
         .arg(rt_path)
