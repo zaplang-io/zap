@@ -101,6 +101,30 @@ fn opt_pipeline_spec() -> &'static str {
     }
 }
 
+/// The `-O` flag the C runtime translation unit (`zaprt.c`) is compiled with on
+/// the default (non-LTO) object-link path (I#867, D-0157).
+///
+/// The runtime is the whole dict / set / string / GC machinery, and every hot
+/// generated op calls into it, so an UNOPTIMIZED runtime dominated end-to-end
+/// time even after the program module itself was optimized (D-0152): the
+/// accessors (`zap_dict_get_i64_i64`, …) stay stack-spilled with ~5 out-of-line
+/// helper calls per lookup at `-O0`, versus ~1 call fully register-allocated at
+/// `-O2`. So the default is `-O2` (release intuition); `--debug` compiles it at
+/// `-O0` for fast iteration (a build is ~0.73s vs ~3s — the runtime TU is large),
+/// mirroring `cargo`'s debug/release split. This is a plain optimization level, NOT
+/// LTO: the opt-in `ZAP_LTO` cross-module path (D-0149/D-0150) is unchanged, and
+/// the perf data shows `-flto` buys ≈ nothing over `-O2` here for ~5× the build.
+/// The program module's own opt level is governed separately by D-0152
+/// (`ZAP_OPT_LEVEL` / `ZAP_NO_OPT`); `--debug` deliberately touches only the
+/// runtime TU, which is the dominant compile-time cost.
+fn runtime_opt_flag(debug: bool) -> &'static str {
+    if debug {
+        "-O0"
+    } else {
+        "-O2"
+    }
+}
+
 /// Run the LLVM middle-end optimization pipeline on `llmod` in place, before the
 /// target backend emits the object (I#857, D-0152).
 ///
@@ -635,11 +659,17 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
 ///     (source, collector, portable, clang, triple) and reused across builds.
 ///   * `ZAP_CC` / `ZAP_LTO_CC` — the linker driver for the default / LTO path.
 ///   * `ZAP_CC_EXTRA` — extra driver flags (diagnostics).
+///
+/// `debug` (the `zap build --debug` flag, I#867/D-0157) compiles the C runtime
+/// translation unit at `-O0` instead of the default `-O2` for fast iteration; it
+/// affects only the default object-link path's runtime compile (see
+/// [`runtime_opt_flag`]) and is a no-op under `ZAP_LTO`.
 pub fn build_executable(
     module: &AstModule,
     out_path: &Path,
     portable: bool,
     race: bool,
+    debug: bool,
 ) -> Result<(), String> {
     // `ZAP_PORTABLE` (any value) is an environment-level alias for `--portable`:
     // it lets a deployment image default all builds to the portable profile.
@@ -900,6 +930,18 @@ pub fn build_executable(
         // Default path: compile the runtime source as its own translation unit
         // alongside the already-codegen'd program object, so runtime calls stay
         // out-of-line (the opaque-external-symbol boundary #841/#568 measured).
+        //
+        // Optimize that runtime TU (I#867, D-0157). It carried NO `-O` flag, so
+        // the system `cc` compiled the whole dict/set/string/GC machinery at
+        // `-O0`, and every hot generated op paid into an unoptimized runtime
+        // (`dict_int`: 26.9ms at `-O0` vs 19.0ms at `-O2`, which then beats Go's
+        // 22.5ms). `-O2` by default; `--debug` restores `-O0` for fast iteration
+        // (see `runtime_opt_flag`). `-O2` on this driver invocation compiles
+        // `rt_path` (and the Windows A1/A3/A4 TUs below) at that level; the
+        // already-codegen'd program object is only linked, so its code is
+        // unaffected. The LTO path (above) is untouched — it compiles the runtime
+        // bitcode at `-O2` in `lto_runtime_bitcode` regardless of `--debug`.
+        cmd.arg(runtime_opt_flag(debug));
         cmd.arg(&rt_path);
     }
     cmd.arg("-o").arg(out_path);
@@ -5514,6 +5556,26 @@ mod tests {
     use super::*;
     use zapc_ir::lower_module;
     use zapc_syntax::parser::parse_str;
+
+    /// The default (non-LTO) runtime compile is optimized; `--debug` lowers it to
+    /// `-O0` for fast iteration (I#867, D-0157). This pins the exact flags the
+    /// link step passes to `cc`, independent of a working toolchain (so it runs
+    /// everywhere codegen builds, not just where `objdump` and a C compiler are
+    /// present — see `crates/driver/tests/runtime_opt.rs` for the behavioural
+    /// disassembly guard).
+    #[test]
+    fn runtime_opt_flag_default_is_o2_debug_is_o0() {
+        assert_eq!(
+            runtime_opt_flag(false),
+            "-O2",
+            "the default `zap build` must compile the C runtime at `-O2`"
+        );
+        assert_eq!(
+            runtime_opt_flag(true),
+            "-O0",
+            "`zap build --debug` must compile the C runtime at `-O0`"
+        );
+    }
 
     /// Translate a source program straight to LLVM IR text (no object/link).
     fn llvm_ir(src: &str) -> String {

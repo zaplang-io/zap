@@ -294,7 +294,7 @@ pub fn emit_expand(file: &str) -> ExitCode {
 /// `out` is the output path; when `None`, a default is chosen (a temp path for
 /// `run`, the file stem for `build`).
 pub fn compile(file: &str, out: Option<String>, run_after: bool) -> ExitCode {
-    compile_for(file, out, run_after, &[], false, false, false)
+    compile_for(file, out, run_after, &[], false, false, false, false)
 }
 
 /// Like [`compile`], but with compile-time `--target-feature`s for `when`
@@ -302,6 +302,7 @@ pub fn compile(file: &str, out: Option<String>, run_after: bool) -> ExitCode {
 /// generates code for the host; the features only steer which
 /// `when target.has(.f)` arm is kept. `portable` selects the self-contained
 /// static link (see [`zapc_codegen::build_executable`]).
+#[allow(clippy::too_many_arguments)]
 pub fn compile_for(
     file: &str,
     out: Option<String>,
@@ -310,6 +311,7 @@ pub fn compile_for(
     portable: bool,
     warnings_as_errors: bool,
     race: bool,
+    debug: bool,
 ) -> ExitCode {
     let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
         Ok(m) => m,
@@ -317,7 +319,7 @@ pub fn compile_for(
     };
     // `@test` functions are excluded from release binaries (D-0054).
     testing::strip_test_items(&mut module);
-    backend(&module, file, out, run_after, portable, race)
+    backend(&module, file, out, run_after, portable, race, debug)
 }
 
 /// Default output path for a compile when `-o` is not given.
@@ -361,6 +363,7 @@ fn unique_run_dir() -> PathBuf {
 }
 
 #[cfg(feature = "codegen")]
+#[allow(clippy::too_many_arguments)]
 fn backend(
     module: &Module,
     file: &str,
@@ -368,6 +371,7 @@ fn backend(
     run_after: bool,
     portable: bool,
     race: bool,
+    debug: bool,
 ) -> ExitCode {
     use std::process::Command;
 
@@ -402,7 +406,7 @@ fn backend(
         }
     };
 
-    if let Err(e) = zapc_codegen::build_executable(module, &exe, portable, race) {
+    if let Err(e) = zapc_codegen::build_executable(module, &exe, portable, race, debug) {
         eprintln!("{file}: codegen error: {e}");
         cleanup();
         return ExitCode::from(1);
@@ -425,6 +429,7 @@ fn backend(
 }
 
 #[cfg(not(feature = "codegen"))]
+#[allow(clippy::too_many_arguments)]
 fn backend(
     _module: &Module,
     file: &str,
@@ -432,6 +437,7 @@ fn backend(
     _run_after: bool,
     _portable: bool,
     _race: bool,
+    _debug: bool,
 ) -> ExitCode {
     // Keep the default-output logic exercised so it does not warn as dead code
     // on the no-LLVM host build.
