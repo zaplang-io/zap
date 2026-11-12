@@ -88,11 +88,15 @@ gc-boehm` also links.
 ## Portable builds for Amazon Linux 2023 / AWS Lambda
 
 By default `zap build` emits a binary **dynamically linked** against the image's
-glibc (2.39 on Ubuntu 24.04) plus libstdc++, PCRE2, zlib and OpenSSL — and
-`libpython3.12` **only when the program `import python`s** (#852, D-0153): a
-program that never touches CPython interop no longer links libpython, so it does
-not pay libpython's loader cost at startup and does not even need `python3-dev`
-present to build. That dynamically-linked binary **does not run on older-glibc
+glibc (2.39 on Ubuntu 24.04) plus libstdc++ and libm. The optional C backends
+are linked **only when the program reaches them**: `libpcre2-8` when it uses
+regex, `libz` when it uses `zlib`/`gzip`, `libssl`/`libcrypto` when it uses
+`tls`, OpenSSL-backed `crypto`, or the http `https://` client (#853, D-0154), and
+`libpython3.12` when it `import python`s (#852, D-0153). So a program that
+touches none of these links none of them — it pays none of their loader cost at
+startup and does not even need their `-dev` packages present to build (a plain
+`def main(): print(0)` has an empty optional-library `NEEDED` set). That
+dynamically-linked binary **does not run on older-glibc
 distros** — notably **Amazon Linux 2023** (glibc 2.34), the base of the AWS
 `provided.al2023` Lambda runtime, where it exits 127 because glibc symbol
 versions are fixed at link time (installing the libraries on AL2023 does not
