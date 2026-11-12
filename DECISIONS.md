@@ -7457,10 +7457,13 @@ analysis is invisible to syntax and to observable semantics.
 
 ## D-0152 — run the LLVM middle-end `-O2` pipeline before object emission (#857)
 
-**Status:** Accepted. **Relates:** D-0143/D-0144 (#568 frame-skip & inlined
-volatile safepoint poll), D-0149/D-0150 (#841 LTO `opt -O2` on the merged
-module), #714 (GC/perf north star), #839/D-0151 (escape analysis). **Problem:**
-#857 — compute-bound Zap was ~6× slower than Go.
+**Status:** Accepted. **Amended by D-0157 (#867):** this decision optimizes the
+*program* module on the non-LTO path but left the *runtime* translation unit
+(`zaprt.c`) at `-O0`; D-0157 compiles that runtime TU at `-O2` by default (with
+`--debug` → `-O0`), closing the gap. **Relates:** D-0143/D-0144 (#568 frame-skip
+& inlined volatile safepoint poll), D-0149/D-0150 (#841 LTO `opt -O2` on the
+merged module), #714 (GC/perf north star), #839/D-0151 (escape analysis).
+**Problem:** #857 — compute-bound Zap was ~6× slower than Go.
 
 **Problem.** `zapc` emitted LLVM IR and handed it **straight to the backend** —
 `TargetMachine::write_to_file(module, FileType::Object, …)` — with no middle-end
@@ -7789,3 +7792,122 @@ change in `crates/codegen/src/zaprt.c` (+ the GC trace in `zapgc.inc.c`). The
 codegen change was needed. `design/RUNTIME-ABI.md` already documents the exact
 `dict` probing scheme / load factor / tombstones as **unspecified** (§"What is
 NOT guaranteed"), so this layout is within the stated contract.
+
+## D-0157 — the C runtime compiles at `-O2` by default; `--debug` builds it at `-O0` (#867)
+
+**Status:** Accepted. **Relates:** D-0152 (#857 — the program module's own
+`default<O2>` middle-end pipeline), D-0149/D-0150 (#841 — the opt-in `ZAP_LTO`
+cross-module inlining path), #714 (GC/perf north star), D-0156 (#840 — SoA dict).
+**Amends:** D-0152's "normal (non-LTO) native build" characterisation — that
+decision optimized the *program* module but left the *runtime* translation unit
+at `-O0`; this decision closes that gap.
+
+**Problem.** On the default (non-LTO) object-link path the C runtime
+(`zaprt.c` — the whole dict/set/string/GC machinery, one translation unit) is
+compiled as its OWN object and linked against the program object. The `cc`
+invocation in `build_executable` (`crates/codegen/src/lib.rs`) passed **no `-O`
+flag**, so the system `cc` built the entire runtime at **`-O0`**. #857/D-0152
+optimized the *program* module (`default<O2>` before `write_to_file`), but every
+hot generated op still called into an **unoptimized runtime** — the single
+biggest remaining Zap-vs-Go gap measured on the perf box. At `-O0` the typed
+accessors (`zap_dict_get_i64_i64`, …) are stack-spilled with ~5 out-of-line
+helper calls per lookup (`zap_key_hash`, `zap_tag`, `zap_d_tags`/`keys`/`vals`);
+at `-O2` the `static inline` table accessors fold in and the `always_inline`
+fast path (D-0149/D-0156) collapses to ~47 register-allocated instructions with
+one call.
+
+**Evidence (zap-ci EC2 box, c7i, LLVM-18, main @0e52dcd).** `dict_int` (200k
+int-keyed inserts + lookups), pinned best-of-25 median:
+
+| runtime opt     | median | vs Go (22.5ms) |
+|-----------------|-------:|---------------:|
+| `-O0` (previous)| 26.9ms | slower         |
+| `-O2` (default) | 19.0ms | **faster**     |
+
+Compile time for one program: `-O0` ≈ 0.73s, `-O2` ≈ 3s (the runtime TU is
+large). True cross-module LTO (`ZAP_LTO`, D-0149/D-0150) fully inlines the
+accessor into `main` but measures ≈ `-O2` (18.5ms) for ~5× the build time.
+
+**Decision.** The default (non-LTO) path compiles `zaprt.c` at **`-O2` on
+`x86_64`** (`runtime_opt_flag(false, true)` → `cmd.arg("-O2")` on the runtime `cc`
+invocation, which compiles `rt_path` — and the Windows A1/A3/A4 TUs — at that
+level; the already-codegen'd program object is only linked, so its code is
+unaffected). `zap build --debug` (and `zap run --debug`) passes `-O0` instead
+(`runtime_opt_flag(true, _)`), for fast iteration — the `cargo` debug/release
+intuition. The flag is plumbed `CLI → parse_compile → compile_for → backend →
+build_executable(debug)`; it defaults OFF (optimized). `zap test` harness binaries
+build with the default optimized runtime (they are executed, not iterated on).
+
+**Target gate: `-O2` default is x86_64-only (for now).** The `-O2` default
+applies ONLY to `x86_64`, where #867 measured it and CI validated it (the `full`
+job's whole golden + conformance suite is green at `-O2`). On every other target
+— notably **`aarch64`** — the runtime stays at `-O0`. At `-O2` the aarch64 runtime
+**miscompiles the POSIX `ucontext` coroutine switch**: the `scope_cleanup`
+conformance program SIGSEGVs (signal 11) under BOTH collectors (so it is the
+runtime C, not the GC — the `arm64` `gc-boehm` AND `gc-immix` legs both failed on
+the first #868 push). The classic hazard — a value live across `swapcontext`
+cached in a callee-saved register the switch path does not round-trip the way
+`-O2` assumes, which x86_64's allocation tolerates and aarch64's does not. Keeping
+non-x86_64 at `-O0` is exactly `main`'s pre-#867 behaviour there, so it is a strict
+no-regression hold, not a workaround that hides a fault: the aarch64 `-O2`
+miscompile is reported as a core defect in **I#869** and left for the maintainer
+to assign; extending the `-O2` default to aarch64 is gated on that fix. `--debug`
+is `-O0` on every target. (This is the arch gate added after the first #868 CI
+run surfaced the aarch64 crash; the x86_64 win and the flag are unchanged.)
+
+**Why not `-flto` / default-on LTO.** The perf data shows LTO ≈ `-O2` here (the
+hot dict fast path is already small and the accessor's cost is table mechanics,
+not the former program↔runtime call) for ~5× the build. So `-flto` is **not**
+added and `ZAP_LTO` stays **opt-in and unchanged** (D-0149/D-0150): under
+`ZAP_LTO` the runtime bitcode is compiled at `-O2` in `lto_runtime_bitcode`
+regardless of `--debug`, and the merge + `opt -O2` are untouched. `--debug` is a
+no-op on the LTO path (LTO is a release/perf path by nature).
+
+**Relationship to D-0152.** D-0152 optimizes the *program* module; this optimizes
+the *runtime* TU. They are orthogonal: `--debug` deliberately lowers ONLY the
+runtime opt level (the dominant compile-time cost — the runtime TU is large; the
+program module's `opt -O2` is comparatively cheap). The program module's own
+level stays governed by D-0152's `ZAP_OPT_LEVEL` / `ZAP_NO_OPT` env knobs, which
+`--debug` does not touch.
+
+**GC / correctness.** `-O2` on the runtime TU is a strict superset of an
+already-exercised configuration: the `ZAP_LTO` path (D-0149) already optimizes
+the runtime at `-O2` (as bitcode) with the GC / `--race` / preemption goldens
+green, and the precise-Immix invariants hold structurally — the shadow-frame
+`alloca` escapes via `*zap_shadow_head = &frame` (not promotable), safepoint polls
+are volatile (not hoistable/removable), and `zap_shadow_head_addr` / `zap_key_hash`
+keep `__attribute__((noinline))`. Observable semantics are identical at `-O0` and
+`-O2`; `--debug` changes only build time vs. run speed.
+
+**Tests.** `crates/driver/tests/runtime_opt.rs` is the deterministic behavioural
+guard: it builds a hot `dict[int64,int64]` loop in the default mode and under
+`--debug`, disassembles `zap_dict_get_i64_i64`, and asserts the default build
+inlines the `static inline` table accessors (no out-of-line call survives) while
+`--debug` does not (a call survives + strictly more calls), with the `noinline`
+`zap_key_hash` called out of line in both as the anchor. It is gated to `x86_64`
+(where the `-O2` default applies) and skips cleanly where `objdump` is absent.
+`crates/codegen/src/lib.rs`'s unit test pins `runtime_opt_flag`'s exact flags for
+all four (debug × x86_64) cases including the non-x86_64 `-O0` hold
+(toolchain-independent), and `crates/driver/src/cli.rs` covers `--debug` parsing
+on `run`/`build`/`ir`.
+
+**Build-time: the runtime object is cached.** The runtime TU does not depend on
+the program, so recompiling it for every build — ~3s at `-O2` vs ~0.7s at `-O0` —
+would have made a golden / `zap test` run (hundreds of builds) pay that cost
+hundreds of times, landing the `-O2` default CI-slow. So the default object-link
+path now compiles `zaprt.c` to a cached `.o` ONCE per (runtime source, `-O`
+level, collector, backend gates, CPython profile, `cc`, triple) and just LINKS it
+thereafter — the object-link analogue of the LTO bitcode cache
+(`lto_runtime_bitcode`), in `native_runtime_object`. The cache lives under
+`$ZAP_RT_CACHE` (default a stable temp subdir); the key hashes every
+compile-relevant input (so the `-O2` default and `--debug` `-O0` get distinct
+entries, as do the x86_64/aarch64 `-O` split and each backend-gate profile), and
+entries are published by atomic rename so the parallel golden pool never reads a
+torn object (a lost race recompiles the same bytes). Only compile-relevant flags
+enter the object; link-only flags (`-l*`, `-static`, `-rdynamic`) stay on the link
+step. Windows keeps the inline compile (stubbed, not the hot path). Guarded by
+`crates/driver/tests/runtime_cache.rs` (warm build reuses the object without
+recompiling and runs identically; a changed compile input busts the key).
+
+**No grammar or ABI change.** `--debug` is a build flag, invisible to syntax and
+to observable semantics; `GRAMMAR.ebnf` and `design/RUNTIME-ABI.md` are unchanged.

@@ -49,6 +49,11 @@ fn compile_args(args: &[String], run_after: bool) -> ExitCode {
     // instrumentation (the detector's goldens drive `zapc`, so a dropped flag
     // makes a racy program run clean — #678).
     let mut race = false;
+    // `--debug` (I#867, D-0157): compile the C runtime at `-O0` instead of the
+    // default `-O2` for fast iteration. Thread it exactly like `--race` so the
+    // goldens / perf harness that drive `zapc` can build both the optimized
+    // (default) and the fast-iteration runtime.
+    let mut debug = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -58,6 +63,10 @@ fn compile_args(args: &[String], run_after: bool) -> ExitCode {
             }
             "--race" | "-race" => {
                 race = true;
+                i += 1;
+            }
+            "--debug" => {
+                debug = true;
                 i += 1;
             }
             f => {
@@ -70,7 +79,7 @@ fn compile_args(args: &[String], run_after: bool) -> ExitCode {
         eprintln!("zapc: no input file");
         return ExitCode::from(2);
     };
-    zapc::compile_for(&file, out, run_after, &[], false, false, race)
+    zapc::compile_for(&file, out, run_after, &[], false, false, race, debug)
 }
 
 /// Parse the first positional argument as the file and dump ZIR. `--race`

@@ -28,7 +28,7 @@ pub enum DocFormat {
 /// A parsed `zap` invocation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `zap run [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors]` — compile and
+    /// `zap run [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors] [--debug]` — compile and
     /// run a file or the project.
     Run {
         file: Option<String>,
@@ -41,8 +41,11 @@ pub enum Command {
         warnings_as_errors: bool,
         /// Enable the runtime data-race detector (#665, D-0114); off by default.
         race: bool,
+        /// Compile the C runtime at `-O0` for fast iteration instead of the
+        /// default `-O2` (#867, D-0157); off by default.
+        debug: bool,
     },
-    /// `zap build [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors] [--race]` — build a
+    /// `zap build [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors] [--race] [--debug]` — build a
     /// native binary into `target/`.
     Build {
         file: Option<String>,
@@ -56,6 +59,9 @@ pub enum Command {
         warnings_as_errors: bool,
         /// Enable the runtime data-race detector (#665, D-0114); off by default.
         race: bool,
+        /// Compile the C runtime at `-O0` for fast iteration instead of the
+        /// default `-O2` (#867, D-0157); off by default.
+        debug: bool,
     },
     /// `zap ir [file] [--target-feature f] [--warnings-as-errors] [--race]` — dump ZIR (diagnostic).
     Ir {
@@ -228,6 +234,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 portable,
                 warnings_as_errors,
                 race,
+                debug,
             } = parse_compile(rest)?;
             Ok(Command::Run {
                 file,
@@ -236,6 +243,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 portable,
                 warnings_as_errors,
                 race,
+                debug,
             })
         }
         "build" => {
@@ -246,6 +254,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 portable,
                 warnings_as_errors,
                 race,
+                debug,
             } = parse_compile(rest)?;
             Ok(Command::Build {
                 file,
@@ -254,6 +263,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 portable,
                 warnings_as_errors,
                 race,
+                debug,
             })
         }
         "ir" => {
@@ -366,9 +376,14 @@ struct CompileArgs {
     /// language considers legal. v1 recognizes and plumbs the flag; the
     /// happens-before detector engine is a tracked follow-up slice.
     race: bool,
+    /// `--debug`: compile the C runtime at `-O0` instead of the default `-O2`
+    /// (#867, D-0157). Off by default (optimized runtime); a fast-iteration knob
+    /// that never changes observable behaviour, only build time vs. run speed.
+    /// Meaningful for `build`/`run`; harmless for `ir` (which never links).
+    debug: bool,
 }
 
-/// Parse the `[-o <out>] [--target-feature f]... [--portable] [--race] [file]`
+/// Parse the `[-o <out>] [--target-feature f]... [--portable] [--race] [--debug] [file]`
 /// form shared by `run`, `build`, and `ir`.
 fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
     let mut file: Option<String> = None;
@@ -377,6 +392,7 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
     let mut portable = false;
     let mut warnings_as_errors = false;
     let mut race = false;
+    let mut debug = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -410,6 +426,18 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
                 portable = true;
                 i += 1;
             }
+            // `--debug`: compile the C runtime at `-O0` for fast iteration instead
+            // of the default `-O2` (#867, D-0157). The runtime is the whole
+            // dict/set/string/GC machinery every hot op calls into, so an
+            // unoptimized runtime dominated end-to-end time (`dict_int` 26.9ms at
+            // `-O0` vs 19.0ms at `-O2`); `-O2` is the default on x86_64 and
+            // `--debug` trades run speed for a faster build (~0.73s vs ~3s).
+            // Observable behaviour is identical either way. Like the `cargo`
+            // debug/release split. (aarch64 stays `-O0` regardless, pending #869.)
+            "--debug" => {
+                debug = true;
+                i += 1;
+            }
             // `--target-feature <name>` (repeatable): a compile-time CPU feature
             // assumed present in this build, consulted by `when target.has(.f)`
             // (I#139, D-0079). Distinct from runtime detection.
@@ -440,6 +468,7 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
         portable,
         warnings_as_errors,
         race,
+        debug,
     })
 }
 
@@ -1106,10 +1135,18 @@ pub fn execute(cmd: Command) -> ExitCode {
             portable,
             warnings_as_errors,
             race,
+            debug,
         } => match resolve_entry(file) {
-            Ok(f) => {
-                crate::compile_for(&f, out, true, &features, portable, warnings_as_errors, race)
-            }
+            Ok(f) => crate::compile_for(
+                &f,
+                out,
+                true,
+                &features,
+                portable,
+                warnings_as_errors,
+                race,
+                debug,
+            ),
             Err(code) => code,
         },
         Command::Build {
@@ -1119,7 +1156,16 @@ pub fn execute(cmd: Command) -> ExitCode {
             portable,
             warnings_as_errors,
             race,
-        } => cmd_build(file, out, &features, portable, warnings_as_errors, race),
+            debug,
+        } => cmd_build(
+            file,
+            out,
+            &features,
+            portable,
+            warnings_as_errors,
+            race,
+            debug,
+        ),
         Command::Ir {
             file,
             features,
@@ -1197,6 +1243,7 @@ pub fn execute(cmd: Command) -> ExitCode {
 
 /// `zap build` — like `run` but stops at the binary, defaulting output to
 /// `target/<stem>`.
+#[allow(clippy::too_many_arguments)]
 fn cmd_build(
     file: Option<String>,
     out: Option<String>,
@@ -1204,6 +1251,7 @@ fn cmd_build(
     portable: bool,
     warnings_as_errors: bool,
     race: bool,
+    debug: bool,
 ) -> ExitCode {
     let entry = match resolve_entry(file) {
         Ok(f) => f,
@@ -1231,6 +1279,7 @@ fn cmd_build(
         portable,
         warnings_as_errors,
         race,
+        debug,
     )
 }
 
@@ -1761,6 +1810,11 @@ compile & run:
        --race           (run/build/ir/test; alias -race) enable the runtime
                         data-race detector for the light concurrency model; a
                         test-time diagnostic, off by default (#665, D-0114)
+       --debug          (run/build) compile the C runtime at -O0 for a faster
+                        build instead of the default optimized (-O2) runtime
+                        (x86_64; aarch64 is -O0 either way, #869); trades run
+                        speed for iteration speed, like cargo's debug/release
+                        split, with identical behaviour (#867, D-0157)
 
 project:
   new <name>            scaffold a new project directory (writes zap.toml)
@@ -1878,6 +1932,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
         assert_eq!(
@@ -1889,6 +1944,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
     }
@@ -1904,6 +1960,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
     }
@@ -1919,6 +1976,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
     }
@@ -1935,6 +1993,7 @@ mod tests {
                 portable: true,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
         // Order-independent and composes with `-o`; also accepted by `run`.
@@ -1947,6 +2006,7 @@ mod tests {
                 portable: true,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
         assert_eq!(
@@ -1958,6 +2018,7 @@ mod tests {
                 portable: true,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
         // Absent by default.
@@ -1970,8 +2031,89 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
+    }
+
+    #[test]
+    fn debug_flag_is_parsed() {
+        // `--debug` compiles the C runtime at `-O0` for fast iteration (#867,
+        // D-0157). Off by default; set on `build`.
+        assert_eq!(
+            p(&["build", "a.zap", "--debug"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: false,
+                race: false,
+                debug: true,
+            }
+        );
+        // Also accepted by `run`, and order-independent + composes with `-o`.
+        assert_eq!(
+            p(&["run", "--debug", "a.zap"]).unwrap(),
+            Command::Run {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: false,
+                race: false,
+                debug: true,
+            }
+        );
+        assert_eq!(
+            p(&["build", "--debug", "-o", "x", "a.zap"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: Some("x".into()),
+                features: vec![],
+                portable: false,
+                warnings_as_errors: false,
+                race: false,
+                debug: true,
+            }
+        );
+        // Composes with every other compile flag without interfering.
+        assert_eq!(
+            p(&[
+                "build",
+                "a.zap",
+                "--debug",
+                "--portable",
+                "--race",
+                "-Werror"
+            ])
+            .unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: true,
+                warnings_as_errors: true,
+                race: true,
+                debug: true,
+            }
+        );
+        // Off by default — the optimized (`-O2`) runtime is the default build.
+        assert_eq!(
+            p(&["build", "a.zap"]).unwrap(),
+            Command::Build {
+                file: Some("a.zap".into()),
+                out: None,
+                features: vec![],
+                portable: false,
+                warnings_as_errors: false,
+                race: false,
+                debug: false,
+            }
+        );
+        // `--debug` is parsed off the shared compile grammar, so `ir` accepts it
+        // too (harmless there — `ir` never links a runtime).
+        assert!(p(&["ir", "a.zap", "--debug"]).is_ok());
     }
 
     #[test]
@@ -1988,6 +2130,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: true,
                 race: false,
+                debug: false,
             }
         );
         assert_eq!(
@@ -1999,6 +2142,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: true,
                 race: false,
+                debug: false,
             }
         );
         assert_eq!(
@@ -2028,6 +2172,7 @@ mod tests {
                 portable: true,
                 warnings_as_errors: true,
                 race: false,
+                debug: false,
             }
         );
         // Off by default.
@@ -2040,6 +2185,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
     }
@@ -2058,6 +2204,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: true,
+                debug: false,
             }
         );
         assert_eq!(
@@ -2069,6 +2216,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: true,
+                debug: false,
             }
         );
         assert_eq!(
@@ -2100,6 +2248,7 @@ mod tests {
                 portable: true,
                 warnings_as_errors: true,
                 race: true,
+                debug: false,
             }
         );
         // Off by default.
@@ -2112,6 +2261,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
     }
@@ -2137,6 +2287,7 @@ mod tests {
                 portable: false,
                 warnings_as_errors: false,
                 race: false,
+                debug: false,
             }
         );
         assert!(p(&["run", "a.zap", "--target-feature"]).is_err());

@@ -101,6 +101,42 @@ fn opt_pipeline_spec() -> &'static str {
     }
 }
 
+/// The `-O` flag the C runtime translation unit (`zaprt.c`) is compiled with on
+/// the default (non-LTO) object-link path (I#867, D-0157).
+///
+/// The runtime is the whole dict / set / string / GC machinery, and every hot
+/// generated op calls into it, so an UNOPTIMIZED runtime dominated end-to-end
+/// time even after the program module itself was optimized (D-0152): the
+/// accessors (`zap_dict_get_i64_i64`, …) stay stack-spilled with ~5 out-of-line
+/// helper calls per lookup at `-O0`, versus ~1 call fully register-allocated at
+/// `-O2`. So the default is `-O2` (release intuition); `--debug` compiles it at
+/// `-O0` for fast iteration (a build is ~0.73s vs ~3s — the runtime TU is large),
+/// mirroring `cargo`'s debug/release split. This is a plain optimization level, NOT
+/// LTO: the opt-in `ZAP_LTO` cross-module path (D-0149/D-0150) is unchanged, and
+/// the perf data shows `-flto` buys ≈ nothing over `-O2` here for ~5× the build.
+/// The program module's own opt level is governed separately by D-0152
+/// (`ZAP_OPT_LEVEL` / `ZAP_NO_OPT`); `--debug` deliberately touches only the
+/// runtime TU, which is the dominant compile-time cost.
+///
+/// **Target gate (`target_is_x86_64`).** The `-O2` default applies ONLY to
+/// `x86_64`, where #867 measured and CI validated it (full golden + conformance
+/// at `-O2`). On every other target — notably `aarch64` — the runtime stays at
+/// `-O0`: at `-O2` the aarch64 runtime miscompiles the POSIX `ucontext` coroutine
+/// switch (I#869), SIGSEGV-ing a structured-concurrency program under BOTH
+/// collectors (so it is the runtime C, not the GC). The classic hazard — a value
+/// live across `swapcontext` cached in a callee-saved register the switch path
+/// does not round-trip the way `-O2` assumes — which x86_64's allocation happens
+/// to tolerate. Keeping non-x86_64 at `-O0` is exactly `main`'s pre-#867 behaviour
+/// there (no regression) until the aarch64 runtime is validated at `-O2` (I#869).
+/// `--debug` forces `-O0` on every target.
+fn runtime_opt_flag(debug: bool, target_is_x86_64: bool) -> &'static str {
+    if debug || !target_is_x86_64 {
+        "-O0"
+    } else {
+        "-O2"
+    }
+}
+
 /// Run the LLVM middle-end optimization pipeline on `llmod` in place, before the
 /// target backend emits the object (I#857, D-0152).
 ///
@@ -397,6 +433,143 @@ fn lto_runtime_bitcode(
     Ok(cached)
 }
 
+/// Obtain the C runtime as a compiled native object (`.o`) for the default
+/// (non-LTO) object-link path, cached so `zaprt.c` is compiled at most once per
+/// (runtime source, opt level, collector, backend gates, CPython, `cc`, triple)
+/// rather than once per program (I#867 follow-up).
+///
+/// The runtime object does not depend on the program being compiled, so the
+/// hundreds of programs a `zap test` / golden run builds can all share one
+/// compiled copy. This matters especially after the `-O2` runtime default
+/// (D-0157): without this cache, `golden.rs`'s 442 fixtures each recompiled the
+/// whole large runtime TU — ~3s at `-O2` vs ~0.7s at `-O0` — adding tens of
+/// minutes across the matrix. The LTO path already caches runtime *bitcode* the
+/// same way ([`lto_runtime_bitcode`]); this is the object-link analogue.
+///
+/// The cache lives under `$ZAP_RT_CACHE` (default a stable temp subdir); the key
+/// hashes everything that determines the object, so a runtime edit, a different
+/// `-O` level (so the `-O2` default and `--debug` `-O0` never collide), a
+/// different collector / backend gate / CPython profile / `cc` / triple misses
+/// cleanly. Writes are published by atomic rename, so the parallel golden pool's
+/// concurrent builds never read a half-written object (a lost race just
+/// recompiles the same bytes). Only the compile-relevant flags enter here; the
+/// link-only flags (`-l*`, `-static`, `-rdynamic`, …) stay on the link command.
+///
+/// `rt_path` must already have `zaprt.c` + its `#include`d `zapgc.inc.c` /
+/// `zaprace.inc.c` written beside it (the caller does this). `opt_flag` is the
+/// `-O` level from [`runtime_opt_flag`].
+#[allow(clippy::too_many_arguments)]
+fn native_runtime_object(
+    cc: &str,
+    rt_path: &Path,
+    triple: &str,
+    opt_flag: &str,
+    no_cpython: bool,
+    no_regex: bool,
+    no_zlib: bool,
+    no_openssl: bool,
+) -> Result<std::path::PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+
+    let immix = cfg!(feature = "gc-immix");
+    // Same CPython-cflags logic as the LTO cache: only the `-I...` `--cflags`
+    // affect a `-c` compile, and they are probed only when CPython is actually
+    // embedded (never for a portable / Windows / non-`import python` build), so a
+    // non-Python program builds on a host without `python3-dev`.
+    let py_cflags: Vec<String> = if no_cpython {
+        Vec::new()
+    } else {
+        python_embed_flags()?
+    };
+    let extra = std::env::var("ZAP_CC_EXTRA").unwrap_or_default();
+
+    // Cache key: everything that determines the runtime object.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    RUNTIME_C.hash(&mut h);
+    RUNTIME_GC_C.hash(&mut h);
+    RUNTIME_RACE_C.hash(&mut h);
+    cc.hash(&mut h);
+    triple.hash(&mut h);
+    opt_flag.hash(&mut h);
+    immix.hash(&mut h);
+    no_cpython.hash(&mut h);
+    no_regex.hash(&mut h);
+    no_zlib.hash(&mut h);
+    no_openssl.hash(&mut h);
+    py_cflags.hash(&mut h);
+    extra.hash(&mut h);
+    // Bump when the runtime compile flags below change so a stale pre-change
+    // cache entry is never reused.
+    "rt-obj-flags-v1".hash(&mut h);
+    // Different cc builds emit different objects — fold the version in.
+    if let Ok(out) = Command::new(cc).arg("--version").output() {
+        out.stdout.hash(&mut h);
+    }
+    let key = format!("{:016x}", h.finish());
+
+    let cache_dir = std::env::var_os("ZAP_RT_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("zap-rt-cache"));
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cached = cache_dir.join(format!("zaprt-{key}.o"));
+    if cached.exists() {
+        return Ok(cached);
+    }
+
+    // Miss: compile the runtime to an object and publish atomically into a unique
+    // temp beside the cache entry. These are EXACTLY the compile-relevant flags
+    // the old single-step `cc <prog.o> zaprt.c …` passed (no `-fexceptions`: the
+    // non-LTO object link never merges modules or re-runs the optimizer, so the
+    // runtime's default `nounwind` is harmless here — see `lto_runtime_bitcode`).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = cache_dir.join(format!("zaprt-{key}.{}.{nanos}.tmp.o", std::process::id()));
+    let mut rc = Command::new(cc);
+    rc.arg(opt_flag).arg("-c").arg(rt_path).arg("-o").arg(&tmp);
+    if immix {
+        rc.arg("-DZAP_GC_IMMIX");
+    }
+    if no_cpython {
+        rc.arg("-DZAP_NO_CPYTHON");
+    } else {
+        rc.args(&py_cflags);
+    }
+    if no_regex {
+        rc.arg("-DZAP_NO_PCRE2");
+    }
+    if no_zlib {
+        rc.arg("-DZAP_NO_ZLIB");
+    }
+    if no_openssl {
+        rc.arg("-DZAP_NO_OPENSSL");
+    }
+    for a in extra.split_whitespace() {
+        rc.arg(a);
+    }
+    let status = rc
+        .status()
+        .map_err(|e| format!("failed to run runtime object compile (cc -c): {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("runtime object compile failed: {status}"));
+    }
+    // Publish. If another concurrent build won the race, its copy is equivalent;
+    // rename overwrites atomically on the same filesystem either way.
+    if let Err(e) = std::fs::rename(&tmp, &cached) {
+        let _ = std::fs::remove_file(&tmp);
+        if cached.exists() {
+            return Ok(cached);
+        }
+        return Err(format!(
+            "failed to publish runtime object to cache {}: {e}",
+            cached.display()
+        ));
+    }
+    Ok(cached)
+}
+
 /// Lower a type-checked AST module to a verified in-memory LLVM module (shared
 /// by the object-file backend and the REPL JIT, I#159). Returns the module and
 /// the host target machine whose data layout drove the GC type-descriptor field
@@ -635,11 +808,18 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
 ///     (source, collector, portable, clang, triple) and reused across builds.
 ///   * `ZAP_CC` / `ZAP_LTO_CC` — the linker driver for the default / LTO path.
 ///   * `ZAP_CC_EXTRA` — extra driver flags (diagnostics).
+///
+/// `debug` (the `zap build --debug` flag, I#867/D-0157) compiles the C runtime
+/// translation unit at `-O0` instead of the default `-O2` for fast iteration; it
+/// affects only the default object-link path's runtime compile (see
+/// [`runtime_opt_flag`], whose `-O2` default is x86_64-only — aarch64 stays `-O0`
+/// pending I#869) and is a no-op under `ZAP_LTO`.
 pub fn build_executable(
     module: &AstModule,
     out_path: &Path,
     portable: bool,
     race: bool,
+    debug: bool,
 ) -> Result<(), String> {
     // `ZAP_PORTABLE` (any value) is an environment-level alias for `--portable`:
     // it lets a deployment image default all builds to the portable profile.
@@ -715,7 +895,12 @@ pub fn build_executable(
     // MinGW-w64 toolchain so that work drops straight in. See the PR body and
     // design/0016-platform-1.0.md (Area A).
     let triple = TargetMachine::get_default_triple();
-    let is_windows = triple.as_str().to_string_lossy().contains("windows");
+    let triple_str = triple.as_str().to_string_lossy().into_owned();
+    let is_windows = triple_str.contains("windows");
+    // The `-O2` runtime default (I#867, D-0157) is gated to x86_64, where it was
+    // measured and CI-validated; other targets (aarch64) keep `-O0` pending I#869.
+    // See `runtime_opt_flag`. Both the `x86_64-...` and legacy `amd64` spellings.
+    let target_is_x86_64 = triple_str.contains("x86_64") || triple_str.contains("amd64");
 
     // CPython link gate (#852). Embedding CPython — and so emitting the
     // `libpython` `NEEDED` dynamic dependency and its `pkg-config` cflags/libs —
@@ -897,10 +1082,54 @@ pub fn build_executable(
                 .arg("-Wl,--gc-sections");
         }
     } else {
-        // Default path: compile the runtime source as its own translation unit
-        // alongside the already-codegen'd program object, so runtime calls stay
-        // out-of-line (the opaque-external-symbol boundary #841/#568 measured).
-        cmd.arg(&rt_path);
+        // Default path: the runtime is its own translation unit linked against the
+        // already-codegen'd program object, so runtime calls stay out-of-line (the
+        // opaque-external-symbol boundary #841/#568 measured).
+        //
+        // Optimize that runtime TU (I#867, D-0157). It carried NO `-O` flag, so
+        // the system `cc` compiled the whole dict/set/string/GC machinery at
+        // `-O0`, and every hot generated op paid into an unoptimized runtime
+        // (`dict_int`: 26.9ms at `-O0` vs 19.0ms at `-O2`, which then beats Go's
+        // 22.5ms). `-O2` by default on x86_64; `--debug` restores `-O0` for fast
+        // iteration, and non-x86_64 (aarch64) stays `-O0` pending I#869 (see
+        // `runtime_opt_flag`). The already-codegen'd program object is only linked,
+        // so its code is unaffected. The LTO path (above) is untouched.
+        let opt_flag = runtime_opt_flag(debug, target_is_x86_64);
+        if is_windows {
+            // Windows still compiles the runtime inline alongside the A1/A3/A4 TUs
+            // below (the port is stubbed and not the CI-hot path, so it does not
+            // use the object cache). `-O` applies to all those source TUs here.
+            cmd.arg(opt_flag);
+            cmd.arg(&rt_path);
+        } else {
+            // Compile `zaprt.c` to a cached `.o` ONCE per (source, opt, collector,
+            // backend gates, CPython, cc, triple) and just LINK it here, instead
+            // of recompiling the large runtime TU for every program. At the `-O2`
+            // default this is what keeps a golden / `zap test` run (hundreds of
+            // builds) from each paying the ~3s runtime compile — the object-link
+            // analogue of the LTO bitcode cache. Only the compile-relevant flags
+            // go into the cached object; the link-only flags (`-l*`, `-static`,
+            // `-rdynamic`, the `-D*` that merely mirror the cache key) stay on this
+            // link command below and are harmless no-ops against an object input.
+            let rt_obj = match native_runtime_object(
+                &cc,
+                &rt_path,
+                triple_str.as_str(),
+                opt_flag,
+                no_cpython,
+                no_regex,
+                no_zlib,
+                no_openssl,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&prog_path);
+                    let _ = std::fs::remove_dir_all(&build_dir);
+                    return Err(e);
+                }
+            };
+            cmd.arg(&rt_obj);
+        }
     }
     cmd.arg("-o").arg(out_path);
     // Select the collector (ticket #48): the precise Immix GC is compiled into
@@ -5514,6 +5743,42 @@ mod tests {
     use super::*;
     use zapc_ir::lower_module;
     use zapc_syntax::parser::parse_str;
+
+    /// The default (non-LTO) runtime compile is optimized on x86_64; `--debug`
+    /// lowers it to `-O0`, and non-x86_64 stays `-O0` pending I#869 (I#867,
+    /// D-0157). This pins the exact flags the link step passes to `cc`,
+    /// independent of a working toolchain (so it runs everywhere codegen builds,
+    /// not just where `objdump` and a C compiler are present — see
+    /// `crates/driver/tests/runtime_opt.rs` for the behavioural disassembly guard).
+    #[test]
+    fn runtime_opt_flag_o2_on_x86_64_else_o0() {
+        // x86_64, release (default): optimized.
+        assert_eq!(
+            runtime_opt_flag(false, true),
+            "-O2",
+            "the default `zap build` must compile the C runtime at `-O2` on x86_64"
+        );
+        // x86_64, --debug: fast-iteration -O0.
+        assert_eq!(
+            runtime_opt_flag(true, true),
+            "-O0",
+            "`zap build --debug` must compile the C runtime at `-O0`"
+        );
+        // Non-x86_64 (aarch64): `-O0` even in the default (release) build, because
+        // the aarch64 runtime miscompiles at `-O2` (I#869). This keeps non-x86_64
+        // at `main`'s pre-#867 behaviour until that is fixed.
+        assert_eq!(
+            runtime_opt_flag(false, false),
+            "-O0",
+            "non-x86_64 must stay at `-O0` pending the aarch64 `-O2` fix (I#869)"
+        );
+        // Non-x86_64 + --debug: also `-O0`.
+        assert_eq!(
+            runtime_opt_flag(true, false),
+            "-O0",
+            "`--debug` is `-O0` on every target"
+        );
+    }
 
     /// Translate a source program straight to LLVM IR text (no object/link).
     fn llvm_ir(src: &str) -> String {

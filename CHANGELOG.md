@@ -25,6 +25,27 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **The C runtime is compiled at `-O2` by default on x86_64, with a
+  `zap build --debug` (and `zap run --debug`) fast-iteration build at `-O0`**
+  (#867, D-0157). On the default (non-LTO) object-link path the runtime
+  (`zaprt.c` — the whole dict/set/string/GC machinery) was compiled at `-O0` while
+  the Zap-generated program object was already optimized (#857/D-0152), so every
+  hot op called into an unoptimized runtime. Optimizing it at `-O2` takes
+  `dict_int` (200k int-keyed inserts+lookups) from 26.9ms to 19.0ms (now faster
+  than Go's 22.5ms); the typed accessor `zap_dict_get_i64_i64` drops from ~5
+  out-of-line helper calls per lookup to ~1 inlined, register-allocated call.
+  `--debug` restores `-O0` for a faster build (~0.73s vs ~3s for the large runtime
+  TU) — the `cargo` debug/release intuition — with identical observable behaviour.
+  The `-O2` default is **x86_64-only**: aarch64 (and any non-x86_64) keeps `-O0`,
+  its prior behaviour, because the aarch64 runtime miscompiles the `ucontext`
+  coroutine switch at `-O2` (#869); extending the default there is gated on that
+  fix. This is a plain optimization level, not LTO: the opt-in `ZAP_LTO`
+  cross-module path (D-0149/D-0150) is unchanged, and `-flto` buys ≈ nothing over
+  `-O2` here for ~5× the build. The compiled runtime object is cached (keyed on
+  the runtime source + `-O` level + collector + backend gates + CPython profile +
+  `cc` + triple, overridable with `$ZAP_RT_CACHE`), so the larger `-O2` runtime is
+  compiled once and only linked thereafter rather than recompiled per program. No
+  grammar or runtime-ABI change.
 - **`dict` / `set` use a cache-local struct-of-arrays table with per-slot hash
   tags** (#840, D-0156). The old flat `ZapEntry[]` (32 bytes/slot) dragged a whole
   entry into cache for every probed slot, leaving `dict_int` ~0.7× Go's map on
