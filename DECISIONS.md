@@ -7940,8 +7940,15 @@ accelerant for the FFI epic (#539).
 2. **`with`-head only.** A detached `arena()` (`a = arena()`, returned, stored)
    is a **compile error** — a detached arena has no bounding scope, so its
    regions would leak or be reclaimed nondeterministically, defeating the
-   deterministic-free guarantee. Enforced statically at construction (a targeted
-   sema rule), not left to the escape checker or documentation.
+   deterministic-free guarantee. Enforced statically at construction. An arena is
+   a **`@scoped` resource**: an affine value consumed exactly once, by a `with`
+   head or by a move into another `@scoped` type's field (scopedness contagious
+   through ownership, owner teardown auto-runs owned fields' `__exit__` in reverse
+   construction order). `@scoped` is a general language feature (its own RFC) with
+   arena as first consumer and composites like `arena_dict` as later ones; arena
+   v1 is **not** blocked on it (the base arena owns no `@scoped` fields, so needs
+   only the degenerate `with`-head-only construction check, implementable
+   standalone).
 3. **Sizing / growth.** `size` = initial-reservation hint, rounded up to the GC
    region granularity (32 KB block), default one region; `cap` = hard byte
    ceiling, raises `MemoryError` past it, default unbounded. Growth is automatic

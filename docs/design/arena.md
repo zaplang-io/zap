@@ -90,8 +90,25 @@ finalization — defeating the deterministic-bulk-free guarantee and
 reintroducing exactly the leak class arenas exist to remove. For a GC'd
 language a leak-by-forgetting is unacceptable, so the guarantee is enforced
 *statically at construction*, not left to the escape checker or to documentation.
-This is a targeted sema rule, not new type machinery. (The same discipline may
-later extend to `pin()`; out of scope here.)
+
+Mechanism: an arena is a **`@scoped` resource** — a type whose values are
+*affine*: each must be **consumed exactly once**, and the only consumers are (a)
+a `with` head, or (b) a move into another `@scoped` type's field (ownership
+transfer to an owner that is itself `@scoped`). Scopedness is **contagious
+through ownership** (a struct owning a `@scoped` field is itself `@scoped`), and
+an owner's teardown auto-runs each owned `@scoped` field's `__exit__` in reverse
+construction order (Rust `Drop`-glue style), so cleanup cannot be forgotten. A
+bare `arena()` is simply the degenerate violation of (a)/(b): it is consumed by
+neither.
+
+`@scoped` is a **general language feature** in its own right (its own
+decision/RFC), with arena as its first consumer; it also underlies composite
+scoped types such as `arena_dict` (see the arena-local-collections RFC). Arena
+**v1 is not blocked on the full feature**: the base arena owns no `@scoped`
+fields, so it needs only the degenerate *`with`-head-only construction check*,
+implementable standalone; the general affine/contagion/auto-teardown machinery is
+what later enables composite `@scoped` types and subsumes this check. (The same
+discipline may later extend to `pin()`.)
 
 ### 2.3 Sizing and growth
 
