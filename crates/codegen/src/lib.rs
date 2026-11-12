@@ -117,8 +117,20 @@ fn opt_pipeline_spec() -> &'static str {
 /// The program module's own opt level is governed separately by D-0152
 /// (`ZAP_OPT_LEVEL` / `ZAP_NO_OPT`); `--debug` deliberately touches only the
 /// runtime TU, which is the dominant compile-time cost.
-fn runtime_opt_flag(debug: bool) -> &'static str {
-    if debug {
+///
+/// **Target gate (`target_is_x86_64`).** The `-O2` default applies ONLY to
+/// `x86_64`, where #867 measured and CI validated it (full golden + conformance
+/// at `-O2`). On every other target — notably `aarch64` — the runtime stays at
+/// `-O0`: at `-O2` the aarch64 runtime miscompiles the POSIX `ucontext` coroutine
+/// switch (I#869), SIGSEGV-ing a structured-concurrency program under BOTH
+/// collectors (so it is the runtime C, not the GC). The classic hazard — a value
+/// live across `swapcontext` cached in a callee-saved register the switch path
+/// does not round-trip the way `-O2` assumes — which x86_64's allocation happens
+/// to tolerate. Keeping non-x86_64 at `-O0` is exactly `main`'s pre-#867 behaviour
+/// there (no regression) until the aarch64 runtime is validated at `-O2` (I#869).
+/// `--debug` forces `-O0` on every target.
+fn runtime_opt_flag(debug: bool, target_is_x86_64: bool) -> &'static str {
+    if debug || !target_is_x86_64 {
         "-O0"
     } else {
         "-O2"
@@ -663,7 +675,8 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
 /// `debug` (the `zap build --debug` flag, I#867/D-0157) compiles the C runtime
 /// translation unit at `-O0` instead of the default `-O2` for fast iteration; it
 /// affects only the default object-link path's runtime compile (see
-/// [`runtime_opt_flag`]) and is a no-op under `ZAP_LTO`.
+/// [`runtime_opt_flag`], whose `-O2` default is x86_64-only — aarch64 stays `-O0`
+/// pending I#869) and is a no-op under `ZAP_LTO`.
 pub fn build_executable(
     module: &AstModule,
     out_path: &Path,
@@ -745,7 +758,12 @@ pub fn build_executable(
     // MinGW-w64 toolchain so that work drops straight in. See the PR body and
     // design/0016-platform-1.0.md (Area A).
     let triple = TargetMachine::get_default_triple();
-    let is_windows = triple.as_str().to_string_lossy().contains("windows");
+    let triple_str = triple.as_str().to_string_lossy().into_owned();
+    let is_windows = triple_str.contains("windows");
+    // The `-O2` runtime default (I#867, D-0157) is gated to x86_64, where it was
+    // measured and CI-validated; other targets (aarch64) keep `-O0` pending I#869.
+    // See `runtime_opt_flag`. Both the `x86_64-...` and legacy `amd64` spellings.
+    let target_is_x86_64 = triple_str.contains("x86_64") || triple_str.contains("amd64");
 
     // CPython link gate (#852). Embedding CPython — and so emitting the
     // `libpython` `NEEDED` dynamic dependency and its `pkg-config` cflags/libs —
@@ -935,13 +953,14 @@ pub fn build_executable(
         // the system `cc` compiled the whole dict/set/string/GC machinery at
         // `-O0`, and every hot generated op paid into an unoptimized runtime
         // (`dict_int`: 26.9ms at `-O0` vs 19.0ms at `-O2`, which then beats Go's
-        // 22.5ms). `-O2` by default; `--debug` restores `-O0` for fast iteration
-        // (see `runtime_opt_flag`). `-O2` on this driver invocation compiles
-        // `rt_path` (and the Windows A1/A3/A4 TUs below) at that level; the
-        // already-codegen'd program object is only linked, so its code is
-        // unaffected. The LTO path (above) is untouched — it compiles the runtime
-        // bitcode at `-O2` in `lto_runtime_bitcode` regardless of `--debug`.
-        cmd.arg(runtime_opt_flag(debug));
+        // 22.5ms). `-O2` by default on x86_64; `--debug` restores `-O0` for fast
+        // iteration, and non-x86_64 (aarch64) stays `-O0` pending I#869 (see
+        // `runtime_opt_flag`). `-O2` on this driver invocation compiles `rt_path`
+        // (and the Windows A1/A3/A4 TUs below) at that level; the already-codegen'd
+        // program object is only linked, so its code is unaffected. The LTO path
+        // (above) is untouched — it compiles the runtime bitcode at `-O2` in
+        // `lto_runtime_bitcode` regardless of `--debug`.
+        cmd.arg(runtime_opt_flag(debug, target_is_x86_64));
         cmd.arg(&rt_path);
     }
     cmd.arg("-o").arg(out_path);
@@ -5557,23 +5576,39 @@ mod tests {
     use zapc_ir::lower_module;
     use zapc_syntax::parser::parse_str;
 
-    /// The default (non-LTO) runtime compile is optimized; `--debug` lowers it to
-    /// `-O0` for fast iteration (I#867, D-0157). This pins the exact flags the
-    /// link step passes to `cc`, independent of a working toolchain (so it runs
-    /// everywhere codegen builds, not just where `objdump` and a C compiler are
-    /// present — see `crates/driver/tests/runtime_opt.rs` for the behavioural
-    /// disassembly guard).
+    /// The default (non-LTO) runtime compile is optimized on x86_64; `--debug`
+    /// lowers it to `-O0`, and non-x86_64 stays `-O0` pending I#869 (I#867,
+    /// D-0157). This pins the exact flags the link step passes to `cc`,
+    /// independent of a working toolchain (so it runs everywhere codegen builds,
+    /// not just where `objdump` and a C compiler are present — see
+    /// `crates/driver/tests/runtime_opt.rs` for the behavioural disassembly guard).
     #[test]
-    fn runtime_opt_flag_default_is_o2_debug_is_o0() {
+    fn runtime_opt_flag_o2_on_x86_64_else_o0() {
+        // x86_64, release (default): optimized.
         assert_eq!(
-            runtime_opt_flag(false),
+            runtime_opt_flag(false, true),
             "-O2",
-            "the default `zap build` must compile the C runtime at `-O2`"
+            "the default `zap build` must compile the C runtime at `-O2` on x86_64"
         );
+        // x86_64, --debug: fast-iteration -O0.
         assert_eq!(
-            runtime_opt_flag(true),
+            runtime_opt_flag(true, true),
             "-O0",
             "`zap build --debug` must compile the C runtime at `-O0`"
+        );
+        // Non-x86_64 (aarch64): `-O0` even in the default (release) build, because
+        // the aarch64 runtime miscompiles at `-O2` (I#869). This keeps non-x86_64
+        // at `main`'s pre-#867 behaviour until that is fixed.
+        assert_eq!(
+            runtime_opt_flag(false, false),
+            "-O0",
+            "non-x86_64 must stay at `-O0` pending the aarch64 `-O2` fix (I#869)"
+        );
+        // Non-x86_64 + --debug: also `-O0`.
+        assert_eq!(
+            runtime_opt_flag(true, false),
+            "-O0",
+            "`--debug` is `-O0` on every target"
         );
     }
 

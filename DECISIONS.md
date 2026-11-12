@@ -7828,15 +7828,32 @@ Compile time for one program: `-O0` ≈ 0.73s, `-O2` ≈ 3s (the runtime TU is
 large). True cross-module LTO (`ZAP_LTO`, D-0149/D-0150) fully inlines the
 accessor into `main` but measures ≈ `-O2` (18.5ms) for ~5× the build time.
 
-**Decision.** The default (non-LTO) path compiles `zaprt.c` at **`-O2`**
-(`runtime_opt_flag(false)` → `cmd.arg("-O2")` on the runtime `cc` invocation,
-which compiles `rt_path` — and the Windows A1/A3/A4 TUs — at that level; the
-already-codegen'd program object is only linked, so its code is unaffected).
-`zap build --debug` (and `zap run --debug`) passes `-O0` instead
-(`runtime_opt_flag(true)`), for fast iteration — the `cargo` debug/release
+**Decision.** The default (non-LTO) path compiles `zaprt.c` at **`-O2` on
+`x86_64`** (`runtime_opt_flag(false, true)` → `cmd.arg("-O2")` on the runtime `cc`
+invocation, which compiles `rt_path` — and the Windows A1/A3/A4 TUs — at that
+level; the already-codegen'd program object is only linked, so its code is
+unaffected). `zap build --debug` (and `zap run --debug`) passes `-O0` instead
+(`runtime_opt_flag(true, _)`), for fast iteration — the `cargo` debug/release
 intuition. The flag is plumbed `CLI → parse_compile → compile_for → backend →
 build_executable(debug)`; it defaults OFF (optimized). `zap test` harness binaries
 build with the default optimized runtime (they are executed, not iterated on).
+
+**Target gate: `-O2` default is x86_64-only (for now).** The `-O2` default
+applies ONLY to `x86_64`, where #867 measured it and CI validated it (the `full`
+job's whole golden + conformance suite is green at `-O2`). On every other target
+— notably **`aarch64`** — the runtime stays at `-O0`. At `-O2` the aarch64 runtime
+**miscompiles the POSIX `ucontext` coroutine switch**: the `scope_cleanup`
+conformance program SIGSEGVs (signal 11) under BOTH collectors (so it is the
+runtime C, not the GC — the `arm64` `gc-boehm` AND `gc-immix` legs both failed on
+the first #868 push). The classic hazard — a value live across `swapcontext`
+cached in a callee-saved register the switch path does not round-trip the way
+`-O2` assumes, which x86_64's allocation tolerates and aarch64's does not. Keeping
+non-x86_64 at `-O0` is exactly `main`'s pre-#867 behaviour there, so it is a strict
+no-regression hold, not a workaround that hides a fault: the aarch64 `-O2`
+miscompile is reported as a core defect in **I#869** and left for the maintainer
+to assign; extending the `-O2` default to aarch64 is gated on that fix. `--debug`
+is `-O0` on every target. (This is the arch gate added after the first #868 CI
+run surfaced the aarch64 crash; the x86_64 win and the flag are unchanged.)
 
 **Why not `-flto` / default-on LTO.** The perf data shows LTO ≈ `-O2` here (the
 hot dict fast path is already small and the accessor's cost is table mechanics,
@@ -7867,10 +7884,12 @@ guard: it builds a hot `dict[int64,int64]` loop in the default mode and under
 `--debug`, disassembles `zap_dict_get_i64_i64`, and asserts the default build
 inlines the `static inline` table accessors (no out-of-line call survives) while
 `--debug` does not (a call survives + strictly more calls), with the `noinline`
-`zap_key_hash` called out of line in both as the anchor. It skips cleanly where
-`objdump` is absent. `crates/codegen/src/lib.rs`'s unit test pins
-`runtime_opt_flag`'s exact flags (toolchain-independent), and
-`crates/driver/src/cli.rs` covers `--debug` parsing on `run`/`build`/`ir`.
+`zap_key_hash` called out of line in both as the anchor. It is gated to `x86_64`
+(where the `-O2` default applies) and skips cleanly where `objdump` is absent.
+`crates/codegen/src/lib.rs`'s unit test pins `runtime_opt_flag`'s exact flags for
+all four (debug × x86_64) cases including the non-x86_64 `-O0` hold
+(toolchain-independent), and `crates/driver/src/cli.rs` covers `--debug` parsing
+on `run`/`build`/`ir`.
 
 **No grammar or ABI change.** `--debug` is a build flag, invisible to syntax and
 to observable semantics; `GRAMMAR.ebnf` and `design/RUNTIME-ABI.md` are unchanged.
