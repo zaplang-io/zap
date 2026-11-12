@@ -7713,3 +7713,79 @@ per the GC-golden determinism rule); the measured per-iteration win shows only
 once D-0152 register-promotes the loop, but the change is correct and mergeable
 independently. No `GRAMMAR.ebnf` change — invisible to syntax and observable
 semantics.
+
+## D-0156 — bucketed / struct-of-arrays dict & set layout with per-slot hash tags (#840)
+
+**Context.** `dict`/`set` was open-addressing with linear probing over a **flat**
+`ZapEntry[]` — `{ uint8 state; int64 key; int64 val; uint64 hash }`, 32 bytes per
+slot (the cached `hash` added by #837/D-0145). Every probed slot dragged a whole
+32-byte entry into cache, and every non-matching full slot was inspected in full.
+The #837/#838 forensics (Discussion #858) showed the `dict_int` isolation bench —
+int keys, hash already cached, no string cost — still ran ~0.7× Go's map: a
+structural table-mechanics gap, not a hashing or string cost. That is #840.
+
+**Two prototypes, picked with numbers.** A standalone C microbench of the table
+in isolation (the dict/set code is pure C) compared three layouts on the exact
+`perf.rs` workload (100k sequential insert then lookup, int and string keys) plus
+collision and tombstone-churn scenarios, each verified against a checksum:
+
+| workload (ns/op)             | flat (old) | full bucketed | SoA (chosen) |
+|------------------------------|-----------:|--------------:|-------------:|
+| int insert+lookup (dict_int) |       73.1 |          69.4 |     **32.4** |
+| int lookup ×10               |       27.9 |          42.8 |     **16.2** |
+| string insert+lookup         |       94.9 |          89.1 |     **80.5** |
+
+The **full bucketed** layout (Go `hmap`/`bmap`: 8-slot buckets, 8-wide SIMD tag
+scan) was *eliminated* — more complex (overflow/resize/iteration rewrite) AND
+slower here than SoA on every workload: at a 0.75 load factor the probe chains
+are short, so the fixed 8-wide tag load never pays off and the bucket scatter
+hurts first-probe hits. The **struct-of-arrays** alternative won decisively.
+
+**Decision.** The slot array is **one `zap_ptrbuf` buffer in SoA form**, carved
+into four parallel regions `tags[cap] (1B) | keys[cap] (8B) | vals[cap] (8B) |
+hashes[cap] (8B)` — 25 bytes/slot (set omits `vals`: 17 bytes/slot). State folds
+into the tag byte: a slot's **tag** is the top 8 bits of its hash, biased out of
+two reserved sentinels — `0` EMPTY, `1` TOMB — so a real key's tag is always
+`>= 2` and can never alias a sentinel. A probe scans only the dense 1-byte `tags`
+stream (64 slots per cache line, SIMD-friendly); a tag mismatch rejects a slot
+with one byte compare, and a tag MATCH *always* falls through to the definitive
+compare — never a false hit.
+
+**Int keys skip the hash gate.** On a tag hit an int key compares its word
+directly (`keys[j] == key` is definitive — equality there needs no hash), so the
+int path never reads the `hashes` region at all. That is the lever that turned a
+naive SoA (which read all four arrays on every first-probe hit and *regressed*
+pure lookup ~13%) into a 1.7–2.3× win: int lookup touches `tags` + `keys` only.
+A **string/struct** key keeps #837's full-hash gate before the `memcmp`/`__eq__`.
+`hashes[]` is still written on every insert so `resize` rehashes from the stored
+hash (no FNV / `__hash__` recompute) and `copy` is a single `memcpy` of the whole
+buffer (slot indices preserved). The split fast/slow `zap_dict_get` (D-0149) is
+kept: the inlinable fast path is "first probe, tag hit, key found by identity".
+
+**Semantics are byte-for-byte preserved** (the walled-garden bar). Insertion is
+unchanged, overwrite/`del`+tombstone/tombstone-reuse/`len`/growth thresholds
+(0.75 load, power-of-two) are unchanged, `@derive(Hash)`/`@derive(Eq)` struct keys
+(D-0047) and float-key NaN-reject / `-0.0`→`+0.0` (D-0138) are untouched.
+Enumeration order stays **unspecified** (hash/probe order, D-0059); all existing
+dict/set goldens are order-independent and stay green unchanged. New stress
+goldens (`dict_int_stress`, `dict_collision_stress`, `set_stress`, `dict_edge`)
+add resize-under-load, long-probe-chain collisions, tag-collision discrimination
+(a distinct key sharing a tag must not alias), tombstone churn + reuse, and the
+empty/singleton edges.
+
+**GC.** The entries buffer stays ONE atomic `zap_ptrbuf` allocation, so the
+precise collector still forwards it with a single `zap_process_slot(&d->buf)`,
+then re-derives the region bases from the (possibly relocated) buffer and walks
+the pointer `key`/`val` words of each full slot (`tag >= 2`) — gated on
+`key_ptr`/`val_ptr` exactly as before. A `KEY_FN` `__hash__`/`__eq__` callback can
+relocate the buffer mid-probe, so every probe re-derives its region bases from
+`d->buf` (the same re-read discipline the flat layout got from `d->entries[j]`);
+the callback-free int/str paths have no intervening store, so the optimiser hoists
+those loads. Syntax-checks clean under both `ZAP_GC_IMMIX` and Boehm.
+
+**No language, grammar, or ABI-surface change** — a pure runtime data-structure
+change in `crates/codegen/src/zaprt.c` (+ the GC trace in `zapgc.inc.c`). The
+`dict[K,V]`/`set[T]` entry points and their signatures are unchanged, so no
+codegen change was needed. `design/RUNTIME-ABI.md` already documents the exact
+`dict` probing scheme / load factor / tombstones as **unspecified** (§"What is
+NOT guaranteed"), so this layout is within the stated contract.

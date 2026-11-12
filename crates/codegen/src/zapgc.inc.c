@@ -903,20 +903,26 @@ static void zap_trace_children(void *payload) {
         return;
     }
     case ZAP_TD_DICT: {
+        /* SoA table (#840): one buffer carved into tags[cap]|keys[cap]|vals[cap]|
+         * hashes[cap]. Forward the buffer slot FIRST, then re-derive the region
+         * bases from the (possibly relocated) buffer before walking the pointer
+         * key/val words of each full slot (tag >= 2; ZAP_TAG_EMPTY/TOMB are < 2). */
         ZapDict *dd = (ZapDict *)payload;
-        if (dd->entries) {
-            zap_process_slot((void **)&dd->entries);
+        if (dd->buf) {
+            zap_process_slot((void **)&dd->buf);
             if (dd->key_ptr || dd->val_ptr) {
-                ZapEntry *e = dd->entries;
+                uint8_t *tags = zap_d_tags(dd);
+                int64_t *keys = zap_d_keys(dd);
+                int64_t *vals = zap_d_vals(dd);
                 for (int64_t i = 0; i < dd->cap; i++) {
-                    if (e[i].state != SLOT_FULL) {
+                    if (tags[i] < 2) {
                         continue;
                     }
                     if (dd->key_ptr) {
-                        zap_process_word(&e[i].key);
+                        zap_process_word(&keys[i]);
                     }
                     if (dd->val_ptr) {
-                        zap_process_word(&e[i].val);
+                        zap_process_word(&vals[i]);
                     }
                 }
             }
@@ -925,13 +931,14 @@ static void zap_trace_children(void *payload) {
     }
     case ZAP_TD_SET: {
         ZapSet *s = (ZapSet *)payload;
-        if (s->entries) {
-            zap_process_slot((void **)&s->entries);
+        if (s->buf) {
+            zap_process_slot((void **)&s->buf);
             if (s->elem_ptr) {
-                ZapSetEntry *e = s->entries;
+                uint8_t *tags = zap_s_tags(s);
+                int64_t *keys = zap_s_keys(s);
                 for (int64_t i = 0; i < s->cap; i++) {
-                    if (e[i].state == SLOT_FULL) {
-                        zap_process_word(&e[i].key);
+                    if (tags[i] >= 2) {
+                        zap_process_word(&keys[i]);
                     }
                 }
             }
