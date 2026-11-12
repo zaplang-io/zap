@@ -881,6 +881,8 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | Select { dest, .. }
         | StrConst { dest, .. }
         | StructNew { dest, .. }
+        | StackStruct { dest, .. }
+        | StrBuild { dest, .. }
         | FieldGet { dest, .. }
         | LandingPad { dest, .. }
         | ArrayBinOp { dest, .. }
@@ -1146,6 +1148,25 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             None,
         );
         self.fns.insert("zap_str_concat".to_string(), str_concat);
+        // Single-pass string build (#839; folds in the #837 lever-3(b) f-string
+        // join): `zap_strbuild(ZapStr **parts, i64 n)` allocates one heap string.
+        // `zap_strbuild_into(void *buf, i64 cap, ZapStr **parts, i64 n)` builds
+        // into a caller-provided inline stack buffer of `cap` bytes when the
+        // summed length fits, else spills to a heap `zap_strbuild`. (Named
+        // `strbuild`, not `str_join`, to avoid the `str.join(list)` runtime fn.)
+        let str_build = self.module.add_function(
+            "zap_strbuild",
+            ptr.fn_type(&[ptr.into(), i64t.into()], false),
+            None,
+        );
+        self.fns.insert("zap_strbuild".to_string(), str_build);
+        let str_build_into = self.module.add_function(
+            "zap_strbuild_into",
+            ptr.fn_type(&[ptr.into(), i64t.into(), ptr.into(), i64t.into()], false),
+            None,
+        );
+        self.fns
+            .insert("zap_strbuild_into".to_string(), str_build_into);
         let print_str = self.module.add_function(
             "zap_print_str",
             self.ctx.void_type().fn_type(&[ptr.into()], false),
@@ -2495,15 +2516,28 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // reading it from a root slot or straight from the register is the same
         // pointer.
         let mut is_alloca_dest = vec![false; f.value_types.len()];
+        // A stack-promoted `StackStruct` (#839) is a stack-slot address holding no
+        // outgoing heap pointers. Like an `Alloca` dest it is never a heap
+        // reference, so it needs no direct root slot; excluding it keeps the
+        // #568/D-0144 frame-skip (a function whose only "allocations" are
+        // stack-promoted structs stays frameless) and is sound — the collector
+        // ignores a stack pointer anyway. A stack `StrBuild` is NOT excluded: it
+        // may spill to a *heap* string at run time when the join exceeds the
+        // inline buffer, and that spill must be a precise GC root, so it keeps its
+        // ordinary direct-root slot (rooting the stack-buffer case is harmless —
+        // the collector validates each root against the heap-block registry).
+        let mut is_stack_dest = vec![false; f.value_types.len()];
         for inst in f.blocks.iter().flat_map(|block| &block.insts) {
-            if let Inst::Alloca { dest, .. } = inst {
-                is_alloca_dest[*dest as usize] = true;
+            match inst {
+                Inst::Alloca { dest, .. } => is_alloca_dest[*dest as usize] = true,
+                Inst::StackStruct { dest, .. } => is_stack_dest[*dest as usize] = true,
+                _ => {}
             }
         }
         let mut slot_of = vec![-1i32; f.value_types.len()];
         let mut n: u32 = 0;
         for (vid, ty) in f.value_types.iter().enumerate() {
-            if ty.is_ptr() && !is_alloca_dest[vid] {
+            if ty.is_ptr() && !is_alloca_dest[vid] && !is_stack_dest[vid] {
                 slot_of[vid] = n as i32;
                 n += 1;
             }
@@ -2526,7 +2560,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let mut aggr_sids: Vec<u32> = Vec::new();
         for (vid, ty) in f.value_types.iter().enumerate() {
             if let Ty::Struct(sid) = ty {
-                if self.struct_inline[*sid as usize] {
+                // A stack-promoted struct (#839) is leaf / pointer-free, so it has
+                // no interior reference fields to trace — never an aggregate root.
+                if self.struct_inline[*sid as usize] && !is_stack_dest[vid] {
                     aggr_of[vid] = aggr_sids.len() as i32;
                     aggr_sids.push(*sid);
                 }
@@ -3601,6 +3637,75 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         .ok_or_else(|| "struct has no size".to_string())?;
                     let alloc = self.fns["zap_alloc"];
                     b.build_call(alloc, &[size.into()], "structnew")
+                        .map_err(|e| e.to_string())?
+                };
+                vals[*dest as usize] = cs.try_as_basic_value().left();
+            }
+            Inst::StackStruct { dest, sid } => {
+                // Escape analysis (#839): a non-escaping, leaf / pointer-free
+                // struct lives in an entry-hoisted stack slot (#91) instead of the
+                // GC heap, zero-initialized to match `StructNew`'s zeroed instance.
+                // The slot holds no outgoing heap pointers, so it is never a GC
+                // root (excluded in `gc_setup_frame`) and is never relocated by
+                // moving Immix — see `crates/ir/src/escape.rs` / discussion #849.
+                let st = self.structs[*sid as usize];
+                let ptr = self.entry_alloca(st.into(), "stackstruct")?;
+                b.build_store(ptr, st.const_zero())
+                    .map_err(|e| e.to_string())?;
+                vals[*dest as usize] = Some(BasicValueEnum::PointerValue(ptr));
+            }
+            Inst::StrBuild {
+                dest,
+                parts,
+                stack,
+                cap,
+            } => {
+                // One-pass string join (#839 / #837 lever-3(b)). Spill the part
+                // pointers into an entry-hoisted `[n x ptr]` array, then call the
+                // runtime joiner. `stack` (set by escape analysis) builds into an
+                // inline `{i64 len; [cap x i8]}` stack buffer with a heap spill
+                // when the summed length exceeds `cap`; otherwise one heap alloc.
+                let p = self.ctx.ptr_type(AddressSpace::default());
+                let i64t = self.ctx.i64_type();
+                let n = parts.len();
+                let arr_ty = p.array_type(n as u32);
+                let arr = self.entry_alloca(arr_ty.into(), "strparts")?;
+                // Index the `[n x ptr]` array with i32 indices, matching the
+                // proven GC-roots GEP (an array index wants the aggregate's own
+                // index width, not the i64 pointer width).
+                let i32t = self.ctx.i32_type();
+                let zero = i32t.const_zero();
+                for (i, pv) in parts.iter().enumerate() {
+                    let idx = i32t.const_int(i as u64, false);
+                    let ep = unsafe {
+                        b.build_in_bounds_gep(arr_ty, arr, &[zero, idx], "strpart")
+                            .map_err(|e| e.to_string())?
+                    };
+                    b.build_store(ep, get(vals, *pv))
+                        .map_err(|e| e.to_string())?;
+                }
+                let nconst = i64t.const_int(n as u64, false);
+                let cs = if *stack {
+                    let i8t = self.ctx.i8_type();
+                    let buf_ty = self
+                        .ctx
+                        .struct_type(&[i64t.into(), i8t.array_type(*cap).into()], false);
+                    let buf = self.entry_alloca(buf_ty.into(), "strbuf")?;
+                    let join = self.fns["zap_strbuild_into"];
+                    b.build_call(
+                        join,
+                        &[
+                            buf.into(),
+                            i64t.const_int(*cap as u64, false).into(),
+                            arr.into(),
+                            nconst.into(),
+                        ],
+                        "strjoin",
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    let join = self.fns["zap_strbuild"];
+                    b.build_call(join, &[arr.into(), nconst.into()], "strjoin")
                         .map_err(|e| e.to_string())?
                 };
                 vals[*dest as usize] = cs.try_as_basic_value().left();

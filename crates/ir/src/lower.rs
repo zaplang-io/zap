@@ -1897,6 +1897,15 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
     // renderer slot of that type's itable for `Inst::IfaceRender` dispatch.
     out.iface_renderers = std::mem::take(&mut ctx.iface_renderers.borrow_mut());
 
+    // Escape analysis (#839, discussion #849): lower non-escaping leaf /
+    // pointer-free / finalizer-free `StructNew` and f-string `StrBuild` nodes to
+    // the stack. Conservative — it only ever turns a heap allocation into a stack
+    // one, so a well-formed module stays well-formed and semantics are preserved;
+    // run it only when lowering produced a complete module (no errors).
+    if errors.is_empty() {
+        crate::escape::run(&mut out);
+    }
+
     (out, errors)
 }
 
@@ -7082,7 +7091,7 @@ impl<'a> FnLower<'a> {
                 .filter(|p| matches!(p, FStringPart::Field { .. }))
                 .count();
         let mut field_idx = 0usize;
-        let mut acc: Option<Value> = None;
+        let mut pieces: Vec<Value> = Vec::new();
         for part in &parts {
             let piece = match part {
                 FStringPart::Text(t) => {
@@ -7112,26 +7121,30 @@ impl<'a> FnLower<'a> {
                     }
                 }
             };
-            acc = Some(match acc {
-                None => piece,
-                Some(prev) => {
-                    let d = self.new_value(Ty::Ptr);
-                    self.emit(Inst::Call {
-                        dest: Some(d),
-                        func: "zap_str_concat".to_string(),
-                        args: vec![prev, piece],
-                    });
-                    d
-                }
-            });
+            pieces.push(piece);
         }
-        let result = match acc {
-            Some(v) => v,
-            None => {
+        // Join the pieces in a single pass (#839; folds in the #837 lever-3(b)
+        // single-alloc join). Zero pieces -> empty literal; a single piece is
+        // already the whole string (no join / extra allocation). Two or more ->
+        // one `StrBuild`, which the escape pass may later stack-allocate when the
+        // result is proven non-escaping (the `f"k{i}"` transient-key win).
+        let result = match pieces.len() {
+            0 => {
                 let d = self.new_value(Ty::Ptr);
                 self.emit(Inst::StrConst {
                     dest: d,
                     bytes: Vec::new(),
+                });
+                d
+            }
+            1 => pieces[0],
+            _ => {
+                let d = self.new_value(Ty::Ptr);
+                self.emit(Inst::StrBuild {
+                    dest: d,
+                    parts: pieces,
+                    stack: false,
+                    cap: 0,
                 });
                 d
             }

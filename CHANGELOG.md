@@ -25,6 +25,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Escape analysis — stack-allocate non-escaping leaf values** (#839, D-0151).
+  A conservative ZIR pass lowers a `StructNew` or transient f-string whose value
+  provably does not escape its function, and which is leaf / pointer-free /
+  finalizer-free, to a stack allocation instead of the GC heap: a non-escaping
+  all-scalar reference struct becomes an entry-hoisted `alloca`, and a transient
+  f-string builds into a 64-byte inline stack buffer with a heap spill when it
+  does not fit (which also folds the f-string `zap_str_concat` chain into one
+  allocation). Removes the per-iteration heap allocation behind the `f"k{i}"`
+  transient-key cost (the `dict_string` lookup / `fstring_only` benches) at
+  near-zero GC risk — stack slots are never relocated and hold no heap pointers.
+  Pointer-holding structs and finalizable values stay on the heap. Invisible to
+  the language (no grammar/semantic change).
 - **LTO builds strip the dead runtime — binaries ~5.7× smaller** (#841, D-0150).
   The whole C runtime (http/json/crypto/regex/…) is merged into every `ZAP_LTO`
   program so the fast paths can inline, but a single-module `opt -O2` cannot drop

@@ -580,6 +580,32 @@ pub enum Inst {
         dest: Value,
         sid: u32,
     },
+    /// A **stack-allocated** zeroed struct instance (escape analysis, #839): the
+    /// value is a `StructNew` that the escape pass (`crates/ir/src/escape.rs`)
+    /// proved does not escape its function AND whose layout is leaf / pointer-free
+    /// / finalizer-free. Codegen lowers it to an entry-block `alloca` + zero-init
+    /// instead of a GC heap allocation. `dest : Struct(sid)` (a pointer to the
+    /// stack slot), so `FieldGet`/`FieldSet` are byte-identical to the heap case.
+    /// The slot holds no outgoing heap pointers, so it needs no GC-root tracking
+    /// (keeps the D-0144/#568 frame-skip) and is never relocated by moving Immix.
+    /// Only the pass constructs this; `lower` always emits `StructNew`.
+    StackStruct {
+        dest: Value,
+        sid: u32,
+    },
+    /// Build one string by joining `parts` in order (#839, folds in the #837
+    /// lever-3(b) single-alloc f-string join). `lower_fstring` emits this in place
+    /// of a left-folded `zap_str_concat` chain; `dest : Ptr` is the joined string.
+    /// When `stack` is true (set by the escape pass when the result is proven
+    /// non-escaping) codegen builds into an entry-block inline buffer of `cap`
+    /// bytes with a runtime heap spill when the summed length exceeds `cap`;
+    /// otherwise it is one heap allocation. `cap` is meaningful only when `stack`.
+    StrBuild {
+        dest: Value,
+        parts: Vec<Value>,
+        stack: bool,
+        cap: u32,
+    },
     /// Load field `idx` of struct `sid` from `base`; `dest` gets the field type.
     FieldGet {
         dest: Value,
@@ -1124,6 +1150,20 @@ fn fmt_inst(i: &Inst) -> String {
             format!("%{dest} = strconst {:?}", String::from_utf8_lossy(bytes))
         }
         Inst::StructNew { dest, sid } => format!("%{dest} = structnew struct#{sid}"),
+        Inst::StackStruct { dest, sid } => format!("%{dest} = stackstruct struct#{sid}"),
+        Inst::StrBuild {
+            dest,
+            parts,
+            stack,
+            cap,
+        } => {
+            let a: Vec<String> = parts.iter().map(|v| format!("%{v}")).collect();
+            if *stack {
+                format!("%{dest} = strbuild.stack[{cap}] {}", a.join(", "))
+            } else {
+                format!("%{dest} = strbuild {}", a.join(", "))
+            }
+        }
         Inst::FieldGet {
             dest,
             base,

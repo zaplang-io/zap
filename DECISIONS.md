@@ -7385,3 +7385,72 @@ well under half the un-pruned one (measured ~5.7×; a conservative 2× bound kee
 it non-flaky). The existing inline/`noinline` guard still passes (pruning does
 not touch optimization), and CI's scoped golden slice runs under `ZAP_LTO=1` on
 both collectors.
+
+## D-0151 — Escape analysis: stack-allocate non-escaping leaf values (#839)
+
+**Status:** Accepted. **Relates:** D-0143/D-0144 (#568 frame-skip & inlined
+safepoint), #838 (one-object `ZapStr`), #663/#672 (precise Immix static roots),
+#92 (finalizers), #714 (GC north star). **Discussion:** zaplang-io/zap #849
+(debate & rationale).
+
+A conservative escape-analysis pass over the ZIR (`crates/ir/src/escape.rs`, run
+from `lower_module_opts` after lowering and before codegen, so it applies to the
+AOT path, the REPL JIT, and `zap ir`) lowers a heap allocation whose produced
+value **provably does not escape its function** to a stack allocation instead of
+a GC heap allocation.
+
+**v1 scope.** Stack allocation applies ONLY to non-escaping values that are both
+(a) **leaf / pointer-free** — holding no outgoing heap pointers — and (b)
+**finalizer-free**:
+- a **reference struct** (D-0023, not a `value struct` / tuple / interface-box
+  cell) all of whose fields are scalar (`!Ty::is_ptr`) → `Inst::StackStruct`
+  (an entry-hoisted `alloca` + zero-init, #91);
+- a transient **f-string** `Inst::StrBuild` (pointer-free atomic `str`) → an
+  inline stack buffer of `K = 64` bytes with a runtime heap spill when the summed
+  length exceeds `K` (`zap_strbuild_into`). `StrBuild` also folds the former
+  left-folded `zap_str_concat` chain into one allocation (#837 lever-3(b)).
+
+**Conservatism.** The escape lattice is monotone to *escape*; any allocation
+site, callee, or alias the pass does not understand resolves to *escape* (heap).
+A value escapes if it is returned, stored into a heap object / collection / global
+slot or a non-local (address-captured) slot, captured by a closure, boxed behind
+an interface, or passed to any call that may retain it. A callee retains unless it
+is on a tight allowlist of pure readers/probes proven not to retain, alias, or
+return a pointer argument (`zap_dict_get`/`_contains`, `zap_set_contains`,
+`zap_list_get`, `zap_str_len`/`_concat`/`_eq`/`_hash`, `zap_fmt_*`, `zap_render*`);
+every closure/interface dispatch, `spawn`, and user call is opaque, hence
+retaining. A wrong "does not escape" is a use-after-free, so ambiguity always
+fails safe to the heap.
+
+**Size caps** (tunable; all fail safe to heap): per-allocation `MAX_STACK_ALLOC`
+= 256 B, per-function `MAX_FRAME_BUDGET` = 4096 B summed over **distinct static
+sites** (a promoted site in a loop is one entry-hoisted slot, reused each
+iteration), and the string bound `K` = 64 B. Zap is stricter than Go (64 KB
+implicit / 32 B string) because coroutines run on fixed OS-thread stacks rather
+than growable goroutine stacks.
+
+**GC safety (moving Immix).** A stack slot is never relocated by the collector.
+A `StackStruct` holds no outgoing heap pointers, so it is excluded from the
+shadow-frame roots (keeping the D-0144 frame-skip) — sound because the value does
+not escape and there is no interior root to miss. A stack `StrBuild` keeps its
+ordinary direct-root slot, because it may **spill to a heap string** at run time
+when the join exceeds the inline buffer, and that spill must be a precise root
+(rooting the stack-buffer case is harmless — the collector validates each root
+against the heap-block registry and ignores a stack pointer). Every ZIR node that
+defines a pointer value is registered in codegen's `inst_dest` so its result is
+rooted at the def site. Safe across a GC safepoint and across a `spawn`/`scope`
+boundary (a spawned/scoped argument has escaped). `is` identity is preserved
+(distinct allocation ⇒ distinct stable stack address).
+
+**Deferred.** Pointer-holding non-escaping structs (v2 — require the precise
+static-root scanner, #663/#672, extended to scan a stack object's interior heap
+fields as roots). Finalizable objects (#92 — today only `Ty::Py`, itself a
+pointer) stay permanently heap. A `readline`-style reader-cooperation ABI for
+line-by-line file reads (v1.1).
+
+**Verification.** ZIR-level assertions both directions; a dual-collector golden
+(`escape_stack_promote_gc`) keeping a stack struct and a transient f-string key
+correct across forced `gc.collect()` under churn (contents only, never heap
+bytes); the `fstring_only` / `dict_string` perf benches (#568 harness). Verified
+on an LLVM-18 host under both collectors. No `GRAMMAR.ebnf` change — escape
+analysis is invisible to syntax and to observable semantics.
