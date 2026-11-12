@@ -132,6 +132,16 @@ fn has_objdump() -> bool {
 /// the binary path (inside a unique temp dir the caller must remove). When `lto`
 /// is `Some((clang, llvm_link))`, builds under the LTO flag with those tools.
 fn build_binary(dir: &std::path::Path, lto: Option<(&str, &str, &str)>) -> std::path::PathBuf {
+    build_binary_env(dir, lto, &[])
+}
+
+/// As `build_binary`, but with extra environment variables set on the `zapc
+/// build` child (e.g. `ZAP_LTO_NO_PRUNE=1` to build the un-pruned LTO variant).
+fn build_binary_env(
+    dir: &std::path::Path,
+    lto: Option<(&str, &str, &str)>,
+    extra_env: &[(&str, &str)],
+) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let src = dir.join("hot_dict.zap");
     std::fs::write(&src, HOT_DICT_SRC).unwrap();
@@ -147,6 +157,9 @@ fn build_binary(dir: &std::path::Path, lto: Option<(&str, &str, &str)>) -> std::
             // Keep the merged bitcode so the test can disassemble it and report
             // why the runtime call did/did not inline (I#841 diagnostics).
             .env("ZAP_LTO_KEEP", dir);
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     let out = cmd.output().expect("spawn zapc build");
     assert!(
@@ -302,5 +315,59 @@ fn lto_inlines_dict_fast_path_but_not_shadow_head() {
         "LTO binary has NO call to `zap_shadow_head_addr` — the `noinline` helper \
          was folded away, which breaks coroutine-migration GC correctness \
          (I#223 / #568); LTO must honour its noinline attribute"
+    );
+}
+
+/// The LTO path strips dead runtime at LINK time (`-ffunction-sections` +
+/// `--gc-sections`, with `-rdynamic` dropped so it does not anchor every symbol;
+/// D-0149). The WHOLE C runtime (`zaprt.c` — http/json/crypto/regex/…) is merged
+/// into every program, and a single-module `opt -O2` cannot drop the unused
+/// parts (external linkage ⇒ not provably dead), so the un-pruned
+/// (`ZAP_LTO_NO_PRUNE`, `-rdynamic`, no `--gc-sections`) binary carries the
+/// entire runtime; the linker's section GC drops the functions no path reaches,
+/// so a program that uses only `dict`+`print` links a fraction of the code — a
+/// much smaller binary (which also cuts exec/page-in time, e.g. AWS Lambda cold
+/// start). Stripping at link, not via IR `internalize`+`globaldce` before `-O2`,
+/// is deliberate: internalizing lets `-O2` treat the runtime's scheduler/GC/
+/// race globals as private and miscompiles the concurrent runtime. This guards
+/// that the strip fires: the default (pruned) LTO binary must be well under half
+/// the `ZAP_LTO_NO_PRUNE` one. Measured ~8× on this fixture; the assertion uses
+/// a conservative 2× so it is not flaky across LLVM point releases.
+#[test]
+fn lto_pruning_drops_dead_runtime_and_shrinks_binary() {
+    let (Some(clang), Some(llvm_link), Some(opt)) = (find_clang(), find_llvm_link(), find_opt())
+    else {
+        eprintln!(
+            "SKIP lto_pruning_drops_dead_runtime_and_shrinks_binary: no LLVM 18 LTO toolchain \
+             (clang/llvm-link/opt); CI installs clang-18 + the LLVM 18 tools"
+        );
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("zapltoprune-{}", std::process::id()));
+    let tools = Some((clang.as_str(), llvm_link.as_str(), opt.as_str()));
+
+    // Default LTO build: pruning ON.
+    let pruned = build_binary_env(&root.join("pruned"), tools, &[]);
+    // Same program, pruning OFF: keeps the whole merged runtime.
+    let full = build_binary_env(&root.join("full"), tools, &[("ZAP_LTO_NO_PRUNE", "1")]);
+
+    let pruned_sz = std::fs::metadata(&pruned).map(|m| m.len()).unwrap_or(0);
+    let full_sz = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "lto pruning: pruned binary = {pruned_sz} bytes, un-pruned (ZAP_LTO_NO_PRUNE) = {full_sz} bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        pruned_sz > 0 && full_sz > 0,
+        "expected both LTO binaries to exist (pruned={pruned_sz}, full={full_sz})"
+    );
+    assert!(
+        pruned_sz.saturating_mul(2) < full_sz,
+        "pruned LTO binary ({pruned_sz} bytes) should be well under half the un-pruned \
+         one ({full_sz} bytes) — `internalize,globaldce` did not drop the dead runtime \
+         (D-0149 pruning regressed)"
     );
 }

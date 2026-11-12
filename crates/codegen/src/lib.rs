@@ -448,6 +448,18 @@ pub fn build_executable(
     // (off) because the merge+`-O2` is slower than the object link and, unlike
     // it, is not yet the long-exercised default. See DECISIONS.md.
     let lto = std::env::var_os("ZAP_LTO").is_some();
+    // Under LTO, strip the dead runtime at link time (`-ffunction-sections` +
+    // `--gc-sections`): the WHOLE runtime (zaprt.c — http/json/crypto/regex/…)
+    // is merged into every program, but the linker can drop the functions no
+    // program path reaches, so a program that uses only `dict`+`print` links a
+    // fraction of it — a much smaller binary, which also cuts exec/page-in time
+    // (e.g. AWS Lambda cold start). This is sound because it never re-optimizes:
+    // `opt -O2` ran with the runtime at external linkage, so threaded codegen is
+    // unchanged (IR-level `internalize`+`globaldce` before `-O2` would instead
+    // let the optimizer treat scheduler/GC/race globals as private and miscompile
+    // the concurrent runtime — rejected). `ZAP_LTO_NO_PRUNE` keeps the whole
+    // runtime (and restores `-rdynamic` profiler visibility). Default ON for LTO.
+    let prune = lto && std::env::var_os("ZAP_LTO_NO_PRUNE").is_none();
     // The program artifact handed to the linker driver: a native object on the
     // default path, LLVM bitcode under LTO so the cross-module inliner sees it.
     let prog_path = out_path.with_extension(if lto { "bc" } else { "o" });
@@ -562,6 +574,19 @@ pub fn build_executable(
         //    re-run the IR optimizer, so the inlining must happen here.) clang
         //    below then only codegens + links the already-optimized module.
         //    `$ZAP_OPT` overrides the tool (CI pins the LLVM 18 `opt`).
+        //
+        //    NOTE on dead-runtime removal: the WHOLE runtime (zaprt.c —
+        //    http/json/crypto/regex/…) is merged into every program, and a
+        //    single-module `-O2` can NOT drop the unused parts (they have
+        //    external linkage, so they are not provably dead). We deliberately
+        //    do NOT prune here with `internalize` + `globaldce`: internalizing
+        //    the runtime before `-O2` lets the optimizer treat the scheduler /
+        //    GC / race-detector globals as unobservable and hoist or cache loads
+        //    another thread mutates, which miscompiles the concurrent runtime
+        //    (false `--race` reports and hangs). Instead the dead runtime is
+        //    stripped soundly at LINK time via `-ffunction-sections` +
+        //    `--gc-sections` (see the link step), which never re-optimizes, so
+        //    codegen for live code — and the threaded runtime — is unchanged.
         let opt = std::env::var("ZAP_OPT").unwrap_or_else(|_| "opt".to_string());
         let merged_opt = build_dir.join("merged.opt.bc");
         let status = Command::new(&opt)
@@ -607,6 +632,17 @@ pub fn build_executable(
         // safepoint. `crates/driver/tests/lto.rs` asserts the hot `d[k]` fast
         // path inlines while that call survives.
         cmd.arg("-O2");
+        // Strip the dead runtime at link time (see `prune` above). Emit one
+        // section per function/datum so the linker's `--gc-sections` can drop
+        // the ones no retained section references (roots: `main`, the GC's
+        // `.init_array` constructors, anything address-taken). Sound — no
+        // re-optimization — so the threaded runtime's codegen is unchanged.
+        // Not on Windows (PE/COFF link; the port is still stubbed).
+        if prune && !is_windows {
+            cmd.arg("-ffunction-sections")
+                .arg("-fdata-sections")
+                .arg("-Wl,--gc-sections");
+        }
     } else {
         // Default path: compile the runtime source as its own translation unit
         // alongside the already-codegen'd program object, so runtime calls stay
@@ -741,8 +777,15 @@ pub fn build_executable(
         // pointers) and preserves the "zero-cost when profiling is unused"
         // property — nothing runs until a SIGUSR2 / ZAP_PROFILE toggle. On the
         // fault-handler backtrace (ticket #77) it is a bonus: crash reports now
-        // carry symbol names too.
-        cmd.arg("-rdynamic");
+        // carry symbol names too. Skipped under LTO pruning: `-rdynamic` exports
+        // every global symbol to `.dynsym`, which anchors it as a `--gc-sections`
+        // root and would defeat the dead-runtime strip. The profiler/fault
+        // symbolication of Zap names is a dev feature, deliberately traded away
+        // in a pruned (size-optimized) LTO build, exactly as the portable/static
+        // profile already does.
+        if !prune {
+            cmd.arg("-rdynamic");
+        }
         // CPython embedding flags (ticket #27, D-0012): the `-I...` cflags let
         // `zaprt.c` find `<Python.h>`, and the libs link libpython. Discovered
         // with `pkg-config` (the dev container / CI provide `python3-dev` +

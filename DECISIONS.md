@@ -7338,7 +7338,55 @@ the default object-link build: re-linking every program under `opt -O2` added
 minutes per leg for no extra coverage, and the slice above exercises the
 LTO-specific surface (inlining, GC/safepoints, exception unwinding).
 
-## D-0150 — Escape analysis: stack-allocate non-escaping leaf values (#839)
+## D-0150 — LTO strips the dead runtime at link time (`--gc-sections`), not by IR internalize (#841)
+
+**Context.** The `ZAP_LTO` build (D-0149) merges the WHOLE C runtime (`zaprt.c`
+— http/json/crypto/regex/yaml/…) into every program so the cross-module inliner
+can pull the hot fast paths in. But a single-module `opt -O2` cannot then DROP
+the parts a given program never calls: the runtime functions have external
+linkage, so they are not provably dead, and the linker keeps them. Result: even
+a `dict`+`print` program linked an LTO binary carrying the entire runtime —
+measured **430 KB**. Smaller binaries matter beyond disk: less to `mmap`/page in
+at `exec`, which cuts cold-start latency (e.g. the AWS `provided.al2023` Lambda
+base, where the portable profile already targets startup, D-0082).
+
+**Decision.** Under LTO (default; opt out with `ZAP_LTO_NO_PRUNE`), compile the
+merged module with `-ffunction-sections -fdata-sections` and link with
+`-Wl,--gc-sections`, and DROP `-rdynamic`. The linker then garbage-collects
+every function/datum section no retained section references — roots are `main`,
+the GC's `.init_array` constructors, and anything address-taken — so the dead
+runtime never reaches the binary. `dict_word_count` fell **430 KB → 76 KB
+(5.7×)**; both binaries produce identical output. `-rdynamic` is dropped because
+it exports every global to `.dynsym`, anchoring it as a GC root and defeating the
+strip; this trades away the profiler/fault symbolication of Zap function names
+(#78/#77) in a pruned build, exactly as the portable/static profile already does
+(D-0082) — `ZAP_LTO_NO_PRUNE` restores both the full runtime and `-rdynamic`.
+
+**Why not prune in IR (`internalize` + `globaldce`) before `-O2`.** That would
+also cut per-program *optimize* time (opt sees a smaller module: measured ~6×)
+and shrink further (~8×). It was implemented, then **rejected**: internalizing
+the runtime flips its scheduler / GC / race-detector globals to internal
+linkage, and `-O2` then assumes nothing outside the module observes them and
+hoists/caches loads another thread mutates. The full golden corpus under LTO
+caught the miscompile — clean `--race` fixtures reported false races (exit 66)
+and concurrent goldens hung. Link-time `--gc-sections` is **sound** because it
+never re-optimizes: `opt -O2` runs with the runtime at external linkage, so
+codegen for live code — and the threaded runtime — is byte-for-byte what it was.
+The size win is kept; cutting per-program *optimize* time soundly needs true
+ThinLTO (import only referenced functions) and is a separate future item — the
+acute CI cost is already handled by the scoped `ZAP_GOLDEN_ONLY` LTO step
+(D-0149), so optimize time now only affects per-program builds under a future
+default-LTO flip.
+
+**Tests.** `crates/driver/tests/lto.rs` gains
+`lto_pruning_drops_dead_runtime_and_shrinks_binary`: it builds the hot-dict
+fixture under LTO and under `ZAP_LTO_NO_PRUNE` and asserts the pruned binary is
+well under half the un-pruned one (measured ~5.7×; a conservative 2× bound keeps
+it non-flaky). The existing inline/`noinline` guard still passes (pruning does
+not touch optimization), and CI's scoped golden slice runs under `ZAP_LTO=1` on
+both collectors.
+
+## D-0151 — Escape analysis: stack-allocate non-escaping leaf values (#839)
 
 **Status:** Accepted. **Relates:** D-0143/D-0144 (#568 frame-skip & inlined
 safepoint), #838 (one-object `ZapStr`), #663/#672 (precise Immix static roots),
@@ -7384,16 +7432,15 @@ than growable goroutine stacks.
 **GC safety (moving Immix).** A stack slot is never relocated by the collector.
 A `StackStruct` holds no outgoing heap pointers, so it is excluded from the
 shadow-frame roots (keeping the D-0144 frame-skip) — sound because the value does
-not escape (nothing live is reachable only through it) and there is no interior
-root to miss. A stack `StrBuild` keeps its ordinary direct-root slot, because it
-may **spill to a heap string** at run time when the join exceeds the inline
-buffer, and that spill must be a precise root (rooting the stack-buffer case is
-harmless — the collector validates each root against the heap-block registry and
-ignores a stack pointer). Safe across a GC safepoint (allocation never collects;
-at a safepoint the slot is live, unmoved) and across a `spawn`/`scope` boundary (a
-spawned/scoped argument has escaped, so a stack object never leaves its
-coroutine's own stack). `is` identity is preserved (distinct allocation ⇒ distinct
-stable stack address).
+not escape and there is no interior root to miss. A stack `StrBuild` keeps its
+ordinary direct-root slot, because it may **spill to a heap string** at run time
+when the join exceeds the inline buffer, and that spill must be a precise root
+(rooting the stack-buffer case is harmless — the collector validates each root
+against the heap-block registry and ignores a stack pointer). Every ZIR node that
+defines a pointer value is registered in codegen's `inst_dest` so its result is
+rooted at the def site. Safe across a GC safepoint and across a `spawn`/`scope`
+boundary (a spawned/scoped argument has escaped). `is` identity is preserved
+(distinct allocation ⇒ distinct stable stack address).
 
 **Deferred.** Pointer-holding non-escaping structs (v2 — require the precise
 static-root scanner, #663/#672, extended to scan a stack object's interior heap
@@ -7401,11 +7448,9 @@ fields as roots). Finalizable objects (#92 — today only `Ty::Py`, itself a
 pointer) stay permanently heap. A `readline`-style reader-cooperation ABI for
 line-by-line file reads (v1.1).
 
-**Verification.** ZIR-level assertions both directions (non-escaping leaf struct
-/ transient f-string → `StackStruct` / stack `StrBuild`; a returned / stored /
-inserted / oversized sibling stays heap); a dual-collector golden
+**Verification.** ZIR-level assertions both directions; a dual-collector golden
 (`escape_stack_promote_gc`) keeping a stack struct and a transient f-string key
 correct across forced `gc.collect()` under churn (contents only, never heap
-bytes); the `fstring_only` / `dict_string` perf benches (#568 harness). No
-`GRAMMAR.ebnf` change — escape analysis is invisible to syntax and to observable
-semantics.
+bytes); the `fstring_only` / `dict_string` perf benches (#568 harness). Verified
+on an LLVM-18 host under both collectors. No `GRAMMAR.ebnf` change — escape
+analysis is invisible to syntax and to observable semantics.

@@ -25,7 +25,7 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
-- **Escape analysis — stack-allocate non-escaping leaf values** (#839, D-0150).
+- **Escape analysis — stack-allocate non-escaping leaf values** (#839, D-0151).
   A conservative ZIR pass lowers a `StructNew` or transient f-string whose value
   provably does not escape its function, and which is leaf / pointer-free /
   finalizer-free, to a stack allocation instead of the GC heap: a non-escaping
@@ -37,6 +37,20 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   near-zero GC risk — stack slots are never relocated and hold no heap pointers.
   Pointer-holding structs and finalizable values stay on the heap. Invisible to
   the language (no grammar/semantic change).
+- **LTO builds strip the dead runtime — binaries ~5.7× smaller** (#841, D-0150).
+  The whole C runtime (http/json/crypto/regex/…) is merged into every `ZAP_LTO`
+  program so the fast paths can inline, but a single-module `opt -O2` cannot drop
+  the parts a program never calls, so the binary carried the entire runtime
+  (`dict_word_count` = 430 KB). The LTO link now emits `-ffunction-sections
+  -fdata-sections`, links with `-Wl,--gc-sections`, and drops `-rdynamic` (which
+  would anchor every symbol): the linker garbage-collects the unreachable
+  runtime, taking `dict_word_count` to **76 KB**. Smaller binaries also page in
+  faster at `exec` (e.g. AWS Lambda cold start). Sound by construction — it
+  strips at link, never re-optimizes, so threaded codegen is unchanged; an
+  IR-level `internalize`+`globaldce` prune was rejected because it miscompiles
+  the concurrent runtime (false `--race` reports + hangs). `ZAP_LTO_NO_PRUNE`
+  keeps the full runtime (and `-rdynamic` profiler symbol visibility). Guarded by
+  `crates/driver/tests/lto.rs`.
 - **`ConcurrentSet[K]` and `ConcurrentStack[T]` — lock-free concurrent set +
   stack** (#184, D-0148). `ConcurrentSet[K: Hashable]` (`new_concurrent_set`;
   `add`/`contains`/`remove`/`length`) is a membership wrapper over
