@@ -2078,20 +2078,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // reading it from a root slot or straight from the register is the same
         // pointer.
         let mut is_alloca_dest = vec![false; f.value_types.len()];
-        // A stack-promoted allocation (#839) — `StackStruct`, or a `StrBuild` the
-        // escape pass marked `stack` — is a stack-slot address holding no outgoing
-        // heap pointers. Like an `Alloca` dest it is never a heap reference, so it
-        // needs no direct root slot; excluding it keeps the #568/D-0144 frame-skip
-        // (a function whose only "allocations" are stack-promoted stays frameless)
-        // and is sound — the collector ignores a stack pointer anyway.
+        // A stack-promoted `StackStruct` (#839) is a stack-slot address holding no
+        // outgoing heap pointers. Like an `Alloca` dest it is never a heap
+        // reference, so it needs no direct root slot; excluding it keeps the
+        // #568/D-0144 frame-skip (a function whose only "allocations" are
+        // stack-promoted structs stays frameless) and is sound — the collector
+        // ignores a stack pointer anyway. A stack `StrBuild` is NOT excluded: it
+        // may spill to a *heap* string at run time when the join exceeds the
+        // inline buffer, and that spill must be a precise GC root, so it keeps its
+        // ordinary direct-root slot (rooting the stack-buffer case is harmless —
+        // the collector validates each root against the heap-block registry).
         let mut is_stack_dest = vec![false; f.value_types.len()];
         for inst in f.blocks.iter().flat_map(|block| &block.insts) {
             match inst {
                 Inst::Alloca { dest, .. } => is_alloca_dest[*dest as usize] = true,
                 Inst::StackStruct { dest, .. } => is_stack_dest[*dest as usize] = true,
-                Inst::StrBuild {
-                    dest, stack: true, ..
-                } => is_stack_dest[*dest as usize] = true,
                 _ => {}
             }
         }
@@ -3231,9 +3232,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 let n = parts.len();
                 let arr_ty = p.array_type(n as u32);
                 let arr = self.entry_alloca(arr_ty.into(), "strparts")?;
-                let zero = i64t.const_zero();
+                // Index the `[n x ptr]` array with i32 indices, matching the
+                // proven GC-roots GEP (an array index wants the aggregate's own
+                // index width, not the i64 pointer width).
+                let i32t = self.ctx.i32_type();
+                let zero = i32t.const_zero();
                 for (i, pv) in parts.iter().enumerate() {
-                    let idx = i64t.const_int(i as u64, false);
+                    let idx = i32t.const_int(i as u64, false);
                     let ep = unsafe {
                         b.build_in_bounds_gep(arr_ty, arr, &[zero, idx], "strpart")
                             .map_err(|e| e.to_string())?
