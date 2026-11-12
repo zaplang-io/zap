@@ -216,26 +216,46 @@ jobs:
   # is unchanged (the per-leg check runs just gain a `(gc-immix)`/`(gc-boehm)`
   # suffix).
   #
-  # NOTE (container follow-up): the prebuilt ghcr.io/zaplang-io/zap image is the
-  # SLIM runtime stage of the root Dockerfile (just the `zap` CLI + a C link
-  # toolchain — "No Rust, no LLVM dev libraries", see docs/DOCKER.md), published
-  # for downstream package repos to run `zap test`. It cannot build the
-  # LLVM-linked compiler from source, which is what this job does, so the apt
-  # step below stays. Using a container here would require publishing the
-  # Dockerfile's *builder* stage as its own image (a docker.yml change, out of
-  # scope for this PR).
+  # Runs INSIDE the prebuilt CI toolchain image (ghcr.io/zaplang-io/zap-ci,
+  # issue #854 / CI_DOCKER_IMAGES/) — the LLVM 18 + Rust + C-dep build
+  # environment is already baked, so this leg no longer installs LLVM and the C
+  # headers from third-party mirrors on every job. Those per-job apt.llvm.org
+  # fetches were slow and the dominant source of CI *hangs* (a job stalled
+  # mid-download and wedged the run); the only network step left is the image
+  # pull from GitHub's own registry/CDN. The image mirrors
+  # .devcontainer/Dockerfile exactly, so this builds in the dev environment.
+  #
+  # Pinned to `:latest` per the request; a `:sha-<short>` provenance tag also
+  # exists if we later want to pin this leg to an exact image. The x86_64-only
+  # image does not serve `arm64` (aarch64) below, and the `host` leg stays on
+  # the bare runner on purpose (it proves the default members build WITHOUT
+  # LLVM and installs no LLVM/C deps, so it is not a hang source).
   full:
     name: full (LLVM 18 + codegen)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # Authenticate the image pull with the repo GITHUB_TOKEN so the leg works
+    # even while the GHCR package is private (it is owned by this repo's org, so
+    # `packages: read` can pull it). If the maintainer makes zap-ci public — like
+    # the runtime image (#277) — the `credentials:` block becomes optional and
+    # fork PRs can pull it too.
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/zaplang-io/zap-ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     strategy:
       # Run both collectors concurrently; don't cancel one leg if the other fails.
       fail-fast: false
       matrix:
         gc: [gc-immix, gc-boehm]
     env:
-      # Where llvm-sys / inkwell (llvm18-0) find LLVM 18. Matches the Dockerfile.
+      # Where llvm-sys / inkwell (llvm18-0) find LLVM 18. Also baked into the
+      # image env; set here too so the leg is explicit and matches `arm64`.
       LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
       LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
       # Link Rust's own binaries with mold (ticket #128): a fraction of GNU ld's
@@ -245,35 +265,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Same LLVM 18 toolchain and system libraries llvm-sys links against as
-      # .devcontainer/Dockerfile, plus mold (the link-step linker, see env
-      # above). (build-essential, curl and git are already on the runner.)
-      - name: Install LLVM 18 and system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            llvm-18 \
-            llvm-18-dev \
-            libpolly-18-dev \
-            clang-18 \
-            libclang-18-dev \
-            libgc-dev \
-            libpcre2-dev \
-            python3-dev \
-            pkg-config \
-            zlib1g-dev \
-            libzstd-dev \
-            libffi-dev \
-            libedit-dev \
-            libxml2-dev \
-            libncurses-dev \
-            mold
-
-      - name: Install pinned Rust toolchain
-        run: |
-          rustup toolchain install
-          rustup component add clippy rustfmt
-
+      # No LLVM / C-dep install and no `rustup` here: the toolchain image already
+      # carries LLVM 18, mold, the C `-dev` libraries and Rust 1.99.1 (+ clippy,
+      # rustfmt). See CI_DOCKER_IMAGES/README.md.
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
         with:
@@ -329,10 +323,10 @@ jobs:
   # `cargo` runs, halving this job's wall-clock. Clippy/fmt stay on x86 (`host`
   # and `full` already gate them; they are target-independent).
   #
-  # No container here: the prebuilt ghcr.io/zaplang-io/zap image is amd64-only
-  # (docker.yml's build-push sets no `platforms:`) AND is the slim runtime image
-  # that cannot build the compiler from source (see the `full` header), so the
-  # apt install stays. A multi-arch *builder* image would be a future follow-up.
+  # No container here: the CI toolchain image (ghcr.io/zaplang-io/zap-ci) the
+  # `full` leg runs in is x86_64-only (#854 is Linux x86_64 scoped), so it cannot
+  # serve this aarch64 leg — the apt install stays. A multi-arch *builder* image
+  # is a future follow-up.
   arm64:
     name: arm64 (aarch64 Linux + codegen)
     needs: changes
