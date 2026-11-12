@@ -7911,3 +7911,93 @@ recompiling and runs identically; a changed compile input busts the key).
 
 **No grammar or ABI change.** `--debug` is a build flag, invisible to syntax and
 to observable semantics; `GRAMMAR.ebnf` and `design/RUNTIME-ABI.md` are unchanged.
+
+## D-0158 — Scope-bound, non-moving, escape-checked arena / region allocation (#553)
+
+**Status:** Accepted (design; implementation follows review). **Relates:**
+D-0151 (#839/#850 escape analysis — this is its compile-time dual), D-0127 /
+`docs/design/gc-immixpp.md` (#714 region-policy model + pinned/non-moving "(FFI
+arena)" region tag), `docs/design/c-ffi.md` (§2 pin/root rules, §5 lifetimes, §9
+allocator strategy, Appendix A), #539 (C FFI epic), #544 (FFI-4 pin across a
+section), #551 (FFI-11 segregated C arena). **Discussion:** zaplang-io/zap #871
+(design debate & rationale). **Doc:** `docs/design/arena.md` (authoritative
+spec). **Gate:** the OPEN-QUESTIONS deferral ("revisit after precise GC lands")
+is satisfied by I#116/I#120.
+
+A **scope-bound, non-moving, escape-checked arena**: a lexical block inside which
+leaf objects are bump-allocated from the GC's own region pool and freed as a unit
+at block exit — never by the collector. The principled primitive behind "pin a
+buffer across a C section" (#544) and the segregated C arena (#551), and an
+accelerant for the FFI epic (#539).
+
+**Decisions (v1).**
+
+1. **Surface.** `with arena(size=?, cap=?) as a:` — reuses the existing `with`
+   context-manager grammar (#185), no new keyword, rejects reusing `scope:`
+   (that is a concurrency-lifetime axis; arena is an allocation-lifetime axis,
+   kept orthogonal). Allocation is explicit and handle-targeted (`a.alloc(T, n)`
+   / `a.new(T, …)`), never ambient. No manual `alloc`/`free`, no `a.extend`.
+2. **`with`-head only.** A detached `arena()` (`a = arena()`, returned, stored)
+   is a **compile error** — a detached arena has no bounding scope, so its
+   regions would leak or be reclaimed nondeterministically, defeating the
+   deterministic-free guarantee. Enforced statically at construction (a targeted
+   sema rule), not left to the escape checker or documentation.
+3. **Sizing / growth.** `size` = initial-reservation hint, rounded up to the GC
+   region granularity (32 KB block), default one region; `cap` = hard byte
+   ceiling, raises `MemoryError` past it, default unbounded. Growth is automatic
+   in region units (no manual extend); a >region allocation is a humongous
+   contiguous run.
+4. **Escape rule = the compile-time dual of D-0151.** A value region-bound to `a`
+   may not outlive `a`'s block (return / store into a longer-lived slot / closure
+   capture / interface box / `spawn`/`scope:` crossing). Reuses D-0151's escape
+   lattice (`crates/ir/src/escape.rs`); changes the boundary from function to
+   arena block and **inverts the consequence** — an escape is a hard compile
+   error, never the D-0151 heap fallback (there is no safe fallback: the memory
+   is gone at block exit). Ambiguity fails safe to *reject*.
+5. **Reach (v1): intra-function only.** Arena values may be passed only to the
+   proven-non-retaining allowlist D-0151 keeps; the one carve-out is a C `extern`
+   call, which **borrows** the pointer for the call's duration (allowed — the
+   arena guarantees non-move). C retaining a pointer past the call/block is NOT
+   statically caught: it is the existing `c-ffi.md` §2.2 programmer contract
+   (use a rooted handle for retained pointers), the single documented sharp edge.
+6. **Leaf-only objects (v1).** Arena objects must be pointer-free (`bytes`,
+   scalar `@repr(c)` structs, numeric arrays) — the D-0151 v1 restriction. This
+   erases outgoing-pointer tracing and the `arena → young` write-barrier coupling
+   to #714, while still covering FFI buffers *and* index-linked arena-local data
+   structures (links expressed as scalar indices into the arena, not GC
+   pointers).
+7. **Coroutine-local.** Bump pointer unshared, handle not `@shareable` (D-0113),
+   `spawn`/`scope:` crossing is an escape (free from decision 4). Parallel
+   allocation is a deferred need, to be served by per-worker sub-arenas, not a
+   shared atomic cursor.
+8. **Block-scoped free only.** No `a.reset()` in v1; loop reuse uses the
+   nested-`with`-block idiom.
+
+**GC soundness (precise moving Immix, D-0151/D-0127).** The arena is served from
+the GC region pool and tagged pinned/non-moving (gc-immixpp §4), so arena objects
+never evacuate (the evacuator's existing mark-in-place set, c-ffi §2.2 Rule 1).
+Bulk free returns the regions to the pool as a unit; the collector never reclaims
+arena objects (they are live-by-scope, and C may hold invisible pointers).
+`heap → arena` surviving the block is precisely an escape and is forbidden by
+decision 4 — that static rule is what makes the bulk free sound. `arena → heap`
+cannot exist under leaf-only (decision 6), so the collector never traces out of
+the arena and the §8 generational barrier is not involved. On today's Phase-0 STW
+collector every root is rescanned each cycle, so there is no missed-edge hazard.
+
+**Sequencing.** #553 is **not** on the #714 critical path. Leaf-only v1 needs from
+#714 only a region-lifecycle API (tag pinned/non-moving, claim/bulk-return from
+the fungible pool) — a subset of the region-tag model, no generational barrier —
+so it lands on today's Immix as the first consumer of that model, co-designing
+the API. Pointerful arena objects (v2) are the only piece that waits for #714's
+generational write-barrier.
+
+**Deferred** (each gated on need): a `@noescape` parameter annotation (D-0089
+surface) to thread arena values through Zap helpers — verified in the callee,
+visible in the signature, preferred over inferred interprocedural non-retention;
+pointerful arena objects (v2, behind #714 §8); per-worker sub-arenas for parallel
+allocation; `a.reset()` mid-block recycle; arena-local typed collections
+(`arena_dict()` etc.).
+
+**No grammar change.** `with` (#185) and inline parameter annotations (#458 /
+D-0089) already exist; the `with`-head-only constraint on `arena()` is a sema
+rule, not a grammar production. `GRAMMAR.ebnf` is unchanged.

@@ -93,6 +93,10 @@ Once the IR schema and runtime ABI are frozen, these run concurrently:
 - Formatter, LSP, package tooling.
 - C FFI (`extern "C"`) — generalizes interop to all languages, incl. Go via
   `c-shared`.
+- Arena / region allocation — scope-bound, non-moving, escape-checked (FFI
+  accelerant, #553). Design is `D-0158` /
+  [`docs/design/arena.md`](docs/design/arena.md); leaf-only v1 lands on today's
+  Immix as the first consumer of the #714 region-tag model.
 
 ---
 
