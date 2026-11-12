@@ -15,6 +15,7 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module as LlvmModule;
+use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine,
 };
@@ -66,10 +67,84 @@ impl Backend for LlvmBackend {
         let ctx = Context::create();
         let builder = ctx.create_builder();
         let (llmod, tm) = build_llvm_module(&ctx, &builder, module, "zap", false, race)?;
+        // Run the LLVM middle-end optimization pipeline BEFORE object emission
+        // (I#857, D-0152). `write_to_file` is `llc`-equivalent — it runs the
+        // backend (isel/regalloc/sched) but NOT the IR transform passes
+        // (`mem2reg`/SROA, instcombine, GVN, LICM, …), which live in the
+        // middle-end `opt` pipeline. Without them every local stays in its
+        // `alloca` stack slot and tight loops round-trip `i`/`s` to memory each
+        // iteration (~6× slower than Go). This is the normal (non-LTO) native
+        // build path; the LTO path (`compile_bitcode`, D-0149/D-0150) runs
+        // `opt -O2` on the merged module instead, so neither path double-opts.
+        run_opt_pipeline(&llmod, &tm)?;
         tm.write_to_file(&llmod, FileType::Object, obj_path)
             .map_err(|e| format!("failed to write object file: {}", e.to_string()))?;
         Ok(())
     }
+}
+
+/// The new-pass-manager pipeline string for the normal (non-LTO) native build
+/// (I#857). `default<O2>` is the full middle-end pipeline at `-O2` — the same
+/// pipeline the LTO path already runs on its merged module (D-0149) and the same
+/// one the target backend expects to have run before codegen. Overridable with
+/// `$ZAP_OPT_LEVEL` (`0`/`1`/`2`/`3`/`s`/`z`) for A/B measurement and bisection;
+/// anything unrecognised falls back to `-O2`.
+fn opt_pipeline_spec() -> &'static str {
+    match std::env::var("ZAP_OPT_LEVEL").as_deref() {
+        Ok("0") => "default<O0>",
+        Ok("1") => "default<O1>",
+        Ok("3") => "default<O3>",
+        Ok("s") => "default<Os>",
+        Ok("z") => "default<Oz>",
+        // "2" and everything else (including unset): the default.
+        _ => "default<O2>",
+    }
+}
+
+/// Run the LLVM middle-end optimization pipeline on `llmod` in place, before the
+/// target backend emits the object (I#857, D-0152).
+///
+/// ## Why this is safe under the precise-Immix moving GC (D-0144)
+///
+/// The optimizer must not break the invariants the collector relies on; it does
+/// not, and the same `-O2` already runs over generated code on the LTO path
+/// (D-0149), where the GC / `--race` / preemption goldens are green:
+///
+/// * **Shadow-stack root stores survive.** The frame alloca is address-taken via
+///   `*zap_shadow_head = &frame` (it escapes to an external function), so
+///   `mem2reg`/SROA cannot promote it to a register and the per-root stores are
+///   not dead — a collection walking the shadow stack still finds every root.
+/// * **Safepoint polls are not hoisted, reordered or deleted.** Each poll loads
+///   `zap_gc_wanted`/`zap_collecting`/`zap_preempt_any` with **volatile** loads
+///   (see [`Cg::gc_safepoint`]); LICM cannot hoist a volatile access out of the
+///   loop and DCE cannot drop it, and a volatile memory op also keeps the loop
+///   itself from being deleted (so a tight GC-free loop still polls every
+///   iteration — the `*preempt*` / `gc_*_stress` goldens stay live). The cold
+///   slow path's `zap_safepoint` is an opaque external call, never eliminated.
+/// * GC-pointer values stay reloaded from their root cells across each safepoint
+///   (D-0144 keeps loads un-CSE'd across the opaque poll call), so a moved object
+///   is seen at its new address.
+///
+/// Register promotion of the *non-escaping scalar* locals (`i`, `s`, temporaries)
+/// — which have no GC meaning — is exactly the win: they collapse from stack
+/// slots to SSA registers, and the hot loop stops round-tripping to memory.
+///
+/// `$ZAP_NO_OPT` skips the pipeline entirely (byte-for-byte the pre-#857
+/// behaviour) for bisecting a suspected mis-optimization.
+fn run_opt_pipeline(llmod: &LlvmModule, tm: &TargetMachine) -> Result<(), String> {
+    if std::env::var_os("ZAP_NO_OPT").is_some() {
+        return Ok(());
+    }
+    let passes = opt_pipeline_spec();
+    llmod
+        .run_passes(passes, tm, PassBuilderOptions::create())
+        .map_err(|e| {
+            format!(
+                "optimization pipeline (`{passes}`) failed: {}",
+                e.to_string()
+            )
+        })?;
+    Ok(())
 }
 
 impl LlvmBackend {
@@ -5251,6 +5326,31 @@ mod tests {
         llmod.print_to_string().to_string()
     }
 
+    /// Like [`llvm_ir`], but runs the real middle-end optimization pipeline
+    /// ([`run_opt_pipeline`], the exact code path `compile_object` takes before
+    /// object emission) and returns the optimized IR text. Used by the #857
+    /// register-promotion assertion so the test exercises the shipping pipeline,
+    /// not a hand-rolled pass list.
+    #[cfg(feature = "gc-immix")]
+    fn optimized_llvm_ir(src: &str) -> String {
+        let (ast, perrs, lerrs) = parse_str(src);
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        let ctx = Context::create();
+        let builder = ctx.create_builder();
+        // Reuse the production module builder (which lowers to ZIR internally) so
+        // the IR, data layout and triple match exactly what `compile_object`
+        // optimizes.
+        let (llmod, tm) =
+            build_llvm_module(&ctx, &builder, &ast, "test", false, false).expect("build module");
+        run_opt_pipeline(&llmod, &tm).expect("opt pipeline");
+        llmod
+            .verify()
+            .map_err(|e| e.to_string())
+            .expect("valid optimized LLVM module");
+        llmod.print_to_string().to_string()
+    }
+
     // The payoff of ticket #24: element-wise array arithmetic must lower to
     // explicit LLVM vector instructions (SIMD), not a scalar loop.
     #[test]
@@ -5481,6 +5581,101 @@ mod tests {
         assert!(
             build.contains("@zap_gc_wanted"),
             "a GC-using function still uses the inlined safepoint poll:\n{build}"
+        );
+    }
+
+    // ---- #857 (D-0152): middle-end opt pipeline promotes loop locals ---------
+    //
+    // These guard the ONE structural fix of #857: `compile_object` now runs the
+    // `default<O2>` middle-end pipeline before the backend emits the object, so
+    // loop/temporary locals are register-promoted instead of round-tripping to
+    // their `alloca` stack slot every iteration (the ~6×-slower-than-Go defect
+    // the issue disassembled). IR-text assertions — deterministic and machine-
+    // independent, per the GC-golden determinism rule; the wall-clock trend lives
+    // in `crates/driver/tests/perf.rs` (`tight_loop`/`fib`).
+
+    /// A GC-free tight loop (`loop_sum`/`fib` shape — the issue's exact evidence).
+    #[cfg(feature = "gc-immix")]
+    const HOT_LOOP_SRC: &str =
+        "def spin(int64 n) -> int64:\n    int64 i = 0\n    int64 s = 0\n    \
+         while i < n:\n        s = s + i\n        i = i + 1\n    \
+         return s\n\
+         def main():\n    print(spin(30000000))\n";
+
+    // WRITTEN FIRST (reproduces the defect): the RAW translation — what the
+    // backend used to receive straight from `write_to_file` — keeps `i` and `s`
+    // in `alloca` stack slots with a per-iteration load + store. This is the
+    // `0x8(%rsp)`/`0x10(%rsp)` round-trip the issue's `objdump` showed.
+    #[cfg(feature = "gc-immix")]
+    #[test]
+    fn unoptimized_hot_loop_keeps_locals_on_the_stack() {
+        let spin = one_fn_ir(&llvm_ir(HOT_LOOP_SRC), "spin");
+        assert!(
+            spin.contains("alloca i64"),
+            "pre-opt, the loop counter/accumulator must live in alloca stack slots \
+             (the #857 defect this fix removes):\n{spin}"
+        );
+        // No SSA phi before the pipeline runs — the value flows through memory.
+        assert!(
+            !spin.contains("phi i64"),
+            "pre-opt IR should carry no register phi for the loop locals:\n{spin}"
+        );
+    }
+
+    // THE FIX: after the `default<O2>` pipeline, `spin`'s loop locals are
+    // promoted to SSA registers (phi nodes) and the hot function keeps nothing in
+    // an `alloca` — the loop no longer touches the stack per iteration. The loop
+    // ITSELF survives because its back-edge safepoint poll is a volatile access
+    // (gc-immix): the test is about promotion, not loop deletion. (User functions
+    // are external in the AOT path, so `spin` survives the pipeline standalone
+    // even if also inlined into `main`.)
+    #[cfg(feature = "gc-immix")]
+    #[test]
+    fn opt_pipeline_promotes_hot_loop_locals_to_registers() {
+        let ir = optimized_llvm_ir(HOT_LOOP_SRC);
+        let spin = one_fn_ir(&ir, "spin");
+        // The back-edge safepoint poll is preserved (volatile loads => the loop is
+        // not deleted and still polls every iteration).
+        assert!(
+            spin.contains("@zap_gc_wanted"),
+            "O2 must preserve the back-edge safepoint poll (GC/preemption liveness):\n{spin}"
+        );
+        // Register promotion happened: the induction variable is now an SSA phi...
+        assert!(
+            spin.contains("phi i64"),
+            "the loop induction/accumulator must be promoted to an SSA phi by O2:\n{spin}"
+        );
+        // ...and the GC-free hot function keeps NO scalar stack slot — no
+        // per-iteration reload/store of `i`/`s` (the register-only hot loop the
+        // issue's acceptance criterion asks for).
+        assert!(
+            !spin.contains("alloca"),
+            "a GC-free hot loop must keep its locals in registers, not allocas, after O2:\n{spin}"
+        );
+    }
+
+    // Regression guard: optimization must NOT weaken the GC frame of a function
+    // that holds a managed reference. The shadow-frame alloca escapes via
+    // `*zap_shadow_head = &frame`, so O2 cannot promote it away — the root stores
+    // survive and a collection still finds every root (D-0144 under O2).
+    #[cfg(feature = "gc-immix")]
+    #[test]
+    fn opt_pipeline_preserves_gc_frame_root_stores() {
+        let ir = optimized_llvm_ir(
+            "def build(int64 n) -> int64:\n    list[int64] xs = []\n    xs.append(n)\n    \
+             xs.append(n + 1)\n    return len(xs)\n\
+             def main():\n    print(build(3))\n",
+        );
+        let build = one_fn_ir(&ir, "build");
+        // The shadow frame is still linked (the head push/pop helper is called)
+        // and still stored to — the escaping alloca was not optimized away.
+        assert!(
+            build.contains("zap_shadow_head_addr"),
+            "O2 must keep the shadow frame of a GC-using function (roots stay tracked):\n{build}"
+        );
+        assert!(
+            build.contains("store ptr"),
+            "the escaping shadow-frame/root stores must survive O2:\n{build}"
         );
     }
 }
