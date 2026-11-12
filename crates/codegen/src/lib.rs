@@ -1388,6 +1388,34 @@ fn width_mask(width: u32) -> u64 {
 /// GC-pointer-typed definition at its definition site; see I#167). Non-pointer
 /// dests are filtered out downstream by their absent root slot.
 #[cfg(feature = "gc-immix")]
+/// A hot dict runtime op whose first-probe fast path codegen open-codes inline as
+/// LLVM IR, falling back to the C runtime on the cold path (I#842, D-0158).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DictOp {
+    Get,
+    Set,
+}
+
+/// Classify a runtime call symbol for open-coding (I#842). Returns
+/// `(op, key_is_ptr, val_is_ptr)` for the eight hot `int`/`str`-keyed,
+/// `i64`/`ptr`-valued dict accessors, or `None` for everything else (the `f64`
+/// value and `fn` struct-key variants — D-0047 — stay plain runtime calls: they
+/// are cold and/or must always consult a user `__hash__`/`__eq__`).
+fn opencode_dict_kind(func: &str) -> Option<(DictOp, bool, bool)> {
+    use DictOp::*;
+    Some(match func {
+        "zap_dict_get_i64_i64" => (Get, false, false),
+        "zap_dict_get_i64_ptr" => (Get, false, true),
+        "zap_dict_get_str_i64" => (Get, true, false),
+        "zap_dict_get_str_ptr" => (Get, true, true),
+        "zap_dict_set_i64_i64" => (Set, false, false),
+        "zap_dict_set_i64_ptr" => (Set, false, true),
+        "zap_dict_set_str_i64" => (Set, true, false),
+        "zap_dict_set_str_ptr" => (Set, true, true),
+        _ => return None,
+    })
+}
+
 fn inst_dest(i: &zir::Inst) -> Option<u32> {
     use zir::Inst::*;
     match i {
@@ -3774,6 +3802,507 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         Ok(v.into())
     }
 
+    /// Wrap `cond` in `@llvm.expect.i1(cond, expected)` so the backend lays the
+    /// unlikely edge out of line. Collector-agnostic sibling of [`Cg::expect_false`]
+    /// (which is gc-immix-only); returns `cond` unchanged if the intrinsic is
+    /// unavailable (correctness preserved, only the layout hint is lost). Used by
+    /// the open-coded hot paths (I#842) to hint "fast path taken".
+    fn oc_expect(
+        &self,
+        cond: inkwell::values::IntValue<'ctx>,
+        expected: bool,
+    ) -> Result<inkwell::values::IntValue<'ctx>, String> {
+        let Some(expect) = inkwell::intrinsics::Intrinsic::find("llvm.expect") else {
+            return Ok(cond);
+        };
+        let i1 = self.ctx.bool_type();
+        let Some(decl) = expect.get_declaration(self.module, &[i1.into()]) else {
+            return Ok(cond);
+        };
+        let want = i1.const_int(expected as u64, false);
+        let hinted = self
+            .builder
+            .build_call(decl, &[cond.into(), want.into()], "oc.expect")
+            .map_err(|e| e.to_string())?;
+        Ok(hinted
+            .try_as_basic_value()
+            .left()
+            .expect("llvm.expect returns i1")
+            .into_int_value())
+    }
+
+    /// Inline the splitmix64 finalizer the runtime uses for `int` keys
+    /// (`zap_hash_i64`, zaprt.c). Pure arithmetic — no call, no safepoint — so the
+    /// open-coded `int`-key probe (I#842) computes its slot index with no runtime
+    /// round-trip. MUST stay byte-identical to the C: it is the oracle, and a probe
+    /// that hashed a key differently from the slow path would look in the wrong
+    /// bucket and silently miss a present key.
+    fn oc_splitmix64(
+        &self,
+        k: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, String> {
+        let b = self.builder;
+        let i64t = self.ctx.i64_type();
+        let add = |a, c: u64, n| {
+            b.build_int_add(a, i64t.const_int(c, false), n)
+                .map_err(|e| e.to_string())
+        };
+        let mul = |a, c: u64, n| {
+            b.build_int_mul(a, i64t.const_int(c, false), n)
+                .map_err(|e| e.to_string())
+        };
+        // x = k + 0x9e3779b97f4a7c15
+        let x = add(k, 0x9e37_79b9_7f4a_7c15, "oc.sm.0")?;
+        // x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+        let s = b
+            .build_right_shift(x, i64t.const_int(30, false), false, "oc.sm.s0")
+            .map_err(|e| e.to_string())?;
+        let x = b.build_xor(x, s, "oc.sm.x0").map_err(|e| e.to_string())?;
+        let x = mul(x, 0xbf58_476d_1ce4_e5b9, "oc.sm.m0")?;
+        // x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+        let s = b
+            .build_right_shift(x, i64t.const_int(27, false), false, "oc.sm.s1")
+            .map_err(|e| e.to_string())?;
+        let x = b.build_xor(x, s, "oc.sm.x1").map_err(|e| e.to_string())?;
+        let x = mul(x, 0x94d0_49bb_1331_11eb, "oc.sm.m1")?;
+        // x ^ (x >> 31)
+        let s = b
+            .build_right_shift(x, i64t.const_int(31, false), false, "oc.sm.s2")
+            .map_err(|e| e.to_string())?;
+        b.build_xor(x, s, "oc.sm.h").map_err(|e| e.to_string())
+    }
+
+    /// `zap_tag(h)`: the top 8 hash bits biased out of the reserved sentinels
+    /// (`ZAP_TAG_EMPTY`/`TOMB`), so a real key's tag is always `>= 2` (zaprt.c,
+    /// #840). `t = (uint8)(h >> 56); t < 2 ? t + 2 : t`.
+    fn oc_tag(
+        &self,
+        h: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, String> {
+        let b = self.builder;
+        let i64t = self.ctx.i64_type();
+        let i8t = self.ctx.i8_type();
+        let hi = b
+            .build_right_shift(h, i64t.const_int(56, false), false, "oc.tag.sh")
+            .map_err(|e| e.to_string())?;
+        let t = b
+            .build_int_truncate(hi, i8t, "oc.tag.tr")
+            .map_err(|e| e.to_string())?;
+        let lt2 = b
+            .build_int_compare(IntPredicate::ULT, t, i8t.const_int(2, false), "oc.tag.lt2")
+            .map_err(|e| e.to_string())?;
+        let tp2 = b
+            .build_int_add(t, i8t.const_int(2, false), "oc.tag.p2")
+            .map_err(|e| e.to_string())?;
+        Ok(b.build_select(lt2, tp2, t, "oc.tag")
+            .map_err(|e| e.to_string())?
+            .into_int_value())
+    }
+
+    /// A byte-offset field of the opaque `ZapDict` pointer. The layout codegen
+    /// hardcodes here (`len`@0, `cap`@8, `buf`@16, `key_ptr`@40, `val_ptr`@41) is
+    /// locked by `_Static_assert`s in zaprt.c (I#842): a layout change there breaks
+    /// the build loudly rather than silently miscompiling a probe.
+    fn oc_field_ptr(
+        &self,
+        d: inkwell::values::PointerValue<'ctx>,
+        off: u64,
+        name: &str,
+    ) -> Result<inkwell::values::PointerValue<'ctx>, String> {
+        let i8t = self.ctx.i8_type();
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(i8t, d, &[self.ctx.i64_type().const_int(off, false)], name)
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// Open-code the first-probe fast path of a hot dict `get`/`set` as inline IR
+    /// (Go-style; I#842, D-0158), falling back to the C runtime (`func`) on every
+    /// cold case. Returns `Ok(true)` when it handled the call (fast path + cold
+    /// fallback already emitted and `dest` bound), `Ok(false)` to let the normal
+    /// call path emit a plain `call` (any non-open-codeable op, or the
+    /// `$ZAP_NO_OPENCODE` bisection kill-switch).
+    ///
+    /// ## Why this is correct — the slow path IS the oracle
+    ///
+    /// The cold edge calls the very same exported C function the normal path would
+    /// have (`func`), which recomputes the hash and re-runs the full probe. So the
+    /// inline path only ever *shortcuts* the single case it fully settles — a
+    /// first-probe tag+key identity hit (get / set-overwrite) or a first-probe
+    /// EMPTY insert (set) at or below the load factor — and hands EVERYTHING else
+    /// (misses, collisions, probing, tombstones, resize, str byte-compares,
+    /// user-struct `__eq__`, NaN-key handling) to the C, unchanged. The inline hash
+    /// ([`Cg::oc_splitmix64`]) and tag ([`Cg::oc_tag`]) are byte-identical to the
+    /// runtime's, so the inline probe indexes the same slot the C would; it is thus
+    /// behaviorally identical to the C slow path for every edge the goldens cover.
+    ///
+    /// ## Why this is GC-safe under the precise-Immix moving collector (D-0144)
+    ///
+    /// * **No safepoint inside the fast path.** The only call the fast path makes
+    ///   is the leaf `zap_str_hash` (a pure FNV loop — no allocation, no poll), so
+    ///   no collection can run between loading `d->buf` and the load/store, and the
+    ///   raw region pointers never move mid-probe (the same guarantee the C fast
+    ///   path has). The cold fallback `call func` is a safepoint, but it is the last
+    ///   use of the operands on that edge and re-reads them from the shadow frame.
+    /// * **Rooting is unchanged.** This replaces one `Inst::Call { dest }` with
+    ///   `[fast path | the same cold call]`; a pointer `dest` (a `*_ptr` get result)
+    ///   flows into the identical shadow-frame root slot the `Call` used
+    ///   ([`inst_dest`] already lists `Call`), and the operands are the same values
+    ///   `Call` would root. Nothing new is unrooted.
+    /// * **No write barrier is needed — and none is emitted, matching the C.** The
+    ///   collector is stop-the-world mark/evacuate with a full root re-scan and NO
+    ///   remembered set (`zap_gc_write_barrier` is a reserved no-op; zapgc.inc.c),
+    ///   so a store into the dict's (reachable, precisely-traced) buffer needs no
+    ///   barrier today, exactly as the C `zap_dict_set` emits none. A `set` whose
+    ///   key/value is a GC pointer DOES set `d->key_ptr`/`d->val_ptr` inline (as the
+    ///   C wrapper does) so the `ZAP_TD_DICT` tracer follows those words — skipping
+    ///   that, not a barrier, would be the silent heap bug. When a future
+    ///   generational/incremental mode needs a real barrier it is added to
+    ///   `zap_gc_write_barrier` and to these store sites together (D-0144).
+    fn opencode_hot_call(
+        &self,
+        f: &Func,
+        dest: Option<u32>,
+        func: &str,
+        args: &[u32],
+        vals: &mut [Option<BasicValueEnum<'ctx>>],
+        fv: FunctionValue<'ctx>,
+    ) -> Result<bool, String> {
+        let Some((op, key_ptr, val_ptr)) = opencode_dict_kind(func) else {
+            return Ok(false);
+        };
+        // Bisection kill-switch: emit the plain runtime call (pre-#842 behaviour).
+        if std::env::var_os("ZAP_NO_OPENCODE").is_some() {
+            return Ok(false);
+        }
+        let b = self.builder;
+        let ctx = self.ctx;
+        let i8t = ctx.i8_type();
+        let i64t = ctx.i64_type();
+        let ptrt = ctx.ptr_type(AddressSpace::default());
+        let runtime = *self
+            .fns
+            .get(func)
+            .ok_or_else(|| format!("open-code: runtime fn '{func}' not declared"))?;
+
+        // Reload operands from their shadow-frame slots, exactly like the normal
+        // operand path (`get` in `inst`): a no-op under Boehm. Takes `vals` as a
+        // parameter (not a capture) so `dest` can be written back at the end
+        // without a borrow conflict — the same shape as `get`.
+        let reload = |vals: &[Option<BasicValueEnum<'ctx>>], v: u32| -> BasicValueEnum<'ctx> {
+            self.gc_reload_operand(v, vals[v as usize].expect("operand before def"))
+        };
+        let d = reload(vals, args[0]).into_pointer_value();
+        let key_raw = reload(vals, args[1]);
+        // The key as an i64 word (for store + identity compare) and, for str keys,
+        // the pointer form fed to `zap_str_hash`.
+        let (key_word, key_as_ptr) = if key_ptr {
+            let kp = key_raw.into_pointer_value();
+            (
+                b.build_ptr_to_int(kp, i64t, "oc.key.p2i")
+                    .map_err(|e| e.to_string())?,
+                Some(kp),
+            )
+        } else {
+            (key_raw.into_int_value(), None)
+        };
+
+        // --- entry: hash + tag (no OOB access yet) ---------------------------
+        let h = if let Some(kp) = key_as_ptr {
+            // Leaf, allocation-free FNV over the key bytes — not a safepoint.
+            let str_hash = *self
+                .fns
+                .get("zap_str_hash")
+                .ok_or_else(|| "open-code: zap_str_hash not declared".to_string())?;
+            b.build_call(str_hash, &[kp.into()], "oc.h.str")
+                .map_err(|e| e.to_string())?
+                .try_as_basic_value()
+                .left()
+                .expect("zap_str_hash returns i64")
+                .into_int_value()
+        } else {
+            self.oc_splitmix64(key_word)?
+        };
+        let tag = self.oc_tag(h)?;
+        let cap = b
+            .build_load(i64t, self.oc_field_ptr(d, 8, "oc.capp")?, "oc.cap")
+            .map_err(|e| e.to_string())?
+            .into_int_value();
+
+        let cont = ctx.append_basic_block(fv, "oc.cont");
+        let slow = ctx.append_basic_block(fv, "oc.slow");
+
+        // Common probe-index setup, emitted in `probe` once we know cap != 0.
+        let probe = ctx.append_basic_block(fv, "oc.probe");
+
+        match op {
+            DictOp::Get => {
+                // cap == 0 -> slow (C returns the null word); else probe.
+                let nonempty = b
+                    .build_int_compare(IntPredicate::NE, cap, i64t.const_zero(), "oc.nonempty")
+                    .map_err(|e| e.to_string())?;
+                let nonempty = self.oc_expect(nonempty, true)?;
+                b.build_conditional_branch(nonempty, probe, slow)
+                    .map_err(|e| e.to_string())?;
+
+                b.position_at_end(probe);
+                let buf = b
+                    .build_load(ptrt, self.oc_field_ptr(d, 16, "oc.bufp")?, "oc.buf")
+                    .map_err(|e| e.to_string())?
+                    .into_pointer_value();
+                let mask = b
+                    .build_int_sub(cap, i64t.const_int(1, false), "oc.mask")
+                    .map_err(|e| e.to_string())?;
+                let j = b.build_and(h, mask, "oc.j").map_err(|e| e.to_string())?;
+                // tags[j]
+                let tagp = unsafe {
+                    b.build_in_bounds_gep(i8t, buf, &[j], "oc.tagp")
+                        .map_err(|e| e.to_string())?
+                };
+                let tagj = b
+                    .build_load(i8t, tagp, "oc.tagj")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+                // keys[j]  (region base = buf + cap bytes)
+                let keysb = self.oc_region(buf, cap, 1, "oc.keysb")?;
+                let keyp = unsafe {
+                    b.build_in_bounds_gep(i64t, keysb, &[j], "oc.keyp")
+                        .map_err(|e| e.to_string())?
+                };
+                let keyj = b
+                    .build_load(i64t, keyp, "oc.keyj")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+                let tag_eq = b
+                    .build_int_compare(IntPredicate::EQ, tagj, tag, "oc.tageq")
+                    .map_err(|e| e.to_string())?;
+                let key_eq = b
+                    .build_int_compare(IntPredicate::EQ, keyj, key_word, "oc.keyeq")
+                    .map_err(|e| e.to_string())?;
+                let hit = b
+                    .build_and(tag_eq, key_eq, "oc.hit")
+                    .map_err(|e| e.to_string())?;
+                let hit = self.oc_expect(hit, true)?;
+                let found = ctx.append_basic_block(fv, "oc.found");
+                b.build_conditional_branch(hit, found, slow)
+                    .map_err(|e| e.to_string())?;
+
+                // found: load vals[j]  (region base = buf + cap*9 bytes)
+                b.position_at_end(found);
+                let valsb = self.oc_region(buf, cap, 9, "oc.valsb")?;
+                let valp = unsafe {
+                    b.build_in_bounds_gep(i64t, valsb, &[j], "oc.valp")
+                        .map_err(|e| e.to_string())?
+                };
+                let vword = b
+                    .build_load(i64t, valp, "oc.vword")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+                let fast_val: BasicValueEnum = if val_ptr {
+                    b.build_int_to_ptr(vword, ptrt, "oc.v.i2p")
+                        .map_err(|e| e.to_string())?
+                        .into()
+                } else {
+                    vword.into()
+                };
+                let found_bb = b.get_insert_block().expect("found block");
+                b.build_unconditional_branch(cont)
+                    .map_err(|e| e.to_string())?;
+
+                // slow: the real runtime get (recomputes everything; the oracle).
+                b.position_at_end(slow);
+                let ds = reload(vals, args[0]);
+                let ks = reload(vals, args[1]);
+                let sres = b
+                    .build_call(runtime, &[ds.into(), ks.into()], "oc.slow")
+                    .map_err(|e| e.to_string())?
+                    .try_as_basic_value()
+                    .left()
+                    .expect("dict get returns a value");
+                let slow_bb = b.get_insert_block().expect("slow block");
+                b.build_unconditional_branch(cont)
+                    .map_err(|e| e.to_string())?;
+
+                // cont: phi the fast and slow results.
+                b.position_at_end(cont);
+                let phi_ty: BasicTypeEnum = if val_ptr { ptrt.into() } else { i64t.into() };
+                let phi = b.build_phi(phi_ty, "oc.res").map_err(|e| e.to_string())?;
+                phi.add_incoming(&[(&fast_val, found_bb), (&sres, slow_bb)]);
+                if let Some(dv) = dest {
+                    vals[dv as usize] = Some(phi.as_basic_value());
+                }
+            }
+            DictOp::Set => {
+                let val_raw = reload(vals, args[2]);
+                let vword = if val_ptr {
+                    b.build_ptr_to_int(val_raw.into_pointer_value(), i64t, "oc.val.p2i")
+                        .map_err(|e| e.to_string())?
+                } else {
+                    val_raw.into_int_value()
+                };
+                let len = b
+                    .build_load(i64t, self.oc_field_ptr(d, 0, "oc.lenp")?, "oc.len")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+                // Mirror the C wrappers: a GC-pointer key/value marks the dict so
+                // the `ZAP_TD_DICT` tracer follows those words. Idempotent, and the
+                // same store the wrapper does before `zap_dict_set` — emitted
+                // unconditionally here (entry) so both the inline insert and the
+                // cold fallback see the flag set.
+                if key_ptr {
+                    b.build_store(self.oc_field_ptr(d, 40, "oc.kpp")?, i8t.const_int(1, false))
+                        .map_err(|e| e.to_string())?;
+                }
+                if val_ptr {
+                    b.build_store(self.oc_field_ptr(d, 41, "oc.vpp")?, i8t.const_int(1, false))
+                        .map_err(|e| e.to_string())?;
+                }
+                // Resize guard: cap == 0 || (len + 1) * 4 >= cap * 3  (load 0.75).
+                let cap0 = b
+                    .build_int_compare(IntPredicate::EQ, cap, i64t.const_zero(), "oc.cap0")
+                    .map_err(|e| e.to_string())?;
+                let lenp1 = b
+                    .build_int_add(len, i64t.const_int(1, false), "oc.lenp1")
+                    .map_err(|e| e.to_string())?;
+                let lhs = b
+                    .build_int_mul(lenp1, i64t.const_int(4, false), "oc.lf.l")
+                    .map_err(|e| e.to_string())?;
+                let rhs = b
+                    .build_int_mul(cap, i64t.const_int(3, false), "oc.lf.r")
+                    .map_err(|e| e.to_string())?;
+                let full = b
+                    .build_int_compare(IntPredicate::SGE, lhs, rhs, "oc.full")
+                    .map_err(|e| e.to_string())?;
+                let need_resize = b
+                    .build_or(cap0, full, "oc.resize")
+                    .map_err(|e| e.to_string())?;
+                let need_resize = self.oc_expect(need_resize, false)?;
+                b.build_conditional_branch(need_resize, slow, probe)
+                    .map_err(|e| e.to_string())?;
+
+                b.position_at_end(probe);
+                let buf = b
+                    .build_load(ptrt, self.oc_field_ptr(d, 16, "oc.bufp")?, "oc.buf")
+                    .map_err(|e| e.to_string())?
+                    .into_pointer_value();
+                let mask = b
+                    .build_int_sub(cap, i64t.const_int(1, false), "oc.mask")
+                    .map_err(|e| e.to_string())?;
+                let j = b.build_and(h, mask, "oc.j").map_err(|e| e.to_string())?;
+                let tagp = unsafe {
+                    b.build_in_bounds_gep(i8t, buf, &[j], "oc.tagp")
+                        .map_err(|e| e.to_string())?
+                };
+                let tagj = b
+                    .build_load(i8t, tagp, "oc.tagj")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+                let keysb = self.oc_region(buf, cap, 1, "oc.keysb")?;
+                let keyp = unsafe {
+                    b.build_in_bounds_gep(i64t, keysb, &[j], "oc.keyp")
+                        .map_err(|e| e.to_string())?
+                };
+                let valsb = self.oc_region(buf, cap, 9, "oc.valsb")?;
+                let valp = unsafe {
+                    b.build_in_bounds_gep(i64t, valsb, &[j], "oc.valp")
+                        .map_err(|e| e.to_string())?
+                };
+                // tags[j] == EMPTY (0) -> insert; else check first-probe identity.
+                let is_empty = b
+                    .build_int_compare(IntPredicate::EQ, tagj, i8t.const_zero(), "oc.empty")
+                    .map_err(|e| e.to_string())?;
+                let insert = ctx.append_basic_block(fv, "oc.insert");
+                let chk = ctx.append_basic_block(fv, "oc.chk");
+                b.build_conditional_branch(is_empty, insert, chk)
+                    .map_err(|e| e.to_string())?;
+
+                // chk: first-probe tag+key identity -> overwrite in place; else slow.
+                b.position_at_end(chk);
+                let keyj = b
+                    .build_load(i64t, keyp, "oc.keyj")
+                    .map_err(|e| e.to_string())?
+                    .into_int_value();
+                let tag_eq = b
+                    .build_int_compare(IntPredicate::EQ, tagj, tag, "oc.tageq")
+                    .map_err(|e| e.to_string())?;
+                let key_eq = b
+                    .build_int_compare(IntPredicate::EQ, keyj, key_word, "oc.keyeq")
+                    .map_err(|e| e.to_string())?;
+                let hit = b
+                    .build_and(tag_eq, key_eq, "oc.hit")
+                    .map_err(|e| e.to_string())?;
+                let overwrite = ctx.append_basic_block(fv, "oc.overwrite");
+                b.build_conditional_branch(hit, overwrite, slow)
+                    .map_err(|e| e.to_string())?;
+
+                // overwrite: vals[j] = v  (key/tag/hash unchanged, len unchanged).
+                b.position_at_end(overwrite);
+                b.build_store(valp, vword).map_err(|e| e.to_string())?;
+                b.build_unconditional_branch(cont)
+                    .map_err(|e| e.to_string())?;
+
+                // insert: write tag/key/val/hash and bump len.
+                b.position_at_end(insert);
+                b.build_store(tagp, tag).map_err(|e| e.to_string())?;
+                b.build_store(keyp, key_word).map_err(|e| e.to_string())?;
+                b.build_store(valp, vword).map_err(|e| e.to_string())?;
+                let hashesb = self.oc_region(buf, cap, 17, "oc.hashesb")?;
+                let hashp = unsafe {
+                    b.build_in_bounds_gep(i64t, hashesb, &[j], "oc.hashp")
+                        .map_err(|e| e.to_string())?
+                };
+                b.build_store(hashp, h).map_err(|e| e.to_string())?;
+                let len1 = b
+                    .build_int_add(len, i64t.const_int(1, false), "oc.len1")
+                    .map_err(|e| e.to_string())?;
+                b.build_store(self.oc_field_ptr(d, 0, "oc.lenp2")?, len1)
+                    .map_err(|e| e.to_string())?;
+                b.build_unconditional_branch(cont)
+                    .map_err(|e| e.to_string())?;
+
+                // slow: the real runtime set (resize / probe / tombstone / etc.).
+                b.position_at_end(slow);
+                let ds = reload(vals, args[0]);
+                let ks = reload(vals, args[1]);
+                let vs = reload(vals, args[2]);
+                b.build_call(runtime, &[ds.into(), ks.into(), vs.into()], "oc.slow")
+                    .map_err(|e| e.to_string())?;
+                b.build_unconditional_branch(cont)
+                    .map_err(|e| e.to_string())?;
+
+                b.position_at_end(cont);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A SoA region base inside the dict buffer: `buf + cap * stride` bytes, as an
+    /// `i64*` (the region is dense `cap`-element). `stride` is 1 (keys), 9 (vals)
+    /// or 17 (hashes) — the byte multipliers of the `tags|keys|vals|hashes` layout
+    /// (#840). `tags` is `buf + 0` and read as `i8*` directly.
+    fn oc_region(
+        &self,
+        buf: inkwell::values::PointerValue<'ctx>,
+        cap: inkwell::values::IntValue<'ctx>,
+        stride: u64,
+        name: &str,
+    ) -> Result<inkwell::values::PointerValue<'ctx>, String> {
+        let b = self.builder;
+        let i8t = self.ctx.i8_type();
+        let off = b
+            .build_int_mul(
+                cap,
+                self.ctx.i64_type().const_int(stride, false),
+                "oc.rgn.off",
+            )
+            .map_err(|e| e.to_string())?;
+        unsafe {
+            b.build_in_bounds_gep(i8t, buf, &[off], name)
+                .map_err(|e| e.to_string())
+        }
+    }
+
     fn inst(
         &self,
         f: &Func,
@@ -4043,6 +4572,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 vals[*dest as usize] = Some(sel);
             }
             Inst::Call { dest, func, args } => {
+                // I#842: open-code the hot dict get/set first-probe fast path as
+                // inline IR (the cold path still calls the runtime `func`). When it
+                // handles the call it has already bound `dest`, so we are done.
+                if self.opencode_hot_call(f, *dest, func, args, vals, fv)? {
+                    return Ok(());
+                }
                 let fv = *self
                     .fns
                     .get(func)
@@ -6216,6 +6751,156 @@ mod tests {
         assert!(
             build.contains("store ptr"),
             "the escaping shadow-frame/root stores must survive O2:\n{build}"
+        );
+    }
+
+    // ---- I#842: open-coded hot dict get/set first-probe fast path -----------
+    //
+    // The issue's testability bar: a hot `d[k]` must emit an INLINE probe (a tag
+    // byte load + branch), NOT a bare `call @zap_dict_get_*`, with the runtime
+    // call only on the cold (slow / resize) edge. These assert on the
+    // UNOPTIMIZED IR (`llvm_ir`), so the open-coder's own block structure is
+    // visible verbatim and the test is deterministic (no reliance on what -O2
+    // leaves behind). The runtime symbol is still present — it IS the cold
+    // fallback and the behavioral oracle — but it is now reached only past the
+    // inline probe.
+
+    #[test]
+    fn dict_get_int_is_open_coded() {
+        let ir = llvm_ir(
+            "def main():\n    dict[int64, int64] d = {}\n    d[1] = 10\n    \
+             int64 x = d[1]\n    print(x)\n",
+        );
+        // Inline first-probe fast path emitted: probe / found / slow / cont blocks.
+        assert!(
+            ir.contains("oc.probe"),
+            "expected inline probe block:\n{ir}"
+        );
+        assert!(
+            ir.contains("oc.found"),
+            "expected inline found block:\n{ir}"
+        );
+        assert!(
+            ir.contains("oc.slow"),
+            "expected cold fallback block:\n{ir}"
+        );
+        // The tag byte is loaded and the hit is a branch (1-byte reject, #840).
+        assert!(
+            ir.contains("oc.tagj = load i8") || ir.contains("oc.tagj"),
+            "expected a 1-byte tag load in the inline probe:\n{ir}"
+        );
+        // The runtime get survives ONLY as the cold fallback (the oracle).
+        assert!(
+            ir.contains("call i64 @zap_dict_get_i64_i64"),
+            "expected the runtime get as the cold fallback:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn dict_set_int_is_open_coded() {
+        let ir =
+            llvm_ir("def main():\n    dict[int64, int64] d = {}\n    d[1] = 10\n    print(d[1])\n");
+        // Inline insert + overwrite + cold fallback blocks.
+        assert!(
+            ir.contains("oc.insert"),
+            "expected inline insert block:\n{ir}"
+        );
+        assert!(
+            ir.contains("oc.overwrite"),
+            "expected inline overwrite block:\n{ir}"
+        );
+        assert!(
+            ir.contains("oc.slow"),
+            "expected cold fallback block:\n{ir}"
+        );
+        // The tag byte is written inline on the insert path (store i8 of the tag).
+        assert!(
+            ir.contains("store i8"),
+            "expected an inline tag-byte store on the insert path:\n{ir}"
+        );
+        // The runtime set survives ONLY as the cold (resize / probe) fallback.
+        assert!(
+            ir.contains("call void @zap_dict_set_i64_i64"),
+            "expected the runtime set as the cold fallback:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn dict_str_key_open_codes_with_inline_hash() {
+        let ir = llvm_ir(
+            "def main():\n    dict[str, int64] d = {}\n    d[\"a\"] = 10\n    \
+             int64 x = d[\"a\"]\n    print(x)\n",
+        );
+        // A str key hashes via the leaf `zap_str_hash` inside the inline probe
+        // (allocation-free, not a safepoint), then does the same first-probe
+        // IDENTITY shortcut as the C fast path.
+        assert!(
+            ir.contains("oc.probe"),
+            "expected inline probe block:\n{ir}"
+        );
+        assert!(
+            ir.contains("call i64 @zap_str_hash"),
+            "expected the inline str-key hash call in the probe:\n{ir}"
+        );
+        // Cold fallbacks to the real str-keyed runtime ops.
+        assert!(
+            ir.contains("@zap_dict_get_str_i64"),
+            "expected the runtime str get as the cold fallback:\n{ir}"
+        );
+        assert!(
+            ir.contains("@zap_dict_set_str_i64"),
+            "expected the runtime str set as the cold fallback:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn dict_set_ptr_value_marks_gc_flags_inline() {
+        // A GC-pointer value: the inline set MUST mark `d->val_ptr` so the
+        // `ZAP_TD_DICT` tracer follows the stored pointer word (skipping it would
+        // be a silent UAF under the moving collector — the real GC hazard, not a
+        // write barrier). The mark is a `store i8 1` into the dict header, exactly
+        // as the C wrapper does.
+        let ir = llvm_ir(
+            "def main():\n    dict[int64, str] d = {}\n    d[1] = \"x\"\n    print(d[1])\n",
+        );
+        assert!(
+            ir.contains("oc.insert"),
+            "expected inline insert block:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i8 1"),
+            "expected the inline val_ptr GC-flag mark (store i8 1):\n{ir}"
+        );
+        assert!(
+            ir.contains("@zap_dict_set_i64_ptr"),
+            "expected the runtime ptr-value set as the cold fallback:\n{ir}"
+        );
+    }
+
+    // After the real -O2 pipeline the inline probe must SURVIVE (the tag load +
+    // branch is still there and the runtime call is only the cold edge) — i.e.
+    // the hot `d[k]` is not folded back into a bare runtime call. Uses a
+    // parameterized loop so the optimizer cannot constant-fold the dict away.
+    #[cfg(feature = "gc-immix")]
+    #[test]
+    fn dict_open_coding_survives_opt_pipeline() {
+        let ir = optimized_llvm_ir(
+            "def work(int64 n) -> int64:\n    dict[int64, int64] d = {}\n    int64 i = 0\n    \
+             while i < n:\n        d[i] = i\n        i = i + 1\n    int64 s = 0\n    i = 0\n    \
+             while i < n:\n        s = s + d[i]\n        i = i + 1\n    return s\n\
+             def main():\n    print(work(1000))\n",
+        );
+        let work = one_fn_ir(&ir, "work");
+        // The inline tag-byte probe is still present post-O2 (an opaque-pointer
+        // load the optimizer cannot drop)...
+        assert!(
+            work.contains("load i8"),
+            "the inline tag probe must survive -O2:\n{work}"
+        );
+        // ...and the runtime op remains only as the cold fallback.
+        assert!(
+            work.contains("@zap_dict_get_i64_i64") && work.contains("@zap_dict_set_i64_i64"),
+            "the runtime get/set must remain as the cold fallbacks after -O2:\n{work}"
         );
     }
 }

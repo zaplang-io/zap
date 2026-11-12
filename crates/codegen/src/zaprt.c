@@ -1794,6 +1794,22 @@ typedef struct {
     uint8_t val_ptr; /* values are GC pointers */
 } ZapDict;
 
+/* The `ZapDict` header offsets codegen hardcodes when it open-codes the dict
+ * get/set fast path as inline IR (I#842, D-0158, crates/codegen/src/lib.rs
+ * `opencode_hot_call`). The inline probe reads `cap`@8 / `buf`@16 and a `set`
+ * writes `len`@0 and marks `key_ptr`@40 / `val_ptr`@41, so these offsets are ABI
+ * between the generated code and this runtime: a layout change here must be
+ * mirrored in codegen. These assertions make a drift a loud build failure
+ * instead of a silent mis-probe / heap corruption invisible to the host tests. */
+_Static_assert(offsetof(ZapDict, len) == 0, "ZapDict.len offset (open-coded I#842)");
+_Static_assert(offsetof(ZapDict, cap) == 8, "ZapDict.cap offset (open-coded I#842)");
+_Static_assert(offsetof(ZapDict, buf) == 16, "ZapDict.buf offset (open-coded I#842)");
+_Static_assert(offsetof(ZapDict, key_ptr) == 40, "ZapDict.key_ptr offset (open-coded I#842)");
+_Static_assert(offsetof(ZapDict, val_ptr) == 41, "ZapDict.val_ptr offset (open-coded I#842)");
+/* The SoA byte strides (buf + cap*N) the inline probe uses for keys/vals/hashes. */
+_Static_assert(sizeof(int64_t) == 8 && sizeof(uint64_t) == 8,
+               "open-coded dict probe assumes 8-byte key/val/hash words (I#842)");
+
 /* SoA region accessors. Each RE-READS `d->buf` and `d->cap`, so if a KEY_FN
  * `__hash__`/`__eq__` callback relocated the buffer under a moving collector the
  * next access picks up the new address — the same discipline the flat layout got
