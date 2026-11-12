@@ -136,6 +136,42 @@ printf '%s' "$sizerows" | while IFS='|' read -r _ n z g _; do
   [ -n "$n" ] && printf '%-14s %10s %10s\n' "$(echo "$n" | xargs)" "$(echo "$z" | xargs)" "$(echo "$g" | xargs)"
 done
 
+# ---------------------------------------------------------------------------
+# Startup-floor forensics (#851 follow-up): WHERE do the empty Zap and Go
+# binaries differ, and WHY is Go's startup faster? Static vs dynamic link, the
+# NEEDED shared libraries ld.so must load/relocate at exec, section sizes, and a
+# syscall-time breakdown of the actual startup. Best-effort: each tool is guarded
+# so a missing one on the runner does not fail the run.
+if [ -x "$OUT/empty.zap.bin" ] && [ -x "$OUT/empty.go.bin" ]; then
+  echo
+  echo "================ empty-binary startup forensics ================"
+  for lang in zap go; do
+    bin="$OUT/empty.$lang.bin"
+    echo "----- empty.$lang.bin -----"
+    command -v file    >/dev/null 2>&1 && file "$bin"
+    echo "NEEDED shared libraries (ld.so loads these at exec):"
+    if command -v readelf >/dev/null 2>&1; then
+      readelf -d "$bin" 2>/dev/null | grep -E 'NEEDED|Shared library' || echo "  (none — static)"
+    else
+      ldd "$bin" 2>/dev/null || echo "  (ldd unavailable / static)"
+    fi
+    echo "sections:"
+    command -v size >/dev/null 2>&1 && size "$bin" 2>/dev/null
+    echo
+  done
+  if command -v strace >/dev/null 2>&1; then
+    echo "----- strace -f -c  empty.zap.bin (startup syscall time) -----"
+    strace -f -c "$OUT/empty.zap.bin" >/dev/null 2>"$OUT/strace.zap.txt"
+    tail -n 40 "$OUT/strace.zap.txt"
+    echo
+    echo "----- strace -f -c  empty.go.bin (startup syscall time) -----"
+    strace -f -c "$OUT/empty.go.bin" >/dev/null 2>"$OUT/strace.go.txt"
+    tail -n 40 "$OUT/strace.go.txt"
+    echo
+  fi
+  echo "================================================================"
+fi
+
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
     echo "## Zap vs Go vs Python — throwaway perf compare"
