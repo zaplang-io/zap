@@ -838,6 +838,8 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | Select { dest, .. }
         | StrConst { dest, .. }
         | StructNew { dest, .. }
+        | StackStruct { dest, .. }
+        | StrBuild { dest, .. }
         | FieldGet { dest, .. }
         | LandingPad { dest, .. }
         | ArrayBinOp { dest, .. }
