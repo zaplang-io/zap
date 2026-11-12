@@ -7229,7 +7229,7 @@ a GC heap allocation.
   (an entry-hoisted `alloca` + zero-init, #91);
 - a transient **f-string** `Inst::StrBuild` (pointer-free atomic `str`) → an
   inline stack buffer of `K = 64` bytes with a runtime heap spill when the summed
-  length exceeds `K` (`zap_str_join_into`). `StrBuild` also folds the former
+  length exceeds `K` (`zap_strbuild_into`). `StrBuild` also folds the former
   left-folded `zap_str_concat` chain into one allocation (#837 lever-3(b)).
 
 **Conservatism.** The escape lattice is monotone to *escape*; any allocation

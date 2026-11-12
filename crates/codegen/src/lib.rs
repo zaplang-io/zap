@@ -710,24 +710,25 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             None,
         );
         self.fns.insert("zap_str_concat".to_string(), str_concat);
-        // Single-pass string join (#839; folds in the #837 lever-3(b) f-string
-        // join): `zap_str_join(ZapStr **parts, i64 n)` allocates one heap string.
-        // `zap_str_join_into(void *buf, i64 cap, ZapStr **parts, i64 n)` builds
+        // Single-pass string build (#839; folds in the #837 lever-3(b) f-string
+        // join): `zap_strbuild(ZapStr **parts, i64 n)` allocates one heap string.
+        // `zap_strbuild_into(void *buf, i64 cap, ZapStr **parts, i64 n)` builds
         // into a caller-provided inline stack buffer of `cap` bytes when the
-        // summed length fits, else spills to a heap `zap_str_join`.
-        let str_join = self.module.add_function(
-            "zap_str_join",
+        // summed length fits, else spills to a heap `zap_strbuild`. (Named
+        // `strbuild`, not `str_join`, to avoid the `str.join(list)` runtime fn.)
+        let str_build = self.module.add_function(
+            "zap_strbuild",
             ptr.fn_type(&[ptr.into(), i64t.into()], false),
             None,
         );
-        self.fns.insert("zap_str_join".to_string(), str_join);
-        let str_join_into = self.module.add_function(
-            "zap_str_join_into",
+        self.fns.insert("zap_strbuild".to_string(), str_build);
+        let str_build_into = self.module.add_function(
+            "zap_strbuild_into",
             ptr.fn_type(&[ptr.into(), i64t.into(), ptr.into(), i64t.into()], false),
             None,
         );
         self.fns
-            .insert("zap_str_join_into".to_string(), str_join_into);
+            .insert("zap_strbuild_into".to_string(), str_build_into);
         let print_str = self.module.add_function(
             "zap_print_str",
             self.ctx.void_type().fn_type(&[ptr.into()], false),
@@ -3247,7 +3248,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         .ctx
                         .struct_type(&[i64t.into(), i8t.array_type(*cap).into()], false);
                     let buf = self.entry_alloca(buf_ty.into(), "strbuf")?;
-                    let join = self.fns["zap_str_join_into"];
+                    let join = self.fns["zap_strbuild_into"];
                     b.build_call(
                         join,
                         &[
@@ -3260,7 +3261,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     )
                     .map_err(|e| e.to_string())?
                 } else {
-                    let join = self.fns["zap_str_join"];
+                    let join = self.fns["zap_strbuild"];
                     b.build_call(join, &[arr.into(), nconst.into()], "strjoin")
                         .map_err(|e| e.to_string())?
                 };
