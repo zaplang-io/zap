@@ -41,7 +41,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   coroutine switch at `-O2` (#869); extending the default there is gated on that
   fix. This is a plain optimization level, not LTO: the opt-in `ZAP_LTO`
   cross-module path (D-0149/D-0150) is unchanged, and `-flto` buys ≈ nothing over
-  `-O2` here for ~5× the build. No grammar or runtime-ABI change.
+  `-O2` here for ~5× the build. The compiled runtime object is cached (keyed on
+  the runtime source + `-O` level + collector + backend gates + CPython profile +
+  `cc` + triple, overridable with `$ZAP_RT_CACHE`), so the larger `-O2` runtime is
+  compiled once and only linked thereafter rather than recompiled per program. No
+  grammar or runtime-ABI change.
 - **`dict` / `set` use a cache-local struct-of-arrays table with per-slot hash
   tags** (#840, D-0156). The old flat `ZapEntry[]` (32 bytes/slot) dragged a whole
   entry into cache for every probed slot, leaving `dict_int` ~0.7× Go's map on

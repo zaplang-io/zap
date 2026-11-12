@@ -433,6 +433,143 @@ fn lto_runtime_bitcode(
     Ok(cached)
 }
 
+/// Obtain the C runtime as a compiled native object (`.o`) for the default
+/// (non-LTO) object-link path, cached so `zaprt.c` is compiled at most once per
+/// (runtime source, opt level, collector, backend gates, CPython, `cc`, triple)
+/// rather than once per program (I#867 follow-up).
+///
+/// The runtime object does not depend on the program being compiled, so the
+/// hundreds of programs a `zap test` / golden run builds can all share one
+/// compiled copy. This matters especially after the `-O2` runtime default
+/// (D-0157): without this cache, `golden.rs`'s 442 fixtures each recompiled the
+/// whole large runtime TU — ~3s at `-O2` vs ~0.7s at `-O0` — adding tens of
+/// minutes across the matrix. The LTO path already caches runtime *bitcode* the
+/// same way ([`lto_runtime_bitcode`]); this is the object-link analogue.
+///
+/// The cache lives under `$ZAP_RT_CACHE` (default a stable temp subdir); the key
+/// hashes everything that determines the object, so a runtime edit, a different
+/// `-O` level (so the `-O2` default and `--debug` `-O0` never collide), a
+/// different collector / backend gate / CPython profile / `cc` / triple misses
+/// cleanly. Writes are published by atomic rename, so the parallel golden pool's
+/// concurrent builds never read a half-written object (a lost race just
+/// recompiles the same bytes). Only the compile-relevant flags enter here; the
+/// link-only flags (`-l*`, `-static`, `-rdynamic`, …) stay on the link command.
+///
+/// `rt_path` must already have `zaprt.c` + its `#include`d `zapgc.inc.c` /
+/// `zaprace.inc.c` written beside it (the caller does this). `opt_flag` is the
+/// `-O` level from [`runtime_opt_flag`].
+#[allow(clippy::too_many_arguments)]
+fn native_runtime_object(
+    cc: &str,
+    rt_path: &Path,
+    triple: &str,
+    opt_flag: &str,
+    no_cpython: bool,
+    no_regex: bool,
+    no_zlib: bool,
+    no_openssl: bool,
+) -> Result<std::path::PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+
+    let immix = cfg!(feature = "gc-immix");
+    // Same CPython-cflags logic as the LTO cache: only the `-I...` `--cflags`
+    // affect a `-c` compile, and they are probed only when CPython is actually
+    // embedded (never for a portable / Windows / non-`import python` build), so a
+    // non-Python program builds on a host without `python3-dev`.
+    let py_cflags: Vec<String> = if no_cpython {
+        Vec::new()
+    } else {
+        python_embed_flags()?
+    };
+    let extra = std::env::var("ZAP_CC_EXTRA").unwrap_or_default();
+
+    // Cache key: everything that determines the runtime object.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    RUNTIME_C.hash(&mut h);
+    RUNTIME_GC_C.hash(&mut h);
+    RUNTIME_RACE_C.hash(&mut h);
+    cc.hash(&mut h);
+    triple.hash(&mut h);
+    opt_flag.hash(&mut h);
+    immix.hash(&mut h);
+    no_cpython.hash(&mut h);
+    no_regex.hash(&mut h);
+    no_zlib.hash(&mut h);
+    no_openssl.hash(&mut h);
+    py_cflags.hash(&mut h);
+    extra.hash(&mut h);
+    // Bump when the runtime compile flags below change so a stale pre-change
+    // cache entry is never reused.
+    "rt-obj-flags-v1".hash(&mut h);
+    // Different cc builds emit different objects — fold the version in.
+    if let Ok(out) = Command::new(cc).arg("--version").output() {
+        out.stdout.hash(&mut h);
+    }
+    let key = format!("{:016x}", h.finish());
+
+    let cache_dir = std::env::var_os("ZAP_RT_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("zap-rt-cache"));
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cached = cache_dir.join(format!("zaprt-{key}.o"));
+    if cached.exists() {
+        return Ok(cached);
+    }
+
+    // Miss: compile the runtime to an object and publish atomically into a unique
+    // temp beside the cache entry. These are EXACTLY the compile-relevant flags
+    // the old single-step `cc <prog.o> zaprt.c …` passed (no `-fexceptions`: the
+    // non-LTO object link never merges modules or re-runs the optimizer, so the
+    // runtime's default `nounwind` is harmless here — see `lto_runtime_bitcode`).
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = cache_dir.join(format!("zaprt-{key}.{}.{nanos}.tmp.o", std::process::id()));
+    let mut rc = Command::new(cc);
+    rc.arg(opt_flag).arg("-c").arg(rt_path).arg("-o").arg(&tmp);
+    if immix {
+        rc.arg("-DZAP_GC_IMMIX");
+    }
+    if no_cpython {
+        rc.arg("-DZAP_NO_CPYTHON");
+    } else {
+        rc.args(&py_cflags);
+    }
+    if no_regex {
+        rc.arg("-DZAP_NO_PCRE2");
+    }
+    if no_zlib {
+        rc.arg("-DZAP_NO_ZLIB");
+    }
+    if no_openssl {
+        rc.arg("-DZAP_NO_OPENSSL");
+    }
+    for a in extra.split_whitespace() {
+        rc.arg(a);
+    }
+    let status = rc
+        .status()
+        .map_err(|e| format!("failed to run runtime object compile (cc -c): {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("runtime object compile failed: {status}"));
+    }
+    // Publish. If another concurrent build won the race, its copy is equivalent;
+    // rename overwrites atomically on the same filesystem either way.
+    if let Err(e) = std::fs::rename(&tmp, &cached) {
+        let _ = std::fs::remove_file(&tmp);
+        if cached.exists() {
+            return Ok(cached);
+        }
+        return Err(format!(
+            "failed to publish runtime object to cache {}: {e}",
+            cached.display()
+        ));
+    }
+    Ok(cached)
+}
+
 /// Lower a type-checked AST module to a verified in-memory LLVM module (shared
 /// by the object-file backend and the REPL JIT, I#159). Returns the module and
 /// the host target machine whose data layout drove the GC type-descriptor field
@@ -945,9 +1082,9 @@ pub fn build_executable(
                 .arg("-Wl,--gc-sections");
         }
     } else {
-        // Default path: compile the runtime source as its own translation unit
-        // alongside the already-codegen'd program object, so runtime calls stay
-        // out-of-line (the opaque-external-symbol boundary #841/#568 measured).
+        // Default path: the runtime is its own translation unit linked against the
+        // already-codegen'd program object, so runtime calls stay out-of-line (the
+        // opaque-external-symbol boundary #841/#568 measured).
         //
         // Optimize that runtime TU (I#867, D-0157). It carried NO `-O` flag, so
         // the system `cc` compiled the whole dict/set/string/GC machinery at
@@ -955,13 +1092,44 @@ pub fn build_executable(
         // (`dict_int`: 26.9ms at `-O0` vs 19.0ms at `-O2`, which then beats Go's
         // 22.5ms). `-O2` by default on x86_64; `--debug` restores `-O0` for fast
         // iteration, and non-x86_64 (aarch64) stays `-O0` pending I#869 (see
-        // `runtime_opt_flag`). `-O2` on this driver invocation compiles `rt_path`
-        // (and the Windows A1/A3/A4 TUs below) at that level; the already-codegen'd
-        // program object is only linked, so its code is unaffected. The LTO path
-        // (above) is untouched — it compiles the runtime bitcode at `-O2` in
-        // `lto_runtime_bitcode` regardless of `--debug`.
-        cmd.arg(runtime_opt_flag(debug, target_is_x86_64));
-        cmd.arg(&rt_path);
+        // `runtime_opt_flag`). The already-codegen'd program object is only linked,
+        // so its code is unaffected. The LTO path (above) is untouched.
+        let opt_flag = runtime_opt_flag(debug, target_is_x86_64);
+        if is_windows {
+            // Windows still compiles the runtime inline alongside the A1/A3/A4 TUs
+            // below (the port is stubbed and not the CI-hot path, so it does not
+            // use the object cache). `-O` applies to all those source TUs here.
+            cmd.arg(opt_flag);
+            cmd.arg(&rt_path);
+        } else {
+            // Compile `zaprt.c` to a cached `.o` ONCE per (source, opt, collector,
+            // backend gates, CPython, cc, triple) and just LINK it here, instead
+            // of recompiling the large runtime TU for every program. At the `-O2`
+            // default this is what keeps a golden / `zap test` run (hundreds of
+            // builds) from each paying the ~3s runtime compile — the object-link
+            // analogue of the LTO bitcode cache. Only the compile-relevant flags
+            // go into the cached object; the link-only flags (`-l*`, `-static`,
+            // `-rdynamic`, the `-D*` that merely mirror the cache key) stay on this
+            // link command below and are harmless no-ops against an object input.
+            let rt_obj = match native_runtime_object(
+                &cc,
+                &rt_path,
+                triple_str.as_str(),
+                opt_flag,
+                no_cpython,
+                no_regex,
+                no_zlib,
+                no_openssl,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&prog_path);
+                    let _ = std::fs::remove_dir_all(&build_dir);
+                    return Err(e);
+                }
+            };
+            cmd.arg(&rt_obj);
+        }
     }
     cmd.arg("-o").arg(out_path);
     // Select the collector (ticket #48): the precise Immix GC is compiled into

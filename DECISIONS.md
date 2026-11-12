@@ -7891,5 +7891,23 @@ all four (debug × x86_64) cases including the non-x86_64 `-O0` hold
 (toolchain-independent), and `crates/driver/src/cli.rs` covers `--debug` parsing
 on `run`/`build`/`ir`.
 
+**Build-time: the runtime object is cached.** The runtime TU does not depend on
+the program, so recompiling it for every build — ~3s at `-O2` vs ~0.7s at `-O0` —
+would have made a golden / `zap test` run (hundreds of builds) pay that cost
+hundreds of times, landing the `-O2` default CI-slow. So the default object-link
+path now compiles `zaprt.c` to a cached `.o` ONCE per (runtime source, `-O`
+level, collector, backend gates, CPython profile, `cc`, triple) and just LINKS it
+thereafter — the object-link analogue of the LTO bitcode cache
+(`lto_runtime_bitcode`), in `native_runtime_object`. The cache lives under
+`$ZAP_RT_CACHE` (default a stable temp subdir); the key hashes every
+compile-relevant input (so the `-O2` default and `--debug` `-O0` get distinct
+entries, as do the x86_64/aarch64 `-O` split and each backend-gate profile), and
+entries are published by atomic rename so the parallel golden pool never reads a
+torn object (a lost race recompiles the same bytes). Only compile-relevant flags
+enter the object; link-only flags (`-l*`, `-static`, `-rdynamic`) stay on the link
+step. Windows keeps the inline compile (stubbed, not the hot path). Guarded by
+`crates/driver/tests/runtime_cache.rs` (warm build reuses the object without
+recompiling and runs identically; a changed compile input busts the key).
+
 **No grammar or ABI change.** `--debug` is a build flag, invisible to syntax and
 to observable semantics; `GRAMMAR.ebnf` and `design/RUNTIME-ABI.md` are unchanged.
