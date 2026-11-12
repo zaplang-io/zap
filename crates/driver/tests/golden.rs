@@ -226,6 +226,34 @@ where
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    // Optional `ZAP_GOLDEN_ONLY` allowlist: a comma-separated list of
+    // substrings matched against each fixture's path. When set (non-empty),
+    // only the matching fixtures run; when unset/blank the whole corpus runs,
+    // as always. CI's "Test under LTO" step sets this to a small,
+    // representative slice so the LTO build is exercised end-to-end without
+    // re-linking the entire program corpus under `-O2 -flto` on every push
+    // (the full corpus still runs under the default, fast build in the step
+    // above). Patterns that match nothing simply contribute nothing — this
+    // runner is shared by the golden/project/race corpora, so an allowlist of
+    // golden stems is expected to filter the project and race corpora to zero.
+    let items: Vec<PathBuf> = match std::env::var("ZAP_GOLDEN_ONLY") {
+        Ok(list) if !list.trim().is_empty() => {
+            let pats: Vec<String> = list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            items
+                .into_iter()
+                .filter(|p| {
+                    let s = p.to_string_lossy();
+                    pats.iter().any(|pat| s.contains(pat.as_str()))
+                })
+                .collect()
+        }
+        _ => items,
+    };
+
     if items.is_empty() {
         return;
     }

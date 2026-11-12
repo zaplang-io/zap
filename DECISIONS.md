@@ -7208,7 +7208,137 @@ machinery, and gets its own design ticket if demanded. Deletion/reclamation
 limits inherited from D-0147 apply to the set; the stack has none (pop unlinks).
 aarch64-Linux inherits the node-liveness caveat (#223/#650).
 
-## D-0149 — Escape analysis: stack-allocate non-escaping leaf values (#839)
+## D-0149 — no `inline` keyword; inlining is the toolchain's job (LLVM -O2 + LTO runtime boundary + codegen open-coding) (#841)
+
+**Problem.** The C runtime (`zaprt.c`) is compiled to its OWN object file and
+linked against the program object. The program is emitted and optimized as its own
+LLVM module first, so the hot runtime fast paths — `zap_dict_get_str_i64` /
+`zap_dict_set_*`, `zap_str_concat`, `zap_i64_to_str`, … — are opaque **external
+declarations** at the program's optimize step and can never be inlined. Every
+`d[k]` pays an out-of-line call (the costs measured in #837; the "`-O2` changed
+nothing for the runtime calls" observation in #568/D-0144). This is the single
+broadest performance lever left in the gap-to-Go set (#837/#839/#840/#841/#842):
+it benefits every runtime call, not just dict/string.
+
+**Decision — the language surface stays clean; performance comes from the
+toolchain, not annotations.**
+
+1. **Zap exposes NO `inline` keyword and no user-facing inlining pragma.**
+   Inlining is entirely the optimizer's job. LLVM `-O2` already inlines Zap-level
+   `def`s; there is no programmer-visible knob and there will not be one. A
+   language that lets the author annotate `inline` ties the surface to one
+   backend's heuristics and ages badly; keeping it out means the only contract is
+   observable behaviour, and the toolchain is free to inline more (or less) over
+   time with no source change.
+
+2. **LTO extends the optimizer's reach across the program↔runtime boundary
+   (this issue).** Under the `ZAP_LTO` build flag the program is emitted as **LLVM
+   bitcode** (`Module::write_bitcode_to_path`, inkwell `llvm18-0`), the runtime is
+   compiled to bitcode (`clang-18 -O2 -emit-llvm -c`), the two are **merged into a
+   single module with `llvm-link`**, that module is optimized with **`opt -O2`**
+   (which unambiguously runs the inliner over the whole module — `clang -O2` on a
+   bitcode input codegens it but does not reliably re-run the IR optimizer), and
+   `clang` codegens + links the result. Merging explicitly — rather than passing
+   a `.bc` plus `-flto` and
+   relying on the linker's LTO plugin — is what actually produces the
+   cross-module inline: with one module the inliner sees both sides, and it needs
+   no gold/lld plugin (an early `clang -flto program.bc zaprt.c` attempt did NOT
+   inline — clang codegen'd the program bitcode on its own and `-O2` merely
+   unrolled the hot loop, leaving the runtime calls out of line, which the
+   `tests/lto.rs` disassembly assertion caught). One more step is required: clang
+   stamps `target-cpu`/`target-features` on every runtime function while the
+   inkwell program module carries none, and LLVM's inliner refuses to inline a
+   callee whose features are not a subset of the caller's — so even after the
+   merge the thin wrappers would not inline. The merged module therefore has
+   those attributes **stripped from every function** (in-process via inkwell)
+   before `clang -O2`, leaving it uniformly attribute-free so it codegens at the
+   triple's default baseline (no feature lost) and the inliner crosses the
+   boundary. Everything stays on **LLVM 18**
+   (the inkwell program IR and the `clang-18`/`llvm-link` runtime bitcode must
+   match — no version skew). The single merged module is a deterministic,
+   closed-world inline; ThinLTO (to bound per-program optimize time on large
+   programs) is a follow-up refinement. **The runtime bitcode is cached** —
+   compiled + stripped once per (runtime source, collector, portable, clang,
+   triple) and reused across every build (published by atomic rename under
+   `$ZAP_LTO_CACHE`) — because it does not depend on the program; otherwise the
+   whole runtime was recompiled at `-O2` and the whole merged module re-stripped
+   for every program, which made an LTO golden/test run (hundreds of programs)
+   crawl. The program bitcode is stripped up front too, so the merged module
+   needs no per-build strip.
+
+3. **Codegen open-coding of the hottest ops is the next lever (#842),** sequenced
+   AFTER this issue and the dict-layout change (#840): once the structure lands,
+   the compiler emits the fast path for the very hottest ops directly, so even the
+   call-site disappears. Same principle — the toolchain, not the source.
+
+**Runtime fast/slow split (so LTO has something small to inline).** Crossing the
+boundary is necessary but not sufficient: LLVM's cost model will not inline a
+*monolithic* runtime function (e.g. the ~300-byte dict probe) into a hot loop
+even once the modules are merged. So the hot runtime ops are structured as a
+small `always_inline` **fast path** + a `noinline` **slow path**: `zap_dict_get`
+now inlines a first-probe IDENTITY check (word identity for int keys; pointer
+identity for interned / same-object string keys — exactly the repeated `d["k"]`
+case, D-0145) and tail-calls the out-of-line `zap_dict_get_slow` for value
+comparison, probing, tombstones, misses and user-struct (`__eq__`) keys.
+Identity is only ever a *sufficient* condition for equality, so the fast path
+never returns a wrong answer. The fast path folds into the typed `zap_dict_get_*`
+wrappers, which the LTO cross-module inliner then pulls into generated code; the
+slow path stays a call. This also speeds the ordinary object-link build (the
+wrapper carries the fast check inline), so the runtime source is no longer
+byte-for-byte identical to pre-#841 — only the LTO *flag's* default-off
+no-op-ness is (see Gate / default).
+
+**Gate / default.** LTO is behind the `ZAP_LTO` environment build flag, read in
+`build_executable` exactly like `ZAP_PORTABLE` (no new parameter threaded through
+every caller). When unset, the build takes the **unchanged object-link path** —
+compile the program to an object, compile the runtime, link — so turning the
+flag off is a true no-op on the build *mechanism* (the runtime fast/slow split
+above is a plain source change that applies to every build). The default is **OFF**: the LTO link is
+slower and, unlike the long-exercised object-link path, is newly introduced, so a
+toolchain image / CI opts in with `ZAP_LTO=1` (and `ZAP_LTO_CC=clang-18`) rather
+than it defaulting on before it has soaked. Flipping the default on for release
+builds is a one-line follow-up once CI has carried it.
+
+**Correctness (preserved under whole-program LTO).**
+- `zap_shadow_head_addr` keeps `__attribute__((noinline))` and must stay an
+  out-of-line call even under LTO: it resolves the per-thread `zap_shadow_head`
+  TLS slot on the CURRENT thread, and folding it into a cached thread-pointer base
+  would make a migrated coroutine push/pop the wrong thread's shadow stack and
+  free live objects (I#223 / #568). LTO honours the `noinline` function attribute;
+  a test asserts it.
+- The GC-frame + safepoint discipline (D-0144) is unchanged: the shadow-frame
+  alloca escapes via `*zap_shadow_head = &frame`, so `-O2` cannot promote it away,
+  and inlining a runtime call that contains a safepoint preserves the safepoint.
+- The runtime bitcode is compiled with **`-fexceptions`** so clang does not
+  blanket-mark its C functions `nounwind`. `zaprt.c` reaches `__cxa_throw`
+  (`zap_raise`, `zap_scope_exit`, the `except*` group machinery), so those
+  functions genuinely participate in Itanium unwinding. Without the flag, every
+  C function is `nounwind`; once merged with the program, `opt -O2` trusts that
+  attribute, rewrites the program's `invoke`s to the runtime into plain `call`s,
+  deletes the landing pads, and any caught Zap exception unwinds past every
+  handler to `std::terminate`. This is an **LTO-only** hazard — the object-link
+  path never merges the two modules or re-runs the optimizer — so the flag is
+  added only to the LTO runtime-bitcode compile (`lto_runtime_bitcode`), leaving
+  the default build byte-for-byte unchanged.
+
+**Tests.** `crates/driver/tests/lto.rs` is the deterministic guard: it builds a
+hot `dict[str,int64]` read/update loop with and without `ZAP_LTO`, disassembles
+both binaries, and asserts the baseline calls `zap_dict_get_str_i64` out of line,
+the LTO binary has **no** such call (inlined), and the LTO binary **still** calls
+`zap_shadow_head_addr` (noinline honoured) — arch-agnostic across the x86-64 and
+aarch64 legs. `crates/driver/tests/perf.rs` gains an LTO-vs-non-LTO trend for
+`dict_int`/`dict_string` (speedup reported; only a lenient no-regression floor
+asserted, per the GC-golden determinism rule). CI re-runs a small, representative
+golden slice under `ZAP_LTO=1` on both collectors — `dict_word_count` (the
+inlined fast paths), `coroutines` (ucontext switch + GC shadow stack),
+`concurrent_counter_coro_stress` (GC safepoints under concurrency) and
+`except_star_routing` (exception unwinding across a `scope`/`spawn` boundary) —
+via the `ZAP_GOLDEN_ONLY` allowlist in `golden.rs`. The full corpus runs under
+the default object-link build: re-linking every program under `opt -O2` added
+minutes per leg for no extra coverage, and the slice above exercises the
+LTO-specific surface (inlining, GC/safepoints, exception unwinding).
+
+## D-0150 — Escape analysis: stack-allocate non-escaping leaf values (#839)
 
 **Status:** Accepted. **Relates:** D-0143/D-0144 (#568 frame-skip & inlined
 safepoint), #838 (one-object `ZapStr`), #663/#672 (precise Immix static roots),
@@ -7251,18 +7381,19 @@ iteration), and the string bound `K` = 64 B. Zap is stricter than Go (64 KB
 implicit / 32 B string) because coroutines run on fixed OS-thread stacks rather
 than growable goroutine stacks.
 
-**GC safety (moving Immix).** A stack slot is never relocated and is not a GC
-root (`StackStruct` / stack-`StrBuild` dests are excluded from the shadow-frame
-roots, which keeps the D-0144 frame-skip). This is sound because the value does
-not escape — nothing live is reachable only through it — and, being
-leaf/pointer-free, it holds no outgoing heap pointers, so there is no interior
-root to miss. Safe across a GC safepoint (allocation never collects; at a
-safepoint the slot is live, unmoved, root-contributing-nothing) and across a
-`spawn`/`scope` boundary (a spawned/scoped argument has escaped, so a stack
-object never leaves its coroutine's own stack). `is` identity is preserved
-(distinct allocation ⇒ distinct stable stack address). The collector also
-validates every shadow-stack root against the heap-block registry and ignores a
-stack pointer, so promotion is safe even if a dest were rooted.
+**GC safety (moving Immix).** A stack slot is never relocated by the collector.
+A `StackStruct` holds no outgoing heap pointers, so it is excluded from the
+shadow-frame roots (keeping the D-0144 frame-skip) — sound because the value does
+not escape (nothing live is reachable only through it) and there is no interior
+root to miss. A stack `StrBuild` keeps its ordinary direct-root slot, because it
+may **spill to a heap string** at run time when the join exceeds the inline
+buffer, and that spill must be a precise root (rooting the stack-buffer case is
+harmless — the collector validates each root against the heap-block registry and
+ignores a stack pointer). Safe across a GC safepoint (allocation never collects;
+at a safepoint the slot is live, unmoved) and across a `spawn`/`scope` boundary (a
+spawned/scoped argument has escaped, so a stack object never leaves its
+coroutine's own stack). `is` identity is preserved (distinct allocation ⇒ distinct
+stable stack address).
 
 **Deferred.** Pointer-holding non-escaping structs (v2 — require the precise
 static-root scanner, #663/#672, extended to scan a stack object's interior heap

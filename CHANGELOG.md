@@ -25,7 +25,7 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
-- **Escape analysis — stack-allocate non-escaping leaf values** (#839, D-0149).
+- **Escape analysis — stack-allocate non-escaping leaf values** (#839, D-0150).
   A conservative ZIR pass lowers a `StructNew` or transient f-string whose value
   provably does not escape its function, and which is leaf / pointer-free /
   finalizer-free, to a stack allocation instead of the GC heap: a non-escaping
@@ -892,6 +892,45 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **Runtime fast paths can inline into generated code via LTO** (#841, D-0149).
+  The C runtime was compiled to its own object and linked against the program
+  object, so at the program's optimize step the hot runtime helpers
+  (`zap_dict_get_str_i64`, `zap_str_concat`, `zap_i64_to_str`, …) were opaque
+  external symbols the inliner never saw — every `d[k]` paid an out-of-line call
+  (#837, #568). A new **`ZAP_LTO` build flag** instead emits the program as LLVM
+  bitcode, compiles the runtime to bitcode, **merges the two into one module with
+  `llvm-link`**, strips the per-function target/FP attributes that would block
+  cross-function inlining, and optimizes that module with `opt -O2` before `clang`
+  codegens + links it — so LLVM's cross-module inliner pulls those fast paths into
+  the generated hot loops (everything stays on LLVM 18, no version skew). The
+  runtime bitcode is **cached** (compiled once per source/collector/clang/triple
+  and reused across builds) so an LTO build does not recompile the whole runtime
+  per program. The hot
+  runtime ops are **split into a small `always_inline` fast path + a `noinline`
+  slow path** (e.g. `zap_dict_get` inlines a first-probe identity check and
+  tail-calls the out-of-line probe) so there is something small enough for the
+  cost model to inline into a loop; this also speeds the ordinary object-link
+  build. Records the language decision that **Zap has no `inline` keyword**:
+  inlining is purely the optimizer's job (`-O2` on `def`s, this LTO runtime
+  boundary, and codegen open-coding #842 later), never a source annotation. The
+  flag is **off by default** (unset ⇒ the unchanged object-link build); a
+  toolchain image / CI opts in with `ZAP_LTO=1` (`ZAP_LTO_CC=clang-18`).
+  Correctness is preserved under whole-program LTO: `zap_shadow_head_addr` keeps
+  `noinline` (coroutine-migration GC safety, I#223/#568), the GC-frame +
+  safepoint discipline (D-0144) is unchanged, and the runtime bitcode is
+  compiled with **`-fexceptions`** so its throwing functions (`zap_raise`,
+  `zap_scope_exit`, the `except*` group machinery) are not blanket-marked
+  `nounwind` — without it, `opt -O2` over the merged module trusts that
+  attribute, rewrites the program's `invoke`s to the runtime into plain `call`s,
+  deletes the landing pads, and any caught Zap exception unwinds past every
+  handler to `std::terminate` (an LTO-only miscompile; the object-link path
+  never merges the modules). `crates/driver/tests/lto.rs` asserts the hot `d[k]`
+  fast path inlines while the `noinline` helper stays a call; CI re-runs a small
+  representative golden slice (dict / coroutine / concurrency / `except*`) under
+  `ZAP_LTO=1` on both collectors, while the full corpus runs under the default
+  object-link build. The cheapest, broadest lever of the gap-to-Go
+  set (#837/#839/#840/#841/#842); codegen open-coding (#842) sequences after this
+  and the dict-layout change (#840).
 - **String-keyed `dict` and string allocation made ~2× faster** (#837, D-0145).
   After #568/#835 fixed `fib`/loops, a string-keyed `dict` (build + look up 200k
   `str → int`, keys `f"k{i}"`) was the one microbenchmark still ~2× slower than

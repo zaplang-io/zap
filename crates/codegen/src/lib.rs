@@ -72,6 +72,232 @@ impl Backend for LlvmBackend {
     }
 }
 
+impl LlvmBackend {
+    /// Emit a (type-checked) AST module as an LLVM **bitcode** file for the LTO
+    /// link path (I#841, D-0149). Unlike [`Backend::compile_object`], which runs
+    /// the target backend to native code, this writes the program as LLVM IR
+    /// bitcode so it can be merged with the runtime bitcode (`llvm-link`) and
+    /// optimized together (`clang -O2`) — inlining across the program↔runtime
+    /// boundary. The hot runtime fast paths (`zap_dict_get_*`, `zap_str_concat`,
+    /// `zap_i64_to_str`, …) are opaque external declarations in the program
+    /// module and never inlinable until that merge. Everything stays on LLVM 18
+    /// (inkwell's `llvm18-0` here, `clang-18` for the runtime), so the bitcode
+    /// and clang agree with no version skew.
+    fn compile_bitcode(
+        &self,
+        module: &AstModule,
+        bc_path: &Path,
+        race: bool,
+    ) -> Result<(), String> {
+        let ctx = Context::create();
+        let builder = ctx.create_builder();
+        let (llmod, _tm) = build_llvm_module(&ctx, &builder, module, "zap", false, race)?;
+        // `write_bitcode_to_path` returns false on an I/O failure (it has no
+        // richer error channel); surface the path so a build failure is legible.
+        if llmod.write_bitcode_to_path(bc_path) {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to write bitcode file: {}",
+                bc_path.display()
+            ))
+        }
+    }
+}
+
+/// Strip the per-function `target-cpu` / `target-features` / `tune-cpu` string
+/// attributes from every function in the bitcode module at `path`, rewriting it
+/// in place (I#841, D-0149).
+///
+/// WHY. clang stamps these attributes on every C-runtime function (e.g.
+/// `target-features="+sse2,…"`), but the inkwell-emitted program module carries
+/// none. LLVM's cross-module inliner refuses to inline a callee whose
+/// `target-features` are not a subset of the caller's (`areInlineCompatible`),
+/// so a runtime wrapper (clang attrs) will NOT inline into generated code
+/// (inkwell, no attrs) even after the two modules are merged — the thin
+/// `zap_dict_get_str_i64` wrapper stayed a call and the whole LTO win was lost
+/// (the symptom: the `tests/lto.rs` probe still saw the out-of-line call).
+/// Clearing the attributes on both sides makes the merged module uniformly
+/// attribute-free, so it is optimized + codegen'd with the final driver's
+/// DEFAULT target for the triple (the x86-64 / aarch64 baseline the runtime was
+/// written for — no feature is lost, correctness is unchanged) and the inliner
+/// can finally cross the program↔runtime boundary.
+fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
+    let ctx = Context::create();
+    let m = LlvmModule::parse_bitcode_from_path(path, &ctx).map_err(|e| {
+        format!(
+            "failed to parse bitcode {} for attribute strip: {}",
+            path.display(),
+            e.to_string()
+        )
+    })?;
+    // Every function string attribute that LLVM's `areInlineCompatible` /
+    // `hasCompatibleFnAttrs` consults: target features AND the FP/math mode
+    // attributes clang stamps on the runtime (-O2) but the inkwell program
+    // module does not carry. A mismatch in ANY of them makes the inliner refuse
+    // to inline a runtime callee into a generated caller. Clearing all of them
+    // on every function leaves the merged module uniform, so `opt -O2` uses the
+    // target defaults everywhere and the inliner crosses the boundary.
+    const INLINE_BLOCKING_FN_ATTRS: &[&str] = &[
+        "target-features",
+        "target-cpu",
+        "tune-cpu",
+        "denormal-fp-math",
+        "denormal-fp-math-f32",
+        "no-trapping-math",
+        "no-infs-fp-math",
+        "no-nans-fp-math",
+        "no-signed-zeros-fp-math",
+        "unsafe-fp-math",
+        "approx-func-fp-math",
+        "use-soft-float",
+    ];
+    let mut f = m.get_first_function();
+    while let Some(func) = f {
+        for key in INLINE_BLOCKING_FN_ATTRS {
+            func.remove_string_attribute(AttributeLoc::Function, key);
+        }
+        f = func.get_next_function();
+    }
+    if m.write_bitcode_to_path(path) {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to rewrite bitcode {} after attribute strip",
+            path.display()
+        ))
+    }
+}
+
+/// Obtain the C runtime as attribute-stripped LLVM bitcode for the LTO link,
+/// cached so it is compiled at most once per (runtime source, collector,
+/// portable, clang, triple) rather than once per program (I#841 perf).
+///
+/// The runtime bitcode does not depend on the program being compiled, so the
+/// hundreds of programs an LTO `zap test`/golden run builds can all share one
+/// compiled+stripped copy. Without this the whole runtime was recompiled at
+/// `-O2` and the whole merged module re-stripped for every build, which made
+/// the LTO test suites crawl. The cache lives under `$ZAP_LTO_CACHE` (default a
+/// stable temp subdir); the key is a hash of everything that determines the
+/// bitcode, so a runtime edit or a different clang/collector/triple misses
+/// cleanly. Writes are published by atomic rename, so concurrent builds never
+/// read a half-written file (a lost race just recompiles — same bytes).
+///
+/// `rt_path` must already have `zaprt.c` + its `#include`d `zapgc.inc.c` /
+/// `zaprace.inc.c` written beside it (the caller does this).
+fn lto_runtime_bitcode(
+    cc: &str,
+    rt_path: &Path,
+    triple: &str,
+    portable: bool,
+) -> Result<std::path::PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+
+    let immix = cfg!(feature = "gc-immix");
+    // Only the `--cflags` of CPython embedding (the `-I...`) reach a `-c`
+    // compile; compute them once so they feed both the cache key and the
+    // compile. (Portable drops CPython entirely via -DZAP_NO_CPYTHON.)
+    let py_cflags: Vec<String> = if portable {
+        Vec::new()
+    } else {
+        python_embed_flags()?
+    };
+    let extra = std::env::var("ZAP_CC_EXTRA").unwrap_or_default();
+
+    // Cache key: everything that determines the runtime bitcode.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    RUNTIME_C.hash(&mut h);
+    RUNTIME_GC_C.hash(&mut h);
+    RUNTIME_RACE_C.hash(&mut h);
+    cc.hash(&mut h);
+    triple.hash(&mut h);
+    immix.hash(&mut h);
+    portable.hash(&mut h);
+    py_cflags.hash(&mut h);
+    extra.hash(&mut h);
+    // Bump when the runtime compile flags below change (e.g. adding
+    // -fexceptions) so a stale pre-change cache entry is never reused.
+    "rt-bc-flags-v2-fexceptions".hash(&mut h);
+    // Different clang builds emit different bitcode — fold the version in.
+    if let Ok(out) = Command::new(cc).arg("--version").output() {
+        out.stdout.hash(&mut h);
+    }
+    let key = format!("{:016x}", h.finish());
+
+    let cache_dir = std::env::var_os("ZAP_LTO_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("zap-lto-cache"));
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let cached = cache_dir.join(format!("zaprt-{key}.bc"));
+    if cached.exists() {
+        return Ok(cached);
+    }
+
+    // Miss: compile the runtime to bitcode, strip inline-blocking attrs, and
+    // publish atomically. Compile into a unique temp beside the cache entry.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = cache_dir.join(format!("zaprt-{key}.{}.{nanos}.tmp", std::process::id()));
+    let mut rc = Command::new(cc);
+    rc.arg("-O2")
+        // Compile the runtime with C++/Itanium exceptions ENABLED. zaprt.c
+        // reaches `__cxa_throw` (zap_raise, zap_scope_exit, the except* group
+        // machinery, …), so its functions genuinely participate in unwinding.
+        // Without -fexceptions clang blanket-marks every C function `nounwind`;
+        // once this bitcode is merged with the program (LTO path only), `opt
+        // -O2` trusts that `nounwind`, rewrites the program's `invoke`s to the
+        // runtime into plain `call`s and deletes the landing pads — so a thrown
+        // Zap exception unwinds past every handler straight to std::terminate
+        // (I#841). The non-LTO object link never merges the two modules or
+        // re-runs the optimizer, so it is unaffected and stays as-is.
+        .arg("-fexceptions")
+        .arg("-emit-llvm")
+        .arg("-c")
+        .arg(rt_path)
+        .arg("-o")
+        .arg(&tmp);
+    if immix {
+        rc.arg("-DZAP_GC_IMMIX");
+    }
+    if portable {
+        rc.arg("-DZAP_NO_CPYTHON");
+    } else {
+        rc.args(&py_cflags);
+    }
+    for a in extra.split_whitespace() {
+        rc.arg(a);
+    }
+    let status = rc
+        .status()
+        .map_err(|e| format!("failed to run LTO runtime compile (clang -emit-llvm): {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("LTO runtime bitcode compile failed: {status}"));
+    }
+    // Strip the runtime's target/FP attributes once here so the merged module
+    // never needs a per-build strip (see `strip_target_attrs_bitcode`).
+    if let Err(e) = strip_target_attrs_bitcode(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Publish. If another concurrent build won the race, its copy is identical;
+    // rename overwrites atomically on the same filesystem either way.
+    if let Err(e) = std::fs::rename(&tmp, &cached) {
+        let _ = std::fs::remove_file(&tmp);
+        // A concurrent build may already have published it — accept that.
+        if cached.exists() {
+            return Ok(cached);
+        }
+        return Err(format!(
+            "failed to publish runtime bitcode to cache {}: {e}",
+            cached.display()
+        ));
+    }
+    Ok(cached)
+}
+
 /// Lower a type-checked AST module to a verified in-memory LLVM module (shared
 /// by the object-file backend and the REPL JIT, I#159). Returns the module and
 /// the host target machine whose data layout drove the GC type-descriptor field
@@ -175,6 +401,26 @@ const RUNTIME_NP_IOCP_H: &str = include_str!("zap_np_iocp.h");
 /// Linux 2023 (the AWS `provided.al2023` Lambda base), which a dynamically
 /// glibc-2.39-linked Ubuntu build cannot. `ZAP_PORTABLE=1` forces it on too, so
 /// a toolchain image / CI can default every build to portable without the flag.
+///
+/// Build flags read from the environment (so a toolchain image / CI can set a
+/// default without threading a parameter through every caller):
+///   * `ZAP_PORTABLE` — the self-contained static link profile (above).
+///   * `ZAP_LTO` — LTO the C runtime into the program (I#841, D-0149): emit the
+///     program as LLVM bitcode, compile the runtime to bitcode, merge the two
+///     with `llvm-link`, and optimize/codegen the merged module with `clang -O2`
+///     so LLVM inlines the hot runtime fast paths into generated code. OFF by
+///     default; the non-LTO object-link path and its output are unchanged when
+///     unset. The driver is `clang` (override `ZAP_LTO_CC`, e.g. `clang-18`) and
+///     must match the LLVM that emits the program bitcode (18).
+///   * `ZAP_LLVM_LINK` — the `llvm-link` tool for the LTO merge (default
+///     `llvm-link`; CI pins the matching LLVM 18 one).
+///   * `ZAP_OPT` — the `opt` tool that runs `-O2` (incl. the inliner) over the
+///     merged LTO module (default `opt`; CI pins the LLVM 18 one).
+///   * `ZAP_LTO_CACHE` — directory for the cached runtime bitcode (default a
+///     stable temp subdir); the runtime is compiled to bitcode once per
+///     (source, collector, portable, clang, triple) and reused across builds.
+///   * `ZAP_CC` / `ZAP_LTO_CC` — the linker driver for the default / LTO path.
+///   * `ZAP_CC_EXTRA` — extra driver flags (diagnostics).
 pub fn build_executable(
     module: &AstModule,
     out_path: &Path,
@@ -184,8 +430,39 @@ pub fn build_executable(
     // `ZAP_PORTABLE` (any value) is an environment-level alias for `--portable`:
     // it lets a deployment image default all builds to the portable profile.
     let portable = portable || std::env::var_os("ZAP_PORTABLE").is_some();
-    let obj_path = out_path.with_extension("o");
-    LlvmBackend.compile_object(module, &obj_path, race)?;
+    // LTO the C runtime into the program (I#841, D-0149). Gated behind the
+    // `ZAP_LTO` env build flag — OFF by default, so the normal object-link path
+    // below (and the binary it produces) is byte-for-byte unchanged. When set,
+    // the program is emitted as LLVM bitcode, the runtime is compiled to LLVM
+    // bitcode, the two are **merged into one module with `llvm-link`**, and that
+    // single module is optimized + codegen'd by `clang -O2`. Merging explicitly
+    // (rather than passing a `.bc` + `-flto` and relying on the linker's LTO
+    // plugin) is what actually lets LLVM's cross-module inliner pull the hot
+    // runtime fast paths (`zap_dict_get_*`, `zap_str_concat`, `zap_i64_to_str`,
+    // …) into the generated hot loops: with a merged module the inliner sees
+    // both sides and needs no gold/lld plugin. The language exposes no `inline`
+    // keyword — inlining is purely the optimizer's job, and this flag extends
+    // its reach across the program↔runtime boundary (D-0149). A toolchain image
+    // / CI can default every build to LTO by exporting `ZAP_LTO=1` (the same
+    // env-alias pattern as `ZAP_PORTABLE`). The default is kept conservative
+    // (off) because the merge+`-O2` is slower than the object link and, unlike
+    // it, is not yet the long-exercised default. See DECISIONS.md.
+    let lto = std::env::var_os("ZAP_LTO").is_some();
+    // The program artifact handed to the linker driver: a native object on the
+    // default path, LLVM bitcode under LTO so the cross-module inliner sees it.
+    let prog_path = out_path.with_extension(if lto { "bc" } else { "o" });
+    if lto {
+        LlvmBackend.compile_bitcode(module, &prog_path, race)?;
+        // Clear any inline-blocking target/FP attributes from the (small) program
+        // module up front. It carries none today, but stripping it here — plus
+        // stripping the cached runtime bitcode once (below) — means the merged
+        // module is uniformly attribute-free with NO per-build strip of the big
+        // merged module, so the LTO inliner can always cross the boundary
+        // (I#841). Cheap: the program module is small.
+        strip_target_attrs_bitcode(&prog_path)?;
+    } else {
+        LlvmBackend.compile_object(module, &prog_path, race)?;
+    }
 
     // Write the runtime into a per-build temp dir and let cc compile + link it
     // in. The GC collector include is written alongside so `#include
@@ -214,13 +491,129 @@ pub fn build_executable(
     let triple = TargetMachine::get_default_triple();
     let is_windows = triple.as_str().to_string_lossy().contains("windows");
 
-    // Linker driver. `cc` by default (the MinGW-w64 `gcc`/`cc` on a Windows host
-    // provides the `x86_64-pc-windows-gnu` target); override with `$ZAP_CC`
-    // (e.g. a cross driver `x86_64-w64-mingw32-gcc`). Added for the Windows
-    // bring-up but useful on every platform.
-    let cc = std::env::var("ZAP_CC").unwrap_or_else(|_| "cc".to_string());
+    // Linker driver. On the default path, `cc` (the MinGW-w64 `gcc`/`cc` on a
+    // Windows host provides the `x86_64-pc-windows-gnu` target); override with
+    // `$ZAP_CC` (e.g. a cross driver `x86_64-w64-mingw32-gcc`). Added for the
+    // Windows bring-up but useful on every platform. Under LTO, the driver MUST
+    // be the clang matching the LLVM that emitted the program bitcode (LLVM 18):
+    // a plain `gcc`/`cc` cannot consume LLVM bitcode or drive the LTO backend.
+    // Default `clang`, override with `$ZAP_LTO_CC` (CI pins `clang-18`, which
+    // also backs the embedded runtime's `#include` resolution).
+    let cc = if lto {
+        std::env::var("ZAP_LTO_CC").unwrap_or_else(|_| "clang".to_string())
+    } else {
+        std::env::var("ZAP_CC").unwrap_or_else(|_| "cc".to_string())
+    };
+
+    // Under LTO, build a single merged bitcode module (program + runtime) and
+    // hand THAT to the driver, so the cross-module inliner has already seen both
+    // sides by the time we optimize. `program_input` is the primary artifact the
+    // final driver command consumes: the merged module under LTO, else the
+    // program object (with the runtime source compiled alongside it).
+    let program_input = if lto {
+        // 1. Obtain the runtime as LLVM bitcode — CACHED (I#841 perf). The
+        //    runtime bitcode depends only on the embedded runtime source, the
+        //    collector, the CPython/portable compile flags, and the clang/triple
+        //    — NOT on the program being built — so it is identical across every
+        //    program. The non-cached path recompiled the whole runtime (and
+        //    stripped the whole merged module) for EVERY build; the golden corpus
+        //    builds hundreds of programs, which is why the LTO suite crawled.
+        //    Compile + strip it once, publish into a shared cache, and reuse.
+        let rt_bc = match lto_runtime_bitcode(
+            &cc,
+            &rt_path,
+            triple.as_str().to_string_lossy().as_ref(),
+            portable,
+        ) {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = std::fs::remove_file(&prog_path);
+                let _ = std::fs::remove_dir_all(&build_dir);
+                return Err(e);
+            }
+        };
+        // 2. Merge the program and runtime modules into ONE with `llvm-link`, so
+        //    `clang -O2` below inlines across the former program↔runtime
+        //    boundary with no dependence on a linker LTO plugin. `$ZAP_LLVM_LINK`
+        //    overrides the tool (CI pins the matching LLVM 18 `llvm-link`). Both
+        //    inputs are already attribute-free (the program was stripped above,
+        //    the cached runtime was stripped before caching), so the merged
+        //    module needs no further strip — the inliner can cross the boundary.
+        let llvm_link = std::env::var("ZAP_LLVM_LINK").unwrap_or_else(|_| "llvm-link".to_string());
+        let merged = build_dir.join("merged.bc");
+        let status = Command::new(&llvm_link)
+            .arg(&prog_path)
+            .arg(&rt_bc)
+            .arg("-o")
+            .arg(&merged)
+            .status()
+            .map_err(|e| format!("failed to run llvm-link: {e}"))?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&prog_path);
+            let _ = std::fs::remove_dir_all(&build_dir);
+            return Err(format!(
+                "llvm-link (program + runtime bitcode) failed: {status}"
+            ));
+        }
+        // 3. Optimize the merged module with `opt -O2`. This UNAMBIGUOUSLY runs
+        //    the middle-end pipeline — crucially the inliner — over the whole
+        //    module, so the runtime fast paths inline into generated code.
+        //    (`clang -O2` on a bitcode input codegens it but does not reliably
+        //    re-run the IR optimizer, so the inlining must happen here.) clang
+        //    below then only codegens + links the already-optimized module.
+        //    `$ZAP_OPT` overrides the tool (CI pins the LLVM 18 `opt`).
+        let opt = std::env::var("ZAP_OPT").unwrap_or_else(|_| "opt".to_string());
+        let merged_opt = build_dir.join("merged.opt.bc");
+        let status = Command::new(&opt)
+            .arg("-O2")
+            .arg(&merged)
+            .arg("-o")
+            .arg(&merged_opt)
+            .status()
+            .map_err(|e| format!("failed to run opt: {e}"))?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&prog_path);
+            let _ = std::fs::remove_dir_all(&build_dir);
+            return Err(format!("opt -O2 (merged module) failed: {status}"));
+        }
+        // Diagnostic hook (I#841): when `ZAP_LTO_KEEP=<dir>` is set, copy the
+        // pre- and post-optimize merged modules out of the temp build dir so a
+        // test (or a developer) can disassemble them and see why a runtime call
+        // did or did not inline. Off unless the env var is set; never affects a
+        // normal build.
+        if let Some(keep) = std::env::var_os("ZAP_LTO_KEEP") {
+            let keep = std::path::PathBuf::from(keep);
+            let _ = std::fs::create_dir_all(&keep);
+            let _ = std::fs::copy(&merged, keep.join("merged.bc"));
+            let _ = std::fs::copy(&merged_opt, keep.join("merged.opt.bc"));
+        }
+        merged_opt
+    } else {
+        prog_path.clone()
+    };
+
     let mut cmd = Command::new(&cc);
-    cmd.arg(&obj_path).arg(&rt_path).arg("-o").arg(out_path);
+    cmd.arg(&program_input);
+    if lto {
+        // The merged module was already inlined/optimized by `opt -O2` above;
+        // clang here codegens + links it (-O2 for backend codegen quality).
+        // `zap_shadow_head_addr` keeps its `__attribute__((noinline))` and so
+        // stays an out-of-line call even after inlining (coroutine-migration
+        // correctness: it must resolve the per-thread shadow-head slot on the
+        // CURRENT thread, not a folded/cached base — I#223 / #568). The GC-frame
+        // + safepoint discipline (D-0144) is preserved: the shadow-frame alloca
+        // escapes via `*zap_shadow_head = &frame` so -O2 cannot promote it away,
+        // and inlining a runtime call that contains a safepoint keeps the
+        // safepoint. `crates/driver/tests/lto.rs` asserts the hot `d[k]` fast
+        // path inlines while that call survives.
+        cmd.arg("-O2");
+    } else {
+        // Default path: compile the runtime source as its own translation unit
+        // alongside the already-codegen'd program object, so runtime calls stay
+        // out-of-line (the opaque-external-symbol boundary #841/#568 measured).
+        cmd.arg(&rt_path);
+    }
+    cmd.arg("-o").arg(out_path);
     // Select the collector (ticket #48): the precise Immix GC is compiled into
     // the runtime with -DZAP_GC_IMMIX and needs no Boehm library; the default
     // build links the conservative Boehm collector (-lgc). On Windows the Boehm
@@ -367,7 +760,7 @@ pub fn build_executable(
     let status = cmd
         .status()
         .map_err(|e| format!("failed to run linker (cc): {e}"))?;
-    let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&prog_path);
     let _ = std::fs::remove_dir_all(&build_dir);
     if !status.success() {
         return Err(format!("linker (cc) failed: {status}"));

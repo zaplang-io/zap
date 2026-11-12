@@ -34,6 +34,14 @@ const BENCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Compile and run `src`, returning `(stdout_trimmed, wall_time)`. Panics (fails
 /// the test) on a compile/run error or on exceeding [`BENCH_TIMEOUT`].
 fn run_timed(name: &str, src: &str) -> (String, Duration) {
+    run_timed_opts(name, src, None)
+}
+
+/// Like [`run_timed`], but when `lto` is `Some((clang, llvm_link))` the compile
+/// runs under the `ZAP_LTO` build flag (I#841, D-0149) with those tools, so the
+/// runtime fast paths are inlined into the program. Used by the LTO trend test
+/// to compare the same workload with and without runtime inlining.
+fn run_timed_opts(name: &str, src: &str, lto: Option<(&str, &str, &str)>) -> (String, Duration) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -43,9 +51,15 @@ fn run_timed(name: &str, src: &str) -> (String, Duration) {
     std::fs::write(&path, src).unwrap();
 
     let start = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zapc"))
-        .arg("run")
-        .arg(&path)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_zapc"));
+    cmd.arg("run").arg(&path);
+    if let Some((clang, llvm_link, opt)) = lto {
+        cmd.env("ZAP_LTO", "1")
+            .env("ZAP_LTO_CC", clang)
+            .env("ZAP_LLVM_LINK", llvm_link)
+            .env("ZAP_OPT", opt);
+    }
+    let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -253,6 +267,127 @@ fn perf_bench_suite() {
 
     // Always visible on the console (failures) and in the GitHub Actions run
     // summary (every run) so wins and regressions are tracked over time (#422).
+    eprintln!("\n{report}");
+    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
+            let _ = f.write_all(report.as_bytes());
+        }
+    }
+}
+
+/// Resolve an LLVM 18 tool (`$LLVM_SYS_180_PREFIX/bin/<name>`, then `<name>-18`,
+/// `<name>`, `/usr/lib/llvm-18/bin/<name>`), or `None`. Mirrors `tests/lto.rs`.
+fn find_llvm_tool(name: &str) -> Option<String> {
+    let mut cands: Vec<String> = Vec::new();
+    if let Ok(prefix) = std::env::var("LLVM_SYS_180_PREFIX") {
+        cands.push(format!("{prefix}/bin/{name}"));
+    }
+    cands.push(format!("{name}-18"));
+    cands.push(name.to_string());
+    cands.push(format!("/usr/lib/llvm-18/bin/{name}"));
+    for cand in cands {
+        let ok = Command::new(&cand)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// The `(clang, llvm-link, opt)` LLVM 18 tools for the LTO build, or `None` when
+/// the toolchain is absent (skip the LTO trend test).
+fn lto_tools() -> Option<(String, String, String)> {
+    Some((
+        find_llvm_tool("clang")?,
+        find_llvm_tool("llvm-link")?,
+        find_llvm_tool("opt")?,
+    ))
+}
+
+/// Look up a bench's source + expected output by name.
+fn bench_src(name: &str) -> (&'static str, &'static str) {
+    let b = benches()
+        .into_iter()
+        .find(|b| b.name == name)
+        .unwrap_or_else(|| panic!("no bench named `{name}`"));
+    (b.src, b.expect)
+}
+
+/// LTO runtime-inlining TREND (I#841, D-0149). Runs the dict workloads with and
+/// without the `ZAP_LTO` build flag and records the speedup from inlining the
+/// runtime fast paths into the hot `d[k]` loop. Like the rest of this harness it
+/// asserts correctness and only a LENIENT, machine-independent relation — never
+/// an exact wall-clock or a fixed speedup (CI machines vary, and the LTO link
+/// time is not part of the measured run). The deterministic inlining guard is
+/// `tests/lto.rs`; this is the standing wall-clock record of the win.
+///
+/// Skips when no LLVM-18 clang is on PATH (a dev host without the toolchain); CI
+/// installs `clang-18`, so the trend is recorded there.
+#[test]
+fn perf_lto_dict_inlining_trend() {
+    let Some((clang, llvm_link, opt)) = lto_tools() else {
+        eprintln!(
+            "SKIP perf_lto_dict_inlining_trend: no LLVM 18 clang + llvm-link + opt on PATH \
+             (the LTO build needs all three; CI provides the LLVM 18 toolchain)"
+        );
+        return;
+    };
+
+    let mut report = String::new();
+    report.push_str("\n### Zap LTO runtime-inlining trend (#841)\n\n");
+    report.push_str(
+        "Same dict workload with and without `ZAP_LTO`. Speedup is a TREND signal \
+         (not gated); the deterministic inlining guard is the `tests/lto.rs` \
+         disassembly assertion.\n\n",
+    );
+    report.push_str("| bench | non-LTO (ms) | LTO (ms) | speedup |\n");
+    report.push_str("|---|---:|---:|---:|\n");
+
+    for name in ["dict_int", "dict_string"] {
+        let (src, expect) = bench_src(name);
+
+        let (base_out, base_dur) = run_timed_opts(name, src, None);
+        assert_eq!(
+            base_out, expect,
+            "LTO trend: non-LTO `{name}` produced the wrong result (correctness gate)"
+        );
+
+        let (lto_out, lto_dur) = run_timed_opts(name, src, Some((&clang, &llvm_link, &opt)));
+        assert_eq!(
+            lto_out, expect,
+            "LTO trend: `{name}` under ZAP_LTO produced the wrong result — the LTO \
+             build must stay functionally identical (correctness gate)"
+        );
+
+        // REPORT ONLY — never a pass/fail gate. These timings are whole-`zapc
+        // run` wall-clocks (compile + run), and the LTO compile (llvm-link +
+        // `opt -O2` + clang) is much slower than the object-link compile, so for
+        // these short benchmarks the build time dominates the runtime and a
+        // compile-vs-run wall-clock comparison says nothing about the inlining
+        // win. The deterministic proof that the dict fast path inlines is
+        // `tests/lto.rs` (a disassembly assertion); this table is only a trend
+        // line in the CI summary, held to the GC-golden rule that CI never gates
+        // on wall-clock. The correctness checks above remain the real gate.
+        let base_s = base_dur.as_secs_f64();
+        let lto_s = lto_dur.as_secs_f64();
+        let speedup = base_s / lto_s.max(1e-9);
+        report.push_str(&format!(
+            "| {} | {:.1} | {:.1} | {:.2}× |\n",
+            name,
+            base_s * 1e3,
+            lto_s * 1e3,
+            speedup,
+        ));
+    }
+
     eprintln!("\n{report}");
     if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
         if let Ok(mut f) = std::fs::OpenOptions::new()
