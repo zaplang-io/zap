@@ -25,6 +25,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **The per-iteration safepoint poll is one load, not three** (#860, D-0155).
+  The inlined back-edge safepoint poll (D-0144) loaded three separate `volatile`
+  globals every loop iteration (`zap_gc_wanted`, `zap_collecting`,
+  `zap_preempt_any`) — 90M loads on `loop_sum`'s 30M-iteration loop, the visible
+  remaining per-iteration cost once #857 register-promotes the loop locals. The
+  three advisory flags are now three bit lanes of one `volatile uint32_t
+  zap_safepoint_flags`, so the poll is a single `load volatile i32` + compare +
+  branch. Set/clear became atomic bit RMW (`__atomic_fetch_or`/`_and`, relaxed)
+  so the allocator, collector and fairness monitor never clobber one another's
+  lane; every runtime read site masks the relevant lane. Nothing about *when* a
+  safepoint is taken changes — same placement, frequency, latency, volatile
+  semantics and opaque slow path — only the flag encoding, so GC and preemption
+  correctness are unchanged (all GC / `--race` / preemption goldens stay green).
 - **OpenSSL / PCRE2 / zlib are linked only when the program reaches them**
   (#853, D-0154). The sibling of the libpython gate below: a compiled binary
   used to eagerly hard-link PCRE2 (`libpcre2-8`), zlib (`libz`) and OpenSSL

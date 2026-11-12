@@ -410,14 +410,15 @@ typedef struct ZapMutator {
 static pthread_mutex_t zap_stw_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t zap_stw_cv = PTHREAD_COND_INITIALIZER;
 static ZapMutator *zap_mutators = NULL;
-/* Exported (not `static`) since #568 (D-0144): compiled code's INLINED safepoint
- * poll loads these two flags directly (a `load volatile i32 @zap_gc_wanted` plus
- * the same for `@zap_collecting`), branching to the out-of-line `zap_safepoint`
- * slow path only when one is set — instead of an unconditional non-inlinable call
- * at the top of every block. Their meaning and every set/clear site below are
- * unchanged; only the linkage widened so the symbol is loadable from codegen. */
-volatile int zap_gc_wanted = 0;             /* a collection is due (set by alloc)  */
-volatile int zap_collecting = 0;            /* collection in progress             */
+/* The "collection due" (GC_WANTED) and "collection in progress" (COLLECTING)
+ * flags are now two bit lanes of the coalesced `zap_safepoint_flags` word defined
+ * in zaprt.c above this #include (#860, D-0155) — not two separate `volatile int`
+ * globals. Compiled code's inlined safepoint poll reads the combined word with a
+ * single `load volatile i32` (#568, D-0144); the runtime reads a lane with
+ * `zap_sp_test(ZAP_SP_*)` and sets/clears one with `zap_sp_set`/`zap_sp_clear`
+ * (atomic bit RMW, so the allocator, collector and fairness monitor never clobber
+ * one another's lane). Their meaning and every set/clear site below are unchanged;
+ * only the encoding moved from three words to three lanes of one. */
 static __thread ZapMutator *zap_self = NULL;
 
 static void zap_collect_now(void); /* fwd: drive one full collection (caller is
@@ -482,7 +483,7 @@ static void zap_mutator_unregister(void) {
     }
     pthread_mutex_lock(&zap_stw_mu);
     /* Wait out any in-flight collection so we never unlink mid-mark. */
-    while (zap_collecting) {
+    while (zap_sp_test(ZAP_SP_COLLECTING)) {
         pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
     }
     ZapMutator **pp = &zap_mutators;
@@ -520,7 +521,7 @@ static void zap_leave_blocking(void) {
         return;
     }
     pthread_mutex_lock(&zap_stw_mu);
-    while (zap_collecting) {
+    while (zap_sp_test(ZAP_SP_COLLECTING)) {
         pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
     }
     zap_self->state = ZAP_MUT_ACTIVE;
@@ -548,19 +549,19 @@ void zap_safepoint(void) {
          * handler; read and cleared here via RELAXED atomics (#213, D-0121),
          * never plain `volatile`. */
         if (m && __atomic_load_n(&m->preempt, __ATOMIC_RELAXED) && m->current &&
-            !zap_gc_wanted && !zap_collecting) {
+            !zap_sp_test(ZAP_SP_GC_WANTED | ZAP_SP_COLLECTING)) {
             __atomic_store_n(&m->preempt, 0, __ATOMIC_RELAXED);
             copreempt();
         }
     }
-    if (!zap_gc_wanted && !zap_collecting) {
-        return; /* fast path: two loads, predicted not-taken */
+    if (!zap_sp_test(ZAP_SP_GC_WANTED | ZAP_SP_COLLECTING)) {
+        return; /* fast path: one masked load, predicted not-taken */
     }
     if (!zap_self) {
         return; /* a thread that never ran Zap holds no un-flushed roots */
     }
     pthread_mutex_lock(&zap_stw_mu);
-    if (zap_gc_wanted && !zap_collecting) {
+    if (zap_sp_test(ZAP_SP_GC_WANTED) && !zap_sp_test(ZAP_SP_COLLECTING)) {
         pthread_mutex_unlock(&zap_stw_mu);
         zap_collect_now(); /* become the collector */
         return;
@@ -569,7 +570,7 @@ void zap_safepoint(void) {
     zap_flush_shadow();
     zap_self->state = ZAP_MUT_PARKED;
     pthread_cond_broadcast(&zap_stw_cv);
-    while (zap_collecting) {
+    while (zap_sp_test(ZAP_SP_COLLECTING)) {
         pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
     }
     zap_self->state = ZAP_MUT_ACTIVE;
@@ -1333,14 +1334,14 @@ static void zap_reset_alloc_bufs(void) {
  * zap_safepoint / zap_*_blocking. */
 static void zap_collect_now(void) {
     pthread_mutex_lock(&zap_stw_mu);
-    if (zap_collecting) {
+    if (zap_sp_test(ZAP_SP_COLLECTING)) {
         /* Lost the race: another thread already collects. Park and wait. */
         zap_flush_shadow();
         if (zap_self) {
             zap_self->state = ZAP_MUT_PARKED;
             pthread_cond_broadcast(&zap_stw_cv);
         }
-        while (zap_collecting) {
+        while (zap_sp_test(ZAP_SP_COLLECTING)) {
             pthread_cond_wait(&zap_stw_cv, &zap_stw_mu);
         }
         if (zap_self) {
@@ -1349,8 +1350,8 @@ static void zap_collect_now(void) {
         pthread_mutex_unlock(&zap_stw_mu);
         return;
     }
-    zap_collecting = 1;
-    zap_gc_wanted = 0;
+    zap_sp_set(ZAP_SP_COLLECTING);
+    zap_sp_clear(ZAP_SP_GC_WANTED);
     zap_flush_shadow();
     if (zap_self) {
         zap_self->state = ZAP_MUT_PARKED;
@@ -1383,7 +1384,7 @@ static void zap_collect_now(void) {
     pthread_mutex_unlock(&zap_heap_mu);
 
     pthread_mutex_lock(&zap_stw_mu);
-    zap_collecting = 0;
+    zap_sp_clear(ZAP_SP_COLLECTING);
     if (zap_self) {
         zap_self->state = ZAP_MUT_ACTIVE;
     }
@@ -1463,7 +1464,7 @@ static ZapBlock *zap_map_block(void) {
 static void zap_account_refill(ZapBlock *b) {
     zap_bytes_since_gc += b->avail;
     if (zap_bytes_since_gc >= zap_gc_threshold) {
-        zap_gc_wanted = 1; /* collect at the next safepoint */
+        zap_sp_set(ZAP_SP_GC_WANTED); /* collect at the next safepoint */
     }
     /* Enforce the optional hard cap (ZAP_GC_HEAP_LIMIT) on mapped memory. Freed
      * blocks are reused rather than unmapped, so with a working collector the
@@ -1598,7 +1599,7 @@ static void *zap_alloc_los(size_t osize) {
     zap_total_mapped += total;
     zap_bytes_since_gc += osize;
     if (zap_bytes_since_gc >= zap_gc_threshold) {
-        zap_gc_wanted = 1; /* collect at the next safepoint */
+        zap_sp_set(ZAP_SP_GC_WANTED); /* collect at the next safepoint */
     }
     if (zap_heap_limit && zap_total_mapped > zap_heap_limit) {
         pthread_mutex_unlock(&zap_heap_mu);

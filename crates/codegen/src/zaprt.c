@@ -5699,20 +5699,57 @@ static void zap_boehm_gc_event(GC_EventType e) {
 static void cosched(void);   /* fwd (cooperative yield, defined below)          */
 void zap_sched_init(int64_t n_threads); /* fwd (defined below)                  */
 
-/* Global "some M has a pending fairness preemption" flag (#568, D-0144). The
- * monitor recomputes it once per tick as the OR of every M's `preempt` latch
- * (it is the sole writer, so there is no clear/set race). Compiled code's inlined
- * safepoint poll loads it alongside the GC flags: a tight, call-free loop reads
- * `zap_preempt_any` on its back-edge and takes the `zap_safepoint` slow path when
- * set, where the precise per-M `m->preempt` check (which needs the thread-local
- * `cur_m`, unsafe to read from migratable inlined code) runs and yields. A stale
- * 1 only costs an extra slow-path call that finds nothing and returns; the
- * monitor clears it within one ~10 ms tick of the last preempt being consumed, so
- * the window is bounded and the preemption granularity is unchanged. Exported so
- * codegen can load it; only the Immix inline poll reads it (Boehm preempts via a
- * direct signal switch and never reads the flag), but it is defined on both
- * builds because the monitor is shared. */
-volatile int zap_preempt_any = 0;
+/* Coalesced safepoint-poll word (#860, D-0155). The inlined back-edge poll (#568,
+ * D-0144) used to load THREE separate `volatile int` globals every iteration —
+ * `zap_gc_wanted`, `zap_collecting` (both in zapgc.inc.c) and `zap_preempt_any`
+ * (here) — OR them, and branch to the out-of-line `zap_safepoint` slow path when
+ * any was set. On `loop_sum`'s 30M-iteration tight loop that is 90M loads of
+ * globals that are almost always zero (#857 register-promotes the loop locals, so
+ * these three poll loads became the visible remaining per-iteration cost). They
+ * are now three BIT LANES of ONE `volatile uint32_t`, so the poll is a single
+ * `load volatile i32` + `icmp ne 0` + branch (see `Cg::gc_safepoint`).
+ *
+ * Placement, frequency, volatile semantics (so #857's `-O2` still cannot hoist
+ * the load out of the loop) and the opaque `zap_safepoint` slow path are ALL
+ * unchanged — only the flag ENCODING changed. A coalesced-word false positive
+ * (any lane set) is the same harmless extra slow-path visit as before: the slow
+ * path re-checks the precise per-M preempt latch and the GC handshake.
+ *
+ * The three lanes have three INDEPENDENT writers — the allocator sets GC_WANTED
+ * (zapgc.inc.c), the collector sets/clears COLLECTING and clears GC_WANTED, and
+ * the fairness monitor republishes PREEMPT every ~10 ms tick — so a writer must
+ * not clobber another writer's lane. Set/clear are therefore ATOMIC bit RMW
+ * (`__atomic_fetch_or`/`__atomic_fetch_and`), never a plain store that would
+ * load-modify-store the whole word. RELAXED ordering suffices: these are advisory
+ * flags whose slow path re-checks the precise state under `zap_stw_mu`, exactly
+ * as the old separate flags did (`m->preempt` is itself a RELAXED latch, #213 /
+ * D-0121). Reads are a RELAXED atomic load of the whole word masked to the lane —
+ * a single aligned 32-bit load, the same cost as the old per-flag read.
+ *
+ * Exported (external linkage) so codegen's inline poll loads the symbol as an
+ * ordinary external `i32`, like the old flags. Defined on BOTH builds because the
+ * monitor (shared) publishes the PREEMPT lane; under Boehm the GC lanes are
+ * unused and compiled code never reads the word (Boehm preempts via a direct
+ * signal switch). */
+volatile uint32_t zap_safepoint_flags = 0;
+#define ZAP_SP_GC_WANTED 0x1u  /* a collection is due (set by alloc)        */
+#define ZAP_SP_COLLECTING 0x2u /* a collection is in progress               */
+#define ZAP_SP_PREEMPT 0x4u    /* some M has a pending fairness preemption   */
+
+/* Lane accessors over `zap_safepoint_flags`. `zap_sp_test(mask)` is true when ANY
+ * bit of `mask` is set, so a combined check like the old `zap_gc_wanted ||
+ * zap_collecting` is one masked load: `zap_sp_test(ZAP_SP_GC_WANTED |
+ * ZAP_SP_COLLECTING)`. Set/clear are atomic RMW so a concurrent writer of another
+ * lane is never lost. */
+static inline int zap_sp_test(uint32_t mask) {
+    return (__atomic_load_n(&zap_safepoint_flags, __ATOMIC_RELAXED) & mask) != 0;
+}
+static inline void zap_sp_set(uint32_t lane) {
+    __atomic_fetch_or(&zap_safepoint_flags, lane, __ATOMIC_RELAXED);
+}
+static inline void zap_sp_clear(uint32_t lane) {
+    __atomic_fetch_and(&zap_safepoint_flags, ~lane, __ATOMIC_RELAXED);
+}
 
 #if defined(ZAP_PLATFORM_POSIX)
 /* SIGURG handler: the preemption point. Installed process-wide; only acts on a
@@ -5800,9 +5837,10 @@ static void *zap_monitor_main(void *arg) {
         if (__atomic_load_n(&g_shutdown, __ATOMIC_RELAXED)) {
             break;
         }
-        /* OR of every M's preempt latch this tick, published to the exported
-         * `zap_preempt_any` after the scan so compiled code's inline poll sees a
-         * pending preemption and clears it once all are consumed (#568, D-0144). */
+        /* OR of every M's preempt latch this tick, published to the PREEMPT lane of
+         * `zap_safepoint_flags` after the scan so compiled code's inline poll sees a
+         * pending preemption and clears it once all are consumed (#568, D-0144;
+         * coalesced lane, #860, D-0155). */
         int preempt_any = 0;
         for (int i = 0; i < g_nm; i++) {
             M *m = &g_ms[i];
@@ -5858,11 +5896,18 @@ static void *zap_monitor_main(void *arg) {
             last[i] = tick;
             preempt_any |= __atomic_load_n(&m->preempt, __ATOMIC_RELAXED);
         }
-        /* Single-writer publish: no other thread stores `zap_preempt_any`, so a
-         * just-flagged M (set above in this same scan) is included, and the flag
+        /* Publish the PREEMPT lane (#568, #860). The monitor is the sole writer of
+         * THIS lane, but the GC lanes of the shared word are written concurrently
+         * by the allocator and collector, so the lane is updated via an atomic RMW
+         * (not a whole-word store that would clobber a concurrent GC-lane write). A
+         * just-flagged M (set above in this same scan) is included, and the lane
          * drops to 0 only on a tick where every latch reads 0 — i.e. nothing is
-         * genuinely pending (#568). */
-        __atomic_store_n(&zap_preempt_any, preempt_any, __ATOMIC_RELAXED);
+         * genuinely pending. */
+        if (preempt_any) {
+            zap_sp_set(ZAP_SP_PREEMPT);
+        } else {
+            zap_sp_clear(ZAP_SP_PREEMPT);
+        }
     }
     free(last);
     return NULL;
@@ -20210,7 +20255,7 @@ static void zap_prof_handler(int sig, siginfo_t *info, void *uc) {
 #ifdef ZAP_GC_IMMIX
     /* Off-CPU (blocked in a syscall / parked for GC) or mid-collection: not a CPU
      * sample. zap_self is this thread's own mutator node, safe to read here. */
-    if (zap_collecting || zap_gc_wanted) {
+    if (zap_sp_test(ZAP_SP_COLLECTING | ZAP_SP_GC_WANTED)) {
         return;
     }
     if (zap_self && zap_self->state != ZAP_MUT_ACTIVE) {

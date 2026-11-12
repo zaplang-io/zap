@@ -115,7 +115,7 @@ fn opt_pipeline_spec() -> &'static str {
 ///   `mem2reg`/SROA cannot promote it to a register and the per-root stores are
 ///   not dead — a collection walking the shadow stack still finds every root.
 /// * **Safepoint polls are not hoisted, reordered or deleted.** Each poll loads
-///   `zap_gc_wanted`/`zap_collecting`/`zap_preempt_any` with **volatile** loads
+///   the coalesced `zap_safepoint_flags` word (#860) with a **volatile** load
 ///   (see [`Cg::gc_safepoint`]); LICM cannot hoist a volatile access out of the
 ///   loop and DCE cannot drop it, and a volatile memory op also keeps the loop
 ///   itself from being deleted (so a tight GC-free loop still polls every
@@ -2272,22 +2272,24 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             // MCJIT cannot emit a dynamic-TLS access to the dlopen'd runtime's
             // `__thread` global). See `gc_head`.
             self.declare_rt("zap_shadow_head_addr", &[], Some(p.into()));
-            // Inline safepoint poll (#568, D-0144). The hot path no longer calls
-            // the non-inlinable `zap_safepoint` on every block; it loads these
-            // three exported runtime flags and branches to the out-of-line slow
-            // path only when one is set (see `gc_safepoint`). They are PLAIN (not
-            // thread-local) globals, so both the AOT backend and the REPL JIT
-            // (MCJIT) resolve them as ordinary external symbols — unlike the
-            // `__thread zap_shadow_head`, which needs the `*_addr` helper.
-            //   * `zap_gc_wanted` / `zap_collecting` — the GC flags the slow path
-            //     already checks; a collection is due / in progress.
-            //   * `zap_preempt_any` — set by the monitor when any M has a pending
-            //     fairness preemption, so a tight call-free loop still yields.
+            // Inline safepoint poll (#568, D-0144; coalesced #860, D-0155). The hot
+            // path no longer calls the non-inlinable `zap_safepoint` on every
+            // block; it loads ONE exported runtime word and branches to the
+            // out-of-line slow path only when any lane is set (see `gc_safepoint`).
+            // It is a PLAIN (not thread-local) global, so both the AOT backend and
+            // the REPL JIT (MCJIT) resolve it as an ordinary external symbol —
+            // unlike the `__thread zap_shadow_head`, which needs the `*_addr`
+            // helper. The word packs the three advisory flags the poll used to read
+            // as three separate globals into three bit lanes (zaprt.c):
+            //   * GC_WANTED / COLLECTING — the GC flags the slow path already
+            //     checks; a collection is due / in progress.
+            //   * PREEMPT — set by the monitor when any M has a pending fairness
+            //     preemption, so a tight call-free loop still yields.
+            // Coalescing them means the back-edge poll is a single `load volatile
+            // i32`, not three (the #860 win once #857 register-promotes the loop).
             let i32t = self.ctx.i32_type();
-            for name in ["zap_gc_wanted", "zap_collecting", "zap_preempt_any"] {
-                let g = self.module.add_global(i32t, None, name);
-                g.set_linkage(inkwell::module::Linkage::External);
-            }
+            let g = self.module.add_global(i32t, None, "zap_safepoint_flags");
+            g.set_linkage(inkwell::module::Linkage::External);
         }
 
         // Build LLVM struct types (fields are scalars or pointers, so no
@@ -2608,13 +2610,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     /// integer-only functions: recursive `fib` paid three such calls per call,
     /// each re-reading thread-local state inside the runtime. The poll is now an
     /// INLINED flag check — load the three exported runtime flags and branch to
-    /// the out-of-line `zap_safepoint` slow path only when one is set:
+    /// the out-of-line `zap_safepoint` slow path only when one is set. The three
+    /// advisory flags are three bit lanes of ONE exported word (#860, D-0155), so
+    /// the poll is a SINGLE volatile load, not three:
     ///
     /// ```text
-    ///   %w = load volatile i32, ptr @zap_gc_wanted
-    ///   %c = load volatile i32, ptr @zap_collecting
-    ///   %p = load volatile i32, ptr @zap_preempt_any
-    ///   %need = icmp ne (%w | %c | %p), 0        ; hinted false
+    ///   %f = load volatile i32, ptr @zap_safepoint_flags
+    ///   %need = icmp ne i32 %f, 0                 ; hinted false
     ///   br %need, label %sp.slow, label %sp.cont
     /// sp.slow:                                    ; cold
     ///   call void @zap_safepoint()
@@ -2622,8 +2624,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     /// sp.cont:
     /// ```
     ///
-    /// The loads are `volatile` so LICM cannot hoist them out of a loop — a
-    /// back-edge poll must re-read the flags every iteration. The slow path keeps
+    /// The load is `volatile` so LICM (and #857's `-O2` pipeline) cannot hoist it
+    /// out of a loop — a back-edge poll must re-read the word every iteration. Any
+    /// lane set (GC due/in-progress, or a pending preemption) takes the slow path,
+    /// which re-checks the precise per-M / per-collection state exactly as before;
+    /// the coalesce changed only the flag encoding, not when a safepoint is taken.
+    /// The slow path keeps
     /// the exact semantics of the old call: it re-checks precisely, drives the
     /// collection or the preemption yield, and parks. Splitting the current block
     /// in two is why this takes `fv`: it appends the `sp.slow`/`sp.cont` blocks
@@ -2633,27 +2639,24 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     fn gc_safepoint(&self, fv: FunctionValue<'ctx>) -> Result<(), String> {
         let b = self.builder;
         let i32t = self.ctx.i32_type();
-        let load_flag = |name: &str| -> Result<inkwell::values::IntValue<'ctx>, String> {
-            let g = self
-                .module
-                .get_global(name)
-                .ok_or_else(|| format!("safepoint poll flag `{name}` not declared"))?;
-            let v = b
-                .build_load(i32t, g.as_pointer_value(), name)
-                .map_err(|e| e.to_string())?;
-            v.as_instruction_value()
-                .expect("load is an instruction")
-                .set_volatile(true)
-                .map_err(|_| "set volatile on poll load".to_string())?;
-            Ok(v.into_int_value())
-        };
-        let w = load_flag("zap_gc_wanted")?;
-        let c = load_flag("zap_collecting")?;
-        let p = load_flag("zap_preempt_any")?;
-        let wc = b.build_or(w, c, "sp.or0").map_err(|e| e.to_string())?;
-        let any = b.build_or(wc, p, "sp.any").map_err(|e| e.to_string())?;
+        // ONE volatile load of the coalesced flag word (#860, D-0155) — down from
+        // three per-flag loads. `volatile` so the back-edge poll re-reads it every
+        // iteration (neither LICM nor #857's `-O2` can hoist it out of the loop).
+        let name = "zap_safepoint_flags";
+        let g = self
+            .module
+            .get_global(name)
+            .ok_or_else(|| format!("safepoint poll flag `{name}` not declared"))?;
+        let v = b
+            .build_load(i32t, g.as_pointer_value(), name)
+            .map_err(|e| e.to_string())?;
+        v.as_instruction_value()
+            .expect("load is an instruction")
+            .set_volatile(true)
+            .map_err(|_| "set volatile on poll load".to_string())?;
+        let flags = v.into_int_value();
         let need = b
-            .build_int_compare(IntPredicate::NE, any, i32t.const_zero(), "sp.need")
+            .build_int_compare(IntPredicate::NE, flags, i32t.const_zero(), "sp.need")
             .map_err(|e| e.to_string())?;
         // Hint "no safepoint" as the common case so the backend lays the call out
         // cold (predicted not-taken), keeping the hot path a load + branch.
@@ -5729,7 +5732,7 @@ mod tests {
     // loop, so it emits exactly ONE safepoint poll (function entry) — the old
     // FORK-4a emission put a non-inlinable `call zap_safepoint` at the top of
     // every block (the "3× safepoint per call" #568 measured). The poll is now an
-    // inlined flag check that loads `@zap_gc_wanted` and branches to the cold
+    // inlined flag check that loads `@zap_safepoint_flags` and branches to the cold
     // slow path, so the hot path carries no call and no thread-local read.
     #[cfg(feature = "gc-immix")]
     #[test]
@@ -5745,7 +5748,7 @@ mod tests {
             "a GC-free function must emit no shadow frame:\n{fib}"
         );
         assert!(
-            fib.contains("@zap_gc_wanted"),
+            fib.contains("@zap_safepoint_flags"),
             "the safepoint must be an inlined flag check:\n{fib}"
         );
         let polls = fib.matches("call void @zap_safepoint()").count();
@@ -5772,7 +5775,7 @@ mod tests {
             "a GC-free loop needs no shadow frame:\n{spin}"
         );
         assert!(
-            spin.contains("@zap_gc_wanted"),
+            spin.contains("@zap_safepoint_flags"),
             "the loop poll must be the inlined flag check:\n{spin}"
         );
         let polls = spin.matches("call void @zap_safepoint()").count();
@@ -5780,6 +5783,57 @@ mod tests {
             polls >= 2,
             "a loop must keep an entry poll and a back-edge (loop-header) poll; got {polls}:\n{spin}"
         );
+        // #860 (D-0155): each poll is ONE volatile load of the coalesced word, so
+        // the volatile-flag-load count matches the poll count exactly (pre-#860 it
+        // was 3× the poll count — three separate flag globals per poll).
+        let flag_loads = spin.matches("load volatile i32").count();
+        assert_eq!(
+            flag_loads, polls,
+            "each safepoint poll must be exactly ONE coalesced volatile load \
+             (#860); got {flag_loads} loads for {polls} polls:\n{spin}"
+        );
+    }
+
+    // #860 (D-0155): the three per-iteration poll flags (`zap_gc_wanted`,
+    // `zap_collecting`, `zap_preempt_any`) are coalesced into ONE `volatile
+    // uint32_t zap_safepoint_flags` with three bit lanes, so a safepoint poll is a
+    // SINGLE `load volatile i32` + `icmp ne 0` + branch — not three loads OR'd
+    // together. WRITTEN FIRST: it encodes the #860 intent (one load, old symbols
+    // gone). `fib` is GC-free and loopless, so it emits exactly one (entry) poll
+    // and therefore exactly one volatile flag load.
+    #[cfg(feature = "gc-immix")]
+    #[test]
+    fn safepoint_poll_is_a_single_coalesced_load() {
+        let fib = one_fn_ir(
+            &llvm_ir(
+                "def fib(int64 n) -> int64:\n    if n < 2:\n        return n\n    \
+                 return fib(n - 1) + fib(n - 2)\n\
+                 def main():\n    print(fib(10))\n",
+            ),
+            "fib",
+        );
+        // The poll reads the coalesced word...
+        assert!(
+            fib.contains("@zap_safepoint_flags"),
+            "the safepoint poll must read the coalesced flag word:\n{fib}"
+        );
+        // ...with exactly ONE volatile load (one poll => one load; #860 removed the
+        // other two). The only volatile loads compiled code emits are poll loads.
+        let loads = fib.matches("load volatile i32").count();
+        assert_eq!(
+            loads, 1,
+            "a single-poll (loopless, GC-free) function must emit exactly ONE \
+             volatile flag load after coalescing (#860), not three; got {loads}:\n{fib}"
+        );
+        // The three old separate flag symbols must be gone entirely — a lingering
+        // reference would mean a poll (or a missed read site) still used an old
+        // global, a silent correctness hazard the #860 sweep must not leave.
+        for old in ["@zap_gc_wanted", "@zap_collecting", "@zap_preempt_any"] {
+            assert!(
+                !fib.contains(old),
+                "coalesce #860 must remove the old separate flag `{old}`:\n{fib}"
+            );
+        }
     }
 
     // Regression guard for the other direction: a function that holds a managed
@@ -5800,7 +5854,7 @@ mod tests {
         );
         // And the poll is still the inlined flag check, not the old bare call.
         assert!(
-            build.contains("@zap_gc_wanted"),
+            build.contains("@zap_safepoint_flags"),
             "a GC-using function still uses the inlined safepoint poll:\n{build}"
         );
     }
@@ -5858,7 +5912,7 @@ mod tests {
         // The back-edge safepoint poll is preserved (volatile loads => the loop is
         // not deleted and still polls every iteration).
         assert!(
-            spin.contains("@zap_gc_wanted"),
+            spin.contains("@zap_safepoint_flags"),
             "O2 must preserve the back-edge safepoint poll (GC/preemption liveness):\n{spin}"
         );
         // Register promotion happened: the induction variable is now an SSA phi...
