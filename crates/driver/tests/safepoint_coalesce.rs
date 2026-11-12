@@ -15,17 +15,22 @@
 //! (`safepoint_poll_is_a_single_coalesced_load` / `gc_free_loop_keeps_backedge_safepoint`
 //! in crates/codegen/src/lib.rs); THIS test confirms the coalesce survives to
 //! machine code on the shipping build:
-//!   1. the final binary references NONE of the three old flag symbols — a
-//!      lingering reference would mean codegen or a runtime read site still used a
-//!      pre-#860 global, a silent GC/preemption-correctness hazard — and
-//!   2. the hot loop's disassembly references the coalesced word
-//!      `zap_safepoint_flags` (the poll reads the one word, not three globals)
-//!      while still calling `zap_safepoint` on the cold slow path.
+//!   1. the final binary's symbol table (`nm`) contains NONE of the three old
+//!      flag symbols and DOES define the single coalesced `zap_safepoint_flags`
+//!      word — a surviving old symbol would mean codegen or a runtime read site
+//!      still used a pre-#860 global, a silent GC/preemption-correctness hazard —
+//!      and
+//!   2. the hot loop still calls `zap_safepoint` on the cold slow path (the poll
+//!      is not dropped). The symbol checks go through `nm` rather than objdump
+//!      annotations because reaching a global is encoded differently per arch
+//!      (x86-64 RIP-relative `lea`/`mov` vs aarch64 `adrp`/GOT, often lifted out
+//!      of the loop body), but symbol-table presence/absence is arch-independent.
 //!
 //! Needs the precise collector (the inline poll only exists under `ZAP_GC_IMMIX`;
 //! the Boehm build preempts via a direct signal switch and emits no poll) plus
-//! `objdump`, so it is gated like `gc.rs`/`lto.rs`: if `objdump` is absent (a dev
-//! host without binutils) the test SKIPS rather than failing — CI provides it.
+//! `objdump` and `nm`, so it is gated like `gc.rs`/`lto.rs`: if either tool is
+//! absent (a dev host without binutils) the test SKIPS rather than failing — CI
+//! provides them.
 
 #![cfg(all(feature = "codegen", feature = "gc-immix"))]
 
@@ -98,6 +103,36 @@ fn disasm(bin: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Whether `nm` is available (used for arch-independent symbol presence/absence).
+fn has_nm() -> bool {
+    Command::new("nm")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The set of symbol NAMES `nm` lists for `bin` (the last whitespace-delimited
+/// column of each line — defined or undefined). Used to check a symbol's presence
+/// or absence independently of instruction encoding: x86-64 reaches a global with
+/// a RIP-relative `lea`/`mov` that objdump annotates inline, but aarch64 uses an
+/// `adrp`/GOT pair often lifted to a literal pool outside the function body, so
+/// scraping objdump annotations is not portable. A symbol's presence in the
+/// table is.
+fn nm_symbols(bin: &std::path::Path) -> std::collections::HashSet<String> {
+    let out = Command::new("nm").arg(bin).output().expect("spawn nm");
+    assert!(
+        out.status.success(),
+        "nm {} failed: {}",
+        bin.display(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next_back().map(str::to_string))
+        .collect()
+}
+
 /// The disassembly lines of the function whose label is `<sym>:`, from the label
 /// up to (not including) the next `<...>:` function label. Empty if not found.
 fn fn_region<'a>(disasm: &'a str, sym: &str) -> Vec<&'a str> {
@@ -136,66 +171,66 @@ fn sym_refs(lines: &[&str], sym: &str) -> usize {
 
 #[test]
 fn hot_loop_poll_is_one_coalesced_load_not_three() {
-    if !has_objdump() {
+    if !has_objdump() || !has_nm() {
         eprintln!(
-            "SKIP hot_loop_poll_is_one_coalesced_load_not_three: no objdump on PATH \
-             (binutils is required to inspect the final binary; CI provides it)"
+            "SKIP hot_loop_poll_is_one_coalesced_load_not_three: objdump and nm are \
+             required to inspect the final binary (binutils; CI provides it)"
         );
         return;
     }
 
     let root = std::env::temp_dir().join(format!("zapsp860-{}", std::process::id()));
     let bin = build_binary(&root);
-    let dis = disasm(&bin);
 
-    // Whole-binary guard: the three old flag symbols must be GONE everywhere — not
-    // referenced, and not even defined. A lingering reference would mean codegen or
-    // a runtime read site still touched a pre-#860 global (a missed collection or a
-    // missed preempt). Checked over the full disassembly, not just `spin`.
-    let all: Vec<&str> = dis.lines().collect();
+    // Symbol-table guard (arch-independent, via `nm`). The three old flag globals
+    // must be GONE — the coalesce removed their definitions and swept every
+    // codegen/runtime reference, so neither codegen nor a runtime read site can
+    // still touch a pre-#860 global (a missed collection or a missed preempt). The
+    // single coalesced word must be present (defined). This holds identically on
+    // x86-64 and aarch64, unlike the instruction encoding that reaches the global.
+    let syms = nm_symbols(&bin);
     for old in ["zap_gc_wanted", "zap_collecting", "zap_preempt_any"] {
-        let refs = sym_refs(&all, old);
-        assert_eq!(
-            refs, 0,
-            "coalesce #860 must remove the old flag `{old}` from the binary; found {refs} refs"
+        assert!(
+            !syms.contains(old),
+            "coalesce #860 must remove the old flag symbol `{old}` from the binary"
         );
     }
+    assert!(
+        syms.contains("zap_safepoint_flags"),
+        "coalesce #860 must define the single `zap_safepoint_flags` word in the binary"
+    );
 
-    // The hot loop (`spin`) must reach a safepoint — it still CALLS `zap_safepoint`
-    // on the cold slow path (one call per poll: entry + back-edge) — and the poll
-    // now reads the coalesced `zap_safepoint_flags` word. Both must be present or
-    // the probe proves nothing.
+    // Poll-liveness guard (objdump): the hot loop (`spin`) must still reach a
+    // safepoint — it CALLS `zap_safepoint` on the cold slow path (one call per
+    // poll: entry + back-edge). This is the GC/preemption liveness the coalesce
+    // must not drop.
+    let dis = disasm(&bin);
     let spin = fn_region(&dis, "spin");
     assert!(
         !spin.is_empty(),
         "could not locate `spin` in the disassembly:\n{dis}"
     );
     let polls = sym_refs(&spin, "zap_safepoint");
-    let flag_loads = sym_refs(&spin, "zap_safepoint_flags");
-    // Diagnostic (always printed): loads-per-poll. In the common case (direct
-    // RIP-relative addressing of the executable's own defined global) each poll is
-    // one annotated load, so this reads 1:1; under PIE/GOT indirection the
-    // invariant GOT-address load may be CSE'd across polls while the volatile
-    // value deref — unannotated — stays per-poll, so the annotated count can read
-    // below the poll count. The deterministic, machine-independent "exactly one
-    // volatile load per poll" guard is the codegen IR test
-    // (`gc_free_loop_keeps_backedge_safepoint`); here we only assert the coalesce
-    // reached machine code (word present, old symbols gone).
-    eprintln!(
-        "#860 asm: spin polls (zap_safepoint calls) = {polls}, \
-         coalesced flag-load refs (zap_safepoint_flags) = {flag_loads}"
-    );
     assert!(
         polls >= 1,
         "the hot loop must keep its safepoint poll(s) (GC/preemption liveness); \
          found {polls} `zap_safepoint` calls in spin:\n{}",
         spin.join("\n"),
     );
-    assert!(
-        flag_loads >= 1,
-        "#860: the hot loop's safepoint poll must read the coalesced \
-         `zap_safepoint_flags` word; found {flag_loads} refs in spin:\n{}",
-        spin.join("\n"),
+
+    // Diagnostic (always printed): the per-poll annotated flag-load count in the
+    // hot loop. On x86-64 each poll is a RIP-relative load objdump annotates with
+    // `<zap_safepoint_flags>`, so this reads ~1 per poll; on aarch64 the `adrp`/GOT
+    // address materialization is often lifted out of the loop body (and may carry
+    // no inline symbol comment), so it can read 0 here even though the poll loads
+    // the word. The deterministic, machine-independent "exactly one volatile load
+    // per poll" guard is the codegen IR test (`gc_free_loop_keeps_backedge_safepoint`);
+    // this test only confirms, at the binary level, that the coalesce happened
+    // (old symbols gone, one word defined) and the loop still polls.
+    let flag_loads = sym_refs(&spin, "zap_safepoint_flags");
+    eprintln!(
+        "#860 asm: spin polls (zap_safepoint calls) = {polls}, \
+         annotated flag-load refs in spin (zap_safepoint_flags) = {flag_loads}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
