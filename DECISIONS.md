@@ -7454,3 +7454,72 @@ correct across forced `gc.collect()` under churn (contents only, never heap
 bytes); the `fstring_only` / `dict_string` perf benches (#568 harness). Verified
 on an LLVM-18 host under both collectors. No `GRAMMAR.ebnf` change — escape
 analysis is invisible to syntax and to observable semantics.
+
+## D-0152 — run the LLVM middle-end `-O2` pipeline before object emission (#857)
+
+**Status:** Accepted. **Relates:** D-0143/D-0144 (#568 frame-skip & inlined
+volatile safepoint poll), D-0149/D-0150 (#841 LTO `opt -O2` on the merged
+module), #714 (GC/perf north star), #839/D-0151 (escape analysis). **Problem:**
+#857 — compute-bound Zap was ~6× slower than Go.
+
+**Problem.** `zapc` emitted LLVM IR and handed it **straight to the backend** —
+`TargetMachine::write_to_file(module, FileType::Object, …)` — with no middle-end
+pass pipeline run first. `write_to_file` is `llc`-equivalent: it runs instruction
+selection / register allocation / scheduling but **not** the IR transform passes
+(`mem2reg`/SROA, instcombine, GVN, LICM, …), which live in the `opt` pipeline and
+were never invoked. Consequently every local — emitted as an `alloca` — stayed in
+its stack slot: a tight GC-free loop (`s = 0; for i in 0..N: s += i`) reloaded and
+stored its induction variable and accumulator to memory every iteration
+(`i` at `0x8(%rsp)`, `s` at `0x10(%rsp)` in the `objdump`), ~6× slower than Go's
+register-only loop. This was the single highest-leverage compute lever left: it
+helps **every** function with loop/temporary locals.
+
+**Decision.** The normal (non-LTO) native build runs the new-pass-manager
+`default<O2>` pipeline on the program module (`Module::run_passes`, inkwell
+`llvm18-0`) **before** `write_to_file`, in `compile_object`. Loop/temporary
+scalar locals are register-promoted (`mem2reg`/SROA) to SSA and the hot loop stops
+round-tripping to the stack. `$ZAP_OPT_LEVEL` (`0`/`1`/`2`/`3`/`s`/`z`) overrides
+the level for A/B measurement; `$ZAP_NO_OPT` skips the pipeline entirely (the
+byte-for-byte pre-#857 behaviour) for bisecting a suspected mis-optimization.
+
+**Reconciliation with LTO (D-0149/D-0150).** The two optimize paths do not
+overlap and never double-opt: the default path emits a native **object**
+(`compile_object`) and now optimizes it here; the `ZAP_LTO` path emits **bitcode**
+(`compile_bitcode`, no in-module opt) and optimizes the program⊕runtime *merged*
+module with `opt -O2` later. The `-O2` applied to generated code is therefore the
+**same pipeline on both paths**; LTO additionally inlines the runtime across the
+boundary.
+
+**GC safety (precise moving Immix, D-0144).** `-O2` runs over generated code on
+the LTO path already, where the GC / `--race` / preemption goldens are green, so
+running it on the program module alone is a subset of an exercised configuration.
+The invariants the optimizer must not break hold structurally:
+- **Shadow-stack root stores survive.** The shadow-frame `alloca` is address-taken
+  via `*zap_shadow_head = &frame` — it escapes to an external function — so
+  `mem2reg`/SROA cannot promote it away and the per-root stores are not dead; a
+  collection walking the shadow stack still finds every root.
+- **Safepoint polls are not hoisted, reordered or deleted.** Each poll loads
+  `zap_gc_wanted`/`zap_collecting`/`zap_preempt_any` with **volatile** loads
+  (D-0144): LICM cannot hoist a volatile access out of a loop, DCE cannot drop it,
+  and a volatile memory op keeps the loop itself from being deleted — so a tight
+  GC-free loop still polls every iteration (the `*preempt*` / `gc_*_stress`
+  goldens stay live). The cold slow path's `zap_safepoint` is an opaque external
+  call, never eliminated. Register promotion applies only to the *non-escaping
+  scalar* locals, which carry no GC meaning.
+
+Only the GC-meaningless scalars move to registers; nothing a collection reads is
+weakened. Gating the pipeline to provably-GC-free functions (#568) was the
+fallback had an invariant failed; it was not needed.
+
+**Secondary, deferred.** Coalescing the three per-iteration safepoint-poll flag
+loads into one word (or polling every N iterations) is a separable follow-up
+(#857 "Secondary"), tracked apart from this pipeline change.
+
+**Verification.** Codegen IR tests (deterministic, machine-independent): the raw
+translation keeps `i`/`s` in `alloca`s with no phi (reproduces the defect), and
+after the pipeline the hot GC-free loop promotes them to SSA `phi` with **no**
+`alloca` while the volatile back-edge safepoint poll survives; a GC-using function
+still keeps its shadow frame and root stores under `-O2`. Wall-clock trend in
+`crates/driver/tests/perf.rs` (`tight_loop`/`fib`); the full GC / `--race` /
+preemption golden suites gate the invariants. No `GRAMMAR.ebnf` change — the opt
+pipeline is invisible to syntax and to observable semantics.

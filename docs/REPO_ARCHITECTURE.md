@@ -61,7 +61,11 @@ build/test on any host. Only `zapc_codegen` needs LLVM.
   the top of `lower_module`.
 - Backend entry points: the `Backend` trait and
   `build_executable` ([codegen/lib.rs](../crates/codegen/src/lib.rs)); `jit.rs`
-  provides an in-process JIT (used by the REPL/playground).
+  provides an in-process JIT (used by the REPL/playground). `compile_object`
+  runs the LLVM middle-end `default<O2>` pipeline (`Module::run_passes`) on the
+  module before the backend emits the object, so loop/temporary locals are
+  register-promoted (#857, D-0152); the `ZAP_LTO` path optimizes its merged
+  bitcode module with `opt -O2` instead (D-0149/D-0150), so neither double-opts.
 - Tooling re-runs the front-end only (lex→parse→type-check, no LLVM) through
   `zapc_analysis` — see [Tooling](#tooling).
 

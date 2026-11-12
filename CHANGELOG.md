@@ -906,6 +906,29 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **Codegen runs the LLVM middle-end `-O2` pipeline before object emission —
+  loop locals are register-promoted** (#857, D-0152). `zapc` handed its IR
+  straight to the backend (`TargetMachine::write_to_file`, `llc`-equivalent),
+  which runs instruction selection / register allocation but **not** the IR
+  transform passes (`mem2reg`/SROA, instcombine, GVN, LICM, …). So every local
+  stayed in its `alloca` stack slot and a tight loop reloaded/stored its
+  induction variable and accumulator to memory every iteration — a GC-free
+  integer loop ran ~6× slower than Go. The normal (non-LTO) native build now
+  runs the new-pass-manager `default<O2>` pipeline (`Module::run_passes`) on the
+  program module before emitting the object, so scalar loop/temporary locals are
+  promoted to SSA registers and the hot loop stops touching the stack. This is
+  the single broadest compute lever — it helps every function with loop locals,
+  not one benchmark. `$ZAP_OPT_LEVEL` (`0`/`1`/`2`/`3`/`s`/`z`) tunes the level;
+  `$ZAP_NO_OPT` restores the pre-#857 unoptimized emission for bisection. No
+  double-opt with LTO: the default path optimizes its native object here, the
+  `ZAP_LTO` path optimizes its merged bitcode module with `opt -O2` later
+  (D-0149/D-0150) — the same `-O2` over generated code on both paths. GC safety
+  (precise moving Immix, D-0144) is preserved: the shadow-frame `alloca` escapes
+  via `*zap_shadow_head = &frame` so its root stores survive, and the back-edge
+  safepoint poll's **volatile** flag loads cannot be hoisted, deleted, or let the
+  loop be removed — only GC-meaningless scalars move to registers. The
+  `tight_loop`/`fib` perf benches and the full GC / `--race` / preemption golden
+  suites gate it.
 - **Runtime fast paths can inline into generated code via LTO** (#841, D-0149).
   The C runtime was compiled to its own object and linked against the program
   object, so at the program's optimize step the hot runtime helpers
