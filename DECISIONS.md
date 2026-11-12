@@ -7337,3 +7337,51 @@ via the `ZAP_GOLDEN_ONLY` allowlist in `golden.rs`. The full corpus runs under
 the default object-link build: re-linking every program under `opt -O2` added
 minutes per leg for no extra coverage, and the slice above exercises the
 LTO-specific surface (inlining, GC/safepoints, exception unwinding).
+
+## D-0150 — LTO strips the dead runtime at link time (`--gc-sections`), not by IR internalize (#841)
+
+**Context.** The `ZAP_LTO` build (D-0149) merges the WHOLE C runtime (`zaprt.c`
+— http/json/crypto/regex/yaml/…) into every program so the cross-module inliner
+can pull the hot fast paths in. But a single-module `opt -O2` cannot then DROP
+the parts a given program never calls: the runtime functions have external
+linkage, so they are not provably dead, and the linker keeps them. Result: even
+a `dict`+`print` program linked an LTO binary carrying the entire runtime —
+measured **430 KB**. Smaller binaries matter beyond disk: less to `mmap`/page in
+at `exec`, which cuts cold-start latency (e.g. the AWS `provided.al2023` Lambda
+base, where the portable profile already targets startup, D-0082).
+
+**Decision.** Under LTO (default; opt out with `ZAP_LTO_NO_PRUNE`), compile the
+merged module with `-ffunction-sections -fdata-sections` and link with
+`-Wl,--gc-sections`, and DROP `-rdynamic`. The linker then garbage-collects
+every function/datum section no retained section references — roots are `main`,
+the GC's `.init_array` constructors, and anything address-taken — so the dead
+runtime never reaches the binary. `dict_word_count` fell **430 KB → 76 KB
+(5.7×)**; both binaries produce identical output. `-rdynamic` is dropped because
+it exports every global to `.dynsym`, anchoring it as a GC root and defeating the
+strip; this trades away the profiler/fault symbolication of Zap function names
+(#78/#77) in a pruned build, exactly as the portable/static profile already does
+(D-0082) — `ZAP_LTO_NO_PRUNE` restores both the full runtime and `-rdynamic`.
+
+**Why not prune in IR (`internalize` + `globaldce`) before `-O2`.** That would
+also cut per-program *optimize* time (opt sees a smaller module: measured ~6×)
+and shrink further (~8×). It was implemented, then **rejected**: internalizing
+the runtime flips its scheduler / GC / race-detector globals to internal
+linkage, and `-O2` then assumes nothing outside the module observes them and
+hoists/caches loads another thread mutates. The full golden corpus under LTO
+caught the miscompile — clean `--race` fixtures reported false races (exit 66)
+and concurrent goldens hung. Link-time `--gc-sections` is **sound** because it
+never re-optimizes: `opt -O2` runs with the runtime at external linkage, so
+codegen for live code — and the threaded runtime — is byte-for-byte what it was.
+The size win is kept; cutting per-program *optimize* time soundly needs true
+ThinLTO (import only referenced functions) and is a separate future item — the
+acute CI cost is already handled by the scoped `ZAP_GOLDEN_ONLY` LTO step
+(D-0149), so optimize time now only affects per-program builds under a future
+default-LTO flip.
+
+**Tests.** `crates/driver/tests/lto.rs` gains
+`lto_pruning_drops_dead_runtime_and_shrinks_binary`: it builds the hot-dict
+fixture under LTO and under `ZAP_LTO_NO_PRUNE` and asserts the pruned binary is
+well under half the un-pruned one (measured ~5.7×; a conservative 2× bound keeps
+it non-flaky). The existing inline/`noinline` guard still passes (pruning does
+not touch optimization), and CI's scoped golden slice runs under `ZAP_LTO=1` on
+both collectors.
