@@ -703,6 +703,17 @@ fn child_exprs<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
                 out.push(x);
             }
         }
+        Expr::SliceSpec { lo, hi, step, .. } => {
+            if let Some(x) = lo {
+                out.push(x);
+            }
+            if let Some(x) = hi {
+                out.push(x);
+            }
+            if let Some(x) = step {
+                out.push(x);
+            }
+        }
         Expr::Attr { base, .. } => out.push(base),
         Expr::ChanRecv { chan, .. } => out.push(chan),
         Expr::Yield { value, .. } => {

@@ -14966,8 +14966,9 @@ impl<'a> FnLower<'a> {
 
     /// Evaluate the axis indices of an array subscript. `m[i, j]` arrives as an
     /// `Expr::Tuple`; `a[i]` as a single expression. Each index must be an
-    /// integer — a slice inside a multi-axis index (`m[:, 1]`) is a #502
-    /// follow-up. Returns one `i64` index value per axis supplied.
+    /// integer. A sliced read (`m[:, 1]`) is handled by `lower_array_mixed_index`
+    /// before this is reached; a sliced *assignment target* is not supported.
+    /// Returns one `i64` index value per axis supplied.
     fn array_axis_indices(&mut self, index: &Expr) -> Result<Vec<Value>, LowerError> {
         let parts: Vec<&Expr> = match index {
             Expr::Tuple(elems, _) => elems.iter().collect(),
@@ -14975,10 +14976,10 @@ impl<'a> FnLower<'a> {
         };
         let mut out = Vec::with_capacity(parts.len());
         for p in parts {
-            if matches!(p, Expr::Slice { .. }) {
+            if matches!(p, Expr::Slice { .. } | Expr::SliceSpec { .. }) {
                 return Err(err(
-                    "a slice inside a multi-axis array index is not supported yet (#502); \
-                     use integer indices",
+                    "assigning to a sliced array index (a strided-view store) is not \
+                     supported yet (#502); index all axes with integers",
                 ));
             }
             let (iv, it) = self.expr(p)?;
@@ -15022,6 +15023,17 @@ impl<'a> FnLower<'a> {
         ndim: u8,
         index: &Expr,
     ) -> Result<(Value, Ty), LowerError> {
+        // A multi-axis index that contains any slice (`m[:, j]`, `m[lo:hi, k]`,
+        // the 1-D `a[i]` never reaches here) folds per axis into a strided view
+        // (#502); the all-integer paths below stay the plain contiguous
+        // row-fold + scalar get.
+        let parts: Vec<&Expr> = match index {
+            Expr::Tuple(elems, _) => elems.iter().collect(),
+            other => vec![other],
+        };
+        if parts.iter().any(|p| matches!(p, Expr::SliceSpec { .. })) {
+            return self.lower_array_mixed_index(arr, d, ndim, &parts);
+        }
         let idxs = self.array_axis_indices(index)?;
         let k = idxs.len();
         let n = ndim as usize;
@@ -15046,6 +15058,72 @@ impl<'a> FnLower<'a> {
             let view = self.array_fold_rows(arr, d, ndim, &idxs);
             Ok((view, Ty::Array(d, ndim - k as u8)))
         }
+    }
+
+    /// Lower a multi-axis subscript that mixes integer indices and slices
+    /// (`m[:, j]`, `m[lo:hi, k]`, `m[i, ::2]`) into a strided **view** (#502,
+    /// D-0171). Folds the axes left to right: an integer index drops its axis
+    /// (`zap_array_index_axis`), a slice keeps it with a signed step
+    /// (`zap_array_slice_axis`); axes past the supplied specs stay full. The
+    /// running axis cursor only advances past a kept (sliced) axis, since a
+    /// dropped axis shifts the later axes down into its place. The result rank is
+    /// `ndim` minus the number of integer indices (≥ 1, since at least one slice
+    /// is present).
+    fn lower_array_mixed_index(
+        &mut self,
+        arr: Value,
+        d: Dtype,
+        ndim: u8,
+        parts: &[&Expr],
+    ) -> Result<(Value, Ty), LowerError> {
+        let n = ndim as usize;
+        if parts.len() > n {
+            return Err(err(format!(
+                "too many indices for a {n}-dimensional array ({} given)",
+                parts.len()
+            )));
+        }
+        let mut cur = arr;
+        let mut rank = ndim;
+        let mut cur_axis: i64 = 0;
+        for p in parts {
+            match p {
+                Expr::SliceSpec { lo, hi, step, .. } => {
+                    let axis = self.iconst(Ty::I64, cur_axis);
+                    let (lo_v, has_lo) = self.array_slice_bound(lo.as_deref())?;
+                    let (hi_v, has_hi) = self.array_slice_bound(hi.as_deref())?;
+                    let (st_v, has_st) = self.array_slice_bound(step.as_deref())?;
+                    let out = Ty::Array(d, rank); // a slice keeps the rank
+                    let v = self.new_value(out);
+                    self.emit(Inst::Call {
+                        dest: Some(v),
+                        func: "zap_array_slice_axis".to_string(),
+                        args: vec![cur, axis, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
+                    });
+                    cur = v;
+                    cur_axis += 1; // the sliced axis stays, so advance past it
+                }
+                _ => {
+                    let (iv, it) = self.expr(p)?;
+                    if it.int_width().is_none() {
+                        return Err(err("array indices must be integers"));
+                    }
+                    let i = self.coerce_index(iv, it);
+                    let axis = self.iconst(Ty::I64, cur_axis);
+                    rank -= 1; // an integer index drops its axis
+                    let out = Ty::Array(d, rank);
+                    let v = self.new_value(out);
+                    self.emit(Inst::Call {
+                        dest: Some(v),
+                        func: "zap_array_index_axis".to_string(),
+                        args: vec![cur, axis, i],
+                    });
+                    cur = v;
+                    // cur_axis unchanged: the dropped axis pulls the rest down.
+                }
+            }
+        }
+        Ok((cur, Ty::Array(d, rank)))
     }
 
     /// Resolve an N-D array subscript to the (rank-1 view, final index) naming a
@@ -16507,36 +16585,35 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, out))
             }
-            // `array[T]` slice -> a VIEW sharing the buffer (D-0030). A view is
-            // contiguous, so only an absent or literal-`1` step is supported; a
-            // strided view would need strides the 1-D array has not got (a
-            // documented D-0030 follow-up).
+            // `array[T]` slice -> a VIEW sharing the buffer (D-0030, #502). A
+            // 1-D contiguous (absent or literal-`1` step) slice stays the fast
+            // `zap_array_slice` (NULL strides); a stepped/reversed 1-D slice or
+            // an N-D axis-0 window is a strided view via `zap_array_slice_axis`
+            // (which preserves rank), so `m[lo:hi]` keeps rank-n.
             Ty::Array(dt, ndim) => {
-                // A 1-D contiguous slice is a view (D-0030). Slicing an N-D array
-                // (an axis-0 window keeping rank) needs per-axis strides this
-                // header does not carry yet, so it is a #502 follow-up.
-                if ndim != 1 {
-                    return Err(err(
-                        "slicing an N-D array is not supported yet (#502); index axes with \
-                         integers (m[i]) to reach a row view",
-                    ));
+                let out = Ty::Array(dt, ndim);
+                let step_is_unit = step.is_none() || step.map(const_int_value) == Some(Some(1));
+                if ndim == 1 && step_is_unit {
+                    let (lo_v, has_lo) = self.array_slice_bound(lo)?;
+                    let (hi_v, has_hi) = self.array_slice_bound(hi)?;
+                    let d = self.new_value(out);
+                    self.emit(Inst::Call {
+                        dest: Some(d),
+                        func: "zap_array_slice".to_string(),
+                        args: vec![bv, lo_v, hi_v, has_lo, has_hi],
+                    });
+                    return Ok((d, out));
                 }
-                if let Some(s) = step {
-                    if const_int_value(s) != Some(1) {
-                        return Err(err(
-                            "a stepped array slice is not supported yet (an array slice is a \
-                             contiguous view and strided views are a D-0030 follow-up)",
-                        ));
-                    }
-                }
+                // Strided / N-D axis-0 slice: keeps the rank (#502).
+                let axis = self.iconst(Ty::I64, 0);
                 let (lo_v, has_lo) = self.array_slice_bound(lo)?;
                 let (hi_v, has_hi) = self.array_slice_bound(hi)?;
-                let out = Ty::Array(dt, ndim);
+                let (st_v, has_st) = self.array_slice_bound(step)?;
                 let d = self.new_value(out);
                 self.emit(Inst::Call {
                     dest: Some(d),
-                    func: "zap_array_slice".to_string(),
-                    args: vec![bv, lo_v, hi_v, has_lo, has_hi],
+                    func: "zap_array_slice_axis".to_string(),
+                    args: vec![bv, axis, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
                 });
                 Ok((d, out))
             }
@@ -20986,6 +21063,11 @@ fn collect_free_names(
                 collect_free_names(o, bound, out, seen);
             }
         }
+        Expr::SliceSpec { lo, hi, step, .. } => {
+            for o in [lo, hi, step].into_iter().flatten() {
+                collect_free_names(o, bound, out, seen);
+            }
+        }
         Expr::Attr { base, .. } => collect_free_names(base, bound, out, seen),
         Expr::Lambda { params, body, .. } => {
             // Nested lambda: its own parameters shadow within its body.
@@ -21657,10 +21739,12 @@ mod nd_array_tests {
     }
 
     #[test]
-    fn nd_slice_is_rejected() {
-        lower_fails(
-            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    auto r = m[0:1]\n",
-        );
+    fn nd_axis0_slice_lowers_as_a_view() {
+        // N-D axis-0 slicing is a rank-preserving strided view since #502.
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto r = m[0:1]\n    print(sum(r))\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_slice_axis"), 1);
     }
 
     #[test]
@@ -22307,5 +22391,112 @@ mod reduction_tests {
     #[test]
     fn unknown_keyword_to_a_reduction_is_rejected() {
         lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    print(a.sum(dim=0))\n");
+    }
+}
+
+#[cfg(test)]
+mod strided_view_tests {
+    //! Strided slice views `a[::2]`, `a[::-1]`, N-D axis slices `m[lo:hi]`, and
+    //! mixed int/slice indices `m[:, j]` (#502, D-0171). Host-only (AST->ZIR):
+    //! asserts which view primitive each form lowers to — a contiguous step-1
+    //! 1-D slice stays `zap_array_slice`; a stepped/reversed/N-D slice becomes
+    //! `zap_array_slice_axis`; a sliced axis inside a multi-axis index folds the
+    //! integer axes with `zap_array_index_axis` and the sliced axes with
+    //! `zap_array_slice_axis`. A walled garden around the fold, independent of
+    //! the runtime stride kernels (which run in the CI goldens).
+    use super::lower_module;
+    use zapc_ir_core::Inst;
+
+    fn call_funcs(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(
+            perrs.is_empty() && lerrs.is_empty(),
+            "parse/lex: {perrs:?} {lerrs:?}"
+        );
+        let (m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Call { func, .. } | Inst::Invoke { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count(src: &str, func: &str) -> usize {
+        call_funcs(src).iter().filter(|f| *f == func).count()
+    }
+
+    // --- 1-D stepped / reversed ---
+
+    #[test]
+    fn contiguous_1d_slice_stays_the_fast_path() {
+        // A step-1 1-D slice is still the contiguous `zap_array_slice` (NULL
+        // strides), not the strided builder — no regression.
+        let src = "def main():\n    auto a = array[i64]([1, 2, 3, 4])\n    \
+                   auto v = a[1:3]\n    print(sum(v))\n";
+        assert_eq!(count(src, "zap_array_slice"), 1);
+        assert_eq!(count(src, "zap_array_slice_axis"), 0);
+    }
+
+    #[test]
+    fn stepped_1d_slice_is_a_strided_view() {
+        let src = "def main():\n    auto a = array[i64]([1, 2, 3, 4, 5, 6])\n    \
+                   auto v = a[::2]\n    print(sum(v))\n";
+        assert_eq!(count(src, "zap_array_slice_axis"), 1);
+        assert_eq!(count(src, "zap_array_slice"), 0);
+    }
+
+    #[test]
+    fn reversed_1d_slice_is_a_strided_view() {
+        let src = "def main():\n    auto a = array[i64]([1, 2, 3])\n    \
+                   auto v = a[::-1]\n    print(sum(v))\n";
+        assert_eq!(count(src, "zap_array_slice_axis"), 1);
+    }
+
+    // --- N-D axis-0 slice ---
+
+    #[test]
+    fn nd_axis0_slice_keeps_rank() {
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4], [5, 6]])\n    \
+                   auto r = m[1:3]\n    print(r.ndim, sum(r))\n";
+        assert_eq!(count(src, "zap_array_slice_axis"), 1);
+    }
+
+    // --- mixed int/slice ---
+
+    #[test]
+    fn column_view_folds_slice_then_index() {
+        // m[:, 1] -> slice axis 0 (keep), then integer-index the surviving axis.
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto col = m[:, 1]\n    print(col.ndim, sum(col))\n";
+        assert_eq!(count(src, "zap_array_slice_axis"), 1);
+        assert_eq!(count(src, "zap_array_index_axis"), 1);
+    }
+
+    #[test]
+    fn row_then_stepped_slice_mixes_fold() {
+        // m[1, ::2] -> integer-index axis 0 (drop), then stepped-slice the row.
+        let src = "def main():\n    auto m = array[i64]([[1, 2, 3, 4], [5, 6, 7, 8]])\n    \
+                   auto r = m[1, ::2]\n    print(sum(r))\n";
+        assert_eq!(count(src, "zap_array_index_axis"), 1);
+        assert_eq!(count(src, "zap_array_slice_axis"), 1);
+    }
+
+    #[test]
+    fn write_through_a_strided_view_lowers() {
+        // A write through a stepped view still lowers to a plain set (it aliases
+        // the parent via the view's stride at runtime).
+        let src = "def main():\n    auto a = array[i64]([1, 2, 3, 4])\n    \
+                   auto v = a[::2]\n    v[0] = 9\n    print(sum(a))\n";
+        assert_eq!(count(src, "zap_array_slice_axis"), 1);
+        // The construction fills 4 elements, then the write-through is a 5th set.
+        assert_eq!(count(src, "zap_array_set_i64"), 5);
     }
 }

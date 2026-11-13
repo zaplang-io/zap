@@ -682,6 +682,7 @@ fn expr_start(e: &Expr) -> u32 {
         | Expr::Call { span, .. }
         | Expr::Index { span, .. }
         | Expr::Slice { span, .. }
+        | Expr::SliceSpec { span, .. }
         | Expr::Attr { span, .. }
         | Expr::Lambda { span, .. }
         | Expr::RegexMatch { span, .. }

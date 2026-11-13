@@ -998,6 +998,9 @@ static void zap_trace_children(void *payload) {
         if (a->dims) {
             zap_process_slot((void **)&a->dims); /* int64 dims: atomic buffer */
         }
+        if (a->strides) {
+            zap_process_slot((void **)&a->strides); /* int64 strides (#502): atomic */
+        }
         if (a->data) {
             zap_process_slot((void **)&a->data); /* numeric data: atomic, no ptrs */
         }

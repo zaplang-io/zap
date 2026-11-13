@@ -217,10 +217,14 @@ allocation, not a header plus a separate data buffer:
   default, both a plain `V` with no `Optional` wrapper. It needs no `Optional$V`
   instance — the value kind suffices — so monomorphization marks the symbol
   `get_default` for lowering to take the select-value-or-default path.
-- `array[T]` (#24, #49, #476, #500): `[ header | dtype | ndim | dims: *i64 |
-  data: *T | off: i64 ]`. `ndim` is the row-major rank (`>= 1`) and `dims`
-  points at `ndim` per-axis lengths whose product is the element count; the
-  buffer is still contiguous and has no strides. A nested literal builds an N-D
+- `array[T]` (#24, #49, #476, #500, #502): `[ header | dtype | ndim | dims: *i64
+  | strides: *i64 | data: *T | off: i64 ]`. `ndim` is the row-major rank
+  (`>= 1`) and `dims` points at `ndim` per-axis lengths whose product is the
+  element count. `strides` (#502, D-0171) is `NULL` for a contiguous array —
+  canonical row-major strides, the common case — or points at `ndim` signed
+  per-axis **element** strides for a view, so element `(i0..i_{n-1})` is at
+  `data[off + Σ i_k·strides[k]]`; the precise collector forwards it like `dims`.
+  A nested literal builds an N-D
   array via `zap_array_new_nd(dtype, ndim, total)` + one `zap_array_set_dim`
   per axis; `zap_array_count`/`zap_array_ndim`/`zap_array_dim` back `a.size`/
   `a.ndim`/`a.shape`. Constructors (#504, D-0167): `zeros`/`ones`/`full` build a
@@ -239,7 +243,14 @@ allocation, not a header plus a separate data buffer:
   SIMD) vs strided kernel; and `zap_array_bcast_offsets(a, b, res, f, *oa, *ob)`
   maps a result flat index to each operand's window-relative offset
   (stretched/missing axes contribute 0). The exact `zap_array_check_shape`
-  remains available. Strided views and N-D array slicing are follow-ups (#502).
+  remains available. Strided views (#502, D-0171): `zap_array_index_axis(a,
+  axis, i)` integer-indexes one axis (dropping it), `zap_array_slice_axis(a,
+  axis, lo, hi, step, has_lo, has_hi, has_step)` slices one axis (keeping it,
+  signed step) — a multi-axis index folds these — and the step-1 1-D
+  `zap_array_slice` stays. Scalar get/set honor `strides` so a write through a
+  view aliases the parent; `zap_array_contig(a)` returns a contiguous array
+  unchanged and compacts a strided view to a fresh copy, which every SIMD kernel
+  and reduction calls at entry so their loops stay dense.
   `dtype` tags the element type over the full matrix (#503/#890, D-0166): codes
   `0 = f64`, `1 = i64`, `2 = uint8`, `3 = bool` (ABI-stable), then `4 = f32`,
   `5 = i32`, `6 = i8`, `7 = i16`, `8 = u16`, `9 = u32`, `10 = u64`; storage is

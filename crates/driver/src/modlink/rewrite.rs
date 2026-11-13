@@ -375,6 +375,11 @@ impl Rewriter<'_> {
                     self.expr(part, locals);
                 }
             }
+            Expr::SliceSpec { lo, hi, step, .. } => {
+                for part in [lo, hi, step].into_iter().flatten() {
+                    self.expr(part, locals);
+                }
+            }
             Expr::Unary { expr, .. } => self.expr(expr, locals),
             Expr::Binary { lhs, rhs, .. } => {
                 self.expr(lhs, locals);

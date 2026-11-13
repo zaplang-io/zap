@@ -703,6 +703,7 @@ fn expr_span(e: &Expr) -> Span {
         | Call { span, .. }
         | Index { span, .. }
         | Slice { span, .. }
+        | SliceSpec { span, .. }
         | Attr { span, .. }
         | Lambda { span, .. }
         | RegexMatch { span, .. }

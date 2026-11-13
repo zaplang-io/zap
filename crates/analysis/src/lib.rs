@@ -1477,6 +1477,11 @@ impl Walk {
                     self.expr(o);
                 }
             }
+            Expr::SliceSpec { lo, hi, step, .. } => {
+                for o in [lo, hi, step].into_iter().flatten() {
+                    self.expr(o);
+                }
+            }
             Expr::Lambda { body, .. } => self.expr(body),
             Expr::RegexMatch { subject, .. } | Expr::RegexSubst { subject, .. } => {
                 self.expr(subject)
@@ -1558,6 +1563,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::Call { span, .. }
         | Expr::Index { span, .. }
         | Expr::Slice { span, .. }
+        | Expr::SliceSpec { span, .. }
         | Expr::Attr { span, .. }
         | Expr::Lambda { span, .. }
         | Expr::RegexMatch { span, .. }

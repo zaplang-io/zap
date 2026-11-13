@@ -559,8 +559,9 @@ trailer       ::= "(" [ arg_list ] ")"           (* call *)
                 | "." IDENT ;                     (* attribute *)
 call_expr     ::= postfix "(" [ arg_list ] ")" ;
 
-subscript     ::= expr
-                | [ expr ] ":" [ expr ] [ ":" [ expr ] ] ;  (* slice, D-0030 *)
+subscript     ::= index_elem { "," index_elem } ;  (* multi-axis: N-D array index/slice (#502), or type args *)
+index_elem    ::= expr
+                | [ expr ] ":" [ expr ] [ ":" [ expr ] ] ;  (* slice / per-axis slice spec, D-0030 / #502 *)
 
 arg_list      ::= gen_exp                         (* bare generator expression as the SOLE argument, #596 *)
                 | arg { "," arg } ;
