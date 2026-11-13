@@ -6019,6 +6019,81 @@ mod tests {
         );
     }
 
+    /// Body (comments stripped) of the C function whose definition starts with `sig`.
+    fn c_fn_body(sig: &str) -> String {
+        let start = RUNTIME_C
+            .find(sig)
+            .unwrap_or_else(|| panic!("zaprt.c must define `{sig}`"));
+        let end = start + RUNTIME_C[start..].find("\n}\n").expect("function must end");
+        strip_c_comments(&RUNTIME_C[start..end])
+    }
+
+    /// I#889 tripwire. A coroutine that switches away publishes WHY in `g->state`
+    /// (`G_DEAD` / `G_PARKED` / `G_RUNNABLE`) and then calls `zap_ctx_swap`;
+    /// `switch_to_g` dispatches on that state when the swap returns. The span from
+    /// the state store to the actual switch is microseconds (PLT stub, glibc's
+    /// context save, an `rt_sigprocmask` syscall), and a Boehm async preemption
+    /// landing in it rewrites the state to `G_RUNNABLE`, so the resumed sequence
+    /// later swaps out with `G_RUNNING` — a state the scheduler cannot dispatch, and
+    /// the coroutine is lost (hang at join / a parkmu that is never released). So at
+    /// every swap site the no-preempt window must be raised BEFORE the state store
+    /// (`g_enter_switch_out`), and must NOT be cleared coroutine-side before the swap
+    /// (the scheduler clears it after the swap returns).
+    #[test]
+    fn every_switch_out_site_is_a_no_preempt_window_until_the_swap() {
+        for sig in [
+            "static void g_bootstrap(void) {",
+            "static void cosched(void) {",
+            "static void copreempt(void) {",
+            "static void copark(pthread_mutex_t *mu, Waiter *w) {",
+        ] {
+            let body = c_fn_body(sig);
+            let swap = body
+                .find("zap_ctx_swap(&g->ctx, &m->sched_ctx)")
+                .unwrap_or_else(|| panic!("{sig} must swap back to the scheduler"));
+            let enter = body
+                .find("g_enter_switch_out(g);")
+                .unwrap_or_else(|| panic!("I#889: {sig} must call g_enter_switch_out(g)"));
+            let state = body
+                .find("g->state = G_")
+                .unwrap_or_else(|| panic!("{sig} must publish its scheduler state"));
+            assert!(
+                enter < state && state < swap,
+                "I#889: in {sig} the no-preempt window must open BEFORE the `g->state` store \
+                 and the store must precede the swap:\n{body}"
+            );
+            let span = &body[enter..swap];
+            for clears in ["no_preempt = 0", "zap_np_leave()", "no_preempt--"] {
+                assert!(
+                    !span.contains(clears),
+                    "I#889: {sig} must not end the no-preempt window (`{clears}`) before the \
+                     swap; switch_to_g ends it once the coroutine is stopped:\n{span}"
+                );
+            }
+        }
+    }
+
+    /// The companion half of I#889: the scheduler ends the window the coroutine
+    /// opened, right after the swap back returns (the coroutine is stopped then).
+    #[test]
+    fn switch_to_g_ends_the_switch_out_window_after_the_swap() {
+        let body = c_fn_body("static void switch_to_g(M *m, G *g) {");
+        let swap = body
+            .find("zap_ctx_swap(&m->sched_ctx, &g->ctx)")
+            .expect("switch_to_g must swap the coroutine in");
+        let clear = body[swap..]
+            .find("g->no_preempt = 0;")
+            .expect("I#889: switch_to_g must clear g->no_preempt after the swap returns");
+        // ...and before it dispatches on the state the coroutine published.
+        let dispatch = body[swap..]
+            .find("g->state == G_PARKED")
+            .expect("switch_to_g dispatches on g->state");
+        assert!(
+            clear < dispatch,
+            "I#889: g->no_preempt must be cleared before switch_to_g dispatches on g->state"
+        );
+    }
+
     /// I#885 tripwire. Under Boehm a stopped thread is scanned as
     /// `[sp, stack_end)`. `switch_to_g` used to publish the coroutine's stack top
     /// as `stack_end` (`set_bottom(m, &g->sb)`) BEFORE the swap that moves `sp`
