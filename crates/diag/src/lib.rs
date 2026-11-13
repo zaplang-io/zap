@@ -743,6 +743,26 @@ define_codes! {
          is a compile error, because its resource is torn down at `with`-exit and \
          any surviving reference would dangle. Use it only within its own `with` \
          block.";
+    ZAP5130 = 5130 : "invalid arena allocation",
+        "An arena allocation (`a.alloc(...)` / `a.new(...)`, #553, D-0158) is \
+         malformed. Arena v1 is LEAF-ONLY: an allocated object must be pointer-free \
+         — a `bytes` buffer (`a.alloc(bytes, n)`) or a struct whose every field is a \
+         scalar (`a.new(LeafStruct, ...)`). A pointer-holding type, an unsupported \
+         element type, or a wrong argument shape is rejected here. Leaf-only erases \
+         the `arena -> heap` edge, which pointerful arena objects (v2) need #714's \
+         generational write-barrier for; express arena-internal links as scalar \
+         indices into the arena instead.";
+    ZAP5131 = 5131 : "arena-allocated value escapes its arena block",
+        "A value whose provenance is \"allocated in arena `a`\" — anything returned \
+         by `a.alloc`/`a.new`, and anything derived from it by field, element, or \
+         slice access — is region-bound to `a`'s `with` block and may not outlive it \
+         (#553, D-0158 §3, the compile-time dual of D-0151). Returning it, storing \
+         it into a longer-lived slot (a heap-object field, a collection, a module \
+         global, an outer arena), capturing it in a closure, boxing it behind an \
+         escaping interface, or carrying it across a `spawn` / `scope:` boundary is \
+         a compile error — the arena's backing memory is freed at block exit, so \
+         there is no safe heap fallback. Passing it to a C `extern` for the call's \
+         duration is a permitted borrow. Keep the value within its arena's block.";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

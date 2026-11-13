@@ -141,6 +141,76 @@ fn semantic_codes() {
     );
 }
 
+/// Assert that checking `src` does NOT surface a diagnostic with `code` — used
+/// for the arena accept-cases, which must type-check without tripping the
+/// leaf-only (`ZAP5130`) or arena-escape (`ZAP5131`) rules.
+#[track_caller]
+fn assert_no_code(src: &str, code: &str) {
+    let r = check_source(src);
+    let got: Vec<String> = r.diagnostics.iter().map(|d| d.code.to_string()).collect();
+    assert!(
+        !got.iter().any(|c| c == code),
+        "did NOT expect {code} for source {src:?}, got {got:?}"
+    );
+}
+
+/// Arena v1 (#553, D-0158) surface + safety diagnostics. The built-in `arena` is a
+/// `@scoped` resource, so its handle reuses ZAP5127/5128/5129; the arena-specific
+/// rules are leaf-only (ZAP5130) and arena-value escape (ZAP5131).
+#[test]
+fn arena_codes() {
+    // --- reject ---------------------------------------------------------------
+    // Detached construction — not bound by `with` (reuses the @scoped rule).
+    assert_code("def main():\n    auto a = arena()\n", "ZAP5128");
+    // Returning an arena-allocated value out of its block — a use-after-free.
+    assert_code(
+        "def leak() -> bytes:\n    with arena() as a:\n        auto buf = a.alloc(bytes, 16)\n        return buf\n\
+         def main():\n    pass\n",
+        "ZAP5131",
+    );
+    // Storing an arena-allocated value into a longer-lived slot (element store).
+    assert_code(
+        "def main():\n    list[bytes] g = []\n    with arena() as a:\n        auto buf = a.alloc(bytes, 8)\n        g[0] = buf\n",
+        "ZAP5131",
+    );
+    // Carrying an arena value across a `spawn` (coroutine-local, D-0158 dec. 7).
+    assert_code(
+        "def worker(bytes b):\n    pass\n\
+         def main():\n    with arena() as a:\n        auto buf = a.alloc(bytes, 8)\n        spawn worker(buf)\n",
+        "ZAP5131",
+    );
+    // A non-leaf (pointer-holding) arena object — leaf-only v1.
+    assert_code(
+        "struct Node:\n    str name\n\
+         def main():\n    with arena() as a:\n        auto n = a.new(Node, \"x\")\n",
+        "ZAP5130",
+    );
+    // Malformed allocation: wrong argument shape.
+    assert_code(
+        "def main():\n    with arena() as a:\n        auto buf = a.alloc(bytes)\n",
+        "ZAP5130",
+    );
+    // `alloc` of a non-`bytes` element (typed numeric arrays are a v1 follow-up).
+    assert_code(
+        "def main():\n    with arena() as a:\n        auto buf = a.alloc(int32, 8)\n",
+        "ZAP5130",
+    );
+
+    // --- accept (must NOT trip the arena rules) -------------------------------
+    // With-bound leaf byte-buffer alloc, then a plain-call borrow.
+    assert_no_code(
+        "def use_buf(bytes b) -> int64:\n    return len(b)\n\
+         def main():\n    with arena(size=1024) as a:\n        auto buf = a.alloc(bytes, 16)\n        auto n = use_buf(buf)\n",
+        "ZAP5131",
+    );
+    // A single leaf struct via `a.new(T, ...)`.
+    assert_no_code(
+        "struct Pt:\n    int64 x\n    int64 y\n\
+         def main():\n    with arena() as a:\n        auto p = a.new(Pt, 1, 2)\n",
+        "ZAP5130",
+    );
+}
+
 #[test]
 fn eq_none_on_value_type_is_rejected() {
     // `== None` / `!= None` is consistent with `is None` (SPEC §5, #374/B3): a

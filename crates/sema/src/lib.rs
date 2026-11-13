@@ -550,6 +550,57 @@ fn is_exception_type(name: &str) -> bool {
     )
 }
 
+/// The classification of an `arena` allocation's first (type) argument (#553,
+/// D-0158): a `bytes` buffer, a leaf struct, a machine scalar, or an invalid /
+/// already-reported argument.
+enum ArenaElem {
+    Bytes,
+    LeafStruct(String),
+    Scalar,
+    Bad,
+}
+
+/// A pointer-free machine-scalar type name — the leaf set an arena object may be
+/// built from (#553, D-0158 §5.1). Deliberately excludes `bigint`/`complex` (both
+/// GC-managed, i.e. pointer-bearing) and every aggregate/reference type.
+fn is_leaf_scalar_name(n: &str) -> bool {
+    matches!(
+        n,
+        "int32"
+            | "int64"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "usize"
+            | "float32"
+            | "float64"
+            | "bool"
+            | "char"
+    )
+}
+
+/// Is `t` a pointer-free machine scalar (the leaf-field test for `a.new(T, ...)`,
+/// #553)? Mirrors [`is_leaf_scalar_name`] over resolved [`Ty`] values; any
+/// aggregate, reference, `Named`, `Str`/`Bytes`, `Bigint`, `Complex`, or `Py`
+/// field makes the owning struct non-leaf (fails safe to reject).
+fn is_leaf_scalar_ty(t: &Ty) -> bool {
+    matches!(
+        t,
+        Ty::Int64
+            | Ty::Int32
+            | Ty::Uint8
+            | Ty::Uint16
+            | Ty::Uint32
+            | Ty::Uint64
+            | Ty::Usize
+            | Ty::Float64
+            | Ty::Float32
+            | Ty::Bool
+            | Ty::Char
+    )
+}
+
 /// The curated built-in decorator set shipped in v1 (D-0036,
 /// `design/0004-decorators.md` §"Built-in set"). An `@name` whose name is not in
 /// this set, not a declared `annotation`, and not a declared `decorator` is a
@@ -6680,6 +6731,14 @@ impl Checker {
         // is modeled loosely for now.
         if let Expr::Attr { base, name, span } = callee {
             let bt = self.infer(base);
+            // Built-in `arena` methods (#553, D-0158): `a.alloc(bytes, n) -> bytes`
+            // and `a.new(T, ...) -> T` for a leaf `T`. Typed precisely here, before
+            // the generic struct-method path, because the first argument is a *type*
+            // (not a value) and the result type is derived from it, and because
+            // leaf-only is enforced at this site (ZAP5130).
+            if matches!(&bt, Ty::Named(n) if n == "arena") {
+                return self.check_arena_method(name, args, *span);
+            }
             if matches!(bt, Ty::Str) {
                 return self.check_str_method(name, args, *span);
             }
@@ -6747,6 +6806,156 @@ impl Checker {
     /// Type-check a `str` method call (ticket #284, D-0025), returning its
     /// result type. Arity and argument types are checked here so a misspelled
     /// or misused method is caught at compile time.
+    /// Type-check a built-in `arena` method call (#553, D-0158): `a.alloc(bytes, n)`
+    /// -> `bytes` and `a.new(T, ...)` -> `T`. The first argument is a *type*, and
+    /// the result type is derived from it. Arena v1 is LEAF-ONLY: a pointer-holding
+    /// element type is rejected here (ZAP5130). Typed numeric arena arrays are a
+    /// tracked follow-up (#881), so v1 `alloc` supports only `bytes`.
+    fn check_arena_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
+        match name {
+            "alloc" => {
+                if args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+                    self.error(
+                        ErrorCode::ZAP5130,
+                        "a.alloc(T, n) takes exactly two positional arguments: a leaf \
+                         element type and an integer count"
+                            .to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
+                let elem = self.arena_type_arg(&args[0].value, args[0].span);
+                let ct = self.infer(&args[1].value);
+                if !matches!(ct, Ty::Unknown) && !ct.is_int() {
+                    self.error(
+                        ErrorCode::ZAP5130,
+                        format!("a.alloc count must be an integer, got `{}`", ct.display()),
+                        args[1].span,
+                    );
+                }
+                match elem {
+                    ArenaElem::Bytes => Ty::Bytes,
+                    ArenaElem::Bad => Ty::Unknown,
+                    ArenaElem::LeafStruct(_) | ArenaElem::Scalar => {
+                        self.error(
+                            ErrorCode::ZAP5130,
+                            "arena v1 `a.alloc` supports only `bytes` (a non-moving byte \
+                             buffer); use `a.new(T, ...)` for a single leaf object. Typed \
+                             numeric arena arrays are a follow-up (#881)"
+                                .to_string(),
+                            args[0].span,
+                        );
+                        Ty::Unknown
+                    }
+                }
+            }
+            "new" => {
+                if args.is_empty() || args[0].name.is_some() {
+                    self.error(
+                        ErrorCode::ZAP5130,
+                        "a.new(T, ...) requires a leaf struct type as its first argument"
+                            .to_string(),
+                        span,
+                    );
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
+                let elem = self.arena_type_arg(&args[0].value, args[0].span);
+                // Constructor arguments are inferred loosely, matching the loose
+                // arity behaviour of ordinary struct construction.
+                for a in &args[1..] {
+                    self.infer(&a.value);
+                }
+                match elem {
+                    // Non-leaf structs already reported in `arena_type_arg`; recover
+                    // to the named type so downstream use does not cascade.
+                    ArenaElem::LeafStruct(n) => Ty::Named(n),
+                    ArenaElem::Bad => Ty::Unknown,
+                    ArenaElem::Bytes => {
+                        self.error(
+                            ErrorCode::ZAP5130,
+                            "a.new(T, ...) constructs a single leaf struct; use \
+                             `a.alloc(bytes, n)` for a byte buffer"
+                                .to_string(),
+                            args[0].span,
+                        );
+                        Ty::Unknown
+                    }
+                    ArenaElem::Scalar => {
+                        self.error(
+                            ErrorCode::ZAP5130,
+                            "a.new(T, ...) requires a leaf struct type, not a scalar".to_string(),
+                            args[0].span,
+                        );
+                        Ty::Unknown
+                    }
+                }
+            }
+            other => {
+                self.error(
+                    ErrorCode::ZAP5130,
+                    format!(
+                        "`arena` has no method `{other}`; use `a.alloc(bytes, n)` or \
+                         `a.new(T, ...)`"
+                    ),
+                    span,
+                );
+                for a in args {
+                    self.infer(&a.value);
+                }
+                Ty::Unknown
+            }
+        }
+    }
+
+    /// Classify the first (type) argument of an `arena` allocation, emitting
+    /// ZAP5130 for a non-type argument, an unknown/unsupported type, or a
+    /// pointer-holding (non-leaf) struct. A non-leaf struct still returns
+    /// [`ArenaElem::LeafStruct`] after reporting, so the caller recovers cleanly.
+    fn arena_type_arg(&mut self, e: &Expr, span: Span) -> ArenaElem {
+        let Expr::Name(n, _) = e else {
+            self.error(
+                ErrorCode::ZAP5130,
+                "the first argument to `a.alloc`/`a.new` must be a type".to_string(),
+                span,
+            );
+            return ArenaElem::Bad;
+        };
+        if n == "bytes" {
+            return ArenaElem::Bytes;
+        }
+        if is_leaf_scalar_name(n) {
+            return ArenaElem::Scalar;
+        }
+        // A user struct: leaf iff every field is a pointer-free machine scalar.
+        if let Some(info) = self.structs.get(n) {
+            let leaf = info.fields.iter().all(is_leaf_scalar_ty);
+            if !leaf {
+                self.error(
+                    ErrorCode::ZAP5130,
+                    format!(
+                        "arena objects must be pointer-free (leaf) in v1, but struct \
+                         `{n}` holds a non-scalar (pointer-bearing) field; express \
+                         arena-internal links as scalar indices into the arena"
+                    ),
+                    span,
+                );
+            }
+            return ArenaElem::LeafStruct(n.clone());
+        }
+        self.error(
+            ErrorCode::ZAP5130,
+            format!("`{n}` is not a known type usable as an arena element"),
+            span,
+        );
+        ArenaElem::Bad
+    }
+
     fn check_str_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
         // Methods taking no arguments → `str`.
         let no_arg_str = matches!(name, "upper" | "lower" | "strip" | "lstrip" | "rstrip");

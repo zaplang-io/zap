@@ -1177,6 +1177,27 @@ def __xml_dumps(XmlElement e) -> str:
     list[str] parts = []
     __xml_dump(e, parts)
     return xml._join(parts)
+
+# arena — scope-bound, non-moving, bulk-freed region allocator (#553, D-0158;
+# docs/design/arena.md). A @scoped affine resource (D-0159): constructible only
+# as a `with` head, freed deterministically at block exit. Allocation is explicit
+# and handle-targeted: `a.alloc(bytes, n)` for a non-moving byte buffer (the FFI
+# pin case), `a.new(T, ...)` for a single leaf (pointer-free) object. Arena v1 is
+# LEAF-ONLY — arena objects hold no outgoing heap pointers (sema rejects a
+# pointerful `T`), and an arena-allocated value may not escape its block.
+#
+# The method / with bodies below are COMPILER INTRINSICS: lowering recognizes an
+# `arena` with-head and `arena`-typed receiver and emits the runtime region calls
+# (zap_arena_open / zap_arena_alloc_* / zap_arena_close — crates/ir/src/lower.rs),
+# never these Zap bodies. They exist only so the type checks and so `arena`
+# satisfies the @scoped context-manager protocol (ZAP5127).
+@scoped
+struct arena:
+    def __enter__(self) -> arena:
+        return self
+
+    def __exit__(self):
+        pass
 ";
 
 /// Parse the built-in [`PRELUDE_SRC`] into AST items. The prelude is authored to
@@ -1281,6 +1302,10 @@ fn references_prelude(module: &Module) -> bool {
         "\"xml\"",
         "\"XmlElement\"",
         "\"XmlAttr\"",
+        // The scope-bound `arena` region allocator (#553, D-0158): the `@scoped`
+        // `arena` struct ships in the prelude, injected for any program that names
+        // it (`with arena(...) as a:`).
+        "\"arena\"",
     ];
     let dbg = format!("{module:?}");
     NEEDLES.iter().any(|n| dbg.contains(n))

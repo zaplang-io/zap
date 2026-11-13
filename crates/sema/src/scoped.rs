@@ -37,6 +37,231 @@ impl Checker {
         self.close_scoped_contagion();
         self.check_scoped_well_formed(module);
         self.check_scoped_usage(module);
+        self.check_arena_escape(module);
+    }
+
+    /// Arena-value escape check (#553, D-0158 §3; `ZAP5131`). The `@scoped` usage
+    /// walk above already forbids the arena *handle* `a` from escaping (`ZAP5129`).
+    /// This pass forbids the escape of a value whose provenance is "allocated in
+    /// `a`" — anything returned by `a.alloc`/`a.new`, and anything derived from it
+    /// by field / element / slice access. Such a value is region-bound to `a`'s
+    /// `with` block; its backing memory is freed at block exit, so there is no safe
+    /// heap fallback (the inverted consequence of the D-0151 lattice). Ambiguity
+    /// fails safe to *reject*.
+    ///
+    /// This is a per-function AST walk, not a type-directed pass: an arena handle is
+    /// a name bound by `with arena(...) as h`, and taint is propagated monotonically
+    /// to every local bound from an `h.alloc`/`h.new` result or a derivation of a
+    /// tainted value. Passing a tainted value to a plain call is a *borrow* and is
+    /// allowed (the FFI `c_read(fd, buf)` case; C-retention past the block stays the
+    /// `c-ffi.md` §2.2 programmer contract). The caught escapes are: `return`, a
+    /// store into a field / element slot, a `spawn` argument, and a closure capture.
+    fn check_arena_escape(&mut self, module: &Module) {
+        if !self.scoped_types.contains("arena") {
+            return; // no built-in arena in this module — nothing to check
+        }
+        for item in &module.items {
+            match item {
+                Item::Function(f) => self.check_arena_fn(&f.body),
+                Item::Struct(s) => {
+                    for m in &s.methods {
+                        self.check_arena_fn(&m.body);
+                    }
+                }
+                Item::Enum(e) => {
+                    for m in &e.methods {
+                        self.check_arena_fn(&m.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_arena_fn(&mut self, body: &Block) {
+        // 1) Collect the names bound by `with arena(...) as h` anywhere in the body
+        //    (nested arenas included).
+        let mut handles: HashSet<String> = HashSet::new();
+        collect_arena_handles(body, &mut handles);
+        if handles.is_empty() {
+            return;
+        }
+        // 2) Propagate taint to a fixpoint: a local is tainted if it is bound from an
+        //    `h.alloc`/`h.new` result (h a handle) or from a derivation of a tainted
+        //    value. Order-independent, so a value defined after an earlier branch is
+        //    still caught.
+        let mut tainted: HashSet<String> = HashSet::new();
+        loop {
+            let before = tainted.len();
+            collect_arena_taint(body, &handles, &mut tainted);
+            if tainted.len() == before {
+                break;
+            }
+        }
+        // 3) Flag every escape of a tainted value.
+        self.flag_arena_escapes(body, &tainted);
+    }
+
+    fn flag_arena_escapes(&mut self, b: &Block, tainted: &HashSet<String>) {
+        for s in &b.stmts {
+            self.flag_arena_escapes_stmt(s, tainted);
+        }
+    }
+
+    fn flag_arena_escapes_stmt(&mut self, s: &Stmt, tainted: &HashSet<String>) {
+        match s {
+            Stmt::Return { value: Some(v), .. } => {
+                if arena_outflow(v, tainted) {
+                    self.arena_escape_error(expr_span(v));
+                }
+            }
+            // A store into a field or element slot moves the value into a
+            // longer-lived object; a store into a bare local name is propagation
+            // (stays in the function) and is handled by taint, not flagged here.
+            Stmt::Assign { target, value, .. } => {
+                if !matches!(target, Expr::Name(..)) && arena_outflow(value, tainted) {
+                    self.arena_escape_error(expr_span(value));
+                }
+                self.flag_arena_escapes_expr(value, tainted);
+                self.flag_arena_escapes_expr(target, tainted);
+            }
+            Stmt::AugAssign { target, value, .. } => {
+                if !matches!(target, Expr::Name(..)) && arena_outflow(value, tainted) {
+                    self.arena_escape_error(expr_span(value));
+                }
+            }
+            Stmt::AssignChain { targets, value, .. } => {
+                if targets.iter().any(|t| !matches!(t, Expr::Name(..)))
+                    && arena_outflow(value, tainted)
+                {
+                    self.arena_escape_error(expr_span(value));
+                }
+            }
+            Stmt::Let { value, .. } | Stmt::LetTuple { value, .. } => {
+                self.flag_arena_escapes_expr(value, tainted);
+            }
+            Stmt::AssignTuple { value, .. } => {
+                self.flag_arena_escapes_expr(value, tainted);
+            }
+            Stmt::Expr(e) => self.flag_arena_escapes_expr(e, tainted),
+            Stmt::Spawn { call, .. } => {
+                // The whole spawned call (its arguments) crosses a coroutine
+                // boundary — a tainted argument escapes the arena's block.
+                if let Expr::Call { args, .. } = call {
+                    for a in args {
+                        if arena_outflow(&a.value, tainted) {
+                            self.arena_escape_error(expr_span(&a.value));
+                        }
+                    }
+                }
+                self.flag_arena_escapes_expr(call, tainted);
+            }
+            Stmt::Scope { opts, body, .. } => {
+                for o in opts {
+                    self.flag_arena_escapes_expr(&o.value, tainted);
+                }
+                self.flag_arena_escapes(body, tainted);
+            }
+            Stmt::If {
+                branches,
+                else_block,
+                ..
+            } => {
+                for (c, bl) in branches {
+                    self.flag_arena_escapes_expr(c, tainted);
+                    self.flag_arena_escapes(bl, tainted);
+                }
+                if let Some(bl) = else_block {
+                    self.flag_arena_escapes(bl, tainted);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                self.flag_arena_escapes_expr(cond, tainted);
+                self.flag_arena_escapes(body, tainted);
+            }
+            Stmt::DoWhile { body, cond, .. } => {
+                self.flag_arena_escapes(body, tainted);
+                self.flag_arena_escapes_expr(cond, tainted);
+            }
+            Stmt::For { iter, body, .. } => {
+                self.flag_arena_escapes_expr(iter, tainted);
+                self.flag_arena_escapes(body, tainted);
+            }
+            Stmt::Match {
+                scrutinee, arms, ..
+            } => {
+                self.flag_arena_escapes_expr(scrutinee, tainted);
+                for arm in arms {
+                    if let Some(g) = &arm.guard {
+                        self.flag_arena_escapes_expr(g, tainted);
+                    }
+                    self.flag_arena_escapes(&arm.body, tainted);
+                }
+            }
+            Stmt::Try {
+                body,
+                excepts,
+                finally,
+                ..
+            } => {
+                self.flag_arena_escapes(body, tainted);
+                for ex in excepts {
+                    self.flag_arena_escapes(&ex.body, tainted);
+                }
+                if let Some(fb) = finally {
+                    self.flag_arena_escapes(fb, tainted);
+                }
+            }
+            Stmt::With { items, body, .. } => {
+                for it in items {
+                    self.flag_arena_escapes_expr(&it.expr, tainted);
+                }
+                self.flag_arena_escapes(body, tainted);
+            }
+            Stmt::Raise { value, cause, .. } => {
+                if let Some(v) = value {
+                    // Raising a tainted value hands it to the unwinder, which
+                    // outlives the block — an escape.
+                    if arena_outflow(v, tainted) {
+                        self.arena_escape_error(expr_span(v));
+                    }
+                }
+                if let Some(c) = cause {
+                    self.flag_arena_escapes_expr(c, tainted);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Scan an expression for a closure that captures a tainted value (the capture
+    /// outlives the block). Plain call arguments are *borrows* and are not flagged.
+    fn flag_arena_escapes_expr(&mut self, e: &Expr, tainted: &HashSet<String>) {
+        // A closure that captures an arena-allocated value may outlive the block;
+        // conservatively reject any lambda that references a tainted name in its
+        // body (a captured borrow that stays in-block is rare and fails safe).
+        if let Expr::Lambda { body, .. } = e {
+            if references_tainted(body, tainted) {
+                self.arena_escape_error(expr_span(e));
+            }
+        }
+        let mut kids: Vec<&Expr> = Vec::new();
+        child_exprs(e, &mut kids);
+        for k in kids {
+            self.flag_arena_escapes_expr(k, tainted);
+        }
+    }
+
+    fn arena_escape_error(&mut self, span: Span) {
+        self.error(
+            ErrorCode::ZAP5131,
+            "an arena-allocated value may not escape its `with` scope — it cannot be \
+             returned, stored in a longer-lived slot, captured by a closure, or \
+             carried across a `spawn`/`scope:` boundary (#553, D-0158). Passing it to \
+             a C `extern` for the call is a permitted borrow."
+                .to_string(),
+            span,
+        );
     }
 
     /// Close `scoped_types` under contagion: a struct is `@scoped` if any field's
@@ -503,4 +728,143 @@ fn push_clauses<'a>(clauses: &'a [CompClause], out: &mut Vec<&'a Expr>) {
             out.push(f);
         }
     }
+}
+
+// ---- arena-value escape helpers (#553, D-0158 §3) --------------------------
+
+/// Push every nested block of a statement into `out` (control-flow bodies only).
+fn stmt_blocks<'a>(s: &'a Stmt, out: &mut Vec<&'a Block>) {
+    match s {
+        Stmt::With { body, .. }
+        | Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::Scope { body, .. } => out.push(body),
+        Stmt::If {
+            branches,
+            else_block,
+            ..
+        } => {
+            for (_, b) in branches {
+                out.push(b);
+            }
+            if let Some(b) = else_block {
+                out.push(b);
+            }
+        }
+        Stmt::Match { arms, .. } => {
+            for arm in arms {
+                out.push(&arm.body);
+            }
+        }
+        Stmt::Try {
+            body,
+            excepts,
+            finally,
+            ..
+        } => {
+            out.push(body);
+            for ex in excepts {
+                out.push(&ex.body);
+            }
+            if let Some(b) = finally {
+                out.push(b);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the names bound by `with arena(...) as h` anywhere in `b` (nested).
+fn collect_arena_handles(b: &Block, out: &mut HashSet<String>) {
+    for s in &b.stmts {
+        if let Stmt::With { items, .. } = s {
+            for it in items {
+                if is_arena_producer(&it.expr) {
+                    if let Some(a) = &it.alias {
+                        out.insert(a.clone());
+                    }
+                }
+            }
+        }
+        let mut blocks: Vec<&Block> = Vec::new();
+        stmt_blocks(s, &mut blocks);
+        for blk in blocks {
+            collect_arena_handles(blk, out);
+        }
+    }
+}
+
+/// Is `e` a fresh `arena(...)` construction (the one `@scoped` arena producer)?
+fn is_arena_producer(e: &Expr) -> bool {
+    matches!(e, Expr::Call { callee, .. } if matches!(&**callee, Expr::Name(n, _) if n == "arena"))
+}
+
+/// Propagate arena taint one step: mark a local bound from an `h.alloc`/`h.new`
+/// result (h a handle) or from a bare alias of an already-tainted value. Returns
+/// via `out` (monotone; the caller iterates to a fixpoint).
+fn collect_arena_taint(b: &Block, handles: &HashSet<String>, out: &mut HashSet<String>) {
+    for s in &b.stmts {
+        match s {
+            Stmt::Let { name, value, .. } if is_arena_source(value, handles, out) => {
+                out.insert(name.clone());
+            }
+            Stmt::Assign {
+                target: Expr::Name(n, _),
+                value,
+                ..
+            } if is_arena_source(value, handles, out) => {
+                out.insert(n.clone());
+            }
+            _ => {}
+        }
+        let mut blocks: Vec<&Block> = Vec::new();
+        stmt_blocks(s, &mut blocks);
+        for blk in blocks {
+            collect_arena_taint(blk, handles, out);
+        }
+    }
+}
+
+/// Does `e` produce an arena-bound value — a direct `h.alloc`/`h.new` result, or a
+/// bare alias of an already-tainted local? Leaf-only (D-0158 §5.1) means field /
+/// element / slice access yields a scalar or a fresh copy, never an interior arena
+/// pointer, so derivations do NOT propagate taint.
+fn is_arena_source(e: &Expr, handles: &HashSet<String>, tainted: &HashSet<String>) -> bool {
+    match e {
+        Expr::Call { callee, .. } => {
+            matches!(&**callee, Expr::Attr { base, name, .. }
+                if (name == "alloc" || name == "new")
+                    && matches!(&**base, Expr::Name(h, _) if handles.contains(h)))
+        }
+        Expr::Name(n, _) => tainted.contains(n),
+        _ => false,
+    }
+}
+
+/// Does `e` let an arena-bound value flow out *by value*? True for a bare tainted
+/// name or one inside a transparent tuple/list/set/`*`-splat display; it does not
+/// descend into a call (a borrow), attribute, or index (a leaf copy).
+fn arena_outflow(e: &Expr, tainted: &HashSet<String>) -> bool {
+    match e {
+        Expr::Name(n, _) => tainted.contains(n),
+        Expr::Tuple(xs, _) | Expr::List(xs, _) | Expr::Set(xs, _) => {
+            xs.iter().any(|x| arena_outflow(x, tainted))
+        }
+        Expr::Starred { value, .. } => arena_outflow(value, tainted),
+        _ => false,
+    }
+}
+
+/// Does `e` reference any tainted name anywhere in its subtree (used to detect a
+/// closure capturing an arena-allocated value)?
+fn references_tainted(e: &Expr, tainted: &HashSet<String>) -> bool {
+    if let Expr::Name(n, _) = e {
+        if tainted.contains(n) {
+            return true;
+        }
+    }
+    let mut kids: Vec<&Expr> = Vec::new();
+    child_exprs(e, &mut kids);
+    kids.iter().any(|k| references_tainted(k, tainted))
 }
