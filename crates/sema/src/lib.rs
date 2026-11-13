@@ -360,6 +360,13 @@ struct Checker {
     /// generic spelling is covered by its base. Consulted by the `@scoped`
     /// well-formedness, with-head-only, and escape checks (`crates/sema/src/scoped.rs`).
     scoped_types: HashSet<String>,
+    /// The receiver name (`self`) whose field is a legal move target for a fresh
+    /// `@scoped` value (#876, D-0159), set only while walking a method of a
+    /// `@scoped` struct. `Some("self")` inside such a method; `None` in a free
+    /// function, a non-`@scoped` struct's method, or anywhere else — so a
+    /// `@scoped` value may be moved into `self.<field>` ONLY inside its owner's
+    /// own method, never into an arbitrary object's field. See `scoped.rs`.
+    scoped_self_base: Option<String>,
     /// Names of mutable module-level globals whose type is NOT `@shareable`
     /// (#664, D-0113). Each read or write of one of these — resolving to the
     /// module frame, not a shadowing local — raises the ZAP5125 sharing-lint
@@ -832,6 +839,7 @@ impl Checker {
             deprecated: HashMap::new(),
             shareable_types: HashSet::new(),
             scoped_types: HashSet::new(),
+            scoped_self_base: None,
             share_lint_globals: HashSet::new(),
             scopes: Vec::new(),
             const_scopes: Vec::new(),
@@ -9100,6 +9108,74 @@ def main():
         // A plain struct is never @scoped: free to construct detached, return,
         // store — no @scoped diagnostics.
         ok("struct Plain:\n    int64 n = 0\ndef make() -> Plain:\n    return Plain()\ndef main():\n    auto p = Plain()\n    print(p.n)\n");
+    }
+
+    #[test]
+    fn scoped_rejects_construction_in_a_method() {
+        // A @scoped value constructed detached inside a *method* (here a plain
+        // struct's method) is rejected exactly as in a free function: the
+        // with-head-only rule holds everywhere, not just in `main`/free functions.
+        let src = arena_src(
+            "struct Plain:\n    int64 n = 0\n    \
+             def build(self):\n        auto a = Arena()\ndef main():\n    print(0)\n",
+        );
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+            "expected ZAP5128 for detached @scoped construction in a method, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_rejects_producer_as_method_arg() {
+        // Passing a freshly produced @scoped value to a call from within a method
+        // is a retaining-call escape — rejected (ZAP5128 at the producer).
+        let src = arena_src(
+            "struct Plain:\n    int64 n = 0\n    \
+             def use(self):\n        self.sink(Arena())\n    \
+             def sink(self, Arena a):\n        pass\ndef main():\n    print(0)\n",
+        );
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+            "expected ZAP5128 for a fresh @scoped value passed to a call in a method, got {e:?}"
+        );
+    }
+
+    /// A well-formed `@scoped` `Arena` + a `@scoped` `Pool` owner that moves an
+    /// `Arena` into its field in `__enter__`.
+    fn pool_src(extra: &str) -> String {
+        format!(
+            "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+             def __enter__(self) -> Arena:\n        return self\n    \
+             def __exit__(self):\n        pass\n\
+             @scoped\nstruct Pool:\n    Arena a\n    \
+             def __enter__(self) -> Pool:\n        self.a = Arena()\n        return self\n    \
+             def __exit__(self):\n        pass\n{extra}"
+        )
+    }
+
+    #[test]
+    fn scoped_rejects_field_move_outside_the_owner() {
+        // The legal field move is ONLY `self.<field> = Producer()` inside the
+        // owner's own method. Storing a fresh @scoped value into another object's
+        // field (here a `Pool` parameter, not `self`) is NOT a legal move — it is
+        // a detached construction stored into an arbitrary slot (ZAP5128).
+        let src = pool_src("def tamper(Pool p):\n    p.a = Arena()\ndef main():\n    print(0)\n");
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+            "expected ZAP5128 for a @scoped field move outside the owner, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_accepts_self_field_move_in_owner_enter() {
+        // The complement of the previous test: the SAME `self.a = Arena()` move is
+        // accepted inside the `@scoped` owner's own `__enter__`.
+        ok(&pool_src(
+            "def main():\n    with Pool() as p:\n        pass\n",
+        ));
     }
 
     #[test]

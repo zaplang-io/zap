@@ -110,20 +110,40 @@ impl Checker {
         let empty: HashSet<String> = HashSet::new();
         for item in &module.items {
             match item {
-                Item::Function(f) => self.walk_scoped_block(&f.body, &empty),
+                Item::Function(f) => {
+                    // A free function owns no `@scoped` struct, so it has no legal
+                    // field-move site: a fresh `@scoped` value may only be
+                    // `with`-bound here.
+                    self.scoped_self_base = None;
+                    self.walk_scoped_block(&f.body, &empty);
+                }
                 Item::Struct(s) => {
+                    // A legal move into `self.<field>` exists only inside a method
+                    // of a `@scoped` owner (typically its `__enter__`); the base is
+                    // that method's receiver name. A non-`@scoped` struct's method
+                    // has no legal field-move site.
+                    let owner_scoped = self.scoped_types.contains(&s.name);
                     for m in &s.methods {
+                        self.scoped_self_base = if owner_scoped {
+                            m.params.first().map(|p| p.name.clone())
+                        } else {
+                            None
+                        };
                         self.walk_scoped_block(&m.body, &empty);
                     }
                 }
                 Item::Enum(e) => {
+                    // Enums are never `@scoped` (the marker requires a struct
+                    // target), so an enum method has no legal field-move site.
                     for m in &e.methods {
+                        self.scoped_self_base = None;
                         self.walk_scoped_block(&m.body, &empty);
                     }
                 }
                 _ => {}
             }
         }
+        self.scoped_self_base = None;
     }
 
     fn walk_scoped_block(&mut self, b: &Block, aliases: &HashSet<String>) {
@@ -152,11 +172,22 @@ impl Checker {
                 self.walk_scoped_block(body, &inner);
             }
             // `target = value` — the one other legal construction site is a move
-            // of a fresh `@scoped` value into a field/slot (ownership transfer).
+            // of a fresh `@scoped` value into a `@scoped` field of the owner being
+            // set up: `self.<field> = Producer()` inside the owner's own method
+            // (D-0159 consumer (b)). The target must be `self.<field>` where `self`
+            // is the enclosing `@scoped` method's receiver (`scoped_self_base`);
+            // a store into any other object's field, into a subscript, or from a
+            // non-`@scoped`-owner method is NOT a legal move, so the producer is
+            // rejected (ZAP5128).
             Stmt::Assign { target, value, .. } => {
                 self.scan_expr(target, aliases);
-                let legal_move = matches!(target, Expr::Attr { .. } | Expr::Index { .. })
-                    && self.producer_span(value).is_some();
+                let legal_move = self.producer_span(value).is_some()
+                    && matches!(
+                        target,
+                        Expr::Attr { base, .. }
+                            if matches!(&**base, Expr::Name(n, _)
+                                if self.scoped_self_base.as_deref() == Some(n.as_str()))
+                    );
                 if legal_move {
                     self.scan_children(value, aliases);
                 } else {
