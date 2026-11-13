@@ -8008,3 +8008,100 @@ allocation; `a.reset()` mid-block recycle; arena-local typed collections
 **No grammar change.** `with` (#185) and inline parameter annotations (#458 /
 D-0089) already exist; the `with`-head-only constraint on `arena()` is a sema
 rule, not a grammar production. `GRAMMAR.ebnf` is unchanged.
+
+## D-0159 — `@scoped` affine resource marker (with-bound RAII) (#876)
+
+**Status:** Accepted (design frozen with the maintainer; implementation in this
+PR). **Relates:** D-0069 / #185 (the `with` context-manager protocol —
+`__enter__`/`__exit__`), D-0151 (#839/#850 escape analysis — reused), D-0113
+(`@shareable`, the struct-marker-decorator precedent), D-0158 / `docs/design/arena.md`
+(#553 arena — the first `@scoped` consumer). **Discussion:** zaplang-io/zap #874
+(RFC — design debate & rationale). **Doc:** `docs/design/scoped.md` (authoritative
+spec).
+
+A **`@scoped` affine, with-bound resource marker**: a struct whose values must be
+bound by a `with` block (or owned by another `@scoped` value) and are torn down
+deterministically at scope exit, enforced **statically**. This generalizes the
+leak-free guarantee the #553 arena needs (D-0158) into a reusable language
+feature and underlies composite scoped types such as `arena_dict` (#873).
+
+**Why.** Zap's `with` is a Python-faithful context-manager protocol (D-0069): any
+struct with `__enter__`/`__exit__` is a context manager, and — exactly like
+Python — a manager can be constructed *detached* (`a = arena()`), in which case
+its cleanup never runs. For cleanup-critical RAII (arena, locks, DB transactions,
+`pin()` #544) the managed resource is not on the GC heap, so a dropped-on-the-floor
+value is a real leak the collector cannot reclaim. `@scoped` closes that hole
+statically, with the guarantee visible in the type rather than inferred from a
+body (the same visible-over-inferred principle as #553's `@noescape`).
+
+**Decisions (frozen; the six #876 open questions).**
+
+1. **Surface = decorator.** A struct is marked with the `@scoped` decorator,
+   reusing the existing struct-decorator surface (the `@shareable` precedent,
+   D-0113); `StructDef` already carries `decorators`, so there is **no grammar
+   change** (`GRAMMAR.ebnf` unchanged). Rejected: a marker interface/trait (more
+   machinery; conflates the "must define `__enter__`/`__exit__`" *well-formedness*
+   rule with interface conformance) and a new keyword (a grammar production and a
+   reserved word for a niche, expert-facing property).
+2. **Auto-teardown = compiler drop-glue, reverse construction order.** An owner's
+   teardown auto-runs each owned `@scoped` field's `__exit__` in reverse
+   construction order (Rust `Drop`-glue / Python `ExitStack`), *in addition to* the
+   owner's hand-written `__exit__` body, on every exit path. The hand-written
+   `__exit__` is the owner's own cleanup; the drop-glue guarantees owned scoped
+   fields are released regardless, so an owned scoped field can never be forgotten.
+   Rejected: author-must-call-with-compiler-verification (reintroduces the
+   forget-to-cleanup hole for owned fields).
+3. **Affine checker narrow + reuse escape machinery.** The affine check is scoped
+   narrowly to `@scoped`-typed values — **not** general linear typing — so the
+   cost is contained. The no-escape leg reuses the D-0151 escape lattice
+   (`crates/ir/src/escape.rs`) with the boundary set to the `with` scope and the
+   consequence inverted to a hard compile error (never the D-0151 heap fallback —
+   the resource is gone at block exit); ambiguity fails safe to reject. The
+   consume-exactly-once leg is a small dedicated check layered on top (the escape
+   pass models reachability, not use-counts).
+4. **No move/consume syntax.** Ownership transfer into a `@scoped` field
+   (consumer (b)) is plain assignment; "assigned into exactly one `@scoped` field,
+   else error" is sufficient because the affine checker already proves
+   single-consumption. No new surface syntax. Rejected: an explicit
+   `move`/`consume` keyword (redundant ceremony + a grammar change).
+5. **Implicit-`@scoped` owners must hand-write both `__enter__` and `__exit__`.**
+   A struct that becomes `@scoped` only by owning a `@scoped` field (contagion,
+   below) is subject to the same well-formedness rule as an explicitly-marked one:
+   it must hand-write both methods. The compiler does **not** synthesize a trivial
+   pair. This keeps the rule uniform and the owner's setup/teardown explicit; the
+   drop-glue of decision 2 still guarantees the *owned* fields are torn down.
+6. **Single issue, not an epic.** One coherent sema/type-system feature (marker +
+   well-formedness + affine/consume + contagion + auto-teardown lowering + tests)
+   landing in one PR; the pieces do not ship independently. Fits AGENTS.md's "do
+   not split into unnecessary S-sized issues."
+
+**Core rules (full spec in `docs/design/scoped.md`).**
+
+- **Well-formedness.** A `@scoped` struct (marked or contagious) **must** define
+  both `__enter__` and `__exit__`; absence is a compile error
+  (`ZAP5127: @scoped struct 'X' must define both __enter__ and __exit__`).
+- **With-head-only construction** (`ZAP5128`). A freshly produced `@scoped` value
+  may appear only as a `with` head or as the RHS of an assignment into a `@scoped`
+  field; bare construction, `return` of a fresh value, or store into a non-scoped
+  slot is a compile error. A fresh `@scoped` value consumed by neither consumer is
+  caught here (it is never bound), giving the affine "consumed-exactly-once"
+  guarantee for construction sites.
+- **No escape** (`ZAP5129`). A `with`-bound `@scoped` value may not outlive its
+  `with` scope: returning it, storing it into a longer-lived slot, or passing it
+  across a call / `spawn` / `scope:` boundary is a compile error — the arena's
+  coroutine-local rule (D-0158 decision 7) generalized.
+- **Contagion.** A struct owning a `@scoped` field is itself `@scoped`,
+  transitively (cf. Rust: owning a `Drop` type makes you `Drop`).
+
+Three new diagnostics: `ZAP5127` (well-formedness), `ZAP5128` (with-head-only /
+affine construction), `ZAP5129` (escape, incl. `spawn`/`scope:` crossing).
+
+**Relationship to #553.** The arena is the first `@scoped` consumer. Arena v1's
+degenerate with-head-only check (D-0158 decision 2) is **subsumed** by this
+mechanism once it lands; the full affine/contagion/auto-teardown machinery is what
+unblocks composite `@scoped` types (`arena_dict` #873). Arena v1 itself is not
+blocked on, and not modified by, this feature.
+
+**No grammar change.** The surface is a struct decorator with no new syntax and no
+`move`/`consume` keyword; every rule is a sema/type-system check or a
+`with`-lowering addition. `GRAMMAR.ebnf` is unchanged.

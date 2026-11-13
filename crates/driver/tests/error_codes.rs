@@ -117,6 +117,28 @@ fn semantic_codes() {
         "def main():\n    list[int64] xs = [1]\n    auto d = {\"a\": 1, **xs}\n",
         "ZAP5123",
     );
+    // A `@scoped` struct missing its context-manager methods (#876, D-0159).
+    assert_code(
+        "@scoped\nstruct Arena:\n    int64 id = 0\n\ndef main():\n    pass\n",
+        "ZAP5127",
+    );
+    // A detached construction of a `@scoped` value — not bound by `with` (#876).
+    assert_code(
+        "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+         def __enter__(self) -> Arena:\n        return self\n    \
+         def __exit__(self):\n        pass\n\
+         def main():\n    auto a = Arena()\n",
+        "ZAP5128",
+    );
+    // A `with`-bound `@scoped` value escaping its scope (returned) (#876).
+    assert_code(
+        "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+         def __enter__(self) -> Arena:\n        return self\n    \
+         def __exit__(self):\n        pass\n\
+         def make() -> Arena:\n    with Arena() as a:\n        return a\n\
+         def main():\n    pass\n",
+        "ZAP5129",
+    );
 }
 
 #[test]

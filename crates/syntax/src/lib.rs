@@ -27,6 +27,18 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// lint (ZAP5125) consults: there is no hardcoded type allowlist in the lint.
 pub const SHAREABLE_MARKER: &str = "shareable";
 
+/// The `@scoped` affine-resource marker (#876, D-0159).
+///
+/// A nominal annotation (D-0036) a type author applies to a `struct` to make it
+/// a *with-bound affine resource*: its values must be consumed exactly once — by
+/// a `with` head or by a move into another `@scoped` struct's field — and are
+/// torn down deterministically at scope exit, enforced statically. A `@scoped`
+/// struct MUST define both `__enter__` and `__exit__` (the context-manager
+/// protocol, D-0069). Scopedness is contagious through ownership (a struct owning
+/// a `@scoped` field is itself `@scoped`). The first consumer is the #553 arena
+/// (D-0158); the full spec is `docs/design/scoped.md`.
+pub const SCOPED_MARKER: &str = "scoped";
+
 /// The built-in types that carry the `@shareable` marker implicitly (#664,
 /// D-0113): the concurrency primitives and concurrent collections whose whole
 /// purpose is safe concurrent shared access. Seeding the lint's one membership
