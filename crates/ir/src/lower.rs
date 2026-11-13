@@ -14922,11 +14922,9 @@ impl<'a> FnLower<'a> {
         } else {
             "zap_array_arange_i"
         };
-        self.emit(Inst::Call {
-            dest: Some(arr),
-            func: func.to_string(),
-            args: vec![code, start, stop, step],
-        });
+        // arange raises a catchable ValueError on a zero step, so it must be a
+        // throwing call (invoke) for an enclosing `try` to catch it.
+        self.throwing_call(Some(arr), func, vec![code, start, stop, step]);
         Ok((arr, ty))
     }
 
@@ -21617,7 +21615,9 @@ mod constructor_tests {
             .flat_map(|f| f.blocks.iter())
             .flat_map(|b| b.insts.iter())
             .filter_map(|i| match i {
-                Inst::Call { func, .. } => Some(func.clone()),
+                // arange lowers to a throwing call (Invoke) so its zero-step
+                // ValueError is catchable; collect both call forms.
+                Inst::Call { func, .. } | Inst::Invoke { func, .. } => Some(func.clone()),
                 _ => None,
             })
             .collect()
