@@ -895,6 +895,11 @@ fn collect_expr_bindings(e: &Expr, s: &mut HashSet<String>) {
                 collect_expr_bindings(part, s);
             }
         }
+        Expr::SliceSpec { lo, hi, step, .. } => {
+            for part in [lo, hi, step].iter().copied().flatten() {
+                collect_expr_bindings(part, s);
+            }
+        }
         Expr::Attr { base, .. } => collect_expr_bindings(base, s),
         Expr::Tuple(xs, _) | Expr::List(xs, _) | Expr::Set(xs, _) => {
             for x in xs {

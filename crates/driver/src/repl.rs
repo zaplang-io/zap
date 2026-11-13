@@ -1096,6 +1096,7 @@ mod engine {
             | Expr::Call { span, .. }
             | Expr::Index { span, .. }
             | Expr::Slice { span, .. }
+            | Expr::SliceSpec { span, .. }
             | Expr::Attr { span, .. }
             | Expr::Lambda { span, .. }
             | Expr::RegexMatch { span, .. }
