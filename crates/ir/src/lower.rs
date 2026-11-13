@@ -3948,6 +3948,23 @@ fn is_atomic_struct(ctx: &StructCtx, sid: u32) -> bool {
     }
 }
 
+/// Is `sid` the built-in scope-bound `arena` struct (#553, D-0158)? Its handle
+/// value is an opaque `ZapArena*`; `a.alloc`/`a.new` on it lower to runtime region
+/// calls rather than ordinary struct methods.
+fn is_arena_struct(ctx: &StructCtx, sid: u32) -> bool {
+    ctx.names
+        .get(sid as usize)
+        .map(|n| n == "arena")
+        .unwrap_or(false)
+}
+
+/// Is `e` a fresh `arena(...)` construction — the head of a `with arena(...) as a:`
+/// (#553)? Recognized by the callee name, mirroring the `expect_raises` special
+/// case; sema's `@scoped` rule guarantees it appears only as a `with` head.
+fn is_arena_call(e: &Expr) -> bool {
+    matches!(e, Expr::Call { callee, .. } if is_name(callee, "arena"))
+}
+
 /// Recognize a field type that is a monomorphized `Optional[T]` instance (by its
 /// mangled name `Optional` / `Optional$…`) and return its layout, else `None`.
 fn optional_layout(ctx: &StructCtx, fty: Ty) -> Option<OptionalLayout> {
@@ -5887,6 +5904,10 @@ enum Cleanup {
     EndCatch,
     /// Leaving a structured concurrency region cancels and awaits its children.
     ScopeCancel(Value),
+    /// Leaving a `with arena(...) as a:` block bulk-frees the arena's regions
+    /// (#553, D-0158): emit `zap_arena_close(handle)`. Runs on every exit path —
+    /// normal, exception unwind, and structured early-exit — like any `with`.
+    ArenaClose(Value),
 }
 
 /// State threaded through the lowering of a generator's `__next__` (I#67). The
@@ -6137,6 +6158,13 @@ impl<'a> FnLower<'a> {
                     self.emit(Inst::Call {
                         dest: None,
                         func: "zap_scope_exit_cancel".to_string(),
+                        args: vec![*handle],
+                    });
+                }
+                Cleanup::ArenaClose(handle) => {
+                    self.emit(Inst::Call {
+                        dest: None,
+                        func: "zap_arena_close".to_string(),
                         args: vec![*handle],
                     });
                 }
@@ -8920,6 +8948,16 @@ impl<'a> FnLower<'a> {
             return Ok(());
         }
         let item = &items[idx];
+        // Arena (#553, D-0158): `with arena(size=?, cap=?) as a:` lowers to the
+        // runtime region primitive, not the generic `__enter__`/`__exit__` protocol
+        // — the handle is `zap_arena_open(size, cap)`, and the deterministic
+        // block-exit bulk free (`zap_arena_close`) rides the same cleanup +
+        // landing-pad machinery as any `with` (normal / unwind / early-exit paths).
+        if is_arena_call(&item.expr) {
+            if let Some(&arena_sid) = self.ctx.ids.get("arena") {
+                return self.lower_arena_with(items, body, idx, arena_sid);
+            }
+        }
         let (mgr, mty) = self.expr(&item.expr)?;
         let Ty::Struct(sid) = mty else {
             return Err(err(
@@ -9004,6 +9042,119 @@ impl<'a> FnLower<'a> {
         }
         self.position(after);
         Ok(())
+    }
+
+    /// Lower a `with arena(size=?, cap=?) as a:` item (#553, D-0158). Mirrors
+    /// `lower_with_items`' exit-path structure (normal fall-through, exception
+    /// unwind, structured early-exit via the cleanup stack), but the manager is the
+    /// runtime arena: entry is `zap_arena_open(size, cap)` and teardown is the
+    /// deterministic bulk free `zap_arena_close(handle)` (a `Cleanup::ArenaClose`).
+    /// The handle is bound as `Ty::Struct(arena_sid)` so an `a.alloc`/`a.new`
+    /// method call dispatches through the arena receiver path; the underlying value
+    /// is the opaque `ZapArena*`, which the precise marker ignores (not in the heap
+    /// registry).
+    fn lower_arena_with(
+        &mut self,
+        items: &[ast::WithItem],
+        body: &ast::Block,
+        idx: usize,
+        arena_sid: u32,
+    ) -> Result<(), LowerError> {
+        let (size, cap) = self.lower_arena_open_args(&items[idx].expr)?;
+        let aty = Ty::Struct(arena_sid);
+        let handle = self.new_value(aty);
+        self.emit(Inst::Call {
+            dest: Some(handle),
+            func: "zap_arena_open".to_string(),
+            args: vec![size, cap],
+        });
+        // A NULL open (runtime `size > cap`, or heap OOM reserving the hint) raises
+        // before the block is entered; no arena exists yet to tear down, so this
+        // guard precedes the cleanup/landing-pad setup below.
+        self.arena_oom_guard(handle);
+        if let Some(alias) = &items[idx].alias {
+            let alias = alias.clone();
+            let slot = self.alloca(aty);
+            self.store(slot, handle);
+            self.declare(&alias, slot, aty);
+        }
+
+        let lp = self.new_block();
+        let after = self.new_block();
+        self.landing_pads.push(lp);
+        self.cleanups.push(Cleanup::ArenaClose(handle));
+        self.push_scope();
+        self.lower_with_items(items, body, idx + 1)?;
+        self.pop_scope();
+        self.cleanups.pop();
+        self.landing_pads.pop();
+
+        // Normal fall-through: bulk-free, then continue past the `with`.
+        if !self.terminated() {
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_arena_close".to_string(),
+                args: vec![handle],
+            });
+            self.ensure_br(after);
+        }
+
+        // Body could not raise → no landing pad needed.
+        if !self.used_lps.contains(&lp) {
+            self.position(after);
+            return Ok(());
+        }
+
+        // Unwind path: bulk-free, then re-raise (chaining to the enclosing
+        // manager/`try`, `lp` already popped).
+        self.position(lp);
+        let exc = self.new_value(Ty::Ptr);
+        self.emit(Inst::LandingPad { dest: exc });
+        self.emit_end_catch();
+        self.emit(Inst::Call {
+            dest: None,
+            func: "zap_arena_close".to_string(),
+            args: vec![handle],
+        });
+        if !self.terminated() {
+            self.throwing_call(None, "zap_raise", vec![exc]);
+            if !self.terminated() {
+                self.set_term(Term::Unreachable);
+            }
+        }
+        self.position(after);
+        Ok(())
+    }
+
+    /// Lower the `size` / `cap` arguments of an `arena(...)` head to two `i64`
+    /// values, each defaulting to `0` (0 size = one region; 0 cap = unbounded).
+    /// Accepts them positionally or by keyword; unknown keywords are ignored (sema
+    /// has already validated the call).
+    fn lower_arena_open_args(&mut self, e: &Expr) -> Result<(Value, Value), LowerError> {
+        let mut size: Option<Value> = None;
+        let mut cap: Option<Value> = None;
+        if let Expr::Call { args, .. } = e {
+            let mut positional = 0usize;
+            for a in args {
+                let (v, _) = self.expr(&a.value)?;
+                match a.name.as_deref() {
+                    Some("size") => size = Some(v),
+                    Some("cap") => cap = Some(v),
+                    Some(_) => {}
+                    None => {
+                        if positional == 0 {
+                            size = Some(v);
+                        } else if positional == 1 {
+                            cap = Some(v);
+                        }
+                        positional += 1;
+                    }
+                }
+            }
+        }
+        let size = size.unwrap_or_else(|| self.iconst(Ty::I64, 0));
+        let cap = cap.unwrap_or_else(|| self.iconst(Ty::I64, 0));
+        Ok((size, cap))
     }
 
     /// `with expect_raises(ErrType):` (D-0054) — the test-framework assertion
@@ -12584,6 +12735,12 @@ impl<'a> FnLower<'a> {
             let Ty::Struct(sid) = bty else {
                 return Err(err("method call on a non-struct value"));
             };
+            // Arena (#553, D-0158): `a.alloc(bytes, n)` / `a.new(T, ...)` on an
+            // arena handle lower to the runtime region allocator, not a struct
+            // method call. Sema has already enforced leaf-only and the escape rule.
+            if is_arena_struct(self.ctx, sid) {
+                return self.lower_arena_method(recv, name, args);
+            }
             // `Atomic[T]` (I#176): a method on a monomorphized `Atomic` box
             // (`Atomic$int64`, `Atomic$str`, …) lowers to an inline LLVM atomic on
             // its cell, not to a struct-method call. Recognized by the mangled
@@ -13259,9 +13416,106 @@ impl<'a> FnLower<'a> {
         ))
     }
 
+    /// Lower an `arena` method call (#553, D-0158): `a.alloc(bytes, n)` to a
+    /// non-moving byte buffer (`zap_arena_alloc_bytes`), and `a.new(T, ...)` to a
+    /// leaf struct bump-allocated in the arena (`Inst::ArenaNew` →
+    /// `zap_arena_alloc_atomic`) with its fields initialized like `construct`. Both
+    /// guard the result against a NULL (cap / heap-OOM) return by raising through
+    /// `zap_arena_oom`. Sema (`check_arena_method`) has already enforced the
+    /// argument shape and leaf-only rule, so this trusts them.
+    fn lower_arena_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        match name {
+            "alloc" => {
+                // `a.alloc(bytes, n)`: arg0 is the element type (`bytes`, per sema);
+                // arg1 is the byte count.
+                let n = if args.len() >= 2 {
+                    self.expr(&args[1].value)?.0
+                } else {
+                    self.iconst(Ty::I64, 0)
+                };
+                let dest = self.new_value(Ty::Bytes);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_arena_alloc_bytes".to_string(),
+                    args: vec![recv, n],
+                });
+                self.arena_oom_guard(dest);
+                Ok((dest, Ty::Bytes))
+            }
+            "new" => {
+                // `a.new(T, field_args...)`: arg0 is the leaf struct type.
+                let Some(first) = args.first() else {
+                    return Err(err("a.new(T, ...) requires a type argument"));
+                };
+                let Expr::Name(tname, _) = &first.value else {
+                    return Err(err("a.new(T, ...)'s first argument must be a struct type"));
+                };
+                let Some(&tsid) = self.ctx.ids.get(tname) else {
+                    return Err(err(format!("a.new: unknown struct type '{tname}'")));
+                };
+                let dest = self.new_value(Ty::Struct(tsid));
+                self.emit(Inst::ArenaNew {
+                    dest,
+                    sid: tsid,
+                    arena: recv,
+                });
+                self.arena_oom_guard(dest);
+                self.fill_struct_fields(dest, tsid, &args[1..])?;
+                Ok((dest, Ty::Struct(tsid)))
+            }
+            other => Err(err(format!(
+                "`arena` has no method '{other}' (use `alloc`/`new`)"
+            ))),
+        }
+    }
+
+    /// Raise `zap_arena_oom` (a catchable error) when an arena allocation returned
+    /// NULL (cap exceeded / heap OOM). The raise is a `throwing_call`, so inside the
+    /// arena's `with` it unwinds to the block's landing pad and the arena is torn
+    /// down (`Cleanup::ArenaClose`) on the way out.
+    fn arena_oom_guard(&mut self, obj: Value) {
+        let isnull = self.new_value(Ty::I1);
+        self.emit(Inst::IsNull {
+            dest: isnull,
+            val: obj,
+        });
+        let oom_bb = self.new_block();
+        let ok_bb = self.new_block();
+        self.set_term(Term::BrIf {
+            cond: isnull,
+            then_bb: oom_bb,
+            else_bb: ok_bb,
+        });
+        self.position(oom_bb);
+        self.throwing_call(None, "zap_arena_oom", vec![]);
+        if !self.terminated() {
+            self.set_term(Term::Unreachable);
+        }
+        self.position(ok_bb);
+    }
+
     fn construct(&mut self, sid: u32, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
         let dest = self.new_value(Ty::Struct(sid));
         self.emit(Inst::StructNew { dest, sid });
+        self.fill_struct_fields(dest, sid, args)?;
+        Ok((dest, Ty::Struct(sid)))
+    }
+
+    /// Initialize the fields of an already-allocated struct `dest` of type `sid`
+    /// from `args` (supplied values + declared defaults) and run its `@validate` /
+    /// `@range` checks. Shared by the heap `construct` and the arena `a.new(...)`
+    /// path (#553), which differ only in how `dest` is allocated.
+    fn fill_struct_fields(
+        &mut self,
+        dest: Value,
+        sid: u32,
+        args: &[ast::Arg],
+    ) -> Result<(), LowerError> {
         // Track which field slots the caller supplies, so every omitted field
         // that carries a declared default (D-0038) is still initialized (#461).
         let mut set = vec![false; self.ctx.fields[sid as usize].len()];
@@ -13332,7 +13586,7 @@ impl<'a> FnLower<'a> {
             let validator = format!("{}____validate__", self.ctx.names[sid as usize]);
             self.throwing_call(None, &validator, vec![dest]);
         }
-        Ok((dest, Ty::Struct(sid)))
+        Ok(())
     }
 
     /// Construct a generator's state struct for a call `gen(args)` (I#67).

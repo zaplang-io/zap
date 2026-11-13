@@ -7953,7 +7953,10 @@ accelerant for the FFI epic (#539).
    region granularity (32 KB block), default one region; `cap` = hard byte
    ceiling, raises `MemoryError` past it, default unbounded. Growth is automatic
    in region units (no manual extend); a >region allocation is a humongous
-   contiguous run.
+   contiguous run. A statically-known `size > cap` is a **compile error**
+   (`ZAP5132`) — a contradiction the compiler can see should not become a latent
+   runtime failure; the check fires only when both args fold to constants, and a
+   runtime `size > cap` fails `arena()` open instead.
 4. **Escape rule = the compile-time dual of D-0151.** A value region-bound to `a`
    may not outlive `a`'s block (return / store into a longer-lived slot / closure
    capture / interface box / `spawn`/`scope:` crossing). Reuses D-0151's escape

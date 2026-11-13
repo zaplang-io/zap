@@ -128,6 +128,15 @@ with arena(size=64*1024, cap=1<<20) as a: ...
   Default: unbounded (grow until heap OOM). `cap` is the bounding knob for
   FFI/embedded use and is the hook the #551 C-malloc model uses (over-cap ⇒
   malloc returns NULL ⇒ the C library's own error path fires).
+- **`size > cap` is a contradiction.** When both `size` and `cap` are
+  statically-known constants and `size > cap`, the arena could never satisfy its
+  own initial reservation; this is a **compile error** (`ZAP5132`) rather than a
+  latent runtime failure — a contradiction the compiler can see should not be
+  deferred to run time. The check fires only when both fold to compile-time
+  integer constants (the common `size=64*1024, cap=1<<20` case); a `size`/`cap`
+  computed at run time cannot be caught statically, so that path keeps the runtime
+  guard: `arena()` open fails (raising the exhaustion error) when a runtime
+  `size` exceeds a runtime `cap`.
 - **Growth** is automatic and transparent: when the current region fills,
   `a.alloc` claims another region from the pool and chains it (the arena is a
   *set* of regions; individual objects never straddle a region). A single
@@ -289,3 +298,32 @@ pointerful-v2 after #714 generational**, not "#714 then #553".
 No `GRAMMAR.ebnf` change: `with` (#185) and inline parameter annotations (#458 /
 D-0089, for the future `@noescape`) already exist. The `with`-head-only
 constraint on `arena()` (§2.2) is a sema rule, not a grammar production.
+
+## 10. Implementation status (v1)
+
+The shipped v1 (epic #553: runtime #878, surface/sema #879, codegen #880) realizes
+this spec with two refinements worth recording:
+
+- **`alloc` element set.** `a.alloc(bytes, n)` (a non-moving byte buffer, the FFI
+  motivation) and `a.new(T, …)` (a single leaf struct) are implemented. Typed
+  numeric arena arrays — `a.alloc(numericT, n)` yielding a flat element-typed
+  buffer (§5.1) — are deferred (#881): they need a size-parametric element-typed
+  buffer representation that `sema_types::Ty` does not yet have. Leaf-only still
+  applies to every element type. Allocating a non-`bytes` element in `alloc`, or a
+  pointerful `T` in `new`, is a compile error (`ZAP5130`).
+- **Exhaustion exception.** `cap` overflow / heap OOM raises a **catchable**
+  exception as specified, but v1 raises a `RuntimeError` whose message names it a
+  memory error rather than a first-class `MemoryError` — Zap has no `MemoryError`
+  type yet. Promoting it to a dedicated `MemoryError` is a small, separable
+  language-surface follow-up tracked under the #553 epic.
+
+A statically-known `size > cap` is rejected at compile time (`ZAP5132`,
+`check_arena_sizing`); a runtime `size > cap` fails `arena()` open (NULL →
+exhaustion raise), covered by the `arena_size_cap` golden.
+
+Enforcement lands in sema (`crates/sema/src/scoped.rs` arena-value escape,
+`ZAP5131`; `crates/sema/src/lib.rs` leaf-only, `ZAP5130`), with the runtime region
+primitive in `crates/codegen/src/zapgc.inc.c` / `zaprt.c` (`zap_arena_open` /
+`zap_arena_alloc_bytes` / `zap_arena_alloc_atomic` / `zap_arena_close`, a pinned
+`ZapBlock` tag the evacuator and sweep both honor) and the `with`-exit bulk free +
+allocation path in `crates/ir/src/lower.rs` / `crates/codegen/src/lib.rs`.

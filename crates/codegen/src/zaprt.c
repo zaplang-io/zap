@@ -381,6 +381,22 @@ __attribute__((noreturn)) static void zap_oom(const char *detail) {
     abort();
 }
 
+/* Scope-bound arena / region allocator (#553, D-0158). Backend-uniform public
+ * entry points: the precise-collector implementation is in zapgc.inc.c (pooled
+ * non-moving regions, deterministic bulk free); the Boehm implementation is below
+ * (cap-accounting over GC allocations). `arena` is an opaque control-block
+ * pointer; a NULL alloc result signals cap / heap OOM so codegen raises
+ * MemoryError. */
+void *zap_arena_open(int64_t size_hint, int64_t cap);
+void *zap_arena_alloc_bytes(void *arena, int64_t n);
+void *zap_arena_alloc_atomic(void *arena, int64_t size);
+void zap_arena_close(void *arena);
+/* Raised (from a generated NULL-check on an arena allocation) when the arena's
+ * `cap` is exceeded or the heap is exhausted. A catchable RuntimeError whose
+ * message names it a memory error; noreturn. (A first-class MemoryError type is a
+ * tracked follow-up — see the #553 epic.) */
+void zap_arena_oom(void);
+
 #ifdef ZAP_GC_IMMIX
 /* Precise collector entry points (defined in zapgc.inc.c, #included below). */
 void *zap_gc_alloc(const ZapTypeDesc *desc);
@@ -533,6 +549,74 @@ static ZapStr *zap_str_alloc(int64_t len) {
     s->len = len;
     return s;
 }
+
+#ifndef ZAP_GC_IMMIX
+/* Boehm arena (#553, D-0158). The conservative collector is non-moving, so arena
+ * objects are "pinned" automatically and there is no region pool to draw from:
+ * the arena is a cap-accounting control block over ordinary GC allocations. Leaf-
+ * only means the objects hold no pointers; they are reclaimed by the collector
+ * when unreachable (the deterministic bulk-free is an Immix-only guarantee). `cap`
+ * still bounds total reservation, returning NULL (-> MemoryError) past it. */
+typedef struct ZapArena {
+    size_t reserved;
+    size_t cap;
+} ZapArena;
+
+void *zap_arena_open(int64_t size_hint, int64_t cap) {
+    (void)size_hint; /* no pooled reservation under Boehm */
+    ZapArena *a = (ZapArena *)malloc(sizeof(ZapArena));
+    if (!a) {
+        zap_oom("arena open");
+    }
+    a->reserved = 0;
+    a->cap = cap > 0 ? (size_t)cap : 0;
+    /* A runtime `size > cap` (both set) can never be satisfied (#553, D-0158):
+     * fail the open so the generated NULL-check raises. The constant case is a
+     * compile error (ZAP5132). */
+    if (cap > 0 && size_hint > 0 && size_hint > cap) {
+        free(a);
+        return NULL;
+    }
+    return a;
+}
+
+static void *zap_arena_boehm_alloc(ZapArena *a, size_t n, int atomic) {
+    if (a->cap && a->reserved + n > a->cap) {
+        return NULL; /* cap exceeded -> MemoryError */
+    }
+    zap_np_enter();
+    void *p = atomic ? GC_MALLOC_ATOMIC(n) : GC_MALLOC(n);
+    zap_np_leave();
+    if (!p) {
+        return NULL; /* heap OOM -> MemoryError */
+    }
+    a->reserved += n;
+    return p;
+}
+
+void *zap_arena_alloc_bytes(void *arena, int64_t n) {
+    ZapArena *a = (ZapArena *)arena;
+    if (n < 0) {
+        n = 0;
+    }
+    size_t total = sizeof(ZapStr) + (size_t)n;
+    ZapStr *s = (ZapStr *)zap_arena_boehm_alloc(a, total, 1 /* atomic/leaf */);
+    if (s) {
+        s->len = n; /* GC_MALLOC_ATOMIC returns zeroed memory */
+    }
+    return s;
+}
+
+void *zap_arena_alloc_atomic(void *arena, int64_t size) {
+    ZapArena *a = (ZapArena *)arena;
+    return zap_arena_boehm_alloc(a, (size_t)(size < 0 ? 0 : size), 1 /* atomic/leaf */);
+}
+
+void zap_arena_close(void *arena) {
+    /* Objects are GC-managed; just drop the cap-accounting control block. */
+    free(arena);
+}
+#endif /* !ZAP_GC_IMMIX */
 
 /* A stack-allocated, non-GC string with the one-object layout (#837), for a short
  * COMPILE-TIME-sized borrowed C string passed to a `ZapStr *`-consuming call
@@ -3130,6 +3214,17 @@ void zap_raise(void *exc) {
 
 void zap_panic_typed(int64_t type_id, void *message) {
     zap_raise(zap_exception_new(type_id, message));
+}
+
+/* Arena cap / heap-OOM (#553, D-0158). A generated NULL-check on an arena
+ * allocation (`a.alloc`/`a.new`) calls this when the runtime returned NULL; it
+ * raises a catchable error (RuntimeError, named a memory error in the message —
+ * a first-class MemoryError type is a tracked follow-up) and never returns, so
+ * the enclosing arena `with` tears the arena down on the unwind path. */
+__attribute__((noreturn)) void zap_arena_oom(void) {
+    const char *m = "MemoryError: arena allocation exceeds its cap or the heap is exhausted";
+    zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+    abort(); /* unreachable: zap_panic_typed unwinds */
 }
 
 /* Landing-pad entry: recover the Zap exception object from the in-flight C++

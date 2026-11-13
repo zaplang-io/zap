@@ -71,6 +71,9 @@ typedef struct ZapBlock {
     struct ZapBlock *all_next;    /* link through every block ever mapped       */
     uint8_t kind;                 /* ZAP_BK_SMALL or ZAP_BK_LOS                  */
     uint8_t los_mark;             /* LOS: 1 iff marked this cycle               */
+    uint8_t arena;                /* #553: 1 iff owned by a scope-bound arena —
+                                   * never evacuated, never reclaimed by the
+                                   * collector; freed as a unit at scope exit.  */
     size_t los_size;              /* LOS: full object size incl. header         */
     uint32_t hole_cursor;         /* small: byte offset of next alloc           */
     uint32_t hole_limit;          /* small: end of current free run             */
@@ -823,7 +826,7 @@ static void *zap_evac_mark(void *payload) {
      * its address, so it is deliberately excluded.) */
     if (zap_evac_active && (d == &zap_desc_atomic || d == &zap_desc_strobj)) {
         ZapBlock *b = zap_block_of(payload);
-        if (b->kind == ZAP_BK_SMALL && b->evac_src) {
+        if (b->kind == ZAP_BK_SMALL && b->evac_src && !b->arena) {
             void *np = zap_evac_copy(payload);
             if (np) {
                 final = np;
@@ -1265,6 +1268,16 @@ static void zap_sweep(void) {
     ZapBlock **pp = &zap_all_blocks;
     while (*pp) {
         ZapBlock *b = *pp;
+        if (b->arena) {
+            /* Arena-owned block (#553, D-0158), pooled OR humongous: never
+             * reclaimed by the collector — it is freed as a unit at the arena's
+             * scope exit, and C may hold pointers into it the collector cannot
+             * see. Leave its state untouched and keep it off every alloc list.
+             * (Checked before the LOS branch so an unreferenced humongous arena
+             * block is not unmapped here.) */
+            pp = &b->all_next;
+            continue;
+        }
         if (b->kind == ZAP_BK_LOS) {
             if (b->los_mark) {
                 b->los_mark = 0;
@@ -1445,6 +1458,7 @@ static ZapBlock *zap_map_block(void) {
     }
     ZapBlock *b = (ZapBlock *)mem;
     b->kind = ZAP_BK_SMALL;
+    b->arena = 0;
     b->all_next = zap_all_blocks;
     zap_all_blocks = b;
     zap_reg_insert((uintptr_t)b);
@@ -1598,6 +1612,7 @@ static void *zap_alloc_los(size_t osize) {
     pthread_mutex_lock(&zap_heap_mu);
     ZapBlock *b = (ZapBlock *)mem;
     b->kind = ZAP_BK_LOS;
+    b->arena = 0;
     b->los_mark = 0;
     b->los_size = osize;
     b->all_next = zap_all_blocks;
@@ -1666,6 +1681,215 @@ void *zap_gc_alloc_var(const ZapTypeDesc *desc, int64_t size) {
     return zap_gc_alloc_sized(desc, (size_t)(size < 0 ? 0 : size));
 }
 
+/* ---- scope-bound arena / region allocator (#553, D-0158) ------------------ *
+ * A `with arena(...) as a:` region: leaf objects are bump-allocated from the GC's
+ * own region pool into blocks tagged `arena` (non-moving, never reclaimed by the
+ * collector — see zap_evac_mark / zap_sweep / zap_mark_sweep), and the whole set
+ * of regions is returned to the pool as a unit at block exit (zap_arena_close),
+ * O(regions), no per-object sweep. Leaf-only (D-0158 §5.1): arena objects hold no
+ * outgoing heap pointers, so the collector never traces out of them; the sema
+ * escape check (ZAP5131) guarantees no surviving heap->arena pointer, which is
+ * what makes the bulk free sound. Coroutine-local: the bump cursor is unshared
+ * (the shared free pool is touched only under zap_heap_mu when a region is claimed
+ * or returned). */
+typedef struct ZapArena {
+    ZapBlock *blocks;  /* full owned chain (via ->next), for the bulk free        */
+    ZapBlock *cur;     /* current small bump region (within `blocks`), or NULL    */
+    size_t reserved;   /* total bytes reserved from the heap (cap accounting)     */
+    size_t cap;        /* hard byte ceiling, 0 = unbounded                        */
+} ZapArena;
+
+/* Claim one pooled 32 KiB region for the arena (caller holds zap_heap_mu). Drawn
+ * from the shared fungible free pool, else freshly mapped. Tagged `arena`, pushed
+ * onto the arena's own chain, and made the current bump region. NULL if a `cap`
+ * would be exceeded. */
+static ZapBlock *zap_arena_claim_block(ZapArena *a) {
+    if (a->cap && a->reserved + ZAP_BLOCK > a->cap) {
+        return NULL;
+    }
+    ZapBlock *b;
+    if (zap_free_blocks) {
+        b = zap_free_blocks;
+        zap_free_blocks = b->next;
+    } else {
+        b = zap_map_block(); /* already on zap_all_blocks + registry */
+    }
+    b->kind = ZAP_BK_SMALL;
+    zap_block_reset_marks(b);
+    b->arena = 1;
+    b->hole_cursor = (uint32_t)ZAP_RESERVED_BYTES; /* bump cursor */
+    b->hole_limit = ZAP_BLOCK;
+    b->search_line = ZAP_RESERVED_LINES;
+    b->live_lines = 0;
+    b->evac_src = 0;
+    b->next = a->blocks;
+    a->blocks = b;
+    a->cur = b;
+    a->reserved += ZAP_BLOCK;
+    return b;
+}
+
+/* Core arena allocation: `payload_size` payload bytes for descriptor `desc`,
+ * header-initialized and zeroed, non-moving. Returns NULL on cap / heap OOM so the
+ * caller raises MemoryError (never aborts — an arena is a bounded resource). */
+static void *zap_arena_alloc_raw(ZapArena *a, const ZapTypeDesc *desc, size_t payload_size) {
+    size_t osize = zap_round16(ZAP_HEADER_BYTES + payload_size);
+    size_t usable = ZAP_BLOCK - ZAP_RESERVED_BYTES;
+    void *hdr = NULL;
+    pthread_mutex_lock(&zap_heap_mu);
+    if (osize > usable) {
+        /* Humongous: a single object larger than one region gets a dedicated
+         * contiguous aligned mapping, one object, tagged arena, freed as a unit. */
+        size_t total = ((osize + ZAP_RESERVED_BYTES + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
+        if (a->cap && a->reserved + total > a->cap) {
+            pthread_mutex_unlock(&zap_heap_mu);
+            return NULL;
+        }
+        void *mem = NULL;
+        if (zap_os_aligned_alloc(&mem, ZAP_BLOCK, total) != 0 || !mem) {
+            pthread_mutex_unlock(&zap_heap_mu);
+            return NULL;
+        }
+        ZapBlock *b = (ZapBlock *)mem;
+        b->kind = ZAP_BK_LOS;
+        b->arena = 1;
+        b->los_mark = 0;
+        b->los_size = osize;
+        b->all_next = zap_all_blocks;
+        zap_all_blocks = b;
+        zap_reg_insert((uintptr_t)b);
+        zap_total_mapped += total;
+        b->next = a->blocks; /* arena chain (not a bump region) */
+        a->blocks = b;
+        a->reserved += total;
+        hdr = (char *)b + ZAP_RESERVED_BYTES;
+    } else {
+        ZapBlock *b = a->cur;
+        if (!b || b->hole_cursor + osize > b->hole_limit) {
+            b = zap_arena_claim_block(a);
+            if (!b) {
+                pthread_mutex_unlock(&zap_heap_mu);
+                return NULL;
+            }
+        }
+        hdr = (char *)b + b->hole_cursor;
+        b->hole_cursor += (uint32_t)osize;
+    }
+    pthread_mutex_unlock(&zap_heap_mu);
+    void *payload = (char *)hdr + ZAP_HEADER_BYTES;
+    ZAP_HDR(payload) = (uintptr_t)desc; /* mark bit 0 clear */
+    ZAP_OSIZE(payload) = payload_size;
+    memset(payload, 0, payload_size);
+    return payload;
+}
+
+void *zap_arena_open(int64_t size_hint, int64_t cap) {
+    ZapArena *a = (ZapArena *)malloc(sizeof(ZapArena));
+    if (!a) {
+        zap_oom("arena open");
+    }
+    a->blocks = NULL;
+    a->cur = NULL;
+    a->reserved = 0;
+    a->cap = cap > 0 ? (size_t)cap : 0;
+    /* A runtime `size > cap` (both set) is a contradiction the arena can never
+     * satisfy (#553, D-0158): fail the open so the generated NULL-check raises. The
+     * static case (constant args) is already a compile error (ZAP5132). */
+    if (cap > 0 && size_hint > 0 && size_hint > cap) {
+        free(a);
+        return NULL;
+    }
+    /* Pre-claim regions to honor the size hint (rounded up to the 32 KiB region
+     * granularity, at least one region); never past `cap` — if the cap is below a
+     * region the first allocation raises MemoryError. */
+    size_t want = size_hint > 0 ? (size_t)size_hint : 1;
+    size_t regions = (want + ZAP_BLOCK - 1) / ZAP_BLOCK;
+    if (regions < 1) {
+        regions = 1;
+    }
+    pthread_mutex_lock(&zap_heap_mu);
+    for (size_t i = 0; i < regions; i++) {
+        if (!zap_arena_claim_block(a)) {
+            break; /* cap reached at open: grow lazily, or alloc raises */
+        }
+    }
+    pthread_mutex_unlock(&zap_heap_mu);
+    return a;
+}
+
+/* Allocate a non-moving `bytes` buffer of `n` bytes in the arena — the one-object
+ * {i64 len; data[]} ZapStr layout with the (leaf/atomic) string descriptor, len
+ * preset, data zeroed. The FFI pin case: the raw address is stable for the block.
+ * NULL past cap -> MemoryError. */
+void *zap_arena_alloc_bytes(void *arena, int64_t n) {
+    ZapArena *a = (ZapArena *)arena;
+    if (n < 0) {
+        n = 0;
+    }
+    size_t payload = sizeof(ZapStr) + (size_t)n;
+    ZapStr *s = (ZapStr *)zap_arena_alloc_raw(a, &zap_desc_strobj, payload);
+    if (s) {
+        s->len = n;
+    }
+    return s;
+}
+
+/* Allocate `size` bytes of leaf (pointer-free) payload in the arena — used for a
+ * leaf struct instance (codegen passes the struct's ABI size); payload zeroed, the
+ * caller sets fields. The atomic/leaf descriptor means the collector never traces
+ * into it (sound under leaf-only, D-0158 §5.1). NULL past cap / heap OOM. */
+void *zap_arena_alloc_atomic(void *arena, int64_t size) {
+    ZapArena *a = (ZapArena *)arena;
+    return zap_arena_alloc_raw(a, &zap_desc_atomic, (size_t)(size < 0 ? 0 : size));
+}
+
+/* Bulk-free the whole arena at block exit: pooled regions are reset and returned
+ * to the free pool; humongous mappings are unmapped. O(regions), no per-object
+ * sweep. The control block is freed. Idempotent on NULL. */
+void zap_arena_close(void *arena) {
+    ZapArena *a = (ZapArena *)arena;
+    if (!a) {
+        return;
+    }
+    pthread_mutex_lock(&zap_heap_mu);
+    ZapBlock *b = a->blocks;
+    while (b) {
+        ZapBlock *nx = b->next;
+        if (b->kind == ZAP_BK_LOS) {
+            /* Humongous arena block: unlink from zap_all_blocks, deregister, unmap. */
+            ZapBlock **pp = &zap_all_blocks;
+            while (*pp && *pp != b) {
+                pp = &(*pp)->all_next;
+            }
+            if (*pp == b) {
+                *pp = b->all_next;
+            }
+            zap_reg_remove((uintptr_t)b);
+            size_t total =
+                ((b->los_size + ZAP_RESERVED_BYTES + ZAP_BLOCK - 1) / ZAP_BLOCK) * ZAP_BLOCK;
+            zap_total_mapped -= total;
+            zap_os_aligned_free(b);
+        } else {
+            /* Pooled region: reset to a pristine free block and return to the pool
+             * (it stays on zap_all_blocks + the registry). A later sweep rebuilds
+             * the free list from zap_all_blocks and re-adds it consistently. */
+            b->arena = 0;
+            b->kind = ZAP_BK_SMALL;
+            zap_block_reset_marks(b);
+            b->search_line = ZAP_RESERVED_LINES;
+            zap_block_next_hole(b);
+            b->avail = (ZAP_LINES - ZAP_RESERVED_LINES) * ZAP_LINE;
+            b->live_lines = 0;
+            b->evac_src = 0;
+            b->next = zap_free_blocks;
+            zap_free_blocks = b;
+        }
+        b = nx;
+    }
+    pthread_mutex_unlock(&zap_heap_mu);
+    free(a);
+}
+
 /* Mark + sweep. Caller holds zap_heap_mu and the world is stopped. */
 static void zap_mark_sweep(void) {
     /* Clear line / LOS marks (object header mark bits are already clear: every
@@ -1684,7 +1908,7 @@ static void zap_mark_sweep(void) {
                 b->line_mark[i] = 1;
             }
             b->evac_src = 0;
-            if (!zap_evac_disabled && b->live_lines > 0 &&
+            if (!b->arena && !zap_evac_disabled && b->live_lines > 0 &&
                 b->live_lines <= ZAP_EVAC_SPARSE_LINES && src < (int)ZAP_EVAC_MAX_SRC) {
                 b->evac_src = 1;
                 src++;
