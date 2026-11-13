@@ -1164,6 +1164,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **gc-boehm: a stop-the-world landing during a coroutine context switch crashed
+  the collector** (#885, D-0161). The scheduler moved Boehm's per-thread stack end
+  to the coroutine's stack top *before* the `swapcontext` that moves `sp`, and back
+  only *after* swapping out, so a collection catching a worker in that gap scanned
+  `[native sp, green stack top)` — a multi-MB range over unmapped memory — and a
+  Boehm mark thread died with a bare SIGSEGV (~80% of runs of a program that
+  switches constantly; ~1 in 1000-3000 for a mild one; every architecture and
+  `-O` level; gc-immix unaffected). The stack end is now never moved; instead a
+  `GC_set_sp_corrector` hook maps a thread captured while running on a coroutine's
+  stack to an empty range at scan time, when the world is stopped (the stack is
+  still scanned as heap through its `G`). The per-switch `GC_set_stackbottom` calls
+  are gone. New golden `coroutine_switch_gc_stress` plus source-contract tests.
+
 - **aarch64 `-O2` runtime: a coroutine that parked and finished on a different
   worker thread crashed (SIGSEGV / stack smashing)** (#869, D-0160). `g_bootstrap`
   re-read the `cur_m` thread-local after the coroutine body; on aarch64 at `-O2`

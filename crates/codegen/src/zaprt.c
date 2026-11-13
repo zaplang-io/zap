@@ -110,10 +110,6 @@ static void *GC_get_my_stackbottom(struct GC_stack_base *sb) {
     sb->mem_base = NULL;
     return NULL;
 }
-static void GC_set_stackbottom(void *h, struct GC_stack_base *sb) {
-    (void)h;
-    (void)sb;
-}
 #endif
 #include <math.h>
 #include <pthread.h>
@@ -5081,10 +5077,11 @@ void *zap_py_str(void *obj_) {
  * *as heap* with no stack maps or safepoints — the key trick. Every live G is
  * additionally kept in the statically-rooted `g_all[]` registry, so a parked G
  * (otherwise reachable only from a Waiter on its own stack) is never collected.
- * A *running* G executes on its green stack on some M; so that the collector
- * scans that stack as the M thread's stack (and does not scan a bogus
- * cross-stack range), each context switch updates the M thread's GC stack
- * bottom via `GC_set_stackbottom` (bdwgc's documented coroutine support).
+ * A *running* G executes on its green stack on some M. Boehm scans a stopped
+ * thread as `[sp, stack_end)`; to keep that from being a bogus cross-stack range
+ * while a G runs, the runtime installs a `GC_set_sp_corrector` hook (see
+ * `zap_sp_corrector`, I#885) and never moves `stack_end` off the M's native stack
+ * top — the running G's stack is scanned as heap through its `G` instead.
  *
  * Context switch (design/0005 "Interaction with exception unwinding"):
  * ucontext `swapcontext` saves/restores callee-saved regs + SP + IP. ARCH
@@ -5181,7 +5178,6 @@ typedef struct G {
                         * via the A1 seam (ucontext on POSIX, asm on Windows)  */
     void *stack;       /* GC_MALLOC'd green stack buffer (scanned as heap)     */
     size_t stack_size;
-    struct GC_stack_base sb; /* cold end (high address) of this G's stack      */
     void *fn;          /* trampoline `void *(*)(void *)` from zap_spawn        */
     void *arg;         /* closure passed to the trampoline                     */
     GState state;
@@ -5252,7 +5248,6 @@ typedef struct M {
     pthread_t thread;
     zap_ctx_t sched_ctx;        /* the scheduler loop's context (native stack) */
     struct GC_stack_base native_sb; /* this M's native stack cold end          */
-    void *gc_handle;            /* GC thread handle for GC_set_stackbottom      */
     G *current;                 /* G running on this M, or NULL in scheduler    */
     P *p;                       /* processor this M is attached to              */
     /* Preemption monitor (ticket #172). `schedtick` is bumped every time this M
@@ -5412,43 +5407,69 @@ static void zap_np_unlock(pthread_mutex_t *mu) {
     zap_np_leave();
 }
 
-/* ---- GC stack-bottom tracking across switches ----------------------------- */
-/* Point the current M thread's conservatively-scanned stack at `sb`, so the
- * Boehm collector scans [SP, sb->mem_base] — the green stack a coroutine runs
- * on, or the M's native scheduler stack between coroutines — rather than a wild
- * range spanning two unrelated stacks.
+/* ---- GC stack scanning across context switches (I#885) -------------------- */
+/* Under Boehm a stopped thread is scanned as `[sp, stack_end)`: `sp` is captured
+ * by the stop-the-world signal handler at whatever instruction the thread was on,
+ * and `stack_end` is the thread's registered stack cold end. An M thread runs on
+ * TWO kinds of stack — its native (scheduler) stack, and a coroutine's green stack
+ * (a GC_MALLOC buffer) — so while a coroutine runs `sp` is on the green stack and
+ * a `stack_end` at the native top would make `[sp, stack_end)` a wild range
+ * spanning unrelated mappings (a mark thread faults in the unmapped holes).
  *
- * This runs on the scheduler's HOT switch path (`switch_to_g`, on every context
- * switch) and MUST NOT take the bdwgc global allocator lock (#223). The lock is
- * acquired inside GC_MALLOC / GC_generic_malloc_many; a coroutine can be left
- * descheduled while momentarily holding it. If resuming any coroutine also
- * required that lock — as it did when this wrapped GC_call_with_alloc_lock — the
- * only thread able to release the lock could be rescheduled only through a path
- * that first demands it: an unbreakable lock-ordering inversion between the
- * scheduler and the allocator. On a high-core aarch64 box it deadlocks the whole
- * scheduler within seconds (gc-boehm, two gdb captures, 2026-11-05: workers
- * blocked in GC_generic_malloc_many, one M blocked in set_bottom from
- * switch_to_g, no collection in flight); x86's stronger ordering and the small
- * hosted arm runner mask it. Making the switch path lock-free breaks the cycle:
- * the scheduler can always resume the lock-holder, which then releases the lock,
- * so no coroutine stays stuck.
+ * The scheduler used to follow the switch by moving `stack_end` (`set_bottom`):
+ * to the green stack top before the swap, back to the native top after. But `sp`
+ * and `stack_end` could not be changed atomically — `stack_end` moved before the
+ * swap that moves `sp`, and back only after swapping back — so a stop-the-world
+ * landing in either gap (a switch-heavy program is in one a large fraction of the
+ * time; the swap itself is a syscall) saw `sp` on one stack and `stack_end` on the
+ * other and crashed the collector. (#885; the old comment here argued either
+ * value of `stack_end` was "valid" — true only when it is consistent with `sp`.)
  *
- * Doing this without the lock is safe here. With a cached, non-NULL thread handle
- * `GC_set_stackbottom` performs a single aligned pointer store to this thread's
- * stack cold-end — the thread-table lookup, the only part that would need the
- * lock, is skipped — which is atomic and tear-free on every supported arch. It
- * runs on the M's OWN thread while that thread is active (STW stops threads at
- * instruction boundaries, never mid-store), so a concurrent collection observes
- * either the old or the new bottom, and BOTH are valid: a running coroutine's
- * register roots are captured by Boehm's stop-the-world register snapshot, and
- * its stack roots live on the green stack, which is itself a GC_MALLOC object
- * kept reachable through its `G` (registered in `g_all`) and so conservatively
- * scanned as heap no matter which bottom the collector read — no root is ever
- * missed in the window. Under gc-immix GC_set_stackbottom is an inert shim, so
- * this is a no-op there. */
-static void set_bottom(M *m, struct GC_stack_base *sb) {
-    GC_set_stackbottom(m->gc_handle, sb);
+ * Now `stack_end` is NEVER moved: it stays the native stack top for the thread's
+ * whole life, so the native case is always right and the switch path calls nothing
+ * in the collector (which also keeps it lock-free, #223 / D-0117). The running
+ * coroutine case is fixed up where it is safe — when the collector pushes the
+ * stacks, with the world stopped and every thread's `sp` already captured — by
+ * bdwgc's `GC_set_sp_corrector` hook (documented for "a crude integration with
+ * certain coroutine implementations"): a thread whose captured `sp` lies inside a
+ * coroutine's stack buffer is mapped to an EMPTY range `[native_top, native_top)`.
+ * Nothing is lost: a green stack is itself a GC_MALLOC object kept reachable
+ * through its `G` (registered in `g_all`), so it is conservatively scanned in full
+ * as heap — including the register snapshot / signal frame the stop-the-world
+ * handler pushes on it, and the collecting thread's own spilled registers — and
+ * the scheduler's native frames, which were not scanned while a G ran before
+ * either, hold no GC pointers that are not also reachable from the `G`s. Under
+ * gc-immix there is no thread-stack scanning (precise roots), so this is Boehm
+ * only. The hook runs with the GC lock held and possibly the world stopped: it
+ * only reads `g_all` / `G` / `M` fields and takes no lock and allocates nothing. */
+#if defined(ZAP_PLATFORM_POSIX) && !defined(ZAP_GC_IMMIX)
+static void zap_sp_corrector(void **sp_ptr, void *pthread_id) {
+    (void)pthread_id;
+    char *sp = (char *)*sp_ptr;
+    /* Lock-free read of the registry: the world is stopped (or this is the
+     * collecting thread itself), so no entry is being rewritten; a stopped thread
+     * frozen mid-`all_add`/`all_remove` leaves every index below `g_all_len`
+     * pointing at a live (or NULL) G. */
+    G **all = g_all;
+    int64_t n = g_all_len;
+    for (int64_t i = 0; i < n; i++) {
+        G *g = all[i];
+        if (g == NULL) {
+            continue;
+        }
+        char *lo = (char *)g->stack;
+        if (sp >= lo && sp < lo + g->stack_size) {
+            /* The thread is running this coroutine: report an empty native range.
+             * `run_m` is the M that resumed it (switch_to_g), i.e. this thread. */
+            M *m = g->run_m;
+            if (m != NULL && m->native_sb.mem_base != NULL) {
+                *sp_ptr = m->native_sb.mem_base;
+            }
+            return;
+        }
+    }
 }
+#endif
 
 /* ---- run queues ----------------------------------------------------------- */
 static void global_push(G *g) {
@@ -5586,10 +5607,11 @@ static G *sched_find_runnable(M *m) {
     }
 }
 
-/* Scheduler-side switch into `g`. Brackets the swapcontext with the GC
- * stack-bottom update so the collector always scans the correct stack for this
- * M. On return the G has either parked (unlock the channel mutex it asked us to
- * release, completing the park/wake handoff) or finished (reclaim it). */
+/* Scheduler-side switch into `g`. (The collector's view of this M's stack is not
+ * touched here: `stack_end` is fixed and a thread captured on a green stack is
+ * corrected at scan time by `zap_sp_corrector`, I#885.) On return the G has
+ * either parked (unlock the channel mutex it asked us to release, completing the
+ * park/wake handoff) or finished (reclaim it). */
 static void gfree(G *g);
 static void sched_gdone(void);
 static void scope_gdone(struct Scope *sc);
@@ -5607,7 +5629,6 @@ static void switch_to_g(M *m, G *g) {
      * the same coroutine monopolized this M and earns a preemption request. */
     __atomic_fetch_add(&m->schedtick, 1, __ATOMIC_RELAXED);
     __atomic_store_n(&m->preempt, 0, __ATOMIC_RELAXED);
-    set_bottom(m, &g->sb);
 #ifdef ZAP_GC_IMMIX
     /* Restore this coroutine's shadow-stack head into the per-thread cell the
      * compiled code mutates; save it back when the G switches out (parks /
@@ -5619,7 +5640,6 @@ static void switch_to_g(M *m, G *g) {
 #ifdef ZAP_GC_IMMIX
     g->shadow_head = zap_shadow_head;
 #endif
-    set_bottom(m, &m->native_sb);
     m->current = NULL;
     if (g->state == G_PARKED) {
         if (g->parkmu) {
@@ -5717,7 +5737,7 @@ static void *worker_main(void *arg) {
     /* This thread was created by GC_pthread_create, so it is registered; record
      * its GC handle + native stack bottom for the switch bracketing. */
     struct GC_stack_base sb;
-    m->gc_handle = GC_get_my_stackbottom(&sb);
+    (void)GC_get_my_stackbottom(&sb);
     m->native_sb = sb;
     /* Precise GC (#48): this worker runs compiled Zap on Gs, so register it as a
      * mutator. It is BLOCKED (GC-safe) while in the scheduler loop and ACTIVE
@@ -5822,8 +5842,6 @@ static G *galloc(void *fn, void *arg) {
     g->severed = 0; /* #825: not a timed-out orphan until a deadline severs it */
     g->shadow_head = NULL; /* precise GC (#48): a fresh G has an empty chain */
     g->race_gid = -1;      /* unassigned until the race engine first sees it */
-    /* Cold end of a down-growing stack is its high address. */
-    g->sb.mem_base = (char *)g->stack + g->stack_size;
     zap_ctx_make(&g->ctx, g->stack, g->stack_size, g_bootstrap);
     all_add(g);
     return g;
@@ -6232,7 +6250,7 @@ static void *dedicated_worker_main(void *arg) {
     M *m = (M *)arg;
     cur_m = m;
     struct GC_stack_base sb;
-    m->gc_handle = GC_get_my_stackbottom(&sb);
+    (void)GC_get_my_stackbottom(&sb);
     m->native_sb = sb;
     zap_mutator_register();
 #if defined(ZAP_PLATFORM_WINDOWS)
@@ -6370,6 +6388,10 @@ int64_t zap_runtime_maxprocs(void) {
 }
 
 static void zap_sched_init_once(void) {
+#if defined(ZAP_PLATFORM_POSIX) && !defined(ZAP_GC_IMMIX)
+    /* I#885: before any worker can run a coroutine. See `zap_sp_corrector`. */
+    GC_set_sp_corrector(zap_sp_corrector);
+#endif
     g_nm = zap_maxprocs();
     g_ps = (P *)ZAP_INFRA_ALLOC((size_t)g_nm * sizeof(P));
     g_ms = (M *)ZAP_INFRA_ALLOC((size_t)g_nm * sizeof(M));

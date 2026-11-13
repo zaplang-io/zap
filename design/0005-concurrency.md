@@ -552,6 +552,19 @@ not relied on:
 - Movable/growable stacks remain a v2 follow-up (v1 Immix is non-moving); the
   entry points and the fixed-stack decision above are unchanged.
 
+### Boehm: how a running coroutine's stack is scanned (I#885, D-0161)
+
+Boehm scans a stopped thread as `[sp, stack_end)`. An M alternates between its
+native scheduler stack and coroutines' green stacks, and `sp` and `stack_end`
+cannot be changed together — so the runtime does **not** try to keep `stack_end`
+in step with the switch (an earlier scheme did, and a collection landing between
+the two updates scanned a multi-MB cross-stack range and crashed). `stack_end`
+stays the native stack top for the thread's whole life; a `GC_set_sp_corrector`
+hook (`zap_sp_corrector`) maps a thread captured on a green stack to an empty range
+at scan time, when the world is stopped and `sp` is fixed. The coroutine's stack is
+not lost: it is a `GC_MALLOC` buffer reachable through its `G` in `g_all`, so it is
+scanned in full as heap, like a parked coroutine's.
+
 ### Finding the running M after a park (I#869, D-0160)
 
 A coroutine is resumed on whichever worker M picks it up, so after any park it may
