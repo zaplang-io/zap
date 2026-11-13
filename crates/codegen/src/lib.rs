@@ -6001,12 +6001,12 @@ mod tests {
                 let body = &func[..func.find("\n}").unwrap_or(func.len())];
                 for tok in raw {
                     if let Some(at) = body.find(tok) {
-                        let enter = body.find("zap_np_enter();");
-                        let leave = body.rfind("zap_np_leave();");
+                        let enter = body.find("zap_np_begin(np);");
+                        let leave = body.rfind("zap_np_end(np);");
                         assert!(
                             enter.is_some_and(|x| x < at) && leave.is_some_and(|x| x > at),
                             "I#888: guarded-layer function calling `{tok}` must wrap it in \
-                             zap_np_enter(); ... zap_np_leave();\n{body}"
+                             zap_np_begin(np); ... zap_np_end(np); (np = zap_np_slot())\n{body}"
                         );
                         checked += 1;
                     }
@@ -6092,6 +6092,143 @@ mod tests {
             clear < dispatch,
             "I#889: g->no_preempt must be cleared before switch_to_g dispatches on g->state"
         );
+    }
+
+    /// All runtime thread-local DECLARATIONS (comments stripped), as `name` per
+    /// `__thread` variable, across the runtime and the Immix collector source.
+    fn thread_local_names() -> Vec<String> {
+        let mut names = Vec::new();
+        for src in [RUNTIME_C, RUNTIME_GC_C] {
+            for line in strip_c_comments(src).lines() {
+                let t = line.trim();
+                if !t.contains("__thread") || t.starts_with('#') {
+                    continue;
+                }
+                // `[extern] [static] __thread T *name [= init];` -> `name`
+                let decl = t.split('=').next().unwrap().trim_end_matches(';').trim();
+                if let Some(name) = decl
+                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                {
+                    if !name.is_empty() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// I#891 tripwire (the stale-TLS class of I#869). A coroutine is resumed on
+    /// whichever OS thread picks it up; on aarch64 at `-O2` the compiler computes a
+    /// thread-local's ADDRESS once per function and holds it in a callee-saved
+    /// register that `swapcontext` restores unchanged, so any access after a park
+    /// (including the inlined `zap_np_lock`/`zap_np_unlock` in `chan_block`, and
+    /// `zap_self` in `zap_safepoint` after its cooperative preempt) touches the
+    /// thread the coroutine LEFT. Every runtime thread-local that coroutine code can
+    /// reach is therefore private (`*_tls`) and accessed only through a `noinline`
+    /// accessor with a volatile asm barrier (so neither GCC's nor LLVM's IPA can infer
+    /// it const/pure and merge calls), recomputing the thread pointer on every use.
+    /// A NEW `__thread` variable must be added here deliberately.
+    #[test]
+    fn runtime_thread_locals_are_reached_only_through_fresh_accessors() {
+        let allowed_private = [
+            (
+                "zap_cur_m_tls",
+                "zap_cur_m_slot",
+                "#define cur_m (*zap_cur_m_slot())",
+            ),
+            (
+                "zap_self_tls",
+                "zap_self_slot",
+                "#define zap_self (*zap_self_slot())",
+            ),
+            (
+                "zap_shadow_head_tls",
+                "zap_shadow_head_addr",
+                "#define zap_shadow_head (*zap_shadow_head_addr())",
+            ),
+        ];
+        // REPL-only catch state: set/read on one thread inside a single JIT call
+        // (setjmp/longjmp), never across a coroutine switch.
+        let allowed_other = ["zap_repl_catch", "zap_repl_exc"];
+        let both = format!(
+            "{}\n{}",
+            strip_c_comments(RUNTIME_C),
+            strip_c_comments(RUNTIME_GC_C)
+        );
+        for name in thread_local_names() {
+            assert!(
+                allowed_private.iter().any(|(n, _, _)| *n == name) || allowed_other.contains(&name.as_str()),
+                "I#891: new runtime `__thread` variable `{name}`: a coroutine can migrate OS threads, so \
+                 it must be reached only via a noinline accessor (like zap_cur_m_slot) — add it to this \
+                 test deliberately"
+            );
+        }
+        for (tls, accessor, macro_def) in allowed_private {
+            // The DEFINITION (`name(void) {`), not the forward declaration.
+            let at = both
+                .find(&format!("{accessor}(void) {{"))
+                .unwrap_or_else(|| panic!("I#891: accessor `{accessor}` must be defined"));
+            let head = &both[at.saturating_sub(120)..at + 260];
+            assert!(
+                head.contains("noinline"),
+                "I#891: `{accessor}` must be `__attribute__((noinline))`:\n{head}"
+            );
+            assert!(
+                head.contains("__asm__ __volatile__"),
+                "I#891: `{accessor}` must contain a volatile asm so it is never inferred const/pure:\n{head}"
+            );
+            assert!(
+                head.contains(tls),
+                "I#891: `{accessor}` must return the address of `{tls}`:\n{head}"
+            );
+            assert!(
+                both.contains(macro_def),
+                "I#891: expected `{macro_def}` so every use recomputes the thread pointer"
+            );
+        }
+    }
+
+    /// I#891: the no-preempt bookkeeping reads the current coroutine's counter fresh.
+    #[test]
+    fn np_bookkeeping_reads_the_thread_local_fresh_on_every_call() {
+        let code = strip_c_comments(RUNTIME_C);
+        let at = code
+            .find("int *zap_np_slot(void) {")
+            .expect("zap_np_slot must be defined");
+        let head = &code[at.saturating_sub(80)..at + 320];
+        assert!(
+            head.contains("noinline") && head.contains("__asm__ __volatile__"),
+            "{head}"
+        );
+        for f in [
+            "static void zap_np_enter(void) {",
+            "static void zap_np_leave(void) {",
+        ] {
+            let b = code.find(f).unwrap_or_else(|| panic!("{f} must exist"));
+            assert!(
+                code[b..b + 120].contains("zap_np_slot()"),
+                "I#891: {f} must go through zap_np_slot() (fresh thread-local read)"
+            );
+        }
+    }
+
+    /// I#891 / I#223 defense in depth: the Boehm preemption handler must not
+    /// switch a coroutine away unless the interrupted PC is inside the program's
+    /// own text — not in libgc / libc / the loader, where the allocator lock and
+    /// other thread-affine state live.
+    #[test]
+    fn preempt_handler_requires_the_interrupted_pc_to_be_program_text() {
+        let body =
+            c_fn_body("static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {");
+        assert!(
+            body.contains("zap_pc_in_program_text(uc)"),
+            "I#891: zap_preempt_handler must gate copreempt() on zap_pc_in_program_text(uc):\n{body}"
+        );
+        let gate = body.find("zap_pc_in_program_text(uc)").unwrap();
+        let swap = body.find("copreempt();").expect("handler must copreempt");
+        assert!(gate < swap, "the PC gate must precede the copreempt() call");
     }
 
     /// I#885 tripwire. Under Boehm a stopped thread is scanned as
