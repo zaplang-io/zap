@@ -27,7 +27,13 @@ def burn(int64 n) -> int64:
     return acc
 
 # One half of a ping-pong pair: compute, hand a token over, park until it returns.
-def ping(int64 rounds, int64 work, channel[int64] to, channel[int64] back, channel[int64] done):
+def ping(
+    int64 rounds,
+    int64 work,
+    channel[int64] to,
+    channel[int64] back,
+    channel[int64] done,
+):
     int64 total = 0
     for r in range(rounds):
         total = total + burn(work) - burn(work) + 1
