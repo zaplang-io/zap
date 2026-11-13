@@ -40,23 +40,27 @@ fn lower(
     method: &str,
     args: &[ast::Arg],
 ) -> Result<Option<(Value, Ty)>, LowerError> {
-    let func = match method {
-        "sqrt" => "zap_math_sqrt",
-        "exp" => "zap_math_exp",
-        "log" => "zap_math_log",
-        "log2" => "zap_math_log2",
-        "log10" => "zap_math_log10",
-        "sin" => "zap_math_sin",
-        "cos" => "zap_math_cos",
-        "tan" => "zap_math_tan",
-        "asin" => "zap_math_asin",
-        "acos" => "zap_math_acos",
-        "atan" => "zap_math_atan",
-        "floor" => "zap_math_floor",
-        "ceil" => "zap_math_ceil",
-        "round" => "zap_math_round",
-        "trunc" => "zap_math_trunc",
-        "fabs" => "zap_math_fabs",
+    // Unary libm wrappers. The second element is the element-wise array op
+    // (#505): when the argument is a numeric `array`, `math.<fn>(a)` maps the
+    // function over it (a new result array); `None` means array mapping is not
+    // wired for that function yet (a scalar-only libm wrapper).
+    let (func, array_op): (&str, Option<ArrayMathOp>) = match method {
+        "sqrt" => ("zap_math_sqrt", Some(ArrayMathOp::Sqrt)),
+        "exp" => ("zap_math_exp", Some(ArrayMathOp::Exp)),
+        "log" => ("zap_math_log", Some(ArrayMathOp::Log)),
+        "log2" => ("zap_math_log2", None),
+        "log10" => ("zap_math_log10", None),
+        "sin" => ("zap_math_sin", Some(ArrayMathOp::Sin)),
+        "cos" => ("zap_math_cos", Some(ArrayMathOp::Cos)),
+        "tan" => ("zap_math_tan", Some(ArrayMathOp::Tan)),
+        "asin" => ("zap_math_asin", None),
+        "acos" => ("zap_math_acos", None),
+        "atan" => ("zap_math_atan", None),
+        "floor" => ("zap_math_floor", None),
+        "ceil" => ("zap_math_ceil", None),
+        "round" => ("zap_math_round", None),
+        "trunc" => ("zap_math_trunc", None),
+        "fabs" => ("zap_math_fabs", Some(ArrayMathOp::Fabs)),
         // `pow` reuses the `**`-operator libm wrapper (ticket #19).
         "pow" => return Ok(Some(binary(lowerer, "zap_powf", args)?)),
         "atan2" => return Ok(Some(binary(lowerer, "zap_math_atan2", args)?)),
@@ -66,19 +70,55 @@ fn lower(
         "isinf" => return Ok(Some(predicate(lowerer, "zap_math_isinf", args)?)),
         _ => return Ok(None),
     };
-    Ok(Some(unary(lowerer, func, args)?))
+    Ok(Some(unary_or_array(lowerer, method, func, array_op, args)?))
 }
 
-/// `func(f64) -> f64`.
-fn unary(lowerer: &mut FnLower, func: &str, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
-    let x = f64_arg(lowerer, func, args, 0)?;
-    let d = lowerer.new_value(Ty::F64);
-    lowerer.emit(Inst::Call {
-        dest: Some(d),
-        func: func.to_string(),
-        args: vec![x],
-    });
-    Ok((d, Ty::F64))
+/// `math.<fn>(x)`: a scalar `func(f64) -> f64`, or — when `x` is a numeric
+/// `array` — an element-wise map over it (#505, D-0168), yielding a new float
+/// array (`f32` for an `f32` source, else `f64`). A function with no array op
+/// wired yet is rejected cleanly on an array argument.
+fn unary_or_array(
+    lowerer: &mut FnLower,
+    method: &str,
+    func: &str,
+    array_op: Option<ArrayMathOp>,
+    args: &[ast::Arg],
+) -> Result<(Value, Ty), LowerError> {
+    let arg = args
+        .first()
+        .ok_or_else(|| err(format!("math.{method} missing its argument")))?;
+    let (v, t) = lowerer.expr(&arg.value)?;
+    if let Ty::Array(dt, ndim) = t {
+        let op = array_op.ok_or_else(|| {
+            err(format!(
+                "math.{method} is not supported on arrays yet (try sqrt/exp/log/sin/cos/tan/fabs)"
+            ))
+        })?;
+        // Float-domain result: keep an f32 source at f32, otherwise f64.
+        let out = if matches!(dt, Dtype::F32) {
+            Dtype::F32
+        } else {
+            Dtype::F64
+        };
+        let dest = lowerer.new_value(Ty::Array(out, ndim));
+        lowerer.emit(Inst::ArrayUnaryOp {
+            dest,
+            op,
+            out,
+            src: v,
+            src_dtype: dt,
+        });
+        Ok((dest, Ty::Array(out, ndim)))
+    } else {
+        let x = lowerer.coerce(v, t, Ty::F64);
+        let d = lowerer.new_value(Ty::F64);
+        lowerer.emit(Inst::Call {
+            dest: Some(d),
+            func: func.to_string(),
+            args: vec![x],
+        });
+        Ok((d, Ty::F64))
+    }
 }
 
 /// `func(f64, f64) -> f64`.

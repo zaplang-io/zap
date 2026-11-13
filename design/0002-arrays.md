@@ -231,6 +231,16 @@ header + buffer layout, GC-managed buffer).
   num)`: `num` samples inclusive of both ends (`zap_array_linspace`). All over
   the full dtype matrix.
 
+**Increment 7 (shipped, #505 / D-0168):** element-wise math intrinsics.
+
+- The `math` module's unary functions map over an array argument:
+  `math.sqrt`/`exp`/`log`/`sin`/`cos`/`tan`/`fabs`. Result is a float array of
+  the same shape (`f32`→`f32`, else `f64`); scalar `math.<fn>` is unchanged.
+- A new `Inst::ArrayUnaryOp` + unary SIMD codegen kernel (load → convert to the
+  float result dtype → LLVM math intrinsic → store; `tan` = `sin`/`cos`). No new
+  runtime entry points. The other `math` unary fns reject an array argument for
+  now; `pow`/binary math over arrays is deferred.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Inner-axis SIMD for the broadcast path; broadcasting in assignment /
@@ -245,9 +255,11 @@ header + buffer layout, GC-managed buffer).
   at the base and `off` carries the window. A strided view would need per-axis
   strides the 1-D `ZapArray` has not got, so a stepped array slice is rejected at
   compile time for now (a list slice, a copy, supports any step).
-- `sqrt`/elementwise math and axis reductions. (The full dtype matrix shipped in
-  Increment 5 / D-0166; `zeros`/`ones`/`full`/`arange`/`linspace` in Increment 6
-  / D-0167.)
+- Axis reductions; the rest of the math surface (`pow`/binary math over arrays,
+  and `log2`/`log10`/`asin`/`acos`/`atan`/`floor`/`ceil`/`round`/`trunc` on
+  arrays — trivial follow-ups on the Increment 7 kernel). (Shipped: dtype matrix
+  Increment 5 / D-0166; constructors Increment 6 / D-0167; the core elementwise
+  math set Increment 7 / D-0168.)
 - Scalar-on-the-left of a non-commutative op (`scalar - array`).
 - `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 

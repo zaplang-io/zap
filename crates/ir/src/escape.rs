@@ -369,6 +369,7 @@ fn visit_non_slot_operands(i: &Inst, f: &mut dyn FnMut(Value)) {
             f(*lhs);
             f(*rhs);
         }
+        Inst::ArrayUnaryOp { src, .. } => f(*src),
         Inst::ClosureMake { captures, .. } => {
             for c in captures {
                 f(*c);

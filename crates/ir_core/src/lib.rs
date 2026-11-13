@@ -517,6 +517,21 @@ pub enum BinOp {
     Shr, // arithmetic (signed, ashr) or logical (unsigned, lshr) right shift, by result type (#552)
 }
 
+/// Element-wise unary math over a numeric `array` (#505, D-0168). Each maps to a
+/// float LLVM intrinsic in codegen (`llvm.sqrt`/`exp`/`log`/`sin`/`cos`/`fabs`);
+/// `tan` has no direct intrinsic, so codegen emits `sin/cos`. Carried by
+/// [`Inst::ArrayUnaryOp`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrayMathOp {
+    Sqrt,
+    Exp,
+    Log,
+    Sin,
+    Cos,
+    Tan,
+    Fabs,
+}
+
 /// Comparison predicate. Codegen picks the signed or unsigned integer `icmp`
 /// predicate from the *operand* type (#552) and the ordered predicate for
 /// floats.
@@ -771,6 +786,19 @@ pub enum Inst {
         rhs: Value,
         rhs_dtype: Dtype,
         scalar: bool,
+    },
+    /// Element-wise unary math over a numeric `array` (#505, D-0168): the result
+    /// is a shape-preserving array of `out` dtype, `out[i] = op(src[i])`. Codegen
+    /// loads each `src` element (`src_dtype`), converts to the float result dtype
+    /// `out`, applies the LLVM math intrinsic for `op`, and stores (a vectorized
+    /// body with a scalar tail, like [`Inst::ArrayBinOp`]). The result is always
+    /// a float dtype (`f32` for an `f32` source, else `f64`).
+    ArrayUnaryOp {
+        dest: Value,
+        op: ArrayMathOp,
+        out: Dtype,
+        src: Value,
+        src_dtype: Dtype,
     },
     /// Launch a coroutine running `func(args...)` (ticket #25, D-0013): a
     /// fire-and-forget `spawn`. Arguments are evaluated eagerly in the spawning
@@ -1332,6 +1360,17 @@ fn fmt_inst(i: &Inst) -> String {
                 rhs_dtype.suffix(),
             )
         }
+        Inst::ArrayUnaryOp {
+            dest,
+            op,
+            out,
+            src,
+            src_dtype,
+        } => format!(
+            "%{dest} = array.{op:?}.{} %{src}:{}",
+            out.suffix(),
+            src_dtype.suffix(),
+        ),
         Inst::Spawn {
             func, args, owner, ..
         } => {
