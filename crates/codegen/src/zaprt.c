@@ -3261,10 +3261,17 @@ void *zap_array_slice(void *ap, int64_t lo, int64_t hi, int64_t has_lo, int64_t 
 
 /* Out-of-range access aborts (shape-mismatch exceptions wait for a follow-up,
  * matching the list bounds behaviour above). */
+/* The typed get/set bound is the TOTAL element count (product of all dims), not
+ * `dims[0]`: these take a FLAT element index into the contiguous window. That is
+ * how N-D construction fills the buffer (flat 0..count), and for a rank-1 array
+ * or a rank-1 row view (the only shapes a full-index get/set ever lands on after
+ * row folding) the count equals `dims[0]`, so 1-D behaviour is unchanged. A
+ * partial index is bounds-checked per axis in `zap_array_row` instead. */
 static void zap_array_bounds(ZapArray *a, int64_t i) {
-    if (i < 0 || i >= a->dims[0]) {
+    int64_t n = zap_array_count_of(a);
+    if (i < 0 || i >= n) {
         fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
-                (long long)i, (long long)a->dims[0]);
+                (long long)i, (long long)n);
         abort();
     }
 }
