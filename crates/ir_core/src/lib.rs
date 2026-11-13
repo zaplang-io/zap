@@ -580,6 +580,20 @@ pub enum Inst {
         dest: Value,
         sid: u32,
     },
+    /// A zeroed struct instance allocated in a **scope-bound arena** (#553, D-0158):
+    /// the struct's leaf (pointer-free) bytes are bump-allocated from `arena` (the
+    /// `ZapArena*` handle bound by the enclosing `with arena(...) as a:`) into a
+    /// non-moving, never-reclaimed region, and freed as a unit at block exit.
+    /// Codegen emits `zap_arena_alloc_atomic(arena, size_of(sid))` and the result
+    /// `dest : Struct(sid)` is GC-rooted like any heap pointer (it must appear in
+    /// codegen's `inst_dest`, #839) — the precise marker marks it in place (the
+    /// region is pinned) and never traces into it (leaf-only). On a NULL (cap /
+    /// heap-OOM) return the lowering raises via `zap_arena_oom`.
+    ArenaNew {
+        dest: Value,
+        sid: u32,
+        arena: Value,
+    },
     /// A **stack-allocated** zeroed struct instance (escape analysis, #839): the
     /// value is a `StructNew` that the escape pass (`crates/ir/src/escape.rs`)
     /// proved does not escape its function AND whose layout is leaf / pointer-free
@@ -1150,6 +1164,9 @@ fn fmt_inst(i: &Inst) -> String {
             format!("%{dest} = strconst {:?}", String::from_utf8_lossy(bytes))
         }
         Inst::StructNew { dest, sid } => format!("%{dest} = structnew struct#{sid}"),
+        Inst::ArenaNew { dest, sid, arena } => {
+            format!("%{dest} = arenanew struct#{sid} in %{arena}")
+        }
         Inst::StackStruct { dest, sid } => format!("%{dest} = stackstruct struct#{sid}"),
         Inst::StrBuild {
             dest,

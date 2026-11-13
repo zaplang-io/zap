@@ -289,3 +289,28 @@ pointerful-v2 after #714 generational**, not "#714 then #553".
 No `GRAMMAR.ebnf` change: `with` (#185) and inline parameter annotations (#458 /
 D-0089, for the future `@noescape`) already exist. The `with`-head-only
 constraint on `arena()` (§2.2) is a sema rule, not a grammar production.
+
+## 10. Implementation status (v1)
+
+The shipped v1 (epic #553: runtime #878, surface/sema #879, codegen #880) realizes
+this spec with two refinements worth recording:
+
+- **`alloc` element set.** `a.alloc(bytes, n)` (a non-moving byte buffer, the FFI
+  motivation) and `a.new(T, …)` (a single leaf struct) are implemented. Typed
+  numeric arena arrays — `a.alloc(numericT, n)` yielding a flat element-typed
+  buffer (§5.1) — are deferred (#881): they need a size-parametric element-typed
+  buffer representation that `sema_types::Ty` does not yet have. Leaf-only still
+  applies to every element type. Allocating a non-`bytes` element in `alloc`, or a
+  pointerful `T` in `new`, is a compile error (`ZAP5130`).
+- **Exhaustion exception.** `cap` overflow / heap OOM raises a **catchable**
+  exception as specified, but v1 raises a `RuntimeError` whose message names it a
+  memory error rather than a first-class `MemoryError` — Zap has no `MemoryError`
+  type yet. Promoting it to a dedicated `MemoryError` is a small, separable
+  language-surface follow-up tracked under the #553 epic.
+
+Enforcement lands in sema (`crates/sema/src/scoped.rs` arena-value escape,
+`ZAP5131`; `crates/sema/src/lib.rs` leaf-only, `ZAP5130`), with the runtime region
+primitive in `crates/codegen/src/zapgc.inc.c` / `zaprt.c` (`zap_arena_open` /
+`zap_arena_alloc_bytes` / `zap_arena_alloc_atomic` / `zap_arena_close`, a pinned
+`ZapBlock` tag the evacuator and sweep both honor) and the `with`-exit bulk free +
+allocation path in `crates/ir/src/lower.rs` / `crates/codegen/src/lib.rs`.

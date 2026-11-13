@@ -330,6 +330,9 @@ fn visit_non_slot_operands(i: &Inst, f: &mut dyn FnMut(Value)) {
         | Inst::LandingPad { .. }
         // A `Load`'s only operand is the excluded `ptr`.
         | Inst::Load { .. } => {}
+        // An arena allocation reads the arena handle (a Call result, never an
+        // alloca); its `dest` is the def. Visit the handle like any value operand.
+        Inst::ArenaNew { arena, .. } => f(*arena),
         Inst::IsNull { val, .. } | Inst::Un { val, .. } | Inst::Cast { val, .. } => f(*val),
         Inst::Bin { lhs, rhs, .. } | Inst::ICmp { lhs, rhs, .. } | Inst::FCmp { lhs, rhs, .. } => {
             f(*lhs);

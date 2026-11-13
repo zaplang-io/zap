@@ -25,6 +25,25 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Scope-bound arena / region allocation — leaf-only v1** (#553, D-0158). A
+  `with arena(size=?, cap=?) as a:` block bump-allocates leaf (pointer-free)
+  objects into pinned, non-moving GC regions and frees them all as a unit at block
+  exit — never by the collector. `a.alloc(bytes, n)` yields a non-moving byte
+  buffer (the FFI-pin case: a stable address for a whole C-heavy section without
+  per-call `pin`); `a.new(T, …)` constructs a single leaf struct in the arena.
+  `size` is an initial-reservation hint (rounded up to the 32 KB region), growth
+  is automatic in region units, and `cap` is a hard byte ceiling whose overflow
+  raises a catchable error (v1: a `RuntimeError` whose message names it a memory
+  error — a first-class `MemoryError` type is a tracked follow-up). The arena is a
+  built-in `@scoped` resource (D-0159), so a detached `a = arena()` is rejected
+  (`ZAP5128`); it is **leaf-only** — a pointer-holding arena object is rejected
+  (`ZAP5130`); and an arena-allocated value may not escape its block — returned,
+  stored in a longer-lived slot, captured by a closure, or carried across a
+  `spawn`/`scope:` boundary (`ZAP5131`, the compile-time dual of D-0151). Passing
+  one to a C `extern` for the call is a permitted borrow. Coroutine-local; served
+  from the GC's own region pool (the first consumer of the #714 region-tag model's
+  pinned/non-moving tag). Pointerful arena objects are v2, gated on #714's
+  generational write-barrier. Spec: `docs/design/arena.md`.
 - **`@scoped` affine resource marker — with-bound RAII** (#876, D-0159). A struct
   marked `@scoped` is a *with-bound affine resource*: each value must be consumed
   exactly once — by a `with` head or by a move into another `@scoped` struct's

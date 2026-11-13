@@ -1406,6 +1406,7 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | Select { dest, .. }
         | StrConst { dest, .. }
         | StructNew { dest, .. }
+        | ArenaNew { dest, .. }
         | StackStruct { dest, .. }
         | StrBuild { dest, .. }
         | FieldGet { dest, .. }
@@ -1707,6 +1708,28 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             self.module
                 .add_function("zap_str_len", i64t.fn_type(&[ptr.into()], false), None);
         self.fns.insert("zap_str_len".to_string(), str_len);
+
+        // Scope-bound arena / region allocator (#553, D-0158). Backend-uniform:
+        // open(size_hint, cap) -> arena handle; alloc_bytes(arena, n) -> bytes;
+        // alloc_desc(arena, desc) -> leaf struct; close(arena). A NULL alloc
+        // result signals cap / heap OOM and codegen raises MemoryError.
+        self.declare_rt(
+            "zap_arena_open",
+            &[i64t.into(), i64t.into()],
+            Some(ptr.into()),
+        );
+        self.declare_rt(
+            "zap_arena_alloc_bytes",
+            &[ptr.into(), i64t.into()],
+            Some(ptr.into()),
+        );
+        self.declare_rt(
+            "zap_arena_alloc_atomic",
+            &[ptr.into(), i64t.into()],
+            Some(ptr.into()),
+        );
+        self.declare_rt("zap_arena_close", &[ptr.into()], None);
+        self.declare_rt("zap_arena_oom", &[], None);
 
         // String surface (ticket #284, design/0007-strings.md): codepoint
         // indexing/slicing/len/iteration, char conversions, and the core method
@@ -4167,6 +4190,25 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     b.build_call(alloc, &[size.into()], "structnew")
                         .map_err(|e| e.to_string())?
                 };
+                vals[*dest as usize] = cs.try_as_basic_value().left();
+            }
+            Inst::ArenaNew { dest, sid, arena } => {
+                // Scope-bound arena allocation (#553, D-0158): bump `size_of(sid)`
+                // leaf bytes out of the arena handle `arena`. Backend-uniform and
+                // size-based (the object is leaf / pointer-free, so the atomic
+                // descriptor the runtime uses carries no tracing). The returned
+                // payload pointer is GC-rooted via `inst_dest`; the precise marker
+                // marks it in place (the region is pinned) and never traces into it.
+                let st = self.structs[*sid as usize];
+                let size = st
+                    .size_of()
+                    .ok_or_else(|| "arena struct has no size".to_string())?;
+                let arena_v = vals[*arena as usize]
+                    .ok_or_else(|| "arena handle not materialized".to_string())?;
+                let alloc = self.fns["zap_arena_alloc_atomic"];
+                let cs = b
+                    .build_call(alloc, &[arena_v.into(), size.into()], "arenanew")
+                    .map_err(|e| e.to_string())?;
                 vals[*dest as usize] = cs.try_as_basic_value().left();
             }
             Inst::StackStruct { dest, sid } => {
