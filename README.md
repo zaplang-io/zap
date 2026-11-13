@@ -169,7 +169,7 @@ zap help              print usage
 optimized "release" build); `--debug` compiles it at `-O0` instead for a faster
 build while you iterate — the same debug/release intuition as `cargo`, with
 identical program behaviour, trading run speed for build time (#867, D-0157).
-(aarch64 keeps `-O0` for now, pending #869.) `zap run`,
+`zap run`,
 `zap build`, `zap test`, `zap repl`, and `zap playground` require the LLVM
 codegen feature; front-end and project commands can be built without LLVM.
 Stability varies by surface: package publishing/discovery, the playground, and

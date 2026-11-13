@@ -430,10 +430,10 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
             // of the default `-O2` (#867, D-0157). The runtime is the whole
             // dict/set/string/GC machinery every hot op calls into, so an
             // unoptimized runtime dominated end-to-end time (`dict_int` 26.9ms at
-            // `-O0` vs 19.0ms at `-O2`); `-O2` is the default on x86_64 and
+            // `-O0` vs 19.0ms at `-O2`); `-O2` is the default on every target and
             // `--debug` trades run speed for a faster build (~0.73s vs ~3s).
             // Observable behaviour is identical either way. Like the `cargo`
-            // debug/release split. (aarch64 stays `-O0` regardless, pending #869.)
+            // debug/release split.
             "--debug" => {
                 debug = true;
                 i += 1;
@@ -1812,7 +1812,7 @@ compile & run:
                         test-time diagnostic, off by default (#665, D-0114)
        --debug          (run/build) compile the C runtime at -O0 for a faster
                         build instead of the default optimized (-O2) runtime
-                        (x86_64; aarch64 is -O0 either way, #869); trades run
+                        trades run
                         speed for iteration speed, like cargo's debug/release
                         split, with identical behaviour (#867, D-0157)
 

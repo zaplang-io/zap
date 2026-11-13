@@ -177,17 +177,6 @@ const INLINE_HELPERS: &[&str] = &["zap_d_keys", "zap_d_vals", "zap_d_tags", "zap
 
 #[test]
 fn default_runtime_is_optimized_and_debug_is_not() {
-    // The `-O2` default is gated to x86_64 (I#867, D-0157): on other targets
-    // (aarch64) the default is `-O0` too, pending the aarch64 `-O2` fix (I#869),
-    // so this test's premise (default inlines, `--debug` does not) holds only on
-    // x86_64. `zapc build` targets the host, so the host arch is the build target.
-    if !cfg!(target_arch = "x86_64") {
-        eprintln!(
-            "SKIP default_runtime_is_optimized_and_debug_is_not: the `-O2` runtime \
-             default is x86_64-only (I#867/D-0157); non-x86_64 stays `-O0` pending I#869"
-        );
-        return;
-    }
     if !has_objdump() {
         eprintln!(
             "SKIP default_runtime_is_optimized_and_debug_is_not: no objdump on PATH \
