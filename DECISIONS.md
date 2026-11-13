@@ -8518,3 +8518,33 @@ this makes `ndim > 1` real.
   scalar-on-left (#506), axis reductions + min/max/mean/prod (#507).
 No grammar change (the comma subscript `m[i, j]` already parses as a tuple
 index). See `design/0002-arrays.md`, SPEC §15, and `design/RUNTIME-ABI.md`.
+
+## D-0165 — Element-wise broadcasting for numeric arrays (#501)
+**Status:** Locked (design) / incremental implementation
+Second increment of the N-D arrays epic (#499), over N-D shape + indexing
+(D-0164). Element-wise `+`/`-`/`*` on two arrays now **broadcast** (NumPy
+semantics) instead of requiring identical shapes.
+- **Rules.** Shapes are **right-aligned**; each aligned axis must be equal, or
+  one side is 1 (stretched), or missing — the lower-rank operand gets implicit
+  leading 1s (rank extension). The result rank is the larger rank (static, from
+  the type); each result dim is the larger aligned dim. Per-axis compatibility
+  and the result dims are runtime values (dims are runtime).
+- **Validation.** Incompatible shapes raise a catchable `ValueError` ("array
+  shape mismatch", D-0007) from a throwing `zap_array_broadcast_check` the
+  lowering emits before the kernel (overlaps #508). The old exact-shape
+  `zap_array_check_shape` path is subsumed (equal shapes are a special case of
+  broadcast).
+- **Kernel (codegen, not a runtime op loop).** The element-wise kernel stays in
+  codegen. It branches at run time on `zap_array_same_shape`: equal shapes take
+  the existing **flat SIMD** loop (no regression on the common case); otherwise a
+  **strided** loop walks the result in row-major order and maps each output
+  index to each operand's window-relative offset via `zap_array_bcast_offsets`
+  (stretched/missing axes contribute stride 0, re-reading the same element). The
+  broadcast result is allocated by `zap_array_broadcast_new`. **Inner-axis SIMD
+  for the broadcast path is a deferred perf follow-up** (the broadcast branch is
+  a scalar loop for now); the flat equal-shape path is already vectorized.
+- **Scalar broadcast** (`a + n`) is unchanged (NEP-50 weak scalar, D-0011/#49).
+- **Deferred:** inner-axis SIMD on the broadcast path; broadcasting in
+  assignment / partial-index (whole-row) stores; division and comparison kernels
+  (#506). Rank stays static per the type (D-0164); no annotation change.
+No grammar change. See `design/0002-arrays.md`, SPEC §15, `design/RUNTIME-ABI.md`.

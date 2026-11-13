@@ -3294,6 +3294,126 @@ void zap_array_check_shape(void *left, void *right) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * Broadcasting (#501, D-0165). NumPy semantics: shapes are right-aligned, and
+ * each aligned axis must be equal, or one side 1 (stretched), or missing (the
+ * lower-rank operand gets implicit leading 1s). The result rank is the larger
+ * rank; each result dim is the larger of the two aligned dims.
+ *
+ * `a`'s length on result axis `k` (rank `r` = result rank): an axis past the
+ * left edge of `a` is an implicit 1, as is a genuine size-1 (stretched) axis. */
+static int64_t zap_array_bcast_dim(const ZapArray *a, int64_t r, int64_t k) {
+    int64_t ax = k - (r - a->ndim);
+    return ax < 0 ? 1 : a->dims[ax];
+}
+
+/* Window-relative contiguous row-major stride of `a`'s own axis `ax`
+ * (product of the trailing dims); the element step when that axis increments. */
+static int64_t zap_array_axis_stride(const ZapArray *a, int64_t ax) {
+    int64_t s = 1;
+    for (int64_t k = ax + 1; k < a->ndim; k++) {
+        s *= a->dims[k];
+    }
+    return s;
+}
+
+int64_t zap_array_broadcastable(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *b = (ZapArray *)bp;
+    int64_t r = a->ndim > b->ndim ? a->ndim : b->ndim;
+    for (int64_t k = 0; k < r; k++) {
+        int64_t da = zap_array_bcast_dim(a, r, k);
+        int64_t db = zap_array_bcast_dim(b, r, k);
+        if (da != db && da != 1 && db != 1) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Raise a catchable ValueError when the operands cannot broadcast together
+ * (#508 overlap). Emitted as a throwing call before the kernel, so the kernel
+ * may assume compatibility. */
+void zap_array_broadcast_check(void *ap, void *bp) {
+    if (!zap_array_broadcastable(ap, bp)) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("array shape mismatch", 20));
+    }
+}
+
+/* 1 iff the two arrays have identical ndim and dims (the fast, no-broadcast
+ * path — the element buffers line up element-for-element). */
+int64_t zap_array_same_shape(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *b = (ZapArray *)bp;
+    if (a->ndim != b->ndim) {
+        return 0;
+    }
+    for (int64_t k = 0; k < a->ndim; k++) {
+        if (a->dims[k] != b->dims[k]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Allocate the element-wise result for a broadcast of `a` and `b` with dtype
+ * `out_dtype`: rank = max rank, each dim = the larger aligned dim. Compatibility
+ * must already have been checked (`zap_array_broadcast_check`). */
+void *zap_array_broadcast_new(void *ap, void *bp, int64_t out_dtype) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *b = (ZapArray *)bp;
+    int64_t r = a->ndim > b->ndim ? a->ndim : b->ndim;
+    if (r < 1) {
+        r = 1;
+    }
+    ZapArray *res = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t *dims = (int64_t *)zap_buf((size_t)r * sizeof(int64_t));
+    int64_t total = 1;
+    for (int64_t k = 0; k < r; k++) {
+        int64_t da = zap_array_bcast_dim(a, r, k);
+        int64_t db = zap_array_bcast_dim(b, r, k);
+        dims[k] = da > db ? da : db;
+        total *= dims[k];
+    }
+    size_t esz = zap_array_elem_size(out_dtype);
+    res->dtype = out_dtype;
+    res->ndim = r;
+    res->dims = dims;
+    res->data = zap_buf((size_t)(total > 0 ? total : 0) * esz);
+    res->off = 0;
+    return res;
+}
+
+/* For a result flat index `f` into the broadcast result `res`, compute the
+ * window-relative element offsets into `a` and `b` (stretched/missing axes
+ * contribute 0, so they re-read the same element). The offsets are relative to
+ * each operand's window base — the kernel's data pointers come from
+ * `zap_array_data`, which already includes each array's `off`. */
+void zap_array_bcast_offsets(void *ap, void *bp, void *resp, int64_t f,
+                             int64_t *off_a, int64_t *off_b) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *b = (ZapArray *)bp;
+    ZapArray *res = (ZapArray *)resp;
+    int64_t r = res->ndim;
+    int64_t oa = 0, ob = 0;
+    int64_t rem = f;
+    for (int64_t k = r - 1; k >= 0; k--) {
+        int64_t idx = rem % res->dims[k];
+        rem /= res->dims[k];
+        int64_t aax = k - (r - a->ndim);
+        if (aax >= 0 && a->dims[aax] != 1) {
+            oa += idx * zap_array_axis_stride(a, aax);
+        }
+        int64_t bax = k - (r - b->ndim);
+        if (bax >= 0 && b->dims[bax] != 1) {
+            ob += idx * zap_array_axis_stride(b, bax);
+        }
+    }
+    *off_a = oa;
+    *off_b = ob;
+}
+
 double zap_array_get_f64(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);

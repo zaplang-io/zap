@@ -64,8 +64,8 @@ Once the IR schema and runtime ABI are frozen, these run concurrently:
 - **Regex track** — `m//`, `s//`, `=~`/`!~`, `~=`, match objects (PCRE2). `D-0010`.
 - **Arrays track** — `array[T]` 1-D first: element-wise ops + scalar broadcast +
   SIMD lowering (done); then N-D static-rank shape + multi-axis indexing (#500,
-  `D-0164`, done), then broadcasting, slicing, dtypes, constructors, math,
-  reductions, matmul (epic #499). `D-0011`.
+  `D-0164`, done), element-wise broadcasting (#501, `D-0165`, done), then
+  slicing, dtypes, constructors, math, reductions, matmul (epic #499). `D-0011`.
 - **Concurrency track** — coroutines + channels (unbuffered/buffered, `close`,
   `select`), sync primitives, structured concurrency, DRF-SC memory model.
   `D-0008`, `D-0031`–`D-0034`.

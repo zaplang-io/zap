@@ -367,7 +367,10 @@ mod tests {
         let module = lower_ok(include_str!(
             "../../../tests/conformance/array_contract.zap"
         ));
-        assert!(format!("{module}").contains("zap_array_check_shape"));
+        // Element-wise array-array ops guard with a broadcast-compatibility check
+        // (#501, D-0165) — a throwing call that raises ValueError on incompatible
+        // shapes before the kernel runs (it subsumes the old exact-shape check).
+        assert!(format!("{module}").contains("zap_array_broadcast_check"));
         lower_ok(include_str!(
             "../../../tests/conformance/collection_elements.zap"
         ));

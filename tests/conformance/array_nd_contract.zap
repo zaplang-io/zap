@@ -21,7 +21,10 @@ def main():
     auto c = array[i64]([[[1, 2]], [[3, 4]]])
     print("cube", c.ndim, c.size, c[1, 0, 0])
     try:
-        auto bad = m + array[i64]([[1], [2]])
+        # (2, 3) + (2,) is not broadcast-compatible (trailing 3 vs 2), so this
+        # raises even under #501 broadcasting — a (2, 1) operand would instead
+        # stretch, which array_broadcast_contract covers.
+        auto bad = m + array[i64]([1, 2])
         print(sum(bad))
     except ValueError as e:
         print("shape error", e)
