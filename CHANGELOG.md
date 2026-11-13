@@ -25,6 +25,19 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`@scoped` affine resource marker — with-bound RAII** (#876, D-0159). A struct
+  marked `@scoped` is a *with-bound affine resource*: each value must be consumed
+  exactly once — by a `with` head or by a move into another `@scoped` struct's
+  field — and is torn down deterministically at scope exit, enforced statically.
+  A `@scoped` struct must define both `__enter__` and `__exit__` (`ZAP5127`); a
+  detached construction / `return` / store of a fresh `@scoped` value is rejected
+  (`ZAP5128`); a `with`-bound value escaping its scope — returned, stored, or
+  carried across a `spawn`/`scope:` boundary — is rejected (`ZAP5129`). Scopedness
+  is *contagious*: a struct owning a `@scoped` field is itself `@scoped`, and an
+  owner's teardown auto-runs each owned `@scoped` field's `__exit__` in reverse
+  declaration order (Rust `Drop`-glue). Generalizes the #553 arena's with-binding
+  guarantee (D-0158) and underlies composite scoped types such as `arena_dict`
+  (#873). Decorator surface only — no grammar change. Spec: `docs/design/scoped.md`.
 - **The C runtime is compiled at `-O2` by default on x86_64, with a
   `zap build --debug` (and `zap run --debug`) fast-iteration build at `-O0`**
   (#867, D-0157). On the default (non-LTO) object-link path the runtime

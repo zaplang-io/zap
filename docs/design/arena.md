@@ -101,13 +101,16 @@ construction order (Rust `Drop`-glue style), so cleanup cannot be forgotten. A
 bare `arena()` is simply the degenerate violation of (a)/(b): it is consumed by
 neither.
 
-`@scoped` is a **general language feature** in its own right (its own
-decision/RFC), with arena as its first consumer; it also underlies composite
-scoped types such as `arena_dict` (see the arena-local-collections RFC). Arena
-**v1 is not blocked on the full feature**: the base arena owns no `@scoped`
+`@scoped` is a **general language feature** in its own right — frozen as
+**D-0159** (#876), spec in `docs/design/scoped.md` — with arena as its first
+consumer; it also underlies composite scoped types such as `arena_dict` (#873).
+Arena **v1 is not blocked on the full feature**: the base arena owns no `@scoped`
 fields, so it needs only the degenerate *`with`-head-only construction check*,
-implementable standalone; the general affine/contagion/auto-teardown machinery is
-what later enables composite `@scoped` types and subsumes this check. (The same
+implementable standalone. Now that `@scoped` has landed (D-0159), that degenerate
+check is **subsumed** by the general mechanism — the arena is simply a `@scoped`
+struct, its with-binding guarantee is the `@scoped` with-head-only rule
+(`docs/design/scoped.md` §3.2), and the general affine/contagion/auto-teardown
+machinery enables composite `@scoped` types built on the arena. (The same
 discipline may later extend to `pin()`.)
 
 ### 2.3 Sizing and growth

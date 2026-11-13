@@ -718,6 +718,31 @@ define_codes! {
          it (D-0139/#809). Ordering may be customized with `__cmp__` (it affects \
          only sort/heap order, never equality), but it must stay a strict total \
          order over distinct members.";
+    ZAP5127 = 5127 : "@scoped struct must define __enter__ and __exit__",
+        "A struct that is `@scoped` (#876, D-0159) — whether marked with the \
+         `@scoped` decorator or `@scoped` implicitly by owning a `@scoped` field \
+         (contagion) — MUST define both `__enter__` and `__exit__`. A `@scoped` \
+         type is by definition a with-bound resource that participates in the \
+         context-manager protocol (D-0069, I#185); a `@scoped` marker without the \
+         methods is meaningless, and is caught at the definition rather than \
+         deferred to the first `with` use. Add both methods (an owner that becomes \
+         `@scoped` only by ownership must still hand-write them, D-0159 Q5).";
+    ZAP5128 = 5128 : "@scoped value must be bound by `with`",
+        "A freshly produced `@scoped` value (#876, D-0159) may appear only as the \
+         head of a `with` (`with Arena() as a:`) or as the immediate right-hand \
+         side of an assignment into a `@scoped` field (ownership transfer to an \
+         owner that is itself `@scoped`). A detached construction (`a = Arena()`), \
+         a `return` of a freshly produced `@scoped` value, a store into a \
+         non-`@scoped` slot, or passing one to a retaining call would leave the \
+         resource with no bounding scope and leak its deterministic cleanup. Bind \
+         it with `with`, or move it into a `@scoped` field.";
+    ZAP5129 = 5129 : "@scoped value escapes its `with` scope",
+        "A `with`-bound `@scoped` value (#876, D-0159) may not outlive its `with` \
+         scope: returning it, storing it into a longer-lived slot, or carrying it \
+         across a `spawn` / `scope:` boundary (coroutine-local, D-0158 decision 7) \
+         is a compile error, because its resource is torn down at `with`-exit and \
+         any surviving reference would dangle. Use it only within its own `with` \
+         block.";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

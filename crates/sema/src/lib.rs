@@ -14,7 +14,9 @@ use zapc_syntax::ast::*;
 use zapc_syntax::fstring::{self, FStringPart, FormatSpec};
 use zapc_syntax::genanalysis;
 use zapc_syntax::span::Span;
-use zapc_syntax::{BUILTIN_SHAREABLE_TYPES, SHAREABLE_MARKER};
+use zapc_syntax::{BUILTIN_SHAREABLE_TYPES, SCOPED_MARKER, SHAREABLE_MARKER};
+
+mod scoped;
 
 // The source-level type model (`Ty`, the `*Info` records, and the pure type
 // operations `assignable`/`join`/`num_join`/`default_type` and the dunder
@@ -181,6 +183,7 @@ pub fn analyze(module: &Module) -> (Vec<TypeError>, Vec<TypeError>) {
     c.check_bitfields(module);
     c.collect_sigs(module);
     c.validate_decorators(module);
+    c.check_scoped(module);
     c.check_module(module);
     (c.errors, c.warnings)
 }
@@ -208,6 +211,7 @@ pub fn analyze_queryable(module: &Module) -> (Vec<TypeError>, Vec<TypeError>, An
     c.check_bitfields(module);
     c.collect_sigs(module);
     c.validate_decorators(module);
+    c.check_scoped(module);
     c.check_module(module);
     let facts = c.analysis.take().unwrap_or_default();
     (c.errors, c.warnings, facts)
@@ -349,6 +353,20 @@ struct Checker {
     /// are recognized by [`Checker::name_is_shareable`] through the shared
     /// [`BUILTIN_SHAREABLE_TYPES`] seed, so the lint runs one uniform rule.
     shareable_types: HashSet<String>,
+    /// Structs that are `@scoped` (#876, D-0159): an affine, with-bound resource.
+    /// Seeded with structs carrying the `@scoped` decorator, then closed under
+    /// *contagion* — a struct owning a `@scoped` field is itself `@scoped` — by a
+    /// fixpoint in [`Checker::check_scoped`]. Keyed on the nominal base name, so a
+    /// generic spelling is covered by its base. Consulted by the `@scoped`
+    /// well-formedness, with-head-only, and escape checks (`crates/sema/src/scoped.rs`).
+    scoped_types: HashSet<String>,
+    /// The receiver name (`self`) whose field is a legal move target for a fresh
+    /// `@scoped` value (#876, D-0159), set only while walking a method of a
+    /// `@scoped` struct. `Some("self")` inside such a method; `None` in a free
+    /// function, a non-`@scoped` struct's method, or anywhere else — so a
+    /// `@scoped` value may be moved into `self.<field>` ONLY inside its owner's
+    /// own method, never into an arbitrary object's field. See `scoped.rs`.
+    scoped_self_base: Option<String>,
     /// Names of mutable module-level globals whose type is NOT `@shareable`
     /// (#664, D-0113). Each read or write of one of these — resolving to the
     /// module frame, not a shadowing local — raises the ZAP5125 sharing-lint
@@ -548,6 +566,10 @@ const BUILTIN_DECORATORS: &[&str] = &[
     // asserts the type is safe under concurrent shared access (a trusted,
     // unverified claim), reflectable via `reflect_has(T, "shareable")`.
     SHAREABLE_MARKER,
+    // Affine with-bound resource marker (#876, D-0159): `@scoped` on a `struct`
+    // makes it a with-bound affine resource (must define __enter__/__exit__,
+    // contagious through ownership). See `docs/design/scoped.md`.
+    SCOPED_MARKER,
     // JSON codec hooks (ticket #346, D-0086): `@json(timestamp="epoch"|"iso8601")`
     // on a `DateTime` field selects its wire form; `@json(open)` on an enum marks
     // it an open (forward-compatible) string enum. See `design/0010-json.md`.
@@ -816,6 +838,8 @@ impl Checker {
             user_decorators: HashSet::new(),
             deprecated: HashMap::new(),
             shareable_types: HashSet::new(),
+            scoped_types: HashSet::new(),
+            scoped_self_base: None,
             share_lint_globals: HashSet::new(),
             scopes: Vec::new(),
             const_scopes: Vec::new(),
@@ -1158,6 +1182,11 @@ impl Checker {
                     // sharing lint and reflection. A trusted, unverified claim.
                     if s.decorators.iter().any(|d| d.name == SHAREABLE_MARKER) {
                         self.shareable_types.insert(s.name.clone());
+                    }
+                    // Seed the `@scoped` set (#876, D-0159) with explicitly
+                    // marked structs; contagion closes it in `check_scoped`.
+                    if s.decorators.iter().any(|d| d.name == SCOPED_MARKER) {
+                        self.scoped_types.insert(s.name.clone());
                     }
                 }
                 Item::Interface(i) => {
@@ -2994,6 +3023,20 @@ impl Checker {
                     self.error(
                         ErrorCode::ZAP5041,
                         "@shareable takes no arguments".to_string(),
+                        d.span,
+                    );
+                }
+            }
+            // Affine with-bound resource marker (#876, D-0159). `@scoped` applies
+            // to a `struct` and takes no arguments; the affine/with-head-only/
+            // escape semantics and the __enter__/__exit__ well-formedness rule are
+            // enforced in `check_scoped` (`crates/sema/src/scoped.rs`).
+            SCOPED_MARKER => {
+                self.require_target(d, target, DecoTarget::Struct);
+                if !d.args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP5041,
+                        "@scoped takes no arguments".to_string(),
                         d.span,
                     );
                 }
@@ -8863,6 +8906,276 @@ def main():
         );
         // A well-formed application is accepted.
         ok("@shareable\nstruct S:\n    int64 n\ndef main():\n    print(0)\n");
+    }
+
+    // --- `@scoped` affine resource marker (#876, D-0159) ----------------------
+
+    /// A well-formed `@scoped` struct `Arena` (both dunders), plus `main`.
+    fn arena_src(extra: &str) -> String {
+        format!(
+            "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+             def __enter__(self) -> Arena:\n        return self\n    \
+             def __exit__(self):\n        pass\n{extra}"
+        )
+    }
+
+    #[test]
+    fn scoped_marker_rejects_wrong_target_and_args() {
+        // `@scoped` applies to a struct only (ZAP5047) and takes no args (ZAP5041).
+        let e = errors("@scoped\ndef f():\n    print(1)\ndef main():\n    f()\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5047),
+            "expected ZAP5047 for @scoped on a function, got {e:?}"
+        );
+        let e = errors(&arena_src(
+            "@scoped(1)\nstruct B:\n    int64 n\ndef main():\n    print(0)\n",
+        ));
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5041),
+            "expected ZAP5041 for @scoped with arguments, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_requires_enter_and_exit() {
+        // Missing both.
+        let e = errors("@scoped\nstruct Arena:\n    int64 id = 0\ndef main():\n    print(0)\n");
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5127),
+            "expected ZAP5127 when both dunders missing, got {e:?}"
+        );
+        // Missing only __exit__.
+        let e = errors(
+            "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+             def __enter__(self) -> Arena:\n        return self\ndef main():\n    print(0)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5127),
+            "expected ZAP5127 when __exit__ missing, got {e:?}"
+        );
+        // Missing only __enter__.
+        let e = errors(
+            "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+             def __exit__(self):\n        pass\ndef main():\n    print(0)\n",
+        );
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5127),
+            "expected ZAP5127 when __enter__ missing, got {e:?}"
+        );
+        // Both present: well-formed.
+        ok(&arena_src("def main():\n    print(0)\n"));
+    }
+
+    #[test]
+    fn scoped_accepts_with_binding_and_receiver_use() {
+        // The canonical valid form: construct at the `with` head, use the bound
+        // value as a receiver / field read inside the body.
+        ok(&arena_src(
+            "def main():\n    with Arena() as a:\n        print(a.id)\n",
+        ));
+        // An unused `with`-bound value is still consumed by the `with`.
+        ok(&arena_src(
+            "def main():\n    with Arena() as a:\n        pass\n",
+        ));
+        // Nested `with`s.
+        ok(&arena_src(
+            "def main():\n    with Arena() as outer:\n        with Arena() as inner:\n            print(inner.id)\n",
+        ));
+    }
+
+    #[test]
+    fn scoped_rejects_detached_construction() {
+        for stmt in [
+            "    auto a = Arena()\n",
+            "    Arena a = Arena()\n",
+            "    Arena()\n",
+            "    print(Arena().id)\n",
+        ] {
+            let src = arena_src(&format!("def main():\n{stmt}"));
+            let e = errors(&src);
+            assert!(
+                e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+                "expected ZAP5128 for detached construction `{stmt}`, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_rejects_return_of_fresh_value() {
+        let src =
+            arena_src("def make() -> Arena:\n    return Arena()\ndef main():\n    print(0)\n");
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+            "expected ZAP5128 for returning a fresh @scoped value, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_rejects_escape_of_bound_value() {
+        // return the bound alias.
+        let src = arena_src(
+            "def make() -> Arena:\n    with Arena() as a:\n        return a\ndef main():\n    print(0)\n",
+        );
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5129),
+            "expected ZAP5129 for returning a with-bound @scoped value, got {e:?}"
+        );
+        // pass the bound alias to a retaining call.
+        let src = arena_src(
+            "def sink(Arena a):\n    pass\ndef main():\n    with Arena() as a:\n        sink(a)\n",
+        );
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5129),
+            "expected ZAP5129 for passing a with-bound @scoped value to a call, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_rejects_cross_spawn_boundary() {
+        let src = arena_src(
+            "def work(Arena a):\n    pass\ndef main():\n    with Arena() as a:\n        spawn work(a)\n",
+        );
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5129),
+            "expected ZAP5129 for a @scoped value crossing a spawn boundary, got {e:?}"
+        );
+        // Also inside a `scope:` region.
+        let src = arena_src(
+            "def work(Arena a):\n    pass\ndef main():\n    with Arena() as a:\n        scope:\n            spawn work(a)\n",
+        );
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5129),
+            "expected ZAP5129 for a @scoped value crossing a scope: boundary, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_contagion_makes_owner_scoped() {
+        // `Pool` owns a `@scoped` field, so it is `@scoped` by contagion and must
+        // itself define both dunders — a well-formed owner is accepted, and used
+        // via `with`; a field move in __enter__ is a legal construction site.
+        let pool = "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+             def __enter__(self) -> Arena:\n        return self\n    \
+             def __exit__(self):\n        pass\n\
+             struct Pool:\n    Arena a\n    \
+             def __enter__(self) -> Pool:\n        self.a = Arena()\n        return self\n    \
+             def __exit__(self):\n        pass\n\
+             def main():\n    with Pool() as p:\n        pass\n";
+        ok(pool);
+    }
+
+    #[test]
+    fn scoped_contagion_requires_owner_dunders() {
+        // `Pool` owns a `@scoped` field but defines neither dunder: ZAP5127 fires
+        // on the implicitly-`@scoped` owner (D-0159 Q5).
+        let src = "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+             def __enter__(self) -> Arena:\n        return self\n    \
+             def __exit__(self):\n        pass\n\
+             struct Pool:\n    Arena a\n\
+             def main():\n    print(0)\n";
+        let e = errors(src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5127),
+            "expected ZAP5127 on a contagious @scoped owner missing dunders, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_contagion_rejects_detached_owner() {
+        // A contagious `@scoped` owner is itself with-head-only: a detached
+        // `Pool()` is ZAP5128.
+        let src = "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+             def __enter__(self) -> Arena:\n        return self\n    \
+             def __exit__(self):\n        pass\n\
+             struct Pool:\n    Arena a\n    \
+             def __enter__(self) -> Pool:\n        self.a = Arena()\n        return self\n    \
+             def __exit__(self):\n        pass\n\
+             def main():\n    auto p = Pool()\n";
+        let e = errors(src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+            "expected ZAP5128 for a detached contagious @scoped owner, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_unrelated_struct_unaffected() {
+        // A plain struct is never @scoped: free to construct detached, return,
+        // store — no @scoped diagnostics.
+        ok("struct Plain:\n    int64 n = 0\ndef make() -> Plain:\n    return Plain()\ndef main():\n    auto p = Plain()\n    print(p.n)\n");
+    }
+
+    #[test]
+    fn scoped_rejects_construction_in_a_method() {
+        // A @scoped value constructed detached inside a *method* (here a plain
+        // struct's method) is rejected exactly as in a free function: the
+        // with-head-only rule holds everywhere, not just in `main`/free functions.
+        let src = arena_src(
+            "struct Plain:\n    int64 n = 0\n    \
+             def build(self):\n        auto a = Arena()\ndef main():\n    print(0)\n",
+        );
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+            "expected ZAP5128 for detached @scoped construction in a method, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_rejects_producer_as_method_arg() {
+        // Passing a freshly produced @scoped value to a call from within a method
+        // is a retaining-call escape — rejected (ZAP5128 at the producer).
+        let src = arena_src(
+            "struct Plain:\n    int64 n = 0\n    \
+             def use(self):\n        self.sink(Arena())\n    \
+             def sink(self, Arena a):\n        pass\ndef main():\n    print(0)\n",
+        );
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+            "expected ZAP5128 for a fresh @scoped value passed to a call in a method, got {e:?}"
+        );
+    }
+
+    /// A well-formed `@scoped` `Arena` + a `@scoped` `Pool` owner that moves an
+    /// `Arena` into its field in `__enter__`.
+    fn pool_src(extra: &str) -> String {
+        format!(
+            "@scoped\nstruct Arena:\n    int64 id = 0\n    \
+             def __enter__(self) -> Arena:\n        return self\n    \
+             def __exit__(self):\n        pass\n\
+             @scoped\nstruct Pool:\n    Arena a\n    \
+             def __enter__(self) -> Pool:\n        self.a = Arena()\n        return self\n    \
+             def __exit__(self):\n        pass\n{extra}"
+        )
+    }
+
+    #[test]
+    fn scoped_rejects_field_move_outside_the_owner() {
+        // The legal field move is ONLY `self.<field> = Producer()` inside the
+        // owner's own method. Storing a fresh @scoped value into another object's
+        // field (here a `Pool` parameter, not `self`) is NOT a legal move — it is
+        // a detached construction stored into an arbitrary slot (ZAP5128).
+        let src = pool_src("def tamper(Pool p):\n    p.a = Arena()\ndef main():\n    print(0)\n");
+        let e = errors(&src);
+        assert!(
+            e.iter().any(|x| x.code == ErrorCode::ZAP5128),
+            "expected ZAP5128 for a @scoped field move outside the owner, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_accepts_self_field_move_in_owner_enter() {
+        // The complement of the previous test: the SAME `self.a = Arena()` move is
+        // accepted inside the `@scoped` owner's own `__enter__`.
+        ok(&pool_src(
+            "def main():\n    with Pool() as p:\n        pass\n",
+        ));
     }
 
     #[test]

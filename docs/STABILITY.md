@@ -236,6 +236,19 @@ not supported — it may change in **any** release, including a PATCH:
   does not change what compiles. The marker name, the warning code, and the
   suppression and `--warnings-as-errors` mechanisms are expected to graduate to
   Stable; they are Experimental until the #206 audit.
+- **`@scoped` affine resource marker** (#876, D-0159) — **Experimental**. The
+  no-argument `@scoped` marker on a `struct` makes it a with-bound affine
+  resource: each value must be consumed exactly once (by a `with` head or a move
+  into another `@scoped` struct's field) and is torn down deterministically at
+  scope exit, enforced statically. A `@scoped` struct must define both
+  `__enter__` and `__exit__` (**`ZAP5127`**); a detached construction / `return` /
+  store of a fresh `@scoped` value is rejected (**`ZAP5128`**); a `with`-bound
+  value escaping its scope is rejected (**`ZAP5129`**). Scopedness is contagious
+  through ownership and an owner's teardown auto-runs owned `@scoped` fields'
+  `__exit__` in reverse declaration order. The marker name, the three codes, and
+  the static rules are expected to graduate to Stable; they are Experimental until
+  the #206 audit, and the affine checker's exact accepted/rejected boundary may
+  tighten as composite consumers (#873) land.
 - **Runtime data-race detector `--race`** (#665, D-0114) — **Experimental**. The
   `--race` flag (alias `-race`) on `run`/`build`/`ir`/`test` enables a test-time
   runtime data-race detector for the light concurrency model (epic #661); it is

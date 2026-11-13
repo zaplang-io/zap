@@ -255,6 +255,12 @@ struct StructCtx {
     /// Struct ids that are `value struct`s (value types, D-0051). A value struct
     /// has value semantics: copied on assign/pass/return (no shared identity).
     value_ids: HashSet<u32>,
+    /// Struct ids that are `@scoped` (#876, D-0159), explicit or closed under
+    /// contagion (a struct owning a `@scoped` field is itself `@scoped`). Drives
+    /// the `with`-lowering auto-teardown drop-glue: an owner's owned `@scoped`
+    /// fields have their `__exit__` run (reverse declaration order) at every
+    /// `with`-exit. Sema enforces the static `@scoped` rules (`crates/sema/src/scoped.rs`).
+    scoped_structs: HashSet<u32>,
     /// Registered enums (tier-1 and tier-3), keyed by type name.
     enums: HashMap<String, EnumLow>,
     /// Python import aliases (ticket #27, D-0012): the in-scope name
@@ -683,6 +689,26 @@ struct IfaceMethodLow {
 }
 
 impl StructCtx {
+    /// Owned `@scoped` fields of struct `sid`, in declaration order (#876,
+    /// D-0159): `(field_idx, field_sid, field___exit___symbol)` for each field
+    /// whose type is a `@scoped` struct. Empty for every struct that owns none
+    /// (all structs today), so the drop-glue is a no-op for existing `with`s.
+    fn scoped_field_exits(&self, sid: u32) -> Vec<(u32, u32, String)> {
+        let Some(fs) = self.fields.get(sid as usize) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (idx, (_name, ty)) in fs.iter().enumerate() {
+            if let Ty::Struct(fsid) = ty {
+                if self.scoped_structs.contains(fsid) {
+                    let exit_fn = format!("{}__{}", self.names[*fsid as usize], "__exit__");
+                    out.push((idx as u32, *fsid, exit_fn));
+                }
+            }
+        }
+        out
+    }
+
     /// Index and type of `name` in struct `sid`.
     fn field(&self, sid: u32, name: &str) -> Option<(u32, Ty)> {
         self.fields[sid as usize]
@@ -1337,11 +1363,53 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
         })
         .collect();
 
+    // `@scoped` struct ids (#876, D-0159): explicitly marked, closed under
+    // contagion (a struct owning a `@scoped` field is itself `@scoped`). Drives
+    // the with-lowering auto-teardown drop-glue. Computed before `names`/`fields`
+    // are moved into `ctx`.
+    let scoped_structs: HashSet<u32> = {
+        let mut s: HashSet<u32> = module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ast::Item::Struct(st)
+                    if st
+                        .decorators
+                        .iter()
+                        .any(|d| d.name == zapc_syntax::SCOPED_MARKER) =>
+                {
+                    ids.get(&st.name).copied()
+                }
+                _ => None,
+            })
+            .collect();
+        loop {
+            let mut added: Vec<u32> = Vec::new();
+            for sid in 0..names.len() as u32 {
+                if s.contains(&sid) {
+                    continue;
+                }
+                let owns_scoped = fields[sid as usize]
+                    .iter()
+                    .any(|(_, t)| matches!(t, Ty::Struct(f) if s.contains(f)));
+                if owns_scoped {
+                    added.push(sid);
+                }
+            }
+            if added.is_empty() {
+                break;
+            }
+            s.extend(added);
+        }
+        s
+    };
+
     let mut ctx = StructCtx {
         ids,
         names,
         fields,
         value_ids,
+        scoped_structs,
         enums,
         py,
         tuples,
@@ -5802,8 +5870,17 @@ struct LoopFrame {
 /// this enum is only consulted when a jump would otherwise skip it.
 #[derive(Clone)]
 enum Cleanup {
-    /// A `with` manager: emit `exit_fn(mgr)` (the lowered `__exit__`).
-    WithExit { mgr: Value, exit_fn: String },
+    /// A `with` manager: emit `exit_fn(mgr)` (the lowered `__exit__`), then the
+    /// `@scoped` drop-glue — each owned `@scoped` field's `__exit__` in reverse
+    /// declaration order (#876, D-0159). `mgr_sid` is the manager's struct id (for
+    /// the field loads); `field_exits` is `(field_idx, field_sid, exit_symbol)` and
+    /// is empty for every manager that owns no `@scoped` field.
+    WithExit {
+        mgr: Value,
+        mgr_sid: u32,
+        exit_fn: String,
+        field_exits: Vec<(u32, u32, String)>,
+    },
     /// A `try ... finally`: re-lower the `finally` block.
     Finally(ast::Block),
     /// Balance a landing-pad `__cxa_begin_catch` on a structured early exit.
@@ -6040,9 +6117,16 @@ impl<'a> FnLower<'a> {
             i -= 1;
             self.cleanups.truncate(i);
             match &saved[i] {
-                Cleanup::WithExit { mgr, exit_fn } => {
-                    let (mgr, exit_fn) = (*mgr, exit_fn.clone());
+                Cleanup::WithExit {
+                    mgr,
+                    mgr_sid,
+                    exit_fn,
+                    field_exits,
+                } => {
+                    let (mgr, mgr_sid, exit_fn, field_exits) =
+                        (*mgr, *mgr_sid, exit_fn.clone(), field_exits.clone());
                     self.throwing_call(None, &exit_fn, vec![mgr]);
+                    self.emit_scoped_field_teardown(mgr, mgr_sid, &field_exits);
                 }
                 Cleanup::Finally(block) => {
                     let block = block.clone();
@@ -6064,6 +6148,33 @@ impl<'a> FnLower<'a> {
         self.cleanups = saved;
         self.landing_pads = saved_lps;
         Ok(())
+    }
+
+    /// `@scoped` auto-teardown drop-glue (#876, D-0159): for a `with` manager that
+    /// owns `@scoped` fields, run each field's `__exit__` in **reverse declaration
+    /// order** (last-constructed first), after the owner's own `__exit__`. Each
+    /// call loads the owned field value from the manager and invokes its
+    /// `__exit__`; a throwing teardown routes to the enclosing manager/`try` like
+    /// any other cleanup. A no-op when `field_exits` is empty.
+    fn emit_scoped_field_teardown(
+        &mut self,
+        mgr: Value,
+        mgr_sid: u32,
+        field_exits: &[(u32, u32, String)],
+    ) {
+        for (idx, fsid, exit_fn) in field_exits.iter().rev() {
+            if self.terminated() {
+                break;
+            }
+            let fv = self.new_value(Ty::Struct(*fsid));
+            self.emit(Inst::FieldGet {
+                dest: fv,
+                base: mgr,
+                sid: mgr_sid,
+                idx: *idx,
+            });
+            self.throwing_call(None, exit_fn, vec![fv]);
+        }
     }
 
     // scopes
@@ -8831,6 +8942,11 @@ impl<'a> FnLower<'a> {
             )));
         }
 
+        // `@scoped` owned-field teardown (#876, D-0159): the owner's `__exit__`
+        // runs first, then each owned `@scoped` field's `__exit__` in reverse
+        // declaration order. Empty for every manager that owns no `@scoped` field.
+        let field_exits = self.ctx.scoped_field_exits(sid);
+
         // `NAME = mgr.__enter__()` on entry (result discarded without `as`).
         let entered = self.new_value(enter_ret);
         self.throwing_call(Some(entered), &enter_m, vec![mgr]);
@@ -8847,7 +8963,9 @@ impl<'a> FnLower<'a> {
         self.landing_pads.push(lp);
         self.cleanups.push(Cleanup::WithExit {
             mgr,
+            mgr_sid: sid,
             exit_fn: exit_m.clone(),
+            field_exits: field_exits.clone(),
         });
         self.push_scope();
         self.lower_with_items(items, body, idx + 1)?;
@@ -8855,9 +8973,11 @@ impl<'a> FnLower<'a> {
         self.cleanups.pop();
         self.landing_pads.pop();
 
-        // Normal fall-through: run `__exit__`, continue past the `with`.
+        // Normal fall-through: run `__exit__`, the `@scoped` field drop-glue, then
+        // continue past the `with`.
         if !self.terminated() {
             self.throwing_call(None, &exit_m, vec![mgr]);
+            self.emit_scoped_field_teardown(mgr, sid, &field_exits);
             self.ensure_br(after);
         }
 
@@ -8875,6 +8995,7 @@ impl<'a> FnLower<'a> {
         self.emit(Inst::LandingPad { dest: exc });
         self.emit_end_catch();
         self.throwing_call(None, &exit_m, vec![mgr]);
+        self.emit_scoped_field_teardown(mgr, sid, &field_exits);
         if !self.terminated() {
             self.throwing_call(None, "zap_raise", vec![exc]);
             if !self.terminated() {
