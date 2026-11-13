@@ -1,0 +1,12 @@
+zeros 0.0 0
+ones 5 4.0
+ones_shape 2 2 3 1
+full 28 7
+full_f 4.5
+arange 5 0 8 20
+arange_dflt 10
+arange_f 4 0.0 0.75
+arange_empty 0
+linspace 5 0.0 0.5 1.0
+linspace_one 1
+step error

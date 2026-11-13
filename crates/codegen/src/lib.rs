@@ -2285,6 +2285,26 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_get_f32", &[p.into(), i.into()], Some(f.into()));
         self.declare_rt("zap_array_set_f32", &[p.into(), i.into(), f.into()], None);
         self.declare_rt("zap_array_sum_f32", &[p.into()], Some(f.into()));
+        // Constructors (#504, D-0167): zeros/ones/full fill a `new_nd` result via
+        // `fill_i`/`fill_f` (value as an i64 or f64 ABI word); arange/linspace
+        // allocate and fill a runtime-length 1-D array themselves.
+        self.declare_rt("zap_array_fill_i", &[p.into(), i.into()], None);
+        self.declare_rt("zap_array_fill_f", &[p.into(), f.into()], None);
+        self.declare_rt(
+            "zap_array_arange_i",
+            &[i.into(), i.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_arange_f",
+            &[i.into(), f.into(), f.into(), f.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_linspace",
+            &[i.into(), f.into(), f.into(), i.into()],
+            Some(p.into()),
+        );
 
         // Scalar numeric helpers (ticket #19): integer/float power (`**`) and
         // Python floor division (`//`). The lowering emits plain `Inst::Call`s

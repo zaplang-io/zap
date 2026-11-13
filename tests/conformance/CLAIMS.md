@@ -215,5 +215,6 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | ARR-2 | §15 | numeric array: N-D shape + multi-axis indexing, row views, shape attrs, full reductions (#500, D-0164) | covered | array_nd_contract |
 | ARR-3 | §15 | numeric array: element-wise broadcasting — trailing-dim alignment, size-1 stretch, rank extension; incompatible shapes raise (#501, D-0165) | covered | array_broadcast_contract |
 | ARR-4 | §15 | numeric array: full dtype matrix (f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool) + NEP-50 promotion; per-width wrap (#503/#890, D-0166) | covered | array_dtype_matrix_contract |
+| ARR-5 | §15 | numeric array: constructors zeros/ones/full (int or tuple shape), arange (half-open, zero step raises), linspace (num samples, ends inclusive) (#504, D-0167) | covered | array_constructors_contract |
 | DEC-1 | §16 | `@derive(...)` generates field-by-field code at compile time (D-0036) | TODO | — |
 | DEC-2 | §16 | multiple decorators stack bottom-up | TODO | — |

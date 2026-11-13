@@ -3528,6 +3528,118 @@ int64_t zap_array_sum_bool(void *ap) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Array constructors (#504, D-0167): zeros / ones / full / arange / linspace.
+ * These allocate a fresh contiguous array (`off == 0`) and fill it. The flat
+ * element stores dispatch on dtype; the value crosses the ABI as an int64 word
+ * (integer/bool dtypes, truncated/normalized) or a double (float dtypes). */
+static void arr_store_i(ZapArray *a, int64_t i, int64_t v) {
+    switch (a->dtype) {
+    case DTYPE_BOOL:
+        ((uint8_t *)a->data)[i] = v ? 1 : 0;
+        break;
+    case DTYPE_U8:
+    case DTYPE_I8:
+        ((uint8_t *)a->data)[i] = (uint8_t)v;
+        break;
+    case DTYPE_I16:
+    case DTYPE_U16:
+        ((uint16_t *)a->data)[i] = (uint16_t)v;
+        break;
+    case DTYPE_I32:
+    case DTYPE_U32:
+        ((uint32_t *)a->data)[i] = (uint32_t)v;
+        break;
+    default: /* i64 / u64 */
+        ((uint64_t *)a->data)[i] = (uint64_t)v;
+        break;
+    }
+}
+static void arr_store_f(ZapArray *a, int64_t i, double v) {
+    if (a->dtype == DTYPE_F32) {
+        ((float *)a->data)[i] = (float)v;
+    } else {
+        ((double *)a->data)[i] = v;
+    }
+}
+
+/* zeros/ones/full: fill an already-allocated array with a constant. `_i` takes
+ * the value as an int64 word (integer/bool dtypes), `_f` as a double (floats);
+ * the lowering picks the variant by the dtype's ABI word. */
+void zap_array_fill_i(void *ap, int64_t v) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t n = zap_array_count_of(a);
+    for (int64_t i = 0; i < n; i++) {
+        arr_store_i(a, i, v);
+    }
+}
+void zap_array_fill_f(void *ap, double v) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t n = zap_array_count_of(a);
+    for (int64_t i = 0; i < n; i++) {
+        arr_store_f(a, i, v);
+    }
+}
+
+/* arange: a 1-D array of `start, start+step, ...` stopping before `stop` (the
+ * length is runtime, like NumPy). `_i` for integer dtypes, `_f` for floats.
+ * A zero step raises a catchable ValueError. */
+void *zap_array_arange_i(int64_t dtype, int64_t start, int64_t stop, int64_t step) {
+    if (step == 0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("arange step must be nonzero", 27));
+    }
+    int64_t n = 0;
+    if (step > 0 && stop > start) {
+        n = (stop - start + step - 1) / step;
+    } else if (step < 0 && stop < start) {
+        n = (start - stop + (-step) - 1) / (-step);
+    }
+    ZapArray *a = (ZapArray *)zap_array_new(dtype, n);
+    for (int64_t i = 0; i < n; i++) {
+        arr_store_i(a, i, start + i * step);
+    }
+    return a;
+}
+void *zap_array_arange_f(int64_t dtype, double start, double stop, double step) {
+    if (step == 0.0) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("arange step must be nonzero", 27));
+    }
+    double raw = (stop - start) / step;
+    int64_t n = raw > 0.0 ? (int64_t)ceil(raw) : 0;
+    ZapArray *a = (ZapArray *)zap_array_new(dtype, n);
+    int is_f = (dtype == DTYPE_F32 || dtype == DTYPE_F64);
+    for (int64_t i = 0; i < n; i++) {
+        double v = start + (double)i * step;
+        if (is_f) {
+            arr_store_f(a, i, v);
+        } else {
+            arr_store_i(a, i, (int64_t)v);
+        }
+    }
+    return a;
+}
+
+/* linspace: `num` evenly-spaced samples from `start` to `stop` inclusive of both
+ * ends (NumPy default). `num == 1` yields `[start]`; `num <= 0` an empty array.
+ * The last sample is set to `stop` exactly to avoid floating-point drift. */
+void *zap_array_linspace(int64_t dtype, double start, double stop, int64_t num) {
+    int64_t n = num > 0 ? num : 0;
+    ZapArray *a = (ZapArray *)zap_array_new(dtype, n);
+    int is_f = (dtype == DTYPE_F32 || dtype == DTYPE_F64);
+    double step = n > 1 ? (stop - start) / (double)(n - 1) : 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        double v = (i == n - 1) ? stop : start + (double)i * step;
+        if (is_f) {
+            arr_store_f(a, i, v);
+        } else {
+            arr_store_i(a, i, (int64_t)v);
+        }
+    }
+    return a;
+}
+
+/* ---------------------------------------------------------------------------
  * Exceptions / unwinding (ticket #22, design/RUNTIME-ABI.md §"Exception /
  * unwinding ABI"). Zap uses the platform C++ unwinder: `zap_panic` raises,
  * landing pads catch via the libstdc++ personality (`__gxx_personality_v0` on
