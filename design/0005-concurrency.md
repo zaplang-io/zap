@@ -573,6 +573,15 @@ every swap site raises the no-preempt depth before the state store
 `ZAP_PREEMPT_SLICE_US` (POSIX, 20 µs ≤ value < 1 s) to shorten the 10 ms preemption
 slice when testing these windows.
 
+### Thread-locals across a park (I#891, D-0163)
+
+On aarch64 a thread-local's address is computed once per function, so any thread-local
+read *after* a park reaches the thread the coroutine left. The runtime's coroutine-reachable
+thread-locals (`cur_m`, `zap_self`, `zap_shadow_head`) are therefore private and reached
+only through `noinline` accessors with a volatile asm; a test fails on a new bare
+`__thread`. The Boehm preemption handler additionally preempts only when the interrupted
+PC is in the program's own text, never inside libgc/libc.
+
 ### Boehm: how a running coroutine's stack is scanned (I#885, D-0161)
 
 Boehm scans a stopped thread as `[sp, stack_end)`. An M alternates between its

@@ -8121,7 +8121,9 @@ blocked on, and not modified by, this feature.
 
 ## D-0160 — a coroutine finds its M through its G, never by re-reading the `cur_m` thread-local after a park; the `-O2` runtime default applies on every target (#869)
 
-**Status:** Accepted. **Relates:** D-0157 (#867 — the `-O2` runtime default;
+**Status:** Accepted. **Extended by D-0163 (#891):** the "never hold a thread-local's
+address across a park" rule now holds for EVERY runtime thread-local by construction
+(fresh accessors), not just `g_bootstrap`. **Relates:** D-0157 (#867 — the `-O2` runtime default;
 **amended**: its `x86_64`-only target gate is removed), D-0013/D-0031 and
 `design/0005-concurrency.md` (the M:N scheduler, `ucontext` coroutines), D-0117
 (#223 — lock-free `set_bottom` on the switch path). **Defect report:** I#869
@@ -8402,3 +8404,83 @@ the window before storing state and does not clear it itself) and
 `switch_to_g_ends_the_switch_out_window_after_the_swap`.
 
 **No grammar, runtime-ABI, or language-semantics change.**
+
+## D-0163 — Runtime thread-locals are reached only through fresh accessors; the Boehm preemption handler requires the interrupted PC to be program text (#891, #223)
+
+**Status:** Accepted. **Relates:** D-0160 (#869 — the `g_bootstrap` instance of this
+hazard; **extended**), D-0162 (#888/#889 — the no-preempt windows that this makes
+reliable on aarch64), D-0161, I#223 (the aarch64 multicore GC investigation whose
+32-core re-run found both halves), D-0144/I#159 (generated code already reaches the
+shadow head through `zap_shadow_head_addr()` for the same reason).
+
+**Problem.** A coroutine is resumed on whichever OS thread picks it up. On aarch64 at
+`-O2` the compiler computes a thread-local's *address* (`mrs tpidr_el0` + offset) once
+per function and keeps it in a callee-saved register; `swapcontext` restores that
+register unchanged when the coroutine is resumed on another thread, so any access to the
+thread-local after a park touches the thread the coroutine *left*. D-0160 fixed this for
+`g_bootstrap`; the same hazard was live at every other site:
+- **gc-boehm: the no-preempt bookkeeping.** `chan_block` takes a lock (`zap_np_lock`),
+  parks (`copark`) and afterwards runs more `zap_np_lock/unlock`. The inlined
+  `zap_np_*` read `cur_m->current->no_preempt` through the pre-park thread pointer, so
+  the depth was applied to whatever coroutine was running on the OLD thread; the real
+  one could drop to 0 *inside* a lock or inside libgc, the async-preemption handler
+  switched it away there, and the allocator lock was stranded (I#888's hang, which the
+  guarded layer alone did not cure on aarch64: 105/120 clean, 13 hangs, 2 aborts; the
+  disassembly shows `mrs x21, tpidr_el0` at entry and `add x0, x21, ...` after
+  `bl copark`).
+- **gc-immix: `zap_self`.** `zap_safepoint` starts with a cooperative `copreempt()` and
+  then uses the per-thread mutator node; after migration it marked the node of the
+  thread the coroutine left `PARKED` while its own stayed `ACTIVE`, and a collection
+  waited for it forever (measured on a 32-core aarch64 box: a stale-TLS migration in
+  200/200 `mpsc_coro` runs, hanging ~0.05% of the time).
+x86_64 executables address TLS as `%fs:off` on every access, which is why none of this
+showed there.
+
+**Decision.**
+1. **Fresh accessors, by construction.** The runtime thread-locals that coroutine code
+   can reach — `cur_m`, `zap_self`, `zap_shadow_head` — keep private storage
+   (`zap_cur_m_tls`, `zap_self_tls`, `zap_shadow_head_tls`) and are accessed only through
+   a `noinline` function with a volatile asm (`zap_cur_m_slot`, `zap_self_slot`,
+   `zap_shadow_head_addr`), reached through macros of the original names
+   (`#define cur_m (*zap_cur_m_slot())`), so every use recomputes the thread pointer and
+   neither GCC's nor LLVM's IPA can infer the accessor const/pure and merge calls. The
+   no-preempt counter is read through `zap_np_slot()` (same treatment), and the
+   allocation wrappers read it ONCE per allocation and use the pointer for both ends of
+   the window (no park inside libgc), which keeps the hot path to one call (a naive
+   per-use accessor cost ~10% on a pure-allocation microbenchmark; this one ~3%).
+2. **The Boehm async-preemption handler preempts only when the interrupted PC is inside
+   the program's own text** (`[__executable_start, etext)`, read from the `ucontext`;
+   Linux x86_64/aarch64, always-allow elsewhere; the two bound symbols are WEAK, so a
+   runtime built as a shared object — the REPL `dlopen`s it, which a strong reference
+   would break with "undefined symbol: __executable_start" — falls back to
+   always-allow). libgc, libc, the loader and the vdso
+   are outside: that code holds the allocator lock and other thread-affine state, and a
+   switch there lets the next coroutine on the thread corrupt it. A declined preemption
+   keeps `m->preempt` latched and the monitor re-signals, so fairness waits one tick. The
+   `no_preempt` windows (D-0162) stay the precise guard; this is the catch-all for libc /
+   libgc paths nobody wrapped (the 32-core aarch64 experiment: ~1.5% failures with the
+   check absent, 0/4500 present).
+3. **Walled garden.** A source-contract test enumerates every `__thread` declaration in
+   the runtime and fails on any not on the deliberate list (the three above plus the
+   REPL-only `zap_repl_catch/exc`, which never cross a coroutine switch), and checks each
+   accessor is `noinline`, contains the volatile asm and returns its storage.
+   Companion tests pin `zap_np_slot`/`zap_np_enter`/`zap_np_leave` and the handler's PC
+   gate.
+
+**Alternatives considered.** (a) Mark just `zap_np_*` `noinline` — fixes the
+observed site but leaves `cur_m` and `zap_self` as the next one. (b) A per-function
+audit — what D-0160 did, and it missed these. (c) A compiler flag — none exists for
+GCC/aarch64. (d) Only the PC check — hides the bookkeeping bug on the allocator path
+but leaves non-preempting races (the `zap_self` hang) and the wrong coroutine's depth.
+
+**Tests (written first; red on the previous runtime on aarch64).**
+`runtime_thread_locals_are_reached_only_through_fresh_accessors`,
+`np_bookkeeping_reads_the_thread_local_fresh_on_every_call`,
+`preempt_handler_requires_the_interrupted_pc_to_be_program_text`, plus the existing
+goldens `gc_collect_preempt_stress` and `coroutine_preempt_window_stress`: with D-0162
+alone they failed on aarch64 (~11% of runs for the former); with this decision 150/150
+on aarch64 and x86_64.
+
+**Not addressed here.** Generated code reaches the shadow head through
+`zap_shadow_head_addr()` already; any other thread-local a *compiler-emitted* function
+would use across a safepoint is a codegen matter.

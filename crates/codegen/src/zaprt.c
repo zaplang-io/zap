@@ -341,6 +341,22 @@ extern const ZapTypeDesc zap_desc_atomicarray; /* AtomicArray[T] (#844)         
  * builds (a harmless no-op when no coroutine is running). */
 static void zap_np_enter(void);
 static void zap_np_leave(void);
+/* The current coroutine's no-preempt counter, or NULL off a coroutine (defined in
+ * the scheduler section). A `noinline` call that reads the thread-local FRESH, so
+ * a caller may hold the returned pointer across code that cannot park (a libgc
+ * call) and use it for both ends of a no-preempt window with ONE thread-local read
+ * (I#891: cheaper than two, and immune to a stale thread pointer). */
+static __attribute__((noinline)) int *zap_np_slot(void);
+static inline void zap_np_begin(int *np) {
+    if (np) {
+        ++*np;
+    }
+}
+static inline void zap_np_end(int *np) {
+    if (np && *np > 0) {
+        --*np;
+    }
+}
 
 /* CPU profiler (ticket #78, D-0058). Defined in the profiler section at the end
  * of this file (it needs the scheduler globals and, under gc-immix, the mutator
@@ -412,7 +428,12 @@ void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes);
  * becomes unreachable. `zap_py_wrap` uses it for the CPython-ref DECREF. */
 void zap_gc_register_finalizer(void *payload, void (*fn)(void *obj, void *cd), void *cd);
 int64_t zap_gc_finalizer_selftest(void); /* internal __gc_finalizer_selftest hook */
-extern __thread void *zap_shadow_head;
+/* The per-thread shadow-stack head lives in `zap_shadow_head_tls` (zapgc.inc.c) and
+ * is reached ONLY through the `noinline` accessor, never by a cached thread-local
+ * address, so a coroutine that migrates OS threads at a safepoint cannot touch the
+ * thread it left (I#891; generated code already did, I#159/#568). */
+void **zap_shadow_head_addr(void);
+#define zap_shadow_head (*zap_shadow_head_addr())
 static void zap_enter_blocking(void); /* fwd (defined in zapgc.inc.c)           */
 static void zap_leave_blocking(void);
 static void zap_mutator_register(void);
@@ -472,36 +493,41 @@ void zap_gc_write_barrier(void **slot) { (void)slot; }
  * coroutine preempted just inside `GC_gcollect` hung `gc_switch_alloc_stress`
  * ~7% of runs). */
 static inline void *zap_gc_malloc(size_t n) {
-    zap_np_enter();
+    int *np = zap_np_slot();
+    zap_np_begin(np);
     void *p = GC_MALLOC(n);
-    zap_np_leave();
+    zap_np_end(np);
     return p;
 }
 static inline void *zap_gc_malloc_atomic(size_t n) {
-    zap_np_enter();
+    int *np = zap_np_slot();
+    zap_np_begin(np);
     void *p = GC_MALLOC_ATOMIC(n);
-    zap_np_leave();
+    zap_np_end(np);
     return p;
 }
 static inline void zap_gc_collect_guarded(void) {
-    zap_np_enter();
+    int *np = zap_np_slot();
+    zap_np_begin(np);
     GC_gcollect();
-    zap_np_leave();
+    zap_np_end(np);
 }
 static inline void zap_gc_heap_sizes(size_t *heap, size_t *freeb) {
-    zap_np_enter();
+    int *np = zap_np_slot();
+    zap_np_begin(np);
     *heap = GC_get_heap_size();
     *freeb = GC_get_free_bytes();
-    zap_np_leave();
+    zap_np_end(np);
 }
 /* Finalizers (ticket #92): forward to Boehm's registration so the one call site
  * (`zap_py_wrap`) is backend-uniform. Boehm's default finalizer already provides
  * exactly these semantics (one-shot, run when unreachable, outside the GC). */
 static inline void zap_gc_register_finalizer(void *payload,
                                              void (*fn)(void *obj, void *cd), void *cd) {
-    zap_np_enter();
+    int *np = zap_np_slot();
+    zap_np_begin(np);
     GC_register_finalizer(payload, (GC_finalization_proc)fn, cd, NULL, NULL);
-    zap_np_leave();
+    zap_np_end(np);
 }
 /* ZAP_GC_GUARDED_LAYER_END */
 
@@ -541,21 +567,24 @@ static inline void *zap_ptrbuf(int64_t n) {
  * are plain pthread calls and the window is a harmless no-op bracket. */
 static inline int zap_gc_pthread_create(pthread_t *t, const pthread_attr_t *a,
                                         void *(*fn)(void *), void *arg) {
-    zap_np_enter();
+    int *np = zap_np_slot();
+    zap_np_begin(np);
     int rc = GC_pthread_create(t, a, fn, arg);
-    zap_np_leave();
+    zap_np_end(np);
     return rc;
 }
 static inline int zap_gc_pthread_detach(pthread_t t) {
-    zap_np_enter();
+    int *np = zap_np_slot();
+    zap_np_begin(np);
     int rc = GC_pthread_detach(t);
-    zap_np_leave();
+    zap_np_end(np);
     return rc;
 }
 static inline int zap_gc_pthread_join(pthread_t t, void **rv) {
-    zap_np_enter();
+    int *np = zap_np_slot();
+    zap_np_begin(np);
     int rc = GC_pthread_join(t, rv);
-    zap_np_leave();
+    zap_np_end(np);
     return rc;
 }
 /* ZAP_GC_GUARDED_LAYER_END */
@@ -5367,20 +5396,34 @@ typedef struct Waiter {
 /* ---- scheduler globals ---------------------------------------------------- */
 /* The M running this thread; NULL on main.
  *
- * CONTRACT (I#869, D-0160): never hold `&cur_m` — or any value derived from this
- * thread's TLS base — across a point where the running coroutine can park. A
- * coroutine is resumed on whichever worker thread picks it up, so after any
+ * CONTRACT (I#869, D-0160; enforced for every site by I#891): a thread-local's
+ * ADDRESS must never be held across a point where the running coroutine can park.
+ * A coroutine is resumed on whichever worker thread picks it up, so after any
  * `zap_ctx_swap` / `copark` / `cosched` / call into code that can block, "this
  * thread" is a different OS thread. On aarch64 at -O2 the compiler materialises a
  * thread-local's address (`mrs tpidr_el0` + offset) ONCE per function and keeps it
  * in a callee-saved register, which `swapcontext` restores unchanged on resume: a
- * post-park `cur_m` read then loads the OLD thread's slot. (x86_64 executables
+ * post-park access then reads/writes the OLD thread's slot. (x86_64 executables
  * address TLS as `%fs:off` on every access, so they do not show it; an x86_64
- * -fPIC build can.) The coroutine-side way to find its M after resuming is
- * `g->run_m`, written by `switch_to_g`; the unit tests in zapc_codegen pin that
- * `g_bootstrap` obeys this. Reading `cur_m` ONCE and using it only up to the
- * park (cosched/copark/zap_np_enter..leave) is fine. */
-static __thread M *cur_m = NULL;
+ * -fPIC build can.) `g_bootstrap` hit it first (I#869), then the no-preempt
+ * bookkeeping: `chan_block` parks and afterwards runs the inlined
+ * `zap_np_lock/unlock`, which bumped the depth of whatever coroutine was running
+ * on the OLD thread (I#891) and left the real one preemptible inside a lock or
+ * inside libgc.
+ *
+ * So the storage is private and EVERY access goes through `zap_cur_m_slot()`: a
+ * `noinline` function whose volatile asm keeps both GCC's and LLVM's IPA from
+ * inferring it const/pure and merging calls, so the thread pointer is recomputed on
+ * each use and can never be cached across a park. `cur_m` is a macro for the
+ * dereferenced slot, so reads, writes and `cur_m->field` all read naturally. The
+ * coroutine-side way to find its M after resuming is still `g->run_m`
+ * (`switch_to_g`). */
+static __thread M *zap_cur_m_tls = NULL;
+static __attribute__((noinline)) M **zap_cur_m_slot(void) {
+    __asm__ __volatile__("" ::: "memory");
+    return &zap_cur_m_tls;
+}
+#define cur_m (*zap_cur_m_slot())
 
 static M *g_ms = NULL;
 static P *g_ps = NULL;
@@ -5436,18 +5479,13 @@ static size_t zap_stack_size(void) {
  * so it follows the coroutine across M migrations; the Boehm async-preemption
  * handler only switches when it is 0. A no-op on a native thread (main) or in
  * the scheduler loop (no current coroutine), which are never async-preempted. */
-static void zap_np_enter(void) {
-    M *m = cur_m;
-    if (m && m->current) {
-        m->current->no_preempt++;
-    }
+static __attribute__((noinline)) int *zap_np_slot(void) {
+    __asm__ __volatile__("" ::: "memory"); /* never const/pure: not mergeable across a park (I#891) */
+    M *m = zap_cur_m_tls;                  /* fresh thread-local read on EVERY call */
+    return (m && m->current) ? &m->current->no_preempt : NULL;
 }
-static void zap_np_leave(void) {
-    M *m = cur_m;
-    if (m && m->current && m->current->no_preempt > 0) {
-        m->current->no_preempt--;
-    }
-}
+static void zap_np_enter(void) { zap_np_begin(zap_np_slot()); }
+static void zap_np_leave(void) { zap_np_end(zap_np_slot()); }
 /* Guarded lock/unlock for the runtime critical sections a long, non-parking
  * compute loop can touch (channel fast paths, sync primitives): holding one of
  * these mutexes across an async preemption could deadlock a switched-in sibling
@@ -6137,10 +6175,50 @@ static inline void zap_sp_clear(uint32_t lane) {
 #if defined(ZAP_PLATFORM_POSIX)
 /* SIGURG handler: the preemption point. Installed process-wide; only acts on a
  * worker thread that is currently running a (non-pinned) coroutine. */
+/* I#891 / I#223 defense in depth: is the interrupted instruction inside THIS
+ * program's own text (the Zap-generated code and the runtime, which are linked into
+ * the executable)? If not, the signal landed inside libgc, libc, the dynamic loader
+ * or the vdso — code that may hold the allocator lock or other thread-affine state
+ * (the collector's thread-local free lists, mutexes whose owner is the OS thread),
+ * and switching the coroutine away THERE lets the next coroutine on this thread
+ * corrupt or deadlock on it. A 32-core aarch64 re-run measured the effect: no
+ * preemption unless the PC is in the executable's text took a ~1.5% failure rate to
+ * 0/4500. The no-preempt windows (zap_np_*) are the precise guard; this is the
+ * catch-all for libc/libgc code reached on paths nobody wrapped. A declined
+ * preemption keeps `m->preempt` latched and the monitor re-signals, so fairness only
+ * waits for the next tick. Linux x86_64/aarch64 only; elsewhere it always allows. */
+#ifndef ZAP_GC_IMMIX /* only the Boehm async-preemption branch consults it */
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+/* WEAK: when the runtime is built as a shared object (the REPL `dlopen`s it, and
+ * `-fPIC` builds exist) the linker does not provide `__executable_start`, and a strong
+ * reference would make the load fail ("undefined symbol"). Missing bounds mean we
+ * cannot tell "program text" from "library text", so preemption is simply allowed
+ * (the no-preempt windows remain the precise guard). */
+extern char __executable_start __attribute__((weak));
+extern char etext __attribute__((weak));
+static int zap_pc_in_program_text(void *uc) {
+    if (&__executable_start == NULL || &etext == NULL) {
+        return 1;
+    }
+    ucontext_t *u = (ucontext_t *)uc;
+#if defined(__x86_64__)
+    uintptr_t pc = (uintptr_t)u->uc_mcontext.gregs[16]; /* REG_RIP (needs _GNU_SOURCE by name) */
+#else
+    uintptr_t pc = (uintptr_t)u->uc_mcontext.pc;
+#endif
+    return pc >= (uintptr_t)&__executable_start && pc < (uintptr_t)&etext;
+}
+#else
+static int zap_pc_in_program_text(void *uc) {
+    (void)uc;
+    return 1;
+}
+#endif
+#endif /* !ZAP_GC_IMMIX */
+
 static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
     (void)sig;
     (void)info;
-    (void)uc;
     M *m = cur_m;
     if (!m || !m->current) {
         return; /* main/scheduler/idle thread: nothing to preempt */
@@ -6183,7 +6261,7 @@ static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
         char *sp = &probe;
         char *lo = (char *)g->stack;
         char *hi = lo + g->stack_size;
-        if (sp >= lo && sp < hi && g->no_preempt == 0 &&
+        if (sp >= lo && sp < hi && g->no_preempt == 0 && zap_pc_in_program_text(uc) &&
             !__atomic_load_n(&g_boehm_in_stw, __ATOMIC_SEQ_CST)) {
             __atomic_store_n(&m->preempt, 0, __ATOMIC_RELAXED);
             copreempt();
