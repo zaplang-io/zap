@@ -6642,6 +6642,13 @@ impl Checker {
                     }
                     // Struct construction: `StructName(fields...)`.
                     if self.user_types.contains(fname) {
+                        // Arena (#553, D-0158): reject a statically-known
+                        // `size > cap` at compile time — the arena could never
+                        // satisfy its own initial reservation (ZAP5132). A runtime
+                        // `size`/`cap` is bounds-checked at `arena()` open instead.
+                        if fname == "arena" {
+                            self.check_arena_sizing(args, span);
+                        }
                         for a in args {
                             self.infer(&a.value);
                         }
@@ -6954,6 +6961,44 @@ impl Checker {
             span,
         );
         ArenaElem::Bad
+    }
+
+    /// Reject a statically-known `size > cap` on an `arena(...)` head (#553, D-0158;
+    /// `ZAP5132`). Fires only when BOTH `size` and `cap` fold to compile-time
+    /// integer constants (the common `size=64*1024, cap=1<<20` case); a runtime
+    /// `size`/`cap` cannot be caught here and is bounds-checked at `arena()` open.
+    /// `cap == 0` means unbounded, so it is never a contradiction.
+    fn check_arena_sizing(&mut self, args: &[Arg], span: Span) {
+        let (mut size, mut cap): (Option<i64>, Option<i64>) = (None, None);
+        let mut positional = 0usize;
+        for a in args {
+            let val = arena_const_int(&a.value);
+            match a.name.as_deref() {
+                Some("size") => size = val,
+                Some("cap") => cap = val,
+                Some(_) => {}
+                None => {
+                    if positional == 0 {
+                        size = val;
+                    } else if positional == 1 {
+                        cap = val;
+                    }
+                    positional += 1;
+                }
+            }
+        }
+        if let (Some(s), Some(c)) = (size, cap) {
+            if c > 0 && s > c {
+                self.error(
+                    ErrorCode::ZAP5132,
+                    format!(
+                        "arena size ({s}) exceeds cap ({c}); the arena can never \
+                         satisfy its own initial reservation"
+                    ),
+                    span,
+                );
+            }
+        }
     }
 
     fn check_str_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
@@ -8100,6 +8145,36 @@ fn const_int_lit(e: &Expr) -> Option<i64> {
             expr,
             ..
         } => const_int_lit(expr),
+        _ => None,
+    }
+}
+
+/// Fold an integer constant expression for the arena `size`/`cap` static check
+/// (#553, `ZAP5132`): integer literals, unary `+`/`-`, and the common arithmetic
+/// / bitwise binary operators (`*`, `<<`, `+`, `-`, `/`, `%`, `&`, `|`, `^`,
+/// `>>`) so `64*1024` and `1<<20` fold. Returns `None` for anything not provably
+/// constant (a runtime value), so the static check never fires on a value the
+/// compiler cannot evaluate. Wrapping arithmetic matches the runtime's i64 wrap.
+fn arena_const_int(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Int(..) | Expr::Unary { .. } => const_int_lit(e),
+        Expr::Binary { op, lhs, rhs, .. } => {
+            let a = arena_const_int(lhs)?;
+            let b = arena_const_int(rhs)?;
+            match op {
+                BinOp::Add => Some(a.wrapping_add(b)),
+                BinOp::Sub => Some(a.wrapping_sub(b)),
+                BinOp::Mul => Some(a.wrapping_mul(b)),
+                BinOp::Div | BinOp::FloorDiv => (b != 0).then(|| a.wrapping_div(b)),
+                BinOp::Mod => (b != 0).then(|| a.wrapping_rem(b)),
+                BinOp::BitAnd => Some(a & b),
+                BinOp::BitOr => Some(a | b),
+                BinOp::BitXor => Some(a ^ b),
+                BinOp::Shl => (0..64).contains(&b).then(|| a.wrapping_shl(b as u32)),
+                BinOp::Shr => (0..64).contains(&b).then(|| a.wrapping_shr(b as u32)),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }

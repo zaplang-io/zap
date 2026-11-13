@@ -9068,6 +9068,10 @@ impl<'a> FnLower<'a> {
             func: "zap_arena_open".to_string(),
             args: vec![size, cap],
         });
+        // A NULL open (runtime `size > cap`, or heap OOM reserving the hint) raises
+        // before the block is entered; no arena exists yet to tear down, so this
+        // guard precedes the cleanup/landing-pad setup below.
+        self.arena_oom_guard(handle);
         if let Some(alias) = &items[idx].alias {
             let alias = alias.clone();
             let slot = self.alloca(aty);

@@ -195,6 +195,16 @@ fn arena_codes() {
         "def main():\n    with arena() as a:\n        auto buf = a.alloc(int32, 8)\n",
         "ZAP5130",
     );
+    // A statically-known `size > cap` is a compile error (#553).
+    assert_code(
+        "def main():\n    with arena(size=131072, cap=65536) as a:\n        pass\n",
+        "ZAP5132",
+    );
+    // …including through constant folding of the `1<<20` / `64*1024` idioms.
+    assert_code(
+        "def main():\n    with arena(size=1 << 20, cap=64 * 1024) as a:\n        pass\n",
+        "ZAP5132",
+    );
 
     // --- accept (must NOT trip the arena rules) -------------------------------
     // With-bound leaf byte-buffer alloc, then a plain-call borrow.
@@ -208,6 +218,11 @@ fn arena_codes() {
         "struct Pt:\n    int64 x\n    int64 y\n\
          def main():\n    with arena() as a:\n        auto p = a.new(Pt, 1, 2)\n",
         "ZAP5130",
+    );
+    // A constant `size <= cap` is well-formed (no ZAP5132); `1<<16` <= `1<<20`.
+    assert_no_code(
+        "def main():\n    with arena(size=1 << 16, cap=1 << 20) as a:\n        pass\n",
+        "ZAP5132",
     );
 }
 

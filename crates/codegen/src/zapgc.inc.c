@@ -1792,6 +1792,13 @@ void *zap_arena_open(int64_t size_hint, int64_t cap) {
     a->cur = NULL;
     a->reserved = 0;
     a->cap = cap > 0 ? (size_t)cap : 0;
+    /* A runtime `size > cap` (both set) is a contradiction the arena can never
+     * satisfy (#553, D-0158): fail the open so the generated NULL-check raises. The
+     * static case (constant args) is already a compile error (ZAP5132). */
+    if (cap > 0 && size_hint > 0 && size_hint > cap) {
+        free(a);
+        return NULL;
+    }
     /* Pre-claim regions to honor the size hint (rounded up to the 32 KiB region
      * granularity, at least one region); never past `cap` — if the cap is below a
      * region the first allocation raises MemoryError. */

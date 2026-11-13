@@ -128,6 +128,15 @@ with arena(size=64*1024, cap=1<<20) as a: ...
   Default: unbounded (grow until heap OOM). `cap` is the bounding knob for
   FFI/embedded use and is the hook the #551 C-malloc model uses (over-cap ⇒
   malloc returns NULL ⇒ the C library's own error path fires).
+- **`size > cap` is a contradiction.** When both `size` and `cap` are
+  statically-known constants and `size > cap`, the arena could never satisfy its
+  own initial reservation; this is a **compile error** (`ZAP5132`) rather than a
+  latent runtime failure — a contradiction the compiler can see should not be
+  deferred to run time. The check fires only when both fold to compile-time
+  integer constants (the common `size=64*1024, cap=1<<20` case); a `size`/`cap`
+  computed at run time cannot be caught statically, so that path keeps the runtime
+  guard: `arena()` open fails (raising the exhaustion error) when a runtime
+  `size` exceeds a runtime `cap`.
 - **Growth** is automatic and transparent: when the current region fills,
   `a.alloc` claims another region from the pool and chains it (the arena is a
   *set* of regions; individual objects never straddle a region). A single
@@ -307,6 +316,10 @@ this spec with two refinements worth recording:
   memory error rather than a first-class `MemoryError` — Zap has no `MemoryError`
   type yet. Promoting it to a dedicated `MemoryError` is a small, separable
   language-surface follow-up tracked under the #553 epic.
+
+A statically-known `size > cap` is rejected at compile time (`ZAP5132`,
+`check_arena_sizing`); a runtime `size > cap` fails `arena()` open (NULL →
+exhaustion raise), covered by the `arena_size_cap` golden.
 
 Enforcement lands in sema (`crates/sema/src/scoped.rs` arena-value escape,
 `ZAP5131`; `crates/sema/src/lib.rs` leaf-only, `ZAP5130`), with the runtime region

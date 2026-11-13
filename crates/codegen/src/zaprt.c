@@ -570,6 +570,13 @@ void *zap_arena_open(int64_t size_hint, int64_t cap) {
     }
     a->reserved = 0;
     a->cap = cap > 0 ? (size_t)cap : 0;
+    /* A runtime `size > cap` (both set) can never be satisfied (#553, D-0158):
+     * fail the open so the generated NULL-check raises. The constant case is a
+     * compile error (ZAP5132). */
+    if (cap > 0 && size_hint > 0 && size_hint > cap) {
+        free(a);
+        return NULL;
+    }
     return a;
 }
 

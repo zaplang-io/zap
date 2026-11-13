@@ -763,6 +763,14 @@ define_codes! {
          a compile error — the arena's backing memory is freed at block exit, so \
          there is no safe heap fallback. Passing it to a C `extern` for the call's \
          duration is a permitted borrow. Keep the value within its arena's block.";
+    ZAP5132 = 5132 : "arena size exceeds cap",
+        "An `arena(size=…, cap=…)` is opened with a statically-known `size` greater \
+         than its `cap` (#553, D-0158) — the arena could never satisfy its own \
+         initial reservation, so it is a contradiction the compiler rejects rather \
+         than letting it become a latent runtime `MemoryError`. Lower `size`, raise \
+         `cap`, or drop one of them. (This static check fires only when both \
+         arguments are compile-time constants; a `size`/`cap` computed at runtime is \
+         still bounds-checked at `arena()` open.)";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",
