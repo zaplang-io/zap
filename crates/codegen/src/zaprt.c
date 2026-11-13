@@ -3373,7 +3373,11 @@ void *zap_array_broadcast_new(void *ap, void *bp, int64_t out_dtype) {
     for (int64_t k = 0; k < r; k++) {
         int64_t da = zap_array_bcast_dim(a, r, k);
         int64_t db = zap_array_bcast_dim(b, r, k);
-        dims[k] = da > db ? da : db;
+        /* A size-1 axis stretches to the OTHER dim — which may be 0, so the
+         * result is `da==1 ? db : da`, not `max(da, db)` (a `(0,)`/`(1,)` pair
+         * broadcasts to an empty result, never a 1-element read of an empty
+         * buffer). Compatibility (`da==db || da==1 || db==1`) is already checked. */
+        dims[k] = (da == 1) ? db : da;
         total *= dims[k];
     }
     size_t esz = zap_array_elem_size(out_dtype);

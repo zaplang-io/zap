@@ -23,12 +23,15 @@ def main():
     auto none = a[4:2]
     print("empty view", len(none), sum(none))
     try:
-        auto mismatch = a + array[i64]([1])
+        # (5,) + (3,) is not broadcast-compatible (neither is 1), so it raises
+        # even under #501 broadcasting; a length-1 operand would instead stretch.
+        auto mismatch = a + array[i64]([1, 2, 3])
         print("wrong length", sum(mismatch))
     except ValueError as e:
         print("shape error", e)
     try:
-        auto mismatch = empty * array[f64]([1.0])
+        # (0,) + (2,) is incompatible; a length-1 operand would stretch to empty.
+        auto mismatch = empty * array[f64]([1.0, 2.0])
         print(sum(mismatch))
     except ValueError:
         print("empty shape error")
