@@ -217,12 +217,23 @@ allocation, not a header plus a separate data buffer:
   default, both a plain `V` with no `Optional` wrapper. It needs no `Optional$V`
   instance — the value kind suffices — so monomorphization marks the symbol
   `get_default` for lowering to take the select-value-or-default path.
-- `array[T]` (#24, #49, #476): `[ header | dtype | ndim | dims: *i64 |
-  data: *T | off: i64 ]`. The current layout is 1-D (`ndim = 1`); it has no
-  strides. Contiguous views share the buffer base and retain an element offset
-  in `off`; `zap_array_data` returns the window start for SIMD kernels.
-  `zap_array_check_shape(lhs, rhs)` checks equal lengths and raises `ValueError`
-  before a binary kernel reads its buffers. `dtype` tags the
+- `array[T]` (#24, #49, #476, #500): `[ header | dtype | ndim | dims: *i64 |
+  data: *T | off: i64 ]`. `ndim` is the row-major rank (`>= 1`) and `dims`
+  points at `ndim` per-axis lengths whose product is the element count; the
+  buffer is still contiguous and has no strides. A nested literal builds an N-D
+  array via `zap_array_new_nd(dtype, ndim, total)` + one `zap_array_set_dim`
+  per axis; `zap_array_count`/`zap_array_ndim`/`zap_array_dim` back `a.size`/
+  `a.ndim`/`a.shape`. A partial index `m[i]` is a rank-(n-1) **view**
+  (`zap_array_row`): it shares the buffer base and advances `off` by one
+  row-stride, copying `dims[1..]` into a fresh (non-interior) buffer; a full
+  index `m[i, j]` folds rows to a rank-1 view then a 1-D get. Contiguous 1-D
+  views share the buffer base and retain an element offset in `off`;
+  `zap_array_data` returns the window start for SIMD kernels, and
+  `zap_array_new_like(src, out_dtype)` allocates an element-wise result sharing
+  the operand shape. `zap_array_check_shape(lhs, rhs)` checks equal `ndim` and
+  equal `dims` on every axis and raises `ValueError` before a binary kernel
+  reads its buffers (strided views, N-D array slicing, and cross-shape
+  broadcasting are follow-ups, #502/#501). `dtype` tags the
   element type — `0 = f64`, `1 = i64` (8-byte words), `2 = uint8`, `3 = bool`
   (1-byte words). `zap_array_new(dtype, len)` sizes the buffer by dtype; `uint8`
   /`bool` cross the typed get/set/sum entry points as `i64` words (get

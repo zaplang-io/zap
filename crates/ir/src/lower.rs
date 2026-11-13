@@ -2017,7 +2017,10 @@ fn resolve_ty(t: &ast::Type, env: &TyEnv) -> Result<Ty, LowerError> {
                     Some(a) => dtype_of(a, env)?,
                     None => Dtype::F64,
                 };
-                Ok(Ty::Array(d))
+                // A bare `array[T]` annotation denotes a rank-1 array (#500);
+                // N-D values arise through inference. Explicit N-D annotation
+                // syntax is a documented follow-up.
+                Ok(Ty::Array(d, 1))
             }
             "dict" => {
                 let k = match args.first() {
@@ -2280,6 +2283,50 @@ fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
     }
 }
 
+/// Validate one subtree of an N-D array literal against the remaining `shape`
+/// (the dims below this level, row-major) and append its scalar leaves to `flat`
+/// in row-major order (#500). An empty `shape` means this node must be a scalar
+/// leaf; otherwise it must be a nested list of exactly `shape[0]` children, each
+/// recursively matching `shape[1..]`. Any departure is a *ragged* (non-
+/// rectangular / inconsistently nested) literal and is rejected at compile time,
+/// since a dense `array` has one fixed shape.
+fn flatten_array_literal<'e>(
+    e: &'e ast::Expr,
+    shape: &[i64],
+    flat: &mut Vec<&'e ast::Expr>,
+) -> Result<(), LowerError> {
+    match shape.split_first() {
+        None => {
+            if matches!(e, ast::Expr::List(..)) {
+                return Err(err(
+                    "ragged array literal: a row is nested deeper than the array's shape \
+                     (every row must nest to the same depth)",
+                ));
+            }
+            flat.push(e);
+            Ok(())
+        }
+        Some((&want, rest)) => {
+            let ast::Expr::List(elems, _) = e else {
+                return Err(err(format!(
+                    "ragged array literal: expected a nested list of {want} elements, \
+                     found a scalar (every row must nest to the same depth)"
+                )));
+            };
+            if elems.len() as i64 != want {
+                return Err(err(format!(
+                    "ragged array literal: expected {want} elements in this row, found {}",
+                    elems.len()
+                )));
+            }
+            for c in elems {
+                flatten_array_literal(c, rest, flat)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// The channel element kind named by a construction subscript like
 /// `channel[int64]`, where the element type appears as a bare name in
 /// expression position (ticket #25, D-0031). Integers/bools become an `i64`
@@ -2330,7 +2377,7 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
         Ty::List(_) | Ty::Dict(..) | Ty::Set(_) | Ty::Heap(_) | Ty::Chan(_) | Ty::AtomicArray(_) => {
             Ok(Elem::Nested(nested.borrow_mut().intern(t)))
         }
-        Ty::Ptr | Ty::Bytes | Ty::Array(_) | Ty::Match | Ty::Func(_) | Ty::Py => Ok(Elem::Ptr),
+        Ty::Ptr | Ty::Bytes | Ty::Array(..) | Ty::Match | Ty::Func(_) | Ty::Py => Ok(Elem::Ptr),
         Ty::Bigint | Ty::Complex => Err(err(
             "collections of bigint or complex values are not supported yet",
         )),
@@ -11291,7 +11338,7 @@ impl<'a> FnLower<'a> {
             }
             Expr::Unary { op, expr, .. } => {
                 let (v, t) = self.expr(expr)?;
-                if matches!(t, Ty::Array(_)) && matches!(op, AstUn::Neg | AstUn::BitNot) {
+                if matches!(t, Ty::Array(..)) && matches!(op, AstUn::Neg | AstUn::BitNot) {
                     return Err(err("element-wise unary array operations are unsupported"));
                 }
                 // Unary operator overloading on user structs (D-0047): `-a` ->
@@ -11619,8 +11666,8 @@ impl<'a> FnLower<'a> {
                     }
                 }
                 let (bv, bty) = self.expr(base)?;
-                if matches!(bty, Ty::Array(_)) {
-                    return Err(err(format!("array attribute '{name}' is unsupported; arrays are one-dimensional and expose length via len(a)")));
+                if let Ty::Array(_, ndim) = bty {
+                    return self.lower_array_attr(bv, ndim, name);
                 }
                 // Attribute read on a Python handle, e.g. `np.pi` (ticket #27,
                 // D-0012). A call `np.foo(...)` is intercepted in `call` before
@@ -11954,7 +12001,7 @@ impl<'a> FnLower<'a> {
                 }
                 let (v, vt) = self.expr(&args[0].value)?;
                 // An `array[T]` sums through its dedicated runtime reduction.
-                if let Ty::Array(d) = vt {
+                if let Ty::Array(d, _) = vt {
                     let dest = self.new_value(d.ty());
                     self.emit(Inst::Call {
                         dest: Some(dest),
@@ -12227,7 +12274,7 @@ impl<'a> FnLower<'a> {
                     Ty::Dict(..) => "zap_dict_len",
                     Ty::Set(_) => "zap_set_len",
                     Ty::Heap(_) => "zap_heap_len",
-                    Ty::Array(_) => "zap_array_len",
+                    Ty::Array(..) => "zap_array_len",
                     // `len(str)` is the Unicode **codepoint** count (D-0025,
                     // #284/#374/B6), consistent with codepoint indexing/slicing/
                     // iteration — so `len("héllo") == 5`, not the byte length.
@@ -14563,9 +14610,13 @@ impl<'a> FnLower<'a> {
     // (like collections). Only the element-wise ops (`binop`) use a dedicated
     // ZIR node so codegen can emit SIMD; everything else stays a plain call.
 
-    /// `array[dtype]([e0, e1, ...])` — allocate an array of the literal's length
-    /// and fill it element-by-element. N-D literals, non-literal arguments
-    /// (`array[f64](xs)`), and `zeros`/`arange` constructors are deferred.
+    /// `array[dtype]([...])` — allocate an array from a list literal and fill it
+    /// element-by-element in row-major order. A flat literal builds a 1-D array;
+    /// a **nested rectangular** literal builds an N-D array whose static rank is
+    /// the nesting depth and whose shape is the per-level length (`[[1, 2],
+    /// [3, 4]]` -> shape `(2, 2)`, #500). Ragged (non-rectangular) literals are
+    /// rejected. Non-literal arguments (`array[f64](xs)`) and `zeros`/`arange`
+    /// constructors remain deferred (#504).
     fn lower_array_new(
         &mut self,
         dtype_expr: &Expr,
@@ -14576,28 +14627,74 @@ impl<'a> FnLower<'a> {
         };
         let dtype = dtype_from_name(dname)?;
         if args.len() != 1 || args[0].name.is_some() {
-            return Err(err("array[T](...) takes one positional flat list literal"));
+            return Err(err("array[T](...) takes one positional list literal"));
         }
         let Expr::List(elems, _) = &args[0].value else {
             return Err(err(
                 "array[T](...) takes a list literal, e.g. array[f64]([1.0, 2.0, 3.0]) \
-                 (N-D and non-literal construction are not supported yet)",
+                 or a nested one array[f64]([[1.0, 2.0], [3.0, 4.0]]) \
+                 (non-literal construction is not supported yet)",
             ));
         };
+
+        // The shape is read by descending into the first child while it is a
+        // list; `flatten_array_literal` then validates every other row against
+        // that shape and collects the scalar leaves in row-major order.
+        let mut shape: Vec<i64> = vec![elems.len() as i64];
+        {
+            let mut cur = elems;
+            while let Some(Expr::List(inner, _)) = cur.first() {
+                shape.push(inner.len() as i64);
+                cur = inner;
+            }
+        }
+        if shape.len() > u8::MAX as usize {
+            return Err(err("array rank (nesting depth) is too large"));
+        }
+        let ndim = shape.len() as u8;
+        let mut flat: Vec<&Expr> = Vec::new();
+        for c in elems {
+            flatten_array_literal(c, &shape[1..], &mut flat)?;
+        }
+        let ty = Ty::Array(dtype, ndim);
+
         let code = self.iconst(Ty::I64, dtype.code());
-        let n = self.iconst(Ty::I64, elems.len() as i64);
-        let arr = self.new_value(Ty::Array(dtype));
-        self.emit(Inst::Call {
-            dest: Some(arr),
-            func: "zap_array_new".to_string(),
-            args: vec![code, n],
-        });
+        let arr = self.new_value(ty);
+        if ndim == 1 {
+            // 1-D: the historical single-dim construction (unchanged IR shape).
+            let n = self.iconst(Ty::I64, shape[0]);
+            self.emit(Inst::Call {
+                dest: Some(arr),
+                func: "zap_array_new".to_string(),
+                args: vec![code, n],
+            });
+        } else {
+            // N-D: allocate the rank-`ndim` header + total-element buffer, then
+            // write each axis length before filling the flat elements.
+            let total: i64 = shape.iter().product();
+            let ndim_v = self.iconst(Ty::I64, ndim as i64);
+            let total_v = self.iconst(Ty::I64, total);
+            self.emit(Inst::Call {
+                dest: Some(arr),
+                func: "zap_array_new_nd".to_string(),
+                args: vec![code, ndim_v, total_v],
+            });
+            for (axis, dim) in shape.iter().enumerate() {
+                let ax = self.iconst(Ty::I64, axis as i64);
+                let dv = self.iconst(Ty::I64, *dim);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_array_set_dim".to_string(),
+                    args: vec![arr, ax, dv],
+                });
+            }
+        }
         let setter = format!("zap_array_set_{}", dtype.suffix());
-        for (i, e) in elems.iter().enumerate() {
+        for (i, e) in flat.iter().enumerate() {
             let (v, vt) = self.expr(e)?;
             if vt.int_width().is_none() && !vt.is_float() {
                 return Err(err(
-                    "array construction requires numeric scalars in one flat list literal",
+                    "array construction requires numeric scalars in a (possibly nested) list literal",
                 ));
             }
             let v = self.coerce(v, vt, dtype.ty());
@@ -14608,7 +14705,174 @@ impl<'a> FnLower<'a> {
                 args: vec![arr, idx, v],
             });
         }
-        Ok((arr, Ty::Array(dtype)))
+        Ok((arr, ty))
+    }
+
+    /// Evaluate the axis indices of an array subscript. `m[i, j]` arrives as an
+    /// `Expr::Tuple`; `a[i]` as a single expression. Each index must be an
+    /// integer — a slice inside a multi-axis index (`m[:, 1]`) is a #502
+    /// follow-up. Returns one `i64` index value per axis supplied.
+    fn array_axis_indices(&mut self, index: &Expr) -> Result<Vec<Value>, LowerError> {
+        let parts: Vec<&Expr> = match index {
+            Expr::Tuple(elems, _) => elems.iter().collect(),
+            other => vec![other],
+        };
+        let mut out = Vec::with_capacity(parts.len());
+        for p in parts {
+            if matches!(p, Expr::Slice { .. }) {
+                return Err(err(
+                    "a slice inside a multi-axis array index is not supported yet (#502); \
+                     use integer indices",
+                ));
+            }
+            let (iv, it) = self.expr(p)?;
+            if it.int_width().is_none() {
+                return Err(err("array indices must be integers"));
+            }
+            out.push(self.coerce_index(iv, it));
+        }
+        if out.is_empty() {
+            return Err(err("an array index requires at least one integer index"));
+        }
+        Ok(out)
+    }
+
+    /// Fold a sequence of leading axis indices into successive **row views**
+    /// (`zap_array_row`), each reducing the rank by one (#500). Returns the final
+    /// (lower-rank) array value; an empty `idxs` returns `arr` unchanged.
+    fn array_fold_rows(&mut self, arr: Value, d: Dtype, ndim: u8, idxs: &[Value]) -> Value {
+        let mut cur = arr;
+        let mut rank = ndim;
+        for &i in idxs {
+            rank -= 1;
+            let v = self.new_value(Ty::Array(d, rank));
+            self.emit(Inst::Call {
+                dest: Some(v),
+                func: "zap_array_row".to_string(),
+                args: vec![cur, i],
+            });
+            cur = v;
+        }
+        cur
+    }
+
+    /// Lower an N-D array subscript **get** `m[i, j, ...]`. A full index (one per
+    /// axis) names a scalar element; a partial index (fewer than `ndim`) yields a
+    /// rank-reduced **view** (#500). Too many indices is an error.
+    fn lower_array_index_get(
+        &mut self,
+        arr: Value,
+        d: Dtype,
+        ndim: u8,
+        index: &Expr,
+    ) -> Result<(Value, Ty), LowerError> {
+        let idxs = self.array_axis_indices(index)?;
+        let k = idxs.len();
+        let n = ndim as usize;
+        if k > n {
+            return Err(err(format!(
+                "too many indices for a {n}-dimensional array ({k} given)"
+            )));
+        }
+        if k == n {
+            // Fold all but the final axis to a rank-1 view, then a 1-D get.
+            let view = self.array_fold_rows(arr, d, ndim, &idxs[..k - 1]);
+            let last = idxs[k - 1];
+            let dest = self.new_value(d.ty());
+            self.emit(Inst::Call {
+                dest: Some(dest),
+                func: format!("zap_array_get_{}", d.suffix()),
+                args: vec![view, last],
+            });
+            Ok((dest, d.ty()))
+        } else {
+            // Partial index -> a rank-(ndim - k) view.
+            let view = self.array_fold_rows(arr, d, ndim, &idxs);
+            Ok((view, Ty::Array(d, ndim - k as u8)))
+        }
+    }
+
+    /// Resolve an N-D array subscript to the (rank-1 view, final index) naming a
+    /// single scalar slot, for `m[i, j] = v` / augmented assignment. The index is
+    /// evaluated exactly once. Only a full index names a slot; assigning a partial
+    /// index (a whole-row store) is a documented follow-up (#501/#511).
+    fn array_scalar_slot(
+        &mut self,
+        arr: Value,
+        d: Dtype,
+        ndim: u8,
+        index: &Expr,
+    ) -> Result<(Value, Value), LowerError> {
+        let idxs = self.array_axis_indices(index)?;
+        let k = idxs.len();
+        let n = ndim as usize;
+        if k > n {
+            return Err(err(format!(
+                "too many indices for a {n}-dimensional array ({k} given)"
+            )));
+        }
+        if k < n {
+            return Err(err(format!(
+                "assigning to a partial index of a {n}-dimensional array (a whole-row store) \
+                 is not supported yet; index all {n} axes"
+            )));
+        }
+        let view = self.array_fold_rows(arr, d, ndim, &idxs[..k - 1]);
+        Ok((view, idxs[k - 1]))
+    }
+
+    /// Lower an array attribute read (#500): `a.ndim` (the static rank, a
+    /// compile-time constant), `a.size` (total element count across all axes),
+    /// and `a.shape` (a fixed-arity `tuple` of the per-axis lengths, one `int64`
+    /// per axis read from the runtime `dims`). `len(a)` still gives the first
+    /// axis; other attribute names are rejected with a pointer to these.
+    fn lower_array_attr(
+        &mut self,
+        arr: Value,
+        ndim: u8,
+        name: &str,
+    ) -> Result<(Value, Ty), LowerError> {
+        match name {
+            "ndim" => Ok((self.iconst(Ty::I64, ndim as i64), Ty::I64)),
+            "size" => {
+                let dest = self.new_value(Ty::I64);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_array_count".to_string(),
+                    args: vec![arr],
+                });
+                Ok((dest, Ty::I64))
+            }
+            "shape" => {
+                // A statically rank-`ndim` array has a fixed-arity shape tuple;
+                // build it as a `tuple[int64; ndim]` from per-axis `zap_array_dim`
+                // reads. (Rank 1 still yields a one-element tuple, matching NumPy.)
+                let tys = vec![Ty::I64; ndim as usize];
+                let sid = self.ctx.tuples.borrow_mut().intern(tys);
+                let dest = self.new_value(Ty::Struct(sid));
+                self.emit(Inst::StructNew { dest, sid });
+                for axis in 0..ndim {
+                    let ax = self.iconst(Ty::I64, axis as i64);
+                    let dim = self.new_value(Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(dim),
+                        func: "zap_array_dim".to_string(),
+                        args: vec![arr, ax],
+                    });
+                    self.emit(Inst::FieldSet {
+                        base: dest,
+                        sid,
+                        idx: axis as u32,
+                        val: dim,
+                    });
+                }
+                Ok((dest, Ty::Struct(sid)))
+            }
+            other => Err(err(format!(
+                "array attribute '{other}' is unsupported; arrays expose '.shape', \
+                 '.ndim', '.size', and len(a) for the first axis"
+            ))),
+        }
     }
 
     /// Lower channel construction `channel[T]()` (unbuffered) or
@@ -15884,20 +16148,10 @@ impl<'a> FnLower<'a> {
                 );
                 Ok((d, vty))
             }
-            Ty::Array(d) => {
-                // One-dimensional access; reject multi-axis indices before coercion.
-                let (iv, it) = self.expr(index)?;
-                if it.int_width().is_none() {
-                    return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
-                }
-                let iv = self.coerce_index(iv, it);
-                let dest = self.new_value(d.ty());
-                self.emit(Inst::Call {
-                    dest: Some(dest),
-                    func: format!("zap_array_get_{}", d.suffix()),
-                    args: vec![bv, iv],
-                });
-                Ok((dest, d.ty()))
+            Ty::Array(d, ndim) => {
+                // N-D indexing (#500): a full index -> scalar, a partial index ->
+                // a rank-reduced view. `m[i, j]` arrives as an `Expr::Tuple`.
+                self.lower_array_index_get(bv, d, ndim, index)
             }
             Ty::Struct(sid) => {
                 // Indexing overloading (D-0047): `a[i]` -> `a.__getitem__(i)`.
@@ -16001,7 +16255,16 @@ impl<'a> FnLower<'a> {
             // contiguous, so only an absent or literal-`1` step is supported; a
             // strided view would need strides the 1-D array has not got (a
             // documented D-0030 follow-up).
-            Ty::Array(dt) => {
+            Ty::Array(dt, ndim) => {
+                // A 1-D contiguous slice is a view (D-0030). Slicing an N-D array
+                // (an axis-0 window keeping rank) needs per-axis strides this
+                // header does not carry yet, so it is a #502 follow-up.
+                if ndim != 1 {
+                    return Err(err(
+                        "slicing an N-D array is not supported yet (#502); index axes with \
+                         integers (m[i]) to reach a row view",
+                    ));
+                }
                 if let Some(s) = step {
                     if const_int_value(s) != Some(1) {
                         return Err(err(
@@ -16012,7 +16275,7 @@ impl<'a> FnLower<'a> {
                 }
                 let (lo_v, has_lo) = self.array_slice_bound(lo)?;
                 let (hi_v, has_hi) = self.array_slice_bound(hi)?;
-                let out = Ty::Array(dt);
+                let out = Ty::Array(dt, ndim);
                 let d = self.new_value(out);
                 self.emit(Inst::Call {
                     dest: Some(d),
@@ -16181,12 +16444,8 @@ impl<'a> FnLower<'a> {
                 );
                 Ok(())
             }
-            Ty::Array(d) => {
-                let (iv, it) = self.expr(index)?;
-                if it.int_width().is_none() {
-                    return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
-                }
-                let iv = self.coerce_index(iv, it);
+            Ty::Array(d, ndim) => {
+                let (view, last) = self.array_scalar_slot(bv, d, ndim, index)?;
                 let (v, vt) = self.expr(value)?;
                 if vt.int_width().is_none() && !vt.is_float() {
                     return Err(err("array element assignment requires a numeric scalar"));
@@ -16195,7 +16454,7 @@ impl<'a> FnLower<'a> {
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_array_set_{}", d.suffix()),
-                    args: vec![bv, iv, v],
+                    args: vec![view, last, v],
                 });
                 Ok(())
             }
@@ -16311,17 +16570,15 @@ impl<'a> FnLower<'a> {
                 });
                 Ok(())
             }
-            Ty::Array(d) => {
-                let (iv, it) = self.expr(index)?;
-                if it.int_width().is_none() {
-                    return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
-                }
-                let iv = self.coerce_index(iv, it);
+            Ty::Array(d, ndim) => {
+                // The index (and any row folds) is resolved once to a scalar
+                // slot, then read-modified-written through that rank-1 view.
+                let (view, last) = self.array_scalar_slot(bv, d, ndim, index)?;
                 let cur = self.new_value(d.ty());
                 self.emit(Inst::Call {
                     dest: Some(cur),
                     func: format!("zap_array_get_{}", d.suffix()),
-                    args: vec![bv, iv],
+                    args: vec![view, last],
                 });
                 let (rhs, rt) = self.expr(value)?;
                 let (res, rty) = self.aug_combine(op, cur, d.ty(), rhs, rt)?;
@@ -16332,7 +16589,7 @@ impl<'a> FnLower<'a> {
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_array_set_{}", d.suffix()),
-                    args: vec![bv, iv, res],
+                    args: vec![view, last, res],
                 });
                 Ok(())
             }
@@ -16484,12 +16741,8 @@ impl<'a> FnLower<'a> {
                 );
                 Ok(())
             }
-            Ty::Array(d) => {
-                let (iv, it) = self.expr(index)?;
-                if it.int_width().is_none() {
-                    return Err(err("array indexing requires one integer index; multi-axis indexing is unsupported"));
-                }
-                let iv = self.coerce_index(iv, it);
+            Ty::Array(d, ndim) => {
+                let (view, last) = self.array_scalar_slot(bv, d, ndim, index)?;
                 if vt.int_width().is_none() && !vt.is_float() {
                     return Err(err("array element assignment requires a numeric scalar"));
                 }
@@ -16497,7 +16750,7 @@ impl<'a> FnLower<'a> {
                 self.emit(Inst::Call {
                     dest: None,
                     func: format!("zap_array_set_{}", d.suffix()),
-                    args: vec![bv, iv, v],
+                    args: vec![view, last, v],
                 });
                 Ok(())
             }
@@ -18833,7 +19086,7 @@ impl<'a> FnLower<'a> {
 
         // Element-wise numeric-array ops (ticket #24): same-shape `a + b` and
         // scalar broadcast `a + 2.0`, lowered to a SIMD kernel in codegen.
-        if matches!(lt, Ty::Array(_)) || matches!(rt, Ty::Array(_)) {
+        if matches!(lt, Ty::Array(..)) || matches!(rt, Ty::Array(..)) {
             return self.array_binop(op, l, lt, r, rt);
         }
 
@@ -19602,10 +19855,19 @@ impl<'a> FnLower<'a> {
         };
         let is_scalar = |t: Ty| t.is_float() || t.int_width().is_some();
         match (lt, rt) {
-            (Ty::Array(ld), Ty::Array(rd)) => {
+            (Ty::Array(ld, lnd), Ty::Array(rd, rnd)) => {
+                // Element-wise ops require equal rank (#500); a full-shape check
+                // at runtime catches unequal dims. Broadcasting across unequal
+                // ranks/shapes is a #501 follow-up.
+                if lnd != rnd {
+                    return Err(err(format!(
+                        "element-wise op on arrays of different rank ({lnd}-D vs {rnd}-D); \
+                         cross-rank broadcasting is a follow-up (#501)"
+                    )));
+                }
                 self.throwing_call(None, "zap_array_check_shape", vec![l, r]);
                 let out = Dtype::promote(ld, rd);
-                let dest = self.new_value(Ty::Array(out));
+                let dest = self.new_value(Ty::Array(out, lnd));
                 self.emit(Inst::ArrayBinOp {
                     dest,
                     op: irop,
@@ -19616,9 +19878,9 @@ impl<'a> FnLower<'a> {
                     rhs_dtype: rd,
                     scalar: false,
                 });
-                Ok((dest, Ty::Array(out)))
+                Ok((dest, Ty::Array(out, lnd)))
             }
-            (Ty::Array(ld), _) if is_scalar(rt) => {
+            (Ty::Array(ld, lnd), _) if is_scalar(rt) => {
                 // Weak scalar (NEP 50): an int scalar keeps the array's dtype,
                 // a float scalar forces `f64`. The scalar crosses to codegen as
                 // its natural `i64`/`f64` word (`rhs_dtype`); codegen converts
@@ -19631,7 +19893,7 @@ impl<'a> FnLower<'a> {
                 };
                 let s = self.coerce(r, rt, sdt.ty());
                 let out = Dtype::promote_scalar(ld, scalar_is_float);
-                let dest = self.new_value(Ty::Array(out));
+                let dest = self.new_value(Ty::Array(out, lnd));
                 self.emit(Inst::ArrayBinOp {
                     dest,
                     op: irop,
@@ -19642,9 +19904,9 @@ impl<'a> FnLower<'a> {
                     rhs_dtype: sdt,
                     scalar: true,
                 });
-                Ok((dest, Ty::Array(out)))
+                Ok((dest, Ty::Array(out, lnd)))
             }
-            (_, Ty::Array(rd)) if is_scalar(lt) => {
+            (_, Ty::Array(rd, rnd)) if is_scalar(lt) => {
                 if !matches!(op, Add | Mul) {
                     return Err(err(
                         "scalar-on-the-left broadcast is only supported for + and * (write `a - scalar`, not `scalar - a`)",
@@ -19658,7 +19920,7 @@ impl<'a> FnLower<'a> {
                 };
                 let s = self.coerce(l, lt, sdt.ty());
                 let out = Dtype::promote_scalar(rd, scalar_is_float);
-                let dest = self.new_value(Ty::Array(out));
+                let dest = self.new_value(Ty::Array(out, rnd));
                 self.emit(Inst::ArrayBinOp {
                     dest,
                     op: irop,
@@ -19669,7 +19931,7 @@ impl<'a> FnLower<'a> {
                     rhs_dtype: sdt,
                     scalar: true,
                 });
-                Ok((dest, Ty::Array(out)))
+                Ok((dest, Ty::Array(out, rnd)))
             }
             _ => Err(err(
                 "unsupported array operand (element-wise ops take two arrays or an array and a numeric scalar)",
@@ -20045,7 +20307,7 @@ impl<'a> FnLower<'a> {
             Ty::Dict(..) => Some("zap_dict_len"),
             Ty::Set(_) => Some("zap_set_len"),
             Ty::Heap(_) => Some("zap_heap_len"),
-            Ty::Array(_) => Some("zap_array_len"),
+            Ty::Array(..) => Some("zap_array_len"),
             _ => None,
         };
         if let Some(len_fn) = len_fn {
@@ -20774,5 +21036,231 @@ mod float_collection_tests {
         lower_fails("def main():\n    dict[str, f32] d = {}\n");
         lower_fails("def main():\n    heap[f32] h = heap[f32]()\n");
         lower_fails("def main():\n    channel[f32] c = channel[f32]()\n");
+    }
+}
+
+#[cfg(test)]
+mod nd_array_tests {
+    //! N-D numeric arrays: shape + multi-axis indexing (#500, D-0164). These run
+    //! on the host (no LLVM): they exercise AST->ZIR lowering directly, so the
+    //! shape/rank typing and the row-fold indexing lowering are a walled garden.
+    //! Construction, full/partial indexing, `.shape`/`.ndim`/`.size`, assignment,
+    //! element-wise ops, and reductions must lower cleanly; ragged literals, rank
+    //! mismatches, over-indexing, N-D slices, and whole-row stores must be
+    //! rejected with a lowering diagnostic.
+    use super::lower_module;
+    use zapc_ir_core::Inst;
+
+    fn lower_errs(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty(), "parse errors in test source: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors in test source: {lerrs:?}");
+        let (_m, errs) = lower_module(&module);
+        errs.into_iter().map(|e| format!("{e:?}")).collect()
+    }
+
+    fn lowers_ok(src: &str) {
+        let errs = lower_errs(src);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+    }
+
+    fn lower_fails(src: &str) {
+        let errs = lower_errs(src);
+        assert!(!errs.is_empty(), "expected a lowering error for\n{src}");
+    }
+
+    /// Every runtime-call function name emitted anywhere in the lowered program
+    /// (both `Call` and the unwinding `Invoke`), so a test can prove which
+    /// runtime entry points an N-D operation lowers to.
+    fn call_funcs(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty(), "parse errors in test source: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors in test source: {lerrs:?}");
+        let (m, errs) = lower_module(&module);
+        assert!(errs.is_empty(), "unexpected lowering errors: {errs:?}");
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Call { func, .. } => Some(func.clone()),
+                Inst::Invoke { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count(src: &str, func: &str) -> usize {
+        call_funcs(src).iter().filter(|f| *f == func).count()
+    }
+
+    // --- construction ---
+
+    #[test]
+    fn two_d_construction_lowers() {
+        // A rectangular nested literal builds a rank-2 array via new_nd + two
+        // set_dim calls (one per axis) and four element stores.
+        let src =
+            "def main():\n    auto m = array[f64]([[1.0, 2.0], [3.0, 4.0]])\n    print(len(m))\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_new_nd"), 1);
+        assert_eq!(count(src, "zap_array_set_dim"), 2);
+        assert_eq!(count(src, "zap_array_set_f64"), 4);
+    }
+
+    #[test]
+    fn three_d_construction_and_index_lowers() {
+        lowers_ok(
+            "def main():\n    auto c = array[i64]([[[1, 2], [3, 4]], [[5, 6], [7, 8]]])\n    \
+             print(c[1, 0, 1])\n",
+        );
+    }
+
+    #[test]
+    fn one_d_construction_still_uses_plain_new() {
+        // A flat literal keeps the historical 1-D path (new, not new_nd).
+        let src = "def main():\n    auto a = array[f64]([1.0, 2.0, 3.0])\n    print(a[0])\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_new"), 1);
+        assert_eq!(count(src, "zap_array_new_nd"), 0);
+        assert_eq!(count(src, "zap_array_set_dim"), 0);
+    }
+
+    #[test]
+    fn empty_and_zero_axis_literals_lower() {
+        lowers_ok("def main():\n    auto a = array[f64]([])\n    print(len(a))\n");
+        lowers_ok("def main():\n    auto m = array[i64]([[], []])\n    print(len(m))\n");
+    }
+
+    // --- indexing ---
+
+    #[test]
+    fn full_index_folds_rows_then_gets() {
+        // m[i, j] on a rank-2 array -> one row fold + a 1-D get (scalar).
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    print(m[1, 0])\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_row"), 1);
+        assert_eq!(count(src, "zap_array_get_i64"), 1);
+    }
+
+    #[test]
+    fn partial_index_returns_a_row_view() {
+        // m[i] on a rank-2 array -> a rank-1 view (one row fold, no scalar get).
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto row = m[0]\n    print(len(row), row[1])\n";
+        lowers_ok(src);
+        // one fold for m[0]; the row[1] get is a plain 1-D get on the view.
+        assert_eq!(count(src, "zap_array_row"), 1);
+    }
+
+    #[test]
+    fn one_d_index_unchanged() {
+        // Rank-1 a[i] is still a direct get with no row fold.
+        let src = "def main():\n    auto a = array[i64]([1, 2, 3])\n    print(a[2])\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_row"), 0);
+        assert_eq!(count(src, "zap_array_get_i64"), 1);
+    }
+
+    // --- attributes ---
+
+    #[test]
+    fn shape_ndim_size_lower() {
+        lowers_ok(
+            "def main():\n    auto m = array[f64]([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])\n    \
+             auto s = m.shape\n    print(s[0], s[1], m.ndim, m.size)\n",
+        );
+        // .shape reads each axis via zap_array_dim; .size via zap_array_count.
+        let src = "def main():\n    auto m = array[f64]([[1.0, 2.0], [3.0, 4.0]])\n    \
+                   print(m.shape[0], m.shape[1], m.size)\n";
+        assert!(count(src, "zap_array_dim") >= 2);
+        assert_eq!(count(src, "zap_array_count"), 1);
+    }
+
+    #[test]
+    fn unknown_array_attribute_is_rejected() {
+        lower_fails(
+            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    print(m.strides)\n",
+        );
+    }
+
+    // --- assignment / augmented ---
+
+    #[test]
+    fn full_index_assignment_lowers() {
+        lowers_ok(
+            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    m[0, 1] = 9\n    \
+             print(m[0, 1])\n",
+        );
+    }
+
+    #[test]
+    fn augmented_full_index_lowers() {
+        lowers_ok(
+            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    m[1, 1] += 5\n    \
+             print(m[1, 1])\n",
+        );
+    }
+
+    // --- element-wise / reductions ---
+
+    #[test]
+    fn same_rank_elementwise_and_scalar_broadcast_lower() {
+        lowers_ok(
+            "def main():\n    auto a = array[i64]([[1, 2], [3, 4]])\n    \
+             auto b = array[i64]([[5, 6], [7, 8]])\n    print(sum(a + b), sum(a * 2))\n",
+        );
+    }
+
+    #[test]
+    fn full_reduction_over_nd_lowers() {
+        lowers_ok(
+            "def main():\n    auto m = array[f64]([[1.0, 2.0], [3.0, 4.0]])\n    print(sum(m))\n",
+        );
+    }
+
+    // --- rejections ---
+
+    #[test]
+    fn ragged_literals_are_rejected() {
+        // Short row.
+        lower_fails("def main():\n    auto m = array[i64]([[1, 2], [3]])\n");
+        // Inconsistent nesting depth (scalar beside a list).
+        lower_fails("def main():\n    auto m = array[i64]([1, [2, 3]])\n");
+        // Nested deeper than the first row.
+        lower_fails("def main():\n    auto m = array[i64]([[1, 2], [[3], [4]]])\n");
+    }
+
+    #[test]
+    fn too_many_indices_is_rejected() {
+        lower_fails(
+            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    print(m[0, 1, 0])\n",
+        );
+    }
+
+    #[test]
+    fn cross_rank_elementwise_is_rejected() {
+        lower_fails(
+            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+             auto v = array[i64]([1, 2])\n    auto x = m + v\n    print(sum(x))\n",
+        );
+    }
+
+    #[test]
+    fn nd_slice_is_rejected() {
+        lower_fails(
+            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    auto r = m[0:1]\n",
+        );
+    }
+
+    #[test]
+    fn whole_row_store_is_rejected() {
+        lower_fails(
+            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+             m[0] = array[i64]([9, 9])\n",
+        );
     }
 }

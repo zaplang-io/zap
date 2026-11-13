@@ -3055,11 +3055,14 @@ void *zap_heap_items(void *hp) {
  * Numeric arrays (ticket #24, design/0002-arrays.md, design/RUNTIME-ABI.md
  * §"Collection layout": `array[T]`).
  *
- * A dense, contiguous, fixed-dtype buffer. 1-D over the dtypes `f64` and `i64`
+ * A dense, contiguous, fixed-dtype buffer over the dtypes `f64` and `i64`
  * (8-byte element words) and `uint8`/`bool` (1-byte words; ticket #49, image
- * data and masks). The object carries its dtype and shape so N-D (`ndim > 1`)
- * and strided views can layer on later without an ABI break; this increment
- * always sets `ndim = 1`.
+ * data and masks). The object carries its dtype and an N-D row-major shape
+ * (`ndim` + `dims`, #500): rank-1 arrays set `ndim = 1`, and `array_new_nd`
+ * builds a rank-`n` array whose `dims` multiply to the element count. A full
+ * multi-axis index `m[i, j]` folds through `zap_array_row` (partial index ->
+ * rank-reduced view) down to a rank-1 view and a 1-D get; strided views layer
+ * on later without an ABI break.
  *
  * The element buffer is pointer-free, so it is allocated with GC_MALLOC_ATOMIC
  * (the collector need not scan it); the shape (`dims`) is likewise atomic. The
@@ -3070,14 +3073,15 @@ void *zap_heap_items(void *hp) {
  * reductions. `uint8`/`bool` elements cross the ABI as `int64_t` words (get
  * zero-extends, set truncates to a byte / normalizes to 0|1).
  *
- * Deferred: N-D shape + multi-axis indexing, strided views, and broadcasting
- * beyond a scalar. Contiguous views and shape checks are supported (I#476). */
+ * Deferred: strided views, broadcasting beyond a scalar, and N-D (axis-0)
+ * array slicing. N-D shape + multi-axis indexing are supported (#500);
+ * contiguous 1-D views and full-shape checks are supported (I#476). */
 enum { DTYPE_F64 = 0, DTYPE_I64 = 1, DTYPE_U8 = 2, DTYPE_BOOL = 3 };
 
 typedef struct {
     int64_t dtype;  /* DTYPE_F64 | DTYPE_I64 | DTYPE_U8 | DTYPE_BOOL */
-    int64_t ndim;   /* always 1 this increment */
-    int64_t *dims;  /* `ndim` dimensions; dims[0] is the length */
+    int64_t ndim;   /* static rank >= 1 (#500); 1 for a plain 1-D array */
+    int64_t *dims;  /* `ndim` row-major dimensions; dims[0] is len(a) */
     void *data;     /* GC buffer base; `off` elements precede this array's first */
     int64_t off;    /* element offset of this array's first element into `data` */
 } ZapArray;
@@ -3091,6 +3095,17 @@ typedef struct {
 /* Bytes per stored element: f64/i64 are 8-byte words, uint8/bool one byte. */
 static size_t zap_array_elem_size(int64_t dtype) {
     return (dtype == DTYPE_U8 || dtype == DTYPE_BOOL) ? 1 : 8;
+}
+
+/* The total number of elements = product of all `ndim` dimensions (row-major,
+ * N-D, #500). For a 1-D array this is `dims[0]`; an empty axis makes it 0. The
+ * contiguous buffer always holds exactly this many elements starting at `off`. */
+static int64_t zap_array_count_of(const ZapArray *a) {
+    int64_t n = 1;
+    for (int64_t k = 0; k < a->ndim; k++) {
+        n *= a->dims[k];
+    }
+    return n;
 }
 
 void *zap_array_new(int64_t dtype, int64_t len) {
@@ -3108,7 +3123,111 @@ void *zap_array_new(int64_t dtype, int64_t len) {
     return a;
 }
 
+/* N-D construction (#500, D-0164). Allocate a rank-`ndim` array whose buffer
+ * holds `total` elements (= product of the dims the caller is about to set).
+ * The dims buffer is zeroed; codegen fills each axis with `zap_array_set_dim`
+ * and then fills the elements by flat (row-major) index with `zap_array_set_*`.
+ * Splitting construction this way keeps every runtime entry point fixed-arity
+ * (the shape is static per construction site but has no uniform ABI word). */
+void *zap_array_new_nd(int64_t dtype, int64_t ndim, int64_t total) {
+    if (ndim < 1) {
+        ndim = 1;
+    }
+    ZapArray *a = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t *dims = (int64_t *)zap_buf((size_t)ndim * sizeof(int64_t));
+    for (int64_t k = 0; k < ndim; k++) {
+        dims[k] = 0;
+    }
+    size_t esz = zap_array_elem_size(dtype);
+    void *data = zap_buf((size_t)(total > 0 ? total : 0) * esz);
+    a->dtype = dtype;
+    a->ndim = ndim;
+    a->dims = dims;
+    a->data = data;
+    a->off = 0;
+    return a;
+}
+
+void zap_array_set_dim(void *ap, int64_t axis, int64_t size) {
+    ((ZapArray *)ap)->dims[axis] = size;
+}
+
+/* Allocate a result array with the SAME shape (ndim + dims) as `src` but a
+ * possibly different `out_dtype` — the element-wise kernels' result buffer
+ * (#500). The dims buffer is copied (never aliased: a fresh buffer avoids an
+ * interior GC pointer, like a slice view's `off`), and the data buffer is sized
+ * for the full element count so N-D kernels stay flat over the whole shape. */
+void *zap_array_new_like(void *srcp, int64_t out_dtype) {
+    ZapArray *src = (ZapArray *)srcp;
+    ZapArray *a = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t ndim = src->ndim;
+    int64_t *dims = (int64_t *)zap_buf((size_t)ndim * sizeof(int64_t));
+    int64_t total = 1;
+    for (int64_t k = 0; k < ndim; k++) {
+        dims[k] = src->dims[k];
+        total *= dims[k];
+    }
+    size_t esz = zap_array_elem_size(out_dtype);
+    void *data = zap_buf((size_t)(total > 0 ? total : 0) * esz);
+    a->dtype = out_dtype;
+    a->ndim = ndim;
+    a->dims = dims;
+    a->data = data;
+    a->off = 0;
+    return a;
+}
+
+/* `len(a)` is the length of the FIRST axis (NumPy `len`), not the total element
+ * count — `dims[0]` for every rank. The total is `zap_array_count`. */
 int64_t zap_array_len(void *a) { return ((ZapArray *)a)->dims[0]; }
+
+/* `a.ndim` — the static rank; `a.shape[k]` / offset math reads `a.dims[axis]`;
+ * `a.size` — the total element count (product of all dims, #500). */
+int64_t zap_array_ndim(void *a) { return ((ZapArray *)a)->ndim; }
+int64_t zap_array_count(void *a) { return zap_array_count_of((ZapArray *)a); }
+int64_t zap_array_dim(void *ap, int64_t axis) {
+    ZapArray *a = (ZapArray *)ap;
+    if (axis < 0 || axis >= a->ndim) {
+        fprintf(stderr, "zap: array axis %lld out of range (ndim %lld)\n",
+                (long long)axis, (long long)a->ndim);
+        abort();
+    }
+    return a->dims[axis];
+}
+
+/* A partial index `m[i]` on a rank-n (n >= 2) array -> a rank-(n-1) **view**
+ * sharing the parent buffer (#500, D-0030 view semantics). Row-major: axis 0 is
+ * the outermost, so row `i` begins `i * stride0` elements in, where `stride0` is
+ * the product of the trailing dims. The new header copies `dims[1..n]` into a
+ * fresh buffer (never an interior pointer into the parent's dims) and advances
+ * `off`; `data` stays at the shared base. A full multi-axis index `m[i, j]` is
+ * lowered as a fold of rows down to a rank-1 view followed by a 1-D get, so this
+ * is only ever called with n >= 2. Python-style out-of-range aborts (catchable
+ * index exceptions are a documented follow-up, matching 1-D `a[i]`). */
+void *zap_array_row(void *ap, int64_t i) {
+    ZapArray *a = (ZapArray *)ap;
+    if (i < 0 || i >= a->dims[0]) {
+        fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
+                (long long)i, (long long)a->dims[0]);
+        abort();
+    }
+    int64_t ndim = a->ndim - 1;
+    int64_t stride0 = 1;
+    for (int64_t k = 1; k < a->ndim; k++) {
+        stride0 *= a->dims[k];
+    }
+    ZapArray *v = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t *dims = (int64_t *)zap_buf((size_t)(ndim > 0 ? ndim : 1) * sizeof(int64_t));
+    for (int64_t k = 0; k < ndim; k++) {
+        dims[k] = a->dims[k + 1];
+    }
+    v->dtype = a->dtype;
+    v->ndim = ndim;
+    v->dims = dims;
+    v->data = a->data;              /* share the parent buffer base (GC-safe) */
+    v->off = a->off + i * stride0;  /* window begins at row `i` */
+    return v;
+}
 
 /* The raw element buffer at this array's first element; codegen's SIMD kernels
  * index this directly from 0. For a slice view this is the parent base advanced
@@ -3142,21 +3261,36 @@ void *zap_array_slice(void *ap, int64_t lo, int64_t hi, int64_t has_lo, int64_t 
 
 /* Out-of-range access aborts (shape-mismatch exceptions wait for a follow-up,
  * matching the list bounds behaviour above). */
+/* The typed get/set bound is the TOTAL element count (product of all dims), not
+ * `dims[0]`: these take a FLAT element index into the contiguous window. That is
+ * how N-D construction fills the buffer (flat 0..count), and for a rank-1 array
+ * or a rank-1 row view (the only shapes a full-index get/set ever lands on after
+ * row folding) the count equals `dims[0]`, so 1-D behaviour is unchanged. A
+ * partial index is bounds-checked per axis in `zap_array_row` instead. */
 static void zap_array_bounds(ZapArray *a, int64_t i) {
-    if (i < 0 || i >= a->dims[0]) {
+    int64_t n = zap_array_count_of(a);
+    if (i < 0 || i >= n) {
         fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
-                (long long)i, (long long)a->dims[0]);
+                (long long)i, (long long)n);
         abort();
     }
 }
 
-/* Validate both operands before a SIMD kernel reads either data buffer. */
+/* Validate both operands before a SIMD kernel reads either data buffer. The
+ * element-wise kernels run flat over the full element count, so equal shapes
+ * mean equal `ndim` and equal `dims` on every axis (#500; broadcasting across
+ * unequal shapes is a follow-up, #501). A mismatch raises a catchable
+ * `ValueError` (D-0007) before either buffer is read. */
 void zap_array_check_shape(void *left, void *right) {
     ZapArray *a = (ZapArray *)left;
     ZapArray *b = (ZapArray *)right;
-    if (a->dims[0] != b->dims[0]) {
+    int ok = a->ndim == b->ndim;
+    for (int64_t k = 0; ok && k < a->ndim; k++) {
+        ok = a->dims[k] == b->dims[k];
+    }
+    if (!ok) {
         zap_panic_typed(ZAP_EXC_VALUE_ERROR,
-                        zap_str_new("array length mismatch", 21));
+                        zap_str_new("array shape mismatch", 20));
     }
 }
 
@@ -3181,11 +3315,14 @@ void zap_array_set_i64(void *ap, int64_t i, int64_t v) {
     ((int64_t *)a->data)[a->off + i] = v;
 }
 
+/* `sum(a)` is a FULL reduction over every element (all axes), not just the
+ * first — so N-D arrays sum their whole contiguous window (#500). */
 double zap_array_sum_f64(void *ap) {
     ZapArray *a = (ZapArray *)ap;
     const double *d = (const double *)a->data + a->off;
+    int64_t n = zap_array_count_of(a);
     double s = 0.0;
-    for (int64_t i = 0; i < a->dims[0]; i++) {
+    for (int64_t i = 0; i < n; i++) {
         s += d[i];
     }
     return s;
@@ -3193,8 +3330,9 @@ double zap_array_sum_f64(void *ap) {
 int64_t zap_array_sum_i64(void *ap) {
     ZapArray *a = (ZapArray *)ap;
     const int64_t *d = (const int64_t *)a->data + a->off;
+    int64_t n = zap_array_count_of(a);
     int64_t s = 0;
-    for (int64_t i = 0; i < a->dims[0]; i++) {
+    for (int64_t i = 0; i < n; i++) {
         s += d[i];
     }
     return s;
@@ -3216,8 +3354,9 @@ void zap_array_set_u8(void *ap, int64_t i, int64_t v) {
 int64_t zap_array_sum_u8(void *ap) {
     ZapArray *a = (ZapArray *)ap;
     const uint8_t *d = (const uint8_t *)a->data + a->off;
+    int64_t n = zap_array_count_of(a);
     int64_t s = 0;
-    for (int64_t i = 0; i < a->dims[0]; i++) {
+    for (int64_t i = 0; i < n; i++) {
         s += (int64_t)d[i];
     }
     return s;
@@ -3236,8 +3375,9 @@ void zap_array_set_bool(void *ap, int64_t i, int64_t v) {
 int64_t zap_array_sum_bool(void *ap) {
     ZapArray *a = (ZapArray *)ap;
     const uint8_t *d = (const uint8_t *)a->data + a->off;
+    int64_t n = zap_array_count_of(a);
     int64_t s = 0;
-    for (int64_t i = 0; i < a->dims[0]; i++) {
+    for (int64_t i = 0; i < n; i++) {
         s += d[i] ? 1 : 0;
     }
     return s;

@@ -1385,38 +1385,48 @@ if line =~ m/(?<year>\d{4})-(?<month>\d{2})/ as mt:
 
 ## 15. Numeric arrays (D-0011)
 
-The current **Experimental** surface is dense, one-dimensional numeric arrays
-with SIMD element-wise kernels. `len(a)` is the length; shape tuples and
-multi-axis indexing are not exposed. This is the supported subset of the
+The current **Experimental** surface is dense, **N-dimensional** numeric arrays
+with SIMD element-wise kernels. An array carries a **static rank** (`ndim`, part
+of its type) and a row-major shape. This is the supported subset of the
 longer-term N-D design in `design/0002-arrays.md`.
 
 | Surface | Supported now |
 | --- | --- |
 | Dtypes | `f64`/`float64`, `i64`/`int64`, `uint8`/`u8`, `bool` |
-| Construction | One positional, flat list literal: `array[f64]([1, 2.5])`; empty literals are allowed |
-| Access | One integer index for get/set; use an in-bounds, nonnegative index |
-| Arithmetic | Element-wise `+`, `-`, `*`; two arrays require equal lengths |
-| Scalar broadcast | `a + n`, `a - n`, `a * n`; `n + a` and `n * a` |
-| Reduction | `sum(a)` returns `f64` for `f64`, otherwise `int64` |
-| Slicing | Contiguous views `a[lo:hi]`, with omitted bounds or literal step `1`; writes alias the parent |
+| Construction | A positional list literal, flat (`array[f64]([1, 2.5])`, 1-D) or **nested rectangular** (`array[f64]([[1, 2], [3, 4]])`, N-D); empty / zero-axis literals are allowed |
+| Access | One integer index per axis. A *full* index `m[i, j]` is a scalar get/set; a *partial* index `m[i]` is a rank-reduced **view**. Indices are in-bounds and nonnegative |
+| Shape | `a.ndim` (rank), `a.shape` (a `tuple[int64; ndim]`), `a.size` (total elements); `len(a)` is the first axis |
+| Arithmetic | Element-wise `+`, `-`, `*`; two arrays require **equal rank and shape** |
+| Scalar broadcast | `a + n`, `a - n`, `a * n`; `n + a` and `n * a` (shape preserved) |
+| Reduction | `sum(a)` over **all** elements; returns `f64` for `f64`, otherwise `int64` |
+| Slicing | Contiguous 1-D views `a[lo:hi]`, with omitted bounds or literal step `1`; writes alias the parent |
 
 Mixed array dtypes promote on `bool < uint8 < i64 < f64`; arithmetic on two
 boolean arrays yields `uint8`. Integer scalars retain the array dtype (boolean
 arithmetic promotes to `uint8`), while floating scalars promote to `f64`.
-`uint8` arithmetic wraps modulo 256. Unequal array lengths raise catchable
-`ValueError` before the SIMD kernel reads the buffers.
+`uint8` arithmetic wraps modulo 256. Arrays of unequal shape (including unequal
+rank) raise catchable `ValueError` ("array shape mismatch") before the SIMD
+kernel reads the buffers.
 
-N-D literals, list-variable/iterable constructors, `zeros`/`arange`, `f32`/`i32`
-dtypes, element-wise unary negation/bitwise operations, array division/comparisons,
-axis reductions, broadcasting beyond a
-scalar, `scalar - array`, and strided/reversed array views are unsupported.
-Semantic or lowering diagnostics reject these forms.
+A bare `array[T]` type annotation denotes a rank-1 array; N-D values arise
+through inference (`auto`). List-variable/iterable constructors, `zeros`/`arange`,
+`f32`/`i32` dtypes, element-wise unary negation/bitwise operations, array
+division/comparisons, axis reductions, broadcasting beyond a scalar (including
+across unequal ranks/shapes), `scalar - array`, partial-index (whole-row)
+stores, N-D and strided/reversed array slicing, and explicit N-D type
+annotations are unsupported. Semantic or lowering diagnostics reject these forms.
 
 ```python
 auto a = array[f64]([1, 2, 3])
 auto c = a + 1.0
-auto window = a[1:3]      # contiguous view
+auto window = a[1:3]      # contiguous 1-D view
 window[0] = 9.0          # a[1] is now 9.0
+
+auto m = array[i64]([[1, 2, 3], [4, 5, 6]])
+print(m.shape, m.ndim)   # (2, 3)-style tuple, 2
+auto x = m[1, 2]         # 6 (full index -> scalar)
+auto row = m[0]          # rank-1 view [1, 2, 3]; row[0] = 9 writes m[0, 0]
+auto s = sum(m)          # 21 (reduces every element)
 ```
 
 ---
