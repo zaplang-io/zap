@@ -5861,6 +5861,51 @@ mod tests {
         );
     }
 
+    /// I#885 tripwire. Under Boehm a stopped thread is scanned as
+    /// `[sp, stack_end)`. `switch_to_g` used to publish the coroutine's stack top
+    /// as `stack_end` (`set_bottom(m, &g->sb)`) BEFORE the swap that moves `sp`
+    /// there, and restore the native bottom only AFTER swapping back, so a
+    /// stop-the-world in either gap saw `sp` and `stack_end` on different stacks:
+    /// a multi-MB cross-mapping range, and a mark thread faulted in an unmapped
+    /// hole. The fix never changes `stack_end` after the thread is registered
+    /// (it stays the native stack top) and instead corrects the recorded `sp` at
+    /// scan time (`GC_set_sp_corrector`), when the world is stopped and `sp` /
+    /// `stack_end` cannot be torn. So the switch path must not move the bottom.
+    #[test]
+    fn switch_to_g_does_not_move_the_boehm_stack_bottom() {
+        let src = RUNTIME_C;
+        let start = src
+            .find("static void switch_to_g(M *m, G *g) {")
+            .expect("switch_to_g must exist in zaprt.c");
+        let body = strip_c_comments(
+            &src[start..start + src[start..].find("\n}\n").expect("switch_to_g must end")],
+        );
+        for forbidden in ["set_bottom(", "GC_set_stackbottom("] {
+            assert!(
+                !body.contains(forbidden),
+                "I#885: switch_to_g must not call `{forbidden}`: moving Boehm's stack bottom \
+                 around the context switch leaves a window where a stop-the-world sees sp on \
+                 one stack and the bottom on the other. Keep the bottom fixed at the native \
+                 stack top and fix up sp in the GC_set_sp_corrector hook instead."
+            );
+        }
+    }
+
+    /// The companion half of I#885: with the per-switch bottom updates gone, the
+    /// scheduler must install the `GC_set_sp_corrector` hook (Boehm builds) that
+    /// maps a thread captured while running on a coroutine's stack to an empty
+    /// native range; the coroutine's stack is still scanned as heap through its `G`.
+    #[test]
+    fn scheduler_installs_the_boehm_sp_corrector() {
+        let code = strip_c_comments(RUNTIME_C);
+        assert!(
+            code.contains("GC_set_sp_corrector(zap_sp_corrector)"),
+            "I#885: the scheduler must install `GC_set_sp_corrector(zap_sp_corrector)` \
+             (non-Immix builds) so a thread stopped while running on a green stack is not \
+             scanned as a cross-stack range"
+        );
+    }
+
     /// The companion half of the I#869 contract: `switch_to_g` is the ONLY way a
     /// coroutine is entered or re-entered, so it must record the resuming M in the
     /// G before it swaps the coroutine in (otherwise `g_bootstrap` would read a

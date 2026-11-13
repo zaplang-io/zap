@@ -4848,6 +4848,13 @@ the generic lowering umbrella.
 
 **Status:** Accepted. A runtime fix for the aarch64 multicore GC deadlock; it
 changes the lock discipline of the M:N scheduler's context-switch path.
+**Superseded in mechanism by D-0161 (#885):** the per-switch `set_bottom` this
+decision made lock-free was removed altogether, because moving the bottom around
+the switch is itself unsound (the "both bottoms are valid" argument below holds
+only when the bottom is consistent with the captured `sp`, which the update
+cannot guarantee). The lock-free / no-allocator-lock requirement on the switch
+path stands, and is satisfied trivially: the switch path now calls nothing in the
+collector.
 
 **Context.** The conservative (gc-boehm) collector scans each OS thread's stack
 from its current SP to a cold-end "stack bottom". Because a coroutine runs on a
@@ -8120,7 +8127,7 @@ blocked on, and not modified by, this feature.
 (#223 — lock-free `set_bottom` on the switch path). **Defect report:** I#869
 (root cause and evidence in the issue's diagnosis comment); the separate gc-boehm
 stack-bottom/`sp` race found while cross-checking on x86_64 is I#885 and is NOT
-addressed here.
+addressed here (fixed separately by D-0161).
 
 **Problem.** The scheduler resumes a parked coroutine on whichever worker M picks
 it up, so a coroutine can start on one OS thread and finish on another. The
@@ -8186,3 +8193,99 @@ before the swap-in. `runtime_opt_flag` is pinned `-O2` by default / `-O0` under
 
 **No grammar, runtime-ABI, or language-semantics change** — `GRAMMAR.ebnf` and
 `design/RUNTIME-ABI.md` are unchanged; `run_m` is an internal scheduler field.
+
+## D-0161 — Boehm: never move a thread's stack end across a coroutine switch; correct the captured `sp` at scan time with `GC_set_sp_corrector` (#885)
+
+**Status:** Accepted. **Relates:** D-0117 (#223 — lock-free stack-bottom update;
+**superseded in mechanism** by this decision), D-0160 (#869 — the other
+coroutine-switch defect), D-0013/D-0031 and `design/0005-concurrency.md` (the
+M:N scheduler, green-thread stacks and the Boehm interaction), #722 (Boehm as the
+fallback collector). **Defect report:** I#885 (root cause and core-dump evidence
+in the issue). gc-boehm only: gc-immix has no thread-stack scanning and was
+never affected.
+
+**Problem.** The conservative collector scans a stopped thread as
+`[sp, stack_end)`: `sp` is captured by the stop-the-world signal handler at
+whatever instruction the thread was executing, `stack_end` is the thread's
+registered stack cold end. An M runs on two kinds of stack — its native scheduler
+stack and a coroutine's green stack (a `GC_MALLOC` buffer) — so the scheduler
+kept `stack_end` in step by calling `GC_set_stackbottom` in `switch_to_g`: to the
+green top before the swap, back to the native top after swapping back. But `sp`
+and `stack_end` cannot be changed atomically. `stack_end` moved *before* the
+`swapcontext` that moves `sp` (and the swap itself is a syscall, so the gap is
+long), and returned to the native top only *after* the swap back. A
+stop-the-world landing in either gap saw `sp` on the native stack and
+`stack_end` on a green stack: `[sp, stack_end)` became a multi-MB range spanning
+other threads' stacks, libc, libgc and **unmapped holes**, and a Boehm parallel
+mark thread SIGSEGV-ed reading one — with no Zap fault report, since the
+faulting thread is a Boehm mark thread. D-0117's "a concurrent collection
+observes either the old or the new bottom, and both are valid" was wrong: each is
+valid only together with the matching `sp`. Evidence: a core from a real crash
+showed M1 with `rsp` on its native stack and Boehm's `stack_end` equal to the
+current coroutine's stack top (`stack + stack_size`), the faulting address
+unmapped just below that coroutine's mapping; in the stress program below three of
+four scheduler threads were stopped in this state at once. A program that
+switches constantly spends a large fraction of its time in the gap, so it
+crashed ~80% of runs on x86_64 (and ~1 in 1000-3000 for a mild coroutine
+program); the window exists on every architecture and at every `-O` level.
+
+**Decision.**
+1. **`stack_end` never moves.** After a worker M is registered, its Boehm stack
+   end stays the native stack top for the thread's whole life; `switch_to_g` no
+   longer calls `set_bottom`/`GC_set_stackbottom` (both removed, with the cached
+   `gc_handle` and the per-`G` `sb`). The switch path now calls nothing in the
+   collector, so the #223 "no allocator lock on the switch path" requirement holds
+   trivially.
+2. **The running-coroutine case is fixed at scan time, where it is atomic.**
+   The scheduler installs bdwgc's `GC_set_sp_corrector` hook (8.0+; documented for
+   "a crude integration with certain coroutine implementations"; available on
+   Linux pthreads for x86_64 and aarch64, in the Ubuntu 24.04 libgc 8.2.6 the CI
+   uses). The collector calls it while pushing stacks — with the world stopped and
+   every thread's `sp` already captured — for each thread. `zap_sp_corrector`
+   checks whether the captured `sp` lies inside some live coroutine's stack buffer
+   (`g_all`); if so it replaces `sp` with that M's native stack top
+   (`g->run_m->native_sb.mem_base`, `run_m` from D-0160), giving the empty range
+   `[native_top, native_top)`. A thread on its native stack is untouched and its
+   `[sp, native_top)` is, as always, exactly right. Because the test is on the
+   captured `sp` itself, it is correct at every instant of a switch, however the
+   thread was caught.
+3. **Nothing is lost by scanning the green stack as heap.** A coroutine's stack is
+   a `GC_MALLOC` object kept reachable through its `G` in the statically-rooted
+   `g_all[]`, so it is conservatively scanned in full during marking — including
+   the register snapshot / signal frame the stop-the-world handler pushes on it,
+   and the collecting thread's own spilled registers — exactly as a *parked*
+   coroutine's stack always was. The scheduler's native frames were not scanned
+   while a coroutine ran under the old scheme either (the bottom was the green
+   top), and hold no GC pointers that are not also reachable from the `G`s.
+4. **The hook is signal/lock safe.** It runs with the GC lock held and possibly
+   the world stopped: it reads `g_all`/`G`/`M` fields without locks and allocates
+   nothing; a stopped thread frozen mid-`all_add`/`all_remove` leaves every index
+   below `g_all_len` pointing at a live (or NULL) `G`. Cost: O(live coroutines)
+   per thread per collection, small next to marking those coroutines' stacks.
+5. A side benefit: two fewer collector calls per context switch.
+
+**Alternatives considered.** (a) Block the stop-the-world signal around the
+switch (`pthread_sigmask`) — correct, but `swapcontext` installs the target
+context's saved mask before it moves `sp`, so every context's saved mask would
+have to carry the block and be unblocked after landing: ~4 extra syscalls per
+round trip on top of the 2 `swapcontext` already costs. (b) Hold the allocator
+lock across the switch (what Crystal's patched bdwgc does with a read lock) —
+reintroduces the #223 lock-ordering inversion and the stock libgc has no shared
+lock. (c) Wrap/defer the suspend signal handler while a flag is set — no
+syscalls, but replaces the collector's handler and depends on its retry
+protocol. (d) An "empty" stack end (a tiny constant) while on a green stack —
+violates `lo <= hi`, trips `GC_ASSERT` in debug libgc and wraps
+`GC_total_stacksize`, skewing the collection-frequency heuristic. (e) Boehm's
+`GC_do_blocking` — asserts against `GC_set_stackbottom` and the coroutine
+allocates while running. The corrector is the hook bdwgc provides for exactly this.
+
+**Tests (written first; red on `main`).** `tests/golden/coroutine_switch_gc_stress.zap`:
+16 coroutines that yield through the scheduler on every loop iteration while
+allocating — crashed ~80% of runs under gc-boehm on x86_64 before the fix, 0 of
+1000 after. Two source-contract unit tests in `crates/codegen/src/lib.rs`:
+`switch_to_g` must not call `set_bottom`/`GC_set_stackbottom`, and the scheduler
+must install `GC_set_sp_corrector(zap_sp_corrector)`.
+
+**No grammar, runtime-ABI, or language-semantics change.** Requires bdwgc >= 8.0
+(`GC_set_sp_corrector`); on a libgc without it the Boehm build fails to link
+rather than silently regressing.
