@@ -5206,6 +5206,15 @@ typedef struct G {
     struct M *locked_m; /* LockOSThread (#172): dedicated M this coroutine is
                          * pinned to, or NULL. While set, the coroutine runs only
                          * on `locked_m` and is excluded from fairness preemption. */
+    /* The M that most recently resumed this coroutine (I#869). `switch_to_g` stores
+     * it just before swapping the coroutine in, and it is rewritten on every
+     * resume, so while the coroutine is running it is the M it is running ON.
+     * `g_bootstrap` reads it after the coroutine body returns to find the right
+     * scheduler context to swap back into. It exists because the obvious
+     * alternative — re-reading the `cur_m` thread-local after the body — is
+     * miscompiled when the body parked and migrated: see the contract on `cur_m`.
+     * A plain (non-GC) pointer: Ms are runtime-infrastructure memory, not heap. */
+    struct M *run_m;
     int lock_depth;     /* LockOSThread nesting count (lock/unlock balance)      */
     /* Diagnostics (I#475 / D-0058). Both are static C-strings (codegen globals or
      * runtime literals), never GC-managed, so they need no tracing and stay valid
@@ -5306,7 +5315,22 @@ typedef struct Waiter {
 } Waiter;
 
 /* ---- scheduler globals ---------------------------------------------------- */
-static __thread M *cur_m = NULL; /* the M running this thread; NULL on main    */
+/* The M running this thread; NULL on main.
+ *
+ * CONTRACT (I#869, D-0160): never hold `&cur_m` — or any value derived from this
+ * thread's TLS base — across a point where the running coroutine can park. A
+ * coroutine is resumed on whichever worker thread picks it up, so after any
+ * `zap_ctx_swap` / `copark` / `cosched` / call into code that can block, "this
+ * thread" is a different OS thread. On aarch64 at -O2 the compiler materialises a
+ * thread-local's address (`mrs tpidr_el0` + offset) ONCE per function and keeps it
+ * in a callee-saved register, which `swapcontext` restores unchanged on resume: a
+ * post-park `cur_m` read then loads the OLD thread's slot. (x86_64 executables
+ * address TLS as `%fs:off` on every access, so they do not show it; an x86_64
+ * -fPIC build can.) The coroutine-side way to find its M after resuming is
+ * `g->run_m`, written by `switch_to_g`; the unit tests in zapc_codegen pin that
+ * `g_bootstrap` obeys this. Reading `cur_m` ONCE and using it only up to the
+ * park (cosched/copark/zap_np_enter..leave) is fine. */
+static __thread M *cur_m = NULL;
 
 static M *g_ms = NULL;
 static P *g_ps = NULL;
@@ -5572,6 +5596,11 @@ static void scope_gdone(struct Scope *sc);
 static void sched_enqueue(G *g);
 static void switch_to_g(M *m, G *g) {
     m->current = g;
+    /* I#869: tell the coroutine which M is resuming it NOW. A coroutine can park
+     * on one OS thread and resume on another, so this is rewritten on every
+     * switch-in; `g_bootstrap` uses it to swap back into the right scheduler
+     * context when the coroutine's body returns (it must not re-read `cur_m`). */
+    g->run_m = m;
     g->state = G_RUNNING;
     /* Preemption monitor (#172): a fresh scheduling tick + a clean preempt flag.
      * The monitor samples `schedtick`; an unchanged tick across an interval means
@@ -5632,7 +5661,17 @@ static void g_bootstrap(void) {
     M *m = cur_m;
     G *g = m->current;
     g_entry_fn(g);
-    m = cur_m; /* may have migrated across parks */
+    /* The body may have parked and been resumed on a DIFFERENT M (OS thread), so
+     * `m` from above can be stale. Do NOT re-read `cur_m` here (I#869): it is a
+     * `__thread` variable, and on aarch64 at -O2 the compiler computes its address
+     * (`mrs tpidr_el0` + offset) once and holds it in a callee-saved register
+     * across the whole body; `swapcontext` restores that register unchanged on
+     * resume, so the "re-read" would load the OLD thread's slot and swap into a
+     * scheduler context another thread is still running on (SIGSEGV / stack
+     * smashing). `g->run_m` is the M that resumed this coroutine most recently
+     * (set by `switch_to_g`), read from the heap-allocated G, which the compiler
+     * cannot cache across the opaque body call. */
+    m = g->run_m;
     g->state = G_DEAD;
     zap_ctx_swap(&g->ctx, &m->sched_ctx);
     /* unreachable */
@@ -5775,6 +5814,7 @@ static G *galloc(void *fn, void *arg) {
     g->state = G_RUNNABLE;
     g->link = NULL;
     g->parkmu = NULL;
+    g->run_m = NULL; /* I#869: set by switch_to_g on every resume */
     g->scope = NULL;
     g->in_live = 0;
     g->name = NULL;

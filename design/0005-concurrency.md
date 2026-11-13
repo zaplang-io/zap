@@ -552,6 +552,22 @@ not relied on:
 - Movable/growable stacks remain a v2 follow-up (v1 Immix is non-moving); the
   entry points and the fixed-stack decision above are unchanged.
 
+### Finding the running M after a park (I#869, D-0160)
+
+A coroutine is resumed on whichever worker M picks it up, so after any park it may
+be on a different OS thread than before. Code that runs on a coroutine stack must
+therefore not carry a value derived from the *thread* across a park. The runtime's
+`cur_m` is `__thread`, and on aarch64 at `-O2` the compiler caches a thread-local's
+*address* (the `tpidr_el0`-relative computation) in a callee-saved register that
+`swapcontext` restores unchanged — so a "re-read" of `cur_m` after a park silently
+loads the OLD thread's slot. The coroutine bootstrap (`g_bootstrap`), which must
+swap back into the scheduler context of the M it finishes on, took exactly that
+wrong turn. The rule: `switch_to_g` stores the resuming M in the coroutine
+(`G.run_m`) on every switch-in, and coroutine-side code that needs its M after a
+possible park reads `g->run_m`, never `cur_m`. Reading `cur_m` once and using it
+only up to the park (`cosched`, `copark`, the no-preempt allocation brackets) is
+fine.
+
 ### Interaction with exception unwinding
 
 - **Per-coroutine unwinding.**

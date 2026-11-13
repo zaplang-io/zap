@@ -68,10 +68,9 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   out-of-line helper calls per lookup to ~1 inlined, register-allocated call.
   `--debug` restores `-O0` for a faster build (~0.73s vs ~3s for the large runtime
   TU) — the `cargo` debug/release intuition — with identical observable behaviour.
-  The `-O2` default is **x86_64-only**: aarch64 (and any non-x86_64) keeps `-O0`,
-  its prior behaviour, because the aarch64 runtime miscompiles the `ucontext`
-  coroutine switch at `-O2` (#869); extending the default there is gated on that
-  fix. This is a plain optimization level, not LTO: the opt-in `ZAP_LTO`
+  The `-O2` default applies on every target (it was briefly x86_64-only
+  until the aarch64 coroutine crash it exposed was fixed, #869/D-0160). This is a
+  plain optimization level, not LTO: the opt-in `ZAP_LTO`
   cross-module path (D-0149/D-0150) is unchanged, and `-flto` buys ≈ nothing over
   `-O2` here for ~5× the build. The compiled runtime object is cached (keyed on
   the runtime source + `-O` level + collector + backend gates + CPython profile +
@@ -1164,6 +1163,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 - _Nothing yet._
 
 ### Fixed
+
+- **aarch64 `-O2` runtime: a coroutine that parked and finished on a different
+  worker thread crashed (SIGSEGV / stack smashing)** (#869, D-0160). `g_bootstrap`
+  re-read the `cur_m` thread-local after the coroutine body; on aarch64 at `-O2`
+  the compiler keeps the thread-local's address in a callee-saved register that
+  `swapcontext` restores unchanged, so the "re-read" returned the *old* thread's
+  scheduler and the coroutine swapped into a scheduler stack another thread was
+  running on. The resuming M is now recorded in the coroutine (`G.run_m`, set by
+  `switch_to_g`) and `g_bootstrap` uses that. With it fixed, the `-O2` runtime
+  default (D-0157) now applies on aarch64 too. x86_64 executables were not
+  affected. New golden `coroutine_park_migrate_exit` plus source-contract tests.
 
 - **Sema rejected a conformer at an interface-typed collection element**
   (#831, D-0016). Type-checking admitted the `struct`/`enum → interface`

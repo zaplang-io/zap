@@ -7800,7 +7800,10 @@ NOT guaranteed"), so this layout is within the stated contract.
 cross-module inlining path), #714 (GC/perf north star), D-0156 (#840 — SoA dict).
 **Amends:** D-0152's "normal (non-LTO) native build" characterisation — that
 decision optimized the *program* module but left the *runtime* translation unit
-at `-O0`; this decision closes that gap.
+at `-O0`; this decision closes that gap. **Amended by D-0160 (#869):** the
+`x86_64`-only target gate described below was removed once the aarch64 `-O2`
+crash was root-caused and fixed in the runtime; the `-O2` default now applies on
+every target.
 
 **Problem.** On the default (non-LTO) object-link path the C runtime
 (`zaprt.c` — the whole dict/set/string/GC machinery, one translation unit) is
@@ -7838,7 +7841,8 @@ intuition. The flag is plumbed `CLI → parse_compile → compile_for → backen
 build_executable(debug)`; it defaults OFF (optimized). `zap test` harness binaries
 build with the default optimized runtime (they are executed, not iterated on).
 
-**Target gate: `-O2` default is x86_64-only (for now).** The `-O2` default
+**Target gate: `-O2` default is x86_64-only (for now). — SUPERSEDED by D-0160
+(#869): the gate was removed; this paragraph is the history.** The `-O2` default
 applies ONLY to `x86_64`, where #867 measured it and CI validated it (the `full`
 job's whole golden + conformance suite is green at `-O2`). On every other target
 — notably **`aarch64`** — the runtime stays at `-O0`. At `-O2` the aarch64 runtime
@@ -7884,11 +7888,10 @@ guard: it builds a hot `dict[int64,int64]` loop in the default mode and under
 `--debug`, disassembles `zap_dict_get_i64_i64`, and asserts the default build
 inlines the `static inline` table accessors (no out-of-line call survives) while
 `--debug` does not (a call survives + strictly more calls), with the `noinline`
-`zap_key_hash` called out of line in both as the anchor. It is gated to `x86_64`
-(where the `-O2` default applies) and skips cleanly where `objdump` is absent.
-`crates/codegen/src/lib.rs`'s unit test pins `runtime_opt_flag`'s exact flags for
-all four (debug × x86_64) cases including the non-x86_64 `-O0` hold
-(toolchain-independent), and `crates/driver/src/cli.rs` covers `--debug` parsing
+`zap_key_hash` called out of line in both as the anchor. It runs on every target
+(the `x86_64`-only gate was removed by D-0160) and skips cleanly where `objdump`
+is absent. `crates/codegen/src/lib.rs`'s unit test pins `runtime_opt_flag`'s exact
+flags (`-O2` default, `-O0` under `--debug`; toolchain-independent), and `crates/driver/src/cli.rs` covers `--debug` parsing
 on `run`/`build`/`ir`.
 
 **Build-time: the runtime object is cached.** The runtime TU does not depend on
@@ -8108,3 +8111,78 @@ blocked on, and not modified by, this feature.
 **No grammar change.** The surface is a struct decorator with no new syntax and no
 `move`/`consume` keyword; every rule is a sema/type-system check or a
 `with`-lowering addition. `GRAMMAR.ebnf` is unchanged.
+
+## D-0160 — a coroutine finds its M through its G, never by re-reading the `cur_m` thread-local after a park; the `-O2` runtime default applies on every target (#869)
+
+**Status:** Accepted. **Relates:** D-0157 (#867 — the `-O2` runtime default;
+**amended**: its `x86_64`-only target gate is removed), D-0013/D-0031 and
+`design/0005-concurrency.md` (the M:N scheduler, `ucontext` coroutines), D-0117
+(#223 — lock-free `set_bottom` on the switch path). **Defect report:** I#869
+(root cause and evidence in the issue's diagnosis comment); the separate gc-boehm
+stack-bottom/`sp` race found while cross-checking on x86_64 is I#885 and is NOT
+addressed here.
+
+**Problem.** The scheduler resumes a parked coroutine on whichever worker M picks
+it up, so a coroutine can start on one OS thread and finish on another. The
+coroutine bootstrap (`g_bootstrap`, `zaprt.c`) ran the coroutine body and then
+did `m = cur_m` ("re-read after migration") to swap back into the scheduler
+context of the M running it. `cur_m` is a `__thread` variable. On **aarch64 at
+`-O2`** GCC computes a thread-local's *address* once (`mrs x20, tpidr_el0` + the
+`cur_m` offset) and keeps it in a callee-saved register for the whole function;
+`swapcontext` saves and restores callee-saved registers, so after the body parked
+and was resumed on another thread the register still held the **old thread's**
+`&cur_m`. The "re-read" loaded the old M, and the finishing coroutine swapped into
+that M's `sched_ctx` while the old thread was still running on it: two threads on
+one scheduler stack → SIGSEGV / `*** stack smashing detected ***`, ~every run of
+any program whose coroutines park and then finish (the `scope_cleanup`
+conformance case; a 64-coroutine park-then-return program fails 40/40). It is not
+the collector (both `gc-boehm` and `gc-immix` failed), not a `swapcontext`
+register clobber, and not `makecontext` misuse. x86_64 executables address TLS as
+`%fs:off` on every access (the post-body read is a fresh load), so they do not
+show it; an x86_64 `-fPIC`/local-dynamic build can (the toolchain caches the
+`__tls_get_addr` result). It only appeared when #867 raised the runtime to `-O2`;
+at `-O0` every access recomputes the address.
+
+**Decision.**
+1. **`G` records the resuming M.** `G` gains `struct M *run_m`. `switch_to_g` —
+   the only function that enters or re-enters a coroutine — stores `g->run_m = m`
+   immediately before swapping the coroutine in, on every switch-in, so while a
+   coroutine runs it names the M it is running on. `g_bootstrap` takes the M to
+   swap back into from `g->run_m` after the body returns; it no longer touches the
+   `cur_m` thread-local after the body. `run_m` is read from the heap-allocated
+   `G` through an opaque body call, so no compiler can cache it across the park the
+   way it can a TLS address. It is a plain pointer (Ms are runtime-infrastructure
+   memory, not GC heap) and is not in the precise-GC descriptor.
+2. **The contract is written down.** The `cur_m` declaration carries the rule: do
+   not hold `&cur_m` (or anything derived from the thread's TLS base) across a
+   point where the coroutine can park; read it once and use it only up to the
+   park (`cosched`/`copark`/`zap_np_enter..leave` already do). An audit of the
+   `-O2` aarch64 disassembly found `g_bootstrap` to be the only site that reuses a
+   TLS-derived address across a park (the rest are the no-preempt allocation
+   brackets, which by construction cannot switch).
+3. **The `x86_64`-only gate on the `-O2` default is removed.** `runtime_opt_flag`
+   is `-O2` unless `--debug`, on every target; the `arm64` CI leg now exercises
+   the optimized runtime.
+
+**Alternatives considered.** (a) A `noinline` `cur_m` accessor at the one site —
+verified to fix the crash (200/200 runs), but it leaves correctness resting on an
+attribute the optimizer is allowed to ignore under future inlining/LTO; keeping
+the M in the `G` removes the dependence on the compiler's TLS addressing model
+entirely. (b) A `volatile`/compiler-barrier around the swap — does not help: the
+cached value is an address held in a callee-saved register, not a memory
+operand. (c) Compiling the runtime with a flag that disables thread-pointer
+caching — there is none on aarch64 GCC; a build-flag fix would also not protect
+other toolchains. (d) Keep the gate — leaves the real defect latent (it still
+reproduces on an x86_64 `-fPIC` build) and aarch64 permanently slower.
+
+**Tests (written first; red before the fix on aarch64).**
+`tests/golden/coroutine_park_migrate_exit.zap`: many rounds of many coroutines
+that park once or twice and then return, on the multi-worker scheduler — crashes
+every run on aarch64 at `-O2` before the fix. Two toolchain-independent
+source-contract unit tests in `crates/codegen/src/lib.rs`: `g_bootstrap` must not
+reference `cur_m` after `g_entry_fn(g)`, and `switch_to_g` must set `g->run_m`
+before the swap-in. `runtime_opt_flag` is pinned `-O2` by default / `-O0` under
+`--debug`, and `crates/driver/tests/runtime_opt.rs` now runs on aarch64.
+
+**No grammar, runtime-ABI, or language-semantics change** — `GRAMMAR.ebnf` and
+`design/RUNTIME-ABI.md` are unchanged; `run_m` is an internal scheduler field.
