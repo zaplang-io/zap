@@ -4587,11 +4587,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 rhs,
                 rhs_dtype,
                 scalar,
+                scalar_lhs,
             } => {
                 let lv = get(vals, *lhs);
                 let rv = get(vals, *rhs);
-                let res =
-                    self.array_binop(*op, *out, *lhs_dtype, *rhs_dtype, lv, rv, *scalar, fv)?;
+                let res = self.array_binop(
+                    *op,
+                    *out,
+                    *lhs_dtype,
+                    *rhs_dtype,
+                    lv,
+                    rv,
+                    *scalar,
+                    *scalar_lhs,
+                    fv,
+                )?;
                 vals[*dest as usize] = Some(res);
             }
             Inst::ArrayUnaryOp {
@@ -5320,6 +5330,12 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     /// scalar), then the arithmetic and store happen in `out`. This is the
     /// deliberate exception to the "mechanical" rule — the whole point of the
     /// ticket is that the arithmetic vectorizes.
+    ///
+    /// `scalar_lhs` (#506): for a non-commutative scalar-on-left op (`s - a`,
+    /// `s / a`) the scalar still arrives in `rhs`, but the per-lane arithmetic
+    /// is computed with the operands swapped (`scalar <op> array[i]`). `Div` is
+    /// NumPy true division, so `out` is always a float dtype and a zero element
+    /// yields IEEE ±inf/nan (no raise).
     #[allow(clippy::too_many_arguments)]
     fn array_binop(
         &self,
@@ -5330,6 +5346,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         lhs: BasicValueEnum<'ctx>,
         rhs: BasicValueEnum<'ctx>,
         scalar: bool,
+        scalar_lhs: bool,
         fv: FunctionValue<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>, String> {
         let b = self.builder;
@@ -5521,7 +5538,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             }
             None => svec.unwrap(),
         };
-        let resvec = self.vec_arith(op, out_float, lvec, rvec)?;
+        // For a non-commutative scalar-on-left op the scalar (`rvec`) is the
+        // left arithmetic operand: `scalar <op> array[i]` (#506).
+        let (vl, vr) = if scalar_lhs {
+            (rvec, lvec)
+        } else {
+            (lvec, rvec)
+        };
+        let resvec = self.vec_arith(op, out_float, vl, vr)?;
         let optr = unsafe {
             b.build_gep(out_elem, op_ptr, &[i], "optr")
                 .map_err(|e| e.to_string())?
@@ -5556,7 +5580,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             }
             None => sscalar.unwrap(),
         };
-        let ressc = self.scalar_arith(op, out_float, lsc, rsc)?;
+        let (sl, sr) = if scalar_lhs { (rsc, lsc) } else { (lsc, rsc) };
+        let ressc = self.scalar_arith(op, out_float, sl, sr)?;
         let optr = unsafe {
             b.build_gep(out_elem, op_ptr, &[j], "optrs")
                 .map_err(|e| e.to_string())?
@@ -5974,6 +5999,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 Add => b.build_float_add(l, r, "vfadd"),
                 Sub => b.build_float_sub(l, r, "vfsub"),
                 Mul => b.build_float_mul(l, r, "vfmul"),
+                // True division (#506): `out` is always a float dtype, so a
+                // zero divisor yields IEEE ±inf/nan (no raise, D-0169).
+                Div => b.build_float_div(l, r, "vfdiv"),
                 _ => return Err("unsupported element-wise array op".into()),
             }
         } else {
@@ -6002,6 +6030,9 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 Add => b.build_float_add(lf, rf, "fadd"),
                 Sub => b.build_float_sub(lf, rf, "fsub"),
                 Mul => b.build_float_mul(lf, rf, "fmul"),
+                // True division (#506): `out` is always float -> ±inf/nan on a
+                // zero divisor, no raise (D-0169).
+                Div => b.build_float_div(lf, rf, "fdiv"),
                 _ => return Err("unsupported element-wise array op".into()),
             }
             .map_err(|e| e.to_string())?

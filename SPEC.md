@@ -1398,8 +1398,8 @@ longer-term N-D design in `design/0002-arrays.md`.
 | Elementwise math | `math.sqrt`/`exp`/`log`/`sin`/`cos`/`tan`/`fabs` applied to an array map over it, returning a new float array (`f32`→`f32`, else `f64`) |
 | Access | One integer index per axis. A *full* index `m[i, j]` is a scalar get/set; a *partial* index `m[i]` is a rank-reduced **view**. Indices are in-bounds and nonnegative |
 | Shape | `a.ndim` (rank), `a.shape` (a `tuple[int64; ndim]`), `a.size` (total elements); `len(a)` is the first axis |
-| Arithmetic | Element-wise `+`, `-`, `*`; two arrays **broadcast** (right-align shapes, stretch size-1 axes, extend rank) |
-| Scalar broadcast | `a + n`, `a - n`, `a * n`; `n + a` and `n * a` (shape preserved) |
+| Arithmetic | Element-wise `+`, `-`, `*`, `/`; two arrays **broadcast** (right-align shapes, stretch size-1 axes, extend rank). `/` is **true division** (always a float result) |
+| Scalar broadcast | `a + n`, `a - n`, `a * n`, `a / n`; and scalar-on-left `n + a`, `n * a`, `n - a`, `n / a` (shape preserved) |
 | Reduction | `sum(a)` over **all** elements; returns `f64` for `f64`, otherwise `int64` |
 | Slicing | Contiguous 1-D views `a[lo:hi]`, with omitted bounds or literal step `1`; writes alias the parent |
 
@@ -1414,14 +1414,22 @@ leading 1s; the result takes the larger rank and the larger aligned dim). Shapes
 that cannot broadcast together raise a catchable `ValueError` ("array shape
 mismatch") before the kernel reads the buffers.
 
+Division `/` is NumPy **true division**: the result dtype is always a float, so
+an all-integer division lifts to `f64` (`array[i64] / 2 → f64`) while a float
+operand keeps its width (`array[f32] / 2 → f32`). A zero divisor follows
+IEEE-754 — `x/0 → ±inf`, `0/0 → nan` — and does **not** raise (unlike scalar
+`/`, which raises `ZeroDivisionError`); array arithmetic follows NumPy, which
+warns but does not raise. Floor division `//` and modulo `%` are not yet
+supported on arrays.
+
 A bare `array[T]` type annotation denotes a rank-1 array; N-D values arise
 through inference (`auto`). List-variable/iterable `array[T]` construction,
 a fully dynamic-rank (runtime-tuple) constructor shape,
 element-wise unary negation/bitwise operations, array
-division/comparisons, axis reductions, broadcasting in assignment or partial-index
-(whole-row) stores, `scalar - array`, N-D and strided/reversed array slicing, and
-explicit N-D type annotations are unsupported. Semantic or lowering diagnostics
-reject these forms.
+comparisons, floor division `//`/modulo `%`, axis reductions, broadcasting in
+assignment or partial-index (whole-row) stores, N-D and strided/reversed array
+slicing, and explicit N-D type annotations are unsupported. Semantic or lowering
+diagnostics reject these forms.
 
 ```python
 auto a = array[f64]([1, 2, 3])

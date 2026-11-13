@@ -249,7 +249,12 @@ allocation, not a header plus a separate data buffer:
   every float as an `f64` word (get widens, set narrows); the accessors are
   macro-generated per dtype in `zaprt.c`. Mixed-dtype element-wise ops promote
   by NEP-50 (D-0166); the SIMD kernel reads each operand buffer at its own
-  element type and widens to the result dtype.
+  element type and widens to the result dtype. Division `/` (#506, D-0169) is
+  NumPy true division: the kernel's result dtype is always a float (an integer
+  `/` lifts to `f64`), so a zero divisor produces IEEE ±inf/nan with no runtime
+  call and no raise; the non-commutative scalar-on-left `s - a` / `s / a` swap
+  the per-lane operands in codegen. No new runtime entry points — the ABI is
+  unchanged by #506.
 - `heap[T]` (#76, D-0057): a binary min-heap priority queue — `[ header | len:
   i64 | cap: i64 | data: *T | kind | dir ]`, a complete binary tree over a
   growable element-word array (amortized-doubling growth). `kind` selects the

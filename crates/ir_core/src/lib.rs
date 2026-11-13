@@ -763,20 +763,29 @@ pub enum Inst {
     LandingPad {
         dest: Value,
     },
-    /// Element-wise binary op on numeric arrays (tickets #24, #49): `dest` is a
-    /// fresh array holding `lhs[i] <op> rhs[i]` (or `lhs[i] <op> scalar` when
-    /// `scalar`). `op` is one of `Add`/`Sub`/`Mul`. Codegen lowers this to an
-    /// explicit LLVM vector loop (SIMD) with a scalar remainder — the one
-    /// non-mechanical ZIR node for arrays, mirroring how `Invoke`/`LandingPad`
-    /// carry the exception-edge shape.
+    /// Element-wise binary op on numeric arrays (tickets #24, #49, #506): `dest`
+    /// is a fresh array holding `lhs[i] <op> rhs[i]` (or `lhs[i] <op> scalar`
+    /// when `scalar`). `op` is one of `Add`/`Sub`/`Mul`/`Div`. Codegen lowers
+    /// this to an explicit LLVM vector loop (SIMD) with a scalar remainder — the
+    /// one non-mechanical ZIR node for arrays, mirroring how `Invoke`/
+    /// `LandingPad` carry the exception-edge shape.
     ///
     /// Mixed-dtype promotion (#49): the operands may have different dtypes, so
     /// each carries its own — `lhs_dtype`/`rhs_dtype` — and `out` is the
     /// promoted result dtype ([`Dtype::promote`] / [`Dtype::promote_scalar`]).
     /// Codegen loads each operand at its own storage type, widens it to `out`,
-    /// does the arithmetic in `out`, and stores `out`. `lhs` is always an array;
-    /// `rhs` is an array (same length) when `!scalar`, or a scalar of
+    /// does the arithmetic in `out`, and stores `out`. `lhs` is always the
+    /// array; `rhs` is an array (same length) when `!scalar`, or a scalar of
     /// `rhs_dtype`'s [`Dtype::ty`] when `scalar`.
+    ///
+    /// `scalar_lhs` (#506): for the non-commutative `Sub`/`Div` with the scalar
+    /// on the *left* (`scalar - array`, `scalar / array`), the scalar still
+    /// crosses in `rhs` but the kernel computes `rhs <op> lhs[i]` (scalar as the
+    /// left arithmetic operand). It is `false` for every array-array op and for
+    /// a scalar on the right; commutative scalar-on-left (`s + a`, `s * a`) is
+    /// reordered at lowering to a plain scalar-on-right op, so it never sets this
+    /// flag. `Div` on arrays is NumPy true division (always a float `out`), so a
+    /// zero divisor yields IEEE ±inf/nan rather than raising (D-0169).
     ArrayBinOp {
         dest: Value,
         op: BinOp,
@@ -786,6 +795,7 @@ pub enum Inst {
         rhs: Value,
         rhs_dtype: Dtype,
         scalar: bool,
+        scalar_lhs: bool,
     },
     /// Element-wise unary math over a numeric `array` (#505, D-0168): the result
     /// is a shape-preserving array of `out` dtype, `out[i] = op(src[i])`. Codegen
@@ -1351,8 +1361,17 @@ fn fmt_inst(i: &Inst) -> String {
             rhs,
             rhs_dtype,
             scalar,
+            scalar_lhs,
         } => {
-            let kind = if *scalar { "scalar" } else { "array" };
+            let kind = if *scalar {
+                if *scalar_lhs {
+                    "scalar-lhs"
+                } else {
+                    "scalar"
+                }
+            } else {
+                "array"
+            };
             format!(
                 "%{dest} = array.{op:?}.{} %{lhs}:{}, %{rhs}:{} ({kind})",
                 out.suffix(),
