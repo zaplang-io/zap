@@ -65,8 +65,9 @@ Once the IR schema and runtime ABI are frozen, these run concurrently:
 - **Arrays track** — `array[T]` 1-D first: element-wise ops + scalar broadcast +
   SIMD lowering (done); then N-D static-rank shape + multi-axis indexing (#500,
   `D-0164`, done), element-wise broadcasting (#501, `D-0165`, done), the full
-  dtype matrix + NEP-50 promotion (#503/#890, `D-0166`, done), then slicing,
-  constructors, math, reductions, matmul (epic #499). `D-0011`.
+  dtype matrix + NEP-50 promotion (#503/#890, `D-0166`, done), constructors
+  zeros/ones/full/arange/linspace (#504, `D-0167`, done), then slicing, math,
+  reductions, matmul (epic #499). `D-0011`.
 - **Concurrency track** — coroutines + channels (unbuffered/buffered, `close`,
   `select`), sync primitives, structured concurrency, DRF-SC memory model.
   `D-0008`, `D-0031`–`D-0034`.

@@ -2277,6 +2277,15 @@ fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
 
 /// The array dtype named by a construction subscript like `array[f64]`, where
 /// the dtype appears as a bare name in expression position.
+/// Which shaped-fill constructor is being lowered (#504): `zeros`/`ones` fill a
+/// constant 0/1, `full` fills a caller-supplied value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrayFill {
+    Zeros,
+    Ones,
+    Full,
+}
+
 fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
     match name {
         "float" | "float64" | "f64" => Ok(Dtype::F64),
@@ -11994,6 +12003,23 @@ impl<'a> FnLower<'a> {
             if is_name(base, "array") {
                 return self.lower_array_new(index, args);
             }
+            // Array constructors (#504, D-0167): `zeros[T](shape)` etc. The callee
+            // parses as a subscript `name[dtype]`, like `array[dtype]`.
+            if is_name(base, "zeros") {
+                return self.lower_array_fill_ctor(index, args, ArrayFill::Zeros);
+            }
+            if is_name(base, "ones") {
+                return self.lower_array_fill_ctor(index, args, ArrayFill::Ones);
+            }
+            if is_name(base, "full") {
+                return self.lower_array_fill_ctor(index, args, ArrayFill::Full);
+            }
+            if is_name(base, "arange") {
+                return self.lower_array_arange(index, args);
+            }
+            if is_name(base, "linspace") {
+                return self.lower_array_linspace(index, args);
+            }
             if is_name(base, "channel") {
                 return self.lower_chan_new(index, args);
             }
@@ -14718,6 +14744,216 @@ impl<'a> FnLower<'a> {
                 args: vec![arr, idx, v],
             });
         }
+        Ok((arr, ty))
+    }
+
+    /// The dtype named by a constructor subscript like `zeros[f64]`.
+    fn ctor_dtype(&self, index: &Expr) -> Result<Dtype, LowerError> {
+        let Expr::Name(dname, _) = index else {
+            return Err(err(
+                "an array constructor expects a dtype name, e.g. zeros[f64]((3, 4))",
+            ));
+        };
+        dtype_from_name(dname)
+    }
+
+    /// Evaluate a constructor shape argument into one `i64` dim value per axis
+    /// (#504). A tuple literal `(d0, d1, ...)` is N-D (rank = its arity); a single
+    /// expression is 1-D. The rank is therefore static (as D-0164 requires); the
+    /// dim *values* may be runtime. An empty shape `()` is rejected.
+    fn array_shape_dims(&mut self, shape: &Expr) -> Result<Vec<Value>, LowerError> {
+        let parts: Vec<&Expr> = match shape {
+            Expr::Tuple(elems, _) => elems.iter().collect(),
+            other => vec![other],
+        };
+        if parts.is_empty() {
+            return Err(err("an array shape needs at least one dimension"));
+        }
+        if parts.len() > u8::MAX as usize {
+            return Err(err("array rank (shape length) is too large"));
+        }
+        let mut dims = Vec::with_capacity(parts.len());
+        for p in parts {
+            let (v, t) = self.expr(p)?;
+            if t.int_width().is_none() {
+                return Err(err("array shape dimensions must be integers"));
+            }
+            dims.push(self.coerce(v, t, Ty::I64));
+        }
+        Ok(dims)
+    }
+
+    /// Allocate a rank-`dims.len()` array of `dtype` with the given (runtime) dim
+    /// values: compute the element count as their product, allocate via
+    /// `zap_array_new_nd`, then write each axis with `zap_array_set_dim`.
+    fn array_alloc_shaped(&mut self, dtype: Dtype, dims: &[Value]) -> Value {
+        let ndim = dims.len() as u8;
+        let code = self.iconst(Ty::I64, dtype.code());
+        let mut total = self.iconst(Ty::I64, 1);
+        for &d in dims {
+            let next = self.new_value(Ty::I64);
+            self.emit(Inst::Bin {
+                dest: next,
+                op: BinOp::Mul,
+                lhs: total,
+                rhs: d,
+            });
+            total = next;
+        }
+        let ndim_v = self.iconst(Ty::I64, ndim as i64);
+        let arr = self.new_value(Ty::Array(dtype, ndim));
+        self.emit(Inst::Call {
+            dest: Some(arr),
+            func: "zap_array_new_nd".to_string(),
+            args: vec![code, ndim_v, total],
+        });
+        for (axis, &d) in dims.iter().enumerate() {
+            let ax = self.iconst(Ty::I64, axis as i64);
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_array_set_dim".to_string(),
+                args: vec![arr, ax, d],
+            });
+        }
+        arr
+    }
+
+    /// `zeros[T](shape)` / `ones[T](shape)` / `full[T](shape, value)` (#504): a
+    /// shaped array filled with 0 / 1 / a given scalar. The fill value crosses as
+    /// an `i64` word (integer/bool dtypes) or an `f64` word (float dtypes).
+    fn lower_array_fill_ctor(
+        &mut self,
+        index: &Expr,
+        args: &[ast::Arg],
+        fill: ArrayFill,
+    ) -> Result<(Value, Ty), LowerError> {
+        let dtype = self.ctor_dtype(index)?;
+        let want = if matches!(fill, ArrayFill::Full) {
+            2
+        } else {
+            1
+        };
+        if args.len() != want || args.iter().any(|a| a.name.is_some()) {
+            return Err(err(if matches!(fill, ArrayFill::Full) {
+                "full[T](shape, value) takes a shape and a fill value"
+            } else {
+                "zeros[T](shape) / ones[T](shape) take one shape argument"
+            }));
+        }
+        let dims = self.array_shape_dims(&args[0].value)?;
+        let ndim = dims.len() as u8;
+        let arr = self.array_alloc_shaped(dtype, &dims);
+        if dtype.is_float() {
+            let fv = match fill {
+                ArrayFill::Zeros => self.fconst(Ty::F64, 0.0),
+                ArrayFill::Ones => self.fconst(Ty::F64, 1.0),
+                ArrayFill::Full => {
+                    let (v, vt) = self.expr(&args[1].value)?;
+                    if vt.int_width().is_none() && !vt.is_float() {
+                        return Err(err("full value must be a numeric scalar"));
+                    }
+                    self.coerce(v, vt, Ty::F64)
+                }
+            };
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_array_fill_f".to_string(),
+                args: vec![arr, fv],
+            });
+        } else {
+            let iv = match fill {
+                ArrayFill::Zeros => self.iconst(Ty::I64, 0),
+                ArrayFill::Ones => self.iconst(Ty::I64, 1),
+                ArrayFill::Full => {
+                    let (v, vt) = self.expr(&args[1].value)?;
+                    if vt.int_width().is_none() && !vt.is_float() {
+                        return Err(err("full value must be a numeric scalar"));
+                    }
+                    self.coerce(v, vt, Ty::I64)
+                }
+            };
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_array_fill_i".to_string(),
+                args: vec![arr, iv],
+            });
+        }
+        Ok((arr, Ty::Array(dtype, ndim)))
+    }
+
+    /// Evaluate a constructor scalar argument, coercing to `to` (`Ty::I64`/`F64`).
+    fn ctor_scalar(&mut self, arg: &ast::Arg, to: Ty) -> Result<Value, LowerError> {
+        let (v, t) = self.expr(&arg.value)?;
+        if t.int_width().is_none() && !t.is_float() {
+            return Err(err("array constructor arguments must be numeric scalars"));
+        }
+        Ok(self.coerce(v, t, to))
+    }
+
+    /// `arange[T](start, stop[, step])` (#504): a rank-1 array `start, start+step,
+    /// ...` up to (excluding) `stop`; the length is a runtime value. Float dtypes
+    /// use the `_f` runtime entry point, integer dtypes `_i`.
+    fn lower_array_arange(
+        &mut self,
+        index: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let dtype = self.ctor_dtype(index)?;
+        if !(2..=3).contains(&args.len()) || args.iter().any(|a| a.name.is_some()) {
+            return Err(err(
+                "arange[T](start, stop[, step]) takes two or three positional arguments",
+            ));
+        }
+        let ty = Ty::Array(dtype, 1);
+        let arr = self.new_value(ty);
+        let code = self.iconst(Ty::I64, dtype.code());
+        let word = if dtype.is_float() { Ty::F64 } else { Ty::I64 };
+        let start = self.ctor_scalar(&args[0], word)?;
+        let stop = self.ctor_scalar(&args[1], word)?;
+        let step = if args.len() == 3 {
+            self.ctor_scalar(&args[2], word)?
+        } else if dtype.is_float() {
+            self.fconst(Ty::F64, 1.0)
+        } else {
+            self.iconst(Ty::I64, 1)
+        };
+        let func = if dtype.is_float() {
+            "zap_array_arange_f"
+        } else {
+            "zap_array_arange_i"
+        };
+        self.emit(Inst::Call {
+            dest: Some(arr),
+            func: func.to_string(),
+            args: vec![code, start, stop, step],
+        });
+        Ok((arr, ty))
+    }
+
+    /// `linspace[T](start, stop, num)` (#504): a rank-1 array of `num` evenly
+    /// spaced samples from `start` to `stop` inclusive of both ends.
+    fn lower_array_linspace(
+        &mut self,
+        index: &Expr,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let dtype = self.ctor_dtype(index)?;
+        if args.len() != 3 || args.iter().any(|a| a.name.is_some()) {
+            return Err(err(
+                "linspace[T](start, stop, num) takes three positional arguments",
+            ));
+        }
+        let ty = Ty::Array(dtype, 1);
+        let arr = self.new_value(ty);
+        let code = self.iconst(Ty::I64, dtype.code());
+        let start = self.ctor_scalar(&args[0], Ty::F64)?;
+        let stop = self.ctor_scalar(&args[1], Ty::F64)?;
+        let num = self.ctor_scalar(&args[2], Ty::I64)?;
+        self.emit(Inst::Call {
+            dest: Some(arr),
+            func: "zap_array_linspace".to_string(),
+            args: vec![code, start, stop, num],
+        });
         Ok((arr, ty))
     }
 
@@ -21356,5 +21592,101 @@ mod dtype_matrix_tests {
             zapc_syntax::parser::parse_str("def main():\n    auto a = array[f128]([1.0])\n");
         let (_m, errs) = lower_module(&module);
         assert!(!errs.is_empty(), "array[f128] should be rejected");
+    }
+}
+
+#[cfg(test)]
+mod constructor_tests {
+    //! Array constructors zeros/ones/full/arange/linspace (#504, D-0167).
+    //! Host-only (AST->ZIR): the interception, shape parsing, and runtime-call
+    //! wiring are a walled garden independent of codegen.
+    use super::lower_module;
+    use zapc_ir_core::Inst;
+
+    fn calls(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        let (m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Call { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn count(src: &str, func: &str) -> usize {
+        calls(src).iter().filter(|f| *f == func).count()
+    }
+
+    fn lowers_ok(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (_m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+    }
+
+    fn lower_fails(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (_m, errs) = lower_module(&module);
+        assert!(!errs.is_empty(), "expected a lowering error for\n{src}");
+    }
+
+    #[test]
+    fn zeros_ones_full_lower_with_shape_and_fill() {
+        // 1-D int zeros: new_nd + one set_dim + fill_i.
+        let z = "def main():\n    auto a = zeros[i64](3)\n    print(sum(a))\n";
+        lowers_ok(z);
+        assert_eq!(count(z, "zap_array_new_nd"), 1);
+        assert_eq!(count(z, "zap_array_set_dim"), 1);
+        assert_eq!(count(z, "zap_array_fill_i"), 1);
+        // N-D float ones: two set_dim, fill_f.
+        let o = "def main():\n    auto a = ones[f64]((2, 3))\n    print(sum(a))\n";
+        lowers_ok(o);
+        assert_eq!(count(o, "zap_array_set_dim"), 2);
+        assert_eq!(count(o, "zap_array_fill_f"), 1);
+        // full with a value; runtime-valued dims are allowed.
+        lowers_ok(
+            "def main():\n    auto n = 4\n    auto a = full[i32]((n, 2), 7)\n    print(sum(a))\n",
+        );
+    }
+
+    #[test]
+    fn arange_and_linspace_lower() {
+        // integer arange with explicit + default step.
+        let a = "def main():\n    auto a = arange[i64](0, 10, 2)\n    print(sum(a))\n";
+        lowers_ok(a);
+        assert_eq!(count(a, "zap_array_arange_i"), 1);
+        lowers_ok("def main():\n    auto a = arange[i64](0, 5)\n    print(len(a))\n");
+        // float arange uses the _f entry point.
+        let af = "def main():\n    auto a = arange[f64](0.0, 1.0, 0.25)\n    print(len(a))\n";
+        lowers_ok(af);
+        assert_eq!(count(af, "zap_array_arange_f"), 1);
+        // linspace.
+        let l = "def main():\n    auto a = linspace[f64](0.0, 1.0, 5)\n    print(a[4])\n";
+        lowers_ok(l);
+        assert_eq!(count(l, "zap_array_linspace"), 1);
+    }
+
+    #[test]
+    fn constructor_misuse_is_rejected() {
+        lower_fails("def main():\n    auto a = zeros[f128](3)\n"); // bad dtype
+        lower_fails("def main():\n    auto a = zeros[f64](())\n"); // empty shape
+        lower_fails("def main():\n    auto a = full[f64]((2, 2))\n"); // missing value
+        lower_fails("def main():\n    auto a = zeros[f64](3, 4)\n"); // dims must be a tuple, not varargs
+        lower_fails("def main():\n    auto a = arange[i64](0)\n"); // too few args
+        lower_fails("def main():\n    auto a = linspace[f64](0.0, 1.0)\n"); // needs num
     }
 }

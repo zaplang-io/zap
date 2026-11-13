@@ -975,6 +975,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   take the signed type that holds both, `u64`-with-signed → `f64`). Each integer
   dtype wraps at its own width; element access crosses as `int64`/`float64`.
 
+- **Array constructors** (#504, D-0167, epic #499): `zeros[T](shape)`,
+  `ones[T](shape)`, `full[T](shape, value)` (shape is an int for 1-D or a tuple
+  literal for N-D), `arange[T](start, stop[, step])` (half-open; a zero step
+  raises `ValueError`), and `linspace[T](start, stop, num)` (`num` samples, both
+  ends inclusive). All accept the full dtype matrix.
+
 - `scope(timeout=<ms>)` deadlines (integer milliseconds, no unit suffix): on
   expiry the scope cancels and awaits its children through the shared channel-aware
   cancellation path (preserving `finally`/`with` cleanup), then raises the new

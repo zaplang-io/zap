@@ -38,10 +38,10 @@ stretch size-1 axes, extend rank), **NEP-50 dtype promotion**, and contiguous
 Shapes that cannot broadcast together raise `ValueError` before entering the
 kernel. Empty and zero-axis arrays are supported.
 
-Axis reductions, N-D and strided views, `zeros`/`arange`/`sqrt`,
+Axis reductions, N-D and strided views, `sqrt` (and other elementwise math),
 division/comparison kernels, broadcasting in assignment / partial-index
 (whole-row) stores, inner-axis SIMD on the broadcast path, and
-list-variable/iterable constructors are future design work. The broader examples
+list-variable/iterable `array[T]` construction are future design work. The broader examples
 below describe that future design rather than an available surface. Unsupported
 forms receive semantic or lowering errors.
 `float64`/`float` is supported in every built-in collection position — list
@@ -220,6 +220,17 @@ header + buffer layout, GC-managed buffer).
   `u32+i32→i64`), `u64`-with-signed → `f64`. Weak scalars keep the array dtype
   (int) or a float array's width (float).
 
+**Increment 6 (shipped, #504 / D-0167):** constructors.
+
+- `zeros[T](shape)` / `ones[T](shape)` / `full[T](shape, value)`: `shape` is an
+  int (1-D) or a tuple literal (N-D) — arity = static rank, dim values runtime.
+  Lowering allocates via `zap_array_new_nd` + `zap_array_set_dim` and fills with
+  `zap_array_fill_i`/`_f`.
+- `arange[T](start, stop[, step])`: half-open 1-D range, runtime length; a zero
+  step raises `ValueError` (`zap_array_arange_i`/`_f`). `linspace[T](start, stop,
+  num)`: `num` samples inclusive of both ends (`zap_array_linspace`). All over
+  the full dtype matrix.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Inner-axis SIMD for the broadcast path; broadcasting in assignment /
@@ -234,8 +245,9 @@ header + buffer layout, GC-managed buffer).
   at the base and `off` carries the window. A strided view would need per-axis
   strides the 1-D `ZapArray` has not got, so a stepped array slice is rejected at
   compile time for now (a list slice, a copy, supports any step).
-- `zeros`/`arange`/`sqrt` and axis reductions. (The full dtype matrix —
-  `f32`/`i32`/`i8`/`i16`/`u16`/`u32`/`u64` — shipped in Increment 5, D-0166.)
+- `sqrt`/elementwise math and axis reductions. (The full dtype matrix shipped in
+  Increment 5 / D-0166; `zeros`/`ones`/`full`/`arange`/`linspace` in Increment 6
+  / D-0167.)
 - Scalar-on-the-left of a non-commutative op (`scalar - array`).
 - `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 

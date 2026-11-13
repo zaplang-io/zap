@@ -5847,6 +5847,31 @@ impl Checker {
                 }
                 return Ty::Unknown;
             }
+            // Array constructors `zeros[T](shape)` / `ones` / `full[T](shape, v)` /
+            // `arange[T](...)` / `linspace[T](...)` (#504, D-0167). Validate the
+            // dtype name and type-check the arguments; the result is typed loosely
+            // (`array` is Unknown in sema), with concrete shape/arity checks in
+            // lowering.
+            if matches!(base.as_ref(), Expr::Name(n, _)
+                if matches!(n.as_str(), "zeros" | "ones" | "full" | "arange" | "linspace"))
+            {
+                let valid_dtype = matches!(index.as_ref(), Expr::Name(n, _) if matches!(n.as_str(),
+                    "float" | "f64" | "float64" | "f32" | "float32"
+                    | "int" | "i64" | "int64" | "i32" | "int32" | "i16" | "int16" | "i8" | "int8"
+                    | "uint8" | "u8" | "u16" | "uint16" | "u32" | "uint32" | "u64" | "uint64"
+                    | "bool"));
+                if !valid_dtype {
+                    self.error(
+                        ErrorCode::ZAP4028,
+                        "unsupported array dtype; expected f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, or bool".to_string(),
+                        expr_span(index),
+                    );
+                }
+                for a in args {
+                    self.infer(&a.value);
+                }
+                return Ty::Unknown;
+            }
             // Channel construction `channel[T]()` / `channel[T](cap)` (ticket #25,
             // D-0031). The element type `T` appears as the subscript; an optional
             // single argument is the buffer capacity (an integer).

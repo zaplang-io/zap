@@ -8576,3 +8576,28 @@ matrix (third increment of the arrays epic #499, over D-0164/D-0165):
   float array's width else forces `f64`. The legacy 4-dtype results are
   unchanged subcases.
 No grammar change. See `design/0002-arrays.md`, SPEC §15, `design/RUNTIME-ABI.md`.
+
+## D-0167 — Array constructors: zeros / ones / full / arange / linspace (#504)
+**Status:** Locked (design) / implemented
+Fourth increment of the arrays epic (#499), over N-D shape (D-0164),
+broadcasting (D-0165), and the dtype matrix (D-0166). Adds the dtype-parameterized
+constructors, intercepted at call lowering like `array[T]` construction:
+- **`zeros[T](shape)` / `ones[T](shape)` / `full[T](shape, value)`.** `shape` is
+  an **int** (1-D) or a **tuple literal** `(d0, d1, …)` (N-D) — the arity gives
+  the static rank (as D-0164 requires), while the dim *values* may be runtime.
+  Varargs dims (`zeros[T](3, 4)`) are **not** accepted (NumPy parity, and keeps
+  `full`'s trailing `value` unambiguous). Lowering allocates via
+  `zap_array_new_nd` + per-axis `zap_array_set_dim`, then fills with
+  `zap_array_fill_i`/`_f` (the value as an `i64`/`f64` ABI word).
+- **`arange[T](start, stop[, step])`.** A half-open 1-D range; the length is a
+  runtime value (`ceil((stop−start)/step)`, clamped to 0). `step` defaults to 1;
+  a **zero step raises a catchable `ValueError`**. Integer dtypes use
+  `zap_array_arange_i`, floats `zap_array_arange_f`.
+- **`linspace[T](start, stop, num)`.** `num` evenly-spaced samples from `start`
+  to `stop` **inclusive of both ends** (NumPy default); `num == 1` → `[start]`,
+  `num <= 0` → empty. The last sample is set to `stop` exactly (no fp drift).
+  `zap_array_linspace` fills in `double`; an integer dtype truncates.
+All constructors accept the full dtype matrix (D-0166). A fully dynamic-rank
+shape (a runtime tuple variable) stays deferred — rank must be static. No grammar
+change (the subscript-call form already parses). See `design/0002-arrays.md`,
+SPEC §15, `design/RUNTIME-ABI.md`.

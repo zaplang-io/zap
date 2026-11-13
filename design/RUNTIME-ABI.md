@@ -223,7 +223,9 @@ allocation, not a header plus a separate data buffer:
   buffer is still contiguous and has no strides. A nested literal builds an N-D
   array via `zap_array_new_nd(dtype, ndim, total)` + one `zap_array_set_dim`
   per axis; `zap_array_count`/`zap_array_ndim`/`zap_array_dim` back `a.size`/
-  `a.ndim`/`a.shape`. A partial index `m[i]` is a rank-(n-1) **view**
+  `a.ndim`/`a.shape`. Constructors (#504, D-0167): `zeros`/`ones`/`full` build a
+  `new_nd` array then `zap_array_fill_i`/`_f`; `zap_array_arange_i`/`_f` and
+  `zap_array_linspace` allocate and fill a runtime-length 1-D array. A partial index `m[i]` is a rank-(n-1) **view**
   (`zap_array_row`): it shares the buffer base and advances `off` by one
   row-stride, copying `dims[1..]` into a fresh (non-interior) buffer; a full
   index `m[i, j]` folds rows to a rank-1 view then a 1-D get. Contiguous 1-D

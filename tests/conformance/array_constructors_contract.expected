@@ -1,0 +1,6 @@
+zeros 0
+ones 4.0
+full 28
+arange 5 20
+linspace 0.5 1.0
+step error
