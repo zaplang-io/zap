@@ -1164,6 +1164,42 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **gc-boehm: a coroutine preempted inside `gc.collect()` (or another libgc call)
+  deadlocked the program** (#888, D-0162). The async-preemption handler may switch a
+  coroutine away at any instruction unless it is in a no-preempt window. Allocation
+  was always inside one, but `gc.collect()` (`GC_gcollect`, which holds the bdwgc
+  allocator lock for the whole collection), finalizer registration, heap statistics,
+  the raw `zap_alloc`, the scheduler's infrastructure allocations and thread
+  create/join/detach were not: a coroutine preempted while holding the lock left the
+  next coroutine on the same OS thread to block on a mutex its own thread owned, and
+  every worker piled up behind it (`gc_switch_alloc_stress` hung ~7% of runs). Every
+  such libgc entry point now lives in a guarded no-preempt layer, and a source test
+  forbids raw calls outside it. New golden `gc_collect_preempt_stress`.
+
+- **gc-boehm: a coroutine preempted between publishing its state and the swap was
+  lost** (#889, D-0162). `g_bootstrap`, `copark` and `cosched` store `g->state`
+  (`G_DEAD` / `G_PARKED` / `G_RUNNABLE`) and then swap; `cosched`/`copark` cleared the
+  no-preempt depth before the swap and `g_bootstrap` never raised it, so a preemption in
+  that microseconds-wide span rewrote the state, and the resumed sequence swapped out
+  with `G_RUNNING` — which the scheduler has no branch for: an exiting coroutine was
+  never reclaimed (hang at join) and a parking one never had its channel mutex released
+  nor was woken. The span is now a no-preempt window cleared by the scheduler after
+  the swap. New testing knob `ZAP_PREEMPT_SLICE_US` (POSIX; shortens the preemption
+  slice) and golden `coroutine_preempt_window_stress`.
+
+- **aarch64: a thread-local read after a coroutine parked used a stale thread
+  pointer — the no-preempt bookkeeping hit the wrong coroutine, and a gc-immix
+  collection could wait forever** (#891, D-0163; found with the aarch64 re-run in
+  #223). At `-O2` the compiler keeps a thread-local's address in a callee-saved
+  register that `swapcontext` restores unchanged, so after a park (`chan_block`'s
+  `zap_np_lock/unlock`, `zap_safepoint`'s `zap_self`) the access touched the thread the
+  coroutine had left. `cur_m`, `zap_self` and `zap_shadow_head` are now reached only
+  through `noinline` accessors that recompute the thread pointer on every use, a source
+  test forbids a new bare runtime `__thread`, and the gc-boehm preemption handler only
+  switches a coroutine when the interrupted instruction is in the program's own text
+  (not inside libgc/libc). The collect-loop stress on aarch64 goes from 105/120 clean to
+  150/150.
+
 - **gc-boehm: a stop-the-world landing during a coroutine context switch crashed
   the collector** (#885, D-0161). The scheduler moved Boehm's per-thread stack end
   to the coroutine's stack top *before* the `swapcontext` that moves `sp`, and back

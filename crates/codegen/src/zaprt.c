@@ -341,6 +341,22 @@ extern const ZapTypeDesc zap_desc_atomicarray; /* AtomicArray[T] (#844)         
  * builds (a harmless no-op when no coroutine is running). */
 static void zap_np_enter(void);
 static void zap_np_leave(void);
+/* The current coroutine's no-preempt counter, or NULL off a coroutine (defined in
+ * the scheduler section). A `noinline` call that reads the thread-local FRESH, so
+ * a caller may hold the returned pointer across code that cannot park (a libgc
+ * call) and use it for both ends of a no-preempt window with ONE thread-local read
+ * (I#891: cheaper than two, and immune to a stale thread pointer). */
+static __attribute__((noinline)) int *zap_np_slot(void);
+static inline void zap_np_begin(int *np) {
+    if (np) {
+        ++*np;
+    }
+}
+static inline void zap_np_end(int *np) {
+    if (np && *np > 0) {
+        --*np;
+    }
+}
 
 /* CPU profiler (ticket #78, D-0058). Defined in the profiler section at the end
  * of this file (it needs the scheduler globals and, under gc-immix, the mutator
@@ -412,7 +428,12 @@ void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes);
  * becomes unreachable. `zap_py_wrap` uses it for the CPython-ref DECREF. */
 void zap_gc_register_finalizer(void *payload, void (*fn)(void *obj, void *cd), void *cd);
 int64_t zap_gc_finalizer_selftest(void); /* internal __gc_finalizer_selftest hook */
-extern __thread void *zap_shadow_head;
+/* The per-thread shadow-stack head lives in `zap_shadow_head_tls` (zapgc.inc.c) and
+ * is reached ONLY through the `noinline` accessor, never by a cached thread-local
+ * address, so a coroutine that migrates OS threads at a safepoint cannot touch the
+ * thread it left (I#891; generated code already did, I#159/#568). */
+void **zap_shadow_head_addr(void);
+#define zap_shadow_head (*zap_shadow_head_addr())
 static void zap_enter_blocking(void); /* fwd (defined in zapgc.inc.c)           */
 static void zap_leave_blocking(void);
 static void zap_mutator_register(void);
@@ -453,53 +474,120 @@ void zap_gc_add_root(void **slot) { (void)slot; }
  * incremental cycle.) */
 void zap_gc_write_barrier(void **slot) { (void)slot; }
 #define zap_gc_mark(p) ((void)(p))
-/* Boehm allocation routes to GC_MALLOC, whose internal allocator lock must not
- * be held across an async preemption (ticket #172): a switched-in sibling
- * coroutine on the same M calling GC_MALLOC would deadlock on that lock. So each
- * allocation is a no-preempt window — the one runtime lock a tight, yield-free
- * compute loop actually touches. */
+/* ZAP_GC_GUARDED_LAYER_BEGIN (Boehm) --------------------------------------------
+ * EVERY call into libgc that takes (or may take) the collector's allocator lock
+ * lives in this block, bracketed by a no-preempt window, and nothing outside the
+ * `ZAP_GC_GUARDED_LAYER_*` blocks may name the raw entry points (a unit test in
+ * zapc_codegen enforces it — I#888).
+ *
+ * Why: the allocator lock is a plain, non-recursive `pthread_mutex_t`. The Boehm
+ * async-preemption handler (SIGURG, ticket #172) switches a coroutine away at an
+ * arbitrary instruction unless it is inside a no-preempt window (`no_preempt > 0`).
+ * A coroutine preempted while inside libgc holds the lock across the switch; the
+ * coroutine run next on the SAME OS thread then blocks in its first allocation on
+ * a lock its own thread already owns — a self-deadlock that wedges every worker.
+ * The allocation helpers were always guarded; `gc.collect()` (`GC_gcollect`, which
+ * holds the lock for the whole collection), the finalizer registration, the heap
+ * statistics, the raw `zap_alloc`, the scheduler-infrastructure allocations and the
+ * thread create/join/detach calls (each takes the lock) were not (I#888: a
+ * coroutine preempted just inside `GC_gcollect` hung `gc_switch_alloc_stress`
+ * ~7% of runs). */
+static inline void *zap_gc_malloc(size_t n) {
+    int *np = zap_np_slot();
+    zap_np_begin(np);
+    void *p = GC_MALLOC(n);
+    zap_np_end(np);
+    return p;
+}
+static inline void *zap_gc_malloc_atomic(size_t n) {
+    int *np = zap_np_slot();
+    zap_np_begin(np);
+    void *p = GC_MALLOC_ATOMIC(n);
+    zap_np_end(np);
+    return p;
+}
+static inline void zap_gc_collect_guarded(void) {
+    int *np = zap_np_slot();
+    zap_np_begin(np);
+    GC_gcollect();
+    zap_np_end(np);
+}
+static inline void zap_gc_heap_sizes(size_t *heap, size_t *freeb) {
+    int *np = zap_np_slot();
+    zap_np_begin(np);
+    *heap = GC_get_heap_size();
+    *freeb = GC_get_free_bytes();
+    zap_np_end(np);
+}
+/* Finalizers (ticket #92): forward to Boehm's registration so the one call site
+ * (`zap_py_wrap`) is backend-uniform. Boehm's default finalizer already provides
+ * exactly these semantics (one-shot, run when unreachable, outside the GC). */
+static inline void zap_gc_register_finalizer(void *payload,
+                                             void (*fn)(void *obj, void *cd), void *cd) {
+    int *np = zap_np_slot();
+    zap_np_begin(np);
+    GC_register_finalizer(payload, (GC_finalization_proc)fn, cd, NULL, NULL);
+    zap_np_end(np);
+}
+/* ZAP_GC_GUARDED_LAYER_END */
+
 /* Every Boehm allocation checks the result: on heap exhaustion GC_MALLOC /
  * GC_MALLOC_ATOMIC return NULL (bdwgc's default GC_oom_fn returns 0), and codegen
  * stores into the returned pointer unchecked (#697), so an unchecked NULL faults
  * as a nil-deref SIGSEGV at address 0. Routing NULL through zap_oom turns that
  * wild fault into a clean `zap: out of memory` abort. */
 static inline void *zap_alloc_desc(const ZapTypeDesc *d) {
-    zap_np_enter();
-    void *p = GC_MALLOC((size_t)d->size);
-    zap_np_leave();
+    void *p = zap_gc_malloc((size_t)d->size);
     if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_obj(const ZapTypeDesc *d) {
-    zap_np_enter();
-    void *p = GC_MALLOC((size_t)d->size);
-    zap_np_leave();
+    void *p = zap_gc_malloc((size_t)d->size);
     if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_buf(int64_t n) {
-    zap_np_enter();
-    void *p = GC_MALLOC_ATOMIC((size_t)n);
-    zap_np_leave();
+    void *p = zap_gc_malloc_atomic((size_t)n);
     if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_ptrbuf(int64_t n) {
-    zap_np_enter();
-    void *p = GC_MALLOC((size_t)n);
-    zap_np_leave();
+    void *p = zap_gc_malloc((size_t)n);
     if (!p) zap_oom(NULL);
     return p;
 }
-#define ZAP_INFRA_ALLOC(n) GC_MALLOC(n)
-/* Finalizers (ticket #92): forward to Boehm's registration so the one call site
- * (`zap_py_wrap`) is backend-uniform. Boehm's default finalizer already provides
- * exactly these semantics (one-shot, run when unreachable, outside the GC). */
-static inline void zap_gc_register_finalizer(void *payload,
-                                             void (*fn)(void *obj, void *cd), void *cd) {
-    GC_register_finalizer(payload, (GC_finalization_proc)fn, cd, NULL, NULL);
-}
+#define ZAP_INFRA_ALLOC(n) zap_gc_malloc(n)
 #endif
+
+/* ZAP_GC_GUARDED_LAYER_BEGIN (threads) -------------------------------------------
+ * Thread create / detach / join. Under Boehm these are `GC_pthread_*` and take the
+ * allocator lock (thread-table update + allocation), and a coroutine can reach them
+ * (`dedicated_pin`, the scope timers, the lazily-started pollers) — so they get the
+ * same no-preempt window as every other libgc entry point (I#888). Under Immix they
+ * are plain pthread calls and the window is a harmless no-op bracket. */
+static inline int zap_gc_pthread_create(pthread_t *t, const pthread_attr_t *a,
+                                        void *(*fn)(void *), void *arg) {
+    int *np = zap_np_slot();
+    zap_np_begin(np);
+    int rc = GC_pthread_create(t, a, fn, arg);
+    zap_np_end(np);
+    return rc;
+}
+static inline int zap_gc_pthread_detach(pthread_t t) {
+    int *np = zap_np_slot();
+    zap_np_begin(np);
+    int rc = GC_pthread_detach(t);
+    zap_np_end(np);
+    return rc;
+}
+static inline int zap_gc_pthread_join(pthread_t t, void **rv) {
+    int *np = zap_np_slot();
+    zap_np_begin(np);
+    int rc = GC_pthread_join(t, rv);
+    zap_np_end(np);
+    return rc;
+}
+/* ZAP_GC_GUARDED_LAYER_END */
 
 /* One-object string layout (#837, D-0145). The byte payload is a flexible array
  * member CONTIGUOUS with the header, so a string is a SINGLE GC object (header +
@@ -535,9 +623,7 @@ static ZapStr *zap_str_alloc(int64_t len) {
 #ifdef ZAP_GC_IMMIX
     ZapStr *s = (ZapStr *)zap_gc_alloc_var(&zap_desc_strobj, total);
 #else
-    zap_np_enter();
-    ZapStr *s = (ZapStr *)GC_MALLOC_ATOMIC((size_t)total);
-    zap_np_leave();
+    ZapStr *s = (ZapStr *)zap_gc_malloc_atomic((size_t)total);
     if (!s) {
         zap_oom(NULL);
     }
@@ -580,9 +666,7 @@ static void *zap_arena_boehm_alloc(ZapArena *a, size_t n, int atomic) {
     if (a->cap && a->reserved + n > a->cap) {
         return NULL; /* cap exceeded -> MemoryError */
     }
-    zap_np_enter();
-    void *p = atomic ? GC_MALLOC_ATOMIC(n) : GC_MALLOC(n);
-    zap_np_leave();
+    void *p = atomic ? zap_gc_malloc_atomic(n) : zap_gc_malloc(n);
     if (!p) {
         return NULL; /* heap OOM -> MemoryError */
     }
@@ -779,7 +863,7 @@ void *zap_alloc(int64_t size) {
      * net rather than a hot path. */
     return zap_gc_alloc_atomic(size);
 #else
-    void *p = GC_MALLOC((size_t)size);
+    void *p = zap_gc_malloc((size_t)size); /* guarded: I#888 */
     if (!p) zap_oom(NULL); /* unchecked NULL would nil-deref in generated code (#697) */
     return p;
 #endif
@@ -797,10 +881,10 @@ void *zap_alloc(int64_t size) {
  * ones wrap bdwgc here. */
 int64_t zap_gc_count(void);
 #ifndef ZAP_GC_IMMIX
-void zap_gc_collect(void) { GC_gcollect(); }
+void zap_gc_collect(void) { zap_gc_collect_guarded(); } /* I#888: no-preempt window */
 void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes) {
-    size_t heap = GC_get_heap_size();
-    size_t freeb = GC_get_free_bytes();
+    size_t heap, freeb;
+    zap_gc_heap_sizes(&heap, &freeb);
     if (heap_bytes) {
         *heap_bytes = (int64_t)heap;
     }
@@ -5312,20 +5396,34 @@ typedef struct Waiter {
 /* ---- scheduler globals ---------------------------------------------------- */
 /* The M running this thread; NULL on main.
  *
- * CONTRACT (I#869, D-0160): never hold `&cur_m` — or any value derived from this
- * thread's TLS base — across a point where the running coroutine can park. A
- * coroutine is resumed on whichever worker thread picks it up, so after any
+ * CONTRACT (I#869, D-0160; enforced for every site by I#891): a thread-local's
+ * ADDRESS must never be held across a point where the running coroutine can park.
+ * A coroutine is resumed on whichever worker thread picks it up, so after any
  * `zap_ctx_swap` / `copark` / `cosched` / call into code that can block, "this
  * thread" is a different OS thread. On aarch64 at -O2 the compiler materialises a
  * thread-local's address (`mrs tpidr_el0` + offset) ONCE per function and keeps it
  * in a callee-saved register, which `swapcontext` restores unchanged on resume: a
- * post-park `cur_m` read then loads the OLD thread's slot. (x86_64 executables
+ * post-park access then reads/writes the OLD thread's slot. (x86_64 executables
  * address TLS as `%fs:off` on every access, so they do not show it; an x86_64
- * -fPIC build can.) The coroutine-side way to find its M after resuming is
- * `g->run_m`, written by `switch_to_g`; the unit tests in zapc_codegen pin that
- * `g_bootstrap` obeys this. Reading `cur_m` ONCE and using it only up to the
- * park (cosched/copark/zap_np_enter..leave) is fine. */
-static __thread M *cur_m = NULL;
+ * -fPIC build can.) `g_bootstrap` hit it first (I#869), then the no-preempt
+ * bookkeeping: `chan_block` parks and afterwards runs the inlined
+ * `zap_np_lock/unlock`, which bumped the depth of whatever coroutine was running
+ * on the OLD thread (I#891) and left the real one preemptible inside a lock or
+ * inside libgc.
+ *
+ * So the storage is private and EVERY access goes through `zap_cur_m_slot()`: a
+ * `noinline` function whose volatile asm keeps both GCC's and LLVM's IPA from
+ * inferring it const/pure and merging calls, so the thread pointer is recomputed on
+ * each use and can never be cached across a park. `cur_m` is a macro for the
+ * dereferenced slot, so reads, writes and `cur_m->field` all read naturally. The
+ * coroutine-side way to find its M after resuming is still `g->run_m`
+ * (`switch_to_g`). */
+static __thread M *zap_cur_m_tls = NULL;
+static __attribute__((noinline)) M **zap_cur_m_slot(void) {
+    __asm__ __volatile__("" ::: "memory");
+    return &zap_cur_m_tls;
+}
+#define cur_m (*zap_cur_m_slot())
 
 static M *g_ms = NULL;
 static P *g_ps = NULL;
@@ -5381,18 +5479,13 @@ static size_t zap_stack_size(void) {
  * so it follows the coroutine across M migrations; the Boehm async-preemption
  * handler only switches when it is 0. A no-op on a native thread (main) or in
  * the scheduler loop (no current coroutine), which are never async-preempted. */
-static void zap_np_enter(void) {
-    M *m = cur_m;
-    if (m && m->current) {
-        m->current->no_preempt++;
-    }
+static __attribute__((noinline)) int *zap_np_slot(void) {
+    __asm__ __volatile__("" ::: "memory"); /* never const/pure: not mergeable across a park (I#891) */
+    M *m = zap_cur_m_tls;                  /* fresh thread-local read on EVERY call */
+    return (m && m->current) ? &m->current->no_preempt : NULL;
 }
-static void zap_np_leave(void) {
-    M *m = cur_m;
-    if (m && m->current && m->current->no_preempt > 0) {
-        m->current->no_preempt--;
-    }
-}
+static void zap_np_enter(void) { zap_np_begin(zap_np_slot()); }
+static void zap_np_leave(void) { zap_np_end(zap_np_slot()); }
 /* Guarded lock/unlock for the runtime critical sections a long, non-parking
  * compute loop can touch (channel fast paths, sync primitives): holding one of
  * these mutexes across an async preemption could deadlock a switched-in sibling
@@ -5637,6 +5730,9 @@ static void switch_to_g(M *m, G *g) {
     zap_shadow_head = g->shadow_head;
 #endif
     zap_ctx_swap(&m->sched_ctx, &g->ctx);
+    /* I#889: the coroutine is stopped (it published its state and swapped out), so
+     * end the no-preempt window it opened in `g_enter_switch_out`. */
+    g->no_preempt = 0;
 #ifdef ZAP_GC_IMMIX
     g->shadow_head = zap_shadow_head;
 #endif
@@ -5674,6 +5770,31 @@ static void switch_to_g(M *m, G *g) {
 
 static void *g_entry_fn(G *g); /* fwd */
 
+/* I#889: the publish-state -> swap span is a no-preempt window.
+ *
+ * A coroutine that is about to switch away tells the scheduler WHY by storing
+ * `g->state` (G_DEAD / G_PARKED / G_RUNNABLE) and then calling `zap_ctx_swap`;
+ * `switch_to_g` dispatches on that state when the swap returns. If the Boehm
+ * async-preemption handler (SIGURG) fires between the store and the actual
+ * switch — the swap is a PLT stub, glibc's context save and an `rt_sigprocmask`
+ * syscall, so that is microseconds, not instructions — `copreempt` overwrites the
+ * state with G_RUNNABLE and switches away; when the scheduler later resumes the
+ * coroutine inside the handler it sets G_RUNNING, the handler returns, and the
+ * interrupted park/exit sequence performs ITS swap with state == G_RUNNING, which
+ * `switch_to_g` has no branch for: an exiting coroutine is never reclaimed
+ * (`g_live` never reaches 0 -> hang at join), a parking one never has its
+ * `parkmu` unlocked nor is woken.
+ *
+ * So the span is made non-preemptible: raise the depth BEFORE the state store
+ * (the compiler barrier makes the handler, which runs on this very thread, observe
+ * the stores in that order), do NOT clear it on the coroutine side, and let
+ * `switch_to_g` clear it once the coroutine is stopped. The depth is per-G, so it
+ * cannot leak to a sibling. (`copark`/`cosched` used to clear it BEFORE the swap.) */
+static inline void g_enter_switch_out(G *g) {
+    g->no_preempt = 1;
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+}
+
 /* The makecontext bootstrap: runs on the green stack. Re-reads `cur_m` after
  * the call returns because a G may be resumed on a different M than it started
  * on. Never returns — switches back to whatever M's scheduler is running it. */
@@ -5692,6 +5813,7 @@ static void g_bootstrap(void) {
      * (set by `switch_to_g`), read from the heap-allocated G, which the compiler
      * cannot cache across the opaque body call. */
     m = g->run_m;
+    g_enter_switch_out(g); /* I#889: no preemption between the state store and the swap */
     g->state = G_DEAD;
     zap_ctx_swap(&g->ctx, &m->sched_ctx);
     /* unreachable */
@@ -5835,6 +5957,7 @@ static G *galloc(void *fn, void *arg) {
     g->link = NULL;
     g->parkmu = NULL;
     g->run_m = NULL; /* I#869: set by switch_to_g on every resume */
+    g->no_preempt = 0; /* I#889: a recycled G must not inherit a stale window */
     g->scope = NULL;
     g->in_live = 0;
     g->name = NULL;
@@ -6052,10 +6175,50 @@ static inline void zap_sp_clear(uint32_t lane) {
 #if defined(ZAP_PLATFORM_POSIX)
 /* SIGURG handler: the preemption point. Installed process-wide; only acts on a
  * worker thread that is currently running a (non-pinned) coroutine. */
+/* I#891 / I#223 defense in depth: is the interrupted instruction inside THIS
+ * program's own text (the Zap-generated code and the runtime, which are linked into
+ * the executable)? If not, the signal landed inside libgc, libc, the dynamic loader
+ * or the vdso — code that may hold the allocator lock or other thread-affine state
+ * (the collector's thread-local free lists, mutexes whose owner is the OS thread),
+ * and switching the coroutine away THERE lets the next coroutine on this thread
+ * corrupt or deadlock on it. A 32-core aarch64 re-run measured the effect: no
+ * preemption unless the PC is in the executable's text took a ~1.5% failure rate to
+ * 0/4500. The no-preempt windows (zap_np_*) are the precise guard; this is the
+ * catch-all for libc/libgc code reached on paths nobody wrapped. A declined
+ * preemption keeps `m->preempt` latched and the monitor re-signals, so fairness only
+ * waits for the next tick. Linux x86_64/aarch64 only; elsewhere it always allows. */
+#ifndef ZAP_GC_IMMIX /* only the Boehm async-preemption branch consults it */
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+/* WEAK: when the runtime is built as a shared object (the REPL `dlopen`s it, and
+ * `-fPIC` builds exist) the linker does not provide `__executable_start`, and a strong
+ * reference would make the load fail ("undefined symbol"). Missing bounds mean we
+ * cannot tell "program text" from "library text", so preemption is simply allowed
+ * (the no-preempt windows remain the precise guard). */
+extern char __executable_start __attribute__((weak));
+extern char etext __attribute__((weak));
+static int zap_pc_in_program_text(void *uc) {
+    if (&__executable_start == NULL || &etext == NULL) {
+        return 1;
+    }
+    ucontext_t *u = (ucontext_t *)uc;
+#if defined(__x86_64__)
+    uintptr_t pc = (uintptr_t)u->uc_mcontext.gregs[16]; /* REG_RIP (needs _GNU_SOURCE by name) */
+#else
+    uintptr_t pc = (uintptr_t)u->uc_mcontext.pc;
+#endif
+    return pc >= (uintptr_t)&__executable_start && pc < (uintptr_t)&etext;
+}
+#else
+static int zap_pc_in_program_text(void *uc) {
+    (void)uc;
+    return 1;
+}
+#endif
+#endif /* !ZAP_GC_IMMIX */
+
 static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
     (void)sig;
     (void)info;
-    (void)uc;
     M *m = cur_m;
     if (!m || !m->current) {
         return; /* main/scheduler/idle thread: nothing to preempt */
@@ -6098,7 +6261,7 @@ static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {
         char *sp = &probe;
         char *lo = (char *)g->stack;
         char *hi = lo + g->stack_size;
-        if (sp >= lo && sp < hi && g->no_preempt == 0 &&
+        if (sp >= lo && sp < hi && g->no_preempt == 0 && zap_pc_in_program_text(uc) &&
             !__atomic_load_n(&g_boehm_in_stw, __ATOMIC_SEQ_CST)) {
             __atomic_store_n(&m->preempt, 0, __ATOMIC_RELAXED);
             copreempt();
@@ -6123,13 +6286,29 @@ static void *zap_monitor_main(void *arg) {
     if (!last) {
         return NULL;
     }
+#if !defined(ZAP_PLATFORM_WINDOWS)
+    /* `ZAP_PREEMPT_SLICE_US` shortens the preemption slice (default ~10 ms) so a
+     * test can make the async-preemption signal land thousands of times more
+     * often and exercise the park/exit/collect windows reliably (I#888, I#889).
+     * A tuning/testing knob; unset or out of range (20 us .. 1 s) keeps the default. */
+    long slice_ns = ZAP_PREEMPT_SLICE_NS;
+    {
+        const char *e = getenv("ZAP_PREEMPT_SLICE_US");
+        if (e && *e) {
+            long us = strtol(e, NULL, 10);
+            if (us >= 20 && us < 1000000L) {
+                slice_ns = us * 1000L;
+            }
+        }
+    }
+#endif
     for (;;) {
 #if defined(ZAP_PLATFORM_WINDOWS)
         Sleep((DWORD)(ZAP_PREEMPT_SLICE_NS / 1000000L));
 #else
         struct timespec ts;
         ts.tv_sec = 0;
-        ts.tv_nsec = ZAP_PREEMPT_SLICE_NS;
+        ts.tv_nsec = slice_ns;
         nanosleep(&ts, NULL);
 #endif
         if (__atomic_load_n(&g_shutdown, __ATOMIC_RELAXED)) {
@@ -6334,7 +6513,7 @@ static void dedicated_pin(int joinable) {
         g_ded_live++;
         zap_np_unlock(&g_ded_mu);
     }
-    if (GC_pthread_create(&d->thread, NULL, dedicated_worker_main, d) != 0) {
+    if (zap_gc_pthread_create(&d->thread, NULL, dedicated_worker_main, d) != 0) {
         if (joinable) {
             zap_np_lock(&g_ded_mu);
             g_ded_live--;
@@ -6343,7 +6522,7 @@ static void dedicated_pin(int joinable) {
         free(d);
         return;
     }
-    GC_pthread_detach(d->thread); /* self-cleaning; joined via the chosen barrier */
+    zap_gc_pthread_detach(d->thread); /* self-cleaning; joined via the chosen barrier */
     g->lock_depth = 1;
     g->locked_m = d;
     /* Yield: switch_to_g on the current worker will route us (locked_m set) to
@@ -6411,14 +6590,14 @@ static void zap_sched_init_once(void) {
     GC_set_on_collection_event(zap_boehm_gc_event);
 #endif
     for (int i = 0; i < g_nm; i++) {
-        int rc = GC_pthread_create(&g_ms[i].thread, NULL, worker_main, &g_ms[i]);
+        int rc = zap_gc_pthread_create(&g_ms[i].thread, NULL, worker_main, &g_ms[i]);
         if (rc != 0) {
             fprintf(stderr, "zap: failed to start scheduler thread (%d)\n", rc);
             abort();
         }
     }
     /* The preemption monitor: samples schedticks and signals monopolizing Ms. */
-    if (GC_pthread_create(&g_monitor_thread, NULL, zap_monitor_main, NULL) == 0) {
+    if (zap_gc_pthread_create(&g_monitor_thread, NULL, zap_monitor_main, NULL) == 0) {
         g_monitor_started = 1;
     }
     /* ZAP_PROFILE=cpu: start the CPU profiler now that the worker Ms it samples
@@ -6512,11 +6691,11 @@ void zap_rt_join_all(void) {
     zap_np_unlock(&g_idle_mu);
     /* Stop the preemption monitor (it polls g_shutdown every slice). */
     if (g_monitor_started) {
-        GC_pthread_join(g_monitor_thread, NULL);
+        zap_gc_pthread_join(g_monitor_thread, NULL);
         g_monitor_started = 0;
     }
     for (int i = 0; i < g_nm; i++) {
-        GC_pthread_join(g_ms[i].thread, NULL);
+        zap_gc_pthread_join(g_ms[i].thread, NULL);
     }
     /* All worker Ms are joined, so no SIGPROF handler can still be running: free
      * the per-M profiler ring buffers (ticket #78). */
@@ -6597,11 +6776,12 @@ static void cosched(void) {
         zap_panic(zap_str_new("stack overflow", 14));
         return;
     }
-    g->state = G_RUNNABLE;
     /* A yield is a safe point: any no-preempt window the caller opened ends here
-     * (it holds no lock at a cooperative yield), so reset the depth before we
-     * switch out rather than leak it to whatever coroutine runs next. */
-    g->no_preempt = 0;
+     * (it holds no lock at a cooperative yield) — but the depth is cleared by
+     * `switch_to_g` AFTER the swap, not here, so the state-store -> swap span
+     * stays non-preemptible (I#889, see `g_enter_switch_out`). */
+    g_enter_switch_out(g);
+    g->state = G_RUNNABLE;
     zap_ctx_swap(&g->ctx, &m->sched_ctx);
 }
 
@@ -6624,9 +6804,9 @@ static void copreempt(void) {
      * user stack — it only switches away — and this can run in signal context
      * (Boehm), where zap_panic would be unsafe. A genuinely near-full stack is
      * still caught at the next cooperative cosched/copark in normal context. */
+    g_enter_switch_out(g); /* I#889; cleared by switch_to_g after the swap */
     g->state = G_RUNNABLE;
     g->preempt_requeue = 1;
-    g->no_preempt = 0;
 #if defined(ZAP_PLATFORM_WINDOWS)
     /* The coroutine has now yielded (we are about to swap away): clear the per-M
      * in-flight guard so the monitor may hijack this M again on a later slice —
@@ -7104,13 +7284,15 @@ static void copark(pthread_mutex_t *mu, Waiter *w) {
             zap_panic(zap_str_new("stack overflow", 14));
             return;
         }
+        g_enter_switch_out(g); /* I#889: non-preemptible from here to the swap */
         w->g = g;
         g->state = G_PARKED;
         g->parkmu = mu; /* scheduler unlocks once we are fully parked */
         /* Parking ends this coroutine's current runtime critical section: the
-         * scheduler releases `mu` on our behalf, so clear the no-preempt depth
-         * (ticket #172) rather than carry it past the switch. */
-        g->no_preempt = 0;
+         * scheduler releases `mu` on our behalf, and clears the no-preempt depth
+         * (ticket #172) itself once the swap has returned (`switch_to_g`) rather
+         * than carry it past the switch — clearing it HERE would reopen the
+         * state-store -> swap window (I#889). */
         zap_ctx_swap(&g->ctx, &m->sched_ctx);
         /* Resumed (possibly on a different M); `mu` already released. */
     } else {
@@ -7816,7 +7998,7 @@ static void np_start_once(void) {
         fprintf(stderr, "zap: netpoller init failed (epoll)\n");
         return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
     }
-    int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
+    int rc = zap_gc_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
     if (rc != 0) {
         fprintf(stderr, "zap: netpoller thread start failed (%d)\n", rc);
         return;
@@ -7827,7 +8009,7 @@ static void np_start_once(void) {
         fprintf(stderr, "zap: netpoller init failed (IOCP err %d)\n", zap_iocp_last_error());
         return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
     }
-    int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
+    int rc = zap_gc_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
     if (rc != 0) {
         fprintf(stderr, "zap: netpoller thread start failed (%d)\n", rc);
         return;
@@ -7850,7 +8032,7 @@ static void netpoll_shutdown(void) {
     }
     __atomic_store_n(&g_np_shutdown, 1, __ATOMIC_RELAXED);
     np_backend_kick();
-    GC_pthread_join(g_np_thread, NULL);
+    zap_gc_pthread_join(g_np_thread, NULL);
     g_np_started = 0;
 #if defined(ZAP_NETPOLL_IOCP)
     /* The poller thread has joined, so no completion can still reference the port
@@ -8766,7 +8948,7 @@ static void zap_sig_start_once(void) {
         return;
     }
     zap_install_fault_handlers();
-    int rc = GC_pthread_create(&g_sig_thread, NULL, zap_sig_thread_main, NULL);
+    int rc = zap_gc_pthread_create(&g_sig_thread, NULL, zap_sig_thread_main, NULL);
     if (rc != 0) {
         fprintf(stderr, "zap: signal thread start failed (%d)\n", rc);
         return;
@@ -8804,7 +8986,7 @@ static void zap_signal_shutdown(void) {
     if (g_sig_pd) {
         zap_netpoll_wake(g_sig_pd, ZAP_POLL_READ);
     }
-    GC_pthread_join(g_sig_thread, NULL);
+    zap_gc_pthread_join(g_sig_thread, NULL);
     if (g_sig_pd) {
         zap_netpoll_close(g_sig_pd);
         g_sig_pd = NULL;
@@ -8929,11 +9111,11 @@ static void *zap_grace_timer(void *arg) {
 static void zap_grace_arm(ScopeSigSub *ss) {
     ss->refcnt++;
     pthread_t t;
-    if (pthread_create(&t, NULL, zap_grace_timer, ss) != 0) {
+    if (zap_gc_pthread_create(&t, NULL, zap_grace_timer, ss) != 0) {
         ss->refcnt--; /* could not arm: drop the extra ref */
         return;
     }
-    pthread_detach(t);
+    zap_gc_pthread_detach(t);
 }
 
 /* #825: SEVER every coroutine still live in `sc`'s tree that did not drain within
@@ -9052,11 +9234,11 @@ static void *zap_scope_sever_timer(void *arg) {
 static void zap_scope_sever_arm(ScopeSigSub *ss) {
     ss->refcnt++;
     pthread_t t;
-    if (pthread_create(&t, NULL, zap_scope_sever_timer, ss) != 0) {
+    if (zap_gc_pthread_create(&t, NULL, zap_scope_sever_timer, ss) != 0) {
         ss->refcnt--; /* could not arm: drop the extra ref */
         return;
     }
-    pthread_detach(t);
+    zap_gc_pthread_detach(t);
 }
 
 /* Build the `ScopeTimeout` the timed-out scope raises to its caller (I#475). The
@@ -9209,13 +9391,13 @@ void zap_scope_timeout(void *scope_, int64_t duration_ms, int64_t grace_ms) {
         return;
     }
     pthread_t timer;
-    if (pthread_create(&timer, NULL, zap_scope_deadline_main, ss) != 0) {
+    if (zap_gc_pthread_create(&timer, NULL, zap_scope_deadline_main, ss) != 0) {
         g_scope_deadlines = ss->next; free(ss);
         zap_np_unlock(&g_sig_mu);
         zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new("cannot create scope deadline timer", 34));
         return;
     }
-    pthread_detach(timer);
+    zap_gc_pthread_detach(timer);
     zap_np_unlock(&g_sig_mu);
 }
 
@@ -20875,7 +21057,7 @@ static void zap_profile_start_locked(void) {
     zap_prof_warmup();
     g_prof_stop = 0;
     __atomic_store_n(&g_prof_active, 1, __ATOMIC_RELEASE);
-    if (GC_pthread_create(&g_prof_monitor, NULL, zap_prof_monitor_main, NULL) == 0) {
+    if (zap_gc_pthread_create(&g_prof_monitor, NULL, zap_prof_monitor_main, NULL) == 0) {
         g_prof_monitor_started = 1;
     } else {
         __atomic_store_n(&g_prof_active, 0, __ATOMIC_RELEASE);
@@ -20894,7 +21076,7 @@ static void zap_profile_stop_locked(void) {
     __atomic_store_n(&g_prof_active, 0, __ATOMIC_RELEASE);
     g_prof_stop = 1;
     if (g_prof_monitor_started) {
-        GC_pthread_join(g_prof_monitor, NULL);
+        zap_gc_pthread_join(g_prof_monitor, NULL);
         g_prof_monitor_started = 0;
     }
     zap_prof_write_folded();

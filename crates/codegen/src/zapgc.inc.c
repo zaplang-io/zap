@@ -299,7 +299,7 @@ __attribute__((constructor)) static void zap_gc_read_env(void) {
  * flushed head of a non-M thread (chiefly the main thread) lives in that
  * thread's ZapMutator node (`shadow_head`), not a single shared global — see
  * zap_flush_shadow. */
-__thread void *zap_shadow_head = NULL;
+__thread void *zap_shadow_head_tls = NULL; /* reach it only via zap_shadow_head_addr() / the `zap_shadow_head` macro (I#891) */
 
 /* The address of this thread's `zap_shadow_head` slot, resolved on the CURRENT
  * OS thread. ALL compiled code (AOT and the REPL JIT, I#159) reaches the shadow
@@ -316,7 +316,8 @@ __thread void *zap_shadow_head = NULL;
  * (The REPL JIT also needs it: MCJIT cannot emit a dynamic-TLS access to a
  * `__thread` global in the dlopen'd runtime.) */
 __attribute__((noinline)) void **zap_shadow_head_addr(void) {
-    return &zap_shadow_head;
+    __asm__ __volatile__("" ::: "memory"); /* not const/pure: never merged across a park (I#891) */
+    return &zap_shadow_head_tls;
 }
 
 /* A shadow-stack frame, emitted by codegen in each function that holds live GC
@@ -422,7 +423,21 @@ static ZapMutator *zap_mutators = NULL;
  * (atomic bit RMW, so the allocator, collector and fairness monitor never clobber
  * one another's lane). Their meaning and every set/clear site below are unchanged;
  * only the encoding moved from three words to three lanes of one. */
-static __thread ZapMutator *zap_self = NULL;
+static __thread ZapMutator *zap_self_tls = NULL;
+/* I#891 (the stale-TLS class of I#869): `zap_safepoint` begins with `copreempt()`, a
+ * stack switch after which the coroutine may be on a DIFFERENT OS thread, and then
+ * uses the per-thread mutator node. On aarch64 at -O2 the compiler computes the
+ * thread-local's address once and keeps it in a callee-saved register that the
+ * switch restores unchanged, so every `zap_self` access after the preempt would
+ * target the thread the coroutine LEFT: the node of that thread was marked PARKED
+ * while the real one stayed ACTIVE, and a collection waited for it forever. So the
+ * storage is private and every access calls a `noinline` accessor with a volatile
+ * asm (never const/pure), recomputing the thread pointer each time. */
+static __attribute__((noinline)) ZapMutator **zap_self_slot(void) {
+    __asm__ __volatile__("" ::: "memory");
+    return &zap_self_tls;
+}
+#define zap_self (*zap_self_slot())
 
 static void zap_collect_now(void); /* fwd: drive one full collection (caller is
                                     * registered, ACTIVE, about to become the

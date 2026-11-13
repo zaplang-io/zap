@@ -5861,6 +5861,376 @@ mod tests {
         );
     }
 
+    /// Replace every `/* ... */` and `// ...` comment in a C snippet with spaces of
+    /// the SAME length, so byte offsets into the result match the original source.
+    fn blank_c_comments(c: &str) -> String {
+        let b = c.as_bytes();
+        let mut out = b.to_vec();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                let start = i;
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                for o in &mut out[start..i] {
+                    if *o != b'\n' {
+                        *o = b' ';
+                    }
+                }
+            } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                let start = i;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                for o in &mut out[start..i] {
+                    *o = b' ';
+                }
+            } else {
+                i += 1;
+            }
+        }
+        String::from_utf8(out).expect("blanking ASCII comment bytes keeps valid UTF-8")
+    }
+
+    /// The `[start, end)` byte ranges of the runtime's guarded libgc layer: the
+    /// blocks between `ZAP_GC_GUARDED_LAYER_BEGIN` and `ZAP_GC_GUARDED_LAYER_END`.
+    fn guarded_layer_ranges(src: &str) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut from = 0;
+        while let Some(b) = src[from..].find("ZAP_GC_GUARDED_LAYER_BEGIN") {
+            let b = from + b;
+            let e = src[b..]
+                .find("ZAP_GC_GUARDED_LAYER_END")
+                .expect("every ZAP_GC_GUARDED_LAYER_BEGIN needs a matching _END")
+                + b;
+            ranges.push((b, e));
+            from = e;
+        }
+        ranges
+    }
+
+    /// I#888 tripwire. Under Boehm the allocator lock is a plain non-recursive
+    /// mutex, and the async-preemption handler may switch a coroutine away at any
+    /// instruction unless it is inside a no-preempt window. A coroutine preempted
+    /// while inside libgc keeps the lock across the switch, and the next coroutine
+    /// on the same OS thread then self-deadlocks in its first allocation. So every
+    /// libgc entry point that takes the lock must sit inside the runtime's guarded
+    /// layer (`ZAP_GC_GUARDED_LAYER_BEGIN/END` in zaprt.c), bracketed by
+    /// `zap_np_enter()` / `zap_np_leave()` — and nothing else may name the raw
+    /// calls. `gc.collect()` (`GC_gcollect`, which holds the lock for the whole
+    /// collection) was the unguarded one that hung `gc_switch_alloc_stress`.
+    #[test]
+    fn raw_libgc_calls_appear_only_inside_the_guarded_layer() {
+        let src = RUNTIME_C;
+        let blanked = blank_c_comments(src);
+        let layers = guarded_layer_ranges(src);
+        assert!(
+            !layers.is_empty(),
+            "I#888: zaprt.c must declare its guarded libgc layer (ZAP_GC_GUARDED_LAYER_BEGIN/END)"
+        );
+        let raw = [
+            "GC_gcollect(",
+            "GC_register_finalizer(",
+            "GC_get_heap_size(",
+            "GC_get_free_bytes(",
+            "GC_MALLOC(",
+            "GC_MALLOC_ATOMIC(",
+            "GC_pthread_create(",
+            "GC_pthread_join(",
+            "GC_pthread_detach(",
+            "pthread_create(",
+            "pthread_detach(",
+        ];
+        let mut offenders = Vec::new();
+        for tok in raw {
+            let mut from = 0;
+            while let Some(i) = blanked[from..].find(tok) {
+                let at = from + i;
+                from = at + tok.len();
+                // Whole-identifier match only (`zap_gc_pthread_create(` is the guarded wrapper).
+                let prev = blanked[..at].chars().next_back().unwrap_or(' ');
+                if prev.is_ascii_alphanumeric() || prev == '_' {
+                    continue;
+                }
+                // `#define GC_pthread_create pthread_create` style shims carry no call.
+                let line_start = blanked[..at].rfind('\n').map_or(0, |n| n + 1);
+                if blanked[line_start..at].trim_start().starts_with('#') {
+                    continue;
+                }
+                if !layers.iter().any(|&(b, e)| at >= b && at < e) {
+                    let line = src[..at].matches('\n').count() + 1;
+                    offenders.push(format!("zaprt.c:{line}: `{tok}`"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "I#888: raw libgc / thread-create calls outside the guarded layer (they take the \
+             allocator lock without a no-preempt window, so a coroutine preempted inside one \
+             deadlocks the next allocation on its M). Route them through the zap_gc_* wrappers:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// The other half of I#888: inside the guarded layer, every function that
+    /// makes a raw call must open the no-preempt window BEFORE it and close it
+    /// AFTER it.
+    #[test]
+    fn guarded_layer_wraps_every_raw_call_in_a_no_preempt_window() {
+        let src = RUNTIME_C;
+        let blanked = blank_c_comments(src);
+        let raw = [
+            "GC_gcollect(",
+            "GC_register_finalizer(",
+            "GC_get_heap_size(",
+            "GC_get_free_bytes(",
+            "GC_MALLOC(",
+            "GC_MALLOC_ATOMIC(",
+            "GC_pthread_create(",
+            "GC_pthread_join(",
+            "GC_pthread_detach(",
+        ];
+        let mut checked = 0;
+        for (b, e) in guarded_layer_ranges(src) {
+            let layer = &blanked[b..e];
+            // Each layer function is `static inline ... { ... }` closed by a column-0 `}`.
+            for func in layer.split("static inline").skip(1) {
+                let body = &func[..func.find("\n}").unwrap_or(func.len())];
+                for tok in raw {
+                    if let Some(at) = body.find(tok) {
+                        let enter = body.find("zap_np_begin(np);");
+                        let leave = body.rfind("zap_np_end(np);");
+                        assert!(
+                            enter.is_some_and(|x| x < at) && leave.is_some_and(|x| x > at),
+                            "I#888: guarded-layer function calling `{tok}` must wrap it in \
+                             zap_np_begin(np); ... zap_np_end(np); (np = zap_np_slot())\n{body}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 9,
+            "I#888: expected the guarded layer to wrap all 9 raw libgc entry points, saw {checked}"
+        );
+    }
+
+    /// Body (comments stripped) of the C function whose definition starts with `sig`.
+    fn c_fn_body(sig: &str) -> String {
+        let start = RUNTIME_C
+            .find(sig)
+            .unwrap_or_else(|| panic!("zaprt.c must define `{sig}`"));
+        let end = start + RUNTIME_C[start..].find("\n}\n").expect("function must end");
+        strip_c_comments(&RUNTIME_C[start..end])
+    }
+
+    /// I#889 tripwire. A coroutine that switches away publishes WHY in `g->state`
+    /// (`G_DEAD` / `G_PARKED` / `G_RUNNABLE`) and then calls `zap_ctx_swap`;
+    /// `switch_to_g` dispatches on that state when the swap returns. The span from
+    /// the state store to the actual switch is microseconds (PLT stub, glibc's
+    /// context save, an `rt_sigprocmask` syscall), and a Boehm async preemption
+    /// landing in it rewrites the state to `G_RUNNABLE`, so the resumed sequence
+    /// later swaps out with `G_RUNNING` — a state the scheduler cannot dispatch, and
+    /// the coroutine is lost (hang at join / a parkmu that is never released). So at
+    /// every swap site the no-preempt window must be raised BEFORE the state store
+    /// (`g_enter_switch_out`), and must NOT be cleared coroutine-side before the swap
+    /// (the scheduler clears it after the swap returns).
+    #[test]
+    fn every_switch_out_site_is_a_no_preempt_window_until_the_swap() {
+        for sig in [
+            "static void g_bootstrap(void) {",
+            "static void cosched(void) {",
+            "static void copreempt(void) {",
+            "static void copark(pthread_mutex_t *mu, Waiter *w) {",
+        ] {
+            let body = c_fn_body(sig);
+            let swap = body
+                .find("zap_ctx_swap(&g->ctx, &m->sched_ctx)")
+                .unwrap_or_else(|| panic!("{sig} must swap back to the scheduler"));
+            let enter = body
+                .find("g_enter_switch_out(g);")
+                .unwrap_or_else(|| panic!("I#889: {sig} must call g_enter_switch_out(g)"));
+            let state = body
+                .find("g->state = G_")
+                .unwrap_or_else(|| panic!("{sig} must publish its scheduler state"));
+            assert!(
+                enter < state && state < swap,
+                "I#889: in {sig} the no-preempt window must open BEFORE the `g->state` store \
+                 and the store must precede the swap:\n{body}"
+            );
+            let span = &body[enter..swap];
+            for clears in ["no_preempt = 0", "zap_np_leave()", "no_preempt--"] {
+                assert!(
+                    !span.contains(clears),
+                    "I#889: {sig} must not end the no-preempt window (`{clears}`) before the \
+                     swap; switch_to_g ends it once the coroutine is stopped:\n{span}"
+                );
+            }
+        }
+    }
+
+    /// The companion half of I#889: the scheduler ends the window the coroutine
+    /// opened, right after the swap back returns (the coroutine is stopped then).
+    #[test]
+    fn switch_to_g_ends_the_switch_out_window_after_the_swap() {
+        let body = c_fn_body("static void switch_to_g(M *m, G *g) {");
+        let swap = body
+            .find("zap_ctx_swap(&m->sched_ctx, &g->ctx)")
+            .expect("switch_to_g must swap the coroutine in");
+        let clear = body[swap..]
+            .find("g->no_preempt = 0;")
+            .expect("I#889: switch_to_g must clear g->no_preempt after the swap returns");
+        // ...and before it dispatches on the state the coroutine published.
+        let dispatch = body[swap..]
+            .find("g->state == G_PARKED")
+            .expect("switch_to_g dispatches on g->state");
+        assert!(
+            clear < dispatch,
+            "I#889: g->no_preempt must be cleared before switch_to_g dispatches on g->state"
+        );
+    }
+
+    /// All runtime thread-local DECLARATIONS (comments stripped), as `name` per
+    /// `__thread` variable, across the runtime and the Immix collector source.
+    fn thread_local_names() -> Vec<String> {
+        let mut names = Vec::new();
+        for src in [RUNTIME_C, RUNTIME_GC_C] {
+            for line in strip_c_comments(src).lines() {
+                let t = line.trim();
+                if !t.contains("__thread") || t.starts_with('#') {
+                    continue;
+                }
+                // `[extern] [static] __thread T *name [= init];` -> `name`
+                let decl = t.split('=').next().unwrap().trim_end_matches(';').trim();
+                if let Some(name) = decl
+                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                {
+                    if !name.is_empty() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// I#891 tripwire (the stale-TLS class of I#869). A coroutine is resumed on
+    /// whichever OS thread picks it up; on aarch64 at `-O2` the compiler computes a
+    /// thread-local's ADDRESS once per function and holds it in a callee-saved
+    /// register that `swapcontext` restores unchanged, so any access after a park
+    /// (including the inlined `zap_np_lock`/`zap_np_unlock` in `chan_block`, and
+    /// `zap_self` in `zap_safepoint` after its cooperative preempt) touches the
+    /// thread the coroutine LEFT. Every runtime thread-local that coroutine code can
+    /// reach is therefore private (`*_tls`) and accessed only through a `noinline`
+    /// accessor with a volatile asm barrier (so neither GCC's nor LLVM's IPA can infer
+    /// it const/pure and merge calls), recomputing the thread pointer on every use.
+    /// A NEW `__thread` variable must be added here deliberately.
+    #[test]
+    fn runtime_thread_locals_are_reached_only_through_fresh_accessors() {
+        let allowed_private = [
+            (
+                "zap_cur_m_tls",
+                "zap_cur_m_slot",
+                "#define cur_m (*zap_cur_m_slot())",
+            ),
+            (
+                "zap_self_tls",
+                "zap_self_slot",
+                "#define zap_self (*zap_self_slot())",
+            ),
+            (
+                "zap_shadow_head_tls",
+                "zap_shadow_head_addr",
+                "#define zap_shadow_head (*zap_shadow_head_addr())",
+            ),
+        ];
+        // REPL-only catch state: set/read on one thread inside a single JIT call
+        // (setjmp/longjmp), never across a coroutine switch.
+        let allowed_other = ["zap_repl_catch", "zap_repl_exc"];
+        let both = format!(
+            "{}\n{}",
+            strip_c_comments(RUNTIME_C),
+            strip_c_comments(RUNTIME_GC_C)
+        );
+        for name in thread_local_names() {
+            assert!(
+                allowed_private.iter().any(|(n, _, _)| *n == name) || allowed_other.contains(&name.as_str()),
+                "I#891: new runtime `__thread` variable `{name}`: a coroutine can migrate OS threads, so \
+                 it must be reached only via a noinline accessor (like zap_cur_m_slot) — add it to this \
+                 test deliberately"
+            );
+        }
+        for (tls, accessor, macro_def) in allowed_private {
+            // The DEFINITION (`name(void) {`), not the forward declaration.
+            let at = both
+                .find(&format!("{accessor}(void) {{"))
+                .unwrap_or_else(|| panic!("I#891: accessor `{accessor}` must be defined"));
+            let head = &both[at.saturating_sub(120)..at + 260];
+            assert!(
+                head.contains("noinline"),
+                "I#891: `{accessor}` must be `__attribute__((noinline))`:\n{head}"
+            );
+            assert!(
+                head.contains("__asm__ __volatile__"),
+                "I#891: `{accessor}` must contain a volatile asm so it is never inferred const/pure:\n{head}"
+            );
+            assert!(
+                head.contains(tls),
+                "I#891: `{accessor}` must return the address of `{tls}`:\n{head}"
+            );
+            assert!(
+                both.contains(macro_def),
+                "I#891: expected `{macro_def}` so every use recomputes the thread pointer"
+            );
+        }
+    }
+
+    /// I#891: the no-preempt bookkeeping reads the current coroutine's counter fresh.
+    #[test]
+    fn np_bookkeeping_reads_the_thread_local_fresh_on_every_call() {
+        let code = strip_c_comments(RUNTIME_C);
+        let at = code
+            .find("int *zap_np_slot(void) {")
+            .expect("zap_np_slot must be defined");
+        let head = &code[at.saturating_sub(80)..at + 320];
+        assert!(
+            head.contains("noinline") && head.contains("__asm__ __volatile__"),
+            "{head}"
+        );
+        for f in [
+            "static void zap_np_enter(void) {",
+            "static void zap_np_leave(void) {",
+        ] {
+            let b = code.find(f).unwrap_or_else(|| panic!("{f} must exist"));
+            assert!(
+                code[b..b + 120].contains("zap_np_slot()"),
+                "I#891: {f} must go through zap_np_slot() (fresh thread-local read)"
+            );
+        }
+    }
+
+    /// I#891 / I#223 defense in depth: the Boehm preemption handler must not
+    /// switch a coroutine away unless the interrupted PC is inside the program's
+    /// own text — not in libgc / libc / the loader, where the allocator lock and
+    /// other thread-affine state live.
+    #[test]
+    fn preempt_handler_requires_the_interrupted_pc_to_be_program_text() {
+        let body =
+            c_fn_body("static void zap_preempt_handler(int sig, siginfo_t *info, void *uc) {");
+        assert!(
+            body.contains("zap_pc_in_program_text(uc)"),
+            "I#891: zap_preempt_handler must gate copreempt() on zap_pc_in_program_text(uc):\n{body}"
+        );
+        let gate = body.find("zap_pc_in_program_text(uc)").unwrap();
+        let swap = body.find("copreempt();").expect("handler must copreempt");
+        assert!(gate < swap, "the PC gate must precede the copreempt() call");
+    }
+
     /// I#885 tripwire. Under Boehm a stopped thread is scanned as
     /// `[sp, stack_end)`. `switch_to_g` used to publish the coroutine's stack top
     /// as `stack_end` (`set_bottom(m, &g->sb)`) BEFORE the swap that moves `sp`
