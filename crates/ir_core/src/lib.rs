@@ -117,18 +117,27 @@ impl Elem {
     }
 }
 
-/// The element dtype of a numeric `array[T]` (tickets #24, #49). `f64`/`i64`
-/// are 8-byte element words; `uint8`/`bool` are 1-byte words (image data,
-/// masks). The dtype selects the typed runtime entry point (`zap_array_*_f64` /
-/// `_i64` / `_u8` / `_bool`) and the LLVM *storage* element type of the SIMD
-/// element-wise lowering (see [`Dtype::storage_ty`]).
+/// The element dtype of a numeric `array[T]` (tickets #24, #49, #503, #890).
+/// The full dense matrix: floats `f32`/`f64`, signed `i8`/`i16`/`i32`/`i64`,
+/// unsigned `u8`/`u16`/`u32`/`u64`, and `bool` (a 0/1 byte mask). The dtype
+/// selects the typed runtime entry point (`zap_array_*_<suffix>`) and the LLVM
+/// *storage* element type of the SIMD element-wise lowering (see
+/// [`Dtype::storage_ty`]). Element values cross the runtime ABI as a uniform
+/// word — every integer as `i64`, every float as `f64` (see [`Dtype::ty`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dtype {
     F64,
+    F32,
     I64,
-    /// 8-bit unsigned integer (`uint8`/`u8`), e.g. image pixels. Element-wise
-    /// arithmetic wraps mod 256 (D-0005).
+    I32,
+    I16,
+    I8,
+    /// 8-bit unsigned integer (`uint8`/`u8`), e.g. image pixels. Integer
+    /// arithmetic wraps mod 2^width (D-0005).
     Uint8,
+    U16,
+    U32,
+    U64,
     /// Boolean mask (`bool`), stored as a 0/1 byte. Arithmetic on bools
     /// promotes to `uint8` (see [`Dtype::promote`]).
     Bool,
@@ -136,98 +145,177 @@ pub enum Dtype {
 
 impl Dtype {
     /// The ZIR scalar type of one element as it crosses the runtime ABI
-    /// (get/set/sum values). `uint8`/`bool` elements are carried as `i64` words
-    /// (the runtime truncates/normalizes on store, zero-extends on load), so
-    /// `a[i]` and `sum(a)` are ordinary integers; the compact 1-byte storage is
-    /// [`Dtype::storage_ty`].
+    /// (get/set/sum values): every **integer** dtype is carried as an `i64` word
+    /// (the runtime truncates/wraps on store, sign/zero-extends on load) and
+    /// every **float** dtype as an `f64` word (narrowed on store, widened on
+    /// load). So `a[i]` and `sum(a)` are ordinary `int64`/`float64`; the compact
+    /// storage width is [`Dtype::storage_ty`].
     pub fn ty(self) -> Ty {
-        match self {
-            Dtype::F64 => Ty::F64,
-            Dtype::I64 | Dtype::Uint8 | Dtype::Bool => Ty::I64,
+        if self.is_float() {
+            Ty::F64
+        } else {
+            Ty::I64
         }
     }
-    /// The LLVM *storage* element type in the contiguous buffer: `uint8`/`bool`
-    /// occupy one byte (`i8`), `i64`/`f64` eight. The SIMD element-wise kernel
-    /// loads/stores/GEPs with this type.
+    /// The LLVM *storage* element type in the contiguous buffer, by width.
+    /// Unsigned widths share the signed LLVM integer type (LLVM ints are
+    /// sign-agnostic); [`Dtype::is_unsigned`] drives the zext-vs-sext choice.
+    /// The SIMD element-wise kernel loads/stores/GEPs with this type.
     pub fn storage_ty(self) -> Ty {
         match self {
             Dtype::F64 => Ty::F64,
-            Dtype::I64 => Ty::I64,
-            Dtype::Uint8 | Dtype::Bool => Ty::I8,
+            Dtype::F32 => Ty::F32,
+            Dtype::I64 | Dtype::U64 => Ty::I64,
+            Dtype::I32 | Dtype::U32 => Ty::I32,
+            Dtype::I16 | Dtype::U16 => Ty::I16,
+            Dtype::I8 | Dtype::Uint8 | Dtype::Bool => Ty::I8,
         }
     }
     /// The size in bytes of one stored element (the SIMD load/store alignment).
     pub fn elem_size(self) -> u32 {
         match self {
-            Dtype::F64 | Dtype::I64 => 8,
-            Dtype::Uint8 | Dtype::Bool => 1,
+            Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
+            Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
+            Dtype::I16 | Dtype::U16 => 2,
+            Dtype::I8 | Dtype::Uint8 | Dtype::Bool => 1,
         }
     }
     /// The runtime-entry-point suffix for this dtype.
     pub fn suffix(self) -> &'static str {
         match self {
             Dtype::F64 => "f64",
+            Dtype::F32 => "f32",
             Dtype::I64 => "i64",
+            Dtype::I32 => "i32",
+            Dtype::I16 => "i16",
+            Dtype::I8 => "i8",
             Dtype::Uint8 => "u8",
+            Dtype::U16 => "u16",
+            Dtype::U32 => "u32",
+            Dtype::U64 => "u64",
             Dtype::Bool => "bool",
         }
     }
-    /// The runtime dtype tag passed to `zap_array_new` (matches `zaprt.c`).
+    /// The runtime dtype tag passed to `zap_array_new`/`_new_nd` (matches the
+    /// `DTYPE_*` enum in `zaprt.c`). Existing codes (0..=3) are preserved so the
+    /// ABI is stable; the wider dtypes take fresh codes.
     pub fn code(self) -> i64 {
         match self {
             Dtype::F64 => 0,
             Dtype::I64 => 1,
             Dtype::Uint8 => 2,
             Dtype::Bool => 3,
+            Dtype::F32 => 4,
+            Dtype::I32 => 5,
+            Dtype::I8 => 6,
+            Dtype::I16 => 7,
+            Dtype::U16 => 8,
+            Dtype::U32 => 9,
+            Dtype::U64 => 10,
         }
     }
     pub fn is_float(self) -> bool {
-        matches!(self, Dtype::F64)
+        matches!(self, Dtype::F32 | Dtype::F64)
     }
-    /// Whether the *stored* integer is unsigned (`uint8`/`bool`). Selects
-    /// zero-extend / unsigned-int-to-float in the promotion conversions; `i64`
-    /// is signed. (`f64` is not an integer; the result is unused for it.)
+    /// Whether the *stored* integer is unsigned (`uint8`/`u16`/`u32`/`u64`, and
+    /// `bool` as a 0/1 byte). Selects zero-extend / unsigned-int-to-float in the
+    /// promotion conversions; the signed `iN` dtypes use sext/sitofp. (A float
+    /// dtype is not an integer; the result is unused for it.)
     pub fn is_unsigned(self) -> bool {
-        matches!(self, Dtype::Uint8 | Dtype::Bool)
+        matches!(
+            self,
+            Dtype::Uint8 | Dtype::U16 | Dtype::U32 | Dtype::U64 | Dtype::Bool
+        )
     }
-    /// The promotion rank: `bool` < `uint8` < `i64` < `f64`. Mixed-dtype
-    /// element-wise ops produce the higher-ranked dtype.
-    pub fn rank(self) -> u8 {
+    /// Whether this is a signed integer dtype (`i8`/`i16`/`i32`/`i64`).
+    fn is_signed_int(self) -> bool {
+        matches!(self, Dtype::I8 | Dtype::I16 | Dtype::I32 | Dtype::I64)
+    }
+    /// The logical width in bits of an **integer** dtype (`bool` counts as 1).
+    /// Not meaningful for a float dtype.
+    fn int_bits(self) -> u32 {
         match self {
-            Dtype::Bool => 0,
-            Dtype::Uint8 => 1,
-            Dtype::I64 => 2,
-            Dtype::F64 => 3,
+            Dtype::Bool => 1,
+            Dtype::I8 | Dtype::Uint8 => 8,
+            Dtype::I16 | Dtype::U16 => 16,
+            Dtype::I32 | Dtype::U32 => 32,
+            Dtype::I64 | Dtype::U64 => 64,
+            Dtype::F32 => 32,
+            Dtype::F64 => 64,
         }
     }
-    fn of_rank(r: u8) -> Dtype {
-        match r {
-            0 => Dtype::Bool,
-            1 => Dtype::Uint8,
-            2 => Dtype::I64,
-            _ => Dtype::F64,
+    /// The integer dtype of a given signedness and width (8/16/32/64 bits).
+    fn int_dtype(signed: bool, bits: u32) -> Dtype {
+        match (signed, bits) {
+            (true, 8) => Dtype::I8,
+            (true, 16) => Dtype::I16,
+            (true, 32) => Dtype::I32,
+            (true, _) => Dtype::I64,
+            (false, 8) => Dtype::Uint8,
+            (false, 16) => Dtype::U16,
+            (false, 32) => Dtype::U32,
+            (false, _) => Dtype::U64,
         }
     }
     /// The result dtype of an element-wise arithmetic op on two array operands
-    /// (ticket #49). NumPy-style: the higher-ranked dtype wins, so
-    /// `i64 + f64 -> f64`, `uint8 + i64 -> i64`. Arithmetic never *yields* a
-    /// `bool` — `bool + bool` promotes to `uint8` (`True + True == 2`, which a
-    /// 1-bit result could not represent), matching Python's `bool`-as-`int`.
+    /// (NumPy NEP-50 type promotion, D-0166). A float operand forces a float
+    /// result of the **widest float** among the float operands (an integer never
+    /// bumps `f32` to `f64`: `i64 + f32 -> f32`). Two integers of the **same
+    /// signedness** promote to the wider; **mixed** signed/unsigned promote to
+    /// the signed type that holds both — the signed operand's width if it is
+    /// strictly wider, else the next signed width up (`u8 + i8 -> i16`,
+    /// `u32 + i32 -> i64`), and `u64` against any signed falls back to `f64`
+    /// (no 128-bit int). Arithmetic never *yields* `bool`: `bool + bool -> u8`
+    /// (`True + True == 2`), and `bool` otherwise defers to the other operand.
     pub fn promote(a: Dtype, b: Dtype) -> Dtype {
-        let d = Dtype::of_rank(a.rank().max(b.rank()));
-        if matches!(d, Dtype::Bool) {
-            Dtype::Uint8
+        use Dtype::*;
+        // `bool` is the weakest; arithmetic never yields it.
+        match (a, b) {
+            (Bool, Bool) => return Uint8,
+            (Bool, other) | (other, Bool) => return other,
+            _ => {}
+        }
+        // A float operand dominates; the result float width is the widest float
+        // operand only (an int operand does not widen f32 -> f64).
+        if a.is_float() || b.is_float() {
+            let aw = if a.is_float() { a.int_bits() } else { 0 };
+            let bw = if b.is_float() { b.int_bits() } else { 0 };
+            return if aw.max(bw) >= 64 { F64 } else { F32 };
+        }
+        // Both integers.
+        let (asig, bsig) = (a.is_signed_int(), b.is_signed_int());
+        let (aw, bw) = (a.int_bits(), b.int_bits());
+        if asig == bsig {
+            return Dtype::int_dtype(asig, aw.max(bw));
+        }
+        // Mixed signed/unsigned: the unsigned width `uw`, the signed width `sw`.
+        let (uw, sw) = if asig { (bw, aw) } else { (aw, bw) };
+        if uw < sw {
+            // The signed type already covers the unsigned operand's range.
+            Dtype::int_dtype(true, sw)
         } else {
-            d
+            // Need a signed type one size up to hold the unsigned's range;
+            // `u64` has none, so NumPy falls back to `f64`.
+            match uw {
+                8 => I16,
+                16 => I32,
+                32 => I64,
+                _ => F64,
+            }
         }
     }
-    /// The result dtype of `array op scalar` broadcast (ticket #49). Scalars are
-    /// "weak" (NumPy NEP 50): an integer scalar keeps the array's dtype (so
-    /// `uint8_image + 1` stays `uint8`), and only a float scalar forces `f64`.
-    /// A `bool` array is promoted to `uint8` first (arithmetic, not a mask).
+    /// The result dtype of `array op scalar` broadcast. Scalars are **weak**
+    /// (NEP-50): an integer scalar keeps the array's dtype (`uint8_image + 1`
+    /// stays `uint8`, `f32_buf + 2` stays `f32`); a float scalar keeps a float
+    /// array's width (`f32_buf + 1.5 -> f32`) and otherwise forces `f64`. A
+    /// `bool` array promotes to `uint8` first (arithmetic, not a mask).
     pub fn promote_scalar(arr: Dtype, scalar_is_float: bool) -> Dtype {
         if scalar_is_float {
-            Dtype::F64
+            if arr.is_float() {
+                arr
+            } else {
+                Dtype::F64
+            }
         } else if matches!(arr, Dtype::Bool) {
             Dtype::Uint8
         } else {
@@ -1400,5 +1488,119 @@ fn fmt_term(t: &Term) -> String {
             format!("br_if %{cond}, block{then_bb}, block{else_bb}")
         }
         Term::Unreachable => "unreachable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod dtype_tests {
+    //! The dtype matrix (#503/#890) and NEP-50 promotion (D-0166). These are pure
+    //! Rust, so they run on every host (no LLVM) and pin the promotion table as a
+    //! walled garden — a wrong entry is a user-visible semantics regression.
+    use super::{Dtype, Ty};
+
+    const ALL: [Dtype; 11] = [
+        Dtype::Bool,
+        Dtype::Uint8,
+        Dtype::U16,
+        Dtype::U32,
+        Dtype::U64,
+        Dtype::I8,
+        Dtype::I16,
+        Dtype::I32,
+        Dtype::I64,
+        Dtype::F32,
+        Dtype::F64,
+    ];
+
+    #[test]
+    fn promotion_is_commutative_and_never_bool() {
+        for &a in &ALL {
+            for &b in &ALL {
+                assert_eq!(
+                    Dtype::promote(a, b),
+                    Dtype::promote(b, a),
+                    "promote not commutative for {a:?}, {b:?}"
+                );
+                assert_ne!(
+                    Dtype::promote(a, b),
+                    Dtype::Bool,
+                    "arithmetic must never yield bool ({a:?}, {b:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn promotion_matrix_matches_nep50() {
+        use Dtype::*;
+        let cases = [
+            // same kind -> wider
+            (I32, I64, I64),
+            (I8, I16, I16),
+            (Uint8, U32, U32),
+            (U16, U64, U64),
+            (F32, F64, F64),
+            // bool defers to the other operand; bool+bool -> uint8
+            (Bool, Bool, Uint8),
+            (Bool, I32, I32),
+            (Bool, Uint8, Uint8),
+            (Bool, F32, F32),
+            // int + float -> float; an int never widens f32 -> f64
+            (I64, F32, F32),
+            (U64, F32, F32),
+            (I64, F64, F64),
+            (Uint8, F64, F64),
+            // mixed signed/unsigned: signed that holds both
+            (Uint8, I8, I16),
+            (U16, I16, I32),
+            (U32, I32, I64),
+            (U64, I64, F64),   // no 128-bit int -> f64
+            (Uint8, I32, I32), // signed already wider
+            (U32, I8, I64),    // unsigned wider -> next signed up
+            // legacy 4-dtype behavior preserved
+            (Uint8, I64, I64),
+            (Uint8, Uint8, Uint8),
+            (I64, I64, I64),
+            (F64, I64, F64),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(Dtype::promote(a, b), want, "promote({a:?}, {b:?})");
+        }
+    }
+
+    #[test]
+    fn weak_scalar_promotion() {
+        use Dtype::*;
+        // int scalar keeps the array dtype; float scalar keeps a float array's
+        // width, else forces f64; bool array promotes to uint8.
+        assert_eq!(Dtype::promote_scalar(Uint8, false), Uint8);
+        assert_eq!(Dtype::promote_scalar(F32, false), F32);
+        assert_eq!(Dtype::promote_scalar(I32, false), I32);
+        assert_eq!(Dtype::promote_scalar(Bool, false), Uint8);
+        assert_eq!(Dtype::promote_scalar(F32, true), F32);
+        assert_eq!(Dtype::promote_scalar(F64, true), F64);
+        assert_eq!(Dtype::promote_scalar(I32, true), F64);
+        assert_eq!(Dtype::promote_scalar(Uint8, true), F64);
+    }
+
+    #[test]
+    fn dtype_metadata_is_consistent() {
+        // Distinct codes, and storage/ABI widths agree per dtype.
+        let mut codes: Vec<i64> = ALL.iter().map(|d| d.code()).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), ALL.len(), "dtype codes must be distinct");
+        for &d in &ALL {
+            let want = match d.storage_ty() {
+                Ty::F64 | Ty::I64 => 8,
+                Ty::F32 | Ty::I32 => 4,
+                Ty::I16 => 2,
+                Ty::I8 => 1,
+                other => panic!("unexpected storage {other:?} for {d:?}"),
+            };
+            assert_eq!(d.elem_size(), want, "elem_size vs storage for {d:?}");
+            // The ABI word is i64 for ints, f64 for floats.
+            assert_eq!(d.ty(), if d.is_float() { Ty::F64 } else { Ty::I64 });
+        }
     }
 }
