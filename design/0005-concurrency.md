@@ -552,6 +552,18 @@ not relied on:
 - Movable/growable stacks remain a v2 follow-up (v1 Immix is non-moving); the
   entry points and the fixed-stack decision above are unchanged.
 
+### Boehm: libgc calls are no-preempt windows (I#888, D-0162)
+
+The Boehm async-preemption handler (SIGURG) switches a coroutine away at an
+arbitrary instruction unless `g->no_preempt > 0`. The bdwgc allocator lock is a
+non-recursive mutex, so a coroutine preempted *inside* libgc strands that lock on
+its OS thread and the next coroutine run there self-deadlocks in its first
+allocation. Hence every libgc entry point that takes the lock — allocation, explicit
+collection, finalizer registration, heap statistics, thread create/join/detach —
+goes through a small guarded layer in `zaprt.c` that brackets it with
+`zap_np_enter()` / `zap_np_leave()`; raw libgc names may not appear outside it (a
+source test enforces this).
+
 ### Boehm: how a running coroutine's stack is scanned (I#885, D-0161)
 
 Boehm scans a stopped thread as `[sp, stack_end)`. An M alternates between its

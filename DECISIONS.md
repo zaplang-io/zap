@@ -8289,3 +8289,77 @@ must install `GC_set_sp_corrector(zap_sp_corrector)`.
 **No grammar, runtime-ABI, or language-semantics change.** Requires bdwgc >= 8.0
 (`GC_set_sp_corrector`); on a libgc without it the Boehm build fails to link
 rather than silently regressing.
+
+## D-0162 — Boehm: every libgc entry point that takes the allocator lock lives in a guarded no-preempt layer (#888)
+
+**Status:** Accepted. **Relates:** D-0117 (#223 — the allocator lock and the
+scheduler's switch path), D-0120/D-0121 (the Boehm async-preemption handler and
+its STW guard), D-0161 (#885), the #172 no-preempt-around-allocation design.
+**Defect report:** I#888 (core-dump evidence in the issue). gc-boehm only: the
+Immix collector has no allocator lock a coroutine can strand.
+
+**Problem.** Under gc-boehm a coroutine that runs too long is preempted
+asynchronously: the monitor signals the worker thread (SIGURG) and
+`zap_preempt_handler` switches to another coroutine at the interrupted instruction
+— unless the coroutine is inside a *no-preempt window* (`g->no_preempt > 0`, set by
+`zap_np_enter()`/`zap_np_leave()`). The bdwgc allocator lock is a plain,
+non-recursive `pthread_mutex_t`. A coroutine preempted while inside libgc therefore
+keeps that lock across the switch, and the coroutine run next **on the same OS
+thread** blocks in its first allocation on a mutex its own thread already owns: a
+self-deadlock; the other workers then pile up behind the same lock and the program
+hangs forever. The allocation helpers (`zap_obj`/`zap_buf`/`zap_ptrbuf`/
+`zap_alloc_desc`, strings) had always been inside a no-preempt window; the other
+libgc entry points that take the lock were not: `gc.collect()` (`zap_gc_collect` →
+`GC_gcollect`, which holds the lock for the whole collection, so a preemption tick
+lands inside it almost every time it is in flight), `GC_register_finalizer`, the
+heap statistics (`GC_get_heap_size`/`GC_get_free_bytes`), the raw `zap_alloc` (which
+generated code calls), the scheduler-infrastructure allocations (`ZAP_INFRA_ALLOC`),
+and thread create/join/detach (`dedicated_pin` makes a thread from a coroutine; the
+scope timers and the lazily-started pollers do too). Evidence from a core of a live
+hang: all four scheduler threads in `GC_generic_malloc_many` on one mutex whose
+`__owner` was a scheduler thread that was itself blocked on it; on that M a
+`G_RUNNABLE` coroutine with `no_preempt == 0` whose stack showed a signal frame above
+`GC_gcollect+17` (preempted right after the collector took the lock) and a sibling
+`G_RUNNING` in the allocator. `tests/golden/gc_switch_alloc_stress.zap` hung in ~7%
+of runs on x86_64 (it calls `gc.collect()` every 4000 iterations) — the main source
+of intermittent red in the gc-boehm golden leg.
+
+**Decision.**
+1. **A guarded layer.** Every raw libgc entry point that takes (or may take) the
+   allocator lock lives in one place in `zaprt.c`, bracketed by
+   `zap_np_enter()` … `zap_np_leave()`: `zap_gc_malloc`, `zap_gc_malloc_atomic`,
+   `zap_gc_collect_guarded`, `zap_gc_heap_sizes`, `zap_gc_register_finalizer`, and
+   (both collectors) `zap_gc_pthread_create`/`_detach`/`_join`. The existing
+   allocation helpers, `zap_alloc`, `zap_gc_collect`, `zap_gc_stats`,
+   `ZAP_INFRA_ALLOC`, the arena allocator and every thread create/detach/join site
+   now call these. The layer is delimited by `ZAP_GC_GUARDED_LAYER_BEGIN/END`
+   markers.
+2. **The wall is enforced.** Two source-contract tests in `zapc_codegen` assert that
+   the raw names (`GC_gcollect`, `GC_register_finalizer`, `GC_get_heap_size`,
+   `GC_get_free_bytes`, `GC_MALLOC[_ATOMIC]`, `GC_pthread_*`, raw `pthread_create`/
+   `pthread_detach`) occur **only** inside the layer, and that each layer function
+   opens the window before and closes it after its raw call — so a new unguarded call
+   is a failing test, not a 1-in-15 hang. (A `#pragma GCC poison` was considered and
+   rejected: gc.h defines several of these names as macros, and poisoning an existing
+   macro warns on every build.)
+3. **Cost.** A `no_preempt` increment/decrement around calls that already take a
+   mutex; the preemption tick that lands inside is deferred (the monitor re-signals),
+   exactly as for allocation.
+
+**Alternatives considered.** (a) Refuse to preempt when the interrupted PC is inside
+libgc — incomplete: the lock is also held while libgc is inside libc (`mmap`,
+`memset`, `pthread_mutex_unlock`), where the PC is not in libgc's text. (b) Ask
+bdwgc whether this thread holds the lock — the lock and `I_HOLD_LOCK` are
+`GC_INNER` (hidden); not available from the stock libgc. (c) A recursive allocator
+lock — not ours to change in stock libgc, and would let a stranded coroutine's
+half-finished collection state be re-entered. (d) Only guard `zap_gc_collect` (the
+observed site) — leaves the other entry points as latent copies of the same hang.
+
+**Tests (written first; red on `main`).**
+`tests/golden/gc_collect_preempt_stress.zap`: coroutines calling `gc.collect()` back to
+back while others allocate on the multi-worker scheduler — hangs on `main`
+under gc-boehm. Source-contract tests
+`raw_libgc_calls_appear_only_inside_the_guarded_layer` and
+`guarded_layer_wraps_every_raw_call_in_a_no_preempt_window`.
+
+**No grammar, runtime-ABI, or language-semantics change.**

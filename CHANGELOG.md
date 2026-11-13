@@ -1164,6 +1164,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **gc-boehm: a coroutine preempted inside `gc.collect()` (or another libgc call)
+  deadlocked the program** (#888, D-0162). The async-preemption handler may switch a
+  coroutine away at any instruction unless it is in a no-preempt window. Allocation
+  was always inside one, but `gc.collect()` (`GC_gcollect`, which holds the bdwgc
+  allocator lock for the whole collection), finalizer registration, heap statistics,
+  the raw `zap_alloc`, the scheduler's infrastructure allocations and thread
+  create/join/detach were not: a coroutine preempted while holding the lock left the
+  next coroutine on the same OS thread to block on a mutex its own thread owned, and
+  every worker piled up behind it (`gc_switch_alloc_stress` hung ~7% of runs). Every
+  such libgc entry point now lives in a guarded no-preempt layer, and a source test
+  forbids raw calls outside it. New golden `gc_collect_preempt_stress`.
+
 - **gc-boehm: a stop-the-world landing during a coroutine context switch crashed
   the collector** (#885, D-0161). The scheduler moved Boehm's per-thread stack end
   to the coroutine's stack top *before* the `swapcontext` that moves `sp`, and back

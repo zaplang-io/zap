@@ -453,53 +453,112 @@ void zap_gc_add_root(void **slot) { (void)slot; }
  * incremental cycle.) */
 void zap_gc_write_barrier(void **slot) { (void)slot; }
 #define zap_gc_mark(p) ((void)(p))
-/* Boehm allocation routes to GC_MALLOC, whose internal allocator lock must not
- * be held across an async preemption (ticket #172): a switched-in sibling
- * coroutine on the same M calling GC_MALLOC would deadlock on that lock. So each
- * allocation is a no-preempt window — the one runtime lock a tight, yield-free
- * compute loop actually touches. */
+/* ZAP_GC_GUARDED_LAYER_BEGIN (Boehm) --------------------------------------------
+ * EVERY call into libgc that takes (or may take) the collector's allocator lock
+ * lives in this block, bracketed by a no-preempt window, and nothing outside the
+ * `ZAP_GC_GUARDED_LAYER_*` blocks may name the raw entry points (a unit test in
+ * zapc_codegen enforces it — I#888).
+ *
+ * Why: the allocator lock is a plain, non-recursive `pthread_mutex_t`. The Boehm
+ * async-preemption handler (SIGURG, ticket #172) switches a coroutine away at an
+ * arbitrary instruction unless it is inside a no-preempt window (`no_preempt > 0`).
+ * A coroutine preempted while inside libgc holds the lock across the switch; the
+ * coroutine run next on the SAME OS thread then blocks in its first allocation on
+ * a lock its own thread already owns — a self-deadlock that wedges every worker.
+ * The allocation helpers were always guarded; `gc.collect()` (`GC_gcollect`, which
+ * holds the lock for the whole collection), the finalizer registration, the heap
+ * statistics, the raw `zap_alloc`, the scheduler-infrastructure allocations and the
+ * thread create/join/detach calls (each takes the lock) were not (I#888: a
+ * coroutine preempted just inside `GC_gcollect` hung `gc_switch_alloc_stress`
+ * ~7% of runs). */
+static inline void *zap_gc_malloc(size_t n) {
+    zap_np_enter();
+    void *p = GC_MALLOC(n);
+    zap_np_leave();
+    return p;
+}
+static inline void *zap_gc_malloc_atomic(size_t n) {
+    zap_np_enter();
+    void *p = GC_MALLOC_ATOMIC(n);
+    zap_np_leave();
+    return p;
+}
+static inline void zap_gc_collect_guarded(void) {
+    zap_np_enter();
+    GC_gcollect();
+    zap_np_leave();
+}
+static inline void zap_gc_heap_sizes(size_t *heap, size_t *freeb) {
+    zap_np_enter();
+    *heap = GC_get_heap_size();
+    *freeb = GC_get_free_bytes();
+    zap_np_leave();
+}
+/* Finalizers (ticket #92): forward to Boehm's registration so the one call site
+ * (`zap_py_wrap`) is backend-uniform. Boehm's default finalizer already provides
+ * exactly these semantics (one-shot, run when unreachable, outside the GC). */
+static inline void zap_gc_register_finalizer(void *payload,
+                                             void (*fn)(void *obj, void *cd), void *cd) {
+    zap_np_enter();
+    GC_register_finalizer(payload, (GC_finalization_proc)fn, cd, NULL, NULL);
+    zap_np_leave();
+}
+/* ZAP_GC_GUARDED_LAYER_END */
+
 /* Every Boehm allocation checks the result: on heap exhaustion GC_MALLOC /
  * GC_MALLOC_ATOMIC return NULL (bdwgc's default GC_oom_fn returns 0), and codegen
  * stores into the returned pointer unchecked (#697), so an unchecked NULL faults
  * as a nil-deref SIGSEGV at address 0. Routing NULL through zap_oom turns that
  * wild fault into a clean `zap: out of memory` abort. */
 static inline void *zap_alloc_desc(const ZapTypeDesc *d) {
-    zap_np_enter();
-    void *p = GC_MALLOC((size_t)d->size);
-    zap_np_leave();
+    void *p = zap_gc_malloc((size_t)d->size);
     if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_obj(const ZapTypeDesc *d) {
-    zap_np_enter();
-    void *p = GC_MALLOC((size_t)d->size);
-    zap_np_leave();
+    void *p = zap_gc_malloc((size_t)d->size);
     if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_buf(int64_t n) {
-    zap_np_enter();
-    void *p = GC_MALLOC_ATOMIC((size_t)n);
-    zap_np_leave();
+    void *p = zap_gc_malloc_atomic((size_t)n);
     if (!p) zap_oom(NULL);
     return p;
 }
 static inline void *zap_ptrbuf(int64_t n) {
-    zap_np_enter();
-    void *p = GC_MALLOC((size_t)n);
-    zap_np_leave();
+    void *p = zap_gc_malloc((size_t)n);
     if (!p) zap_oom(NULL);
     return p;
 }
-#define ZAP_INFRA_ALLOC(n) GC_MALLOC(n)
-/* Finalizers (ticket #92): forward to Boehm's registration so the one call site
- * (`zap_py_wrap`) is backend-uniform. Boehm's default finalizer already provides
- * exactly these semantics (one-shot, run when unreachable, outside the GC). */
-static inline void zap_gc_register_finalizer(void *payload,
-                                             void (*fn)(void *obj, void *cd), void *cd) {
-    GC_register_finalizer(payload, (GC_finalization_proc)fn, cd, NULL, NULL);
-}
+#define ZAP_INFRA_ALLOC(n) zap_gc_malloc(n)
 #endif
+
+/* ZAP_GC_GUARDED_LAYER_BEGIN (threads) -------------------------------------------
+ * Thread create / detach / join. Under Boehm these are `GC_pthread_*` and take the
+ * allocator lock (thread-table update + allocation), and a coroutine can reach them
+ * (`dedicated_pin`, the scope timers, the lazily-started pollers) — so they get the
+ * same no-preempt window as every other libgc entry point (I#888). Under Immix they
+ * are plain pthread calls and the window is a harmless no-op bracket. */
+static inline int zap_gc_pthread_create(pthread_t *t, const pthread_attr_t *a,
+                                        void *(*fn)(void *), void *arg) {
+    zap_np_enter();
+    int rc = GC_pthread_create(t, a, fn, arg);
+    zap_np_leave();
+    return rc;
+}
+static inline int zap_gc_pthread_detach(pthread_t t) {
+    zap_np_enter();
+    int rc = GC_pthread_detach(t);
+    zap_np_leave();
+    return rc;
+}
+static inline int zap_gc_pthread_join(pthread_t t, void **rv) {
+    zap_np_enter();
+    int rc = GC_pthread_join(t, rv);
+    zap_np_leave();
+    return rc;
+}
+/* ZAP_GC_GUARDED_LAYER_END */
 
 /* One-object string layout (#837, D-0145). The byte payload is a flexible array
  * member CONTIGUOUS with the header, so a string is a SINGLE GC object (header +
@@ -535,9 +594,7 @@ static ZapStr *zap_str_alloc(int64_t len) {
 #ifdef ZAP_GC_IMMIX
     ZapStr *s = (ZapStr *)zap_gc_alloc_var(&zap_desc_strobj, total);
 #else
-    zap_np_enter();
-    ZapStr *s = (ZapStr *)GC_MALLOC_ATOMIC((size_t)total);
-    zap_np_leave();
+    ZapStr *s = (ZapStr *)zap_gc_malloc_atomic((size_t)total);
     if (!s) {
         zap_oom(NULL);
     }
@@ -580,9 +637,7 @@ static void *zap_arena_boehm_alloc(ZapArena *a, size_t n, int atomic) {
     if (a->cap && a->reserved + n > a->cap) {
         return NULL; /* cap exceeded -> MemoryError */
     }
-    zap_np_enter();
-    void *p = atomic ? GC_MALLOC_ATOMIC(n) : GC_MALLOC(n);
-    zap_np_leave();
+    void *p = atomic ? zap_gc_malloc_atomic(n) : zap_gc_malloc(n);
     if (!p) {
         return NULL; /* heap OOM -> MemoryError */
     }
@@ -779,7 +834,7 @@ void *zap_alloc(int64_t size) {
      * net rather than a hot path. */
     return zap_gc_alloc_atomic(size);
 #else
-    void *p = GC_MALLOC((size_t)size);
+    void *p = zap_gc_malloc((size_t)size); /* guarded: I#888 */
     if (!p) zap_oom(NULL); /* unchecked NULL would nil-deref in generated code (#697) */
     return p;
 #endif
@@ -797,10 +852,10 @@ void *zap_alloc(int64_t size) {
  * ones wrap bdwgc here. */
 int64_t zap_gc_count(void);
 #ifndef ZAP_GC_IMMIX
-void zap_gc_collect(void) { GC_gcollect(); }
+void zap_gc_collect(void) { zap_gc_collect_guarded(); } /* I#888: no-preempt window */
 void zap_gc_stats(int64_t *heap_bytes, int64_t *live_bytes) {
-    size_t heap = GC_get_heap_size();
-    size_t freeb = GC_get_free_bytes();
+    size_t heap, freeb;
+    zap_gc_heap_sizes(&heap, &freeb);
     if (heap_bytes) {
         *heap_bytes = (int64_t)heap;
     }
@@ -6334,7 +6389,7 @@ static void dedicated_pin(int joinable) {
         g_ded_live++;
         zap_np_unlock(&g_ded_mu);
     }
-    if (GC_pthread_create(&d->thread, NULL, dedicated_worker_main, d) != 0) {
+    if (zap_gc_pthread_create(&d->thread, NULL, dedicated_worker_main, d) != 0) {
         if (joinable) {
             zap_np_lock(&g_ded_mu);
             g_ded_live--;
@@ -6343,7 +6398,7 @@ static void dedicated_pin(int joinable) {
         free(d);
         return;
     }
-    GC_pthread_detach(d->thread); /* self-cleaning; joined via the chosen barrier */
+    zap_gc_pthread_detach(d->thread); /* self-cleaning; joined via the chosen barrier */
     g->lock_depth = 1;
     g->locked_m = d;
     /* Yield: switch_to_g on the current worker will route us (locked_m set) to
@@ -6411,14 +6466,14 @@ static void zap_sched_init_once(void) {
     GC_set_on_collection_event(zap_boehm_gc_event);
 #endif
     for (int i = 0; i < g_nm; i++) {
-        int rc = GC_pthread_create(&g_ms[i].thread, NULL, worker_main, &g_ms[i]);
+        int rc = zap_gc_pthread_create(&g_ms[i].thread, NULL, worker_main, &g_ms[i]);
         if (rc != 0) {
             fprintf(stderr, "zap: failed to start scheduler thread (%d)\n", rc);
             abort();
         }
     }
     /* The preemption monitor: samples schedticks and signals monopolizing Ms. */
-    if (GC_pthread_create(&g_monitor_thread, NULL, zap_monitor_main, NULL) == 0) {
+    if (zap_gc_pthread_create(&g_monitor_thread, NULL, zap_monitor_main, NULL) == 0) {
         g_monitor_started = 1;
     }
     /* ZAP_PROFILE=cpu: start the CPU profiler now that the worker Ms it samples
@@ -6512,11 +6567,11 @@ void zap_rt_join_all(void) {
     zap_np_unlock(&g_idle_mu);
     /* Stop the preemption monitor (it polls g_shutdown every slice). */
     if (g_monitor_started) {
-        GC_pthread_join(g_monitor_thread, NULL);
+        zap_gc_pthread_join(g_monitor_thread, NULL);
         g_monitor_started = 0;
     }
     for (int i = 0; i < g_nm; i++) {
-        GC_pthread_join(g_ms[i].thread, NULL);
+        zap_gc_pthread_join(g_ms[i].thread, NULL);
     }
     /* All worker Ms are joined, so no SIGPROF handler can still be running: free
      * the per-M profiler ring buffers (ticket #78). */
@@ -7816,7 +7871,7 @@ static void np_start_once(void) {
         fprintf(stderr, "zap: netpoller init failed (epoll)\n");
         return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
     }
-    int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
+    int rc = zap_gc_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
     if (rc != 0) {
         fprintf(stderr, "zap: netpoller thread start failed (%d)\n", rc);
         return;
@@ -7827,7 +7882,7 @@ static void np_start_once(void) {
         fprintf(stderr, "zap: netpoller init failed (IOCP err %d)\n", zap_iocp_last_error());
         return; /* g_np_started stays 0 => zap_netpoll_open reports unsupported */
     }
-    int rc = GC_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
+    int rc = zap_gc_pthread_create(&g_np_thread, NULL, np_poller_main, NULL);
     if (rc != 0) {
         fprintf(stderr, "zap: netpoller thread start failed (%d)\n", rc);
         return;
@@ -7850,7 +7905,7 @@ static void netpoll_shutdown(void) {
     }
     __atomic_store_n(&g_np_shutdown, 1, __ATOMIC_RELAXED);
     np_backend_kick();
-    GC_pthread_join(g_np_thread, NULL);
+    zap_gc_pthread_join(g_np_thread, NULL);
     g_np_started = 0;
 #if defined(ZAP_NETPOLL_IOCP)
     /* The poller thread has joined, so no completion can still reference the port
@@ -8766,7 +8821,7 @@ static void zap_sig_start_once(void) {
         return;
     }
     zap_install_fault_handlers();
-    int rc = GC_pthread_create(&g_sig_thread, NULL, zap_sig_thread_main, NULL);
+    int rc = zap_gc_pthread_create(&g_sig_thread, NULL, zap_sig_thread_main, NULL);
     if (rc != 0) {
         fprintf(stderr, "zap: signal thread start failed (%d)\n", rc);
         return;
@@ -8804,7 +8859,7 @@ static void zap_signal_shutdown(void) {
     if (g_sig_pd) {
         zap_netpoll_wake(g_sig_pd, ZAP_POLL_READ);
     }
-    GC_pthread_join(g_sig_thread, NULL);
+    zap_gc_pthread_join(g_sig_thread, NULL);
     if (g_sig_pd) {
         zap_netpoll_close(g_sig_pd);
         g_sig_pd = NULL;
@@ -8929,11 +8984,11 @@ static void *zap_grace_timer(void *arg) {
 static void zap_grace_arm(ScopeSigSub *ss) {
     ss->refcnt++;
     pthread_t t;
-    if (pthread_create(&t, NULL, zap_grace_timer, ss) != 0) {
+    if (zap_gc_pthread_create(&t, NULL, zap_grace_timer, ss) != 0) {
         ss->refcnt--; /* could not arm: drop the extra ref */
         return;
     }
-    pthread_detach(t);
+    zap_gc_pthread_detach(t);
 }
 
 /* #825: SEVER every coroutine still live in `sc`'s tree that did not drain within
@@ -9052,11 +9107,11 @@ static void *zap_scope_sever_timer(void *arg) {
 static void zap_scope_sever_arm(ScopeSigSub *ss) {
     ss->refcnt++;
     pthread_t t;
-    if (pthread_create(&t, NULL, zap_scope_sever_timer, ss) != 0) {
+    if (zap_gc_pthread_create(&t, NULL, zap_scope_sever_timer, ss) != 0) {
         ss->refcnt--; /* could not arm: drop the extra ref */
         return;
     }
-    pthread_detach(t);
+    zap_gc_pthread_detach(t);
 }
 
 /* Build the `ScopeTimeout` the timed-out scope raises to its caller (I#475). The
@@ -9209,13 +9264,13 @@ void zap_scope_timeout(void *scope_, int64_t duration_ms, int64_t grace_ms) {
         return;
     }
     pthread_t timer;
-    if (pthread_create(&timer, NULL, zap_scope_deadline_main, ss) != 0) {
+    if (zap_gc_pthread_create(&timer, NULL, zap_scope_deadline_main, ss) != 0) {
         g_scope_deadlines = ss->next; free(ss);
         zap_np_unlock(&g_sig_mu);
         zap_panic_typed(ZAP_EXC_RUNTIME_ERROR, zap_str_new("cannot create scope deadline timer", 34));
         return;
     }
-    pthread_detach(timer);
+    zap_gc_pthread_detach(timer);
     zap_np_unlock(&g_sig_mu);
 }
 
@@ -20875,7 +20930,7 @@ static void zap_profile_start_locked(void) {
     zap_prof_warmup();
     g_prof_stop = 0;
     __atomic_store_n(&g_prof_active, 1, __ATOMIC_RELEASE);
-    if (GC_pthread_create(&g_prof_monitor, NULL, zap_prof_monitor_main, NULL) == 0) {
+    if (zap_gc_pthread_create(&g_prof_monitor, NULL, zap_prof_monitor_main, NULL) == 0) {
         g_prof_monitor_started = 1;
     } else {
         __atomic_store_n(&g_prof_active, 0, __ATOMIC_RELEASE);
@@ -20894,7 +20949,7 @@ static void zap_profile_stop_locked(void) {
     __atomic_store_n(&g_prof_active, 0, __ATOMIC_RELEASE);
     g_prof_stop = 1;
     if (g_prof_monitor_started) {
-        GC_pthread_join(g_prof_monitor, NULL);
+        zap_gc_pthread_join(g_prof_monitor, NULL);
         g_prof_monitor_started = 0;
     }
     zap_prof_write_folded();
