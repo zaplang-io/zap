@@ -2257,14 +2257,20 @@ fn heap_elem_of(t: &ast::Type, env: &TyEnv) -> Result<Elem, LowerError> {
 fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
     match resolve_ty(t, env)? {
         Ty::F64 => Ok(Dtype::F64),
+        Ty::F32 => Ok(Dtype::F32),
         Ty::I64 => Ok(Dtype::I64),
-        // `array[uint8]` is the dense byte-buffer dtype (image data, #49/#552);
-        // `uint8` now resolves to the scalar `Ty::U8`, so map it to the uint8
-        // dtype here. Wider unsigned array dtypes are a documented follow-up.
+        Ty::I32 => Ok(Dtype::I32),
+        Ty::I16 => Ok(Dtype::I16),
+        Ty::I8 => Ok(Dtype::I8),
+        // The unsigned scalar `Ty::U8`..`U64` map to the unsigned array dtypes
+        // (the full dtype matrix, #503/#890; `uint8` is the image-byte dtype).
         Ty::U8 => Ok(Dtype::Uint8),
+        Ty::U16 => Ok(Dtype::U16),
+        Ty::U32 => Ok(Dtype::U32),
+        Ty::U64 => Ok(Dtype::U64),
         Ty::I1 => Ok(Dtype::Bool),
         other => Err(err(format!(
-            "array[{other}] is not supported yet (only array[f64], array[i64], array[uint8], array[bool])"
+            "array[{other}] is not a numeric dtype (f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool)"
         ))),
     }
 }
@@ -2274,11 +2280,18 @@ fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
 fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
     match name {
         "float" | "float64" | "f64" => Ok(Dtype::F64),
+        "float32" | "f32" => Ok(Dtype::F32),
         "int" | "int64" | "i64" => Ok(Dtype::I64),
+        "int32" | "i32" => Ok(Dtype::I32),
+        "int16" | "i16" => Ok(Dtype::I16),
+        "int8" | "i8" => Ok(Dtype::I8),
         "uint8" | "u8" => Ok(Dtype::Uint8),
+        "uint16" | "u16" => Ok(Dtype::U16),
+        "uint32" | "u32" => Ok(Dtype::U32),
+        "uint64" | "u64" => Ok(Dtype::U64),
         "bool" => Ok(Dtype::Bool),
         other => Err(err(format!(
-            "array[{other}] is not supported yet (only array[f64], array[i64], array[uint8], array[bool])"
+            "array[{other}] is not a numeric dtype (f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool)"
         ))),
     }
 }
@@ -21270,5 +21283,78 @@ mod nd_array_tests {
             "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
              m[0] = array[i64]([9, 9])\n",
         );
+    }
+}
+
+#[cfg(test)]
+mod dtype_matrix_tests {
+    //! Construction/indexing/ops lower for every dtype in the matrix (#503 f32/i32,
+    //! #890 i8/i16 + u16/u32/u64). Host-only (AST->ZIR), so the dtype plumbing is a
+    //! walled garden independent of codegen.
+    use super::lower_module;
+
+    fn lowers_ok(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty(), "parse errors: {perrs:?}");
+        assert!(lerrs.is_empty(), "lex errors: {lerrs:?}");
+        let (_m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+    }
+
+    #[test]
+    fn every_dtype_constructs_indexes_and_reduces() {
+        for (dt, lit) in [
+            ("f32", "[1.0, 2.0, 3.0]"),
+            ("f64", "[1.0, 2.0, 3.0]"),
+            ("i8", "[1, 2, 3]"),
+            ("i16", "[1, 2, 3]"),
+            ("i32", "[1, 2, 3]"),
+            ("i64", "[1, 2, 3]"),
+            ("u8", "[1, 2, 3]"),
+            ("u16", "[1, 2, 3]"),
+            ("u32", "[1, 2, 3]"),
+            ("u64", "[1, 2, 3]"),
+            ("bool", "[True, False, True]"),
+        ] {
+            lowers_ok(&format!(
+                "def main():\n    auto a = array[{dt}]({lit})\n    a[0] = a[1]\n    \
+                 print(a[2], len(a), sum(a))\n"
+            ));
+            // N-D construction + multi-axis index for the same dtype.
+            if dt != "bool" {
+                lowers_ok(&format!(
+                    "def main():\n    auto m = array[{dt}]([[1, 2], [3, 4]])\n    \
+                     print(m[1, 0], m.ndim, m.size)\n"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn wide_dtype_elementwise_and_broadcast_lower() {
+        // Element-wise + scalar broadcast + array-array broadcast across new dtypes.
+        lowers_ok(
+            "def main():\n    auto a = array[f32]([[1.0, 2.0], [3.0, 4.0]])\n    \
+             auto b = array[f32]([10.0, 20.0])\n    print(sum(a + b), sum(a * 2.0))\n",
+        );
+        lowers_ok(
+            "def main():\n    auto a = array[i32]([1, 2, 3])\n    \
+             auto b = array[u16]([4, 5, 6])\n    print(sum(a + b))\n",
+        );
+        lowers_ok(
+            "def main():\n    auto a = array[u64]([1, 2])\n    \
+             auto b = array[i64]([3, 4])\n    print(sum(a + b))\n",
+        );
+    }
+
+    #[test]
+    fn bogus_dtype_is_rejected() {
+        let (module, _p, _l) =
+            zapc_syntax::parser::parse_str("def main():\n    auto a = array[f128]([1.0])\n");
+        let (_m, errs) = lower_module(&module);
+        assert!(!errs.is_empty(), "array[f128] should be rejected");
     }
 }

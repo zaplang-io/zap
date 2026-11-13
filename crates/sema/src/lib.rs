@@ -5791,11 +5791,15 @@ impl Checker {
         // ordinary value names, so they are not inferred as such. Typed loosely.
         if let Expr::Index { base, index, .. } = callee {
             if matches!(base.as_ref(), Expr::Name(n, _) if n == "array") {
-                let valid_dtype = matches!(index.as_ref(), Expr::Name(n, _) if matches!(n.as_str(), "float" | "f64" | "float64" | "int" | "i64" | "int64" | "uint8" | "u8" | "bool"));
+                let valid_dtype = matches!(index.as_ref(), Expr::Name(n, _) if matches!(n.as_str(),
+                    "float" | "f64" | "float64" | "f32" | "float32"
+                    | "int" | "i64" | "int64" | "i32" | "int32" | "i16" | "int16" | "i8" | "int8"
+                    | "uint8" | "u8" | "u16" | "uint16" | "u32" | "uint32" | "u64" | "uint64"
+                    | "bool"));
                 if !valid_dtype {
                     self.error(
                         ErrorCode::ZAP4028,
-                        "unsupported array dtype; expected f64, i64, uint8, or bool".to_string(),
+                        "unsupported array dtype; expected f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, or bool".to_string(),
                         expr_span(index),
                     );
                 }
@@ -9729,20 +9733,16 @@ def main():
     }
 
     #[test]
-    fn array_f32_is_not_diagnosed_by_the_collection_float_guard() {
-        // The asymmetry the capability refactor preserves: `array` is deliberately
-        // absent from the `f32` collection-slot gate, so `array[f32]` does NOT
-        // raise ZAP4027. (It is still rejected — a dense `array` only supports the
-        // f64/i64/uint8/bool dtypes today — but by the array-dtype guard ZAP4028,
-        // which avoids double-diagnosing the same type.)
-        let es = errors("def main():\n    array[f32] a = array[f32]([1.0, 2.0])\n");
+    fn array_f32_is_an_accepted_dtype() {
+        // `array[f32]` is a supported dense dtype (#503, D-0166). It never tripped
+        // the `f32` collection-slot gate (ZAP4027 — `array` is exempt), and it is
+        // no longer rejected by the array-dtype guard (ZAP4028): dense f32 buffers
+        // are exactly what `array[f32]` is for.
+        let es =
+            errors("def main():\n    array[f32] a = array[f32]([1.0, 2.0])\n    print(len(a))\n");
         assert!(
-            !es.iter().any(|e| e.code == ErrorCode::ZAP4027),
-            "array[f32] must not trip the collection float guard (ZAP4027): {es:?}"
-        );
-        assert!(
-            es.iter().any(|e| e.code == ErrorCode::ZAP4028),
-            "array[f32] is still rejected, by the array-dtype guard (ZAP4028): {es:?}"
+            es.is_empty(),
+            "array[f32] should now be accepted (no ZAP4027/ZAP4028): {es:?}"
         );
     }
 
@@ -10217,9 +10217,8 @@ def main():
     #[test]
     fn unsupported_array_constructors_are_diagnosed() {
         for value in [
-            "array[f32]([1])",
-            "array[i32]([1])",
             "array[str]([1])",
+            "array[complex]([1])",
             "array[f64]([\"x\"])",
             "array[f64]([[\"x\"]])", // a non-numeric leaf, even nested, is rejected
             "array[f64]()",

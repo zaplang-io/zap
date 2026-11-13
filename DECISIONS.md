@@ -8548,3 +8548,31 @@ semantics) instead of requiring identical shapes.
   assignment / partial-index (whole-row) stores; division and comparison kernels
   (#506). Rank stays static per the type (D-0164); no annotation change.
 No grammar change. See `design/0002-arrays.md`, SPEC §15, `design/RUNTIME-ABI.md`.
+
+## D-0166 — Complete the numeric array dtype matrix + NEP-50 promotion (#503, #890)
+**Status:** Locked (design) / implemented
+Extends the `array[T]` dtype set from {`f64`,`i64`,`uint8`,`bool`} to the full
+matrix (third increment of the arrays epic #499, over D-0164/D-0165):
+- **Floats** `f32`, `f64`; **signed** `i8`,`i16`,`i32`,`i64`; **unsigned**
+  `u8`(=`uint8`),`u16`,`u32`,`u64`; `bool`. Names `f32`/`float32`, `i8`/`int8`,
+  `u16`/`uint16`, … all accepted in `array[T]` construction and annotations.
+- **ABI.** Every integer dtype crosses the runtime get/set/sum ABI as an `int64`
+  word (get sign/zero-extends by signedness, set wraps mod 2^width per D-0005);
+  every float as a `float64` word (get widens, set narrows). So `a[i]`/`sum(a)`
+  are ordinary `int64`/`float64`; the compact storage width is internal. `u64`
+  reinterprets its top bit through the signed `int64` word (a documented edge).
+- **Storage/codegen.** 1/2/4/8-byte storage; the SIMD element-wise kernel
+  loads/widens/computes/stores at each dtype's width (new `convert`/`dtype_vec`
+  cases: `i16`/`i32` ints, `f32` floats with fpext/fptrunc). Codes 0..=3 keep
+  their values (ABI-stable); the wider dtypes take fresh codes 4..=10.
+- **Promotion (NEP-50).** A float operand forces a float result of the **widest
+  float operand** (an integer never bumps `f32`→`f64`: `i64 + f32 → f32`). Two
+  integers of the same signedness → the wider; **mixed** signed/unsigned → the
+  signed type that holds both (the signed width if strictly wider, else the next
+  signed width up: `u8+i8→i16`, `u16+i16→i32`, `u32+i32→i64`), and `u64` against
+  any signed falls back to `f64` (no 128-bit int). Arithmetic never yields
+  `bool` (`bool+bool→uint8`); `bool` otherwise defers to the other operand. Weak
+  scalars (NEP-50): an int scalar keeps the array dtype, a float scalar keeps a
+  float array's width else forces `f64`. The legacy 4-dtype results are
+  unchanged subcases.
+No grammar change. See `design/0002-arrays.md`, SPEC §15, `design/RUNTIME-ABI.md`.

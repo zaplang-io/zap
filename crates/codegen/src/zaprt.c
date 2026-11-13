@@ -3076,10 +3076,24 @@ void *zap_heap_items(void *hp) {
  * Deferred: strided views, broadcasting beyond a scalar, and N-D (axis-0)
  * array slicing. N-D shape + multi-axis indexing are supported (#500);
  * contiguous 1-D views and full-shape checks are supported (I#476). */
-enum { DTYPE_F64 = 0, DTYPE_I64 = 1, DTYPE_U8 = 2, DTYPE_BOOL = 3 };
+/* The full dtype matrix (#503 f32/i32, #890 i8/i16 + u16/u32/u64). Codes 0..=3
+ * are the original dtypes (ABI-stable, must match `Dtype::code` in ir_core). */
+enum {
+    DTYPE_F64 = 0,
+    DTYPE_I64 = 1,
+    DTYPE_U8 = 2,
+    DTYPE_BOOL = 3,
+    DTYPE_F32 = 4,
+    DTYPE_I32 = 5,
+    DTYPE_I8 = 6,
+    DTYPE_I16 = 7,
+    DTYPE_U16 = 8,
+    DTYPE_U32 = 9,
+    DTYPE_U64 = 10
+};
 
 typedef struct {
-    int64_t dtype;  /* DTYPE_F64 | DTYPE_I64 | DTYPE_U8 | DTYPE_BOOL */
+    int64_t dtype;  /* one of DTYPE_* above */
     int64_t ndim;   /* static rank >= 1 (#500); 1 for a plain 1-D array */
     int64_t *dims;  /* `ndim` row-major dimensions; dims[0] is len(a) */
     void *data;     /* GC buffer base; `off` elements precede this array's first */
@@ -3092,9 +3106,23 @@ typedef struct {
  * `off` (first element) + `dims[0]` (length). All element access adds `off`, and
  * `zap_array_data` returns the window base so the SIMD kernels stay contiguous. */
 
-/* Bytes per stored element: f64/i64 are 8-byte words, uint8/bool one byte. */
+/* Bytes per stored element, by dtype width (#503/#890). */
 static size_t zap_array_elem_size(int64_t dtype) {
-    return (dtype == DTYPE_U8 || dtype == DTYPE_BOOL) ? 1 : 8;
+    switch (dtype) {
+    case DTYPE_U8:
+    case DTYPE_BOOL:
+    case DTYPE_I8:
+        return 1;
+    case DTYPE_I16:
+    case DTYPE_U16:
+        return 2;
+    case DTYPE_F32:
+    case DTYPE_I32:
+    case DTYPE_U32:
+        return 4;
+    default: /* f64 / i64 / u64 */
+        return 8;
+    }
 }
 
 /* The total number of elements = product of all `ndim` dimensions (row-major,
@@ -3418,74 +3446,66 @@ void zap_array_bcast_offsets(void *ap, void *bp, void *resp, int64_t f,
     *off_b = ob;
 }
 
-double zap_array_get_f64(void *ap, int64_t i) {
-    ZapArray *a = (ZapArray *)ap;
-    zap_array_bounds(a, i);
-    return ((double *)a->data)[a->off + i];
-}
-void zap_array_set_f64(void *ap, int64_t i, double v) {
-    ZapArray *a = (ZapArray *)ap;
-    zap_array_bounds(a, i);
-    ((double *)a->data)[a->off + i] = v;
-}
-int64_t zap_array_get_i64(void *ap, int64_t i) {
-    ZapArray *a = (ZapArray *)ap;
-    zap_array_bounds(a, i);
-    return ((int64_t *)a->data)[a->off + i];
-}
-void zap_array_set_i64(void *ap, int64_t i, int64_t v) {
-    ZapArray *a = (ZapArray *)ap;
-    zap_array_bounds(a, i);
-    ((int64_t *)a->data)[a->off + i] = v;
-}
-
-/* `sum(a)` is a FULL reduction over every element (all axes), not just the
- * first — so N-D arrays sum their whole contiguous window (#500). */
-double zap_array_sum_f64(void *ap) {
-    ZapArray *a = (ZapArray *)ap;
-    const double *d = (const double *)a->data + a->off;
-    int64_t n = zap_array_count_of(a);
-    double s = 0.0;
-    for (int64_t i = 0; i < n; i++) {
-        s += d[i];
+/* The typed get/set/sum for every numeric dtype (#49/#503/#890). Each integer
+ * dtype crosses the ABI as an `int64_t` word: `get` sign/zero-extends the stored
+ * element (the signedness of `ctype` picks which), `set` truncates (wraps mod
+ * 2^width, D-0005), and `sum` accumulates in `int64_t` over the whole N-D
+ * element window (#500). Each float dtype crosses as a `double`: `get` widens,
+ * `set` narrows, `sum` accumulates in `double`. `bool` is special-cased below. */
+#define ZAP_ARRAY_INT_ACCESS(suffix, ctype)                                    \
+    int64_t zap_array_get_##suffix(void *ap, int64_t i) {                      \
+        ZapArray *a = (ZapArray *)ap;                                          \
+        zap_array_bounds(a, i);                                                \
+        return (int64_t)((const ctype *)a->data)[a->off + i];                 \
+    }                                                                          \
+    void zap_array_set_##suffix(void *ap, int64_t i, int64_t v) {             \
+        ZapArray *a = (ZapArray *)ap;                                          \
+        zap_array_bounds(a, i);                                               \
+        ((ctype *)a->data)[a->off + i] = (ctype)v;                            \
+    }                                                                          \
+    int64_t zap_array_sum_##suffix(void *ap) {                                \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a), s = 0;                             \
+        for (int64_t i = 0; i < n; i++)                                       \
+            s += (int64_t)d[i];                                               \
+        return s;                                                             \
     }
-    return s;
-}
-int64_t zap_array_sum_i64(void *ap) {
-    ZapArray *a = (ZapArray *)ap;
-    const int64_t *d = (const int64_t *)a->data + a->off;
-    int64_t n = zap_array_count_of(a);
-    int64_t s = 0;
-    for (int64_t i = 0; i < n; i++) {
-        s += d[i];
-    }
-    return s;
-}
 
-/* uint8 / bool (ticket #49): 1-byte storage, i64 ABI. `get` zero-extends the
- * byte; `set` truncates to a byte (uint8, wraps mod 256) or normalizes to 0|1
- * (bool). `sum` accumulates in int64 so it never overflows the narrow dtype. */
-int64_t zap_array_get_u8(void *ap, int64_t i) {
-    ZapArray *a = (ZapArray *)ap;
-    zap_array_bounds(a, i);
-    return (int64_t)((const uint8_t *)a->data)[a->off + i];
-}
-void zap_array_set_u8(void *ap, int64_t i, int64_t v) {
-    ZapArray *a = (ZapArray *)ap;
-    zap_array_bounds(a, i);
-    ((uint8_t *)a->data)[a->off + i] = (uint8_t)v;
-}
-int64_t zap_array_sum_u8(void *ap) {
-    ZapArray *a = (ZapArray *)ap;
-    const uint8_t *d = (const uint8_t *)a->data + a->off;
-    int64_t n = zap_array_count_of(a);
-    int64_t s = 0;
-    for (int64_t i = 0; i < n; i++) {
-        s += (int64_t)d[i];
+#define ZAP_ARRAY_FLOAT_ACCESS(suffix, ctype)                                  \
+    double zap_array_get_##suffix(void *ap, int64_t i) {                       \
+        ZapArray *a = (ZapArray *)ap;                                          \
+        zap_array_bounds(a, i);                                                \
+        return (double)((const ctype *)a->data)[a->off + i];                  \
+    }                                                                          \
+    void zap_array_set_##suffix(void *ap, int64_t i, double v) {              \
+        ZapArray *a = (ZapArray *)ap;                                          \
+        zap_array_bounds(a, i);                                               \
+        ((ctype *)a->data)[a->off + i] = (ctype)v;                            \
+    }                                                                          \
+    double zap_array_sum_##suffix(void *ap) {                                 \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        double s = 0.0;                                                        \
+        for (int64_t i = 0; i < n; i++)                                       \
+            s += (double)d[i];                                                 \
+        return s;                                                             \
     }
-    return s;
-}
 
+ZAP_ARRAY_FLOAT_ACCESS(f64, double)
+ZAP_ARRAY_FLOAT_ACCESS(f32, float)
+ZAP_ARRAY_INT_ACCESS(i64, int64_t)
+ZAP_ARRAY_INT_ACCESS(i32, int32_t)
+ZAP_ARRAY_INT_ACCESS(i16, int16_t)
+ZAP_ARRAY_INT_ACCESS(i8, int8_t)
+ZAP_ARRAY_INT_ACCESS(u8, uint8_t)
+ZAP_ARRAY_INT_ACCESS(u16, uint16_t)
+ZAP_ARRAY_INT_ACCESS(u32, uint32_t)
+ZAP_ARRAY_INT_ACCESS(u64, uint64_t)
+
+/* `bool` is a 0/1 byte: `set` normalizes any nonzero to 1, `get`/`sum` read it
+ * back as 0/1 (distinct from `uint8`, which stores the raw byte). */
 int64_t zap_array_get_bool(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);

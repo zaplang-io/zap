@@ -238,12 +238,16 @@ allocation, not a header plus a separate data buffer:
   maps a result flat index to each operand's window-relative offset
   (stretched/missing axes contribute 0). The exact `zap_array_check_shape`
   remains available. Strided views and N-D array slicing are follow-ups (#502).
-  `dtype` tags the
-  element type — `0 = f64`, `1 = i64` (8-byte words), `2 = uint8`, `3 = bool`
-  (1-byte words). `zap_array_new(dtype, len)` sizes the buffer by dtype; `uint8`
-  /`bool` cross the typed get/set/sum entry points as `i64` words (get
-  zero-extends, set truncates/normalizes). Mixed-dtype element-wise ops promote
-  per D-0011; the SIMD kernel reads each operand buffer at its own element type.
+  `dtype` tags the element type over the full matrix (#503/#890, D-0166): codes
+  `0 = f64`, `1 = i64`, `2 = uint8`, `3 = bool` (ABI-stable), then `4 = f32`,
+  `5 = i32`, `6 = i8`, `7 = i16`, `8 = u16`, `9 = u32`, `10 = u64`; storage is
+  1/2/4/8 bytes by width. `zap_array_new(dtype, len)` / `_new_nd` size the buffer
+  by dtype. Every integer dtype crosses the typed get/set/sum entry points as an
+  `i64` word (get sign/zero-extends by signedness, set wraps mod 2^width) and
+  every float as an `f64` word (get widens, set narrows); the accessors are
+  macro-generated per dtype in `zaprt.c`. Mixed-dtype element-wise ops promote
+  by NEP-50 (D-0166); the SIMD kernel reads each operand buffer at its own
+  element type and widens to the result dtype.
 - `heap[T]` (#76, D-0057): a binary min-heap priority queue — `[ header | len:
   i64 | cap: i64 | data: *T | kind | dir ]`, a complete binary tree over a
   growable element-word array (amortized-doubling growth). `kind` selects the

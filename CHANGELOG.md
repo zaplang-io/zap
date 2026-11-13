@@ -967,6 +967,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   the flat SIMD kernel; the broadcast path is a strided codegen kernel (inner-axis
   SIMD for it is a perf follow-up).
 
+- **Full numeric array dtype matrix** (#503, #890, D-0166, epic #499). `array[T]`
+  now supports floats `f32`/`f64`, signed `i8`/`i16`/`i32`/`i64`, unsigned
+  `u8`/`u16`/`u32`/`u64`, and `bool`. Mixed-dtype element-wise ops promote by
+  NumPy NEP-50 (a float operand forces the widest float — an int never bumps
+  `f32`→`f64`; same-signedness integers take the wider; mixed signed/unsigned
+  take the signed type that holds both, `u64`-with-signed → `f64`). Each integer
+  dtype wraps at its own width; element access crosses as `int64`/`float64`.
+
 - `scope(timeout=<ms>)` deadlines (integer milliseconds, no unit suffix): on
   expiry the scope cancels and awaits its children through the shared channel-aware
   cancellation path (preserving `finally`/`with` cleanup), then raises the new

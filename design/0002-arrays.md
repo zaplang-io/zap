@@ -27,17 +27,18 @@ differentiator. This type is distinct from `list[T]`:
 
 The normative supported subset is SPEC §15: **N-dimensional** arrays with a
 **static rank** (`ndim`, part of the type), constructed from a flat or nested
-**rectangular** list literal; dtypes `f64`/`float64`, `i64`/`int64`,
-`uint8`/`u8`, and `bool`; integer indexing per axis (a full index `m[i, j]` is a
-scalar get/set, a partial index `m[i]` a rank-reduced view); `a.ndim`/`a.shape`/
-`a.size`, `len`, `sum` (over all elements), element-wise `+`/`-`/`*`, scalar
-broadcasting (`+`/`*` on either side, `-` with array on the left), **array-array
-broadcasting** (right-align shapes, stretch size-1 axes, extend rank), mixed
-dtype promotion, and contiguous 1-D view slices (optional literal step `1`).
+**rectangular** list literal; the full dtype matrix — floats `f32`/`f64`, signed
+`i8`/`i16`/`i32`/`i64`, unsigned `u8`/`u16`/`u32`/`u64`, and `bool`; integer
+indexing per axis (a full index `m[i, j]` is a scalar get/set, a partial index
+`m[i]` a rank-reduced view); `a.ndim`/`a.shape`/`a.size`, `len`, `sum` (over all
+elements), element-wise `+`/`-`/`*`, scalar broadcasting (`+`/`*` on either side,
+`-` with array on the left), **array-array broadcasting** (right-align shapes,
+stretch size-1 axes, extend rank), **NEP-50 dtype promotion**, and contiguous
+1-D view slices (optional literal step `1`).
 Shapes that cannot broadcast together raise `ValueError` before entering the
 kernel. Empty and zero-axis arrays are supported.
 
-Axis reductions, N-D and strided views, `f32`/`i32`, `zeros`/`arange`/`sqrt`,
+Axis reductions, N-D and strided views, `zeros`/`arange`/`sqrt`,
 division/comparison kernels, broadcasting in assignment / partial-index
 (whole-row) stores, inner-axis SIMD on the broadcast path, and
 list-variable/iterable constructors are future design work. The broader examples
@@ -204,6 +205,21 @@ header + buffer layout, GC-managed buffer).
   → stride 0). The result is allocated by `zap_array_broadcast_new`. Inner-axis
   SIMD on the broadcast path is a deferred perf follow-up (scalar body for now).
 
+**Increment 5 (shipped, #503 / #890 / D-0166):** the full dtype matrix.
+
+- Dtypes: floats `f32`/`f64`, signed `i8`/`i16`/`i32`/`i64`, unsigned
+  `u8`/`u16`/`u32`/`u64`, `bool`. Each integer crosses the get/set/sum ABI as an
+  `int64` word (sign/zero-extend on get, wrap on set); each float as a `float64`
+  word (widen/narrow). Storage is 1/2/4/8 bytes; the SIMD kernel loads/computes
+  at each width (new `i16`/`i32` int and `f32` fpext/fptrunc `convert` cases).
+  Runtime get/set/sum are macro-generated per dtype (`ZAP_ARRAY_INT_ACCESS` /
+  `ZAP_ARRAY_FLOAT_ACCESS`); dtype codes 0..=3 are preserved, 4..=10 are new.
+- Promotion is **NEP-50** (`Dtype::promote`): widest float wins and an int never
+  bumps `f32`→`f64`; same-signedness integers take the wider; mixed
+  signed/unsigned take the signed type that holds both (`u8+i8→i16`,
+  `u32+i32→i64`), `u64`-with-signed → `f64`. Weak scalars keep the array dtype
+  (int) or a float array's width (float).
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Inner-axis SIMD for the broadcast path; broadcasting in assignment /
@@ -218,7 +234,8 @@ header + buffer layout, GC-managed buffer).
   at the base and `off` carries the window. A strided view would need per-axis
   strides the 1-D `ZapArray` has not got, so a stepped array slice is rejected at
   compile time for now (a list slice, a copy, supports any step).
-- `f32`/`i32` dtypes; `zeros`/`arange`/`sqrt` and axis reductions.
+- `zeros`/`arange`/`sqrt` and axis reductions. (The full dtype matrix —
+  `f32`/`i32`/`i8`/`i16`/`u16`/`u32`/`u64` — shipped in Increment 5, D-0166.)
 - Scalar-on-the-left of a non-commutative op (`scalar - array`).
 - `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 

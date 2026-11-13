@@ -2265,6 +2265,26 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_get_bool", &[p.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_array_set_bool", &[p.into(), i.into(), i.into()], None);
         self.declare_rt("zap_array_sum_bool", &[p.into()], Some(i.into()));
+        // The rest of the dtype matrix (#503 f32/i32, #890 i8/i16 + u16/u32/u64):
+        // every integer dtype crosses the ABI as an `i64` word (runtime
+        // sign/zero-extends on get, wraps on set), every float as an `f64` word
+        // (widened on get, narrowed on set) — same prototypes as i64 / f64.
+        for s in ["i32", "i16", "i8", "u16", "u32", "u64"] {
+            self.declare_rt(
+                &format!("zap_array_get_{s}"),
+                &[p.into(), i.into()],
+                Some(i.into()),
+            );
+            self.declare_rt(
+                &format!("zap_array_set_{s}"),
+                &[p.into(), i.into(), i.into()],
+                None,
+            );
+            self.declare_rt(&format!("zap_array_sum_{s}"), &[p.into()], Some(i.into()));
+        }
+        self.declare_rt("zap_array_get_f32", &[p.into(), i.into()], Some(f.into()));
+        self.declare_rt("zap_array_set_f32", &[p.into(), i.into(), f.into()], None);
+        self.declare_rt("zap_array_sum_f32", &[p.into()], Some(f.into()));
 
         // Scalar numeric helpers (ticket #19): integer/float power (`**`) and
         // Python floor division (`//`). The lowering emits plain `Inst::Call`s
@@ -5526,10 +5546,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
     fn dtype_vec(&self, d: zir::Dtype, vw: u32) -> VectorType<'ctx> {
         match d.storage_ty() {
             Ty::F64 => self.ctx.f64_type().vec_type(vw),
+            Ty::F32 => self.ctx.f32_type().vec_type(vw),
             Ty::I64 => self.ctx.i64_type().vec_type(vw),
+            Ty::I32 => self.ctx.i32_type().vec_type(vw),
+            Ty::I16 => self.ctx.i16_type().vec_type(vw),
             Ty::I8 => self.ctx.i8_type().vec_type(vw),
-            // `storage_ty` yields only f64/i64/i8 for the array dtypes.
-            _ => unreachable!("array dtype storage is f64/i64/i8"),
+            // `storage_ty` yields only these float/int widths for array dtypes.
+            _ => unreachable!("array dtype storage is f32/f64 or i8/i16/i32/i64"),
         }
     }
 
@@ -5583,10 +5606,23 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         .into()
                 }
             }
-            // float -> float (f64 is the only float dtype, so `src == dst`
-            // already returned); float -> int never arises (promotion only
-            // moves up the lattice toward float).
-            _ => v,
+            // float -> float: widen (f32 -> f64, fpext) or narrow (f64 -> f32,
+            // fptrunc) — the narrowing is the weak-float-scalar-into-f32-result
+            // and `f32 + f64 -> f64` paths. `src == dst` already returned, so the
+            // widths differ; `elem_size` orders them (f32 = 4, f64 = 8). float ->
+            // int never arises (a float operand forces a float result).
+            (true, true) => {
+                let fv = v.into_float_value();
+                let to_f = to.into_float_type();
+                if dst.elem_size() > src.elem_size() {
+                    b.build_float_ext(fv, to_f, "fpext")
+                } else {
+                    b.build_float_trunc(fv, to_f, "fptrunc")
+                }
+                .map_err(|e| e.to_string())?
+                .into()
+            }
+            (true, false) => v,
         };
         Ok(r)
     }
@@ -5629,7 +5665,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                         .map_err(|e| e.to_string())?
                 }
             }
-            _ => v,
+            // float -> float vector: fpext (f32 -> f64) / fptrunc (f64 -> f32).
+            (true, true) => if dst.elem_size() > src.elem_size() {
+                b.build_float_ext(v, to, "vfpext")
+            } else {
+                b.build_float_trunc(v, to, "vfptrunc")
+            }
+            .map_err(|e| e.to_string())?,
+            // float -> int never arises in element-wise promotion.
+            (true, false) => v,
         };
         Ok(r)
     }
