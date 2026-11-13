@@ -1406,6 +1406,7 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
         | FieldGet { dest, .. }
         | LandingPad { dest, .. }
         | ArrayBinOp { dest, .. }
+        | ArrayUnaryOp { dest, .. }
         | FuncAddr { dest, .. }
         | GlobalAddr { dest, .. }
         | ClosureMake { dest, .. }
@@ -4593,6 +4594,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                     self.array_binop(*op, *out, *lhs_dtype, *rhs_dtype, lv, rv, *scalar, fv)?;
                 vals[*dest as usize] = Some(res);
             }
+            Inst::ArrayUnaryOp {
+                dest,
+                op,
+                out,
+                src,
+                src_dtype,
+            } => {
+                let sv = get(vals, *src);
+                let res = self.array_unaryop(*op, *out, *src_dtype, sv, fv)?;
+                vals[*dest as usize] = Some(res);
+            }
             Inst::Spawn {
                 func,
                 args,
@@ -5560,6 +5572,190 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
 
         b.position_at_end(done);
         Ok(res.into())
+    }
+
+    /// Element-wise unary math over an array (#505, D-0168): `out[i] = op(src[i])`
+    /// with a `VW`-lane vector body + scalar remainder, mirroring [`array_binop`]
+    /// with a single operand. Each lane is loaded at `src_dtype`, converted to the
+    /// float result dtype `out`, run through the LLVM math intrinsic, and stored.
+    fn array_unaryop(
+        &self,
+        op: zir::ArrayMathOp,
+        out: zir::Dtype,
+        src_dtype: zir::Dtype,
+        src: BasicValueEnum<'ctx>,
+        fv: FunctionValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let b = self.builder;
+        let i64t = self.ctx.i64_type();
+        let sa = src.into_pointer_value();
+        let code = i64t.const_int(out.code() as u64, false);
+        let res = self
+            .call1("zap_array_new_like", &[sa.into(), code.into()], "arr")?
+            .into_pointer_value();
+        let n = self
+            .call1("zap_array_count", &[res.into()], "n")?
+            .into_int_value();
+        let sp = self
+            .call1("zap_array_data", &[sa.into()], "sp")?
+            .into_pointer_value();
+        let op_ptr = self
+            .call1("zap_array_data", &[res.into()], "op")?
+            .into_pointer_value();
+
+        let out_elem = self.basic(out.storage_ty());
+        let out_align = out.elem_size();
+        let src_elem = self.basic(src_dtype.storage_ty());
+        let src_align = src_dtype.elem_size();
+        const VW: u64 = 4;
+        let out_vec = self.dtype_vec(out, VW as u32);
+        let src_vec = self.dtype_vec(src_dtype, VW as u32);
+
+        let mask = i64t.const_int(!(VW - 1), false);
+        let vend = b.build_and(n, mask, "vend").map_err(|e| e.to_string())?;
+
+        let entry = b.get_insert_block().unwrap();
+        let vhead = self.ctx.append_basic_block(fv, "um.vhead");
+        let vbody = self.ctx.append_basic_block(fv, "um.vbody");
+        let rhead = self.ctx.append_basic_block(fv, "um.rhead");
+        let rbody = self.ctx.append_basic_block(fv, "um.rbody");
+        let done = self.ctx.append_basic_block(fv, "um.done");
+        b.build_unconditional_branch(vhead)
+            .map_err(|e| e.to_string())?;
+
+        // --- vector loop ---
+        b.position_at_end(vhead);
+        let i_phi = b.build_phi(i64t, "i").map_err(|e| e.to_string())?;
+        let i = i_phi.as_basic_value().into_int_value();
+        let vcond = b
+            .build_int_compare(IntPredicate::SLT, i, vend, "vcond")
+            .map_err(|e| e.to_string())?;
+        b.build_conditional_branch(vcond, vbody, rhead)
+            .map_err(|e| e.to_string())?;
+        b.position_at_end(vbody);
+        let sv = self.vec_load(src_vec, src_elem, sp, i, src_align, "sv")?;
+        let sv = self.convert_vec(sv, src_dtype, out, out_vec)?;
+        let rv = self.math_vec(op, out_vec, sv)?;
+        let optr = unsafe {
+            b.build_gep(out_elem, op_ptr, &[i], "optr")
+                .map_err(|e| e.to_string())?
+        };
+        let st = b.build_store(optr, rv).map_err(|e| e.to_string())?;
+        st.set_alignment(out_align).map_err(|e| e.to_string())?;
+        let inext = b
+            .build_int_add(i, i64t.const_int(VW, false), "inext")
+            .map_err(|e| e.to_string())?;
+        b.build_unconditional_branch(vhead)
+            .map_err(|e| e.to_string())?;
+        let zero = i64t.const_int(0, false);
+        i_phi.add_incoming(&[(&zero, entry), (&inext, vbody)]);
+
+        // --- scalar remainder loop ---
+        b.position_at_end(rhead);
+        let j_phi = b.build_phi(i64t, "j").map_err(|e| e.to_string())?;
+        let j = j_phi.as_basic_value().into_int_value();
+        let rcond = b
+            .build_int_compare(IntPredicate::SLT, j, n, "rcond")
+            .map_err(|e| e.to_string())?;
+        b.build_conditional_branch(rcond, rbody, done)
+            .map_err(|e| e.to_string())?;
+        b.position_at_end(rbody);
+        let ssc = self.elem_load(src_elem, sp, j, "ss")?;
+        let ssc = self.convert_scalar(ssc, src_dtype, out, out_elem)?;
+        let rsc = self.math_scalar(op, out_elem, ssc)?;
+        let optr = unsafe {
+            b.build_gep(out_elem, op_ptr, &[j], "optrs")
+                .map_err(|e| e.to_string())?
+        };
+        let st = b.build_store(optr, rsc).map_err(|e| e.to_string())?;
+        st.set_alignment(out_align).map_err(|e| e.to_string())?;
+        let jnext = b
+            .build_int_add(j, i64t.const_int(1, false), "jnext")
+            .map_err(|e| e.to_string())?;
+        b.build_unconditional_branch(rhead)
+            .map_err(|e| e.to_string())?;
+        j_phi.add_incoming(&[(&vend, vhead), (&jnext, rbody)]);
+
+        b.position_at_end(done);
+        Ok(res.into())
+    }
+
+    /// The LLVM intrinsic name for a float unary-math op (`tan` is special-cased
+    /// by the callers as `sin/cos`).
+    fn math_intrinsic_name(op: zir::ArrayMathOp) -> &'static str {
+        use zir::ArrayMathOp::*;
+        match op {
+            Sqrt => "llvm.sqrt",
+            Exp => "llvm.exp",
+            Log => "llvm.log",
+            Sin => "llvm.sin",
+            Cos => "llvm.cos",
+            Fabs => "llvm.fabs",
+            Tan => "llvm.sin", // unused directly; Tan builds sin/cos below
+        }
+    }
+
+    /// Apply a unary-math op to a lane vector via the LLVM intrinsic. `tan` has
+    /// no intrinsic, so it is `sin(x) / cos(x)`.
+    fn math_vec(
+        &self,
+        op: zir::ArrayMathOp,
+        vec_ty: VectorType<'ctx>,
+        v: VectorValue<'ctx>,
+    ) -> Result<VectorValue<'ctx>, String> {
+        if matches!(op, zir::ArrayMathOp::Tan) {
+            let s = self.call_unary_intrinsic("llvm.sin", vec_ty.into(), v.into())?;
+            let c = self.call_unary_intrinsic("llvm.cos", vec_ty.into(), v.into())?;
+            return self
+                .builder
+                .build_float_div(s.into_vector_value(), c.into_vector_value(), "vtan")
+                .map_err(|e| e.to_string());
+        }
+        let name = Self::math_intrinsic_name(op);
+        Ok(self
+            .call_unary_intrinsic(name, vec_ty.into(), v.into())?
+            .into_vector_value())
+    }
+
+    /// Scalar form of [`Self::math_vec`].
+    fn math_scalar(
+        &self,
+        op: zir::ArrayMathOp,
+        ty: BasicTypeEnum<'ctx>,
+        v: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        if matches!(op, zir::ArrayMathOp::Tan) {
+            let s = self.call_unary_intrinsic("llvm.sin", ty, v)?;
+            let c = self.call_unary_intrinsic("llvm.cos", ty, v)?;
+            return self
+                .builder
+                .build_float_div(s.into_float_value(), c.into_float_value(), "tan")
+                .map(|x| x.into())
+                .map_err(|e| e.to_string());
+        }
+        self.call_unary_intrinsic(Self::math_intrinsic_name(op), ty, v)
+    }
+
+    /// Call an overloaded unary LLVM intrinsic (`llvm.sqrt`, …) whose single
+    /// overload type is `ty` (a scalar float or a float vector).
+    fn call_unary_intrinsic(
+        &self,
+        name: &str,
+        ty: BasicTypeEnum<'ctx>,
+        v: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, String> {
+        let intr = inkwell::intrinsics::Intrinsic::find(name)
+            .ok_or_else(|| format!("missing LLVM intrinsic {name}"))?;
+        let decl = intr
+            .get_declaration(self.module, &[ty])
+            .ok_or_else(|| format!("no declaration for intrinsic {name}"))?;
+        let cs = self
+            .builder
+            .build_call(decl, &[v.into()], "m")
+            .map_err(|e| e.to_string())?;
+        cs.try_as_basic_value()
+            .left()
+            .ok_or_else(|| format!("intrinsic {name} returned void"))
     }
 
     /// The `VW`-lane LLVM vector type for a dtype's storage element.

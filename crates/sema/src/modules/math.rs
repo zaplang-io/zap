@@ -32,11 +32,22 @@ fn const_ty(name: &str) -> Option<Ty> {
 
 fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Option<Ty> {
     match method {
-        // One float argument -> float64.
+        // One numeric argument. For a scalar -> float64; for a numeric `array`
+        // (#505) `math.<fn>` maps element-wise and yields an **array**, which
+        // sema types loosely (`Unknown`) so downstream `sum`/indexing on the
+        // result stay in the loose array path instead of being mis-typed scalar.
         "sqrt" | "exp" | "log" | "log2" | "log10" | "sin" | "cos" | "tan" | "asin" | "acos"
         | "atan" | "floor" | "ceil" | "round" | "trunc" | "fabs" => {
             expect_argc(checker, "math", method, args, 1, span);
-            Some(Ty::Float64)
+            let arg_is_array = matches!(
+                args.first().map(|a| checker.infer(&a.value)),
+                Some(Ty::Unknown)
+            );
+            Some(if arg_is_array {
+                Ty::Unknown
+            } else {
+                Ty::Float64
+            })
         }
         // Two float arguments -> float64.
         "pow" | "atan2" | "hypot" | "fmod" => {

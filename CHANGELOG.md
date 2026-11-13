@@ -981,6 +981,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   raises `ValueError`), and `linspace[T](start, stop, num)` (`num` samples, both
   ends inclusive). All accept the full dtype matrix.
 
+- **Element-wise math over arrays** (#505, D-0168, epic #499): `math.sqrt`,
+  `math.exp`, `math.log`, `math.sin`, `math.cos`, `math.tan`, and `math.fabs`
+  now map over a numeric array (not just a scalar), returning a new float array
+  of the same shape — `f32` stays `f32`, every other dtype promotes to `f64`.
+  Lowers to a vectorized unary SIMD kernel over LLVM math intrinsics.
+
 - `scope(timeout=<ms>)` deadlines (integer milliseconds, no unit suffix): on
   expiry the scope cancels and awaits its children through the shared channel-aware
   cancellation path (preserving `finally`/`with` cleanup), then raises the new

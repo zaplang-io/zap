@@ -8601,3 +8601,27 @@ All constructors accept the full dtype matrix (D-0166). A fully dynamic-rank
 shape (a runtime tuple variable) stays deferred — rank must be static. No grammar
 change (the subscript-call form already parses). See `design/0002-arrays.md`,
 SPEC §15, `design/RUNTIME-ABI.md`.
+
+## D-0168 — Element-wise math intrinsics over arrays (#505)
+**Status:** Locked (design) / implemented
+Fifth increment of the arrays epic (#499). Overloads the `math` module so its
+unary functions map element-wise when given a numeric `array`, instead of only
+accepting scalars.
+- **Surface.** `math.sqrt(a)`, `math.exp(a)`, `math.log(a)`, `math.sin(a)`,
+  `math.cos(a)`, `math.tan(a)`, `math.fabs(a)` where `a` is an array → a new
+  array of the same shape; the scalar form `math.sqrt(2.0)` is unchanged. One
+  namespace, dispatch on the argument type (an array vs a scalar). The remaining
+  `math` unary fns (log2/log10/asin/acos/atan/floor/ceil/round/trunc) reject an
+  array argument with a clear "not supported on arrays yet" error — a trivial
+  follow-up that reuses the same kernel. `pow`/binary math over arrays deferred.
+- **Result dtype.** Always a float: an `f32` array stays `f32`, every other dtype
+  (incl. all integers) yields `f64` — matching scalar `math.*` which widens to
+  `f64`. (`fabs` is therefore float-valued even on an int array; NumPy's dtype-
+  preserving `abs` is separate and not added here.)
+- **Codegen.** A new `Inst::ArrayUnaryOp` + a unary SIMD kernel (vector body +
+  scalar remainder, mirroring `ArrayBinOp`): load each element at its dtype,
+  convert to the float result dtype, apply the LLVM math intrinsic
+  (`llvm.sqrt`/`exp`/`log`/`sin`/`cos`/`fabs`; `tan` = `sin`/`cos`), store.
+  `sqrt`/`fabs` vectorize to hardware; the transcendentals LLVM scalarizes to
+  libm. No new runtime entry points.
+No grammar change. See `design/0002-arrays.md`, SPEC §15.

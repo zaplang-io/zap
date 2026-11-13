@@ -1395,6 +1395,7 @@ longer-term N-D design in `design/0002-arrays.md`.
 | Dtypes | floats `f32`/`f64`, signed `i8`/`i16`/`i32`/`i64`, unsigned `u8`/`u16`/`u32`/`u64`, `bool` |
 | Construction | A positional list literal, flat (`array[f64]([1, 2.5])`, 1-D) or **nested rectangular** (`array[f64]([[1, 2], [3, 4]])`, N-D); empty / zero-axis literals are allowed |
 | Constructors | `zeros[T](shape)`, `ones[T](shape)`, `full[T](shape, v)` (shape = an int or a tuple literal); `arange[T](start, stop[, step])`; `linspace[T](start, stop, num)` |
+| Elementwise math | `math.sqrt`/`exp`/`log`/`sin`/`cos`/`tan`/`fabs` applied to an array map over it, returning a new float array (`f32`→`f32`, else `f64`) |
 | Access | One integer index per axis. A *full* index `m[i, j]` is a scalar get/set; a *partial* index `m[i]` is a rank-reduced **view**. Indices are in-bounds and nonnegative |
 | Shape | `a.ndim` (rank), `a.shape` (a `tuple[int64; ndim]`), `a.size` (total elements); `len(a)` is the first axis |
 | Arithmetic | Element-wise `+`, `-`, `*`; two arrays **broadcast** (right-align shapes, stretch size-1 axes, extend rank) |
