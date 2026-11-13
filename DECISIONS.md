@@ -8657,3 +8657,34 @@ non-commutative operators.
 - **Deferred.** Floor division `//` and modulo `%` on arrays are not yet
   supported (they reject with a lowering error), and remain follow-ups.
 No grammar change. See `design/0002-arrays.md`, SPEC §15.
+
+## D-0170 — Array reductions (sum/min/max/mean/prod) with axis= (#507)
+**Status:** Locked (design) / implemented
+Seventh increment of the arrays epic (#499). Adds the reduction surface beyond
+the existing full `sum`, plus the axis-wise form.
+- **Surface — methods.** `a.sum()`, `a.min()`, `a.max()`, `a.mean()`, `a.prod()`,
+  each taking an optional keyword `axis=`. Chosen over new builtin functions
+  (maintainer call): `min`/`max`/`mean`/`prod` do not become reserved global
+  names, and the methods are NumPy-idiomatic (`a.mean(axis=0)`). The existing
+  builtin `sum(a)` stays; an array also gains `a.sum()`. `axis` is keyword-only;
+  a positional argument or any other keyword is rejected.
+- **Full reduction (no axis) → scalar.** `sum`/`min`/`max`/`prod` keep the array
+  dtype (an integer product wraps per width, like the existing `sum`); `mean` is
+  a float — `f32` for an `f32` source, else `f64`.
+- **Axis reduction `axis=k` → rank-(n-1) array.** One axis collapses. On a
+  rank-1 array `axis=0` (or `-1`) is the full, scalar reduction (the axis is
+  still range-checked). A negative axis is normalized at runtime; an
+  out-of-range axis raises a catchable `ValueError`. `keepdims` is deferred.
+- **Empty reductions.** `sum → 0`, `prod → 1`, `mean → nan` (no raise, matching
+  NumPy's warn-don't-raise). `min`/`max` on an empty array or empty axis raise a
+  catchable `ValueError` ("reduction of an empty array"), so those forms lower
+  through `throwing_call`; `sum`/`prod`/`mean` are plain calls.
+- **Implementation.** No codegen/SIMD changes: reductions lower to runtime
+  calls, like `sum`. The per-dtype `min`/`max`/`prod`/`mean` full reducers are
+  macro-generated beside the existing get/set/sum; the axis forms are two
+  runtime kernels — `zap_array_reduce_axis(arr, axis, op)` (op 0=sum/1=min/2=max/
+  3=prod, result dtype = input) and `zap_array_mean_axis(arr, axis)` (float
+  result) — that factor the contiguous buffer into `outer × axislen × inner`
+  around the reduced axis. New runtime entry points, but the array header ABI is
+  unchanged.
+No grammar change. See `design/0002-arrays.md`, SPEC §15.

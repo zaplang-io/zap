@@ -981,6 +981,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   raises `ValueError`), and `linspace[T](start, stop, num)` (`num` samples, both
   ends inclusive). All accept the full dtype matrix.
 
+- **Array reductions + axis** (#507, D-0170, epic #499): `a.sum()`, `a.min()`,
+  `a.max()`, `a.mean()`, `a.prod()` as array methods, each with an optional
+  `axis=`. Full reductions keep the dtype (`mean` is a float); `axis=k` collapses
+  one axis to a rank-(n-1) array (on a 1-D array, the scalar reduction). A
+  negative axis is normalized; an out-of-range axis raises `ValueError`. Empty
+  `sum`/`prod`/`mean` are `0`/`1`/`nan`; empty `min`/`max` raise `ValueError`.
+
 - **Array division + non-commutative scalar-on-left** (#506, D-0169, epic #499):
   `/` now works element-wise on numeric arrays as NumPy **true division** — the
   result is always a float, so an all-integer `/` lifts to `f64`

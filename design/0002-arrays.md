@@ -262,6 +262,22 @@ scalar-on-left.
   points; the ABI is unchanged. Floor division `//` and `%` over arrays stay
   deferred.
 
+**Increment 9 (shipped, #507 / D-0170):** reductions + axis.
+
+- `a.sum()`/`a.min()`/`a.max()`/`a.mean()`/`a.prod()` as array **methods**, each
+  with an optional `axis=`. Full reductions keep the dtype (`mean` is a float:
+  `f32` source → `f32`, else `f64`); `axis=k` collapses one axis to a rank-(n-1)
+  array (on a rank-1 array the scalar reduction). Negative axis normalized at
+  runtime; out-of-range `axis` raises `ValueError`. `keepdims` deferred.
+- Empty: `sum → 0`, `prod → 1`, `mean → nan`; `min`/`max` on an empty array/axis
+  raise a catchable `ValueError`, so those forms lower through `throwing_call`.
+- No codegen/SIMD change: reductions lower to runtime calls, like `sum`. The
+  per-dtype full reducers are macro-generated beside get/set/sum; the axis forms
+  are `zap_array_reduce_axis(arr, axis, op)` (sum/min/max/prod, result dtype =
+  input) and `zap_array_mean_axis(arr, axis)` (float result), factoring the
+  contiguous buffer into `outer × axislen × inner`. The array header ABI is
+  unchanged.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Inner-axis SIMD for the broadcast path; broadcasting in assignment /
@@ -278,11 +294,13 @@ scalar-on-left.
   compile time for now (a list slice, a copy, supports any step).
 - Floor division `//` and modulo `%` over arrays (a lowering error for now; the
   existing kernel extends to them with an integer `sdiv`/`udiv` + floor-adjust).
-- Axis reductions; the rest of the math surface (`pow`/binary math over arrays,
-  and `log2`/`log10`/`asin`/`acos`/`atan`/`floor`/`ceil`/`round`/`trunc` on
-  arrays — trivial follow-ups on the Increment 7 kernel). (Shipped: dtype matrix
-  Increment 5 / D-0166; constructors Increment 6 / D-0167; the core elementwise
-  math set Increment 7 / D-0168; division + scalar-on-left Increment 8 / D-0169.)
+- `keepdims` reductions and multi-axis `axis=(i, j)`; the rest of the math
+  surface (`pow`/binary math over arrays, and `log2`/`log10`/`asin`/`acos`/
+  `atan`/`floor`/`ceil`/`round`/`trunc` on arrays — trivial follow-ups on the
+  Increment 7 kernel). (Shipped: dtype matrix Increment 5 / D-0166; constructors
+  Increment 6 / D-0167; the core elementwise math set Increment 7 / D-0168;
+  division + scalar-on-left Increment 8 / D-0169; reductions + single `axis=`
+  Increment 9 / D-0170.)
 - `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 
 ## Open issues

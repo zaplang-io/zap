@@ -68,8 +68,8 @@ Once the IR schema and runtime ABI are frozen, these run concurrently:
   dtype matrix + NEP-50 promotion (#503/#890, `D-0166`, done), constructors
   zeros/ones/full/arange/linspace (#504, `D-0167`, done), elementwise math
   intrinsics (#505, `D-0168`, done), true division `/` + non-commutative
-  scalar-on-left (#506, `D-0169`, done), then slicing, reductions, matmul
-  (epic #499). `D-0011`.
+  scalar-on-left (#506, `D-0169`, done), axis reductions + min/max/mean/prod
+  (#507, `D-0170`, done), then slicing, matmul (epic #499). `D-0011`.
 - **Concurrency track** — coroutines + channels (unbuffered/buffered, `close`,
   `select`), sync primitives, structured concurrency, DRF-SC memory model.
   `D-0008`, `D-0031`–`D-0034`.

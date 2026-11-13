@@ -254,7 +254,14 @@ allocation, not a header plus a separate data buffer:
   `/` lifts to `f64`), so a zero divisor produces IEEE ±inf/nan with no runtime
   call and no raise; the non-commutative scalar-on-left `s - a` / `s / a` swap
   the per-lane operands in codegen. No new runtime entry points — the ABI is
-  unchanged by #506.
+  unchanged by #506. Reductions (#507, D-0170): per-dtype `zap_array_min_*` /
+  `max_*` / `prod_*` keep the dtype (an int or f64 word) and `zap_array_mean_*`
+  returns an f64 word (sum exists); `min`/`max` raise a catchable ValueError on
+  an empty array. The `axis=` forms return a new rank-(n-1) array:
+  `zap_array_reduce_axis(arr, axis, op)` (op 0=sum/1=min/2=max/3=prod, result
+  dtype = input) and `zap_array_mean_axis(arr, axis)` (float result), both
+  raising on an out-of-range axis (`zap_array_axis_check` validates the rank-1
+  scalar case). The array header layout is unchanged.
 - `heap[T]` (#76, D-0057): a binary min-heap priority queue — `[ header | len:
   i64 | cap: i64 | data: *T | kind | dir ]`, a complete binary tree over a
   growable element-word array (amortized-doubling growth). `kind` selects the
