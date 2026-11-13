@@ -5807,9 +5807,20 @@ impl Checker {
                     );
                 }
                 for a in args {
-                    if let Expr::List(elements, _) = &a.value {
-                        for element in elements {
-                            let ty = self.infer(element);
+                    if matches!(&a.value, Expr::List(..)) {
+                        // Walk the (possibly nested) literal to its scalar leaves:
+                        // a flat literal builds a 1-D array, a nested rectangular
+                        // one an N-D array (#500, D-0164). Every leaf must be a
+                        // numeric scalar; rectangularity is enforced in lowering.
+                        let mut stack = vec![&a.value];
+                        while let Some(e) = stack.pop() {
+                            if let Expr::List(elements, _) = e {
+                                for element in elements {
+                                    stack.push(element);
+                                }
+                                continue;
+                            }
+                            let ty = self.infer(e);
                             if !matches!(
                                 ty,
                                 Ty::Unknown
@@ -5822,12 +5833,12 @@ impl Checker {
                                     | Ty::Float64
                                     | Ty::UntypedFloat
                             ) {
-                                self.error(ErrorCode::ZAP4028, "array elements must be numeric scalars in a flat list literal; nested arrays are unsupported".to_string(), expr_span(element));
+                                self.error(ErrorCode::ZAP4028, "array elements must be numeric scalars in a (possibly nested) list literal".to_string(), expr_span(e));
                             }
                         }
                     } else {
                         self.infer(&a.value);
-                        self.error(ErrorCode::ZAP4028, "array construction supports only a flat list literal, not a list variable or iterable".to_string(), expr_span(&a.value));
+                        self.error(ErrorCode::ZAP4028, "array construction supports only a (possibly nested) list literal, not a list variable or iterable".to_string(), expr_span(&a.value));
                     }
                 }
                 return Ty::Unknown;
@@ -10209,8 +10220,8 @@ def main():
             "array[f32]([1])",
             "array[i32]([1])",
             "array[str]([1])",
-            "array[f64]([[1]])",
             "array[f64]([\"x\"])",
+            "array[f64]([[\"x\"]])", // a non-numeric leaf, even nested, is rejected
             "array[f64]()",
             "array[f64](values=[1])",
             "array[f64]([1], [2])",
@@ -10222,6 +10233,19 @@ def main():
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn nd_array_constructors_pass_sema() {
+        // Nested rectangular literals build N-D arrays (#500, D-0164): sema accepts
+        // them (every scalar leaf is numeric); rectangularity is a lowering concern.
+        ok("def main():\n    auto m = array[f64]([[1.0, 2.0], [3.0, 4.0]])\n    print(len(m))\n");
+        ok("def main():\n    auto c = array[i64]([[[1, 2], [3, 4]], [[5, 6], [7, 8]]])\n    print(c[1, 0, 1])\n");
+        // Shape attributes and multi-axis indexing type loosely (no false error).
+        ok(
+            "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+            print(m.ndim, m.shape[0], m.size, m[0, 1])\n",
+        );
     }
 
     #[test]
