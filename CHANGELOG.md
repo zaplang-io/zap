@@ -1176,6 +1176,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   such libgc entry point now lives in a guarded no-preempt layer, and a source test
   forbids raw calls outside it. New golden `gc_collect_preempt_stress`.
 
+- **gc-boehm: a coroutine preempted between publishing its state and the swap was
+  lost** (#889, D-0162). `g_bootstrap`, `copark` and `cosched` store `g->state`
+  (`G_DEAD` / `G_PARKED` / `G_RUNNABLE`) and then swap; `cosched`/`copark` cleared the
+  no-preempt depth before the swap and `g_bootstrap` never raised it, so a preemption in
+  that microseconds-wide span rewrote the state, and the resumed sequence swapped out
+  with `G_RUNNING` — which the scheduler has no branch for: an exiting coroutine was
+  never reclaimed (hang at join) and a parking one never had its channel mutex released
+  nor was woken. The span is now a no-preempt window cleared by the scheduler after
+  the swap. New testing knob `ZAP_PREEMPT_SLICE_US` (POSIX; shortens the preemption
+  slice) and golden `coroutine_preempt_window_stress`.
+
 - **gc-boehm: a stop-the-world landing during a coroutine context switch crashed
   the collector** (#885, D-0161). The scheduler moved Boehm's per-thread stack end
   to the coroutine's stack top *before* the `swapcontext` that moves `sp`, and back

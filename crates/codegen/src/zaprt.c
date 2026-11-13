@@ -5692,6 +5692,9 @@ static void switch_to_g(M *m, G *g) {
     zap_shadow_head = g->shadow_head;
 #endif
     zap_ctx_swap(&m->sched_ctx, &g->ctx);
+    /* I#889: the coroutine is stopped (it published its state and swapped out), so
+     * end the no-preempt window it opened in `g_enter_switch_out`. */
+    g->no_preempt = 0;
 #ifdef ZAP_GC_IMMIX
     g->shadow_head = zap_shadow_head;
 #endif
@@ -5729,6 +5732,31 @@ static void switch_to_g(M *m, G *g) {
 
 static void *g_entry_fn(G *g); /* fwd */
 
+/* I#889: the publish-state -> swap span is a no-preempt window.
+ *
+ * A coroutine that is about to switch away tells the scheduler WHY by storing
+ * `g->state` (G_DEAD / G_PARKED / G_RUNNABLE) and then calling `zap_ctx_swap`;
+ * `switch_to_g` dispatches on that state when the swap returns. If the Boehm
+ * async-preemption handler (SIGURG) fires between the store and the actual
+ * switch — the swap is a PLT stub, glibc's context save and an `rt_sigprocmask`
+ * syscall, so that is microseconds, not instructions — `copreempt` overwrites the
+ * state with G_RUNNABLE and switches away; when the scheduler later resumes the
+ * coroutine inside the handler it sets G_RUNNING, the handler returns, and the
+ * interrupted park/exit sequence performs ITS swap with state == G_RUNNING, which
+ * `switch_to_g` has no branch for: an exiting coroutine is never reclaimed
+ * (`g_live` never reaches 0 -> hang at join), a parking one never has its
+ * `parkmu` unlocked nor is woken.
+ *
+ * So the span is made non-preemptible: raise the depth BEFORE the state store
+ * (the compiler barrier makes the handler, which runs on this very thread, observe
+ * the stores in that order), do NOT clear it on the coroutine side, and let
+ * `switch_to_g` clear it once the coroutine is stopped. The depth is per-G, so it
+ * cannot leak to a sibling. (`copark`/`cosched` used to clear it BEFORE the swap.) */
+static inline void g_enter_switch_out(G *g) {
+    g->no_preempt = 1;
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+}
+
 /* The makecontext bootstrap: runs on the green stack. Re-reads `cur_m` after
  * the call returns because a G may be resumed on a different M than it started
  * on. Never returns — switches back to whatever M's scheduler is running it. */
@@ -5747,6 +5775,7 @@ static void g_bootstrap(void) {
      * (set by `switch_to_g`), read from the heap-allocated G, which the compiler
      * cannot cache across the opaque body call. */
     m = g->run_m;
+    g_enter_switch_out(g); /* I#889: no preemption between the state store and the swap */
     g->state = G_DEAD;
     zap_ctx_swap(&g->ctx, &m->sched_ctx);
     /* unreachable */
@@ -5890,6 +5919,7 @@ static G *galloc(void *fn, void *arg) {
     g->link = NULL;
     g->parkmu = NULL;
     g->run_m = NULL; /* I#869: set by switch_to_g on every resume */
+    g->no_preempt = 0; /* I#889: a recycled G must not inherit a stale window */
     g->scope = NULL;
     g->in_live = 0;
     g->name = NULL;
@@ -6178,13 +6208,29 @@ static void *zap_monitor_main(void *arg) {
     if (!last) {
         return NULL;
     }
+#if !defined(ZAP_PLATFORM_WINDOWS)
+    /* `ZAP_PREEMPT_SLICE_US` shortens the preemption slice (default ~10 ms) so a
+     * test can make the async-preemption signal land thousands of times more
+     * often and exercise the park/exit/collect windows reliably (I#888, I#889).
+     * A tuning/testing knob; unset or out of range (20 us .. 1 s) keeps the default. */
+    long slice_ns = ZAP_PREEMPT_SLICE_NS;
+    {
+        const char *e = getenv("ZAP_PREEMPT_SLICE_US");
+        if (e && *e) {
+            long us = strtol(e, NULL, 10);
+            if (us >= 20 && us < 1000000L) {
+                slice_ns = us * 1000L;
+            }
+        }
+    }
+#endif
     for (;;) {
 #if defined(ZAP_PLATFORM_WINDOWS)
         Sleep((DWORD)(ZAP_PREEMPT_SLICE_NS / 1000000L));
 #else
         struct timespec ts;
         ts.tv_sec = 0;
-        ts.tv_nsec = ZAP_PREEMPT_SLICE_NS;
+        ts.tv_nsec = slice_ns;
         nanosleep(&ts, NULL);
 #endif
         if (__atomic_load_n(&g_shutdown, __ATOMIC_RELAXED)) {
@@ -6652,11 +6698,12 @@ static void cosched(void) {
         zap_panic(zap_str_new("stack overflow", 14));
         return;
     }
-    g->state = G_RUNNABLE;
     /* A yield is a safe point: any no-preempt window the caller opened ends here
-     * (it holds no lock at a cooperative yield), so reset the depth before we
-     * switch out rather than leak it to whatever coroutine runs next. */
-    g->no_preempt = 0;
+     * (it holds no lock at a cooperative yield) — but the depth is cleared by
+     * `switch_to_g` AFTER the swap, not here, so the state-store -> swap span
+     * stays non-preemptible (I#889, see `g_enter_switch_out`). */
+    g_enter_switch_out(g);
+    g->state = G_RUNNABLE;
     zap_ctx_swap(&g->ctx, &m->sched_ctx);
 }
 
@@ -6679,9 +6726,9 @@ static void copreempt(void) {
      * user stack — it only switches away — and this can run in signal context
      * (Boehm), where zap_panic would be unsafe. A genuinely near-full stack is
      * still caught at the next cooperative cosched/copark in normal context. */
+    g_enter_switch_out(g); /* I#889; cleared by switch_to_g after the swap */
     g->state = G_RUNNABLE;
     g->preempt_requeue = 1;
-    g->no_preempt = 0;
 #if defined(ZAP_PLATFORM_WINDOWS)
     /* The coroutine has now yielded (we are about to swap away): clear the per-M
      * in-flight guard so the monitor may hijack this M again on a later slice —
@@ -7159,13 +7206,15 @@ static void copark(pthread_mutex_t *mu, Waiter *w) {
             zap_panic(zap_str_new("stack overflow", 14));
             return;
         }
+        g_enter_switch_out(g); /* I#889: non-preemptible from here to the swap */
         w->g = g;
         g->state = G_PARKED;
         g->parkmu = mu; /* scheduler unlocks once we are fully parked */
         /* Parking ends this coroutine's current runtime critical section: the
-         * scheduler releases `mu` on our behalf, so clear the no-preempt depth
-         * (ticket #172) rather than carry it past the switch. */
-        g->no_preempt = 0;
+         * scheduler releases `mu` on our behalf, and clears the no-preempt depth
+         * (ticket #172) itself once the swap has returned (`switch_to_g`) rather
+         * than carry it past the switch — clearing it HERE would reopen the
+         * state-store -> swap window (I#889). */
         zap_ctx_swap(&g->ctx, &m->sched_ctx);
         /* Resumed (possibly on a different M); `mu` already released. */
     } else {

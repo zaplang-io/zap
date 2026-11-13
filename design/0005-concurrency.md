@@ -564,6 +564,15 @@ goes through a small guarded layer in `zaprt.c` that brackets it with
 `zap_np_enter()` / `zap_np_leave()`; raw libgc names may not appear outside it (a
 source test enforces this).
 
+The same handler can also fire in the microseconds between a coroutine storing its
+scheduler state (`g->state`) and the `swapcontext` that hands control back; a
+preemption there rewrites the state and the resumed sequence swaps out with
+`G_RUNNING`, which `switch_to_g` cannot dispatch (the coroutine is lost: I#889). So
+every swap site raises the no-preempt depth before the state store
+(`g_enter_switch_out`) and `switch_to_g` clears it after the swap returns. Set
+`ZAP_PREEMPT_SLICE_US` (POSIX, 20 µs ≤ value < 1 s) to shorten the 10 ms preemption
+slice when testing these windows.
+
 ### Boehm: how a running coroutine's stack is scanned (I#885, D-0161)
 
 Boehm scans a stopped thread as `[sp, stack_end)`. An M alternates between its

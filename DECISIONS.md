@@ -8290,13 +8290,15 @@ must install `GC_set_sp_corrector(zap_sp_corrector)`.
 (`GC_set_sp_corrector`); on a libgc without it the Boehm build fails to link
 rather than silently regressing.
 
-## D-0162 — Boehm: every libgc entry point that takes the allocator lock lives in a guarded no-preempt layer (#888)
+## D-0162 — Boehm async preemption: libgc entry points and the state-store→swap span are no-preempt windows (#888, #889)
 
 **Status:** Accepted. **Relates:** D-0117 (#223 — the allocator lock and the
 scheduler's switch path), D-0120/D-0121 (the Boehm async-preemption handler and
 its STW guard), D-0161 (#885), the #172 no-preempt-around-allocation design.
-**Defect report:** I#888 (core-dump evidence in the issue). gc-boehm only: the
-Immix collector has no allocator lock a coroutine can strand.
+**Defect reports:** I#888 (allocator lock stranded across a preemption) and I#889
+(coroutine state clobbered by a preemption between publishing it and the swap),
+both with core-dump evidence in the issues. gc-boehm only: the Immix collector
+preempts cooperatively at safepoints, never asynchronously.
 
 **Problem.** Under gc-boehm a coroutine that runs too long is preempted
 asynchronously: the monitor signals the worker thread (SIGURG) and
@@ -8355,11 +8357,48 @@ lock — not ours to change in stock libgc, and would let a stranded coroutine's
 half-finished collection state be re-entered. (d) Only guard `zap_gc_collect` (the
 observed site) — leaves the other entry points as latent copies of the same hang.
 
+**Part 2 (#889): the state-store → swap span is a no-preempt window.** Validating
+Part 1 exposed a second hang from the same family. A coroutine that switches away
+tells the scheduler why by storing `g->state` (`G_DEAD` in `g_bootstrap`,
+`G_PARKED` in `copark`, `G_RUNNABLE` in `cosched`) and then calling `zap_ctx_swap`;
+`switch_to_g` dispatches on that state when the swap returns. `cosched` and `copark`
+cleared `no_preempt` *before* the swap and `g_bootstrap` never raised it, so the whole
+span (PLT stub, glibc's context save, an `rt_sigprocmask` syscall: microseconds) was
+preemptible. A preemption landing there made `copreempt` overwrite the state with
+`G_RUNNABLE` and switch away; when the scheduler later resumed the coroutine inside
+the signal handler it set `G_RUNNING`, the handler returned, and the interrupted
+sequence then performed *its* swap with `state == G_RUNNING` — a state `switch_to_g`
+has no branch for. An exiting coroutine was never reclaimed (`g_live` never reached
+0: hang at join; or `Uncaught exception: stack overflow` from a stale view), a
+parking one never had its `parkmu` unlocked nor was woken. Evidence: core with the
+only live coroutine `G_RUNNING`, saved `rip` at the exit swap in `g_bootstrap`, all Ms
+idle, and stale `zap_preempt_handler` / `__restore_rt` frames on its stack.
+Decision: every swap site (`g_bootstrap`, `cosched`, `copark`, `copreempt`) calls
+`g_enter_switch_out(g)` — raise the depth, then a compiler signal fence — BEFORE the
+state store and does not clear it; `switch_to_g` clears it right after the swap
+returns, once the coroutine is stopped (the depth is per-`G`, so it cannot leak to a
+sibling); `galloc` resets it for recycled `G`s.
+
+**A testing knob.** The preemption slice (10 ms) is a compile-time constant, so these
+windows are hit about once per thousands of runs by default. `ZAP_PREEMPT_SLICE_US`
+(POSIX only; 20 µs ≤ value < 1 s, otherwise ignored) shortens it so a golden can make
+the preemption signal land thousands of times more often. The default is unchanged. At
+very small slices (≤100 µs) a further ~3-5% SIGSEGV remains (and ~8% on `main`
+with the knob): a separate latent problem at extreme preemption density that is
+reported, not addressed here; the goldens use 250 µs, where the old runtime fails
+~95% of runs and the fixed one 0 of 300.
+
 **Tests (written first; red on `main`).**
-`tests/golden/gc_collect_preempt_stress.zap`: coroutines calling `gc.collect()` back to
-back while others allocate on the multi-worker scheduler — hangs on `main`
-under gc-boehm. Source-contract tests
-`raw_libgc_calls_appear_only_inside_the_guarded_layer` and
-`guarded_layer_wraps_every_raw_call_in_a_no_preempt_window`.
+`tests/golden/gc_collect_preempt_stress.zap` (+ `.env`): coroutines calling
+`gc.collect()` back to back while others allocate on the multi-worker scheduler —
+hangs on `main` under gc-boehm. `tests/golden/coroutine_preempt_window_stress.zap`
+(+ `.env`, 250 µs slice): ping-pong pairs and a stream of short-lived children that
+compute past a slice and then park / exit — fails ~95% of runs on the old runtime
+(`stack overflow` exceptions and hangs), 0 of 300 on the fixed one. Source-contract
+tests: `raw_libgc_calls_appear_only_inside_the_guarded_layer`,
+`guarded_layer_wraps_every_raw_call_in_a_no_preempt_window`,
+`every_switch_out_site_is_a_no_preempt_window_until_the_swap` (each swap site raises
+the window before storing state and does not clear it itself) and
+`switch_to_g_ends_the_switch_out_window_after_the_swap`.
 
 **No grammar, runtime-ABI, or language-semantics change.**
