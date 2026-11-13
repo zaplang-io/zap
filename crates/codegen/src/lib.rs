@@ -118,19 +118,16 @@ fn opt_pipeline_spec() -> &'static str {
 /// (`ZAP_OPT_LEVEL` / `ZAP_NO_OPT`); `--debug` deliberately touches only the
 /// runtime TU, which is the dominant compile-time cost.
 ///
-/// **Target gate (`target_is_x86_64`).** The `-O2` default applies ONLY to
-/// `x86_64`, where #867 measured and CI validated it (full golden + conformance
-/// at `-O2`). On every other target — notably `aarch64` — the runtime stays at
-/// `-O0`: at `-O2` the aarch64 runtime miscompiles the POSIX `ucontext` coroutine
-/// switch (I#869), SIGSEGV-ing a structured-concurrency program under BOTH
-/// collectors (so it is the runtime C, not the GC). The classic hazard — a value
-/// live across `swapcontext` cached in a callee-saved register the switch path
-/// does not round-trip the way `-O2` assumes — which x86_64's allocation happens
-/// to tolerate. Keeping non-x86_64 at `-O0` is exactly `main`'s pre-#867 behaviour
-/// there (no regression) until the aarch64 runtime is validated at `-O2` (I#869).
-/// `--debug` forces `-O0` on every target.
-fn runtime_opt_flag(debug: bool, target_is_x86_64: bool) -> &'static str {
-    if debug || !target_is_x86_64 {
+/// **No target gate (I#869).** The `-O2` default applies on every target. It was
+/// briefly gated to `x86_64` (#867/#868) because the aarch64 runtime SIGSEGV-ed
+/// at `-O2`; that was root-caused (I#869) to `g_bootstrap` re-reading the
+/// thread-local `cur_m` after a coroutine parked — on aarch64 `-O2` caches the
+/// thread-local's *address* across the call, so a coroutine resumed on another
+/// worker thread read the old thread's `M`. `g_bootstrap` now reads the resuming
+/// `M` from its own `G` (set by `switch_to_g`), independent of the compiler's TLS
+/// addressing model, so the gate is gone. `--debug` forces `-O0` on every target.
+fn runtime_opt_flag(debug: bool) -> &'static str {
+    if debug {
         "-O0"
     } else {
         "-O2"
@@ -812,8 +809,8 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
 /// `debug` (the `zap build --debug` flag, I#867/D-0157) compiles the C runtime
 /// translation unit at `-O0` instead of the default `-O2` for fast iteration; it
 /// affects only the default object-link path's runtime compile (see
-/// [`runtime_opt_flag`], whose `-O2` default is x86_64-only — aarch64 stays `-O0`
-/// pending I#869) and is a no-op under `ZAP_LTO`.
+/// [`runtime_opt_flag`]; `-O2` by default on every target) and is a no-op under
+/// `ZAP_LTO`.
 pub fn build_executable(
     module: &AstModule,
     out_path: &Path,
@@ -897,10 +894,6 @@ pub fn build_executable(
     let triple = TargetMachine::get_default_triple();
     let triple_str = triple.as_str().to_string_lossy().into_owned();
     let is_windows = triple_str.contains("windows");
-    // The `-O2` runtime default (I#867, D-0157) is gated to x86_64, where it was
-    // measured and CI-validated; other targets (aarch64) keep `-O0` pending I#869.
-    // See `runtime_opt_flag`. Both the `x86_64-...` and legacy `amd64` spellings.
-    let target_is_x86_64 = triple_str.contains("x86_64") || triple_str.contains("amd64");
 
     // CPython link gate (#852). Embedding CPython — and so emitting the
     // `libpython` `NEEDED` dynamic dependency and its `pkg-config` cflags/libs —
@@ -1090,11 +1083,12 @@ pub fn build_executable(
         // the system `cc` compiled the whole dict/set/string/GC machinery at
         // `-O0`, and every hot generated op paid into an unoptimized runtime
         // (`dict_int`: 26.9ms at `-O0` vs 19.0ms at `-O2`, which then beats Go's
-        // 22.5ms). `-O2` by default on x86_64; `--debug` restores `-O0` for fast
-        // iteration, and non-x86_64 (aarch64) stays `-O0` pending I#869 (see
-        // `runtime_opt_flag`). The already-codegen'd program object is only linked,
+        // 22.5ms). `-O2` by default on every target (the aarch64 `-O2` coroutine
+        // crash, I#869, is fixed in the runtime itself — see `runtime_opt_flag`);
+        // `--debug` restores `-O0` for fast iteration. The already-codegen'd
+        // program object is only linked,
         // so its code is unaffected. The LTO path (above) is untouched.
-        let opt_flag = runtime_opt_flag(debug, target_is_x86_64);
+        let opt_flag = runtime_opt_flag(debug);
         if is_windows {
             // Windows still compiles the runtime inline alongside the A1/A3/A4 TUs
             // below (the port is stubbed and not the CI-hot path, so it does not
@@ -5786,39 +5780,107 @@ mod tests {
     use zapc_ir::lower_module;
     use zapc_syntax::parser::parse_str;
 
-    /// The default (non-LTO) runtime compile is optimized on x86_64; `--debug`
-    /// lowers it to `-O0`, and non-x86_64 stays `-O0` pending I#869 (I#867,
-    /// D-0157). This pins the exact flags the link step passes to `cc`,
-    /// independent of a working toolchain (so it runs everywhere codegen builds,
-    /// not just where `objdump` and a C compiler are present — see
+    /// The default (non-LTO) runtime compile is `-O2` on EVERY target (the
+    /// aarch64 gate from #868 is gone now that I#869 is fixed in the runtime);
+    /// `--debug` lowers it to `-O0`. This pins the exact flags the link step
+    /// passes to `cc`, independent of a working toolchain (so it runs everywhere
+    /// codegen builds, not just where `objdump` and a C compiler are present — see
     /// `crates/driver/tests/runtime_opt.rs` for the behavioural disassembly guard).
     #[test]
-    fn runtime_opt_flag_o2_on_x86_64_else_o0() {
-        // x86_64, release (default): optimized.
+    fn runtime_opt_flag_o2_by_default_o0_with_debug() {
         assert_eq!(
-            runtime_opt_flag(false, true),
+            runtime_opt_flag(false),
             "-O2",
-            "the default `zap build` must compile the C runtime at `-O2` on x86_64"
+            "the default `zap build` must compile the C runtime at `-O2` on every target \
+             (aarch64 included, I#869)"
         );
-        // x86_64, --debug: fast-iteration -O0.
         assert_eq!(
-            runtime_opt_flag(true, true),
+            runtime_opt_flag(true),
             "-O0",
             "`zap build --debug` must compile the C runtime at `-O0`"
         );
-        // Non-x86_64 (aarch64): `-O0` even in the default (release) build, because
-        // the aarch64 runtime miscompiles at `-O2` (I#869). This keeps non-x86_64
-        // at `main`'s pre-#867 behaviour until that is fixed.
-        assert_eq!(
-            runtime_opt_flag(false, false),
-            "-O0",
-            "non-x86_64 must stay at `-O0` pending the aarch64 `-O2` fix (I#869)"
+    }
+
+    /// Remove `/* ... */` and `// ...` comments from a C snippet, so a source-contract
+    /// test inspects CODE only (the explanatory comments legitimately name `cur_m`).
+    fn strip_c_comments(c: &str) -> String {
+        let mut out = String::with_capacity(c.len());
+        let b = c.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// I#869 tripwire. The scheduler resumes a coroutine on whichever worker M
+    /// picks it up, so a coroutine can PARK on one OS thread and finish on
+    /// another. `cur_m` is `__thread`: on aarch64, `-O2` GCC/clang materialise a
+    /// thread-local's address from `tpidr_el0` once and keep it in a callee-saved
+    /// register for the whole function, and `swapcontext` restores that register
+    /// on resume — so any function that reads `cur_m`, runs code that can park,
+    /// then "re-reads" `cur_m` silently reads the OLD thread's slot. In
+    /// `g_bootstrap` that made a finishing coroutine swap into another thread's
+    /// scheduler context (SIGSEGV / stack smashing). x86_64 executables happen to
+    /// reload `%fs:cur_m` every time, so only an aarch64 (or `-fPIC` x86) build
+    /// shows it; this pins the source-level contract on every host: after the
+    /// coroutine body (`g_entry_fn(g)`) returns, `g_bootstrap` must not touch the
+    /// `cur_m` thread-local again — it takes the resuming M from the `G`
+    /// (`g->run_m`, set by `switch_to_g`), which is not TLS-addressed.
+    #[test]
+    fn g_bootstrap_does_not_reread_cur_m_after_the_coroutine_body() {
+        let src = RUNTIME_C;
+        let start = src
+            .find("static void g_bootstrap(void) {")
+            .expect("g_bootstrap must exist in zaprt.c");
+        let body_end = start + src[start..].find("\n}\n").expect("g_bootstrap must end");
+        let body = strip_c_comments(&src[start..body_end]);
+        let call = body
+            .find("g_entry_fn(g);")
+            .expect("g_bootstrap must run the coroutine body via g_entry_fn(g)");
+        let after = &body[call + "g_entry_fn(g);".len()..];
+        assert!(
+            !after.contains("cur_m"),
+            "I#869: g_bootstrap re-reads the thread-local `cur_m` after the coroutine \
+             body returned. The body may have parked and resumed on another OS thread, \
+             and at -O2 on aarch64 the compiler reuses the OLD thread's `&cur_m` — read \
+             the resuming M from the G (`g->run_m`) instead. Offending tail:\n{after}"
         );
-        // Non-x86_64 + --debug: also `-O0`.
-        assert_eq!(
-            runtime_opt_flag(true, false),
-            "-O0",
-            "`--debug` is `-O0` on every target"
+    }
+
+    /// The companion half of the I#869 contract: `switch_to_g` is the ONLY way a
+    /// coroutine is entered or re-entered, so it must record the resuming M in the
+    /// G before it swaps the coroutine in (otherwise `g_bootstrap` would read a
+    /// stale or NULL `run_m`).
+    #[test]
+    fn switch_to_g_records_the_resuming_m_before_swapping_in() {
+        let src = RUNTIME_C;
+        let start = src
+            .find("static void switch_to_g(M *m, G *g) {")
+            .expect("switch_to_g must exist in zaprt.c");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("switch_to_g must end")];
+        let set = body
+            .find("g->run_m = m;")
+            .expect("I#869: switch_to_g must record `g->run_m = m` for g_bootstrap");
+        let swap = body
+            .find("zap_ctx_swap(&m->sched_ctx, &g->ctx)")
+            .expect("switch_to_g must swap the coroutine in");
+        assert!(
+            set < swap,
+            "I#869: `g->run_m = m` must happen BEFORE the coroutine is swapped in"
         );
     }
 
