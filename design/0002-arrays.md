@@ -241,6 +241,27 @@ header + buffer layout, GC-managed buffer).
   runtime entry points. The other `math` unary fns reject an array argument for
   now; `pow`/binary math over arrays is deferred.
 
+**Increment 8 (shipped, #506 / D-0169):** division + non-commutative
+scalar-on-left.
+
+- `/` completes the element-wise operators as NumPy **true division**: the
+  result dtype is always a float, so an all-integer `/` lifts to `f64`
+  (`array[i64] / 2 → f64`, `array[i8] / array[i8] → f64`) while a float operand
+  keeps its width under NEP-50 (`array[f32] / 2 → f32`). A zero divisor follows
+  IEEE-754 (`x/0 → ±inf`, `0/0 → nan`) and does **not** raise — array ops follow
+  NumPy (warn, don't raise), and a per-element zero check would serialize the
+  SIMD kernel. This is a deliberate divergence from scalar `/`, which raises a
+  catchable `ZeroDivisionError`.
+- Scalar-on-the-left now lowers for every op. The commutative `s + a` / `s * a`
+  reorder to `a + s` / `a * s`; the non-commutative `s - a` / `s / a` are kept
+  as scalar-on-left so the kernel computes `s <op> a[i]`.
+- Reuses `Inst::ArrayBinOp` (now `op: Div` + a `scalar_lhs` flag) and the
+  existing vector-body + scalar-remainder kernel; the scalar-on-left form swaps
+  the two per-lane arithmetic operands, and division adds only a float-divide
+  arm (`out` is always float, so no integer-divide path). No new runtime entry
+  points; the ABI is unchanged. Floor division `//` and `%` over arrays stay
+  deferred.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Inner-axis SIMD for the broadcast path; broadcasting in assignment /
@@ -255,12 +276,13 @@ header + buffer layout, GC-managed buffer).
   at the base and `off` carries the window. A strided view would need per-axis
   strides the 1-D `ZapArray` has not got, so a stepped array slice is rejected at
   compile time for now (a list slice, a copy, supports any step).
+- Floor division `//` and modulo `%` over arrays (a lowering error for now; the
+  existing kernel extends to them with an integer `sdiv`/`udiv` + floor-adjust).
 - Axis reductions; the rest of the math surface (`pow`/binary math over arrays,
   and `log2`/`log10`/`asin`/`acos`/`atan`/`floor`/`ceil`/`round`/`trunc` on
   arrays — trivial follow-ups on the Increment 7 kernel). (Shipped: dtype matrix
   Increment 5 / D-0166; constructors Increment 6 / D-0167; the core elementwise
-  math set Increment 7 / D-0168.)
-- Scalar-on-the-left of a non-commutative op (`scalar - array`).
+  math set Increment 7 / D-0168; division + scalar-on-left Increment 8 / D-0169.)
 - `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 
 ## Open issues

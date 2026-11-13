@@ -981,6 +981,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   raises `ValueError`), and `linspace[T](start, stop, num)` (`num` samples, both
   ends inclusive). All accept the full dtype matrix.
 
+- **Array division + non-commutative scalar-on-left** (#506, D-0169, epic #499):
+  `/` now works element-wise on numeric arrays as NumPy **true division** — the
+  result is always a float, so an all-integer `/` lifts to `f64`
+  (`array[i64] / 2 → f64`) while a float operand keeps its width
+  (`array[f32] / 2 → f32`). A zero divisor yields IEEE `±inf`/`nan` and does not
+  raise (unlike scalar `/`). Scalar-on-the-left now lowers for every operator:
+  the non-commutative `scalar - a` and `scalar / a` keep left-operand order.
+  Floor division `//` and `%` over arrays remain unsupported.
+
 - **Element-wise math over arrays** (#505, D-0168, epic #499): `math.sqrt`,
   `math.exp`, `math.log`, `math.sin`, `math.cos`, `math.tan`, and `math.fabs`
   now map over a numeric array (not just a scalar), returning a new float array

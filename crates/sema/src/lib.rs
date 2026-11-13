@@ -11227,6 +11227,7 @@ def main():
         ok(include_str!("../../../tests/golden/array_promote.zap"));
         ok(include_str!("../../../tests/golden/array_uint8.zap"));
         ok(include_str!("../../../tests/golden/array_bool.zap"));
+        ok(include_str!("../../../tests/golden/array_division.zap"));
     }
 
     // --- decorators & annotations (ticket #16, D-0036) ---

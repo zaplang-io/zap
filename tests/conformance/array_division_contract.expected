@@ -1,0 +1,7 @@
+div_i 3.5
+div_s 3.0
+div_f32 3.0
+sdiv 26.0
+ssub 24
+zero inf
+nan nan

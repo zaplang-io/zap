@@ -11519,8 +11519,14 @@ impl<'a> FnLower<'a> {
                 // These lower to the plain inline op; everything else goes
                 // through `binop`, which routes the guarded forms (zap_fdiv /
                 // zap_ishl / zap_ishr) so a bad value raises a catchable fault.
+                //
+                // An array operand never takes this scalar fast path (#506): it
+                // must reach `binop`, which dispatches to `array_binop` for the
+                // element-wise SIMD kernel (NumPy true division, inf/nan on a
+                // zero element, not a raise).
+                let any_array = matches!(lt, Ty::Array(..)) || matches!(rt, Ty::Array(..));
                 match op {
-                    AstBin::Div if Self::is_nonzero_numeric_literal(rhs) => {
+                    AstBin::Div if !any_array && Self::is_nonzero_numeric_literal(rhs) => {
                         let lf = self.as_f64(l, lt);
                         let rf = self.as_f64(r, rt);
                         let d = self.new_value(Ty::F64);
@@ -11532,7 +11538,7 @@ impl<'a> FnLower<'a> {
                         });
                         Ok((d, Ty::F64))
                     }
-                    AstBin::Shl | AstBin::Shr if Self::is_safe_shift_literal(rhs) => {
+                    AstBin::Shl | AstBin::Shr if !any_array && Self::is_safe_shift_literal(rhs) => {
                         // Preserve unsignedness so `>>` on an unsigned value
                         // lowers to a *logical* shift (codegen keys `lshr` vs
                         // `ashr` off the result type, #552). A mixed signed/
@@ -20074,13 +20080,22 @@ impl<'a> FnLower<'a> {
         }
     }
 
-    /// Element-wise `+`/`-`/`*` on arrays, including scalar broadcast and
-    /// mixed-dtype promotion (ticket #49). Emits the [`Inst::ArrayBinOp`] node
-    /// codegen vectorizes. Two arrays of different dtypes promote to the higher
-    /// dtype ([`Dtype::promote`], so `i64 + f64 -> f64`); a scalar is weak
-    /// ([`Dtype::promote_scalar`], so `uint8 + 1` stays `uint8`). `scalar op
-    /// array` is only accepted for the commutative `+`/`*` (reordered to `array
-    /// op scalar`), so the SIMD kernel always computes `array[i] op scalar`.
+    /// Element-wise `+`/`-`/`*`/`/` on arrays, including scalar broadcast and
+    /// mixed-dtype promotion (tickets #49, #506). Emits the [`Inst::ArrayBinOp`]
+    /// node codegen vectorizes. Two arrays of different dtypes promote to the
+    /// higher dtype ([`Dtype::promote`], so `i64 + f64 -> f64`); a scalar is
+    /// weak ([`Dtype::promote_scalar`], so `uint8 + 1` stays `uint8`).
+    ///
+    /// `scalar op array` (#506): the commutative `+`/`*` are reordered to
+    /// `array op scalar` (kernel computes `array[i] op scalar`); the
+    /// non-commutative `-`/`/` are kept as scalar-on-left (`scalar_lhs`), so the
+    /// kernel computes `scalar op array[i]`.
+    ///
+    /// `/` is NumPy **true division** (#506): the result dtype is always a float
+    /// — an all-integer division lifts to `f64` (`int_array / 2 -> f64`), while a
+    /// float operand keeps its width (`f32_array / 2 -> f32`). A zero divisor
+    /// yields IEEE ±inf/nan, not a raise (D-0169). Floor division `//` is not yet
+    /// supported on arrays.
     fn array_binop(
         &mut self,
         op: AstBin,
@@ -20094,10 +20109,21 @@ impl<'a> FnLower<'a> {
             Add => BinOp::Add,
             Sub => BinOp::Sub,
             Mul => BinOp::Mul,
+            Div => BinOp::Div,
             _ => {
                 return Err(err(
-                    "only +, -, and * are supported on arrays yet (/, reductions beyond sum, etc. are deferred)",
+                    "only +, -, *, and / are supported on arrays yet (//, reductions beyond sum, etc. are deferred)",
                 ))
+            }
+        };
+        let is_div = matches!(op, Div);
+        // NumPy true division always yields a float: an integer elementwise
+        // result dtype lifts to `f64` (#506). Float dtypes are unchanged.
+        let lift = |d: Dtype| {
+            if is_div && !d.is_float() {
+                Dtype::F64
+            } else {
+                d
             }
         };
         let is_scalar = |t: Ty| t.is_float() || t.int_width().is_some();
@@ -20113,7 +20139,7 @@ impl<'a> FnLower<'a> {
                 // kernel by a runtime same-shape test.
                 let rank = lnd.max(rnd);
                 self.throwing_call(None, "zap_array_broadcast_check", vec![l, r]);
-                let out = Dtype::promote(ld, rd);
+                let out = lift(Dtype::promote(ld, rd));
                 let dest = self.new_value(Ty::Array(out, rank));
                 self.emit(Inst::ArrayBinOp {
                     dest,
@@ -20124,6 +20150,7 @@ impl<'a> FnLower<'a> {
                     rhs: r,
                     rhs_dtype: rd,
                     scalar: false,
+                    scalar_lhs: false,
                 });
                 Ok((dest, Ty::Array(out, rank)))
             }
@@ -20139,7 +20166,7 @@ impl<'a> FnLower<'a> {
                     Dtype::I64
                 };
                 let s = self.coerce(r, rt, sdt.ty());
-                let out = Dtype::promote_scalar(ld, scalar_is_float);
+                let out = lift(Dtype::promote_scalar(ld, scalar_is_float));
                 let dest = self.new_value(Ty::Array(out, lnd));
                 self.emit(Inst::ArrayBinOp {
                     dest,
@@ -20150,15 +20177,16 @@ impl<'a> FnLower<'a> {
                     rhs: s,
                     rhs_dtype: sdt,
                     scalar: true,
+                    scalar_lhs: false,
                 });
                 Ok((dest, Ty::Array(out, lnd)))
             }
             (_, Ty::Array(rd, rnd)) if is_scalar(lt) => {
-                if !matches!(op, Add | Mul) {
-                    return Err(err(
-                        "scalar-on-the-left broadcast is only supported for + and * (write `a - scalar`, not `scalar - a`)",
-                    ));
-                }
+                // The commutative `+`/`*` reorder to `array op scalar` (the
+                // kernel computes `array[i] op scalar`); the non-commutative
+                // `-`/`/` are kept as scalar-on-left (`scalar_lhs`), so the
+                // kernel computes `scalar op array[i]` (#506).
+                let scalar_lhs = !matches!(op, Add | Mul);
                 let scalar_is_float = lt.is_float();
                 let sdt = if scalar_is_float {
                     Dtype::F64
@@ -20166,7 +20194,7 @@ impl<'a> FnLower<'a> {
                     Dtype::I64
                 };
                 let s = self.coerce(l, lt, sdt.ty());
-                let out = Dtype::promote_scalar(rd, scalar_is_float);
+                let out = lift(Dtype::promote_scalar(rd, scalar_is_float));
                 let dest = self.new_value(Ty::Array(out, rnd));
                 self.emit(Inst::ArrayBinOp {
                     dest,
@@ -20177,6 +20205,7 @@ impl<'a> FnLower<'a> {
                     rhs: s,
                     rhs_dtype: sdt,
                     scalar: true,
+                    scalar_lhs,
                 });
                 Ok((dest, Ty::Array(out, rnd)))
             }
@@ -21762,5 +21791,220 @@ mod math_array_tests {
         lower_fails(
             "def main():\n    auto a = array[f64]([1.5, 2.5])\n    auto b = math.floor(a)\n",
         );
+    }
+}
+
+#[cfg(test)]
+mod division_tests {
+    //! Array true division `/` and non-commutative scalar-on-left (#506, D-0169).
+    //! Host-only (AST->ZIR): every element-wise op lowers to a single
+    //! `Inst::ArrayBinOp`, so these assert the op, the promoted result dtype, and
+    //! the `scalar`/`scalar_lhs` flags directly — a walled garden around the
+    //! operand ordering and the NumPy true-division dtype rule, independent of
+    //! codegen (the SIMD kernel + inf/nan behaviour run in the CI goldens).
+    use super::lower_module;
+    use zapc_ir_core::{BinOp, Dtype, Inst};
+
+    struct BinInfo {
+        op: BinOp,
+        out: Dtype,
+        scalar: bool,
+        scalar_lhs: bool,
+    }
+
+    fn binops(src: &str) -> Vec<BinInfo> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(
+            perrs.is_empty() && lerrs.is_empty(),
+            "parse/lex: {perrs:?} {lerrs:?}"
+        );
+        let (m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::ArrayBinOp {
+                    op,
+                    out,
+                    scalar,
+                    scalar_lhs,
+                    ..
+                } => Some(BinInfo {
+                    op: *op,
+                    out: *out,
+                    scalar: *scalar,
+                    scalar_lhs: *scalar_lhs,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The single `ArrayBinOp` a one-expression program lowers to.
+    fn one(src: &str) -> BinInfo {
+        let v = binops(src);
+        assert_eq!(v.len(), 1, "expected exactly one ArrayBinOp for\n{src}");
+        v.into_iter().next().unwrap()
+    }
+
+    fn has_bin_div(src: &str) -> bool {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (m, errs) = lower_module(&module);
+        assert!(errs.is_empty(), "unexpected lowering errors: {errs:?}");
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::Bin { op: BinOp::Div, .. }))
+    }
+
+    fn broadcast_checks(src: &str) -> usize {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (m, errs) = lower_module(&module);
+        assert!(errs.is_empty(), "unexpected lowering errors: {errs:?}");
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| match i {
+                Inst::Call { func, .. } | Inst::Invoke { func, .. } => {
+                    func == "zap_array_broadcast_check"
+                }
+                _ => false,
+            })
+            .count()
+    }
+
+    fn lower_fails(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (_m, errs) = lower_module(&module);
+        assert!(!errs.is_empty(), "expected a lowering error for\n{src}");
+    }
+
+    // --- true division: array / array ---
+
+    #[test]
+    fn int_array_div_lifts_to_f64() {
+        // NumPy true division: an all-integer `/` yields f64 (not integer div).
+        let b = one("def main():\n    auto a = array[i64]([1, 2])\n    \
+             auto c = array[i64]([2, 4])\n    print(sum(a / c))\n");
+        assert!(matches!(b.op, BinOp::Div));
+        assert_eq!(b.out, Dtype::F64);
+        assert!(!b.scalar);
+        assert!(!b.scalar_lhs);
+        // Narrow integer dtypes also lift all the way to f64, not f32.
+        let b8 = one("def main():\n    auto a = array[i8]([1, 2])\n    \
+             auto c = array[i8]([2, 4])\n    print(sum(a / c))\n");
+        assert_eq!(b8.out, Dtype::F64);
+    }
+
+    #[test]
+    fn float_array_div_keeps_width() {
+        // f32 / f32 stays f32; a mixed f32/f64 array-array div promotes to f64.
+        let b = one("def main():\n    auto a = array[f32]([1.0, 2.0])\n    \
+             auto c = array[f32]([2.0, 4.0])\n    print(sum(a / c))\n");
+        assert_eq!(b.out, Dtype::F32);
+        let m = one("def main():\n    auto a = array[f32]([1.0, 2.0])\n    \
+             auto c = array[f64]([2.0, 4.0])\n    print(sum(a / c))\n");
+        assert_eq!(m.out, Dtype::F64);
+    }
+
+    #[test]
+    fn array_div_array_emits_broadcast_check() {
+        // Like +,-,*, a two-array `/` guards shape compatibility at runtime.
+        let src = "def main():\n    auto a = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto v = array[i64]([10, 20])\n    print(sum(a / v))\n";
+        assert_eq!(broadcast_checks(src), 1);
+        assert_eq!(one(src).out, Dtype::F64);
+    }
+
+    // --- scalar on the right ---
+
+    #[test]
+    fn array_div_scalar_is_true_division() {
+        // int array / int scalar -> f64; f32 array / int scalar stays f32 (weak).
+        let bi = one("def main():\n    auto a = array[i64]([1, 2])\n    print(sum(a / 2))\n");
+        assert!(matches!(bi.op, BinOp::Div));
+        assert_eq!(bi.out, Dtype::F64);
+        assert!(bi.scalar && !bi.scalar_lhs);
+        let bf = one("def main():\n    auto a = array[f32]([1.0, 2.0])\n    print(sum(a / 2))\n");
+        assert_eq!(bf.out, Dtype::F32);
+        assert!(bf.scalar && !bf.scalar_lhs);
+    }
+
+    #[test]
+    fn array_div_by_literal_does_not_take_scalar_fast_path() {
+        // The scalar `/`-by-nonzero-literal fast path (#374) must not fire for an
+        // array operand: `a / 2` lowers to an ArrayBinOp, never an Inst::Bin div.
+        let src = "def main():\n    auto a = array[i64]([1, 2])\n    print(sum(a / 2))\n";
+        assert_eq!(binops(src).len(), 1);
+        assert!(!has_bin_div(src));
+    }
+
+    #[test]
+    fn array_sub_scalar_on_right_is_plain() {
+        let b = one("def main():\n    auto a = array[i64]([1, 2])\n    print(sum(a - 3))\n");
+        assert!(matches!(b.op, BinOp::Sub));
+        assert_eq!(b.out, Dtype::I64);
+        assert!(b.scalar && !b.scalar_lhs);
+    }
+
+    // --- scalar on the left ---
+
+    #[test]
+    fn scalar_div_array_is_scalar_lhs() {
+        // `s / a` keeps scalar-on-left ordering (non-commutative) and true-divides.
+        let b = one("def main():\n    auto a = array[i64]([1, 2])\n    print(sum(2 / a))\n");
+        assert!(matches!(b.op, BinOp::Div));
+        assert_eq!(b.out, Dtype::F64);
+        assert!(b.scalar && b.scalar_lhs);
+        // float scalar on the left over an f32 array keeps f32.
+        let bf = one("def main():\n    auto a = array[f32]([1.0, 2.0])\n    print(sum(2.0 / a))\n");
+        assert_eq!(bf.out, Dtype::F32);
+        assert!(bf.scalar_lhs);
+    }
+
+    #[test]
+    fn scalar_sub_array_is_scalar_lhs() {
+        let b = one("def main():\n    auto a = array[i64]([1, 2])\n    print(sum(10 - a))\n");
+        assert!(matches!(b.op, BinOp::Sub));
+        assert_eq!(b.out, Dtype::I64);
+        assert!(b.scalar && b.scalar_lhs);
+    }
+
+    #[test]
+    fn commutative_scalar_on_left_is_reordered_not_flagged() {
+        // `s + a` / `s * a` reorder to `array op scalar`, so they never set
+        // scalar_lhs (the kernel computes `array[i] op scalar`).
+        let add = one("def main():\n    auto a = array[i64]([1, 2])\n    print(sum(2 + a))\n");
+        assert!(matches!(add.op, BinOp::Add) && add.scalar && !add.scalar_lhs);
+        let mul = one("def main():\n    auto a = array[i64]([1, 2])\n    print(sum(3 * a))\n");
+        assert!(matches!(mul.op, BinOp::Mul) && mul.scalar && !mul.scalar_lhs);
+    }
+
+    // --- rejections / deferrals ---
+
+    #[test]
+    fn floor_div_on_arrays_is_deferred() {
+        // `//` is not yet wired for arrays (#506 ships `/` only).
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    auto b = a // 2\n");
+        lower_fails(
+            "def main():\n    auto a = array[i64]([1, 2])\n    \
+             auto c = array[i64]([2, 4])\n    auto b = a // c\n",
+        );
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    auto b = 8 // a\n");
+    }
+
+    #[test]
+    fn mod_on_arrays_is_deferred() {
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    auto b = a % 2\n");
     }
 }

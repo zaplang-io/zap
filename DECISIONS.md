@@ -8625,3 +8625,35 @@ accepting scalars.
   `sqrt`/`fabs` vectorize to hardware; the transcendentals LLVM scalarizes to
   libm. No new runtime entry points.
 No grammar change. See `design/0002-arrays.md`, SPEC §15.
+
+## D-0169 — Array true division and non-commutative scalar-on-left (#506)
+**Status:** Locked (design) / implemented
+Sixth increment of the arrays epic (#499). Completes the element-wise binary
+operators: adds `/` and lifts the scalar-on-the-left restriction for the
+non-commutative operators.
+- **Surface.** `a / b`, `a / scalar`, and `scalar / a` for numeric arrays, plus
+  `scalar - a` (the previously rejected non-commutative left form). The
+  commutative `scalar + a` / `scalar * a` continue to reorder to `a + scalar` /
+  `a * scalar`; the non-commutative `scalar - a` / `scalar / a` keep
+  left-operand order so the kernel computes `scalar <op> a[i]`.
+- **True division (NumPy parity).** `/` is always true division: the result
+  dtype is a float regardless of the operands. An all-integer division lifts to
+  `f64` (`array[i64] / 2 -> f64`, `array[i8] / array[i8] -> f64`); a float
+  operand keeps its width under NEP-50 (`array[f32] / 2 -> f32`,
+  `array[f32] / array[f64] -> f64`). This matches NumPy, where `/` is true
+  division and `//` is floor division.
+- **Divide by zero.** Because the result is always a float, a zero divisor
+  follows IEEE-754 — `x/0 -> ±inf`, `0/0 -> nan` — and does **not** raise. This
+  deliberately diverges from Zap's *scalar* `/`, which raises a catchable
+  `ZeroDivisionError`: array ops chase NumPy semantics (where division warns but
+  does not raise), and a per-element zero check would serialize the SIMD kernel.
+  Decided with the maintainer on this ticket.
+- **Codegen.** Reuses `Inst::ArrayBinOp` (now carrying `op: Div` and a new
+  `scalar_lhs` flag) and the existing vector-body + scalar-remainder kernel; the
+  non-commutative left form swaps the two arithmetic operands per lane. Division
+  adds only a float-divide arm (`out` is always a float dtype, so no integer
+  divide path is needed). No new runtime entry points; the runtime ABI is
+  unchanged.
+- **Deferred.** Floor division `//` and modulo `%` on arrays are not yet
+  supported (they reject with a lowering error), and remain follow-ups.
+No grammar change. See `design/0002-arrays.md`, SPEC §15.

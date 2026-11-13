@@ -663,14 +663,17 @@ mod tests {
         for (operation, message) in [
             ("auto x = a[::2]", "stepped array slice"),
             ("auto x = a[::-1]", "stepped array slice"),
-            ("auto x = a / a", "only +, -, and *"),
-            ("auto x = 1 - a", "scalar-on-the-left"),
+            // `/` and scalar-on-the-left `-`/`/` are supported since #506; `//`
+            // (floor division) and `%` stay deferred.
+            ("auto x = a // a", "only +, -, *, and /"),
+            ("auto x = 1 // a", "only +, -, *, and /"),
+            ("auto x = a % 2", "only +, -, *, and /"),
             // Multi-axis indexing is supported for N-D arrays (#500); on a 1-D
             // array a two-axis index is simply too many indices.
             ("auto x = a[0, 1]", "too many indices"),
             ("a[0, 1] = 2", "too many indices"),
             ("auto x = a[0.5:]", "slice bounds must be integers"),
-            ("auto x = a == a", "only +, -, and *"),
+            ("auto x = a == a", "only +, -, *, and /"),
             ("auto x = -a", "unary array operations are unsupported"),
             ("a[0] = \"x\"", "assignment requires a numeric scalar"),
         ] {
@@ -1564,12 +1567,24 @@ mod tests {
     }
 
     #[test]
-    fn array_scalar_on_left_only_commutative() {
-        // `scalar + array` is accepted (reordered); `scalar - array` is not.
-        let (ast, _, _) =
-            parse_str("def main():\n    auto a = array[i64]([1, 2])\n    print(sum(3 - a))\n");
-        let (_m, errs) = lower_module(&ast);
-        assert!(!errs.is_empty(), "scalar - array should be rejected");
+    fn array_scalar_on_left_lowers_for_all_four_ops() {
+        // #506: scalar-on-the-left now lowers for every element-wise op. The
+        // commutative `+`/`*` reorder to `array op scalar`; the non-commutative
+        // `-`/`/` are kept as scalar-on-left (`scalar-lhs` in the ZIR dump), and
+        // `/` is true division (an int result lifts to f64).
+        let m = lower_ok(
+            "def main():\n    auto a = array[i64]([1, 2])\n    \
+             print(sum(3 + a), sum(3 * a), sum(3 - a), sum(6 / a))\n",
+        );
+        let text = format!("{m}");
+        // `3 - a` stays scalar-on-left over an i64 array.
+        assert!(text.contains("array.Sub.i64"), "text:\n{text}");
+        assert!(text.contains("(scalar-lhs)"), "text:\n{text}");
+        // `6 / a` true-divides: a scalar-lhs division with an f64 result.
+        assert!(text.contains("array.Div.f64"), "text:\n{text}");
+        // The commutative pair reordered to plain scalar-on-right (not flagged).
+        assert!(text.contains("array.Add.i64"), "text:\n{text}");
+        assert!(text.contains("array.Mul.i64"), "text:\n{text}");
     }
 
     #[test]
