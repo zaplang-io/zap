@@ -5861,6 +5861,164 @@ mod tests {
         );
     }
 
+    /// Replace every `/* ... */` and `// ...` comment in a C snippet with spaces of
+    /// the SAME length, so byte offsets into the result match the original source.
+    fn blank_c_comments(c: &str) -> String {
+        let b = c.as_bytes();
+        let mut out = b.to_vec();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                let start = i;
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                for o in &mut out[start..i] {
+                    if *o != b'\n' {
+                        *o = b' ';
+                    }
+                }
+            } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                let start = i;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                for o in &mut out[start..i] {
+                    *o = b' ';
+                }
+            } else {
+                i += 1;
+            }
+        }
+        String::from_utf8(out).expect("blanking ASCII comment bytes keeps valid UTF-8")
+    }
+
+    /// The `[start, end)` byte ranges of the runtime's guarded libgc layer: the
+    /// blocks between `ZAP_GC_GUARDED_LAYER_BEGIN` and `ZAP_GC_GUARDED_LAYER_END`.
+    fn guarded_layer_ranges(src: &str) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut from = 0;
+        while let Some(b) = src[from..].find("ZAP_GC_GUARDED_LAYER_BEGIN") {
+            let b = from + b;
+            let e = src[b..]
+                .find("ZAP_GC_GUARDED_LAYER_END")
+                .expect("every ZAP_GC_GUARDED_LAYER_BEGIN needs a matching _END")
+                + b;
+            ranges.push((b, e));
+            from = e;
+        }
+        ranges
+    }
+
+    /// I#888 tripwire. Under Boehm the allocator lock is a plain non-recursive
+    /// mutex, and the async-preemption handler may switch a coroutine away at any
+    /// instruction unless it is inside a no-preempt window. A coroutine preempted
+    /// while inside libgc keeps the lock across the switch, and the next coroutine
+    /// on the same OS thread then self-deadlocks in its first allocation. So every
+    /// libgc entry point that takes the lock must sit inside the runtime's guarded
+    /// layer (`ZAP_GC_GUARDED_LAYER_BEGIN/END` in zaprt.c), bracketed by
+    /// `zap_np_enter()` / `zap_np_leave()` — and nothing else may name the raw
+    /// calls. `gc.collect()` (`GC_gcollect`, which holds the lock for the whole
+    /// collection) was the unguarded one that hung `gc_switch_alloc_stress`.
+    #[test]
+    fn raw_libgc_calls_appear_only_inside_the_guarded_layer() {
+        let src = RUNTIME_C;
+        let blanked = blank_c_comments(src);
+        let layers = guarded_layer_ranges(src);
+        assert!(
+            !layers.is_empty(),
+            "I#888: zaprt.c must declare its guarded libgc layer (ZAP_GC_GUARDED_LAYER_BEGIN/END)"
+        );
+        let raw = [
+            "GC_gcollect(",
+            "GC_register_finalizer(",
+            "GC_get_heap_size(",
+            "GC_get_free_bytes(",
+            "GC_MALLOC(",
+            "GC_MALLOC_ATOMIC(",
+            "GC_pthread_create(",
+            "GC_pthread_join(",
+            "GC_pthread_detach(",
+            "pthread_create(",
+            "pthread_detach(",
+        ];
+        let mut offenders = Vec::new();
+        for tok in raw {
+            let mut from = 0;
+            while let Some(i) = blanked[from..].find(tok) {
+                let at = from + i;
+                from = at + tok.len();
+                // Whole-identifier match only (`zap_gc_pthread_create(` is the guarded wrapper).
+                let prev = blanked[..at].chars().next_back().unwrap_or(' ');
+                if prev.is_ascii_alphanumeric() || prev == '_' {
+                    continue;
+                }
+                // `#define GC_pthread_create pthread_create` style shims carry no call.
+                let line_start = blanked[..at].rfind('\n').map_or(0, |n| n + 1);
+                if blanked[line_start..at].trim_start().starts_with('#') {
+                    continue;
+                }
+                if !layers.iter().any(|&(b, e)| at >= b && at < e) {
+                    let line = src[..at].matches('\n').count() + 1;
+                    offenders.push(format!("zaprt.c:{line}: `{tok}`"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "I#888: raw libgc / thread-create calls outside the guarded layer (they take the \
+             allocator lock without a no-preempt window, so a coroutine preempted inside one \
+             deadlocks the next allocation on its M). Route them through the zap_gc_* wrappers:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// The other half of I#888: inside the guarded layer, every function that
+    /// makes a raw call must open the no-preempt window BEFORE it and close it
+    /// AFTER it.
+    #[test]
+    fn guarded_layer_wraps_every_raw_call_in_a_no_preempt_window() {
+        let src = RUNTIME_C;
+        let blanked = blank_c_comments(src);
+        let raw = [
+            "GC_gcollect(",
+            "GC_register_finalizer(",
+            "GC_get_heap_size(",
+            "GC_get_free_bytes(",
+            "GC_MALLOC(",
+            "GC_MALLOC_ATOMIC(",
+            "GC_pthread_create(",
+            "GC_pthread_join(",
+            "GC_pthread_detach(",
+        ];
+        let mut checked = 0;
+        for (b, e) in guarded_layer_ranges(src) {
+            let layer = &blanked[b..e];
+            // Each layer function is `static inline ... { ... }` closed by a column-0 `}`.
+            for func in layer.split("static inline").skip(1) {
+                let body = &func[..func.find("\n}").unwrap_or(func.len())];
+                for tok in raw {
+                    if let Some(at) = body.find(tok) {
+                        let enter = body.find("zap_np_enter();");
+                        let leave = body.rfind("zap_np_leave();");
+                        assert!(
+                            enter.is_some_and(|x| x < at) && leave.is_some_and(|x| x > at),
+                            "I#888: guarded-layer function calling `{tok}` must wrap it in \
+                             zap_np_enter(); ... zap_np_leave();\n{body}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 9,
+            "I#888: expected the guarded layer to wrap all 9 raw libgc entry points, saw {checked}"
+        );
+    }
+
     /// I#885 tripwire. Under Boehm a stopped thread is scanned as
     /// `[sp, stack_end)`. `switch_to_g` used to publish the coroutine's stack top
     /// as `stack_end` (`set_bottom(m, &g->sb)`) BEFORE the swap that moves `sp`
