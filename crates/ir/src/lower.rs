@@ -12775,6 +12775,9 @@ impl<'a> FnLower<'a> {
             if let Ty::AtomicArray(elem) = bty {
                 return self.lower_atomicarray_method(recv, elem, name, args);
             }
+            if let Ty::Array(d, ndim) = bty {
+                return self.lower_array_method(recv, d, ndim, name, args);
+            }
             if bty == Ty::Match {
                 return self.lower_match_method(recv, name, args);
             }
@@ -20080,6 +20083,126 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Array reduction methods (#507, D-0170): `a.sum()`, `a.min()`, `a.max()`,
+    /// `a.mean()`, `a.prod()`, each with an optional `axis=` keyword.
+    ///
+    /// Without `axis`, the whole array reduces to a scalar: `sum`/`min`/`max`/
+    /// `prod` keep the dtype, `mean` yields a float (`f32` source → `f32`, else
+    /// `f64`). With `axis=k`, one axis collapses: on a rank-1 array that is the
+    /// full (scalar) reduction, and on a rank-`n` (n ≥ 2) array it produces a
+    /// new rank-`(n-1)` array (`zap_array_reduce_axis` / `zap_array_mean_axis`).
+    /// `min`/`max` raise a catchable `ValueError` on an empty array/axis, and an
+    /// out-of-range `axis` raises too, so those forms lower through
+    /// `throwing_call`; `sum`/`prod`/`mean` have defined empty results
+    /// (`0`/`1`/`nan`) and never raise.
+    fn lower_array_method(
+        &mut self,
+        recv: Value,
+        d: Dtype,
+        ndim: u8,
+        name: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        // op code shared with the runtime axis kernel: 0=sum,1=min,2=max,3=prod.
+        let op_code = match name {
+            "sum" => 0i64,
+            "min" => 1,
+            "max" => 2,
+            "prod" => 3,
+            "mean" => 4, // mean has its own entry points (float result)
+            other => {
+                return Err(err(format!(
+                    "'{other}' is not an array method; array reductions are \
+                     sum/min/max/mean/prod (each with an optional axis=)"
+                )))
+            }
+        };
+        let is_mean = op_code == 4;
+        let raises = matches!(op_code, 1 | 2); // min/max raise on empty
+                                               // The float result dtype for `mean` (f32 source stays f32).
+        let mean_dt = if d == Dtype::F32 {
+            Dtype::F32
+        } else {
+            Dtype::F64
+        };
+
+        // Parse the single optional `axis=` keyword; no positional args.
+        let mut axis: Option<&Expr> = None;
+        for a in args {
+            match &a.name {
+                Some(k) if k == "axis" => {
+                    if axis.is_some() {
+                        return Err(err(format!("{name}() got axis= more than once")));
+                    }
+                    axis = Some(&a.value);
+                }
+                Some(k) => {
+                    return Err(err(format!(
+                        "{name}() got an unexpected keyword '{k}' (only axis= is supported)"
+                    )))
+                }
+                None => {
+                    return Err(err(format!(
+                        "array {name}() takes no positional arguments; pass axis= as a keyword"
+                    )))
+                }
+            }
+        }
+
+        // No axis, or axis on a rank-1 array -> a full reduction to a scalar.
+        if axis.is_none() || ndim == 1 {
+            // Evaluate (and discard) an axis expression on a 1-D array so a
+            // runtime out-of-range axis still faults; its only valid value is 0
+            // or -1, but we keep the full-reduction result either way.
+            if let Some(ax) = axis {
+                let (av, at) = self.expr(ax)?;
+                let av = self.coerce(av, at, Ty::I64);
+                self.throwing_call(None, "zap_array_axis_check", vec![recv, av]);
+            }
+            if is_mean {
+                let raw = self.new_value(Ty::F64);
+                self.emit(Inst::Call {
+                    dest: Some(raw),
+                    func: format!("zap_array_mean_{}", d.suffix()),
+                    args: vec![recv],
+                });
+                let res = self.coerce(raw, Ty::F64, mean_dt.ty());
+                return Ok((res, mean_dt.ty()));
+            }
+            let dest = self.new_value(d.ty());
+            let func = format!("zap_array_{name}_{}", d.suffix());
+            if raises {
+                self.throwing_call(Some(dest), &func, vec![recv]);
+            } else {
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func,
+                    args: vec![recv],
+                });
+            }
+            return Ok((dest, d.ty()));
+        }
+
+        // Axis reduction on a rank-(n>=2) array -> a rank-(n-1) array.
+        let ax = axis.unwrap();
+        let (av, at) = self.expr(ax)?;
+        let av = self.coerce(av, at, Ty::I64);
+        let out_rank = ndim - 1;
+        if is_mean {
+            let out_ty = Ty::Array(mean_dt, out_rank);
+            let dest = self.new_value(out_ty);
+            // Raises ValueError on an out-of-range axis.
+            self.throwing_call(Some(dest), "zap_array_mean_axis", vec![recv, av]);
+            return Ok((dest, out_ty));
+        }
+        let out_ty = Ty::Array(d, out_rank);
+        let dest = self.new_value(out_ty);
+        let opv = self.iconst(Ty::I64, op_code);
+        // Raises ValueError on an out-of-range axis (min/max also on an empty axis).
+        self.throwing_call(Some(dest), "zap_array_reduce_axis", vec![recv, av, opv]);
+        Ok((dest, out_ty))
+    }
+
     /// Element-wise `+`/`-`/`*`/`/` on arrays, including scalar broadcast and
     /// mixed-dtype promotion (tickets #49, #506). Emits the [`Inst::ArrayBinOp`]
     /// node codegen vectorizes. Two arrays of different dtypes promote to the
@@ -22006,5 +22129,183 @@ mod division_tests {
     #[test]
     fn mod_on_arrays_is_deferred() {
         lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    auto b = a % 2\n");
+    }
+}
+
+#[cfg(test)]
+mod reduction_tests {
+    //! Array reduction methods `a.sum()/min()/max()/mean()/prod()` with an
+    //! optional `axis=` (#507, D-0170). Host-only (AST->ZIR): asserts which
+    //! runtime entry point each form lowers to (full reductions keep the dtype
+    //! suffix; `axis=` routes to the axis kernels), that `min`/`max` and the
+    //! `axis=` forms are raising (Invoke under `main`'s implicit handler), and
+    //! that bad surfaces are rejected — a walled garden around the dispatch,
+    //! independent of the runtime kernels (which run in the CI goldens).
+    use super::lower_module;
+    use zapc_ir_core::Inst;
+
+    /// Every runtime-call name emitted (Call + the unwinding Invoke).
+    fn call_funcs(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(
+            perrs.is_empty() && lerrs.is_empty(),
+            "parse/lex: {perrs:?} {lerrs:?}"
+        );
+        let (m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Call { func, .. } | Inst::Invoke { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has(src: &str, func: &str) -> bool {
+        call_funcs(src).iter().any(|f| f == func)
+    }
+
+    /// True when `func` is emitted as a raising Invoke (not a plain Call).
+    fn is_invoked(src: &str, func: &str) -> bool {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (m, errs) = lower_module(&module);
+        assert!(errs.is_empty(), "unexpected lowering errors: {errs:?}");
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::Invoke { func: f, .. } if f == func))
+    }
+
+    fn lower_fails(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (_m, errs) = lower_module(&module);
+        assert!(!errs.is_empty(), "expected a lowering error for\n{src}");
+    }
+
+    fn lowers_ok(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (_m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+    }
+
+    // --- full reductions -> scalar ---
+
+    #[test]
+    fn full_reductions_hit_their_dtype_entry_points() {
+        let pre = "def main():\n    auto a = array[i64]([3, 1, 2])\n    ";
+        assert!(has(&format!("{pre}print(a.sum())\n"), "zap_array_sum_i64"));
+        assert!(has(&format!("{pre}print(a.min())\n"), "zap_array_min_i64"));
+        assert!(has(&format!("{pre}print(a.max())\n"), "zap_array_max_i64"));
+        assert!(has(
+            &format!("{pre}print(a.prod())\n"),
+            "zap_array_prod_i64"
+        ));
+        assert!(has(
+            &format!("{pre}print(a.mean())\n"),
+            "zap_array_mean_i64"
+        ));
+        // A float array selects the f-suffixed entry points.
+        let pf = "def main():\n    auto a = array[f32]([3.0, 1.0])\n    ";
+        assert!(has(&format!("{pf}print(a.sum())\n"), "zap_array_sum_f32"));
+        assert!(has(&format!("{pf}print(a.mean())\n"), "zap_array_mean_f32"));
+    }
+
+    #[test]
+    fn min_max_are_raising_but_sum_prod_mean_are_not() {
+        // min/max raise ValueError on an empty array, so they invoke; sum/prod/
+        // mean have defined empty results and lower to a plain call.
+        let pre = "def main():\n    auto a = array[i64]([3, 1, 2])\n    ";
+        assert!(is_invoked(
+            &format!("{pre}print(a.min())\n"),
+            "zap_array_min_i64"
+        ));
+        assert!(is_invoked(
+            &format!("{pre}print(a.max())\n"),
+            "zap_array_max_i64"
+        ));
+        assert!(!is_invoked(
+            &format!("{pre}print(a.sum())\n"),
+            "zap_array_sum_i64"
+        ));
+        assert!(!is_invoked(
+            &format!("{pre}print(a.prod())\n"),
+            "zap_array_prod_i64"
+        ));
+        assert!(!is_invoked(
+            &format!("{pre}print(a.mean())\n"),
+            "zap_array_mean_i64"
+        ));
+    }
+
+    // --- axis reductions ---
+
+    #[test]
+    fn axis_reduction_on_nd_routes_to_the_axis_kernel() {
+        let pre = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    ";
+        // sum/min/max/prod share zap_array_reduce_axis; mean has its own.
+        assert!(has(
+            &format!("{pre}print(sum(m.sum(axis=0)))\n"),
+            "zap_array_reduce_axis"
+        ));
+        assert!(has(
+            &format!("{pre}print(sum(m.max(axis=1)))\n"),
+            "zap_array_reduce_axis"
+        ));
+        assert!(has(
+            &format!("{pre}print(sum(m.mean(axis=0)))\n"),
+            "zap_array_mean_axis"
+        ));
+        // These are raising (out-of-range axis -> ValueError).
+        assert!(is_invoked(
+            &format!("{pre}print(sum(m.sum(axis=0)))\n"),
+            "zap_array_reduce_axis"
+        ));
+        assert!(is_invoked(
+            &format!("{pre}print(sum(m.mean(axis=0)))\n"),
+            "zap_array_mean_axis"
+        ));
+        // A negative axis is accepted (normalized at runtime).
+        lowers_ok(&format!("{pre}print(sum(m.sum(axis=-1)))\n"));
+    }
+
+    #[test]
+    fn axis_on_rank1_is_a_full_reduction_with_an_axis_check() {
+        // a.sum(axis=0) on a 1-D array is the scalar full reduction, but the axis
+        // is still validated at runtime (so axis=5 faults).
+        let src = "def main():\n    auto a = array[i64]([1, 2, 3])\n    print(a.sum(axis=0))\n";
+        assert!(has(src, "zap_array_sum_i64"));
+        assert!(has(src, "zap_array_axis_check"));
+        assert!(!has(src, "zap_array_reduce_axis"));
+    }
+
+    // --- rejections ---
+
+    #[test]
+    fn unknown_array_method_is_rejected() {
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    print(a.median())\n");
+    }
+
+    #[test]
+    fn positional_arg_to_a_reduction_is_rejected() {
+        // The axis must be passed as a keyword: `a.sum(0)` is rejected.
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    print(a.sum(0))\n");
+    }
+
+    #[test]
+    fn unknown_keyword_to_a_reduction_is_rejected() {
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    print(a.sum(dim=0))\n");
     }
 }

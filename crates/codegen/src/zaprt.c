@@ -3452,6 +3452,14 @@ void zap_array_bcast_offsets(void *ap, void *bp, void *resp, int64_t f,
  * 2^width, D-0005), and `sum` accumulates in `int64_t` over the whole N-D
  * element window (#500). Each float dtype crosses as a `double`: `get` widens,
  * `set` narrows, `sum` accumulates in `double`. `bool` is special-cased below. */
+/* Raised by `min`/`max` on an empty array (NumPy's "zero-size array to
+ * reduction operation" — a catchable ValueError, #507). `sum`/`prod`/`mean`
+ * have well-defined empty results (0 / 1 / nan) and never raise. */
+static void zap_array_empty_reduce(void) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                    zap_str_new("reduction of an empty array", 27));
+}
+
 #define ZAP_ARRAY_INT_ACCESS(suffix, ctype)                                    \
     int64_t zap_array_get_##suffix(void *ap, int64_t i) {                      \
         ZapArray *a = (ZapArray *)ap;                                          \
@@ -3470,6 +3478,55 @@ void zap_array_bcast_offsets(void *ap, void *bp, void *resp, int64_t f,
         for (int64_t i = 0; i < n; i++)                                       \
             s += (int64_t)d[i];                                               \
         return s;                                                             \
+    }                                                                          \
+    /* prod/min/max accumulate in `ctype` so each matches NumPy's per-dtype    \
+     * result: an integer product wraps modulo 2^width, and min/max compare    \
+     * with the operand's own signedness (widening an unsigned value to int64  \
+     * would misorder values above INT64_MAX). The result crosses the ABI as   \
+     * an int64 word, like get/sum. */                                         \
+    int64_t zap_array_prod_##suffix(void *ap) {                               \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        ctype p = (ctype)1;                                                   \
+        for (int64_t i = 0; i < n; i++)                                       \
+            p *= d[i];                                                        \
+        return (int64_t)p;                                                    \
+    }                                                                          \
+    int64_t zap_array_min_##suffix(void *ap) {                                \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        if (n == 0)                                                           \
+            zap_array_empty_reduce();                                         \
+        ctype m = d[0];                                                       \
+        for (int64_t i = 1; i < n; i++)                                       \
+            if (d[i] < m)                                                     \
+                m = d[i];                                                     \
+        return (int64_t)m;                                                    \
+    }                                                                          \
+    int64_t zap_array_max_##suffix(void *ap) {                                \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        if (n == 0)                                                           \
+            zap_array_empty_reduce();                                         \
+        ctype m = d[0];                                                       \
+        for (int64_t i = 1; i < n; i++)                                       \
+            if (d[i] > m)                                                     \
+                m = d[i];                                                     \
+        return (int64_t)m;                                                    \
+    }                                                                          \
+    /* mean accumulates in double and returns f64 (empty -> nan, no raise);    \
+     * the lowering narrows to f32 for an f32 source. */                       \
+    double zap_array_mean_##suffix(void *ap) {                                \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        double s = 0.0;                                                        \
+        for (int64_t i = 0; i < n; i++)                                       \
+            s += (double)d[i];                                                \
+        return s / (double)n;                                                 \
     }
 
 #define ZAP_ARRAY_FLOAT_ACCESS(suffix, ctype)                                  \
@@ -3479,7 +3536,7 @@ void zap_array_bcast_offsets(void *ap, void *bp, void *resp, int64_t f,
         return (double)((const ctype *)a->data)[a->off + i];                  \
     }                                                                          \
     void zap_array_set_##suffix(void *ap, int64_t i, double v) {              \
-        ZapArray *a = (ZapArray *)ap;                                          \
+        ZapArray *a = (ZapArray *)ap;                                         \
         zap_array_bounds(a, i);                                               \
         ((ctype *)a->data)[a->off + i] = (ctype)v;                            \
     }                                                                          \
@@ -3491,6 +3548,48 @@ void zap_array_bcast_offsets(void *ap, void *bp, void *resp, int64_t f,
         for (int64_t i = 0; i < n; i++)                                       \
             s += (double)d[i];                                                 \
         return s;                                                             \
+    }                                                                          \
+    double zap_array_prod_##suffix(void *ap) {                                \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        double p = 1.0;                                                       \
+        for (int64_t i = 0; i < n; i++)                                       \
+            p *= (double)d[i];                                                \
+        return p;                                                             \
+    }                                                                          \
+    double zap_array_min_##suffix(void *ap) {                                 \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        if (n == 0)                                                           \
+            zap_array_empty_reduce();                                         \
+        double m = (double)d[0];                                              \
+        for (int64_t i = 1; i < n; i++)                                       \
+            if ((double)d[i] < m)                                             \
+                m = (double)d[i];                                             \
+        return m;                                                             \
+    }                                                                          \
+    double zap_array_max_##suffix(void *ap) {                                 \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        if (n == 0)                                                           \
+            zap_array_empty_reduce();                                         \
+        double m = (double)d[0];                                              \
+        for (int64_t i = 1; i < n; i++)                                       \
+            if ((double)d[i] > m)                                             \
+                m = (double)d[i];                                             \
+        return m;                                                             \
+    }                                                                          \
+    double zap_array_mean_##suffix(void *ap) {                                \
+        ZapArray *a = (ZapArray *)ap;                                         \
+        const ctype *d = (const ctype *)a->data + a->off;                     \
+        int64_t n = zap_array_count_of(a);                                    \
+        double s = 0.0;                                                        \
+        for (int64_t i = 0; i < n; i++)                                       \
+            s += (double)d[i];                                                \
+        return s / (double)n;                                                 \
     }
 
 ZAP_ARRAY_FLOAT_ACCESS(f64, double)
@@ -3525,6 +3624,268 @@ int64_t zap_array_sum_bool(void *ap) {
         s += d[i] ? 1 : 0;
     }
     return s;
+}
+/* bool reductions (#507): min/max/prod stay 0/1 (prod = logical "all"); mean is
+ * the fraction of True, a float. Elements are normalized 0/1 bytes. */
+int64_t zap_array_prod_bool(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    const uint8_t *d = (const uint8_t *)a->data + a->off;
+    int64_t n = zap_array_count_of(a);
+    for (int64_t i = 0; i < n; i++)
+        if (!d[i])
+            return 0;
+    return 1;
+}
+int64_t zap_array_min_bool(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    const uint8_t *d = (const uint8_t *)a->data + a->off;
+    int64_t n = zap_array_count_of(a);
+    if (n == 0)
+        zap_array_empty_reduce();
+    for (int64_t i = 0; i < n; i++)
+        if (!d[i])
+            return 0;
+    return 1;
+}
+int64_t zap_array_max_bool(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    const uint8_t *d = (const uint8_t *)a->data + a->off;
+    int64_t n = zap_array_count_of(a);
+    if (n == 0)
+        zap_array_empty_reduce();
+    for (int64_t i = 0; i < n; i++)
+        if (d[i])
+            return 1;
+    return 0;
+}
+double zap_array_mean_bool(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    const uint8_t *d = (const uint8_t *)a->data + a->off;
+    int64_t n = zap_array_count_of(a);
+    int64_t s = 0;
+    for (int64_t i = 0; i < n; i++)
+        s += d[i] ? 1 : 0;
+    return (double)s / (double)n;
+}
+
+/* --- axis reductions (#507, D-0170) --------------------------------------
+ * `m.sum(axis=k)` and friends reduce one axis of an N-D array, producing a
+ * rank-(ndim-1) result (the lowering handles a rank-1 source as a full, scalar
+ * reduction, so these run only for ndim >= 2). The contiguous row-major buffer
+ * factors around the reduced axis into `outer * axislen * inner`: element
+ * (o, k, j) lives at flat index `(o*axislen + k)*inner + j`, and the result
+ * element (o, j) at `o*inner + j`. `op` is 0=sum, 1=min, 2=max, 3=prod; mean
+ * has its own entry point because its result is always a float. sum/min/max/
+ * prod keep the input dtype and accumulate in its own `ctype` (so an integer
+ * product wraps per width and unsigned min/max order correctly). */
+#define ZAP_REDUCE_AXIS(suffix, ctype)                                         \
+    static void zap_reduce_axis_##suffix(const ctype *in, ctype *out,          \
+                                         int64_t outer, int64_t axislen,        \
+                                         int64_t inner, int64_t op) {           \
+        for (int64_t o = 0; o < outer; o++) {                                  \
+            for (int64_t j = 0; j < inner; j++) {                              \
+                const ctype *col = in + (o * axislen) * inner + j;             \
+                ctype acc;                                                     \
+                if (op == 3) { /* prod */                                      \
+                    acc = (ctype)1;                                            \
+                    for (int64_t k = 0; k < axislen; k++)                      \
+                        acc *= col[k * inner];                                 \
+                } else if (op == 0) { /* sum */                                \
+                    acc = (ctype)0;                                            \
+                    for (int64_t k = 0; k < axislen; k++)                      \
+                        acc += col[k * inner];                                 \
+                } else { /* min (1) / max (2); axislen >= 1 (guarded) */       \
+                    acc = col[0];                                              \
+                    for (int64_t k = 1; k < axislen; k++) {                    \
+                        ctype v = col[k * inner];                              \
+                        if (op == 1 ? (v < acc) : (v > acc))                   \
+                            acc = v;                                           \
+                    }                                                          \
+                }                                                              \
+                out[o * inner + j] = acc;                                      \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    static void zap_mean_axis_##suffix(const ctype *in, double *out,           \
+                                       int64_t outer, int64_t axislen,          \
+                                       int64_t inner) {                        \
+        for (int64_t o = 0; o < outer; o++) {                                  \
+            for (int64_t j = 0; j < inner; j++) {                              \
+                const ctype *col = in + (o * axislen) * inner + j;             \
+                double s = 0.0;                                                \
+                for (int64_t k = 0; k < axislen; k++)                          \
+                    s += (double)col[k * inner];                              \
+                out[o * inner + j] = s / (double)axislen;                      \
+            }                                                                  \
+        }                                                                      \
+    }
+
+ZAP_REDUCE_AXIS(f64, double)
+ZAP_REDUCE_AXIS(f32, float)
+ZAP_REDUCE_AXIS(i64, int64_t)
+ZAP_REDUCE_AXIS(i32, int32_t)
+ZAP_REDUCE_AXIS(i16, int16_t)
+ZAP_REDUCE_AXIS(i8, int8_t)
+ZAP_REDUCE_AXIS(u8, uint8_t)
+ZAP_REDUCE_AXIS(u16, uint16_t)
+ZAP_REDUCE_AXIS(u32, uint32_t)
+ZAP_REDUCE_AXIS(u64, uint64_t)
+ZAP_REDUCE_AXIS(bool, uint8_t)
+
+/* Normalize a (possibly negative) axis and raise a catchable ValueError if it
+ * is out of range for `ndim` (#507). Returns the non-negative axis. */
+static int64_t zap_array_axis_norm(int64_t axis, int64_t ndim) {
+    if (axis < 0)
+        axis += ndim;
+    if (axis < 0 || axis >= ndim) {
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("array axis out of range", 24));
+    }
+    return axis;
+}
+
+/* Allocate the rank-(ndim-1) result of reducing `a` along `axis`, with dims
+ * copied from `a` minus the reduced axis. `*outer`/`*axislen`/`*inner` receive
+ * the factorization. The result dtype is `out_dtype`. */
+static ZapArray *zap_array_reduce_alloc(ZapArray *a, int64_t axis,
+                                        int64_t out_dtype, int64_t *outer,
+                                        int64_t *axislen, int64_t *inner) {
+    int64_t nd = a->ndim;
+    int64_t ox = 1, ax = a->dims[axis], in = 1;
+    for (int64_t k = 0; k < axis; k++)
+        ox *= a->dims[k];
+    for (int64_t k = axis + 1; k < nd; k++)
+        in *= a->dims[k];
+    *outer = ox;
+    *axislen = ax;
+    *inner = in;
+    ZapArray *res = (ZapArray *)zap_array_new_nd(out_dtype, nd - 1, ox * in);
+    int64_t ri = 0;
+    for (int64_t k = 0; k < nd; k++)
+        if (k != axis)
+            zap_array_set_dim(res, ri++, a->dims[k]);
+    return res;
+}
+
+/* Validate a (possibly negative) `axis` against an array's rank, raising a
+ * catchable ValueError if out of range (#507). Used by the rank-1 full-reduction
+ * path, where the reduction result is a scalar but an out-of-range axis must
+ * still fault like the N-D `axis=` forms. */
+void zap_array_axis_check(void *ap, int64_t axis) {
+    (void)zap_array_axis_norm(axis, ((ZapArray *)ap)->ndim);
+}
+
+/* sum/min/max/prod along `axis` (op 0/1/2/3). Result keeps the input dtype. */
+void *zap_array_reduce_axis(void *ap, int64_t axis, int64_t op) {
+    ZapArray *a = (ZapArray *)ap;
+    axis = zap_array_axis_norm(axis, a->ndim);
+    if ((op == 1 || op == 2) && a->dims[axis] == 0)
+        zap_array_empty_reduce();
+    int64_t outer, axislen, inner;
+    ZapArray *res =
+        zap_array_reduce_alloc(a, axis, a->dtype, &outer, &axislen, &inner);
+    size_t esz = zap_array_elem_size(a->dtype);
+    const void *inb = (const char *)a->data + (size_t)a->off * esz;
+    void *outb = res->data;
+    switch (a->dtype) {
+    case DTYPE_F64:
+        zap_reduce_axis_f64(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_F32:
+        zap_reduce_axis_f32(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_I64:
+        zap_reduce_axis_i64(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_I32:
+        zap_reduce_axis_i32(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_I16:
+        zap_reduce_axis_i16(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_I8:
+        zap_reduce_axis_i8(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_U8:
+        zap_reduce_axis_u8(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_U16:
+        zap_reduce_axis_u16(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_U32:
+        zap_reduce_axis_u32(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_U64:
+        zap_reduce_axis_u64(inb, outb, outer, axislen, inner, op);
+        break;
+    case DTYPE_BOOL:
+        zap_reduce_axis_bool(inb, outb, outer, axislen, inner, op);
+        break;
+    default:
+        break;
+    }
+    return res;
+}
+
+/* mean along `axis`: an f64 result (f32 source keeps f32). Accumulates in
+ * double; an empty axis yields nan per lane (no raise). */
+void *zap_array_mean_axis(void *ap, int64_t axis) {
+    ZapArray *a = (ZapArray *)ap;
+    axis = zap_array_axis_norm(axis, a->ndim);
+    int64_t out_dtype = (a->dtype == DTYPE_F32) ? DTYPE_F32 : DTYPE_F64;
+    int64_t outer, axislen, inner;
+    ZapArray *res =
+        zap_array_reduce_alloc(a, axis, out_dtype, &outer, &axislen, &inner);
+    size_t esz = zap_array_elem_size(a->dtype);
+    const void *inb = (const char *)a->data + (size_t)a->off * esz;
+    /* Reduce into a double scratch lane buffer, then narrow to the result's
+     * float width. For f64 the result buffer is used directly. */
+    int64_t total = outer * inner;
+    if (out_dtype == DTYPE_F32) {
+        double *tmp = (double *)zap_buf((size_t)(total > 0 ? total : 0) *
+                                        sizeof(double));
+        zap_mean_axis_f32(inb, tmp, outer, axislen, inner);
+        float *out = (float *)res->data;
+        for (int64_t i = 0; i < total; i++)
+            out[i] = (float)tmp[i];
+        return res;
+    }
+    double *out = (double *)res->data;
+    switch (a->dtype) {
+    case DTYPE_F64:
+        zap_mean_axis_f64(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_I64:
+        zap_mean_axis_i64(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_I32:
+        zap_mean_axis_i32(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_I16:
+        zap_mean_axis_i16(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_I8:
+        zap_mean_axis_i8(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_U8:
+        zap_mean_axis_u8(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_U16:
+        zap_mean_axis_u16(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_U32:
+        zap_mean_axis_u32(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_U64:
+        zap_mean_axis_u64(inb, out, outer, axislen, inner);
+        break;
+    case DTYPE_BOOL:
+        zap_mean_axis_bool(inb, out, outer, axislen, inner);
+        break;
+    default:
+        break;
+    }
+    return res;
 }
 
 /* ---------------------------------------------------------------------------

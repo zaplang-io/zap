@@ -1400,7 +1400,7 @@ longer-term N-D design in `design/0002-arrays.md`.
 | Shape | `a.ndim` (rank), `a.shape` (a `tuple[int64; ndim]`), `a.size` (total elements); `len(a)` is the first axis |
 | Arithmetic | Element-wise `+`, `-`, `*`, `/`; two arrays **broadcast** (right-align shapes, stretch size-1 axes, extend rank). `/` is **true division** (always a float result) |
 | Scalar broadcast | `a + n`, `a - n`, `a * n`, `a / n`; and scalar-on-left `n + a`, `n * a`, `n - a`, `n / a` (shape preserved) |
-| Reduction | `sum(a)` over **all** elements; returns `f64` for `f64`, otherwise `int64` |
+| Reduction | `sum(a)` over **all** elements, or the methods `a.sum()`/`a.min()`/`a.max()`/`a.mean()`/`a.prod()`; an optional `a.sum(axis=k)` collapses one axis to a rank-(n-1) array. `sum`/`min`/`max`/`prod` keep the dtype, `mean` is a float |
 | Slicing | Contiguous 1-D views `a[lo:hi]`, with omitted bounds or literal step `1`; writes alias the parent |
 
 Mixed array dtypes promote by NumPy NEP-50 (a float operand forces the widest
@@ -1422,14 +1422,22 @@ IEEE-754 — `x/0 → ±inf`, `0/0 → nan` — and does **not** raise (unlike s
 warns but does not raise. Floor division `//` and modulo `%` are not yet
 supported on arrays.
 
+Reductions (`sum`/`min`/`max`/`mean`/`prod`) reduce the whole array to a scalar,
+or — with `axis=k` — one axis, giving a rank-(n-1) array (on a rank-1 array
+`axis=0` is the scalar reduction). `sum`/`min`/`max`/`prod` keep the dtype (an
+integer product wraps per width); `mean` is a float (`f32` source → `f32`, else
+`f64`). Empty reductions are defined for `sum` (`0`), `prod` (`1`), and `mean`
+(`nan`); `min`/`max` on an empty array, and an out-of-range `axis`, raise a
+catchable `ValueError`.
+
 A bare `array[T]` type annotation denotes a rank-1 array; N-D values arise
 through inference (`auto`). List-variable/iterable `array[T]` construction,
 a fully dynamic-rank (runtime-tuple) constructor shape,
 element-wise unary negation/bitwise operations, array
-comparisons, floor division `//`/modulo `%`, axis reductions, broadcasting in
-assignment or partial-index (whole-row) stores, N-D and strided/reversed array
-slicing, and explicit N-D type annotations are unsupported. Semantic or lowering
-diagnostics reject these forms.
+comparisons, floor division `//`/modulo `%`, `keepdims` reductions, broadcasting
+in assignment or partial-index (whole-row) stores, N-D and strided/reversed
+array slicing, and explicit N-D type annotations are unsupported. Semantic or
+lowering diagnostics reject these forms.
 
 ```python
 auto a = array[f64]([1, 2, 3])

@@ -2286,6 +2286,29 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_get_f32", &[p.into(), i.into()], Some(f.into()));
         self.declare_rt("zap_array_set_f32", &[p.into(), i.into(), f.into()], None);
         self.declare_rt("zap_array_sum_f32", &[p.into()], Some(f.into()));
+        // Reductions (#507, D-0170): min/max/prod keep the dtype (an int word
+        // for integer/bool dtypes, an f64 word for float dtypes); mean always
+        // returns an f64 word (the lowering narrows to f32 for an f32 source).
+        // The `axis=` forms return a new rank-(n-1) array pointer.
+        for s in ["i64", "i32", "i16", "i8", "u8", "u16", "u32", "u64", "bool"] {
+            self.declare_rt(&format!("zap_array_min_{s}"), &[p.into()], Some(i.into()));
+            self.declare_rt(&format!("zap_array_max_{s}"), &[p.into()], Some(i.into()));
+            self.declare_rt(&format!("zap_array_prod_{s}"), &[p.into()], Some(i.into()));
+            self.declare_rt(&format!("zap_array_mean_{s}"), &[p.into()], Some(f.into()));
+        }
+        for s in ["f64", "f32"] {
+            self.declare_rt(&format!("zap_array_min_{s}"), &[p.into()], Some(f.into()));
+            self.declare_rt(&format!("zap_array_max_{s}"), &[p.into()], Some(f.into()));
+            self.declare_rt(&format!("zap_array_prod_{s}"), &[p.into()], Some(f.into()));
+            self.declare_rt(&format!("zap_array_mean_{s}"), &[p.into()], Some(f.into()));
+        }
+        self.declare_rt(
+            "zap_array_reduce_axis",
+            &[p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_array_mean_axis", &[p.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_array_axis_check", &[p.into(), i.into()], None);
         // Constructors (#504, D-0167): zeros/ones/full fill a `new_nd` result via
         // `fill_i`/`fill_f` (value as an i64 or f64 ABI word); arange/linspace
         // allocate and fill a runtime-length 1-D array themselves.

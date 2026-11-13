@@ -1,0 +1,7 @@
+full 15 1 8 64 3.75
+axis0 10 7
+axis1 10 4
+mean 2.0 3.0
+empty 0 1
+empty raises
+axis raises
