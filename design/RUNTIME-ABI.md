@@ -230,10 +230,15 @@ allocation, not a header plus a separate data buffer:
   views share the buffer base and retain an element offset in `off`;
   `zap_array_data` returns the window start for SIMD kernels, and
   `zap_array_new_like(src, out_dtype)` allocates an element-wise result sharing
-  the operand shape. `zap_array_check_shape(lhs, rhs)` checks equal `ndim` and
-  equal `dims` on every axis and raises `ValueError` before a binary kernel
-  reads its buffers (strided views, N-D array slicing, and cross-shape
-  broadcasting are follow-ups, #502/#501). `dtype` tags the
+  the operand shape. Element-wise ops **broadcast** (#501, D-0165):
+  `zap_array_broadcast_check(lhs, rhs)` raises `ValueError` on incompatible
+  shapes before the kernel; `zap_array_broadcast_new(lhs, rhs, out)` allocates
+  the broadcast-shaped result; `zap_array_same_shape` picks the flat (equal-shape
+  SIMD) vs strided kernel; and `zap_array_bcast_offsets(a, b, res, f, *oa, *ob)`
+  maps a result flat index to each operand's window-relative offset
+  (stretched/missing axes contribute 0). The exact `zap_array_check_shape`
+  remains available. Strided views and N-D array slicing are follow-ups (#502).
+  `dtype` tags the
   element type — `0 = f64`, `1 = i64` (8-byte words), `2 = uint8`, `3 = bool`
   (1-byte words). `zap_array_new(dtype, len)` sizes the buffer by dtype; `uint8`
   /`bool` cross the typed get/set/sum entry points as `i64` words (get

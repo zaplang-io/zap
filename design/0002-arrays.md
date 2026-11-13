@@ -31,14 +31,15 @@ The normative supported subset is SPEC §15: **N-dimensional** arrays with a
 `uint8`/`u8`, and `bool`; integer indexing per axis (a full index `m[i, j]` is a
 scalar get/set, a partial index `m[i]` a rank-reduced view); `a.ndim`/`a.shape`/
 `a.size`, `len`, `sum` (over all elements), element-wise `+`/`-`/`*`, scalar
-broadcasting (`+`/`*` on either side, `-` with array on the left), mixed dtype
-promotion, and contiguous 1-D view slices (optional literal step `1`). Unequal
-shapes (including unequal rank) raise `ValueError` before entering the SIMD
+broadcasting (`+`/`*` on either side, `-` with array on the left), **array-array
+broadcasting** (right-align shapes, stretch size-1 axes, extend rank), mixed
+dtype promotion, and contiguous 1-D view slices (optional literal step `1`).
+Shapes that cannot broadcast together raise `ValueError` before entering the
 kernel. Empty and zero-axis arrays are supported.
 
-Axis reductions, broadcasting beyond a scalar (including across unequal
-ranks/shapes), N-D and strided views, `f32`/`i32`, `zeros`/`arange`/`sqrt`,
-division/comparison kernels, partial-index (whole-row) stores, and
+Axis reductions, N-D and strided views, `f32`/`i32`, `zeros`/`arange`/`sqrt`,
+division/comparison kernels, broadcasting in assignment / partial-index
+(whole-row) stores, inner-axis SIMD on the broadcast path, and
 list-variable/iterable constructors are future design work. The broader examples
 below describe that future design rather than an available surface. Unsupported
 forms receive semantic or lowering errors.
@@ -190,12 +191,24 @@ header + buffer layout, GC-managed buffer).
   result dtype). `sum(a)` reduces over the whole element count. The SIMD kernel
   is unchanged — it runs flat over `zap_array_count` elements.
 
+**Increment 4 (shipped, #501 / D-0165):** element-wise broadcasting.
+
+- `+`/`-`/`*` on two arrays broadcast (NumPy): shapes right-align, a size-1 or
+  missing (lower-rank) axis stretches, the result takes the larger rank and the
+  larger aligned dim. Incompatible shapes raise a catchable `ValueError` from a
+  throwing `zap_array_broadcast_check` emitted before the kernel.
+- The kernel stays in codegen and branches on `zap_array_same_shape`: equal
+  shapes keep the existing **flat SIMD** loop (no regression); otherwise a
+  **strided** loop walks the result row-major and maps each output index to each
+  operand's window-relative offset via `zap_array_bcast_offsets` (stretched axes
+  → stride 0). The result is allocated by `zap_array_broadcast_new`. Inner-axis
+  SIMD on the broadcast path is a deferred perf follow-up (scalar body for now).
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
-- Broadcasting beyond a scalar (trailing-dim alignment, size-1 stretch), incl.
-  element-wise ops across unequal ranks/shapes (#501).
-- Partial-index (whole-row) stores `m[i] = row`, and N-D (axis-0) array slicing
-  `m[lo:hi]` (#502/#511).
+- Inner-axis SIMD for the broadcast path; broadcasting in assignment /
+  partial-index (whole-row) stores `m[i] = row` (#501 follow-up / #511).
+- N-D (axis-0) array slicing `m[lo:hi]` and strided views (#502).
 - **Strided** slice views (`a[::2]`, `a[::-1]`). A *contiguous* 1-D slice
   (`a[lo:hi]`, `a[:]`, `a[lo:]`, `a[:hi]`) is now a view (#400, D-0030): the
   slice header shares the parent buffer and carries an element `off`set + length

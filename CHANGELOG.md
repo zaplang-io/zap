@@ -956,8 +956,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   partial index `m[i]` is a rank-reduced **view** that aliases the parent.
   `a.ndim`/`a.shape`/`a.size` expose the shape (`len(a)` is the first axis);
   element-wise `+`/`-`/`*` and scalar broadcast require equal rank and preserve
-  it, and `sum(a)` reduces over every element. N-D/strided slicing, whole-row
-  stores, and cross-shape broadcasting remain follow-ups (#501/#502).
+  it, and `sum(a)` reduces over every element. N-D/strided slicing and whole-row
+  stores remain follow-ups (#502/#511).
+
+- **Element-wise array broadcasting** (#501, D-0165, epic #499). `+`/`-`/`*` on
+  two arrays now broadcast with NumPy semantics: shapes right-align, a size-1 or
+  missing (lower-rank) axis stretches, and the result takes the larger rank and
+  the larger aligned dim (`matrix + row_vector`, `matrix + col_vector`, etc.).
+  Shapes that cannot broadcast raise a catchable `ValueError`. Equal shapes keep
+  the flat SIMD kernel; the broadcast path is a strided codegen kernel (inner-axis
+  SIMD for it is a perf follow-up).
 
 - `scope(timeout=<ms>)` deadlines (integer milliseconds, no unit suffix): on
   expiry the scope cancels and awaits its children through the shared channel-aware

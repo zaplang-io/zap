@@ -19856,18 +19856,18 @@ impl<'a> FnLower<'a> {
         let is_scalar = |t: Ty| t.is_float() || t.int_width().is_some();
         match (lt, rt) {
             (Ty::Array(ld, lnd), Ty::Array(rd, rnd)) => {
-                // Element-wise ops require equal rank (#500); a full-shape check
-                // at runtime catches unequal dims. Broadcasting across unequal
-                // ranks/shapes is a #501 follow-up.
-                if lnd != rnd {
-                    return Err(err(format!(
-                        "element-wise op on arrays of different rank ({lnd}-D vs {rnd}-D); \
-                         cross-rank broadcasting is a follow-up (#501)"
-                    )));
-                }
-                self.throwing_call(None, "zap_array_check_shape", vec![l, r]);
+                // Broadcasting (#501, D-0165): shapes are right-aligned and each
+                // aligned axis must be equal, or one side 1 (stretched), or
+                // missing (the lower-rank operand gets implicit leading 1s). The
+                // result rank is the larger rank (static); the per-axis
+                // compatibility and result dims are a runtime concern. A throwing
+                // check raises a catchable ValueError on incompatible shapes
+                // before the kernel runs; codegen then picks the flat or strided
+                // kernel by a runtime same-shape test.
+                let rank = lnd.max(rnd);
+                self.throwing_call(None, "zap_array_broadcast_check", vec![l, r]);
                 let out = Dtype::promote(ld, rd);
-                let dest = self.new_value(Ty::Array(out, lnd));
+                let dest = self.new_value(Ty::Array(out, rank));
                 self.emit(Inst::ArrayBinOp {
                     dest,
                     op: irop,
@@ -19878,7 +19878,7 @@ impl<'a> FnLower<'a> {
                     rhs_dtype: rd,
                     scalar: false,
                 });
-                Ok((dest, Ty::Array(out, lnd)))
+                Ok((dest, Ty::Array(out, rank)))
             }
             (Ty::Array(ld, lnd), _) if is_scalar(rt) => {
                 // Weak scalar (NEP 50): an int scalar keeps the array's dtype,
@@ -21242,10 +21242,18 @@ mod nd_array_tests {
     }
 
     #[test]
-    fn cross_rank_elementwise_is_rejected() {
-        lower_fails(
+    fn cross_rank_and_cross_shape_elementwise_broadcast_lowers() {
+        // Broadcasting (#501): cross-rank (2-D + 1-D) and cross-shape element-wise
+        // ops now lower; compatibility is a runtime check (zap_array_broadcast_check),
+        // not a lowering error. Even an incompatible pair lowers and fails at runtime.
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto v = array[i64]([10, 20])\n    print(sum(m + v))\n";
+        lowers_ok(src);
+        assert_eq!(count(src, "zap_array_broadcast_check"), 1);
+        // A size-1 column stretched against a full matrix also lowers.
+        lowers_ok(
             "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
-             auto v = array[i64]([1, 2])\n    auto x = m + v\n    print(sum(x))\n",
+             auto c = array[i64]([[10], [20]])\n    print(sum(m + c))\n",
         );
     }
 

@@ -2220,6 +2220,28 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_count", &[p.into()], Some(i.into()));
         self.declare_rt("zap_array_dim", &[p.into(), i.into()], Some(i.into()));
         self.declare_rt("zap_array_row", &[p.into(), i.into()], Some(p.into()));
+        // Broadcasting (#501, D-0165): `broadcast_check` raises ValueError on
+        // incompatible shapes (emitted as a throwing call in lowering);
+        // `broadcast_new` allocates the broadcast-shaped result; `same_shape`
+        // selects the flat vs strided kernel; `bcast_offsets` maps a result flat
+        // index to each operand's window-relative element offset (last two args
+        // are `int64*` out-params, so `p`).
+        self.declare_rt("zap_array_broadcast_check", &[p.into(), p.into()], None);
+        self.declare_rt(
+            "zap_array_broadcast_new",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_same_shape",
+            &[p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt(
+            "zap_array_bcast_offsets",
+            &[p.into(), p.into(), p.into(), i.into(), p.into(), p.into()],
+            None,
+        );
         // array slice `a[lo:hi]` -> a VIEW sharing the buffer (D-0030, contiguous
         // only). Bounds `(lo, hi)` + their present-flags; no step (strided views
         // are a follow-up, so codegen rejects a non-unit step before here).
@@ -5263,19 +5285,30 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let i32t = self.ctx.i32_type();
         let la = lhs.into_pointer_value();
 
-        // n = count(lhs) (total elements across ALL axes, not len == dims[0]);
-        // res = new_like(lhs, out) shares lhs's N-D shape with the result dtype
-        // (#500). Both element buffers come back as raw pointers via
-        // `zap_array_data`, so this flat loop never needs the array's field
-        // layout or its rank — equal-shape operands (checked before this) make
-        // the contiguous windows element-for-element aligned.
-        let n = self
-            .call1("zap_array_count", &[la.into()], "n")?
-            .into_int_value();
+        // Result allocation. A scalar broadcast keeps the array operand's shape
+        // (`new_like`); an array-array op uses the *broadcast* shape (#501,
+        // D-0165) — rank = max rank, each dim the larger aligned dim. Broadcast
+        // compatibility is validated by a throwing check the lowering emits
+        // before this call, so `broadcast_new` may assume the shapes are
+        // compatible. `n` is the result element count. The element buffers come
+        // back as raw pointers via `zap_array_data` (already past each array's
+        // `off`), so the kernels never touch the array header layout.
         let code = i64t.const_int(out.code() as u64, false);
-        let res = self
-            .call1("zap_array_new_like", &[la.into(), code.into()], "arr")?
-            .into_pointer_value();
+        let res = if scalar {
+            self.call1("zap_array_new_like", &[la.into(), code.into()], "arr")?
+                .into_pointer_value()
+        } else {
+            let ra = rhs.into_pointer_value();
+            self.call1(
+                "zap_array_broadcast_new",
+                &[la.into(), ra.into(), code.into()],
+                "arr",
+            )?
+            .into_pointer_value()
+        };
+        let n = self
+            .call1("zap_array_count", &[res.into()], "n")?
+            .into_int_value();
         let lp = self
             .call1("zap_array_data", &[la.into()], "lp")?
             .into_pointer_value();
@@ -5320,6 +5353,90 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             (None, None)
         };
 
+        // The shared exit block for whichever kernel runs.
+        let done = self.ctx.append_basic_block(fv, "arr.done");
+
+        // For an array-array op, pick the kernel at run time: the flat SIMD loop
+        // when the operands already line up element-for-element (equal shapes —
+        // the common case, no regression), else a strided broadcast loop that
+        // re-reads stretched/missing axes. The flat path then falls through from
+        // `flat_bb`. Inner-axis SIMD for the broadcast path is a follow-up; it is
+        // the scalar loop below for now.
+        if !scalar {
+            let ra = rhs.into_pointer_value();
+            let rp = rp.unwrap();
+            let same = self
+                .call1("zap_array_same_shape", &[la.into(), ra.into()], "same")?
+                .into_int_value();
+            let zero64 = i64t.const_int(0, false);
+            let is_same = b
+                .build_int_compare(IntPredicate::NE, same, zero64, "issame")
+                .map_err(|e| e.to_string())?;
+            let flat_bb = self.ctx.append_basic_block(fv, "arr.flat");
+            let bcast_bb = self.ctx.append_basic_block(fv, "arr.bcast");
+            b.build_conditional_branch(is_same, flat_bb, bcast_bb)
+                .map_err(|e| e.to_string())?;
+
+            // --- strided broadcast loop (scalar body) ---
+            b.position_at_end(bcast_bb);
+            let oa_slot = b.build_alloca(i64t, "oa").map_err(|e| e.to_string())?;
+            let ob_slot = b.build_alloca(i64t, "ob").map_err(|e| e.to_string())?;
+            let bhead = self.ctx.append_basic_block(fv, "arr.bc.head");
+            let bbody = self.ctx.append_basic_block(fv, "arr.bc.body");
+            b.build_unconditional_branch(bhead)
+                .map_err(|e| e.to_string())?;
+            b.position_at_end(bhead);
+            let f_phi = b.build_phi(i64t, "f").map_err(|e| e.to_string())?;
+            let f = f_phi.as_basic_value().into_int_value();
+            let bcond = b
+                .build_int_compare(IntPredicate::SLT, f, n, "bcond")
+                .map_err(|e| e.to_string())?;
+            b.build_conditional_branch(bcond, bbody, done)
+                .map_err(|e| e.to_string())?;
+            b.position_at_end(bbody);
+            b.build_call(
+                self.fns["zap_array_bcast_offsets"],
+                &[
+                    la.into(),
+                    ra.into(),
+                    res.into(),
+                    f.into(),
+                    oa_slot.into(),
+                    ob_slot.into(),
+                ],
+                "",
+            )
+            .map_err(|e| e.to_string())?;
+            let ol = b
+                .build_load(i64t, oa_slot, "ol")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let or = b
+                .build_load(i64t, ob_slot, "or")
+                .map_err(|e| e.to_string())?
+                .into_int_value();
+            let lsc = self.elem_load(lhs_elem, lp, ol, "bls")?;
+            let lsc = self.convert_scalar(lsc, lhs_dtype, out, out_elem)?;
+            let rsc = self.elem_load(rhs_elem, rp, or, "brs")?;
+            let rsc = self.convert_scalar(rsc, rhs_dtype, out, out_elem)?;
+            let ressc = self.scalar_arith(op, out_float, lsc, rsc)?;
+            let optr = unsafe {
+                b.build_gep(out_elem, op_ptr, &[f], "boptr")
+                    .map_err(|e| e.to_string())?
+            };
+            let st = b.build_store(optr, ressc).map_err(|e| e.to_string())?;
+            st.set_alignment(out_align).map_err(|e| e.to_string())?;
+            let fnext = b
+                .build_int_add(f, i64t.const_int(1, false), "fnext")
+                .map_err(|e| e.to_string())?;
+            b.build_unconditional_branch(bhead)
+                .map_err(|e| e.to_string())?;
+            f_phi.add_incoming(&[(&i64t.const_int(0, false), bcast_bb), (&fnext, bbody)]);
+
+            // The flat loop below runs in `flat_bb`.
+            b.position_at_end(flat_bb);
+        }
+
         // vend = n & ~(VW-1): the largest multiple of VW not exceeding n.
         let mask = i64t.const_int(!(VW - 1), false);
         let vend = b.build_and(n, mask, "vend").map_err(|e| e.to_string())?;
@@ -5329,7 +5446,6 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let vbody = self.ctx.append_basic_block(fv, "arr.vbody");
         let rhead = self.ctx.append_basic_block(fv, "arr.rhead");
         let rbody = self.ctx.append_basic_block(fv, "arr.rbody");
-        let done = self.ctx.append_basic_block(fv, "arr.done");
         b.build_unconditional_branch(vhead)
             .map_err(|e| e.to_string())?;
 

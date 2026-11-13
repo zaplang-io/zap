@@ -1396,7 +1396,7 @@ longer-term N-D design in `design/0002-arrays.md`.
 | Construction | A positional list literal, flat (`array[f64]([1, 2.5])`, 1-D) or **nested rectangular** (`array[f64]([[1, 2], [3, 4]])`, N-D); empty / zero-axis literals are allowed |
 | Access | One integer index per axis. A *full* index `m[i, j]` is a scalar get/set; a *partial* index `m[i]` is a rank-reduced **view**. Indices are in-bounds and nonnegative |
 | Shape | `a.ndim` (rank), `a.shape` (a `tuple[int64; ndim]`), `a.size` (total elements); `len(a)` is the first axis |
-| Arithmetic | Element-wise `+`, `-`, `*`; two arrays require **equal rank and shape** |
+| Arithmetic | Element-wise `+`, `-`, `*`; two arrays **broadcast** (right-align shapes, stretch size-1 axes, extend rank) |
 | Scalar broadcast | `a + n`, `a - n`, `a * n`; `n + a` and `n * a` (shape preserved) |
 | Reduction | `sum(a)` over **all** elements; returns `f64` for `f64`, otherwise `int64` |
 | Slicing | Contiguous 1-D views `a[lo:hi]`, with omitted bounds or literal step `1`; writes alias the parent |
@@ -1404,17 +1404,19 @@ longer-term N-D design in `design/0002-arrays.md`.
 Mixed array dtypes promote on `bool < uint8 < i64 < f64`; arithmetic on two
 boolean arrays yields `uint8`. Integer scalars retain the array dtype (boolean
 arithmetic promotes to `uint8`), while floating scalars promote to `f64`.
-`uint8` arithmetic wraps modulo 256. Arrays of unequal shape (including unequal
-rank) raise catchable `ValueError` ("array shape mismatch") before the SIMD
-kernel reads the buffers.
+`uint8` arithmetic wraps modulo 256. Two arrays **broadcast** (NumPy rules:
+right-align shapes, stretch size-1 axes, and extend the lower-rank operand with
+leading 1s; the result takes the larger rank and the larger aligned dim). Shapes
+that cannot broadcast together raise a catchable `ValueError` ("array shape
+mismatch") before the kernel reads the buffers.
 
 A bare `array[T]` type annotation denotes a rank-1 array; N-D values arise
 through inference (`auto`). List-variable/iterable constructors, `zeros`/`arange`,
 `f32`/`i32` dtypes, element-wise unary negation/bitwise operations, array
-division/comparisons, axis reductions, broadcasting beyond a scalar (including
-across unequal ranks/shapes), `scalar - array`, partial-index (whole-row)
-stores, N-D and strided/reversed array slicing, and explicit N-D type
-annotations are unsupported. Semantic or lowering diagnostics reject these forms.
+division/comparisons, axis reductions, broadcasting in assignment or partial-index
+(whole-row) stores, `scalar - array`, N-D and strided/reversed array slicing, and
+explicit N-D type annotations are unsupported. Semantic or lowering diagnostics
+reject these forms.
 
 ```python
 auto a = array[f64]([1, 2, 3])
@@ -1427,6 +1429,7 @@ print(m.shape, m.ndim)   # (2, 3)-style tuple, 2
 auto x = m[1, 2]         # 6 (full index -> scalar)
 auto row = m[0]          # rank-1 view [1, 2, 3]; row[0] = 9 writes m[0, 0]
 auto s = sum(m)          # 21 (reduces every element)
+auto b = m + array[i64]([10, 20, 30])  # broadcast (3,) across rows -> (2, 3)
 ```
 
 ---
