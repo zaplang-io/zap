@@ -25,18 +25,23 @@ differentiator. This type is distinct from `list[T]`:
 
 ## Current Experimental contract (I#476)
 
-The normative supported subset is SPEC §15: one-dimensional arrays constructed
-from a single flat list literal; dtypes `f64`/`float64`, `i64`/`int64`,
-`uint8`/`u8`, and `bool`; one integer index; `len`, `sum`, element-wise `+`/`-`/`*`,
-scalar broadcasting (`+`/`*` on either side, `-` with array on the left), mixed
-dtype promotion, and contiguous view slices (optional literal step `1`).
-Unequal lengths raise `ValueError` before entering the SIMD kernel. Empty arrays
-are supported. No shape/ndim attribute is exposed; length is the only dimension.
+The normative supported subset is SPEC §15: **N-dimensional** arrays with a
+**static rank** (`ndim`, part of the type), constructed from a flat or nested
+**rectangular** list literal; dtypes `f64`/`float64`, `i64`/`int64`,
+`uint8`/`u8`, and `bool`; integer indexing per axis (a full index `m[i, j]` is a
+scalar get/set, a partial index `m[i]` a rank-reduced view); `a.ndim`/`a.shape`/
+`a.size`, `len`, `sum` (over all elements), element-wise `+`/`-`/`*`, scalar
+broadcasting (`+`/`*` on either side, `-` with array on the left), mixed dtype
+promotion, and contiguous 1-D view slices (optional literal step `1`). Unequal
+shapes (including unequal rank) raise `ValueError` before entering the SIMD
+kernel. Empty and zero-axis arrays are supported.
 
-N-D shapes, `zeros`/`arange`/`sqrt`, axis reductions, division/comparison kernels,
-strided views, `f32`/`i32`, and list-variable/iterable constructors are future
-design work. The broader examples below describe that future design rather than
-an available surface. Unsupported forms receive semantic or lowering errors.
+Axis reductions, broadcasting beyond a scalar (including across unequal
+ranks/shapes), N-D and strided views, `f32`/`i32`, `zeros`/`arange`/`sqrt`,
+division/comparison kernels, partial-index (whole-row) stores, and
+list-variable/iterable constructors are future design work. The broader examples
+below describe that future design rather than an available surface. Unsupported
+forms receive semantic or lowering errors.
 `float64`/`float` is supported in every built-in collection position — list
 elements (I#569), dict values/keys, set members, and heap/channel elements (#800
 Phase 1 D-0137, #800 Phase 2 / #803 D-0138; a float key/member canonicalizes
@@ -165,10 +170,32 @@ header + buffer layout, GC-managed buffer).
   zero-extends, set truncates to a byte / normalizes to `0|1`). Integer-array
   arithmetic wraps per D-0005 (`uint8` wraps mod 256).
 
+**Increment 3 (shipped, #500 / D-0164):** N-D shape + multi-axis indexing.
+
+- `array[T]` carries a **static rank** (`ndim`) in its type. A nested
+  rectangular list literal builds a shaped array (`array[f64]([[1, 2],
+  [3, 4]])` -> shape `(2, 2)`); ragged literals are a compile error. The runtime
+  allocates the rank-`n` header with `zap_array_new_nd` + per-axis
+  `zap_array_set_dim`.
+- Indexing: a **full** index `m[i, j]` reaches a scalar (get/set, incl. `+=`); a
+  **partial** index `m[i]` is a contiguous rank-`(n-1)` **view** that aliases the
+  parent (`zap_array_row`: shares the buffer base, advances `off` by a
+  row-stride, copies `dims[1..]`). `m[i, j]` lowers as a fold of row views down
+  to a rank-1 view plus a 1-D get, so the narrow-dtype get/set are reused
+  unchanged. Out-of-range aborts (as 1-D); negative indices stay unsupported.
+- Shape surface: `a.ndim` (constant), `a.shape` (a `tuple[int64; ndim]` from
+  `zap_array_dim`), `a.size` (`zap_array_count`); `len(a)` is the first axis.
+- Element-wise ops require equal rank and preserve it; `zap_array_check_shape`
+  compares the full shape; the result buffer is `zap_array_new_like` (same shape,
+  result dtype). `sum(a)` reduces over the whole element count. The SIMD kernel
+  is unchanged — it runs flat over `zap_array_count` elements.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
-- N-D shape and row-major multi-axis indexing (`m[i, j]`); `ndim` is always 1.
-- Broadcasting beyond a scalar (trailing-dim alignment, size-1 stretch).
+- Broadcasting beyond a scalar (trailing-dim alignment, size-1 stretch), incl.
+  element-wise ops across unequal ranks/shapes (#501).
+- Partial-index (whole-row) stores `m[i] = row`, and N-D (axis-0) array slicing
+  `m[lo:hi]` (#502/#511).
 - **Strided** slice views (`a[::2]`, `a[::-1]`). A *contiguous* 1-D slice
   (`a[lo:hi]`, `a[:]`, `a[lo:]`, `a[:hi]`) is now a view (#400, D-0030): the
   slice header shares the parent buffer and carries an element `off`set + length

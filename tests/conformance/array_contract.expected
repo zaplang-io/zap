@@ -7,5 +7,5 @@ bool 2 4
 view 3 20 40 20
 nested 30 72
 empty view 0 0
-shape error array length mismatch
+shape error array shape mismatch
 empty shape error

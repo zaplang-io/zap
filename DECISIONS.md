@@ -8484,3 +8484,37 @@ on aarch64 and x86_64.
 **Not addressed here.** Generated code reaches the shadow head through
 `zap_shadow_head_addr()` already; any other thread-local a *compiler-emitted* function
 would use across a safepoint is a codegen matter.
+## D-0164 — N-D numeric arrays: static rank + multi-axis indexing (#500)
+**Status:** Locked (design) / incremental implementation
+First increment of the N-D arrays epic (#499) over the 1-D subset (D-0011).
+An `array[T]` now carries a **static rank** (`ndim`) in its type, so indexing is
+typed statically: a *full* index (one per axis) yields a scalar, a *partial*
+index (fewer than `ndim`) yields a lower-rank **view**, and element-wise ops
+require equal rank. The runtime `ZapArray` header already carried `ndim`/`dims`;
+this makes `ndim > 1` real.
+- **Construction.** A nested **rectangular** list literal builds a shaped array
+  whose rank is the nesting depth and whose shape is the per-level length
+  (`array[f64]([[1, 2], [3, 4]])` -> shape `(2, 2)`). Ragged (non-rectangular /
+  inconsistently nested) literals are a compile error. A flat literal is rank 1,
+  unchanged. Non-literal / `zeros`-style constructors stay deferred (#504).
+- **Indexing.** `m[i, j]` (a tuple subscript) reaches a scalar; `m[i]` on a
+  rank-`n` array is a contiguous rank-`(n-1)` row **view** that aliases the
+  parent (D-0030). A full index also stores (`m[i, j] = v`, `m[i, j] += v`);
+  partial-index (whole-row) stores are deferred (#501/#511). Too many indices is
+  an error; out-of-range aborts (catchable index errors are a follow-up, as for
+  1-D). Negative indices stay unsupported for now.
+- **Attributes.** `a.ndim` (the static rank), `a.shape` (a fixed-arity
+  `tuple[int64; ndim]`), `a.size` (total element count); `len(a)` is the first
+  axis (NumPy semantics).
+- **Element-wise / reductions.** `+`/`-`/`*` and scalar broadcast require equal
+  rank and preserve it; `zap_array_check_shape` now compares the full shape
+  (message: "array shape mismatch"). `sum(a)` reduces over **all** elements.
+  Cross-rank/cross-shape broadcasting is #501; axis reductions are #507.
+- **Typing surface.** A bare `array[T]` type annotation denotes rank 1 (the
+  historical default, back-compatible); N-D values arise through inference
+  (`auto`). An explicit N-D annotation syntax is a documented follow-up.
+- **Deferred (noted):** N-D (axis-0) and strided array slicing (#502), f32/i32
+  dtypes (#503), constructors (#504), math intrinsics (#505), division /
+  scalar-on-left (#506), axis reductions + min/max/mean/prod (#507).
+No grammar change (the comma subscript `m[i, j]` already parses as a tuple
+index). See `design/0002-arrays.md`, SPEC §15, and `design/RUNTIME-ABI.md`.

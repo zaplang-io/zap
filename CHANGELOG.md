@@ -943,10 +943,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   bare `a := 10` statement is rejected (`ZAP2020`, steering to `auto a = 10`)
   (#600, D-0106, epic #614 D8).
 
-- Array length mismatches raise `ValueError` before SIMD kernels run; the
-  Experimental array contract records supported 1-D dtypes, construction,
+- Array shape mismatches raise `ValueError` before SIMD kernels run; the
+  Experimental array contract records supported dtypes, construction,
   arithmetic and contiguous views. Unsupported array constructors and native
   floating-point collection slots have semantic diagnostics (#476).
+
+- **N-dimensional numeric arrays — static-rank shape + multi-axis indexing**
+  (#500, D-0164, epic #499). `array[T]` now carries a static rank (`ndim`) in
+  its type: a nested rectangular list literal builds a shaped array
+  (`array[f64]([[1, 2], [3, 4]])` → shape `(2, 2)`; ragged literals are a
+  compile error). A full index `m[i, j]` is a scalar get/set (incl. `+=`); a
+  partial index `m[i]` is a rank-reduced **view** that aliases the parent.
+  `a.ndim`/`a.shape`/`a.size` expose the shape (`len(a)` is the first axis);
+  element-wise `+`/`-`/`*` and scalar broadcast require equal rank and preserve
+  it, and `sum(a)` reduces over every element. N-D/strided slicing, whole-row
+  stores, and cross-shape broadcasting remain follow-ups (#501/#502).
 
 - `scope(timeout=<ms>)` deadlines (integer milliseconds, no unit suffix): on
   expiry the scope cancels and awaits its children through the shared channel-aware

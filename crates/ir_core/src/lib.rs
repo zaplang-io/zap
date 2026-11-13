@@ -289,9 +289,16 @@ pub enum Ty {
     /// runtime compares `i64` words numerically and pointer words as `ZapStr`
     /// bytes.
     Heap(Elem),
-    /// A pointer to a numeric `array` object with the given element dtype
-    /// (ticket #24).
-    Array(Dtype),
+    /// A pointer to a numeric `array` object with the given element dtype and
+    /// **static rank** (`ndim`, ticket #24 / #500, D-0164). The rank is part of
+    /// the type so indexing can be typed statically: a full index (one per axis)
+    /// yields a scalar, a partial index (fewer than `ndim`) yields a lower-rank
+    /// `array` view, and element-wise ops require equal rank. The runtime
+    /// `ZapArray` header carries the concrete per-axis `dims`; the rank here is
+    /// always `>= 1`. A bare `array[T]` type annotation denotes rank 1 (the
+    /// historical default); N-D values arise through inference (`auto`), and an
+    /// explicit N-D annotation syntax is a documented follow-up.
+    Array(Dtype, u8),
     /// A pointer to a runtime channel object (ticket #25, D-0031) whose elements
     /// are stored as uniform 8-byte words of the given kind. The element kind
     /// selects the typed send/receive runtime entry point (`zap_chan_send_i64`
@@ -1082,7 +1089,13 @@ impl fmt::Display for Ty {
             Ty::Dict(k, v) => return write!(f, "dict[{}, {}]", k.key_suffix(), v.val_suffix()),
             Ty::Set(e) => return write!(f, "set[{}]", e.key_suffix()),
             Ty::Heap(e) => return write!(f, "heap[{}]", e.val_suffix()),
-            Ty::Array(d) => return write!(f, "array[{}]", d.suffix()),
+            Ty::Array(d, n) => {
+                return if *n <= 1 {
+                    write!(f, "array[{}]", d.suffix())
+                } else {
+                    write!(f, "array[{}; {}]", d.suffix(), n)
+                }
+            }
             Ty::Chan(e) => return write!(f, "chan[{}]", e.val_suffix()),
             Ty::AtomicArray(e) => return write!(f, "AtomicArray[{}]", e.val_suffix()),
             Ty::Func(idx) => return write!(f, "fn#{idx}"),

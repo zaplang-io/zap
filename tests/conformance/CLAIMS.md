@@ -212,5 +212,6 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | Claim | Section | Statement | Status | Case |
 |---|---|---|---|---|
 | ARR-1 | §15 | numeric array: element-wise ops + scalar broadcast; slices are views (D-0011) | covered | array_contract |
+| ARR-2 | §15 | numeric array: N-D shape + multi-axis indexing, row views, shape attrs, full reductions (#500, D-0164) | covered | array_nd_contract |
 | DEC-1 | §16 | `@derive(...)` generates field-by-field code at compile time (D-0036) | TODO | — |
 | DEC-2 | §16 | multiple decorators stack bottom-up | TODO | — |

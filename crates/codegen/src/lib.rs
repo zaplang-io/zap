@@ -2205,6 +2205,21 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_len", &[p.into()], Some(i.into()));
         self.declare_rt("zap_array_check_shape", &[p.into(), p.into()], None);
         self.declare_rt("zap_array_data", &[p.into()], Some(p.into()));
+        // N-D shape + multi-axis indexing (#500, D-0164). Construction builds a
+        // rank-`ndim` array (`new_nd` + per-axis `set_dim`); `ndim`/`dim`/`count`
+        // back `a.ndim`/`a.shape`/`a.size`; `row` is a partial index (rank-reduced
+        // view); `new_like` allocates an element-wise result sharing the shape.
+        self.declare_rt(
+            "zap_array_new_nd",
+            &[i.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_array_set_dim", &[p.into(), i.into(), i.into()], None);
+        self.declare_rt("zap_array_new_like", &[p.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_array_ndim", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_array_count", &[p.into()], Some(i.into()));
+        self.declare_rt("zap_array_dim", &[p.into(), i.into()], Some(i.into()));
+        self.declare_rt("zap_array_row", &[p.into(), i.into()], Some(p.into()));
         // array slice `a[lo:hi]` -> a VIEW sharing the buffer (D-0030, contiguous
         // only). Bounds `(lo, hi)` + their present-flags; no step (strided views
         // are a follow-up, so codegen rejects a non-unit step before here).
@@ -3517,7 +3532,7 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             | Ty::Dict(..)
             | Ty::Set(_)
             | Ty::Heap(_)
-            | Ty::Array(_)
+            | Ty::Array(..)
             | Ty::Chan(_)
             | Ty::AtomicArray(_)
             | Ty::Bytes
@@ -5248,15 +5263,18 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         let i32t = self.ctx.i32_type();
         let la = lhs.into_pointer_value();
 
-        // n = len(lhs); res = new(out, n). Both element buffers come back as
-        // raw pointers via `zap_array_data`, so this loop never needs to know
-        // the array object's field layout.
+        // n = count(lhs) (total elements across ALL axes, not len == dims[0]);
+        // res = new_like(lhs, out) shares lhs's N-D shape with the result dtype
+        // (#500). Both element buffers come back as raw pointers via
+        // `zap_array_data`, so this flat loop never needs the array's field
+        // layout or its rank — equal-shape operands (checked before this) make
+        // the contiguous windows element-for-element aligned.
         let n = self
-            .call1("zap_array_len", &[la.into()], "n")?
+            .call1("zap_array_count", &[la.into()], "n")?
             .into_int_value();
         let code = i64t.const_int(out.code() as u64, false);
         let res = self
-            .call1("zap_array_new", &[code.into(), n.into()], "arr")?
+            .call1("zap_array_new_like", &[la.into(), code.into()], "arr")?
             .into_pointer_value();
         let lp = self
             .call1("zap_array_data", &[la.into()], "lp")?

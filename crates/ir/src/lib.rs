@@ -662,10 +662,11 @@ mod tests {
             ("auto x = a[::-1]", "stepped array slice"),
             ("auto x = a / a", "only +, -, and *"),
             ("auto x = 1 - a", "scalar-on-the-left"),
-            ("auto x = a[0, 1]", "one integer index"),
-            ("a[0, 1] = 2", "one integer index"),
+            // Multi-axis indexing is supported for N-D arrays (#500); on a 1-D
+            // array a two-axis index is simply too many indices.
+            ("auto x = a[0, 1]", "too many indices"),
+            ("a[0, 1] = 2", "too many indices"),
             ("auto x = a[0.5:]", "slice bounds must be integers"),
-            ("auto x = a.shape", "array attribute 'shape' is unsupported"),
             ("auto x = a == a", "only +, -, and *"),
             ("auto x = -a", "unary array operations are unsupported"),
             ("a[0] = \"x\"", "assignment requires a numeric scalar"),

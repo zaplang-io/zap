@@ -1,0 +1,9 @@
+f 1.0 4.0
+fadd 20.0
+fmul 20.0
+img 250 5
+isum 266
+iscalar 260
+iwrap 50
+mask 1 0
+msum 3
