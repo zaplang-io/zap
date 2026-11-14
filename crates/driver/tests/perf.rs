@@ -197,6 +197,30 @@ fn benches() -> Vec<Bench> {
             unit: "strings",
             floor_per_sec: 1_000.0,
         },
+        // ARRAY REDUCTION, whole-array (#911): sum a 20M-element i64 array. The
+        // reducer is an 8-way-unrolled multi-accumulator loop the compiler packs
+        // into SIMD, so this is bandwidth-bound rather than add-latency-bound.
+        // sum of 0..20_000_000-1 = n*(n-1)/2.
+        Bench {
+            name: "array_sum_1d",
+            src: "def main():\n    print(arange[i64](0, 20000000).sum())\n",
+            expect: "199999990000000",
+            work: 20_000_000,
+            unit: "elems",
+            floor_per_sec: 1_000_000.0,
+        },
+        // ARRAY REDUCTION, axis= (#911): sum axis 0 of a (1000, 20000) view.
+        // inner=20000 > 1, so the vectorized contiguous j-loop (loop-interchange)
+        // runs; the grand total equals the whole-array sum above.
+        Bench {
+            name: "array_sum_axis",
+            src: "def main():\n    auto m = arange[i64](0, 20000000).reshape(1000, 20000)\n    \
+                  print(sum(m.sum(axis=0)))\n",
+            expect: "199999990000000",
+            work: 20_000_000,
+            unit: "elems",
+            floor_per_sec: 1_000_000.0,
+        },
     ]
 }
 

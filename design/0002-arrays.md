@@ -344,6 +344,23 @@ indexing + `where` — the final feature increment of #499.
   stay loose (`Unknown`) in sema so masks combine and index. No new grammar; no
   array-ABI change. Matches NumPy 2.5.4 (verified before implementation).
 
+**Increment 14 (shipped, #911 / D-0177):** vectorized reduction kernels — the
+first performance increment (epic #914, Phase 1; sibling of the broadcast-kernel
+work #896).
+
+- `sum`/`min`/`max`/`mean`/`prod` (whole-array and `axis=`, #507/D-0170) now run
+  an eight-lane multi-accumulator body + scalar tail instead of a single
+  latency-bound scalar chain, so the compiler packs the lanes into SIMD
+  (bandwidth-bound target ~4–8×, #909 — the FLOOR kernel, simple portable C, no
+  intrinsics, tuning deferred).
+- Behaviour unchanged. Integer reductions are bit-identical at any size; an
+  `axis=` reduction with a contiguous last axis reuses the unrolled reducer,
+  while a non-last axis interchanges the reduced/contiguous loops to vectorize —
+  both keeping each cell's per-element accumulation order, so every `axis=`
+  reduction is bit-identical for all dtypes. Only a floating-point whole-array or
+  last-axis `sum`/`prod`/`mean` reassociates (within IEEE-754 tolerance).
+  Accumulator widths are the D-0170 ones (int sum → int64, float → double).
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Integer-array (non-mask) bitwise element-wise ops (`&`/`|`/`^`/`~` on numeric

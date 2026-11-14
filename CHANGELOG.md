@@ -1107,6 +1107,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **Array reductions are vectorized (multiple accumulators)** (#911, D-0177).
+  `sum`/`min`/`max`/`mean`/`prod` — whole-array and `axis=` (#507/D-0170) — ran a
+  scalar accumulator loop with a single, latency-bound dependency chain. They now
+  run an eight-lane multi-accumulator body plus a scalar tail, which the compiler
+  packs into SIMD, targeting the ~4–8× that a bandwidth-bound reduction leaves on
+  the table (#909). Phase 1 of the array performance epic (#914); the FLOOR
+  kernel stays simple, portable C (no intrinsics, tuning deferred). Behaviour is
+  unchanged: integer reductions are bit-identical at any size, every `axis=`
+  reduction preserves its per-element accumulation order (bit-identical for all
+  dtypes), and only a floating-point whole-array or last-axis `sum`/`prod`/`mean`
+  may differ from a strict left-to-right fold within IEEE-754 reassociation
+  tolerance. Accumulator widths are unchanged (int sum → int64, float → double).
 - **Codegen runs the LLVM middle-end `-O2` pipeline before object emission —
   loop locals are register-promoted** (#857, D-0152). `zapc` handed its IR
   straight to the backend (`TargetMachine::write_to_file`, `llc`-equivalent),
