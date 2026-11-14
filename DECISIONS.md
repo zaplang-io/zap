@@ -9093,3 +9093,33 @@ have to care whether BLAS is linked.
   dev / distribution images).
 Relates to #925, D-0179 (the seam), D-0181 (matmul dispatch), #512 (Phase 3
 epic — the motivating consumer).
+
+## D-0183 — `import linalg`: LAPACK-backed solve / inv / det (#926)
+**Status:** implemented (first linalg slice)
+First feature slice of the Phase 3 numeric-breadth epic (#512). `import linalg`
+exposes NumPy-shaped linear algebra over numeric arrays, backed by LAPACK through
+the #912 acceleration seam. This slice: `linalg.solve(a, b)` (solve `a @ x == b`),
+`linalg.inv(a)`, `linalg.det(a)`.
+- **Provider interface.** The **Fortran LAPACK** interface (`dgesv_` / `dgetrf_` /
+  `dgetri_`), which both providers expose — OpenBLAS (Linux) and Apple Accelerate
+  (macOS, NEW_LAPACK) — rather than LAPACKE, which Accelerate does not ship. LAPACK
+  is column-major and Zap arrays are row-major, so each matrix is transposed into a
+  column-major scratch buffer and the result transposed back (det is sign-correct
+  from the pivots). A program that uses `linalg` links the provider via
+  `BackendUse::blas` (the pcre2/zlib per-program pattern), exactly like matmul.
+- **Precision.** This slice computes in **f64** (any input promoted; f64 result),
+  one numeric path. f32-precision LAPACK (`sgesv` etc.) is a follow-up. (NumPy
+  preserves f32; the diff harness pins the f64 cases.)
+- **Errors.** `a` must be a square 2-D matrix and `b` 1-D/2-D with matching
+  leading dim; a singular matrix (LAPACK `info > 0`) and a bad shape raise a
+  catchable `ValueError` (the LinAlgError-equivalent — Zap has no separate
+  `LinAlgError` type). `det` of a singular matrix returns `0.0` (as NumPy).
+- **No-provider build.** The public entry points are always compiled; a build
+  with no provider (the rare exotic host — normal builds ship one, D-0182) raises
+  a catchable "linalg requires a BLAS/LAPACK provider". There is no programmer
+  opt-out (D-0182 dropped `ZAP_NO_BLAS`).
+- **Surface shape.** Matches `numpy.linalg`; the eigensolvers / decompositions /
+  lstsq / norm are the next slices (#927/#928). Cross-checked against NumPy in the
+  CPython diff harness.
+Relates to #926 / #512 (Phase 3 epic), #912/D-0179 + D-0182 (the seam), #904
+(matmul, the sibling consumer), #509/D-0172 (matmul surface).

@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`import linalg` — LAPACK-backed linear algebra** (#926, D-0183). First slice
+  of the Phase 3 numeric-breadth epic (#512): `linalg.solve(a, b)`,
+  `linalg.inv(a)`, `linalg.det(a)` over square numeric matrices, matching
+  `numpy.linalg`. Backed by LAPACK through the #912 acceleration seam (the
+  Fortran interface, so it works on both OpenBLAS and Apple Accelerate). Integer
+  input promotes to `f64`; results are `f64`; a singular matrix or bad shape
+  raises a catchable `ValueError`. Eigensolvers / decompositions / `lstsq` /
+  `norm` are later increments (#927/#928).
 - **Numeric acceleration seam — OpenBLAS / Apple Accelerate** (#912, D-0179).
   Infrastructure for the array performance epic (#914, Phase 2): a provider-
   neutral seam the matmul dispatch (#904) will consult to choose between the

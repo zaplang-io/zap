@@ -1,0 +1,9 @@
+det -2.0
+detd 8.0
+deti -2.0
+solve 3.0 2.0
+solvet 2.0 1.0
+solvem 1.0 3.0 1.0 2.0
+inv 0.5 0.25
+invu 1.0 -1.0 1.0
+singular raises

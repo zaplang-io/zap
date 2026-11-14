@@ -4489,6 +4489,107 @@ void zap_accel_ensure_threads(void);
     }
 ZAP_MATMUL_BLAS(f64, double, cblas_dgemm)
 ZAP_MATMUL_BLAS(f32, float, cblas_sgemm)
+
+/* --- linear algebra (#926, D-0183), LAPACK-backed ------------------------
+ * `import linalg`: solve / inv / det via the Fortran LAPACK interface
+ * (`dgesv_`/`dgetrf_`/`dgetri_`), which BOTH providers expose — OpenBLAS and
+ * Apple Accelerate (NEW_LAPACK, declared by <Accelerate/Accelerate.h> above).
+ * LAPACK is column-major while Zap arrays are row-major, so each matrix is
+ * transposed into a column-major scratch buffer and the result transposed back.
+ * The first slice computes in f64 (any input promoted; f64 result) — one path,
+ * no f32-precision LAPACK yet (a follow-up). The public entry points below are
+ * ALWAYS compiled (so a linalg program links); only these impls need a provider. */
+#if defined(ZAP_BLAS_OPENBLAS)
+/* OpenBLAS ships the Fortran symbols but no standard C declaration header; the
+ * ABI is stable (all args by pointer, trailing underscore). Accelerate declares
+ * them itself via the header already included for cblas. */
+extern void dgesv_(const int *n, const int *nrhs, double *a, const int *lda,
+                   int *ipiv, double *b, const int *ldb, int *info);
+extern void dgetrf_(const int *m, const int *n, double *a, const int *lda,
+                    int *ipiv, int *info);
+extern void dgetri_(const int *n, double *a, const int *lda, const int *ipiv,
+                    double *work, const int *lwork, int *info);
+#endif
+
+static void zap_linalg_err(const char *m) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+}
+/* Transpose a's row-major n*n into a fresh column-major double buffer (a's
+ * elements read dtype-generically, so integer / f32 inputs promote to f64). */
+static double *zap_linalg_colmajor(ZapArray *a, int64_t n) {
+    double *cm = (double *)zap_buf((size_t)(n * n) * sizeof(double));
+    for (int64_t i = 0; i < n; i++)
+        for (int64_t j = 0; j < n; j++)
+            cm[i + j * n] = mm_load_f(a, i * n + j);
+    return cm;
+}
+
+static void *zap_linalg_solve_impl(ZapArray *a, ZapArray *b, int64_t n,
+                                   int64_t nrhs, int b_is_1d) {
+    double *A = zap_linalg_colmajor(a, n);
+    double *X = (double *)zap_buf((size_t)(n * nrhs) * sizeof(double));
+    for (int64_t i = 0; i < n; i++)
+        for (int64_t r = 0; r < nrhs; r++)
+            X[i + r * n] = b_is_1d ? mm_load_f(b, i) : mm_load_f(b, i * nrhs + r);
+    int *ipiv = (int *)zap_buf((size_t)n * sizeof(int));
+    int ni = (int)n, nr = (int)nrhs, info = 0;
+    dgesv_(&ni, &nr, A, &ni, ipiv, X, &ni, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.solve: singular matrix");
+    ZapArray *res;
+    if (b_is_1d) {
+        res = (ZapArray *)zap_array_new(DTYPE_F64, n);
+        for (int64_t i = 0; i < n; i++)
+            arr_store_f(res, i, X[i]);
+    } else {
+        res = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, n * nrhs);
+        zap_array_set_dim(res, 0, n);
+        zap_array_set_dim(res, 1, nrhs);
+        for (int64_t i = 0; i < n; i++)
+            for (int64_t r = 0; r < nrhs; r++)
+                arr_store_f(res, i * nrhs + r, X[i + r * n]);
+    }
+    return res;
+}
+
+static void *zap_linalg_inv_impl(ZapArray *a, int64_t n) {
+    double *A = zap_linalg_colmajor(a, n);
+    int *ipiv = (int *)zap_buf((size_t)n * sizeof(int));
+    int ni = (int)n, info = 0;
+    dgetrf_(&ni, &ni, A, &ni, ipiv, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.inv: singular matrix");
+    int lwork = (int)(n * 64);
+    double *work = (double *)zap_buf((size_t)lwork * sizeof(double));
+    dgetri_(&ni, A, &ni, ipiv, work, &lwork, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.inv: singular matrix");
+    ZapArray *res = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, n * n);
+    zap_array_set_dim(res, 0, n);
+    zap_array_set_dim(res, 1, n);
+    for (int64_t i = 0; i < n; i++)
+        for (int64_t j = 0; j < n; j++)
+            arr_store_f(res, i * n + j, A[i + j * n]); /* col-major A^-1 -> row */
+    return res;
+}
+
+static double zap_linalg_det_impl(ZapArray *a, int64_t n) {
+    double *A = zap_linalg_colmajor(a, n);
+    int *ipiv = (int *)zap_buf((size_t)n * sizeof(int));
+    int ni = (int)n, info = 0;
+    dgetrf_(&ni, &ni, A, &ni, ipiv, &info);
+    if (info > 0)
+        return 0.0; /* singular -> exactly-0 determinant (NumPy returns 0.0) */
+    if (info < 0)
+        zap_linalg_err("linalg.det: invalid matrix");
+    double d = 1.0;
+    for (int64_t i = 0; i < n; i++) {
+        d *= A[i + i * n];
+        if (ipiv[i] != (int)(i + 1))
+            d = -d; /* each row swap flips the sign */
+    }
+    return d;
+}
 #endif
 
 /* Matrix multiply for the array-producing cases (not 1-D·1-D, which is `dot`):
@@ -4547,6 +4648,70 @@ void *zap_array_matmul(void *ap, void *bp, int64_t out_dtype) {
         }
     }
     return res;
+}
+
+/* Public `import linalg` entry points (#926, D-0183). ALWAYS compiled so a
+ * program that uses linalg links; the LAPACK impls above need a provider, so a
+ * build with none raises a catchable ValueError (the rare exotic host — normal
+ * builds ship a provider). Shape validation (square 2-D `a`, compatible `b`) is
+ * here, provider-independent. Results are f64. */
+static void zap_linalg_need_provider(void) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                    zap_str_new("linalg requires a BLAS/LAPACK provider "
+                                "(none linked in this build)",
+                                58));
+}
+static int64_t zap_linalg_square(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    if (a->ndim != 2 || a->dims[0] != a->dims[1])
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("linalg: expected a square 2-D matrix", 36));
+    return a->dims[0];
+}
+
+void *zap_linalg_solve(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    int64_t n = zap_linalg_square(a);
+    int b_is_1d = (b->ndim == 1);
+    if (b->ndim != 1 && b->ndim != 2)
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("linalg.solve: b must be 1-D or 2-D", 34));
+    if (b->dims[0] != n)
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("linalg.solve: a and b shapes are not aligned", 44));
+    int64_t nrhs = b_is_1d ? 1 : b->dims[1];
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_solve_impl(a, b, n, nrhs, b_is_1d);
+#else
+    (void)nrhs;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+
+void *zap_linalg_inv(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_inv_impl(a, n);
+#else
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+
+double zap_linalg_det(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_det_impl(a, n);
+#else
+    (void)n;
+    zap_linalg_need_provider();
+    return 0.0;
+#endif
 }
 
 /* --- element-wise comparison & mask combination (#510, D-0175) -----------

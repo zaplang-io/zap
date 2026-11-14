@@ -1463,6 +1463,13 @@ MAXPROCS). Integer products always use the exact own kernel; a large float
 product via BLAS matches the own kernel only within floating-point tolerance
 (BLAS reassociates), as NumPy's BLAS-backed `@` does.
 
+`import linalg` provides LAPACK-backed linear algebra over numeric arrays
+(#926): `linalg.solve(a, b)` (solve `a @ x == b`), `linalg.inv(a)`, and
+`linalg.det(a)`, matching `numpy.linalg`. `a` must be a square 2-D matrix;
+integer input promotes to `f64` and the result is `f64`; a singular matrix or a
+misaligned/non-square shape raises a catchable `ValueError`. (Eigensolvers,
+decompositions, `lstsq`, and `norm` are later increments.)
+
 Shape ops reshape the N-D view. `a.reshape(d0, d1, …)` takes positional dims
 (one may be `-1`, inferred) and is a view when the source is contiguous, else a
 copy; `a.transpose()` / `a.T` reverse all axes as a view (a stride permutation);

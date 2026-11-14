@@ -31,6 +31,7 @@ mod hex;
 mod http;
 mod io;
 mod json;
+mod linalg;
 mod logging;
 mod math;
 mod net;
@@ -82,6 +83,7 @@ pub(super) const MODULES: &[ModuleLower] = &[
     base64::MODULE,
     hex::MODULE,
     math::MODULE,
+    linalg::MODULE,
     random::MODULE,
     time::MODULE,
     datetime::MODULE,
