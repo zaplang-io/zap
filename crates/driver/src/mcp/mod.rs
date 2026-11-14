@@ -43,6 +43,34 @@ use std::process::ExitCode;
 
 use crate::json::{self, Json};
 
+/// Test-only: allocate a fresh, parallel-safe temp directory and return its
+/// path (the directory is created).
+///
+/// The name combines the process id with a process-global atomic counter, so
+/// every call yields a distinct path regardless of clock resolution — across
+/// threads within this process and across concurrent `cargo test` processes
+/// (which have distinct pids). This is the one sanctioned way for the MCP test
+/// modules to name a fixture dir.
+///
+/// Deliberately **does not** read `SystemTime`: two tests landing in the same
+/// nanosecond bucket produced identical names and stomped each other's
+/// fixtures under parallel runs — the flake behind issue #180. (The earlier
+/// #735 fix added pid + counter but left a redundant clock reading in the
+/// name; this removes it everywhere and routes all three modules through one
+/// helper so the mistake cannot reappear piecemeal.)
+#[cfg(test)]
+pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&base).unwrap();
+    base
+}
+
 /// The MCP protocol revision this server implements. Broadly supported by
 /// current clients; if a client requests a different one at `initialize`, we
 /// echo theirs back (the handshake is forward-compatible).
@@ -756,32 +784,78 @@ mod tests {
 
     /// A unique temp directory to act as a server root.
     ///
-    /// Unique per call: a process-wide atomic counter plus the pid, so parallel
-    /// tests never collide on a coarse-resolution clock (#735). Several tests in
-    /// this module write a conventions file into their root while two assert its
-    /// absence; two tests sharing a directory would leak one's `zap_mcp.md` into
-    /// the other's root and flake the absent-file assertions. Mirrors the same
-    /// fix already in `conventions.rs::tmpdir()`.
+    /// Several tests in this module write a conventions file into their root
+    /// while others assert its absence; two tests sharing a directory would
+    /// leak one's `zap_mcp.md` into the other's root and flake the absent-file
+    /// assertions. [`super::unique_temp_dir`] guarantees a distinct dir per
+    /// call regardless of timing (issue #180).
     fn tmproot() -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let base = std::env::temp_dir().join(format!(
-            "zap-mcp-conv-{}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        base
+        unique_temp_dir("zap-mcp-conv")
     }
 
     /// Drive one request line through a server rooted at `s`.
     fn call_on(s: &Server, line: &str) -> Json {
         let resp = s.handle_line(line).expect("expected a response");
         json::parse(&resp).expect("response must be valid JSON")
+    }
+
+    /// Regression guard for issue #180: fixture temp-dir names must be unique
+    /// regardless of timing. Many threads allocate in a tight loop behind a
+    /// barrier so they all start at the same instant — the exact condition
+    /// under which a `SystemTime`-nanosecond name used to collide and stomp a
+    /// sibling test's fixture. The atomic-counter mechanism in
+    /// [`unique_temp_dir`] makes every name distinct, so this passes
+    /// deterministically; a regression to clock-based naming fails it here
+    /// instead of flaking in unrelated MCP tests under parallel CI.
+    #[test]
+    fn fixture_temp_dirs_are_unique_under_parallel_allocation() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier, Mutex};
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 64;
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let seen: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // Release all threads simultaneously, maximising the chance
+                    // a time-based name would land in the same nanosecond.
+                    barrier.wait();
+                    (0..PER_THREAD)
+                        .map(|_| unique_temp_dir("zap-mcp-uniq"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let mut all = Vec::with_capacity(THREADS * PER_THREAD);
+        for h in handles {
+            let dirs = h.join().expect("allocation thread panicked");
+            let mut guard = seen.lock().unwrap();
+            for d in dirs {
+                assert!(
+                    guard.insert(d.clone()),
+                    "temp-dir name collided under parallel allocation: {}",
+                    d.display()
+                );
+                all.push(d);
+            }
+        }
+
+        assert_eq!(
+            all.len(),
+            THREADS * PER_THREAD,
+            "every allocation must yield a distinct path"
+        );
+        // Each path was a real, freshly created directory. Clean up after.
+        for d in &all {
+            assert!(d.is_dir(), "expected a created temp dir: {}", d.display());
+            std::fs::remove_dir_all(d).ok();
+        }
     }
 
     #[test]

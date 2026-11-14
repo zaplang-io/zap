@@ -469,15 +469,9 @@ mod tests {
     }
 
     fn tmpdir() -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "zap-graph-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        base
+        // Unique per call regardless of timing: a wall-clock name collided
+        // under parallel runs (issue #180). See [`super::super::unique_temp_dir`].
+        crate::mcp::unique_temp_dir("zap-graph")
     }
 
     #[test]
