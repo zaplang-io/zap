@@ -8897,3 +8897,37 @@ runtime/deployment correctness fix independent of arrays.
   deterministically) and an escape hatch for non-standard cgroup mounts.
 Relates to #172 (MAXPROCS / M:N scheduler), #914 (perf epic, Phase 0), #904
 (BLAS thread-pinning consumer).
+
+## D-0177 — Vectorized reduction kernels (multi-accumulator) (#911)
+**Status:** implemented
+Phase 1 of the array performance & acceleration epic (#914), the reduction half
+(sibling to #896, the broadcast element-wise half). A pure performance change:
+no surface syntax and no semantics change.
+- **Problem.** The reduction kernels (`sum`/`min`/`max`/`mean`/`prod`, whole-array
+  and `axis=`, #507/D-0170) ran a scalar accumulator loop with a single
+  dependency chain. These are memory-bandwidth-bound, so a one-accumulator loop
+  is both un-vectorized and latency-bound on the FMA/add chain, leaving ~4–8× on
+  the table (#909 calibration: we own these kernels, the ceiling is DRAM/L2
+  bandwidth, not register tiling — so this is NOT the gemm story).
+- **Decision.** Reduce with eight independent accumulator lanes plus a scalar
+  tail, so the chain is not latency-bound and the compiler packs the lanes into
+  SIMD at `-O2` (verified: the double-sum loop emits packed-double adds). This is
+  the FLOOR-kernel bar from #914 ruling 5 — simple, portable C in `zaprt.c`, no
+  intrinsics or target `#ifdef`s, tuning deferred.
+- **Numerics.** Integer sum/prod stay **bit-identical** at any size (two's-
+  complement add/mul is associative modulo 2^width); `min`/`max` are order-
+  independent for non-NaN data (float NaN handling stays unspecified, as before).
+  Floating-point whole-array (and last-axis) `sum`/`prod`/`mean` differ from the
+  strict left-to-right fold only by IEEE-754 reassociation — within tolerance and
+  the accepted cost of vectorizing a bandwidth-bound reduction. Accumulator
+  WIDTHS are unchanged from D-0170: whole-array integer sum widens to int64,
+  float reductions accumulate in double, while an `axis=` reduction keeps the
+  element width.
+- **Axis kernels.** `axis=` reduction with a contiguous last axis (`inner == 1`)
+  reuses the unrolled contiguous reducers; otherwise (`inner > 1`) the kernel
+  interchanges the reduced (`k`) and contiguous (`j`) loops so the innermost work
+  is a contiguous element-wise accumulate over the output row (vectorized), which
+  **preserves each cell's per-element accumulation order** — so every `axis=`
+  reduction is bit-identical for every dtype, floats included.
+Relates to #914 (perf epic, Phase 1), #507/D-0170 (the reduction surface), #896
+(sibling broadcast-kernel vectorization), #909 (bandwidth-bound calibration).

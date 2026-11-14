@@ -1434,7 +1434,11 @@ or — with `axis=k` — one axis, giving a rank-(n-1) array (on a rank-1 array
 integer product wraps per width); `mean` is a float (`f32` source → `f32`, else
 `f64`). Empty reductions are defined for `sum` (`0`), `prod` (`1`), and `mean`
 (`nan`); `min`/`max` on an empty array, and an out-of-range `axis`, raise a
-catchable `ValueError`.
+catchable `ValueError`. Reductions are vectorized (multiple accumulators, #911):
+a performance detail only — integer reductions are bit-identical at any size and
+every `axis=` reduction keeps its per-element accumulation order, while a
+floating-point whole-array (or last-axis) `sum`/`prod`/`mean` may differ from a
+strict left-to-right fold within IEEE-754 reassociation tolerance.
 
 Slices are **views** (per-axis strides): a stepped `a[::2]`, reversed `a[::-1]`,
 an N-D axis-0 window `m[lo:hi]` (rank-preserving), and a sliced axis inside a
