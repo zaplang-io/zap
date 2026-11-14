@@ -8769,11 +8769,13 @@ explicit programmer override for those who want control.
   is inexact past 2^53). The own kernel is the **jitter-safe default** — it runs
   on Zap's own Ms, respects `MAXPROCS` natively, and has no thread pool to
   misconfigure.
-- **BLAS is always pinned to Zap's CPU budget** (`openblas_set_num_threads(
-  MAXPROCS)`), never left at its default (which reads node cores). A
-  default-threaded BLAS under a k8s CFS quota measured p99 80 ms vs p50 2.3 ms
-  (a 35× tail) from CFS-throttle vs its spin barriers. This gates on #905
-  (making `MAXPROCS` container-aware).
+- **BLAS defaults to pinning at Zap's CPU budget** (`openblas_set_num_threads(
+  MAXPROCS)`) rather than its own default (which reads node cores), but the
+  thread count stays **overridable** — a programmer who knows better can set it.
+  The default matters because a default-threaded BLAS under a k8s CFS quota
+  measured p99 80 ms vs p50 2.3 ms (a 35× tail) from CFS-throttle vs its spin
+  barriers. The pinning default builds on #905 (container-aware `MAXPROCS`); for
+  now it is explicitly overridable, not forced.
 - **Programmer override:** a way to force own-kernel / force BLAS / set threads,
   for people who want control. Exact surface TBD in the RFC.
 Benchmarks (naive vs own-blocked vs BLAS × dtype × size, GFLOP/s, AWS c7i.xlarge

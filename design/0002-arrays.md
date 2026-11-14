@@ -314,10 +314,12 @@ model.
 
 - **Matmul performance** (#904, D-0173): the D-0172 kernel is a correct *scalar*
   triple loop. Policy locked: Zap auto-dispatches between an own blocked+SIMD
-  kernel and a BLAS hand-off (both linked), BLAS pinned to `MAXPROCS`; own kernel
-  the jitter-safe default; integers/`i64`>2^53/no-BLAS → own (exact). Benchmarks
-  (GFLOP/s, AWS c7i.xlarge 4-vCPU Sapphire Rapids) in #904; RFC = discussion #906;
-  gated on container-aware `MAXPROCS` (#905).
+  kernel and a BLAS hand-off (both linked); the BLAS path **defaults** to pinning
+  at `MAXPROCS` but stays **overridable** (a programmer can set BLAS threads
+  explicitly); own kernel the jitter-safe default; integers/`i64`>2^53/no-BLAS →
+  own (exact). Benchmarks (GFLOP/s, AWS c7i.xlarge 4-vCPU Sapphire Rapids) in
+  #904; RFC = discussion #906; the `MAXPROCS`-pinning default builds on
+  container-aware `MAXPROCS` (#905).
 - Inner-axis SIMD for the broadcast path; broadcasting in assignment /
   partial-index (whole-row) stores `m[i] = row` (#501 follow-up / #511).
 - Assigning *through* a sliced index — a strided-view store `m[:, j] = col` —

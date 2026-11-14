@@ -991,8 +991,8 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   (≥3-D) matmul is not yet supported. The #509 kernel is a correct *scalar*
   baseline; the performance direction — Zap auto-dispatches between an own
   blocked+SIMD kernel and a BLAS hand-off (both linked; "the language optimizes
-  for you"), with BLAS pinned to `MAXPROCS` — is locked in **D-0173** and tracked
-  by #904 (benchmarks) / discussion #906 (RFC).
+  for you"), with BLAS pinned to `MAXPROCS` by default (overridable) — is locked
+  in **D-0173** and tracked by #904 (benchmarks) / discussion #906 (RFC).
 
 - **Strided array views** (#502, D-0171, epic #499): stepped/reversed 1-D slices
   (`a[::2]`, `a[::-1]`), N-D axis-0 windows (`m[lo:hi]`, rank-preserving), and a
