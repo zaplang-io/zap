@@ -8061,10 +8061,132 @@ static void sched_gdone(void) {
 /* ---- scheduler init (lazy, on first spawn) -------------------------------- */
 static pthread_once_t g_sched_once = PTHREAD_ONCE_INIT;
 
+/* Container-aware CPU budget (#905, D-0176). Under a Kubernetes CFS CPU quota
+ * (`resources.limits.cpu`) the cgroup limits CPU *time*, not *which cores*, so
+ * `sysconf(_SC_NPROCESSORS_ONLN)` (and `nproc`, `/proc/cpuinfo`, even the
+ * affinity mask) all report the NODE's core count, not the pod's budget — a Zap
+ * service in a `cpu: 1000m` pod on a 16-core node would otherwise spin 16 worker
+ * Ms for a 1-core budget (and any BLAS hand-off would over-thread the same way).
+ * The effective budget is `min(online, affinity, ceil(cfs_quota/period))`.
+ * These readers are file-based (no `_GNU_SOURCE` / `sched_getaffinity`, so the
+ * portable / no-CPython and Windows builds still compile); a missing or
+ * unlimited source returns -1 (ignored in the min). */
+
+/* ceil(quota/period) as a CPU count, or -1 for unlimited / invalid. */
+static long zap_cpu_quota_ncpu(long quota, long period) {
+    if (quota <= 0 || period <= 0) {
+        return -1; /* v1 quota == -1 (and 'max' in v2) map here: unlimited */
+    }
+    long n = (quota + period - 1) / period;
+    return n < 1 ? 1 : n;
+}
+
+/* Parse a cgroup v2 `cpu.max` line ("<quota> <period>" or "max [period]") into
+ * a CPU count, or -1 if unlimited / unparseable. */
+static long zap_parse_cpu_max(const char *s) {
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    if (strncmp(s, "max", 3) == 0) {
+        return -1;
+    }
+    long q = 0, p = 0;
+    if (sscanf(s, "%ld %ld", &q, &p) != 2) {
+        return -1;
+    }
+    return zap_cpu_quota_ncpu(q, p);
+}
+
+/* First line of `path` into `buf`; 1 on success, 0 if unreadable. */
+static int zap_read_first_line(const char *path, char *buf, size_t n) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    char *r = fgets(buf, (int)n, f);
+    fclose(f);
+    return r != NULL;
+}
+
+/* The cgroup CPU quota as a CPU count, or -1 if unlimited / unknown. cgroup v2
+ * (`cpu.max`) then v1 (`cpu.cfs_quota_us` / `cpu.cfs_period_us`). `ZAP_CPU_MAX`
+ * overrides the v2 read (a v2-format string, e.g. "150000 100000" or "max") —
+ * a diagnostic / testing seam and an escape hatch for non-standard mounts. */
+static long zap_cgroup_ncpu(void) {
+    const char *env = getenv("ZAP_CPU_MAX");
+    if (env && *env) {
+        return zap_parse_cpu_max(env);
+    }
+#if defined(__linux__)
+    char buf[128];
+    if (zap_read_first_line("/sys/fs/cgroup/cpu.max", buf, sizeof buf)) {
+        return zap_parse_cpu_max(buf); /* cgroup v2 */
+    }
+    char qb[64], pb[64];
+    if (zap_read_first_line("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us", qb, sizeof qb) &&
+        zap_read_first_line("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us", pb, sizeof pb)) {
+        return zap_cpu_quota_ncpu(atol(qb), atol(pb)); /* cgroup v1 */
+    }
+#endif
+    return -1;
+}
+
+/* The CPU affinity count from `/proc/self/status` `Cpus_allowed_list`
+ * (a comma-separated list of single CPUs and `a-b` ranges, the cpuset case), or
+ * -1 if unavailable. File-based so it needs no `_GNU_SOURCE`. */
+static long zap_affinity_ncpu(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) {
+        return -1;
+    }
+    char line[512];
+    long count = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "Cpus_allowed_list:", 18) != 0) {
+            continue;
+        }
+        count = 0;
+        char *p = line + 18;
+        while (*p) {
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+            if (*p < '0' || *p > '9') {
+                p++;
+                continue;
+            }
+            long a = strtol(p, &p, 10);
+            long b = a;
+            if (*p == '-') {
+                p++;
+                b = strtol(p, &p, 10);
+            }
+            if (b >= a) {
+                count += (b - a + 1);
+            }
+            while (*p && *p != ',') {
+                p++;
+            }
+            if (*p == ',') {
+                p++;
+            }
+        }
+        break;
+    }
+    fclose(f);
+    return count;
+#else
+    return -1;
+#endif
+}
+
 /* The parallelism knob (ticket #172): env var `MAXPROCS` sets the number of
  * worker Ms (== Ps). Dropped the `ZAP_` prefix and the GOMAXPROCS-analogue
  * naming — it is simply `MAXPROCS`, our term. `zap_runtime_maxprocs()` exposes
- * the effective value to Zap. Default: the online hardware-thread count. */
+ * the effective value to Zap. Default: the online hardware-thread count, clamped
+ * DOWN to a cgroup CFS quota / cpuset affinity when present (container-aware,
+ * #905 / D-0176) so a Zap service does not over-thread under a k8s CPU limit. */
 static int zap_maxprocs(void) {
     const char *e = getenv("MAXPROCS");
     if (e) {
@@ -8076,17 +8198,28 @@ static int zap_maxprocs(void) {
 #if defined(ZAP_PLATFORM_WINDOWS)
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    long hw = (long)si.dwNumberOfProcessors;
+    long eff = (long)si.dwNumberOfProcessors;
 #else
-    long hw = sysconf(_SC_NPROCESSORS_ONLN);
+    long eff = sysconf(_SC_NPROCESSORS_ONLN);
+    if (eff < 1) {
+        eff = 1;
+    }
+    long quota = zap_cgroup_ncpu();
+    if (quota >= 1 && quota < eff) {
+        eff = quota;
+    }
+    long aff = zap_affinity_ncpu();
+    if (aff >= 1 && aff < eff) {
+        eff = aff;
+    }
 #endif
-    if (hw < 1) {
-        hw = 1;
+    if (eff < 1) {
+        eff = 1;
     }
-    if (hw > 256) {
-        hw = 256;
+    if (eff > 256) {
+        eff = 256;
     }
-    return (int)hw;
+    return (int)eff;
 }
 
 /* ===========================================================================

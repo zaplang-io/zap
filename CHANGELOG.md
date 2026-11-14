@@ -1257,6 +1257,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Fixed
 
+- **`MAXPROCS` is now container-aware** (#905, D-0176). When `MAXPROCS` is unset,
+  the default worker-M count clamps the online-core count DOWN to the cgroup CFS
+  CPU quota (`min(online, affinity, ceil(cfs_quota/period))`), so a Zap service
+  under a Kubernetes `resources.limits.cpu` quota no longer over-threads its
+  scheduler to the node's core count (the cause of GC-coordination overhead and
+  CFS-throttle latency spikes). Readers are file-based (cgroup v2 `cpu.max`, v1
+  `cpu.cfs_quota_us`/`cpu.cfs_period_us`, affinity via `/proc/self/status`), so
+  the portable and Windows builds are unaffected. An explicit `MAXPROCS=` still
+  overrides. New `ZAP_CPU_MAX` diagnostic/testing seam overrides the detected
+  cgroup-v2 quota. Foundation (Phase 0) of the performance & acceleration epic
+  #914 — the single CPU budget a future BLAS hand-off is pinned to.
+
 - **gc-boehm: a coroutine preempted inside `gc.collect()` (or another libgc call)
   deadlocked the program** (#888, D-0162). The async-preemption handler may switch a
   coroutine away at any instruction unless it is in a no-preempt window. Allocation
