@@ -9004,3 +9004,33 @@ language optimizes for you," with a programmer override.
 Relates to #914 (perf epic, Phase 2), #904 (matmul dispatch — sharpens D-0173),
 #905 (container-aware MAXPROCS), #853 (the per-program backend-link pattern),
 #512 (LAPACK consumer), discussions #906/#909.
+
+## D-0180 — Own blocked+SIMD matmul floor kernel (#913)
+**Status:** implemented
+Phase 2 of the array performance & acceleration epic (#914): the own-kernel
+FLOOR for matrix multiply (`@` / `dot`, #509/D-0172) that the dispatch (#904)
+selects for small / integer / `i64`>2^53 / no-BLAS cases. A pure performance
+change; no surface or semantics change.
+- **Problem.** The D-0172 kernel was a scalar triple loop that read every
+  element through `mm_load_*` (a per-element dtype switch) and walked B down a
+  column (stride `n`) — so it neither vectorized nor used cache, far below even a
+  simple SIMD floor.
+- **Decision.** Materialize A (m×kk) and B (kk×n) into contiguous
+  accumulator-typed buffers once, then run the cache-friendly **`ikj`** order:
+  the innermost loop is a contiguous SAXPY over a result row (`C[i,j] += a *
+  B[t,j]`), which the compiler vectorizes at `-O2`. Accumulator is `double`
+  (float out) / `int64_t` (integer out), as D-0172. This is the FLOOR per the
+  #914 ruling — **simple blocked+SIMD, tuning deferred** (#909: a single-thread
+  BLAS microkernel is ~7× from register tiling/packing, so the floor deliberately
+  does NOT chase it; register/cache tiling and the BLAS hand-off are the ceiling,
+  dispatched at #904).
+- **Numerics.** `ikj` preserves each output cell's increasing-`t` contraction
+  order, so products are **BIT-IDENTICAL** to the scalar kernel for every dtype
+  and shape — integers exact, floats with no reassociation (no tolerance needed,
+  unlike the #911 reductions). Runtime C, host-verifiable (`zap_matmul_f` /
+  `zap_matmul_i` in `zaprt.c`); the `zap_array_matmul` entry point is unchanged,
+  so no codegen/lowering change. 1-D·1-D `dot` keeps its scalar accumulator
+  (tiny, order-preserving); only the matrix path changed.
+Relates to #914 (perf epic, Phase 2), #509/D-0172 (matmul surface), #904
+(auto-dispatch — the consumer, sharpens D-0173), #912/D-0179 (the accel seam),
+#909 (own-floor-vs-BLAS calibration).

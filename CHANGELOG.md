@@ -1119,6 +1119,16 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **The matrix-multiply floor kernel is vectorized (blocked + SIMD)** (#913,
+  D-0180). `@` / `dot` (#509/D-0172) ran a scalar triple loop that read each
+  element through a per-element dtype switch and walked B down a column; it now
+  materializes the operands into contiguous accumulator-typed buffers and runs
+  the cache-friendly `ikj` order whose innermost loop is a vectorized contiguous
+  SAXPY. This is the own-kernel FLOOR for the array performance epic (#914) — the
+  kernel the matmul dispatch (#904) picks for small / integer / no-BLAS cases;
+  simple and portable, tuning deferred (#909). Results are bit-identical to the
+  scalar kernel for every dtype and shape (per-cell contraction order preserved;
+  no fp reassociation).
 - **The broadcast element-wise kernel is vectorized** (#896, D-0178). Element-wise
   `+`/`-`/`*`/`/` on arrays of unequal-but-compatible shapes (`m + row`, `m + col`,
   outer products, N-D, mixed dtype) ran a per-element scalar loop that decoded each

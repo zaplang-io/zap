@@ -393,6 +393,21 @@ Phase 2 (infrastructure; the matmul dispatch that uses it is #904).
   opts out; no provider ⇒ `fast` degrades to `native`. **Dormant until #904**
   wires the first caller, so no program links or runs BLAS yet.
 
+**Increment 17 (shipped, #913 / D-0180):** own blocked+SIMD matmul floor kernel —
+epic #914 Phase 2 (the FLOOR the dispatch #904 picks for small / integer /
+no-BLAS cases).
+
+- `@` / `dot` (#509/D-0172) was a scalar triple loop reading each element through
+  a per-element dtype switch and walking B down a column (stride `n`). It now
+  materializes A/B into contiguous accumulator-typed buffers once and runs the
+  cache-friendly `ikj` order whose inner loop is a vectorized contiguous SAXPY
+  (`zap_matmul_f` / `zap_matmul_i` in `zaprt.c`; the `zap_array_matmul` entry
+  point and lowering are unchanged).
+- Simple and portable, **tuning deferred** (#909: the floor deliberately does not
+  chase BLAS's register-tiled microkernel). Bit-identical to the scalar kernel
+  for every dtype and shape — each output cell keeps its contraction order, so no
+  fp reassociation. 1-D·1-D `dot` keeps its scalar accumulator.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Integer-array (non-mask) bitwise element-wise ops (`&`/`|`/`^`/`~` on numeric
