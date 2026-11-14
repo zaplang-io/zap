@@ -46,6 +46,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libedit-dev \
         libxml2-dev \
         libncurses-dev \
+        libopenblas-dev \
+        liblapacke-dev \
         mold \
     && rm -rf /var/lib/apt/lists/*
 
@@ -92,6 +94,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   * libssl-dev         — `-lssl -lcrypto` + openssl headers (tls/https, #147).
 #   * python3-dev        — libpython + <Python.h> for CPython embedding (#27).
 #   * pkg-config         — how the compiler discovers the libpython flags.
+#   * libopenblas-dev /  — the numeric acceleration provider (cblas + LAPACK/
+#     liblapacke-dev       LAPACKE) the array perf epic links against when built
+#                          with it (#912/#914); detection is best-effort, so a
+#                          program links it only when present.
 # The remaining libs (libffi/libedit/libxml2/libtinfo/libzstd) come in as deps
 # of the above and back the statically-linked LLVM inside `zap`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -105,6 +111,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         python3-dev \
         pkg-config \
+        libopenblas-dev \
+        liblapacke-dev \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/clang-18 /usr/local/bin/cc \
     && ln -s /usr/bin/clang-18 /usr/local/bin/clang

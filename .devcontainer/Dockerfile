@@ -35,6 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libedit-dev \
         libxml2-dev \
         libncurses-dev \
+        libopenblas-dev \
+        liblapacke-dev \
         mold \
         sccache \
     && rm -rf /var/lib/apt/lists/*

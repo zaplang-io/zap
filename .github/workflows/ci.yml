@@ -368,6 +368,8 @@ jobs:
             libedit-dev \
             libxml2-dev \
             libncurses-dev \
+            libopenblas-dev \
+            liblapacke-dev \
             mold
 
       - name: Install pinned Rust toolchain

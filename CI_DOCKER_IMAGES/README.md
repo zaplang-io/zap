@@ -22,6 +22,7 @@ mirror fetch on the critical path.
 | **LLVM 18** | `llvm-18`, `llvm-18-dev`, `libpolly-18-dev`, `clang-18`, `lld-18`, `libclang-18-dev` — LLVM **18.1.3** (the 18.1 series Ubuntu 24.04 LTS ships). `LLVM_SYS_180_PREFIX` / `LLVM_SYS_181_PREFIX` are set to `/usr/lib/llvm-18` in the image env. |
 | **Rust** | `1.99.1` (pinned to `rust-toolchain.toml`) with `clippy` + `rustfmt`. |
 | **C deps (dev + runtime)** | OpenSSL (`libssl-dev`), PCRE2 (`libpcre2-dev`), zlib (`zlib1g-dev`), libstdc++ (via `build-essential`), plus `libgc-dev`, `python3-dev`, `libzstd-dev`, `libffi-dev`, `libedit-dev`, `libxml2-dev`, `libncurses-dev`, `pkg-config`. |
+| **Numeric accelerator** | OpenBLAS + LAPACK/LAPACKE (`libopenblas-dev`, `liblapacke-dev`) — the array perf epic's cblas/lapacke provider on Linux (#912/#914; Apple Accelerate on macOS). Lets the accelerator path build and link in CI. |
 | **Linkers / build perf** | `mold` (Rust's own link step, `-fuse-ld=mold`), `lld-18`, `sccache`. |
 | **Tooling** | `git`, **Node 20 LTS** (folds in #296), `curl`, `ca-certificates`. |
 
