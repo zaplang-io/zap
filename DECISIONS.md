@@ -8749,3 +8749,35 @@ realizes the grammar-parity decision D21 (PEP 465 `@`), superseding #613.
   change.
 No new grammar beyond `@` / `@=` at `term` / `aug_op`. See `docs/GRAMMAR.ebnf`,
 `design/0002-arrays.md`, SPEC §15.
+
+## D-0173 — Array matmul: automatic kernel dispatch (own-blocked vs BLAS) (#904)
+**Status:** Locked (policy) — implementation tracked by #904
+The matmul/`dot` kernel from D-0172 is a correct **scalar** baseline; this locks
+how Zap gets it **fast**. The guiding principle: **the language optimizes for
+you** — `a @ b` picks the fastest available kernel automatically, with an
+explicit programmer override for those who want control.
+- **Default = automatic dispatch** on `(dtype, shape, effective-CPU budget)`. No
+  flags, no tuning, for the common path.
+- **Both kernels linked by default.** The binary ships *both* an own blocked +
+  SIMD kernel and a BLAS hand-off; the runtime chooses. The binary-size cost of
+  linking both is explicitly accepted here (a deliberate exception to Zap's
+  usual lean-binary stance, because matmul performance is a headline "NumPy
+  refugees" differentiator).
+- **Dispatch policy:** tiny `n` → own unrolled kernel (BLAS call overhead not
+  worth it); large float/complex → BLAS; integer (exact) / `i64` beyond 2^53 /
+  a build without BLAS → own kernel (BLAS routes integers through `f64`, which
+  is inexact past 2^53). The own kernel is the **jitter-safe default** — it runs
+  on Zap's own Ms, respects `MAXPROCS` natively, and has no thread pool to
+  misconfigure.
+- **BLAS is always pinned to Zap's CPU budget** (`openblas_set_num_threads(
+  MAXPROCS)`), never left at its default (which reads node cores). A
+  default-threaded BLAS under a k8s CFS quota measured p99 80 ms vs p50 2.3 ms
+  (a 35× tail) from CFS-throttle vs its spin barriers. This gates on #905
+  (making `MAXPROCS` container-aware).
+- **Programmer override:** a way to force own-kernel / force BLAS / set threads,
+  for people who want control. Exact surface TBD in the RFC.
+Benchmarks (naive vs own-blocked vs BLAS × dtype × size, GFLOP/s, AWS c7i.xlarge
+4-vCPU Sapphire Rapids/AVX-512) and the full rationale are in #904; the RFC for
+the dispatch thresholds / BLAS-dependency / override surface is
+[discussion #906](https://github.com/zaplang-io/zap/discussions/906). Part of
+epic #499; relates to #905, D-0172.

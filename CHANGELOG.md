@@ -988,7 +988,11 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   follows NEP-50; a shape mismatch raises `ValueError`. `@` desugars to the
   `__matmul__` / `__imatmul__` operator dunders (D-0047), so a user struct can
   define it too; it is a type error on non-array scalars/`list`/`dict`. Batched
-  (≥3-D) matmul is not yet supported.
+  (≥3-D) matmul is not yet supported. The #509 kernel is a correct *scalar*
+  baseline; the performance direction — Zap auto-dispatches between an own
+  blocked+SIMD kernel and a BLAS hand-off (both linked; "the language optimizes
+  for you"), with BLAS pinned to `MAXPROCS` — is locked in **D-0173** and tracked
+  by #904 (benchmarks) / discussion #906 (RFC).
 
 - **Strided array views** (#502, D-0171, epic #499): stepped/reversed 1-D slices
   (`a[::2]`, `a[::-1]`), N-D axis-0 windows (`m[lo:hi]`, rank-preserving), and a
