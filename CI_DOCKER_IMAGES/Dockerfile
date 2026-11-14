@@ -48,6 +48,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   * mold    — the faster/leaner linker used for Rust's own link step (#128),
 #               driven via -fuse-ld=mold in CI's RUSTFLAGS.
 #   * sccache — the shared compiler cache (RUSTC_WRAPPER) the dev container uses.
+#   * libopenblas-dev / liblapacke-dev — the numeric acceleration provider
+#               (cblas + LAPACK/LAPACKE) the array perf epic links against on
+#               Linux (#912/#914; Apple Accelerate is the macOS equivalent).
+#               Build-time detection is best-effort, so this is what lets the
+#               accelerator path actually build and link in CI.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -71,6 +76,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libedit-dev \
         libxml2-dev \
         libncurses-dev \
+        libopenblas-dev \
+        liblapacke-dev \
         mold \
         sccache \
     && rm -rf /var/lib/apt/lists/* \
