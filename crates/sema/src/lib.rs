@@ -465,6 +465,8 @@ const BUILTINS: &[&str] = &[
     "len",
     "sum",
     "dot",
+    "concatenate",
+    "stack",
     "sorted",
     // String / char builtins (ticket #284, D-0025).
     "ord",
@@ -6125,6 +6127,14 @@ impl Checker {
                     }
                     return Ty::Unknown;
                 }
+                "concatenate" | "stack" => {
+                    // Shape ops over a list of arrays (#511); typed loosely, the
+                    // lowering derives the real rank from the list element type.
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
                 // `sorted(xs, key=..., reverse=...)` -> a new list of the same
                 // element type, leaving `xs` unchanged (ticket #336). The element
                 // type is carried through so the result can be indexed/iterated
@@ -11273,6 +11283,7 @@ def main():
         ok(include_str!("../../../tests/golden/array_reductions.zap"));
         ok(include_str!("../../../tests/golden/array_strided.zap"));
         ok(include_str!("../../../tests/golden/array_matmul.zap"));
+        ok(include_str!("../../../tests/golden/array_shape_ops.zap"));
     }
 
     // --- decorators & annotations (ticket #16, D-0036) ---

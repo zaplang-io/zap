@@ -71,7 +71,8 @@ Once the IR schema and runtime ABI are frozen, these run concurrently:
   scalar-on-left (#506, `D-0169`, done), axis reductions + min/max/mean/prod
   (#507, `D-0170`, done), strided N-D slice views (#502, `D-0171`, done), matrix
   multiply `@`/`dot` (#509, `D-0172`, done; perf auto-dispatch own-vs-BLAS
-  designed, #904/`D-0173`), then fancy indexing, shape ops (epic #499). `D-0011`.
+  designed, #904/`D-0173`), shape ops reshape/transpose/flatten/concatenate/stack
+  (#511, `D-0174`, done), then fancy/mask indexing (#510) (epic #499). `D-0011`.
 - **Concurrency track** — coroutines + channels (unbuffered/buffered, `close`,
   `select`), sync primitives, structured concurrency, DRF-SC memory model.
   `D-0008`, `D-0031`–`D-0034`.

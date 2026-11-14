@@ -221,5 +221,6 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | ARR-8 | §15 | numeric array: reductions sum/min/max/mean/prod as methods, optional axis= -> rank-(n-1) array (dtype preserved, mean float; empty sum/prod/mean = 0/1/nan, empty min/max + bad axis raise ValueError) (#507, D-0170) | covered | array_reductions_contract |
 | ARR-9 | §15 | numeric array: strided slice views — a[::2]/a[::-1] (1-D stepped/reversed), m[lo:hi] (N-D axis-0, rank-preserving), m[:, j] (sliced axis in a multi-axis index); all alias the parent, arithmetic over a strided operand compacts first (#502, D-0171) | covered | array_strided_contract |
 | ARR-10 | §15 | numeric array: matrix multiply `@` / `dot` on 1-D/2-D (1-D·1-D scalar dot, 2-D·2-D matrix, mixed 1-D/2-D vector; `@=` in-place; NEP-50 dtype; shape mismatch -> ValueError) (#509, D-0172, PEP 465) | covered | array_matmul_contract |
+| ARR-11 | §15 | numeric array: shape ops — reshape/transpose/`.T` (views), flatten (copy), concatenate/stack (copies, optional axis=); size/shape/axis fault -> catchable ValueError (#511, D-0174) | covered | array_shape_ops_contract |
 | DEC-1 | §16 | `@derive(...)` generates field-by-field code at compile time (D-0036) | TODO | — |
 | DEC-2 | §16 | multiple decorators stack bottom-up | TODO | — |

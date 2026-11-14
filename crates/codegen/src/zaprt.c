@@ -4248,6 +4248,210 @@ void *zap_array_matmul(void *ap, void *bp, int64_t out_dtype) {
     return res;
 }
 
+/* --- shape ops (#511, D-0174) --------------------------------------------
+ * reshape / transpose / flatten / concatenate / stack over the N-D shape model.
+ * transpose is a pure stride view; reshape is a view (contiguous source) or a
+ * compacted copy; flatten/concatenate/stack produce fresh contiguous copies.
+ * All error paths raise a catchable ValueError. */
+static void zap_shape_err(const char *m) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+}
+
+/* `a.transpose()` / `a.T` (#511): reverse all axes. A view — the dims and
+ * (effective) strides are reversed, so a contiguous source becomes a strided
+ * view; a 1-D array transposes to itself (stays contiguous). */
+void *zap_array_transpose(void *ap) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t nd = a->ndim;
+    ZapArray *v = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t *dims = (int64_t *)zap_buf((size_t)nd * sizeof(int64_t));
+    for (int64_t k = 0; k < nd; k++) {
+        dims[k] = a->dims[nd - 1 - k];
+    }
+    int64_t *strides = NULL;
+    if (nd >= 2) {
+        strides = (int64_t *)zap_buf((size_t)nd * sizeof(int64_t));
+        for (int64_t k = 0; k < nd; k++) {
+            strides[k] = zap_array_stride_of(a, nd - 1 - k);
+        }
+    }
+    v->dtype = a->dtype;
+    v->ndim = nd;
+    v->dims = dims;
+    v->strides = strides; /* NULL for 1-D (still contiguous) */
+    v->data = a->data;
+    v->off = a->off;
+    return v;
+}
+
+/* `a.flatten()` (#511): a fresh contiguous 1-D COPY (row-major). */
+void *zap_array_flatten(void *ap) {
+    ZapArray *c = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_array_count_of(c);
+    size_t esz = zap_array_elem_size(c->dtype);
+    ZapArray *r = (ZapArray *)zap_array_new(c->dtype, n);
+    if (n > 0) {
+        memcpy(r->data, (const char *)c->data + (size_t)c->off * esz,
+               (size_t)n * esz);
+    }
+    return r;
+}
+
+/* A small atomic i64 buffer the lowering fills with reshape's target dims (one
+ * `-1` allowed). Atomic (no GC pointers). */
+void *zap_i64buf(int64_t n) {
+    return zap_buf((size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+}
+void zap_i64set(void *b, int64_t i, int64_t v) { ((int64_t *)b)[i] = v; }
+
+/* `a.reshape(dims...)` (#511): a view sharing the (compacted) buffer with new
+ * dims. One dim may be -1 (inferred). Total must match the element count. */
+void *zap_array_reshape(void *ap, int64_t ndim, int64_t *dims) {
+    ZapArray *c = (ZapArray *)zap_array_contig(ap);
+    int64_t count = zap_array_count_of(c);
+    int64_t prod = 1, neg = -1;
+    for (int64_t k = 0; k < ndim; k++) {
+        if (dims[k] < 0) {
+            if (neg >= 0) {
+                zap_shape_err("reshape: only one dimension can be -1");
+            }
+            neg = k;
+        } else {
+            prod *= dims[k];
+        }
+    }
+    int64_t *out = (int64_t *)zap_buf((size_t)(ndim > 0 ? ndim : 1) * sizeof(int64_t));
+    for (int64_t k = 0; k < ndim; k++) {
+        out[k] = dims[k];
+    }
+    if (neg >= 0) {
+        if (prod == 0 || count % prod != 0) {
+            zap_shape_err("reshape: cannot infer the -1 dimension");
+        }
+        out[neg] = count / prod;
+        prod *= out[neg];
+    }
+    if (prod != count) {
+        zap_shape_err("reshape: total size must be unchanged");
+    }
+    ZapArray *v = (ZapArray *)zap_obj(&zap_desc_array);
+    v->dtype = c->dtype;
+    v->ndim = ndim;
+    v->dims = out;
+    v->strides = NULL; /* c is contiguous, so the reshaped view is too */
+    v->data = c->data;
+    v->off = c->off;
+    return v;
+}
+
+/* `concatenate([a, b, ...], axis)` (#511): join same-rank, same-dtype arrays
+ * along `axis` (all other dims must match). A fresh contiguous copy. */
+void *zap_array_concat(void *listp, int64_t axis) {
+    ZapList *L = (ZapList *)listp;
+    int64_t n = L->len;
+    if (n < 1) {
+        zap_shape_err("concatenate needs at least one array");
+    }
+    ZapArray *first = (ZapArray *)(uintptr_t)L->data[0];
+    int64_t nd = first->ndim, dt = first->dtype;
+    if (axis < 0) {
+        axis += nd;
+    }
+    if (axis < 0 || axis >= nd) {
+        zap_shape_err("concatenate: axis out of range");
+    }
+    int64_t axis_total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ZapArray *x = (ZapArray *)(uintptr_t)L->data[i];
+        if (x->ndim != nd || x->dtype != dt) {
+            zap_shape_err("concatenate: all arrays need the same rank and dtype");
+        }
+        for (int64_t k = 0; k < nd; k++) {
+            if (k != axis && x->dims[k] != first->dims[k]) {
+                zap_shape_err("concatenate: dims must match except on the join axis");
+            }
+        }
+        axis_total += x->dims[axis];
+    }
+    int64_t outer = 1, inner = 1;
+    for (int64_t k = 0; k < axis; k++) {
+        outer *= first->dims[k];
+    }
+    for (int64_t k = axis + 1; k < nd; k++) {
+        inner *= first->dims[k];
+    }
+    ZapArray *r = (ZapArray *)zap_array_new_nd(dt, nd, outer * axis_total * inner);
+    for (int64_t k = 0; k < nd; k++) {
+        zap_array_set_dim(r, k, k == axis ? axis_total : first->dims[k]);
+    }
+    size_t esz = zap_array_elem_size(dt);
+    char *rd = (char *)r->data;
+    int64_t run = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ZapArray *xi = (ZapArray *)zap_array_contig((void *)(uintptr_t)L->data[i]);
+        int64_t ax = xi->dims[axis];
+        const char *xd = (const char *)xi->data + (size_t)xi->off * esz;
+        for (int64_t o = 0; o < outer; o++) {
+            memcpy(rd + (size_t)((o * axis_total + run) * inner) * esz,
+                   xd + (size_t)(o * ax * inner) * esz, (size_t)(ax * inner) * esz);
+        }
+        run += ax;
+    }
+    return r;
+}
+
+/* `stack([a, b, ...], axis)` (#511): join same-shape arrays along a NEW axis
+ * (result rank = input rank + 1). A fresh contiguous copy. */
+void *zap_array_stack(void *listp, int64_t axis) {
+    ZapList *L = (ZapList *)listp;
+    int64_t n = L->len;
+    if (n < 1) {
+        zap_shape_err("stack needs at least one array");
+    }
+    ZapArray *first = (ZapArray *)(uintptr_t)L->data[0];
+    int64_t nd = first->ndim, dt = first->dtype, rnd = nd + 1;
+    if (axis < 0) {
+        axis += rnd;
+    }
+    if (axis < 0 || axis >= rnd) {
+        zap_shape_err("stack: axis out of range");
+    }
+    for (int64_t i = 0; i < n; i++) {
+        ZapArray *x = (ZapArray *)(uintptr_t)L->data[i];
+        if (x->ndim != nd || x->dtype != dt) {
+            zap_shape_err("stack: all arrays need the same rank and dtype");
+        }
+        for (int64_t k = 0; k < nd; k++) {
+            if (x->dims[k] != first->dims[k]) {
+                zap_shape_err("stack: all arrays need the same shape");
+            }
+        }
+    }
+    int64_t count = zap_array_count_of(first);
+    ZapArray *r = (ZapArray *)zap_array_new_nd(dt, rnd, n * count);
+    for (int64_t k = 0; k < rnd; k++) {
+        zap_array_set_dim(r, k, k == axis ? n : first->dims[k < axis ? k : k - 1]);
+    }
+    int64_t outer = 1, inner = 1;
+    for (int64_t k = 0; k < axis; k++) {
+        outer *= first->dims[k];
+    }
+    for (int64_t k = axis; k < nd; k++) {
+        inner *= first->dims[k];
+    }
+    size_t esz = zap_array_elem_size(dt);
+    char *rd = (char *)r->data;
+    for (int64_t i = 0; i < n; i++) {
+        ZapArray *xi = (ZapArray *)zap_array_contig((void *)(uintptr_t)L->data[i]);
+        const char *xd = (const char *)xi->data + (size_t)xi->off * esz;
+        for (int64_t o = 0; o < outer; o++) {
+            memcpy(rd + (size_t)((o * n + i) * inner) * esz,
+                   xd + (size_t)(o * inner) * esz, (size_t)inner * esz);
+        }
+    }
+    return r;
+}
+
 /* zeros/ones/full: fill an already-allocated array with a constant. `_i` takes
  * the value as an int64 word (integer/bool dtypes), `_f` as a double (floats);
  * the lowering picks the variant by the dtype's ABI word. */

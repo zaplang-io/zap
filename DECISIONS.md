@@ -8783,3 +8783,37 @@ Benchmarks (naive vs own-blocked vs BLAS × dtype × size, GFLOP/s, AWS c7i.xlar
 the dispatch thresholds / BLAS-dependency / override surface is
 [discussion #906](https://github.com/zaplang-io/zap/discussions/906). Part of
 epic #499; relates to #905, D-0172.
+
+## D-0174 — Array shape ops: reshape / transpose / flatten / concatenate / stack (#511)
+**Status:** Locked (design) / implemented
+Tenth increment of the arrays epic (#499): the NumPy shape surface over the N-D
+stride model (D-0171).
+- **Surface (maintainer call).** The unary ops are **methods** — `a.reshape(...)`,
+  `a.transpose()`, `a.flatten()` — plus the **`a.T` attribute** (alias of
+  `a.transpose()`), matching the reductions-as-methods choice (D-0170). The
+  n-ary ops are **builtins** over a list of arrays — `concatenate([...], axis=)`,
+  `stack([...], axis=)` — matching `sum`/`dot`.
+- **reshape(d0, d1, …)** — positional integer dims (static rank = argument
+  count); one dim may be the literal `-1` (inferred at runtime). A **view** when
+  the source is contiguous (shares the buffer), else a compacted copy; a
+  total-size mismatch raises a catchable `ValueError`.
+- **transpose() / .T** — reverse all axes; a **view** (a stride permutation, so a
+  contiguous source becomes a strided view; 1-D is identity). A permutation
+  argument (`transpose(perm)`) is a follow-up.
+- **flatten()** — a fresh contiguous 1-D **copy** (row-major). `ravel` (a
+  view-when-possible) is a follow-up.
+- **concatenate([a, …], axis=0)** — join same-rank, same-dtype arrays along an
+  existing axis (all other dims must match); result rank = input rank. **stack([a,
+  …], axis=0)** — join same-shape arrays along a **new** axis; result rank = input
+  rank + 1. Both are fresh contiguous copies; a shape/dtype/axis fault raises a
+  catchable `ValueError`.
+- **Implementation.** transpose is pure metadata (reverse dims + effective
+  strides); reshape/flatten/concat/stack reuse #502's `zap_array_contig` to work
+  on dense buffers, then copy (concat/stack use an outer×axis×inner block
+  memcpy). A `list[array[T]]` erases the element dtype/rank in the collection
+  ABI, so `concatenate`/`stack` require a **list literal** and read rank/dtype
+  from the first element (each element lowered once into a fresh pointer list).
+  No new grammar — the methods, `.T`, and the two builtins ride existing
+  surfaces. No array-header ABI change.
+See `design/0002-arrays.md`, SPEC §15. Part of epic #499; relates to D-0171,
+D-0170.
