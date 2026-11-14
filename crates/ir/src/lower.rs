@@ -11694,8 +11694,8 @@ impl<'a> FnLower<'a> {
                     }
                 }
                 let (bv, bty) = self.expr(base)?;
-                if let Ty::Array(_, ndim) = bty {
-                    return self.lower_array_attr(bv, ndim, name);
+                if let Ty::Array(d, ndim) = bty {
+                    return self.lower_array_attr(bv, d, ndim, name);
                 }
                 // Attribute read on a Python handle, e.g. `np.pi` (ticket #27,
                 // D-0012). A call `np.foo(...)` is intercepted in `call` before
@@ -12075,6 +12075,13 @@ impl<'a> FnLower<'a> {
                     return Err(err("dot() requires array arguments"));
                 }
                 return self.lower_array_matmul(lv, lt, rv, rt);
+            }
+            // `concatenate([a, b, ...], axis=0)` / `stack([a, b, ...], axis=0)`
+            // (#511): join a list of arrays. concatenate keeps the rank; stack
+            // adds a new axis (rank+1). A shape/dtype mismatch or bad axis raises
+            // a catchable ValueError at runtime.
+            if fname == "concatenate" || fname == "stack" {
+                return self.lower_array_join(fname, args);
             }
             // `sorted(xs, key=..., reverse=...)` — a new sorted list, leaving the
             // input untouched (ticket #336). The list is positional; `key` /
@@ -15176,11 +15183,24 @@ impl<'a> FnLower<'a> {
     fn lower_array_attr(
         &mut self,
         arr: Value,
+        d: Dtype,
         ndim: u8,
         name: &str,
     ) -> Result<(Value, Ty), LowerError> {
         match name {
             "ndim" => Ok((self.iconst(Ty::I64, ndim as i64), Ty::I64)),
+            // `a.T` (#511): the full-axis-reverse transpose, a view (same as
+            // `a.transpose()`).
+            "T" => {
+                let out = Ty::Array(d, ndim);
+                let dest = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_array_transpose".to_string(),
+                    args: vec![arr],
+                });
+                Ok((dest, out))
+            }
             "size" => {
                 let dest = self.new_value(Ty::I64);
                 self.emit(Inst::Call {
@@ -15217,7 +15237,7 @@ impl<'a> FnLower<'a> {
             }
             other => Err(err(format!(
                 "array attribute '{other}' is unsupported; arrays expose '.shape', \
-                 '.ndim', '.size', and len(a) for the first axis"
+                 '.ndim', '.size', '.T' (transpose), and len(a) for the first axis"
             ))),
         }
     }
@@ -20206,6 +20226,40 @@ impl<'a> FnLower<'a> {
         name: &str,
         args: &[ast::Arg],
     ) -> Result<(Value, Ty), LowerError> {
+        // Shape ops (#511): reshape / transpose / flatten are not reductions.
+        match name {
+            "reshape" => return self.lower_array_reshape(recv, d, ndim, args),
+            "transpose" => {
+                if !args.is_empty() {
+                    return Err(err(
+                        "transpose() takes no arguments yet (a permutation argument is a follow-up)",
+                    ));
+                }
+                // Reverse all axes; a view (metadata only), rank preserved.
+                let out = Ty::Array(d, ndim);
+                let dest = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_array_transpose".to_string(),
+                    args: vec![recv],
+                });
+                return Ok((dest, out));
+            }
+            "flatten" => {
+                if !args.is_empty() {
+                    return Err(err("flatten() takes no arguments"));
+                }
+                let out = Ty::Array(d, 1); // always rank-1 copy
+                let dest = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_array_flatten".to_string(),
+                    args: vec![recv],
+                });
+                return Ok((dest, out));
+            }
+            _ => {}
+        }
         // op code shared with the runtime axis kernel: 0=sum,1=min,2=max,3=prod.
         let op_code = match name {
             "sum" => 0i64,
@@ -20215,8 +20269,9 @@ impl<'a> FnLower<'a> {
             "mean" => 4, // mean has its own entry points (float result)
             other => {
                 return Err(err(format!(
-                    "'{other}' is not an array method; array reductions are \
-                     sum/min/max/mean/prod (each with an optional axis=)"
+                    "'{other}' is not an array method; the array methods are \
+                     reductions sum/min/max/mean/prod (optional axis=) and shape \
+                     ops reshape/transpose/flatten"
                 )))
             }
         };
@@ -20451,6 +20506,142 @@ impl<'a> FnLower<'a> {
     ///
     /// A shape mismatch raises a catchable `ValueError` from the runtime, so the
     /// calls are `throwing_call`s. Batched (≥ 3-D) matmul is a follow-up.
+    /// `a.reshape(d0, d1, ...)` (#511, D-0174): a view over the compacted buffer
+    /// with the given dims, one of which may be the literal `-1` (inferred at
+    /// runtime). The result's static rank is the number of dim arguments. A
+    /// total-size mismatch raises a catchable `ValueError`, so the reshape call
+    /// is a `throwing_call`.
+    fn lower_array_reshape(
+        &mut self,
+        recv: Value,
+        d: Dtype,
+        _ndim: u8,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        if args.is_empty() {
+            return Err(err("reshape() needs at least one dimension"));
+        }
+        if args.len() > u8::MAX as usize {
+            return Err(err("reshape() rank is too large"));
+        }
+        let mut dims = Vec::with_capacity(args.len());
+        for a in args {
+            if a.name.is_some() {
+                return Err(err("reshape() takes positional integer dimensions"));
+            }
+            let (v, t) = self.expr(&a.value)?;
+            if t.int_width().is_none() {
+                return Err(err("reshape() dimensions must be integers"));
+            }
+            dims.push(self.coerce(v, t, Ty::I64));
+        }
+        let rank = dims.len() as u8;
+        // Build the i64 dims buffer the runtime reads.
+        let nd_v = self.iconst(Ty::I64, rank as i64);
+        let buf = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(buf),
+            func: "zap_i64buf".to_string(),
+            args: vec![nd_v],
+        });
+        for (k, &dv) in dims.iter().enumerate() {
+            let kv = self.iconst(Ty::I64, k as i64);
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_i64set".to_string(),
+                args: vec![buf, kv, dv],
+            });
+        }
+        let out = Ty::Array(d, rank);
+        let dest = self.new_value(out);
+        // Raises ValueError on a size mismatch / bad -1.
+        self.throwing_call(Some(dest), "zap_array_reshape", vec![recv, nd_v, buf]);
+        Ok((dest, out))
+    }
+
+    /// `concatenate([a, …], axis=k)` / `stack([a, …], axis=k)` (#511, D-0174):
+    /// join a `list` of arrays. The list is passed straight to the runtime (it
+    /// is already GC-traced). `concatenate` keeps the input rank; `stack` adds a
+    /// new axis (rank + 1). The result's static rank/dtype come from the list's
+    /// element type `array[T]`. Raises `ValueError` on a shape/dtype/axis fault.
+    fn lower_array_join(
+        &mut self,
+        fname: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        let mut list_arg: Option<&Expr> = None;
+        let mut axis_arg: Option<&Expr> = None;
+        for a in args {
+            match &a.name {
+                None if list_arg.is_none() => list_arg = Some(&a.value),
+                Some(k) if k == "axis" => axis_arg = Some(&a.value),
+                _ => {
+                    return Err(err(format!(
+                        "{fname}() takes a list of arrays and an optional axis="
+                    )))
+                }
+            }
+        }
+        let Some(list_expr) = list_arg else {
+            return Err(err(format!("{fname}() needs a list of arrays")));
+        };
+        // A `list[array[T]]` erases its element dtype/rank to a pointer in the
+        // collection ABI, so the result rank/dtype can't come from the list
+        // type. Require a list literal and read them from the elements
+        // directly, lowering each exactly once into a fresh pointer list.
+        let Expr::List(elems, _) = list_expr else {
+            return Err(err(format!(
+                "{fname}() needs a list literal of arrays, e.g. {fname}([a, b])"
+            )));
+        };
+        if elems.is_empty() {
+            return Err(err(format!("{fname}() needs at least one array")));
+        }
+        let listv = self.new_value(Ty::List(Elem::Ptr));
+        self.emit(Inst::Call {
+            dest: Some(listv),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let mut dr: Option<(Dtype, u8)> = None;
+        for e in elems {
+            let (v, t) = self.expr(e)?;
+            let Ty::Array(d, ndim) = t else {
+                return Err(err(format!("{fname}() elements must be arrays")));
+            };
+            if dr.is_none() {
+                dr = Some((d, ndim));
+            }
+            self.emit(Inst::Call {
+                dest: None,
+                func: "zap_list_push_ptr".to_string(),
+                args: vec![listv, v],
+            });
+        }
+        let (d, ndim) = dr.unwrap();
+        // concatenate keeps the rank; stack adds a new axis.
+        let out_rank = if fname == "stack" { ndim + 1 } else { ndim };
+        let axis = match axis_arg {
+            Some(e) => {
+                let (v, t) = self.expr(e)?;
+                if t.int_width().is_none() {
+                    return Err(err(format!("{fname}() axis must be an integer")));
+                }
+                self.coerce(v, t, Ty::I64)
+            }
+            None => self.iconst(Ty::I64, 0),
+        };
+        let func = if fname == "stack" {
+            "zap_array_stack"
+        } else {
+            "zap_array_concat"
+        };
+        let out = Ty::Array(d, out_rank);
+        let dest = self.new_value(out);
+        self.throwing_call(Some(dest), func, vec![listv, axis]);
+        Ok((dest, out))
+    }
+
     fn lower_array_matmul(
         &mut self,
         l: Value,
@@ -22715,5 +22906,166 @@ mod matmul_tests {
         // `@` is only defined for arrays; a scalar `@` is a type error (sema) —
         // and non-array operands never reach a matmul kernel.
         lower_fails("def main():\n    auto x = 3 @ 4\n");
+    }
+}
+
+#[cfg(test)]
+mod shape_ops_tests {
+    //! Shape ops (#511, D-0174): reshape/transpose/flatten (methods) + `.T`
+    //! (attribute), and concatenate/stack (builtins over a list literal).
+    //! Host-only (AST->ZIR): asserts which runtime entry point each form lowers
+    //! to, that the mutating/raising forms are Invokes, and that bad surfaces
+    //! are rejected. Runtime kernels run in the CI goldens.
+    use super::lower_module;
+    use zapc_ir_core::Inst;
+
+    fn call_funcs(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(
+            perrs.is_empty() && lerrs.is_empty(),
+            "parse/lex: {perrs:?} {lerrs:?}"
+        );
+        let (m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Call { func, .. } | Inst::Invoke { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn has(src: &str, func: &str) -> bool {
+        call_funcs(src).iter().any(|f| f == func)
+    }
+    fn is_invoked(src: &str, func: &str) -> bool {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (m, errs) = lower_module(&module);
+        assert!(errs.is_empty(), "unexpected lowering errors: {errs:?}");
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::Invoke { func: f, .. } if f == func))
+    }
+    fn lower_fails(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (_m, errs) = lower_module(&module);
+        assert!(!errs.is_empty(), "expected a lowering error for\n{src}");
+    }
+    fn lowers_ok(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(
+            perrs.is_empty() && lerrs.is_empty(),
+            "parse/lex: {perrs:?} {lerrs:?}"
+        );
+        let (_m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+    }
+
+    #[test]
+    fn reshape_builds_dims_buffer_and_is_raising() {
+        let src = "def main():\n    auto a = array[i64]([1, 2, 3, 4, 5, 6])\n    \
+                   auto m = a.reshape(2, 3)\n    print(m.ndim, sum(m))\n";
+        assert!(has(src, "zap_i64buf"));
+        assert_eq!(
+            call_funcs(src)
+                .iter()
+                .filter(|f| *f == "zap_i64set")
+                .count(),
+            2
+        );
+        assert!(is_invoked(src, "zap_array_reshape")); // size mismatch -> ValueError
+    }
+
+    #[test]
+    fn reshape_allows_one_inferred_minus_one() {
+        lowers_ok(
+            "def main():\n    auto a = array[i64]([1, 2, 3, 4])\n    \
+                   auto m = a.reshape(2, -1)\n    print(sum(m))\n",
+        );
+    }
+
+    #[test]
+    fn transpose_method_and_t_attr_lower_to_a_view() {
+        let m = "def main():\n    auto a = array[i64]([[1, 2, 3], [4, 5, 6]])\n    ";
+        assert!(has(
+            &format!("{m}print(sum(a.transpose()))\n"),
+            "zap_array_transpose"
+        ));
+        assert!(has(&format!("{m}print(sum(a.T))\n"), "zap_array_transpose"));
+        // transpose is a pure view: not a raising call.
+        assert!(!is_invoked(
+            &format!("{m}print(sum(a.T))\n"),
+            "zap_array_transpose"
+        ));
+    }
+
+    #[test]
+    fn flatten_lowers_to_a_copy() {
+        let src = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto f = m.flatten()\n    print(f.ndim, sum(f))\n";
+        assert!(has(src, "zap_array_flatten"));
+    }
+
+    #[test]
+    fn concatenate_and_stack_over_a_list_literal() {
+        let pre = "def main():\n    auto a = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto b = array[i64]([[5, 6], [7, 8]])\n    ";
+        assert!(is_invoked(
+            &format!("{pre}print(sum(concatenate([a, b])))\n"),
+            "zap_array_concat"
+        ));
+        assert!(is_invoked(
+            &format!("{pre}print(sum(concatenate([a, b], axis=1)))\n"),
+            "zap_array_concat"
+        ));
+        assert!(is_invoked(
+            &format!("{pre}print(sum(stack([a, b])))\n"),
+            "zap_array_stack"
+        ));
+        // each array element is pushed into a fresh pointer list
+        assert_eq!(
+            call_funcs(&format!("{pre}print(sum(concatenate([a, b])))\n"))
+                .iter()
+                .filter(|f| *f == "zap_list_push_ptr")
+                .count(),
+            2
+        );
+    }
+
+    // --- rejections ---
+
+    #[test]
+    fn unknown_array_method_is_rejected() {
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    print(a.ravel())\n");
+    }
+    #[test]
+    fn transpose_with_args_is_rejected() {
+        lower_fails("def main():\n    auto a = array[i64]([[1, 2], [3, 4]])\n    auto b = a.transpose(1, 0)\n");
+    }
+    #[test]
+    fn reshape_with_no_dims_is_rejected() {
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    auto b = a.reshape()\n");
+    }
+    #[test]
+    fn concatenate_needs_a_list_literal() {
+        lower_fails(
+            "def main():\n    auto a = array[i64]([1, 2])\n    print(sum(concatenate(a)))\n",
+        );
+    }
+    #[test]
+    fn unknown_array_attribute_still_rejected() {
+        lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    print(a.strides)\n");
     }
 }

@@ -2345,6 +2345,20 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), i.into()],
             Some(p.into()),
         );
+        // Shape ops (#511, D-0174): transpose/flatten/reshape (views or copies)
+        // and concatenate/stack (over a `list` of arrays). `i64buf`/`i64set`
+        // build the reshape target-dims buffer.
+        self.declare_rt("zap_array_transpose", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_array_flatten", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_i64buf", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_i64set", &[p.into(), i.into(), i.into()], None);
+        self.declare_rt(
+            "zap_array_reshape",
+            &[p.into(), i.into(), p.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_array_concat", &[p.into(), i.into()], Some(p.into()));
+        self.declare_rt("zap_array_stack", &[p.into(), i.into()], Some(p.into()));
         // Constructors (#504, D-0167): zeros/ones/full fill a `new_nd` result via
         // `fill_i`/`fill_f` (value as an i64 or f64 ABI word); arange/linspace
         // allocate and fill a runtime-length 1-D array themselves.

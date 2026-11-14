@@ -1,0 +1,13 @@
+reshape 2 2 3 3 4 21
+infer 3 2 6
+view 99
+T 2 3 2 4 3 21
+T1d 7 9 24
+flat 1 6 1 6 21
+flatcopy 1
+c0 4 2 5 8 36
+c1 2 4 6 7 36
+s0 3 2 2 2 3 6 36
+s2 2 1 5 36
+reshape error
+concat error

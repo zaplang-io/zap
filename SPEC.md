@@ -1404,6 +1404,7 @@ longer-term N-D design in `design/0002-arrays.md`.
 | Reduction | `sum(a)` over **all** elements, or the methods `a.sum()`/`a.min()`/`a.max()`/`a.mean()`/`a.prod()`; an optional `a.sum(axis=k)` collapses one axis to a rank-(n-1) array. `sum`/`min`/`max`/`prod` keep the dtype, `mean` is a float |
 | Slicing | Views that alias the parent: contiguous `a[lo:hi]`, stepped/reversed `a[::2]` / `a[::-1]`, N-D axis-0 windows `m[lo:hi]`, and a sliced axis in a multi-axis index `m[:, j]` (per-axis strides) |
 | Linear algebra | `a @ b` (matrix multiply, PEP 465) / `dot(a, b)` / in-place `a @= b` on 1-D & 2-D arrays: 1-D·1-D → scalar dot, 2-D·2-D → matrix, mixed → vector |
+| Shape ops | `a.reshape(d…)` and `a.transpose()` / `a.T` are views; `a.flatten()` is a 1-D copy; `concatenate([…], axis=)` / `stack([…], axis=)` build new arrays |
 
 Mixed array dtypes promote by NumPy NEP-50 (a float operand forces the widest
 float; same-signedness integers take the wider; mixed signed/unsigned take the
@@ -1446,6 +1447,14 @@ NEP-50; a shape mismatch on the contracted axis raises `ValueError`. `@=` is the
 in-place form. `@` is defined only for arrays — on any other type it is an
 ordinary "no such operator" error — and batched (≥ 3-D) matmul is not yet
 supported.
+
+Shape ops reshape the N-D view. `a.reshape(d0, d1, …)` takes positional dims
+(one may be `-1`, inferred) and is a view when the source is contiguous, else a
+copy; `a.transpose()` / `a.T` reverse all axes as a view (a stride permutation);
+`a.flatten()` is a fresh 1-D row-major copy. `concatenate([a, …], axis=k)` joins
+same-rank arrays along an existing axis (other dims must match) and `stack([a,
+…], axis=k)` joins same-shape arrays along a new axis (rank + 1); both are fresh
+copies. A size/shape/axis fault raises a catchable `ValueError`.
 
 A bare `array[T]` type annotation denotes a rank-1 array; N-D values arise
 through inference (`auto`). List-variable/iterable `array[T]` construction,

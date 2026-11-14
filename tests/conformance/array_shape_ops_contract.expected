@@ -1,0 +1,6 @@
+reshape 2 21
+T 21 3
+flat 1 21
+concat 36 4
+stack 3 36
+err

@@ -310,6 +310,19 @@ model.
   `zap_array_matmul(a, b, out_dtype)` (array), compacting operands via
   `zap_array_contig`. No array-header ABI change.
 
+**Increment 12 (shipped, #511 / D-0174):** shape ops.
+
+- `a.reshape(d…)` (view-or-copy, one `-1` inferred), `a.transpose()` / `a.T`
+  (view, reverse axes), `a.flatten()` (1-D copy) as methods/attribute;
+  `concatenate([…], axis=)` / `stack([…], axis=)` as builtins over a list literal
+  of arrays (fresh copies; concat keeps rank, stack adds one). Shape/size/axis
+  faults raise a catchable `ValueError`.
+- transpose is pure metadata (reverse dims + effective strides); the rest reuse
+  `zap_array_contig` (#502) then copy. `concatenate`/`stack` require a list
+  literal (the `list[array[T]]` element type erases dtype/rank in the collection
+  ABI) and read rank/dtype from the first element. No new grammar; no array-ABI
+  change.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - **Matmul performance** (#904, D-0173): the D-0172 kernel is a correct *scalar*

@@ -981,6 +981,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   raises `ValueError`), and `linspace[T](start, stop, num)` (`num` samples, both
   ends inclusive). All accept the full dtype matrix.
 
+- **Array shape ops** (#511, D-0174, epic #499): `a.reshape(d…)` (one `-1`
+  inferred) and `a.transpose()` / `a.T` are **views**; `a.flatten()` is a 1-D
+  **copy**; `concatenate([…], axis=)` and `stack([…], axis=)` build new arrays
+  (concat keeps the rank, stack adds one). A size/shape/axis fault raises a
+  catchable `ValueError`. Methods + `.T` attribute + two builtins; no new syntax.
+
 - **Matrix multiply `@` / `dot`** (#509, D-0172, PEP 465, epic #499): the infix
   `@` operator (and in-place `@=`) and the `dot(a, b)` function do matrix
   multiplication on 1-D and 2-D numeric arrays — 1-D·1-D is a scalar dot product,
