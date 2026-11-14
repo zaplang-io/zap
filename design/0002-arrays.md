@@ -408,20 +408,32 @@ no-BLAS cases).
   for every dtype and shape — each output cell keeps its contraction order, so no
   fp reassociation. 1-D·1-D `dot` keeps its scalar accumulator.
 
+**Increment 18 (shipped, #904 / D-0181):** matmul auto-dispatch — own floor vs
+BLAS gemm. Completes epic #914 Phase 2 (the consumer that wires the #912 seam +
+#913 floor).
+
+- `zap_array_matmul` dispatches: integer → always own (exact); float → BLAS
+  (`cblas_{d,s}gemm`) when a provider is linked and (`ZAP_ACCEL=fast`, or `auto`
+  past the hardcoded ~`n≥64` floor), else the own floor; `ZAP_ACCEL=native`
+  forces own. The BLAS pool is pinned to the container-aware MAXPROCS (#905) via
+  `zap_accel_ensure_threads`, overridable by `ZAP_ACCEL_THREADS`.
+- A program that uses `@`/2-D `dot` now flips `BackendUse::blas`, so the runtime
+  compiles with the provider and links it (pcre2/zlib pattern) — this is the
+  first caller that actually exercises the #912 seam. BLAS reassociates, so a
+  large float `@` matches the own kernel within fp tolerance (NumPy-like);
+  integers stay exact. Floor is tunable (#904 benchmarking), not an API promise.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Integer-array (non-mask) bitwise element-wise ops (`&`/`|`/`^`/`~` on numeric
   arrays — a sibling of the Increment 7/8 element-wise ops, out of #510's
   indexing scope); `ravel` (a view-when-possible flatten); `add.at`-style
   accumulating scatter (#510 uses last-write-wins, as NumPy's plain `a[idx]=`).
-- **Matmul performance** (#904, D-0173): the D-0172 kernel is a correct *scalar*
-  triple loop. Policy locked: Zap auto-dispatches between an own blocked+SIMD
-  kernel and a BLAS hand-off (both linked); the BLAS path **defaults** to pinning
-  at `MAXPROCS` but stays **overridable** (a programmer can set BLAS threads
-  explicitly); own kernel the jitter-safe default; integers/`i64`>2^53/no-BLAS →
-  own (exact). Benchmarks (GFLOP/s, AWS c7i.xlarge 4-vCPU Sapphire Rapids) in
-  #904; RFC = discussion #906; the `MAXPROCS`-pinning default builds on
-  container-aware `MAXPROCS` (#905).
+- **Matmul performance** (#904, D-0173/D-0181): **shipped** (Increments 16–18 —
+  the #912 seam, the #913 own floor, and the #904 auto-dispatch). Remaining
+  tuning follow-ups: a register-tiled + packed own micro-kernel targeting ~70–90%
+  of single-thread BLAS, and refining the hardcoded BLAS floor after the
+  1/4/32-core ±container benchmarking (#904; RFC = discussion #906).
 - Broadcasting in assignment / partial-index (whole-row) stores `m[i] = row`
   (#501 follow-up / #511). (Inner-axis SIMD for the broadcast path shipped in
   Increment 15, #896 / D-0178.)

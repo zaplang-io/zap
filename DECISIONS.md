@@ -8751,7 +8751,7 @@ No new grammar beyond `@` / `@=` at `term` / `aug_op`. See `docs/GRAMMAR.ebnf`,
 `design/0002-arrays.md`, SPEC §15.
 
 ## D-0173 — Array matmul: automatic kernel dispatch (own-blocked vs BLAS) (#904)
-**Status:** Locked (policy) — implementation tracked by #904
+**Status:** Locked (policy) — **implemented by #904 (D-0181)**
 The matmul/`dot` kernel from D-0172 is a correct **scalar** baseline; this locks
 how Zap gets it **fast**. The guiding principle: **the language optimizes for
 you** — `a @ b` picks the fastest available kernel automatically, with an
@@ -9034,3 +9034,38 @@ change; no surface or semantics change.
 Relates to #914 (perf epic, Phase 2), #509/D-0172 (matmul surface), #904
 (auto-dispatch — the consumer, sharpens D-0173), #912/D-0179 (the accel seam),
 #909 (own-floor-vs-BLAS calibration).
+
+## D-0181 — Matmul auto-dispatch: own floor vs BLAS gemm (#904)
+**Status:** implemented
+Implements the D-0173 policy (and is the last unit of epic #914 Phase 2): `a @ b`
+picks the fastest kernel for the `(dtype, shape, CPU budget)` automatically —
+the own blocked+SIMD FLOOR (#913) by default, a BLAS gemm CEILING (#912 seam)
+auto-selected for large float products — with a `ZAP_ACCEL` override.
+- **Dispatch (in `zap_array_matmul`).** Integer out → always own (BLAS routes
+  ints through f64, inexact past 2^53). Float out → BLAS iff a provider is
+  linked AND (`ZAP_ACCEL=fast`, or `auto` and the work `m·n·k` is at/above the
+  floor); `ZAP_ACCEL=native` forces own; below the floor → own (BLAS call
+  overhead / jitter not worth it on small products). 1-D·1-D `dot` keeps its
+  scalar accumulator (unchanged).
+- **Floor.** Hardcoded `64·64·64` (≈ n ≥ 64 square), deliberately conservative —
+  the own kernel is the jitter-safe default (no thread pool to misconfigure).
+  **Tunable, not an API promise**: the 1/4/32-core ±container benchmarking in
+  #904 / discussions #906/#909 will refine it (possibly per-setting).
+- **BLAS path.** `cblas_dgemm` / `cblas_sgemm` (row-major), operands materialized
+  into contiguous gemm-typed buffers; the pool is pinned to the container-aware
+  MAXPROCS (#905) via `zap_accel_ensure_threads()` before the call, overridable
+  by `ZAP_ACCEL_THREADS`, never the library default (a default-threaded BLAS in a
+  1-core pod spiked p99 80 ms vs p50 2.3 ms, #904). On macOS the Accelerate arm
+  uses the modern (non-deprecated) CBLAS interface.
+- **Numerics.** The own floor is bit-identical to the D-0172 scalar kernel; the
+  BLAS path packs/blocks and so **reassociates** — a large float `@` matches the
+  scalar reference only within fp tolerance, and its exact low bits can differ
+  between a BLAS build and a no-BLAS (or `native`) build. This mirrors NumPy's
+  BLAS-backed `@` and is the accepted cost of the auto-ceiling; integers are
+  always exact (never BLAS).
+- **Linking.** `zap_array_matmul` is in `BackendUse::blas`'s scan set, so a
+  program that uses `@`/2-D `dot` compiles the runtime with the provider and
+  links it (pcre2/zlib pattern, #853); a program without matmul links nothing.
+Relates to #904 (issue + benchmarks), D-0173 (the locked policy), #913/D-0180
+(the floor), #912/D-0179 (the seam), #905 (MAXPROCS), #499/D-0011; the
+own-micro-kernel tuning and linalg (#512) are follow-ups.
