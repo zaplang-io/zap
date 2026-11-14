@@ -60,6 +60,64 @@ fn lower(
             lowerer.throwing_call(Some(d), "zap_linalg_det", vec![a]);
             Ok(Some((d, Ty::F64)))
         }
+        "cholesky" => {
+            if args.len() != 1 {
+                return Err(err("linalg.cholesky expects (a)"));
+            }
+            let (a, _) = lowerer.expr(&args[0].value)?;
+            let out = Ty::Array(Dtype::F64, 2);
+            let d = lowerer.new_value(out);
+            lowerer.throwing_call(Some(d), "zap_linalg_cholesky", vec![a]);
+            Ok(Some((d, out)))
+        }
+        // qr / svd return a tuple of arrays — one runtime call per output, then
+        // assemble the tuple (the where()/nonzero pattern). f64 throughout.
+        "qr" => {
+            if args.len() != 1 {
+                return Err(err("linalg.qr expects (a)"));
+            }
+            let (a, _) = lowerer.expr(&args[0].value)?;
+            let elems = vec![Ty::Array(Dtype::F64, 2), Ty::Array(Dtype::F64, 2)];
+            let fns = ["zap_linalg_qr_q", "zap_linalg_qr_r"];
+            Ok(Some(tuple_of_arrays(lowerer, a, &elems, &fns)))
+        }
+        "svd" => {
+            if args.len() != 1 {
+                return Err(err("linalg.svd expects (a)"));
+            }
+            let (a, _) = lowerer.expr(&args[0].value)?;
+            let elems = vec![
+                Ty::Array(Dtype::F64, 2), // U
+                Ty::Array(Dtype::F64, 1), // S
+                Ty::Array(Dtype::F64, 2), // Vt
+            ];
+            let fns = ["zap_linalg_svd_u", "zap_linalg_svd_s", "zap_linalg_svd_vt"];
+            Ok(Some(tuple_of_arrays(lowerer, a, &elems, &fns)))
+        }
         _ => Ok(None),
     }
+}
+
+/// Build a tuple whose fields are the results of calling each `fns[i]` on the
+/// same matrix `a` (each a throwing LAPACK hand-off). The element types `elems`
+/// give the tuple's struct layout. Mirrors `where`/nonzero's tuple construction.
+fn tuple_of_arrays(lowerer: &mut FnLower, a: Value, elems: &[Ty], fns: &[&str]) -> (Value, Ty) {
+    let mut vals = Vec::with_capacity(fns.len());
+    for (i, f) in fns.iter().enumerate() {
+        let d = lowerer.new_value(elems[i]);
+        lowerer.throwing_call(Some(d), f, vec![a]);
+        vals.push(d);
+    }
+    let sid = lowerer.ctx.tuples.borrow_mut().intern(elems.to_vec());
+    let dest = lowerer.new_value(Ty::Struct(sid));
+    lowerer.emit(Inst::StructNew { dest, sid });
+    for (idx, v) in vals.into_iter().enumerate() {
+        lowerer.emit(Inst::FieldSet {
+            base: dest,
+            sid,
+            idx: idx as u32,
+            val: v,
+        });
+    }
+    (dest, Ty::Struct(sid))
 }
