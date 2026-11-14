@@ -26,8 +26,11 @@ def main():
     print("solvem", str(xm[0, 0]), str(xm[0, 1]), str(xm[1, 0]), str(xm[1, 1]))  # 1.0 3.0 1.0 2.0
 
     # inv: diagonal (powers of two) and unit upper-triangular -> exact.
+    # (The off-diagonal of a diagonal inverse is a computed zero whose SIGN is
+    # LAPACK-impl-dependent — OpenBLAS yields -0.0 — so only the diagonal, which
+    # is exact, is pinned here.)
     auto iv = linalg.inv(array[f64]([[2.0, 0.0], [0.0, 4.0]]))
-    print("inv", str(iv[0, 0]), str(iv[1, 1]), str(iv[0, 1]))  # 0.5 0.25 0.0
+    print("inv", str(iv[0, 0]), str(iv[1, 1]))  # 0.5 0.25
     auto iu = linalg.inv(array[f64]([[1.0, 1.0], [0.0, 1.0]]))
     print("invu", str(iu[0, 0]), str(iu[0, 1]), str(iu[1, 1]))  # 1.0 -1.0 1.0
 
