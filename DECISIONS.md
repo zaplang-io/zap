@@ -8867,3 +8867,33 @@ were verified against NumPy 2.5.4 before implementation.
   ops; `ravel`; `add.at`-style accumulating scatter.
 See `design/0002-arrays.md`, SPEC §15. Part of epic #499; relates to D-0165
 (broadcasting), D-0171 (views), D-0170. Completes the #499 feature set.
+
+## D-0176 — Container-aware `MAXPROCS` (CFS quota / cpuset) (#905)
+**Status:** implemented
+Phase 0 of the array performance & acceleration epic (#914), but a general
+runtime/deployment correctness fix independent of arrays.
+- **Problem.** `MAXPROCS` (#172, the worker-M count) defaulted to
+  `sysconf(_SC_NPROCESSORS_ONLN)`. Under a Kubernetes CFS CPU quota
+  (`resources.limits.cpu`, e.g. `1000m`) the cgroup limits CPU *time*, not
+  *which cores* — so `_SC_NPROCESSORS_ONLN` (and `nproc`, `/proc/cpuinfo`, even
+  the affinity mask) report the **node's** core count, not the pod's budget. A
+  Zap service in a `cpu: 1000m` pod on a 16-core node spun 16 worker Ms for a
+  1-core budget: oversubscription, extra GC stop-the-world coordination, and
+  CFS-throttle latency spikes.
+- **Decision.** When `MAXPROCS` is unset the default is
+  `min(online, affinity, ceil(cfs_quota / cfs_period))`, clamped to ≥ 1 — the
+  JVM `UseContainerSupport` / Go `automaxprocs` approach. An explicit `MAXPROCS=`
+  still overrides unchanged. This effective value is also the single budget any
+  future BLAS/FFI hand-off is pinned to (#904/#914, `openblas_set_num_threads`).
+- **Implementation.** All readers are **file-based** (cgroup v2 `/sys/fs/cgroup/
+  cpu.max`, else v1 `cpu.cfs_quota_us`/`cpu.cfs_period_us`; affinity from
+  `/proc/self/status` `Cpus_allowed_list`), so no `_GNU_SOURCE` /
+  `sched_getaffinity` — the portable (no-CPython) and Windows builds still
+  compile; Windows keeps `GetSystemInfo` (no cgroup). An unlimited/unknown
+  source is ignored in the min.
+- **`ZAP_CPU_MAX` seam.** Overrides the cgroup-v2 `cpu.max` read with a
+  v2-format string ("`<quota> <period>`" or "`max`"); a diagnostic / testing
+  override (used by the `maxprocs_cgroup_quota` golden to inject a 0.5-CPU quota
+  deterministically) and an escape hatch for non-standard cgroup mounts.
+Relates to #172 (MAXPROCS / M:N scheduler), #914 (perf epic, Phase 0), #904
+(BLAS thread-pinning consumer).
