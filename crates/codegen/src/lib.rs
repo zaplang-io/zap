@@ -1425,6 +1425,39 @@ fn inst_dest(i: &zir::Inst) -> Option<u32> {
     }
 }
 
+/// The shared context for the vectorized broadcast kernel (#896), so its four
+/// inner-axis specializations ((lhs contiguous?, rhs contiguous?)) share one
+/// argument bundle rather than a 20-argument call. All values live in the
+/// current function; `emit_bcast_kernel` reads them and emits one row-walking
+/// loop with a vectorized inner body + scalar tail.
+struct BcastKernel<'ctx> {
+    fv: FunctionValue<'ctx>,
+    la: PointerValue<'ctx>,
+    ra: PointerValue<'ctx>,
+    res: PointerValue<'ctx>,
+    n: inkwell::values::IntValue<'ctx>,
+    inner: inkwell::values::IntValue<'ctx>,
+    lp: PointerValue<'ctx>,
+    rp: PointerValue<'ctx>,
+    op_ptr: PointerValue<'ctx>,
+    op: zir::BinOp,
+    out_float: bool,
+    scalar_lhs: bool,
+    out: zir::Dtype,
+    out_elem: BasicTypeEnum<'ctx>,
+    out_vec: VectorType<'ctx>,
+    out_align: u32,
+    lhs_dtype: zir::Dtype,
+    lhs_elem: BasicTypeEnum<'ctx>,
+    lhs_vec: VectorType<'ctx>,
+    lhs_align: u32,
+    rhs_dtype: zir::Dtype,
+    rhs_elem: BasicTypeEnum<'ctx>,
+    rhs_vec: VectorType<'ctx>,
+    rhs_align: u32,
+    done: BasicBlock<'ctx>,
+}
+
 struct Cg<'a, 'ctx> {
     ctx: &'ctx Context,
     module: &'a LlvmModule<'ctx>,
@@ -2242,6 +2275,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             "zap_array_bcast_offsets",
             &[p.into(), p.into(), p.into(), i.into(), p.into(), p.into()],
             None,
+        );
+        // #896: operand's element step along the result's innermost axis — 0 if
+        // stretched there (splat), else its contiguous stride. The vectorized
+        // broadcast kernel precomputes this per operand.
+        self.declare_rt(
+            "zap_array_bcast_inner_stride",
+            &[p.into(), p.into()],
+            Some(i.into()),
         );
         // array slice `a[lo:hi]` -> a VIEW sharing the buffer (D-0030, contiguous
         // only). Bounds `(lo, hi)` + their present-flags; no step (strided views
@@ -5599,61 +5640,110 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             b.build_conditional_branch(is_same, flat_bb, bcast_bb)
                 .map_err(|e| e.to_string())?;
 
-            // --- strided broadcast loop (scalar body) ---
+            // --- vectorized broadcast kernel (#896) ---
+            // Walk the result one inner row at a time: `bcast_offsets` gives each
+            // operand's base offset for the row (correct for any rank), then the
+            // INNERMOST axis is vectorized — a contiguous operand is vector-loaded,
+            // a stretched (size-1) one is splat across the lanes (its value is
+            // constant across the row). Each operand's inner step is 0 (stretched)
+            // or its stride (contiguous), computed once; the kernel is specialized
+            // on the two booleans so the hot inner loop carries no per-lane branch
+            // and no per-element offset call.
             b.position_at_end(bcast_bb);
-            let oa_slot = b.build_alloca(i64t, "oa").map_err(|e| e.to_string())?;
-            let ob_slot = b.build_alloca(i64t, "ob").map_err(|e| e.to_string())?;
-            let bhead = self.ctx.append_basic_block(fv, "arr.bc.head");
-            let bbody = self.ctx.append_basic_block(fv, "arr.bc.body");
-            b.build_unconditional_branch(bhead)
-                .map_err(|e| e.to_string())?;
-            b.position_at_end(bhead);
-            let f_phi = b.build_phi(i64t, "f").map_err(|e| e.to_string())?;
-            let f = f_phi.as_basic_value().into_int_value();
-            let bcond = b
-                .build_int_compare(IntPredicate::SLT, f, n, "bcond")
-                .map_err(|e| e.to_string())?;
-            b.build_conditional_branch(bcond, bbody, done)
-                .map_err(|e| e.to_string())?;
-            b.position_at_end(bbody);
-            b.build_call(
-                self.fns["zap_array_bcast_offsets"],
-                &[
-                    la.into(),
-                    ra.into(),
-                    res.into(),
-                    f.into(),
-                    oa_slot.into(),
-                    ob_slot.into(),
-                ],
-                "",
-            )
-            .map_err(|e| e.to_string())?;
-            let ol = b
-                .build_load(i64t, oa_slot, "ol")
-                .map_err(|e| e.to_string())?
+            let rnd = self
+                .call1("zap_array_ndim", &[res.into()], "rnd")?
                 .into_int_value();
-            let or = b
-                .build_load(i64t, ob_slot, "or")
-                .map_err(|e| e.to_string())?
+            let last_ax = b
+                .build_int_sub(rnd, i64t.const_int(1, false), "lastax")
+                .map_err(|e| e.to_string())?;
+            let inner = self
+                .call1("zap_array_dim", &[res.into(), last_ax.into()], "inner")?
                 .into_int_value();
-            let lsc = self.elem_load(lhs_elem, lp, ol, "bls")?;
-            let lsc = self.convert_scalar(lsc, lhs_dtype, out, out_elem)?;
-            let rsc = self.elem_load(rhs_elem, rp, or, "brs")?;
-            let rsc = self.convert_scalar(rsc, rhs_dtype, out, out_elem)?;
-            let ressc = self.scalar_arith(op, out_float, lsc, rsc)?;
-            let optr = unsafe {
-                b.build_gep(out_elem, op_ptr, &[f], "boptr")
-                    .map_err(|e| e.to_string())?
+            // A zero-length result axis means an empty result — nothing to do, and
+            // guards the `n / inner` below against a zero divisor.
+            let inner_pos = b
+                .build_int_compare(
+                    IntPredicate::SGT,
+                    inner,
+                    i64t.const_int(0, false),
+                    "innerpos",
+                )
+                .map_err(|e| e.to_string())?;
+            let bc_go = self.ctx.append_basic_block(fv, "arr.bc.go");
+            b.build_conditional_branch(inner_pos, bc_go, done)
+                .map_err(|e| e.to_string())?;
+            b.position_at_end(bc_go);
+            let lstep = self
+                .call1(
+                    "zap_array_bcast_inner_stride",
+                    &[la.into(), res.into()],
+                    "lstep",
+                )?
+                .into_int_value();
+            let rstep = self
+                .call1(
+                    "zap_array_bcast_inner_stride",
+                    &[ra.into(), res.into()],
+                    "rstep",
+                )?
+                .into_int_value();
+            let zero64 = i64t.const_int(0, false);
+            let lc = b
+                .build_int_compare(IntPredicate::NE, lstep, zero64, "lc")
+                .map_err(|e| e.to_string())?;
+            let rc = b
+                .build_int_compare(IntPredicate::NE, rstep, zero64, "rc")
+                .map_err(|e| e.to_string())?;
+            // Four specializations keyed on (lhs contiguous?, rhs contiguous?).
+            let e_tt = self.ctx.append_basic_block(fv, "arr.bc.tt");
+            let e_tf = self.ctx.append_basic_block(fv, "arr.bc.tf");
+            let e_ft = self.ctx.append_basic_block(fv, "arr.bc.ft");
+            let e_ff = self.ctx.append_basic_block(fv, "arr.bc.ff");
+            let on_lc = self.ctx.append_basic_block(fv, "arr.bc.lc");
+            let on_nlc = self.ctx.append_basic_block(fv, "arr.bc.nlc");
+            b.build_conditional_branch(lc, on_lc, on_nlc)
+                .map_err(|e| e.to_string())?;
+            b.position_at_end(on_lc);
+            b.build_conditional_branch(rc, e_tt, e_tf)
+                .map_err(|e| e.to_string())?;
+            b.position_at_end(on_nlc);
+            b.build_conditional_branch(rc, e_ft, e_ff)
+                .map_err(|e| e.to_string())?;
+            let bk = BcastKernel {
+                fv,
+                la,
+                ra,
+                res,
+                n,
+                inner,
+                lp,
+                rp,
+                op_ptr,
+                op,
+                out_float,
+                scalar_lhs,
+                out,
+                out_elem,
+                out_vec,
+                out_align,
+                lhs_dtype,
+                lhs_elem,
+                lhs_vec,
+                lhs_align,
+                rhs_dtype,
+                rhs_elem,
+                rhs_vec,
+                rhs_align,
+                done,
             };
-            let st = b.build_store(optr, ressc).map_err(|e| e.to_string())?;
-            st.set_alignment(out_align).map_err(|e| e.to_string())?;
-            let fnext = b
-                .build_int_add(f, i64t.const_int(1, false), "fnext")
-                .map_err(|e| e.to_string())?;
-            b.build_unconditional_branch(bhead)
-                .map_err(|e| e.to_string())?;
-            f_phi.add_incoming(&[(&i64t.const_int(0, false), bcast_bb), (&fnext, bbody)]);
+            b.position_at_end(e_tt);
+            self.emit_bcast_kernel(&bk, true, true)?;
+            b.position_at_end(e_tf);
+            self.emit_bcast_kernel(&bk, true, false)?;
+            b.position_at_end(e_ft);
+            self.emit_bcast_kernel(&bk, false, true)?;
+            b.position_at_end(e_ff);
+            self.emit_bcast_kernel(&bk, false, false)?;
 
             // The flat loop below runs in `flat_bb`.
             b.position_at_end(flat_bb);
@@ -5750,6 +5840,224 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
 
         b.position_at_end(done);
         Ok(res.into())
+    }
+
+    /// Splat `scalar` across all `vw` lanes of `vec_ty` (a chain of
+    /// `insertelement`s, which the backend folds to a broadcast).
+    fn splat_vec(
+        &self,
+        vec_ty: VectorType<'ctx>,
+        scalar: BasicValueEnum<'ctx>,
+        vw: u64,
+    ) -> Result<VectorValue<'ctx>, String> {
+        let i32t = self.ctx.i32_type();
+        let mut v = vec_ty.get_undef();
+        for lane in 0..vw {
+            v = self
+                .builder
+                .build_insert_element(v, scalar, i32t.const_int(lane, false), "splat")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(v)
+    }
+
+    /// Emit one inner-axis specialization of the broadcast kernel (#896),
+    /// positioned at its entry block. `lcontig`/`rcontig` say whether each
+    /// operand is contiguous on the result's innermost axis (vector-load per
+    /// lane) or stretched there (a per-row constant, splat across the lanes).
+    /// Walks the result row by row — `bcast_offsets` gives each operand's base
+    /// offset for the row (any rank), then the inner axis runs a `VW`-lane vector
+    /// body + scalar tail — and finally branches to `bk.done`.
+    fn emit_bcast_kernel(
+        &self,
+        bk: &BcastKernel<'ctx>,
+        lcontig: bool,
+        rcontig: bool,
+    ) -> Result<(), String> {
+        let b = self.builder;
+        let i64t = self.ctx.i64_type();
+        const VW: u64 = 4;
+        let entry = b.get_insert_block().unwrap();
+        let oa_slot = b.build_alloca(i64t, "bk.oa").map_err(|e| e.to_string())?;
+        let ob_slot = b.build_alloca(i64t, "bk.ob").map_err(|e| e.to_string())?;
+        let nrows = b
+            .build_int_signed_div(bk.n, bk.inner, "bk.nrows")
+            .map_err(|e| e.to_string())?;
+        let mask = i64t.const_int(!(VW - 1), false);
+        let vend = b
+            .build_and(bk.inner, mask, "bk.vend")
+            .map_err(|e| e.to_string())?;
+        let rhead = self.ctx.append_basic_block(bk.fv, "bk.rhead");
+        let rbody = self.ctx.append_basic_block(bk.fv, "bk.rbody");
+        b.build_unconditional_branch(rhead)
+            .map_err(|e| e.to_string())?;
+
+        // --- per-row loop ---
+        b.position_at_end(rhead);
+        let r_phi = b.build_phi(i64t, "bk.r").map_err(|e| e.to_string())?;
+        let r = r_phi.as_basic_value().into_int_value();
+        let rcond = b
+            .build_int_compare(IntPredicate::SLT, r, nrows, "bk.rcond")
+            .map_err(|e| e.to_string())?;
+        b.build_conditional_branch(rcond, rbody, bk.done)
+            .map_err(|e| e.to_string())?;
+
+        b.position_at_end(rbody);
+        let rowbase = b
+            .build_int_mul(r, bk.inner, "bk.rowbase")
+            .map_err(|e| e.to_string())?;
+        b.build_call(
+            self.fns["zap_array_bcast_offsets"],
+            &[
+                bk.la.into(),
+                bk.ra.into(),
+                bk.res.into(),
+                rowbase.into(),
+                oa_slot.into(),
+                ob_slot.into(),
+            ],
+            "",
+        )
+        .map_err(|e| e.to_string())?;
+        let oa = b
+            .build_load(i64t, oa_slot, "bk.oaL")
+            .map_err(|e| e.to_string())?
+            .into_int_value();
+        let ob = b
+            .build_load(i64t, ob_slot, "bk.obL")
+            .map_err(|e| e.to_string())?
+            .into_int_value();
+
+        // A stretched operand's value is constant across the row: load + splat it
+        // once (both the lane vector for the body and the scalar for the tail).
+        let l_splat = if lcontig {
+            None
+        } else {
+            let s = self.elem_load(bk.lhs_elem, bk.lp, oa, "bk.lspl")?;
+            let s = self.convert_scalar(s, bk.lhs_dtype, bk.out, bk.out_elem)?;
+            Some((s, self.splat_vec(bk.out_vec, s, VW)?))
+        };
+        let r_splat = if rcontig {
+            None
+        } else {
+            let s = self.elem_load(bk.rhs_elem, bk.rp, ob, "bk.rspl")?;
+            let s = self.convert_scalar(s, bk.rhs_dtype, bk.out, bk.out_elem)?;
+            Some((s, self.splat_vec(bk.out_vec, s, VW)?))
+        };
+
+        let ivhead = self.ctx.append_basic_block(bk.fv, "bk.ivhead");
+        let ivbody = self.ctx.append_basic_block(bk.fv, "bk.ivbody");
+        let ithead = self.ctx.append_basic_block(bk.fv, "bk.ithead");
+        let itbody = self.ctx.append_basic_block(bk.fv, "bk.itbody");
+        let rcont = self.ctx.append_basic_block(bk.fv, "bk.rcont");
+        b.build_unconditional_branch(ivhead)
+            .map_err(|e| e.to_string())?;
+
+        // --- inner vector loop ---
+        b.position_at_end(ivhead);
+        let k_phi = b.build_phi(i64t, "bk.k").map_err(|e| e.to_string())?;
+        let k = k_phi.as_basic_value().into_int_value();
+        let vcond = b
+            .build_int_compare(IntPredicate::SLT, k, vend, "bk.vcond")
+            .map_err(|e| e.to_string())?;
+        b.build_conditional_branch(vcond, ivbody, ithead)
+            .map_err(|e| e.to_string())?;
+        b.position_at_end(ivbody);
+        let lvec = if lcontig {
+            let idx = b
+                .build_int_add(oa, k, "bk.lvi")
+                .map_err(|e| e.to_string())?;
+            let v = self.vec_load(bk.lhs_vec, bk.lhs_elem, bk.lp, idx, bk.lhs_align, "bk.lv")?;
+            self.convert_vec(v, bk.lhs_dtype, bk.out, bk.out_vec)?
+        } else {
+            l_splat.unwrap().1
+        };
+        let rvec = if rcontig {
+            let idx = b
+                .build_int_add(ob, k, "bk.rvi")
+                .map_err(|e| e.to_string())?;
+            let v = self.vec_load(bk.rhs_vec, bk.rhs_elem, bk.rp, idx, bk.rhs_align, "bk.rv")?;
+            self.convert_vec(v, bk.rhs_dtype, bk.out, bk.out_vec)?
+        } else {
+            r_splat.unwrap().1
+        };
+        let (vl, vr) = if bk.scalar_lhs {
+            (rvec, lvec)
+        } else {
+            (lvec, rvec)
+        };
+        let resv = self.vec_arith(bk.op, bk.out_float, vl, vr)?;
+        let oidx = b
+            .build_int_add(rowbase, k, "bk.voi")
+            .map_err(|e| e.to_string())?;
+        let optr = unsafe {
+            b.build_gep(bk.out_elem, bk.op_ptr, &[oidx], "bk.vop")
+                .map_err(|e| e.to_string())?
+        };
+        let st = b.build_store(optr, resv).map_err(|e| e.to_string())?;
+        st.set_alignment(bk.out_align).map_err(|e| e.to_string())?;
+        let knext = b
+            .build_int_add(k, i64t.const_int(VW, false), "bk.knext")
+            .map_err(|e| e.to_string())?;
+        b.build_unconditional_branch(ivhead)
+            .map_err(|e| e.to_string())?;
+        k_phi.add_incoming(&[(&i64t.const_int(0, false), rbody), (&knext, ivbody)]);
+
+        // --- inner scalar tail ---
+        b.position_at_end(ithead);
+        let j_phi = b.build_phi(i64t, "bk.j").map_err(|e| e.to_string())?;
+        let j = j_phi.as_basic_value().into_int_value();
+        let jcond = b
+            .build_int_compare(IntPredicate::SLT, j, bk.inner, "bk.jcond")
+            .map_err(|e| e.to_string())?;
+        b.build_conditional_branch(jcond, itbody, rcont)
+            .map_err(|e| e.to_string())?;
+        b.position_at_end(itbody);
+        let ls = if lcontig {
+            let idx = b
+                .build_int_add(oa, j, "bk.lji")
+                .map_err(|e| e.to_string())?;
+            let s = self.elem_load(bk.lhs_elem, bk.lp, idx, "bk.ls")?;
+            self.convert_scalar(s, bk.lhs_dtype, bk.out, bk.out_elem)?
+        } else {
+            l_splat.unwrap().0
+        };
+        let rs = if rcontig {
+            let idx = b
+                .build_int_add(ob, j, "bk.rji")
+                .map_err(|e| e.to_string())?;
+            let s = self.elem_load(bk.rhs_elem, bk.rp, idx, "bk.rs")?;
+            self.convert_scalar(s, bk.rhs_dtype, bk.out, bk.out_elem)?
+        } else {
+            r_splat.unwrap().0
+        };
+        let (sl, sr) = if bk.scalar_lhs { (rs, ls) } else { (ls, rs) };
+        let ress = self.scalar_arith(bk.op, bk.out_float, sl, sr)?;
+        let oidx = b
+            .build_int_add(rowbase, j, "bk.joi")
+            .map_err(|e| e.to_string())?;
+        let optr = unsafe {
+            b.build_gep(bk.out_elem, bk.op_ptr, &[oidx], "bk.jop")
+                .map_err(|e| e.to_string())?
+        };
+        let st = b.build_store(optr, ress).map_err(|e| e.to_string())?;
+        st.set_alignment(bk.out_align).map_err(|e| e.to_string())?;
+        let jnext = b
+            .build_int_add(j, i64t.const_int(1, false), "bk.jnext")
+            .map_err(|e| e.to_string())?;
+        b.build_unconditional_branch(ithead)
+            .map_err(|e| e.to_string())?;
+        j_phi.add_incoming(&[(&vend, ivhead), (&jnext, itbody)]);
+
+        // --- next row ---
+        b.position_at_end(rcont);
+        let rnext = b
+            .build_int_add(r, i64t.const_int(1, false), "bk.rnext")
+            .map_err(|e| e.to_string())?;
+        b.build_unconditional_branch(rhead)
+            .map_err(|e| e.to_string())?;
+        r_phi.add_incoming(&[(&i64t.const_int(0, false), entry), (&rnext, rcont)]);
+        Ok(())
     }
 
     /// Element-wise unary math over an array (#505, D-0168): `out[i] = op(src[i])`
@@ -6947,6 +7255,25 @@ mod tests {
         assert!(
             ir.contains("fadd <4 x double>"),
             "expected a vectorized fadd in IR:\n{ir}"
+        );
+    }
+
+    // #896: the BROADCAST kernel (unequal but compatible shapes) must vectorize
+    // its inner axis too, not only the equal-shape flat path. Both kernels are
+    // always emitted (the shape test picks one at run time), so a vectorized
+    // broadcast path shows up as MORE than the single flat vector `fadd` — the
+    // four inner-axis specializations each contribute one. Before #896 the
+    // broadcast body was a scalar loop, so there was exactly one.
+    #[test]
+    fn array_broadcast_vectorizes_f64() {
+        let ir = llvm_ir(
+            "def main():\n    auto a = array[f64]([[1.0, 2.0, 3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0, 10.0]])\n    auto b = array[f64]([5.0, 4.0, 3.0, 2.0, 1.0])\n    print(sum(a + b))\n",
+        );
+        let n = ir.matches("fadd <4 x double>").count();
+        assert!(
+            n >= 2,
+            "expected the broadcast path to also vectorize (saw {n} vector fadds, \
+             want the flat one plus the broadcast specializations):\n{ir}"
         );
     }
 

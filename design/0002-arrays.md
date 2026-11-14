@@ -361,6 +361,23 @@ work #896).
   last-axis `sum`/`prod`/`mean` reassociates (within IEEE-754 tolerance).
   Accumulator widths are the D-0170 ones (int sum → int64, float → double).
 
+**Increment 15 (shipped, #896 / D-0178):** vectorized broadcast element-wise
+kernel — the broadcast half of epic #914 Phase 1 (sibling of the reduction work
+#911).
+
+- The broadcast path (`m + row`, `m + col`, outer products, N-D, mixed dtype) was
+  a per-element scalar loop calling `zap_array_bcast_offsets` for every element;
+  it now walks the result one inner row at a time (one offset call per row) and
+  vectorizes the innermost axis with a `<4 × T>` body + scalar tail, matching the
+  equal-shape flat kernel. Inline in codegen (the mixed-dtype/NEP-50 arithmetic
+  lives there, not the runtime).
+- Each operand is compacted/contiguous, so its inner step is either its stride
+  (contiguous → vector-load) or 0 (stretched size-1 axis → constant across the
+  row, splat into the lanes); no gather case arises. The kernel is specialized on
+  (lhs contiguous?, rhs contiguous?) so the hot loop has no per-lane branch.
+  Results are unchanged. New runtime helper `zap_array_bcast_inner_stride`;
+  `zap_array_bcast_offsets` reused.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Integer-array (non-mask) bitwise element-wise ops (`&`/`|`/`^`/`~` on numeric
@@ -375,8 +392,9 @@ work #896).
   own (exact). Benchmarks (GFLOP/s, AWS c7i.xlarge 4-vCPU Sapphire Rapids) in
   #904; RFC = discussion #906; the `MAXPROCS`-pinning default builds on
   container-aware `MAXPROCS` (#905).
-- Inner-axis SIMD for the broadcast path; broadcasting in assignment /
-  partial-index (whole-row) stores `m[i] = row` (#501 follow-up / #511).
+- Broadcasting in assignment / partial-index (whole-row) stores `m[i] = row`
+  (#501 follow-up / #511). (Inner-axis SIMD for the broadcast path shipped in
+  Increment 15, #896 / D-0178.)
 - Assigning *through* a sliced index — a strided-view store `m[:, j] = col` —
   stays a lowering error (the read side ships in Increment 10 below).
 - Floor division `//` and modulo `%` over arrays (a lowering error for now; the

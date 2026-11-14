@@ -3644,6 +3644,22 @@ void zap_array_bcast_offsets(void *ap, void *bp, void *resp, int64_t f,
     *off_b = ob;
 }
 
+/* The element step of operand `a` along the result's INNERMOST axis (#896): 0
+ * when that axis is stretched (a size-1 or missing axis — the same value repeats
+ * across the inner row, so the vectorized kernel splats it), else its contiguous
+ * row-major stride, which for the last axis of a contiguous operand is 1 (the
+ * kernel vector-loads). The broadcast kernel precomputes this once per operand,
+ * then walks each inner row with `base + k * step` — no per-element offset call. */
+int64_t zap_array_bcast_inner_stride(void *ap, void *resp) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *res = (ZapArray *)resp;
+    int64_t r = res->ndim;
+    int64_t aax = (r - 1) - (r - a->ndim); /* a's own last axis, == a->ndim - 1 */
+    if (aax >= 0 && a->dims[aax] != 1)
+        return zap_array_axis_stride(a, aax);
+    return 0;
+}
+
 /* The typed get/set/sum for every numeric dtype (#49/#503/#890). Each integer
  * dtype crosses the ABI as an `int64_t` word: `get` sign/zero-extends the stored
  * element (the signedness of `ctype` picks which), `set` truncates (wraps mod
