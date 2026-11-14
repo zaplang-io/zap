@@ -4,15 +4,17 @@
  * and a BLAS/LAPACK accelerator CEILING (auto-used when present).
  *
  * The provider is chosen at BUILD time — OpenBLAS on Linux, Apple Accelerate on
- * macOS (one cblas/lapacke ABI), excluded by the `ZAP_NO_BLAS` build opt-out —
- * and a program links it only when it reaches an accel-eligible op (#904),
- * exactly like the pcre2/zlib seams: the codegen defines `ZAP_HAVE_BLAS` (plus
- * the provider macro) on the runtime compile and adds the provider's link flags
- * only for such a program. When no provider is compiled in, `zap_accel_
- * available()` is 0 and the `fast` tier degrades to `native`.
+ * macOS (one cblas/lapacke ABI) — and a program links it only when it reaches an
+ * accel-eligible op (#904), exactly like the pcre2/zlib seams: the codegen
+ * defines `ZAP_HAVE_BLAS` (plus the provider macro) on the runtime compile and
+ * adds the provider's link flags only for such a program. There is no opt-out
+ * knob (#925 dropped `ZAP_NO_BLAS`): a program that uses no accel-eligible op
+ * links no provider anyway, and `ZAP_ACCEL` is the runtime override. When no
+ * provider is compiled in (an exotic host without one), `zap_accel_available()`
+ * is 0 and the `fast` tier degrades to `native`.
  *
  * The tier/thread KNOBS below are pure getenv parsing and are ALWAYS compiled,
- * so the dispatcher reads them even in a `ZAP_NO_BLAS` build; only the provider
+ * so the dispatcher reads them even in a no-provider build; only the provider
  * thread-pool call in `zap_accel_ensure_threads` is gated behind ZAP_HAVE_BLAS.
  * Included near the end of zaprt.c, after `zap_maxprocs` / `zap_setenv_compat`
  * are defined (same translation unit, so no forward declarations are needed).
@@ -53,8 +55,7 @@ int64_t zap_accel_threads_env(void) {
 }
 
 /* 1 iff a BLAS/LAPACK accelerator is compiled in (a provider was found at build
- * time and `ZAP_NO_BLAS` was not set). A compile-time constant the `auto`/`fast`
- * dispatch (#904) consults. */
+ * time). A compile-time constant the `auto`/`fast` dispatch (#904) consults. */
 int64_t zap_accel_available(void) {
 #if defined(ZAP_HAVE_BLAS)
     return 1;

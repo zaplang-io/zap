@@ -389,9 +389,11 @@ Phase 2 (infrastructure; the matmul dispatch that uses it is #904).
 - Provider chosen at build time — OpenBLAS (Linux, `pkg-config`) / Apple
   Accelerate (macOS) — and linked only for a program that reaches a `zap_accel_*`
   seam, exactly like the pcre2/zlib backends (#853): codegen gates
-  `-DZAP_HAVE_BLAS` + the provider link flags on `BackendUse::blas`. `ZAP_NO_BLAS`
-  opts out; no provider ⇒ `fast` degrades to `native`. **Dormant until #904**
-  wires the first caller, so no program links or runs BLAS yet.
+  `-DZAP_HAVE_BLAS` + the provider link flags on `BackendUse::blas`. No provider
+  ⇒ `fast` degrades to `native`. (No build opt-out: the `ZAP_NO_BLAS` knob this
+  shipped with was dropped in #925 / D-0182 — `ZAP_ACCEL` is the runtime
+  override, and a program that uses no accel op links nothing anyway. Wired to
+  the first caller by the #904 dispatch.)
 
 **Increment 17 (shipped, #913 / D-0180):** own blocked+SIMD matmul floor kernel —
 epic #914 Phase 2 (the FLOOR the dispatch #904 picks for small / integer /

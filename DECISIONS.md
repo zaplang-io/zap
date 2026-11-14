@@ -8981,10 +8981,11 @@ language optimizes for you," with a programmer override.
   (`BackendUse::blas`, set by the matmul/accel dispatch #904): codegen defines
   `ZAP_HAVE_BLAS` + the provider macro on the runtime compile and adds the
   provider link flags (`-lopenblas` via `pkg-config` / `-framework Accelerate`)
-  for that program. Detection is **best-effort**: no provider found (or the
-  `ZAP_NO_BLAS` build opt-out) leaves `ZAP_HAVE_BLAS` undefined, so
-  `zap_accel_available()` is 0 and the `fast` tier **degrades to `native`** (no
-  link error). A program with no accelerated op pays nothing.
+  for that program. Detection is **best-effort**: no provider found leaves
+  `ZAP_HAVE_BLAS` undefined, so `zap_accel_available()` is 0 and the `fast` tier
+  **degrades to `native`** (no link error). A program with no accelerated op pays
+  nothing. *(Superseded in part by D-0182: the `ZAP_NO_BLAS` build opt-out
+  described below was dropped in #925.)*
 - **Thread budget pinned to Zap's.** `zap_accel_ensure_threads()` sizes the
   provider's internal pool from the container-aware MAXPROCS (#905) on first use,
   never the library default (default-threaded BLAS in a 1-core pod spiked p99,
@@ -8993,9 +8994,10 @@ language optimizes for you," with a programmer override.
 - **Provider-neutral naming** (survives replacing BLAS with an own impl — "never
   say never"): tiers `auto`/`native`/`fast` used identically by `ZAP_ACCEL`, the
   global knob, and the future `@kernel(...)` call-site; `ZAP_ACCEL_THREADS` sizes
-  the pool; `ZAP_NO_BLAS` is the build opt-out. The seam's tier/thread knobs are
-  always compiled (the dispatcher reads them even in a no-provider build); only
-  the provider thread-pool call is gated behind `ZAP_HAVE_BLAS`.
+  the pool. *(The `ZAP_NO_BLAS` build opt-out originally defined here was dropped
+  — see D-0182.)* The seam's tier/thread knobs are always compiled (the
+  dispatcher reads them even in a no-provider build); only the provider
+  thread-pool call is gated behind `ZAP_HAVE_BLAS`.
 - **Scope.** This decision is the seam only — the capability probe
   (`zap_accel_available`/`_ops`), the tier/thread knobs, and the build detection
   + link plumbing. It is **dormant until #904** wires the first caller (the
@@ -9069,3 +9071,25 @@ auto-selected for large float products — with a `ZAP_ACCEL` override.
 Relates to #904 (issue + benchmarks), D-0173 (the locked policy), #913/D-0180
 (the floor), #912/D-0179 (the seam), #905 (MAXPROCS), #499/D-0011; the
 own-micro-kernel tuning and linalg (#512) are follow-ups.
+
+## D-0182 — Drop the `ZAP_NO_BLAS` build opt-out (#925)
+**Status:** implemented — supersedes the `ZAP_NO_BLAS` part of D-0179
+D-0179 shipped the acceleration seam with a `ZAP_NO_BLAS` build opt-out (a power
+user could exclude the provider). That knob is removed: a programmer should not
+have to care whether BLAS is linked.
+- **Why it is redundant.** The provider is already linked **per program** only
+  when the program reaches an accel-eligible op (`BackendUse::blas`, the
+  pcre2/zlib pattern), and LTO/dead-strip removes it otherwise — so a program
+  that does no matmul/linalg carries no BLAS without any opt-out. The
+  binary-size concern `ZAP_NO_BLAS` addressed is thus already handled.
+- **What stays.** Best-effort build-time detection (OpenBLAS / Apple Accelerate)
+  and the runtime override `ZAP_ACCEL` (`auto`/`native`/`fast`) + the
+  `ZAP_ACCEL_THREADS` pool size. `native` still forces the own kernel at runtime
+  for anyone who wants no accelerator. A host with no provider still degrades
+  gracefully (the `fast` tier → `native`), now purely from detection, not a knob.
+- **Consequence for Phase 3.** `import linalg` (#512) is unconditionally
+  LAPACK-backed — there is no "built without BLAS" mode for a programmer to hit;
+  a provider is a standard part of the build environment (shipped in the CI /
+  dev / distribution images).
+Relates to #925, D-0179 (the seam), D-0181 (matmul dispatch), #512 (Phase 3
+epic — the motivating consumer).
