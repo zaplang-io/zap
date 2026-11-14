@@ -208,6 +208,8 @@ fn build_runtime_dylib() -> Result<(PathBuf, PathBuf), String> {
         .map_err(|e| format!("failed to write gc runtime: {e}"))?;
     std::fs::write(dir.join("zaprace.inc.c"), crate::RUNTIME_RACE_C)
         .map_err(|e| format!("failed to write race runtime: {e}"))?;
+    std::fs::write(dir.join("zapblas.inc.c"), crate::RUNTIME_BLAS_C)
+        .map_err(|e| format!("failed to write accel seam runtime: {e}"))?;
 
     let is_macos = triple.as_str().to_string_lossy().contains("darwin");
     let lib = dir.join(if is_macos {
