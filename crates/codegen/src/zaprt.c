@@ -14740,6 +14740,13 @@ __attribute__((constructor)) static void zap_gc_register_statics(void) {
  * link in that case. See zaprace.inc.c. */
 #include "zaprace.inc.c"
 
+/* Numeric acceleration seam (#912, D-0179): the tier/thread knobs + capability
+ * probe the array dispatcher (#904) consults. Included after `zap_maxprocs` /
+ * `zap_setenv_compat` so it reads them directly. The provider thread-pool call
+ * is gated behind ZAP_HAVE_BLAS, which the codegen defines only for a program
+ * that links a provider. */
+#include "zapblas.inc.c"
+
 /* ===========================================================================
  * stdlib: math + random (ticket #98, D-0056)
  * ---------------------------------------------------------------------------

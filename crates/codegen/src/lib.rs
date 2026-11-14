@@ -301,6 +301,7 @@ fn lto_runtime_bitcode(
     no_regex: bool,
     no_zlib: bool,
     no_openssl: bool,
+    blas_defines: &[String],
 ) -> Result<std::path::PathBuf, String> {
     use std::hash::{Hash, Hasher};
 
@@ -325,6 +326,7 @@ fn lto_runtime_bitcode(
     RUNTIME_C.hash(&mut h);
     RUNTIME_GC_C.hash(&mut h);
     RUNTIME_RACE_C.hash(&mut h);
+    RUNTIME_BLAS_C.hash(&mut h);
     cc.hash(&mut h);
     triple.hash(&mut h);
     immix.hash(&mut h);
@@ -333,11 +335,12 @@ fn lto_runtime_bitcode(
     no_zlib.hash(&mut h);
     no_openssl.hash(&mut h);
     py_cflags.hash(&mut h);
+    blas_defines.hash(&mut h);
     extra.hash(&mut h);
     // Bump when the runtime compile flags below change (e.g. adding
     // -fexceptions, #852 keying the CPython drop on `no_cpython`, or #853 adding
     // the PCRE2/zlib gates) so a stale pre-change cache entry is never reused.
-    "rt-bc-flags-v5-openssl-gate".hash(&mut h);
+    "rt-bc-flags-v6-blas-seam".hash(&mut h);
     // Different clang builds emit different bitcode — fold the version in.
     if let Ok(out) = Command::new(cc).arg("--version").output() {
         out.stdout.hash(&mut h);
@@ -397,6 +400,12 @@ fn lto_runtime_bitcode(
     }
     if no_openssl {
         rc.arg("-DZAP_NO_OPENSSL");
+    }
+    // Numeric accelerator (#912): define ZAP_HAVE_BLAS + the provider macro (and
+    // any `pkg-config --cflags`) for a program that reaches a `zap_accel_*` seam;
+    // empty otherwise, so the seam compiles as its no-provider stubs.
+    for d in blas_defines {
+        rc.arg(d);
     }
     for a in extra.split_whitespace() {
         rc.arg(a);
@@ -465,6 +474,7 @@ fn native_runtime_object(
     no_regex: bool,
     no_zlib: bool,
     no_openssl: bool,
+    blas_defines: &[String],
 ) -> Result<std::path::PathBuf, String> {
     use std::hash::{Hash, Hasher};
 
@@ -485,6 +495,7 @@ fn native_runtime_object(
     RUNTIME_C.hash(&mut h);
     RUNTIME_GC_C.hash(&mut h);
     RUNTIME_RACE_C.hash(&mut h);
+    RUNTIME_BLAS_C.hash(&mut h);
     cc.hash(&mut h);
     triple.hash(&mut h);
     opt_flag.hash(&mut h);
@@ -494,10 +505,11 @@ fn native_runtime_object(
     no_zlib.hash(&mut h);
     no_openssl.hash(&mut h);
     py_cflags.hash(&mut h);
+    blas_defines.hash(&mut h);
     extra.hash(&mut h);
     // Bump when the runtime compile flags below change so a stale pre-change
     // cache entry is never reused.
-    "rt-obj-flags-v1".hash(&mut h);
+    "rt-obj-flags-v2-blas-seam".hash(&mut h);
     // Different cc builds emit different objects — fold the version in.
     if let Ok(out) = Command::new(cc).arg("--version").output() {
         out.stdout.hash(&mut h);
@@ -541,6 +553,12 @@ fn native_runtime_object(
     }
     if no_openssl {
         rc.arg("-DZAP_NO_OPENSSL");
+    }
+    // Numeric accelerator (#912): define ZAP_HAVE_BLAS + the provider macro (and
+    // any `pkg-config --cflags`) for a program that reaches a `zap_accel_*` seam;
+    // empty otherwise, so the seam compiles as its no-provider stubs.
+    for d in blas_defines {
+        rc.arg(d);
     }
     for a in extra.split_whitespace() {
         rc.arg(a);
@@ -637,6 +655,12 @@ const RUNTIME_GC_C: &str = include_str!("zapgc.inc.c");
 /// the other embedded runtime files as `rerun-if-changed` inputs so a runtime
 /// edit always rebuilds this crate (CI's cache otherwise kept a stale runtime).
 const RUNTIME_RACE_C: &str = include_str!("zaprace.inc.c");
+/// The numeric acceleration seam (#912, D-0179), `#include`d unconditionally by
+/// `zaprt.c`. Written next to the runtime so the relative include resolves. Its
+/// tier/thread knobs are always compiled; the provider thread-pool call is gated
+/// behind `ZAP_HAVE_BLAS`, which codegen defines only for a program that links a
+/// BLAS provider (see `blas_build_flags`).
+const RUNTIME_BLAS_C: &str = include_str!("zapblas.inc.c");
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
 /// unit so it links into the Windows program build AND compiles standalone in
@@ -711,6 +735,13 @@ pub(crate) struct BackendUse {
     /// program that only hashes links no libssl. Over-matching a future
     /// self-contained `zap_crypto_*` would only over-link (never a miss).
     pub openssl: bool,
+    /// Numeric accelerator (#912): the program calls a `zap_accel_*` seam that
+    /// needs the BLAS provider (set by the matmul/accel dispatch, #904). Gates
+    /// `-DZAP_HAVE_BLAS` on the runtime compile and the provider link flags
+    /// (`-lopenblas` / `-framework Accelerate`). Off ⇒ `fast` degrades to
+    /// `native` and no provider is linked. The always-compiled tier/thread knobs
+    /// (`zap_accel_tier` / `zap_accel_threads_env`) do not set this.
+    pub blas: bool,
 }
 
 /// `zap_crypto_*` seams that are implemented in pure C (SHA-2 family, SHA-1,
@@ -771,11 +802,79 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
                         && !SELF_CONTAINED_CRYPTO.contains(&callee))
                 {
                     u.openssl = true;
+                } else if callee.starts_with("zap_accel_") {
+                    // #912: the numeric accelerator seam. Set when the array
+                    // dispatcher (#904) emits an accel-eligible op, so the BLAS
+                    // provider is compiled in + linked only for such a program.
+                    // The always-compiled tier/thread knobs are not gated on this.
+                    u.blas = true;
                 }
             }
         }
     }
     u
+}
+
+/// The numeric-acceleration provider's build flags (#912, D-0179) as
+/// `(compile_defines, link_args)`, or `None` when none is available. Called only
+/// for a program that reaches a `zap_accel_*` seam (`BackendUse::blas`), so a
+/// program with no accelerated op pays nothing. Detection is best-effort and
+/// build-time:
+///   * `ZAP_NO_BLAS` (the documented build opt-out) ⇒ `None`.
+///   * macOS ⇒ Apple Accelerate (a system framework, always present):
+///     `-DZAP_BLAS_ACCELERATE` + `-framework Accelerate`.
+///   * otherwise (Linux) ⇒ OpenBLAS when `pkg-config openblas` resolves (the CI
+///     image / dev container ship `libopenblas-dev`), else `None`.
+/// `None` leaves `ZAP_HAVE_BLAS` undefined, so `zap_accel_available()` is 0 and
+/// the `fast` tier degrades to `native` (the issue's graceful fallback). The
+/// compile defines always include `-DZAP_HAVE_BLAS` and the provider macro; the
+/// OpenBLAS arm also folds in `pkg-config --cflags` so a later `#include
+/// <cblas.h>` (the gemm dispatch, #904) finds its header.
+fn blas_build_flags() -> Option<(Vec<String>, Vec<String>)> {
+    if std::env::var_os("ZAP_NO_BLAS").is_some() {
+        return None;
+    }
+    let triple = TargetMachine::get_default_triple();
+    let triple_str = triple.as_str().to_string_lossy().into_owned();
+    let is_macos =
+        triple_str.contains("darwin") || triple_str.contains("macos") || cfg!(target_os = "macos");
+    if is_macos {
+        return Some((
+            vec!["-DZAP_HAVE_BLAS".into(), "-DZAP_BLAS_ACCELERATE".into()],
+            vec!["-framework".into(), "Accelerate".into()],
+        ));
+    }
+    // Linux / other: require pkg-config to resolve OpenBLAS, so a host without
+    // the provider falls back gracefully to `native` instead of a link error.
+    let libs = Command::new("pkg-config")
+        .args(["--libs", "openblas"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let link: Vec<String> = String::from_utf8_lossy(&libs.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if link.is_empty() {
+        return None;
+    }
+    let mut defines = vec![
+        "-DZAP_HAVE_BLAS".to_string(),
+        "-DZAP_BLAS_OPENBLAS".to_string(),
+    ];
+    if let Ok(cf) = Command::new("pkg-config")
+        .args(["--cflags", "openblas"])
+        .output()
+    {
+        if cf.status.success() {
+            defines.extend(
+                String::from_utf8_lossy(&cf.stdout)
+                    .split_whitespace()
+                    .map(str::to_string),
+            );
+        }
+    }
+    Some((defines, link))
 }
 
 /// Build a native executable. With `portable`, use the portable link profile
@@ -878,6 +977,8 @@ pub fn build_executable(
         .map_err(|e| format!("failed to write gc runtime: {e}"))?;
     std::fs::write(build_dir.join("zaprace.inc.c"), RUNTIME_RACE_C)
         .map_err(|e| format!("failed to write race runtime: {e}"))?;
+    std::fs::write(build_dir.join("zapblas.inc.c"), RUNTIME_BLAS_C)
+        .map_err(|e| format!("failed to write accel seam runtime: {e}"))?;
 
     // Target-aware link step (ticket #199, platform epic #158 / Area A5). Today
     // codegen emits for the host triple only, so "Windows target" means "running
@@ -930,6 +1031,16 @@ pub fn build_executable(
     let no_regex = !backends.regex;
     let no_zlib = !backends.zlib;
     let no_openssl = !backends.openssl;
+    // Numeric accelerator (#912): resolve the provider's build flags only for a
+    // program that reaches a `zap_accel_*` seam (the matmul/accel dispatch, #904)
+    // — otherwise nothing probes for a provider and nothing links. A reaching
+    // program with no provider available gets empty flags (the seam compiles as
+    // its no-provider stubs: `fast` degrades to `native`).
+    let (blas_defines, blas_libs): (Vec<String>, Vec<String>) = if backends.blas {
+        blas_build_flags().unwrap_or_default()
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     // Linker driver. On the default path, `cc` (the MinGW-w64 `gcc`/`cc` on a
     // Windows host provides the `x86_64-pc-windows-gnu` target); override with
@@ -967,6 +1078,7 @@ pub fn build_executable(
             no_regex,
             no_zlib,
             no_openssl,
+            &blas_defines,
         ) {
             Ok(path) => path,
             Err(e) => {
@@ -1114,6 +1226,7 @@ pub fn build_executable(
                 no_regex,
                 no_zlib,
                 no_openssl,
+                &blas_defines,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1182,6 +1295,14 @@ pub fn build_executable(
     // depends on `-lcrypto`, so that order.
     if !no_openssl {
         cmd.arg("-lssl").arg("-lcrypto");
+    }
+    // Numeric accelerator (#912): the BLAS/LAPACK provider's link flags
+    // (`-lopenblas` on Linux via `pkg-config`, `-framework Accelerate` on macOS),
+    // resolved into `blas_libs` only for a program that reaches a `zap_accel_*`
+    // seam (#904). Empty otherwise, so a program with no accelerated op — and any
+    // program on a host with no provider — links nothing extra.
+    for a in &blas_libs {
+        cmd.arg(a);
     }
     cmd
         // `-lpthread` backs the coroutine runtime (ticket #25): each `spawn`
@@ -7255,6 +7376,26 @@ mod tests {
         assert!(
             ir.contains("fadd <4 x double>"),
             "expected a vectorized fadd in IR:\n{ir}"
+        );
+    }
+
+    // #912: the acceleration seam's build-time provider detection honours the
+    // `ZAP_NO_BLAS` opt-out — it returns None regardless of host, so the `fast`
+    // tier degrades to `native` and nothing links. (The positive case depends on
+    // the host having a provider, so it is left to the CI image / #904.)
+    #[test]
+    fn blas_build_flags_respects_zap_no_blas() {
+        // Env is process-global; save and restore so no sibling test is affected.
+        let prev = std::env::var_os("ZAP_NO_BLAS");
+        std::env::set_var("ZAP_NO_BLAS", "1");
+        let got = blas_build_flags();
+        match prev {
+            Some(v) => std::env::set_var("ZAP_NO_BLAS", v),
+            None => std::env::remove_var("ZAP_NO_BLAS"),
+        }
+        assert!(
+            got.is_none(),
+            "ZAP_NO_BLAS must disable the accelerator (got {got:?})"
         );
     }
 
