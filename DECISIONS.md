@@ -8931,3 +8931,38 @@ no surface syntax and no semantics change.
   reduction is bit-identical for every dtype, floats included.
 Relates to #914 (perf epic, Phase 1), #507/D-0170 (the reduction surface), #896
 (sibling broadcast-kernel vectorization), #909 (bandwidth-bound calibration).
+
+## D-0178 — Vectorized broadcast element-wise kernel (#896)
+**Status:** implemented
+Phase 1 of the array performance & acceleration epic (#914), the broadcast half
+(sibling to #911, the reduction half). A pure codegen performance change: no
+surface syntax and no semantics change.
+- **Problem.** Element-wise `+`/`-`/`*`/`/` picks its kernel at run time
+  (`zap_array_same_shape`): equal shapes take the flat SIMD loop (`<4 x T>` body
+  + scalar tail), but a *broadcast* (unequal yet compatible shapes — `m + row`,
+  `m + col`, an outer product, …) fell to a **scalar** loop that called
+  `zap_array_bcast_offsets` per element to decode the result index into each
+  operand's window offset. One runtime call and one scalar op per element — far
+  off the "the compiler owns vectorization" bar and much slower than the
+  equal-shape path it otherwise resembles.
+- **Decision.** Vectorize the broadcast path along the result's **innermost
+  axis**, inline in codegen (consistent with the equal-shape kernel — the mixed-
+  dtype/NEP-50 arithmetic lives in codegen, not the runtime, so a runtime kernel
+  would have to duplicate the whole promotion matrix). Walk the result one inner
+  row at a time: `zap_array_bcast_offsets` is called ONCE per row (not per
+  element) to get each operand's base offset (correct for any rank, since only
+  the last axis varies within a row), then the inner axis runs a `<4 x T>` vector
+  body + scalar tail. Operands are compacted/contiguous, so each operand's inner
+  step is either its stride (contiguous → vector-load) or 0 (stretched size-1
+  axis → the value is constant across the row, splat into the lanes); no non-unit
+  stride and so no gather ever arises. The kernel is specialized on the two
+  booleans (`lhs contiguous?`, `rhs contiguous?`) chosen once per op, so the hot
+  inner loop carries no per-lane branch.
+- **Result.** The broadcast path now matches the equal-shape path's
+  vectorization. `zap_array_same_shape` stays only as a cheap early-out. Results
+  are unchanged (the arithmetic, dtype promotion, and true-division IEEE
+  semantics are the same per-lane operations as before). A new runtime helper
+  `zap_array_bcast_inner_stride` reports an operand's inner-axis step (0 or its
+  stride); `zap_array_bcast_offsets` is reused unchanged.
+Relates to #914 (perf epic, Phase 1), #501/D-0165 (broadcasting surface), #911
+(sibling reduction-kernel vectorization), #502 (the shared stride model).

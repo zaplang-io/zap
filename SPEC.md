@@ -1418,7 +1418,9 @@ wrap modulo 2^width. Two arrays **broadcast** (NumPy rules:
 right-align shapes, stretch size-1 axes, and extend the lower-rank operand with
 leading 1s; the result takes the larger rank and the larger aligned dim). Shapes
 that cannot broadcast together raise a catchable `ValueError` ("array shape
-mismatch") before the kernel reads the buffers.
+mismatch") before the kernel reads the buffers. Both the equal-shape and the
+broadcast element-wise kernels are vectorized along the innermost axis (#896) —
+a performance detail with no effect on results.
 
 Division `/` is NumPy **true division**: the result dtype is always a float, so
 an all-integer division lifts to `f64` (`array[i64] / 2 → f64`) while a float

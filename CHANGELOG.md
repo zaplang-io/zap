@@ -1107,6 +1107,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **The broadcast element-wise kernel is vectorized** (#896, D-0178). Element-wise
+  `+`/`-`/`*`/`/` on arrays of unequal-but-compatible shapes (`m + row`, `m + col`,
+  outer products, N-D, mixed dtype) ran a per-element scalar loop that decoded each
+  operand's offset with a runtime call per element; the equal-shape path was
+  already SIMD. The broadcast path now walks the result one inner row at a time
+  (one offset call per row) and vectorizes the innermost axis — a contiguous
+  operand is vector-loaded, a stretched one is splat across the lanes — matching
+  the equal-shape kernel. Phase 1 of the array performance epic (#914), the
+  broadcast half (sibling of #911). Pure codegen change; results unchanged.
 - **Array reductions are vectorized (multiple accumulators)** (#911, D-0177).
   `sum`/`min`/`max`/`mean`/`prod` — whole-array and `axis=` (#507/D-0170) — ran a
   scalar accumulator loop with a single, latency-bound dependency chain. They now
