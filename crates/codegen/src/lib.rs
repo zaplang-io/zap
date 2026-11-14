@@ -822,22 +822,22 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
 /// `(compile_defines, link_args)`, or `None` when none is available. Called only
 /// for a program that reaches a `zap_accel_*` seam (`BackendUse::blas`), so a
 /// program with no accelerated op pays nothing. Detection is best-effort and
-/// build-time:
-///   * `ZAP_NO_BLAS` (the documented build opt-out) ⇒ `None`.
+/// build-time (there is no opt-out knob — #925 dropped `ZAP_NO_BLAS`: a program
+/// that uses no accel-eligible op already links no provider, via LTO/dead-strip
+/// and the per-program `BackendUse::blas` gate, and `ZAP_ACCEL` is the runtime
+/// override):
 ///   * macOS ⇒ Apple Accelerate (a system framework, always present):
 ///     `-DZAP_BLAS_ACCELERATE` + `-framework Accelerate`.
 ///   * otherwise (Linux) ⇒ OpenBLAS when `pkg-config openblas` resolves (the CI
 ///     image / dev container ship `libopenblas-dev`), else `None`.
 ///
-/// `None` leaves `ZAP_HAVE_BLAS` undefined, so `zap_accel_available()` is 0 and
-/// the `fast` tier degrades to `native` (the issue's graceful fallback). The
-/// compile defines always include `-DZAP_HAVE_BLAS` and the provider macro; the
-/// OpenBLAS arm also folds in `pkg-config --cflags` so a later `#include
-/// <cblas.h>` (the gemm dispatch, #904) finds its header.
+/// `None` (no provider found) leaves `ZAP_HAVE_BLAS` undefined, so
+/// `zap_accel_available()` is 0 and the `fast` tier degrades to `native` (the
+/// graceful fallback for an exotic host without a provider). The compile defines
+/// always include `-DZAP_HAVE_BLAS` and the provider macro; the OpenBLAS arm also
+/// folds in `pkg-config --cflags` so a later `#include <cblas.h>` (the gemm
+/// dispatch, #904) finds its header.
 fn blas_build_flags() -> Option<(Vec<String>, Vec<String>)> {
-    if std::env::var_os("ZAP_NO_BLAS").is_some() {
-        return None;
-    }
     let triple = TargetMachine::get_default_triple();
     let triple_str = triple.as_str().to_string_lossy().into_owned();
     let is_macos =
@@ -7380,26 +7380,6 @@ mod tests {
         assert!(
             ir.contains("fadd <4 x double>"),
             "expected a vectorized fadd in IR:\n{ir}"
-        );
-    }
-
-    // #912: the acceleration seam's build-time provider detection honours the
-    // `ZAP_NO_BLAS` opt-out — it returns None regardless of host, so the `fast`
-    // tier degrades to `native` and nothing links. (The positive case depends on
-    // the host having a provider, so it is left to the CI image / #904.)
-    #[test]
-    fn blas_build_flags_respects_zap_no_blas() {
-        // Env is process-global; save and restore so no sibling test is affected.
-        let prev = std::env::var_os("ZAP_NO_BLAS");
-        std::env::set_var("ZAP_NO_BLAS", "1");
-        let got = blas_build_flags();
-        match prev {
-            Some(v) => std::env::set_var("ZAP_NO_BLAS", v),
-            None => std::env::remove_var("ZAP_NO_BLAS"),
-        }
-        assert!(
-            got.is_none(),
-            "ZAP_NO_BLAS must disable the accelerator (got {got:?})"
         );
     }
 
