@@ -467,6 +467,7 @@ const BUILTINS: &[&str] = &[
     "dot",
     "concatenate",
     "stack",
+    "where",
     "sorted",
     // String / char builtins (ticket #284, D-0025).
     "ord",
@@ -4827,7 +4828,15 @@ impl Checker {
                         self.arith_result(*op, l, r, *span);
                     }
                 }
-                Ty::Bool
+                // A comparison against a loose (array) operand is itself loose
+                // (#510): `a > 3` on an `array` is a boolean *mask*, not a scalar
+                // bool, so it must stay `Unknown` to combine with `& | ~` and to
+                // index. Concrete scalar comparisons remain a strict `bool`.
+                if tys.iter().any(|t| matches!(t, Ty::Unknown)) {
+                    Ty::Unknown
+                } else {
+                    Ty::Bool
+                }
             }
             Expr::Call { callee, args, span } => self.check_call(callee, args, *span),
             Expr::Index { base, index, span } => {
@@ -5225,7 +5234,16 @@ impl Checker {
                     Ty::Unknown
                 }
             }
-            Eq | Ne => Ty::Bool,
+            // A comparison against a loose (array) operand is a boolean *mask*,
+            // itself loose (#510), so it stays `Unknown` to combine with
+            // `& | ~` and to index; a concrete scalar comparison is `bool`.
+            Eq | Ne => {
+                if matches!(l, Ty::Unknown) || matches!(r, Ty::Unknown) {
+                    Ty::Unknown
+                } else {
+                    Ty::Bool
+                }
+            }
             Lt | Le | Gt | Ge => {
                 if matches!(l, Ty::Complex) || matches!(r, Ty::Complex) {
                     self.error(
@@ -5234,7 +5252,11 @@ impl Checker {
                         span,
                     );
                 }
-                Ty::Bool
+                if matches!(l, Ty::Unknown) || matches!(r, Ty::Unknown) {
+                    Ty::Unknown
+                } else {
+                    Ty::Bool
+                }
             }
             In | NotIn => Ty::Bool,
             // `is` / `is not` (#611, D18): the operand rules are enforced by
@@ -6130,6 +6152,15 @@ impl Checker {
                 "concatenate" | "stack" => {
                     // Shape ops over a list of arrays (#511); typed loosely, the
                     // lowering derives the real rank from the list element type.
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
+                "where" => {
+                    // where(cond, x, y) selects element-wise; where(cond) returns
+                    // a tuple of index arrays (#510). Arrays type loosely, so the
+                    // result is loose; the lowering derives the real shape/tuple.
                     for a in args {
                         self.infer(&a.value);
                     }
@@ -11284,6 +11315,7 @@ def main():
         ok(include_str!("../../../tests/golden/array_strided.zap"));
         ok(include_str!("../../../tests/golden/array_matmul.zap"));
         ok(include_str!("../../../tests/golden/array_shape_ops.zap"));
+        ok(include_str!("../../../tests/golden/array_fancy_mask.zap"));
     }
 
     // --- decorators & annotations (ticket #16, D-0036) ---

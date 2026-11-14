@@ -1405,6 +1405,9 @@ longer-term N-D design in `design/0002-arrays.md`.
 | Slicing | Views that alias the parent: contiguous `a[lo:hi]`, stepped/reversed `a[::2]` / `a[::-1]`, N-D axis-0 windows `m[lo:hi]`, and a sliced axis in a multi-axis index `m[:, j]` (per-axis strides) |
 | Linear algebra | `a @ b` (matrix multiply, PEP 465) / `dot(a, b)` / in-place `a @= b` on 1-D & 2-D arrays: 1-D·1-D → scalar dot, 2-D·2-D → matrix, mixed → vector |
 | Shape ops | `a.reshape(d…)` and `a.transpose()` / `a.T` are views; `a.flatten()` is a 1-D copy; `concatenate([…], axis=)` / `stack([…], axis=)` build new arrays |
+| Masks | Element-wise comparisons `a > 3` / `a == b` give an `array[bool]`; combine with `&` `\|` `^` `~`. An array in a boolean context (`if a:`, `and`/`or`, `lo < a < hi`) raises — use `.any()`/`.all()` (follow-up) or a mask |
+| Advanced indexing | `a[mask]` (boolean) and `a[idx]` (integer array) gather a fresh **copy**; `a[mask]=`/`a[idx]=` scatter. Multiple index arrays and mixed `a[1:3, idx]` broadcast and follow NumPy's transpose rule. Out-of-bounds → `IndexError` |
+| Selection | `where(cond, x, y)` picks element-wise with broadcasting (`x`/`y` may be scalars); `where(cond)` returns the index arrays of the true cells |
 
 Mixed array dtypes promote by NumPy NEP-50 (a float operand forces the widest
 float; same-signedness integers take the wider; mixed signed/unsigned take the
@@ -1456,14 +1459,31 @@ same-rank arrays along an existing axis (other dims must match) and `stack([a,
 …], axis=k)` joins same-shape arrays along a new axis (rank + 1); both are fresh
 copies. A size/shape/axis fault raises a catchable `ValueError`.
 
+Element-wise comparisons (`a > 3`, `a == b`, with scalar broadcast) produce an
+`array[bool]` **mask**; `&`, `|`, `^` combine masks and `~` inverts one. Because
+the truth value of a multi-element array is ambiguous, an array in a boolean
+context — `if a:`, `a and b`, `not a`, or a chained `lo < a < hi` — raises a
+catchable `ValueError`. A mask indexes: `a[mask]` applies to the leading axes and
+returns a fresh 1-D (or rank-reduced) **copy** of the selected elements, and
+`a[mask] = v` scatters a scalar or array of values in place. Integer-array
+indexing `a[idx]` gathers along axis 0 (result shape `idx.shape + a.shape[1:]`, a
+copy; negative indices wrap, out-of-bounds raises `IndexError`), and `a[idx] = v`
+scatters (duplicate indices resolve last-write-wins). A multi-axis subscript may
+mix scalars, slices, and index arrays (`a[1:3, idx]`, `a[i, j]`): the index
+arrays broadcast together and the result follows NumPy's layout rule (the
+broadcast axes sit at the advanced block when its axes are contiguous, else at
+the front). `where(cond, x, y)` selects element-wise with broadcasting (`x`/`y`
+may be scalars); `where(cond)` returns a tuple of the true cells' index arrays.
+Advanced indexing always copies (unlike a slice view).
+
 A bare `array[T]` type annotation denotes a rank-1 array; N-D values arise
 through inference (`auto`). List-variable/iterable `array[T]` construction,
-a fully dynamic-rank (runtime-tuple) constructor shape,
-element-wise unary negation/bitwise operations, array
-comparisons, floor division `//`/modulo `%`, `keepdims` reductions, broadcasting
-in assignment or partial-index (whole-row) stores, assigning through a sliced
-index (a strided-view store), and explicit N-D type annotations are unsupported.
-Semantic or lowering diagnostics reject these forms.
+a fully dynamic-rank (runtime-tuple) constructor shape, element-wise unary
+negation and integer-array (non-mask) bitwise operations, floor division
+`//`/modulo `%`, `keepdims` reductions, broadcasting in assignment or
+partial-index (whole-row) stores, assigning through a sliced index (a
+strided-view store), and explicit N-D type annotations are unsupported. Semantic
+or lowering diagnostics reject these forms.
 
 ```python
 auto a = array[f64]([1, 2, 3])

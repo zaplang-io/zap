@@ -1,0 +1,22 @@
+mask 3
+eq 0
+and 2
+or 2
+not 3
+sel 3 4 6 15
+2dmask 2 3 4 7
+leadmask 2 1 2 3
+clip 0 0 2 3
+maskset 7 8 18
+gather 4 30 110
+neg 40 30
+ndgather 2 2 5 2 14
+scatter 9 9 24
+where 0 3 8
+where2 1 20 51
+fancy2 2 2 7 9
+mixed 2 2 5 7 24
+full 2 3 9 30
+ambig
+oob
+nonzero 2 4 5

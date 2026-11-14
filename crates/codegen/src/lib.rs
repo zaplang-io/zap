@@ -2359,6 +2359,78 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         );
         self.declare_rt("zap_array_concat", &[p.into(), i.into()], Some(p.into()));
         self.declare_rt("zap_array_stack", &[p.into(), i.into()], Some(p.into()));
+        // Comparison & mask combination (#510, D-0175): element-wise compare ->
+        // array[bool] (array-array with broadcast, and array-scalar), the logical
+        // `&`/`|`/`^` combiners and `~` over bool masks.
+        self.declare_rt(
+            "zap_array_cmp",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_cmp_scalar",
+            &[p.into(), i.into(), f.into(), i.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_logical",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_array_lognot", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_array_truth_ambiguous", &[], None);
+        // Boolean-mask indexing (#510, D-0175): select -> a fresh copy;
+        // assignment writes back into the target's storage.
+        self.declare_rt(
+            "zap_array_mask_select",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_mask_assign_scalar",
+            &[p.into(), p.into(), i.into(), f.into(), i.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_array_mask_assign_array",
+            &[p.into(), p.into(), p.into()],
+            None,
+        );
+        // Fancy integer-array indexing (#510, D-0175): gather along axis 0 and
+        // the matching scatter assignments.
+        self.declare_rt("zap_array_take", &[p.into(), p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_array_scatter_scalar",
+            &[p.into(), p.into(), i.into(), f.into(), i.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_array_scatter_array",
+            &[p.into(), p.into(), p.into()],
+            None,
+        );
+        // where(cond, x, y) + nonzero (#510, D-0175): 3-way broadcast select,
+        // scalar->1-elem-array wrappers, and the per-axis nonzero gather that the
+        // 1-arg where(cond) packs into a tuple.
+        self.declare_rt("zap_array_from_scalar_i", &[i.into()], Some(p.into()));
+        self.declare_rt("zap_array_from_scalar_f", &[f.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_array_where",
+            &[p.into(), p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_nonzero_axis",
+            &[p.into(), i.into()],
+            Some(p.into()),
+        );
+        // General advanced indexing (#510, D-0175): multi-axis fancy/mixed
+        // subscripts via a per-axis spec buffer + the list of index arrays.
+        self.declare_rt(
+            "zap_array_fancy",
+            &[p.into(), p.into(), i.into(), p.into()],
+            Some(p.into()),
+        );
         // Constructors (#504, D-0167): zeros/ones/full fill a `new_nd` result via
         // `fill_i`/`fill_f` (value as an i64 or f64 ABI word); arange/linspace
         // allocate and fill a runtime-length 1-D array themselves.

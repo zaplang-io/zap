@@ -672,7 +672,8 @@ mod tests {
             ("auto x = a[0, 1]", "too many indices"),
             ("a[0, 1] = 2", "too many indices"),
             ("auto x = a[0.5:]", "slice bounds must be integers"),
-            ("auto x = a == a", "only +, -, *, and /"),
+            // `==` on arrays is a boolean-mask comparison since #510 (see
+            // mask_tests); `-a` (element-wise negate) stays unsupported.
             ("auto x = -a", "unary array operations are unsupported"),
             ("a[0] = \"x\"", "assignment requires a numeric scalar"),
         ] {

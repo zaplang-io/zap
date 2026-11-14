@@ -323,8 +323,33 @@ model.
   ABI) and read rank/dtype from the first element. No new grammar; no array-ABI
   change.
 
+**Increment 13 (shipped, #510 / D-0175):** boolean-mask & fancy (integer-array)
+indexing + `where` — the final feature increment of #499.
+
+- Element-wise comparisons `== != < <= > >=` → `array[bool]` masks (broadcast +
+  scalar), `& | ^` combine and `~` inverts; array truthiness / `and` / `or` /
+  chained `lo < a < hi` raise NumPy's ambiguous `ValueError`.
+- `a[mask]` (leading-axis boolean, result rank `1 + ndim − mask.ndim`) and
+  `a[idx]` (integer gather along axis 0, result `idx.shape + a.shape[1:]`) are
+  fresh **copies**; `a[mask] = …` / `a[idx] = …` scatter in place (last write
+  wins). The general `a[p0, p1, …]` engine mixes scalars, slices, and index
+  arrays, broadcasts the advanced indices, and places the broadcast axes by
+  NumPy's transpose rule (at the advanced block when contiguous, else at the
+  front). `where(cond, x, y)` selects with full broadcasting; `where(cond)` is
+  `nonzero` (a tuple of index arrays).
+- All runtime C (the matmul/reductions pattern), not inline SIMD: compare/logical
+  kernels, `mask_select`/`mask_assign_*`, `take`/`scatter_*`, the general
+  `zap_array_fancy` (spec-buffer + index-array list), `where`/`nonzero_axis`, and
+  a general N-D `zap_array_phys_nd` for in-place advanced assignment. Comparisons
+  stay loose (`Unknown`) in sema so masks combine and index. No new grammar; no
+  array-ABI change. Matches NumPy 2.5.4 (verified before implementation).
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
+- Integer-array (non-mask) bitwise element-wise ops (`&`/`|`/`^`/`~` on numeric
+  arrays — a sibling of the Increment 7/8 element-wise ops, out of #510's
+  indexing scope); `ravel` (a view-when-possible flatten); `add.at`-style
+  accumulating scatter (#510 uses last-write-wins, as NumPy's plain `a[idx]=`).
 - **Matmul performance** (#904, D-0173): the D-0172 kernel is a correct *scalar*
   triple loop. Policy locked: Zap auto-dispatches between an own blocked+SIMD
   kernel and a BLAS hand-off (both linked); the BLAS path **defaults** to pinning
