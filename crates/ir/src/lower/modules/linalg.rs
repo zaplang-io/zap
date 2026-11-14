@@ -35,7 +35,7 @@ fn lower(
         let (v, _) = lowerer.expr(&a.value)?;
         vs.push(v);
     }
-    let d = lowerer.new_value(ret.clone());
+    let d = lowerer.new_value(ret);
     lowerer.throwing_call(Some(d), rt, vs);
     Ok(Some((d, ret)))
 }
