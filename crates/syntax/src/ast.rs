@@ -985,6 +985,7 @@ pub enum BinOp {
     Div,      // /   (true division, D-0024)
     FloorDiv, // //  (floor division, D-0024)
     Mod,      // %
+    MatMul,   // @   (matrix multiply, PEP 465, #509)
     Pow,      // **
     And,      // and
     Or,       // or
@@ -1031,6 +1032,7 @@ pub fn binop_str(op: BinOp) -> &'static str {
         Div => "/",
         FloorDiv => "//",
         Mod => "%",
+        MatMul => "@",
         Pow => "**",
         And => "and",
         Or => "or",

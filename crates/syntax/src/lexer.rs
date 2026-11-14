@@ -697,7 +697,13 @@ impl<'a> Lexer<'a> {
                     TokenKind::Colon
                 }
             }
-            b'@' => TokenKind::At,
+            b'@' => {
+                if self.eat(b'=') {
+                    TokenKind::AtEq
+                } else {
+                    TokenKind::At
+                }
+            }
             b'~' => {
                 if self.eat(b'=') {
                     TokenKind::SubstAssign

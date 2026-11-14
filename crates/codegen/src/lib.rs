@@ -2334,6 +2334,17 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         );
         self.declare_rt("zap_array_mean_axis", &[p.into(), i.into()], Some(p.into()));
         self.declare_rt("zap_array_axis_check", &[p.into(), i.into()], None);
+        // Matrix multiply / dot product (#509, D-0172). `dot{i,f}` return the
+        // 1-D·1-D scalar (int/float word); `matmul` returns a new rank-1 or
+        // rank-2 array of the promoted `out_dtype`. All raise ValueError on a
+        // shape mismatch.
+        self.declare_rt("zap_array_doti", &[p.into(), p.into()], Some(i.into()));
+        self.declare_rt("zap_array_dotf", &[p.into(), p.into()], Some(f.into()));
+        self.declare_rt(
+            "zap_array_matmul",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
         // Constructors (#504, D-0167): zeros/ones/full fill a `new_nd` result via
         // `fill_i`/`fill_f` (value as an i64 or f64 ABI word); arange/linspace
         // allocate and fill a runtime-length 1-D array themselves.

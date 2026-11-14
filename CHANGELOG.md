@@ -981,6 +981,15 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   raises `ValueError`), and `linspace[T](start, stop, num)` (`num` samples, both
   ends inclusive). All accept the full dtype matrix.
 
+- **Matrix multiply `@` / `dot`** (#509, D-0172, PEP 465, epic #499): the infix
+  `@` operator (and in-place `@=`) and the `dot(a, b)` function do matrix
+  multiplication on 1-D and 2-D numeric arrays — 1-D·1-D is a scalar dot product,
+  2-D·2-D a matrix product, and a mixed 1-D/2-D operand a vector. Result dtype
+  follows NEP-50; a shape mismatch raises `ValueError`. `@` desugars to the
+  `__matmul__` / `__imatmul__` operator dunders (D-0047), so a user struct can
+  define it too; it is a type error on non-array scalars/`list`/`dict`. Batched
+  (≥3-D) matmul is not yet supported.
+
 - **Strided array views** (#502, D-0171, epic #499): stepped/reversed 1-D slices
   (`a[::2]`, `a[::-1]`), N-D axis-0 windows (`m[lo:hi]`, rank-preserving), and a
   sliced axis inside a multi-axis index (`m[:, j]`, `m[lo:hi, k]`, `m[i, ::2]`)

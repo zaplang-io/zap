@@ -33,7 +33,7 @@ fn binop_prec(op: BinOp) -> (u8, bool /* right-assoc */) {
         BitAnd => (9, false),
         Shl | Shr => (10, false),
         Add | Sub => (11, false),
-        Mul | Div | FloorDiv | Mod => (12, false),
+        Mul | Div | FloorDiv | Mod | MatMul => (12, false),
         Pow => (P_POW, true),
     }
 }

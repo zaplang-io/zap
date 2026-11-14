@@ -335,7 +335,7 @@ del_stmt      ::= "del" index_target ;
                      immediately followed by another identifier, and stays an
                      ordinary identifier everywhere else. *)
 index_target  ::= target ;                     (* must resolve to an `atom trailer+` ending in "[" expr "]" *)
-aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**="
+aug_op        ::= "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**=" | "@="
                 | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
                   (* Operator overloading (D-0047) is semantic, not grammatical:
                      each operator desugars to a dunder method (`a + b` ->
@@ -549,7 +549,7 @@ bit_xor       ::= bit_and { "^" bit_and } ;
 bit_and       ::= shift { "&" shift } ;
 shift         ::= add { ( "<<" | ">>" ) add } ;
 add           ::= term { ( "+" | "-" ) term } ;
-term          ::= factor { ( "*" | "/" | "//" | "%" ) factor } ;
+term          ::= factor { ( "*" | "/" | "//" | "%" | "@" ) factor } ;  (* "@" matrix multiply, PEP 465, #509 *)
 factor        ::= ( "+" | "-" | "~" ) factor | power ;
 power         ::= postfix [ "**" factor ] ;
 postfix       ::= atom { trailer } ;

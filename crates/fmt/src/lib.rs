@@ -1273,6 +1273,16 @@ mod tests {
     }
 
     #[test]
+    fn matmul_operator_round_trips() {
+        // `@` (matrix multiply) and `@=` re-emit byte-for-byte, and `@` binds at
+        // multiply precedence so `a + b @ c` keeps its shape without parens (#509).
+        let src = "def main():\n    auto a = array[i64]([[1, 2], [3, 4]])\n    \
+                   auto b = array[i64]([[1, 0], [0, 1]])\n    auto c = a @ b\n    \
+                   a @= b\n    auto d = a @ b @ c\n    print(sum(c), sum(d))\n";
+        assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
     fn strided_subscripts_round_trip() {
         // Stepped / reversed 1-D slices and multi-axis slices (#502) re-emit
         // byte-for-byte: a bare `:` axis, a `lo:hi:step`, a negative step, and a
