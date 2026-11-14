@@ -293,6 +293,7 @@ fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
 ///
 /// `rt_path` must already have `zaprt.c` + its `#include`d `zapgc.inc.c` /
 /// `zaprace.inc.c` written beside it (the caller does this).
+#[allow(clippy::too_many_arguments)]
 fn lto_runtime_bitcode(
     cc: &str,
     rt_path: &Path,
@@ -825,6 +826,7 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
 ///     `-DZAP_BLAS_ACCELERATE` + `-framework Accelerate`.
 ///   * otherwise (Linux) ⇒ OpenBLAS when `pkg-config openblas` resolves (the CI
 ///     image / dev container ship `libopenblas-dev`), else `None`.
+///
 /// `None` leaves `ZAP_HAVE_BLAS` undefined, so `zap_accel_available()` is 0 and
 /// the `fast` tier degrades to `native` (the issue's graceful fallback). The
 /// compile defines always include `-DZAP_HAVE_BLAS` and the provider macro; the
