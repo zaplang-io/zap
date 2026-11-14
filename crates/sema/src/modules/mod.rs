@@ -32,6 +32,7 @@ mod hex;
 mod http;
 mod io;
 mod json;
+mod linalg;
 mod logging;
 mod math;
 mod net;
@@ -78,6 +79,7 @@ pub(crate) const MODULES: &[ModuleCheck] = &[
     base64::MODULE,
     hex::MODULE,
     math::MODULE,
+    linalg::MODULE,
     random::MODULE,
     time::MODULE,
     datetime::MODULE,

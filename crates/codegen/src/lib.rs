@@ -803,13 +803,16 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
                         && !SELF_CONTAINED_CRYPTO.contains(&callee))
                 {
                     u.openssl = true;
-                } else if callee.starts_with("zap_array_matmul") {
+                } else if callee.starts_with("zap_array_matmul")
+                    || callee.starts_with("zap_linalg_")
+                {
                     // #904: matrix multiply (`@` / 2-D `dot`) auto-dispatches to
-                    // a BLAS gemm for large float products (#912 seam), so a
-                    // program that reaches it compiles the runtime with the
-                    // provider (`ZAP_HAVE_BLAS`) and links it — exactly like the
-                    // pcre2/zlib seams. 1-D·1-D `dot` (`zap_array_dot{i,f}`) stays
-                    // the scalar accumulator and never needs BLAS.
+                    // a BLAS gemm for large float products (#912 seam); #926:
+                    // `import linalg` (solve/inv/det) is LAPACK-backed. Either
+                    // makes the program compile the runtime with the provider
+                    // (`ZAP_HAVE_BLAS`) and link it — exactly like the pcre2/zlib
+                    // seams. 1-D·1-D `dot` (`zap_array_dot{i,f}`) stays the scalar
+                    // accumulator and never needs BLAS.
                     u.blas = true;
                 }
             }
@@ -2511,6 +2514,13 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), p.into(), i.into()],
             Some(p.into()),
         );
+        // linalg (#926, D-0183): `import linalg` solve/inv/det, LAPACK-backed.
+        // solve(a, b) -> x array; inv(a) -> array; det(a) -> f64. Each raises a
+        // catchable ValueError on a bad shape / singular matrix, so the lowering
+        // routes them through `throwing_call`.
+        self.declare_rt("zap_linalg_solve", &[p.into(), p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_inv", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_det", &[p.into()], Some(f.into()));
         // Shape ops (#511, D-0174): transpose/flatten/reshape (views or copies)
         // and concatenate/stack (over a `list` of arrays). `i64buf`/`i64set`
         // build the reshape target-dims buffer.
