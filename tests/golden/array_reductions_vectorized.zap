@@ -15,12 +15,13 @@ def main():
     auto a = array[i64]([1, 1, 1, 1, 1, 1, 1, 1, 1, 21, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
     print("i64", a.sum(), a.min(), a.max(), a.prod(), str(a.mean()))  # 40 1 21 21 2.0
 
-    auto g = array[f64]([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 21.0,
-                         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    # Same pattern via a constructor + one store (keeps the literal short).
+    auto g = ones[f64](20)
+    g[9] = 21.0
     print("f64", str(g.sum()), str(g.min()), str(g.max()), str(g.prod()), str(g.mean()))
 
-    auto h = array[f32]([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 21.0,
-                         1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    auto h = ones[f32](20)
+    h[9] = 21.0
     print("f32", str(h.sum()), str(h.max()), str(h.mean()))  # 40.0 21.0 2.0
 
     # Whole-array integer sum accumulates in int64, so a narrow-dtype sum that
