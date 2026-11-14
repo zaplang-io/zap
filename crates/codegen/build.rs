@@ -21,6 +21,7 @@ fn main() {
         "src/zaprt.c",
         "src/zapgc.inc.c",
         "src/zaprace.inc.c",
+        "src/zapblas.inc.c",
         "src/zap_ctx_win_x64.c",
         "src/zap_win_a3.c",
         "src/zap_np_iocp.c",

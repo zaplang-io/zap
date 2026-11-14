@@ -8966,3 +8966,41 @@ surface syntax and no semantics change.
   stride); `zap_array_bcast_offsets` is reused unchanged.
 Relates to #914 (perf epic, Phase 1), #501/D-0165 (broadcasting surface), #911
 (sibling reduction-kernel vectorization), #502 (the shared stride model).
+
+## D-0179 — Numeric acceleration seam (OpenBLAS / Apple Accelerate) (#912)
+**Status:** implemented (seam; dispatch is #904)
+Phase 2 of the array performance & acceleration epic (#914); locks the RFC
+outcome of discussions #906/#909 (data in #904). Zap ships an own-kernel FLOOR
+always, and auto-uses a BLAS/LAPACK accelerator CEILING when present — "the
+language optimizes for you," with a programmer override.
+- **One ABI, two providers.** A single cblas/lapacke ABI with **OpenBLAS** on
+  Linux and **Apple Accelerate** on macOS (same cblas symbols). **MKL rejected**
+  (non-free redistribution). OpenBLAS also brings LAPACK (for #512).
+- **Default ON, build-time, per-program.** Following the pcre2/zlib seam pattern
+  (#853), a program links the provider only when it reaches an accel-eligible op
+  (`BackendUse::blas`, set by the matmul/accel dispatch #904): codegen defines
+  `ZAP_HAVE_BLAS` + the provider macro on the runtime compile and adds the
+  provider link flags (`-lopenblas` via `pkg-config` / `-framework Accelerate`)
+  for that program. Detection is **best-effort**: no provider found (or the
+  `ZAP_NO_BLAS` build opt-out) leaves `ZAP_HAVE_BLAS` undefined, so
+  `zap_accel_available()` is 0 and the `fast` tier **degrades to `native`** (no
+  link error). A program with no accelerated op pays nothing.
+- **Thread budget pinned to Zap's.** `zap_accel_ensure_threads()` sizes the
+  provider's internal pool from the container-aware MAXPROCS (#905) on first use,
+  never the library default (default-threaded BLAS in a 1-core pod spiked p99,
+  #904); `ZAP_ACCEL_THREADS` overrides. OpenBLAS via `openblas_set_num_threads`;
+  Accelerate via `VECLIB_MAXIMUM_THREADS` (it has no runtime set-threads call).
+- **Provider-neutral naming** (survives replacing BLAS with an own impl — "never
+  say never"): tiers `auto`/`native`/`fast` used identically by `ZAP_ACCEL`, the
+  global knob, and the future `@kernel(...)` call-site; `ZAP_ACCEL_THREADS` sizes
+  the pool; `ZAP_NO_BLAS` is the build opt-out. The seam's tier/thread knobs are
+  always compiled (the dispatcher reads them even in a no-provider build); only
+  the provider thread-pool call is gated behind `ZAP_HAVE_BLAS`.
+- **Scope.** This decision is the seam only — the capability probe
+  (`zap_accel_available`/`_ops`), the tier/thread knobs, and the build detection
+  + link plumbing. It is **dormant until #904** wires the first caller (the
+  matmul dispatch), which references the `zap_accel_*` seam and so flips
+  `BackendUse::blas` on. Own floor matmul kernel is #913; linalg is #512.
+Relates to #914 (perf epic, Phase 2), #904 (matmul dispatch — sharpens D-0173),
+#905 (container-aware MAXPROCS), #853 (the per-program backend-link pattern),
+#512 (LAPACK consumer), discussions #906/#909.

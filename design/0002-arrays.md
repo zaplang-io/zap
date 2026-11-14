@@ -378,6 +378,21 @@ kernel — the broadcast half of epic #914 Phase 1 (sibling of the reduction wor
   Results are unchanged. New runtime helper `zap_array_bcast_inner_stride`;
   `zap_array_bcast_offsets` reused.
 
+**Increment 16 (shipped, #912 / D-0179):** numeric acceleration seam — epic #914
+Phase 2 (infrastructure; the matmul dispatch that uses it is #904).
+
+- A provider-neutral seam (`crates/codegen/src/zapblas.inc.c`) the dispatcher
+  consults: capability probe `zap_accel_available()` / `zap_accel_ops()`, the tier
+  knob `zap_accel_tier()` (`ZAP_ACCEL=auto|native|fast`), and the thread budget
+  `zap_accel_ensure_threads()` (pins the provider pool to `ZAP_ACCEL_THREADS` or
+  the container-aware MAXPROCS, #905).
+- Provider chosen at build time — OpenBLAS (Linux, `pkg-config`) / Apple
+  Accelerate (macOS) — and linked only for a program that reaches a `zap_accel_*`
+  seam, exactly like the pcre2/zlib backends (#853): codegen gates
+  `-DZAP_HAVE_BLAS` + the provider link flags on `BackendUse::blas`. `ZAP_NO_BLAS`
+  opts out; no provider ⇒ `fast` degrades to `native`. **Dormant until #904**
+  wires the first caller, so no program links or runs BLAS yet.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Integer-array (non-mask) bitwise element-wise ops (`&`/`|`/`^`/`~` on numeric

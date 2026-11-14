@@ -25,6 +25,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Numeric acceleration seam — OpenBLAS / Apple Accelerate** (#912, D-0179).
+  Infrastructure for the array performance epic (#914, Phase 2): a provider-
+  neutral seam the matmul dispatch (#904) will consult to choose between the
+  own-kernel floor and a BLAS/LAPACK accelerator. The provider is detected at
+  build time (OpenBLAS on Linux via `pkg-config`, Apple Accelerate on macOS) and,
+  following the pcre2/zlib pattern, linked only for a program that reaches an
+  accel-eligible op; `ZAP_NO_BLAS` is the build opt-out and a missing provider
+  degrades the `fast` tier to `native` with no link error. Knobs (provider-
+  neutral, all tiers `auto`/`native`/`fast`): `ZAP_ACCEL` selects the tier,
+  `ZAP_ACCEL_THREADS` sizes the accelerator pool (default: the container-aware
+  `MAXPROCS` budget, #905). Dormant until #904 wires the first caller; no
+  behaviour change yet.
 - **Scope-bound arena / region allocation — leaf-only v1** (#553, D-0158). A
   `with arena(size=?, cap=?) as a:` block bump-allocates leaf (pointer-free)
   objects into pinned, non-moving GC regions and frees them all as a unit at block
