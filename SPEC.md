@@ -1455,8 +1455,13 @@ dropped (2-D · 1-D and 1-D · 2-D yield a 1-D vector). The result dtype follows
 NEP-50; a shape mismatch on the contracted axis raises `ValueError`. `@=` is the
 in-place form. `@` is defined only for arrays — on any other type it is an
 ordinary "no such operator" error — and batched (≥ 3-D) matmul is not yet
-supported. The own kernel is vectorized (blocked + SIMD, #913) — a performance
-detail with no effect on results.
+supported. The kernel is chosen automatically (#904): an own blocked+SIMD floor
+(#913) by default, or a BLAS gemm for large float products when a provider is
+linked, overridable with `ZAP_ACCEL` (`auto` / `native` / `fast`) and the BLAS
+pool pinned to the CPU budget (`ZAP_ACCEL_THREADS`, default container-aware
+MAXPROCS). Integer products always use the exact own kernel; a large float
+product via BLAS matches the own kernel only within floating-point tolerance
+(BLAS reassociates), as NumPy's BLAS-backed `@` does.
 
 Shape ops reshape the N-D view. `a.reshape(d0, d1, …)` takes positional dims
 (one may be `-1`, inferred) and is a view when the source is contiguous, else a

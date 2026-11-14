@@ -803,11 +803,13 @@ pub(crate) fn program_backend_use(module: &AstModule, race: bool) -> BackendUse 
                         && !SELF_CONTAINED_CRYPTO.contains(&callee))
                 {
                     u.openssl = true;
-                } else if callee.starts_with("zap_accel_") {
-                    // #912: the numeric accelerator seam. Set when the array
-                    // dispatcher (#904) emits an accel-eligible op, so the BLAS
-                    // provider is compiled in + linked only for such a program.
-                    // The always-compiled tier/thread knobs are not gated on this.
+                } else if callee.starts_with("zap_array_matmul") {
+                    // #904: matrix multiply (`@` / 2-D `dot`) auto-dispatches to
+                    // a BLAS gemm for large float products (#912 seam), so a
+                    // program that reaches it compiles the runtime with the
+                    // provider (`ZAP_HAVE_BLAS`) and links it — exactly like the
+                    // pcre2/zlib seams. 1-D·1-D `dot` (`zap_array_dot{i,f}`) stays
+                    // the scalar accumulator and never needs BLAS.
                     u.blas = true;
                 }
             }

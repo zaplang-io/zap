@@ -1119,6 +1119,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Changed
 
+- **Matrix multiply auto-dispatches between the own kernel and BLAS** (#904,
+  D-0181, sharpening D-0173). `a @ b` now picks the fastest kernel for the
+  `(dtype, size, CPU budget)`: the own blocked+SIMD floor (#913) by default, or a
+  `cblas_{d,s}gemm` hand-off for large float products when a BLAS provider is
+  linked (#912). Overridable with `ZAP_ACCEL` (`auto` / `native` / `fast`); the
+  BLAS pool is pinned to the container-aware `MAXPROCS` (#905), set by
+  `ZAP_ACCEL_THREADS`, never the library default. Integer products always use the
+  exact own kernel (BLAS routes ints through f64). The dispatch is a performance
+  choice — a large float product via BLAS matches the own kernel within
+  floating-point tolerance (BLAS reassociates), as NumPy's BLAS-backed `@` does.
+  Completes Phase 2 of the array performance epic (#914). The BLAS floor
+  (`~n≥64`) is hardcoded and tunable, not an API promise.
 - **The matrix-multiply floor kernel is vectorized (blocked + SIMD)** (#913,
   D-0180). `@` / `dot` (#509/D-0172) ran a scalar triple loop that read each
   element through a per-element dtype switch and walked B down a column; it now

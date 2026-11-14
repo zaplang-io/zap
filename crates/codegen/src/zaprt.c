@@ -4435,6 +4435,62 @@ double zap_array_dotf(void *ap, void *bp) {
 ZAP_MATMUL_KERNEL(f, double, mm_load_f)
 ZAP_MATMUL_KERNEL(i, int64_t, mm_load_i)
 
+/* Numeric acceleration seam (#912, D-0179), defined in zapblas.inc.c at the end
+ * of this file. Forward-declared here so the matmul dispatch can consult the
+ * tier/availability and pin the provider's threads before a BLAS hand-off. */
+int64_t zap_accel_tier(void);
+int64_t zap_accel_available(void);
+void zap_accel_ensure_threads(void);
+
+/* Automatic matmul dispatch (#904, D-0181). Zap picks the fastest kernel for the
+ * (dtype, shape, CPU-budget): the own blocked+SIMD FLOOR (#913) by default, with
+ * a BLAS gemm CEILING auto-selected for large FLOAT products when a provider is
+ * linked — "the language optimizes for you," overridable via ZAP_ACCEL.
+ *   - integer out  -> always own (BLAS routes ints through f64, inexact > 2^53);
+ *   - ZAP_ACCEL=native -> own; =fast -> BLAS (if linked), else own;
+ *   - auto (default) -> BLAS for large float (work >= the floor), else own.
+ * The floor is hardcoded and deliberately conservative (jitter-safe default; the
+ * own kernel has no thread pool to misconfigure); it is tunable after the
+ * 1/4/32-core ±container benchmarking in #904 (not an API promise). */
+#define ZAP_MATMUL_BLAS_FLOOR (64 * 64 * 64) /* ~n>=64 square; tunable (#904) */
+
+#if defined(ZAP_HAVE_BLAS)
+#if defined(ZAP_BLAS_ACCELERATE)
+/* Use Accelerate's modern CBLAS (LP64, `int` dims) — the classic `cblas_dgemm`
+ * spelling is deprecated since macOS 13.3 but the NEW_LAPACK interface keeps the
+ * same name and signature. (Not ILP64, so the `(int)` dim casts below stand.) */
+#define ACCELERATE_NEW_LAPACK 1
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+/* BLAS gemm hand-off: materialize the operands as the gemm element type, pin the
+ * provider pool to Zap's CPU budget (#905), then `cblas_{d,s}gemm`. BLAS packs
+ * and blocks, so it reassociates the contraction — float results match the own
+ * kernel only within fp tolerance (as NumPy's BLAS-backed `@` does); integers
+ * never take this path, so they stay exact. */
+#define ZAP_MATMUL_BLAS(suffix, ctype, gemm)                                   \
+    static void zap_matmul_blas_##suffix(ZapArray *a, ZapArray *b,             \
+                                         ZapArray *res, int64_t m, int64_t n,   \
+                                         int64_t kk) {                          \
+        int64_t na = m * kk, nb = kk * n, nc = m * n;                          \
+        ctype *A = (ctype *)zap_buf((size_t)(na > 0 ? na : 0) * sizeof(ctype)); \
+        ctype *B = (ctype *)zap_buf((size_t)(nb > 0 ? nb : 0) * sizeof(ctype)); \
+        ctype *C = (ctype *)zap_buf((size_t)(nc > 0 ? nc : 0) * sizeof(ctype)); \
+        for (int64_t x = 0; x < na; x++)                                       \
+            A[x] = (ctype)mm_load_f(a, x);                                     \
+        for (int64_t x = 0; x < nb; x++)                                       \
+            B[x] = (ctype)mm_load_f(b, x);                                     \
+        zap_accel_ensure_threads();                                            \
+        gemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)m, (int)n,        \
+             (int)kk, (ctype)1, A, (int)kk, B, (int)n, (ctype)0, C, (int)n);   \
+        for (int64_t x = 0; x < nc; x++)                                       \
+            arr_store_f(res, x, (double)C[x]);                                 \
+    }
+ZAP_MATMUL_BLAS(f64, double, cblas_dgemm)
+ZAP_MATMUL_BLAS(f32, float, cblas_sgemm)
+#endif
+
 /* Matrix multiply for the array-producing cases (not 1-D·1-D, which is `dot`):
  * a 1-D operand is promoted to a row (left) or column (right) and its singleton
  * axis dropped from the result. `out_dtype` is the NEP-50 promotion the lowering
@@ -4462,10 +4518,33 @@ void *zap_array_matmul(void *ap, void *bp, int64_t out_dtype) {
         res = (ZapArray *)zap_array_new(out_dtype, len);
     }
     int is_float = (out_dtype == DTYPE_F32 || out_dtype == DTYPE_F64);
-    if (is_float) {
-        zap_matmul_f(a, b, res, m, n, kk);
-    } else {
-        zap_matmul_i(a, b, res, m, n, kk);
+    /* Dispatch (#904, D-0181): integer always own (exact); float -> BLAS when a
+     * provider is linked and (ZAP_ACCEL=fast, or auto past the floor), else own.
+     * The whole BLAS branch is compiled out when no provider is built in, so a
+     * no-BLAS build is always the own floor and references no cblas symbol. */
+    int use_blas = 0;
+#if defined(ZAP_HAVE_BLAS)
+    if (is_float && zap_accel_available()) {
+        int64_t tier = zap_accel_tier(); /* 0 auto, 1 native, 2 fast */
+        if (tier != 1 &&
+            (tier == 2 || (double)m * (double)n * (double)kk >= ZAP_MATMUL_BLAS_FLOOR)) {
+            use_blas = 1;
+        }
+    }
+    if (use_blas) {
+        if (out_dtype == DTYPE_F64) {
+            zap_matmul_blas_f64(a, b, res, m, n, kk);
+        } else {
+            zap_matmul_blas_f32(a, b, res, m, n, kk);
+        }
+    }
+#endif
+    if (!use_blas) {
+        if (is_float) {
+            zap_matmul_f(a, b, res, m, n, kk);
+        } else {
+            zap_matmul_i(a, b, res, m, n, kk);
+        }
     }
     return res;
 }
