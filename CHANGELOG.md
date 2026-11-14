@@ -981,6 +981,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   raises `ValueError`), and `linspace[T](start, stop, num)` (`num` samples, both
   ends inclusive). All accept the full dtype matrix.
 
+- **Strided array views** (#502, D-0171, epic #499): stepped/reversed 1-D slices
+  (`a[::2]`, `a[::-1]`), N-D axis-0 windows (`m[lo:hi]`, rank-preserving), and a
+  sliced axis inside a multi-axis index (`m[:, j]`, `m[lo:hi, k]`, `m[i, ::2]`)
+  are now **views** that alias the parent buffer. The array header gains per-axis
+  `strides` (NULL = contiguous); arithmetic over a strided operand transparently
+  compacts it to a contiguous copy first. Assigning *through* a sliced index (a
+  strided-view store) is not yet supported.
+
 - **Array reductions + axis** (#507, D-0170, epic #499): `a.sum()`, `a.min()`,
   `a.max()`, `a.mean()`, `a.prod()` as array methods, each with an optional
   `axis=`. Full reductions keep the dtype (`mean` is a float); `axis=k` collapses

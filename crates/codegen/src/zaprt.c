@@ -3093,18 +3093,30 @@ enum {
 };
 
 typedef struct {
-    int64_t dtype;  /* one of DTYPE_* above */
-    int64_t ndim;   /* static rank >= 1 (#500); 1 for a plain 1-D array */
-    int64_t *dims;  /* `ndim` row-major dimensions; dims[0] is len(a) */
-    void *data;     /* GC buffer base; `off` elements precede this array's first */
-    int64_t off;    /* element offset of this array's first element into `data` */
+    int64_t dtype;      /* one of DTYPE_* above */
+    int64_t ndim;       /* static rank >= 1 (#500); 1 for a plain 1-D array */
+    int64_t *dims;      /* `ndim` row-major dimensions; dims[0] is len(a) */
+    int64_t *strides;   /* per-axis element strides (#502); NULL == contiguous */
+    void *data;         /* GC buffer base; `off` elements precede this array's first */
+    int64_t off;        /* element offset of this array's first element into `data` */
 } ZapArray;
 /* `off` is a non-zero element offset only for a slice *view* (D-0030): a view
  * shares its parent's `data` buffer (pointing at the buffer BASE, not into its
  * middle — the precise collector forwards `data` as an object start under
  * evacuation, so an interior pointer would corrupt), carrying its window as
  * `off` (first element) + `dims[0]` (length). All element access adds `off`, and
- * `zap_array_data` returns the window base so the SIMD kernels stay contiguous. */
+ * `zap_array_data` returns the window base so the SIMD kernels stay contiguous.
+ *
+ * `strides` (#502, D-0171) is NULL for every contiguous array — the common case,
+ * every constructed array — meaning canonical row-major strides (the element
+ * stride of axis k is the product of the dims below it, axis ndim-1 being 1). A
+ * NON-NULL `strides` marks a strided *view* (a stepped/reversed/N-D slice): it
+ * holds one signed element stride per axis, so element (i0..i_{n-1}) lives at
+ * `data[off + Σ i_k·strides[k]]`. Bulk kernels (element-wise ops, reductions)
+ * never read strided storage directly — they call `zap_array_contig`, which
+ * returns a contiguous array unchanged and compacts a strided view to a fresh
+ * contiguous copy first; only scalar get/set, indexing, and the view builders
+ * are stride-aware (so a write through a strided view still aliases the parent). */
 
 /* Bytes per stored element, by dtype width (#503/#890). */
 static size_t zap_array_elem_size(int64_t dtype) {
@@ -3146,6 +3158,7 @@ void *zap_array_new(int64_t dtype, int64_t len) {
     a->dtype = dtype;
     a->ndim = 1;
     a->dims = dims;
+    a->strides = NULL; /* contiguous (#502) */
     a->data = data;
     a->off = 0;
     return a;
@@ -3171,6 +3184,7 @@ void *zap_array_new_nd(int64_t dtype, int64_t ndim, int64_t total) {
     a->dtype = dtype;
     a->ndim = ndim;
     a->dims = dims;
+    a->strides = NULL; /* contiguous (#502); dims are filled by set_dim */
     a->data = data;
     a->off = 0;
     return a;
@@ -3200,6 +3214,7 @@ void *zap_array_new_like(void *srcp, int64_t out_dtype) {
     a->dtype = out_dtype;
     a->ndim = ndim;
     a->dims = dims;
+    a->strides = NULL; /* fresh contiguous result (#502) */
     a->data = data;
     a->off = 0;
     return a;
@@ -3232,44 +3247,140 @@ int64_t zap_array_dim(void *ap, int64_t axis) {
  * lowered as a fold of rows down to a rank-1 view followed by a 1-D get, so this
  * is only ever called with n >= 2. Python-style out-of-range aborts (catchable
  * index exceptions are a documented follow-up, matching 1-D `a[i]`). */
-void *zap_array_row(void *ap, int64_t i) {
+/* The effective element stride of `axis` (#502): an explicit per-axis stride for
+ * a view, else the canonical row-major stride (product of the dims below it). */
+static int64_t zap_array_stride_of(const ZapArray *a, int64_t axis) {
+    if (a->strides) {
+        return a->strides[axis];
+    }
+    int64_t s = 1;
+    for (int64_t k = axis + 1; k < a->ndim; k++) {
+        s *= a->dims[k];
+    }
+    return s;
+}
+
+/* Map a flat logical index into a rank-1 array/view to its physical element
+ * offset into `data` (#502). A rank-1 strided view steps by `strides[0]`; every
+ * other case (a contiguous array of any rank, including the flat fill during N-D
+ * construction) is dense, so the flat index is the offset past `off`. */
+static int64_t zap_array_phys(const ZapArray *a, int64_t i) {
+    if (a->strides && a->ndim == 1) {
+        return a->off + i * a->strides[0];
+    }
+    return a->off + i;
+}
+
+/* Compact a possibly-strided array to a contiguous one (#502): returns `a`
+ * unchanged when it is already contiguous (`strides == NULL`), else allocates a
+ * fresh contiguous array and copies the elements in row-major order by walking
+ * the strided layout with an odometer over the dims. Bulk kernels (element-wise
+ * ops, reductions) call this at entry so their inner loops stay contiguous and
+ * oblivious to views; the copy is read-only, so no aliasing is lost (those
+ * operations already produce fresh results). */
+void *zap_array_contig(void *ap) {
     ZapArray *a = (ZapArray *)ap;
-    if (i < 0 || i >= a->dims[0]) {
+    if (!a->strides) {
+        return a; /* already contiguous */
+    }
+    int64_t ndim = a->ndim;
+    int64_t total = zap_array_count_of(a);
+    ZapArray *r = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t *dims = (int64_t *)zap_buf((size_t)ndim * sizeof(int64_t));
+    for (int64_t k = 0; k < ndim; k++) {
+        dims[k] = a->dims[k];
+    }
+    size_t esz = zap_array_elem_size(a->dtype);
+    char *dst = (char *)zap_buf((size_t)(total > 0 ? total : 0) * esz);
+    r->dtype = a->dtype;
+    r->ndim = ndim;
+    r->dims = dims;
+    r->strides = NULL;
+    r->data = dst;
+    r->off = 0;
+    /* Odometer over the N-D index space, gathering each element in row-major
+     * order. `coord` counts the dims; `phys` tracks the strided source offset. */
+    const char *base = (const char *)a->data + (size_t)a->off * esz;
+    int64_t *coord = (int64_t *)zap_buf((size_t)ndim * sizeof(int64_t));
+    for (int64_t k = 0; k < ndim; k++) {
+        coord[k] = 0;
+    }
+    for (int64_t i = 0; i < total; i++) {
+        int64_t phys = 0;
+        for (int64_t k = 0; k < ndim; k++) {
+            phys += coord[k] * a->strides[k];
+        }
+        memcpy(dst + (size_t)i * esz, base + (size_t)phys * esz, esz);
+        for (int64_t k = ndim - 1; k >= 0; k--) { /* increment the odometer */
+            if (++coord[k] < a->dims[k]) {
+                break;
+            }
+            coord[k] = 0;
+        }
+    }
+    return r;
+}
+
+/* Integer-index `axis` of `a`, dropping it: `m[i]` is `index_axis(a, 0, i)`
+ * (#500/#502). Shares the parent buffer base (GC-safe) and advances `off` by
+ * `i` strides of that axis; the surviving axes keep their effective strides, so
+ * a contiguous axis-0 index stays contiguous (NULL strides) while any other case
+ * carries explicit strides. Out-of-range aborts, like 1-D `a[i]`. */
+void *zap_array_index_axis(void *ap, int64_t axis, int64_t i) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t dim = a->dims[axis];
+    if (i < 0 || i >= dim) {
         fprintf(stderr, "zap: array index %lld out of range (len %lld)\n",
-                (long long)i, (long long)a->dims[0]);
+                (long long)i, (long long)dim);
         abort();
     }
     int64_t ndim = a->ndim - 1;
-    int64_t stride0 = 1;
-    for (int64_t k = 1; k < a->ndim; k++) {
-        stride0 *= a->dims[k];
-    }
     ZapArray *v = (ZapArray *)zap_obj(&zap_desc_array);
     int64_t *dims = (int64_t *)zap_buf((size_t)(ndim > 0 ? ndim : 1) * sizeof(int64_t));
-    for (int64_t k = 0; k < ndim; k++) {
-        dims[k] = a->dims[k + 1];
+    int64_t ri = 0;
+    for (int64_t k = 0; k < a->ndim; k++) {
+        if (k != axis) {
+            dims[ri++] = a->dims[k];
+        }
+    }
+    int64_t off = a->off + i * zap_array_stride_of(a, axis);
+    /* A contiguous axis-0 index keeps a contiguous sub-block; otherwise the
+     * surviving axes need explicit strides. */
+    int64_t *strides = NULL;
+    if (a->strides || axis != 0) {
+        strides = (int64_t *)zap_buf((size_t)(ndim > 0 ? ndim : 1) * sizeof(int64_t));
+        int64_t si = 0;
+        for (int64_t k = 0; k < a->ndim; k++) {
+            if (k != axis) {
+                strides[si++] = zap_array_stride_of(a, k);
+            }
+        }
     }
     v->dtype = a->dtype;
     v->ndim = ndim;
     v->dims = dims;
-    v->data = a->data;              /* share the parent buffer base (GC-safe) */
-    v->off = a->off + i * stride0;  /* window begins at row `i` */
+    v->strides = strides;
+    v->data = a->data;
+    v->off = off;
     return v;
 }
 
+/* `m[i]` on a rank-n (n >= 2) array: the leading-axis integer index, kept as a
+ * thin alias of `index_axis(a, 0, i)` for the codegen that still emits it. */
+void *zap_array_row(void *ap, int64_t i) { return zap_array_index_axis(ap, 0, i); }
+
 /* The raw element buffer at this array's first element; codegen's SIMD kernels
- * index this directly from 0. For a slice view this is the parent base advanced
- * by `off` elements, so the kernels stay oblivious to views (D-0030). */
+ * index this directly from 0. Valid only for a CONTIGUOUS array (strides NULL) —
+ * the kernels pass every operand through `zap_array_contig` first (#502). */
 void *zap_array_data(void *a) {
     ZapArray *arr = (ZapArray *)a;
     return (char *)arr->data + (size_t)arr->off * zap_array_elem_size(arr->dtype);
 }
 
-/* A slice view `a[lo:hi]` -> a NEW array header SHARING the parent's buffer
- * (D-0030): mutations through either alias. Python bounds (negatives from the
- * end, out-of-range clamps). Step is handled by the caller: only the contiguous
- * `step == 1` case reaches here, since a strided view would need strides the
- * 1-D array has not got (a documented D-0030 follow-up). */
+/* A contiguous 1-D slice `a[lo:hi]` (step 1) -> a NEW array header SHARING the
+ * parent's buffer (D-0030): mutations through either alias. Python bounds
+ * (negatives from the end, out-of-range clamps). Stepped / reversed / N-D slices
+ * go through `zap_array_slice_axis` instead (#502). */
 void *zap_array_slice(void *ap, int64_t lo, int64_t hi, int64_t has_lo, int64_t has_hi) {
     ZapArray *a = (ZapArray *)ap;
     int64_t n = a->dims[0];
@@ -3282,8 +3393,74 @@ void *zap_array_slice(void *ap, int64_t lo, int64_t hi, int64_t has_lo, int64_t 
     v->dtype = a->dtype;
     v->ndim = 1;
     v->dims = dims;
-    v->data = a->data;          /* share the parent buffer base (GC-safe) */
-    v->off = a->off + start;    /* window begins `start` elements in */
+    /* A step-1 slice of a contiguous 1-D array stays contiguous; of a strided
+     * view it inherits the parent's stride. */
+    if (a->strides) {
+        int64_t *st = (int64_t *)zap_buf(sizeof(int64_t));
+        st[0] = a->strides[0];
+        v->strides = st;
+    } else {
+        v->strides = NULL;
+    }
+    v->data = a->data;
+    v->off = a->off + start * zap_array_stride_of(a, 0);
+    return v;
+}
+
+/* Slice `axis` of `a`, KEEPING it (#502): the general basic-indexing primitive
+ * for a stepped/reversed 1-D slice (`a[::2]`, `a[::-1]`), an N-D axis-0 window
+ * (`m[lo:hi]`), or a sliced axis inside a multi-axis index (`m[:, j]` folds the
+ * integer axes with `index_axis` and the sliced axes here). Python slice
+ * semantics (negative bounds, sign-dependent defaults, clamping); a zero step is
+ * a fatal error, matching list slicing. The surviving axis gets an explicit
+ * stride (`parent_stride * step`), so the result is a strided view unless it is a
+ * step-1 window of an already-contiguous axis-0. */
+void *zap_array_slice_axis(void *ap, int64_t axis, int64_t lo, int64_t hi,
+                           int64_t step, int64_t has_lo, int64_t has_hi,
+                           int64_t has_step) {
+    ZapArray *a = (ZapArray *)ap;
+    int64_t n = a->dims[axis];
+    int64_t st = has_step ? step : 1;
+    if (st == 0) {
+        zap_panic(zap_str_new("slice step cannot be zero", 25));
+    }
+    int64_t start, stop;
+    if (st > 0) {
+        start = has_lo ? zap_slice_pos(lo, n) : 0;
+        stop = has_hi ? zap_slice_pos(hi, n) : n;
+    } else {
+        start = has_lo ? zap_slice_neg(lo, n) : n - 1;
+        stop = has_hi ? zap_slice_neg(hi, n) : -1;
+    }
+    int64_t len = 0;
+    if (st > 0) {
+        len = stop > start ? (stop - start + st - 1) / st : 0;
+    } else {
+        len = start > stop ? (start - stop + (-st) - 1) / (-st) : 0;
+    }
+    int64_t pstride = zap_array_stride_of(a, axis);
+    int64_t ndim = a->ndim;
+    ZapArray *v = (ZapArray *)zap_obj(&zap_desc_array);
+    int64_t *dims = (int64_t *)zap_buf((size_t)ndim * sizeof(int64_t));
+    for (int64_t k = 0; k < ndim; k++) {
+        dims[k] = a->dims[k];
+    }
+    dims[axis] = len;
+    int64_t off = a->off + start * pstride;
+    int64_t *strides = NULL;
+    if (a->strides || st != 1 || axis != 0) {
+        strides = (int64_t *)zap_buf((size_t)ndim * sizeof(int64_t));
+        for (int64_t k = 0; k < ndim; k++) {
+            strides[k] = zap_array_stride_of(a, k);
+        }
+        strides[axis] = pstride * st;
+    }
+    v->dtype = a->dtype;
+    v->ndim = ndim;
+    v->dims = dims;
+    v->strides = strides;
+    v->data = a->data;
+    v->off = off;
     return v;
 }
 
@@ -3460,19 +3637,23 @@ static void zap_array_empty_reduce(void) {
                     zap_str_new("reduction of an empty array", 27));
 }
 
+/* get/set are stride-aware (`zap_array_phys`) so a write through a strided view
+ * aliases the parent; the reducers compact a strided view first
+ * (`zap_array_contig`, a no-op when contiguous) so their inner loop stays a
+ * dense `data + off` walk (#502). */
 #define ZAP_ARRAY_INT_ACCESS(suffix, ctype)                                    \
     int64_t zap_array_get_##suffix(void *ap, int64_t i) {                      \
         ZapArray *a = (ZapArray *)ap;                                          \
         zap_array_bounds(a, i);                                                \
-        return (int64_t)((const ctype *)a->data)[a->off + i];                 \
+        return (int64_t)((const ctype *)a->data)[zap_array_phys(a, i)];        \
     }                                                                          \
     void zap_array_set_##suffix(void *ap, int64_t i, int64_t v) {             \
         ZapArray *a = (ZapArray *)ap;                                          \
         zap_array_bounds(a, i);                                               \
-        ((ctype *)a->data)[a->off + i] = (ctype)v;                            \
+        ((ctype *)a->data)[zap_array_phys(a, i)] = (ctype)v;                  \
     }                                                                          \
     int64_t zap_array_sum_##suffix(void *ap) {                                \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a), s = 0;                             \
         for (int64_t i = 0; i < n; i++)                                       \
@@ -3485,7 +3666,7 @@ static void zap_array_empty_reduce(void) {
      * would misorder values above INT64_MAX). The result crosses the ABI as   \
      * an int64 word, like get/sum. */                                         \
     int64_t zap_array_prod_##suffix(void *ap) {                               \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         ctype p = (ctype)1;                                                   \
@@ -3494,7 +3675,7 @@ static void zap_array_empty_reduce(void) {
         return (int64_t)p;                                                    \
     }                                                                          \
     int64_t zap_array_min_##suffix(void *ap) {                                \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         if (n == 0)                                                           \
@@ -3506,7 +3687,7 @@ static void zap_array_empty_reduce(void) {
         return (int64_t)m;                                                    \
     }                                                                          \
     int64_t zap_array_max_##suffix(void *ap) {                                \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         if (n == 0)                                                           \
@@ -3520,7 +3701,7 @@ static void zap_array_empty_reduce(void) {
     /* mean accumulates in double and returns f64 (empty -> nan, no raise);    \
      * the lowering narrows to f32 for an f32 source. */                       \
     double zap_array_mean_##suffix(void *ap) {                                \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         double s = 0.0;                                                        \
@@ -3533,15 +3714,15 @@ static void zap_array_empty_reduce(void) {
     double zap_array_get_##suffix(void *ap, int64_t i) {                       \
         ZapArray *a = (ZapArray *)ap;                                          \
         zap_array_bounds(a, i);                                                \
-        return (double)((const ctype *)a->data)[a->off + i];                  \
+        return (double)((const ctype *)a->data)[zap_array_phys(a, i)];        \
     }                                                                          \
     void zap_array_set_##suffix(void *ap, int64_t i, double v) {              \
         ZapArray *a = (ZapArray *)ap;                                         \
         zap_array_bounds(a, i);                                               \
-        ((ctype *)a->data)[a->off + i] = (ctype)v;                            \
+        ((ctype *)a->data)[zap_array_phys(a, i)] = (ctype)v;                  \
     }                                                                          \
     double zap_array_sum_##suffix(void *ap) {                                 \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         double s = 0.0;                                                        \
@@ -3550,7 +3731,7 @@ static void zap_array_empty_reduce(void) {
         return s;                                                             \
     }                                                                          \
     double zap_array_prod_##suffix(void *ap) {                                \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         double p = 1.0;                                                       \
@@ -3559,7 +3740,7 @@ static void zap_array_empty_reduce(void) {
         return p;                                                             \
     }                                                                          \
     double zap_array_min_##suffix(void *ap) {                                 \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         if (n == 0)                                                           \
@@ -3571,7 +3752,7 @@ static void zap_array_empty_reduce(void) {
         return m;                                                             \
     }                                                                          \
     double zap_array_max_##suffix(void *ap) {                                 \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         if (n == 0)                                                           \
@@ -3583,7 +3764,7 @@ static void zap_array_empty_reduce(void) {
         return m;                                                             \
     }                                                                          \
     double zap_array_mean_##suffix(void *ap) {                                \
-        ZapArray *a = (ZapArray *)ap;                                         \
+        ZapArray *a = (ZapArray *)zap_array_contig(ap);                       \
         const ctype *d = (const ctype *)a->data + a->off;                     \
         int64_t n = zap_array_count_of(a);                                    \
         double s = 0.0;                                                        \
@@ -3608,15 +3789,15 @@ ZAP_ARRAY_INT_ACCESS(u64, uint64_t)
 int64_t zap_array_get_bool(void *ap, int64_t i) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    return ((const uint8_t *)a->data)[a->off + i] ? 1 : 0;
+    return ((const uint8_t *)a->data)[zap_array_phys(a, i)] ? 1 : 0;
 }
 void zap_array_set_bool(void *ap, int64_t i, int64_t v) {
     ZapArray *a = (ZapArray *)ap;
     zap_array_bounds(a, i);
-    ((uint8_t *)a->data)[a->off + i] = v ? 1 : 0;
+    ((uint8_t *)a->data)[zap_array_phys(a, i)] = v ? 1 : 0;
 }
 int64_t zap_array_sum_bool(void *ap) {
-    ZapArray *a = (ZapArray *)ap;
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
     const uint8_t *d = (const uint8_t *)a->data + a->off;
     int64_t n = zap_array_count_of(a);
     int64_t s = 0;
@@ -3628,7 +3809,7 @@ int64_t zap_array_sum_bool(void *ap) {
 /* bool reductions (#507): min/max/prod stay 0/1 (prod = logical "all"); mean is
  * the fraction of True, a float. Elements are normalized 0/1 bytes. */
 int64_t zap_array_prod_bool(void *ap) {
-    ZapArray *a = (ZapArray *)ap;
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
     const uint8_t *d = (const uint8_t *)a->data + a->off;
     int64_t n = zap_array_count_of(a);
     for (int64_t i = 0; i < n; i++)
@@ -3637,7 +3818,7 @@ int64_t zap_array_prod_bool(void *ap) {
     return 1;
 }
 int64_t zap_array_min_bool(void *ap) {
-    ZapArray *a = (ZapArray *)ap;
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
     const uint8_t *d = (const uint8_t *)a->data + a->off;
     int64_t n = zap_array_count_of(a);
     if (n == 0)
@@ -3648,7 +3829,7 @@ int64_t zap_array_min_bool(void *ap) {
     return 1;
 }
 int64_t zap_array_max_bool(void *ap) {
-    ZapArray *a = (ZapArray *)ap;
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
     const uint8_t *d = (const uint8_t *)a->data + a->off;
     int64_t n = zap_array_count_of(a);
     if (n == 0)
@@ -3659,7 +3840,7 @@ int64_t zap_array_max_bool(void *ap) {
     return 0;
 }
 double zap_array_mean_bool(void *ap) {
-    ZapArray *a = (ZapArray *)ap;
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
     const uint8_t *d = (const uint8_t *)a->data + a->off;
     int64_t n = zap_array_count_of(a);
     int64_t s = 0;
@@ -3777,7 +3958,11 @@ void zap_array_axis_check(void *ap, int64_t axis) {
 
 /* sum/min/max/prod along `axis` (op 0/1/2/3). Result keeps the input dtype. */
 void *zap_array_reduce_axis(void *ap, int64_t axis, int64_t op) {
-    ZapArray *a = (ZapArray *)ap;
+    /* Compact a strided view so the factorization below walks a dense buffer
+     * (#502). Validate the axis against the view's rank BEFORE compacting so a
+     * bad axis still raises (compaction preserves ndim). */
+    (void)zap_array_axis_norm(axis, ((ZapArray *)ap)->ndim);
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
     axis = zap_array_axis_norm(axis, a->ndim);
     if ((op == 1 || op == 2) && a->dims[axis] == 0)
         zap_array_empty_reduce();
@@ -3830,7 +4015,8 @@ void *zap_array_reduce_axis(void *ap, int64_t axis, int64_t op) {
 /* mean along `axis`: an f64 result (f32 source keeps f32). Accumulates in
  * double; an empty axis yields nan per lane (no raise). */
 void *zap_array_mean_axis(void *ap, int64_t axis) {
-    ZapArray *a = (ZapArray *)ap;
+    (void)zap_array_axis_norm(axis, ((ZapArray *)ap)->ndim);
+    ZapArray *a = (ZapArray *)zap_array_contig(ap); /* dense walk (#502) */
     axis = zap_array_axis_norm(axis, a->ndim);
     int64_t out_dtype = (a->dtype == DTYPE_F32) ? DTYPE_F32 : DTYPE_F64;
     int64_t outer, axislen, inner;

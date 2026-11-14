@@ -1,0 +1,9 @@
+step2 1 3 10 30 50 90
+rev 60 10 210
+sub 20 40 60 120
+alias 99 279
+arith 162
+nd 2 2 21
+col 1 3 2 5 8 15
+mix 16
+ndarith 30

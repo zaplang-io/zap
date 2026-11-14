@@ -219,5 +219,6 @@ Status counts are printed by `cargo test -p zapc conformance` (see
 | ARR-6 | §15 | numeric array: element-wise math `math.sqrt`/`exp`/`log`/`sin`/`cos`/`tan`/`fabs` map over an array -> new float array (int promotes to f64) (#505, D-0168) | covered | array_math_contract |
 | ARR-7 | §15 | numeric array: true division `/` (int operands promote to f64, float keep width; zero divisor -> IEEE inf/nan, no raise) + non-commutative scalar-on-left `s - a` / `s / a` (#506, D-0169) | covered | array_division_contract |
 | ARR-8 | §15 | numeric array: reductions sum/min/max/mean/prod as methods, optional axis= -> rank-(n-1) array (dtype preserved, mean float; empty sum/prod/mean = 0/1/nan, empty min/max + bad axis raise ValueError) (#507, D-0170) | covered | array_reductions_contract |
+| ARR-9 | §15 | numeric array: strided slice views — a[::2]/a[::-1] (1-D stepped/reversed), m[lo:hi] (N-D axis-0, rank-preserving), m[:, j] (sliced axis in a multi-axis index); all alias the parent, arithmetic over a strided operand compacts first (#502, D-0171) | covered | array_strided_contract |
 | DEC-1 | §16 | `@derive(...)` generates field-by-field code at compile time (D-0036) | TODO | — |
 | DEC-2 | §16 | multiple decorators stack bottom-up | TODO | — |

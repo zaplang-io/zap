@@ -1,0 +1,6 @@
+step 9 12
+rev 6 21
+alias 10 30
+axis0 2 6
+col 9
+ndarith 25

@@ -197,6 +197,9 @@ pub fn render(e: &Expr) -> String {
         } => {
             format!("{}[{}]", pexpr(base, P_POSTFIX), render_slice(lo, hi, step))
         }
+        // A baseless slice spec inside a multi-axis subscript (`m[:, j]`): render
+        // just the `lo:hi:step` part; the enclosing Index renders the brackets.
+        Expr::SliceSpec { lo, hi, step, .. } => render_slice(lo, hi, step),
         Expr::Attr { base, name, .. } => format!("{}.{name}", pexpr(base, P_POSTFIX)),
 
         Expr::RegexMatch {

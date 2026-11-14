@@ -1401,7 +1401,7 @@ longer-term N-D design in `design/0002-arrays.md`.
 | Arithmetic | Element-wise `+`, `-`, `*`, `/`; two arrays **broadcast** (right-align shapes, stretch size-1 axes, extend rank). `/` is **true division** (always a float result) |
 | Scalar broadcast | `a + n`, `a - n`, `a * n`, `a / n`; and scalar-on-left `n + a`, `n * a`, `n - a`, `n / a` (shape preserved) |
 | Reduction | `sum(a)` over **all** elements, or the methods `a.sum()`/`a.min()`/`a.max()`/`a.mean()`/`a.prod()`; an optional `a.sum(axis=k)` collapses one axis to a rank-(n-1) array. `sum`/`min`/`max`/`prod` keep the dtype, `mean` is a float |
-| Slicing | Contiguous 1-D views `a[lo:hi]`, with omitted bounds or literal step `1`; writes alias the parent |
+| Slicing | Views that alias the parent: contiguous `a[lo:hi]`, stepped/reversed `a[::2]` / `a[::-1]`, N-D axis-0 windows `m[lo:hi]`, and a sliced axis in a multi-axis index `m[:, j]` (per-axis strides) |
 
 Mixed array dtypes promote by NumPy NEP-50 (a float operand forces the widest
 float; same-signedness integers take the wider; mixed signed/unsigned take the
@@ -1430,14 +1430,20 @@ integer product wraps per width); `mean` is a float (`f32` source → `f32`, els
 (`nan`); `min`/`max` on an empty array, and an out-of-range `axis`, raise a
 catchable `ValueError`.
 
+Slices are **views** (per-axis strides): a stepped `a[::2]`, reversed `a[::-1]`,
+an N-D axis-0 window `m[lo:hi]` (rank-preserving), and a sliced axis inside a
+multi-axis index `m[:, j]` all share the parent buffer, so a write through the
+view is visible through the parent. A zero step is an error. Arithmetic over a
+strided operand transparently compacts it to a contiguous copy first.
+
 A bare `array[T]` type annotation denotes a rank-1 array; N-D values arise
 through inference (`auto`). List-variable/iterable `array[T]` construction,
 a fully dynamic-rank (runtime-tuple) constructor shape,
 element-wise unary negation/bitwise operations, array
 comparisons, floor division `//`/modulo `%`, `keepdims` reductions, broadcasting
-in assignment or partial-index (whole-row) stores, N-D and strided/reversed
-array slicing, and explicit N-D type annotations are unsupported. Semantic or
-lowering diagnostics reject these forms.
+in assignment or partial-index (whole-row) stores, assigning through a sliced
+index (a strided-view store), and explicit N-D type annotations are unsupported.
+Semantic or lowering diagnostics reject these forms.
 
 ```python
 auto a = array[f64]([1, 2, 3])

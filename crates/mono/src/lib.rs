@@ -2299,6 +2299,15 @@ impl Mono<'_> {
                 },
                 CTy::Unknown,
             )),
+            Expr::SliceSpec { lo, hi, step, span } => Ok((
+                Expr::SliceSpec {
+                    lo: self.rw_opt(lo, env)?,
+                    hi: self.rw_opt(hi, env)?,
+                    step: self.rw_opt(step, env)?,
+                    span: *span,
+                },
+                CTy::Unknown,
+            )),
             Expr::IfElse {
                 cond,
                 then,

@@ -375,6 +375,11 @@ impl Rewriter<'_> {
                     self.expr(part, locals);
                 }
             }
+            Expr::SliceSpec { lo, hi, step, .. } => {
+                for part in [lo, hi, step].into_iter().flatten() {
+                    self.expr(part, locals);
+                }
+            }
             Expr::Unary { expr, .. } => self.expr(expr, locals),
             Expr::Binary { lhs, rhs, .. } => {
                 self.expr(lhs, locals);
@@ -886,6 +891,11 @@ fn collect_expr_bindings(e: &Expr, s: &mut HashSet<String>) {
             base, lo, hi, step, ..
         } => {
             collect_expr_bindings(base, s);
+            for part in [lo, hi, step].iter().copied().flatten() {
+                collect_expr_bindings(part, s);
+            }
+        }
+        Expr::SliceSpec { lo, hi, step, .. } => {
             for part in [lo, hi, step].iter().copied().flatten() {
                 collect_expr_bindings(part, s);
             }

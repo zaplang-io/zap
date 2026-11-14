@@ -3995,67 +3995,93 @@ impl Parser {
 
     fn parse_subscript(&mut self, base: Expr, start: u32) -> Expr {
         self.expect(&TokenKind::LBracket, "'['");
-        let lo = if self.is(&TokenKind::Colon) || self.is(&TokenKind::RBracket) {
-            None
-        } else {
-            Some(Box::new(self.parse_expr()))
-        };
-        if self.is(&TokenKind::Colon) {
-            self.bump();
-            let hi = if self.is(&TokenKind::Colon) || self.is(&TokenKind::RBracket) {
-                None
-            } else {
-                Some(Box::new(self.parse_expr()))
-            };
-            let step = if self.eat(&TokenKind::Colon) {
-                if self.is(&TokenKind::RBracket) {
-                    None
-                } else {
-                    Some(Box::new(self.parse_expr()))
-                }
-            } else {
-                None
-            };
-            self.expect(&TokenKind::RBracket, "']'");
-            Expr::Slice {
-                base: Box::new(base),
-                lo,
-                hi,
-                step,
-                span: self.span_from(start),
-            }
-        } else if self.is(&TokenKind::Comma) {
-            // A comma-separated postfix `base[a, b, ...]` is a multi-element
-            // subscript. Classified in sema/monomorphization: when `base` names a
-            // type or generic callee it is call-site type arguments
-            // (`Pair[int64, str]`, `map[int64, str]`, I#154 Fork S); otherwise it
-            // is a tuple value subscript. The parser produces a uniform node: the
-            // index is a tuple of the elements.
+        // Parse the first element, which may itself be a slice (`a[lo:hi:step]`)
+        // or a plain index. A lone element that is a slice becomes the dedicated
+        // `Slice` node (its 1-D / axis-0 lowering); a lone plain element is an
+        // `Index`. A comma makes it a multi-axis subscript whose index is a
+        // tuple, where each element may independently be a slice spec (`m[:, j]`,
+        // `m[lo:hi, k]`) represented by `SliceSpec` (#502).
+        let first = self.parse_index_elem(start);
+        if self.is(&TokenKind::Comma) {
             let tstart = self.peek_span().start;
-            let mut elems = vec![*lo.expect("lo parsed before a comma")];
+            let mut elems = vec![first];
             while self.eat(&TokenKind::Comma) {
                 if self.is(&TokenKind::RBracket) {
                     break; // trailing comma
                 }
-                elems.push(self.parse_expr());
+                elems.push(self.parse_index_elem(self.peek_span().start));
             }
             self.expect(&TokenKind::RBracket, "']'");
-            Expr::Index {
+            return Expr::Index {
                 base: Box::new(base),
                 index: Box::new(Expr::Tuple(elems, self.span_from(tstart))),
                 span: self.span_from(start),
-            }
+            };
+        }
+        self.expect(&TokenKind::RBracket, "']'");
+        match first {
+            // A lone slice spec attaches the base and becomes a `Slice` (the
+            // existing 1-D / N-D axis-0 slice path).
+            Expr::SliceSpec {
+                lo, hi, step, span, ..
+            } => Expr::Slice {
+                base: Box::new(base),
+                lo,
+                hi,
+                step,
+                span,
+            },
+            index => Expr::Index {
+                base: Box::new(base),
+                index: Box::new(index),
+                span: self.span_from(start),
+            },
+        }
+    }
+
+    /// Parse one element of a subscript: a plain expression, or a slice spec
+    /// `[lo]:[hi][:step]` (#502). A slice spec is returned as a baseless
+    /// `Expr::SliceSpec`; `parse_subscript` attaches the base for a lone slice.
+    fn parse_index_elem(&mut self, start: u32) -> Expr {
+        let lo = if self.is(&TokenKind::Colon)
+            || self.is(&TokenKind::RBracket)
+            || self.is(&TokenKind::Comma)
+        {
+            None
         } else {
-            self.expect(&TokenKind::RBracket, "']'");
-            let index = lo.unwrap_or_else(|| {
+            Some(Box::new(self.parse_expr()))
+        };
+        if !self.is(&TokenKind::Colon) {
+            // No colon -> a plain index expression. (A missing expr here is an
+            // empty subscript, reported by the caller's `]`/`,` handling.)
+            return *lo.unwrap_or_else(|| {
                 self.error_here(ErrorCode::ZAP2013, "expected an index expression");
                 Box::new(Expr::None(self.peek_span()))
             });
-            Expr::Index {
-                base: Box::new(base),
-                index,
-                span: self.span_from(start),
+        }
+        self.bump(); // the first ':'
+        let hi = if self.is(&TokenKind::Colon)
+            || self.is(&TokenKind::RBracket)
+            || self.is(&TokenKind::Comma)
+        {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()))
+        };
+        let step = if self.eat(&TokenKind::Colon) {
+            if self.is(&TokenKind::RBracket) || self.is(&TokenKind::Comma) {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()))
             }
+        } else {
+            None
+        };
+        Expr::SliceSpec {
+            lo,
+            hi,
+            step,
+            span: self.span_from(start),
         }
     }
 

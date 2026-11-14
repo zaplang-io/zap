@@ -2251,6 +2251,31 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
             &[p.into(), i.into(), i.into(), i.into(), i.into()],
             Some(p.into()),
         );
+        // Strided views (#502, D-0171): `contig` compacts a strided view to a
+        // contiguous copy (no-op when already contiguous) for the SIMD kernels;
+        // `index_axis` integer-indexes one axis (dropping it) and `slice_axis`
+        // slices one axis (keeping it, with a signed step) — the lowering folds a
+        // multi-axis index/slice into a sequence of these.
+        self.declare_rt("zap_array_contig", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_array_index_axis",
+            &[p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_slice_axis",
+            &[
+                p.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+                i.into(),
+            ],
+            Some(p.into()),
+        );
         self.declare_rt("zap_array_get_f64", &[p.into(), i.into()], Some(f.into()));
         self.declare_rt("zap_array_set_f64", &[p.into(), i.into(), f.into()], None);
         self.declare_rt("zap_array_get_i64", &[p.into(), i.into()], Some(i.into()));
@@ -4612,8 +4637,15 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 scalar,
                 scalar_lhs,
             } => {
-                let lv = get(vals, *lhs);
-                let rv = get(vals, *rhs);
+                // Strided-view operands are compacted to a contiguous copy
+                // before the SIMD kernel reads them (#502); a scalar `rhs` is a
+                // plain value, not an array, so it is left untouched.
+                let lv = self.call1("zap_array_contig", &[get(vals, *lhs).into()], "lc")?;
+                let rv = if *scalar {
+                    get(vals, *rhs)
+                } else {
+                    self.call1("zap_array_contig", &[get(vals, *rhs).into()], "rc")?
+                };
                 let res = self.array_binop(
                     *op,
                     *out,
@@ -4634,7 +4666,8 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
                 src,
                 src_dtype,
             } => {
-                let sv = get(vals, *src);
+                // Compact a strided view before the unary SIMD kernel (#502).
+                let sv = self.call1("zap_array_contig", &[get(vals, *src).into()], "sc")?;
                 let res = self.array_unaryop(*op, *out, *src_dtype, sv, fv)?;
                 vals[*dest as usize] = Some(res);
             }

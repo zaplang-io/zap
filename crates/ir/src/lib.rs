@@ -661,10 +661,9 @@ mod tests {
     #[test]
     fn unsupported_array_operations_have_lowering_errors() {
         for (operation, message) in [
-            ("auto x = a[::2]", "stepped array slice"),
-            ("auto x = a[::-1]", "stepped array slice"),
-            // `/` and scalar-on-the-left `-`/`/` are supported since #506; `//`
-            // (floor division) and `%` stay deferred.
+            // Stepped / reversed / N-D array slices are supported since #502
+            // (see the strided-view tests); `/` and scalar-on-the-left `-`/`/`
+            // since #506; `//` (floor division) and `%` stay deferred.
             ("auto x = a // a", "only +, -, *, and /"),
             ("auto x = 1 // a", "only +, -, *, and /"),
             ("auto x = a % 2", "only +, -, *, and /"),

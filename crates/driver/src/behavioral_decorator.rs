@@ -1841,6 +1841,12 @@ impl Rewriter<'_> {
                 step: step.map(|e| Box::new(self.expr(*e))),
                 span,
             },
+            Expr::SliceSpec { lo, hi, step, span } => Expr::SliceSpec {
+                lo: lo.map(|e| Box::new(self.expr(*e))),
+                hi: hi.map(|e| Box::new(self.expr(*e))),
+                step: step.map(|e| Box::new(self.expr(*e))),
+                span,
+            },
             Expr::Lambda { params, body, span } => Expr::Lambda {
                 params,
                 body: Box::new(self.expr(*body)),

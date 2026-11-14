@@ -1215,6 +1215,7 @@ fn espan(e: &Expr) -> Span {
         | Expr::Call { span, .. }
         | Expr::Index { span, .. }
         | Expr::Slice { span, .. }
+        | Expr::SliceSpec { span, .. }
         | Expr::Attr { span, .. }
         | Expr::Lambda { span, .. }
         | Expr::RegexMatch { span, .. }
@@ -1269,6 +1270,18 @@ mod tests {
         ] {
             assert_eq!(format_source(source).unwrap(), source);
         }
+    }
+
+    #[test]
+    fn strided_subscripts_round_trip() {
+        // Stepped / reversed 1-D slices and multi-axis slices (#502) re-emit
+        // byte-for-byte: a bare `:` axis, a `lo:hi:step`, a negative step, and a
+        // slice mixed with an integer index inside one subscript.
+        let src = "def main():\n    auto a = array[i64]([1, 2, 3, 4])\n    \
+                   auto b = a[::2]\n    auto c = a[::-1]\n    auto d = a[1:4:2]\n    \
+                   auto m = array[i64]([[1, 2], [3, 4]])\n    auto col = m[:, 1]\n    \
+                   auto r = m[0, ::2]\n    auto top = m[0:1]\n";
+        assert_eq!(format_source(src).unwrap(), src);
     }
 
     #[test]

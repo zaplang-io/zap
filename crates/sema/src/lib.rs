@@ -4897,6 +4897,15 @@ impl Checker {
                     _ => Ty::Unknown,
                 }
             }
+            // A baseless slice spec only appears inside a multi-axis array
+            // subscript (`m[:, j]`, #502), which types loosely; infer its bounds
+            // for side effects and leave the spec itself `Unknown`.
+            Expr::SliceSpec { lo, hi, step, .. } => {
+                for part in [lo, hi, step].into_iter().flatten() {
+                    self.infer(part);
+                }
+                Ty::Unknown
+            }
             Expr::Attr { base, name, span } => {
                 // Qualified enum member/variant access: `Color.RED`,
                 // `Shape.Unit` (D-0018/D-0046). The base is a *type* name, not a
@@ -8136,6 +8145,7 @@ fn expr_span(e: &Expr) -> Span {
         | Expr::Call { span, .. }
         | Expr::Index { span, .. }
         | Expr::Slice { span, .. }
+        | Expr::SliceSpec { span, .. }
         | Expr::Attr { span, .. }
         | Expr::Lambda { span, .. }
         | Expr::RegexMatch { span, .. }
@@ -11229,6 +11239,7 @@ def main():
         ok(include_str!("../../../tests/golden/array_bool.zap"));
         ok(include_str!("../../../tests/golden/array_division.zap"));
         ok(include_str!("../../../tests/golden/array_reductions.zap"));
+        ok(include_str!("../../../tests/golden/array_strided.zap"));
     }
 
     // --- decorators & annotations (ticket #16, D-0036) ---

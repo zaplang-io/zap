@@ -8688,3 +8688,37 @@ the existing full `sum`, plus the axis-wise form.
   around the reduced axis. New runtime entry points, but the array header ABI is
   unchanged.
 No grammar change. See `design/0002-arrays.md`, SPEC §15.
+
+## D-0171 — Strided array views (the full N-D stride model) (#502)
+**Status:** Locked (design) / implemented
+Eighth increment of the arrays epic (#499). Makes stepped/reversed/N-D slices
+real **views** by adding per-axis strides to the array — the general N-D stride
+model, not a 1-D special case (maintainer call).
+- **Surface.** `a[::2]` / `a[::-1]` (1-D stepped / reversed), `a[lo:hi:step]`,
+  `m[lo:hi]` (N-D axis-0 window, rank-preserving), and a sliced axis inside a
+  multi-axis index — `m[:, j]`, `m[lo:hi, k]`, `m[i, ::2]`. Every one is a view
+  that aliases the parent buffer (a write through it is seen by the parent),
+  matching NumPy basic indexing. A sliced *assignment target* (`m[:, j] = …`, a
+  strided-view store) stays deferred. A zero step is a fatal error (as for a
+  `list` slice).
+- **ABI change.** `ZapArray` gains `int64_t *strides` after `dims`. It is `NULL`
+  for every contiguous array — the common case, including every freshly
+  constructed array — meaning canonical row-major strides; a non-`NULL`
+  `strides` (one signed element stride per axis) marks a view, so element
+  `(i0..i_{n-1})` is at `data[off + Σ i_k·strides[k]]`. The precise collector
+  forwards `strides` like `dims`/`data` (an atomic int64 buffer).
+- **Why NULL-is-contiguous.** It keeps the contiguous hot path and the SIMD
+  kernels untouched: only the scalar get/set, the indexing/slicing view builders
+  (`zap_array_index_axis` drops an axis, `zap_array_slice_axis` keeps one with a
+  signed step), and a compaction helper are stride-aware. A multi-axis index is
+  lowered as a left-to-right fold of these two primitives.
+- **Kernels compact, not rewrite.** Element-wise ops, unary math, and reductions
+  call `zap_array_contig` at entry: it returns a contiguous array unchanged and
+  compacts a strided view to a fresh contiguous copy first (a read-only copy, so
+  no aliasing is lost — those ops already produce fresh results). So the vector
+  loops stay dense and oblivious to views; arbitrary strides are never gathered
+  in-SIMD.
+- **Parser/AST.** A new baseless `Expr::SliceSpec { lo, hi, step }` represents a
+  slice as one element of a subscript tuple (`m[:, j]`); a lone slice still
+  parses to `Expr::Slice`. This is the one grammar addition.
+See `design/0002-arrays.md`, SPEC §15, `design/RUNTIME-ABI.md`.

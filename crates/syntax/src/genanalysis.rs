@@ -248,6 +248,11 @@ fn each_yield_in_expr<'a>(e: &'a Expr, visit: &mut dyn FnMut(&'a Expr)) {
                 each_yield_in_expr(part, visit);
             }
         }
+        Expr::SliceSpec { lo, hi, step, .. } => {
+            for part in [lo, hi, step].into_iter().flatten() {
+                each_yield_in_expr(part, visit);
+            }
+        }
         Expr::Attr { base, .. } => each_yield_in_expr(base, visit),
         Expr::ChanRecv { chan, .. } => each_yield_in_expr(chan, visit),
         Expr::IfElse {

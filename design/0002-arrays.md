@@ -278,20 +278,31 @@ scalar-on-left.
   contiguous buffer into `outer × axislen × inner`. The array header ABI is
   unchanged.
 
+**Increment 10 (shipped, #502 / D-0171):** strided views — the full N-D stride
+model.
+
+- `ZapArray` gains `strides` (NULL == contiguous row-major; non-NULL == a view
+  with one signed element stride per axis). The precise collector forwards it
+  like `dims`/`data`.
+- Views that alias the parent: `a[::2]` / `a[::-1]` (1-D stepped / reversed),
+  `a[lo:hi:step]`, `m[lo:hi]` (N-D axis-0, rank-preserving), and a sliced axis in
+  a multi-axis index `m[:, j]` / `m[lo:hi, k]` / `m[i, ::2]`. Scalar get/set are
+  stride-aware (so a write aliases the parent); `zap_array_index_axis` /
+  `zap_array_slice_axis` build the views and a multi-axis index folds them left
+  to right. Assigning through a sliced index (a strided-view store) is deferred.
+- The SIMD kernels and reductions stay contiguous: each calls `zap_array_contig`
+  at entry, which compacts a strided operand to a fresh contiguous copy first
+  (read-only, so no aliasing is lost). NULL-is-contiguous keeps the common path
+  and every existing kernel untouched.
+- Parser/AST: a baseless `Expr::SliceSpec` carries a slice as one element of a
+  subscript tuple (`m[:, j]`); a lone slice still parses to `Expr::Slice`.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Inner-axis SIMD for the broadcast path; broadcasting in assignment /
   partial-index (whole-row) stores `m[i] = row` (#501 follow-up / #511).
-- N-D (axis-0) array slicing `m[lo:hi]` and strided views (#502).
-- **Strided** slice views (`a[::2]`, `a[::-1]`). A *contiguous* 1-D slice
-  (`a[lo:hi]`, `a[:]`, `a[lo:]`, `a[:hi]`) is now a view (#400, D-0030): the
-  slice header shares the parent buffer and carries an element `off`set + length
-  (see `ZapArray.off` in `zaprt.c`), so a write through either side aliases.
-  Pointing a view's `data` into the buffer's interior is unsafe — the precise
-  collector forwards `data` as an object start under evacuation — so `data` stays
-  at the base and `off` carries the window. A strided view would need per-axis
-  strides the 1-D `ZapArray` has not got, so a stepped array slice is rejected at
-  compile time for now (a list slice, a copy, supports any step).
+- Assigning *through* a sliced index — a strided-view store `m[:, j] = col` —
+  stays a lowering error (the read side ships in Increment 10 below).
 - Floor division `//` and modulo `%` over arrays (a lowering error for now; the
   existing kernel extends to them with an integer `sdiv`/`udiv` + floor-adjust).
 - `keepdims` reductions and multi-axis `axis=(i, j)`; the rest of the math
@@ -300,13 +311,13 @@ scalar-on-left.
   Increment 7 kernel). (Shipped: dtype matrix Increment 5 / D-0166; constructors
   Increment 6 / D-0167; the core elementwise math set Increment 7 / D-0168;
   division + scalar-on-left Increment 8 / D-0169; reductions + single `axis=`
-  Increment 9 / D-0170.)
+  Increment 9 / D-0170; strided N-D views Increment 10 / D-0171.)
 - `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 
 ## Open issues
 
 - **Views vs copies** for slices: settled (D-0030, #400) — an array slice is a
-  view, a list slice is a copy. Contiguous array views ship now; strided views
-  (which need per-axis strides) remain deferred above.
+  view, a list slice is a copy. Both contiguous and strided (stepped / reversed /
+  N-D) array views now ship (Increment 10, #502 / D-0171).
 - Whether `@simd`/alignment hints on loops are exposed to users (later).
 - Integer-array overflow: follows D-0005 (wrap) unless a checked mode is added.

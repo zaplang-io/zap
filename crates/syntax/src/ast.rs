@@ -894,6 +894,17 @@ pub enum Expr {
         step: Option<Box<Expr>>,
         span: Span,
     },
+    /// A bare slice specifier `lo:hi:step` appearing as one element of a
+    /// multi-axis subscript tuple, e.g. the `:` and `lo:hi` in `m[:, j]` /
+    /// `m[lo:hi, k]` (#502). It carries no base — it only ever occurs inside an
+    /// `Index` tuple, where N-D array slicing consumes it; anywhere else it is a
+    /// semantic/lowering error.
+    SliceSpec {
+        lo: Option<Box<Expr>>,
+        hi: Option<Box<Expr>>,
+        step: Option<Box<Expr>>,
+        span: Span,
+    },
     Attr {
         base: Box<Expr>,
         name: String,
