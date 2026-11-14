@@ -4109,6 +4109,145 @@ static void arr_store_f(ZapArray *a, int64_t i, double v) {
     }
 }
 
+/* --- matrix multiply / dot product (#509, D-0172) ------------------------
+ * `a @ b` and `dot(a, b)`. Operands are compacted to contiguous first, then the
+ * element at logical flat index `i` is read with its source dtype widened to an
+ * int64 or double accumulator (`mm_load_i` / `mm_load_f`). A shape mismatch on
+ * the contracted axis raises a catchable ValueError. */
+static int64_t mm_load_i(const ZapArray *a, int64_t i) {
+    int64_t p = a->off + i;
+    switch (a->dtype) {
+    case DTYPE_BOOL:
+    case DTYPE_U8:
+        return ((const uint8_t *)a->data)[p];
+    case DTYPE_I8:
+        return ((const int8_t *)a->data)[p];
+    case DTYPE_I16:
+        return ((const int16_t *)a->data)[p];
+    case DTYPE_U16:
+        return ((const uint16_t *)a->data)[p];
+    case DTYPE_I32:
+        return ((const int32_t *)a->data)[p];
+    case DTYPE_U32:
+        return ((const uint32_t *)a->data)[p];
+    case DTYPE_U64:
+        return (int64_t)((const uint64_t *)a->data)[p];
+    case DTYPE_F32:
+        return (int64_t)((const float *)a->data)[p];
+    case DTYPE_F64:
+        return (int64_t)((const double *)a->data)[p];
+    default: /* I64 */
+        return ((const int64_t *)a->data)[p];
+    }
+}
+static double mm_load_f(const ZapArray *a, int64_t i) {
+    int64_t p = a->off + i;
+    switch (a->dtype) {
+    case DTYPE_F64:
+        return ((const double *)a->data)[p];
+    case DTYPE_F32:
+        return (double)((const float *)a->data)[p];
+    case DTYPE_BOOL:
+    case DTYPE_U8:
+        return (double)((const uint8_t *)a->data)[p];
+    case DTYPE_I8:
+        return (double)((const int8_t *)a->data)[p];
+    case DTYPE_I16:
+        return (double)((const int16_t *)a->data)[p];
+    case DTYPE_U16:
+        return (double)((const uint16_t *)a->data)[p];
+    case DTYPE_I32:
+        return (double)((const int32_t *)a->data)[p];
+    case DTYPE_U32:
+        return (double)((const uint32_t *)a->data)[p];
+    case DTYPE_U64:
+        return (double)((const uint64_t *)a->data)[p];
+    default: /* I64 */
+        return (double)((const int64_t *)a->data)[p];
+    }
+}
+static void zap_array_matmul_mismatch(void) {
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                    zap_str_new("matmul: shapes are not aligned", 30));
+}
+
+/* 1-D · 1-D dot product -> a scalar word. `doti` accumulates in int64 (integer
+ * result dtypes), `dotf` in double (float). Lengths must match. */
+int64_t zap_array_doti(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    int64_t n = a->dims[0];
+    if (b->dims[0] != n) {
+        zap_array_matmul_mismatch();
+    }
+    int64_t acc = 0;
+    for (int64_t k = 0; k < n; k++) {
+        acc += mm_load_i(a, k) * mm_load_i(b, k);
+    }
+    return acc;
+}
+double zap_array_dotf(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    int64_t n = a->dims[0];
+    if (b->dims[0] != n) {
+        zap_array_matmul_mismatch();
+    }
+    double acc = 0.0;
+    for (int64_t k = 0; k < n; k++) {
+        acc += mm_load_f(a, k) * mm_load_f(b, k);
+    }
+    return acc;
+}
+
+/* Matrix multiply for the array-producing cases (not 1-D·1-D, which is `dot`):
+ * a 1-D operand is promoted to a row (left) or column (right) and its singleton
+ * axis dropped from the result. `out_dtype` is the NEP-50 promotion the lowering
+ * computed; the accumulator is int64 (integer out) or double (float out). */
+void *zap_array_matmul(void *ap, void *bp, int64_t out_dtype) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    int64_t na = a->ndim, nb = b->ndim;
+    int64_t m = (na == 1) ? 1 : a->dims[0];
+    int64_t ka = (na == 1) ? a->dims[0] : a->dims[1];
+    int64_t kb = b->dims[0];
+    int64_t n = (nb == 1) ? 1 : b->dims[1];
+    if (ka != kb) {
+        zap_array_matmul_mismatch();
+    }
+    int64_t kk = ka;
+    ZapArray *res;
+    if (na == 2 && nb == 2) {
+        res = (ZapArray *)zap_array_new_nd(out_dtype, 2, m * n);
+        zap_array_set_dim(res, 0, m);
+        zap_array_set_dim(res, 1, n);
+    } else {
+        /* (1,k)·(k,n) -> (n,) ; (m,k)·(k,) -> (m,) */
+        int64_t len = (na == 1) ? n : m;
+        res = (ZapArray *)zap_array_new(out_dtype, len);
+    }
+    int is_float = (out_dtype == DTYPE_F32 || out_dtype == DTYPE_F64);
+    for (int64_t i = 0; i < m; i++) {
+        for (int64_t j = 0; j < n; j++) {
+            int64_t out_idx = i * n + j; /* linear for a 1-D result (m or n == 1) */
+            if (is_float) {
+                double acc = 0.0;
+                for (int64_t t = 0; t < kk; t++) {
+                    acc += mm_load_f(a, i * kk + t) * mm_load_f(b, t * n + j);
+                }
+                arr_store_f(res, out_idx, acc);
+            } else {
+                int64_t acc = 0;
+                for (int64_t t = 0; t < kk; t++) {
+                    acc += mm_load_i(a, i * kk + t) * mm_load_i(b, t * n + j);
+                }
+                arr_store_i(res, out_idx, acc);
+            }
+        }
+    }
+    return res;
+}
+
 /* zeros/ones/full: fill an already-allocated array with a constant. `_i` takes
  * the value as an int64 word (integer/bool dtypes), `_f` as a double (floats);
  * the lowering picks the variant by the dtype's ABI word. */

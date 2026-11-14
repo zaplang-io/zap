@@ -12063,6 +12063,19 @@ impl<'a> FnLower<'a> {
                 // type, so this handles both integer and float elements.
                 return self.lower_sum_iterable(v, vt, &args[0].value);
             }
+            // `dot(a, b)` — matrix multiply / dot product, the function spelling
+            // of `a @ b` (#509). Same kernels, same NEP-50 result dtype.
+            if fname == "dot" {
+                if args.len() != 2 {
+                    return Err(err("dot() takes exactly two arguments (dot(a, b))"));
+                }
+                let (lv, lt) = self.expr(&args[0].value)?;
+                let (rv, rt) = self.expr(&args[1].value)?;
+                if !matches!(lt, Ty::Array(..)) && !matches!(rt, Ty::Array(..)) {
+                    return Err(err("dot() requires array arguments"));
+                }
+                return self.lower_array_matmul(lv, lt, rv, rt);
+            }
             // `sorted(xs, key=..., reverse=...)` — a new sorted list, leaving the
             // input untouched (ticket #336). The list is positional; `key` /
             // `reverse` are keyword-only, same as `xs.sort(...)`.
@@ -19417,6 +19430,14 @@ impl<'a> FnLower<'a> {
             return Ok((self.iconst(Ty::I32, 0), Ty::I32));
         }
 
+        // `@` matrix multiply / dot product (#509, PEP 465): not element-wise,
+        // so it routes to its own runtime kernel rather than `array_binop`.
+        if matches!(op, AstBin::MatMul)
+            && (matches!(lt, Ty::Array(..)) || matches!(rt, Ty::Array(..)))
+        {
+            return self.lower_array_matmul(l, lt, r, rt);
+        }
+
         // Element-wise numeric-array ops (ticket #24): same-shape `a + b` and
         // scalar broadcast `a + 2.0`, lowered to a SIMD kernel in codegen.
         if matches!(lt, Ty::Array(..)) || matches!(rt, Ty::Array(..)) {
@@ -20149,6 +20170,11 @@ impl<'a> FnLower<'a> {
                 });
                 Ok((d, Ty::I1))
             }
+            // `@` on arrays is intercepted at the top of `binop`; on any other
+            // operand type sema has already raised a "no such operator" error.
+            MatMul => Err(err(
+                "operator '@' (matrix multiply) is only defined for arrays",
+            )),
             In => Err(err("'in' is not supported by codegen yet")),
             NotIn => unreachable!("'not in' is rewritten to a negated 'in' in binop()"),
             // `Send` is intercepted at the top of `binop` (before the generic
@@ -20413,6 +20439,57 @@ impl<'a> FnLower<'a> {
                 "unsupported array operand (element-wise ops take two arrays or an array and a numeric scalar)",
             )),
         }
+    }
+
+    /// Matrix multiply / dot product `a @ b` (and `dot(a, b)`) on numeric arrays
+    /// (#509, D-0172, PEP 465). Both operands must be rank-1 or rank-2 arrays;
+    /// the result dtype is the NEP-50 promotion of the operand dtypes.
+    /// - 1-D · 1-D → a scalar dot product (`zap_array_dot{i,f}`);
+    /// - 1-D · 2-D / 2-D · 1-D → a rank-1 array (the vector promoted to a row /
+    ///   column and the singleton axis dropped);
+    /// - 2-D · 2-D → a rank-2 matrix product.
+    ///
+    /// A shape mismatch raises a catchable `ValueError` from the runtime, so the
+    /// calls are `throwing_call`s. Batched (≥ 3-D) matmul is a follow-up.
+    fn lower_array_matmul(
+        &mut self,
+        l: Value,
+        lt: Ty,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        let (Ty::Array(ld, lnd), Ty::Array(rd, rnd)) = (lt, rt) else {
+            return Err(err(
+                "'@' (matrix multiply) requires two arrays; a scalar does not define '@'",
+            ));
+        };
+        if lnd > 2 || rnd > 2 {
+            return Err(err(
+                "'@' (matrix multiply) supports only 1-D and 2-D arrays (batched matmul is a follow-up)",
+            ));
+        }
+        let out = Dtype::promote(ld, rd);
+        if lnd == 1 && rnd == 1 {
+            // Dot product -> scalar. Accumulate in the wide word, then narrow to
+            // the promoted dtype (like `sum`).
+            let is_float = out.is_float();
+            let (func, raw_ty) = if is_float {
+                ("zap_array_dotf", Ty::F64)
+            } else {
+                ("zap_array_doti", Ty::I64)
+            };
+            let raw = self.new_value(raw_ty);
+            self.throwing_call(Some(raw), func, vec![l, r]);
+            let res = self.coerce(raw, raw_ty, out.ty());
+            return Ok((res, out.ty()));
+        }
+        // An array result: rank 2 only when both operands are 2-D, else rank 1.
+        let rank = if lnd == 2 && rnd == 2 { 2u8 } else { 1u8 };
+        let out_ty = Ty::Array(out, rank);
+        let dest = self.new_value(out_ty);
+        let code = self.iconst(Ty::I64, out.code());
+        self.throwing_call(Some(dest), "zap_array_matmul", vec![l, r, code]);
+        Ok((dest, out_ty))
     }
 
     // --- coercions / helpers ---
@@ -22498,5 +22575,145 @@ mod strided_view_tests {
         assert_eq!(count(src, "zap_array_slice_axis"), 1);
         // The construction fills 4 elements, then the write-through is a 5th set.
         assert_eq!(count(src, "zap_array_set_i64"), 5);
+    }
+}
+
+#[cfg(test)]
+mod matmul_tests {
+    //! Matrix multiply `@` / `dot` (#509, D-0172, PEP 465). Host-only (AST->ZIR):
+    //! asserts which runtime kernel each operand-rank combination lowers to
+    //! (1-D·1-D dot -> scalar `dot{i,f}`; the array-producing cases -> `matmul`),
+    //! that all are raising (Invoke under `main`'s handler, for the shape-mismatch
+    //! ValueError), that `dot(a, b)` matches `a @ b`, and that `@=` and the `@`
+    //! precedence parse. A walled garden around the operator plumbing + dispatch,
+    //! independent of the runtime kernels (which run in the CI goldens).
+    use super::lower_module;
+    use zapc_ir_core::Inst;
+
+    fn call_funcs(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(
+            perrs.is_empty() && lerrs.is_empty(),
+            "parse/lex: {perrs:?} {lerrs:?}"
+        );
+        let (m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Call { func, .. } | Inst::Invoke { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has(src: &str, func: &str) -> bool {
+        call_funcs(src).iter().any(|f| f == func)
+    }
+
+    fn is_invoked(src: &str, func: &str) -> bool {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (m, errs) = lower_module(&module);
+        assert!(errs.is_empty(), "unexpected lowering errors: {errs:?}");
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::Invoke { func: f, .. } if f == func))
+    }
+
+    fn lower_fails(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (_m, errs) = lower_module(&module);
+        assert!(!errs.is_empty(), "expected a lowering error for\n{src}");
+    }
+
+    fn lowers_ok(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(
+            perrs.is_empty() && lerrs.is_empty(),
+            "parse/lex: {perrs:?} {lerrs:?}"
+        );
+        let (_m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+    }
+
+    #[test]
+    fn one_d_dot_product_is_a_scalar_dot() {
+        // int 1-D·1-D -> integer dot; it is raising (length mismatch -> ValueError).
+        let si = "def main():\n    auto a = array[i64]([1, 2, 3])\n    \
+                  auto b = array[i64]([4, 5, 6])\n    print(a @ b)\n";
+        assert!(is_invoked(si, "zap_array_doti"));
+        assert!(!has(si, "zap_array_matmul"));
+        // float operand -> float dot.
+        let sf = "def main():\n    auto a = array[f64]([1.0, 2.0])\n    \
+                  auto b = array[f64]([3.0, 4.0])\n    print(a @ b)\n";
+        assert!(is_invoked(sf, "zap_array_dotf"));
+    }
+
+    #[test]
+    fn two_d_matmul_uses_the_matmul_kernel() {
+        let s = "def main():\n    auto a = array[i64]([[1, 2], [3, 4]])\n    \
+                 auto b = array[i64]([[5, 6], [7, 8]])\n    auto c = a @ b\n    print(sum(c))\n";
+        assert!(is_invoked(s, "zap_array_matmul"));
+        assert!(!has(s, "zap_array_doti"));
+    }
+
+    #[test]
+    fn mixed_rank_matmul_uses_the_matmul_kernel() {
+        // 2-D · 1-D and 1-D · 2-D both produce a 1-D array via matmul (not dot).
+        let s1 = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                  auto v = array[i64]([5, 6])\n    print(sum(m @ v))\n";
+        assert!(is_invoked(s1, "zap_array_matmul"));
+        let s2 = "def main():\n    auto v = array[i64]([5, 6])\n    \
+                  auto m = array[i64]([[1, 2], [3, 4]])\n    print(sum(v @ m))\n";
+        assert!(is_invoked(s2, "zap_array_matmul"));
+    }
+
+    #[test]
+    fn dot_builtin_matches_the_operator() {
+        let s = "def main():\n    auto a = array[i64]([1, 2, 3])\n    \
+                 auto b = array[i64]([4, 5, 6])\n    print(dot(a, b))\n";
+        assert!(is_invoked(s, "zap_array_doti"));
+        let s2 = "def main():\n    auto a = array[i64]([[1, 2], [3, 4]])\n    \
+                  auto b = array[i64]([[5, 6], [7, 8]])\n    print(sum(dot(a, b)))\n";
+        assert!(is_invoked(s2, "zap_array_matmul"));
+    }
+
+    #[test]
+    fn in_place_matmul_lowers() {
+        // `m @= n` rebinds through the matmul kernel.
+        let s = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                 auto n = array[i64]([[1, 0], [0, 1]])\n    m @= n\n    print(sum(m))\n";
+        lowers_ok(s);
+        assert!(is_invoked(s, "zap_array_matmul"));
+    }
+
+    #[test]
+    fn matmul_binds_like_multiply() {
+        // PEP 465: `@` shares `*`'s precedence, above `+`. `a + b @ c` parses as
+        // `a + (b @ c)`, so the matmul lowers (the dot runs before the scalar add
+        // would even apply). Here a/b/c are 1-D so `b @ c` is a scalar dot.
+        let s = "def main():\n    auto b = array[i64]([1, 2])\n    \
+                 auto c = array[i64]([3, 4])\n    print(10 + b @ c)\n";
+        lowers_ok(s);
+        assert!(is_invoked(s, "zap_array_doti"));
+    }
+
+    #[test]
+    fn matmul_on_scalars_is_rejected() {
+        // `@` is only defined for arrays; a scalar `@` is a type error (sema) —
+        // and non-array operands never reach a matmul kernel.
+        lower_fails("def main():\n    auto x = 3 @ 4\n");
     }
 }

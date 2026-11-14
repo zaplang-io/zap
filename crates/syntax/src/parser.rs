@@ -3238,6 +3238,7 @@ impl Parser {
             TokenKind::SlashEq => BinOp::Div,
             TokenKind::SlashSlashEq => BinOp::FloorDiv,
             TokenKind::PercentEq => BinOp::Mod,
+            TokenKind::AtEq => BinOp::MatMul,
             TokenKind::StarStarEq => BinOp::Pow,
             TokenKind::AmpEq => BinOp::BitAnd,
             TokenKind::PipeEq => BinOp::BitOr,
@@ -3752,6 +3753,8 @@ impl Parser {
             TokenKind::Slash => (90, BinOp::Div),
             TokenKind::SlashSlash => (90, BinOp::FloorDiv),
             TokenKind::Percent => (90, BinOp::Mod),
+            // `@` matrix multiply shares `*`'s precedence (PEP 465, #509).
+            TokenKind::At => (90, BinOp::MatMul),
             _ => return None,
         })
     }

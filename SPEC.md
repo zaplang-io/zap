@@ -506,7 +506,8 @@ feature.
 ## 5. Operators & expressions
 
 - Arithmetic `+ - * / // % **`; **`/` is true division** (float), **`//` is
-  floor division** (D-0024).
+  floor division** (D-0024). `@` is matrix multiply (PEP 465), defined for
+  arrays (§15); it shares `*`'s precedence.
 - Comparison `== != < <= > >=`; `==` is built-in for scalars and strings —
   collections and user types **define their own equality** (D-0024).
 - Membership `in` / `not in` (D-0024, #593): `x in xs` tests whether `x` is a
@@ -1402,6 +1403,7 @@ longer-term N-D design in `design/0002-arrays.md`.
 | Scalar broadcast | `a + n`, `a - n`, `a * n`, `a / n`; and scalar-on-left `n + a`, `n * a`, `n - a`, `n / a` (shape preserved) |
 | Reduction | `sum(a)` over **all** elements, or the methods `a.sum()`/`a.min()`/`a.max()`/`a.mean()`/`a.prod()`; an optional `a.sum(axis=k)` collapses one axis to a rank-(n-1) array. `sum`/`min`/`max`/`prod` keep the dtype, `mean` is a float |
 | Slicing | Views that alias the parent: contiguous `a[lo:hi]`, stepped/reversed `a[::2]` / `a[::-1]`, N-D axis-0 windows `m[lo:hi]`, and a sliced axis in a multi-axis index `m[:, j]` (per-axis strides) |
+| Linear algebra | `a @ b` (matrix multiply, PEP 465) / `dot(a, b)` / in-place `a @= b` on 1-D & 2-D arrays: 1-D·1-D → scalar dot, 2-D·2-D → matrix, mixed → vector |
 
 Mixed array dtypes promote by NumPy NEP-50 (a float operand forces the widest
 float; same-signedness integers take the wider; mixed signed/unsigned take the
@@ -1435,6 +1437,15 @@ an N-D axis-0 window `m[lo:hi]` (rank-preserving), and a sliced axis inside a
 multi-axis index `m[:, j]` all share the parent buffer, so a write through the
 view is visible through the parent. A zero step is an error. Arithmetic over a
 strided operand transparently compacts it to a contiguous copy first.
+
+The `@` operator (PEP 465) and `dot(a, b)` are matrix multiplication on 1-D and
+2-D arrays: 1-D · 1-D is a scalar dot product, 2-D · 2-D a matrix product, and a
+mixed 1-D/2-D operand is promoted to a row/column with its singleton axis
+dropped (2-D · 1-D and 1-D · 2-D yield a 1-D vector). The result dtype follows
+NEP-50; a shape mismatch on the contracted axis raises `ValueError`. `@=` is the
+in-place form. `@` is defined only for arrays — on any other type it is an
+ordinary "no such operator" error — and batched (≥ 3-D) matmul is not yet
+supported.
 
 A bare `array[T]` type annotation denotes a rank-1 array; N-D values arise
 through inference (`auto`). List-variable/iterable `array[T]` construction,

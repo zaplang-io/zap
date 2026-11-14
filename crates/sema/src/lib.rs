@@ -464,6 +464,7 @@ const BUILTINS: &[&str] = &[
     "range",
     "len",
     "sum",
+    "dot",
     "sorted",
     // String / char builtins (ticket #284, D-0025).
     "ord",
@@ -5102,6 +5103,28 @@ impl Checker {
             }
         }
         match op {
+            // `@` matrix multiply (#509, PEP 465) is defined only for arrays,
+            // which type loosely (Unknown) here; a user struct's `__matmul__` is
+            // dispatched through the operator-dunder machinery before
+            // arith_result is reached. Any concrete non-array operand (a scalar,
+            // str, list, dict) is a "no such operator" type error.
+            MatMul => {
+                if matches!(l, Ty::Unknown) || matches!(r, Ty::Unknown) {
+                    Ty::Unknown
+                } else {
+                    self.error(
+                        ErrorCode::ZAP4012,
+                        format!(
+                            "operator '@' (matrix multiply) is only defined for arrays, \
+                             found {} and {}",
+                            l.display(),
+                            r.display()
+                        ),
+                        span,
+                    );
+                    Ty::Unknown
+                }
+            }
             Add => {
                 if l.is_numeric() && r.is_numeric() {
                     num_join(l, r)
@@ -6088,6 +6111,15 @@ impl Checker {
                 }
                 "sum" => {
                     // Reduction over an array -> scalar; typed loosely for now.
+                    for a in args {
+                        self.infer(&a.value);
+                    }
+                    return Ty::Unknown;
+                }
+                "dot" => {
+                    // `dot(a, b)` — matrix multiply / dot product (#509), the
+                    // function form of `a @ b`. Arrays type loosely, so the
+                    // result is loose; the lowering computes the real shape.
                     for a in args {
                         self.infer(&a.value);
                     }
@@ -11240,6 +11272,7 @@ def main():
         ok(include_str!("../../../tests/golden/array_division.zap"));
         ok(include_str!("../../../tests/golden/array_reductions.zap"));
         ok(include_str!("../../../tests/golden/array_strided.zap"));
+        ok(include_str!("../../../tests/golden/array_matmul.zap"));
     }
 
     // --- decorators & annotations (ticket #16, D-0036) ---

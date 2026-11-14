@@ -8722,3 +8722,30 @@ model, not a 1-D special case (maintainer call).
   slice as one element of a subscript tuple (`m[:, j]`); a lone slice still
   parses to `Expr::Slice`. This is the one grammar addition.
 See `design/0002-arrays.md`, SPEC §15, `design/RUNTIME-ABI.md`.
+
+## D-0172 — Matrix multiply `@` / `dot` for arrays (PEP 465) (#509)
+**Status:** Locked (design) / implemented
+Ninth increment of the arrays epic (#499); the first linear-algebra step, and it
+realizes the grammar-parity decision D21 (PEP 465 `@`), superseding #613.
+- **Surface.** The infix operator `@` (matrix multiply) and its in-place form
+  `@=`, plus the function `dot(a, b)` (the same operation). `@` binds at `*`'s
+  precedence (PEP 465). `@` is defined only for arrays: a scalar / `list` / `dict`
+  operand is a "no such operator" type error.
+- **Semantics (1-D / 2-D only; batched ≥3-D deferred).** 1-D · 1-D → a scalar
+  dot product; 2-D · 2-D → a matrix product; a mixed 1-D/2-D operand is promoted
+  to a row (left) or column (right) and its singleton axis dropped (so 2-D·1-D
+  and 1-D·2-D give a 1-D vector). The result dtype is the NEP-50 promotion of the
+  operand dtypes (integer accumulate for an integer result, double for a float
+  result). A mismatch on the contracted axis raises a catchable `ValueError`.
+- **No special-casing (D-0047).** `@` / `@=` go through the ordinary operator
+  pipeline: a new `ast::BinOp::MatMul`, the dunder mapping `__matmul__` /
+  `__imatmul__` in the operator-interface tables, so a user struct defining
+  `__matmul__` works with no extra machinery. Arrays are intercepted in lowering
+  (like `+`/`/`) and emit the matmul/dot runtime kernels rather than an
+  `Inst::Bin` — no IR `BinOp` or codegen change.
+- **Runtime.** `zap_array_doti`/`zap_array_dotf` (1-D·1-D scalar) and
+  `zap_array_matmul(a, b, out_dtype)` (array result); operands are compacted to
+  contiguous first (reusing #502's `zap_array_contig`). No array-header ABI
+  change.
+No new grammar beyond `@` / `@=` at `term` / `aug_op`. See `docs/GRAMMAR.ebnf`,
+`design/0002-arrays.md`, SPEC §15.

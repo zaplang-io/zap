@@ -297,6 +297,19 @@ model.
 - Parser/AST: a baseless `Expr::SliceSpec` carries a slice as one element of a
   subscript tuple (`m[:, j]`); a lone slice still parses to `Expr::Slice`.
 
+**Increment 11 (shipped, #509 / D-0172):** matrix multiply `@` / `dot`.
+
+- The infix `@` (PEP 465, `*` precedence) + in-place `@=` + `dot(a, b)` on 1-D
+  and 2-D arrays: 1-D·1-D → scalar dot, 2-D·2-D → matrix, mixed 1-D/2-D → a 1-D
+  vector (row/column, singleton axis dropped). NEP-50 result dtype; a contracted-
+  axis mismatch raises `ValueError`. Batched (≥3-D) matmul deferred.
+- No special-casing: a new `ast::BinOp::MatMul` with the `__matmul__` /
+  `__imatmul__` dunder mapping (D-0047), so a user struct's `@` works too; arrays
+  are intercepted in lowering (like `+`/`/`) and emit the runtime kernels. No IR
+  `BinOp` / codegen change. Runtime: `zap_array_dot{i,f}` (scalar) and
+  `zap_array_matmul(a, b, out_dtype)` (array), compacting operands via
+  `zap_array_contig`. No array-header ABI change.
+
 **Deferred (clean follow-ups, noted so they are not silently missing):**
 
 - Inner-axis SIMD for the broadcast path; broadcasting in assignment /
@@ -311,7 +324,8 @@ model.
   Increment 7 kernel). (Shipped: dtype matrix Increment 5 / D-0166; constructors
   Increment 6 / D-0167; the core elementwise math set Increment 7 / D-0168;
   division + scalar-on-left Increment 8 / D-0169; reductions + single `axis=`
-  Increment 9 / D-0170; strided N-D views Increment 10 / D-0171.)
+  Increment 9 / D-0170; strided N-D views Increment 10 / D-0171; matrix multiply
+  `@` / `dot` Increment 11 / D-0172.)
 - `uint8` is currently *only* an `array[T]` dtype, not a general scalar type.
 
 ## Open issues

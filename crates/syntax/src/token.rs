@@ -87,7 +87,8 @@ pub enum TokenKind {
     Comma,        // ,
     Dot,          // .
     Ellipsis,     // ...  (variadic, D-0038)
-    At,           // @    (decorator, D-0036)
+    At,           // @    (decorator, D-0036; infix matrix-multiply, #509)
+    AtEq,         // @=   (in-place matrix-multiply, #509)
     Semicolon,    // ;
     LArrow,       // <-   (channel receive/send, D-0031)
     RegexBind,    // =~
