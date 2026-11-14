@@ -4395,6 +4395,46 @@ double zap_array_dotf(void *ap, void *bp) {
     return acc;
 }
 
+/* Blocked + SIMD matmul floor kernel (#913, D-0180). The D-0172 scalar triple
+ * loop read every element through `mm_load_*` (a per-element dtype switch) and
+ * walked B down a column (stride n), so it neither vectorized nor used cache.
+ * Here we materialize A (m×kk) and B (kk×n) into contiguous accumulator-typed
+ * buffers ONCE, then run the cache-friendly `ikj` order: the innermost loop is a
+ * contiguous SAXPY over a result row (`C[i,j] += a * B[t,j]`), which the compiler
+ * vectorizes at -O2. Per output cell the k-accumulation keeps its increasing-`t`
+ * order, so results are BIT-IDENTICAL to the scalar kernel for every dtype (no
+ * floating-point reassociation). This is the own-kernel FLOOR (#914): simple,
+ * exact, portable; register/cache tiling and the BLAS hand-off are the ceiling,
+ * dispatched at #904. Accumulator is `double` (float out) or `int64_t` (integer
+ * out), matching D-0172; `arr_store_*` narrows to the result dtype. */
+#define ZAP_MATMUL_KERNEL(suffix, acctype, load)                               \
+    static void zap_matmul_##suffix(ZapArray *a, ZapArray *b, ZapArray *res,    \
+                                    int64_t m, int64_t n, int64_t kk) {         \
+        int64_t na = m * kk, nb = kk * n, nc = m * n;                          \
+        acctype *A = (acctype *)zap_buf((size_t)(na > 0 ? na : 0) * sizeof(acctype)); \
+        acctype *B = (acctype *)zap_buf((size_t)(nb > 0 ? nb : 0) * sizeof(acctype)); \
+        acctype *C = (acctype *)zap_buf((size_t)(nc > 0 ? nc : 0) * sizeof(acctype)); \
+        for (int64_t x = 0; x < na; x++)                                       \
+            A[x] = (acctype)load(a, x);                                        \
+        for (int64_t x = 0; x < nb; x++)                                       \
+            B[x] = (acctype)load(b, x);                                        \
+        for (int64_t x = 0; x < nc; x++)                                       \
+            C[x] = (acctype)0;                                                 \
+        for (int64_t i = 0; i < m; i++) {                                      \
+            for (int64_t t = 0; t < kk; t++) {                                 \
+                acctype av = A[i * kk + t];                                    \
+                const acctype *restrict brow = B + t * n;                     \
+                acctype *restrict crow = C + i * n;                           \
+                for (int64_t j = 0; j < n; j++)                               \
+                    crow[j] += av * brow[j];                                   \
+            }                                                                  \
+        }                                                                      \
+        for (int64_t x = 0; x < nc; x++)                                       \
+            arr_store_##suffix(res, x, C[x]);                                  \
+    }
+ZAP_MATMUL_KERNEL(f, double, mm_load_f)
+ZAP_MATMUL_KERNEL(i, int64_t, mm_load_i)
+
 /* Matrix multiply for the array-producing cases (not 1-D·1-D, which is `dot`):
  * a 1-D operand is promoted to a row (left) or column (right) and its singleton
  * axis dropped from the result. `out_dtype` is the NEP-50 promotion the lowering
@@ -4422,23 +4462,10 @@ void *zap_array_matmul(void *ap, void *bp, int64_t out_dtype) {
         res = (ZapArray *)zap_array_new(out_dtype, len);
     }
     int is_float = (out_dtype == DTYPE_F32 || out_dtype == DTYPE_F64);
-    for (int64_t i = 0; i < m; i++) {
-        for (int64_t j = 0; j < n; j++) {
-            int64_t out_idx = i * n + j; /* linear for a 1-D result (m or n == 1) */
-            if (is_float) {
-                double acc = 0.0;
-                for (int64_t t = 0; t < kk; t++) {
-                    acc += mm_load_f(a, i * kk + t) * mm_load_f(b, t * n + j);
-                }
-                arr_store_f(res, out_idx, acc);
-            } else {
-                int64_t acc = 0;
-                for (int64_t t = 0; t < kk; t++) {
-                    acc += mm_load_i(a, i * kk + t) * mm_load_i(b, t * n + j);
-                }
-                arr_store_i(res, out_idx, acc);
-            }
-        }
+    if (is_float) {
+        zap_matmul_f(a, b, res, m, n, kk);
+    } else {
+        zap_matmul_i(a, b, res, m, n, kk);
     }
     return res;
 }

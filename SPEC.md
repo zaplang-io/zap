@@ -1455,7 +1455,8 @@ dropped (2-D · 1-D and 1-D · 2-D yield a 1-D vector). The result dtype follows
 NEP-50; a shape mismatch on the contracted axis raises `ValueError`. `@=` is the
 in-place form. `@` is defined only for arrays — on any other type it is an
 ordinary "no such operator" error — and batched (≥ 3-D) matmul is not yet
-supported.
+supported. The own kernel is vectorized (blocked + SIMD, #913) — a performance
+detail with no effect on results.
 
 Shape ops reshape the N-D view. `a.reshape(d0, d1, …)` takes positional dims
 (one may be `-1`, inferred) and is a view when the source is contiguous, else a

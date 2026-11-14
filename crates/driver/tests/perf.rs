@@ -221,6 +221,18 @@ fn benches() -> Vec<Bench> {
             unit: "elems",
             floor_per_sec: 1_000_000.0,
         },
+        // MATMUL FLOOR (#913): a 256x256 i64 matrix product — the own blocked+SIMD
+        // floor kernel (the scalar triple loop the dispatch picks when BLAS is off
+        // / for integers). ones@ones = every cell N, so the sum is N^3. work is
+        // the multiply-accumulate count N^3.
+        Bench {
+            name: "array_matmul_floor",
+            src: "def main():\n    print(sum(ones[i64]((256, 256)) @ ones[i64]((256, 256))))\n",
+            expect: "16777216",
+            work: 16_777_216,
+            unit: "macs",
+            floor_per_sec: 1_000_000.0,
+        },
     ]
 }
 
