@@ -981,6 +981,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
   raises `ValueError`), and `linspace[T](start, stop, num)` (`num` samples, both
   ends inclusive). All accept the full dtype matrix.
 
+- **Boolean-mask & fancy (integer-array) indexing + `where`** (#510, D-0175,
+  epic #499): element-wise comparisons (`a > 3`, `a == b`) build `array[bool]`
+  masks, combined with `&` `|` `^` `~`; `a[mask]` and `a[idx]` gather a fresh
+  **copy**, `a[mask] = …` / `a[idx] = …` scatter in place. Multiple index arrays
+  and mixed `a[1:3, idx]` broadcast and follow NumPy's transpose rule.
+  `where(cond, x, y)` selects element-wise (scalars allowed); `where(cond)` is
+  nonzero. An array in a boolean context (`if a:`, `and`/`or`, chained
+  `lo < a < hi`) and out-of-bounds indices raise a catchable
+  `ValueError`/`IndexError`. Matches NumPy; completes the #499 array feature set.
+  No new syntax; no array-ABI change.
+
 - **Array shape ops** (#511, D-0174, epic #499): `a.reshape(d…)` (one `-1`
   inferred) and `a.transpose()` / `a.T` are **views**; `a.flatten()` is a 1-D
   **copy**; `concatenate([…], axis=)` and `stack([…], axis=)` build new arrays

@@ -1887,6 +1887,9 @@ void *zap_list_copy(void *lp) {
  * are defined with the string helpers below; forward-declare them here. */
 static int64_t zap_slice_pos(int64_t v, int64_t n);
 static int64_t zap_slice_neg(int64_t v, int64_t n);
+/* `zap_shape_err` is defined with the shape ops (#511) but used earlier by the
+ * advanced-indexing slice normalizer (#510); forward-declare it. */
+static void zap_shape_err(const char *m);
 void *zap_list_slice(void *lp, int64_t lo, int64_t hi, int64_t step, int64_t has_lo,
                      int64_t has_hi, int64_t has_step) {
     ZapList *l = (ZapList *)lp;
@@ -3271,6 +3274,24 @@ static int64_t zap_array_phys(const ZapArray *a, int64_t i) {
     return a->off + i;
 }
 
+/* Map a row-major flat logical index over the WHOLE N-D shape to its physical
+ * element offset into `data`, honoring per-axis strides for a view of any rank
+ * (#510). Dense (`strides == NULL`) is the flat index past `off`. Used by
+ * in-place advanced-index assignment, which writes into the real storage (a may
+ * itself be a strided view) and so cannot compact first. */
+static int64_t zap_array_phys_nd(const ZapArray *a, int64_t flat) {
+    if (!a->strides) {
+        return a->off + flat;
+    }
+    int64_t off = a->off, rem = flat;
+    for (int64_t k = a->ndim - 1; k >= 0; k--) {
+        int64_t c = rem % a->dims[k];
+        rem /= a->dims[k];
+        off += c * a->strides[k];
+    }
+    return off;
+}
+
 /* Compact a possibly-strided array to a contiguous one (#502): returns `a`
  * unchanged when it is already contiguous (`strides == NULL`), else allocates a
  * fresh contiguous array and copies the elements in row-major order by walking
@@ -4166,6 +4187,26 @@ static double mm_load_f(const ZapArray *a, int64_t i) {
         return (double)((const int64_t *)a->data)[p];
     }
 }
+/* Read element `i` as a raw `uint64_t` (for the unsigned comparison domain,
+ * #510): u8/u16/u32/u64/bool widen exactly; signed types are never asked for in
+ * this domain. Flat index, so the caller contiguates (or uses a stride-aware
+ * offset) first, exactly like `mm_load_i`/`mm_load_f`. */
+static uint64_t mm_load_u(const ZapArray *a, int64_t i) {
+    int64_t p = a->off + i;
+    switch (a->dtype) {
+    case DTYPE_U64:
+        return ((const uint64_t *)a->data)[p];
+    case DTYPE_U32:
+        return (uint64_t)((const uint32_t *)a->data)[p];
+    case DTYPE_U16:
+        return (uint64_t)((const uint16_t *)a->data)[p];
+    case DTYPE_BOOL:
+    case DTYPE_U8:
+        return (uint64_t)((const uint8_t *)a->data)[p];
+    default: /* a same-family unsigned pair never reaches here with a signed */
+        return (uint64_t)mm_load_i(a, i);
+    }
+}
 static void zap_array_matmul_mismatch(void) {
     zap_panic_typed(ZAP_EXC_VALUE_ERROR,
                     zap_str_new("matmul: shapes are not aligned", 30));
@@ -4244,6 +4285,745 @@ void *zap_array_matmul(void *ap, void *bp, int64_t out_dtype) {
                 arr_store_i(res, out_idx, acc);
             }
         }
+    }
+    return res;
+}
+
+/* --- element-wise comparison & mask combination (#510, D-0175) -----------
+ * `a > 3`, `a == b`, ... produce a fresh `array[bool]` (NumPy); `&`/`|`/`^`
+ * combine bool masks and `~` inverts one. These are the mask *source* for
+ * boolean-mask indexing. Comparison picks a numeric domain matching NumPy's
+ * result_type: any float operand -> double; a `u64` paired with a signed
+ * operand -> double (NumPy promotes that pair to float64); two unsigned
+ * operands -> uint64; otherwise int64. `pred` is 0 Eq, 1 Ne, 2 Lt, 3 Le,
+ * 4 Gt, 5 Ge. Broadcasting reuses `zap_array_bcast_offsets` (stride-aware),
+ * so a strided view never needs compacting first. */
+static int zap_dt_is_float(int64_t d) { return d == DTYPE_F32 || d == DTYPE_F64; }
+static int zap_dt_is_unsigned(int64_t d) {
+    return d == DTYPE_U8 || d == DTYPE_U16 || d == DTYPE_U32 || d == DTYPE_U64 ||
+           d == DTYPE_BOOL;
+}
+enum { CMP_DOM_I = 0, CMP_DOM_U = 1, CMP_DOM_F = 2 };
+static int cmp_domain(int64_t da, int64_t db) {
+    if (zap_dt_is_float(da) || zap_dt_is_float(db)) {
+        return CMP_DOM_F;
+    }
+    int ua = zap_dt_is_unsigned(da), ub = zap_dt_is_unsigned(db);
+    if (ua && ub) {
+        return CMP_DOM_U;
+    }
+    if ((da == DTYPE_U64 && !ub) || (db == DTYPE_U64 && !ua)) {
+        return CMP_DOM_F; /* u64 vs signed -> float64, matching NumPy */
+    }
+    return CMP_DOM_I;
+}
+static int cmp_f(double x, double y, int64_t pred) {
+    switch (pred) {
+    case 0: return x == y;
+    case 1: return x != y;
+    case 2: return x < y;
+    case 3: return x <= y;
+    case 4: return x > y;
+    default: return x >= y;
+    }
+}
+static int cmp_i(int64_t x, int64_t y, int64_t pred) {
+    switch (pred) {
+    case 0: return x == y;
+    case 1: return x != y;
+    case 2: return x < y;
+    case 3: return x <= y;
+    case 4: return x > y;
+    default: return x >= y;
+    }
+}
+static int cmp_u(uint64_t x, uint64_t y, int64_t pred) {
+    switch (pred) {
+    case 0: return x == y;
+    case 1: return x != y;
+    case 2: return x < y;
+    case 3: return x <= y;
+    case 4: return x > y;
+    default: return x >= y;
+    }
+}
+
+/* `a <cmp> b` element-wise -> array[bool], with NumPy broadcasting. */
+void *zap_array_cmp(void *ap, void *bp, int64_t pred) {
+    zap_array_broadcast_check(ap, bp);
+    ZapArray *res = (ZapArray *)zap_array_broadcast_new(ap, bp, DTYPE_BOOL);
+    int64_t n = zap_array_count_of(res);
+    ZapArray *a = (ZapArray *)ap, *b = (ZapArray *)bp;
+    int dom = cmp_domain(a->dtype, b->dtype);
+    uint8_t *out = (uint8_t *)res->data;
+    for (int64_t f = 0; f < n; f++) {
+        int64_t oa = 0, ob = 0;
+        zap_array_bcast_offsets(ap, bp, res, f, &oa, &ob);
+        int v;
+        if (dom == CMP_DOM_F) {
+            v = cmp_f(mm_load_f(a, oa), mm_load_f(b, ob), pred);
+        } else if (dom == CMP_DOM_U) {
+            v = cmp_u(mm_load_u(a, oa), mm_load_u(b, ob), pred);
+        } else {
+            v = cmp_i(mm_load_i(a, oa), mm_load_i(b, ob), pred);
+        }
+        out[f] = v ? 1 : 0;
+    }
+    return res;
+}
+
+/* `a <cmp> scalar` (and `scalar <cmp> a` when `scalar_lhs`) -> array[bool].
+ * The weak scalar crosses as its natural word: `si` (int64) or `sf` (double),
+ * selected by `s_is_float`. The domain follows NumPy weak-scalar rules. */
+void *zap_array_cmp_scalar(void *ap, int64_t si, double sf, int64_t s_is_float,
+                           int64_t pred, int64_t scalar_lhs) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *res = (ZapArray *)zap_array_new_like(a, DTYPE_BOOL);
+    int64_t n = zap_array_count_of(a);
+    uint8_t *out = (uint8_t *)res->data;
+    int dom;
+    if (s_is_float || zap_dt_is_float(a->dtype)) {
+        dom = CMP_DOM_F;
+    } else if (zap_dt_is_unsigned(a->dtype)) {
+        if (a->dtype == DTYPE_U64 && si < 0) {
+            dom = CMP_DOM_F;
+        } else if (si >= 0) {
+            dom = CMP_DOM_U;
+        } else {
+            dom = CMP_DOM_I; /* small unsigned vs negative fits int64 exactly */
+        }
+    } else {
+        dom = CMP_DOM_I;
+    }
+    for (int64_t i = 0; i < n; i++) {
+        int v;
+        if (dom == CMP_DOM_F) {
+            double x = mm_load_f(a, i), y = s_is_float ? sf : (double)si;
+            v = scalar_lhs ? cmp_f(y, x, pred) : cmp_f(x, y, pred);
+        } else if (dom == CMP_DOM_U) {
+            uint64_t x = mm_load_u(a, i), y = (uint64_t)si;
+            v = scalar_lhs ? cmp_u(y, x, pred) : cmp_u(x, y, pred);
+        } else {
+            int64_t x = mm_load_i(a, i), y = si;
+            v = scalar_lhs ? cmp_i(y, x, pred) : cmp_i(x, y, pred);
+        }
+        out[i] = v ? 1 : 0;
+    }
+    return res;
+}
+
+/* `mask1 & mask2` / `| ` / `^` on bool arrays -> array[bool] (NumPy treats
+ * these as logical on bool dtype), with broadcasting. `op`: 0 and, 1 or,
+ * 2 xor. Operands are read truthily, so any numeric dtype works, but the
+ * lowering restricts this to bool-dtype operands (mask combination). */
+static int log_apply(int x, int y, int64_t op) {
+    x = x ? 1 : 0;
+    y = y ? 1 : 0;
+    switch (op) {
+    case 0: return x && y;
+    case 1: return x || y;
+    default: return x ^ y;
+    }
+}
+void *zap_array_logical(void *ap, void *bp, int64_t op) {
+    zap_array_broadcast_check(ap, bp);
+    ZapArray *res = (ZapArray *)zap_array_broadcast_new(ap, bp, DTYPE_BOOL);
+    int64_t n = zap_array_count_of(res);
+    ZapArray *a = (ZapArray *)ap, *b = (ZapArray *)bp;
+    uint8_t *out = (uint8_t *)res->data;
+    for (int64_t f = 0; f < n; f++) {
+        int64_t oa = 0, ob = 0;
+        zap_array_bcast_offsets(ap, bp, res, f, &oa, &ob);
+        out[f] = log_apply((int)mm_load_i(a, oa), (int)mm_load_i(b, ob), op) ? 1 : 0;
+    }
+    return res;
+}
+/* Raised for the truth value of an array in a boolean context (`if a:`,
+ * `a and b`, `not a`, chained `lo < a < hi`) — NumPy's "ambiguous" rule. */
+void zap_array_truth_ambiguous(void) {
+    const char *m = "the truth value of an array is ambiguous; use .any() or "
+                    ".all(), or combine masks with & / | / ~";
+    zap_panic_typed(ZAP_EXC_VALUE_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+}
+/* `~mask` -> array[bool], logical not over a bool array. */
+void *zap_array_lognot(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *res = (ZapArray *)zap_array_new_like(a, DTYPE_BOOL);
+    int64_t n = zap_array_count_of(a);
+    uint8_t *out = (uint8_t *)res->data;
+    for (int64_t i = 0; i < n; i++) {
+        out[i] = mm_load_i(a, i) ? 0 : 1;
+    }
+    return res;
+}
+
+/* --- boolean-mask indexing (#510, D-0175) --------------------------------
+ * `a[mask]`: the mask is applied to the LEADING `mask.ndim` axes of `a`
+ * (NumPy), which must match `a`'s dims there. Each True position selects the
+ * contiguous trailing "block" (product of `a.dims[mask.ndim:]`). The result is
+ * a COPY (advanced indexing never aliases, unlike a slice view) of rank
+ * `1 + (a.ndim - mask.ndim)`: a leading axis of length = #True, then the
+ * untouched trailing dims (so a full-shape mask yields a 1-D array). Assignment
+ * writes back into `a`'s real storage, so it maps each slot through
+ * `zap_array_phys_nd` (never compacting the target). A shape/rank mismatch
+ * raises a catchable `IndexError`, matching NumPy. */
+static void zap_array_index_err(const char *m) {
+    zap_panic_typed(ZAP_EXC_INDEX_ERROR, zap_str_new(m, (int64_t)strlen(m)));
+}
+static void mask_check(const ZapArray *a, const ZapArray *m) {
+    if (m->ndim > a->ndim) {
+        zap_array_index_err("boolean index has more dimensions than the array");
+    }
+    for (int64_t k = 0; k < m->ndim; k++) {
+        if (m->dims[k] != a->dims[k]) {
+            zap_array_index_err(
+                "boolean index did not match the indexed array: dimension mismatch");
+        }
+    }
+}
+static int64_t mask_block(const ZapArray *a, const ZapArray *m) {
+    int64_t b = 1;
+    for (int64_t k = m->ndim; k < a->ndim; k++) {
+        b *= a->dims[k];
+    }
+    return b;
+}
+static int64_t mask_ntrue(const ZapArray *m) {
+    int64_t n = zap_array_count_of(m), c = 0;
+    for (int64_t i = 0; i < n; i++) {
+        c += mm_load_i(m, i) ? 1 : 0;
+    }
+    return c;
+}
+
+void *zap_array_mask_select(void *ap, void *mp) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *m = (ZapArray *)zap_array_contig(mp);
+    mask_check(a, m);
+    int64_t block = mask_block(a, m);
+    int64_t mcount = zap_array_count_of(m);
+    int64_t ntrue = mask_ntrue(m);
+    int64_t rndim = 1 + (a->ndim - m->ndim);
+    ZapArray *res = (ZapArray *)zap_array_new_nd(a->dtype, rndim, ntrue * block);
+    res->dims[0] = ntrue;
+    for (int64_t k = m->ndim; k < a->ndim; k++) {
+        res->dims[1 + (k - m->ndim)] = a->dims[k];
+    }
+    size_t esz = zap_array_elem_size(a->dtype);
+    char *ad = (char *)zap_array_data(a);
+    char *rd = (char *)res->data;
+    int64_t w = 0;
+    for (int64_t i = 0; i < mcount; i++) {
+        if (mm_load_i(m, i)) {
+            memcpy(rd + (size_t)w * block * esz, ad + (size_t)i * block * esz,
+                   (size_t)block * esz);
+            w++;
+        }
+    }
+    return res;
+}
+
+/* `a[mask] = scalar` (weak scalar word si/sf) — fill every selected slot. */
+void zap_array_mask_assign_scalar(void *ap, void *mp, int64_t si, double sf,
+                                  int64_t is_float) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *m = (ZapArray *)zap_array_contig(mp);
+    mask_check(a, m);
+    int64_t block = mask_block(a, m);
+    int64_t mcount = zap_array_count_of(m);
+    int af = zap_dt_is_float(a->dtype);
+    for (int64_t i = 0; i < mcount; i++) {
+        if (!mm_load_i(m, i)) {
+            continue;
+        }
+        for (int64_t j = 0; j < block; j++) {
+            int64_t phys = zap_array_phys_nd(a, i * block + j);
+            if (af) {
+                arr_store_f(a, phys, is_float ? sf : (double)si);
+            } else {
+                arr_store_i(a, phys, is_float ? (int64_t)sf : si);
+            }
+        }
+    }
+}
+
+/* `a[mask] = values` — values must have exactly `#True * block` elements (the
+ * selection's element count), or be a single element (broadcast fill). */
+void zap_array_mask_assign_array(void *ap, void *mp, void *vp) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *m = (ZapArray *)zap_array_contig(mp);
+    mask_check(a, m);
+    int64_t block = mask_block(a, m);
+    int64_t mcount = zap_array_count_of(m);
+    int64_t ntrue = mask_ntrue(m);
+    ZapArray *v = (ZapArray *)zap_array_contig(vp);
+    int64_t vcount = zap_array_count_of(v);
+    int64_t need = ntrue * block;
+    int vscalar = (vcount == 1);
+    if (!vscalar && vcount != need) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_str_new("cannot assign the input values to the masked selection: "
+                        "count mismatch",
+                        61));
+    }
+    int af = zap_dt_is_float(a->dtype);
+    int64_t sel = 0;
+    for (int64_t i = 0; i < mcount; i++) {
+        if (!mm_load_i(m, i)) {
+            continue;
+        }
+        for (int64_t j = 0; j < block; j++) {
+            int64_t phys = zap_array_phys_nd(a, i * block + j);
+            int64_t vidx = vscalar ? 0 : (sel * block + j);
+            if (af) {
+                arr_store_f(a, phys, mm_load_f(v, vidx));
+            } else {
+                arr_store_i(a, phys, mm_load_i(v, vidx));
+            }
+        }
+        sel++;
+    }
+}
+
+/* --- fancy integer-array indexing (#510, D-0175) -------------------------
+ * `a[idx]` gathers along axis 0: the result is `idx.shape + a.shape[1:]`, a
+ * fresh COPY. Each index wraps once for negatives (Python/NumPy) and is bounds-
+ * checked against axis 0 (a catchable IndexError). Assignment scatters back into
+ * `a`'s real storage (mapped through `zap_array_phys_nd`); duplicate indices
+ * resolve last-write-wins, matching NumPy (not `add.at` accumulation). */
+static int64_t fancy_axis0(int64_t j, int64_t n0) {
+    if (j < 0) {
+        j += n0;
+    }
+    if (j < 0 || j >= n0) {
+        zap_array_index_err("fancy index out of bounds for axis 0");
+    }
+    return j;
+}
+
+void *zap_array_take(void *ap, void *ip) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *idx = (ZapArray *)zap_array_contig(ip);
+    int64_t n0 = a->dims[0];
+    int64_t block = 1;
+    for (int64_t k = 1; k < a->ndim; k++) {
+        block *= a->dims[k];
+    }
+    int64_t icount = zap_array_count_of(idx);
+    int64_t rndim = idx->ndim + a->ndim - 1;
+    ZapArray *res = (ZapArray *)zap_array_new_nd(a->dtype, rndim, icount * block);
+    for (int64_t k = 0; k < idx->ndim; k++) {
+        res->dims[k] = idx->dims[k];
+    }
+    for (int64_t k = 1; k < a->ndim; k++) {
+        res->dims[idx->ndim + (k - 1)] = a->dims[k];
+    }
+    size_t esz = zap_array_elem_size(a->dtype);
+    char *ad = (char *)zap_array_data(a);
+    char *rd = (char *)res->data;
+    for (int64_t ii = 0; ii < icount; ii++) {
+        int64_t j = fancy_axis0(mm_load_i(idx, ii), n0);
+        memcpy(rd + (size_t)ii * block * esz, ad + (size_t)j * block * esz,
+               (size_t)block * esz);
+    }
+    return res;
+}
+
+/* `a[idx] = scalar` — set the gathered block of every indexed row. */
+void zap_array_scatter_scalar(void *ap, void *ip, int64_t si, double sf,
+                              int64_t is_float) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *idx = (ZapArray *)zap_array_contig(ip);
+    int64_t n0 = a->dims[0];
+    int64_t block = 1;
+    for (int64_t k = 1; k < a->ndim; k++) {
+        block *= a->dims[k];
+    }
+    int64_t icount = zap_array_count_of(idx);
+    int af = zap_dt_is_float(a->dtype);
+    for (int64_t ii = 0; ii < icount; ii++) {
+        int64_t j = fancy_axis0(mm_load_i(idx, ii), n0);
+        for (int64_t t = 0; t < block; t++) {
+            int64_t phys = zap_array_phys_nd(a, j * block + t);
+            if (af) {
+                arr_store_f(a, phys, is_float ? sf : (double)si);
+            } else {
+                arr_store_i(a, phys, is_float ? (int64_t)sf : si);
+            }
+        }
+    }
+}
+
+/* `a[idx] = values` — values has `idx.count * block` elements (the gather's
+ * element count), or a single element (broadcast fill). */
+void zap_array_scatter_array(void *ap, void *ip, void *vp) {
+    ZapArray *a = (ZapArray *)ap;
+    ZapArray *idx = (ZapArray *)zap_array_contig(ip);
+    int64_t n0 = a->dims[0];
+    int64_t block = 1;
+    for (int64_t k = 1; k < a->ndim; k++) {
+        block *= a->dims[k];
+    }
+    int64_t icount = zap_array_count_of(idx);
+    ZapArray *v = (ZapArray *)zap_array_contig(vp);
+    int64_t vcount = zap_array_count_of(v);
+    int64_t need = icount * block;
+    int vscalar = (vcount == 1);
+    if (!vscalar && vcount != need) {
+        zap_panic_typed(
+            ZAP_EXC_VALUE_ERROR,
+            zap_str_new("cannot assign the input values to the fancy selection: "
+                        "count mismatch",
+                        60));
+    }
+    int af = zap_dt_is_float(a->dtype);
+    for (int64_t ii = 0; ii < icount; ii++) {
+        int64_t j = fancy_axis0(mm_load_i(idx, ii), n0);
+        for (int64_t t = 0; t < block; t++) {
+            int64_t phys = zap_array_phys_nd(a, j * block + t);
+            int64_t vidx = vscalar ? 0 : (ii * block + t);
+            if (af) {
+                arr_store_f(a, phys, mm_load_f(v, vidx));
+            } else {
+                arr_store_i(a, phys, mm_load_i(v, vidx));
+            }
+        }
+    }
+}
+
+/* --- general advanced indexing (#510, D-0175) ----------------------------
+ * `a[p0, p1, ...]` where at least one part is an integer index array. Each
+ * axis is FULL, a SLICE, an INT scalar, or ADV (an index array); a boolean
+ * array part is expanded by the lowering into one ADV int array per axis via
+ * nonzero. The advanced arrays broadcast together to shape B; the result places
+ * B at the advanced block when the advanced axes are contiguous in the
+ * subscript, else at the front (NumPy's transpose rule), with the kept
+ * (FULL/SLICE) axes preserved in order. A fresh COPY; out-of-bounds indices
+ * raise IndexError, a broadcast mismatch ValueError. */
+static void fancy_slice_norm(int64_t n, int64_t lo, int64_t hi, int64_t step,
+                             int64_t has_lo, int64_t has_hi, int64_t has_step,
+                             int64_t *o_start, int64_t *o_step, int64_t *o_len) {
+    int64_t st = has_step ? step : 1;
+    if (st == 0) {
+        zap_shape_err("slice step cannot be zero");
+    }
+    int64_t start, stop;
+    if (st > 0) {
+        start = has_lo ? zap_slice_pos(lo, n) : 0;
+        stop = has_hi ? zap_slice_pos(hi, n) : n;
+    } else {
+        start = has_lo ? zap_slice_neg(lo, n) : n - 1;
+        stop = has_hi ? zap_slice_neg(hi, n) : -1;
+    }
+    int64_t len;
+    if (st > 0) {
+        len = stop > start ? (stop - start + st - 1) / st : 0;
+    } else {
+        len = start > stop ? (start - stop + (-st) - 1) / (-st) : 0;
+    }
+    *o_start = start;
+    *o_step = st;
+    *o_len = len;
+}
+
+void *zap_array_fancy(void *ap, void *specp, int64_t ndim, void *advp) {
+    ZapArray *a = (ZapArray *)ap; /* read-only; mapped via phys_nd (handles views) */
+    int64_t *spec = (int64_t *)specp;
+    ZapList *adv = (ZapList *)advp;
+    int64_t *kstart = (int64_t *)zap_buf(ndim * 8);
+    int64_t *kstep = (int64_t *)zap_buf(ndim * 8);
+    int64_t *klen = (int64_t *)zap_buf(ndim * 8);
+    int64_t *fixed = (int64_t *)zap_buf(ndim * 8);
+    int64_t *tag = (int64_t *)zap_buf(ndim * 8);
+    int64_t *advg = (int64_t *)zap_buf(ndim * 8);
+    int64_t G = 0, adv_first = -1, adv_last = -1;
+    for (int64_t ax = 0; ax < ndim; ax++) {
+        int64_t *r = spec + ax * 7;
+        int64_t n = a->dims[ax];
+        tag[ax] = r[0];
+        if (r[0] == 3) {
+            advg[ax] = r[1];
+            if (adv_first < 0) {
+                adv_first = ax;
+            }
+            adv_last = ax;
+            G++;
+        } else if (r[0] == 2) {
+            int64_t j = r[1];
+            if (j < 0) {
+                j += n;
+            }
+            if (j < 0 || j >= n) {
+                zap_array_index_err("index out of bounds for the indexed axis");
+            }
+            fixed[ax] = j;
+        } else if (r[0] == 1) {
+            fancy_slice_norm(n, r[1], r[2], r[3], r[4], r[5], r[6], &kstart[ax],
+                             &kstep[ax], &klen[ax]);
+        } else {
+            kstart[ax] = 0;
+            kstep[ax] = 1;
+            klen[ax] = n;
+        }
+    }
+    /* broadcast the advanced index arrays to shape B */
+    int64_t b = 0;
+    for (int64_t g = 0; g < G; g++) {
+        ZapArray *ia = (ZapArray *)(uintptr_t)adv->data[g];
+        if (ia->ndim > b) {
+            b = ia->ndim;
+        }
+    }
+    int64_t bb = b > 0 ? b : 1;
+    int64_t *B = (int64_t *)zap_buf(bb * 8);
+    for (int64_t k = 0; k < b; k++) {
+        B[k] = 1;
+    }
+    for (int64_t g = 0; g < G; g++) {
+        ZapArray *ia = (ZapArray *)(uintptr_t)adv->data[g];
+        for (int64_t k = 0; k < b; k++) {
+            int64_t dk = zap_array_bcast_dim(ia, b, k);
+            if (dk != 1) {
+                if (B[k] != 1 && B[k] != dk) {
+                    zap_panic_typed(
+                        ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("advanced index arrays could not be broadcast together",
+                                    54));
+                }
+                B[k] = dk;
+            }
+        }
+    }
+    int adv_contig = (G == 0) ? 1 : (adv_last - adv_first + 1 == G);
+    int64_t K = 0;
+    for (int64_t ax = 0; ax < ndim; ax++) {
+        if (tag[ax] == 0 || tag[ax] == 1) {
+            K++;
+        }
+    }
+    int64_t rndim = b + K;
+    if (rndim < 1) {
+        rndim = 1;
+    }
+    int64_t *rk_kind = (int64_t *)zap_buf(rndim * 8); /* 0 = kept axis, 1 = B axis */
+    int64_t *rk_val = (int64_t *)zap_buf(rndim * 8);
+    int64_t *rdims = (int64_t *)zap_buf(rndim * 8);
+    int64_t ri = 0;
+    if (adv_contig) {
+        int64_t pre_hi = (adv_first < 0) ? ndim : adv_first;
+        for (int64_t ax = 0; ax < pre_hi; ax++) {
+            if (tag[ax] == 0 || tag[ax] == 1) {
+                rk_kind[ri] = 0;
+                rk_val[ri] = ax;
+                rdims[ri] = klen[ax];
+                ri++;
+            }
+        }
+        for (int64_t k = 0; k < b; k++) {
+            rk_kind[ri] = 1;
+            rk_val[ri] = k;
+            rdims[ri] = B[k];
+            ri++;
+        }
+        int64_t post_lo = (adv_last < 0) ? ndim : adv_last + 1;
+        for (int64_t ax = post_lo; ax < ndim; ax++) {
+            if (tag[ax] == 0 || tag[ax] == 1) {
+                rk_kind[ri] = 0;
+                rk_val[ri] = ax;
+                rdims[ri] = klen[ax];
+                ri++;
+            }
+        }
+    } else {
+        for (int64_t k = 0; k < b; k++) {
+            rk_kind[ri] = 1;
+            rk_val[ri] = k;
+            rdims[ri] = B[k];
+            ri++;
+        }
+        for (int64_t ax = 0; ax < ndim; ax++) {
+            if (tag[ax] == 0 || tag[ax] == 1) {
+                rk_kind[ri] = 0;
+                rk_val[ri] = ax;
+                rdims[ri] = klen[ax];
+                ri++;
+            }
+        }
+    }
+    int64_t total = 1;
+    for (int64_t k = 0; k < rndim; k++) {
+        total *= rdims[k];
+    }
+    ZapArray *res = (ZapArray *)zap_array_new_nd(a->dtype, rndim, total);
+    for (int64_t k = 0; k < rndim; k++) {
+        res->dims[k] = rdims[k];
+    }
+    size_t esz = zap_array_elem_size(a->dtype);
+    char *rd = (char *)res->data;
+    char *ad = (char *)a->data;
+    int64_t *srcco = (int64_t *)zap_buf(ndim * 8);
+    int64_t *bco = (int64_t *)zap_buf(bb * 8);
+    for (int64_t f = 0; f < total; f++) {
+        int64_t rem = f;
+        for (int64_t k = 0; k < b; k++) {
+            bco[k] = 0;
+        }
+        for (int64_t ax = 0; ax < ndim; ax++) {
+            if (tag[ax] == 2) {
+                srcco[ax] = fixed[ax];
+            }
+        }
+        for (int64_t rax = rndim - 1; rax >= 0; rax--) {
+            int64_t c = rem % rdims[rax];
+            rem /= rdims[rax];
+            if (rk_kind[rax] == 0) {
+                int64_t ax = rk_val[rax];
+                srcco[ax] = kstart[ax] + c * kstep[ax];
+            } else {
+                bco[rk_val[rax]] = c;
+            }
+        }
+        for (int64_t ax = 0; ax < ndim; ax++) {
+            if (tag[ax] != 3) {
+                continue;
+            }
+            ZapArray *ia = (ZapArray *)(uintptr_t)adv->data[advg[ax]];
+            int64_t off = 0;
+            for (int64_t k = 0; k < b; k++) {
+                int64_t iax = k - (b - ia->ndim);
+                if (iax >= 0 && ia->dims[iax] != 1) {
+                    off += bco[k] * zap_array_axis_stride(ia, iax);
+                }
+            }
+            int64_t j = mm_load_i(ia, off);
+            int64_t n = a->dims[ax];
+            if (j < 0) {
+                j += n;
+            }
+            if (j < 0 || j >= n) {
+                zap_array_index_err("fancy index out of bounds");
+            }
+            srcco[ax] = j;
+        }
+        int64_t lf = 0;
+        for (int64_t ax = 0; ax < ndim; ax++) {
+            lf = lf * a->dims[ax] + srcco[ax];
+        }
+        int64_t phys = zap_array_phys_nd(a, lf);
+        memcpy(rd + (size_t)f * esz, ad + (size_t)phys * esz, esz);
+    }
+    return res;
+}
+
+/* --- where(cond, x, y) + nonzero (#510, D-0175) --------------------------
+ * `where` selects element-wise from `x` where `cond` is true, else `y`, with
+ * full NumPy broadcasting of all three (result rank = max). A scalar `x`/`y`
+ * crosses as a 1-element array (built by the lowering) so one code path covers
+ * scalars and arrays; the lowering computes `out_dtype` (the NEP-50 promotion of
+ * x and y, weak scalars). `nonzero_axis` returns the `axis`-coordinate of each
+ * true element in row-major order — the 1-arg `where(cond)` builds a tuple of
+ * one such array per axis. */
+void *zap_array_from_scalar_i(int64_t v) {
+    ZapArray *a = (ZapArray *)zap_array_new(DTYPE_I64, 1);
+    ((int64_t *)a->data)[0] = v;
+    return a;
+}
+void *zap_array_from_scalar_f(double v) {
+    ZapArray *a = (ZapArray *)zap_array_new(DTYPE_F64, 1);
+    ((double *)a->data)[0] = v;
+    return a;
+}
+/* Window-relative element offset of result flat index `f` into one operand
+ * under broadcasting (right-aligned axes; a size-1 or missing axis contributes
+ * 0). Stride-aware, so a view operand needs no compaction. */
+static int64_t zap_bcast_off1(const ZapArray *a, const ZapArray *res, int64_t f) {
+    int64_t r = res->ndim, o = 0, rem = f;
+    for (int64_t k = r - 1; k >= 0; k--) {
+        int64_t idx = rem % res->dims[k];
+        rem /= res->dims[k];
+        int64_t ax = k - (r - a->ndim);
+        if (ax >= 0 && a->dims[ax] != 1) {
+            o += idx * zap_array_axis_stride(a, ax);
+        }
+    }
+    return o;
+}
+void *zap_array_where(void *cp, void *xp, void *yp, int64_t out_dtype) {
+    ZapArray *c = (ZapArray *)cp, *x = (ZapArray *)xp, *y = (ZapArray *)yp;
+    int64_t r = c->ndim;
+    if (x->ndim > r) {
+        r = x->ndim;
+    }
+    if (y->ndim > r) {
+        r = y->ndim;
+    }
+    int64_t *dims = (int64_t *)zap_buf(r * (int64_t)sizeof(int64_t));
+    int64_t total = 1;
+    for (int64_t k = 0; k < r; k++) {
+        int64_t dc = zap_array_bcast_dim(c, r, k);
+        int64_t dx = zap_array_bcast_dim(x, r, k);
+        int64_t dy = zap_array_bcast_dim(y, r, k);
+        int64_t dim = 1;
+        int64_t ds[3];
+        ds[0] = dc;
+        ds[1] = dx;
+        ds[2] = dy;
+        for (int t = 0; t < 3; t++) {
+            int64_t d = ds[t];
+            if (d != 1) {
+                if (dim != 1 && dim != d) {
+                    zap_panic_typed(
+                        ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("where: operands could not be broadcast together", 48));
+                }
+                dim = d;
+            }
+        }
+        dims[k] = dim;
+        total *= dim;
+    }
+    ZapArray *res = (ZapArray *)zap_array_new_nd(out_dtype, r, total);
+    for (int64_t k = 0; k < r; k++) {
+        res->dims[k] = dims[k];
+    }
+    int outf = zap_dt_is_float(out_dtype);
+    for (int64_t f = 0; f < total; f++) {
+        int64_t oc = zap_bcast_off1(c, res, f);
+        int pick = mm_load_i(c, oc) ? 1 : 0;
+        int64_t ox = zap_bcast_off1(x, res, f);
+        int64_t oy = zap_bcast_off1(y, res, f);
+        if (outf) {
+            arr_store_f(res, f, pick ? mm_load_f(x, ox) : mm_load_f(y, oy));
+        } else {
+            arr_store_i(res, f, pick ? mm_load_i(x, ox) : mm_load_i(y, oy));
+        }
+    }
+    return res;
+}
+void *zap_array_nonzero_axis(void *cp, int64_t axis) {
+    ZapArray *c = (ZapArray *)zap_array_contig(cp);
+    int64_t n = zap_array_count_of(c);
+    int64_t ntrue = 0;
+    for (int64_t i = 0; i < n; i++) {
+        ntrue += mm_load_i(c, i) ? 1 : 0;
+    }
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_I64, ntrue);
+    int64_t *out = (int64_t *)res->data;
+    int64_t w = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (!mm_load_i(c, i)) {
+            continue;
+        }
+        int64_t rem = i, coord = 0;
+        for (int64_t k = c->ndim - 1; k >= 0; k--) {
+            int64_t cc = rem % c->dims[k];
+            rem /= c->dims[k];
+            if (k == axis) {
+                coord = cc;
+            }
+        }
+        out[w++] = coord;
     }
     return res;
 }

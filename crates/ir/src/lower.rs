@@ -426,6 +426,20 @@ struct StructCtx {
     race: bool,
 }
 
+/// One classified axis of an array subscript (#510). `Slice`'s pairs are the
+/// `(value, present_flag)` results of `array_slice_bound`; `Int` carries the
+/// evaluated index value and its type; `Adv` carries an index array value with
+/// its dtype and rank. Built with one evaluation per part.
+enum IdxPart {
+    Slice {
+        lo: (Value, Value),
+        hi: (Value, Value),
+        step: (Value, Value),
+    },
+    Int(Value, Ty),
+    Adv(Value, Dtype, u8),
+}
+
 /// One construction-time field validation constraint (`@validate`/`@range`,
 /// D-0101). Sema validated the argument shapes; lowering realizes each as a
 /// guard in the generated `{Struct}____validate__` method that raises a
@@ -11360,8 +11374,26 @@ impl<'a> FnLower<'a> {
             }
             Expr::Unary { op, expr, .. } => {
                 let (v, t) = self.expr(expr)?;
-                if matches!(t, Ty::Array(..)) && matches!(op, AstUn::Neg | AstUn::BitNot) {
-                    return Err(err("element-wise unary array operations are unsupported"));
+                if matches!(t, Ty::Array(..)) {
+                    // `~mask` inverts a boolean array (#510, D-0175).
+                    if matches!(op, AstUn::BitNot) {
+                        if let Ty::Array(Dtype::Bool, nd) = t {
+                            let out = Ty::Array(Dtype::Bool, nd);
+                            let dest = self.new_value(out);
+                            self.emit(Inst::Call {
+                                dest: Some(dest),
+                                func: "zap_array_lognot".to_string(),
+                                args: vec![v],
+                            });
+                            return Ok((dest, out));
+                        }
+                        return Err(err(
+                            "'~' on an array is only supported for boolean masks (array[bool])",
+                        ));
+                    }
+                    if matches!(op, AstUn::Neg) {
+                        return Err(err("element-wise unary array operations are unsupported"));
+                    }
                 }
                 // Unary operator overloading on user structs (D-0047): `-a` ->
                 // `a.__neg__()`, `+a` -> `a.__pos__()`, `~a` -> `a.__invert__()`.
@@ -11576,6 +11608,22 @@ impl<'a> FnLower<'a> {
             // branch to a shared join after each link just like `and` does. The
             // IR has no phi, so the result is merged through a stack slot.
             Expr::Compare { first, rest, .. } => {
+                // A single array comparison `a > 3` / `a == b` is a *mask*
+                // (#510, D-0175): return the `array[bool]` directly rather than
+                // reducing it to a scalar truthy. A chained comparison with any
+                // array operand (`lo < a < hi`) falls through to the scalar path,
+                // where `truthy` on the first array link raises NumPy's
+                // "ambiguous" ValueError — exactly as intended.
+                if rest.len() == 1 {
+                    let (lv, lt) = self.expr(first)?;
+                    let (rv, rt) = self.expr(&rest[0].1)?;
+                    if matches!(lt, Ty::Array(..)) || matches!(rt, Ty::Array(..)) {
+                        return self.binop(rest[0].0, lv, lt, rv, rt);
+                    }
+                    let (cv, ct) = self.binop(rest[0].0, lv, lt, rv, rt)?;
+                    let cb = self.truthy(cv, ct);
+                    return Ok((cb, Ty::I1));
+                }
                 let slot = self.alloca(Ty::I1);
                 let join_bb = self.new_block();
                 let (mut prev_v, mut prev_t) = self.expr(first)?;
@@ -12082,6 +12130,12 @@ impl<'a> FnLower<'a> {
             // a catchable ValueError at runtime.
             if fname == "concatenate" || fname == "stack" {
                 return self.lower_array_join(fname, args);
+            }
+            // `where(cond, x, y)` selects element-wise (#510, D-0175), with full
+            // broadcasting; `where(cond)` returns a tuple of the true-element
+            // coordinates (one index array per axis of `cond`).
+            if fname == "where" {
+                return self.lower_array_where(args);
             }
             // `sorted(xs, key=..., reverse=...)` — a new sorted list, leaving the
             // input untouched (ticket #336). The list is positional; `key` /
@@ -14984,11 +15038,11 @@ impl<'a> FnLower<'a> {
         Ok((arr, ty))
     }
 
-    /// Evaluate the axis indices of an array subscript. `m[i, j]` arrives as an
-    /// `Expr::Tuple`; `a[i]` as a single expression. Each index must be an
-    /// integer. A sliced read (`m[:, 1]`) is handled by `lower_array_mixed_index`
-    /// before this is reached; a sliced *assignment target* is not supported.
-    /// Returns one `i64` index value per axis supplied.
+    /// Evaluate the axis indices of an array subscript, for an assignment target.
+    /// `m[i, j]` arrives as an `Expr::Tuple`; `a[i]` as a single expression. Each
+    /// index must be an integer; a sliced assignment target is not supported (a
+    /// sliced read goes through `lower_array_tuple`). Returns one `i64` index
+    /// value per axis supplied.
     fn array_axis_indices(&mut self, index: &Expr) -> Result<Vec<Value>, LowerError> {
         let parts: Vec<&Expr> = match index {
             Expr::Tuple(elems, _) => elems.iter().collect(),
@@ -15047,49 +15101,50 @@ impl<'a> FnLower<'a> {
         // the 1-D `a[i]` never reaches here) folds per axis into a strided view
         // (#502); the all-integer paths below stay the plain contiguous
         // row-fold + scalar get.
+        // Advanced indexing (#510, D-0175): a single array operand is a boolean
+        // mask (`a[mask]`) or an integer index array (`a[idx]`, fancy gather).
+        // Detect by lowering the lone subscript once; a scalar integer index or
+        // a view is handled inline here (reusing the already-evaluated value so
+        // the index runs exactly once).
+        if !matches!(
+            index,
+            Expr::Tuple(..) | Expr::Slice { .. } | Expr::SliceSpec { .. }
+        ) {
+            let (iv, it) = self.expr(index)?;
+            if let Ty::Array(idt, ind) = it {
+                return self.lower_array_single_advanced(arr, d, ndim, iv, idt, ind);
+            }
+            if it.int_width().is_none() {
+                return Err(err("array indices must be integers"));
+            }
+            let i = self.coerce_index(iv, it);
+            if ndim == 1 {
+                let dest = self.new_value(d.ty());
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: format!("zap_array_get_{}", d.suffix()),
+                    args: vec![arr, i],
+                });
+                return Ok((dest, d.ty()));
+            }
+            let view = self.array_fold_rows(arr, d, ndim, &[i]);
+            return Ok((view, Ty::Array(d, ndim - 1)));
+        }
+
         let parts: Vec<&Expr> = match index {
             Expr::Tuple(elems, _) => elems.iter().collect(),
             other => vec![other],
         };
-        if parts.iter().any(|p| matches!(p, Expr::SliceSpec { .. })) {
-            return self.lower_array_mixed_index(arr, d, ndim, &parts);
-        }
-        let idxs = self.array_axis_indices(index)?;
-        let k = idxs.len();
-        let n = ndim as usize;
-        if k > n {
-            return Err(err(format!(
-                "too many indices for a {n}-dimensional array ({k} given)"
-            )));
-        }
-        if k == n {
-            // Fold all but the final axis to a rank-1 view, then a 1-D get.
-            let view = self.array_fold_rows(arr, d, ndim, &idxs[..k - 1]);
-            let last = idxs[k - 1];
-            let dest = self.new_value(d.ty());
-            self.emit(Inst::Call {
-                dest: Some(dest),
-                func: format!("zap_array_get_{}", d.suffix()),
-                args: vec![view, last],
-            });
-            Ok((dest, d.ty()))
-        } else {
-            // Partial index -> a rank-(ndim - k) view.
-            let view = self.array_fold_rows(arr, d, ndim, &idxs);
-            Ok((view, Ty::Array(d, ndim - k as u8)))
-        }
+        self.lower_array_tuple(arr, d, ndim, &parts)
     }
 
-    /// Lower a multi-axis subscript that mixes integer indices and slices
-    /// (`m[:, j]`, `m[lo:hi, k]`, `m[i, ::2]`) into a strided **view** (#502,
-    /// D-0171). Folds the axes left to right: an integer index drops its axis
-    /// (`zap_array_index_axis`), a slice keeps it with a signed step
-    /// (`zap_array_slice_axis`); axes past the supplied specs stay full. The
-    /// running axis cursor only advances past a kept (sliced) axis, since a
-    /// dropped axis shifts the later axes down into its place. The result rank is
-    /// `ndim` minus the number of integer indices (≥ 1, since at least one slice
-    /// is present).
-    fn lower_array_mixed_index(
+    /// Lower a tuple subscript `a[p0, p1, ...]` (and the single-slice case),
+    /// classifying every part with exactly one evaluation. If any part is an
+    /// array it is advanced indexing (#510) routed to `lower_array_advanced`;
+    /// otherwise it is the pre-#510 behavior — a strided view when any slice is
+    /// present (#502), else a scalar get (full integer index) or a rank-reduced
+    /// view (partial integer index, #500).
+    fn lower_array_tuple(
         &mut self,
         arr: Value,
         d: Dtype,
@@ -15103,47 +15158,412 @@ impl<'a> FnLower<'a> {
                 parts.len()
             )));
         }
-        let mut cur = arr;
-        let mut rank = ndim;
-        let mut cur_axis: i64 = 0;
+        let mut cls: Vec<IdxPart> = Vec::with_capacity(parts.len());
+        let mut has_adv = false;
+        let mut has_slice = false;
         for p in parts {
             match p {
                 Expr::SliceSpec { lo, hi, step, .. } => {
-                    let axis = self.iconst(Ty::I64, cur_axis);
-                    let (lo_v, has_lo) = self.array_slice_bound(lo.as_deref())?;
-                    let (hi_v, has_hi) = self.array_slice_bound(hi.as_deref())?;
-                    let (st_v, has_st) = self.array_slice_bound(step.as_deref())?;
-                    let out = Ty::Array(d, rank); // a slice keeps the rank
-                    let v = self.new_value(out);
-                    self.emit(Inst::Call {
-                        dest: Some(v),
-                        func: "zap_array_slice_axis".to_string(),
-                        args: vec![cur, axis, lo_v, hi_v, st_v, has_lo, has_hi, has_st],
-                    });
-                    cur = v;
-                    cur_axis += 1; // the sliced axis stays, so advance past it
+                    let lo = self.array_slice_bound(lo.as_deref())?;
+                    let hi = self.array_slice_bound(hi.as_deref())?;
+                    let st = self.array_slice_bound(step.as_deref())?;
+                    has_slice = true;
+                    cls.push(IdxPart::Slice { lo, hi, step: st });
                 }
-                _ => {
-                    let (iv, it) = self.expr(p)?;
-                    if it.int_width().is_none() {
-                        return Err(err("array indices must be integers"));
+                Expr::Slice { lo, hi, .. } => {
+                    let lo = self.array_slice_bound(lo.as_deref())?;
+                    let hi = self.array_slice_bound(hi.as_deref())?;
+                    let st = (self.iconst(Ty::I64, 0), self.iconst(Ty::I64, 0));
+                    has_slice = true;
+                    cls.push(IdxPart::Slice { lo, hi, step: st });
+                }
+                other => {
+                    let (v, t) = self.expr(other)?;
+                    if let Ty::Array(idt, ind) = t {
+                        has_adv = true;
+                        cls.push(IdxPart::Adv(v, idt, ind));
+                    } else if t.int_width().is_some() {
+                        cls.push(IdxPart::Int(v, t));
+                    } else {
+                        return Err(err("array indices must be integers or index arrays"));
                     }
-                    let i = self.coerce_index(iv, it);
-                    let axis = self.iconst(Ty::I64, cur_axis);
-                    rank -= 1; // an integer index drops its axis
-                    let out = Ty::Array(d, rank);
-                    let v = self.new_value(out);
-                    self.emit(Inst::Call {
-                        dest: Some(v),
-                        func: "zap_array_index_axis".to_string(),
-                        args: vec![cur, axis, i],
-                    });
-                    cur = v;
-                    // cur_axis unchanged: the dropped axis pulls the rest down.
                 }
             }
         }
-        Ok((cur, Ty::Array(d, rank)))
+        if has_adv {
+            return self.lower_array_advanced(arr, d, ndim, cls);
+        }
+        // No advanced parts: reproduce the pre-#510 slice / integer behavior.
+        if has_slice {
+            let mut cur = arr;
+            let mut rank = ndim;
+            let mut cur_axis: i64 = 0;
+            for part in cls {
+                match part {
+                    IdxPart::Slice { lo, hi, step } => {
+                        let axis = self.iconst(Ty::I64, cur_axis);
+                        let v = self.new_value(Ty::Array(d, rank));
+                        self.emit(Inst::Call {
+                            dest: Some(v),
+                            func: "zap_array_slice_axis".to_string(),
+                            args: vec![cur, axis, lo.0, hi.0, step.0, lo.1, hi.1, step.1],
+                        });
+                        cur = v;
+                        cur_axis += 1;
+                    }
+                    IdxPart::Int(v, t) => {
+                        let i = self.coerce_index(v, t);
+                        let axis = self.iconst(Ty::I64, cur_axis);
+                        rank -= 1;
+                        let out = Ty::Array(d, rank);
+                        let nv = self.new_value(out);
+                        self.emit(Inst::Call {
+                            dest: Some(nv),
+                            func: "zap_array_index_axis".to_string(),
+                            args: vec![cur, axis, i],
+                        });
+                        cur = nv;
+                    }
+                    IdxPart::Adv(..) => unreachable!("has_adv is false here"),
+                }
+            }
+            return Ok((cur, Ty::Array(d, rank)));
+        }
+        // All-integer index: fold to a rank-1 view then a scalar get (full
+        // index), or a rank-reduced view (partial index).
+        let idxs: Vec<Value> = cls
+            .into_iter()
+            .map(|p| match p {
+                IdxPart::Int(v, t) => self.coerce_index(v, t),
+                _ => unreachable!(),
+            })
+            .collect();
+        let k = idxs.len();
+        if k == n {
+            let view = self.array_fold_rows(arr, d, ndim, &idxs[..k - 1]);
+            let last = idxs[k - 1];
+            let dest = self.new_value(d.ty());
+            self.emit(Inst::Call {
+                dest: Some(dest),
+                func: format!("zap_array_get_{}", d.suffix()),
+                args: vec![view, last],
+            });
+            Ok((dest, d.ty()))
+        } else {
+            let view = self.array_fold_rows(arr, d, ndim, &idxs);
+            Ok((view, Ty::Array(d, ndim - k as u8)))
+        }
+    }
+
+    /// Lower general advanced indexing `a[p0, p1, ...]` (#510, D-0175) with at
+    /// least one array part. Builds a per-axis spec buffer (7 i64 per axis:
+    /// tag + slice/int/group params) and the ordered list of integer index
+    /// arrays, then calls `zap_array_fancy`. A boolean array of rank k is
+    /// expanded into k integer index arrays via `nonzero_axis`, consuming k
+    /// axes. The result rank = (broadcast rank of the advanced arrays) + (number
+    /// of kept FULL/SLICE axes). The kernel raises IndexError/ValueError, so it
+    /// is a `throwing_call`.
+    fn lower_array_advanced(
+        &mut self,
+        arr: Value,
+        d: Dtype,
+        ndim: u8,
+        cls: Vec<IdxPart>,
+    ) -> Result<(Value, Ty), LowerError> {
+        let n = ndim as usize;
+        let zero = self.iconst(Ty::I64, 0);
+        let mut spec: Vec<[Value; 7]> = (0..n).map(|_| [zero; 7]).collect();
+        let adv_list = self.new_value(Ty::List(Elem::Ptr));
+        self.emit(Inst::Call {
+            dest: Some(adv_list),
+            func: "zap_list_new".to_string(),
+            args: vec![],
+        });
+        let mut axis = 0usize;
+        let mut g: i64 = 0;
+        let mut b: u8 = 0;
+        let mut slices: u8 = 0;
+        for part in cls {
+            if axis >= n {
+                return Err(err("too many indices for the array"));
+            }
+            match part {
+                IdxPart::Slice { lo, hi, step } => {
+                    let tag = self.iconst(Ty::I64, 1);
+                    spec[axis] = [tag, lo.0, hi.0, step.0, lo.1, hi.1, step.1];
+                    slices += 1;
+                    axis += 1;
+                }
+                IdxPart::Int(v, t) => {
+                    let iv = self.coerce(v, t, Ty::I64);
+                    let tag = self.iconst(Ty::I64, 2);
+                    spec[axis] = [tag, iv, zero, zero, zero, zero, zero];
+                    axis += 1;
+                }
+                IdxPart::Adv(v, idt, ind) => {
+                    if matches!(idt, Dtype::Bool) {
+                        let k = ind as usize;
+                        if axis + k > n {
+                            return Err(err("boolean index spans more axes than the array has"));
+                        }
+                        for t in 0..k {
+                            let axc = self.iconst(Ty::I64, t as i64);
+                            let nz = self.new_value(Ty::Array(Dtype::I64, 1));
+                            self.emit(Inst::Call {
+                                dest: Some(nz),
+                                func: "zap_array_nonzero_axis".to_string(),
+                                args: vec![v, axc],
+                            });
+                            self.emit(Inst::Call {
+                                dest: None,
+                                func: "zap_list_push_ptr".to_string(),
+                                args: vec![adv_list, nz],
+                            });
+                            let tag = self.iconst(Ty::I64, 3);
+                            let gc = self.iconst(Ty::I64, g);
+                            spec[axis] = [tag, gc, zero, zero, zero, zero, zero];
+                            axis += 1;
+                            g += 1;
+                        }
+                        if b < 1 {
+                            b = 1;
+                        }
+                    } else {
+                        self.emit(Inst::Call {
+                            dest: None,
+                            func: "zap_list_push_ptr".to_string(),
+                            args: vec![adv_list, v],
+                        });
+                        let tag = self.iconst(Ty::I64, 3);
+                        let gc = self.iconst(Ty::I64, g);
+                        spec[axis] = [tag, gc, zero, zero, zero, zero, zero];
+                        if ind > b {
+                            b = ind;
+                        }
+                        axis += 1;
+                        g += 1;
+                    }
+                }
+            }
+        }
+        // Kept axes (preserved in the result) = trailing FULL axes + the SLICE
+        // axes placed above. Integer and advanced axes are consumed.
+        let kept: u8 = (n - axis) as u8 + slices;
+        let rank = b + kept;
+        let total_slots = (n * 7) as i64;
+        let nd_slots = self.iconst(Ty::I64, total_slots);
+        let buf = self.new_value(Ty::Ptr);
+        self.emit(Inst::Call {
+            dest: Some(buf),
+            func: "zap_i64buf".to_string(),
+            args: vec![nd_slots],
+        });
+        for (ax, rec) in spec.iter().enumerate() {
+            for (s, &val) in rec.iter().enumerate() {
+                let slot = self.iconst(Ty::I64, (ax * 7 + s) as i64);
+                self.emit(Inst::Call {
+                    dest: None,
+                    func: "zap_i64set".to_string(),
+                    args: vec![buf, slot, val],
+                });
+            }
+        }
+        let ndim_v = self.iconst(Ty::I64, ndim as i64);
+        let out = Ty::Array(d, rank);
+        let dest = self.new_value(out);
+        self.throwing_call(
+            Some(dest),
+            "zap_array_fancy",
+            vec![arr, buf, ndim_v, adv_list],
+        );
+        Ok((dest, out))
+    }
+
+    /// Lower a single advanced subscript `a[ix]` where `ix` is an array (#510,
+    /// D-0175): a boolean mask (`array[bool]`) selects via `zap_array_mask_select`
+    /// (result rank `1 + ndim - mask.ndim`, a 1-D copy when the mask is
+    /// full-shape); an integer index array gathers via `zap_array_take` (result
+    /// rank `idx.ndim + ndim - 1`). Both produce a fresh copy and may raise a
+    /// catchable `IndexError`, so the kernels are `throwing_call`s.
+    fn lower_array_single_advanced(
+        &mut self,
+        arr: Value,
+        d: Dtype,
+        ndim: u8,
+        ix: Value,
+        ix_dtype: Dtype,
+        ix_ndim: u8,
+    ) -> Result<(Value, Ty), LowerError> {
+        if matches!(ix_dtype, Dtype::Bool) {
+            if ix_ndim > ndim {
+                return Err(err("boolean index has more dimensions than the array"));
+            }
+            let rank = 1 + ndim - ix_ndim;
+            let out = Ty::Array(d, rank);
+            let dest = self.new_value(out);
+            self.throwing_call(Some(dest), "zap_array_mask_select", vec![arr, ix]);
+            Ok((dest, out))
+        } else {
+            // Integer index array -> fancy gather along axis 0.
+            let rank = ix_ndim + ndim - 1;
+            let out = Ty::Array(d, rank);
+            let dest = self.new_value(out);
+            self.throwing_call(Some(dest), "zap_array_take", vec![arr, ix]);
+            Ok((dest, out))
+        }
+    }
+
+    /// Lower `where(...)` (#510, D-0175). Three args: element-wise select from
+    /// `x` where `cond` is true else `y`, with full NumPy broadcasting (result
+    /// rank = max of the operand ranks; a scalar `x`/`y` is wrapped as a 1-element
+    /// array so one runtime path serves scalars and arrays). The result dtype is
+    /// the NEP-50 promotion of `x` and `y` (weak scalars). One arg: a tuple of
+    /// `cond.ndim` index arrays (`cond.nonzero()`). The select kernel raises a
+    /// catchable ValueError on incompatible shapes, so it is a `throwing_call`.
+    fn lower_array_where(&mut self, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+        if args.iter().any(|a| a.name.is_some()) {
+            return Err(err("where() takes positional arguments only"));
+        }
+        if args.len() == 1 {
+            let (cv, ct) = self.expr(&args[0].value)?;
+            let Ty::Array(_, cnd) = ct else {
+                return Err(err("where(cond) requires an array condition"));
+            };
+            let mut vals = Vec::with_capacity(cnd as usize);
+            let mut tys = Vec::with_capacity(cnd as usize);
+            for k in 0..cnd as i64 {
+                let axis = self.iconst(Ty::I64, k);
+                let out = Ty::Array(Dtype::I64, 1);
+                let d = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(d),
+                    func: "zap_array_nonzero_axis".to_string(),
+                    args: vec![cv, axis],
+                });
+                vals.push(d);
+                tys.push(out);
+            }
+            let sid = self.ctx.tuples.borrow_mut().intern(tys);
+            let dest = self.new_value(Ty::Struct(sid));
+            self.emit(Inst::StructNew { dest, sid });
+            for (idx, v) in vals.into_iter().enumerate() {
+                self.emit(Inst::FieldSet {
+                    base: dest,
+                    sid,
+                    idx: idx as u32,
+                    val: v,
+                });
+            }
+            return Ok((dest, Ty::Struct(sid)));
+        }
+        if args.len() != 3 {
+            return Err(err("where() takes 1 argument (nonzero) or 3 (cond, x, y)"));
+        }
+        let (cv, ct) = self.expr(&args[0].value)?;
+        let Ty::Array(_, cnd) = ct else {
+            return Err(err("where(cond, x, y): cond must be an array"));
+        };
+        let (xv, xt) = self.expr(&args[1].value)?;
+        let (yv, yt) = self.expr(&args[2].value)?;
+        // Operand -> (wrapped array value, its dtype-or-None-if-scalar, rank).
+        let wrap =
+            |s: &mut Self, v: Value, t: Ty| -> Result<(Value, Option<Dtype>, u8), LowerError> {
+                match t {
+                    Ty::Array(dd, nd) => Ok((v, Some(dd), nd)),
+                    _ if t.is_float() => {
+                        let f = s.coerce(v, t, Ty::F64);
+                        let a = s.new_value(Ty::Array(Dtype::F64, 1));
+                        s.emit(Inst::Call {
+                            dest: Some(a),
+                            func: "zap_array_from_scalar_f".to_string(),
+                            args: vec![f],
+                        });
+                        Ok((a, None, 1))
+                    }
+                    _ if t.int_width().is_some() => {
+                        let i = s.coerce(v, t, Ty::I64);
+                        let a = s.new_value(Ty::Array(Dtype::I64, 1));
+                        s.emit(Inst::Call {
+                            dest: Some(a),
+                            func: "zap_array_from_scalar_i".to_string(),
+                            args: vec![i],
+                        });
+                        Ok((a, None, 1))
+                    }
+                    _ => Err(err(
+                        "where(cond, x, y): x and y must be arrays or numeric scalars",
+                    )),
+                }
+            };
+        let x_is_float = xt.is_float();
+        let y_is_float = yt.is_float();
+        let (xa, xd, xnd) = wrap(self, xv, xt)?;
+        let (ya, yd, ynd) = wrap(self, yv, yt)?;
+        // NEP-50 result dtype: array⊗array promotes both dtypes; a scalar is weak.
+        let out = match (xd, yd) {
+            (Some(a), Some(b)) => Dtype::promote(a, b),
+            (Some(a), None) => Dtype::promote_scalar(a, y_is_float),
+            (None, Some(b)) => Dtype::promote_scalar(b, x_is_float),
+            (None, None) => {
+                if xt.is_float() || yt.is_float() {
+                    Dtype::F64
+                } else {
+                    Dtype::I64
+                }
+            }
+        };
+        let rank = cnd.max(xnd).max(ynd);
+        let out_ty = Ty::Array(out, rank);
+        let code = self.iconst(Ty::I64, out.code());
+        let dest = self.new_value(out_ty);
+        self.throwing_call(Some(dest), "zap_array_where", vec![cv, xa, ya, code]);
+        Ok((dest, out_ty))
+    }
+
+    /// Lower an advanced-index assignment `a[ix] = value` (#510, D-0175) where
+    /// `ix` is an array. A boolean mask fills (scalar) or scatters (array of
+    /// values) the selected elements; an integer index array scatters by index.
+    /// The write goes into `a`'s real storage (so the runtime maps each slot
+    /// through `zap_array_phys_nd`), and may raise a catchable IndexError/
+    /// ValueError, so the kernels are `throwing_call`s. `value` is lowered once.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_array_advanced_assign(
+        &mut self,
+        target: Value,
+        _d: Dtype,
+        ndim: u8,
+        ix: Value,
+        ix_dtype: Dtype,
+        ix_ndim: u8,
+        value: &Expr,
+    ) -> Result<(), LowerError> {
+        let (v, vt) = self.expr(value)?;
+        let is_mask = matches!(ix_dtype, Dtype::Bool);
+        if is_mask && ix_ndim > ndim {
+            return Err(err("boolean index has more dimensions than the array"));
+        }
+        let (scalar_fn, array_fn) = if is_mask {
+            (
+                "zap_array_mask_assign_scalar",
+                "zap_array_mask_assign_array",
+            )
+        } else {
+            ("zap_array_scatter_scalar", "zap_array_scatter_array")
+        };
+        match vt {
+            Ty::Array(..) => {
+                self.throwing_call(None, array_fn, vec![target, ix, v]);
+                Ok(())
+            }
+            _ if vt.is_float() || vt.int_width().is_some() => {
+                let (si, sf, isf) = self.array_scalar_words(v, vt);
+                self.throwing_call(None, scalar_fn, vec![target, ix, si, sf, isf]);
+                Ok(())
+            }
+            _ => Err(err(
+                "advanced-index assignment requires a numeric scalar or an array of values",
+            )),
+        }
     }
 
     /// Resolve an N-D array subscript to the (rank-1 view, final index) naming a
@@ -16811,6 +17231,40 @@ impl<'a> FnLower<'a> {
                 Ok(())
             }
             Ty::Array(d, ndim) => {
+                // Advanced-index assignment `a[mask] = ...` / `a[idx] = ...`
+                // (#510, D-0175): a single array subscript scatters into the
+                // target's storage. Detected by lowering the lone subscript once;
+                // a scalar integer index keeps the existing single-slot store.
+                if !matches!(
+                    index,
+                    Expr::Tuple(..) | Expr::Slice { .. } | Expr::SliceSpec { .. }
+                ) {
+                    let (iv, it) = self.expr(index)?;
+                    if let Ty::Array(idt, ind) = it {
+                        return self.lower_array_advanced_assign(bv, d, ndim, iv, idt, ind, value);
+                    }
+                    if it.int_width().is_none() {
+                        return Err(err("array indices must be integers"));
+                    }
+                    let i = self.coerce_index(iv, it);
+                    if ndim != 1 {
+                        return Err(err(format!(
+                            "assigning to a partial index of a {ndim}-dimensional array \
+                             (a whole-row store) is not supported yet; index all {ndim} axes"
+                        )));
+                    }
+                    let (v, vt) = self.expr(value)?;
+                    if vt.int_width().is_none() && !vt.is_float() {
+                        return Err(err("array element assignment requires a numeric scalar"));
+                    }
+                    let v = self.coerce(v, vt, d.ty());
+                    self.emit(Inst::Call {
+                        dest: None,
+                        func: format!("zap_array_set_{}", d.suffix()),
+                        args: vec![bv, i, v],
+                    });
+                    return Ok(());
+                }
                 let (view, last) = self.array_scalar_slot(bv, d, ndim, index)?;
                 let (v, vt) = self.expr(value)?;
                 if vt.int_width().is_none() && !vt.is_float() {
@@ -19458,6 +19912,23 @@ impl<'a> FnLower<'a> {
             return self.lower_array_matmul(l, lt, r, rt);
         }
 
+        // Element-wise comparison `a > 3` / `a == b` -> array[bool] (#510,
+        // D-0175), the mask source for boolean-mask indexing. Must precede the
+        // arithmetic `array_binop` (which rejects comparison ops).
+        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
+            && (matches!(lt, Ty::Array(..)) || matches!(rt, Ty::Array(..)))
+        {
+            return self.lower_array_cmp(op, l, lt, r, rt);
+        }
+        // `&`/`|`/`^` combine bool masks (and `~` inverts, in the unary lowerer)
+        // -> array[bool] (#510). Only bool-dtype array operands are allowed;
+        // integer-array bitwise is a separate element-wise op (not indexing).
+        if matches!(op, BitAnd | BitOr | BitXor)
+            && (matches!(lt, Ty::Array(..)) || matches!(rt, Ty::Array(..)))
+        {
+            return self.lower_array_logical(op, l, lt, r, rt);
+        }
+
         // Element-wise numeric-array ops (ticket #24): same-shape `a + b` and
         // scalar broadcast `a + 2.0`, lowered to a SIMD kernel in codegen.
         if matches!(lt, Ty::Array(..)) || matches!(rt, Ty::Array(..)) {
@@ -20496,6 +20967,123 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Split a numeric scalar operand into the `(si, sf, is_float)` ABI words the
+    /// array comparison kernel expects: a float scalar crosses as `sf` (`f64`)
+    /// with `is_float = 1`; an int scalar as `si` (`i64`) with `is_float = 0`.
+    /// The unused word is a zero constant.
+    fn array_scalar_words(&mut self, v: Value, t: Ty) -> (Value, Value, Value) {
+        if t.is_float() {
+            let sf = self.coerce(v, t, Ty::F64);
+            let si = self.iconst(Ty::I64, 0);
+            let isf = self.iconst(Ty::I64, 1);
+            (si, sf, isf)
+        } else {
+            let si = self.coerce(v, t, Ty::I64);
+            let sf = self.fconst(Ty::F64, 0.0);
+            let isf = self.iconst(Ty::I64, 0);
+            (si, sf, isf)
+        }
+    }
+
+    /// Element-wise comparison `a <op> b` / `a <op> scalar` → `array[bool]`
+    /// (#510, D-0175), the mask source for boolean-mask indexing. Array⊗array
+    /// broadcasts (result rank = max; the kernel validates shapes and raises a
+    /// catchable `ValueError`, so it is a `throwing_call`); array⊗scalar keeps
+    /// the array's shape. `scalar_lhs` records a scalar on the left so the kernel
+    /// preserves operand order (`3 < a`), which matters for `<`/`<=`/`>`/`>=`.
+    fn lower_array_cmp(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lt: Ty,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        use AstBin::*;
+        let pred: i64 = match op {
+            Eq => 0,
+            Ne => 1,
+            Lt => 2,
+            Le => 3,
+            Gt => 4,
+            Ge => 5,
+            _ => return Err(err("internal: non-comparison op in lower_array_cmp")),
+        };
+        let pred_v = self.iconst(Ty::I64, pred);
+        let is_scalar = |t: &Ty| t.is_float() || t.int_width().is_some();
+        match (lt, rt) {
+            (Ty::Array(_, lnd), Ty::Array(_, rnd)) => {
+                let rank = lnd.max(rnd);
+                let out = Ty::Array(Dtype::Bool, rank);
+                let dest = self.new_value(out);
+                self.throwing_call(Some(dest), "zap_array_cmp", vec![l, r, pred_v]);
+                Ok((dest, out))
+            }
+            (Ty::Array(_, lnd), _) if is_scalar(&rt) => {
+                let (si, sf, isf) = self.array_scalar_words(r, rt);
+                let lhs_flag = self.iconst(Ty::I64, 0);
+                let out = Ty::Array(Dtype::Bool, lnd);
+                let dest = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_array_cmp_scalar".to_string(),
+                    args: vec![l, si, sf, isf, pred_v, lhs_flag],
+                });
+                Ok((dest, out))
+            }
+            (_, Ty::Array(_, rnd)) if is_scalar(&lt) => {
+                let (si, sf, isf) = self.array_scalar_words(l, lt);
+                let lhs_flag = self.iconst(Ty::I64, 1);
+                let out = Ty::Array(Dtype::Bool, rnd);
+                let dest = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_array_cmp_scalar".to_string(),
+                    args: vec![r, si, sf, isf, pred_v, lhs_flag],
+                });
+                Ok((dest, out))
+            }
+            _ => Err(err(
+                "array comparison takes two arrays or an array and a numeric scalar",
+            )),
+        }
+    }
+
+    /// `mask1 & mask2` / `|` / `^` → `array[bool]` (#510, D-0175): combine two
+    /// boolean masks (NumPy's logical `&`/`|`/`^` on bool dtype), with
+    /// broadcasting. Only `array[bool]` operands are allowed — integer-array
+    /// bitwise is a separate element-wise op, outside #510's indexing charter.
+    /// The kernel validates broadcast shapes and raises, so it is a
+    /// `throwing_call`.
+    fn lower_array_logical(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lt: Ty,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        use AstBin::*;
+        let (Ty::Array(Dtype::Bool, lnd), Ty::Array(Dtype::Bool, rnd)) = (lt, rt) else {
+            return Err(err(
+                "'&' / '|' / '^' on arrays is only supported between boolean masks \
+                 (array[bool]); integer-array bitwise operations are not supported yet",
+            ));
+        };
+        let opc: i64 = match op {
+            BitAnd => 0,
+            BitOr => 1,
+            BitXor => 2,
+            _ => return Err(err("internal: non-bitwise op in lower_array_logical")),
+        };
+        let opv = self.iconst(Ty::I64, opc);
+        let rank = lnd.max(rnd);
+        let out = Ty::Array(Dtype::Bool, rank);
+        let dest = self.new_value(out);
+        self.throwing_call(Some(dest), "zap_array_logical", vec![l, r, opv]);
+        Ok((dest, out))
+    }
+
     /// Matrix multiply / dot product `a @ b` (and `dot(a, b)`) on numeric arrays
     /// (#509, D-0172, PEP 465). Both operands must be rank-1 or rank-2 arrays;
     /// the result dtype is the NEP-50 promotion of the operand dtypes.
@@ -20980,6 +21568,14 @@ impl<'a> FnLower<'a> {
     fn truthy(&mut self, v: Value, t: Ty) -> Value {
         if t == Ty::I1 {
             return v;
+        }
+        // The truth value of a (possibly multi-element) array is ambiguous
+        // (#510, D-0175) — exactly NumPy's rule. This covers `if a:`, `a and b`,
+        // `not a`, and chained comparison `lo < a < hi` (which desugars through
+        // `and`). Raise a catchable `ValueError`; the result value is unused.
+        if matches!(t, Ty::Array(..)) {
+            self.throwing_call(None, "zap_array_truth_ambiguous", vec![]);
+            return self.iconst(Ty::I1, 0);
         }
         if t == Ty::Complex || t == Ty::Bigint {
             let raw = self.new_value(Ty::I64);
@@ -23067,5 +23663,327 @@ mod shape_ops_tests {
     #[test]
     fn unknown_array_attribute_still_rejected() {
         lower_fails("def main():\n    auto a = array[i64]([1, 2])\n    print(a.strides)\n");
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    //! Element-wise comparison -> `array[bool]`, mask combination `& | ^ ~`, and
+    //! the ambiguous-truth rule (#510, D-0175). Host-only (AST->ZIR): asserts the
+    //! comparison/logical kernels each form lowers to, that array⊗array compares
+    //! and mask combiners are raising (Invoke — they run `zap_array_broadcast_check`
+    //! and raise ValueError on incompatible shapes), that a scalar on either side
+    //! routes through `cmp_scalar`, and that truthiness / `and`/`or`/`not` /
+    //! chained comparison on an array raise NumPy's "ambiguous" ValueError. A
+    //! walled garden around the mask-source plumbing; the kernels themselves run
+    //! in the CI goldens.
+    use super::lower_module;
+    use zapc_ir_core::Inst;
+
+    fn all_calls(src: &str) -> Vec<String> {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(
+            perrs.is_empty() && lerrs.is_empty(),
+            "parse/lex: {perrs:?} {lerrs:?}"
+        );
+        let (m, errs) = lower_module(&module);
+        assert!(
+            errs.is_empty(),
+            "unexpected lowering errors for\n{src}\n{errs:?}"
+        );
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| match i {
+                Inst::Call { func, .. } | Inst::Invoke { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn has(src: &str, func: &str) -> bool {
+        all_calls(src).iter().any(|f| f == func)
+    }
+    fn is_invoked(src: &str, func: &str) -> bool {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (m, errs) = lower_module(&module);
+        assert!(errs.is_empty(), "unexpected lowering errors: {errs:?}");
+        m.funcs
+            .iter()
+            .flat_map(|f| f.blocks.iter())
+            .flat_map(|b| b.insts.iter())
+            .any(|i| matches!(i, Inst::Invoke { func: f, .. } if f == func))
+    }
+    fn lower_fails(src: &str) {
+        let (module, perrs, lerrs) = zapc_syntax::parser::parse_str(src);
+        assert!(perrs.is_empty() && lerrs.is_empty());
+        let (_m, errs) = lower_module(&module);
+        assert!(!errs.is_empty(), "expected a lowering error for\n{src}");
+    }
+
+    const A1: &str = "def main():\n    auto a = array[i64]([1, 2, 3, 4])\n    ";
+    const AB: &str =
+        "def main():\n    auto a = array[i64]([1, 2, 3])\n    auto b = array[i64]([3, 2, 1])\n    ";
+
+    #[test]
+    fn scalar_comparison_makes_a_bool_mask() {
+        // `a > 3` -> cmp_scalar (not raising: no broadcast, so a plain Call).
+        let s = format!("{A1}auto m = a > 3\n    print(m[0])\n");
+        assert!(has(&s, "zap_array_cmp_scalar"));
+        assert!(!has(&s, "zap_array_cmp"));
+    }
+
+    #[test]
+    fn all_six_relational_ops_lower_to_a_compare() {
+        for op in ["==", "!=", "<", "<=", ">", ">="] {
+            let s = format!("{A1}auto m = a {op} 2\n    print(m[0])\n");
+            assert!(
+                has(&s, "zap_array_cmp_scalar"),
+                "op {op} did not lower to cmp_scalar"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_on_left_also_lowers_to_compare() {
+        // `3 < a` must preserve operand order (scalar_lhs); still cmp_scalar.
+        let s = format!("{A1}auto m = 3 < a\n    print(m[0])\n");
+        assert!(has(&s, "zap_array_cmp_scalar"));
+    }
+
+    #[test]
+    fn float_scalar_comparison_lowers_to_compare() {
+        let s = "def main():\n    auto a = array[f64]([1.0, 2.0])\n    auto m = a >= 1.5\n    print(m[0])\n";
+        assert!(has(s, "zap_array_cmp_scalar"));
+    }
+
+    #[test]
+    fn array_array_comparison_is_a_raising_compare() {
+        // `a == b` broadcasts -> the kernel runs broadcast_check and can raise,
+        // so it is an Invoke, and it is `zap_array_cmp` (not the scalar form).
+        let s = format!("{AB}auto m = a == b\n    print(m[0])\n");
+        assert!(is_invoked(&s, "zap_array_cmp"));
+        assert!(!has(&s, "zap_array_cmp_scalar"));
+    }
+
+    #[test]
+    fn mask_combiners_lower_to_logical() {
+        for (op, _) in [("&", 0), ("|", 1), ("^", 2)] {
+            let s = format!("{A1}auto m = (a > 1) {op} (a < 4)\n    print(m[0])\n");
+            assert!(
+                is_invoked(&s, "zap_array_logical"),
+                "op {op} did not lower to logical"
+            );
+        }
+    }
+
+    #[test]
+    fn invert_lowers_to_lognot() {
+        let s = format!("{A1}auto m = ~(a > 2)\n    print(m[0])\n");
+        assert!(has(&s, "zap_array_lognot"));
+    }
+
+    #[test]
+    fn bitwise_on_non_bool_arrays_is_rejected() {
+        // `&` on integer arrays is not mask combination (integer-array bitwise is
+        // a separate element-wise op, out of #510's scope).
+        lower_fails(&format!("{AB}auto m = a & b\n    print(m[0])\n"));
+    }
+
+    #[test]
+    fn invert_of_a_non_bool_array_is_rejected() {
+        lower_fails(&format!("{A1}auto m = ~a\n    print(m[0])\n"));
+    }
+
+    #[test]
+    fn array_in_if_condition_raises_ambiguous() {
+        let s = format!("{A1}if a > 3:\n        print(1)\n");
+        assert!(is_invoked(&s, "zap_array_truth_ambiguous"));
+    }
+
+    #[test]
+    fn chained_comparison_on_an_array_raises_ambiguous() {
+        // `1 < a < 4` desugars through `and`, whose truthy on the first (array)
+        // link raises — exactly NumPy's behavior.
+        let s = format!("{A1}auto m = 1 < a < 4\n    print(m)\n");
+        assert!(is_invoked(&s, "zap_array_truth_ambiguous"));
+    }
+
+    #[test]
+    fn logical_and_or_not_on_arrays_raise_ambiguous() {
+        let sand = format!("{AB}auto m = (a == b) and (a != b)\n    print(m)\n");
+        assert!(is_invoked(&sand, "zap_array_truth_ambiguous"));
+        let snot = format!("{A1}auto m = not (a > 1)\n    print(m)\n");
+        assert!(is_invoked(&snot, "zap_array_truth_ambiguous"));
+    }
+
+    // --- Fork 2: boolean-mask indexing (#510) ---
+
+    #[test]
+    fn boolean_mask_index_selects_via_mask_select() {
+        // `a[a > 2]` -> compare (scalar) then a raising mask-select gather.
+        let s = format!("{A1}auto r = a[a > 2]\n    print(r[0])\n");
+        assert!(has(&s, "zap_array_cmp_scalar"));
+        assert!(is_invoked(&s, "zap_array_mask_select"));
+    }
+
+    #[test]
+    fn boolean_mask_from_a_variable_selects() {
+        let s = format!("{A1}auto m = a > 2\n    auto r = a[m]\n    print(r[0])\n");
+        assert!(is_invoked(&s, "zap_array_mask_select"));
+    }
+
+    #[test]
+    fn full_shape_2d_mask_selects() {
+        let s = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                 auto k = m > 2\n    auto r = m[k]\n    print(r[0])\n";
+        assert!(is_invoked(s, "zap_array_mask_select"));
+    }
+
+    #[test]
+    fn masked_scalar_assignment_clips() {
+        // `a[a < 0] = 0` -> mask-assign-scalar (raising on shape mismatch).
+        let s = "def main():\n    auto a = array[i64]([-1, 2, -3, 4])\n    \
+                 a[a < 0] = 0\n    print(a[0])\n";
+        assert!(is_invoked(s, "zap_array_mask_assign_scalar"));
+        assert!(!has(s, "zap_array_mask_assign_array"));
+    }
+
+    #[test]
+    fn masked_array_assignment_scatters() {
+        let s = "def main():\n    auto a = array[i64]([1, 2, 3, 4])\n    \
+                 auto vals = array[i64]([7, 8])\n    a[a > 2] = vals\n    print(a[0])\n";
+        assert!(is_invoked(s, "zap_array_mask_assign_array"));
+    }
+
+    #[test]
+    fn masked_float_assignment_lowers() {
+        let s = "def main():\n    auto a = array[f64]([1.0, -2.0, 3.0])\n    \
+                 a[a < 0.0] = 9.0\n    print(a[1])\n";
+        assert!(is_invoked(s, "zap_array_mask_assign_scalar"));
+    }
+
+    // --- Fork 4a: fancy integer-array gather / scatter (#510) ---
+
+    #[test]
+    fn integer_index_array_gathers_via_take() {
+        // `a[idx]` with an integer index array -> a raising gather (bounds check).
+        let s = format!(
+            "{A1}auto idx = array[i64]([0, 2, 2, 3])\n    auto r = a[idx]\n    print(r[0])\n"
+        );
+        assert!(is_invoked(&s, "zap_array_take"));
+        assert!(!has(&s, "zap_array_mask_select"));
+    }
+
+    #[test]
+    fn nd_array_gather_on_axis0() {
+        let s = "def main():\n    auto m = array[i64]([[1, 2], [3, 4], [5, 6]])\n    \
+                 auto idx = array[i64]([2, 0])\n    auto r = m[idx]\n    print(r[0, 0])\n";
+        assert!(is_invoked(s, "zap_array_take"));
+    }
+
+    #[test]
+    fn fancy_scalar_scatter_assignment() {
+        let s = format!("{A1}auto idx = array[i64]([0, 2])\n    a[idx] = 9\n    print(a[0])\n");
+        assert!(is_invoked(&s, "zap_array_scatter_scalar"));
+    }
+
+    #[test]
+    fn fancy_array_scatter_assignment() {
+        let s = format!(
+            "{A1}auto idx = array[i64]([0, 2])\n    auto v = array[i64]([7, 8])\n    \
+             a[idx] = v\n    print(a[0])\n"
+        );
+        assert!(is_invoked(&s, "zap_array_scatter_array"));
+    }
+
+    // --- Fork 5: where(cond, x, y) + nonzero (#510) ---
+
+    #[test]
+    fn where_with_scalar_fill_lowers_to_select() {
+        // `where(a > 0, a, 0)` -> a raising select; the int 0 is wrapped as a
+        // 1-element array.
+        let s = format!("{A1}auto r = where(a > 0, a, 0)\n    print(r[0])\n");
+        assert!(is_invoked(&s, "zap_array_where"));
+        assert!(has(&s, "zap_array_from_scalar_i"));
+    }
+
+    #[test]
+    fn where_promotes_with_a_float_scalar() {
+        let s = format!("{A1}auto r = where(a > 0, a, 2.5)\n    print(r[0])\n");
+        assert!(is_invoked(&s, "zap_array_where"));
+        assert!(has(&s, "zap_array_from_scalar_f"));
+    }
+
+    #[test]
+    fn where_with_two_arrays_takes_neither_scalar_wrapper() {
+        let s = format!("{AB}auto r = where(a > b, a, b)\n    print(r[0])\n");
+        assert!(is_invoked(&s, "zap_array_where"));
+        assert!(!has(&s, "zap_array_from_scalar_i"));
+        assert!(!has(&s, "zap_array_from_scalar_f"));
+    }
+
+    #[test]
+    fn one_arg_where_is_nonzero() {
+        // `where(a > 2)` -> a tuple of one index array (1-D cond).
+        let s = format!("{A1}auto t = where(a > 2)\n    print(t[0][0])\n");
+        assert!(has(&s, "zap_array_nonzero_axis"));
+        assert!(!has(&s, "zap_array_where"));
+    }
+
+    #[test]
+    fn two_arg_where_is_rejected() {
+        lower_fails(&format!("{A1}auto r = where(a > 0, a)\n    print(r[0])\n"));
+    }
+
+    // --- Fork 4b: general advanced / mixed indexing (#510) ---
+
+    const M2: &str =
+        "def main():\n    auto m = array[i64]([[1, 2, 3], [4, 5, 6], [7, 8, 9]])\n    \
+                      auto i = array[i64]([0, 2])\n    auto j = array[i64]([1, 0])\n    ";
+
+    #[test]
+    fn two_integer_index_arrays_use_the_fancy_engine() {
+        // `m[i, j]` (two advanced indices) -> the general fancy engine, raising.
+        let s = format!("{M2}auto r = m[i, j]\n    print(r[0])\n");
+        assert!(is_invoked(&s, "zap_array_fancy"));
+    }
+
+    #[test]
+    fn mixed_slice_and_index_array_uses_fancy() {
+        // `m[1:3, j]` mixes a basic slice with an advanced index.
+        let s = format!("{M2}auto r = m[1:3, j]\n    print(r[0, 0])\n");
+        assert!(is_invoked(&s, "zap_array_fancy"));
+    }
+
+    #[test]
+    fn index_array_with_full_axis_uses_fancy() {
+        let s = format!("{M2}auto r = m[i, :]\n    print(r[0, 0])\n");
+        assert!(is_invoked(&s, "zap_array_fancy"));
+    }
+
+    #[test]
+    fn index_array_with_scalar_axis_uses_fancy() {
+        let s = format!("{M2}auto r = m[i, 2]\n    print(r[0])\n");
+        assert!(is_invoked(&s, "zap_array_fancy"));
+    }
+
+    #[test]
+    fn pure_slice_tuple_still_a_strided_view_not_fancy() {
+        // No array part -> the #502 strided-view path, never the fancy engine.
+        let s = "def main():\n    auto m = array[i64]([[1, 2, 3], [4, 5, 6]])\n    \
+                 auto r = m[0:2, 1]\n    print(r[0])\n";
+        assert!(has(s, "zap_array_slice_axis"));
+        assert!(!has(s, "zap_array_fancy"));
+    }
+
+    #[test]
+    fn plain_nd_integer_index_is_not_fancy() {
+        // `m[1, 2]` (all integer, full index) stays the scalar-get path.
+        let s = "def main():\n    auto m = array[i64]([[1, 2], [3, 4]])\n    \
+                 print(m[1, 0])\n";
+        assert!(!has(s, "zap_array_fancy"));
+        assert!(has(s, "zap_array_get_i64"));
     }
 }

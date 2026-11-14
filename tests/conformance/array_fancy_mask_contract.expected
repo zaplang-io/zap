@@ -1,0 +1,7 @@
+sel 15
+clip 6
+gather 90
+where 15
+nonzero 2
+fancy2 7
+err

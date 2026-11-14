@@ -8817,3 +8817,53 @@ stride model (D-0171).
   surfaces. No array-header ABI change.
 See `design/0002-arrays.md`, SPEC §15. Part of epic #499; relates to D-0171,
 D-0170.
+
+## D-0175 — Boolean-mask & fancy (integer-array) indexing + `where` (#510)
+**Status:** Locked (design) / implemented
+Eleventh and final feature increment of the arrays epic (#499): NumPy advanced
+indexing and selection. The maintainer's call was to **match NumPy fully** in a
+single PR, including the deepest corners (multi-advanced-index broadcasting and
+the mixed basic/advanced transpose rule), rather than a narrowed v1. Semantics
+were verified against NumPy 2.5.4 before implementation.
+- **Mask source (comparisons).** Element-wise `== != < <= > >=` on arrays produce
+  a fresh `array[bool]` (array⊗array with broadcasting, and array⊗scalar); the
+  bitwise combiners `&`/`|`/`^` and the unary `~` combine/invert bool masks.
+  Integer-array bitwise (non-bool `&`) is **not** in scope here — it is a separate
+  element-wise op, a sibling of D-0168/D-0169. In sema these results stay loose
+  (`Unknown`) so they combine and index; the dtype lives in the ZIR lowering.
+- **Ambiguous truth (NumPy rule).** The truth value of an array is ambiguous:
+  `if a:`, `a and b`, `not a`, and a chained comparison `lo < a < hi` (which
+  desugars through `and`) all raise a catchable `ValueError`. Masks are combined
+  with `& | ~`, never `and`/`or`.
+- **Boolean-mask indexing.** `a[mask]` applies `mask` to the **leading**
+  `mask.ndim` axes (which must match `a`'s dims there); the result is a fresh
+  **copy** of rank `1 + (a.ndim − mask.ndim)` — a 1-D array for a full-shape
+  mask. `a[mask] = scalar` fills; `a[mask] = values` scatters (element count must
+  match, or a single value broadcasts). A shape/rank fault raises `IndexError`.
+- **Fancy integer-array indexing.** `a[idx]` gathers along axis 0: result shape
+  `idx.shape + a.shape[1:]`, a **copy**; negatives wrap, out-of-bounds raises
+  `IndexError`. `a[idx] = …` scatters (duplicate indices resolve last-write-wins,
+  matching NumPy, not `add.at`). General `a[p0, p1, …]` mixes integer scalars,
+  slices, and index arrays: the advanced index arrays broadcast together to a
+  shape B, and (NumPy's transpose rule) B is placed at the advanced block when
+  the advanced axes are **contiguous** in the subscript, else at the **front**,
+  with the kept FULL/SLICE axes preserved in order. A boolean array used as one
+  of several indices is expanded to one integer index array per axis via
+  `nonzero`. All advanced results are copies (unlike a #502 slice view).
+- **where.** `where(cond, x, y)` selects element-wise with full broadcasting of
+  all three operands (result rank = max; `x`/`y` may be scalars, wrapped as
+  1-element arrays); the result dtype is the NEP-50 promotion of `x` and `y`
+  (weak scalars). `where(cond)` is `nonzero` — a `tuple` of `cond.ndim` 1-D
+  index arrays.
+- **Implementation.** All kernels are runtime C (the matmul/reductions pattern),
+  not inline SIMD: `zap_array_cmp`/`_cmp_scalar`/`_logical`/`_lognot` (masks),
+  `zap_array_mask_select`/`_mask_assign_*` (bool indexing), `zap_array_take`/
+  `_scatter_*` (single-axis fancy), `zap_array_fancy` (the general engine, driven
+  by a per-axis spec buffer + the list of index arrays), and `zap_array_where`/
+  `_nonzero_axis`. In-place assignment maps each slot through a new general
+  `zap_array_phys_nd` (N-D stride-aware), never compacting the target. No new
+  grammar (comparisons, `& | ~`, subscripts, and the `where` call ride existing
+  surfaces); no array-header ABI change. Deferred: integer-array bitwise element
+  ops; `ravel`; `add.at`-style accumulating scatter.
+See `design/0002-arrays.md`, SPEC §15. Part of epic #499; relates to D-0165
+(broadcasting), D-0171 (views), D-0170. Completes the #499 feature set.
