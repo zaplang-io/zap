@@ -2521,6 +2521,14 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_linalg_solve", &[p.into(), p.into()], Some(p.into()));
         self.declare_rt("zap_linalg_inv", &[p.into()], Some(p.into()));
         self.declare_rt("zap_linalg_det", &[p.into()], Some(f.into()));
+        // Decompositions (#927): cholesky -> L; qr -> (Q, R); svd -> (U, S, Vt).
+        // Each output has its own entry point (the lowering assembles the tuple).
+        self.declare_rt("zap_linalg_cholesky", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_qr_q", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_qr_r", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_svd_u", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_svd_s", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_svd_vt", &[p.into()], Some(p.into()));
         // Shape ops (#511, D-0174): transpose/flatten/reshape (views or copies)
         // and concatenate/stack (over a `list` of arrays). `i64buf`/`i64set`
         // build the reshape target-dims buffer.

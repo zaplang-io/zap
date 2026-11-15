@@ -25,6 +25,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`linalg` matrix decompositions — cholesky / qr / svd** (#927, D-0184).
+  Second `linalg` slice (Phase 3 epic #512), reduced form (NumPy
+  `mode='reduced'` / `full_matrices=False`), f64: `linalg.cholesky(a)` → the
+  lower factor `L` (`a = L @ L.T`, `a` SPD); `linalg.qr(a)` → `(Q, R)` (unpacked
+  `auto q, r = linalg.qr(a)`); `linalg.svd(a)` → `(U, S, Vt)`. Backed by LAPACK
+  (`dpotrf`/`dgeqrf`+`dorgqr`/`dgesdd`) through the #912 seam, same Fortran
+  interface as the first slice. Q/R and U/Vt signs are gauge-ambiguous and
+  provider-dependent; the singular values and shapes are well-defined. A
+  non-positive-definite `cholesky`, a non-convergent `svd`, or a bad shape raises
+  a catchable `ValueError`. `eig`/`eigh`/`lstsq`/`norm`/`pinv` are a later
+  increment (#928).
 - **`import linalg` — LAPACK-backed linear algebra** (#926, D-0183). First slice
   of the Phase 3 numeric-breadth epic (#512): `linalg.solve(a, b)`,
   `linalg.inv(a)`, `linalg.det(a)` over square numeric matrices, matching

@@ -4509,6 +4509,17 @@ extern void dgetrf_(const int *m, const int *n, double *a, const int *lda,
                     int *ipiv, int *info);
 extern void dgetri_(const int *n, double *a, const int *lda, const int *ipiv,
                     double *work, const int *lwork, int *info);
+extern void dpotrf_(const char *uplo, const int *n, double *a, const int *lda,
+                    int *info);
+extern void dgeqrf_(const int *m, const int *n, double *a, const int *lda,
+                    double *tau, double *work, const int *lwork, int *info);
+extern void dorgqr_(const int *m, const int *n, const int *k, double *a,
+                    const int *lda, const double *tau, double *work,
+                    const int *lwork, int *info);
+extern void dgesdd_(const char *jobz, const int *m, const int *n, double *a,
+                    const int *lda, double *s, double *u, const int *ldu,
+                    double *vt, const int *ldvt, double *work, const int *lwork,
+                    int *iwork, int *info);
 #endif
 
 static void zap_linalg_err(const char *m) {
@@ -4589,6 +4600,137 @@ static double zap_linalg_det_impl(ZapArray *a, int64_t n) {
             d = -d; /* each row swap flips the sign */
     }
     return d;
+}
+
+/* Transpose a's row-major m*n into a fresh column-major double buffer (#927). */
+static double *zap_linalg_colmajor_mn(ZapArray *a, int64_t m, int64_t n) {
+    int64_t t = m * n;
+    double *cm = (double *)zap_buf((size_t)(t > 0 ? t : 0) * sizeof(double));
+    for (int64_t i = 0; i < m; i++)
+        for (int64_t j = 0; j < n; j++)
+            cm[i + j * m] = mm_load_f(a, i * n + j);
+    return cm;
+}
+
+/* cholesky (#927): a row-major n*n symmetric positive-definite -> lower L (with
+ * A = L Lᵀ), strict upper zeroed. dpotrf is in-place on the lower triangle. */
+static void *zap_linalg_cholesky_impl(ZapArray *a, int64_t n) {
+    double *A = zap_linalg_colmajor(a, n);
+    int ni = (int)n, info = 0;
+    dpotrf_("L", &ni, A, &ni, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.cholesky: matrix is not positive definite");
+    ZapArray *res = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, n * n);
+    zap_array_set_dim(res, 0, n);
+    zap_array_set_dim(res, 1, n);
+    for (int64_t i = 0; i < n; i++)
+        for (int64_t j = 0; j < n; j++)
+            arr_store_f(res, i * n + j, (i >= j) ? A[i + j * n] : 0.0);
+    return res;
+}
+
+/* qr reduced (#927), NumPy mode='reduced': a (m*n) -> Q (m*k) orthonormal and R
+ * (k*n) upper-triangular, k=min(m,n). Q and R get their own entry points (each
+ * re-runs the factorization — a shared-factorization out-param form is a
+ * follow-up). `dgeqrf` yields R + Householder vectors; `dorgqr` forms Q. */
+static double *zap_linalg_qr_factor(ZapArray *a, int64_t m, int64_t n, double **tau_out) {
+    int64_t k = m < n ? m : n;
+    double *cm = zap_linalg_colmajor_mn(a, m, n);
+    double *tau = (double *)zap_buf((size_t)(k > 0 ? k : 1) * sizeof(double));
+    int im = (int)m, in = (int)n, info = 0, lw = -1;
+    double wq = 0;
+    dgeqrf_(&im, &in, cm, &im, tau, &wq, &lw, &info);
+    lw = (int)wq;
+    double *work = (double *)zap_buf((size_t)(lw > 0 ? lw : 1) * sizeof(double));
+    dgeqrf_(&im, &in, cm, &im, tau, work, &lw, &info);
+    *tau_out = tau;
+    return cm;
+}
+static void *zap_linalg_qr_r_impl(ZapArray *a, int64_t m, int64_t n) {
+    int64_t k = m < n ? m : n;
+    double *tau = NULL;
+    double *cm = zap_linalg_qr_factor(a, m, n, &tau);
+    ZapArray *R = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, k * n);
+    zap_array_set_dim(R, 0, k);
+    zap_array_set_dim(R, 1, n);
+    for (int64_t i = 0; i < k; i++)
+        for (int64_t j = 0; j < n; j++)
+            arr_store_f(R, i * n + j, (i <= j) ? cm[i + j * m] : 0.0);
+    return R;
+}
+static void *zap_linalg_qr_q_impl(ZapArray *a, int64_t m, int64_t n) {
+    int64_t k = m < n ? m : n;
+    double *tau = NULL;
+    double *cm = zap_linalg_qr_factor(a, m, n, &tau);
+    int im = (int)m, ik = (int)k, info = 0, lw = -1;
+    double wq = 0;
+    dorgqr_(&im, &ik, &ik, cm, &im, tau, &wq, &lw, &info);
+    lw = (int)wq;
+    double *work = (double *)zap_buf((size_t)(lw > 0 ? lw : 1) * sizeof(double));
+    dorgqr_(&im, &ik, &ik, cm, &im, tau, work, &lw, &info);
+    ZapArray *Q = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, m * k);
+    zap_array_set_dim(Q, 0, m);
+    zap_array_set_dim(Q, 1, k);
+    for (int64_t i = 0; i < m; i++)
+        for (int64_t j = 0; j < k; j++)
+            arr_store_f(Q, i * k + j, cm[i + j * m]);
+    return Q;
+}
+
+/* svd reduced (#927), NumPy full_matrices=False: a (m*n) -> U (m*k), S (k), Vt
+ * (k*n), k=min(m,n), via `dgesdd`. U/S/Vt get their own entry points (each
+ * re-runs gesdd — a shared-factorization form is a follow-up). */
+static void zap_linalg_svd_run(ZapArray *a, int64_t m, int64_t n, int64_t k,
+                               double *S, double *Uc, double *Vc) {
+    double *cm = zap_linalg_colmajor_mn(a, m, n);
+    int im = (int)m, in = (int)n, ik = (int)k, info = 0, lw = -1;
+    double wq = 0;
+    int *iw = (int *)zap_buf((size_t)(8 * (k > 0 ? k : 1)) * sizeof(int));
+    dgesdd_("S", &im, &in, cm, &im, S, Uc, &im, Vc, &ik, &wq, &lw, iw, &info);
+    lw = (int)wq;
+    double *work = (double *)zap_buf((size_t)(lw > 0 ? lw : 1) * sizeof(double));
+    dgesdd_("S", &im, &in, cm, &im, S, Uc, &im, Vc, &ik, work, &lw, iw, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.svd: did not converge");
+}
+static void *zap_linalg_svd_u_impl(ZapArray *a, int64_t m, int64_t n) {
+    int64_t k = m < n ? m : n;
+    double *S = (double *)zap_buf((size_t)(k > 0 ? k : 1) * sizeof(double));
+    double *Uc = (double *)zap_buf((size_t)(m * k > 0 ? m * k : 1) * sizeof(double));
+    double *Vc = (double *)zap_buf((size_t)(k * n > 0 ? k * n : 1) * sizeof(double));
+    zap_linalg_svd_run(a, m, n, k, S, Uc, Vc);
+    ZapArray *U = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, m * k);
+    zap_array_set_dim(U, 0, m);
+    zap_array_set_dim(U, 1, k);
+    for (int64_t i = 0; i < m; i++)
+        for (int64_t j = 0; j < k; j++)
+            arr_store_f(U, i * k + j, Uc[i + j * m]);
+    return U;
+}
+static void *zap_linalg_svd_s_impl(ZapArray *a, int64_t m, int64_t n) {
+    int64_t k = m < n ? m : n;
+    double *S = (double *)zap_buf((size_t)(k > 0 ? k : 1) * sizeof(double));
+    double *Uc = (double *)zap_buf((size_t)(m * k > 0 ? m * k : 1) * sizeof(double));
+    double *Vc = (double *)zap_buf((size_t)(k * n > 0 ? k * n : 1) * sizeof(double));
+    zap_linalg_svd_run(a, m, n, k, S, Uc, Vc);
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_F64, k);
+    for (int64_t i = 0; i < k; i++)
+        arr_store_f(res, i, S[i]);
+    return res;
+}
+static void *zap_linalg_svd_vt_impl(ZapArray *a, int64_t m, int64_t n) {
+    int64_t k = m < n ? m : n;
+    double *S = (double *)zap_buf((size_t)(k > 0 ? k : 1) * sizeof(double));
+    double *Uc = (double *)zap_buf((size_t)(m * k > 0 ? m * k : 1) * sizeof(double));
+    double *Vc = (double *)zap_buf((size_t)(k * n > 0 ? k * n : 1) * sizeof(double));
+    zap_linalg_svd_run(a, m, n, k, S, Uc, Vc);
+    ZapArray *Vt = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, k * n);
+    zap_array_set_dim(Vt, 0, k);
+    zap_array_set_dim(Vt, 1, n);
+    for (int64_t i = 0; i < k; i++)
+        for (int64_t j = 0; j < n; j++)
+            arr_store_f(Vt, i * n + j, Vc[i + j * k]);
+    return Vt;
 }
 #endif
 
@@ -4711,6 +4853,94 @@ double zap_linalg_det(void *ap) {
     (void)n;
     zap_linalg_need_provider();
     return 0.0;
+#endif
+}
+
+/* Validate a 2-D matrix (qr/svd accept any m*n, not just square), returning the
+ * dims via out-params. */
+static void zap_linalg_rect(void *ap, int64_t *m, int64_t *n) {
+    ZapArray *a = (ZapArray *)ap;
+    if (a->ndim != 2)
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("linalg: expected a 2-D matrix", 29));
+    *m = a->dims[0];
+    *n = a->dims[1];
+}
+
+void *zap_linalg_cholesky(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_cholesky_impl(a, n);
+#else
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_qr_q(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t m = 0, n = 0;
+    zap_linalg_rect(a, &m, &n);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_qr_q_impl(a, m, n);
+#else
+    (void)m;
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_qr_r(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t m = 0, n = 0;
+    zap_linalg_rect(a, &m, &n);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_qr_r_impl(a, m, n);
+#else
+    (void)m;
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_svd_u(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t m = 0, n = 0;
+    zap_linalg_rect(a, &m, &n);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_svd_u_impl(a, m, n);
+#else
+    (void)m;
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_svd_s(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t m = 0, n = 0;
+    zap_linalg_rect(a, &m, &n);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_svd_s_impl(a, m, n);
+#else
+    (void)m;
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_svd_vt(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t m = 0, n = 0;
+    zap_linalg_rect(a, &m, &n);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_svd_vt_impl(a, m, n);
+#else
+    (void)m;
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
 #endif
 }
 

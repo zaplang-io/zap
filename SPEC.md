@@ -1467,8 +1467,20 @@ product via BLAS matches the own kernel only within floating-point tolerance
 (#926): `linalg.solve(a, b)` (solve `a @ x == b`), `linalg.inv(a)`, and
 `linalg.det(a)`, matching `numpy.linalg`. `a` must be a square 2-D matrix;
 integer input promotes to `f64` and the result is `f64`; a singular matrix or a
-misaligned/non-square shape raises a catchable `ValueError`. (Eigensolvers,
-decompositions, `lstsq`, and `norm` are later increments.)
+misaligned/non-square shape raises a catchable `ValueError`.
+
+It also provides the matrix decompositions (#927), reduced form (NumPy
+`mode='reduced'` / `full_matrices=False`), f64: `linalg.cholesky(a)` returns the
+lower-triangular factor `L` with `a = L @ L.T` (`a` symmetric positive-definite);
+`linalg.qr(a)` returns a tuple `(Q, R)` — for `a` an (m×n) matrix, `Q` is (m×k)
+with orthonormal columns and `R` is (k×n) upper-triangular, k=min(m,n) — unpacked
+`auto q, r = linalg.qr(a)`; `linalg.svd(a)` returns `(U, S, Vt)` — `U` (m×k), the
+singular values `S` (k, descending) and `Vt` (k×n). The factor **signs** of
+`qr`/`svd` are gauge-ambiguous (a reflection or per-vector sign flip is an equally
+valid factorization) and provider-dependent, while the singular values and the
+result shapes are well-defined. A non-positive-definite `cholesky`, a
+non-convergent `svd`, or a bad shape raises a catchable `ValueError`.
+(Eigensolvers, `lstsq`, `pinv`, and `norm` are later increments.)
 
 Shape ops reshape the N-D view. `a.reshape(d0, d1, …)` takes positional dims
 (one may be `-1`, inferred) and is a view when the source is contiguous, else a

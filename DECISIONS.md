@@ -9123,3 +9123,38 @@ the #912 acceleration seam. This slice: `linalg.solve(a, b)` (solve `a @ x == b`
   CPython diff harness.
 Relates to #926 / #512 (Phase 3 epic), #912/D-0179 + D-0182 (the seam), #904
 (matmul, the sibling consumer), #509/D-0172 (matmul surface).
+
+## D-0184 — `import linalg`: LAPACK-backed cholesky / qr / svd (#927)
+**Status:** implemented (linalg decompositions slice)
+Second `linalg` slice of the Phase 3 numeric-breadth epic (#512): the matrix
+decompositions, backed by LAPACK through the #912 seam, continuing D-0183's
+column-major-transpose + Fortran-interface approach.
+- **Surface.** NumPy-shaped, reduced form (NumPy `mode='reduced'` /
+  `full_matrices=False`), f64 throughout:
+  - `cholesky(a) -> L` — lower-triangular factor with `a = L @ L.T`; `a` SPD.
+  - `qr(a) -> (Q, R)` — `a` (m×n) → `Q` (m×k) orthonormal, `R` (k×n)
+    upper-triangular, k=min(m,n).
+  - `svd(a) -> (U, S, Vt)` — `a` (m×n) → `U` (m×k), singular values `S` (k,
+    descending), `Vt` (k×n).
+- **Provider interface.** Fortran LAPACK — `dpotrf_` (cholesky), `dgeqrf_` +
+  `dorgqr_` (qr), `dgesdd_` (svd) — present in both OpenBLAS and Accelerate (no
+  LAPACKE, as D-0183). Column-major scratch in, transpose out; host-verified
+  against Accelerate.
+- **Tuple returns.** `qr`/`svd` return a tuple of arrays, unpacked
+  `auto q, r = linalg.qr(a)` / `auto u, s, vt = linalg.svd(a)`. Each output has
+  its own runtime entry point (each re-runs the factorization — a
+  shared-factorization out-param form is a follow-up); the lowering assembles the
+  tuple (the `where`/nonzero construction).
+- **Determinism.** Q/R and U/Vt are sign/gauge-ambiguous — a reflection or a
+  per-vector sign flip is an equally valid factorization, and the exact signs are
+  provider- and routine-dependent. The well-defined, provider-portable facts
+  (cholesky's exact L, the singular values, the result shapes, R's structural
+  zeros) are what the goldens/contracts pin; full numeric reconstruction is
+  checked by the runtime's own host harness, not the goldens.
+- **Errors.** A non-positive-definite `cholesky` (`dpotrf` `info ≠ 0`), a
+  non-convergent `svd`, and a bad/non-2-D shape raise a catchable `ValueError`.
+- **No-provider build.** As D-0183 — entry points always compiled; a
+  provider-less build raises the "requires a BLAS/LAPACK provider" ValueError.
+Remaining `numpy.linalg` surface — `eig`/`eigh`/`lstsq`/`norm`/`pinv` — is the
+next slice (#928). Relates to #927 / #512 (Phase 3 epic), #926/D-0183 (the first
+linalg slice), #912/D-0179 (the seam).

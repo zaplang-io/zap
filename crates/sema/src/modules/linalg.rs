@@ -28,6 +28,11 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         "solve" => (2, Ty::Unknown),
         "inv" => (1, Ty::Unknown),
         "det" => (1, Ty::Float64),
+        // Decompositions (#927). Arrays type loosely as `Unknown`; qr/svd return a
+        // tuple of arrays (`q, r = linalg.qr(a)` / `u, s, vt = linalg.svd(a)`).
+        "cholesky" => (1, Ty::Unknown),
+        "qr" => (1, Ty::Tuple(vec![Ty::Unknown, Ty::Unknown])),
+        "svd" => (1, Ty::Tuple(vec![Ty::Unknown, Ty::Unknown, Ty::Unknown])),
         _ => return None,
     };
     super::expect_argc(checker, "linalg", method, args, argc, span);

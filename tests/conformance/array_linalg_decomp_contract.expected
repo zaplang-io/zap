@@ -1,0 +1,5 @@
+chol 2.0 0.0 1.0 2.0
+qr 3 2 2 2 0.0
+svdshape 2 2 2 2 2
+svds 3.0 2.0
+not-pd raises
