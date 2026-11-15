@@ -216,6 +216,8 @@ fn build_runtime_dylib() -> Result<(PathBuf, PathBuf), String> {
         .map_err(|e| format!("failed to write ziggurat constants: {e}"))?;
     std::fs::write(dir.join("zap_cpu_features.h"), crate::CPU_FEATURES_H)
         .map_err(|e| format!("failed to write cpu-features header: {e}"))?;
+    std::fs::write(dir.join("zapmemchr.inc.c"), crate::RUNTIME_MEMCHR_C)
+        .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
     std::fs::write(dir.join("zapcpu.inc.c"), crate::RUNTIME_CPU_C)
         .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
 

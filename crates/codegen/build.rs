@@ -38,6 +38,8 @@ fn main() {
         // and the detection module that includes it.
         "src/zap_cpu_features.h",
         "src/zapcpu.inc.c",
+        // SIMD memchr/memmem kernel (#945, epic #139): first multiversioned kernel.
+        "src/zapmemchr.inc.c",
     ];
     for f in EMBEDDED_RUNTIME_FILES {
         println!("cargo:rerun-if-changed={f}");
