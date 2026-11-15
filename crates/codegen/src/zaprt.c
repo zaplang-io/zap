@@ -4520,6 +4520,19 @@ extern void dgesdd_(const char *jobz, const int *m, const int *n, double *a,
                     const int *lda, double *s, double *u, const int *ldu,
                     double *vt, const int *ldvt, double *work, const int *lwork,
                     int *iwork, int *info);
+/* #928: general eigenvalues (geev), symmetric eigendecomposition (syevd),
+ * minimum-norm least squares (gelsd). */
+extern void dgeev_(const char *jobvl, const char *jobvr, const int *n, double *a,
+                   const int *lda, double *wr, double *wi, double *vl,
+                   const int *ldvl, double *vr, const int *ldvr, double *work,
+                   const int *lwork, int *info);
+extern void dsyevd_(const char *jobz, const char *uplo, const int *n, double *a,
+                    const int *lda, double *w, double *work, const int *lwork,
+                    int *iwork, const int *liwork, int *info);
+extern void dgelsd_(const int *m, const int *n, const int *nrhs, double *a,
+                    const int *lda, double *b, const int *ldb, double *s,
+                    const double *rcond, int *rank, double *work,
+                    const int *lwork, int *iwork, int *info);
 #endif
 
 static void zap_linalg_err(const char *m) {
@@ -4732,6 +4745,298 @@ static void *zap_linalg_svd_vt_impl(ZapArray *a, int64_t m, int64_t n) {
             arr_store_f(Vt, i * n + j, Vc[i + j * k]);
     return Vt;
 }
+
+/* eigvals (#928), general real matrix via `dgeev` (no eigenvectors): returns the
+ * eigenvalues as a `list[complex]`. Eigenvalues of a real matrix are real or come
+ * in conjugate pairs; LAPACK yields each pair consecutively with the +imag member
+ * first. Order is otherwise LAPACK's (not sorted — matches numpy.linalg.eigvals).
+ * Eigenvectors (a complex *matrix*) have no representation yet, so `eig` itself is
+ * deferred (tracked separately) until a complex array dtype exists. */
+static void *zap_linalg_eigvals_impl(ZapArray *a, int64_t n) {
+    double *A = zap_linalg_colmajor(a, n); /* dgeev overwrites A */
+    double *wr = (double *)zap_buf((size_t)(n > 0 ? n : 1) * sizeof(double));
+    double *wi = (double *)zap_buf((size_t)(n > 0 ? n : 1) * sizeof(double));
+    int ni = (int)n, info = 0, lw = -1;
+    double wq = 0;
+    dgeev_("N", "N", &ni, A, &ni, wr, wi, NULL, &ni, NULL, &ni, &wq, &lw, &info);
+    lw = (int)wq;
+    double *work = (double *)zap_buf((size_t)(lw > 0 ? lw : 1) * sizeof(double));
+    dgeev_("N", "N", &ni, A, &ni, wr, wi, NULL, &ni, NULL, &ni, work, &lw, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.eigvals: eigenvalue iteration did not converge");
+    void *lst = zap_list_new();
+    for (int64_t i = 0; i < n; i++)
+        zap_list_push_ptr(lst, zap_complex_new(wr[i], wi[i]));
+    return lst;
+}
+
+/* eigh / eigvalsh (#928), symmetric matrix via `dsyevd` (lower triangle, UPLO=L —
+ * a symmetric matrix is its own transpose, so the column-major buffer's lower
+ * triangle is correct). Eigenvalues `w` come back in ASCENDING order (NumPy's
+ * eigh/eigvalsh convention); with `want_vec`, `A` is overwritten with the
+ * orthonormal eigenvectors as columns (column i pairs with w[i]). */
+static void zap_linalg_syevd(ZapArray *a, int64_t n, double *w, double *A_out, int want_vec) {
+    double *A = zap_linalg_colmajor(a, n);
+    const char *jobz = want_vec ? "V" : "N";
+    int ni = (int)n, info = 0, lw = -1, liw = -1;
+    double wq = 0;
+    int iwq = 0;
+    dsyevd_(jobz, "L", &ni, A, &ni, w, &wq, &lw, &iwq, &liw, &info);
+    lw = (int)wq;
+    liw = iwq;
+    double *work = (double *)zap_buf((size_t)(lw > 0 ? lw : 1) * sizeof(double));
+    int *iwork = (int *)zap_buf((size_t)(liw > 0 ? liw : 1) * sizeof(int));
+    dsyevd_(jobz, "L", &ni, A, &ni, w, work, &lw, iwork, &liw, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.eigh: eigenvalue computation did not converge");
+    if (want_vec && A_out)
+        memcpy(A_out, A, (size_t)(n * n) * sizeof(double));
+}
+static void *zap_linalg_eigh_w_impl(ZapArray *a, int64_t n) {
+    double *w = (double *)zap_buf((size_t)(n > 0 ? n : 1) * sizeof(double));
+    zap_linalg_syevd(a, n, w, NULL, 0);
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_F64, n);
+    for (int64_t i = 0; i < n; i++)
+        arr_store_f(res, i, w[i]);
+    return res;
+}
+static void *zap_linalg_eigh_v_impl(ZapArray *a, int64_t n) {
+    double *w = (double *)zap_buf((size_t)(n > 0 ? n : 1) * sizeof(double));
+    double *A = (double *)zap_buf((size_t)(n * n > 0 ? n * n : 1) * sizeof(double));
+    zap_linalg_syevd(a, n, w, A, 1);
+    ZapArray *res = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, n * n);
+    zap_array_set_dim(res, 0, n);
+    zap_array_set_dim(res, 1, n);
+    for (int64_t i = 0; i < n; i++)
+        for (int64_t j = 0; j < n; j++)
+            arr_store_f(res, i * n + j, A[i + j * n]); /* col-major cols -> row */
+    return res;
+}
+
+/* lstsq (#928), minimum-norm least squares via `dgelsd` (SVD-based, handles
+ * rank-deficient a). a is (m x n), b is (m,) or (m x nrhs). Fills: X (the n x nrhs
+ * solution, column-major in a max(m,n)-row buffer), S (the min(m,n) singular
+ * values of a), the effective rank, and — only when m>n and rank==n — the
+ * per-column residual sum of squares (NumPy returns an empty residuals array
+ * otherwise). rcond=-1 uses machine precision (NumPy's default cutoff). */
+static int zap_linalg_gelsd_run(ZapArray *a, ZapArray *b, int64_t m, int64_t n,
+                                int64_t nrhs, int b_is_1d, double *Bout, double *Sout,
+                                int64_t *rank_out, int64_t ldb) {
+    double *A = zap_linalg_colmajor_mn(a, m, n);
+    double *B = (double *)zap_buf((size_t)(ldb * nrhs > 0 ? ldb * nrhs : 1) * sizeof(double));
+    memset(B, 0, (size_t)(ldb * nrhs) * sizeof(double));
+    for (int64_t i = 0; i < m; i++)
+        for (int64_t r = 0; r < nrhs; r++)
+            B[i + r * ldb] = b_is_1d ? mm_load_f(b, i) : mm_load_f(b, i * nrhs + r);
+    int64_t minmn = m < n ? m : n;
+    int im = (int)m, in = (int)n, inr = (int)nrhs, ild = (int)ldb, rank = 0, info = 0, lw = -1;
+    double rcond = -1.0, wq = 0;
+    int iwq = 0;
+    dgelsd_(&im, &in, &inr, A, &im, B, &ild, Sout, &rcond, &rank, &wq, &lw, &iwq, &info);
+    lw = (int)wq;
+    double *work = (double *)zap_buf((size_t)(lw > 0 ? lw : 1) * sizeof(double));
+    int *iwork = (int *)zap_buf((size_t)(iwq > 0 ? iwq : 1) * sizeof(int));
+    dgelsd_(&im, &in, &inr, A, &im, B, &ild, Sout, &rcond, &rank, work, &lw, iwork, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.lstsq: SVD did not converge");
+    (void)minmn;
+    memcpy(Bout, B, (size_t)(ldb * nrhs) * sizeof(double));
+    *rank_out = rank;
+    return rank;
+}
+static void *zap_linalg_lstsq_x_impl(ZapArray *a, ZapArray *b, int64_t m, int64_t n,
+                                     int64_t nrhs, int b_is_1d) {
+    int64_t ldb = m > n ? m : n;
+    double *B = (double *)zap_buf((size_t)(ldb * nrhs) * sizeof(double));
+    double *S = (double *)zap_buf((size_t)((m < n ? m : n) > 0 ? (m < n ? m : n) : 1) * sizeof(double));
+    int64_t rank = 0;
+    zap_linalg_gelsd_run(a, b, m, n, nrhs, b_is_1d, B, S, &rank, ldb);
+    ZapArray *res;
+    if (b_is_1d) {
+        res = (ZapArray *)zap_array_new(DTYPE_F64, n);
+        for (int64_t i = 0; i < n; i++)
+            arr_store_f(res, i, B[i]);
+    } else {
+        res = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, n * nrhs);
+        zap_array_set_dim(res, 0, n);
+        zap_array_set_dim(res, 1, nrhs);
+        for (int64_t i = 0; i < n; i++)
+            for (int64_t r = 0; r < nrhs; r++)
+                arr_store_f(res, i * nrhs + r, B[i + r * ldb]);
+    }
+    return res;
+}
+static void *zap_linalg_lstsq_resid_impl(ZapArray *a, ZapArray *b, int64_t m, int64_t n,
+                                         int64_t nrhs, int b_is_1d) {
+    int64_t ldb = m > n ? m : n;
+    double *B = (double *)zap_buf((size_t)(ldb * nrhs) * sizeof(double));
+    double *S = (double *)zap_buf((size_t)((m < n ? m : n) > 0 ? (m < n ? m : n) : 1) * sizeof(double));
+    int64_t rank = 0;
+    zap_linalg_gelsd_run(a, b, m, n, nrhs, b_is_1d, B, S, &rank, ldb);
+    /* NumPy: residuals present only when m>n and rank==n (full column rank, an
+     * over-determined system); otherwise an empty (0,) array. */
+    if (m > n && rank == n) {
+        ZapArray *res = (ZapArray *)zap_array_new(DTYPE_F64, nrhs);
+        for (int64_t r = 0; r < nrhs; r++) {
+            double acc = 0.0;
+            for (int64_t i = n; i < m; i++) {
+                double e = B[i + r * ldb];
+                acc += e * e;
+            }
+            arr_store_f(res, r, acc);
+        }
+        return res;
+    }
+    return zap_array_new(DTYPE_F64, 0);
+}
+static int64_t zap_linalg_lstsq_rank_impl(ZapArray *a, ZapArray *b, int64_t m, int64_t n,
+                                          int64_t nrhs, int b_is_1d) {
+    int64_t ldb = m > n ? m : n;
+    double *B = (double *)zap_buf((size_t)(ldb * nrhs) * sizeof(double));
+    double *S = (double *)zap_buf((size_t)((m < n ? m : n) > 0 ? (m < n ? m : n) : 1) * sizeof(double));
+    int64_t rank = 0;
+    zap_linalg_gelsd_run(a, b, m, n, nrhs, b_is_1d, B, S, &rank, ldb);
+    return rank;
+}
+static void *zap_linalg_lstsq_s_impl(ZapArray *a, ZapArray *b, int64_t m, int64_t n,
+                                     int64_t nrhs, int b_is_1d) {
+    int64_t ldb = m > n ? m : n;
+    int64_t minmn = m < n ? m : n;
+    double *B = (double *)zap_buf((size_t)(ldb * nrhs) * sizeof(double));
+    double *S = (double *)zap_buf((size_t)(minmn > 0 ? minmn : 1) * sizeof(double));
+    int64_t rank = 0;
+    zap_linalg_gelsd_run(a, b, m, n, nrhs, b_is_1d, B, S, &rank, ldb);
+    ZapArray *res = (ZapArray *)zap_array_new(DTYPE_F64, minmn);
+    for (int64_t i = 0; i < minmn; i++)
+        arr_store_f(res, i, S[i]);
+    return res;
+}
+
+/* Singular values only (#928), for the matrix 2-/-2-norm — `dgesdd` with jobz=N
+ * (no vectors). Descending order. */
+static void zap_linalg_singvals(ZapArray *a, int64_t m, int64_t n, double *S) {
+    double *cm = zap_linalg_colmajor_mn(a, m, n);
+    int im = (int)m, in = (int)n, info = 0, lw = -1;
+    int64_t k = m < n ? m : n;
+    double wq = 0;
+    int *iw = (int *)zap_buf((size_t)(8 * (k > 0 ? k : 1)) * sizeof(int));
+    dgesdd_("N", &im, &in, cm, &im, S, NULL, &im, NULL, &im, &wq, &lw, iw, &info);
+    lw = (int)wq;
+    double *work = (double *)zap_buf((size_t)(lw > 0 ? lw : 1) * sizeof(double));
+    dgesdd_("N", &im, &in, cm, &im, S, NULL, &im, NULL, &im, work, &lw, iw, &info);
+    if (info != 0)
+        zap_linalg_err("linalg.norm: SVD did not converge");
+}
+
+/* pinv (#928), Moore-Penrose pseudo-inverse of an (m x n) matrix via the reduced
+ * SVD: pinv = V Σ⁺ Uᵀ, reciprocating singular values above rcond·σ_max (NumPy's
+ * default rcond = 1e-15). Result is (n x m). */
+static void *zap_linalg_pinv_impl(ZapArray *a, int64_t m, int64_t n) {
+    int64_t k = m < n ? m : n;
+    double *S = (double *)zap_buf((size_t)(k > 0 ? k : 1) * sizeof(double));
+    double *Uc = (double *)zap_buf((size_t)(m * k > 0 ? m * k : 1) * sizeof(double));
+    double *Vc = (double *)zap_buf((size_t)(k * n > 0 ? k * n : 1) * sizeof(double));
+    zap_linalg_svd_run(a, m, n, k, S, Uc, Vc);
+    double smax = 0.0;
+    for (int64_t i = 0; i < k; i++)
+        if (S[i] > smax)
+            smax = S[i];
+    double cut = smax * 1e-15;
+    ZapArray *res = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, n * m);
+    zap_array_set_dim(res, 0, n);
+    zap_array_set_dim(res, 1, m);
+    for (int64_t j = 0; j < n; j++)
+        for (int64_t l = 0; l < m; l++) {
+            double acc = 0.0;
+            for (int64_t i = 0; i < k; i++)
+                if (S[i] > cut)
+                    acc += (Vc[i + j * k] / S[i]) * Uc[l + i * m];
+            arr_store_f(res, j * m + l, acc);
+        }
+    return res;
+}
+
+/* norm (#928). Vector (1-D) ords: none/2 -> Euclidean, 1 -> Σ|x|, +inf -> max|x|,
+ * -inf -> min|x|, p -> (Σ|x|^p)^(1/p). Matrix (2-D) ords: none -> Frobenius,
+ * 1/-1 -> max/min column Σ|·|, +inf/-inf -> max/min row Σ|·|, 2/-2 -> largest /
+ * smallest singular value. `ord` is NaN when omitted. ('fro'/'nuc' string ords are
+ * a follow-up; the default already gives Frobenius.) */
+static double zap_linalg_norm_impl(ZapArray *a, double ord, int64_t ndim,
+                                   int64_t m, int64_t n) {
+    int none = isnan(ord);
+    if (ndim == 1) {
+        int64_t len = m;
+        if (none || ord == 2.0) {
+            double s = 0.0;
+            for (int64_t i = 0; i < len; i++) {
+                double v = mm_load_f(a, i);
+                s += v * v;
+            }
+            return sqrt(s);
+        }
+        if (ord == 1.0) {
+            double s = 0.0;
+            for (int64_t i = 0; i < len; i++)
+                s += fabs(mm_load_f(a, i));
+            return s;
+        }
+        if (isinf(ord)) {
+            double best = (ord > 0) ? 0.0 : HUGE_VAL;
+            for (int64_t i = 0; i < len; i++) {
+                double v = fabs(mm_load_f(a, i));
+                if (ord > 0 ? (v > best) : (v < best))
+                    best = v;
+            }
+            return best;
+        }
+        double s = 0.0;
+        for (int64_t i = 0; i < len; i++)
+            s += pow(fabs(mm_load_f(a, i)), ord);
+        return pow(s, 1.0 / ord);
+    }
+    /* matrix */
+    if (none) {
+        double s = 0.0;
+        for (int64_t i = 0; i < m * n; i++) {
+            double v = mm_load_f(a, i);
+            s += v * v;
+        }
+        return sqrt(s);
+    }
+    if (ord == 2.0 || ord == -2.0) {
+        int64_t k = m < n ? m : n;
+        double *S = (double *)zap_buf((size_t)(k > 0 ? k : 1) * sizeof(double));
+        zap_linalg_singvals(a, m, n, S);
+        double best = S[0];
+        for (int64_t i = 1; i < k; i++)
+            best = (ord > 0) ? (S[i] > best ? S[i] : best) : (S[i] < best ? S[i] : best);
+        return best;
+    }
+    if (ord == 1.0 || ord == -1.0) { /* max/min column absolute sum */
+        double best = (ord > 0) ? 0.0 : HUGE_VAL;
+        for (int64_t j = 0; j < n; j++) {
+            double c = 0.0;
+            for (int64_t i = 0; i < m; i++)
+                c += fabs(mm_load_f(a, i * n + j));
+            if (ord > 0 ? (c > best) : (c < best))
+                best = c;
+        }
+        return best;
+    }
+    if (isinf(ord)) { /* max/min row absolute sum */
+        double best = (ord > 0) ? 0.0 : HUGE_VAL;
+        for (int64_t i = 0; i < m; i++) {
+            double r = 0.0;
+            for (int64_t j = 0; j < n; j++)
+                r += fabs(mm_load_f(a, i * n + j));
+            if (ord > 0 ? (r > best) : (r < best))
+                best = r;
+        }
+        return best;
+    }
+    zap_linalg_err("linalg.norm: unsupported matrix ord (use 1, -1, 2, -2, inf, -inf, or none)");
+    return 0.0;
+}
 #endif
 
 /* Matrix multiply for the array-producing cases (not 1-D·1-D, which is `dot`):
@@ -4942,6 +5247,175 @@ void *zap_linalg_svd_vt(void *ap) {
     zap_linalg_need_provider();
     return NULL;
 #endif
+}
+
+/* --- #928 eigensolvers / least squares / norms / pinv / matrix_power ------- */
+
+void *zap_linalg_eigvals(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_eigvals_impl(a, n);
+#else
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_eigh_w(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_eigh_w_impl(a, n);
+#else
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_eigh_v(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_eigh_v_impl(a, n);
+#else
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+
+/* lstsq shape check: a is (m x n), b is (m,) or (m x nrhs). */
+static void zap_linalg_lstsq_shapes(ZapArray *a, ZapArray *b, int64_t *m, int64_t *n,
+                                    int64_t *nrhs, int *b_is_1d) {
+    if (a->ndim != 2)
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("linalg.lstsq: a must be a 2-D matrix", 36));
+    *m = a->dims[0];
+    *n = a->dims[1];
+    *b_is_1d = (b->ndim == 1);
+    if (b->ndim != 1 && b->ndim != 2)
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("linalg.lstsq: b must be 1-D or 2-D", 34));
+    if (b->dims[0] != *m)
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("linalg.lstsq: a and b shapes are not aligned", 44));
+    *nrhs = *b_is_1d ? 1 : b->dims[1];
+}
+void *zap_linalg_lstsq_x(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    int64_t m = 0, n = 0, nrhs = 0;
+    int b1 = 0;
+    zap_linalg_lstsq_shapes(a, b, &m, &n, &nrhs, &b1);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_lstsq_x_impl(a, b, m, n, nrhs, b1);
+#else
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+void *zap_linalg_lstsq_resid(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    int64_t m = 0, n = 0, nrhs = 0;
+    int b1 = 0;
+    zap_linalg_lstsq_shapes(a, b, &m, &n, &nrhs, &b1);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_lstsq_resid_impl(a, b, m, n, nrhs, b1);
+#else
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+int64_t zap_linalg_lstsq_rank(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    int64_t m = 0, n = 0, nrhs = 0;
+    int b1 = 0;
+    zap_linalg_lstsq_shapes(a, b, &m, &n, &nrhs, &b1);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_lstsq_rank_impl(a, b, m, n, nrhs, b1);
+#else
+    zap_linalg_need_provider();
+    return 0;
+#endif
+}
+void *zap_linalg_lstsq_s(void *ap, void *bp) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    ZapArray *b = (ZapArray *)zap_array_contig(bp);
+    int64_t m = 0, n = 0, nrhs = 0;
+    int b1 = 0;
+    zap_linalg_lstsq_shapes(a, b, &m, &n, &nrhs, &b1);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_lstsq_s_impl(a, b, m, n, nrhs, b1);
+#else
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+double zap_linalg_norm(void *ap, double ord) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    if (a->ndim != 1 && a->ndim != 2)
+        zap_panic_typed(ZAP_EXC_VALUE_ERROR,
+                        zap_str_new("linalg.norm: a must be a 1-D or 2-D array", 41));
+    int64_t m = a->dims[0];
+    int64_t n = (a->ndim == 2) ? a->dims[1] : 1;
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_norm_impl(a, ord, a->ndim, m, n);
+#else
+    (void)m;
+    (void)n;
+    (void)ord;
+    zap_linalg_need_provider();
+    return 0.0;
+#endif
+}
+void *zap_linalg_pinv(void *ap) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t m = 0, n = 0;
+    zap_linalg_rect(a, &m, &n);
+#if defined(ZAP_HAVE_BLAS)
+    return zap_linalg_pinv_impl(a, m, n);
+#else
+    (void)m;
+    (void)n;
+    zap_linalg_need_provider();
+    return NULL;
+#endif
+}
+/* matrix_power (#928): a**p for an integer p, by binary exponentiation over the
+ * array matmul (own floor or BLAS, #904). p==0 -> identity; p<0 -> (a⁻¹)**|p|
+ * (the inverse needs a provider, so a negative power on a provider-less build
+ * raises through `zap_linalg_inv`). Computed in f64. Always compiled: a
+ * non-negative power is pure matmul and needs no provider. */
+static void *zap_linalg_identity(int64_t n) {
+    ZapArray *id = (ZapArray *)zap_array_new_nd(DTYPE_F64, 2, n * n);
+    zap_array_set_dim(id, 0, n);
+    zap_array_set_dim(id, 1, n);
+    for (int64_t i = 0; i < n; i++)
+        for (int64_t j = 0; j < n; j++)
+            arr_store_f(id, i * n + j, i == j ? 1.0 : 0.0);
+    return id;
+}
+void *zap_linalg_matrix_power(void *ap, int64_t p) {
+    ZapArray *a = (ZapArray *)zap_array_contig(ap);
+    int64_t n = zap_linalg_square(a);
+    void *base = a;
+    int64_t e = p;
+    if (p < 0) {
+        base = zap_linalg_inv(ap); /* raises if no provider */
+        e = -p;
+    }
+    void *result = zap_linalg_identity(n);
+    while (e > 0) {
+        if (e & 1)
+            result = zap_array_matmul(result, base, DTYPE_F64);
+        e >>= 1;
+        if (e > 0)
+            base = zap_array_matmul(base, base, DTYPE_F64);
+    }
+    return result;
 }
 
 /* --- element-wise comparison & mask combination (#510, D-0175) -----------

@@ -423,8 +423,10 @@ Native floating-point values are currently unsupported as direct `list`, `dict`
 character, string/bytes, enum, and supported reference/aggregate element types
 retain their existing storage rules; tuple and struct fields may be floats.
 Use `array[f64]` for dense floating-point data. `array` dtypes have the narrower
-Experimental contract in §15; `bigint` and `complex` collection elements are
-also unsupported.
+Experimental contract in §15. A `complex` **value** element (a `list`, `dict`
+value, or `channel` element) is supported (#928) — stored as a heap `complex`,
+rendered `(re±imj)`, read back as `complex`; `complex` as a hashed dict/set *key*
+and `bigint` collection elements remain unsupported.
 User-defined generics (monomorphized) are staged in later; the syntax is
 reserved now:
 
@@ -1480,7 +1482,26 @@ singular values `S` (k, descending) and `Vt` (k×n). The factor **signs** of
 valid factorization) and provider-dependent, while the singular values and the
 result shapes are well-defined. A non-positive-definite `cholesky`, a
 non-convergent `svd`, or a bad shape raises a catchable `ValueError`.
-(Eigensolvers, `lstsq`, `pinv`, and `norm` are later increments.)
+
+It also provides the eigensolvers, least squares, norms, pseudo-inverse, and
+matrix power (#928), f64: `linalg.eigvals(a)` returns the eigenvalues of a general
+square matrix as a `list[complex]` (a real matrix has real or conjugate-pair
+eigenvalues, LAPACK-ordered with the +imaginary member of a pair first; `eig`
+itself — whose eigenvectors are a complex matrix — is deferred until a complex
+array dtype exists). For a symmetric matrix, `linalg.eigh(a)` returns `(w, v)` with
+real eigenvalues `w` **ascending** and orthonormal eigenvector columns `v`, and
+`linalg.eigvalsh(a)` returns just `w`. `linalg.lstsq(a, b)` returns the
+minimum-norm least-squares tuple `(x, residuals, rank, singular_values)` (residuals
+present only for an over-determined full-rank system, else empty). `linalg.norm(a)`
+is the vector 2-norm / matrix Frobenius norm; `linalg.norm(a, ord)` takes an
+order — vector `1`/`2`/`±math.inf`/`p`, matrix `1`/`-1` (max/min column absolute
+sum), `±math.inf` (max/min row absolute sum), `2`/`-2` (largest/smallest singular
+value). `linalg.pinv(a)` is the Moore–Penrose pseudo-inverse (via the SVD), and
+`linalg.matrix_power(a, p)` raises a square matrix to an integer power (`p < 0`
+inverts). Eigenvector signs and the SVD-computed least-squares solution are
+gauge-ambiguous / provider-dependent, while eigenvalues, singular values, rank, and
+shapes are well-defined; a bad shape raises a catchable `ValueError`. (The string
+norm orders `'fro'`/`'nuc'` and the complex-matrix `eig` are later increments.)
 
 Shape ops reshape the N-D view. `a.reshape(d0, d1, …)` takes positional dims
 (one may be `-1`, inferred) and is a view when the source is contiguous, else a

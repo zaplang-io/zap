@@ -187,3 +187,30 @@ pub(super) fn expect_argc(
         checker.infer(&a.value);
     }
 }
+
+/// Like [`expect_argc`] but admits an argument count in `[min, max]` (a method
+/// with an optional trailing argument, e.g. `linalg.norm(a[, ord])`). Still
+/// type-checks (infers) every supplied argument.
+pub(super) fn expect_argc_range(
+    checker: &mut Checker,
+    module: &str,
+    method: &str,
+    args: &[Arg],
+    min: usize,
+    max: usize,
+    span: Span,
+) {
+    if args.len() < min || args.len() > max {
+        checker.error(
+            ErrorCode::ZAP4025,
+            format!(
+                "{module}.{method}() takes {min} to {max} argument(s), found {}",
+                args.len()
+            ),
+            span,
+        );
+    }
+    for a in args {
+        checker.infer(&a.value);
+    }
+}

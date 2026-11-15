@@ -2529,6 +2529,31 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_linalg_svd_u", &[p.into()], Some(p.into()));
         self.declare_rt("zap_linalg_svd_s", &[p.into()], Some(p.into()));
         self.declare_rt("zap_linalg_svd_vt", &[p.into()], Some(p.into()));
+        // Eigensolvers / least squares / norm / pinv / matrix_power (#928).
+        // eigvals -> list[complex]; eigh -> (w, v); eigvalsh reuses eigh_w; lstsq
+        // -> (x, residuals, rank:i64, s); norm(a, ord) -> f64; matrix_power(a, p).
+        self.declare_rt("zap_linalg_eigvals", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_eigh_w", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_eigh_v", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_lstsq_x", &[p.into(), p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_linalg_lstsq_resid",
+            &[p.into(), p.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_linalg_lstsq_rank",
+            &[p.into(), p.into()],
+            Some(i.into()),
+        );
+        self.declare_rt("zap_linalg_lstsq_s", &[p.into(), p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_norm", &[p.into(), f.into()], Some(f.into()));
+        self.declare_rt("zap_linalg_pinv", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_linalg_matrix_power",
+            &[p.into(), i.into()],
+            Some(p.into()),
+        );
         // Shape ops (#511, D-0174): transpose/flatten/reshape (views or copies)
         // and concatenate/stack (over a `list` of arrays). `i64buf`/`i64set`
         // build the reshape target-dims buffer.

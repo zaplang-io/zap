@@ -68,6 +68,16 @@ pub enum Elem {
     /// interner, so it falls back to [`Ty::Ptr`]; the lowering resolves the real
     /// nested type through its interner instead.
     Nested(u32),
+    /// A `complex` element (#928). Physically a pointer word to a heap `ZapComplex`
+    /// — exactly like [`Elem::Ptr`], so it pushes/reads through the `_ptr` runtime
+    /// entry points and GC-traces as a pointer — but it retains `complex` identity
+    /// so read-back (`xs[i]`, iteration) recovers [`Ty::Complex`] and the Display
+    /// protocol renders it via `zap_complex_to_str` rather than defaulting the bare
+    /// pointer to `str`. Admitted only in *value* positions (list element, dict
+    /// value, channel element), not as a dict/set key: `complex` as a hashed key is
+    /// a clean follow-up, so [`elem_kind`] still rejects it there. Introduced so
+    /// `linalg.eigvals` can return a `list[complex]`.
+    Complex,
 }
 
 impl Elem {
@@ -85,6 +95,9 @@ impl Elem {
             // A nested collection flows as a pointer when the interner is out of
             // reach; lowering resolves the precise `list`/`dict`/... type itself.
             Elem::Nested(_) => Ty::Ptr,
+            // A complex element reads back as the scalar `complex` (#928): its
+            // physical pointer word is reinterpreted as a `ZapComplex *`.
+            Elem::Complex => Ty::Complex,
         }
     }
     /// The runtime-entry-point suffix for an element/value of this kind. Struct
@@ -94,7 +107,8 @@ impl Elem {
         match self {
             Elem::I64 | Elem::Bool | Elem::Char | Elem::Enum(_) => "i64",
             Elem::F64 => "f64",
-            Elem::Ptr | Elem::Struct(_) | Elem::Nested(_) => "ptr",
+            // `complex` is a heap pointer word, stored/read through the `_ptr` path.
+            Elem::Ptr | Elem::Struct(_) | Elem::Nested(_) | Elem::Complex => "ptr",
         }
     }
     /// The runtime-entry-point suffix for a *key* of this kind. Pointer keys are
@@ -113,6 +127,9 @@ impl Elem {
             // or set keys), so this is never reached; share the pointer-key path
             // for a defined value rather than panicking.
             Elem::Nested(_) => "str",
+            // `complex` is admitted only in value positions (not as a key), so this
+            // is never reached; share the pointer-key path for a defined value.
+            Elem::Complex => "str",
         }
     }
 }

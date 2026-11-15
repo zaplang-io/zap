@@ -1,0 +1,7 @@
+eigvals [(0+1j), (0-1j)]
+eigh 2.0 3.0 2 2
+eigvalsh 2.0 3.0
+lstsq 2 2 1 2
+norm 5.0 7.0 4.0
+pinv 2 3 1.0
+mpow 8.0 1.0
