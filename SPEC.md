@@ -1473,6 +1473,25 @@ sample frequencies. An optional `norm=` (`"backward"` default, `"ortho"`,
 tolerance; a bad shape, or a build without the FFT backend, raises a catchable
 `ValueError`.
 
+`import random` also provides a NumPy-compatible array `Generator` (#930/#931)
+that is **bit-for-bit** with NumPy: `random.default_rng(seed)` returns a handle
+whose draws reproduce `numpy.random.default_rng(seed).<method>(...)`
+value-for-value (PCG64 bit generator + NumPy `SeedSequence` seeding + the ziggurat
+/ rejection distribution algorithms). This coexists with the module-level xoshiro
+`random` (D-0056); the handle-taking form is selected by passing a `Generator` as
+the first argument. Following Zap's stdlib convention for stateful handles, the
+operations are free functions on the handle rather than methods: `random.random
+(g)`, `random.uniform(g, lo, hi)`, `random.integers(g, lo, hi, endpoint=…)`,
+`random.normal(g, loc=…, scale=…)` / `standard_normal(g)`, `exponential` /
+`standard_exponential`, `gamma` / `standard_gamma`, `beta`, `poisson(g, lam)`,
+`binomial(g, n, p)`, `choice(g, n, replace=…, p=…)` (over an int population),
+`shuffle(g, a)` (in place), and `permutation(g, x)`. A draw is a scalar unless a
+`size=` keyword is given — an int for a 1-D array or a tuple for an N-D array
+(row-major draw order). The distributions follow NumPy's exact algorithms
+(Lemire-bounded integers, 256-region ziggurat for normal/exponential, PTRS/BTPE
+for poisson/binomial, Floyd sampling for `choice`), with the ziggurat tables
+vendored from NumPy (BSD-3).
+
 The `@` operator (PEP 465) and `dot(a, b)` are matrix multiplication on 1-D and
 2-D arrays: 1-D · 1-D is a scalar dot product, 2-D · 2-D a matrix product, and a
 mixed 1-D/2-D operand is promoted to a row/column with its singleton axis

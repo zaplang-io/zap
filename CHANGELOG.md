@@ -25,6 +25,18 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`random` — NumPy-compatible bit-exact PCG64 `Generator`** (#930/#931, D-0189).
+  Third Phase 3 track (#512): `random.default_rng(seed)` returns a generator whose
+  draws reproduce `numpy.random.default_rng(seed).<method>(...)` **value-for-value**
+  (PCG64 + NumPy `SeedSequence`, verified against NumPy 2.5.4). Free functions on
+  the handle (Zap's stdlib convention): `random`/`uniform`/`integers`,
+  `normal`/`standard_normal`, `exponential`/`standard_exponential`,
+  `gamma`/`standard_gamma`, `beta`, `poisson`, `binomial`, `choice` (int
+  population; replace / p= / no-replace), `shuffle`, `permutation`. A `size=`
+  keyword (int or N-D tuple) turns a scalar draw into an array. Distributions use
+  NumPy's exact algorithms (ziggurat for normal/exponential — tables vendored from
+  NumPy, BSD-3 —, PTRS/BTPE for poisson/binomial, Floyd for choice). Coexists with
+  the module-level xoshiro `random` (D-0056), selected by a `Generator` first arg.
 - **`linalg.eig` + `eigvals` → `array[complex]`** (#928-eig, D-0188). Completes
   the deferred general-matrix eigenproblem now that `array[complex]` exists:
   `eig(a)` → `(w, v)` (eigenvalues + the complex eigenvector matrix, columns =

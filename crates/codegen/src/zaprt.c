@@ -16386,6 +16386,11 @@ void zap_random_shuffle(void *l) {
     zap_np_unlock(&zap_rng_mu);
 }
 
+/* NumPy-compatible bit-exact PCG64 `Generator` surface (#930/#931, D-0189).
+ * Included here, after the ZapArray helpers (array construction/access) and the
+ * xoshiro block (`zap_os_entropy_u64`), so both are in scope. */
+#include "zaprandom.inc.c"
+
 /* ===========================================================================
  * json — JSON tokenizer cursor (ticket #100 / #131, D-0059)
  *

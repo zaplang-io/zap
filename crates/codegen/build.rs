@@ -30,6 +30,10 @@ fn main() {
         // it includes, both embedded and written out at compile time.
         "src/zapfft.cpp",
         "../../third_party/pocketfft/pocketfft_hdronly.h",
+        // random Generator (#930/#931): the bit-exact PCG64 surface and the
+        // vendored NumPy ziggurat tables it includes.
+        "src/zaprandom.inc.c",
+        "../../third_party/numpy/ziggurat_constants.h",
     ];
     for f in EMBEDDED_RUNTIME_FILES {
         println!("cargo:rerun-if-changed={f}");

@@ -9308,3 +9308,55 @@ complex array dtype exists (D-0186).
   `a @ v == w · v` reconstruction is host-verified against Apple Accelerate.
 Relates to #928 / #512 (Phase 3 epic), D-0185 (the eig/eigvals slice this
 completes), D-0186 (the complex array dtype `eig`/`eigvals` return).
+
+## D-0189 — `random`: NumPy-compatible bit-exact PCG64 `Generator` (#930/#931)
+**Status:** implemented
+Extends the `random` module (D-0056, a module-level xoshiro256** generator with
+the Python `random` surface) with NumPy's array `Generator`, **bit-for-bit
+compatible with NumPy's stream**: the same seed reproduces
+`numpy.random.default_rng(seed).<method>(...)` value-for-value. Verified against
+NumPy 2.5.4; NumPy guarantees cross-version stream stability for the `Generator`,
+so this is a durable contract.
+- **Engine.** `default_rng(seed)` → a `Generator` handle. The bit generator is
+  **PCG64** (XSL-RR 128→64) with NumPy's exact multiplier, step order (step then
+  output) and `pcg64_srandom` seeding; the 128-bit `initstate`/`initseq` come from
+  NumPy's **SeedSequence** entropy expansion (`hashmix`/`mix` with NumPy's
+  constants, `generate_state(4, uint64)`). The 32-bit draw buffer that NumPy keeps
+  in the PCG64 state (consumed by narrow integer draws, bypassed by 64-bit draws)
+  is part of the handle, so interleaved calls match.
+- **Surface (free functions on the handle, not methods).** NumPy's surface is
+  `rng.method(...)`; Zap's stdlib stateful handles are uniformly free functions on
+  an opaque handle (`deque`/`datetime`), and there is no method dispatch on a
+  module handle type — adding one is core work (filed as a follow-up, not done
+  here per the core-defect rule). So the surface is `random.random(g)`,
+  `random.normal(g, …)`, etc. The handle is an opaque, pointer-free value typed
+  `bytes` (the deque/crypto convention). The four names shared with the Python
+  surface (`random`/`uniform`/`choice`/`shuffle`) dispatch to the `Generator` path
+  when their first argument is a handle; the NumPy-only names always do.
+- **Scalar vs array.** A draw is a scalar unless a `size=` keyword is given, which
+  turns it into an array — an int (1-D) or a shape tuple (N-D, row-major
+  sequential draws then reshape). `size` is a keyword (not positional) so it never
+  collides with a distribution's positional parameters.
+- **Distributions / sampling (each follows NumPy's exact algorithm).**
+  `random`/`uniform`/`integers` (Lemire-bounded, `endpoint=`); `normal`/
+  `standard_normal` and `exponential`/`standard_exponential` (256-region
+  **ziggurat**, tables vendored verbatim in `third_party/numpy/
+  ziggurat_constants.h`, BSD-3); `gamma`/`standard_gamma` (Marsaglia–Tsang /
+  small-shape), `beta` (Johnk / gamma-ratio); `poisson` (Knuth multiplication for
+  λ<10, PTRS transformed-rejection with NumPy's own `loggam` for λ≥10);
+  `binomial` (inversion for n·p≤30, BTPE above); `choice` over an int population
+  (uniform / cumulative-`p=` / no-replacement Floyd-with-hash-set + tail-shuffle),
+  `shuffle` (in-place Fisher–Yates, `random_interval` masked rejection),
+  `permutation` (shuffled `arange` for an int, a shuffled copy for an array).
+- **Validation & verification.** The whole engine + every distribution/sampling
+  path was cross-checked **bit-for-bit against NumPy 2.5.4** host-side before
+  landing (the shipped `zaprandom.inc.c` through its real entry points). Misuse
+  (e.g. a no-replacement sample larger than the population) aborts with a message;
+  catchable `ValueError`s are a follow-up. 128-bit arithmetic uses `__int128`
+  (always available in the clang-compiled runtime).
+- **Scope / follow-ups.** `choice` samples an **int population** (returns
+  indices); gathering from an arbitrary array `a` (NumPy `choice(array, …)`) is a
+  follow-up over fancy indexing. `f32` sampling (the `_float` ziggurat tables are
+  vendored but unused) and `g.method()` method sugar are follow-ups.
+Relates to #930 / #931 / #512 (Phase 3 epic), D-0056 (the pre-existing xoshiro
+`random`), D-0164 (N-D arrays the `size=` results use).
