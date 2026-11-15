@@ -328,6 +328,8 @@ fn lto_runtime_bitcode(
     RUNTIME_GC_C.hash(&mut h);
     RUNTIME_RACE_C.hash(&mut h);
     RUNTIME_BLAS_C.hash(&mut h);
+    RUNTIME_RANDOM_C.hash(&mut h);
+    ZIGGURAT_H.hash(&mut h);
     cc.hash(&mut h);
     triple.hash(&mut h);
     immix.hash(&mut h);
@@ -497,6 +499,8 @@ fn native_runtime_object(
     RUNTIME_GC_C.hash(&mut h);
     RUNTIME_RACE_C.hash(&mut h);
     RUNTIME_BLAS_C.hash(&mut h);
+    RUNTIME_RANDOM_C.hash(&mut h);
+    ZIGGURAT_H.hash(&mut h);
     cc.hash(&mut h);
     triple.hash(&mut h);
     opt_flag.hash(&mut h);
@@ -662,6 +666,13 @@ const RUNTIME_RACE_C: &str = include_str!("zaprace.inc.c");
 /// behind `ZAP_HAVE_BLAS`, which codegen defines only for a program that links a
 /// BLAS provider (see `blas_build_flags`).
 const RUNTIME_BLAS_C: &str = include_str!("zapblas.inc.c");
+/// The NumPy-compatible bit-exact PCG64 `Generator` surface (#930/#931, D-0189),
+/// `#include`d unconditionally by `zaprt.c`. Written next to the runtime so the
+/// relative include resolves, along with the vendored NumPy ziggurat tables it
+/// `#include`s (`ziggurat_constants.h`). Pointer-free, no provider — always
+/// compiled into the runtime like the rest of `random`.
+const RUNTIME_RANDOM_C: &str = include_str!("zaprandom.inc.c");
+const ZIGGURAT_H: &str = include_str!("ziggurat_constants.h");
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
 /// unit so it links into the Windows program build AND compiles standalone in
@@ -1010,6 +1021,10 @@ pub fn build_executable(
         .map_err(|e| format!("failed to write race runtime: {e}"))?;
     std::fs::write(build_dir.join("zapblas.inc.c"), RUNTIME_BLAS_C)
         .map_err(|e| format!("failed to write accel seam runtime: {e}"))?;
+    std::fs::write(build_dir.join("zaprandom.inc.c"), RUNTIME_RANDOM_C)
+        .map_err(|e| format!("failed to write random runtime: {e}"))?;
+    std::fs::write(build_dir.join("ziggurat_constants.h"), ZIGGURAT_H)
+        .map_err(|e| format!("failed to write ziggurat constants: {e}"))?;
 
     // Target-aware link step (ticket #199, platform epic #158 / Area A5). Today
     // codegen emits for the host triple only, so "Windows target" means "running
