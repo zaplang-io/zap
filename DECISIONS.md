@@ -9282,3 +9282,29 @@ the complex array dtype (#938/D-0186), which it returns.
   (±1/±i twiddles) and the exact-rational sample frequencies.
 Relates to #929 / #512 (Phase 3 epic), #938/D-0186 (the complex array dtype it
 returns), #853 (the per-program optional-backend link gate it follows).
+
+## D-0188 — `linalg.eig` + `eigvals` → `array[complex]` (#928-eig)
+**Status:** implemented
+Completes the deferred general-matrix eigenproblem from D-0185, now that the
+complex array dtype exists (D-0186).
+- **`eig(a) -> (w, v)`** (general matrix) via `dgeev` with right eigenvectors:
+  `w` the eigenvalues (1-D `array[complex]`) and `v` the eigenvector matrix (2-D
+  `array[complex]`, columns = eigenvectors), matching `numpy.linalg.eig`. `dgeev`
+  returns the eigenvectors REAL-packed — a real eigenvalue's vector is its column,
+  a complex conjugate pair (`wi[j] > 0`, `wi[j+1] < 0`) has vectors
+  `vr[:,j] ± i·vr[:,j+1]` — which the runtime unpacks into the complex matrix.
+  Two entry points (`eig_w` reusing `eigvals`, `eig_v`) assembled into a tuple by
+  the lowering, like `qr`/`svd`.
+- **`eigvals` migrated `list[complex]` → `array[complex]`.** D-0185 returned the
+  eigenvalues as a `list[complex]` only because no complex array dtype existed yet
+  (an explicit stopgap). With `array[complex]` (D-0186) it now returns a 1-D
+  `array[complex]`, consistent with `eig`'s `w` and `numpy.linalg.eigvals` (an
+  ndarray). Pre-1.0 signature change; the `list[complex]` element kind (`Elem::
+  Complex`, #928) stays — it is still exercised by `list[complex]` literals.
+- **Determinism.** Eigenvector signs/scaling are gauge-ambiguous and
+  provider-dependent (`eig`'s `v`), so the tests pin the invariant cases — a
+  diagonal matrix's exact eigenvalues and standard-basis eigenvectors, and
+  `eigvals` of a rotation matrix (the exact ±i conjugate pair); the full
+  `a @ v == w · v` reconstruction is host-verified against Apple Accelerate.
+Relates to #928 / #512 (Phase 3 epic), D-0185 (the eig/eigvals slice this
+completes), D-0186 (the complex array dtype `eig`/`eigvals` return).

@@ -2650,6 +2650,10 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // eigvals -> list[complex]; eigh -> (w, v); eigvalsh reuses eigh_w; lstsq
         // -> (x, residuals, rank:i64, s); norm(a, ord) -> f64; matrix_power(a, p).
         self.declare_rt("zap_linalg_eigvals", &[p.into()], Some(p.into()));
+        // eig -> (w, v): eigenvalues (array[complex]) + the complex eigenvector
+        // matrix, via dgeev JOBVR='V' (#928-eig).
+        self.declare_rt("zap_linalg_eig_w", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_linalg_eig_v", &[p.into()], Some(p.into()));
         self.declare_rt("zap_linalg_eigh_w", &[p.into()], Some(p.into()));
         self.declare_rt("zap_linalg_eigh_v", &[p.into()], Some(p.into()));
         self.declare_rt("zap_linalg_lstsq_x", &[p.into(), p.into()], Some(p.into()));

@@ -1,4 +1,5 @@
-eigvals [(0+1j), (0-1j)]
+eigvals (0+1j) (0-1j) 2
+eig (2+0j) (3+0j) (1+0j) (1+0j)
 eigh 2.0 3.0 2 2
 eigvalsh 2.0 3.0
 lstsq 2 2 1 2

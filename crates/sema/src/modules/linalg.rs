@@ -4,9 +4,9 @@
 //! seam). Surface, grown across slices:
 //!   solve / inv / det (#926); cholesky / qr / svd (#927, decompositions);
 //!   eigvals / eigh / eigvalsh / lstsq / norm / pinv / matrix_power (#928).
-//! `eigvals` returns a `list[complex]`; qr/svd/eigh/lstsq return tuples; `norm`
-//! returns an `f64` and takes an optional `ord`. `eig` (complex eigenvector
-//! matrix) is deferred until a complex array dtype exists.
+//! `eigvals` returns an `array[complex]` and `eig` returns `(w, v)` (complex
+//! eigenvalues + eigenvector matrix, #928-eig); qr/svd/eigh/lstsq return tuples;
+//! `norm` returns an `f64` and takes an optional `ord`.
 //!
 //! Arrays are typed loosely (`Ty::Unknown`) in sema, as the rest of the array
 //! surface is, so the arguments are only inferred (type-checked), not shape- or
@@ -44,9 +44,11 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
         // `eigvals` (general) returns the eigenvalues as a `list[complex]` (real
         // matrices have real or conjugate-pair eigenvalues); `eig` itself is
         // deferred until a complex array dtype can hold the eigenvectors.
-        "eigvals" => (1, Ty::List(Box::new(Ty::Complex))),
-        // `eigh` (symmetric) returns (w, v): real eigenvalues ascending + real
-        // eigenvector matrix; `eigvalsh` returns just w.
+        "eigvals" => (1, Ty::Unknown),
+        // `eig` (general) returns (w, v): eigenvalues and the eigenvector matrix,
+        // both `array[complex]` (#928-eig). `eigh` (symmetric) returns (w, v):
+        // real eigenvalues ascending + real eigenvector matrix; `eigvalsh` just w.
+        "eig" => (1, Ty::Tuple(vec![Ty::Unknown, Ty::Unknown])),
         "eigh" => (1, Ty::Tuple(vec![Ty::Unknown, Ty::Unknown])),
         "eigvalsh" => (1, Ty::Unknown),
         // `lstsq(a, b)` returns (solution, residuals, rank, singular_values);
