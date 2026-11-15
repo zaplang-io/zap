@@ -8563,18 +8563,18 @@ int64_t zap_str_endswith(void *sp, void *pp) {
     return memcmp(s->data + (s->len - p->len), p->data, (size_t)p->len) == 0 ? 1 : 0;
 }
 
+/* SIMD substring search (#945, epic #139, D-0194), defined in zapmemchr.inc.c
+ * (#included near the end of this file, after the cpu_features detector it
+ * dispatches on). Forward-declared here so the string paths can route through it. */
+ptrdiff_t zap_memmem_off(const void *hay, size_t hn, const void *ndl, size_t nn);
+
 /* First byte offset of `sub` in `s`, or -1. Both are valid UTF-8, so a byte
- * match is codepoint-aligned. */
+ * match is codepoint-aligned. Routed through the multiversioned SIMD memmem
+ * (#945): scan for the needle's first byte with a dispatched SIMD memchr, verify
+ * the rest with memcmp — far faster than the former O(n*m) memcmp-at-every-offset
+ * scan, and identical in result (first offset, or -1; empty needle -> 0). */
 static int64_t zap_str_find_bytes(const ZapStr *s, const ZapStr *sub) {
-    if (sub->len == 0) {
-        return 0;
-    }
-    for (int64_t i = 0; i + sub->len <= s->len; i++) {
-        if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) {
-            return i;
-        }
-    }
-    return -1;
+    return (int64_t)zap_memmem_off(s->data, (size_t)s->len, sub->data, (size_t)sub->len);
 }
 
 int64_t zap_str_contains(void *sp, void *subp) {
@@ -17049,6 +17049,13 @@ void zap_random_shuffle(void *l) {
  * the string helpers (`zap_str_new` / `zap_sys_cstr`) its `sys.cpu_*` wrappers
  * build on are in scope. */
 #include "zapcpu.inc.c"
+
+/* SIMD byte/substring search (#945, ISA-acceleration epic #139, D-0194): the
+ * first multiversioned kernel. Included after `zapcpu.inc.c` so its resolver
+ * sees `zap_cpu_has`. Defines `zap_memchr_off` / `zap_memmem_off`, which the
+ * string/bytes search paths (`zap_str_find_bytes`, forward-declared above) route
+ * through. */
+#include "zapmemchr.inc.c"
 
 /* ===========================================================================
  * json — JSON tokenizer cursor (ticket #100 / #131, D-0059)

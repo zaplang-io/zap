@@ -9557,3 +9557,54 @@ the first client is SIMD memchr (#945). Design: #920 §6, §7, comment 3.
   selection is CI/qemu-gated; a dispatch bug is invisible on the dev machine.
 Relates to epic #139, Discussion #920 (§6, §7, comment 3), D-0192 (`cpu_features`,
 the detector it reads). Consumed by #945 (SIMD memchr).
+
+## D-0194 — SIMD memchr/memmem: the first multiversioned kernel (ISA-acceleration epic #139 / #945)
+**Status:** implemented
+A SIMD byte/substring search in the C runtime — the FIRST multiversioned kernel,
+proving the clone + resolver + `cpu_features` dispatch pattern end to end on a
+real, high-traffic operation before the facility grows. Builds on #943 (D-0192).
+Design: #920 §4, comments 2 & 5.
+- **Dispatch is hand-written C**, not the #944 `@multiversion` codegen cloner:
+  that multiversions *Zap* functions, whereas `memchr` is a C-runtime hot path.
+  Both ride the same `cpu_features` detector (#943) — the facility has two faces
+  (Zap-level and C-runtime), one detection layer. The pattern is
+  pointer-with-once-init (#920 §6a): a resolver reads `zap_cpu_has`, picks the
+  widest supported clone, and caches the function pointer (a benign first-call
+  race recomputes the identical pointer; malloc-free, lock-free).
+- **Clones** (`zapmemchr.inc.c`): `scalar` (the GENERIC floor) · `SSE2` (the
+  guaranteed x86-64 floor, so the x86 fallback is never scalar) · `AVX2` (the
+  runtime-detected x86 upgrade — the one real dispatch decision) · `NEON` (the
+  guaranteed aarch64 floor). The AVX2 clone carries `__attribute__((target("avx2")))`
+  so this baseline-compiled TU may contain AVX2 codegen.
+- **Horizontal reduce follows #920 §4**: x86 exports a compare bitmask and finds
+  the first match with count-trailing-zeros; NEON has no movemask, so it detects
+  "any match in this 16-byte block" with a horizontal max, then locates the lane.
+  Same algorithm, different horizontal primitive — never designed to the x86
+  `movemask` spelling (which is how portable SIMD layers end up slow on ARM).
+- **memmem rides memchr**: scan for the needle's first byte with the dispatched
+  SIMD memchr (clamped to `[pos, hn-nn]`), verify the rest with memcmp — the
+  memchr-crate / glibc strategy. Only memchr is multiversioned; memmem is one
+  scalar driver over it.
+- **Client.** `zap_str_find_bytes` (hence `str.find` / `in` / `index`, and the
+  substring paths) routes through `zap_memmem_off`, replacing the former
+  O(n*m) memcmp-at-every-offset scan. Same observable result (first offset or -1;
+  empty needle → 0); no user-facing surface change (no grammar/STABILITY entry).
+- **LTO safety.** The SIMD clones' `_mvsimd_` name marks them for the I#841
+  `strip_target_attrs_bitcode` EXEMPTION (alongside #944's `$mv$` clones), so the
+  AVX2 clone keeps its `+avx2` through LTO — otherwise the backend could not
+  legalize the AVX2 instructions the bitcode already carries (the green-debug /
+  broken-LTO failure mode, #845). The clones are reached only via the function
+  pointer, so they are never inlined into a baseline caller regardless.
+- **Testing.** A standalone C harness (`zapmemchr_test.c`, run by a cargo test)
+  checks every available clone against a scalar reference across all lengths that
+  cross the vector width (0, 1, w-1, w, w+1, multi-block + tail), the needle at
+  start/middle/end/absent, byte value 0, and first-match-wins; and `zap_memmem_off`
+  against a brute-force search over many needle lengths, overlapping matches,
+  needle-longer-than-haystack, and the empty needle. On-silicon clone selection
+  under `qemu -cpu` and the `-O2`/LTO build ride the CI matrix (the sole gate for
+  the arch SIMD paths — a dispatch bug is invisible on one dev machine). An
+  end-to-end string-workload measurement (per the dict isolation-vs-end-to-end
+  lesson) before claiming the perf win is a follow-up.
+Relates to epic #139, Discussion #920 (§4, comments 2 & 5), D-0192
+(`cpu_features`), D-0193 (the `@multiversion` facility; this is its C-runtime
+sibling). A later SVE first-faulting-load clone is future work.

@@ -273,16 +273,20 @@ fn strip_target_attrs_bitcode(path: &Path) -> Result<(), String> {
     ];
     let mut f = m.get_first_function();
     while let Some(func) = f {
-        // EXCEPTION: a `@multiversion` clone (name carries the `$mv$` marker,
-        // #944) MUST keep its `target-features` — that attribute is the whole
-        // point of the clone, and it is exactly what makes the clone an
-        // un-inlinable dispatch barrier (rule #3). Stripping it would silently
-        // demote every clone to baseline and erase the specialization. Every
-        // other function is stripped so the I#841 cross-boundary inlining holds.
+        // EXCEPTION: a multiversioned clone MUST keep its `target-features` — that
+        // attribute is the whole point of the clone, and it is exactly what makes
+        // it an un-inlinable dispatch barrier (rule #3). Stripping it would
+        // silently demote the clone to baseline and (for a clone carrying
+        // already-selected wider intrinsics, e.g. an AVX2 runtime kernel) leave
+        // the backend unable to legalize them — the green-debug / broken-LTO
+        // failure mode (#845). Two markers: `$mv$` is a #944 Zap-function clone;
+        // `_mvsimd_` is a hand-written C runtime SIMD clone (#945, e.g.
+        // `zap_memchr_mvsimd_avx2`). Every other function is stripped so the
+        // I#841 cross-boundary inlining holds.
         let is_mv_clone = func
             .get_name()
             .to_str()
-            .map(|n| n.contains("$mv$"))
+            .map(|n| n.contains("$mv$") || n.contains("_mvsimd_"))
             .unwrap_or(false);
         if !is_mv_clone {
             for key in INLINE_BLOCKING_FN_ATTRS {
@@ -706,6 +710,12 @@ const ZIGGURAT_H: &str = include_str!("ziggurat_constants.h");
 /// Rust by `crate::cpu_features` and locked by its agreement test.
 const RUNTIME_CPU_C: &str = include_str!("zapcpu.inc.c");
 const CPU_FEATURES_H: &str = include_str!("zap_cpu_features.h");
+/// The SIMD byte/substring search kernel (#945, ISA-acceleration epic #139,
+/// D-0194), `#include`d by `zaprt.c` after `zapcpu.inc.c` (it dispatches on the
+/// detector). Written next to the runtime so the relative include resolves. The
+/// first multiversioned kernel: hand-written clones (scalar/SSE2/AVX2/NEON) +
+/// pointer-once-init dispatch reading `cpu_features`.
+const RUNTIME_MEMCHR_C: &str = include_str!("zapmemchr.inc.c");
 /// The Windows x86_64 coroutine context switch (ticket #195 / A1): the asm
 /// backend for the `zap_ctx_swap`/`zap_ctx_make` seam, a separate translation
 /// unit so it links into the Windows program build AND compiles standalone in
@@ -1060,6 +1070,8 @@ pub fn build_executable(
         .map_err(|e| format!("failed to write ziggurat constants: {e}"))?;
     std::fs::write(build_dir.join("zap_cpu_features.h"), CPU_FEATURES_H)
         .map_err(|e| format!("failed to write cpu-features header: {e}"))?;
+    std::fs::write(build_dir.join("zapmemchr.inc.c"), RUNTIME_MEMCHR_C)
+        .map_err(|e| format!("failed to write memchr runtime: {e}"))?;
     std::fs::write(build_dir.join("zapcpu.inc.c"), RUNTIME_CPU_C)
         .map_err(|e| format!("failed to write cpu-features runtime: {e}"))?;
 

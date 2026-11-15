@@ -25,6 +25,13 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **SIMD `memchr`/`memmem` — the first multiversioned kernel** (#945, epic #139,
+  D-0194). A SIMD byte/substring search in the runtime with hand-written
+  scalar/SSE2/AVX2/NEON clones and pointer-once-init dispatch reading
+  `cpu_features` (#943) — the x86 floor is SSE2, AVX2 is the runtime-detected
+  upgrade, NEON the aarch64 floor. `str.find` / `in` / `index` (via
+  `zap_str_find_bytes`) now route through it, replacing the former O(n·m) scan
+  with a first-byte SIMD scan + memcmp verify; same results, no surface change.
 - **Function multiversioning — `@multiversion`** (#944, epic #139, D-0193).
   `@multiversion("avx2", "sse4.2", "default")` on a free function compiles one
   clone per CPU-feature tier (each with its LLVM `target-features`, kept as a
