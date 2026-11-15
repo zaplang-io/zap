@@ -2716,6 +2716,22 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         // build the reshape target-dims buffer.
         self.declare_rt("zap_array_transpose", &[p.into()], Some(p.into()));
         self.declare_rt("zap_array_flatten", &[p.into()], Some(p.into()));
+        // Array sort / argsort (#932): in-place sort, sorted copy, argsort indices.
+        self.declare_rt(
+            "zap_array_sort_inplace",
+            &[p.into(), i.into(), i.into()],
+            None,
+        );
+        self.declare_rt(
+            "zap_array_sorted",
+            &[p.into(), i.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_argsort",
+            &[p.into(), i.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
         self.declare_rt("zap_i64buf", &[i.into()], Some(p.into()));
         self.declare_rt("zap_i64set", &[p.into(), i.into(), i.into()], None);
         self.declare_rt(

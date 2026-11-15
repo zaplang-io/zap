@@ -25,6 +25,14 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Numeric-array `sort` / `argsort` — own floor** (#932, D-0190). Fourth Phase 3
+  track (#512): `a.sort()` (in place), `sort(a)` (sorted copy), `a.argsort()` /
+  `argsort(a)` (an `array[i64]` of indices), matching `numpy.sort`/`argsort` (not
+  `list.sort`). `axis=` (default last axis; `None` flattens) and `kind=` — the
+  default unstable own introsort, or `"stable"`/`"mergesort"` (LSD radix for ints,
+  mergesort for floats). NaNs sort to the end, `-0.0 == +0.0`; sorted values match
+  NumPy for any kind, argsort tie-order for the stable kind. Complex is rejected
+  (no ordering). Own floor only — the SIMD accelerator is a later slice (#933).
 - **`random` — NumPy-compatible bit-exact PCG64 `Generator`** (#930/#931, D-0189).
   Third Phase 3 track (#512): `random.default_rng(seed)` returns a generator whose
   draws reproduce `numpy.random.default_rng(seed).<method>(...)` **value-for-value**

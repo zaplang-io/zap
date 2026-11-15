@@ -12160,6 +12160,38 @@ impl<'a> FnLower<'a> {
             if fname == "where" {
                 return self.lower_array_where(args);
             }
+            // `sort(a, axis=, kind=)` / `argsort(a, ...)` (#932): a NEW array (a
+            // sorted copy / an i64 index array), leaving `a` unchanged. The array
+            // is positional; axis=/kind= are keyword-only. For a list, use the
+            // `sorted()` builtin instead.
+            if fname == "sort" || fname == "argsort" {
+                let mut arr_arg: Option<&Expr> = None;
+                let mut rest: Vec<ast::Arg> = Vec::new();
+                for a in args {
+                    if a.name.is_none() {
+                        if arr_arg.is_some() {
+                            return Err(err(format!(
+                                "{fname}() takes a single positional argument (the array)"
+                            )));
+                        }
+                        arr_arg = Some(&a.value);
+                    } else {
+                        rest.push(a.clone());
+                    }
+                }
+                let Some(arr_expr) = arr_arg else {
+                    return Err(err(format!(
+                        "{fname}() takes the array to sort as its argument"
+                    )));
+                };
+                let (recv, rt) = self.expr(arr_expr)?;
+                let Ty::Array(d, ndim) = rt else {
+                    return Err(err(format!(
+                        "{fname}() requires a numeric array (use sorted() for a list)"
+                    )));
+                };
+                return self.lower_array_sortish(recv, d, ndim, fname == "argsort", false, &rest);
+            }
             // `sorted(xs, key=..., reverse=...)` — a new sorted list, leaving the
             // input untouched (ticket #336). The list is positional; `key` /
             // `reverse` are keyword-only, same as `xs.sort(...)`.
@@ -20788,6 +20820,10 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((dest, out));
             }
+            // Sort (#932): `a.sort(axis=, kind=)` sorts IN PLACE (returns nothing);
+            // `a.argsort(axis=, kind=)` returns a new i64 index array.
+            "sort" => return self.lower_array_sortish(recv, d, ndim, false, true, args),
+            "argsort" => return self.lower_array_sortish(recv, d, ndim, true, false, args),
             _ => {}
         }
         // op code shared with the runtime axis kernel: 0=sum,1=min,2=max,3=prod.
@@ -20889,6 +20925,98 @@ impl<'a> FnLower<'a> {
         // Raises ValueError on an out-of-range axis (min/max also on an empty axis).
         self.throwing_call(Some(dest), "zap_array_reduce_axis", vec![recv, av, opv]);
         Ok((dest, out_ty))
+    }
+
+    /// `sort` / `argsort` over a numeric array (#932, D-0190), as a method
+    /// (`a.sort()` in place, `a.argsort()` -> indices) or a builtin (`sort(a)`
+    /// copy, `argsort(a)`). `kw` holds the keyword arguments (`axis=`, `kind=`);
+    /// the receiver array is already lowered. `in_place` is the sorting method
+    /// form; `is_argsort` selects argsort. Unstable (introsort) is the default;
+    /// `kind="stable"`/`"mergesort"` selects the stable floor. `axis=` is an int
+    /// (default last axis) or `None` (flatten); the runtime raises ValueError on
+    /// a bad axis. Complex has no ordering and is rejected.
+    fn lower_array_sortish(
+        &mut self,
+        recv: Value,
+        d: Dtype,
+        ndim: u8,
+        is_argsort: bool,
+        in_place: bool,
+        kw: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        if matches!(d, Dtype::Complex) {
+            return Err(err(
+                "sort/argsort: complex arrays have no ordering (sort the real/imag parts)",
+            ));
+        }
+        let mut stable = false;
+        let mut axis_expr: Option<&Expr> = None;
+        for a in kw {
+            match a.name.as_deref() {
+                Some("kind") => match &a.value {
+                    Expr::Str {
+                        value,
+                        fstring: false,
+                        ..
+                    } => match value.as_str() {
+                        "stable" | "mergesort" => stable = true,
+                        "quicksort" | "heapsort" => stable = false,
+                        _ => {
+                            return Err(err(
+                                "sort kind= must be \"quicksort\", \"stable\", \"mergesort\", or \"heapsort\"",
+                            ))
+                        }
+                    },
+                    _ => return Err(err("sort kind= must be a string literal")),
+                },
+                Some("axis") => axis_expr = Some(&a.value),
+                Some(k) => {
+                    return Err(err(format!(
+                        "sort/argsort got an unexpected keyword '{k}' (only axis= and kind=)"
+                    )))
+                }
+                None => {
+                    return Err(err(
+                        "array sort/argsort takes no extra positional arguments (pass axis=/kind=)",
+                    ))
+                }
+            }
+        }
+        // axis: None -> flatten; an int -> that axis; absent -> last axis (-1).
+        let (flatten, axis_val) = match axis_expr {
+            Some(Expr::None(_)) => (true, self.iconst(Ty::I64, 0)),
+            Some(e) => {
+                let (v, t) = self.expr(e)?;
+                (false, self.coerce(v, t, Ty::I64))
+            }
+            None => (false, self.iconst(Ty::I64, -1)),
+        };
+        let stable_v = self.iconst(Ty::I64, i64::from(stable));
+        if in_place {
+            if flatten {
+                return Err(err(
+                    "a.sort(axis=None) is not supported; use sort(a, axis=None)",
+                ));
+            }
+            self.throwing_call(
+                None,
+                "zap_array_sort_inplace",
+                vec![recv, axis_val, stable_v],
+            );
+            return Ok((self.iconst(Ty::I32, 0), Ty::I32));
+        }
+        let flatten_v = self.iconst(Ty::I64, i64::from(flatten));
+        let out_dtype = if is_argsort { Dtype::I64 } else { d };
+        let out_rank = if flatten { 1 } else { ndim };
+        let out = Ty::Array(out_dtype, out_rank);
+        let dest = self.new_value(out);
+        let func = if is_argsort {
+            "zap_array_argsort"
+        } else {
+            "zap_array_sorted"
+        };
+        self.throwing_call(Some(dest), func, vec![recv, axis_val, flatten_v, stable_v]);
+        Ok((dest, out))
     }
 
     /// Element-wise `+`/`-`/`*`/`/` on arrays, including scalar broadcast and
