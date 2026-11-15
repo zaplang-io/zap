@@ -141,7 +141,15 @@ impl ReplJit {
         let name = format!("zap_repl_{}", self.gen);
         let builder = self.ctx.create_builder();
         // The REPL JIT has no `--race` surface, so race instrumentation is off.
-        let (module, _tm) = crate::build_llvm_module(self.ctx, &builder, ast, &name, true, false)?;
+        let (module, _tm) = crate::build_llvm_module(
+            self.ctx,
+            &builder,
+            ast,
+            &name,
+            true,
+            false,
+            zapc_ir::FpPolicy::default(),
+        )?;
         self.engine
             .add_module(&module)
             .map_err(|()| "failed to add the entry module to the JIT engine".to_string())?;

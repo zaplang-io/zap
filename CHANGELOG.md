@@ -25,6 +25,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Floating-point determinism model — `--fp` policy + `math.fma`** (#946,
+  D-0196). A compile-time `--fp=strict|default|fast` flag controls whether
+  codegen may change FP rounding structure for speed: `default` (the default)
+  contracts `a*b+c` into an FMA but never reassociates reductions; `strict` is
+  bit-exact (no FMA); `fast` adds reduction reassociation (warned, width-
+  dependent). Codegen stamps the matching LLVM fast-math flags on scalar and
+  vector float arithmetic. Integer / float-`min`/`max` reassociation stays
+  unconditionally on (always sound). Adds the explicit `math.fma(x, y, z)` —
+  a single-rounding fused multiply-add, bit-identical across targets. The pinned
+  width-independent reduction grouping is defined by the policy and implemented
+  in the array kernels (#896/#911). **Experimental.**
 - **Numeric-array sort accelerator — vendored SIMD kernels** (#933, D-0195).
   Large unstable `sort`/`argsort` auto-dispatch to Intel x86-simd-sort (x86-64
   AVX2/AVX-512) or Google Highway vqsort (aarch64 NEON) via the `cpu_features`

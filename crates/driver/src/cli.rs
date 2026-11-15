@@ -11,6 +11,8 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use zapc_ir::FpPolicy;
+
 use zapc_pkg::Source;
 
 /// The output form for `zap doc` (I#233).
@@ -44,6 +46,9 @@ pub enum Command {
         /// Compile the C runtime at `-O0` for fast iteration instead of the
         /// default `-O2` (#867, D-0157); off by default.
         debug: bool,
+        /// Floating-point determinism policy (`--fp`, #946, D-0196); defaults to
+        /// `default` (contraction on, reassociation off).
+        fp: FpPolicy,
     },
     /// `zap build [file] [-o out] [--target-feature f] [--portable] [--warnings-as-errors] [--race] [--debug]` — build a
     /// native binary into `target/`.
@@ -62,6 +67,9 @@ pub enum Command {
         /// Compile the C runtime at `-O0` for fast iteration instead of the
         /// default `-O2` (#867, D-0157); off by default.
         debug: bool,
+        /// Floating-point determinism policy (`--fp`, #946, D-0196); defaults to
+        /// `default` (contraction on, reassociation off).
+        fp: FpPolicy,
     },
     /// `zap ir [file] [--target-feature f] [--warnings-as-errors] [--race]` — dump ZIR (diagnostic).
     Ir {
@@ -235,6 +243,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 warnings_as_errors,
                 race,
                 debug,
+                fp,
             } = parse_compile(rest)?;
             Ok(Command::Run {
                 file,
@@ -244,6 +253,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 warnings_as_errors,
                 race,
                 debug,
+                fp,
             })
         }
         "build" => {
@@ -255,6 +265,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 warnings_as_errors,
                 race,
                 debug,
+                fp,
             } = parse_compile(rest)?;
             Ok(Command::Build {
                 file,
@@ -264,6 +275,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 warnings_as_errors,
                 race,
                 debug,
+                fp,
             })
         }
         "ir" => {
@@ -381,6 +393,11 @@ struct CompileArgs {
     /// that never changes observable behaviour, only build time vs. run speed.
     /// Meaningful for `build`/`run`; harmless for `ir` (which never links).
     debug: bool,
+    /// `--fp=<strict|default|fast>`: the floating-point determinism policy
+    /// (#946, D-0196). Controls whether codegen may change FP rounding structure
+    /// for speed — contraction (FMA) and reduction reassociation. Defaults to
+    /// `default` (contraction on, reassoc off: reproducible across platforms).
+    fp: FpPolicy,
 }
 
 /// Parse the `[-o <out>] [--target-feature f]... [--portable] [--race] [--debug] [file]`
@@ -393,6 +410,7 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
     let mut warnings_as_errors = false;
     let mut race = false;
     let mut debug = false;
+    let mut fp = FpPolicy::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -449,6 +467,23 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
                 features.push(f);
                 i += 2;
             }
+            // `--fp=<strict|default|fast>`: floating-point determinism policy
+            // (#946, D-0196). `--fp <level>` (space-separated) is also accepted.
+            flag if flag == "--fp" || flag.starts_with("--fp=") => {
+                let level = if let Some(v) = flag.strip_prefix("--fp=") {
+                    i += 1;
+                    v.to_string()
+                } else {
+                    let v = args
+                        .get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| "`--fp` needs a level: strict|default|fast".to_string())?;
+                    i += 2;
+                    v
+                };
+                fp = FpPolicy::parse(&level)
+                    .ok_or_else(|| format!("unknown --fp level `{level}` (strict|default|fast)"))?;
+            }
             flag if flag.starts_with('-') => {
                 return Err(format!("unknown flag `{flag}`"));
             }
@@ -469,6 +504,7 @@ fn parse_compile(args: &[String]) -> Result<CompileArgs, String> {
         warnings_as_errors,
         race,
         debug,
+        fp,
     })
 }
 
@@ -1136,6 +1172,7 @@ pub fn execute(cmd: Command) -> ExitCode {
             warnings_as_errors,
             race,
             debug,
+            fp,
         } => match resolve_entry(file) {
             Ok(f) => crate::compile_for(
                 &f,
@@ -1146,6 +1183,7 @@ pub fn execute(cmd: Command) -> ExitCode {
                 warnings_as_errors,
                 race,
                 debug,
+                fp,
             ),
             Err(code) => code,
         },
@@ -1157,6 +1195,7 @@ pub fn execute(cmd: Command) -> ExitCode {
             warnings_as_errors,
             race,
             debug,
+            fp,
         } => cmd_build(
             file,
             out,
@@ -1165,6 +1204,7 @@ pub fn execute(cmd: Command) -> ExitCode {
             warnings_as_errors,
             race,
             debug,
+            fp,
         ),
         Command::Ir {
             file,
@@ -1252,6 +1292,7 @@ fn cmd_build(
     warnings_as_errors: bool,
     race: bool,
     debug: bool,
+    fp: FpPolicy,
 ) -> ExitCode {
     let entry = match resolve_entry(file) {
         Ok(f) => f,
@@ -1280,6 +1321,7 @@ fn cmd_build(
         warnings_as_errors,
         race,
         debug,
+        fp,
     )
 }
 
@@ -1897,6 +1939,36 @@ mod tests {
         parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
+    fn fp_of(c: Command) -> FpPolicy {
+        match c {
+            Command::Run { fp, .. } | Command::Build { fp, .. } => fp,
+            other => panic!("expected run/build, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fp_flag_parses_the_three_levels_and_defaults() {
+        // Absent -> the speed-by-default policy (#946, D-0196).
+        assert_eq!(fp_of(p(&["build", "a.zap"]).unwrap()), FpPolicy::Default);
+        assert_eq!(fp_of(p(&["run", "a.zap"]).unwrap()), FpPolicy::Default);
+        // `--fp=<level>` and the space-separated `--fp <level>` both work.
+        assert_eq!(
+            fp_of(p(&["run", "a.zap", "--fp=strict"]).unwrap()),
+            FpPolicy::Strict
+        );
+        assert_eq!(
+            fp_of(p(&["build", "--fp", "fast", "a.zap"]).unwrap()),
+            FpPolicy::Fast
+        );
+        assert_eq!(
+            fp_of(p(&["build", "a.zap", "--fp=default"]).unwrap()),
+            FpPolicy::Default
+        );
+        // An unknown level, or a bare `--fp` with no value, is a clear error.
+        assert!(p(&["build", "a.zap", "--fp=reckless"]).is_err());
+        assert!(p(&["build", "a.zap", "--fp"]).is_err());
+    }
+
     #[test]
     fn explain_parses_a_code_and_requires_one() {
         assert_eq!(
@@ -1933,6 +2005,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         assert_eq!(
@@ -1945,6 +2018,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
     }
@@ -1961,6 +2035,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
     }
@@ -1977,6 +2052,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
     }
@@ -1994,6 +2070,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         // Order-independent and composes with `-o`; also accepted by `run`.
@@ -2007,6 +2084,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         assert_eq!(
@@ -2019,6 +2097,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         // Absent by default.
@@ -2032,6 +2111,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
     }
@@ -2050,6 +2130,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: true,
+                fp: FpPolicy::default(),
             }
         );
         // Also accepted by `run`, and order-independent + composes with `-o`.
@@ -2063,6 +2144,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: true,
+                fp: FpPolicy::default(),
             }
         );
         assert_eq!(
@@ -2075,6 +2157,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: true,
+                fp: FpPolicy::default(),
             }
         );
         // Composes with every other compile flag without interfering.
@@ -2096,6 +2179,7 @@ mod tests {
                 warnings_as_errors: true,
                 race: true,
                 debug: true,
+                fp: FpPolicy::default(),
             }
         );
         // Off by default — the optimized (`-O2`) runtime is the default build.
@@ -2109,6 +2193,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         // `--debug` is parsed off the shared compile grammar, so `ir` accepts it
@@ -2131,6 +2216,7 @@ mod tests {
                 warnings_as_errors: true,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         assert_eq!(
@@ -2143,6 +2229,7 @@ mod tests {
                 warnings_as_errors: true,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         assert_eq!(
@@ -2173,6 +2260,7 @@ mod tests {
                 warnings_as_errors: true,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         // Off by default.
@@ -2186,6 +2274,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
     }
@@ -2205,6 +2294,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: true,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         assert_eq!(
@@ -2217,6 +2307,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: true,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         assert_eq!(
@@ -2249,6 +2340,7 @@ mod tests {
                 warnings_as_errors: true,
                 race: true,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         // Off by default.
@@ -2262,6 +2354,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
     }
@@ -2288,6 +2381,7 @@ mod tests {
                 warnings_as_errors: false,
                 race: false,
                 debug: false,
+                fp: FpPolicy::default(),
             }
         );
         assert!(p(&["run", "a.zap", "--target-feature"]).is_err());

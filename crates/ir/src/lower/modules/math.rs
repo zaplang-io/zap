@@ -66,6 +66,11 @@ fn lower(
         "atan2" => return Ok(Some(binary(lowerer, "zap_math_atan2", args)?)),
         "hypot" => return Ok(Some(binary(lowerer, "zap_math_hypot", args)?)),
         "fmod" => return Ok(Some(binary(lowerer, "zap_math_fmod", args)?)),
+        // `fma(x, y, z)` — explicit fused multiply-add (#946, D-0196): a single
+        // rounding of `x*y + z`, independent of the implicit-`x*y+z` contraction
+        // policy. Lowers to a libm `fma` wrapper (correctly rounded, hardware FMA
+        // where present) so the bits are identical on every target.
+        "fma" => return Ok(Some(ternary(lowerer, "zap_math_fma", args)?)),
         "isnan" => return Ok(Some(predicate(lowerer, "zap_math_isnan", args)?)),
         "isinf" => return Ok(Some(predicate(lowerer, "zap_math_isinf", args)?)),
         _ => return Ok(None),
@@ -130,6 +135,24 @@ fn binary(lowerer: &mut FnLower, func: &str, args: &[ast::Arg]) -> Result<(Value
         dest: Some(d),
         func: func.to_string(),
         args: vec![a, b],
+    });
+    Ok((d, Ty::F64))
+}
+
+/// `func(f64, f64, f64) -> f64` (the explicit `fma`, #946).
+fn ternary(
+    lowerer: &mut FnLower,
+    func: &str,
+    args: &[ast::Arg],
+) -> Result<(Value, Ty), LowerError> {
+    let a = f64_arg(lowerer, func, args, 0)?;
+    let b = f64_arg(lowerer, func, args, 1)?;
+    let c = f64_arg(lowerer, func, args, 2)?;
+    let d = lowerer.new_value(Ty::F64);
+    lowerer.emit(Inst::Call {
+        dest: Some(d),
+        func: func.to_string(),
+        args: vec![a, b, c],
     });
     Ok((d, Ty::F64))
 }

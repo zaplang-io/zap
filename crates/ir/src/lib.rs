@@ -18,7 +18,7 @@ pub use zapc_mono as mono;
 pub use lower::{lower_module, lower_module_opts};
 pub use zapc_ir_core::{
     ArrayMathOp, AtomicOrd, AtomicRmwOp, BinOp, Block, BlockId, CastKind, CmpPred, Dtype, Elem,
-    Func, Inst, Module, MvGroup, MvTier, Owner, Term, Ty, UnOp, Value,
+    FpPolicy, Func, Inst, Module, MvGroup, MvTier, Owner, Term, Ty, UnOp, Value,
 };
 // `LowerError` moved to `zapc_mono` with monomorphization (#129); re-export it
 // here (and at `zapc_ir::lower::LowerError`, via `lower.rs`) unchanged.

@@ -296,6 +296,18 @@ not supported — it may change in **any** release, including a PATCH:
   expected to graduate to Stable; the standalone `@target_feature` building block
   and its unsafe-to-call-directly rule are a later addition, Experimental until
   the #139 facility's surface is finalized.
+- **Floating-point determinism policy** (`--fp=strict|default|fast` + `math.fma`,
+  #946, D-0196) — **Experimental**. The `--fp` flag selects whether codegen may
+  change FP rounding structure for speed: `default` contracts (`a*b+c` may fuse to
+  an FMA) but never reassociates reductions; `strict` is bit-exact; `fast` adds
+  reduction reassociation (warned, width-dependent). `math.fma(x, y, z)` is the
+  explicit single-rounding fused multiply-add, bit-identical across targets. The
+  three level names, the speed-by-default rule, and `math.fma`'s name + semantics
+  are intended to graduate to Stable; the exact fast-math flags, the pinned
+  reduction grouping (defined by the policy, implemented in the array kernels),
+  and the deferred `@strict_fp` region marker are Experimental until then. Integer
+  and float `min`/`max` reassociation is always sound and is not governed by this
+  flag.
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,

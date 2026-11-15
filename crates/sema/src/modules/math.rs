@@ -54,6 +54,14 @@ fn check(checker: &mut Checker, method: &str, args: &[Arg], span: Span) -> Optio
             expect_argc(checker, "math", method, args, 2, span);
             Some(Ty::Float64)
         }
+        // `fma(x, y, z)` — the explicit fused multiply-add (#946, D-0196): one
+        // rounding of `x*y + z`, portable and bit-identical across targets
+        // (hardware FMA where present, correctly-rounded libm `fma` otherwise).
+        // Three float arguments -> float64.
+        "fma" => {
+            expect_argc(checker, "math", method, args, 3, span);
+            Some(Ty::Float64)
+        }
         // One float argument -> bool.
         "isnan" | "isinf" => {
             expect_argc(checker, "math", method, args, 1, span);
