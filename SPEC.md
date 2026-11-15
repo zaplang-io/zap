@@ -1504,6 +1504,19 @@ to the end and `-0.0 == +0.0`. The sorted values match NumPy for any kind; the
 argsort index order among equal keys matches NumPy only for the stable kind
 (ties keep input order). Complex arrays have no ordering and are rejected.
 
+Searching and selection over numeric arrays (#934) match NumPy: `searchsorted(a,
+v, side=)` binary-searches a sorted `a` (`v` a scalar or an array; `side` `"left"`
+default or `"right"`); `unique(a, return_index=, return_inverse=, return_counts=)`
+returns the sorted unique values (NaNs collapse to one), or a tuple `(values[,
+index][, inverse][, counts])` when any `return_*` is set; `argmin`/`argmax(a,
+axis=)` return the first-occurrence index of the min/max (a flattened scalar
+without `axis`, else a rank-(n-1) index array) and propagate NaN (the first NaN's
+index wins); and `partition`/`argpartition(a, kth, axis=)` quickselect so the
+`kth` element (an int or a sequence) lands in its final sorted position with
+smaller elements before and larger after. These exist as methods (`a.argmin()`,
+`a.searchsorted(v)`, `a.partition(kth)` in place, …) and builtins. Partition's
+non-`kth` order is implementation-defined; complex arrays are rejected.
+
 The `@` operator (PEP 465) and `dot(a, b)` are matrix multiplication on 1-D and
 2-D arrays: 1-D · 1-D is a scalar dot product, 2-D · 2-D a matrix product, and a
 mixed 1-D/2-D operand is promoted to a row/column with its singleton axis

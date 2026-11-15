@@ -12192,6 +12192,37 @@ impl<'a> FnLower<'a> {
                 };
                 return self.lower_array_sortish(recv, d, ndim, fname == "argsort", false, &rest);
             }
+            // `unique(a, return_index=, return_inverse=, return_counts=)` (#934).
+            if fname == "unique" {
+                return self.lower_unique(args);
+            }
+            // `argmin`/`argmax`/`searchsorted`/`partition`/`argpartition`(a, ...)
+            // (#934): the array is the first positional; the rest (v/kth + axis=/
+            // side=) go to the shared lowering. Builtin partition returns a copy.
+            if matches!(
+                fname.as_str(),
+                "argmin" | "argmax" | "searchsorted" | "partition" | "argpartition"
+            ) {
+                let mut arr_arg: Option<&Expr> = None;
+                let mut rest: Vec<ast::Arg> = Vec::new();
+                for a in args {
+                    if a.name.is_none() && arr_arg.is_none() {
+                        arr_arg = Some(&a.value);
+                    } else {
+                        rest.push(a.clone());
+                    }
+                }
+                let Some(arr_expr) = arr_arg else {
+                    return Err(err(format!(
+                        "{fname}() takes the array as its first argument"
+                    )));
+                };
+                let (recv, rt) = self.expr(arr_expr)?;
+                let Ty::Array(d, ndim) = rt else {
+                    return Err(err(format!("{fname}() requires a numeric array")));
+                };
+                return self.lower_array_search(recv, d, ndim, fname, false, &rest);
+            }
             // `sorted(xs, key=..., reverse=...)` — a new sorted list, leaving the
             // input untouched (ticket #336). The list is positional; `key` /
             // `reverse` are keyword-only, same as `xs.sort(...)`.
@@ -20824,6 +20855,17 @@ impl<'a> FnLower<'a> {
             // `a.argsort(axis=, kind=)` returns a new i64 index array.
             "sort" => return self.lower_array_sortish(recv, d, ndim, false, true, args),
             "argsort" => return self.lower_array_sortish(recv, d, ndim, true, false, args),
+            // Searching / selection (#934): methods. `a.partition()` sorts in
+            // place; the rest return a new array/scalar.
+            "argmin" => return self.lower_array_search(recv, d, ndim, "argmin", false, args),
+            "argmax" => return self.lower_array_search(recv, d, ndim, "argmax", false, args),
+            "searchsorted" => {
+                return self.lower_array_search(recv, d, ndim, "searchsorted", false, args)
+            }
+            "partition" => return self.lower_array_search(recv, d, ndim, "partition", true, args),
+            "argpartition" => {
+                return self.lower_array_search(recv, d, ndim, "argpartition", false, args)
+            }
             _ => {}
         }
         // op code shared with the runtime axis kernel: 0=sum,1=min,2=max,3=prod.
@@ -21017,6 +21059,259 @@ impl<'a> FnLower<'a> {
         };
         self.throwing_call(Some(dest), func, vec![recv, axis_val, flatten_v, stable_v]);
         Ok((dest, out))
+    }
+
+    /// Build a fresh 1-element `array[d]` holding the already-lowered scalar `v`
+    /// (used for a scalar `searchsorted` `v` / an int `partition` `kth`).
+    fn build_scalar_array(&mut self, d: Dtype, v: Value, t: Ty) -> Value {
+        let one = self.iconst(Ty::I64, 1);
+        let arr = self.array_alloc_shaped(d, &[one]);
+        let zero = self.iconst(Ty::I64, 0);
+        let is_float = matches!(d, Dtype::F64 | Dtype::F32);
+        let sv = self.coerce(v, t, if is_float { Ty::F64 } else { Ty::I64 });
+        self.emit(Inst::Call {
+            dest: None,
+            func: format!("zap_array_set_{}", d.suffix()),
+            args: vec![arr, zero, sv],
+        });
+        arr
+    }
+
+    /// A keyword argument's expression, if present.
+    fn kw_arg<'b>(&self, args: &'b [ast::Arg], name: &str) -> Option<&'b Expr> {
+        args.iter()
+            .find(|a| a.name.as_deref() == Some(name))
+            .map(|a| &a.value)
+    }
+
+    /// `argmin`/`argmax`/`searchsorted`/`partition`/`argpartition` over a numeric
+    /// array (#934), as a method (receiver `recv`) or a builtin (first positional).
+    /// `rest` is the remaining arguments. `in_place` marks the `a.partition()`
+    /// method (sorts the receiver in place). Complex has no ordering → rejected.
+    fn lower_array_search(
+        &mut self,
+        recv: Value,
+        d: Dtype,
+        ndim: u8,
+        which: &str,
+        in_place: bool,
+        rest: &[ast::Arg],
+    ) -> Result<(Value, Ty), LowerError> {
+        if matches!(d, Dtype::Complex) {
+            return Err(err(format!(
+                "{which}: complex arrays have no ordering (operate on real/imag parts)"
+            )));
+        }
+        let positional: Vec<&Expr> = rest
+            .iter()
+            .filter(|a| a.name.is_none())
+            .map(|a| &a.value)
+            .collect();
+        match which {
+            "argmin" | "argmax" => {
+                let is_max = i64::from(which == "argmax");
+                let im = self.iconst(Ty::I64, is_max);
+                // An axis on a rank-(>=2) array -> a rank-(n-1) index array; no
+                // axis, or a rank-1 array -> a flattened scalar index.
+                match self.kw_arg(rest, "axis") {
+                    Some(ax) if ndim > 1 => {
+                        let (v, t) = self.expr(ax)?;
+                        let av = self.coerce(v, t, Ty::I64);
+                        let out = Ty::Array(Dtype::I64, ndim - 1);
+                        let dest = self.new_value(out);
+                        self.throwing_call(
+                            Some(dest),
+                            "zap_array_argminmax_axis",
+                            vec![recv, av, im],
+                        );
+                        Ok((dest, out))
+                    }
+                    axis => {
+                        // A rank-1 axis is validated but still yields a scalar.
+                        if let Some(ax) = axis {
+                            let (v, t) = self.expr(ax)?;
+                            let av = self.coerce(v, t, Ty::I64);
+                            self.throwing_call(None, "zap_array_axis_check", vec![recv, av]);
+                        }
+                        let dest = self.new_value(Ty::I64);
+                        self.throwing_call(Some(dest), "zap_array_argminmax", vec![recv, im]);
+                        Ok((dest, Ty::I64))
+                    }
+                }
+            }
+            "searchsorted" => {
+                if positional.len() != 1 {
+                    return Err(err("searchsorted expects (v, side=...)"));
+                }
+                let side = match self.kw_arg(rest, "side") {
+                    Some(Expr::Str {
+                        value,
+                        fstring: false,
+                        ..
+                    }) => match value.as_str() {
+                        "left" => 0,
+                        "right" => 1,
+                        _ => return Err(err("searchsorted side= must be \"left\" or \"right\"")),
+                    },
+                    Some(_) => return Err(err("searchsorted side= must be a string literal")),
+                    None => 0,
+                };
+                let sidev = self.iconst(Ty::I64, side);
+                let (vv, vt) = self.expr(positional[0])?;
+                if let Ty::Array(_, vnd) = vt {
+                    let out = Ty::Array(Dtype::I64, vnd);
+                    let dest = self.new_value(out);
+                    self.emit(Inst::Call {
+                        dest: Some(dest),
+                        func: "zap_array_searchsorted".to_string(),
+                        args: vec![recv, vv, sidev],
+                    });
+                    Ok((dest, out))
+                } else {
+                    // scalar v -> a 1-element array[d]; the result's element 0.
+                    let varr = self.build_scalar_array(d, vv, vt);
+                    let arr = self.new_value(Ty::Array(Dtype::I64, 1));
+                    self.emit(Inst::Call {
+                        dest: Some(arr),
+                        func: "zap_array_searchsorted".to_string(),
+                        args: vec![recv, varr, sidev],
+                    });
+                    let zero = self.iconst(Ty::I64, 0);
+                    let dest = self.new_value(Ty::I64);
+                    self.emit(Inst::Call {
+                        dest: Some(dest),
+                        func: "zap_array_get_i64".to_string(),
+                        args: vec![arr, zero],
+                    });
+                    Ok((dest, Ty::I64))
+                }
+            }
+            "partition" | "argpartition" => {
+                if positional.len() != 1 {
+                    return Err(err(format!("{which} expects (kth, axis=...)")));
+                }
+                let (kv, kt) = self.expr(positional[0])?;
+                // kth: an int (-> 1-element array[i64]) or an array[i64] sequence.
+                let karr = if matches!(kt, Ty::Array(..)) {
+                    kv
+                } else {
+                    self.build_scalar_array(Dtype::I64, kv, kt)
+                };
+                let axisv = match self.kw_arg(rest, "axis") {
+                    Some(e) => {
+                        let (v, t) = self.expr(e)?;
+                        self.coerce(v, t, Ty::I64)
+                    }
+                    None => self.iconst(Ty::I64, -1),
+                };
+                if which == "argpartition" {
+                    let out = Ty::Array(Dtype::I64, ndim);
+                    let dest = self.new_value(out);
+                    self.throwing_call(
+                        Some(dest),
+                        "zap_array_argpartition",
+                        vec![recv, karr, axisv],
+                    );
+                    Ok((dest, out))
+                } else if in_place {
+                    self.throwing_call(
+                        None,
+                        "zap_array_partition_inplace",
+                        vec![recv, karr, axisv],
+                    );
+                    Ok((self.iconst(Ty::I32, 0), Ty::I32))
+                } else {
+                    let out = Ty::Array(d, ndim);
+                    let dest = self.new_value(out);
+                    self.throwing_call(
+                        Some(dest),
+                        "zap_array_partitioned",
+                        vec![recv, karr, axisv],
+                    );
+                    Ok((dest, out))
+                }
+            }
+            _ => Err(err(format!(
+                "'{which}' is not an array search/select method"
+            ))),
+        }
+    }
+
+    /// `unique(a, return_index=, return_inverse=, return_counts=)` (#934): the
+    /// sorted unique values, or a tuple (values[, index][, inverse][, counts]) in
+    /// NumPy's order when any `return_*` is set. Each output recomputes the sort.
+    fn lower_unique(&mut self, args: &[ast::Arg]) -> Result<(Value, Ty), LowerError> {
+        let positional: Vec<&Expr> = args
+            .iter()
+            .filter(|a| a.name.is_none())
+            .map(|a| &a.value)
+            .collect();
+        if positional.len() != 1 {
+            return Err(err(
+                "unique() takes the array as its single positional argument",
+            ));
+        }
+        let (recv, rt) = self.expr(positional[0])?;
+        let Ty::Array(d, _) = rt else {
+            return Err(err("unique() requires a numeric array"));
+        };
+        if matches!(d, Dtype::Complex) {
+            return Err(err("unique: complex arrays have no ordering"));
+        }
+        let flag = |this: &Self, name: &str| -> Result<bool, LowerError> {
+            match this.kw_arg(args, name) {
+                Some(Expr::Bool(value, _)) => Ok(*value),
+                Some(_) => Err(err(format!("unique {name}= must be True or False"))),
+                None => Ok(false),
+            }
+        };
+        let ri = flag(self, "return_index")?;
+        let rv = flag(self, "return_inverse")?;
+        let rc = flag(self, "return_counts")?;
+        let values_ty = Ty::Array(d, 1);
+        let values = self.new_value(values_ty);
+        self.emit(Inst::Call {
+            dest: Some(values),
+            func: "zap_array_unique_values".to_string(),
+            args: vec![recv],
+        });
+        if !ri && !rv && !rc {
+            return Ok((values, values_ty));
+        }
+        // Build the tuple (values, [index], [inverse], [counts]) in NumPy's order.
+        let mut elems = vec![values_ty];
+        let mut vals = vec![values];
+        let mut add = |this: &mut Self, func: &str| {
+            let v = this.new_value(Ty::Array(Dtype::I64, 1));
+            this.emit(Inst::Call {
+                dest: Some(v),
+                func: func.to_string(),
+                args: vec![recv],
+            });
+            elems.push(Ty::Array(Dtype::I64, 1));
+            vals.push(v);
+        };
+        if ri {
+            add(self, "zap_array_unique_index");
+        }
+        if rv {
+            add(self, "zap_array_unique_inverse");
+        }
+        if rc {
+            add(self, "zap_array_unique_counts");
+        }
+        let sid = self.ctx.tuples.borrow_mut().intern(elems);
+        let dest = self.new_value(Ty::Struct(sid));
+        self.emit(Inst::StructNew { dest, sid });
+        for (idx, v) in vals.into_iter().enumerate() {
+            self.emit(Inst::FieldSet {
+                base: dest,
+                sid,
+                idx: idx as u32,
+                val: v,
+            });
+        }
+        Ok((dest, Ty::Struct(sid)))
     }
 
     /// Element-wise `+`/`-`/`*`/`/` on arrays, including scalar broadcast and

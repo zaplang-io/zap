@@ -25,6 +25,12 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Numeric-array searching / selection — own kernels** (#934, D-0191). Fifth
+  Phase 3 track (#512): `searchsorted(a, v, side=)`, `unique(a, return_index=/
+  return_inverse=/return_counts=)`, `argmin`/`argmax(a, axis=)` and `partition`/
+  `argpartition(a, kth, axis=)` (quickselect, `kth` int or sequence), as methods
+  + builtins, matching NumPy (NaN to the end, argmin/argmax propagate the first
+  NaN, unique collapses NaNs). Built on the sort floor; complex rejected.
 - **Numeric-array `sort` / `argsort` — own floor** (#932, D-0190). Fourth Phase 3
   track (#512): `a.sort()` (in place), `sort(a)` (sorted copy), `a.argsort()` /
   `argsort(a)` (an `array[i64]` of indices), matching `numpy.sort`/`argsort` (not
