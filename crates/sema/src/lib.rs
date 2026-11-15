@@ -798,7 +798,9 @@ impl Checker {
                 Type::Named { name, args, .. } => {
                     let here = match name.as_str() {
                         "bigint" => pos != Pos::Free,
-                        "complex" => matches!(pos, Pos::Key | Pos::Dtype),
+                        // `complex` is a value element and now a dense array dtype
+                        // (#938, `array[complex]`); only a hashed key is rejected.
+                        "complex" => matches!(pos, Pos::Key),
                         _ => false,
                     };
                     here || args.iter().enumerate().any(|(i, arg)| {
@@ -5893,11 +5895,14 @@ impl Checker {
                     "float" | "f64" | "float64" | "f32" | "float32"
                     | "int" | "i64" | "int64" | "i32" | "int32" | "i16" | "int16" | "i8" | "int8"
                     | "uint8" | "u8" | "u16" | "uint16" | "u32" | "uint32" | "u64" | "uint64"
-                    | "bool"));
+                    | "bool" | "complex"));
+                // A complex array (#938) additionally admits a `complex` element
+                // literal (real elements still promote to complex, imag 0).
+                let is_complex_dtype = matches!(index.as_ref(), Expr::Name(n, _) if n == "complex");
                 if !valid_dtype {
                     self.error(
                         ErrorCode::ZAP4028,
-                        "unsupported array dtype; expected f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, or bool".to_string(),
+                        "unsupported array dtype; expected f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool, or complex".to_string(),
                         expr_span(index),
                     );
                 }
@@ -5923,7 +5928,7 @@ impl Checker {
                                 continue;
                             }
                             let ty = self.infer(e);
-                            if !matches!(
+                            let numeric = matches!(
                                 ty,
                                 Ty::Unknown
                                     | Ty::Bool
@@ -5934,7 +5939,11 @@ impl Checker {
                                     | Ty::Float32
                                     | Ty::Float64
                                     | Ty::UntypedFloat
-                            ) {
+                            );
+                            // A complex array also admits `complex` element
+                            // literals (#938); a complex element in a real array is
+                            // caught in lowering.
+                            if !numeric && !(is_complex_dtype && matches!(ty, Ty::Complex)) {
                                 self.error(ErrorCode::ZAP4028, "array elements must be numeric scalars in a (possibly nested) list literal".to_string(), expr_span(e));
                             }
                         }
@@ -5957,11 +5966,11 @@ impl Checker {
                     "float" | "f64" | "float64" | "f32" | "float32"
                     | "int" | "i64" | "int64" | "i32" | "int32" | "i16" | "int16" | "i8" | "int8"
                     | "uint8" | "u8" | "u16" | "uint16" | "u32" | "uint32" | "u64" | "uint64"
-                    | "bool"));
+                    | "bool" | "complex"));
                 if !valid_dtype {
                     self.error(
                         ErrorCode::ZAP4028,
-                        "unsupported array dtype; expected f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, or bool".to_string(),
+                        "unsupported array dtype; expected f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool, or complex".to_string(),
                         expr_span(index),
                     );
                 }
@@ -9975,20 +9984,21 @@ def main():
 
     #[test]
     fn bigint_complex_collection_elements_still_rejected() {
-        // `bigint` has no collection slot in any position (ZAP4024). `complex`
-        // (#928) is admitted as a VALUE element but is still rejected as a
-        // dict/set key, a heap element, or an array dtype.
+        // `bigint` has no collection slot in any position (ZAP4024). `complex` is
+        // admitted as a VALUE element (#928) and as a dense array dtype (#938,
+        // `array[complex]`), but is still rejected as a dict/set key or a heap
+        // element.
         for source in [
             "list[bigint] x = []",
             "dict[str, bigint] x = {}",
             "dict[bigint, str] x = {}",
             "set[bigint] x = set()",
             "heap[bigint] x = heap[bigint]()",
-            // complex in a key / ordered / dtype position:
+            "array[bigint] x = array[bigint]()",
+            // complex in a key / ordered position:
             "dict[complex, str] x = {}",
             "set[complex] x = set()",
             "heap[complex] x = heap[complex]()",
-            "array[complex] x = array[complex]()",
             // bigint/complex nested inside a container-held tuple stay rejected.
             "list[(complex, int)] x = []",
         ] {
@@ -10011,6 +10021,8 @@ def main():
             "channel[complex] x = channel[complex]()",
             "list[list[complex]] x = []",
             "dict[str, list[complex]] x = {}",
+            // #938: a dense complex array dtype.
+            "array[complex] x = array[complex]()",
         ] {
             let source = format!("def main():\n    {source}\n");
             assert!(
@@ -10391,7 +10403,6 @@ def main():
     fn unsupported_array_constructors_are_diagnosed() {
         for value in [
             "array[str]([1])",
-            "array[complex]([1])",
             "array[f64]([\"x\"])",
             "array[f64]([[\"x\"]])", // a non-numeric leaf, even nested, is rejected
             "array[f64]()",

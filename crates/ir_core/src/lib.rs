@@ -158,6 +158,17 @@ pub enum Dtype {
     /// Boolean mask (`bool`), stored as a 0/1 byte. Arithmetic on bools
     /// promotes to `uint8` (see [`Dtype::promote`]).
     Bool,
+    /// Complex `f64` pair — NumPy `complex128` (#938). Each element is 16 bytes,
+    /// two contiguous `f64` lanes (real, imag). Unlike every other dtype, a
+    /// complex element is *not* a single scalar LLVM value, so it never flows
+    /// through the generic SIMD element-wise kernel or the generic get/set path:
+    /// every complex-array operation (construction, get/set, element-wise
+    /// arithmetic, conj/abs, Display) is routed to a dedicated `zap_array_*complex`
+    /// runtime helper by the lowering. The codegen storage plumbing arms below are
+    /// therefore only ever consulted for the element *size* (16 bytes) and the
+    /// dtype *code*; [`Dtype::storage_ty`] is never used to lay a complex element
+    /// out inline. Introduced so `fft` and `linalg.eig` can return complex arrays.
+    Complex,
 }
 
 impl Dtype {
@@ -168,7 +179,11 @@ impl Dtype {
     /// load). So `a[i]` and `sum(a)` are ordinary `int64`/`float64`; the compact
     /// storage width is [`Dtype::storage_ty`].
     pub fn ty(self) -> Ty {
-        if self.is_float() {
+        if matches!(self, Dtype::Complex) {
+            // A complex element reads back as the scalar `complex` (#938): a
+            // `ZapComplex` pointer, materialised by the runtime get helper.
+            Ty::Complex
+        } else if self.is_float() {
             Ty::F64
         } else {
             Ty::I64
@@ -186,11 +201,18 @@ impl Dtype {
             Dtype::I32 | Dtype::U32 => Ty::I32,
             Dtype::I16 | Dtype::U16 => Ty::I16,
             Dtype::I8 | Dtype::Uint8 | Dtype::Bool => Ty::I8,
+            // Placeholder: a complex element is a 16-byte (2×f64) inline slot that
+            // never flows through the generic SIMD / get / set path (the lowering
+            // routes every complex-array op to a runtime helper), so this is never
+            // used to lay one out. One of its two `f64` lanes is the honest stand-in.
+            Dtype::Complex => Ty::F64,
         }
     }
     /// The size in bytes of one stored element (the SIMD load/store alignment).
     pub fn elem_size(self) -> u32 {
         match self {
+            // Two contiguous `f64` lanes (real, imag).
+            Dtype::Complex => 16,
             Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
             Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
             Dtype::I16 | Dtype::U16 => 2,
@@ -211,6 +233,7 @@ impl Dtype {
             Dtype::U32 => "u32",
             Dtype::U64 => "u64",
             Dtype::Bool => "bool",
+            Dtype::Complex => "complex",
         }
     }
     /// The runtime dtype tag passed to `zap_array_new`/`_new_nd` (matches the
@@ -229,6 +252,7 @@ impl Dtype {
             Dtype::U16 => 8,
             Dtype::U32 => 9,
             Dtype::U64 => 10,
+            Dtype::Complex => 11,
         }
     }
     pub fn is_float(self) -> bool {
@@ -259,6 +283,8 @@ impl Dtype {
             Dtype::I64 | Dtype::U64 => 64,
             Dtype::F32 => 32,
             Dtype::F64 => 64,
+            // Not meaningful (complex is handled before any int/float width path).
+            Dtype::Complex => 128,
         }
     }
     /// The integer dtype of a given signedness and width (8/16/32/64 bits).
@@ -286,6 +312,11 @@ impl Dtype {
     /// (`True + True == 2`), and `bool` otherwise defers to the other operand.
     pub fn promote(a: Dtype, b: Dtype) -> Dtype {
         use Dtype::*;
+        // `complex` dominates every real dtype (#938): real ↔ complex, and
+        // complex ↔ complex, both yield `complex`.
+        if matches!(a, Complex) || matches!(b, Complex) {
+            return Complex;
+        }
         // `bool` is the weakest; arithmetic never yields it.
         match (a, b) {
             (Bool, Bool) => return Uint8,
@@ -327,6 +358,10 @@ impl Dtype {
     /// array's width (`f32_buf + 1.5 -> f32`) and otherwise forces `f64`. A
     /// `bool` array promotes to `uint8` first (arithmetic, not a mask).
     pub fn promote_scalar(arr: Dtype, scalar_is_float: bool) -> Dtype {
+        // A complex array stays complex under a real scalar broadcast (#938).
+        if matches!(arr, Dtype::Complex) {
+            return Dtype::Complex;
+        }
         if scalar_is_float {
             if arr.is_float() {
                 arr

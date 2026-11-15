@@ -2283,8 +2283,10 @@ fn dtype_of(t: &ast::Type, env: &TyEnv) -> Result<Dtype, LowerError> {
         Ty::U32 => Ok(Dtype::U32),
         Ty::U64 => Ok(Dtype::U64),
         Ty::I1 => Ok(Dtype::Bool),
+        // A complex array (#938): dense NumPy `complex128` (two f64 lanes).
+        Ty::Complex => Ok(Dtype::Complex),
         other => Err(err(format!(
-            "array[{other}] is not a numeric dtype (f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool)"
+            "array[{other}] is not a numeric dtype (f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool, complex)"
         ))),
     }
 }
@@ -2313,8 +2315,9 @@ fn dtype_from_name(name: &str) -> Result<Dtype, LowerError> {
         "uint32" | "u32" => Ok(Dtype::U32),
         "uint64" | "u64" => Ok(Dtype::U64),
         "bool" => Ok(Dtype::Bool),
+        "complex" => Ok(Dtype::Complex),
         other => Err(err(format!(
-            "array[{other}] is not a numeric dtype (f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool)"
+            "array[{other}] is not a numeric dtype (f32/f64, i8/i16/i32/i64, u8/u16/u32/u64, bool, complex)"
         ))),
     }
 }
@@ -11400,6 +11403,18 @@ impl<'a> FnLower<'a> {
                         ));
                     }
                     if matches!(op, AstUn::Neg) {
+                        // A complex array negates element-wise (#938); other array
+                        // dtypes can negate via `0 - a` (an element-wise binop).
+                        if let Ty::Array(Dtype::Complex, nd) = t {
+                            let out = Ty::Array(Dtype::Complex, nd);
+                            let dest = self.new_value(out);
+                            self.emit(Inst::Call {
+                                dest: Some(dest),
+                                func: "zap_array_cneg".to_string(),
+                                args: vec![v],
+                            });
+                            return Ok((dest, out));
+                        }
                         return Err(err("element-wise unary array operations are unsupported"));
                     }
                 }
@@ -14822,7 +14837,14 @@ impl<'a> FnLower<'a> {
         let setter = format!("zap_array_set_{}", dtype.suffix());
         for (i, e) in flat.iter().enumerate() {
             let (v, vt) = self.expr(e)?;
-            if vt.int_width().is_none() && !vt.is_float() {
+            // Numeric scalars fill any array; a `complex` element additionally
+            // fills a `complex` array (#938). Real elements of a complex array
+            // promote to `complex` via `coerce` (imag 0), matching NumPy's
+            // `np.array([1, 2], dtype=complex)`.
+            let elem_ok = vt.int_width().is_some()
+                || vt.is_float()
+                || (matches!(dtype, Dtype::Complex) && matches!(vt, Ty::Complex));
+            if !elem_ok {
                 return Err(err(
                     "array construction requires numeric scalars in a (possibly nested) list literal",
                 ));
@@ -20737,6 +20759,35 @@ impl<'a> FnLower<'a> {
                 });
                 return Ok((dest, out));
             }
+            // Complex support (#938): `a.conj()` -> complex array (conjugate; a
+            // real receiver lifts to complex with imag 0), `a.abs()` -> f64 array
+            // of magnitudes (|z| for complex, |x| for a real dtype).
+            "conj" => {
+                if !args.is_empty() {
+                    return Err(err("conj() takes no arguments"));
+                }
+                let out = Ty::Array(Dtype::Complex, ndim);
+                let dest = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_array_conj".to_string(),
+                    args: vec![recv],
+                });
+                return Ok((dest, out));
+            }
+            "abs" => {
+                if !args.is_empty() {
+                    return Err(err("abs() takes no arguments"));
+                }
+                let out = Ty::Array(Dtype::F64, ndim);
+                let dest = self.new_value(out);
+                self.emit(Inst::Call {
+                    dest: Some(dest),
+                    func: "zap_array_cabs".to_string(),
+                    args: vec![recv],
+                });
+                return Ok((dest, out));
+            }
             _ => {}
         }
         // op code shared with the runtime axis kernel: 0=sum,1=min,2=max,3=prod.
@@ -20749,8 +20800,8 @@ impl<'a> FnLower<'a> {
             other => {
                 return Err(err(format!(
                     "'{other}' is not an array method; the array methods are \
-                     reductions sum/min/max/mean/prod (optional axis=) and shape \
-                     ops reshape/transpose/flatten"
+                     reductions sum/min/max/mean/prod (optional axis=), shape \
+                     ops reshape/transpose/flatten, and conj/abs"
                 )))
             }
         };
@@ -20876,6 +20927,14 @@ impl<'a> FnLower<'a> {
                 ))
             }
         };
+        // A `complex` operand (a complex array, or a complex scalar against an
+        // array) routes to the complex runtime helpers (#938): a complex element
+        // is a 16-byte 2×f64 slot, not a scalar SIMD lane, so it never flows
+        // through `Inst::ArrayBinOp`.
+        let is_cx = |t: Ty| matches!(t, Ty::Complex) || matches!(t, Ty::Array(Dtype::Complex, _));
+        if is_cx(lt) || is_cx(rt) {
+            return self.complex_array_binop(op, l, lt, r, rt);
+        }
         let is_div = matches!(op, Div);
         // NumPy true division always yields a float: an integer elementwise
         // result dtype lifts to `f64` (#506). Float dtypes are unchanged.
@@ -20971,6 +21030,76 @@ impl<'a> FnLower<'a> {
             }
             _ => Err(err(
                 "unsupported array operand (element-wise ops take two arrays or an array and a numeric scalar)",
+            )),
+        }
+    }
+
+    /// Element-wise `+`/`-`/`*`/`/` where a `complex` operand is involved (#938),
+    /// routed to the complex runtime helpers. `array ⊗ array` (either operand real
+    /// or complex) → `zap_array_cbinop`; `array ⊗ scalar` → `zap_array_cbinop_cs`
+    /// (a real scalar is boxed to a `complex` with a zero imaginary part, so one
+    /// helper covers both). The result is always a `complex` array.
+    fn complex_array_binop(
+        &mut self,
+        op: AstBin,
+        l: Value,
+        lt: Ty,
+        r: Value,
+        rt: Ty,
+    ) -> Result<(Value, Ty), LowerError> {
+        use AstBin::*;
+        let opcode = match op {
+            Add => 0,
+            Sub => 1,
+            Mul => 2,
+            Div => 3,
+            _ => return Err(err("only +, -, *, and / are supported on complex arrays")),
+        };
+        let opc = self.iconst(Ty::I64, opcode);
+        let is_scalar = |t: Ty| t.is_float() || t.int_width().is_some() || matches!(t, Ty::Complex);
+        // Box a scalar operand into a `complex` value (a real scalar → imag 0).
+        let to_complex = |s: &mut FnLower, v: Value, t: Ty| -> Value {
+            if matches!(t, Ty::Complex) {
+                v
+            } else {
+                let f = s.coerce(v, t, Ty::F64);
+                let zc = s.new_value(Ty::Complex);
+                s.emit(Inst::Call {
+                    dest: Some(zc),
+                    func: "zap_complex_from_f64".to_string(),
+                    args: vec![f],
+                });
+                zc
+            }
+        };
+        match (lt, rt) {
+            (Ty::Array(_, lnd), Ty::Array(_, rnd)) => {
+                let rank = lnd.max(rnd);
+                self.throwing_call(None, "zap_array_broadcast_check", vec![l, r]);
+                let out = Ty::Array(Dtype::Complex, rank);
+                let d = self.new_value(out);
+                self.throwing_call(Some(d), "zap_array_cbinop", vec![l, r, opc]);
+                Ok((d, out))
+            }
+            (Ty::Array(_, lnd), _) if is_scalar(rt) => {
+                let zc = to_complex(self, r, rt);
+                let scalar_lhs = self.iconst(Ty::I64, 0);
+                let out = Ty::Array(Dtype::Complex, lnd);
+                let d = self.new_value(out);
+                self.throwing_call(Some(d), "zap_array_cbinop_cs", vec![l, zc, opc, scalar_lhs]);
+                Ok((d, out))
+            }
+            (_, Ty::Array(_, rnd)) if is_scalar(lt) => {
+                // `-`/`/` are non-commutative, so the scalar stays on the left.
+                let scalar_lhs = self.iconst(Ty::I64, i64::from(!matches!(op, Add | Mul)));
+                let zc = to_complex(self, l, lt);
+                let out = Ty::Array(Dtype::Complex, rnd);
+                let d = self.new_value(out);
+                self.throwing_call(Some(d), "zap_array_cbinop_cs", vec![r, zc, opc, scalar_lhs]);
+                Ok((d, out))
+            }
+            _ => Err(err(
+                "unsupported complex array operand (element-wise ops take two arrays or an array and a numeric scalar)",
             )),
         }
     }

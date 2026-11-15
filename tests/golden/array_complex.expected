@@ -1,0 +1,12 @@
+get (3+4j) (0-5j) 2 1
+real (5+0j) (2+0j)
+add (3+5j) (1-5j)
+sub (3+3j)
+mul (-4+3j) (0-5j)
+div (4-3j)
+scal (6+8j) (-4+3j)
+neg (-3-4j)
+conj (3-4j)
+abs 5.0 5.0
+sum (3-1j)
+mix (8+4j)

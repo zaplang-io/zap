@@ -1395,7 +1395,7 @@ longer-term N-D design in `design/0002-arrays.md`.
 
 | Surface | Supported now |
 | --- | --- |
-| Dtypes | floats `f32`/`f64`, signed `i8`/`i16`/`i32`/`i64`, unsigned `u8`/`u16`/`u32`/`u64`, `bool` |
+| Dtypes | floats `f32`/`f64`, signed `i8`/`i16`/`i32`/`i64`, unsigned `u8`/`u16`/`u32`/`u64`, `bool`, and `complex` (dense `complex128`: a 16-byte `(re, im)` f64 pair; `a[i]` is a complex scalar) |
 | Construction | A positional list literal, flat (`array[f64]([1, 2.5])`, 1-D) or **nested rectangular** (`array[f64]([[1, 2], [3, 4]])`, N-D); empty / zero-axis literals are allowed |
 | Constructors | `zeros[T](shape)`, `ones[T](shape)`, `full[T](shape, v)` (shape = an int or a tuple literal); `arange[T](start, stop[, step])`; `linspace[T](start, stop, num)` |
 | Elementwise math | `math.sqrt`/`exp`/`log`/`sin`/`cos`/`tan`/`fabs` applied to an array map over it, returning a new float array (`f32`→`f32`, else `f64`) |
@@ -1449,6 +1449,18 @@ an N-D axis-0 window `m[lo:hi]` (rank-preserving), and a sliced axis inside a
 multi-axis index `m[:, j]` all share the parent buffer, so a write through the
 view is visible through the parent. A zero step is an error. Arithmetic over a
 strided operand transparently compacts it to a contiguous copy first.
+
+**Complex arrays** (`array[complex]`, #938) are dense `complex128`: each element a
+16-byte `(re, im)` f64 pair, and `a[i]` a `complex` scalar (rendered `(re±imj)`).
+They are constructed from `complex` literals, or from real / integer literals
+promoted to complex (imaginary part 0, as `np.array([1, 2], dtype=complex)`).
+Element-wise `+`/`-`/`*`/`/` (array⊗array of equal shape, or array⊗scalar with a
+real or complex scalar), unary negation, `a.conj()` (→ a complex array) and
+`a.abs()` (→ an `f64` array of magnitudes), whole-array `sum(a)`, and real⊗complex
+promotion (a real operand against a complex one yields a complex result) all apply
+element-wise. In this first increment complex element-wise ops require equal
+shapes (dim-stretch broadcasting is a follow-up), and the per-axis reductions and
+`min`/`max`/`prod`/`mean` are real-only.
 
 The `@` operator (PEP 465) and `dot(a, b)` are matrix multiplication on 1-D and
 2-D arrays: 1-D · 1-D is a scalar dot product, 2-D · 2-D a matrix product, and a

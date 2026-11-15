@@ -2480,6 +2480,35 @@ impl<'a, 'ctx> Cg<'a, 'ctx> {
         self.declare_rt("zap_array_get_f32", &[p.into(), i.into()], Some(f.into()));
         self.declare_rt("zap_array_set_f32", &[p.into(), i.into(), f.into()], None);
         self.declare_rt("zap_array_sum_f32", &[p.into()], Some(f.into()));
+        // complex128 arrays (#938): get/set a `complex` element (a ZapComplex
+        // pointer), the element-wise helpers (array⊗array and array⊗scalar, op
+        // code 0/1/2/3 = +/-/×/÷), conj/abs, and the whole-array complex sum. The
+        // lowering routes every complex-array op to one of these (a complex
+        // element is a 16-byte 2×f64 slot, not a scalar SIMD lane).
+        self.declare_rt(
+            "zap_array_get_complex",
+            &[p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_set_complex",
+            &[p.into(), i.into(), p.into()],
+            None,
+        );
+        self.declare_rt("zap_array_sum_complex", &[p.into()], Some(p.into()));
+        self.declare_rt(
+            "zap_array_cbinop",
+            &[p.into(), p.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt(
+            "zap_array_cbinop_cs",
+            &[p.into(), p.into(), i.into(), i.into()],
+            Some(p.into()),
+        );
+        self.declare_rt("zap_array_conj", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_array_cabs", &[p.into()], Some(p.into()));
+        self.declare_rt("zap_array_cneg", &[p.into()], Some(p.into()));
         // Reductions (#507, D-0170): min/max/prod keep the dtype (an int word
         // for integer/bool dtypes, an f64 word for float dtypes); mean always
         // returns an f64 word (the lowering narrows to f32 for an f32 source).
