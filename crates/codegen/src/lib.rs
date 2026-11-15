@@ -8113,8 +8113,13 @@ mod tests {
         let ir = llvm_ir(
             "def main():\n    auto a = array[f64]([1.0, 2.0, 3.0, 4.0, 5.0])\n    auto b = array[f64]([5.0, 4.0, 3.0, 2.0, 1.0])\n    print(sum(a + b))\n",
         );
+        // Normalize away the FP-policy fast-math flags (#946): under the default
+        // policy codegen stamps `contract` on float ops, so the opcode prints as
+        // `fadd contract <4 x double>`. Strip the flag tokens so this structural
+        // (vectorization-happened) assertion is policy-independent.
+        let v = ir.replace(" contract", "").replace(" reassoc", "");
         assert!(
-            ir.contains("fadd <4 x double>"),
+            v.contains("fadd <4 x double>"),
             "expected a vectorized fadd in IR:\n{ir}"
         );
     }
@@ -8130,7 +8135,13 @@ mod tests {
         let ir = llvm_ir(
             "def main():\n    auto a = array[f64]([[1.0, 2.0, 3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0, 10.0]])\n    auto b = array[f64]([5.0, 4.0, 3.0, 2.0, 1.0])\n    print(sum(a + b))\n",
         );
-        let n = ir.matches("fadd <4 x double>").count();
+        // Strip the FP-policy fast-math flags (#946) before counting — see
+        // `array_elementwise_vectorizes_f64`.
+        let n = ir
+            .replace(" contract", "")
+            .replace(" reassoc", "")
+            .matches("fadd <4 x double>")
+            .count();
         assert!(
             n >= 2,
             "expected the broadcast path to also vectorize (saw {n} vector fadds, \
@@ -8246,8 +8257,11 @@ mod tests {
         );
         // The scalar is broadcast across lanes (a constant splat folds to a
         // constant vector) and the multiply is still vectorized.
+        // Strip the FP-policy fast-math flags (#946) — see
+        // `array_elementwise_vectorizes_f64`.
+        let v = ir.replace(" contract", "").replace(" reassoc", "");
         assert!(
-            ir.contains("fmul <4 x double>"),
+            v.contains("fmul <4 x double>"),
             "expected a vectorized fmul for scalar broadcast:\n{ir}"
         );
     }
