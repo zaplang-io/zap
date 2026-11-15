@@ -273,6 +273,17 @@ not supported — it may change in **any** release, including a PATCH:
   format is diagnostic output (below) and is not itself a covered surface — its
   exact wording, the coroutine names, the byte-span locations, and the non-zero
   exit code (66) may change.
+- **`sys` CPU-feature introspection** (`sys.cpu_has(name)` / `sys.cpu_source()` /
+  `sys.cpu_sve_vl()`, #943, D-0192) — **Experimental**. A read-only query over the
+  `cpu_features` detector, keyed by stable documented feature **names** (`"avx2"`,
+  `"neon"`, `"sve"`, …; case-insensitive, aliases accepted); an unknown or
+  arch-foreign name is false, never an error. It is diagnostics/observability only
+  — the internal feature-bit taxonomy and the dispatch mechanism (#944) are NOT a
+  public surface (§1.5). The *names* are intended to graduate to Stable (stability
+  is on the names, not the bit indices); the methods are Experimental until the
+  #139 facility's programmer-facing surface (`arch.cpu.has`) is finalized, and the
+  flat `sys.cpu_*` spelling may be superseded by a nested `sys.cpu.*` facade. The
+  rest of `sys` (§4's Stable list) is unaffected.
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,

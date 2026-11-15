@@ -9435,3 +9435,72 @@ distinct from `list`/`sorted`. Complex has no ordering → rejected.
 Relates to #934 / #512 (Phase 3 epic, now complete bar the held SIMD ceiling
 #933), D-0190 (the sort floor these build on). The SIMD sort accelerator (#933)
 remains held pending the #920 dispatch-facility decision and SIMD CI hardware.
+
+## D-0192 — `cpu_features` runtime detection (ISA-acceleration epic #139 / #943)
+**Status:** implemented
+The shared CPU-capability detection layer the whole ISA-acceleration facility
+(Discussion #920) is built on: one process-lifetime-constant struct, computed
+once and read-only thereafter, that every future multiversioning resolver (#944)
+and every `arch.*` intrinsic reads to pick a kernel variant. First concrete
+slice of #139; #944 (multiversioning codegen/dispatch) and #945 (SIMD memchr)
+build on it. Design snapshot: #920 comment 4.
+- **Shape.** A `zap_cpu_t { uint64_t feat[2]; uint16_t sve_vl_bytes; uint8_t
+  avx10_level; uint8_t source; }` in the C runtime, published once with
+  acquire/release and warmed by a constructor. `zap_cpu()` (cached pointer),
+  `zap_cpu_has(idx)` (hides the word-split across `feat[2]`), `zap_cpu_has_name()`
+  (stable-name query). A 128-bit set from day one removes the "is 64 enough?"
+  question; levels (SVE width, AVX10) are integers, not bits, modelling the
+  hardware honestly and keeping the bitset lean.
+- **Single source of truth for bit positions.** The feature indices live in ONE
+  shared header, `crates/codegen/src/zap_cpu_features.h`, consumed by both the C
+  detector (`zapcpu.inc.c`) and codegen's Rust mirror (`cpu_features.rs`); a unit
+  test parses the header and asserts the two agree, bit for bit. Drift between
+  "codegen thinks AVX2 is bit 2" and "the runtime sets it as bit 3" is a silent
+  mis-dispatch no single build catches — same cross-boundary footgun class as
+  `inst_dest` / the `zapc_ir` re-exports. Per-arch namespacing (a binary runs on
+  one arch) lets x86 and aarch64 reuse the same bit positions.
+- **Curated taxonomy**, not raw silicon — a feature earns a bit only when a
+  clone will dispatch on it, so bit growth tracks kernels written, not flags
+  shipped. x86: `SSE2` (baseline) · `SSE42` · `AVX2_FMA` (bundled; they
+  co-arrived on Haswell) · `AVX512F`. aarch64: `NEON` (baseline) · `AES` · `SHA2`
+  · `CRC32` · `DOTPROD` · `I8MM` · `SVE` · `SVE2` · `SME`. The scalable SVE clone
+  is a first-class member of the aarch64 clone set (`sve_vl_bytes` carries its
+  runtime width), so an SVE/SME retrofit is not foreclosed (#920 comment 3).
+- **Detection backends** (one C file, `#if` arms + a baseline fallback): x86
+  `CPUID` leaf 1/7 **plus `XGETBV`/XCR0** — a vector tier is reported ABSENT
+  unless the OS actually saves the wide state, not merely because the CPUID bit
+  is set (the mandatory XCR0 gate; SSE2/SSE4.2 run on the always-saved XMM regs
+  and need no gate); aarch64 Linux `getauxval(AT_HWCAP/AT_HWCAP2)` + SVE VL via
+  `prctl(PR_SVE_GET_VL)`; aarch64 macOS `sysctlbyname("hw.optional.arm.*")`;
+  aarch64 Windows `IsProcessorFeaturePresent`; else `GENERIC`. Baseline is
+  mandatory (SSE2 / NEON), so even total detection failure yields a correct
+  conservative answer, never a crash.
+- **Malloc-free & reentrant.** No malloc, no constructor-dependent locks, no I/O
+  on the compute path, so an ifunc resolver (#944) may call `zap_cpu()` during
+  relocation, before libc init. A benign recompute race is harmless (the answer
+  is identical).
+- **Environment overrides are DOWNGRADE-ONLY.** `ZAP_CPU=generic` forces the
+  baseline (the one knob that lets the CI / qemu matrix exercise the fallback
+  clone on capable silicon); `ZAP_NO_AVX512=1` is the Intel down-clock escape
+  hatch; `ZAP_DISABLE_CPU_FEATURES="avx2 sse42 …"` drops named features (NumPy's
+  `NPY_DISABLE_CPU_FEATURES` precedent). They may only ever CLEAR bits, never set
+  one — adding a feature the silicon lacks would reintroduce a SIGILL — and the
+  override logic is structurally AND-NOT-only, with the baseline re-asserted so
+  the floor is never emptied.
+- **Programmer exposure: stable NAMES only.** A read-only `sys.cpu_has("avx2")` /
+  `sys.cpu_source()` / `sys.cpu_sve_vl()` introspection surface, keyed by stable
+  documented names (stability on the names, not the churning internal bit
+  indices); an unknown or arch-foreign name is false, never an error. This is for
+  diagnostics/observability — dispatch itself stays hidden and remains internal
+  to #944. The flat `sys.cpu_*` spelling fits the existing module seam; a nested
+  `sys.cpu.*` / `arch.cpu.has` facade is a later ergonomic wrapper.
+- **Testing.** The detection core is split into pure, host-independent helpers
+  (x86 bit-assembly + XCR0 gating, aarch64 HWCAP mapping, the name tables, the
+  env downgrade), exercised with synthetic inputs by a standalone C harness
+  (`zapcpu_test.c`, driven by a cargo test) so x86 and aarch64 paths are both
+  covered on any one host — no single CI box can fake the other arch's silicon.
+  The header/Rust agreement and per-arch dense-numbering invariants are Rust unit
+  tests. On-silicon per-clone selection under `qemu -cpu` rides the 4-box CI
+  matrix (an acceptance criterion carried forward into #944/#945).
+Relates to epic #139, Discussion #920 (comment 4), and the deferred `arch.*`
+curated-intrinsics surface specced in #139. Consumed by #944 and #945.

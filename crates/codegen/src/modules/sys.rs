@@ -14,4 +14,9 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     cg.declare_rt("zap_sys_argv", &[], Some(p.into()));
     cg.declare_rt("zap_sys_exit", &[i.into()], None);
     cg.declare_rt("zap_sys_platform", &[], Some(p.into()));
+    // CPU-feature introspection (#943, epic #139). cpu_has takes a str (ptr) and
+    // returns an i64 0/1; cpu_source returns a str (ptr); cpu_sve_vl returns i64.
+    cg.declare_rt("zap_sys_cpu_has", &[p.into()], Some(i.into()));
+    cg.declare_rt("zap_sys_cpu_source", &[], Some(p.into()));
+    cg.declare_rt("zap_sys_cpu_sve_vl", &[], Some(i.into()));
 }

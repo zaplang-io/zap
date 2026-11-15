@@ -117,6 +117,7 @@ representation, object layout, calling convention, entry points) is
 |---|---|
 | [`crates/codegen/src/zaprt.c`](../crates/codegen/src/zaprt.c) | The runtime (~12k lines): object/string/collection entry points, the **M:N scheduler & coroutines** (ucontext-based), the **netpoller** (epoll/kqueue drives), **signals/preemption/faults**, CSPRNG, GC thread hooks |
 | [`crates/codegen/src/zapgc.inc.c`](../crates/codegen/src/zapgc.inc.c) | The **precise Immix GC** (default collector), incl. `zap_gc_stats` heap accounting |
+| `crates/codegen/src/zapcpu.inc.c` + `zap_cpu_features.h` | **`cpu_features`** runtime detection (#943, epic #139, D-0192): malloc-free, compute-once CPU-capability probe (CPUID/XCR0, HWCAP, macOS sysctl, Windows) read by future multiversioning resolvers (#944) and `arch.*` intrinsics. The `.h` is the single source of truth for the feature-bit taxonomy, mirrored in Rust by `cpu_features.rs` and locked by an agreement test |
 | `crates/codegen/src/zap_np_iocp.c` / `.h` | Windows IOCP netpoller (A2) |
 | `crates/codegen/src/zap_ctx_win_x64.c` | Windows x64 coroutine context switch (A1) |
 | `crates/codegen/src/zap_win_a3.c` | Windows signals/faults via SEH (A3) |

@@ -1,0 +1,3 @@
+baseline_survives
+no_avx2
+no_sve

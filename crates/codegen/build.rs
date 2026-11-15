@@ -34,6 +34,10 @@ fn main() {
         // vendored NumPy ziggurat tables it includes.
         "src/zaprandom.inc.c",
         "src/ziggurat_constants.h",
+        // cpu_features detector (#943, epic #139): the shared bit-taxonomy header
+        // and the detection module that includes it.
+        "src/zap_cpu_features.h",
+        "src/zapcpu.inc.c",
     ];
     for f in EMBEDDED_RUNTIME_FILES {
         println!("cargo:rerun-if-changed={f}");
