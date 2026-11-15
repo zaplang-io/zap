@@ -9158,3 +9158,52 @@ column-major-transpose + Fortran-interface approach.
 Remaining `numpy.linalg` surface — `eig`/`eigh`/`lstsq`/`norm`/`pinv` — is the
 next slice (#928). Relates to #927 / #512 (Phase 3 epic), #926/D-0183 (the first
 linalg slice), #912/D-0179 (the seam).
+
+## D-0185 — `import linalg`: eig / lstsq / norm / pinv / matrix_power (#928)
+**Status:** implemented (linalg eigensolvers / least squares / norms slice)
+Third `linalg` slice of the Phase 3 numeric-breadth epic (#512), continuing the
+Fortran-LAPACK + column-major-transpose approach of D-0183/D-0184.
+- **Surface** (NumPy-shaped, f64):
+  - `eigvals(a) -> list[complex]` — general matrix eigenvalues via `dgeev` (no
+    vectors). Real matrices have real or conjugate-pair eigenvalues; LAPACK yields
+    each pair consecutively, +imag member first. Order is otherwise LAPACK's (not
+    sorted — matches `numpy.linalg.eigvals`).
+  - `eigh(a) -> (w, v)` / `eigvalsh(a) -> w` — symmetric matrix via `dsyevd`
+    (lower triangle). Eigenvalues `w` real and **ascending**; `v`'s columns are
+    the orthonormal eigenvectors.
+  - `lstsq(a, b) -> (x, residuals, rank, singular_values)` — minimum-norm least
+    squares via `dgelsd` (SVD-based, rank-revealing). `rank` is an int; residuals
+    are present only when `m>n` and the system has full column rank (else an empty
+    array), mirroring NumPy.
+  - `norm(a[, ord]) -> f64` — vector (1-D) and matrix (2-D). Default (`ord`
+    omitted) is the 2-norm (vector) / Frobenius (matrix). Supported ords: vector
+    1 / 2 / ±inf / p; matrix 1 / −1 (max/min column abs-sum), +inf / −inf (max/min
+    row abs-sum), 2 / −2 (largest / smallest singular value via `dgesdd`).
+  - `pinv(a)` — Moore–Penrose pseudo-inverse via the reduced SVD, reciprocating
+    singular values above `rcond·σ_max` (NumPy's default `rcond = 1e-15`).
+  - `matrix_power(a, p)` — integer power by binary exponentiation over the array
+    matmul (#904); `p == 0` is the identity, `p < 0` inverts first.
+- **`eig` deferred.** `eig` returns the eigenvectors of a general matrix — a
+  **complex matrix** — which needs a complex array dtype Zap does not have (only a
+  scalar `complex`). `eigvals` ships (eigenvalues fit a `list[complex]`), but `eig`
+  itself is deferred and tracked until a complex array dtype exists.
+- **`ord` encoding.** `norm`'s optional `ord` is a single `f64`: integer orders
+  are written as `1` / `2`, the infinity orders as `math.inf` / `-math.inf`, and
+  `ord` omitted lowers to a NaN sentinel the runtime reads as "default". String
+  orders (`'fro'` / `'nuc'`) are a follow-up — the default already gives Frobenius.
+- **`list[complex]` (a core prerequisite).** `eigvals` returns a `list[complex]`,
+  which collections previously rejected. This slice adds a `complex` **value**
+  element kind (`Elem::Complex`): physically a `ZapComplex` pointer word (so it
+  pushes/reads/GC-traces through the `_ptr` path) that retains complex identity so
+  read-back recovers `complex` (arithmetic, indexing, iteration) and Display
+  renders it `(re±imj)`. Admitted in value positions (list element, dict value,
+  channel element); `complex` as a hashed dict/set **key** stays a follow-up.
+- **Determinism.** Eigenvector signs (`eigh`'s `v`) and the SVD-computed `lstsq`
+  solution are gauge-ambiguous / fp-dependent, so the goldens/contracts pin only
+  the well-defined facts (eigenvalues, singular values, shapes, rank, residual
+  presence, exact integer/inf norms, the orthonormal-column pinv); full numeric
+  reconstruction is host-verified against Apple Accelerate, not the goldens.
+This finishes the `numpy.linalg` surface for this epic (bar the complex-matrix
+`eig`). Relates to #928 / #512 (Phase 3 epic), #926/D-0183 + #927/D-0184 (the
+earlier linalg slices), #912/D-0179 (the seam), #904/D-0181 (matmul, for
+matrix_power).

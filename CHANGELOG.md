@@ -25,6 +25,21 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **`linalg` eigensolvers / least squares / norms / pinv / matrix_power** (#928,
+  D-0185). Third `linalg` slice (Phase 3 epic #512), f64: `eigvals(a)` (general,
+  returning a `list[complex]`), `eigh(a)` → `(w, v)` and `eigvalsh(a)` → `w`
+  (symmetric, real, ascending), `lstsq(a, b)` → `(x, residuals, rank,
+  singular_values)`, `norm(a[, ord])` (default 2-norm / Frobenius; integer and
+  `±math.inf` ords), `pinv(a)` (via SVD), and `matrix_power(a, p)`. Backed by
+  LAPACK (`dgeev`/`dsyevd`/`dgelsd`/`dgesdd`) through the #912 seam. `eig` (whose
+  eigenvectors are a complex matrix) is deferred until a complex array dtype
+  exists. Eigenvector signs and the SVD least-squares solution are
+  gauge-ambiguous; eigenvalues / singular values / shapes / rank are well-defined.
+- **Collections of `complex`** (#928). A `complex` value element is now admitted
+  in value positions — `list` elements, `dict` values, `channel` elements — stored
+  as a heap `complex`, rendered `(re±imj)`, and read back as `complex` (so
+  arithmetic, indexing, and iteration work). This is what lets `linalg.eigvals`
+  return a `list[complex]`. `complex` as a hashed dict/set key remains a follow-up.
 - **`linalg` matrix decompositions — cholesky / qr / svd** (#927, D-0184).
   Second `linalg` slice (Phase 3 epic #512), reduced form (NumPy
   `mode='reduced'` / `full_matrices=False`), f64: `linalg.cholesky(a)` → the

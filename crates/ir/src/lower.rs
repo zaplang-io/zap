@@ -2444,6 +2444,14 @@ fn elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError
 /// [`elem_kind`]; it is kept as a named value-position call site for the Phase 1
 /// code paths, and so the intent at those sites stays legible.
 fn value_elem_kind(t: Ty, nested: &RefCell<NestedInterner>) -> Result<Elem, LowerError> {
+    // A `complex` value element (#928) is admitted in value positions (list element,
+    // dict value, channel element) as a dedicated `Elem::Complex` — a `ZapComplex`
+    // pointer word that retains complex identity for read-back / Display. It stays
+    // rejected as a hashed key by [`elem_kind`] (complex-as-key is a follow-up), so
+    // this split is the value-position counterpart of the `f64`-in-lists admission.
+    if t == Ty::Complex {
+        return Ok(Elem::Complex);
+    }
     elem_kind(t, nested)
 }
 
@@ -17725,7 +17733,7 @@ impl<'a> FnLower<'a> {
                 // A nested collection (#625) is not directly orderable (the
                 // runtime compares elements as `i64`/str words), like `f64` and
                 // structs; sort it via a `key=` projection.
-                Elem::F64 | Elem::Struct(_) | Elem::Nested(_) => Err(err(format!(
+                Elem::F64 | Elem::Struct(_) | Elem::Nested(_) | Elem::Complex => Err(err(format!(
                     "{what} is not orderable; pass key= to sort by an orderable \
                      projection (an int or str)"
                 ))),
