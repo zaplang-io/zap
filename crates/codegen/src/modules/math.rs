@@ -33,6 +33,12 @@ pub(crate) fn declare_rt(cg: &mut Cg) {
     for name in ["zap_math_atan2", "zap_math_hypot", "zap_math_fmod"] {
         cg.declare_rt(name, &[f.into(), f.into()], Some(f.into()));
     }
+    // `fma(x, y, z)` — explicit fused multiply-add (#946, D-0196): 3 f64 -> f64.
+    cg.declare_rt(
+        "zap_math_fma",
+        &[f.into(), f.into(), f.into()],
+        Some(f.into()),
+    );
     cg.declare_rt("zap_math_isnan", &[f.into()], Some(i.into()));
     cg.declare_rt("zap_math_isinf", &[f.into()], Some(i.into()));
 }

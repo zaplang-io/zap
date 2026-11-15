@@ -16903,6 +16903,11 @@ double zap_math_fabs(double x) { return fabs(x); }
 double zap_math_atan2(double y, double x) { return atan2(y, x); }
 double zap_math_hypot(double a, double b) { return hypot(a, b); }
 double zap_math_fmod(double a, double b) { return fmod(a, b); }
+/* math.fma(x, y, z): the explicit fused multiply-add (#946, D-0196) — one
+ * rounding of x*y + z. C99 `fma` is correctly rounded and uses the hardware FMA
+ * where the target has it, so the result is bit-identical across platforms and
+ * independent of the implicit-contraction `--fp` policy. */
+double zap_math_fma(double x, double y, double z) { return fma(x, y, z); }
 int64_t zap_math_isnan(double x) { return isnan(x) ? 1 : 0; }
 int64_t zap_math_isinf(double x) { return isinf(x) ? 1 : 0; }
 

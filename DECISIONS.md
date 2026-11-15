@@ -9646,3 +9646,52 @@ Design: #920 §4, comments 2 & 5.
 Relates to epic #139, Discussion #920 (§4, comments 2 & 5), D-0192
 (`cpu_features`), D-0193 (the `@multiversion` facility; this is its C-runtime
 sibling). A later SVE first-faulting-load clone is future work.
+
+## D-0196 — floating-point determinism model: contraction/reassociation policy, `--fp` flag, `math.fma` (#946)
+**Status:** implemented
+Zap's whole-language floating-point determinism model: when the compiler may
+change the rounding STRUCTURE of FP code for speed, the `zapc` flag that controls
+it, and the explicit `fma()` operation. Orthogonal to the ISA-dispatch facility
+(#139) — this governs all scalar/array float arithmetic, with the array kernels
+(#896/#911/#913) as clients. Design snapshot: Discussion #920 comments 5 & 6.
+- **Compile-time `--fp=<level>` policy, three levels — no source opt-in to speed:**
+
+  | level | contraction (FMA) | float reassociation | reproducibility |
+  |---|---|---|---|
+  | `strict` | off | off | bit-exact vs IEEE-754, incl. no FMA |
+  | **`default`** | on | off | fixed-grouping reductions, cross-platform |
+  | `fast` | on | on (warned) | none — width-dependent |
+
+  Codegen stamps the matching LLVM fast-math flags (`contract`, and `reassoc`
+  under `fast`) on every scalar and vector float arithmetic instruction
+  (`FpPolicy::fast_math_flags`, locked by a unit test). Speed is the default;
+  turning it off (`strict`) is the only knob, and `fast` warns in the compiler
+  log. It is a `zapc` flag, NOT a runtime env var — contraction is an AOT codegen
+  choice that cannot be un-baked at run time, and it is orthogonal to `ZAP_ACCEL`.
+- **Integer and float `min`/`max` reassociation: unconditionally on**, no flag.
+  Confirmed from codegen: fixed-width ints lower to plain LLVM `add`/`mul` with no
+  `nsw`/`nuw` (two's-complement wrap → exactly associative); Python-level `int` is
+  arbitrary-precision bigint (never overflows → associative); narrow int-array
+  `sum` widens to i64 (NumPy upcast). So only FP contraction/reassociation is
+  policy-gated.
+- **No `@fast_math` annotation.** An opt-in-to-speed attribute contradicts
+  speed-by-default; the useful inverse, a `@strict_fp` bit-exact region, is
+  deferred (not in v1).
+- **`math.fma(x, y, z)`** — the explicit fused multiply-add: one rounding of
+  `x*y + z`, requested by name, bit-identical on every target (C99 libm `fma`,
+  which is correctly rounded and uses the hardware FMA where present). Independent
+  of the implicit-`x*y+z` contraction default — for deliberate FMA (determinants,
+  Kahan compensation). A runtime wrapper (`zap_math_fma`) on the existing `math`
+  seam, so it is Experimental alongside the rest of the Tier-? stdlib surface.
+- **Deferred to the array-kernel clients (#896/#911), not this PR:** the pinned
+  width-independent *pairwise/tree* grouping for float `sum`/`dot`/`mean` under
+  `default`. This D-#### fixes the POLICY (the determinism promise is defined
+  against the specified grouping, width-independent, NumPy `np.sum` model); the
+  grouping's implementation lives in the reduction kernels and is verified on the
+  CI matrix there.
+- **Scope of v1 here:** the `--fp` flag + fast-math stamping, `math.fma`, the
+  integer-reassoc confirmation, and this record. The spelling is `--fp` on
+  `zap`/`zapc` `run`/`build`; `ir` ignores it (it never codegens).
+Threaded driver → codegen as `FpPolicy` (in `zapc_ir_core`, re-exported from
+`zapc_ir`). Relates to Discussion #920 (5 & 6); clients #896/#911/#913. NOT a
+sub-issue of #139 (float semantics, not dispatch).

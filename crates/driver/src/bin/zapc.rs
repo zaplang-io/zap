@@ -54,6 +54,10 @@ fn compile_args(args: &[String], run_after: bool) -> ExitCode {
     // goldens / perf harness that drive `zapc` can build both the optimized
     // (default) and the fast-iteration runtime.
     let mut debug = false;
+    // `--fp=<strict|default|fast>` (#946, D-0196): the FP determinism policy.
+    // Thread it like `--race`/`--debug` so the goldens / perf harness driving
+    // `zapc` can exercise each policy.
+    let mut fp = zapc_ir::FpPolicy::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -69,6 +73,23 @@ fn compile_args(args: &[String], run_after: bool) -> ExitCode {
                 debug = true;
                 i += 1;
             }
+            flag if flag == "--fp" || flag.starts_with("--fp=") => {
+                let level = if let Some(v) = flag.strip_prefix("--fp=") {
+                    i += 1;
+                    v.to_string()
+                } else {
+                    let v = args.get(i + 1).cloned().unwrap_or_default();
+                    i += 2;
+                    v
+                };
+                match zapc_ir::FpPolicy::parse(&level) {
+                    Some(p) => fp = p,
+                    None => {
+                        eprintln!("zapc: unknown --fp level `{level}` (strict|default|fast)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             f => {
                 file = Some(f.to_string());
                 i += 1;
@@ -79,7 +100,7 @@ fn compile_args(args: &[String], run_after: bool) -> ExitCode {
         eprintln!("zapc: no input file");
         return ExitCode::from(2);
     };
-    zapc::compile_for(&file, out, run_after, &[], false, false, race, debug)
+    zapc::compile_for(&file, out, run_after, &[], false, false, race, debug, fp)
 }
 
 /// Parse the first positional argument as the file and dump ZIR. `--race`

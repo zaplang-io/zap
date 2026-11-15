@@ -1246,6 +1246,56 @@ pub struct GlobalVar {
     pub ty: Ty,
 }
 
+/// Floating-point determinism policy (#946, D-0196): the `zapc --fp=<level>` knob
+/// controlling whether codegen may change the rounding structure of FP code for
+/// speed. Speed is the default; `strict` opts out for bit-exact cross-platform
+/// reproducibility, `fast` opts into reduction reassociation (unbounded error,
+/// width-dependent). Threaded from the driver into codegen, which stamps the
+/// matching LLVM fast-math flags onto scalar and vector float arithmetic. This
+/// governs only the rounding STRUCTURE; integer and float `min`/`max`
+/// reassociation is always sound (two's-complement wrap / bigint) and unaffected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FpPolicy {
+    /// No contraction, no reassociation — bit-exact against the IEEE-754 spec
+    /// (the opt-out for ledger math / golden oracles).
+    Strict,
+    /// Contraction (FMA fusion of `a*b+c`) on, reassociation off — the default.
+    /// Reproducible across platforms; reductions use a fixed pairwise grouping.
+    #[default]
+    Default,
+    /// Contraction + reduction reassociation on — lets reductions vectorize with
+    /// multiple accumulators; width-dependent, no reproducibility promise (the
+    /// driver warns when it is selected).
+    Fast,
+}
+
+impl FpPolicy {
+    /// The LLVM `FastMathFlags` bitmask codegen stamps on float arithmetic for
+    /// this policy. `contract` (allow FMA fusion) for `Default`/`Fast`;
+    /// additionally `reassoc` for `Fast`; nothing for `Strict`. The bit values
+    /// are the stable LLVM-C `LLVMFastMathFlags` ABI (`reassoc = 1<<0`,
+    /// `contract = 1<<5`), consumed by inkwell's `set_fast_math_flags`.
+    pub fn fast_math_flags(self) -> u32 {
+        const REASSOC: u32 = 1 << 0;
+        const CONTRACT: u32 = 1 << 5;
+        match self {
+            FpPolicy::Strict => 0,
+            FpPolicy::Default => CONTRACT,
+            FpPolicy::Fast => CONTRACT | REASSOC,
+        }
+    }
+
+    /// Parse the `--fp=<level>` flag value. `None` for an unrecognized level.
+    pub fn parse(s: &str) -> Option<FpPolicy> {
+        match s {
+            "strict" => Some(FpPolicy::Strict),
+            "default" => Some(FpPolicy::Default),
+            "fast" => Some(FpPolicy::Fast),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Module {
     pub structs: Vec<StructLayout>,
@@ -1643,6 +1693,40 @@ fn fmt_term(t: &Term) -> String {
             format!("br_if %{cond}, block{then_bb}, block{else_bb}")
         }
         Term::Unreachable => "unreachable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod fp_policy_tests {
+    //! The FP-determinism policy (#946, D-0196). Pure Rust — pins the flag
+    //! mapping and parse as a walled garden (a wrong bit silently changes every
+    //! float program's rounding).
+    use super::FpPolicy;
+
+    #[test]
+    fn flag_mapping_matches_the_model() {
+        // strict: bit-exact — no fast-math flags at all.
+        assert_eq!(FpPolicy::Strict.fast_math_flags(), 0);
+        // default: contraction only (bit 5), NO reassoc (bit 0).
+        assert_eq!(FpPolicy::Default.fast_math_flags(), 1 << 5);
+        assert_eq!(
+            FpPolicy::Default.fast_math_flags() & 1,
+            0,
+            "default must NOT reassoc"
+        );
+        // fast: contraction + reassoc.
+        assert_eq!(FpPolicy::Fast.fast_math_flags(), (1 << 5) | 1);
+        // Speed is the default.
+        assert_eq!(FpPolicy::default(), FpPolicy::Default);
+    }
+
+    #[test]
+    fn parse_round_trips_the_three_levels() {
+        assert_eq!(FpPolicy::parse("strict"), Some(FpPolicy::Strict));
+        assert_eq!(FpPolicy::parse("default"), Some(FpPolicy::Default));
+        assert_eq!(FpPolicy::parse("fast"), Some(FpPolicy::Fast));
+        assert_eq!(FpPolicy::parse("Fast"), None, "parse is exact/lowercase");
+        assert_eq!(FpPolicy::parse("reckless"), None);
     }
 }
 

@@ -8508,6 +8508,21 @@ mod tests {
         assert!(e.is_empty(), "unexpected type errors: {e:?}");
     }
 
+    // --- math.fma (#946, D-0196) -----------------------------------------------
+
+    #[test]
+    fn math_fma_takes_three_floats_and_returns_float() {
+        // Three float arguments -> float64; integer args widen.
+        ok("import math\ndef main():\n    print(math.fma(2.0, 3.0, 4.0))\n");
+        ok("import math\ndef main():\n    float64 r = math.fma(1.0, 2.0, 3.0)\n    print(r)\n");
+        // Wrong arity is rejected (fma is strictly ternary, unlike pow/hypot).
+        assert!(!errors("import math\ndef main():\n    print(math.fma(1.0, 2.0))\n").is_empty());
+        assert!(
+            !errors("import math\ndef main():\n    print(math.fma(1.0, 2.0, 3.0, 4.0))\n")
+                .is_empty()
+        );
+    }
+
     // --- AtomicArray[T] (#844) -------------------------------------------------
 
     #[test]

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use zapc_diag::ErrorCode;
+use zapc_ir::FpPolicy;
 use zapc_syntax::ast::Module;
 use zapc_syntax::cfg::Target;
 
@@ -294,7 +295,17 @@ pub fn emit_expand(file: &str) -> ExitCode {
 /// `out` is the output path; when `None`, a default is chosen (a temp path for
 /// `run`, the file stem for `build`).
 pub fn compile(file: &str, out: Option<String>, run_after: bool) -> ExitCode {
-    compile_for(file, out, run_after, &[], false, false, false, false)
+    compile_for(
+        file,
+        out,
+        run_after,
+        &[],
+        false,
+        false,
+        false,
+        false,
+        FpPolicy::default(),
+    )
 }
 
 /// Like [`compile`], but with compile-time `--target-feature`s for `when`
@@ -312,6 +323,7 @@ pub fn compile_for(
     warnings_as_errors: bool,
     race: bool,
     debug: bool,
+    fp: FpPolicy,
 ) -> ExitCode {
     let mut module = match front_end_program(file, &build_target(features), warnings_as_errors) {
         Ok(m) => m,
@@ -319,7 +331,16 @@ pub fn compile_for(
     };
     // `@test` functions are excluded from release binaries (D-0054).
     testing::strip_test_items(&mut module);
-    backend(&module, file, out, run_after, portable, race, debug)
+    // `--fp=fast` enables reduction reassociation (unbounded error, width-
+    // dependent bits). Warn in the compiler log as the model mandates (#946,
+    // D-0196) so a non-reproducible build is never silent.
+    if fp == FpPolicy::Fast {
+        eprintln!(
+            "zap: warning: --fp=fast enables float reduction reassociation; \
+             results are width-dependent and NOT reproducible across targets (#946)"
+        );
+    }
+    backend(&module, file, out, run_after, portable, race, debug, fp)
 }
 
 /// Default output path for a compile when `-o` is not given.
@@ -372,6 +393,7 @@ fn backend(
     portable: bool,
     race: bool,
     debug: bool,
+    fp: FpPolicy,
 ) -> ExitCode {
     use std::process::Command;
 
@@ -406,7 +428,7 @@ fn backend(
         }
     };
 
-    if let Err(e) = zapc_codegen::build_executable(module, &exe, portable, race, debug) {
+    if let Err(e) = zapc_codegen::build_executable(module, &exe, portable, race, debug, fp) {
         eprintln!("{file}: codegen error: {e}");
         cleanup();
         return ExitCode::from(1);
@@ -438,6 +460,7 @@ fn backend(
     _portable: bool,
     _race: bool,
     _debug: bool,
+    _fp: FpPolicy,
 ) -> ExitCode {
     // Keep the default-output logic exercised so it does not warn as dead code
     // on the no-LLVM host build.
