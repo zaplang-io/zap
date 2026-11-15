@@ -1779,7 +1779,20 @@ pub fn lower_module_opts(module: &ast::Module, race: bool) -> (Module, Vec<Lower
                     &deco.param_meta,
                     &deco.on_signal_meta,
                 ) {
-                    Ok(func) => out.funcs.push(func),
+                    // `@multiversion` (#944, epic #139): emit the clone set + the
+                    // group metadata instead of the bare function; codegen builds
+                    // the dispatcher under the public name. Other functions emit
+                    // unchanged.
+                    Ok(func) => match f.decorators.iter().find(|d| d.name == "multiversion") {
+                        Some(d) => match expand_multiversion(func, d) {
+                            Ok((clones, group)) => {
+                                out.funcs.extend(clones);
+                                out.multiversion_groups.push(group);
+                            }
+                            Err(e) => errors.push(e),
+                        },
+                        None => out.funcs.push(func),
+                    },
                     Err(e) => errors.push(e),
                 }
             }
@@ -2538,6 +2551,60 @@ fn err_code(code: zapc_diag::ErrorCode, m: impl Into<String>) -> LowerError {
     }
 }
 
+/// The emitted clone symbol for a `@multiversion` tier: `foo` + `avx2` ->
+/// `foo$mv$avx2` (#944, epic #139). Dots in a tier name (`sse4.2`) become `_`
+/// so the symbol stays a valid identifier for every backend.
+fn mv_clone_name(public: &str, tier: &str) -> String {
+    format!("{public}$mv${}", tier.replace('.', "_"))
+}
+
+/// Expand a `@multiversion(...)` function into its clone set (#944, epic #139).
+/// `base` is the already-lowered body under the public name; this returns one
+/// clone [`Func`] per tier (a copy tagged with its `target_feature`) plus the
+/// [`MvGroup`] codegen turns into a resolver + pointer-once-init dispatcher. The
+/// base is NOT emitted under the public name — codegen emits the dispatcher
+/// there, so every caller dispatches with no call-site change. Sema has already
+/// validated the decorator (string tiers, a mandatory `"default"`); the checks
+/// here are a defensive backstop that keeps a malformed decorator from reaching
+/// codegen as a half-formed group.
+fn expand_multiversion(
+    base: Func,
+    deco: &ast::Decorator,
+) -> Result<(Vec<Func>, MvGroup), LowerError> {
+    let public = base.name.clone();
+    let mut tiers = Vec::new();
+    let mut clones = Vec::new();
+    for a in &deco.args {
+        let ast::Expr::Str { value, .. } = &a.value else {
+            return Err(err("@multiversion tiers must be string literals, e.g. \
+                 @multiversion(\"avx2\", \"default\")"));
+        };
+        let tier = value.clone();
+        let clone_name = mv_clone_name(&public, &tier);
+        let mut clone = base.clone();
+        clone.name = clone_name.clone();
+        clone.target_feature = Some(tier.clone());
+        clones.push(clone);
+        tiers.push(MvTier {
+            clone_name,
+            is_default: tier == "default",
+            tier,
+        });
+    }
+    if !tiers.iter().any(|t| t.is_default) {
+        return Err(err(
+            "@multiversion requires a \"default\" tier (the mandatory portable fallback)",
+        ));
+    }
+    Ok((
+        clones,
+        MvGroup {
+            public_name: public,
+            tiers,
+        },
+    ))
+}
+
 // ----------------------------------------------------------------------------
 // Decorators & annotations (ticket #16, D-0036)
 //
@@ -3073,6 +3140,12 @@ impl DecoratorPlan {
                             // `@deprecated` (I#472, D-0109): a sema-only use-site
                             // warning; the function body lowers unchanged, so there
                             // is nothing to generate here.
+                        } else if d.name == "multiversion" {
+                            // `@multiversion(...)` (#944, epic #139): the function
+                            // body lowers unchanged here; the post-lowering pass
+                            // (`expand_multiversion`) clones it per CPU-feature tier
+                            // and records the dispatch group. Nothing to collect in
+                            // this reflection-metadata scan.
                         } else if DEFERRED_BUILTINS.contains(&d.name.as_str()) {
                             errors.push(err(format!(
                                 "built-in decorator '@{}' is not implemented yet (deferred)",
@@ -6051,6 +6124,7 @@ impl<'a> FnLower<'a> {
             params,
             ret,
             is_main,
+            target_feature: None,
             self_param,
             value_types,
             blocks: vec![Block {

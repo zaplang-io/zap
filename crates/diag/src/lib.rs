@@ -771,6 +771,18 @@ define_codes! {
          `cap`, or drop one of them. (This static check fires only when both \
          arguments are compile-time constants; a `size`/`cap` computed at runtime is \
          still bounds-checked at `arena()` open.)";
+    ZAP5133 = 5133 : "invalid @multiversion",
+        "A `@multiversion(...)` function decorator (#944, ISA-acceleration epic \
+         #139) is malformed. It applies to a free function and takes one or more \
+         positional CPU-feature tier NAMES as string literals — stable names from \
+         the `cpu_features` taxonomy (#943): x86 `\"sse2\"`, `\"sse4.2\"`, `\"avx2\"`, \
+         `\"avx512f\"`; aarch64 `\"neon\"`, `\"aes\"`, `\"sha2\"`, `\"crc32\"`, `\"dotprod\"`, \
+         `\"i8mm\"`, `\"sve\"`, `\"sve2\"`, `\"sme\"` — plus the MANDATORY `\"default\"` \
+         portable fallback, so there is never a \"no implementation for this CPU\" \
+         hole. The compiler compiles one clone per tier and dispatches to the best \
+         one the host supports at runtime (the lower tiers / the other arch's names \
+         are simply never selected). Keyword arguments, a non-string tier, an \
+         unknown feature name, or a missing `\"default\"` is rejected here.";
 
     // ---- ZAP6xxx — lowering / IR / codegen (Experimental) ------------------
     ZAP6001 = 6001 : "lowering error",

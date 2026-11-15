@@ -284,6 +284,18 @@ not supported — it may change in **any** release, including a PATCH:
   #139 facility's programmer-facing surface (`arch.cpu.has`) is finalized, and the
   flat `sys.cpu_*` spelling may be superseded by a nested `sys.cpu.*` facade. The
   rest of `sys` (§4's Stable list) is unaffected.
+- **`@multiversion` function decorator** (#944, epic #139, D-0193) —
+  **Experimental**. `@multiversion("avx2", "default")` on a free function
+  compiles one clone per CPU-feature tier + a runtime resolver/dispatcher reading
+  `cpu_features`, dispatching to the best clone the host supports; a `"default"`
+  tier is mandatory (**ZAP5133**). The tier NAMES are the stable `cpu_features`
+  names (above); the clone/resolver/dispatch mechanism, the `$mv$` symbol
+  scheme, and whether dispatch uses a pointer or an `ifunc` are all internal and
+  NOT a covered surface (§1.5) — an observable program behaves identically
+  whichever clone runs. The decorator name and its mandatory-`default` rule are
+  expected to graduate to Stable; the standalone `@target_feature` building block
+  and its unsafe-to-call-directly rule are a later addition, Experimental until
+  the #139 facility's surface is finalized.
 - **Bug-for-bug behavior.** We reserve the right to fix bugs; see §3.2.
 - **Timing, performance, and resource use** — GC algorithm and pauses (Boehm vs
   precise Immix, D-0009), scheduler fairness and ordering of coroutines,

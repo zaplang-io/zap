@@ -640,6 +640,11 @@ const BUILTIN_DECORATORS: &[&str] = &[
     // Signals (ticket #77, D-0058): `@on_signal(Signal.X)` on a function
     // registers it as a handler for signal X (sugar over `signal.notify`).
     "on_signal",
+    // Function multiversioning (#944, ISA-acceleration epic #139, D-0193):
+    // `@multiversion("avx2", "default")` on a free function compiles one clone
+    // per CPU-feature tier + a runtime resolver/dispatcher reading `cpu_features`
+    // (#943). A mandatory `"default"` tier is the portable fallback.
+    "multiversion",
     // Test framework (D-0054, issue #73). These mark functions for `zap test`;
     // normal builds strip the annotated functions, so they never reach codegen.
     "test",
@@ -651,6 +656,21 @@ const BUILTIN_DECORATORS: &[&str] = &[
     "skip",
     "skip_if",
     "expect_raises",
+];
+
+/// Valid `@multiversion(...)` CPU-feature tier names (#944, ISA-acceleration
+/// epic #139), besides the mandatory `"default"` fallback. These are the stable
+/// documented `cpu_features` names (#943, D-0192), across both arches — a program
+/// is compiled for one arch, and codegen ignores the other arch's tiers (they
+/// can never be selected), so sema accepts the union. Aliases are accepted
+/// (`sse42`/`sse4.2`, `avx512`/`avx512f`, `asimd`/`neon`). The canonical→index
+/// mapping and the LLVM `target-features` string live in codegen's
+/// `cpu_features` module; this is only the name-validation list (the names are
+/// the stable public contract, per STABILITY §3.1).
+pub const MULTIVERSION_TIERS: &[&str] = &[
+    // x86-64
+    "sse2", "sse4.2", "sse42", "avx2", "fma", "avx512f", "avx512", // aarch64
+    "neon", "asimd", "aes", "sha2", "crc32", "dotprod", "i8mm", "sve", "sve2", "sme",
 ];
 
 /// The `@test`-suite decorators (D-0054). A function carrying any of these is a
@@ -2915,6 +2935,62 @@ impl Checker {
                             d.span,
                         );
                     }
+                }
+            }
+            "multiversion" => {
+                // `@multiversion("avx2", "default")` on a free function (#944,
+                // ISA-acceleration epic #139): compile one clone per CPU-feature
+                // tier + a runtime resolver/dispatcher. Positional string tiers
+                // only, a mandatory "default" fallback, names from the taxonomy.
+                self.require_target(d, target, DecoTarget::Function);
+                if positionals == 0 || keywords != 0 {
+                    self.error(
+                        ErrorCode::ZAP5133,
+                        "@multiversion(...) takes one or more positional feature-tier \
+                         names, e.g. @multiversion(\"avx2\", \"default\")",
+                        d.span,
+                    );
+                }
+                let mut has_default = false;
+                for a in &d.args {
+                    if a.name.is_some() {
+                        self.error(
+                            ErrorCode::ZAP5133,
+                            "@multiversion takes positional tier names, not keywords",
+                            d.span,
+                        );
+                        continue;
+                    }
+                    match &a.value {
+                        Expr::Str { value, .. } => {
+                            if value == "default" {
+                                has_default = true;
+                            } else if !MULTIVERSION_TIERS.contains(&value.as_str()) {
+                                self.error(
+                                    ErrorCode::ZAP5133,
+                                    format!(
+                                        "unknown @multiversion tier '{value}' (expected a \
+                                         cpu_features name like \"avx2\"/\"neon\", or \"default\")"
+                                    ),
+                                    d.span,
+                                );
+                            }
+                        }
+                        _ => self.error(
+                            ErrorCode::ZAP5133,
+                            "@multiversion tiers must be string literals, \
+                             e.g. @multiversion(\"avx2\", \"default\")",
+                            d.span,
+                        ),
+                    }
+                }
+                if !has_default && !d.args.is_empty() {
+                    self.error(
+                        ErrorCode::ZAP5133,
+                        "@multiversion requires a \"default\" tier (the mandatory \
+                         portable fallback), e.g. @multiversion(\"avx2\", \"default\")",
+                        d.span,
+                    );
                 }
             }
             "default" => {
@@ -13633,6 +13709,55 @@ def main():
         ok("def main():\n    int64 s = -1\n    uint64 u = uint64(s)\n    int64 back = int64(u)\n    print(u)\n    print(back)\n");
         // Short spellings resolve identically.
         ok("def main():\n    u8 a = 1\n    u16 b = 2\n    u32 c = 3\n    u64 d = 4\n    print(a)\n");
+    }
+
+    #[test]
+    fn multiversion_decorator_validation() {
+        // A well-formed @multiversion with the mandatory "default" tier is fine.
+        ok("@multiversion(\"avx2\", \"sse4.2\", \"default\")\n\
+            def k(int64 a) -> int64:\n    return a + 1\n\
+            def main():\n    print(k(1))\n");
+        // A single-tier aarch64 form is also fine (a program is one arch; the
+        // other arch's tiers are simply never selected at runtime).
+        ok("@multiversion(\"sve\", \"default\")\n\
+            def k(int64 a) -> int64:\n    return a + 1\n\
+            def main():\n    print(k(1))\n");
+        // Missing the mandatory "default" fallback is rejected (ZAP5133) — this
+        // is the "no impl for this CPU" hole the rule exists to prevent.
+        assert!(has_code(
+            "@multiversion(\"avx2\")\ndef k(int64 a) -> int64:\n    return a\n\
+             def main():\n    print(k(1))\n",
+            ErrorCode::ZAP5133,
+        ));
+        // An unknown feature-tier name is a (typo-catching) error.
+        assert!(has_code(
+            "@multiversion(\"avx9000\", \"default\")\ndef k(int64 a) -> int64:\n    return a\n\
+             def main():\n    print(k(1))\n",
+            ErrorCode::ZAP5133,
+        ));
+        // Tiers must be positional string literals, not keywords.
+        assert!(has_code(
+            "@multiversion(tier=\"avx2\", default=1)\ndef k(int64 a) -> int64:\n    return a\n\
+             def main():\n    print(k(1))\n",
+            ErrorCode::ZAP5133,
+        ));
+        // A non-string tier is rejected.
+        assert!(has_code(
+            "@multiversion(avx2, default)\ndef k(int64 a) -> int64:\n    return a\n\
+             def main():\n    print(k(1))\n",
+            ErrorCode::ZAP5133,
+        ));
+    }
+
+    #[test]
+    fn multiversion_wrong_target_is_rejected() {
+        // @multiversion applies to a free function, not a struct (the generic
+        // wrong-target diagnostic, ZAP5047).
+        assert!(has_code(
+            "@multiversion(\"avx2\", \"default\")\nstruct P:\n    int64 x\n\
+             def main():\n    pass\n",
+            ErrorCode::ZAP5047,
+        ));
     }
 
     #[test]

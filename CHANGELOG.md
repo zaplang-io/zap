@@ -25,6 +25,17 @@ commit-by-commit; the authoritative per-feature record is `DECISIONS.md`
 
 ### Added
 
+- **Function multiversioning — `@multiversion`** (#944, epic #139, D-0193).
+  `@multiversion("avx2", "sse4.2", "default")` on a free function compiles one
+  clone per CPU-feature tier (each with its LLVM `target-features`, kept as a
+  non-inlined dispatch barrier) and a runtime resolver + pointer-once-init
+  dispatcher that reads `cpu_features` (#943) and picks the best clone the host
+  supports — callers invoke the public name unchanged. A `"default"` tier is
+  mandatory (ZAP5133), so there is never a "no impl for this CPU" hole; the
+  resolver/dispatcher stay baseline (no feature leak → no SIGILL); the scalable
+  SVE clone stays first-class. Foundation for SIMD kernels (#945). GNU `ifunc`
+  (an x86-Linux optimization) and standalone `@target_feature` are follow-ons.
+  **Experimental.**
 - **`cpu_features` runtime detection** (#943, epic #139, D-0192). The shared
   CPU-capability layer the ISA-acceleration facility (Discussion #920) is built
   on: a malloc-free, compute-once, read-only `zap_cpu()` probe in the C runtime
