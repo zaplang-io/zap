@@ -7,7 +7,7 @@
 # output is the same on every CI box. (The `str_find_simd_generic` sibling forces
 # the baseline clone via ZAP_CPU=generic and prints the same thing.)
 def main():
-    s = "the quick brown fox jumps over the lazy dog, then the fox naps away"
+    auto s = "the quick brown fox jumps over the lazy dog, then the fox naps away"
     print(s.find("the"))  # 0  (first occurrence)
     print(s.find("fox"))  # 16 (first occurrence, not the later one)
     print(s.find(" "))  # 3  (single-byte needle -> memchr fast path)

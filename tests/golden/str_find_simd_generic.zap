@@ -4,7 +4,7 @@
 # result is identical — proving the baseline search path is correct and a
 # feature-absent host never traps.
 def main():
-    s = "the quick brown fox jumps over the lazy dog, then the fox naps away"
+    auto s = "the quick brown fox jumps over the lazy dog, then the fox naps away"
     print(s.find("the"))
     print(s.find("fox"))
     print(s.find(" "))
